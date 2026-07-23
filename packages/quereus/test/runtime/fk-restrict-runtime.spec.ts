@@ -390,3 +390,163 @@ describe('runtime FK RESTRICT pre-check', () => {
 		void expect(rows).to.deep.equal([]);
 	});
 });
+
+// The FK/DDL enforcement probes and cascade DML are executed through a
+// per-Database LRU pool of compiled statements (InternalStatementCache) instead
+// of a fresh prepare/finalize per affected row. These pin the pool's observable
+// contract: reuse across repeated same-shape executions, correct recompilation
+// after intervening DDL, type-agnostic re-binding, the re-entrancy busy-guard,
+// rollback-safety, and close-time drain.
+describe('internal FK statement cache', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('pragma foreign_keys = true');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('reuses one cached probe statement across repeated same-shape RESTRICT checks', async () => {
+		await db.exec(`
+			create table cp (id integer primary key);
+			create table cc (id integer primary key, pid integer,
+				foreign key (pid) references cp(id) on delete restrict);
+			insert into cp values (1), (2), (3);
+			insert into cc values (10, 1);
+		`);
+		const parent = db.schemaManager.getTable('main', 'cp');
+		void expect(parent, 'cp schema').to.exist;
+
+		const before = db._internalStatementCache.stats;
+		// Two probes of the SAME child-table shape (unreferenced keys ⇒ clean return).
+		await assertNoRestrictedChildrenForParentMutation(db, parent!, 'delete', [2]);
+		await assertNoRestrictedChildrenForParentMutation(db, parent!, 'delete', [3]);
+		const after = db._internalStatementCache.stats;
+
+		// The second probe reused the statement the first one compiled.
+		void expect(after.hits, 'second probe is a cache hit').to.be.greaterThan(before.hits);
+		void expect(after.size, 'the probe shape is retained').to.be.greaterThan(0);
+	});
+
+	it('recompiles a cached RESTRICT probe across drop+recreate of the child table', async () => {
+		await db.exec(`
+			create table rp (id integer primary key);
+			create table rc (id integer primary key, pid integer,
+				foreign key (pid) references rp(id) on delete restrict);
+			insert into rp values (1);
+			insert into rc values (10, 1);
+		`);
+		const parent = db.schemaManager.getTable('main', 'rp');
+		void expect(parent, 'rp schema').to.exist;
+
+		// First probe caches a plan bound to the ORIGINAL rc table object.
+		await expectThrows(
+			() => assertNoRestrictedChildrenForParentMutation(db, parent!, 'delete', [1]),
+			'constraint failed',
+		);
+
+		// Drop and recreate the child EMPTY. The cached statement's schema-change
+		// subscription must invalidate it, so the next probe recompiles against the
+		// NEW rc (a stale plan would still see the destroyed table / old rows).
+		await db.exec('drop table rc');
+		await db.exec(`create table rc (id integer primary key, pid integer,
+			foreign key (pid) references rp(id) on delete restrict)`);
+
+		// No child rows now ⇒ clean return, proving the recompile happened.
+		await assertNoRestrictedChildrenForParentMutation(db, parent!, 'delete', [1]);
+	});
+
+	it('rebinds a differently-typed key for the same probe SQL without a type-mismatch', async () => {
+		// A loose-affinity (`any`) FK column can hold an integer key on one row and a
+		// text key on another under one SQL shape. The cache prepares internal probes
+		// type-agnostically, so reusing the statement with a differently-typed value
+		// must not surface a bind-time parameter type-mismatch.
+		await db.exec(`
+			create table ap (k any primary key);
+			create table ac (id integer primary key, k any,
+				foreign key (k) references ap(k) on delete restrict);
+			insert into ap values (1), ('x');
+			insert into ac values (10, 1);
+		`);
+		const parent = db.schemaManager.getTable('main', 'ap');
+		void expect(parent, 'ap schema').to.exist;
+
+		// First probe binds an INTEGER key → compiles + caches the plan; k=1 is referenced.
+		await expectThrows(
+			() => assertNoRestrictedChildrenForParentMutation(db, parent!, 'delete', [1]),
+			'constraint failed',
+		);
+		// Second probe reuses the SAME statement but binds a TEXT key. A frozen
+		// first-use INTEGER type would reject this as a mismatch; k='x' is unreferenced.
+		await assertNoRestrictedChildrenForParentMutation(db, parent!, 'delete', ['x']);
+	});
+
+	it('self-referential cascade delete re-enters through the busy-guard and completes', async () => {
+		// A cascade chain re-fires the SAME cascade-DELETE SQL text while the outer
+		// execution is still draining, so the cache must route the re-entry to a fresh
+		// one-shot statement (never the live one) — no deadlock, whole chain deleted.
+		await db.exec(`
+			create table node (id integer primary key, parent integer null,
+				foreign key (parent) references node(id) on delete cascade);
+			insert into node values (1, null), (2, 1), (3, 2), (4, 3);
+		`);
+
+		await db.exec('delete from node where id = 1');
+
+		const rows: Record<string, unknown>[] = [];
+		for await (const r of db.eval('select id from node')) rows.push(r);
+		void expect(rows, 'entire self-referential chain cascaded away').to.deep.equal([]);
+		void expect(
+			db._internalStatementCache.stats.busyFallbacks,
+			'the recursive cascade exercised the busy-guard',
+		).to.be.greaterThan(0);
+	});
+
+	it('cached cascade statements survive a savepoint rollback with no stale state', async () => {
+		await db.exec(`
+			create table tp (id integer primary key);
+			create table tc (id integer primary key, pid integer,
+				foreign key (pid) references tp(id) on delete cascade);
+			insert into tp values (1), (2);
+			insert into tc values (10, 1), (20, 2);
+		`);
+
+		await db.exec('begin');
+		await db.exec('savepoint sp1');
+		// Cascade delete inside the savepoint — compiles + caches the cascade statement.
+		await db.exec('delete from tp where id = 1');
+		await db.exec('rollback to sp1');
+		await db.exec('release sp1');
+		// Reuse the cached cascade statement AFTER the rollback — it must hold no state
+		// from the rolled-back execution.
+		await db.exec('delete from tp where id = 2');
+		await db.exec('commit');
+
+		const tp: Record<string, unknown>[] = [];
+		for await (const r of db.eval('select id from tp order by id')) tp.push(r);
+		void expect(tp, 'id=1 restored by rollback, id=2 committed-deleted').to.deep.equal([{ id: 1 }]);
+		const tc: Record<string, unknown>[] = [];
+		for await (const r of db.eval('select id from tc order by id')) tc.push(r);
+		void expect(tc, 'tc(10) restored, tc(20) cascaded away').to.deep.equal([{ id: 10 }]);
+	});
+
+	it('close drains the internal statement cache', async () => {
+		const d = new Database();
+		await d.exec('pragma foreign_keys = true');
+		await d.exec(`
+			create table xp (id integer primary key);
+			create table xc (id integer primary key, pid integer,
+				foreign key (pid) references xp(id) on delete cascade);
+			insert into xp values (1);
+			insert into xc values (10, 1);
+			delete from xp where id = 1;
+		`);
+		void expect(d._internalStatementCache.stats.size, 'cascade populated the cache').to.be.greaterThan(0);
+
+		await d.close();
+		void expect(d._internalStatementCache.stats.size, 'close finalized + dropped every entry').to.equal(0);
+	});
+});

@@ -467,5 +467,61 @@ describe('Performance sentinels', function () {
 			}
 		});
 	});
+
+	// ------------------------------- FK cascade bulk parent delete (stmt cache)
+	describe('FK cascade bulk parent delete', function () {
+		this.timeout(60_000);
+
+		it('cascade-deletes 500 parents each with a child, reusing cached statements', async () => {
+			// Every deleted parent row fires two per-row internal statements — the
+			// transitive pre-walk `select * from child where parent_id = ?` and the
+			// cascade `delete from child where parent_id = ?`. Without the internal
+			// statement cache each is a fresh parse + plan + emit per parent row
+			// (~1000 compiles for 500 parents); the cache compiles each shape once
+			// and rebinds. The hit-ratio assertion is the real sentinel here (a cache
+			// bypass makes misses scale with row count); the timing bound is generous
+			// CI headroom that only trips on a catastrophic regression.
+			const db = new Database();
+			try {
+				await db.exec(`
+					pragma foreign_keys = true;
+					create table cparent (id integer primary key, name text);
+					create table cchild (id integer primary key, parent_id integer,
+						foreign key (parent_id) references cparent(id) on delete cascade);
+				`);
+				const N = 500;
+				const BATCH = 250;
+				for (let i = 0; i < N; i += BATCH) {
+					const parents = Array.from({ length: BATCH }, (_, j) => `(${i + j + 1}, 'p${i + j + 1}')`).join(', ');
+					await db.exec(`insert into cparent values ${parents}`);
+					// One child per parent, referencing it — each parent delete cascades.
+					const children = Array.from({ length: BATCH }, (_, j) => `(${i + j + 1}, ${i + j + 1})`).join(', ');
+					await db.exec(`insert into cchild values ${children}`);
+				}
+
+				const before = db._internalStatementCache.stats;
+				const elapsed = await timeMs(async () => {
+					await db.exec('delete from cparent');
+				});
+				const after = db._internalStatementCache.stats;
+
+				const parentRows = await collect(db.eval('select count(*) as cnt from cparent'));
+				const childRows = await collect(db.eval('select count(*) as cnt from cchild'));
+				expect(parentRows[0].cnt).to.equal(0);
+				expect(childRows[0].cnt, 'every child cascaded away').to.equal(0);
+
+				// Each per-row shape compiled ONCE and was then reused across all rows:
+				// the miss delta is a small constant (a couple of shapes), not O(N).
+				const missDelta = after.misses - before.misses;
+				const hitDelta = after.hits - before.hits;
+				expect(missDelta, `only a couple of shapes compiled (saw ${missDelta} misses)`).to.be.below(10);
+				expect(hitDelta, 'the vast majority of per-row executions were cache hits').to.be.greaterThan(N);
+				expect(elapsed).to.be.below(5000,
+					`cascade delete of ${N} parent+child pairs took ${elapsed.toFixed(1)} ms`);
+			} finally {
+				await db.close();
+			}
+		});
+	});
 });
 

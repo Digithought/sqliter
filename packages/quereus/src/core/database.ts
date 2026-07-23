@@ -58,6 +58,7 @@ import {
 	type SchemaChangeSubscriptionOptions,
 } from './database-events.js';
 import { TransactionManager, type TransactionManagerContext } from './database-transaction.js';
+import { InternalStatementCache } from './internal-statement-cache.js';
 import { ingestExternalRowChangeBatch } from './database-external-changes.js';
 import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
 import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViolation } from './database-assertions.js';
@@ -161,11 +162,21 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * on the same key. Memory-table managers reach it via `this.db.latches`.
 	 */
 	public readonly latches = new Latches();
+	/**
+	 * @internal Per-connection LRU pool of compiled internal statements for the FK
+	 * and DDL enforcement paths (RESTRICT probes, cascade DML, drop-referencing
+	 * check). Those sites otherwise re-`prepare` a tiny fixed-shape query per
+	 * affected row, paying a full parse + plan + emit each time (the engine has no
+	 * plan cache). Not a public statement-cache feature — see
+	 * {@link InternalStatementCache}. Drained by {@link close}.
+	 */
+	public readonly _internalStatementCache: InternalStatementCache;
 
 	constructor() {
 		this.schemaManager = new SchemaManager(this);
 		this.declaredSchemaManager = new DeclaredSchemaManager();
 		this.options = new DatabaseOptionsManager();
+		this._internalStatementCache = new InternalStatementCache(this);
 		log("Database instance created.");
 
 		// Register built-in functions
@@ -1058,6 +1069,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		// Disconnect all active connections first
 		await this.disconnectAllConnections();
+
+		// Drain the internal FK/DDL statement pool (finalizes its cached statements,
+		// which also deregisters them from `this.statements` below — double-finalize
+		// is a no-op, so the subsequent sweep is harmless).
+		await this._internalStatementCache.clear();
 
 		// Finalize all prepared statements
 		const finalizePromises = Array.from(this.statements).map(stmt => stmt.finalize());

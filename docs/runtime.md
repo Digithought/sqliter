@@ -1070,6 +1070,25 @@ out of scope: the transitive recursion reads children at call time and, post-evi
 parent value is gone, so a deeper cascade may not resolve — mirroring the documented
 SET-DEFAULT recursion gap and no regression beyond status quo.
 
+**Internal statement cache.** The per-row FK/DDL enforcement statements — the RESTRICT
+existence probe (`assertNoRestrictedChildrenForParentMutation` and its lens dual), the
+transitive cascade pre-walk child scan, the cascade DML
+(`executeSingleFKAction`'s `DELETE`/`UPDATE`), and the drop-referencing check
+(`SchemaManager.assertNoReferencingChildrenForDrop`) — are executed through a
+per-`Database` LRU pool of compiled statements keyed by exact SQL text
+(`InternalStatementCache`), rather than a fresh `prepare`/`finalize` per affected row (the
+engine has no plan cache, so each fresh prepare pays a full parse + plan + emit). Each fixed
+shape compiles once and rebinds; a bulk cascade over N parents runs a couple of compiles, not
+2N. Correctness rides existing `Statement` behavior: the compiled statement subscribes to
+schema-change notifications and lazily recompiles across intervening DDL, and a cascade that
+re-enters with the same SQL text while that statement is mid-iteration falls back to a fresh
+one-shot statement (the busy-guard) rather than sharing a live cursor. Internal probes are
+prepared type-agnostically, so a loose-affinity FK column binding an integer key on one row
+and a text key on another under one SQL shape is neither rejected nor served a
+first-use-frozen plan. Deliberately internal — not a public statement-cache feature. The
+batched RESTRICT flush is a handful of compiles per statement, not per row, so it is left on
+the plain `prepare` path.
+
 ### Implementation Guidelines for Emitter Authors
 
 **When adding new mutation operations:**

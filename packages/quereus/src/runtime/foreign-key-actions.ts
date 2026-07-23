@@ -417,61 +417,61 @@ export async function assertTransitiveRestrictsForParentMutation(
 
 			log('TRANSITIVE pre-walk: %s with params %o', sql, oldParentValues);
 
-			const stmt = db.prepare(sql);
-			try {
-				stmt.bindAll(oldParentValues);
-				for await (const childOldRow of stmt._iterateRowsRaw()) {
-					let childNewRow: Row | undefined;
-					let childOp: 'delete' | 'update';
+			// Cached internal statement leased for the whole scan (compiled once per
+			// shape, not re-prepared per parent row). The recursion inside this loop
+			// can re-enter with the SAME SQL text (self-referential / diamond FK graph)
+			// while this statement is still iterating — that re-entry hits the cache's
+			// busy-guard and gets its own fresh one-shot statement, never this live
+			// cursor. See InternalStatementCache.iterate.
+			for await (const childOldRow of db._internalStatementCache.iterate(sql, oldParentValues)) {
+				let childNewRow: Row | undefined;
+				let childOp: 'delete' | 'update';
 
-					if (action === 'cascade' && operation === 'delete') {
-						childOp = 'delete';
-						childNewRow = undefined;
-					} else if (action === 'cascade' && operation === 'update' && newParentValues) {
-						childOp = 'update';
-						const next = [...(childOldRow as Row)] as SqlValue[];
-						for (let i = 0; i < fk.columns.length; i++) {
-							next[fk.columns[i]] = newParentValues[i];
-						}
-						childNewRow = next as Row;
-					} else if (action === 'setNull') {
-						childOp = 'update';
-						const next = [...(childOldRow as Row)] as SqlValue[];
-						for (let i = 0; i < fk.columns.length; i++) {
-							next[fk.columns[i]] = null;
-						}
-						childNewRow = next as Row;
-					} else if (action === 'setDefault') {
-						// SET DEFAULT recursion: pass the child OLD row as both
-						// old and new. The recursion's column-change short-circuit
-						// will treat this as "no FK column moved" and the per-target
-						// cascade SQL (executeSingleFKAction) still fires its own
-						// RESTRICT enforcement for non-rowid-chained backends. This
-						// matches the coverage gap SET DEFAULT already has in
-						// rowid-chained backends — no regression beyond status quo.
-						childOp = 'update';
-						childNewRow = childOldRow as Row;
-					} else {
-						continue;
+				if (action === 'cascade' && operation === 'delete') {
+					childOp = 'delete';
+					childNewRow = undefined;
+				} else if (action === 'cascade' && operation === 'update' && newParentValues) {
+					childOp = 'update';
+					const next = [...(childOldRow as Row)] as SqlValue[];
+					for (let i = 0; i < fk.columns.length; i++) {
+						next[fk.columns[i]] = newParentValues[i];
 					}
-
-					// Recurse carrying the SAME `lensRouted`: the nested levels are the
-					// transitive closure of *this* write, so when the top-level write is
-					// lens-routed every level inherits the logical FK semantics. This is
-					// load-bearing for a logical RESTRICT sitting below an *agreeing*
-					// basis cascade (basis + logical both cascade): at runtime that basis
-					// cascade executes as a basis-direct write — which does NOT fire the
-					// deeper lens RESTRICT — and the agreeing lens cascade is elided, so it
-					// never re-enters through the child view either. The ONLY place that
-					// deeper RESTRICT is caught is this pre-walk recursing with the lens flag
-					// still set. For a basis-direct top-level write `lensRouted` is already
-					// false, so the recursion correctly stays basis-only throughout.
-					await assertTransitiveRestrictsForParentMutation(
-						db, childTable, childOp, childOldRow as Row, childNewRow, lensRouted, visitedSet,
-					);
+					childNewRow = next as Row;
+				} else if (action === 'setNull') {
+					childOp = 'update';
+					const next = [...(childOldRow as Row)] as SqlValue[];
+					for (let i = 0; i < fk.columns.length; i++) {
+						next[fk.columns[i]] = null;
+					}
+					childNewRow = next as Row;
+				} else if (action === 'setDefault') {
+					// SET DEFAULT recursion: pass the child OLD row as both
+					// old and new. The recursion's column-change short-circuit
+					// will treat this as "no FK column moved" and the per-target
+					// cascade SQL (executeSingleFKAction) still fires its own
+					// RESTRICT enforcement for non-rowid-chained backends. This
+					// matches the coverage gap SET DEFAULT already has in
+					// rowid-chained backends — no regression beyond status quo.
+					childOp = 'update';
+					childNewRow = childOldRow as Row;
+				} else {
+					continue;
 				}
-			} finally {
-				await stmt.finalize();
+
+				// Recurse carrying the SAME `lensRouted`: the nested levels are the
+				// transitive closure of *this* write, so when the top-level write is
+				// lens-routed every level inherits the logical FK semantics. This is
+				// load-bearing for a logical RESTRICT sitting below an *agreeing*
+				// basis cascade (basis + logical both cascade): at runtime that basis
+				// cascade executes as a basis-direct write — which does NOT fire the
+				// deeper lens RESTRICT — and the agreeing lens cascade is elided, so it
+				// never re-enters through the child view either. The ONLY place that
+				// deeper RESTRICT is caught is this pre-walk recursing with the lens flag
+				// still set. For a basis-direct top-level write `lensRouted` is already
+				// false, so the recursion correctly stays basis-only throughout.
+				await assertTransitiveRestrictsForParentMutation(
+					db, childTable, childOp, childOldRow as Row, childNewRow, lensRouted, visitedSet,
+				);
 			}
 		}
 	} finally {
@@ -558,23 +558,14 @@ export async function assertNoRestrictedChildrenForParentMutation(
 
 		log('RESTRICT check (%s): %s with params %o', operation, sql, oldParentValues);
 
-		const stmt = db.prepare(sql);
-		try {
-			stmt.bindAll(oldParentValues);
-			let referenced = false;
-			for await (const _row of stmt._iterateRowsRaw()) {
-				referenced = true;
-				break;
-			}
-			if (referenced) {
-				const opName = operation === 'delete' ? 'DELETE' : 'UPDATE';
-				throw new QuereusError(
-					`FOREIGN KEY constraint failed: ${opName} on '${parentTable.name}' violates RESTRICT from '${childTable.name}'`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-		} finally {
-			await stmt.finalize();
+		// Cached internal statement (compiled once per shape) rather than a fresh
+		// per-row prepare/finalize — see InternalStatementCache.
+		if (await db._internalStatementCache.probe(sql, oldParentValues)) {
+			const opName = operation === 'delete' ? 'DELETE' : 'UPDATE';
+			throw new QuereusError(
+				`FOREIGN KEY constraint failed: ${opName} on '${parentTable.name}' violates RESTRICT from '${childTable.name}'`,
+				StatusCode.CONSTRAINT,
+			);
 		}
 	}
 }
@@ -628,7 +619,7 @@ async function executeSingleFKAction(
 				// CASCADE DELETE: delete matching child rows
 				const sql = `DELETE FROM ${qualifiedChildTable} WHERE ${whereClause}`;
 				log('CASCADE DELETE: %s with params %o', sql, oldParentValues);
-				await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
+				await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, oldParentValues));
 			} else {
 				// CASCADE UPDATE: update child FK columns to new parent values
 				const newParentValues = parentColIndices.map(idx => newRow[idx]);
@@ -641,7 +632,7 @@ async function executeSingleFKAction(
 				const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereParamsClause}`;
 				const params = [...newParentValues, ...oldParentValues];
 				log('CASCADE UPDATE: %s with params %o', sql, params);
-				await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, params));
+				await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, params));
 			}
 			break;
 		}
@@ -649,7 +640,7 @@ async function executeSingleFKAction(
 			const setClauses = childColNames.map(name => `"${name}" = NULL`).join(', ');
 			const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereClause}`;
 			log('SET NULL: %s with params %o', sql, oldParentValues);
-			await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
+			await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, oldParentValues));
 			break;
 		}
 		case 'setDefault': {
@@ -664,7 +655,7 @@ async function executeSingleFKAction(
 			}).join(', ');
 			const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereClause}`;
 			log('SET DEFAULT: %s with params %o', sql, oldParentValues);
-			await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
+			await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, oldParentValues));
 			break;
 		}
 	}
@@ -874,7 +865,7 @@ async function issueLensFkAction(
 			if (operation === 'delete') {
 				const sql = `delete from ${qualifiedChild} where ${whereClause}`;
 				log('LENS CASCADE DELETE: %s with params %o', sql, oldParentValues);
-				await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
+				await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, oldParentValues));
 			} else {
 				// CASCADE UPDATE: rewrite the child FK columns to the NEW parent values
 				// (SET) for rows that still reference the OLD values (WHERE).
@@ -890,7 +881,7 @@ async function issueLensFkAction(
 			const setClauses = childLogicalColumns.map(c => `${quoteIdentifier(c)} = null`).join(', ');
 			const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
 			log('LENS SET NULL: %s with params %o', sql, oldParentValues);
-			await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
+			await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, oldParentValues));
 			break;
 		}
 		case 'setDefault': {
@@ -903,7 +894,7 @@ async function issueLensFkAction(
 			}).join(', ');
 			const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
 			log('LENS SET DEFAULT: %s with params %o', sql, oldParentValues);
-			await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
+			await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, oldParentValues));
 			break;
 		}
 	}
@@ -1033,22 +1024,13 @@ async function assertNoLensChildReferences(
 
 	log('LENS RESTRICT check (%s): %s with params %o', operation, sql, oldParentValues);
 
-	const stmt = db.prepare(sql);
-	try {
-		stmt.bindAll(oldParentValues);
-		let referenced = false;
-		for await (const _row of stmt._iterateRowsRaw()) {
-			referenced = true;
-			break;
-		}
-		if (referenced) {
-			const opName = operation === 'delete' ? 'DELETE' : 'UPDATE';
-			throw new QuereusError(
-				`FOREIGN KEY constraint failed: ${opName} on '${parentSlot.logicalTable.name}' violates RESTRICT from '${childTable.name}'`,
-				StatusCode.CONSTRAINT,
-			);
-		}
-	} finally {
-		await stmt.finalize();
+	// Cached internal statement (compiled once per shape) rather than a fresh
+	// per-row prepare/finalize — see InternalStatementCache.
+	if (await db._internalStatementCache.probe(sql, oldParentValues)) {
+		const opName = operation === 'delete' ? 'DELETE' : 'UPDATE';
+		throw new QuereusError(
+			`FOREIGN KEY constraint failed: ${opName} on '${parentSlot.logicalTable.name}' violates RESTRICT from '${childTable.name}'`,
+			StatusCode.CONSTRAINT,
+		);
 	}
 }

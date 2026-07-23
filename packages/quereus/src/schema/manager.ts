@@ -1408,21 +1408,13 @@ export class SchemaManager {
 				: '';
 			const sql = `select 1 from ${schemaPrefix}${quoteIdentifier(childTable.name)} where ${whereClause} limit 1`;
 
-			const stmt = this.db.prepare(sql);
-			try {
-				let referenced = false;
-				for await (const _row of stmt._iterateRowsRaw()) {
-					referenced = true;
-					break;
-				}
-				if (referenced) {
-					throw new QuereusError(
-						`FOREIGN KEY constraint failed: cannot drop table '${parentTableName}' because table '${childTable.name}' still has rows referencing it`,
-						StatusCode.CONSTRAINT,
-					);
-				}
-			} finally {
-				await stmt.finalize();
+			// Cached internal statement (compiled once per shape) rather than a fresh
+			// per-drop prepare/finalize — see InternalStatementCache.
+			if (await this.db._internalStatementCache.probe(sql)) {
+				throw new QuereusError(
+					`FOREIGN KEY constraint failed: cannot drop table '${parentTableName}' because table '${childTable.name}' still has rows referencing it`,
+					StatusCode.CONSTRAINT,
+				);
 			}
 		}
 	}
