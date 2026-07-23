@@ -1089,6 +1089,53 @@ first-use-frozen plan. Deliberately internal — not a public statement-cache fe
 batched RESTRICT flush is a handful of compiles per statement, not per row, so it is left on
 the plain `prepare` path.
 
+### Batched RESTRICT
+
+Parent-side RESTRICT enforcement normally costs **two** probes per mutated parent row per
+inbound FK: the plan-time synthesized `NOT EXISTS(select 1 from child where fk = OLD.pk)`
+constraint (compiled once, evaluated per row by `ConstraintCheckNode`) and the runtime
+transitive pre-walk (`assertTransitiveRestrictsForParentMutation` inside
+`processDeleteRow` / `processUpdateRow`). On a high-latency store each probe is a storage
+round-trip, so a bulk parent DELETE paid O(rows × FKs) round-trips even when nothing
+references the deleted keys.
+
+For statement shapes where it is provably equivalent, both per-row probes are replaced by
+**one chunked probe per inbound FK at the end-of-statement boundary**. The shared
+batchability gate, `getBatchableRestrictFks` (`planner/building/foreign-key-builder.ts`),
+is consulted by both the plan builders (`buildDeleteStmt` / `buildUpdateStmt` skip the
+per-row `NOT EXISTS` checks) and the DML executor (`runDelete` / `runUpdate` skip the
+per-row pre-walk), so the two sides cannot disagree. A DELETE/UPDATE batches iff it is
+not lens-routed, its effective conflict resolution is default/ABORT or ROLLBACK, and
+**every** inbound FK is a non-self-referential `restrict` for the op:
+
+- **FAIL / IGNORE / REPLACE** have per-row keep/skip semantics a statement-end check
+  cannot honor (FAIL keeps prior rows; the gate excludes it, so the flush always runs
+  under the statement-scope savepoint).
+- **Any cascading / set-null / set-default inbound FK** forces the per-row transitive
+  pre-walk, which must interleave with cascade execution (a cascade could delete a
+  RESTRICT child's rows mid-statement).
+- **A self-referential FK**'s check outcome depends on which rows of the same table the
+  statement has already deleted, so it stays per-row.
+
+During the row loop the executor accumulates each affected row's OLD referenced-key tuple
+into per-execution, per-FK state (`createParentRestrictBatch` /
+`accumulateParentRestrictKeys`, `runtime/foreign-key-actions.ts`) — deduplicated on an
+injective serialization, skipping tuples containing NULL (MATCH SIMPLE) and UPDATE rows
+that change no referenced column. The state is allocated per execution (never on the emit
+closure), so a re-run prepared statement starts empty. `flushParentRestrictBatch` fires in
+`runWithStatementSavepoints` after the row loop, **before** the deferred-maintenance flush
+(fail fast — skip wasted MV work) and before the statement savepoint releases, probing
+each FK's child table in ~500-key chunks (`fkcol in (?, …)`, or OR-of-conjunctions for a
+composite FK — plain SQL `=`/`IN` against the child column, so collation semantics match
+the per-row `NOT EXISTS` by construction). A hit throws the existing
+`FOREIGN KEY constraint failed: DELETE on '<parent>' violates RESTRICT from '<child>'`
+error and the statement savepoint unwinds every row — the same final state and error class
+as a per-row abort. The REPLACE-eviction path (`processEvictions`) always stays per-row.
+
+The one observable divergence: a consumer streaming `RETURNING` rows sees **all** rows
+yielded before the violation aborts the statement, instead of only the rows preceding the
+violating one — transient output before an error that voids the statement either way.
+
 ### Implementation Guidelines for Emitter Authors
 
 **When adding new mutation operations:**
