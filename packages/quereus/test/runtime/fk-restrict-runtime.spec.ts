@@ -371,6 +371,30 @@ describe('runtime FK RESTRICT pre-check', () => {
 		void expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }]);
 	});
 
+	it('batched path: a violation past the first 500-key probe chunk still fires and rolls back', async () => {
+		// The flush probes accumulated keys in RESTRICT_BATCH_CHUNK (500)-key
+		// slices. With >500 deleted parents the loop runs a second probe; a child
+		// referencing a parent that lands beyond the first chunk must still be
+		// caught. Perf-sentinels cover the multi-chunk SUCCESS path (no match);
+		// this pins the multi-chunk VIOLATION path.
+		await db.exec(`
+			create table cp (id integer primary key);
+			create table cc (cid integer primary key, p_id integer,
+				foreign key (p_id) references cp(id) on delete restrict);
+		`);
+		const values = Array.from({ length: 600 }, (_, i) => `(${i + 1})`).join(', ');
+		await db.exec(`insert into cp values ${values}`);
+		// Reference the last parent — index 599 of 600, past the first 500-key chunk.
+		await db.exec('insert into cc values (1, 600)');
+
+		await expectThrows(() => db.exec('delete from cp'), "violates RESTRICT from 'cc'");
+
+		// Atomic: every parent survives the rollback.
+		const rows: Record<string, unknown>[] = [];
+		for await (const r of db.eval('select count(*) as cnt from cp')) rows.push(r);
+		void expect(rows).to.deep.equal([{ cnt: 600 }]);
+	});
+
 	it('does not fire for CASCADE / SET NULL / SET DEFAULT — those go through the action walker', async () => {
 		await db.exec(`
 			create table p_cd (id integer primary key, code text not null unique);
