@@ -1,4 +1,7 @@
--- in-subquery-caching.sqllogic - Testing IN subquery materialization via CacheNode
+-- in-subquery-caching.sqllogic - Testing uncorrelated IN subquery materialization
+-- via the emitIn set probe (once-per-execution lookup set; see
+-- quereus-in-subquery-set-probe). Correlated / non-deterministic sources keep the
+-- per-outer-row streaming path.
 
 -- Setup tables
 CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT, val INTEGER);
@@ -30,7 +33,8 @@ SELECT id FROM items WHERE id NOT IN (SELECT val FROM nullable_ids) ORDER BY id;
 SELECT id FROM items WHERE id IN (SELECT val FROM nullable_ids WHERE val > 100) ORDER BY id;
 → []
 
--- Correlated IN subquery — must NOT get CacheNode (should still work correctly)
+-- Correlated IN subquery — must take the streaming (per-outer-row) path, not the
+-- set probe (should still work correctly)
 SELECT c.name FROM categories c WHERE c.name IN (SELECT i.category FROM items i WHERE i.val > 20 AND i.category = c.name) ORDER BY c.name;
 → [{"name":"A"},{"name":"B"},{"name":"C"}]
 
@@ -53,6 +57,56 @@ WITH RECURSIVE
   )
 SELECT val FROM items WHERE id IN (SELECT id FROM tree) ORDER BY val;
 → [{"val":10},{"val":20},{"val":30}]
+
+-- IN in projection position (not a WHERE filter): same emitter / set-probe path,
+-- must yield the three-valued boolean per row. id 4 (category 'C') is not in the
+-- filtered set {'A','B'}, and the subquery has no NULLs, so → false (0).
+SELECT id, category IN (SELECT name FROM categories WHERE name <> 'C') AS in_ab FROM items ORDER BY id;
+→ [{"id":1,"in_ab":true},{"id":2,"in_ab":true},{"id":3,"in_ab":true},{"id":4,"in_ab":false},{"id":5,"in_ab":true}]
+
+-- NOCASE collation: membership uses the condition column's collation. The set
+-- probe keys the lookup set under the same collation as the streaming path, so
+-- 'Apple' matches 'apple' and 'BANANA' matches 'banana'.
+CREATE TABLE nc (id INTEGER PRIMARY KEY, tag TEXT COLLATE NOCASE);
+INSERT INTO nc VALUES (1, 'Apple'), (2, 'BANANA'), (3, 'cherry');
+CREATE TABLE nc_want (w TEXT);
+INSERT INTO nc_want VALUES ('apple'), ('banana');
+
+SELECT id FROM nc WHERE tag IN (SELECT w FROM nc_want) ORDER BY id;
+→ [{"id":1},{"id":2}]
+
+DROP TABLE nc_want;
+DROP TABLE nc;
+
+-- Self-referencing DELETE: the subquery reads the same table being deleted from.
+-- Materialize-once makes this a deterministic pre-statement snapshot — the set of
+-- ids to delete is computed before any row is removed.
+CREATE TABLE sref (id INTEGER PRIMARY KEY, keep INTEGER);
+INSERT INTO sref VALUES (1, 1), (2, 0), (3, 1), (4, 0);
+
+DELETE FROM sref WHERE id IN (SELECT id FROM sref WHERE keep = 0);
+SELECT id FROM sref ORDER BY id;
+→ [{"id":1},{"id":3}]
+
+DROP TABLE sref;
+
+-- UPDATE / DELETE row counts filtered by an uncorrelated IN subquery over a
+-- larger set (exercises the set probe on many candidate rows).
+CREATE TABLE dml_outer (id INTEGER PRIMARY KEY, mark INTEGER);
+INSERT INTO dml_outer VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0);
+CREATE TABLE dml_keep (id INTEGER PRIMARY KEY);
+INSERT INTO dml_keep VALUES (2), (4), (6);
+
+UPDATE dml_outer SET mark = 1 WHERE id IN (SELECT id FROM dml_keep);
+SELECT id, mark FROM dml_outer ORDER BY id;
+→ [{"id":1,"mark":0},{"id":2,"mark":1},{"id":3,"mark":0},{"id":4,"mark":1},{"id":5,"mark":0},{"id":6,"mark":1}]
+
+DELETE FROM dml_outer WHERE id IN (SELECT id FROM dml_keep);
+SELECT id, mark FROM dml_outer ORDER BY id;
+→ [{"id":1,"mark":0},{"id":3,"mark":0},{"id":5,"mark":0}]
+
+DROP TABLE dml_keep;
+DROP TABLE dml_outer;
 
 -- Cleanup
 DROP TABLE nullable_ids;

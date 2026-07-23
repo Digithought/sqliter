@@ -5,21 +5,20 @@ import { CountingMemoryModule } from './_counting-memory-module.js';
 import type { OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
 
 /**
- * Runtime execution-count checks for the uncorrelated IN-subquery cache.
+ * Runtime execution-count checks for the uncorrelated IN-subquery set probe.
  *
- * `ruleInSubqueryCache` wraps an uncorrelated `x IN (subquery)` source in an
- * EAGER CacheNode so the subquery runs once and later outer rows replay from the
- * buffer. Before the eager fix, `emitIn` returned on the first matching row,
- * which aborted the streaming cache build mid-drain so `cachedResult` was never
- * committed — every outer row re-opened the subquery source from scratch. When
- * every outer row matches (the worst case), that was one source scan per outer
- * row. Eager mode drains + commits the buffer before yielding, so the first-match
- * short-circuit can no longer defeat the cache.
+ * `emitIn` materializes an uncorrelated, functional `x IN (subquery)` source into
+ * a lookup set exactly once per statement execution and probes it per outer row
+ * (`src/runtime/emit/subquery.ts`, `runSetProbe`). This replaced the earlier
+ * eager-CacheNode mechanism, whose threshold could abandon the cache and re-drive
+ * the subquery per outer row (see quereus-in-subquery-set-probe). The guarantee
+ * these tests pin: the source is scanned exactly once per execution, independent
+ * of outer cardinality and of any cache-threshold tuning.
  *
  * These tests assert on `scanCounts.get('counting')` — the number of `query()`
  * opens on the subquery source table.
  */
-describe('IN-subquery cache: scan count', () => {
+describe('IN-subquery set probe: scan count', () => {
 	let db: Database;
 	let module: CountingMemoryModule;
 
@@ -46,9 +45,10 @@ describe('IN-subquery cache: scan count', () => {
 	}
 
 	it('scans the subquery source exactly once when every outer row matches', async () => {
-		// Every probe.x ∈ {1,2,3} matches counting {1,2,3}, so IN short-circuits
-		// on the first match for every outer row — the exact case that defeated the
-		// streaming cache before the eager fix.
+		// Every probe.x ∈ {1,2,3} matches counting {1,2,3} — the match-heavy case
+		// that defeated the old streaming cache (IN short-circuited on first match
+		// before the cache committed). The set probe builds once and answers every
+		// outer row from the set.
 		await db.exec("INSERT INTO probe VALUES (1, 1), (2, 2), (3, 3)");
 
 		module.scanCounts.clear();
@@ -57,14 +57,14 @@ describe('IN-subquery cache: scan count', () => {
 		);
 		expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }, { id: 3 }]);
 		expect(module.scanCounts.get('counting'),
-			'eager cache must build once and replay; a match-heavy outer relation must not re-scan the source'
+			'the set builds once and answers every outer row; a match-heavy outer relation must not re-scan the source'
 		).to.equal(1);
 	});
 
 	it('still scans once when a leading NULL-condition outer row precedes matches', async () => {
 		// A NULL IN-expression makes emitIn return NULL WITHOUT iterating the source,
-		// so that eval drives no scan; the cache builds lazily on the first eval that
-		// actually iterates. Total scans stay 1 regardless of row order.
+		// so that eval drives no scan; the set builds lazily on the first eval that
+		// actually needs it. Total scans stay 1 regardless of row order.
 		await db.exec("INSERT INTO probe VALUES (1, NULL), (2, 2), (3, 3)");
 
 		module.scanCounts.clear();
@@ -74,16 +74,16 @@ describe('IN-subquery cache: scan count', () => {
 		// The NULL row yields NULL (excluded by WHERE); the two matches survive.
 		expect(rows).to.deep.equal([{ id: 2 }, { id: 3 }]);
 		expect(module.scanCounts.get('counting'),
-			'a null-condition leading row drives no scan; the cache still builds exactly once'
+			'a null-condition leading row drives no scan; the set still builds exactly once'
 		).to.equal(1);
 	});
 
-	it('re-scans per outer row when the source exceeds the cache threshold', async () => {
-		// Force the CacheNode threshold below the source size: eager buffers up to
-		// the threshold, then abandons and streams the remainder through. An
-		// abandoned cache streams fresh on every subsequent eval, so the scan count
-		// intentionally rises to N (one per outer row). This documents that the
-		// memory bound — not caching — wins past the threshold.
+	it('scans once regardless of the (now-irrelevant) cache threshold', async () => {
+		// Regression for the O(N×K) cliff: the old eager CacheNode abandoned its
+		// buffer once the source exceeded `cte.maxCacheThreshold`, then re-drove the
+		// subquery per outer row (one scan per outer row). The set probe has no size
+		// threshold, so forcing the tuning knob low must NOT reintroduce re-scans —
+		// the source is still drained exactly once.
 		const base = db.optimizer.tuning;
 		db.optimizer.updateTuning({
 			...base,
@@ -97,10 +97,9 @@ describe('IN-subquery cache: scan count', () => {
 			'select id from probe where x in (select k from counting) order by id'
 		);
 		expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }, { id: 3 }]);
-		// counting has 3 rows > threshold 2 → cache abandoned → one scan per outer row.
 		expect(module.scanCounts.get('counting'),
-			'over-threshold source is not cached; each of the 3 outer rows re-scans'
-		).to.equal(3);
+			'the set probe has no threshold; a small maxCacheThreshold must not cause per-row re-scans'
+		).to.equal(1);
 	});
 
 	it('re-materializes per execution of a prepared statement (once each run, never zero)', async () => {
@@ -115,13 +114,13 @@ describe('IN-subquery cache: scan count', () => {
 			expect(run1).to.have.lengthOf(3);
 			expect(module.scanCounts.get('counting'), 'first execution scans once').to.equal(1);
 
-			// A fresh RuntimeContext per execution means a fresh eager build — not a
+			// A fresh RuntimeContext per execution means a fresh set build — not a
 			// stale replay of run 1, and not zero scans.
 			module.scanCounts.clear();
 			const run2: Record<string, unknown>[] = [];
 			for await (const row of stmt.all()) run2.push(row);
 			expect(run2).to.have.lengthOf(3);
-			expect(module.scanCounts.get('counting'), 'second execution re-builds the cache once').to.equal(1);
+			expect(module.scanCounts.get('counting'), 'second execution re-builds the set once').to.equal(1);
 		} finally {
 			await stmt.finalize();
 		}

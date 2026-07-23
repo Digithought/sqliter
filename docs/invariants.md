@@ -54,7 +54,7 @@ self-guarding: `validateSideEffectMode` raises `QuereusError(INTERNAL)` at regis
 A rule that moves, duplicates, drops, or merges a subtree it has not separately proven pure
 declares `'aware'` and consults a purity signal, refusing or weakening when a participating
 subtree carries a write. Usually that signal is `PlanNodeCharacteristics.hasSideEffects` /
-`subtreeHasSideEffects`; `in-subquery-cache` instead refuses on `isFunctional`
+`subtreeHasSideEffects`; `scalar-subquery-cache` instead refuses on `isFunctional`
 (`physical.readonly` **and** deterministic), which is strictly stronger. `'safe'` is the
 counter-claim that the transform's structural shape preserves side effects by itself. One
 `'aware'` rule, `cte-optimization`, consults nothing: it wraps the subtree in a run-once

@@ -8,6 +8,7 @@ import type { VirtualTable } from "../vtab/table.js";
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { RowContextMap } from './context-helpers.js';
 import type { CacheState } from './cache/shared-cache.js';
+import type { BTree } from 'inheritree';
 
 // Re-export types from common/types.js for convenience
 export type { OutputValue };
@@ -109,6 +110,20 @@ export type RuntimeContext = {
 	 *   descriptor — not the plan id — is what the copies agree on.
 	 */
 	cteMaterializations?: Map<string | TableDescriptor, Promise<Row[]>>;
+	/**
+	 * Per-execution materialized lookup sets for uncorrelated, functional
+	 * `x IN (subquery)` probes ({@link import('./emit/subquery.js').emitIn}), keyed
+	 * by a stable symbol minted in the emitter closure. The subquery source is
+	 * drained exactly once per statement execution into a `BTree` keyed under the
+	 * membership collation, then probed per outer row — O(K + N·log K) with zero
+	 * statistics, replacing the retired row-cache-plus-linear-scan mechanism. A
+	 * fresh RuntimeContext per execution resets the map between prepared-statement
+	 * runs, so a re-executed statement re-drains and observes current data.
+	 * `hasNull` records whether the inner produced any NULL — needed for
+	 * three-valued membership (a miss yields NULL when the inner had a NULL, else
+	 * false). Mirrors {@link executionMemo} / {@link cacheStates}.
+	 */
+	inSetProbes?: Map<symbol, { tree: BTree<SqlValue, SqlValue>; hasNull: boolean }>;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;

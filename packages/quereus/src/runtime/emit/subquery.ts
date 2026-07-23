@@ -11,6 +11,7 @@ import { compareSqlValuesFast } from '../../util/comparison.js';
 import { ConstantNode } from '../../planner/nodes/plan-node.js';
 import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
 import { effectiveInCollation } from '../../planner/analysis/comparison-collation.js';
+import { isCorrelatedSubquery } from '../../planner/cache/correlation-detector.js';
 
 /**
  * Once-per-execution memo for impure (DML-bearing) subquery inners. The cell
@@ -157,7 +158,80 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			};
 		}
 
-		// Pure subquery: streaming + early exit on match.
+		// Uncorrelated + functional (deterministic, read-only) source: materialize
+		// the subquery result once per execution into a lookup set and probe it per
+		// outer row — O(K + N·log K). This replaces re-driving the subquery for every
+		// candidate row, the O(N×K) cliff that a per-row streaming scan degrades to at
+		// scale (see quereus-in-subquery-set-probe). The gate matches the retired
+		// `rule-in-subquery-cache`: a correlated source must re-evaluate per outer row,
+		// and a non-deterministic source must keep its per-row semantics — both route
+		// to the streaming path below. Parameter references inside the subquery are NOT
+		// correlation (they are ParameterReference, not ColumnReference), so a
+		// parameterized-but-uncorrelated subquery takes this path and rebuilds per
+		// execution as the bound value changes.
+		if (!isCorrelatedSubquery(plan.source) && PlanNodeCharacteristics.isFunctional(plan.source)) {
+			// Per-execution memo: the set lives on the RuntimeContext (rebuilt each
+			// execution), keyed by a symbol minted here at emit time. The emit-time
+			// closure persists across prepared-statement runs but holds only the
+			// symbol — never the tree — so the set resets between executions and a
+			// re-run re-drains the source with current data. Same rule as the
+			// impure-IN memo and emitCache.
+			const probeKey = Symbol('IN(set-probe)');
+
+			// NOTE: the set holds deduplicated scalar values — strictly less memory
+			// than the row cache it replaces, and the literal `IN (a, b, …)` path is
+			// already uncapped, so no size cap here. If enormous inner results ever
+			// need bounding, add a threshold that spills to the streaming path.
+			async function runSetProbe(rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
+				// Condition NULL → NULL, and do NOT force the build (short-circuit).
+				if (condition === null) {
+					return null;
+				}
+
+				let probe = rctx.inSetProbes?.get(probeKey);
+				if (!probe) {
+					// First evaluation that needs the set: drain the source once into a
+					// BTree keyed under the membership collation, tracking inner NULLs.
+					const tree = new BTree<SqlValue, SqlValue>(
+						(val: SqlValue) => val,
+						(a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation)
+					);
+					let hasNull = false;
+					for await (const row of input) {
+						if (row.length > 0) {
+							const rowValue = row[0];
+							if (rowValue === null) {
+								hasNull = true;
+							} else {
+								// Duplicate keys are a no-op insert — the set only tracks membership.
+								tree.insert(rowValue);
+							}
+						}
+					}
+					probe = { tree, hasNull };
+					(rctx.inSetProbes ??= new Map()).set(probeKey, probe);
+				}
+
+				// Three-valued membership, identical to the streaming and value-list paths:
+				// hit → true; miss → NULL if the inner had a NULL, else false.
+				if (probe.tree.find(condition).on) {
+					return true;
+				}
+				return probe.hasNull ? null : false;
+			}
+
+			const sourceInstruction = emitPlanNode(plan.source, ctx);
+			const conditionExpr = emitPlanNode(plan.condition, ctx);
+
+			return {
+				params: [sourceInstruction, conditionExpr],
+				run: asRun(runSetProbe),
+				note: 'IN (subquery set-probe)'
+			};
+		}
+
+		// Correlated or non-deterministic source: streaming + early exit on match,
+		// re-evaluated per outer row.
 		async function runSubqueryStreaming(_rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
 			// If condition is NULL, result is NULL
 			if (condition === null) {

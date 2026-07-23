@@ -228,23 +228,19 @@ describe('Prepared statement setup amortization', () => {
 		}
 	});
 
-	// Guards the CacheNode counterpart of the executionMemo regression above: the
-	// uncorrelated `IN (subquery)` rule injects a CacheNode so the subquery's rows
-	// materialize once per execution instead of once per outer row. That materialized
-	// row state used to live in the emit-time closure (createCacheState() called at
-	// emit time), which persists across executions once the instruction tree is
-	// cached — so a re-executed statement replayed run 1's cached rows even after the
-	// source table changed. The fix moves the cache state onto the per-execution
-	// RuntimeContext, keyed by a stable per-emit-site symbol.
-	it('re-drives an uncorrelated IN-subquery cache with fresh data on every execution of a prepared statement', async () => {
+	// Guards the per-execution reset of the uncorrelated `IN (subquery)` set probe:
+	// `emitIn` materializes the subquery result once per execution into a lookup set
+	// (`runSetProbe`, keyed by a stable per-emit-site symbol on the RuntimeContext)
+	// instead of re-driving the subquery per outer row. Because the set lives on the
+	// RuntimeContext — rebuilt each execution — a re-executed statement re-drains the
+	// source and observes current data rather than replaying run 1's set, even though
+	// the instruction tree (and the emitter closure that mints the key) is cached.
+	it('re-drives an uncorrelated IN-subquery set probe with fresh data on every execution of a prepared statement', async () => {
 		await db.exec('create table t1 (a integer primary key);');
 		await db.exec('insert into t1 values (1), (2), (3);');
 		await db.exec('create table t2 (b integer primary key);');
 		await db.exec('insert into t2 values (2);');
 
-		// Outer row a=1 has no match, forcing a full drain of the IN subquery so the
-		// cache actually completes (shared-cache.ts only saves on full iteration) —
-		// keep this property so the regression exercises the completed-cache path.
 		const stmt = db.prepare('select a from t1 where a in (select b from t2) order by a');
 		try {
 			const run1 = await collectRows(stmt.all());
@@ -259,6 +255,34 @@ describe('Prepared statement setup amortization', () => {
 			// Same cached scheduler reused — the fix works with a cached instruction
 			// tree, not by accidentally forcing a recompile.
 			void expect(internals(stmt).scheduler).to.equal(schedulerAfterRun1, 'scheduler reused across executions');
+		} finally {
+			await stmt.finalize();
+		}
+	});
+
+	// A parameter reference inside the IN subquery is NOT correlation (it is a
+	// ParameterReference, not a ColumnReference to an outer attribute), so the
+	// subquery still routes through the once-per-execution set probe. Binding a
+	// different value across two executions of one prepared statement must produce a
+	// different set — proving both that the parameter does not defeat the set-probe
+	// gate and that the set rebuilds per execution rather than replaying run 1.
+	it('rebuilds an uncorrelated but parameterized IN-subquery set per execution', async () => {
+		await db.exec('create table src (id integer primary key, grp integer);');
+		await db.exec('insert into src values (1, 10), (2, 10), (3, 20), (4, 20);');
+		await db.exec('create table probe_t (id integer primary key);');
+		await db.exec('insert into probe_t values (1), (2), (3), (4);');
+
+		const stmt = db.prepare('select id from probe_t where id in (select id from src where grp = ?) order by id');
+		try {
+			stmt.bindAll([10]);
+			const run1 = await collectRows(stmt.all());
+			void expect(run1).to.deep.equal([{ id: 1 }, { id: 2 }]);
+
+			stmt.bindAll([20]);
+			const run2 = await collectRows(stmt.all());
+			// The second execution must re-drain the subquery with grp=20, not replay
+			// run 1's grp=10 set.
+			void expect(run2).to.deep.equal([{ id: 3 }, { id: 4 }]);
 		} finally {
 			await stmt.finalize();
 		}

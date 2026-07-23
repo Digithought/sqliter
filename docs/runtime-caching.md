@@ -50,9 +50,12 @@ registers a `VirtualTableConnection`, so this is independent of the
 
 `emitCache` (`src/runtime/emit/cache.ts`) materializes its source's rows on
 first iteration and replays them on later re-iterations within the same
-execution — used for uncorrelated `IN (subquery)` (`rule-in-subquery-cache`),
-CTE materialization (`rule-cte-optimization`), and mutating-subquery caching
-(`rule-mutating-subquery-cache`). The materialized `CacheState` (from
+execution — used for CTE materialization (`rule-cte-optimization`),
+mutating-subquery caching (`rule-mutating-subquery-cache`), uncorrelated scalar
+subqueries (`rule-scalar-subquery-cache`), and the nested-loop right side
+(`rule-nested-loop-right-cache`). Uncorrelated `IN (subquery)` no longer uses a
+row cache — `emitIn` materializes a probed value set directly (see § IN-subquery
+set probe below). The materialized `CacheState` (from
 `src/runtime/cache/shared-cache.ts`) lives on the per-execution
 `RuntimeContext` (`ctx.cacheStates`, a `Map<symbol, CacheState>`), keyed by a
 symbol minted in the `emitCache` closure — the same pattern as
@@ -65,20 +68,38 @@ source and observes current data instead of replaying the first run's rows.
 
 **Eager vs. streaming-first build.** `streamWithCache` has two build modes,
 selected by `CacheNode.eager`. The default *streaming-first* mode yields each
-source row as it arrives and only commits `cachedResult` after the source
-drains to completion — great first-row latency, but a consumer that
-short-circuits (breaks on an early row) aborts the generator before the drain
-finishes, so the buffer is never committed and the next evaluation re-opens the
-source. That defeats caching for `IN (subquery)`, whose `emitIn` returns on the
-first matching row (`src/runtime/emit/subquery.ts`): while outer rows keep
-matching early, the source is re-opened per outer row. So `rule-in-subquery-cache`
-sets `eager: true`, which drains the source fully and commits the buffer
-**before** yielding any row — the first-match short-circuit can no longer abort
-the build, and every later outer row replays from cache (source opened once). If
-the eager drain exceeds the cache threshold it abandons and streams the
-remainder through (memory bound wins; later evals stream fresh). CTE,
-nested-loop-right, and mutating-subquery caches keep `eager` defaulted `false`
-for their first-row latency.
+source row as it arrives and only commits `cachedResult` after the source drains
+to completion — great first-row latency, but a consumer that short-circuits
+(breaks on an early row) aborts the generator before the drain finishes, so the
+buffer is never committed and the next evaluation re-opens the source. The
+*eager* mode drains the source fully and commits the buffer **before** yielding
+any row, so a first-match short-circuit can't abort the build; if the eager drain
+exceeds the cache threshold it abandons and streams the remainder through.
+
+> **NOTE:** eager mode currently has **no caller** — the only rule that set
+> `eager: true` was `rule-in-subquery-cache`, retired in favor of the emit-level
+> IN-subquery set probe (below). CTE, nested-loop-right, mutating-subquery, and
+> scalar-subquery caches all use streaming-first (`eager` defaulted `false`). The
+> capability is kept for a future short-circuiting cache consumer; if none
+> materializes, it is dead code that could be removed.
+
+## IN-subquery set probe
+
+An uncorrelated, functional `x IN (subquery)` is **not** row-cached. `emitIn`
+(`src/runtime/emit/subquery.ts`, `runSetProbe`) drains the subquery source
+exactly once per statement execution into a `BTree` keyed under the membership
+collation, tracking whether the inner produced any NULL, then probes that set per
+outer row: hit → `true`; miss → `NULL` if the inner had a NULL else `false`;
+condition NULL → `NULL` (without forcing the build). This is O(K + N·log K) with
+**zero statistics** — it replaced the retired eager-CacheNode mechanism, whose
+threshold could abandon the buffer and re-drive the subquery per outer row
+(O(N×K); see quereus-in-subquery-set-probe). The probe set lives on the
+per-execution `RuntimeContext` (`ctx.inSetProbes`, `Map<symbol, {tree, hasNull}>`)
+keyed by a symbol minted in the `emitIn` closure — same reset-per-execution
+pattern as `cacheStates` / `executionMemo`, so a re-run re-drains with current
+data. The gate (uncorrelated + functional) matches the retired rule: correlated
+sources must re-evaluate per outer row, and non-deterministic sources keep their
+per-row semantics — both route to the streaming (early-exit) path instead.
 
 ## Shared CTE materialization (multi-reference CTEs)
 

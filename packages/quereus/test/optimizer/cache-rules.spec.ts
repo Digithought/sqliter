@@ -161,6 +161,15 @@ describe('Cache rules', () => {
 			]);
 		});
 
+		it('uncorrelated IN subquery no longer produces a CACHE node', async () => {
+			// The retired `rule-in-subquery-cache` used to wrap the source in a CACHE.
+			// `emitIn` now materializes the result once per execution into a probed
+			// lookup set (quereus-in-subquery-set-probe), so no CacheNode is injected.
+			const sql = "SELECT id FROM t WHERE category IN (SELECT name FROM cats)";
+			const ops = await queryPlanOps(sql);
+			expect(ops).not.to.include('CACHE');
+		});
+
 		it('uncorrelated IN subquery with filtering returns correct results', async () => {
 			const sql = "SELECT id FROM t WHERE category IN (SELECT name FROM cats WHERE name = 'A') ORDER BY id";
 			const rows = await allRows<{ id: number }>(sql);

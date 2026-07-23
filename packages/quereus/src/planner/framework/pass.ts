@@ -138,9 +138,9 @@ function createConstantFoldingPass(): OptimizationPass {
  * (O(anchors) graph builds per optimize, now 1).
  *
  * Placement (order 35) is between PostOptimization (30) and Validation (40) so
- * the advisory runs AFTER the CacheNodes injected by `cte-optimization` /
- * `in-subquery-cache` are already in place — it skips `nodeType === Cache`, so
- * running last avoids double-wrapping.
+ * the advisory runs AFTER the CacheNodes injected by `cte-optimization` are
+ * already in place — it skips `nodeType === Cache`, so running last avoids
+ * double-wrapping.
  *
  * Side-effect soundness (a custom `execute` bypasses `sideEffectMode`
  * validation, so the reasoning lives here rather than in a RuleHandle field):

@@ -523,5 +523,62 @@ describe('Performance sentinels', function () {
 			}
 		});
 	});
+
+	// ----------------------------- Uncorrelated IN-subquery set probe (O(K + N·log K))
+	// Regression sentinel for quereus-in-subquery-set-probe. A DELETE/SELECT filtered
+	// by `col IN (SELECT ...)` must materialize the subquery once into a lookup set and
+	// probe it per outer row, NOT re-drive the subquery per candidate row. The old path
+	// degraded to O(N×K) once the inner result crossed the cache threshold (reporter saw
+	// 22 s at outer=4000 / inner=2000). Here outer≈10000 / inner≈5000 (2500 in-set):
+	// quadratic would take many seconds; the set probe is well under the generous bound.
+	describe('IN-subquery set probe', function () {
+		this.timeout(30_000);
+
+		let db: Database;
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table in_inner (id integer primary key, entity text)');
+			await db.exec('create table in_outer (id integer primary key, txn_id integer)');
+			const BATCH = 500;
+			// 5000 inner rows; half carry entity 'e1' (the in-set half → 2500 keys).
+			for (let i = 0; i < 5000; i += BATCH) {
+				const rows = Array.from({ length: BATCH }, (_, j) => {
+					const id = i + j + 1;
+					return `(${id}, '${id % 2 === 0 ? 'e1' : 'e2'}')`;
+				}).join(', ');
+				await db.exec(`insert into in_inner values ${rows}`);
+			}
+			// 10000 outer rows referencing inner ids (cycled), so ~half match the set.
+			for (let i = 0; i < 10000; i += BATCH) {
+				const rows = Array.from({ length: BATCH }, (_, j) => {
+					const id = i + j + 1;
+					return `(${id}, ${(id % 5000) + 1})`;
+				}).join(', ');
+				await db.exec(`insert into in_outer values ${rows}`);
+			}
+		});
+
+		afterEach(async () => {
+			await db.close();
+		});
+
+		it('SELECT ... WHERE col IN (subquery) over 10k×5k under 3 s', async () => {
+			const elapsed = await timeMs(async () => {
+				const rows = await collect(db.eval(
+					"select count(*) as c from in_outer where txn_id in (select id from in_inner where entity = 'e1')"
+				));
+				expect(rows).to.have.length(1);
+			});
+			expect(elapsed).to.be.below(3000, `IN-subquery select took ${elapsed.toFixed(1)} ms`);
+		});
+
+		it('DELETE ... WHERE col IN (subquery) over 10k×5k under 3 s', async () => {
+			const elapsed = await timeMs(async () => {
+				await db.exec("delete from in_outer where txn_id in (select id from in_inner where entity = 'e1')");
+			});
+			expect(elapsed).to.be.below(3000, `IN-subquery delete took ${elapsed.toFixed(1)} ms`);
+		});
+	});
 });
 

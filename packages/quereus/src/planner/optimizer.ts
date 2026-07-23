@@ -55,7 +55,6 @@ import { ruleMonotonicWindow } from './rules/window/rule-monotonic-window.js';
 import { ruleCteOptimization } from './rules/cache/rule-cte-optimization.js';
 import { ruleMutatingSubqueryCache } from './rules/cache/rule-mutating-subquery-cache.js';
 import { ruleNestedLoopRightCache } from './rules/cache/rule-nested-loop-right-cache.js';
-import { ruleInSubqueryCache } from './rules/cache/rule-in-subquery-cache.js';
 import { ruleScalarSubqueryCache } from './rules/cache/rule-scalar-subquery-cache.js';
 import { ruleSubqueryDecorrelation, ruleExistsInSelectDecorrelation } from './rules/subquery/rule-subquery-decorrelation.js';
 import { ruleScalarAggDecorrelation, ruleScalarAggDecorrelationAggregate, ruleScalarAggDecorrelationFilter, ruleScalarAggDecorrelationSort } from './rules/subquery/rule-scalar-agg-decorrelation.js';
@@ -1088,16 +1087,10 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		sideEffectMode: 'aware',
 	},
 
-	// IN-subquery caching: wrap uncorrelated IN subquery sources in CacheNode.
-	{
-		pass: PassId.PostOptimization,
-		id: 'in-subquery-cache',
-		nodeType: PlanNodeType.In,
-		phase: 'rewrite',
-		fn: ruleInSubqueryCache,
-		// Already gates on `isFunctional(source)` (deterministic + read-only).
-		sideEffectMode: 'aware',
-	},
+	// NOTE: uncorrelated `IN (subquery)` is no longer wrapped in a CacheNode here.
+	// `emitIn` materializes the result once per execution into a probed lookup set
+	// (O(K + N·log K), zero stats) — a row cache would just double-buffer it. See
+	// `runtime/emit/subquery.ts` and quereus-in-subquery-set-probe.
 
 	// Scalar-subquery caching: wrap uncorrelated scalar subquery inners in CacheNode.
 	{
@@ -1113,7 +1106,7 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// NOTE: The materialization advisory no longer registers per-node-type rules.
 	// It runs once over the whole plan as a dedicated custom-execute pass
 	// (`PassId.Materialization`, order 35 — after PostOptimization so it observes
-	// the CacheNodes injected by `cte-optimization` / `in-subquery-cache`). See
+	// the CacheNodes injected by `cte-optimization`). See
 	// `createMaterializationPass` in framework/pass.ts for the single-walk rationale
 	// and the side-effect-soundness argument.
 ];

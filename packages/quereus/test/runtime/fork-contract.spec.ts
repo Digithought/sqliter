@@ -66,6 +66,11 @@ const EXPECTED_FORK_POLICY = {
 	// re-driving the source. Mutation across branches is the emitCTE contract's
 	// responsibility.
 	cteMaterializations: 'shared-cooperative',
+	// Once-per-execution uncorrelated IN-subquery lookup-set map: shared by reference
+	// so a set materialized in one branch is visible to a sibling branch re-driving
+	// the same IN site within the same execution. Mutation across branches is the
+	// emitIn set-probe contract's responsibility.
+	inSetProbes: 'shared-cooperative',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
 
 /**
@@ -200,6 +205,7 @@ describe('Fork contract (test harness)', () => {
 			parent.scanConnections = new Map();
 			parent.cacheStates = new Map();
 			parent.cteMaterializations = new Map();
+			parent.inSetProbes = new Map();
 
 			const [fork] = driver.fork(parent, 1);
 
