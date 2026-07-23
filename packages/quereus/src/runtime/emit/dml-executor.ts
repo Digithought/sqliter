@@ -18,7 +18,8 @@ import { validateAndParse } from '../../types/validation.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
-import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
+import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation, createParentRestrictBatch, accumulateParentRestrictKeys, flushParentRestrictBatch, type ParentRestrictBatch } from '../foreign-key-actions.js';
+import { getBatchableRestrictFks } from '../../planner/building/foreign-key-builder.js';
 import type { BackingConnectionCache, ResidualKeyBatch } from '../../core/database-materialized-views.js';
 import { poisonResidualDeltaAccumulations } from '../../core/database-materialized-views-apply.js';
 import type { BackingRowChange } from '../../vtab/backing-host.js';
@@ -564,6 +565,11 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		deferredRebuilds: Set<string>,
 		residualBatch: ResidualKeyBatch,
 		backingConnCache: BackingConnectionCache,
+		// Set only when the statement uses batched parent-side RESTRICT
+		// enforcement (see getBatchableRestrictFks): flushes the accumulated
+		// key batch at the end-of-statement boundary. The gate excludes FAIL,
+		// so a non-null flush always runs under the statement savepoint.
+		flushFkBatch?: () => Promise<void>,
 	): AsyncIterable<Row> {
 		let failSavepointCounter = 0;
 
@@ -635,7 +641,15 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 						yield rowToYield;
 					}
 				}
-				// End-of-statement boundary: drain the deferred maintenance (residual key
+				// End-of-statement boundary. First the batched parent-side RESTRICT
+				// probe (fail fast — skip wasted MV work on a violation), then the
+				// deferred maintenance; both BEFORE the statement savepoint releases
+				// so a failure rolls the whole statement back. Inside the try, so an
+				// error routes to the rollback branch below.
+				if (flushFkBatch) {
+					await flushFkBatch();
+				}
+				// Drain the deferred maintenance (residual key
 				// batch + full-rebuild set) NOW — after every source row has been applied
 				// (so each recompute/rebuild reads all this statement's writes) and BEFORE
 				// the statement savepoint releases (so a failed flush rolls the whole
@@ -933,6 +947,17 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const residualBatch: ResidualKeyBatch = new Map();
 
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
+
+		// Batched parent-side RESTRICT enforcement (per-execution state, never on
+		// the emit closure — a re-run prepared statement must start empty). When
+		// the gate admits the statement, the per-row transitive pre-walk is
+		// replaced by key accumulation + one chunked probe per FK at the
+		// end-of-statement boundary. The plan side made the same gate decision
+		// and skipped the per-row NOT EXISTS checks.
+		const batchableFks = getBatchableRestrictFks(
+			ctx.db.schemaManager, tableSchema, 'update', plan.onConflict, plan.lensRouted);
+		const fkRestrictBatch = batchableFks ? createParentRestrictBatch(batchableFks) : undefined;
+
 		// Physical Halloween avoidance: unless the target module guarantees per-scan
 		// snapshot isolation, fully drain the source match set (closing the scan
 		// cursor) BEFORE applying any write — otherwise the first UPDATE invalidates
@@ -944,8 +969,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const sourceRows = await resolveDmlSourceRows(ctx, vtab, tableSchema, rows);
 		yield* runWithStatementSavepoints(
 			ctx, vtab, sourceRows, isFailMode,
-			(flatRow) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds, residualBatch),
+			(flatRow) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
 			deferredRebuilds, residualBatch, backingConnCache,
+			fkRestrictBatch ? () => flushParentRestrictBatch(ctx.db, tableSchema, 'update', fkRestrictBatch) : undefined,
 		);
 	}
 
@@ -966,6 +992,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		backingConnCache: BackingConnectionCache,
 		deferredRebuilds: Set<string>,
 		residualBatch: ResidualKeyBatch,
+		fkRestrictBatch: ParentRestrictBatch | undefined,
 	): Promise<Row | undefined> {
 		const oldRow = extractOldRowFromFlat(flatRow, tableSchema.columns.length);
 		const newRow = extractNewRowFromFlat(flatRow, tableSchema.columns.length);
@@ -985,14 +1012,22 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			mutationStatement = buildUpdateStatement(tableSchema, newRow, keyValues, contextRow);
 		}
 
-		// Defense-in-depth RESTRICT enforcement: the plan-time `NOT EXISTS`
-		// check is the primary path, but some vtab modules evaluate the
-		// embedded subquery differently from a plain row scan. Pre-walk
-		// the transitive cascade closure so RESTRICTs at any depth fire
-		// BEFORE vtab.update — needed for rowid-mode backends (lamina)
-		// where post-mutation OLD-value scans dereference through the
-		// just-mutated parent and find zero rows.
-		await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
+		// Parent-side RESTRICT enforcement. Batched statements accumulate the
+		// OLD referenced keys (probed once per FK at the end-of-statement
+		// boundary — same pre-vtab observation point per row, so a row the vtab
+		// later reports not-found contributes identically to the per-row path).
+		// Otherwise: defense-in-depth per-row pre-walk — the plan-time
+		// `NOT EXISTS` check is the primary path, but some vtab modules evaluate
+		// the embedded subquery differently from a plain row scan. Pre-walk the
+		// transitive cascade closure so RESTRICTs at any depth fire BEFORE
+		// vtab.update — needed for rowid-mode backends (lamina) where
+		// post-mutation OLD-value scans dereference through the just-mutated
+		// parent and find zero rows.
+		if (fkRestrictBatch) {
+			accumulateParentRestrictKeys(fkRestrictBatch, 'update', oldRow, newRow);
+		} else {
+			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
+		}
 
 		const args: UpdateArgs = {
 			operation: 'update',
@@ -1093,6 +1128,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const residualBatch: ResidualKeyBatch = new Map();
 
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
+
+		// Batched parent-side RESTRICT enforcement — see the matching note in
+		// runUpdate (per-execution state; one chunked probe per FK at the
+		// end-of-statement boundary when the gate admits the statement).
+		const batchableFks = getBatchableRestrictFks(
+			ctx.db.schemaManager, tableSchema, 'delete', plan.onConflict, plan.lensRouted);
+		const fkRestrictBatch = batchableFks ? createParentRestrictBatch(batchableFks) : undefined;
+
 		// Physical Halloween avoidance — see the matching note in runUpdate. Unless
 		// the target module guarantees per-scan snapshot isolation, drain the source
 		// match set (closing the scan cursor) before applying any DELETE, so the
@@ -1100,8 +1143,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const sourceRows = await resolveDmlSourceRows(ctx, vtab, tableSchema, rows);
 		yield* runWithStatementSavepoints(
 			ctx, vtab, sourceRows, isFailMode,
-			(flatRow) => processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds, residualBatch),
+			(flatRow) => processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
 			deferredRebuilds, residualBatch, backingConnCache,
+			fkRestrictBatch ? () => flushParentRestrictBatch(ctx.db, tableSchema, 'delete', fkRestrictBatch) : undefined,
 		);
 	}
 
@@ -1122,6 +1166,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		backingConnCache: BackingConnectionCache,
 		deferredRebuilds: Set<string>,
 		residualBatch: ResidualKeyBatch,
+		fkRestrictBatch: ParentRestrictBatch | undefined,
 	): Promise<Row | undefined> {
 		const oldRow = extractOldRowFromFlat(flatRow, tableSchema.columns.length);
 		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`;
@@ -1139,9 +1184,13 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			mutationStatement = buildDeleteStatement(tableSchema, keyValues, contextRow);
 		}
 
-		// Defense-in-depth RESTRICT enforcement — see comment on the UPDATE
-		// path above.
-		await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', oldRow, undefined, plan.lensRouted);
+		// Parent-side RESTRICT enforcement: batched key accumulation, or the
+		// per-row defense-in-depth pre-walk — see comment on the UPDATE path above.
+		if (fkRestrictBatch) {
+			accumulateParentRestrictKeys(fkRestrictBatch, 'delete', oldRow);
+		} else {
+			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', oldRow, undefined, plan.lensRouted);
+		}
 
 		const args: UpdateArgs = {
 			operation: 'delete',

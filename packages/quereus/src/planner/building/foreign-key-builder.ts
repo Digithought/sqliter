@@ -1,6 +1,8 @@
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from '../../schema/table.js';
 import { RowOpFlag, type RowOpMask, resolveReferencedColumns } from '../../schema/table.js';
+import type { SchemaManager } from '../../schema/manager.js';
+import { ConflictResolution } from '../../common/constants.js';
 import type { Attribute, ScalarPlanNode } from '../nodes/plan-node.js';
 import type { ConstraintCheck } from '../nodes/constraint-check-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -440,4 +442,74 @@ export function buildParentSideFKChecks(
 	}
 
 	return checks;
+}
+
+/**
+ * One inbound RESTRICT FK eligible for statement-end batched enforcement —
+ * discovery output of {@link getBatchableRestrictFks}, consumed by the runtime
+ * batch machinery (`runtime/foreign-key-actions.ts`).
+ */
+export interface BatchableRestrictFk {
+	readonly childTable: TableSchema;
+	readonly fk: ForeignKeyConstraintSchema;
+	/** Referenced-column indices into the PARENT table's row, aligned with `fk.columns`. */
+	readonly parentColIndices: number[];
+}
+
+/**
+ * Batchability gate for parent-side RESTRICT enforcement on a DELETE/UPDATE
+ * against `tableSchema`. When the statement shape is provably equivalent under
+ * statement-end checking, the per-row parent-side `NOT EXISTS` plan checks AND
+ * the per-row runtime RESTRICT pre-walk are both replaced by ONE batched probe
+ * per inbound FK at end of statement (see `flushParentRestrictBatch`). Shared
+ * by the plan builders (delete.ts / update.ts) and the runtime DML executor so
+ * the two sides cannot disagree on the route.
+ *
+ * Returns the inbound RESTRICT FKs to batch (possibly empty — nothing
+ * references this table), or `undefined` when the statement must keep the
+ * existing per-row machinery:
+ *
+ * - lens-routed write: logical FK duals / divergent-FK suppression are per-row;
+ * - statement conflict resolution other than default/ABORT/ROLLBACK: FAIL and
+ *   IGNORE have per-row keep/skip semantics a statement-end check cannot honor,
+ *   REPLACE resolves per row;
+ * - any inbound FK whose op-appropriate action is not `'restrict'`: the per-row
+ *   transitive pre-walk must interleave with cascade execution, and a cascade
+ *   could delete a RESTRICT child's rows mid-statement;
+ * - any self-referential inbound FK (child table === parent table): its check
+ *   outcome depends on which rows the same statement has already deleted.
+ *
+ * An inbound FK whose referenced-column resolution is malformed (column-count
+ * mismatch) is skipped from the batch — the per-row paths skip it identically,
+ * so it never disqualifies. The `foreign_keys` pragma is NOT part of the gate;
+ * callers check it (the plan side already gates the build, the runtime flush
+ * re-checks at execution).
+ */
+export function getBatchableRestrictFks(
+	schemaManager: SchemaManager,
+	tableSchema: TableSchema,
+	operation: 'delete' | 'update',
+	onConflict: ConflictResolution | undefined,
+	lensRouted: boolean,
+): BatchableRestrictFk[] | undefined {
+	if (lensRouted) return undefined;
+	if (onConflict !== undefined
+		&& onConflict !== ConflictResolution.ABORT
+		&& onConflict !== ConflictResolution.ROLLBACK) {
+		return undefined;
+	}
+
+	const batchable: BatchableRestrictFk[] = [];
+	for (const { childTable, fk } of schemaManager.getReferencingForeignKeys(tableSchema.schemaName, tableSchema.name)) {
+		const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
+		if (action !== 'restrict') return undefined;
+		if (childTable.schemaName.toLowerCase() === tableSchema.schemaName.toLowerCase()
+			&& childTable.name.toLowerCase() === tableSchema.name.toLowerCase()) {
+			return undefined;
+		}
+		const parentColIndices = resolveReferencedColumns(fk, tableSchema);
+		if (parentColIndices.length !== fk.columns.length) continue; // malformed — per-row skips it too
+		batchable.push({ childTable, fk, parentColIndices });
+	}
+	return batchable;
 }

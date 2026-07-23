@@ -19,7 +19,7 @@ import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
 import { buildConstraintChecks } from './constraint-builder.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
-import { buildParentSideFKChecks } from './foreign-key-builder.js';
+import { buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { buildViewMutation } from './view-mutation-builder.js';
@@ -216,8 +216,15 @@ export function buildDeleteStmt(
     additionalConstraints
   );
 
-  // Build parent-side FK constraint checks if foreign_keys pragma is enabled
-  if (ctx.db.options.getBooleanOption('foreign_keys')) {
+  // Build parent-side FK constraint checks if foreign_keys pragma is enabled.
+  // Skipped entirely when the batchability gate admits the statement — the
+  // runtime DML executor then enforces every inbound RESTRICT FK with ONE
+  // chunked probe per FK at the end-of-statement boundary instead of one
+  // correlated NOT EXISTS per row (see getBatchableRestrictFks). DELETE has no
+  // statement-level OR clause, so the effective conflict resolution is the
+  // ABORT default (matching the `undefined` onConflict on the DmlExecutorNode).
+  if (ctx.db.options.getBooleanOption('foreign_keys')
+    && getBatchableRestrictFks(ctx.schemaManager, tableReference.tableSchema, 'delete', undefined, lensRouted) === undefined) {
     const parentFKChecks = buildParentSideFKChecks(
       ctx, tableReference.tableSchema, RowOpFlag.DELETE,
       oldAttributes, newAttributes, contextAttributes

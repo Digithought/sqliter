@@ -19,7 +19,7 @@ import { expandReturningStar } from './returning-star.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
-import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-builder.js';
+import { buildChildSideFKChecks, buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { buildViewMutation } from './view-mutation-builder.js';
@@ -275,12 +275,21 @@ export function buildUpdateStmt(
       ctx, tableReference.tableSchema, RowOpFlag.UPDATE,
       oldAttributes, newAttributes, contextAttributes
     );
-    // Parent-side: check no children reference old values being changed
-    const parentFKChecks = buildParentSideFKChecks(
-      ctx, tableReference.tableSchema, RowOpFlag.UPDATE,
-      oldAttributes, newAttributes, contextAttributes
-    );
-    constraintChecks.push(...childFKChecks, ...parentFKChecks);
+    constraintChecks.push(...childFKChecks);
+    // Parent-side: check no children reference old values being changed.
+    // Skipped entirely when the batchability gate admits the statement — the
+    // runtime DML executor then enforces every inbound RESTRICT FK with ONE
+    // chunked probe per FK at the end-of-statement boundary instead of one
+    // correlated NOT EXISTS per row (see getBatchableRestrictFks). UPDATE has
+    // no statement-level OR clause, so the effective conflict resolution is the
+    // ABORT default (matching the `undefined` onConflict on the DmlExecutorNode).
+    if (getBatchableRestrictFks(ctx.schemaManager, tableReference.tableSchema, 'update', undefined, lensRouted) === undefined) {
+      const parentFKChecks = buildParentSideFKChecks(
+        ctx, tableReference.tableSchema, RowOpFlag.UPDATE,
+        oldAttributes, newAttributes, contextAttributes
+      );
+      constraintChecks.push(...parentFKChecks);
+    }
   }
 
   // Pre-build DEFAULT evaluators for NOT NULL columns (used by REPLACE substitution).

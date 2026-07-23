@@ -308,6 +308,69 @@ describe('runtime FK RESTRICT pre-check', () => {
 		await assertLensRestrictsForParentMutation(db, basisParent!, 'delete', [2, 'b']);
 	});
 
+	// --- Batched parent-side RESTRICT (statement-end probe) -----------------
+	// When every inbound FK is a non-self-ref RESTRICT under default conflict
+	// resolution, per-row enforcement (plan-time NOT EXISTS + runtime pre-walk)
+	// is replaced by one chunked probe per FK flushed at end of statement — see
+	// getBatchableRestrictFks / flushParentRestrictBatch.
+
+	it('batched path: prepared statement re-runs start with a fresh key batch', async () => {
+		await db.exec(`
+			create table rp (id integer primary key);
+			create table rc (cid integer primary key, p_id integer,
+				foreign key (p_id) references rp(id) on delete restrict);
+			insert into rp values (1), (2), (3);
+			insert into rc values (10, 2);
+		`);
+
+		const stmt = db.prepare('delete from rp where id = ?');
+		try {
+			// Run 1: unreferenced parent deletes cleanly.
+			await stmt.run([1]);
+			// Run 2: referenced parent aborts at the statement-end flush.
+			await expectThrows(() => stmt.run([2]), "violates RESTRICT from 'rc'");
+			// Run 3: the failed run's accumulated key must NOT leak into this one.
+			await stmt.run([3]);
+		} finally {
+			await stmt.finalize();
+		}
+
+		const rows: Record<string, unknown>[] = [];
+		for await (const r of db.eval('select id from rp')) rows.push(r);
+		void expect(rows).to.deep.equal([{ id: 2 }]);
+	});
+
+	it('batched path: RETURNING streams all rows before the statement-end abort (documented divergence)', async () => {
+		await db.exec(`
+			create table sp (id integer primary key);
+			create table sc (cid integer primary key, p_id integer,
+				foreign key (p_id) references sp(id) on delete restrict);
+			insert into sp values (1), (2);
+			insert into sc values (10, 2);
+		`);
+
+		// Per-row enforcement would abort before yielding the violating row's
+		// RETURNING output; the batched path yields every row and aborts at the
+		// end-of-statement flush. Final state and error class are identical —
+		// the transient RETURNING output is the one observable difference
+		// (documented in docs/runtime.md).
+		const yielded: unknown[] = [];
+		let thrown: unknown;
+		try {
+			for await (const r of db.eval('delete from sp returning id')) yielded.push(r);
+		} catch (e) {
+			thrown = e;
+		}
+		void expect(thrown, 'expected statement-end RESTRICT throw').to.exist;
+		void expect((thrown as Error).message).to.include("violates RESTRICT from 'sc'");
+		void expect(yielded.length, 'all rows stream before the abort').to.equal(2);
+
+		// Atomic: both parents survive the rollback.
+		const rows: Record<string, unknown>[] = [];
+		for await (const r of db.eval('select id from sp order by id')) rows.push(r);
+		void expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }]);
+	});
+
 	it('does not fire for CASCADE / SET NULL / SET DEFAULT — those go through the action walker', async () => {
 		await db.exec(`
 			create table p_cd (id integer primary key, code text not null unique);

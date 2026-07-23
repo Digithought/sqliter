@@ -17,8 +17,166 @@ import {
 	basisFksOverriddenByDivergentLensFk,
 	type LogicalParentFkRef,
 } from '../schema/lens-fk-discovery.js';
+import type { BatchableRestrictFk } from '../planner/building/foreign-key-builder.js';
 
 const log = createLogger('runtime:fk-actions');
+
+// ---------------------------------------------------------------------------
+// Batched parent-side RESTRICT enforcement.
+//
+// For the statement shapes the batchability gate (`getBatchableRestrictFks`,
+// planner/building/foreign-key-builder.ts) admits — non-lens-routed
+// DELETE/UPDATE under ABORT/ROLLBACK where EVERY inbound FK is a non-self-ref
+// RESTRICT — both per-row probes (the plan-time `NOT EXISTS` and the runtime
+// pre-walk) are replaced by ONE chunked probe per FK at end of statement. The
+// DML executor accumulates each affected row's OLD referenced-key tuple here
+// during the row loop and flushes before the statement savepoint releases, so
+// a violation still rolls the whole statement back exactly like a per-row
+// abort under ABORT/ROLLBACK. See docs/runtime.md § Batched RESTRICT.
+// ---------------------------------------------------------------------------
+
+/** Per-FK accumulation state for one statement execution. */
+export interface ParentRestrictBatchEntry extends BatchableRestrictFk {
+	/** Deduplicated OLD referenced-key tuples, keyed by an injective serialization. */
+	readonly keys: Map<string, SqlValue[]>;
+}
+
+export type ParentRestrictBatch = ParentRestrictBatchEntry[];
+
+/** Keys probed per child-table query — a handful of compiles per statement, not one per row. */
+const RESTRICT_BATCH_CHUNK = 500;
+
+/**
+ * Allocate the per-statement-execution accumulation state for the batchable
+ * inbound RESTRICT FKs. Must be called once per execution (never cached on the
+ * emit closure) so a re-run prepared statement starts empty.
+ */
+export function createParentRestrictBatch(fks: readonly BatchableRestrictFk[]): ParentRestrictBatch {
+	return fks.map(fk => ({ ...fk, keys: new Map<string, SqlValue[]>() }));
+}
+
+/**
+ * Injective serialization of a referenced-key tuple for dedup. Each segment is
+ * type-tagged and (for variable-length payloads) length-prefixed, so two
+ * distinct tuples can never collide — a collision would silently drop a probe.
+ */
+function serializeKeyTuple(values: SqlValue[]): string {
+	let out = '';
+	for (const v of values) {
+		if (typeof v === 'number') out += `n${v};`;
+		else if (typeof v === 'bigint') out += `i${v};`;
+		else if (typeof v === 'string') out += `s${v.length}:${v};`;
+		else if (v instanceof Uint8Array) out += `b${v.length}:${Array.from(v).join(',')};`;
+		else out += `x${String(v)};`;
+	}
+	return out;
+}
+
+/**
+ * Accumulate one mutated parent row's OLD referenced-key tuples into the batch
+ * — the batched replacement for the per-row RESTRICT probes, applying the same
+ * skip rules: MATCH SIMPLE (a tuple containing NULL is unreferenceable) and,
+ * for UPDATE, the referenced-column-change short-circuit.
+ */
+export function accumulateParentRestrictKeys(
+	batch: ParentRestrictBatch,
+	operation: 'delete' | 'update',
+	oldRow: Row,
+	newRow?: Row,
+): void {
+	for (const entry of batch) {
+		// UPDATE: only rows that actually re-key a referenced column contribute.
+		if (operation === 'update' && newRow !== undefined) {
+			let anyChanged = false;
+			for (const idx of entry.parentColIndices) {
+				if (!sqlValueIdentical(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
+					anyChanged = true;
+					break;
+				}
+			}
+			if (!anyChanged) continue;
+		}
+
+		// MATCH SIMPLE: NULL parent values cannot be referenced.
+		const values = entry.parentColIndices.map(idx => oldRow[idx]) as SqlValue[];
+		if (values.some(v => v === null || v === undefined)) continue;
+
+		const key = serializeKeyTuple(values);
+		if (!entry.keys.has(key)) entry.keys.set(key, values);
+	}
+}
+
+/**
+ * End-of-statement flush: one chunked probe per inbound RESTRICT FK over the
+ * accumulated key tuples. Fired by `runWithStatementSavepoints` after the row
+ * loop and BEFORE the deferred-maintenance flush and the statement savepoint
+ * release, so a hit throws the existing RESTRICT error shape and rolls the
+ * whole statement back. Re-checks the `foreign_keys` pragma and the
+ * trust-the-origin suppression at flush time, mirroring the per-row pre-check.
+ *
+ * The probe selects the FK columns (not `select 1`) so the violating key stays
+ * available for a future richer message; the message itself is unchanged and
+ * matcher-compatible (`/constraint|foreign|fk/i`). Comparison rides plain SQL
+ * `=` / `IN` against the child column — identical collation semantics to the
+ * per-row `NOT EXISTS` by construction.
+ */
+export async function flushParentRestrictBatch(
+	db: Database,
+	parentTable: TableSchema,
+	operation: 'delete' | 'update',
+	batch: ParentRestrictBatch,
+): Promise<void> {
+	if (db._isFkRestrictSuppressed()) return;
+	if (!db.options.getBooleanOption('foreign_keys')) return;
+
+	for (const entry of batch) {
+		if (entry.keys.size === 0) continue;
+		const { childTable, fk } = entry;
+		const childColQuoted = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
+		const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
+			? `${quoteIdentifier(childTable.schemaName)}.`
+			: '';
+		const from = `${schemaPrefix}${quoteIdentifier(childTable.name)}`;
+
+		const tuples = [...entry.keys.values()];
+		for (let i = 0; i < tuples.length; i += RESTRICT_BATCH_CHUNK) {
+			const chunk = tuples.slice(i, i + RESTRICT_BATCH_CHUNK);
+			let whereClause: string;
+			let params: SqlValue[];
+			if (childColQuoted.length === 1) {
+				whereClause = `${childColQuoted[0]} in (${chunk.map(() => '?').join(', ')})`;
+				params = chunk.map(t => t[0]);
+			} else {
+				whereClause = chunk
+					.map(() => `(${childColQuoted.map(c => `${c} = ?`).join(' and ')})`)
+					.join(' or ');
+				params = chunk.flat();
+			}
+			const sql = `select ${childColQuoted.join(', ')} from ${from} where ${whereClause} limit 1`;
+
+			log('RESTRICT batch check (%s): child=%s keys=%d', operation, childTable.name, chunk.length);
+
+			const stmt = db.prepare(sql);
+			try {
+				stmt.bindAll(params);
+				let referenced = false;
+				for await (const _row of stmt._iterateRowsRaw()) {
+					referenced = true;
+					break;
+				}
+				if (referenced) {
+					const opName = operation === 'delete' ? 'DELETE' : 'UPDATE';
+					throw new QuereusError(
+						`FOREIGN KEY constraint failed: ${opName} on '${parentTable.name}' violates RESTRICT from '${childTable.name}'`,
+						StatusCode.CONSTRAINT,
+					);
+				}
+			} finally {
+				await stmt.finalize();
+			}
+		}
+	}
+}
 
 /**
  * Executes cascading foreign key actions when a parent row is deleted or updated.

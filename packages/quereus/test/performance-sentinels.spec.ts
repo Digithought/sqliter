@@ -425,5 +425,47 @@ describe('Performance sentinels', function () {
 				`bulk insert with 2 aggregate MVs took ${withMvs.toFixed(1)} ms vs ${plain.toFixed(1)} ms plain (ratio ${(withMvs / plain).toFixed(1)}×)`);
 		});
 	});
+
+	// -------------------------------- Batched parent-side RESTRICT enforcement
+	describe('Batched FK RESTRICT bulk parent delete', function () {
+		this.timeout(60_000);
+
+		it('deletes 1000 referenced-but-unmatched parents with 4000 UNINDEXED children well under budget', async () => {
+			// Pre-batching this was O(N_parents × K_children): one full child scan
+			// per deleted parent per probe (~6 s on this shape). The batched path
+			// runs ⌈1000/500⌉ = 2 chunked probes total, so the whole delete is a
+			// couple of child scans — bound is generous CI headroom over ~100 ms.
+			const db = new Database();
+			try {
+				await db.exec(`
+					pragma foreign_keys = true;
+					create table parent (id integer primary key, name text);
+					create table child (id integer primary key, parent_id integer null,
+						foreign key (parent_id) references parent(id) on delete restrict);
+				`);
+				const BATCH = 250;
+				for (let i = 0; i < 1000; i += BATCH) {
+					const values = Array.from({ length: BATCH }, (_, j) => `(${i + j + 1}, 'p${i + j + 1}')`).join(', ');
+					await db.exec(`insert into parent values ${values}`);
+				}
+				// 4000 children, all referencing NULL (match nothing) — the RESTRICT
+				// probe must still consult the (unindexed) child FK column.
+				for (let i = 0; i < 4000; i += BATCH) {
+					const values = Array.from({ length: BATCH }, (_, j) => `(${i + j + 1}, null)`).join(', ');
+					await db.exec(`insert into child values ${values}`);
+				}
+
+				const elapsed = await timeMs(async () => {
+					await db.exec('delete from parent');
+				});
+				const rows = await collect(db.eval('select count(*) as cnt from parent'));
+				expect(rows[0].cnt).to.equal(0);
+				expect(elapsed).to.be.below(2500,
+					`bulk parent delete with unindexed RESTRICT child took ${elapsed.toFixed(1)} ms (pre-batching ~6000 ms)`);
+			} finally {
+				await db.close();
+			}
+		});
+	});
 });
 

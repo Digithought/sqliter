@@ -1575,7 +1575,7 @@ select aid, bid from l_jv order by aid;
 -- deferred [0,1] fan-out: deleting l_a aid=1 first trips l_b's reference to aid=1 (l_b
 -- bid=10 has aref=1) at the per-base-op parent-side FK check.
 delete from l_jv where aid = 1;
--- error: CHECK constraint failed: _fk_l_b_aref
+-- error: violates RESTRICT from 'l_b'
 -- the rejected delete is a no-op: both base rows survive.
 select aid, bref from l_a order by aid;
 → [{"aid":1,"bref":10},{"aid":2,"bref":null}]

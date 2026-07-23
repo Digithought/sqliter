@@ -85,9 +85,10 @@ INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 1);
 SELECT count(*) FROM departments;
 → [{"count(*)":2}]
 
--- Attempt to delete a referenced department (should fail - RESTRICT)
+-- Attempt to delete a referenced department (should fail - RESTRICT; enforced
+-- by the batched statement-end probe since fk-restrict-statement-batch)
 DELETE FROM departments WHERE id = 1;
--- error: CHECK constraint failed: _fk_employees_dept_id
+-- error: violates RESTRICT from 'employees'
 
 -- Verify nothing was deleted
 SELECT count(*) FROM departments;
@@ -100,9 +101,9 @@ SELECT count(*) FROM departments;
 
 -- --- RESTRICT on UPDATE ---
 
--- Attempt to update referenced PK (should fail - RESTRICT)
+-- Attempt to update referenced PK (should fail - RESTRICT; batched probe)
 UPDATE departments SET id = 99 WHERE id = 1;
--- error: CHECK constraint failed: _fk_employees_dept_id
+-- error: violates RESTRICT from 'employees'
 
 -- Verify nothing changed
 SELECT id FROM departments;
@@ -133,7 +134,7 @@ SELECT count(*) FROM products;
 
 -- NO ACTION → RESTRICT: deleting parent with existing children fails
 DELETE FROM categories WHERE id = 1;
--- error: CHECK constraint failed: _fk_products_cat_id
+-- error: violates RESTRICT from 'products'
 
 -- Nothing changed
 SELECT count(*) FROM categories WHERE id = 1;
@@ -744,7 +745,7 @@ SELECT id, name FROM pmask_parent;
 
 -- UPDATE that touches the referenced PK still trips RESTRICT
 UPDATE pmask_parent SET id = 'b' WHERE id = 'a';
--- error: CHECK constraint failed:
+-- error: violates RESTRICT from 'pmask_child'
 
 DROP TABLE pmask_child;
 DROP TABLE pmask_parent;
@@ -774,11 +775,11 @@ INSERT INTO pmask2_child_label VALUES (20, 'L1');
 -- Updating `label` only: pmask2_child_code's parent-side check (on `code`) must skip;
 -- pmask2_child_label's check fires on `label` change → RESTRICT.
 UPDATE pmask2_parent SET label = 'L2' WHERE id = 1;
--- error: CHECK constraint failed:
+-- error: violates RESTRICT from 'pmask2_child_label'
 
 -- Updating `code` only: symmetric — pmask2_child_code's check fires.
 UPDATE pmask2_parent SET code = 'C2' WHERE id = 1;
--- error: CHECK constraint failed:
+-- error: violates RESTRICT from 'pmask2_child_code'
 
 -- Updating neither referenced column: both checks must skip.
 UPDATE pmask2_parent SET extra = 'ok' WHERE id = 1;
