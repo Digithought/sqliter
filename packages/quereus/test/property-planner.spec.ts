@@ -279,6 +279,11 @@ describe('Property-Based Planner/Optimizer Tests', function () {
 		//     commutativity — is covered by the 'Join commutativity' suite below.
 		//     (Verified by dumping enabled/disabled query_plan for the asymmetric-data
 		//     shape: the op/node_type streams were byte-identical.)
+		//
+		// NOTE: neither removed rule has a "disabling it leaves the result set
+		// unchanged" check here. If that specific coverage is ever wanted, a plan
+		// diff can't provide it (see above) — assert on a cost / among-plans signal
+		// or on child order exposed some other way, not on op/node_type.
 		const twoTableRules: RuleDef[] = [
 			{
 				id: 'subquery-decorrelation',
