@@ -1073,7 +1073,7 @@ SET-DEFAULT recursion gap and no regression beyond status quo.
 **Internal statement cache.** The per-row FK/DDL enforcement statements — the RESTRICT
 existence probe (`assertNoRestrictedChildrenForParentMutation` and its lens dual), the
 transitive cascade pre-walk child scan, the cascade DML
-(`executeSingleFKAction`'s `DELETE`/`UPDATE`), and the drop-referencing check
+(`executeSingleFKAction`'s and `issueLensFkAction`'s `DELETE`/`UPDATE`), and the drop-referencing check
 (`SchemaManager.assertNoReferencingChildrenForDrop`) — are executed through a
 per-`Database` LRU pool of compiled statements keyed by exact SQL text
 (`InternalStatementCache`), rather than a fresh `prepare`/`finalize` per affected row (the

@@ -873,7 +873,7 @@ async function issueLensFkAction(
 				const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
 				const params = [...(newParentValues ?? []), ...oldParentValues];
 				log('LENS CASCADE UPDATE: %s with params %o', sql, params);
-				await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, params));
+				await withFkCascadeReentry(db, () => db._internalStatementCache.run(sql, params));
 			}
 			break;
 		}
