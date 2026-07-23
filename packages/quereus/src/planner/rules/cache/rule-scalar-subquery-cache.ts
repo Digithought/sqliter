@@ -14,14 +14,16 @@
  * Benefits: Materializes the inner result once and replays from cache on
  * subsequent evaluations, reducing O(N) inner scans to O(1) per execution.
  *
- * EAGER vs. NON-EAGER — this rule uses NON-eager, the key contrast with
- * `rule-in-subquery-cache`. `ruleInSubqueryCache` needs eager mode because
- * `emitIn`'s pure consumer returns on the first matching row, which would abort
- * a streaming cache build mid-drain and leave it uncommitted. `emitScalarSubquery`
- * has NO such short-circuit: it iterates the entire input on every evaluation
- * (it must read every row to detect the ">1 row" error). So a streaming
- * (non-eager) CacheNode is fully drained and committed on the first evaluation,
- * and subsequent evaluations replay from the buffer. Do NOT "fix" this to eager.
+ * EAGER vs. NON-EAGER — this rule uses NON-eager. `emitScalarSubquery` iterates
+ * the entire input on every evaluation (it must read every row to detect the
+ * ">1 row" error), so it has no short-circuit that could abort a streaming cache
+ * build mid-drain. A streaming (non-eager) CacheNode is therefore fully drained
+ * and committed on the first evaluation, and subsequent evaluations replay from
+ * the buffer. Do NOT "fix" this to eager. (Eager mode exists for a first-match
+ * short-circuiting consumer; its only historical caller, `rule-in-subquery-cache`,
+ * was retired in favor of the emit-level IN-subquery set probe — see
+ * `runtime/emit/subquery.ts` and `docs/runtime-caching.md` § Eager vs.
+ * streaming-first build.)
  */
 
 import { createLogger } from '../../../common/logger.js';
