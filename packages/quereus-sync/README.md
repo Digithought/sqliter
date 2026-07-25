@@ -130,6 +130,11 @@ if (checkpoint) {
 }
 ```
 
+A `SnapshotCheckpoint` holds a `Uint8Array` site id and a `bigint` HLC wall time,
+so it is **not** JSON-safe as-is. To send one to a peer (e.g. in a
+`resume_snapshot` message), run it through `serializeSnapshotCheckpoint` and
+recover it on the far side with `deserializeSnapshotCheckpoint`.
+
 ## Events
 
 Subscribe to sync events for UI updates:

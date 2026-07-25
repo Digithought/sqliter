@@ -17,8 +17,11 @@ import {
   deserializeChangeSet,
   serializeSnapshotChunk,
   deserializeSnapshotChunk,
+  serializeSnapshotCheckpoint,
+  deserializeSnapshotCheckpoint,
   type SerializedChangeSet,
   type SerializedSnapshotChunk,
+  type SerializedSnapshotCheckpoint,
 } from '../src/sync/wire.js';
 import { createHLC } from '../src/clock/hlc.js';
 import { generateSiteId } from '../src/clock/site.js';
@@ -30,6 +33,7 @@ import type {
   SchemaMigration,
   SnapshotChunk,
 } from '../src/sync/protocol.js';
+import type { SnapshotCheckpoint } from '../src/sync/manager.js';
 
 const siteId = generateSiteId();
 
@@ -363,6 +367,59 @@ describe('wire protocol', () => {
         totalEntries: 300,
         totalMigrations: 2,
       });
+    });
+  });
+
+  // ==========================================================================
+  // SnapshotCheckpoint codec
+  // ==========================================================================
+
+  describe('SnapshotCheckpoint codec', () => {
+    const checkpoint: SnapshotCheckpoint = {
+      snapshotId: 'snap-1',
+      siteId,
+      hlc: hlc(1700000000000, 7, 2),
+      lastTableIndex: 2,
+      lastEntryIndex: 41,
+      completedTables: ['main.a', 'main.b'],
+      entriesProcessed: 141,
+      createdAt: 1700000000000,
+    };
+
+    it('round-trips a checkpoint, serializing the bigint HLC and binary siteId to strings', () => {
+      const serialized = serializeSnapshotCheckpoint(checkpoint);
+      // Both binary fields must have become strings — otherwise JSON.stringify
+      // throws on the raw bigint wallTime and the siteId lands as a plain object.
+      expect(serialized.hlc).to.be.a('string');
+      expect(serialized.siteId).to.be.a('string');
+      expect(() => JSON.stringify(serialized)).to.not.throw();
+      expect(deserializeSnapshotCheckpoint(serialized)).to.deep.equal(checkpoint);
+    });
+
+    it('survives an actual JSON.parse(JSON.stringify(...)) hop', () => {
+      // The wire path the coordinator sees: the message is stringified by the
+      // client and parsed back into plain JSON before the codec runs.
+      const overWire = JSON.parse(
+        JSON.stringify(serializeSnapshotCheckpoint(checkpoint)),
+      ) as SerializedSnapshotCheckpoint;
+      const restored = deserializeSnapshotCheckpoint(overWire);
+      expect(restored).to.deep.equal(checkpoint);
+      expect(restored.siteId).to.be.instanceOf(Uint8Array);
+      expect(restored.hlc.wallTime).to.be.a('bigint');
+    });
+
+    it('round-trips an empty completedTables list', () => {
+      const empty: SnapshotCheckpoint = { ...checkpoint, completedTables: [] };
+      const restored = deserializeSnapshotCheckpoint(serializeSnapshotCheckpoint(empty));
+      expect(restored.completedTables).to.deep.equal([]);
+      expect(restored).to.deep.equal(empty);
+    });
+
+    it('copies completedTables rather than aliasing the input', () => {
+      const source: SnapshotCheckpoint = { ...checkpoint, completedTables: ['main.a'] };
+      const serialized = serializeSnapshotCheckpoint(source);
+      serialized.completedTables.push('main.injected');
+      expect(source.completedTables).to.deep.equal(['main.a']);
     });
   });
 });

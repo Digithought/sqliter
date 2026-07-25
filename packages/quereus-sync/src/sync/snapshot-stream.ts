@@ -628,6 +628,14 @@ export async function applySnapshotStream(
 // ============================================================================
 // Checkpoint Management
 // ============================================================================
+//
+// NOTE: the AT-REST encoding below (wallTime as a decimal string, siteId as a
+// number array) is deliberately NOT the wire encoding. The wire form is
+// `SerializedSnapshotCheckpoint` in `wire.ts` (both binary fields as base64),
+// used by the `resume_snapshot` message. Two encodings for one type is a wart,
+// but unifying them is a stored-format migration: existing `sc:` records would
+// have to be read under both shapes. If checkpoint storage is ever reworked for
+// another reason, fold it onto the wire codec then.
 
 /**
  * Retrieve a saved checkpoint for an in-progress snapshot.

@@ -8,7 +8,12 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import WebSocket from 'ws';
-import { PROTOCOL_VERSION } from '@quereus/sync';
+import {
+  PROTOCOL_VERSION,
+  createHLC,
+  siteIdFromBase64,
+  serializeSnapshotCheckpoint,
+} from '@quereus/sync';
 import { createCoordinatorServer, loadConfig, type CoordinatorServer } from '../src/index.js';
 
 // Test database ID in <org_id>:<type>_<id> format
@@ -384,18 +389,86 @@ describe('WebSocket Handler', () => {
   });
 
   describe('Resume Snapshot via WS', () => {
+    /**
+     * A checkpoint in its JSON-safe wire form. Built through the shared codec so
+     * the test speaks exactly what a client would send: the raw checkpoint holds
+     * a Uint8Array siteId and a bigint HLC wallTime, neither of which survives
+     * JSON on its own.
+     */
+    function makeWireCheckpoint(snapshotId: string) {
+      return serializeSnapshotCheckpoint({
+        snapshotId,
+        siteId: siteIdFromBase64(TEST_SITE_ID_1),
+        hlc: createHLC(BigInt(1700000000000), 0, siteIdFromBase64(TEST_SITE_ID_1), 0),
+        lastTableIndex: 0,
+        lastEntryIndex: 0,
+        completedTables: [],
+        entriesProcessed: 0,
+        createdAt: 1700000000000,
+      });
+    }
+
     it('should require authentication for resume_snapshot', async () => {
       const ws = await connectWs();
       try {
         const response = await sendAndReceive(ws, {
           type: 'resume_snapshot',
-          checkpoint: { snapshotId: 'test', tableIndex: 0, rowOffset: 0 },
+          checkpoint: makeWireCheckpoint('test'),
         }) as { type: string; code: string };
 
         expect(response.type).to.equal('error');
         expect(response.code).to.equal('NOT_AUTHENTICATED');
       } finally {
         ws.close();
+      }
+    });
+
+    it('should resume a snapshot from a serialized checkpoint after handshake', async function () {
+      const ws = await connectWs();
+      try {
+        await sendAndReceive(ws, {
+          type: 'handshake',
+          databaseId: TEST_DATABASE_ID,
+          siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
+        });
+
+        // The checkpoint must survive JSON.stringify on the way out and be
+        // decoded back to its binary shape by the coordinator; a raw checkpoint
+        // would throw here on the bigint, and an undecoded one would hand the
+        // service a base64 string where it expects a Uint8Array siteId.
+        const messages = await new Promise<object[]>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Timeout waiting for resumed snapshot')), 5000);
+          const received: object[] = [];
+          ws.send(JSON.stringify({
+            type: 'resume_snapshot',
+            checkpoint: makeWireCheckpoint('snap-resume-ws'),
+          }));
+          ws.on('message', (data) => {
+            const msg = JSON.parse(data.toString()) as { type: string };
+            received.push(msg);
+            if (msg.type === 'snapshot_complete' || msg.type === 'error') {
+              clearTimeout(timeout);
+              resolve(received);
+            }
+          });
+        });
+
+        const types = messages.map((m) => (m as { type: string }).type);
+        expect(types, `unexpected resume response: ${JSON.stringify(messages)}`).to.not.include('error');
+        expect(types[types.length - 1]).to.equal('snapshot_complete');
+
+        // The resumed stream reuses the checkpoint's snapshotId — proof the
+        // decoded checkpoint (not a corrupt one) reached the stream generator.
+        const header = messages.find(
+          (m) => (m as { type: string; chunk?: { type: string } }).chunk?.type === 'header',
+        ) as { chunk: { snapshotId: string; siteId: string; hlc: string } } | undefined;
+        expect(header, 'no header chunk in resumed stream').to.not.be.undefined;
+        expect(header!.chunk.snapshotId).to.equal('snap-resume-ws');
+        expect(header!.chunk.siteId).to.equal(TEST_SITE_ID_1);
+      } finally {
+        ws.close();
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
     });
   });

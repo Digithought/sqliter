@@ -20,7 +20,7 @@ import {
 } from '@quereus/sync';
 import type { CoordinatorService } from '../service/coordinator-service.js';
 import type { ClientIdentity, ClientSession } from '../service/types.js';
-import { wsLog, serializeChangeSet, deserializeChangeSet, serializeSnapshotChunk } from '../common/index.js';
+import { wsLog, serializeChangeSet, deserializeChangeSet, serializeSnapshotChunk, deserializeSnapshotCheckpoint } from '../common/index.js';
 
 // The ClientMessage union and its per-message interfaces are the shared wire
 // definitions from @quereus/sync (`sync/wire.ts`), the single source of truth
@@ -256,7 +256,11 @@ export function registerWebSocket(
       }
 
       try {
-        for await (const chunk of service.resumeSnapshotStream(session.databaseId, session.identity, msg.checkpoint)) {
+        // The checkpoint arrives from JSON.parse in its serialized form (base64
+        // siteId/HLC); decode before handing it to the service, which expects the
+        // binary in-memory shape.
+        const checkpoint = deserializeSnapshotCheckpoint(msg.checkpoint);
+        for await (const chunk of service.resumeSnapshotStream(session.databaseId, session.identity, checkpoint)) {
           sendMessage({ type: 'snapshot_chunk', chunk: serializeSnapshotChunk(chunk) });
         }
         sendMessage({ type: 'snapshot_complete' });

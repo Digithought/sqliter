@@ -19,5 +19,7 @@ export {
   deserializeChangeSet,
   serializeSnapshotChunk,
   deserializeSnapshotChunk,
+  serializeSnapshotCheckpoint,
+  deserializeSnapshotCheckpoint,
 } from '@quereus/sync';
 

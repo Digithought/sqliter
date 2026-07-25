@@ -227,9 +227,15 @@ See [`sync.md` § Protocol version](sync.md) for the rationale.
 | { type: "get_changes"; sinceHLC?: HLC }
 | { type: "apply_changes"; changes: ChangeSet[] }
 | { type: "get_snapshot" }
-| { type: "resume_snapshot"; checkpoint: SnapshotCheckpoint }
+| { type: "resume_snapshot"; checkpoint: SerializedSnapshotCheckpoint }
 | { type: "ping" }
 ```
+
+`SerializedSnapshotCheckpoint` is the JSON-safe form of `SnapshotCheckpoint`
+(base64 `siteId` and `hlc`); the raw checkpoint holds a `Uint8Array` and a
+`bigint`, which `JSON.stringify` cannot emit. Senders build it with
+`serializeSnapshotCheckpoint`; the coordinator decodes it with
+`deserializeSnapshotCheckpoint` before handing it to the service.
 
 **Server → Client:**
 ```typescript

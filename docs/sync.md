@@ -819,7 +819,14 @@ interface SnapshotProgress {
   currentTable?: string;
 }
 
-/** Checkpoint for resumable snapshot transfers */
+/**
+ * Checkpoint for resumable snapshot transfers.
+ *
+ * NOT JSON-safe: `siteId` is raw bytes and `hlc.wallTime` is a bigint, which
+ * `JSON.stringify` throws on. Cross the wire via `serializeSnapshotCheckpoint` /
+ * `deserializeSnapshotCheckpoint` (`sync/wire.ts`), which encode both as base64
+ * into `SerializedSnapshotCheckpoint` — the shape `resume_snapshot` carries.
+ */
 interface SnapshotCheckpoint {
   snapshotId: string;
   siteId: SiteId;
@@ -1557,8 +1564,14 @@ async function receiveSnapshot(ws: WebSocket) {
 async function resumeSnapshot(ws: WebSocket) {
   const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
   if (checkpoint) {
-    // Request resume from server
-    ws.send(JSON.stringify({ type: 'resume', checkpoint }));
+    // Request resume from server. The checkpoint MUST go through
+    // serializeSnapshotCheckpoint first: it holds a Uint8Array siteId and a
+    // bigint HLC wallTime, and JSON.stringify throws on the bigint. The
+    // coordinator calls deserializeSnapshotCheckpoint on receipt.
+    ws.send(JSON.stringify({
+      type: 'resume_snapshot',
+      checkpoint: serializeSnapshotCheckpoint(checkpoint),
+    }));
 
     // Server resumes from checkpoint
     for await (const chunk of syncManager.resumeSnapshotStream(checkpoint)) {

@@ -208,6 +208,25 @@ export type SerializedSnapshotChunk =
   | SerializedSnapshotSchemaMigrationChunk
   | SerializedSnapshotFooterChunk;
 
+/**
+ * A {@link SnapshotCheckpoint} serialized for JSON transport.
+ *
+ * Mirrors the in-memory shape field for field, with the two binary fields as
+ * base64 strings: `siteId` (raw bytes) and `hlc` (whose `wallTime` is a bigint
+ * that `JSON.stringify` throws on). Everything else is already JSON-safe and
+ * passes through unchanged.
+ */
+export interface SerializedSnapshotCheckpoint {
+  snapshotId: string;
+  siteId: string;                       // base64
+  hlc: string;                          // base64
+  lastTableIndex: number;
+  lastEntryIndex: number;
+  completedTables: string[];
+  entriesProcessed: number;
+  createdAt: number;
+}
+
 // ============================================================================
 // Schema migration codec
 // ============================================================================
@@ -454,6 +473,49 @@ export function deserializeSnapshotChunk(obj: SerializedSnapshotChunk): Snapshot
 }
 
 // ============================================================================
+// SnapshotCheckpoint codec
+// ============================================================================
+
+/**
+ * Serialize a SnapshotCheckpoint for JSON transport.
+ *
+ * The in-memory checkpoint holds a raw `Uint8Array` siteId and an HLC whose
+ * `wallTime` is a bigint — `JSON.stringify` THROWS on the latter, so a
+ * checkpoint must route through here before it can ride the wire.
+ */
+export function serializeSnapshotCheckpoint(cp: SnapshotCheckpoint): SerializedSnapshotCheckpoint {
+  return {
+    snapshotId: cp.snapshotId,
+    siteId: siteIdToBase64(cp.siteId),
+    hlc: serializeHLCForTransport(cp.hlc),
+    lastTableIndex: cp.lastTableIndex,
+    lastEntryIndex: cp.lastEntryIndex,
+    completedTables: [...cp.completedTables],
+    entriesProcessed: cp.entriesProcessed,
+    createdAt: cp.createdAt,
+  };
+}
+
+/**
+ * Deserialize a SnapshotCheckpoint from JSON transport format.
+ *
+ * Restores the binary siteId and the HLC; without this the receiver would read
+ * a base64 string where it expects `Uint8Array`/bigint.
+ */
+export function deserializeSnapshotCheckpoint(obj: SerializedSnapshotCheckpoint): SnapshotCheckpoint {
+  return {
+    snapshotId: obj.snapshotId,
+    siteId: siteIdFromBase64(obj.siteId),
+    hlc: deserializeHLCFromTransport(obj.hlc),
+    lastTableIndex: obj.lastTableIndex,
+    lastEntryIndex: obj.lastEntryIndex,
+    completedTables: [...obj.completedTables],
+    entriesProcessed: obj.entriesProcessed,
+    createdAt: obj.createdAt,
+  };
+}
+
+// ============================================================================
 // Message envelopes
 // ============================================================================
 //
@@ -508,10 +570,11 @@ export interface GetSnapshotMessage {
 export interface ResumeSnapshotMessage {
   type: 'resume_snapshot';
   /**
-   * The checkpoint to resume from. Carried as-is (the coordinator receives it
-   * typed as `SnapshotCheckpoint`); its binary fields are not re-encoded here.
+   * The checkpoint to resume from, in its JSON-safe form — build it with
+   * {@link serializeSnapshotCheckpoint} and read it with
+   * {@link deserializeSnapshotCheckpoint}.
    */
-  checkpoint: SnapshotCheckpoint;
+  checkpoint: SerializedSnapshotCheckpoint;
 }
 
 /** Client → Server: Heartbeat. */

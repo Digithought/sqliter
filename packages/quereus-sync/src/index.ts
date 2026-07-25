@@ -123,11 +123,14 @@ export {
   type SerializedSnapshotTableEndChunk,
   type SerializedSnapshotSchemaMigrationChunk,
   type SerializedSnapshotFooterChunk,
+  type SerializedSnapshotCheckpoint,
   // Codec functions
   serializeChangeSet,
   deserializeChangeSet,
   serializeSnapshotChunk,
   deserializeSnapshotChunk,
+  serializeSnapshotCheckpoint,
+  deserializeSnapshotCheckpoint,
   // Message unions + per-message interfaces
   type ClientMessage,
   type HandshakeMessage,
