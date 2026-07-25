@@ -219,7 +219,11 @@ export async function loadPlugin(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-function resolveEnvironment(env?: 'auto' | 'browser' | 'node'): 'browser' | 'node' {
+/**
+ * @internal Exported for tests only — not re-exported from `index.js`, so it is
+ * not part of the package's public API.
+ */
+export function resolveEnvironment(env?: 'auto' | 'browser' | 'node'): 'browser' | 'node' {
 	if (env && env !== 'auto') return env;
 	return isBrowserEnv() ? 'browser' : 'node';
 }
@@ -229,6 +233,11 @@ function isBrowserEnv(): boolean {
 		&& typeof (globalThis as unknown as { document?: unknown }).document !== 'undefined';
 }
 
+// NOTE: a spec with a disallowed scheme (e.g. 'http://host/p.js') is not
+// url-like, so loadPlugin falls through to the npm branch and reports a package
+// resolution failure rather than a protocol one. The load is still refused —
+// only the message is confusing. If that error turns up in user reports, reject
+// parseable-but-disallowed URL schemes here instead of letting them fall through.
 function isUrlLike(s: string): boolean {
 	try {
 		const u = new URL(s);
@@ -238,13 +247,22 @@ function isUrlLike(s: string): boolean {
 	}
 }
 
-interface NpmSpec {
+/** @internal Exported for tests only — see {@link resolveEnvironment}. */
+export interface NpmSpec {
 	name: string;
 	version?: string;
 	subpath?: string;
 }
 
-function parseNpmSpec(input: string): NpmSpec | null {
+/**
+ * Parses an npm spec (`npm:@scope/name@version/subpath`, or a bare package
+ * name) into its parts. Returns null for input that cannot be a package spec
+ * (empty, or containing whitespace); it does *not* attempt full npm name
+ * validation — resolution failures surface from the import itself.
+ *
+ * @internal Exported for tests only — see {@link resolveEnvironment}.
+ */
+export function parseNpmSpec(input: string): NpmSpec | null {
 	const raw = input.startsWith('npm:') ? input.slice(4) : input;
 	if (!raw || /\s/.test(raw)) return null;
 
@@ -322,7 +340,8 @@ async function tryLoadManifestFromPackage(packageName: string): Promise<PluginMa
 	}
 }
 
-function toCdnUrl(spec: NpmSpec, cdn: 'jsdelivr' | 'unpkg' | 'esm.sh'): string {
+/** @internal Exported for tests only — see {@link resolveEnvironment}. */
+export function toCdnUrl(spec: NpmSpec, cdn: 'jsdelivr' | 'unpkg' | 'esm.sh'): string {
 	const versionSegment = spec.version ? `@${spec.version}` : '';
 	const subpath = spec.subpath ? spec.subpath.replace(/^\//, '') : 'plugin';
 	switch (cdn) {

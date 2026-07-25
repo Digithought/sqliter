@@ -9,33 +9,22 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import type { Database } from '@quereus/quereus';
 import { toPluginSqlConfig, loadPluginsFromConfig } from '../src/index.js';
+import {
+	writeTempModule,
+	cleanupTempModules,
+	capturePluginSource,
+	readCapturedConfig,
+	clearCapturedConfig
+} from './helpers/plugin-fixtures.js';
 
 const CAPTURE_KEY = '__quereusPluginConfigReceived';
 
-/** A minimal ESM plugin whose default export records the config it was given. */
-const CAPTURE_PLUGIN_SRC = `
-export default function register(_db, config) {
-	globalThis['${CAPTURE_KEY}'] = config;
-	return {};
-}
-`;
-
-function readCapturedConfig(): Record<string, unknown> | undefined {
-	return (globalThis as Record<string, unknown>)[CAPTURE_KEY] as Record<string, unknown> | undefined;
-}
-
 describe('plugin config channel', () => {
-	const tempDirs: string[] = [];
-
 	afterEach(async () => {
-		delete (globalThis as Record<string, unknown>)[CAPTURE_KEY];
-		await Promise.all(tempDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
+		clearCapturedConfig(CAPTURE_KEY);
+		await cleanupTempModules();
 	});
 
 	describe('toPluginSqlConfig', () => {
@@ -59,11 +48,7 @@ describe('plugin config channel', () => {
 
 	describe('loadPluginsFromConfig round-trip', () => {
 		it('delivers a structured cache config to the plugin as an object', async () => {
-			const dir = await mkdtemp(join(tmpdir(), 'ql-plugin-channel-'));
-			tempDirs.push(dir);
-			const pluginPath = join(dir, 'capture-plugin.mjs');
-			await writeFile(pluginPath, CAPTURE_PLUGIN_SRC, 'utf8');
-			const source = pathToFileURL(pluginPath).href;
+			const { url: source } = await writeTempModule(capturePluginSource(CAPTURE_KEY), 'capture-plugin.mjs');
 
 			const cache = { enabled: false, maxEntries: 7, maxBytes: 4096 };
 
@@ -72,7 +57,7 @@ describe('plugin config channel', () => {
 				plugins: [{ source, config: { cache, databaseName: 'user-db' } }],
 			});
 
-			const received = readCapturedConfig();
+			const received = readCapturedConfig(CAPTURE_KEY);
 			expect(received, 'plugin register() should have been invoked').toBeDefined();
 			expect(typeof received!.cache).toBe('object');
 			expect(received!.cache).toEqual(cache);

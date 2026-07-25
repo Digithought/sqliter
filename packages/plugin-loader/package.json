@@ -26,9 +26,10 @@
     "clean": "rimraf dist",
     "build": "tsc",
     "lint": "echo 'No lint configured'",
-    "typecheck": "tsc --noEmit",
-    "//test": "NOTE: test/config-channel.spec.ts covers the plugin config channel only; url parsing/validation, npm-spec resolution, and CDN url building are still untested — this is core infrastructure, so that gap is tracked as debt, not shrugged off: see tickets/backlog/debt-plugin-loader-test-coverage.md. --passWithNoTests stays so an empty glob (or a future test-file rename) doesn't fail the build.",
-    "test": "vitest run --passWithNoTests"
+    "//typecheck": "NOTE: the second pass type-checks test/ too (tsconfig.json only includes src/). vitest transpiles specs without checking them, so without this a signature change in src/ would leave the specs silently stale.",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "//test": "NOTE: test/ covers url validation + the loader's protocol allowlist, npm-spec parsing, CDN url building, env detection, loadPlugin dispatch, config interpolation/validation, and the config channel. Known gaps (all need network or a DOM): https:// module loads, manifest fetch from a plugin's package.json, and the real browser+CDN load path. --passWithNoTests is deliberately NOT set, so a glob that stops matching fails loudly instead of reporting green.",
+    "test": "vitest run"
   },
   "peerDependencies": {
     "@quereus/quereus": "workspace:^"
