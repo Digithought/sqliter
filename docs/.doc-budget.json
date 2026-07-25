@@ -3,7 +3,7 @@
 	"note": "Ratchet entries record a doc's size at the time it was grandfathered in. A doc may shrink; it may never grow past its recorded size. New docs must come in under maxWords. Lower an entry with `node scripts/check-docs.mjs --update-ratchet` after a doc shrinks. See docs/doc-conventions.md.",
 	"ratchet": {
 		"docs/lens.md": 17934,
-		"docs/runtime.md": 13270,
+		"docs/runtime.md": 13220,
 		"docs/schema.md": 15915,
 		"docs/sync.md": 13511
 	}

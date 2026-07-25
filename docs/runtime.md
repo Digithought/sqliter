@@ -56,17 +56,9 @@ export class MyOperationNode extends PlanNode implements UnaryRelationalNode {
 	}
 	
 	private buildAttributes(): Attribute[] {
-		// Define how this node creates/transforms attributes
-		// Option 1: Preserve source attributes (like FilterNode, SortNode)
+		// Forward the source's attributes (FilterNode, SortNode), or mint new ones with
+		// `PlanNode.nextAttrId()` when the node originates columns (ProjectNode).
 		return this.source.getAttributes();
-		
-		// Option 2: Create new attributes (like ProjectNode)
-		// return this.projections.map((proj, index) => ({
-		//   id: PlanNode.nextAttrId(),
-		//   name: proj.alias ?? `col_${index}`,
-		//   type: proj.node.getType(),
-		//   sourceRelation: `${this.nodeType}:${this.id}`
-		// }));
 	}
 
 	getAttributes(): Attribute[] {
@@ -134,59 +126,27 @@ Each plan node provides three complementary sources of information:
 
 ### toString() Guidelines
 
-**Purpose**: Provide concise, human-readable descriptions for quick plan comprehension.
+One line a reader scans, not parses. Start with the SQL keyword or principal action,
+keep it ≤ 80 characters when practical, and show only what identifies this node —
+never the node type, ID, or wrapping parentheses, and nothing already in the logical
+or physical properties.
 
-**Rules**:
-- Never include node type, ID, or parentheses
-- Keep ≤ 80 characters when practical  
-- Start with SQL keyword or principal action
-- Show only essential information (predicates, projections, etc.)
-- Don't duplicate information from logical/physical properties
-
-**Examples**:
 ```typescript
-// TableReferenceNode
-toString(): "main.users"
-
-// FilterNode
-toString(): "where age > 40"
-
-// ProjectNode
-toString(): "select name, count(*) as total"
-
-// SortNode
-toString(): "order by name desc, age asc"
-
-// AggregateNode
-toString(): "group by dept_id  agg  count(*) as count, sum(salary) as total"
+"main.users"                        // TableReferenceNode
+"where age > 40"                    // FilterNode
+"select name, count(*) as total"    // ProjectNode
+"order by name desc, age asc"       // SortNode
 ```
 
 ### getLogicalProperties() Guidelines
 
-**Purpose**: Provide comprehensive logical information for detailed plan analysis.
+Always an object, never undefined. camelCased keys, primitive JSON values (strings,
+numbers, arrays), carrying the logically important detail the description omits — and
+not the physical properties (`estimatedRows`, ordering, …), which have their own slot.
 
-**Rules**:
-- Always return an object (never undefined)
-- Use camelCased keys with semantic meaning
-- Return primitive JSON types when possible (strings, numbers, arrays)
-- Include logically important information not in description
-- Don't duplicate physical properties (estimatedRows, ordering, etc.)
-
-**Examples**:
 ```typescript
-// FilterNode
-getLogicalProperties(): {
-  predicate: "age > 40"
-}
-
-// AggregateNode  
-getLogicalProperties(): {
-  groupBy: ["dept_id"],
-  aggregates: [
-    { expression: "COUNT(*)", alias: "count" },
-    { expression: "SUM(salary)", alias: "total" }
-  ]
-}
+{ predicate: "age > 40" }                                        // FilterNode
+{ groupBy: ["dept_id"], aggregates: [{ expression: "COUNT(*)", alias: "count" }] }
 ```
 
 ### Formatting Utilities
@@ -202,29 +162,6 @@ import {
   formatScalarType       // ScalarType → "INTEGER" | "TEXT" | etc.
 } from '../../util/plan-formatter.js';
 ```
-
-### Implementation Template
-
-```typescript
-export class MyOperationNode extends PlanNode {
-  // ... constructor and other methods
-
-  override toString(): string {
-    // Concise description focusing on key operation details
-    return `MY_OP ${this.operationParam}`;
-  }
-
-  override getLogicalProperties(): Record<string, unknown> {
-    return {
-      operation: this.operationParam,
-      targetColumns: this.columns.map(col => col.name),
-      // Include other logical details...
-    };
-  }
-}
-```
-
-This standardized format ensures plan viewers receive consistent, comprehensive information for both quick scanning (description) and deep analysis (logical + physical properties).
 
 ## Creating an Emitter
 
@@ -453,12 +390,10 @@ the debug-only aggregate log. Not observable outside the `runtime:metrics` logge
 
 ### Key Points for Emitter Authors
 
-- **Row Descriptors**: Always create row descriptors mapping attribute IDs to column indices
-- **Context Cleanup**: Use try/finally blocks to ensure context cleanup
-- **Return Types**: Match your function signature to expected output type
-- **Async Iterables**: Use `async function*` for row-producing operations
-- **Error Handling**: Throw `QuereusError` with appropriate `StatusCode`
-- **Attribute Preservation**: Understand whether your node preserves or creates new attributes
+Build a row descriptor mapping attribute IDs to column indices, close every context in
+a `finally`, and know whether your node forwards its source's attributes or originates
+new ones. Row-producing runs are `async function*`; failures throw `QuereusError` with
+a `StatusCode`.
 
 ## Schema Resolution (Build-Time)
 
@@ -466,80 +401,29 @@ Quereus resolves all schema dependencies during the planning phase and tracks th
 
 ### Early Resolution at Build Time
 
-All schema objects are resolved during planning and stored directly in plan nodes:
-
-```typescript
-// TableReferenceNode stores pre-resolved objects
-class TableReferenceNode {
-  constructor(
-    scope: Scope,
-    public readonly tableSchema: TableSchema,
-    public readonly vtabModule: VirtualTableModule,
-    public readonly vtabAuxData?: unknown
-  ) { ... }
-}
-
-// ScalarFunctionCallNode stores pre-resolved function
-class ScalarFunctionCallNode {
-  constructor(
-    scope: Scope,
-    public readonly expression: AST.FunctionExpr,
-    public readonly functionSchema: FunctionSchema,
-    public readonly operands: ScalarPlanNode[]
-  ) { ... }
-}
-```
+Schema objects are resolved during planning and stored on the plan node as readonly
+constructor fields — `TableReferenceNode` holds its `TableSchema`, `VirtualTableModule`
+and aux data; `ScalarFunctionCallNode` holds its `FunctionSchema`. The runtime never
+re-resolves a name.
 
 ### Dependency Tracking and Auto-Invalidation
 
-The planning context tracks all schema dependencies:
-
-```typescript
-// During planning
-const functionSchema = resolveFunctionSchema(ctx, 'sum', 1);
-const tableSchema = resolveTableSchema(ctx, 'users');
-const vtabModule = resolveVtabModule(ctx, 'memory');
-
-// Dependencies tracked automatically
-ctx.schemaDependencies.recordDependency({
-  type: 'function',
-  objectName: 'sum/1'
-}, functionSchema);
-```
-
-Prepared statements automatically invalidate when dependencies change:
-
-```typescript
-// Schema change triggers automatic plan invalidation
-schemaManager.createTable(...); // Emits 'table_added' event
-// → Statements using affected schema objects recompile automatically
-```
+Each `resolve*Schema(ctx, …)` call records what it resolved on
+`ctx.schemaDependencies`, keyed by type and object name (`'function'`, `'sum/1'`). A
+schema change emits an event (`table_added`, …), and every prepared statement holding
+a dependency on the affected object recompiles on its next execution.
 
 ## Attribute-Based Context System
 
-Quereus implements a robust attribute-based context system that eliminates the architectural deficiencies of traditional node-based column reference resolution.
-
-**Core Design Principles:**
-
-- **Stable Attribute IDs**: Every column is identified by a unique, stable attribute ID that persists across plan transformations and optimizations.
-- **Deterministic Resolution**: Column references use attribute IDs for lookup, eliminating the need for node type checking or fragile node-based resolution.
-- **Context Isolation**: Each row context is isolated using row descriptors that map attribute IDs to column indices.
-- **Transformation Safety**: Plan transformations (logical→physical) preserve attribute IDs, ensuring column references remain valid.
+Column references resolve through stable attribute IDs rather than node references, so
+no emitter has to type-check a node to find a column.
 
 ### Core Types
 
-**RowDescriptor**: Maps attribute IDs to column indices in a row
 ```typescript
 type RowDescriptor = number[];  // attributeId → columnIndex mapping
-```
+type RowGetter = () => Row;     // access to the current row
 
-**RowGetter**: Function that provides access to the current row
-```typescript
-type RowGetter = () => Row;
-```
-
-**RuntimeContext**: Uses attribute-based context mapping
-```typescript
 interface RuntimeContext {
   db: Database;
   stmt: Statement;
@@ -550,7 +434,8 @@ interface RuntimeContext {
 
 ### Attribute System
 
-Every relational plan node must implement `getAttributes(): Attribute[]` to define its output schema:
+Every relational plan node implements `getAttributes(): Attribute[]` — its output
+schema, one entry per column:
 
 ```typescript
 interface Attribute {
@@ -561,70 +446,39 @@ interface Attribute {
 }
 ```
 
-**Key principles:**
-- Attribute IDs are **stable** across plan transformations
-- Column references use attribute IDs for resolution, not node references
-- Optimizer preserves attribute IDs when converting logical to physical nodes
-- No node type checking required in `emitColumnReference`
+Attribute IDs are **stable** across plan transformations — the optimizer preserves them
+when it converts a logical node to a physical one, which is what keeps a reference
+built at plan time valid at runtime.
 
 ## Context Debugging and Tracing
 
-Quereus provides comprehensive debugging infrastructure for diagnosing context-related issues, which are common when developing new emitters or troubleshooting column reference resolution problems.
+Two debug namespaces cover the failure modes new emitters hit — a "no row context
+found" error and a reference resolving against the wrong row:
 
-**`quereus:runtime:context`**: General context lifecycle operations
-**`quereus:runtime:context:lookup`**: Column reference resolution attempts
+- **`quereus:runtime:context`** — context lifecycle. Watch for mismatched PUSH/POP, and
+  for a context torn down before the reference that reads it evaluates.
+- **`quereus:runtime:context:lookup`** — resolution attempts, showing which contexts are
+  live and whether the wanted attribute ID appears in any of them.
 
 ```bash
 # Enable all context tracing
 set DEBUG=quereus:runtime:context* && yarn test
 ```
 
-### Debugging Common Issues
-
-**"No row context found" Errors:**
-1. Enable `DEBUG=quereus:runtime:context:lookup` to see what contexts are available
-2. Check if the expected attribute ID is present in any context
-3. Verify context push/pop timing with `DEBUG=quereus:runtime:context`
-
-**Context Lifecycle Issues:**
-1. Enable `DEBUG=quereus:runtime:context` to trace context management
-2. Look for mismatched PUSH/POP operations
-3. Verify contexts are available when column references are evaluated
-
-**Best Practices for Emitter Authors:**
-- Always use the logging helpers: `logContextPush()` and `logContextPop()`
-- Include meaningful notes that identify the operation context
-- Log attribute information when setting up row descriptors
-- Always use context helpers (`withRowContext`, `withAsyncRowContext`, `createRowSlot`)
-- Never call `rctx.context.set/delete` directly
-- Choose the appropriate helper based on your use case
-- Include meaningful notes in your instruction's `note` field
+Log through `logContextPush()` / `logContextPop()` rather than ad-hoc logging, and give
+every instruction a `note` — both traces are only readable when the operations name
+themselves.
 
 ## Bags vs Sets (Relational Semantics)
 
-Quereus implements a precise distinction between **bags** (multisets) and **sets** in its relational model, aligning with Third Manifesto principles and enabling sophisticated query optimizations.
-
-### Core Concepts
-
-**Set**: A relation that guarantees unique rows (no duplicates)
-- All rows are distinct according to the relation's primary key(s)
-- Example: Result of `SELECT DISTINCT`, aggregation results, base tables
-
-**Bag**: A relation that can contain duplicate rows
-- Multiple identical rows are possible
-- Example: Result of `SELECT * FROM table`, table function outputs
+A **set** guarantees unique rows — every row distinct by the relation's key
+(`SELECT DISTINCT`, aggregation results, base tables). A **bag** (multiset) may repeat
+a row (`SELECT * FROM table`, table function output).
 
 ### RelationType.isSet Property
 
-Every relational plan node specifies whether it produces a set or bag via the `isSet` property:
-
-```typescript
-interface RelationType {
-  ...
-  isSet: boolean;  // true = set (unique rows), false = bag (duplicates possible)
-  ...
-}
-```
+Every relational plan node declares which it produces via `RelationType.isSet`: `true`
+for unique rows, `false` where duplicates are possible.
 
 ### Set/Bag Classification by Node Type
 
@@ -649,25 +503,10 @@ async function* run(ctx: RuntimeContext, source: AsyncIterable<Row>): AsyncItera
 
 ### Optimization Implications
 
-The bag/set distinction enables important optimizations:
-
-**Set-Specific Optimizations:**
-- Duplicate elimination can be skipped for sets
-- Certain join algorithms are more efficient with sets
-- Set operations (UNION, INTERSECT) have different complexity
-
-**Bag-Aware Planning:**
-- Streaming operations can be more efficient on bags
-- Memory usage optimizations for bag operations
-- Different sorting strategies for bags vs sets
-
-### Third Manifesto Alignment
-
-This design aligns with Third Manifesto principles:
-- **Clear Semantics**: Explicit distinction between sets and bags
-- **Type Safety**: RelationType captures bag/set information at compile time
-- **Algebraic Foundation**: Operations preserve or transform bag/set properties predictably
-- **Optimization Enabling**: Type information guides query optimization decisions
+`isSet` is what lets the optimizer drop a redundant duplicate elimination, pick a
+set-aware join or set-operation strategy, and choose sorting/memory strategy per
+input. Operations preserve or transform the property predictably, so it is
+statically known for every node.
 
 ## Mutation Operations: Always-Present OLD/NEW Model
 
@@ -712,51 +551,22 @@ await withAsyncRowContext(rctx, flatRowDescriptor, () => flatRow, async () => {
 
 **Constraint Evaluation**: All constraints (CHECK, NOT NULL) evaluate against the flat row context without conditional logic. CHECK constraints that reference other relations automatically defer to transaction boundaries via the `DeferredConstraintQueue`, so emitters simply enqueue the evaluator and continue streaming. Deferred rows reuse a single runtime context and row slot for efficiency while preserving scope isolation.
 
-### Benefits
+### Rejected alternatives
 
-- **Eliminates Context Conflicts**: Single flat descriptor prevents attribute ID collisions
-- **Simplifies Emitters**: No conditional OLD/NEW context setup across mutation types
-- **Consistent Symbol Space**: OLD/NEW always available, always defined for all operations
-- **Easier Reasoning**: Users can reliably reference OLD/NEW in any mutation context
-- **Future-Proof**: Supports triggers, defaults, and other features that need OLD/NEW access
-
-### Don't use Conditional Model
-
-The previous model used conditional OLD/NEW descriptors with metadata properties:
-```typescript
-// OLD MODEL - conditional contexts
-if (plan.oldRowDescriptor) {
-  rctx.context.set(plan.oldRowDescriptor, () => updateData.oldRow);
-}
-// Plus hidden __updateRowData properties
-
-// CURRENT MODEL - always-present flat context with helpers
-const flatRow = composeOldNewRow(oldRow, newRow, columnCount);
-const slot = createRowSlot(rctx, flatRowDescriptor);
-try {
-	for await (const flatRow of flatRows) {
-		slot.set(flatRow);
-		yield flatRow;
-	}
-} finally {
-	slot.close();
-}
-```
-
-This eliminates the break-fix cycle where attribute ID conflicts caused unpredictable column resolution behavior.
+- **Conditional OLD/NEW descriptors** (installed only when the operation has that
+  side, plus hidden `__updateRowData` properties). Attribute IDs then collided
+  between the conditionally-present descriptors, making column resolution depend on
+  which contexts happened to be installed. One flat descriptor per mutation is
+  collision-free by construction, keeps OLD/NEW defined for every operation, and
+  removes the conditional setup from every emitter.
 
 ## Mutation Context
 
-Quereus supports table-level mutation context variables that provide per-operation parameters for default values and constraints. This feature integrates seamlessly with the existing attribute-based context system.
-
-### Overview
-
-Mutation context allows you to:
-- Define reusable parameters in table definitions
-- Pass different values for each DML operation
-- Use context in default value expressions
-- Reference context in CHECK constraints (both immediate and deferred)
-- Provide runtime-specific validation rules
+A table declares reusable parameters in its definition (`WITH CONTEXT (...)`) and each
+DML statement supplies values for them. Those values are readable from DEFAULT
+expressions and from CHECK constraints, immediate and deferred alike — which is how a
+schema states a rule that depends on a per-operation value (a timestamp, a user id)
+without a non-deterministic expression in the DDL.
 
 ### Architecture
 
@@ -834,30 +644,9 @@ const combinedRow = [...contextRow, ...oldRow, ...newRow];
 const combinedDescriptor = composeCombinedDescriptor(contextDescriptor, flatRowDescriptor);
 ```
 
-**Descriptor Composition:**
-```typescript
-function composeCombinedDescriptor(
-  contextDescriptor: RowDescriptor, 
-  flatRowDescriptor: RowDescriptor
-): RowDescriptor {
-  const combined: RowDescriptor = [];
-  const contextLength = Object.keys(contextDescriptor).length;
-
-  // Context attributes: indices 0..contextLength-1
-  for (const attrIdStr in contextDescriptor) {
-    const attrId = parseInt(attrIdStr);
-    combined[attrId] = contextDescriptor[attrId];
-  }
-
-  // OLD/NEW attributes: offset by contextLength
-  for (const attrIdStr in flatRowDescriptor) {
-    const attrId = parseInt(attrIdStr);
-    combined[attrId] = flatRowDescriptor[attrId] + contextLength;
-  }
-
-  return combined;
-}
-```
+`composeCombinedDescriptor` keeps each context attribute at its own index and shifts
+every OLD/NEW attribute right by the context length, so one descriptor addresses the
+concatenation without renumbering either side.
 
 ### Deferred Constraints
 
@@ -889,21 +678,10 @@ already-coerced stored rows on UPDATE — and a per-cell parse failure falls bac
 the raw value so the row's own `performInsert` remains the authoritative source of
 the MISMATCH error.
 
-**Evaluation at COMMIT:**
-```typescript
-// Compose context with flat row for deferred evaluation
-const evaluationRow = entry.contextRow 
-  ? [...entry.contextRow, ...entry.row] 
-  : entry.row;
-const evaluationDescriptor = entry.contextRow && entry.contextDescriptor
-  ? composeCombinedDescriptor(entry.contextDescriptor, entry.descriptor)
-  : entry.descriptor;
-
-// Evaluate with context available
-const slot = createRowSlot(runtimeCtx, evaluationDescriptor);
-slot.set(evaluationRow);
-const value = await entry.evaluator(runtimeCtx);
-```
+**Evaluation at COMMIT:** the queued entry's captured context row and descriptor are
+recomposed with its snapshotted row the same way, installed in a row slot, and the
+stored evaluator runs against them — so a deferred CHECK sees the context values the
+originating statement supplied, not whatever is current at COMMIT.
 
 ### Plan Node Structure
 
@@ -1394,42 +1172,11 @@ for forward INSERT/UPDATE enforcement.
 
 ## Common Patterns
 
-### Row Processing with Context
-```typescript
-// Streaming pattern with row slot
-async function* run(rctx: RuntimeContext, input: AsyncIterable<Row>): AsyncIterable<Row> {
-	const slot = createRowSlot(rctx, rowDescriptor);
-	try {
-		for await (const row of input) {
-			slot.set(row);
-			yield processRow(row, rctx);
-		}
-	} finally {
-		slot.close();
-	}
-}
-```
-
-### Scalar Functions
-```typescript
-function run(rctx: RuntimeContext, ...args: SqlValue[]): SqlValue {
-	// Compute result
-	return result;
-}
-```
-
-### Side Effects (DDL/DML)
-```typescript
-async function run(rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<undefined> {
-	// Process each row with proper context
-	for await (const row of input) {
-		await withAsyncRowContext(rctx, rowDescriptor, () => row, async () => {
-			await performMutation(row, rctx);
-		});
-	}
-	return undefined;
-}
-```
+The three `run` shapes — streaming (`createRowSlot`), scalar (plain value in, value
+out), and void DDL/DML (`withAsyncRowContext` per row) — are shown under
+[Creating an Emitter](#creating-an-emitter) and
+[Row Context Management](#row-context-management). What follows are the patterns those
+templates do not cover.
 
 ### Impure subquery emitters: full-drain + run-once
 
@@ -1696,20 +1443,11 @@ SQL requires different coercion strategies for different contexts. Quereus handl
 
 ### Implementation Guidelines
 
-```typescript
-import { coerceToNumberForArithmetic, coerceForAggregate } from '../../util/coercion.js';
-
-// In arithmetic operations:
-const n1 = coerceToNumberForArithmetic(v1);
-const n2 = coerceToNumberForArithmetic(v2);
-const result = n1 + n2;
-
-// In aggregate functions:
-const coercedArg = coerceForAggregate(rawValue, functionName);
-accumulator = schema.stepFunction(accumulator, coercedArg);
-```
-
-**Critical Rule**: Never implement custom coercion logic in individual emitters. Always use centralized utilities (for arithmetic/aggregates) or rely on planner-inserted CastNodes (for comparisons) to ensure consistent behavior across the system.
+**Critical Rule**: never write coercion logic in an emitter. Coerce each operand with
+`coerceToNumberForArithmetic` before an arithmetic op, coerce an aggregate argument
+with `coerceForAggregate(rawValue, functionName)` before the step function, and for
+comparisons rely on the planner-inserted `CastNode` — one behavior, one home
+(`src/util/coercion.ts`).
 
 ## Uniqueness and sorting guidelines
 
@@ -1723,10 +1461,8 @@ if (seen.has(key)) continue; // Skip duplicate
 seen.add(key);
 ```
 
-**Problems**: 
-- Doesn't follow SQL comparison rules
-- `1` and `"1"` have different JSON representations but may be equal in SQL
-- Doesn't respect collation rules
+A JSON string is not a SQL comparison: it respects no collation, and `1` and `"1"`
+serialize differently though SQL may compare them equal.
 
 **Correct** — pre-resolve comparators at emit time to avoid runtime overhead:
 ```typescript
