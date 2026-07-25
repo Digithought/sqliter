@@ -105,6 +105,8 @@ See [Backing-host capability](mv-backing-host.md) for the member-by-member contr
 
 A maintained table has two equivalent authoring surfaces — the declared-shape **table form** and the `create materialized view` **sugar** — plus the lifecycle verbs that attach and detach a derivation on an existing table (the [migration pattern's](migration.md) flip and contract phases stand on these). `MAINTAINED`, `MATERIALIZED`, and `REFRESH` are contextual keywords — no new reserved words are introduced.
 
+Every statement below creates, drops, or rewrites a real module-backed table, so all of them — including `REFRESH` — are refused inside an explicit `begin … commit` under the opt-in `ddl_transaction_policy = 'strict'` setting, on any backing module that does not declare `ddlTransactionality: 'transactional'` (no built-in module does). The module consulted is the backing host (`using <module>(…)`, else `memory`). Under the default `permissive` policy nothing is refused. See [module-authoring.md § DDL transactionality tiers](module-authoring.md#ddl-transactionality-tiers).
+
 ### `CREATE TABLE … MAINTAINED AS` (declared-shape form)
 
 ```sql

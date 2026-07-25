@@ -16,6 +16,14 @@ const log = createLogger('runtime:emit:set-object-tags');
  * invalidate. Reserved-tag validation already ran at plan-build time (SET/ADD
  * only). NOTFOUND on a missing object — or a drop-of-absent key — surfaces from
  * the setter.
+ *
+ * NOTE: deliberately NOT covered by the `ddl_transaction_policy = 'strict'` gate
+ * (see ddl-transaction-policy.ts), because it dispatches to no module — matching
+ * the gate's stated scope ("module-dispatching DDL"; `create view` and friends
+ * are out too). This does leave one asymmetry: `alter table t set tags` IS gated,
+ * since the ALTER emitter gates every arm uniformly rather than per-arm. If a
+ * module ever persists tags such that a tag edit survives rollback — or the gate's
+ * scope is restated as "anything that escapes the transaction" — gate here too.
  */
 export function emitSetObjectTags(plan: SetObjectTagsNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {

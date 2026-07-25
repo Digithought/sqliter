@@ -145,6 +145,71 @@ drop table sp_t;
 -- run
 
 -- ===================================
+-- 6c. strict: create materialized view is refused inside begin
+-- ===================================
+
+begin;
+-- run
+create materialized view strict_mv as select id, v from strict_t;
+-- error: ddl_transaction_policy = strict
+
+-- The refusal left the transaction open and usable.
+insert into strict_t values (4, 'd');
+-- run
+commit;
+-- run
+
+select count(*) as cnt from strict_t;
+→ [{ "cnt": 4 }]
+
+-- Nothing was materialized.
+drop materialized view strict_mv;
+-- error: no such materialized view
+
+-- A no-op `if exists` drop has no target to resolve, so the gate never fires.
+begin;
+-- run
+drop materialized view if exists strict_mv;
+-- run
+rollback;
+-- run
+
+-- ===================================
+-- 6d. strict: the same create is allowed OUTSIDE a transaction (autocommit)
+-- ===================================
+
+create materialized view strict_mv as select id, v from strict_t;
+-- run
+
+select count(*) as cnt from strict_mv;
+→ [{ "cnt": 4 }]
+
+-- ===================================
+-- 6e. strict: refresh / drop materialized view are refused inside begin
+--     (REFRESH is gated too — its reshape arm dispatches module alterTable and
+--     both arms commit contents mid-transaction; see materialized-view.ts)
+-- ===================================
+
+begin;
+-- run
+refresh materialized view strict_mv;
+-- error: ddl_transaction_policy = strict
+drop materialized view strict_mv;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
+-- Both refusals left the MV intact and readable.
+select count(*) as cnt from strict_mv;
+→ [{ "cnt": 4 }]
+
+-- Outside a transaction both succeed.
+refresh materialized view strict_mv;
+-- run
+drop materialized view strict_mv;
+-- run
+
+-- ===================================
 -- 7. Reset to permissive; DDL inside a transaction works again
 -- ===================================
 
@@ -160,6 +225,27 @@ commit;
 
 drop table perm_again;
 -- run
+
+-- Materialized-view DDL inside a transaction is likewise allowed again.
+begin;
+-- run
+create materialized view perm_mv as select id, v from strict_t;
+-- run
+refresh materialized view perm_mv;
+-- run
+commit;
+-- run
+
+select count(*) as cnt from perm_mv;
+→ [{ "cnt": 4 }]
+
+begin;
+-- run
+drop materialized view perm_mv;
+-- run
+commit;
+-- run
+
 drop table strict_t;
 -- run
 drop table perm_t;

@@ -10,6 +10,9 @@ import { StatusCode, type SqlValue } from '../../common/types.js';
 import { astToString } from '../../emit/ast-stringify.js';
 import type { Database } from '../../core/database.js';
 import type { MaintainedTableSchema } from '../../schema/derivation.js';
+import { requireVtabModule } from '../../schema/table.js';
+import { normalizeBackingModuleName } from '../../schema/view.js';
+import { assertDdlTransactionPolicy, isDdlPolicyStrict } from './ddl-transaction-policy.js';
 import {
 	materializeView,
 	deriveBackingShape,
@@ -22,12 +25,22 @@ import {
 
 export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
-		// NOTE: not covered by the ddl_transaction_policy=strict gate. The MV backing is a
-		// module (memory/store) table whose creation escapes rollback like any other DDL, but
-		// feat-ddl-transaction-capability scoped the gate to the plain CREATE/DROP TABLE/INDEX
-		// + ALTER emitters; the dedicated materialized-view verbs were left out. If strict must
-		// also refuse MV DDL inside a transaction, gate here (and in drop/refresh below) — see
-		// backlog debt-strict-ddl-gate-materialized-views.
+		// Strict-policy gate (see ddl-transaction-policy.ts). The MV's backing is a real
+		// module (memory/store) table, so creating one escapes rollback exactly like
+		// CREATE TABLE. The owning module is the `using <module>(...)` backing host, else
+		// the memory default — the same resolution buildBackingTableSchema performs (NOT
+		// the session default module, which MV backing deliberately ignores). If it isn't
+		// registered, skip the gate and let materializeView raise the natural
+		// "no virtual table module named ..." error.
+		const backingModuleName = normalizeBackingModuleName(plan.backingModuleName);
+		const backingModule = rctx.db.schemaManager.getModule(backingModuleName);
+		if (backingModule?.module) {
+			assertDdlTransactionPolicy(
+				rctx.db, backingModule.module, backingModuleName,
+				`CREATE MATERIALIZED VIEW ${plan.viewName}`,
+			);
+		}
+
 		await rctx.db._ensureTransaction();
 		const db = rctx.db;
 		const sm = db.schemaManager;
@@ -81,6 +94,27 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 
 export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
+		// Strict-policy gate (see ddl-transaction-policy.ts). REFRESH is gated even though
+		// it mostly rewrites rows rather than the catalog shape, for two reasons: (1) its
+		// reshape arm reconciles a shifted body shape onto the live table with module
+		// `alterTable` ops — a genuine escaping schema change, and one that fires only on
+		// some inputs, so gating it data-dependently would make strict unpredictable; and
+		// (2) both arms are commit-first (`begin; refresh; rollback` does NOT undo the
+		// refresh today — see rebuildBacking), so the effect escapes the enclosing
+		// transaction exactly as the gated DDL statements do. Resolving the owning module
+		// needs the MV lookup, so guard it behind the cheap policy check — the default
+		// permissive path pays nothing and keeps its statement ordering. A missing MV
+		// skips the gate and falls through to the not-found diagnostics below.
+		if (isDdlPolicyStrict(rctx.db)) {
+			const target = rctx.db.schemaManager.getMaintainedTable(plan.schemaName, plan.viewName);
+			if (target) {
+				assertDdlTransactionPolicy(
+					rctx.db, requireVtabModule(target), target.vtabModuleName,
+					`REFRESH MATERIALIZED VIEW ${plan.viewName}`,
+				);
+			}
+		}
+
 		await rctx.db._ensureTransaction();
 		const db = rctx.db;
 		const sm = db.schemaManager;
@@ -218,6 +252,21 @@ export async function dropMaintainedTable(db: Database, mv: MaintainedTableSchem
 
 export function emitDropMaterializedView(plan: DropMaterializedViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
+		// Strict-policy gate (see ddl-transaction-policy.ts). Dropping an MV drops its
+		// backing module table, escaping rollback exactly like DROP TABLE. The owning
+		// module comes off the resolved maintained-table schema, so guard the lookup
+		// behind the cheap policy check; a missing MV skips the gate and falls through to
+		// the IF EXISTS / not-found diagnostics below.
+		if (isDdlPolicyStrict(rctx.db)) {
+			const target = rctx.db.schemaManager.getMaintainedTable(plan.schemaName, plan.viewName);
+			if (target) {
+				assertDdlTransactionPolicy(
+					rctx.db, requireVtabModule(target), target.vtabModuleName,
+					`DROP MATERIALIZED VIEW ${plan.viewName}`,
+				);
+			}
+		}
+
 		await rctx.db._ensureTransaction();
 		const db = rctx.db;
 		const sm = db.schemaManager;
