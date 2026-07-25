@@ -32,9 +32,14 @@ import {
 	validateValue,
 	parseValue,
 	validateAndParse,
+	coerceRowToSchema,
 	isValidForType,
 	tryParse,
 } from '../src/types/validation.js';
+import { createDefaultColumnSchema } from '../src/schema/column.js';
+import type { ColumnSchema } from '../src/schema/column.js';
+import { QuereusError } from '../src/common/errors.js';
+import { StatusCode } from '../src/common/types.js';
 
 describe('Type System', () => {
 
@@ -431,6 +436,37 @@ describe('Type System', () => {
 		it('tryParse should return null on failure', () => {
 			expect(tryParse('42', INTEGER_TYPE)).to.equal(42);
 			expect(tryParse('abc', INTEGER_TYPE)).to.equal(null);
+		});
+	});
+
+	// ──────────────────── Row-level coercion ────────────────────
+	describe('coerceRowToSchema', () => {
+		const columns = (...types: LogicalType[]): ColumnSchema[] =>
+			types.map((logicalType, i) => ({ ...createDefaultColumnSchema(`c${i}`), logicalType }));
+
+		it('should coerce each cell to its own column type', () => {
+			const row = coerceRowToSchema(['42', '1.5', 'text'], columns(INTEGER_TYPE, REAL_TYPE, TEXT_TYPE), 't');
+			expect([...row]).to.deep.equal([42, 1.5, 'text']);
+		});
+
+		it('should accept a short row, coercing only the cells present', () => {
+			const row = coerceRowToSchema(['42'], columns(INTEGER_TYPE, TEXT_TYPE, TEXT_TYPE), 't');
+			expect([...row]).to.deep.equal([42]);
+		});
+
+		it('should accept an empty row', () => {
+			expect([...coerceRowToSchema([], columns(INTEGER_TYPE), 't')]).to.deep.equal([]);
+		});
+
+		it('should throw with the caller-supplied label when the row is too long', () => {
+			expect(() => coerceRowToSchema([1, 2], columns(INTEGER_TYPE), 'INSERT into widgets'))
+				.to.throw(QuereusError, 'Too many values for INSERT into widgets: expected 1, got 2')
+				.with.property('code', StatusCode.ERROR);
+		});
+
+		it('should surface the offending column name when a cell fails validation', () => {
+			expect(() => coerceRowToSchema(['ok', 'abc'], columns(TEXT_TYPE, INTEGER_TYPE), 't'))
+				.to.throw(/c1/);
 		});
 	});
 
