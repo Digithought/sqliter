@@ -216,6 +216,37 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 		});
 	});
 
+	describe('a declared `json` primary key', () => {
+		// A DECLARED-json key member encodes structurally (json-key.ts): string leaves and
+		// object keys are keyed by their own UTF-8 bytes, so a lone surrogate inside them
+		// is refused exactly as a text key is — unlike the `any` column above, whose
+		// canonical-text encoding is accidentally safe behind JSON.stringify's ASCII
+		// escapes. The memory table keeps accepting the value; same deliberate divergence.
+		beforeEach(async () => {
+			await db.exec(`create table j (k json primary key, v text) using store`);
+		});
+
+		it('rejects a JSON key whose string leaf carries a lone surrogate', async () => {
+			await rejects(db, `insert into j values ('["\\ud800"]', 'one')`);
+			expect(await column(db, `select v from j`, 'v'), 'nothing was written').to.deep.equal([]);
+		});
+
+		it('rejects a JSON key whose object key carries a lone surrogate', async () => {
+			await rejects(db, `insert into j values ('{"\\ud800":1}', 'one')`);
+		});
+
+		it('the memory table accepts the same JSON value (the divergence oracle)', async () => {
+			await db.exec(`create table jm (k json primary key, v text)`);
+			await db.exec(`insert into jm values ('["\\ud800"]', 'one'), ('["\\ud801"]', 'two')`);
+			expect(await column(db, `select v from jm`, 'v')).to.have.lengthOf(2);
+		});
+
+		it('still accepts a well-formed astral leaf', async () => {
+			await db.exec(`insert into j values ('["${ASTRAL}"]', 'astral')`);
+			expect((await db.get(`select count(*) as cnt from j`))?.cnt).to.equal(1);
+		});
+	});
+
 	describe('an identifier or persisted DDL text carrying a lone surrogate', () => {
 		// Companion to the value-side guard above: `buildCatalogKey` folded an unpaired
 		// surrogate in a TABLE NAME to U+FFFD exactly like `encodeText` did for a value —

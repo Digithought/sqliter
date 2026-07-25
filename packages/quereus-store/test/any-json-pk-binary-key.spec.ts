@@ -12,13 +12,13 @@
  *
  * A memory table is the oracle for UNIQUENESS throughout. Since the semantic-ordering ruling
  * (docs/types.md "Semantic ordering"), it is the ordering oracle too: `Sort` ranks a TIMESPAN
- * or JSON operand by `logicalType.compare` (elapsed time / structural). JSON's canonical-text
- * key bytes cannot reproduce structural order, and the store DECLINES ordering advertisements
- * and byte windows over every semantic-ordering PK member (`keyOrderMatchesCollation`),
- * answering through a full scan + the type-aware residual instead. TIMESPAN keys now encode
- * the type's `groupKey` (total seconds — see timespan-semantic-key-identity.spec.ts), so its
- * byte order matches `compare` and the decline is merely conservative there; re-opening those
- * seeks is tracked in backlog `feat-reopen-timespan-store-seeks`.
+ * or JSON operand by `logicalType.compare` (elapsed time / structural). The store DECLINES
+ * ordering advertisements and byte windows over every semantic-ordering PK member
+ * (`keyOrderMatchesCollation`), answering through a full scan + the type-aware residual
+ * instead. Both types' key bytes now encode through an order-preserving transform (TIMESPAN's
+ * `groupKey` total seconds — see timespan-semantic-key-identity.spec.ts; JSON's structural
+ * encoding — see json-semantic-key-order.spec.ts), so the declines are merely conservative;
+ * re-opening those seeks is tracked in backlog `feat-reopen-timespan-store-seeks`.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -188,9 +188,10 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 		});
 
 		it('declines the PK-order advertisement for a `json` PK and still matches the memory table', async () => {
-			// JSON's semantic (structural) order is not the store's byte order, so the
-			// gate closes: a real Sort runs, and its structural order agrees with the
-			// memory table's typed PK order.
+			// The blanket semantic-ordering gate closes for a JSON PK, so a real Sort
+			// runs (conservative now that the structural key bytes DO scan in compare
+			// order — see json-semantic-key-order.spec.ts), and its structural order
+			// agrees with the memory table's typed PK order.
 			await db.exec(`create table t (j json primary key) using store`);
 			await db.exec(`create table m (j json primary key)`);
 			for (const t of ['t', 'm']) {
@@ -200,7 +201,7 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			const q = `select json_quote(j) as j from t order by j`;
 			expect(await column(db, q, 'j'))
 				.to.deep.equal(await column(db, `select json_quote(j) as j from m order by j`, 'j'));
-			expect(await planOps(db, `select j from t order by j`), 'byte order is not structural order — Sort must run')
+			expect(await planOps(db, `select j from t order by j`), 'advertisement conservatively declined — Sort must run')
 				.to.match(/sort/i);
 		});
 

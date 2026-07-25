@@ -209,7 +209,7 @@ This ensures type information flows through the entire planning and execution pi
 - Validation: Must be valid JSON; accepts objects, arrays, numbers, booleans, strings (parsed as JSON), and null
 - Comparison: Deep structural comparison (`deepCompareJson`). **Object key order is not significant** — `{a:1,b:2}` equals `{b:2,a:1}` — but **array element order is** (positional). Numeric storage class holds, so a JSON scalar `5` equals `5.0`.
 - Ordering: **Semantic** (`semanticOrdering: true`) — ORDER BY and `<`/`>` on a declared JSON column rank by the structural deep-compare (JSON type rank: null < boolean < number < string < array < object, then element/key-wise recursion — so `{"a":2}` sorts before `{"a":10}`), not by canonical JSON text. Equality is identical under both forms, so identity paths (DISTINCT, GROUP BY, hash keys) need no change. See "Semantic ordering" below.
-- Keys: hash keys (GROUP BY / DISTINCT / join partitioning) and persisted byte keys (JSON PK / index) derive from a **single canonical form** (`canonicalJsonString` — recursive object-key sort, arrays positional) so a value's key always agrees with the comparator: reorder-equal objects group/de-dup/conflict as one, distinct objects never over-merge. The canonical form is used **only to derive keys** — never for storage or display.
+- Keys: hash keys (GROUP BY / DISTINCT / join partitioning) derive from a **canonical text form** (`canonicalJsonString` — recursive object-key sort, arrays positional) so a value's key always agrees with the comparator: reorder-equal objects group/de-dup/conflict as one, distinct objects never over-merge. Persisted byte keys (a JSON PK / index member in `quereus-store`) instead encode a **structural byte form** (`jsonStructuralKey`, `quereus-store`'s json-key.ts) — same identity, and its memcmp order also reproduces the structural compare, so the store scans JSON keys in `compare` order. Both forms are used **only to derive keys** — never for storage or display.
 - Collations: None
 - Serialization: `serialize()` converts to JSON string for storage; `deserialize()` parses back to native object. Storage and display preserve **insertion order** (only key derivation canonicalizes)
 - Conversion: `json(value)` parses a JSON string into a native object; inserting a JSON string into a JSON column auto-parses it
@@ -261,20 +261,20 @@ by plain storage-class order, which stays total even when a list literal is not 
 value of the type, whereas `TIMESPAN.compare` mixes elapsed-time and text ordering
 there and is not.
 
-The persistent store follows the same identity rule: a TIMESPAN primary-key or index
-key member is encoded through `groupKey` (see `quereus-store`'s
-`resolvePkKeyTransforms`), so `'PT1H'` and `'PT60M'` collide on one physical key —
-duplicate spellings raise the ordinary PK/UNIQUE violation, `on conflict` actions
-fire, and the isolation overlay shadows across spellings. JSON keys already encode
-the canonical text, which is identity-faithful — but *not* order-faithful: the store
-emits a JSON primary key in canonical-text byte order while every comparator (and the
-memory backend) orders it structurally, so the isolation overlay cannot align the two
-streams and an in-transaction row surfaces twice. Tracked as fix
-`bug-json-pk-store-scan-order`. Store *ordering* advertisements and
-byte-window seeks over semantic-ordering members remain declined (a real Sort runs
-and point/range predicates re-check through the type-aware residual); TIMESPAN's
-total-seconds keys make re-opening them possible — tracked in backlog
-`feat-reopen-timespan-store-seeks`.
+The persistent store follows the same rule for both identity and order (resolved by
+`quereus-store`'s `storeSemanticKeyTransform`): a TIMESPAN key member is encoded
+through `groupKey`, so `'PT1H'` and `'PT60M'` collide on one physical key — duplicate
+spellings raise the ordinary PK/UNIQUE violation, `on conflict` actions fire, and the
+isolation overlay shadows across spellings; a JSON key member is encoded in a
+store-local **structural byte form** (`jsonStructuralKey`, `quereus-store`'s
+json-key.ts) whose memcmp order reproduces the structural compare — so a store scan
+emits JSON keys in `compare` order, agreeing with the memory backend, and the
+isolation overlay aligns its merge streams (an in-transaction update or delete of a
+JSON-keyed row shadows correctly). Store *ordering* advertisements and byte-window
+seeks over semantic-ordering members remain declined (a real Sort runs and
+point/range predicates re-check through the type-aware residual); with both types'
+key bytes now order-faithful the declines are merely conservative — re-opening them
+is tracked in backlog `feat-reopen-timespan-store-seeks`.
 
 Known gap: the built-in `min`/`max` aggregates rank with a bare BINARY compare —
 aggregate step functions receive no type context — so `min(timespan_col)` returns

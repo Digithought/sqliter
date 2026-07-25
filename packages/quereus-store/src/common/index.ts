@@ -108,10 +108,14 @@ export {
   resolvePkKeyCollations,
   resolvePkKeyTransforms,
   resolveIndexKeyTransforms,
+  storeSemanticKeyTransform,
   type StoreTableConfig,
   type StoreTableModule,
   type ExternalRowOp,
 } from './store-table.js';
+
+// Structural key encoding for declared-JSON key members
+export { jsonStructuralKey } from './json-key.js';
 export { StoreConnection } from './store-connection.js';
 
 // Materialized-view backing host (engine backing-host capability over a store table)

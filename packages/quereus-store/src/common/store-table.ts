@@ -31,6 +31,8 @@ import {
 	uniqueEnforcementCollations,
 	logicalTypeCanHoldText,
 	pkKeyCollationName,
+	JSON_TYPE,
+	type LogicalType,
 	type Database,
 	type DatabaseInternal,
 	type CollationFunction,
@@ -72,6 +74,7 @@ import {
 	type TableStats,
 } from './serialization.js';
 import { type EncodeOptions, type KeyValueTransform } from './encoding.js';
+import { jsonStructuralKey } from './json-key.js';
 
 /** Number of mutations before persisting statistics. */
 const STATS_FLUSH_INTERVAL = 100;
@@ -149,43 +152,68 @@ export function resolvePkKeyCollations(
 }
 
 /**
- * Resolve the per-column key-identity VALUE TRANSFORM for each primary-key column —
- * the engine's {@link semanticKeyTransform} of the member's logical type. One entry
- * per PK member in `pkDef` order; `undefined` for every type whose raw value already
- * keys faithfully. Today only TIMESPAN takes a transform (its `groupKey`: total
- * seconds against the same reference date as `TIMESPAN.compare`), which makes
- * 'PT1H' and 'PT60M' collide on one physical key exactly as the memory table's typed
- * BTree collapses them. The companion of {@link resolvePkKeyCollations}: every call
- * site that threads the collations MUST thread these too, or key identity drifts
- * between the write path and the rebuild/lookup path.
+ * The store's per-type key VALUE TRANSFORM for a semantic-ordering logical type, or
+ * `undefined` when raw values already key faithfully.
  *
- * NOTE: identity is only half the contract. `StoreTable` implements no
+ * The contract is TWO-sided — identity AND order. `StoreTable` implements no
  * `comparePrimaryKey`, so the isolation layer merges overlay against underlying with
- * its own fallback comparator (the PK type's `compare`) and needs this table's key
- * BYTE order to agree with it. TIMESPAN's total-seconds transform makes it agree;
- * JSON has no transform and its canonical-text bytes do NOT sort structurally, which
- * is why a JSON PK breaks overlay shadowing (fix `bug-json-pk-store-scan-order`).
- * Any future semantic-ordering type added here needs an order-preserving transform,
- * not merely an identity-faithful one.
+ * its own fallback comparator (the PK type's `compare` via `createTypedComparator`)
+ * and needs this table's key BYTE order to agree with it; and byte equality must be
+ * exactly the type's equality, or two spellings of one value land on two keys.
+ *
+ *  - JSON → the store-local structural encoder ({@link jsonStructuralKey}): a
+ *    `Uint8Array` whose memcmp order reproduces the type's structural `compare`
+ *    (canonical-text bytes are identity-faithful but sort `[10]` before `[2]`,
+ *    which broke overlay shadowing — see json-key.ts).
+ *  - Everything else → the engine's {@link semanticKeyTransform} (the type's
+ *    `groupKey`). Today that is TIMESPAN: total seconds against the same reference
+ *    date as `TIMESPAN.compare`, so 'PT1H' and 'PT60M' collide on one key AND byte
+ *    order is elapsed-time order.
+ *
+ * JSON deliberately gets NO engine `groupKey` — `groupKey` also drives GROUP BY /
+ * `IN` / hash-join identity, where canonical-text identity is already correct and a
+ * `Uint8Array` key would be a behaviour change for no benefit. Hence this
+ * store-local seam. A semantic-ordering type with NEITHER a `groupKey` nor an entry
+ * here cannot key a persisted structure soundly; `StoreTable` rejects it at DDL time
+ * (see `validateSemanticKeyTransforms`).
+ */
+export function storeSemanticKeyTransform(type: LogicalType | undefined): KeyValueTransform | undefined {
+	// Matched by NAME, not object identity (`type === JSON_TYPE`): the engine and this
+	// package can be loaded as two module instances (e.g. the logic suite runs the
+	// engine from src via ts-node while the store resolves `@quereus/quereus` to dist),
+	// and each instance carries its own JSON_TYPE singleton. The `hasSemanticOrdering`
+	// gate keeps a hypothetical plain custom type named 'JSON' out of this branch.
+	if (hasSemanticOrdering(type) && type.name === JSON_TYPE.name) return jsonStructuralKey;
+	return semanticKeyTransform(type);
+}
+
+/**
+ * Resolve the per-column key value transform for each primary-key column —
+ * {@link storeSemanticKeyTransform} of the member's logical type. One entry per PK
+ * member in `pkDef` order; `undefined` for every type whose raw value already keys
+ * faithfully. The companion of {@link resolvePkKeyCollations}: every call site that
+ * threads the collations MUST thread these too, or key identity/order drifts
+ * between the write path and the rebuild/lookup path.
  */
 export function resolvePkKeyTransforms(
 	pkDef: ReadonlyArray<{ index: number }>,
 	columns: ReadonlyArray<ColumnSchema>,
 ): (KeyValueTransform | undefined)[] {
-	return pkDef.map(def => semanticKeyTransform(columns[def.index]?.logicalType));
+	return pkDef.map(def => storeSemanticKeyTransform(columns[def.index]?.logicalType));
 }
 
 /**
- * Per-column key-identity transforms for a secondary index's OWN columns (the
+ * Per-column key value transforms for a secondary index's OWN columns (the
  * index half of `buildIndexKey`), positionally aligned with `index.columns`.
- * Same rule as {@link resolvePkKeyTransforms}: a semantic-ordering member with a
- * `groupKey` canonicalizes, everything else encodes raw.
+ * Same rule as {@link resolvePkKeyTransforms}: a semantic-ordering member
+ * canonicalizes through {@link storeSemanticKeyTransform}, everything else
+ * encodes raw.
  */
 export function resolveIndexKeyTransforms(
 	index: TableIndexSchema,
 	columns: ReadonlyArray<ColumnSchema>,
 ): (KeyValueTransform | undefined)[] {
-	return index.columns.map(col => semanticKeyTransform(columns[col.index]?.logicalType));
+	return index.columns.map(col => storeSemanticKeyTransform(columns[col.index]?.logicalType));
 }
 
 /**
@@ -254,13 +282,12 @@ export function keyOrderMatchesCollation(
 ): boolean {
 	// A semantic-ordering logical type (TIMESPAN, JSON — see docs/types.md "Semantic
 	// ordering") is ordered by its `compare` (elapsed time / structural), which the
-	// engine's Sort, comparison operators, and the memory backend all use. JSON's key
-	// bytes encode canonical text, whose memcmp order is not structural order, so the
-	// decline is a hard requirement there. TIMESPAN keys now encode the `groupKey`
-	// total-seconds transform (see `resolvePkKeyTransforms`), whose byte order DOES
-	// match `TIMESPAN.compare` for every parseable value — the decline for it is
-	// conservative, costing the seek/elision, never a row. Re-opening TIMESPAN's
-	// window/advertisement (and the byte-EQ arms in `analyzePKAccess` /
+	// engine's Sort, comparison operators, and the memory backend all use. Both types'
+	// key bytes now encode through an order-preserving transform (TIMESPAN's `groupKey`
+	// total seconds; JSON's structural encoding — see `storeSemanticKeyTransform`), so
+	// byte order DOES match the type's `compare` for every well-formed value and this
+	// blanket decline is conservative, costing the seek/sort-elision, never a row.
+	// Re-opening the window/advertisement (and the byte-EQ arms in `analyzePKAccess` /
 	// `analyzeIndexAccess`) is tracked in backlog `feat-reopen-timespan-store-seeks`.
 	if (hasSemanticOrdering(column?.logicalType)) return false;
 	if (!columnCanHoldText(column)) return true;
@@ -571,6 +598,7 @@ export class StoreTable extends VirtualTable {
 		// Validate the MATERIALIZED schema, so a `_uc_*` over a text column that needs the
 		// table key collation K is rejected up front just like an explicit index would be.
 		this.validateKeyCollations(this.materializedSchema, this.pkKeyCollations);
+		this.validateSemanticKeyTransforms(this.materializedSchema);
 		this.ddlSaved = isConnected;
 	}
 
@@ -625,6 +653,48 @@ export class StoreTable extends VirtualTable {
 		}
 	}
 
+	/**
+	 * Reject, at DDL time, a key member whose semantic-ordering logical type has no
+	 * store key transform — before a single row is keyed under bytes whose order the
+	 * type's `compare` (and so the isolation merge, the memory oracle, and Sort)
+	 * disagrees with.
+	 *
+	 * A semantic-ordering type keys soundly only through an order- and
+	 * identity-preserving transform ({@link storeSemanticKeyTransform}: the type's
+	 * `groupKey`, or a store-local encoder like JSON's structural one). This gap used
+	 * to be undetectable — JSON sat here transform-less for a release, keying in
+	 * canonical-text order while every comparator ordered structurally, and the only
+	 * symptom was a misaligned overlay merge deep inside a transaction. Unreachable
+	 * today (TIMESPAN and JSON are both covered); it exists so the NEXT
+	 * semantic-ordering type fails loudly at CREATE TABLE instead.
+	 *
+	 * Checked over the same materialized schema as {@link validateKeyCollations}:
+	 * every PK member and every (explicit or hidden `_uc_*`) index column.
+	 *
+	 * CAVEAT: this can only check that a transform EXISTS — a `groupKey` that is
+	 * identity-faithful but not order-preserving passes undetected, so a new type's
+	 * transform still needs its byte order argued against its `compare` (see
+	 * json-key.ts for the shape of that argument).
+	 */
+	private validateSemanticKeyTransforms(schema: TableSchema): void {
+		const check = (colIndex: number, member: string): void => {
+			const col = schema.columns[colIndex];
+			const type = col?.logicalType;
+			if (!hasSemanticOrdering(type) || storeSemanticKeyTransform(type) !== undefined) return;
+			throw new QuereusError(
+				`column ${col?.name ?? String(colIndex)} (${member}): semantic-ordering type `
+					+ `${type.name} cannot key a persisted structure: its raw encoding would not `
+					+ `reproduce the type's compare order — the type needs an order-preserving `
+					+ `groupKey or a store key encoder (see storeSemanticKeyTransform)`,
+				StatusCode.ERROR,
+			);
+		};
+		for (const def of schema.primaryKeyDefinition) check(def.index, 'primary key');
+		for (const index of schema.indexes ?? []) {
+			for (const col of index.columns) check(col.index, `index ${index.name}`);
+		}
+	}
+
 	/** Get the table configuration. */
 	getConfig(): StoreTableConfig {
 		return this.config;
@@ -662,6 +732,7 @@ export class StoreTable extends VirtualTable {
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
 		this.validateKeyCollations(materialized, pkKeyCollations);
+		this.validateSemanticKeyTransforms(materialized);
 		this.tableSchema = newSchema;
 		this.materializedSchema = materialized;
 		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
@@ -1202,12 +1273,15 @@ export class StoreTable extends VirtualTable {
 
 	/**
 	 * True when some PK member's logical type carries semantic ordering (TIMESPAN,
-	 * JSON). Byte-key EQUALITY is then a strict SUBSET of the type's equality
-	 * ('PT1H' ≡ 'PT60M' elapsed-time-equal, byte-distinct), so a point window
-	 * under-fetches — and no residual can resurrect a row the window skipped. Such
-	 * PKs decline the point arm and full-scan, where {@link matchesFilters} applies
-	 * the type's compare. (Range windows and ordering advertisements are already
-	 * declined by {@link keyOrderMatchesCollation}.)
+	 * JSON). Such PKs decline the point arm and full-scan, where
+	 * {@link matchesFilters} applies the type's compare. Historically required —
+	 * byte-key equality was a strict subset of the type's equality ('PT1H' ≡
+	 * 'PT60M' elapsed-time-equal, byte-distinct) and a point window under-fetched
+	 * with no residual able to resurrect a skipped row. Both types' key transforms
+	 * (see {@link storeSemanticKeyTransform}) now make byte equality the type's
+	 * equality, so the decline is conservative; re-opening is tracked in backlog
+	 * `feat-reopen-timespan-store-seeks`. (Range windows and ordering
+	 * advertisements are already declined by {@link keyOrderMatchesCollation}.)
 	 */
 	protected pkHasSemanticOrderingMember(): boolean {
 		const schema = this.tableSchema!;

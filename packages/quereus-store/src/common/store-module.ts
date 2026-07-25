@@ -39,7 +39,7 @@ import type {
 	BackingHost,
 	LensDeploymentSnapshot,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, semanticKeyTransform, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
 import type { CompiledPredicate, EffectiveRowSource, KeyNormalizer, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
@@ -47,7 +47,7 @@ import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import { StoreBackingHost } from './backing-host.js';
-import { StoreTable, resolvePkKeyCollations, resolvePkKeyTransforms, resolveIndexKeyTransforms, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, withImplicitUniqueIndexes, implicitUniqueIndexName, type StoreTableConfig, type StoreTableModule } from './store-table.js';
+import { StoreTable, resolvePkKeyCollations, resolvePkKeyTransforms, resolveIndexKeyTransforms, storeSemanticKeyTransform, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, withImplicitUniqueIndexes, implicitUniqueIndexName, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
@@ -2153,18 +2153,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
 		};
 
-		// SET DATA TYPE onto/off a type with a key-identity transform (TIMESPAN's
-		// total-seconds groupKey — see `resolvePkKeyTransforms`) changes the physical
-		// KEY BYTES a value encodes to, even when the stored VALUE bytes don't change
-		// (text → timespan keeps TEXT physical). Treated exactly like a collation
-		// change below: existing-row UNIQUE re-validation (equal-elapsed spellings now
-		// collide), a PK re-key when the column is a PK member, and a secondary-index
-		// rebuild (index keys encode the column's values). A same-type no-op ALTER
-		// never gets here (`inferType` returns the shared type object, so the identity
-		// check short-circuits).
+		// SET DATA TYPE onto/off a type with a key transform (TIMESPAN's total-seconds
+		// groupKey, JSON's structural encoder — see `storeSemanticKeyTransform`)
+		// changes the physical KEY BYTES a value encodes to, even when the stored
+		// VALUE bytes don't change (text → timespan keeps TEXT physical). Treated
+		// exactly like a collation change below: existing-row UNIQUE re-validation
+		// (equal-elapsed spellings now collide), a PK re-key when the column is a PK
+		// member, and a secondary-index rebuild (index keys encode the column's
+		// values). A same-type no-op ALTER never gets here (`inferType` returns the
+		// shared type object, so the identity check short-circuits).
 		const keyTransformChanged = oldCol.logicalType !== newCol.logicalType
-			&& (semanticKeyTransform(oldCol.logicalType) !== undefined
-				|| semanticKeyTransform(newCol.logicalType) !== undefined);
+			&& (storeSemanticKeyTransform(oldCol.logicalType) !== undefined
+				|| storeSemanticKeyTransform(newCol.logicalType) !== undefined);
 
 		// SET COLLATE existing-row re-validation (Option A, non-PK UNIQUE): a new
 		// per-column collation can make rows that were distinct under the old
@@ -3940,9 +3940,10 @@ function indexDedupeNormalizers(
 
 /**
  * Collation- and identity-aware dedupe signature of `row` over `colIndices`: each value
- * runs through its column's key-identity transform (the engine's `semanticKeyTransform`
- * — TIMESPAN's total-seconds `groupKey`, so 'PT1H' and 'PT60M' sign identically) before
- * `serializeKey` applies the per-column normalizer. Returns null when any covered value
+ * runs through its column's key transform (`storeSemanticKeyTransform` — TIMESPAN's
+ * total-seconds `groupKey`, so 'PT1H' and 'PT60M' sign identically; JSON's structural
+ * bytes, so reorder-equal objects sign identically) before `serializeKey` applies the
+ * per-column normalizer. Returns null when any covered value
  * is NULL (SQL UNIQUE allows multiple NULLs). The build/validate-time twin of the
  * write-time typed compare in `StoreTable.uniqueColumnComparators`.
  */
@@ -3975,7 +3976,7 @@ async function assertNoDuplicateRows(
 	normalizers: readonly KeyNormalizer[],
 	predicate: CompiledPredicate | undefined,
 ): Promise<void> {
-	const transforms = columnIndices.map(i => semanticKeyTransform(tableSchema.columns[i]?.logicalType));
+	const transforms = columnIndices.map(i => storeSemanticKeyTransform(tableSchema.columns[i]?.logicalType));
 	const seen = new Set<string>();
 	for await (const row of rows) {
 		if (predicate && predicate.evaluate(row) !== true) continue;

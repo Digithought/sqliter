@@ -55,13 +55,20 @@ export const BUILTIN_KEY_NORMALIZER_RESOLVER: KeyNormalizerResolver = (collation
 };
 
 /**
- * Per-column key-identity value transform (the engine's `semanticKeyTransform` output for
- * the column's logical type): applied to a value BEFORE type-dispatched encoding, so a
- * semantic-ordering type whose stored form is not canonical for equality (TIMESPAN:
- * 'PT1H' ≡ 'PT60M') keys both spellings to identical bytes. TIMESPAN's transform yields
- * total seconds (a number), so the member encodes through the NUMERIC path — making its
- * byte order the type's `compare` order as a side effect; an unparseable value passes
- * through as its raw text, matching `TIMESPAN.compare`'s BINARY-text fallback.
+ * Per-column key value transform (resolved by `storeSemanticKeyTransform` in
+ * store-table.ts): applied to a value BEFORE type-dispatched encoding, so a
+ * semantic-ordering type keys in its `compare` order and identity. Two transforms
+ * exist today:
+ *
+ *  - TIMESPAN — the engine's `semanticKeyTransform` (the type's `groupKey`: total
+ *    seconds, a number), so the member encodes through the NUMERIC path: 'PT1H' and
+ *    'PT60M' collide on one key, and byte order is elapsed-time order. An unparseable
+ *    value passes through as its raw text, matching `TIMESPAN.compare`'s BINARY-text
+ *    fallback.
+ *  - JSON — the store-local structural encoder (`jsonStructuralKey`, json-key.ts),
+ *    which yields a `Uint8Array` so the member encodes through the BLOB path: byte
+ *    order is the type's structural `compare` order, which canonical-text bytes
+ *    cannot reproduce (`[10]` sorts before `[2]` textually).
  */
 export type KeyValueTransform = (value: SqlValue) => SqlValue;
 
@@ -242,20 +249,33 @@ function encodeNumeric(value: number | bigint): Uint8Array {
   }
 
   // Primary: sortable IEEE-754 double.
-  view.setFloat64(1, primary, false); // big-endian
-  if (primary < 0) {
-    // Negative: flip all bits so more-negative sorts first.
-    for (let i = 1; i < 9; i++) buffer[i] ^= 0xff;
-  } else {
-    // Non-negative (incl. +0, +Inf, NaN): flip only the sign bit.
-    buffer[1] ^= 0x80;
-  }
+  writeSortableDouble(buffer, 1, primary);
 
   // Tie-break: signed int64 residual, big-endian with sign bit flipped.
   view.setBigInt64(9, offset, false);
   buffer[9] ^= 0x80;
 
   return buffer;
+}
+
+/**
+ * Write the 8-byte SORTABLE form of an IEEE-754 double at `offset`: big-endian bits,
+ * all flipped when negative, sign bit only otherwise — so memcmp order over the 8
+ * bytes is numeric order, with `-Inf < … < +Inf < NaN`. `-0` normalizes to `+0` so
+ * the two zeros collide on one key. The primary body of {@link encodeNumeric}, and
+ * the number-leaf body of json-key.ts's structural JSON encoding.
+ */
+export function writeSortableDouble(buffer: Uint8Array, offset: number, value: number): void {
+  const normalized = Object.is(value, -0) ? 0 : value;
+  const view = new DataView(buffer.buffer, buffer.byteOffset);
+  view.setFloat64(offset, normalized, false); // big-endian
+  if (normalized < 0) {
+    // Negative: flip all bits so more-negative sorts first.
+    for (let i = offset; i < offset + 8; i++) buffer[i] ^= 0xff;
+  } else {
+    // Non-negative (incl. +0, +Inf, NaN): flip only the sign bit.
+    buffer[offset] ^= 0x80;
+  }
 }
 
 /**
@@ -398,6 +418,13 @@ function encodeBlob(value: Uint8Array): Uint8Array {
 /**
  * Encode a JSON object/array as text with TYPE_OBJECT prefix.
  * Uses the same encoding as TEXT for sort order (by JSON string representation).
+ *
+ * This generic OBJECT path serves columns with NO declared JSON type — `any` columns
+ * holding objects — whose ordering oracle is `compareSqlValues`' OBJECT-class branch:
+ * canonical-string, code-point order. It must stay canonical text. A column DECLARED
+ * `json` never reaches here: its key transform (`jsonStructuralKey`, json-key.ts —
+ * resolved by `storeSemanticKeyTransform`) maps the value to a `Uint8Array` first, so
+ * it encodes through the BLOB path in structural `compare` order instead.
  *
  * NOTE: the collation normalizer runs over the CANONICAL JSON STRING, not over the
  * object's text leaves — under the default NOCASE that already lowercases object keys
@@ -587,6 +614,12 @@ function decodeBlob(buffer: Uint8Array, offset: number): { value: Uint8Array; by
   return { value: bytes, bytesRead };
 }
 
+/**
+ * NOTE: only the generic (`any`-column) OBJECT encoding decodes here. A DECLARED-json
+ * key member's structural bytes (json-key.ts) travel under the BLOB tag, so
+ * `decodeValue` returns them as a `Uint8Array`, not the JSON value — an accepted
+ * asymmetry documented in json-key.ts (no `src/` caller decodes key bytes to values).
+ */
 function decodeObject(buffer: Uint8Array, offset: number): { value: SqlValue; bytesRead: number } {
   const { bytes, bytesRead } = readEscapedUntilTerminator(buffer, offset);
   const jsonString = new TextDecoder().decode(bytes);
