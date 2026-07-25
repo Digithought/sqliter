@@ -192,7 +192,7 @@ export function resolveInCollation(condition: ScalarType, rhs: ReadonlyArray<Sca
 }
 
 /** RHS contribution sources of an InNode: list element types, or the subquery's single output column. */
-function inRhsTypes(node: InNode): ReadonlyArray<ScalarType> {
+export function inRhsTypes(node: InNode): ReadonlyArray<ScalarType> {
 	if (node.values) return node.values.map(v => v.getType());
 	if (node.source) {
 		const rel = node.source.getType();

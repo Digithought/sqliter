@@ -7,11 +7,12 @@ import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { BTree } from 'inheritree';
-import { compareSqlValuesFast } from '../../util/comparison.js';
+import { compareSqlValuesFast, hasSemanticOrdering, semanticKeyTransform } from '../../util/comparison.js';
 import { ConstantNode } from '../../planner/nodes/plan-node.js';
 import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
-import { effectiveInCollation } from '../../planner/analysis/comparison-collation.js';
+import { effectiveInCollation, inRhsTypes } from '../../planner/analysis/comparison-collation.js';
 import { isCorrelatedSubquery } from '../../planner/cache/correlation-detector.js';
+import type { LogicalType } from '../../types/logical-type.js';
 
 /**
  * Once-per-execution memo for impure (DML-bearing) subquery inners. The cell
@@ -98,6 +99,35 @@ export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContex
 	};
 }
 
+const IDENTITY_KEY = (value: SqlValue): SqlValue => value;
+
+/**
+ * Membership key transform for `condition IN (...)`. IN is an identity test, so when
+ * an operand declares a semantic-ordering logical type (see
+ * {@link hasSemanticOrdering}) the probe AND every RHS value are normalized through
+ * that type's canonical group key before comparing. Without it, `d IN ('PT120M')` on a
+ * TIMESPAN column compares raw duration text and misses, while `d = 'PT120M'` matches
+ * on elapsed time — IN must not disagree with the equality it desugars to.
+ *
+ * Normalizing (rather than routing the type's `compare` straight into the comparator,
+ * as `emitComparisonOp`/BETWEEN do) is what keeps the BTree paths sound: the keys are
+ * ranked by plain storage-class + collation order, which is total even when a list
+ * literal is not a valid value of the type — `TIMESPAN.compare` mixes elapsed-time and
+ * text ordering in that case and is not.
+ *
+ * A mixed pair (typed column vs plain text literal) still normalizes, matching
+ * `emitComparisonOp`'s generic path, whose runtime temporal check compares
+ * duration-vs-text semantically. Types with semantic ordering but no `groupKey` (JSON,
+ * whose canonical text is already identity-faithful) take no transform, as do
+ * membership tests whose operands declare two different semantic types.
+ */
+function inMembershipKey(plan: InNode): (value: SqlValue) => SqlValue {
+	const types: LogicalType[] = [plan.condition.getType().logicalType, ...inRhsTypes(plan).map(t => t.logicalType)];
+	const semantic = new Set(types.filter(hasSemanticOrdering));
+	if (semantic.size !== 1) return IDENTITY_KEY;
+	return semanticKeyTransform(semantic.values().next().value) ?? IDENTITY_KEY;
+}
+
 export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 	// ONE collation for the whole membership test (condition vs every RHS
 	// value), resolved through the shared provenance lattice — the BTree build
@@ -105,6 +135,10 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 	// already rejected conflicts at plan time.
 	const collationName = effectiveInCollation(plan);
 	const collation = ctx.resolveCollation(collationName);
+
+	// Canonical identity key applied to both sides of every comparison below.
+	const memberKey = inMembershipKey(plan);
+	const keyNote = memberKey === IDENTITY_KEY ? '' : ' semantic';
 
 	if (plan.source) {
 		const isImpure = PlanNodeCharacteristics.subtreeHasSideEffects(plan.source);
@@ -122,13 +156,14 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				let matched = false;
 				let hasNull = false;
 				const shouldCompare = condition !== null;
+				const conditionKey = shouldCompare ? memberKey(condition) : null;
 
 				for await (const row of input) {
 					if (row.length > 0) {
 						const rowValue = row[0];
 						if (rowValue === null) {
 							hasNull = true;
-						} else if (shouldCompare && !matched && compareSqlValuesFast(condition, rowValue, collation) === 0) {
+						} else if (shouldCompare && !matched && compareSqlValuesFast(conditionKey, memberKey(rowValue), collation) === 0) {
 							matched = true;
 						}
 					}
@@ -154,7 +189,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			return {
 				params: [sourceInstruction, conditionExpr],
 				run: asRun(runImpure),
-				note: 'IN(impure)'
+				note: `IN(impure)${keyNote}`
 			};
 		}
 
@@ -204,7 +239,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 								hasNull = true;
 							} else {
 								// Duplicate keys are a no-op insert — the set only tracks membership.
-								tree.insert(rowValue);
+								tree.insert(memberKey(rowValue));
 							}
 						}
 					}
@@ -214,7 +249,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 				// Three-valued membership, identical to the streaming and value-list paths:
 				// hit → true; miss → NULL if the inner had a NULL, else false.
-				if (probe.tree.find(condition).on) {
+				if (probe.tree.find(memberKey(condition)).on) {
 					return true;
 				}
 				return probe.hasNull ? null : false;
@@ -226,7 +261,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			return {
 				params: [sourceInstruction, conditionExpr],
 				run: asRun(runSetProbe),
-				note: 'IN (subquery set-probe)'
+				note: `IN (subquery set-probe)${keyNote}`
 			};
 		}
 
@@ -238,6 +273,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				return null;
 			}
 
+			const conditionKey = memberKey(condition);
 			let hasNull = false;
 			for await (const row of input) {
 				if (row.length > 0) {
@@ -247,7 +283,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 						continue;
 					}
 					// Check for match immediately - no need to materialize
-					if (compareSqlValuesFast(condition, rowValue, collation) === 0) {
+					if (compareSqlValuesFast(conditionKey, memberKey(rowValue), collation) === 0) {
 						return true; // Found a match
 					}
 				}
@@ -263,7 +299,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 		return {
 			params: [sourceInstruction, conditionExpr],
 			run: asRun(runSubqueryStreaming),
-			note: `IN (subquery)`
+			note: `IN (subquery)${keyNote}`
 		};
 	} else if (plan.values) {
 		// IN value list: expr IN (value1, value2, ...)
@@ -286,7 +322,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				}
 
 				// Check if condition exists in pre-built tree
-				const path = tree.find(condition);
+				const path = tree.find(memberKey(condition));
 				if (path.on) {
 					return true; // Found a match
 				}
@@ -309,7 +345,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 							hasNull = true;
 							continue;
 						}
-						tree.insert(value as SqlValue);
+						tree.insert(memberKey(value as SqlValue));
 					}
 
 					return innerConstantRun(rctx, condition);
@@ -320,7 +356,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 						hasNull = true;
 						continue;
 					}
-					tree.insert(value as SqlValue);
+					tree.insert(memberKey(value as SqlValue));
 				}
 				runFunc = asRun(innerConstantRun);
 			}
@@ -330,7 +366,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			return {
 				params: [conditionExpr],
 				run: runFunc,
-				note: `IN (${plan.values.length} constant values)`
+				note: `IN (${plan.values.length} constant values)${keyNote}`
 			};
 		} else {
 			// Some values are expressions - build tree at runtime
@@ -341,13 +377,14 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				}
 
 				// Linear scan is optimal since we're only doing one lookup per execution
+				const conditionKey = memberKey(condition);
 				let hasNull = false;
 				for (const value of values) {
 					if (value === null) {
 						hasNull = true;
 						continue;
 					}
-					if (compareSqlValuesFast(condition, value, collation) === 0) {
+					if (compareSqlValuesFast(conditionKey, memberKey(value), collation) === 0) {
 						return true; // Found a match
 					}
 				}
@@ -362,7 +399,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			return {
 				params: [conditionExpr, ...valueExprs],
 				run: asRun(runDynamicValues),
-				note: `IN (${plan.values.length} dynamic values)`
+				note: `IN (${plan.values.length} dynamic values)${keyNote}`
 			};
 		}
 	} else {

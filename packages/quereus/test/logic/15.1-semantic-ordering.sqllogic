@@ -169,6 +169,24 @@ select count(*) as c from (
 select count(*) over (partition by d) as c from dt;
 → [{"c":2},{"c":2}]
 
+-- IN membership must agree with the `=` it desugars to, on every emitIn path:
+-- a constant list, a non-constant list element, and a subquery source. `d` is not
+-- the primary key here, so the residual `In` node survives and the comparison is
+-- exercised directly rather than being turned into an index multi-seek.
+select id from dt where d in ('PT60M') order by id;
+→ [{"id":1},{"id":2}]
+
+select id from dt where d in ((select d from dt where id = 2)) order by id;
+→ [{"id":1},{"id":2}]
+
+select id from dt where d in (select d from dt where id = 2) order by id;
+→ [{"id":1},{"id":2}]
+
+-- Non-members still miss, and an unparseable list entry compares as text (no
+-- false match) instead of derailing the rest of the list.
+select id from dt where d in ('PT59M', 'not-a-duration') order by id;
+→ []
+
 -- Equi-join matches across spellings (any join algorithm must agree with `=`).
 create table jt2 (id integer primary key, d timespan);
 insert into jt2 values (10, 'PT60M');

@@ -500,9 +500,9 @@ export function hasSemanticOrdering(type: LogicalType | undefined): type is Logi
  * values already key faithfully. Defined exactly when the type carries semantic ordering
  * AND a `groupKey` hook (TIMESPAN — its stored text is not canonical for equality:
  * 'PT1H' ≡ 'PT60M'); JSON has semantic ordering but its canonical text is already
- * identity-faithful, so it takes no transform. Every hash- or byte-keyed identity site
- * (GROUP BY, hash joins, the persistent store's PK/index key encoding, the isolation
- * overlay's shadowing keys) must run values through this before serializing, or two
+ * identity-faithful, so it takes no transform. Every hash-, set-, or byte-keyed identity
+ * site (GROUP BY, hash joins, IN membership, the persistent store's PK/index key encoding,
+ * the isolation overlay's shadowing keys) must run values through this before serializing, or two
  * values the type's `compare` calls equal land on distinct keys.
  */
 export function semanticKeyTransform(type: LogicalType | undefined): ((value: SqlValue) => SqlValue) | undefined {

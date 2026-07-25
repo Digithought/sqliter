@@ -224,8 +224,8 @@ collation order of their stored representation. These declare
 `semanticOrdering: true` on the `LogicalType`, and the rule is:
 
 > Wherever a value of a declared logical type is ordered or compared — ORDER BY,
-> `<`/`>`/`=` operators, BETWEEN, primary-key/index order and range scans,
-> DISTINCT / GROUP BY / set-operation identity, window ORDER BY/PARTITION BY,
+> `<`/`>`/`=` operators, BETWEEN, IN membership, primary-key/index order and range
+> scans, DISTINCT / GROUP BY / set-operation identity, window ORDER BY/PARTITION BY,
 > merge/hash join keys — the type's `compare` function is the order. Text/byte
 > order is a storage encoding detail, never a user-visible semantic.
 
@@ -251,6 +251,15 @@ canonical for equality also supplies `groupKey` — a canonical representative s
 that compare-equal values serialize to the same hash key (TIMESPAN maps to total
 seconds against the same fixed reference date `compare` uses). JSON needs no
 `groupKey`: canonical-text equality and structural equality coincide.
+
+`IN` is an identity test, so it routes through `groupKey` rather than `compare`: when
+either side declares a semantic-ordering type, `emitIn` normalizes the probe and every
+RHS value before comparing, so `d IN ('PT120M')` matches a `'PT2H'` row exactly as
+`d = 'PT120M'` does. Normalizing (instead of dropping `compare` into the membership
+BTree's comparator) is what keeps the set structures sound — the normalized keys rank
+by plain storage-class order, which stays total even when a list literal is not a valid
+value of the type, whereas `TIMESPAN.compare` mixes elapsed-time and text ordering
+there and is not.
 
 The persistent store follows the same identity rule: a TIMESPAN primary-key or index
 key member is encoded through `groupKey` (see `quereus-store`'s

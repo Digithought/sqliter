@@ -74,7 +74,7 @@ export interface LogicalType {
 	 * storage-class + collation ordering of the stored representation (e.g. TIMESPAN
 	 * orders by elapsed time, JSON by structural deep-compare — not by their text).
 	 * Every user-visible ordering/identity site (ORDER BY, `<`/`>`/`=` operators,
-	 * index range filters, DISTINCT / GROUP BY / set-operation identity) routes
+	 * index range filters, IN membership, DISTINCT / GROUP BY / set-operation identity) routes
 	 * through {@link compare} exactly when this is set; when unset, storage-class +
 	 * collation ordering is already the type's semantic order and the cheaper
 	 * generic comparators are used. Declared-key BTrees (memory-table PKs and
@@ -82,8 +82,8 @@ export interface LogicalType {
 	 */
 	semanticOrdering?: boolean;
 	/**
-	 * Canonical identity representative for hash-keyed grouping (GROUP BY, window
-	 * PARTITION BY). Two values for which {@link compare} returns 0 MUST map to
+	 * Canonical identity representative for hash- or set-keyed identity (GROUP BY,
+	 * window PARTITION BY, IN membership). Two values for which {@link compare} returns 0 MUST map to
 	 * representatives that serialize identically under the storage-class key
 	 * serializer (`util/key-serializer.ts`); distinct values must not collide.
 	 * Only needed when {@link semanticOrdering} is set AND the stored form is not
