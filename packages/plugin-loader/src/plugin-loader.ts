@@ -106,7 +106,11 @@ export async function dynamicLoadModule(
 			);
 		}
 
-		// Add cache-busting timestamp for local development
+		// Add cache-busting timestamp for local development.
+		// NOTE: each reload imports a distinct specifier, so Node keeps every
+		// prior version of the module in its registry. Harmless for a CLI or a
+		// dev session; if a long-lived host starts reloading plugins in a loop,
+		// it needs a real unload story rather than a new query string per load.
 		if (moduleUrl.protocol === 'file:' || moduleUrl.hostname === 'localhost') {
 			moduleUrl.searchParams.set('t', Date.now().toString());
 		}
@@ -233,15 +237,16 @@ function isBrowserEnv(): boolean {
 		&& typeof (globalThis as unknown as { document?: unknown }).document !== 'undefined';
 }
 
-// NOTE: a spec with a disallowed scheme (e.g. 'http://host/p.js') is not
-// url-like, so loadPlugin falls through to the npm branch and reports a package
-// resolution failure rather than a protocol one. The load is still refused —
-// only the message is confusing. If that error turns up in user reports, reject
-// parseable-but-disallowed URL schemes here instead of letting them fall through.
+/**
+ * True when a spec should be handled as a URL rather than an npm package.
+ * Any parseable absolute URL qualifies — *including* disallowed schemes, so that
+ * {@link dynamicLoadModule}'s allowlist names the offending protocol instead of
+ * the spec falling through to the package branch and failing as an unresolvable
+ * package name. `npm:` is the one scheme that means "package", so it is exempt.
+ */
 function isUrlLike(s: string): boolean {
 	try {
-		const u = new URL(s);
-		return u.protocol === 'https:' || u.protocol === 'file:';
+		return new URL(s).protocol !== 'npm:';
 	} catch {
 		return false;
 	}

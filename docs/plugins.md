@@ -881,14 +881,19 @@ const db = new Database();
 // 1) Load from npm package name (Node):
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, { api_key: '...' });
 
-// 2) Load from direct URL (Node or Browser):
+// 2a) Load from a direct https:// URL (Browser only — see note below):
 await dynamicLoadModule('https://example.com/plugin.js', db, { timeout: 10000 });
+
+// 2b) Load from a direct file:// URL (Node):
+await dynamicLoadModule('file:///path/to/plugin.mjs', db, { timeout: 10000 });
 
 // 3) Browser npm via CDN (opt-in only):
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, { timeout: 8000 }, { allowCdn: true, cdn: 'jsdelivr' });
 ```
 
 Behavior:
+- Allowed module protocols are `https:` and `file:` — enforced inside `dynamicLoadModule`, so any other scheme is refused before an import is attempted.
+- **`https:` module loads work in the browser only.** Node's ESM loader accepts only `file:` and `data:` URLs (network imports were experimental and have been removed), so `dynamicLoadModule('https://…')` under Node fails with `ERR_UNSUPPORTED_ESM_URL_SCHEME`, wrapped as `Failed to load plugin from …`. In Node, load plugins from an installed npm package or a `file://` URL.
 - npm package resolution prefers the `exports['./plugin']` subpath. In Node, the package is loaded directly. In browsers, npm resolution is disabled by default; enabling it requires `{ allowCdn: true }` and maps to a CDN URL.
 - Version compatibility: if the package declares `engines.quereus` or a `peerDependency` on `@quereus/quereus`, hosts should throw when incompatible (error, not warning).
 

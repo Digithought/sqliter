@@ -47,6 +47,19 @@ describe('interpolateEnvVars', () => {
 		expect(interpolateEnvVars('${HOST:-fallback}', { HOST: '' })).toBe('');
 	});
 
+	it('keeps a default that itself contains ":-"', () => {
+		// Only the first `:-` separates name from default.
+		expect(interpolateEnvVars('${MISSING:-a:-b}', {})).toBe('a:-b');
+		expect(interpolateEnvVars('${MISSING:-https://host/p.js}', {})).toBe('https://host/p.js');
+	});
+
+	it('does not resolve inherited Object.prototype members as variables', () => {
+		expect(interpolateEnvVars('${constructor}', {})).toBe('${constructor}');
+		expect(interpolateEnvVars('${toString}', {})).toBe('${toString}');
+		expect(interpolateEnvVars('${__proto__}', {})).toBe('${__proto__}');
+		expect(interpolateEnvVars('${hasOwnProperty:-fallback}', {})).toBe('fallback');
+	});
+
 	it('leaves the placeholder text in place when there is no var and no default', () => {
 		expect(interpolateEnvVars('${MISSING}', {})).toBe('${MISSING}');
 		expect(interpolateEnvVars('prefix-${MISSING}-suffix', {})).toBe('prefix-${MISSING}-suffix');
@@ -196,6 +209,12 @@ describe('loadPluginsFromConfig failure handling', () => {
 		})).rejects.toThrow(/Failed to load 1 plugin\(s\)/);
 
 		expect(readCapturedConfig(CAPTURE_KEY)?.loaded).toBe(true);
+	});
+
+	it('forwards loader options to each plugin load', async () => {
+		// The browser+npm refusal only fires if `env` reached `loadPlugin`.
+		await expect(loadPluginsFromConfig(db, { plugins: [{ source: 'npm:@scope/foo' }] }, { env: 'browser' }))
+			.rejects.toThrow(/requires allowCdn=true/);
 	});
 
 	it('aggregates every failure, naming each source and its reason', async () => {

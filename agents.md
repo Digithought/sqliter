@@ -66,6 +66,7 @@ Task workflow in `tickets/` folder (see `tickets/AGENTS.md`).
 - `yarn test:store` re-runs `packages/quereus` logic tests vs LevelDB store module (slower; exercises store path for ALTER, constraints, transactions, etc.)
 - `yarn test:full` runs both — **only for store-specific diagnosis or release prep**
 - `yarn lint` fans out across **every** package (`workspaces foreach ... run lint`). Only `packages/quereus` has a real lint (eslint **+** type-checks test files via `tsc -p tsconfig.test.json --noEmit`, catches signature drift in spec call sites too; ~adds tsc pass, slower than eslint alone). Every other package ships an intentional `echo 'No lint configured'` no-op so foreach reaches it instead of silently skipping — each package has a `lint` script, so `yarn check` can't miss one
+- `yarn typecheck` fans out too, and runs inside `yarn check` **after** `yarn build` (a package whose typecheck covers its test files — e.g. `plugin-loader`'s `tsconfig.test.json` pass — resolves workspace deps via their built `dist` types). Put a test-file type pass in `typecheck`, not `lint`, for that reason
 - Windows: lint globs must single-quote, avoid cmd-line-too-long errors
 - Tests: Mocha + ts-node/esm for quereus, Vitest for other packages
 - Default cwd = repo root. Already `cd packages/quereus` in prior Bash call? cwd persists — don't re-prefix `cd packages/quereus &&`. Chain in one Bash call, or use absolute paths / `yarn workspace @quereus/quereus run <script>` from root.

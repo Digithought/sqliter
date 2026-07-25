@@ -159,6 +159,21 @@ describe('loadPlugin dispatch', () => {
 		expect(readCapturedConfig(CAPTURE_KEY)?.from).toBe('direct-url');
 	});
 
+	it('reports the protocol for a parseable URL outside the allowlist', async () => {
+		// A disallowed scheme must not fall through to the package branch, where it
+		// would be reported as an unresolvable package name.
+		await expect(loadPlugin('http://example.com/plugin.js', db, {}, { env: 'node' }))
+			.rejects.toThrow(/Unsupported plugin URL protocol 'http:'/);
+		await expect(loadPlugin('data:text/javascript,export default () => ({})', db, {}, { env: 'node' }))
+			.rejects.toThrow(/Unsupported plugin URL protocol 'data:'/);
+	});
+
+	it('still treats an npm: spec as a package, not a URL', async () => {
+		// `npm:` parses as a URL, so it is the one scheme the URL branch must skip.
+		await expect(loadPlugin(`npm:${MISSING_PACKAGE}`, db, {}, { env: 'node' }))
+			.rejects.toThrow(/Failed to resolve plugin package/);
+	});
+
 	it('rejects a spec that is neither a URL nor a package name', async () => {
 		await expect(loadPlugin('', db)).rejects.toThrow(/Invalid plugin spec/);
 		await expect(loadPlugin('has space', db)).rejects.toThrow(/Invalid plugin spec/);

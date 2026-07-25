@@ -35,9 +35,12 @@ type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
  */
 export function interpolateEnvVars(value: JsonValue, env: Record<string, string> = {}): JsonValue {
 	if (typeof value === 'string') {
-		return value.replace(/\$\{([^}]+)\}/g, (_match, varSpec: string) => {
-			const [varName, defaultValue] = varSpec.split(':-');
-			return env[varName.trim()] ?? defaultValue ?? _match;
+		return value.replace(/\$\{([^}]+)\}/g, (match, varSpec: string) => {
+			const { name, defaultValue } = parsePlaceholder(varSpec);
+			// Own properties only: without this, `${constructor}` or `${toString}`
+			// would resolve to an inherited Object.prototype member.
+			if (Object.hasOwn(env, name)) return env[name];
+			return defaultValue ?? match;
 		});
 	}
 	if (typeof value === 'object' && value !== null) {
@@ -51,6 +54,16 @@ export function interpolateEnvVars(value: JsonValue, env: Record<string, string>
 		return result;
 	}
 	return value;
+}
+
+/**
+ * Splits a `${...}` body into its variable name and optional default. Only the
+ * *first* `:-` separates, so a default may itself contain `:-` (e.g. a URL).
+ */
+function parsePlaceholder(varSpec: string): { name: string; defaultValue?: string } {
+	const separator = varSpec.indexOf(':-');
+	if (separator === -1) return { name: varSpec.trim() };
+	return { name: varSpec.slice(0, separator).trim(), defaultValue: varSpec.slice(separator + 2) };
 }
 
 /**

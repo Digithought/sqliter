@@ -26,8 +26,11 @@ const db = new Database();
 // Load from npm package (Node.js)
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, { api_key: '...' });
 
-// Load from URL (Node.js or Browser)
+// Load from an https:// URL (Browser only — Node's ESM loader rejects https:)
 await dynamicLoadModule('https://example.com/plugin.js', db, { timeout: 10000 });
+
+// Load from a local file (Node.js)
+await dynamicLoadModule('file:///path/to/plugin.mjs', db, { timeout: 10000 });
 
 // Browser with CDN (opt-in)
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, {}, { allowCdn: true });
