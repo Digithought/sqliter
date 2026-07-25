@@ -189,7 +189,9 @@ This ensures type information flows through the entire planning and execution pi
 - Physical: `PhysicalType.TEXT` (ISO 8601 duration string: "PT1H30M", "P1DT2H")
 - Values: ISO 8601 duration strings
 - Validation: Must parse as valid Temporal.Duration
-- Comparison: Total duration comparison (normalized to seconds)
+- Comparison: Total duration comparison (normalized to seconds; calendar units — years/months/weeks — resolve against a fixed reference date, 2024-01-01)
+- Ordering: **Semantic** (`semanticOrdering: true`) — ordered by elapsed time, not by duration text: `'PT90M'` sorts before `'PT2H'` although the text sorts the other way. See "Semantic ordering" below.
+- Identity: `'PT1H'` and `'PT60M'` are the *same* elapsed time — `=` treats them equal, and DISTINCT / GROUP BY / set operations / hash-join keys collapse them (via the type's `groupKey` hook, which maps compare-equal values to one hash representative). Which textual representative survives is unspecified.
 - Collations: None
 - Arithmetic: Supports addition/subtraction with DATE, TIME, DATETIME types
 - Human-readable parsing: `timespan('1 hour 30 minutes')` → `"PT1H30M"`
@@ -206,11 +208,53 @@ This ensures type information flows through the entire planning and execution pi
 - Values: Native JS objects, arrays, and JSON-compatible primitives (stored in memory as-is)
 - Validation: Must be valid JSON; accepts objects, arrays, numbers, booleans, strings (parsed as JSON), and null
 - Comparison: Deep structural comparison (`deepCompareJson`). **Object key order is not significant** — `{a:1,b:2}` equals `{b:2,a:1}` — but **array element order is** (positional). Numeric storage class holds, so a JSON scalar `5` equals `5.0`.
+- Ordering: **Semantic** (`semanticOrdering: true`) — ORDER BY and `<`/`>` on a declared JSON column rank by the structural deep-compare (JSON type rank: null < boolean < number < string < array < object, then element/key-wise recursion — so `{"a":2}` sorts before `{"a":10}`), not by canonical JSON text. Equality is identical under both forms, so identity paths (DISTINCT, GROUP BY, hash keys) need no change. See "Semantic ordering" below.
 - Keys: hash keys (GROUP BY / DISTINCT / join partitioning) and persisted byte keys (JSON PK / index) derive from a **single canonical form** (`canonicalJsonString` — recursive object-key sort, arrays positional) so a value's key always agrees with the comparator: reorder-equal objects group/de-dup/conflict as one, distinct objects never over-merge. The canonical form is used **only to derive keys** — never for storage or display.
 - Collations: None
 - Serialization: `serialize()` converts to JSON string for storage; `deserialize()` parses back to native object. Storage and display preserve **insertion order** (only key derivation canonicalizes)
 - Conversion: `json(value)` parses a JSON string into a native object; inserting a JSON string into a JSON column auto-parses it
 - Functions: All `json_*` functions accept both native objects and JSON strings as input
+
+---
+
+## Semantic ordering
+
+Some logical types define an order that observably differs from the storage-class +
+collation order of their stored representation. These declare
+`semanticOrdering: true` on the `LogicalType`, and the rule is:
+
+> Wherever a value of a declared logical type is ordered or compared — ORDER BY,
+> `<`/`>`/`=` operators, BETWEEN, primary-key/index order and range scans,
+> DISTINCT / GROUP BY / set-operation identity, window ORDER BY/PARTITION BY,
+> merge/hash join keys — the type's `compare` function is the order. Text/byte
+> order is a storage encoding detail, never a user-visible semantic.
+
+Today the flag is set on **TIMESPAN** (elapsed-time order) and **JSON** (structural
+order). DATE/TIME/DATETIME need no flag: their canonical ISO text order *is* their
+semantic order, so the cheaper storage-class compare is already correct. ANY and
+untyped expressions have no semantic-ordering type and keep storage-class +
+collation ordering (their declared `compare` is a BINARY fallback that ignores
+collation, which is why the flag — not mere presence of `compare` — gates routing).
+
+The flag keys on the **declared** logical type of the column/expression, not the
+runtime value: an ANY column holding a duration-shaped string still orders as text.
+When only one side of a comparison is declared (e.g. `timespan_col > 'PT90M'` with a
+plain text literal), the runtime temporal check in the generic comparison path still
+compares durations semantically; the typed fast path engages when *both* sides share
+the semantic-ordering type. Probes of a different storage class (an integer literal
+against a TIMESPAN column) order by storage class and never falsely compare equal
+(`createTypedComparator`'s mismatch fallback).
+
+Hash-keyed identity (GROUP BY, window PARTITION BY, hash-join build/probe) cannot
+call `compare` pairwise, so a semantic-ordering type whose stored form is not
+canonical for equality also supplies `groupKey` — a canonical representative such
+that compare-equal values serialize to the same hash key (TIMESPAN maps to total
+seconds against the same fixed reference date `compare` uses). JSON needs no
+`groupKey`: canonical-text equality and structural equality coincide.
+
+Known gap: the built-in `min`/`max` aggregates rank with a bare BINARY compare —
+aggregate step functions receive no type context — so `min(timespan_col)` returns
+the text-order extremum, not the shortest duration (tracked as a fix ticket).
 
 ---
 

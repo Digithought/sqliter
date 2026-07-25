@@ -7,8 +7,9 @@ import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
-import { compareSqlValuesFast } from '../../util/comparison.js';
-import type { CollationFunction } from '../../util/comparison.js';
+import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering } from '../../util/comparison.js';
+import type { SqlValue } from '../../common/types.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
@@ -24,13 +25,13 @@ function compareKeys(
 	rightRow: Row,
 	leftIndices: number[],
 	rightIndices: number[],
-	collations: CollationFunction[]
+	comparators: Array<(a: SqlValue, b: SqlValue) => number>
 ): number | null {
 	for (let i = 0; i < leftIndices.length; i++) {
 		const lv = leftRow[leftIndices[i]];
 		const rv = rightRow[rightIndices[i]];
 		if (lv === null || rv === null) return null;
-		const cmp = compareSqlValuesFast(lv, rv, collations[i]);
+		const cmp = comparators[i](lv, rv);
 		if (cmp !== 0) return cmp;
 	}
 	return 0;
@@ -52,10 +53,10 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 	const leftRowDescriptor = buildRowDescriptor(leftAttributes);
 	const rightRowDescriptor = buildRowDescriptor(rightAttributes);
 
-	// Pre-resolve equi-pair column indices and collation functions
+	// Pre-resolve equi-pair column indices and key comparators
 	const leftIndices: number[] = [];
 	const rightIndices: number[] = [];
-	const collations: CollationFunction[] = [];
+	const keyComparators: Array<(a: SqlValue, b: SqlValue) => number> = [];
 	const leftIndex = plan.left.getAttributeIndex();
 	const rightIndex = plan.right.getAttributeIndex();
 	for (const pair of plan.equiPairs) {
@@ -78,7 +79,17 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 		// gate's docstring in equi-pair-extractor.ts), so this is unreachable for
 		// legitimately-admitted pairs.
 		const collationName = effectiveCollationOfTypes(leftAttributes[li].type, rightAttributes[ri].type);
-		collations.push(ctx.resolveCollation(collationName));
+		const collationFunc = ctx.resolveCollation(collationName);
+		// When both sides declare the SAME semantic-ordering logical type (TIMESPAN,
+		// JSON), advance/match under the type's compare — the inputs are sorted by it
+		// (Sort and index order are typed since the semantic-ordering change), so a
+		// collation/text compare here would advance the wrong side and drop matches.
+		// Mixed or plain pairs keep the storage-class + collation compare.
+		const leftLogical = leftAttributes[li].type.logicalType as LogicalType;
+		const rightLogical = rightAttributes[ri].type.logicalType as LogicalType;
+		keyComparators.push(leftLogical === rightLogical && hasSemanticOrdering(leftLogical)
+			? createTypedComparator(leftLogical, collationFunc)
+			: (a, b) => compareSqlValuesFast(a, b, collationFunc));
 	}
 
 	const rightColCount = rightAttributes.length;
@@ -132,7 +143,7 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 				} else {
 					// Advance right pointer past rows that are less than the current left key
 					while (rightIdx < rightRows.length) {
-						const cmp = compareKeys(leftRow, rightRows[rightIdx], leftIndices, rightIndices, collations);
+						const cmp = compareKeys(leftRow, rightRows[rightIdx], leftIndices, rightIndices, keyComparators);
 						if (cmp === null) {
 							// Right row has NULL key — skip it
 							rightIdx++;
@@ -145,7 +156,7 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 					// Collect the run of matching right rows
 					let runStart = rightIdx;
 					while (runStart < rightRows.length) {
-						const cmp = compareKeys(leftRow, rightRows[runStart], leftIndices, rightIndices, collations);
+						const cmp = compareKeys(leftRow, rightRows[runStart], leftIndices, rightIndices, keyComparators);
 						if (cmp !== 0) break; // No longer equal
 						runStart++;
 					}

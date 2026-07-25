@@ -8,7 +8,8 @@ import { LiteralNode } from "../../planner/nodes/scalar.js";
 import type { ScalarPlanNode, PlanNode } from "../../planner/nodes/plan-node.js";
 import { isRelationalNode } from "../../planner/nodes/plan-node.js";
 import { emitPlanNode, emitCallFromPlan } from "../emitters.js";
-import { compareSqlValuesFast, isTruthy } from "../../util/comparison.js";
+import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, isTruthy } from "../../util/comparison.js";
+import type { LogicalType } from "../../types/logical-type.js";
 import type { CollationFunction } from "../../util/comparison.js";
 import { coerceToNumberForArithmetic } from "../../util/coercion.js";
 import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
@@ -236,7 +237,26 @@ export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Inst
 	let run: (ctx: RuntimeContext, v1: SqlValue, v2: SqlValue) => SqlValue;
 	let noteTag: string;
 
-	if (!needsTemporalCheck && bothSameCategory) {
+	// Both operands declare the SAME logical type with semantic ordering (TIMESPAN,
+	// JSON): route the operator through the type's compare so `<`/`>`/`=` agree with
+	// ORDER BY and index order (elapsed-time for TIMESPAN, structural for JSON).
+	// createTypedComparator keeps the storage-class-mismatch fallback, so a runtime
+	// probe of a different storage class orders by class rather than falsely matching.
+	// Mixed pairs (typed column vs plain text literal) fall to the generic path below,
+	// whose runtime temporal check already handles duration-vs-text semantically.
+	const sharedSemanticType = leftLogical === rightLogical && hasSemanticOrdering(leftLogical as LogicalType)
+		? leftLogical as LogicalType
+		: undefined;
+
+	if (sharedSemanticType) {
+		const typedCompare = createTypedComparator(sharedSemanticType, collationFunc);
+		const cmpToResult = buildCmpToResult(operator, plan);
+		run = function runSemanticTypedCompare(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+			if (v1 === null || v2 === null) return null;
+			return cmpToResult(typedCompare(v1, v2));
+		};
+		noteTag = 'compare-typed';
+	} else if (!needsTemporalCheck && bothSameCategory) {
 		// Fast same-category comparison: no temporal check, no coercion needed
 		// Use compareSqlValuesFast which handles runtime type mismatches gracefully
 		const cmpToResult = buildCmpToResult(operator, plan);

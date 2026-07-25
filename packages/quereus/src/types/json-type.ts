@@ -11,6 +11,11 @@ import { compareCodePoints } from '../util/comparison.js';
 export const JSON_TYPE: LogicalType = {
 	name: 'JSON',
 	physicalType: PhysicalType.OBJECT,
+	// Ordered by structural deep-compare (type rank, then element/key-wise recursion:
+	// {"a":2} < {"a":10}), not by canonical JSON text. Equality is unchanged —
+	// canonical-text equal iff structurally equal — so no groupKey hook is needed;
+	// only the ordering differs. See LogicalType.semanticOrdering.
+	semanticOrdering: true,
 
 	validate: (v) => {
 		if (v === null) return true;
@@ -53,9 +58,20 @@ export const JSON_TYPE: LogicalType = {
 		return v; // Already native
 	},
 
-	compare: (a, b) => {
+	compare: (a, b, collation) => {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
+
+		// Two JSON string scalars under an explicit collation: honor it. A NOCASE pin
+		// on a JSON comparison must keep discriminating exactly as the storage-class
+		// TEXT compare always did ('Bob' = 'bob' under NOCASE — see
+		// test/planner/collation-soundness.spec.ts). BINARY is code-point order,
+		// identical to the structural string-leaf compare, so this branch only
+		// changes behavior for non-BINARY pins. In-engine JSON values are native
+		// objects or scalar strings — serialized JSON text does not reach here.
+		if (typeof a === 'string' && typeof b === 'string' && collation) {
+			return collation(a, b);
+		}
 
 		// Ensure both are in native form for comparison
 		const parsedA = typeof a === 'string' ? safeJsonParse(a) : a as JSONValue;

@@ -7,7 +7,7 @@ import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { resolveWindowFunction, type WindowFunctionSchema } from '../../schema/window-function.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { createTypedComparator, createOrderByComparatorFast } from '../../util/comparison.js';
+import { createTypedComparator, createTypedOrderByComparator, hasSemanticOrdering } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
@@ -50,13 +50,15 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 	// Create row descriptors
 	const sourceRowDescriptor = buildRowDescriptor(plan.source.getAttributes());
 
-	// Pre-resolve ORDER BY comparators using actual expression types (not hardcoded BINARY)
+	// Pre-resolve ORDER BY comparators using actual expression types (not hardcoded BINARY).
+	// Semantic-ordering types (TIMESPAN, JSON) rank by the type's compare — matching the
+	// typed peer-equality comparators below, so ordering and peer detection agree.
 	const orderByComparators = plan.orderByExpressions.map((exprPlan, i) => {
 		const exprType = exprPlan.getType();
 		const collationName = exprType.collationName || 'BINARY';
 		const collationFunc = ctx.resolveCollation(collationName);
 		const orderClause = plan.windowSpec.orderBy[i];
-		return createOrderByComparatorFast(orderClause.direction, orderClause.nulls, collationFunc);
+		return createTypedOrderByComparator(exprType.logicalType as LogicalType, orderClause.direction, orderClause.nulls, collationFunc);
 	});
 
 	// Pre-resolve typed equality comparators for ORDER BY (used in ranking functions)
@@ -71,6 +73,24 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 		const exprType = exprPlan.getType();
 		return ctx.resolveKeyNormalizer(hashKeyCollationName(exprType.collationName, [exprType]));
 	});
+
+	// Partition-key canonicalizers for semantic-ordering key types: values the type's
+	// compare treats as equal (TIMESPAN 'PT1H' ≡ 'PT60M') must land in one partition,
+	// so they serialize via the type's groupKey representative (mirrors GROUP BY in
+	// hash-aggregate.ts).
+	const partitionKeyCanonicalizers = plan.partitionExpressions.map(exprPlan => {
+		const logical = exprPlan.getType().logicalType as LogicalType;
+		return hasSemanticOrdering(logical) && logical.groupKey
+			? (v: SqlValue) => logical.groupKey!(v)
+			: undefined;
+	});
+	const hasPartitionCanonicalizer = partitionKeyCanonicalizers.some(c => c !== undefined);
+	const serializePartitionKey = (values: SqlValue[]): string => {
+		const keyValues = hasPartitionCanonicalizer
+			? values.map((v, i) => partitionKeyCanonicalizers[i] ? partitionKeyCanonicalizers[i]!(v) : v)
+			: values;
+		return serializeKeyNullGrouping(keyValues, partitionKeyNormalizers);
+	};
 
 	async function* run(
 		rctx: RuntimeContext,
@@ -105,7 +125,7 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 				yield* runStreaming(
 					plan, functionSchemas, rctx, source, sourceRowDescriptor,
 					partitionCallbackList, orderByCallbackList, funcArgCallbackGroups,
-					partitionKeyNormalizers, orderByEqualityComparators,
+					serializePartitionKey, orderByEqualityComparators,
 				);
 				return;
 			}
@@ -127,7 +147,7 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 			} else {
 				// With partitioning - group by partition keys
 				const partitions = await groupByPartitions(
-					allRows, partitionCallbackList, rctx, sourceSlot, partitionKeyNormalizers
+					allRows, partitionCallbackList, rctx, sourceSlot, serializePartitionKey
 				);
 
 				for (const partitionRows of partitions.values()) {
@@ -165,7 +185,7 @@ async function groupByPartitions(
 	partitionCallbacks: Array<(ctx: RuntimeContext) => OutputValue>,
 	rctx: RuntimeContext,
 	sourceSlot: RowSlot,
-	keyNormalizers: readonly ((s: string) => string)[]
+	serializePartitionKey: (values: SqlValue[]) => string
 ): Promise<Map<string, Row[]>> {
 	const partitions = new Map<string, Row[]>();
 
@@ -180,7 +200,7 @@ async function groupByPartitions(
 			const raw = callback(rctx);
 			partitionValues.push((raw instanceof Promise ? await raw : raw) as SqlValue);
 		}
-		const partitionKey = serializeKeyNullGrouping(partitionValues, keyNormalizers);
+		const partitionKey = serializePartitionKey(partitionValues);
 
 		if (!partitions.has(partitionKey)) {
 			partitions.set(partitionKey, []);
@@ -938,7 +958,7 @@ async function* runStreaming(
 	partitionCallbacks: ReadonlyArray<(ctx: RuntimeContext) => OutputValue>,
 	orderByCallbacks: ReadonlyArray<(ctx: RuntimeContext) => OutputValue>,
 	funcArgCallbackGroups: ReadonlyArray<ReadonlyArray<(ctx: RuntimeContext) => OutputValue>>,
-	partitionKeyNormalizers: ReadonlyArray<(s: string) => string>,
+	serializePartitionKey: (values: SqlValue[]) => string,
 	orderByEqualityComparators: ReadonlyArray<(a: SqlValue, b: SqlValue) => number>,
 ): AsyncIterable<Row> {
 	const streaming = plan.streaming!;
@@ -1027,7 +1047,7 @@ async function* runStreaming(
 			const rawP = cb(rctx);
 			partitionValues.push((rawP instanceof Promise ? await rawP : rawP) as SqlValue);
 		}
-		const partitionKey = serializeKeyNullGrouping(partitionValues, partitionKeyNormalizers);
+		const partitionKey = serializePartitionKey(partitionValues);
 
 		// Resolve ORDER BY values (same shared-subtree concern as above).
 		const orderByValues: SqlValue[] = [];

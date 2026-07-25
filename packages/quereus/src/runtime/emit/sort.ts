@@ -4,7 +4,8 @@ import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type Row, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { createOrderByComparatorFast } from '../../util/comparison.js';
+import { createTypedOrderByComparator } from '../../util/comparison.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { withAsyncRowContext } from '../context-helpers.js';
 
@@ -20,7 +21,10 @@ export function emitSort(plan: SortNode, ctx: EmissionContext): Instruction {
 		const keyType = key.expression.getType();
 		const collationName = keyType.collationName || 'BINARY';
 		const collationFunc = ctx.resolveCollation(collationName);
-		return createOrderByComparatorFast(key.direction, key.nulls, collationFunc);
+		// Semantic-ordering key types (TIMESPAN, JSON) rank by the type's compare;
+		// everything else keeps the storage-class + collation fast path. Per-key
+		// selection, so composite sorts mix typed and plain keys correctly.
+		return createTypedOrderByComparator(keyType.logicalType as LogicalType, key.direction, key.nulls, collationFunc);
 	});
 
 	async function* run(

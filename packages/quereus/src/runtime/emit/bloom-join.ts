@@ -2,12 +2,14 @@ import type { BloomJoinNode } from '../../planner/nodes/bloom-join-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
-import type { Row, SubProgram } from '../../common/types.js';
+import type { Row, SqlValue, SubProgram } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
-import { serializeRowKey } from '../../util/key-serializer.js';
+import { serializeKey, serializeRowKey } from '../../util/key-serializer.js';
+import { hasSemanticOrdering } from '../../util/comparison.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { effectiveCollationOfTypes, hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
@@ -53,6 +55,28 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		keyNormalizers.push(ctx.resolveKeyNormalizer(hashKeyCollationName(collationName, [leftType, rightType])));
 	}
 
+	// Hash-key canonicalizers for semantic-ordering key types: the serialized key IS
+	// the join match (no re-verify), so values `=` treats as equal (TIMESPAN
+	// 'PT1H' ≡ 'PT60M') must serialize identically. Mirrors GROUP BY in
+	// hash-aggregate.ts; per equi-pair, active only when both sides declare the same
+	// semantic-ordering logical type with a groupKey hook.
+	const keyCanonicalizers = plan.equiPairs.map((_pair, i) => {
+		const leftLogical = leftAttributes[leftIndices[i]].type.logicalType as LogicalType;
+		const rightLogical = rightAttributes[rightIndices[i]].type.logicalType as LogicalType;
+		return leftLogical === rightLogical && hasSemanticOrdering(leftLogical) && leftLogical.groupKey
+			? (v: SqlValue) => leftLogical.groupKey!(v)
+			: undefined;
+	});
+	const hasKeyCanonicalizer = keyCanonicalizers.some(c => c !== undefined);
+	const extractKey = (row: Row, indices: number[]): string | null => {
+		if (!hasKeyCanonicalizer) return serializeRowKey(row, indices, keyNormalizers);
+		const values = indices.map((idx, i) => {
+			const v = row[idx];
+			return keyCanonicalizers[i] ? keyCanonicalizers[i]!(v) : v;
+		});
+		return serializeKey(values, keyNormalizers);
+	};
+
 	const rightColCount = rightAttributes.length;
 
 	// The residual sub-program is a param only when `plan.residualCondition` is set,
@@ -88,7 +112,7 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 			// === Build phase: materialize right side into hash map ===
 			const hashMap = new Map<string, Row[]>();
 			for await (const rightRow of rightSource) {
-				const key = serializeRowKey(rightRow, rightIndices, keyNormalizers);
+				const key = extractKey(rightRow, rightIndices);
 				if (key === null) continue; // null keys can't match
 				const bucket = hashMap.get(key);
 				if (bucket) {
@@ -107,7 +131,7 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 				const leftRow = next.value;
 				leftSlot.set(leftRow);
 
-				const key = serializeRowKey(leftRow, leftIndices, keyNormalizers);
+				const key = extractKey(leftRow, leftIndices);
 				let matched = false;
 
 				if (key !== null) {

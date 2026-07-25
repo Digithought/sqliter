@@ -2,11 +2,10 @@ import type { ScanPlan } from './scan-plan.js';
 import type { Layer } from './interface.js';
 import type { BTreeKey, BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
-import { compareSqlValuesFast } from '../../../util/comparison.js';
 import { StatusCode, type Row } from '../../../common/types.js';
 import { safeIterate } from './safe-iterate.js';
 import { QuereusError } from '../../../common/errors.js';
-import { planAppliesToKey, resolveScanCollations, type ResolvedScanCollations } from './plan-filter.js';
+import { planAppliesToKey, resolveScanComparators, type ResolvedScanComparators } from './plan-filter.js';
 
 /**
  * True if a multi-seek key is SQL NULL (scalar) or contains any NULL component
@@ -22,27 +21,30 @@ function seekKeyHasNull(key: BTreeKey): boolean {
  * Scans a layer (base or transaction) according to a ScanPlan, yielding matching rows.
  * Operates on the Layer interface — the inherited BTrees handle data inheritance transparently.
  *
- * The plan's collation *names* are resolved against the layer's database exactly once
- * here; {@link scanLayerResolved} does the work and passes the functions down its own
- * recursion, so a multi-seek or multi-range plan never re-resolves per sub-scan or per row.
+ * The plan's collation names and the scanned index's column types are resolved into
+ * per-column comparators exactly once here; {@link scanLayerResolved} does the work and
+ * passes the functions down its own recursion, so a multi-seek or multi-range plan
+ * never re-resolves per sub-scan or per row. The comparators mirror the tree's own key
+ * comparator (typed — see plan-filter.ts), so bound filtering and early termination
+ * agree with the physical BTree order.
  */
 export function* scanLayer(
 	layer: Layer,
 	plan: ScanPlan
 ): Iterable<Row> {
-	yield* scanLayerResolved(layer, plan, resolveScanCollations(plan, layer.collationResolver));
+	yield* scanLayerResolved(layer, plan, resolveScanComparators(plan, layer.getSchema(), layer.collationResolver));
 }
 
 /**
- * The scan body. `collations` holds the plan's already-resolved collation functions;
- * narrowing a plan (multi-seek → single key, multi-range → single range) never changes
- * which columns the prefix/bound collations describe, so the same functions are reused
- * down the recursion.
+ * The scan body. `comparators` holds the plan's already-resolved bound/prefix
+ * comparators; narrowing a plan (multi-seek → single key, multi-range → single range)
+ * never changes which columns the prefix/bound comparators describe, so the same
+ * functions are reused down the recursion.
  */
 function* scanLayerResolved(
 	layer: Layer,
 	plan: ScanPlan,
-	collations: ResolvedScanCollations,
+	comparators: ResolvedScanComparators,
 ): Iterable<Row> {
 	// Multi-seek: iterate over multiple equality keys (e.g. `col IN (v1, v2, …)`).
 	// This is set-membership, not a bag, so two faults must be avoided:
@@ -64,7 +66,7 @@ function* scanLayerResolved(
 		for (const key of plan.equalityKeys) {
 			if (seekKeyHasNull(key)) continue;
 			const singlePlan: ScanPlan = { ...plan, equalityKey: key, equalityKeys: undefined };
-			for (const row of scanLayerResolved(layer, singlePlan, collations)) {
+			for (const row of scanLayerResolved(layer, singlePlan, comparators)) {
 				const encoded = encodePk(primaryKeyExtractorFromRow(row));
 				// A key already in `seen` means this row was yielded by an earlier seek.
 				if (seen.has(encoded)) continue;
@@ -84,7 +86,7 @@ function* scanLayerResolved(
 				lowerBound: range.lowerBound,
 				upperBound: range.upperBound,
 			};
-			yield* scanLayerResolved(layer, singlePlan, collations);
+			yield* scanLayerResolved(layer, singlePlan, comparators);
 		}
 		return;
 	}
@@ -157,13 +159,13 @@ function* scanLayerResolved(
 		for (const value of safeIterate(tree, isAscending, startKey, primaryKeyExtractorFromRow)) {
 			const row = value as Row;
 			const primaryKey = primaryKeyExtractorFromRow(row);
-			if (!planAppliesToKey(plan, primaryKey, primaryKeyComparator, collations)) {
+			if (!planAppliesToKey(plan, primaryKey, primaryKeyComparator, comparators)) {
 				// Early termination for prefix-range: break when prefix no longer matches
 				if (plan.equalityPrefix) {
 					const keyArr = Array.isArray(primaryKey) ? primaryKey : [primaryKey];
 					let prefixMismatch = false;
 					for (let i = 0; i < plan.equalityPrefix.length; i++) {
-						if (compareSqlValuesFast(keyArr[i], plan.equalityPrefix[i], collations.equalityPrefix[i]) !== 0) {
+						if (comparators.equalityPrefix[i](keyArr[i], plan.equalityPrefix[i]) !== 0) {
 							prefixMismatch = true;
 							break;
 						}
@@ -173,16 +175,17 @@ function* scanLayerResolved(
 					// Past the bound we terminate at — early exit. We seek from one end
 					// and terminate at the other, so this is the complement of
 					// seekFromUpper and holds for both physical walk directions. The
-					// terminating compare uses the bound column's declared collation so a
-					// non-BINARY walk terminates at the collation-correct boundary.
+					// terminating compare uses the bound column's typed comparator (same
+					// construction as the tree's key comparator) so the walk terminates
+					// at the boundary of the tree's own order.
 					const keyForComparison = Array.isArray(primaryKey) ? primaryKey[0] : primaryKey;
 					if (!seekFromUpper && plan.upperBound) {
-						const cmp = compareSqlValuesFast(keyForComparison, plan.upperBound.value, collations.bound);
+						const cmp = comparators.bound(keyForComparison, plan.upperBound.value);
 						if (cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT)) {
 							break;
 						}
 					} else if (seekFromUpper && plan.lowerBound) {
-						const cmp = compareSqlValuesFast(keyForComparison, plan.lowerBound.value, collations.bound);
+						const cmp = comparators.bound(keyForComparison, plan.lowerBound.value);
 						if (cmp < 0 || (cmp === 0 && plan.lowerBound.op === IndexConstraintOp.GT)) {
 							break;
 						}
@@ -265,13 +268,13 @@ function* scanLayerResolved(
 		}
 
 		for (const indexEntry of safeIterate(indexTree, isAscending, startKey, entry => entry.indexKey)) {
-			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator, collations)) {
+			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator, comparators)) {
 				// Early termination for prefix-range: break when prefix no longer matches
 				if (plan.equalityPrefix) {
 					const keyArr = Array.isArray(indexEntry.indexKey) ? indexEntry.indexKey : [indexEntry.indexKey];
 					let prefixMismatch = false;
 					for (let i = 0; i < plan.equalityPrefix.length; i++) {
-						if (compareSqlValuesFast(keyArr[i], plan.equalityPrefix[i], collations.equalityPrefix[i]) !== 0) {
+						if (comparators.equalityPrefix[i](keyArr[i], plan.equalityPrefix[i]) !== 0) {
 							prefixMismatch = true;
 							break;
 						}
@@ -281,16 +284,17 @@ function* scanLayerResolved(
 				}
 				// Early termination: break once the leading column passes the bound we
 				// terminate at (the complement of seekFromUpper; holds for both
-				// physical walk directions). Uses the bound column's declared collation
-				// so a non-BINARY index walk terminates at the collation-correct boundary.
+				// physical walk directions). Uses the bound column's typed comparator
+				// (same construction as the index tree's key comparator) so the walk
+				// terminates at the boundary of the tree's own order.
 				const keyForComparison = Array.isArray(indexEntry.indexKey) ? indexEntry.indexKey[0] : indexEntry.indexKey;
 				if (!seekFromUpper && plan.upperBound) {
-					const cmp = compareSqlValuesFast(keyForComparison, plan.upperBound.value, collations.bound);
+					const cmp = comparators.bound(keyForComparison, plan.upperBound.value);
 					if (cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT)) {
 						break;
 					}
 				} else if (seekFromUpper && plan.lowerBound) {
-					const cmp = compareSqlValuesFast(keyForComparison, plan.lowerBound.value, collations.bound);
+					const cmp = comparators.bound(keyForComparison, plan.lowerBound.value);
 					if (cmp < 0 || (cmp === 0 && plan.lowerBound.op === IndexConstraintOp.GT)) {
 						break;
 					}

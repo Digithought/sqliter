@@ -262,6 +262,24 @@ function parseHumanReadableDuration(input: string): Temporal.Duration | null {
 }
 
 /**
+ * Total elapsed seconds of an ISO 8601 duration string, resolving calendar units
+ * (years/months/weeks) against a fixed reference date so the mapping is total and
+ * deterministic engine-wide. This single helper backs both `TIMESPAN_TYPE.compare`
+ * and `TIMESPAN_TYPE.groupKey`, so ordering and hash-grouping identity can never
+ * disagree on the reference date. Returns undefined for unparseable input.
+ */
+function timespanTotalSeconds(v: string): number | undefined {
+	try {
+		const duration = Temporal.Duration.from(v);
+		// Reference date resolves calendar units (months/years have no fixed length)
+		const referenceDate = Temporal.PlainDate.from('2024-01-01');
+		return duration.total({ unit: 'seconds', relativeTo: referenceDate });
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * TIMESPAN type - stores ISO 8601 duration strings
  * Uses Temporal.Duration for validation and parsing
  */
@@ -269,6 +287,9 @@ export const TIMESPAN_TYPE: LogicalType = {
 	name: 'TIMESPAN',
 	physicalType: PhysicalType.TEXT,
 	isTemporal: true,
+	// Ordered by elapsed time, not by duration text: 'PT90M' < 'PT2H' though the
+	// text sorts the other way. See LogicalType.semanticOrdering.
+	semanticOrdering: true,
 
 	validate: (v) => {
 		if (v === null) return true;
@@ -311,21 +332,21 @@ export const TIMESPAN_TYPE: LogicalType = {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
 
-		try {
-			const durationA = Temporal.Duration.from(a as string);
-			const durationB = Temporal.Duration.from(b as string);
-
-			// Use a reference date to resolve calendar units
-			// This ensures consistent comparison of durations with months/years
-			const referenceDate = Temporal.PlainDate.from('2024-01-01');
-			const totalA = durationA.total({ unit: 'seconds', relativeTo: referenceDate });
-			const totalB = durationB.total({ unit: 'seconds', relativeTo: referenceDate });
-
-			return totalA < totalB ? -1 : totalA > totalB ? 1 : 0;
-		} catch {
+		const totalA = timespanTotalSeconds(a as string);
+		const totalB = timespanTotalSeconds(b as string);
+		if (totalA === undefined || totalB === undefined) {
 			// If parsing fails, fall back to binary string comparison
 			return BINARY_COLLATION(a as string, b as string);
 		}
+		return totalA < totalB ? -1 : totalA > totalB ? 1 : 0;
+	},
+
+	// Hash-grouping identity representative: equal elapsed times ('PT1H' ≡ 'PT60M')
+	// must key alike, so group on the total seconds compare() ranks by. Unparseable
+	// values keep their raw text (compare falls back to text for those too).
+	groupKey: (v) => {
+		if (typeof v !== 'string') return v;
+		return timespanTotalSeconds(v) ?? v;
 	},
 
 	supportedCollations: [],

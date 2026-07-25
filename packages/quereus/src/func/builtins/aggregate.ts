@@ -159,6 +159,12 @@ export const avgFunc = createAggregateFunction(
 );
 
 // --- MIN(X) ---
+// NOTE: min/max rank by storage-class + BINARY compare — aggregate step functions
+// receive bare runtime values, with no declared-type or collation context to consult.
+// For a TIMESPAN argument this is TEXT order, not elapsed-time order (min('PT2H',
+// 'PT90M') returns 'PT2H' though 90 minutes is smaller), disagreeing with ORDER
+// BY/`<` under the semantic-ordering rule (docs/types.md). Fixing it requires
+// threading the argument's logical type into the aggregate step/merge contract.
 export const minFunc = createAggregateFunction(
 	{
 		name: 'min',

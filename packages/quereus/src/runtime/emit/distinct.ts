@@ -4,7 +4,8 @@ import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import { type Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { createCollationRowComparator, BINARY_COLLATION } from '../../util/comparison.js';
+import { createSemanticRowComparator, BINARY_COLLATION } from '../../util/comparison.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { BTree } from 'inheritree';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
@@ -13,9 +14,13 @@ export function emitDistinct(plan: DistinctNode, ctx: EmissionContext): Instruct
 	// Create row descriptor for output attributes (same as source since DISTINCT preserves attributes)
 	const outputRowDescriptor = buildRowDescriptor(plan.getAttributes());
 
-	// Pre-resolve collation-based row comparator (safe for mixed-type rows)
+	// Pre-resolve the row-identity comparator (safe for mixed-type rows). Columns whose
+	// declared logical type has semantic ordering (TIMESPAN, JSON) compare through the
+	// type's compare so DISTINCT identity agrees with `=` (TIMESPAN 'PT1H' ≡ 'PT60M'
+	// collapses to one row); all other columns keep storage-class + collation identity.
 	const attributes = plan.getAttributes();
-	const collationRowComparator = createCollationRowComparator(
+	const collationRowComparator = createSemanticRowComparator(
+		attributes.map(attr => attr.type.logicalType as LogicalType),
 		attributes.map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
 	);
 

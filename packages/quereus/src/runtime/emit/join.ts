@@ -244,6 +244,11 @@ type ResolvedUsingColumn = {
  * Evaluates USING condition using pre-resolved column indices and collation functions.
  * All index lookups and collation resolution are done at emit time.
  * Uses compareSqlValuesFast for safe cross-type comparison.
+ *
+ * NOTE: USING equality is storage-class + collation, not semantic-ordering-aware —
+ * a TIMESPAN USING column treats 'PT1H'/'PT60M' as distinct where `l.d = r.d`
+ * treats them equal. Fine while USING on semantic-ordering columns stays unused;
+ * if it shows up, resolve per-column comparators like emitMergeJoin does.
  */
 function evaluateUsingCondition(
 	leftRow: Row,

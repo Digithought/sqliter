@@ -42,9 +42,11 @@ import {
 	BINARY_COLLATION,
 	builtinCollationResolver,
 	compareSqlValuesFast,
+	createTypedComparator,
+	hasSemanticOrdering,
 	normalizeCollationName,
 } from '../../util/comparison.js';
-import type { CollationFunction, CollationResolver } from '../../types/logical-type.js';
+import type { CollationFunction, CollationResolver, LogicalType } from '../../types/logical-type.js';
 import { isNoOpCast } from './scalar-invertibility.js';
 import { flipComparison } from './predicate-shape.js';
 import { createLogger } from '../../common/logger.js';
@@ -110,9 +112,25 @@ export function checkSatisfiability(
 	const collations = resolveColumnCollations(conjuncts, domains, bindings, attrIndex, getCollation, collationResolver);
 	if (collations === undefined) return 'unknown'; // a collation we cannot resolve ⇒ prove nothing
 
+	// Columns declared with a semantic-ordering logical type (TIMESPAN, JSON) must be
+	// reasoned about under the type's compare, not text order — otherwise a satisfiable
+	// range like `d BETWEEN 'PT30M' AND 'PT100M'` reads as empty ('PT30M' > 'PT100M'
+	// textually) and mints a false `unsat` that deletes rows. Types are discovered from
+	// the conjuncts' column references; a semantic-ordering column reachable only via
+	// domains/bindings (no reference in any conjunct) keeps the collation compare, which
+	// is the pre-existing conservative behavior for facts the checker cannot see.
+	const semanticTypes = collectSemanticColumnTypes(conjuncts, attrIndex);
+	const typedComparators = new Map<number, (a: SqlValue, b: SqlValue) => number>();
+	for (const [col, type] of semanticTypes) {
+		typedComparators.set(col, createTypedComparator(type, collations.get(col) ?? BINARY_COLLATION));
+	}
+
 	const accs = new Map<number, ColumnAccumulator>();
-	const cmp = (a: SqlValue, b: SqlValue, col: number): number =>
-		compareSqlValuesFast(a, b, collations.get(col) ?? BINARY_COLLATION);
+	const cmp = (a: SqlValue, b: SqlValue, col: number): number => {
+		const typed = typedComparators.get(col);
+		if (typed) return typed(a, b);
+		return compareSqlValuesFast(a, b, collations.get(col) ?? BINARY_COLLATION);
+	};
 
 	// 1) Seed accumulators from declared domains.
 	for (const d of domains) {
@@ -249,6 +267,34 @@ function tryResolve(resolver: CollationResolver, name: string): CollationFunctio
 		warnLog('Cannot reason about collation %s (%s); satisfiability check yields unknown', name, e);
 		return undefined;
 	}
+}
+
+/**
+ * Map each conjunct-referenced column to its declared logical type when that type
+ * carries semantic ordering (see {@link hasSemanticOrdering}); other columns are
+ * omitted and compare under storage-class + collation.
+ */
+function collectSemanticColumnTypes(
+	conjuncts: ReadonlyArray<ScalarPlanNode>,
+	attrIndex: (attrId: number) => number | undefined,
+): Map<number, LogicalType> {
+	const out = new Map<number, LogicalType>();
+	const stack: ScalarPlanNode[] = [...conjuncts];
+	while (stack.length > 0) {
+		const cur = stack.pop()!;
+		if (cur instanceof ColumnReferenceNode) {
+			const idx = attrIndex(cur.attributeId);
+			if (idx !== undefined) {
+				const logical = cur.getType().logicalType as LogicalType;
+				if (hasSemanticOrdering(logical)) out.set(idx, logical);
+			}
+			continue;
+		}
+		for (const child of cur.getChildren()) {
+			if ('expression' in child) stack.push(child as ScalarPlanNode);
+		}
+	}
+	return out;
 }
 
 /** Collect the physical column index of every `ColumnReferenceNode` reachable from `n`. */

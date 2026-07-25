@@ -435,29 +435,26 @@ export function compareWithOrderByFast(
 	nullsOrdering: NullsOrdering,
 	collationFunc: CollationFunction
 ): number {
-	let comparison: number;
-
 	// Fast path: both values are non-NULL (most common case)
 	if (a !== null && b !== null) {
-		comparison = compareSqlValuesFast(a, b, collationFunc);
-	} else if (a === null && b === null) {
-		comparison = 0;
-	} else if (a === null) {
-		// Explicit NULLS ordering is absolute — not affected by ASC/DESC
-		if (nullsOrdering === NullsOrdering.FIRST) return -1;
-		if (nullsOrdering === NullsOrdering.LAST) return 1;
-		// Default behavior: nulls always first (both ASC and DESC)
-		comparison = direction === SortDirection.DESC ? 1 : -1;
-	} else { // b === null
-		// Explicit NULLS ordering is absolute — not affected by ASC/DESC
-		if (nullsOrdering === NullsOrdering.FIRST) return 1;
-		if (nullsOrdering === NullsOrdering.LAST) return -1;
-		// Default behavior: nulls always first (both ASC and DESC)
-		comparison = direction === SortDirection.DESC ? -1 : 1;
+		const comparison = compareSqlValuesFast(a, b, collationFunc);
+		// Apply DESC direction (branchless when direction is ASC)
+		return direction === SortDirection.DESC ? -comparison : comparison;
 	}
+	return orderByNullResult(a, b, nullsOrdering);
+}
 
-	// Apply DESC direction (branchless when direction is ASC)
-	return direction === SortDirection.DESC ? -comparison : comparison;
+/**
+ * Final ORDER BY verdict for a pair with at least one NULL. NULL placement is
+ * absolute — never affected by ASC/DESC: explicit NULLS FIRST/LAST pin the ends,
+ * and the default places NULLs first for both directions (SQLite-compatible; the
+ * historical direction-conditioned form in {@link compareWithOrderByFast} negated
+ * itself back to the same result).
+ */
+function orderByNullResult(a: SqlValue, b: SqlValue, nullsOrdering: NullsOrdering): number {
+	if (a === null && b === null) return 0;
+	if (a === null) return nullsOrdering === NullsOrdering.LAST ? 1 : -1;
+	return nullsOrdering === NullsOrdering.LAST ? -1 : 1;
 }
 
 /**
@@ -484,6 +481,90 @@ export function createOrderByComparatorFast(
 	// Return a closure that captures the pre-resolved values
 	return (a: SqlValue, b: SqlValue): number => {
 		return compareWithOrderByFast(a, b, directionFlag, nullsFlag, collationFunc);
+	};
+}
+
+/**
+ * True when a logical type's `compare` defines an order that observably differs from
+ * storage-class + collation ordering (see {@link LogicalType.semanticOrdering}). This
+ * is the routing predicate for user-visible ordering/identity sites: ORDER BY,
+ * comparison operators, range-scan bound filters, and DISTINCT/GROUP BY identity use
+ * the type's `compare` exactly when this returns true.
+ */
+export function hasSemanticOrdering(type: LogicalType | undefined): type is LogicalType {
+	return type?.semanticOrdering === true && typeof type.compare === 'function';
+}
+
+/**
+ * ORDER BY comparator for one sort key of a declared logical type. When the type
+ * carries semantic ordering (see {@link hasSemanticOrdering}), non-NULL pairs are
+ * ranked by the type's `compare` (via {@link createTypedComparator}, which keeps the
+ * storage-class-mismatch fallback so a probe of a different storage class never
+ * falsely equals); otherwise this is exactly {@link createOrderByComparatorFast}.
+ *
+ * NULL placement is handled HERE, never delegated to `type.compare` — the type
+ * convention (NULL smallest, always) differs from ORDER BY's NULLS FIRST/LAST and
+ * default rules, which {@link orderByNullResult} implements.
+ */
+export function createTypedOrderByComparator(
+	type: LogicalType | undefined,
+	direction: 'asc' | 'desc' = 'asc',
+	nullsOrdering?: 'first' | 'last',
+	collationFunc: CollationFunction = BINARY_COLLATION
+): (a: SqlValue, b: SqlValue) => number {
+	if (!hasSemanticOrdering(type)) {
+		return createOrderByComparatorFast(direction, nullsOrdering, collationFunc);
+	}
+	const negate = direction === 'desc';
+	const nullsFlag = nullsOrdering === 'first'
+		? NullsOrdering.FIRST
+		: nullsOrdering === 'last'
+			? NullsOrdering.LAST
+			: NullsOrdering.DEFAULT;
+	const typedCompare = createTypedComparator(type, collationFunc);
+
+	return (a: SqlValue, b: SqlValue): number => {
+		if (a !== null && b !== null) {
+			const comparison = typedCompare(a, b);
+			return negate ? -comparison : comparison;
+		}
+		return orderByNullResult(a, b, nullsFlag);
+	};
+}
+
+/**
+ * Row comparator for identity checks (DISTINCT, set operations) that routes each
+ * column through its declared logical type's `compare` when — and only when — that
+ * type carries semantic ordering ({@link hasSemanticOrdering}); all other columns
+ * keep the storage-class + collation comparison of
+ * {@link createCollationRowComparator}. This makes row identity agree with `=`
+ * (e.g. TIMESPAN 'PT1H' ≡ 'PT60M' collapses) without perturbing collation-aware
+ * text identity on ANY/TEXT columns, whose declared `compare` is not
+ * collation-aware and must not be consulted here.
+ *
+ * `types[i]` may be undefined (untyped/mixed column) — such columns use the
+ * collation comparator. Safe for runtime type drift: the typed path's
+ * storage-class-mismatch guard (see {@link createTypedComparator}) falls back to
+ * storage-class ordering rather than mis-parsing.
+ */
+export function createSemanticRowComparator(
+	types: readonly (LogicalType | undefined)[],
+	collations: readonly CollationFunction[]
+): (a: Row, b: Row) => number {
+	const comparators = types.map((type, i) => {
+		const collationFunc = collations[i] ?? BINARY_COLLATION;
+		return hasSemanticOrdering(type)
+			? createTypedComparator(type, collationFunc)
+			: (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collationFunc);
+	});
+	const len = comparators.length;
+
+	return (a: Row, b: Row): number => {
+		for (let i = 0; i < len; i++) {
+			const cmp = comparators[i](a[i], b[i]);
+			if (cmp !== 0) return cmp;
+		}
+		return 0;
 	};
 }
 

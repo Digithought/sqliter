@@ -328,11 +328,15 @@ SELECT id FROM ts_test WHERE dur >= 'PT1H' ORDER BY id;
 SELECT id FROM ts_test WHERE dur != 'PT1H' ORDER BY id;
 → [{"id":1},{"id":3},{"id":4},{"id":5}]
 
--- ORDER BY with timespans (lexicographic on stored TEXT — P1D < PT*)
+-- ORDER BY with timespans: semantic (elapsed-time) order, matching `<`/`>` above
+-- (see docs/types.md "Semantic ordering"; was lexicographic before that ruling)
 SELECT id, dur FROM ts_test ORDER BY dur;
-→ [{"id":4,"dur":"P1D"},{"id":5,"dur":"PT0S"},{"id":2,"dur":"PT1H"},{"id":3,"dur":"PT2H"},{"id":1,"dur":"PT30M"}]
+→ [{"id":5,"dur":"PT0S"},{"id":1,"dur":"PT30M"},{"id":2,"dur":"PT1H"},{"id":3,"dur":"PT2H"},{"id":4,"dur":"P1D"}]
 
--- MIN / MAX aggregation (lexicographic)
+-- MIN / MAX aggregation: still lexicographic — KNOWN GAP, disagrees with the
+-- semantic ordering rule (aggregate steps carry no type context; tracked as a
+-- fix ticket). When min/max become type-aware this expectation flips to
+-- mn=PT0S, mx=P1D.
 SELECT min(dur) as mn, max(dur) as mx FROM ts_test;
 → [{"mn":"P1D","mx":"PT30M"}]
 

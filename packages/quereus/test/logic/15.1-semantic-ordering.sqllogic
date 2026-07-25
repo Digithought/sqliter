@@ -1,0 +1,151 @@
+-- 15.1-semantic-ordering.sqllogic - Semantic ordering for TIMESPAN and JSON
+--
+-- The rule (docs/types.md "Semantic ordering"): wherever a value of a declared
+-- semantic-ordering logical type is ordered or compared — ORDER BY, comparison
+-- operators, BETWEEN, PK order and range scans, DISTINCT/GROUP BY/set-operation
+-- identity, window ordering/partitioning, join keys — the type's compare is the
+-- order. TIMESPAN orders by elapsed time; JSON by structural deep-compare.
+
+-- === TIMESPAN primary key: order, elision, range scan, point seek ===
+
+create table m (d timespan primary key);
+insert into m values ('PT2H'), ('PT90M');
+
+-- Elapsed-time order: 90 minutes < 2 hours, though the text 'PT2H' < 'PT90M'.
+-- (This ORDER BY may be satisfied by the PK order — elided sort — or by a real
+-- sort; both must produce elapsed-time order.)
+select d from m order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+select d from m order by d desc;
+→ [{"d":"PT2H"},{"d":"PT90M"}]
+
+-- Range scan through the PK BTree: the bound filter must agree with the typed
+-- tree order (previously returned no rows — text-order filter over a
+-- elapsed-time-ordered tree produced an empty window).
+select d from m where d > 'PT90M';
+→ [{"d":"PT2H"}]
+
+select d from m where d < 'PT2H';
+→ [{"d":"PT90M"}]
+
+select d from m where d >= 'PT90M' order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+-- Point seek with an equal-elapsed-time spelling: PT120M ≡ PT2H.
+select d from m where d = 'PT120M';
+→ [{"d":"PT2H"}]
+
+-- BETWEEN agrees with the desugared comparisons: [30m, 100m] contains 90m only.
+-- (Text order would exclude PT90M: 'PT90M' > 'PT100M' lexicographically.)
+select d from m where d between 'PT30M' and 'PT100M';
+→ [{"d":"PT90M"}]
+
+drop table m;
+
+-- === TIMESPAN non-key column: real Sort node, comparisons ===
+
+create table s (id integer primary key, d timespan);
+insert into s values (1, 'PT2H'), (2, 'PT90M');
+
+-- Real sort (no index on d) must match the elided PK-order result above.
+select d from s order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+select d from s where d > 'PT90M';
+→ [{"d":"PT2H"}]
+
+select d from s where d between 'PT30M' and 'PT100M';
+→ [{"d":"PT90M"}]
+
+-- Window ordering ranks by elapsed time.
+select d, row_number() over (order by d) as rn from s order by rn;
+→ [{"d":"PT90M","rn":1},{"d":"PT2H","rn":2}]
+
+drop table s;
+
+-- === TIMESPAN identity: 'PT1H' ≡ 'PT60M' (same elapsed time) ===
+
+create table dt (id integer primary key, d timespan);
+insert into dt values (1, 'PT1H'), (2, 'PT60M');
+
+-- Equality operator already says they are equal.
+select (timespan('PT1H') = timespan('PT60M')) as r;
+→ [{"r":true}]
+
+-- DISTINCT through a typed column collapses (representative unspecified — assert
+-- the count, not the surviving text).
+select count(*) as c from (select distinct d from dt) as q;
+→ [{"c":1}]
+
+-- GROUP BY groups them together (project the key through total-seconds so the
+-- expectation does not depend on which textual representative survives).
+select timespan_total_seconds(d) as s, count(*) as c from dt group by d;
+→ [{"s":3600,"c":2}]
+
+-- Set-operation identity (UNION dedup) collapses them.
+select count(*) as c from (
+	select d from dt where id = 1
+	union
+	select d from dt where id = 2
+) as q;
+→ [{"c":1}]
+
+-- Window PARTITION BY places both rows in one partition.
+select count(*) over (partition by d) as c from dt;
+→ [{"c":2},{"c":2}]
+
+-- Equi-join matches across spellings (any join algorithm must agree with `=`).
+create table jt2 (id integer primary key, d timespan);
+insert into jt2 values (10, 'PT60M');
+select dt.id as l, jt2.id as r from dt join jt2 on dt.d = jt2.d order by l;
+→ [{"l":1,"r":10},{"l":2,"r":10}]
+
+drop table jt2;
+drop table dt;
+
+-- === Untyped expressions keep storage-class/text ordering ===
+
+-- Text literals (no declared TIMESPAN type): DISTINCT keeps both spellings.
+select count(*) as c from (
+	select distinct d from (select 'PT1H' as d union all select 'PT60M' as d) as u
+) as q;
+→ [{"c":2}]
+
+-- ANY column holding duration-shaped strings orders as text ('PT2H' < 'PT90M').
+create table anyt (id integer primary key, v any);
+insert into anyt values (1, 'PT2H'), (2, 'PT90M');
+select id from anyt order by v;
+→ [{"id":1},{"id":2}]
+
+drop table anyt;
+
+-- === JSON: structural ordering ===
+
+create table jv (id integer primary key, v json);
+insert into jv values (1, '{"a":10}'), (2, '{"a":2}');
+
+-- Structural order: {"a":2} < {"a":10} because 2 < 10 numerically (canonical-text
+-- order would sort '{"a":10}' first).
+select id from jv order by v;
+→ [{"id":2},{"id":1}]
+
+select id from jv order by v desc;
+→ [{"id":1},{"id":2}]
+
+-- Comparison operators use the structural order too.
+select (json('{"a":2}') < json('{"a":10}')) as r;
+→ [{"r":true}]
+
+-- JSON type-rank order: number < string < array < object.
+select (json('5') < json('"a"')) as r;
+→ [{"r":true}]
+
+select (json('[99]') < json('{"a":0}')) as r;
+→ [{"r":true}]
+
+-- Equality is unchanged: key order in objects is insignificant either way.
+select (json('{"a":1,"b":2}') = json('{"b":2,"a":1}')) as r;
+→ [{"r":true}]
+
+drop table jv;

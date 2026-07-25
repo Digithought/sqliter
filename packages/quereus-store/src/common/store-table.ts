@@ -18,6 +18,8 @@ import {
 	StatusCode,
 	compareSqlValues,
 	compareSqlValuesFast,
+	createTypedComparator,
+	hasSemanticOrdering,
 	resolveUniqueEnforcementCollations,
 	BINARY_COLLATION,
 	rowsValueIdentical,
@@ -192,6 +194,15 @@ export function keyOrderMatchesCollation(
 	keyCollation: string,
 	compareCollation: string,
 ): boolean {
+	// A semantic-ordering logical type (TIMESPAN, JSON — see docs/types.md "Semantic
+	// ordering") is ordered by its `compare` (elapsed time / structural), which the
+	// engine's Sort, comparison operators, and the memory backend all use. The store's
+	// key bytes encode the TEXT/canonical form, whose memcmp order differs ('PT2H'
+	// bytes sort before 'PT90M' though 90min < 2h), so no byte window or byte-order
+	// advertisement over such a column is sound. Costs the seek/elision, never a row;
+	// restoring them needs an order-preserving key encoding (e.g. total-seconds for
+	// TIMESPAN) — tracked as a store-side fix ticket.
+	if (hasSemanticOrdering(column?.logicalType)) return false;
 	if (!columnCanHoldText(column)) return true;
 	if (compareCollation.toUpperCase() !== keyCollation.toUpperCase()) return false;
 	return (db as DatabaseInternal)._isCollationOrderPreserving(keyCollation);
@@ -208,13 +219,12 @@ export function keyOrderMatchesCollation(
  * already aligned with the key collation for every *textual* PK member.
  *
  * What the advertisement is measured against is the order the planner's `Sort` would have
- * produced, and `Sort` (like every scalar comparison) orders under the operand's COLLATION via
- * `compareSqlValuesFast` — never through `logicalType.compare`. So a collation match is the
- * whole question, even for a member whose type declares a `compare` that orders differently
- * (`TIMESPAN.compare` ranks by `Temporal.Duration` total, `JSON_TYPE.compare` structurally).
- * `MemoryTable`, whose primary-key BTree *is* keyed by `createTypedComparator`, advertises the
- * type's order instead and so disagrees with its own `Sort` — tracked as
- * `bug-memory-pk-btree-orders-by-logical-type-compare`, not something the store should copy.
+ * produced. For most members Sort orders under the operand's COLLATION, so a collation match
+ * is the question; for a member whose logical type carries SEMANTIC ordering (TIMESPAN, JSON
+ * — see docs/types.md "Semantic ordering") Sort now ranks by `logicalType.compare`, which no
+ * text-byte encoding reproduces, and {@link keyOrderMatchesCollation} closes the gate for
+ * such members outright (the memory backend's typed BTree order is the canonical order under
+ * that ruling; the store declines rather than advertising a divergent byte order).
  *
  * `0` ⇒ even the leading member is unsafe: no range seek, no PK-order advertisement.
  * A prefix shorter than the PK truncates the ordering advertisement rather than voiding it.
@@ -1114,6 +1124,21 @@ export class StoreTable extends VirtualTable {
 		) >= 1;
 	}
 
+	/**
+	 * True when some PK member's logical type carries semantic ordering (TIMESPAN,
+	 * JSON). Byte-key EQUALITY is then a strict SUBSET of the type's equality
+	 * ('PT1H' ≡ 'PT60M' elapsed-time-equal, byte-distinct), so a point window
+	 * under-fetches — and no residual can resurrect a row the window skipped. Such
+	 * PKs decline the point arm and full-scan, where {@link matchesFilters} applies
+	 * the type's compare. (Range windows and ordering advertisements are already
+	 * declined by {@link keyOrderMatchesCollation}.)
+	 */
+	protected pkHasSemanticOrderingMember(): boolean {
+		const schema = this.tableSchema!;
+		return schema.primaryKeyDefinition.some(def =>
+			hasSemanticOrdering(schema.columns[def.index]?.logicalType));
+	}
+
 	/** Analyze filter info to determine PK access pattern. */
 	protected analyzePKAccess(filterInfo: FilterInfo): PKAccessPattern {
 		const schema = this.tableSchema!;
@@ -1140,7 +1165,7 @@ export class StoreTable extends VirtualTable {
 			}
 		}
 
-		if (allEq) {
+		if (allEq && !this.pkHasSemanticOrderingMember()) {
 			return { type: 'point', values: eqValues };
 		}
 
@@ -1308,9 +1333,13 @@ export class StoreTable extends VirtualTable {
 		const indexCols = index.columns.map(c => c.index);
 		const indexDirections = index.columns.map(c => !!c.desc);
 
-		// Contiguous leading-prefix EQ → point/prefix window.
+		// Contiguous leading-prefix EQ → point/prefix window. A prefix member whose
+		// logical type carries semantic ordering stops the prefix: its byte-equality
+		// window under-fetches the type's equality (see pkHasSemanticOrderingMember),
+		// and a skipped row cannot be resurrected by the residual.
 		const eqValues: SqlValue[] = [];
 		for (let i = 0; i < indexCols.length; i++) {
+			if (hasSemanticOrdering(this.tableSchema!.columns[indexCols[i]]?.logicalType)) break;
 			const eq = filterInfo.constraints?.find(
 				c => c.constraint.iColumn === indexCols[i]
 					&& c.constraint.op === IndexConstraintOp.EQ
@@ -1493,7 +1522,17 @@ export class StoreTable extends VirtualTable {
 			const filterValue = filterInfo.args[argvIndex - 1];
 			const collation = collations.get(constraint.iColumn) ?? BINARY_COLLATION;
 
-			if (!this.compareValues(rowValue, constraint.op, filterValue, collation)) {
+			// A semantic-ordering column (TIMESPAN, JSON) must filter under the type's
+			// compare — the same order the engine's operators and Sort use — or a pushed
+			// `d > 'PT90M'` would text-compare and drop rows the predicate admits. The
+			// comparator is built per row only on this rare column kind; if a profile
+			// ever shows it, resolve it once per scan alongside the collations.
+			const logicalType = this.tableSchema!.columns[constraint.iColumn]?.logicalType;
+			const compare = hasSemanticOrdering(logicalType)
+				? createTypedComparator(logicalType, collation)
+				: undefined;
+
+			if (!this.compareValues(rowValue, constraint.op, filterValue, collation, compare)) {
 				return false;
 			}
 		}
@@ -1571,12 +1610,18 @@ export class StoreTable extends VirtualTable {
 	 * NULL on either side fails every operator except EQ-with-both-NULL (the
 	 * internal point-lookup convention; the planner never pushes `= NULL`).
 	 */
-	protected compareValues(a: SqlValue, op: IndexConstraintOp, b: SqlValue, collationFunc: CollationFunction): boolean {
+	protected compareValues(
+		a: SqlValue,
+		op: IndexConstraintOp,
+		b: SqlValue,
+		collationFunc: CollationFunction,
+		semanticCompare?: (a: SqlValue, b: SqlValue) => number,
+	): boolean {
 		if (a === null || b === null) {
 			return op === IndexConstraintOp.EQ ? a === b : false;
 		}
 
-		const cmp = compareSqlValuesFast(a, b, collationFunc);
+		const cmp = semanticCompare ? semanticCompare(a, b) : compareSqlValuesFast(a, b, collationFunc);
 		switch (op) {
 			case IndexConstraintOp.EQ: return cmp === 0;
 			case IndexConstraintOp.NE: return cmp !== 0;

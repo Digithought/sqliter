@@ -10,11 +10,13 @@
  * are distinct BINARY values that collided at one NOCASE key, so the second `insert` was
  * rejected and an `insert or replace` silently destroyed the first row.
  *
- * A memory table is the oracle for UNIQUENESS throughout. It is NOT the oracle for PK ORDER of
- * a `timespan` column: its primary-key BTree is keyed by `createTypedComparator`, so it
- * advertises `TIMESPAN.compare`'s duration order while the planner's `Sort` — the order any
- * advertisement is measured against — compares under the operand's collation. That divergence
- * is `bug-memory-pk-btree-orders-by-logical-type-compare`, not the store's to reproduce.
+ * A memory table is the oracle for UNIQUENESS throughout. Since the semantic-ordering ruling
+ * (docs/types.md "Semantic ordering"), it is the ordering oracle too: `Sort` ranks a TIMESPAN
+ * or JSON operand by `logicalType.compare` (elapsed time / structural), which no text-byte key
+ * encoding reproduces — so the store DECLINES ordering advertisements and byte windows over
+ * such PK members (`keyOrderMatchesCollation`) and answers through a full scan + the
+ * type-aware residual instead. Restoring those seeks needs an order-preserving key encoding —
+ * a store-side fix ticket.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -183,7 +185,10 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			expect(await planOps(db, q), 'byte order is comparator order here').to.not.match(/sort/i);
 		});
 
-		it('advertises PK order for a `json` PK, matching the memory table', async () => {
+		it('declines the PK-order advertisement for a `json` PK and still matches the memory table', async () => {
+			// JSON's semantic (structural) order is not the store's byte order, so the
+			// gate closes: a real Sort runs, and its structural order agrees with the
+			// memory table's typed PK order.
 			await db.exec(`create table t (j json primary key) using store`);
 			await db.exec(`create table m (j json primary key)`);
 			for (const t of ['t', 'm']) {
@@ -193,28 +198,40 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			const q = `select json_quote(j) as j from t order by j`;
 			expect(await column(db, q, 'j'))
 				.to.deep.equal(await column(db, `select json_quote(j) as j from m order by j`, 'j'));
-			expect(await planOps(db, `select j from t order by j`)).to.not.match(/sort/i);
+			expect(await planOps(db, `select j from t order by j`), 'byte order is not structural order — Sort must run')
+				.to.match(/sort/i);
 		});
 
-		it('advertises the order a `Sort` would produce, not the one `logicalType.compare` defines', async () => {
-			// The advertisement's contract is "these rows arrive in the order the planner's Sort
-			// would have put them", and Sort compares under the operand's COLLATION. It never
-			// consults `logicalType.compare` — so `'PT2H'` precedes `'PT90M'` here, even though
-			// `TIMESPAN.compare` ranks by `Temporal.Duration` total and would say the reverse.
-			// The byte order the store advertises is exactly the order Sort produces.
+		it('orders a `timespan` PK by elapsed time via a real Sort (advertisement declined)', async () => {
+			// Under the semantic-ordering ruling, Sort ranks TIMESPAN by
+			// `TIMESPAN.compare` (elapsed time): 'PT90M' precedes 'PT2H' though the
+			// text-byte order says the reverse. The store's key bytes still order by
+			// text, so the PK-order advertisement is declined and a real Sort runs —
+			// on the PK table exactly as on the integer-PK table.
 			await db.exec(`create table t (d timespan primary key) using store`);
 			await db.exec(`create table sorted (id integer primary key, d timespan) using store`);
 			await db.exec(`insert into t values ('PT2H'), ('PT90M')`);
 			await db.exec(`insert into sorted values (1, 'PT2H'), (2, 'PT90M')`);
 
-			const advertised = await column(db, `select d from t order by d`, 'd');
-			expect(await planOps(db, `select d from t order by d`), 'the advertisement elides the Sort')
-				.to.not.match(/sort/i);
+			const pkOrdered = await column(db, `select d from t order by d`, 'd');
+			expect(await planOps(db, `select d from t order by d`), 'byte order is not elapsed-time order — Sort must run')
+				.to.match(/sort/i);
 
-			// `sorted` has an integer PK, so `order by d` must run a real Sort. Same order.
 			expect(await planOps(db, `select d from sorted order by d`)).to.match(/sort/i);
-			expect(advertised).to.deep.equal(await column(db, `select d from sorted order by d`, 'd'));
-			expect(advertised).to.deep.equal(['PT2H', 'PT90M']);
+			expect(pkOrdered).to.deep.equal(await column(db, `select d from sorted order by d`, 'd'));
+			expect(pkOrdered).to.deep.equal(['PT90M', 'PT2H']);
+		});
+
+		it('range-scans a `timespan` PK with elapsed-time bounds (window declined, residual type-aware)', async () => {
+			await db.exec(`create table t (d timespan primary key) using store`);
+			await db.exec(`create table m (d timespan primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT2H'), ('PT90M')`);
+			}
+			// 2h > 90min semantically, though 'PT2H' < 'PT90M' textually.
+			const q = `select d from t where d > 'PT90M'`;
+			expect(await column(db, q, 'd')).to.deep.equal(['PT2H']);
+			expect(await column(db, q, 'd')).to.deep.equal(await column(db, `select d from m where d > 'PT90M'`, 'd'));
 		});
 	});
 });

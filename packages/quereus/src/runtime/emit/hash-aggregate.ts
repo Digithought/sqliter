@@ -17,7 +17,7 @@ import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { AggValue } from '../../func/registration.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
-import { createTypedComparator } from '../../util/comparison.js';
+import { createTypedComparator, hasSemanticOrdering } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { cloneInitialValue, findSourceRelation, ctxLog } from './aggregate.js';
@@ -61,6 +61,19 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 		const exprType = expr.getType();
 		return ctx.resolveKeyNormalizer(hashKeyCollationName(exprType.collationName, [exprType]));
 	});
+
+	// Group-key canonicalizers for semantic-ordering key types: values the type's
+	// compare treats as equal (TIMESPAN 'PT1H' ≡ 'PT60M') must land in one hash
+	// bucket, so they serialize via the type's groupKey representative. The RAW
+	// first-seen value stays in groupValues (the emitted representative — which one
+	// survives is unspecified, matching DISTINCT).
+	const keyCanonicalizers = plan.groupBy.map(expr => {
+		const logical = expr.getType().logicalType as LogicalType;
+		return hasSemanticOrdering(logical) && logical.groupKey
+			? (v: SqlValue) => logical.groupKey!(v)
+			: undefined;
+	});
+	const hasKeyCanonicalizer = keyCanonicalizers.some(c => c !== undefined);
 
 	// Pre-resolve typed comparators for DISTINCT aggregate tracking per aggregate
 	const distinctComparators: ((a: SqlValue | SqlValue[], b: SqlValue | SqlValue[]) => number)[] = [];
@@ -267,7 +280,10 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 				}
 
 				// Serialize key using collation-aware serialization (NULLs group together per SQL standard)
-				const key = serializeKeyNullGrouping(groupValues, keyNormalizers);
+				const keyValues = hasKeyCanonicalizer
+					? groupValues.map((v, i) => keyCanonicalizers[i] ? keyCanonicalizers[i]!(v) : v)
+					: groupValues;
+				const key = serializeKeyNullGrouping(keyValues, keyNormalizers);
 
 				// Look up or create group entry
 				let group = groups.get(key);

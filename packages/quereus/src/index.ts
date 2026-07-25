@@ -120,9 +120,12 @@ export {
 	createTypedComparator,
 	createTypedRowComparator,
 	createCollationRowComparator,
+	createSemanticRowComparator,
+	hasSemanticOrdering,
 	// ORDER BY comparison utilities
 	compareWithOrderByFast,
 	createOrderByComparatorFast,
+	createTypedOrderByComparator,
 	SortDirection,
 	NullsOrdering,
 	// Truthiness evaluation

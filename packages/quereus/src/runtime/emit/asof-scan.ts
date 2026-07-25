@@ -63,6 +63,12 @@ function resolveSetup(plan: AsofScanNode, ctx: EmissionContext): AsofScanSetup {
 	// same alignment `equi-pair-extractor` enforces for merge join.
 	const matchCollationName = effectiveCollationOfTypes(leftAttrs[leftMatchIdx].type, rightAttrs[rightMatchIdx].type);
 	const matchCollation: CollationFunction = ctx.resolveCollation(matchCollationName);
+	// NOTE: AS OF match/partition compares are storage-class + collation, not
+	// semantic-ordering-aware. Correct for the canonical AS OF column types
+	// (DATE/DATETIME — canonical ISO text order IS their semantic order). A TIMESPAN
+	// or JSON match column would order by text here, disagreeing with `<`/ORDER BY;
+	// if that ever becomes a real usage, resolve typed comparators as emitMergeJoin
+	// does (docs/types.md, semantic ordering).
 
 	const leftPartitionIndices: number[] = [];
 	const rightPartitionIndices: number[] = [];

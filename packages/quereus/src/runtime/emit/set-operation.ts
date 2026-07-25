@@ -5,16 +5,19 @@ import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
 import { BTree } from 'inheritree';
-import { createCollationRowComparator, BINARY_COLLATION } from '../../util/comparison.js';
+import { createSemanticRowComparator, BINARY_COLLATION } from '../../util/comparison.js';
+import type { LogicalType } from '../../types/logical-type.js';
 
 export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): Instruction {
   const leftInst = emitPlanNode(plan.left, ctx);
   const rightInst = emitPlanNode(plan.right, ctx);
 
-  // Pre-resolve collation-based row comparator (safe for mixed-type rows in set
+  // Pre-resolve the row-identity comparator (safe for mixed-type rows in set
   // operations). The comparator runs over the DATA columns only — membership flags
   // are appended after, but dedup / probe identity is on data columns alone, so set
-  // identity is never perturbed by the flags.
+  // identity is never perturbed by the flags. Columns whose merged output type has
+  // semantic ordering (TIMESPAN, JSON) compare through the type's compare so set
+  // identity agrees with `=` (see createSemanticRowComparator).
   //
   // Each data column's collation is the CROSS-INPUT resolved collation: `SetOperationNode`
   // merges both operands' column types through the shared comparison lattice and writes
@@ -26,8 +29,10 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
   // DATA arity is recursive (`plan.dataColumnCount()`), NOT `plan.left.getType().columns.length`
   // — a flagged inner set-op operand on the left would over-count by its surfaced flags.
   const dataColCount = plan.dataColumnCount();
-  const dataComparator = createCollationRowComparator(
-    attributes.slice(0, dataColCount).map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
+  const dataAttributes = attributes.slice(0, dataColCount);
+  const dataComparator = createSemanticRowComparator(
+    dataAttributes.map(attr => attr.type.logicalType as LogicalType),
+    dataAttributes.map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
   );
 
   // Helper function to create a properly structured DATA row (flags excluded; the
