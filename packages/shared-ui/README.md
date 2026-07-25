@@ -1,5 +1,9 @@
 # @quereus/shared-ui
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. See
+> [Stability Tiers](../../docs/stability.md#tiers).
+
 Shared React UI components for Quereus applications. Provides common components used across quoomb-web and other Quereus-based UIs.
 
 ## Installation

@@ -1,12 +1,12 @@
 # Quoomb Web
 
-**A browser-based interactive SQL playground and query interface for Quereus**
-
-Quoomb Web is a modern, React-based web application that provides a full-featured SQL development environment for the Quereus engine. It offers real-time query execution, visual query planning, plugin management, and advanced debugging capabilities—all running entirely in your browser.
-
 > **Stability: Beta** — complete and tested, but the surface is still being shaped; a
 > breaking change may land in a minor release. See
 > [Stability Tiers](../../docs/stability.md#tiers).
+
+**A browser-based interactive SQL playground and query interface for Quereus**
+
+Quoomb Web is a modern, React-based web application that provides a full-featured SQL development environment for the Quereus engine. It offers real-time query execution, visual query planning, plugin management, and advanced debugging capabilities—all running entirely in your browser.
 
 ## Features
 

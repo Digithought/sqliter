@@ -2,6 +2,11 @@
 
 <img src="../../docs/images/Quereus_colored_wide.svg" alt="Quereus Logo" height="150">
 
+> **Stability** — this package spans tiers: the core SQL engine, type system, and
+> virtual-table framework are **Stable**, while other feature areas are Beta or
+> Experimental. See [Stability](#stability) below and
+> [Stability Tiers](../../docs/stability.md#tiers) for the per-area assignment.
+
 Quereus is a feature-complete SQL query processor specifically designed for efficient in-memory data processing with a strong emphasis on the **virtual table** interface. It provides rich SQL query and constraint capabilities (joins, aggregates, subqueries, CTEs, window functions, constraints) over data sources exposed via the virtual table mechanism. Quereus features a modern type system with temporal types, JSON support, and plugin-extensible custom types. It has no persistent file storage, though one could be built as a virtual table module.
 
 ## Project Goals

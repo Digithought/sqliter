@@ -31,13 +31,21 @@ new check inside `scripts/check-docs.mjs`, or a sibling script run alongside it)
 - flags a package in the map whose `README.md` no longer exists, or a published package
   missing from the map entirely (so a newly added package isn't silently exempt).
 
-The non-published / non-consumer packages (the VS Code extension, `shared-ui`,
-`sample-plugins`, `tools/planviz`) intentionally carry no banner and should stay excluded
-from the map, not flagged as violations.
+Which packages the map should cover, as of the review of
+`debt-package-readme-stability-banners`:
+
+- **All fourteen packages `yarn pub` publishes** (the list is in the root `package.json`'s
+  `pub` script) carry a banner and belong in the map.
+- `quoomb-web` and the VS Code extension are not published to npm but are named in the
+  assignment table's Tooling row and carry a banner, so include them too.
+- `@quereus/sample-plugins` has no `README.md` at all and is the one intended exclusion.
+
+Deriving the expected package list from the `pub` script rather than hand-listing it is
+worth considering — the first draft of the banners ticket hand-listed it and missed
+`@quereus/shared-ui` and `@quereus/planviz`, both of which do publish.
 
 ## Out of scope
 
-Re-deciding which packages get a banner or what tier they carry — that judgment call was
-already made in `debt-package-readme-stability-banners` and is recorded in the banners
-themselves and in that ticket's review findings. This ticket is only about catching future
-drift.
+Re-deciding what tier a package carries — that judgment is recorded in
+`docs/stability.md`'s assignment table and mirrored in the banners. This ticket is only
+about catching future drift between the two.

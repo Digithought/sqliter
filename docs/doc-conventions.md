@@ -125,6 +125,21 @@ does not — and cannot — tell you whether the tier you chose is the right one
 `--update-stability` flag for the same reason: a flag that classifies a doc for you would
 classify every doc `untiered`.
 
+### In a package README
+
+Every package that `yarn pub` publishes carries a banner under its `README.md` heading too,
+so the tier reaches the npm page and not only this folder. Two differences from a doc
+banner: the link is relative to the package (`../../docs/stability.md#tiers`, one level
+deeper from `packages/tools/*`), and the clause after the em dash spells out what the tier
+means for *this* package rather than stopping at the link — the on-disk format for
+`@quereus/store`, the wire protocol for the sync packages. The tier word still comes from
+the `## Assignment` table in `stability.md`; a README states its tier and never redefines
+one.
+
+Nothing gates this: `docs:check` reads package READMEs for link integrity only, so a
+README's tier is correct by review rather than by check. Changing a package's tier means
+editing both the assignment table and that package's README by hand.
+
 ## The size ratchet
 
 `docs/.doc-budget.json` records each large doc's current word count. A doc may shrink; it

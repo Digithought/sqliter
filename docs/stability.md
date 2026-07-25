@@ -1,13 +1,15 @@
 # Stability Tiers
 
-Quereus publishes sixteen packages sharing one version. Some of them are a
+Quereus is one version across seventeen packages, fourteen of which publish to npm
+(the list `yarn pub` walks — see [Releasing](releasing.md)). Some of them are a
 battle-tested SQL core; others are research tracks that are nowhere near settled.
 This document says which is which, so a user can tell what they are allowed to build
 on and a maintainer has a declared boundary to point at.
 
 Every user-facing feature area is assigned one of four tiers — **Stable**, **Beta**,
 **Experimental**, **Internal** — and every doc describing one carries a banner naming
-its tier.
+its tier. Every package that publishes carries the same banner at the top of its
+`README.md`, so the tier is visible on the npm page and not only here.
 
 ## What a tier measures
 
@@ -91,7 +93,7 @@ report the user-visible symptom, not the internal detail.
 | `SchemaManager` API and DDL generation | Beta | [schema.md](schema.md) |
 | Persistent store — `@quereus/store` and the LevelDB / IndexedDB / React-Native-LevelDB / NativeScript-SQLite plugins. Its on-disk key encoding is **not** frozen, carries no format-version marker, and has no in-place upgrade tooling today: a format change would be published with a documented migration procedure, not applied for you. | Beta | [store.md](store.md) |
 | Isolation layer — `@quereus/isolation` | Beta | [store.md](store.md#isolation-gap), [design-isolation-layer.md](design-isolation-layer.md) |
-| Tooling — `quoomb-cli`, `quoomb-web`, the VS Code extension | Beta | [usage.md](usage.md) |
+| Tooling — `quoomb-cli`, `quoomb-web`, `@quereus/planviz`, `@quereus/shared-ui`, the VS Code extension | Beta | [usage.md](usage.md) |
 | Lenses and layered schemas | Experimental | [lens.md](lens.md) |
 | Schema migration in a synced database | Experimental | [migration.md](migration.md) |
 | Parallel runtime — `ParallelDriver`, `EagerPrefetchNode`, `AsyncGatherNode`, `FanOutLookupJoinNode`, `VirtualTableModule.concurrencyMode` | Experimental | [runtime.md](runtime.md) § ParallelDriver (section banner), [module-authoring.md](module-authoring.md) § Concurrency Mode (section banner), [optimizer-parallel.md](optimizer-parallel.md) |
