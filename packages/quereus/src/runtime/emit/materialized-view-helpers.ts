@@ -19,7 +19,7 @@ import {
 	formatKeyValue,
 } from '../../schema/constraint-builder.js';
 import type { CoarsenedKeyInfo } from '../../schema/view.js';
-import { computeBodyHash } from '../../schema/view.js';
+import { computeBodyHash, normalizeBackingModuleName } from '../../schema/view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from '../../schema/derivation.js';
 import type { Schema } from '../../schema/schema.js';
 import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewriter.js';
@@ -287,7 +287,9 @@ export function computeBackingPrimaryKey(shape: BackingShape): ReadonlyArray<{ i
 
 /**
  * Constructs the backing-table {@link TableSchema} for a materialized view from a
- * derived {@link BackingShape}, hosted in `moduleName` (default `'memory'`).
+ * derived {@link BackingShape}, hosted in `moduleName` — resolved through the one
+ * {@link normalizeBackingModuleName} decision (absent ⇒ `'memory'`), the same one
+ * the strict DDL-transaction gate in `materialized-view.ts` consults.
  * The capability check here is defense-in-depth — the create builder already
  * gates, but the catalog-import path reaches this without it.
  */
@@ -301,7 +303,7 @@ export function buildBackingTableSchema(
 	/** Table-level metadata tags (the MV's `with tags (…)` — top-level on the unified record). */
 	tags?: Readonly<Record<string, SqlValue>>,
 ): TableSchema {
-	const resolvedModuleName = moduleName ?? 'memory';
+	const resolvedModuleName = normalizeBackingModuleName(moduleName);
 	const moduleInfo = db.schemaManager.getModule(resolvedModuleName);
 	if (!moduleInfo || !moduleInfo.module) {
 		throw new QuereusError(`no virtual table module named '${resolvedModuleName}'`, StatusCode.ERROR);

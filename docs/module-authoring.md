@@ -513,7 +513,15 @@ silently over-promise.
 
 Engine-only schema objects (`create view`, `create assertion`, `declare schema`) are out
 of the gate's scope: they touch no module, and the engine's own schema is transient by
-design (see [architecture.md § Transient Schema](architecture.md)).
+design (see [architecture.md § Transient Schema](architecture.md)). Tag-only edits
+(`alter view/index/materialized view … set tags`) are likewise ungated — they dispatch to
+no module either. The one inconsistency: `alter table … set tags` *is* refused, because
+the `ALTER TABLE` emitter gates all of its arms uniformly rather than per-arm.
+
+`apply schema` runs its generated migration DDL through the engine's *implicit*
+transaction, so the gate does not fire statement-by-statement inside a migration. It does
+fire — on the first gated statement the migration emits — if the caller wrapped the
+`apply schema` in an explicit `begin`.
 
 The isolation wrapper **forwards the underlying's declared tier verbatim and never
 upgrades it**: the overlay stages DML outside the underlying module, so an underlying

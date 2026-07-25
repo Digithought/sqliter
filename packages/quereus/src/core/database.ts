@@ -314,7 +314,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.options.registerOption('ddl_transaction_policy', {
 			type: 'string',
 			defaultValue: 'permissive',
-			description: 'Whether module-dispatching DDL (CREATE/DROP TABLE/INDEX, ALTER TABLE) is allowed inside an explicit transaction: "permissive" (default; schema changes may escape the transaction, as today) or "strict" (refuse such DDL inside a transaction unless the module declares ddlTransactionality=transactional).',
+			description: 'Whether module-dispatching DDL (CREATE/DROP TABLE/INDEX, ALTER TABLE, CREATE/DROP/REFRESH MATERIALIZED VIEW) is allowed inside an explicit transaction: "permissive" (default; schema changes may escape the transaction, as today) or "strict" (refuse such DDL inside a transaction unless the module declares ddlTransactionality=transactional).',
 			onChange: (event) => {
 				const value = event.newValue as string;
 				if (value !== 'permissive' && value !== 'strict') {
@@ -2385,6 +2385,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * implicit transaction exactly as the single-MV `refresh` does, so a failure
 	 * partway leaves earlier MVs converged; the caller (snapshot bootstrap) retries
 	 * the whole load idempotently.
+	 *
+	 * An engine convergence primitive, NOT a SQL statement: the
+	 * `ddl_transaction_policy = 'strict'` gate that refuses `refresh materialized
+	 * view` inside an explicit transaction does not apply here. A caller that opens
+	 * its own `begin` around the sweep still gets the commit-first behavior above.
 	 *
 	 * Serialized via the exec mutex like any statement — do NOT call from within
 	 * statement execution or a vtab callback (deadlock; same constraint as

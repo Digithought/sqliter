@@ -2,7 +2,8 @@
 --
 -- `permissive` (the default) leaves DDL-in-transaction behavior exactly as it was.
 -- `strict` refuses a module-dispatching DDL statement (CREATE/DROP TABLE/INDEX,
--- ALTER TABLE) while an explicit transaction is open, because on memory and store
+-- ALTER TABLE, CREATE/DROP/REFRESH MATERIALIZED VIEW) while an explicit transaction
+-- is open, because on memory and store
 -- the schema change would escape the transaction (survive rollback). The refusal
 -- fires before any dispatch or catalog mutation, so the open transaction stays
 -- fully usable afterward.
@@ -184,6 +185,16 @@ create materialized view strict_mv as select id, v from strict_t;
 select count(*) as cnt from strict_mv;
 → [{ "cnt": 4 }]
 
+-- `if not exists` does NOT skip the gate: like CREATE TABLE, the gate keys off the
+-- statement, not off whether it would have been a no-op. (DROP differs by design —
+-- it has no target to resolve a module from; see the `if exists` case in 6c.)
+begin;
+-- run
+create materialized view if not exists strict_mv as select id, v from strict_t;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
 -- ===================================
 -- 6e. strict: refresh / drop materialized view are refused inside begin
 --     (REFRESH is gated too — its reshape arm dispatches module alterTable and
@@ -194,8 +205,16 @@ begin;
 -- run
 refresh materialized view strict_mv;
 -- error: ddl_transaction_policy = strict
+
+-- A refusal inside a savepoint leaves the savepoint usable (6b, for the MV verbs).
+savepoint mv_sp;
+-- run
+insert into strict_t values (5, 'e');
+-- run
 drop materialized view strict_mv;
 -- error: ddl_transaction_policy = strict
+rollback to savepoint mv_sp;
+-- run
 rollback;
 -- run
 
@@ -249,4 +268,42 @@ commit;
 drop table strict_t;
 -- run
 drop table perm_t;
+-- run
+
+-- ===================================
+-- 8. strict + `apply schema`: a migration is NOT gated in autocommit (its generated
+--    DDL runs inside the engine's implicit transaction), but the same migration
+--    wrapped in an explicit begin trips the gate on the first gated statement.
+--    Runs last, against an otherwise-empty main schema, so the declaration below is
+--    the whole of main and the diff generates no drops.
+-- ===================================
+
+pragma ddl_transaction_policy = 'strict';
+-- run
+
+declare schema main {
+	table ap_t (id INTEGER PRIMARY KEY, x INTEGER NOT NULL)
+	materialized view ap_mv as select id, x from ap_t
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+insert into ap_t values (1, 10);
+-- run
+
+select x from ap_mv;
+→ [{ "x": 10 }]
+
+-- Dropping only the MV leaves one statement in the next migration: its re-create.
+drop materialized view ap_mv;
+-- run
+begin;
+-- run
+apply schema main;
+-- error: ddl_transaction_policy = strict
+rollback;
 -- run
