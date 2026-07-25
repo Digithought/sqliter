@@ -279,21 +279,10 @@ function collectSemanticColumnTypes(
 	attrIndex: (attrId: number) => number | undefined,
 ): Map<number, LogicalType> {
 	const out = new Map<number, LogicalType>();
-	const stack: ScalarPlanNode[] = [...conjuncts];
-	while (stack.length > 0) {
-		const cur = stack.pop()!;
-		if (cur instanceof ColumnReferenceNode) {
-			const idx = attrIndex(cur.attributeId);
-			if (idx !== undefined) {
-				const logical = cur.getType().logicalType as LogicalType;
-				if (hasSemanticOrdering(logical)) out.set(idx, logical);
-			}
-			continue;
-		}
-		for (const child of cur.getChildren()) {
-			if ('expression' in child) stack.push(child as ScalarPlanNode);
-		}
-	}
+	forEachColumnReference(conjuncts, attrIndex, (col, ref) => {
+		const logical = ref.getType().logicalType;
+		if (hasSemanticOrdering(logical)) out.set(col, logical);
+	});
 	return out;
 }
 
@@ -303,12 +292,25 @@ function collectColumns(
 	attrIndex: (attrId: number) => number | undefined,
 	out: Set<number>,
 ): void {
-	const stack: ScalarPlanNode[] = [n];
+	forEachColumnReference([n], attrIndex, col => out.add(col));
+}
+
+/**
+ * Walk the scalar subtrees of `roots`, invoking `visit` for every reachable
+ * `ColumnReferenceNode` whose attribute maps to a physical column index. Relational
+ * children are not descended into — a subquery's columns are not this predicate's.
+ */
+function forEachColumnReference(
+	roots: ReadonlyArray<ScalarPlanNode>,
+	attrIndex: (attrId: number) => number | undefined,
+	visit: (col: number, ref: ColumnReferenceNode) => void,
+): void {
+	const stack: ScalarPlanNode[] = [...roots];
 	while (stack.length > 0) {
 		const cur = stack.pop()!;
 		if (cur instanceof ColumnReferenceNode) {
 			const idx = attrIndex(cur.attributeId);
-			if (idx !== undefined) out.add(idx);
+			if (idx !== undefined) visit(idx, cur);
 			continue;
 		}
 		for (const child of cur.getChildren()) {

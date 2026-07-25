@@ -376,15 +376,8 @@ export function emitTemporalArithmetic(plan: BinaryOpNode, ctx: EmissionContext)
  * @returns Comparison result (boolean) if temporal comparison, undefined otherwise
  */
 export function tryTemporalComparison(operator: string, v1: SqlValue, v2: SqlValue): SqlValue | undefined {
-	// Check if both values are timespans
-	// Timespans are the only temporal type that needs special comparison logic
-	// because ISO 8601 duration strings don't compare correctly lexicographically
-	if (!isTimespanValue(v1) || !isTimespanValue(v2)) {
-		return undefined;
-	}
-
-	// Use the TIMESPAN_TYPE's compare function
-	const cmp = TIMESPAN_TYPE.compare!(v1, v2);
+	const cmp = tryTemporalCompare(v1, v2);
+	if (cmp === undefined) return undefined;
 
 	switch (operator) {
 		case '=':
@@ -404,4 +397,17 @@ export function tryTemporalComparison(operator: string, v1: SqlValue, v2: SqlVal
 		default:
 			return undefined;
 	}
+}
+
+/**
+ * Three-way duration compare, for callers that need an ordering rather than a
+ * boolean verdict (BETWEEN's per-bound comparator). Returns undefined unless BOTH
+ * values look like ISO 8601 duration strings — the same guard
+ * {@link tryTemporalComparison} applies, so the two never disagree.
+ */
+export function tryTemporalCompare(v1: SqlValue, v2: SqlValue): number | undefined {
+	// Timespans are the only temporal type that needs special comparison logic
+	// because ISO 8601 duration strings don't compare correctly lexicographically
+	if (!isTimespanValue(v1) || !isTimespanValue(v2)) return undefined;
+	return TIMESPAN_TYPE.compare!(v1, v2);
 }

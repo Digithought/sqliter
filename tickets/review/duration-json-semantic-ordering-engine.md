@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-25T19:20:31.925Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\duration-json-semantic-ordering-engine.review.2026-07-25T19-20-31-924Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ---
 description: The engine now orders duration and JSON values by what they mean (elapsed time, structural value) everywhere — sorting, comparisons, grouping, and index range scans previously disagreed with each other because some paths ordered by the raw text.
 prereq:

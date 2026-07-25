@@ -2,12 +2,13 @@ import type { SqlValue } from "../../common/types.js";
 import type { Instruction, RuntimeContext } from "../types.js";
 import { asRun } from "../types.js";
 import type { BetweenNode } from "../../planner/nodes/scalar.js";
+import type { ScalarPlanNode } from "../../planner/nodes/plan-node.js";
 import { emitPlanNode } from "../emitters.js";
 import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering } from "../../util/comparison.js";
-import type { LogicalType } from "../../types/logical-type.js";
+import type { CollationFunction, LogicalType } from "../../types/logical-type.js";
 import type { EmissionContext } from "../emission-context.js";
 import { effectiveBetweenBoundCollation } from "../../planner/analysis/comparison-collation.js";
-import { tryTemporalComparison } from "./temporal-arithmetic.js";
+import { tryTemporalCompare } from "./temporal-arithmetic.js";
 
 export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instruction {
 	// BETWEEN desugars to `expr >= lower AND expr <= upper`; each comparison
@@ -22,28 +23,9 @@ export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instructio
 	const lowerCollationFunc = ctx.resolveCollation(lowerCollationName);
 	const upperCollationFunc = ctx.resolveCollation(upperCollationName);
 
-	// Per-bound comparator, mirroring emitComparisonOp so BETWEEN stays byte-identical
-	// to its desugared `expr >= lower AND expr <= upper`: a shared semantic-ordering
-	// logical type (TIMESPAN, JSON) compares through the type's compare; otherwise a
-	// runtime temporal check catches duration-vs-text pairs (as the generic comparison
-	// path does) before the storage-class + collation compare.
-	const exprLogical = plan.expr.getType().logicalType as LogicalType;
-	const makeBoundCompare = (boundNode: typeof plan.lower, collationFunc: (a: string, b: string) => number) => {
-		const boundLogical = boundNode.getType().logicalType as LogicalType;
-		if (exprLogical === boundLogical && hasSemanticOrdering(exprLogical)) {
-			return createTypedComparator(exprLogical, collationFunc);
-		}
-		return (v: SqlValue, bound: SqlValue): number => {
-			const geResult = tryTemporalComparison('>=', v, bound);
-			if (geResult !== undefined) {
-				// Derive the three-way result from two semantic probes.
-				return geResult === true ? (tryTemporalComparison('<=', v, bound) === true ? 0 : 1) : -1;
-			}
-			return compareSqlValuesFast(v, bound, collationFunc);
-		};
-	};
-	const lowerCompare = makeBoundCompare(plan.lower, lowerCollationFunc);
-	const upperCompare = makeBoundCompare(plan.upper, upperCollationFunc);
+	const exprLogical = plan.expr.getType().logicalType;
+	const lowerCompare = makeBoundComparator(exprLogical, plan.lower, lowerCollationFunc);
+	const upperCompare = makeBoundComparator(exprLogical, plan.upper, upperCollationFunc);
 
 	// Cross-category coercion is handled at plan time via explicit CastNodes,
 	// so no runtime coercion is needed here.
@@ -70,6 +52,38 @@ export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instructio
 		run: asRun(run),
 		note: `${notPrefix}BETWEEN${formatBetweenCollationNote(lowerCollationName, upperCollationName)}`
 	};
+}
+
+/**
+ * Comparator for one BETWEEN bound, selecting the SAME path `emitComparisonOp` would
+ * select for the desugared `expr >= lower` / `expr <= upper`, so BETWEEN and its
+ * desugared form never disagree:
+ *  - both sides declare the same semantic-ordering type (TIMESPAN, JSON) ⇒ the type's
+ *    compare, matching the operator's typed fast path;
+ *  - neither side is temporal and both share a category (numeric/numeric or
+ *    textual/textual) ⇒ plain storage-class + collation compare, matching the
+ *    operator's same-category fast path. Notably a plain TEXT column holding
+ *    duration-shaped text ('PT30M') stays text-ordered here, exactly as `>=` leaves it;
+ *  - otherwise ⇒ a runtime duration check first, matching the operator's generic path.
+ */
+function makeBoundComparator(
+	exprLogical: LogicalType,
+	boundNode: ScalarPlanNode,
+	collationFunc: CollationFunction,
+): (v: SqlValue, bound: SqlValue) => number {
+	const boundLogical = boundNode.getType().logicalType;
+	if (exprLogical === boundLogical && hasSemanticOrdering(exprLogical)) {
+		return createTypedComparator(exprLogical, collationFunc);
+	}
+
+	const needsTemporalCheck = exprLogical.isTemporal || boundLogical.isTemporal;
+	const bothSameCategory = (exprLogical.isNumeric && boundLogical.isNumeric)
+		|| (exprLogical.isTextual && boundLogical.isTextual);
+	if (!needsTemporalCheck && bothSameCategory) {
+		return (v, bound) => compareSqlValuesFast(v, bound, collationFunc);
+	}
+
+	return (v, bound) => tryTemporalCompare(v, bound) ?? compareSqlValuesFast(v, bound, collationFunc);
 }
 
 /** Build the collation suffix for a BETWEEN note: nothing when both bounds are

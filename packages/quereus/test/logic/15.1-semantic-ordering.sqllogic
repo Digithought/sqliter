@@ -64,6 +64,80 @@ select d, row_number() over (order by d) as rn from s order by rn;
 
 drop table s;
 
+-- NULL placement is ORDER BY's rule, never the type's: NULLs first by default in
+-- BOTH directions, and explicit NULLS FIRST/LAST is absolute.
+create table sn (id integer primary key, d timespan null);
+insert into sn values (1, 'PT2H'), (2, 'PT90M'), (3, null);
+
+select id from sn order by d;
+→ [{"id":3},{"id":2},{"id":1}]
+
+select id from sn order by d desc;
+→ [{"id":3},{"id":1},{"id":2}]
+
+select id from sn order by d nulls last;
+→ [{"id":2},{"id":1},{"id":3}]
+
+drop table sn;
+
+-- === Index and composite-key access paths over a TIMESPAN column ===
+
+-- Secondary index: seek, range and ordering all run under the tree's typed order.
+create table si (id integer primary key, d timespan);
+create index si_d on si(d);
+insert into si values (1, 'PT2H'), (2, 'PT90M'), (3, 'PT30M');
+
+select id from si order by d;
+→ [{"id":3},{"id":2},{"id":1}]
+
+select id from si where d > 'PT90M';
+→ [{"id":1}]
+
+select id from si where d = 'PT120M';
+→ [{"id":1}]
+
+drop table si;
+
+-- Composite PK with a TIMESPAN trailing member: the equality prefix and the
+-- trailing range bound must both compare under the tree's order.
+create table cp (g integer, d timespan, primary key (g, d));
+insert into cp values (1, 'PT2H'), (1, 'PT90M'), (2, 'PT30M');
+
+select d from cp where g = 1 order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+select d from cp where g = 1 and d > 'PT90M';
+→ [{"d":"PT2H"}]
+
+select d from cp where g = 1 and d = 'PT120M';
+→ [{"d":"PT2H"}]
+
+drop table cp;
+
+-- DESC primary key: the descending physical walk still yields elapsed-time order.
+create table dsc (d timespan, primary key (d desc));
+insert into dsc values ('PT2H'), ('PT90M');
+
+select d from dsc order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+select d from dsc where d > 'PT90M';
+→ [{"d":"PT2H"}]
+
+drop table dsc;
+
+-- IN-list multi-seek: each probe seeks by elapsed time, not by text.
+create table il (d timespan primary key);
+insert into il values ('PT2H'), ('PT90M');
+
+select d from il where d in ('PT120M', 'PT30M');
+→ [{"d":"PT2H"}]
+
+select d from il where d not between 'PT30M' and 'PT100M';
+→ [{"d":"PT2H"}]
+
+drop table il;
+
 -- === TIMESPAN identity: 'PT1H' ≡ 'PT60M' (same elapsed time) ===
 
 create table dt (id integer primary key, d timespan);
@@ -119,6 +193,21 @@ select id from anyt order by v;
 → [{"id":1},{"id":2}]
 
 drop table anyt;
+
+-- A plain TEXT column holding duration-shaped text stays text-ordered, and BETWEEN
+-- must agree with the comparisons it desugars to. (Regression: a runtime duration
+-- probe applied unconditionally in BETWEEN made these two disagree — 'PT30M' passed
+-- the text comparisons but was rejected by BETWEEN.)
+create table txt (id integer primary key, v text);
+insert into txt values (1, 'PT30M'), (2, 'PT2H'), (3, 'PT90M');
+
+select id from txt where v between 'PT100M' and 'PT3H' order by id;
+→ [{"id":1},{"id":2}]
+
+select id from txt where v >= 'PT100M' and v <= 'PT3H' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table txt;
 
 -- === JSON: structural ordering ===
 
