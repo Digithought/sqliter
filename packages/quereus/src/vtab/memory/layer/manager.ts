@@ -21,7 +21,7 @@ import { scanLayer as scanLayerImpl } from './scan-layer.js';
 import { createPrimaryKeyFunctions, buildPrimaryKeyFromValues, type PrimaryKeyFunctions } from '../utils/primary-key.js';
 import { createMemoryTableLoggers } from '../utils/logging.js';
 import { tryFoldLiteral } from '../../../parser/utils.js';
-import { validateAndParse } from '../../../types/validation.js';
+import { validateAndParse, coerceRowToSchema } from '../../../types/validation.js';
 import type { VTableEventEmitter } from '../../events.js';
 import { inferType } from '../../../types/registry.js';
 import type { Expression } from '../../../parser/ast.js';
@@ -826,18 +826,7 @@ export class MemoryTableManager {
 
 		// Validate and parse values according to column types
 		const schema = targetLayer.getSchema();
-		const validatedRow: Row = values.map((value, index) => {
-			if (index >= schema.columns.length) {
-				throw new QuereusError(
-					`Too many values for INSERT into ${this._tableName}: expected ${schema.columns.length}, got ${values.length}`,
-					StatusCode.ERROR
-				);
-			}
-			const column = schema.columns[index];
-			return validateAndParse(value, column.logicalType, column.name);
-		});
-
-		const newRowData: Row = validatedRow;
+		const newRowData: Row = coerceRowToSchema(values, schema.columns, `INSERT into ${this._tableName}`);
 		const primaryKey = this.primaryKeyFromRow(newRowData);
 		const existingRow = this.lookupEffectiveRow(primaryKey, targetLayer);
 
@@ -883,18 +872,7 @@ export class MemoryTableManager {
 
 		// Validate and parse values according to column types
 		const schema = targetLayer.getSchema();
-		const validatedRow: Row = values.map((value, index) => {
-			if (index >= schema.columns.length) {
-				throw new QuereusError(
-					`Too many values for UPDATE on ${this._tableName}: expected ${schema.columns.length}, got ${values.length}`,
-					StatusCode.ERROR
-				);
-			}
-			const column = schema.columns[index];
-			return validateAndParse(value, column.logicalType, column.name);
-		});
-
-		const newRowData: Row = validatedRow;
+		const newRowData: Row = coerceRowToSchema(values, schema.columns, `UPDATE on ${this._tableName}`);
 		const targetPrimaryKey = buildPrimaryKeyFromValues(oldKeyValues, schema.primaryKeyDefinition);
 		const oldRowData = this.lookupEffectiveRow(targetPrimaryKey, targetLayer);
 

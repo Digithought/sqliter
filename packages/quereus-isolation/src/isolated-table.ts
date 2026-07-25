@@ -1,5 +1,5 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, validateAndParse, IndexConstraintOp, decodeIdxStr } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -1039,14 +1039,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * the existing one (bug-store-isolation-upsert-affinity-coerced-pk).
 	 */
 	private coerceRow(row: Row): Row {
-		const cols = this.tableSchema!.columns;
-		if (row.length > cols.length) {
-			throw new QuereusError(
-				`Too many values for ${this.schemaName}.${this.tableName}: expected ${cols.length}, got ${row.length}`,
-				StatusCode.ERROR,
-			);
-		}
-		return row.map((v, i) => validateAndParse(v, cols[i].logicalType, cols[i].name)) as Row;
+		return coerceRowToSchema(row, this.tableSchema!.columns, `${this.schemaName}.${this.tableName}`);
 	}
 
 	// ==================== Write Operations ====================

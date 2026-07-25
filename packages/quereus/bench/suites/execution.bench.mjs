@@ -27,6 +27,64 @@ async function createPopulatedDb() {
 	return db;
 }
 
+/** 40 identical leading characters — forces a comparator to scan past a long common
+ * prefix before it finds a differing character, the opposite cost profile of keys
+ * that differ at character 1. */
+const PREFIX40 = 'p'.repeat(40);
+
+/** One astral emoji (U+1F600, outside the Basic Multilingual Plane) plus one rare
+ * CJK Extension B ideograph (U+20000) — both are surrogate pairs in UTF-16, so any
+ * string containing them takes `compareCodePoints`'s surrogate-aware slow path
+ * instead of its native `<`/`>` fast path (see `util/comparison.ts`). */
+const UNICODE_PREFIX = '\u{1F600}\u{20000}';
+
+/**
+ * Build and populate a 10K-row database with several text columns, each shaped for a
+ * different comparator workload: `tkey` is unique text (order by / point compares),
+ * `label` is low-cardinality text (group by / distinct), `tkey_prefixed` shares a
+ * 40-char prefix across every row, and `tkey_unicode` carries astral code points.
+ */
+async function createTextDb() {
+	const db = new Database();
+	await db.exec(`
+		create table bench_text_t (
+			id integer primary key,
+			tkey text,
+			label text,
+			tkey_prefixed text,
+			tkey_unicode text
+		);
+	`);
+
+	for (let batch = 0; batch < 20; batch++) {
+		const values = Array.from({ length: 500 }, (_, j) => {
+			const id = batch * 500 + j + 1;
+			const suffix = String(id).padStart(5, '0');
+			return `(${id}, 'key_${suffix}', 'group_${id % 100}', '${PREFIX40}${suffix}', '${UNICODE_PREFIX}${suffix}')`;
+		}).join(', ');
+		await db.exec(`insert into bench_text_t values ${values}`);
+	}
+
+	return db;
+}
+
+/** Build and populate a 10K-row database with a text primary key (zero-padded so
+ * lexicographic order matches insertion order, making range bounds predictable). */
+async function createTextPkDb() {
+	const db = new Database();
+	await db.exec('create table bench_text_pk (tkey text primary key, val integer)');
+
+	for (let batch = 0; batch < 20; batch++) {
+		const values = Array.from({ length: 500 }, (_, j) => {
+			const id = batch * 500 + j + 1;
+			return `('key_${String(id).padStart(5, '0')}', ${id})`;
+		}).join(', ');
+		await db.exec(`insert into bench_text_pk values ${values}`);
+	}
+
+	return db;
+}
+
 let db;
 
 export const benchmarks = [

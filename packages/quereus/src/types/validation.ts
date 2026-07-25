@@ -1,7 +1,8 @@
-import type { SqlValue } from '../common/types.js';
+import type { Row, SqlValue } from '../common/types.js';
 import { StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 import type { LogicalType } from './logical-type.js';
+import type { ColumnSchema } from '../schema/column.js';
 
 /**
  * Validate a value against a logical type.
@@ -88,6 +89,27 @@ export function validateAndParse(
 
 	// Then validate the parsed result
 	return validateValue(parsed, type, columnName);
+}
+
+/**
+ * Coerce each cell in `row` to its declared column's logical type via
+ * {@link validateAndParse} (INTEGER/REAL affinity, JSON parsing, etc.) — the
+ * shared step every write path (memory tables, the KV store backend, the
+ * isolation overlay) applies before PK extraction, serialization, and index-key
+ * construction. `label` identifies the target for the "too many values" error
+ * (e.g. `` `${schemaName}.${tableName}` `` or `` `INSERT into ${tableName}` ``)
+ * so each call site keeps its own wording.
+ *
+ * @throws QuereusError if `row` has more cells than `columns`, or a cell fails validation/parsing
+ */
+export function coerceRowToSchema(row: Row, columns: readonly ColumnSchema[], label: string): Row {
+	if (row.length > columns.length) {
+		throw new QuereusError(
+			`Too many values for ${label}: expected ${columns.length}, got ${row.length}`,
+			StatusCode.ERROR,
+		);
+	}
+	return row.map((value, i) => validateAndParse(value, columns[i].logicalType, columns[i].name)) as Row;
 }
 
 /**

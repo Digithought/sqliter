@@ -14,4 +14,4 @@ export { JSON_TYPE } from './json-type.js';
 export { typeRegistry, registerType, getType, getTypeOrDefault, inferType } from './registry.js';
 
 // Validation utilities
-export { validateValue, parseValue, validateAndParse, isValidForType, tryParse } from './validation.js';
+export { validateValue, parseValue, validateAndParse, coerceRowToSchema, isValidForType, tryParse } from './validation.js';

@@ -23,7 +23,7 @@ import {
 	resolveUniqueEnforcementCollations,
 	BINARY_COLLATION,
 	rowsValueIdentical,
-	validateAndParse,
+	coerceRowToSchema,
 	compilePredicate,
 	decodeIdxStr,
 	maintainedTableUniqueViolationError,
@@ -993,14 +993,7 @@ export class StoreTable extends VirtualTable {
 	 * objects before PK extraction, serialization, and index-key construction.
 	 */
 	protected coerceRow(row: Row): Row {
-		const cols = this.tableSchema!.columns;
-		if (row.length > cols.length) {
-			throw new QuereusError(
-				`Too many values for ${this.schemaName}.${this.tableName}: expected ${cols.length}, got ${row.length}`,
-				StatusCode.ERROR,
-			);
-		}
-		return row.map((v, i) => validateAndParse(v, cols[i].logicalType, cols[i].name)) as Row;
+		return coerceRowToSchema(row, this.tableSchema!.columns, `${this.schemaName}.${this.tableName}`);
 	}
 
 	/**
