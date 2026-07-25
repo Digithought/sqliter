@@ -54,6 +54,17 @@ export const BUILTIN_KEY_NORMALIZER_RESOLVER: KeyNormalizerResolver = (collation
   return normalizer;
 };
 
+/**
+ * Per-column key-identity value transform (the engine's `semanticKeyTransform` output for
+ * the column's logical type): applied to a value BEFORE type-dispatched encoding, so a
+ * semantic-ordering type whose stored form is not canonical for equality (TIMESPAN:
+ * 'PT1H' ≡ 'PT60M') keys both spellings to identical bytes. TIMESPAN's transform yields
+ * total seconds (a number), so the member encodes through the NUMERIC path — making its
+ * byte order the type's `compare` order as a side effect; an unparseable value passes
+ * through as its raw text, matching `TIMESPAN.compare`'s BINARY-text fallback.
+ */
+export type KeyValueTransform = (value: SqlValue) => SqlValue;
+
 /** Options for encoding keys. */
 export interface EncodeOptions {
   /** Collation name for TEXT/OBJECT values. Default: 'NOCASE'. */
@@ -148,17 +159,25 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
  * A `undefined` entry (or no array) falls back to `options.collation`. Collation
  * only affects TEXT/OBJECT encoding; non-text components ignore it, so a
  * per-column override on an integer/real/blob member is a harmless no-op.
+ *
+ * When `transforms` is provided, each position with a defined entry maps its value
+ * through that {@link KeyValueTransform} BEFORE encoding (and before DESC inversion),
+ * so semantically-equal spellings of a semantic-ordering type collide on one key.
+ * NULL is exempt: it always encodes as the NULL tag regardless of any transform,
+ * mirroring how every comparator handles NULL outside the type's `compare`.
  */
 export function encodeCompositeKey(
   values: SqlValue[],
   options?: EncodeOptions,
   directions?: ReadonlyArray<boolean>,
   collations?: ReadonlyArray<string | undefined>,
+  transforms?: ReadonlyArray<KeyValueTransform | undefined>,
 ): Uint8Array {
   const parts = values.map((v, i) => {
     const colCollation = collations?.[i];
     const colOptions = colCollation !== undefined ? { ...options, collation: colCollation } : options;
-    const encoded = encodeValue(v, colOptions);
+    const transform = transforms?.[i];
+    const encoded = encodeValue(transform && v !== null ? transform(v) : v, colOptions);
     if (directions && directions[i]) {
       for (let j = 0; j < encoded.length; j++) {
         encoded[j] ^= 0xff;

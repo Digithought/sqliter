@@ -20,6 +20,7 @@ import {
 	compareSqlValuesFast,
 	createTypedComparator,
 	hasSemanticOrdering,
+	semanticKeyTransform,
 	resolveUniqueEnforcementCollations,
 	BINARY_COLLATION,
 	rowsValueIdentical,
@@ -70,7 +71,7 @@ import {
 	deserializeStats,
 	type TableStats,
 } from './serialization.js';
-import { type EncodeOptions } from './encoding.js';
+import { type EncodeOptions, type KeyValueTransform } from './encoding.js';
 
 /** Number of mutations before persisting statistics. */
 const STATS_FLUSH_INTERVAL = 100;
@@ -148,6 +149,54 @@ export function resolvePkKeyCollations(
 }
 
 /**
+ * Resolve the per-column key-identity VALUE TRANSFORM for each primary-key column —
+ * the engine's {@link semanticKeyTransform} of the member's logical type. One entry
+ * per PK member in `pkDef` order; `undefined` for every type whose raw value already
+ * keys faithfully. Today only TIMESPAN takes a transform (its `groupKey`: total
+ * seconds against the same reference date as `TIMESPAN.compare`), which makes
+ * 'PT1H' and 'PT60M' collide on one physical key exactly as the memory table's typed
+ * BTree collapses them. The companion of {@link resolvePkKeyCollations}: every call
+ * site that threads the collations MUST thread these too, or key identity drifts
+ * between the write path and the rebuild/lookup path.
+ */
+export function resolvePkKeyTransforms(
+	pkDef: ReadonlyArray<{ index: number }>,
+	columns: ReadonlyArray<ColumnSchema>,
+): (KeyValueTransform | undefined)[] {
+	return pkDef.map(def => semanticKeyTransform(columns[def.index]?.logicalType));
+}
+
+/**
+ * Per-column key-identity transforms for a secondary index's OWN columns (the
+ * index half of `buildIndexKey`), positionally aligned with `index.columns`.
+ * Same rule as {@link resolvePkKeyTransforms}: a semantic-ordering member with a
+ * `groupKey` canonicalizes, everything else encodes raw.
+ */
+export function resolveIndexKeyTransforms(
+	index: TableIndexSchema,
+	columns: ReadonlyArray<ColumnSchema>,
+): (KeyValueTransform | undefined)[] {
+	return index.columns.map(col => semanticKeyTransform(columns[col.index]?.logicalType));
+}
+
+/**
+ * Per-PK-column typed equality comparator for semantic-ordering members, `undefined`
+ * elsewhere. Backs {@link StoreTable.keysEqual}: two PK arrays naming the same
+ * physical key under {@link resolvePkKeyTransforms} ('PT1H' / 'PT60M') must also
+ * answer "same row" here, or self-PK exclusion in the UNIQUE checks false-conflicts
+ * a row against its own differently-spelled image.
+ */
+function resolvePkSemanticEquality(
+	pkDef: ReadonlyArray<{ index: number }>,
+	columns: ReadonlyArray<ColumnSchema>,
+): (((a: SqlValue, b: SqlValue) => number) | undefined)[] {
+	return pkDef.map(def => {
+		const logicalType = columns[def.index]?.logicalType;
+		return hasSemanticOrdering(logicalType) ? createTypedComparator(logicalType) : undefined;
+	});
+}
+
+/**
  * True when `col` can produce a TEXT value at runtime, and so when its physical
  * key bytes are produced by a collation normalizer rather than a type-native
  * encoding. The `ColumnSchema`-shaped wrapper over the engine's
@@ -196,12 +245,14 @@ export function keyOrderMatchesCollation(
 ): boolean {
 	// A semantic-ordering logical type (TIMESPAN, JSON — see docs/types.md "Semantic
 	// ordering") is ordered by its `compare` (elapsed time / structural), which the
-	// engine's Sort, comparison operators, and the memory backend all use. The store's
-	// key bytes encode the TEXT/canonical form, whose memcmp order differs ('PT2H'
-	// bytes sort before 'PT90M' though 90min < 2h), so no byte window or byte-order
-	// advertisement over such a column is sound. Costs the seek/elision, never a row;
-	// restoring them needs an order-preserving key encoding (e.g. total-seconds for
-	// TIMESPAN) — tracked as a store-side fix ticket.
+	// engine's Sort, comparison operators, and the memory backend all use. JSON's key
+	// bytes encode canonical text, whose memcmp order is not structural order, so the
+	// decline is a hard requirement there. TIMESPAN keys now encode the `groupKey`
+	// total-seconds transform (see `resolvePkKeyTransforms`), whose byte order DOES
+	// match `TIMESPAN.compare` for every parseable value — the decline for it is
+	// conservative, costing the seek/elision, never a row. Re-opening TIMESPAN's
+	// window/advertisement (and the byte-EQ arms in `analyzePKAccess` /
+	// `analyzeIndexAccess`) is tracked in backlog `feat-reopen-timespan-store-seeks`.
 	if (hasSemanticOrdering(column?.logicalType)) return false;
 	if (!columnCanHoldText(column)) return true;
 	if (compareCollation.toUpperCase() !== keyCollation.toUpperCase()) return false;
@@ -410,6 +461,21 @@ export class StoreTable extends VirtualTable {
 	 */
 	protected pkKeyCollations: (string | undefined)[];
 	/**
+	 * Per-PK-column key-identity value transform (see {@link resolvePkKeyTransforms}).
+	 * Threaded alongside {@link pkKeyCollations} into every data-key / PK-suffix /
+	 * PK-prefix-bounds encode, so a semantic-ordering PK member (TIMESPAN) keys
+	 * semantically-equal spellings to one physical key. Recomputed on every
+	 * {@link updateSchema}.
+	 */
+	protected pkKeyTransforms: (KeyValueTransform | undefined)[];
+	/**
+	 * Per-PK-column typed EQUALITY comparator for the semantic-ordering members only —
+	 * `undefined` for every other member, which {@link keysEqual} still compares with
+	 * strict `!==` as before. Keeps self-PK exclusion and PK-identity questions in
+	 * agreement with the physical key identity above ('PT1H' row IS the 'PT60M' row).
+	 */
+	protected pkSemanticEquality: (((a: SqlValue, b: SqlValue) => number) | undefined)[];
+	/**
 	 * `db.getCollationResolver()`, bound once at construction. Every collation-aware
 	 * VALUE comparison this table makes — pushed-constraint re-check, UNIQUE conflict
 	 * detection — resolves names through it, so a collation registered with
@@ -491,6 +557,8 @@ export class StoreTable extends VirtualTable {
 			tableSchema.columns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
+		this.pkKeyTransforms = resolvePkKeyTransforms(tableSchema.primaryKeyDefinition, tableSchema.columns);
+		this.pkSemanticEquality = resolvePkSemanticEquality(tableSchema.primaryKeyDefinition, tableSchema.columns);
 		// Validate the MATERIALIZED schema, so a `_uc_*` over a text column that needs the
 		// table key collation K is rejected up front just like an explicit index would be.
 		this.validateKeyCollations(this.materializedSchema, this.pkKeyCollations);
@@ -589,6 +657,8 @@ export class StoreTable extends VirtualTable {
 		this.materializedSchema = materialized;
 		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
 		this.pkKeyCollations = pkKeyCollations;
+		this.pkKeyTransforms = resolvePkKeyTransforms(newSchema.primaryKeyDefinition, newSchema.columns);
+		this.pkSemanticEquality = resolvePkSemanticEquality(newSchema.primaryKeyDefinition, newSchema.columns);
 	}
 
 	/**
@@ -736,10 +806,14 @@ export class StoreTable extends VirtualTable {
 			newColumns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
+		// Post-ALTER key-identity transforms too: an ALTER PRIMARY KEY onto (or a SET
+		// DATA TYPE creating) a semantic-ordering member must collapse equal spellings
+		// — pass 1 then rejects 'PT1H'/'PT60M' as a duplicate PK, all-or-nothing.
+		const newPkTransforms = resolvePkKeyTransforms(newPkDef, newColumns);
 		// Both passes key rows through this one helper, so a collision judged in pass 1
 		// is byte-identical to the key pass 2 writes.
 		const computeNewKey = (row: Row): Uint8Array =>
-			buildDataKey(newPkDef.map(pk => row[pk.index]), this.encodeOptions, newPkDirections, newPkCollations);
+			buildDataKey(newPkDef.map(pk => row[pk.index]), this.encodeOptions, newPkDirections, newPkCollations, newPkTransforms);
 
 		// Pass 1 — collision detection only. Hold one hex signature per new key, never
 		// the row or old key. On a repeat, reject before any write; the store is
@@ -1639,7 +1713,7 @@ export class StoreTable extends VirtualTable {
 				if (!values) throw new QuereusError('INSERT requires values', StatusCode.MISUSE);
 				const coerced = args.preCoerced ? values : this.coerceRow(values);
 				const pk = this.extractPK(coerced);
-				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
+				const key = this.encodeDataKey(pk);
 
 				// Check for existing row (for conflict handling).
 				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
@@ -1767,8 +1841,8 @@ export class StoreTable extends VirtualTable {
 				const coerced = args.preCoerced ? values : this.coerceRow(values);
 				const oldPk = this.extractPK(oldKeyValues);
 				const newPk = this.extractPK(coerced);
-				const oldKey = buildDataKey(oldPk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
-				const newKey = buildDataKey(newPk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
+				const oldKey = this.encodeDataKey(oldPk);
+				const newKey = this.encodeDataKey(newPk);
 
 				// Get old row for index updates. Read the effective
 				// (pending-over-committed) image UNCONDITIONALLY — including the trusted
@@ -1896,7 +1970,7 @@ export class StoreTable extends VirtualTable {
 			case 'delete': {
 				if (!oldKeyValues) throw new QuereusError('DELETE requires oldKeyValues', StatusCode.MISUSE);
 				const pk = this.extractPK(oldKeyValues);
-				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
+				const key = this.encodeDataKey(pk);
 
 				// Get old row for index cleanup. Read the effective
 				// (pending-over-committed) image so a row inserted earlier in the same
@@ -1964,6 +2038,9 @@ export class StoreTable extends VirtualTable {
 			const indexStore = await this.ensureIndexStore(index.name);
 			const indexCols = index.columns.map(c => c.index);
 			const indexDirections = index.columns.map(c => !!c.desc);
+			// Canonicalize semantic-ordering index members ('PT1H'/'PT60M' → one key) so a
+			// UNIQUE enforcement seek and delete-then-insert maintenance address one entry.
+			const indexTransforms = resolveIndexKeyTransforms(index, this.tableSchema!.columns);
 
 			// Partial index: only rows the predicate unambiguously accepts are
 			// indexed (mirrors buildIndexEntries' build-time filtering). Guarding both
@@ -1983,6 +2060,8 @@ export class StoreTable extends VirtualTable {
 					indexDirections,
 					this.pkDirections,
 					this.pkKeyCollations,
+					indexTransforms,
+					this.pkKeyTransforms,
 				);
 
 				if (inTransaction && this.coordinator) {
@@ -2002,6 +2081,8 @@ export class StoreTable extends VirtualTable {
 					indexDirections,
 					this.pkDirections,
 					this.pkKeyCollations,
+					indexTransforms,
+					this.pkKeyTransforms,
 				);
 				// Index value = the row's encoded DATA key. The index-entry key can
 				// locate a row's byte window, but its PK suffix is not losslessly
@@ -2052,13 +2133,39 @@ export class StoreTable extends VirtualTable {
 		return compiled;
 	}
 
-	/** Check if two PK arrays are equal. */
+	/**
+	 * Check if two PK arrays name the same row. A semantic-ordering member compares
+	 * through its type's `compare` (see {@link resolvePkSemanticEquality}) so
+	 * differently-spelled equal values ('PT1H' / 'PT60M') answer "same row",
+	 * agreeing with the physical key identity {@link encodeDataKey} produces; every
+	 * other member keeps the original strict `!==`.
+	 */
 	protected keysEqual(a: SqlValue[], b: SqlValue[]): boolean {
 		if (a.length !== b.length) return false;
 		for (let i = 0; i < a.length; i++) {
-			if (a[i] !== b[i]) return false;
+			const semantic = this.pkSemanticEquality[i];
+			if (semantic ? semantic(a[i], b[i]) !== 0 : a[i] !== b[i]) return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Per-constrained-column comparison functions for one UNIQUE constraint: the
+	 * type's `compare` for a semantic-ordering column (so 'PT1H' conflicts with
+	 * 'PT60M', matching the memory backend's typed BTree), else the enforcement
+	 * collation the caller resolved (`resolveUniqueEnforcementCollations`) through
+	 * `compareSqlValuesFast` — the exact comparison every finder used before.
+	 */
+	private uniqueColumnComparators(
+		uc: UniqueConstraintSchema,
+		collations: ReadonlyArray<CollationFunction>,
+	): ((a: SqlValue, b: SqlValue) => number)[] {
+		const columns = this.tableSchema!.columns;
+		return uc.columns.map((colIdx, i) => {
+			const logicalType = columns[colIdx]?.logicalType;
+			if (hasSemanticOrdering(logicalType)) return createTypedComparator(logicalType, collations[i]);
+			return (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collations[i]);
+		});
 	}
 
 	/**
@@ -2311,10 +2418,14 @@ export class StoreTable extends VirtualTable {
 		// unregistered name and cannot be inlined, so a per-candidate call would be
 		// pure overhead.
 		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
+		const compares = this.uniqueColumnComparators(uc, collations);
+		// Same per-column transforms `updateSecondaryIndexes` wrote the entries under, so
+		// the probe for 'PT60M' lands on the window holding the 'PT1H' entry.
 		const bounds = buildIndexPrefixBounds(
 			uc.columns.map(c => newRow[c]),
 			this.encodeOptions,
 			index.columns.map(c => !!c.desc),
+			resolveIndexKeyTransforms(index, this.tableSchema!.columns),
 		);
 
 		for await (const entry of this.iterateEffective(indexStore, bounds)) {
@@ -2332,7 +2443,7 @@ export class StoreTable extends VirtualTable {
 
 			const pk = this.extractPK(candidate);
 			if (selfPks.some(skip => this.keysEqual(pk, skip))) continue;
-			if (uc.columns.some((c, i) => compareSqlValuesFast(newRow[c], candidate[c], collations[i]) !== 0)) continue;
+			if (uc.columns.some((c, i) => compares[i](newRow[c], candidate[c]) !== 0)) continue;
 			if (predicate && predicate.evaluate(candidate) !== true) continue;
 			return { pk, row: candidate };
 		}
@@ -2363,6 +2474,7 @@ export class StoreTable extends VirtualTable {
 		// COLLATE for an index-derived UNIQUE, else the declared column collation.
 		// Resolved once here, not per candidate row.
 		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
+		const compares = this.uniqueColumnComparators(uc, collations);
 
 		const matches = (candidate: Row): UniqueConflict | null => {
 			const pk = this.extractPK(candidate);
@@ -2371,7 +2483,7 @@ export class StoreTable extends VirtualTable {
 			}
 			for (let i = 0; i < constrainedCols.length; i++) {
 				const idx = constrainedCols[i];
-				if (compareSqlValuesFast(newRow[idx], candidate[idx], collations[i]) !== 0) return null;
+				if (compares[i](newRow[idx], candidate[idx]) !== 0) return null;
 			}
 			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
 			if (predicate && predicate.evaluate(candidate) !== true) return null;
@@ -2419,6 +2531,7 @@ export class StoreTable extends VirtualTable {
 		const newSourcePk = this.extractPK(newRow);
 		// Resolved once, above the candidate loop.
 		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
+		const compares = this.uniqueColumnComparators(uc, collations);
 		const candidates = await (this.db as DatabaseInternal)._lookupCoveringConflicts(mv, uc, newRow, newSourcePk);
 		for (const cand of candidates) {
 			const liveRow = await this.readLiveRowByPk(cand.pk);
@@ -2434,7 +2547,7 @@ export class StoreTable extends VirtualTable {
 			// index over a BINARY column) is declined upstream by the collation gate in
 			// findRowTimeCoveringStructure, so only BINARY-floor or equal-collation MVs
 			// reach here — the superset this re-validation can soundly filter.
-			if (uc.columns.some((c, i) => compareSqlValuesFast(newRow[c], liveRow[c], collations[i]) !== 0)) continue;
+			if (uc.columns.some((c, i) => compares[i](newRow[c], liveRow[c]) !== 0)) continue;
 			if (predicate && predicate.evaluate(liveRow) !== true) continue;
 			return { pk: cand.pk, row: liveRow };
 		}
@@ -2459,7 +2572,7 @@ export class StoreTable extends VirtualTable {
 
 	/** Encode `pkValues` (in PK-definition order) exactly as the data store keys rows. */
 	encodeDataKey(pkValues: SqlValue[]): Uint8Array {
-		return buildDataKey(pkValues, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
+		return buildDataKey(pkValues, this.encodeOptions, this.pkDirections, this.pkKeyCollations, this.pkKeyTransforms);
 	}
 
 	/**
@@ -2474,6 +2587,7 @@ export class StoreTable extends VirtualTable {
 			this.encodeOptions,
 			this.pkDirections.slice(0, prefixValues.length),
 			this.pkKeyCollations.slice(0, prefixValues.length),
+			this.pkKeyTransforms.slice(0, prefixValues.length),
 		);
 	}
 
@@ -2700,7 +2814,7 @@ export class StoreTable extends VirtualTable {
 		oldRow: Row,
 	): Promise<void> {
 		const store = await this.ensureStore();
-		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
+		const key = this.encodeDataKey(pk);
 		if (inTransaction && this.coordinator) {
 			this.coordinator.delete(key, store);
 		} else {

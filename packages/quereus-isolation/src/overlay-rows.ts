@@ -1,5 +1,5 @@
 import type { Database, Row, SqlValue, TableSchema, VirtualTable } from '@quereus/quereus';
-import { QuereusError, StatusCode, pkKeyCollationName, serializeKeyNullGrouping } from '@quereus/quereus';
+import { QuereusError, StatusCode, pkKeyCollationName, semanticKeyTransform, serializeKeyNullGrouping } from '@quereus/quereus';
 import { makeFullScanFilterInfo } from './filter-info.js';
 
 /**
@@ -67,7 +67,12 @@ export async function collectOverlayEntries(
  * serializer normalizes string values only), so a comparator-only collation declared on
  * an integer column does not raise here.
  *
- * NULL-grouping (rather than {@link serializeRowKey}'s NULL-poisoning) so a degenerate
+ * A PK column whose logical type carries semantic ordering with a `groupKey` (TIMESPAN)
+ * runs its value through the engine's `semanticKeyTransform` first, so the two spellings
+ * of one elapsed time ('PT1H' / 'PT60M') — which both backends key as ONE row — hash to
+ * one bucket here too, and an overlay rewrite shadows the underlying spelling it replaces.
+ *
+ * NULL-grouping (rather than `serializeRowKey`'s NULL-poisoning) so a degenerate
  * nullable PK column still produces a usable key instead of collapsing to `null`.
  */
 export function makePkKeySerializer(db: Database, schema: TableSchema): (pk: readonly SqlValue[]) => string {
@@ -76,7 +81,15 @@ export function makePkKeySerializer(db: Database, schema: TableSchema): (pk: rea
 		const column = schema.columns[def.index];
 		return resolver(pkKeyCollationName(column));
 	});
-	return pk => serializeKeyNullGrouping(pk, normalizers);
+	const transforms = schema.primaryKeyDefinition.map(def =>
+		semanticKeyTransform(schema.columns[def.index]?.logicalType));
+	return pk => serializeKeyNullGrouping(
+		pk.map((v, i) => {
+			const transform = transforms[i];
+			return transform && v !== null ? transform(v) : v;
+		}),
+		normalizers,
+	);
 }
 
 /**

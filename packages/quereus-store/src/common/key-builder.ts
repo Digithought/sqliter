@@ -15,7 +15,7 @@
  */
 
 import type { SqlValue } from '@quereus/quereus';
-import { encodeCompositeKey, assertNoUnpairedSurrogate, type EncodeOptions } from './encoding.js';
+import { encodeCompositeKey, assertNoUnpairedSurrogate, type EncodeOptions, type KeyValueTransform } from './encoding.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -102,14 +102,19 @@ export function buildStatsKey(schemaName: string, tableName: string): Uint8Array
  * `collations[i]`, when defined, encodes PK column i under its own key collation
  * (overriding `options.collation`), so each text PK column honors its declared
  * collation in the physical key bytes. Non-text members ignore it.
+ *
+ * `transforms[i]`, when defined, canonicalizes PK column i's value before encoding
+ * (see {@link KeyValueTransform}), so semantically-equal spellings of a
+ * semantic-ordering member ('PT1H' / 'PT60M') land on one key.
  */
 export function buildDataKey(
 	pkValues: SqlValue[],
 	options?: EncodeOptions,
 	directions?: ReadonlyArray<boolean>,
 	collations?: ReadonlyArray<string | undefined>,
+	transforms?: ReadonlyArray<KeyValueTransform | undefined>,
 ): Uint8Array {
-	return encodeCompositeKey(pkValues, options, directions, collations);
+	return encodeCompositeKey(pkValues, options, directions, collations, transforms);
 }
 
 /**
@@ -125,6 +130,10 @@ export function buildDataKey(
  * with the same per-column collations as the data key (see `buildDataKey`), so
  * index maintenance (delete-then-insert on UPDATE/DELETE) addresses the same
  * bytes the data store keys by. Index columns keep `options.collation`.
+ *
+ * `indexTransforms` / `pkTransforms` canonicalize each half's values before
+ * encoding (see {@link KeyValueTransform}); the PK-suffix transforms MUST match
+ * the data key's for the same reason as the collations above.
  */
 export function buildIndexKey(
 	indexValues: SqlValue[],
@@ -133,9 +142,11 @@ export function buildIndexKey(
 	indexDirections?: ReadonlyArray<boolean>,
 	pkDirections?: ReadonlyArray<boolean>,
 	pkCollations?: ReadonlyArray<string | undefined>,
+	indexTransforms?: ReadonlyArray<KeyValueTransform | undefined>,
+	pkTransforms?: ReadonlyArray<KeyValueTransform | undefined>,
 ): Uint8Array {
-	const indexEncoded = encodeCompositeKey(indexValues, options, indexDirections);
-	const pkEncoded = encodeCompositeKey(pkValues, options, pkDirections, pkCollations);
+	const indexEncoded = encodeCompositeKey(indexValues, options, indexDirections, undefined, indexTransforms);
+	const pkEncoded = encodeCompositeKey(pkValues, options, pkDirections, pkCollations, pkTransforms);
 	return concatBytes(indexEncoded, pkEncoded);
 }
 
@@ -318,12 +329,13 @@ export function buildIndexPrefixBounds(
 	prefixValues: SqlValue[],
 	options?: EncodeOptions,
 	directions?: ReadonlyArray<boolean>,
+	transforms?: ReadonlyArray<KeyValueTransform | undefined>,
 ): { gte: Uint8Array; lt?: Uint8Array } {
 	if (prefixValues.length === 0) {
 		return buildFullScanBounds();
 	}
 
-	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions);
+	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions, undefined, transforms);
 	return {
 		gte: prefixEncoded,
 		lt: incrementLastByte(prefixEncoded),
@@ -357,12 +369,13 @@ export function buildPkPrefixBounds(
 	options?: EncodeOptions,
 	directions?: ReadonlyArray<boolean>,
 	collations?: ReadonlyArray<string | undefined>,
+	transforms?: ReadonlyArray<KeyValueTransform | undefined>,
 ): { gte: Uint8Array; lt?: Uint8Array } {
 	if (prefixValues.length === 0) {
 		return buildFullScanBounds();
 	}
 
-	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions, collations);
+	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions, collations, transforms);
 	return {
 		gte: prefixEncoded,
 		lt: incrementLastByte(prefixEncoded),

@@ -39,7 +39,7 @@ import type {
 	BackingHost,
 	LensDeploymentSnapshot,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeRowKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, semanticKeyTransform, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
 import type { CompiledPredicate, EffectiveRowSource, KeyNormalizer, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
@@ -47,7 +47,7 @@ import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import { StoreBackingHost } from './backing-host.js';
-import { StoreTable, resolvePkKeyCollations, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, withImplicitUniqueIndexes, implicitUniqueIndexName, type StoreTableConfig, type StoreTableModule } from './store-table.js';
+import { StoreTable, resolvePkKeyCollations, resolvePkKeyTransforms, resolveIndexKeyTransforms, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, withImplicitUniqueIndexes, implicitUniqueIndexName, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
@@ -1128,6 +1128,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const encodeOptions = { collation: keyCollation, normalizers };
 		const pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
 		const pkCollations = resolvePkKeyCollations(tableSchema.primaryKeyDefinition, tableSchema.columns, keyCollation);
+		// Key-identity transforms for both halves, mirroring `StoreTable`'s maintenance
+		// writes (`updateSecondaryIndexes` / `encodeDataKey`) — a rebuild that skipped them
+		// would re-encode a TIMESPAN member under different bytes than DML writes.
+		const pkTransforms = resolvePkKeyTransforms(tableSchema.primaryKeyDefinition, tableSchema.columns);
+		const indexTransforms = resolveIndexKeyTransforms(indexSchema, tableSchema.columns);
 		const indexDirections = indexSchema.columns.map(col => !!col.desc);
 
 		const predicate: CompiledPredicate | undefined = indexSchema.predicate
@@ -1162,9 +1167,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			const indexValues = indexSchema.columns.map(col => row[col.index]);
 
 			if (seen) {
-				// serializeRowKey returns null when any indexed column is NULL —
+				// The signature returns null when any indexed column is NULL —
 				// SQL UNIQUE allows multiple NULLs, so those rows never collide.
-				const keySig = serializeRowKey(row, indexColIndices, indexNormalizers!);
+				const keySig = dedupeRowSignature(row, indexColIndices, indexNormalizers!, indexTransforms);
 				if (keySig !== null) {
 					if (seen.has(keySig)) {
 						const colNames = indexSchema.columns
@@ -1187,13 +1192,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				indexDirections,
 				pkDirections,
 				pkCollations,
+				indexTransforms,
+				pkTransforms,
 			);
 			// Index value = the row's encoded DATA key, so an index scan resolves each
 			// entry back to its base row via a direct data-store read (see
 			// `StoreTable.scanIndex`). Encoded under the same PK directions + per-column
-			// PK collations as `buildDataKey` / `updateSecondaryIndexes`, so the value
-			// byte-matches the data store's key for this row.
-			const dataKey = buildDataKey(pkValues, encodeOptions, pkDirections, pkCollations);
+			// PK collations + key transforms as `buildDataKey` / `updateSecondaryIndexes`,
+			// so the value byte-matches the data store's key for this row.
+			const dataKey = buildDataKey(pkValues, encodeOptions, pkDirections, pkCollations, pkTransforms);
 			batch.put(indexKey, dataKey);
 
 			// Bound heap: once the accumulated serialized key bytes cross the budget, flush
@@ -1289,7 +1296,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *
 	 * No index store is written — store UNIQUE enforcement is a full-scan over
 	 * `uniqueConstraints` at write time. The signature is built by
-	 * {@link serializeRowKey} with one normalizer per constrained column, resolved from
+	 * {@link dedupeRowSignature} with one normalizer per constrained column, resolved from
 	 * `tableSchema.columns[idx].collation` through the connection's
 	 * `db.getKeyNormalizerResolver()`, so a per-column collation registered with
 	 * `db.registerCollation` is honored (matching write-time `compareSqlValues`
@@ -2146,6 +2153,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
 		};
 
+		// SET DATA TYPE onto/off a type with a key-identity transform (TIMESPAN's
+		// total-seconds groupKey — see `resolvePkKeyTransforms`) changes the physical
+		// KEY BYTES a value encodes to, even when the stored VALUE bytes don't change
+		// (text → timespan keeps TEXT physical). Treated exactly like a collation
+		// change below: existing-row UNIQUE re-validation (equal-elapsed spellings now
+		// collide), a PK re-key when the column is a PK member, and a secondary-index
+		// rebuild (index keys encode the column's values). A same-type no-op ALTER
+		// never gets here (`inferType` returns the shared type object, so the identity
+		// check short-circuits).
+		const keyTransformChanged = oldCol.logicalType !== newCol.logicalType
+			&& (semanticKeyTransform(oldCol.logicalType) !== undefined
+				|| semanticKeyTransform(newCol.logicalType) !== undefined);
+
 		// SET COLLATE existing-row re-validation (Option A, non-PK UNIQUE): a new
 		// per-column collation can make rows that were distinct under the old
 		// collation collide. Re-scan every UNIQUE constraint covering the altered
@@ -2154,7 +2174,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// left unchanged and writable (matches the ADD CONSTRAINT rollback shape).
 		// The PK is intentionally excluded — it never appears in `uniqueConstraints`;
 		// its physical re-key/re-validation is the `isPkColumn` block below.
-		if (collationChanged) {
+		if (collationChanged || keyTransformChanged) {
 			const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 				.filter(uc => uc.columns.includes(colIndex));
 			for (const uc of coveringConstraints) {
@@ -2178,7 +2198,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// ALTER PRIMARY KEY. Runs AFTER the non-PK UNIQUE re-validation above so both
 		// throw-only checks precede the first store mutation. `updatedSchema.columns`
 		// carries the new collation, so the new key bytes follow it.
-		if (collationChanged && oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+		const pkRekeyNeeded = (collationChanged || keyTransformChanged)
+			&& oldSchema.primaryKeyDefinition.some(def => def.index === colIndex);
+		if (pkRekeyNeeded) {
 			// Physical re-key ahead — flush buffered writes (see
 			// {@link ddlCommitPendingOps}). Deliberately AFTER the non-PK UNIQUE
 			// re-validation above: that check reads effectively and throws without
@@ -2198,16 +2220,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 
 		// SET DATA TYPE physical conversion / SET NOT NULL DEFAULT backfill rewrote stored
-		// column values in place (same PK, new value) via mapRowsAtIndex. Secondary index KEY
-		// bytes encode the indexed column VALUES, so any index covering this column still points
-		// at the OLD value bytes until rebuilt — an index-backed lookup for the new value finds
-		// nothing (mirrors the memory module's `valuesRewritten` rebuild in MemoryTableManager.
-		// alterColumn). The sub-helper already ran ddlCommitPendingOps before its rewrite, so the
-		// committed data store rebuildSecondaryIndexes reads is "everything live". Mutually
-		// exclusive with the collation re-key above (distinct attributes), so no double rebuild.
-		// Materialize so an implicit `_uc_*` over the rewritten column is rebuilt against the
-		// new value bytes too.
-		if (valuesRewritten) {
+		// column values in place (same PK, new value) via mapRowsAtIndex — and a key-identity
+		// transform change re-encodes the column's index-key bytes even with values untouched.
+		// Secondary index KEY bytes encode the indexed column VALUES, so any index covering
+		// this column still points at the OLD bytes until rebuilt — an index-backed lookup for
+		// the new value finds nothing (mirrors the memory module's `valuesRewritten` rebuild in
+		// MemoryTableManager.alterColumn). `rebuildSecondaryIndexes` reads committed-only, so
+		// flush buffered writes first — the `valuesRewritten` sub-helpers already did, and the
+		// transform-only path (text → timespan: no value rewrite) must too; a re-flush with
+		// nothing pending is a no-op. Skipped when the PK re-key above already rebuilt every
+		// index, so no double rebuild. Materialize so an implicit `_uc_*` over the rewritten
+		// column is rebuilt against the new value bytes too.
+		if ((valuesRewritten || keyTransformChanged) && !pkRekeyNeeded) {
+			await this.ddlCommitPendingOps();
 			await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver());
 		}
 
@@ -3896,7 +3921,7 @@ async function* rowsFromEntries(entries: AsyncIterable<KVEntry>): AsyncIterable<
  * write-time enforcement.
  *
  * A column whose declared type can never hold text takes the identity normalizer regardless
- * of its collation (`serializeRowKey` normalizes only string values), so a comparator-only
+ * of its collation (the signature serializer normalizes only string values), so a comparator-only
  * collation named on an integer column is not rejected here when the engine's own hash sites
  * would accept it.
  */
@@ -3914,12 +3939,34 @@ function indexDedupeNormalizers(
 }
 
 /**
+ * Collation- and identity-aware dedupe signature of `row` over `colIndices`: each value
+ * runs through its column's key-identity transform (the engine's `semanticKeyTransform`
+ * — TIMESPAN's total-seconds `groupKey`, so 'PT1H' and 'PT60M' sign identically) before
+ * `serializeKey` applies the per-column normalizer. Returns null when any covered value
+ * is NULL (SQL UNIQUE allows multiple NULLs). The build/validate-time twin of the
+ * write-time typed compare in `StoreTable.uniqueColumnComparators`.
+ */
+function dedupeRowSignature(
+	row: Row,
+	colIndices: readonly number[],
+	normalizers: readonly KeyNormalizer[],
+	transforms: ReadonlyArray<((v: SqlValue) => SqlValue) | undefined>,
+): string | null {
+	const values = colIndices.map((c, i) => {
+		const v = row[c];
+		const transform = transforms[i];
+		return transform && v !== null ? transform(v) : v;
+	});
+	return serializeKey(values, normalizers);
+}
+
+/**
  * Throws CONSTRAINT on the first pair of `rows` that share a signature over `columnIndices`.
  *
- * SQL NULL semantics: `serializeRowKey` returns null when any constrained column is NULL, and
- * such rows never collide. A partial `predicate` restricts the judged set to rows it accepts
- * unambiguously. Shared by {@link StoreModule.validateUniqueOverExistingRows} (constraint
- * columns) and {@link StoreModule.validateUniqueIndexOverRows} (index columns).
+ * SQL NULL semantics: {@link dedupeRowSignature} returns null when any constrained column is
+ * NULL, and such rows never collide. A partial `predicate` restricts the judged set to rows
+ * it accepts unambiguously. Shared by {@link StoreModule.validateUniqueOverExistingRows}
+ * (constraint columns) and {@link StoreModule.validateUniqueIndexOverRows} (index columns).
  */
 async function assertNoDuplicateRows(
 	rows: AsyncIterable<Row>,
@@ -3928,11 +3975,12 @@ async function assertNoDuplicateRows(
 	normalizers: readonly KeyNormalizer[],
 	predicate: CompiledPredicate | undefined,
 ): Promise<void> {
+	const transforms = columnIndices.map(i => semanticKeyTransform(tableSchema.columns[i]?.logicalType));
 	const seen = new Set<string>();
 	for await (const row of rows) {
 		if (predicate && predicate.evaluate(row) !== true) continue;
 
-		const keySig = serializeRowKey(row, columnIndices, normalizers);
+		const keySig = dedupeRowSignature(row, columnIndices, normalizers, transforms);
 		if (keySig === null) continue;
 
 		if (seen.has(keySig)) {

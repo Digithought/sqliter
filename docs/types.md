@@ -252,6 +252,17 @@ that compare-equal values serialize to the same hash key (TIMESPAN maps to total
 seconds against the same fixed reference date `compare` uses). JSON needs no
 `groupKey`: canonical-text equality and structural equality coincide.
 
+The persistent store follows the same identity rule: a TIMESPAN primary-key or index
+key member is encoded through `groupKey` (see `quereus-store`'s
+`resolvePkKeyTransforms`), so `'PT1H'` and `'PT60M'` collide on one physical key —
+duplicate spellings raise the ordinary PK/UNIQUE violation, `on conflict` actions
+fire, and the isolation overlay shadows across spellings. JSON keys already encode
+the canonical text, which is identity-faithful. Store *ordering* advertisements and
+byte-window seeks over semantic-ordering members remain declined (a real Sort runs
+and point/range predicates re-check through the type-aware residual); TIMESPAN's
+total-seconds keys make re-opening them possible — tracked in backlog
+`feat-reopen-timespan-store-seeks`.
+
 Known gap: the built-in `min`/`max` aggregates rank with a bare BINARY compare —
 aggregate step functions receive no type context — so `min(timespan_col)` returns
 the text-order extremum, not the shortest duration (tracked as a fix ticket).

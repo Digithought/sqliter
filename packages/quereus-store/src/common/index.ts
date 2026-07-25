@@ -26,6 +26,7 @@ export {
   assertNoUnpairedSurrogate,
   findUnpairedSurrogate,
   type EncodeOptions,
+  type KeyValueTransform,
 } from './encoding.js';
 
 // Row serialization
@@ -105,6 +106,8 @@ export { CachedKVStore, type CacheOptions } from './cached-kv-store.js';
 export {
   StoreTable,
   resolvePkKeyCollations,
+  resolvePkKeyTransforms,
+  resolveIndexKeyTransforms,
   type StoreTableConfig,
   type StoreTableModule,
   type ExternalRowOp,

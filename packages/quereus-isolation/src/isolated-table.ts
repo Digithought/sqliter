@@ -1,5 +1,5 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -73,6 +73,31 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * which invalidates the entry.
 	 */
 	private pkCollationCache?: { schema: TableSchema; functions: CollationFunction[]; directions: boolean[] };
+
+	/**
+	 * Per-PK-column typed EQUALITY comparators for semantic-ordering members (TIMESPAN,
+	 * JSON — see the engine's `hasSemanticOrdering`), `undefined` elsewhere. The
+	 * underlying backends collapse semantically-equal PK spellings onto one row (the
+	 * memory table's typed BTree; the store's `groupKey`-transformed key bytes), so
+	 * shadowing and self-PK questions here must call 'PT1H' and 'PT60M' the same key
+	 * too. Memoized against the schema object like {@link pkCollationCache}.
+	 */
+	private pkSemanticCache?: { schema: TableSchema; comparators: (((a: SqlValue, b: SqlValue) => number) | undefined)[] };
+
+	private getPkSemanticComparators(): (((a: SqlValue, b: SqlValue) => number) | undefined)[] {
+		const schema = this.tableSchema;
+		if (!schema) return [];
+		if (this.pkSemanticCache?.schema !== schema) {
+			this.pkSemanticCache = {
+				schema,
+				comparators: (schema.primaryKeyDefinition ?? []).map(pk => {
+					const logicalType = schema.columns[pk.index]?.logicalType;
+					return hasSemanticOrdering(logicalType) ? createTypedComparator(logicalType) : undefined;
+				}),
+			};
+		}
+		return this.pkSemanticCache.comparators;
+	}
 
 	/**
 	 * Returns the connection-scoped set of savepoint depths that pre-date the overlay.
@@ -472,7 +497,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// getComparePK/keysEqual and agreeing with `db.registerCollation`.
 		//
 		// A PK column whose declared type can never hold text takes the identity
-		// normalizer regardless of its collation: `serializeRowKey` normalizes only
+		// normalizer regardless of its collation: the key serializer normalizes only
 		// string values, so the collation cannot affect how such a key buckets. Asking
 		// the resolver for it would reject `n integer collate mycoll` under a
 		// comparator-only collation, which the engine's own hash sites accept (they gate
@@ -484,6 +509,21 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			const column = this.tableSchema!.columns[i];
 			return this.keyNormalizerResolver(pkKeyCollationName(column));
 		});
+		// Key-identity transforms for semantic-ordering PK members (TIMESPAN's total-seconds
+		// groupKey): the underlying backends key 'PT1H' and 'PT60M' as ONE row, so the
+		// modified-PK shadow set must bucket them identically or a staged rewrite fails to
+		// shadow the committed spelling and both rows surface. `!` on the serialized key is
+		// safe: PK columns are NOT NULL, so serializeKey never returns null; both the build
+		// and probe below use this one encoder so they stay consistent.
+		const pkTransforms = pkIndices.map(i => semanticKeyTransform(this.tableSchema!.columns[i]?.logicalType));
+		const pkShadowKey = (row: Row): string => serializeKey(
+			pkIndices.map((idx, i) => {
+				const v = row[idx];
+				const transform = pkTransforms[i];
+				return transform && v !== null ? transform(v) : v;
+			}),
+			pkNormalizers,
+		)!;
 
 		// Step 1: one full overlay scan collects the modified PKs AND the in-window
 		// non-tombstone data rows. The window filter is applied here, unconditionally —
@@ -498,9 +538,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const modifiedPKs = new Set<string>();
 		const overlayRows: Row[] = [];
 		for await (const row of overlay.query(this.createFullScanFilterInfo())) {
-			// `!` is safe: PK columns are NOT NULL, so serializeRowKey never returns
-			// null here; both sides use the same encoder so they stay consistent.
-			modifiedPKs.add(serializeRowKey(row, pkIndices, pkNormalizers)!);
+			modifiedPKs.add(pkShadowKey(row));
 			if (row[tombstoneIndex] !== 1) {
 				const dataRow = row.slice(0, tombstoneIndex);
 				if (matchesWindow(dataRow)) {
@@ -523,8 +561,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// Merge two sorted, disjoint streams
 		let oi = 0;
 		for await (const underlyingRow of this.underlyingTable.query!(filterInfo)) {
-			// `!` is safe for the same reason as the build loop above (PK NOT NULL).
-			if (modifiedPKs.has(serializeRowKey(underlyingRow, pkIndices, pkNormalizers)!)) {
+			if (modifiedPKs.has(pkShadowKey(underlyingRow))) {
 				continue; // Skip rows modified in overlay
 			}
 
@@ -951,11 +988,17 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// the underlying row it shadows ('apple') as distinct keys; an ascending one
 		// walks a `primary key (k desc)` table against its scan order. Either way both
 		// rows surface in a scan instead of the overlay shadowing the underlying.
+		// A semantic-ordering member compares through its type's `compare` — both the
+		// memory table's typed BTree and the store's groupKey-transformed key bytes
+		// emit in that order, and its equality is what shadowing needs ('PT1H' ≡ 'PT60M').
 		const collations = this.getPkCollations();
 		const directions = this.getPkDirections();
+		const semantic = this.getPkSemanticComparators();
 		return (a: SqlValue[], b: SqlValue[]) => {
 			for (let i = 0; i < a.length; i++) {
-				const cmp = compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION);
+				const cmp = semantic[i]
+					? semantic[i]!(a[i], b[i])
+					: compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION);
 				if (cmp !== 0) return directions[i] ? -cmp : cmp;
 			}
 			return 0;
@@ -971,9 +1014,15 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	private buildDescriptorComparators(keyColumns: readonly IndexKeyColumn[]): ((a: SqlValue, b: SqlValue) => number)[] {
 		return keyColumns.map(kc => {
+			// A semantic-ordering key column merges by the type's `compare` — the order
+			// both backends emit such a column in (typed BTree / groupKey key bytes).
+			const logicalType = this.tableSchema?.columns[kc.columnIndex]?.logicalType;
 			const collation = kc.collation ? this.collationResolver(kc.collation) : BINARY_COLLATION;
+			const compare = hasSemanticOrdering(logicalType)
+				? createTypedComparator(logicalType, collation)
+				: (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation);
 			return (a: SqlValue, b: SqlValue) => {
-				const cmp = compareSqlValuesFast(a, b, collation);
+				const cmp = compare(a, b);
 				return kc.desc ? -cmp : cmp;
 			};
 		});
@@ -1418,10 +1467,16 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// store keys rows collation-aware (e.g. a NOCASE text PK), so a case-only PK
 		// rewrite ('apple' → 'APPLE') is the SAME logical key. A binary comparison here
 		// would mis-classify it as a PK relocation, then resolve the "new" key back to the
-		// same physical underlying row and raise a false UNIQUE PK conflict.
+		// same physical underlying row and raise a false UNIQUE PK conflict. A
+		// semantic-ordering member compares through its type's `compare` for the same
+		// reason: both backends key 'PT1H' and 'PT60M' as one row.
 		const collations = this.getPkCollations();
+		const semantic = this.getPkSemanticComparators();
 		for (let i = 0; i < a.length; i++) {
-			if (compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION) !== 0) return false;
+			const cmp = semantic[i]
+				? semantic[i]!(a[i], b[i])
+				: compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION);
+			if (cmp !== 0) return false;
 		}
 		return true;
 	}
@@ -1556,15 +1611,23 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		selfPks: SqlValue[][],
 		tombstoneIndex: number,
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
-		// One comparison collation per constrained column — the index's per-column
-		// COLLATE for an index-derived UNIQUE, else the declared column collation.
-		// Resolved once, above both candidate scans; both phases compare identically.
+		// One comparison function per constrained column — the type's `compare` for a
+		// semantic-ordering column ('PT1H' conflicts with 'PT60M', matching both
+		// backends' typed enforcement), else the enforcement collation (the index's
+		// per-column COLLATE for an index-derived UNIQUE, else the declared column
+		// collation) through `compareSqlValuesFast`. Resolved once, above both
+		// candidate scans; both phases compare identically.
 		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
+		const compares = uc.columns.map((colIdx, i) => {
+			const logicalType = this.tableSchema!.columns[colIdx]?.logicalType;
+			if (hasSemanticOrdering(logicalType)) return createTypedComparator(logicalType, collations[i]);
+			return (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collations[i]);
+		});
 
-		const overlayConflict = await this.findOverlayUniqueConflict(overlay, predicate, newRow, selfPks, tombstoneIndex, uc.columns, collations);
+		const overlayConflict = await this.findOverlayUniqueConflict(overlay, predicate, newRow, selfPks, tombstoneIndex, uc.columns, compares);
 		if (overlayConflict) return overlayConflict;
 
-		return this.findUnderlyingUniqueConflict(overlay, uc, predicate, newRow, selfPks, tombstoneIndex, collations);
+		return this.findUnderlyingUniqueConflict(overlay, uc, predicate, newRow, selfPks, tombstoneIndex, compares);
 	}
 
 	/**
@@ -1582,7 +1645,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		selfPks: SqlValue[][],
 		tombstoneIndex: number,
 		constrainedCols: ReadonlyArray<number>,
-		collations: CollationFunction[],
+		compares: ReadonlyArray<(a: SqlValue, b: SqlValue) => number>,
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
 		if (!overlay.query) return null;
 		const pkIndices = this.getPrimaryKeyIndices();
@@ -1593,7 +1656,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			if (selfPks.some(self => this.keysEqual(pk, self))) continue;
 
 			const mergedRow = overlayRow.slice(0, tombstoneIndex) as Row;
-			if (this.rowMatchesUniqueConstraint(mergedRow, newRow, constrainedCols, collations, predicate)) {
+			if (this.rowMatchesUniqueConstraint(mergedRow, newRow, constrainedCols, compares, predicate)) {
 				return { pk, row: mergedRow };
 			}
 		}
@@ -1615,7 +1678,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		newRow: Row,
 		selfPks: SqlValue[][],
 		tombstoneIndex: number,
-		collations: CollationFunction[],
+		compares: ReadonlyArray<(a: SqlValue, b: SqlValue) => number>,
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
 		if (!this.underlyingTable.query) return null;
 		const pkIndices = this.getPrimaryKeyIndices();
@@ -1634,7 +1697,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			const overlayRow = await this.getOverlayRow(overlay, pk);
 			if (overlayRow) continue;
 
-			if (this.rowMatchesUniqueConstraint(underlyingRow, newRow, uc.columns, collations, predicate)) {
+			if (this.rowMatchesUniqueConstraint(underlyingRow, newRow, uc.columns, compares, predicate)) {
 				return { pk, row: underlyingRow };
 			}
 		}
@@ -1644,24 +1707,26 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	/**
 	 * True-match test shared by both merged-check phases so they compare identically:
 	 * `candidate` matches `newRow` on every constrained column under that column's
-	 * enforcement collation (NULLs never match), and — for a partial UNIQUE — the
+	 * comparison function (NULLs never match), and — for a partial UNIQUE — the
 	 * predicate holds for `candidate`.
 	 *
-	 * The per-column collation (the index's per-column COLLATE for an index-derived
-	 * UNIQUE, else the declared column collation) enforces a UNIQUE over a collated
-	 * column against merged rows through the isolation path
+	 * `compares` carries one function per constrained column, resolved once in
+	 * {@link findMergedUniqueConflict}: the type's `compare` for a semantic-ordering
+	 * column, else the enforcement collation (the index's per-column COLLATE for an
+	 * index-derived UNIQUE, else the declared column collation) — the latter enforces
+	 * a UNIQUE over a collated column against merged rows through the isolation path
 	 * (unique-constraint-honors-column-collation / store-index-derived-unique).
 	 */
 	private rowMatchesUniqueConstraint(
 		candidate: Row,
 		newRow: Row,
 		constrainedCols: ReadonlyArray<number>,
-		collations: CollationFunction[],
+		compares: ReadonlyArray<(a: SqlValue, b: SqlValue) => number>,
 		predicate: CompiledPredicate | undefined,
 	): boolean {
 		const matches = constrainedCols.every((idx, i) => {
 			if (newRow[idx] === null || candidate[idx] === null) return false;
-			return compareSqlValuesFast(newRow[idx], candidate[idx], collations[i]) === 0;
+			return compares[i](newRow[idx], candidate[idx]) === 0;
 		});
 		if (!matches) return false;
 		// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.

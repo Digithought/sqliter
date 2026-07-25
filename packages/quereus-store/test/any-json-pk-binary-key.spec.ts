@@ -12,11 +12,13 @@
  *
  * A memory table is the oracle for UNIQUENESS throughout. Since the semantic-ordering ruling
  * (docs/types.md "Semantic ordering"), it is the ordering oracle too: `Sort` ranks a TIMESPAN
- * or JSON operand by `logicalType.compare` (elapsed time / structural), which no text-byte key
- * encoding reproduces — so the store DECLINES ordering advertisements and byte windows over
- * such PK members (`keyOrderMatchesCollation`) and answers through a full scan + the
- * type-aware residual instead. Restoring those seeks needs an order-preserving key encoding —
- * a store-side fix ticket.
+ * or JSON operand by `logicalType.compare` (elapsed time / structural). JSON's canonical-text
+ * key bytes cannot reproduce structural order, and the store DECLINES ordering advertisements
+ * and byte windows over every semantic-ordering PK member (`keyOrderMatchesCollation`),
+ * answering through a full scan + the type-aware residual instead. TIMESPAN keys now encode
+ * the type's `groupKey` (total seconds — see timespan-semantic-key-identity.spec.ts), so its
+ * byte order matches `compare` and the decline is merely conservative there; re-opening those
+ * seeks is tracked in backlog `feat-reopen-timespan-store-seeks`.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -205,9 +207,10 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 		it('orders a `timespan` PK by elapsed time via a real Sort (advertisement declined)', async () => {
 			// Under the semantic-ordering ruling, Sort ranks TIMESPAN by
 			// `TIMESPAN.compare` (elapsed time): 'PT90M' precedes 'PT2H' though the
-			// text-byte order says the reverse. The store's key bytes still order by
-			// text, so the PK-order advertisement is declined and a real Sort runs —
-			// on the PK table exactly as on the integer-PK table.
+			// text-byte order says the reverse. The store's key bytes now encode total
+			// seconds (order-preserving), but the PK-order advertisement is still
+			// conservatively declined, so a real Sort runs — on the PK table exactly
+			// as on the integer-PK table.
 			await db.exec(`create table t (d timespan primary key) using store`);
 			await db.exec(`create table sorted (id integer primary key, d timespan) using store`);
 			await db.exec(`insert into t values ('PT2H'), ('PT90M')`);
