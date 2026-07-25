@@ -425,6 +425,7 @@ describe('WebSocket Handler', () => {
 
     it('should resume a snapshot from a serialized checkpoint after handshake', async function () {
       const ws = await connectWs();
+      const wireCheckpoint = makeWireCheckpoint('snap-resume-ws');
       try {
         await sendAndReceive(ws, {
           type: 'handshake',
@@ -440,10 +441,7 @@ describe('WebSocket Handler', () => {
         const messages = await new Promise<object[]>((resolve, reject) => {
           const timeout = setTimeout(() => reject(new Error('Timeout waiting for resumed snapshot')), 5000);
           const received: object[] = [];
-          ws.send(JSON.stringify({
-            type: 'resume_snapshot',
-            checkpoint: makeWireCheckpoint('snap-resume-ws'),
-          }));
+          ws.send(JSON.stringify({ type: 'resume_snapshot', checkpoint: wireCheckpoint }));
           ws.on('message', (data) => {
             const msg = JSON.parse(data.toString()) as { type: string };
             received.push(msg);
@@ -458,14 +456,17 @@ describe('WebSocket Handler', () => {
         expect(types, `unexpected resume response: ${JSON.stringify(messages)}`).to.not.include('error');
         expect(types[types.length - 1]).to.equal('snapshot_complete');
 
-        // The resumed stream reuses the checkpoint's snapshotId — proof the
+        // The resumed stream echoes the checkpoint's identity fields — proof the
         // decoded checkpoint (not a corrupt one) reached the stream generator.
+        // The hlc echo is the load-bearing one: it only matches if the base64
+        // survived the round trip back to a bigint wallTime and out again.
         const header = messages.find(
           (m) => (m as { type: string; chunk?: { type: string } }).chunk?.type === 'header',
         ) as { chunk: { snapshotId: string; siteId: string; hlc: string } } | undefined;
         expect(header, 'no header chunk in resumed stream').to.not.be.undefined;
-        expect(header!.chunk.snapshotId).to.equal('snap-resume-ws');
+        expect(header!.chunk.snapshotId).to.equal(wireCheckpoint.snapshotId);
         expect(header!.chunk.siteId).to.equal(TEST_SITE_ID_1);
+        expect(header!.chunk.hlc).to.equal(wireCheckpoint.hlc);
       } finally {
         ws.close();
         await new Promise(resolve => setTimeout(resolve, 300));

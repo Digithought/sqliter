@@ -258,7 +258,8 @@ export function registerWebSocket(
       try {
         // The checkpoint arrives from JSON.parse in its serialized form (base64
         // siteId/HLC); decode before handing it to the service, which expects the
-        // binary in-memory shape.
+        // binary in-memory shape. Its CONTENTS are still client-supplied and
+        // unchecked against the session — see `bug-sync-resume-snapshot-unvalidated-checkpoint`.
         const checkpoint = deserializeSnapshotCheckpoint(msg.checkpoint);
         for await (const chunk of service.resumeSnapshotStream(session.databaseId, session.identity, checkpoint)) {
           sendMessage({ type: 'snapshot_chunk', chunk: serializeSnapshotChunk(chunk) });

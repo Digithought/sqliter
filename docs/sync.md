@@ -1560,23 +1560,32 @@ async function receiveSnapshot(ws: WebSocket) {
   });
 }
 
-// Resume interrupted snapshot
-async function resumeSnapshot(ws: WebSocket) {
-  const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
-  if (checkpoint) {
-    // Request resume from server. The checkpoint MUST go through
-    // serializeSnapshotCheckpoint first: it holds a Uint8Array siteId and a
-    // bigint HLC wallTime, and JSON.stringify throws on the bigint. The
-    // coordinator calls deserializeSnapshotCheckpoint on receipt.
-    ws.send(JSON.stringify({
-      type: 'resume_snapshot',
-      checkpoint: serializeSnapshotCheckpoint(checkpoint),
-    }));
+// Client: ask the server to resume an interrupted snapshot
+import { serializeSnapshotCheckpoint } from '@quereus/sync';
 
-    // Server resumes from checkpoint
-    for await (const chunk of syncManager.resumeSnapshotStream(checkpoint)) {
-      ws.send(JSON.stringify(chunk));
-    }
+async function requestResume(ws: WebSocket, snapshotId: string) {
+  const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
+  if (!checkpoint) return;  // nothing saved — fall back to a fresh get_snapshot
+
+  // The checkpoint MUST go through serializeSnapshotCheckpoint: it holds a
+  // Uint8Array siteId and a bigint HLC wallTime, and JSON.stringify throws on
+  // the bigint.
+  ws.send(JSON.stringify({
+    type: 'resume_snapshot',
+    checkpoint: serializeSnapshotCheckpoint(checkpoint),
+  }));
+
+  // Chunks come back exactly as for a fresh snapshot — apply them the same way
+  await syncManager.applySnapshotStream(receiveChunks(ws));
+}
+
+// Server: resume streaming from the client's checkpoint
+import { deserializeSnapshotCheckpoint } from '@quereus/sync';
+
+async function handleResume(ws: WebSocket, message: { checkpoint: SerializedSnapshotCheckpoint }) {
+  const checkpoint = deserializeSnapshotCheckpoint(message.checkpoint);
+  for await (const chunk of syncManager.resumeSnapshotStream(checkpoint)) {
+    ws.send(JSON.stringify(chunk));
   }
 }
 ```

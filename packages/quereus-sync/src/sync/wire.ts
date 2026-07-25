@@ -9,7 +9,7 @@
  * - cross-platform base64 helpers (browser btoa/atob, Node `Buffer` fallback);
  * - `Serialized*` types describing the on-the-wire JSON shapes;
  * - codec functions (`serialize*` / `deserialize*`) for change sets, snapshot
- *   chunks, and HLCs;
+ *   chunks, snapshot checkpoints, and HLCs;
  * - the `ClientMessage` / `ServerMessage` unions (the true superset of what both
  *   sides emit and handle);
  * - `PROTOCOL_VERSION`, stamped into the handshake so peers can detect drift.
@@ -22,6 +22,13 @@
  *
  * Uint8Array (blob) `SqlValue`s ride the `{ __bin: "<base64>" }` tagged encoding
  * from `encodeSqlValue` / `decodeSqlValue`; HLCs and site ids ride base64.
+ *
+ * NOTE: every `deserialize*` here trusts its input to match the declared
+ * `Serialized*` shape — malformed JSON throws from inside a base64/HLC helper
+ * with an opaque message ("Cannot convert undefined to a BigInt") rather than a
+ * named validation error. Callers catch and report it, so this is a diagnostics
+ * gap, not a crash. If peers ever need actionable protocol errors, add a
+ * validation layer across the whole module rather than one codec at a time.
  */
 
 import type { SqlValue, Row } from '@quereus/quereus';
@@ -211,20 +218,15 @@ export type SerializedSnapshotChunk =
 /**
  * A {@link SnapshotCheckpoint} serialized for JSON transport.
  *
- * Mirrors the in-memory shape field for field, with the two binary fields as
- * base64 strings: `siteId` (raw bytes) and `hlc` (whose `wallTime` is a bigint
- * that `JSON.stringify` throws on). Everything else is already JSON-safe and
- * passes through unchanged.
+ * Derived from the in-memory shape so a field added to `SnapshotCheckpoint`
+ * fails to compile here until the codec below carries it too. Only the two
+ * binary fields are re-typed: `siteId` (raw bytes) and `hlc` (whose `wallTime`
+ * is a bigint that `JSON.stringify` throws on) both become base64 strings.
+ * Everything else is already JSON-safe and passes through unchanged.
  */
-export interface SerializedSnapshotCheckpoint {
-  snapshotId: string;
+export interface SerializedSnapshotCheckpoint extends Omit<SnapshotCheckpoint, 'siteId' | 'hlc'> {
   siteId: string;                       // base64
   hlc: string;                          // base64
-  lastTableIndex: number;
-  lastEntryIndex: number;
-  completedTables: string[];
-  entriesProcessed: number;
-  createdAt: number;
 }
 
 // ============================================================================
