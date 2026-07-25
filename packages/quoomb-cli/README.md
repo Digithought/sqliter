@@ -1,5 +1,9 @@
 # quoomb-cli
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. See
+> [Stability Tiers](../../docs/stability.md#tiers).
+
 Command-line interface for [Quereus](https://github.com/gotchoices/quereus) — an interactive SQL shell and file execution tool.
 
 ## Installation

@@ -1,5 +1,9 @@
 # @quereus/isolation
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. See
+> [Stability Tiers](../../docs/stability.md#tiers).
+
 Generic transaction isolation layer for Quereus virtual table modules.
 
 ## Overview

@@ -1,5 +1,10 @@
 # @quereus/store
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. Its on-disk key encoding is not frozen, so
+> a format change can make an existing database unreadable without a migration step. See
+> [Stability Tiers](../../docs/stability.md#tiers).
+
 Abstract key-value storage module for [Quereus](https://github.com/gotchoices/quereus). Provides platform-agnostic interfaces and a generic `StoreModule` virtual table implementation.
 
 ## Architecture

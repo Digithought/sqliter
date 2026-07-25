@@ -1,5 +1,9 @@
 # @quereus/sync
 
+> **Stability: Experimental** — a research track; the API, the wire protocol, and the
+> stored bytes may change or disappear without notice, in any release including a patch.
+> See [Stability Tiers](../../docs/stability.md#tiers).
+
 CRDT-based multi-master sync framework for [Quereus](https://github.com/gotchoices/quereus). Enables offline-first applications with automatic conflict resolution.
 
 ## Features

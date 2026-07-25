@@ -1,5 +1,9 @@
 # @quereus/sync-client
 
+> **Stability: Experimental** — a research track; the API and the wire protocol it speaks
+> may change or disappear without notice, in any release including a patch. See
+> [Stability Tiers](../../docs/stability.md#tiers).
+
 WebSocket sync client for [Quereus](https://github.com/gotchoices/quereus). Handles connection management, reconnection, and bidirectional change synchronization.
 
 ## Features

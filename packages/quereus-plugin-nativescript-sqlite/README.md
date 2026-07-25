@@ -1,5 +1,9 @@
 # @quereus/plugin-nativescript-sqlite
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. It rides `@quereus/store`'s on-disk key
+> encoding, which is not frozen. See [Stability Tiers](../../docs/stability.md#tiers).
+
 SQLite storage plugin for Quereus on NativeScript. Provides persistent storage for iOS and Android mobile apps using the [`@quereus/store`](../quereus-store/) module.
 
 ## Features

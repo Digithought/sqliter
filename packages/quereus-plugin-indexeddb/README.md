@@ -1,5 +1,9 @@
 # @quereus/plugin-indexeddb
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. It rides `@quereus/store`'s on-disk key
+> encoding, which is not frozen. See [Stability Tiers](../../docs/stability.md#tiers).
+
 IndexedDB storage plugin for Quereus. Provides persistent storage for browser environments using the [`@quereus/store`](../quereus-store/) module.
 
 ## Features

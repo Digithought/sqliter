@@ -1,5 +1,8 @@
 # @quereus/plugin-loader
 
+> **Stability: Stable** — the exported API keeps its shape across minor and patch
+> releases. See [Stability Tiers](../../docs/stability.md#tiers).
+
 Plugin loading system for Quereus. This package provides dynamic module loading capabilities for extending Quereus with custom virtual tables, functions, collations, and types.
 
 **Note:** This package uses dynamic `import()` which is not compatible with React Native. For React Native environments, use static imports and manual plugin registration instead.

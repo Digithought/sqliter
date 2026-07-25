@@ -1,5 +1,9 @@
 # @quereus/sync-coordinator
 
+> **Stability: Experimental** — a research track; the API, the HTTP/WebSocket wire
+> protocol, and the on-disk state may change or disappear without notice, in any release
+> including a patch. See [Stability Tiers](../../docs/stability.md#tiers).
+
 Standalone coordinator backend for [@quereus/sync](../quereus-sync) — a production-ready server for multi-master CRDT replication.
 
 ## Features
