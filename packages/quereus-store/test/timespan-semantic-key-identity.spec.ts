@@ -261,6 +261,25 @@ describe('TIMESPAN semantic key identity (isolated store)', () => {
 		expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(0);
 	});
 
+	it('shadows across spellings when the scan is driven by a secondary index', async () => {
+		// A UNIQUE (non-PK) column gives the planner a secondary index to drive the scan
+		// while the TIMESPAN PK is what the overlay shadows BY, so the merge's PK keys
+		// come from `makePkKeySerializer` / the modified-PK shadow set rather than the
+		// plain PK-ordered merge the tests above exercise.
+		await db.exec(`alter table t add column n integer`);
+		await db.exec(`create unique index t_n on t (n)`);
+		await db.exec(`insert into t values ('PT60M', 'committed', 5), ('PT3H', 'other', 7)`);
+
+		await db.exec('begin');
+		await db.exec(`insert or replace into t values ('PT1H', 'staged', 5)`);
+		const staged = await asyncIterableToArray(db.eval(`select d, v from t where n = 5`));
+		expect(staged, 'the staged spelling must shadow the committed one').to.have.lengthOf(1);
+		expect(staged[0].v).to.equal('staged');
+		await db.exec('commit');
+
+		expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(2);
+	});
+
 	it('a duplicate spelling INSERT inside a transaction is a PK conflict against the committed row', async () => {
 		await db.exec(`insert into t values ('PT1H', 'committed')`);
 

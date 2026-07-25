@@ -266,7 +266,11 @@ key member is encoded through `groupKey` (see `quereus-store`'s
 `resolvePkKeyTransforms`), so `'PT1H'` and `'PT60M'` collide on one physical key —
 duplicate spellings raise the ordinary PK/UNIQUE violation, `on conflict` actions
 fire, and the isolation overlay shadows across spellings. JSON keys already encode
-the canonical text, which is identity-faithful. Store *ordering* advertisements and
+the canonical text, which is identity-faithful — but *not* order-faithful: the store
+emits a JSON primary key in canonical-text byte order while every comparator (and the
+memory backend) orders it structurally, so the isolation overlay cannot align the two
+streams and an in-transaction row surfaces twice. Tracked as fix
+`bug-json-pk-store-scan-order`. Store *ordering* advertisements and
 byte-window seeks over semantic-ordering members remain declined (a real Sort runs
 and point/range predicates re-check through the type-aware residual); TIMESPAN's
 total-seconds keys make re-opening them possible — tracked in backlog

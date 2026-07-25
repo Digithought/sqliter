@@ -158,6 +158,15 @@ export function resolvePkKeyCollations(
  * BTree collapses them. The companion of {@link resolvePkKeyCollations}: every call
  * site that threads the collations MUST thread these too, or key identity drifts
  * between the write path and the rebuild/lookup path.
+ *
+ * NOTE: identity is only half the contract. `StoreTable` implements no
+ * `comparePrimaryKey`, so the isolation layer merges overlay against underlying with
+ * its own fallback comparator (the PK type's `compare`) and needs this table's key
+ * BYTE order to agree with it. TIMESPAN's total-seconds transform makes it agree;
+ * JSON has no transform and its canonical-text bytes do NOT sort structurally, which
+ * is why a JSON PK breaks overlay shadowing (fix `bug-json-pk-store-scan-order`).
+ * Any future semantic-ordering type added here needs an order-preserving transform,
+ * not merely an identity-faithful one.
  */
 export function resolvePkKeyTransforms(
 	pkDef: ReadonlyArray<{ index: number }>,
