@@ -644,7 +644,19 @@ Identifiers are guarded the same way. `buildCatalogKey`, `buildViewCatalogKey`,
 encoding a schema/table/view name carrying an unpaired surrogate, and the full persisted DDL
 text (`saveTableDDL` and the other catalog-write sites in `store-module.ts`) is guarded too —
 a lone surrogate in a quoted column name or a `default`/`check` string literal is caught even
-when the table's own name is clean. `@quereus/sync`'s metadata key builders
+when the table's own name is clean.
+
+For a **view or materialized view** that guard alone is not enough, because the catalog write
+is fire-and-forget (see [schema.md](schema.md) § View and materialized-view persistence): the
+throw lands inside the persist queue, where it can only be logged, so the definition would
+create "successfully" and be gone after reopen. `StoreModule.assertCatalogObjectPersistable`
+closes that on the CREATE VIEW / CREATE MATERIALIZED VIEW / `ALTER … SET TAGS` paths — it runs
+the same key + DDL derivation the write path runs, synchronously, before the object is
+registered, so a refusal is a clean no-op. It does **not** yet cover an ALTER that rewrites a
+view/MV indirectly (a table/column rename propagated into a body, or renaming the MV itself);
+that gap is `bug-store-rename-into-lone-surrogate-drops-dependent-view-or-mv`.
+
+`@quereus/sync`'s metadata key builders
 (`buildColumnVersionKey`, `buildTombstoneKey`, etc. in `metadata/keys.ts`) apply the same
 guard to their schema/table/column identifier arguments, importing it from `@quereus/store`.
 

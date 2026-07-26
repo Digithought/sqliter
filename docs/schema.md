@@ -615,6 +615,17 @@ unpaired UTF-16 surrogate, which `TextEncoder` folds to U+FFFD (see
 `packages/quereus-store/src/common/encoding.ts`). A wrapper module (e.g. the isolation
 layer) must forward the hook or the wrapped module never gets its veto.
 
+Those four call sites are the whole of the coverage, and the gap is the ALTER paths that
+rewrite a view/MV **indirectly**: `alter table … rename to` / `rename column` propagates the
+new name into every dependent view and materialized-view body and fires `view_modified` /
+`materialized_view_modified`, and renaming a materialized view moves its catalog entry
+(`materialized_view_removed` old → `materialized_view_added` new). Those re-persists are
+still fire-and-forget, so a rename that introduces text the store cannot encode still drops
+the dependent object silently — and the MV-rename case deletes the old entry first, so the
+object is lost outright. A store-BACKED table is incidentally protected (its physical
+store-name guard refuses the rename first); a memory table or memory-backed MV is not.
+Tracked as `bug-store-rename-into-lone-surrogate-drops-dependent-view-or-mv`.
+
 **Rehydrate phasing.** `rehydrateCatalog` first consumes the clean-shutdown
 marker (the reserved `\x00meta\x00clean_shutdown` catalog entry `closeAll` writes
 after every batch flushed — read and immediately deleted, single-use; its value is

@@ -24,7 +24,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, asyncIterableToArray, type SqlValue } from '@quereus/quereus';
-import { StoreModule, InMemoryKVStore, type KVStoreProvider } from '../src/index.js';
+import { StoreModule, InMemoryKVStore, createIsolatedStoreModule, type KVStoreProvider } from '../src/index.js';
 
 /** Lone high surrogate — no low surrogate follows. */
 const LONE_HIGH = '\uD800';
@@ -372,15 +372,19 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			await db.exec(`create view v as select id from t`);
 			await rejects(db, `alter view v set tags ("${LONE_HIGH}" = 1)`);
 			await rejects(db, `alter view v set tags (k = '${LONE_HIGH}')`);
-			expect(db.schemaManager.getView('main', 'v')?.tags, 'tags must be unchanged')
-				.to.be.undefined;
+			// The view itself must survive the refusal — asserting only on `?.tags` would
+			// pass just as happily if the veto had taken the whole view with it.
+			const view = db.schemaManager.getView('main', 'v');
+			expect(view, 'the view must survive the refused ALTER').to.not.be.undefined;
+			expect(view?.tags, 'tags must be unchanged').to.be.undefined;
 		});
 
 		it('rejects ALTER MATERIALIZED VIEW … SET TAGS carrying a lone surrogate', async () => {
 			await db.exec(`create materialized view mv as select id, v from t`);
 			await rejects(db, `alter materialized view mv set tags ("${LONE_HIGH}" = 1)`);
-			expect(db.schemaManager.getTable('main', 'mv')?.tags, 'tags must be unchanged')
-				.to.be.undefined;
+			const mv = db.schemaManager.getTable('main', 'mv');
+			expect(mv, 'the MV must survive the refused ALTER').to.not.be.undefined;
+			expect(mv?.tags, 'tags must be unchanged').to.be.undefined;
 		});
 
 		it('still accepts a well-formed astral view name and body literal', async () => {
@@ -401,6 +405,26 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 				expect(mem.schemaManager.getTable('main', LONE_LOW)).to.not.be.undefined;
 			} finally {
 				await mem.close();
+			}
+		});
+
+		it('an isolation-wrapped store still vetoes — the wrapper forwards the hook', async () => {
+			// `allModules()` yields the REGISTERED module, which here is the `IsolationModule`
+			// wrapper, not the store inside it. Without `IsolationModule`'s forward the store
+			// is never asked and every isolated deployment keeps the silent-drop bug.
+			const isoProvider = createInMemoryProvider();
+			const iso = new Database();
+			iso.registerModule('store', createIsolatedStoreModule({ provider: isoProvider }));
+			try {
+				await iso.exec(`create table t (id integer primary key, v integer) using store`);
+				await rejects(iso, `create view "${LONE_HIGH}" as select id from t`);
+				expect(iso.schemaManager.getView('main', LONE_HIGH), 'the view must not be registered')
+					.to.be.undefined;
+				await rejects(iso, `create view vb as select '${LONE_HIGH}' as tag from t`);
+				expect(iso.schemaManager.getView('main', 'vb')).to.be.undefined;
+			} finally {
+				await isoProvider.closeAll();
+				await iso.close();
 			}
 		});
 	});

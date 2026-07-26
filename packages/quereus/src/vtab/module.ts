@@ -548,13 +548,17 @@ export interface VirtualTableModule<
 	 * module chains the actual write onto an async queue. Neither layer can surface a
 	 * failure to the statement, so an unpersistable definition would otherwise appear
 	 * to succeed and then vanish on reopen. This hook is the ONE synchronous point where
-	 * a module can refuse. See `docs/store.md` § View / materialized-view catalog
-	 * persistence.
+	 * a module can refuse. See `docs/schema.md` § View and materialized-view persistence.
 	 *
 	 * Views and materialized views are not owned by any one module the way a table is,
 	 * so every module gets the veto; a module that would not persist the object must
 	 * no-op. Synchronous by contract: the check must be a pure function of the schema
 	 * (no IO). Omit ⇒ never consulted (today's behavior).
+	 *
+	 * Coverage is the CREATE / SET TAGS paths only. An ALTER that rewrites a view or MV
+	 * indirectly — a table or column rename propagated into a body, or renaming the MV
+	 * itself — still persists fire-and-forget and can still drop the object silently;
+	 * see `bug-store-rename-into-lone-surrogate-drops-dependent-view-or-mv`.
 	 */
 	assertCatalogObjectPersistable?(
 		db: Database,
