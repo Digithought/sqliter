@@ -252,33 +252,43 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 		// surrogate in a TABLE NAME to U+FFFD exactly like `encodeText` did for a value —
 		// so two tables whose quoted names differed only in a lone surrogate shared one
 		// catalog key, and the second table's DDL write silently clobbered the first's on
-		// reopen (`bug-store-catalog-key-lone-surrogate-identifier-collision`). DDL text is
-		// persisted lazily, on first access to the table's underlying store (see
-		// `StoreTable.initializeStore`), so the rejection surfaces on the first INSERT/SELECT
-		// against the table, not at `CREATE TABLE` itself.
+		// reopen (`bug-store-catalog-key-lone-surrogate-identifier-collision`).
+		//
+		// Two different rejection timings live here, and the difference is the point:
+		//   - A bad TABLE / INDEX NAME is refused at `CREATE`, by the identifier guard in
+		//     `buildDataStoreName` / `buildIndexStoreName` — the PHYSICAL store name is
+		//     built before the statement's first side effect, so the create is a clean
+		//     no-op (`bug-store-physical-store-name-lone-surrogate-collision`).
+		//   - A bad identifier or literal that only shows up in the persisted DDL TEXT (a
+		//     column name, a `default` string) leaves the table's own name clean, so the
+		//     store-name guard never sees it. DDL text is persisted lazily, on first access
+		//     to the table's underlying store (see `StoreTable.initializeStore`), so those
+		//     surface on the first INSERT/SELECT rather than at `CREATE TABLE`.
 
-		it('rejects persisting DDL for a table named with a lone surrogate, on first data access', async () => {
-			await db.exec(`create table "${LONE_HIGH}" (k integer primary key) using store`);
-			await rejects(db, `insert into "${LONE_HIGH}" values (1)`);
+		it('rejects CREATE TABLE for a table named with a lone surrogate', async () => {
+			await rejects(db, `create table "${LONE_HIGH}" (k integer primary key) using store`);
 			// Nothing was silently written under a folded U+FFFD key.
 			const mod = new StoreModule(provider);
 			expect((await mod.loadAllDDL())).to.deep.equal([]);
 		});
 
 		it('rejects both of two tables whose names differ only in a lone surrogate, never colliding', async () => {
-			// Pre-fix this was the invisible half of the bug: the SECOND create's lazy DDL
-			// save would silently overwrite the FIRST's catalog entry. Now both are refused
-			// outright — the identifier is invalid, independent of whether another table
-			// happens to share its folded bytes.
-			await db.exec(`create table "${LONE_HIGH}" (k integer primary key) using store`);
-			await db.exec(`create table "${LONE_HIGH_2}" (k integer primary key) using store`);
-			await rejects(db, `insert into "${LONE_HIGH}" values (1)`);
-			await rejects(db, `insert into "${LONE_HIGH_2}" values (2)`);
+			// Pre-fix this was the invisible half of the bug: both names survived CREATE and
+			// folded onto ONE physical store (and one catalog key), so the second silently
+			// overwrote the first. Now both creates are refused outright — the identifier is
+			// invalid, independent of whether another table happens to share its folded bytes.
+			await rejects(db, `create table "${LONE_HIGH}" (k integer primary key) using store`);
+			await rejects(db, `create table "${LONE_HIGH_2}" (k integer primary key) using store`);
+			const mod = new StoreModule(provider);
+			expect((await mod.loadAllDDL())).to.deep.equal([]);
 		});
 
-		it('rejects a schema.table pair persisted via CREATE INDEX (a direct, non-lazy save path)', async () => {
-			await db.exec(`create table "${LONE_HIGH}" (id integer primary key, v integer) using store`);
-			await rejects(db, `create index ix on "${LONE_HIGH}" (v)`);
+		it('rejects an index whose own name carries a lone surrogate', async () => {
+			await db.exec(`create table t3 (id integer primary key, v integer) using store`);
+			await db.exec(`insert into t3 values (1, 10), (2, 20)`);
+			await rejects(db, `create index "${LONE_HIGH}" on t3 (v)`);
+			// The rejected index build never touched t3's own rows.
+			expect(await column(db, `select v from t3 order by id`, 'v')).to.deep.equal([10, 20]);
 		});
 
 		it('rejects a column name carrying a lone surrogate, not just the table name', async () => {

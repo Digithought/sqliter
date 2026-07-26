@@ -72,6 +72,13 @@ export class IndexedDBProvider implements KVStoreProvider {
 		this.cacheOptions = options.cache;
 	}
 
+	// NOTE: the physical store name is used verbatim as an IndexedDB object-store name.
+	// Per spec those are `DOMString`s compared by code unit, so an unpaired surrogate
+	// SHOULD survive intact (unlike LevelDB, whose sublevel names go through UTF-8 and
+	// fold every unpaired surrogate to U+FFFD) — but that has not been verified against a
+	// real browser here. It does not affect correctness: `buildDataStoreName` /
+	// `buildIndexStoreName` reject such an identifier above every provider, so no name
+	// reaching here can carry one.
 	async getStore(schemaName: string, tableName: string, _options?: Record<string, unknown>): Promise<KVStore> {
 		const storeName = buildDataStoreName(schemaName, tableName);
 		return this.getOrCreateStore(storeName);

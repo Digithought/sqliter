@@ -648,6 +648,22 @@ when the table's own name is clean. `@quereus/sync`'s metadata key builders
 (`buildColumnVersionKey`, `buildTombstoneKey`, etc. in `metadata/keys.ts`) apply the same
 guard to their schema/table/column identifier arguments, importing it from `@quereus/store`.
 
+The **physical store-name** builders `buildDataStoreName` and `buildIndexStoreName` carry the
+same guard, and it matters for two reasons beyond keying. First, a provider may encode the
+store name to bytes — `LevelDBProvider.encodeSublevelName` percent-escapes the name's UTF-8
+bytes — so without the guard two tables whose names differ only in a lone surrogate would
+resolve to the *same* sublevel (`main.%EF%BF%BD`). Second, it is what makes
+`StoreModule.assertStoreNameFree` sound: that collision check compares names as JS strings,
+before any provider byte-encoding, and only with unpaired surrogates refused does equal bytes
+imply equal string. Because every call site builds the physical name before its first side
+effect, the throw always lands on a clean no-op — notably `renameTable`, which relocates
+storage *before* rewriting the catalog and does not undo the relocation, so a guard that only
+fired at the catalog write left the table's rows stranded under an orphan store name and the
+table reading as empty. The user-visible consequence is a timing difference: a table or index
+whose own **name** carries a lone surrogate is refused at `CREATE`/`ALTER … RENAME`, while a
+lone surrogate that only appears in the persisted DDL **text** (a column name, a `default`
+literal) still surfaces lazily on first data access, since the table's own name is clean.
+
 Note also that a text-capable but non-textual primary-key column (`any`, `json`, a date/time
 type) is keyed under `BINARY`, not under the table key collation `K` — matching the `BINARY`
 the engine compares it under, so its range seeks and PK-order advertisement stand and its

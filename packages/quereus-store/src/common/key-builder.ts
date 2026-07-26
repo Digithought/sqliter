@@ -35,8 +35,32 @@ export const CATALOG_STORE_NAME = '__catalog__';
 export const STATS_STORE_NAME = '__stats__';
 
 /**
+ * Raise when any identifier in `names` carries an unpaired surrogate — such an identifier
+ * has no faithful UTF-8 key bytes, so encoding it straight through `TextEncoder` would fold
+ * it to U+FFFD and collide with every other identifier differing only in that respect. See
+ * {@link assertNoUnpairedSurrogate}. Shared by the physical store-name builders and every
+ * catalog-key builder below so the guard reads identically regardless of which kind of name
+ * is being built.
+ */
+function assertKeyableIdentifiers(...names: string[]): void {
+	for (const name of names) {
+		assertNoUnpairedSurrogate(name, `the identifier "${name}"`);
+	}
+}
+
+/**
  * Build the store name for a table's data.
  * Format: {schema}.{table}
+ *
+ * Guarded by {@link assertKeyableIdentifiers}: the physical name is handed to a provider
+ * that may encode it to bytes (`LevelDBProvider.encodeSublevelName` runs it through
+ * `TextEncoder`), which folds every unpaired surrogate to U+FFFD — so two tables whose
+ * names differ only in a lone surrogate would share one physical store. Refusing the
+ * identifier here is also what makes `StoreModule.assertStoreNameFree` sound: that guard
+ * compares names as JS strings, BEFORE any provider byte-encoding, and with unpaired
+ * surrogates refused the remaining name space encodes injectively, so equal bytes imply
+ * equal strings. Every call site builds the name before its first side effect, so the
+ * throw always lands on a clean no-op.
  */
 // NOTE: composes with a literal '.' delimiter, so the schema/table boundary is
 // not recoverable from the physical name. A lone dotted identifier round-trips
@@ -47,18 +71,24 @@ export const STATS_STORE_NAME = '__stats__';
 // effectively never dotted); if dotted schema names become reachable, switch to
 // a boundary-safe encoding (length-prefix or escape the delimiter).
 export function buildDataStoreName(schemaName: string, tableName: string): string {
+	assertKeyableIdentifiers(schemaName, tableName);
 	return `${schemaName}.${tableName}`.toLowerCase();
 }
 
 /**
  * Build the store name for a secondary index.
  * Format: {schema}.{table}_idx_{indexName}
+ *
+ * Identifier-guarded for the same reason as {@link buildDataStoreName} — see its docstring
+ * for why refusing an unpaired surrogate here is what keeps physical store names injective
+ * across providers and makes `StoreModule.assertStoreNameFree`'s JS-string comparison sound.
  */
 export function buildIndexStoreName(
 	schemaName: string,
 	tableName: string,
 	indexName: string
 ): string {
+	assertKeyableIdentifiers(schemaName, tableName, indexName);
 	return `${schemaName}.${tableName}_idx_${indexName}`.toLowerCase();
 }
 
@@ -69,19 +99,6 @@ export function buildIndexStoreName(
  */
 export function buildStatsStoreName(schemaName: string, tableName: string): string {
 	return `${schemaName}.${tableName}_stats`.toLowerCase();
-}
-
-/**
- * Raise when any identifier in `names` carries an unpaired surrogate — such an identifier
- * has no faithful UTF-8 key bytes, so encoding it straight through `TextEncoder` would fold
- * it to U+FFFD and collide with every other identifier differing only in that respect. See
- * {@link assertNoUnpairedSurrogate}. Shared by every catalog-key builder below so the guard
- * reads identically regardless of which kind of catalog object is being keyed.
- */
-function assertKeyableIdentifiers(...names: string[]): void {
-	for (const name of names) {
-		assertNoUnpairedSurrogate(name, `the identifier "${name}"`);
-	}
 }
 
 /**

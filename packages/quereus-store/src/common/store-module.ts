@@ -2596,6 +2596,17 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 
 		// Move physical storage (data directory + index directories).
+		//
+		// NOTE: the relocation runs BEFORE the catalog rewrite below, and nothing undoes it.
+		// Any failure after this point — an IO error, or the DDL-text guard in
+		// `encodeCatalogDDL` firing on an unpaired surrogate in a column name or a `default`
+		// literal — strands the rows under the NEW physical name while the catalog still
+		// names the old table, so the table reads as empty with only the raised error as a
+		// clue. Harmless for today's validation cases: the store-name guard in
+		// `buildDataStoreName` (called above, before any side effect) refuses a bad target
+		// name outright, and a table whose DDL text is unpersistable can never have held
+		// rows in the first place. If a new post-relocation failure mode appears, the
+		// relocation must be undone here or deferred until after the catalog write.
 		if (this.provider.renameTableStores) {
 			await this.provider.renameTableStores(schemaName, oldName, newName, indexNames);
 		}

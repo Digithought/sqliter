@@ -26,6 +26,13 @@ import { compareBytes } from '../src/common/bytes.js';
 
 const encoder = new TextEncoder();
 
+/** Lone high surrogate — no low surrogate follows. Not encodable as UTF-8. */
+const LONE_HIGH = '\uD800';
+/** Lone low surrogate — no high surrogate precedes. Not encodable as UTF-8. */
+const LONE_LOW = '\uDC00';
+/** U+10000 — the same two code-unit ranges, legally PAIRED. Must keep working. */
+const ASTRAL = '\u{10000}';
+
 describe('key-builder', () => {
 	describe('constants', () => {
 		it('STORE_SUFFIX has INDEX and STATS', () => {
@@ -50,11 +57,63 @@ describe('key-builder', () => {
 		it('preserves dots and underscores', () => {
 			expect(buildDataStoreName('my_schema', 'my_table')).to.equal('my_schema.my_table');
 		});
+
+		it('rejects a lone high surrogate in the table name', () => {
+			expect(() => buildDataStoreName('main', LONE_HIGH)).to.throw(/unpaired surrogate/i);
+		});
+
+		it('rejects a lone low surrogate in the table name', () => {
+			expect(() => buildDataStoreName('main', LONE_LOW)).to.throw(/unpaired surrogate/i);
+		});
+
+		it('rejects a lone surrogate embedded mid-identifier', () => {
+			expect(() => buildDataStoreName('main', `us${LONE_HIGH}ers`)).to.throw(/unpaired surrogate/i);
+		});
+
+		it('rejects a lone surrogate in the schema name', () => {
+			expect(() => buildDataStoreName(LONE_HIGH, 'users')).to.throw(/unpaired surrogate/i);
+		});
+
+		it('two table names differing only in a lone surrogate both throw instead of colliding', () => {
+			// Pre-fix both produced distinct JS strings that a provider's UTF-8 encoding then
+			// folded onto ONE physical store (LevelDB: `main.%EF%BF%BD` for both), so the two
+			// tables silently shared storage. Refused at the builder now.
+			expect(() => buildDataStoreName('main', '\uD800')).to.throw(/unpaired surrogate/i);
+			expect(() => buildDataStoreName('main', '\uD801')).to.throw(/unpaired surrogate/i);
+		});
+
+		it('still accepts a well-formed astral character', () => {
+			expect(buildDataStoreName('main', `t${ASTRAL}`)).to.equal(`main.t${ASTRAL}`);
+		});
 	});
 
 	describe('buildIndexStoreName', () => {
 		it('returns lowercase schema.table_idx_name', () => {
 			expect(buildIndexStoreName('Main', 'Users', 'ByEmail')).to.equal('main.users_idx_byemail');
+		});
+
+		it('rejects a lone high surrogate in the index name', () => {
+			expect(() => buildIndexStoreName('main', 'users', LONE_HIGH)).to.throw(/unpaired surrogate/i);
+		});
+
+		it('rejects a lone low surrogate in the index name', () => {
+			expect(() => buildIndexStoreName('main', 'users', LONE_LOW)).to.throw(/unpaired surrogate/i);
+		});
+
+		it('rejects a lone surrogate embedded mid-identifier', () => {
+			expect(() => buildIndexStoreName('main', 'users', `by${LONE_LOW}email`)).to.throw(/unpaired surrogate/i);
+		});
+
+		it('rejects a lone surrogate in the table name', () => {
+			expect(() => buildIndexStoreName('main', LONE_HIGH, 'byemail')).to.throw(/unpaired surrogate/i);
+		});
+
+		it('rejects a lone surrogate in the schema name', () => {
+			expect(() => buildIndexStoreName(LONE_HIGH, 'users', 'byemail')).to.throw(/unpaired surrogate/i);
+		});
+
+		it('still accepts a well-formed astral character', () => {
+			expect(buildIndexStoreName('main', 'users', `by${ASTRAL}`)).to.equal(`main.users_idx_by${ASTRAL}`);
 		});
 	});
 

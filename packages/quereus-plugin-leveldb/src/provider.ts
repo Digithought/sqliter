@@ -42,10 +42,17 @@ const textEncoder = new TextEncoder();
  * — with the default `!` separator that is 35..126. Logical store names are
  * `{schema}.{table}` identifiers that may contain spaces, punctuation, or non-ASCII
  * (e.g. a quoted table name `"Table With Spaces"`), so any byte outside the safe set
- * is percent-encoded. The mapping is deterministic and injective (distinct logical
- * names → distinct sublevel names), which is all the provider's name-keyed caching
- * and the StoreModule's collision checks require; the sublevel name is never decoded
- * back. Common names (lowercase identifiers, `.`, `_`) pass through unchanged.
+ * is percent-encoded. Common names (lowercase identifiers, `.`, `_`) pass through
+ * unchanged; the sublevel name is never decoded back.
+ *
+ * The mapping is deterministic, and injective over the names the guarded key-builders
+ * can produce (`buildDataStoreName` / `buildIndexStoreName`) — which is all the
+ * provider's name-keyed caching and the StoreModule's collision checks require. It is
+ * NOT injective over arbitrary JS strings: `TextEncoder` folds every unpaired surrogate
+ * to U+FFFD, so `'main.\uD800'` and `'main.\uD801'` would both encode to
+ * `'main.%EF%BF%BD'`. Those builders reject an identifier carrying an unpaired
+ * surrogate, so such a name never reaches here — do not call this with a raw
+ * user-supplied string that bypassed them.
  */
 function encodeSublevelName(name: string): string {
 	let out = '';
