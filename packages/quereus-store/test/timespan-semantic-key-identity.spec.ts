@@ -186,6 +186,34 @@ describe('TIMESPAN semantic key identity (store)', () => {
 				expect((await db.get(`select count(*) as cnt from ${tbl}`))?.cnt).to.equal(1);
 			}
 		});
+
+		it('enforces the identity through a row-time covering materialized view', async () => {
+			// A covering MV displaces the store's own index/scan finders
+			// (`findUniqueConflictFor` prefers it), so this pins
+			// `findUniqueConflictViaCoveringMv` and the engine-side candidate generator
+			// (`lookupCoveringConflicts`) — which used to drop an equal-elapsed candidate
+			// because its stored text differed from the writing row's.
+			await db.exec(`create table t (id integer primary key, d timespan, unique (d)) using store`);
+			await db.exec(`create materialized view ix as select d, id from t order by d`);
+			await db.exec(`insert into t values (1, 'PT1H')`);
+
+			const err = await attempt(db, `insert into t values (2, 'PT60M')`);
+			expect(err, 'the covering-MV route must see one identity').to.not.be.null;
+			expect(String(err)).to.match(/unique/i);
+
+			await db.exec(`insert or ignore into t values (3, 'PT3600S')`);
+			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(1);
+
+			await db.exec(`insert or replace into t values (4, 'PT60M')`);
+			const rows = await asyncIterableToArray(db.eval(`select id, d from t`));
+			expect(rows).to.have.lengthOf(1);
+			expect(Number(rows[0].id)).to.equal(4);
+
+			// Self-exclusion: re-spelling the constrained value on the same row is not a
+			// conflict against its own (differently-spelled) backing entry.
+			expect(await attempt(db, `update t set d = 'PT1H' where id = 4`)).to.be.null;
+			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(1);
+		});
 	});
 
 	describe('ALTER interactions', () => {

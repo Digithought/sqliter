@@ -1400,6 +1400,108 @@ describe('row-time covering enforcement', () => {
 		expect(conflicts.map(c => c.pk)).to.deep.equal([[1]]);
 	});
 
+	// ── Semantic-ordering identity (covering-mv-conflict-candidates-semantic) ──
+	// A TIMESPAN column calls 'PT1H' and 'PT60M' one value (`docs/types.md` § Semantic
+	// ordering). The candidate generator must admit an equal-elapsed backing row even
+	// though its stored text differs, or the re-validator never sees the conflict.
+
+	it('generator: an equal-elapsed TIMESPAN probe surfaces the differently-spelled conflicting PK', async () => {
+		// The direct analogue of the NOCASE generator case above: the backing holds
+		// 'PT1H' and we probe with 'PT60M'. Before the fix the per-candidate filter
+		// compared under the declared collation only (byte-different ⇒ dropped) and this
+		// returned [].
+		db = new Database();
+		await db.exec('create table t (id integer primary key, d timespan, unique (d))');
+		await db.exec('create materialized view ix as select d, id from t order by d');
+		await db.exec("insert into t values (1, 'PT1H')");
+		const mv = db.schemaManager.getMaintainedTable('main', 'ix')!;
+		const uc = db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
+		expect(db._findRowTimeCoveringStructure('main', 't', uc)?.name, 'MV is the covering structure').to.equal('ix');
+		const conflicts = await db._lookupCoveringConflicts(mv, uc, [2, 'PT60M'], [2]);
+		expect(conflicts.map(c => c.pk)).to.deep.equal([[1]]);
+	});
+
+	it('end-to-end: a re-spelled TIMESPAN duplicate is a UNIQUE violation through the covering MV', async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, d timespan, unique (d))');
+		await db.exec('create materialized view ix as select d, id from t order by d');
+		await db.exec("insert into t values (1, 'PT1H')");
+		await expectThrows(() => db.exec("insert into t values (2, 'PT60M')"), 'UNIQUE constraint failed: t (d)');
+		// Control: an identical spelling was already rejected before this fix.
+		await expectThrows(() => db.exec("insert into t values (3, 'PT1H')"), 'UNIQUE constraint failed: t (d)');
+		// A genuinely different elapsed time is admitted.
+		await db.exec("insert into t values (4, 'PT30M')");
+		expect(await selectAll('select id from t order by id')).to.deep.equal([{ id: 1 }, { id: 4 }]);
+	});
+
+	it('end-to-end: OR IGNORE skips and OR REPLACE evicts on a re-spelled TIMESPAN duplicate', async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, d timespan, unique (d))');
+		await db.exec('create materialized view ix as select d, id from t order by d');
+		await db.exec("insert into t values (1, 'PT1H')");
+
+		await db.exec("insert or ignore into t values (2, 'PT60M')");
+		expect(await selectAll('select count(*) as n from t')).to.deep.equal([{ n: 1 }]);
+
+		// REPLACE recovers the conflicting source PK (id=1) and evicts it, backing included.
+		await db.exec("insert or replace into t values (3, 'PT3600S')");
+		expect(await selectAll('select id, d from t order by id')).to.deep.equal([{ id: 3, d: 'PT3600S' }]);
+		expect(await selectAll('select id from ix')).to.deep.equal([{ id: 3 }]);
+	});
+
+	it('control: an integer covering MV keeps rejecting its duplicate', async () => {
+		// Guards against the semantic branch swallowing the ordinary path.
+		db = new Database();
+		await db.exec('create table t (id integer primary key, n integer, unique (n))');
+		await db.exec('create materialized view ix as select n, id from t order by n');
+		await db.exec('insert into t values (1, 7)');
+		await expectThrows(() => db.exec('insert into t values (2, 7)'), 'UNIQUE constraint failed: t (n)');
+		await db.exec('insert into t values (3, 8)');
+		expect(await selectAll('select count(*) as n from t')).to.deep.equal([{ n: 2 }]);
+	});
+
+	it('self-exclusion: an UPDATE re-spelling the constrained TIMESPAN on the same row succeeds', async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, d timespan, unique (d))');
+		await db.exec('create materialized view ix as select d, id from t order by d');
+		await db.exec("insert into t values (1, 'PT1H')");
+		// The new value is semantically equal to the row's own backing entry, so the
+		// candidate IS generated (that is the fix) and must then be excluded as self.
+		await db.exec("update t set d = 'PT60M' where id = 1");
+		expect(await selectAll('select id, d from t')).to.deep.equal([{ id: 1, d: 'PT60M' }]);
+		// The sole entry still blocks a third equal-elapsed spelling.
+		await expectThrows(() => db.exec("insert into t values (2, 'PT1H0S')"), 'UNIQUE constraint failed: t (d)');
+	});
+
+	it('generator self-exclusion honors a semantic-ordering PRIMARY KEY member', async () => {
+		// The PK is TIMESPAN, so 'PT1H' and 'PT60M' name the SAME row. A candidate whose
+		// recovered source PK is spelled differently from the writing row's must still be
+		// excluded as self.
+		//
+		// Asserted at the generator, not end-to-end: both re-validators already re-check
+		// self with a semantic-aware PK equality of their own (memory's
+		// `comparePrimaryKeys`, the store's `keysEqual`), so an end-to-end UPDATE passes
+		// either way and cannot distinguish the fix. This was the last copy of the
+		// comparison that did not honor the type.
+		db = new Database();
+		await db.exec('create table t (d timespan primary key, v integer not null, unique (v))');
+		await db.exec('create materialized view ix as select v, d from t order by v');
+		await db.exec("insert into t values ('PT1H', 1)");
+		const mv = db.schemaManager.getMaintainedTable('main', 'ix')!;
+		const uc = db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
+		// Source row order is (d, v). Re-spelling the PK on the same row ⇒ no conflict.
+		expect(await db._lookupCoveringConflicts(mv, uc, ['PT60M', 1], ['PT60M'])).to.deep.equal([]);
+		// A genuinely different row with the same `v` IS a conflict, recovering the
+		// backing row's own spelling of the source PK.
+		const other = await db._lookupCoveringConflicts(mv, uc, ['PT5M', 1], ['PT5M']);
+		expect(other.map(c => c.pk)).to.deep.equal([['PT1H']]);
+
+		// End-to-end sanity: the UPDATE succeeds and `v` stays enforced.
+		await db.exec("update t set d = 'PT60M' where v = 1");
+		expect(await selectAll('select d, v from t')).to.deep.equal([{ d: 'PT60M', v: 1 }]);
+		await expectThrows(() => db.exec("insert into t values ('PT5M', 1)"), 'UNIQUE constraint failed: t (v)');
+	});
+
 	it('DESC-leading covering MV: the prefix seek still resolves conflicts', async () => {
 		// `order by x desc` ⇒ the backing PK leads with x DESC. The equalityPrefix seek
 		// must still land on the matching block under the descending physical order.

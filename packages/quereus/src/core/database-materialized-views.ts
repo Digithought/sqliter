@@ -50,7 +50,7 @@ import type { BackingRowChange } from '../vtab/backing-host.js';
 import { compareSqlValuesFast, resolveCollationFunctions } from '../util/comparison.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
-import { coveringMvHonorsIndexCollation } from '../schema/unique-enforcement.js';
+import { coveringMvHonorsIndexCollation, uniqueEnforcementComparators } from '../schema/unique-enforcement.js';
 import type { Database } from './database.js';
 import type { MaintenanceCollisionEvent } from './database-events.js';
 import { splitBaseKey } from '../util/qualified-name.js';
@@ -1113,6 +1113,18 @@ export class MaterializedViewManager {
 		const pkCollationFns = resolveCollationFunctions(
 			resolver, pkDef.map(d => d.collation));
 
+		// Collation alone is not the whole identity notion: a semantic-ordering column
+		// (`docs/types.md` § Semantic ordering — TIMESPAN's 'PT1H' == 'PT60M') calls two
+		// different spellings one value, and both backends key such a column through the
+		// type's `compare`. Route both comparisons through the shared constructor so a
+		// candidate that is semantically equal but textually different is not dropped here
+		// before the re-validators ever see it. Orthogonal to the declared-vs-enforcement
+		// collation choice above: the two spellings are one value at EVERY site, so
+		// admitting them keeps the candidate set a superset either way.
+		const ucComparators = uniqueEnforcementComparators(sourceSchema.columns, uc.columns, ucCollationFns);
+		const pkComparators = uniqueEnforcementComparators(
+			sourceSchema.columns, pkDef.map(d => d.index), pkCollationFns);
+
 		const conflicts: Array<{ pk: SqlValue[]; row?: Row }> = [];
 		// Fast path: a backing-PK prefix scan keyed on `newRow`'s UC values. The
 		// covering-index shape guarantees the leading backing-PK columns are the UC
@@ -1127,7 +1139,7 @@ export class MaterializedViewManager {
 		for await (const backingRow of host.scanEffective(connection, { equalityPrefix })) {
 			let match = true;
 			for (let k = 0; k < uc.columns.length; k++) {
-				if (compareSqlValuesFast(newRow[uc.columns[k]], backingRow[ucBackingCols[k]], ucCollationFns[k]) !== 0) {
+				if (ucComparators[k](newRow[uc.columns[k]], backingRow[ucBackingCols[k]]) !== 0) {
 					match = false;
 					break;
 				}
@@ -1138,7 +1150,7 @@ export class MaterializedViewManager {
 			// Exclude the row currently being written (its own source PK).
 			let isSelf = sourcePk.length === newSourcePk.length;
 			for (let i = 0; isSelf && i < sourcePk.length; i++) {
-				if (compareSqlValuesFast(sourcePk[i], newSourcePk[i], pkCollationFns[i]) !== 0) isSelf = false;
+				if (pkComparators[i](sourcePk[i], newSourcePk[i]) !== 0) isSelf = false;
 			}
 			if (isSelf) continue;
 
@@ -1198,6 +1210,15 @@ export class MaterializedViewManager {
 			// Soundness: both the backing-PK column (btree ordering / early-termination)
 			// and its source UC column (UNIQUE semantics) must be BINARY for the binary
 			// prefix-equality scan to neither over- nor under-match.
+			//
+			// NOTE: a semantic-ordering column (TIMESPAN — 'PT1H' == 'PT60M') declares no
+			// collation, so `isBinaryCollation` returns true and it PASSES this gate. That is
+			// correct, not an oversight: both backings key such a column through the type
+			// (memory via `createTypedComparator` in `resolveScanComparators`, the store via
+			// `storeSemanticKeyTransform`'s `groupKey`), so equal-value rows are physically
+			// contiguous and the seek lands on the whole group regardless of spelling — the
+			// early-termination cannot `break` before a semantically-equal conflict. Do not
+			// "fix" the gate to decline these columns; it would silently lose the fast path.
 			if (!isBinaryCollation(d.collation)) return undefined;
 			const sourceCol = projector.sourceCol;
 			if (!isBinaryCollation(sourceSchema.columns[sourceCol]?.collation)) return undefined;
