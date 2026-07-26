@@ -316,7 +316,7 @@ later `select` reads back. It is converted to the declared logical types at the
 (`MemoryTableManager.performInsert`, `quereus-store`'s `StoreTable.coerceRow`).
 That is the single conversion point; everything upstream of it sees raw values.
 
-Constraint evaluation is the one exception, and it takes a **copy** rather than
+CHECK and FK evaluation is the one exception, and it takes a **copy** rather than
 converting the row in place. `ConstraintCheckNode` builds a coerced view of the
 NEW half of the flat OLD/NEW row once per row (`coerceNewSection` in
 `runtime/emit/constraint-check.ts`) and evaluates CHECK expressions — immediate
@@ -333,6 +333,16 @@ untouched.
 > where it would reach the storage layer and be parsed twice.
 > (`quereus-isolation`'s `IsolatedTable` declines to thread its own coerced row
 > into the overlay write for the same reason.)
+
+That non-idempotence sets the phase order inside `ConstraintCheckNode`. The NOT
+NULL pass runs **first and against the raw row**: under `OR REPLACE` it may
+substitute a column's DEFAULT, and a DEFAULT expression can read a sibling via
+`new.<col>`. Whatever it returns is written back into the row that continues on
+to the storage layer, so it has to be the raw value. Only afterwards is the
+coerced view built — from the row *as finally substituted* — and shown to the
+CHECK/FK expressions, which is also what makes a substituted DEFAULT subject to
+the table's CHECKs. Both phases share one row context whose getter is swapped
+between them, so this costs no extra context push.
 
 Consequence: any consumer reading the DML executor's raw row rather than the
 stored row sees the uncoerced value. `insert ... returning j` reporting `text`

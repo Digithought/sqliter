@@ -657,7 +657,7 @@ Mutation context is captured and preserved for deferred constraints:
 rctx.db._queueDeferredConstraintRow(
   baseTable,
   constraintName,
-  coerceNewSection(row, tableSchema),  // NEW section coerced to column logical types
+  coercedRow,        // NEW section coerced to column logical types
   flatRowDescriptor,
   evaluator,
   connectionId,
@@ -666,16 +666,18 @@ rctx.db._queueDeferredConstraintRow(
 );
 ```
 
-The NEW section of the snapshotted row (indices `n..2n-1`) is coerced to the
-declared column logical types via `validateAndParse` before queueing. The insert
-pipeline otherwise defers type conversion to the storage layer's `performInsert`,
-so the row reaching the ConstraintCheck node still holds *raw* NEW values. Deferred
-CHECK subqueries compare those values against rows already stored (and therefore
-coerced) in other tables, so without this step a logical type that rewrites its
-value on parse (e.g. `datetime`) would spuriously fail equality at COMMIT (GitHub
-#25). OLD values are left untouched — they are NULL on INSERT or read from
-already-coerced stored rows on UPDATE — and a per-cell parse failure falls back to
-the raw value so the row's own `performInsert` remains the authoritative source of
+`coercedRow` is the same view the *immediate* CHECKs are evaluated against —
+`coerceNewSection` runs once per row, after NOT NULL substitution, and both paths
+read it (see docs/types.md § Where coercion happens). Its NEW section (indices
+`n..2n-1`) is coerced to the declared column logical types via `validateAndParse`.
+The insert pipeline otherwise defers type conversion to the storage layer's
+`performInsert`, so the row reaching the ConstraintCheck node still holds *raw* NEW
+values. Deferred CHECK subqueries compare those values against rows already stored
+(and therefore coerced) in other tables, so without this step a logical type that
+rewrites its value on parse (e.g. `datetime`) would spuriously fail equality at
+COMMIT (GitHub #25). OLD values are left untouched — they are NULL on INSERT or read
+from already-coerced stored rows on UPDATE — and a per-cell parse failure falls back
+to the raw value so the row's own `performInsert` remains the authoritative source of
 the MISMATCH error.
 
 **Evaluation at COMMIT:** the queued entry's captured context row and descriptor are

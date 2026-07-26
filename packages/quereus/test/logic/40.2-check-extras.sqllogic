@@ -481,3 +481,88 @@ select count(*) as cnt from t_defer;
 → [{"cnt":1}]
 
 drop table t_defer;
+
+-- === OR REPLACE default substitution is subject to CHECK ===
+-- A NOT NULL violation under OR REPLACE substitutes the column's DEFAULT. The
+-- CHECK verdict must be computed against the SUBSTITUTED row, not the original
+-- NULL — `null > 100` is NULL, which CHECK treats as a pass, so evaluating
+-- pre-substitution let a stored value of 5 slip past `check (v > 100)`.
+-- Regression for bug-replace-default-skips-check.
+
+create table rd_bad (id integer primary key, v integer not null default 5 check (v > 100));
+
+-- Control: the CHECK is live on a supplied value.
+insert into rd_bad values (2, 7);
+-- error: CHECK
+
+-- The substituted DEFAULT (5) is not > 100, so the row must be rejected too.
+insert or replace into rd_bad values (1, null);
+-- error: CHECK
+
+select count(*) as cnt from rd_bad;
+→ [{"cnt":0}]
+
+drop table rd_bad;
+
+-- A substituted DEFAULT that satisfies the CHECK is still stored.
+create table rd_ok (id integer primary key, v integer not null default 500 check (v > 100));
+
+insert or replace into rd_ok values (1, null);
+
+select id, v from rd_ok;
+→ [{"id":1,"v":500}]
+
+drop table rd_ok;
+
+-- UPDATE has no statement-level OR clause, so its substitution arrives through a
+-- column-level `on conflict replace`. Same rule: the CHECK sees the substituted row.
+create table rd_upd (id integer primary key, v integer not null on conflict replace default 500 check (v > 100));
+
+insert into rd_upd values (1, 700);
+
+update rd_upd set v = null where id = 1;
+
+select id, v from rd_upd;
+→ [{"id":1,"v":500}]
+
+drop table rd_upd;
+
+create table rd_upd_bad (id integer primary key, v integer not null on conflict replace default 5 check (v > 100));
+
+insert into rd_upd_bad values (1, 700);
+
+update rd_upd_bad set v = null where id = 1;
+-- error: CHECK
+
+select id, v from rd_upd_bad;
+→ [{"id":1,"v":700}]
+
+drop table rd_upd_bad;
+
+-- The deferred CHECK path reaches the same verdict.
+create table rd_defer (id integer primary key, v integer not null default 5 check ((select v > 100)));
+
+insert or replace into rd_defer values (1, null);
+-- error: CHECK
+
+select count(*) as cnt from rd_defer;
+→ [{"cnt":0}]
+
+drop table rd_defer;
+
+-- A DEFAULT that reads a sibling column of the same row still resolves: the
+-- substitution runs against the raw NEW row, and the CHECK then sees the result.
+create table rd_sib (id integer primary key, a integer, b integer not null default (new.a * 2) check (b > 10));
+
+insert or replace into rd_sib values (1, 9, null);
+
+select id, a, b from rd_sib;
+→ [{"id":1,"a":9,"b":18}]
+
+insert or replace into rd_sib values (2, 3, null);
+-- error: CHECK
+
+select count(*) as cnt from rd_sib;
+→ [{"cnt":1}]
+
+drop table rd_sib;

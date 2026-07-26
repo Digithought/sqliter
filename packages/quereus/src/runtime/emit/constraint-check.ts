@@ -116,9 +116,6 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 		};
 	});
 
-	// Constant per plan: whether any CHECK / FK expression will read the row.
-	const hasConstraintExprs = constraintMetadata.length > 0;
-
 	async function* run(rctx: RuntimeContext, inputRows: AsyncIterable<Row>, ...evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>): AsyncIterable<Row> {
 		if (!inputRows) {
 			return;
@@ -172,27 +169,17 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 			for await (const inputRow of inputRows) {
 				let flatRow = inputRow;
 
-				// Constraint expressions read the row through this context, so they see
-				// the COERCED NEW section — the same canonical values a later `select`
-				// reads back. `flatRow` itself stays raw and is what flows downstream:
-				// the storage layer coerces it on its own, and JSON's `parse` is not
-				// idempotent for a JSON string scalar, so a pre-coerced row must never
-				// reach it. See coerceNewSection.
-				//
-				// Only the CHECK / FK expressions read this view, and the DML builders
-				// emit a ConstraintCheckNode for EVERY table, so skip the copy when there
-				// are none — NOT NULL reads the raw row, and coercion cannot change
-				// whether a value is NULL.
-				//
-				// NOTE: for a table that does carry checks this copies the flat row and
-				// runs validateAndParse over every column, once per row (replacing the
-				// previous per-deferred-constraint recompute). If constraint-heavy insert
-				// throughput ever shows as hot, narrow it to the columns the constraint
-				// expressions actually reference.
-				const coercedRow = hasConstraintExprs ? coerceNewSection(flatRow, tableSchema) : flatRow;
+				// The row expressions see through `combinedDescriptor`. The getter is
+				// called lazily per lookup, so checkConstraints can swap it mid-row:
+				// NOT NULL DEFAULT substitution reads the RAW row, CHECK / FK read the
+				// COERCED view. `flatRow` itself stays raw and is what flows downstream.
+				let visibleRow: Row = flatRow;
 
-				const evaluation = await withAsyncRowContext(rctx, combinedDescriptor, () => contextRow ? [...contextRow, ...coercedRow] : coercedRow, async () => {
-					return await checkConstraints(
+				const evaluation = await withAsyncRowContext(
+					rctx,
+					combinedDescriptor,
+					() => contextRow ? [...contextRow, ...visibleRow] : visibleRow,
+					() => checkConstraints(
 						rctx,
 						plan,
 						tableSchema,
@@ -201,9 +188,9 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 						constraintEvalFunctions,
 						stmtOR,
 						defaultsRuntime,
-						coercedRow,
-					);
-				});
+						row => { visibleRow = row; },
+					),
+				);
 
 				if (evaluation.skip) continue;
 				if (evaluation.replacedRow) {
@@ -250,20 +237,31 @@ async function checkConstraints(
 	evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>,
 	stmtOR: ConflictResolution | undefined,
 	notNullDefaults: NotNullDefaultRuntime[],
-	coercedRow: Row,
+	showRow: (row: Row) => void,
 ): Promise<ConstraintCheckResult> {
-	// NOT NULL constraints with possible REPLACE-DEFAULT substitution.
+	// NOT NULL runs first, against the RAW row. A REPLACE-substituted DEFAULT may
+	// read `new.<col>`, and whatever it returns is written back into the row that
+	// flows on to the storage layer — which coerces it there. Showing it a coerced
+	// value would coerce twice, and JSON's `parse` is not idempotent for a string
+	// scalar (`'"Bob"'` → `Bob`, and re-parsing `Bob` throws).
 	const nnResult = await checkNotNullConstraints(rctx, plan, tableSchema, row, stmtOR, notNullDefaults);
 	if (nnResult.skip) return { skip: true };
-	if (nnResult.replacedRow) {
-		// A REPLACE-substituted DEFAULT changed the NEW section, so the pre-computed
-		// coerced view is stale — rebuild it for the deferred snapshot below.
-		row = nnResult.replacedRow;
-		coercedRow = constraintMetadata.length > 0 ? coerceNewSection(row, tableSchema) : row;
-	}
+	if (nnResult.replacedRow) row = nnResult.replacedRow;
+
+	// CHECK / FK read the coerced view of the row AS FINALLY SUBSTITUTED, so a
+	// REPLACE-substituted DEFAULT is subject to the table's CHECKs. The DML builders
+	// emit a ConstraintCheckNode for every table, so skip the copy entirely when the
+	// table carries no constraint expressions to read it.
+	//
+	// NOTE: for a table that does carry checks this copies the flat row and runs
+	// validateAndParse over every column, once per row. If constraint-heavy insert
+	// throughput ever shows as hot, narrow it to the columns the constraint
+	// expressions actually reference.
+	const coercedRow = constraintMetadata.length > 0 ? coerceNewSection(row, tableSchema) : row;
+	showRow(coercedRow);
 
 	// CHECK constraints (and synthetic FK existence checks built as RowConstraintSchema).
-	const ckResult = await checkCheckConstraints(rctx, plan, tableSchema, row, constraintMetadata, evaluatorFunctions, stmtOR, coercedRow);
+	const ckResult = await checkCheckConstraints(rctx, plan, tableSchema, constraintMetadata, evaluatorFunctions, stmtOR, coercedRow);
 	if (ckResult.skip) return { skip: true };
 
 	return { skip: false, replacedRow: nnResult.replacedRow };
@@ -337,7 +335,6 @@ async function checkCheckConstraints(
 	rctx: RuntimeContext,
 	plan: ConstraintCheckNode,
 	tableSchema: TableSchema,
-	row: Row,
 	constraintMetadata: ConstraintMetadataEntry[],
 	evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>,
 	stmtOR: ConflictResolution | undefined,
@@ -363,11 +360,14 @@ async function checkCheckConstraints(
 			metadata.kind === 'fk-parent' &&
 			metadata.referencedColumnIndices
 		) {
+			// Read from the coerced view: OLD comes from an already-coerced stored row,
+			// so comparing it against a raw NEW would call an unchanged column changed.
+			// (Erring that way only costs a redundant NOT EXISTS, never a missed check.)
 			const numCols = tableSchema.columns.length;
 			let anyChanged = false;
 			for (const colIdx of metadata.referencedColumnIndices) {
-				const oldVal = row[colIdx] as SqlValue;           // OLD section: 0..n-1
-				const newVal = row[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
+				const oldVal = coercedRow[colIdx] as SqlValue;           // OLD section: 0..n-1
+				const newVal = coercedRow[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
 				if (!sqlValueIdentical(oldVal, newVal)) {
 					anyChanged = true;
 					break;
@@ -427,13 +427,13 @@ async function checkCheckConstraints(
 }
 
 /**
- * Snapshot the flat OLD/NEW row for constraint evaluation, coercing the NEW
+ * Snapshot the flat OLD/NEW row for CHECK / FK evaluation, coercing the NEW
  * section (indices n..2n-1) to the declared column logical types.
  *
  * The insert pipeline defers type conversion to the storage layer's
  * validateAndParse, so the row reaching this node still holds raw NEW values —
  * an unconverted `'{"a":2}'` straight from the SQL literal, not the parsed JSON
- * value a `select` would read back. Every constraint expression must see the
+ * value a `select` would read back. Every CHECK / FK expression must see the
  * converted form, or it compares apples to oranges:
  *
  * - Deferred CHECK subqueries compare NEW against already-coerced stored rows in
@@ -442,10 +442,12 @@ async function checkCheckConstraints(
  *   as text — `'{"a":10}' < '{"a":2}'` alphabetically — instead of structurally
  *   (fix `bug-json-compare-string-ambiguity`).
  *
- * The result is used ONLY for constraint evaluation. The raw row is what flows
- * downstream to the storage layer, which coerces it itself; JSON's `parse` is not
- * idempotent for a JSON string scalar (`'"Bob"'` parses to the bare string `Bob`,
- * and re-parsing that throws), so a pre-coerced row must never reach it.
+ * The result is used ONLY for CHECK / FK evaluation — the NOT NULL pass, whose
+ * REPLACE substitution writes back into the row that continues downstream, runs
+ * against the raw row before this is built. The raw row is what flows on to the
+ * storage layer, which coerces it itself; JSON's `parse` is not idempotent for a
+ * JSON string scalar (`'"Bob"'` parses to the bare string `Bob`, and re-parsing
+ * that throws), so a pre-coerced row must never reach it.
  *
  * OLD values (0..n-1) are NULL on INSERT or read from already-coerced stored
  * rows on UPDATE, so they are left untouched. A per-cell parse failure falls

@@ -87,7 +87,16 @@ export const JSON_TYPE: LogicalType = {
 	isTemporal: false,
 };
 
-/** Ordering rank for JSON value types: null < boolean < number < string < array < object */
+/**
+ * Ordering rank for JSON value types: null < boolean < number < string < array < object
+ *
+ * NOTE: this must stay ordered compatibly with `StorageClass` in util/comparison.ts
+ * (NULL < NUMERIC < TEXT < BLOB < OBJECT). `createTypedComparator` short-circuits on a
+ * storage-class mismatch *before* reaching this compare, while `compareSqlValues` calls
+ * the type's compare directly — the two agree only because both orderings put numbers
+ * before strings and strings before containers. If either ranking is ever reordered,
+ * `j1 < j2` and `order by j` will start disagreeing.
+ */
 function jsonTypeOrder(v: JSONValue): number {
 	if (v === null) return 0;
 	switch (typeof v) {

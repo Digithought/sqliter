@@ -132,3 +132,38 @@ select a from jcc_bin;
 → [{"a":"Bob"}]
 
 drop table jcc_bin;
+
+-- === The coerced view is for CHECK only; a substituted DEFAULT stays raw ===
+
+-- A NOT NULL DEFAULT substituted under OR REPLACE is written back into the row
+-- that flows on to the storage layer, which coerces it there. So `new.<col>` in
+-- that DEFAULT must read the RAW value: handing it the coerced one coerces twice,
+-- and `JSON_TYPE.parse` is not idempotent for a string scalar
+-- (`'"Bob"'` → `Bob`, and re-parsing `Bob` throws).
+
+create table jcc_def_raw (id integer primary key, j json, k json not null default (new.j), check (id > 0));
+
+insert or replace into jcc_def_raw values (1, '"Bob"', null);
+
+select id, j, k from jcc_def_raw;
+→ [{"id":1,"j":"Bob","k":"Bob"}]
+
+-- An object value round-trips the same way (parse IS idempotent for these, so
+-- this case passed even while the string-scalar one threw).
+insert or replace into jcc_def_raw values (2, '{"a":2}', null);
+
+select k from jcc_def_raw where id = 2;
+→ [{"k":{"a":2}}]
+
+drop table jcc_def_raw;
+
+-- Control: the same shape on a table with NO check expressions at all, which
+-- takes the skip-the-copy path in ConstraintCheckNode.
+create table jcc_def_nochk (id integer primary key, j json, k json not null default (new.j));
+
+insert or replace into jcc_def_nochk values (1, '"Bob"', null);
+
+select id, j, k from jcc_def_nochk;
+→ [{"id":1,"j":"Bob","k":"Bob"}]
+
+drop table jcc_def_nochk;
