@@ -62,30 +62,22 @@ export const JSON_TYPE: LogicalType = {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
 
-		// A JSON string scalar always compares as text — under the supplied collation,
-		// or BINARY (code-point order) when none is supplied. This agrees with
-		// deepCompareJson's string-leaf order below and with the store's structural
+		// A JS string reaching here is ALWAYS a JSON string scalar, never serialized
+		// object/array text: every caller reads values that have already been through
+		// `parse` above — stored rows via coerceRowToSchema, and constraint expressions
+		// via constraint-check.ts's coerceNewSection. Nothing is re-parsed here, so the
+		// JSON string "9" stays distinct from the JSON number 9.
+		//
+		// Two string scalars compare as text — under the supplied collation, or
+		// BINARY (code-point order) when none is supplied. Code-point order agrees
+		// with deepCompareJson's string-leaf order and with the store's structural
 		// key bytes, so a comparator built without a collation (PK equality checks)
-		// still tells '9' and '9.0' apart. Every collation-less caller reads values
-		// that have already been through coerceRowToSchema, so a string here is a
-		// scalar, never serialized object/array text. (Immediate CHECK constraints do
-		// evaluate pre-coercion and can feed serialized text in, but they always
-		// supply a collation — see fix `bug-json-compare-string-ambiguity`.)
+		// still tells '9' and '9.0' apart.
 		if (typeof a === 'string' && typeof b === 'string') {
 			return collation ? collation(a, b) : compareCodePoints(a, b);
 		}
 
-		// Ensure both are in native form for comparison
-		const parsedA = typeof a === 'string' ? safeJsonParse(a) : a as JSONValue;
-		const parsedB = typeof b === 'string' ? safeJsonParse(b) : b as JSONValue;
-
-		if (parsedA === null || parsedB === null) {
-			const strA = typeof a === 'string' ? a : JSON.stringify(a);
-			const strB = typeof b === 'string' ? b : JSON.stringify(b);
-			return compareCodePoints(strA, strB);
-		}
-
-		return deepCompareJson(parsedA, parsedB);
+		return deepCompareJson(a as JSONValue, b as JSONValue);
 	},
 
 	supportedCollations: [],

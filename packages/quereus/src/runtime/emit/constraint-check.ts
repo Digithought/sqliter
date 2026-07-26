@@ -169,7 +169,21 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 			for await (const inputRow of inputRows) {
 				let flatRow = inputRow;
 
-				const evaluation = await withAsyncRowContext(rctx, combinedDescriptor, () => contextRow ? [...contextRow, ...flatRow] : flatRow, async () => {
+				// Constraint expressions read the row through this context, so they see
+				// the COERCED NEW section — the same canonical values a later `select`
+				// reads back. `flatRow` itself stays raw and is what flows downstream:
+				// the storage layer coerces it on its own, and JSON's `parse` is not
+				// idempotent for a JSON string scalar, so a pre-coerced row must never
+				// reach it. See coerceNewSection.
+				//
+				// NOTE: this copies the flat row and runs validateAndParse over every
+				// column once per row reaching this node — but only for tables that have
+				// constraints at all, and it replaces the previous per-deferred-constraint
+				// recompute. If constraint-heavy insert throughput ever shows as hot,
+				// narrow it to the columns the constraint expressions actually reference.
+				const coercedRow = coerceNewSection(flatRow, tableSchema);
+
+				const evaluation = await withAsyncRowContext(rctx, combinedDescriptor, () => contextRow ? [...contextRow, ...coercedRow] : coercedRow, async () => {
 					return await checkConstraints(
 						rctx,
 						plan,
@@ -179,6 +193,7 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 						constraintEvalFunctions,
 						stmtOR,
 						defaultsRuntime,
+						coercedRow,
 					);
 				});
 
@@ -227,14 +242,20 @@ async function checkConstraints(
 	evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>,
 	stmtOR: ConflictResolution | undefined,
 	notNullDefaults: NotNullDefaultRuntime[],
+	coercedRow: Row,
 ): Promise<ConstraintCheckResult> {
 	// NOT NULL constraints with possible REPLACE-DEFAULT substitution.
 	const nnResult = await checkNotNullConstraints(rctx, plan, tableSchema, row, stmtOR, notNullDefaults);
 	if (nnResult.skip) return { skip: true };
-	if (nnResult.replacedRow) row = nnResult.replacedRow;
+	if (nnResult.replacedRow) {
+		// A REPLACE-substituted DEFAULT changed the NEW section, so the pre-computed
+		// coerced view is stale — rebuild it for the deferred snapshot below.
+		row = nnResult.replacedRow;
+		coercedRow = coerceNewSection(row, tableSchema);
+	}
 
 	// CHECK constraints (and synthetic FK existence checks built as RowConstraintSchema).
-	const ckResult = await checkCheckConstraints(rctx, plan, tableSchema, row, constraintMetadata, evaluatorFunctions, stmtOR);
+	const ckResult = await checkCheckConstraints(rctx, plan, tableSchema, row, constraintMetadata, evaluatorFunctions, stmtOR, coercedRow);
 	if (ckResult.skip) return { skip: true };
 
 	return { skip: false, replacedRow: nnResult.replacedRow };
@@ -312,6 +333,7 @@ async function checkCheckConstraints(
 	constraintMetadata: ConstraintMetadataEntry[],
 	evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>,
 	stmtOR: ConflictResolution | undefined,
+	coercedRow: Row,
 ): Promise<ConstraintCheckResult> {
 	for (let i = 0; i < constraintMetadata.length; i++) {
 		const metadata = constraintMetadata[i];
@@ -356,7 +378,7 @@ async function checkCheckConstraints(
 			rctx.db._queueDeferredConstraintRow(
 				metadata.baseTable,
 				metadata.constraintName,
-				coerceNewSection(row, tableSchema),
+				coercedRow,
 				metadata.flatRowDescriptor,
 				evaluator,
 				activeConnectionId,
@@ -397,14 +419,25 @@ async function checkCheckConstraints(
 }
 
 /**
- * Snapshot the flat OLD/NEW row for deferred evaluation, coercing the NEW
+ * Snapshot the flat OLD/NEW row for constraint evaluation, coercing the NEW
  * section (indices n..2n-1) to the declared column logical types.
  *
  * The insert pipeline defers type conversion to the storage layer's
- * validateAndParse, so the row reaching this node still holds raw NEW values.
- * Deferred CHECK subqueries compare these against already-coerced stored rows
- * in other tables, so we coerce NEW here to keep coerced-vs-coerced equality at
- * commit time (GitHub #25).
+ * validateAndParse, so the row reaching this node still holds raw NEW values —
+ * an unconverted `'{"a":2}'` straight from the SQL literal, not the parsed JSON
+ * value a `select` would read back. Every constraint expression must see the
+ * converted form, or it compares apples to oranges:
+ *
+ * - Deferred CHECK subqueries compare NEW against already-coerced stored rows in
+ *   other tables (GitHub #25).
+ * - Immediate CHECKs compare NEW against NEW; two raw JSON texts would compare
+ *   as text — `'{"a":10}' < '{"a":2}'` alphabetically — instead of structurally
+ *   (fix `bug-json-compare-string-ambiguity`).
+ *
+ * The result is used ONLY for constraint evaluation. The raw row is what flows
+ * downstream to the storage layer, which coerces it itself; JSON's `parse` is not
+ * idempotent for a JSON string scalar (`'"Bob"'` parses to the bare string `Bob`,
+ * and re-parsing that throws), so a pre-coerced row must never reach it.
  *
  * OLD values (0..n-1) are NULL on INSERT or read from already-coerced stored
  * rows on UPDATE, so they are left untouched. A per-cell parse failure falls
