@@ -791,3 +791,98 @@ DROP TABLE pmask2_child_label;
 DROP TABLE pmask2_child_code;
 DROP TABLE pmask2_parent;
 
+-- ===================================================================
+-- Phase: change-detection short-circuit coerces before comparing
+-- (regression for bug-fk-restrict-change-detection-uncoerced)
+-- ===================================================================
+-- The referenced-column-change short-circuit used to compare the stored OLD
+-- value against the raw, uncoerced NEW value, so a value spelled differently
+-- from its stored form (integer 1 written as text '1'; a JSON object written
+-- with reordered keys) read as "changed" and wrongly tripped RESTRICT even
+-- though the stored value would not actually move. Both tables below carry a
+-- RESTRICT child and a CASCADE child on the SAME parent so the gate that
+-- batches pure-RESTRICT statements (see 41.9-fk-restrict-batched.sqllogic)
+-- excludes them: the update runs the per-row transitive pre-walk
+-- (assertNoRestrictedChildrenForParentMutation + the cascade-recursion arm of
+-- assertTransitiveRestrictsForParentMutation), not the batched accumulator.
+
+CREATE TABLE crc_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE crc_restrict_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES crc_parent(id) ON UPDATE RESTRICT);
+CREATE TABLE crc_cascade_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES crc_parent(id) ON UPDATE CASCADE);
+
+INSERT INTO crc_parent VALUES (1, 100);
+INSERT INTO crc_restrict_child VALUES (10, 1);
+INSERT INTO crc_cascade_child VALUES (20, 1);
+
+-- Rewriting the integer key as the text '1' does not change the stored value:
+-- must NOT trip RESTRICT.
+UPDATE crc_parent SET id = '1' WHERE id = 1;
+SELECT id FROM crc_parent;
+→ [{"id":1}]
+
+-- The cascade child must be untouched too — no key change means no
+-- propagating UPDATE should fire (the short-circuit is shared by both arms).
+SELECT p_id FROM crc_cascade_child;
+→ [{"p_id":1}]
+
+-- Sanity: a genuine key change with a live RESTRICT child still raises the
+-- error, so the fix cannot silently disable enforcement. Mixed actions are
+-- not batchable, so this is the plan-time synthesized parent-side NOT EXISTS
+-- (ConstraintCheckNode), not the runtime pre-walk's friendlier message.
+UPDATE crc_parent SET id = 2 WHERE id = 1;
+-- error: CHECK constraint failed: _fk_crc_restrict_child_p_id
+
+DROP TABLE crc_cascade_child;
+DROP TABLE crc_restrict_child;
+DROP TABLE crc_parent;
+
+-- Same short-circuit, JSON-typed key: a value re-typed through the column's
+-- logical type (validateAndParse) rather than compared as raw text — a JSON
+-- object rewritten with different whitespace / key order is the same stored
+-- value.
+
+CREATE TABLE crcj_parent (id JSON PRIMARY KEY, other INTEGER);
+CREATE TABLE crcj_restrict_child (cid INTEGER PRIMARY KEY, p_id JSON,
+    FOREIGN KEY (p_id) REFERENCES crcj_parent(id) ON UPDATE RESTRICT);
+CREATE TABLE crcj_cascade_child (cid INTEGER PRIMARY KEY, p_id JSON,
+    FOREIGN KEY (p_id) REFERENCES crcj_parent(id) ON UPDATE CASCADE);
+
+INSERT INTO crcj_parent VALUES ('{"a":1,"b":2}', 100);
+INSERT INTO crcj_restrict_child VALUES (10, '{"a":1,"b":2}');
+INSERT INTO crcj_cascade_child VALUES (20, '{"a":1,"b":2}');
+
+-- Reorder-equal JSON key: must NOT trip RESTRICT.
+UPDATE crcj_parent SET id = '{"b": 2, "a": 1}' WHERE other = 100;
+SELECT id FROM crcj_parent;
+→ [{"id":{"b":2,"a":1}}]
+
+-- Cascade child untouched (no key change ⇒ no propagating UPDATE).
+SELECT p_id FROM crcj_cascade_child;
+→ [{"p_id":{"a":1,"b":2}}]
+
+-- Sanity: a genuine JSON key change with a live RESTRICT child still raises
+-- the error (plan-time NOT EXISTS, as above — mixed actions are not batchable).
+UPDATE crcj_parent SET id = '{"a":9,"b":9}' WHERE other = 100;
+-- error: CHECK constraint failed: _fk_crcj_restrict_child_p_id
+
+DROP TABLE crcj_cascade_child;
+DROP TABLE crcj_restrict_child;
+DROP TABLE crcj_parent;
+
+-- ON DELETE RESTRICT has no NEW row, so the change-detection short-circuit
+-- never runs for it — guard that the refactor left the delete path alone.
+CREATE TABLE crcd_parent (id INTEGER PRIMARY KEY);
+CREATE TABLE crcd_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES crcd_parent(id) ON DELETE RESTRICT);
+
+INSERT INTO crcd_parent VALUES (1);
+INSERT INTO crcd_child VALUES (10, 1);
+
+DELETE FROM crcd_parent WHERE id = 1;
+-- error: violates RESTRICT from 'crcd_child'
+
+DROP TABLE crcd_child;
+DROP TABLE crcd_parent;
+

@@ -225,3 +225,48 @@ delete from zp where id = 2;
 drop table zc2;
 drop table zc1;
 drop table zp;
+
+-- ===================================
+-- 11. Referenced-column-change short-circuit coerces before comparing
+-- (regression for bug-fk-restrict-change-detection-uncoerced): a rewrite that
+-- spells the same stored value differently must not contribute a key to the
+-- batch, so accumulateParentRestrictKeys must not flush a spurious probe.
+-- ===================================
+
+create table crb_p (id integer primary key);
+create table crb_c (cid integer primary key, p_id integer,
+	foreign key (p_id) references crb_p(id) on update restrict);
+
+insert into crb_p values (1), (2);
+insert into crb_c values (10, 1);
+
+-- Integer key rewritten as text '1': same stored value, no batch entry.
+update crb_p set id = '1' where id = 1;
+select id from crb_p order by id;
+→ [{"id":1},{"id":2}]
+
+-- Genuine re-key of the referenced row still flushes a violating probe.
+update crb_p set id = 100 where id = 1;
+-- error: violates RESTRICT from 'crb_c'
+
+drop table crb_c;
+drop table crb_p;
+
+create table crbj_p (id json primary key, tag integer);
+create table crbj_c (cid integer primary key, p_id json,
+	foreign key (p_id) references crbj_p(id) on update restrict);
+
+insert into crbj_p values ('{"a":1,"b":2}', 1);
+insert into crbj_c values (10, '{"a":1,"b":2}');
+
+-- Reorder-equal JSON key: same stored value, no batch entry.
+update crbj_p set id = '{"b": 2, "a": 1}' where tag = 1;
+select id from crbj_p;
+→ [{"id":{"b":2,"a":1}}]
+
+-- Genuine JSON re-key still flushes a violating probe.
+update crbj_p set id = '{"a":9,"b":9}' where tag = 1;
+-- error: violates RESTRICT from 'crbj_c'
+
+drop table crbj_c;
+drop table crbj_p;

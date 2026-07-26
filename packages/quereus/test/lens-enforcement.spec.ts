@@ -3183,6 +3183,24 @@ describe('lens enforcement: parent-side FK RESTRICT over a non-restrict basis (r
 		}
 	});
 
+	it('UPDATE rewriting the referenced key with a differently-spelled equivalent value does NOT trip the lens RESTRICT pre-check (regression for bug-fk-restrict-change-detection-uncoerced)', async () => {
+		const db = new Database();
+		try {
+			await deployLensRestrictOverBasis(db, { basisFkTail: 'on delete cascade on update cascade' });
+			await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+			await db.exec('insert into x.child (id, pid) values (10, 1)');
+			// The integer key rewritten as the text '1' stores the same value. The referenced-
+			// column-change short-circuit (resolveLensFkParentReferencedValues) must re-coerce the
+			// raw NEW value through the column's logical type before comparing — otherwise this
+			// reads as a change and the lens RESTRICT pre-check wrongly ABORTs a no-op rewrite.
+			await db.exec(`update x.parent set id = '1' where id = 1`);
+			expect(await rows(db, 'select id from x.parent'), 'key unchanged, no abort').to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, 'select id, pid from x.child where id = 10'), 'child unaffected').to.deep.equal([{ id: 10, pid: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('UPDATE of the referenced key — lens RESTRICT over basis SET NULL ABORTs (rows unchanged)', async () => {
 		const db = new Database();
 		try {
