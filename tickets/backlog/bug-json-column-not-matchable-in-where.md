@@ -10,7 +10,23 @@ difficulty: medium
 
 # A JSON column cannot be addressed from a where clause
 
-## Observed
+## Status: mostly resolved — only the third repro survives
+
+`bug-json-equality-not-structural` landed the type-directed comparison described under
+"fault 1" and the object-valued-constant fix described under "fault 2". Re-run against
+current `main`, two of the three queries below now return row 1 as intended:
+
+- `select * from t where j = '[2]'` — **fixed**, matches (spacing- and key-order-insensitive)
+- `select * from t where j = json('[2]')` — **fixed**, no longer errors, matches
+- `select * from t where json_quote(j) = '[2]'` — **still 0 rows**
+
+The survivor is not about addressing a JSON column at all: `json_quote` returns serialized
+JSON *text* but declares no return type, so the comparison treats an operand as JSON-typed
+and re-parses the other side. That is the same defect already filed as
+`bug-json-typed-comparison-reparses-text-literal`, which is where it should be fixed.
+This ticket can be closed once someone agrees with that reading.
+
+## Observed (as originally filed)
 
 With rows present in a `json` column, none of the three natural ways to select one
 works. Both the in-memory backend and the disk-backed store behave identically, so this

@@ -194,7 +194,42 @@ select id from jse_re where v = '{ "a" : 1 }';
 → [{"id":1}]
 
 -- ===================================
--- 9. Identity sites are unchanged — GROUP BY / DISTINCT were already structural
+-- 9. Two DIFFERENT JSON comparisons in one statement stay different
+-- ===================================
+-- Every object literal used to fingerprint as '[object Object]'
+-- (analysis/expression-fingerprint.ts), so scalar CSE folded these two comparisons
+-- into one and evaluated only the first: the AND matched row 1 and the OR missed
+-- row 2. Reachable through `json(...)` before this file existed, and through a
+-- plain text literal after the coercion landed.
+create table jse_cse (id integer primary key, v json);
+insert into jse_cse values (1, '{"a":1}'), (2, '{"a":2}');
+-- run
+
+select id from jse_cse where v = '{"a":1}' and v = '{"a":2}';
+→ []
+
+select id from jse_cse where v = json('{"a":1}') and v = json('{"a":2}');
+→ []
+
+select id from jse_cse where v = '{"a":1}' or v = '{"a":2}' order by id;
+→ [{"id":1},{"id":2}]
+
+-- Reorder-equal literals ARE the same value, so folding them is correct.
+select id from jse_cse where v = '{"a":1}' and v = '{ "a" : 1 }';
+→ [{"id":1}]
+
+select id, (v = '{"a":1}') as p, (v = '{"a":2}') as q from jse_cse order by id;
+→ [{"id":1,"p":true,"q":false},{"id":2,"p":false,"q":true}]
+
+-- ===================================
+-- 10. A simple CASE compares its base structurally, like `=` does
+-- ===================================
+select id, case v when '{ "a" : 1 }' then 'one' when '{"a":2}' then 'two' else 'miss' end as r
+from jse_cse order by id;
+→ [{"id":1,"r":"one"},{"id":2,"r":"two"}]
+
+-- ===================================
+-- 11. Identity sites are unchanged — GROUP BY / DISTINCT were already structural
 -- ===================================
 select count(*) as groups from (select v from jse_t group by v);
 → [{"groups":4}]

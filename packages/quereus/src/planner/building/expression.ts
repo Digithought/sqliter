@@ -98,6 +98,9 @@ function insertCrossTypeCoercion(
 
 	const leftObject = leftLogical.physicalType === PhysicalType.OBJECT;
 	const rightObject = rightLogical.physicalType === PhysicalType.OBJECT;
+	// NOTE: two object-physical operands of DIFFERENT logical types fall through both
+	// arms onto the generic runtime path. Unreachable while JSON is the only
+	// PhysicalType.OBJECT type; adding a second one means deciding which side converts.
 	// Exactly one side is object-physical. A NULL-typed operand is left alone: the
 	// comparison is UNKNOWN regardless, so the cast would only add a runtime hop.
 	if (leftObject !== rightObject) {
@@ -127,33 +130,35 @@ function insertCrossTypeCoercion(
 }
 
 /**
- * Apply the object-physical arm of {@link insertCrossTypeCoercion} across an IN
- * value list, so `json_col in ('{"a":1}')` agrees with `json_col = '{"a":1}'`.
+ * Apply the object-physical arm of {@link insertCrossTypeCoercion} across the
+ * one-probe-against-many-values shape shared by an IN value list and a simple
+ * CASE, so `json_col in ('{"a":1}')` and `case json_col when '{"a":1}' …` agree
+ * with `json_col = '{"a":1}'`.
  *
  * Scoped to the object-physical pairing on purpose. The numeric ↔ textual arm has
- * never been applied to IN lists (`int_col in ('1')` is false today for the same
+ * never been applied to either site (`int_col in ('1')` is false today for the same
  * underlying reason), and turning it on here would change unrelated behavior; that
  * case is tracked separately.
  *
- * The tested expression is shared by every listed value, so it is wrapped at most
- * once — if any value is object-physical while the tested expression is not, the
- * tested expression is cast first and the values are then reconciled against it.
+ * The probe is shared by every value, so it is wrapped at most once — if any value
+ * is object-physical while the probe is not, the probe is cast first and the values
+ * are then reconciled against it.
  */
-function coerceInListOperands(
+function coerceObjectPhysicalSet(
 	scope: import('../scopes/scope.js').Scope,
-	left: ScalarPlanNode,
+	probe: ScalarPlanNode,
 	values: ScalarPlanNode[],
 ): [ScalarPlanNode, ScalarPlanNode[]] {
 	const isObject = (node: ScalarPlanNode): boolean =>
 		node.getType().logicalType.physicalType === PhysicalType.OBJECT;
 
 	const objectValue = values.find(isObject);
-	if (!isObject(left) && !objectValue) return [left, values];
+	if (!isObject(probe) && !objectValue) return [probe, values];
 
-	const coercedLeft = isObject(left)
-		? left
-		: wrapInCast(scope, left, objectValue!.getType().logicalType.name);
-	return [coercedLeft, values.map(val => insertCrossTypeCoercion(scope, coercedLeft, val)[1])];
+	const coercedProbe = isObject(probe)
+		? probe
+		: wrapInCast(scope, probe, objectValue!.getType().logicalType.name);
+	return [coercedProbe, values.map(val => insertCrossTypeCoercion(scope, coercedProbe, val)[1])];
 }
 
 /** Create a synthetic CastNode wrapping `operand` with the given target type name. */
@@ -241,13 +246,23 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
 
     case 'case': {
       // Build base expression if present
-      const baseExpr = expr.baseExpr ? buildExpression(ctx, expr.baseExpr, allowAggregates) : undefined;
+      let baseExpr = expr.baseExpr ? buildExpression(ctx, expr.baseExpr, allowAggregates) : undefined;
 
       // Build WHEN/THEN clauses
       const whenThenClauses = expr.whenThenClauses.map(clause => ({
         when: buildExpression(ctx, clause.when, allowAggregates),
         then: buildExpression(ctx, clause.then, allowAggregates)
       }));
+
+      // A simple CASE compares its base against every WHEN, so it needs the same
+      // object-physical reconciliation an IN list gets — otherwise
+      // `case json_col when '{"a":1}'` disagrees with `json_col = '{"a":1}'`.
+      if (baseExpr) {
+        const [coercedBase, coercedWhens] = coerceObjectPhysicalSet(
+          ctx.scope, baseExpr, whenThenClauses.map(c => c.when));
+        baseExpr = coercedBase;
+        coercedWhens.forEach((when, i) => { whenThenClauses[i].when = when; });
+      }
 
       // Build ELSE expression if present
       const elseExpr = expr.elseExpr ? buildExpression(ctx, expr.elseExpr, allowAggregates) : undefined;
@@ -350,7 +365,7 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
                } else if (expr.values) {
           // IN value list: expr IN (value1, value2, ...)
           const rawValueExprs = expr.values.map(val => buildExpression(ctx, val, allowAggregates));
-          const [inLeft, valueExprs] = coerceInListOperands(ctx.scope, leftExpr, rawValueExprs);
+          const [inLeft, valueExprs] = coerceObjectPhysicalSet(ctx.scope, leftExpr, rawValueExprs);
           const inListNode = new InNode(ctx.scope, expr, inLeft, undefined, valueExprs);
           // Same eager collation-lattice validation as the subquery form.
           inListNode.getType();
