@@ -1541,3 +1541,61 @@ select rid from rj_mv where lid_pk is null;
 
 select rid from rj_mv where name is not null order by rid;
 → [{"rid":10},{"rid":30}]
+
+-- ===================================
+-- 32. Row-time maintenance sees the STORED source row, not the raw proposed one
+--     (bug-dml-downstream-uses-uncoerced-row). The storage layer coerces a write
+--     to the declared column type inside `vtab.update()` — a `json` column given
+--     the text '{ "a" : 1 }' stores the same JSON value as '{"a":1}'. The DML
+--     executor used to hand maintenance the PRE-coercion row, so the
+--     incrementally maintained MV grouped the two spellings into two groups
+--     while the same body evaluated over the base table produced one. The
+--     maintained MV must be indistinguishable from the equivalent plain view.
+-- ===================================
+
+create table jg (id integer primary key, j json, v integer);
+create materialized view jg_mv as select j, count(*) as c, sum(v) as s from jg group by j;
+-- the same body as a plain (always-recomputed-from-base) view, for parity
+create view jg_plain as select j, count(*) as c, sum(v) as s from jg group by j;
+
+-- two structurally-equal, textually-DIFFERENT JSON spellings → ONE group of 2.
+insert into jg values (1, '{"a":1}', 10);
+insert into jg values (2, '{ "a" : 1 }', 5);
+
+select j, c, s from jg_mv order by c;
+→ [{"j":{"a":1},"c":2,"s":15}]
+
+-- ...and the plain view agrees (this is the assertion the maintained MV used to fail).
+select j, c, s from jg_plain order by c;
+→ [{"j":{"a":1},"c":2,"s":15}]
+
+-- a genuinely different JSON value opens its own group.
+insert into jg values (3, '{"a":2}', 7);
+select c, s from jg_mv order by s;
+→ [{"c":1,"s":7},{"c":2,"s":15}]
+select c, s from jg_plain order by s;
+→ [{"c":1,"s":7},{"c":2,"s":15}]
+
+-- a group-key UPDATE whose new key is a whitespace variant of an EXISTING group
+-- must merge into it (raw-row maintenance would have opened a third group).
+update jg set j = '{ "a":1 }' where id = 3;
+select c, s from jg_mv order by s;
+→ [{"c":3,"s":22}]
+select c, s from jg_plain order by s;
+→ [{"c":3,"s":22}]
+
+-- ...and splitting back out again removes the merged contribution.
+update jg set j = '{"a":3}' where id = 3;
+select c, s from jg_mv order by s;
+→ [{"c":1,"s":7},{"c":2,"s":15}]
+select c, s from jg_plain order by s;
+→ [{"c":1,"s":7},{"c":2,"s":15}]
+
+-- an INTEGER-affinity group key behaves the same: '7' stores as 7 and must group
+-- with a numeric 7 rather than beside it.
+create table ng (id integer primary key, k integer, v integer);
+create materialized view ng_mv as select k, count(*) as c from ng group by k;
+insert into ng values (1, 7, 1);
+insert into ng values (2, '7', 2);
+select k, c from ng_mv order by k;
+→ [{"k":7,"c":2}]

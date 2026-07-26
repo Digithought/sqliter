@@ -815,6 +815,25 @@ the `DeltaExecutor`), row-time materialized-view backing maintenance
 data-change auto-event. This pipeline has exactly one home; substrates do not drive
 any of it themselves.
 
+**Raw flows down, stored flows back up.** Column coercion to the declared logical
+type happens *inside* `vtab.update()` (`coerceRowToSchema` in the memory manager
+and the store table; the overlay's own coercion in the isolation layer), so the row
+the executor hands **down** still carries the statement's un-converted input — a
+`json` column's `'{"a":2}'` is TEXT there, an `integer`-affinity column's `'7'` is
+still a string. The row a subsequent `select` reads back is the coerced one. Every
+post-write consumer must therefore see the **stored** row, which `vtab.update()`
+reports as `UpdateResult.row`: the executor recovers it via `storedRowOrRaw` and
+feeds it to change-tracking, row-time MV maintenance, the FK cascade, the
+changed-column comparison, the auto-event, and the row yielded downstream to
+`RETURNING` (`withStoredNewSection` swaps the NEW half of the flat OLD/NEW row).
+Nothing is coerced *before* the write, so the row is coerced exactly once and
+non-idempotent parses are never re-entered. `storedRowOrRaw` falls back to the raw
+row when the module reports none (or one of the wrong width) — a minimal
+test/sample module that echoes its input never coerces, so raw *is* stored for it.
+DELETE is the one arm that does not consult `UpdateResult.row`: its OLD image comes
+from the source scan and is already a stored row, and the isolation layer returns a
+synthetic PK-only placeholder for delete. See `bug-dml-downstream-uses-uncoerced-row`.
+
 A REPLACE conflict resolved inside `vtab.update()` can delete rows the executor
 never asked it to touch. Two channels on the `ok` `UpdateResult` report them so the
 pipeline still runs uniformly (`internal-eviction-reporting`):

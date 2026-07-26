@@ -132,7 +132,15 @@ export abstract class VirtualTable {
 	 * Performs an INSERT, UPDATE, or DELETE operation.
 	 *
 	 * Returns an UpdateResult indicating success or constraint violation:
-	 * - `{ status: 'ok', row?: Row }` - Success. Row is new/updated row for INSERT/UPDATE, undefined for DELETE.
+	 * - `{ status: 'ok', row?: Row }` - Success. For INSERT/UPDATE, `row` is the row the
+	 *   module actually STORED: the proposed `args.values` after the module's own coercion
+	 *   to the declared column logical types. A module that coerces MUST return the coerced
+	 *   row, because the DML executor reports `row` (not `args.values`) to every post-write
+	 *   consumer — RETURNING, change tracking, row-time materialized-view maintenance, FK
+	 *   cascades, data-change events. Returning the raw input from a coercing module makes
+	 *   RETURNING disagree with a subsequent `select` on the same row. Omit `row` (or return
+	 *   a different width) only if the module does not coerce at all; the executor then falls
+	 *   back to the proposed values. For DELETE, `row` is undefined and is never consulted.
 	 * - `{ status: 'constraint', constraint, message?, existingRow? }` - Constraint violation.
 	 *   For 'unique' constraints, existingRow contains the conflicting row (enables UPSERT).
 	 *
