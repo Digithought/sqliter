@@ -229,6 +229,13 @@ drop table sem6b;
 --    the column's declared collation. So `text collate nocase → date` changes the ordering
 --    too, even though both orderings are "textual" — the guard turns on comparator
 --    identity, not on semantic ordering alone.
+--
+--    NOTE: `create table … (d date collate nocase)` is REJECTED (DATE declares
+--    `supportedCollations: []`), but SET DATA TYPE does not re-check the column's existing
+--    collation against the new type, so this ALTER leaves `d DATE COLLATE NOCASE` — a column
+--    no CREATE TABLE could produce, whose canonical DDL will not re-parse. Tracked in
+--    tickets/fix/bug-retype-keeps-illegal-collation.md; when that lands this section becomes
+--    an `-- error:` case and the re-key coverage moves to a plain `text` column.
 -- ===================================
 
 create table sem7 (id integer primary key, d text collate nocase);
@@ -249,6 +256,26 @@ select id, d from sem7 order by d;
 → [{"id":1,"d":"2024-01-01"},{"id":2,"d":"2024-02-01"}]
 
 drop table sem7;
+
+-- 7b. …and the collation-legal shape of the same retype (a plain BINARY `text` column, the
+-- only collation DATE accepts). DATE compares exactly as BINARY text does, so this one
+-- re-sorts into the order it was already in — the point is that it stays correct and stays
+-- accepted. This is the section that survives bug-retype-keeps-illegal-collation.
+create table sem7b (id integer primary key, d text);
+create unique index sem7b_d on sem7b (d);
+insert into sem7b values (1, '2024-02-01'), (2, '2024-01-01');
+-- run
+
+alter table sem7b alter column d set data type date;
+-- run
+
+select id, d from sem7b order by d;
+→ [{"id":2,"d":"2024-01-01"},{"id":1,"d":"2024-02-01"}]
+
+select id from sem7b where d = '2024-02-01';
+→ [{"id":1}]
+
+drop table sem7b;
 
 -- ===================================
 -- 8. EFFECTIVE rows, not committed rows: a collision involving a row the open transaction
@@ -307,3 +334,60 @@ select id from sem8b where v = 'PT120M';
 → [{"id":3}]
 
 drop table sem8b;
+
+-- ===================================
+-- 9. JSON is the third same-storage-class type carrying its own comparison: it ranks by
+--    canonical structure, so '{"a":1}' and '{ "a" : 1 }' are one document where text sees
+--    two. Same contract as the TIMESPAN sections above.
+-- ===================================
+
+create table sem9 (id integer primary key, v text);
+create unique index sem9_v on sem9 (v);
+insert into sem9 values (1, '{"a":1}'), (2, '{ "a" : 1 }');
+-- run
+
+alter table sem9 alter column v set data type json;
+-- error: UNIQUE constraint failed
+
+select id, v from sem9 order by id;
+→ [{"id":1,"v":"{\"a\":1}"},{"id":2,"v":"{ \"a\" : 1 }"}]
+
+drop table sem9;
+
+-- 9b. …the accepted case: distinct documents, so the retype lands and the index enforces
+-- uniqueness by structure rather than by spelling. The retyped column must answer exactly as
+-- a column declared `json` from the start does — which is what 9c pins.
+create table sem9b (id integer primary key, v text);
+create unique index sem9b_v on sem9b (v);
+insert into sem9b values (1, '{"a":1}'), (2, '{"b":2}');
+-- run
+
+alter table sem9b alter column v set data type json;
+-- run
+
+insert into sem9b values (3, '{  "b":2  }');
+-- error: UNIQUE constraint failed
+
+-- NOTE: a differently-spaced document is a duplicate to the INDEX but not to `=`, which
+-- compares JSON columns as canonical text without canonicalizing the literal on the other
+-- side (JSON carries a `compare` but no `groupKey`). That divergence is a property of the
+-- JSON type itself, not of the retype — 9c shows a natively-declared column doing the same —
+-- and is tracked in tickets/fix/bug-json-equality-not-structural.md.
+select id from sem9b where v = '{ "a" : 1 }';
+→ []
+
+drop table sem9b;
+
+-- 9c. …and the natively-declared column the retyped one has to match, spelling for spelling.
+create table sem9c (id integer primary key, v json);
+create unique index sem9c_v on sem9c (v);
+insert into sem9c values (1, '{"a":1}'), (2, '{"b":2}');
+-- run
+
+insert into sem9c values (3, '{  "b":2  }');
+-- error: UNIQUE constraint failed
+
+select id from sem9c where v = '{ "a" : 1 }';
+→ []
+
+drop table sem9c;

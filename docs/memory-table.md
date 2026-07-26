@@ -221,7 +221,8 @@ exactly as the rebuilt structure will. Two families qualify:
 *   **`SET COLLATE`** re-keys the structures under a new comparator; the stored values are
     unchanged, so the probe reads the effective rows as they are.
 *   **A `SET DATA TYPE` that keeps the physical storage class but moves the comparison** —
-    `TEXT` ↔ `TIMESPAN` (`'PT1H'`, `'PT60M'` and `'PT3600S'` are one duration), or `TEXT` ↔
+    `TEXT` ↔ `TIMESPAN` (`'PT1H'`, `'PT60M'` and `'PT3600S'` are one duration), `TEXT` ↔ `JSON`
+    (`'{"a":1}'` and `'{ "a" : 1 }'` are one document), or `TEXT` ↔
     `DATE`/`TIME`/`DATETIME` (whose comparison is hard-wired to `BINARY`, ignoring the column's
     collation). No value is rewritten, so like `SET COLLATE` the probe reads the effective rows
     as they are — but a `MemoryIndex` builds its comparator from the column's **logical type**,
@@ -289,7 +290,7 @@ policy leaves the behavior above unchanged.
 
 **`SET DATA TYPE` validates and rewrites values, not just structures.** When the new type shares
 the physical type, no value is touched and the statement is metadata-only *unless* the two types
-compare differently (`comparisonSemanticsDiffer` — `TEXT` ↔ `TIMESPAN`, `TEXT` ↔
+compare differently (`comparisonSemanticsDiffer` — `TEXT` ↔ `TIMESPAN`, `TEXT` ↔ `JSON`, `TEXT` ↔
 `DATE`/`TIME`/`DATETIME`), in which case it takes the `SET COLLATE` path in full: UNIQUE
 re-validation over the effective rows under the new comparator, `rebuildAllSecondaryIndexes` on
 the base, and `adoptSchema` on every open transaction layer. A direct module call that aims such a

@@ -507,12 +507,22 @@ export function hasSemanticOrdering(type: LogicalType | undefined): type is Logi
  *
  *  - TEXT ↔ TIMESPAN — TIMESPAN's `compare` ranks by elapsed time, so 'PT1H', 'PT60M' and
  *    'PT3600S' are one value where text sees three.
+ *  - TEXT ↔ JSON — JSON's `compare` ranks by canonical structure, so '{"a":1}' and
+ *    '{ "a" : 1 }' are one value.
  *  - TEXT ↔ DATE / TIME / DATETIME — these carry their own `compare` hard-wired to
  *    BINARY_COLLATION, ignoring the column's declared collation, so `text collate nocase →
  *    date` really does re-order even though both orderings are "textual".
  *
  * A retype that flattens to the SAME logical type object (`text → varchar(50)`,
  * `integer → bigint`) shares one `compare` and is correctly reported as no change.
+ *
+ * NOTE: deliberately conservative — it answers "may the order move", not "does it". The
+ * DATE / TIME / DATETIME family compares exactly as BINARY text does, so under the only
+ * collation those types legally accept (BINARY — `supportedCollations: []`) a `text → date`
+ * retype re-sorts every structure into the order it was already in. Harmless but O(rows);
+ * if a retype on a large table ever shows up as slow, narrow the predicate to a probe of the
+ * two comparators over a representative value set, or special-case the BINARY-equivalent
+ * comparators by identity.
  */
 export function comparisonSemanticsDiffer(a: LogicalType, b: LogicalType): boolean {
 	return a.compare !== b.compare;
