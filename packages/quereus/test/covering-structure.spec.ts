@@ -1502,6 +1502,48 @@ describe('row-time covering enforcement', () => {
 		await expectThrows(() => db.exec("insert into t values ('PT5M', 1)"), 'UNIQUE constraint failed: t (v)');
 	});
 
+	it('DESC-leading covering MV over a TIMESPAN column still resolves a re-spelled conflict', async () => {
+		// `order by d desc` ⇒ the backing PK leads with d DESC, ordered by elapsed time.
+		// The prefix seek positions with the raw probe text, so it must land on the
+		// group the *typed* comparator defines, under the descending physical order.
+		db = new Database();
+		await db.exec('create table t (id integer primary key, d timespan, unique (d))');
+		await db.exec('create materialized view ix as select d, id from t order by d desc');
+		await db.exec("insert into t values (1, 'PT1H')");
+		await db.exec("insert into t values (2, 'PT30M')"); // different elapsed time ⇒ ok
+		await expectThrows(() => db.exec("insert into t values (3, 'PT60M')"), 'UNIQUE constraint failed: t (d)');
+		expect(await selectAll('select id from t order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+	});
+
+	it('composite UC with a TIMESPAN member: the multi-column prefix seek honors the type', async () => {
+		// The leading prefix is (g, d) — an ordinary integer followed by a semantic-ordering
+		// column — so the seek must key the second component by elapsed time, not text.
+		db = new Database();
+		await db.exec('create table t (id integer primary key, g integer not null, d timespan, unique (g, d))');
+		await db.exec('create materialized view ix as select g, d, id from t order by g, d');
+		await db.exec("insert into t values (1, 1, 'PT1H')");
+		await db.exec("insert into t values (2, 2, 'PT60M')"); // different group ⇒ ok
+		await expectThrows(() => db.exec("insert into t values (3, 1, 'PT60M')"), 'UNIQUE constraint failed: t (g, d)');
+		expect(await selectAll('select count(*) as n from t')).to.deep.equal([{ n: 2 }]);
+	});
+
+	it('JSON covering MV: structurally-equal objects are one value regardless of key order', async () => {
+		// JSON is the other `semanticOrdering` type. Its EQUALITY already coincided with
+		// the storage-class compare (StorageClass.OBJECT compares canonical strings), so
+		// routing through the type's `compare` must not change the verdict either way —
+		// this pins that, and closes the semantic-ordering matrix left open by the
+		// TIMESPAN-only cases above.
+		db = new Database();
+		await db.exec('create table t (id integer primary key, j json, unique (j))');
+		await db.exec('create materialized view ix as select j, id from t order by j');
+		await db.exec(`insert into t values (1, '{"a":1,"b":2}')`);
+		await expectThrows(() => db.exec(`insert into t values (2, '{"b":2,"a":1}')`), 'UNIQUE constraint failed: t (j)');
+		// Array element order IS significant ⇒ a distinct value.
+		await db.exec(`insert into t values (3, '[1,2]')`);
+		await db.exec(`insert into t values (4, '[2,1]')`);
+		expect(await selectAll('select count(*) as n from t')).to.deep.equal([{ n: 3 }]);
+	});
+
 	it('DESC-leading covering MV: the prefix seek still resolves conflicts', async () => {
 		// `order by x desc` ⇒ the backing PK leads with x DESC. The equalityPrefix seek
 		// must still land on the matching block under the descending physical order.

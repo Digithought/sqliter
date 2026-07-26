@@ -269,8 +269,10 @@ TEXT/ANY column's declared `compare` is not collation-aware, so consulting it wo
 break NOCASE/RTRIM enforcement — the `hasSemanticOrdering` flag is the gate). The
 per-column comparators are built once per constraint check by the shared
 `uniqueEnforcementComparators` (`schema/unique-enforcement.ts`), which the memory
-backend's three re-validators, the persistent store's finders, and the isolation
-overlay's merged-view search all call, so the backends cannot drift. Concretely, in a
+backend's three re-validators, the persistent store's finders, the isolation
+overlay's merged-view search, and the covering materialized view's shared candidate
+generator (`lookupCoveringConflicts` — see [mv-constraints.md](mv-constraints.md))
+all call, so the backends cannot drift. Concretely, in a
 `d timespan unique` column an insert of `'PT60M'` after `'PT1H'` raises a UNIQUE
 violation, `insert or ignore` drops it, and `insert or replace` evicts the existing
 row — the same on memory and store.

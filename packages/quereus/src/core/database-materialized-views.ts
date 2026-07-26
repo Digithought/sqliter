@@ -1177,8 +1177,9 @@ export class MaterializedViewManager {
 	 *  - the leading `k` backing-PK columns do not map to **exactly** the UC
 	 *    source-column set (defensive guard against a non-UC-leading structure);
 	 *  - any leading backing-PK column, or its source UC column, has a **non-BINARY**
-	 *    collation. This is a *soundness* gate, not a perf choice: the prefix seek's
-	 *    early-termination compares with plain `compareSqlValues` (binary), while the
+	 *    collation. This is a *soundness* gate, not a perf choice: the scan request
+	 *    carries no collation names, so the prefix seek's early-termination resolves its
+	 *    comparators at the BINARY floor (`resolveScanComparators`), while the
 	 *    backing btree orders the PK by its declared collation and the UNIQUE
 	 *    constraint conflicts by the source collation. Under a non-binary collation
 	 *    the binary early-termination could `break` before a collated-equal /
@@ -1215,10 +1216,11 @@ export class MaterializedViewManager {
 			// collation, so `isBinaryCollation` returns true and it PASSES this gate. That is
 			// correct, not an oversight: both backings key such a column through the type
 			// (memory via `createTypedComparator` in `resolveScanComparators`, the store via
-			// `storeSemanticKeyTransform`'s `groupKey`), so equal-value rows are physically
-			// contiguous and the seek lands on the whole group regardless of spelling — the
-			// early-termination cannot `break` before a semantically-equal conflict. Do not
-			// "fix" the gate to decline these columns; it would silently lose the fast path.
+			// `storeSemanticKeyTransform` — TIMESPAN's `groupKey`, JSON's structural byte
+			// encoder), so equal-value rows are physically contiguous and the seek lands on
+			// the whole group regardless of spelling — the early-termination cannot `break`
+			// before a semantically-equal conflict. Do not "fix" the gate to decline these
+			// columns; it would silently lose the fast path.
 			if (!isBinaryCollation(d.collation)) return undefined;
 			const sourceCol = projector.sourceCol;
 			if (!isBinaryCollation(sourceSchema.columns[sourceCol]?.collation)) return undefined;
