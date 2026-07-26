@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-26T15:12:47.205Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\bug-isolation-index-ddl-rebuild-drops-savepoint-writes.implement.2026-07-26T15-12-47-205Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ---
 description: When a transaction creates or drops an index and later rolls back to a savepoint taken before that index change, rows the transaction had already inserted vanish without any error.
 files:

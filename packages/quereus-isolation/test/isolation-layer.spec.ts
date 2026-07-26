@@ -1821,6 +1821,99 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	describe('index DDL inside a transaction preserves the overlay savepoint chain', () => {
+		// Regression (`bug-isolation-index-ddl-rebuild-drops-savepoint-writes`): CREATE/DROP
+		// INDEX used to throw the overlay away and copy staged rows into a fresh MemoryTable.
+		// That table's first write lazily registered its connection, and
+		// `Database.registerConnection` replays begin() + the whole active savepoint stack
+		// BEFORE the copy — so every copied row landed ABOVE the replayed savepoint and the
+		// next `rollback to savepoint` discarded work done before the savepoint was taken.
+		// The layer's index DDL now adopts in place, leaving the savepoint chain intact.
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new IsolationModule({
+				underlying: new MemoryTableModule(),
+			});
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('DROP INDEX after a savepoint keeps rows staged before the savepoint', async () => {
+			await db.exec(`CREATE TABLE iso_spa (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`CREATE UNIQUE INDEX iso_spa_v ON iso_spa (v)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO iso_spa VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`DROP INDEX iso_spa_v`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM iso_spa ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'pre-savepoint row must survive').to.deep.equal([[1, 'a']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM iso_spa ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a']]);
+		});
+
+		it('CREATE UNIQUE INDEX after a savepoint keeps rows staged before the savepoint', async () => {
+			await db.exec(`CREATE TABLE iso_spb (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO iso_spb VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`CREATE UNIQUE INDEX iso_spb_v ON iso_spb (v)`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM iso_spb ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'pre-savepoint row must survive').to.deep.equal([[1, 'a']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM iso_spb ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a']]);
+		});
+
+		it('rollback to savepoint keeps pre-savepoint rows and discards post-savepoint ones across a DROP INDEX', async () => {
+			// Pins BOTH directions: the rebuild flattened the layer chain, so "staged before
+			// the savepoint" and "staged after it" became indistinguishable.
+			await db.exec(`CREATE TABLE iso_spc (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`CREATE UNIQUE INDEX iso_spc_v ON iso_spc (v)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO iso_spc VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO iso_spc VALUES (2, 'b')`);
+			await db.exec(`DROP INDEX iso_spc_v`);
+			await db.exec(`INSERT INTO iso_spc VALUES (3, 'c')`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM iso_spc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM iso_spc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a']]);
+		});
+
+		it('a staged tombstone survives DROP INDEX under a savepoint', async () => {
+			// The in-place adopt must not disturb tombstone rows either: a DELETE staged
+			// before the savepoint still lands at COMMIT.
+			await db.exec(`CREATE TABLE iso_spd (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO iso_spd VALUES (1, 'a'), (2, 'b')`);
+			await db.exec(`CREATE UNIQUE INDEX iso_spd_v ON iso_spd (v)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM iso_spd WHERE id = 1`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`DROP INDEX iso_spd_v`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM iso_spd ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[2, 'b']]);
+		});
+	});
+
 	describe('ALTER TABLE ADD COLUMN atomic pre-validation', () => {
 		// The isolation layer dry-runs every affected overlay's backfill BEFORE mutating
 		// the shared underlying, so a NOT NULL / tombstone rejection leaves the underlying

@@ -964,10 +964,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Runs one overlay's rebuild and installs the result, routing a CONSTRAINT failure by who
 	 * owns the overlay:
 	 *
-	 * - **The DDL-issuing connection.** Unreachable: the row source handed to the underlying
-	 *   (see {@link issuerEffectiveRows}) judged a superset of exactly these rows and accepted
-	 *   them, so a rejection here means validation and migration have drifted. Raise INTERNAL —
-	 *   loudly, because the alternative is the silent row loss this guard exists to end.
+	 * - **The DDL-issuing connection.** Unreachable — raise INTERNAL, see
+	 *   {@link issuerOverlayDriftError}.
 	 * - **A foreign connection.** Reachable and legitimate: its staged rows may violate a
 	 *   constraint another connection just declared. Poison that overlay and leave it
 	 *   unmigrated, so its owner errors on its next read/write/commit and rolls back. The
@@ -990,15 +988,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			rebuilt = await rebuild();
 		} catch (e) {
 			if (!(e instanceof QuereusError) || e.code !== StatusCode.CONSTRAINT) throw e;
-			if (isIssuer) {
-				throw new QuereusError(
-					`Isolation layer: rebuilding the issuing connection's overlay for '${schemaName}.${tableName}' after `
-					+ `${ddlDescription} raised: ${e.message}. That DDL's validation pass already judged a superset of these `
-					+ `rows and accepted them, so validation and migration have drifted.`,
-					StatusCode.INTERNAL,
-					e,
-				);
-			}
+			if (isIssuer) throw this.issuerOverlayDriftError(schemaName, tableName, ddlDescription, e);
 			// Poisoned: the OLD overlay stays installed under `key` (unmigrated, unreleased) so
 			// its owner errors and rolls back — do NOT release it here.
 			oldState.poison = { message: this.buildRebuildPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
@@ -1009,6 +999,31 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// HALF-built new overlay on their own throw path, so nothing is double-released.
 		this.connectionOverlays.set(key, rebuilt);
 		await this.releaseOverlayTable(oldState);
+	}
+
+	/**
+	 * The INTERNAL raised when the DDL-ISSUING connection's own overlay rejects the change the
+	 * DDL just made — whether adopted in place ({@link applyIndexChangeToOverlays}) or by
+	 * rebuild ({@link adoptRebuiltOverlay}).
+	 *
+	 * Unreachable by construction: the row source handed to the underlying (see
+	 * {@link issuerEffectiveRows}) judged a superset of exactly these rows and accepted them,
+	 * so a rejection here means validation and migration have drifted. Raise loudly — the
+	 * alternative is the silent row loss these guards exist to end.
+	 */
+	private issuerOverlayDriftError(
+		schemaName: string,
+		tableName: string,
+		ddlDescription: string,
+		cause: QuereusError,
+	): QuereusError {
+		return new QuereusError(
+			`Isolation layer: applying ${ddlDescription} to the issuing connection's overlay for `
+			+ `'${schemaName}.${tableName}' raised: ${cause.message}. That DDL's validation pass already judged a `
+			+ `superset of these rows and accepted them, so validation and migration have drifted.`,
+			StatusCode.INTERNAL,
+			cause,
+		);
 	}
 
 	/**
@@ -1107,9 +1122,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Creates an index on the underlying table, then rebuilds every per-connection overlay so
-	 * the new index (and, for a UNIQUE index, the constraint derived from it) is enforced for
-	 * the rest of each open transaction.
+	 * Creates an index on the underlying table, then hands the same index to every
+	 * per-connection overlay so it (and, for a UNIQUE index, the constraint derived from it)
+	 * is enforced for the rest of each open transaction.
 	 *
 	 * Two things the underlying cannot do for itself:
 	 *
@@ -1121,8 +1136,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * 2. **Enforce the new constraint.** An overlay built before the index knows nothing of it,
 	 *    and `IsolatedTable.findMergedUniqueConflict` only scans the underlying — so a pending
 	 *    row colliding with another pending row is nobody's job until the overlay itself carries
-	 *    the index. Hence the rebuild, which is also what gives a merged secondary-index scan
-	 *    later in the transaction an overlay that can serve it.
+	 *    the index. Forwarding is also what gives a merged secondary-index scan later in the
+	 *    transaction an overlay that can serve it.
 	 *
 	 * We use the stored table instance's createIndex() rather than the module-level method so
 	 * that the MemoryTable's local tableSchema property stays in sync. That property is what
@@ -1146,12 +1161,45 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		} else if (this.underlying.createIndex) {
 			await this.underlying.createIndex(db, schemaName, tableName, indexSchema, rowSource);
 		} else {
-			return; // underlying does not support indexes; nothing was created, nothing to rebuild
+			return; // underlying does not support indexes; nothing was created, nothing to forward
 		}
 		if (!state) return;
 
+		// Take the index back off the underlying's refreshed schema rather than reusing the
+		// caller's object: that is the canonical post-create form (resolved column indices,
+		// any normalization the underlying applied), and the overlay's copy is derived from it.
 		const updatedSchema = this.assertIndexPresent(state.underlyingTable, schemaName, tableName, indexSchema.name);
-		await this.rebuildOverlaysForIndexChange(db, schemaName, tableName, updatedSchema, `create index '${indexSchema.name}'`);
+		const created = updatedSchema.indexes!.find(idx => idx.name.toLowerCase() === indexSchema.name.toLowerCase())!;
+		await this.applyIndexChangeToOverlays(
+			db, schemaName, tableName, `create index '${indexSchema.name}'`,
+			overlayState => this.createOverlayIndex(overlayState, updatedSchema.name, created),
+		);
+	}
+
+	/**
+	 * Adds one index to an already-open overlay, in the overlay's own flavor (predicate
+	 * narrowed to live rows and rescoped onto the overlay's table name — see
+	 * {@link createOverlayIndexSchema}).
+	 *
+	 * A UNIQUE index the overlay's staged rows violate raises `CONSTRAINT` out of
+	 * `MemoryTableManager.createIndex`'s pre-validation pass, which
+	 * {@link applyIndexChangeToOverlays} routes to INTERNAL (issuer) or poison (foreign).
+	 * The pass runs before any mutation, so a rejected overlay is left exactly as it was.
+	 *
+	 * No-ops when the overlay module has no index support, or when the overlay already
+	 * carries an index of that name (an overlay built after the underlying's create already
+	 * copied it in through {@link createOverlaySchema}).
+	 */
+	private async createOverlayIndex(
+		overlayState: ConnectionOverlayState,
+		baseName: string,
+		indexSchema: IndexSchema,
+	): Promise<void> {
+		const overlayTable = overlayState.overlayTable;
+		const overlaySchema = overlayTable.tableSchema;
+		if (!overlayTable.createIndex || !overlaySchema) return;
+		if (this.schemaHasIndex(overlaySchema, indexSchema.name)) return;
+		await overlayTable.createIndex(this.createOverlayIndexSchema(indexSchema, baseName, overlaySchema.name));
 	}
 
 	/**
@@ -1171,7 +1219,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		indexName: string,
 	): TableSchema {
 		const updatedSchema = underlyingTable.tableSchema;
-		const present = updatedSchema?.indexes?.some(idx => idx.name.toLowerCase() === indexName.toLowerCase());
+		const present = updatedSchema && this.schemaHasIndex(updatedSchema, indexName);
 		if (!updatedSchema || !present) {
 			throw new QuereusError(
 				`Isolation layer: underlying table '${schemaName}.${tableName}' did not refresh its cached tableSchema after `
@@ -1183,26 +1231,20 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		return updatedSchema;
 	}
 
+	/** Case-insensitive "does `schema` declare an index named `indexName`". */
+	private schemaHasIndex(schema: TableSchema, indexName: string): boolean {
+		const lower = indexName.toLowerCase();
+		return schema.indexes?.some(idx => idx.name.toLowerCase() === lower) ?? false;
+	}
+
 	/**
-	 * Drops an index on the underlying table.
+	 * Drops an index on the underlying table, then drops it from every per-connection overlay.
 	 *
 	 * Mirrors createIndex: when the underlying VirtualTable exposes an
 	 * instance-level dropIndex (e.g. MemoryTable, which forwards to its manager
 	 * so MemoryTable.tableSchema stays fresh), prefer that. Otherwise fall back
 	 * to the module-level dropIndex (e.g. StoreModule, which refreshes the
 	 * StoreTable's cached tableSchema and tears down the index store).
-	 *
-	 * Any per-connection overlay that already exists for this table is
-	 * rebuilt under the post-drop schema, preserving staged rows. A bare
-	 * forward to `overlay.dropIndex` is insufficient: when the overlay's
-	 * MemoryTable has an active write `TransactionLayer`, its
-	 * `tableSchemaAtCreation` is frozen at layer-creation time, so the
-	 * synthesized UNIQUE constraint keeps firing inside the overlay's
-	 * own UC check on the next write even after the manager's schema is
-	 * refreshed. Rebuilding gives the new MemoryTable a fresh
-	 * transaction layer that captures the post-drop schema. Overlays
-	 * created AFTER this point inherit the post-drop schema from the
-	 * underlying at ensureOverlay time.
 	 */
 	async dropIndex(
 		db: Database,
@@ -1217,81 +1259,71 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			await this.underlying.dropIndex(db, schemaName, tableName, indexName);
 		}
 
-		// After the underlying drop, state.underlyingTable.tableSchema reflects the
-		// post-drop schema. Rebuild every affected overlay against that schema so
-		// the synthesized UC is fully gone from the overlay's transaction layer.
-		const updatedSchema = state?.underlyingTable.tableSchema;
-		if (!updatedSchema) return;
-
-		await this.rebuildOverlaysForIndexChange(db, schemaName, tableName, updatedSchema, `drop index '${indexName}'`);
+		await this.applyIndexChangeToOverlays(
+			db, schemaName, tableName, `drop index '${indexName}'`,
+			overlayState => this.dropOverlayIndex(overlayState, indexName),
+		);
 	}
 
 	/**
-	 * Rebuilds every non-poisoned per-connection overlay of one table under a schema whose
-	 * index / constraint set just changed (CREATE INDEX or DROP INDEX). Shared because the two
-	 * directions differ only in which structures the new schema carries — the column layout is
-	 * identical either way, so staged rows copy verbatim.
-	 *
-	 * A poisoned overlay (from a cross-connection ALTER, or a DROP TABLE) holds rows in the
-	 * pre-alter column layout, narrower/wider than `updatedSchema`. Rebuilding it would copy
-	 * layout-mismatched rows AND drop the poison flag (the new state carries none), silently
-	 * un-poisoning a connection that must still roll back. Leave it as-is.
+	 * Drops one index (and the UNIQUE constraint derived from it) from an already-open
+	 * overlay. No-ops when the overlay module has no index support, or when the overlay never
+	 * carried the index.
 	 */
-	private async rebuildOverlaysForIndexChange(
+	private async dropOverlayIndex(overlayState: ConnectionOverlayState, indexName: string): Promise<void> {
+		const overlayTable = overlayState.overlayTable;
+		const overlaySchema = overlayTable.tableSchema;
+		if (!overlayTable.dropIndex || !overlaySchema) return;
+		if (!this.schemaHasIndex(overlaySchema, indexName)) return;
+		await overlayTable.dropIndex(indexName);
+	}
+
+	/**
+	 * Applies an index change (CREATE INDEX or DROP INDEX) IN PLACE to every non-poisoned
+	 * per-connection overlay of one table.
+	 *
+	 * In place, not by rebuild. Both paths used to discard the overlay and copy its staged
+	 * rows into a fresh `MemoryTable`, which silently destroyed the overlay's savepoint chain:
+	 * the copy's first write lazily registers the new overlay's connection, and
+	 * `Database.registerConnection` replays `begin()` plus the whole active savepoint stack
+	 * BEFORE the copy runs — so every copied row landed ABOVE the replayed savepoint and the
+	 * next `rollback to savepoint` discarded rows staged long before that savepoint was taken
+	 * (`bug-isolation-index-ddl-rebuild-drops-savepoint-writes`).
+	 *
+	 * The rebuild was originally forced by a memory-module limitation — an open write
+	 * `TransactionLayer` froze its schema at creation, so a bare `overlay.dropIndex` left the
+	 * synthesized UNIQUE constraint firing inside the layer. `TransactionLayer.adoptSchema`
+	 * now has both an additive and a removal branch, and `MemoryTableManager` calls it for
+	 * both index directions, so an open layer adopts the change with its savepoint snapshots
+	 * intact.
+	 *
+	 * CONSTRAINT is routed by who owns the overlay, exactly as {@link adoptRebuiltOverlay}
+	 * does for ALTER: issuer → INTERNAL (its rows were already judged by the DDL's own
+	 * validation pass, so a rejection here means the two have drifted), foreign → poison and
+	 * leave the overlay untouched so its owner errors and rolls back.
+	 *
+	 * A poisoned overlay is skipped: it holds rows in a pre-ALTER column layout and its owner
+	 * must roll back regardless, so there is nothing to keep enforcing for it.
+	 */
+	private async applyIndexChangeToOverlays(
 		db: Database,
 		schemaName: string,
 		tableName: string,
-		updatedSchema: TableSchema,
 		ddlDescription: string,
+		apply: (overlayState: ConnectionOverlayState) => Promise<void>,
 	): Promise<void> {
 		const ownKey = this.makeConnectionOverlayKey(db, schemaName, tableName);
 		for (const key of this.connectionScopedKeys(this.connectionOverlays, schemaName, tableName)) {
 			const overlayState = this.connectionOverlays.get(key)!;
 			if (overlayState.poison) continue;
-			await this.adoptRebuiltOverlay(
-				key,
-				overlayState,
-				key === ownKey,
-				schemaName,
-				tableName,
-				ddlDescription,
-				() => this.rebuildOverlayForIndexChange(db, overlayState, updatedSchema),
-			);
-		}
-	}
-
-	/**
-	 * Rebuilds an overlay table under a post-CREATE/DROP-INDEX schema, preserving staged rows
-	 * (including tombstones). Column layout is unchanged by either, so rows copy verbatim — but
-	 * the new overlay's index/constraint set is not, so an insert here can legitimately raise
-	 * UNIQUE (a foreign connection staged two rows the new index forbids).
-	 */
-	private async rebuildOverlayForIndexChange(
-		db: Database,
-		oldState: ConnectionOverlayState,
-		updatedSchema: TableSchema,
-	): Promise<ConnectionOverlayState> {
-		const oldOverlay = oldState.overlayTable;
-
-		const newOverlaySchema = this.createOverlaySchema(updatedSchema);
-		const newOverlayTable = await this.overlayModule.create(db, newOverlaySchema);
-		const newState: ConnectionOverlayState = { overlayTable: newOverlayTable, hasChanges: oldState.hasChanges, db };
-
-		try {
-			if (oldState.hasChanges && oldOverlay.query) {
-				for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
-					await this.insertIntoRebuiltOverlay(newOverlayTable, oldRow as SqlValue[], updatedSchema.name);
-				}
+			try {
+				await apply(overlayState);
+			} catch (e) {
+				if (!(e instanceof QuereusError) || e.code !== StatusCode.CONSTRAINT) throw e;
+				if (key === ownKey) throw this.issuerOverlayDriftError(schemaName, tableName, ddlDescription, e);
+				overlayState.poison = { message: this.buildRebuildPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
 			}
-		} catch (e) {
-			// A mid-copy throw (e.g. a UNIQUE the new index forbids) abandons this freshly
-			// built overlay: adoptRebuiltOverlay keeps the OLD overlay installed on its throw
-			// path and never sees this handle, so free it here or it leaks.
-			await this.releaseOverlayTable(newState);
-			throw e;
 		}
-
-		return newState;
 	}
 
 	/**
@@ -2033,8 +2065,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Creates overlay schema from underlying schema.
 	 * Adds tombstone column and uses unique name to avoid conflicts.
 	 *
-	 * Called by IsolatedTable when lazily creating its overlay, and by the two overlay-rebuild
-	 * paths (`rebuildOverlayForIndexChange`, `migrateOverlayForAlter`).
+	 * Called by IsolatedTable when lazily creating its overlay, and by the ALTER TABLE overlay
+	 * migration (`migrateOverlayForAlter`). Index DDL no longer rebuilds — it adopts in place
+	 * through {@link createOverlayIndexSchema}, which this method shares.
 	 *
 	 * Every copied secondary index — and every copied UNIQUE constraint, including the ones
 	 * a UNIQUE index derives — is narrowed to a PARTIAL structure over live rows only
@@ -2072,27 +2105,49 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const overlayId = generateOverlayId();
 		const overlayName = `_overlay_${baseSchema.name}_${overlayId}`;
 
-		const liveOnly = this.liveRowPredicate();
-
-		// A partial-index / UNIQUE predicate copied from the base carries a self-qualifier
-		// bound to the base table's name (e.g. `where t.v > 0`). The overlay renames the table
-		// to `overlayName`, so that qualifier now names a DIFFERENT table than the overlay's
-		// MemoryIndex is scoped to — and `compilePredicate` rejects a foreign qualifier at
-		// index-build time (see partial-index-predicate table-qualifier rejection). Rescope the
-		// self-qualifier to the overlay name so it stays a self-reference. A foreign qualifier
-		// cannot occur here: `compilePredicate` already rejected one when the base index/UNIQUE
-		// was created, so every qualifier present is the base name.
-		const rescope = (p: Predicate | undefined): Predicate | undefined =>
-			p ? rescopePredicateQualifier(p, baseSchema.name, overlayName) : undefined;
-
 		return {
 			...baseSchema,
 			name: overlayName,
 			columns: newColumns,
 			columnIndexMap: newColumnIndexMap,
-			indexes: baseSchema.indexes?.map(idx => ({ ...idx, predicate: andPredicate(rescope(idx.predicate), liveOnly) })),
-			uniqueConstraints: baseSchema.uniqueConstraints?.map(uc => ({ ...uc, predicate: andPredicate(rescope(uc.predicate), liveOnly) })),
+			indexes: baseSchema.indexes?.map(idx => this.createOverlayIndexSchema(idx, baseSchema.name, overlayName)),
+			uniqueConstraints: baseSchema.uniqueConstraints?.map(uc => ({
+				...uc,
+				predicate: this.overlayPredicate(uc.predicate, baseSchema.name, overlayName),
+			})),
 		};
+	}
+
+	/**
+	 * The overlay-flavored form of one base `IndexSchema`: same name and columns, predicate
+	 * narrowed to live rows and rescoped onto the overlay's table name (see
+	 * {@link overlayPredicate}).
+	 *
+	 * Shared by {@link createOverlaySchema}, which maps the whole index set when an overlay is
+	 * first created, and {@link createIndex}, which hands a single index to an overlay that is
+	 * already open — so both produce structurally identical entries, and the UNIQUE constraint
+	 * `MemoryTableManager.createIndex` synthesizes from a unique index inherits the same
+	 * predicate either way.
+	 */
+	private createOverlayIndexSchema(idx: IndexSchema, baseName: string, overlayName: string): IndexSchema {
+		return { ...idx, predicate: this.overlayPredicate(idx.predicate, baseName, overlayName) };
+	}
+
+	/**
+	 * `<base predicate, rescoped to the overlay> AND <tombstone> = 0`.
+	 *
+	 * A partial-index / UNIQUE predicate copied from the base carries a self-qualifier bound to
+	 * the base table's name (e.g. `where t.v > 0`). The overlay renames the table to
+	 * `overlayName`, so that qualifier now names a DIFFERENT table than the overlay's
+	 * MemoryIndex is scoped to — and `compilePredicate` rejects a foreign qualifier at
+	 * index-build time (see partial-index-predicate table-qualifier rejection). Rescope the
+	 * self-qualifier to the overlay name so it stays a self-reference. A foreign qualifier
+	 * cannot occur here: `compilePredicate` already rejected one when the base index/UNIQUE
+	 * was created, so every qualifier present is the base name.
+	 */
+	private overlayPredicate(base: Predicate | undefined, baseName: string, overlayName: string): Predicate {
+		const rescoped = base ? rescopePredicateQualifier(base, baseName, overlayName) : undefined;
+		return andPredicate(rescoped, this.liveRowPredicate());
 	}
 
 	/**
