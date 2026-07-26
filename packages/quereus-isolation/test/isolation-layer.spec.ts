@@ -2048,11 +2048,10 @@ describe('IsolationModule', () => {
 		// overlay's own `alterSchema`, `set not null` as a live-row backfill via ordinary
 		// overlay writes, and `add constraint … unique` as a tombstone-narrowed unique index.
 		//
-		// The `set not null` / `set default` / `rename constraint` savepoint shapes live HERE
-		// rather than in the cross-backend 41.8 sqllogic file: the memory-NATIVE leg of those
-		// shapes loses the transaction's staged rows (metadata-only ALTER arms skip
-		// adopt-on-open-layers — see tickets/.pre-existing-error.md), while on this leg the
-		// staged rows live in the isolation overlay, which those arms never disturb.
+		// The `set not null` / `set default` / `rename constraint` savepoint shapes are covered
+		// cross-backend in 41.8-alter-savepoint-staged-rows.sqllogic too; these keep the
+		// isolation-specific leg, where the staged rows live in the overlay rather than in the
+		// memory module's own transaction layers.
 		let isolatedModule: IsolationModule;
 
 		beforeEach(() => {

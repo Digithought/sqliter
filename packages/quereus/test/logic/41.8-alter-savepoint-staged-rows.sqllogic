@@ -151,14 +151,40 @@ select id, v, w from t4 order by id;
 drop table t4;
 -- run
 
--- NOTE: a `set not null` that needs NO backfill (and likewise `set default` and
--- `rename constraint`) is metadata-only in the memory module, whose ALTER COLUMN /
--- RENAME CONSTRAINT arms skip `adoptSchemaOnOpenLayers` for such changes — a
--- `rollback to savepoint` taken across one then loses the transaction's staged rows on
--- the memory-NATIVE leg (see tickets/.pre-existing-error.md). Those savepoint blocks
--- live in packages/quereus-isolation/test/isolation-layer.spec.ts (where the staged
--- rows live in the isolation overlay, which is unaffected) until the memory fix lands;
--- this file keeps the flavors both backends pass.
+-- ALTER COLUMN SET NOT NULL that needs NO backfill: metadata-only, so it moves nothing an
+-- open layer derives — but the layers still have to ADOPT the new schema OBJECT, or the
+-- savepoint snapshot a `rollback to savepoint` swaps in keeps its frozen pre-ALTER schema,
+-- fails `commitTransaction`'s snapshot-wrap identity check, and the staged rows are dropped
+-- at COMMIT.
+create table t5 (id integer primary key, v text null);
+-- run
+
+begin;
+-- run
+insert into t5 values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t5 values (2, 'b');
+-- run
+alter table t5 alter column v set not null;
+-- run
+insert into t5 values (3, 'c');
+-- run
+rollback to savepoint s;
+-- run
+
+select id, v from t5 order by id;
+→ [{"id":1,"v":"a"}]
+
+commit;
+-- run
+
+select id, v from t5 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table t5;
+-- run
 
 -- ALTER COLUMN SET NOT NULL, the DEFAULT-backfill flavor: a staged NULL is filled at the ALTER, and the
 -- filled row (staged before the later savepoint) survives that savepoint's rollback.
@@ -315,9 +341,37 @@ select count(*) as c from t9 where v = 'dup';
 drop table t9;
 -- run
 
--- RENAME CONSTRAINT with a savepoint across it lives in isolation-layer.spec.ts for
--- now — the memory-native leg loses the staged rows (see the NOTE above t5b). The
--- no-savepoint rename flavor both backends pass:
+-- RENAME CONSTRAINT: schema-only, but the renamed UNIQUE's implicit covering index moves
+-- under a new key in every open layer's index map, and the layers must re-freeze the new
+-- schema so a savepoint snapshot restored across the rename still commits its staged rows.
+create table t10s (id integer primary key, v text, constraint u_old unique (v));
+-- run
+
+begin;
+-- run
+insert into t10s values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t10s values (2, 'b');
+-- run
+alter table t10s rename constraint u_old to u_new;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from t10s order by id;
+→ [{"id":1,"v":"a"}]
+
+insert into t10s values (3, 'a');
+-- error: UNIQUE
+
+drop table t10s;
+-- run
+
+-- ...and the same rename with no savepoint across it:
 create table t10 (id integer primary key, v text, constraint u_old unique (v));
 -- run
 

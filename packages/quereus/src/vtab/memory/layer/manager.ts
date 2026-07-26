@@ -2568,16 +2568,21 @@ export class MemoryTableManager {
 				this.convertColumnOnOpenLayers(finalNewTableSchema, colIndex, valueConvert, convertNulls);
 			} else if (structuresRekeyed) {
 				this.adoptSchemaOnOpenLayers(finalNewTableSchema, pkColumnRekeyed);
+			} else {
+				// The remaining changes (SET DEFAULT, DROP NOT NULL, a SET NOT NULL that needed no
+				// backfill, a retype between aliases of one logical type) touch nothing a layer
+				// DERIVES — its index set, its `uniqueConstraints` enforcement and its MemoryIndex
+				// comparators all stay put, and DEFAULT application / NOT NULL enforcement happen
+				// above the module, off the catalog schema. But the frozen schema OBJECT is itself
+				// observable: `commitTransaction` only wraps a swapped-in savepoint snapshot back
+				// into the committed chain when `readLayer.getSchema() === this.tableSchema`. Left
+				// stale, a `rollback to savepoint` taken across one of these ALTERs restores a
+				// snapshot the wrap then skips, and the transaction's staged rows are silently
+				// dropped at COMMIT. Adoption is cheap here — every IndexSchema object is carried
+				// over unchanged, so `adoptSchema` keeps each layer's MemoryIndex and only swaps
+				// the schema reference.
+				this.adoptSchemaOnOpenLayers(finalNewTableSchema);
 			}
-			// NOTE: the remaining changes (SET DEFAULT, DROP NOT NULL, a SET NOT NULL that needed no
-			// backfill, a retype between aliases of one logical type) fall through with the open layers
-			// still holding their creation-time schema. Verified not observable today: a layer's
-			// frozen schema drives only its index set, its `uniqueConstraints` enforcement and its
-			// MemoryIndex comparators, none of which these changes touch — DEFAULT application and
-			// NOT NULL enforcement happen above the module, off the catalog schema (probed inside a
-			// transaction with a pending layer: both behave correctly). If a layer ever starts
-			// reading per-column metadata beyond collation and logical type, this fall-through has to
-			// call `adoptSchemaOnOpenLayers(finalNewTableSchema)` unconditionally.
 
 			this.eventEmitter?.emitSchemaChange?.({
 				type: 'alter',
@@ -2894,6 +2899,14 @@ export class MemoryTableManager {
 			if (renamedIndex) this.baseLayer.rebuildAllSecondaryIndexes();
 			this.tableSchema = newSchema;
 			this.initializePrimaryKeyFunctions();
+			// Hand the new schema to the DDL transaction's own frozen layers, as `dropConstraint`
+			// does: a renamed covering index has to move under its new key in each layer's index
+			// map (the old key is dropped, the new one rebuilt over the parent's already-renamed
+			// tree — hence oldest-first), and even the pure schema-only classes (CHECK / FK) must
+			// re-freeze the new schema OBJECT, or `commitTransaction`'s snapshot-wrap identity
+			// check (`readLayer.getSchema() === this.tableSchema`) skips a savepoint snapshot
+			// restored across this ALTER and drops the transaction's staged rows at COMMIT.
+			this.adoptSchemaOnOpenLayers(newSchema);
 
 			this.eventEmitter?.emitSchemaChange?.({
 				type: 'alter',
