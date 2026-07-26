@@ -24,7 +24,13 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, asyncIterableToArray, type SqlValue } from '@quereus/quereus';
-import { StoreModule, InMemoryKVStore, createIsolatedStoreModule, type KVStoreProvider } from '../src/index.js';
+import {
+	StoreModule,
+	InMemoryKVStore,
+	createIsolatedStoreModule,
+	buildMaterializedViewCatalogKey,
+	type KVStoreProvider,
+} from '../src/index.js';
 
 /** Lone high surrogate — no low surrogate follows. */
 const LONE_HIGH = '\uD800';
@@ -83,14 +89,28 @@ async function rejects(db: Database, sql: string): Promise<void> {
 		.to.not.match(/unique/i);
 }
 
+/** The DDL text persisted under `key`, or undefined when no entry exists. */
+async function catalogDDL(provider: KVStoreProvider, key: Uint8Array): Promise<string | undefined> {
+	const bytes = await (await provider.getCatalogStore()).get(key);
+	return bytes === undefined ? undefined : new TextDecoder().decode(bytes);
+}
+
+/** Whether a maintained table's row-time maintenance was released (`stale`). */
+function isStale(db: Database, name: string): boolean {
+	const mv = db.schemaManager.getTable('main', name) as { derivation?: { stale?: boolean } } | undefined;
+	return mv?.derivation?.stale === true;
+}
+
 describe('Lone surrogates are refused by the store and accepted in memory', () => {
 	let db: Database;
 	let provider: KVStoreProvider;
+	let storeModule: StoreModule;
 
 	beforeEach(() => {
 		db = new Database();
 		provider = createInMemoryProvider();
-		db.registerModule('store', new StoreModule(provider));
+		storeModule = new StoreModule(provider);
+		db.registerModule('store', storeModule);
 	});
 
 	afterEach(async () => {
@@ -425,6 +445,196 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			} finally {
 				await isoProvider.closeAll();
 				await iso.close();
+			}
+		});
+	});
+
+	describe('a RENAME that would make a persisted view or materialized view unwritable', () => {
+		// The CREATE-side veto left the RENAME paths uncovered. `alter table … rename to` and
+		// `alter table … rename column` rewrite the new name into every dependent view / MV
+		// body and re-persist them; renaming a materialized view additionally MOVES its own
+		// catalog entry. All of that rides `SchemaChangeNotifier` (try/catch per listener,
+		// log only) and then the store's async persist queue (`.catch`-log), so nothing there
+		// can fail the statement. Before the fix each of these renames REPORTED SUCCESS and:
+		//   - deleted the MV's catalog entry outright (the MV answered queries all session and
+		//     was simply absent after reopen);
+		//   - or left the persisted view/MV entry holding the OLD text while the live body
+		//     carried the new one — live and durable definitions silently diverged;
+		//   - or, for a store-backed dependent MV, threw mid-propagation into
+		//     `failMaterializedViewRenamePropagation`, leaving the MV permanently stale with a
+		//     body naming a column that no longer existed — and no `console.warn` at all.
+		//
+		// The fix is a pre-flight dependent scan that runs BEFORE the first side effect of
+		// either rename arm: each dependent body is rewritten on a spine CLONE, and the
+		// prospective object goes through the same `assertCatalogObjectPersistable` veto the
+		// CREATE paths use. A refusal therefore leaves the catalog and all physical storage
+		// untouched — the same clean-no-op guarantee CREATE gives.
+
+		beforeEach(async () => {
+			// A store table so the module is subscribed (and so the veto is live), plus a
+			// MEMORY table to rename: the store's own physical-store-name guard would
+			// otherwise fire first and hide whether the pre-flight works at all.
+			await db.exec(`create table st (id integer primary key, v integer) using store`);
+			await db.exec(`insert into st values (1, 10)`);
+			await db.exec(`create table m (id integer primary key, x integer)`);
+			await db.exec(`insert into m values (1, 100)`);
+		});
+
+		it('refuses to rename a memory-backed materialized view into a lone surrogate, keeping its catalog entry', async () => {
+			// Case A — the loudest loss: the rename fired `materialized_view_removed` for the
+			// old name and `materialized_view_added` for the unwritable new one, so the store
+			// DELETED the entry and wrote nothing back. Assert the durable entry, not just the
+			// in-memory record: the bug was invisible until reopen.
+			await db.exec(`create materialized view mv as select id, x from m`);
+			await storeModule.whenCatalogPersisted();
+
+			await rejects(db, `alter table mv rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'mv'), 'the MV must survive under its own name')
+				.to.not.be.undefined;
+			expect(db.schemaManager.getTable('main', LONE_HIGH), 'nothing may be registered under the new name')
+				.to.be.undefined;
+			expect(await column(db, `select x from mv`, 'x')).to.deep.equal([100]);
+			await storeModule.whenCatalogPersisted();
+			expect(await catalogDDL(provider, buildMaterializedViewCatalogKey('main', 'mv')),
+				'the MV catalog entry must still be there').to.not.be.undefined;
+		});
+
+		it('refuses to rename a memory table that a persisted view reads, leaving the view body intact', async () => {
+			// Case B. The live view body was rewritten to name the new table while the persisted
+			// entry kept the old text. Querying the view is the load-bearing assertion: had the
+			// pre-flight leaked its rewrite onto the LIVE AST, this would fail to resolve.
+			await db.exec(`create view vm as select id, x from m`);
+
+			await rejects(db, `alter table m rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm'), 'the table keeps its name').to.not.be.undefined;
+			expect(db.schemaManager.getTable('main', LONE_HIGH)).to.be.undefined;
+			expect(await column(db, `select x from vm`, 'x'), 'the view body still names m').to.deep.equal([100]);
+		});
+
+		it('refuses to rename a COLUMN of a memory table that a persisted view reads', async () => {
+			await db.exec(`create view vm as select id, x from m`);
+
+			await rejects(db, `alter table m rename column x to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm')?.columnIndexMap.has('x'),
+				'the column keeps its name').to.be.true;
+			expect(await column(db, `select x from vm`, 'x'), 'the view body still names x').to.deep.equal([100]);
+		});
+
+		it('refuses a table rename a dependent memory-backed materialized view could not persist', async () => {
+			// Case F: the MV's own catalog entry diverged exactly as the plain view's did.
+			await db.exec(`create materialized view mvm as select id, x from m`);
+
+			await rejects(db, `alter table m rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm')).to.not.be.undefined;
+			expect(await column(db, `select x from mvm`, 'x')).to.deep.equal([100]);
+			expect(isStale(db, 'mvm'), 'the MV must not be left stale').to.be.false;
+		});
+
+		it('refuses a table rename a dependent STORE-backed materialized view could not persist', async () => {
+			// Case G — the quietest one. The propagation got as far as renaming the MV's
+			// backing column, threw inside the store, and `failMaterializedViewRenamePropagation`
+			// swallowed it: the MV was left permanently stale with a body naming a vanished
+			// table, reported only on the debug log channel.
+			await db.exec(`create materialized view mvs using store as select id, x from m`);
+
+			await rejects(db, `alter table m rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm')).to.not.be.undefined;
+			expect(await column(db, `select x from mvs`, 'x')).to.deep.equal([100]);
+			expect(isStale(db, 'mvs'), 'the MV must not be left stale').to.be.false;
+		});
+
+		it('refuses a column rename a dependent memory-backed materialized view could not persist', async () => {
+			await db.exec(`create materialized view mvm as select id, x from m`);
+
+			await rejects(db, `alter table m rename column x to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm')?.columnIndexMap.has('x')).to.be.true;
+			expect(await column(db, `select x from mvm`, 'x')).to.deep.equal([100]);
+			expect(isStale(db, 'mvm'), 'the MV must not be left stale').to.be.false;
+		});
+
+		it('refuses a column rename a dependent STORE-backed materialized view could not persist', async () => {
+			await db.exec(`create materialized view mvs using store as select id, x from m`);
+
+			await rejects(db, `alter table m rename column x to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm')?.columnIndexMap.has('x')).to.be.true;
+			expect(await column(db, `select x from mvs`, 'x')).to.deep.equal([100]);
+			expect(isStale(db, 'mvs'), 'the MV must not be left stale').to.be.false;
+		});
+
+		// ── Regression pins: already-loud paths must STAY loud and stay clean no-ops ──
+		//
+		// The store's physical store-name / DDL-text guard already refused these. The
+		// pre-flight now runs ahead of it whenever the object HAS a dependent, so for those
+		// the reported message shifts from `cannot store the identifier …` to `cannot store
+		// persisted schema text …`. Both name an unpaired surrogate and both leave a clean
+		// no-op, so `rejects()` asserts on the shared substance rather than exact wording.
+
+		it('keeps rejecting a store-backed table rename into a lone surrogate', async () => {
+			await rejects(db, `alter table st rename to "${LONE_HIGH}"`);
+			expect(db.schemaManager.getTable('main', 'st'), 'the table survives').to.not.be.undefined;
+			expect(await column(db, `select v from st`, 'v')).to.deep.equal([10]);
+		});
+
+		it('keeps rejecting a store-backed table rename into a lone surrogate with a view over it', async () => {
+			await db.exec(`create view vs as select id, v from st`);
+			await rejects(db, `alter table st rename to "${LONE_HIGH}"`);
+			expect(await column(db, `select v from vs`, 'v')).to.deep.equal([10]);
+		});
+
+		it('keeps rejecting a store-backed table COLUMN rename into a lone surrogate', async () => {
+			await rejects(db, `alter table st rename column v to "${LONE_HIGH}"`);
+			expect(db.schemaManager.getTable('main', 'st')?.columnIndexMap.has('v')).to.be.true;
+			expect(await column(db, `select v from st`, 'v')).to.deep.equal([10]);
+		});
+
+		it('keeps rejecting a store-backed materialized-view rename into a lone surrogate', async () => {
+			await db.exec(`create materialized view mvs using store as select id, v from st`);
+			await rejects(db, `alter table mvs rename to "${LONE_HIGH}"`);
+			expect(db.schemaManager.getTable('main', 'mvs'), 'the MV survives').to.not.be.undefined;
+			expect(await column(db, `select v from mvs`, 'v')).to.deep.equal([10]);
+		});
+
+		it('still accepts a well-formed astral rename of a table and a column', async () => {
+			// The guard must not over-reject: an astral character is a PAIRED surrogate and
+			// encodes fine. Both dependent kinds are present so the pre-flight actually renders
+			// a prospective view AND a prospective MV before letting the rename through.
+			await db.exec(`create view vm as select id, x from m`);
+			await db.exec(`create materialized view mvm as select id, x from m`);
+
+			await db.exec(`alter table m rename to "${ASTRAL}"`);
+			expect(await column(db, `select x from vm`, 'x')).to.deep.equal([100]);
+			expect(await column(db, `select x from mvm`, 'x')).to.deep.equal([100]);
+
+			await db.exec(`alter table "${ASTRAL}" rename column x to "${ASTRAL}"`);
+			expect(await column(db, `select "${ASTRAL}" from vm`, ASTRAL)).to.deep.equal([100]);
+		});
+
+		it('a database with no store module registered keeps accepting all of it', async () => {
+			// Same deliberate divergence as the CREATE side: nothing is persisted, so nothing
+			// can be lost. Only a module that would have to write the entry gets a veto.
+			const mem = new Database();
+			try {
+				await mem.exec(`create table m (id integer primary key, x integer)`);
+				await mem.exec(`insert into m values (1, 100)`);
+				await mem.exec(`create view vm as select id, x from m`);
+				await mem.exec(`create materialized view mvm as select id, x from m`);
+
+				await mem.exec(`alter table mvm rename to "${LONE_LOW}"`);
+				await mem.exec(`alter table m rename column x to "${LONE_HIGH}"`);
+				await mem.exec(`alter table m rename to "${LONE_HIGH_2}"`);
+
+				expect(mem.schemaManager.getTable('main', LONE_LOW)).to.not.be.undefined;
+				expect(mem.schemaManager.getTable('main', LONE_HIGH_2)).to.not.be.undefined;
+				expect(mem.schemaManager.getView('main', 'vm')).to.not.be.undefined;
+			} finally {
+				await mem.close();
 			}
 		});
 	});

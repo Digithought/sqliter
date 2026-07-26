@@ -15,6 +15,8 @@ import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
 import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
+import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
+import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
@@ -193,6 +195,22 @@ async function runRenameTable(
 		throw new QuereusError(`Table '${newName}' already exists`, StatusCode.ERROR);
 	}
 
+	// Pre-flight, BEFORE the first side effect (`module.renameTable`): every catalog
+	// entry this rename would rewrite must still be persistable. Both the rename
+	// propagation and the store's catalog write are unfailable (notifier try/catch,
+	// then an async persist queue), so without this the statement reports success and
+	// the dependent silently diverges from — or vanishes from — the durable catalog.
+	if (isMaintainedTable(tableSchema)) {
+		// The renamed table is itself a materialized view: its own catalog entry moves
+		// (`materialized_view_removed` old → `materialized_view_added` new), so vet the
+		// prospective record's new KEY and DDL text. The self-reference rewrite
+		// `rewriteTableForTableRename` performs is not applied to the probe — it only
+		// substitutes `newName`, which is already under test as the record's own name.
+		assertCatalogObjectPersistable(rctx.db, 'materializedView', { ...tableSchema, name: newName });
+	}
+	assertRenameDependentsPersistable(rctx.db, schema,
+		ast => renameTableInAst(ast, oldName, newName, tableSchema.schemaName));
+
 	// Clone schema with new name
 	const updatedTableSchema: TableSchema = {
 		...tableSchema,
@@ -294,6 +312,17 @@ async function runRenameColumn(
 		throw new QuereusError(`Column '${newName}' already exists in table '${tableSchema.name}'`, StatusCode.ERROR);
 	}
 
+	// Pre-flight, BEFORE the first side effect (`module.alterTable`): the rewritten
+	// body of every dependent view / materialized view must still be persistable —
+	// same unfailable-propagation reasoning as the table-rename arm above. Uses the
+	// very resolver `propagateColumnRename` will build, so the probe computes exactly
+	// the rewrite the real pass computes. Safe to evaluate pre-mutation:
+	// `isTableInUnaliasedScope` skips the renamed table itself and probes only OTHER
+	// sources, whose column sets this rename does not touch.
+	const resolveColumnInSource = buildColumnSourceResolver(rctx.db);
+	assertRenameDependentsPersistable(rctx.db, schema, ast => renameColumnInAst(
+		ast, tableSchema.name, oldName, newName, tableSchema.schemaName, resolveColumnInSource));
+
 	const existingCol = tableSchema.columns[colIndex];
 
 	// Build a ColumnDef AST for the renamed column (preserving type info)
@@ -356,7 +385,7 @@ async function runRenameColumn(
 
 	// Propagate the rename into dependent objects (CHECK / FK / partial-index
 	// predicates in this and other tables, view and materialized-view bodies).
-	await propagateColumnRename(rctx, tableSchema.schemaName, tableSchema.name, oldName, newName, preStaleMvs);
+	await propagateColumnRename(rctx, tableSchema.schemaName, tableSchema.name, oldName, newName, preStaleMvs, resolveColumnInSource);
 
 	log('Renamed column %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
 	return null;
@@ -1827,6 +1856,20 @@ function rewriteTableForTableRename(
 	});
 }
 
+/**
+ * The catalog-backed {@link ResolveColumnInSource} the column-rename rewriters consult
+ * to keep their unqualified-reference walk scope-aware. Built once per statement and
+ * shared by the pre-flight probe in {@link runRenameColumn} and the real propagation
+ * below, so the rewrite the probe computes is the rewrite that later lands.
+ */
+function buildColumnSourceResolver(db: Database): ResolveColumnInSource {
+	return (s, t, col) => {
+		const targetSchema = db.schemaManager.getSchema(s);
+		const targetTable = targetSchema?.getTable(t);
+		return targetTable?.columnIndexMap.has(col.toLowerCase()) ?? false;
+	};
+}
+
 async function propagateColumnRename(
 	rctx: RuntimeContext,
 	renamedSchemaName: string,
@@ -1834,13 +1877,9 @@ async function propagateColumnRename(
 	oldCol: string,
 	newCol: string,
 	preStaleMvs: ReadonlySet<string>,
+	resolveColumnInSource: ResolveColumnInSource,
 ): Promise<void> {
 	const schemaManager = rctx.db.schemaManager;
-	const resolveColumnInSource: import('../../schema/rename-rewriter.js').ResolveColumnInSource = (s, t, col) => {
-		const targetSchema = schemaManager.getSchema(s);
-		const targetTable = targetSchema?.getTable(t);
-		return targetTable?.columnIndexMap.has(col.toLowerCase()) ?? false;
-	};
 	for (const schema of schemaManager._getAllSchemas()) {
 		await propagateColumnRenameInSchema(rctx.db, schema, renamedSchemaName, tableName, oldCol, newCol, resolveColumnInSource, preStaleMvs);
 	}
@@ -1858,7 +1897,7 @@ async function propagateColumnRenameInSchema(
 	tableName: string,
 	oldCol: string,
 	newCol: string,
-	resolveColumnInSource: import('../../schema/rename-rewriter.js').ResolveColumnInSource,
+	resolveColumnInSource: ResolveColumnInSource,
 	preStaleMvs: ReadonlySet<string>,
 ): Promise<void> {
 	const notifier = db.schemaManager.getChangeNotifier();
@@ -1921,7 +1960,7 @@ function rewriteTableForColumnRename(
 	tableName: string,
 	oldCol: string,
 	newCol: string,
-	resolveColumnInSource: import('../../schema/rename-rewriter.js').ResolveColumnInSource,
+	resolveColumnInSource: ResolveColumnInSource,
 ): TableSchema {
 	const oldColLower = oldCol.toLowerCase();
 	const tableLower = tableName.toLowerCase();

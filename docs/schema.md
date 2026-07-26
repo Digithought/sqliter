@@ -615,16 +615,46 @@ unpaired UTF-16 surrogate, which `TextEncoder` folds to U+FFFD (see
 `packages/quereus-store/src/common/encoding.ts`). A wrapper module (e.g. the isolation
 layer) must forward the hook or the wrapped module never gets its veto.
 
-Those four call sites are the whole of the coverage, and the gap is the ALTER paths that
-rewrite a view/MV **indirectly**: `alter table … rename to` / `rename column` propagates the
-new name into every dependent view and materialized-view body and fires `view_modified` /
-`materialized_view_modified`, and renaming a materialized view moves its catalog entry
+**The RENAME arms get the same veto, through a pre-flight dependent scan.**
+`alter table … rename to` / `rename column` rewrites the new name into every dependent
+view and materialized-view body and fires `view_modified` / `materialized_view_modified`,
+and renaming a materialized view additionally moves its own catalog entry
 (`materialized_view_removed` old → `materialized_view_added` new). Those re-persists are
-still fire-and-forget, so a rename that introduces text the store cannot encode still drops
-the dependent object silently — and the MV-rename case deletes the old entry first, so the
-object is lost outright. A store-BACKED table is incidentally protected (its physical
-store-name guard refuses the rename first); a memory table or memory-backed MV is not.
-Tracked as `bug-store-rename-into-lone-surrogate-drops-dependent-view-or-mv`.
+fire-and-forget like every other, so both arms run `assertRenameDependentsPersistable`
+(same file) BEFORE their first side effect — `module.renameTable` for the table arm,
+`module.alterTable` for the column arm:
+
+- Every view and every maintained table in the renamed object's **own schema** (the same
+  scope the propagation's own loops use) has its body rewritten on a **spine clone** —
+  `spineCloneAst` in `src/util/ast-spine-clone.ts`, a plain-object/array deep copy that
+  passes every other value through by reference. The rewriters mutate in place, so a veto
+  thrown after mutating the live AST would strand a body naming a table that was never
+  renamed; `structuredClone` is not an option, because `LiteralExpr.value` may hold a
+  Promise. A body the rewrite does not touch renders identically to what is already
+  persisted, so it is skipped.
+- Both DDL generators read the AST rather than a cached string, so the prospective object
+  is just the record with the clone swapped in.
+- Renaming a maintained table additionally vets the prospective record
+  `{ …, name: newName }` directly — that checks the new catalog **key** as well as the new
+  DDL text, and it runs long before the `materialized_view_removed` that would otherwise
+  delete the old entry.
+- The column arm threads the very `ResolveColumnInSource` the real propagation builds, so
+  the probe computes the rewrite that later lands. Evaluating it pre-mutation is sound: the
+  resolver is only ever asked about sources *other* than the renamed table, whose column
+  sets the rename does not touch.
+
+Ordering note: for a **store-backed** table with a dependent view the pre-flight now fires
+ahead of the store's physical store-name guard, so the reported message changes from
+`cannot store the identifier …` to `cannot store persisted schema text …`. Both name the
+unpaired surrogate and both leave a clean no-op.
+
+Two things stay uncovered. A `select *` materialized view's persisted backing **column
+list** shifts under a column rename with no AST change at all, so the scan cannot see it
+(and no persist event fires) — harmless today because reopen re-derives an implicit MV's
+shape from its body; see the `NOTE:` on `restoreUnaffectedMaterializedViews` in
+`runtime/emit/materialized-view-helpers.ts`. And a store module that has not yet subscribed
+to a database never vetoes at all —
+`bug-store-untouched-table-and-early-view-never-persisted`.
 
 **Rehydrate phasing.** `rehydrateCatalog` first consumes the clean-shutdown
 marker (the reserved `\x00meta\x00clean_shutdown` catalog entry `closeAll` writes

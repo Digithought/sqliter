@@ -2920,6 +2920,17 @@ async function restoreMaterializedViewLive(
  * output name fails shape derivation and stays stale (staleness-diagnostic parity
  * with a broken plain-view chain). Best-effort like the rest of the propagation:
  * a per-MV failure logs, leaves that MV stale, and continues.
+ *
+ * NOTE: firing no `materialized_view_modified` is deliberate, but
+ * {@link renameShiftedBackingColumns} (run from the shared restore tail) DOES change the
+ * backing column names — and those names ARE part of the persisted DDL
+ * (`generateMaintainedTableDDL` renders the declared column list). So a `select *`
+ * materialized view's persisted column list goes stale after any source column rename,
+ * clean or not; the rename pre-flight in `schema/catalog-persistability.ts` cannot see it
+ * either, because the body AST never changes. Harmless today: reopen re-derives an
+ * IMPLICIT MV's shape from its body and reshapes (verified — persisted `("id","x")` with
+ * body `select * from m` rehydrates as `("id","y")` with no error). If implicit MVs ever
+ * stop reshaping on import, this becomes real durable drift and this pass needs an event.
  */
 export async function restoreUnaffectedMaterializedViews(
 	db: Database,

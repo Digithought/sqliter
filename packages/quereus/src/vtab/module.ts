@@ -555,10 +555,18 @@ export interface VirtualTableModule<
 	 * no-op. Synchronous by contract: the check must be a pure function of the schema
 	 * (no IO). Omit ⇒ never consulted (today's behavior).
 	 *
-	 * Coverage is the CREATE / SET TAGS paths only. An ALTER that rewrites a view or MV
-	 * indirectly — a table or column rename propagated into a body, or renaming the MV
-	 * itself — still persists fire-and-forget and can still drop the object silently;
-	 * see `bug-store-rename-into-lone-surrogate-drops-dependent-view-or-mv`.
+	 * Call sites, each ahead of its statement's first side effect: `emitCreateView`
+	 * (before `schema.addView`); `materializeView` (inside its existing rollback arm — an
+	 * MV's DDL text does not exist until the derivation is attached); the two view/MV SET
+	 * TAGS paths in `SchemaManager` (tags ride the persisted DDL); and both ALTER RENAME
+	 * arms in `runtime/emit/alter-table.ts`, which reach this through
+	 * `assertRenameDependentsPersistable` — the pre-flight scan that offers the
+	 * PROSPECTIVE (rewritten-on-a-clone) body of every dependent view / materialized view,
+	 * plus, for a renamed materialized view, its own prospective record under the new name.
+	 *
+	 * Not covered: a `select *` materialized view's persisted backing COLUMN LIST shifts
+	 * under a column rename with no AST change and no persist event, so nothing asks here
+	 * (see the `NOTE:` on `restoreUnaffectedMaterializedViews`).
 	 */
 	assertCatalogObjectPersistable?(
 		db: Database,

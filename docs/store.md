@@ -652,9 +652,19 @@ throw lands inside the persist queue, where it can only be logged, so the defini
 create "successfully" and be gone after reopen. `StoreModule.assertCatalogObjectPersistable`
 closes that on the CREATE VIEW / CREATE MATERIALIZED VIEW / `ALTER … SET TAGS` paths — it runs
 the same key + DDL derivation the write path runs, synchronously, before the object is
-registered, so a refusal is a clean no-op. It does **not** yet cover an ALTER that rewrites a
-view/MV indirectly (a table/column rename propagated into a body, or renaming the MV itself);
-that gap is `bug-store-rename-into-lone-surrogate-drops-dependent-view-or-mv`.
+registered, so a refusal is a clean no-op.
+
+An ALTER that rewrites a view/MV **indirectly** rides the same hook, through the engine-side
+pre-flight dependent scan `assertRenameDependentsPersistable`: before
+`alter table … rename to` / `rename column` takes its first side effect, every dependent view
+and materialized-view body in that schema is rewritten on a clone and the prospective object
+is offered here — and a renamed materialized view's own new catalog key and DDL text are
+vetted too. One visible consequence: for a **store-backed** table that has a dependent view,
+the pre-flight now fires ahead of the physical store-name guard, so the error changes from
+`cannot store the identifier …` to `cannot store persisted schema text …`. Both name the
+unpaired surrogate; both leave the catalog and all physical storage untouched. Still
+uncovered: a module that has never been handed a `Database` persists nothing and therefore
+vetoes nothing — `bug-store-untouched-table-and-early-view-never-persisted`.
 
 `@quereus/sync`'s metadata key builders
 (`buildColumnVersionKey`, `buildTombstoneKey`, etc. in `metadata/keys.ts`) apply the same
