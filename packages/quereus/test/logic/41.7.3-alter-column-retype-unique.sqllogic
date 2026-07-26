@@ -280,3 +280,36 @@ select id, v, typeof(v) from tx2 order by id;
 → [{"id":1,"v":"1","typeof(v)":"text"}]
 
 drop table tx2;
+
+-- ===================================
+-- 10. A rejected retype leaves the transaction USABLE: removing the offending row and
+--     retrying inside the same transaction succeeds, and the whole thing commits.
+-- ===================================
+
+create table tx3 (id integer primary key, v text);
+create unique index tx3_v on tx3 (v);
+insert into tx3 values (1, '1');
+-- run
+
+begin;
+-- run
+insert into tx3 values (2, '01');
+-- run
+
+alter table tx3 alter column v set data type integer;
+-- error: UNIQUE constraint failed
+
+-- still writable after the rejection, and the retry now passes
+delete from tx3 where id = 2;
+-- run
+insert into tx3 values (3, '7');
+-- run
+alter table tx3 alter column v set data type integer;
+-- run
+commit;
+-- run
+
+select id, v, typeof(v) from tx3 order by id;
+→ [{"id":1,"v":1,"typeof(v)":"integer"},{"id":3,"v":7,"typeof(v)":"integer"}]
+
+drop table tx3;

@@ -114,9 +114,10 @@ interface AddColumnBackfillContext {
  * with staged overlays to migrate.
  *
  * NOTE: `alter column … set data type` has the SAME overlay gap — its issuer/foreign overlay
- * rows are not converted here (the underlying's rowSource covers only committed rows). A later
- * ticket closing that would hook a parallel `SetDataTypeBackfillContext` through this exact
- * derive → validate → translate seam. See `alter-column-set-data-type-sees-transaction-rows.md`.
+ * rows are not converted here (the underlying's rowSource covers only committed rows), so an
+ * accepted retype commits staged rows still holding the OLD physical type. Closing it means
+ * hooking a parallel `SetDataTypeBackfillContext` through this exact derive → validate →
+ * translate seam. Tracked by `bug-isolation-retype-leaves-staged-rows-unconverted`.
  */
 interface SetNotNullBackfillContext {
 	/** Zero-based index of the now-NOT-NULL column in the overlay's data columns. */

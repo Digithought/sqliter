@@ -648,8 +648,9 @@ See [runtime.md](runtime.md) for transaction semantics.
 ### DDL inside an open transaction
 
 `createIndex` and the row-validating `alterTable` arms (`ADD CONSTRAINT ... UNIQUE`,
-`ALTER COLUMN ... SET COLLATE`) can be invoked while the calling connection has uncommitted
-writes. Two obligations follow, and both bundled modules meet them:
+`ALTER COLUMN ... SET COLLATE`, and the two value-rewriting arms `ALTER COLUMN ... SET DATA TYPE`
+/ `ALTER COLUMN ... SET NOT NULL`, whose rewrite can collapse two distinct values onto one) can be
+invoked while the calling connection has uncommitted writes. Two obligations follow, and both bundled modules meet them:
 
 *   **Validate against the effective rows**, not the committed ones — the rows a `SELECT` on
     that connection would return. Scanning committed rows alone lets a duplicate the
@@ -695,8 +696,9 @@ problem at commit time, exactly as a concurrent duplicate insert would be.
 **What the receiver must do with it.** When `rows` is present it is the ONLY set the module may
 judge row CONTENT against:
 
-*   Every row-content check — UNIQUE duplicate detection, collation-rekey collision detection —
-    reads this stream.
+*   Every row-content check — UNIQUE duplicate detection, collation-rekey collision detection,
+    value-rewrite collapse detection (`SET DATA TYPE` / `SET NOT NULL` backfill, judged with the
+    altered column already converted) — reads this stream.
 *   The module MUST NOT reject the DDL over a duplicate that exists only in its own committed
     data. That duplicate may be a row the issuing transaction has already deleted; rejecting it
     is a false positive the caller cannot work around.

@@ -2231,8 +2231,14 @@ export class MemoryTableManager {
 			// The rebuild that follows is deliberately non-enforcing, so this is the only guard.
 			//
 			// The two arms are mutually exclusive today — SET COLLATE never sets `valueConvert` —
-			// and stay separate so the collate path's PK pre-pass ordering is untouched. A retype of
-			// a PK column is rejected upstream, so the rewrite arm needs no PK pre-pass.
+			// and stay separate so the collate path's PK pre-pass ordering is untouched. Neither
+			// rewrite can re-key the primary tree, so the rewrite arm needs no PK pre-pass: a retype
+			// of a PK column is rejected upstream, and the backfill only fires on a column holding
+			// NULLs, which a PK column cannot (the engine enforces NOT NULL on every PK member
+			// regardless of the declared nullability).
+			// NOTE: if PK members ever become genuinely nullable, the backfill arm gains a PK
+			// collision path (two NULL keys → one DEFAULT) and needs `validateRekeyedPrimaryKey`
+			// plus a primary-tree re-key of its own.
 			if (collationChanged) {
 				await this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex, rows);
 				// NOTE: `validateRekeyedPrimaryKey` deliberately ignores `rows`. It asserts that no

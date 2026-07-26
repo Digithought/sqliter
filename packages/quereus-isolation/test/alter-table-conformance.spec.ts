@@ -390,6 +390,46 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		await db.exec('rollback');
 	});
 
+	// The value-rewriting arms (`SET DATA TYPE`, `SET NOT NULL` backfill) re-validate UNIQUE over
+	// the CONVERTED rows. Under the wrapper that stream is the issuer's merged async view, so
+	// these are the only tests that drive the memory manager's async mapping arm (`mapRowsAsync`
+	// in `vtab/memory/layer/row-convert.ts`); the memory leg's fixture drives the sync one.
+
+	it('SET DATA TYPE re-validates UNIQUE over the converted committed rows', async () => {
+		await db.exec(`create table t (id integer primary key, v text unique) using isolated`);
+		await db.exec(`insert into t values (1, '1'), (2, '01')`); // distinct text, one integer
+
+		const err = await attemptAlter(db, `alter table t alter column v set data type integer`);
+		expect(err, 'converted values collide, so the retype must reject').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged').to.contain('text');
+		expect(await rows(db, `select v from t order by id`)).to.deep.equal([{ v: '1' }, { v: '01' }]);
+	});
+
+	it('SET DATA TYPE sees a collision staged only in the issuer overlay', async () => {
+		await db.exec(`create table t (id integer primary key, v text unique) using isolated`);
+		await db.exec(`insert into t values (1, '1')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, '01')`); // overlay-only; committed rows alone do not collide
+
+		const err = await attemptAlter(db, `alter table t alter column v set data type integer`);
+		expect(err, 'the overlay row must be judged too').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
+
+		await db.exec('rollback');
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged').to.contain('text');
+	});
+
+	it('SET DATA TYPE is honored when the converted committed values stay distinct', async () => {
+		await db.exec(`create table t (id integer primary key, v text unique) using isolated`);
+		await db.exec(`insert into t values (1, '10'), (2, '9')`);
+		await db.exec(`alter table t alter column v set data type integer`);
+
+		expect(await rows(db, `select v from t order by id`), 'values physically rewritten')
+			.to.deep.equal([{ v: 10 }, { v: 9 }]);
+		await expectConstraint(db, `insert into t values (3, 9)`, 'post-retype UNIQUE');
+	});
+
 	it('honored SET NOT NULL backfills a staged overlay NULL from a literal DEFAULT', async () => {
 		await db.exec(`create table t (id integer primary key, v text null default 'filled') using isolated`);
 		await db.exec('begin');
