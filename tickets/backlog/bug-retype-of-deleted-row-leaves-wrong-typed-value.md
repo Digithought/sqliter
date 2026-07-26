@@ -68,3 +68,22 @@ Not obvious — this needs a decision, which is why it is filed as a spec rather
 
 Whichever is chosen, the memory and store legs must agree — they share the validation shape
 today and the conformance matrix asserts they behave identically.
+
+## Update: the two legs already disagree behind the isolation wrapper
+
+Found while reviewing `bug-retype-same-class-skips-value-validation`, which widened this same
+validation to retypes that keep the storage class (text → date), so the corner now reaches many
+more statements.
+
+When the table sits behind the isolation layer, a transaction's DELETE is a tombstone in the
+wrapper's overlay. The memory module is handed the wrapper's merged row stream and honors it, so
+the deleted row's offending value does not block the retype. The store module's convert pre-pass
+ignores that stream and scans its own committed rows, so it still sees the deleted row and
+**rejects**. Same statement, same data, opposite answers depending on the backing module.
+
+The test that pins the accepting behavior therefore had to be marked memory-only:
+`packages/quereus/test/logic/41.2.1-alter-column-retype-deleted-row-memory.sqllogic`. Whichever
+option is chosen above, closing it should also remove that exclusion — Option A makes both legs
+reject, and Options B/C require the store's pre-pass to read the wrapper-supplied
+`EffectiveRowSource` the way `alterColumnSetNotNull` already does (see the NOTE in
+`StoreModule.alterColumnSetDataType`).

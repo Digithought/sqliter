@@ -285,3 +285,104 @@ select id from t_tx where v = '2024-06-05';
 → [{"id": 4}]
 
 drop table t_tx;
+
+-- ===================================
+-- 16. Structures keyed by the column follow the rewrite
+-- (normalization moves each value, so every index over the column must be
+-- rebuilt from the CONVERTED rows — otherwise an index-driven lookup still
+-- probes the pre-retype spelling and misses, and UNIQUE keeps enforcing on
+-- the old text)
+-- ===================================
+
+create table t_idx (id integer primary key, v text unique);
+create index t_idx_v2 on t_idx (v);
+insert into t_idx values (1, '2024-06-05T00:00:00Z'), (2, '2024-01-02');
+alter table t_idx alter column v set data type date;
+
+select id, v from t_idx order by v;
+→ [{"id": 2, "v": "2024-01-02"}, {"id": 1, "v": "2024-06-05"}]
+
+select id from t_idx where v = '2024-06-05';
+→ [{"id": 1}]
+
+-- UNIQUE now enforces over the NORMALIZED value: another spelling of a
+-- stored date is a duplicate.
+insert into t_idx values (3, '2024-06-05T00:00:00Z');
+-- error: UNIQUE constraint failed
+
+-- ...and a genuinely new date is still accepted, findable by either spelling.
+insert into t_idx values (4, '2024-07-04T00:00:00Z');
+select id, v from t_idx where v = '2024-07-04';
+→ [{"id": 4, "v": "2024-07-04"}]
+
+drop table t_idx;
+
+-- 16b. …the same inside the DDL transaction: the transaction's own pending
+-- row is converted AND re-indexed, before and after commit.
+create table t_idxtx (id integer primary key, v text);
+create index t_idxtx_v on t_idxtx (v);
+insert into t_idxtx values (1, '2024-01-02');
+begin;
+insert into t_idxtx values (2, '2024-06-05T00:00:00Z');
+alter table t_idxtx alter column v set data type date;
+
+select id from t_idxtx where v = '2024-06-05';
+→ [{"id": 2}]
+
+commit;
+
+select id from t_idxtx where v = '2024-06-05';
+→ [{"id": 2}]
+
+select id, v from t_idxtx order by v;
+→ [{"id": 1, "v": "2024-01-02"}, {"id": 2, "v": "2024-06-05"}]
+
+drop table t_idxtx;
+
+-- 16c. …and the pending-row collision the normalization creates is judged over the
+-- transaction's EFFECTIVE rows: the ALTER rejects and the transaction stays usable.
+create table t_txdup (id integer primary key, v text unique);
+insert into t_txdup values (1, '2024-06-05');
+begin;
+insert into t_txdup values (2, '2024-06-05T00:00:00Z');
+-- run
+
+alter table t_txdup alter column v set data type date;
+-- error: UNIQUE constraint failed
+
+-- the transaction survived: dropping the offending row lets the retry pass
+delete from t_txdup where id = 2;
+alter table t_txdup alter column v set data type date;
+commit;
+
+select id, v from t_txdup order by id;
+→ [{"id": 1, "v": "2024-06-05"}]
+
+drop table t_txdup;
+
+-- ===================================
+-- 17. Writes AFTER the retype, in the same transaction, see the new type
+-- (the rest of the transaction coerces and enforces under the retyped
+-- column, so a non-canonical spelling normalizes on the way in and
+-- duplicates the row it now equals)
+-- ===================================
+
+create table t_after (id integer primary key, v text unique);
+insert into t_after values (1, '2024-01-01');
+begin;
+alter table t_after alter column v set data type date;
+insert into t_after values (2, '2024-06-05T00:00:00Z');
+-- run
+
+select id, v from t_after order by id;
+→ [{"id": 1, "v": "2024-01-01"}, {"id": 2, "v": "2024-06-05"}]
+
+insert into t_after values (3, '2024-06-05');
+-- error: UNIQUE constraint failed
+
+commit;
+
+select id, v from t_after order by id;
+→ [{"id": 1, "v": "2024-01-01"}, {"id": 2, "v": "2024-06-05"}]
+
+drop table t_after;

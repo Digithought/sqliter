@@ -2164,6 +2164,12 @@ export class MemoryTableManager {
 				// the new type's canonical spelling ('2024-06-05T00:00:00Z' → '2024-06-05'),
 				// or the column holds values no INSERT could have produced — unfindable by
 				// equality (DATE compares BINARY over the stored text) and invisible to UNIQUE.
+				// NOTE: the rewrite is unconditional once the types differ, even when every
+				// converted value comes back byte-identical (already-canonical ISO durations on a
+				// text → timespan). That costs a full base-tree + secondary-index rebuild here, and
+				// a physical rewrite of every row on the store leg. If ALTER on large tables ever
+				// shows up as slow, have the convert pre-pass record whether any value actually
+				// moved and, when none did, fall through to the comparator-only re-key.
 				if (newLogicalType !== oldCol.logicalType) {
 					// Retyping a PRIMARY KEY column moves the key bytes (a class change), the
 					// tree's ordering (a comparator move), or at minimum the key values'

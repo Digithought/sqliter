@@ -1,8 +1,10 @@
 -- ALTER COLUMN ... SET DATA TYPE into a type that COMPARES differently, when the physical
 -- storage class does not change.
 --
--- TEXT and TIMESPAN are both physically text, so retyping between them rewrites no stored
--- value. It does change how two values compare: TIMESPAN ranks by elapsed time, so 'PT1H',
+-- TEXT and TIMESPAN are both physically text, and every spelling below is already the new
+-- type's canonical form, so the retype leaves the stored bytes alone (the rewrite pass
+-- re-parses each value — '1 hour' WOULD become 'PT1H'; see 41.2 §12 — but ISO durations
+-- round-trip unchanged). It does change how two values compare: TIMESPAN ranks by elapsed time, so 'PT1H',
 -- 'PT60M' and 'PT3600S' are ONE value where text sees three. Every index over the column is
 -- keyed by the column's logical type, so such a retype must be treated exactly like a
 -- SET COLLATE: re-validate every uniqueness-enforcing structure covering the column BEFORE
@@ -13,13 +15,11 @@
 -- INSERT of that same spelling was rejected as a duplicate — a value simultaneously absent
 -- on SELECT and duplicate on INSERT (bug-retype-to-semantic-type-unique-and-query).
 --
--- MEMORY-ONLY (listed in MEMORY_ONLY_FILES): the store backend re-validates and rebuilds on
--- the TIMESPAN/JSON halves of this via its own key-transform guard, but not on the DATE /
--- TIME / DATETIME retypes of section 7b, which turn on comparator identity rather than a key
--- transform. Those three compare exactly as BINARY text does, so on a BINARY column memory's
--- re-sort lands on the order the store's untouched keys already have — the divergence was only
--- observable through the illegal `collate nocase` pairing section 7 now rejects. The memory-side
--- contract is what this file pins.
+-- CROSS-MODULE (the `-memory` in the filename is historical): the store backend used to cover
+-- only the TIMESPAN/JSON halves, via its own key-transform guard. It now gates its value rewrite
+-- on logical-type identity like memory does (bug-retype-same-class-skips-value-validation), so
+-- the DATE / TIME / DATETIME retypes of section 7b re-validate and rebuild there too, and this
+-- file runs on both legs.
 
 -- ===================================
 -- 1. Colliding rows under an explicit `create unique index` → the ALTER is REJECTED, and
@@ -89,7 +89,8 @@ alter table sem3 alter column v set data type timespan;
 select name, type from table_info('sem3') where name = 'v';
 → [{"name":"v","type":"TIMESPAN"}]
 
--- the stored values are untouched: same physical class, no rewrite
+-- the stored values survive byte-identical: both are already canonical ISO durations, so the
+-- rewrite pass re-parses them to themselves
 select id, v, typeof(v) from sem3 order by id;
 → [{"id":1,"v":"PT1H","typeof(v)":"text"},{"id":2,"v":"PT2H","typeof(v)":"text"}]
 

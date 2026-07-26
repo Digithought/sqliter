@@ -219,27 +219,30 @@ UNIQUE constraint). The probe index is built from the *new* `TableSchema`, so it
 exactly as the rebuilt structure will. Two families qualify:
 
 *   **`SET COLLATE`** re-keys the structures under a new comparator; the stored values are
-    unchanged, so the probe reads the effective rows as they are.
-*   **A `SET DATA TYPE` that keeps the physical storage class but moves the comparison** —
-    `TEXT` ↔ `TIMESPAN` (`'PT1H'`, `'PT60M'` and `'PT3600S'` are one duration), `TEXT` ↔ `JSON`
-    (`'{"a":1}'` and `'{ "a" : 1 }'` are one document), or `TEXT` ↔
-    `DATE`/`TIME`/`DATETIME` (whose comparison is hard-wired to `BINARY`, ignoring the column's
-    collation). No value is rewritten, so like `SET COLLATE` the probe reads the effective rows
-    as they are — but a `MemoryIndex` builds its comparator from the column's **logical type**,
-    so every structure over the column has to be re-keyed just the same. The trigger is
-    `comparisonSemanticsDiffer` (`util/comparison.ts`): the two types' `compare` functions are
-    not the same function. A retype whose types compare identically (`TEXT` → `VARCHAR(50)`,
-    `INTEGER` → `BIGINT`) is a metadata-only no-op and skips all of this.
-*   **A value rewrite** — `SET DATA TYPE` across physical storage classes, or a `SET NOT NULL`
-    NULL → DEFAULT backfill — leaves
-    the comparators alone but changes the values, so the probe reads the effective rows with the
-    altered column **converted**, under the column's new logical type. That is what catches
-    `'1'`/`'01'` collapsing onto the integer `1`, `'1.0'`/`'1.00'` onto the real `1.0`, and two
-    NULLs (mutually distinct under SQL UNIQUE) collapsing onto one DEFAULT literal. The base
+    unchanged, so the probe reads the effective rows as they are. This is the only family that
+    moves the comparator without rewriting values.
+*   **A value rewrite** — `SET DATA TYPE` between any two *different* logical types (whether or
+    not the physical storage class changes), or a `SET NOT NULL` NULL → DEFAULT backfill — so the
+    probe reads the effective rows with the altered column **converted**, under the column's new
+    logical type. That is what catches `'1'`/`'01'` collapsing onto the integer `1`,
+    `'1.0'`/`'1.00'` onto the real `1.0`, `'2024-06-05'`/`'2024-06-05T00:00:00Z'` onto one
+    canonical `DATE`, and two NULLs (mutually distinct under SQL UNIQUE) collapsing onto one
+    DEFAULT literal. When the retype ALSO moves the comparison — `TEXT` ↔ `TIMESPAN` (`'PT1H'`,
+    `'PT60M'` and `'PT3600S'` are one duration), `TEXT` ↔ `JSON` (`'{"a":1}'` and `'{ "a" : 1 }'`
+    are one document), `TEXT` ↔ `DATE`/`TIME`/`DATETIME` (whose comparison is hard-wired to
+    `BINARY`, ignoring the column's collation) — the same probe covers both effects at once,
+    because it judges the converted rows under the new schema's comparators. The comparator
+    trigger is `comparisonSemanticsDiffer` (`util/comparison.ts`): the two types' `compare`
+    functions are not the same function; a `MemoryIndex` builds its comparator from the column's
+    **logical type**, so every structure over the column is re-keyed as well as rebuilt. The base
     rewrite that follows is deliberately non-enforcing — the base's rows are not a subset of the
     effective rows — so this pre-pass is the only guard. The per-row conversion is shared with
     the base rewrite and the open layers' rewrite (`convertRowAtIndex`) so the three cannot
     disagree about what the converted row is.
+
+Only a retype between **aliases of one logical type** (`TEXT` → `VARCHAR(50)`, `INTEGER` →
+`BIGINT` — `inferType` returns the same shared type object) is a metadata-only no-op that skips
+all of this.
 
 When the table is wrapped by a module that stages the transaction's writes *outside* this
 manager — the isolation layer, whose per-connection overlay this manager cannot see — those
@@ -288,29 +291,32 @@ rolls back normally. Callers that want a hard guarantee against this can set the
 transaction on any module that is not `transactional` (memory is not). The default `'permissive'`
 policy leaves the behavior above unchanged.
 
-**`SET DATA TYPE` validates and rewrites values, not just structures.** When the new type shares
-the physical type, no value is touched and the statement is metadata-only *unless* the two types
-compare differently (`comparisonSemanticsDiffer` — `TEXT` ↔ `TIMESPAN`, `TEXT` ↔ `JSON`, `TEXT` ↔
-`DATE`/`TIME`/`DATETIME`), in which case it takes the `SET COLLATE` path in full: UNIQUE
-re-validation over the effective rows under the new comparator, `rebuildAllSecondaryIndexes` on
-the base, and `adoptSchema` on every open transaction layer. A direct module call that aims such a
-retype at a PRIMARY KEY column is rejected with `CONSTRAINT` (defense in depth — the engine
-already refuses `SET DATA TYPE` on any PK column), since nothing on this path re-keys the primary
-tree. When the new type has a
-different physical type, `MemoryTableManager.alterColumn` first runs a throw-only conversion pass
-over the effective rows (rule 1): a value the transaction can see that will not convert rejects the
-`ALTER` with `MISMATCH`, and one only in a row it has deleted does not block it. It then converts
-the committed base rows in place and, for the open transaction, hands each layer to
-`TransactionLayer.convertColumn` oldest-first (paralleling `adoptSchema`, but rewriting the stored
-value at the column index rather than re-pointing an index). Like `rekeyPrimaryKey`, `convertColumn`
-collapses the layer's own-write log to its net effect per key, carrying the *converted* value, so the
-commit-time rebase replays converted rows. A base or own-write value that fails to convert here is
-left untouched: the effective-view pass already accepted every value the transaction can read, so an
+**`SET DATA TYPE` validates and rewrites values, not just structures.** The gate is logical-type
+**identity**, not the physical storage class: a retype between aliases of one type (`TEXT` →
+`VARCHAR(50)`, `INTEGER` → `BIGINT`, where `inferType` returns the same shared object) is
+metadata-only; *every* other retype validates and rewrites. `MemoryTableManager.alterColumn` first
+runs a throw-only conversion pass over the effective rows (rule 1): a value the transaction can see
+that will not convert rejects the `ALTER` with `MISMATCH`, and one only in a row it has deleted does
+not block it. Accepted values are rewritten to the new type's **canonical form** — the value an
+`INSERT` would have stored (`'2024-06-05T00:00:00Z'` → `'2024-06-05'`, `'1 hour'` → `'PT1H'`) —
+even when the storage class is unchanged, so the column never holds a spelling no write path could
+have produced. The rewrite REPLACES the base primary tree with a fresh one built from the converted
+rows (`rebuildPrimaryTreeFromRows`, which rebuilds every secondary index too) — never an in-place
+mutation, which inheritree forbids while open layers derive from that tree — and, for the open
+transaction, hands each layer to `TransactionLayer.convertColumn` oldest-first (paralleling
+`adoptSchema`, but rewriting the stored value at the column index rather than only re-pointing an
+index; it re-installs the schema and rebuilds the layer's indexes, so it subsumes `adoptSchema`
+when the retype also moved the comparators). Like `rekeyPrimaryKey`, `convertColumn` collapses the
+layer's own-write log to its net effect per key, carrying the *converted* value, so the commit-time
+rebase replays converted rows. A base or own-write value that fails to convert here is left
+untouched: the effective-view pass already accepted every value the transaction can read, so an
 unconvertible one is necessarily shadowed by a delete or a later write and is never read back. The
 result matches the store backend, whose `alterColumnSetDataType` flushes buffered writes before the
-physical rewrite. Retyping a **primary-key** column is rejected outright (`CONSTRAINT`): the physical
-key bytes would change, which the in-place base rewrite cannot re-key — the type-change analogue of
-the SET COLLATE primary-key carve-out.
+physical rewrite. Retyping a **primary-key** column is rejected outright (`CONSTRAINT`) — defense in
+depth, since the engine already refuses `SET DATA TYPE` on any PK column: the key bytes, the tree's
+ordering, or at minimum the key values' canonical spelling would move, and neither the base rewrite
+nor the layer conversion re-keys the primary tree. It is the type-change analogue of the SET COLLATE
+primary-key carve-out.
 
 **`SET NOT NULL` validates over the effective view and backfills through the same machinery.**
 Tightening a column to `NOT NULL` scans the effective rows (rule 1) for a NULL the transaction can
