@@ -1075,7 +1075,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// post-mutation OLD-value scans dereference through the just-mutated
 		// parent and find zero rows.
 		if (fkRestrictBatch) {
-			accumulateParentRestrictKeys(fkRestrictBatch, 'update', oldRow, newRow);
+			accumulateParentRestrictKeys(fkRestrictBatch, tableSchema, 'update', oldRow, newRow);
 		} else {
 			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
 		}
@@ -1244,7 +1244,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Parent-side RESTRICT enforcement: batched key accumulation, or the
 		// per-row defense-in-depth pre-walk — see comment on the UPDATE path above.
 		if (fkRestrictBatch) {
-			accumulateParentRestrictKeys(fkRestrictBatch, 'delete', oldRow);
+			accumulateParentRestrictKeys(fkRestrictBatch, tableSchema, 'delete', oldRow);
 		} else {
 			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', oldRow, undefined, plan.lensRouted);
 		}

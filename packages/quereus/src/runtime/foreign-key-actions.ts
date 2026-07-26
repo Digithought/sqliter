@@ -8,6 +8,7 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { expressionToString, quoteIdentifier } from '../emit/ast-stringify.js';
 import { sqlValueIdentical } from '../util/comparison.js';
+import { validateAndParse } from '../types/validation.js';
 import type { LensSlot } from '../schema/lens.js';
 import { resolveSlotBasisSource } from '../schema/lens-prover.js';
 import {
@@ -73,6 +74,53 @@ function serializeKeyTuple(values: SqlValue[]): string {
 }
 
 /**
+ * The shared UPDATE short-circuit behind every parent-side RESTRICT / cascade site:
+ * true when at least one of `colIndices` would actually STORE a different value.
+ *
+ * `oldRow` comes from the source scan, so its cells are already affinity-coerced;
+ * `newRow` is the raw proposed row (these checks deliberately run BEFORE `vtab.update`,
+ * so the substrate has not coerced it yet). Comparing the two directly reads `1` vs the
+ * text `'1'`, or two spellings of the same JSON, as a key change — and the RESTRICT scan
+ * that follows then rejects an update that changes nothing. So a value that is not already
+ * identical is re-coerced through the column's logical type — the exact conversion
+ * `coerceRowToSchema` will apply a moment later — and compared again.
+ *
+ * The coerced value is a throwaway comparison copy and never escapes: the row handed to
+ * the storage layer stays raw (JSON's parse step is not safe to run twice — see
+ * `bug-json-string-scalar-not-round-trip-safe`).
+ *
+ * Both fallbacks (no declared type, coercion throws) report "changed", and the comparison
+ * is BINARY identity rather than the column's collation. Both choices err the same way,
+ * which is the only safe direction here: a spurious "changed" costs one redundant RESTRICT
+ * probe, while a spurious "unchanged" would SKIP enforcement entirely. Collation in
+ * particular must stay out — a NOCASE parent column still stores `'A'` and `'a'` as
+ * distinct values, and the child's own match runs under the CHILD column's collation,
+ * which may well be BINARY.
+ */
+function anyReferencedColumnChanged(
+	parentTable: TableSchema,
+	colIndices: readonly number[],
+	oldRow: Row,
+	newRow: Row,
+): boolean {
+	for (const idx of colIndices) {
+		const oldValue = oldRow[idx] as SqlValue;
+		const newValue = newRow[idx] as SqlValue;
+		if (sqlValueIdentical(oldValue, newValue)) continue;
+		const type = parentTable.columns[idx]?.logicalType;
+		if (!type) return true;
+		let coerced: SqlValue;
+		try {
+			coerced = validateAndParse(newValue, type);
+		} catch {
+			return true;
+		}
+		if (!sqlValueIdentical(oldValue, coerced)) return true;
+	}
+	return false;
+}
+
+/**
  * Accumulate one mutated parent row's OLD referenced-key tuples into the batch
  * — the batched replacement for the per-row RESTRICT probes, applying the same
  * skip rules: MATCH SIMPLE (a tuple containing NULL is unreferenceable) and,
@@ -80,6 +128,7 @@ function serializeKeyTuple(values: SqlValue[]): string {
  */
 export function accumulateParentRestrictKeys(
 	batch: ParentRestrictBatch,
+	parentTable: TableSchema,
 	operation: 'delete' | 'update',
 	oldRow: Row,
 	newRow?: Row,
@@ -87,14 +136,7 @@ export function accumulateParentRestrictKeys(
 	for (const entry of batch) {
 		// UPDATE: only rows that actually re-key a referenced column contribute.
 		if (operation === 'update' && newRow !== undefined) {
-			let anyChanged = false;
-			for (const idx of entry.parentColIndices) {
-				if (!sqlValueIdentical(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
-					anyChanged = true;
-					break;
-				}
-			}
-			if (!anyChanged) continue;
+			if (!anyReferencedColumnChanged(parentTable, entry.parentColIndices, oldRow, newRow)) continue;
 		}
 
 		// MATCH SIMPLE: NULL parent values cannot be referenced.
@@ -396,14 +438,7 @@ export async function assertTransitiveRestrictsForParentMutation(
 			// UPDATE-only short-circuit: skip if no referenced parent column changed.
 			let newParentValues: SqlValue[] | undefined;
 			if (operation === 'update' && newRow !== undefined) {
-				let anyChanged = false;
-				for (const idx of parentColIndices) {
-					if (!sqlValueIdentical(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
-						anyChanged = true;
-						break;
-					}
-				}
-				if (!anyChanged) continue;
+				if (!anyReferencedColumnChanged(parentTable, parentColIndices, oldRow, newRow)) continue;
 				newParentValues = parentColIndices.map(idx => newRow[idx]) as SqlValue[];
 			}
 
@@ -535,14 +570,7 @@ export async function assertNoRestrictedChildrenForParentMutation(
 
 		// UPDATE: only enforce when at least one referenced parent column changed.
 		if (operation === 'update' && newRow !== undefined) {
-			let anyChanged = false;
-			for (const idx of parentColIndices) {
-				if (!sqlValueIdentical(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
-					anyChanged = true;
-					break;
-				}
-			}
-			if (!anyChanged) continue;
+			if (!anyReferencedColumnChanged(parentTable, parentColIndices, oldRow, newRow)) continue;
 		}
 
 		// MATCH SIMPLE: NULL parent values cannot be referenced.
@@ -737,7 +765,7 @@ type LensFkAction = Extract<ForeignKeyAction, 'cascade' | 'setNull' | 'setDefaul
  * (⇒ skip this ref) when:
  *  - a referenced column has no plain basis projection (cannot read its basis value);
  *  - MATCH SIMPLE: any OLD referenced value is NULL (participates in no FK match); or
- *  - UPDATE: no referenced parent column actually changed (`sqlValueIdentical` short-circuit).
+ *  - UPDATE: no referenced parent column actually changed ({@link anyReferencedColumnChanged}).
  */
 function resolveLensFkParentReferencedValues(
 	ref: LogicalParentFkRef,
@@ -766,11 +794,7 @@ function resolveLensFkParentReferencedValues(
 	// UPDATE short-circuit: skip when no referenced parent column actually changed.
 	let newParentValues: SqlValue[] | undefined;
 	if (operation === 'update' && newRow !== undefined) {
-		let anyChanged = false;
-		for (const i of basisIndices) {
-			if (!sqlValueIdentical(oldRow[i] as SqlValue, newRow[i] as SqlValue)) { anyChanged = true; break; }
-		}
-		if (!anyChanged) return undefined;
+		if (!anyReferencedColumnChanged(basisParentTable, basisIndices, oldRow, newRow)) return undefined;
 		newParentValues = basisIndices.map(i => newRow[i]) as SqlValue[];
 	}
 
