@@ -2386,10 +2386,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 	/**
 	 * SET DATA TYPE sub-branch of {@link alterColumnChange}. Returns the retyped column
-	 * schema. Mutates nothing: when the physical type changes, a throw-only convert pass
-	 * over the live rows proves every value convertible, and the conversion itself is
-	 * returned as a deferred `valueConvert` the caller applies only after every throw-only
-	 * check — including the UNIQUE re-validation over the converted values — has passed.
+	 * schema. Mutates nothing: for every retype between DIFFERENT logical types, a
+	 * throw-only convert pass over the live rows proves every value convertible, and the
+	 * conversion itself is returned as a deferred `valueConvert` the caller applies only
+	 * after every throw-only check — including the UNIQUE re-validation over the converted
+	 * values — has passed. Gated on logical-type IDENTITY, not the physical storage class:
+	 * `inferType` flattens aliases to the shared type object (`varchar(50)` IS `TEXT_TYPE`),
+	 * so an alias retype is schema-only, while a same-class retype (text → date) still
+	 * rejects values the new type refuses and rewrites the rest to the new type's
+	 * canonical spelling ('2024-06-05T00:00:00Z' → '2024-06-05') — exactly as an INSERT
+	 * would have stored them.
 	 */
 	private async alterColumnSetDataType(
 		table: StoreTable,
@@ -2399,8 +2405,8 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	): Promise<AlterColumnAttrChange> {
 		const newLogicalType = inferType(change.setDataType!);
 		let valueConvert: ((v: SqlValue) => SqlValue) | undefined;
-		if (newLogicalType.physicalType !== oldCol.logicalType.physicalType) {
-			// Physical conversion required — walk every row and attempt parse.
+		if (newLogicalType !== oldCol.logicalType) {
+			// Conversion required — walk every row and attempt parse.
 			const convert = (v: SqlValue): SqlValue => {
 				try {
 					return validateAndParse(v, newLogicalType, change.columnName) as SqlValue;
@@ -2415,6 +2421,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			// transaction inserted rejects the ALTER with the transaction still intact.
 			// The rewrite itself is DEFERRED: the caller flushes + `mapRowsAtIndex`es
 			// this closure only after its remaining throw-only checks pass.
+			// NOTE: pre-existing gap — this scan reads the store's own effective rows and
+			// ignores a wrapper-supplied `rows` stream (unlike the memory module's arm). No
+			// hole under isolation: the wrapper's `validateOverlayMigration` converts every
+			// staged overlay value itself before the underlying mutates.
 			for await (const value of table.iterateEffectiveValuesAtIndex(colIndex)) {
 				if (value !== null) convert(value);
 			}

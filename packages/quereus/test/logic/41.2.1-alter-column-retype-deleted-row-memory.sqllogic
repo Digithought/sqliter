@@ -1,0 +1,32 @@
+-- ALTER COLUMN SET DATA TYPE: a value only in a row the transaction has DELETED does
+-- not block the retype. The convert pre-pass walks the transaction's EFFECTIVE rows
+-- (committed rows overlaid with its own pending writes), so a deleted row's
+-- unconvertible value is deliberately not counted against the ALTER.
+--
+-- MEMORY-ONLY (listed in MEMORY_ONLY_FILES): the store's throw-only convert pass scans
+-- the store's OWN effective rows and ignores the wrapper-supplied effective stream (see
+-- the NOTE in StoreModule.alterColumnSetDataType) — behind the isolation wrapper a
+-- transaction's delete is an overlay tombstone the store cannot see, so the store leg
+-- rejects on the deleted row's value where memory accepts. The known rollback corner
+-- (rollback restores the row under the new type) is tracked as
+-- bug-retype-of-deleted-row-leaves-wrong-typed-value.
+
+create table t_del (id integer primary key, v text);
+insert into t_del values (1, '2024-01-01'), (2, 'not-a-date');
+-- run
+
+begin;
+-- run
+delete from t_del where id = 2;
+-- run
+
+-- The only unconvertible value lives in a row this transaction deleted — accepted.
+alter table t_del alter column v set data type date;
+-- run
+commit;
+-- run
+
+select id, v from t_del order by id;
+→ [{"id": 1, "v": "2024-01-01"}]
+
+drop table t_del;

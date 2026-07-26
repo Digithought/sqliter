@@ -338,10 +338,15 @@ export class TransactionLayer implements Layer {
 	 * layer, not the base.
 	 *
 	 * NON-primary-key column, or a key column whose bytes are unchanged. `MemoryTableManager.alterColumn`
-	 * rejects a physical retype of a key column before any mutation, and SET NOT NULL leaves the key
+	 * rejects any retype of a key column before any mutation, and SET NOT NULL leaves the key
 	 * bytes intact, so the primary key encoding is unchanged: {@link pkFunctions} and the primary tree
 	 * keep their keys, and only the value at `colIndex` moves. (Contrast {@link rekeyPrimaryKey}, which
 	 * must rebuild the tree because the keys themselves change.)
+	 *
+	 * Subsumes {@link adoptSchema} for a same-storage-class retype that ALSO moves the comparator
+	 * (text → date/timespan): `tableSchemaAtCreation` is swapped to `newSchema` and every secondary
+	 * index is rebuilt from scratch against it below, so the layer's structures pick up the new
+	 * comparators along with the converted values.
 	 *
 	 * Like {@link adoptSchema} / {@link rekeyPrimaryKey}, the caller MUST apply this oldest-first
 	 * (base already converted): the layer's copy-on-write base inherits the parent's already-converted

@@ -200,6 +200,54 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
+		// Mirrors the memory leg: sharing the TEXT storage class is not a free pass on value
+		// validation — DATE refuses 'hello', so the retype rejects with MISMATCH.
+		label: 'alterColumn SET DATA TYPE (same storage class, narrowing, illegal value) → MISMATCH',
+		seed: [`create table t (id integer primary key, v text) using isolated`, `insert into t values (1, 'hello')`],
+		alter: `alter table t alter column v set data type date`,
+		expect: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /\bv\b|convert/i },
+		confirm: async (db) => {
+			expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged after narrowing reject').to.contain('text');
+			expect((await rows(db, `select v from t`)).map(x => x.v), 'value untouched').to.deep.equal(['hello']);
+		},
+	},
+	{
+		// Mirrors the memory leg: an accepted same-class retype rewrites each value to the
+		// new type's canonical spelling, so an equality lookup for the canonical date finds
+		// the row (DATE compares BINARY over the stored text).
+		label: 'alterColumn SET DATA TYPE (same storage class) normalizes values',
+		seed: [`create table t (id integer primary key, v text) using isolated`, `insert into t values (1, '2024-06-05T00:00:00Z')`],
+		alter: `alter table t alter column v set data type date`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'v');
+			if (outcome === 'honored') {
+				expect(String(info?.type).toLowerCase(), 'declared type now DATE').to.contain('date');
+				expect((await rows(db, `select v from t`)).map(x => x.v), 'value rewritten to canonical form').to.deep.equal(['2024-06-05']);
+				expect((await rows(db, `select id from t where v = '2024-06-05'`)).map(x => x.id), 'equality lookup finds the normalized row').to.deep.equal([1]);
+			} else {
+				expect(String(info?.type).toLowerCase()).to.contain('text');
+			}
+		},
+	},
+	{
+		// Mirrors the memory leg: normalization collapses '2024-06-05' and
+		// '2024-06-05T00:00:00Z' into one DATE, so the UNIQUE re-validation over the
+		// CONVERTED rows rejects before anything mutates.
+		label: 'alterColumn SET DATA TYPE (same storage class, normalization collides under UNIQUE) → CONSTRAINT',
+		seed: [
+			`create table t (id integer primary key, v text, constraint u_v unique (v)) using isolated`,
+			`insert into t values (1, '2024-06-05'), (2, '2024-06-05T00:00:00Z')`,
+		],
+		alter: `alter table t alter column v set data type date`,
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /unique/i },
+		confirm: async (db) => {
+			expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged after collision reject').to.contain('text');
+			expect((await rows(db, `select id, v from t order by id`)).map(x => x.v), 'both spellings survive').to.deep.equal(['2024-06-05', '2024-06-05T00:00:00Z']);
+			await db.exec(`insert into t values (3, '2024-06-05T06:00:00Z')`); // still writable, still textual UNIQUE
+		},
+	},
+	{
 		label: 'alterColumn SET DEFAULT',
 		seed: [`create table t (id integer primary key, v integer null) using isolated`, `insert into t values (1, 5)`],
 		alter: `alter table t alter column v set default 99`,
@@ -484,6 +532,74 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		// first, so this is a clean CONSTRAINT — not the INTERNAL `adoptRebuiltOverlay` raises when
 		// a rebuild hits a constraint the DDL's own validation pass had already accepted.
 		expect(err!.code, `reject code was ${err!.code} (${err!.message})`).to.equal(StatusCode.CONSTRAINT);
+
+		await db.exec('rollback');
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged').to.contain('text');
+	});
+
+	// Same-storage-class retype (text → date): the overlay legs of the value rewrite. The
+	// storage class never changes, but the logical type does, so staged values must be
+	// validated and normalized exactly like class-changing conversions above.
+
+	it('same-class SET DATA TYPE rejects an illegal value staged only in the overlay', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using isolated`);
+		await db.exec(`insert into t values (1, '2024-01-01')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, 'hello')`); // overlay-only, DATE refuses it
+
+		const err = await attemptAlter(db, `alter table t alter column v set data type date`);
+		expect(err, 'staged illegal value must reject the same-class retype').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.MISMATCH);
+		expect(err!.message).to.contain(`Cannot convert value in 'v'`);
+
+		await db.exec('rollback');
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged after rollback').to.contain('text');
+	});
+
+	it('same-class SET DATA TYPE normalizes a staged overlay row, in-transaction and past commit', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using isolated`);
+		await db.exec(`insert into t values (1, '2024-01-01')`); // committed before the transaction
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, '2024-06-05T00:00:00Z')`); // staged, non-canonical
+		await db.exec(`alter table t alter column v set data type date`);
+
+		expect(await rows(db, `select id, v from t order by id`), 'staged row normalized in-transaction')
+			.to.deep.equal([{ id: 1, v: '2024-01-01' }, { id: 2, v: '2024-06-05' }]);
+
+		await db.exec('commit');
+
+		expect(await rows(db, `select id, v from t order by id`), 'normalization persists past commit')
+			.to.deep.equal([{ id: 1, v: '2024-01-01' }, { id: 2, v: '2024-06-05' }]);
+		// The bug's user-visible symptom: an un-normalized value is invisible to equality
+		// (DATE compares BINARY over the stored text).
+		expect(await rows(db, `select id from t where v = '2024-06-05'`), 'normalized row found by equality')
+			.to.deep.equal([{ id: 2 }]);
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'column retyped').to.contain('date');
+	});
+
+	it('same-class SET DATA TYPE ignores an illegal value only in a row the transaction deleted', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using isolated`);
+		await db.exec(`insert into t values (1, '2024-01-01'), (2, 'not-a-date')`);
+		await db.exec('begin');
+		await db.exec(`delete from t where id = 2`); // the only offending value is now invisible to this transaction
+
+		const err = await attemptAlter(db, `alter table t alter column v set data type date`);
+		expect(err, 'a deleted row must not block the retype').to.equal(null);
+
+		await db.exec('commit');
+		expect(await rows(db, `select id, v from t order by id`)).to.deep.equal([{ id: 1, v: '2024-01-01' }]);
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'column retyped').to.contain('date');
+	});
+
+	it('same-class SET DATA TYPE rejects when a staged row collides with a committed one after normalization', async () => {
+		await db.exec(`create table t (id integer primary key, v text unique) using isolated`);
+		await db.exec(`insert into t values (1, '2024-06-05')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, '2024-06-05T00:00:00Z')`); // distinct text, same DATE
+
+		const err = await attemptAlter(db, `alter table t alter column v set data type date`);
+		expect(err, 'the overlay row must be judged against committed rows post-normalization').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
 
 		await db.exec('rollback');
 		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged').to.contain('text');

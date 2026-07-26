@@ -1782,10 +1782,13 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	/**
 	 * Precomputes the per-ALTER constants an `alter column … set data type` overlay conversion
 	 * needs: the retyped column's index and a per-value `convert`. Returns undefined unless this
-	 * is a retype with at least one overlay to convert, and undefined for a METADATA-ONLY retype
-	 * (new physical type equals old) — both underlyings gate their value rewrite on that exact
+	 * is a retype with at least one overlay to convert, and undefined for an ALIAS retype (the
+	 * new logical type IS the old type object — `inferType` flattens `varchar(50)` to
+	 * `TEXT_TYPE`) — both underlyings gate their value rewrite on that exact identity
 	 * comparison, so mirroring it here keeps overlay and committed rows moving together should
-	 * "what counts as a value-rewriting retype" ever change.
+	 * "what counts as a value-rewriting retype" ever change. A same-storage-class retype between
+	 * different types (text → date) DOES convert: staged values are validated and normalized to
+	 * the new type's canonical spelling, exactly as the underlyings treat their committed rows.
 	 *
 	 * `inferType` never throws (an unknown type name falls through SQLite-style affinity rules),
 	 * so deriving this BEFORE the underlying mutation is safe. `convert` is the literal mirror of
@@ -1805,8 +1808,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const oldCol = overlaySchema.columns[colIndex];
 		if (!oldCol) return undefined;
 		const newLogicalType = inferType(change.setDataType);
-		// Metadata-only retype: the underlying rewrites nothing, so neither do we.
-		if (newLogicalType.physicalType === oldCol.logicalType.physicalType) return undefined;
+		// Alias retype (same logical type object): the underlying rewrites nothing, so neither do we.
+		if (newLogicalType === oldCol.logicalType) return undefined;
 		const setDataType = change.setDataType;
 		const columnName = change.columnName;
 		return {

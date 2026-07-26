@@ -379,6 +379,68 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
+		// Same physical storage class (both TEXT) is NOT a free pass on value validation:
+		// DATE refuses 'hello', so the retype must reject with MISMATCH exactly as a
+		// class-changing lossy retype does — the column must never declare DATE while
+		// holding a value no INSERT could have produced.
+		label: 'alterColumn SET DATA TYPE (same storage class, narrowing, illegal value) → MISMATCH',
+		seed: u => [`create table t (id integer primary key, v text)${u}`, `insert into t values (1, 'hello')`],
+		alter: `alter table t alter column v set data type date`,
+		memory: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /\bv\b|convert/i },
+		stubUnsupported: true,
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'v');
+			expect(String(info?.type).toLowerCase(), 'type unchanged after narrowing reject').to.contain('text');
+			const r = await rows(db, `select v from t`);
+			expect(r.map(x => x.v), 'value untouched after narrowing reject').to.deep.equal(['hello']);
+		},
+	},
+	{
+		// An accepted same-class retype REWRITES each value to the new type's canonical
+		// spelling — the state an INSERT would have produced. DATE compares BINARY over
+		// the stored text, so without the rewrite the row is invisible to an equality
+		// lookup for the canonical date (the silent divergence this matrix forbids).
+		label: 'alterColumn SET DATA TYPE (same storage class) normalizes values',
+		seed: u => [`create table t (id integer primary key, v text)${u}`, `insert into t values (1, '2024-06-05T00:00:00Z')`],
+		alter: `alter table t alter column v set data type date`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'v');
+			if (outcome === 'honored') {
+				expect(String(info?.type).toLowerCase(), 'declared type now DATE').to.contain('date');
+				const r = await rows(db, `select v from t`);
+				expect(r.map(x => x.v), 'value rewritten to canonical form').to.deep.equal(['2024-06-05']);
+				const hit = await rows(db, `select id from t where v = '2024-06-05'`);
+				expect(hit.map(x => x.id), 'equality lookup finds the normalized row').to.deep.equal([1]);
+			} else {
+				expect(String(info?.type).toLowerCase(), 'type unchanged on reject').to.contain('text');
+			}
+		},
+	},
+	{
+		// The combined value-rewrite + comparator-move path: normalization collapses two
+		// previously-distinct spellings ('2024-06-05' and '2024-06-05T00:00:00Z' are one
+		// DATE), so the UNIQUE re-validation over the CONVERTED rows must reject before
+		// anything mutates — leaving values, declared type and writability intact.
+		label: 'alterColumn SET DATA TYPE (same storage class, normalization collides under UNIQUE) → CONSTRAINT',
+		seed: u => [
+			`create table t (id integer primary key, v text, constraint u_v unique (v))${u}`,
+			`insert into t values (1, '2024-06-05'), (2, '2024-06-05T00:00:00Z')`,
+		],
+		alter: `alter table t alter column v set data type date`,
+		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /unique/i },
+		stubUnsupported: true,
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'v');
+			expect(String(info?.type).toLowerCase(), 'type unchanged after collision reject').to.contain('text');
+			const r = await rows(db, `select id, v from t order by id`);
+			expect(r.map(x => x.v), 'both spellings survive').to.deep.equal(['2024-06-05', '2024-06-05T00:00:00Z']);
+			// Still writable, still enforcing TEXTUAL uniqueness under the unchanged type.
+			await db.exec(`insert into t values (3, '2024-06-05T06:00:00Z')`);
+		},
+	},
+	{
 		// SET DATA TYPE keeps the column's collation, so the NEW type has to accept it. DATE
 		// declares `supportedCollations: []` (BINARY only), so `text collate nocase → date` must
 		// reject — otherwise the ALTER mints `d DATE COLLATE NOCASE`, a shape CREATE TABLE would

@@ -351,6 +351,20 @@ keys are suffixed with the PK. Any `constraint` result returned by an underlying
 is a violated invariant (the merged-view pre-checks should have resolved it before commit) and
 is thrown as an INTERNAL error rather than silently swallowed.
 
+**Phase-1 invariant — the flush must not read an underlying table once it has begun writing
+that table.** Deciding insert-vs-update for a live overlay row is a read: a full-PK point lookup
+that drives the underlying's primary index (`rowExistsInUnderlying`). Every one of those probes
+is therefore resolved **up front**, before the first `update()` of that table's flush lands. An
+underlying module is under no obligation to serve reads — least of all index-driven ones — over
+its own uncommitted writes: a module that only authors its compound/secondary index entries when
+the write batch resolves must *refuse* an index walk over staged state rather than answer from a
+silently stale index (lamina's staged collection does exactly this). Probing inline in the write
+loop consequently failed every probe after the first, breaking any transaction that wrote two or
+more rows to one table with a compound primary key. Hoisting the probes is answer-preserving
+because each PK appears at most once in the overlay, so no write in the flush can change another
+entry's existence answer — and it costs one fewer read per written row. The invariant is
+per table, not per commit: Phase 1 may legitimately probe table B after writing table A.
+
 **Phase 2 — commit all.** Once **every** overlay has applied, `commit()` the affected
 underlying tables. For a `quereus-store` underlying (whose tables share one module-wide
 `TransactionCoordinator`) Phase 1's begins/applies all accumulate in that single coordinator,

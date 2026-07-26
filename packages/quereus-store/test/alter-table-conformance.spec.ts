@@ -297,6 +297,55 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
+		// Mirrors the memory leg's arm of the same label: sharing the TEXT storage class is
+		// not a free pass on value validation — DATE refuses 'hello', so the retype rejects
+		// with MISMATCH, leaving the declared type and stored value untouched.
+		label: 'alterColumn SET DATA TYPE (same storage class, narrowing, illegal value) → MISMATCH',
+		seed: [`create table t (id integer primary key, v text) using store`, `insert into t values (1, 'hello')`],
+		alter: `alter table t alter column v set data type date`,
+		expect: { kind: 'reject', codes: [StatusCode.MISMATCH], site: /\bv\b|convert/i },
+		confirm: async (db) => {
+			expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged after narrowing reject').to.contain('text');
+			expect((await rows(db, `select v from t`)).map(x => x.v), 'value untouched').to.deep.equal(['hello']);
+		},
+	},
+	{
+		// Mirrors the memory leg: an accepted same-class retype rewrites each value to the
+		// new type's canonical spelling, so an equality lookup for the canonical date finds
+		// the row (DATE compares BINARY over the stored text).
+		label: 'alterColumn SET DATA TYPE (same storage class) normalizes values',
+		seed: [`create table t (id integer primary key, v text) using store`, `insert into t values (1, '2024-06-05T00:00:00Z')`],
+		alter: `alter table t alter column v set data type date`,
+		expect: { kind: 'honored' },
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'v');
+			if (outcome === 'honored') {
+				expect(String(info?.type).toLowerCase(), 'declared type now DATE').to.contain('date');
+				expect((await rows(db, `select v from t`)).map(x => x.v), 'value rewritten to canonical form').to.deep.equal(['2024-06-05']);
+				expect((await rows(db, `select id from t where v = '2024-06-05'`)).map(x => x.id), 'equality lookup finds the normalized row').to.deep.equal([1]);
+			} else {
+				expect(String(info?.type).toLowerCase()).to.contain('text');
+			}
+		},
+	},
+	{
+		// Mirrors the memory leg: normalization collapses two previously-distinct spellings
+		// ('2024-06-05' and '2024-06-05T00:00:00Z' are one DATE), so the UNIQUE re-validation
+		// over the CONVERTED rows rejects before anything mutates.
+		label: 'alterColumn SET DATA TYPE (same storage class, normalization collides under UNIQUE) → CONSTRAINT',
+		seed: [
+			`create table t (id integer primary key, v text, constraint u_v unique (v)) using store`,
+			`insert into t values (1, '2024-06-05'), (2, '2024-06-05T00:00:00Z')`,
+		],
+		alter: `alter table t alter column v set data type date`,
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /unique/i },
+		confirm: async (db) => {
+			expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged after collision reject').to.contain('text');
+			expect((await rows(db, `select id, v from t order by id`)).map(x => x.v), 'both spellings survive').to.deep.equal(['2024-06-05', '2024-06-05T00:00:00Z']);
+			await db.exec(`insert into t values (3, '2024-06-05T06:00:00Z')`); // still writable, still textual UNIQUE
+		},
+	},
+	{
 		// Mirrors the memory leg's arm of the same label. The guard is engine-side (it fires
 		// before module.alterTable), so the store inherits it — which is the point: without it
 		// the store PERSISTS `d DATE COLLATE NOCASE` into its catalog DDL and then silently
