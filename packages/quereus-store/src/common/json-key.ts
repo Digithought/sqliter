@@ -53,12 +53,14 @@
  *   string leaves and object keys order as `compareCodePoints` does.
  *
  * NOTE: a TOP-LEVEL string value orders by code point here, which matches the
- * BINARY-collation typed comparator every store-relevant path uses (the isolation
- * merge, UNIQUE enforcement, the memory BTree's collation-carrying comparator).
- * Bare `JSON_TYPE.compare` with NO collation argument instead RE-PARSES a
- * JSON-parseable string leaf ('9' vs '10' compares 9 < 10 numerically); no store
- * path invokes it that way, but keep the distinction in mind when testing against
- * the raw type object.
+ * BINARY-collation typed comparator the ORDERING paths use (the isolation merge,
+ * UNIQUE enforcement, the memory BTree's collation-carrying comparator). Bare
+ * `JSON_TYPE.compare` with NO collation argument instead RE-PARSES a JSON-parseable
+ * string leaf, so it calls the strings '9' and '9.0' EQUAL. Two PK-EQUALITY sites do
+ * build the comparator that way — `resolvePkSemanticEquality` (store-table.ts) and
+ * the isolation layer's `getPkSemanticComparators` — so they disagree with these key
+ * bytes for JSON string leaves. Pre-dates this encoder (canonical text disagreed the
+ * same way); tracked as fix `bug-json-pk-equality-drops-collation`.
  *
  * ## Identity
  *
@@ -110,6 +112,10 @@ const utf8 = new TextEncoder();
  * NESTED JSON null is a real node and encodes with its own tag.
  */
 export function jsonStructuralKey(value: SqlValue): SqlValue {
+	// NOTE: accumulates into a number[] and copies once into a Uint8Array — two passes
+	// and a boxed intermediate per key encode, which is nothing for the small values a
+	// key member normally holds. If large JSON keys (deep documents, long string leaves)
+	// ever show up hot, write into a growable Uint8Array instead.
 	const out: number[] = [];
 	pushJsonNode(out, value);
 	return Uint8Array.from(out);

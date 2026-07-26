@@ -91,6 +91,61 @@ describe('jsonStructuralKey', () => {
 		});
 	});
 
+	describe('differential sweep over generated values', () => {
+		// The hand-written corpus above only proves the layouts its author thought of.
+		// This generator draws from every node kind at every nesting depth, so a body
+		// layout that is order-correct for the shapes above but wrong for (say) an
+		// object whose key sections tie and whose values then decide is caught here.
+		// Deterministic (fixed-seed LCG) — a failure reproduces exactly.
+		const nextRandom = (() => {
+			let state = 0x2f6e2b1;
+			return (): number => {
+				state = (state * 1103515245 + 12345) & 0x7fffffff;
+				return state / 0x80000000;
+			};
+		})();
+		const pick = <T>(items: readonly T[]): T => items[Math.floor(nextRandom() * items.length)];
+
+		const SCALARS: readonly SqlValue[] = [
+			null, false, true,
+			-1e308, -1, -0.5, 0, 1e-320, 0.5, 1, 2, 3, 10, 1e308, Infinity,
+			'', '1', '9', '10', 'a', 'ab', 'A', 'é', 'é', '￿', '\u{1F600}', '\u{10FFFF}',
+		];
+		const KEYS: readonly string[] = ['', 'a', 'ab', 'b', 'A', 'é', '￿', '\u{1F600}'];
+
+		const generate = (depth: number): SqlValue => {
+			if (depth <= 0 || nextRandom() < 0.5) return pick(SCALARS);
+			const length = Math.floor(nextRandom() * 4);
+			if (nextRandom() < 0.5) {
+				return Array.from({ length }, () => generate(depth - 1));
+			}
+			const object: Record<string, SqlValue> = {};
+			for (let i = 0; i < length; i++) object[pick(KEYS)] = generate(depth - 1);
+			return object;
+		};
+
+		it('memcmp of key bytes matches the comparator for every generated pair', () => {
+			const comparator = createTypedComparator(JSON_TYPE, BINARY_COLLATION);
+			const values = Array.from({ length: 400 }, () => generate(4));
+			const keys = values.map(key);
+			// The pair label is built only on mismatch — eagerly stringifying both sides
+			// of every pair costs more than the whole comparison sweep.
+			const label = (i: number, j: number): string =>
+				`${JSON.stringify(values[i])} vs ${JSON.stringify(values[j])}`;
+			for (let i = 0; i < values.length; i++) {
+				for (let j = 0; j < values.length; j++) {
+					const byType = sign(comparator(values[i], values[j]));
+					if (sign(compareBytes(keys[i], keys[j])) !== byType) {
+						expect.fail(`order mismatch: ${label(i, j)} — comparator ${byType}`);
+					}
+					// Identity is the other half of the contract: comparator-equal values
+					// MUST land on one physical key, or two spellings become two rows.
+					if (byType === 0) expect(keys[i], label(i, j)).to.deep.equal(keys[j]);
+				}
+			}
+		});
+	});
+
 	describe('rejections', () => {
 		it('raises on a string leaf holding an unpaired surrogate', () => {
 			expect(() => jsonStructuralKey(['a\uD800b'])).to.throw(/unpaired surrogate/i);

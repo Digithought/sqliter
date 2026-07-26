@@ -36,6 +36,13 @@ so an explicit per-type assertion is safer). Constraint values seek through the 
 
 Edges to decide before widening:
 
+- The two `buildIndexPrefixBounds` calls in `StoreTable` (`analyzeIndexAccess`'s
+  EQ-prefix arm and `buildIndexRangeBounds`) pass NO key transforms. That is sound
+  only because both arms decline semantic-ordering columns today. Thread the
+  column's transforms through before re-opening either arm, or the seek window will
+  address raw-value bytes while the index holds transformed ones — a silently
+  under-fetching window with no residual able to resurrect the missed rows.
+
 - TIMESPAN: an UNPARSEABLE stored value falls back to raw-text key bytes
   (numeric-tagged keys sort before text-tagged ones), while `compare` falls back to
   BINARY text comparison — mixed parseable/unparseable pairs would break the order

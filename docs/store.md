@@ -633,8 +633,11 @@ them would share one key). The store closes that gap from the other side: `encod
 offending code unit and offset. This is the one deliberate divergence between a memory table
 (accepts the value — the comparators stay total) and a store-backed table (raises at encode
 time), and it is what makes the built-ins' `orderPreserving` stamp true over every value a
-store-backed table can hold. Object/JSON keys need no such guard: their bytes come from
-`JSON.stringify`, which escapes a lone surrogate to ASCII.
+store-backed table can hold. A key member on an **`any`** column holding an object needs no
+such guard: its bytes come from `JSON.stringify`, which escapes a lone surrogate to ASCII.
+A member on a column DECLARED `json` does: it keys through the structural byte form
+(`jsonStructuralKey`, `json-key.ts`), which encodes real UTF-8, so a lone surrogate in a
+string leaf or an object key raises exactly as `encodeText` raises for a text column.
 
 Identifiers are guarded the same way. `buildCatalogKey`, `buildViewCatalogKey`,
 `buildMaterializedViewCatalogKey`, and `buildStatsKey` (`key-builder.ts`) all raise before
@@ -649,6 +652,8 @@ Note also that a text-capable but non-textual primary-key column (`any`, `json`,
 type) is keyed under `BINARY`, not under the table key collation `K` — matching the `BINARY`
 the engine compares it under, so its range seeks and PK-order advertisement stand and its
 uniqueness is enforced bytewise. See "Per-column PK key collation" in [schema.md](schema.md).
+(A declared-`json` member takes no collation at all: its transform hands `encodeValue` a
+`Uint8Array`, which the BLOB path encodes verbatim — no normalizer runs.)
 
 ## Package Structure
 
@@ -659,6 +664,7 @@ packages/quereus-store/                # Core (platform-agnostic)
   src/
     common/
       encoding.ts       # Key encoding utilities (type-prefixed sort-safe encoding)
+      json-key.ts       # Structural key bytes for declared-json key members
       key-builder.ts    # Store naming and key construction utilities
       serialization.ts  # Extended JSON row serialization
       kv-store.ts       # KVStore and KVStoreProvider interfaces
