@@ -509,6 +509,10 @@ export class MemoryTableManager {
 				// key's shape from the PK arity, never from `Array.isArray` — a JSON PK whose
 				// value is a document like `[1]` is a SCALAR key that happens to be a JS
 				// array, and sniffing it would emit `[1]` where the contract wants `[[1]]`.
+				// NOTE: on the tuple path this hands listeners the STORED key array itself
+				// (`VTableDataChangeEvent.key` is mutable `SqlValue[]`, as it always was).
+				// If a listener is ever seen mutating `event.key`, copy here — an in-place
+				// edit would re-order the primary tree under the comparator.
 				const eventKeyIsTuple = primaryKeyArity(this.tableSchema) !== 1;
 				for (const change of changes) {
 					const event: import('../../events.js').VTableDataChangeEvent = {
@@ -1301,6 +1305,9 @@ export class MemoryTableManager {
 		// Component-array view of the source PK. Shape comes from the PK arity, never
 		// from `Array.isArray` — a single-column JSON PK holding a document like `[1]`
 		// is a scalar key that is also a JS array (see the `BTreeKey` invariant).
+		// A wrong shape here only WIDENS the candidate set (the row fails its own
+		// self-exclusion), and the loop below re-excludes self through the real PK
+		// comparator — which is why no query result can observe this line.
 		const newSourcePk = keyParts(newPrimaryKey, primaryKeyArity(schema) !== 1) as SqlValue[];
 		const conflicts = await this.db._lookupCoveringConflicts(mv, uc, newRowData, newSourcePk);
 		// Re-validate under each column's enforcement collation — the index's per-column

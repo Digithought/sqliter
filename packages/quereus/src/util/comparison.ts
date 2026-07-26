@@ -233,10 +233,11 @@ function compareNumbers(a: number | bigint, b: number | bigint): number {
  * then key list, then values. This branch's order is what the store's `encodeObject`
  * writes as UTF-8 and physically sorts by.
  *
- * This branch is only reached for a value whose column is NOT declared `json`. A declared
- * JSON column is compared through `createTypedComparator(JSON_TYPE, …)` everywhere it is
- * ordered — the memory BTree's key comparator, `<`/`>`/BETWEEN at runtime, and ORDER BY —
- * so an indexed JSON range seek walks exactly the window the operators evaluate.
+ * This branch is reached only where an OBJECT value is ordered WITHOUT a declared JSON
+ * logical type to route it. A declared JSON column is compared through
+ * `createTypedComparator(JSON_TYPE, …)` everywhere it is ordered — the memory BTree's key
+ * comparator, `<`/`>`/BETWEEN at runtime, and ORDER BY — so an indexed JSON range seek
+ * walks exactly the window the operators evaluate.
  *
  * NOTE: assumes OBJECT-class values are treated as immutable — the string is cached on
  * first serialization and never invalidated, so mutating a value in place after it has
