@@ -927,15 +927,15 @@ During the row loop the executor accumulates each affected row's OLD referenced-
 into per-execution, per-FK state (`createParentRestrictBatch` /
 `accumulateParentRestrictKeys`, `runtime/foreign-key-actions.ts`) — deduplicated on an
 injective serialization, skipping tuples containing NULL (MATCH SIMPLE) and UPDATE rows
-that change no referenced column. "Change" is decided against the value the column will
-actually store, not the raw UPDATE text: the shared `anyReferencedColumnChanged` helper
-re-coerces a non-identical NEW value through the column's logical type (the same
-`validateAndParse` conversion `coerceRowToSchema` applies moments later) before comparing
-again, so rewriting a key with an equivalent-but-differently-spelled value (`1` as the text
-`'1'`, a JSON object with reordered keys) does not read as a change. Collation is
-deliberately excluded from that comparison — it answers "will the stored value differ?",
-not "would an equality test call these equal?" — see the helper's doc comment for the
-reasoning. The state is allocated per execution (never on the emit
+that change no referenced column. "Change" means the value the column will actually
+**store** differs, not that the UPDATE text differs: `anyReferencedColumnChanged` re-coerces
+a non-identical NEW value through the column's logical type (the same `validateAndParse`
+conversion `coerceRowToSchema` applies moments later) before comparing again, so rewriting a
+key as an equivalent-but-differently-spelled value (`1` as the text `'1'`, a JSON object with
+reordered keys) is not a change. The comparison is deliberately BINARY, not the column's
+collation — a `nocase` column still stores `'A'` and `'a'` distinctly. The same helper backs
+the per-row pre-walk and the lens pre-check, so all four enforcement sites agree; see its doc
+comment for the failure-direction reasoning. The state is allocated per execution (never on the emit
 closure), so a re-run prepared statement starts empty. `flushParentRestrictBatch` fires in
 `runWithStatementSavepoints` after the row loop, **before** the deferred-maintenance flush
 (fail fast — skip wasted MV work) and before the statement savepoint releases, probing

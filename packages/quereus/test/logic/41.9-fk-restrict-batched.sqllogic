@@ -270,3 +270,21 @@ update crbj_p set id = '{"a":9,"b":9}' where tag = 1;
 
 drop table crbj_c;
 drop table crbj_p;
+
+-- The re-coercion compares BINARY on purpose: the column's collation says which
+-- values an equality test calls equal, not which value gets STORED. A case-only
+-- rewrite of a `collate nocase` key does change the stored value, so it must still
+-- count as a change and flush a violating probe.
+
+create table crbn_p (id text collate nocase primary key);
+create table crbn_c (cid integer primary key, p_id text,
+	foreign key (p_id) references crbn_p(id) on update restrict);
+
+insert into crbn_p values ('A');
+insert into crbn_c values (10, 'A');
+
+update crbn_p set id = 'a' where id = 'A';
+-- error: violates RESTRICT from 'crbn_c'
+
+drop table crbn_c;
+drop table crbn_p;
