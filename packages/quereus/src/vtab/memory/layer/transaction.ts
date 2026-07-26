@@ -41,6 +41,19 @@ export interface OwnWrite {
 }
 
 /**
+ * One layer's net own-writes at the post-ADD/DROP-COLUMN arity, computed fallibly by
+ * {@link TransactionLayer.prepareReshapedColumns} and installed infallibly by
+ * {@link TransactionLayer.installReshapedColumns} — see those methods for why the
+ * two phases are split.
+ */
+export interface PreparedColumnReshape {
+	/** Keys this layer's net effect deletes. Key values are invariant under a column-set change. */
+	survivingDeletions: BTreeKeyForPrimary[];
+	/** This layer's net effective rows, rewritten to the new column set. */
+	upserts: Row[];
+}
+
+/**
  * Represents a set of modifications (inserts, updates, deletes) applied
  * on top of a parent Layer using inherited BTrees with copy-on-write semantics.
  * These layers are immutable once committed.
@@ -59,8 +72,10 @@ export class TransactionLayer implements Layer {
 	 * Schema when this layer was started. Replaced when DDL runs inside this layer's own
 	 * transaction: by {@link adoptSchema} for additive index/constraint DDL, a secondary-index
 	 * re-key from `alter column … set collate`, and index/constraint removal (`drop index` /
-	 * `drop constraint`), and by {@link rekeyPrimaryKey} when that collate change lands on a
-	 * primary-key column. The column set is identical across every such swap.
+	 * `drop constraint`); by {@link rekeyPrimaryKey} when that collate change lands on a
+	 * primary-key column; and by {@link installReshapedColumns} when `add column` / `drop
+	 * column` changes the column set itself. Every swap except the last keeps the column set
+	 * identical.
 	 */
 	private tableSchemaAtCreation: TableSchema;
 
@@ -195,8 +210,10 @@ export class TransactionLayer implements Layer {
 	 *
 	 * Never applied to a column-set or primary-key change: either would invalidate
 	 * {@link pkFunctions} and the primary tree. A PK-column collation change goes to
-	 * {@link rekeyPrimaryKey} instead, and `ensureSchemaChangeSafety` raises BUSY when any
-	 * connection other than the DDL issuer holds a pending layer.
+	 * {@link rekeyPrimaryKey} instead, a column-set change (`add column` / `drop column`) to
+	 * {@link prepareReshapedColumns} / {@link installReshapedColumns}, and
+	 * `ensureSchemaChangeSafety` raises BUSY when any connection other than the DDL issuer
+	 * holds a pending layer.
 	 */
 	public adoptSchema(newSchema: TableSchema): void {
 		const oldSchema = this.tableSchemaAtCreation;
@@ -427,6 +444,109 @@ export class TransactionLayer implements Layer {
 		// Any secondary index on the column holds keys extracted from the OLD value. Rebuild every
 		// index over the parent's freshly-converted trees (matching the base's unconditional rebuild),
 		// then re-file this layer's own converted writes.
+		this.secondaryIndexes = new Map();
+		this.initializeSecondaryIndexes();
+		for (const index of this.secondaryIndexes.values()) {
+			this.reindexOwnWrites(index);
+		}
+	}
+
+	/**
+	 * Computes — without mutating anything — what {@link installReshapedColumns} will install
+	 * for an `alter table … add column` / `drop column` applied while THIS layer's transaction
+	 * is still open: the net per-key effect of the layer's own writes, with each surviving row
+	 * run through `reshapeRow` to the new column set.
+	 *
+	 * Split from the install (unlike {@link convertColumn}, which mutates in one pass) because
+	 * this rewrite can FAIL: an ADD COLUMN with a per-row `default (new.<col>)` expression
+	 * evaluates that expression against each pending row, and it can throw — or produce NULL
+	 * for a NOT NULL column — on a pending row even when every committed row backfilled cleanly.
+	 * The rewrite is async for the same reason (`convertColumn`'s value map is a pure function;
+	 * a backfill evaluator is engine-supplied and may await). `MemoryTableManager` therefore runs
+	 * every prepare — one per open layer — BEFORE the first mutation anywhere (base included), so
+	 * a failure rejects the whole ALTER with every structure untouched; there is no undo for a
+	 * half-reshaped layer chain.
+	 *
+	 * Own writes collapse to one entry per key exactly as {@link convertColumn}'s pass does: the
+	 * primary key is unchanged by a column-set change (ADD appends past every key index; dropping
+	 * a PK column is rejected upstream), so a key is either finally-deleted or finally-upserted,
+	 * never both, and no key can collapse onto another.
+	 */
+	public async prepareReshapedColumns(reshapeRow: (row: Row) => Row | Promise<Row>): Promise<PreparedColumnReshape> {
+		const seen = new Set<string>();
+		const survivingDeletions: BTreeKeyForPrimary[] = [];
+		const upserts: Row[] = [];
+		for (const write of this.ownWrites) {
+			const encoded = this.pkFunctions.encode(write.primaryKey);
+			if (seen.has(encoded)) continue;
+			seen.add(encoded);
+
+			// `get` traverses the inheritance chain, so this is the layer's EFFECTIVE row:
+			// undefined when the layer deleted the key, the layer's own row otherwise.
+			const effectiveRow = this.primaryModifications.get(write.primaryKey);
+			if (effectiveRow === undefined) {
+				survivingDeletions.push(write.primaryKey);
+				continue;
+			}
+			upserts.push(await reshapeRow(effectiveRow));
+		}
+		return { survivingDeletions, upserts };
+	}
+
+	/**
+	 * Adopts an `alter table … add column` / `drop column` applied while THIS layer's
+	 * transaction is still open, installing what {@link prepareReshapedColumns} computed:
+	 * swaps in the new schema, rebuilds the primary tree over the parent's already-reshaped
+	 * one, replays the layer's net own-writes at the new arity, and rebuilds every secondary
+	 * index. Synchronous and mutation-only — everything fallible ran in the prepare phase.
+	 *
+	 * {@link pkFunctions} is REBUILT (unlike {@link convertColumn}, which keeps it): DROP
+	 * COLUMN shifts the primary key's column *indices* (`manager.dropColumn` renumbers
+	 * `primaryKeyDefinition` past the dropped slot), so the row extractor changes even though
+	 * the key *values* do not. Because the values are invariant under both ADD (the new column
+	 * appends past every key index) and DROP (dropping a PK column is rejected upstream), tree
+	 * ordering is preserved and the `primaryKey` values recorded in {@link ownWrites} stay
+	 * valid — no re-key of the kind {@link rekeyPrimaryKey} performs is needed, and the
+	 * prepared deletions apply verbatim.
+	 *
+	 * Like every other open-layer adoption, the caller MUST apply this to the whole parent
+	 * chain oldest-first (base already reshaped): the rebuilt tree inherits copy-on-write from
+	 * the parent's NEW tree, so the parent's must already hold rows at the new arity. The
+	 * rewritten {@link ownWrites} log — carrying reshaped rows — is what the commit-time rebase
+	 * and any later `create index` ({@link reindexOwnWrites}) replay.
+	 */
+	public installReshapedColumns(newSchema: TableSchema, prepared: PreparedColumnReshape): void {
+		this.tableSchemaAtCreation = newSchema;
+		this.pkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
+
+		const { extractFromRow, compare } = this.pkFunctions;
+		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
+		const rebuilt = new BTree<BTreeKeyForPrimary, Row>(
+			(value: Row): BTreeKeyForPrimary => extractFromRow(value),
+			compare,
+			{ base: parentPrimaryTree || undefined },
+		);
+
+		for (const primaryKey of prepared.survivingDeletions) {
+			const path = rebuilt.find(primaryKey);
+			if (path.on) rebuilt.deleteAt(path);
+		}
+		for (const row of prepared.upserts) {
+			rebuilt.upsert(row);
+		}
+		this.primaryModifications = rebuilt;
+
+		this.ownWrites.length = 0;
+		for (const primaryKey of prepared.survivingDeletions) {
+			this.ownWrites.push({ type: 'delete', primaryKey });
+		}
+		for (const row of prepared.upserts) {
+			this.ownWrites.push({ type: 'upsert', primaryKey: extractFromRow(row), newRow: row });
+		}
+
+		// Every secondary index holds rows at the old arity (and, after DROP, possibly stale
+		// column indices in its IndexSchema), and each inherits the parent's freshly-rebuilt
+		// tree — so all of them are rebuilt, then re-filed with this layer's reshaped writes.
 		this.secondaryIndexes = new Map();
 		this.initializeSecondaryIndexes();
 		for (const index of this.secondaryIndexes.values()) {

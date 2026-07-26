@@ -4,7 +4,7 @@ import { keyParts, type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer, iteratePrimaryRows, populateIndexFromRows, populateIndexFromRowsAsync } from './base.js';
-import { TransactionLayer, type OwnWrite } from './transaction.js';
+import { TransactionLayer, type OwnWrite, type PreparedColumnReshape } from './transaction.js';
 import type { Layer } from './interface.js';
 import { MemoryTableConnection } from './connection.js';
 import { MemoryVirtualTableConnection } from '../connection.js';
@@ -1807,6 +1807,22 @@ export class MemoryTableManager {
 				columns: updatedColumnsSchema,
 				columnIndexMap: buildColumnIndexMap(updatedColumnsSchema),
 			});
+			// Phase 1 of reaching the open transaction's own pending rows: compute their
+			// post-ADD shape before ANY mutation, since the per-row backfill below can throw
+			// on a pending row (and there is no undo for a half-reshaped layer chain). The
+			// NOT NULL enforcement mirrors the base backfill's per-row check — and additionally
+			// covers the no-DEFAULT case, which the `tableHasRows` gate above waves through
+			// when the only rows are PENDING ones (it inspects the committed base alone).
+			const reshapePlans = await this.prepareReshapeOnOpenLayers(async (row: Row): Promise<Row> => {
+				const value = backfillEvaluator ? await backfillEvaluator(row) : defaultValue;
+				if (newColumnSchema.notNull && value === null) {
+					throw new QuereusError(
+						`NOT NULL constraint failed: adding column '${this._tableName}.${newColumnSchema.name}' would leave NULL in a row pending in the open transaction`,
+						StatusCode.CONSTRAINT,
+					);
+				}
+				return [...row, value] as Row;
+			});
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
 			// its own value via the engine-supplied evaluator; a literal/NULL default
@@ -1814,6 +1830,7 @@ export class MemoryTableManager {
 			await this.baseLayer.addColumnToBase(newColumnSchema, defaultValue, backfillEvaluator);
 			this.tableSchema = finalNewTableSchema;
 			this.initializePrimaryKeyFunctions();
+			this.installReshapeOnOpenLayers(finalNewTableSchema, reshapePlans);
 
 			// Emit schema change event
 			this.eventEmitter?.emitSchemaChange?.({
@@ -1901,6 +1918,11 @@ export class MemoryTableManager {
 					: undefined,
 			});
 
+			// Phase 1 of reaching the open transaction's own pending rows. The rewrite here is
+			// a pure filter and cannot throw — the split exists for ADD COLUMN's fallible
+			// backfill — but running it before any mutation keeps the two paths uniform.
+			const reshapePlans = await this.prepareReshapeOnOpenLayers((row: Row): Row =>
+				row.filter((_, idx) => idx !== colIndex) as Row);
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			await this.baseLayer.dropColumnFromBase(colIndex);
 			this.tableSchema = finalNewTableSchema;
@@ -1908,6 +1930,7 @@ export class MemoryTableManager {
 			// clear them (keys computed against the pre-drop column names above).
 			for (const key of droppedUcKeys) this.implicitCoveringStructures.delete(key);
 			this.initializePrimaryKeyFunctions();
+			this.installReshapeOnOpenLayers(finalNewTableSchema, reshapePlans);
 
 			// Emit schema change event
 			this.eventEmitter?.emitSchemaChange?.({
@@ -3342,13 +3365,64 @@ export class MemoryTableManager {
 	}
 
 	/**
+	 * Phase 1 of propagating `add column` / `drop column` into every open transaction layer:
+	 * computes each layer's net own-writes rewritten to the new column set, WITHOUT mutating
+	 * anything (see {@link TransactionLayer.prepareReshapedColumns}). Runs BEFORE the base is
+	 * touched, because `reshapeRow` can throw — ADD COLUMN's per-row backfill evaluates an
+	 * engine-supplied `default (new.<col>)` expression against each pending row, and enforces
+	 * NOT NULL on the result — and a failure part-way through a mutation pass would leave the
+	 * base and the already-visited layers at the new arity with the rest at the old, with no
+	 * undo. Failing here instead rejects the ALTER with every structure untouched, exactly like
+	 * the pre-mutation validation passes of `alterColumn`.
+	 *
+	 * The returned plans pin the layer set: {@link installReshapeOnOpenLayers} walks the plans,
+	 * not a fresh chain snapshot, so the two phases cannot disagree about which layers exist.
+	 * Reading each layer's effective rows here — before the base rebuild — yields the same rows
+	 * the single-pass prototype read after it: a layer's pre-reshape tree resolves against the
+	 * parent's OLD tree either way (the base rebuild REPLACES the base's tree object; it never
+	 * mutates the one the layers inherit from).
+	 */
+	private async prepareReshapeOnOpenLayers(
+		reshapeRow: (row: Row) => Row | Promise<Row>,
+	): Promise<Array<{ layer: TransactionLayer; prepared: PreparedColumnReshape }>> {
+		const plans: Array<{ layer: TransactionLayer; prepared: PreparedColumnReshape }> = [];
+		for (const layer of this.openTransactionLayersOldestFirst()) {
+			plans.push({ layer, prepared: await layer.prepareReshapedColumns(reshapeRow) });
+		}
+		return plans;
+	}
+
+	/**
+	 * Phase 2: installs the prepared reshape into each open transaction layer, oldest-first
+	 * (the plans were gathered in that order), after the base has been rebuilt at the new arity
+	 * — each layer's rebuilt tree inherits copy-on-write from its parent's NEW one. Synchronous
+	 * and mutation-only; everything fallible ran in {@link prepareReshapeOnOpenLayers}.
+	 *
+	 * Beyond keeping the transaction's own reads correct, this is what makes the
+	 * `commitTransaction` snapshot-wrap identity check (`readLayer.getSchema() ===
+	 * this.tableSchema`) pass after a `rollback to savepoint`: without it the eager savepoint
+	 * snapshot keeps its frozen pre-ALTER schema, the wrap is skipped, and the snapshot's rows
+	 * are silently dropped at commit.
+	 */
+	private installReshapeOnOpenLayers(
+		newSchema: TableSchema,
+		plans: ReadonlyArray<{ layer: TransactionLayer; prepared: PreparedColumnReshape }>,
+	): void {
+		for (const { layer, prepared } of plans) {
+			layer.installReshapedColumns(newSchema, prepared);
+		}
+	}
+
+	/**
 	 * The DDL connection's open {@link TransactionLayer}s, oldest-first, base excluded — its
 	 * pending layer and every savepoint snapshot below it, the layers on the view's parent chain
 	 * above the base. Empty in autocommit (no connection, or the view IS the base).
 	 *
-	 * Both schema adoption ({@link adoptSchemaOnOpenLayers}) and value conversion
-	 * ({@link convertColumnOnOpenLayers}) MUST apply oldest-first: each layer rebuilds its
-	 * structures over its parent's, so the parent's must already be the new/converted ones.
+	 * Schema adoption ({@link adoptSchemaOnOpenLayers}), value conversion
+	 * ({@link convertColumnOnOpenLayers}), and column-set reshape
+	 * ({@link prepareReshapeOnOpenLayers} / {@link installReshapeOnOpenLayers}) MUST all apply
+	 * oldest-first: each layer rebuilds its structures over its parent's, so the parent's must
+	 * already be the new/converted/reshaped ones.
 	 *
 	 * NOTE: the walk takes every TransactionLayer below the view, which normally means the pending
 	 * layer and its savepoint snapshots. A committed layer already drained into the base by

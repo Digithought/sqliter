@@ -201,7 +201,8 @@ await db.exec("alter table users rename column created_at to registration_date")
 
 `CREATE INDEX` / `CREATE UNIQUE INDEX` / `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` /
 `ALTER TABLE ... ALTER COLUMN ... SET COLLATE` / `ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE` /
-`ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` may run inside an open transaction. Three rules
+`ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` / `ALTER TABLE ... ADD COLUMN` /
+`ALTER TABLE ... DROP COLUMN` may run inside an open transaction. Three rules
 define what that means.
 
 **1. Row-validating DDL sees exactly what a `SELECT` in the same transaction sees.**
@@ -331,6 +332,33 @@ which live in the pending layer, not the base — and avoids mutating a base the
 (`MutatedBaseError`). The key bytes never change, so no primary-key re-key is involved. This matches
 the store backend, whose `alterColumnSetNotNull` flushes buffered writes before its `mapRowsAtIndex`
 backfill.
+
+**`ADD COLUMN` / `DROP COLUMN` reshape the open transaction's own pending rows too.** The base
+rewrite (`addColumnToBase` / `dropColumnFromBase`) reaches only committed rows; the DDL
+connection's uncommitted rows live in its open transaction layers, which would otherwise keep the
+pre-ALTER arity under their frozen schema. Left alone, that mismatch is not merely a stale read:
+mid-transaction `SELECT`s project *every* row — committed ones included — through the stale column
+list, a `DROP` of a column preceding others commits rows whose values sit one slot off their
+column names, and after a `ROLLBACK TO SAVEPOINT` the commit-time snapshot wrap (which requires
+the read layer's schema to be the *current* one) is skipped and the snapshot's rows are dropped at
+commit. `TransactionLayer.prepareReshapedColumns` / `installReshapedColumns` close this the same
+way `convertColumn` does for value rewrites, applied oldest-first: each layer's own-write log is
+collapsed to its net per-key effect, each surviving row is rewritten to the new column set (ADD
+appends the backfilled value — including a per-row `default (new.<col>)` evaluated against the
+pending row itself — DROP filters out the dropped slot), the layer's primary tree is rebuilt over
+its parent's already-reshaped one, and every secondary index is rebuilt. Unlike `convertColumn`,
+the primary-key *functions* are rebuilt — `DROP COLUMN` shifts the PK's column indices — but the
+key *values* are invariant (ADD appends past them; dropping a PK column is rejected), so tree
+ordering and the recorded own-write keys survive unchanged. The rewrite is split into a fallible
+compute phase and an infallible install phase because the ADD backfill can throw on a pending row
+even when every committed row converts cleanly: all computation runs *before* the first mutation
+anywhere, so a failure — including a per-row DEFAULT that yields NULL for a `NOT NULL` column on a
+pending row, or `ADD COLUMN ... NOT NULL` without a DEFAULT when the only rows are pending ones —
+rejects the ALTER with the schema, the base, and every layer untouched. As with every schema
+change here, the ALTER itself is **not** undone by `ROLLBACK` / `ROLLBACK TO SAVEPOINT` (DDL is
+non-transactional — see the declared-contract paragraph above); what the reshape guarantees is
+that the transaction's DML — including rows inserted before a savepoint — survives at the new
+arity.
 
 **3. A collation change on a PRIMARY KEY column obeys a stricter rule, because the primary tree
 is a map.** A secondary index is a multi-map and tolerates two primary keys under one index key,
