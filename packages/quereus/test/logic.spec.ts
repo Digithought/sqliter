@@ -43,7 +43,8 @@ const MEMORY_ONLY_FILES = new Set([
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
   // '41-foreign-keys.sqllogic' was excluded here; now fixed by IsolatedTable surfacing replacedRow for OR REPLACE store-side displacements
   // '41.7.1-alter-column-collate-unique.sqllogic' is now cross-module: the store keys the PK per-column (store-pk-collate-physical-rekey), so an explicit `collate binary` PK holds the 'a'/'A' pair and re-keys it under SET COLLATE just like memory
-  '41.7.3-alter-column-retype-unique.sqllogic',  // Memory-only until bug-retype-unique-revalidation-store lands: the store does not re-validate UNIQUE after a value-rewriting ALTER COLUMN either, and has a further defect of its own on that path
+  // '41.7.3-alter-column-retype-unique.sqllogic' is now cross-module: the store defers the ALTER COLUMN value rewrite until after the UNIQUE re-validation over converted values (bug-retype-unique-revalidation-store)
+  '41.7.3.1-alter-column-retype-staged-rows-memory.sqllogic',  // Memory-only until bug-isolation-retype-leaves-staged-rows-unconverted lands: the isolation overlay the store runs behind does not convert the transaction's staged rows on an accepted retype
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
   // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
   '103-database-options-edge-cases.sqllogic',  // Asserts default_vtab_module='memory'; store-mode harness sets it to 'store'

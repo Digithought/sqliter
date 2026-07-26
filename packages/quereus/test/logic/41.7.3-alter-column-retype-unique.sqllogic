@@ -15,9 +15,10 @@
 -- collision only among rows it has DELETED does not block the change, while one among
 -- rows it has INSERTED but not committed does reject it.
 --
--- MEMORY-ONLY (listed in MEMORY_ONLY_FILES) for now: the store backend has the same
--- missing re-validation plus a further defect of its own, both fixed by ticket
--- bug-retype-unique-revalidation-store, which removes the entry.
+-- Cross-module: the memory backend probes the converted rows before replacing its base
+-- tree, and the store backend defers its value rewrite (`mapRowsAtIndex`) until after the
+-- same probe — so on both, a rejection leaves the stored values AND the declared type at
+-- their old form (the `table_info` checks below pin the declared-type half).
 --
 -- NOTE: a bare `v text` column is NOT NULL in this engine; the NULL sections below
 -- declare `v text null` so they can hold NULLs at all.
@@ -38,6 +39,11 @@ alter table ri alter column v set data type integer;
 -- rolled back: both rows survive as their original TEXT values
 select id, v, typeof(v) from ri order by id;
 → [{"id":1,"v":"1","typeof(v)":"text"},{"id":2,"v":"01","typeof(v)":"text"}]
+
+-- ...and the DECLARED type is unchanged too — a rejection must not leave rewritten values
+-- behind a stale catalog type, nor a changed catalog over old values
+select name, type from table_info('ri') where name = 'v';
+→ [{"name":"v","type":"TEXT"}]
 
 -- the table is still writable, and the index still enforces under the unchanged type
 insert into ri values (3, '001');
@@ -160,6 +166,10 @@ alter table ok1 alter column v set data type integer;
 
 select id, v, typeof(v) from ok1 order by id;
 → [{"id":1,"v":10,"typeof(v)":"integer"},{"id":2,"v":9,"typeof(v)":"integer"}]
+
+-- the accepted retype updates the declared type in lockstep with the values
+select name, type from table_info('ok1') where name = 'v';
+→ [{"name":"v","type":"INTEGER"}]
 
 -- index-backed lookup by the new numeric value
 select id from ok1 where v = 9;
@@ -284,6 +294,9 @@ drop table tx2;
 -- ===================================
 -- 10. A rejected retype leaves the transaction USABLE: removing the offending row and
 --     retrying inside the same transaction succeeds, and the whole thing commits.
+--     (The variant where the transaction also INSERTS a row the retry must convert
+--     lives in 41.7.3.1-…-memory.sqllogic until the isolation layer converts staged
+--     rows — bug-isolation-retype-leaves-staged-rows-unconverted.)
 -- ===================================
 
 create table tx3 (id integer primary key, v text);
@@ -302,14 +315,12 @@ alter table tx3 alter column v set data type integer;
 -- still writable after the rejection, and the retry now passes
 delete from tx3 where id = 2;
 -- run
-insert into tx3 values (3, '7');
--- run
 alter table tx3 alter column v set data type integer;
 -- run
 commit;
 -- run
 
 select id, v, typeof(v) from tx3 order by id;
-→ [{"id":1,"v":1,"typeof(v)":"integer"},{"id":3,"v":7,"typeof(v)":"integer"}]
+→ [{"id":1,"v":1,"typeof(v)":"integer"}]
 
 drop table tx3;
