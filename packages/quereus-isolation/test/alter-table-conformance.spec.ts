@@ -634,3 +634,98 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		expect(info?.notnull, 'column tightened to NOT NULL').to.equal(1);
 	});
 });
+
+// ── Wrapper-specific: a constraint declared INLINE on an added column.
+//
+// `ALTER TABLE ADD COLUMN c … check (…) / references … ` no longer merges the constraint
+// into the engine's catalog copy; it issues a follow-up `alterTable({ addConstraint })`
+// per inline constraint so the MODULE owns it (and it survives later structural ALTERs).
+// Those extra round-trips now pass through the isolation wrapper, whose ADD CONSTRAINT
+// forwarding is per class (CHECK forwards to the overlay, FK deliberately does not, UNIQUE
+// lands as a tombstone-narrowed unique index) — so the wrapper must neither drop the
+// constraint nor turn its rejection into a silent success.
+
+describe('ADD COLUMN with an inline constraint (isolation layer)', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+		db.registerModule('isolated', new IsolationModule({ underlying: new MemoryTableModule() }));
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('an inline CHECK is declared, enforced, and survives an unrelated DROP COLUMN', async () => {
+		await db.exec(`create table t (id integer primary key, junk text null) using isolated`);
+		await db.exec(`insert into t values (1, 'j')`);
+		await db.exec(`alter table t add column w integer null check (w is null or w > 0)`);
+
+		await expectConstraint(db, `insert into t values (2, 'k', -5)`, 'inline CHECK');
+
+		// The ALTER that used to eat an engine-only constraint.
+		await db.exec(`alter table t drop column junk`);
+		expect(await rows(db, `select name from check_constraint_info('t')`), 'CHECK still declared')
+			.to.deep.equal([{ name: '_check_w' }]);
+		await expectConstraint(db, `insert into t values (3, -5)`, 'inline CHECK after DROP COLUMN');
+
+		await db.exec(`insert into t values (4, 7)`);
+		expect(await rows(db, `select id, w from t order by id`)).to.deep.equal([
+			{ id: 1, w: null }, { id: 4, w: 7 },
+		]);
+	});
+
+	it('an inline FOREIGN KEY is declared and enforced through the wrapper', async () => {
+		await db.exec(`pragma foreign_keys = true`);
+		await db.exec(`create table p (pid integer primary key) using isolated`);
+		await db.exec(`insert into p values (1)`);
+		await db.exec(`create table t (id integer primary key) using isolated`);
+		await db.exec(`insert into t values (1)`);
+		await db.exec(`alter table t add column fk integer null references p(pid)`);
+
+		expect(await rows(db, `select name, referenced_table from foreign_key_info('t')`))
+			.to.deep.equal([{ name: '_fk_t_fk', referenced_table: 'p' }]);
+		await expectConstraint(db, `insert into t values (2, 99)`, 'inline FK');
+		await db.exec(`insert into t values (3, 1)`); // satisfied reference is accepted
+	});
+
+	it('a rejected add leaves no constraint stranded, and a satisfied retry works', async () => {
+		await db.exec(`pragma foreign_keys = true`);
+		await db.exec(`create table p (pid integer primary key) using isolated`);
+		await db.exec(`insert into p values (1)`);
+		await db.exec(`create table t (id integer primary key, junk text null) using isolated`);
+		await db.exec(`insert into t values (1, 'j')`);
+
+		// DEFAULT 5 satisfies the CHECK (so it installs) but references a missing parent,
+		// so the FK arm aborts and the revert must hand the CHECK back.
+		const err = await attemptAlter(db,
+			`alter table t add column parent integer default 5 check (parent > 0) references p(pid)`);
+		expect(err, 'FK over existing rows must reject').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
+
+		expect(await columnNames(db), 'column dropped again').to.not.include('parent');
+		expect(await rows(db, `select count(*) as c from check_constraint_info('t')`)).to.deep.equal([{ c: 0 }]);
+		expect(await rows(db, `select count(*) as c from foreign_key_info('t')`)).to.deep.equal([{ c: 0 }]);
+		await db.exec(`insert into t values (2, 'k')`); // original shape still writable
+
+		await db.exec(`alter table t add column parent integer default 1 check (parent > 0) references p(pid)`);
+		expect(await rows(db, `select name from check_constraint_info('t')`))
+			.to.deep.equal([{ name: '_check_parent' }]);
+		await expectConstraint(db, `insert into t values (3, 'z', 0)`, 'retried inline CHECK');
+	});
+
+	it('an inline CHECK reaches staged overlay rows and holds past commit', async () => {
+		await db.exec(`create table t (id integer primary key, junk text null) using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, 'j')`); // lives only in the overlay
+		await db.exec(`alter table t add column w integer null check (w is null or w > 0)`);
+
+		expect(await rows(db, `select id, junk, w from t`), 'staged row migrated forward')
+			.to.deep.equal([{ id: 1, junk: 'j', w: null }]);
+		await expectConstraint(db, `insert into t values (2, 'k', -5)`, 'inline CHECK in-transaction');
+
+		await db.exec('commit');
+		await expectConstraint(db, `insert into t values (3, 'k', -5)`, 'inline CHECK past commit');
+	});
+});

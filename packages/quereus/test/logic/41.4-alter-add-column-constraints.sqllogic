@@ -665,3 +665,60 @@ insert into t_rev values (4, 'z', 99);
 
 drop table t_rev;
 drop table p_rev;
+-- run
+
+-- 7g. Per-row (expression) DEFAULT together with an inline CHECK.
+--
+-- The two default kinds validate the CHECK in different places: a literal DEFAULT by a
+-- post-backfill scan, a per-row DEFAULT inside the backfill hook itself (against each
+-- freshly-computed value, since the scan would read a stale pre-backfill snapshot). Only
+-- the literal half was covered; this pins the per-row half in both directions, and that
+-- the CHECK still reaches the module on this path (it is declared, and it survives a
+-- later structural ALTER — the whole point of the reroute).
+create table t_perrow (id integer primary key, v integer null, junk text null);
+insert into t_perrow values (1, 10, 'j'), (2, 20, 'k');
+-- run
+
+alter table t_perrow add column w integer null default (new.v * 2) check (w is null or w > 0);
+-- run
+
+select id, w from t_perrow order by id;
+→ [{"id":1,"w":20},{"id":2,"w":40}]
+
+select count(*) as c from check_constraint_info('t_perrow') where name = '_check_w';
+→ [{"c":1}]
+
+-- the CHECK is the module's now, so an unrelated structural ALTER cannot eat it
+alter table t_perrow drop column junk;
+-- run
+
+select count(*) as c from check_constraint_info('t_perrow') where name = '_check_w';
+→ [{"c":1}]
+
+insert into t_perrow values (3, 1, -5);
+-- error: CHECK
+
+drop table t_perrow;
+-- run
+
+-- ...and the violating direction: a per-row default that computes a CHECK-violating value
+-- for an existing row aborts inside the backfill, leaving the table untouched.
+create table t_perrow_bad (id integer primary key, v integer null);
+insert into t_perrow_bad values (1, -3);
+-- run
+
+alter table t_perrow_bad add column w integer null default (new.v) check (w > 0);
+-- error: CHECK
+
+select * from t_perrow_bad;
+→ [{"id":1,"v":-3}]
+
+select count(*) as c from check_constraint_info('t_perrow_bad');
+→ [{"c":0}]
+
+-- writes still work over the original shape
+insert into t_perrow_bad values (2, 5);
+select count(*) as c from t_perrow_bad;
+→ [{"c":2}]
+
+drop table t_perrow_bad;

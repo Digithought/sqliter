@@ -1150,26 +1150,43 @@ default kind:
   column's declared collation is carried into the predicate so comparisons resolve
   the same collation as at write time.
 
-The compiled CHECKs are also merged into the table-level constraint set, so future
-INSERT/UPDATE enforce them the same way. `ADD CONSTRAINT` likewise validates at
-first INSERT/UPDATE.
+**Where the inline constraints end up.** All three kinds declarable inline on the
+added column — UNIQUE, CHECK, FOREIGN KEY — are synthesized into the equivalent
+*table-level* `AST.TableConstraint` over the new column (the three
+`extractColumnLevel*` helpers in `schema/constraint-builder.ts`) and handed to
+`module.alterTable({ type: 'addConstraint', constraint })`, one call each, in the
+order UNIQUE → CHECK → FK. That is the **same** path `ALTER TABLE ADD CONSTRAINT`
+takes, so the *module* owns the constraint exactly as it owns one written in `CREATE
+TABLE`. Ownership is what makes it durable: every later structural ALTER (`DROP
+COLUMN`, `RENAME COLUMN`, …) asks the module for the new table schema and installs
+that answer in the catalog verbatim, so a constraint merged only into the engine's
+catalog copy is dropped on the floor by the next one — silently, with bad data
+accepted afterwards. Consequences of routing through the module:
 
-A **column-level FOREIGN KEY** added via `ADD COLUMN` validates the existing
-(backfilled) rows against the referenced parent, for **both** default kinds, via a
-single post-`alterTable` scan using the shared `validateForeignKeyOverExistingRows`
-primitive — the same one `ADD CONSTRAINT` calls, so the two paths cannot drift. It is
-MATCH SIMPLE (a fully-non-NULL backfilled value with no matching parent row aborts; a
-NULL value satisfies the FK), pragma-gated (`pragma foreign_keys = false` skips it),
-and runs in the **same try/revert region** as the literal-default CHECK scan, so a
-violation drops the new column and restores the original catalog entry. Unlike CHECK,
-FK validation runs for **all** default kinds (literal and per-row): it is a
-cross-table existence check, not a per-row predicate, and a post-scan reads a
-consistent post-alter table — correct even for a self-referential FK (parent ==
-child) and for the parent-absent case (any fully-non-NULL backfilled row is an
-orphan). The new column-level FK is also merged into the table-level constraint set
-for forward INSERT/UPDATE enforcement.
+- Existing-row validation is the module's (`addConstraint` re-validates for UNIQUE
+  and FK; CHECK is a schema-only append there, which is why the engine keeps the
+  literal-default CHECK scan above). The engine no longer runs its own FK scan — the
+  memory and store modules both call the shared `validateForeignKeyOverExistingRows`,
+  so the ADD COLUMN and ADD CONSTRAINT paths cannot drift. FK validation is MATCH
+  SIMPLE (a fully-non-NULL backfilled value with no matching parent aborts; NULL
+  satisfies) and pragma-gated (`pragma foreign_keys = false` skips the scan and defers
+  enforcement to later writes). It is correct for a self-referential FK and for the
+  parent-absent case, both of which make every fully-non-NULL backfilled row an orphan.
+- The engine still rejects a **conflicting child/parent collation** on the FK itself,
+  before the module call, mirroring `runAddConstraintViaModule` — a pure schema check,
+  so a rejected ALTER never reaches the module's persistence side effects.
+- An unnamed constraint is auto-named by the **same** convention the `CREATE TABLE`
+  spelling uses: `_check_<column>`, `_fk_<table>_<column>`. (The CHECK name is set by
+  the extractor, because the module's table-level `ADD CONSTRAINT` convention would
+  otherwise name it `check_<n>`.)
+- Any failure from the materialization onward goes through `revertAddColumn`: each
+  CHECK / FK the module already accepted is handed back via `dropConstraint` (newest
+  first), then the column is dropped, the batched events are un-remapped, and the
+  original catalog entry is restored — so a violation leaves the table exactly as it
+  was. An inline UNIQUE needs no explicit hand-back; both modules prune a UNIQUE over
+  a dropped column.
 
-> **Why validation runs against an intermediate schema.** The optimizer trusts a
+> **Why validation runs against a column-only schema.** The optimizer trusts a
 > DECLARED constraint as a proven invariant, which makes each existing-row validator
 > fold away its own work if the new constraint is already live during the pass:
 > - The FK validator issues a `NOT EXISTS` correlated subquery (the same form `ADD
@@ -1183,13 +1200,14 @@ for forward INSERT/UPDATE enforcement.
 >
 > Either fold makes validation trust the very invariant it is checking and silently admit
 > a violating row. So ADD COLUMN registers the new **column with only the pre-existing
-> (already-proven) constraints** for the validation pass — an intermediate
-> `validationSchema` that omits the new FK(s) **and** the new CHECK(s) — then commits the
-> full schema **after** validation passes. The live schema the planner reads during
-> validation therefore declares neither the new FK nor the new CHECK to fold against, so
-> the validators read the freshly-backfilled column directly and surface real violations.
-> This mirrors `ADD CONSTRAINT`, which likewise validates before swapping the constraint
-> into the live schema.
+> (already-proven) constraints** — a `columnOnlySchema` that omits every new constraint —
+> and leaves it live for the whole validation window; each module holds its new
+> constraint in its own cached schema until that constraint's validation passes, and the
+> catalog only learns of them from the final schema published after the last one lands.
+> The live schema the planner reads during validation therefore declares nothing new to
+> fold against, so the validators read the freshly-backfilled column directly and surface
+> real violations. This mirrors `ADD CONSTRAINT`, which likewise validates before swapping
+> the constraint into the live schema.
 
 **INSERT/UPDATE:**
 - DEFAULT expressions validated when building row expansion

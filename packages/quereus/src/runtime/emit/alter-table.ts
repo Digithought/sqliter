@@ -429,8 +429,9 @@ async function runAddColumn(
 	//
 	// Extracted BEFORE the column is materialized so a malformed declaration (e.g. a
 	// multi-parent-column FK on a single ADD COLUMN) throws while the table is still
-	// untouched. UNIQUE goes first so its existing-row validation — the one that rejects a
-	// literal DEFAULT duplicating across rows — runs before the cheaper appends.
+	// untouched. Install order within the loop is UNIQUE → CHECK → FK, so a column
+	// declaring several kinds reports the cheapest-to-explain violation first; the
+	// literal-default CHECK scan runs ahead of the whole loop (see below).
 	const inlineChecks = extractColumnLevelCheckConstraints(columnDef);
 	const inlineConstraints: AST.TableConstraint[] = [
 		...extractColumnLevelUniqueConstraints(columnDef),
@@ -569,8 +570,8 @@ async function runAddColumn(
 		// path only. A per-row (evaluator) default already enforced its CHECKs inside the
 		// backfill hook above — against the freshly-computed value rather than this scan's
 		// stale pre-backfill snapshot — and the module enforces NOT NULL there too. Runs
-		// before every `addConstraint` below so a CHECK violation is reported ahead of an
-		// FK one on a column that declares both.
+		// before the whole install loop below, so on a column declaring several kinds a
+		// CHECK violation is reported ahead of a UNIQUE or FK one.
 		if (!backfill && inlineChecks.length > 0) {
 			await validateBackfillAgainstChecks(rctx, columnOnlySchema, inlineChecks);
 		}
@@ -651,6 +652,14 @@ async function runAddColumn(
  * Best-effort on the module half: a revert failure is logged, never thrown, so it cannot
  * mask the original violation. Restoring the catalog entry is a no-op when the ALTER failed
  * before registering anything (the original schema is still the live one).
+ *
+ * NOTE: the hand-back is by NAME, so it assumes a name resolves to the constraint this
+ * ALTER installed. A pre-existing constraint can legitimately share an auto-name (nothing
+ * rejects `constraint _check_w check (…)` on a table that later gets `add column w …
+ * check (…)`; `create table` collides the same way), and today both modules' DROP
+ * CONSTRAINT removes every match, which lands on the right end state. If constraint-name
+ * resolution ever narrows to a single match, revert must instead identify the installed
+ * constraint by identity — otherwise it can drop the pre-existing one and leave ours.
  */
 async function revertAddColumn(
 	rctx: RuntimeContext,
@@ -717,7 +726,15 @@ async function validateBackfillAgainstChecks(
 	const qualifiedTable = qualifyTableName(columnOnlySchema.schemaName, columnOnlySchema.name);
 
 	for (const cc of newCheckConstraints) {
-		if (!cc.expr) continue;
+		// `extractColumnLevelCheckConstraints` skips an expression-less CHECK, so this
+		// cannot fire — but silently skipping a constraint we were asked to validate
+		// would admit a violating row, so say so loudly rather than `continue`.
+		if (!cc.expr) {
+			throw new QuereusError(
+				`CHECK constraint ${cc.name ? `'${cc.name}' ` : ''}on ALTER TABLE ADD COLUMN has no expression`,
+				StatusCode.INTERNAL,
+			);
+		}
 		const checkSql = expressionToString(cc.expr);
 		const sql = `select 1 from ${qualifiedTable} where not (${checkSql}) limit 1`;
 		const stmt = rctx.db.prepare(sql);
