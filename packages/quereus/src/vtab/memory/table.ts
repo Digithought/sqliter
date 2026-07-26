@@ -284,7 +284,7 @@ export class MemoryTable extends VirtualTable {
 		const conn = await this.ensureConnection();
 		// Delegate mutation to the manager.
 		// Note: mutationStatement is ignored by memory table (could be logged if needed)
-		return this.manager.performMutation(conn, args.operation, args.values, args.oldKeyValues, args.onConflict);
+		return this.manager.performMutation(conn, args.operation, args.values, args.oldKeyValues, args.onConflict, args.preCoerced);
 	}
 
 	/** Begins a transaction for this connection */

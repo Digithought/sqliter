@@ -751,7 +751,8 @@ export class MemoryTableManager {
 		operation: 'insert' | 'update' | 'delete',
 		values: Row | undefined,
 		oldKeyValues?: Row,
-		onConflict?: ConflictResolution
+		onConflict?: ConflictResolution,
+		preCoerced?: boolean
 	): Promise<UpdateResult> {
 		this.validateMutationPermissions(operation);
 
@@ -764,10 +765,10 @@ export class MemoryTableManager {
 
 		switch (operation) {
 			case 'insert':
-				result = await this.performInsert(targetLayer, values, onConflict);
+				result = await this.performInsert(targetLayer, values, onConflict, preCoerced);
 				break;
 			case 'update':
-				result = await this.performUpdate(targetLayer, values, oldKeyValues, onConflict);
+				result = await this.performUpdate(targetLayer, values, oldKeyValues, onConflict, preCoerced);
 				break;
 			case 'delete':
 				result = await this.performDelete(targetLayer, oldKeyValues);
@@ -818,15 +819,19 @@ export class MemoryTableManager {
 	private async performInsert(
 		targetLayer: TransactionLayer,
 		values: Row | undefined,
-		onConflict: ConflictResolution | undefined
+		onConflict: ConflictResolution | undefined,
+		preCoerced?: boolean
 	): Promise<UpdateResult> {
 		if (!values) {
 			throw new QuereusError("INSERT requires values.", StatusCode.MISUSE);
 		}
 
-		// Validate and parse values according to column types
+		// Validate and parse values according to column types. Skip when the caller
+		// (e.g. isolation overlay flush/tombstone writes) already coerced to declared
+		// form — JSON conversion is not idempotent, so re-running it can throw or
+		// silently change the value.
 		const schema = targetLayer.getSchema();
-		const newRowData: Row = coerceRowToSchema(values, schema.columns, `INSERT into ${this._tableName}`);
+		const newRowData: Row = preCoerced ? values : coerceRowToSchema(values, schema.columns, `INSERT into ${this._tableName}`);
 		const primaryKey = this.primaryKeyFromRow(newRowData);
 		const existingRow = this.lookupEffectiveRow(primaryKey, targetLayer);
 
@@ -864,15 +869,17 @@ export class MemoryTableManager {
 		targetLayer: TransactionLayer,
 		values: Row | undefined,
 		oldKeyValues: Row | undefined,
-		onConflict: ConflictResolution | undefined
+		onConflict: ConflictResolution | undefined,
+		preCoerced?: boolean
 	): Promise<UpdateResult> {
 		if (!values || !oldKeyValues) {
 			throw new QuereusError("UPDATE requires new values and old key values.", StatusCode.MISUSE);
 		}
 
-		// Validate and parse values according to column types
+		// Validate and parse values according to column types. Skip when preCoerced
+		// (see performInsert).
 		const schema = targetLayer.getSchema();
-		const newRowData: Row = coerceRowToSchema(values, schema.columns, `UPDATE on ${this._tableName}`);
+		const newRowData: Row = preCoerced ? values : coerceRowToSchema(values, schema.columns, `UPDATE on ${this._tableName}`);
 		const targetPrimaryKey = buildPrimaryKeyFromValues(oldKeyValues, schema.primaryKeyDefinition);
 		const oldRowData = this.lookupEffectiveRow(targetPrimaryKey, targetLayer);
 

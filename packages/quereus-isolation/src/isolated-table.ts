@@ -1317,13 +1317,16 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						// (e.g. dml-executor auto-event path) know no actual row was removed.
 						return { status: 'ok' };
 					}
-					// Convert to tombstone by updating the tombstone flag
+					// Convert to tombstone by updating the tombstone flag. The row is sliced
+					// from a row the overlay itself already wrote/coerced — mark preCoerced
+					// so the overlay doesn't re-run (non-idempotent) JSON coercion on it.
 					const tombstoneRow = [...existingOverlayRow.slice(0, tombstoneIndex), 1];
 					await overlay.update({
 						operation: 'update',
 						values: tombstoneRow,
 						oldKeyValues: targetPK,
 						onConflict: args.onConflict,
+						preCoerced: true,
 					});
 					// Return the pre-deletion row so dml-executor emits the auto change event.
 					const deletedRow = existingOverlayRow.slice(0, tombstoneIndex) as SqlValue[];
@@ -1340,10 +1343,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 					});
 					tombstoneRow[tombstoneIndex] = 1; // Set tombstone flag
 
+					// targetPK cells come from oldKeyValues (already coerced, read from the
+					// source scan) — mark preCoerced so the overlay doesn't re-run (non-idempotent)
+					// JSON coercion on them.
 					await overlay.update({
 						operation: 'insert',
 						values: tombstoneRow,
 						onConflict: args.onConflict,
+						preCoerced: true,
 					});
 					// Return a minimal placeholder row (PK columns only) so dml-executor
 					// recognises the delete as successful and emits the auto change event.
@@ -1537,10 +1544,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		pkIndices.forEach((colIdx, i) => { tombstoneRow[colIdx] = pk[i]; });
 		tombstoneRow[tombstoneIndex] = 1;
 		const existing = await this.getOverlayRow(overlay, pk);
+		// `pk` is already coerced (callers pass targetPK/coercedValues cells) — mark
+		// preCoerced so the overlay doesn't re-run (non-idempotent) JSON coercion on it.
 		if (existing) {
-			await overlay.update({ operation: 'update', values: tombstoneRow, oldKeyValues: pk });
+			await overlay.update({ operation: 'update', values: tombstoneRow, oldKeyValues: pk, preCoerced: true });
 		} else {
-			await overlay.update({ operation: 'insert', values: tombstoneRow });
+			await overlay.update({ operation: 'insert', values: tombstoneRow, preCoerced: true });
 		}
 	}
 

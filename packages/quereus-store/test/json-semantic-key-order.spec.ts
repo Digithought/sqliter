@@ -326,4 +326,61 @@ describe('JSON structural key order (isolated store)', () => {
 		expect(final.map(r => `${r.q}:${r.v}`).sort())
 			.to.deep.equal(['[2]:X', '[2]:d', '[3]:c']);
 	});
+
+	describe('DELETE of a JSON string-scalar key does not re-coerce the tombstone', () => {
+		// Repro for bug-json-tombstone-recoerces-stored-key: the delete tombstone
+		// carried the deleted row's already-converted PK back through the overlay's
+		// own coercion pass. A string-scalar key that happens to look like a JSON
+		// number ('"9"') got parsed a second time into the number 9, so the
+		// tombstone landed at the wrong key and the row stayed visible. A key
+		// whose text is not valid JSON source ('"abc"') threw instead.
+
+		it('removes exactly the targeted row in autocommit, leaving its sibling', async () => {
+			await db.exec(`create table sd (j json primary key, v text) using store`);
+			await db.exec(`insert into sd values ('"9"', 'a'), ('"9.0"', 'b')`);
+
+			await db.exec(`delete from sd where v = 'a'`);
+
+			const rows = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd`));
+			expect(rows).to.have.lengthOf(1);
+			expect(rows[0].q).to.equal('"9.0"');
+		});
+
+		it('removes exactly the targeted row inside an explicit transaction', async () => {
+			await db.exec(`create table sd2 (j json primary key, v text) using store`);
+			await db.exec(`insert into sd2 values ('"9"', 'a'), ('"9.0"', 'b')`);
+
+			await db.exec('begin');
+			await db.exec(`delete from sd2 where v = 'a'`);
+			const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd2`));
+			expect(staged).to.have.lengthOf(1);
+			expect(staged[0].q).to.equal('"9.0"');
+			await db.exec('commit');
+
+			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd2`));
+			expect(final).to.have.lengthOf(1);
+			expect(final[0].q).to.equal('"9.0"');
+		});
+
+		it('does not throw deleting a key whose text is not valid JSON source, in autocommit', async () => {
+			await db.exec(`create table sd3 (j json primary key, v text) using store`);
+			await db.exec(`insert into sd3 values ('"abc"', 'a')`);
+
+			await db.exec(`delete from sd3 where v = 'a'`);
+
+			expect((await db.get(`select count(*) as cnt from sd3`))?.cnt).to.equal(0);
+		});
+
+		it('does not throw deleting a key whose text is not valid JSON source, inside an explicit transaction', async () => {
+			await db.exec(`create table sd4 (j json primary key, v text) using store`);
+			await db.exec(`insert into sd4 values ('"abc"', 'a')`);
+
+			await db.exec('begin');
+			await db.exec(`delete from sd4 where v = 'a'`);
+			expect((await db.get(`select count(*) as cnt from sd4`))?.cnt).to.equal(0);
+			await db.exec('commit');
+
+			expect((await db.get(`select count(*) as cnt from sd4`))?.cnt).to.equal(0);
+		});
+	});
 });
