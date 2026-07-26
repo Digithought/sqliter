@@ -669,6 +669,57 @@ describe('Store ALTER TABLE', () => {
 		});
 	});
 
+	describe('ALTER COLUMN SET DATA TYPE onto a key-transform type', () => {
+		// TIMESPAN keys by elapsed time, so 'PT1H' and 'PT60M' — distinct TEXT — become one
+		// value the moment the column is retyped. The physical type is TEXT either way, so no
+		// value rewrite happens; only the key transform changes. That arm rebuilds every
+		// secondary index WITHOUT the in-pass duplicate check (the pre-mutation UNIQUE probe
+		// is the sole guard, so a wrapper's overlay-deleted row cannot spuriously reject), and
+		// these two tests pin both halves of that bargain: the probe still rejects a real
+		// collision, and the non-enforcing rebuild still produces an enforcing index.
+		it('rejects an equal-elapsed pair under a UNIQUE index, changing nothing', async () => {
+			await db.exec(`create table ts (id integer primary key, d text) using store`);
+			await db.exec(`create unique index ts_d on ts (d)`);
+			await db.exec(`insert into ts values (1, 'PT1H'), (2, 'PT60M')`);
+
+			let caught: unknown = null;
+			try {
+				await db.exec(`alter table ts alter column d set data type timespan`);
+			} catch (e) {
+				caught = e;
+			}
+			expect(String(caught)).to.match(/UNIQUE constraint failed/i);
+
+			// Values, declared type and writability all survive the rejection.
+			expect(await asyncIterableToArray(db.eval(`select id, d from ts order by id`)))
+				.to.deep.equal([{ id: 1, d: 'PT1H' }, { id: 2, d: 'PT60M' }]);
+			expect(await db.get(`select type from table_info('ts') where name = 'd'`))
+				.to.deep.equal({ type: 'TEXT' });
+			await db.exec(`insert into ts values (3, 'PT90M')`);
+			expect(await db.get(`select count(*) as cnt from ts`)).to.deep.equal({ cnt: 3 });
+		});
+
+		it('leaves an enforcing, seekable index behind when there is no collision', async () => {
+			await db.exec(`create table ts (id integer primary key, d text) using store`);
+			await db.exec(`create unique index ts_d on ts (d)`);
+			await db.exec(`insert into ts values (1, 'PT1H'), (2, 'PT30M')`);
+
+			await db.exec(`alter table ts alter column d set data type timespan`);
+
+			// The rebuilt index keys by elapsed time: an equal-elapsed spelling finds row 1.
+			expect(await db.get(`select id from ts where d = 'PT60M'`)).to.deep.equal({ id: 1 });
+			expect(await db.get(`select id from ts where d = 'PT1H'`)).to.deep.equal({ id: 1 });
+
+			let caught: unknown = null;
+			try {
+				await db.exec(`insert into ts values (3, 'PT60M')`);
+			} catch (e) {
+				caught = e;
+			}
+			expect(String(caught), 'the rebuilt index must still enforce').to.match(/UNIQUE constraint failed/i);
+		});
+	});
+
 	describe('DDL persistence', () => {
 		it('persists updated DDL after ADD COLUMN', async () => {
 			const storeModule = new StoreModule(provider);

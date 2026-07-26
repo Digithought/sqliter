@@ -2140,9 +2140,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			return oldSchema;
 		}
 		const { newCol, collationChanged, valueConvert } = attr;
-		// The deferred value rewrite (SET DATA TYPE conversion / SET NOT NULL backfill) is
-		// applied below, after every throw-only check; until then the store holds the old values.
-		const valuesRewritten = valueConvert !== undefined;
+		// Named for the PENDING act, not a completed one: the deferred value rewrite (SET DATA
+		// TYPE conversion / SET NOT NULL backfill) is applied below, after every throw-only
+		// check. Both gates that read this run BEFORE it, while the store still holds the old
+		// values.
+		const rewritesValues = valueConvert !== undefined;
 
 		const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newCol : c);
 		// Mirror the memory module (MemoryTableManager.alterColumn): a per-column
@@ -2199,7 +2201,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		//    reachable through this walk.
 		// The PK is intentionally excluded — it never appears in `uniqueConstraints`;
 		// its physical re-key/re-validation is the `pkRekeyNeeded` block below.
-		if (collationChanged || keyTransformChanged || valuesRewritten) {
+		//
+		// NOTE: one full row scan per covering constraint, and this gate now fires on the
+		// COMMON retype/backfill path, not only on the rare collation/transform ones. Fine
+		// while tables covered by several UNIQUE constraints over one column are rare; if a
+		// wide-constraint table makes ALTER COLUMN slow, judge all covering constraints in a
+		// single pass (one `seen` Set per constraint, one stream).
+		if (collationChanged || keyTransformChanged || rewritesValues) {
 			const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 				.filter(uc => uc.columns.includes(colIndex));
 			for (const uc of coveringConstraints) {
@@ -2252,11 +2260,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// transaction's rows too; unflushed, they would replay under the OLD physical type
 		// (see {@link ddlCommitPendingOps}; a re-flush after the PK re-key's own is a no-op).
 		//
-		// NOTE: a PK-member retype would reach here with `pkRekeyNeeded` possibly set, its
-		// re-key/index rebuild having used the PRE-rewrite values — the store does not yet
-		// reject a PK-column SET DATA TYPE the way memory does. Tracked by
-		// bug-store-pk-column-set-data-type-corrupts-keys; its rejection belongs with the
-		// throw-only checks above, in front of this rewrite.
+		// NOTE: `valueConvert` and `pkRekeyNeeded` cannot both be set today, and this ordering
+		// depends on that. `valueConvert` comes only from SET DATA TYPE or SET NOT NULL;
+		// SET NOT NULL changes neither collation nor logical type, so it never sets
+		// `pkRekeyNeeded`, and SET DATA TYPE on a PK member is refused upstream by every
+		// caller (the engine's ALTER COLUMN emitter — see `runAlterColumn` in
+		// runtime/emit/alter-table.ts — and the materialized-view reshape, which declares a
+		// key-column retype inexpressible). If a PK-member retype is ever admitted, this
+		// rewrite must move IN FRONT of the `pkRekeyNeeded` block: otherwise `rekeyRows` and
+		// its index rebuild encode the PRE-rewrite values and the rebuild below is skipped,
+		// leaving keys and indexes disagreeing with the stored values.
 		if (valueConvert) {
 			await this.ddlCommitPendingOps();
 			await table.mapRowsAtIndex(colIndex, valueConvert);
@@ -2277,7 +2290,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// the issuer's effective rows, and this module's committed rows may retain a row a
 		// wrapper's transaction has deleted whose converted value duplicates a survivor —
 		// enforcing here would spuriously reject what the probe correctly accepted.
-		if ((valuesRewritten || keyTransformChanged) && !pkRekeyNeeded) {
+		if ((rewritesValues || keyTransformChanged) && !pkRekeyNeeded) {
 			await this.ddlCommitPendingOps();
 			await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver(), true);
 		}
