@@ -15,8 +15,14 @@
 -- resolves the `from` column as `columns[fk.columns[seq]].name` — the very read that
 -- raises on a dangling index.
 --
--- The keys are declared with `create table` on purpose: constraints added by
--- `alter table add column … references …` are covered separately.
+-- NOTE: the `-- error:` lines match the auto-generated constraint name (`_fk_<table>_<cols>`)
+-- on purpose — the name proves WHICH column is being enforced, which a generic `foreign key`
+-- match would not. If that naming convention ever changes, update these expectations; the
+-- convention itself is pinned by `41.4-alter-add-column-constraints.sqllogic` § 7e.
+--
+-- Most keys here are declared with `create table`; § 10 covers the same rule for a key
+-- an `alter table add column … references …` created, which is also the shape the engine
+-- reverts by dropping the just-added column.
 
 pragma foreign_keys = true;
 
@@ -150,3 +156,83 @@ delete from FkCascP where pid = 1;
 -- Only the child of the deleted parent went away.
 select id, fkcol from FkCasc order by id;
 → [{"id":2,"fkcol":2}]
+
+-- ===================================================================
+-- 7. Declaration shape is irrelevant to the shift: an explicitly NAMED key,
+--    a MULTI-column key whose columns all move, and an `on update` action all
+--    renumber the same way. (The partition never reads `name`, and the actions
+--    read the shifted child positions.)
+-- ===================================================================
+
+create table FkNamed (id integer primary key, a integer, fkcol integer, constraint fk_named foreign key (fkcol) references FkP(pid));
+insert into FkNamed values (1, 10, 1);
+alter table FkNamed drop column a;
+select "from", "to", name from foreign_key_info('FkNamed');
+→ [{"from":"fkcol","to":"pid","name":"fk_named"}]
+insert into FkNamed values (2, 99);
+-- error: fk_named
+
+-- Both child positions of a composite key move down one.
+create table FkMultiShift (id integer primary key, dead integer, x integer, y integer, foreign key (x, y) references FkP2(a, b));
+insert into FkMultiShift values (1, 0, 1, 2);
+alter table FkMultiShift drop column dead;
+select "from", "to", seq from foreign_key_info('FkMultiShift') order by seq;
+→ [{"from":"x","to":"a","seq":0},{"from":"y","to":"b","seq":1}]
+insert into FkMultiShift values (2, 9, 9);
+-- error: _fk_fkmultishift_x_y
+insert into FkMultiShift values (3, 1, 2);
+select count(*) as c from FkMultiShift;
+→ [{"c":2}]
+
+-- `on update cascade` rewrites the child through the shifted position.
+create table FkUpP (pid integer primary key);
+insert into FkUpP values (1);
+create table FkUpC (id integer primary key, dead integer, fkcol integer references FkUpP(pid) on update cascade);
+insert into FkUpC values (1, 0, 1);
+alter table FkUpC drop column dead;
+update FkUpP set pid = 5 where pid = 1;
+select id, fkcol from FkUpC;
+→ [{"id":1,"fkcol":5}]
+
+-- ===================================================================
+-- 8. A DEFERRED key still resolves at COMMIT against the shifted position.
+-- ===================================================================
+
+create table FkDef (id integer primary key, dead integer, fkcol integer references FkP(pid) deferrable initially deferred);
+alter table FkDef drop column dead;
+begin;
+insert into FkDef values (1, 7);
+insert into FkP values (7);
+commit;
+select id, fkcol from FkDef;
+→ [{"id":1,"fkcol":7}]
+
+-- ===================================================================
+-- 9. A SELF-referential key shifts on the child side and keeps resolving its
+--    parent column by name against the narrowed table.
+-- ===================================================================
+
+create table FkSelf (id integer primary key, a integer, parent_id integer null references FkSelf(id));
+insert into FkSelf values (1, 10, null);
+alter table FkSelf drop column a;
+select "from", "to" from foreign_key_info('FkSelf');
+→ [{"from":"parent_id","to":"id"}]
+insert into FkSelf values (2, 1);
+insert into FkSelf values (3, 77);
+-- error: _fk_fkself_parent_id
+select count(*) as c from FkSelf;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 10. A key created by `add column … references …` is removed by dropping that
+--     same column — the shape the engine's own ADD COLUMN revert path takes.
+-- ===================================================================
+
+create table FkAdded (id integer primary key, z text);
+insert into FkAdded values (1, 'a');
+alter table FkAdded add column fkcol integer null references FkP(pid);
+select count(*) as c from foreign_key_info('FkAdded');
+→ [{"c":1}]
+alter table FkAdded drop column fkcol;
+select count(*) as c from foreign_key_info('FkAdded');
+→ [{"c":0}]

@@ -526,10 +526,9 @@ drop table t_surv_chk;
 -- 7c. Inline FOREIGN KEY survives an unrelated DROP COLUMN.
 --
 -- The dropped column is added AFTER the FK column on purpose, so it is the FK child
--- column's TRAILING neighbour. Dropping a column that PRECEDES an FK child column has to
--- renumber the FK's recorded child position, which is a separate, still-open defect
--- (`bug-drop-column-leaves-fk-child-index-dangling`) affecting every FK regardless of how
--- it was declared; this case deliberately avoids it so it tests only survival.
+-- column's TRAILING neighbour and no recorded position moves — this case tests survival
+-- only. Dropping a column that PRECEDES an FK child column (which renumbers the FK's
+-- recorded child position) is covered in `41.10-alter-drop-column-foreign-key.sqllogic`.
 create table p_surv (pid integer primary key);
 insert into p_surv values (1);
 create table t_surv_fk (id integer primary key);
