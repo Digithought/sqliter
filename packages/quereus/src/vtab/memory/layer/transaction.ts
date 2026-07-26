@@ -292,14 +292,6 @@ export class TransactionLayer implements Layer {
 		this.tableSchemaAtCreation = newSchema;
 		this.pkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
 
-		const { extractFromRow, compare } = this.pkFunctions;
-		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
-		const rekeyed = new BTree<BTreeKeyForPrimary, Row>(
-			(value: Row): BTreeKeyForPrimary => extractFromRow(value),
-			compare,
-			{ base: parentPrimaryTree || undefined },
-		);
-
 		// Net per-key effect of this layer's own writes, read out of the pre-rekey tree
 		// (`get` traverses the inheritance chain, so it yields the layer's EFFECTIVE row).
 		const deletions: BTreeKeyForPrimary[] = [];
@@ -315,30 +307,61 @@ export class TransactionLayer implements Layer {
 			else upserts.push(effectiveRow);
 		}
 
+		this.installNetOwnWrites(deletions, upserts);
+	}
+
+	/**
+	 * A fresh primary tree inheriting copy-on-write from the parent's CURRENT one, keyed by this
+	 * layer's current {@link pkFunctions}. Callers must have installed the post-DDL `pkFunctions`
+	 * first, and the parent must already carry the DDL (every whole-layer rebuild runs oldest-first).
+	 */
+	private newPrimaryTreeOverParent(): BTree<BTreeKeyForPrimary, Row> {
+		const { extractFromRow, compare } = this.pkFunctions;
+		return new BTree<BTreeKeyForPrimary, Row>(
+			(value: Row): BTreeKeyForPrimary => extractFromRow(value),
+			compare,
+			{ base: this.parentLayer.getModificationTree('primary') || undefined },
+		);
+	}
+
+	/**
+	 * Shared tail of the three whole-layer rebuilds — {@link rekeyPrimaryKey},
+	 * {@link convertColumn}, {@link installReshapedColumns}. Each has already swapped in its new
+	 * schema (and, where the key changed, its new {@link pkFunctions}) and collapsed
+	 * {@link ownWrites} to the net per-key effect passed here; this replays that effect into a
+	 * tree built over the parent's fresh one, installs it, rewrites the own-write log to match,
+	 * and rebuilds every secondary index.
+	 *
+	 * Every index is rebuilt unconditionally, not only those over an altered column: each inherits
+	 * the parent's freshly-rebuilt tree, and each index's key encoding and PK bookkeeping derive
+	 * from `pkFunctions`.
+	 *
+	 * A deletion an upsert has since re-occupied is dropped from the log — keeping it would make
+	 * the log claim both a deletion and an upsert of the same key. Only {@link rekeyPrimaryKey}
+	 * can produce that collision (two old keys collapsing under the new comparator); where key
+	 * values are invariant a key is classified as either a deletion or an upsert, never both, so
+	 * the filter is a no-op.
+	 */
+	private installNetOwnWrites(deletions: readonly BTreeKeyForPrimary[], upserts: readonly Row[]): void {
+		const rebuilt = this.newPrimaryTreeOverParent();
 		for (const primaryKey of deletions) {
-			const path = rekeyed.find(primaryKey);
-			if (path.on) rekeyed.deleteAt(path);
+			const path = rebuilt.find(primaryKey);
+			if (path.on) rebuilt.deleteAt(path);
 		}
 		for (const row of upserts) {
-			rekeyed.upsert(row);
+			rebuilt.upsert(row);
 		}
-		this.primaryModifications = rekeyed;
+		this.primaryModifications = rebuilt;
 
-		// A deleted key an upsert has since re-occupied (`update t set v='A' where v='a'` under
-		// NOCASE) is no longer a deletion of anything: keeping it would make the log claim both
-		// a deletion and an upsert of the same key.
-		const survivingDeletions = deletions.filter(primaryKey => rekeyed.get(primaryKey) === undefined);
+		const { extractFromRow } = this.pkFunctions;
 		this.ownWrites.length = 0;
-		for (const primaryKey of survivingDeletions) {
-			this.ownWrites.push({ type: 'delete', primaryKey });
+		for (const primaryKey of deletions) {
+			if (rebuilt.get(primaryKey) === undefined) this.ownWrites.push({ type: 'delete', primaryKey });
 		}
 		for (const row of upserts) {
 			this.ownWrites.push({ type: 'upsert', primaryKey: extractFromRow(row), newRow: row });
 		}
 
-		// Every secondary index's key encoding and PK bookkeeping derive from `pkFunctions`,
-		// and each inherits the parent's freshly-rebuilt tree — so all of them are rebuilt,
-		// including ones the altered column does not appear in.
 		this.secondaryIndexes = new Map();
 		this.initializeSecondaryIndexes();
 		for (const index of this.secondaryIndexes.values()) {
@@ -386,20 +409,12 @@ export class TransactionLayer implements Layer {
 
 		// The parent's primary tree has been REPLACED by the conversion (base rebuilt from fresh
 		// rows, or a parent layer already converted oldest-first), so this layer's own tree — which
-		// derived from the OLD one — must be rebuilt over the parent's NEW tree, exactly as
-		// rekeyPrimaryKey does. The PK is unchanged (a key-column retype is rejected upstream), so
-		// pkFunctions and the keys stay; only the value at colIndex moves.
-		const { extractFromRow, compare } = this.pkFunctions;
-		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
-		const rebuilt = new BTree<BTreeKeyForPrimary, Row>(
-			(value: Row): BTreeKeyForPrimary => extractFromRow(value),
-			compare,
-			{ base: parentPrimaryTree || undefined },
-		);
-
-		// Net per-key effect of this layer's own writes, read out of the pre-conversion tree. The PK
-		// is unchanged, so a key is either finally-deleted or finally-upserted, never both — no key
-		// can collapse onto another (unlike rekeyPrimaryKey).
+		// derived from the OLD one — must be rebuilt over the parent's NEW tree; installNetOwnWrites
+		// below does that. The PK is unchanged (a key-column retype is rejected upstream), so
+		// pkFunctions and the keys stay; only the value at colIndex moves — which also means a key
+		// is either finally-deleted or finally-upserted, never both, and no key can collapse onto
+		// another (unlike rekeyPrimaryKey). The net per-key effect is read out of the
+		// pre-conversion tree.
 		const seen = new Set<string>();
 		const survivingDeletions: BTreeKeyForPrimary[] = [];
 		const upserts: Row[] = [];
@@ -424,31 +439,7 @@ export class TransactionLayer implements Layer {
 			upserts.push(newRow);
 		}
 
-		for (const primaryKey of survivingDeletions) {
-			const path = rebuilt.find(primaryKey);
-			if (path.on) rebuilt.deleteAt(path);
-		}
-		for (const row of upserts) {
-			rebuilt.upsert(row);
-		}
-		this.primaryModifications = rebuilt;
-
-		this.ownWrites.length = 0;
-		for (const primaryKey of survivingDeletions) {
-			this.ownWrites.push({ type: 'delete', primaryKey });
-		}
-		for (const row of upserts) {
-			this.ownWrites.push({ type: 'upsert', primaryKey: extractFromRow(row), newRow: row });
-		}
-
-		// Any secondary index on the column holds keys extracted from the OLD value. Rebuild every
-		// index over the parent's freshly-converted trees (matching the base's unconditional rebuild),
-		// then re-file this layer's own converted writes.
-		this.secondaryIndexes = new Map();
-		this.initializeSecondaryIndexes();
-		for (const index of this.secondaryIndexes.values()) {
-			this.reindexOwnWrites(index);
-		}
+		this.installNetOwnWrites(survivingDeletions, upserts);
 	}
 
 	/**
@@ -519,39 +510,7 @@ export class TransactionLayer implements Layer {
 		this.tableSchemaAtCreation = newSchema;
 		this.pkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
 
-		const { extractFromRow, compare } = this.pkFunctions;
-		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
-		const rebuilt = new BTree<BTreeKeyForPrimary, Row>(
-			(value: Row): BTreeKeyForPrimary => extractFromRow(value),
-			compare,
-			{ base: parentPrimaryTree || undefined },
-		);
-
-		for (const primaryKey of prepared.survivingDeletions) {
-			const path = rebuilt.find(primaryKey);
-			if (path.on) rebuilt.deleteAt(path);
-		}
-		for (const row of prepared.upserts) {
-			rebuilt.upsert(row);
-		}
-		this.primaryModifications = rebuilt;
-
-		this.ownWrites.length = 0;
-		for (const primaryKey of prepared.survivingDeletions) {
-			this.ownWrites.push({ type: 'delete', primaryKey });
-		}
-		for (const row of prepared.upserts) {
-			this.ownWrites.push({ type: 'upsert', primaryKey: extractFromRow(row), newRow: row });
-		}
-
-		// Every secondary index holds rows at the old arity (and, after DROP, possibly stale
-		// column indices in its IndexSchema), and each inherits the parent's freshly-rebuilt
-		// tree — so all of them are rebuilt, then re-filed with this layer's reshaped writes.
-		this.secondaryIndexes = new Map();
-		this.initializeSecondaryIndexes();
-		for (const index of this.secondaryIndexes.values()) {
-			this.reindexOwnWrites(index);
-		}
+		this.installNetOwnWrites(prepared.survivingDeletions, prepared.upserts);
 	}
 
 	/**

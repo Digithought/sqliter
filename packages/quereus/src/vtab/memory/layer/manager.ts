@@ -1809,10 +1809,16 @@ export class MemoryTableManager {
 			});
 			// Phase 1 of reaching the open transaction's own pending rows: compute their
 			// post-ADD shape before ANY mutation, since the per-row backfill below can throw
-			// on a pending row (and there is no undo for a half-reshaped layer chain). The
-			// NOT NULL enforcement mirrors the base backfill's per-row check — and additionally
-			// covers the no-DEFAULT case, which the `tableHasRows` gate above waves through
-			// when the only rows are PENDING ones (it inspects the committed base alone).
+			// on a pending row (and there is no undo for a half-reshaped layer chain).
+			//
+			// The NOT NULL check mirrors the base backfill's per-row check in
+			// `BaseLayer.recreatePrimaryTreeWithNewColumn`, extended to pending rows. It is
+			// deliberately NOT gated on `backfillEvaluator`, which today makes the
+			// literal-default arm redundant: `validateNotNullBackfill`
+			// (runtime/emit/alter-table.ts) already rejects NOT NULL without a usable DEFAULT
+			// by querying the DDL connection's EFFECTIVE rows — pending ones included — so the
+			// only violation that reaches here is a per-row evaluator yielding NULL. Kept
+			// ungated so the module enforces its own invariant instead of relying on that gate.
 			const reshapePlans = await this.prepareReshapeOnOpenLayers(async (row: Row): Promise<Row> => {
 				const value = backfillEvaluator ? await backfillEvaluator(row) : defaultValue;
 				if (newColumnSchema.notNull && value === null) {

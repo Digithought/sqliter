@@ -352,9 +352,11 @@ key *values* are invariant (ADD appends past them; dropping a PK column is rejec
 ordering and the recorded own-write keys survive unchanged. The rewrite is split into a fallible
 compute phase and an infallible install phase because the ADD backfill can throw on a pending row
 even when every committed row converts cleanly: all computation runs *before* the first mutation
-anywhere, so a failure — including a per-row DEFAULT that yields NULL for a `NOT NULL` column on a
-pending row, or `ADD COLUMN ... NOT NULL` without a DEFAULT when the only rows are pending ones —
-rejects the ALTER with the schema, the base, and every layer untouched. As with every schema
+anywhere, so a failure — a throwing evaluator, or a per-row DEFAULT that yields NULL for a
+`NOT NULL` column on a pending row — rejects the ALTER with the schema, the base, and every layer
+untouched. (`ADD COLUMN ... NOT NULL` with no usable DEFAULT is rejected earlier still, by the
+emitter's `validateNotNullBackfill`, which queries the DDL connection's *effective* rows and so
+already counts pending ones.) As with every schema
 change here, the ALTER itself is **not** undone by `ROLLBACK` / `ROLLBACK TO SAVEPOINT` (DDL is
 non-transactional — see the declared-contract paragraph above); what the reshape guarantees is
 that the transaction's DML — including rows inserted before a savepoint — survives at the new
