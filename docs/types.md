@@ -312,9 +312,16 @@ export function validateValue(value: SqlValue, type: LogicalType): SqlValue {
 A row travelling through an INSERT/UPDATE plan carries **raw** values — the literal
 text the statement supplied, an unparsed `'{"a":2}'` rather than the object a
 later `select` reads back. It is converted to the declared logical types at the
-**storage layer**, which coerces every row unconditionally on its own
+**storage layer**, which coerces every row on its own
 (`MemoryTableManager.performInsert`, `quereus-store`'s `StoreTable.coerceRow`).
 That is the single conversion point; everything upstream of it sees raw values.
+
+The one escape hatch is `UpdateArgs.preCoerced`. A caller that is *re-writing
+values it read back out of storage* — rather than passing user input through —
+sets it, and both storage backends then skip their coercion pass. Only
+`quereus-isolation` uses it: the overlay→underlying flush, the delete-tombstone
+writes (whose primary-key cells come straight from a scan), and the overlay
+rebuild after a schema change. Everything else leaves it unset.
 
 CHECK and FK evaluation is the one exception, and it takes a **copy** rather than
 converting the row in place. `ConstraintCheckNode` builds a coerced view of the
@@ -332,7 +339,10 @@ untouched.
 > constraint evaluation instead of being pushed upstream into the DML emitters,
 > where it would reach the storage layer and be parsed twice.
 > (`quereus-isolation`'s `IsolatedTable` declines to thread its own coerced row
-> into the overlay write for the same reason.)
+> into the overlay write for the same reason — it coerces only for PK extraction
+> and conflict detection, and hands the overlay the raw row. Its tombstone writes
+> are the exception: those cells are already-converted values read back from
+> storage, so they go through with `preCoerced` set.)
 
 That non-idempotence sets the phase order inside `ConstraintCheckNode`. The NOT
 NULL pass runs **first and against the raw row**: under `OR REPLACE` it may

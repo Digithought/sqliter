@@ -1117,9 +1117,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
 
 		// Coerced only for PK extraction / merged-view conflict detection below — NOT
-		// for the overlay write. The overlay (a memory-module table) always re-coerces
-		// every cell on its own insert/update unconditionally, so writing the coerced
-		// row through would coerce twice. That is a no-op for most logical types, but
+		// for the overlay write. The overlay (a memory-module table) re-coerces every
+		// cell on its own insert/update unless the write sets `preCoerced` (which these
+		// data writes deliberately do not — only the tombstone writes below, whose cells
+		// already come from storage, do), so writing the coerced row through without the
+		// flag would coerce twice. That is a no-op for most logical types, but
 		// JSON's `parse` is not idempotent for a JSON-string scalar (`'"hello"'` parses
 		// to the native JS string `"hello"`; re-parsing that bare string as JSON throws,
 		// since it lacks its own quotes) — double coercion would break any JSON column.
@@ -1129,7 +1131,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// NOTE: this coerces the full row on every isolation-layer write, and the overlay
 		// coerces it again on its own insert/update — two validateAndParse passes per write
 		// (two JSON.parse for JSON columns). Negligible now; if isolation-write throughput or
-		// large-JSON rows ever show as hot, thread the coerced row through as pre-coerced.
+		// large-JSON rows ever show as hot, thread this row through with `preCoerced: true`
+		// (the overlay now honors it) instead of letting the overlay redo the work.
 		const coercedValues = values ? this.coerceRow(values) : values;
 
 		// Resolve the effective PK-level action once so the wrapped overlay vtab

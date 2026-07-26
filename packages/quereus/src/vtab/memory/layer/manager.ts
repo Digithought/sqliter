@@ -830,6 +830,10 @@ export class MemoryTableManager {
 		// (e.g. isolation overlay flush/tombstone writes) already coerced to declared
 		// form — JSON conversion is not idempotent, so re-running it can throw or
 		// silently change the value.
+		// NOTE: skipping it also skips that helper's "too many values" width guard. Every
+		// preCoerced caller today builds its row programmatically from this same schema, so
+		// the width is structural; if an externally-shaped row ever reaches here preCoerced,
+		// hoist the width check out of coerceRowToSchema and run it unconditionally.
 		const schema = targetLayer.getSchema();
 		const newRowData: Row = preCoerced ? values : coerceRowToSchema(values, schema.columns, `INSERT into ${this._tableName}`);
 		const primaryKey = this.primaryKeyFromRow(newRowData);

@@ -382,5 +382,40 @@ describe('JSON structural key order (isolated store)', () => {
 
 			expect((await db.get(`select count(*) as cnt from sd4`))?.cnt).to.equal(0);
 		});
+
+		it('converts an overlay row staged earlier in the same transaction into a tombstone', async () => {
+			// The other delete cases shadow a COMMITTED row (fresh-tombstone insert). This
+			// one re-writes a row the overlay itself already holds, which takes the
+			// convert-to-tombstone update instead — a separate write that carried the same
+			// double-coercion defect.
+			await db.exec(`create table sd5 (j json primary key, v text) using store`);
+			await db.exec(`insert into sd5 values ('"9"', 'a'), ('"9.0"', 'b')`);
+
+			await db.exec('begin');
+			await db.exec(`insert or replace into sd5 values ('"9"', 'z')`);
+			await db.exec(`delete from sd5 where v = 'z'`);
+			const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd5`));
+			expect(staged.map(r => `${r.q}:${r.v}`)).to.deep.equal(['"9.0":b']);
+			await db.exec('commit');
+
+			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd5`));
+			expect(final.map(r => `${r.q}:${r.v}`)).to.deep.equal(['"9.0":b']);
+		});
+
+		it('tombstones the row a UNIQUE `or replace` evicts', async () => {
+			// The eviction routes through the shared insertTombstoneForPK helper rather
+			// than the delete branch, so it exercises the third fixed tombstone write.
+			await db.exec(`create table su (j json primary key, v text unique) using store`);
+			await db.exec(`insert into su values ('"9"', 'a'), ('"7"', 'keep')`);
+
+			await db.exec('begin');
+			await db.exec(`insert or replace into su values ('"9.0"', 'a')`);
+			const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su`));
+			expect(staged.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"7":keep', '"9.0":a']);
+			await db.exec('commit');
+
+			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su`));
+			expect(final.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"7":keep', '"9.0":a']);
+		});
 	});
 });
