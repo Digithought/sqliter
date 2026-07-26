@@ -1914,6 +1914,208 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	describe('column-shape ALTER inside a transaction preserves the overlay savepoint chain', () => {
+		// Regression (`isolation-alter-forward-column-shape`): every ALTER TABLE used to
+		// rebuild the overlay — copy staged rows into a fresh MemoryTable — with the same
+		// savepoint-flattening mechanism the index-DDL suite above describes: the copy's
+		// first write lazily registered a fresh connection, `Database.registerConnection`
+		// replayed the active savepoint stack BEFORE the copy, and the next `rollback to
+		// savepoint` discarded rows staged long before the savepoint was taken. ADD / DROP /
+		// RENAME COLUMN now forward to the overlay in place, keeping its layer chain intact.
+		// (DDL itself is not transactional: the rollback keeps the column change and only
+		// unwinds row writes.)
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('ADD COLUMN keeps pre-savepoint rows and discards post-savepoint ones', async () => {
+			await db.exec(`CREATE TABLE asp_add (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO asp_add VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO asp_add VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE asp_add ADD COLUMN w TEXT DEFAULT 'z'`);
+			await db.exec(`INSERT INTO asp_add VALUES (3, 'c', 'x')`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM asp_add ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w]), 'only the pre-savepoint row survives, backfilled').to.deep.equal([[1, 'a', 'z']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM asp_add ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w])).to.deep.equal([[1, 'a', 'z']]);
+		});
+
+		it('ADD COLUMN with a per-row new.<col> DEFAULT backfills the surviving staged row', async () => {
+			await db.exec(`CREATE TABLE asp_nc (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO asp_nc VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO asp_nc VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE asp_nc ADD COLUMN w TEXT DEFAULT (new.v)`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM asp_nc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w]), "w backfilled from the staged row's own v").to.deep.equal([[1, 'a', 'a']]);
+		});
+
+		it('DROP COLUMN (middle) keeps pre-savepoint rows, discards post-savepoint ones, and realigns values', async () => {
+			// The underlying stays EMPTY here on purpose: a committed row would be reverted
+			// to its PRE-alter layout by the memory module's own savepoint restore — the
+			// underlying connection's `rollback to savepoint` snapshot pre-dates the ALTER
+			// and restores the pre-reshape tree. That is a memory-module defect independent
+			// of this layer (see tickets/.pre-existing-error.md); the overlay behavior under
+			// test here does not need committed rows.
+			await db.exec(`CREATE TABLE asp_drop (id INTEGER PRIMARY KEY, v TEXT, x INTEGER) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO asp_drop VALUES (1, 'a', 10)`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO asp_drop VALUES (2, 'b', 20)`);
+			await db.exec(`ALTER TABLE asp_drop DROP COLUMN v`);
+			await db.exec(`INSERT INTO asp_drop VALUES (3, 30)`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, x FROM asp_drop ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.x]), 'staged x realigned after the middle column dropped').to.deep.equal([[1, 10]]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, x FROM asp_drop ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.x])).to.deep.equal([[1, 10]]);
+		});
+
+		it('DROP COLUMN (last) keeps the pre-savepoint row', async () => {
+			await db.exec(`CREATE TABLE asp_dl (id INTEGER PRIMARY KEY, v TEXT, x INTEGER) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO asp_dl VALUES (1, 'a', 10)`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`ALTER TABLE asp_dl DROP COLUMN x`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM asp_dl ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a']]);
+		});
+
+		it('RENAME COLUMN keeps pre-savepoint rows and discards post-savepoint ones', async () => {
+			await db.exec(`CREATE TABLE asp_rn (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO asp_rn VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO asp_rn VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE asp_rn RENAME COLUMN v TO vv`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, vv FROM asp_rn ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.vv])).to.deep.equal([[1, 'a']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, vv FROM asp_rn ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.vv])).to.deep.equal([[1, 'a']]);
+		});
+
+		it('a staged tombstone survives an ADD COLUMN under a savepoint and applies at COMMIT', async () => {
+			await db.exec(`CREATE TABLE asp_tb (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO asp_tb VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM asp_tb WHERE id = 1`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`ALTER TABLE asp_tb ADD COLUMN w TEXT DEFAULT 'z'`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			// `w` is deliberately not read: the memory module's own savepoint restore reverts
+			// the committed rows' backfill to the pre-ALTER layout on `rollback to savepoint`
+			// (underlying-side defect, independent of this layer — see
+			// tickets/.pre-existing-error.md). The OVERLAY behavior under test — the staged
+			// tombstone surviving the in-place ALTER and its rollback, then landing at
+			// COMMIT — is fully pinned by the surviving id/v pair. Tighten to include `w`
+			// once the underlying defect is fixed.
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM asp_tb ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'pre-savepoint DELETE still lands').to.deep.equal([[2, 'b']]);
+		});
+	});
+
+	describe('in-transaction column-shape ALTER keeps the overlay tombstone flag last', () => {
+		// The overlay stages rows as [data columns..., tombstone flag] and every read/write
+		// path assumes the flag is LAST. A bare addColumn forward to the overlay would append
+		// the new column AFTER the flag, silently dropping every value written to it on read —
+		// these pin the `insertAtIndex` overlay-flavouring (see buildOverlayAddColumnChange).
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('a value written to the just-added column reads back in-transaction and after COMMIT', async () => {
+			await db.exec(`CREATE TABLE lay_w (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO lay_w VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE lay_w ADD COLUMN w TEXT DEFAULT 'z'`);
+			await db.exec(`INSERT INTO lay_w VALUES (2, 'b', 'fresh')`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM lay_w ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w]), 'in-transaction read').to.deep.equal([[1, 'a', 'z'], [2, 'b', 'fresh']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM lay_w ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w]), 'post-commit read').to.deep.equal([[1, 'a', 'z'], [2, 'b', 'fresh']]);
+		});
+
+		it('UPDATE of a staged row targets the just-added column correctly', async () => {
+			await db.exec(`CREATE TABLE lay_u (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO lay_u VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE lay_u ADD COLUMN w TEXT DEFAULT 'z'`);
+			await db.exec(`UPDATE lay_u SET w = 'updated' WHERE id = 1`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM lay_u ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w])).to.deep.equal([[1, 'a', 'updated']]);
+		});
+
+		it('a committed row deleted in-transaction stays deleted across an ADD COLUMN', async () => {
+			await db.exec(`CREATE TABLE lay_d (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO lay_d VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM lay_d WHERE id = 1`);
+			await db.exec(`ALTER TABLE lay_d ADD COLUMN w TEXT DEFAULT 'z'`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM lay_d ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w])).to.deep.equal([[2, 'b', 'z']]);
+		});
+
+		it('DROP COLUMN (middle) realigns staged rows alongside committed ones at COMMIT', async () => {
+			await db.exec(`CREATE TABLE lay_dc (id INTEGER PRIMARY KEY, v TEXT, x INTEGER) USING isolated`);
+			await db.exec(`INSERT INTO lay_dc VALUES (0, 'base', 100)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO lay_dc VALUES (1, 'a', 10)`);
+			await db.exec(`ALTER TABLE lay_dc DROP COLUMN v`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, x FROM lay_dc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.x]), 'in-transaction merged read').to.deep.equal([[0, 100], [1, 10]]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, x FROM lay_dc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.x]), 'post-commit read').to.deep.equal([[0, 100], [1, 10]]);
+		});
+	});
+
 	describe('ALTER TABLE ADD COLUMN atomic pre-validation', () => {
 		// The isolation layer dry-runs every affected overlay's backfill BEFORE mutating
 		// the shared underlying, so a NOT NULL / tombstone rejection leaves the underlying
@@ -2232,6 +2434,38 @@ describe('IsolationModule', () => {
 			expect(rc[0][2]).to.equal(5);
 		});
 
+		it('ADD COLUMN forwards a foreign overlay IN PLACE — same overlay object, rows realigned', async () => {
+			await injectOverlay(dbB, [[10, 7]]);
+			const before = overlayState(dbB)!.overlayTable;
+
+			await iso.alterTable(dbA, 'main', 't', addBackfillableCol('c'));
+
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'B stays healthy').to.be.undefined;
+			expect(bState.overlayTable, 'overlay adopted in place, not rebuilt').to.equal(before);
+			const rows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
+			expect(rows.length).to.equal(1);
+			// [id, x, c, _tombstone] — the new column lands AHEAD of the tombstone flag.
+			expect(rows[0][0]).to.equal(10);
+			expect(rows[0][1]).to.equal(7);
+			expect(rows[0][2], 'literal default backfilled').to.equal(0);
+			expect(rows[0][3], 'tombstone flag stays last').to.equal(0);
+		});
+
+		it('DROP COLUMN forwards a foreign overlay IN PLACE and realigns staged values', async () => {
+			await injectOverlay(dbB, [[10, 7]]);
+			const before = overlayState(dbB)!.overlayTable;
+
+			await iso.alterTable(dbA, 'main', 't', { type: 'dropColumn', columnName: 'x' });
+
+			const bState = overlayState(dbB)!;
+			expect(bState.poison).to.be.undefined;
+			expect(bState.overlayTable, 'overlay adopted in place, not rebuilt').to.equal(before);
+			const rows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
+			// [id, _tombstone]
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[10, 0]]);
+		});
+
 		/**
 		 * `CREATE UNIQUE INDEX` by one connection over rows another connection has staged.
 		 *
@@ -2310,7 +2544,7 @@ describe('IsolationModule', () => {
 			const updated = await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
 			expect(updated.columns.some(col => col.name === 'c')).to.equal(true);
 
-			// B poisoned; C migrated forward (new state object, no poison).
+			// B poisoned; C carried forward in place (addColumn no longer rebuilds), no poison.
 			expect(overlayState(dbB)!.poison, 'B poisoned').to.not.be.undefined;
 			const cState = overlayState(dbC)!;
 			expect(cState.poison, 'C must NOT be poisoned').to.be.undefined;

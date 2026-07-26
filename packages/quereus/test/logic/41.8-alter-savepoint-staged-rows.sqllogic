@@ -1,0 +1,104 @@
+-- ALTER TABLE column-shape changes (ADD / DROP / RENAME COLUMN) inside a transaction
+-- must not disturb the savepoint ledger of rows the transaction has already staged:
+-- rows staged BEFORE a savepoint survive `rollback to savepoint`, rows staged AFTER it
+-- are discarded. (DDL itself is not transactional — the rollback keeps the column
+-- change and only unwinds row writes.)
+--
+-- Cross-backend on purpose: under the memory module the pending rows live in its own
+-- transaction layers; under --store they live in the isolation wrapper's per-connection
+-- overlay, which every ALTER used to REBUILD (copy staged rows into a fresh staging
+-- table). The copy's first write lazily registered a fresh connection whose replayed
+-- savepoint stack sat ABOVE the copied rows, so the next `rollback to savepoint`
+-- discarded rows staged long before the savepoint (isolation-alter-forward-column-shape).
+
+-- ADD COLUMN: pre-savepoint row survives (backfilled), post-savepoint rows discarded.
+create table t1 (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into t1 values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t1 values (2, 'b');
+-- run
+alter table t1 add column w text default 'z';
+-- run
+insert into t1 values (3, 'c', 'x');
+-- run
+rollback to savepoint s;
+-- run
+
+select id, v, w from t1 order by id;
+→ [{"id":1,"v":"a","w":"z"}]
+
+commit;
+-- run
+
+select id, v, w from t1 order by id;
+→ [{"id":1,"v":"a","w":"z"}]
+
+drop table t1;
+-- run
+
+-- DROP COLUMN (middle) with a committed row present: staged values realign under the
+-- narrower layout, and the savepoint ledger still splits pre/post rows correctly.
+create table t2 (id integer primary key, v text, x integer);
+-- run
+insert into t2 values (0, 'base', 100);
+-- run
+
+begin;
+-- run
+insert into t2 values (1, 'a', 10);
+-- run
+savepoint s;
+-- run
+insert into t2 values (2, 'b', 20);
+-- run
+alter table t2 drop column v;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, x from t2 order by id;
+→ [{"id":0,"x":100},{"id":1,"x":10}]
+
+drop table t2;
+-- run
+
+-- NOTE: no RENAME COLUMN case here yet. The memory module natively loses a
+-- transaction's pending rows at COMMIT when a savepoint exists across an
+-- in-transaction RENAME COLUMN (`renameColumn` has no open-layer reshape, unlike
+-- addColumn/dropColumn) — see tickets/.pre-existing-error.md. Add the RENAME leg when
+-- that lands; the isolation-layer half is covered by
+-- packages/quereus-isolation/test/isolation-layer.spec.ts ("RENAME COLUMN keeps
+-- pre-savepoint rows...").
+
+-- A staged tombstone (an in-transaction DELETE of a committed row) survives the ALTER
+-- under a savepoint and still applies at COMMIT.
+create table t4 (id integer primary key, v text);
+-- run
+insert into t4 values (1, 'a'), (2, 'b');
+-- run
+
+begin;
+-- run
+delete from t4 where id = 1;
+-- run
+savepoint s;
+-- run
+alter table t4 add column w text default 'z';
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v, w from t4 order by id;
+→ [{"id":2,"v":"b","w":"z"}]
+
+drop table t4;

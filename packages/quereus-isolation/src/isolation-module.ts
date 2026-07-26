@@ -1297,10 +1297,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * both index directions, so an open layer adopts the change with its savepoint snapshots
 	 * intact.
 	 *
-	 * CONSTRAINT is routed by who owns the overlay, exactly as {@link adoptRebuiltOverlay}
-	 * does for ALTER: issuer → INTERNAL (its rows were already judged by the DDL's own
-	 * validation pass, so a rejection here means the two have drifted), foreign → poison and
-	 * leave the overlay untouched so its owner errors and rolls back.
+	 * CONSTRAINT is routed by who owns the overlay via {@link applyInPlaceOverlayChange},
+	 * exactly as {@link adoptRebuiltOverlay} does for the rebuild path.
 	 *
 	 * A poisoned overlay is skipped: it holds rows in a pre-ALTER column layout and its owner
 	 * must roll back regardless, so there is nothing to keep enforcing for it.
@@ -1316,29 +1314,61 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		for (const key of this.connectionScopedKeys(this.connectionOverlays, schemaName, tableName)) {
 			const overlayState = this.connectionOverlays.get(key)!;
 			if (overlayState.poison) continue;
-			try {
-				await apply(overlayState);
-			} catch (e) {
-				if (!(e instanceof QuereusError) || e.code !== StatusCode.CONSTRAINT) throw e;
-				if (key === ownKey) throw this.issuerOverlayDriftError(schemaName, tableName, ddlDescription, e);
-				overlayState.poison = { message: this.buildRebuildPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
-			}
+			await this.applyInPlaceOverlayChange(
+				key === ownKey, overlayState, schemaName, tableName, ddlDescription,
+				() => apply(overlayState),
+			);
 		}
 	}
 
 	/**
-	 * Delegates ALTER TABLE to the underlying module and migrates any per-connection
+	 * Applies one in-place DDL mutation to a single overlay, routing a CONSTRAINT failure
+	 * by who owns the overlay: the issuer's own overlay → INTERNAL (its rows were already
+	 * judged by the DDL's own validation pass, so a rejection here means validation and
+	 * migration have drifted — {@link issuerOverlayDriftError}); a foreign overlay →
+	 * poison and leave it untouched so its owner errors and rolls back
+	 * ({@link buildRebuildPoisonMessage}). Any non-CONSTRAINT failure is a layer-invariant
+	 * violation, not a data condition, and rethrows for everyone.
+	 *
+	 * Shared by the index paths ({@link applyIndexChangeToOverlays}) and the ALTER TABLE
+	 * column-shape forwards ({@link alterTable}), so the two cannot drift on error routing.
+	 */
+	private async applyInPlaceOverlayChange(
+		isIssuer: boolean,
+		overlayState: ConnectionOverlayState,
+		schemaName: string,
+		tableName: string,
+		ddlDescription: string,
+		apply: () => Promise<void>,
+	): Promise<void> {
+		try {
+			await apply();
+		} catch (e) {
+			if (!(e instanceof QuereusError) || e.code !== StatusCode.CONSTRAINT) throw e;
+			if (isIssuer) throw this.issuerOverlayDriftError(schemaName, tableName, ddlDescription, e);
+			overlayState.poison = { message: this.buildRebuildPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
+		}
+	}
+
+	/**
+	 * Delegates ALTER TABLE to the underlying module and carries any per-connection
 	 * overlays to the post-alter schema without discarding staged rows.
 	 *
-	 * ADD COLUMN  — appends the new column's value to each overlay row's data columns,
-	 *               backfilled per row exactly as the committed path does (literal default,
-	 *               per-row `new.<col>` evaluator, or NULL); tombstone rows get NULL.
-	 * DROP COLUMN — removes the dropped column from each overlay row.
-	 * ALTER COLUMN — data column indices are unchanged, but the two value-rewriting attributes
-	 *               also rewrite staged values: `set not null` fills a staged NULL from the
-	 *               column's literal DEFAULT, and `set data type` converts the staged value
-	 *               exactly as the underlying converts its committed rows. Every other
-	 *               attribute (and RENAME) only rotates schema metadata.
+	 * ADD / DROP / RENAME COLUMN are forwarded to each overlay IN PLACE — the overlay's
+	 * own `alterSchema` reshapes its open layers — so the overlay's layer chain and
+	 * savepoint snapshots survive the ALTER (see {@link forwardColumnShapeToOverlay}, and
+	 * {@link applyIndexChangeToOverlays} for why a rebuild destroys them). ADD COLUMN
+	 * backfills each staged row exactly as the committed path does (literal default,
+	 * per-row `new.<col>` evaluator, or NULL); tombstone rows get NULL.
+	 *
+	 * ALTER COLUMN and the constraint change types still REBUILD the overlay — copy its
+	 * staged rows into a fresh staging table ({@link migrateOverlayForAlter}) — which
+	 * flattens the savepoint chain, so rows staged before an active savepoint are lost to
+	 * a later `rollback to savepoint`. Forwarding those in place is
+	 * `isolation-alter-forward-constraints-and-retype`. During that rebuild the two
+	 * value-rewriting ALTER COLUMN attributes also rewrite staged values: `set not null`
+	 * fills a staged NULL from the column's literal DEFAULT, and `set data type` converts
+	 * the staged value exactly as the underlying converts its committed rows.
 	 *
 	 * **Atomicity guarantee.** DDL through Quereus is not transaction-scoped and the
 	 * underlying (shared, committed) base auto-commits its mutation immediately —
@@ -1401,8 +1431,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// overlay whose schema may be a stale pre-alter layout.
 		const toMigrate = ownEntry ? [ownEntry, ...foreign] : foreign;
 
-		// For dropColumn we need the pre-alter column index, readable from any
-		// to-be-migrated overlay's schema.
+		// For dropColumn the rebuild path needs the pre-alter column index, readable from
+		// any to-be-migrated overlay's schema. dropColumn now forwards in place, so this
+		// only feeds `translateOverlayRow`'s (currently unreachable) dropColumn arm — kept
+		// so the rebuild machinery stays whole until it is retired.
 		let dropColumnIdx: number | undefined;
 		if (change.type === 'dropColumn' && toMigrate.length > 0) {
 			const overlaySchema = toMigrate[0][1].overlayTable.tableSchema;
@@ -1456,15 +1488,33 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 		const ddlDescription = `alter table (${change.type})`;
 
+		// Carry one overlay to the post-alter schema. ADD / DROP / RENAME COLUMN forward
+		// IN PLACE so the overlay's layer chain and savepoint snapshots stay intact; every
+		// other change type still rebuilds (see the method doc for the split and its cost).
+		const migrateOverlay = async (key: string, state: ConnectionOverlayState, isIssuer: boolean): Promise<void> => {
+			switch (change.type) {
+				case 'addColumn':
+				case 'dropColumn':
+				case 'renameColumn':
+					await this.applyInPlaceOverlayChange(
+						isIssuer, state, schemaName, tableName, ddlDescription,
+						() => this.forwardColumnShapeToOverlay(state, change, addColumnCtx),
+					);
+					break;
+				default:
+					await this.adoptRebuiltOverlay(
+						key, state, isIssuer, schemaName, tableName, ddlDescription,
+						() => this.migrateOverlayForAlter(db, state, updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx, setDataTypeCtx),
+					);
+			}
+		};
+
 		// Migrate the issuer's own overlay (already validated above). Its NOT NULL /
 		// tombstone throw sites are unreachable after pre-validation; so is a UNIQUE
-		// rejection, which `rowSource` already judged — {@link adoptRebuiltOverlay} raises
+		// rejection, which `rowSource` already judged — the CONSTRAINT routing raises
 		// INTERNAL if one fires anyway rather than dropping the row.
 		if (ownEntry) {
-			await this.adoptRebuiltOverlay(
-				ownEntry[0], ownEntry[1], true, schemaName, tableName, ddlDescription,
-				() => this.migrateOverlayForAlter(db, ownEntry![1], updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx, setDataTypeCtx),
-			);
+			await migrateOverlay(ownEntry[0], ownEntry[1], true);
 		}
 
 		// Tier 3: per FOREIGN overlay, validate then migrate — but a per-row NOT NULL
@@ -1487,10 +1537,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 				}
 				throw e;
 			}
-			await this.adoptRebuiltOverlay(
-				key, oldState, false, schemaName, tableName, ddlDescription,
-				() => this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx, setDataTypeCtx),
-			);
+			await migrateOverlay(key, oldState, false);
 		}
 
 		return updated;
@@ -1982,6 +2029,75 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			return value;
 		}
 		return ctx.foldedDefault;
+	}
+
+	/**
+	 * Forwards one column-shape change (ADD / DROP / RENAME COLUMN) to an already-open
+	 * overlay IN PLACE via the overlay's optional `alterSchema`. The overlay module (the
+	 * memory module by default) reshapes its open transaction layers with their savepoint
+	 * snapshots intact, so `rollback to savepoint` keeps distinguishing rows staged before
+	 * the savepoint from rows staged after it — the rebuild path destroyed that
+	 * distinction in both directions (see {@link applyIndexChangeToOverlays}).
+	 *
+	 * A missing `alterSchema` is treated as a no-op, the way the index paths treat a
+	 * missing `createIndex` / `dropIndex`.
+	 *
+	 * `dropColumn` / `renameColumn` forward the caller's change unchanged. `addColumn`
+	 * forwards an overlay-flavoured copy — see {@link buildOverlayAddColumnChange}.
+	 */
+	private async forwardColumnShapeToOverlay(
+		overlayState: ConnectionOverlayState,
+		change: SchemaChangeInfo,
+		addColumnCtx: AddColumnBackfillContext | undefined,
+	): Promise<void> {
+		const overlayTable = overlayState.overlayTable;
+		if (!overlayTable.alterSchema) return;
+		// `deriveAddColumnBackfill` returns a context for every addColumn, so the assertion
+		// cannot fire when the change type matches.
+		const overlayChange = change.type === 'addColumn'
+			? this.buildOverlayAddColumnChange(change, addColumnCtx!, overlayTable)
+			: change;
+		await overlayTable.alterSchema(overlayChange);
+	}
+
+	/**
+	 * The overlay-flavoured form of one `addColumn` change:
+	 *
+	 * - `insertAtIndex` = the overlay's current tombstone column index, so the new data
+	 *   column lands ahead of the tombstone flag and the flag stays LAST — the layout
+	 *   every read/write path of this package assumes. A bare forward would append after
+	 *   the flag and every value written to the new column would be dropped on read.
+	 * - The column definition is made NULLABLE. The overlay's ADD re-runs the overlay
+	 *   module's own NOT NULL validation against a different row population than the
+	 *   base's: tombstone rows carry placeholder NULL in every non-PK column, so a
+	 *   NOT NULL column the base already accepted would be rejected here. The base's
+	 *   NOT NULL is still enforced where it belongs — by the engine's pre-mutation
+	 *   `validateNotNullBackfill` and the underlying's own ADD (both judged the issuer's
+	 *   effective rows), and per staged row by {@link computeAddColumnValue}'s
+	 *   evaluator-path check.
+	 * - `backfillEvaluator` receives an OVERLAY row (data columns plus the flag) and
+	 *   routes through {@link computeAddColumnValue} — the same helper
+	 *   {@link validateOverlayMigration} dry-runs, so validation and forward cannot
+	 *   drift: NULL for a tombstone row, else the engine's per-row `new.<col>` evaluator
+	 *   over the flag-stripped row, or the folded literal default.
+	 */
+	private buildOverlayAddColumnChange(
+		change: Extract<SchemaChangeInfo, { type: 'addColumn' }>,
+		addColumnCtx: AddColumnBackfillContext,
+		overlayTable: VirtualTable,
+	): SchemaChangeInfo {
+		const tombstoneIdx = overlayTable.tableSchema?.columnIndexMap.get(this.tombstoneColumn.toLowerCase());
+		if (tombstoneIdx === undefined) {
+			throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
+		}
+		const constraints = (change.columnDef.constraints ?? []).filter(c => c.type !== 'notNull');
+		if (!constraints.some(c => c.type === 'null')) constraints.push({ type: 'null' });
+		return {
+			...change,
+			columnDef: { ...change.columnDef, constraints },
+			insertAtIndex: tombstoneIdx,
+			backfillEvaluator: (overlayRow: Row) => this.computeAddColumnValue(addColumnCtx, overlayRow, tombstoneIdx),
+		};
 	}
 
 	/**
