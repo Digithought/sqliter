@@ -1,0 +1,152 @@
+-- ALTER TABLE DROP COLUMN vs. the table's OWN foreign keys.
+--
+-- A foreign key records which of its own table's columns it constrains by POSITION
+-- (`foreignKeys[].columns` is an array of indices into that table's column list), so a
+-- DROP COLUMN has to renumber them — exactly as it already renumbers the primary key,
+-- the secondary indexes and the UNIQUE constraints. A key that loses any of its child
+-- columns is removed outright rather than narrowed (a key missing a child column is a
+-- different constraint against the parent's key). Left unshifted, a surviving key's
+-- index either dangles past the end of the column array (raw TypeError on the next
+-- enforced write) or silently slides onto an unrelated column.
+--
+-- These cases run under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`, which additionally round-trips the corrected keys through the
+-- persisted DDL). Assertions read `foreign_key_info`, which is module-agnostic and
+-- resolves the `from` column as `columns[fk.columns[seq]].name` — the very read that
+-- raises on a dangling index.
+--
+-- The keys are declared with `create table` on purpose: constraints added by
+-- `alter table add column … references …` are covered separately.
+
+pragma foreign_keys = true;
+
+create table FkP (pid integer primary key);
+insert into FkP values (1), (2);
+
+-- ===================================================================
+-- 1. A key whose child column sits AFTER the dropped one shifts down and
+--    keeps constraining the same column.
+-- ===================================================================
+
+create table FkShift (id integer primary key, a integer, fkcol integer references FkP(pid));
+insert into FkShift values (1, 10, 1);
+
+-- Drop `a`, which precedes the FK child column: the recorded position 2 must become 1.
+alter table FkShift drop column a;
+
+-- Introspection resolves the child column (a dangling index throws here instead).
+select "from", "to" from foreign_key_info('FkShift');
+→ [{"from":"fkcol","to":"pid"}]
+
+-- Still enforced, and against the CORRECT column: an orphan is rejected. The
+-- constraint named in the error is the one declared on `fkcol`, not a slid-over key.
+insert into FkShift values (2, 99);
+-- error: _fk_fkshift_fkcol
+
+-- ...while a value present in the parent is accepted.
+insert into FkShift values (3, 2);
+select count(*) as c from FkShift;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 2. Dropping the key's ONLY child column removes the whole key — it must not
+--    slide onto the next column along. This is the silent-corruption case: with
+--    the key left in place, position 1 now names the unrelated text column `z`,
+--    which the engine would then check against the parent's integer key.
+-- ===================================================================
+
+create table FkGone (id integer primary key, fkcol integer references FkP(pid), z text);
+insert into FkGone values (1, 1, 'a');
+alter table FkGone drop column fkcol;
+
+-- No key survives, so `foreignKeys` is back to empty.
+select count(*) as c from foreign_key_info('FkGone');
+→ [{"c":0}]
+
+-- `z` is unconstrained: a text value that is no parent key inserts cleanly.
+insert into FkGone values (11, 'r');
+select count(*) as c from FkGone;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 3. A MULTI-column key that loses one of its columns is removed in full —
+--    not narrowed to its surviving columns.
+-- ===================================================================
+
+create table FkP2 (a integer, b integer, primary key (a, b));
+insert into FkP2 values (1, 2);
+
+create table FkMulti (id integer primary key, x integer, y integer, foreign key (x, y) references FkP2(a, b));
+insert into FkMulti values (1, 1, 2);
+
+-- Enforced over the pair while both columns exist.
+insert into FkMulti values (2, 9, 9);
+-- error: _fk_fkmulti_x_y
+
+alter table FkMulti drop column y;
+select count(*) as c from foreign_key_info('FkMulti');
+→ [{"c":0}]
+
+-- `x` alone is no longer constrained against FkP2.a — a narrowed leftover key
+-- would have rejected this.
+insert into FkMulti values (3, 77);
+select count(*) as c from FkMulti;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 4. Control: dropping a column the key does NOT use leaves it enforcing.
+-- ===================================================================
+
+create table FkKeep (id integer primary key, fkcol integer references FkP(pid), z text);
+insert into FkKeep values (1, 1, 'a');
+
+-- `z` is the trailing column — no recorded position changes.
+alter table FkKeep drop column z;
+select "from", "to" from foreign_key_info('FkKeep');
+→ [{"from":"fkcol","to":"pid"}]
+
+insert into FkKeep values (2, 99);
+-- error: _fk_fkkeep_fkcol
+insert into FkKeep values (3, 2);
+select count(*) as c from FkKeep;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 5. Two keys, one dropped and one shifted in the same statement: the partition
+--    must remove `f1`'s key AND renumber `f2`'s from position 2 to 1.
+-- ===================================================================
+
+create table FkTwo (id integer primary key, f1 integer references FkP(pid), f2 integer references FkP(pid));
+insert into FkTwo values (1, 1, 2);
+alter table FkTwo drop column f1;
+
+select "from", "to" from foreign_key_info('FkTwo');
+→ [{"from":"f2","to":"pid"}]
+
+-- The survivor enforces over f2, not over the vacated slot — and the error names
+-- f2's own constraint, so the shift landed on the right column.
+insert into FkTwo values (2, 99);
+-- error: _fk_fktwo_f2
+insert into FkTwo values (3, 1);
+select count(*) as c from FkTwo;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 6. A referential ACTION still fires correctly after a preceding drop — the
+--    cascade path reads the same child column indices.
+-- ===================================================================
+
+create table FkCascP (pid integer primary key);
+insert into FkCascP values (1), (2);
+
+create table FkCasc (id integer primary key, a integer, fkcol integer references FkCascP(pid) on delete cascade);
+insert into FkCasc values (1, 10, 1);
+insert into FkCasc values (2, 20, 2);
+
+-- Drop the column preceding the FK child column, then trigger the cascade.
+alter table FkCasc drop column a;
+delete from FkCascP where pid = 1;
+
+-- Only the child of the deleted parent went away.
+select id, fkcol from FkCasc order by id;
+→ [{"id":2,"fkcol":2}]

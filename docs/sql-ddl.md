@@ -581,6 +581,8 @@ Removes a column from the table and all its data. Restrictions:
 
 Any UNIQUE constraint over the dropped column is removed with it — a single-column UNIQUE outright, and a **multi-column** UNIQUE in full (a UNIQUE missing one of its columns is a different, stronger constraint, not a silently-narrowed one). The auto-built covering index backing such a constraint is torn down at the same time, leaving no orphan in `index_info`. A UNIQUE whose columns do **not** include the dropped column survives, with its column indices shifted over the removed slot. (SQLite rejects dropping a column that participates in a UNIQUE; Quereus permits it and drops the constraint.)
 
+The table's own **FOREIGN KEY** constraints follow the same shift-or-remove rule. A foreign key that uses the dropped column as one of its child columns is removed in full — single-column and multi-column alike — since a key missing one of its child columns is a different constraint against the parent's key, not a narrowed one. A foreign key whose child columns do **not** include the dropped column survives and keeps constraining exactly the columns it did before, its recorded child-column positions shifted over the removed slot. (SQLite likewise rejects this drop; Quereus permits it and drops the key.) A foreign key in *another* table pointing **at** the dropped column is unaffected by this rule: it resolves the parent column by name at enforcement time.
+
 **ADD / DROP / RENAME CONSTRAINT**
 
 ```sql

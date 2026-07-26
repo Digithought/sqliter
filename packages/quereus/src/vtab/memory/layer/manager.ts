@@ -2037,14 +2037,22 @@ export class MemoryTableManager {
 						.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index }))
 				})).filter(idx => idx.columns.length > 0);
 
-			// BUG (pre-existing, tracked by ticket `bug-drop-column-leaves-fk-child-index-dangling`):
-			// `foreignKeys[].columns` — indices into THIS table — are carried through the spread
-			// UNSHIFTED, so after dropping a column that precedes an FK child column the index
-			// dangles and the next enforced write crashes. `shiftSchemaIndicesForInsert` (the
-			// ADD-COLUMN-at-a-position mirror of this block) does shift them; a fix here
-			// additionally has to decide what to do with an FK the drop empties, which has no
-			// insert-side counterpart.
+			// Shift or prune the table's own foreign keys. `foreignKeys[].columns` are indices
+			// into THIS table, so they renumber over the removed slot exactly as the PK and the
+			// UNIQUE constraints above do. A foreign key that loses ANY of its child columns is
+			// removed outright, the same call the UNIQUE pruning makes: a key missing one of its
+			// child columns is a different constraint against the parent's key, not a narrowed
+			// one. Both halves matter — left unshifted, a surviving key's index either dangles
+			// past the end of the column array or, worse, silently slides onto an unrelated
+			// column and starts enforcing against the parent there.
 			//
+			// `referencedColumns` is not touched: enforcement resolves the parent indices on
+			// demand from `referencedColumnNames` against the parent's current schema. See
+			// `shiftSchemaIndicesForInsert`, the ADD-COLUMN-at-a-position mirror of this block.
+			const remainingForeignKeys = (this.tableSchema.foreignKeys ?? [])
+				.filter(fk => !fk.columns.includes(colIndex))
+				.map(fk => ({ ...fk, columns: Object.freeze(fk.columns.map(i => i > colIndex ? i - 1 : i)) }));
+
 			// NOTE: the generated-column bookkeeping (`generatedColumnDependencies` /
 			// `generatedColumnTopoOrder`, also index-keyed) is likewise unshifted, but the
 			// engine recomputes it from column names right after this returns
@@ -2061,6 +2069,9 @@ export class MemoryTableManager {
 				indexes: Object.freeze(updatedIndexes),
 				uniqueConstraints: remainingUniqueConstraints.length > 0
 					? Object.freeze(remainingUniqueConstraints)
+					: undefined,
+				foreignKeys: remainingForeignKeys.length > 0
+					? Object.freeze(remainingForeignKeys)
 					: undefined,
 			});
 

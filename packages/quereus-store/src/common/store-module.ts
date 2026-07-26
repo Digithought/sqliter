@@ -1747,6 +1747,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			.filter(uc => !uc.columns.includes(colIndex))
 			.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(i => i > colIndex ? i - 1 : i)) }));
 
+		// Shift or prune this table's own foreign keys, mirroring the UNIQUE pruning above
+		// and the memory module's `dropColumn`. `foreignKeys[].columns` are indices into
+		// THIS table, so they renumber over the removed slot; a key that loses ANY of its
+		// child columns is removed outright (a key missing a child column is a different
+		// constraint against the parent's key, not a narrowed one). Left unshifted, a
+		// surviving key's index dangles past the column array or silently slides onto an
+		// unrelated column — and `saveTableDDL` below persists whichever it ends up being.
+		// `referencedColumnNames` is resolved against the parent by name at enforcement
+		// time, so the parent side needs nothing here.
+		const updatedForeignKeys = (oldSchema.foreignKeys ?? [])
+			.filter(fk => !fk.columns.includes(colIndex))
+			.map(fk => ({ ...fk, columns: Object.freeze(fk.columns.map(i => i > colIndex ? i - 1 : i)) }));
+
 		const updatedSchema: TableSchema = {
 			...oldSchema,
 			columns: Object.freeze(updatedColumns),
@@ -1755,6 +1768,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			indexes: Object.freeze(updatedIndexes),
 			uniqueConstraints: updatedUniqueConstraints.length > 0
 				? Object.freeze(updatedUniqueConstraints)
+				: undefined,
+			foreignKeys: updatedForeignKeys.length > 0
+				? Object.freeze(updatedForeignKeys)
 				: undefined,
 		};
 
