@@ -5055,4 +5055,25 @@ describe('IsolationModule — cross-connection SET DATA TYPE over staged overlay
 		expect((caught as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
 		expect((caught as QuereusError).message).to.contain('main.t');
 	});
+
+	it('poisons a foreign overlay whose staged rows collide only AFTER conversion', async () => {
+		// Each value converts fine on its own, so `validateOverlayMigration` passes; the collision
+		// surfaces only when the rebuilt overlay re-inserts both converted rows under the UNIQUE
+		// column. That CONSTRAINT must poison B, not escape as INTERNAL or abort A's ALTER.
+		await dbA.exec(`create table u (id integer primary key, v text unique) using isolated`);
+		const underlyingU = iso.getUnderlyingState('main', 'u')!.underlyingTable;
+		const overlayU = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlyingU.tableSchema!));
+		await overlayU.update({ operation: 'insert', values: [10, '1', 0] });  // distinct as text…
+		await overlayU.update({ operation: 'insert', values: [11, '01', 0] }); // …identical as integers
+		iso.setConnectionOverlay(dbB, 'main', 'u', { overlayTable: overlayU, hasChanges: true, db: dbB });
+
+		const updated = await iso.alterTable(dbA, 'main', 'u', { type: 'alterColumn', columnName: 'v', setDataType: 'integer' });
+
+		expect(updated.columns.find(c => c.name === 'v')?.logicalType.name.toLowerCase(), 'A\'s ALTER still applies')
+			.to.contain('int');
+		const bState = iso.getConnectionOverlay(dbB, 'main', 'u')!;
+		expect(bState.poison, 'B overlay must be poisoned by the post-conversion collision').to.not.be.undefined;
+		expect(bState.poison!.message).to.match(/roll back this transaction/i);
+		expect(bState.poison!.message).to.contain('main.u');
+	});
 });

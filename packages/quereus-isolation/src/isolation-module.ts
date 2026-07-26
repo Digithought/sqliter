@@ -124,10 +124,8 @@ interface SetNotNullBackfillContext {
 	foldedDefault: SqlValue;
 	/** Whether a usable literal DEFAULT exists — backfill when true, reject the staged NULL when false. */
 	hasDefault: boolean;
-	/** Column name, for the CONSTRAINT / poison message. */
+	/** Column name, for the CONSTRAINT message. */
 	colName: string;
-	/** Owning table name, for the poison message. */
-	tableName: string;
 }
 
 /**
@@ -144,10 +142,6 @@ interface SetDataTypeConvertContext {
 	colIndex: number;
 	/** Per-value conversion; throws MISMATCH exactly as the underlying's does. */
 	convert: (v: SqlValue) => SqlValue;
-	/** Column name, for the poison message. */
-	colName: string;
-	/** Owning table name, for the poison message. */
-	tableName: string;
 }
 
 /**
@@ -1393,12 +1387,12 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// with overlays to migrate). The now-NOT-NULL column's index and folded DEFAULT are read
 		// from a to-be-migrated overlay's PRE-alter schema — the same layout every migrated overlay
 		// shares, and the same source `dropColumnIdx` uses above.
-		const setNotNullCtx = this.deriveSetNotNullBackfill(change, toMigrate, tableName);
+		const setNotNullCtx = this.deriveSetNotNullBackfill(change, toMigrate);
 
 		// Build the setDataType conversion context (undefined unless this is a value-rewriting
 		// retype with overlays to convert). Read from the same PRE-alter overlay schema as above;
 		// `inferType` cannot throw, so deriving it before the underlying mutation is safe.
-		const setDataTypeCtx = this.deriveSetDataTypeConvert(change, toMigrate, tableName);
+		const setDataTypeCtx = this.deriveSetDataTypeConvert(change, toMigrate);
 
 		// Tier 2: validate the ISSUER's own overlay BEFORE mutating the shared underlying.
 		// Any throw here (CONSTRAINT backfill, MISMATCH conversion, or INTERNAL tombstone guard)
@@ -1703,6 +1697,12 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		return newState;
 	}
 
+	// NOTE: the ALTER overlay-migration machinery (the three derive* helpers, validateOverlayMigration,
+	// translateOverlayRow, migrateOverlayForAlter, adoptRebuiltOverlay, buildAlterPoisonMessage) is
+	// roughly a third of this file and threads one context parameter per value-rewriting attribute.
+	// If a fourth attribute ever needs a context, extract the whole cluster into its own module and
+	// pass a single context object instead of a widening parameter list.
+
 	/**
 	 * Precomputes the per-ALTER constants an `addColumn` overlay backfill needs:
 	 * the folded literal DEFAULT (the `tryFoldLiteral` of the DEFAULT expr, or `null`
@@ -1759,7 +1759,6 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	private deriveSetNotNullBackfill(
 		change: SchemaChangeInfo,
 		toMigrate: [string, ConnectionOverlayState][],
-		tableName: string,
 	): SetNotNullBackfillContext | undefined {
 		if (change.type !== 'alterColumn' || change.setNotNull !== true) return undefined;
 		if (toMigrate.length === 0) return undefined;
@@ -1777,7 +1776,6 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			foldedDefault: hasDefault ? folded : null,
 			hasDefault,
 			colName: change.columnName,
-			tableName,
 		};
 	}
 
@@ -1797,7 +1795,6 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	private deriveSetDataTypeConvert(
 		change: SchemaChangeInfo,
 		toMigrate: [string, ConnectionOverlayState][],
-		tableName: string,
 	): SetDataTypeConvertContext | undefined {
 		if (change.type !== 'alterColumn' || change.setDataType === undefined) return undefined;
 		if (toMigrate.length === 0) return undefined;
@@ -1824,8 +1821,6 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					);
 				}
 			},
-			colName: columnName,
-			tableName,
 		};
 	}
 
@@ -1889,8 +1884,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// SET NOT NULL with no usable DEFAULT: reject a staged NULL the migration could not fill.
 		// (With a DEFAULT there is nothing to reject — translateOverlayRow backfills instead.)
 		if (setNotNullCtx && !setNotNullCtx.hasDefault) {
-			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
-				if (oldRow[oldTombstoneIdx] === 1) continue; // tombstone: placeholder NULLs, not a row
+			for await (const oldRow of this.stagedLiveRows(oldOverlay, oldTombstoneIdx)) {
 				if (oldRow[setNotNullCtx.colIndex] === null) {
 					throw new QuereusError(
 						`column ${setNotNullCtx.colName} contains NULL values`,
@@ -1902,14 +1896,23 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		}
 
 		// SET DATA TYPE: prove every staged value convertible before anything is rewritten. NULLs
-		// are left untouched by the conversion (the underlying's `convertNulls` is false for a
-		// retype), and tombstones carry placeholder NULLs that are never read.
+		// are left untouched by the conversion (the underlying's `convertNulls` is false for a retype).
 		if (setDataTypeCtx) {
-			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
-				if (oldRow[oldTombstoneIdx] === 1) continue;
+			for await (const oldRow of this.stagedLiveRows(oldOverlay, oldTombstoneIdx)) {
 				const value = oldRow[setDataTypeCtx.colIndex];
 				if (value !== null) setDataTypeCtx.convert(value as SqlValue); // discard — validation only
 			}
+		}
+	}
+
+	/**
+	 * The staged rows an overlay holds that represent LIVE data, i.e. every row except the
+	 * tombstones — those carry placeholder NULLs at every data column and must never be fed to a
+	 * per-value check, which would read a NULL that is not the row's real value.
+	 */
+	private async *stagedLiveRows(overlay: VirtualTable, tombstoneIdx: number): AsyncIterable<Row> {
+		for await (const row of overlay.query!(makeFullScanFilterInfo())) {
+			if (row[tombstoneIdx] !== 1) yield row;
 		}
 	}
 
