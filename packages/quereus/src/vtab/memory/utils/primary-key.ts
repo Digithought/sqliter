@@ -27,6 +27,18 @@ export interface PrimaryKeyFunctions {
 type ExtractAndCompare = Pick<PrimaryKeyFunctions, 'extractFromRow' | 'compare'>;
 
 /**
+ * The number of components a primary key of `schema` stores — the SAME fallback
+ * {@link createPrimaryKeyFunctions} applies (no PK definition ⇒ all columns), so the
+ * two can never disagree.
+ *
+ * This is the only way to know whether a stored PK is a scalar (arity 1) or a tuple;
+ * see the `BTreeKey` invariant in `vtab/memory/types.ts`.
+ */
+export function primaryKeyArity(schema: TableSchema): number {
+	return schema.primaryKeyDefinition?.length ?? schema.columns.length;
+}
+
+/**
  * Creates optimized primary key extraction and comparison functions for a given table schema.
  * This centralizes the logic that was previously duplicated across BaseLayer and TransactionLayer.
  *

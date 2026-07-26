@@ -140,11 +140,10 @@ select id from jse_ix where v = cast('{ "a" : 1 , "b" : 2 }' as json);
 select id from jse_ix where v in ('{"b":2,"a":1}', '[1,2,3]') order by id;
 → [{"id":1},{"id":2}]
 
--- NOTE: this table holds only documents whose deepCompareJson order and canonical-text
--- (index byte) order agree, so the indexed and unindexed answers match. They do NOT agree
--- in general — an indexed JSON range can return a different row set than the same range
--- over a scan. That divergence predates this file and is tracked in
--- tickets/fix/bug-json-index-range-seek-order; do not read this case as coverage for it.
+-- A range over the index: the tree, `<`/`>` and BETWEEN all rank JSON documents by the
+-- same structural compare, so the indexed answer equals the unindexed one. Ranges over a
+-- corpus of every JSON kind (including array-valued documents) are covered in
+-- 06.9.3-json-index-range-seek.sqllogic.
 select id from jse_ix where v between '{"a":1,"b":1}' and '{"a":1,"b":3}';
 → [{"id":1}]
 

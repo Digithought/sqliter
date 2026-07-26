@@ -233,12 +233,10 @@ function compareNumbers(a: number | bigint, b: number | bigint): number {
  * then key list, then values. This branch's order is what the store's `encodeObject`
  * writes as UTF-8 and physically sorts by.
  *
- * NOTE: BOTH orders are load-bearing, and they disagree. `<`/`>`/BETWEEN on a JSON column
- * evaluate under `deepCompareJson` (emitComparisonOp's shared-semantic-type path), while an
- * index range seek walks this branch's order — so the memory module returns a different row
- * set for the same range depending on whether the index is used. Equality is unaffected (the
- * two agree there), which is why `=` / UNIQUE / GROUP BY are sound. Tracked in
- * `tickets/fix/bug-json-index-range-seek-order`.
+ * This branch is only reached for a value whose column is NOT declared `json`. A declared
+ * JSON column is compared through `createTypedComparator(JSON_TYPE, …)` everywhere it is
+ * ordered — the memory BTree's key comparator, `<`/`>`/BETWEEN at runtime, and ORDER BY —
+ * so an indexed JSON range seek walks exactly the window the operators evaluate.
  *
  * NOTE: assumes OBJECT-class values are treated as immutable — the string is cached on
  * first serialization and never invalidated, so mutating a value in place after it has

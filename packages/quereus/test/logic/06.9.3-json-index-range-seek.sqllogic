@@ -1,0 +1,166 @@
+-- json-index-range-seek.sqllogic
+-- A range / equality / IN seek over an INDEXED json column must return exactly the
+-- rows the same predicate returns over an UNINDEXED one (ticket
+-- bug-json-index-range-seek-order). The defect was not an ordering disagreement:
+-- the index tree, `<`/`>` and `order by` all rank JSON documents by the same
+-- structural compare. The scan path recovered a key's scalar-vs-tuple shape with
+-- `Array.isArray`, so a stored document that IS a JS array (`[1]`, `[null]`) was
+-- misread as a composite key tuple and every bound / prefix / NULL check compared
+-- against its first element.
+--
+-- Every query below is asserted against BOTH tables with the SAME expected rows,
+-- and the expectations agree with the `order by v` sequence at the end of section 1.
+-- No `using memory`, so store mode runs this too (the store encodes JSON key members
+-- structurally and never had the defect — this pins that the two modules agree).
+
+-- ===================================
+-- 1. Single-column index over a mixed JSON corpus
+-- ===================================
+-- The corpus spans every JSON kind, in structural rank order (null < boolean <
+-- number < string < array < object) plus the shapes that specifically broke:
+-- `[]` (empty array), `[1]` (single-element — read as the tuple `(1)`), `[null]`
+-- (read as a NULL-bearing tuple, so equality returned nothing), `[9,9]`, and a
+-- nested array. `g` exists only for the composite index in section 3.
+create table jrs_n (id integer primary key, g integer, v json);
+create table jrs_i (id integer primary key, g integer, v json);
+create index jrs_i_v on jrs_i (v);
+insert into jrs_n values
+	(1, 1, 'false'), (2, 1, 'true'),
+	(3, 1, '-1'), (4, 1, '5'), (5, 1, '2.5'),
+	(6, 1, '"a"'), (7, 1, '"z"'),
+	(8, 1, '[]'), (9, 1, '[1]'), (10, 1, '[null]'), (11, 1, '[9,9]'), (12, 1, '[[1,2],[3]]'),
+	(13, 1, '{}'), (14, 1, '{"a":1}'), (15, 1, '{"a":2}'), (16, 1, '{"a":10}'), (17, 1, '{"b":1}'),
+	(18, 2, '[1]'), (19, 2, '{"a":1}'), (20, 2, '5');
+insert into jrs_i select * from jrs_n;
+-- run
+
+-- The structural order both tables must agree with. Ties (`5` at ids 4 and 20,
+-- `[1]` at 9 and 18, `{"a":1}` at 14 and 19) are broken by id so the row list is
+-- deterministic.
+select id from jrs_n order by v, id;
+→ [{"id":1},{"id":2},{"id":3},{"id":5},{"id":4},{"id":20},{"id":6},{"id":7},{"id":8},{"id":10},{"id":9},{"id":18},{"id":11},{"id":12},{"id":13},{"id":14},{"id":19},{"id":15},{"id":16},{"id":17}]
+
+select id from jrs_i order by v, id;
+→ [{"id":1},{"id":2},{"id":3},{"id":5},{"id":4},{"id":20},{"id":6},{"id":7},{"id":8},{"id":10},{"id":9},{"id":18},{"id":11},{"id":12},{"id":13},{"id":14},{"id":19},{"id":15},{"id":16},{"id":17}]
+
+-- ===================================
+-- 2. Range bounds: indexed answer == unindexed answer
+-- ===================================
+-- `> 5` must include every string, array and object — the arrays (8..12, 18) are
+-- exactly what the shape sniff used to drop.
+select id from jrs_n where v > json('5') order by id;
+→ [{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":17},{"id":18},{"id":19}]
+
+select id from jrs_i where v > json('5') order by id;
+→ [{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":17},{"id":18},{"id":19}]
+
+select id from jrs_n where v >= json('5') order by id;
+→ [{"id":4},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":17},{"id":18},{"id":19},{"id":20}]
+
+select id from jrs_i where v >= json('5') order by id;
+→ [{"id":4},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":17},{"id":18},{"id":19},{"id":20}]
+
+select id from jrs_n where v < json('"a"') order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":20}]
+
+select id from jrs_i where v < json('"a"') order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":20}]
+
+-- An ARRAY as the bound: `<= [1]` stops just after the two `[1]` rows, and `[null]`
+-- (id 10) sorts BELOW `[1]` because element-wise null < number.
+select id from jrs_n where v <= json('[1]') order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":18},{"id":20}]
+
+select id from jrs_i where v <= json('[1]') order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":18},{"id":20}]
+
+-- Both bounds are arrays/objects.
+select id from jrs_n where v > json('[1]') and v < json('{"b":1}') order by id;
+→ [{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":19}]
+
+select id from jrs_i where v > json('[1]') and v < json('{"b":1}') order by id;
+→ [{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":19}]
+
+select id from jrs_n where v between json('[1]') and json('{"a":1}') order by id;
+→ [{"id":9},{"id":11},{"id":12},{"id":13},{"id":14},{"id":18},{"id":19}]
+
+select id from jrs_i where v between json('[1]') and json('{"a":1}') order by id;
+→ [{"id":9},{"id":11},{"id":12},{"id":13},{"id":14},{"id":18},{"id":19}]
+
+-- Descending walk over the same window.
+select id from jrs_n where v > json('5') order by v desc, id desc;
+→ [{"id":17},{"id":16},{"id":15},{"id":19},{"id":14},{"id":13},{"id":12},{"id":11},{"id":18},{"id":9},{"id":10},{"id":8},{"id":7},{"id":6}]
+
+select id from jrs_i where v > json('5') order by v desc, id desc;
+→ [{"id":17},{"id":16},{"id":15},{"id":19},{"id":14},{"id":13},{"id":12},{"id":11},{"id":18},{"id":9},{"id":10},{"id":8},{"id":7},{"id":6}]
+
+-- ===================================
+-- 3. Equality and IN on array-valued documents
+-- ===================================
+-- `[null]` is the case the naive fix (bound comparison only) leaves broken: the
+-- seek-key NULL test read the document as a tuple containing SQL NULL and returned
+-- no rows at all.
+select id from jrs_n where v = json('[null]') order by id;
+→ [{"id":10}]
+
+select id from jrs_i where v = json('[null]') order by id;
+→ [{"id":10}]
+
+select id from jrs_n where v = json('[9,9]') order by id;
+→ [{"id":11}]
+
+select id from jrs_i where v = json('[9,9]') order by id;
+→ [{"id":11}]
+
+select id from jrs_n where v = json('[]') order by id;
+→ [{"id":8}]
+
+select id from jrs_i where v = json('[]') order by id;
+→ [{"id":8}]
+
+select id from jrs_n where v = json('{}') order by id;
+→ [{"id":13}]
+
+select id from jrs_i where v = json('{}') order by id;
+→ [{"id":13}]
+
+-- Multi-seek (`IN`) mixes an array-with-null, a plain array and an object.
+select id from jrs_n where v in (json('[null]'), json('[1]'), json('{"a":10}')) order by id;
+→ [{"id":9},{"id":10},{"id":16},{"id":18}]
+
+select id from jrs_i where v in (json('[null]'), json('[1]'), json('{"a":10}')) order by id;
+→ [{"id":9},{"id":10},{"id":16},{"id":18}]
+
+-- ===================================
+-- 4. Composite index: leading equality + trailing JSON range
+-- ===================================
+-- Here the index key genuinely IS a tuple, so the arity-derived shape must stay
+-- `true` — this is the direction a fix that simply hard-coded "scalar" would break.
+create table jrs_c (id integer primary key, g integer, v json);
+create index jrs_c_gv on jrs_c (g, v);
+insert into jrs_c select * from jrs_n;
+-- run
+
+select id from jrs_c where g = 1 and v > json('5') order by id;
+→ [{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":17}]
+
+select id from jrs_n where g = 1 and v > json('5') order by id;
+→ [{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":17}]
+
+select id from jrs_c where g = 2 and v >= json('[1]') order by id;
+→ [{"id":18},{"id":19}]
+
+select id from jrs_n where g = 2 and v >= json('[1]') order by id;
+→ [{"id":18},{"id":19}]
+
+select id from jrs_c where g = 1 and v between json('[1]') and json('{"a":1}') order by id;
+→ [{"id":9},{"id":11},{"id":12},{"id":13},{"id":14}]
+
+select id from jrs_n where g = 1 and v between json('[1]') and json('{"a":1}') order by id;
+→ [{"id":9},{"id":11},{"id":12},{"id":13},{"id":14}]
+
+select id from jrs_c where g = 2 and v = json('[1]') order by id;
+→ [{"id":18}]
+
+select id from jrs_n where g = 2 and v = json('[1]') order by id;
+→ [{"id":18}]

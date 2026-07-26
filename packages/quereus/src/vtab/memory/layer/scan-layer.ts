@@ -1,6 +1,6 @@
 import type { ScanPlan } from './scan-plan.js';
 import type { Layer } from './interface.js';
-import type { BTreeKey, BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
+import { keyParts, leadingKeyPart, type BTreeKey, type BTreeKeyForPrimary, type BTreeKeyForIndex, type MemoryIndexEntry } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 import { StatusCode, type Row } from '../../../common/types.js';
 import { safeIterate } from './safe-iterate.js';
@@ -12,9 +12,13 @@ import { planAppliesToKey, resolveScanComparators, type ResolvedScanComparators 
  * (composite tuple). Such a key contributes no match: `x IN (…, NULL)` is TRUE on
  * a non-null equal element else NULL, so the WHERE excludes the row; for a tuple
  * seek, a NULL in any component makes the row-value comparison NULL ⇒ no match.
+ *
+ * `keyIsTuple` comes from the scanned structure's arity (see the {@link BTreeKey}
+ * invariant) — sniffing it would read the JSON document `[null]` as a NULL-bearing
+ * tuple and silently drop the equality seek that should match it.
  */
-function seekKeyHasNull(key: BTreeKey): boolean {
-	return Array.isArray(key) ? key.some(v => v === null) : key === null;
+function seekKeyHasNull(key: BTreeKey, keyIsTuple: boolean): boolean {
+	return keyParts(key, keyIsTuple).some(v => v === null);
 }
 
 /**
@@ -64,7 +68,7 @@ function* scanLayerResolved(
 			layer.getPkExtractorsAndComparators(seekSchema);
 		const seen = new Set<string>();
 		for (const key of plan.equalityKeys) {
-			if (seekKeyHasNull(key)) continue;
+			if (seekKeyHasNull(key, comparators.keyIsTuple)) continue;
 			const singlePlan: ScanPlan = { ...plan, equalityKey: key, equalityKeys: undefined };
 			for (const row of scanLayerResolved(layer, singlePlan, comparators)) {
 				const encoded = encodePk(primaryKeyExtractorFromRow(row));
@@ -103,7 +107,7 @@ function* scanLayerResolved(
 			// logic ⇒ no row matches. Short-circuit before `tree.get`: a literal `null`
 			// could otherwise match a stored NULL index entry for a composite key. Only
 			// `undefined` (no equality key) falls through to the full/range walk below.
-			if (seekKeyHasNull(plan.equalityKey)) return;
+			if (seekKeyHasNull(plan.equalityKey, comparators.keyIsTuple)) return;
 			const value = tree.get(plan.equalityKey as BTreeKeyForPrimary);
 			if (value) {
 				yield value as Row;
@@ -116,6 +120,11 @@ function* scanLayerResolved(
 		// that column descending. The synthesized all-columns fallback definition
 		// carries no `desc`, so the `?.` chain yields false there, which is correct.
 		const isDescFirstColumn = schema.primaryKeyDefinition?.[0]?.desc === true;
+		// NOTE: `> 1`, whereas the key-shape flag `comparators.keyIsTuple` uses `!== 1`.
+		// They differ only for the zero-column singleton PK, which stores `[]`: neither
+		// branch below can reach it (an `equalityPrefix` needs a PK column, and there is
+		// no column for a bound to constrain), so the seek key is never built for it. If a
+		// zero-arity plan ever does reach here, switch this to `keyIsTuple`.
 		const isComposite = (schema.primaryKeyDefinition?.length ?? schema.columns.length) > 1;
 
 		// Seek-start selection must depend on the *physical* walk direction, not just
@@ -162,7 +171,7 @@ function* scanLayerResolved(
 			if (!planAppliesToKey(plan, primaryKey, primaryKeyComparator, comparators)) {
 				// Early termination for prefix-range: break when prefix no longer matches
 				if (plan.equalityPrefix) {
-					const keyArr = Array.isArray(primaryKey) ? primaryKey : [primaryKey];
+					const keyArr = keyParts(primaryKey, comparators.keyIsTuple);
 					let prefixMismatch = false;
 					for (let i = 0; i < plan.equalityPrefix.length; i++) {
 						if (comparators.equalityPrefix[i](keyArr[i], plan.equalityPrefix[i]) !== 0) {
@@ -178,7 +187,7 @@ function* scanLayerResolved(
 					// terminating compare uses the bound column's typed comparator (same
 					// construction as the tree's key comparator) so the walk terminates
 					// at the boundary of the tree's own order.
-					const keyForComparison = Array.isArray(primaryKey) ? primaryKey[0] : primaryKey;
+					const keyForComparison = leadingKeyPart(primaryKey, comparators.keyIsTuple);
 					if (!seekFromUpper && plan.upperBound) {
 						const cmp = comparators.bound(keyForComparison, plan.upperBound.value);
 						if (cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT)) {
@@ -217,7 +226,7 @@ function* scanLayerResolved(
 		if (plan.equalityKey !== undefined) {
 			// NULL equality is UNKNOWN ⇒ no rows (see the primary branch above). Only
 			// `undefined` falls through to the ordered walk.
-			if (seekKeyHasNull(plan.equalityKey)) return;
+			if (seekKeyHasNull(plan.equalityKey, comparators.keyIsTuple)) return;
 			const indexEntry = indexTree.get(plan.equalityKey as BTreeKeyForIndex);
 			if (indexEntry && primaryTree) {
 				for (const pk of sortedPrimaryKeys(indexEntry)) {
@@ -271,7 +280,7 @@ function* scanLayerResolved(
 			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator, comparators)) {
 				// Early termination for prefix-range: break when prefix no longer matches
 				if (plan.equalityPrefix) {
-					const keyArr = Array.isArray(indexEntry.indexKey) ? indexEntry.indexKey : [indexEntry.indexKey];
+					const keyArr = keyParts(indexEntry.indexKey, comparators.keyIsTuple);
 					let prefixMismatch = false;
 					for (let i = 0; i < plan.equalityPrefix.length; i++) {
 						if (comparators.equalityPrefix[i](keyArr[i], plan.equalityPrefix[i]) !== 0) {
@@ -287,7 +296,7 @@ function* scanLayerResolved(
 				// physical walk directions). Uses the bound column's typed comparator
 				// (same construction as the index tree's key comparator) so the walk
 				// terminates at the boundary of the tree's own order.
-				const keyForComparison = Array.isArray(indexEntry.indexKey) ? indexEntry.indexKey[0] : indexEntry.indexKey;
+				const keyForComparison = leadingKeyPart(indexEntry.indexKey, comparators.keyIsTuple);
 				if (!seekFromUpper && plan.upperBound) {
 					const cmp = comparators.bound(keyForComparison, plan.upperBound.value);
 					if (cmp > 0 || (cmp === 0 && plan.upperBound.op === IndexConstraintOp.LT)) {

@@ -1,6 +1,6 @@
 import type { Database } from '../../../core/database.js';
 import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, validateCollationForType } from '../../../schema/table.js';
-import { type BTreeKeyForPrimary } from '../types.js';
+import { keyParts, type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer, iteratePrimaryRows, populateIndexFromRows, populateIndexFromRowsAsync } from './base.js';
@@ -18,7 +18,7 @@ import type { CollationResolver } from '../../../types/logical-type.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
 import { scanLayer as scanLayerImpl } from './scan-layer.js';
-import { createPrimaryKeyFunctions, buildPrimaryKeyFromValues, type PrimaryKeyFunctions } from '../utils/primary-key.js';
+import { createPrimaryKeyFunctions, buildPrimaryKeyFromValues, primaryKeyArity, type PrimaryKeyFunctions } from '../utils/primary-key.js';
 import { createMemoryTableLoggers } from '../utils/logging.js';
 import { tryFoldLiteral } from '../../../parser/utils.js';
 import { validateAndParse, coerceRowToSchema } from '../../../types/validation.js';
@@ -505,12 +505,17 @@ export class MemoryTableManager {
 
 			// Emit data change events after successful commit
 			if (changes.length > 0 && this.eventEmitter?.emitDataChange) {
+				// The event contract carries the PK as a component array. Derive the stored
+				// key's shape from the PK arity, never from `Array.isArray` — a JSON PK whose
+				// value is a document like `[1]` is a SCALAR key that happens to be a JS
+				// array, and sniffing it would emit `[1]` where the contract wants `[[1]]`.
+				const eventKeyIsTuple = primaryKeyArity(this.tableSchema) !== 1;
 				for (const change of changes) {
 					const event: import('../../events.js').VTableDataChangeEvent = {
 						type: change.type,
 						schemaName: this.schemaName,
 						tableName: this._tableName,
-						key: Array.isArray(change.pk) ? change.pk : [change.pk],
+						key: keyParts(change.pk, eventKeyIsTuple) as SqlValue[],
 						oldRow: change.oldRow,
 						newRow: change.newRow,
 					};
@@ -1293,7 +1298,10 @@ export class MemoryTableManager {
 		onConflict: ConflictResolution,
 		evicted: Row[]
 	): Promise<UpdateResult | null> {
-		const newSourcePk = Array.isArray(newPrimaryKey) ? newPrimaryKey as SqlValue[] : [newPrimaryKey as SqlValue];
+		// Component-array view of the source PK. Shape comes from the PK arity, never
+		// from `Array.isArray` — a single-column JSON PK holding a document like `[1]`
+		// is a scalar key that is also a JS array (see the `BTreeKey` invariant).
+		const newSourcePk = keyParts(newPrimaryKey, primaryKeyArity(schema) !== 1) as SqlValue[];
 		const conflicts = await this.db._lookupCoveringConflicts(mv, uc, newRowData, newSourcePk);
 		// Re-validate under each column's enforcement collation — the index's per-column
 		// COLLATE for an index-derived UNIQUE, else the declared column collation

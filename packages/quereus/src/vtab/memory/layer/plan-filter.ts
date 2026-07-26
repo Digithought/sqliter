@@ -1,5 +1,5 @@
 import type { ScanPlan } from './scan-plan.js';
-import type { BTreeKey } from '../types.js';
+import { keyParts, leadingKeyPart, type BTreeKey } from '../types.js';
 import type { SqlValue } from '../../../common/types.js';
 import type { TableSchema, IndexColumnSchema, PrimaryKeyColumnDefinition } from '../../../schema/table.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
@@ -29,6 +29,13 @@ export interface ResolvedScanComparators {
 	readonly equalityPrefix: readonly ValueComparator[];
 	/** Comparator for the range-bound column (leading column, or the column after the equality prefix). */
 	readonly bound: ValueComparator;
+	/**
+	 * True when the scanned tree stores TUPLE keys (arity !== 1) — see the
+	 * {@link BTreeKey} invariant. Never infer this from `Array.isArray`: a JSON array
+	 * value is a scalar key that is also a JS array, and sniffing it makes every bound
+	 * and prefix check compare against the document's first element instead.
+	 */
+	readonly keyIsTuple: boolean;
 }
 
 /**
@@ -82,7 +89,12 @@ export function resolveScanComparators(
 	// The range bound applies to the leading index column, or — for a prefix-range
 	// plan — to the column immediately after the equality prefix (see scan-plan.ts).
 	const bound = comparatorAt(plan.equalityPrefix?.length ?? 0, plan.boundCollation);
-	return { equalityPrefix, bound };
+	// `!== 1`, not `> 1`: the zero-column (singleton) primary key's extractor returns
+	// `[]`, so it stores tuple keys too. `resolveIndexColumns` falls back to the
+	// synthesized all-columns definition exactly as `createPrimaryKeyFunctions` does,
+	// so the two arities cannot drift.
+	const keyIsTuple = (indexColumns?.length ?? 1) !== 1;
+	return { equalityPrefix, bound, keyIsTuple };
 }
 
 /**
@@ -114,7 +126,7 @@ export function planAppliesToKey(
 	// scan into `comparators`) so a non-BINARY or semantically-ordered seek matches
 	// exactly the window the tree's order defines.
 	if (plan.equalityPrefix) {
-		const keyArr = Array.isArray(key) ? key : [key];
+		const keyArr = keyParts(key, comparators.keyIsTuple);
 		for (let i = 0; i < plan.equalityPrefix.length; i++) {
 			if (comparators.equalityPrefix[i](keyArr[i], plan.equalityPrefix[i]) !== 0) return false;
 		}
@@ -138,7 +150,7 @@ export function planAppliesToKey(
 		return true;
 	}
 
-	const keyForBoundComparison = Array.isArray(key) ? key[0] : key;
+	const keyForBoundComparison = leadingKeyPart(key, comparators.keyIsTuple);
 	// A NULL bound-column value never satisfies a range comparison (`NULL <op> v` is
 	// NULL, never true), so a NULL key is excluded whenever a range bound is present.
 	// The seek covers the predicate (the planner drops the residual `Filter`), so this
