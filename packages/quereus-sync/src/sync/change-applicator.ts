@@ -24,7 +24,7 @@ import type {
 	SchemaMigration,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { toError } from './sync-context.js';
+import { toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
 import { admitGroup } from './admission.js';
 
 /**
@@ -702,11 +702,14 @@ export async function commitChangeMetadata(
 	await batch.write();
 
 	// Column-version cleanup for deletes requires async iteration — once per winning
-	// delete (losers were never written, so there is nothing of theirs to clean).
+	// delete (losers were never written, so there is nothing of theirs to clean). The
+	// row's change-log column entries go in the same batch as its versions: an inbound
+	// delete must leave no more index garbage behind than a local one, and this is the
+	// path a relay runs almost exclusively.
 	for (const resolved of deleteWinners.values()) {
 		const change = resolved.change;
 		if (change.type !== 'delete') continue;
-		await ctx.columnVersions.deleteRowVersions(change.schema, change.table, change.pk);
+		await deleteRowVersionsAndLogEntries(ctx, change.schema, change.table, change.pk);
 	}
 }
 

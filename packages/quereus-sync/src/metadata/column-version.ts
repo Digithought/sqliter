@@ -8,7 +8,7 @@
 import type { SqlValue } from '@quereus/quereus';
 import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, type SerializedHLC, serializeHLC, deserializeHLC, compareHLC, hlcToJson, hlcFromJson } from '../clock/hlc.js';
-import { buildColumnVersionKey, buildColumnVersionScanBounds } from './keys.js';
+import { buildColumnVersionKey, buildColumnVersionRowPrefix, buildColumnVersionScanBounds } from './keys.js';
 
 /**
  * Column version record stored in the KV store.
@@ -191,13 +191,16 @@ export class ColumnVersionStore {
     pk: SqlValue[]
   ): Promise<Map<string, ColumnVersion>> {
     const bounds = buildColumnVersionScanBounds(schemaName, tableName, pk);
+    const prefix = buildColumnVersionRowPrefix(schemaName, tableName, pk);
+    const decoder = new TextDecoder();
     const versions = new Map<string, ColumnVersion>();
 
     for await (const entry of this.kv.iterate(bounds)) {
-      // Extract column name from key
-      const keyStr = new TextDecoder().decode(entry.key);
-      const lastColon = keyStr.lastIndexOf(':');
-      const column = keyStr.slice(lastColon + 1);
+      // The scan bounds are exactly [prefix, prefix+1), so every key here starts
+      // with `prefix` and everything after it is the column name verbatim —
+      // including a name containing `:`, which a last-colon split would truncate.
+      const keyStr = decoder.decode(entry.key);
+      const column = keyStr.slice(prefix.length);
 
       versions.set(column, deserializeColumnVersion(entry.value));
     }
@@ -206,20 +209,45 @@ export class ColumnVersionStore {
   }
 
   /**
+   * Queue deletion of every column version of a row into `batch`, returning the
+   * versions that were removed (column → version).
+   *
+   * The returned map is what lets a caller drop the paired `cl:` change-log
+   * entries in the SAME batch — each entry's key embeds the version's HLC, which
+   * is only recoverable from the record being deleted.
+   *
+   * NOTE: this fully deserializes each cell (a JSON parse of the value) when the
+   * change-log caller only needs the 30-byte HLC prefix. If deleting wide rows or
+   * rows with large blob cells ever shows up as slow, read just the HLC prefix
+   * here instead of reusing `getRowVersions`.
+   */
+  async deleteRowVersionsBatch(
+    batch: WriteBatch,
+    schemaName: string,
+    tableName: string,
+    pk: SqlValue[]
+  ): Promise<Map<string, ColumnVersion>> {
+    const versions = await this.getRowVersions(schemaName, tableName, pk);
+    for (const column of versions.keys()) {
+      batch.delete(buildColumnVersionKey(schemaName, tableName, pk, column));
+    }
+    return versions;
+  }
+
+  /**
    * Delete all column versions for a row.
+   *
+   * Prefer `deleteRowVersionsAndLogEntries` (sync-context.ts) on the sync write
+   * paths: this leaves the row's change-log entries pointing at records that no
+   * longer exist.
    */
   async deleteRowVersions(
     schemaName: string,
     tableName: string,
     pk: SqlValue[]
   ): Promise<void> {
-    const bounds = buildColumnVersionScanBounds(schemaName, tableName, pk);
     const batch = this.kv.batch();
-
-    for await (const entry of this.kv.iterate(bounds)) {
-      batch.delete(entry.key);
-    }
-
+    await this.deleteRowVersionsBatch(batch, schemaName, tableName, pk);
     await batch.write();
   }
 

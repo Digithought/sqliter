@@ -132,6 +132,12 @@ export class TombstoneStore {
 
   /**
    * Delete a tombstone (used when resurrecting a row).
+   *
+   * NOTE: no production caller. If one is added, it must ALSO delete the paired
+   * `cl:` change-log delete entry (`changeLog.deleteEntryBatch(batch, tombstone.hlc,
+   * 'delete', schema, table, pk)`) in the same batch — otherwise the entry outlives
+   * its target and becomes permanent index garbage, the leak `SyncManagerImpl.
+   * pruneTombstones` was fixed to avoid.
    */
   async deleteTombstone(
     schemaName: string,
@@ -168,6 +174,12 @@ export class TombstoneStore {
   /**
    * Prune expired tombstones.
    * Returns the number of tombstones deleted.
+   *
+   * NOTE: no production caller — `SyncManagerImpl.pruneTombstones` is the wired
+   * all-tables equivalent. If this per-table variant is wired up, it needs the same
+   * paired `cl:` change-log delete-entry removal that one does (see
+   * {@link deleteTombstone}); this store has no `ChangeLogStore` handle, so that
+   * would mean threading one in or moving the sweep up a level.
    */
   async pruneExpired(schemaName: string, tableName: string): Promise<number> {
     const bounds = buildTombstoneScanBounds(schemaName, tableName);

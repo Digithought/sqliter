@@ -6,6 +6,7 @@
  */
 
 import type { KVStore } from '@quereus/store';
+import type { SqlValue } from '@quereus/quereus';
 import type { HLCManager, HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import type { ColumnVersionStore } from '../metadata/column-version.js';
@@ -81,6 +82,41 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
 	view.setBigUint64(0, state.wallTime, false);
 	view.setUint16(8, state.counter, false);
 	await ctx.kv.put(SYNC_KEY_PREFIX.HLC_STATE, buffer);
+}
+
+/**
+ * Delete every column version of a row together with the change-log entries that
+ * index them, atomically.
+ *
+ * The `cl:` change log is a derived HLC-ordered index over live `cv:`/`tb:`
+ * records: `collectChangesSince` resolves each entry back to its record and drops
+ * the entry when that record is gone. So once a row's column versions are deleted,
+ * their `cl:` entries can never produce output again — they are pure garbage that
+ * still costs a KV lookup per delta scan. Deleting them with their target is what
+ * keeps the change log proportional to LIVE data instead of to the replica's
+ * lifetime delete volume.
+ *
+ * Both stores' deletions share one `WriteBatch`, so no crash can leave the index
+ * and the data disagreeing.
+ *
+ * Used by both delete paths — local DML capture (`recordDataEvent`) and inbound
+ * apply (`commitChangeMetadata`) — which must stay symmetric: a relay runs almost
+ * exclusively the latter.
+ */
+export async function deleteRowVersionsAndLogEntries(
+	ctx: SyncContext,
+	schema: string,
+	table: string,
+	pk: SqlValue[],
+): Promise<void> {
+	const batch = ctx.kv.batch();
+	const removed = await ctx.columnVersions.deleteRowVersionsBatch(batch, schema, table, pk);
+	if (removed.size === 0) return;
+
+	for (const [column, version] of removed) {
+		ctx.changeLog.deleteEntryBatch(batch, version.hlc, 'column', schema, table, pk, column);
+	}
+	await batch.write();
 }
 
 /**

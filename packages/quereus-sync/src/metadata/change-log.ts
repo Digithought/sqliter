@@ -125,6 +125,21 @@ export class ChangeLogStore {
   /**
    * Delete change log entries up to a given HLC.
    * Used for pruning old entries after they've been synced to all peers.
+   *
+   * NOTE: intentionally unwired — no production caller invokes this, and that is
+   * deliberate, not an oversight. The change log no longer leaks (entries are
+   * deleted with the `cv:`/`tb:` record they point at, so its size tracks live
+   * data), so horizon pruning is now a behaviour change rather than a leak fix:
+   * it drops index entries for cells that are still LIVE, which silently breaks
+   * any peer whose `sinceHLC` predates the horizon — their delta scan would start
+   * past the pruned range and never learn about those cells.
+   *
+   * Precondition before wiring it up: the server must first REFUSE delta sync for
+   * a too-old `sinceHLC` and fall back to a snapshot. `SyncManager.canDeltaSync`
+   * is that check, but no production caller invokes it either — the coordinator's
+   * `get_changes` handler passes `sinceHLC` straight through
+   * (packages/sync-coordinator/src/server/websocket.ts). Both halves must land
+   * together. Tracked as `feat-sync-changelog-horizon-pruning`.
    */
   async pruneEntriesBefore(beforeHLC: HLC): Promise<number> {
     const bounds = buildAllChangeLogScanBounds();

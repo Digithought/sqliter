@@ -221,6 +221,37 @@ describe('ColumnVersion', () => {
       const shouldApplyOlder = await store.shouldApplyWrite('main', 'users', [1], 'name', olderHLC);
       expect(shouldApplyOlder).to.be.false;
     });
+
+    // Load-bearing for change-log cleanup: on delete, each column name recovered
+    // by getRowVersions is fed straight back to buildChangeLogKey to locate that
+    // column's log entry. A name that does not round-trip leaves a permanent orphan.
+    it('recovers every column name exactly, including one containing the key separator', async () => {
+      const siteId = generateSiteId();
+      const hlc: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
+      // ':' is legal in an identifier — key building rejects only unpaired surrogates.
+      const columns = ['id', 'a:b', 'plain'];
+
+      for (const column of columns) {
+        await store.setColumnVersion('main', 'users', [1], column, { hlc, value: column });
+      }
+
+      const versions = await store.getRowVersions('main', 'users', [1]);
+
+      expect([...versions.keys()].sort()).to.deep.equal([...columns].sort());
+      for (const column of columns) {
+        expect(versions.get(column)!.value).to.equal(column);
+      }
+    });
+
+    it('recovers column names when the primary key value contains a colon', async () => {
+      const siteId = generateSiteId();
+      const hlc: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
+
+      await store.setColumnVersion('main', 'users', ['x:y'], 'name', { hlc, value: 'v' });
+
+      const versions = await store.getRowVersions('main', 'users', ['x:y']);
+      expect([...versions.keys()]).to.deep.equal(['name']);
+    });
   });
 });
 

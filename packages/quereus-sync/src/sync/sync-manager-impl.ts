@@ -72,7 +72,7 @@ import type {
 } from './protocol.js';
 import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCStateBatch, toError } from './sync-context.js';
+import { persistHLCStateBatch, toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
 import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl, drainReappearedTables } from './change-applicator.js';
 import { buildTransactionChangeSets } from './change-grouping.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
@@ -780,7 +780,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			const priorRow: Row | undefined = oldRow ? [...oldRow] : undefined;
 			this.tombstones.setTombstoneBatch(batch, schemaName, tableName, pk, hlc, priorRow);
 			this.changeLog.recordDeletionBatch(batch, hlc, schemaName, tableName, pk);
-			await this.columnVersions.deleteRowVersions(schemaName, tableName, pk);
+			// The row's column versions die here, so their change-log entries must die
+			// with them — otherwise every deleted row leaves one orphan entry per column
+			// behind forever (see deleteRowVersionsAndLogEntries).
+			await deleteRowVersionsAndLogEntries(this, schemaName, tableName, pk);
 
 			const change: RowDeletion = {
 				type: 'delete',
@@ -1268,6 +1271,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return this.peerStates.getPeerSentState(peerSiteId);
 	}
 
+	/**
+	 * Drop tombstones past the retention horizon, together with the change-log
+	 * `delete` entry each one backs. The entry is only an index pointer at the
+	 * tombstone ({@link resolveLogEntry} returns null once the tombstone is gone),
+	 * so leaving it would accumulate one dead entry per delete the replica has ever
+	 * seen — the delete-side twin of the column cleanup in
+	 * {@link deleteRowVersionsAndLogEntries}. Both deletions share this batch.
+	 */
 	async pruneTombstones(): Promise<number> {
 		const now = Date.now();
 		let count = 0;
@@ -1279,6 +1290,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 			if (now - tombstone.createdAt > this.config.retentionHorizonMs) {
 				batch.delete(entry.key);
+				const parsed = parseTombstoneKey(entry.key);
+				if (parsed) {
+					this.changeLog.deleteEntryBatch(batch, tombstone.hlc, 'delete', parsed.schema, parsed.table, parsed.pk);
+				} else {
+					console.warn('[Sync] Unparseable tombstone key during prune — its change-log entry is left orphaned');
+				}
 				count++;
 			}
 		}

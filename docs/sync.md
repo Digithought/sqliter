@@ -403,6 +403,26 @@ written, keeping a single surviving entry whose HLC equals the current version's
 matter how many versions of a key were batched (e.g. concurrent deletes of the same pk
 relayed together).
 
+**Entries die with their target.** The change log is a *derived index* over the live
+`cv:`/`tb:` records — `resolveLogEntry` returns `null` for an entry whose record is
+gone, and the scan drops it. So every entry is deleted in the same `WriteBatch` as the
+record it points at:
+
+| record removed | entries removed with it | where |
+|---|---|---|
+| a row's column versions, on delete | that row's `column` entries | `deleteRowVersionsAndLogEntries`, called from both the local write path (`recordDataEvent`) and apply (`commitChangeMetadata`) |
+| an expired tombstone | that pk's `delete` entry | `SyncManagerImpl.pruneTombstones` |
+
+This bounds the change log to **live cells + live tombstones** rather than to the
+replica's lifetime delete volume: a replica that repeatedly inserts and deletes the same
+row keeps a constant-size log. The removal is lossless by construction — a dropped entry
+already resolved to `null` and could never have appeared in any `ChangeSet`.
+
+Pruning entries by a *time* horizon (`ChangeLogStore.pruneEntriesBefore`) is a different,
+deliberately **unwired** operation: it drops entries for cells that are still live, which
+is only safe once the server refuses delta sync for a too-old `sinceHLC`
+(`SyncManager.canDeltaSync`, likewise not yet called by the coordinator).
+
 **Oversized transaction.** A single transaction whose fact count exceeds `batchSize`
 is returned **whole** as one ChangeSet and telemetered (a `console.warn`), never
 silently chunked — splitting it would violate the one-ChangeSet-per-transaction

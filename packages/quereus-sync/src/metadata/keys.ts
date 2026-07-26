@@ -167,6 +167,23 @@ export function buildTableColumnVersionScanBounds(
 }
 
 /**
+ * The key prefix shared by every column version of one row:
+ * `cv:{schema}.{table}:{pk_json}:`.
+ *
+ * Exported so a row scan can recover each entry's column name by stripping this
+ * exact prefix, rather than splitting the key at its last `:` — the column name
+ * is the only unbounded, separator-bearing component, so only the prefix is
+ * unambiguous (see {@link parseColumnVersionKey}, which has no pk to anchor on).
+ */
+export function buildColumnVersionRowPrefix(
+  schemaName: string,
+  tableName: string,
+  pk: SqlValue[]
+): string {
+  return `cv:${schemaName}.${tableName}${SEPARATOR}${encodePK(pk)}${SEPARATOR}`;
+}
+
+/**
  * Build scan bounds for all column versions of a row.
  * Returns keys to scan cv:{schema}.{table}:{pk_json}:*
  */
@@ -175,7 +192,7 @@ export function buildColumnVersionScanBounds(
   tableName: string,
   pk: SqlValue[]
 ): { gte: Uint8Array; lt: Uint8Array } {
-  const prefix = `cv:${schemaName}.${tableName}${SEPARATOR}${encodePK(pk)}${SEPARATOR}`;
+  const prefix = buildColumnVersionRowPrefix(schemaName, tableName, pk);
   return {
     gte: encoder.encode(prefix),
     lt: incrementLastByte(encoder.encode(prefix)),
@@ -259,6 +276,14 @@ export function buildAllSchemaMigrationsScanBounds(): { gte: Uint8Array; lt: Uin
 /**
  * Parse a column version key to extract components.
  * Key format: cv:{schema}.{table}:{pk_json}:{column}
+ *
+ * NOTE: the pk/column split is taken at the LAST `:`, so a column name that
+ * itself contains a `:` (legal — `assertKeyableIdentifiers` rejects only unpaired
+ * surrogates) mis-splits and `decodePK` then fails, returning null. Callers treat
+ * null as "skip", so such a cell silently drops out of full sync and snapshots.
+ * Pre-existing and out of scope here; tracked as `bug-sync-colon-in-column-name-drops-cell`.
+ * When the row's pk IS known, use {@link buildColumnVersionRowPrefix} instead —
+ * stripping the exact prefix is unambiguous.
  */
 export function parseColumnVersionKey(key: Uint8Array): {
   schema: string;
