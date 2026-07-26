@@ -542,6 +542,14 @@ this per-scan / auto-index path (still under the index collation). The gate read
 `index.columns[i].collation` this resolver does, so the two stay consistent across an `ALTER
 COLUMN … SET COLLATE`.
 
+A **semantic-ordering** column (TIMESPAN, JSON — see [types.md § Semantic
+ordering](types.md#semantic-ordering)) is the one exception: its enforcement comparison is
+the declared type's `compare`, so neither the index nor the column `COLLATE` participates
+and `'PT1H'`/`'PT60M'` conflict under any collation. The resolved collation is still passed
+to the type's `compare` (types whose ordering is partly textual may consult it). Every
+backend builds these comparators from the resolved collations through one helper,
+`uniqueEnforcementComparators` (`schema/unique-enforcement.ts`).
+
 ### View and materialized-view persistence
 
 Views and materialized views are engine-level catalog objects that never pass

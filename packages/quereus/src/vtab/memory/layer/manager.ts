@@ -1361,6 +1361,14 @@ export class MemoryTableManager {
 		// One resolve per column, not per scanned row. A semantic-ordering column
 		// (TIMESPAN, JSON) compares through its declared type's `compare` instead of the
 		// collation — the shared rule across all three backends.
+		//
+		// NOTE: the collations come from the DECLARED column collation, not from
+		// `uniqueEnforcementCollations(schema, uc)` as the index and MV paths use. For an
+		// index-derived UNIQUE (`create unique index … collate x`) the two disagree — this
+		// path would enforce under the column's collation instead of the index's. Harmless
+		// today: this fallback fires only when no covering structure resolves at all, and
+		// an index-derived UC always resolves its own index. If a shape ever reaches here
+		// with `uc.derivedFromIndex` set, switch this line to the shared resolver.
 		const collations = uc.columns.map(colIdx => this.collationResolver(schema.columns[colIdx].collation ?? 'BINARY'));
 		const compares = uniqueEnforcementComparators(schema.columns, uc.columns, collations);
 
