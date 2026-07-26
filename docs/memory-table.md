@@ -391,7 +391,9 @@ consumer (e.g. the sync engine's per-column versioning) would never record the a
 as was suppressing the pre-image, which silently turns updates into upserts.
 `rekeyPrimaryKey` (`SET COLLATE` on a PK column) deliberately leaves the log alone: a collation
 change moves only the comparator, never a stored value or key value, so the recorded images are
-still accurate. Consolidation (`consolidateToBaseLayer`) clears the drained committed layers'
+still accurate. `RENAME COLUMN` needs nothing either — the log stores no column names, and
+`changedColumns` is derived from the images against `this.tableSchema` at *emit* time, so it
+already reads the post-rename name. Consolidation (`consolidateToBaseLayer`) clears the drained committed layers'
 logs — their events were delivered when those layers committed, and leaving them in place would
 re-deliver them at the transaction's commit once the base becomes the collection boundary.
 

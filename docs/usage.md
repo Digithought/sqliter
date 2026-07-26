@@ -350,10 +350,15 @@ The `DatabaseDataChangeEvent` interface:
 `oldRow` / `newRow` are **positional**: pair value *i* with column *i* of the table's schema.
 The engine guarantees that pairing is safe **at delivery time**: every event a commit delivers
 describes its rows in the schema current at delivery — even when the transaction changed the
-table's columns (`ALTER TABLE ADD/DROP COLUMN`, `ALTER COLUMN … SET DATA TYPE` / `SET NOT NULL`)
-*after* recording the write. Events recorded before such an ALTER are rewritten to the
-post-ALTER shape before the commit delivers them, and `changedColumns` only ever names columns
-that exist in that schema.
+table's columns (`ALTER TABLE ADD/DROP/RENAME COLUMN`, `ALTER COLUMN … SET DATA TYPE` /
+`SET NOT NULL`) *after* recording the write. Events recorded before such an ALTER are rewritten
+to the post-ALTER shape before the commit delivers them, and `changedColumns` only ever names
+columns that exist in that schema (a `RENAME COLUMN` moves no value, so only the name changes).
+
+`changedColumns` is present on an update event only if the owning module supplies it — the
+memory module and the engine's auto-event path do; the store module deliberately omits it and
+leaves the per-column diff to the consumer. That per-module choice is stable: a mid-transaction
+ALTER re-derives an existing `changedColumns`, but never synthesizes one that was absent.
 
 ### Subscribing to Schema Changes
 

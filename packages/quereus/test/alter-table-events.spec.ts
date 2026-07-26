@@ -159,6 +159,87 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.deepEqual(events[0].changedColumns, []);
 		});
 
+		it('a delete recorded before the ALTER reshapes its oldRow too', async () => {
+			await db.exec('create table t (id integer primary key, v text, w text)');
+			await db.exec("insert into t values (1, 'a', 'p')");
+			events.length = 0;
+
+			await db.exec('begin');
+			await db.exec('delete from t where id = 1');
+			await db.exec('alter table t drop column w');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.equal(events[0].type, 'delete');
+			assert.deepEqual(events[0].oldRow, [1, 'a']);
+		});
+
+		it('a delete recorded before an ADD COLUMN gains the backfilled slot', async () => {
+			await db.exec('create table t (id integer primary key, v text)');
+			await db.exec("insert into t values (1, 'a')");
+			events.length = 0;
+
+			await db.exec('begin');
+			await db.exec('delete from t where id = 1');
+			await db.exec("alter table t add column w text default 'z'");
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.equal(events[0].type, 'delete');
+			assert.deepEqual(events[0].oldRow, [1, 'a', 'z']);
+		});
+
+		it('RENAME COLUMN mid-transaction renames the recorded changedColumns', async () => {
+			await db.exec('create table t (id integer primary key, v text, w text)');
+			await db.exec("insert into t values (1, 'a', 'p')");
+			events.length = 0;
+
+			await db.exec('begin');
+			await db.exec("update t set v = 'b' where id = 1");
+			await db.exec('alter table t rename column v to v2');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			// Images are untouched (a rename moves no value), but the name must follow.
+			assert.deepEqual(events[0].oldRow, [1, 'a', 'p']);
+			assert.deepEqual(events[0].newRow, [1, 'b', 'p']);
+			assert.deepEqual(events[0].changedColumns, ['v2']);
+		});
+
+		it('an ALTER on one table leaves another table\'s batched events alone', async () => {
+			await db.exec('create table a (id integer primary key, v text, w text)');
+			await db.exec('create table b (id integer primary key, v text, w text)');
+			await db.exec('begin');
+			await db.exec("insert into a values (1, 'x', 'p')");
+			await db.exec("insert into b values (1, 'y', 'q')");
+			await db.exec('alter table a drop column w');
+			await db.exec('commit');
+
+			assert.deepEqual(events.map(e => [e.tableName, e.newRow]), [
+				['a', [1, 'x']],
+				['b', [1, 'y', 'q']],
+			]);
+		});
+
+		it('ROLLBACK TO SAVEPOINT does not revert the ALTER, so the reshaped events stay consistent with the schema', async () => {
+			// DDL escapes savepoint rollback (the module tier is not savepoint-transactional),
+			// so the already-reshaped events must NOT be un-reshaped either — the two stay in
+			// step only because neither is rolled back.
+			await db.exec('create table t (id integer primary key, v text, w text)');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 'a', 'p')");
+			await db.exec('savepoint s1');
+			await db.exec('alter table t drop column w');
+			await db.exec('rollback to s1');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].newRow, [1, 'a']);
+			const rows: unknown[] = [];
+			for await (const row of db.eval('select * from t')) rows.push(row);
+			assert.deepEqual(rows, [{ id: 1, v: 'a' }]);
+		});
+
 		it('SET DATA TYPE converts the value at the altered column in earlier events', async () => {
 			await db.exec('create table t (id integer primary key, v text)');
 			await db.exec('begin');
@@ -348,6 +429,46 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.equal(dml.length, 1, 'only the in-transaction insert may be delivered');
 			assert.deepEqual(dml[0].key, [2]);
 			assert.deepEqual(dml[0].newRow, [2, 'b']);
+		});
+
+		it('ADD COLUMN with a per-row expression default backfills each logged image from itself', async () => {
+			await db.exec('create table t (id integer primary key, v text)');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 'a')");
+			await db.exec('alter table t add column w text default (new.v)');
+			await db.exec('commit');
+
+			const dml = events.filter(e => e.tableName === 't');
+			assert.equal(dml.length, 1);
+			assert.deepEqual(dml[0].newRow, [1, 'a', 'a']);
+		});
+
+		it('SET NOT NULL backfill maps logged NULLs to the folded default', async () => {
+			await db.exec("create table t (id integer primary key, v text null default 'd')");
+			await db.exec('begin');
+			await db.exec('insert into t values (1, null)');
+			await db.exec('alter table t alter column v set not null');
+			await db.exec('commit');
+
+			const dml = events.filter(e => e.tableName === 't');
+			assert.equal(dml.length, 1);
+			assert.deepEqual(dml[0].newRow, [1, 'd']);
+		});
+
+		it('a delete recorded before the ALTER reshapes its oldRow too', async () => {
+			await db.exec('create table t (id integer primary key, v text, w text)');
+			await db.exec("insert into t values (1, 'a', 'p')");
+			events.length = 0;
+
+			await db.exec('begin');
+			await db.exec('delete from t where id = 1');
+			await db.exec('alter table t drop column w');
+			await db.exec('commit');
+
+			const dml = events.filter(e => e.tableName === 't');
+			assert.equal(dml.length, 1);
+			assert.equal(dml[0].type, 'delete');
+			assert.deepEqual(dml[0].oldRow, [1, 'a']);
 		});
 
 		it('the reshaped log is NOT deduplicated: every recorded write stays a separate event', async () => {

@@ -758,16 +758,18 @@ export class DatabaseEventEmitter {
 
 	/**
 	 * Rewrite the row images of every BATCHED data event for one table, in place, after a
-	 * mid-transaction column-set or column-value change (`ALTER TABLE ADD/DROP COLUMN`,
-	 * `ALTER COLUMN … SET DATA TYPE` / `SET NOT NULL` backfill). Covers
-	 * {@link batchedDataEvents} and every {@link dataEventLayers} savepoint layer, so a
-	 * commit delivers each event's `oldRow`/`newRow` in the schema current at delivery.
+	 * mid-transaction column-set, column-name, or column-value change (`ALTER TABLE
+	 * ADD/DROP/RENAME COLUMN`, `ALTER COLUMN … SET DATA TYPE` / `SET NOT NULL` backfill).
+	 * Covers {@link batchedDataEvents} and every {@link dataEventLayers} savepoint layer,
+	 * so a commit delivers each event's `oldRow`/`newRow` in the schema current at delivery.
 	 * No-op when not batching: in autocommit the earlier events were already delivered,
 	 * and there is no earlier same-transaction write to fix.
 	 *
-	 * `changedColumns` is recomputed from the remapped pair against `newColumnNames`
-	 * (so it can never name a dropped column, and can name an added one); when only one
-	 * row image is present it is instead filtered to names that still exist.
+	 * An event that already carried `changedColumns` gets it re-derived against
+	 * `newColumnNames`; one that never carried it keeps it absent, because some modules
+	 * (the store) deliberately omit it and leave the per-column diff to the consumer —
+	 * synthesizing one only for transactions that happened to ALTER would make the
+	 * delivered shape depend on unrelated DDL.
 	 *
 	 * BEST-EFFORT, unlike the module-side pending-ROW reshape (whose failure must reject
 	 * the ALTER): these are historical row images, including superseded intermediate ones
@@ -807,11 +809,18 @@ export class DatabaseEventEmitter {
 					warnLog('remapBatchedDataEvents: newRow remap failed on %s.%s, leaving image as-is: %O',
 						event.schemaName, event.tableName, e);
 				}
-				if (event.type === 'update' && next.oldRow && next.newRow) {
-					next.changedColumns = computeChangedColumnNames(next.oldRow, next.newRow, newColumnNames);
-				} else if (next.changedColumns) {
-					const valid = new Set(newColumnNames.map(n => n.toLowerCase()));
-					next.changedColumns = next.changedColumns.filter(n => valid.has(n.toLowerCase()));
+				if (next.changedColumns) {
+					// Both images present at a common arity ⇒ re-derive positionally: a dropped
+					// column falls out, an added one can appear, and a RENAME's new name
+					// replaces the old. Otherwise (a delete's lone image, or a remap that failed
+					// on one side and left it at the old arity) a positional diff is meaningless,
+					// so only drop names that no longer exist.
+					if (next.oldRow && next.newRow && next.oldRow.length === next.newRow.length) {
+						next.changedColumns = computeChangedColumnNames(next.oldRow, next.newRow, newColumnNames);
+					} else {
+						const valid = new Set(newColumnNames.map(n => n.toLowerCase()));
+						next.changedColumns = next.changedColumns.filter(n => valid.has(n.toLowerCase()));
+					}
 				}
 				entry.event = next;
 				remapped++;

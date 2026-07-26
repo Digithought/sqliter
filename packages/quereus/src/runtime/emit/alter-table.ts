@@ -325,6 +325,17 @@ async function runRenameColumn(
 		};
 	}
 
+	// A rename moves no value and changes no arity, so the batched events' row images are
+	// already right — but their `changedColumns` still names the OLD column. Re-derive it
+	// against the new names with an identity row map, so no delivered event names a column
+	// the table no longer has. (Modules that emit at commit from their own queue read the
+	// current schema then, so they need nothing here.)
+	await rctx.db._getEventEmitter().remapBatchedDataEvents(
+		tableSchema.schemaName, tableSchema.name,
+		(row) => row,
+		updatedTableSchema.columns.map(c => c.name),
+	);
+
 	// Update the schema catalog
 	schema.addTable(updatedTableSchema);
 
@@ -1165,6 +1176,13 @@ function alterColumnEventValueRemap(
 			try {
 				return validateAndParse(v, newLogicalType, columnName) as SqlValue;
 			} catch {
+				// NOTE: the surviving raw value is honest about what the row held, but its
+				// JS type no longer matches the column's logical type — the delivered
+				// contract is positional (value i belongs to column i), not typed. Only
+				// reachable for a superseded intermediate image (e.g. insert 'zzz' →
+				// update to '42' → retype to integer delivers oldRow ['zzz']). If a
+				// consumer ever type-validates delivered images, revisit: the options are
+				// NULL (loses the value) or dropping the image (loses the event).
 				return v;
 			}
 		};

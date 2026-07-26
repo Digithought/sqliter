@@ -1204,8 +1204,10 @@ Quereus provides a unified event system at the database level that aggregates ev
 `oldRow` / `newRow` are positional — a consumer pairs value *i* with column *i* of the table's
 schema. The delivered contract is: **every event's row images match the schema current at
 delivery**, even when the transaction changed the table's column set (`ALTER TABLE ADD/DROP
-COLUMN`) or column values (`SET DATA TYPE`, `SET NOT NULL` backfill) *after* the write was
-recorded. `changedColumns` never names a column that no longer exists.
+COLUMN`), a column name (`RENAME COLUMN`), or column values (`SET DATA TYPE`, `SET NOT NULL`
+backfill) *after* the write was recorded. `changedColumns` never names a column that no longer
+exists — but it is only ever *re-derived*, never *introduced*: a module that omits it (the store
+does, so the sync layer diffs the rows itself) still omits it after an ALTER.
 
 Who upholds it depends on where the not-yet-delivered event sits at ALTER time:
 
@@ -1213,6 +1215,7 @@ Who upholds it depends on where the not-yet-delivered event sits at ALTER time:
   that flushes its queue into the engine during the ALTER (the store module's coordinator
   commit does) — are rewritten by the engine itself: the ALTER arms call
   `DatabaseEventEmitter.remapBatchedDataEvents` after the module's `alterTable` returns.
+  (`RENAME COLUMN` is in that set: the images need no rewrite, but `changedColumns` does.)
 - Events a module still holds in its **own** queue across the ALTER and emits only at commit
   are the **module's responsibility**: a third-party module that queues events per-transaction
   must rewrite their row images inside its `alterTable` (the memory module reshapes its

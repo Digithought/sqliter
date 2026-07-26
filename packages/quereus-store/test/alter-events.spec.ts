@@ -96,7 +96,22 @@ describe('Store-backed ALTER TABLE mid-transaction: events keep the delivered sc
 		assert.equal(dml[0].type, 'update');
 		assert.deepEqual(dml[0].oldRow, [1, 'a']);
 		assert.deepEqual(dml[0].newRow, [1, 'b']);
-		assert.deepEqual(dml[0].changedColumns, ['v']);
+		// The store deliberately omits `changedColumns` (consumers diff the rows
+		// themselves); the reshape must not start synthesizing one, or the delivered
+		// shape would depend on whether the transaction happened to run DDL.
+		assert.equal(dml[0].changedColumns, undefined);
+	});
+
+	it('an update event outside any ALTER also omits changedColumns (the shape the reshape must preserve)', async () => {
+		await db.exec('create table t (id integer primary key, v text, w text) using store');
+		await db.exec("insert into t values (1, 'a', 'p')");
+		events.length = 0;
+
+		await db.exec("update t set v = 'b' where id = 1");
+
+		const dml = events.filter(e => e.tableName === 't');
+		assert.equal(dml.length, 1);
+		assert.equal(dml[0].changedColumns, undefined);
 	});
 
 	it('mixed arity inside one commit batch is normalized to one shape', async () => {
