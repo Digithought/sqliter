@@ -358,6 +358,53 @@ describe('Database.watch (integration)', () => {
 		sub.unsubscribe();
 	});
 
+	// Change tracking is fed the row the substrate STORED, not the raw values the
+	// statement proposed (bug-dml-downstream-uses-uncoerced-row). Coercion happens
+	// inside vtab.update(), so a watcher keyed on a coerced column only matches if
+	// the executor records the post-coercion row.
+	it("'rows' watch matches on the STORED key, not the raw proposed one", async () => {
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		const events: WatchEvent[] = [];
+		const sub = db.watch(handBuiltRowsScope('t', 'id', [[7]]), e => { events.push(e); });
+
+		// TEXT '7' into an INTEGER-affinity PK stores as the number 7.
+		await db.exec("INSERT INTO t VALUES ('7', 'seven')");
+		expect(events).to.have.length(1);
+		expect(events[0].matched[0].hits).to.deep.equal([[7]]);
+
+		// The same coercion on the way out of an UPDATE that moves the key.
+		await db.exec("UPDATE t SET id = '7' WHERE id = 7");
+		expect(events).to.have.length(2);
+		expect(events[1].matched[0].hits).to.deep.equal([[7]]);
+
+		sub.unsubscribe();
+	});
+
+	it("'groups' watch reports the STORED group key for a coerced column", async () => {
+		await db.exec('CREATE TABLE jw (id INTEGER PRIMARY KEY, j JSON) USING memory');
+		const events: WatchEvent[] = [];
+		const scope: ChangeScope = {
+			watches: [{
+				table: { schema: 'main', table: 'jw' },
+				columns: new Set(['j']),
+				scope: { kind: 'groups', groupBy: ['j'] },
+			}],
+			nonDeterministicSources: [],
+			unboundParameters: [],
+		};
+		const sub = db.watch(scope, e => { events.push(e); });
+
+		// The proposed value is TEXT; the stored value is a parsed JSON value, so
+		// the group key a subscriber sees must not be the input string.
+		await db.exec(`INSERT INTO jw VALUES (1, '{"a":1}')`);
+		expect(events).to.have.length(1);
+		const groupKey = events[0].matched[0].hits[0][0];
+		expect(groupKey).to.not.equal('{"a":1}');
+		expect(groupKey).to.deep.equal({ a: 1 });
+
+		sub.unsubscribe();
+	});
+
 	it('accepts hand-built scope with non-lowercased schema/table names', async () => {
 		// Hand-built scopes from external sources may not honor the lowercased
 		// contract — the watcher must still resolve and fire.

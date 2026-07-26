@@ -827,12 +827,19 @@ feeds it to change-tracking, row-time MV maintenance, the FK cascade, the
 changed-column comparison, the auto-event, and the row yielded downstream to
 `RETURNING` (`withStoredNewSection` swaps the NEW half of the flat OLD/NEW row).
 Nothing is coerced *before* the write, so the row is coerced exactly once and
-non-idempotent parses are never re-entered. `storedRowOrRaw` falls back to the raw
-row when the module reports none (or one of the wrong width) — a minimal
-test/sample module that echoes its input never coerces, so raw *is* stored for it.
-DELETE is the one arm that does not consult `UpdateResult.row`: its OLD image comes
-from the source scan and is already a stored row, and the isolation layer returns a
-synthetic PK-only placeholder for delete. See `bug-dml-downstream-uses-uncoerced-row`.
+non-idempotent parses are never re-entered.
+
+`UpdateResult.row` carries two signals at once, and all four arms read the first
+one. Its **presence** means a row really was written or removed; every arm
+short-circuits and returns nothing downstream when it is absent, which is how a
+key-not-found UPDATE/DELETE and a module-resolved IGNORE conflict are reported.
+Its **contents** are the stored row, and only INSERT/UPDATE read them:
+`storedRowOrRaw` falls back to the raw row when the reported row's width is not
+the table's column count, covering a minimal test/sample module that echoes its
+input (raw *is* stored for one that never coerces). DELETE reads only the
+presence — its OLD image comes from the source scan and is already a stored row,
+and the isolation layer returns a synthetic PK-only placeholder there. See
+`bug-dml-downstream-uses-uncoerced-row`.
 
 A REPLACE conflict resolved inside `vtab.update()` can delete rows the executor
 never asked it to touch. Two channels on the `ok` `UpdateResult` report them so the

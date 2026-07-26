@@ -4893,3 +4893,69 @@ describe('IsolationModule — a rebuild-poisoned overlay is freed on rollback (n
 		expect(overlayTables.size, 'poisoned overlay freed on rollback').to.equal(0);
 	});
 });
+
+describe('isolated table stored-row reporting', () => {
+	// The DML executor reports `UpdateResult.row` — the row the substrate STORED —
+	// to RETURNING and every other post-write consumer
+	// (bug-dml-downstream-uses-uncoerced-row). The isolation layer coerces the
+	// proposed row for conflict detection but writes the RAW row into the overlay,
+	// leaving the overlay's own single coercion pass to produce the stored row,
+	// which `stripTombstoneFromResult` then hands back at user-facing width. These
+	// cases pin that round trip: RETURNING through the overlay must agree with a
+	// following SELECT, value and type.
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		db.registerModule('isolated', new IsolationModule({ underlying: new MemoryTableModule() }));
+		await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, j JSON, n INTEGER) USING isolated`);
+	});
+
+	afterEach(async () => { await db.close(); });
+
+	const parity = async (returning: string, where: string) => {
+		const written = await asyncIterableToArray(db.eval(returning));
+		const read = await asyncIterableToArray(db.eval(where));
+		expect(written).to.deep.equal(read);
+		return written;
+	};
+
+	it('INSERT ... RETURNING reports the coerced overlay row', async () => {
+		const rows = await parity(
+			`INSERT INTO t VALUES (1, '{"a":2}', '7') RETURNING j, typeof(j) AS jt, n, typeof(n) AS nt`,
+			`SELECT j, typeof(j) AS jt, n, typeof(n) AS nt FROM t WHERE id = 1`,
+		);
+		expect(rows).to.deep.equal([{ j: { a: 2 }, jt: 'json', n: 7, nt: 'integer' }]);
+	});
+
+	it('UPDATE ... RETURNING reports the coerced overlay row', async () => {
+		await db.exec(`INSERT INTO t VALUES (1, '{"a":1}', 1)`);
+		const rows = await parity(
+			`UPDATE t SET j = '{"a":2}', n = '7' WHERE id = 1 RETURNING j, typeof(j) AS jt, n, typeof(n) AS nt`,
+			`SELECT j, typeof(j) AS jt, n, typeof(n) AS nt FROM t WHERE id = 1`,
+		);
+		expect(rows).to.deep.equal([{ j: { a: 2 }, jt: 'json', n: 7, nt: 'integer' }]);
+	});
+
+	it('a PK-moving UPDATE keeps RETURNING and SELECT in agreement', async () => {
+		await db.exec(`INSERT INTO t VALUES (1, '{"a":1}', 1)`);
+		const rows = await parity(
+			`UPDATE t SET id = 5, j = '{"a":9}', n = '42' WHERE id = 1 RETURNING id, j, typeof(j) AS jt, n, typeof(n) AS nt`,
+			`SELECT id, j, typeof(j) AS jt, n, typeof(n) AS nt FROM t`,
+		);
+		expect(rows).to.deep.equal([{ id: 5, j: { a: 9 }, jt: 'json', n: 42, nt: 'integer' }]);
+	});
+
+	it('DELETE still reports its row through the tombstone path', async () => {
+		await db.exec(`INSERT INTO t VALUES (1, '{"a":1}', 1)`);
+		// Committed row: the delete inserts a fresh tombstone and the overlay
+		// reports a PK-only placeholder, whose mere presence is what tells the
+		// executor a row really went away.
+		const deleted = await asyncIterableToArray(db.eval(`DELETE FROM t WHERE id = 1 RETURNING id, j`));
+		expect(deleted).to.deep.equal([{ id: 1, j: { a: 1 } }]);
+		expect(await asyncIterableToArray(db.eval('SELECT * FROM t'))).to.deep.equal([]);
+
+		// Deleting a key that was never there writes nothing and emits nothing.
+		expect(await asyncIterableToArray(db.eval(`DELETE FROM t WHERE id = 99 RETURNING id`))).to.deep.equal([]);
+	});
+});

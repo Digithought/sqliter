@@ -185,9 +185,11 @@ async function resolveDmlSourceRows(
  * the user's un-converted input — `'{"a":2}'` as TEXT rather than the parsed
  * JSON value a subsequent `select` reads back.
  *
- * Falls back to the raw row when the substrate's row is absent or the wrong
- * width (a minimal test/sample module that echoes its input, or one that returns
- * nothing) — those never coerce, so raw IS stored for them.
+ * Falls back to the raw row when the substrate's row is the wrong width — a
+ * minimal test/sample module that echoes its input never coerces, so raw IS
+ * stored for it. The absent case is only reached defensively: every caller has
+ * already short-circuited on a missing `result.row`, which the module contract
+ * reserves for "nothing was written" (see `VirtualTable.update`).
  */
 function storedRowOrRaw(resultRow: Row | undefined, rawRow: Row, columnCount: number): Row {
 	return resultRow && resultRow.length === columnCount ? resultRow : rawRow;

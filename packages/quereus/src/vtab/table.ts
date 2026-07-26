@@ -132,15 +132,21 @@ export abstract class VirtualTable {
 	 * Performs an INSERT, UPDATE, or DELETE operation.
 	 *
 	 * Returns an UpdateResult indicating success or constraint violation:
-	 * - `{ status: 'ok', row?: Row }` - Success. For INSERT/UPDATE, `row` is the row the
-	 *   module actually STORED: the proposed `args.values` after the module's own coercion
-	 *   to the declared column logical types. A module that coerces MUST return the coerced
-	 *   row, because the DML executor reports `row` (not `args.values`) to every post-write
-	 *   consumer — RETURNING, change tracking, row-time materialized-view maintenance, FK
-	 *   cascades, data-change events. Returning the raw input from a coercing module makes
-	 *   RETURNING disagree with a subsequent `select` on the same row. Omit `row` (or return
-	 *   a different width) only if the module does not coerce at all; the executor then falls
-	 *   back to the proposed values. For DELETE, `row` is undefined and is never consulted.
+	 * - `{ status: 'ok', row?: Row }` - Success. The presence of `row` is how the module
+	 *   reports that a row was actually written or removed. Omitting it means "no row
+	 *   changed" (an UPDATE/DELETE whose key was not found, or a conflict the module
+	 *   resolved as IGNORE): the executor then skips the whole post-write pipeline and
+	 *   emits nothing downstream — so every module must return `row` on a real write.
+	 *   For INSERT/UPDATE, `row` is the row the module actually STORED: the proposed
+	 *   `args.values` after the module's own coercion to the declared column logical
+	 *   types. A module that coerces MUST return the coerced row, because the DML
+	 *   executor reports `row` (not `args.values`) to every post-write consumer —
+	 *   RETURNING, change tracking, row-time materialized-view maintenance, FK cascades,
+	 *   data-change events. Returning the raw input from a coercing module makes
+	 *   RETURNING disagree with a subsequent `select` on the same row. A row whose width
+	 *   is not the table's column count makes the executor fall back to `args.values`.
+	 *   For DELETE, only the presence of `row` is consulted, never its contents (the OLD
+	 *   image comes from the source scan), so a PK-only placeholder is acceptable.
 	 * - `{ status: 'constraint', constraint, message?, existingRow? }` - Constraint violation.
 	 *   For 'unique' constraints, existingRow contains the conflicting row (enables UPSERT).
 	 *

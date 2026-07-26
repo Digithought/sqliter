@@ -130,11 +130,14 @@ export type ConstraintType = 'unique' | 'check' | 'not_null' | 'foreign_key';
  * Replaces exception-based constraint signaling to distinguish expected
  * constraint violations from unexpected errors (network issues, bugs, etc.).
  *
- * `row` is the row the module STORED for an INSERT/UPDATE — the proposed values
- * after the module's own coercion to the declared column logical types. The DML
- * executor reports it, not the proposed row, to every post-write consumer; see
+ * `row` present means a row really was written/removed; absent means nothing
+ * changed and the executor skips the post-write pipeline entirely. For an
+ * INSERT/UPDATE it is the row the module STORED — the proposed values after the
+ * module's own coercion to the declared column logical types — and the DML
+ * executor reports it, not the proposed row, to every post-write consumer. For a
+ * DELETE only its presence is read, never its contents. See
  * `VirtualTable.update`'s doc comment for the module-author contract and
- * docs/runtime.md § per-row post-write pipeline. Undefined (and unused) for DELETE.
+ * docs/runtime.md § per-row post-write pipeline.
  *
  * Two REPLACE-displacement channels, both consumed by the DML executor so the
  * single post-write pipeline (change-tracking, row-time MV maintenance, FK
