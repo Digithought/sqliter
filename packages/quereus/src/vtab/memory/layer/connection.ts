@@ -225,6 +225,31 @@ export class MemoryTableConnection {
 			this.connectionId, targetDepth);
 	}
 
+	/**
+	 * Re-points every LAZY savepoint marker that captured a committed-chain view at
+	 * `committedHead`. Called by `MemoryTableManager.ensureSchemaChangeSafety` once a schema
+	 * change has drained the committed layers into the base: a marker still naming a drained
+	 * layer would, on `rollback to savepoint`, reinstate that layer's PRE-change rows as the
+	 * read view — rows in the old column shape under the new schema, which then commit as
+	 * permanent corruption.
+	 *
+	 * Only markers with `readSnapshot === null` move. A non-null `readSnapshot` means the
+	 * captured `readLayer` is this connection's OWN eager savepoint snapshot, holding
+	 * uncommitted rows that base does not have; re-pointing it would discard them. Those layers
+	 * are instead carried across the change by the manager's open-layer adopt/reshape passes.
+	 *
+	 * Eager entries (`snapshot !== null`) are left alone: their rollback path restores
+	 * `entry.snapshot` and never reads `entry.readLayer`.
+	 */
+	public repointLazySavepointsToCommittedHead(committedHead: Layer): void {
+		for (const entry of this.savepointStack) {
+			if (entry.readSnapshot !== null) continue;
+			if (entry.readLayer === committedHead) continue;
+			debugLog(`Connection %d: Re-pointing lazy savepoint marker to the current committed head`, this.connectionId);
+			entry.readLayer = committedHead;
+		}
+	}
+
 	/** Ends savepoint bookkeeping. Only called where the transaction itself is ending. */
 	public clearSavepoints(): void {
 		this.savepointStack = [];

@@ -1966,13 +1966,13 @@ describe('IsolationModule', () => {
 		});
 
 		it('DROP COLUMN (middle) keeps pre-savepoint rows, discards post-savepoint ones, and realigns values', async () => {
-			// The underlying stays EMPTY here on purpose: a committed row would be reverted
-			// to its PRE-alter layout by the memory module's own savepoint restore — the
-			// underlying connection's `rollback to savepoint` snapshot pre-dates the ALTER
-			// and restores the pre-reshape tree. That is a memory-module defect independent
-			// of this layer (see tickets/.pre-existing-error.md); the overlay behavior under
-			// test here does not need committed rows.
+			// The committed row also pins the underlying side: the forwarded BEGIN/SAVEPOINT
+			// leave the underlying connection holding a LAZY savepoint marker (no own writes —
+			// the staged rows live in the overlay), and that marker used to name the committed
+			// layer the ALTER then drained and reshaped, so `rollback to savepoint` reinstated
+			// the row in its pre-ALTER 3-wide shape.
 			await db.exec(`CREATE TABLE asp_drop (id INTEGER PRIMARY KEY, v TEXT, x INTEGER) USING isolated`);
+			await db.exec(`INSERT INTO asp_drop VALUES (0, 'base', 100)`);
 
 			await db.exec(`BEGIN`);
 			await db.exec(`INSERT INTO asp_drop VALUES (1, 'a', 10)`);
@@ -1983,11 +1983,11 @@ describe('IsolationModule', () => {
 			await db.exec(`ROLLBACK TO SAVEPOINT s`);
 
 			let rows = await asyncIterableToArray(db.eval(`SELECT id, x FROM asp_drop ORDER BY id`));
-			expect(rows.map((r: any) => [r.id, r.x]), 'staged x realigned after the middle column dropped').to.deep.equal([[1, 10]]);
+			expect(rows.map((r: any) => [r.id, r.x]), 'staged x realigned after the middle column dropped').to.deep.equal([[0, 100], [1, 10]]);
 
 			await db.exec(`COMMIT`);
 			rows = await asyncIterableToArray(db.eval(`SELECT id, x FROM asp_drop ORDER BY id`));
-			expect(rows.map((r: any) => [r.id, r.x])).to.deep.equal([[1, 10]]);
+			expect(rows.map((r: any) => [r.id, r.x])).to.deep.equal([[0, 100], [1, 10]]);
 		});
 
 		it('DROP COLUMN (last) keeps the pre-savepoint row', async () => {
@@ -2033,15 +2033,10 @@ describe('IsolationModule', () => {
 			await db.exec(`ROLLBACK TO SAVEPOINT s`);
 			await db.exec(`COMMIT`);
 
-			// `w` is deliberately not read: the memory module's own savepoint restore reverts
-			// the committed rows' backfill to the pre-ALTER layout on `rollback to savepoint`
-			// (underlying-side defect, independent of this layer — see
-			// tickets/.pre-existing-error.md). The OVERLAY behavior under test — the staged
-			// tombstone surviving the in-place ALTER and its rollback, then landing at
-			// COMMIT — is fully pinned by the surviving id/v pair. Tighten to include `w`
-			// once the underlying defect is fixed.
-			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM asp_tb ORDER BY id`));
-			expect(rows.map((r: any) => [r.id, r.v]), 'pre-savepoint DELETE still lands').to.deep.equal([[2, 'b']]);
+			// `w` is read too: the committed row's backfill has to survive the underlying
+			// connection's `rollback to savepoint`, whose lazy marker pre-dates the ALTER.
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM asp_tb ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w]), 'pre-savepoint DELETE still lands').to.deep.equal([[2, 'b', 'z']]);
 		});
 	});
 

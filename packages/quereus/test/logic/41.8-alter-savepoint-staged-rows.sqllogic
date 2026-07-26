@@ -70,13 +70,60 @@ select id, x from t2 order by id;
 drop table t2;
 -- run
 
--- NOTE: no RENAME COLUMN case here yet. The memory module natively loses a
--- transaction's pending rows at COMMIT when a savepoint exists across an
--- in-transaction RENAME COLUMN (`renameColumn` has no open-layer reshape, unlike
--- addColumn/dropColumn) — see tickets/.pre-existing-error.md. Add the RENAME leg when
--- that lands; the isolation-layer half is covered by
--- packages/quereus-isolation/test/isolation-layer.spec.ts ("RENAME COLUMN keeps
--- pre-savepoint rows...").
+-- RENAME COLUMN: the rename does not change the column set, but the open layers still
+-- have to ADOPT the renamed schema — an eager savepoint snapshot left holding its frozen
+-- pre-rename schema fails `commitTransaction`'s snapshot-wrap identity check and the
+-- transaction's staged rows are dropped at COMMIT.
+create table t3 (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into t3 values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t3 values (2, 'b');
+-- run
+alter table t3 rename column v to vv;
+-- run
+insert into t3 values (3, 'c');
+-- run
+rollback to savepoint s;
+-- run
+
+select id, vv from t3 order by id;
+→ [{"id":1,"vv":"a"}]
+
+commit;
+-- run
+
+select id, vv from t3 order by id;
+→ [{"id":1,"vv":"a"}]
+
+drop table t3;
+-- run
+
+-- ...and the same rename with no rollback: every staged row survives COMMIT.
+create table t3b (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into t3b values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table t3b rename column v to vv;
+-- run
+commit;
+-- run
+
+select id, vv from t3b order by id;
+→ [{"id":1,"vv":"a"}]
+
+drop table t3b;
+-- run
 
 -- A staged tombstone (an in-transaction DELETE of a committed row) survives the ALTER
 -- under a savepoint and still applies at COMMIT.

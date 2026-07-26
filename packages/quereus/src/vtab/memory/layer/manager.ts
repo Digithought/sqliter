@@ -2151,6 +2151,20 @@ export class MemoryTableManager {
 			await this.baseLayer.handleColumnRename();
 			this.tableSchema = finalNewTableSchema;
 			this.initializePrimaryKeyFunctions();
+			// The DDL transaction's own layers froze their schema at creation; hand them the
+			// renamed one, mirroring `handleColumnRename`'s base-side secondary rebuild —
+			// `updatedIndexes` above rebuilt every `IndexSchema` object, which is exactly the
+			// identity discriminator `adoptSchema` rebuilds a layer's `MemoryIndex` on.
+			//
+			// A rename touches neither the column set nor the primary key, so `adoptSchema` is
+			// the right level (not the `prepareReshapeOnOpenLayers` / `installReshapeOnOpenLayers`
+			// pair `add column` / `drop column` need) — but it is just as mandatory: without it an
+			// eager savepoint snapshot keeps its frozen pre-rename schema, fails
+			// `commitTransaction`'s snapshot-wrap identity check
+			// (`readLayer.getSchema() === this.tableSchema`), and the transaction's staged rows are
+			// silently dropped at COMMIT. Covered by
+			// `test/logic/41.8-alter-savepoint-staged-rows.sqllogic`.
+			this.adoptSchemaOnOpenLayers(finalNewTableSchema);
 
 			// Emit schema change event
 			this.eventEmitter?.emitSchemaChange?.({
@@ -3160,6 +3174,20 @@ export class MemoryTableManager {
 		// bug. A detached connection always has `pendingTransactionLayer === null` (disconnect
 		// defers while a pending layer is uncommitted), so this never discards in-flight writes.
 		this.repointRegisteredConnections();
+
+		// Re-pointing `readLayer` is not enough: a savepoint taken while a connection held no
+		// pending layer stored the layer it was READING as the view to restore. Consolidation
+		// has just drained that layer into the base, and the caller is about to reshape the
+		// base's rows — so the stored reference is a pre-change snapshot of the committed rows.
+		// Left alone, the transaction's `rollback to savepoint` reinstates it and the old column
+		// shape commits over the new one.
+		//
+		// Every connection, not just the re-pointed ones: the DDL issuer is exempt from the
+		// sweeps above (its read view holds its own uncommitted rows) but its own lazy markers
+		// are just as stale.
+		for (const connection of this.knownConnections()) {
+			connection.repointLazySavepointsToCommittedHead(this.baseLayer);
+		}
 
 		logger.debugLog(`Schema change safety check passed for ${this._tableName}. Current committed layer is base.`);
 	}

@@ -363,6 +363,30 @@ non-transactional — see the declared-contract paragraph above); what the resha
 that the transaction's DML — including rows inserted before a savepoint — survives at the new
 arity.
 
+**`RENAME COLUMN` adopts the renamed schema on the open layers.** A rename changes neither the
+column set nor the key bytes, so it needs `adoptSchema` rather than the reshape pair — but it needs
+it just as much. `renameColumn` rebuilds every `IndexSchema` object (each carries the column's
+name), which is exactly the identity signal `adoptSchema` rebuilds a layer's `MemoryIndex` on,
+mirroring the base-side `handleColumnRename` rebuild. Skipping the adopt leaves an eager savepoint
+snapshot on its frozen pre-rename schema, which fails the commit-time snapshot wrap's
+`readLayer.getSchema() === tableSchema` check — and the transaction's staged rows are dropped at
+`COMMIT` even without any rollback.
+
+**A savepoint's *restore view* is re-pointed at the base too.** A `SAVEPOINT` taken while the
+connection holds no pending layer stores a lazy marker naming the layer it was *reading* —
+typically the committed head — as the view to reinstate. `ensureSchemaChangeSafety` drains that
+head into the base and the ALTER then reshapes the base's rows, so the stored reference becomes a
+pre-change snapshot of the committed rows: a later `ROLLBACK TO SAVEPOINT` would reinstate it and
+commit rows in the old column shape under the new schema. So the sweep that re-points `readLayer`
+also re-points every lazy marker
+(`MemoryTableConnection.repointLazySavepointsToCommittedHead`), on *every* connection — the DDL
+issuer is exempt from the `readLayer` sweep (its read view holds its own uncommitted rows) but its
+markers are just as stale. Markers whose captured view is the connection's own eager snapshot are
+left alone: those rows are not in the base, and the adopt/reshape passes above carry them across.
+The isolation wrapper is the sharpest case — it forwards `begin`/`savepoint` to the underlying
+table while the staged rows sit in its overlay, so the underlying connection's markers are always
+lazy.
+
 **`ADD COLUMN` can place the column somewhere other than the end.** `SchemaChangeInfo.addColumn`
 carries an optional `insertAtIndex`; the memory module honors it, splicing the new value into
 that slot in every committed and pending row and renumbering the schema's index-bearing fields
