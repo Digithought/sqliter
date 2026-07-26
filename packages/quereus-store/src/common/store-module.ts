@@ -39,7 +39,7 @@ import type {
 	BackingHost,
 	LensDeploymentSnapshot,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
 import type { CompiledPredicate, EffectiveRowSource, KeyNormalizer, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
@@ -1662,20 +1662,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			columnIndexMap: buildColumnIndexMap(updatedColumns),
 		};
 
-		// Extract any column-level CHECK / FK to persist (see the persist block below).
-		// Hoisted above the row migration so a malformed constraint (e.g. a multi-column
-		// FK on a single ADD COLUMN, which `extractColumnLevelForeignKeys` rejects) throws
-		// BEFORE any rows are migrated or the in-memory schema is swapped — validate-before-
-		// mutate, matching the engine's ordering in `runAddColumn`.
-		const newCheckConstraints = extractColumnLevelCheckConstraints(change.columnDef);
-		const newForeignKeys = extractColumnLevelForeignKeys(change.columnDef, schemaName);
-
 		// Physical rewrite ahead: flush the module's buffered writes so `migrateRows`
 		// (a committed-store scan + batch) sees this transaction's rows and re-encodes
 		// them under the new column layout. See {@link ddlCommitPendingOps}. Placed
 		// after every throw-only check above — the NOT NULL rejection reads effectively
-		// (`hasAnyRows`) and `extractColumnLevel*` reads no rows — so a rejected ALTER
-		// leaves the enclosing transaction intact.
+		// (`hasAnyRows`) — so a rejected ALTER leaves the enclosing transaction intact.
 		await this.ddlCommitPendingOps();
 
 		// Migrate rows: append the new column's value — a single literal default, or a
@@ -1692,34 +1683,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				: undefined,
 		);
 
-		// Update table schema (column-only) and persist DDL.
-		//
-		// The engine's `runAddColumn` re-merges the column-level FK/CHECK extracted
-		// from `columnDef.constraints` into the LIVE in-memory schema AFTER this hook
-		// returns, so the schema handed back to it must stay column-only — returning a
-		// constrained schema would double the constraint in the live SchemaManager (and,
-		// on the next persist, in the DDL). But that engine-side merge is in-memory only:
-		// it never reaches the catalog, so persistence must carry the column-level
-		// CHECK/FK itself or they vanish on `rehydrateCatalog`. Build a separate
-		// `persistedSchema` for `saveTableDDL` when (and only when) the column declares
-		// such a constraint; the common path persists `updatedSchema` unchanged. This is
-		// unconditional on the default kind — a per-row (evaluator) DEFAULT extracts the
-		// same AST constraints as a literal one.
+		// Update table schema (column-only) and persist DDL. Any constraint declared inline
+		// on the added column (UNIQUE / CHECK / FOREIGN KEY) arrives as its own follow-up
+		// `addConstraint` call from the engine's `runAddColumn`, which is what persists it —
+		// so this arm neither installs nor persists them, and the schema it hands back stays
+		// column-only.
 		table.updateSchema(updatedSchema);
-
-		let persistedSchema = updatedSchema;
-		if (newCheckConstraints.length > 0 || newForeignKeys.length > 0) {
-			// The new column is appended last; resolve each FK's child column to its index
-			// (matching how the engine resolves `resolvedForeignKeys` via columnIndexMap).
-			const newColIdx = updatedColumns.length - 1;
-			const resolvedForeignKeys = newForeignKeys.map(fk => ({ ...fk, columns: Object.freeze([newColIdx]) }));
-			persistedSchema = {
-				...updatedSchema,
-				checkConstraints: Object.freeze([...updatedSchema.checkConstraints, ...newCheckConstraints]),
-				foreignKeys: Object.freeze([...(updatedSchema.foreignKeys ?? []), ...resolvedForeignKeys]),
-			};
-		}
-		await this.saveTableDDL(persistedSchema);
+		await this.saveTableDDL(updatedSchema);
 
 		this.eventEmitter?.emitSchemaChange({
 			type: 'alter',

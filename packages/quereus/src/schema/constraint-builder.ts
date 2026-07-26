@@ -130,23 +130,40 @@ export function buildCheckConstraintSchema(
 	};
 }
 
+/* ──────────────── ALTER TABLE ADD COLUMN inline constraints ────────────────
+ * A constraint written inline on an added column (`add column c int unique`,
+ * `… check (c > 0)`, `… references p(pid)`) has no table-level AST of its own, so
+ * these three extractors synthesize the equivalent table-level
+ * {@link AST.TableConstraint} over the new column. The emitter hands each to
+ * `module.alterTable({ type: 'addConstraint', constraint })` — the very path
+ * `ALTER TABLE … ADD CONSTRAINT` uses — so the MODULE ends up owning the
+ * constraint, exactly as it owns one declared in CREATE TABLE.
+ *
+ * That ownership is what makes the constraint durable. Every later structural
+ * ALTER (DROP COLUMN, RENAME COLUMN, …) asks the module for the new table schema
+ * and installs the module's answer in the catalog verbatim; a constraint merged
+ * only into the engine's catalog copy is silently dropped by the next one.
+ */
+
 /**
  * Extracts the column-level CHECK constraints declared on a single `ALTER TABLE
- * ADD COLUMN` ColumnDef into {@link RowConstraintSchema}s. Used by both the
- * engine's emit layer (to merge into the live in-memory schema) and the store
- * module (to persist into the catalog DDL), so the live and persisted constraint
- * sets cannot drift. Auto-names an unnamed CHECK `_check_<column>`, matching the
- * engine's enforcement naming.
+ * ADD COLUMN` ColumnDef into the equivalent table-level constraints.
+ *
+ * An unnamed CHECK is named `_check_<column>` HERE rather than left to
+ * {@link buildCheckConstraintSchema} (which would auto-name it `check_<n>`,
+ * the table-level `ADD CONSTRAINT` convention): the inline-CREATE-TABLE spelling
+ * of the same declaration is named `_check_<column>`, and the two paths must agree.
  */
-export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef): RowConstraintSchema[] {
-	const result: RowConstraintSchema[] = [];
+export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef): AST.TableConstraint[] {
+	const result: AST.TableConstraint[] = [];
 	for (const con of columnDef.constraints ?? []) {
 		if (con.type !== 'check' || !con.expr) continue;
 		result.push({
+			type: 'check',
 			name: con.name ?? `_check_${columnDef.name}`,
 			expr: con.expr,
-			operations: opsToMask(con.operations),
-			tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
+			operations: con.operations,
+			tags: con.tags,
 		});
 	}
 	return result;
@@ -154,41 +171,35 @@ export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef): Ro
 
 /**
  * Extracts the column-level FOREIGN KEY constraints declared on a single `ALTER
- * TABLE ADD COLUMN` ColumnDef into {@link ForeignKeyConstraintSchema}s. The
- * child column index is NOT resolved here (`columns: Object.freeze([])`) — the
- * caller resolves it once the new column's index is known (the engine via
- * `columnIndexMap`, the store to `[newColIdx]`). Used by both the engine's emit
- * layer and the store module so the live and persisted FK sets cannot drift.
- * Auto-names an unnamed FK `_fk_<column>` and enforces the single-child-column
- * count match against the parent column list.
+ * TABLE ADD COLUMN` ColumnDef into the equivalent table-level constraints over
+ * the new column.
+ *
+ * The name is left unset for an unnamed FK so {@link buildForeignKeyConstraintSchema}
+ * applies its `_fk_<table>_<column>` convention — the same name the inline-CREATE-TABLE
+ * spelling produces.
+ *
+ * The single-child-column count match against the parent column list is enforced
+ * here, ahead of the builder's identical check, so a malformed declaration is
+ * rejected *before* the column is materialized rather than after.
  */
-export function extractColumnLevelForeignKeys(
-	columnDef: AST.ColumnDef,
-	defaultSchemaName: string,
-): ForeignKeyConstraintSchema[] {
-	const result: ForeignKeyConstraintSchema[] = [];
+export function extractColumnLevelForeignKeys(columnDef: AST.ColumnDef): AST.TableConstraint[] {
+	const result: AST.TableConstraint[] = [];
 	for (const con of columnDef.constraints ?? []) {
 		if (con.type !== 'foreignKey' || !con.foreignKey) continue;
 		const fk = con.foreignKey;
-		// child column index gets resolved by caller after module.alterTable returns
-		// the updated schema with the new column appended.
 		if (fk.columns && fk.columns.length !== 1) {
 			throw new QuereusError(
-				`FK constraint '${con.name ?? `_fk_${columnDef.name}`}' on ADD COLUMN '${columnDef.name}': child column count (1) does not match parent column count (${fk.columns.length})`,
+				`FOREIGN KEY${con.name ? ` '${con.name}'` : ''} on ADD COLUMN '${columnDef.name}': `
+					+ `child column count (1) does not match parent column count (${fk.columns.length})`,
 				StatusCode.ERROR,
 			);
 		}
 		result.push({
-			name: con.name ?? `_fk_${columnDef.name}`,
-			columns: Object.freeze([]),
-			referencedTable: fk.table,
-			referencedSchema: fk.schema ?? defaultSchemaName,
-			referencedColumns: Object.freeze([]),
-			referencedColumnNames: fk.columns,
-			onDelete: fk.onDelete ?? 'restrict',
-			onUpdate: fk.onUpdate ?? 'restrict',
-			deferred: fk.initiallyDeferred ?? false,
-			tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
+			type: 'foreignKey',
+			name: con.name,
+			columns: [{ name: columnDef.name }],
+			foreignKey: fk,
+			tags: con.tags,
 		});
 	}
 	return result;
@@ -196,14 +207,8 @@ export function extractColumnLevelForeignKeys(
 
 /**
  * Extracts the column-level UNIQUE constraints declared on a single `ALTER TABLE
- * ADD COLUMN` ColumnDef into the equivalent **table-level** {@link AST.TableConstraint}s
- * over the new column. Unlike the CHECK / FK extractors above (which return schema
- * objects merged into the live schema), this returns AST table-constraints so the
- * caller can feed each straight to `module.alterTable({ type: 'addConstraint',
- * constraint })` — the same materialize + validate + persist path that
- * `ALTER TABLE … ADD CONSTRAINT … UNIQUE` uses. Without this, an inline UNIQUE on
- * an ADD COLUMN reaches neither CREATE TABLE's `extractUniqueConstraints` nor the
- * ADD CONSTRAINT path, so it would be silently dropped.
+ * ADD COLUMN` ColumnDef into the equivalent table-level constraints over the new
+ * column.
  *
  * The synthetic constraint preserves a named inline UNIQUE's name (so it
  * round-trips), `ON CONFLICT`, and tags. `buildUniqueConstraintSchema` reads only

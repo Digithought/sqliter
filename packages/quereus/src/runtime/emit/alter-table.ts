@@ -7,9 +7,10 @@ import { createRowSlot } from '../context-helpers.js';
 import { QuereusError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
-import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema } from '../../schema/table.js';
+import type { TableSchema, PrimaryKeyColumnDefinition } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
-import { validateForeignKeyOverExistingRows, validateForeignKeyCollations, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
+import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
+import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
@@ -420,13 +421,22 @@ async function runAddColumn(
 		}
 	}
 
-	// Extract column-level CHECK / FK constraints to merge into the engine-side schema below.
-	// Column-level UNIQUE is handled separately, right after the column is materialized (see
-	// the inline-UNIQUE block below): it routes through the module's `addConstraint` UNIQUE
-	// path — the same path `ALTER TABLE ADD CONSTRAINT … UNIQUE` uses — so it is materialized,
-	// enforced, and (for store-backed modules) persisted, symmetric with CREATE TABLE.
-	const newCheckConstraints = extractColumnLevelCheckConstraints(columnDef);
-	const newForeignKeys = extractColumnLevelForeignKeys(columnDef, tableSchema.schemaName);
+	// Synthesize the table-level equivalent of every constraint declared inline on the new
+	// column. All three kinds go to the module via `addConstraint` below — the same path
+	// `ALTER TABLE ADD CONSTRAINT` uses — so the module owns them exactly as it owns a
+	// constraint declared in CREATE TABLE, and they survive every later structural ALTER
+	// (which installs the module's returned schema in the catalog verbatim).
+	//
+	// Extracted BEFORE the column is materialized so a malformed declaration (e.g. a
+	// multi-parent-column FK on a single ADD COLUMN) throws while the table is still
+	// untouched. UNIQUE goes first so its existing-row validation — the one that rejects a
+	// literal DEFAULT duplicating across rows — runs before the cheaper appends.
+	const inlineChecks = extractColumnLevelCheckConstraints(columnDef);
+	const inlineConstraints: AST.TableConstraint[] = [
+		...extractColumnLevelUniqueConstraints(columnDef),
+		...inlineChecks,
+		...extractColumnLevelForeignKeys(columnDef),
+	];
 
 	// A non-foldable default backfills each existing row from its own value. Install a row
 	// slot over the default's row descriptor; the evaluator the module calls per existing
@@ -524,172 +534,152 @@ async function runAddColumn(
 		checkSlot?.close();
 	}
 
-	// Materialize + enforce any inline column-level UNIQUE(s) on the new column. CREATE TABLE
-	// routes inline UNIQUE through `extractUniqueConstraints`; `ALTER TABLE ADD CONSTRAINT …
-	// UNIQUE` routes it through `module.alterTable({ addConstraint })`. The imperative ADD
-	// COLUMN path reaches neither, so without this an inline UNIQUE would be silently dropped —
-	// never materialized, enforced, or rejected. Convert each into the equivalent table-level
-	// constraint over the just-added column and feed it to the same addConstraint path, so the
-	// module builds/reuses its covering structure, validates the existing rows (throwing
-	// CONSTRAINT on the first duplicate), and (store) persists. Each call returns a schema
-	// carrying the new column + the unique constraint (+ memory covering index); thread the
-	// latest forward so the CHECK/FK merge below layers naturally on top.
-	//
-	// Ordering: the column is already materialized (so it resolves in `columnIndexMap`), and the
-	// engine catalog is untouched until the first `schema.addTable` below. So on a UNIQUE failure
-	// (e.g. a literal DEFAULT that backfills the same value to ≥2 existing rows → immediate
-	// duplicate) we only drop the just-added column from the module and rethrow — no catalog
-	// restore. The module's own addConstraint already rolled back its half-built covering
-	// structure before throwing.
-	const inlineUniqueConstraints = extractColumnLevelUniqueConstraints(columnDef);
-	for (const uniqueConstraint of inlineUniqueConstraints) {
-		try {
-			updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+	// The column is materialized; now install the inline constraints. Names of the CHECK /
+	// FK ones the module has accepted so far, so a later failure can hand each back to
+	// `dropConstraint` before the column itself goes (see {@link revertAddColumn}).
+	const installedConstraintNames: string[] = [];
+	let finalTableSchema: TableSchema;
+	try {
+		// Recompute the generated-column dependency graph. If the added column is generated
+		// and its expression references an unknown column, or any new generated-column edges
+		// form a cycle, this throws — and the revert below undoes the materialization.
+		const columnOnlySchema = withGeneratedColumnGraph(updatedTableSchema);
+
+		// Register the COLUMN-ONLY schema before installing any inline constraint. Two
+		// properties depend on this ordering, and both are easy to break:
+		//
+		//  - The module's FK arm validates existing rows with SQL planned against the LIVE
+		//    catalog, so the new column has to resolve there. Likewise the CHECK backfill
+		//    scan below.
+		//  - The new constraint must NOT be live while its own validation runs. The optimizer
+		//    trusts a DECLARED constraint as a proven invariant: a declared FK seeds the
+		//    inclusion dependency `child.fk ⊆ parent.pk` and folds the validator's own
+		//    `not exists` anti-join to EmptyRelation (`ruleAntiJoinFkEmpty`); a declared CHECK
+		//    `<p>` seeds a domain constraint that folds the CHECK scan's `where not (<p>)`
+		//    away (`ruleFilterContradiction`). Either fold makes validation trust the very
+		//    thing it is checking and silently admit a violating row. The module holds each
+		//    new constraint in its own cached schema until that constraint's validation
+		//    passes, and the catalog only learns of them from `finalTableSchema` below.
+		//
+		// Pre-existing constraints stay live throughout: they held before this ALTER, so
+		// folding against them is sound and preserves the optimizer's reach.
+		schema.addTable(columnOnlySchema);
+
+		// Validate the backfilled values against each inline CHECK, for the literal-default
+		// path only. A per-row (evaluator) default already enforced its CHECKs inside the
+		// backfill hook above — against the freshly-computed value rather than this scan's
+		// stale pre-backfill snapshot — and the module enforces NOT NULL there too. Runs
+		// before every `addConstraint` below so a CHECK violation is reported ahead of an
+		// FK one on a column that declares both.
+		if (!backfill && inlineChecks.length > 0) {
+			await validateBackfillAgainstChecks(rctx, columnOnlySchema, inlineChecks);
+		}
+
+		// Starts as the column-only schema so a column with no inline constraint needs no
+		// further work; each accepted constraint replaces it with the module's answer.
+		//
+		// NOTE: one module round-trip per inline constraint — each takes the module's
+		// schema-change latch and, store-backed, writes the table's DDL again. Fine at the
+		// counts SQL produces (a column declares 0 or 1 of each kind); if a batched
+		// `addConstraint` arm ever appears, or ADD COLUMN becomes hot, hand the whole set
+		// over in one call instead.
+		let current = columnOnlySchema;
+		for (const constraint of inlineConstraints) {
+			// A CHECK / FK is dropped by NAME on the revert path, so resolve the name the
+			// module will store BEFORE handing the constraint over. UNIQUE needs no entry:
+			// an unnamed one has no name to drop by, and the module's own DROP COLUMN
+			// prunes a UNIQUE over the dropped column (which CHECK / FK are not).
+			let installedName: string | undefined;
+			if (constraint.type === 'foreignKey') {
+				// Reject a same-rank child/parent collation conflict (which enforcement would
+				// raise at the first DML) BEFORE `module.alterTable`, so a rejected ALTER never
+				// reaches the module's persistence side effects — mirroring
+				// `runAddConstraintViaModule`. Built with the same builder and columnIndexMap
+				// the module uses, so the name and column indices are identical to its own.
+				const fk = buildForeignKeyConstraintSchema(
+					constraint, columnOnlySchema.columnIndexMap, tableSchema.name, tableSchema.schemaName);
+				validateForeignKeyCollations(rctx.db, columnOnlySchema, fk);
+				installedName = fk.name;
+			} else if (constraint.type === 'check') {
+				installedName = constraint.name;	// always set by the extractor
+			}
+
+			// The module materializes (UNIQUE's covering structure), validates the existing
+			// rows as the kind requires (UNIQUE duplicates, pragma-gated MATCH SIMPLE FK
+			// orphans) and — store-backed — persists. Thread the returned schema forward so
+			// each constraint layers on the last. The module's answer carries no
+			// generated-column bookkeeping of its own, so re-derive it each round.
+			const withConstraint = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
 				type: 'addConstraint',
-				constraint: uniqueConstraint,
+				constraint,
 			});
-		} catch (err) {
-			try {
-				await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
-					type: 'dropColumn',
-					columnName: columnDef.name,
-				});
-				await remapEventsForRevertedAddColumn(rctx, tableSchema, addedColIndex);
-			} catch (revertErr) {
-				log('Failed to revert ADD COLUMN after inline UNIQUE violation: %s', (revertErr as Error).message);
-			}
-			throw err;
+			current = withGeneratedColumnGraph(withConstraint);
+			if (installedName !== undefined) installedConstraintNames.push(installedName);
 		}
+
+		finalTableSchema = current;
+	} catch (err) {
+		await revertAddColumn(rctx, tableSchema, schema, columnDef.name, addedColIndex, installedConstraintNames);
+		throw err;
 	}
 
-	// Resolve the new child column index in the freshly returned schema for any FK constraints.
-	const newColIdx = updatedTableSchema.columnIndexMap.get(columnDef.name.toLowerCase());
-	const resolvedForeignKeys = newColIdx !== undefined
-		? newForeignKeys.map(fk => ({ ...fk, columns: Object.freeze([newColIdx]) }))
-		: newForeignKeys;
-
-	// Merge new column-level CHECK / FK into the table-level constraint sets so the
-	// existing constraint-builder picks them up for INSERT/UPDATE enforcement.
-	const mergedChecks = newCheckConstraints.length > 0
-		? Object.freeze([...updatedTableSchema.checkConstraints, ...newCheckConstraints])
-		: updatedTableSchema.checkConstraints;
-	const mergedForeignKeys = resolvedForeignKeys.length > 0
-		? Object.freeze([...(updatedTableSchema.foreignKeys ?? []), ...resolvedForeignKeys])
-		: updatedTableSchema.foreignKeys;
-
-	const enhancedBase: TableSchema = {
-		...updatedTableSchema,
-		checkConstraints: mergedChecks,
-		foreignKeys: mergedForeignKeys,
-	};
-
-	// Recompute the generated-column dependency graph. If the added column is
-	// generated and its expression references an unknown column, or any new
-	// generated-column edges form a cycle, this throws before we register the
-	// new schema in the catalog.
-	const enhancedTableSchema = withGeneratedColumnGraph(enhancedBase);
-
-	// The optimizer trusts a DECLARED constraint as a proven invariant, which makes
-	// the existing-row validators below fold away their own work if the new constraint
-	// is already live:
-	//   - A new FK seeds an inclusion dependency `child.fk ⊆ parent.pk`; the FK
-	//     validator's `not exists` anti-join folds to EmptyRelation under
-	//     `ruleAntiJoinFkEmpty` (+ the INDs seeded at TableReferenceNode).
-	//   - A new CHECK `<p>` seeds a domain constraint on the scan; the CHECK post-scan's
-	//     own `where not (<p>)` folds to EmptyRelation under `ruleFilterContradiction`
-	//     (the domain `<p>` and the predicate `not <p>` are jointly unsatisfiable).
-	// Either fold makes validation trust the very invariant it is checking and silently
-	// admit a violating row. So register the new COLUMN with only the PRE-EXISTING
-	// (already-proven) constraints for the validation pass, then register the full schema
-	// — with the new FK(s) and CHECK(s) — only once validation passes. This mirrors the
-	// ADD CONSTRAINT path, which validates before swapping the constraint into the live
-	// schema. Pre-existing constraints are kept: they held before this ALTER, so folding
-	// against them is sound and preserves the optimizer's reach.
-	const hasNewForeignKeys = resolvedForeignKeys.length > 0;
-	const hasNewChecks = newCheckConstraints.length > 0;
-	const usesIntermediateSchema = hasNewForeignKeys || hasNewChecks;
-	const validationSchema = usesIntermediateSchema
-		? withGeneratedColumnGraph({
-			...enhancedBase,
-			checkConstraints: updatedTableSchema.checkConstraints,
-			foreignKeys: updatedTableSchema.foreignKeys,
-		})
-		: enhancedTableSchema;
-	schema.addTable(validationSchema);
-
-	// Validate new CHECK constraints against the (already-backfilled) rows AND validate
-	// existing rows against any new column-level FK, reverting (drop the column + restore
-	// the original catalog entry) on a violation. Both run inside a single try/revert
-	// region so that when both a new CHECK and a new FK exist and either fails, the same
-	// revert path fires.
-	//
-	// CHECK is gated on `!backfill`: NOT NULL of a per-row default is enforced by the module
-	// during backfill (it has the values in-hand and throws before the column is committed),
-	// and the per-row (evaluator) default path already enforced each CHECK inside the backfill
-	// hook above (against the freshly-computed value, not a stale snapshot). The CHECK post-scan
-	// is therefore only correct for the literal-default path, whose values were bulk-written by
-	// the module without a per-row hook.
-	//
-	// FK runs for ALL default kinds. It is a cross-table existence check, not a per-row
-	// predicate, so it must be a post-`alterTable` scan: the scan sees both the bulk-written
-	// (literal) and per-row-evaluated backfilled values, and for a self-referential FK it reads
-	// a consistent post-alter table (a per-row hook would have to query the very table being
-	// rebuilt). It reuses `validateForeignKeyOverExistingRows` — the same MATCH-SIMPLE,
-	// pragma-gated validator the ADD CONSTRAINT path calls — so the two paths can never drift.
-	const runCheckScan = !backfill && newCheckConstraints.length > 0;
-	if (runCheckScan || hasNewForeignKeys) {
-		try {
-			// Reject any new FK whose child/parent column collations declare a same-rank
-			// conflict (the conflict enforcement would raise at first DML). Pure schema
-			// check — no row scan, pragma-independent — but kept inside this try/revert
-			// region so a conflict drops the just-materialized column and restores the
-			// original catalog, leaving the table untouched. `enhancedTableSchema` carries
-			// the new column so the child FK column resolves.
-			for (const fk of resolvedForeignKeys) {
-				validateForeignKeyCollations(rctx.db, enhancedTableSchema, fk);
-			}
-			if (runCheckScan) {
-				await validateBackfillAgainstChecks(rctx, validationSchema, newCheckConstraints);
-			}
-			for (const fk of resolvedForeignKeys) {
-				// `enhancedTableSchema` supplies only column-name resolution here; the LIVE
-				// schema the planner reads is `validationSchema`, which omits the new FK(s)
-				// and CHECK(s), so the anti-join is not folded.
-				await validateForeignKeyOverExistingRows(rctx.db, enhancedTableSchema, fk);
-			}
-		} catch (err) {
-			// Revert: drop the column and restore the original catalog entry.
-			try {
-				await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
-					type: 'dropColumn',
-					columnName: columnDef.name,
-				});
-				await remapEventsForRevertedAddColumn(rctx, tableSchema, addedColIndex);
-			} catch (revertErr) {
-				log('Failed to revert ADD COLUMN after constraint violation: %s', (revertErr as Error).message);
-			}
-			schema.addTable(tableSchema);
-			throw err;
-		}
-	}
-
-	// Validation passed — commit the full schema (with the new FK(s)/CHECK(s)) into the
-	// catalog. Skipped when no intermediate schema was used, in which case
-	// `validationSchema === enhancedTableSchema` is already registered.
-	if (usesIntermediateSchema) {
-		schema.addTable(enhancedTableSchema);
-	}
+	// Every constraint validated and installed — publish the module's final schema.
+	schema.addTable(finalTableSchema);
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: enhancedTableSchema,
+		newObject: finalTableSchema,
 	});
 
 	log('Added column %s to table %s.%s', columnDef.name, tableSchema.schemaName, tableSchema.name);
 	return null;
+}
+
+/**
+ * Undoes a partially-applied ADD COLUMN, leaving the table exactly as it was: hands each
+ * inline CHECK / FK the module already accepted back to `dropConstraint` (newest first),
+ * drops the column, un-remaps the batched events, and restores the original catalog entry.
+ *
+ * The constraints must go before the column: neither built-in module prunes a CHECK / FK
+ * over a dropped column, so a stranded one would keep naming a column the table no longer
+ * has. (An inline UNIQUE needs no explicit drop — both modules prune a UNIQUE over the
+ * dropped column, and an unnamed one has no name to drop by.)
+ *
+ * Best-effort on the module half: a revert failure is logged, never thrown, so it cannot
+ * mask the original violation. Restoring the catalog entry is a no-op when the ALTER failed
+ * before registering anything (the original schema is still the live one).
+ */
+async function revertAddColumn(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: Schema,
+	columnName: string,
+	addedColIndex: number | undefined,
+	installedConstraintNames: ReadonlyArray<string>,
+): Promise<void> {
+	try {
+		const module = requireVtabModule(tableSchema);
+		// Unreachable: runAddColumn requires `alterTable` before materializing anything.
+		if (!module.alterTable) return;
+		for (let i = installedConstraintNames.length - 1; i >= 0; i--) {
+			await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+				type: 'dropConstraint',
+				constraintName: installedConstraintNames[i],
+			});
+		}
+		await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
+			type: 'dropColumn',
+			columnName,
+		});
+		await remapEventsForRevertedAddColumn(rctx, tableSchema, addedColIndex);
+	} catch (revertErr) {
+		log('Failed to revert ADD COLUMN %s.%s.%s: %s',
+			tableSchema.schemaName, tableSchema.name, columnName, (revertErr as Error).message);
+	}
+	schema.addTable(tableSchema);
 }
 
 /**
@@ -713,18 +703,21 @@ async function remapEventsForRevertedAddColumn(
 }
 
 /**
- * Runs each new CHECK against existing rows. We rely on the just-registered
- * enhanced schema so SQL can resolve the new column. Any row matching
+ * Runs each new CHECK against the (already-backfilled) existing rows. Relies on the
+ * just-registered column-only schema so SQL can resolve the new column while the CHECK
+ * itself is not yet declared — declaring it first would let `ruleFilterContradiction`
+ * fold this scan's own `not (<check_expr>)` to EmptyRelation. Any row matching
  * `not (<check_expr>)` is a violation and aborts the ALTER.
  */
 async function validateBackfillAgainstChecks(
 	rctx: RuntimeContext,
-	enhancedTableSchema: TableSchema,
-	newCheckConstraints: RowConstraintSchema[],
+	columnOnlySchema: TableSchema,
+	newCheckConstraints: ReadonlyArray<AST.TableConstraint>,
 ): Promise<void> {
-	const qualifiedTable = qualifyTableName(enhancedTableSchema.schemaName, enhancedTableSchema.name);
+	const qualifiedTable = qualifyTableName(columnOnlySchema.schemaName, columnOnlySchema.name);
 
 	for (const cc of newCheckConstraints) {
+		if (!cc.expr) continue;
 		const checkSql = expressionToString(cc.expr);
 		const sql = `select 1 from ${qualifiedTable} where not (${checkSql}) limit 1`;
 		const stmt = rctx.db.prepare(sql);
@@ -736,7 +729,7 @@ async function validateBackfillAgainstChecks(
 			}
 			if (violated) {
 				throw new QuereusError(
-					`CHECK constraint ${cc.name ? `'${cc.name}' ` : ''}violated by backfilled rows in ALTER TABLE ADD COLUMN on '${enhancedTableSchema.name}'`,
+					`CHECK constraint ${cc.name ? `'${cc.name}' ` : ''}violated by backfilled rows in ALTER TABLE ADD COLUMN on '${columnOnlySchema.name}'`,
 					StatusCode.CONSTRAINT,
 				);
 			}

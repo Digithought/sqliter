@@ -468,3 +468,200 @@ select sum(score) as s, count(score) as c from t_agg;
 → [{"s":21,"c":3}]
 
 drop table t_agg;
+-- run
+
+-- ===================================
+-- 7. Inline CHECK / FOREIGN KEY SURVIVE later structural ALTERs
+--
+-- An inline constraint on an added column routes through the module's `addConstraint` —
+-- the same path `ALTER TABLE ADD CONSTRAINT` uses — so the MODULE owns it. That is what
+-- makes it durable: every later structural ALTER asks the module for the new table schema
+-- and installs that answer in the catalog verbatim, so a constraint merged only into the
+-- engine's catalog copy is dropped on the floor by the next DROP / RENAME COLUMN (and no
+-- error is raised — bad data is simply accepted afterwards). Under `yarn test:store` these
+-- same cases also cover the persisted half.
+-- ===================================
+
+-- 7a. Inline CHECK survives an unrelated DROP COLUMN.
+create table t_surv_chk (id integer primary key, junk text);
+insert into t_surv_chk values (1, 'j');
+-- run
+
+alter table t_surv_chk add column n integer null check (n is null or n > 0);
+-- run
+
+-- enforces immediately
+insert into t_surv_chk values (2, 'k', -5);
+-- error: CHECK
+
+alter table t_surv_chk drop column junk;
+-- run
+
+-- still declared after the unrelated drop (it used to vanish here)
+select count(*) as c from check_constraint_info('t_surv_chk') where name = '_check_n';
+→ [{"c":1}]
+
+-- ...and still enforces
+insert into t_surv_chk values (3, -5);
+-- error: CHECK
+
+-- a satisfying insert still works
+insert into t_surv_chk values (4, 7);
+select id, n from t_surv_chk order by id;
+→ [{"id":1,"n":null},{"id":4,"n":7}]
+
+-- 7b. ...and survives an unrelated RENAME COLUMN too.
+alter table t_surv_chk rename column id to ident;
+-- run
+
+select count(*) as c from check_constraint_info('t_surv_chk') where name = '_check_n';
+→ [{"c":1}]
+
+insert into t_surv_chk values (5, -5);
+-- error: CHECK
+
+drop table t_surv_chk;
+-- run
+
+-- 7c. Inline FOREIGN KEY survives an unrelated DROP COLUMN.
+--
+-- The dropped column is added AFTER the FK column on purpose, so it is the FK child
+-- column's TRAILING neighbour. Dropping a column that PRECEDES an FK child column has to
+-- renumber the FK's recorded child position, which is a separate, still-open defect
+-- (`bug-drop-column-leaves-fk-child-index-dangling`) affecting every FK regardless of how
+-- it was declared; this case deliberately avoids it so it tests only survival.
+create table p_surv (pid integer primary key);
+insert into p_surv values (1);
+create table t_surv_fk (id integer primary key);
+insert into t_surv_fk values (1);
+-- run
+
+alter table t_surv_fk add column fkcol integer null references p_surv(pid);
+alter table t_surv_fk add column junk text null;
+-- run
+
+-- enforces immediately
+insert into t_surv_fk values (2, 999, 'k');
+-- error:
+
+alter table t_surv_fk drop column junk;
+-- run
+
+-- still declared after the unrelated drop (it used to vanish here)
+select count(*) as c from foreign_key_info('t_surv_fk') where referenced_table = 'p_surv';
+→ [{"c":1}]
+
+-- ...and still enforces
+insert into t_surv_fk values (3, 999);
+-- error:
+
+-- a satisfying insert still works
+insert into t_surv_fk values (4, 1);
+select id, fkcol from t_surv_fk order by id;
+→ [{"id":1,"fkcol":null},{"id":4,"fkcol":1}]
+
+-- 7d. ...and survives an unrelated RENAME COLUMN too.
+alter table t_surv_fk rename column id to ident;
+-- run
+
+select count(*) as c from foreign_key_info('t_surv_fk') where referenced_table = 'p_surv';
+→ [{"c":1}]
+
+insert into t_surv_fk values (5, 999);
+-- error:
+
+drop table t_surv_fk;
+drop table p_surv;
+-- run
+
+-- 7e. Auto-generated constraint names agree with the `create table` spelling.
+--
+-- An unnamed inline FK on an added column is named `_fk_<table>_<column>` — the same name
+-- the equivalent `create table` declaration produces. (It used to be `_fk_<column>`, an
+-- engine-only spelling that no other path produced; routing through the module unified
+-- the two.) An unnamed inline CHECK keeps its established `_check_<column>` name, which
+-- `create table` also uses. Explicit names round-trip unchanged.
+create table p_nm (pid integer primary key);
+create table t_nm (id integer primary key);
+-- run
+
+alter table t_nm add column fkcol integer null references p_nm(pid);
+alter table t_nm add column chkcol integer null check (chkcol is null or chkcol > 0);
+alter table t_nm add column named_fk integer null constraint my_fk references p_nm(pid);
+alter table t_nm add column named_chk integer null constraint my_chk check (named_chk is null or named_chk > 0);
+-- run
+
+select name from foreign_key_info('t_nm') order by name;
+→ [{"name":"_fk_t_nm_fkcol"},{"name":"my_fk"}]
+
+select name from check_constraint_info('t_nm') order by name;
+→ [{"name":"_check_chkcol"},{"name":"my_chk"}]
+
+-- The same declarations written as `create table` produce the same names.
+create table t_nm2 (
+	id integer primary key,
+	fkcol integer null references p_nm(pid),
+	chkcol integer null check (chkcol is null or chkcol > 0)
+);
+-- run
+
+select name from foreign_key_info('t_nm2') order by name;
+→ [{"name":"_fk_t_nm2_fkcol"}]
+
+select name from check_constraint_info('t_nm2') order by name;
+→ [{"name":"_check_chkcol"}]
+
+drop table t_nm2;
+drop table t_nm;
+drop table p_nm;
+-- run
+
+-- 7f. A rejected add leaves NO stranded constraint behind.
+--
+-- CHECK and FK are installed in that order, so an FK violation aborts AFTER the CHECK is
+-- already in the module's schema. The revert has to hand the CHECK back before dropping
+-- the column — neither module prunes a CHECK over a dropped column, so a stranded one
+-- would keep naming a column the table no longer has and break the next write.
+create table p_rev (pid integer primary key);
+insert into p_rev values (1);
+create table t_rev (id integer primary key, junk text);
+insert into t_rev values (1, 'j');
+-- run
+
+-- default 5 satisfies `parent > 0` but references a missing parent → FK arm aborts.
+alter table t_rev add column parent integer default 5 check (parent > 0) references p_rev(pid);
+-- error: foreign key
+
+-- The table is exactly as it was: column gone, and neither constraint left declared.
+select * from t_rev order by id;
+→ [{"id":1,"junk":"j"}]
+
+select count(*) as c from check_constraint_info('t_rev');
+→ [{"c":0}]
+
+select count(*) as c from foreign_key_info('t_rev');
+→ [{"c":0}]
+
+-- Writes still work over the original shape.
+insert into t_rev values (2, 'k');
+select count(*) as c from t_rev;
+→ [{"c":2}]
+
+-- A satisfied retry of the same ALTER now succeeds and both constraints enforce.
+alter table t_rev add column parent integer default 1 check (parent > 0) references p_rev(pid);
+-- run
+
+select count(*) as c from check_constraint_info('t_rev') where name = '_check_parent';
+→ [{"c":1}]
+
+select count(*) as c from foreign_key_info('t_rev') where name = '_fk_t_rev_parent';
+→ [{"c":1}]
+
+insert into t_rev values (3, 'z', 0);
+-- error: CHECK
+
+insert into t_rev values (4, 'z', 99);
+-- error:
+
+drop table t_rev;
+drop table p_rev;
