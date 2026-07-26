@@ -109,3 +109,40 @@ insert into jco_nul values (1, 'null');
 
 select id, j, (j is null) as isnull from jco_nul;
 → [{"id":1,"j":null,"isnull":true}]
+
+-- A generated column must derive from the value that is actually STORED, not
+-- from the raw assignment: emitUpdate converts the regular assignments before
+-- the generated expressions read them. Otherwise `g` here would keep the
+-- assignment's TEXT and store the object's serialization as a JSON *string*.
+create table jco_gen (id integer primary key, j json, g json generated always as (j));
+insert into jco_gen values (1, '"abc"');
+update jco_gen set j = '{"k":1}';
+-- run
+
+select id, json_quote(j) as jq, json_quote(g) as gq from jco_gen;
+→ [{"id":1,"jq":"{\"k\":1}","gq":"{\"k\":1}"}]
+
+-- `insert or replace` substitutes a NOT NULL column's DEFAULT after the row was
+-- already converted, so the substituted cell converts on its own (its DEFAULT is
+-- a TEXT literal, so it is JSON source).
+create table jco_dflt (id integer primary key, j json not null default '"dflt"');
+insert or replace into jco_dflt values (1, null);
+-- run
+
+select id, j from jco_dflt;
+→ [{"id":1,"j":"dflt"}]
+
+-- ...and a DEFAULT that CONVERTS to SQL NULL (the JSON text 'null') does not
+-- satisfy NOT NULL, even though the raw text is non-null.
+create table jco_dflt_null (id integer primary key, j json not null default 'null');
+insert or replace into jco_dflt_null values (1, null);
+-- error: NOT NULL constraint failed
+
+-- A DEFAULT whose static type already IS the column's (json() returns a native
+-- value) is substituted untouched.
+create table jco_dflt_json (id integer primary key, j json not null default (json('{"a":1}')));
+insert or replace into jco_dflt_json values (1, null);
+-- run
+
+select id, j from jco_dflt_json;
+→ [{"id":1,"j":{"a":1}}]

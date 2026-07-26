@@ -87,6 +87,14 @@ function serializeKeyTuple(values: SqlValue[]): string {
  * runs under the CHILD column's collation, which may well be BINARY. A spurious
  * "changed" costs one redundant RESTRICT probe; a spurious "unchanged" would SKIP
  * enforcement entirely — so identity is the safe direction.
+ *
+ * NOTE: every caller today supplies declared-form rows (the DML executor's converted
+ * NEW row; materialized-view maintenance passes the changes `applyMaintenance`
+ * reports, i.e. what the backing actually stored). A future caller that hands in a
+ * RAW proposed row would see spurious "changed" on any cell conversion normalizes —
+ * harmless on the cascade path, but a spurious RESTRICT error on the assert path. If
+ * one appears, convert at that caller rather than re-introducing a per-cell coercion
+ * here.
  */
 function anyReferencedColumnChanged(
 	colIndices: readonly number[],

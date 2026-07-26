@@ -376,11 +376,23 @@ JS string reaching `compare` is unambiguously a JSON **string scalar** and is
 never re-parsed: `compare('9', 9)` ranks the number first (number < string)
 instead of calling them equal.
 
-One caveat of trusting static types: a scalar function whose schema *declares* a
-JSON return type must return native (parsed) JSON values, never serialized text —
-the skip rule takes the declaration at its word. The builtins that declare JSON
-(`json()`, `json_group_array`, `json_group_object`) all return native values;
-`json_extract` and friends declare no return type and are unaffected.
+The rule is only as sound as the static types it reads, so an expression node
+that advertises a logical type it does not actually produce becomes a write-path
+defect. Known cases:
+
+- A scalar function whose schema *declares* a JSON return type must return
+  native (parsed) JSON values, never serialized text — the skip rule takes the
+  declaration at its word. The builtins that declare JSON (`json()`,
+  `json_group_array`, `json_group_object`) all return native values;
+  `json_extract` and friends declare no return type and are unaffected.
+- A set operation reports its LEFT arm's logical type for every output column
+  (`SetOperationNode.resolvedDataType` overrides only collation), so a `union`
+  whose arms disagree mis-describes one arm's values — ticket
+  `union-branch-value-not-converted-on-write`.
+- `CAST` is lenient: when the target type's `parse` throws and the type has no
+  numeric/text fallback, `emitCast` returns the operand unchanged while still
+  advertising the target type — ticket
+  `failed-cast-stores-unconverted-value`.
 
 ### Explicit Conversion
 
