@@ -7,6 +7,7 @@ import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { ConstraintError, FailConflictError, RollbackConflictError } from '../../common/errors.js';
 import { type SqlValue, type OutputValue } from '../../common/types.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
+import type { ColumnSchema } from '../../schema/column.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { RowOpFlag } from '../../schema/table.js';
 import { ConflictResolution } from '../../common/constants.js';
@@ -34,6 +35,14 @@ interface ConstraintMetadataEntry {
 interface NotNullDefaultRuntime {
 	columnIndex: number;
 	evaluator: (ctx: RuntimeContext) => OutputValue;
+	/**
+	 * Set when the DEFAULT expression's static type is not the column's declared
+	 * type: the substituted value must then be converted before it is written
+	 * into the (already-converted) NEW section — the same static-type rule the
+	 * DML emitters applied to the rest of the row, which the substitution
+	 * bypasses by injecting a value after that pass.
+	 */
+	coerceColumn?: ColumnSchema;
 }
 
 /**
@@ -97,6 +106,13 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 	const notNullDefaultPlans: ReadonlyArray<NotNullDefaultPlan> = plan.notNullDefaults ?? [];
 	const notNullDefaultInstructions = notNullDefaultPlans.map(d => emitCallFromPlan(d.defaultNode, ctx));
 
+	// Which substitutions need conversion — the emitters' static-type rule
+	// applied to the DEFAULT expression (see NotNullDefaultRuntime.coerceColumn).
+	const notNullDefaultCoercions = notNullDefaultPlans.map(d =>
+		d.defaultNode.getType().logicalType !== tableSchema.columns[d.columnIndex].logicalType
+			? tableSchema.columns[d.columnIndex]
+			: undefined);
+
 	const constraintMetadata: ConstraintMetadataEntry[] = plan.constraintChecks.map((check: ConstraintCheck, idx) => {
 		const evaluatorInstruction = checkEvaluators[idx];
 		const constraintName = check.constraint.name ?? generateDefaultConstraintName(tableSchema, check.constraint);
@@ -158,6 +174,7 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 		const defaultsRuntime: NotNullDefaultRuntime[] = notNullDefaultPlans.map((d, i) => ({
 			columnIndex: d.columnIndex,
 			evaluator: defaultEvalFunctions[i],
+			coerceColumn: notNullDefaultCoercions[i],
 		}));
 
 		// Pre-compute the combined descriptor (constant across rows)
@@ -171,8 +188,11 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 
 				// The row expressions see through `combinedDescriptor`. The getter is
 				// called lazily per lookup, so checkConstraints can swap it mid-row:
-				// NOT NULL DEFAULT substitution reads the RAW row, CHECK / FK read the
-				// COERCED view. `flatRow` itself stays raw and is what flows downstream.
+				// after a REPLACE NOT NULL DEFAULT substitution, CHECK / FK must read
+				// the row AS SUBSTITUTED. The row arrives already converted to declared
+				// column types (the DML emitters convert the NEW section up front), so
+				// no separate coerced view exists — the substituted row IS what flows
+				// downstream.
 				let visibleRow: Row = flatRow;
 
 				const evaluation = await withAsyncRowContext(
@@ -239,29 +259,20 @@ async function checkConstraints(
 	notNullDefaults: NotNullDefaultRuntime[],
 	showRow: (row: Row) => void,
 ): Promise<ConstraintCheckResult> {
-	// NOT NULL runs first, against the RAW row. A REPLACE-substituted DEFAULT may
-	// read `new.<col>`, and whatever it returns is written back into the row that
-	// flows on to the storage layer — which coerces it there. Showing it a coerced
-	// value would coerce twice, and JSON's `parse` is not idempotent for a string
-	// scalar (`'"Bob"'` → `Bob`, and re-parsing `Bob` throws).
+	// The row arrives with its NEW section already converted to declared column
+	// types (the DML emitters convert up front, driven by static types), so both
+	// passes read declared-form values. NOT NULL runs first: under OR REPLACE it
+	// may substitute a column's DEFAULT (converting that one injected value —
+	// see NotNullDefaultRuntime.coerceColumn), and CHECK / FK then read the row
+	// AS FINALLY SUBSTITUTED, which is also what flows on downstream.
 	const nnResult = await checkNotNullConstraints(rctx, plan, tableSchema, row, stmtOR, notNullDefaults);
 	if (nnResult.skip) return { skip: true };
 	if (nnResult.replacedRow) row = nnResult.replacedRow;
 
-	// CHECK / FK read the coerced view of the row AS FINALLY SUBSTITUTED, so a
-	// REPLACE-substituted DEFAULT is subject to the table's CHECKs. The DML builders
-	// emit a ConstraintCheckNode for every table, so skip the copy entirely when the
-	// table carries no constraint expressions to read it.
-	//
-	// NOTE: for a table that does carry checks this copies the flat row and runs
-	// validateAndParse over every column, once per row. If constraint-heavy insert
-	// throughput ever shows as hot, narrow it to the columns the constraint
-	// expressions actually reference.
-	const coercedRow = constraintMetadata.length > 0 ? coerceNewSection(row, tableSchema) : row;
-	showRow(coercedRow);
+	showRow(row);
 
 	// CHECK constraints (and synthetic FK existence checks built as RowConstraintSchema).
-	const ckResult = await checkCheckConstraints(rctx, plan, tableSchema, constraintMetadata, evaluatorFunctions, stmtOR, coercedRow);
+	const ckResult = await checkCheckConstraints(rctx, plan, tableSchema, constraintMetadata, evaluatorFunctions, stmtOR, row);
 	if (ckResult.skip) return { skip: true };
 
 	return { skip: false, replacedRow: nnResult.replacedRow };
@@ -314,10 +325,21 @@ async function checkNotNullConstraints(
 				// No DEFAULT available — REPLACE cannot recover.
 				throw new ConstraintError(message);
 			}
-			const defaultValue = await defaultEntry.evaluator(rctx) as SqlValue;
+			let defaultValue = await defaultEntry.evaluator(rctx) as SqlValue;
 			if (defaultValue === null || defaultValue === undefined) {
 				// DEFAULT itself is NULL — substitution does not satisfy NOT NULL.
 				throw new ConstraintError(message);
+			}
+			if (defaultEntry.coerceColumn) {
+				// The substituted value is injected AFTER the emitters' conversion
+				// pass, so convert it here by the same static-type rule. Conversion
+				// itself can produce NULL (JSON's text 'null'), which still violates
+				// NOT NULL.
+				defaultValue = validateAndParse(
+					defaultValue, defaultEntry.coerceColumn.logicalType, defaultEntry.coerceColumn.name);
+				if (defaultValue === null) {
+					throw new ConstraintError(message);
+				}
 			}
 			if (!mutableRow) mutableRow = [...flatRow] as Row;
 			mutableRow[newValueIndex] = defaultValue;
@@ -338,7 +360,7 @@ async function checkCheckConstraints(
 	constraintMetadata: ConstraintMetadataEntry[],
 	evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>,
 	stmtOR: ConflictResolution | undefined,
-	coercedRow: Row,
+	flatRow: Row,
 ): Promise<ConstraintCheckResult> {
 	for (let i = 0; i < constraintMetadata.length; i++) {
 		const metadata = constraintMetadata[i];
@@ -360,14 +382,13 @@ async function checkCheckConstraints(
 			metadata.kind === 'fk-parent' &&
 			metadata.referencedColumnIndices
 		) {
-			// Read from the coerced view: OLD comes from an already-coerced stored row,
-			// so comparing it against a raw NEW would call an unchanged column changed.
-			// (Erring that way only costs a redundant NOT EXISTS, never a missed check.)
+			// Both halves are in stored (declared) form: OLD comes from the scan, NEW
+			// was converted by the DML emitter — so plain identity is the right test.
 			const numCols = tableSchema.columns.length;
 			let anyChanged = false;
 			for (const colIdx of metadata.referencedColumnIndices) {
-				const oldVal = coercedRow[colIdx] as SqlValue;           // OLD section: 0..n-1
-				const newVal = coercedRow[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
+				const oldVal = flatRow[colIdx] as SqlValue;           // OLD section: 0..n-1
+				const newVal = flatRow[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
 				if (!sqlValueIdentical(oldVal, newVal)) {
 					anyChanged = true;
 					break;
@@ -386,7 +407,7 @@ async function checkCheckConstraints(
 			rctx.db._queueDeferredConstraintRow(
 				metadata.baseTable,
 				metadata.constraintName,
-				coercedRow,
+				flatRow,
 				metadata.flatRowDescriptor,
 				evaluator,
 				activeConnectionId,
@@ -424,51 +445,6 @@ async function checkCheckConstraints(
 		}
 	}
 	return { skip: false };
-}
-
-/**
- * Snapshot the flat OLD/NEW row for CHECK / FK evaluation, coercing the NEW
- * section (indices n..2n-1) to the declared column logical types.
- *
- * The insert pipeline defers type conversion to the storage layer's
- * validateAndParse, so the row reaching this node still holds raw NEW values —
- * an unconverted `'{"a":2}'` straight from the SQL literal, not the parsed JSON
- * value a `select` would read back. Every CHECK / FK expression must see the
- * converted form, or it compares apples to oranges:
- *
- * - Deferred CHECK subqueries compare NEW against already-coerced stored rows in
- *   other tables (GitHub #25).
- * - Immediate CHECKs compare NEW against NEW; two raw JSON texts would compare
- *   as text — `'{"a":10}' < '{"a":2}'` alphabetically — instead of structurally
- *   (fix `bug-json-compare-string-ambiguity`).
- *
- * The result is used ONLY for CHECK / FK evaluation — the NOT NULL pass, whose
- * REPLACE substitution writes back into the row that continues downstream, runs
- * against the raw row before this is built. The raw row is what flows on to the
- * storage layer, which coerces it itself; JSON's `parse` is not idempotent for a
- * JSON string scalar (`'"Bob"'` parses to the bare string `Bob`, and re-parsing
- * that throws), so a pre-coerced row must never reach it.
- *
- * OLD values (0..n-1) are NULL on INSERT or read from already-coerced stored
- * rows on UPDATE, so they are left untouched. A per-cell parse failure falls
- * back to the raw value, preserving the existing error semantics — the row's
- * own performInsert remains the authoritative place that throws MISMATCH.
- */
-function coerceNewSection(row: Row, tableSchema: TableSchema): Row {
-	const numCols = tableSchema.columns.length;
-	const snapshot = row.slice() as Row;
-	for (let i = 0; i < numCols; i++) {
-		const newIndex = numCols + i;
-		if (newIndex >= snapshot.length) break;
-		const column = tableSchema.columns[i];
-		const value = snapshot[newIndex] as SqlValue;
-		try {
-			snapshot[newIndex] = validateAndParse(value, column.logicalType, column.name);
-		} catch {
-			// Keep the raw value; downstream performInsert reports the error as today.
-		}
-	}
-	return snapshot;
 }
 
 function generateDefaultConstraintName(tableSchema: TableSchema, constraint: RowConstraintSchema): string {

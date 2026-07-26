@@ -26,12 +26,15 @@ export interface UpdateArgs {
 	/** Optional: Deterministic SQL statement that reproduces this mutation (if logMutations is enabled) */
 	mutationStatement?: string;
 	/**
-	 * If true, `values` is already coerced to the table's declared column logical
-	 * types (e.g. flushed from an overlay that coerced on write). The vtab may skip
-	 * its own coercion pass. Used by the isolation layer's overlay→underlying flush,
-	 * and by its delete-tombstone writes (rows built from already-converted stored
-	 * values), to avoid double-parsing values that are not idempotent under parse
-	 * (e.g. JSON scalar strings).
+	 * If true, `values` (and any key cells in `oldKeyValues`) are already coerced
+	 * to the table's declared column logical types, and the vtab may skip its own
+	 * coercion pass — conversion is not idempotent for every type (JSON scalar
+	 * strings double-parse to a different value or throw). Set by the DML executor
+	 * (whose emitters convert every write at the top of the pipeline, driven by
+	 * static expression types — docs/types.md § Where coercion happens) and by the
+	 * isolation layer's overlay→underlying flush and tombstone writes (rows built
+	 * from already-converted stored values). Direct API callers leave it unset and
+	 * the vtab converts raw values itself, as before.
 	 */
 	preCoerced?: boolean;
 	/**

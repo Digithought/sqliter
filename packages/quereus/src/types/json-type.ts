@@ -64,9 +64,10 @@ export const JSON_TYPE: LogicalType = {
 
 		// A JS string reaching here is ALWAYS a JSON string scalar, never serialized
 		// object/array text: every caller reads values that have already been through
-		// `parse` above — stored rows via coerceRowToSchema, and constraint expressions
-		// via constraint-check.ts's coerceNewSection. Nothing is re-parsed here, so the
-		// JSON string "9" stays distinct from the JSON number 9.
+		// `parse` above — the DML emitters convert writes at the top of the pipeline
+		// (buildRowCoercion), and the storage layer converts direct API writes
+		// (coerceRowToSchema). Nothing is re-parsed here, so the JSON string "9"
+		// stays distinct from the JSON number 9.
 		//
 		// Two string scalars compare as text — under the supplied collation, or
 		// BINARY (code-point order) when none is supplied. Code-point order agrees

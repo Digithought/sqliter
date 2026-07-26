@@ -23,7 +23,6 @@ import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
 import { RowOpFlag, type TableSchema, type RowConstraintSchema } from '../../schema/table.js';
 import { uniqueEnforcementCollations } from '../../schema/unique-enforcement.js';
-import type { LogicalType } from '../../types/logical-type.js';
 import { ReturningNode, type ReturningProjection } from '../nodes/returning-node.js';
 import { expandReturningStar } from './returning-star.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
@@ -260,12 +259,12 @@ function createGeneratedColumnProjection(
 }
 
 /**
- * Resolve the per-target-column comparison metadata an `ON CONFLICT (cols)` clause
- * needs to decide whether a UNIQUE violation matches it: the column affinity
- * (logical type) and the enforcement collation NAME of the constraint the target
- * names. Both arrays are index-aligned with `conflictTargetIndices` (the single
- * source of column order) so the runtime match can compare the way the constraint
- * *enforces* rather than by byte identity.
+ * Resolve the enforcement collation NAME of the constraint an `ON CONFLICT (cols)`
+ * target names, per target column — index-aligned with `conflictTargetIndices`
+ * (the single source of column order) — so the runtime match can compare the way
+ * the constraint *enforces* rather than by byte identity. (Affinity needs no
+ * per-row handling here: the proposed row is converted to declared column types
+ * by the INSERT emitter before it reaches the executor.)
  *
  * The enforcement collation is the *constraint's*, not merely the column's declared
  * collation:
@@ -281,9 +280,7 @@ function createGeneratedColumnProjection(
 function resolveConflictTargetEnforcement(
 	tableSchema: TableSchema,
 	conflictTargetIndices: number[],
-): { collations: (string | undefined)[]; types: LogicalType[] } {
-	const types = conflictTargetIndices.map(idx => tableSchema.columns[idx].logicalType);
-
+): { collations: (string | undefined)[] } {
 	const targetSet = new Set(conflictTargetIndices);
 	const sameColumnSet = (cols: ReadonlyArray<number>): boolean =>
 		cols.length === conflictTargetIndices.length && cols.every(c => targetSet.has(c));
@@ -292,7 +289,7 @@ function resolveConflictTargetEnforcement(
 	const pkDef = tableSchema.primaryKeyDefinition;
 	if (pkDef.length > 0 && sameColumnSet(pkDef.map(d => d.index))) {
 		const byIndex = new Map(pkDef.map(d => [d.index, d.collation]));
-		return { collations: conflictTargetIndices.map(idx => byIndex.get(idx)), types };
+		return { collations: conflictTargetIndices.map(idx => byIndex.get(idx)) };
 	}
 
 	// UNIQUE target: the matching constraint's per-column enforcement collation.
@@ -300,11 +297,11 @@ function resolveConflictTargetEnforcement(
 	if (uc) {
 		const ucCollations = uniqueEnforcementCollations(tableSchema, uc);
 		const byIndex = new Map(uc.columns.map((c, i) => [c, ucCollations[i]]));
-		return { collations: conflictTargetIndices.map(idx => byIndex.get(idx)), types };
+		return { collations: conflictTargetIndices.map(idx => byIndex.get(idx)) };
 	}
 
 	// Defensive fallback: the columns' declared collations.
-	return { collations: conflictTargetIndices.map(idx => tableSchema.columns[idx].collation), types };
+	return { collations: conflictTargetIndices.map(idx => tableSchema.columns[idx].collation) };
 }
 
 /**
@@ -351,7 +348,6 @@ function buildUpsertClausePlans(
 			return {
 				conflictTargetIndices,
 				conflictTargetCollations: enforcement?.collations,
-				conflictTargetTypes: enforcement?.types,
 				action: 'nothing' as const,
 			};
 		}
@@ -455,7 +451,6 @@ function buildUpsertClausePlans(
 		return {
 			conflictTargetIndices,
 			conflictTargetCollations: enforcement?.collations,
-			conflictTargetTypes: enforcement?.types,
 			action: 'update' as const,
 			assignments,
 			whereCondition,

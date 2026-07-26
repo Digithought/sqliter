@@ -1,0 +1,111 @@
+-- json-coerce-once.sqllogic
+-- A write's values are converted to declared column types exactly once, at the
+-- DML emitter, driven by the static type of each cell's producing expression
+-- (ticket json-coerce-once-at-dml-source). A JSON value that came OUT of storage
+-- is already converted and must never be converted again: JSON's parse reads a
+-- plain JS string as JSON source, so re-converting the stored text `9` turns it
+-- into the number 9, and re-converting `abc` (not valid JSON source) throws.
+-- No `using memory`, so store mode exercises the same rules on the store path.
+
+-- UPDATE of a NON-JSON column must leave an untouched JSON column byte-identical:
+-- a JSON string scalar whose text looks numeric must not silently become a number.
+create table jco_num (j json primary key, v text);
+insert into jco_num values ('"9"', 'a'), ('"9.0"', 'b');
+update jco_num set v = 'X' where v = 'a';
+-- run
+
+-- The JSON output shape pins identity: "9" (string scalar) vs 9 (number).
+select j, v from jco_num order by v;
+→ [{"j":"9","v":"X"},{"j":"9.0","v":"b"}]
+
+-- Same shape where the stored JSON text is NOT valid JSON source: before the fix
+-- this UPDATE failed with "Type conversion failed for column 'j'" even though the
+-- statement never mentions j.
+create table jco_txt (j json primary key, v text);
+insert into jco_txt values ('"abc"', 'a');
+update jco_txt set v = 'X';
+-- run
+
+select j, v from jco_txt;
+→ [{"j":"abc","v":"X"}]
+
+-- INSERT ... SELECT of a JSON column: the source cell is already a JSON value
+-- (static type JSON → skip conversion), so copying rows must neither re-parse
+-- nor throw.
+create table jco_src (id integer primary key, j json);
+create table jco_dst (id integer primary key, j json);
+insert into jco_src values (1, '"abc"'), (2, '"9"'), (3, '[2]'), (4, '{"a":1}');
+insert into jco_dst select id, j from jco_src;
+-- run
+
+select id, j from jco_dst order by id;
+→ [{"id":1,"j":"abc"},{"id":2,"j":"9"},{"id":3,"j":[2]},{"id":4,"j":{"a":1}}]
+
+-- Self-assignment: `set j = j` reads the stored (converted) value; assigning it
+-- back must be a no-op, not a re-parse.
+update jco_dst set j = j;
+-- run
+
+select id, j from jco_dst order by id;
+→ [{"id":1,"j":"abc"},{"id":2,"j":"9"},{"id":3,"j":[2]},{"id":4,"j":{"a":1}}]
+
+-- Assigning a TEXT literal to a JSON column still converts: '"abc"' is JSON
+-- source for the text value abc, and '[2]' is JSON source for a list.
+update jco_dst set j = '"xyz"' where id = 1;
+update jco_dst set j = '[5,6]' where id = 3;
+-- run
+
+select id, j from jco_dst where id in (1, 3) order by id;
+→ [{"id":1,"j":"xyz"},{"id":3,"j":[5,6]}]
+
+-- ...and a literal that is not valid JSON source still fails, naming the column.
+create table jco_err (id integer primary key, j json);
+insert into jco_err values (1, 'abc');
+-- error: Type conversion failed for column 'j'
+
+-- A CHECK constraint on a table UPDATEd without mentioning its JSON column must
+-- see the STORED JSON value, not a re-converted one. j holds the JSON text "9"
+-- (a string scalar): under JSON's type rank a string never equals a number, so
+-- `j <> 9` holds. Re-conversion would damage it into the NUMBER 9 and fail the
+-- CHECK on an UPDATE that never touches j.
+create table jco_chk (id integer primary key, j json, v text,
+	check (j <> 9));
+insert into jco_chk values (1, '"9"', 'a');
+update jco_chk set v = 'X';
+-- run
+
+select id, j, v from jco_chk;
+→ [{"id":1,"j":"9","v":"X"}]
+
+-- ON CONFLICT DO UPDATE: the assignment's TEXT literal converts; excluded./stored
+-- JSON references pass through untouched.
+create table jco_upsert (id integer primary key, j json);
+insert into jco_upsert values (1, '"abc"');
+insert into jco_upsert values (1, '"zzz"')
+	on conflict (id) do update set j = excluded.j;
+-- run
+
+select id, j from jco_upsert;
+→ [{"id":1,"j":"zzz"}]
+
+insert into jco_upsert values (1, '"proposed"')
+	on conflict (id) do update set j = '"lit"';
+-- run
+
+select id, j from jco_upsert;
+→ [{"id":1,"j":"lit"}]
+
+-- JSON null converts to SQL NULL. Now that conversion happens before the NOT
+-- NULL check, a NOT NULL JSON column rejects the text 'null' (previously the
+-- check inspected the raw text, passed, and storage silently stored NULL).
+create table jco_nn (id integer primary key, j json not null);
+insert into jco_nn values (1, 'null');
+-- error: NOT NULL constraint failed
+
+-- A nullable JSON column stores it as SQL NULL, as before.
+create table jco_nul (id integer primary key, j json null);
+insert into jco_nul values (1, 'null');
+-- run
+
+select id, j, (j is null) as isnull from jco_nul;
+→ [{"id":1,"j":null,"isnull":true}]

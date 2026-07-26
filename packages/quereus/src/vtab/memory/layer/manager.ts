@@ -827,12 +827,15 @@ export class MemoryTableManager {
 		}
 
 		// Validate and parse values according to column types. Skip when the caller
-		// (e.g. isolation overlay flush/tombstone writes) already coerced to declared
-		// form — JSON conversion is not idempotent, so re-running it can throw or
-		// silently change the value.
+		// already converted to declared form and says so via preCoerced — the DML
+		// executor (whose emitters convert by static type at the top of the pipeline)
+		// and the isolation overlay's flush/tombstone writes. JSON conversion is not
+		// idempotent, so re-running it can throw or silently change the value. Direct
+		// API callers leave the flag unset and this conversion remains their contract.
 		// NOTE: skipping it also skips that helper's "too many values" width guard. Every
-		// preCoerced caller today builds its row programmatically from this same schema, so
-		// the width is structural; if an externally-shaped row ever reaches here preCoerced,
+		// preCoerced caller today builds its row from this same schema's column order
+		// (the DML builders project the source into full table-column shape), so the
+		// width is structural; if an externally-shaped row ever reaches here preCoerced,
 		// hoist the width check out of coerceRowToSchema and run it unconditionally.
 		const schema = targetLayer.getSchema();
 		const newRowData: Row = preCoerced ? values : coerceRowToSchema(values, schema.columns, `INSERT into ${this._tableName}`);

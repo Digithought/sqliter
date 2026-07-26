@@ -113,6 +113,51 @@ export function coerceRowToSchema(row: Row, columns: readonly ColumnSchema[], la
 }
 
 /**
+ * Build the per-statement conversion step for a DML write. Given the static
+ * logical type of the expression producing each cell (index-aligned with
+ * `columns`) and the target columns, returns a closure that converts exactly
+ * the cells whose producing type is not already the target column's logical
+ * type — or `undefined` when no cell needs converting, so the caller can skip
+ * the per-row work entirely.
+ *
+ * Types are compared by object identity: the type registry hands out one
+ * shared `LogicalType` instance per type, so an expression whose static type
+ * IS the column's type (a reference to a same-typed column — an unassigned
+ * column in an UPDATE, or `insert into b select j from a`) produces values
+ * already in declared form, and those MUST be left alone: conversion is not
+ * repeatable for every type. JSON's `parse` reads a plain JS string as JSON
+ * source, so re-converting a stored JSON text value either changes it (the
+ * text `9` becomes the number 9) or throws (`abc` is not valid JSON source).
+ * An unknown source type (`undefined` entry) converts — the safe historical
+ * behavior for values of unproven provenance.
+ *
+ * The returned closure copies the row and converts via {@link validateAndParse},
+ * so conversion failures carry the same message text the storage layer used to
+ * produce. Cells at or beyond the row's length are left for the storage width
+ * guard, mirroring {@link coerceRowToSchema}'s map-over-present-cells behavior.
+ */
+export function buildRowCoercion(
+	sourceTypes: ReadonlyArray<LogicalType | undefined>,
+	columns: readonly ColumnSchema[],
+): ((row: Row) => Row) | undefined {
+	const convertIndices: number[] = [];
+	for (let i = 0; i < columns.length; i++) {
+		if (sourceTypes[i] !== columns[i].logicalType) {
+			convertIndices.push(i);
+		}
+	}
+	if (convertIndices.length === 0) return undefined;
+	return (row: Row): Row => {
+		const out = row.slice() as Row;
+		for (const i of convertIndices) {
+			if (i >= out.length) break;
+			out[i] = validateAndParse(out[i] as SqlValue, columns[i].logicalType, columns[i].name);
+		}
+		return out;
+	};
+}
+
+/**
  * Check if a value is compatible with a logical type without throwing.
  *
  * @param value The value to check

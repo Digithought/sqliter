@@ -4,15 +4,29 @@ import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
+import { buildRowCoercion } from '../../types/validation.js';
 
 export function emitInsert(plan: InsertNode, ctx: EmissionContext): Instruction {
-	// INSERT node now only handles data transformations and passes flat rows through.
+	// INSERT node only handles data transformations and passes flat rows through.
 	// The actual database insert operations are handled by DmlExecutorNode.
-	// Type conversion is handled by the table manager's validateAndParse in performInsert.
-	async function* run(_ctx: RuntimeContext, sourceValue: AsyncIterable<Row>): AsyncIterable<Row> {
-		const tableSchema = plan.table.tableSchema;
-		const colCount = tableSchema.columns.length;
+	const tableSchema = plan.table.tableSchema;
+	const colCount = tableSchema.columns.length;
 
+	// Convert each cell to its declared column type HERE — the top of the DML
+	// pipeline — driven by the source expressions' static types, so constraint
+	// checking and the storage layer (which is told `preCoerced`) both see the
+	// declared form exactly once. The source is already projected into full
+	// table-column order (buildExpandedSource), so source attributes align
+	// positionally with table columns. A cell whose source type already IS the
+	// column's type (e.g. `insert into b select j from a` for a JSON column) is
+	// left alone — see buildRowCoercion.
+	const sourceAttrs = plan.source.getAttributes();
+	const coerceNewRow = buildRowCoercion(
+		tableSchema.columns.map((_, i) => sourceAttrs[i]?.type.logicalType),
+		tableSchema.columns,
+	);
+
+	async function* run(_ctx: RuntimeContext, sourceValue: AsyncIterable<Row>): AsyncIterable<Row> {
 		for await (const sourceRow of sourceValue) {
 			// Convert source row to flat OLD/NEW format
 			// For INSERT: OLD values are all NULL, NEW values are from source
@@ -23,10 +37,11 @@ export function emitInsert(plan: InsertNode, ctx: EmissionContext): Instruction 
 				flatRow[i] = null;
 			}
 
-			// Fill NEW section with source values (indices n..2n-1)
-			// No affinity conversion here - let the type system handle it
+			// Fill NEW section (indices n..2n-1) with the source values, converted
+			// to declared column types where the static source type requires it.
+			const newRow = coerceNewRow ? coerceNewRow(sourceRow) : sourceRow;
 			for (let colIdx = 0; colIdx < colCount; colIdx++) {
-				flatRow[colCount + colIdx] = sourceRow[colIdx];
+				flatRow[colCount + colIdx] = newRow[colIdx];
 			}
 
 			yield flatRow;

@@ -1116,24 +1116,22 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const { operation, values, oldKeyValues } = args;
 		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
 
-		// Coerced only for PK extraction / merged-view conflict detection below — NOT
-		// for the overlay write. The overlay (a memory-module table) re-coerces every
-		// cell on its own insert/update unless the write sets `preCoerced` (which these
-		// data writes deliberately do not — only the tombstone writes below, whose cells
-		// already come from storage, do), so writing the coerced row through without the
-		// flag would coerce twice. That is a no-op for most logical types, but
-		// JSON's `parse` is not idempotent for a JSON-string scalar (`'"hello"'` parses
-		// to the native JS string `"hello"`; re-parsing that bare string as JSON throws,
-		// since it lacks its own quotes) — double coercion would break any JSON column.
-		// Detection instead needs the coerced form: probing the overlay/underlying by an
-		// un-coerced PK (e.g. TEXT '1' against a stored INTEGER 1) misses the existing
-		// row entirely (bug-store-isolation-upsert-affinity-coerced-pk).
-		// NOTE: this coerces the full row on every isolation-layer write, and the overlay
-		// coerces it again on its own insert/update — two validateAndParse passes per write
-		// (two JSON.parse for JSON columns). Negligible now; if isolation-write throughput or
-		// large-JSON rows ever show as hot, thread this row through with `preCoerced: true`
-		// (the overlay now honors it) instead of letting the overlay redo the work.
-		const coercedValues = values ? this.coerceRow(values) : values;
+		// The DML executor converts every row to declared column types at the top of
+		// the pipeline and says so via `preCoerced` — then `values` is already in
+		// declared form, must NOT be converted again (JSON's `parse` is not
+		// idempotent for a JSON-string scalar: `'"hello"'` parses to the native JS
+		// string `"hello"`, and re-parsing that bare string throws), and the flag is
+		// forwarded on every overlay data write below so the overlay's own memory
+		// module skips its pass too.
+		//
+		// A direct API caller that leaves the flag unset still hands us raw values:
+		// convert them here — conflict detection needs the declared form (probing the
+		// overlay/underlying by an un-coerced PK, e.g. TEXT '1' against a stored
+		// INTEGER 1, misses the existing row entirely —
+		// bug-store-isolation-upsert-affinity-coerced-pk) — but keep the OVERLAY
+		// write raw in that case (the overlay converts on its own write, and
+		// handing it the converted row without `preCoerced` would convert twice).
+		const coercedValues = values ? (args.preCoerced ? values : this.coerceRow(values)) : values;
 
 		// Resolve the effective PK-level action once so the wrapped overlay vtab
 		// agrees with the overlay's decision. Per-UC defaults are applied inside
@@ -1174,6 +1172,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 							values: overlayRow,
 							oldKeyValues: pk,
 							onConflict: effectiveOR,
+							preCoerced: args.preCoerced,
 						});
 						const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
 						return this.attachEvicted(stripped, evicted, tombstoneIndex);
@@ -1258,7 +1257,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						await this.insertTombstoneForPK(overlay, targetPK, tombstoneIndex);
 						// Reuse a tombstone already at newPK (a PK freed earlier in this txn)
 						// instead of colliding with it — see writeRelocatedRow.
-						const result = await this.writeRelocatedRow(overlay, newPK, overlayRow, tombstoneIndex, effectiveOR);
+						const result = await this.writeRelocatedRow(overlay, newPK, overlayRow, tombstoneIndex, effectiveOR, args.preCoerced);
 						const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
 						return this.attachEvicted(this.attachReplacedUnderlying(stripped, pkOutcome.replacedUnderlyingRow), evicted, tombstoneIndex);
 					}
@@ -1296,8 +1295,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 					// A same-PK update has no overlay row at newPK (=== targetPK), so the
 					// helper's insert path matches the prior behavior.
 					const result = pkChanged
-						? await this.writeRelocatedRow(overlay, newPK, overlayRow, tombstoneIndex, effectiveOR)
-						: await overlay.update({ operation: 'insert', values: overlayRow, onConflict: effectiveOR });
+						? await this.writeRelocatedRow(overlay, newPK, overlayRow, tombstoneIndex, effectiveOR, args.preCoerced)
+						: await overlay.update({ operation: 'insert', values: overlayRow, onConflict: effectiveOR, preCoerced: args.preCoerced });
 					const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
 					return this.attachEvicted(this.attachReplacedUnderlying(stripped, replacedUnderlyingRow), evicted, tombstoneIndex);
 				}
@@ -1522,6 +1521,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		overlayRow: SqlValue[],
 		tombstoneIndex: number,
 		effectiveOR: ConflictResolution | undefined,
+		preCoerced: boolean | undefined,
 	): Promise<UpdateResult> {
 		const existingAtNewPK = await this.getOverlayRow(overlay, newPK);
 		if (existingAtNewPK && existingAtNewPK[tombstoneIndex] === 1) {
@@ -1530,12 +1530,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				values: overlayRow,
 				oldKeyValues: newPK,
 				onConflict: effectiveOR,
+				preCoerced,
 			});
 		}
 		return overlay.update({
 			operation: 'insert',
 			values: overlayRow,
 			onConflict: effectiveOR,
+			preCoerced,
 		});
 	}
 

@@ -309,61 +309,78 @@ export function validateValue(value: SqlValue, type: LogicalType): SqlValue {
 
 ### Where coercion happens (and why exactly once)
 
-A row travelling through an INSERT/UPDATE plan carries **raw** values — the literal
-text the statement supplied, an unparsed `'{"a":2}'` rather than the object a
-later `select` reads back. It is converted to the declared logical types at the
-**storage layer**, which coerces every row on its own
-(`MemoryTableManager.performInsert`, `quereus-store`'s `StoreTable.coerceRow`).
-That is the single conversion point; everything upstream of it sees raw values.
+A write's values are converted to the declared column logical types **once, at
+the top of the DML pipeline** — in the DML emitters — and everything downstream
+(constraint checking, the isolation overlay, the storage layer) sees the
+declared form.
 
-The one escape hatch is `UpdateArgs.preCoerced`. A caller that is *re-writing
-values it read back out of storage* — rather than passing user input through —
-sets it, and both storage backends then skip their coercion pass. Only
-`quereus-isolation` uses it: the overlay→underlying flush, the delete-tombstone
-writes (whose primary-key cells come straight from a scan), and the overlay
-rebuild after a schema change. Everything else leaves it unset.
-
-CHECK and FK evaluation is the one exception, and it takes a **copy** rather than
-converting the row in place. `ConstraintCheckNode` builds a coerced view of the
-NEW half of the flat OLD/NEW row once per row (`coerceNewSection` in
-`runtime/emit/constraint-check.ts`) and evaluates CHECK expressions — immediate
-and deferred alike — against that copy, so a CHECK compares the same values the
-read path would. Without it `check (a < b)` over two JSON columns compared raw
-text and put `{"a":10}` before `{"a":2}`. The raw row keeps flowing downstream
-untouched.
+Conversion cannot simply be re-run at each layer, because it is not repeatable
+for every type:
 
 > **`JSON_TYPE.parse` is not idempotent for a string scalar.** `parse('"Bob"')`
 > returns the bare string `Bob`, and `parse('Bob')` then throws
-> `Cannot convert 'Bob' to JSON: invalid JSON syntax`. So a coerced row must
-> never be coerced again — which is why the coerced view stays local to
-> constraint evaluation instead of being pushed upstream into the DML emitters,
-> where it would reach the storage layer and be parsed twice.
-> (`quereus-isolation`'s `IsolatedTable` declines to thread its own coerced row
-> into the overlay write for the same reason — it coerces only for PK extraction
-> and conflict detection, and hands the overlay the raw row. Its tombstone writes
-> are the exception: those cells are already-converted values read back from
-> storage, so they go through with `preCoerced` set.)
+> `Cannot convert 'Bob' to JSON: invalid JSON syntax` — while re-parsing the
+> stored text `9` silently *changes* it into the number 9. A converted value is
+> indistinguishable at runtime from unparsed JSON source, so "convert again just
+> in case" is not safe.
 
-That non-idempotence sets the phase order inside `ConstraintCheckNode`. The NOT
-NULL pass runs **first and against the raw row**: under `OR REPLACE` it may
-substitute a column's DEFAULT, and a DEFAULT expression can read a sibling via
-`new.<col>`. Whatever it returns is written back into the row that continues on
-to the storage layer, so it has to be the raw value. Only afterwards is the
-coerced view built — from the row *as finally substituted* — and shown to the
-CHECK/FK expressions, which is also what makes a substituted DEFAULT subject to
-the table's CHECKs. Both phases share one row context whose getter is swapped
-between them, so this costs no extra context push.
+What decides whether a cell converts is therefore the **static type of the
+expression that produced it**, which the planner already knows. The rule
+(`buildRowCoercion` in `types/validation.ts`): convert cell *i* iff the
+producing expression's `LogicalType` is not — by object identity — the target
+column's type. A SQL literal `'"abc"'` is TEXT → into a JSON column, convert; a
+reference to a JSON column is JSON → already declared form, leave alone.
+Concretely:
 
-Consequence: any consumer reading the DML executor's raw row rather than the
-stored row sees the uncoerced value. `insert ... returning j` reporting `text`
-instead of `json`, and row-time materialized-view maintenance writing raw values
-into the MV backing, are both instances of this — tracked as
-`bug-dml-downstream-uses-uncoerced-row`.
+- `emitInsert` masks each cell by the source relation's attribute type at that
+  position (the source is projected into full table-column order, so the two
+  align). `insert into b select j from a` copies JSON values untouched; a
+  VALUES literal still converts.
+- `emitUpdate` masks an assigned column by its assignment expression's type and
+  an unassigned column by the source attribute's type — for the ordinary
+  target-table scan that is the declared type itself, so the carried-over
+  stored values are never re-converted. `update t set v = 'X'` leaves a JSON
+  key column byte-identical.
+- Two paths inject a value *after* that pass and convert their one cell by the
+  same rule: the `OR REPLACE` NOT NULL DEFAULT substitution
+  (`constraint-check.ts`) and `ON CONFLICT … DO UPDATE` assignments (the DML
+  executor).
+
+The DML executor then passes `preCoerced: true` on its `vtab.update` calls, and
+every conversion-performing layer below honors it: the memory module
+(`MemoryTableManager.performInsert`/`performUpdate`), `quereus-store`'s
+`StoreTable`, and `quereus-isolation`'s `IsolatedTable` (which also forwards the
+flag to its overlay writes). The isolation layer's flush and tombstone writes
+set the flag themselves — those cells were read back out of storage.
+
+The storage layer's own conversion is **not** gone: a write that does not come
+through the DML executor — external-change apply, materialized-view maintenance
+writes, direct `vtab.update` API use — leaves `preCoerced` unset and the
+storage layer converts as before. The public vtab contract is unchanged.
+
+Because the row reaching `ConstraintCheckNode` is already in declared form,
+CHECK and FK expressions — immediate and deferred alike — read it directly: a
+CHECK compares the same values the read path would (`check (a < b)` over two
+JSON columns compares structurally, not as raw text), and an UPDATE that never
+mentions a JSON column shows the CHECK the *stored* value rather than a
+re-converted (possibly damaged) one. Under `OR REPLACE`, the NOT NULL pass may
+substitute a column's DEFAULT first; CHECK/FK then read the row *as finally
+substituted*, which is also what flows downstream.
+
+Conversion errors surface from the emitter (for INSERT, before the row reaches
+constraint checking), but the message text is unchanged — the same
+`validateAndParse` produces it.
 
 Because every `JSON_TYPE.compare` caller is guaranteed to hold parsed values, a
 JS string reaching `compare` is unambiguously a JSON **string scalar** and is
 never re-parsed: `compare('9', 9)` ranks the number first (number < string)
 instead of calling them equal.
+
+One caveat of trusting static types: a scalar function whose schema *declares* a
+JSON return type must return native (parsed) JSON values, never serialized text —
+the skip rule takes the declaration at its word. The builtins that declare JSON
+(`json()`, `json_group_array`, `json_group_object`) all return native values;
+`json_extract` and friends declare no return type and are unaffected.
 
 ### Explicit Conversion
 

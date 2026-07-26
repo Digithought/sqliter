@@ -15,7 +15,7 @@ import { isMaintainedTable } from '../../schema/derivation.js';
 import { hasNativeEventSupport } from '../../util/event-support.js';
 import { sqlValueIdentical, compareSqlValuesFast, BINARY_COLLATION, type CollationFunction } from '../../util/comparison.js';
 import { validateAndParse } from '../../types/validation.js';
-import type { LogicalType } from '../../types/logical-type.js';
+import type { ColumnSchema } from '../../schema/column.js';
 import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation, createParentRestrictBatch, accumulateParentRestrictKeys, flushParentRestrictBatch, type ParentRestrictBatch } from '../foreign-key-actions.js';
@@ -45,16 +45,16 @@ interface RuntimeUpsertClause {
 	 * array falls back to BINARY, i.e. the pre-fix byte-identity behavior).
 	 */
 	conflictTargetCollationFns?: CollationFunction[];
-	/**
-	 * Per-conflict-target-column logical type, index-aligned with
-	 * {@link conflictTargetIndices}. The match applies this column's affinity to the
-	 * proposed value (which reaches the executor pre-affinity-coercion) before comparing
-	 * against the already-coerced existing row.
-	 */
-	conflictTargetTypes?: LogicalType[];
 	action: 'nothing' | 'update';
 	/** Indices into the evaluators array for each assignment (column index -> evaluator index) */
 	assignmentIndices?: Map<number, number>;
+	/**
+	 * Columns whose DO UPDATE assignment value needs conversion to the declared
+	 * type before it is written — the same static-type rule emitUpdate applies
+	 * (assignment expression type vs column type, compared by identity). Keyed
+	 * by column index; a column absent here is assigned as evaluated.
+	 */
+	assignmentCoercions?: Map<number, ColumnSchema>;
 	/** Index into the evaluators array for WHERE condition, or -1 if no WHERE */
 	whereIndex: number;
 	/** Row descriptor for NEW references */
@@ -65,17 +65,15 @@ interface RuntimeUpsertClause {
 
 /**
  * True when a proposed value equals the stored existing value at one conflict-target
- * column the way the targeted constraint ENFORCES: the column's affinity is applied to
- * the proposed value (which reaches the executor pre-affinity-coercion, while
- * `existing` is the already-coerced stored value), then the two are compared under the
- * column's precomputed enforcement collation.
+ * column the way the targeted constraint ENFORCES: compared under the column's
+ * precomputed enforcement collation. Both sides are already in declared (stored)
+ * form — `existing` is a stored row and the proposed row was converted by the
+ * INSERT emitter's static-type pass — so no per-row conversion happens here.
  *
- * `targetPos` indexes the clause's per-target metadata arrays (which are aligned with
- * `conflictTargetIndices`). When that metadata is absent — a defensively-old plan — it
- * degrades to BINARY with no coercion, i.e. exactly the byte-identity semantics of
- * `sqlValueIdentical`, preserving its numeric-storage-class tolerance via
- * {@link compareSqlValuesFast}. A coercion failure likewise falls back to the raw
- * proposed value (it then compares unequal and the caller aborts, as before).
+ * `targetPos` indexes the clause's per-target collation array (aligned with
+ * `conflictTargetIndices`). When absent — a defensively-old plan — it degrades to
+ * BINARY, i.e. the byte-identity semantics of `sqlValueIdentical`, preserving its
+ * numeric-storage-class tolerance via {@link compareSqlValuesFast}.
  */
 function conflictTargetValuesMatch(
 	existing: SqlValue,
@@ -83,22 +81,8 @@ function conflictTargetValuesMatch(
 	clause: RuntimeUpsertClause,
 	targetPos: number,
 ): boolean {
-	const type = clause.conflictTargetTypes?.[targetPos];
 	const collationFn = clause.conflictTargetCollationFns?.[targetPos] ?? BINARY_COLLATION;
-	// NOTE: re-coerces the proposed value per conflicting row via validateAndParse; only
-	// reached on the (cold) UNIQUE-violation-with-upsert-clause path, so it is off the
-	// happy-path insert. If a workload ever hammers ON CONFLICT on a wide composite target,
-	// precompute per-target coercion closures at emit instead of dispatching on type here.
-	let coercedProposed = proposed;
-	if (type) {
-		try {
-			coercedProposed = validateAndParse(proposed, type);
-		} catch {
-			// Coercion failed — compare the raw proposed value (aborts, as pre-fix).
-			coercedProposed = proposed;
-		}
-	}
-	return compareSqlValuesFast(existing, coercedProposed, collationFn) === 0;
+	return compareSqlValuesFast(existing, proposed, collationFn) === 0;
 }
 
 /**
@@ -178,17 +162,16 @@ async function resolveDmlSourceRows(
 
 /**
  * The row the substrate actually STORED for this write, which is what every
- * post-write consumer must see: `vtab.update()` returns `result.row` after the
- * storage layer has coerced the proposed values to the declared column logical
- * types (`coerceRowToSchema` in the memory manager / store table; the overlay's
- * own coercion in the isolation layer). The raw row we handed in still carries
- * the user's un-converted input — `'{"a":2}'` as TEXT rather than the parsed
- * JSON value a subsequent `select` reads back.
+ * post-write consumer must see. The executor's own writes are converted by the
+ * emitters up front (and passed with `preCoerced`), so for the standard
+ * backends `result.row` and the row we handed in now usually agree — but a
+ * module remains free to normalize further (or to ignore `preCoerced` and
+ * convert on its own), and `result.row` is its word on what landed.
  *
  * Falls back to the raw row when the substrate's row is the wrong width — a
- * minimal test/sample module that echoes its input never coerces, so raw IS
- * stored for it. The absent case is only reached defensively: every caller has
- * already short-circuited on a missing `result.row`, which the module contract
+ * minimal test/sample module that echoes its input in a different shape. The
+ * absent case is only reached defensively: every caller has already
+ * short-circuited on a missing `result.row`, which the module contract
  * reserves for "nothing was written" (see `VirtualTable.update`).
  */
 function storedRowOrRaw(resultRow: Row | undefined, rawRow: Row, columnCount: number): Row {
@@ -374,24 +357,29 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			};
 
 			// Resolve the per-target-column enforcement collation NAMES to functions once
-			// here (recording the collation dependency so a redefined collation re-emits),
-			// and carry the per-column logical types for affinity coercion. Consumed by
-			// matchUpsertClause so a collation-equal / affinity-coerced conflict on the
-			// targeted constraint routes to DO UPDATE / DO NOTHING instead of aborting.
+			// here (recording the collation dependency so a redefined collation re-emits).
+			// Consumed by matchUpsertClause so a collation-equal conflict on the targeted
+			// constraint routes to DO UPDATE / DO NOTHING instead of aborting.
 			if (clause.conflictTargetIndices && clause.conflictTargetCollations) {
 				runtime.conflictTargetCollationFns = clause.conflictTargetCollations.map(
 					name => ctx.resolveCollation(name ?? 'BINARY'),
 				);
-				runtime.conflictTargetTypes = clause.conflictTargetTypes;
 			}
 
 			if (clause.action === 'update' && clause.assignments) {
 				runtime.assignmentIndices = new Map();
+				runtime.assignmentCoercions = new Map();
 				for (const [colIndex, valueNode] of clause.assignments) {
 					const evaluatorIndex = upsertEvaluatorInstructions.length;
 					const instruction = emitCallFromPlan(valueNode, ctx);
 					upsertEvaluatorInstructions.push(instruction);
 					runtime.assignmentIndices.set(colIndex, evaluatorIndex);
+					// Same static-type rule as emitUpdate: convert only when the
+					// assignment expression's type is not the column's declared type.
+					const column = tableSchema.columns[colIndex];
+					if (valueNode.getType().logicalType !== column.logicalType) {
+						runtime.assignmentCoercions.set(colIndex, column);
+					}
 				}
 			}
 
@@ -435,15 +423,16 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 			// Match when the proposed values equal the existing row at the clause's
 			// conflict-target columns — i.e. the conflict is on those columns —
-			// compared the way the constraint ENFORCES: the column's affinity is
-			// applied to the (pre-affinity-coercion) proposed value, then it is compared
-			// under the constraint's enforcement collation. This routes a collation-equal
-			// (NOCASE case-variant, RTRIM trailing-space) or affinity-coerced (`'1'` vs a
-			// stored INTEGER `1`) conflict on the targeted constraint to the DO UPDATE /
-			// DO NOTHING arm rather than aborting with a UNIQUE error. The per-column
-			// collation functions + logical types are precomputed at emit; a BINARY,
-			// byte-identical key still compares 0 (well-formed seeds re-present
-			// byte-identical literals, so seed idempotency is unaffected).
+			// compared the way the constraint ENFORCES: under the constraint's
+			// enforcement collation. Both rows are already in declared (stored)
+			// form — the INSERT emitter converted the proposed row by static type —
+			// so an affinity-coerced conflict (`'1'` proposed into an INTEGER key
+			// holding `1`) arrives converted, and a collation-equal conflict (NOCASE
+			// case-variant, RTRIM trailing-space) is routed by the collation compare
+			// to the DO UPDATE / DO NOTHING arm rather than aborting with a UNIQUE
+			// error. The per-column collation functions are precomputed at emit; a
+			// BINARY, byte-identical key still compares 0 (well-formed seeds
+			// re-present byte-identical literals, so seed idempotency is unaffected).
 			//
 			// NOTE: one residual corner remains out of scope — multi-constraint
 			// coincidence. If an insert violates the targeted constraint AND another
@@ -500,11 +489,18 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			// Evaluate assignment expressions with proper contexts
 			for (const [colIndex, evaluatorIndex] of clause.assignmentIndices) {
 				const evaluator = upsertEvaluators[evaluatorIndex];
-				const value = await withAsyncRowContext(rctx, clause.existingRowDescriptor, () => existingRow, async () => {
+				let value = await withAsyncRowContext(rctx, clause.existingRowDescriptor, () => existingRow, async () => {
 					return await withAsyncRowContext(rctx, clause.newRowDescriptor!, () => proposedRow, async () => {
 						return await evaluator(rctx);
 					});
 				}) as SqlValue;
+				// Convert to the declared column type when the assignment's static
+				// type requires it (see assignmentCoercions) — `existingRow` is a
+				// stored row, so the composed updatedRow is then fully declared-form.
+				const coerceColumn = clause.assignmentCoercions?.get(colIndex);
+				if (coerceColumn) {
+					value = validateAndParse(value, coerceColumn.logicalType, coerceColumn.name);
+				}
 				updatedRow[colIndex] = value;
 			}
 		}
@@ -512,12 +508,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Extract the primary key from existing row
 		const keyValues = pkColumnIndicesInSchema.map(idx => existingRow[idx]);
 
-		// Perform the UPDATE operation
+		// Perform the UPDATE operation. `preCoerced`: the row is composed of
+		// stored cells plus assignments already converted above.
 		const updateArgs: UpdateArgs = {
 			operation: 'update',
 			values: updatedRow,
 			oldKeyValues: keyValues,
 			onConflict: ConflictResolution.ABORT,
+			preCoerced: true,
 			mutationStatement: vtab.wantStatements ?
 				buildUpdateStatement(tableSchema, updatedRow, keyValues, contextRow) : undefined
 		};
@@ -838,6 +836,10 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			// can fall back to per-constraint defaultConflict directives. The memory
 			// module treats undefined as ABORT when no constraint default is set.
 			onConflict: plan.onConflict,
+			// The emitters converted the NEW section to declared types up front
+			// (emitInsert / constraint-check DEFAULT substitution), so the storage
+			// layer must not convert again — JSON conversion is not repeatable.
+			preCoerced: true,
 			mutationStatement
 		};
 
@@ -1075,7 +1077,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// post-mutation OLD-value scans dereference through the just-mutated
 		// parent and find zero rows.
 		if (fkRestrictBatch) {
-			accumulateParentRestrictKeys(fkRestrictBatch, tableSchema, 'update', oldRow, newRow);
+			accumulateParentRestrictKeys(fkRestrictBatch, 'update', oldRow, newRow);
 		} else {
 			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
 		}
@@ -1088,6 +1090,10 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			// can fall back to per-constraint defaultConflict directives. The memory
 			// module treats undefined as ABORT when no constraint default is set.
 			onConflict: plan.onConflict,
+			// emitUpdate converted the NEW section to declared types (assigned
+			// columns by static type, unassigned columns are stored values) — the
+			// storage layer must not convert again.
+			preCoerced: true,
 			mutationStatement
 		};
 
@@ -1244,7 +1250,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Parent-side RESTRICT enforcement: batched key accumulation, or the
 		// per-row defense-in-depth pre-walk — see comment on the UPDATE path above.
 		if (fkRestrictBatch) {
-			accumulateParentRestrictKeys(fkRestrictBatch, tableSchema, 'delete', oldRow);
+			accumulateParentRestrictKeys(fkRestrictBatch, 'delete', oldRow);
 		} else {
 			await assertTransitiveRestrictsForParentMutation(ctx.db, tableSchema, 'delete', oldRow, undefined, plan.lensRouted);
 		}
@@ -1254,6 +1260,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			values: undefined,
 			oldKeyValues: keyValues,
 			onConflict: plan.onConflict ?? ConflictResolution.ABORT,
+			// The key cells come from the scanned OLD row — already stored form.
+			preCoerced: true,
 			mutationStatement
 		};
 

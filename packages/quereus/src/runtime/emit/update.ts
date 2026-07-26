@@ -7,6 +7,7 @@ import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { buildRowDescriptor, composeOldNewRow } from '../../util/row-descriptor.js';
 import { createRowSlot, withRowContext } from '../context-helpers.js';
+import { buildRowCoercion } from '../../types/validation.js';
 
 export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction {
 	const tableSchema = plan.table.tableSchema;
@@ -39,6 +40,23 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 		emitCallFromPlan(assign.value, ctx)
 	);
 
+	// Convert the NEW row to declared column types HERE, driven by static types,
+	// so constraint checking and the storage layer (told `preCoerced`) see the
+	// declared form exactly once. An assigned column's source type is its
+	// assignment expression's type; an unassigned column keeps whatever the
+	// source relation reports at that position — for the ordinary target-table
+	// scan that is the declared column type itself (identity match ⇒ leave
+	// alone: the scanned value is already converted, and e.g. JSON conversion
+	// is not repeatable — see buildRowCoercion). Never assume "unassigned ⇒
+	// converted": a non-scan source (view decomposition, member insert) reports
+	// its own types and converts by the same rule.
+	const sourceAttrs = plan.source.getAttributes();
+	const cellSourceTypes = tableSchema.columns.map((_, i) => sourceAttrs[i]?.type.logicalType);
+	plan.assignments.forEach((assign, i) => {
+		cellSourceTypes[assignmentTargetIndices[i]] = assign.value.getType().logicalType;
+	});
+	const coerceNewRow = buildRowCoercion(cellSourceTypes, tableSchema.columns);
+
 	async function* run(rctx: RuntimeContext, sourceRowsIterable: AsyncIterable<Row>, ...assignmentEvaluators: Array<(ctx: RuntimeContext) => SqlValue | Promise<SqlValue>>): AsyncIterable<Row> {
 		const slot = createRowSlot(rctx, sourceRowDescriptor);
 		try {
@@ -67,8 +85,11 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 					});
 				}
 
-				// Create flat row with OLD (source) and NEW (updated) values for constraint checking
-				const flatRow = composeOldNewRow(sourceRow, updatedRow, tableSchema.columns.length);
+				// Create flat row with OLD (source) and NEW (updated) values for constraint
+				// checking. The NEW half is converted to declared column types first (see
+				// coerceNewRow above); OLD is the scanned row, already in stored form.
+				const newRow = coerceNewRow ? coerceNewRow(updatedRow) : updatedRow;
+				const flatRow = composeOldNewRow(sourceRow, newRow, tableSchema.columns.length);
 
 				// Yield the flat row for constraint checking
 				// NOTE: UpdateNode only transforms rows - it does NOT execute the actual update

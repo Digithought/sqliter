@@ -2,12 +2,12 @@
 -- A CHECK constraint must compare JSON values exactly the way a later `select`
 -- compares the stored row.
 --
--- The insert pipeline hands ConstraintCheckNode the RAW new row — the JSON text
--- the statement supplied, not the parsed JSON value the storage layer converts
--- it to. Constraint evaluation therefore reads its own coerced copy of the NEW
--- section (runtime/emit/constraint-check.ts, coerceNewSection). Without it an
--- immediate CHECK compared two raw JSON texts letter-by-letter, so '{"a":10}'
--- sorted before '{"a":2}' and a perfectly valid row was rejected.
+-- The DML emitters convert the NEW row to declared column types at the top of
+-- the pipeline (driven by static types — docs/types.md § Where coercion
+-- happens), so ConstraintCheckNode reads parsed JSON values, never the raw text
+-- the statement supplied. Before that held, an immediate CHECK compared two raw
+-- JSON texts letter-by-letter, so '{"a":10}' sorted before '{"a":2}' and a
+-- perfectly valid row was rejected.
 -- Regression for bug-json-compare-string-ambiguity; the structural order itself
 -- is covered by 15.1-semantic-ordering.sqllogic.
 

@@ -83,16 +83,47 @@ describe('JSON structural key order (store)', () => {
 			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
 		});
 
-		it('ranks all six JSON kinds: null < boolean < number < string < array < object', async () => {
+		it('ranks the non-null JSON kinds: boolean < number < string < array < object', async () => {
+			// JSON null converts to SQL NULL, and a PRIMARY KEY column is NOT NULL —
+			// see the companion test below — so the PK-scan rank covers the five
+			// non-null kinds and the null rank is pinned via ORDER BY on a nullable
+			// column.
 			await db.exec(`create table t (j json primary key) using store`);
 			await db.exec(`create table m (j json primary key)`);
 			for (const tbl of ['t', 'm']) {
 				await db.exec(
-					`insert into ${tbl} values ('{"a":1}'), ('[2]'), ('"abc"'), ('7'), ('true'), ('null')`);
+					`insert into ${tbl} values ('{"a":1}'), ('[2]'), ('"abc"'), ('7'), ('true')`);
 			}
 			const scan = await column(db, `select json_quote(j) as q from t`, 'q');
-			expect(scan).to.deep.equal(['null', 'true', '7', '"abc"', '[2]', '{"a":1}']);
+			expect(scan).to.deep.equal(['true', '7', '"abc"', '[2]', '{"a":1}']);
 			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
+
+			// Null ranks first (SQL NULL sorts before every JSON value, matching the
+			// structural rank null < boolean < ...), on both backends.
+			await db.exec(`create table tn (id integer primary key, j json null) using store`);
+			await db.exec(`create table mn (id integer primary key, j json null)`);
+			for (const tbl of ['tn', 'mn']) {
+				await db.exec(`insert into ${tbl} values (1, '{"a":1}'), (2, 'null'), (3, 'true')`);
+			}
+			const sorted = await column(db, `select json_quote(j) as q from tn order by j`, 'q');
+			expect(sorted).to.deep.equal(['null', 'true', '{"a":1}']);
+			expect(sorted).to.deep.equal(await column(db, `select json_quote(j) as q from mn order by j`, 'q'));
+		});
+
+		it('rejects JSON null in a JSON PRIMARY KEY column (converts to SQL NULL)', async () => {
+			// JSON null and SQL NULL are the same value in Quereus (JSON_TYPE.parse
+			// maps the text 'null' to null). Conversion now happens at the DML
+			// emitter (json-coerce-once-at-dml-source), so the NOT NULL check sees
+			// the converted value and fires — previously it inspected the raw text
+			// 'null', passed, and the storage layer then silently stored a NULL key
+			// in a NOT NULL PK column.
+			await db.exec(`create table pk_null (j json primary key) using store`);
+			await db.exec(`create table pk_null_m (j json primary key)`);
+			for (const tbl of ['pk_null', 'pk_null_m']) {
+				const err = await attempt(db, `insert into ${tbl} values ('null')`);
+				expect(err, `${tbl} must reject JSON null in a PK column`).to.not.be.null;
+				expect(String(err)).to.match(/not null/i);
+			}
 		});
 
 		it('orders nested structures by element-wise recursion', async () => {
@@ -286,9 +317,8 @@ describe('JSON structural key order (isolated store)', () => {
 	it('keeps a JSON-number-spelled string PK distinct from a committed row across `insert or replace`', async () => {
 		// Repro for bug-json-pk-equality-drops-collation, replayed through the isolation
 		// overlay: staging '"9.0"' as `insert or replace` must NOT be treated as a
-		// rewrite of the committed '"9"' row — they are different rows. (UPDATE/DELETE
-		// of a JSON string-scalar row are out of scope here — see
-		// bug-json-string-scalar-not-round-trip-safe.)
+		// rewrite of the committed '"9"' row — they are different rows. (UPDATE and
+		// DELETE of a JSON string-scalar row are covered by their own sections below.)
 		await db.exec(`create table o (j json primary key, v text) using store`);
 		await db.exec(`insert into o values ('"9"', 'committed')`);
 
@@ -402,6 +432,23 @@ describe('JSON structural key order (isolated store)', () => {
 			expect(final.map(r => `${r.q}:${r.v}`)).to.deep.equal(['"9.0":b']);
 		});
 
+		it('converts the values of an UPDATE exactly once, at the DML emitter', async () => {
+			// See the UPDATE section below for the full matrix; this case pins the
+			// overlay path specifically: an in-transaction UPDATE of a non-key column
+			// must not re-convert the carried-over JSON key on its way into the overlay.
+			await db.exec(`create table su2 (j json primary key, v text) using store`);
+			await db.exec(`insert into su2 values ('"9"', 'a'), ('"abc"', 'b')`);
+
+			await db.exec('begin');
+			await db.exec(`update su2 set v = upper(v)`);
+			const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su2`));
+			expect(staged.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"9":A', '"abc":B']);
+			await db.exec('commit');
+
+			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su2`));
+			expect(final.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"9":A', '"abc":B']);
+		});
+
 		it('tombstones the row a UNIQUE `or replace` evicts', async () => {
 			// The eviction routes through the shared insertTombstoneForPK helper rather
 			// than the delete branch, so it exercises the third fixed tombstone write.
@@ -416,6 +463,55 @@ describe('JSON structural key order (isolated store)', () => {
 
 			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su`));
 			expect(final.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"7":keep', '"9.0":a']);
+		});
+	});
+
+	describe('UPDATE of a non-key column leaves a JSON string-scalar key intact', () => {
+		// Repro for the UPDATE half of json-coerce-once-at-dml-source: the row the
+		// executor hands to the storage layer on UPDATE is the SCANNED row with only
+		// the assigned columns overwritten, so every unassigned cell is already in
+		// declared form. The old pipeline converted the whole row again on the way
+		// in: the stored JSON text `9` silently became the number 9 (re-keying the
+		// row), and a key whose text is not valid JSON source (`abc`) threw a
+		// conversion error naming a column the statement never touched. The memory
+		// table runs alongside as the oracle.
+
+		it('keeps a number-spelled string key byte-identical', async () => {
+			await db.exec(`create table uj (j json primary key, v text) using store`);
+			await db.exec(`create table ujm (j json primary key, v text)`); // memory oracle
+
+			for (const tbl of ['uj', 'ujm']) {
+				await db.exec(`insert into ${tbl} values ('"9"', 'a'), ('"9.0"', 'b')`);
+				await db.exec(`update ${tbl} set v = 'X' where v = 'a'`);
+				const rows = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from ${tbl}`));
+				expect(rows.map(r => `${r.q}:${r.v}`).sort(), tbl)
+					.to.deep.equal(['"9":X', '"9.0":b']);
+			}
+		});
+
+		it('does not throw when the key text is not valid JSON source', async () => {
+			await db.exec(`create table ua (j json primary key, v text) using store`);
+			await db.exec(`create table uam (j json primary key, v text)`); // memory oracle
+
+			for (const tbl of ['ua', 'uam']) {
+				await db.exec(`insert into ${tbl} values ('"abc"', 'a')`);
+				await db.exec(`update ${tbl} set v = 'X'`);
+				const rows = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from ${tbl}`));
+				expect(rows.map(r => `${r.q}:${r.v}`), tbl).to.deep.equal(['"abc":X']);
+			}
+		});
+
+		it('still converts an assigned TEXT literal, and passes a self-assignment through', async () => {
+			await db.exec(`create table us (j json primary key, v text) using store`);
+			await db.exec(`insert into us values ('"abc"', 'a')`);
+
+			// Self-assignment reads the stored (converted) value — must be a no-op.
+			await db.exec(`update us set j = j`);
+			// A TEXT literal is JSON source and still converts.
+			await db.exec(`update us set j = '"xyz"'`);
+
+			const rows = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from us`));
+			expect(rows.map(r => `${r.q}:${r.v}`)).to.deep.equal(['"xyz":a']);
 		});
 	});
 });

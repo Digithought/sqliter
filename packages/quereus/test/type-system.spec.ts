@@ -423,8 +423,8 @@ describe('Type System', () => {
 				// re-parse a string that was paired with a non-string, so the JSON string
 				// "9" and the JSON number 9 came back equal — contradicting the type's own
 				// rank (number < string). Every caller now holds already-parsed values
-				// (stored rows via coerceRowToSchema, constraint rows via
-				// constraint-check.ts's coerceNewSection), so nothing is re-parsed here.
+				// (DML rows via the emitters' buildRowCoercion pass, direct API writes
+				// via coerceRowToSchema), so nothing is re-parsed here.
 				expect(JSON_TYPE.compare!('9', 9)).to.equal(1);
 				expect(JSON_TYPE.compare!(9, '9')).to.equal(-1);
 
