@@ -59,7 +59,7 @@ export {
 	planKindFromCode,
 	planCodeFromKind,
 } from './vtab/idx-str.js';
-export type { BaseModuleConfig, EffectiveRowSource, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
+export type { BaseModuleConfig, CatalogObjectKind, EffectiveRowSource, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
 export { getModuleConcurrencyMode, acquireConnectionLock } from './vtab/concurrency.js';
 
 // Virtual Table Event Hooks

@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, UpdateResult } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, UpdateResult, CatalogObjectKind, ViewSchema } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema, isConstraintViolation, inferType, validateAndParse } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -766,6 +766,21 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	async notifyLensDeployment(db: Database, logicalSchemaName: string, snapshot: LensDeploymentSnapshot): Promise<void> {
 		await this.underlying.notifyLensDeployment?.(db, logicalSchemaName, snapshot);
+	}
+
+	/**
+	 * Forwards the view / materialized-view catalog-persistability veto to the underlying
+	 * module.
+	 *
+	 * `allModules()` yields the REGISTERED module, which is this wrapper when a store is
+	 * isolated — so without this forward an isolation-wrapped store would never be
+	 * consulted and would keep the silent-drop bug (a view it cannot persist creates
+	 * "successfully" and vanishes on reopen). Whether a catalog entry is encodable is a
+	 * property of the definition text, not of the overlay, so a straight delegate is
+	 * correct; the throw must propagate (that is the entire point of the hook).
+	 */
+	assertCatalogObjectPersistable(db: Database, kind: CatalogObjectKind, object: ViewSchema | TableSchema): void {
+		this.underlying.assertCatalogObjectPersistable?.(db, kind, object);
 	}
 
 	/**

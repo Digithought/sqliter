@@ -21,6 +21,7 @@ import {
 import type { CoarsenedKeyInfo } from '../../schema/view.js';
 import { computeBodyHash, normalizeBackingModuleName } from '../../schema/view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from '../../schema/derivation.js';
+import { assertCatalogObjectPersistable } from '../../schema/catalog-persistability.js';
 import type { Schema } from '../../schema/schema.js';
 import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
@@ -539,6 +540,13 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 	// body that is not row-time maintainable — roll the whole MV back so an
 	// ineligible body errors cleanly.
 	try {
+		// Same pre-flight the CREATE VIEW path runs, but it can only run HERE: the
+		// persisted DDL text (`generateMaintainedTableDDL`) does not exist until the
+		// derivation is attached. Placed inside this try so the existing catch — which
+		// already unlinks and drops the half-built backing — rolls a rejection back with
+		// no extra teardown. Harmless on the catalog-import path (an entry read back from
+		// the catalog re-generates persistable DDL by construction).
+		assertCatalogObjectPersistable(db, 'materializedView', maintained);
 		db.registerMaterializedView(maintained);
 	} catch (e) {
 		unlinkCoveredUniqueConstraints(db, maintained);

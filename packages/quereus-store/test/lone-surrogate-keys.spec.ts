@@ -254,7 +254,7 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 		// catalog key, and the second table's DDL write silently clobbered the first's on
 		// reopen (`bug-store-catalog-key-lone-surrogate-identifier-collision`).
 		//
-		// Two different rejection timings live here, and the difference is the point:
+		// Three different rejection timings live here, and the difference is the point:
 		//   - A bad TABLE / INDEX NAME is refused at `CREATE`, by the identifier guard in
 		//     `buildDataStoreName` / `buildIndexStoreName` — the PHYSICAL store name is
 		//     built before the statement's first side effect, so the create is a clean
@@ -264,6 +264,10 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 		//     store-name guard never sees it. DDL text is persisted lazily, on first access
 		//     to the table's underlying store (see `StoreTable.initializeStore`), so those
 		//     surface on the first INSERT/SELECT rather than at `CREATE TABLE`.
+		//   - A VIEW / MATERIALIZED VIEW is refused at `CREATE` too, but by a different
+		//     mechanism: a synchronous pre-flight veto over every registered module
+		//     (`VirtualTableModule.assertCatalogObjectPersistable`), run before the object
+		//     is registered. See the dedicated block below for why nothing later can work.
 
 		it('rejects CREATE TABLE for a table named with a lone surrogate', async () => {
 			await rejects(db, `create table "${LONE_HIGH}" (k integer primary key) using store`);
@@ -304,6 +308,100 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			// so it must be guarded too (not just the catalog-key identifiers).
 			await db.exec(`create table t2 (id integer primary key, v text default '${LONE_HIGH}') using store`);
 			await rejects(db, `insert into t2 (id) values (1)`);
+		});
+	});
+
+	describe('a view or materialized view the store could not persist', () => {
+		// A view / MV catalog entry is written FIRE-AND-FORGET: the store persists it from a
+		// `SchemaChangeNotifier` listener (which try/catches every listener and only logs)
+		// through an async persist queue (which `.catch`-logs). Neither layer can fail the
+		// statement. So before the fix, `create view "<lone surrogate>"` SUCCEEDED, answered
+		// queries for the rest of the session, wrote no catalog entry, and was simply gone
+		// after reopen — the loss visible only as a `console.warn`.
+		//
+		// The fix is a synchronous pre-flight veto (`assertCatalogObjectPersistable`) asked of
+		// every registered module before the object is registered, so a refusal leaves the
+		// statement a clean no-op. It checks the FULL generated DDL, so a lone surrogate in the
+		// view's own NAME and one in a string literal in its BODY are both caught — the body
+		// case is why "reject lone surrogates in identifiers" would not have been enough.
+
+		beforeEach(async () => {
+			// The store module persists only for the `Database` it is subscribed to, and it
+			// subscribes on its first create/connect — so a store table must exist before the
+			// veto is live. Any real store-backed session has one; this mirrors that.
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+			await db.exec(`insert into t values (1, 10)`);
+		});
+
+		it('rejects CREATE VIEW for a view named with a lone surrogate, and does not register it', async () => {
+			await rejects(db, `create view "${LONE_HIGH}" as select id from t`);
+			// The bug was that the view WAS present in-session and only missing after reopen.
+			expect(db.schemaManager.getView('main', LONE_HIGH), 'the view must not be registered')
+				.to.be.undefined;
+		});
+
+		it('rejects a view whose BODY carries a lone surrogate, even though its name is clean', async () => {
+			// A string literal in a view body is a VALUE, and values carrying lone surrogates
+			// are deliberately accepted by the engine and by memory tables. Only the module
+			// that would have to persist the generated DDL can judge this one.
+			await rejects(db, `create view v as select '${LONE_HIGH}' as tag from t`);
+			expect(db.schemaManager.getView('main', 'v'), 'the view must not be registered')
+				.to.be.undefined;
+		});
+
+		it('rejects a memory-backed materialized view named with a lone surrogate, leaving no backing table', async () => {
+			// Default (memory) backing, so the store's physical-store-name guard never runs —
+			// the veto is the only thing standing between this and a silent drop. It fires
+			// inside `materializeView`'s existing rollback arm, so the half-built backing table
+			// created under the MV's own name is dropped again.
+			await rejects(db, `create materialized view "${LONE_HIGH}" as select id, v from t`);
+			expect(db.schemaManager.getTable('main', LONE_HIGH), 'no backing table may survive')
+				.to.be.undefined;
+		});
+
+		it('keeps rejecting a store-backed materialized view named with a lone surrogate', async () => {
+			// This one already failed loudly before the fix — `StoreModule.create` builds the
+			// physical store name before any side effect. Pinned so the two paths stay aligned.
+			await rejects(db, `create materialized view "${LONE_HIGH}" using store as select id, v from t`);
+			expect(db.schemaManager.getTable('main', LONE_HIGH)).to.be.undefined;
+		});
+
+		it('rejects ALTER VIEW … SET TAGS carrying a lone surrogate, leaving the tags unchanged', async () => {
+			// Tags ride the persisted DDL text, so the same silent drop applied to a tag swap
+			// on an already-persisted view — in the tag KEY (a quoted identifier) or its VALUE.
+			await db.exec(`create view v as select id from t`);
+			await rejects(db, `alter view v set tags ("${LONE_HIGH}" = 1)`);
+			await rejects(db, `alter view v set tags (k = '${LONE_HIGH}')`);
+			expect(db.schemaManager.getView('main', 'v')?.tags, 'tags must be unchanged')
+				.to.be.undefined;
+		});
+
+		it('rejects ALTER MATERIALIZED VIEW … SET TAGS carrying a lone surrogate', async () => {
+			await db.exec(`create materialized view mv as select id, v from t`);
+			await rejects(db, `alter materialized view mv set tags ("${LONE_HIGH}" = 1)`);
+			expect(db.schemaManager.getTable('main', 'mv')?.tags, 'tags must be unchanged')
+				.to.be.undefined;
+		});
+
+		it('still accepts a well-formed astral view name and body literal', async () => {
+			await db.exec(`create view "${ASTRAL}" as select '${ASTRAL}' as tag from t`);
+			expect((await db.get(`select tag from "${ASTRAL}"`))?.tag).to.equal(ASTRAL);
+		});
+
+		it('a database with no store module registered keeps accepting all of it', async () => {
+			// The memory-vs-store divergence is deliberate: nothing is persisted, so nothing
+			// can be lost. Only a module that would have to write the entry gets a veto.
+			const mem = new Database();
+			try {
+				await mem.exec(`create table t (id integer primary key, v integer)`);
+				await mem.exec(`create view "${LONE_HIGH}" as select id from t`);
+				await mem.exec(`create view vb as select '${LONE_HIGH}' as tag from t`);
+				await mem.exec(`create materialized view "${LONE_LOW}" as select id, v from t`);
+				expect(mem.schemaManager.getView('main', LONE_HIGH)).to.not.be.undefined;
+				expect(mem.schemaManager.getTable('main', LONE_LOW)).to.not.be.undefined;
+			} finally {
+				await mem.close();
+			}
 		});
 	});
 });

@@ -38,6 +38,7 @@ import type {
 	MaintainedTableSchema,
 	BackingHost,
 	LensDeploymentSnapshot,
+	CatalogObjectKind,
 } from '@quereus/quereus';
 import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
 import type { CompiledPredicate, EffectiveRowSource, KeyNormalizer, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
@@ -242,6 +243,50 @@ interface AlterColumnAttrChange {
 	newCol: ColumnSchema;
 	collationChanged: boolean;
 	valueConvert?: (v: SqlValue) => SqlValue;
+}
+
+/** A catalog entry as it would be written: the store key and its persisted DDL text. */
+interface CatalogEntry {
+	key: Uint8Array;
+	ddl: string;
+}
+
+/**
+ * Guard the FULL persisted schema text, not just the object's own name: a lone
+ * surrogate anywhere in it — a quoted column name, a `default '…'` string literal, a
+ * `check` constraint's string constant — folds to U+FFFD under `TextEncoder` and would
+ * read back as different schema text than what was created. Independent of the
+ * catalog-key builders' identifier guard; it catches what they cannot see.
+ */
+function assertPersistableDdlText(ddl: string): void {
+	assertNoUnpairedSurrogate(ddl, 'persisted schema text');
+}
+
+/**
+ * The catalog entry a plain view would be persisted as. Building it is the check:
+ * {@link buildViewCatalogKey} rejects an unencodable name, and the caller then runs
+ * {@link assertPersistableDdlText} over `ddl`. Shared by the write path
+ * ({@link StoreModule.saveViewDDL}) and the pre-flight veto
+ * ({@link StoreModule.assertCatalogObjectPersistable}) so the two cannot drift.
+ */
+function viewCatalogEntry(view: ViewSchema): CatalogEntry {
+	return {
+		key: buildViewCatalogKey(view.schemaName, view.name),
+		ddl: generateViewDDL(view),
+	};
+}
+
+/**
+ * The catalog entry a materialized view would be persisted as, or `undefined` when
+ * `table` carries no derivation (not an MV — nothing lands under the MV prefix).
+ * Counterpart of {@link viewCatalogEntry}; same write/veto sharing.
+ */
+function maintainedViewCatalogEntry(table: TableSchema): CatalogEntry | undefined {
+	if (!isMaintainedTable(table)) return undefined;
+	return {
+		key: buildMaterializedViewCatalogKey(table.schemaName, table.name),
+		ddl: generateMaintainedTableDDL(table),
+	};
 }
 
 /**
@@ -3224,15 +3269,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 	/**
 	 * Encode a bundle of persisted schema text (DDL) for the catalog store.
-	 *
-	 * Guards the FULL text, not just the object's name: a lone surrogate anywhere in it — a
-	 * quoted column name, a `default '…'` string literal, a `check` constraint's string
-	 * constant — would otherwise fold to U+FFFD under `TextEncoder` and read back as
-	 * different schema text than what was created. This does not rely on the catalog-key
-	 * builders' identifier guard having already caught it; it catches it independently.
+	 * The guard is {@link assertPersistableDdlText} — see it for why the FULL text
+	 * is checked, not just the object's name.
 	 */
 	private encodeCatalogDDL(ddl: string): Uint8Array {
-		assertNoUnpairedSurrogate(ddl, 'persisted schema text');
+		assertPersistableDdlText(ddl);
 		return new TextEncoder().encode(ddl);
 	}
 
@@ -3565,10 +3606,8 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * {@link persistObjectCatalogEntryIfChanged}.
 	 */
 	async saveViewDDL(view: ViewSchema): Promise<void> {
-		await this.persistObjectCatalogEntryIfChanged(
-			buildViewCatalogKey(view.schemaName, view.name),
-			generateViewDDL(view),
-		);
+		const { key, ddl } = viewCatalogEntry(view);
+		await this.persistObjectCatalogEntryIfChanged(key, ddl);
 	}
 
 	/** Remove a plain view's catalog entry (on DROP VIEW). */
@@ -3584,16 +3623,48 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * {@link persistObjectCatalogEntryIfChanged}.
 	 */
 	async saveMaterializedViewDDL(mv: MaintainedTableSchema): Promise<void> {
-		await this.persistObjectCatalogEntryIfChanged(
-			buildMaterializedViewCatalogKey(mv.schemaName, mv.name),
-			generateMaintainedTableDDL(mv),
-		);
+		const entry = maintainedViewCatalogEntry(mv);
+		// Callers only reach here with a maintained table; the guard keeps the shared
+		// helper's `undefined` arm honest rather than asserting non-null.
+		if (!entry) return;
+		await this.persistObjectCatalogEntryIfChanged(entry.key, entry.ddl);
 	}
 
 	/** Remove a materialized view's catalog entry (on DROP MATERIALIZED VIEW). */
 	async removeMaterializedViewDDL(schemaName: string, mvName: string): Promise<void> {
 		const catalogStore = await this.provider.getCatalogStore();
 		await catalogStore.delete(buildMaterializedViewCatalogKey(schemaName, mvName));
+	}
+
+	/**
+	 * Pre-flight veto (see `VirtualTableModule.assertCatalogObjectPersistable`): refuse a
+	 * view / materialized view whose catalog entry this module could not durably write.
+	 *
+	 * It runs exactly the derivation the write path runs — {@link viewCatalogEntry} /
+	 * {@link maintainedViewCatalogEntry} build the key (rejecting an unencodable
+	 * identifier) and {@link assertPersistableDdlText} checks the generated DDL text —
+	 * so the veto and the write cannot disagree about what is persistable. It is the only
+	 * synchronous path a rejection can travel: the actual save is chained onto
+	 * `persistQueue` behind a `SchemaChangeNotifier` listener, and both layers swallow.
+	 *
+	 * Gated on `subscribedDb === db`: this module persists a view/MV only while subscribed
+	 * to that `Database`'s change notifier ({@link ensureSchemaSubscription}, driven by the
+	 * first `create`/`connect`/`alterTable`/`rehydrateCatalog`). A module registered but
+	 * never handed a `db` writes nothing, so vetoing there would reject a definition that
+	 * loses nothing. The gate becomes removable if persistence is ever made unconditional
+	 * (`bug-store-untouched-table-and-early-view-never-persisted`).
+	 */
+	// NOTE: regenerates the object's full DDL text on every CREATE VIEW / CREATE MATERIALIZED
+	// VIEW / view-or-MV SET TAGS, and the persist that follows regenerates it again. DDL is
+	// rare and the text is small, so the duplicate render is not worth caching today; if a
+	// schema-heavy workload (a large `apply schema` deploying many views) ever shows up hot
+	// here, thread the already-built CatalogEntry from the veto through to the write.
+	assertCatalogObjectPersistable(db: Database, kind: CatalogObjectKind, object: ViewSchema | TableSchema): void {
+		if (this.subscribedDb !== db) return;
+		const entry = kind === 'view'
+			? viewCatalogEntry(object as ViewSchema)
+			: maintainedViewCatalogEntry(object as TableSchema);
+		if (entry) assertPersistableDdlText(entry.ddl);
 	}
 
 	/**

@@ -15,6 +15,7 @@ import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
 import { isHiddenImplicitIndex, findExposedImplicitConstraintIndex } from './catalog.js';
+import { assertCatalogObjectPersistable } from './catalog-persistability.js';
 import { buildLensBasisFkGate } from './lens-fk-discovery.js';
 import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
@@ -1074,6 +1075,10 @@ export class SchemaManager {
 			throw new QuereusError(`View '${viewName}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
 		const updated: ViewSchema = { ...view, tags: compute(view.tags) };
+		// A tag key/value is persisted verbatim into the view's DDL text, so it can
+		// carry something a module cannot durably encode. Veto before the swap — the
+		// re-persist that follows the event is fire-and-forget and could not report it.
+		assertCatalogObjectPersistable(this.db, 'view', updated);
 		schema.addView(updated);
 		this.changeNotifier.notifyChange({
 			type: 'view_modified',
@@ -1144,6 +1149,8 @@ export class SchemaManager {
 			throw new QuereusError(`Materialized view '${name}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
 		const updated: MaintainedTableSchema = { ...table, tags: compute(table.tags) };
+		// See updateViewTags: tags ride the persisted DDL, so veto before the swap.
+		assertCatalogObjectPersistable(this.db, 'materializedView', updated);
 		schema.addTable(updated);
 		this.changeNotifier.notifyChange({
 			type: 'materialized_view_modified',

@@ -9,6 +9,7 @@ import type { ModuleCapabilities } from './capabilities.js';
 import type { MappingAdvertisement } from './mapping-advertisement.js';
 import type { BackingHost } from './backing-host.js';
 import type { Schema } from '../schema/schema.js';
+import type { ViewSchema } from '../schema/view.js';
 import type { LensDeploymentSnapshot } from '../schema/lens.js';
 import type { Row, SqlValue } from '../common/types.js';
 
@@ -533,7 +534,41 @@ export interface VirtualTableModule<
 		logicalSchemaName: string,
 		snapshot: LensDeploymentSnapshot,
 	): void | Promise<void>;
+
+	/**
+	 * Optional pre-flight veto: throw when this module would be UNABLE to durably
+	 * persist the catalog entry for `object`. Consulted over every registered module
+	 * by the CREATE VIEW / CREATE MATERIALIZED VIEW / ALTER … SET TAGS paths BEFORE
+	 * the object is registered (or, for a materialized view, inside `materializeView`'s
+	 * existing rollback arm), so a rejection leaves the statement a clean no-op.
+	 *
+	 * Why a veto instead of an error on the persist itself: catalog persistence for
+	 * views and materialized views is **advisory / fire-and-forget** — it rides the
+	 * `SchemaChangeNotifier`, whose listeners are wrapped in try/catch, and a store
+	 * module chains the actual write onto an async queue. Neither layer can surface a
+	 * failure to the statement, so an unpersistable definition would otherwise appear
+	 * to succeed and then vanish on reopen. This hook is the ONE synchronous point where
+	 * a module can refuse. See `docs/store.md` § View / materialized-view catalog
+	 * persistence.
+	 *
+	 * Views and materialized views are not owned by any one module the way a table is,
+	 * so every module gets the veto; a module that would not persist the object must
+	 * no-op. Synchronous by contract: the check must be a pure function of the schema
+	 * (no IO). Omit ⇒ never consulted (today's behavior).
+	 */
+	assertCatalogObjectPersistable?(
+		db: Database,
+		kind: CatalogObjectKind,
+		object: ViewSchema | TableSchema,
+	): void;
 }
+
+/**
+ * The catalog object classes {@link VirtualTableModule.assertCatalogObjectPersistable}
+ * arbitrates. `'view'` carries a {@link ViewSchema}; `'materializedView'` carries the
+ * maintained {@link TableSchema} (the unified MV record).
+ */
+export type CatalogObjectKind = 'view' | 'materializedView';
 
 /**
  * Defines the structure for schema change information passed to xAlterSchema

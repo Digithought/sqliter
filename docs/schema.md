@@ -591,6 +591,30 @@ table hook), so a reopened DB persists subsequent view/MV DDL even when its firs
 post-reopen statement is a view. Gap: a brand-new DB never rehydrated, whose very
 first DDL is a view, still relies on a prior store-table create/connect to subscribe.
 
+**Persistence is advisory — except for one pre-flight veto.** These writes are
+fire-and-forget in both layers: `SchemaChangeNotifier.notifyChange` wraps every
+listener in `try`/`catch` and only logs, and the store then chains the actual save
+onto `persistQueue` behind its own `.catch`. That is deliberate — an unrelated
+listener's failure must not abort user DDL — but it means **no** failure discovered
+at write time can reach the statement that caused it. A definition the store cannot
+encode would therefore create "successfully", answer queries for the session, and be
+silently absent after reopen.
+
+The single exception closes that hole: the optional module hook
+`VirtualTableModule.assertCatalogObjectPersistable(db, kind, object)`, driven by
+`assertCatalogObjectPersistable` in `src/schema/catalog-persistability.ts` over every
+registered module. It is **synchronous, pure (no IO), and consulted before the object
+is registered** — from `emitCreateView` (before `schema.addView`), from
+`materializeView` (inside its existing rollback arm, since the MV's DDL text does not
+exist until the derivation is attached), and from `SchemaManager.updateViewTags` /
+`updateMaterializedViewTags` (tags ride the persisted DDL). A module that would not
+persist the object no-ops; a throw propagates and leaves the statement a clean no-op.
+The store implements it by running exactly the key + DDL derivation its write path
+runs, so veto and write cannot drift. Today it rejects one thing: text carrying an
+unpaired UTF-16 surrogate, which `TextEncoder` folds to U+FFFD (see
+`packages/quereus-store/src/common/encoding.ts`). A wrapper module (e.g. the isolation
+layer) must forward the hook or the wrapped module never gets its veto.
+
 **Rehydrate phasing.** `rehydrateCatalog` first consumes the clean-shutdown
 marker (the reserved `\x00meta\x00clean_shutdown` catalog entry `closeAll` writes
 after every batch flushed — read and immediately deleted, single-use; its value is

@@ -473,4 +473,42 @@ describe('StoreModule view / materialized-view persistence', () => {
 		expect(db2.schemaManager.getTable('main', 'bad'), 'no half-built backing left behind').to.be.undefined;
 		expect(await rows(db2, 'select id, v from good')).to.deep.equal([{ id: 1, v: 10 }]);
 	});
+
+	// ── Definitions the store cannot persist are refused, not silently dropped ──
+
+	it('a view whose CREATE was rejected leaves no catalog entry and nothing to rehydrate', async () => {
+		// The bug (`bug-store-view-lone-surrogate-name-silently-dropped`): a view name
+		// carrying an unpaired surrogate created "successfully" and was queryable for the
+		// session, but `TextEncoder` cannot encode it, so the catalog write failed inside
+		// the fire-and-forget persist queue and only logged. Reopen showed no view.
+		//
+		// Now the create is refused up front. This pins the durable half of that: an empty
+		// catalog — not an entry folded onto the U+FFFD replacement character, which would
+		// collide with every other lone surrogate.
+		const LONE_HIGH = '\uD800';
+		const { db, mod } = open();
+		await db.exec(`create table base (id integer primary key, v integer) using store`);
+		await db.exec(`insert into base values (1, 10)`);
+
+		let raised: unknown;
+		try {
+			await db.exec(`create view "${LONE_HIGH}" as select id from base`);
+		} catch (e) {
+			raised = e;
+		}
+		expect(raised, 'the create must raise').to.be.an('error');
+		expect((raised as Error).message).to.match(/unpaired surrogate/i);
+		await mod.closeAll();
+
+		const catalog = await provider.getCatalogStore();
+		expect(await catalog.get(buildViewCatalogKey('main', '�')), 'no folded U+FFFD entry')
+			.to.be.undefined;
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.views, 'no view rehydrated').to.deep.equal([]);
+		expect(db2.schemaManager.getView('main', LONE_HIGH), 'view not registered').to.be.undefined;
+		// The rest of the database is untouched by the refusal.
+		expect(await rows(db2, 'select id, v from base')).to.deep.equal([{ id: 1, v: 10 }]);
+	});
 });

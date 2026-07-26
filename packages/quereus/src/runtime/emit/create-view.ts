@@ -4,6 +4,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import type { ViewSchema } from '../../schema/view.js';
+import { assertCatalogObjectPersistable } from '../../schema/catalog-persistability.js';
 
 export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -44,6 +45,12 @@ export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Ins
 				StatusCode.ERROR
 			);
 		}
+
+		// Refuse up front if a registered module could not durably persist this
+		// definition — the persistence itself is fire-and-forget (see
+		// assertCatalogObjectPersistable), so this is the only place the failure can
+		// reach the statement. Nothing has been mutated yet, so a throw is a clean no-op.
+		assertCatalogObjectPersistable(rctx.db, 'view', viewSchema);
 
 		schema.addView(viewSchema);
 
