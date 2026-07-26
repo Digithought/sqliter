@@ -200,7 +200,14 @@ function synthesizeEquality(scope: Scope, attr: Attribute, columnIndex: number, 
 	let valueNode: ScalarPlanNode;
 	if (value.kind === 'literal') {
 		const litExpr: AST.LiteralExpr = { type: 'literal', value: value.value };
-		valueNode = new LiteralNode(scope, litExpr);
+		// Type the synthesized literal from the attribute it is compared against, so a
+		// non-null constant whose JS shape does not name its logical type (a JSON
+		// document is a plain object) still reports the column's type. A null keeps the
+		// inferred NULL_TYPE — the attribute's type would claim `nullable: false`.
+		const litType = value.value !== null
+			? { ...attr.type, nullable: false, isReadOnly: true }
+			: undefined;
+		valueNode = new LiteralNode(scope, litExpr, litType);
 	} else {
 		const paramExpr: AST.ParameterExpr = typeof value.paramRef === 'string'
 			? { type: 'parameter', name: value.paramRef }

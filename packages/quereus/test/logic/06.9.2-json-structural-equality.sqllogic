@@ -1,0 +1,203 @@
+-- json-structural-equality.sqllogic
+-- Comparing a JSON column against SQL text must agree with the JSON value comparator
+-- and with the index: whitespace and object key order are irrelevant, array element
+-- order is significant (ticket bug-json-equality-not-structural). The text operand is
+-- coerced to JSON at plan time (insertCrossTypeCoercion), so `=`, `<`/`>`, BETWEEN and
+-- IN all route through JSON_TYPE.compare.
+-- No `using memory`, so store mode exercises the persisted byte-key path too.
+
+-- ===================================
+-- 1. Unindexed JSON column: text literal on the right
+-- ===================================
+create table jse_t (id integer primary key, v json);
+insert into jse_t values (1, '{"a":1,"b":2}'), (2, '[1,2,3]'), (3, '"hello"'), (4, '42');
+-- run
+
+-- Byte-identical text matches (this was false before the fix — the stored value is a
+-- native object and the literal a string, so the storage classes never met).
+select id from jse_t where v = '{"a":1,"b":2}';
+→ [{"id":1}]
+
+-- Differently spaced, same document.
+select id from jse_t where v = '{ "a" : 1 , "b" : 2 }';
+→ [{"id":1}]
+
+-- Reordered keys, same document.
+select id from jse_t where v = '{"b":2,"a":1}';
+→ [{"id":1}]
+
+-- Array element order stays significant.
+select id from jse_t where v = '[1,2,3]';
+→ [{"id":2}]
+
+select id from jse_t where v = '[3,2,1]';
+→ []
+
+-- Text on the LEFT works identically — the coercion is symmetric.
+select id from jse_t where '{"b":2,"a":1}' = v;
+→ [{"id":1}]
+
+-- `!=` is the complement, not an error.
+select id from jse_t where v <> '{"b":2,"a":1}' order by id;
+→ [{"id":2},{"id":3},{"id":4}]
+
+-- ===================================
+-- 2. Text that is not valid JSON is FALSE, never an error
+-- ===================================
+-- CAST to JSON is lenient: a parse failure returns the operand unchanged, so the
+-- comparison is simply unequal.
+select id from jse_t where v = 'not json';
+→ []
+
+select count(*) as c from jse_t where v = '{unclosed';
+→ [{"c":0}]
+
+-- SQL NULL on either side stays UNKNOWN (no rows), not an error.
+select count(*) as c from jse_t where v = null;
+→ [{"c":0}]
+
+-- ===================================
+-- 3. JSON scalars
+-- ===================================
+-- A JSON number scalar matches both its JSON source text and a bare SQL number.
+select id from jse_t where v = '42';
+→ [{"id":4}]
+
+select id from jse_t where v = 42;
+→ [{"id":4}]
+
+-- A JSON string scalar matches its quoted JSON source...
+select id from jse_t where v = '"hello"';
+→ [{"id":3}]
+
+-- ...and also the bare text: 'hello' is not valid JSON, so the lenient cast leaves it
+-- as the raw string, and JSON_TYPE.compare compares two string scalars as text. Pinned
+-- deliberately — the quoted form is the one that generalizes to non-string documents.
+select id from jse_t where v = 'hello';
+→ [{"id":3}]
+
+-- ===================================
+-- 4. Ordering: <, >, BETWEEN
+-- ===================================
+-- JSON type rank is null < boolean < number < string < array < object, so the number
+-- 42 sorts below the string scalar and the containers sort above it.
+select id from jse_t where v < '"hello"' order by id;
+→ [{"id":4}]
+
+select id from jse_t where v > '"hello"' order by id;
+→ [{"id":1},{"id":2}]
+
+-- BETWEEN routes both bounds through the same coercion.
+create table jse_b (id integer primary key, v json);
+insert into jse_b values (1, '{"a":1}');
+-- run
+
+select id from jse_b where v between '{"a":0}' and '{"a":2}';
+→ [{"id":1}]
+
+select id from jse_b where v between '{"a":2}' and '{"a":9}';
+→ []
+
+-- ===================================
+-- 5. IN value list
+-- ===================================
+select id from jse_t where v in ('{ "b" : 2 , "a" : 1 }');
+→ [{"id":1}]
+
+select id from jse_t where v in ('[1,2,3]', '{"b":2,"a":1}') order by id;
+→ [{"id":1},{"id":2}]
+
+select id from jse_t where v in ('{"z":26}');
+→ []
+
+-- A non-JSON entry in the list is inert, not an error.
+select id from jse_t where v in ('not json', '{"a":1,"b":2}');
+→ [{"id":1}]
+
+-- ===================================
+-- 6. The same set with a UNIQUE index on the JSON column
+-- ===================================
+-- Before the fix, an indexed JSON column raised `Unknown literal type object` at plan
+-- time for the forms that DID work unindexed (`= json(...)` / `= cast(... as json)`),
+-- because the seek key was rebuilt as a LiteralNode with no type.
+create table jse_ix (id integer primary key, v json);
+create unique index jse_ix_v on jse_ix (v);
+insert into jse_ix values (1, '{"a":1,"b":2}'), (2, '[1,2,3]');
+-- run
+
+select id from jse_ix where v = '{"a":1,"b":2}';
+→ [{"id":1}]
+
+select id from jse_ix where v = '{ "b" : 2 , "a" : 1 }';
+→ [{"id":1}]
+
+select id from jse_ix where v = json('{"b":2,"a":1}');
+→ [{"id":1}]
+
+select id from jse_ix where v = cast('{ "a" : 1 , "b" : 2 }' as json);
+→ [{"id":1}]
+
+select id from jse_ix where v in ('{"b":2,"a":1}', '[1,2,3]') order by id;
+→ [{"id":1},{"id":2}]
+
+-- NOTE: this table holds only documents whose deepCompareJson order and canonical-text
+-- (index byte) order agree, so the indexed and unindexed answers match. They do NOT agree
+-- in general — an indexed JSON range can return a different row set than the same range
+-- over a scan. That divergence predates this file and is tracked in
+-- tickets/fix/bug-json-index-range-seek-order; do not read this case as coverage for it.
+select id from jse_ix where v between '{"a":1,"b":1}' and '{"a":1,"b":3}';
+→ [{"id":1}]
+
+select id from jse_ix where v = 'not json';
+→ []
+
+-- The index still enforces uniqueness by structure, and `=` now agrees with it.
+insert into jse_ix values (3, '{ "b" : 2 , "a" : 1 }');
+-- error: UNIQUE constraint failed
+
+-- The seek returns the stored native document, not the literal's text.
+select v from jse_ix where v = '{"b":2,"a":1}';
+→ [{"v":{"a":1,"b":2}}]
+
+-- ===================================
+-- 7. Cross-column: a TEXT column compared against a JSON column
+-- ===================================
+-- Behavior change, made explicit: "one side is JSON" coerces the other side, so a text
+-- column holding JSON source now matches structurally where it was always false.
+create table jse_txt (id integer primary key, s text);
+insert into jse_txt values (1, '{ "b" : 2 , "a" : 1 }'), (2, 'not json');
+-- run
+
+select t.id as tid, j.id as jid from jse_txt t join jse_t j on t.s = j.v;
+→ [{"tid":1,"jid":1}]
+
+select t.id as tid, j.id as jid from jse_txt t join jse_t j on j.v = t.s;
+→ [{"tid":1,"jid":1}]
+
+-- ===================================
+-- 8. A TEXT column retyped to JSON answers exactly as a native JSON column does
+-- ===================================
+create table jse_re (id integer primary key, v text);
+insert into jse_re values (1, '{"a":1}');
+-- run
+
+alter table jse_re alter column v set data type json;
+-- run
+
+select id from jse_re where v = '{ "a" : 1 }';
+→ [{"id":1}]
+
+create unique index jse_re_v on jse_re (v);
+-- run
+
+select id from jse_re where v = '{ "a" : 1 }';
+→ [{"id":1}]
+
+-- ===================================
+-- 9. Identity sites are unchanged — GROUP BY / DISTINCT were already structural
+-- ===================================
+select count(*) as groups from (select v from jse_t group by v);
+→ [{"groups":4}]
+
+select count(*) as c from (select distinct v from jse_t);
+→ [{"c":4}]

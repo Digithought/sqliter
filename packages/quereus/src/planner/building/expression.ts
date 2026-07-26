@@ -16,6 +16,8 @@ import { buildDeleteStmt } from './delete.js';
 import { resolveWindowFunction } from '../../schema/window-function.js';
 import { buildFunctionCall } from './function-call.js';
 import { createLogger } from '../../common/logger.js';
+import { PhysicalType } from '../../types/logical-type.js';
+import { NULL_TYPE } from '../../types/builtin-types.js';
 
 /**
  * Plans a `QueryExpr` in scalar / IN / EXISTS expression position.
@@ -53,9 +55,38 @@ const logger = createLogger('planner:expression');
 const COMPARISON_OPS = new Set(['=', '==', '!=', '<>', '<', '<=', '>', '>=']);
 
 /**
- * If one operand is numeric and the other is textual, wrap the textual operand
- * in a CastNode targeting the numeric side's type name (e.g. 'INTEGER' or 'REAL').
+ * Reconcile operands of a comparison whose plan-time types cannot be compared
+ * meaningfully as-is, by wrapping one side in a synthetic CastNode.
  * Returns `[left, right]` — possibly with one side replaced by a CastNode.
+ *
+ * Two pairings are handled, in this order:
+ *
+ * 1. **Object-physical vs anything else.** JSON is the engine's only logical type
+ *    whose `physicalType` is `PhysicalType.OBJECT`: its runtime values are native
+ *    JS objects/arrays, which `compareSqlValuesFast` short-circuits against any
+ *    other storage class — so `json_col = '{"a":1}'` was unconditionally false,
+ *    even for byte-identical text. The non-object side is cast to the object
+ *    side's type, never the reverse: casting the JSON side to text would make
+ *    equality depend on spelling and put `=` out of step with the index, which
+ *    compares structurally.
+ *
+ *    The gate is deliberately `physicalType === OBJECT`, **not**
+ *    `semanticOrdering`. DATE/TIME/DATETIME/TIMESPAN also carry semantic ordering
+ *    but are physically text, and the runtime's `tryTemporalComparison` already
+ *    reconciles them; routing them through a cast would change behavior for no
+ *    gain.
+ *
+ *    A cast to JSON is lenient (see `runtime/emit/cast.ts`): text that does not
+ *    parse comes back unchanged, so `json_col = 'not json'` is false rather than
+ *    an error. Note the consequence for JSON *string scalars*, which are stored
+ *    as plain JS strings: a column holding `"hello"` matches BOTH the SQL literal
+ *    `'"hello"'` (parses to the JSON string `hello`) and the bare `'hello'` (does
+ *    not parse, falls back to the raw string `hello`, which `JSON_TYPE.compare`
+ *    then compares as text). Only the first form generalizes — `'[1,2]'` matches
+ *    the JSON array while a bare `[1,2]` is not SQL text at all.
+ *
+ * 2. **Numeric vs textual.** The textual operand is cast to the numeric side's
+ *    type name (e.g. 'INTEGER' or 'REAL') so the runtime can take the fast path.
  */
 function insertCrossTypeCoercion(
 	scope: import('../scopes/scope.js').Scope,
@@ -64,6 +95,20 @@ function insertCrossTypeCoercion(
 ): [ScalarPlanNode, ScalarPlanNode] {
 	const leftLogical = left.getType().logicalType;
 	const rightLogical = right.getType().logicalType;
+
+	const leftObject = leftLogical.physicalType === PhysicalType.OBJECT;
+	const rightObject = rightLogical.physicalType === PhysicalType.OBJECT;
+	// Exactly one side is object-physical. A NULL-typed operand is left alone: the
+	// comparison is UNKNOWN regardless, so the cast would only add a runtime hop.
+	if (leftObject !== rightObject) {
+		if (leftObject && rightLogical !== NULL_TYPE) {
+			return [left, wrapInCast(scope, right, leftLogical.name)];
+		}
+		if (rightObject && leftLogical !== NULL_TYPE) {
+			return [wrapInCast(scope, left, rightLogical.name), right];
+		}
+		return [left, right];
+	}
 
 	const leftNumeric = !!leftLogical.isNumeric;
 	const rightNumeric = !!rightLogical.isNumeric;
@@ -79,6 +124,36 @@ function insertCrossTypeCoercion(
 		return [wrapInCast(scope, left, rightLogical.name), right];
 	}
 	return [left, right];
+}
+
+/**
+ * Apply the object-physical arm of {@link insertCrossTypeCoercion} across an IN
+ * value list, so `json_col in ('{"a":1}')` agrees with `json_col = '{"a":1}'`.
+ *
+ * Scoped to the object-physical pairing on purpose. The numeric ↔ textual arm has
+ * never been applied to IN lists (`int_col in ('1')` is false today for the same
+ * underlying reason), and turning it on here would change unrelated behavior; that
+ * case is tracked separately.
+ *
+ * The tested expression is shared by every listed value, so it is wrapped at most
+ * once — if any value is object-physical while the tested expression is not, the
+ * tested expression is cast first and the values are then reconciled against it.
+ */
+function coerceInListOperands(
+	scope: import('../scopes/scope.js').Scope,
+	left: ScalarPlanNode,
+	values: ScalarPlanNode[],
+): [ScalarPlanNode, ScalarPlanNode[]] {
+	const isObject = (node: ScalarPlanNode): boolean =>
+		node.getType().logicalType.physicalType === PhysicalType.OBJECT;
+
+	const objectValue = values.find(isObject);
+	if (!isObject(left) && !objectValue) return [left, values];
+
+	const coercedLeft = isObject(left)
+		? left
+		: wrapInCast(scope, left, objectValue!.getType().logicalType.name);
+	return [coercedLeft, values.map(val => insertCrossTypeCoercion(scope, coercedLeft, val)[1])];
 }
 
 /** Create a synthetic CastNode wrapping `operand` with the given target type name. */
@@ -274,8 +349,9 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
                    return inSubqueryNode;
                } else if (expr.values) {
           // IN value list: expr IN (value1, value2, ...)
-          const valueExprs = expr.values.map(val => buildExpression(ctx, val, allowAggregates));
-          const inListNode = new InNode(ctx.scope, expr, leftExpr, undefined, valueExprs);
+          const rawValueExprs = expr.values.map(val => buildExpression(ctx, val, allowAggregates));
+          const [inLeft, valueExprs] = coerceInListOperands(ctx.scope, leftExpr, rawValueExprs);
+          const inListNode = new InNode(ctx.scope, expr, inLeft, undefined, valueExprs);
           // Same eager collation-lattice validation as the subquery form.
           inListNode.getType();
           return inListNode;

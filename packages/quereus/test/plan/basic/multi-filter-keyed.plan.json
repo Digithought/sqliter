@@ -86,7 +86,7 @@
                   "children": [],
                   "detail": "3",
                   "logical": {
-                    "resultType": "REAL",
+                    "resultType": "INTEGER",
                     "value": 3
                   },
                   "nodeType": "Literal",

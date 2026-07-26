@@ -9,6 +9,7 @@ import { formatExpression, formatScalarType } from "../../util/plan-formatter.js
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE } from "../../types/builtin-types.js";
+import { JSON_TYPE } from "../../types/json-type.js";
 import { typeRegistry } from "../../types/registry.js";
 import { collationConflictError, isComparisonOperator, mergePropagatedCollation, resolveComparisonCollation } from "../analysis/comparison-collation.js";
 
@@ -429,6 +430,18 @@ export class LiteralNode extends PlanNode implements ZeroAryScalarNode, Constant
 			return {
 				typeClass: 'scalar',
 				logicalType: BLOB_TYPE,
+				nullable: false,
+				isReadOnly: true,
+			};
+		}
+		// Native object/array: the only logical type whose physical representation is
+		// PhysicalType.OBJECT is JSON, so an untyped object-valued literal is a JSON
+		// document. Reached when a rule rebuilds a literal from a plain constant value
+		// (e.g. an index seek key) without threading the source ScalarType through.
+		if (typeof value === 'object') {
+			return {
+				typeClass: 'scalar',
+				logicalType: JSON_TYPE,
 				nullable: false,
 				isReadOnly: true,
 			};

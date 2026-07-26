@@ -25,6 +25,7 @@ import { PRIMARY_INDEX_NAME, PRIMARY_PHYSICAL_INDEX_NAME, resolveIndexDescriptor
 import { encodeIdxStr, makeIdxStrSpec } from '../../../vtab/idx-str.js';
 import type { IndexConstraint } from '../../../vtab/index-info.js';
 import type { SqlValue } from '../../../common/types.js';
+import type { ScalarType } from '../../../common/datatype.js';
 import { compareSqlValues, normalizeCollationName } from '../../../util/comparison.js';
 import type { Scope } from '../../scopes/scope.js';
 import { TableReferenceNode } from '../../nodes/reference.js';
@@ -514,7 +515,8 @@ function selectPhysicalNodeFromPlan(
 					log('IN-list is entirely NULL literals on %s — using empty result', physicalIndexName);
 					return createEmptyResultNode(tableRef);
 				}
-				seekKeys = effectiveValues.map(v => literalFromValue(tableRef.scope, v));
+				const colType = columnScalarType(tableRef, colIdx);
+				seekKeys = effectiveValues.map(v => literalFromValue(tableRef.scope, v, colType));
 			}
 
 			const inConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekKeys.map((_sk, i) => ({
@@ -586,7 +588,7 @@ function selectPhysicalNodeFromPlan(
 				}
 
 				const seekKeys: ScalarPlanNode[] = effectiveTuples.flatMap(tuple =>
-					tuple.map(v => literalFromValue(tableRef.scope, v))
+					tuple.map((v, colPos) => literalFromValue(tableRef.scope, v, columnScalarType(tableRef, seekCols[colPos])))
 				);
 				const seekConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekKeys.map((_sk, i) => ({
 					constraint: { iColumn: seekCols[i % seekWidth], op: IndexConstraintOp.EQ, usable: true },
@@ -624,7 +626,7 @@ function selectPhysicalNodeFromPlan(
 					if (cv.exprs && cv.exprs[valueIdx]) {
 						return cv.exprs[valueIdx];
 					}
-					return literalFromValue(tableRef.scope, cv.values[valueIdx]);
+					return literalFromValue(tableRef.scope, cv.values[valueIdx], columnScalarType(tableRef, cv.colIdx));
 				})
 			);
 
@@ -664,7 +666,7 @@ function selectPhysicalNodeFromPlan(
 
 		// Standard equality seek on all seek columns
 		const seekKeys: ScalarPlanNode[] = seekCols.map(colIdx =>
-			equalitySeekKey(tableRef.scope, eqBySeekCol.get(colIdx)!)
+			equalitySeekKey(tableRef.scope, eqBySeekCol.get(colIdx)!, columnScalarType(tableRef, colIdx))
 		);
 
 		const eqConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekCols.map((colIdx, i) => ({
@@ -746,20 +748,21 @@ function selectPhysicalNodeFromPlan(
 
 			// Add prefix equality values
 			for (const { colIdx, constraint } of prefixConstraints) {
-				seekKeys.push(equalitySeekKey(tableRef.scope, constraint));
+				seekKeys.push(equalitySeekKey(tableRef.scope, constraint, columnScalarType(tableRef, colIdx)));
 				allConstraints.push({ constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true }, argvIndex: argv });
 				argv++;
 			}
 
 			// Add trailing range values
+			const trailingRangeType = columnScalarType(tableRef, trailingRangeCol);
 			if (lower) {
 				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
-				seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue));
+				seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue, trailingRangeType));
 				argv++;
 			}
 			if (upper) {
 				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
-				seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue));
+				seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue, trailingRangeType));
 				argv++;
 			}
 
@@ -825,14 +828,15 @@ function selectPhysicalNodeFromPlan(
 		const rangeConstraints: { constraint: IndexConstraint; argvIndex: number }[] = [];
 
 		let argv = 1;
+		const rangeColType = columnScalarType(tableRef, rangeCol);
 		if (lower) {
 			rangeConstraints.push({ constraint: { iColumn: rangeCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
-			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue));
+			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue, rangeColType));
 			argv++;
 		}
 		if (upper) {
 			rangeConstraints.push({ constraint: { iColumn: rangeCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
-			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue));
+			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue, rangeColType));
 			argv++;
 		}
 
@@ -889,19 +893,20 @@ function selectPhysicalNodeFromPlan(
 		const seekKeys: ScalarPlanNode[] = [];
 		const rangeOps: string[] = [];
 
+		const orRangeColType = columnScalarType(tableRef, orRangeConstraint.columnIndex);
 		for (const range of ranges) {
 			const parts: string[] = [];
 			if (range.lower) {
 				const opStr = range.lower.op === '>=' ? 'ge' : 'gt';
 				parts.push(opStr);
 				seekKeys.push(range.lower.valueExpr
-					?? literalFromValue(tableRef.scope, range.lower.value));
+					?? literalFromValue(tableRef.scope, range.lower.value, orRangeColType));
 			}
 			if (range.upper) {
 				const opStr = range.upper.op === '<=' ? 'le' : 'lt';
 				parts.push(opStr);
 				seekKeys.push(range.upper.valueExpr
-					?? literalFromValue(tableRef.scope, range.upper.value));
+					?? literalFromValue(tableRef.scope, range.upper.value, orRangeColType));
 			}
 			rangeOps.push(parts.join(':'));
 		}
@@ -1021,7 +1026,7 @@ function selectPhysicalNodeLegacy(
 		}
 
 		const seekKeys: ScalarPlanNode[] = pkCols.map(pk =>
-			equalitySeekKey(tableRef.scope, eqByCol.get(pk.index)!)
+			equalitySeekKey(tableRef.scope, eqByCol.get(pk.index)!, columnScalarType(tableRef, pk.index))
 		);
 
 		const eqConstraints: { constraint: IndexConstraint; argvIndex: number }[] = pkCols.map((pk, i) => ({
@@ -1083,14 +1088,15 @@ function selectPhysicalNodeLegacy(
 		const rangeConstraints: { constraint: IndexConstraint; argvIndex: number }[] = [];
 
 		let argv = 1;
+		const primaryFirstColType = columnScalarType(tableRef, primaryFirstCol);
 		if (lower) {
 			rangeConstraints.push({ constraint: { iColumn: primaryFirstCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
-			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue));
+			seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue, primaryFirstColType));
 			argv++;
 		}
 		if (upper) {
 			rangeConstraints.push({ constraint: { iColumn: primaryFirstCol, op: opToIndexOp(upper.op as RangeOp), usable: true }, argvIndex: argv });
-			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue));
+			seekKeys.push(upper.valueExpr && !Array.isArray(upper.valueExpr) ? upper.valueExpr : literalFromValue(tableRef.scope, upper.value as SqlValue, primaryFirstColType));
 			argv++;
 		}
 
@@ -1173,9 +1179,30 @@ function opToIndexOp(op: RangeOp): IndexConstraintOp {
 	}
 }
 
-function literalFromValue(scope: Scope, value: SqlValue): LiteralNode {
+/**
+ * Rebuild a seek-key literal from a constraint's plan-time value.
+ *
+ * `columnType` (the constrained column's declared {@link ScalarType}) is threaded in
+ * so the literal reports the column's logical type instead of one re-inferred from
+ * the raw JS value. Inference cannot tell a JSON document from any other native
+ * object, and before the JSON backstop in `LiteralNode.getType()` an object-valued
+ * seek key raised `Unknown literal type object` outright. Mirrors what
+ * `rule-sargable-range-rewrite.ts` does for its synthesized bounds.
+ *
+ * A NULL value keeps the inferred NULL_TYPE: the column's type would claim
+ * `nullable: false` for a value that is exactly null.
+ */
+function literalFromValue(scope: Scope, value: SqlValue, columnType?: ScalarType): LiteralNode {
 	const lit: AST.LiteralExpr = { type: 'literal', value };
-	return new LiteralNode(scope, lit);
+	const explicitType: ScalarType | undefined = value !== null && columnType
+		? { ...columnType, nullable: false, isReadOnly: true }
+		: undefined;
+	return new LiteralNode(scope, lit, explicitType);
+}
+
+/** Declared scalar type of a table column by index, for seek-key literal typing. */
+function columnScalarType(tableRef: TableReferenceNode, colIdx: number): ScalarType | undefined {
+	return tableRef.getType().columns[colIdx]?.type;
 }
 
 /**
@@ -1199,7 +1226,7 @@ function literalFromValue(scope: Scope, value: SqlValue): LiteralNode {
  * `Statement.validateParameterTypes` throws `StatusCode.MISMATCH` when such a
  * parameter is bound to an array/object value.
  */
-function equalitySeekKey(scope: Scope, c: PlannerPredicateConstraint): ScalarPlanNode {
+function equalitySeekKey(scope: Scope, c: PlannerPredicateConstraint, columnType?: ScalarType): ScalarPlanNode {
 	if (c.op === 'IN' && Array.isArray(c.valueExpr) && c.valueExpr.length === 1) {
 		return c.valueExpr[0];
 	}
@@ -1207,7 +1234,7 @@ function equalitySeekKey(scope: Scope, c: PlannerPredicateConstraint): ScalarPla
 	const val = c.op === 'IN' && Array.isArray(c.value)
 		? (c.value as unknown as SqlValue[])[0]
 		: (c.value as SqlValue);
-	return literalFromValue(scope, val);
+	return literalFromValue(scope, val, columnType);
 }
 
 /**

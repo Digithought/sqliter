@@ -368,13 +368,11 @@ alter table sem9b alter column v set data type json;
 insert into sem9b values (3, '{  "b":2  }');
 -- error: UNIQUE constraint failed
 
--- NOTE: a differently-spaced document is a duplicate to the INDEX but not to `=`, which
--- compares JSON columns as canonical text without canonicalizing the literal on the other
--- side (JSON carries a `compare` but no `groupKey`). That divergence is a property of the
--- JSON type itself, not of the retype — 9c shows a natively-declared column doing the same —
--- and is tracked in tickets/fix/bug-json-equality-not-structural.md.
+-- A differently-spaced document is one document to the INDEX and to `=` alike: the text
+-- operand is coerced to JSON at plan time, so equality compares structure. See
+-- 06.9.2-json-structural-equality.sqllogic for the full contract.
 select id from sem9b where v = '{ "a" : 1 }';
-→ []
+→ [{"id":1}]
 
 drop table sem9b;
 
@@ -388,6 +386,6 @@ insert into sem9c values (3, '{  "b":2  }');
 -- error: UNIQUE constraint failed
 
 select id from sem9c where v = '{ "a" : 1 }';
-→ []
+→ [{"id":1}]
 
 drop table sem9c;
