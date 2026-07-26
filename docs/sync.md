@@ -1229,6 +1229,13 @@ interface SchemaChangeEvent {
 }
 ```
 
+`oldRow` / `newRow` are positional, and the sync layer pairs value *i* with column *i* of the
+table's schema **as read at event time** (see `recordColumnVersions`). The engine guarantees
+that pairing: every event a commit delivers describes its rows in the schema current at
+delivery, even when the transaction ran `ALTER TABLE ADD/DROP COLUMN` (or a retype /
+`SET NOT NULL` backfill) *after* recording the write — the recorded events are rewritten to the
+post-ALTER shape before delivery, and `changedColumns` never names a dropped column.
+
 #### Sync Module Event Handling
 
 The SyncManager subscribes once to the engine transaction boundary and records the

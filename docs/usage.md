@@ -347,6 +347,14 @@ The `DatabaseDataChangeEvent` interface:
 | `changedColumns` | `string[]` | Column names that changed (for updates) |
 | `remote` | `boolean` | `true` if the change originated from a sync/remote source |
 
+`oldRow` / `newRow` are **positional**: pair value *i* with column *i* of the table's schema.
+The engine guarantees that pairing is safe **at delivery time**: every event a commit delivers
+describes its rows in the schema current at delivery — even when the transaction changed the
+table's columns (`ALTER TABLE ADD/DROP COLUMN`, `ALTER COLUMN … SET DATA TYPE` / `SET NOT NULL`)
+*after* recording the write. Events recorded before such an ALTER are rewritten to the
+post-ALTER shape before the commit delivers them, and `changedColumns` only ever names columns
+that exist in that schema.
+
 ### Subscribing to Schema Changes
 
 ```typescript

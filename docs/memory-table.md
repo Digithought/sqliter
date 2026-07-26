@@ -363,6 +363,43 @@ non-transactional — see the declared-contract paragraph above); what the resha
 that the transaction's DML — including rows inserted before a savepoint — survives at the new
 arity.
 
+**The pending-change *event log* is rewritten alongside the rows.** When change tracking is on
+(the module was given an emitter and a listener exists), each open layer also holds the
+`PendingChange` log its commit will emit; a mid-transaction column-set or value change must
+rewrite those recorded `oldRow`/`newRow` images too, or the events delivered at commit describe
+rows in the pre-ALTER shape (value *i* filed under the wrong column *i*). The delivered contract
+is: *every event's row images match the schema current at delivery.* So
+`prepareReshapedColumns` reshapes the log alongside the net own-writes (installed by
+`installReshapedColumns`), and `convertColumn` converts the value at the altered column in every
+image. Two deliberate asymmetries with the row rewrite beside it:
+
+*   **The log is never deduplicated.** The row rewrite collapses own-writes to one entry per
+    key; the event log keeps every recorded write as a separate event, because that is what the
+    listener is owed.
+*   **The log rewrite is best-effort; the row rewrite is not.** The log holds *historical*
+    images — including superseded intermediate ones the net-effect row rewrite never touches —
+    and an ADD COLUMN backfill evaluator or a retype conversion can legitimately fail on such an
+    image while succeeding on every live row. A row-rewrite failure must reject the ALTER; an
+    event-image failure must not. ADD COLUMN falls back to `NULL` in the new slot; a retype
+    keeps the raw value.
+
+For ADD COLUMN, the pre-image (`oldRow`) gets the **same** map as the post-image: the literal
+default, or the backfill evaluator applied to the pre-image itself (the evaluator is a function
+of a row, and the pre-image is a row), falling back to `NULL`. Reusing the post-image's result
+for the pre-image was rejected — it makes `oldRow[new] === newRow[new]` always, so a diffing
+consumer (e.g. the sync engine's per-column versioning) would never record the added column —
+as was suppressing the pre-image, which silently turns updates into upserts.
+`rekeyPrimaryKey` (`SET COLLATE` on a PK column) deliberately leaves the log alone: a collation
+change moves only the comparator, never a stored value or key value, so the recorded images are
+still accurate. Consolidation (`consolidateToBaseLayer`) clears the drained committed layers'
+logs — their events were delivered when those layers committed, and leaving them in place would
+re-deliver them at the transaction's commit once the base becomes the collection boundary.
+
+(The same delivered contract is enforced for the module's *other* two event producers — the
+engine's auto-events and the store module's coordinator queue — by
+`DatabaseEventEmitter.remapBatchedDataEvents`, which the engine's ALTER arms call; see
+`docs/module-authoring.md`.)
+
 **`RENAME COLUMN` adopts the renamed schema on the open layers.** A rename changes neither the
 column set nor the key bytes, so it needs `adoptSchema` rather than the reshape pair — but it needs
 it just as much. `renameColumn` rebuilds every `IndexSchema` object (each carries the column's

@@ -1199,6 +1199,29 @@ Quereus provides a unified event system at the database level that aggregates ev
 4. **Transaction Batching**: Events are batched during transactions and only delivered after successful commit; on rollback, events are discarded
 5. **Savepoint Support**: Events respect savepoint semantics - `ROLLBACK TO SAVEPOINT` discards events from that savepoint forward, while `RELEASE SAVEPOINT` merges them into the parent transaction
 
+### Row-Shape Contract Across Mid-Transaction ALTER
+
+`oldRow` / `newRow` are positional — a consumer pairs value *i* with column *i* of the table's
+schema. The delivered contract is: **every event's row images match the schema current at
+delivery**, even when the transaction changed the table's column set (`ALTER TABLE ADD/DROP
+COLUMN`) or column values (`SET DATA TYPE`, `SET NOT NULL` backfill) *after* the write was
+recorded. `changedColumns` never names a column that no longer exists.
+
+Who upholds it depends on where the not-yet-delivered event sits at ALTER time:
+
+- Events already inside the engine's transaction batch — the auto-event path, and any module
+  that flushes its queue into the engine during the ALTER (the store module's coordinator
+  commit does) — are rewritten by the engine itself: the ALTER arms call
+  `DatabaseEventEmitter.remapBatchedDataEvents` after the module's `alterTable` returns.
+- Events a module still holds in its **own** queue across the ALTER and emits only at commit
+  are the **module's responsibility**: a third-party module that queues events per-transaction
+  must rewrite their row images inside its `alterTable` (the memory module reshapes its
+  per-layer pending-change log this way — see `docs/memory-table.md` § DDL and transactions).
+  The rewrite should be best-effort per image (an unconvertible historical image keeps its raw
+  value; an ADD COLUMN image that defeats the backfill gets `NULL` in the new slot) — never
+  fail the ALTER over an event image — and must not deduplicate the log: every recorded write
+  is a separately delivered event.
+
 ### Event Types
 
 **Data Change Events** (`DatabaseDataChangeEvent`):

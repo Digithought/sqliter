@@ -19,6 +19,7 @@ import type { Database } from '../../core/database.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
+import { validateAndParse } from '../../types/validation.js';
 import {
 	snapshotStaleMaterializedViews,
 	propagateTableRenameToMaterializedViews,
@@ -374,6 +375,10 @@ async function runAddColumn(
 	// and, when it does not fold to a literal, compiled into `backfill` — the default
 	// evaluated against the existing row, so `new.<column>` reads that row's sibling.
 	const defaultConstraint = columnDef.constraints?.find(c => c.type === 'default');
+	// Folded literal default; undefined when there is no default or it does not fold
+	// (the latter carries `backfill` instead). Used by the NOT NULL gate below and by
+	// the batched-event remap's backfill value.
+	const foldedDefault = defaultConstraint?.expr ? tryFoldLiteral(defaultConstraint.expr) : undefined;
 
 	// Call module.alterTable for data + schema update
 	const module = requireVtabModule(tableSchema);
@@ -398,8 +403,7 @@ async function runAddColumn(
 	const delegatesBackfill = module.getCapabilities?.().delegatesNotNullBackfill === true;
 	const hasNotNull = columnDef.constraints?.some(c => c.type === 'notNull') ?? false;
 	if (hasNotNull && !delegatesBackfill && !backfill) {
-		const folded = defaultConstraint?.expr ? tryFoldLiteral(defaultConstraint.expr) : undefined;
-		const defaultIsNullish = !defaultConstraint?.expr || folded === null;
+		const defaultIsNullish = !defaultConstraint?.expr || foldedDefault === null;
 		if (defaultIsNullish) {
 			await validateNotNullBackfill(rctx, tableSchema, columnDef.name);
 		}
@@ -455,12 +459,55 @@ async function runAddColumn(
 	// scan below re-reads the table — so the backfill's context does not shadow the
 	// scan's own row context.
 	let updatedTableSchema: TableSchema;
+	// Slot the module actually placed the new column at (the module API permits
+	// `insertAtIndex`; SQL always appends). Recorded so the revert paths below can apply
+	// the inverse event remap.
+	let addedColIndex: number | undefined;
 	try {
 		updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
 			type: 'addColumn',
 			columnDef,
 			backfillEvaluator,
 		});
+
+		// Events this transaction already batched for the table still describe the
+		// pre-ADD column set; insert the backfilled value at the new slot so a listener
+		// at commit pairs value i with column i of the schema current at delivery.
+		// Covers the engine auto-event path and the store module (which flushed its
+		// queued events into the batch during the ALTER); the memory module's own
+		// pending-change log is reshaped inside its alterTable. Must run INSIDE this
+		// try: the backfill evaluator closes over rowSlot/checkSlot, which the finally
+		// below closes the moment the module returns.
+		addedColIndex = updatedTableSchema.columnIndexMap.get(columnDef.name.toLowerCase());
+		if (addedColIndex !== undefined) {
+			const insertAt = addedColIndex;
+			await rctx.db._getEventEmitter().remapBatchedDataEvents(
+				tableSchema.schemaName, tableSchema.name,
+				async (row) => {
+					// oldRow gets the SAME map as newRow: the literal default, or the backfill
+					// evaluator applied to the pre-image itself (the evaluator is a function of
+					// a row, and the pre-image is a row), falling back to NULL — the honest
+					// "column did not exist yet" placeholder, which errs toward REPORTING a
+					// change on the new column rather than suppressing one. Rejected: reusing
+					// the newRow result for oldRow (makes oldRow[new] === newRow[new] always,
+					// so a diffing consumer never syncs the added column); suppressing the
+					// pre-ALTER oldRow (silently turns updates into upserts).
+					let value: SqlValue = foldedDefault ?? null;
+					if (backfillEvaluator) {
+						try {
+							value = await backfillEvaluator(row);
+						} catch {
+							// Best-effort: a historical image may fail the evaluator (or its
+							// CHECKs) where every live row backfilled cleanly. Never abort
+							// the ALTER for an event image.
+							value = null;
+						}
+					}
+					return [...row.slice(0, insertAt), value, ...row.slice(insertAt)] as Row;
+				},
+				updatedTableSchema.columns.map(c => c.name),
+			);
+		}
 	} finally {
 		rowSlot?.close();
 		checkSlot?.close();
@@ -496,6 +543,7 @@ async function runAddColumn(
 					type: 'dropColumn',
 					columnName: columnDef.name,
 				});
+				await remapEventsForRevertedAddColumn(rctx, tableSchema, addedColIndex);
 			} catch (revertErr) {
 				log('Failed to revert ADD COLUMN after inline UNIQUE violation: %s', (revertErr as Error).message);
 			}
@@ -605,6 +653,7 @@ async function runAddColumn(
 					type: 'dropColumn',
 					columnName: columnDef.name,
 				});
+				await remapEventsForRevertedAddColumn(rctx, tableSchema, addedColIndex);
 			} catch (revertErr) {
 				log('Failed to revert ADD COLUMN after constraint violation: %s', (revertErr as Error).message);
 			}
@@ -630,6 +679,26 @@ async function runAddColumn(
 
 	log('Added column %s to table %s.%s', columnDef.name, tableSchema.schemaName, tableSchema.name);
 	return null;
+}
+
+/**
+ * Inverse of {@link runAddColumn}'s batched-event remap, for its revert paths: the
+ * just-added column has been dropped from the module again, so the batched events must
+ * drop the slot too or they keep describing a column the table no longer has. No-op when
+ * the forward remap never ran (`addedColIndex` undefined). Best-effort like the forward
+ * remap — never masks the original constraint error.
+ */
+async function remapEventsForRevertedAddColumn(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	addedColIndex: number | undefined,
+): Promise<void> {
+	if (addedColIndex === undefined) return;
+	await rctx.db._getEventEmitter().remapBatchedDataEvents(
+		tableSchema.schemaName, tableSchema.name,
+		(row) => row.filter((_, i) => i !== addedColIndex),
+		tableSchema.columns.map(c => c.name),
+	);
 }
 
 /**
@@ -793,6 +862,18 @@ async function runDropColumn(
 		type: 'dropColumn',
 		columnName,
 	});
+
+	// Events this transaction already batched for the table still carry the pre-drop
+	// arity; drop the slot so a listener at commit pairs value i with column i of the
+	// schema current at delivery (and `changedColumns` never names the dropped column).
+	// Pure slot filter — no failure mode. Covers the engine auto-event path and the
+	// store module (which flushed its queued events into the batch during the ALTER);
+	// the memory module's own pending-change log is reshaped inside its alterTable.
+	await rctx.db._getEventEmitter().remapBatchedDataEvents(
+		tableSchema.schemaName, tableSchema.name,
+		(row) => row.filter((_, i) => i !== colIndex),
+		updatedTableSchema.columns.map(c => c.name),
+	);
 
 	// Recompute the generated-column dependency graph against the post-drop
 	// column array — old indices in the previous map are invalid.
@@ -1030,6 +1111,23 @@ async function runAlterColumn(
 		setCollation: action.setCollation,
 	});
 
+	// Events this transaction already batched still carry the PRE-conversion value at
+	// the altered column (`SET DATA TYPE`'s normalization, `SET NOT NULL`'s null →
+	// DEFAULT backfill); rewrite it so a listener at commit sees the value the
+	// committed row holds. The conversion is engine-derivable (the same
+	// `validateAndParse` the memory module's converter wraps), so no module-contract
+	// change. `SET COLLATE` / `SET DEFAULT` / `DROP NOT NULL` move no stored value and
+	// need no remap — in particular the primary-key `SET COLLATE` re-key leaves every
+	// event's key and row images valid as-is.
+	const eventValueRemap = alterColumnEventValueRemap(tableSchema, colIndex, action);
+	if (eventValueRemap) {
+		await rctx.db._getEventEmitter().remapBatchedDataEvents(
+			tableSchema.schemaName, tableSchema.name,
+			(row) => row.map((v, i) => i === colIndex ? eventValueRemap(v) : v) as Row,
+			updatedTableSchema.columns.map(c => c.name),
+		);
+	}
+
 	schema.addTable(updatedTableSchema);
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
@@ -1042,6 +1140,45 @@ async function runAlterColumn(
 
 	log('Altered column %s.%s.%s', tableSchema.schemaName, tableSchema.name, action.columnName);
 	return null;
+}
+
+/**
+ * The per-value map {@link runAlterColumn}'s batched-event remap applies at the altered
+ * column, or undefined when the ALTER moves no stored value (SET COLLATE, SET DEFAULT,
+ * DROP NOT NULL, an alias retype). The returned function is TOTAL — an unconvertible
+ * historical event image keeps its raw value rather than aborting the ALTER; the module
+ * already validated every value the transaction can actually SEE, so a failure here is
+ * confined to a superseded intermediate image.
+ */
+function alterColumnEventValueRemap(
+	tableSchema: TableSchema,
+	colIndex: number,
+	action: Extract<import('../../planner/nodes/alter-table-node.js').AlterTableAction, { type: 'alterColumn' }>,
+): ((v: SqlValue) => SqlValue) | undefined {
+	if (action.setDataType !== undefined) {
+		const newLogicalType = inferType(action.setDataType);
+		// Alias retype (`varchar(50)` IS TEXT): schema-only, values untouched.
+		if (newLogicalType === tableSchema.columns[colIndex].logicalType) return undefined;
+		const columnName = tableSchema.columns[colIndex].name;
+		return (v) => {
+			if (v === null) return v; // retype leaves NULLs untouched, matching the module's conversion
+			try {
+				return validateAndParse(v, newLogicalType, columnName) as SqlValue;
+			} catch {
+				return v;
+			}
+		};
+	}
+	if (action.setNotNull === true) {
+		// SET NOT NULL backfill: null → the folded literal DEFAULT, the same map the
+		// module applies. No usable literal default means the module either found no
+		// NULLs (nothing to remap) or rejected the ALTER before reaching here.
+		const defaultExpr = tableSchema.columns[colIndex].defaultValue;
+		const folded = defaultExpr ? tryFoldLiteral(defaultExpr) : undefined;
+		if (folded === undefined || folded === null) return undefined;
+		return (v) => (v === null ? folded : v);
+	}
+	return undefined;
 }
 
 /**

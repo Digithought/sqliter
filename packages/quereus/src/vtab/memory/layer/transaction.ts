@@ -19,7 +19,7 @@ let transactionLayerCounter = 1000;
 /**
  * Pending change for event emission.
  */
-interface PendingChange {
+export interface PendingChange {
 	type: 'insert' | 'update' | 'delete';
 	pk: BTreeKeyForPrimary;
 	oldRow?: Row;
@@ -51,6 +51,13 @@ export interface PreparedColumnReshape {
 	survivingDeletions: BTreeKeyForPrimary[];
 	/** This layer's net effective rows, rewritten to the new column set. */
 	upserts: Row[];
+	/**
+	 * The layer's {@link PendingChange} event log with every row image rewritten to the
+	 * new column set, or null when change tracking is disabled. Unlike the own-write
+	 * collapse above, the log is NOT deduplicated — every recorded write stays a
+	 * separate event, because that is the delivered contract.
+	 */
+	reshapedPendingChanges: PendingChange[] | null;
 }
 
 /**
@@ -286,6 +293,10 @@ export class TransactionLayer implements Layer {
 	 * is the row it removed.
 	 */
 	public rekeyPrimaryKey(newSchema: TableSchema): void {
+		// The pending-change EVENT log is deliberately NOT rewritten here: a collation
+		// change moves only the comparator — every stored value and every key value is
+		// untouched — so the recorded `pk`/`oldRow`/`newRow` images stay accurate as-is.
+		// (Contrast convertColumn / installReshapedColumns, which do rewrite the log.)
 		const preRekeyTree = this.primaryModifications;
 		const preRekeyEncode = this.pkFunctions.encode;
 
@@ -440,6 +451,26 @@ export class TransactionLayer implements Layer {
 		}
 
 		this.installNetOwnWrites(survivingDeletions, upserts);
+
+		// Rewrite the pending-change EVENT log's images too, so the events emitted at this
+		// table's commit carry the post-conversion values the committed rows hold. Best-effort,
+		// per image: the log holds historical images (including superseded intermediate ones the
+		// net rewrite above never touches), so an unconvertible value keeps its raw form rather
+		// than failing the ALTER. One entry per recorded write is kept — no dedup, unlike the
+		// own-write collapse — because every recorded write is a separately delivered event.
+		if (this.pendingChanges) {
+			this.pendingChanges = this.pendingChanges.map(change => {
+				const remapImage = (row: Row | undefined): Row | undefined => {
+					if (!row) return row;
+					try {
+						return convertRowAtIndex(row, colIndex, convert, convertNulls);
+					} catch {
+						return row;
+					}
+				};
+				return { ...change, oldRow: remapImage(change.oldRow), newRow: remapImage(change.newRow) };
+			});
+		}
 	}
 
 	/**
@@ -464,7 +495,10 @@ export class TransactionLayer implements Layer {
 	 * dropping a PK column is rejected upstream), so a key is either finally-deleted or
 	 * finally-upserted, never both, and no key can collapse onto another.
 	 */
-	public async prepareReshapedColumns(reshapeRow: (row: Row) => Row | Promise<Row>): Promise<PreparedColumnReshape> {
+	public async prepareReshapedColumns(
+		reshapeRow: (row: Row) => Row | Promise<Row>,
+		reshapeEventRow: (row: Row) => Row | Promise<Row>,
+	): Promise<PreparedColumnReshape> {
 		const seen = new Set<string>();
 		const survivingDeletions: BTreeKeyForPrimary[] = [];
 		const upserts: Row[] = [];
@@ -482,7 +516,33 @@ export class TransactionLayer implements Layer {
 			}
 			upserts.push(await reshapeRow(effectiveRow));
 		}
-		return { survivingDeletions, upserts };
+
+		// Reshape the pending-change EVENT log alongside — through `reshapeEventRow`, the
+		// BEST-EFFORT variant of `reshapeRow`, deliberately the opposite posture: `reshapeRow`
+		// rewrites the layer's net effective rows and its failure MUST reject the ALTER, while
+		// the log holds historical images (including superseded intermediate ones the net
+		// rewrite never touches) that a backfill evaluator can legitimately fail on. The
+		// caller supplies a `reshapeEventRow` that falls back rather than throws (ADD COLUMN
+		// fills NULL when the evaluator fails); a throw that still escapes leaves that image
+		// at the old arity (logged) and never rejects the ALTER. One entry per recorded write
+		// is kept — no dedup, unlike the own-write collapse above — because every recorded
+		// write is a separately delivered event.
+		let reshapedPendingChanges: PendingChange[] | null = null;
+		if (this.pendingChanges) {
+			reshapedPendingChanges = [];
+			for (const change of this.pendingChanges) {
+				const next: PendingChange = { ...change };
+				try {
+					if (change.oldRow) next.oldRow = await reshapeEventRow(change.oldRow);
+					if (change.newRow) next.newRow = await reshapeEventRow(change.newRow);
+				} catch (e) {
+					warnLog('Pending-change reshape failed on %s; leaving image at the old arity: %O',
+						this.tableSchemaAtCreation.name, e);
+				}
+				reshapedPendingChanges.push(next);
+			}
+		}
+		return { survivingDeletions, upserts, reshapedPendingChanges };
 	}
 
 	/**
@@ -513,6 +573,12 @@ export class TransactionLayer implements Layer {
 		this.pkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
 
 		this.installNetOwnWrites(prepared.survivingDeletions, prepared.upserts);
+		// Install the reshaped event log the prepare phase computed (null ⇔ tracking
+		// disabled), so the events emitted at this table's commit describe rows in the
+		// post-ALTER column set.
+		if (prepared.reshapedPendingChanges !== null) {
+			this.pendingChanges = prepared.reshapedPendingChanges;
+		}
 	}
 
 	/**
@@ -594,6 +660,19 @@ export class TransactionLayer implements Layer {
 	 */
 	getPendingChanges(): readonly PendingChange[] {
 		return this.pendingChanges ?? [];
+	}
+
+	/**
+	 * Drops the pending-change event log (tracking stays enabled). Called when this
+	 * layer's content is drained into the base by ALTER's consolidation
+	 * (`MemoryTableManager.consolidateToBaseLayer`): its events were already delivered
+	 * when the layer originally committed, but the layer can remain in the DDL
+	 * connection's open-transaction parent chain — and once the base becomes the
+	 * committed head, the commit-time collection (`collectPendingChanges`) walks that
+	 * chain all the way down to the base and would re-deliver them.
+	 */
+	clearPendingChanges(): void {
+		if (this.pendingChanges) this.pendingChanges = [];
 	}
 
 	/** This layer's own structural writes, oldest-first — the rebase replay source. */

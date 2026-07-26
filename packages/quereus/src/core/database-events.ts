@@ -182,6 +182,19 @@ interface PendingSchemaEvent {
 const DEFAULT_MAX_LISTENERS = 100;
 
 /**
+ * Names of the columns whose values differ between two same-arity row images —
+ * the `changedColumns` recomputation for a remapped update event. Same strict
+ * (`!==`) comparison the memory module's `computeChangedColumns` uses.
+ */
+function computeChangedColumnNames(oldRow: Row, newRow: Row, columnNames: readonly string[]): string[] {
+	const changed: string[] = [];
+	for (let i = 0; i < columnNames.length; i++) {
+		if (oldRow[i] !== newRow[i]) changed.push(columnNames[i]);
+	}
+	return changed;
+}
+
+/**
  * Central event emitter for database-level reactivity.
  *
  * Aggregates events from all virtual table modules and broadcasts them to
@@ -740,6 +753,72 @@ export class DatabaseEventEmitter {
 			} catch (e) {
 				errorLog('Transaction-commit listener error: %O', e);
 			}
+		}
+	}
+
+	/**
+	 * Rewrite the row images of every BATCHED data event for one table, in place, after a
+	 * mid-transaction column-set or column-value change (`ALTER TABLE ADD/DROP COLUMN`,
+	 * `ALTER COLUMN … SET DATA TYPE` / `SET NOT NULL` backfill). Covers
+	 * {@link batchedDataEvents} and every {@link dataEventLayers} savepoint layer, so a
+	 * commit delivers each event's `oldRow`/`newRow` in the schema current at delivery.
+	 * No-op when not batching: in autocommit the earlier events were already delivered,
+	 * and there is no earlier same-transaction write to fix.
+	 *
+	 * `changedColumns` is recomputed from the remapped pair against `newColumnNames`
+	 * (so it can never name a dropped column, and can name an added one); when only one
+	 * row image is present it is instead filtered to names that still exist.
+	 *
+	 * BEST-EFFORT, unlike the module-side pending-ROW reshape (whose failure must reject
+	 * the ALTER): these are historical row images, including superseded intermediate ones
+	 * a backfill evaluator or value conversion can legitimately fail on. A `remapRow`
+	 * throw leaves that event's image as it was (logged), and never rejects an ALTER
+	 * that would otherwise succeed.
+	 */
+	async remapBatchedDataEvents(
+		schemaName: string,
+		tableName: string,
+		remapRow: (row: Row, which: 'old' | 'new') => Row | Promise<Row>,
+		newColumnNames: readonly string[],
+	): Promise<void> {
+		if (!this.isBatching) return;
+
+		const schemaLower = schemaName.toLowerCase();
+		const tableLower = tableName.toLowerCase();
+		const stores = [this.batchedDataEvents, ...this.dataEventLayers];
+		let remapped = 0;
+		for (const store of stores) {
+			for (const entry of store) {
+				const event = entry.event;
+				if (event.schemaName.toLowerCase() !== schemaLower
+					|| event.tableName.toLowerCase() !== tableLower) {
+					continue;
+				}
+				const next: VTableDataChangeEvent = { ...event };
+				try {
+					if (event.oldRow !== undefined) next.oldRow = await remapRow(event.oldRow, 'old');
+				} catch (e) {
+					warnLog('remapBatchedDataEvents: oldRow remap failed on %s.%s, leaving image as-is: %O',
+						event.schemaName, event.tableName, e);
+				}
+				try {
+					if (event.newRow !== undefined) next.newRow = await remapRow(event.newRow, 'new');
+				} catch (e) {
+					warnLog('remapBatchedDataEvents: newRow remap failed on %s.%s, leaving image as-is: %O',
+						event.schemaName, event.tableName, e);
+				}
+				if (event.type === 'update' && next.oldRow && next.newRow) {
+					next.changedColumns = computeChangedColumnNames(next.oldRow, next.newRow, newColumnNames);
+				} else if (next.changedColumns) {
+					const valid = new Set(newColumnNames.map(n => n.toLowerCase()));
+					next.changedColumns = next.changedColumns.filter(n => valid.has(n.toLowerCase()));
+				}
+				entry.event = next;
+				remapped++;
+			}
+		}
+		if (remapped > 0) {
+			log('Remapped %d batched data events on %s.%s after mid-transaction ALTER', remapped, schemaName, tableName);
 		}
 	}
 

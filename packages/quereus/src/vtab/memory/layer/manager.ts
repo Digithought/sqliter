@@ -1920,16 +1920,34 @@ export class MemoryTableManager {
 			// by querying the DDL connection's EFFECTIVE rows — pending ones included — so the
 			// only violation that reaches here is a per-row evaluator yielding NULL. Kept
 			// ungated so the module enforces its own invariant instead of relying on that gate.
-			const reshapePlans = await this.prepareReshapeOnOpenLayers(async (row: Row): Promise<Row> => {
-				const value = backfillEvaluator ? await backfillEvaluator(row) : defaultValue;
-				if (newColumnSchema.notNull && value === null) {
-					throw new QuereusError(
-						`NOT NULL constraint failed: adding column '${this._tableName}.${newColumnSchema.name}' would leave NULL in a row pending in the open transaction`,
-						StatusCode.CONSTRAINT,
-					);
-				}
-				return insertValueAt(row, targetIndex, value) as Row;
-			});
+			const reshapePlans = await this.prepareReshapeOnOpenLayers(
+				async (row: Row): Promise<Row> => {
+					const value = backfillEvaluator ? await backfillEvaluator(row) : defaultValue;
+					if (newColumnSchema.notNull && value === null) {
+						throw new QuereusError(
+							`NOT NULL constraint failed: adding column '${this._tableName}.${newColumnSchema.name}' would leave NULL in a row pending in the open transaction`,
+							StatusCode.CONSTRAINT,
+						);
+					}
+					return insertValueAt(row, targetIndex, value) as Row;
+				},
+				// Event-log variant: same map applied to the log's historical images (oldRow
+				// included — the evaluator is a function of a row and the pre-image is a row),
+				// but BEST-EFFORT: an image the evaluator (or its CHECKs) rejects gets NULL —
+				// the honest "column did not exist yet" placeholder — and the NOT NULL throw
+				// above is omitted, so no historical image can abort the ALTER.
+				async (row: Row): Promise<Row> => {
+					let value = defaultValue;
+					if (backfillEvaluator) {
+						try {
+							value = await backfillEvaluator(row);
+						} catch {
+							value = null;
+						}
+					}
+					return insertValueAt(row, targetIndex, value) as Row;
+				},
+			);
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
 			// its own value via the engine-supplied evaluator; a literal/NULL default
@@ -2048,9 +2066,10 @@ export class MemoryTableManager {
 
 			// Phase 1 of reaching the open transaction's own pending rows. The rewrite here is
 			// a pure filter and cannot throw — the split exists for ADD COLUMN's fallible
-			// backfill — but running it before any mutation keeps the two paths uniform.
-			const reshapePlans = await this.prepareReshapeOnOpenLayers((row: Row): Row =>
-				row.filter((_, idx) => idx !== colIndex) as Row);
+			// backfill — but running it before any mutation keeps the two paths uniform. The
+			// same filter reshapes the pending-change event log (second arg).
+			const dropSlot = (row: Row): Row => row.filter((_, idx) => idx !== colIndex) as Row;
+			const reshapePlans = await this.prepareReshapeOnOpenLayers(dropSlot, dropSlot);
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			await this.baseLayer.dropColumnFromBase(colIndex);
 			this.tableSchema = finalNewTableSchema;
@@ -3553,10 +3572,11 @@ export class MemoryTableManager {
 	 */
 	private async prepareReshapeOnOpenLayers(
 		reshapeRow: (row: Row) => Row | Promise<Row>,
+		reshapeEventRow: (row: Row) => Row | Promise<Row>,
 	): Promise<Array<{ layer: TransactionLayer; prepared: PreparedColumnReshape }>> {
 		const plans: Array<{ layer: TransactionLayer; prepared: PreparedColumnReshape }> = [];
 		for (const layer of this.openTransactionLayersOldestFirst()) {
-			plans.push({ layer, prepared: await layer.prepareReshapedColumns(reshapeRow) });
+			plans.push({ layer, prepared: await layer.prepareReshapedColumns(reshapeRow, reshapeEventRow) });
 		}
 		return plans;
 	}
@@ -3628,6 +3648,17 @@ export class MemoryTableManager {
 
 				// Copy all data from the transaction layer to the base layer
 				await this.copyTransactionDataToBase(transactionLayer);
+
+				// The drained chain's pending-change event logs were already delivered when
+				// each layer committed, but the layers can remain in the DDL connection's own
+				// open-transaction parent chain. Once the base becomes the committed head, the
+				// commit-time collection (`collectPendingChanges`) walks that chain down to
+				// the base and would re-deliver them — clear the logs so consolidation is
+				// event-neutral. (Savepoint snapshots of the OPEN transaction sit above the
+				// committed head, not in this chain, so their un-emitted events are kept.)
+				for (let cur: Layer | null = transactionLayer; cur && cur !== this.baseLayer; cur = cur.getParent()) {
+					if (cur instanceof TransactionLayer) cur.clearPendingChanges();
+				}
 
 				// Force all connections to read from the base layer
 				for (const conn of this.connections.values()) {
