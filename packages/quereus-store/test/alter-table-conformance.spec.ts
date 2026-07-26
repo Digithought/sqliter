@@ -361,6 +361,22 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
+		// Guard is engine-side (`runAlterColumn` in runtime/emit/alter-table.ts refuses this
+		// before `module.alterTable` is ever dispatched), same shape as the collation-less-type
+		// arm above — the store never sees the call. A direct module call is guarded separately
+		// (`StoreModule.alterColumnSetDataType`, see the store's own `pk-retype-reject.spec.ts`),
+		// but that path has no SQL surface to exercise here.
+		label: 'alterColumn SET DATA TYPE on a PRIMARY KEY column → CONSTRAINT',
+		seed: [`create table t (id text primary key, v text) using store`, `insert into t values ('1', 'a')`],
+		alter: `alter table t alter column id set data type integer`,
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /primary key/i },
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'id');
+			expect(String(info?.type).toLowerCase(), 'type unchanged after PK retype reject').to.contain('text');
+			expect((await rows(db, `select id from t`)).map(x => x.id), 'value untouched').to.deep.equal(['1']);
+		},
+	},
+	{
 		label: 'alterColumn SET DEFAULT',
 		seed: [`create table t (id integer primary key, v integer null) using store`, `insert into t values (1, 5)`],
 		alter: `alter table t alter column v set default 99`,

@@ -460,6 +460,24 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
+		// Guard is engine-side (`runAlterColumn` in runtime/emit/alter-table.ts refuses this
+		// before `module.alterTable` is ever dispatched — see docs/module-authoring.md), same
+		// shape as the collation-less-type arm above. `stubUnsupported: false`: the stub leg
+		// (no `alterTable`) sees this same engine-side CONSTRAINT, not the sited UNSUPPORTED
+		// that leg otherwise asserts for arms with no engine-side fallback.
+		label: 'alterColumn SET DATA TYPE on a PRIMARY KEY column → CONSTRAINT',
+		seed: u => [`create table t (id text primary key, v text)${u}`, `insert into t values ('1', 'a')`],
+		alter: `alter table t alter column id set data type integer`,
+		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /primary key/i },
+		stubUnsupported: false,
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'id');
+			expect(String(info?.type).toLowerCase(), 'type unchanged after PK retype reject').to.contain('text');
+			const r = await rows(db, `select id from t`);
+			expect(r.map(x => x.id), 'value untouched').to.deep.equal(['1']);
+		},
+	},
+	{
 		label: 'alterColumn SET DEFAULT',
 		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, 5)`],
 		alter: `alter table t alter column v set default 99`,

@@ -2136,7 +2136,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		if (change.setNotNull !== undefined) {
 			attr = await this.alterColumnSetNotNull(table, oldSchema, oldCol, colIndex, change, rows);
 		} else if (change.setDataType !== undefined) {
-			attr = await this.alterColumnSetDataType(table, oldCol, colIndex, change);
+			attr = await this.alterColumnSetDataType(table, oldSchema, oldCol, colIndex, change);
 		} else if (change.setDefault !== undefined) {
 			attr = { newCol: { ...oldCol, defaultValue: change.setDefault }, collationChanged: false };
 		} else if (change.setCollation !== undefined) {
@@ -2271,13 +2271,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// NOTE: `valueConvert` and `pkRekeyNeeded` cannot both be set today, and this ordering
 		// depends on that. `valueConvert` comes only from SET DATA TYPE or SET NOT NULL;
 		// SET NOT NULL changes neither collation nor logical type, so it never sets
-		// `pkRekeyNeeded`, and SET DATA TYPE on a PK member is refused upstream by every
-		// caller (the engine's ALTER COLUMN emitter — see `runAlterColumn` in
-		// runtime/emit/alter-table.ts — and the materialized-view reshape, which declares a
-		// key-column retype inexpressible). If a PK-member retype is ever admitted, this
-		// rewrite must move IN FRONT of the `pkRekeyNeeded` block: otherwise `rekeyRows` and
-		// its index rebuild encode the PRE-rewrite values and the rebuild below is skipped,
-		// leaving keys and indexes disagreeing with the stored values.
+		// `pkRekeyNeeded`, and SET DATA TYPE on a PK member is refused both upstream (every live
+		// caller — the engine's ALTER COLUMN emitter, see `runAlterColumn` in
+		// runtime/emit/alter-table.ts, and the materialized-view reshape, which declares a
+		// key-column retype inexpressible) AND locally, by `alterColumnSetDataType` itself. If a
+		// PK-member retype is ever admitted (that local guard removed), this rewrite must move IN
+		// FRONT of the `pkRekeyNeeded` block: otherwise `rekeyRows` and its index rebuild encode
+		// the PRE-rewrite values and the rebuild below is skipped, leaving keys and indexes
+		// disagreeing with the stored values.
 		if (valueConvert) {
 			await this.ddlCommitPendingOps();
 			await table.mapRowsAtIndex(colIndex, valueConvert);
@@ -2404,9 +2405,21 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * rejects values the new type refuses and rewrites the rest to the new type's
 	 * canonical spelling ('2024-06-05T00:00:00Z' → '2024-06-05') — exactly as an INSERT
 	 * would have stored them.
+	 *
+	 * A retype of a PRIMARY KEY member is refused here rather than converted: the rewrite
+	 * below is `mapRowsAtIndex`, a payload-only rewrite that reuses `entry.key` verbatim, so
+	 * a PK column's physical key bytes would stay encoded under the OLD type while the value
+	 * moves to the new one — unfindable by any lookup under the new encoding, and the same
+	 * `keyTransformChanged` path in the caller would re-key from the pre-rewrite values before
+	 * this rewrite ever ran (see the NOTE above the `valueConvert` block in
+	 * {@link alterColumnChange}). Every live SQL caller already refuses this earlier (the
+	 * engine's `runAlterColumn` and the materialized-view reshape's inexpressibility check),
+	 * so this only guards a direct module call — mirrors the memory backend's carve-out
+	 * (`MemoryTableManager.alterColumn`).
 	 */
 	private async alterColumnSetDataType(
 		table: StoreTable,
+		oldSchema: TableSchema,
 		oldCol: ColumnSchema,
 		colIndex: number,
 		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
@@ -2414,6 +2427,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const newLogicalType = inferType(change.setDataType!);
 		let valueConvert: ((v: SqlValue) => SqlValue) | undefined;
 		if (newLogicalType !== oldCol.logicalType) {
+			if (oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+				throw new QuereusError(
+					`Cannot change the data type of primary key column '${change.columnName}' of table '${oldSchema.name}'.`,
+					StatusCode.CONSTRAINT,
+				);
+			}
 			// Conversion required — walk every row and attempt parse.
 			const convert = (v: SqlValue): SqlValue => {
 				try {
