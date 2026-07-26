@@ -378,6 +378,7 @@ export class MemoryTable extends VirtualTable {
 						setNotNull: changeInfo.setNotNull,
 						setDataType: changeInfo.setDataType,
 						setDefault: changeInfo.setDefault,
+						setCollation: changeInfo.setCollation,
 					});
 					break;
 				default: {

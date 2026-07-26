@@ -2040,6 +2040,191 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	describe('constraint & retype ALTER inside a transaction preserves the overlay savepoint chain', () => {
+		// Second half of the same regression (`isolation-alter-forward-constraints-and-retype`):
+		// ALTER COLUMN and the constraint change types used to REBUILD the overlay, flattening
+		// its savepoint chain exactly as the column-shape suite above describes. They now
+		// forward in place: `set data type` / `set collate` / `set default` through the
+		// overlay's own `alterSchema`, `set not null` as a live-row backfill via ordinary
+		// overlay writes, and `add constraint … unique` as a tombstone-narrowed unique index.
+		//
+		// The `set not null` / `set default` / `rename constraint` savepoint shapes live HERE
+		// rather than in the cross-backend 41.8 sqllogic file: the memory-NATIVE leg of those
+		// shapes loses the transaction's staged rows (metadata-only ALTER arms skip
+		// adopt-on-open-layers — see tickets/.pre-existing-error.md), while on this leg the
+		// staged rows live in the isolation overlay, which those arms never disturb.
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('SET NOT NULL keeps pre-savepoint rows and discards post-savepoint ones', async () => {
+			await db.exec(`CREATE TABLE csp_nn (id INTEGER PRIMARY KEY, v TEXT NULL) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_nn VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_nn VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE csp_nn ALTER COLUMN v SET NOT NULL`);
+			await db.exec(`INSERT INTO csp_nn VALUES (3, 'c')`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_nn ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'only the pre-savepoint row survives').to.deep.equal([[1, 'a']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_nn ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a']]);
+
+			// The tightening (DDL, not transactional) survived the rollback.
+			let err: unknown;
+			try { await db.exec(`INSERT INTO csp_nn VALUES (4, NULL)`); } catch (e) { err = e; }
+			expect(err, 'NOT NULL enforced after commit').to.be.instanceOf(QuereusError);
+		});
+
+		it('SET NOT NULL backfills a staged NULL and the fill survives a later savepoint rollback', async () => {
+			await db.exec(`CREATE TABLE csp_bf (id INTEGER PRIMARY KEY, v TEXT NULL DEFAULT 'filled') USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_bf VALUES (1, NULL)`);
+			await db.exec(`ALTER TABLE csp_bf ALTER COLUMN v SET NOT NULL`);
+			// The backfill wrote in the frame BELOW this savepoint, so the rollback keeps it.
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_bf VALUES (2, 'b')`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_bf ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'staged NULL backfilled; post-savepoint row discarded').to.deep.equal([[1, 'filled']]);
+		});
+
+		it('SET DATA TYPE keeps the pre-savepoint row CONVERTED and discards post-savepoint ones', async () => {
+			await db.exec(`CREATE TABLE csp_dt (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_dt VALUES (1, '10')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_dt VALUES (2, '20')`);
+			await db.exec(`ALTER TABLE csp_dt ALTER COLUMN v SET DATA TYPE INTEGER`);
+			await db.exec(`INSERT INTO csp_dt VALUES (3, 30)`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_dt ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'survivor converted (integer 10, not text)').to.deep.equal([[1, 10]]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_dt ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 10]]);
+		});
+
+		it('SET DEFAULT keeps the savepoint ledger and applies the new DEFAULT after the rollback', async () => {
+			await db.exec(`CREATE TABLE csp_df (id INTEGER PRIMARY KEY, v INTEGER NULL) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_df VALUES (1, 5)`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_df VALUES (2, 6)`);
+			await db.exec(`ALTER TABLE csp_df ALTER COLUMN v SET DEFAULT 99`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_df (id) VALUES (3)`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_df ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'pre-savepoint row kept; new DEFAULT effective').to.deep.equal([[1, 5], [3, 99]]);
+		});
+
+		it('ADD CONSTRAINT UNIQUE keeps pre-savepoint rows, discards post-savepoint ones, and enforces after', async () => {
+			await db.exec(`CREATE TABLE csp_uc (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_uc VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_uc VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE csp_uc ADD CONSTRAINT u_v UNIQUE (v)`);
+			await db.exec(`INSERT INTO csp_uc VALUES (3, 'c')`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_uc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'only the pre-savepoint row survives').to.deep.equal([[1, 'a']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_uc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a']]);
+
+			let err: unknown;
+			try { await db.exec(`INSERT INTO csp_uc VALUES (4, 'a')`); } catch (e) { err = e; }
+			expect(err, 'the constraint (DDL) survived the rollback and enforces').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+		});
+
+		it('DROP CONSTRAINT keeps the pre-savepoint row and stays dropped past the rollback', async () => {
+			await db.exec(`CREATE TABLE csp_dc (id INTEGER PRIMARY KEY, v TEXT, CONSTRAINT u_v UNIQUE (v)) USING isolated`);
+			await db.exec(`INSERT INTO csp_dc VALUES (0, 'dup')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_dc VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`ALTER TABLE csp_dc DROP CONSTRAINT u_v`);
+			await db.exec(`INSERT INTO csp_dc VALUES (2, 'dup')`); // legal once dropped
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_dc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'post-savepoint duplicate unwound; staged row kept').to.deep.equal([[0, 'dup'], [1, 'a']]);
+
+			await db.exec(`INSERT INTO csp_dc VALUES (3, 'dup')`); // the drop survived the rollback
+			rows = await asyncIterableToArray(db.eval(`SELECT count(*) AS c FROM csp_dc WHERE v = 'dup'`));
+			expect((rows[0] as any).c).to.equal(2);
+		});
+
+		it('RENAME CONSTRAINT keeps the savepoint ledger and enforces under the new name', async () => {
+			await db.exec(`CREATE TABLE csp_rc (id INTEGER PRIMARY KEY, v TEXT, CONSTRAINT u_old UNIQUE (v)) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_rc VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_rc VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE csp_rc RENAME CONSTRAINT u_old TO u_new`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_rc ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'pre-savepoint row survives the rename').to.deep.equal([[1, 'a']]);
+
+			const names = (await asyncIterableToArray(db.eval(`SELECT name FROM unique_constraint_info('csp_rc')`))).map((r: any) => String(r.name));
+			expect(names, 'renamed in the catalog').to.include('u_new');
+
+			let err: unknown;
+			try { await db.exec(`INSERT INTO csp_rc VALUES (3, 'a')`); } catch (e) { err = e; }
+			expect(err, 'still enforced under the new name').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+		});
+
+		it('ADD CONSTRAINT UNIQUE over a primary-key member ignores in-transaction deletion markers', async () => {
+			// The spike's failing shape: two staged deletions share a = 1, and a naive UNIQUE
+			// forward to the overlay saw the two tombstones as duplicates of each other
+			// (`UNIQUE constraint failed: _overlay_…`). The tombstone-narrowed index must not.
+			await db.exec(`CREATE TABLE csp_tb (a INTEGER, b INTEGER, PRIMARY KEY (a, b)) USING isolated`);
+			await db.exec(`INSERT INTO csp_tb VALUES (1, 1), (1, 2), (2, 1)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM csp_tb WHERE a = 1`);
+			await db.exec(`ALTER TABLE csp_tb ADD CONSTRAINT u_a UNIQUE (a)`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT a, b FROM csp_tb ORDER BY a, b`));
+			expect(rows.map((r: any) => [r.a, r.b]), 'deletes applied; ALTER accepted').to.deep.equal([[2, 1]]);
+
+			await db.exec(`INSERT INTO csp_tb VALUES (3, 1)`);
+			let err: unknown;
+			try { await db.exec(`INSERT INTO csp_tb VALUES (3, 2)`); } catch (e) { err = e; }
+			expect(err, 'the new UNIQUE(a) enforces on live rows').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+		});
+	});
+
 	describe('in-transaction column-shape ALTER keeps the overlay tombstone flag last', () => {
 		// The overlay stages rows as [data columns..., tombstone flag] and every read/write
 		// path assumes the flag is LAST. A bare addColumn forward to the overlay would append
@@ -2686,14 +2871,114 @@ describe('IsolationModule', () => {
 			await iso.alterTable(dbA, 'main', 't', { type: 'alterColumn', columnName: 'x', setDefault: { type: 'literal', value: 0 } });
 			await injectOverlay(dbB, [[10, null]]); // B stages a NULL at x
 
+			const before = overlayState(dbB)!.overlayTable;
 			const updated = await iso.alterTable(dbA, 'main', 't', setNotNullX());
 			expect(updated.columns.find(c => c.name === 'x')?.notNull, 'x tightened').to.equal(true);
 
-			// B's overlay is migrated forward (NOT poisoned); its staged NULL is backfilled to 0.
+			// B's overlay is backfilled IN PLACE (NOT poisoned, not rebuilt).
 			const bState = overlayState(dbB)!;
 			expect(bState.poison, 'foreign overlay with a usable DEFAULT is backfilled, not poisoned').to.be.undefined;
+			expect(bState.overlayTable, 'overlay adopted in place, not rebuilt').to.equal(before);
 			const bRows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
 			expect(bRows.map(r => [r[0], r[1]]), 'staged NULL backfilled to the DEFAULT').to.deep.equal([[10, 0]]);
+		});
+
+		it('a backfilling SET NOT NULL leaves a tombstone\'s placeholder NULL alone', async () => {
+			// A tombstone carries its primary key and NULL everywhere else — those NULLs are
+			// placeholders, not values. Backfilling one from the DEFAULT (or rejecting it when
+			// no DEFAULT exists) would corrupt a row that is not a row; only LIVE staged NULLs
+			// are filled.
+			await iso.alterTable(dbA, 'main', 't', { type: 'alterColumn', columnName: 'x', setDefault: { type: 'literal', value: 0 } });
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlying.tableSchema!));
+			await overlay.update({ operation: 'insert', values: [10, null, 0] }); // live staged NULL
+			await overlay.update({ operation: 'insert', values: [11, null, 1] }); // tombstone of committed row 11
+			iso.setConnectionOverlay(dbB, 'main', 't', { overlayTable: overlay, hasChanges: true, db: dbB });
+
+			await iso.alterTable(dbA, 'main', 't', setNotNullX());
+
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'tombstone NULL must not reject the tightening').to.be.undefined;
+			const bRows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
+			const byId = new Map(bRows.map(r => [r[0], r]));
+			expect(byId.get(10)![1], 'live staged NULL backfilled').to.equal(0);
+			expect(byId.get(10)![2], 'live flag intact').to.equal(0);
+			expect(byId.get(11)![1], 'tombstone keeps its placeholder NULL, not the DEFAULT').to.equal(null);
+			expect(byId.get(11)![2], 'tombstone flag intact').to.equal(1);
+		});
+
+		// ── ADD CONSTRAINT … UNIQUE over staged overlay rows. The constraint lands on each
+		// overlay as a tombstone-narrowed unique index (the AST constraint has no predicate
+		// field, so a bare forward would judge deletion markers as rows).
+
+		/** `alter table t add constraint u_x unique (x)`, as the module receives it. */
+		function addUniqueX(): SchemaChangeInfo {
+			return { type: 'addConstraint', constraint: { type: 'unique', name: 'u_x', columns: [{ name: 'x' }] } };
+		}
+
+		it('ADD CONSTRAINT UNIQUE forwards a foreign overlay IN PLACE as a tombstone-narrowed unique index', async () => {
+			await injectOverlay(dbB, [[10, 7], [11, 8]]); // distinct on x — healthy
+			const before = overlayState(dbB)!.overlayTable;
+
+			const updated = await iso.alterTable(dbA, 'main', 't', addUniqueX());
+			expect(updated.uniqueConstraints?.some(uc => uc.name === 'u_x'), 'underlying gained the constraint').to.equal(true);
+
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'B stays healthy').to.be.undefined;
+			expect(bState.overlayTable, 'overlay adopted in place, not rebuilt').to.equal(before);
+
+			// The overlay carries the index AND the UNIQUE derived from it, both named u_x and
+			// both narrowed to live rows — so drop/rename forwards resolve the same object.
+			const overlaySchema = bState.overlayTable.tableSchema!;
+			const idx = overlaySchema.indexes?.find(i => i.name === 'u_x');
+			expect(idx, 'overlay carries the covering index').to.not.be.undefined;
+			expect(idx!.predicate, 'index predicate narrowed (tombstone flag = 0)').to.not.be.undefined;
+			const uc = overlaySchema.uniqueConstraints?.find(c => c.name === 'u_x');
+			expect(uc, 'overlay carries the derived UNIQUE').to.not.be.undefined;
+			expect(uc!.predicate, 'constraint predicate narrowed too').to.not.be.undefined;
+
+			// And it ENFORCES for the rest of B's transaction: another x = 7 is rejected.
+			const dup: UpdateResult = await bState.overlayTable.update({ operation: 'insert', values: [12, 7, 0], preCoerced: true });
+			expect(dup.status, 'staged duplicate rejected by the overlay').to.equal('constraint');
+		});
+
+		it('ADD CONSTRAINT UNIQUE poisons a foreign overlay whose staged rows violate it', async () => {
+			await injectOverlay(dbB, [[10, 7], [11, 7]]); // B stages two rows colliding on x
+
+			const updated = await iso.alterTable(dbA, 'main', 't', addUniqueX());
+
+			// The issuer's ALTER applied — a foreign connection's uncommitted rows must not abort it.
+			expect(updated.uniqueConstraints?.some(uc => uc.name === 'u_x'), 'underlying gained the constraint').to.equal(true);
+
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'B overlay must be poisoned').to.not.be.undefined;
+			expect(bState.poison!.message).to.match(/roll back this transaction/i);
+			// Both staged rows kept — nothing was silently truncated on the way to the poison.
+			const bRows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
+			expect(bRows.map(r => r[0]), 'no staged row was dropped').to.deep.equal([10, 11]);
+		});
+
+		it('ADD CONSTRAINT UNIQUE over a primary-key member ignores a foreign overlay\'s tombstones', async () => {
+			// Compound PK so a PK member can carry a duplicated value across two tombstones:
+			// two staged deletions share a = 1, and each tombstone carries its full PK. A bare
+			// UNIQUE(a) forward would see them as duplicates of each other.
+			await dbA.exec('create table tc (a integer, b integer, primary key (a, b)) using isolated');
+			const underlyingC = iso.getUnderlyingState('main', 'tc')!.underlyingTable;
+			const overlayC = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlyingC.tableSchema!));
+			await overlayC.update({ operation: 'insert', values: [1, 1, 1] }); // tombstone (a=1, b=1)
+			await overlayC.update({ operation: 'insert', values: [1, 2, 1] }); // tombstone (a=1, b=2)
+			iso.setConnectionOverlay(dbB, 'main', 'tc', { overlayTable: overlayC, hasChanges: true, db: dbB });
+			const before = iso.getConnectionOverlay(dbB, 'main', 'tc')!.overlayTable;
+
+			const updated = await iso.alterTable(dbA, 'main', 'tc', {
+				type: 'addConstraint',
+				constraint: { type: 'unique', name: 'u_a', columns: [{ name: 'a' }] },
+			});
+			expect(updated.uniqueConstraints?.some(uc => uc.name === 'u_a')).to.equal(true);
+
+			const cState = iso.getConnectionOverlay(dbB, 'main', 'tc')!;
+			expect(cState.poison, 'two deletion markers are not duplicates — no poison').to.be.undefined;
+			expect(cState.overlayTable, 'overlay adopted in place').to.equal(before);
 		});
 	});
 
@@ -5380,8 +5665,9 @@ describe('IsolationModule — cross-connection SET DATA TYPE over staged overlay
 
 	it('poisons a foreign overlay whose staged rows collide only AFTER conversion', async () => {
 		// Each value converts fine on its own, so `validateOverlayMigration` passes; the collision
-		// surfaces only when the rebuilt overlay re-inserts both converted rows under the UNIQUE
-		// column. That CONSTRAINT must poison B, not escape as INTERNAL or abort A's ALTER.
+		// surfaces only when the overlay adopts the retype — its converted-row UNIQUE
+		// re-validation fires before mutating anything. That CONSTRAINT must poison B, not
+		// escape as INTERNAL or abort A's ALTER.
 		await dbA.exec(`create table u (id integer primary key, v text unique) using isolated`);
 		const underlyingU = iso.getUnderlyingState('main', 'u')!.underlyingTable;
 		const overlayU = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlyingU.tableSchema!));
@@ -5397,5 +5683,135 @@ describe('IsolationModule — cross-connection SET DATA TYPE over staged overlay
 		expect(bState.poison, 'B overlay must be poisoned by the post-conversion collision').to.not.be.undefined;
 		expect(bState.poison!.message).to.match(/roll back this transaction/i);
 		expect(bState.poison!.message).to.contain('main.u');
+	});
+
+	it('converts a foreign overlay IN PLACE — same overlay object across the retype', async () => {
+		await injectOverlay(dbB, [[10, '20']]);
+		const before = overlayState(dbB)!.overlayTable;
+
+		await iso.alterTable(dbA, 'main', 't', retypeVToInteger);
+
+		const bState = overlayState(dbB)!;
+		expect(bState.poison).to.be.undefined;
+		expect(bState.overlayTable, 'overlay adopted in place, not rebuilt').to.equal(before);
+	});
+});
+
+describe('IsolationModule — ALTER PRIMARY KEY over per-connection overlays', () => {
+	// No overlay can follow a primary-key change: its staging BTrees are keyed by the OLD
+	// primary key, a staged tombstone identifies the row it deletes BY that key, and the
+	// (memory) overlay module rejects in-place PK alteration. So the isolation layer
+	// rejects the ISSUER up front when it has staged rows, poisons a FOREIGN overlay with
+	// staged rows after the underlying applies, and swaps a CLEAN overlay for a fresh
+	// staging table under the new key.
+	//
+	// The memory underlying rejects alterPrimaryKey outright (UNSUPPORTED), so the
+	// post-underlying paths are reachable only through a PK-capable underlying (the store
+	// module). `PkAcceptingMemoryModule` stands in for one: it answers alterPrimaryKey
+	// with the re-keyed schema (no physical re-key — the overlay handling under test
+	// never reads the underlying's rows) and delegates everything else to memory.
+	let iso: IsolationModule;
+	let dbA: Database; // the ALTER issuer
+	let dbB: Database; // a foreign connection
+
+	class PkAcceptingMemoryModule extends MemoryTableModule {
+		alterTableCalls = 0;
+		async alterTable(db: Database, schemaName: string, tableName: string, change: SchemaChangeInfo, rows?: any): Promise<TableSchema> {
+			this.alterTableCalls++;
+			if (change.type === 'alterPrimaryKey') {
+				const prior = iso.getUnderlyingState(schemaName, tableName)!.underlyingTable.tableSchema!;
+				return Object.freeze({
+					...prior,
+					primaryKeyDefinition: Object.freeze(change.newPkColumns.map(pk => ({ index: pk.index, desc: pk.desc }))),
+				});
+			}
+			return super.alterTable(db, schemaName, tableName, change, rows);
+		}
+	}
+	let underlyingModule: PkAcceptingMemoryModule;
+
+	/** `alter table t alter primary key (x)` — move the PK from id (index 0) to x (index 1). */
+	const alterPkToX: SchemaChangeInfo = { type: 'alterPrimaryKey', newPkColumns: [{ index: 1, desc: false }] };
+
+	beforeEach(async () => {
+		underlyingModule = new PkAcceptingMemoryModule();
+		iso = new IsolationModule({ underlying: underlyingModule });
+		dbA = new Database();
+		dbB = new Database();
+		dbA.registerModule('isolated', iso);
+		await dbA.exec('create table t (id integer primary key, x integer) using isolated');
+	});
+
+	afterEach(async () => {
+		await dbA.close();
+		await dbB.close();
+	});
+
+	async function injectOverlay(forDb: Database, rows: SqlValue[][], hasChanges = true): Promise<void> {
+		const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+		const overlay = await iso.overlayModule.create(forDb, iso.createOverlaySchema(underlying.tableSchema!));
+		for (const r of rows) {
+			await overlay.update({ operation: 'insert', values: [...r, 0] });
+		}
+		iso.setConnectionOverlay(forDb, 'main', 't', { overlayTable: overlay, hasChanges, db: forDb });
+	}
+
+	it('rejects the issuer up front when its transaction has staged rows, before the underlying mutates', async () => {
+		await injectOverlay(dbA, [[1, 7]]);
+		const callsBefore = underlyingModule.alterTableCalls;
+
+		let err: unknown;
+		try { await iso.alterTable(dbA, 'main', 't', alterPkToX); } catch (e) { err = e; }
+		expect(err, 'issuer with staged rows must be rejected').to.be.instanceOf(QuereusError);
+		expect((err as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+		expect((err as QuereusError).message).to.match(/primary key/i);
+
+		// Atomic: the underlying was never asked to mutate, and A's overlay is intact.
+		expect(underlyingModule.alterTableCalls, 'underlying alterTable never reached').to.equal(callsBefore);
+		const aState = iso.getConnectionOverlay(dbA, 'main', 't')!;
+		expect(aState.poison, 'issuer overlay rejected, never poisoned').to.be.undefined;
+		expect(aState.hasChanges).to.equal(true);
+	});
+
+	it('poisons a foreign overlay with staged rows while the issuer\'s ALTER applies', async () => {
+		await injectOverlay(dbB, [[10, 7]]);
+
+		const updated = await iso.alterTable(dbA, 'main', 't', alterPkToX);
+		expect(updated.primaryKeyDefinition.map(d => d.index), 'PK moved to x').to.deep.equal([1]);
+
+		const bState = iso.getConnectionOverlay(dbB, 'main', 't')!;
+		expect(bState.poison, 'B overlay must be poisoned').to.not.be.undefined;
+		expect(bState.poison!.message).to.match(/primary key/i);
+		expect(bState.poison!.message).to.match(/roll back this transaction/i);
+	});
+
+	it('swaps a clean overlay for a fresh staging table keyed by the new primary key', async () => {
+		await injectOverlay(dbB, [], false); // clean: exists, stages nothing
+		const overlayTables = (iso.overlayModule as unknown as { tables: Map<string, unknown> }).tables;
+		const before = iso.getConnectionOverlay(dbB, 'main', 't')!.overlayTable;
+		expect(overlayTables.size, 'baseline: one staging table').to.equal(1);
+
+		await iso.alterTable(dbA, 'main', 't', alterPkToX);
+
+		const bState = iso.getConnectionOverlay(dbB, 'main', 't')!;
+		expect(bState.poison, 'clean overlay is carried, not poisoned').to.be.undefined;
+		expect(bState.hasChanges).to.equal(false);
+		expect(bState.overlayTable, 'fresh staging table installed').to.not.equal(before);
+		expect(bState.overlayTable.tableSchema!.primaryKeyDefinition.map(d => d.index), 'overlay keyed by the new PK')
+			.to.deep.equal([1]);
+		expect(overlayTables.size, 'old staging table released — no leak').to.equal(1);
+	});
+
+	it('a memory underlying\'s UNSUPPORTED propagates with every overlay untouched', async () => {
+		const memIso = new IsolationModule({ underlying: new MemoryTableModule() });
+		const dbM = new Database();
+		dbM.registerModule('isolated', memIso);
+		await dbM.exec('create table m (id integer primary key, x integer) using isolated');
+
+		let err: unknown;
+		try { await memIso.alterTable(dbM, 'main', 'm', alterPkToX); } catch (e) { err = e; }
+		expect(err, 'the wrapper must not swallow the underlying rejection').to.be.instanceOf(QuereusError);
+		expect((err as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+		await dbM.close();
 	});
 });
