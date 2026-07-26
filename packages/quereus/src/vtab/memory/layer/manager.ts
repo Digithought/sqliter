@@ -13,7 +13,7 @@ import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
 import { indexEnforcesUnique, uniqueEnforcementCollations, uniqueEnforcementComparators } from '../../../schema/unique-enforcement.js';
-import { compareSqlValues, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
+import { compareSqlValues, rowsValueIdentical, normalizeCollationName, comparisonSemanticsDiffer } from '../../../util/comparison.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
@@ -2047,6 +2047,13 @@ export class MemoryTableManager {
 			// A collation change re-keys any PK / UNIQUE / index that orders by this
 			// column, so it needs the structure re-sort + uniqueness re-validation below.
 			let collationChanged = false;
+			// Set when a SET DATA TYPE keeps the physical storage class but moves to a type
+			// that ORDERS values differently (comparisonSemanticsDiffer). Same consequence as
+			// a collation change — every structure keyed by the column has to be re-sorted and
+			// its uniqueness re-judged — but a separate flag, because the index-column collation
+			// propagation and the `pkColumnRekeyed` primary-tree path below belong to SET COLLATE
+			// alone.
+			let comparatorChanged = false;
 			// Set to the per-value conversion function when a physical value rewrite is needed:
 			// SET DATA TYPE (retype every value) or SET NOT NULL backfill (map null → DEFAULT).
 			// Both REPLACE the base primary tree with a freshly-built one (never an in-place
@@ -2130,6 +2137,25 @@ export class MemoryTableManager {
 			} else if (change.setDataType !== undefined) {
 				const newLogicalType = inferType(change.setDataType);
 				if (newLogicalType.physicalType === oldCol.logicalType.physicalType) {
+					// Same storage class → the stored values are byte-identical afterwards, so no
+					// `valueConvert`. But every MemoryIndex builds its comparator from the column's
+					// LOGICAL type (`createTypedComparator(columnSchema.logicalType, …)` in
+					// vtab/memory/index.ts), so a move to a differently-ordering type (text ↔ timespan:
+					// 'PT1H' ≡ 'PT60M'; text ↔ date/time/datetime: binary, ignoring the column's
+					// collation) leaves every structure sorted the OLD way while write-time uniqueness
+					// reads the NEW schema — lookups miss rows and duplicates slip past. Take the
+					// SET COLLATE shape: re-validate, re-sort, hand the schema to open layers.
+					comparatorChanged = comparisonSemanticsDiffer(oldCol.logicalType, newLogicalType);
+					if (comparatorChanged && this.tableSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+						// Defense in depth, mirroring the class-changing branch below: the engine already
+						// refuses SET DATA TYPE on any PK column (runtime/emit/alter-table.ts), but a
+						// direct module call must not re-key the primary tree behind the manager's back —
+						// nothing here rebuilds it, so the tree would keep the old order under a new type.
+						throw new QuereusError(
+							`Cannot change the data type of primary key column '${change.columnName}' of table '${this._tableName}'.`,
+							StatusCode.CONSTRAINT,
+						);
+					}
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				} else {
 					// Retyping a PRIMARY KEY column changes the physical key bytes. The in-place
@@ -2190,17 +2216,31 @@ export class MemoryTableManager {
 
 			const updatedCols = this.tableSchema.columns.map((c, i) => i === colIndex ? newCol : c);
 
+			// The two changes that leave the VALUES alone and move the COMPARATOR: SET COLLATE and
+			// a same-storage-class retype into a differently-ordering type. Both need the identical
+			// re-validate / re-sort / adopt sequence below.
+			const structuresRekeyed = collationChanged || comparatorChanged;
+
 			// Propagate a collation change into every PK-definition entry and index
 			// column that orders by this column, so their comparators re-key under it.
 			const updatedPkDef = collationChanged
 				? this.tableSchema.primaryKeyDefinition.map(def =>
 					def.index === colIndex ? { ...def, collation: newCol.collation } : def)
 				: this.tableSchema.primaryKeyDefinition;
-			const updatedIndexes = (collationChanged && this.tableSchema.indexes)
+			// Every re-keying change also REBUILDS the IndexSchema objects, because their identity is
+			// the discriminator `TransactionLayer.adoptSchema` uses to decide an open layer's
+			// MemoryIndex must be replaced rather than kept (an index it holds under an object the new
+			// schema still carries is left alone). SET COLLATE has a field to write — the index
+			// column's own collation. A comparator-only retype has none: an index column carries no
+			// logical type, it reads the column's from `newSchema.columns`, so the fresh object IS the
+			// whole signal. Without it the base rebuilt its trees under the new comparator while the
+			// DDL transaction's own layers went on comparing the old way — and shadowed the base's
+			// rebuilt trees once the pending layer became the committed head.
+			const updatedIndexes = (structuresRekeyed && this.tableSchema.indexes)
 				? this.tableSchema.indexes.map(idx => ({
 					...idx,
 					columns: idx.columns.map(ic =>
-						ic.index === colIndex ? { ...ic, collation: newCol.collation } : ic),
+						(ic.index === colIndex && collationChanged) ? { ...ic, collation: newCol.collation } : ic),
 				}))
 				: this.tableSchema.indexes;
 
@@ -2230,16 +2270,23 @@ export class MemoryTableManager {
 			// CONVERTED rows, using the same per-row conversion the base rewrite below applies.
 			// The rebuild that follows is deliberately non-enforcing, so this is the only guard.
 			//
-			// The two arms are mutually exclusive today — SET COLLATE never sets `valueConvert` —
-			// and stay separate so the collate path's PK pre-pass ordering is untouched. Neither
-			// rewrite can re-key the primary tree, so the rewrite arm needs no PK pre-pass: a retype
-			// of a PK column is rejected upstream, and the backfill only fires on a column holding
-			// NULLs, which a PK column cannot (the engine enforces NOT NULL on every PK member
-			// regardless of the declared nullability).
+			// The comparator-MOVING arm has two triggers, SET COLLATE and a same-storage-class retype
+			// into a differently-ordering type (`comparatorChanged`, e.g. text → timespan, where
+			// 'PT1H' and 'PT60M' become one value). They share this pre-pass because they share its
+			// premise exactly: the values are untouched — hence no `mapRow` — and only the comparator
+			// the structures are keyed by moves. `newSchema` carries the new logical types, so the
+			// probe indexes compare as the rebuilt ones will.
+			//
+			// The two arms are mutually exclusive today — neither comparator trigger sets
+			// `valueConvert` — and stay separate so the collate path's PK pre-pass ordering is
+			// untouched. Neither rewrite can re-key the primary tree, so the rewrite arm needs no
+			// PK pre-pass: a retype of a PK column is rejected upstream, and the backfill only fires
+			// on a column holding NULLs, which a PK column cannot (the engine enforces NOT NULL on
+			// every PK member regardless of the declared nullability).
 			// NOTE: if PK members ever become genuinely nullable, the backfill arm gains a PK
 			// collision path (two NULL keys → one DEFAULT) and needs `validateRekeyedPrimaryKey`
 			// plus a primary-tree re-key of its own.
-			if (collationChanged) {
+			if (structuresRekeyed) {
 				await this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex, rows);
 				// NOTE: `validateRekeyedPrimaryKey` deliberately ignores `rows`. It asserts that no
 				// LAYER of this manager's own chain holds a PK collision under the new comparator —
@@ -2265,14 +2312,17 @@ export class MemoryTableManager {
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
 
-			// A collation change re-sorts the structures that order by the column. The
+			// A comparator move (collation change, or a same-storage-class retype into a
+			// differently-ordering type) re-sorts the structures that order by the column — each
+			// MemoryIndex rebuilds its comparator from the CURRENT schema's collation and logical
+			// type, which `updateSchema` above has just swapped in. The
 			// secondary rebuild is NON-enforcing (the pre-pass above owns uniqueness, and the
 			// base's rows are not a subset of the effective rows); the primary tree rebuild is
 			// strict, since a PK collision cannot be represented at all — the pre-pass has
 			// already proved the base collision-free, so the strict rebuild is a live invariant
 			// check, not the enforcement path. It runs LAST so its throw leaves the live tree
 			// intact for the catch's rollback.
-			if (collationChanged) {
+			if (structuresRekeyed) {
 				this.baseLayer.rebuildAllSecondaryIndexes();
 				if (pkColumnRekeyed) {
 					basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
@@ -2304,17 +2354,17 @@ export class MemoryTableManager {
 			this.initializePrimaryKeyFunctions();
 
 			// The base rebuild handed every secondary index a fresh tree under the new
-			// collation; the DDL transaction's own layers still inherit the old ones and froze
+			// comparator; the DDL transaction's own layers still inherit the old ones and froze
 			// the old schema at construction. Re-key them, or the rest of the transaction — and
 			// everything after the pending layer becomes the committed head at commit — keeps
-			// comparing under the old collation.
+			// comparing under the old collation / old logical type.
 			//
 			// When the altered column is part of the primary key, `rebuildPrimaryTreeStrict` also
 			// swapped the base primary tree object out from under those layers' copy-on-write
 			// bases and invalidated their `pkFunctions`; `rekeyPrimaryKey` rebuilds both, plus
 			// every secondary index (each derives its PK comparator/encoder from the PK
 			// definition). Outside a transaction there are no open layers and both are no-ops.
-			if (collationChanged) {
+			if (structuresRekeyed) {
 				this.adoptSchemaOnOpenLayers(finalNewTableSchema, pkColumnRekeyed);
 			} else if (valueConvert) {
 				// SET DATA TYPE / SET NOT NULL backfill converted the base above; the DDL
@@ -2325,6 +2375,15 @@ export class MemoryTableManager {
 				// layer, never reached by the old in-place base upsert). No-op in autocommit.
 				this.convertColumnOnOpenLayers(finalNewTableSchema, colIndex, valueConvert, convertNulls);
 			}
+			// NOTE: the remaining changes (SET DEFAULT, DROP NOT NULL, a SET NOT NULL that needed no
+			// backfill, a retype whose comparator did not move) fall through with the open layers
+			// still holding their creation-time schema. Verified not observable today: a layer's
+			// frozen schema drives only its index set, its `uniqueConstraints` enforcement and its
+			// MemoryIndex comparators, none of which these changes touch — DEFAULT application and
+			// NOT NULL enforcement happen above the module, off the catalog schema (probed inside a
+			// transaction with a pending layer: both behave correctly). If a layer ever starts
+			// reading per-column metadata beyond collation and logical type, this fall-through has to
+			// call `adoptSchemaOnOpenLayers(finalNewTableSchema)` unconditionally.
 
 			this.eventEmitter?.emitSchemaChange?.({
 				type: 'alter',

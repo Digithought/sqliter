@@ -496,6 +496,29 @@ export function hasSemanticOrdering(type: LogicalType | undefined): type is Logi
 }
 
 /**
+ * True when two logical types order values differently — i.e. the comparators
+ * {@link createTypedComparator} builds for them are not interchangeable, so any structure
+ * keyed by one has to be re-sorted (and its uniqueness re-judged) to move to the other.
+ *
+ * `createTypedComparator(type, coll)` is fully determined by `type.compare`: present → the
+ * type's own `compare`; absent → `compareSqlValuesFast` under the collation. So comparing
+ * the two `compare` identities is exactly the question, and it catches more than a
+ * {@link hasSemanticOrdering} check would:
+ *
+ *  - TEXT ↔ TIMESPAN — TIMESPAN's `compare` ranks by elapsed time, so 'PT1H', 'PT60M' and
+ *    'PT3600S' are one value where text sees three.
+ *  - TEXT ↔ DATE / TIME / DATETIME — these carry their own `compare` hard-wired to
+ *    BINARY_COLLATION, ignoring the column's declared collation, so `text collate nocase →
+ *    date` really does re-order even though both orderings are "textual".
+ *
+ * A retype that flattens to the SAME logical type object (`text → varchar(50)`,
+ * `integer → bigint`) shares one `compare` and is correctly reported as no change.
+ */
+export function comparisonSemanticsDiffer(a: LogicalType, b: LogicalType): boolean {
+	return a.compare !== b.compare;
+}
+
+/**
  * Canonical key-identity transform for a declared logical type, or undefined when raw
  * values already key faithfully. Defined exactly when the type carries semantic ordering
  * AND a `groupKey` hook (TIMESPAN — its stored text is not canonical for equality:

@@ -123,6 +123,7 @@ export {
 	createSemanticRowComparator,
 	hasSemanticOrdering,
 	semanticKeyTransform,
+	comparisonSemanticsDiffer,
 	// ORDER BY comparison utilities
 	compareWithOrderByFast,
 	createOrderByComparatorFast,

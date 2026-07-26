@@ -331,6 +331,54 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
+		// Same physical storage class (both TEXT), so nothing is rewritten — but TIMESPAN ranks by
+		// elapsed time, so the index over `v` has to be re-keyed. An honored-but-not-re-keyed ALTER
+		// is exactly the silent divergence this matrix forbids, and `confirm` probes it
+		// behaviorally: a lookup by a DIFFERENT spelling of the stored duration must find the row.
+		label: 'alterColumn SET DATA TYPE (same storage class, semantic retype) re-keys',
+		seed: u => [
+			`create table t (id integer primary key, v text, constraint u_v unique (v))${u}`,
+			`insert into t values (1, 'PT1H'), (2, 'PT2H')`,
+		],
+		alter: `alter table t alter column v set data type timespan`,
+		memory: { kind: 'honored' },
+		stubUnsupported: true,
+		confirm: async (db, outcome) => {
+			const info = await columnInfo(db, 'v');
+			if (outcome === 'honored') {
+				expect(String(info?.type).toLowerCase(), 'declared type now TIMESPAN').to.contain('timespan');
+				// The index answers by elapsed time: 60 minutes locates the row stored as 'PT1H'.
+				const r = await rows(db, `select id from t where v = 'PT60M'`);
+				expect(r.map(x => x.id), 'lookup by an equal-elapsed spelling finds the row').to.deep.equal([1]);
+				// ...and UNIQUE enforces by elapsed time too: 120 minutes duplicates 'PT2H'.
+				await expectConstraint(db, `insert into t values (3, 'PT120M')`, 'semantic retype revalidate');
+			} else {
+				expect(String(info?.type).toLowerCase(), 'type unchanged on reject').to.contain('text');
+			}
+		},
+	},
+	{
+		// The collision half: 'PT1H' and 'PT60M' are distinct text but ONE timespan, so the
+		// existing rows violate the UNIQUE the moment the comparator moves. Must be rejected
+		// before anything mutates — leaving values, declared type and writability intact.
+		label: 'alterColumn SET DATA TYPE (semantic retype, UNIQUE collision) → CONSTRAINT',
+		seed: u => [
+			`create table t (id integer primary key, v text, constraint u_v unique (v))${u}`,
+			`insert into t values (1, 'PT1H'), (2, 'PT60M')`,
+		],
+		alter: `alter table t alter column v set data type timespan`,
+		memory: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /unique/i },
+		stubUnsupported: true,
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'v');
+			expect(String(info?.type).toLowerCase(), 'type unchanged after collision reject').to.contain('text');
+			const r = await rows(db, `select id, v from t order by id`);
+			expect(r.map(x => x.v), 'both spellings survive').to.deep.equal(['PT1H', 'PT60M']);
+			// Still writable, still enforcing TEXTUAL uniqueness under the unchanged type.
+			await db.exec(`insert into t values (3, 'PT3600S')`);
+		},
+	},
+	{
 		label: 'alterColumn SET DEFAULT',
 		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, 5)`],
 		alter: `alter table t alter column v set default 99`,

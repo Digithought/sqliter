@@ -220,7 +220,17 @@ exactly as the rebuilt structure will. Two families qualify:
 
 *   **`SET COLLATE`** re-keys the structures under a new comparator; the stored values are
     unchanged, so the probe reads the effective rows as they are.
-*   **A value rewrite** — `SET DATA TYPE`, or a `SET NOT NULL` NULL → DEFAULT backfill — leaves
+*   **A `SET DATA TYPE` that keeps the physical storage class but moves the comparison** —
+    `TEXT` ↔ `TIMESPAN` (`'PT1H'`, `'PT60M'` and `'PT3600S'` are one duration), or `TEXT` ↔
+    `DATE`/`TIME`/`DATETIME` (whose comparison is hard-wired to `BINARY`, ignoring the column's
+    collation). No value is rewritten, so like `SET COLLATE` the probe reads the effective rows
+    as they are — but a `MemoryIndex` builds its comparator from the column's **logical type**,
+    so every structure over the column has to be re-keyed just the same. The trigger is
+    `comparisonSemanticsDiffer` (`util/comparison.ts`): the two types' `compare` functions are
+    not the same function. A retype whose types compare identically (`TEXT` → `VARCHAR(50)`,
+    `INTEGER` → `BIGINT`) is a metadata-only no-op and skips all of this.
+*   **A value rewrite** — `SET DATA TYPE` across physical storage classes, or a `SET NOT NULL`
+    NULL → DEFAULT backfill — leaves
     the comparators alone but changes the values, so the probe reads the effective rows with the
     altered column **converted**, under the column's new logical type. That is what catches
     `'1'`/`'01'` collapsing onto the integer `1`, `'1.0'`/`'1.00'` onto the real `1.0`, and two
@@ -245,13 +255,15 @@ not of the wrapper's merged rows.
 `TransactionLayer` freezes its schema at construction, so a layer created before the DDL would
 otherwise carry neither the new `IndexSchema` (an index scan raises "Secondary index not found")
 nor the derived `uniqueConstraints` entry (a colliding insert is silently accepted) — and after a
-collation change it would go on comparing under the old collation, then *become* the committed
-head at commit and shadow the base's rebuilt structures entirely.
+re-keying change (a collation change, or a same-storage-class semantic retype) it would go on
+comparing the old way, then *become* the committed head at commit and shadow the base's rebuilt
+structures entirely.
 
 `TransactionLayer.adoptSchema` hands the new schema to the pending layer and to every savepoint
 snapshot beneath it, oldest-first. It **adds** an index the layer does not hold, and **replaces**
 one whose `IndexSchema` object the new schema rebuilt (which is exactly what re-keying DDL does,
-and what additive DDL never does). Either way the layer's `MemoryIndex` is built over its parent's
+and what additive DDL never does — a semantic retype has no index-column field to change, so
+`alterColumn` rebuilds those objects purely to raise this signal). Either way the layer's `MemoryIndex` is built over its parent's
 tree and then brought up to date with only that layer's own writes. Rebasing would achieve the
 same, but it would invalidate the savepoint snapshots a `ROLLBACK TO SAVEPOINT` must restore.
 
@@ -275,7 +287,15 @@ rolls back normally. Callers that want a hard guarantee against this can set the
 transaction on any module that is not `transactional` (memory is not). The default `'permissive'`
 policy leaves the behavior above unchanged.
 
-**`SET DATA TYPE` validates and rewrites values, not just structures.** When the new type has a
+**`SET DATA TYPE` validates and rewrites values, not just structures.** When the new type shares
+the physical type, no value is touched and the statement is metadata-only *unless* the two types
+compare differently (`comparisonSemanticsDiffer` — `TEXT` ↔ `TIMESPAN`, `TEXT` ↔
+`DATE`/`TIME`/`DATETIME`), in which case it takes the `SET COLLATE` path in full: UNIQUE
+re-validation over the effective rows under the new comparator, `rebuildAllSecondaryIndexes` on
+the base, and `adoptSchema` on every open transaction layer. A direct module call that aims such a
+retype at a PRIMARY KEY column is rejected with `CONSTRAINT` (defense in depth — the engine
+already refuses `SET DATA TYPE` on any PK column), since nothing on this path re-keys the primary
+tree. When the new type has a
 different physical type, `MemoryTableManager.alterColumn` first runs a throw-only conversion pass
 over the effective rows (rule 1): a value the transaction can see that will not convert rejects the
 `ALTER` with `MISMATCH`, and one only in a row it has deleted does not block it. It then converts

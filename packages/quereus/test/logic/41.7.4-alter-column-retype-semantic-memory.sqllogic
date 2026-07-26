@@ -1,0 +1,309 @@
+-- ALTER COLUMN ... SET DATA TYPE into a type that COMPARES differently, when the physical
+-- storage class does not change.
+--
+-- TEXT and TIMESPAN are both physically text, so retyping between them rewrites no stored
+-- value. It does change how two values compare: TIMESPAN ranks by elapsed time, so 'PT1H',
+-- 'PT60M' and 'PT3600S' are ONE value where text sees three. Every index over the column is
+-- keyed by the column's logical type, so such a retype must be treated exactly like a
+-- SET COLLATE: re-validate every uniqueness-enforcing structure covering the column BEFORE
+-- mutating anything, and re-sort those structures when the change is accepted.
+--
+-- Without that, the change was silently accepted and left the indexes sorted the old way:
+-- an index-backed lookup for another spelling of a stored duration found nothing, while an
+-- INSERT of that same spelling was rejected as a duplicate — a value simultaneously absent
+-- on SELECT and duplicate on INSERT (bug-retype-to-semantic-type-unique-and-query).
+--
+-- MEMORY-ONLY (listed in MEMORY_ONLY_FILES): the store backend already re-validates and
+-- rebuilds on the TIMESPAN half of this via its own key-transform guard, but the
+-- `collate nocase → date` section below turns on comparator identity rather than a key
+-- transform, which the store does not track. The memory-side contract is what this file pins.
+
+-- ===================================
+-- 1. Colliding rows under an explicit `create unique index` → the ALTER is REJECTED, and
+--    the rejection changes nothing: values, declared type and writability all survive.
+-- ===================================
+
+create table sem1 (id integer primary key, v text);
+create unique index sem1_v on sem1 (v);
+insert into sem1 values (1, 'PT1H'), (2, 'PT60M');
+-- run
+
+alter table sem1 alter column v set data type timespan;
+-- error: UNIQUE constraint failed
+
+-- the declared type is unchanged — a rejected ALTER must not leave a new type over
+-- structures still keyed the old way
+select name, type from table_info('sem1') where name = 'v';
+→ [{"name":"v","type":"TEXT"}]
+
+select id, v from sem1 order by id;
+→ [{"id":1,"v":"PT1H"},{"id":2,"v":"PT60M"}]
+
+-- still writable, and the index still enforces TEXTUAL uniqueness under the unchanged type,
+-- so a third spelling of the same duration is accepted
+insert into sem1 values (3, 'PT3600S');
+select count(*) as n from sem1;
+→ [{"n":3}]
+
+insert into sem1 values (4, 'PT1H');
+-- error: UNIQUE constraint failed
+
+drop table sem1;
+
+-- ===================================
+-- 2. Same collision through an inline `v text unique` (the auto-built covering index
+--    rather than a user-created one).
+-- ===================================
+
+create table sem2 (id integer primary key, v text unique);
+insert into sem2 values (1, 'PT1H'), (2, 'PT60M');
+-- run
+
+alter table sem2 alter column v set data type timespan;
+-- error: UNIQUE constraint failed
+
+select name, type from table_info('sem2') where name = 'v';
+→ [{"name":"v","type":"TEXT"}]
+
+select id, v from sem2 order by id;
+→ [{"id":1,"v":"PT1H"},{"id":2,"v":"PT60M"}]
+
+drop table sem2;
+
+-- ===================================
+-- 3. ACCEPTED: no collision (one hour and two hours). The change must still re-sort the
+--    index — this is the case the old code got wrong WITHOUT any uniqueness violation.
+-- ===================================
+
+create table sem3 (id integer primary key, v text);
+create unique index sem3_v on sem3 (v);
+insert into sem3 values (1, 'PT1H'), (2, 'PT2H');
+-- run
+
+alter table sem3 alter column v set data type timespan;
+-- run
+
+select name, type from table_info('sem3') where name = 'v';
+→ [{"name":"v","type":"TIMESPAN"}]
+
+-- the stored values are untouched: same physical class, no rewrite
+select id, v, typeof(v) from sem3 order by id;
+→ [{"id":1,"v":"PT1H","typeof(v)":"text"},{"id":2,"v":"PT2H","typeof(v)":"text"}]
+
+-- an index-backed lookup by ANOTHER spelling of the stored duration finds the row
+select id from sem3 where v = 'PT60M';
+→ [{"id":1}]
+
+select id from sem3 where v = 'PT3600S';
+→ [{"id":1}]
+
+-- ...and uniqueness now enforces semantically: 120 minutes duplicates the stored 'PT2H'
+insert into sem3 values (3, 'PT120M');
+-- error: UNIQUE constraint failed
+
+-- a genuinely new duration is still accepted
+insert into sem3 values (4, 'PT30M');
+select id from sem3 where v = 'PT1800S';
+→ [{"id":4}]
+
+drop table sem3;
+
+-- ===================================
+-- 4. Non-unique index: no uniqueness to violate, but the index still has to be re-sorted or
+--    the lookup misses rows. The answer must match the same table with NO index, and the
+--    same table declared TIMESPAN from the start.
+-- ===================================
+
+create table sem4 (id integer primary key, v text);
+create index sem4_v on sem4 (v);
+insert into sem4 values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+alter table sem4 alter column v set data type timespan;
+-- run
+
+select id from sem4 where v = 'PT3600S' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table sem4;
+
+-- 4b. …the identical table with no index at all
+create table sem4b (id integer primary key, v text);
+insert into sem4b values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+alter table sem4b alter column v set data type timespan;
+-- run
+
+select id from sem4b where v = 'PT3600S' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table sem4b;
+
+-- 4c. …and the same rows under a natively-declared TIMESPAN column
+create table sem4c (id integer primary key, v timespan);
+create index sem4c_v on sem4c (v);
+insert into sem4c values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+select id from sem4c where v = 'PT3600S' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table sem4c;
+
+-- ===================================
+-- 5. Reverse direction, TIMESPAN → TEXT: comparison becomes textual again, so the spellings
+--    separate and a duration that was a duplicate becomes insertable.
+-- ===================================
+
+create table sem5 (id integer primary key, v timespan);
+create unique index sem5_v on sem5 (v);
+insert into sem5 values (1, 'PT1H'), (2, 'PT2H');
+-- run
+
+-- while TIMESPAN: another spelling finds the row and duplicates it
+select id from sem5 where v = 'PT60M';
+→ [{"id":1}]
+
+alter table sem5 alter column v set data type text;
+-- run
+
+select name, type from table_info('sem5') where name = 'v';
+→ [{"name":"v","type":"TEXT"}]
+
+-- now purely textual: 'PT60M' is a different value from the stored 'PT1H'
+select id from sem5 where v = 'PT60M';
+→ []
+
+select id from sem5 where v = 'PT1H';
+→ [{"id":1}]
+
+-- ...so it is no longer a duplicate
+insert into sem5 values (3, 'PT60M');
+select count(*) as n from sem5;
+→ [{"n":3}]
+
+drop table sem5;
+
+-- ===================================
+-- 6. A retype into a type that compares IDENTICALLY stays a metadata-only no-op — the
+--    guard must not re-validate or re-sort on every `text → varchar` widening.
+-- ===================================
+
+create table sem6 (id integer primary key, v text);
+create unique index sem6_v on sem6 (v);
+insert into sem6 values (1, 'PT1H'), (2, 'PT60M');
+-- run
+
+-- both spellings survive: still two distinct TEXT values
+alter table sem6 alter column v set data type varchar(50);
+-- run
+
+select id, v from sem6 order by id;
+→ [{"id":1,"v":"PT1H"},{"id":2,"v":"PT60M"}]
+
+select id from sem6 where v = 'PT60M';
+→ [{"id":2}]
+
+drop table sem6;
+
+-- 6b. integer → bigint, likewise a no-op
+create table sem6b (id integer primary key, n integer);
+create unique index sem6b_n on sem6b (n);
+insert into sem6b values (1, 10), (2, 9);
+-- run
+
+alter table sem6b alter column n set data type bigint;
+-- run
+
+select id, n from sem6b order by id;
+→ [{"id":1,"n":10},{"id":2,"n":9}]
+
+select id from sem6b where n = 9;
+→ [{"id":2}]
+
+drop table sem6b;
+
+-- ===================================
+-- 7. DATE / TIME / DATETIME carry their own comparison, hard-wired to BINARY and ignoring
+--    the column's declared collation. So `text collate nocase → date` changes the ordering
+--    too, even though both orderings are "textual" — the guard turns on comparator
+--    identity, not on semantic ordering alone.
+-- ===================================
+
+create table sem7 (id integer primary key, d text collate nocase);
+create unique index sem7_d on sem7 (d);
+insert into sem7 values (1, '2024-01-01'), (2, '2024-02-01');
+-- run
+
+alter table sem7 alter column d set data type date;
+-- run
+
+select name, type from table_info('sem7') where name = 'd';
+→ [{"name":"d","type":"DATE"}]
+
+select id from sem7 where d = '2024-02-01';
+→ [{"id":2}]
+
+select id, d from sem7 order by d;
+→ [{"id":1,"d":"2024-01-01"},{"id":2,"d":"2024-02-01"}]
+
+drop table sem7;
+
+-- ===================================
+-- 8. EFFECTIVE rows, not committed rows: a collision involving a row the open transaction
+--    has staged but not committed MUST reject the retype, and the transaction stays usable.
+-- ===================================
+
+create table sem8 (id integer primary key, v text);
+create unique index sem8_v on sem8 (v);
+insert into sem8 values (1, 'PT1H');
+-- run
+
+begin;
+-- run
+insert into sem8 values (2, 'PT60M');
+-- run
+
+alter table sem8 alter column v set data type timespan;
+-- error: UNIQUE constraint failed
+
+-- the transaction survived the rejection: removing the offending row lets the retry pass
+delete from sem8 where id = 2;
+-- run
+alter table sem8 alter column v set data type timespan;
+-- run
+commit;
+-- run
+
+select id, v from sem8 order by id;
+→ [{"id":1,"v":"PT1H"}]
+
+-- committed under the new type, so the re-sorted index answers semantically
+select id from sem8 where v = 'PT3600S';
+→ [{"id":1}]
+
+drop table sem8;
+
+-- 8b. …and a collision only among rows the transaction has DELETED does NOT block it.
+create table sem8b (id integer primary key, v text);
+create unique index sem8b_v on sem8b (v);
+insert into sem8b values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+begin;
+-- run
+delete from sem8b where id = 2;
+-- run
+alter table sem8b alter column v set data type timespan;
+-- run
+commit;
+-- run
+
+select id from sem8b where v = 'PT3600S';
+→ [{"id":1}]
+
+select id from sem8b where v = 'PT120M';
+→ [{"id":3}]
+
+drop table sem8b;

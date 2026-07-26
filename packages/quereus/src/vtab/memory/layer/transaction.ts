@@ -164,12 +164,17 @@ export class TransactionLayer implements Layer {
 	 *    `IndexSchema` (so an index scan raises "Secondary index not found") nor the derived
 	 *    `uniqueConstraints` entry (so `checkUniqueConstraints` silently skips it and a
 	 *    colliding insert is accepted).
-	 *  - **Re-keying** (`alter column … set collate`): an index whose `IndexSchema` object
-	 *    is no longer the one this layer holds is REPLACED. `BaseLayer.rebuildAllSecondaryIndexes`
-	 *    hands every index a fresh BTree under the new collation, so a layer that kept its old
-	 *    `MemoryIndex` would go on comparing under the old collation over an orphaned tree —
-	 *    and, once it becomes the committed head at commit, would shadow the base's rebuilt
-	 *    structures entirely.
+	 *  - **Re-keying** (`alter column … set collate`, or an `alter column … set data type` that
+	 *    keeps the physical storage class but moves to a differently-ordering logical type —
+	 *    text ↔ timespan, where 'PT1H' and 'PT60M' are one value): an index whose `IndexSchema`
+	 *    object is no longer the one this layer holds is REPLACED.
+	 *    `BaseLayer.rebuildAllSecondaryIndexes` hands every index a fresh BTree under the new
+	 *    comparator, so a layer that kept its old `MemoryIndex` would go on comparing the old way
+	 *    over an orphaned tree — and, once it becomes the committed head at commit, would shadow
+	 *    the base's rebuilt structures entirely. The retype has no index-column field to change
+	 *    (an index column carries no logical type; it reads the column's), so
+	 *    `MemoryTableManager.alterColumn` rebuilds the `IndexSchema` objects purely to raise this
+	 *    signal — see its `structuresRekeyed` branch.
 	 *  - **Removal** (`drop index` / `drop constraint`): an index whose name the new schema no
 	 *    longer declares is DROPPED from {@link secondaryIndexes}. Without it the layer keeps the
 	 *    derived `uniqueConstraints` entry in its frozen schema and goes on enforcing a constraint
