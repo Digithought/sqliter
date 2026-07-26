@@ -177,6 +177,44 @@ async function resolveDmlSourceRows(
 }
 
 /**
+ * The row the substrate actually STORED for this write, which is what every
+ * post-write consumer must see: `vtab.update()` returns `result.row` after the
+ * storage layer has coerced the proposed values to the declared column logical
+ * types (`coerceRowToSchema` in the memory manager / store table; the overlay's
+ * own coercion in the isolation layer). The raw row we handed in still carries
+ * the user's un-converted input — `'{"a":2}'` as TEXT rather than the parsed
+ * JSON value a subsequent `select` reads back.
+ *
+ * Falls back to the raw row when the substrate's row is absent or the wrong
+ * width (a minimal test/sample module that echoes its input, or one that returns
+ * nothing) — those never coerce, so raw IS stored for them.
+ */
+function storedRowOrRaw(resultRow: Row | undefined, rawRow: Row, columnCount: number): Row {
+	return resultRow && resultRow.length === columnCount ? resultRow : rawRow;
+}
+
+/**
+ * Rebuild the flat OLD/NEW row with its NEW section (indices n..2n-1) replaced by
+ * the substrate's stored row, so `RETURNING new.<col>` reports the same value and
+ * `typeof` as a subsequent `select`. Returns `flatRow` untouched when the stored
+ * row IS the raw NEW section (the fallback above), avoiding a per-row copy.
+ *
+ * NOTE: on a coercing substrate this allocates one array per written row (the
+ * DML executor previously yielded `flatRow` verbatim). It is one copy against a
+ * per-row `vtab.update()` await, so it does not register today; if bulk-INSERT
+ * throughput ever shows this as hot, have the substrates report which columns
+ * coercion actually changed and patch only those in place.
+ */
+function withStoredNewSection(flatRow: Row, storedRow: Row, rawNewRow: Row, columnCount: number): Row {
+	if (storedRow === rawNewRow) return flatRow;
+	const out = flatRow.slice() as Row;
+	for (let i = 0; i < columnCount; i++) {
+		out[columnCount + i] = storedRow[i];
+	}
+	return out;
+}
+
+/**
  * Emit an automatic data change event for modules without native event support.
  */
 function emitAutoDataEvent(
@@ -495,10 +533,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			return undefined;
 		}
 
-		// Build a flat row for RETURNING (OLD = existing, NEW = updated)
-		const flatRow: Row = [...existingRow, ...updatedRow];
+		// Report the row the substrate STORED, not the one we composed — see
+		// storedRowOrRaw. `existingRow` is already a stored (coerced) row.
+		const storedRow = storedRowOrRaw(updateResult.row, updatedRow, tableSchema.columns.length);
 
-		return { updatedRow, flatRow };
+		// Build a flat row for RETURNING (OLD = existing, NEW = stored)
+		const flatRow: Row = [...existingRow, ...storedRow];
+
+		return { updatedRow: storedRow, flatRow };
 	}
 
 	/**
@@ -848,6 +890,13 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			return undefined;
 		}
 
+		// Everything downstream of the write — change tracking, row-time MV
+		// maintenance, auto-events, and the row RETURNING projects — must see the
+		// row the substrate STORED, not the raw input we handed it. See
+		// storedRowOrRaw.
+		const numCols = tableSchema.columns.length;
+		const storedRow = storedRowOrRaw(result.row, newRow, numCols);
+
 		// Internal REPLACE evictions (rows at OTHER PKs removed to resolve a non-PK
 		// UNIQUE conflict) run the full delete pipeline here, before the new row's
 		// own bookkeeping — evict-then-write, matching the substrate journal order.
@@ -856,31 +905,31 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const replacedRow = result.replacedRow;
 
 		if (replacedRow) {
-			const newKeyValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
-			ctx.db._recordUpdate(tableKey, replacedRow, newRow, pkColumnIndicesInSchema);
-			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow }, backingConnCache, deferredRebuilds, residualBatch);
+			const newKeyValues = pkColumnIndicesInSchema.map(idx => storedRow[idx]);
+			ctx.db._recordUpdate(tableKey, replacedRow, storedRow, pkColumnIndicesInSchema);
+			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow: storedRow }, backingConnCache, deferredRebuilds, residualBatch);
 			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', replacedRow, undefined, plan.lensRouted);
 
 			if (needsAutoEvents) {
 				const changedColumns: string[] = [];
-				for (let i = 0; i < tableSchema.columns.length; i++) {
-					if (!sqlValueIdentical(replacedRow[i], newRow[i])) {
+				for (let i = 0; i < numCols; i++) {
+					if (!sqlValueIdentical(replacedRow[i], storedRow[i])) {
 						changedColumns.push(tableSchema.columns[i].name);
 					}
 				}
-				emitAutoDataEvent(ctx, tableSchema, 'update', newKeyValues, [...replacedRow], [...newRow], changedColumns);
+				emitAutoDataEvent(ctx, tableSchema, 'update', newKeyValues, [...replacedRow], [...storedRow], changedColumns);
 			}
 		} else {
-			const pkValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
-			ctx.db._recordInsert(tableKey, newRow, pkColumnIndicesInSchema);
-			await maintainRowTimeStructures(ctx, tableKey, { op: 'insert', newRow }, backingConnCache, deferredRebuilds, residualBatch);
+			const pkValues = pkColumnIndicesInSchema.map(idx => storedRow[idx]);
+			ctx.db._recordInsert(tableKey, storedRow, pkColumnIndicesInSchema);
+			await maintainRowTimeStructures(ctx, tableKey, { op: 'insert', newRow: storedRow }, backingConnCache, deferredRebuilds, residualBatch);
 
 			if (needsAutoEvents) {
-				emitAutoDataEvent(ctx, tableSchema, 'insert', pkValues, undefined, [...newRow]);
+				emitAutoDataEvent(ctx, tableSchema, 'insert', pkValues, undefined, [...storedRow]);
 			}
 		}
 
-		return flatRow;
+		return withStoredNewSection(flatRow, storedRow, newRow, numCols);
 	}
 
 	/**
@@ -1052,6 +1101,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			return undefined;
 		}
 
+		// Post-write bookkeeping and the RETURNING row must see the row the
+		// substrate STORED, not the raw input — see storedRowOrRaw. `oldRow` came
+		// from the source scan, so it is already a stored (coerced) row.
+		const numCols = tableSchema.columns.length;
+		const storedRow = storedRowOrRaw(result.row, newRow, numCols);
+
 		// If the UPDATE moved this row onto an occupied PK under REPLACE,
 		// the vtab returns the displaced row. Surface its deletion BEFORE
 		// the move bookkeeping so change tracking, FK cascade, and auto-events
@@ -1086,30 +1141,30 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		ctx.db._recordUpdate(
 			tableKey,
 			oldRow,
-			newRow,
+			storedRow,
 			pkColumnIndicesInSchema,
 		);
 		await maintainRowTimeStructures(ctx, tableKey,
-			{ op: 'update', oldRow, newRow }, backingConnCache, deferredRebuilds, residualBatch);
+			{ op: 'update', oldRow, newRow: storedRow }, backingConnCache, deferredRebuilds, residualBatch);
 
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
-		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', oldRow, newRow, plan.lensRouted);
+		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', oldRow, storedRow, plan.lensRouted);
 
 		// Emit auto event for modules without native event support
 		if (needsAutoEvents) {
 			// Compute changed columns
 			const changedColumns: string[] = [];
-			for (let i = 0; i < tableSchema.columns.length; i++) {
+			for (let i = 0; i < numCols; i++) {
 				const oldVal = oldRow[i];
-				const newVal = newRow[i];
+				const newVal = storedRow[i];
 				if (!sqlValueIdentical(oldVal, newVal)) {
 					changedColumns.push(tableSchema.columns[i].name);
 				}
 			}
-			emitAutoDataEvent(ctx, tableSchema, 'update', keyValues, [...oldRow], [...newRow], changedColumns);
+			emitAutoDataEvent(ctx, tableSchema, 'update', keyValues, [...oldRow], [...storedRow], changedColumns);
 		}
 
-		return flatRow;
+		return withStoredNewSection(flatRow, storedRow, newRow, numCols);
 	}
 
 	// DELETE ----------------------------------------------------
