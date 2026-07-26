@@ -566,7 +566,11 @@ export interface VirtualTableModule<
 	 *
 	 * Not covered: a `select *` materialized view's persisted backing COLUMN LIST shifts
 	 * under a column rename with no AST change and no persist event, so nothing asks here
-	 * (see the `NOTE:` on `restoreUnaffectedMaterializedViews`).
+	 * (see the `NOTE:` on `restoreUnaffectedMaterializedViews`); and dependent TABLE
+	 * entries — the FK / CHECK / partial-index rewrites a rename propagates into other
+	 * tables — re-persist through the same swallowing path with no veto at all, since
+	 * {@link CatalogObjectKind} has no `'table'` case
+	 * (`bug-store-rename-diverges-dependent-table-catalog-entry`).
 	 */
 	assertCatalogObjectPersistable?(
 		db: Database,

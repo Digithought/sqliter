@@ -77,6 +77,18 @@ async function rows(db: Database, sql: string): Promise<Record<string, unknown>[
 	return (await asyncIterableToArray(db.eval(sql))) as Record<string, unknown>[];
 }
 
+/** Asserts `sql` is refused, naming the unpaired surrogate rather than some later symptom. */
+async function expectRejected(db: Database, sql: string): Promise<void> {
+	let raised: unknown;
+	try {
+		await db.exec(sql);
+	} catch (e) {
+		raised = e;
+	}
+	expect(raised, `expected a rejection from: ${sql}`).to.not.be.undefined;
+	expect(String(raised)).to.match(/unpaired surrogate/i);
+}
+
 describe('StoreModule view / materialized-view persistence', () => {
 	let provider: ReturnType<typeof createPersistentProvider>;
 
@@ -150,6 +162,54 @@ describe('StoreModule view / materialized-view persistence', () => {
 		expect(db2.schemaManager.getView('main', 'v')!.sql, 'DDL references new column name')
 			.to.match(/\bamount\b/);
 		expect(await rows(db2, 'select id, amount from v')).to.deep.equal([{ id: 1, amount: 10 }]);
+	});
+
+	// ── Reopen after a REFUSED rename ────────────────────────────────
+	//
+	// The mirror image of the two tests above. `alter table … rename` is refused up front
+	// when the rewritten dependent would no longer be persistable (see the pre-flight in
+	// `schema/catalog-persistability.ts`, and the rejection cases in
+	// `lone-surrogate-keys.spec.ts`). Those cases assert the durable catalog entry
+	// directly; these assert the fact one level up — the refusal really is a clean no-op
+	// across close → reopen, with no half-written or deleted entry left behind.
+	//
+	// A lone (unpaired) UTF-16 surrogate is the trigger: a legal JS string and a legal
+	// Quereus text value, but no UTF-8 byte sequence encodes it, so the store cannot write
+	// it. The renamed object is memory-backed on purpose — a store-backed one would be
+	// refused earlier, by the store's own physical-store-name guard.
+	const LONE_HIGH = '\uD800';
+
+	it('a REFUSED materialized-view rename leaves the MV intact across reopen', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table base (id integer primary key, v integer) using store`);
+		await db.exec(`insert into base values (1, 10), (2, 20)`);
+		// Memory-backed MV over a STORE table, so the MV survives reopen by re-deriving.
+		await db.exec(`create materialized view mv as select id, v from base`);
+		await expectRejected(db, `alter table mv rename to "${LONE_HIGH}"`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate after the refused rename').to.have.lengthOf(0);
+		expect(result.materializedViews, 'the MV kept its own name').to.deep.equal(['main.mv']);
+		expect(await rows(db2, 'select id, v from mv order by id'))
+			.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+	});
+
+	it('a REFUSED column rename leaves a dependent view queryable across reopen', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table base (id integer primary key, v integer) using store`);
+		await db.exec(`insert into base values (1, 10)`);
+		await db.exec(`create view v as select id, v from base`);
+		// Refused because `base` is store-backed; the point is that neither the column nor
+		// the view body is left half-rewritten once the storage is reopened.
+		await expectRejected(db, `alter table base rename column v to "${LONE_HIGH}"`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate after the refused rename').to.have.lengthOf(0);
+		expect(db2.schemaManager.getView('main', 'v')!.sql, 'the view body still names v')
+			.to.match(/\bv\b/);
+		expect(await rows(db2, 'select id, v from v')).to.deep.equal([{ id: 1, v: 10 }]);
 	});
 
 	it('view tags persist across reopen (SET, then ADD, then DROP)', async () => {

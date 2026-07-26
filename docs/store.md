@@ -662,9 +662,15 @@ is offered here — and a renamed materialized view's own new catalog key and DD
 vetted too. One visible consequence: for a **store-backed** table that has a dependent view,
 the pre-flight now fires ahead of the physical store-name guard, so the error changes from
 `cannot store the identifier …` to `cannot store persisted schema text …`. Both name the
-unpaired surrogate; both leave the catalog and all physical storage untouched. Still
-uncovered: a module that has never been handed a `Database` persists nothing and therefore
-vetoes nothing — `bug-store-untouched-table-and-early-view-never-persisted`.
+unpaired surrogate; both leave the catalog and all physical storage untouched.
+
+Still uncovered: a module that has never been handed a `Database` persists nothing and
+therefore vetoes nothing (`bug-store-untouched-table-and-early-view-never-persisted`); and
+dependent **tables** get no veto at all, because the hook takes only a view or a
+materialized view. A rename propagated into another table's FK target, CHECK expression or
+partial-index predicate re-persists fire-and-forget, so renaming an in-memory table under a
+store-backed dependent succeeds while that dependent's persisted DDL keeps the old name —
+`bug-store-rename-diverges-dependent-table-catalog-entry`.
 
 `@quereus/sync`'s metadata key builders
 (`buildColumnVersionKey`, `buildTombstoneKey`, etc. in `metadata/keys.ts`) apply the same

@@ -648,12 +648,18 @@ ahead of the store's physical store-name guard, so the reported message changes 
 `cannot store the identifier …` to `cannot store persisted schema text …`. Both name the
 unpaired surrogate and both leave a clean no-op.
 
-Two things stay uncovered. A `select *` materialized view's persisted backing **column
+Three things stay uncovered. A `select *` materialized view's persisted backing **column
 list** shifts under a column rename with no AST change at all, so the scan cannot see it
 (and no persist event fires) — harmless today because reopen re-derives an implicit MV's
 shape from its body; see the `NOTE:` on `restoreUnaffectedMaterializedViews` in
-`runtime/emit/materialized-view-helpers.ts`. And a store module that has not yet subscribed
-to a database never vetoes at all —
+`runtime/emit/materialized-view-helpers.ts`. Dependent **tables** — the FK
+`referencedTable`, CHECK-expression and partial-index-predicate rewrites
+`rewriteTableForTableRename` / `rewriteTableForColumnRename` perform — re-persist through
+the same swallowing path with nothing vetting them, because `CatalogObjectKind` has no
+`'table'` case; reproduced (a memory table renamed under a store-backed FK dependent
+succeeds, and the dependent's persisted DDL keeps the old name) and tracked as
+`bug-store-rename-diverges-dependent-table-catalog-entry`. And a store module that has not
+yet subscribed to a database never vetoes at all —
 `bug-store-untouched-table-and-early-view-never-persisted`.
 
 **Rehydrate phasing.** `rehydrateCatalog` first consumes the clean-shutdown

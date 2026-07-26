@@ -314,9 +314,10 @@ async function runRenameColumn(
 
 	// Pre-flight, BEFORE the first side effect (`module.alterTable`): the rewritten
 	// body of every dependent view / materialized view must still be persistable —
-	// same unfailable-propagation reasoning as the table-rename arm above. Uses the
-	// very resolver `propagateColumnRename` will build, so the probe computes exactly
-	// the rewrite the real pass computes. Safe to evaluate pre-mutation:
+	// same unfailable-propagation reasoning as the table-rename arm above. Shares one
+	// resolver with `propagateColumnRename` so the two passes cannot drift apart in
+	// code; what makes them agree at RUNTIME (the resolver reads the LIVE catalog, and
+	// this probe runs pre-mutation while the propagation runs post-) is that
 	// `isTableInUnaliasedScope` skips the renamed table itself and probes only OTHER
 	// sources, whose column sets this rename does not touch.
 	const resolveColumnInSource = buildColumnSourceResolver(rctx.db);
@@ -1860,7 +1861,9 @@ function rewriteTableForTableRename(
  * The catalog-backed {@link ResolveColumnInSource} the column-rename rewriters consult
  * to keep their unqualified-reference walk scope-aware. Built once per statement and
  * shared by the pre-flight probe in {@link runRenameColumn} and the real propagation
- * below, so the rewrite the probe computes is the rewrite that later lands.
+ * below, so the two cannot drift apart. Note it resolves against the LIVE catalog on
+ * every call, so sharing it does not by itself freeze the answer between the two passes
+ * — see the pre-flight's comment for why they agree anyway.
  */
 function buildColumnSourceResolver(db: Database): ResolveColumnInSource {
 	return (s, t, col) => {
