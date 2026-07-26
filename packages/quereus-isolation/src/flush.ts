@@ -1,7 +1,7 @@
 import type { SqlValue, UpdateResult, RowOp, VirtualTable } from '@quereus/quereus';
 import { QuereusError, StatusCode, isConstraintViolation } from '@quereus/quereus';
 import { makePkPointLookupFilter } from './filter-info.js';
-import { collectOverlayEntries } from './overlay-rows.js';
+import { type OverlayEntry, collectOverlayEntries } from './overlay-rows.js';
 
 /**
  * Applies every staged overlay row to the underlying table WITHOUT committing.
@@ -58,6 +58,20 @@ export async function applyOverlayToUnderlying(
 	const ordered = [...overlayEntries].sort((a, b) =>
 		(a.isTombstone === b.isTombstone ? 0 : a.isTombstone ? -1 : 1));
 
+	// Resolve insert-vs-update for every live row BEFORE any write of this flush
+	// lands. `rowExistsInUnderlying` drives the underlying's PK index, and a
+	// module whose read path cannot serve an index-driven scan over its own
+	// uncommitted writes fails every probe after the first (lamina's
+	// staged-overlay wrapper refuses a compound-index scan once the episode holds
+	// staged drafts). Each PK appears at most once in the overlay, so no write in
+	// this flush can change another entry's existence answer — hoisting the
+	// probes is answer-preserving as well as one fewer read per written row.
+	const existsInUnderlying = new Map<OverlayEntry, boolean>();
+	for (const entry of ordered) {
+		if (entry.isTombstone) continue;
+		existsInUnderlying.set(entry, await rowExistsInUnderlying(underlyingTable, pkIndices, entry.pk));
+	}
+
 	for (const entry of ordered) {
 		if (entry.isTombstone) {
 			const result = await underlyingTable.update({
@@ -67,9 +81,8 @@ export async function applyOverlayToUnderlying(
 			});
 			assertFlushWriteOk(result, 'delete', entry.pk, tableName);
 		} else {
-			// Insert vs update decided by whether the row already exists underlying.
-			const existsInUnderlying = await rowExistsInUnderlying(underlyingTable, pkIndices, entry.pk);
-			if (existsInUnderlying) {
+			// Insert vs update decided by the pre-write probe above.
+			if (existsInUnderlying.get(entry) === true) {
 				const result = await underlyingTable.update({
 					operation: 'update',
 					values: entry.dataRow,

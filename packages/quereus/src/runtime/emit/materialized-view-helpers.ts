@@ -2199,6 +2199,15 @@ function classifyBackingReshape(current: TableSchema, shape: BackingShape): Resh
 	// rows may still violate them, but the re-derived body rows will not. A NOT NULL
 	// *loosening* never throws on data, so it stays pre-reconcile. `name` is the
 	// column's post-rename (new) name.
+	// NOTE: `retype` is queued before `recollate`, so a `TEXT COLLATE NOCASE` → `DATE`
+	// reshape transits an illegal `DATE COLLATE NOCASE` shape between the two ops. Harmless
+	// today — these lift straight onto `module.alterTable`, bypassing the engine-side
+	// SET-DATA-TYPE collation guard (runtime/emit/alter-table.ts), and the following
+	// `recollate` lands the legal final shape. It matters if either changes: if that guard
+	// ever moves module-side the retype op starts failing, and on a store backend a crash
+	// between the two ops leaves catalog DDL that does not re-parse. Fix then is the
+	// differ's rule (schema-differ.ts `comparisonDomainAlters`): queue the collation change
+	// first when its target is BINARY, after the retype otherwise.
 	const recordAttrShift = (from: ColumnSchema, to: ColumnSchema, name: string): void => {
 		if (!backingTypeMatches(from, to)) postReconcileOps.push({ kind: 'retype', name, newTypeName: to.logicalType.name });
 		if (!backingCollationMatches(from, to)) postReconcileOps.push({ kind: 'recollate', name, collation: to.collation ?? 'BINARY' });

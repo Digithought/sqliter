@@ -2317,6 +2317,28 @@ function orderDropsByFKDependency(
 }
 
 /**
+ * One column's `SET DATA TYPE` / `SET COLLATE` statements, ordered so the engine
+ * accepts them. `SET DATA TYPE` carries the column's CURRENT collation into the new
+ * type and is rejected when the new type does not accept it, so a retype into a
+ * BINARY-only type (`DATE`/`TIME`/`DATETIME`/`TIMESPAN`/`JSON`) must follow its
+ * `SET COLLATE BINARY` rather than precede it.
+ *
+ * Collate-first is the right order exactly when the target collation is BINARY: every
+ * type accepts BINARY, so that statement never fails on the OLD type, and the retype
+ * then arrives with a collation the new type accepts. A non-BINARY target must land
+ * AFTER the retype instead — the new type is the one declaring support for it, and
+ * setting it on the old type could be rejected (`DATE` → `TEXT COLLATE NOCASE`).
+ */
+function comparisonDomainAlters(quotedTable: string, quotedCol: string, change: ColumnAttributeChange): string[] {
+	const prefix = `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol}`;
+	const retype = change.dataType !== undefined ? [`${prefix} SET DATA TYPE ${change.dataType}`] : [];
+	const recollate = change.collation !== undefined ? [`${prefix} SET COLLATE ${change.collation}`] : [];
+	return normalizeCollationName(change.collation ?? 'BINARY') === 'BINARY'
+		? [...recollate, ...retype]
+		: [...retype, ...recollate];
+}
+
+/**
  * Generates migration DDL statements from a schema diff
  */
 export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): string[] {
@@ -2379,8 +2401,9 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	// Phase order within one table:
 	//   RENAME COLUMN (so subsequent phases see post-rename column names)
 	//   → ADD COLUMN
-	//   → ALTER COLUMN (type, then default, then nullability — so SET NOT NULL
-	//     can rely on an already-populated DEFAULT for backfill)
+	//   → ALTER COLUMN (comparison domain, then default, then nullability — so SET
+	//     NOT NULL can rely on an already-populated DEFAULT for backfill; the
+	//     type/collation pair orders internally, see comparisonDomainAlters)
 	//   → RENAME CONSTRAINT, then DROP CONSTRAINT (free / remove a name before any
 	//     re-add; a UNIQUE drop precedes the PK change so it can't strand a PK dep)
 	//   → ALTER PRIMARY KEY
@@ -2396,14 +2419,9 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		}
 		for (const colAlter of alter.columnsToAlter) {
 			const quotedCol = quoteIdentifier(colAlter.columnName);
-			if (colAlter.dataType !== undefined) {
-				statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET DATA TYPE ${colAlter.dataType}`);
-			}
-			// SET COLLATE right after SET DATA TYPE (both are comparison-domain
-			// changes), before DEFAULT / NOT NULL.
-			if (colAlter.collation !== undefined) {
-				statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET COLLATE ${colAlter.collation}`);
-			}
+			// SET DATA TYPE / SET COLLATE lead the per-column phase (both are
+			// comparison-domain changes), before DEFAULT / NOT NULL.
+			statements.push(...comparisonDomainAlters(quotedTable, quotedCol, colAlter));
 			if (colAlter.defaultValue !== undefined) {
 				if (colAlter.defaultValue === null) {
 					statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);

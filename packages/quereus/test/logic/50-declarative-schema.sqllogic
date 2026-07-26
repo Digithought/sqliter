@@ -1586,3 +1586,74 @@ declare schema decl_seed_dup_unique using (default_vtab_module = 'memory') {
 
 apply schema decl_seed_dup_unique with seed;
 -- error: UNIQUE constraint failed
+
+-- Comparison-domain ALTER ordering. A column whose declared type AND collation both
+-- drift needs `SET DATA TYPE` and `SET COLLATE` in the order the engine accepts:
+-- `SET DATA TYPE` carries the column's CURRENT collation into the new type, and
+-- DATE / TIME / DATETIME / TIMESPAN / JSON accept BINARY only, so narrowing a
+-- `TEXT COLLATE NOCASE` column to `DATE` must emit `SET COLLATE BINARY` FIRST — the
+-- other order is rejected engine-side and aborts the whole migration
+-- (bug-retype-keeps-illegal-collation). Widening back keeps the opposite order: NOCASE
+-- can only land once the column is TEXT again.
+declare schema decl_collate_retype using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		d TEXT COLLATE NOCASE
+	}
+}
+
+-- run
+
+apply schema decl_collate_retype;
+insert into decl_collate_retype.t values (1, '2024-01-01'), (2, '2024-02-01');
+
+-- run
+
+-- Narrowing: TEXT COLLATE NOCASE → DATE.
+declare schema decl_collate_retype using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		d DATE
+	}
+}
+
+-- run
+
+diff schema decl_collate_retype;
+→ [{"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET COLLATE BINARY"}, {"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET DATA TYPE DATE"}]
+
+apply schema decl_collate_retype;
+
+-- run
+
+-- Converged (no residual drift) and the rows survived the retype.
+diff schema decl_collate_retype;
+→ []
+
+select id, d from decl_collate_retype.t order by d;
+→ [{"id": 1, "d": "2024-01-01"}, {"id": 2, "d": "2024-02-01"}]
+
+-- Widening back: DATE → TEXT COLLATE NOCASE, retype first this time.
+declare schema decl_collate_retype using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		d TEXT COLLATE NOCASE
+	}
+}
+
+-- run
+
+diff schema decl_collate_retype;
+→ [{"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET DATA TYPE TEXT"}, {"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET COLLATE NOCASE"}]
+
+apply schema decl_collate_retype;
+
+-- run
+
+diff schema decl_collate_retype;
+→ []
+
+select id, d from decl_collate_retype.t order by id;
+→ [{"id": 1, "d": "2024-01-01"}, {"id": 2, "d": "2024-02-01"}]
+
+drop table decl_collate_retype.t;
