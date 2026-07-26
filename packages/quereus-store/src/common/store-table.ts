@@ -22,6 +22,7 @@ import {
 	hasSemanticOrdering,
 	semanticKeyTransform,
 	resolveUniqueEnforcementCollations,
+	uniqueEnforcementComparators,
 	BINARY_COLLATION,
 	rowsValueIdentical,
 	coerceRowToSchema,
@@ -2238,17 +2239,15 @@ export class StoreTable extends VirtualTable {
 	 * 'PT60M', matching the memory backend's typed BTree), else the enforcement
 	 * collation the caller resolved (`resolveUniqueEnforcementCollations`) through
 	 * `compareSqlValuesFast` — the exact comparison every finder used before.
+	 *
+	 * Thin wrapper over the engine's `uniqueEnforcementComparators`, which memory
+	 * and the isolation overlay share so the three backends cannot drift.
 	 */
 	private uniqueColumnComparators(
 		uc: UniqueConstraintSchema,
 		collations: ReadonlyArray<CollationFunction>,
 	): ((a: SqlValue, b: SqlValue) => number)[] {
-		const columns = this.tableSchema!.columns;
-		return uc.columns.map((colIdx, i) => {
-			const logicalType = columns[colIdx]?.logicalType;
-			if (hasSemanticOrdering(logicalType)) return createTypedComparator(logicalType, collations[i]);
-			return (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collations[i]);
-		});
+		return uniqueEnforcementComparators(this.tableSchema!.columns, uc.columns, collations);
 	}
 
 	/**

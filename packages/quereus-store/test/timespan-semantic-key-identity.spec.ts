@@ -145,24 +145,23 @@ describe('TIMESPAN semantic key identity (store)', () => {
 
 	describe('secondary UNIQUE identity', () => {
 		it("rejects 'PT60M' after 'PT1H' in a UNIQUE column, honoring `on conflict`", async () => {
-			// No memory oracle here: the memory backend's plain-UNIQUE enforcement still
-			// compares under collation and ADMITS the equal-elapsed spelling, contradicting
-			// the semantic-ordering ruling — tracked as fix/bug-memory-unique-timespan-spelling.
-			// The store enforces the ruling.
 			await db.exec(`create table t (id integer primary key, d timespan unique) using store`);
+			await db.exec(`create table m (id integer primary key, d timespan unique)`);
 
-			await db.exec(`insert into t values (1, 'PT1H')`);
-			const err = await attempt(db, `insert into t values (2, 'PT60M')`);
-			expect(err, 'store must reject the equal-elapsed UNIQUE value').to.not.be.null;
-			expect(String(err)).to.match(/unique/i);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT1H')`);
+				const err = await attempt(db, `insert into ${tbl} values (2, 'PT60M')`);
+				expect(err, `${tbl} must reject the equal-elapsed UNIQUE value`).to.not.be.null;
+				expect(String(err)).to.match(/unique/i);
 
-			await db.exec(`insert or ignore into t values (3, 'PT60M')`);
-			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(1);
+				await db.exec(`insert or ignore into ${tbl} values (3, 'PT60M')`);
+				expect((await db.get(`select count(*) as cnt from ${tbl}`))?.cnt).to.equal(1);
 
-			await db.exec(`insert or replace into t values (4, 'PT60M')`);
-			const rows = await asyncIterableToArray(db.eval(`select id, d from t`));
-			expect(rows).to.have.lengthOf(1);
-			expect(Number(rows[0].id)).to.equal(4);
+				await db.exec(`insert or replace into ${tbl} values (4, 'PT60M')`);
+				const rows = await asyncIterableToArray(db.eval(`select id, d from ${tbl}`));
+				expect(rows).to.have.lengthOf(1);
+				expect(Number(rows[0].id)).to.equal(4);
+			}
 		});
 
 		it('rejects `create unique index` over existing equal-elapsed spellings', async () => {
@@ -176,12 +175,16 @@ describe('TIMESPAN semantic key identity (store)', () => {
 
 		it('maintains a UNIQUE index across an UPDATE that re-spells the indexed value', async () => {
 			await db.exec(`create table t (id integer primary key, d timespan unique) using store`);
-			await db.exec(`insert into t values (1, 'PT1H')`);
-			// Same identity, new spelling: must not conflict with itself, and afterwards
-			// the sole index entry must still block a third equal-elapsed spelling.
-			expect(await attempt(db, `update t set d = 'PT60M' where id = 1`)).to.be.null;
-			expect(await attempt(db, `insert into t values (2, 'PT1H0S')`)).to.not.be.null;
-			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(1);
+			await db.exec(`create table m (id integer primary key, d timespan unique)`);
+
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT1H')`);
+				// Same identity, new spelling: must not conflict with itself, and afterwards
+				// the sole index entry must still block a third equal-elapsed spelling.
+				expect(await attempt(db, `update ${tbl} set d = 'PT60M' where id = 1`)).to.be.null;
+				expect(await attempt(db, `insert into ${tbl} values (2, 'PT1H0S')`)).to.not.be.null;
+				expect((await db.get(`select count(*) as cnt from ${tbl}`))?.cnt).to.equal(1);
+			}
 		});
 	});
 

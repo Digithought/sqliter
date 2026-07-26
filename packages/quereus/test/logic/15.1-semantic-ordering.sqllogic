@@ -196,6 +196,84 @@ select dt.id as l, jt2.id as r from dt join jt2 on dt.d = jt2.d order by l;
 drop table jt2;
 drop table dt;
 
+-- === TIMESPAN UNIQUE enforcement: identity, not spelling ===
+--
+-- A UNIQUE constraint over a semantic-ordering column compares candidates through
+-- the column's declared type, so an equal-elapsed re-spelling is a duplicate — the
+-- same identity `=`, DISTINCT and the PRIMARY KEY already use above. Runs under both
+-- the memory module (`yarn test`) and the store module (`yarn test:store`); both must
+-- agree. (Regression: memory's candidate lookup was typed but its re-validation
+-- compared raw text, so the duplicate was found and then discarded as unequal.)
+
+create table u (id integer primary key, d timespan unique);
+insert into u values (1, 'PT1H');
+
+insert into u values (2, 'PT60M');
+-- error: UNIQUE constraint failed
+
+-- `on conflict ignore` drops the duplicate spelling; the original row survives.
+insert or ignore into u values (3, 'PT60M');
+select id, timespan_total_seconds(d) as s from u;
+→ [{"id":1,"s":3600}]
+
+-- `on conflict replace` evicts the row the conflicting spelling names.
+insert or replace into u values (4, 'PT1H0S');
+select id, timespan_total_seconds(d) as s from u;
+→ [{"id":4,"s":3600}]
+
+drop table u;
+
+-- Composite UNIQUE: the TIMESPAN member collapses spellings, a differing leading
+-- column is still a distinct key.
+create table uc (id integer primary key, k integer, d timespan, unique (k, d));
+insert into uc values (1, 1, 'PT1H');
+
+insert into uc values (2, 1, 'PT60M');
+-- error: UNIQUE constraint failed
+
+insert into uc values (3, 2, 'PT60M');
+select count(*) as c from uc;
+→ [{"c":2}]
+
+drop table uc;
+
+-- `create unique index` enforces the same identity at WRITE time (the build-time
+-- dedup over pre-existing rows already did).
+create table ui (id integer primary key, d timespan);
+create unique index ui_d on ui (d);
+insert into ui values (1, 'PT1H');
+
+insert into ui values (2, 'PT60M');
+-- error: UNIQUE constraint failed
+
+drop table ui;
+
+-- UPDATE: re-spelling a row's OWN value is not a self-conflict; moving a row onto
+-- ANOTHER row's identity is.
+create table uu (id integer primary key, d timespan unique);
+insert into uu values (1, 'PT1H'), (2, 'PT30M');
+
+update uu set d = 'PT60M' where id = 1;
+select id, timespan_total_seconds(d) as s from uu order by id;
+→ [{"id":1,"s":3600},{"id":2,"s":1800}]
+
+update uu set d = 'PT60M' where id = 2;
+-- error: UNIQUE constraint failed
+
+select count(*) as c from uu;
+→ [{"c":2}]
+
+drop table uu;
+
+-- Negative control: the SAME strings in a declared TEXT column stay two distinct
+-- values — only a declared semantic-ordering type changes UNIQUE identity.
+create table ut (id integer primary key, d text unique);
+insert into ut values (1, 'PT1H'), (2, 'PT60M');
+select count(*) as c from ut;
+→ [{"c":2}]
+
+drop table ut;
+
 -- === Untyped expressions keep storage-class/text ordering ===
 
 -- Text literals (no declared TIMESPAN type): DISTINCT keeps both spellings.

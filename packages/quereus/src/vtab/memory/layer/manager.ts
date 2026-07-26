@@ -12,8 +12,8 @@ import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
-import { indexEnforcesUnique, uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
-import { compareSqlValues, compareSqlValuesFast, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
+import { indexEnforcesUnique, uniqueEnforcementCollations, uniqueEnforcementComparators } from '../../../schema/unique-enforcement.js';
+import { compareSqlValues, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
@@ -992,6 +992,14 @@ export class MemoryTableManager {
 	 * Returns true if any column covered by a UNIQUE constraint changed between
 	 * old and new rows, or if any column referenced by a partial-UNIQUE predicate
 	 * changed (which may transition the row into or out of the predicate's scope).
+	 *
+	 * NOTE: the per-column test is byte-level `compareSqlValues`, not the enforcement
+	 * comparator, so it OVER-triggers for a semantic-ordering column: rewriting a
+	 * TIMESPAN 'PT1H' to 'PT60M' reports "changed" and re-runs the UNIQUE check, which
+	 * then excludes the row's own primary key and passes. Correct — this only gates
+	 * whether to re-check — just not minimal. If UPDATE-heavy workloads over
+	 * semantic-ordering UNIQUE columns ever show the redundant re-check as hot, route
+	 * this through `uniqueEnforcementComparators` too.
 	 */
 	private uniqueColumnsChanged(schema: TableSchema, oldRow: Row, newRow: Row): boolean {
 		if (!schema.uniqueConstraints) return false;
@@ -1181,9 +1189,12 @@ export class MemoryTableManager {
 		if (existingPKs.length === 0) return null;
 
 		// Resolve the per-column enforcement collations once, ahead of the candidate loop
-		// (which collation governs, and why, is spelled out at the compare below).
+		// (which collation governs, and why, is spelled out at the compare below), then
+		// build the per-column comparators from them through the shared helper the store
+		// and isolation re-validators also use.
 		const enforcementCollations = uc.columns.map((col, i) =>
 			this.collationResolver(index.specColumns[i]?.collation ?? schema.columns[col].collation ?? 'BINARY'));
+		const compares = uniqueEnforcementComparators(schema.columns, uc.columns, enforcementCollations);
 
 		for (const existingPK of existingPKs) {
 			if (this.comparePrimaryKeys(newPrimaryKey, existingPK) === 0) continue;
@@ -1205,7 +1216,12 @@ export class MemoryTableManager {
 			// the enforcing structure, and an explicit `create unique index …
 			// (col collate nocase)` may declare a coarser collation than the
 			// column — re-checking under the column's collation would skip the
-			// case-variant candidates the index legitimately unifies.
+			// case-variant candidates the index legitimately unifies. A
+			// semantic-ordering column (TIMESPAN, JSON) compares through its
+			// declared type's `compare` instead, so the re-check agrees with the
+			// typed BTree that produced the candidate — without it a 'PT60M' probe
+			// found the 'PT1H' row's PK and then discarded it as unequal, and the
+			// duplicate was admitted.
 			// This is the authoritative LIVE-index source for the per-column
 			// enforcement collation. The shared `uniqueEnforcementCollations(schema,
 			// uc)` helper (which store/isolation import, and checkUniqueViaMaterializedView
@@ -1222,8 +1238,7 @@ export class MemoryTableManager {
 			// is a finding, not a reason to widen the helper).
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
-			if (!uc.columns.every((col, i) =>
-				compareSqlValuesFast(newRowData[col], conflictingRow[col], enforcementCollations[i]) === 0)) continue;
+			if (!uc.columns.every((col, i) => compares[i](newRowData[col], conflictingRow[col]) === 0)) continue;
 			if (index.predicate && !index.rowMatchesPredicate(conflictingRow)) continue;
 
 			// Found a different live row with the same unique key values
@@ -1289,7 +1304,11 @@ export class MemoryTableManager {
 		// index-derived UNIQUE whose declared candidate set could be a subset is declined
 		// upstream by findRowTimeCoveringStructure's collation gate, so only BINARY-floor
 		// or equal-collation MVs ever reach here.
+		// A semantic-ordering column (TIMESPAN, JSON) re-checks through its declared
+		// type's `compare` rather than the collation — same rule the index path and both
+		// out-of-package re-validators follow, via the shared helper.
 		const collations = uniqueEnforcementCollations(schema, uc).map(name => this.collationResolver(name ?? 'BINARY'));
+		const compares = uniqueEnforcementComparators(schema.columns, uc.columns, collations);
 
 		for (const conflict of conflicts) {
 			const existingPK = buildPrimaryKeyFromValues(conflict.pk, schema.primaryKeyDefinition);
@@ -1298,7 +1317,7 @@ export class MemoryTableManager {
 			// Validate against the live source row: skip stale backing candidates.
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
-			if (!uc.columns.every((col, i) => compareSqlValuesFast(newRowData[col], conflictingRow[col], collations[i]) === 0)) continue;
+			if (!uc.columns.every((col, i) => compares[i](newRowData[col], conflictingRow[col]) === 0)) continue;
 
 			if (onConflict === ConflictResolution.IGNORE) {
 				return { status: 'ok', row: undefined };
@@ -1339,8 +1358,11 @@ export class MemoryTableManager {
 			? compilePredicate(uc.predicate, schema.columns, schema.name)
 			: undefined;
 
-		// One resolve per column, not per scanned row.
+		// One resolve per column, not per scanned row. A semantic-ordering column
+		// (TIMESPAN, JSON) compares through its declared type's `compare` instead of the
+		// collation — the shared rule across all three backends.
 		const collations = uc.columns.map(colIdx => this.collationResolver(schema.columns[colIdx].collation ?? 'BINARY'));
+		const compares = uniqueEnforcementComparators(schema.columns, uc.columns, collations);
 
 		for (const path of primaryTree.ascending(primaryTree.first())) {
 			const existingRow = primaryTree.at(path)!;
@@ -1350,7 +1372,7 @@ export class MemoryTableManager {
 			if (predicate && predicate.evaluate(existingRow) !== true) continue;
 
 			const allMatch = uc.columns.every(
-				(colIdx, i) => compareSqlValuesFast(newRowData[colIdx], existingRow[colIdx], collations[i]) === 0
+				(colIdx, i) => compares[i](newRowData[colIdx], existingRow[colIdx]) === 0
 			);
 			if (!allMatch) continue;
 

@@ -1,5 +1,5 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, serializeKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -1630,13 +1630,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// backends' typed enforcement), else the enforcement collation (the index's
 		// per-column COLLATE for an index-derived UNIQUE, else the declared column
 		// collation) through `compareSqlValuesFast`. Resolved once, above both
-		// candidate scans; both phases compare identically.
+		// candidate scans; both phases compare identically. The construction is the
+		// engine's `uniqueEnforcementComparators`, shared with the store and memory
+		// re-validators so the three backends cannot drift.
 		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
-		const compares = uc.columns.map((colIdx, i) => {
-			const logicalType = this.tableSchema!.columns[colIdx]?.logicalType;
-			if (hasSemanticOrdering(logicalType)) return createTypedComparator(logicalType, collations[i]);
-			return (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collations[i]);
-		});
+		const compares = uniqueEnforcementComparators(this.tableSchema!.columns, uc.columns, collations);
 
 		const overlayConflict = await this.findOverlayUniqueConflict(overlay, predicate, newRow, selfPks, tombstoneIndex, uc.columns, compares);
 		if (overlayConflict) return overlayConflict;

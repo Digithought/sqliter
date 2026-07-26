@@ -50,8 +50,10 @@
  *    test fires is declined (perf-only loss in an already-exotic shape).
  */
 
-import { normalizeCollationName, resolveCollationFunctions } from '../util/comparison.js';
+import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, normalizeCollationName, resolveCollationFunctions } from '../util/comparison.js';
 import type { CollationFunction, CollationResolver } from '../types/logical-type.js';
+import type { SqlValue } from '../common/types.js';
+import type { ColumnSchema } from './column.js';
 import type { IndexSchema, TableSchema, UniqueConstraintSchema } from './table.js';
 
 /**
@@ -110,6 +112,41 @@ export function resolveUniqueEnforcementCollations(
 	resolver: CollationResolver,
 ): CollationFunction[] {
 	return resolveCollationFunctions(resolver, uniqueEnforcementCollations(schema, uc));
+}
+
+/**
+ * Per-constrained-column comparison functions for one UNIQUE constraint, one entry
+ * per `ucColumns` position: the declared type's `compare` for a semantic-ordering
+ * column (so TIMESPAN 'PT1H' conflicts with 'PT60M', matching the memory backend's
+ * typed BTree and `=` / DISTINCT / GROUP BY), else the enforcement collation through
+ * {@link compareSqlValuesFast} — the exact comparison every re-validator used before.
+ *
+ * Only semantic-ordering types are routed through `compare` ({@link hasSemanticOrdering}
+ * is the gate): a TEXT/ANY column's declared `compare` is not collation-aware, so
+ * consulting it would break NOCASE/RTRIM enforcement.
+ *
+ * Takes PRE-RESOLVED collations rather than `(schema, uc, resolver)` because the four
+ * call sites do not share one collation resolution. Memory's `checkUniqueViaIndex`
+ * deliberately reads them from the LIVE `MemoryIndex` handle rather than from
+ * {@link uniqueEnforcementCollations} (see the divergence note in this file's docstring;
+ * it is conformance-locked by `test/unique-enforcement-collation.spec.ts`), while the
+ * store, the isolation overlay, and memory's MV/scan paths resolve by name. A
+ * pre-resolved-collation signature lets all of them share the comparator construction
+ * while each keeps its own collation resolution.
+ *
+ * Call ONCE per constraint check, above the candidate loop — same discipline as
+ * {@link resolveUniqueEnforcementCollations}.
+ */
+export function uniqueEnforcementComparators(
+	columns: readonly ColumnSchema[],
+	ucColumns: readonly number[],
+	collations: readonly CollationFunction[],
+): Array<(a: SqlValue, b: SqlValue) => number> {
+	return ucColumns.map((colIdx, i) => {
+		const logicalType = columns[colIdx]?.logicalType;
+		if (hasSemanticOrdering(logicalType)) return createTypedComparator(logicalType, collations[i]);
+		return (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collations[i]);
+	});
 }
 
 /**

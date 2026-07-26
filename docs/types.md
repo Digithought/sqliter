@@ -226,8 +226,9 @@ collation order of their stored representation. These declare
 > Wherever a value of a declared logical type is ordered or compared — ORDER BY,
 > `<`/`>`/`=` operators, BETWEEN, IN membership, primary-key/index order and range
 > scans, DISTINCT / GROUP BY / set-operation identity, window ORDER BY/PARTITION BY,
-> merge/hash join keys — the type's `compare` function is the order. Text/byte
-> order is a storage encoding detail, never a user-visible semantic.
+> merge/hash join keys, UNIQUE constraint enforcement — the type's `compare` function
+> is the order. Text/byte order is a storage encoding detail, never a user-visible
+> semantic.
 
 Today the flag is set on **TIMESPAN** (elapsed-time order) and **JSON** (structural
 order). DATE/TIME/DATETIME need no flag: their canonical ISO text order *is* their
@@ -260,6 +261,19 @@ BTree's comparator) is what keeps the set structures sound — the normalized ke
 by plain storage-class order, which stays total even when a list literal is not a valid
 value of the type, whereas `TIMESPAN.compare` mixes elapsed-time and text ordering
 there and is not.
+
+UNIQUE enforcement collapses the same identity on **every** backend. A constrained
+column whose declared type carries semantic ordering is compared through that type's
+`compare`; every other column keeps the storage-class + collation comparison (a
+TEXT/ANY column's declared `compare` is not collation-aware, so consulting it would
+break NOCASE/RTRIM enforcement — the `hasSemanticOrdering` flag is the gate). The
+per-column comparators are built once per constraint check by the shared
+`uniqueEnforcementComparators` (`schema/unique-enforcement.ts`), which the memory
+backend's three re-validators, the persistent store's finders, and the isolation
+overlay's merged-view search all call, so the backends cannot drift. Concretely, in a
+`d timespan unique` column an insert of `'PT60M'` after `'PT1H'` raises a UNIQUE
+violation, `insert or ignore` drops it, and `insert or replace` evicts the existing
+row — the same on memory and store.
 
 The persistent store follows the same rule for both identity and order (resolved by
 `quereus-store`'s `storeSemanticKeyTransform`): a TIMESPAN key member is encoded
