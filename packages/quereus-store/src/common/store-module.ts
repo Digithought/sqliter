@@ -521,6 +521,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * stores in the set therefore causes no false rejects and keeps the
 	 * reject-before-any-side-effect guarantee uniform.
 	 */
+	// NOTE: the builders below carry the unpaired-surrogate identifier guard, so this
+	// enumeration can THROW on an EXISTING schema object, not just on the incoming one —
+	// an unrelated CREATE/RENAME in the same schema would then fail with a confusing
+	// "cannot store the identifier ..." error. Unreachable today: `create` throws before
+	// the table is registered, and a catalog entry written before the guard existed was
+	// folded to a real U+FFFD character, which passes. If a lone-surrogate-named table ever
+	// does reach the schema manager by another route, skip such an object here (it occupies
+	// no store) rather than letting the enumeration throw.
 	private collectOccupiedStoreNames(db: Database, schemaName: string): Map<string, string> {
 		const names = new Map<string, string>();
 		const add = (s: TableSchema) => {

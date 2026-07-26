@@ -36,6 +36,10 @@ const LONE_HIGH = '\uD800';
 const LONE_HIGH_2 = '\uD801';
 /** The percent-escaped U+FFFD replacement byte sequence a folded name would produce. */
 const FOLDED = '%EF%BF%BD';
+/** U+10000 — the same two code-unit ranges, legally PAIRED. Must keep working end to end. */
+const ASTRAL = '\u{10000}';
+/** U+10001 — a second, distinct astral character; must land on its own sublevel. */
+const ASTRAL_2 = '\u{10001}';
 
 describe('LevelDB lone-surrogate physical store names', () => {
 	let testDir: string;
@@ -153,5 +157,29 @@ describe('LevelDB lone-surrogate physical store names', () => {
 		expect(await rows(`select b from t order by id`)).to.deep.equal([{ b: 10 }, { b: 20 }]);
 
 		expect((await rawKeys()).filter(k => k.includes(FOLDED)), 'no folded index sublevel').to.deep.equal([]);
+	});
+
+	// The over-rejection direction. A WELL-FORMED astral character occupies the same two
+	// code-unit ranges as a lone surrogate, so a guard that tested code units instead of
+	// pairs would refuse it — and the unit tests alone would not catch a provider that
+	// mangled it deeper down. This drives one end to end: table name, index name, rename
+	// target, and a second astral character that must not share the first's sublevel.
+	it('accepts well-formed astral characters end to end, on distinct sublevels', async () => {
+		await db.exec(`create table "t${ASTRAL}" (id integer primary key, b integer) using store`);
+		await db.exec(`create index "ix${ASTRAL}" on "t${ASTRAL}" (b)`);
+		await db.exec(`insert into "t${ASTRAL}" values (1, 10), (2, 20)`);
+		expect(await rows(`select id from "t${ASTRAL}" where b = 20`)).to.deep.equal([{ id: 2 }]);
+
+		// A sibling named with a DIFFERENT astral character keeps its own rows — the two
+		// names must not fold onto one store the way two lone surrogates would have.
+		await db.exec(`create table "t${ASTRAL_2}" (id integer primary key, b integer) using store`);
+		await db.exec(`insert into "t${ASTRAL_2}" values (1, 99)`);
+		expect(await rows(`select b from "t${ASTRAL}" order by id`)).to.deep.equal([{ b: 10 }, { b: 20 }]);
+		expect(await rows(`select b from "t${ASTRAL_2}" order by id`)).to.deep.equal([{ b: 99 }]);
+
+		// Rename onto another astral name relocates rows rather than rejecting.
+		await db.exec(`alter table "t${ASTRAL}" rename to "u${ASTRAL_2}"`);
+		expect(await rows(`select b from "u${ASTRAL_2}" order by id`)).to.deep.equal([{ b: 10 }, { b: 20 }]);
+		expect(await rows(`select id from "u${ASTRAL_2}" where b = 20`)).to.deep.equal([{ id: 2 }]);
 	});
 });

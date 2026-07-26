@@ -652,10 +652,16 @@ The **physical store-name** builders `buildDataStoreName` and `buildIndexStoreNa
 same guard, and it matters for two reasons beyond keying. First, a provider may encode the
 store name to bytes — `LevelDBProvider.encodeSublevelName` percent-escapes the name's UTF-8
 bytes — so without the guard two tables whose names differ only in a lone surrogate would
-resolve to the *same* sublevel (`main.%EF%BF%BD`). Second, it is what makes
-`StoreModule.assertStoreNameFree` sound: that collision check compares names as JS strings,
-before any provider byte-encoding, and only with unpaired surrogates refused does equal bytes
-imply equal string. Because every call site builds the physical name before its first side
+resolve to the *same* sublevel (`main.%EF%BF%BD`). Second, it is what lets
+`StoreModule.assertStoreNameFree` stand in for a *physical* store collision check: that check
+compares names as JS strings, before any provider encoding, so distinct logical names imply
+distinct physical stores only where the provider's encoding is injective. With unpaired
+surrogates refused it is, for LevelDB (percent-escaped UTF-8) and IndexedDB (verbatim
+`DOMString`). It is not for `@quereus/plugin-nativescript-sqlite`, whose `getTableName` folds
+every character outside `[a-zA-Z0-9_]` to `_` — a lossy mapping unrelated to surrogates and
+not repairable by this guard, tracked separately in
+`tickets/backlog/bug-mobile-provider-physical-store-name-collisions.md`.
+Because every call site builds the physical name before its first side
 effect, the throw always lands on a clean no-op — notably `renameTable`, which relocates
 storage *before* rewriting the catalog and does not undo the relocation, so a guard that only
 fired at the catalog write left the table's rows stranded under an orphan store name and the

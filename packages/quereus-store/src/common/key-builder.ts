@@ -55,12 +55,17 @@ function assertKeyableIdentifiers(...names: string[]): void {
  * Guarded by {@link assertKeyableIdentifiers}: the physical name is handed to a provider
  * that may encode it to bytes (`LevelDBProvider.encodeSublevelName` runs it through
  * `TextEncoder`), which folds every unpaired surrogate to U+FFFD — so two tables whose
- * names differ only in a lone surrogate would share one physical store. Refusing the
- * identifier here is also what makes `StoreModule.assertStoreNameFree` sound: that guard
- * compares names as JS strings, BEFORE any provider byte-encoding, and with unpaired
- * surrogates refused the remaining name space encodes injectively, so equal bytes imply
- * equal strings. Every call site builds the name before its first side effect, so the
- * throw always lands on a clean no-op.
+ * names differ only in a lone surrogate would share one physical store. Every call site
+ * builds the name before its first side effect, so the throw always lands on a clean no-op.
+ *
+ * Refusing the identifier here is also what lets `StoreModule.assertStoreNameFree` stand in
+ * for a PHYSICAL store collision check: that guard compares names as JS strings, before any
+ * provider encoding, so distinct logical names imply distinct physical stores only where the
+ * provider's encoding is injective. With unpaired surrogates refused it is — for LevelDB
+ * (percent-escaped UTF-8) and IndexedDB (verbatim `DOMString`). It is NOT for
+ * `@quereus/plugin-nativescript-sqlite`, whose `getTableName` folds every character outside
+ * `[a-zA-Z0-9_]` to `_`; that is a lossy mapping this guard neither causes nor repairs. See
+ * `tickets/backlog/bug-mobile-provider-physical-store-name-collisions.md`.
  */
 // NOTE: composes with a literal '.' delimiter, so the schema/table boundary is
 // not recoverable from the physical name. A lone dotted identifier round-trips
@@ -80,8 +85,8 @@ export function buildDataStoreName(schemaName: string, tableName: string): strin
  * Format: {schema}.{table}_idx_{indexName}
  *
  * Identifier-guarded for the same reason as {@link buildDataStoreName} — see its docstring
- * for why refusing an unpaired surrogate here is what keeps physical store names injective
- * across providers and makes `StoreModule.assertStoreNameFree`'s JS-string comparison sound.
+ * for why refusing an unpaired surrogate is what keeps distinct logical names on distinct
+ * physical stores, and for the one provider whose encoding that still does not hold for.
  */
 export function buildIndexStoreName(
 	schemaName: string,
