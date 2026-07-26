@@ -1596,6 +1596,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * ADD COLUMN arm of {@link alterTable}: append the new column, eagerly migrate
 	 * each row (literal or per-row backfill), and persist. Behavior-preserving
 	 * extraction of the former `switch` arm.
+	 *
+	 * The store always appends. A caller-chosen `insertAtIndex` (module-API only; SQL never
+	 * produces one) is rejected unless it names the append position, rather than silently
+	 * landing the column somewhere the caller did not ask for.
 	 */
 	private async alterAddColumn(
 		db: Database,
@@ -1606,6 +1610,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		change: Extract<SchemaChangeInfo, { type: 'addColumn' }>,
 		defaultNotNull: boolean,
 	): Promise<TableSchema> {
+		if (change.insertAtIndex !== undefined && change.insertAtIndex !== oldSchema.columns.length) {
+			throw new QuereusError(
+				`Store-backed table '${schemaName}.${tableName}' can only ADD COLUMN at the end `
+					+ `(position ${oldSchema.columns.length}), not at position ${change.insertAtIndex}`,
+				StatusCode.UNSUPPORTED,
+			);
+		}
+
 		// Honor the session `default_collation` for an ADD COLUMN that omits an
 		// explicit COLLATE, matching the CREATE path so an ADD-COLUMN-ed text column
 		// gets the same collation a CREATE-d one would. The persisted DDL re-emits an

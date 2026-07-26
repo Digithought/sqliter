@@ -551,6 +551,24 @@ export type SchemaChangeInfo =
 		 * writing a single default value.
 		 */
 		backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>;
+		/**
+		 * Insert the new column at this index instead of appending. Undefined (the normal
+		 * case, and what SQL `alter table … add column` always produces) means append.
+		 * A module that cannot honour a position must reject it rather than silently append.
+		 *
+		 * There is no SQL syntax for this — it is reachable only from an in-process module
+		 * wrapper. The one caller today is the transaction-isolation overlay, which keeps a
+		 * private bookkeeping column last and so must insert ahead of it.
+		 *
+		 * NOTE: the engine's own ADD COLUMN pipeline assumes an append in one place a wrapper
+		 * can reach — the per-row context it evaluates a column-level CHECK against is built as
+		 * `[...existingRow, value]` (`buildAddColumnChecks` in planner/building/alter-table.ts).
+		 * So a wrapper that redirects an *engine-driven* `alter table … add column` to a
+		 * non-append position must not rely on a column-level CHECK on that column; it would be
+		 * evaluated against the append layout. Applying the change straight to a module (the
+		 * isolation overlay's case) never goes near that path.
+		 */
+		insertAtIndex?: number;
 	}
 	| { type: 'dropColumn'; columnName: string }
 	| { type: 'renameColumn'; oldName: string; newName: string; newColumnDefAst?: ColumnDef }

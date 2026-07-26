@@ -7,7 +7,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, asyncIterableToArray } from '@quereus/quereus';
+import { Database, asyncIterableToArray, type SchemaChangeInfo } from '@quereus/quereus';
 import {
 	StoreModule,
 	InMemoryKVStore,
@@ -84,11 +84,12 @@ function createInMemoryProvider(): KVStoreProvider {
 describe('Store ALTER TABLE', () => {
 	let db: Database;
 	let provider: KVStoreProvider;
+	let storeModule: StoreModule;
 
 	beforeEach(async () => {
 		db = new Database();
 		provider = createInMemoryProvider();
-		const storeModule = new StoreModule(provider);
+		storeModule = new StoreModule(provider);
 		db.registerModule('store', storeModule);
 	});
 
@@ -97,6 +98,45 @@ describe('Store ALTER TABLE', () => {
 	});
 
 	describe('ADD COLUMN', () => {
+		// `SchemaChangeInfo.addColumn.insertAtIndex` lets an in-process module wrapper place a
+		// new column somewhere other than the end (the memory module honours it). The store
+		// always appends, so rather than silently ignoring a position it was handed, it must
+		// reject one it cannot honour. SQL never produces a position, so this is unreachable
+		// from `alter table … add column` — the change is applied to the module directly.
+		it('rejects ADD COLUMN at a non-append position instead of silently appending', async () => {
+			await db.exec(`
+				CREATE TABLE items (
+					id INTEGER PRIMARY KEY,
+					name TEXT
+				) USING store
+			`);
+			await db.exec(`INSERT INTO items VALUES (1, 'Widget')`);
+
+			const addPrice = (insertAtIndex: number): SchemaChangeInfo => ({
+				type: 'addColumn',
+				columnDef: { name: 'price', dataType: 'REAL', constraints: [{ type: 'null' }] },
+				insertAtIndex,
+			});
+
+			let error: unknown;
+			try {
+				await storeModule.alterTable!(db, 'main', 'items', addPrice(0));
+			} catch (e) {
+				error = e;
+			}
+			expect(error, 'a non-append position should have been rejected').to.be.instanceOf(Error);
+			expect(String(error)).to.match(/can only ADD COLUMN at the end/);
+
+			// The table is untouched by the rejection.
+			expect(await asyncIterableToArray(db.eval('select * from items'))).to.deep.equal([
+				{ id: 1, name: 'Widget' },
+			]);
+
+			// Naming the append position explicitly is accepted — it is what the store does anyway.
+			const updated = await storeModule.alterTable!(db, 'main', 'items', addPrice(2));
+			expect(updated.columns.map(c => c.name)).to.deep.equal(['id', 'name', 'price']);
+		});
+
 		it('adds a column to a populated table with null default', async () => {
 			await db.exec(`
 				CREATE TABLE items (

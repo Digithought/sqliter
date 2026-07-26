@@ -66,6 +66,78 @@ export interface ImplicitCoveringStructure {
 	origin: 'implicit-from-unique-constraint';
 }
 
+/** A copy of `items` with `value` inserted at `at` (`at === items.length` ⇒ append). */
+function insertValueAt<T>(items: ReadonlyArray<T>, at: number, value: T): T[] {
+	const out = items.slice();
+	out.splice(at, 0, value);
+	return out;
+}
+
+/** Index of a column after a new one is inserted at `at`. */
+const shiftForInsert = (index: number, at: number): number => index >= at ? index + 1 : index;
+
+/**
+ * The index-bearing fields of `schema` renumbered for a column inserted at `at`, to be
+ * spread over the schema alongside the new `columns` array. Only reached when `at` is a
+ * real insert point (an append leaves every existing index valid), and the mirror image
+ * of the shift `dropColumn` performs — except that an insert can never empty an index or
+ * a constraint, so none of `dropColumn`'s prune/filter logic has a counterpart here.
+ *
+ * `checkConstraints` and the manager's implicit covering structures are name/AST-keyed
+ * and need nothing. `statistics.columnStats` is keyed by column name. `columnIndexMap` is
+ * rebuilt from the new column list by the caller.
+ *
+ * A foreign key's `columns` are indices into THIS table and always shift.
+ * `referencedColumns` are indices into the PARENT table, so they shift only when the FK
+ * points back at this same table. Note that a foreign key in ANOTHER table referencing
+ * this one is out of this manager's reach — its `referencedColumns` go stale on any
+ * insert here, exactly as they already do on `dropColumn`.
+ */
+function shiftSchemaIndicesForInsert(schema: TableSchema, at: number): Partial<TableSchema> {
+	const shift = (index: number): number => shiftForInsert(index, at);
+
+	const primaryKeyDefinition = schema.primaryKeyDefinition.map(def => ({ ...def, index: shift(def.index) }));
+
+	const indexes = schema.indexes?.map(idx => ({
+		...idx,
+		columns: idx.columns.map(ic => ({ ...ic, index: shift(ic.index) })),
+	}));
+
+	const uniqueConstraints = schema.uniqueConstraints?.map(uc => ({
+		...uc,
+		columns: Object.freeze(uc.columns.map(shift)),
+	}));
+
+	const selfReferencing = (fk: { referencedTable: string; referencedSchema?: string }) =>
+		fk.referencedTable.toLowerCase() === schema.name.toLowerCase()
+		&& (fk.referencedSchema ?? schema.schemaName).toLowerCase() === schema.schemaName.toLowerCase();
+	const foreignKeys = schema.foreignKeys?.map(fk => ({
+		...fk,
+		columns: Object.freeze(fk.columns.map(shift)),
+		referencedColumns: selfReferencing(fk)
+			? Object.freeze(fk.referencedColumns.map(shift))
+			: fk.referencedColumns,
+	}));
+
+	// Generated-column bookkeeping is keyed BY column index and holds column indices.
+	// Nothing inside the memory module reads it — the engine recomputes the graph after
+	// its own ADD COLUMN — but a wrapper driving this API directly gets the schema back
+	// verbatim, so leaving it unshifted would hand out a schema whose generated-column
+	// edges point at the wrong columns.
+	const generatedColumnDependencies = schema.generatedColumnDependencies
+		&& new Map(Array.from(schema.generatedColumnDependencies, ([col, deps]) => [shift(col), deps.map(shift)]));
+	const generatedColumnTopoOrder = schema.generatedColumnTopoOrder?.map(shift);
+
+	return {
+		primaryKeyDefinition: Object.freeze(primaryKeyDefinition),
+		...(indexes && { indexes: Object.freeze(indexes) }),
+		...(uniqueConstraints && { uniqueConstraints: Object.freeze(uniqueConstraints) }),
+		...(foreignKeys && { foreignKeys: Object.freeze(foreignKeys) }),
+		...(generatedColumnDependencies && { generatedColumnDependencies }),
+		...(generatedColumnTopoOrder && { generatedColumnTopoOrder: Object.freeze(generatedColumnTopoOrder) }),
+	};
+}
+
 export class MemoryTableManager {
 	public readonly managerId: number;
 	public readonly db: Database;
@@ -1753,7 +1825,19 @@ export class MemoryTableManager {
 	}
 
 	// --- Schema Operations (simplified with inherited BTrees) ---
-	async addColumn(columnDefAst: ASTColumnDef, backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>): Promise<void> {
+	/**
+	 * ADD COLUMN. `insertAtIndex` — when supplied — puts the new column at that slot
+	 * instead of appending; every existing column at or after it shifts right by one,
+	 * and each index-bearing schema field is renumbered to match (see
+	 * {@link shiftSchemaIndicesForInsert}). Omitted ⇒ append, which is what SQL
+	 * `alter table … add column` always asks for and which leaves the schema rebuild
+	 * on exactly the path it took before positions existed.
+	 */
+	async addColumn(
+		columnDefAst: ASTColumnDef,
+		backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>,
+		insertAtIndex?: number,
+	): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -1801,9 +1885,27 @@ export class MemoryTableManager {
 					StatusCode.CONSTRAINT,
 				);
 			}
-			const updatedColumnsSchema: ReadonlyArray<ColumnSchema> = Object.freeze([...this.tableSchema.columns, newColumnSchema]);
+			const appendIndex = this.tableSchema.columns.length;
+			const targetIndex = insertAtIndex ?? appendIndex;
+			if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex > appendIndex) {
+				throw new QuereusError(
+					`Cannot add column '${newColumnSchema.name}' at position ${insertAtIndex}: `
+						+ `expected an integer in [0, ${appendIndex}]`,
+					StatusCode.MISUSE,
+				);
+			}
+			const updatedColumnsSchema: ReadonlyArray<ColumnSchema> = Object.freeze(
+				insertValueAt(this.tableSchema.columns, targetIndex, newColumnSchema),
+			);
+			// Appending never invalidates an existing column index, so the append path keeps
+			// carrying every index-bearing field through the spread unchanged; only a real
+			// insert pays for the renumber.
+			const shiftedIndexFields = targetIndex < appendIndex
+				? shiftSchemaIndicesForInsert(this.tableSchema, targetIndex)
+				: undefined;
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
+				...shiftedIndexFields,
 				columns: updatedColumnsSchema,
 				columnIndexMap: buildColumnIndexMap(updatedColumnsSchema),
 			});
@@ -1827,18 +1929,24 @@ export class MemoryTableManager {
 						StatusCode.CONSTRAINT,
 					);
 				}
-				return [...row, value] as Row;
+				return insertValueAt(row, targetIndex, value) as Row;
 			});
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
 			// its own value via the engine-supplied evaluator; a literal/NULL default
 			// uses the single folded `defaultValue` for every row.
-			await this.baseLayer.addColumnToBase(newColumnSchema, defaultValue, backfillEvaluator);
+			await this.baseLayer.addColumnToBase(newColumnSchema, defaultValue, backfillEvaluator, targetIndex);
 			this.tableSchema = finalNewTableSchema;
 			this.initializePrimaryKeyFunctions();
 			this.installReshapeOnOpenLayers(finalNewTableSchema, reshapePlans);
 
-			// Emit schema change event
+			// Emit schema change event.
+			// NOTE: the event names the added column but not its position, which is fine while
+			// the only non-append caller is an in-process wrapper that rebuilds its view from the
+			// post-change schema. An append never invalidates an existing column index; an insert
+			// does. If a position ever becomes SQL-reachable, anything that caches a column index
+			// across this swap (planner caches, prepared statements, a wrapper's own schema
+			// snapshot) needs to learn the insert point — so the event would have to carry it.
 			this.eventEmitter?.emitSchemaChange?.({
 				type: 'alter',
 				objectType: 'column',
@@ -1912,6 +2020,13 @@ export class MemoryTableManager {
 						.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index }))
 				})).filter(idx => idx.columns.length > 0);
 
+			// NOTE: `foreignKeys[].columns` (indices into THIS table) and the generated-column
+			// bookkeeping (`generatedColumnDependencies` / `generatedColumnTopoOrder`, also
+			// index-keyed) are carried through the spread UNSHIFTED, so they dangle past the
+			// removed slot. Pre-existing; `shiftSchemaIndicesForInsert` (the ADD-COLUMN-at-a-
+			// position mirror of this block) does shift them. Fix here needs the same care about
+			// an FK whose column set is emptied by the drop, which has no insert-side counterpart.
+			// `primaryKey` below is not a TableSchema field at all — nothing reads it.
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
 				columns: Object.freeze(updatedColumnsSchema),

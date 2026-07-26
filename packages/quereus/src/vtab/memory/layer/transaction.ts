@@ -458,10 +458,11 @@ export class TransactionLayer implements Layer {
 	 * a failure rejects the whole ALTER with every structure untouched; there is no undo for a
 	 * half-reshaped layer chain.
 	 *
-	 * Own writes collapse to one entry per key exactly as {@link convertColumn}'s pass does: the
-	 * primary key is unchanged by a column-set change (ADD appends past every key index; dropping
-	 * a PK column is rejected upstream), so a key is either finally-deleted or finally-upserted,
-	 * never both, and no key can collapse onto another.
+	 * Own writes collapse to one entry per key exactly as {@link convertColumn}'s pass does: a
+	 * column-set change leaves every primary key VALUE untouched (ADD introduces a column no key
+	 * reads — even when it is inserted ahead of one, which only renumbers the key's *indices*;
+	 * dropping a PK column is rejected upstream), so a key is either finally-deleted or
+	 * finally-upserted, never both, and no key can collapse onto another.
 	 */
 	public async prepareReshapedColumns(reshapeRow: (row: Row) => Row | Promise<Row>): Promise<PreparedColumnReshape> {
 		const seen = new Set<string>();
@@ -491,14 +492,15 @@ export class TransactionLayer implements Layer {
 	 * one, replays the layer's net own-writes at the new arity, and rebuilds every secondary
 	 * index. Synchronous and mutation-only — everything fallible ran in the prepare phase.
 	 *
-	 * {@link pkFunctions} is REBUILT (unlike {@link convertColumn}, which keeps it): DROP
-	 * COLUMN shifts the primary key's column *indices* (`manager.dropColumn` renumbers
-	 * `primaryKeyDefinition` past the dropped slot), so the row extractor changes even though
-	 * the key *values* do not. Because the values are invariant under both ADD (the new column
-	 * appends past every key index) and DROP (dropping a PK column is rejected upstream), tree
-	 * ordering is preserved and the `primaryKey` values recorded in {@link ownWrites} stay
-	 * valid — no re-key of the kind {@link rekeyPrimaryKey} performs is needed, and the
-	 * prepared deletions apply verbatim.
+	 * {@link pkFunctions} is REBUILT (unlike {@link convertColumn}, which keeps it): a column-set
+	 * change can shift the primary key's column *indices* — DROP COLUMN renumbers
+	 * `primaryKeyDefinition` past the dropped slot, and an ADD COLUMN placed AHEAD of a key
+	 * column (`insertAtIndex`, module-API only) renumbers it past the inserted slot — so the row
+	 * extractor changes even though the key *values* do not. Because the values are invariant
+	 * under both ADD (the new column is not part of any key, wherever it lands) and DROP
+	 * (dropping a PK column is rejected upstream), tree ordering is preserved and the
+	 * `primaryKey` values recorded in {@link ownWrites} stay valid — no re-key of the kind
+	 * {@link rekeyPrimaryKey} performs is needed, and the prepared deletions apply verbatim.
 	 *
 	 * Like every other open-layer adoption, the caller MUST apply this to the whole parent
 	 * chain oldest-first (base already reshaped): the rebuilt tree inherits copy-on-write from

@@ -336,10 +336,16 @@ export class BaseLayer implements Layer {
 		return value !== undefined;
 	};
 
+	/**
+	 * @param insertAtIndex Slot the new column occupies in the updated schema — every
+	 *   committed row gets its value spliced in there. The manager always passes an explicit
+	 *   index (the append position when the caller asked for no particular one).
+	 */
 	async addColumnToBase(
 		newColumnSchema: ColumnSchema,
 		defaultValue: SqlValue,
-		backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>,
+		backfillEvaluator: ((row: Row) => SqlValue | Promise<SqlValue>) | undefined,
+		insertAtIndex: number,
 	): Promise<void> {
 		logger.operation('Add Column', this.tableSchema.name, {
 			columnName: newColumnSchema.name,
@@ -348,11 +354,13 @@ export class BaseLayer implements Layer {
 
 		const oldPrimaryTree = this.primaryTree;
 
-		// Reinitialize primary key functions with the updated schema (which already includes the new column)
+		// Reinitialize primary key functions with the updated schema (which already includes the
+		// new column, and — for an insert rather than an append — its shifted key indices). The
+		// extraction below runs on the already-spliced row, so the two agree.
 		this.initializePrimaryKeyFunctions();
 
 		// Create new primary tree with the updated schema and migrate data
-		await this.recreatePrimaryTreeWithNewColumn(oldPrimaryTree, newColumnSchema, defaultValue, backfillEvaluator);
+		await this.recreatePrimaryTreeWithNewColumn(oldPrimaryTree, newColumnSchema, defaultValue, backfillEvaluator, insertAtIndex);
 
 		this.rebuildAllSecondaryIndexes();
 	}
@@ -361,7 +369,8 @@ export class BaseLayer implements Layer {
 		oldTree: BTree<BTreeKeyForPrimary, Row>,
 		newColumnSchema: ColumnSchema,
 		defaultValue: SqlValue,
-		backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>,
+		backfillEvaluator: ((row: Row) => SqlValue | Promise<SqlValue>) | undefined,
+		insertAtIndex: number,
 	): Promise<void> {
 		// Use the updated primary key functions for the new tree
 		const btreeKeyFromValue = (value: Row): BTreeKeyForPrimary =>
@@ -390,7 +399,9 @@ export class BaseLayer implements Layer {
 					StatusCode.CONSTRAINT,
 				);
 			}
-			newTree.insert([...oldRow, value]);
+			const newRow = oldRow.slice();
+			newRow.splice(insertAtIndex, 0, value);
+			newTree.insert(newRow);
 		}
 
 		this.primaryTree = newTree;
