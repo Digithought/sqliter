@@ -66,8 +66,11 @@ export const JSON_TYPE: LogicalType = {
 		// or BINARY (code-point order) when none is supplied. This agrees with
 		// deepCompareJson's string-leaf order below and with the store's structural
 		// key bytes, so a comparator built without a collation (PK equality checks)
-		// still tells '9' and '9.0' apart. In-engine JSON values are native objects
-		// or scalar strings — serialized JSON text does not reach here.
+		// still tells '9' and '9.0' apart. Every collation-less caller reads values
+		// that have already been through coerceRowToSchema, so a string here is a
+		// scalar, never serialized object/array text. (Immediate CHECK constraints do
+		// evaluate pre-coercion and can feed serialized text in, but they always
+		// supply a collation — see fix `bug-json-compare-string-ambiguity`.)
 		if (typeof a === 'string' && typeof b === 'string') {
 			return collation ? collation(a, b) : compareCodePoints(a, b);
 		}

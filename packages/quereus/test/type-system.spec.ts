@@ -400,6 +400,32 @@ describe('Type System', () => {
 				expect(JSON_TYPE.parse!('{"a":1}')).to.deep.equal({ a: 1 });
 				expect(JSON_TYPE.parse!(null)).to.equal(null);
 			});
+
+			it('should compare two string scalars as text, with or without a collation', () => {
+				// Regression for bug-json-pk-equality-drops-collation: with no collation the
+				// pair must still compare BINARY (code point), not re-parse as JSON numbers.
+				// A comparator built without a collation drives PK identity, so calling
+				// '9' and '9.0' equal there swallowed real UNIQUE violations.
+				expect(JSON_TYPE.compare!('9', '9.0')).to.be.lessThan(0);
+				expect(JSON_TYPE.compare!('9.0', '9')).to.be.greaterThan(0);
+				expect(JSON_TYPE.compare!('9', '9')).to.equal(0);
+				expect(JSON_TYPE.compare!('10', '9')).to.be.lessThan(0); // text order, not numeric
+
+				// An explicit collation still wins — a NOCASE pin must keep folding case.
+				const nocase = (a: string, b: string) =>
+					a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0;
+				expect(JSON_TYPE.compare!('Bob', 'bob', nocase)).to.equal(0);
+				expect(JSON_TYPE.compare!('Bob', 'bob')).to.not.equal(0);
+			});
+
+			it('should order structurally, not by canonical text', () => {
+				// {"a":2} < {"a":10} — semanticOrdering, the reason this type exists.
+				expect(JSON_TYPE.compare!({ a: 2 }, { a: 10 })).to.be.lessThan(0);
+				expect(JSON_TYPE.compare!([2], [10])).to.be.lessThan(0);
+				// Type rank: null < boolean < number < string < array < object.
+				expect(JSON_TYPE.compare!(9, 'nine')).to.be.lessThan(0);
+				expect(JSON_TYPE.compare!(['x'], { x: 1 })).to.be.lessThan(0);
+			});
 		});
 	});
 
