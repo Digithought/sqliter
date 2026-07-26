@@ -119,6 +119,20 @@ describe('JSON structural key order (store)', () => {
 			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
 		});
 
+		it('keeps JSON-number-spelled string scalars distinct, in code-point order', async () => {
+			// '"9"' and '"9.0"' are both string leaves, not numbers — they must stay
+			// separate rows and scan in code-point order ('"10"' < '"9"' < '"9.0"'),
+			// not numeric order.
+			await db.exec(`create table t (j json primary key) using store`);
+			await db.exec(`create table m (j json primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('"9"'), ('"9.0"'), ('"10"')`);
+			}
+			const scan = await column(db, `select json_quote(j) as q from t`, 'q');
+			expect(scan).to.deep.equal(['"10"', '"9"', '"9.0"']);
+			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
+		});
+
 		it('iterates a DESC JSON PK in reverse structural order', async () => {
 			// DESC bit-inverts the structural blob's key bytes — variable-length, escaped,
 			// 0x00-terminated — which must still reverse cleanly.
@@ -148,6 +162,25 @@ describe('JSON structural key order (store)', () => {
 				await db.exec(`insert into ${tbl} values ('{"a":1,"b":2}', 'first')`);
 				const err = await attempt(db, `insert into ${tbl} values ('{"b":2,"a":1}', 'second')`);
 				expect(err, `${tbl} must reject the reorder-equal spelling`).to.not.be.null;
+				expect(String(err)).to.match(/unique/i);
+				expect((await db.get(`select count(*) as cnt from ${tbl}`))?.cnt).to.equal(1);
+			}
+		});
+
+		it('rejects a JSON-number-spelled string PK as a duplicate when it collides via a UNIQUE column, as the memory table does', async () => {
+			// Repro for bug-json-pk-equality-drops-collation: '"9"' and '"9.0"' are
+			// distinct string-scalar PKs, but the store's self-PK-exclusion check used to
+			// build its equality comparator with no collation, which made JSON_TYPE.compare
+			// re-parse both as the number 9 and call them the same row — so the second
+			// insert's own UNIQUE conflict search excluded the first row from consideration
+			// and the violation went unraised.
+			await db.exec(`create table t (j json primary key, u text unique) using store`);
+			await db.exec(`create table m (j json primary key, u text unique)`);
+
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('"9"', 'dup')`);
+				const err = await attempt(db, `insert into ${tbl} values ('"9.0"', 'dup')`);
+				expect(err, `${tbl} must reject the duplicate 'u' value`).to.not.be.null;
 				expect(String(err)).to.match(/unique/i);
 				expect((await db.get(`select count(*) as cnt from ${tbl}`))?.cnt).to.equal(1);
 			}
@@ -248,6 +281,29 @@ describe('JSON structural key order (isolated store)', () => {
 		await db.exec('commit');
 
 		expect((await db.get(`select count(*) as cnt from o`))?.cnt).to.equal(1);
+	});
+
+	it('keeps a JSON-number-spelled string PK distinct from a committed row across `insert or replace`', async () => {
+		// Repro for bug-json-pk-equality-drops-collation, replayed through the isolation
+		// overlay: staging '"9.0"' as `insert or replace` must NOT be treated as a
+		// rewrite of the committed '"9"' row — they are different rows. (UPDATE/DELETE
+		// of a JSON string-scalar row are out of scope here — see
+		// bug-json-string-scalar-not-round-trip-safe.)
+		await db.exec(`create table o (j json primary key, v text) using store`);
+		await db.exec(`insert into o values ('"9"', 'committed')`);
+
+		await db.exec('begin');
+		await db.exec(`insert or replace into o values ('"9.0"', 'staged')`);
+		const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from o`));
+		expect(staged).to.have.lengthOf(2);
+		expect(staged.map(r => `${r.q}:${r.v}`).sort())
+			.to.deep.equal(['"9":committed', '"9.0":staged']);
+		await db.exec('commit');
+
+		const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from o`));
+		expect(final).to.have.lengthOf(2);
+		expect(final.map(r => `${r.q}:${r.v}`).sort())
+			.to.deep.equal(['"9":committed', '"9.0":staged']);
 	});
 
 	it('shadows inside an equal-integer group of a composite (int, json) PK', async () => {

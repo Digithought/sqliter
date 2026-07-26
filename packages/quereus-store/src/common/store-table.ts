@@ -222,12 +222,6 @@ export function resolveIndexKeyTransforms(
  * physical key under {@link resolvePkKeyTransforms} ('PT1H' / 'PT60M') must also
  * answer "same row" here, or self-PK exclusion in the UNIQUE checks false-conflicts
  * a row against its own differently-spelled image.
- *
- * BUG: the comparator is built with NO collation, and collation-less `JSON.compare`
- * re-parses a JSON string leaf — so two DISTINCT JSON string-scalar PKs ('9' and
- * '9.0') answer "same row" and self-PK exclusion swallows a real UNIQUE violation.
- * Pre-dates the structural key encoding; tracked as fix
- * `bug-json-pk-equality-drops-collation`.
  */
 function resolvePkSemanticEquality(
 	pkDef: ReadonlyArray<{ index: number }>,

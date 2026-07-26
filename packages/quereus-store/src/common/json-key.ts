@@ -52,15 +52,13 @@
  * - UTF-8 byte order equals code-point order and the escape map is monotonic, so
  *   string leaves and object keys order as `compareCodePoints` does.
  *
- * NOTE: a TOP-LEVEL string value orders by code point here, which matches the
- * BINARY-collation typed comparator the ORDERING paths use (the isolation merge,
- * UNIQUE enforcement, the memory BTree's collation-carrying comparator). Bare
- * `JSON_TYPE.compare` with NO collation argument instead RE-PARSES a JSON-parseable
- * string leaf, so it calls the strings '9' and '9.0' EQUAL. Two PK-EQUALITY sites do
- * build the comparator that way — `resolvePkSemanticEquality` (store-table.ts) and
- * the isolation layer's `getPkSemanticComparators` — so they disagree with these key
- * bytes for JSON string leaves. Pre-dates this encoder (canonical text disagreed the
- * same way); tracked as fix `bug-json-pk-equality-drops-collation`.
+ * NOTE: a TOP-LEVEL string value orders by code point here, matching every JSON
+ * comparator, collation argument or not — `JSON_TYPE.compare` defaults to
+ * `compareCodePoints` (BINARY) for a string-vs-string pair when no collation is
+ * supplied. So the ORDERING paths (the isolation merge, UNIQUE enforcement, the
+ * memory BTree's collation-carrying comparator) and the PK-EQUALITY-only paths
+ * (`resolvePkSemanticEquality` in store-table.ts, the isolation layer's
+ * `getPkSemanticComparators`) all agree with these key bytes for JSON string leaves.
  *
  * ## Identity
  *

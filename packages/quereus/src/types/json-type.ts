@@ -62,15 +62,14 @@ export const JSON_TYPE: LogicalType = {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
 
-		// Two JSON string scalars under an explicit collation: honor it. A NOCASE pin
-		// on a JSON comparison must keep discriminating exactly as the storage-class
-		// TEXT compare always did ('Bob' = 'bob' under NOCASE — see
-		// test/planner/collation-soundness.spec.ts). BINARY is code-point order,
-		// identical to the structural string-leaf compare, so this branch only
-		// changes behavior for non-BINARY pins. In-engine JSON values are native
-		// objects or scalar strings — serialized JSON text does not reach here.
-		if (typeof a === 'string' && typeof b === 'string' && collation) {
-			return collation(a, b);
+		// A JSON string scalar always compares as text — under the supplied collation,
+		// or BINARY (code-point order) when none is supplied. This agrees with
+		// deepCompareJson's string-leaf order below and with the store's structural
+		// key bytes, so a comparator built without a collation (PK equality checks)
+		// still tells '9' and '9.0' apart. In-engine JSON values are native objects
+		// or scalar strings — serialized JSON text does not reach here.
+		if (typeof a === 'string' && typeof b === 'string') {
+			return collation ? collation(a, b) : compareCodePoints(a, b);
 		}
 
 		// Ensure both are in native form for comparison
