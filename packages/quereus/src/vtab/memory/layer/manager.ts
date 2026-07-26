@@ -87,11 +87,16 @@ const shiftForInsert = (index: number, at: number): number => index >= at ? inde
  * and need nothing. `statistics.columnStats` is keyed by column name. `columnIndexMap` is
  * rebuilt from the new column list by the caller.
  *
- * A foreign key's `columns` are indices into THIS table and always shift.
- * `referencedColumns` are indices into the PARENT table, so they shift only when the FK
- * points back at this same table. Note that a foreign key in ANOTHER table referencing
- * this one is out of this manager's reach — its `referencedColumns` go stale on any
- * insert here, exactly as they already do on `dropColumn`.
+ * A foreign key's `columns` are indices into THIS table and always shift. Its
+ * `referencedColumns` are NOT touched: every constructor of a foreign key leaves that
+ * array empty (`constraint-builder.ts`, `schema/manager.ts`) and enforcement resolves the
+ * parent indices on demand from `referencedColumnNames` against the parent's CURRENT
+ * schema (`resolveReferencedColumns`) — so even a self-referential key needs no shift here.
+ *
+ * `derivation.logicalKey` / `derivation.ordering` also hold indices into this table and are
+ * NOT shifted, in either direction: they exist only on a maintained table (a materialized
+ * view's backing table), whose shape is defined by its body, and the emitter rejects every
+ * structural ALTER on one before dispatch.
  */
 function shiftSchemaIndicesForInsert(schema: TableSchema, at: number): Partial<TableSchema> {
 	const shift = (index: number): number => shiftForInsert(index, at);
@@ -108,15 +113,9 @@ function shiftSchemaIndicesForInsert(schema: TableSchema, at: number): Partial<T
 		columns: Object.freeze(uc.columns.map(shift)),
 	}));
 
-	const selfReferencing = (fk: { referencedTable: string; referencedSchema?: string }) =>
-		fk.referencedTable.toLowerCase() === schema.name.toLowerCase()
-		&& (fk.referencedSchema ?? schema.schemaName).toLowerCase() === schema.schemaName.toLowerCase();
 	const foreignKeys = schema.foreignKeys?.map(fk => ({
 		...fk,
 		columns: Object.freeze(fk.columns.map(shift)),
-		referencedColumns: selfReferencing(fk)
-			? Object.freeze(fk.referencedColumns.map(shift))
-			: fk.referencedColumns,
 	}));
 
 	// Generated-column bookkeeping is keyed BY column index and holds column indices.
@@ -2020,12 +2019,20 @@ export class MemoryTableManager {
 						.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index }))
 				})).filter(idx => idx.columns.length > 0);
 
-			// NOTE: `foreignKeys[].columns` (indices into THIS table) and the generated-column
-			// bookkeeping (`generatedColumnDependencies` / `generatedColumnTopoOrder`, also
-			// index-keyed) are carried through the spread UNSHIFTED, so they dangle past the
-			// removed slot. Pre-existing; `shiftSchemaIndicesForInsert` (the ADD-COLUMN-at-a-
-			// position mirror of this block) does shift them. Fix here needs the same care about
-			// an FK whose column set is emptied by the drop, which has no insert-side counterpart.
+			// BUG (pre-existing, tracked by ticket `bug-drop-column-leaves-fk-child-index-dangling`):
+			// `foreignKeys[].columns` — indices into THIS table — are carried through the spread
+			// UNSHIFTED, so after dropping a column that precedes an FK child column the index
+			// dangles and the next enforced write crashes. `shiftSchemaIndicesForInsert` (the
+			// ADD-COLUMN-at-a-position mirror of this block) does shift them; a fix here
+			// additionally has to decide what to do with an FK the drop empties, which has no
+			// insert-side counterpart.
+			//
+			// NOTE: the generated-column bookkeeping (`generatedColumnDependencies` /
+			// `generatedColumnTopoOrder`, also index-keyed) is likewise unshifted, but the
+			// engine recomputes it from column names right after this returns
+			// (`withGeneratedColumnGraph` in `runDropColumn`), so only a caller driving the
+			// module API directly ever observes the stale map.
+			//
 			// `primaryKey` below is not a TableSchema field at all — nothing reads it.
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,

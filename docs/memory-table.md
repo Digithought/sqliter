@@ -344,12 +344,13 @@ the read layer's schema to be the *current* one) is skipped and the snapshot's r
 commit. `TransactionLayer.prepareReshapedColumns` / `installReshapedColumns` close this the same
 way `convertColumn` does for value rewrites, applied oldest-first: each layer's own-write log is
 collapsed to its net per-key effect, each surviving row is rewritten to the new column set (ADD
-appends the backfilled value — including a per-row `default (new.<col>)` evaluated against the
+splices in the backfilled value — including a per-row `default (new.<col>)` evaluated against the
 pending row itself — DROP filters out the dropped slot), the layer's primary tree is rebuilt over
 its parent's already-reshaped one, and every secondary index is rebuilt. Unlike `convertColumn`,
-the primary-key *functions* are rebuilt — `DROP COLUMN` shifts the PK's column indices — but the
-key *values* are invariant (ADD appends past them; dropping a PK column is rejected), so tree
-ordering and the recorded own-write keys survive unchanged. The rewrite is split into a fallible
+the primary-key *functions* are rebuilt — a column-set change can shift the PK's column indices
+(`DROP COLUMN` past the removed slot, a positioned `ADD COLUMN` past the inserted one) — but the
+key *values* are invariant (the added column is part of no key wherever it lands; dropping a PK
+column is rejected), so tree ordering and the recorded own-write keys survive unchanged. The rewrite is split into a fallible
 compute phase and an infallible install phase because the ADD backfill can throw on a pending row
 even when every committed row converts cleanly: all computation runs *before* the first mutation
 anywhere, so a failure — a throwing evaluator, or a per-row DEFAULT that yields NULL for a
@@ -361,6 +362,17 @@ change here, the ALTER itself is **not** undone by `ROLLBACK` / `ROLLBACK TO SAV
 non-transactional — see the declared-contract paragraph above); what the reshape guarantees is
 that the transaction's DML — including rows inserted before a savepoint — survives at the new
 arity.
+
+**`ADD COLUMN` can place the column somewhere other than the end.** `SchemaChangeInfo.addColumn`
+carries an optional `insertAtIndex`; the memory module honors it, splicing the new value into
+that slot in every committed and pending row and renumbering the schema's index-bearing fields
+(PK definition, secondary index and UNIQUE column lists, FK child columns, generated-column
+bookkeeping) to match. Omitting it appends, which is what `alter table … add column` always asks
+for — there is no SQL syntax for a position, so it reaches the module only from an in-process
+wrapper (see `docs/module-authoring.md` § Per-arm mandate). One engine-side path still assumes an
+append: a column-level `CHECK` on the new column is evaluated by `buildAddColumnChecks` against
+`[...existingRow, value]`, so a wrapper that redirects an *engine-driven* `ADD COLUMN` to a
+position must not rely on one.
 
 **3. A collation change on a PRIMARY KEY column obeys a stricter rule, because the primary tree
 is a map.** A secondary index is a multi-map and tolerates two primary keys under one index key,

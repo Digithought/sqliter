@@ -534,7 +534,7 @@ the honest choice.
 
 | Arm | Mandate | memory | store |
 | --- | --- | --- | --- |
-| `addColumn` | append column; backfill; NOT-NULL gated by `delegatesNotNullBackfill` | ✓ | ✓ |
+| `addColumn` | append column; backfill; NOT-NULL gated by `delegatesNotNullBackfill`; honor `insertAtIndex` **or throw `UNSUPPORTED`** | ✓ (honors a position) | ✓ (append only — rejects a position) |
 | `dropColumn` | remove slot + reindex | ✓ | ✓ |
 | `renameColumn` | schema-only | ✓ | ✓ |
 | `alterPrimaryKey` | re-key in place **or throw `UNSUPPORTED`** | throws `UNSUPPORTED` → engine `runAlterPrimaryKey` catches → **generic rebuild** | in-place re-key |
@@ -851,7 +851,8 @@ The current arms of the union (`vtab/module.ts`):
 
 ```typescript
 export type SchemaChangeInfo =
-	| { type: 'addColumn'; columnDef: ColumnDef; backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue> }
+	| { type: 'addColumn'; columnDef: ColumnDef; backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>;
+	    insertAtIndex?: number }
 	| { type: 'dropColumn'; columnName: string }
 	| { type: 'renameColumn'; oldName: string; newName: string; newColumnDefAst?: ColumnDef }
 	| { type: 'alterPrimaryKey'; newPkColumns: ReadonlyArray<{ index: number; desc: boolean }> }
@@ -868,7 +869,7 @@ Each arm carries its own contract. A module that implements `alterTable` is resp
 
 | Arm | Mandate |
 | --- | --- |
-| `addColumn` | Append the column and backfill existing rows. A literal / NULL default is bulk-written; a non-foldable default (e.g. `new.<col>`) arrives as `backfillEvaluator`, which the module must call **per existing row**. NOT-NULL backfill rejection is gated by the `delegatesNotNullBackfill` capability. |
+| `addColumn` | Append the column and backfill existing rows. A literal / NULL default is bulk-written; a non-foldable default (e.g. `new.<col>`) arrives as `backfillEvaluator`, which the module must call **per existing row**. NOT-NULL backfill rejection is gated by the `delegatesNotNullBackfill` capability. `insertAtIndex`, when present, asks for the column at that slot instead of the end (every existing column at or after it shifts right by one, and every index-bearing schema field — PK definition, index / UNIQUE / FK column lists — must be renumbered to match). SQL never produces one; it reaches a module only from an in-process wrapper. A module that cannot place a column anywhere but the end must **throw `UNSUPPORTED`** for a position it cannot honor rather than silently appending. |
 | `dropColumn` | Remove the column slot and reindex remaining columns. |
 | `renameColumn` | Schema-only rename (no row migration). |
 | `alterPrimaryKey` | Re-key in place **or** throw `UNSUPPORTED` (see below). |

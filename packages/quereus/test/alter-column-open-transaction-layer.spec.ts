@@ -569,6 +569,102 @@ describe('ALTER TABLE ADD COLUMN at a position (memory module)', () => {
 		]);
 	});
 
+	it('keeps a partial index whose key AND predicate columns both shift', async () => {
+		// The index key column is renumbered; the predicate is an AST that names its column,
+		// so it must re-resolve against the new column list when the index is rebuilt.
+		await db.exec(`create table t (id integer primary key, v text, active integer)`);
+		await db.exec(`create index ix on t (v) where active = 1`);
+		await db.exec(`insert into t values (1, 'a', 1)`);
+		await db.exec(`insert into t values (2, 'b', 0)`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (3, 'c', 1)`);
+
+		mod.insertAt = 0;
+		await db.exec(`alter table t add column w text default 'z'`);
+
+		// A write AFTER the reshape exercises index maintenance under the new layout.
+		await db.exec(`insert into t values ('z', 4, 'd', 1)`);
+
+		const inScope = `select id from t where active = 1 order by id`;
+		expect(await collect(db, inScope)).to.deep.equal([{ id: 1 }, { id: 3 }, { id: 4 }]);
+		expect(await collect(db, `select id from t where v = 'b'`)).to.deep.equal([{ id: 2 }]);
+
+		await db.exec(`commit`);
+
+		expect(await collect(db, inScope)).to.deep.equal([{ id: 1 }, { id: 3 }, { id: 4 }]);
+		expect(await collect(db, `select id from t where v = 'd'`)).to.deep.equal([{ id: 4 }]);
+	});
+
+	it('shifts foreign-key child columns and generated-column bookkeeping', async () => {
+		await db.exec(`create table parent (pid integer primary key)`);
+		await db.exec(`create table t (id integer primary key, pref integer references parent(pid), g integer generated always as (id + 1))`);
+
+		// Applied straight to the module: the engine recomputes the generated-column graph from
+		// column names after its own ADD COLUMN, so only a caller driving the module API sees
+		// these two fields as the module leaves them.
+		const updated = await mod.alterTable(db, 'main', 't', {
+			type: 'addColumn',
+			columnDef: { name: 'w', dataType: 'TEXT', constraints: [{ type: 'null' }] },
+			insertAtIndex: 0,
+		});
+
+		expect(updated.columns.map(c => c.name)).to.deep.equal(['w', 'id', 'pref', 'g']);
+		expect(updated.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1]);
+		// FK child columns are indices into THIS table and shift; the parent-side indices are
+		// left empty by every builder and resolved from names at enforcement time.
+		expect(updated.foreignKeys?.map(fk => [...fk.columns])).to.deep.equal([[2]]);
+		expect(updated.foreignKeys?.map(fk => [...fk.referencedColumns])).to.deep.equal([[]]);
+		// `g` (2 → 3) is generated from `id` (0 → 1).
+		expect([...(updated.generatedColumnDependencies ?? [])].map(([col, deps]) => [col, [...deps]]))
+			.to.deep.equal([[3, [1]]]);
+		expect([...(updated.generatedColumnTopoOrder ?? [])]).to.deep.equal([3]);
+	});
+
+	it('applies two positioned adds in one transaction, the second relative to the first', async () => {
+		await db.exec(`create table t (id integer primary key, v text)`);
+		await db.exec(`insert into t values (1, 'committed')`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (2, 'pending')`);
+
+		mod.insertAt = 0;
+		await db.exec(`alter table t add column w text default 'w1'`);
+		// `id` now sits at 1, so inserting at 2 lands between `id` and `v`.
+		mod.insertAt = 2;
+		await db.exec(`alter table t add column x text default 'x2'`);
+
+		expect(columnOrder(db, 't')).to.deep.equal(['w', 'id', 'x', 'v']);
+		expect(await collect(db, `select v from t where id = 2`)).to.deep.equal([{ v: 'pending' }]);
+
+		await db.exec(`commit`);
+
+		expect(await collect(db, `select * from t order by id`)).to.deep.equal([
+			{ w: 'w1', id: 1, x: 'x2', v: 'committed' },
+			{ w: 'w1', id: 2, x: 'x2', v: 'pending' },
+		]);
+	});
+
+	it('keeps pre-savepoint rows at the new layout after a rollback to savepoint', async () => {
+		// DDL is not transactional here (see the note at the top of this file): the column
+		// change survives the rollback; what must survive with it is the pre-savepoint INSERT,
+		// reshaped to the inserted-column layout rather than the appended one.
+		await db.exec(`create table t (id integer primary key, v text)`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (1, 'a')`);
+		await db.exec(`savepoint s`);
+
+		mod.insertAt = 0;
+		await db.exec(`alter table t add column w text default 'z'`);
+		await db.exec(`rollback to savepoint s`);
+
+		expect(columnOrder(db, 't')).to.deep.equal(['w', 'id', 'v']);
+		expect(await collect(db, `select * from t`)).to.deep.equal([{ w: 'z', id: 1, v: 'a' }]);
+
+		await db.exec(`commit`);
+
+		expect(await collect(db, `select * from t`)).to.deep.equal([{ w: 'z', id: 1, v: 'a' }]);
+		expect(await collect(db, `select v from t where id = 1`)).to.deep.equal([{ v: 'a' }]);
+	});
+
 	it('rejects an out-of-range position and leaves the table untouched', async () => {
 		await db.exec(`create table t (id integer primary key, v text)`);
 		await db.exec(`insert into t values (1, 'a')`);
