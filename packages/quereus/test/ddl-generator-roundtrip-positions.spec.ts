@@ -360,6 +360,56 @@ describe('Generator: table-column COLLATE default elision + round-trip', () => {
 	});
 });
 
+describe('Generator: every ALTER-reachable column shape re-parses', () => {
+	// The standing invariant, stated as a property rather than as today's answer: a column
+	// shape an ALTER can produce must be a shape CREATE TABLE accepts. `ALTER COLUMN … SET
+	// DATA TYPE` keeps the column's collation, so retyping a `collate nocase` column into a
+	// type that accepts BINARY only (DATE / TIME / DATETIME / TIMESPAN / JSON all declare
+	// `supportedCollations: []`) either has to be REJECTED, or has to leave DDL that still
+	// re-executes. Anything else is the data-loss path: a store-backed catalog persists the
+	// generated DDL and silently skips the table on reopen when it will not re-parse.
+	//
+	// Written as "rejected OR round-trips" so the test survives a future decision to coerce
+	// the collation instead of rejecting — it guards the invariant, not the mechanism.
+	const COLLATIONLESS_TYPES = ['date', 'time', 'datetime', 'timespan', 'json'];
+
+	for (const targetType of COLLATIONLESS_TYPES) {
+		it(`text collate nocase → ${targetType}: rejected, or its generated DDL re-executes`, async () => {
+			const db = new Database();
+			try {
+				await db.exec(`create table t (id integer primary key, d text collate nocase)`);
+
+				let alterErr: unknown = null;
+				try {
+					await db.exec(`alter table t alter column d set data type ${targetType}`);
+				} catch (e) {
+					alterErr = e;
+				}
+
+				const ddl = generateTableDDL(db.schemaManager.findTable('t', 'main')!, db);
+
+				if (alterErr !== null) {
+					// Rejected — and the rejection must leave the ORIGINAL shape, which round-trips.
+					expect(errText(alterErr), `reject should name the collation\n  ddl: ${ddl}`).to.match(/Unknown collation/);
+					expect(ddl, 'rejected retype leaves the column TEXT').to.include('TEXT');
+				}
+
+				// Either way the current shape must be re-creatable from its own canonical DDL.
+				const fresh = new Database();
+				try {
+					await fresh.exec(ddl);
+				} catch (e) {
+					expect.fail(`generated DDL does not re-execute: ${errText(e)}\n  ddl: ${ddl}`);
+				} finally {
+					await fresh.close();
+				}
+			} finally {
+				await db.close();
+			}
+		});
+	}
+});
+
 describe('Generator: cross-schema FOREIGN KEY qualifier round-trip', () => {
 	// `generateTableDDL` must emit the `schema.` qualifier on a FK whose parent
 	// lives in a different schema than the child — so a store-backed catalog keeps

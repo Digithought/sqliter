@@ -379,6 +379,25 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
+		// SET DATA TYPE keeps the column's collation, so the NEW type has to accept it. DATE
+		// declares `supportedCollations: []` (BINARY only), so `text collate nocase → date` must
+		// reject — otherwise the ALTER mints `d DATE COLLATE NOCASE`, a shape CREATE TABLE would
+		// refuse and whose generated DDL does not re-parse (on a store-backed database the table
+		// is dropped on reopen). `stubUnsupported: false`: this guard is engine-side and fires
+		// BEFORE module.alterTable is dispatched, so the stub leg would see this same collation
+		// error rather than the sited UNSUPPORTED that leg asserts.
+		label: 'alterColumn SET DATA TYPE into a collation-less type with an illegal collation → ERROR',
+		seed: u => [`create table t (id integer primary key, d text collate nocase)${u}`, `insert into t values (1, '2024-01-01')`],
+		alter: `alter table t alter column d set data type date`,
+		memory: { kind: 'reject', codes: [StatusCode.ERROR], site: /Unknown collation/ },
+		stubUnsupported: false,
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'd');
+			expect(String(info?.type).toLowerCase(), 'type unchanged after collation reject').to.contain('text');
+			expect(String(info?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('NOCASE');
+		},
+	},
+	{
 		label: 'alterColumn SET DEFAULT',
 		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, 5)`],
 		alter: `alter table t alter column v set default 99`,

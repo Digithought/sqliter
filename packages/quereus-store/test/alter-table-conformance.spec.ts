@@ -297,6 +297,21 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
+		// Mirrors the memory leg's arm of the same label. The guard is engine-side (it fires
+		// before module.alterTable), so the store inherits it — which is the point: without it
+		// the store PERSISTS `d DATE COLLATE NOCASE` into its catalog DDL and then silently
+		// skips that table on rehydrate, losing it (and its rows) on reopen.
+		label: 'alterColumn SET DATA TYPE into a collation-less type with an illegal collation → ERROR',
+		seed: [`create table t (id integer primary key, d text collate nocase) using store`, `insert into t values (1, '2024-01-01')`],
+		alter: `alter table t alter column d set data type date`,
+		expect: { kind: 'reject', codes: [StatusCode.ERROR], site: /Unknown collation/ },
+		confirm: async (db) => {
+			const info = await columnInfo(db, 'd');
+			expect(String(info?.type).toLowerCase(), 'type unchanged after collation reject').to.contain('text');
+			expect(String(info?.collation).toUpperCase(), 'collation unchanged after reject').to.equal('NOCASE');
+		},
+	},
+	{
 		label: 'alterColumn SET DEFAULT',
 		seed: [`create table t (id integer primary key, v integer null) using store`, `insert into t values (1, 5)`],
 		alter: `alter table t alter column v set default 99`,

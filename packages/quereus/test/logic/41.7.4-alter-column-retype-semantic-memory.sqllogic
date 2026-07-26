@@ -13,10 +13,13 @@
 -- INSERT of that same spelling was rejected as a duplicate — a value simultaneously absent
 -- on SELECT and duplicate on INSERT (bug-retype-to-semantic-type-unique-and-query).
 --
--- MEMORY-ONLY (listed in MEMORY_ONLY_FILES): the store backend already re-validates and
--- rebuilds on the TIMESPAN half of this via its own key-transform guard, but the
--- `collate nocase → date` section below turns on comparator identity rather than a key
--- transform, which the store does not track. The memory-side contract is what this file pins.
+-- MEMORY-ONLY (listed in MEMORY_ONLY_FILES): the store backend re-validates and rebuilds on
+-- the TIMESPAN/JSON halves of this via its own key-transform guard, but not on the DATE /
+-- TIME / DATETIME retypes of section 7b, which turn on comparator identity rather than a key
+-- transform. Those three compare exactly as BINARY text does, so on a BINARY column memory's
+-- re-sort lands on the order the store's untouched keys already have — the divergence was only
+-- observable through the illegal `collate nocase` pairing section 7 now rejects. The memory-side
+-- contract is what this file pins.
 
 -- ===================================
 -- 1. Colliding rows under an explicit `create unique index` → the ALTER is REJECTED, and
@@ -225,17 +228,17 @@ select id from sem6b where n = 9;
 drop table sem6b;
 
 -- ===================================
--- 7. DATE / TIME / DATETIME carry their own comparison, hard-wired to BINARY and ignoring
---    the column's declared collation. So `text collate nocase → date` changes the ordering
---    too, even though both orderings are "textual" — the guard turns on comparator
---    identity, not on semantic ordering alone.
+-- 7. SET DATA TYPE keeps the column's existing collation, so the NEW type has to accept it.
+--    DATE / TIME / DATETIME / TIMESPAN / JSON declare `supportedCollations: []` — they accept
+--    BINARY only — so retyping a `collate nocase` column into any of them is REJECTED with
+--    the same error `create table … (d date collate nocase)` gives. Otherwise the ALTER would
+--    mint `d DATE COLLATE NOCASE`, a column shape no CREATE TABLE can produce and whose
+--    canonical DDL does not re-parse (on a store-backed database the table is dropped on
+--    reopen). Remedy is one extra statement: `set collate binary` first — see 7c.
 --
---    NOTE: `create table … (d date collate nocase)` is REJECTED (DATE declares
---    `supportedCollations: []`), but SET DATA TYPE does not re-check the column's existing
---    collation against the new type, so this ALTER leaves `d DATE COLLATE NOCASE` — a column
---    no CREATE TABLE could produce, whose canonical DDL will not re-parse. Tracked in
---    tickets/fix/bug-retype-keeps-illegal-collation.md; when that lands this section becomes
---    an `-- error:` case and the re-key coverage moves to a plain `text` column.
+--    The rejection is uniform: it does not matter whether the collation was written by the
+--    user or inherited from `pragma default_collation`, because that distinction is not
+--    persisted and would flip on a reopen.
 -- ===================================
 
 create table sem7 (id integer primary key, d text collate nocase);
@@ -244,23 +247,29 @@ insert into sem7 values (1, '2024-01-01'), (2, '2024-02-01');
 -- run
 
 alter table sem7 alter column d set data type date;
--- run
+-- error: Unknown collation
 
+-- the rejection changed nothing: declared type, collation, rows and index all survive
 select name, type from table_info('sem7') where name = 'd';
-→ [{"name":"d","type":"DATE"}]
+→ [{"name":"d","type":"TEXT"}]
 
-select id from sem7 where d = '2024-02-01';
-→ [{"id":2}]
+select name, collation from table_info('sem7') where name = 'd';
+→ [{"name":"d","collation":"NOCASE"}]
 
-select id, d from sem7 order by d;
+select id, d from sem7 order by id;
 → [{"id":1,"d":"2024-01-01"},{"id":2,"d":"2024-02-01"}]
+
+-- still writable, and the index still enforces NOCASE uniqueness under the unchanged type
+insert into sem7 values (3, '2024-03-01');
+select count(*) as n from sem7;
+→ [{"n":3}]
 
 drop table sem7;
 
 -- 7b. …and the collation-legal shape of the same retype (a plain BINARY `text` column, the
 -- only collation DATE accepts). DATE compares exactly as BINARY text does, so this one
 -- re-sorts into the order it was already in — the point is that it stays correct and stays
--- accepted. This is the section that survives bug-retype-keeps-illegal-collation.
+-- accepted. This is the surviving re-key coverage now that section 7 rejects.
 create table sem7b (id integer primary key, d text);
 create unique index sem7b_d on sem7b (d);
 insert into sem7b values (1, '2024-02-01'), (2, '2024-01-01');
@@ -276,6 +285,111 @@ select id from sem7b where d = '2024-02-01';
 → [{"id":1}]
 
 drop table sem7b;
+
+-- 7c. …the remedy for section 7: drop the illegal collation first, then retype. Two statements,
+-- both accepted, and the resulting column is a shape CREATE TABLE could have produced directly.
+create table sem7c (id integer primary key, d text collate nocase);
+create unique index sem7c_d on sem7c (d);
+insert into sem7c values (1, '2024-02-01'), (2, '2024-01-01');
+-- run
+
+alter table sem7c alter column d set collate binary;
+-- run
+alter table sem7c alter column d set data type date;
+-- run
+
+select name, type, collation from table_info('sem7c') where name = 'd';
+→ [{"name":"d","type":"DATE","collation":"BINARY"}]
+
+select id, d from sem7c order by d;
+→ [{"id":2,"d":"2024-01-01"},{"id":1,"d":"2024-02-01"}]
+
+drop table sem7c;
+
+-- 7d. Every collation-less type rejects, and the collation name is not special — RTRIM
+-- rejects exactly as NOCASE does.
+create table sem7d (id integer primary key, v text collate nocase);
+insert into sem7d values (1, 'x');
+-- run
+
+alter table sem7d alter column v set data type date;
+-- error: Unknown collation
+
+alter table sem7d alter column v set data type time;
+-- error: Unknown collation
+
+alter table sem7d alter column v set data type datetime;
+-- error: Unknown collation
+
+alter table sem7d alter column v set data type timespan;
+-- error: Unknown collation
+
+alter table sem7d alter column v set data type json;
+-- error: Unknown collation
+
+select name, type, collation from table_info('sem7d') where name = 'v';
+→ [{"name":"v","type":"TEXT","collation":"NOCASE"}]
+
+drop table sem7d;
+
+create table sem7d2 (id integer primary key, v text collate rtrim);
+insert into sem7d2 values (1, 'x');
+-- run
+
+alter table sem7d2 alter column v set data type timespan;
+-- error: Unknown collation
+
+select name, type, collation from table_info('sem7d2') where name = 'v';
+→ [{"name":"v","type":"TEXT","collation":"RTRIM"}]
+
+drop table sem7d2;
+
+-- 7e. …and the types that declare NO collation list (INTEGER / REAL / BLOB) must not regress
+-- into rejecting: they accept any registered collation, so a NOCASE column still retypes.
+create table sem7e (id integer primary key, v text collate nocase);
+insert into sem7e values (1, '10');
+-- run
+
+alter table sem7e alter column v set data type integer;
+-- run
+
+select name, type, collation from table_info('sem7e') where name = 'v';
+→ [{"name":"v","type":"INTEGER","collation":"NOCASE"}]
+
+drop table sem7e;
+
+create table sem7e2 (id integer primary key, v text collate nocase);
+insert into sem7e2 values (1, 'abc');
+-- run
+
+alter table sem7e2 alter column v set data type blob;
+-- run
+
+select name, type, collation from table_info('sem7e2') where name = 'v';
+→ [{"name":"v","type":"BLOB","collation":"NOCASE"}]
+
+drop table sem7e2;
+
+-- 7f. The rejection does not care where the collation came from: with a session default of
+-- NOCASE the user never writes COLLATE, and the retype is still rejected. (`collationExplicit`
+-- is not persisted, so keying the rule on user intent would flip on a reopen.)
+pragma default_collation = 'nocase';
+-- run
+
+create table sem7f (id integer primary key, v text);
+insert into sem7f values (1, '2024-01-01');
+-- run
+
+select name, collation from table_info('sem7f') where name = 'v';
+→ [{"name":"v","collation":"NOCASE"}]
+
+alter table sem7f alter column v set data type date;
+-- error: Unknown collation
+
+drop table sem7f;
+
+pragma default_collation = 'binary';
+-- run
 
 -- ===================================
 -- 8. EFFECTIVE rows, not committed rows: a collision involving a row the open transaction

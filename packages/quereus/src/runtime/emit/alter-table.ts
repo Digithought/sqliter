@@ -28,6 +28,7 @@ import {
 	detachMaintainedDerivation,
 } from './materialized-view-helpers.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
+import { inferType } from '../../types/registry.js';
 
 const log = createLogger('runtime:emit:alter-table');
 
@@ -981,6 +982,22 @@ async function runAlterColumn(
 	if (action.setCollation !== undefined) {
 		validateCollationForType(
 			action.setCollation, tableSchema.columns[colIndex].logicalType, action.columnName,
+			(n) => rctx.db.isCollationRegistered(n),
+		);
+	}
+
+	// SET DATA TYPE: the column keeps its current collation, so the NEW type has to accept it —
+	// otherwise the ALTER mints a column shape CREATE TABLE would refuse and generateTableDDL
+	// cannot round-trip (a store-backed table with such a column is silently dropped on rehydrate).
+	// Same validator, same error text as CREATE TABLE / SET COLLATE. Rejects uniformly whether the
+	// collation was user-declared or inherited from `pragma default_collation`: `collationExplicit`
+	// is not persisted, so keying on it would coerce before a reopen and reject after one.
+	// Remedy: `SET COLLATE binary` first, then retype.
+	if (action.setDataType !== undefined) {
+		validateCollationForType(
+			tableSchema.columns[colIndex].collation,
+			inferType(action.setDataType),
+			action.columnName,
 			(n) => rctx.db.isCollationRegistered(n),
 		);
 	}
