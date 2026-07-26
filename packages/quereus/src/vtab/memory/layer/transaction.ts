@@ -9,6 +9,7 @@ import { createPrimaryKeyFunctions, type PrimaryKeyFunctions } from '../utils/pr
 import { QuereusError } from '../../../common/errors.js';
 import { StatusCode } from '../../../common/types.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
+import { convertRowAtIndex } from './row-convert.js';
 
 const log = createLogger('vtab:memory:layer:transaction');
 const warnLog = log.extend('warn');
@@ -387,15 +388,11 @@ export class TransactionLayer implements Layer {
 				survivingDeletions.push(write.primaryKey);
 				continue;
 			}
-			const oldVal = effectiveRow[colIndex];
 			let newRow = effectiveRow;
-			if (oldVal !== null || convertNulls) {
-				try {
-					const newVal = convert(oldVal);
-					newRow = effectiveRow.map((v, i) => i === colIndex ? newVal : v) as Row;
-				} catch {
-					// Shadowed unconvertible own value — leave as-is (see method doc).
-				}
+			try {
+				newRow = convertRowAtIndex(effectiveRow, colIndex, convert, convertNulls);
+			} catch {
+				// Shadowed unconvertible own value — leave as-is (see method doc).
 			}
 			upserts.push(newRow);
 		}

@@ -212,10 +212,23 @@ committed raises `UNIQUE constraint failed`; a duplicate it has *deleted* does n
 change. Validation runs before anything is mutated, so a rejection leaves the schema, the base
 layer and the index map untouched, and the transaction stays usable.
 
-A collation change is validated the same way, once per uniqueness-enforcing index that orders
-by the altered column (`indexEnforcesUnique` — the index's own `unique` flag, or its role as
-the auto-built covering structure for a declared UNIQUE constraint). The probe index is built
-under the *new* per-column collations, so it compares exactly as the rebuilt structure will.
+Every `ALTER COLUMN` that can make two previously-distinct rows collide is validated the same
+way, once per uniqueness-enforcing index covering the altered column (`indexEnforcesUnique` —
+the index's own `unique` flag, or its role as the auto-built covering structure for a declared
+UNIQUE constraint). The probe index is built from the *new* `TableSchema`, so it compares
+exactly as the rebuilt structure will. Two families qualify:
+
+*   **`SET COLLATE`** re-keys the structures under a new comparator; the stored values are
+    unchanged, so the probe reads the effective rows as they are.
+*   **A value rewrite** — `SET DATA TYPE`, or a `SET NOT NULL` NULL → DEFAULT backfill — leaves
+    the comparators alone but changes the values, so the probe reads the effective rows with the
+    altered column **converted**, under the column's new logical type. That is what catches
+    `'1'`/`'01'` collapsing onto the integer `1`, `'1.0'`/`'1.00'` onto the real `1.0`, and two
+    NULLs (mutually distinct under SQL UNIQUE) collapsing onto one DEFAULT literal. The base
+    rewrite that follows is deliberately non-enforcing — the base's rows are not a subset of the
+    effective rows — so this pre-pass is the only guard. The per-row conversion is shared with
+    the base rewrite and the open layers' rewrite (`convertRowAtIndex`) so the three cannot
+    disagree about what the converted row is.
 
 When the table is wrapped by a module that stages the transaction's writes *outside* this
 manager — the isolation layer, whose per-connection overlay this manager cannot see — those

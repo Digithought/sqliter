@@ -1,0 +1,282 @@
+-- ALTER COLUMN — value-REWRITING change re-validates UNIQUE over the CONVERTED values.
+--
+-- Two families of ALTER COLUMN rewrite the stored values at one column, and either can
+-- collapse two rows that were distinct onto the same value:
+--
+--   * `set data type` — '1' and '01' are distinct text but both convert to the integer 1;
+--     '1.0' and '1.00' both convert to the real 1.0.
+--   * `set not null` with a DEFAULT — SQL UNIQUE treats several NULLs as mutually
+--     distinct, so backfilling them all to the same DEFAULT literal collides.
+--
+-- Every uniqueness-enforcing structure covering the altered column is therefore
+-- re-validated over the converted values, before anything is mutated: a collision
+-- rejects the ALTER with CONSTRAINT and leaves the table, its type and the transaction
+-- exactly as they were. The judged rows are the DDL transaction's EFFECTIVE rows, so a
+-- collision only among rows it has DELETED does not block the change, while one among
+-- rows it has INSERTED but not committed does reject it.
+--
+-- MEMORY-ONLY (listed in MEMORY_ONLY_FILES) for now: the store backend has the same
+-- missing re-validation plus a further defect of its own, both fixed by ticket
+-- bug-retype-unique-revalidation-store, which removes the entry.
+--
+-- NOTE: a bare `v text` column is NOT NULL in this engine; the NULL sections below
+-- declare `v text null` so they can hold NULLs at all.
+
+-- ===================================
+-- 1. text → integer collision under an explicit `create unique index` → rejected,
+--    and the rejection changes nothing: values, type and writability all survive.
+-- ===================================
+
+create table ri (id integer primary key, v text);
+create unique index ri_v on ri (v);
+insert into ri values (1, '1'), (2, '01');
+-- run
+
+alter table ri alter column v set data type integer;
+-- error: UNIQUE constraint failed
+
+-- rolled back: both rows survive as their original TEXT values
+select id, v, typeof(v) from ri order by id;
+→ [{"id":1,"v":"1","typeof(v)":"text"},{"id":2,"v":"01","typeof(v)":"text"}]
+
+-- the table is still writable, and the index still enforces under the unchanged type
+insert into ri values (3, '001');
+select count(*) as n from ri;
+→ [{"n":3}]
+
+insert into ri values (4, '1');
+-- error: UNIQUE constraint failed
+
+drop table ri;
+
+-- ===================================
+-- 2. Same collision under a table-level `unique (v)` constraint, caught through the
+--    auto-built covering index rather than a user-created one.
+-- ===================================
+
+create table ru (id integer primary key, v text unique);
+insert into ru values (1, '1'), (2, '01');
+-- run
+
+alter table ru alter column v set data type integer;
+-- error: UNIQUE constraint failed
+
+select id, v, typeof(v) from ru order by id;
+→ [{"id":1,"v":"1","typeof(v)":"text"},{"id":2,"v":"01","typeof(v)":"text"}]
+
+drop table ru;
+
+-- ===================================
+-- 3. text → real collision — '1.0' and '1.00' are distinct text, one real. The probe
+--    compares under the NEW logical type, which is what makes this reachable.
+-- ===================================
+
+create table rr (id integer primary key, v text unique);
+insert into rr values (1, '1.0'), (2, '1.00');
+-- run
+
+alter table rr alter column v set data type real;
+-- error: UNIQUE constraint failed
+
+select id, v, typeof(v) from rr order by id;
+→ [{"id":1,"v":"1.0","typeof(v)":"text"},{"id":2,"v":"1.00","typeof(v)":"text"}]
+
+drop table rr;
+
+-- ===================================
+-- 4. `set not null` DEFAULT backfill collision — two legal NULLs become two copies of
+--    the same DEFAULT literal → rejected, and the column stays nullable.
+-- ===================================
+
+create table rn (id integer primary key, v text null);
+create unique index rn_v on rn (v);
+insert into rn (id, v) values (1, null), (2, null);
+-- run
+
+alter table rn alter column v set default 'x';
+-- run
+
+alter table rn alter column v set not null;
+-- error: UNIQUE constraint failed
+
+-- rolled back: both NULLs survive and the column is still nullable
+select id, v from rn order by id;
+→ [{"id":1,"v":null},{"id":2,"v":null}]
+
+insert into rn (id, v) values (3, null);
+select count(*) as n from rn where v is null;
+→ [{"n":3}]
+
+drop table rn;
+
+-- 4b. A backfill that collides with an EXISTING non-null row is rejected too: one NULL
+--     plus a row already holding the DEFAULT value.
+create table rn2 (id integer primary key, v text null);
+create unique index rn2_v on rn2 (v);
+insert into rn2 (id, v) values (1, 'x'), (2, null);
+-- run
+
+alter table rn2 alter column v set default 'x';
+-- run
+
+alter table rn2 alter column v set not null;
+-- error: UNIQUE constraint failed
+
+select id, v from rn2 order by id;
+→ [{"id":1,"v":"x"},{"id":2,"v":null}]
+
+drop table rn2;
+
+-- 4c. A single NULL with no colliding partner backfills fine (the guard must not
+--     reject every backfill).
+create table rn3 (id integer primary key, v text null);
+create unique index rn3_v on rn3 (v);
+insert into rn3 (id, v) values (1, 'a'), (2, null);
+-- run
+
+alter table rn3 alter column v set default 'x';
+-- run
+
+alter table rn3 alter column v set not null;
+-- run
+
+select id, v from rn3 order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"x"}]
+
+drop table rn3;
+
+-- ===================================
+-- 5. ACCEPTED: a non-colliding retype still succeeds, the values are physically
+--    rewritten, and an index-backed lookup finds rows by the NEW value.
+-- ===================================
+
+create table ok1 (id integer primary key, v text);
+create unique index ok1_v on ok1 (v);
+insert into ok1 values (1, '10'), (2, '9');
+-- run
+
+alter table ok1 alter column v set data type integer;
+-- run
+
+select id, v, typeof(v) from ok1 order by id;
+→ [{"id":1,"v":10,"typeof(v)":"integer"},{"id":2,"v":9,"typeof(v)":"integer"}]
+
+-- index-backed lookup by the new numeric value
+select id from ok1 where v = 9;
+→ [{"id":2}]
+
+-- the unique index still enforces after the successful retype
+insert into ok1 values (3, 9);
+-- error: UNIQUE constraint failed
+
+drop table ok1;
+
+-- ===================================
+-- 6. ACCEPTED: NULLs stay mutually distinct under UNIQUE, so retyping a column holding
+--    several of them is not a collision.
+-- ===================================
+
+create table ok2 (id integer primary key, v text null);
+create unique index ok2_v on ok2 (v);
+insert into ok2 (id, v) values (1, null), (2, null), (3, '7');
+-- run
+
+alter table ok2 alter column v set data type integer;
+-- run
+
+select id, v, typeof(v) from ok2 order by id;
+→ [{"id":1,"v":null,"typeof(v)":"null"},{"id":2,"v":null,"typeof(v)":"null"},{"id":3,"v":7,"typeof(v)":"integer"}]
+
+-- more NULLs still allowed; a duplicate of the converted value is not
+insert into ok2 (id, v) values (4, null);
+select count(*) as n from ok2 where v is null;
+→ [{"n":3}]
+
+insert into ok2 (id, v) values (5, 7);
+-- error: UNIQUE constraint failed
+
+drop table ok2;
+
+-- ===================================
+-- 7. COMPOSITE `unique (a, v)` — only the pair matters. A retype of `v` that makes two
+--    rows share a `v` value is accepted when they still differ in `a`.
+-- ===================================
+
+create table ok3 (id integer primary key, a integer, v text, unique (a, v));
+insert into ok3 values (1, 1, '1'), (2, 2, '01');
+-- run
+
+alter table ok3 alter column v set data type integer;
+-- run
+
+-- v collapses to 1 in both rows, but a (1 vs 2) still distinguishes them
+select id, a, v, typeof(v) from ok3 order by id;
+→ [{"id":1,"a":1,"v":1,"typeof(v)":"integer"},{"id":2,"a":2,"v":1,"typeof(v)":"integer"}]
+
+-- the composite now enforces on the converted values
+insert into ok3 values (3, 1, 1);
+-- error: UNIQUE constraint failed
+
+drop table ok3;
+
+-- 7b. The same shape where `a` matches too → the pair collides → rejected.
+create table rc (id integer primary key, a integer, v text, unique (a, v));
+insert into rc values (1, 1, '1'), (2, 1, '01');
+-- run
+
+alter table rc alter column v set data type integer;
+-- error: UNIQUE constraint failed
+
+select id, a, v, typeof(v) from rc order by id;
+→ [{"id":1,"a":1,"v":"1","typeof(v)":"text"},{"id":2,"a":1,"v":"01","typeof(v)":"text"}]
+
+drop table rc;
+
+-- ===================================
+-- 8. EFFECTIVE rows, not committed rows: a collision only among rows the open
+--    transaction has DELETED must NOT block the retype.
+-- ===================================
+
+create table tx1 (id integer primary key, v text);
+create unique index tx1_v on tx1 (v);
+insert into tx1 values (1, '1'), (2, '01'), (3, '5');
+-- run
+
+begin;
+-- run
+delete from tx1 where id = 2;
+-- run
+alter table tx1 alter column v set data type integer;
+-- run
+commit;
+-- run
+
+select id, v, typeof(v) from tx1 order by id;
+→ [{"id":1,"v":1,"typeof(v)":"integer"},{"id":3,"v":5,"typeof(v)":"integer"}]
+
+drop table tx1;
+
+-- ===================================
+-- 9. …and a collision among rows the transaction has INSERTED but not committed MUST
+--    reject the retype.
+-- ===================================
+
+create table tx2 (id integer primary key, v text);
+create unique index tx2_v on tx2 (v);
+insert into tx2 values (1, '1');
+-- run
+
+begin;
+-- run
+insert into tx2 values (2, '01');
+-- run
+alter table tx2 alter column v set data type integer;
+-- error: UNIQUE constraint failed
+rollback;
+-- run
+
+-- the rolled-back transaction left nothing behind, and the column is still text
+select id, v, typeof(v) from tx2 order by id;
+→ [{"id":1,"v":"1","typeof(v)":"text"}]
+
+drop table tx2;

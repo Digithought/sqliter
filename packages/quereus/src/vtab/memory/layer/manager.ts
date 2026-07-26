@@ -31,6 +31,7 @@ import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
 import type { EffectiveRowSource } from '../../module.js';
+import { convertRowAtIndex, mapRows, mapRowsAsync, type RowMapper } from './row-convert.js';
 
 let tableManagerCounter = 0;
 const logger = createMemoryTableLoggers('layer:manager');
@@ -2221,6 +2222,17 @@ export class MemoryTableManager {
 			// The primary key gets a stricter pre-pass (`validateRekeyedPrimaryKey`): no layer in
 			// the chain, base included, may hold a collision. That is what lets every step below
 			// succeed unconditionally, and what `TransactionLayer.rekeyPrimaryKey` relies on.
+			//
+			// A value-REWRITING change (`valueConvert`: SET DATA TYPE, or a SET NOT NULL null →
+			// DEFAULT backfill) needs the same pre-pass for the opposite reason: the comparators are
+			// unchanged but the VALUES collapse, so two rows that were distinct can become equal
+			// (`'1'`/`'01'` → 1; two NULLs → the same DEFAULT). The probe therefore judges the
+			// CONVERTED rows, using the same per-row conversion the base rewrite below applies.
+			// The rebuild that follows is deliberately non-enforcing, so this is the only guard.
+			//
+			// The two arms are mutually exclusive today — SET COLLATE never sets `valueConvert` —
+			// and stay separate so the collate path's PK pre-pass ordering is untouched. A retype of
+			// a PK column is rejected upstream, so the rewrite arm needs no PK pre-pass.
 			if (collationChanged) {
 				await this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex, rows);
 				// NOTE: `validateRekeyedPrimaryKey` deliberately ignores `rows`. It asserts that no
@@ -2232,6 +2244,17 @@ export class MemoryTableManager {
 				// side. Rejecting it here would need the wrapper to expose its overlay's PK set, not
 				// just its merged rows.
 				if (pkColumnRekeyed) this.validateRekeyedPrimaryKey(finalNewTableSchema);
+			} else if (valueConvert) {
+				const convert = valueConvert;
+				const nulls = convertNulls;
+				await this.validateRekeyedUniqueStructures(
+					finalNewTableSchema, colIndex, rows,
+					// Unlike `convertBaseRows`, a conversion failure here is NOT swallowed. Every row
+					// the probe sees is visible to the transaction, and the setDataType pre-pass above
+					// already proved each one convertible, so a throw is unreachable; surfacing it as
+					// MISMATCH still beats probing a stale value that could mask a collision.
+					row => convertRowAtIndex(row, colIndex, convert, nulls),
+				);
 			}
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
@@ -2989,19 +3012,11 @@ export class MemoryTableManager {
 	private convertBaseRows(colIndex: number, convert: (v: SqlValue) => SqlValue, convertNulls = false): Row[] {
 		const out: Row[] = [];
 		for (const row of iteratePrimaryRows(this.baseLayer.primaryTree)) {
-			const oldVal = row[colIndex];
-			if (oldVal === null && !convertNulls) {
-				out.push(row);
-				continue;
-			}
-			let newVal: SqlValue;
 			try {
-				newVal = convert(oldVal as SqlValue);
+				out.push(convertRowAtIndex(row, colIndex, convert, convertNulls));
 			} catch {
 				out.push(row); // shadowed unconvertible value — keep as-is
-				continue;
 			}
-			out.push(row.map((v, i) => i === colIndex ? newVal : v) as Row);
 		}
 		return out;
 	}
@@ -3016,11 +3031,17 @@ export class MemoryTableManager {
 	 * the transaction's pending rows outside this manager, so only it can name the rows the
 	 * issuing connection actually sees; when it supplies them, they are the judged set and this
 	 * manager's own committed rows are ignored. See `vtab/module.ts` {@link EffectiveRowSource}.
+	 *
+	 * `mapRow` judges the rows in a form they do not yet have on disk: an `alter column` that
+	 * REWRITES values passes the per-row conversion here, so the probe sees the post-ALTER
+	 * values. Applied to whichever stream is used; the mapping is a read-side wrap and mutates
+	 * nothing.
 	 */
 	private async validateUniqueOverEffectiveRows(
 		indexSchema: IndexSchema,
 		schema: TableSchema,
 		rows?: EffectiveRowSource,
+		mapRow?: RowMapper,
 	): Promise<void> {
 		const probe = new MemoryIndex(
 			indexSchema,
@@ -3031,8 +3052,9 @@ export class MemoryTableManager {
 			schema.name,
 		);
 		if (rows) {
+			const stream = mapRow ? mapRowsAsync(rows(), mapRow) : rows();
 			await populateIndexFromRowsAsync(
-				rows(),
+				stream,
 				probe,
 				this.primaryKeyFunctions.extractFromRow,
 				true,
@@ -3041,8 +3063,9 @@ export class MemoryTableManager {
 			);
 			return;
 		}
+		const own = this.effectiveDdlRows();
 		populateIndexFromRows(
-			this.effectiveDdlRows(),
+			mapRow ? mapRows(own, mapRow) : own,
 			probe,
 			this.primaryKeyFunctions.extractFromRow,
 			true,
@@ -3052,14 +3075,23 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * `ALTER COLUMN … SET COLLATE` arm of {@link validateUniqueOverEffectiveRows}: rejects the
-	 * change when it makes two of the DDL transaction's effective rows collide under any
-	 * uniqueness-enforcing structure that orders by the altered column. Runs before anything is
-	 * mutated, so a rejection leaves the table and schema untouched and the transaction usable.
+	 * `ALTER COLUMN` arm of {@link validateUniqueOverEffectiveRows}: rejects the change when it
+	 * makes two of the DDL transaction's effective rows collide under any uniqueness-enforcing
+	 * structure that covers the altered column. Runs before anything is mutated, so a rejection
+	 * leaves the table and schema untouched and the transaction usable.
 	 *
-	 * `newSchema` carries the post-change per-column collations, so each probe index compares
-	 * exactly as the rebuilt structure will. Indexes that do not mention the column keep their
-	 * keys and need no re-check.
+	 * Serves both families of change that can collapse two distinct values onto one:
+	 *
+	 *  - `SET COLLATE` re-keys the structures under a new comparator; the stored values are
+	 *    untouched, so no `mapRow` is passed.
+	 *  - a value REWRITE (`SET DATA TYPE`, or a `SET NOT NULL` null → DEFAULT backfill) leaves
+	 *    the comparators alone but changes the values; the caller passes a `mapRow` that applies
+	 *    the same per-row conversion the base rewrite will, so the probe judges the post-ALTER
+	 *    values.
+	 *
+	 * `newSchema` carries the post-change per-column collations AND logical types, so each probe
+	 * index compares exactly as the rebuilt structure will (it matters for e.g. `text → real`).
+	 * Indexes that do not mention the column keep their keys and need no re-check.
 	 *
 	 * NOTE: walks `schema.indexes`, so a UNIQUE constraint covered by a row-time materialized
 	 * view rather than its auto-index (`findIndexForConstraint` prefers the MV) is not re-checked
@@ -3070,6 +3102,7 @@ export class MemoryTableManager {
 		newSchema: TableSchema,
 		alteredColumnIndex: number,
 		rows?: EffectiveRowSource,
+		mapRow?: RowMapper,
 	): Promise<void> {
 		// NOTE: the probe index carries the manager's PRE-change `primaryKeyFunctions` (the new
 		// ones cannot exist before the schema swaps). Only the probe's per-entry PK bookkeeping
@@ -3080,7 +3113,7 @@ export class MemoryTableManager {
 			if (!indexSchema.columns.some(c => c.index === alteredColumnIndex)) continue;
 			if (!indexEnforcesUnique(newSchema, indexSchema)) continue;
 			// `rows` is re-callable, so each structure gets a fresh stream.
-			await this.validateUniqueOverEffectiveRows(indexSchema, newSchema, rows);
+			await this.validateUniqueOverEffectiveRows(indexSchema, newSchema, rows, mapRow);
 		}
 	}
 
