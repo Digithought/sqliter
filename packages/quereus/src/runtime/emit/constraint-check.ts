@@ -116,6 +116,9 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 		};
 	});
 
+	// Constant per plan: whether any CHECK / FK expression will read the row.
+	const hasConstraintExprs = constraintMetadata.length > 0;
+
 	async function* run(rctx: RuntimeContext, inputRows: AsyncIterable<Row>, ...evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>): AsyncIterable<Row> {
 		if (!inputRows) {
 			return;
@@ -176,12 +179,17 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 				// idempotent for a JSON string scalar, so a pre-coerced row must never
 				// reach it. See coerceNewSection.
 				//
-				// NOTE: this copies the flat row and runs validateAndParse over every
-				// column once per row reaching this node — but only for tables that have
-				// constraints at all, and it replaces the previous per-deferred-constraint
-				// recompute. If constraint-heavy insert throughput ever shows as hot,
-				// narrow it to the columns the constraint expressions actually reference.
-				const coercedRow = coerceNewSection(flatRow, tableSchema);
+				// Only the CHECK / FK expressions read this view, and the DML builders
+				// emit a ConstraintCheckNode for EVERY table, so skip the copy when there
+				// are none — NOT NULL reads the raw row, and coercion cannot change
+				// whether a value is NULL.
+				//
+				// NOTE: for a table that does carry checks this copies the flat row and
+				// runs validateAndParse over every column, once per row (replacing the
+				// previous per-deferred-constraint recompute). If constraint-heavy insert
+				// throughput ever shows as hot, narrow it to the columns the constraint
+				// expressions actually reference.
+				const coercedRow = hasConstraintExprs ? coerceNewSection(flatRow, tableSchema) : flatRow;
 
 				const evaluation = await withAsyncRowContext(rctx, combinedDescriptor, () => contextRow ? [...contextRow, ...coercedRow] : coercedRow, async () => {
 					return await checkConstraints(
@@ -251,7 +259,7 @@ async function checkConstraints(
 		// A REPLACE-substituted DEFAULT changed the NEW section, so the pre-computed
 		// coerced view is stale — rebuild it for the deferred snapshot below.
 		row = nnResult.replacedRow;
-		coercedRow = coerceNewSection(row, tableSchema);
+		coercedRow = constraintMetadata.length > 0 ? coerceNewSection(row, tableSchema) : row;
 	}
 
 	// CHECK constraints (and synthetic FK existence checks built as RowConstraintSchema).

@@ -1,0 +1,134 @@
+-- 15.1.1-json-check-coercion.sqllogic
+-- A CHECK constraint must compare JSON values exactly the way a later `select`
+-- compares the stored row.
+--
+-- The insert pipeline hands ConstraintCheckNode the RAW new row — the JSON text
+-- the statement supplied, not the parsed JSON value the storage layer converts
+-- it to. Constraint evaluation therefore reads its own coerced copy of the NEW
+-- section (runtime/emit/constraint-check.ts, coerceNewSection). Without it an
+-- immediate CHECK compared two raw JSON texts letter-by-letter, so '{"a":10}'
+-- sorted before '{"a":2}' and a perfectly valid row was rejected.
+-- Regression for bug-json-compare-string-ambiguity; the structural order itself
+-- is covered by 15.1-semantic-ordering.sqllogic.
+
+-- === Immediate CHECK over two JSON columns: structural, not textual ===
+
+create table jcc (id integer primary key, a json, b json, check (a < b));
+
+-- Text order would place '{"a":10}' before '{"a":2}' and reject this row;
+-- structural order is 2 < 10, so it is accepted.
+insert into jcc values (1, '{"a":2}', '{"a":10}');
+
+select count(*) as c from jcc;
+→ [{"c":1}]
+
+-- The read path agrees with the CHECK that admitted the row.
+select (a < b) as r from jcc;
+→ [{"r":true}]
+
+-- The check is not vacuous: the reversed pair is genuinely rejected.
+insert into jcc values (2, '{"a":10}', '{"a":2}');
+-- error: CHECK
+
+-- Equal values are not less-than either.
+insert into jcc values (3, '{"a":2}', '{"a":2}');
+-- error: CHECK
+
+-- JSON type rank (number < string) is enforced at insert time too. As raw text
+-- '"a"' sorts BEFORE '5' (the quote character precedes the digit), so a
+-- text-order check would reject this row and accept the reversed one.
+insert into jcc values (4, '5', '"a"');
+
+select count(*) as c from jcc;
+→ [{"c":2}]
+
+insert into jcc values (5, '"a"', '5');
+-- error: CHECK
+
+drop table jcc;
+
+-- === The deferred path reaches the same verdict as the immediate one ===
+
+-- A subquery-bearing CHECK auto-defers to the DeferredConstraintQueue, which is
+-- handed the same coerced row. Same comparison, same accept/reject decisions.
+create table jcc_def (id integer primary key, a json, b json, check ((select a < b)));
+
+insert into jcc_def values (1, '{"a":2}', '{"a":10}');
+
+select count(*) as c from jcc_def;
+→ [{"c":1}]
+
+insert into jcc_def values (2, '{"a":10}', '{"a":2}');
+-- error: CHECK
+
+insert into jcc_def values (3, '5', '"a"');
+
+select count(*) as c from jcc_def;
+→ [{"c":2}]
+
+insert into jcc_def values (4, '"a"', '5');
+-- error: CHECK
+
+drop table jcc_def;
+
+-- === UPDATE goes through the same coerced NEW section ===
+
+create table jcc_upd (id integer primary key, a json, b json, check (a < b));
+
+insert into jcc_upd values (1, '{"a":2}', '{"a":10}');
+
+update jcc_upd set b = '{"a":30}' where id = 1;
+
+select b from jcc_upd;
+→ [{"b":{"a":30}}]
+
+update jcc_upd set a = '{"a":90}' where id = 1;
+-- error: CHECK
+
+select a from jcc_upd;
+→ [{"a":{"a":2}}]
+
+drop table jcc_upd;
+
+-- === JSON string scalars in a CHECK honour the declared collation ===
+
+-- A JSON column can hold a string scalar: '"Bob"' coerces to the bare string
+-- Bob, so the CHECK compares two strings and a supplied collation applies. JSON
+-- declares no supported collations, so the collation can only arrive as an
+-- explicit COLLATE wrapper (`create table ... j json collate nocase` is rejected
+-- at DDL) — which is exactly how the read path spells it too.
+
+create table jcc_coll (id integer primary key, a json, b json, check (a = b collate nocase));
+
+insert into jcc_coll values (1, '"Bob"', '"bob"');
+
+select count(*) as c from jcc_coll;
+→ [{"c":1}]
+
+-- A JSON string scalar round-trips as the bare string, not as quoted JSON text.
+select a, b from jcc_coll;
+→ [{"a":"Bob","b":"bob"}]
+
+-- Read path agrees with the CHECK that admitted the row.
+select count(*) as c from jcc_coll where a = b collate nocase;
+→ [{"c":1}]
+
+-- Genuinely different strings are still rejected under NOCASE.
+insert into jcc_coll values (2, '"Bob"', '"bib"');
+-- error: CHECK
+
+drop table jcc_coll;
+
+-- Control: with no declared collation the comparison is BINARY, so the same
+-- case-variant pair is rejected.
+create table jcc_bin (id integer primary key, a json, b json, check (a = b));
+
+insert into jcc_bin values (1, '"Bob"', '"bob"');
+-- error: CHECK
+
+insert into jcc_bin values (2, '"Bob"', '"Bob"');
+
+select a from jcc_bin;
+→ [{"a":"Bob"}]
+
+drop table jcc_bin;

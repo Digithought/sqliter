@@ -307,6 +307,44 @@ export function validateValue(value: SqlValue, type: LogicalType): SqlValue {
 }
 ```
 
+### Where coercion happens (and why exactly once)
+
+A row travelling through an INSERT/UPDATE plan carries **raw** values — the literal
+text the statement supplied, an unparsed `'{"a":2}'` rather than the object a
+later `select` reads back. It is converted to the declared logical types at the
+**storage layer**, which coerces every row unconditionally on its own
+(`MemoryTableManager.performInsert`, `quereus-store`'s `StoreTable.coerceRow`).
+That is the single conversion point; everything upstream of it sees raw values.
+
+Constraint evaluation is the one exception, and it takes a **copy** rather than
+converting the row in place. `ConstraintCheckNode` builds a coerced view of the
+NEW half of the flat OLD/NEW row once per row (`coerceNewSection` in
+`runtime/emit/constraint-check.ts`) and evaluates CHECK expressions — immediate
+and deferred alike — against that copy, so a CHECK compares the same values the
+read path would. Without it `check (a < b)` over two JSON columns compared raw
+text and put `{"a":10}` before `{"a":2}`. The raw row keeps flowing downstream
+untouched.
+
+> **`JSON_TYPE.parse` is not idempotent for a string scalar.** `parse('"Bob"')`
+> returns the bare string `Bob`, and `parse('Bob')` then throws
+> `Cannot convert 'Bob' to JSON: invalid JSON syntax`. So a coerced row must
+> never be coerced again — which is why the coerced view stays local to
+> constraint evaluation instead of being pushed upstream into the DML emitters,
+> where it would reach the storage layer and be parsed twice.
+> (`quereus-isolation`'s `IsolatedTable` declines to thread its own coerced row
+> into the overlay write for the same reason.)
+
+Consequence: any consumer reading the DML executor's raw row rather than the
+stored row sees the uncoerced value. `insert ... returning j` reporting `text`
+instead of `json`, and row-time materialized-view maintenance writing raw values
+into the MV backing, are both instances of this — tracked as
+`bug-dml-downstream-uses-uncoerced-row`.
+
+Because every `JSON_TYPE.compare` caller is guaranteed to hold parsed values, a
+JS string reaching `compare` is unambiguously a JSON **string scalar** and is
+never re-parsed: `compare('9', 9)` ranks the number first (number < string)
+instead of calling them equal.
+
 ### Explicit Conversion
 
 Use type conversion functions for explicit conversion:

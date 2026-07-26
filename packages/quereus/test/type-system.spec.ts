@@ -418,6 +418,34 @@ describe('Type System', () => {
 				expect(JSON_TYPE.compare!('Bob', 'bob')).to.not.equal(0);
 			});
 
+			it('should treat a JS string as a JSON string scalar, never as serialized text', () => {
+				// Regression for bug-json-compare-string-ambiguity: `compare` used to
+				// re-parse a string that was paired with a non-string, so the JSON string
+				// "9" and the JSON number 9 came back equal — contradicting the type's own
+				// rank (number < string). Every caller now holds already-parsed values
+				// (stored rows via coerceRowToSchema, constraint rows via
+				// constraint-check.ts's coerceNewSection), so nothing is re-parsed here.
+				expect(JSON_TYPE.compare!('9', 9)).to.equal(1);
+				expect(JSON_TYPE.compare!(9, '9')).to.equal(-1);
+
+				// Full rank: null < boolean < number < string < array < object.
+				expect(JSON_TYPE.compare!(true, 1)).to.equal(-1);
+				expect(JSON_TYPE.compare!(1, true)).to.equal(1);
+				expect(JSON_TYPE.compare!(null, false)).to.be.lessThan(0);
+				expect(JSON_TYPE.compare!('x', ['x'])).to.equal(-1);
+				expect(JSON_TYPE.compare!(['x'], 'x')).to.equal(1);
+
+				// A string paired with a container is likewise not re-parsed: '[1]' is the
+				// four-character JSON string, which ranks below any array.
+				expect(JSON_TYPE.compare!('[1]', [1])).to.equal(-1);
+				expect(JSON_TYPE.compare!('{"a":1}', { a: 1 })).to.equal(-1);
+
+				// A collation only applies string-to-string; it cannot reorder ranks.
+				const nocase = (a: string, b: string) =>
+					a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0;
+				expect(JSON_TYPE.compare!('9', 9, nocase)).to.equal(1);
+			});
+
 			it('should order structurally, not by canonical text', () => {
 				// {"a":2} < {"a":10} — semanticOrdering, the reason this type exists.
 				expect(JSON_TYPE.compare!({ a: 2 }, { a: 10 })).to.be.lessThan(0);
