@@ -98,6 +98,30 @@ describe('StoreModule.alterColumnSetDataType: primary-key column reject', () => 
 		expect(schema.columns.find(c => c.name.toLowerCase() === 'id')!.logicalType.name.toUpperCase()).to.equal('TEXT');
 	});
 
+	it('rejects a retype of a NON-LEADING member of a composite PK, including into a key-transformed type', async () => {
+		await db.exec(`create table t (a text, b text, v text, primary key (a, b)) using store`);
+		await db.exec(`insert into t values ('1','x','p'), ('2','y','q')`);
+
+		const dataStore = await provider.getStore('main', 't');
+		const before = await dumpEntries(dataStore);
+
+		// `timespan` carries its own key encoding, so this is also the `keyTransformChanged`
+		// sub-case: without the guard the caller would re-key from the PRE-rewrite values.
+		for (const setDataType of ['integer', 'timespan']) {
+			const change: SchemaChangeInfo = { type: 'alterColumn', columnName: 'b', setDataType };
+			let err: Error | null = null;
+			try {
+				await mod.alterTable(db, 'main', 't', change);
+			} catch (e) {
+				err = e as Error;
+			}
+			expect(err, `composite-PK member retype to ${setDataType} rejects`).to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			expect(err!.message).to.match(/primary key column 'b'/);
+			expect(await dumpEntries(dataStore)).to.deep.equal(before);
+		}
+	});
+
 	it('still accepts an alias retype of a PK column (schema-only no-op)', async () => {
 		await db.exec(`create table t (id text primary key, v text) using store`);
 		await db.exec(`insert into t values ('1','a'), ('2','b')`);
