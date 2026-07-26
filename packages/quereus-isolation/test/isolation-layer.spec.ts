@@ -4959,3 +4959,100 @@ describe('isolated table stored-row reporting', () => {
 		expect(await asyncIterableToArray(db.eval(`DELETE FROM t WHERE id = 99 RETURNING id`))).to.deep.equal([]);
 	});
 });
+
+describe('IsolationModule — cross-connection SET DATA TYPE over staged overlay rows', () => {
+	// `alter column … set data type` rewrites VALUES. The underlying converts only its own
+	// committed rows, so the isolation layer must convert every staged overlay row itself —
+	// including FOREIGN connections' (nobody else ever reads them). A foreign row that cannot
+	// be converted poisons that one overlay (MISMATCH → poison) rather than aborting the
+	// issuer's ALTER after the underlying has already been rewritten.
+	//
+	// White-box, like the poison suite above: several Databases share one IsolationModule so
+	// each gets its own dbId, overlays are injected directly, and the ALTER is driven straight
+	// through `iso.alterTable`.
+	let iso: IsolationModule;
+	let dbA: Database; // the ALTER issuer
+	let dbB: Database; // a foreign connection
+
+	/** `alter table t alter column v set data type integer`, as the module receives it. */
+	const retypeVToInteger: SchemaChangeInfo = { type: 'alterColumn', columnName: 'v', setDataType: 'integer' };
+
+	beforeEach(async () => {
+		iso = new IsolationModule({ underlying: new MemoryTableModule() });
+		dbA = new Database();
+		dbB = new Database();
+		dbA.registerModule('isolated', iso);
+		await dbA.exec(`create table t (id integer primary key, v text null) using isolated`);
+		// One committed baseline row that always converts, so the underlying's own pre-mutation
+		// pass never rejects — only staged overlay rows decide the outcome.
+		await dbA.exec(`insert into t values (5, '5')`);
+	});
+
+	afterEach(async () => {
+		await dbA.close();
+		await dbB.close();
+	});
+
+	/** Injects a staged-insert overlay (rows = [id, v][]) for `forDb`, hasChanges=true. */
+	async function injectOverlay(forDb: Database, rows: SqlValue[][]): Promise<void> {
+		const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+		const overlay = await iso.overlayModule.create(forDb, iso.createOverlaySchema(underlying.tableSchema!));
+		for (const r of rows) {
+			await overlay.update({ operation: 'insert', values: [...r, 0] }); // trailing 0 = live (not tombstone)
+		}
+		iso.setConnectionOverlay(forDb, 'main', 't', { overlayTable: overlay, hasChanges: true, db: forDb });
+	}
+
+	function overlayState(forDb: Database): ConnectionOverlayState | undefined {
+		return iso.getConnectionOverlay(forDb, 'main', 't');
+	}
+
+	/** Rows visible to `forDb` through a fresh IsolatedTable (merged overlay + underlying). */
+	async function mergedRows(forDb: Database): Promise<Row[]> {
+		const table = await iso.connect(forDb, undefined, 'isolated', 'main', 't', {} as BaseModuleConfig) as IsolatedTable;
+		return await asyncIterableToArray(table.query(makeFullScanFilterInfo()));
+	}
+
+	it('converts a foreign connection\'s staged convertible row and flushes it with the new type', async () => {
+		await injectOverlay(dbB, [[10, '20']]); // convertible text
+
+		await iso.alterTable(dbA, 'main', 't', retypeVToInteger);
+
+		// B's overlay migrated forward (not poisoned) with its staged value CONVERTED.
+		const bState = overlayState(dbB)!;
+		expect(bState.poison, 'a convertible foreign row is migrated, not poisoned').to.be.undefined;
+		const bRows = await asyncIterableToArray(bState.overlayTable.query!(makeFullScanFilterInfo()));
+		expect(bRows.map(r => [r[0], r[1]]), 'staged text converted to integer').to.deep.equal([[10, 20]]);
+
+		// And it flushes that way: after B commits, the shared underlying holds the integer.
+		await iso.commitConnectionOverlays(dbB);
+		expect((await mergedRows(dbA)).map(r => [r[0], r[1]]), 'committed with the new type')
+			.to.deep.equal([[5, 5], [10, 20]]);
+	});
+
+	it('poisons a foreign overlay whose staged value cannot be converted, while the issuer ALTER applies', async () => {
+		await injectOverlay(dbB, [[10, 'abc']]); // unconvertible
+
+		const updated = await iso.alterTable(dbA, 'main', 't', retypeVToInteger);
+
+		// The issuer's ALTER applied — a foreign connection's uncommitted row must not abort it.
+		expect(updated.columns.find(c => c.name === 'v')?.logicalType.name.toLowerCase(), 'v retyped')
+			.to.contain('int');
+		expect((await mergedRows(dbA)).map(r => [r[0], r[1]]), 'committed row converted')
+			.to.deep.equal([[5, 5]]);
+
+		// B's overlay is poisoned, with a message naming the retype (not the NOT NULL wording).
+		const bState = overlayState(dbB)!;
+		expect(bState.poison, 'B overlay must be poisoned').to.not.be.undefined;
+		expect(bState.poison!.message).to.match(/data type/i);
+		expect(bState.poison!.message).to.match(/roll back this transaction/i);
+		expect(bState.poison!.message).to.contain('main.t');
+
+		// B's commit fails rather than silently dropping or mis-typing its staged row.
+		let caught: unknown;
+		try { await iso.commitConnectionOverlays(dbB); } catch (e) { caught = e; }
+		expect(caught, 'the foreign commit must fail, not silently succeed').to.be.instanceOf(QuereusError);
+		expect((caught as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+		expect((caught as QuereusError).message).to.contain('main.t');
+	});
+});

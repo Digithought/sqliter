@@ -1,5 +1,5 @@
 import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, UpdateResult } from '@quereus/quereus';
-import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema, isConstraintViolation } from '@quereus/quereus';
+import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema, isConstraintViolation, inferType, validateAndParse } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
 import { applyOverlayToUnderlying } from './flush.js';
@@ -113,11 +113,9 @@ interface AddColumnBackfillContext {
  * branch on tombstone / has-default. Present only for a NOT NULL *tightening* (`setNotNull: true`)
  * with staged overlays to migrate.
  *
- * NOTE: `alter column … set data type` has the SAME overlay gap — its issuer/foreign overlay
- * rows are not converted here (the underlying's rowSource covers only committed rows), so an
- * accepted retype commits staged rows still holding the OLD physical type. Closing it means
- * hooking a parallel `SetDataTypeBackfillContext` through this exact derive → validate →
- * translate seam. Tracked by `bug-isolation-retype-leaves-staged-rows-unconverted`.
+ * `alter column … set data type` rides the same derive → validate → translate seam via
+ * {@link SetDataTypeConvertContext}. The two are mutually exclusive: the runtime rejects a
+ * multi-attribute `alter column` before it reaches this module.
  */
 interface SetNotNullBackfillContext {
 	/** Zero-based index of the now-NOT-NULL column in the overlay's data columns. */
@@ -127,6 +125,26 @@ interface SetNotNullBackfillContext {
 	/** Whether a usable literal DEFAULT exists — backfill when true, reject the staged NULL when false. */
 	hasDefault: boolean;
 	/** Column name, for the CONSTRAINT / poison message. */
+	colName: string;
+	/** Owning table name, for the poison message. */
+	tableName: string;
+}
+
+/**
+ * Per-ALTER constants for an `alter column … set data type` overlay conversion (see
+ * {@link IsolationModule.deriveSetDataTypeConvert}). Present only when the retype actually
+ * rewrites values (the new physical type differs from the old) and there are staged overlays
+ * to convert — a metadata-only retype leaves every staged value as it stands.
+ *
+ * Without this the underlying converts only its COMMITTED rows, so an accepted retype would
+ * commit staged rows still holding the OLD physical type.
+ */
+interface SetDataTypeConvertContext {
+	/** Zero-based index of the retyped column in the overlay's data columns. */
+	colIndex: number;
+	/** Per-value conversion; throws MISMATCH exactly as the underlying's does. */
+	convert: (v: SqlValue) => SqlValue;
+	/** Column name, for the poison message. */
 	colName: string;
 	/** Owning table name, for the poison message. */
 	tableName: string;
@@ -1290,15 +1308,19 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 *               backfilled per row exactly as the committed path does (literal default,
 	 *               per-row `new.<col>` evaluator, or NULL); tombstone rows get NULL.
 	 * DROP COLUMN — removes the dropped column from each overlay row.
-	 * RENAME / ALTER COLUMN — data column indices are unchanged; only schema metadata rotates.
+	 * ALTER COLUMN — data column indices are unchanged, but the two value-rewriting attributes
+	 *               also rewrite staged values: `set not null` fills a staged NULL from the
+	 *               column's literal DEFAULT, and `set data type` converts the staged value
+	 *               exactly as the underlying converts its committed rows. Every other
+	 *               attribute (and RENAME) only rotates schema metadata.
 	 *
 	 * **Atomicity guarantee.** DDL through Quereus is not transaction-scoped and the
 	 * underlying (shared, committed) base auto-commits its mutation immediately —
 	 * there is no frame to unwind, and `dropColumn` / type-converting `alterColumn`
 	 * are lossy and not invertible, so "revert the underlying on overlay-migration
 	 * failure" is not viable. Instead this method **pre-validates** every affected
-	 * overlay's backfill (the per-row NOT NULL check and the tombstone-present guard)
-	 * BEFORE calling `underlying.alterTable`. A rejection therefore fires while the
+	 * overlay's migration (the per-row NOT NULL check, the per-value retype conversion, and
+	 * the tombstone-present guard) BEFORE calling `underlying.alterTable`. A rejection therefore fires while the
 	 * underlying, the schema catalog, and every overlay are still untouched, so the
 	 * ALTER either fails clean or fully applies — base/catalog can no longer diverge.
 	 * This mirrors the engine's pre-mutation `validateNotNullBackfill` in
@@ -1373,12 +1395,17 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// shares, and the same source `dropColumnIdx` uses above.
 		const setNotNullCtx = this.deriveSetNotNullBackfill(change, toMigrate, tableName);
 
+		// Build the setDataType conversion context (undefined unless this is a value-rewriting
+		// retype with overlays to convert). Read from the same PRE-alter overlay schema as above;
+		// `inferType` cannot throw, so deriving it before the underlying mutation is safe.
+		const setDataTypeCtx = this.deriveSetDataTypeConvert(change, toMigrate, tableName);
+
 		// Tier 2: validate the ISSUER's own overlay BEFORE mutating the shared underlying.
-		// Any throw here (CONSTRAINT backfill or INTERNAL tombstone guard) propagates while
-		// underlying + catalog + every overlay are still untouched — the companion ticket's
-		// atomic-abort guarantee, preserved unchanged for the issuer.
+		// Any throw here (CONSTRAINT backfill, MISMATCH conversion, or INTERNAL tombstone guard)
+		// propagates while underlying + catalog + every overlay are still untouched — the companion
+		// ticket's atomic-abort guarantee, preserved unchanged for the issuer.
 		if (ownEntry) {
-			await this.validateOverlayMigration(ownEntry[1], addColumnCtx, setNotNullCtx);
+			await this.validateOverlayMigration(ownEntry[1], addColumnCtx, setNotNullCtx, setDataTypeCtx);
 		}
 
 		const underlyingState = this.getUnderlyingState(schemaName, tableName);
@@ -1410,22 +1437,25 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		if (ownEntry) {
 			await this.adoptRebuiltOverlay(
 				ownEntry[0], ownEntry[1], true, schemaName, tableName, ddlDescription,
-				() => this.migrateOverlayForAlter(db, ownEntry![1], updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx),
+				() => this.migrateOverlayForAlter(db, ownEntry![1], updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx, setDataTypeCtx),
 			);
 		}
 
 		// Tier 3: per FOREIGN overlay, validate then migrate — but a per-row NOT NULL
 		// (CONSTRAINT) failure poisons that one overlay instead of aborting the issuer's
 		// ALTER, as does a UNIQUE the migration itself raises (its staged rows may violate a
-		// constraint the issuer just declared). An INTERNAL failure (e.g. missing tombstone
-		// column) is a layer-invariant violation, not a data condition, so it rethrows loud
-		// for everyone. Both phases run per overlay, so one bad foreign overlay poisons only
-		// itself; healthy peers still migrate.
+		// constraint the issuer just declared) and an unconvertible staged value under a retype
+		// (MISMATCH). Those three are data conditions of ONE connection's uncommitted rows, and
+		// the underlying has already been mutated by this point, so rethrowing any of them would
+		// abort the issuer's ALTER after the fact — exactly the divergence this tiering exists to
+		// prevent. An INTERNAL failure (e.g. missing tombstone column) is a layer-invariant
+		// violation, not a data condition, so it rethrows loud for everyone. Both phases run per
+		// overlay, so one bad foreign overlay poisons only itself; healthy peers still migrate.
 		for (const [key, oldState] of foreign) {
 			try {
-				await this.validateOverlayMigration(oldState, addColumnCtx, setNotNullCtx);
+				await this.validateOverlayMigration(oldState, addColumnCtx, setNotNullCtx, setDataTypeCtx);
 			} catch (e) {
-				if (e instanceof QuereusError && e.code === StatusCode.CONSTRAINT) {
+				if (e instanceof QuereusError && (e.code === StatusCode.CONSTRAINT || e.code === StatusCode.MISMATCH)) {
 					oldState.poison = { message: this.buildAlterPoisonMessage(schemaName, tableName, change) };
 					continue; // poisoned — do NOT migrate; leave pre-alter rows in place
 				}
@@ -1433,7 +1463,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			}
 			await this.adoptRebuiltOverlay(
 				key, oldState, false, schemaName, tableName, ddlDescription,
-				() => this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx),
+				() => this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx, setDataTypeCtx),
 			);
 		}
 
@@ -1445,8 +1475,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * satisfy a cross-connection ALTER (see {@link alterTable} tier 3). Names the
 	 * schema.table and the offending column so the owning connection's eventual
 	 * read/write/commit error is self-explanatory. Poison arises on the addColumn NOT NULL
-	 * path (a new NOT-NULL column with no usable default) and the `set not null` tightening
-	 * path (a staged NULL with no usable default); other change types never reach here but
+	 * path (a new NOT-NULL column with no usable default), the `set not null` tightening
+	 * path (a staged NULL with no usable default), and the `set data type` path (a staged value
+	 * that cannot be converted to the new type); other change types never reach here but
 	 * are handled defensively.
 	 */
 	private buildAlterPoisonMessage(schemaName: string, tableName: string, change: SchemaChangeInfo): string {
@@ -1454,6 +1485,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			return `ALTER on '${schemaName}.${tableName}' added column '${change.columnDef.name}' (NOT NULL) that this connection's uncommitted row cannot satisfy; roll back this transaction.`;
 		}
 		if (change.type === 'alterColumn') {
+			if (change.setDataType !== undefined) {
+				return `ALTER on '${schemaName}.${tableName}' changed the data type of column '${change.columnName}' to ${change.setDataType}, which this connection's uncommitted row cannot be converted to; roll back this transaction.`;
+			}
 			return `ALTER on '${schemaName}.${tableName}' tightened column '${change.columnName}' to NOT NULL, which this connection's uncommitted row violates; roll back this transaction.`;
 		}
 		return `ALTER on '${schemaName}.${tableName}' cannot migrate this connection's uncommitted rows; roll back this transaction.`;
@@ -1631,6 +1665,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		dropColumnIdx: number | undefined,
 		addColumnCtx: AddColumnBackfillContext | undefined,
 		setNotNullCtx: SetNotNullBackfillContext | undefined,
+		setDataTypeCtx: SetDataTypeConvertContext | undefined,
 	): Promise<ConnectionOverlayState> {
 		const oldOverlay = oldState.overlayTable;
 		const oldOverlaySchema = oldOverlay.tableSchema;
@@ -1653,7 +1688,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					const addColumnValue = addColumnCtx
 						? await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx)
 						: undefined;
-					const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx, addColumnValue, setNotNullCtx);
+					const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx, addColumnValue, setNotNullCtx, setDataTypeCtx);
 					await this.insertIntoRebuiltOverlay(newOverlayTable, newRow, updatedSchema.name);
 				}
 			}
@@ -1747,6 +1782,54 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Precomputes the per-ALTER constants an `alter column … set data type` overlay conversion
+	 * needs: the retyped column's index and a per-value `convert`. Returns undefined unless this
+	 * is a retype with at least one overlay to convert, and undefined for a METADATA-ONLY retype
+	 * (new physical type equals old) — both underlyings gate their value rewrite on that exact
+	 * comparison, so mirroring it here keeps overlay and committed rows moving together should
+	 * "what counts as a value-rewriting retype" ever change.
+	 *
+	 * `inferType` never throws (an unknown type name falls through SQLite-style affinity rules),
+	 * so deriving this BEFORE the underlying mutation is safe. `convert` is the literal mirror of
+	 * `MemoryTableManager.alterColumn` / `StoreModule.alterColumnSetDataType`: `validateAndParse`,
+	 * rethrowing failure as the same MISMATCH message, so the two legs cannot drift.
+	 */
+	private deriveSetDataTypeConvert(
+		change: SchemaChangeInfo,
+		toMigrate: [string, ConnectionOverlayState][],
+		tableName: string,
+	): SetDataTypeConvertContext | undefined {
+		if (change.type !== 'alterColumn' || change.setDataType === undefined) return undefined;
+		if (toMigrate.length === 0) return undefined;
+		const overlaySchema = toMigrate[0][1].overlayTable.tableSchema;
+		if (!overlaySchema) return undefined;
+		const colIndex = overlaySchema.columnIndexMap.get(change.columnName.toLowerCase());
+		if (colIndex === undefined) return undefined;
+		const oldCol = overlaySchema.columns[colIndex];
+		if (!oldCol) return undefined;
+		const newLogicalType = inferType(change.setDataType);
+		// Metadata-only retype: the underlying rewrites nothing, so neither do we.
+		if (newLogicalType.physicalType === oldCol.logicalType.physicalType) return undefined;
+		const setDataType = change.setDataType;
+		const columnName = change.columnName;
+		return {
+			colIndex,
+			convert: (v: SqlValue): SqlValue => {
+				try {
+					return validateAndParse(v, newLogicalType, columnName) as SqlValue;
+				} catch {
+					throw new QuereusError(
+						`Cannot convert value in '${columnName}' to ${setDataType}`,
+						StatusCode.MISMATCH,
+					);
+				}
+			},
+			colName: columnName,
+			tableName,
+		};
+	}
+
+	/**
 	 * Dry-runs an overlay's ALTER migration-fallible work without mutating anything,
 	 * so the caller can run it for every affected overlay BEFORE the irreversible
 	 * `underlying.alterTable` (see {@link alterTable}). It exercises the EXACT code
@@ -1766,14 +1849,23 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * poison. With a usable DEFAULT the staged NULLs are backfilled by {@link translateOverlayRow},
 	 * so nothing is rejected here.
 	 *
-	 * Non-addColumn / non-tightening changes (`addColumnCtx === undefined` and no reject-mode
-	 * `setNotNullCtx`) only run the tombstone guard; their row translation appends/removes nothing
-	 * fallible on data grounds.
+	 * For `set data type` (`setDataTypeCtx`), every staged non-NULL value is run through the
+	 * conversion and the result discarded, so an unconvertible one throws MISMATCH here. For the
+	 * ISSUER this is belt-and-braces — the underlying's own pre-mutation pass walks the same rows
+	 * via {@link issuerEffectiveRows} — EXCEPT when an outer wrapper supplied `rows`, in which case
+	 * this is the only check. For a FOREIGN overlay it is the only pass that ever sees those rows,
+	 * and it must run before the migration so a failure becomes poison rather than a half-migrated
+	 * overlay.
+	 *
+	 * Non-addColumn / non-tightening / non-retype changes (`addColumnCtx === undefined`, no
+	 * reject-mode `setNotNullCtx`, no `setDataTypeCtx`) only run the tombstone guard; their row
+	 * translation appends/removes nothing fallible on data grounds.
 	 */
 	private async validateOverlayMigration(
 		oldState: ConnectionOverlayState,
 		addColumnCtx: AddColumnBackfillContext | undefined,
 		setNotNullCtx: SetNotNullBackfillContext | undefined,
+		setDataTypeCtx: SetDataTypeConvertContext | undefined,
 	): Promise<void> {
 		const oldOverlay = oldState.overlayTable;
 		const oldOverlaySchema = oldOverlay.tableSchema;
@@ -1805,6 +1897,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 						StatusCode.CONSTRAINT,
 					);
 				}
+			}
+			return;
+		}
+
+		// SET DATA TYPE: prove every staged value convertible before anything is rewritten. NULLs
+		// are left untouched by the conversion (the underlying's `convertNulls` is false for a
+		// retype), and tombstones carry placeholder NULLs that are never read.
+		if (setDataTypeCtx) {
+			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
+				if (oldRow[oldTombstoneIdx] === 1) continue;
+				const value = oldRow[setDataTypeCtx.colIndex];
+				if (value !== null) setDataTypeCtx.convert(value as SqlValue); // discard — validation only
 			}
 		}
 	}
@@ -1854,6 +1958,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * staged NULL at the now-NOT-NULL column to that DEFAULT — filling the issuer's own pending
 	 * rows, which the underlying's committed-row backfill never touches. Reject-mode contexts (no
 	 * DEFAULT) never reach here: {@link validateOverlayMigration} aborts/poisons first.
+	 *
+	 * `setDataTypeCtx` (present only for a value-rewriting retype) converts the staged value at the
+	 * retyped column, the overlay-side half of the underlying's committed-row rewrite. Every value
+	 * that reaches here was already proved convertible by {@link validateOverlayMigration}.
 	 */
 	private translateOverlayRow(
 		oldRow: Row,
@@ -1862,6 +1970,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		dropColumnIdx: number | undefined,
 		addColumnValue: SqlValue | undefined,
 		setNotNullCtx: SetNotNullBackfillContext | undefined,
+		setDataTypeCtx: SetDataTypeConvertContext | undefined,
 	): SqlValue[] {
 		const tombstoneValue = oldRow[oldTombstoneIdx] as SqlValue;
 		const data = Array.from(oldRow.slice(0, oldTombstoneIdx)) as SqlValue[];
@@ -1879,14 +1988,24 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					: data;
 				break;
 			case 'alterColumn':
-				// SET NOT NULL backfill (WITH a usable DEFAULT): fill a staged NULL at the
-				// now-NOT-NULL column. Tombstones carry placeholder NULLs never read, so leave them.
-				// Every other alterColumn attribute (and the no-DEFAULT reject case) leaves data as-is.
-				// NOTE: SET DATA TYPE also alters existing values but is NOT converted here — its
-				// overlay gap is deferred (see SetNotNullBackfillContext doc).
-				newData = (setNotNullCtx && tombstoneValue !== 1)
-					? data.map((v, i) => (i === setNotNullCtx.colIndex && v === null ? setNotNullCtx.foldedDefault : v))
-					: data;
+				// Two value-rewriting attributes:
+				//   SET NOT NULL (WITH a usable DEFAULT) — fill a staged NULL at the now-NOT-NULL column;
+				//   SET DATA TYPE (physical type actually changing) — convert the staged value.
+				// Tombstones carry placeholder NULLs never read, so leave them. Every other
+				// attribute (and the no-DEFAULT reject case) leaves data as-is.
+				// NOTE: these are `else if` branches because the runtime rejects a multi-attribute
+				// ALTER COLUMN before it reaches this module, so at most one context is ever
+				// present. If combined attributes are ever admitted, the second rewrite would be
+				// silently skipped here — make them compose instead.
+				if (tombstoneValue === 1) {
+					newData = data;
+				} else if (setNotNullCtx) {
+					newData = data.map((v, i) => (i === setNotNullCtx.colIndex && v === null ? setNotNullCtx.foldedDefault : v));
+				} else if (setDataTypeCtx) {
+					newData = data.map((v, i) => (i === setDataTypeCtx.colIndex && v !== null ? setDataTypeCtx.convert(v) : v));
+				} else {
+					newData = data;
+				}
 				break;
 			case 'renameColumn':
 			case 'alterPrimaryKey':

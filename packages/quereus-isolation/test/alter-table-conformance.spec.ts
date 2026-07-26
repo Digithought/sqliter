@@ -430,6 +430,78 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		await expectConstraint(db, `insert into t values (3, 9)`, 'post-retype UNIQUE');
 	});
 
+	// SET DATA TYPE rewrites VALUES, so the isolation layer must convert the issuer's staged
+	// overlay rows too — the underlying only ever sees its own committed rows. Before the fix an
+	// accepted retype committed staged rows still holding the OLD physical type, so the table held
+	// values contradicting its declared column type and `where v = 20` could not find them.
+
+	it('honored SET DATA TYPE converts a staged overlay row, in-transaction and past commit', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using isolated`);
+		await db.exec(`insert into t values (1, '10')`); // committed before the transaction
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, '20')`); // staged in this connection's overlay
+		await db.exec(`alter table t alter column v set data type integer`);
+
+		// In-transaction: the staged row already reads back converted (deep-equal distinguishes
+		// the integer 20 from the text '20').
+		expect(await rows(db, `select id, v from t order by id`), 'both rows converted in-transaction')
+			.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+
+		await db.exec('commit');
+
+		expect(await rows(db, `select id, v from t order by id`), 'conversion persists past commit')
+			.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+		// The regression's user-visible symptom: an unconverted staged row is invisible to equality.
+		expect(await rows(db, `select id from t where v = 20`), 'converted row found by equality')
+			.to.deep.equal([{ id: 2 }]);
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'column retyped').to.contain('int');
+	});
+
+	it('does NOT turn an unconvertible staged value into a silent success', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using isolated`);
+		await db.exec(`insert into t values (1, '10')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, 'abc')`); // overlay-only, unconvertible
+
+		const err = await attemptAlter(db, `alter table t alter column v set data type integer`);
+		expect(err, 'unconvertible staged value must reject').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.MISMATCH);
+		expect(err!.message).to.contain(`Cannot convert value in 'v'`);
+
+		await db.exec('rollback');
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged after rollback').to.contain('text');
+	});
+
+	it('SET DATA TYPE rejects cleanly when two rows staged in the SAME transaction collide after conversion', async () => {
+		await db.exec(`create table t (id integer primary key, v text unique) using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, '1')`);  // distinct as text…
+		await db.exec(`insert into t values (2, '01')`); // …identical as integers
+
+		const err = await attemptAlter(db, `alter table t alter column v set data type integer`);
+		expect(err, 'the converted values collide, so the retype must reject').to.be.instanceOf(QuereusError);
+		// The underlying's UNIQUE re-validation over the issuer's CONVERTED effective rows fires
+		// first, so this is a clean CONSTRAINT — not the INTERNAL `adoptRebuiltOverlay` raises when
+		// a rebuild hits a constraint the DDL's own validation pass had already accepted.
+		expect(err!.code, `reject code was ${err!.code} (${err!.message})`).to.equal(StatusCode.CONSTRAINT);
+
+		await db.exec('rollback');
+		expect(String((await columnInfo(db, 'v'))?.type).toLowerCase(), 'type unchanged').to.contain('text');
+	});
+
+	it('metadata-only SET DATA TYPE migrates staged rows untouched', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, 'abc')`);
+		// CLOB carries TEXT affinity, so the physical type does not change and neither underlying
+		// rewrites a single value — the overlay must not either.
+		await db.exec(`alter table t alter column v set data type clob`);
+
+		expect(await rows(db, `select id, v from t`), 'staged value untouched').to.deep.equal([{ id: 1, v: 'abc' }]);
+		await db.exec('commit');
+		expect(await rows(db, `select id, v from t`), 'still untouched past commit').to.deep.equal([{ id: 1, v: 'abc' }]);
+	});
+
 	it('honored SET NOT NULL backfills a staged overlay NULL from a literal DEFAULT', async () => {
 		await db.exec(`create table t (id integer primary key, v text null default 'filled') using isolated`);
 		await db.exec('begin');
