@@ -1924,12 +1924,14 @@ describe('SyncManager', () => {
       }
     });
 
-    it('should warn about missing table schema when getTableSchema is provided but returns undefined', async () => {
+    it('should skip changes for a table whose schema the oracle does not know', async () => {
       const warnings: string[] = [];
       const origWarn = console.warn;
       console.warn = (msg: string) => warnings.push(msg);
       try {
-        // Create manager WITH getTableSchema that returns undefined
+        // Create manager WITH getTableSchema that returns undefined: pk identity is
+        // unresolvable, so the row's facts are skipped rather than filed under a
+        // guessed identity (or aborting the whole transaction).
         const getTableSchema = () => undefined;
         const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, undefined, getTableSchema);
 
@@ -1941,10 +1943,19 @@ describe('SyncManager', () => {
           newRow: ['value'],
         });
 
-        await new Promise(resolve => setTimeout(resolve, 10));
+        await manager.whenCommitsSettled();
 
-        // SHOULD have the warning since callback was provided but returned nothing
-        expect(warnings.some(w => w.includes('No table schema found'))).to.be.true;
+        // Exactly one skip warning, naming the table and the change count.
+        const skips = warnings.filter(w => w.includes('Skipped') && w.includes('main.test'));
+        expect(skips).to.have.lengthOf(1);
+        expect(skips[0]).to.include('unresolvable');
+
+        // Nothing recorded: no `cv:` column-version record for the skipped table.
+        const keys: string[] = [];
+        for await (const entry of kv.iterate()) {
+          keys.push(new TextDecoder().decode(entry.key));
+        }
+        expect(keys.some(k => k.startsWith('cv:main.test'))).to.be.false;
       } finally {
         console.warn = origWarn;
       }

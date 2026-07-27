@@ -12,11 +12,12 @@ import { expect } from 'chai';
 import { Database, type TableSchema } from '@quereus/quereus';
 import { InMemoryKVStore } from '@quereus/store';
 import { SyncManagerImpl, assertOpSeqInRange } from '../../src/sync/sync-manager-impl.js';
-import { SyncEventEmitterImpl, type LocalChangeEvent } from '../../src/sync/events.js';
+import { SyncEventEmitterImpl, type LocalChangeEvent, type SyncState } from '../../src/sync/events.js';
 import { DEFAULT_SYNC_CONFIG, type ColumnChange } from '../../src/sync/protocol.js';
 import { deterministicTxnId, createHLC, MAX_OPSEQ, type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId, siteIdEquals } from '../../src/clock/site.js';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
+import { closePeer, collect, makePeer, relayAll, type Peer } from './_peer-harness.js';
 
 /** Let the fire-and-forget commit handler drain its async KV writes. */
 const settle = () => new Promise(resolve => setTimeout(resolve, 10));
@@ -203,6 +204,40 @@ describe('per-transaction HLC tick + opSeq (write side)', () => {
 		expect(after.counter).to.equal(before.counter);
 	});
 
+	it('skip is table-scoped, not transaction-scoped: the known table still records', async () => {
+		const { manager, source, syncEvents, localChanges } = await makeManager();
+		const states: SyncState[] = [];
+		syncEvents.onSyncStateChange(s => states.push(s));
+
+		const warnings: string[] = [];
+		const origWarn = console.warn;
+		console.warn = (msg: string) => warnings.push(msg);
+		try {
+			// `ghost` is unknown to the oracle (SCHEMAS has only users/orders), so its
+			// pk identity is unresolvable. It is listed FIRST: if the skip happened
+			// mid-recording rather than before the tick, users' opSeq would not start at 0.
+			source.commit({
+				data: [
+					{ type: 'insert', schemaName: 'main', tableName: 'ghost', key: [1], newRow: [1, 'boo'] },
+					{ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: [1, 'Alice'] },
+				],
+			});
+			await manager.whenCommitsSettled();
+		} finally {
+			console.warn = origWarn;
+		}
+
+		expect(localChanges, 'the transaction still emitted').to.have.length(1);
+		const facts = localChanges[0].changes;
+		expect(facts.every(f => f.table === 'users'), 'only the resolvable table recorded').to.equal(true);
+		// users(id,name) → 2 facts, contiguous from 0: ghost consumed no opSeq.
+		expect(facts.map(f => f.hlc.opSeq).sort((a, b) => a - b)).to.deep.equal([0, 1]);
+
+		// One skip warning naming the table; no error sync-state event.
+		expect(warnings.filter(w => w.includes('main.ghost'))).to.have.length(1);
+		expect(states.filter(s => s.status === 'error'), 'skip is not an error').to.have.length(0);
+	});
+
 	it('mixed group records only the local facts, with contiguous opSeq', async () => {
 		const { source, localChanges } = await makeManager();
 
@@ -309,5 +344,123 @@ describe('per-transaction HLC tick — rollback (real Database)', () => {
 		expect(pks.has('[1]'), 'rolled-back write not recorded').to.equal(false);
 
 		await db.close();
+	});
+});
+
+/**
+ * Capture is best-effort at TABLE granularity (`filterCapturableDataEvents`).
+ *
+ * A transaction that writes rows AND drops one of the tables it wrote used to abort
+ * recording entirely: the dropped table's schema is gone by the time the commit group
+ * is delivered, so resolving its pk identity threw, the handler's top-level catch
+ * swallowed it, and the OTHER tables' rows plus every schema migration of the same
+ * transaction were lost. Now only the unresolvable table's rows are dropped.
+ */
+describe('capture skips an unresolvable table, not the whole transaction (real Database)', () => {
+	const CREATE_A = 'create table a (id integer primary key, v text) using store';
+	const CREATE_B = 'create table b (id integer primary key, v text) using store';
+
+	/** Peer with `a` and `b` created and one row seeded in each. */
+	async function makeAB(name: string, seed = true): Promise<Peer> {
+		const peer = await makePeer(name);
+		await peer.db.exec(CREATE_A);
+		await peer.db.exec(CREATE_B);
+		if (seed) {
+			await peer.db.exec("insert into a values (1, 'a1')");
+			await peer.db.exec("insert into b values (1, 'b1')");
+		}
+		await peer.manager.whenCommitsSettled();
+		return peer;
+	}
+
+	/** `update a; update b; drop a` in ONE transaction. */
+	async function writeBothThenDropA(peer: Peer): Promise<void> {
+		await peer.db.exec('begin');
+		await peer.db.exec("update a set v = 'a2' where id = 1");
+		await peer.db.exec("update b set v = 'b2' where id = 1");
+		await peer.db.exec('drop table a');
+		await peer.db.exec('commit');
+		await peer.manager.whenCommitsSettled();
+	}
+
+	it('records the sibling table and the drop migration; skips only the dropped table rows', async () => {
+		const peer = await makeAB('capture');
+		try {
+			await writeBothThenDropA(peer);
+
+			const sets = await peer.manager.getChangesSince(generateSiteId());
+			const changes = sets.flatMap(s => s.changes);
+			const migrations = sets.flatMap(s => s.schemaMigrations);
+
+			// b's in-transaction update survived the sibling table's disappearance.
+			const bV = changes.filter((c): c is ColumnChange =>
+				c.type === 'column' && c.table === 'b' && c.column === 'v');
+			expect(bV, "one surviving version for b.v").to.have.length(1);
+			expect(bV[0].value).to.equal('b2');
+
+			// ...and so did the same transaction's drop_table migration for `a`.
+			expect(
+				migrations.some(m => m.type === 'drop_table' && m.table === 'a'),
+				'drop_table migration for a recorded',
+			).to.equal(true);
+
+			// `a`'s rows were the only casualty: its in-transaction update is absent.
+			// (Its PRE-transaction insert facts remain — they were captured while the
+			// table still resolved, and nothing purges a dropped table's metadata.)
+			expect(
+				changes.some(c => c.type === 'column' && c.table === 'a' && c.value === 'a2'),
+				"a's skipped update not recorded",
+			).to.equal(false);
+		} finally {
+			await closePeer(peer);
+		}
+	});
+
+	it('relays the surviving sibling rows and the drop migration to a peer', async () => {
+		const src = await makeAB('src');
+		const dst = await makeAB('dst', false);
+		try {
+			await writeBothThenDropA(src);
+
+			// The drop_table migration is on the wire payload the peer receives. Whether
+			// the peer's table actually disappears is a SEPARATE defect: the store module
+			// emits drop-table with no DDL, so it replicates as `ddl: ''` and applies as a
+			// no-op (ticket `sync-schema-migrations-replicate-empty-ddl`).
+			const wire = await src.manager.getChangesSince(dst.manager.getSiteId());
+			expect(
+				wire.flatMap(s => s.schemaMigrations).some(m => m.type === 'drop_table' && m.table === 'a'),
+				'drop_table for a reaches the wire payload',
+			).to.equal(true);
+
+			await relayAll(src, dst);
+
+			const rows = await collect(dst.db, 'select v from b where id = 1');
+			expect(rows).to.deep.equal([{ v: 'b2' }]);
+		} finally {
+			await closePeer(src);
+			await closePeer(dst);
+		}
+	});
+
+	it('drop-then-recreate in one transaction still captures the post-recreate rows', async () => {
+		// The gate is RESOLVABILITY, not "the transaction contains a drop for this
+		// table": `a` is dropped and re-created here, so it resolves fine at capture
+		// time and its new rows must survive. A blanket drop-name skip would lose them.
+		const peer = await makeAB('recreate');
+		try {
+			await peer.db.exec('begin');
+			await peer.db.exec('drop table a');
+			await peer.db.exec(CREATE_A);
+			await peer.db.exec("insert into a values (2, 'fresh')");
+			await peer.db.exec('commit');
+			await peer.manager.whenCommitsSettled();
+
+			const changes = (await peer.manager.getChangesSince(generateSiteId())).flatMap(s => s.changes);
+			const fresh = changes.filter((c): c is ColumnChange =>
+				c.type === 'column' && c.table === 'a' && c.column === 'v' && c.value === 'fresh');
+			expect(fresh, 'post-recreate insert captured').to.have.length(1);
+		} finally {
+			await closePeer(peer);
+		}
 	});
 });

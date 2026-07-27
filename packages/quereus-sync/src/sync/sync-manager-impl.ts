@@ -713,7 +713,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			// (local + remote in one transaction — unusual) records only its local
 			// facts; opSeq is assigned only to recorded facts so they stay contiguous.
 			const localSchema = batch.schemaEvents.filter(e => !e.remote);
-			const localData = batch.dataEvents.filter(e => !e.remote);
+			const localData = this.filterCapturableDataEvents(
+				batch.dataEvents.filter(e => !e.remote),
+				localSchema,
+			);
 			if (localSchema.length === 0 && localData.length === 0) return;
 
 			// ONE tick per committed transaction. tick() returns opSeq 0; the closure
@@ -757,6 +760,88 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				status: 'error',
 				error: toError(error),
 			});
+		}
+	}
+
+	/**
+	 * Drop the data events of any table whose pk-identity keying cannot be resolved
+	 * right now — typically a table this same transaction dropped, whose schema is
+	 * already gone by the time the commit group is delivered.
+	 *
+	 * Local capture is therefore best-effort at TABLE granularity: one unresolvable
+	 * table costs only its own rows, never the rest of the transaction (which is what
+	 * the handler's top-level catch would do — it aborts recording of every other
+	 * table's rows AND the transaction's schema migrations).
+	 *
+	 * Runs BEFORE the HLC tick, so a transaction whose data is entirely skipped and
+	 * that carries no schema events consumes no clock and emits no local change,
+	 * mirroring the all-remote echo early-out. Probing up front also means no event is
+	 * ever half-recorded: the throw it replaces could fire *after* a tombstone had
+	 * already been staged into the shared `WriteBatch`.
+	 *
+	 * The gate is RESOLVABILITY, not "this transaction dropped the table":
+	 * `create t; drop t; create t; insert into t` carries a drop event for `t` yet
+	 * resolves fine, and its rows must still be captured. `localSchema` is consulted
+	 * only to classify the log line — an expected skip reads differently from a table
+	 * that vanished for some other reason.
+	 *
+	 * A relay-only manager (no `getTableSchema` oracle) resolves every table to
+	 * `RAW_PK_KEYING` and never throws, so nothing is skipped there.
+	 */
+	private filterCapturableDataEvents(
+		events: DatabaseDataChangeEvent[],
+		localSchema: DatabaseSchemaChangeEvent[],
+	): DatabaseDataChangeEvent[] {
+		// One probe per table for the whole transaction, not one per row.
+		const resolvable = new Map<string, boolean>();
+		const skipCounts = new Map<string, number>();
+		const kept: DatabaseDataChangeEvent[] = [];
+
+		for (const event of events) {
+			const tableKey = `${event.schemaName}.${event.tableName}`;
+			let ok = resolvable.get(tableKey);
+			if (ok === undefined) {
+				ok = this.isPkKeyingResolvable(event.schemaName, event.tableName);
+				resolvable.set(tableKey, ok);
+			}
+			if (ok) {
+				kept.push(event);
+			} else {
+				skipCounts.set(tableKey, (skipCounts.get(tableKey) ?? 0) + 1);
+			}
+		}
+
+		if (skipCounts.size > 0) {
+			const droppedHere = new Set(
+				localSchema
+					.filter(e => e.objectType === 'table' && e.type === 'drop')
+					.map(e => `${e.schemaName}.${e.objectName}`),
+			);
+			// ONE line per skipped table with its change count — never one per row.
+			for (const [tableKey, count] of skipCounts) {
+				if (droppedHere.has(tableKey)) {
+					console.log(`[Sync] Skipped ${count} change(s) for ${tableKey} — table dropped by the same transaction`);
+				} else {
+					console.warn(`[Sync] Skipped ${count} change(s) for ${tableKey} — sync pk identity is unresolvable (table schema unavailable at capture time)`);
+				}
+			}
+		}
+
+		return kept;
+	}
+
+	/**
+	 * Probe whether this table's pk-identity keying resolves. The throw is the
+	 * resolver's documented signal for "no schema, no sound identity"
+	 * (see `metadata/pk-identity.ts`); swallowing it here is deliberate — the sole
+	 * caller reports the skip, so the condition is never silent.
+	 */
+	private isPkKeyingResolvable(schemaName: string, tableName: string): boolean {
+		try {
+			this.pkKeying(schemaName, tableName);
+			return true;
+		} catch {
+			return false;
 		}
 	}
 
@@ -858,12 +943,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		nextHlc: () => HLC,
 		changes: Change[],
 	): Promise<void> {
-		const tableSchema = this.getTableSchema?.(schemaName, tableName);
-		const columnNames = tableSchema?.columns?.map(c => c.name);
-
-		if (!tableSchema && this.getTableSchema) {
-			console.warn(`[Sync] No table schema found for ${schemaName}.${tableName} - using fallback column names`);
-		}
+		// `col_${i}` fallback below is the live path for a RELAY-ONLY manager (no
+		// schema oracle at all). An oracle-wired manager can no longer reach here for
+		// a table the oracle does not know — filterCapturableDataEvents skipped it.
+		const columnNames = this.getTableSchema?.(schemaName, tableName)?.columns?.map(c => c.name);
 
 		for (let i = 0; i < newRow.length; i++) {
 			const oldValue = oldRow?.[i];

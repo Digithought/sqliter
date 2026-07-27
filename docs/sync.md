@@ -280,7 +280,7 @@ base HLC:
 ```
 onTransactionCommit(batch):
   localSchema = batch.schemaEvents where !remote
-  localData   = batch.dataEvents   where !remote
+  localData   = batch.dataEvents   where !remote and pk identity of its table resolves
   if both empty: return                 // all-remote echo, or empty/idle commit
   base  = hlcManager.tick()             // ONE tick per transaction; opSeq 0
   txnId = deterministicTxnId(base)      // stable over (wallTime, counter, siteId)
@@ -299,6 +299,17 @@ Why one tick is correct: `tick()` advances `wallTime`/`counter` once, so the bas
 of the transaction shares that triple and differs only in `opSeq` — exactly the
 identity the read side groups on. DDL events take the lowest `opSeq`s so they sort
 below the same transaction's DML (§ DDL Application Order).
+
+**Local capture is best-effort at TABLE granularity.** A table whose pk identity is
+unresolvable at capture time — typically one this same transaction dropped, whose
+schema is already gone when the commit group is delivered — costs only its own rows;
+the transaction's other tables and all its schema migrations still record. The filter
+(`filterCapturableDataEvents`) runs *before* the tick, so a fully-skipped transaction
+consumes no HLC and nothing is ever half-staged into the shared KV batch. Each skipped
+table is logged once with its change count. The gate is resolvability, not "this
+transaction dropped the table": `create t; drop t; create t; insert into t` resolves
+fine and is captured in full. A relay-only manager (no schema oracle) resolves every
+table to raw keying, so nothing is skipped there.
 
 **Commit recording is serialized.** `handleTransactionCommit` does async dedup reads
 (the prior column-version / tombstone lookups that delete a superseded change-log entry)
