@@ -414,7 +414,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * overlay module's table registry rather than leaking there for the life of the
 	 * `Database`. This is the single sink every overlay-discard path funnels through —
 	 * without it, `MemoryTableModule.tables` accumulates one dead `_overlay_<table>_<id>`
-	 * entry per writing transaction (and one more per rebuild), unbounded.
+	 * entry per writing transaction (and one more per `alterPrimaryKey` overlay swap — the
+	 * only DDL path left that replaces an overlay rather than adopting in place), unbounded.
 	 *
 	 * `MemoryTableManager.destroy` rolls back the overlay's own pending layer and clears its
 	 * connections; a later db-side teardown of the (now-detached) `MemoryVirtualTableConnection`
@@ -2307,6 +2308,14 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			state.poison = { message: this.buildAlterPoisonMessage(schemaName, tableName, change) };
 			return;
 		}
+		// NOTE: this is the only remaining path that swaps an overlay table rather than adopting
+		// the change in place, so a registered `IsolatedConnection` keeps the OLD overlay's
+		// connection (captured at construction, isolated-connection.ts) and forwards its
+		// savepoint/rollback calls to a released table. Benign today: the swapped overlay is
+		// clean, so nothing staged is lost, and the fresh overlay registers its own connection
+		// with the `Database` on its first write and receives the broadcasts directly. If this
+		// swap ever becomes reachable with staged rows, or per-connection state moves onto
+		// `IsolatedConnection`, retarget the connection here.
 		const fresh = await this.overlayModule.create(state.db, this.createOverlaySchema(updatedSchema));
 		this.connectionOverlays.set(key, { overlayTable: fresh, hasChanges: false, db: state.db });
 		await this.releaseOverlayTable(state);
