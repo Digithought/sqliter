@@ -58,11 +58,16 @@ export type BatchOp =
 
 /**
  * Write batch for atomic operations.
+ *
+ * Queued operations apply in the order they were queued. When two operations
+ * target the same key, the later one wins: `put(k, a); delete(k)` leaves `k`
+ * absent, and `delete(k); put(k, a)` leaves `k` set to `a`. Ordering is only
+ * defined *within* one batch; `write()` remains all-or-nothing.
  */
 export interface WriteBatch {
-	/** Queue a put operation. */
+	/** Queue a put operation. On a key already queued in this batch, supersedes it. */
 	put(key: Uint8Array, value: Uint8Array): void;
-	/** Queue a delete operation. */
+	/** Queue a delete operation. On a key already queued in this batch, supersedes it. */
 	delete(key: Uint8Array): void;
 	/** Execute all queued operations atomically. */
 	write(): Promise<void>;

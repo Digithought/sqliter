@@ -408,6 +408,42 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 				assertBytes(await store.get(b(2)), b(20));
 			});
 
+			it('put then delete on the same key in one batch leaves it absent (key pre-existing)', async () => {
+				await store.put(b(1), b(10));
+				const batch = store.batch();
+				batch.put(b(1), b(20));
+				batch.delete(b(1));
+				await batch.write();
+				assert.strictEqual(await store.get(b(1)), undefined);
+			});
+
+			it('put then delete on the same key in one batch leaves it absent (key new)', async () => {
+				const batch = store.batch();
+				batch.put(b(1), b(20));
+				batch.delete(b(1));
+				await batch.write();
+				assert.strictEqual(await store.get(b(1)), undefined);
+			});
+
+			it('delete then put on the same key in one batch leaves the put value', async () => {
+				await store.put(b(1), b(10));
+				const batch = store.batch();
+				batch.delete(b(1));
+				batch.put(b(1), b(20));
+				await batch.write();
+				assertBytes(await store.get(b(1)), b(20));
+			});
+
+			it('a run of same-key ops in one batch resolves to the last op queued', async () => {
+				const batch = store.batch();
+				batch.put(b(1), b(10)); // a
+				batch.put(b(1), b(20)); // b
+				batch.delete(b(1));
+				batch.put(b(1), b(30)); // c
+				await batch.write();
+				assertBytes(await store.get(b(1)), b(30));
+			});
+
 			it('a committed batch does not re-apply its ops on reuse', async () => {
 				const batch = store.batch();
 				batch.put(b(1), b(11));

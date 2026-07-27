@@ -388,6 +388,8 @@ The store module integrates with Quereus's transaction coordinator to provide mu
 4. **Transaction Commit**: Quereus calls `commit()` on connections; the coordinator writes the batch atomically
 5. **Transaction Rollback**: The coordinator discards the pending batch; no changes are persisted
 
+**Same-key ordering within a batch**: a `WriteBatch`'s queued operations apply in the order they were queued, so when two operations target the same key, the later one wins — `put(k, a); delete(k)` leaves `k` absent, `delete(k); put(k, a)` leaves `k` set to `a`. Every backend (in-memory, LevelDB, IndexedDB, React Native LevelDB, NativeScript SQLite) honors this; it's part of the `WriteBatch` contract, covered by the shared conformance suite.
+
 ### DDL that implicitly commits
 
 Some DDL rewrites or relocates storage directly, bypassing the coordinator's buffer. Such a statement first **commits the module-wide transaction** — every buffered write, for *every* table the coordinator holds, not just the altered one — and only then touches storage. After it runs there is nothing left to roll back: a subsequent `ROLLBACK` will not restore the pre-DDL rows.
