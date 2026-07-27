@@ -1505,6 +1505,12 @@ migration, rewriting the local table), which is substantially more machinery.
 Note that only `create_table` currently reaches a peer with a non-empty DDL
 string; every other schema event the store module emits carries no DDL, so those
 migrations replicate as an empty statement and change nothing on the receiver.
+Such a migration is skipped outright — counted applied, but neither executed nor
+given a pending remote-event expectation. That last part matters: expectations
+are refcounted and never expire, so one registered for a statement that emits no
+event would linger and consume the next genuine *local* DDL of the same
+signature, marking it remote — and remote events are filtered out of the
+SyncManager's local-fact capture, so that local change would never replicate.
 The drop / index branches above are implemented and tested against synthetic
 migrations so they are correct once real DDL flows for them.
 

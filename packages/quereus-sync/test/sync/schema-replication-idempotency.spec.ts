@@ -341,5 +341,25 @@ describe('schema replication idempotency', () => {
 			expect(result.schemaChangesApplied).to.equal(2);
 			expect(db.schemaManager.getTable('main', 'orders')).to.not.be.undefined;
 		});
+
+		it('leaves no pending remote-event expectation behind for a blank-DDL migration', async () => {
+			// A blank statement emits nothing, so an expectation registered for it
+			// would never be consumed — and would then swallow the NEXT genuine local
+			// DDL of the same signature, marking it remote so the SyncManager drops it
+			// from its local-fact capture and it never replicates.
+			await apply(
+				schemaChange('add_index', 'idx_orders_note', ''),
+				schemaChange('alter_column', 'orders', ''),
+			);
+
+			await db.exec('create index idx_orders_note on orders (note)');
+			await db.exec('alter table orders add column qty integer');
+
+			expect(schemaEvents.map(e => [e.type, e.objectType, e.objectName, e.remote ?? false]))
+				.to.deep.equal([
+					['create', 'index', 'idx_orders_note', false],
+					['alter', 'table', 'orders', false],
+				]);
+		});
 	});
 });

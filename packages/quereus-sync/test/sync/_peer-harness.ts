@@ -123,15 +123,8 @@ export async function localWrite(peer: Peer, sql: string): Promise<void> {
  * they already ran. Use {@link relayAll} when the schema migrations themselves
  * are the subject under test.
  */
-export async function relay(from: Peer, to: Peer): Promise<ApplyResult> {
-	await settle();
-	const sets = await from.manager.getChangesSince(to.manager.getSiteId());
-	const dataOnly = sets.map(cs => ({ ...cs, schemaMigrations: [] }));
-	const res = await to.manager.applyChanges(dataOnly);
-	await settle();
-	await to.manager.updatePeerSyncState(from.manager.getSiteId(), from.manager.getCurrentHLC());
-	return res;
-}
+export const relay = (from: Peer, to: Peer): Promise<ApplyResult> =>
+	relayWith(from, to, sets => sets.map(cs => ({ ...cs, schemaMigrations: [] })));
 
 /**
  * One-directional FULL relay — identical to {@link relay} but keeps each
@@ -139,10 +132,18 @@ export async function relay(from: Peer, to: Peer): Promise<ApplyResult> {
  * receiver's `applyToStore`. This is the wire shape a real transport carries;
  * `relay`'s stripping is a test-only narrowing.
  */
-export async function relayAll(from: Peer, to: Peer): Promise<ApplyResult> {
+export const relayAll = (from: Peer, to: Peer): Promise<ApplyResult> =>
+	relayWith(from, to, sets => sets);
+
+/** Shared relay body: settle, pull from-zero, apply the shaped sets, advance the watermark. */
+async function relayWith(
+	from: Peer,
+	to: Peer,
+	shape: (sets: ChangeSet[]) => ChangeSet[],
+): Promise<ApplyResult> {
 	await settle();
 	const sets = await from.manager.getChangesSince(to.manager.getSiteId());
-	const res = await to.manager.applyChanges(sets);
+	const res = await to.manager.applyChanges(shape(sets));
 	await settle();
 	await to.manager.updatePeerSyncState(from.manager.getSiteId(), from.manager.getCurrentHLC());
 	return res;

@@ -424,7 +424,8 @@ function assertDefinitionMatches(
 }
 
 /**
- * Decide whether a replicated DDL statement still needs to run.
+ * Decide whether a replicated DDL statement still needs to run. Never called
+ * with a blank `ddl` — {@link applySchemaChange} short-circuits that first.
  *
  * Replication delivers a migration to peers that may already be in its wanted
  * state — two offline peers can each `create table orders`, and whichever
@@ -437,15 +438,14 @@ function assertDefinitionMatches(
  * Throws on a same-name/different-definition collision — silently keeping the
  * local shape and committing the metadata would record "converged" for a
  * divergence that is not converged (see {@link assertDefinitionMatches}).
+ *
+ * NOTE: presence is read from the in-memory catalog (`db.schemaManager`), which
+ * is assumed to reflect what is persisted — true once a database has finished
+ * `rehydrateCatalog`. If a peer ever drives sync against a half-rehydrated
+ * catalog, a table present in storage but absent from the catalog decides
+ * `execute` and the underlying "already exists" throw returns.
  */
 function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaChangeAction {
-  // Blank DDL replicates as a no-op `db.exec('')` today — every schema event the
-  // store module emits except `create_table` carries no `ddl` (tracked separately
-  // as bug-sync-schema-migrations-replicate-empty-ddl). Leave that path exactly as
-  // it was rather than inferring intent from the migration type: a blank statement
-  // can neither be compared against a local definition nor change any state.
-  if (change.ddl.trim() === '') return 'execute';
-
   switch (change.type) {
     case 'create_table': {
       const local = db.schemaManager.getTable(change.schema, change.table);
@@ -453,6 +453,11 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // Both sides render through `generateTableDDL` with no `db` argument, so
       // the strings are fully qualified and session-independent — directly
       // comparable against the DDL the origin put on the wire.
+      // NOTE: that symmetry is a property of the store module (it is the only
+      // module that puts DDL on the wire today). A second DDL-emitting module
+      // rendering the same table some other way would be reported as a conflict
+      // rather than converging; the comparison would then need to be over parsed
+      // schemas, not rendered strings.
       assertDefinitionMatches(change, generateTableDDL(local));
       return 'already-applied';
     }
@@ -513,10 +518,18 @@ async function applySchemaChange(
   change: SchemaChangeToApply,
   _options: ApplyToStoreOptions
 ): Promise<void> {
-  // Decide BEFORE registering the remote-event expectation: an expectation for
-  // DDL that is then not executed would linger and mis-mark a later genuine
-  // LOCAL DDL of the same signature as remote (so the SyncManager would never
-  // record it).
+  // Every store schema event except `create_table` replicates with a blank `ddl`
+  // (bug-sync-schema-migrations-replicate-empty-ddl). Such a migration runs
+  // nothing, so it also EMITS nothing — registering a remote-event expectation
+  // for it would leave that expectation pending forever (the emitter refcounts
+  // expectations and never expires them), and the next genuine LOCAL DDL of the
+  // same signature would be consumed by it, marked remote, and dropped from the
+  // SyncManager's local-fact capture — silently never replicated.
+  if (change.ddl.trim() === '') return;
+
+  // Decide BEFORE registering the remote-event expectation, for the same reason:
+  // an expectation for DDL that is then not executed would linger and mis-mark a
+  // later genuine LOCAL DDL of the same signature as remote.
   if (decideSchemaChange(db, change) === 'already-applied') {
     console.debug(
       `[Sync] Remote ${change.type} for ${change.schema}.${change.table} already applied locally — converging without re-executing DDL`
