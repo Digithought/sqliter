@@ -1899,7 +1899,7 @@ describe('SyncManager', () => {
       expect(conflicts[0].remoteValue).to.equal('Alice');
     });
 
-    it('should not warn about missing table schema when getTableSchema is not provided', async () => {
+    it('should capture every table when getTableSchema is not provided (relay-only)', async () => {
       const warnings: string[] = [];
       const origWarn = console.warn;
       console.warn = (msg: string) => warnings.push(msg);
@@ -1915,10 +1915,15 @@ describe('SyncManager', () => {
           newRow: ['value'],
         });
 
-        await new Promise(resolve => setTimeout(resolve, 10));
+        await manager.whenCommitsSettled();
 
-        // Should NOT have the "No table schema" warning
-        expect(warnings.some(w => w.includes('No table schema found'))).to.be.false;
+        // No oracle ⇒ every table reports in-basis ⇒ nothing is skipped.
+        expect(warnings.filter(w => w.includes('Skipped'))).to.have.lengthOf(0);
+        const keys: string[] = [];
+        for await (const entry of kv.iterate()) {
+          keys.push(new TextDecoder().decode(entry.key));
+        }
+        expect(keys.some(k => k.startsWith('cv:main.test'))).to.be.true;
       } finally {
         console.warn = origWarn;
       }

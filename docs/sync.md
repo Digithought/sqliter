@@ -280,7 +280,7 @@ base HLC:
 ```
 onTransactionCommit(batch):
   localSchema = batch.schemaEvents where !remote
-  localData   = batch.dataEvents   where !remote and pk identity of its table resolves
+  localData   = batch.dataEvents   where !remote and its table is still in the basis
   if both empty: return                 // all-remote echo, or empty/idle commit
   base  = hlcManager.tick()             // ONE tick per transaction; opSeq 0
   txnId = deterministicTxnId(base)      // stable over (wallTime, counter, siteId)
@@ -300,16 +300,19 @@ of the transaction shares that triple and differs only in `opSeq` — exactly th
 identity the read side groups on. DDL events take the lowest `opSeq`s so they sort
 below the same transaction's DML (§ DDL Application Order).
 
-**Local capture is best-effort at TABLE granularity.** A table whose pk identity is
-unresolvable at capture time — typically one this same transaction dropped, whose
-schema is already gone when the commit group is delivered — costs only its own rows;
-the transaction's other tables and all its schema migrations still record. The filter
-(`filterCapturableDataEvents`) runs *before* the tick, so a fully-skipped transaction
-consumes no HLC and nothing is ever half-staged into the shared KV batch. Each skipped
-table is logged once with its change count. The gate is resolvability, not "this
-transaction dropped the table": `create t; drop t; create t; insert into t` resolves
-fine and is captured in full. A relay-only manager (no schema oracle) resolves every
-table to raw keying, so nothing is skipped there.
+**Local capture is best-effort at TABLE granularity.** A table that is out of basis at
+capture time — the schema oracle no longer knows it, typically because this same
+transaction dropped it and the schema is gone when the commit group is delivered — has
+no sound pk identity, so it costs its own rows; the transaction's other tables and all
+its schema migrations still record. The filter (`filterCapturableDataEvents`) runs
+*before* the tick, so a fully-skipped transaction consumes no HLC and nothing is ever
+half-staged into the shared KV batch. Each skipped table is logged once with its change
+count — informationally when this transaction dropped it, as a warning otherwise. The
+gate is basis membership, not "this transaction dropped the table":
+`drop t; create t; insert into t` leaves `t` in basis and is captured in full. Only the
+unknown-table case is skipped: any other keying failure (e.g. a pk collation the wired
+normalizer resolver does not know) still fails the transaction loudly. A relay-only
+manager (no schema oracle) reports every table in basis, so nothing is skipped there.
 
 **Commit recording is serialized.** `handleTransactionCommit` does async dedup reads
 (the prior column-version / tombstone lookups that delete a superseded change-log entry)

@@ -71,6 +71,23 @@ function expectSharedBase(facts: ReadonlyArray<{ hlc: HLC }>, base: HLC): void {
 	}
 }
 
+/** Run `body` with `console.warn`/`console.log` captured; restores both even on throw. */
+async function captureConsole(body: () => Promise<void>): Promise<{ warns: string[]; logs: string[] }> {
+	const warns: string[] = [];
+	const logs: string[] = [];
+	const origWarn = console.warn;
+	const origLog = console.log;
+	console.warn = (msg: string) => warns.push(msg);
+	console.log = (msg: string) => logs.push(msg);
+	try {
+		await body();
+	} finally {
+		console.warn = origWarn;
+		console.log = origLog;
+	}
+	return { warns, logs };
+}
+
 describe('per-transaction HLC tick + opSeq (write side)', () => {
 	it('multi-row INSERT: one tick, contiguous opSeq, one emit, one KV batch', async () => {
 		const { manager, source, localChanges, batchCount } = await makeManager();
@@ -209,13 +226,10 @@ describe('per-transaction HLC tick + opSeq (write side)', () => {
 		const states: SyncState[] = [];
 		syncEvents.onSyncStateChange(s => states.push(s));
 
-		const warnings: string[] = [];
-		const origWarn = console.warn;
-		console.warn = (msg: string) => warnings.push(msg);
-		try {
-			// `ghost` is unknown to the oracle (SCHEMAS has only users/orders), so its
-			// pk identity is unresolvable. It is listed FIRST: if the skip happened
-			// mid-recording rather than before the tick, users' opSeq would not start at 0.
+		// `ghost` is unknown to the oracle (SCHEMAS has only users/orders), so its pk
+		// identity is unresolvable. It is listed FIRST: if the skip happened
+		// mid-recording rather than before the tick, users' opSeq would not start at 0.
+		const { warns } = await captureConsole(async () => {
 			source.commit({
 				data: [
 					{ type: 'insert', schemaName: 'main', tableName: 'ghost', key: [1], newRow: [1, 'boo'] },
@@ -223,9 +237,7 @@ describe('per-transaction HLC tick + opSeq (write side)', () => {
 				],
 			});
 			await manager.whenCommitsSettled();
-		} finally {
-			console.warn = origWarn;
-		}
+		});
 
 		expect(localChanges, 'the transaction still emitted').to.have.length(1);
 		const facts = localChanges[0].changes;
@@ -234,8 +246,50 @@ describe('per-transaction HLC tick + opSeq (write side)', () => {
 		expect(facts.map(f => f.hlc.opSeq).sort((a, b) => a - b)).to.deep.equal([0, 1]);
 
 		// One skip warning naming the table; no error sync-state event.
-		expect(warnings.filter(w => w.includes('main.ghost'))).to.have.length(1);
+		expect(warns.filter(w => w.includes('main.ghost'))).to.have.length(1);
 		expect(states.filter(s => s.status === 'error'), 'skip is not an error').to.have.length(0);
+	});
+
+	it('logs one line per skipped table, counting deletes too', async () => {
+		const { manager, source, localChanges } = await makeManager();
+
+		// Two tables unknown to the oracle in ONE transaction, with a DELETE among
+		// them: deletes take the tombstone path in recordDataEvent, which is where a
+		// half-staged write could previously occur.
+		const { warns, logs } = await captureConsole(async () => {
+			source.commit({
+				data: [
+					{ type: 'delete', schemaName: 'main', tableName: 'ghost', key: [1], oldRow: [1, 'boo'] },
+					{ type: 'insert', schemaName: 'main', tableName: 'ghost', key: [2], newRow: [2, 'boo'] },
+					{ type: 'delete', schemaName: 'main', tableName: 'wraith', key: [1], oldRow: [1, 'x'] },
+					{ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: [1, 'Alice'] },
+				],
+			});
+			await manager.whenCommitsSettled();
+		});
+
+		expect(warns.filter(w => w.includes('main.ghost')), 'one line per table, not per row')
+			.to.deep.equal(['[Sync] Skipped 2 change(s) for main.ghost — table is outside the local basis, so sync pk identity is unresolvable']);
+		expect(warns.filter(w => w.includes('main.wraith'))).to.have.length(1);
+		expect(warns.filter(w => w.includes('main.wraith'))[0]).to.include('Skipped 1 change(s)');
+		expect(logs, 'nothing dropped these tables, so nothing is an expected skip').to.have.length(0);
+
+		expect(localChanges[0].changes.every(f => f.table === 'users')).to.equal(true);
+	});
+
+	it('a table dropped by the same transaction skips informationally, not as a warning', async () => {
+		const { manager, source } = await makeManager();
+
+		const { warns, logs } = await captureConsole(async () => {
+			source.commit({
+				schema: [{ type: 'drop', objectType: 'table', schemaName: 'main', objectName: 'ghost' }],
+				data: [{ type: 'update', schemaName: 'main', tableName: 'ghost', key: [1], oldRow: [1, 'a'], newRow: [1, 'b'] }],
+			});
+			await manager.whenCommitsSettled();
+		});
+
+		expect(logs).to.deep.equal(['[Sync] Skipped 1 change(s) for main.ghost — table dropped by the same transaction']);
+		expect(warns.filter(w => w.includes('main.ghost')), 'expected skip is not a warning').to.have.length(0);
 	});
 
 	it('mixed group records only the local facts, with contiguous opSeq', async () => {

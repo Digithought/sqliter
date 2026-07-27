@@ -764,84 +764,79 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Drop the data events of any table whose pk-identity keying cannot be resolved
-	 * right now — typically a table this same transaction dropped, whose schema is
-	 * already gone by the time the commit group is delivered.
+	 * Drop the data events of any table that is no longer in the local basis — the
+	 * schema oracle does not know it, typically because this same transaction dropped
+	 * it and the schema is already gone by the time the commit group is delivered.
+	 * A schemaless table has no sound pk identity (see `metadata/pk-identity.ts`), so
+	 * its rows cannot be filed.
 	 *
-	 * Local capture is therefore best-effort at TABLE granularity: one unresolvable
-	 * table costs only its own rows, never the rest of the transaction (which is what
-	 * the handler's top-level catch would do — it aborts recording of every other
-	 * table's rows AND the transaction's schema migrations).
+	 * Local capture is therefore best-effort at TABLE granularity: one unknown table
+	 * costs only its own rows, never the rest of the transaction (which is what the
+	 * handler's top-level catch would do — it aborts recording of every other table's
+	 * rows AND the transaction's schema migrations).
 	 *
 	 * Runs BEFORE the HLC tick, so a transaction whose data is entirely skipped and
 	 * that carries no schema events consumes no clock and emits no local change,
-	 * mirroring the all-remote echo early-out. Probing up front also means no event is
-	 * ever half-recorded: the throw it replaces could fire *after* a tombstone had
+	 * mirroring the all-remote echo early-out. Filtering up front also means no event
+	 * is ever half-recorded: the throw it replaces could fire *after* a tombstone had
 	 * already been staged into the shared `WriteBatch`.
 	 *
-	 * The gate is RESOLVABILITY, not "this transaction dropped the table":
-	 * `create t; drop t; create t; insert into t` carries a drop event for `t` yet
-	 * resolves fine, and its rows must still be captured. `localSchema` is consulted
-	 * only to classify the log line — an expected skip reads differently from a table
-	 * that vanished for some other reason.
+	 * The gate is basis MEMBERSHIP, not "this transaction dropped the table":
+	 * `drop t; create t; insert into t` carries a drop event for `t` yet leaves it in
+	 * basis, and its rows must still be captured. `localSchema` is consulted only to
+	 * classify the log line — an expected skip reads differently from a table that
+	 * vanished for some other reason.
 	 *
-	 * A relay-only manager (no `getTableSchema` oracle) resolves every table to
-	 * `RAW_PK_KEYING` and never throws, so nothing is skipped there.
+	 * ONLY the unknown-table case is skipped. Any other keying failure — a pk column
+	 * whose collation the wired `keyNormalizerResolver` does not know, say — still
+	 * throws out of `recordDataEvent` and fails the transaction loudly; silently
+	 * discarding those rows would bury a real misconfiguration.
+	 *
+	 * A relay-only manager (no `getTableSchema` oracle) reports every table in basis,
+	 * so nothing is skipped there.
 	 */
 	private filterCapturableDataEvents(
 		events: DatabaseDataChangeEvent[],
 		localSchema: DatabaseSchemaChangeEvent[],
 	): DatabaseDataChangeEvent[] {
-		// One probe per table for the whole transaction, not one per row.
-		const resolvable = new Map<string, boolean>();
+		// NOTE: one oracle lookup per ROW (a schema-map hit today, and dwarfed by the
+		// per-row record work below). If `getTableSchema` ever becomes expensive, memo
+		// the verdict per table for the duration of the transaction.
 		const skipCounts = new Map<string, number>();
-		const kept: DatabaseDataChangeEvent[] = [];
-
-		for (const event of events) {
+		const kept = events.filter(event => {
+			if (this.isTableInBasis(event.schemaName, event.tableName)) return true;
 			const tableKey = `${event.schemaName}.${event.tableName}`;
-			let ok = resolvable.get(tableKey);
-			if (ok === undefined) {
-				ok = this.isPkKeyingResolvable(event.schemaName, event.tableName);
-				resolvable.set(tableKey, ok);
-			}
-			if (ok) {
-				kept.push(event);
-			} else {
-				skipCounts.set(tableKey, (skipCounts.get(tableKey) ?? 0) + 1);
-			}
-		}
+			skipCounts.set(tableKey, (skipCounts.get(tableKey) ?? 0) + 1);
+			return false;
+		});
 
-		if (skipCounts.size > 0) {
-			const droppedHere = new Set(
-				localSchema
-					.filter(e => e.objectType === 'table' && e.type === 'drop')
-					.map(e => `${e.schemaName}.${e.objectName}`),
-			);
-			// ONE line per skipped table with its change count — never one per row.
-			for (const [tableKey, count] of skipCounts) {
-				if (droppedHere.has(tableKey)) {
-					console.log(`[Sync] Skipped ${count} change(s) for ${tableKey} — table dropped by the same transaction`);
-				} else {
-					console.warn(`[Sync] Skipped ${count} change(s) for ${tableKey} — sync pk identity is unresolvable (table schema unavailable at capture time)`);
-				}
-			}
-		}
-
+		if (skipCounts.size > 0) this.logSkippedTables(skipCounts, localSchema);
 		return kept;
 	}
 
 	/**
-	 * Probe whether this table's pk-identity keying resolves. The throw is the
-	 * resolver's documented signal for "no schema, no sound identity"
-	 * (see `metadata/pk-identity.ts`); swallowing it here is deliberate — the sole
-	 * caller reports the skip, so the condition is never silent.
+	 * Report skipped tables: ONE line per table with its change count, never one per
+	 * row. A table this same transaction dropped is expected and logs informationally;
+	 * anything else is a warning — the table vanished for some other reason.
 	 */
-	private isPkKeyingResolvable(schemaName: string, tableName: string): boolean {
-		try {
-			this.pkKeying(schemaName, tableName);
-			return true;
-		} catch {
-			return false;
+	private logSkippedTables(
+		skipCounts: ReadonlyMap<string, number>,
+		localSchema: DatabaseSchemaChangeEvent[],
+	): void {
+		const droppedHere = new Set(
+			localSchema
+				.filter(e => e.objectType === 'table' && e.type === 'drop')
+				.map(e => `${e.schemaName}.${e.objectName}`),
+		);
+		// NOTE: the only `console.log` in this package (everything else is warn/error) —
+		// an expected skip is not a warning. If the package ever gains a real logger
+		// abstraction, this is the call site that wants an `info` level.
+		for (const [tableKey, count] of skipCounts) {
+			if (droppedHere.has(tableKey)) {
+				console.log(`[Sync] Skipped ${count} change(s) for ${tableKey} — table dropped by the same transaction`);
+			} else {
+				console.warn(`[Sync] Skipped ${count} change(s) for ${tableKey} — table is outside the local basis, so sync pk identity is unresolvable`);
+			}
 		}
 	}
 
