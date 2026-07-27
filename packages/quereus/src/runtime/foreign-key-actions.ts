@@ -640,6 +640,11 @@ async function executeSingleFKAction(
 
 	switch (action) {
 		case 'cascade': {
+			// NOTE: this branches purely on `newRow === undefined` to tell cascade DELETE
+			// from cascade UPDATE. Every current caller passes operation === 'update' with
+			// a defined `newRow` (see the three UPDATE sites in emit/dml-executor.ts) — if a
+			// future caller ever invoked executeForeignKeyActions with operation: 'update'
+			// and no newRow, this would silently issue a child DELETE instead.
 			if (newRow === undefined) {
 				// CASCADE DELETE: delete matching child rows
 				const sql = `DELETE FROM ${qualifiedChildTable} WHERE ${whereClause}`;

@@ -886,3 +886,94 @@ DELETE FROM crcd_parent WHERE id = 1;
 DROP TABLE crcd_child;
 DROP TABLE crcd_parent;
 
+-- ===================================================================
+-- Phase: ON UPDATE action gate — untouched referenced column must not
+-- fire the action at all (regression for fk-update-actions-fire-when-key-unchanged)
+-- ===================================================================
+-- executeForeignKeyActions used to re-issue the child DML for CASCADE / SET NULL /
+-- SET DEFAULT after every parent UPDATE, even when the referenced column never
+-- changed. Updating an unrelated parent column wrongly rewrote (or nulled) child
+-- rows that were never re-keyed. Each block below asserts the untouched case is a
+-- no-op and a genuine re-key still fires the action.
+
+-- SET DEFAULT: an untouched referenced column must leave the child alone; a
+-- genuine re-key must still re-point the child to the default (a live parent key).
+CREATE TABLE fkgd_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE fkgd_child (cid INTEGER PRIMARY KEY, p_id INTEGER DEFAULT 99,
+    FOREIGN KEY (p_id) REFERENCES fkgd_parent(id) ON UPDATE SET DEFAULT);
+
+INSERT INTO fkgd_parent VALUES (1, 100), (99, 200);
+INSERT INTO fkgd_child VALUES (10, 1);
+
+UPDATE fkgd_parent SET other = 111 WHERE id = 1;
+SELECT p_id FROM fkgd_child WHERE cid = 10;
+→ [{"p_id":1}]
+
+UPDATE fkgd_parent SET id = 7 WHERE id = 1;
+SELECT p_id FROM fkgd_child WHERE cid = 10;
+→ [{"p_id":99}]
+
+DROP TABLE fkgd_child;
+DROP TABLE fkgd_parent;
+
+-- SET NULL, nullable child column: an untouched referenced column must leave the
+-- child alone; a genuine re-key must still null it out.
+CREATE TABLE fkgn_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE fkgn_child (cid INTEGER PRIMARY KEY, p_id INTEGER NULL,
+    FOREIGN KEY (p_id) REFERENCES fkgn_parent(id) ON UPDATE SET NULL);
+
+INSERT INTO fkgn_parent VALUES (1, 100);
+INSERT INTO fkgn_child VALUES (10, 1);
+
+UPDATE fkgn_parent SET other = 111 WHERE id = 1;
+SELECT p_id FROM fkgn_child WHERE cid = 10;
+→ [{"p_id":1}]
+
+UPDATE fkgn_parent SET id = 7 WHERE id = 1;
+SELECT p_id FROM fkgn_child WHERE cid = 10;
+→ [{"p_id":null}]
+
+DROP TABLE fkgn_child;
+DROP TABLE fkgn_parent;
+
+-- SET NULL, non-nullable child column (bare INTEGER — NOT NULL by default in
+-- Quereus): before the fix, an update leaving the referenced column alone still
+-- re-issued the child SET NULL and tripped NOT NULL. It must now succeed as a
+-- no-op on the child. This is the case most likely to regress unnoticed, since
+-- the symptom was an error rather than silently bad data.
+CREATE TABLE fkgnn_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE fkgnn_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES fkgnn_parent(id) ON UPDATE SET NULL);
+
+INSERT INTO fkgnn_parent VALUES (1, 100);
+INSERT INTO fkgnn_child VALUES (10, 1);
+
+UPDATE fkgnn_parent SET other = 111 WHERE id = 1;
+SELECT p_id FROM fkgnn_child WHERE cid = 10;
+→ [{"p_id":1}]
+
+DROP TABLE fkgnn_child;
+DROP TABLE fkgnn_parent;
+
+-- CASCADE: an untouched referenced column must leave the child value alone (a
+-- phantom rewrite-to-same-value used to fire here — see the runtime spec for the
+-- data-change-event assertion this value-only check cannot make); a genuine
+-- re-key must still cascade.
+CREATE TABLE fkgc_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE fkgc_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES fkgc_parent(id) ON UPDATE CASCADE);
+
+INSERT INTO fkgc_parent VALUES (1, 100);
+INSERT INTO fkgc_child VALUES (10, 1);
+
+UPDATE fkgc_parent SET other = 111 WHERE id = 1;
+SELECT p_id FROM fkgc_child WHERE cid = 10;
+→ [{"p_id":1}]
+
+UPDATE fkgc_parent SET id = 7 WHERE id = 1;
+SELECT p_id FROM fkgc_child WHERE cid = 10;
+→ [{"p_id":7}]
+
+DROP TABLE fkgc_child;
+DROP TABLE fkgc_parent;
+
