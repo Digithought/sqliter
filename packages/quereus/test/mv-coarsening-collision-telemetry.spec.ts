@@ -166,6 +166,47 @@ describe('coarsened-key materialized-view collision telemetry', () => {
 		expect(stat('main.contact_v2')).to.equal(1);
 	});
 
+	it('a mid-transaction RENAME of the view relabels the batched collision event', async () => {
+		// `DatabaseEventEmitter.renameBatchedEvents` walks the collision channel as well as
+		// the data channel (`test/alter-table-events.spec.ts` covers the latter): a
+		// materialized view is a table and RENAME TO is the one ALTER it accepts. Both the
+		// delivered event and the counter key must name the view as it is at commit.
+		await db.exec('create table contact_v1 (handle text primary key, email text)');
+		await db.exec("insert into contact_v1 values ('Bob', 'b@x')");
+		await db.exec('create materialized view contact_v2 as select handle collate nocase as handle, email from contact_v1');
+
+		await db.exec('begin');
+		await db.exec("insert into contact_v1 values ('bob', 'b2@x')"); // collision, batched under contact_v2
+		await db.exec('alter table contact_v2 rename to contact_v3');
+		await db.exec('commit');
+
+		expect(collisions.length, 'one collision delivered').to.equal(1);
+		expect(collisions[0].tableName, 'named as of delivery').to.equal('contact_v3');
+		expect(collisions[0].key).to.deep.equal(['bob']);
+		expect(collisions[0].weakenedColumns).to.deep.equal(['handle']);
+		expect(stat('main.contact_v3'), 'counter keys on the new name').to.equal(1);
+		expect(stat('main.contact_v2'), 'nothing counted under the retired name').to.equal(undefined);
+	});
+
+	it('the relabel reaches a collision sitting in an open savepoint layer', async () => {
+		// The layer arm of the same walk: the collision is queued into the savepoint layer,
+		// not the base batch, and must still be relabelled before RELEASE merges it down.
+		await db.exec('create table contact_v1 (handle text primary key, email text)');
+		await db.exec("insert into contact_v1 values ('Bob', 'b@x')");
+		await db.exec('create materialized view contact_v2 as select handle collate nocase as handle, email from contact_v1');
+
+		await db.exec('begin');
+		await db.exec('savepoint s1');
+		await db.exec("insert into contact_v1 values ('bob', 'b2@x')");
+		await db.exec('alter table contact_v2 rename to contact_v3');
+		await db.exec('release s1');
+		await db.exec('commit');
+
+		expect(collisions.length).to.equal(1);
+		expect(collisions[0].tableName).to.equal('contact_v3');
+		expect(stat('main.contact_v3')).to.equal(1);
+	});
+
 	it('a colliding row applied via the external-change ingest seam fires the event', async () => {
 		await db.exec('create table contact_v1 (handle text primary key, email text)');
 		await db.exec("insert into contact_v1 values ('Bob', 'b@x')");

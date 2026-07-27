@@ -182,6 +182,21 @@ interface PendingSchemaEvent {
 const DEFAULT_MAX_LISTENERS = 100;
 
 /**
+ * Whether a batched event names `(schemaLower, tableLower)` — the single matching rule
+ * every batched-event rewrite (row-shape remap, table-name relabel) applies, on both the
+ * data and the maintenance-collision channel. Both operands are compared lowercased, so
+ * callers pass already-lowercased names.
+ */
+function namesTable(
+	event: { schemaName: string; tableName: string },
+	schemaLower: string,
+	tableLower: string,
+): boolean {
+	return event.schemaName.toLowerCase() === schemaLower
+		&& event.tableName.toLowerCase() === tableLower;
+}
+
+/**
  * Names of the columns whose values differ between two same-arity row images —
  * the `changedColumns` recomputation for a remapped update event. Same strict
  * (`!==`) comparison the memory module's `computeChangedColumns` uses.
@@ -477,6 +492,20 @@ export class DatabaseEventEmitter {
 		return this.collisionEventLayers.length > 0
 			? this.collisionEventLayers[this.collisionEventLayers.length - 1]
 			: this.batchedCollisionEvents;
+	}
+
+	/**
+	 * Every data-event store a batched rewrite must walk: the base batch plus each open
+	 * savepoint layer. A rewrite touches all of them because a layer's events are still
+	 * undelivered — a later RELEASE merges them into the parent and the commit ships them.
+	 */
+	private allDataEventStores(): PendingDataEvent[][] {
+		return [this.batchedDataEvents, ...this.dataEventLayers];
+	}
+
+	/** Collision-channel counterpart of {@link allDataEventStores}. */
+	private allCollisionEventStores(): MaintenanceCollisionEvent[][] {
+		return [this.batchedCollisionEvents, ...this.collisionEventLayers];
 	}
 
 	/**
@@ -787,15 +816,11 @@ export class DatabaseEventEmitter {
 
 		const schemaLower = schemaName.toLowerCase();
 		const tableLower = tableName.toLowerCase();
-		const stores = [this.batchedDataEvents, ...this.dataEventLayers];
 		let remapped = 0;
-		for (const store of stores) {
+		for (const store of this.allDataEventStores()) {
 			for (const entry of store) {
 				const event = entry.event;
-				if (event.schemaName.toLowerCase() !== schemaLower
-					|| event.tableName.toLowerCase() !== tableLower) {
-					continue;
-				}
+				if (!namesTable(event, schemaLower, tableLower)) continue;
 				const next: VTableDataChangeEvent = { ...event };
 				try {
 					if (event.oldRow !== undefined) next.oldRow = await remapRow(event.oldRow, 'old');
@@ -856,26 +881,18 @@ export class DatabaseEventEmitter {
 		const oldLower = oldTableName.toLowerCase();
 		let relabelled = 0;
 
-		for (const store of [this.batchedDataEvents, ...this.dataEventLayers]) {
+		for (const store of this.allDataEventStores()) {
 			for (const entry of store) {
-				const event = entry.event;
-				if (event.schemaName.toLowerCase() !== schemaLower
-					|| event.tableName.toLowerCase() !== oldLower) {
-					continue;
-				}
-				entry.event = { ...event, tableName: newTableName };
+				if (!namesTable(entry.event, schemaLower, oldLower)) continue;
+				entry.event = { ...entry.event, tableName: newTableName };
 				relabelled++;
 			}
 		}
 
-		for (const store of [this.batchedCollisionEvents, ...this.collisionEventLayers]) {
+		for (const store of this.allCollisionEventStores()) {
 			for (let i = 0; i < store.length; i++) {
-				const event = store[i];
-				if (event.schemaName.toLowerCase() !== schemaLower
-					|| event.tableName.toLowerCase() !== oldLower) {
-					continue;
-				}
-				store[i] = { ...event, tableName: newTableName };
+				if (!namesTable(store[i], schemaLower, oldLower)) continue;
+				store[i] = { ...store[i], tableName: newTableName };
 				relabelled++;
 			}
 		}
