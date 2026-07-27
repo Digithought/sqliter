@@ -832,6 +832,61 @@ export class DatabaseEventEmitter {
 	}
 
 	/**
+	 * Relabel every BATCHED event naming `(schemaName, oldTableName)` to `newTableName`,
+	 * in place, after a mid-transaction `ALTER TABLE … RENAME TO`. Covers
+	 * {@link batchedDataEvents} and every {@link dataEventLayers} savepoint layer, plus the
+	 * collision channel ({@link batchedCollisionEvents} / {@link collisionEventLayers}) —
+	 * a maintained table (materialized view) can be renamed too. So a commit delivers each
+	 * event under the name the table has at delivery, not the one it had at write time.
+	 *
+	 * No-op when not batching: in autocommit the earlier events were already delivered under
+	 * the name the table had at the time, which is correct.
+	 *
+	 * Relabelling cannot fail (it moves no value and reads no schema), so unlike
+	 * {@link remapBatchedDataEvents} this is synchronous and needs no per-event `try`.
+	 * `key` and `changedColumns` are untouched — a rename moves no value and changes no column.
+	 *
+	 * Batched SCHEMA events are deliberately NOT relabelled; see the call site in
+	 * `runtime/emit/alter-table.ts`.
+	 */
+	renameBatchedEvents(schemaName: string, oldTableName: string, newTableName: string): void {
+		if (!this.isBatching) return;
+
+		const schemaLower = schemaName.toLowerCase();
+		const oldLower = oldTableName.toLowerCase();
+		let relabelled = 0;
+
+		for (const store of [this.batchedDataEvents, ...this.dataEventLayers]) {
+			for (const entry of store) {
+				const event = entry.event;
+				if (event.schemaName.toLowerCase() !== schemaLower
+					|| event.tableName.toLowerCase() !== oldLower) {
+					continue;
+				}
+				entry.event = { ...event, tableName: newTableName };
+				relabelled++;
+			}
+		}
+
+		for (const store of [this.batchedCollisionEvents, ...this.collisionEventLayers]) {
+			for (let i = 0; i < store.length; i++) {
+				const event = store[i];
+				if (event.schemaName.toLowerCase() !== schemaLower
+					|| event.tableName.toLowerCase() !== oldLower) {
+					continue;
+				}
+				store[i] = { ...event, tableName: newTableName };
+				relabelled++;
+			}
+		}
+
+		if (relabelled > 0) {
+			log('Relabelled %d batched events from %s.%s to %s after mid-transaction RENAME TO',
+				relabelled, schemaName, oldTableName, newTableName);
+		}
+	}
+
+	/**
 	 * Discard all batched events (called on rollback).
 	 */
 	discardBatch(): void {

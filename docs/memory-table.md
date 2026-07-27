@@ -397,10 +397,19 @@ already reads the post-rename name. Consolidation (`consolidateToBaseLayer`) cle
 logs — their events were delivered when those layers committed, and leaving them in place would
 re-deliver them at the transaction's commit once the base becomes the collection boundary.
 
+`ALTER TABLE ... RENAME TO` needs nothing from the log either, for the same reason: the log's
+`PendingChange` records carry no table name, and `commitTransaction` stamps
+`event.tableName` from `this._tableName` as it drains them — which `renameTable` has already
+moved. The delivered event therefore names the table as it exists at commit, with no relabel
+pass. (Note that unlike `renameColumn`, `renameTable` does *not* currently re-point the open
+layers at the renamed schema object, which loses the transaction's staged rows when a savepoint
+is also in play — see `tickets/fix/memory-table-rename-with-savepoint-loses-transaction-rows`.)
+
 (The same delivered contract is enforced for the module's *other* two event producers — the
 engine's auto-events and the store module's coordinator queue — by
-`DatabaseEventEmitter.remapBatchedDataEvents`, which the engine's ALTER arms call; see
-`docs/module-authoring.md`.)
+`DatabaseEventEmitter.remapBatchedDataEvents` for row shape and
+`DatabaseEventEmitter.renameBatchedEvents` for the table name, which the engine's ALTER arms
+call; see `docs/module-authoring.md`.)
 
 **`RENAME COLUMN` adopts the renamed schema on the open layers.** A rename changes neither the
 column set nor the key bytes, so it needs `adoptSchema` rather than the reshape pair — but it needs

@@ -226,6 +226,19 @@ async function runRenameTable(
 		await module.renameTable(rctx.db, tableSchema.schemaName, oldName, newName);
 	}
 
+	// Events this transaction already recorded still carry the OLD name; relabel them so
+	// the commit delivers every event under the name the table has at delivery. AFTER the
+	// module call (a module failure must leave the batch as untouched as the catalog, and
+	// the store's `ddlCommitPendingOps` flushes its queued events into our batch DURING
+	// that call — those must be in the batch before we walk it), BEFORE the catalog swap,
+	// matching where the other ALTER arms call `remapBatchedDataEvents`.
+	//
+	// NOTE: batched SCHEMA events are deliberately out of scope here. A schema event
+	// records a DDL operation, not current state — relabelling `objectName` without
+	// rewriting its `ddl` text would produce an incoherent instruction. How a rename
+	// crosses the wire to a peer is `fix/sync-schema-migrations-replicate-empty-ddl`.
+	rctx.db._getEventEmitter().renameBatchedEvents(tableSchema.schemaName, oldName, newName);
+
 	// The renamed table's own definition can name itself: a self-referencing FK's
 	// `referencedTable`, a table-qualified CHECK expression, a table-qualified
 	// partial-index predicate. Rewrite those BEFORE the catalog swap and the notify

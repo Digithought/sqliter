@@ -355,6 +355,14 @@ table's columns (`ALTER TABLE ADD/DROP/RENAME COLUMN`, `ALTER COLUMN … SET DAT
 to the post-ALTER shape before the commit delivers them, and `changedColumns` only ever names
 columns that exist in that schema (a `RENAME COLUMN` moves no value, so only the name changes).
 
+`tableName` is as-of-delivery in the same way: a mid-transaction `ALTER TABLE … RENAME TO`
+relabels the events the transaction already recorded, so every event a commit delivers names
+the table as it exists at that moment — never a name the rename has already retired. Renames
+compose within a transaction (`t` → `t2` → `t3` delivers `t3`), and a rename that happens
+*between* transactions changes nothing about events already delivered, which correctly carry
+the name the table had when they were delivered. `key` and `oldRow`/`newRow` are untouched by
+a rename, which moves no value.
+
 `changedColumns` is present on an update event only if the owning module supplies it — the
 memory module and the engine's auto-event path do; the store module deliberately omits it and
 leaves the per-column diff to the consumer. That per-module choice is stable: a mid-transaction

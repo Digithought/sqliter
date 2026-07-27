@@ -1200,7 +1200,7 @@ Quereus provides a unified event system at the database level that aggregates ev
 4. **Transaction Batching**: Events are batched during transactions and only delivered after successful commit; on rollback, events are discarded
 5. **Savepoint Support**: Events respect savepoint semantics - `ROLLBACK TO SAVEPOINT` discards events from that savepoint forward, while `RELEASE SAVEPOINT` merges them into the parent transaction
 
-### Row-Shape Contract Across Mid-Transaction ALTER
+### Row-Shape and Table-Name Contract Across Mid-Transaction ALTER
 
 `oldRow` / `newRow` are positional — a consumer pairs value *i* with column *i* of the table's
 schema. The delivered contract is: **every event's row images match the schema current at
@@ -1225,6 +1225,24 @@ Who upholds it depends on where the not-yet-delivered event sits at ALTER time:
   value; an ADD COLUMN image that defeats the backfill gets `NULL` in the new slot) — never
   fail the ALTER over an event image — and must not deduplicate the log: every recorded write
   is a separately delivered event.
+
+The same as-of-delivery rule covers `tableName` across `ALTER TABLE … RENAME TO`: an event a
+commit delivers names the table as it exists at delivery, never a name the rename retired. Row
+images and `key` are untouched (a rename moves no value), so only the label changes. Same split
+of responsibility:
+
+- Events sitting in the engine's batch are relabelled by the engine — `runRenameTable` calls
+  `DatabaseEventEmitter.renameBatchedEvents` after the module's `renameTable` returns, walking
+  the base batch, every open savepoint layer, and the maintenance-collision channel (a
+  materialized view can be renamed too).
+- A module holding its own queue across the rename must either stamp the table name at emit
+  time from its current name — what the memory module does, so it needs no relabel — or
+  relabel its queue itself inside `renameTable`.
+
+Batched **schema** events are deliberately not relabelled. A schema event records a DDL
+operation, not current state; relabelling its `objectName` without rewriting its `ddl` text
+would produce an incoherent instruction, and how a rename should reach a replicating peer is
+an open question tracked separately.
 
 ### Event Types
 

@@ -114,6 +114,23 @@ describe('Store-backed ALTER TABLE mid-transaction: events keep the delivered sc
 		assert.equal(dml[0].changedColumns, undefined);
 	});
 
+	it('RENAME TO relabels an insert recorded before it', async () => {
+		// Same mechanism, name instead of shape: ddlCommitPendingOps flushes the queued
+		// event into the engine batch under the OLD name, and
+		// DatabaseEventEmitter.renameBatchedEvents relabels it. Note the deliberate absence
+		// of the `tableName === 't'` filter the other cases use — that is the bug.
+		await db.exec('create table t (id integer primary key, v text) using store');
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec('alter table t rename to t2');
+		await db.exec('commit');
+
+		const dml = events.filter(e => e.tableName === 't' || e.tableName === 't2');
+		assert.equal(dml.length, 1);
+		assert.equal(dml[0].tableName, 't2');
+		assert.deepEqual(dml[0].newRow, [1, 'a']);
+	});
+
 	it('mixed arity inside one commit batch is normalized to one shape', async () => {
 		await db.exec('create table t (id integer primary key, v text) using store');
 		await db.exec('begin');
