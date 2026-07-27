@@ -4,11 +4,12 @@ import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import { type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { inferType } from '../../types/registry.js';
-import type { LogicalType } from '../../types/logical-type.js';
+import { castFallback } from '../../types/cast-semantics.js';
 
 export function emitCast(plan: CastNode, ctx: EmissionContext): Instruction {
-	const logicalType = inferType(plan.expression.targetType);
+	// The node's own resolved target type — never re-resolve the name here, or the
+	// plan can advertise a type the emitter does not produce.
+	const logicalType = plan.getType().logicalType;
 
 	function run(
 		_runtimeCtx: RuntimeContext,
@@ -39,44 +40,4 @@ export function emitCast(plan: CastNode, ctx: EmissionContext): Instruction {
 		run: asRun(run),
 		note: `cast(${plan.expression.targetType})`
 	};
-}
-
-/**
- * Fallback for when LogicalType.parse throws on invalid input.
- *
- * CAST stays lenient and never throws, but every arm must yield a value that
- * actually inhabits the target type — otherwise the cast advertises a logical
- * type it does not produce and 'junk' ends up stored in a DATE column.
- *
- * The SQLite-compatible arms below (0 / 0.0 / String(v) / UTF-8 bytes) each
- * satisfy their own type's `validate`. Everything else falls to the default,
- * where the type itself is asked. `parse` reads its input as *source text*, so
- * it can reject a value that already IS a valid member of the target type — a
- * bare JS string is a legitimate JSON string scalar even though
- * `JSON_TYPE.parse('hello')` throws on it as invalid JSON syntax. Keeping the
- * operand only when `validate` vouches for it preserves that case (and with it
- * `json_col = 'not json'` evaluating to false rather than erroring), while a
- * value that inhabits no part of the target type yields NULL — the cast has no
- * result.
- *
- * NOTE: `validate` is optional on LogicalType, so a custom registered type that
- * omits it makes every parse failure NULL. Every built-in defines one; if a
- * plugin type ever needs the operand preserved, give it a `validate` rather than
- * loosening this to "no validate ⇒ keep".
- */
-function castFallback(value: SqlValue, type: LogicalType): SqlValue {
-	switch (type.name) {
-		case 'INTEGER':
-			return 0;
-		case 'REAL':
-			return 0.0;
-		case 'NUMERIC':
-			return 0;
-		case 'TEXT':
-			return String(value);
-		case 'BLOB':
-			return new TextEncoder().encode(String(value));
-		default:
-			return type.validate?.(value) === true ? value : null;
-	}
 }

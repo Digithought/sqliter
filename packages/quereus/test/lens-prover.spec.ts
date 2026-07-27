@@ -262,6 +262,40 @@ describe('lens prover: blocking errors', () => {
 	});
 });
 
+describe('lens prover: CAST nullability in a basis expression', () => {
+	it('a NOT NULL logical column over cast(x as text) deploys clean', async () => {
+		const db = new Database();
+		try {
+			// `cast(x as text)` converts every non-null operand, so a NOT NULL basis
+			// column stays NOT NULL through it. While `CastNode` reported *every*
+			// converting cast as nullable this false-tripped lens.nullability-mismatch.
+			await db.exec('declare schema y { table t (id integer primary key, n integer) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, n text) }');
+			await db.exec('declare lens for x over y { view t as select id, cast(n as text) as n from y.t }');
+			await db.exec('apply schema x'); // must not throw
+			expect(report(db).errors ?? [], 'clean deploy').to.have.length(0);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a NOT NULL logical column over cast(x as date) blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			// A DATE target has no total fallback — an unconvertible operand casts to
+			// NULL — so the same shape over a temporal target is genuinely unsound.
+			await db.exec('declare schema y { table t (id integer primary key, n text) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, n date) }');
+			await db.exec('declare lens for x over y { view t as select id, cast(n as date) as n from y.t }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.nullability-mismatch|declared NOT NULL/);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens prover: synthesized (no-PK) all-columns key', () => {
 	it('a no-PK logical table with nullable columns over a nullable basis deploys clean and writable', async () => {
 		const db = new Database();

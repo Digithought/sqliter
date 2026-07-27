@@ -75,4 +75,15 @@ describe('CastNode static type', () => {
 		expect(findCast('select cast(t as text) as c from cst').getType().nullable).to.equal(false);
 		expect(findCast('select cast(n as integer) as c from cst').getType().nullable).to.equal(true);
 	});
+
+	it('keeps a converting cast to TEXT or BLOB non-null over a NOT NULL operand', () => {
+		// TEXT and BLOB convert every non-null operand — parse handles the storage
+		// classes it accepts and castFallback covers the rest — so neither can
+		// introduce a NULL. Reporting them nullable rejected sound NOT NULL
+		// declarations over `cast(x as text)` (see lens-prover.spec.ts).
+		expect(findCast('select cast(id as text) as c from cst').getType().nullable).to.equal(false);
+		expect(findCast('select cast(id as blob) as c from cst').getType().nullable).to.equal(false);
+		// Still nullable when the operand itself is.
+		expect(findCast('select cast(n as text) as c from cst').getType().nullable).to.equal(true);
+	});
 });

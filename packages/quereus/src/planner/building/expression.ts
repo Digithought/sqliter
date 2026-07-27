@@ -167,7 +167,7 @@ function wrapInCast(
 	operand: ScalarPlanNode,
 	targetType: string,
 ): CastNode {
-	// Synthesise a minimal AST.CastExpr — only `targetType` is used by the emitter.
+	// Synthesise a minimal AST.CastExpr — `targetType` is the only field CastNode reads.
 	const syntheticExpr: AST.CastExpr = {
 		type: 'cast',
 		expr: { type: 'literal', value: null } as AST.LiteralExpr, // placeholder

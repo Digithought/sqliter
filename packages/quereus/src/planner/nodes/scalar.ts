@@ -11,6 +11,7 @@ import { StatusCode } from '../../common/types.js';
 import { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE } from "../../types/builtin-types.js";
 import { JSON_TYPE } from "../../types/json-type.js";
 import { typeRegistry } from "../../types/registry.js";
+import { castCanYieldNull } from "../../types/cast-semantics.js";
 import { collationConflictError, isComparisonOperator, mergePropagatedCollation, resolveComparisonCollation } from "../analysis/comparison-collation.js";
 
 export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
@@ -705,9 +706,10 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 		const operandType = this.operand.getType();
 		const targetType = this.expression.targetType;
 
-		// Resolve through inferType, not getTypeOrDefault: the emitter (runtime/emit/cast.ts)
-		// uses inferType, and the two disagree for any name that misses the registry but
-		// matches an affinity rule (`cast(5 as nvarchar)` produces TEXT, not BLOB).
+		// Resolve through inferType, not getTypeOrDefault: this is the single resolution
+		// of the target name — `runtime/emit/cast.ts` reads it back off this node — and
+		// the two lookups disagree for any name that misses the registry but matches an
+		// affinity rule (`cast(5 as nvarchar)` produces TEXT, not BLOB).
 		const logicalType = typeRegistry.inferType(targetType);
 
 		return {
@@ -715,9 +717,11 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 			logicalType,
 			// A converting CAST is nullable even from a non-null operand: `cast('' as integer)`
 			// is null because INTEGER's parse maps the empty string to null, and a conversion
-			// that fails outright now yields null rather than the unconverted operand.
-			// A cast to the operand's own type converts nothing, so it keeps its nullability.
-			nullable: operandType.nullable || logicalType !== operandType.logicalType,
+			// that fails outright yields null rather than the unconverted operand. A cast to
+			// the operand's own type converts nothing, and TEXT/BLOB convert every non-null
+			// operand (`castCanYieldNull`), so both keep the operand's nullability.
+			nullable: operandType.nullable
+				|| (logicalType !== operandType.logicalType && castCanYieldNull(logicalType)),
 			isReadOnly: operandType.isReadOnly,
 			collationName: logicalType.isTextual ? operandType.collationName : undefined,
 			collationSource: logicalType.isTextual ? operandType.collationSource : undefined,

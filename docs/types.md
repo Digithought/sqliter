@@ -453,19 +453,24 @@ defect. Known cases:
 `CAST` is the settled case, and states the rule the others must meet: it stays
 lenient — it never throws — but it never produces a value outside the type it
 advertises either. When the target type's `parse` throws, `castFallback`
-(`runtime/emit/cast.ts`) applies SQLite's numeric/text/blob fallbacks (`0`,
+(`types/cast-semantics.ts`) applies SQLite's numeric/text/blob fallbacks (`0`,
 `0.0`, `String(v)`, UTF-8 bytes — each a valid member of its own type); for
 every other target it keeps the operand only when the target type's own
 `validate` accepts it, and yields NULL otherwise. `parse` reads its input as
 source *text*, so `validate` is the right question to ask: a bare string is a
 legitimate JSON string scalar that `JSON_TYPE.parse` nonetheless rejects.
-Because a converting cast can now produce NULL from a non-null operand,
-`CastNode.getType()` reports `nullable` for any cast that changes the logical
-type. The planner resolves the target name with the same `inferType` the emitter
-uses, so a name that misses the registry but matches an affinity rule
-(`nvarchar` → TEXT) is described identically on both sides; a cast to an alias of
-the operand's own type is therefore recognized as value-preserving and no longer
-blocks an index seek.
+
+Because a converting cast can produce NULL from a non-null operand,
+`CastNode.getType()` reports `nullable` for a cast that changes the logical type
+— except to TEXT or BLOB, which convert *every* non-null operand and so cannot
+introduce a NULL (`castCanYieldNull`, same module, is the one place that table
+lives). The exception matters at the write end: a `not null` lens column over
+`cast(x as text)` is sound and must still deploy, while the same shape over a
+temporal or JSON target is not and is correctly blocked. The emitter reads the
+resolved target type back off `CastNode.getType()` rather than re-resolving the
+name, so the plan and the runtime cannot disagree — they previously did for a
+name that misses the registry but matches an affinity rule (`nvarchar` → TEXT),
+which made a value-preserving cast read as converting and block an index seek.
 
 ### Explicit Conversion
 

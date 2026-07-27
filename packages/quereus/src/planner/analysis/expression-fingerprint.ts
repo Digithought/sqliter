@@ -70,6 +70,10 @@ export function fingerprintExpression(node: ScalarPlanNode): string {
 
 		case PlanNodeType.Cast: {
 			const ca = node as unknown as CastNode;
+			// NOTE: keys off the written target name, so `cast(x as varchar)` and
+			// `cast(x as text)` fingerprint apart even though both resolve to TEXT. Only
+			// costs a missed CSE (never an over-merge); switch to
+			// `ca.getType().logicalType.name` if alias-spelled casts ever need to share.
 			return `CA:${ca.expression.targetType}(${fingerprintExpression(ca.operand)})`;
 		}
 
