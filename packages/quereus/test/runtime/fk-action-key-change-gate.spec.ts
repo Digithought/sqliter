@@ -75,10 +75,12 @@ describe('runtime FK action gate: untouched referenced column emits no child eve
 
 	it('ON UPDATE SET NULL (non-nullable child column): untouched column must succeed as a no-op, not raise NOT NULL', async () => {
 		// Before the fix this raised `NOT NULL constraint failed: c.p_id` — the action
-		// re-issued unconditionally and tripped the child's own NOT NULL default.
+		// re-issued unconditionally and tripped the child's NOT NULL. Spelled out rather
+		// than leaning on Quereus's NOT NULL column default, so the case keeps testing
+		// what it claims if that default ever changes.
 		await db.exec(`
 			create table p (id integer primary key, other integer);
-			create table c (cid integer primary key, p_id integer,
+			create table c (cid integer primary key, p_id integer not null,
 				foreign key (p_id) references p(id) on update set null);
 			insert into p values (1, 100);
 			insert into c values (10, 1);

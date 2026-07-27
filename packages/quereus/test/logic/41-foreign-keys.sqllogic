@@ -936,13 +936,14 @@ SELECT p_id FROM fkgn_child WHERE cid = 10;
 DROP TABLE fkgn_child;
 DROP TABLE fkgn_parent;
 
--- SET NULL, non-nullable child column (bare INTEGER — NOT NULL by default in
--- Quereus): before the fix, an update leaving the referenced column alone still
--- re-issued the child SET NULL and tripped NOT NULL. It must now succeed as a
--- no-op on the child. This is the case most likely to regress unnoticed, since
--- the symptom was an error rather than silently bad data.
+-- SET NULL, non-nullable child column: before the fix, an update leaving the
+-- referenced column alone still re-issued the child SET NULL and tripped NOT NULL.
+-- It must now succeed as a no-op on the child. This is the case most likely to
+-- regress unnoticed, since the symptom was an error rather than silently bad data.
+-- NOT NULL is spelled out even though it is Quereus's column default, so the case
+-- keeps testing what it claims if that default ever changes.
 CREATE TABLE fkgnn_parent (id INTEGER PRIMARY KEY, other INTEGER);
-CREATE TABLE fkgnn_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+CREATE TABLE fkgnn_child (cid INTEGER PRIMARY KEY, p_id INTEGER NOT NULL,
     FOREIGN KEY (p_id) REFERENCES fkgnn_parent(id) ON UPDATE SET NULL);
 
 INSERT INTO fkgnn_parent VALUES (1, 100);
@@ -976,4 +977,25 @@ SELECT p_id FROM fkgc_child WHERE cid = 10;
 
 DROP TABLE fkgc_child;
 DROP TABLE fkgc_parent;
+
+-- Composite CASCADE: the gate asks whether ANY referenced column changed, so a
+-- parent update that moves only the second key column must still cascade, while
+-- one that moves neither must not fire at all.
+CREATE TABLE fkgmc_parent (a INTEGER, b INTEGER, other INTEGER, PRIMARY KEY (a, b));
+CREATE TABLE fkgmc_child (cid INTEGER PRIMARY KEY, ref_a INTEGER, ref_b INTEGER,
+    FOREIGN KEY (ref_a, ref_b) REFERENCES fkgmc_parent(a, b) ON UPDATE CASCADE);
+
+INSERT INTO fkgmc_parent VALUES (1, 2, 100);
+INSERT INTO fkgmc_child VALUES (10, 1, 2);
+
+UPDATE fkgmc_parent SET other = 111 WHERE a = 1 AND b = 2;
+SELECT ref_a, ref_b FROM fkgmc_child WHERE cid = 10;
+→ [{"ref_a":1,"ref_b":2}]
+
+UPDATE fkgmc_parent SET b = 20 WHERE a = 1 AND b = 2;
+SELECT ref_a, ref_b FROM fkgmc_child WHERE cid = 10;
+→ [{"ref_a":1,"ref_b":20}]
+
+DROP TABLE fkgmc_child;
+DROP TABLE fkgmc_parent;
 

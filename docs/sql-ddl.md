@@ -1066,6 +1066,8 @@ When `pragma foreign_keys = on` (the default):
 - **Parent-side DELETE/UPDATE with SET NULL:** Sets child FK columns to NULL.
 - **Parent-side DELETE/UPDATE with SET DEFAULT:** Sets child FK columns to their default values.
 
+On UPDATE, all three propagating actions (CASCADE / SET NULL / SET DEFAULT) apply the same short-circuit as the RESTRICT check above: if the update leaves every parent column the FK references at its old value, the action does not fire and child rows are not written at all — an update to an unrelated parent column never touches, re-points, or emits a data-change event for the children.
+
 Cascade cycle detection prevents infinite recursion when cascading actions chain across multiple tables.
 
 **Examples:**
