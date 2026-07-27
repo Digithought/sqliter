@@ -276,6 +276,22 @@ export class ColumnVersionStore {
   }
 
   /**
+   * Queue deletion of ONE column's cell record into `batch`, whether or not a
+   * committed record exists — the caller may be removing a record that is only
+   * STAGED in this same batch (the local-capture delete cleanup; see
+   * `deleteRowVersionsAndLogEntries`).
+   */
+  deleteColumnVersionBatch(
+    batch: WriteBatch,
+    schemaName: string,
+    tableName: string,
+    pk: SqlValue[],
+    column: string
+  ): void {
+    batch.delete(buildColumnVersionKey(schemaName, tableName, this.identity(schemaName, tableName, pk), column));
+  }
+
+  /**
    * Queue deletion of every column version of a row into `batch`, returning the
    * versions that were removed (column → version). A column in `keepColumns` is
    * skipped entirely — neither staged for deletion nor included in the returned

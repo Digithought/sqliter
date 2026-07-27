@@ -5,7 +5,7 @@
  * this context instead of accessing SyncManagerImpl internals directly.
  */
 
-import type { KVStore } from '@quereus/store';
+import type { KVStore, WriteBatch } from '@quereus/store';
 import type { SqlValue } from '@quereus/quereus';
 import type { HLCManager, HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
@@ -17,6 +17,7 @@ import type { QuarantineStore } from '../metadata/quarantine.js';
 import type { BasisLifecycleStore } from '../metadata/basis-lifecycle.js';
 import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult, UnknownTableDisposition } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
+import type { StagedRowState } from './staged-transaction-metadata.js';
 import { SYNC_KEY_PREFIX, type PkKeying } from '../metadata/keys.js';
 
 /**
@@ -94,8 +95,9 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
 }
 
 /**
- * Delete every column version of a row together with the change-log entries that
- * index them, atomically.
+ * Stage the deletion of every column version of a row, together with the
+ * change-log entries that index them, into the caller's `batch`. The caller
+ * owns the write — nothing is committed here.
  *
  * The `cl:` change log is a derived HLC-ordered index over live `cv:`/`tb:`
  * records: `collectChangesSince` resolves each entry back to its record and drops
@@ -105,8 +107,8 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
  * keeps the change log proportional to LIVE data instead of to the replica's
  * lifetime delete volume.
  *
- * Both stores' deletions share one `WriteBatch`, so no crash can leave the index
- * and the data disagreeing.
+ * Both stores' deletions share the one `WriteBatch`, so no crash can leave the
+ * index and the data disagreeing.
  *
  * Used by both delete paths — local DML capture (`recordDataEvent`) and inbound
  * apply (`commitChangeMetadata`) — which must stay symmetric: a relay runs almost
@@ -119,30 +121,55 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
  * both the `cv:` delete and its paired `cl:` delete skip them. Empty/absent for
  * every caller unless resurrection is on.
  *
- * KNOWN LIMITATION (pre-dates this helper; the LOCAL half of
- * `sync-delete-cleanup-misses-same-batch-writes`, tracked as
- * `sync-local-capture-read-your-own-writes`): the scan reads COMMITTED store
- * state, so on the local-capture path it neither sees nor is seen by writes still
- * pending in the transaction's own batch — a row's versions survive its same-
- * transaction delete, leaking the very `cv:`/`cl:` pair this helper exists to
- * reclaim. The inbound-apply half (a same-batch reinsert wiped back out) is fixed
- * by the reconciliation + `keepColumns` above.
+ * `staged` is the local-capture path's read-your-own-writes overlay state for
+ * the row (see `staged-transaction-metadata.ts`): the committed scan cannot see
+ * cell records the transaction has only STAGED into `batch`, so the column set
+ * here is (committed scan) ∪ (staged live columns), each `cl:` removal keyed by
+ * the staged HLC where one exists (the committed entry's removal was already
+ * staged when the cell was rewritten). A cleared row's committed columns not
+ * re-staged since are skipped — the clear that set `rowCleared` staged their
+ * removals already. Absent on the inbound path, whose batch is committed before
+ * cleanup runs.
  */
 export async function deleteRowVersionsAndLogEntries(
 	ctx: SyncContext,
+	batch: WriteBatch,
 	schema: string,
 	table: string,
 	pk: SqlValue[],
-	keepColumns?: ReadonlySet<string>,
+	options?: {
+		keepColumns?: ReadonlySet<string>;
+		staged?: StagedRowState;
+	},
 ): Promise<void> {
-	const batch = ctx.kv.batch();
-	const removed = await ctx.columnVersions.deleteRowVersionsBatch(batch, schema, table, pk, keepColumns);
-	if (removed.size === 0) return;
+	const keepColumns = options?.keepColumns;
+	const staged = options?.staged;
 
+	const removed = await ctx.columnVersions.deleteRowVersionsBatch(batch, schema, table, pk, keepColumns);
+
+	// `cl:` entry HLC per column: committed HLCs, overridden by the staged HLC
+	// where this transaction rewrote the cell.
+	const entryHlcByColumn = new Map<string, HLC>();
 	for (const [column, version] of removed) {
-		ctx.changeLog.deleteEntryBatch(batch, version.hlc, 'column', schema, table, pk, column);
+		if (staged?.rowCleared && !staged.stagedColumns.has(column)) continue;
+		entryHlcByColumn.set(column, version.hlc);
 	}
-	await batch.write();
+	if (staged) {
+		for (const [column, hlc] of staged.stagedColumns) {
+			if (keepColumns?.has(column)) continue;
+			entryHlcByColumn.set(column, hlc);
+			if (!removed.has(column)) {
+				// Staged-only cell (this transaction created it): no committed record
+				// for the scan to find, so stage its removal explicitly. Batch ordering
+				// makes this later delete win over the earlier staged put.
+				ctx.columnVersions.deleteColumnVersionBatch(batch, schema, table, pk, column);
+			}
+		}
+	}
+
+	for (const [column, hlc] of entryHlcByColumn) {
+		ctx.changeLog.deleteEntryBatch(batch, hlc, 'column', schema, table, pk, column);
+	}
 }
 
 /**
@@ -188,7 +215,7 @@ export function throwIfApplyErrors(ctx: SyncContext, result: ApplyToStoreResult)
  */
 export function persistHLCStateBatch(
 	ctx: SyncContext,
-	batch: import('@quereus/store').WriteBatch,
+	batch: WriteBatch,
 ): void {
 	const state = ctx.hlcManager.getState();
 	const buffer = new Uint8Array(10);

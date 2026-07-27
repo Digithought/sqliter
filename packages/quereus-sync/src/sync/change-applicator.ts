@@ -824,11 +824,17 @@ export async function commitChangeMetadata(
 	// delete must leave no more index garbage behind than a local one, and this is the
 	// path a relay runs almost exclusively. `keepColumns` spares the cell records this
 	// same batch wrote past the delete (allowResurrection winners) — the scan reads
-	// committed storage, which by now INCLUDES them.
+	// committed storage, which by now INCLUDES them (the metadata batch above is
+	// already written, so no staged overlay is needed here; each cleanup commits in
+	// its own batch).
 	for (const resolved of deleteWinners.values()) {
 		const change = resolved.change;
 		if (change.type !== 'delete') continue;
-		await deleteRowVersionsAndLogEntries(ctx, change.schema, change.table, change.pk, resolved.keepColumns);
+		const cleanupBatch = ctx.kv.batch();
+		await deleteRowVersionsAndLogEntries(ctx, cleanupBatch, change.schema, change.table, change.pk, {
+			keepColumns: resolved.keepColumns,
+		});
+		await cleanupBatch.write();
 	}
 }
 

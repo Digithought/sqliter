@@ -144,12 +144,12 @@ describe('change log orphan cleanup', () => {
       expect(after).to.deep.equal(before);
     });
 
-    // Guards the ordering `recordDataEvent` relies on: cleanup runs against
-    // COMMITTED state in its own batch, before the transaction's outer batch lands.
-    // A delete followed by a reinsert of the same pk in ONE transaction must
-    // therefore keep the reinsert — the cleanup ran before those versions existed.
-    // (The reverse order does NOT hold; see
-    // `sync-delete-cleanup-misses-same-batch-writes`.)
+    // A delete followed by a reinsert of the same pk in ONE transaction keeps the
+    // reinsert: the delete's cleanup stages removals of the row's cells into the
+    // transaction's batch, the reinsert stages fresh puts AFTER them, and batch
+    // ordering (later op on a key wins) lets the puts survive. The reinsert reads
+    // the row as deleted through the transaction's staged-metadata overlay, so —
+    // like a first write — it records no before-image and deletes no prior entry.
     it('keeps a reinsert that follows a delete of the same row in one transaction', async () => {
       await insert(1, ['x', 'y', 'z']);
 
@@ -166,6 +166,225 @@ describe('change log orphan cleanup', () => {
       // 3 live column entries + the tombstone's delete entry (the row is
       // tombstoned AND rewritten; LWW resolves by HLC, both stay indexed).
       expect(await countChangeLog(manager)).to.equal(4);
+    });
+
+    // A transaction that touches one row MORE THAN ONCE must record the same
+    // metadata as the equivalent sequence of separate transactions — the capture
+    // path reads its own staged writes through a per-transaction overlay (see
+    // staged-transaction-metadata.ts). Each case runs the same events both ways
+    // (one grouped transaction vs. one transaction per event, on a twin manager)
+    // and asserts identical HLC-independent state, plus the absolute counts.
+    describe('same-transaction row reuse (read-your-own-writes)', () => {
+      type DataEvent = Parameters<FakeTransactionSource['commitData']>[0];
+
+      let twinSource: FakeTransactionSource;
+      let twin: SyncManagerImpl;
+
+      beforeEach(async () => {
+        twinSource = new FakeTransactionSource();
+        twin = await SyncManagerImpl.create(
+          new InMemoryKVStore(),
+          twinSource,
+          { ...DEFAULT_SYNC_CONFIG, ...EXPIRE_IMMEDIATELY },
+          new SyncEventEmitterImpl(),
+        );
+      });
+
+      /** Same seed row on both managers, each as its own committed transaction. */
+      const seedBoth = async (pk: number, row: SqlValue[]): Promise<void> => {
+        const event: DataEvent = { type: 'insert', schemaName: 'main', tableName: 'users', key: [pk], newRow: row };
+        source.commitData(event);
+        twinSource.commitData(event);
+        await settle();
+      };
+
+      /** The events under test: ONE transaction on `manager`, one-per-event on `twin`. */
+      const runBothWays = async (events: DataEvent[]): Promise<void> => {
+        source.commit({ data: events });
+        for (const event of events) twinSource.commitData(event);
+        await settle();
+      };
+
+      /**
+       * Everything comparable between the two managers. HLCs are excluded (the
+       * clocks tick independently); values, before-image chains, and counts of
+       * every record kind must agree exactly.
+       */
+      async function metadataShape(m: SyncManagerImpl, pk: number): Promise<unknown> {
+        const versions = await m.columnVersions.getRowVersions('main', 'users', [pk]);
+        return {
+          cells: [...versions.entries()]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([column, v]) => ({ column, value: v.value, priorValue: v.priorValue, hasPrior: v.priorHlc !== undefined })),
+          logCount: await countChangeLog(m),
+          tombstones: await countTombstones(m),
+        };
+      }
+
+      const assertMatchesTwin = async (...pks: number[]): Promise<void> => {
+        for (const pk of pks) {
+          expect(await metadataShape(manager, pk)).to.deep.equal(await metadataShape(twin, pk));
+        }
+      };
+
+      // Pre-fix: 3 leaked cell records and 4 log entries — the delete's cleanup
+      // scanned committed storage and could not see the cells the same
+      // transaction had only staged.
+      it('insert then delete of one row leaves no cell records', async () => {
+        await runBothWays([
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['x', 'y', 'z'] },
+          { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'] },
+        ]);
+
+        await assertMatchesTwin(1);
+        expect((await manager.columnVersions.getRowVersions('main', 'users', [1])).size).to.equal(0);
+        expect(await countChangeLog(manager)).to.equal(1);   // the delete entry only
+      });
+
+      // Pre-fix: the rewritten column's cell record leaked (the scan cleaned the
+      // two columns the transaction did not touch, and missed the staged one).
+      it('update then delete of one row leaves no cell records', async () => {
+        await seedBoth(1, ['x', 'y', 'z']);
+        await runBothWays([
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'], newRow: ['x', 'Y', 'z'] },
+          { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'Y', 'z'] },
+        ]);
+
+        await assertMatchesTwin(1);
+        expect((await manager.columnVersions.getRowVersions('main', 'users', [1])).size).to.equal(0);
+        expect(await countChangeLog(manager)).to.equal(1);   // the delete entry only
+      });
+
+      // Pre-fix: TWO change-log entries survived for the twice-updated column —
+      // the second update's dedup read committed storage, found the pre-transaction
+      // version, and deleted that entry (already gone) instead of the first
+      // update's. Two entries for one key breaks collectChangesSince's
+      // LOAD-BEARING INVARIANT (survivor's log HLC == its record's HLC).
+      it('two updates of one column keep one cell and one log entry, chaining the before-image', async () => {
+        await seedBoth(1, ['x', 'y', 'z']);
+        await runBothWays([
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'], newRow: ['x', 'Y1', 'z'] },
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'Y1', 'z'], newRow: ['x', 'Y2', 'z'] },
+        ]);
+
+        await assertMatchesTwin(1);
+        const versions = await manager.columnVersions.getRowVersions('main', 'users', [1]);
+        expect(versions.size).to.equal(3);                   // seed's col_0/col_2 plus the rewritten col_1
+        expect(versions.get('col_1')!.value).to.equal('Y2');
+        // The second update's before-image is the FIRST update's version, exactly
+        // as two separate transactions would record — not the pre-transaction seed.
+        expect(versions.get('col_1')!.priorValue).to.equal('Y1');
+        expect(await countChangeLog(manager)).to.equal(3);   // one entry per live cell
+      });
+
+      // Pre-fix: the reinserted cell records leaked past the second delete (1
+      // cell measured) and 3 log entries survived, two of them for one key.
+      it('delete, reinsert, delete of one row leaves no cell records', async () => {
+        await seedBoth(1, ['x', 'y', 'z']);
+        await runBothWays([
+          { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'] },
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a', 'b', 'c'] },
+          { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['a', 'b', 'c'] },
+        ]);
+
+        await assertMatchesTwin(1);
+        expect((await manager.columnVersions.getRowVersions('main', 'users', [1])).size).to.equal(0);
+        expect(await countChangeLog(manager)).to.equal(1);   // the last delete's entry only
+        expect(await countTombstones(manager)).to.equal(1);
+      });
+
+      it('does not bleed one row\'s delete into another row touched by the same transaction', async () => {
+        await seedBoth(1, ['x', 'y', 'z']);
+        await seedBoth(2, ['p', 'q', 'r']);
+        await runBothWays([
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'], newRow: ['x', 'Y', 'z'] },
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [2], oldRow: ['p', 'q', 'r'], newRow: ['p', 'Q', 'r'] },
+          { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'Y', 'z'] },
+        ]);
+
+        await assertMatchesTwin(1, 2);
+        expect((await manager.columnVersions.getRowVersions('main', 'users', [1])).size).to.equal(0);
+        const survivor = await manager.columnVersions.getRowVersions('main', 'users', [2]);
+        expect(survivor.size).to.equal(3);
+        expect(survivor.get('col_1')!.value).to.equal('Q');
+        // Row 2's three entries plus row 1's delete entry.
+        expect(await countChangeLog(manager)).to.equal(4);
+      });
+
+      // The overlay keys rows by pk identity derived through the schema oracle —
+      // exercise that derivation with REAL column names, not only the col_N
+      // fallback the oracle-less managers above use.
+      it('works under a real column-name oracle', async () => {
+        const makeOracleManager = async (): Promise<{ src: FakeTransactionSource; mgr: SyncManagerImpl }> => {
+          const src = new FakeTransactionSource();
+          const mgr = await SyncManagerImpl.create(
+            new InMemoryKVStore(),
+            src,
+            { ...DEFAULT_SYNC_CONFIG, ...EXPIRE_IMMEDIATELY },
+            new SyncEventEmitterImpl(),
+            undefined,
+            usersSchemaOracle(['id', 'name', 'note']),
+          );
+          return { src, mgr };
+        };
+        const batched = await makeOracleManager();
+        const separate = await makeOracleManager();
+
+        const seed: DataEvent = { type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: [1, 'n0', 't0'] };
+        const events: DataEvent[] = [
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: [1, 'n0', 't0'], newRow: [1, 'n1', 't0'] },
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: [1, 'n1', 't0'], newRow: [1, 'n2', 't0'] },
+        ];
+        batched.src.commitData(seed);
+        separate.src.commitData(seed);
+        await settle();
+        batched.src.commit({ data: events });
+        for (const event of events) separate.src.commitData(event);
+        await settle();
+
+        const versions = await batched.mgr.columnVersions.getRowVersions('main', 'users', [1]);
+        expect([...versions.keys()].sort()).to.deep.equal(['id', 'name', 'note']);
+        expect(versions.get('name')!.value).to.equal('n2');
+        expect(versions.get('name')!.priorValue).to.equal('n1');
+        expect(await countChangeLog(batched.mgr)).to.equal(3);
+        expect(await countChangeLog(batched.mgr)).to.equal(await countChangeLog(separate.mgr));
+
+        // And the delete cleanup, keyed through the same oracle-derived identity.
+        batched.src.commitData({ type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: [1, 'n2', 't0'] });
+        await settle();
+        expect((await batched.mgr.columnVersions.getRowVersions('main', 'users', [1])).size).to.equal(0);
+        expect(await countChangeLog(batched.mgr)).to.equal(1);
+      });
+
+      // The overlay changes what a transaction STORES, never what it reports:
+      // listeners still see one inline change per event, in event order.
+      it('emits the same inline change list a transaction reported before', async () => {
+        const events = new SyncEventEmitterImpl();
+        const emitted: Array<{ type: string; column?: string; value?: SqlValue }> = [];
+        events.onLocalChange(e => {
+          for (const c of e.changes) {
+            emitted.push({ type: c.type, ...(c.type === 'column' ? { column: c.column, value: c.value } : {}) });
+          }
+        });
+        const src = new FakeTransactionSource();
+        await SyncManagerImpl.create(
+          new InMemoryKVStore(), src, { ...DEFAULT_SYNC_CONFIG }, events,
+        );
+
+        src.commit({
+          data: [
+            { type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['x', 'y'] },
+            { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y'] },
+          ],
+        });
+        await settle();
+
+        expect(emitted).to.deep.equal([
+          { type: 'column', column: 'col_0', value: 'x' },
+          { type: 'column', column: 'col_1', value: 'y' },
+          { type: 'delete' },
+        ]);
+      });
     });
 
     it('cleans up a column whose name contains the key separator', async () => {

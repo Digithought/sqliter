@@ -326,6 +326,21 @@ commit onto a tail promise (`enqueueTransactionCommit`), so N+1's reads always o
 N's durable writes. The tick itself is synchronous and already ordered; only the
 post-tick dedup reads need this serialization.
 
+**Local capture reads its own writes.** Within one transaction, every metadata read
+(the prior column version / tombstone dedup lookups, and the delete cleanup's column
+set) consults a per-transaction staged-metadata overlay
+(`staged-transaction-metadata.ts`) *before* committed storage, because the
+transaction's own writes are still pending in its single `kvBatch`. A transaction
+that touches one row more than once — update then update, insert then delete, delete
+then reinsert then delete — therefore records exactly the metadata the equivalent
+sequence of separate transactions would: the later event sees the earlier one's
+staged cell versions and tombstone, dedupes the right change-log entry, chains the
+right before-image, and the delete cleanup removes staged cells as well as committed
+ones (staging its removals into the same `kvBatch`; the batch's later-op-wins
+ordering resolves put-then-delete and delete-then-put per key). Staging the cleanup
+into `kvBatch` also makes the pseudocode's atomicity claim complete: *all* of a
+transaction's metadata — including the delete cleanup — lands in one atomic batch.
+
 `opSeq` ordering semantics: **intra-table** order is true write order (a coordinator
 buffers its table's events in DML order); **cross-table** order is the deterministic
 per-coordinator commit order, not the global DML interleave. This is sufficient for
@@ -417,7 +432,10 @@ current version. Column entries are deduped when a newer value overwrites the pr
 delete entries are deduped when a newer tombstone overwrites the prior one — so a
 `delete → reinsert → delete` key reuse no longer leaves a stale delete entry that could
 re-attribute to the later tombstone's HLC and split that transaction across rounds. The
-overwrite dedup covers entries written across *separate* writes/applies. The apply path
+overwrite dedup covers entries written across *separate* writes/applies; repeats
+*within* one local transaction are covered by the write side's staged-metadata overlay
+(§ Write side → *Local capture reads its own writes*), which makes the later touch see
+— and dedupe — the earlier touch's staged entry. The apply path
 (`commitChangeMetadata`) additionally **collapses in-batch repeats**: when two versions
 of one key arrive in a single `applyChanges` call they resolve against the same
 pre-batch prior version, so neither sees the other — only the max-HLC winner per key is

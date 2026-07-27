@@ -77,6 +77,7 @@ import type {
 import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCStateBatch, toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
+import { StagedTransactionMetadata } from './staged-transaction-metadata.js';
 import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl, drainReappearedTables } from './change-applicator.js';
 import { buildTransactionChangeSets } from './change-grouping.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
@@ -733,6 +734,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 			const kvBatch = this.kv.batch();
 			const changes: Change[] = [];
+			// Read-your-own-writes overlay: everything staged into kvBatch is noted
+			// here so a later event of the SAME transaction reads its own staged
+			// metadata instead of pre-transaction storage (see
+			// staged-transaction-metadata.ts). Lives for this one commit.
+			const staged = new StagedTransactionMetadata((schema, table) => this.getPkKeying(schema, table));
 
 			// DDL before DML: migrations take the lowest opSeqs.
 			const versionCounters = new Map<string, number>();
@@ -741,7 +747,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			}
 
 			for (const event of localData) {
-				await this.recordDataEvent(kvBatch, event, nextHlc, changes);
+				await this.recordDataEvent(kvBatch, event, nextHlc, changes, staged);
 			}
 
 			// Persist HLC clock state (wallTime/counter only — opSeq is never persisted).
@@ -875,12 +881,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	/**
 	 * Record one local data-change event: a tombstone (delete) or the changed
 	 * column versions (insert/update). Each recorded fact consumes one `opSeq`.
+	 *
+	 * All reads of the row's current metadata go overlay-first (`staged`), so a
+	 * transaction that touches one row more than once records the same metadata
+	 * the equivalent sequence of separate transactions would — and every write
+	 * staged into `batch` is noted back into the overlay.
 	 */
 	private async recordDataEvent(
 		batch: WriteBatch,
 		event: DatabaseDataChangeEvent,
 		nextHlc: () => HLC,
 		changes: Change[],
+		staged: StagedTransactionMetadata,
 	): Promise<void> {
 		const { schemaName, tableName, type, oldRow, newRow } = event;
 		const pk = event.key;
@@ -891,14 +903,16 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 		if (type === 'delete') {
 			// Dedupe the change-log delete entry the same way columns are deduped: if a
-			// prior tombstone exists for this pk (a delete→reinsert→delete key reuse),
-			// its stale delete entry must go, so at most one delete entry survives per pk
-			// with HLC equal to the current tombstone. This keeps collectChangesSince's
-			// boundary detection (keyed on the log HLC) in lockstep with grouping (keyed
-			// on the resolved tombstone HLC) — see its LOAD-BEARING INVARIANT.
-			const existing = await this.tombstones.getTombstone(schemaName, tableName, pk);
-			if (existing) {
-				this.changeLog.deleteEntryBatch(batch, existing.hlc, 'delete', schemaName, tableName, pk);
+			// prior tombstone exists for this pk (a delete→reinsert→delete key reuse —
+			// staged by this same transaction, or committed), its stale delete entry
+			// must go, so at most one delete entry survives per pk with HLC equal to
+			// the current tombstone. This keeps collectChangesSince's boundary
+			// detection (keyed on the log HLC) in lockstep with grouping (keyed on the
+			// resolved tombstone HLC) — see its LOAD-BEARING INVARIANT.
+			const existingHlc = staged.tombstoneHlc(schemaName, tableName, pk)
+				?? (await this.tombstones.getTombstone(schemaName, tableName, pk))?.hlc;
+			if (existingHlc) {
+				this.changeLog.deleteEntryBatch(batch, existingHlc, 'delete', schemaName, tableName, pk);
 			}
 
 			const hlc = nextHlc();
@@ -911,8 +925,15 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			this.changeLog.recordDeletionBatch(batch, hlc, schemaName, tableName, pk);
 			// The row's column versions die here, so their change-log entries must die
 			// with them — otherwise every deleted row leaves one orphan entry per column
-			// behind forever (see deleteRowVersionsAndLogEntries).
-			await deleteRowVersionsAndLogEntries(this, schemaName, tableName, pk);
+			// behind forever (see deleteRowVersionsAndLogEntries). The cleanup stages
+			// into this same `batch`, covering cells the transaction itself staged
+			// (batch ordering makes these later removals win), and consults the row's
+			// overlay state — captured BEFORE the notes below reset it.
+			await deleteRowVersionsAndLogEntries(this, batch, schemaName, tableName, pk, {
+				staged: staged.rowState(schemaName, tableName, pk),
+			});
+			staged.noteRowCleared(schemaName, tableName, pk);
+			staged.noteTombstone(schemaName, tableName, pk, hlc);
 
 			const change: RowDeletion = {
 				type: 'delete',
@@ -924,7 +945,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			};
 			changes.push(change);
 		} else if (newRow) {
-			await this.recordColumnVersions(batch, schemaName, tableName, pk, oldRow, newRow, nextHlc, changes);
+			await this.recordColumnVersions(batch, schemaName, tableName, pk, oldRow, newRow, nextHlc, changes, staged);
 		}
 	}
 
@@ -937,6 +958,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		newRow: Row,
 		nextHlc: () => HLC,
 		changes: Change[],
+		staged: StagedTransactionMetadata,
 	): Promise<void> {
 		// `col_${i}` fallback below is the live path for a RELAY-ONLY manager (no
 		// schema oracle at all). An oracle-wired manager can no longer reach here for
@@ -950,9 +972,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			if (!oldRow || oldValue !== newValue) {
 				const column = columnNames?.[i] ?? `col_${i}`;
 
-				const oldVersion = await this.columnVersions.getColumnVersion(
-					schemaName, tableName, pk, column
-				);
+				// Overlay first: a cell this same transaction rewrote reads its staged
+				// version (so the staged entry is the one deduped, and the before-image
+				// chains correctly); one it deleted reads as absent (a reinsert after a
+				// delete records no before-image, exactly like a first write).
+				const stagedCell = staged.columnVersion(schemaName, tableName, pk, column);
+				const oldVersion: ColumnVersionData | undefined = stagedCell !== undefined
+					? stagedCell ?? undefined
+					: await this.columnVersions.getColumnVersion(schemaName, tableName, pk, column);
 
 				if (oldVersion) {
 					this.changeLog.deleteEntryBatch(
@@ -976,6 +1003,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				const version: ColumnVersionData = { hlc, value: newValue, ...prior };
 				this.columnVersions.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
 				this.changeLog.recordColumnChangeBatch(batch, hlc, schemaName, tableName, pk, column);
+				staged.noteColumnVersion(schemaName, tableName, pk, column, version);
 
 				const change: ColumnChange = {
 					type: 'column',
