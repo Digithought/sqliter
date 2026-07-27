@@ -311,7 +311,7 @@ async function finalizeBootstrap(
  * grouped change (never re-split the key), so today the only cost is a
  * misgrouped write when both dotted-schema tables exist. If dotted schema names
  * ever become reachable, key on a delimiter that identifiers cannot contain
- * (e.g. length-prefixed, or ` `).
+ * (e.g. length-prefixed, or a NUL byte).
  */
 function groupChangesByTable(
   changes: DataChangeToApply[]
@@ -541,13 +541,18 @@ async function applySchemaChange(
   // consumed by it, marked remote, and dropped from the SyncManager's local-fact
   // capture — silently never replicated.
   if (change.ddl.trim() === '') {
-    // Only `alter_column` reaches here with no DDL today (see the origin-side
-    // warning in `recordSchemaMigration`, sync-manager-impl.ts). The migration
-    // still counts applied — it just runs nothing — so an operator watching this
-    // peer needs to see that a schema change arrived and was silently dropped.
+    // Deliberately NOT scoped to `alter_column`, unlike the origin-side warning in
+    // `recordSchemaMigration` (sync-manager-impl.ts): a peer on an older build can
+    // still send a blank drop/index migration, and that is equally worth hearing.
+    // The migration still counts applied — it just runs nothing — so an operator
+    // watching this peer needs to see that a schema change arrived and did nothing.
+    // NOTE: this returns before the `already-applied` check below, so a peer
+    // re-bootstrapping from zero re-warns for every blank migration it replays.
+    // Fine while alterations are rare; if it ever floods a log, dedupe per
+    // (schema, table, type) for the duration of one apply.
     console.warn(
       `[Sync] Received ${change.type} for ${change.schema}.${change.table} with no DDL — `
-        + `not applied; the receiving table's schema is unchanged`,
+        + `not applied; this peer's schema is unchanged`,
     );
     return;
   }

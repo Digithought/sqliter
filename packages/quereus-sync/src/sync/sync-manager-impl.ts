@@ -870,7 +870,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// nothing here reaches a peer, so a device that alters a table stays silently
 		// diverged unless an operator sees this.
 		// See tickets/backlog/feat-sync-replicate-alter-table.md.
-		if (migrationType === 'alter_column' && !ddl) {
+		if (migrationType === 'alter_column' && !ddl?.trim()) {
 			console.warn(
 				`[Sync] ${schemaName}.${objectName}: recording an ${migrationType} migration with no DDL — `
 					+ `this table alteration will NOT reach other synced devices`,

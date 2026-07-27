@@ -1616,17 +1616,21 @@ ALTER TABLE does **not** replicate. A column add / drop / alter records an
 empty statement and changes nothing on the receiver — a peer that alters a table
 stays silently diverged in shape. This is a known gap, not a bug to work around:
 the event a table alteration emits (`alter` / `table` plus the table name) does
-not describe *what* was altered, a rename reports only the new name, and one
-`ALTER TABLE` statement can decompose into several module-level events — so
-attaching the statement's DDL to the event is real design work, tracked
-separately in `feat-sync-replicate-alter-table`.
+not describe *what* was altered, a rename reports only the new name, and a
+declarative `apply schema` applies its diff as several separate alterations in
+one transaction (each its own event) — so attaching the originating DDL to the
+event is real design work, tracked separately in
+`feat-sync-replicate-alter-table`.
 
 Both ends log the gap rather than staying silent about it. The origin warns in
 `recordSchemaMigration` when it records an `alter_column` migration with no DDL,
 naming the schema and table and stating plainly that the alteration will not
-reach other devices. The receiver warns in `applySchemaChange`, immediately
-before the blank-DDL early return below, naming the migration type, schema and
-table. Neither warning changes behavior — the migration is still recorded (and
+reach other devices — one warning per altering event, so a multi-alteration
+`apply schema` names each one. The receiver warns in `applySchemaChange`, inside
+the blank-DDL early return below, naming the migration type, schema and table;
+that one is deliberately **not** scoped to `alter_column`, so a blank drop/index
+migration from a peer on an older build is reported too. Neither warning changes
+behavior — the migration is still recorded (and
 still advances the table's schema version, which the destructiveness comparison
 above depends on) and the blank-DDL migration is still skipped exactly as
 before.

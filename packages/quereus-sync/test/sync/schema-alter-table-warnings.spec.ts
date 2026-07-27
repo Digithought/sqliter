@@ -62,8 +62,12 @@ describe('alter table sync warnings', () => {
 			await localWrite(a, 'alter table orders add column qty integer');
 		});
 
-		expect(warns.some(w => w.includes('main.orders') && w.toLowerCase().includes('alter_column'))).to.equal(true);
-		expect(warns.some(w => w.toLowerCase().includes('not reach other synced devices'))).to.equal(true);
+		// One alter event → exactly one warning; the origin's wording ("will not reach
+		// other synced devices") is what distinguishes it from the receiver's.
+		const orderWarns = warns.filter(w => w.includes('main.orders'));
+		expect(orderWarns).to.have.length(1);
+		expect(orderWarns[0].toLowerCase()).to.include('alter_column');
+		expect(orderWarns[0].toLowerCase()).to.include('not reach other synced devices');
 
 		const versionAfter = await a.manager.schemaMigrations.getCurrentVersion('main', 'orders');
 		expect(versionAfter).to.equal(versionBefore + 1);
@@ -77,7 +81,12 @@ describe('alter table sync warnings', () => {
 			await relayAll(a, b);
 		});
 
-		expect(warns.some(w => w.includes('main.orders') && w.toLowerCase().includes('alter_column'))).to.equal(true);
+		// Must be the RECEIVER's warning, not an origin one leaking into the window:
+		// both name `main.orders` and `alter_column`, so key on the receive-side wording.
+		const receiveWarns = warns.filter(w => w.includes('main.orders') && w.includes('Received'));
+		expect(receiveWarns).to.have.length(1);
+		expect(receiveWarns[0]).to.include('alter_column');
+		expect(receiveWarns[0]).to.include('no DDL');
 
 		const versionAfter = await b.manager.schemaMigrations.getCurrentVersion('main', 'orders');
 		expect(versionAfter).to.equal(versionBefore + 1);
@@ -85,6 +94,33 @@ describe('alter table sync warnings', () => {
 		// The blank-DDL migration ran nothing — b's table shape is unchanged.
 		const columns = b.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase());
 		expect(columns).to.not.include('qty');
+	});
+
+	// ADD COLUMN is only one of the alterations that lose their DDL: rename, drop and
+	// constraint changes all emit the same bare `alter`/`table` event, so each must
+	// warn too — otherwise the gap stays silent for exactly the cases an operator is
+	// least likely to notice by looking at the data.
+	const ALTER_FORMS = [
+		'alter table orders rename column note to memo',
+		'alter table orders add constraint orders_memo_u unique (memo)',
+		'alter table orders drop column extra',
+	];
+
+	it('warns on the origin for every ALTER TABLE form, one warning each', async () => {
+		const peer = await makePeer('forms', {
+			createOrders: true,
+			ordersDdl: 'create table orders (id integer primary key, note text, extra text) using store',
+		});
+		try {
+			for (const sql of ALTER_FORMS) {
+				const warns = await captureWarnings(async () => { await localWrite(peer, sql); });
+				const orderWarns = warns.filter(w => w.includes('main.orders'));
+				expect(orderWarns, sql).to.have.length(1);
+				expect(orderWarns[0].toLowerCase(), sql).to.include('alter_column');
+			}
+		} finally {
+			await closePeer(peer);
+		}
 	});
 
 	it('never warns for create_table / drop_table / add_index / drop_index', async () => {
