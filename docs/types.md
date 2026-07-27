@@ -317,9 +317,15 @@ therefore take the collation from the argument, not from the backing column — 
 read-side rollup does so via the collation the rewrite matcher records alongside
 each stored partial (`MergeReagg.argCollation`).
 
-Known gap: **window** `min(x) over (…)` still ranks with a raw JS compare — the
-window registry (`schema/window-function.ts`) has no binding seam yet (tracked as
-`minmax-window-semantic-ordering`).
+**Window** `min(x) over (…)` / `max(x) over (…)` follow the same rule through the
+same seam. Window functions live in their own registry
+(`schema/window-function.ts`), so it carries its own `bindArgs` hook — taking the
+same `AggregateArgBinding` and routing through the same
+`createSemanticValueComparator` — applied by `bindWindowSchema` where
+`runtime/emit/window.ts` resolves each call site's schema. The window emitter has
+three execution shapes (the buffered frame walk, the streaming running
+accumulator, and the streaming sliding-frame scan) and all three fold through
+that one bound schema, so they cannot rank differently for the same query.
 
 ---
 

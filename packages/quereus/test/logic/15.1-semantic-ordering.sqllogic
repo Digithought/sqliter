@@ -334,3 +334,79 @@ select (json('{"a":1,"b":2}') = json('{"b":2,"a":1}')) as r;
 → [{"r":true}]
 
 drop table jv;
+
+-- === Window min()/max() follow the same rule as the aggregate ===
+--
+-- Window functions resolve through their own registry (schema/window-function.ts),
+-- so the emitter binds each call site's argument type + collation to the MIN/MAX
+-- step exactly as the aggregate does. `min(x) over (…)` must therefore equal
+-- `min(x)` over the same rows, and agree with `order by x limit 1`.
+
+create table wts (id integer primary key, dur timespan);
+insert into wts values (1,'PT30M'), (2,'PT1H'), (3,'PT2H'), (4,'P1D'), (5,'PT0S');
+
+-- Whole-partition frame: elapsed-time order. Text order would give mn=P1D, mx=PT30M.
+select distinct min(dur) over () as mn, max(dur) over () as mx from wts;
+→ [{"mn":"PT0S","mx":"P1D"}]
+
+-- The window form agrees with the aggregate form and with order by … limit 1.
+select distinct
+	(min(dur) over () = (select min(dur) from wts)) as min_eq_agg,
+	(min(dur) over () = (select dur from wts order by dur limit 1)) as min_eq_order,
+	(max(dur) over () = (select max(dur) from wts)) as max_eq_agg,
+	(max(dur) over () = (select dur from wts order by dur desc limit 1)) as max_eq_order
+from wts;
+→ [{"min_eq_agg":true,"min_eq_order":true,"max_eq_agg":true,"max_eq_order":true}]
+
+-- Running frame (unbounded preceding): tightens by elapsed time, so 'P1D' at id=4
+-- never becomes the minimum and 'PT0S' at id=5 does.
+select id, min(dur) over (order by id rows unbounded preceding) as rmn from wts order by id;
+→ [{"id":1,"rmn":"PT30M"},{"id":2,"rmn":"PT30M"},{"id":3,"rmn":"PT30M"},{"id":4,"rmn":"PT30M"},{"id":5,"rmn":"PT0S"}]
+
+-- Sliding frame (1 preceding .. 1 following): each window ranks independently.
+select id, min(dur) over (order by id rows between 1 preceding and 1 following) as mn,
+       max(dur) over (order by id rows between 1 preceding and 1 following) as mx
+from wts order by id;
+→ [{"id":1,"mn":"PT30M","mx":"PT1H"},{"id":2,"mn":"PT30M","mx":"PT2H"},{"id":3,"mn":"PT1H","mx":"P1D"},{"id":4,"mn":"PT0S","mx":"P1D"},{"id":5,"mn":"PT0S","mx":"P1D"}]
+
+drop table wts;
+
+-- Mixed storage classes in an ANY column. A raw JavaScript `<` never selects the
+-- number (both `5 < 'abc'` and `'abc' < 5` are false), so the window minimum used
+-- to be whichever non-null value arrived first.
+create table wany (id integer primary key, v any);
+insert into wany values (1,'abc'), (2,5), (3,'zz');
+
+select v from wany order by v;
+→ [{"v":5},{"v":"abc"},{"v":"zz"}]
+
+select distinct min(v) over () as mn, max(v) over () as mx from wany;
+→ [{"mn":5,"mx":"zz"}]
+
+drop table wany;
+
+-- Declared collation: NOCASE ranks 'a' below 'B'; BINARY would report mn=B, mx=a.
+create table wnc (id integer primary key, t text collate NOCASE);
+insert into wnc values (1,'B'), (2,'a'), (3,'c');
+
+select distinct min(t) over () as mn, max(t) over () as mx from wnc;
+→ [{"mn":"a","mx":"c"}]
+
+drop table wnc;
+
+-- Blobs compare bytewise, agreeing with the aggregate and with ORDER BY. Under a
+-- raw `<` two Uint8Arrays coerce to strings, which is neither byte order nor
+-- anything else meaningful.
+create table wbl (id integer primary key, b blob);
+insert into wbl values (1, x'ff00'), (2, x'0102'), (3, x'80');
+
+select id from wbl order by b;
+→ [{"id":2},{"id":3},{"id":1}]
+
+select distinct
+	(min(b) over () = (select min(b) from wbl)) as min_eq_agg,
+	(max(b) over () = (select max(b) from wbl)) as max_eq_agg
+from wbl;
+→ [{"min_eq_agg":true,"max_eq_agg":true}]
+
+drop table wbl;

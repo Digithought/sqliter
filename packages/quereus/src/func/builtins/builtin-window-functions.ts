@@ -1,9 +1,10 @@
-import { registerWindowFunction } from '../../schema/window-function.js';
+import { registerWindowFunction, type WindowFunctionBinding } from '../../schema/window-function.js';
 import { AggValue } from '../registration.js';
 import { INTEGER_TYPE, REAL_TYPE } from '../../types/builtin-types.js';
 import type { ScalarType } from '../../common/datatype.js';
-import type { DeepReadonly } from '../../common/types.js';
+import type { DeepReadonly, SqlValue } from '../../common/types.js';
 import type { LogicalType } from '../../types/logical-type.js';
+import { BINARY_COLLATION, compareSqlValuesFast, createSemanticValueComparator } from '../../util/comparison.js';
 
 /**
  * Shared `inferReturnType` for pass-through window functions (MIN, MAX,
@@ -19,6 +20,65 @@ const passThroughArgType = (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>):
 	nullable: true,
 	isReadOnly: true
 });
+
+/**
+ * Window MIN/MAX step+final derived from ONE comparator — the window twin of
+ * `extremumParts` in func/builtins/aggregate.ts. A raw JS `<` would disagree with
+ * plain sorting for mixed storage classes (`5 < 'abc'` and `'abc' < 5` are both
+ * false, so whichever arrived first wins), and would ignore semantic ordering
+ * (TIMESPAN elapsed time, JSON structure) and collation entirely.
+ *
+ * Ties under a non-BINARY comparator ('a' vs 'A' under NOCASE, 'PT1H' vs 'PT60M'
+ * for TIMESPAN) compare equal, so which raw value survives is unspecified — the
+ * same latitude the MIN/MAX aggregate, DISTINCT, and GROUP BY take.
+ */
+function extremumWindowParts(
+	direction: 'min' | 'max',
+	compare: (a: SqlValue, b: SqlValue) => number,
+): Required<WindowFunctionBinding> {
+	const wins = direction === 'min'
+		? (candidate: SqlValue, incumbent: SqlValue): boolean => compare(candidate, incumbent) < 0
+		: (candidate: SqlValue, incumbent: SqlValue): boolean => compare(candidate, incumbent) > 0;
+	return {
+		step: (state: SqlValue | undefined, value: SqlValue): SqlValue => {
+			if (value === null) return state ?? null;   // Ignore NULLs
+			if (state === null || state === undefined) return value; // First non-null value
+			return wins(value, state) ? value : state;
+		},
+		final: (state: SqlValue | undefined): SqlValue => state ?? null,
+	};
+}
+
+/**
+ * Register window MIN or MAX. The registered default ranks by storage class under
+ * BINARY — correct for untyped/ANY arguments and for any caller that never binds —
+ * and `bindArgs` re-derives both hooks over the call site's semantic comparator, so
+ * `min(x) over (…)` agrees with the `min(x)` aggregate and with `order by x limit 1`.
+ */
+function registerExtremumWindowFunction(direction: 'min' | 'max'): void {
+	const defaults = extremumWindowParts(direction, (a, b) => compareSqlValuesFast(a, b, BINARY_COLLATION));
+	registerWindowFunction({
+		name: direction.toUpperCase(),
+		argCount: 1,
+		returnType: {
+			typeClass: 'scalar',
+			logicalType: REAL_TYPE,
+			nullable: true,
+			isReadOnly: true
+		},
+		// MIN/MAX pass the argument value through unchanged, so the result follows
+		// the argument's logical type (mirrors the aggregate minFunc/maxFunc).
+		inferReturnType: passThroughArgType,
+		requiresOrderBy: false,
+		kind: 'aggregate',
+		step: defaults.step,
+		final: defaults.final,
+		bindArgs: (args) => extremumWindowParts(
+			direction,
+			createSemanticValueComparator(args[0]?.logicalType, args[0]?.collation),
+		),
+	});
+}
 
 // Built-in window function schemas
 export function registerBuiltinWindowFunctions(): void {
@@ -233,51 +293,6 @@ export function registerBuiltinWindowFunctions(): void {
 		final: (state: AggValue) => state ? state.sum / state.count : null
 	});
 
-	registerWindowFunction({
-		name: 'MIN',
-		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
-		// MIN passes the argument value through unchanged, so the result follows
-		// the argument's logical type (mirrors the aggregate minFunc).
-		inferReturnType: passThroughArgType,
-		requiresOrderBy: false,
-		kind: 'aggregate',
-		step: (state: AggValue, value: AggValue) => {
-			if (value === null) return state;
-			if (state === null || state === undefined) {
-				return value;
-			}
-			return value < state ? value : state;
-		},
-		final: (state: AggValue) => state
-	});
-
-	registerWindowFunction({
-		name: 'MAX',
-		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
-		// MAX passes the argument value through unchanged, so the result follows
-		// the argument's logical type (mirrors the aggregate maxFunc).
-		inferReturnType: passThroughArgType,
-		requiresOrderBy: false,
-		kind: 'aggregate',
-		step: (state: AggValue, value: AggValue) => {
-			if (value === null) return state;
-			if (state === null || state === undefined) {
-				return value;
-			}
-			return value > state ? value : state;
-		},
-		final: (state: AggValue) => state
-	});
+	registerExtremumWindowFunction('min');
+	registerExtremumWindowFunction('max');
 }

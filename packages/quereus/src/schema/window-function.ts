@@ -1,6 +1,13 @@
 import type { ScalarType } from '../common/datatype.js';
 import type { DeepReadonly, SqlValue } from '../common/types.js';
 import type { LogicalType } from '../types/logical-type.js';
+import type { AggregateArgBinding } from './function.js';
+
+/** The pieces a window bind may replace. Any field omitted keeps the declared default. */
+export interface WindowFunctionBinding {
+	readonly step?: WindowFunctionSchema['step'];
+	readonly final?: WindowFunctionSchema['final'];
+}
 
 export interface WindowFunctionSchema {
 	name: string;                    // 'ROW_NUMBER', 'RANK', 'SUM', etc.
@@ -22,6 +29,19 @@ export interface WindowFunctionSchema {
 	step?: (state: any, value: SqlValue) => any;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	final?: (state: any, rowCount: number) => SqlValue;
+
+	/**
+	 * Specialize step/final to this call site's argument comparison context —
+	 * the arguments' declared logical types and resolved collations. Called ONCE
+	 * at emit time, never per row; apply via {@link bindWindowSchema}. Returning
+	 * undefined (or omitting a field) keeps the declared default.
+	 *
+	 * Mirrors `AggregateFunctionSchema.bindArgs`, and shares its argument type
+	 * ({@link AggregateArgBinding}) so the comparison-routing rule
+	 * (`createSemanticValueComparator`) has exactly one home: window MIN/MAX must
+	 * rank exactly as the MIN/MAX aggregate does.
+	 */
+	readonly bindArgs?: (args: readonly AggregateArgBinding[]) => WindowFunctionBinding | undefined;
 }
 
 // Global registry for window functions
@@ -41,6 +61,31 @@ export function isWindowFunction(name: string): boolean {
 
 export function getAllWindowFunctions(): WindowFunctionSchema[] {
 	return Array.from(windowRegistry.values());
+}
+
+/**
+ * Specialize a window schema to one call site's argument comparison context. A
+ * schema with no `bindArgs` hook — or a hook that declines — is returned
+ * unchanged. Idempotent: the bound schema keeps `bindArgs`, so no call site has
+ * to track whether it already bound.
+ *
+ * Call once per call site at emit time, never per row. Both window execution
+ * shapes (the buffered frame walk and the streaming fast path) must run the SAME
+ * bound schema, or they rank differently for the same query.
+ */
+export function bindWindowSchema(
+	schema: WindowFunctionSchema,
+	args: readonly AggregateArgBinding[],
+): WindowFunctionSchema {
+	const bound = schema.bindArgs?.(args);
+	if (!bound) return schema;
+	// Merge field-by-field rather than spreading `bound`: an explicitly-`undefined`
+	// field must read as "keep the declared default", matching the documented contract.
+	return {
+		...schema,
+		step: bound.step ?? schema.step,
+		final: bound.final ?? schema.final,
+	};
 }
 
 // Helper to create ranking function state

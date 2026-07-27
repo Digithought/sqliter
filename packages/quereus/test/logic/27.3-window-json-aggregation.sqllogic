@@ -44,3 +44,23 @@ SELECT grp, json_group_array(val) as ga FROM w_jagg_part GROUP BY grp ORDER BY g
 
 DROP TABLE w_jagg;
 DROP TABLE w_jagg_part;
+
+-- Window min()/max() over a JSON column rank structurally, matching the plain
+-- aggregate and ORDER BY (docs/types.md "Semantic ordering"). Canonical-text order
+-- would report mn=[10], mx=[9].
+CREATE TABLE w_jmm (id INTEGER PRIMARY KEY, d JSON);
+INSERT INTO w_jmm VALUES (1, '[8,1]'), (2, '[9]'), (3, '[10]');
+-- run
+
+SELECT id, d FROM w_jmm ORDER BY d;
+→ [{"id":1,"d":[8,1]},{"id":2,"d":[9]},{"id":3,"d":[10]}]
+
+SELECT DISTINCT min(d) OVER () AS mn, max(d) OVER () AS mx FROM w_jmm;
+→ [{"mn":[8,1],"mx":[10]}]
+
+-- Sliding frame: each window ranks structurally on its own.
+SELECT id, min(d) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS mn
+FROM w_jmm ORDER BY id;
+→ [{"id":1,"mn":[8,1]},{"id":2,"mn":[8,1]},{"id":3,"mn":[9]}]
+
+DROP TABLE w_jmm;

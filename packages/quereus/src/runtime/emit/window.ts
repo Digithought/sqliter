@@ -4,7 +4,8 @@ import { asRun } from '../types.js';
 import type { OutputValue, Row, SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
-import { resolveWindowFunction, type WindowFunctionSchema } from '../../schema/window-function.js';
+import { bindWindowSchema, resolveWindowFunction, type WindowFunctionSchema } from '../../schema/window-function.js';
+import type { AggregateArgBinding } from '../../schema/function.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { createTypedComparator, createTypedOrderByComparator, hasSemanticOrdering } from '../../util/comparison.js';
@@ -21,13 +22,27 @@ import { tryExtractNumericLiteral } from '../../util/ast-literal.js';
 const log = createLogger('runtime:emit:window');
 
 export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction {
-	// Get schemas for all window functions in this node
-	const functionSchemas = plan.functions.map(func => {
+	// Resolve + bind each window function's schema ONCE here: the call site's
+	// argument types and collations specialize comparison-sensitive windows
+	// (min/max via bindArgs) so their step ranks by the argument's semantic order,
+	// exactly as the min/max aggregate does. Every execution shape below —
+	// the buffered frame walk (computeAggregateFunction), the streaming running
+	// aggregate (stepRunningAgg) and the sliding-frame scans — folds through THIS
+	// schema, so the physical shapes cannot drift apart. Nothing per-row resolves
+	// a type or a collation.
+	const functionSchemas = plan.functions.map((func, fi) => {
 		const schema = resolveWindowFunction(func.functionName);
 		if (!schema) {
 			throw new QuereusError(`Window function ${func.functionName} not found`, StatusCode.INTERNAL);
 		}
-		return schema;
+		const argBindings: AggregateArgBinding[] = (plan.functionArguments[fi] ?? []).map(argPlan => {
+			const argType = argPlan.getType();
+			return {
+				logicalType: argType.logicalType as LogicalType,
+				collation: argType.collationName ? ctx.resolveCollation(argType.collationName) : undefined,
+			};
+		});
+		return bindWindowSchema(schema, argBindings);
 	});
 
 	// Emit callbacks for partition expressions
@@ -1152,7 +1167,7 @@ async function* runStreaming(
 					stepRunningAgg(entry, fi, fs, fc, argVal, isRangeMode);
 					break;
 				case 'slidingAgg':
-					handleSlidingArrival(entry, fi, fs, argVal, orderByVal0Num);
+					handleSlidingArrival(entry, fi, fs, fc.schema, argVal, orderByVal0Num);
 					break;
 			}
 		}
@@ -1335,7 +1350,7 @@ async function* finalizePartition(
 	for (let fi = 0; fi < funcContexts.length; fi++) {
 		const fs = state.funcStates[fi];
 		if (fs.mode.kind !== 'slidingAgg') continue;
-		finalizeSlidingTrailing(fi, fs);
+		finalizeSlidingTrailing(fi, fs, funcContexts[fi].schema);
 	}
 	// Yield queued entries in order. Promote our slot to each entry's row so
 	// downstream attribute resolution sees the correct row.
@@ -1397,24 +1412,28 @@ function slidingFinalAcc(name: string, acc: { sum: number; count: number }): Sql
 	}
 }
 
-function slidingScanMin(buf: SlidingBufEntry[], lo: number, hi: number): SqlValue {
-	let best: SqlValue = null;
+/**
+ * MIN/MAX over a sliding-frame buffer slice, folded through the BOUND schema's own
+ * step/final rather than a local `<`. Reusing the schema is what keeps the sliding
+ * fast path ranking identically to the buffered frame walk — both consume the
+ * comparator `bindWindowSchema` installed at emit (semantic ordering for
+ * TIMESPAN/JSON arguments, the declared collation for text, storage-class order
+ * otherwise). `lo > hi` (empty slice) folds to the empty accumulator ⇒ NULL.
+ */
+function slidingScanExtremum(
+	schema: WindowFunctionSchema,
+	buf: SlidingBufEntry[],
+	lo: number,
+	hi: number,
+): SqlValue {
+	if (!schema.step) return null;
+	let acc: unknown = null;
+	let rowCount = 0;
 	for (let k = lo; k <= hi; k++) {
-		const v = buf[k].argVal;
-		if (v === null) continue;
-		if (best === null || v < best) best = v;
+		acc = schema.step(acc, buf[k].argVal);
+		rowCount++;
 	}
-	return best;
-}
-
-function slidingScanMax(buf: SlidingBufEntry[], lo: number, hi: number): SqlValue {
-	let best: SqlValue = null;
-	for (let k = lo; k <= hi; k++) {
-		const v = buf[k].argVal;
-		if (v === null) continue;
-		if (best === null || v > best) best = v;
-	}
-	return best;
+	return schema.final ? schema.final(acc, rowCount) : acc as SqlValue;
 }
 
 function slidingScanCountNonNull(buf: SlidingBufEntry[], lo: number, hi: number): number {
@@ -1436,20 +1455,22 @@ function slidingScanSum(buf: SlidingBufEntry[], lo: number, hi: number): { sum: 
 	return { sum, count };
 }
 
-/** Per-row dispatch for slidingAgg functions. */
+/** Per-row dispatch for slidingAgg functions. `schema` is the emit-time-bound
+ *  registry schema, consulted by the MIN/MAX scans. */
 function handleSlidingArrival(
 	entry: StreamingRowEntry,
 	fi: number,
 	fs: StreamingFuncState,
+	schema: WindowFunctionSchema,
 	argVal: SqlValue,
 	orderByVal0Num: number,
 ): void {
 	const m = fs.mode as Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>;
 	fs.slidingBuffer!.push({ argVal, orderByVal0: orderByVal0Num });
 	if (m.frameMode === 'rows') {
-		handleSlidingRowsArrival(entry, fi, fs, m, argVal);
+		handleSlidingRowsArrival(entry, fi, fs, schema, m, argVal);
 	} else {
-		handleSlidingRangeArrival(entry, fi, fs, m, orderByVal0Num);
+		handleSlidingRangeArrival(entry, fi, fs, schema, m, orderByVal0Num);
 	}
 }
 
@@ -1459,6 +1480,7 @@ function handleSlidingRowsArrival(
 	entry: StreamingRowEntry,
 	fi: number,
 	fs: StreamingFuncState,
+	schema: WindowFunctionSchema,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 	argVal: SqlValue,
 ): void {
@@ -1467,13 +1489,14 @@ function handleSlidingRowsArrival(
 	}
 	fs.slidingPending!.push(entry);
 	while (fs.slidingPending!.length > m.following) {
-		finalizeSlidingRowsEntry(fi, fs, m);
+		finalizeSlidingRowsEntry(fi, fs, schema, m);
 	}
 }
 
 function finalizeSlidingRowsEntry(
 	fi: number,
 	fs: StreamingFuncState,
+	schema: WindowFunctionSchema,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 ): void {
 	const j = fs.slidingNextFinalizeIdx!;
@@ -1497,10 +1520,8 @@ function finalizeSlidingRowsEntry(
 			value = slidingFinalAcc(m.name, fs.slidingAcc!);
 			break;
 		case 'min':
-			value = slidingScanMin(buf, lo, hi);
-			break;
 		case 'max':
-			value = slidingScanMax(buf, lo, hi);
+			value = slidingScanExtremum(schema, buf, lo, hi);
 			break;
 		case 'first_value':
 			value = lo > hi ? null : buf[lo].argVal;
@@ -1522,6 +1543,7 @@ function handleSlidingRangeArrival(
 	entry: StreamingRowEntry,
 	fi: number,
 	fs: StreamingFuncState,
+	schema: WindowFunctionSchema,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 	orderByVal0Num: number,
 ): void {
@@ -1549,7 +1571,7 @@ function handleSlidingRangeArrival(
 	}
 
 	while (pending.length > 0 && pending[0].rightClosed) {
-		finalizeSlidingRangeEntry(fi, fs, m);
+		finalizeSlidingRangeEntry(fi, fs, schema, m);
 	}
 }
 
@@ -1600,6 +1622,7 @@ function findNonFinitePeerSpan(buf: SlidingBufEntry[]): { lo: number; hi: number
 function finalizeSlidingRangeEntry(
 	fi: number,
 	fs: StreamingFuncState,
+	schema: WindowFunctionSchema,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 ): void {
 	const pending = fs.slidingRangePending!;
@@ -1632,10 +1655,8 @@ function finalizeSlidingRangeEntry(
 				break;
 			}
 			case 'min':
-				value = slidingScanMin(buf, lo, hi);
-				break;
 			case 'max':
-				value = slidingScanMax(buf, lo, hi);
+				value = slidingScanExtremum(schema, buf, lo, hi);
 				break;
 			case 'first_value':
 				value = buf[lo].argVal;
@@ -1702,15 +1723,15 @@ function trimSlidingRangeBuffer(
 	}
 }
 
-function finalizeSlidingTrailing(fi: number, fs: StreamingFuncState): void {
+function finalizeSlidingTrailing(fi: number, fs: StreamingFuncState, schema: WindowFunctionSchema): void {
 	const m = fs.mode as Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>;
 	if (m.frameMode === 'rows') {
 		while (fs.slidingPending!.length > 0) {
-			finalizeSlidingRowsEntry(fi, fs, m);
+			finalizeSlidingRowsEntry(fi, fs, schema, m);
 		}
 	} else {
 		while (fs.slidingRangePending!.length > 0) {
-			finalizeSlidingRangeEntry(fi, fs, m);
+			finalizeSlidingRangeEntry(fi, fs, schema, m);
 		}
 	}
 }
