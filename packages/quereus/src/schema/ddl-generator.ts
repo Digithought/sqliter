@@ -201,6 +201,28 @@ export function generateIndexDDL(
 }
 
 /**
+ * Canonical `drop table "<schema>"."<name>"` statement.
+ *
+ * The counterpart of {@link generateTableDDL} for the drop half of a table's
+ * lifecycle. Always fully qualified (same {@link quoteName} policy as the CREATE
+ * side) so the statement targets the intended schema regardless of the executing
+ * session's current schema — which is what makes it safe to ship to a sync peer.
+ */
+export function generateDropTableDDL(schemaName: string, tableName: string): string {
+	return `drop table ${quoteName(schemaName)}.${quoteName(tableName)}`;
+}
+
+/**
+ * Canonical `drop index "<schema>"."<name>"` statement — the counterpart of
+ * {@link generateIndexDDL}. Fully qualified for the same reason
+ * {@link generateDropTableDDL} is; the owning table is not named because
+ * `DROP INDEX` resolves the owner by scanning the schema.
+ */
+export function generateDropIndexDDL(schemaName: string, indexName: string): string {
+	return `drop index ${quoteName(schemaName)}.${quoteName(indexName)}`;
+}
+
+/**
  * Generate canonical DDL for a (non-materialized) view from its schema.
  *
  * Lifts the stored {@link ViewSchema} back into the equivalent

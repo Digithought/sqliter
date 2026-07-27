@@ -68,7 +68,7 @@ import {
 } from './key-builder.js';
 import { assertNoUnpairedSurrogate } from './encoding.js';
 import { deserializeRow } from './serialization.js';
-import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL, isHiddenImplicitIndex, exposedImplicitIndexes } from '@quereus/quereus';
+import { generateTableDDL, generateIndexDDL, generateDropTableDDL, generateDropIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL, isHiddenImplicitIndex, exposedImplicitIndexes } from '@quereus/quereus';
 
 /**
  * Result of catalog rehydration.
@@ -823,12 +823,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		await this.tearDownTableStorage(schemaName, tableName, indexNames);
 
-		// Emit schema change event for table drop
+		// Emit schema change event for table drop. The `ddl` is what a sync peer
+		// re-executes to replicate the drop — a drop with no DDL crosses the wire as
+		// an empty statement and silently changes nothing on the receiver.
 		this.eventEmitter?.emitSchemaChange({
 			type: 'drop',
 			objectType: 'table',
 			schemaName,
 			objectName: tableName,
+			ddl: generateDropTableDDL(schemaName, tableName),
 		});
 	}
 
@@ -1059,12 +1062,17 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		await this.saveTableDDL(updatedSchema);
 		table.markDdlSaved();
 
-		// Emit schema change event
+		// Emit schema change event. `updatedSchema` (not the pre-create
+		// `tableSchema`) is the owner the canonical CREATE INDEX renders against —
+		// it is only read for the table's qualified name and column names, but
+		// passing the post-create schema keeps the rendering consistent with what a
+		// receiving peer regenerates when it compares definitions.
 		this.eventEmitter?.emitSchemaChange({
 			type: 'create',
 			objectType: 'index',
 			schemaName,
 			objectName: indexSchema.name,
+			ddl: generateIndexDDL(indexSchema, updatedSchema),
 		});
 	}
 
@@ -1142,6 +1150,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			objectType: 'index',
 			schemaName,
 			objectName: indexName,
+			ddl: generateDropIndexDDL(schemaName, indexName),
 		});
 	}
 

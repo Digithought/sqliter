@@ -1588,17 +1588,33 @@ retrying until an operator resolves it. Resolving it automatically would require
 last-writer-wins over schema *definitions* (apply the higher-HLC shape as a
 migration, rewriting the local table), which is substantially more machinery.
 
-Note that only `create_table` currently reaches a peer with a non-empty DDL
-string; every other schema event the store module emits carries no DDL, so those
-migrations replicate as an empty statement and change nothing on the receiver.
-Such a migration is skipped outright — counted applied, but neither executed nor
-given a pending remote-event expectation. That last part matters: expectations
-are refcounted and never expire, so one registered for a statement that emits no
-event would linger and consume the next genuine *local* DDL of the same
-signature, marking it remote — and remote events are filtered out of the
+### What replicates
+
+Four object-lifecycle migrations reach a peer with a real DDL string and are
+re-executed there: `create_table`, `drop_table`, `add_index` and `drop_index`.
+The store module attaches the canonical text at each emit site — `create table`
+and `create index` via `generateTableDDL` / `generateIndexDDL`, the two drops via
+`generateDropTableDDL` / `generateDropIndexDDL` (all in
+`packages/quereus/src/schema/ddl-generator.ts`). The memory virtual-table module
+attaches the same four, so a host that wires it an event emitter sees the same
+DDL; there is no end-to-end sync path for memory-backed tables today, so those
+are covered by direct event assertions rather than a peer relay.
+
+ALTER TABLE does **not** replicate. A column add / drop / alter records an
+`alter_column` migration whose DDL is still blank, so it crosses the wire as an
+empty statement and changes nothing on the receiver — a peer that alters a table
+stays silently diverged in shape.
+
+A migration with a blank DDL is skipped outright — counted applied, but neither
+executed nor given a pending remote-event expectation. That last part matters:
+expectations are refcounted and never expire, so one registered for a statement
+that emits no event would linger and consume the next genuine *local* DDL of the
+same signature, marking it remote — and remote events are filtered out of the
 SyncManager's local-fact capture, so that local change would never replicate.
-The drop / index branches above are implemented and tested against synthetic
-migrations so they are correct once real DDL flows for them.
+The same one-expectation-per-migration accounting is why the executed forms must
+each emit exactly one module event: `drop table` over an indexed table emits one
+`drop`/`table` event and no per-index drop, so its single expectation is matched
+exactly once.
 
 ## Configuration
 

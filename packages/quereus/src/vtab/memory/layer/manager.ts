@@ -13,6 +13,7 @@ import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
 import { indexEnforcesUnique, uniqueEnforcementCollations, uniqueEnforcementComparators } from '../../../schema/unique-enforcement.js';
+import { generateIndexDDL, generateDropIndexDDL } from '../../../schema/ddl-generator.js';
 import { compareSqlValues, rowsValueIdentical, normalizeCollationName, comparisonSemanticsDiffer } from '../../../util/comparison.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
 import type { ScanPlan } from './scan-plan.js';
@@ -2750,12 +2751,15 @@ export class MemoryTableManager {
 			// new one so the rest of the transaction scans and enforces the new index.
 			this.adoptSchemaOnOpenLayers(finalNewTableSchema);
 
-			// Emit schema change event
+			// Emit schema change event. The `ddl` is what a sync peer re-executes to
+			// replicate the index; rendered against the POST-create schema so it matches
+			// what a receiving peer regenerates when comparing definitions.
 			this.eventEmitter?.emitSchemaChange?.({
 				type: 'create',
 				objectType: 'index',
 				schemaName: this.schemaName,
 				objectName: indexName,
+				ddl: generateIndexDDL(newIndexSchemaEntry, finalNewTableSchema),
 			});
 
 			logger.operation('Create Index', this._tableName, { indexName });
@@ -2820,6 +2824,7 @@ export class MemoryTableManager {
 				objectType: 'index',
 				schemaName: this.schemaName,
 				objectName: indexName,
+				ddl: generateDropIndexDDL(this.schemaName, indexName),
 			});
 
 			logger.operation('Drop Index', this._tableName, { indexName });

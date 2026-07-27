@@ -14,10 +14,14 @@
  *     schema migrations INCLUDED — `relay` strips them, which is why no existing
  *     spec saw this);
  *   - adapter-level, driving `createStoreAdapter` with synthetic
- *     `SchemaChangeToApply` records. Needed because only `create_table` carries
- *     non-empty `ddl` on the wire today (every other store schema event
- *     replicates as `db.exec('')`), so the drop/index branches have no
- *     end-to-end driver yet.
+ *     `SchemaChangeToApply` records — the cheapest way to pin one branch of
+ *     `decideSchemaChange` at a time.
+ *
+ * The drop/index branches now also have an end-to-end driver: real DDL flows for
+ * create/drop table and create/drop index (see
+ * `schema-ddl-replication.spec.ts`). A blank `ddl` remains reachable for
+ * `alter_column`, so the blank-DDL cases at the bottom of this file still guard
+ * live behaviour.
  */
 
 import { expect } from 'chai';
@@ -329,9 +333,10 @@ describe('schema replication idempotency', () => {
 		});
 
 		it('leaves blank-DDL migrations as the no-ops they are today', async () => {
-			// Every store schema event except create_table replicates with no `ddl`
-			// (tracked separately); those must keep behaving exactly as before —
-			// counted applied, changing nothing.
+			// A blank `ddl` still reaches the adapter for `alter_column` (ALTER TABLE
+			// migrations are tracked separately), and any peer running an older build
+			// still sends blank drop/index migrations. Those must keep behaving exactly
+			// as before — counted applied, changing nothing.
 			const result = await apply(
 				schemaChange('drop_table', 'orders', ''),
 				schemaChange('add_index', 'idx_orders_note', ''),

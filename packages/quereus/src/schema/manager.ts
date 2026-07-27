@@ -2515,6 +2515,14 @@ export class SchemaManager {
 	 * Emits an auto schema event for modules that don't have native event support,
 	 * if the engine needs schema events — i.e. any `onSchemaChange` or
 	 * `onTransactionCommit` listener is registered (see `Database._needsSchemaEvents`).
+	 *
+	 * NOTE: the auto event carries no `ddl` — the callers have only the (schema,
+	 * object) names here, not the object schema each generator needs. Fine today:
+	 * the only consumer that reads `ddl` is sync replication, which runs over the
+	 * store module, and that module has native event support so this fallback never
+	 * fires for it. If a module without native events ever needs to replicate,
+	 * thread the object schema in and call the `schema/ddl-generator.ts` generators
+	 * here the way the store and memory modules do at their own emit sites.
 	 */
 	private emitAutoSchemaEventIfNeeded(
 		moduleName: string | undefined,

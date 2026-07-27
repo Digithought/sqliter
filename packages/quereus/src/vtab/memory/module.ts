@@ -2,6 +2,7 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type Row } from '../../common/types.js';
 import type { Database } from '../../core/database.js';
 import { type TableSchema, type IndexSchema, IndexColumnSchema } from '../../schema/table.js';
+import { generateTableDDL, generateDropTableDDL } from '../../schema/ddl-generator.js';
 import { MemoryTable } from './table.js';
 import type { VirtualTableModule, SchemaChangeInfo, EffectiveRowSource } from '../module.js';
 import { MemoryTableManager } from './layer/manager.js';
@@ -241,12 +242,17 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// Create the MemoryTable instance
 		const table = new MemoryTable(db, this, manager);
 
-		// Emit schema change event after table is fully created
+		// Emit schema change event after table is fully created. The `ddl` is the
+		// statement a sync peer re-executes to replicate the create; without it the
+		// migration crosses the wire as an empty statement and does nothing. Rendered
+		// lazily — optional chaining short-circuits the whole call (arguments
+		// included) when no emitter is wired.
 		this.eventEmitter?.emitSchemaChange?.({
 			type: 'create',
 			objectType: 'table',
 			schemaName: tableSchema.schemaName,
 			objectName: tableSchema.name,
+			ddl: generateTableDDL(tableSchema),
 		});
 
 		return table;
@@ -907,6 +913,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				objectType: 'table',
 				schemaName,
 				objectName: tableName,
+				ddl: generateDropTableDDL(schemaName, tableName),
 			});
 
 			logger.operation('Destroy Table', tableName, { schema: schemaName });

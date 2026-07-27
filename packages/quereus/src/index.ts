@@ -195,7 +195,7 @@ export type { ColumnSchema } from './schema/column.js';
 export type { ViewSchema } from './schema/view.js';
 export type { TableDerivation, MaintainedTableSchema } from './schema/derivation.js';
 export { isMaintainedTable } from './schema/derivation.js';
-export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL } from './schema/ddl-generator.js';
+export { generateTableDDL, generateIndexDDL, generateDropTableDDL, generateDropIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL } from './schema/ddl-generator.js';
 export { isHiddenImplicitIndex, exposedImplicitIndexes } from './schema/catalog.js';
 export type { SyntheticExposedIndex } from './schema/catalog.js';
 // Rename rewriters for the expression-bearing parts of a table's own definition.
