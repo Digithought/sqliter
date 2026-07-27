@@ -540,7 +540,17 @@ async function applySchemaChange(
   // expires them), and the next genuine LOCAL DDL of the same signature would be
   // consumed by it, marked remote, and dropped from the SyncManager's local-fact
   // capture — silently never replicated.
-  if (change.ddl.trim() === '') return;
+  if (change.ddl.trim() === '') {
+    // Only `alter_column` reaches here with no DDL today (see the origin-side
+    // warning in `recordSchemaMigration`, sync-manager-impl.ts). The migration
+    // still counts applied — it just runs nothing — so an operator watching this
+    // peer needs to see that a schema change arrived and was silently dropped.
+    console.warn(
+      `[Sync] Received ${change.type} for ${change.schema}.${change.table} with no DDL — `
+        + `not applied; the receiving table's schema is unchanged`,
+    );
+    return;
+  }
 
   // Decide BEFORE registering the remote-event expectation, for the same reason:
   // an expectation for DDL that is then not executed would linger and mis-mark a

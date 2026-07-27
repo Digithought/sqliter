@@ -862,6 +862,21 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		if (!migrationType) return;
 
 		const { schemaName, objectName, ddl } = event;
+
+		// `alter_column` is the only tracked type that legitimately reaches here with
+		// no DDL — create/drop table and add/drop index all carry canonical text (see
+		// the store module's emit sites). The migration below still records and still
+		// advances the schema version (destructiveness comparison depends on it), but
+		// nothing here reaches a peer, so a device that alters a table stays silently
+		// diverged unless an operator sees this.
+		// See tickets/backlog/feat-sync-replicate-alter-table.md.
+		if (migrationType === 'alter_column' && !ddl) {
+			console.warn(
+				`[Sync] ${schemaName}.${objectName}: recording an ${migrationType} migration with no DDL — `
+					+ `this table alteration will NOT reach other synced devices`,
+			);
+		}
+
 		const counterKey = `${schemaName}.${objectName}`;
 		let version = versionCounters.get(counterKey);
 		if (version === undefined) {

@@ -1,0 +1,114 @@
+/**
+ * ALTER TABLE does not replicate today (see `tickets/backlog/feat-sync-replicate-alter-table.md`):
+ * an `alter_column` migration always carries a blank DDL, so it crosses the wire
+ * as an empty statement and the receiver runs nothing. Neither end used to say
+ * so. These specs cover the warning added at each end — origin
+ * (`recordSchemaMigration`, sync-manager-impl.ts) and receiver
+ * (`applySchemaChange`, store-adapter.ts) — and that `create_table` / `drop_table`
+ * / `add_index` / `drop_index`, which all carry real DDL, never trigger either
+ * warning.
+ */
+
+import { expect } from 'chai';
+import {
+	DEFAULT_ORDERS_DDL,
+	closePeer,
+	localWrite,
+	makePeer,
+	relayAll,
+	type Peer,
+} from './_peer-harness.js';
+
+const NOTE_INDEX = 'idx_orders_note_warn';
+const CREATE_NOTE_INDEX = `create index ${NOTE_INDEX} on orders (note)`;
+
+/** Two peers that each already created the identical `orders` table. */
+async function makeSyncedPair(): Promise<[Peer, Peer]> {
+	const a = await makePeer('a', { createOrders: true });
+	const b = await makePeer('b', { createOrders: true });
+	return [a, b];
+}
+
+/** Run `body` with `console.warn` captured; restores it even on throw. */
+async function captureWarnings(body: () => Promise<void>): Promise<string[]> {
+	const warns: string[] = [];
+	const orig = console.warn;
+	console.warn = (msg: string) => warns.push(msg);
+	try {
+		await body();
+	} finally {
+		console.warn = orig;
+	}
+	return warns;
+}
+
+describe('alter table sync warnings', () => {
+	let a: Peer;
+	let b: Peer;
+
+	beforeEach(async () => {
+		[a, b] = await makeSyncedPair();
+	});
+
+	afterEach(async () => {
+		await closePeer(a);
+		await closePeer(b);
+	});
+
+	it('warns on the origin when an ALTER TABLE commits, and still records the migration', async () => {
+		const versionBefore = await a.manager.schemaMigrations.getCurrentVersion('main', 'orders');
+
+		const warns = await captureWarnings(async () => {
+			await localWrite(a, 'alter table orders add column qty integer');
+		});
+
+		expect(warns.some(w => w.includes('main.orders') && w.toLowerCase().includes('alter_column'))).to.equal(true);
+		expect(warns.some(w => w.toLowerCase().includes('not reach other synced devices'))).to.equal(true);
+
+		const versionAfter = await a.manager.schemaMigrations.getCurrentVersion('main', 'orders');
+		expect(versionAfter).to.equal(versionBefore + 1);
+	});
+
+	it('warns on the receiver when relaying that migration, without error, and still advances its schema version', async () => {
+		await localWrite(a, 'alter table orders add column qty integer');
+		const versionBefore = await b.manager.schemaMigrations.getCurrentVersion('main', 'orders');
+
+		const warns = await captureWarnings(async () => {
+			await relayAll(a, b);
+		});
+
+		expect(warns.some(w => w.includes('main.orders') && w.toLowerCase().includes('alter_column'))).to.equal(true);
+
+		const versionAfter = await b.manager.schemaMigrations.getCurrentVersion('main', 'orders');
+		expect(versionAfter).to.equal(versionBefore + 1);
+
+		// The blank-DDL migration ran nothing — b's table shape is unchanged.
+		const columns = b.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase());
+		expect(columns).to.not.include('qty');
+	});
+
+	it('never warns for create_table / drop_table / add_index / drop_index', async () => {
+		const x = await makePeer('x');
+		const y = await makePeer('y');
+		try {
+			const warns = await captureWarnings(async () => {
+				await localWrite(x, DEFAULT_ORDERS_DDL);
+				await relayAll(x, y);
+
+				await localWrite(x, CREATE_NOTE_INDEX);
+				await relayAll(x, y);
+
+				await localWrite(x, `drop index ${NOTE_INDEX}`);
+				await relayAll(x, y);
+
+				await localWrite(x, 'drop table orders');
+				await relayAll(x, y);
+			});
+
+			expect(warns).to.deep.equal([]);
+		} finally {
+			await closePeer(x);
+			await closePeer(y);
+		}
+	});
+});
