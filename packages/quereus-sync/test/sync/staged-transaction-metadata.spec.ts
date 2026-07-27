@@ -6,7 +6,7 @@
 
 import { expect } from 'chai';
 import { StagedTransactionMetadata } from '../../src/sync/staged-transaction-metadata.js';
-import { RAW_PK_KEYING } from '../../src/metadata/keys.js';
+import { RAW_PK_KEYING, type PkKeying } from '../../src/metadata/keys.js';
 import type { HLC } from '../../src/clock/hlc.js';
 
 const hlc = (opSeq: number): HLC => ({ wallTime: 1000n, counter: 0, siteId: new Uint8Array(16), opSeq });
@@ -81,5 +81,22 @@ describe('StagedTransactionMetadata', () => {
     const staged = makeOverlay();
     staged.noteRowCleared('a.b', 'c', [1]);
     expect(staged.columnVersion('a', 'b.c', [1], 'x')).to.equal(undefined);
+  });
+
+  // The overlay must key rows exactly as the cv:/tb:/cl: storage keys do, so two
+  // pk spellings that the column's key collation folds together share ONE slot —
+  // otherwise a transaction touching a row under both spellings would read the
+  // second touch as a first write and leak the first's change-log entry.
+  it('folds pk spellings that the column keying folds', () => {
+    const caseInsensitive: PkKeying = { normalizers: [(s: string) => s.toUpperCase()], transforms: [] };
+    const staged = new StagedTransactionMetadata(() => caseInsensitive);
+
+    const version = { hlc: hlc(0), value: 'x' };
+    staged.noteColumnVersion('main', 'users', ['abc'], 'a', version);
+    expect(staged.columnVersion('main', 'users', ['ABC'], 'a')).to.equal(version);
+
+    staged.noteRowCleared('main', 'users', ['AbC']);
+    expect(staged.columnVersion('main', 'users', ['abc'], 'a')).to.equal(null);
+    expect(staged.rowState('main', 'users', ['ABC'])!.rowCleared).to.equal(true);
   });
 });

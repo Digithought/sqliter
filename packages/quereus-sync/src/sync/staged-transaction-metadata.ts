@@ -45,6 +45,11 @@ interface StagedRow {
 }
 
 export class StagedTransactionMetadata {
+	// NOTE: retains one ColumnVersionData — value AND before-image — per staged cell
+	// for the life of the transaction, roughly doubling capture's peak footprint (the
+	// `changes[]` array already holds one entry per fact). If very large transactions
+	// ever pressure memory, note that only `columnVersion()`'s before-image chaining
+	// needs the values; the delete cleanup needs nothing but the HLC.
 	private readonly rows = new Map<string, StagedRow>();
 
 	constructor(private readonly getPkKeying: (schema: string, table: string) => PkKeying) {}

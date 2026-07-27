@@ -311,6 +311,34 @@ describe('change log orphan cleanup', () => {
         expect(await countChangeLog(manager)).to.equal(4);
       });
 
+      // The stored-state assertions above matter because of what they imply for a
+      // PEER. Pre-fix, a twice-touched key left two `cl:` entries, so the delta
+      // scan resolved BOTH back to the one surviving record and handed the peer
+      // the same key twice inside one transaction's ChangeSet.
+      it('hands a peer one change per key of a repeat-touch transaction', async () => {
+        await seedBoth(1, ['x', 'y', 'z']);
+        const peer = generateSiteId();
+
+        await runBothWays([
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'], newRow: ['x', 'Y1', 'z'] },
+          { type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'Y1', 'z'], newRow: ['x', 'Y2', 'z'] },
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [2], newRow: ['p', 'q', 'r'] },
+          { type: 'delete', schemaName: 'main', tableName: 'users', key: [2], oldRow: ['p', 'q', 'r'] },
+        ]);
+
+        const sets = await manager.getChangesSince(peer, BEGINNING_OF_TIME);
+        // One ChangeSet for the seed transaction, one for the transaction above.
+        expect(sets.length).to.equal(2);
+        expect(flattenSets([sets[1]]).map(c => ({
+          type: c.type,
+          pk: c.pk[0],
+          ...(c.type === 'column' ? { column: c.column, value: c.value } : {}),
+        }))).to.deep.equal([
+          { type: 'column', pk: 1, column: 'col_1', value: 'Y2' },
+          { type: 'delete', pk: 2 },
+        ]);
+      });
+
       // The overlay keys rows by pk identity derived through the schema oracle —
       // exercise that derivation with REAL column names, not only the col_N
       // fallback the oracle-less managers above use.

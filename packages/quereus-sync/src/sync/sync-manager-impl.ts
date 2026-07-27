@@ -977,9 +977,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				// chains correctly); one it deleted reads as absent (a reinsert after a
 				// delete records no before-image, exactly like a first write).
 				const stagedCell = staged.columnVersion(schemaName, tableName, pk, column);
-				const oldVersion: ColumnVersionData | undefined = stagedCell !== undefined
-					? stagedCell ?? undefined
-					: await this.columnVersions.getColumnVersion(schemaName, tableName, pk, column);
+				const oldVersion: ColumnVersionData | undefined = stagedCell === null
+					? undefined                                     // staged as deleted
+					: stagedCell ?? await this.columnVersions.getColumnVersion(schemaName, tableName, pk, column);
 
 				if (oldVersion) {
 					this.changeLog.deleteEntryBatch(
