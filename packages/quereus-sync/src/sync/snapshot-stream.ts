@@ -47,6 +47,14 @@ const DEFAULT_SNAPSHOT_CHUNK_SIZE = 1000;
 /** Key prefix for snapshot checkpoints. */
 const CHECKPOINT_PREFIX = 'sc:';
 
+/**
+ * Row changes `applySnapshotStream` accumulates before pushing them to the store.
+ *
+ * Exported so specs that must exceed this bound (to exercise a mid-table flush)
+ * derive their row counts from it rather than restating the literal.
+ */
+export const DATA_FLUSH_SIZE = 100;
+
 // ============================================================================
 // Snapshot Generation
 // ============================================================================
@@ -377,7 +385,6 @@ export async function applySnapshotStream(
 	// Pending data to apply to store (batched for efficiency)
 	let pendingDataChanges: DataChangeToApply[] = [];
 	let pendingSchemaChanges: SchemaChangeToApply[] = [];
-	const DATA_FLUSH_SIZE = 100;
 
 	const flushDataToStore = async (): Promise<void> => {
 		// A streamed snapshot is a known-complete wholesale load: each flush is a
@@ -470,12 +477,13 @@ export async function applySnapshotStream(
 				// flush would otherwise deliver to a table that does not exist yet. Later
 				// `table-start`s find nothing pending and this is a no-op (`applyDataToStore`
 				// returns early when both pending arrays are empty).
-				// NOTE: this trusts the sender's chunk order. A pre-DDL-first sender (one
-				// that emits `schema-migration` after the table sections) still fails on a
-				// table larger than DATA_FLUSH_SIZE, exactly as before. If cross-version
-				// snapshot interop ever becomes a requirement, the receiver would have to
-				// buffer all data until the footer instead — a memory tradeoff the whole
-				// streaming path exists to avoid.
+				// NOTE: this trusts the CHUNK ORDER, which outlives the sender process — the
+				// coordinator gzips a chunk array into S3 (`s3-snapshot-store.ts`) and replays
+				// it here on restore, so a snapshot written before DDL-first ordering still
+				// fails on a table larger than DATA_FLUSH_SIZE, exactly as before. Acceptable
+				// while backwards compat is out of scope; if it ever matters, either
+				// re-generate stored snapshots on upgrade or have the receiver buffer all data
+				// until the footer — the memory tradeoff the streaming path exists to avoid.
 				await flushDataToStore();
 
 				currentTable = `${chunk.schema}.${chunk.table}`;

@@ -30,7 +30,7 @@ import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager, type HLC } from '../../src/clock/hlc.js';
 import { encodeRawPkIdentity } from '../../src/metadata/keys.js';
-import { createInMemoryProvider, collect } from './_peer-harness.js';
+import { createInMemoryProvider, collect, toStream } from './_peer-harness.js';
 
 /** A whole-table `full` watch — fires on any change with empty hits. */
 function fullWatch(table: string): ChangeScope {
@@ -57,9 +57,6 @@ const upd = (table: string, pk: SqlValue[], columns: Record<string, SqlValue>): 
 const cvEntry = (pk: SqlValue[], column: string, hlc: HLC, value: SqlValue): [string, HLC, SqlValue, SqlValue[]] =>
 	[`${encodeRawPkIdentity(pk)}:${column}`, hlc, value, pk];
 
-async function* toStream(chunks: SnapshotChunk[]): AsyncIterable<SnapshotChunk> {
-	for (const c of chunks) yield c;
-}
 
 /** Counters for the three engine entry points the bootstrap path drives. */
 interface Spies {

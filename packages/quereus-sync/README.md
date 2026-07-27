@@ -199,7 +199,7 @@ The four housekeeping sweeps (`drainHeldChanges` / `pruneQuarantine` / `pruneTom
 - `ChangeSet` - Collection of changes from one transaction
 - `Change` (`ColumnChange | RowDeletion`) - Single column or row change
 - `SchemaMigration` - Schema change (CREATE/ALTER/DROP TABLE)
-- `SnapshotChunk` - Streaming snapshot data (header, table-start, column-versions, table-end, schema-migration, footer)
+- `SnapshotChunk` - Streaming snapshot data, in emission order: header, schema-migration, table-start, column-versions, table-end, tombstone, footer. All DDL precedes all table data — see docs/sync.md § Streaming Snapshot API
 - `ApplyResult` - Result of applying changes (applied, skipped, conflicts, transactions)
 - `SyncConfig` / `DEFAULT_SYNC_CONFIG` - Configuration (retentionHorizonMs, allowResurrection, etc.)
 

@@ -1,10 +1,6 @@
 import { expect } from 'chai';
 import type { SnapshotChunk } from '../../src/sync/protocol.js';
-import { makePeer, closePeer, localWrite, relay, collect, changesFor, type Peer } from './_peer-harness.js';
-
-async function* toStream(chunks: SnapshotChunk[]): AsyncIterable<SnapshotChunk> {
-	for (const c of chunks) yield c;
-}
+import { makePeer, closePeer, localWrite, relay, collect, changesFor, toStream, type Peer } from './_peer-harness.js';
 
 describe('sync pk identity honours key collation and semantic key transforms', () => {
 	let a: Peer;

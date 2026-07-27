@@ -6,7 +6,7 @@ import { SyncEventEmitterImpl } from '../../src/sync/events.js';
 import { type SiteId } from '../../src/clock/site.js';
 import {
 	DEFAULT_SYNC_CONFIG,
-	type ApplyResult, type Change, type ChangeSet, type SyncConfig, type UnknownTableDisposition,
+	type ApplyResult, type Change, type ChangeSet, type SnapshotChunk, type SyncConfig, type UnknownTableDisposition,
 } from '../../src/sync/protocol.js';
 
 export const COLUMNS_PER_FRESH_INSERT = 2;
@@ -35,6 +35,11 @@ export function createInMemoryProvider(): { provider: KVStoreProvider; stores: M
 		},
 	};
 	return { provider, stores };
+}
+
+/** Replay a collected chunk array as the `AsyncIterable` `applySnapshotStream` consumes. */
+export async function* toStream(chunks: SnapshotChunk[]): AsyncIterable<SnapshotChunk> {
+	for (const c of chunks) yield c;
 }
 
 export async function collect(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {

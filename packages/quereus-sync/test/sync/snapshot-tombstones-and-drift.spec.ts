@@ -19,13 +19,9 @@ import { expect } from 'chai';
 import type { ChangeSet, ColumnChange, SnapshotChunk } from '../../src/sync/protocol.js';
 import { createHLC, MAX_DRIFT_MS, type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
-import { makePeer, closePeer, localWrite, collect, type Peer } from './_peer-harness.js';
+import { makePeer, closePeer, localWrite, collect, toStream, type Peer } from './_peer-harness.js';
 
 const TEXT_ORDERS = 'create table orders (id text primary key, note text) using store';
-
-async function* toStream(chunks: SnapshotChunk[]): AsyncIterable<SnapshotChunk> {
-	for (const c of chunks) yield c;
-}
 
 const count = async (peer: Peer, sql: string): Promise<number> =>
 	Number((await collect(peer.db, sql))[0].n);

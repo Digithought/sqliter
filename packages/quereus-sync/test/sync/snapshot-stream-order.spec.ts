@@ -14,19 +14,26 @@
 
 import { expect } from 'chai';
 import type { SnapshotChunk } from '../../src/sync/protocol.js';
-import { closePeer, collect, localWrite, makePeer, type Peer } from './_peer-harness.js';
+import { DATA_FLUSH_SIZE } from '../../src/sync/snapshot-stream.js';
+import { closePeer, collect, localWrite, makePeer, toStream, type Peer } from './_peer-harness.js';
 
-async function* toStream(chunks: SnapshotChunk[]): AsyncIterable<SnapshotChunk> {
-	for (const c of chunks) yield c;
-}
+/** Rows per table, above the receiver's flush bound so it flushes mid-table. */
+const ROWS = DATA_FLUSH_SIZE + 50;
 
-/** Rows well above DATA_FLUSH_SIZE (100), so the receiver flushes mid-table. */
-const ROWS = 150;
+const chunksOf = async (peer: Peer): Promise<SnapshotChunk[]> => {
+	const chunks: SnapshotChunk[] = [];
+	for await (const c of peer.manager.getSnapshotStream()) chunks.push(c);
+	return chunks;
+};
 
-async function seedBigTable(peer: Peer): Promise<void> {
-	await peer.db.exec('create table big (id integer primary key, v text) using store');
+const countRows = async (peer: Peer, table: string): Promise<number> =>
+	Number((await collect(peer.db, `select count(*) as n from ${table}`))[0].n);
+
+/** Create `table` and fill it with ROWS rows in one source transaction. */
+async function seedBigTable(peer: Peer, table = 'big'): Promise<void> {
+	await peer.db.exec(`create table ${table} (id integer primary key, v text) using store`);
 	const values = Array.from({ length: ROWS }, (_, i) => `(${i + 1}, 'v${i + 1}')`).join(', ');
-	await localWrite(peer, `insert into big (id, v) values ${values}`);
+	await localWrite(peer, `insert into ${table} (id, v) values ${values}`);
 }
 
 describe('streaming snapshot emits schema before data', () => {
@@ -46,8 +53,7 @@ describe('streaming snapshot emits schema before data', () => {
 	it('every schema-migration chunk precedes the first table-start', async () => {
 		await seedBigTable(sender);
 
-		const types: string[] = [];
-		for await (const chunk of sender.manager.getSnapshotStream()) types.push(chunk.type);
+		const types = (await chunksOf(sender)).map(c => c.type);
 
 		expect(types[0], 'header first').to.equal('header');
 		const firstTableStart = types.indexOf('table-start');
@@ -60,32 +66,37 @@ describe('streaming snapshot emits schema before data', () => {
 	it('a fresh receiver bootstraps a table larger than the mid-table flush bound', async () => {
 		await seedBigTable(sender);
 
-		const chunks: SnapshotChunk[] = [];
-		for await (const c of sender.manager.getSnapshotStream()) chunks.push(c);
-
 		// Before DDL-first ordering this threw:
 		//   apply-to-store failed for 100 change(s): main.big (update):
 		//   Table not found for external write: main.big
-		await receiver.manager.applySnapshotStream(toStream(chunks));
+		await receiver.manager.applySnapshotStream(toStream(await chunksOf(sender)));
 
-		expect(Number((await collect(receiver.db, 'select count(*) as n from big'))[0].n), 'all rows bootstrapped')
-			.to.equal(ROWS);
-		expect(await collect(receiver.db, 'select v from big where id = 150'), 'the last row is intact')
-			.to.deep.equal([{ v: 'v150' }]);
+		expect(await countRows(receiver, 'big'), 'all rows bootstrapped').to.equal(ROWS);
+		expect(await collect(receiver.db, `select v from big where id = ${ROWS}`), 'the last row is intact')
+			.to.deep.equal([{ v: `v${ROWS}` }]);
+	});
+
+	it('bootstraps a SECOND large table, whose table-start finds no pending DDL', async () => {
+		// The first `table-start` flushes every migration; later ones must be harmless
+		// no-ops that still carry the prior table's trailing (sub-flush-bound) rows.
+		await seedBigTable(sender, 'big');
+		await seedBigTable(sender, 'big2');
+
+		await receiver.manager.applySnapshotStream(toStream(await chunksOf(sender)));
+
+		expect(await countRows(receiver, 'big'), 'first table complete').to.equal(ROWS);
+		expect(await countRows(receiver, 'big2'), 'second table complete').to.equal(ROWS);
 	});
 
 	it('re-applying the same stream is idempotent (re-emitted DDL does not collide)', async () => {
 		await seedBigTable(sender);
-
-		const chunks: SnapshotChunk[] = [];
-		for await (const c of sender.manager.getSnapshotStream()) chunks.push(c);
+		const chunks = await chunksOf(sender);
 
 		await receiver.manager.applySnapshotStream(toStream(chunks));
 		// A resumed/retried transfer re-emits every migration; `decideSchemaChange`
 		// skips a `create_table` whose object is already in the wanted state.
 		await receiver.manager.applySnapshotStream(toStream(chunks));
 
-		expect(Number((await collect(receiver.db, 'select count(*) as n from big'))[0].n), 'no duplication')
-			.to.equal(ROWS);
+		expect(await countRows(receiver, 'big'), 'no duplication').to.equal(ROWS);
 	});
 });
