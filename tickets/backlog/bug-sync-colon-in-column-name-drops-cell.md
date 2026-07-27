@@ -37,7 +37,7 @@ Every caller treats `null` as "skip this record". Consequences, all silent:
 - **Delta sync can't see it either.** `getChangesSince` iterates the change-log
   index and skips the unparseable entry, so the cell is invisible on that path as
   well.
-- **Applying an incoming snapshot can delete it.** `clearNonPreservedMetadata`
+- **Applying an incoming snapshot can delete it.** `clearExistingMetadata`
   (`snapshot-stream.ts`) keeps a record only when it can parse the key AND the
   table is on the preserve list. An unparseable key falls through to the delete
   branch, so the local cell is wiped even when its table was meant to be kept.

@@ -235,23 +235,6 @@ export class ColumnVersionStore {
   }
 
   /**
-   * Delete all column versions for a row.
-   *
-   * Prefer `deleteRowVersionsAndLogEntries` (sync-context.ts) on the sync write
-   * paths: this leaves the row's change-log entries pointing at records that no
-   * longer exist.
-   */
-  async deleteRowVersions(
-    schemaName: string,
-    tableName: string,
-    pk: SqlValue[]
-  ): Promise<void> {
-    const batch = this.kv.batch();
-    await this.deleteRowVersionsBatch(batch, schemaName, tableName, pk);
-    await batch.write();
-  }
-
-  /**
    * Check if a column write should be applied (LWW comparison).
    * Returns true if the incoming HLC is newer than the current version.
    */

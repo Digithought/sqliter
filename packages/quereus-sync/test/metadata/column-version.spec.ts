@@ -3,7 +3,7 @@
  */
 
 import { expect } from 'chai';
-import { ColumnVersionStore, serializeColumnVersion, deserializeColumnVersion, encodeSqlValue, decodeSqlValue, type ColumnVersion } from '../../src/metadata/column-version.js';
+import { ColumnVersionStore, serializeColumnVersion, deserializeColumnVersion, decodeSqlValue, type ColumnVersion } from '../../src/metadata/column-version.js';
 import type { HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { InMemoryKVStore } from '@quereus/store';

@@ -102,6 +102,14 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
  * Used by both delete paths — local DML capture (`recordDataEvent`) and inbound
  * apply (`commitChangeMetadata`) — which must stay symmetric: a relay runs almost
  * exclusively the latter.
+ *
+ * KNOWN LIMITATION (pre-dates this helper; tracked as
+ * `sync-delete-cleanup-misses-same-batch-writes`): the scan reads COMMITTED store
+ * state, so it neither sees nor is seen by writes still pending in the caller's own
+ * batch. When one transaction/apply carries both a delete and a write for the same
+ * pk, the two disagree: locally the row's versions survive its delete (leaking the
+ * very `cv:`/`cl:` pair this helper exists to reclaim), and on the apply path a
+ * higher-HLC reinsert that already won LWW is wiped back out.
  */
 export async function deleteRowVersionsAndLogEntries(
 	ctx: SyncContext,

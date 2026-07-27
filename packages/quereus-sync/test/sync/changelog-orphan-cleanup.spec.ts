@@ -130,6 +130,30 @@ describe('change log orphan cleanup', () => {
       expect(after).to.deep.equal(before);
     });
 
+    // Guards the ordering `recordDataEvent` relies on: cleanup runs against
+    // COMMITTED state in its own batch, before the transaction's outer batch lands.
+    // A delete followed by a reinsert of the same pk in ONE transaction must
+    // therefore keep the reinsert — the cleanup ran before those versions existed.
+    // (The reverse order does NOT hold; see
+    // `sync-delete-cleanup-misses-same-batch-writes`.)
+    it('keeps a reinsert that follows a delete of the same row in one transaction', async () => {
+      await insert(1, ['x', 'y', 'z']);
+
+      source.commit({
+        data: [
+          { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'] },
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a', 'b', 'c'] },
+        ],
+      });
+      await settle();
+
+      const versions = await manager.columnVersions.getRowVersions('main', 'users', [1]);
+      expect([...versions.keys()].sort()).to.deep.equal(['col_0', 'col_1', 'col_2']);
+      // 3 live column entries + the tombstone's delete entry (the row is
+      // tombstoned AND rewritten; LWW resolves by HLC, both stay indexed).
+      expect(await countChangeLog(manager)).to.equal(4);
+    });
+
     it('cleans up a column whose name contains the key separator', async () => {
       // A quoted identifier may contain ':' — the change-log key must still be
       // rebuilt from the exact stored column name, not a truncated one.
