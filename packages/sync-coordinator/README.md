@@ -69,6 +69,19 @@ Configuration sources (highest priority first):
 | `SYNC_CORS_ORIGIN` | CORS origins (`true`, `false`, or comma-separated) | `true` |
 | `SYNC_AUTH_MODE` | Auth mode: `none`, `token-whitelist` | `none` |
 | `SYNC_AUTH_TOKENS` | Comma-separated allowed tokens | — |
+| `SYNC_RETENTION_HORIZON_MS` | How long deletion markers and quarantined changes are kept | `2592000000` (30 days) |
+| `SYNC_BATCH_SIZE` | Max changes per sync batch | `1000` |
+
+### Housekeeping
+
+The coordinator sweeps every database it currently has open once an hour, dropping
+deletion markers and quarantined changes older than `SYNC_RETENTION_HORIZON_MS`. Only
+already-open databases are swept — a database nobody is connected to keeps its expired
+records until a client next opens it. See `docs/sync.md` § *Who drives the sweep*.
+
+A client that has been offline for longer than the retention horizon can miss deletes that
+have since been swept, and the server does not yet refuse such a client's incremental sync.
+Keep the horizon comfortably longer than the longest client absence you expect.
 
 ### S3 Durable Storage (Optional)
 

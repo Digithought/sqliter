@@ -87,6 +87,14 @@ export async function runCoordinatorMaintenancePass(
       // it is a sweep issuing reads against a LevelDB handle that closes
       // mid-scan. The pin is refcount-only (never opens a store), so a store
       // closed since the snapshot simply yields undefined and is skipped.
+      //
+      // NOTE: the pin also makes the store ineligible for LRU eviction for the
+      // duration of its sweep — one store at a time, and a sweep over an empty
+      // scan is instant, so it is invisible today. If sweeps ever get slow (a
+      // huge expired-tombstone backlog) on a coordinator sitting at
+      // `maxOpenStores`, an acquire can hit "Cannot evict, all stores have
+      // active references" and open past the cap; then the pass needs to yield
+      // the pin between sweeps rather than hold it across all four.
       const entry = source.acquireIfOpen(databaseId);
       if (!entry) continue;
       pinned = true;

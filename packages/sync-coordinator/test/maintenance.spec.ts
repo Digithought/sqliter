@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
-import type { SyncMaintenanceTarget } from '@quereus/sync';
+import { generateSiteId, type ChangeSet, type HLC, type SyncMaintenanceTarget } from '@quereus/sync';
 import {
   CoordinatorMaintenanceLoop,
   runCoordinatorMaintenancePass,
@@ -311,5 +311,92 @@ describe('StoreManager as a MaintenanceStoreSource', () => {
 
     expect(entries).to.deep.equal([]);
     expect(manager.get('sweep-db')!.refCount).to.equal(0);
+  });
+});
+
+/**
+ * End-to-end reclaim: the point of the whole loop is that expired records
+ * actually leave the store. Everything above proves the plumbing (fan-out,
+ * pinning, isolation); this proves the effect, through a real StoreManager, real
+ * LevelDB stores and real SyncManagers — no fakes.
+ *
+ * Expiry is asserted through `getChangesSince` rather than by scanning `tb:`
+ * keys: that is the only thing a peer can observe, and it does not reach into
+ * the library's key layout.
+ */
+describe('maintenance pass reclaims expired records', () => {
+  let manager: StoreManager;
+  let testDataDir: string;
+
+  /** Negative horizon: every tombstone is instantly expired, so prunes are deterministic. */
+  const EXPIRE_IMMEDIATELY = -1;
+
+  beforeEach(() => {
+    testDataDir = join(tmpdir(), `sync-maintenance-reclaim-${randomUUID()}`);
+    manager = new StoreManager({
+      dataDir: testDataDir,
+      maxOpenStores: 3,
+      idleTimeoutMs: 60_000,
+      cleanupIntervalMs: 60_000,
+      syncConfig: { retentionHorizonMs: EXPIRE_IMMEDIATELY },
+    });
+  });
+
+  afterEach(async () => {
+    await manager.shutdown();
+    await rm(testDataDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  /** One inbound delete, as a relay receives it: a tombstone and nothing else. */
+  function deleteChangeSet(originSiteId: Uint8Array, pk: number): ChangeSet {
+    const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: originSiteId, opSeq: 0 };
+    return {
+      siteId: originSiteId,
+      transactionId: `txn-${pk}`,
+      hlc,
+      changes: [{ type: 'delete', schema: 'main', table: 'users', pk: [pk], hlc }],
+      schemaMigrations: [],
+    };
+  }
+
+  it('drops an expired tombstone, and the delete it served, from a swept store', async () => {
+    const origin = generateSiteId();
+    const peer = generateSiteId();
+
+    const entry = await manager.acquire('reclaim-db');
+    await entry.syncManager.applyChanges([deleteChangeSet(origin, 1)]);
+    // Visible to a peer before the sweep: the tombstone backs a relayable delete.
+    expect(await entry.syncManager.getChangesSince(peer)).to.have.length(1);
+    manager.release('reclaim-db');
+
+    const { log, entries } = makeLogger();
+    await runCoordinatorMaintenancePass(manager, log);
+    expect(entries).to.deep.equal([]);
+
+    // Gone: the tombstone is past the horizon and so is the change-log entry
+    // pointing at it. Without the coordinator's loop this would still be 1.
+    expect(await entry.syncManager.getChangesSince(peer)).to.deep.equal([]);
+  });
+
+  it('reclaims in every open store from one pass (multi-tenant fan-out)', async () => {
+    const origin = generateSiteId();
+    const peer = generateSiteId();
+
+    const first = await manager.acquire('tenant-one');
+    await first.syncManager.applyChanges([deleteChangeSet(origin, 1)]);
+    manager.release('tenant-one');
+
+    const second = await manager.acquire('tenant-two');
+    await second.syncManager.applyChanges([deleteChangeSet(origin, 2)]);
+    manager.release('tenant-two');
+
+    const { log, entries } = makeLogger();
+    await runCoordinatorMaintenancePass(manager, log);
+
+    expect(entries).to.deep.equal([]);
+    expect(await first.syncManager.getChangesSince(peer)).to.deep.equal([]);
+    expect(await second.syncManager.getChangesSince(peer)).to.deep.equal([]);
+    // Neither store was closed or opened by the sweep.
+    expect(manager.openDatabaseIds().sort()).to.deep.equal(['tenant-one', 'tenant-two']);
   });
 });

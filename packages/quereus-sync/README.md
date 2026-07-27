@@ -178,6 +178,15 @@ This means concurrent updates to *different* columns of the same row both apply,
 - `SyncManager` - Main sync coordination interface
 - `SyncEventEmitter` / `SyncEventEmitterImpl` - Event subscription interface and implementation
 
+### Maintenance Exports
+
+The four housekeeping sweeps (`drainHeldChanges` / `pruneQuarantine` / `pruneTombstones` / `evictExpiredBasisTables`) are methods on `SyncManager`; this package deliberately schedules none of them — the host arms the timer. What it does ship is the *shape* of one pass, so every host runs the same semantics:
+
+- `runSyncMaintenancePass(target, log)` - Runs all four sweeps in drain-before-prune order. Each sweep is error-isolated (a throw is reported to `log` and the remaining sweeps still run); the pass never rejects
+- `createSyncMaintenanceTicker(getTarget, log)` - Wraps the pass with the single-flight and null-target guards a timer needs. The collapsed tick resolves immediately rather than joining the running pass — a host that must *await* the in-flight pass (to close stores at shutdown) should hold the pass promise itself
+- `SYNC_MAINTENANCE_INTERVAL_MS` - Suggested cadence (5 minutes), sized for the one latency-sensitive sweep (`drainHeldChanges`). A host where that sweep is inert — a relay with no `getTableSchema` oracle — is free to run slower
+- `SyncMaintenanceTarget` / `MaintenanceLogger` - The structural slice of `SyncManager` the pass calls, and the failure-reporting callback
+
 ### Clock Exports
 
 - `HLCManager` - Hybrid Logical Clock manager
