@@ -208,7 +208,7 @@ This ensures type information flows through the entire planning and execution pi
 - Values: Native JS objects, arrays, and JSON-compatible primitives (stored in memory as-is)
 - Validation: Must be valid JSON; accepts objects, arrays, numbers, booleans, strings (parsed as JSON), and null
 - Comparison: Deep structural comparison (`deepCompareJson`). **Object key order is not significant** — `{a:1,b:2}` equals `{b:2,a:1}` — but **array element order is** (positional). Numeric storage class holds, so a JSON *number* scalar `5` equals `5.0`. A JSON **string** scalar always compares as text — under the supplied collation, or BINARY (code-point order) when none is given — so the strings `"9"` and `"9.0"` are distinct values and never collapse onto one row.
-- Comparison against SQL text: JSON's values are native JS objects, a storage class that never compares equal to a string, so a text operand is converted **at plan time** — `insertCrossTypeCoercion` (`planner/building/expression.ts`) wraps the non-object side of a comparison / BETWEEN bound / IN-list value / simple-`case` WHEN in `cast(… as json)`. `json_col = '{ "a" : 1 }'` therefore matches a row stored as `{"a":1}`, and an unhinted bound parameter (plan-time type TEXT) comes along for free. One surface is **not** covered: `json_col in (select text_col from …)` compares per subquery row rather than against a fixed operand list, so it is still unconditionally false — see `tickets/backlog/bug-json-in-subquery-not-structural`. The gate is `physicalType === OBJECT`, not `semanticOrdering` — the temporal types are physically text and keep their existing runtime path. The cast is lenient: text that is not valid JSON comes back unchanged and simply compares unequal, so `json_col = 'not json'` is false rather than an error. One consequence for JSON *string scalars*, which are physically plain strings: a column holding `"hello"` matches both `'"hello"'` and the bare `'hello'`.
+- Comparison against SQL text: JSON's values are native JS objects, a storage class that never compares equal to a string, so a text operand is converted **at plan time** — `insertCrossTypeCoercion` (`planner/building/expression.ts`) wraps the non-object side of a comparison / BETWEEN bound / IN-list value / simple-`case` WHEN in `cast(… as json)`. `json_col = '{ "a" : 1 }'` therefore matches a row stored as `{"a":1}`, and an unhinted bound parameter (plan-time type TEXT) comes along for free. One surface is **not** covered: `json_col in (select text_col from …)` compares per subquery row rather than against a fixed operand list, so it is still unconditionally false — see `tickets/backlog/bug-json-in-subquery-not-structural`. The gate is `physicalType === OBJECT`, not `semanticOrdering` — the temporal types are physically text and keep their existing runtime path. The cast is lenient: text that is not valid JSON source still compares unequal rather than erroring, so `json_col = 'not json'` is false. It gets there two ways — a bare string is itself a valid JSON *string scalar*, so the JSON type accepts it and the operand survives the cast; anything the JSON type does not accept at all (a blob, say) casts to NULL, which also compares unequal. One consequence for JSON *string scalars*, which are physically plain strings: a column holding `"hello"` matches both `'"hello"'` and the bare `'hello'`.
 - Ordering: **Semantic** (`semanticOrdering: true`) — ORDER BY and `<`/`>` on a declared JSON column rank by the structural deep-compare (JSON type rank: null < boolean < number < string < array < object, then element/key-wise recursion — so `{"a":2}` sorts before `{"a":10}`), not by canonical JSON text. Equality is identical under both forms, so identity paths (DISTINCT, GROUP BY, hash keys) need no change. See "Semantic ordering" below.
 - Keys: hash keys (GROUP BY / DISTINCT / join partitioning) derive from a **canonical text form** (`canonicalJsonString` — recursive object-key sort, arrays positional) so a value's key always agrees with the comparator: reorder-equal objects group/de-dup/conflict as one, distinct objects never over-merge. Persisted byte keys (a JSON PK / index member in `quereus-store`) instead encode a **structural byte form** (`jsonStructuralKey`, `quereus-store`'s json-key.ts) — same identity, and its memcmp order also reproduces the structural compare, so the store scans JSON keys in `compare` order. Both forms are used **only to derive keys** — never for storage or display. The canonical text form also fingerprints object-valued literals for scalar CSE (`planner/analysis/expression-fingerprint.ts`), so two distinct documents are never folded into one shared computation. The memory module keeps documents as native values and orders its BTree with the same `JSON_TYPE` comparator `<`/`>`/ORDER BY use, so an indexed range seek walks exactly the window the operators evaluate. (The canonical-text form's own order sorts by JSON punctuation and does *not* reproduce the structural compare — it is never used to order a JSON index; identity is all it provides.)
 - Collations: None
@@ -409,10 +409,19 @@ defect. Known cases:
   (`SetOperationNode.resolvedDataType` overrides only collation), so a `union`
   whose arms disagree mis-describes one arm's values — ticket
   `union-branch-value-not-converted-on-write`.
-- `CAST` is lenient: when the target type's `parse` throws and the type has no
-  numeric/text fallback, `emitCast` returns the operand unchanged while still
-  advertising the target type — ticket
-  `failed-cast-stores-unconverted-value`.
+
+`CAST` is the settled case, and states the rule the others must meet: it stays
+lenient — it never throws — but it never produces a value outside the type it
+advertises either. When the target type's `parse` throws, `castFallback`
+(`runtime/emit/cast.ts`) applies SQLite's numeric/text/blob fallbacks (`0`,
+`0.0`, `String(v)`, UTF-8 bytes — each a valid member of its own type); for
+every other target it keeps the operand only when the target type's own
+`validate` accepts it, and yields NULL otherwise. `parse` reads its input as
+source *text*, so `validate` is the right question to ask: a bare string is a
+legitimate JSON string scalar that `JSON_TYPE.parse` nonetheless rejects.
+Because a converting cast can now produce NULL from a non-null operand,
+`CastNode.getType()` reports `nullable` for any cast that changes the logical
+type.
 
 ### Explicit Conversion
 

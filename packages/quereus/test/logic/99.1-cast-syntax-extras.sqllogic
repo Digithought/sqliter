@@ -59,3 +59,78 @@ select cast(0.5 as boolean) as r;
 
 select cast(0.0 as boolean) as r;
 → [{"r":false}]
+
+-- =============================================================================
+-- A failed CAST yields NULL, never the unconverted operand
+-- =============================================================================
+-- The numeric/text/blob targets keep SQLite's lenient fallbacks (0, '', bytes).
+-- Every other target has no such fallback, so a value it cannot convert simply
+-- has no result: the cast is NULL rather than a value outside the target type.
+
+select cast('junk' as date) as r;
+→ [{"r":null}]
+
+select cast('junk' as time) as r;
+→ [{"r":null}]
+
+select cast('junk' as datetime) as r;
+→ [{"r":null}]
+
+select cast('junk' as timespan) as r;
+→ [{"r":null}]
+
+select cast('junk' as boolean) as r;
+→ [{"r":null}]
+
+-- A blob is not a JSON value under any reading, so the cast has no result.
+select cast(x'0102' as json) as r;
+→ [{"r":null}]
+
+-- But a bare string IS a valid JSON string scalar even though it is not valid
+-- JSON *source text*, so JSON's own validate keeps it.
+select cast('abc' as json) as r;
+→ [{"r":"abc"}]
+
+-- Successful casts are unaffected.
+select cast('2024-03-05' as date) as r;
+→ [{"r":"2024-03-05"}]
+
+select cast('true' as boolean) as r;
+→ [{"r":true}]
+
+-- Numeric/text/blob fallbacks still apply and still produce their own type.
+select cast('junk' as integer) as r;
+→ [{"r":0}]
+
+select cast('junk' as real) as r;
+→ [{"r":0}]
+
+-- -----------------------------------------------------------------------------
+-- Write path: the NULL reaches storage as a NULL, not as garbage
+-- -----------------------------------------------------------------------------
+
+create table cast_dt (id integer primary key, dt date null);
+
+insert into cast_dt values (1, cast('junk' as date));
+select id, dt, typeof(dt) as ty from cast_dt where id = 1;
+→ [{"id":1,"dt":null,"ty":"null"}]
+
+-- A successful cast round-trips through storage unchanged.
+insert into cast_dt values (2, cast('2024-03-05' as date));
+select id, dt, typeof(dt) as ty from cast_dt where id = 2;
+→ [{"id":2,"dt":"2024-03-05","ty":"text"}]
+
+-- The stored date still orders as a date, not as the raw operand would have.
+select id from cast_dt where dt > '2000-01-01' order by id;
+→ [{"id":2}]
+
+drop table cast_dt;
+
+-- Columns are NOT NULL by default, so the same insert is rejected outright
+-- instead of storing a value the column's type does not admit.
+create table cast_dt_nn (id integer primary key, dt date not null);
+
+insert into cast_dt_nn values (1, cast('junk' as date));
+-- error: NOT NULL constraint failed
+
+drop table cast_dt_nn;

@@ -705,13 +705,19 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 		const operandType = this.operand.getType();
 		const targetType = this.expression.targetType;
 
-		// Look up the logical type from the type registry
-		const logicalType = typeRegistry.getTypeOrDefault(targetType);
+		// Resolve through inferType, not getTypeOrDefault: the emitter (runtime/emit/cast.ts)
+		// uses inferType, and the two disagree for any name that misses the registry but
+		// matches an affinity rule (`cast(5 as nvarchar)` produces TEXT, not BLOB).
+		const logicalType = typeRegistry.inferType(targetType);
 
 		return {
 			typeClass: 'scalar',
 			logicalType,
-			nullable: operandType.nullable, // CAST preserves nullability
+			// A converting CAST is nullable even from a non-null operand: `cast('' as integer)`
+			// is null because INTEGER's parse maps the empty string to null, and a conversion
+			// that fails outright now yields null rather than the unconverted operand.
+			// A cast to the operand's own type converts nothing, so it keeps its nullability.
+			nullable: operandType.nullable || logicalType !== operandType.logicalType,
 			isReadOnly: operandType.isReadOnly,
 			collationName: logicalType.isTextual ? operandType.collationName : undefined,
 			collationSource: logicalType.isTextual ? operandType.collationSource : undefined,

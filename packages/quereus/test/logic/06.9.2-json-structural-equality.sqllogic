@@ -44,8 +44,9 @@ select id from jse_t where v <> '{"b":2,"a":1}' order by id;
 -- ===================================
 -- 2. Text that is not valid JSON is FALSE, never an error
 -- ===================================
--- CAST to JSON is lenient: a parse failure returns the operand unchanged, so the
--- comparison is simply unequal.
+-- CAST to JSON is lenient: a parse failure yields NULL, except where the JSON type
+-- itself still accepts the operand — a bare string is a valid JSON string scalar, so
+-- it survives the cast and the comparison is simply unequal rather than an error.
 select id from jse_t where v = 'not json';
 → []
 
