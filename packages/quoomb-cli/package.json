@@ -24,7 +24,9 @@
     "build": "tsc",
     "dev": "tsc && node dist/bin/quoomb.js",
     "lint": "echo 'No lint configured'",
-    "//test": "NOTE: test/dot-commands.spec.ts smoke-tests table listing, schema display, CSV import type-inference, and export — the non-trivial logic here. --passWithNoTests stays as a safety net (not because this package is meant to stay test-free) so an empty glob doesn't fail the build.",
+    "//typecheck": "NOTE: tsconfig.json only includes src/, and vitest transpiles specs without checking them, so without this pass a signature change in src/ would leave test/ silently stale. Same arrangement as plugin-loader's typecheck.",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "//test": "NOTE: test/dot-commands.spec.ts smoke-tests table listing, schema display, CSV import type-inference, and export — the non-trivial logic here. test/remote-resolver.spec.ts covers the https plugin-load wiring (resolver install, fetch announcement, recorded hash), with fetch stubbed so nothing touches the network. --passWithNoTests stays as a safety net (not because this package is meant to stay test-free) so an empty glob doesn't fail the build.",
     "test": "vitest run --passWithNoTests",
     "prepublish": "npm run build"
   },

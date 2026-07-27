@@ -52,9 +52,11 @@ export interface NodeRemoteResolverOptions {
  */
 export function createNodeRemoteResolver(options: NodeRemoteResolverOptions = {}): RemoteModuleResolver {
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
-	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 
 	return async (url: URL): Promise<string> => {
+		// Resolved per call, not at construction: a host installs the resolver at
+		// startup, which may be before a `fetch` polyfill (or a test double) exists.
+		const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 		const response = await fetchImpl(url.toString());
 		if (!response.ok) {
 			throw new Error(

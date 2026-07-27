@@ -416,6 +416,13 @@ const savePlugins = async (plugins: PluginRecord[]): Promise<void> => {
  * where taking the new hash as expected is the point; startup autoload leaves
  * the record alone so it keeps warning until the user acts on it.
  *
+ * NOTE: every call site runs *after* `dynamicLoadModule`, so the warning reports
+ * code that has already been imported and registered. That is consistent with
+ * warn-don't-block, but it means the comparison cannot be turned into a refusal
+ * where it stands. If the CLI ever wants to gate on the hash, the check has to
+ * move into the resolver's `onFetched` (which is awaited before the import),
+ * which needs the expected hash per URL available there.
+ *
  * @returns true when the record changed and the caller should save it.
  */
 const reconcilePluginHash = (plugin: PluginRecord, adopt: boolean): boolean => {
@@ -754,9 +761,16 @@ export const loadEnabledPlugins = async (db: Database): Promise<void> => {
     } catch (error) {
       console.log(`Warning: Failed to load plugin ${plugin.manifest?.name || plugin.url}: ${error instanceof Error ? error.message : 'Unknown error'}`);
 
-      // Disable the plugin if it failed to load
+      // Disable the plugin if it failed to load. Say so — a remote plugin can
+      // fail for a reason that has nothing to do with the plugin (the host was
+      // offline), and a silent disable leaves the user with no idea why it
+      // stopped loading. `.plugin enable` matches on the manifest name, so it is
+      // only worth naming when a manifest was cached.
       plugin.enabled = false;
       await savePlugins(plugins);
+      console.log(plugin.manifest?.name
+        ? `  Disabled it; run '.plugin enable ${plugin.manifest.name}' to try again.`
+        : `  Disabled it.`);
     }
   }
 };

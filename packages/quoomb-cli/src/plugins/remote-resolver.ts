@@ -16,18 +16,28 @@ import type { RemoteModuleFetch } from '@quereus/plugin-loader';
  * Most recent fetch per requested URL. Read back by the `.plugin` commands so an
  * installed plugin's recorded hash can be compared against what was actually
  * served this time.
+ *
+ * Keyed by {@link normalizeUrlKey}, not the raw string: the loader hands the
+ * resolver a parsed `URL`, so what arrives here is already normalized, while a
+ * plugin record holds whatever the user typed.
  */
 const lastFetchByUrl = new Map<string, RemoteModuleFetch>();
 
+let installed = false;
+
 /**
- * Installs the Node remote-module resolver. Call once at startup, before any
- * plugin load — config autoload, saved-plugin autoload, and the interactive
- * `.plugin` commands all go through the same loader.
+ * Installs the Node remote-module resolver. Called from every CLI entry point
+ * (`bin/quoomb.ts` and the package index) before any plugin load — config
+ * autoload, saved-plugin autoload, and the interactive `.plugin` commands all go
+ * through the same loader. Repeat calls are ignored.
  */
 export function installRemotePluginResolver(): void {
+	if (installed) return;
+	installed = true;
+
 	installNodeRemoteModuleResolver({
 		onFetched: (info: RemoteModuleFetch) => {
-			lastFetchByUrl.set(info.url, info);
+			lastFetchByUrl.set(normalizeUrlKey(info.url), info);
 			console.log(chalk.gray(
 				`Fetched plugin ${info.url} (${formatBytes(info.bytes)}, sha256 ${info.sha256})`
 			));
@@ -40,7 +50,20 @@ export function installRemotePluginResolver(): void {
  * not been fetched in this process (a `file:` plugin, for instance, never is).
  */
 export function getLastFetchedHash(url: string): string | undefined {
-	return lastFetchByUrl.get(url)?.sha256;
+	return lastFetchByUrl.get(normalizeUrlKey(url))?.sha256;
+}
+
+/**
+ * Canonical form of a plugin URL, so `https://Example.com:443/p.mjs` and
+ * `https://example.com/p.mjs` are recognized as the same fetch. Unparseable
+ * input falls through unchanged — it never matches a recorded fetch anyway.
+ */
+function normalizeUrlKey(url: string): string {
+	try {
+		return new URL(url).href;
+	} catch {
+		return url;
+	}
 }
 
 function formatBytes(bytes: number): string {

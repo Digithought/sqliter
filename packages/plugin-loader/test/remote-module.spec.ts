@@ -14,7 +14,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import type { Database } from '@quereus/quereus';
 import { dynamicLoadModule, setRemoteModuleResolver } from '../src/index.js';
-import { isNodeRuntime } from '../src/plugin-loader.js';
+import { isNodeRuntime, resolveImportSpecifier } from '../src/plugin-loader.js';
 import { createNodeRemoteResolver, installNodeRemoteModuleResolver } from '../src/node-remote.js';
 import type { RemoteModuleFetch } from '../src/index.js';
 import { capturePluginSource, readCapturedConfig, clearCapturedConfig } from './helpers/plugin-fixtures.js';
@@ -96,6 +96,47 @@ describe('https module loads under Node', () => {
 
 			vi.stubGlobal('process', { env: {} });   // a bundler's process shim
 			expect(isNodeRuntime()).toBe(false);
+		});
+	});
+
+	// The specifier a load will be handed, without performing the load — the only
+	// way to observe the browser/worker branch from a Node test runner.
+	describe('specifier routing', () => {
+		it('imports an https URL directly in a browser or worker', async () => {
+			vi.stubGlobal('process', { env: {} });   // not Node: no versions.node
+
+			expect(await resolveImportSpecifier(new URL(MODULE_URL))).toBe(MODULE_URL);
+		});
+
+		it('cache-busts a localhost dev server in a browser or worker', async () => {
+			vi.stubGlobal('process', { env: {} });
+
+			const specifier = await resolveImportSpecifier(new URL('https://localhost:5173/plugin.mjs'));
+			expect(specifier).toMatch(/^https:\/\/localhost:5173\/plugin\.mjs\?t=\d+$/);
+		});
+
+		it('cache-busts a file URL without consulting a resolver', async () => {
+			setRemoteModuleResolver(() => {
+				throw new Error('a file: URL must not reach the remote resolver');
+			});
+
+			expect(await resolveImportSpecifier(new URL('file:///plugins/plugin.mjs')))
+				.toMatch(/^file:\/\/\/plugins\/plugin\.mjs\?t=\d+$/);
+		});
+
+		it('prefers an installed resolver over the native import, even outside Node', async () => {
+			vi.stubGlobal('process', { env: {} });
+			setRemoteModuleResolver(async () => 'file:///tmp/from-resolver.mjs');
+
+			expect(await resolveImportSpecifier(new URL(MODULE_URL))).toBe('file:///tmp/from-resolver.mjs');
+		});
+
+		it('leaves the caller\'s URL untouched, so the manifest still resolves beside it', async () => {
+			const moduleUrl = new URL('file:///plugins/dist/plugin.mjs');
+
+			await resolveImportSpecifier(moduleUrl);
+
+			expect(moduleUrl.href).toBe('file:///plugins/dist/plugin.mjs');
 		});
 	});
 
@@ -201,6 +242,14 @@ describe('https module loads under Node', () => {
 			});
 
 			await expect(resolver(new URL(MODULE_URL))).resolves.toMatch(/^file:/);
+		});
+
+		it('rejects a final URL it cannot parse', async () => {
+			const resolver = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => responseRedirectedTo('export default () => ({});', 'not a url'))
+			});
+
+			await expect(resolver(new URL(MODULE_URL))).rejects.toThrow(/unparseable URL 'not a url'/);
 		});
 
 		it('rejects a body over maxBytes', async () => {

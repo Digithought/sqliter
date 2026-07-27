@@ -165,8 +165,12 @@ export async function dynamicLoadModule(
  *
  * Never mutates `moduleUrl` — the caller still needs the original to resolve the
  * plugin's `package.json` against.
+ *
+ * @internal Exported for tests only — the browser/worker branch cannot be
+ * reached through {@link dynamicLoadModule} under Node, since the import it
+ * returns a specifier for would then be attempted for real.
  */
-async function resolveImportSpecifier(moduleUrl: URL): Promise<string> {
+export async function resolveImportSpecifier(moduleUrl: URL): Promise<string> {
 	if (moduleUrl.protocol === 'file:') {
 		return withCacheBuster(moduleUrl);
 	}
