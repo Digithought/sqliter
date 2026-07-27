@@ -2201,6 +2201,85 @@ describe('IsolationModule', () => {
 			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
 		});
 
+		it('DROP NOT NULL takes effect for the rest of the transaction even though it never reaches the overlay', async () => {
+			// The relaxing direction is withheld from the overlay along with the tightening one,
+			// so the overlay's column keeps its stale NOT NULL flag. That is only safe while
+			// nothing on the overlay path reads the flag — pin it by staging a NULL right after.
+			await db.exec(`CREATE TABLE csp_dn (id INTEGER PRIMARY KEY, v TEXT NOT NULL) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_dn VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE csp_dn ALTER COLUMN v DROP NOT NULL`);
+			await db.exec(`INSERT INTO csp_dn VALUES (2, NULL)`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_dn ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'the staged NULL is visible in-transaction').to.deep.equal([[1, 'a'], [2, null]]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_dn ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'and survives the flush').to.deep.equal([[1, 'a'], [2, null]]);
+		});
+
+		it('SET COLLATE forwards to the overlay and keeps the savepoint ledger', async () => {
+			// The only route by which `set collate` reaches an open overlay is
+			// `MemoryTable.alterSchema` → `manager.alterColumn`, which used to drop the
+			// `setCollation` attribute on the way through. With every attribute dropped the
+			// manager raises INTERNAL ('ALTER COLUMN requires an attribute to change'), so this
+			// ALTER fails outright for any connection holding an overlay. Non-PK column: a
+			// collation change on a PRIMARY KEY member inside a transaction is a separate,
+			// still-open carve-out (`alter-collate-pk-in-transaction`).
+			await db.exec(`CREATE TABLE csp_cl (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_cl VALUES (1, 'A')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_cl VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE csp_cl ALTER COLUMN v SET COLLATE NOCASE`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_cl ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'only the pre-savepoint row survives').to.deep.equal([[1, 'A']]);
+
+			const matched = await asyncIterableToArray(db.eval(`SELECT id FROM csp_cl WHERE v = 'a'`));
+			expect(matched.map((r: any) => r.id), 'NOCASE is in effect after the ALTER').to.deep.equal([1]);
+		});
+
+		it('ADD CONSTRAINT CHECK forwards to the overlay, enforces in-transaction, and DROPs by name', async () => {
+			// CHECK is the one constraint class forwarded verbatim (schema-only). Enforcement is
+			// engine-side, so the assertion that matters here is that the forward neither
+			// disturbs the staged rows nor leaves the overlay unable to resolve the constraint
+			// by name when a later DROP arrives.
+			await db.exec(`CREATE TABLE csp_ck (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_ck VALUES (1, 'ok')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO csp_ck VALUES (2, 'also-ok')`);
+			await db.exec(`ALTER TABLE csp_ck ADD CONSTRAINT c_v CHECK (v <> 'bad')`);
+
+			let err: unknown;
+			try { await db.exec(`INSERT INTO csp_ck VALUES (3, 'bad')`); } catch (e) { err = e; }
+			expect(err, 'the new CHECK enforces for the rest of the transaction').to.be.instanceOf(QuereusError);
+
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+			await db.exec(`COMMIT`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_ck ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'only the pre-savepoint row survives').to.deep.equal([[1, 'ok']]);
+
+			// The DROP resolves against the overlay's own copy of the constraint (a name the
+			// overlay never carried would silently no-op instead — see the presence guard).
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO csp_ck VALUES (4, 'ok4')`);
+			await db.exec(`ALTER TABLE csp_ck DROP CONSTRAINT c_v`);
+			await db.exec(`INSERT INTO csp_ck VALUES (5, 'bad')`);
+			await db.exec(`COMMIT`);
+
+			rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM csp_ck ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'the drop took effect; staged rows kept').to.deep.equal([[1, 'ok'], [4, 'ok4'], [5, 'bad']]);
+		});
+
 		it('ADD CONSTRAINT UNIQUE over a primary-key member ignores in-transaction deletion markers', async () => {
 			// The spike's failing shape: two staged deletions share a = 1, and a naive UNIQUE
 			// forward to the overlay saw the two tombstones as duplicates of each other

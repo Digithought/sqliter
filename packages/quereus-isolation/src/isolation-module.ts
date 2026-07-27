@@ -983,7 +983,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * covers the data conditions the pre-validation pass rejects before any overlay is touched;
 	 * this one covers a UNIQUE (or any other) violation raised by the in-place adoption itself.
 	 */
-	private buildRebuildPoisonMessage(schemaName: string, tableName: string, ddlDescription: string, cause: string): string {
+	private buildInPlaceAdoptPoisonMessage(schemaName: string, tableName: string, ddlDescription: string, cause: string): string {
 		return `Another connection's ${ddlDescription} on '${schemaName}.${tableName}' declared a constraint this connection's `
 			+ `uncommitted rows violate (${cause}); roll back this transaction.`;
 	}
@@ -1277,7 +1277,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * judged by the DDL's own validation pass, so a rejection here means validation and
 	 * migration have drifted — {@link issuerOverlayDriftError}); a foreign overlay →
 	 * poison and leave it untouched so its owner errors and rolls back
-	 * ({@link buildRebuildPoisonMessage}). Any non-CONSTRAINT failure is a layer-invariant
+	 * ({@link buildInPlaceAdoptPoisonMessage}). Any non-CONSTRAINT failure is a layer-invariant
 	 * violation, not a data condition, and rethrows for everyone.
 	 *
 	 * Shared by the index paths ({@link applyIndexChangeToOverlays}) and the ALTER TABLE
@@ -1296,7 +1296,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		} catch (e) {
 			if (!(e instanceof QuereusError) || e.code !== StatusCode.CONSTRAINT) throw e;
 			if (isIssuer) throw this.issuerOverlayDriftError(schemaName, tableName, ddlDescription, e);
-			overlayState.poison = { message: this.buildRebuildPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
+			overlayState.poison = { message: this.buildInPlaceAdoptPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
 		}
 	}
 
@@ -2047,15 +2047,31 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * their savepoint snapshots intact, and NULLs pass a retype untouched, so tombstone rows —
 	 * placeholder NULLs at every non-key data column — ride through unharmed.
 	 *
-	 * `set not null` must NOT forward: the overlay's copy of the column stays nullable.
-	 * Tombstone rows carry NULL at every non-PK data column, so the overlay module's own
-	 * tightening would backfill a deletion marker's placeholder NULL from the DEFAULT
-	 * (corrupting a row that is not a row) or reject it outright when no usable DEFAULT
-	 * exists. The base's NOT NULL is enforced where it belongs — by the underlying over the
-	 * issuer's effective rows, and per overlay by {@link validateOverlayMigration} — and the
-	 * staged LIVE rows' NULLs are filled here via {@link backfillStagedNotNull}. The runtime
-	 * admits exactly one attribute per ALTER COLUMN, so a `setNotNull` change carries nothing
-	 * else to forward. A missing overlay `alterSchema` is a no-op, as in
+	 * Neither NOT NULL direction forwards, and the overlay's `notNull` flag is left where it
+	 * stood when the overlay was created:
+	 *
+	 * - **Tightening (`set not null`).** Forwarding would have the overlay module tighten a
+	 *   column whose tombstone rows carry NULL at every non-PK data column, so it would either
+	 *   backfill a deletion marker's placeholder NULL from the DEFAULT (corrupting a row that
+	 *   is not a row) or reject it outright when no usable DEFAULT exists. The base's NOT NULL
+	 *   is enforced where it belongs — by the underlying over the issuer's effective rows, and
+	 *   per overlay by {@link validateOverlayMigration} — and the staged LIVE rows' NULLs are
+	 *   filled here via {@link backfillStagedNotNull}.
+	 * - **Relaxing (`drop not null`).** Nothing to do: the overlay never enforced the flag, and
+	 *   the rows it stages are written with `preCoerced: true` through the overlay module's own
+	 *   write path, which does not consult column nullability at all.
+	 *
+	 * NOTE: both directions therefore leave the overlay's `notNull` flag drifted from the base
+	 * for the rest of the transaction. Inert today — nothing on the overlay path reads it. The
+	 * one consumer that would, `MemoryTableModule.getBestAccessPlan` (which prunes `IS NULL` on
+	 * a NOT NULL column to an empty result), is unreachable because the isolation layer builds
+	 * the overlay's `FilterInfo` itself (see `filter-info.ts`) instead of planning against the
+	 * overlay module. If overlay scans ever route through the overlay module's planner hook, or
+	 * its write path starts enforcing nullability, this has to become a real forward that
+	 * excludes tombstones.
+	 *
+	 * The runtime admits exactly one attribute per ALTER COLUMN, so a `setNotNull` change
+	 * carries nothing else to forward. A missing overlay `alterSchema` is a no-op, as in
 	 * {@link forwardColumnShapeToOverlay}.
 	 */
 	private async forwardAlterColumnToOverlay(

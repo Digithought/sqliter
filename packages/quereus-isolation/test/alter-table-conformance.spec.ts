@@ -529,8 +529,9 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		const err = await attemptAlter(db, `alter table t alter column v set data type integer`);
 		expect(err, 'the converted values collide, so the retype must reject').to.be.instanceOf(QuereusError);
 		// The underlying's UNIQUE re-validation over the issuer's CONVERTED effective rows fires
-		// first, so this is a clean CONSTRAINT — not the INTERNAL `adoptRebuiltOverlay` raises when
-		// a rebuild hits a constraint the DDL's own validation pass had already accepted.
+		// first, so this is a clean CONSTRAINT — not the INTERNAL `applyInPlaceOverlayChange`
+		// raises when the issuer's own overlay rejects a constraint the DDL's own validation
+		// pass had already accepted.
 		expect(err!.code, `reject code was ${err!.code} (${err!.message})`).to.equal(StatusCode.CONSTRAINT);
 
 		await db.exec('rollback');
