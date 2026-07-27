@@ -98,12 +98,23 @@ select cast('2024-03-05' as date) as r;
 select cast('true' as boolean) as r;
 → [{"r":true}]
 
+-- A blob is not a date under any reading either.
+select cast(x'0102' as date) as r;
+→ [{"r":null}]
+
 -- Numeric/text/blob fallbacks still apply and still produce their own type.
 select cast('junk' as integer) as r;
 → [{"r":0}]
 
 select cast('junk' as real) as r;
 → [{"r":0}]
+
+-- Every fallback arm yields a value that inhabits the type the cast advertises.
+-- typeof() reports the storage class, so REAL's 0.0 reads as 'integer'.
+select typeof(cast('junk' as integer)) as i, typeof(cast('junk' as real)) as r,
+	typeof(cast('junk' as numeric)) as n, typeof(cast(x'0102' as text)) as t,
+	typeof(cast('junk' as blob)) as b;
+→ [{"i":"integer","r":"integer","n":"integer","t":"text","b":"blob"}]
 
 -- -----------------------------------------------------------------------------
 -- Write path: the NULL reaches storage as a NULL, not as garbage

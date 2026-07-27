@@ -26,6 +26,11 @@ export function emitCast(plan: CastNode, ctx: EmissionContext): Instruction {
 			}
 		}
 
+		// NOTE: a type with no `parse` defines no conversion, so the operand passes
+		// through while the cast still advertises the target type — the very shape
+		// castFallback exists to prevent. Unreachable today: NULL is the only builtin
+		// without `parse`, and the parser rejects it as a CAST target. If a plugin
+		// ever registers a parse-less type, validate here too.
 		return operandValue;
 	}
 

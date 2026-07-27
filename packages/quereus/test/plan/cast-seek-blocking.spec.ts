@@ -59,4 +59,13 @@ describe('Plan shape: converting CAST blocks index seek', () => {
 		const ops = await planOps(db, "SELECT x FROM t WHERE CAST(x AS TEXT) = '1'");
 		expect(ops).to.include('INDEXSEEK');
 	});
+
+	it('affinity-only alias of the key type is a no-op CAST and still seeks', async () => {
+		// NVARCHAR misses the type registry but matches the CHAR affinity rule, so it
+		// resolves to TEXT — the same type the emitter parses with. While the planner
+		// resolved it to BLOB the cast read as *converting* and blocked the seek even
+		// though the runtime changed nothing.
+		const ops = await planOps(db, "SELECT x FROM t WHERE CAST(x AS NVARCHAR) = '1'");
+		expect(ops).to.include('INDEXSEEK');
+	});
 });

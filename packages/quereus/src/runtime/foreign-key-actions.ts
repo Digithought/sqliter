@@ -270,6 +270,17 @@ export async function executeForeignKeyActions(
 			const parentColIndices = resolveReferencedColumns(fk, parentTable);
 			if (parentColIndices.length !== fk.columns.length) continue;
 
+			// UPDATE: an ON UPDATE action propagates a change to the parent's REFERENCED
+			// columns, so an update that leaves them alone must not touch the child at
+			// all. Without this the child DML re-issues unconditionally: SET DEFAULT /
+			// SET NULL silently re-point or null the child, and CASCADE rewrites the
+			// child to the value it already holds (a real storage write plus a
+			// data-change event with an empty changed-column list). Same short-circuit
+			// the RESTRICT sites and the lens walker already apply.
+			if (operation === 'update' && newRow !== undefined) {
+				if (!anyReferencedColumnChanged(parentColIndices, oldRow, newRow)) continue;
+			}
+
 			// Get old parent values for the referenced columns
 			const oldParentValues = parentColIndices.map(idx => oldRow[idx]);
 

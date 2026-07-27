@@ -53,6 +53,18 @@ select id from jse_t where v = 'not json';
 select count(*) as c from jse_t where v = '{unclosed';
 → [{"c":0}]
 
+-- An operand the JSON type rejects outright (a blob is a JSON value under no
+-- reading) casts to NULL, so the comparison is UNKNOWN rather than false: `<>`
+-- yields no rows either, where a text operand's `<>` yields every row.
+select count(*) as c from jse_t where v = x'0102';
+→ [{"c":0}]
+
+select count(*) as c from jse_t where v <> x'0102';
+→ [{"c":0}]
+
+select count(*) as c from jse_t where v <> 'not json';
+→ [{"c":4}]
+
 -- SQL NULL on either side stays UNKNOWN (no rows), not an error.
 select count(*) as c from jse_t where v = null;
 → [{"c":0}]
