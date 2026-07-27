@@ -458,7 +458,11 @@ arms cannot change the result), OR-merging nullability alongside:
 3. **Both numeric** → the usual promotion (NUMERIC ⊃ REAL ⊃ INTEGER) — the same
    promotion arithmetic (`BinaryOpNode.generateType`) and polymorphic builtins
    (`findCommonType`) apply. Deliberately *not* CASE's "arms differ ⇒ TEXT":
-   `1 union all 2.5` stays numeric.
+   `1 union all 2.5` stays numeric. **Known defect:** unlike rule 4, rule 3
+   converts neither branch, so a bigint from the INTEGER arm rides the
+   advertised REAL past the DML skip rule and is stored unconverted in a
+   REAL-declared column (a REAL-declared key then throws) — ticket
+   `set-op-numeric-promotion-skips-conversion`.
 4. **Exactly one side object-physical** (JSON today) → the object side's type,
    and the construction factory (`SetOperationNode.create`) wraps the other
    branch in a *lenient* CAST so it actually produces that type — the same rule

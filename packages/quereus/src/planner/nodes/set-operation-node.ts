@@ -448,6 +448,11 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     // ordinary type-preserving rewrite keeps the same children and attribute ids).
     // The membership specs carry pre-minted stable attribute ids, so they are
     // threaded verbatim (the appended flag columns survive the rebuild).
+    // NOTE: every optimizer rule is type-preserving today, so re-alignment here is
+    // always a no-op. If a rule ever hands back a child whose column TYPES changed,
+    // this wraps that child and mints fresh cast-column attribute ids mid-optimization
+    // — stale references above would then fail to resolve. Align before the rewrite
+    // (or re-publish the ids) if that day comes.
     return SetOperationNode.create(
       this.scope,
       newLeft as RelationalPlanNode,

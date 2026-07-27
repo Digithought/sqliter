@@ -69,12 +69,14 @@ export function mergeSetOpColumnType(left: LogicalType, right: LogicalType): Set
 	// REAL value spaces, so any pair involving it promotes to NUMERIC; otherwise
 	// the INTEGER/REAL pair promotes to REAL. A non-builtin numeric type has no
 	// principled promotion — fall through to ANY (rule 5) rather than guess.
-	// NOTE: rule 3 promotes WITHOUT converting either branch (builtin numeric
-	// conversion is total and idempotent, so skipped/duplicated conversion is
-	// harmless) — but a bigint INTEGER cell riding an advertised REAL into a
-	// REAL-declared column skips the DML conversion and stores as bigint, which
-	// `REAL_TYPE.compare` (declared-key BTrees) would choke on. If that ever
-	// surfaces, extend the factory's branch alignment to numeric pairs too.
+	// KNOWN DEFECT (ticket `set-op-numeric-promotion-skips-conversion`): rule 3
+	// promotes WITHOUT converting either branch, so a bigint INTEGER cell rides
+	// the advertised REAL into a REAL-declared column, skips the DML conversion
+	// (`buildRowCoercion` sees REAL === REAL) and is stored as a bigint — and a
+	// REAL-declared key throws out of `REAL_TYPE.compare`. Reachable today:
+	// `insert into t(v real) select 9007199254740993 union all select 2.5`.
+	// The fix is either to convert the differing branch (as rule 4 does) or to
+	// advertise a type the pair honestly inhabits; see the ticket.
 	if (left.isNumeric && right.isNumeric) {
 		if (isBuiltinNumeric(left) && isBuiltinNumeric(right)) {
 			if (left === NUMERIC_TYPE || right === NUMERIC_TYPE) return { logicalType: NUMERIC_TYPE };
