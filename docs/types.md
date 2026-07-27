@@ -445,10 +445,43 @@ defect. Known cases:
   declaration at its word. The builtins that declare JSON (`json()`,
   `json_group_array`, `json_group_object`) all return native values;
   `json_extract` and friends declare no return type and are unaffected.
-- A set operation reports its LEFT arm's logical type for every output column
-  (`SetOperationNode.resolvedDataType` overrides only collation), so a `union`
-  whose arms disagree mis-describes one arm's values — ticket
-  `union-branch-value-not-converted-on-write`.
+
+A **set operation is a conversion site** under this contract. Its output column
+carries rows from both operands, so `SetOperationNode` advertises the
+*symmetric* per-column merge of the two operand types (`mergeSetOpColumnType` in
+`planner/analysis/set-op-type-merge.ts` — order-independent, so swapping the
+arms cannot change the result), OR-merging nullability alongside:
+
+1. **Identical logical types** → that type (the overwhelmingly common case).
+2. **Either side NULL** → the other side's type — a `select null` branch is a
+   valid member of every type and must not poison a well-typed union.
+3. **Both numeric** → the usual promotion (NUMERIC ⊃ REAL ⊃ INTEGER) — the same
+   promotion arithmetic (`BinaryOpNode.generateType`) and polymorphic builtins
+   (`findCommonType`) apply. Deliberately *not* CASE's "arms differ ⇒ TEXT":
+   `1 union all 2.5` stays numeric.
+4. **Exactly one side object-physical** (JSON today) → the object side's type,
+   and the construction factory (`SetOperationNode.create`) wraps the other
+   branch in a *lenient* CAST so it actually produces that type — the same rule
+   and direction predicate coercion applies to `json_col = 'text'`. The
+   conversion happens in the branch, so at a DML the advertised type matches the
+   declared column and the skip rule correctly leaves both branches' cells
+   alone; on the read side, UNION dedup and predicates compare both branches
+   under JSON's structural rules.
+5. **Otherwise** → `ANY`. `ANY` on a set-op output column means "no principled
+   common type — nothing is claimed, every consumer converts": its `parse` is
+   pass-through, its `compare` is storage-class + BINARY ordering, and at a DML
+   it is never identical to a declared column type, so every cell converts.
+   That is correct precisely because rule 5 only fires when no branch is
+   guaranteed to already be in target form (`date_col union all '2024-01-02…'`:
+   the raw literal normalizes, the stored value survives idempotent
+   re-conversion).
+
+A branch that surfaces set-op membership flags cannot be CAST-wrapped (the
+projection would flatten its flag columns into the data arity), so a rule-4
+pair over such a branch stays unconverted and honestly advertises `ANY`
+instead. `AsyncGatherNode`'s `unionAll` combinator folds the same merge across
+its children, so the physical rewrite of a union-all chain advertises the same
+types the logical node did.
 
 `CAST` is the settled case, and states the rule the others must meet: it stays
 lenient — it never throws — but it never produces a value outside the type it

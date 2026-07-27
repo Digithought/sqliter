@@ -1,0 +1,134 @@
+-- 28.2-set-op-branch-types.sqllogic
+-- Cross-branch type merge for set operations (ticket
+-- union-branch-value-not-converted-on-write): a set operation advertises a type
+-- it actually produces, merged symmetrically across both operands, so a branch
+-- stores exactly what it would have stored on its own — in either arm order.
+-- No `using memory`, so store mode exercises the same rules on the store path.
+
+-- ============================================================
+-- DATE branch vs TEXT branch. No common concrete type exists (temporal parse is
+-- normalizing), so the merge advertises ANY and every cell converts at the DML —
+-- the raw literal normalizes and the already-stored value survives
+-- re-conversion (temporal conversion is idempotent).
+-- ============================================================
+
+create table sobt_d (id integer primary key, d date);
+create table sobt_d2 (id integer primary key, d date);
+insert into sobt_d values (1, '2024-06-05');
+-- run
+
+-- Single-arm baseline: the literal normalizes to a plain date.
+insert into sobt_d2 select 2, '2024-01-02T00:00:00Z';
+-- run
+
+select id, d from sobt_d2;
+→ [{"id":2,"d":"2024-01-02"}]
+
+-- DATE arm on the LEFT: the TEXT literal in the right arm must STILL normalize
+-- (it used to ride the advertised DATE type unconverted — raw timestamp text
+-- silently stored in a DATE column).
+delete from sobt_d2;
+insert into sobt_d2 select id, d from sobt_d union all select 2, '2024-01-02T00:00:00Z';
+-- run
+
+select id, d from sobt_d2 order by id;
+→ [{"id":1,"d":"2024-06-05"},{"id":2,"d":"2024-01-02"}]
+
+-- DATE arm on the RIGHT: same result — the merge is order-independent.
+delete from sobt_d2;
+insert into sobt_d2 select 2, '2024-01-02T00:00:00Z' union all select id, d from sobt_d;
+-- run
+
+select id, d from sobt_d2 order by id;
+→ [{"id":1,"d":"2024-06-05"},{"id":2,"d":"2024-01-02"}]
+
+-- ============================================================
+-- Must-keep-working cases: pairs whose conversion is total and idempotent keep
+-- their current behavior, and the numeric merge must promote (NOT collapse to
+-- TEXT the way CASE branch typing does).
+-- ============================================================
+
+-- Mixed INTEGER/TEXT values pass through a bag union unchanged.
+select 1 as v union all select 'a';
+→ [{"v":1},{"v":"a"}]
+
+-- INTEGER ∪ REAL promotes numerically: both values stay numbers.
+select 1 as v union all select 2.5;
+→ [{"v":1},{"v":2.5}]
+
+create table sobt_i (id integer primary key, n integer);
+
+-- TEXT numeral in either arm still converts on insert.
+insert into sobt_i select 1, 5 union all select 2, '7';
+-- run
+
+select id, n from sobt_i order by id;
+→ [{"id":1,"n":5},{"id":2,"n":7}]
+
+delete from sobt_i;
+insert into sobt_i select 1, '7' union all select 2, 5;
+-- run
+
+select id, n from sobt_i order by id;
+→ [{"id":1,"n":7},{"id":2,"n":5}]
+
+-- ============================================================
+-- A `select null` branch must not poison a well-typed union: NULL is a member
+-- of every type, so the other branch's type stands and its values are
+-- untouched.
+-- ============================================================
+
+create table sobt_n (id integer primary key, d date null);
+insert into sobt_n select 3, null union all select 4, d from sobt_d;
+-- run
+
+select id, d from sobt_n order by id;
+→ [{"id":3,"d":null},{"id":4,"d":"2024-06-05"}]
+
+-- ...and in the other arm order: the NULL branch on the right must not poison
+-- the DATE claim either.
+delete from sobt_n;
+insert into sobt_n select 4, d from sobt_d union all select 3, null;
+-- run
+
+select id, d from sobt_n order by id;
+→ [{"id":3,"d":null},{"id":4,"d":"2024-06-05"}]
+
+-- ============================================================
+-- DIFF (symmetric difference) expands to (A except B) union (B except A); the
+-- operands are aligned ONCE before the expansion, so both inner EXCEPTs — and
+-- the outer UNION — see the same merged column type.
+-- ============================================================
+
+create table sobt_j (id integer primary key, j json);
+insert into sobt_j values (1, '"abc"');
+-- run
+
+-- The TEXT branch is cast to JSON, so the shared value cancels and only the
+-- symmetric difference remains — in either arm order.
+select j from sobt_j diff select '"xyz"';
+→ [{"j":"abc"},{"j":"xyz"}]
+
+select '"xyz"' as j diff select j from sobt_j;
+→ [{"j":"xyz"},{"j":"abc"}]
+
+select j from sobt_j diff select '"abc"';
+→ []
+
+-- ============================================================
+-- ORDER BY over a set operation, a view over one, and a nested set operation
+-- all still resolve after branch alignment (the aligned branch republishes its
+-- columns; the compound scope resolves against the set operation's output).
+-- ============================================================
+
+select j as x from sobt_j union all select '"9"' order by x;
+→ [{"x":"9"},{"x":"abc"}]
+
+create view sobt_v as select j as x from sobt_j union all select '"9"';
+-- run
+
+select json_quote(x) as q from sobt_v order by 1;
+→ [{"q":"\"9\""},{"q":"\"abc\""}]
+
+select j from sobt_j union select '"9"' union select '"abc"';
+→ [{"j":"abc"},{"j":"9"}]

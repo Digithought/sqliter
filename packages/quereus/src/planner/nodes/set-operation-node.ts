@@ -1,7 +1,9 @@
 import { isRelationalNode, PlanNode } from './plan-node.js';
 import type { RelationalPlanNode, Attribute, BinaryRelationalNode, PhysicalProperties, FunctionalDependency, DomainConstraint, ConstantBinding, UpdateSite } from './plan-node.js';
 import type { RelationType, ColumnDef, CollationSource, ScalarType } from '../../common/datatype.js';
+import type * as AST from '../../parser/ast.js';
 import type { Expression } from '../../parser/ast.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
@@ -10,9 +12,19 @@ import { StatusCode } from '../../common/types.js';
 import { EXISTENCE_FLAG_TYPE } from './join-utils.js';
 import { superkeyToFd } from '../util/fd-utils.js';
 import { resolveSetOpColumnCollation, collationConflictError } from '../analysis/comparison-collation.js';
+import { mergeSetOpColumnType, mergeSetOpAdvertisedType } from '../analysis/set-op-type-merge.js';
+import { ProjectNode, type Projection } from './project-node.js';
+import { ColumnReferenceNode } from './reference.js';
+import { CastNode } from './scalar.js';
 
-/** A data column's cross-input-resolved collation (override over the left base type). */
-interface ResolvedDataCollation {
+/**
+ * A data column's cross-input-resolved output metadata: the symmetric
+ * logical-type merge (`mergeSetOpAdvertisedType`), OR-merged nullability, and
+ * the comparison-lattice collation (override over the left base type).
+ */
+interface ResolvedDataColumn {
+  readonly logicalType: LogicalType;
+  readonly nullable: boolean;
   readonly collationName?: string;
   readonly collationSource?: CollationSource;
 }
@@ -55,13 +67,15 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
   readonly nodeType = PlanNodeType.SetOperation;
   private attributesCache: Cached<readonly Attribute[]>;
   /**
-   * Per-data-column collation resolved across BOTH inputs through the shared
-   * comparison lattice (`set-operation-cross-input-collation-merge`). Cached so
+   * Per-data-column output metadata resolved across BOTH inputs: the symmetric
+   * logical-type merge, OR-merged nullability, and the comparison-lattice
+   * collation (`set-operation-cross-input-collation-merge`). Cached so
    * `buildAttributes` and `getType` read ONE result and cannot drift — the dedup
-   * comparator (which keys off the output attribute collation) and an enclosing
-   * ORDER BY (which keys off the output column collation) thus stay in lockstep.
+   * comparator (which keys off the output attribute type/collation) and an
+   * enclosing ORDER BY (which keys off the output column type/collation) thus
+   * stay in lockstep.
    */
-  private dataCollationsCache: Cached<readonly ResolvedDataCollation[]>;
+  private dataColumnsCache: Cached<readonly ResolvedDataColumn[]>;
 
   constructor(
     scope: Scope,
@@ -90,13 +104,27 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     }
     // TODO: optionally check type compatibility (affinity)
     this.attributesCache = new Cached(() => this.buildAttributes());
-    this.dataCollationsCache = new Cached(() => this.resolveDataCollations());
+    this.dataColumnsCache = new Cached(() => this.resolveDataColumns());
   }
 
   /**
-   * Resolve each DATA column's dedup/compare collation across both inputs through
-   * the shared comparison lattice (`resolveSetOpColumnCollation`). The conflict
-   * policy is keyed on set-ness:
+   * Resolve each DATA column's cross-input output metadata:
+   *
+   * **Logical type** — the symmetric merge (`mergeSetOpAdvertisedType`): identical
+   * types keep theirs, NULL yields to the other side, numerics promote
+   * (INTEGER ∪ REAL → REAL), and an irreconcilable pair advertises ANY. A rule-4
+   * pair (object-physical vs other) also collapses to ANY *here*, because this
+   * node performs no conversion itself — {@link SetOperationNode.create} aligns
+   * such operands with a lenient CAST up front, so an aligned tree lands on the
+   * identical-types rule instead. Everything downstream (the DML write pass's
+   * `buildRowCoercion`, the dedup comparator, predicate coercion) trusts the
+   * advertised type, so it must describe BOTH branches' rows.
+   *
+   * **Nullability** — OR across the two inputs (a nullable right branch must not
+   * be masked by a NOT NULL left branch; same merge `AsyncGatherNode` applies).
+   *
+   * **Collation** — the shared comparison lattice (`resolveSetOpColumnCollation`).
+   * The conflict policy is keyed on set-ness:
    *  - DISTINCT operators (`union`/`intersect`/`except`, `op !== 'unionAll'`) DO
    *    dedup, so a same-rank explicit/declared name conflict is a plan-time error
    *    — the same one a spelled-out `l.c = r.c` would throw. Forced at build time
@@ -105,39 +133,51 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
    *  - `union all` does NO dedup, so a conflict must NOT throw — it propagates no
    *    collation forward (BINARY-equivalent), exactly as `mergePropagatedCollation`
    *    swallows conflicts for `||` / CASE. Rows pass through unchanged (bag).
+   *
    * Only the first `dataColumnCount()` columns are resolved; flag columns (appended
    * after, `EXISTENCE_FLAG_TYPE`, no collation) are never touched.
    */
-  private resolveDataCollations(): readonly ResolvedDataCollation[] {
+  private resolveDataColumns(): readonly ResolvedDataColumn[] {
     const isSet = this.op !== 'unionAll';
     const leftColumns = this.left.getType().columns;
     const rightColumns = this.right.getType().columns;
     const dataCount = this.dataColumnCount();
-    const resolved: ResolvedDataCollation[] = [];
+    const resolved: ResolvedDataColumn[] = [];
     for (let i = 0; i < dataCount; i++) {
-      const res = resolveSetOpColumnCollation(leftColumns[i].type, rightColumns[i].type);
+      const leftType = leftColumns[i].type;
+      const rightType = rightColumns[i].type;
+      const logicalType = mergeSetOpAdvertisedType(leftType.logicalType, rightType.logicalType);
+      const nullable = leftType.nullable || rightType.nullable;
+      const res = resolveSetOpColumnCollation(leftType, rightType);
       if (res.kind === 'conflict') {
         if (isSet) throw collationConflictError(res);
-        resolved.push({}); // union all: no comparison, carry no collation forward
+        resolved.push({ logicalType, nullable }); // union all: no comparison, carry no collation forward
       } else {
-        resolved.push({ collationName: res.collationName, collationSource: res.collationSource });
+        resolved.push({ logicalType, nullable, collationName: res.collationName, collationSource: res.collationSource });
       }
     }
     return resolved;
   }
 
   /**
-   * Data column `i`'s `ScalarType` rebased onto the cross-input-resolved collation:
-   * the left operand's type stays the base (logicalType, nullable, affinity —
-   * cross-branch type merge stays out of scope) and ONLY `collationName`/
-   * `collationSource` are overridden (both possibly `undefined` for the BINARY
-   * floor). Callers map this over the first `dataColumnCount()` attrs/columns,
-   * preserving attribute ids (only the type's collation changes) so ORDER BY / an
-   * enclosing view still resolve and a `withChildren` rebuild yields the same ids.
+   * Data column `i`'s `ScalarType` rebased onto the cross-input-resolved output
+   * metadata: `logicalType` is the symmetric cross-branch merge, `nullable` the
+   * OR of both inputs, `collationName`/`collationSource` the comparison-lattice
+   * resolution (both possibly `undefined` for the BINARY floor); the left
+   * operand's type stays the base for everything else (`isReadOnly`). Callers map
+   * this over the first `dataColumnCount()` attrs/columns, preserving attribute
+   * ids (only the type changes) so ORDER BY / an enclosing view still resolve and
+   * a `withChildren` rebuild yields the same ids.
    */
   private resolvedDataType(baseType: ScalarType, i: number): ScalarType {
-    const c = this.dataCollationsCache.value[i];
-    return { ...baseType, collationName: c.collationName, collationSource: c.collationSource };
+    const c = this.dataColumnsCache.value[i];
+    return {
+      ...baseType,
+      logicalType: c.logicalType,
+      nullable: c.nullable,
+      collationName: c.collationName,
+      collationSource: c.collationSource,
+    };
   }
 
   /** True when this set operation exposes its OWN membership flags. */
@@ -402,16 +442,40 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
       return this;
     }
 
-    // Create new instance preserving attributes (set operation preserves left child's
-    // attributes). The membership specs carry pre-minted stable attribute ids, so they
-    // are threaded verbatim (the appended flag columns survive the rebuild).
-    return new SetOperationNode(
+    // Rebuild through the aligning factory so an optimizer rewrite that changed a
+    // branch's column types re-aligns (alignment is idempotent: already-aligned
+    // operands hit the identical-types merge rule and are not re-wrapped, so the
+    // ordinary type-preserving rewrite keeps the same children and attribute ids).
+    // The membership specs carry pre-minted stable attribute ids, so they are
+    // threaded verbatim (the appended flag columns survive the rebuild).
+    return SetOperationNode.create(
       this.scope,
       newLeft as RelationalPlanNode,
       newRight as RelationalPlanNode,
       this.op,
       this.membership,
     );
+  }
+
+  /**
+   * Build a `SetOperationNode` over operands ALIGNED to the cross-branch merged
+   * column types ({@link alignSetOpOperands}) — the construction path every
+   * builder should use. Alignment is what lets the node advertise a concrete
+   * merged type for a rule-4 pair (JSON ∪ TEXT): the non-object branch is
+   * wrapped so it actually produces the merged type, after which both branches
+   * agree and every consumer (DML write pass, dedup comparator, predicate
+   * coercion) reads an honest type. Idempotent — aligned operands re-align to
+   * themselves — so `withChildren` routes through here safely.
+   */
+  static create(
+    scope: Scope,
+    left: RelationalPlanNode,
+    right: RelationalPlanNode,
+    op: 'union' | 'unionAll' | 'intersect' | 'except',
+    membership?: readonly SetOpMembershipSpec[],
+  ): SetOperationNode {
+    const [alignedLeft, alignedRight] = alignSetOpOperands(scope, left, right);
+    return new SetOperationNode(scope, alignedLeft, alignedRight, op, membership);
   }
 
   override toString(): string {
@@ -425,4 +489,78 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     }
     return base;
   }
+}
+
+/**
+ * Align two set-operation operands to their cross-branch merged column types:
+ * wherever the per-column merge requires converting one operand (rule 4 —
+ * object-physical vs other, `mergeSetOpColumnType().convert`), wrap that operand
+ * in a projection that CASTs the column to the merged type (lenient — a value
+ * that does not parse falls back through `castFallback` rather than throwing, so
+ * `select j from src union all select 'not json'` stays total). All other merge
+ * outcomes (identical, NULL, numeric promotion, ANY) require no conversion and
+ * leave both operands untouched.
+ *
+ * A DIFF builder must call this ONCE on the original operands before expanding
+ * to `(A except B) union (B except A)`, so both inner nodes see the same aligned
+ * pair; the subsequent {@link SetOperationNode.create} calls then re-align to a
+ * no-op (identical types).
+ *
+ * A flag-surfacing operand (a flagged set operation, or a flag-less one over a
+ * flagged operand) is never wrapped: a `ProjectNode` would flatten its surfaced
+ * flag columns into the data arity `dataArity` recursively derives, breaking the
+ * enclosing node's data/flag split. Such a pair stays unconverted and the node
+ * honestly advertises ANY for the affected column (`mergeSetOpAdvertisedType`).
+ */
+export function alignSetOpOperands(
+  scope: Scope,
+  left: RelationalPlanNode,
+  right: RelationalPlanNode,
+): [RelationalPlanNode, RelationalPlanNode] {
+  // Align only the shared data prefix; a data-arity mismatch is left for the
+  // SetOperationNode constructor's error.
+  const dataCount = Math.min(dataArity(left), dataArity(right));
+  const leftColumns = left.getType().columns;
+  const rightColumns = right.getType().columns;
+  const leftCasts = new Map<number, LogicalType>();
+  const rightCasts = new Map<number, LogicalType>();
+  for (let i = 0; i < dataCount; i++) {
+    const merged = mergeSetOpColumnType(leftColumns[i].type.logicalType, rightColumns[i].type.logicalType);
+    if (merged.convert === 'left') leftCasts.set(i, merged.logicalType);
+    else if (merged.convert === 'right') rightCasts.set(i, merged.logicalType);
+  }
+  const alignedLeft = leftCasts.size > 0 && flagCount(left) === 0 ? castColumns(scope, left, leftCasts) : left;
+  const alignedRight = rightCasts.size > 0 && flagCount(right) === 0 ? castColumns(scope, right, rightCasts) : right;
+  return [alignedLeft, alignedRight];
+}
+
+/**
+ * Wrap `branch` in a `ProjectNode` that CASTs the columns in `casts` to their
+ * target logical types and passes every other column through verbatim. A
+ * passed-through column keeps its attribute id (an explicit `attributeId` on a
+ * bare column-reference projection); a cast column mints a fresh id — its values
+ * change, so reusing the source id would let a predicate be pushed below the
+ * conversion. Only called for flag-less branches (see {@link alignSetOpOperands}),
+ * so every projected column is a data column.
+ */
+function castColumns(
+  scope: Scope,
+  branch: RelationalPlanNode,
+  casts: ReadonlyMap<number, LogicalType>,
+): RelationalPlanNode {
+  const attrs = branch.getAttributes();
+  const projections: Projection[] = attrs.map((attr, i) => {
+    const columnExpr: AST.ColumnExpr = { type: 'column', name: attr.name };
+    const columnRef = new ColumnReferenceNode(scope, columnExpr, attr.type, attr.id, i);
+    const target = casts.get(i);
+    if (!target) {
+      return { node: columnRef, alias: attr.name, attributeId: attr.id };
+    }
+    // `CastNode` resolves the target through the registry by name; rule-4 targets
+    // are registered types (JSON today), so the name round-trips to the same
+    // logical-type instance.
+    const castExpr: AST.CastExpr = { type: 'cast', expr: columnExpr, targetType: target.name };
+    return { node: new CastNode(scope, castExpr, columnRef), alias: attr.name, attributeId: PlanNode.nextAttrId() };
+  });
+  return new ProjectNode(scope, branch, projections);
 }

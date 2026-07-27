@@ -146,3 +146,75 @@ insert or replace into jco_dflt_json values (1, null);
 
 select id, j from jco_dflt_json;
 → [{"id":1,"j":{"a":1}}]
+
+-- ---------------------------------------------------------------------------
+-- Set operations over a JSON branch and a TEXT branch (ticket
+-- union-branch-value-not-converted-on-write). The set operation merges the
+-- branch types symmetrically — the object-physical (JSON) side wins and the
+-- TEXT branch is cast (leniently) to it — so each branch stores exactly what it
+-- would have stored on its own, in EITHER arm order.
+create table jco_u_src (id integer primary key, j json);
+create table jco_u_dst (id integer primary key, j json);
+insert into jco_u_src values (1, '"abc"');
+-- run
+
+-- JSON arm on the LEFT: the TEXT literal '"9"' must still convert (it used to
+-- ride the advertised JSON type unconverted and store the raw 3-char text).
+insert into jco_u_dst select id, j from jco_u_src union all select 3, '"9"';
+-- run
+
+select id, json_quote(j) as q from jco_u_dst order by id;
+→ [{"id":1,"q":"\"abc\""},{"id":3,"q":"\"9\""}]
+
+-- JSON arm on the RIGHT: the stored JSON value must NOT be re-converted (it
+-- used to ride the advertised TEXT type into a full re-parse, which throws on
+-- the JSON string scalar abc).
+delete from jco_u_dst;
+insert into jco_u_dst select 3, '"9"' union all select id, j from jco_u_src;
+-- run
+
+select id, json_quote(j) as q from jco_u_dst order by id;
+→ [{"id":1,"q":"\"abc\""},{"id":3,"q":"\"9\""}]
+
+-- The CTE form routes through the same set operation and must agree.
+delete from jco_u_dst;
+with u as (select id, j from jco_u_src union all select 3, '"9"')
+	insert into jco_u_dst select id, j from u;
+-- run
+
+select id, json_quote(j) as q from jco_u_dst order by id;
+→ [{"id":1,"q":"\"abc\""},{"id":3,"q":"\"9\""}]
+
+-- Read side, no DML involved: both branches denote the JSON string abc, so
+-- UNION must collapse them to ONE row — in either arm order.
+select j from jco_u_src union select '"abc"';
+→ [{"j":"abc"}]
+
+select '"abc"' as j union select j from jco_u_src;
+→ [{"j":"abc"}]
+
+-- A predicate over the union output must match BOTH branches' rows.
+select json_quote(x) as q from (select j as x from jco_u_src union all select '"abc"')
+	where x = json('"abc"');
+→ [{"q":"\"abc\""},{"q":"\"abc\""}]
+
+-- The branch cast is lenient: text that is not JSON source falls back to the
+-- raw string (a legitimate JSON string scalar) instead of erroring the read.
+select j from jco_u_src union all select 'not json';
+→ [{"j":"abc"},{"j":"not json"}]
+
+-- INTERSECT / EXCEPT compare across the aligned branches too.
+select j from jco_u_src intersect select '"abc"';
+→ [{"j":"abc"}]
+
+select j from jco_u_src except select '"abc"';
+→ []
+
+-- JSON | JSON stays untouched on both sides (identical types — no cast, no
+-- conversion at the DML).
+delete from jco_u_dst;
+insert into jco_u_dst select id, j from jco_u_src union all select 9, j from jco_u_src;
+-- run
+
+select id, json_quote(j) as q from jco_u_dst order by id;
+→ [{"id":1,"q":"\"abc\""},{"id":9,"q":"\"abc\""}]

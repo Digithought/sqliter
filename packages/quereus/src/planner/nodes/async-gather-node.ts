@@ -25,6 +25,7 @@ import {
 	shiftEquivClasses,
 	shiftFds,
 } from '../util/fd-utils.js';
+import { mergeSetOpAdvertisedType } from '../analysis/set-op-type-merge.js';
 
 /**
  * How {@link AsyncGatherNode} combines rows from its N independent child relations.
@@ -334,8 +335,14 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		}
 		if (this.combinator.kind === 'unionAll') {
 			// Mirror SetOperationNode.buildAttributes: keep left (children[0])
-			// attribute IDs verbatim so ORDER BY references continue to resolve.
-			return this.children[0].getAttributes();
+			// attribute IDs verbatim so ORDER BY references continue to resolve,
+			// but carry the cross-branch merged column types (getType's unionAll
+			// derivation) so the attributes and the relation type cannot drift.
+			const mergedColumns = this.getType().columns;
+			return this.children[0].getAttributes().map((attr, i) =>
+				mergedColumns[i] && attr.type !== mergedColumns[i].type
+					? { ...attr, type: mergedColumns[i].type }
+					: attr);
 		}
 		if (this.combinator.kind === 'zipByKey') {
 			return this.buildZipByKeyAttributes();
@@ -395,19 +402,24 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 
 	getType(): RelationType {
 		if (this.combinator.kind === 'unionAll') {
-			// Per-column nullability is the OR across all children; isSet is
-			// false (unionAll allows duplicates). Other fields fall through
-			// from children[0].
+			// Per-column logical type is the same symmetric cross-branch merge
+			// `SetOperationNode` advertises (a left-deep fold matches the unionAll
+			// chain this gather replaced); nullability is the OR across all
+			// children; isSet is false (unionAll allows duplicates). Other fields
+			// fall through from children[0].
 			const types = this.children.map(c => c.getType());
 			const baseType = types[0];
 			const columns = baseType.columns.map((baseCol, i) => {
+				let logicalType = baseCol.type.logicalType;
 				let nullable = baseCol.type.nullable;
 				for (let j = 1; j < types.length; j++) {
-					nullable = nullable || types[j].columns[i].type.nullable;
+					const childType = types[j].columns[i].type;
+					logicalType = mergeSetOpAdvertisedType(logicalType, childType.logicalType);
+					nullable = nullable || childType.nullable;
 				}
-				return nullable === baseCol.type.nullable
+				return logicalType === baseCol.type.logicalType && nullable === baseCol.type.nullable
 					? baseCol
-					: { ...baseCol, type: { ...baseCol.type, nullable: true } };
+					: { ...baseCol, type: { ...baseCol.type, logicalType, nullable } };
 			});
 			return {
 				typeClass: 'relation',

@@ -4,7 +4,7 @@ import { PlanNode } from '../nodes/plan-node.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { CTEScopeNode } from '../nodes/cte-node.js';
 import type { Scope } from '../scopes/scope.js';
-import { SetOperationNode, type SetOpMembershipSpec } from '../nodes/set-operation-node.js';
+import { SetOperationNode, alignSetOpOperands, type SetOpMembershipSpec } from '../nodes/set-operation-node.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
 import { LimitOffsetNode } from '../nodes/limit-offset.js';
 import { LiteralNode } from '../nodes/scalar.js';
@@ -92,14 +92,18 @@ export function buildCompoundSelect(
 		membership = stmt.compound.existence.map(e => ({ attrId: PlanNode.nextAttrId(), name: e.name, branch: e.branch }));
 	}
 
-	// Expand DIFF as (A EXCEPT B) UNION (B EXCEPT A)
+	// Expand DIFF as (A EXCEPT B) UNION (B EXCEPT A). Align the ORIGINAL operands
+	// once, before the expansion, so both inner EXCEPTs see the same aligned pair
+	// (aligning per-node would convert each independently and hand the outer UNION
+	// a third combination); the `create` calls then re-align to a no-op.
 	let setNode: RelationalPlanNode;
 	if (stmt.compound.op === 'diff') {
-		const leftMinusRight = new SetOperationNode(contextWithCTEs.scope, leftPlan, rightPlan, 'except');
-		const rightMinusLeft = new SetOperationNode(contextWithCTEs.scope, rightPlan, leftPlan, 'except');
-		setNode = new SetOperationNode(contextWithCTEs.scope, leftMinusRight, rightMinusLeft, 'union');
+		const [alignedLeft, alignedRight] = alignSetOpOperands(contextWithCTEs.scope, leftPlan, rightPlan);
+		const leftMinusRight = SetOperationNode.create(contextWithCTEs.scope, alignedLeft, alignedRight, 'except');
+		const rightMinusLeft = SetOperationNode.create(contextWithCTEs.scope, alignedRight, alignedLeft, 'except');
+		setNode = SetOperationNode.create(contextWithCTEs.scope, leftMinusRight, rightMinusLeft, 'union');
 	} else {
-		setNode = new SetOperationNode(contextWithCTEs.scope, leftPlan, rightPlan, stmt.compound.op, membership);
+		setNode = SetOperationNode.create(contextWithCTEs.scope, leftPlan, rightPlan, stmt.compound.op, membership);
 	}
 
 	// After set operation, apply ORDER BY / LIMIT / OFFSET from the *outer* (original) statement
