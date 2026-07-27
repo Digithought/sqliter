@@ -1028,21 +1028,21 @@ export class Parser {
 				throw this.error(this.peek(), "Expected alias after 'AS'.");
 			}
 			alias = this.getIdentifierValue(this.advance());
-		} else if (this.checkIdentifierLike([]) &&
-			!this.checkNext(1, TokenType.DOT) &&
-			!this.isJoinToken() &&
-			!this.isEndOfClause()) {
-			alias = this.getIdentifierValue(this.advance());
-		} else if (requireAlias) {
-			// A subquery write target's alias is mandatory and user-meaningful — never a
-			// generated default (the `where`/`set` reference it). Reject the bare form.
-			throw this.error(this.peek(), "a subquery UPDATE/DELETE write target requires an alias, e.g. (select …) as v");
 		} else {
-			// Generate a default alias if none provided. Keep separate prefixes
-			// for read-only vs mutating bodies so generated aliases stay
-			// distinguishable when surfacing in diagnostics.
-			const isMutating = subquery.type === 'insert' || subquery.type === 'update' || subquery.type === 'delete';
-			alias = `${isMutating ? 'mutating_subquery' : 'subquery'}_${startToken.startOffset}`;
+			const aliasToken = this.matchBareSourceAlias();
+			if (aliasToken) {
+				alias = this.getIdentifierValue(aliasToken);
+			} else if (requireAlias) {
+				// A subquery write target's alias is mandatory and user-meaningful — never a
+				// generated default (the `where`/`set` reference it). Reject the bare form.
+				throw this.error(this.peek(), "a subquery UPDATE/DELETE write target requires an alias, e.g. (select …) as v");
+			} else {
+				// Generate a default alias if none provided. Keep separate prefixes
+				// for read-only vs mutating bodies so generated aliases stay
+				// distinguishable when surfacing in diagnostics.
+				const isMutating = subquery.type === 'insert' || subquery.type === 'update' || subquery.type === 'delete';
+				alias = `${isMutating ? 'mutating_subquery' : 'subquery'}_${startToken.startOffset}`;
+			}
 		}
 
 		// Parse optional column list after alias: AS alias(col1, col2, ...)
@@ -1118,13 +1118,12 @@ export class Parser {
 			const aliasToken = this.advance();
 			alias = this.getIdentifierValue(aliasToken);
 			endToken = aliasToken;
-		} else if (this.checkIdentifierLike([]) &&
-			!this.checkNext(1, TokenType.DOT) &&
-			!this.isJoinToken() &&
-			!this.isEndOfClause()) {
-			const aliasToken = this.advance();
-			alias = this.getIdentifierValue(aliasToken);
-			endToken = aliasToken;
+		} else {
+			const aliasToken = this.matchBareSourceAlias();
+			if (aliasToken) {
+				alias = this.getIdentifierValue(aliasToken);
+				endToken = aliasToken;
+			}
 		}
 
 		return {
@@ -1177,13 +1176,12 @@ export class Parser {
 			const aliasToken = this.advance();
 			alias = this.getIdentifierValue(aliasToken);
 			endToken = aliasToken;
-		} else if (this.checkIdentifierLike([]) &&
-			!this.checkNext(1, TokenType.DOT) &&
-			!this.isJoinToken() &&
-			!this.isEndOfClause()) {
-			const aliasToken = this.advance();
-			alias = this.getIdentifierValue(aliasToken);
-			endToken = aliasToken;
+		} else {
+			const aliasToken = this.matchBareSourceAlias();
+			if (aliasToken) {
+				alias = this.getIdentifierValue(aliasToken);
+				endToken = aliasToken;
+			}
 		}
 
 		// Optional column list after alias: alias(col1, col2, ...)
@@ -2288,6 +2286,21 @@ export class Parser {
 	}
 
 	/**
+	 * Consumes and returns an implicit (no-`as`) alias for a FROM-clause source,
+	 * or undefined when the cursor isn't sitting on one. A trailing comma is fine —
+	 * it only ends the source list item (`from t a, u b`).
+	 */
+	private matchBareSourceAlias(): Token | undefined {
+		if (!this.checkIdentifierLike([]) ||
+			this.checkNext(1, TokenType.DOT) ||
+			this.isJoinToken() ||
+			this.isEndOfClause()) {
+			return undefined;
+		}
+		return this.advance();
+	}
+
+	/**
 	 * True when the current token starts a `QueryExpr` (SELECT, VALUES, WITH,
 	 * INSERT, UPDATE, DELETE). Used by callers that have already consumed an
 	 * `(` to decide between a subquery and a parenthesized scalar expression.
@@ -2301,6 +2314,9 @@ export class Parser {
 			|| this.check(TokenType.DELETE);
 	}
 
+	// NOTE: this is also the stop set for bare (no-`as`) aliases. Any new clause keyword
+	// that can follow a select item or table source must be added here, or it will be
+	// swallowed as an alias — unless it lexes to its own TokenType, which keeps it safe.
 	private isEndOfClause(): boolean {
 		const token = this.peek().type;
 		return token === TokenType.FROM ||

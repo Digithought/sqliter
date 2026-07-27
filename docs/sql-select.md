@@ -407,10 +407,10 @@ The from clause specifies the data sources for a query.
 from table_reference [, table_reference...]
 
 table_reference:
-  table_name [as alias]
-| function_name ([arg[,...]]) [as alias]
-| (select_statement) as alias
-| (mutating_statement) as alias
+  table_name [[as] alias]
+| function_name ([arg[,...]]) [[as] alias]
+| (select_statement) [[as] alias]
+| (mutating_statement) [[as] alias]
 | table_reference join_type join table_reference [join_specification]
 ```
 

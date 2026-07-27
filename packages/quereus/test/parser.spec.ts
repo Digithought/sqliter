@@ -322,6 +322,38 @@ describe('Parser', () => {
 			if (second.type === 'subquerySource') expect(second.alias).to.equal('y');
 		});
 
+		it('should parse a bare table-function alias in a comma-separated FROM list', () => {
+			const stmt = parse('select 1 from f(1) x, g(2) y') as SelectStmt;
+			expect(stmt.from).to.have.length(2);
+			const [first, second] = stmt.from!;
+			expect(first.type).to.equal('functionSource');
+			expect(second.type).to.equal('functionSource');
+			if (first.type === 'functionSource') expect(first.alias).to.equal('x');
+			if (second.type === 'functionSource') expect(second.alias).to.equal('y');
+		});
+
+		it('should parse bare aliases inside a nested subquery projection list', () => {
+			const stmt = parse('select s.a, s.b from (select 1 a, 2 b) s') as SelectStmt;
+			const [source] = stmt.from!;
+			expect(source.type).to.equal('subquerySource');
+			if (source.type !== 'subquerySource') return;
+			const inner = source.subquery as SelectStmt;
+			expect(inner.columns).to.have.length(2);
+			const [a, b] = inner.columns;
+			if (a.type === 'column') expect(a.alias).to.equal('a');
+			if (b.type === 'column') expect(b.alias).to.equal('b');
+		});
+
+		it('should not swallow a JOIN keyword as a bare table alias', () => {
+			const stmt = parse('select 1 from t a join u b on a.k = b.k') as SelectStmt;
+			expect(stmt.from).to.have.length(1);
+			const [join] = stmt.from!;
+			expect(join.type).to.equal('join');
+			if (join.type !== 'join') return;
+			expect(join.left.type === 'table' && join.left.alias).to.equal('a');
+			expect(join.right.type === 'table' && join.right.alias).to.equal('b');
+		});
+
 		it('should parse SELECT *', () => {
 			const stmt = parse('select * from t') as SelectStmt;
 			expect(stmt.columns).to.have.length(1);
