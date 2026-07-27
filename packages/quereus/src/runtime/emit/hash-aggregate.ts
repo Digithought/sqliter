@@ -16,9 +16,8 @@ import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { AggValue } from '../../func/registration.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
-import { hasSemanticOrdering } from '../../util/comparison.js';
+import { semanticKeyTransform } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
-import type { LogicalType } from '../../types/logical-type.js';
 import { cloneInitialValue, findSourceRelation, ctxLog } from './aggregate.js';
 import { bindAggregateSchemas, buildDistinctComparators, computeAggregateSkipCoercion } from './aggregate-setup.js';
 import type { ContextInstaller } from '../context-helpers.js';
@@ -67,12 +66,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 	// bucket, so they serialize via the type's groupKey representative. The RAW
 	// first-seen value stays in groupValues (the emitted representative — which one
 	// survives is unspecified, matching DISTINCT).
-	const keyCanonicalizers = plan.groupBy.map(expr => {
-		const logical = expr.getType().logicalType as LogicalType;
-		return hasSemanticOrdering(logical) && logical.groupKey
-			? (v: SqlValue) => logical.groupKey!(v)
-			: undefined;
-	});
+	const keyCanonicalizers = plan.groupBy.map(expr => semanticKeyTransform(expr.getType().logicalType));
 	const hasKeyCanonicalizer = keyCanonicalizers.some(c => c !== undefined);
 
 	const distinctComparators = buildDistinctComparators(plan.aggregates, ctx);

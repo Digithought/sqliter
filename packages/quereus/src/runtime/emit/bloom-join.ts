@@ -2,14 +2,13 @@ import type { BloomJoinNode } from '../../planner/nodes/bloom-join-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
-import type { Row, SqlValue, SubProgram } from '../../common/types.js';
+import type { Row, SubProgram } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
 import { serializeKey, serializeRowKey } from '../../util/key-serializer.js';
-import { hasSemanticOrdering } from '../../util/comparison.js';
-import type { LogicalType } from '../../types/logical-type.js';
+import { semanticKeyTransform } from '../../util/comparison.js';
 import { effectiveCollationOfTypes, hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
@@ -61,11 +60,9 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 	// hash-aggregate.ts; per equi-pair, active only when both sides declare the same
 	// semantic-ordering logical type with a groupKey hook.
 	const keyCanonicalizers = plan.equiPairs.map((_pair, i) => {
-		const leftLogical = leftAttributes[leftIndices[i]].type.logicalType as LogicalType;
-		const rightLogical = rightAttributes[rightIndices[i]].type.logicalType as LogicalType;
-		return leftLogical === rightLogical && hasSemanticOrdering(leftLogical) && leftLogical.groupKey
-			? (v: SqlValue) => leftLogical.groupKey!(v)
-			: undefined;
+		const leftLogical = leftAttributes[leftIndices[i]].type.logicalType;
+		const rightLogical = rightAttributes[rightIndices[i]].type.logicalType;
+		return leftLogical === rightLogical ? semanticKeyTransform(leftLogical) : undefined;
 	});
 	const hasKeyCanonicalizer = keyCanonicalizers.some(c => c !== undefined);
 	const extractKey = (row: Row, indices: number[]): string | null => {

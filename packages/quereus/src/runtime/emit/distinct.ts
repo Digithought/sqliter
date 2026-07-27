@@ -5,7 +5,6 @@ import { emitPlanNode } from '../emitters.js';
 import { type Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createSemanticRowComparator, BINARY_COLLATION } from '../../util/comparison.js';
-import type { LogicalType } from '../../types/logical-type.js';
 import { BTree } from 'inheritree';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
@@ -20,7 +19,7 @@ export function emitDistinct(plan: DistinctNode, ctx: EmissionContext): Instruct
 	// collapses to one row); all other columns keep storage-class + collation identity.
 	const attributes = plan.getAttributes();
 	const collationRowComparator = createSemanticRowComparator(
-		attributes.map(attr => attr.type.logicalType as LogicalType),
+		attributes.map(attr => attr.type.logicalType),
 		attributes.map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
 	);
 

@@ -8,9 +8,8 @@ import { bindWindowSchema, resolveWindowFunction, type WindowFunctionSchema } fr
 import { argComparisonContext } from './aggregate-setup.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { createTypedComparator, createTypedOrderByComparator, hasSemanticOrdering } from '../../util/comparison.js';
+import { createTypedComparator, createTypedOrderByComparator, semanticKeyTransform } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
-import type { LogicalType } from '../../types/logical-type.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
@@ -67,14 +66,14 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 		const collationName = exprType.collationName || 'BINARY';
 		const collationFunc = ctx.resolveCollation(collationName);
 		const orderClause = plan.windowSpec.orderBy[i];
-		return createTypedOrderByComparator(exprType.logicalType as LogicalType, orderClause.direction, orderClause.nulls, collationFunc);
+		return createTypedOrderByComparator(exprType.logicalType, orderClause.direction, orderClause.nulls, collationFunc);
 	});
 
 	// Pre-resolve typed equality comparators for ORDER BY (used in ranking functions)
 	const orderByEqualityComparators = plan.orderByExpressions.map(exprPlan => {
 		const exprType = exprPlan.getType();
 		const collationFunc = exprType.collationName ? ctx.resolveCollation(exprType.collationName) : undefined;
-		return createTypedComparator(exprType.logicalType as LogicalType, collationFunc);
+		return createTypedComparator(exprType.logicalType, collationFunc);
 	});
 
 	// Pre-resolve collation normalizers for partition key serialization
@@ -87,12 +86,8 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 	// compare treats as equal (TIMESPAN 'PT1H' ≡ 'PT60M') must land in one partition,
 	// so they serialize via the type's groupKey representative (mirrors GROUP BY in
 	// hash-aggregate.ts).
-	const partitionKeyCanonicalizers = plan.partitionExpressions.map(exprPlan => {
-		const logical = exprPlan.getType().logicalType as LogicalType;
-		return hasSemanticOrdering(logical) && logical.groupKey
-			? (v: SqlValue) => logical.groupKey!(v)
-			: undefined;
-	});
+	const partitionKeyCanonicalizers = plan.partitionExpressions.map(
+		exprPlan => semanticKeyTransform(exprPlan.getType().logicalType));
 	const hasPartitionCanonicalizer = partitionKeyCanonicalizers.some(c => c !== undefined);
 	const serializePartitionKey = (values: SqlValue[]): string => {
 		const keyValues = hasPartitionCanonicalizer

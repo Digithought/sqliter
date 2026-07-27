@@ -250,6 +250,19 @@ See the JSON entry above. Probes of a different storage class (an integer litera
 against a TIMESPAN column) order by storage class and never falsely compare equal
 (`createTypedComparator`'s mismatch fallback).
 
+Two surfaces do **not** yet follow the rule, both because they compare without any
+type context:
+
+- A **join key pairing a semantic-ordering column with a plain one** —
+  `timespan_col = text_col` — matches on raw text in the hash and merge join
+  algorithms, so `from a join b on a.d = b.s` drops rows that the same predicate in
+  a `where` clause returns. Tracked as `tickets/fix/mixed-type-equi-join-key-drops-semantic-matches`.
+- **Simple `case x when v`** and **`nullif(x, y)`** compare under storage-class +
+  BINARY, ignoring both the declared type and the resolved collation, so
+  `case d when 'PT60M' …` misses a `'PT1H'` row that `d = 'PT60M'` matches (and the
+  same holds for a `collate nocase` column). Tracked as
+  `tickets/fix/case-and-nullif-ignore-collation-and-type`.
+
 Hash-keyed identity (GROUP BY, window PARTITION BY, hash-join build/probe) cannot
 call `compare` pairwise, so a semantic-ordering type whose stored form is not
 canonical for equality also supplies `groupKey` — a canonical representative such

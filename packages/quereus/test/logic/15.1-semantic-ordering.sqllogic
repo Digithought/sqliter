@@ -165,6 +165,22 @@ select count(*) as c from (
 ) as q;
 → [{"c":1}]
 
+-- EXCEPT and INTERSECT run over the same row-identity comparator as UNION, so a
+-- differing spelling of the same elapsed time subtracts / intersects as one value.
+select count(*) as c from (
+	select d from dt where id = 1
+	except
+	select d from dt where id = 2
+) as q;
+→ [{"c":0}]
+
+select count(*) as c from (
+	select d from dt where id = 1
+	intersect
+	select d from dt where id = 2
+) as q;
+→ [{"c":1}]
+
 -- Window PARTITION BY places both rows in one partition.
 select count(*) over (partition by d) as c from dt;
 → [{"c":2},{"c":2}]
@@ -332,6 +348,42 @@ select (json('[99]') < json('{"a":0}')) as r;
 -- Equality is unchanged: key order in objects is insignificant either way.
 select (json('{"a":1,"b":2}') = json('{"b":2,"a":1}')) as r;
 → [{"r":true}]
+
+-- BETWEEN over a JSON column agrees with the structural comparisons it desugars to.
+select id from jv where v between json('{"a":1}') and json('{"a":5}');
+→ [{"id":2}]
+
+-- JSON row identity: key order is insignificant, so two reordered spellings of one
+-- document are one value to DISTINCT, GROUP BY and set operations. (JSON needs no
+-- groupKey hook — its canonical text form is already identity-faithful — so these
+-- assert that the canonical form, not the stored insertion order, drives the key.)
+create table jd (id integer primary key, v json);
+insert into jd values (1, '{"a":1,"b":2}'), (2, '{"b":2,"a":1}');
+
+select count(*) as c from (select distinct v from jd) as q;
+→ [{"c":1}]
+
+select count(*) as c from (select v from jd group by v) as q;
+→ [{"c":1}]
+
+select count(*) as c from (
+	select v from jd where id = 1
+	union
+	select v from jd where id = 2
+) as q;
+→ [{"c":1}]
+
+-- Window PARTITION BY and an equi-join key collapse the same identity.
+select count(*) over (partition by v) as c from jd;
+→ [{"c":2},{"c":2}]
+
+create table jd2 (id integer primary key, v json);
+insert into jd2 values (10, '{"b":2,"a":1}');
+select jd.id as l, jd2.id as r from jd join jd2 on jd.v = jd2.v order by l;
+→ [{"l":1,"r":10},{"l":2,"r":10}]
+
+drop table jd2;
+drop table jd;
 
 drop table jv;
 

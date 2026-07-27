@@ -6,7 +6,6 @@ import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
 import { BTree } from 'inheritree';
 import { createSemanticRowComparator, BINARY_COLLATION } from '../../util/comparison.js';
-import type { LogicalType } from '../../types/logical-type.js';
 
 export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): Instruction {
   const leftInst = emitPlanNode(plan.left, ctx);
@@ -31,7 +30,7 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
   const dataColCount = plan.dataColumnCount();
   const dataAttributes = attributes.slice(0, dataColCount);
   const dataComparator = createSemanticRowComparator(
-    dataAttributes.map(attr => attr.type.logicalType as LogicalType),
+    dataAttributes.map(attr => attr.type.logicalType),
     dataAttributes.map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
   );
 

@@ -9,7 +9,6 @@ import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
 import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering } from '../../util/comparison.js';
 import type { SqlValue } from '../../common/types.js';
-import type { LogicalType } from '../../types/logical-type.js';
 import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
@@ -85,8 +84,8 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 		// (Sort and index order are typed since the semantic-ordering change), so a
 		// collation/text compare here would advance the wrong side and drop matches.
 		// Mixed or plain pairs keep the storage-class + collation compare.
-		const leftLogical = leftAttributes[li].type.logicalType as LogicalType;
-		const rightLogical = rightAttributes[ri].type.logicalType as LogicalType;
+		const leftLogical = leftAttributes[li].type.logicalType;
+		const rightLogical = rightAttributes[ri].type.logicalType;
 		keyComparators.push(leftLogical === rightLogical && hasSemanticOrdering(leftLogical)
 			? createTypedComparator(leftLogical, collationFunc)
 			: (a, b) => compareSqlValuesFast(a, b, collationFunc));
