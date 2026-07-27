@@ -261,6 +261,67 @@ describe('Parser', () => {
 			}
 		});
 
+		it('should parse bare (no-AS) alias followed by another select item', () => {
+			const stmt = parse('select 1 a, 2 b, 3 c') as SelectStmt;
+			expect(stmt.columns).to.have.length(3);
+			for (const [col, expected] of [[stmt.columns[0], 'a'], [stmt.columns[1], 'b'], [stmt.columns[2], 'c']] as const) {
+				expect(col.type).to.equal('column');
+				if (col.type === 'column') {
+					expect(col.alias).to.equal(expected);
+				}
+			}
+		});
+
+		it('should parse bare alias mixed with an AS alias in the same list', () => {
+			const stmt = parse('select 1 as num, 2 b') as SelectStmt;
+			expect(stmt.columns).to.have.length(2);
+			const [first, second] = stmt.columns;
+			expect(first.type).to.equal('column');
+			expect(second.type).to.equal('column');
+			if (first.type === 'column') expect(first.alias).to.equal('num');
+			if (second.type === 'column') expect(second.alias).to.equal('b');
+		});
+
+		it('should parse a bare alias before a window function column', () => {
+			const stmt = parse('select o.k kk, row_number() over () rn from o') as SelectStmt;
+			expect(stmt.columns).to.have.length(2);
+			const [first, second] = stmt.columns;
+			expect(first.type).to.equal('column');
+			expect(second.type).to.equal('column');
+			if (first.type === 'column') expect(first.alias).to.equal('kk');
+			if (second.type === 'column') expect(second.alias).to.equal('rn');
+		});
+
+		it('should not treat a following column as an alias when there is no bare identifier gap', () => {
+			const stmt = parse('select a, b from t') as SelectStmt;
+			expect(stmt.columns).to.have.length(2);
+			const [first, second] = stmt.columns;
+			expect(first.type).to.equal('column');
+			expect(second.type).to.equal('column');
+			if (first.type === 'column') expect(first.alias).to.be.undefined;
+			if (second.type === 'column') expect(second.alias).to.be.undefined;
+		});
+
+		it('should parse a bare table alias in a comma-separated FROM list', () => {
+			const stmt = parse('select 1 from t a, u b') as SelectStmt;
+			expect(stmt.from).to.have.length(2);
+			const [first, second] = stmt.from!;
+			expect(first.type).to.equal('table');
+			expect(second.type).to.equal('table');
+			if (first.type === 'table') expect(first.alias).to.equal('a');
+			if (second.type === 'table') expect(second.alias).to.equal('b');
+		});
+
+		it('should parse a bare subquery alias in a comma-separated FROM list', () => {
+			const stmt = parse('select 1 from (select 1) x, (select 2) y') as SelectStmt;
+			expect(stmt.from).to.have.length(2);
+			const [first, second] = stmt.from!;
+			expect(first.type).to.equal('subquerySource');
+			expect(second.type).to.equal('subquerySource');
+			if (first.type === 'subquerySource') expect(first.alias).to.equal('x');
+			if (second.type === 'subquerySource') expect(second.alias).to.equal('y');
+		});
+
 		it('should parse SELECT *', () => {
 			const stmt = parse('select * from t') as SelectStmt;
 			expect(stmt.columns).to.have.length(1);

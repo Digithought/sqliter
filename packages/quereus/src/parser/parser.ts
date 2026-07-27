@@ -907,7 +907,6 @@ export class Parser {
 				else if (this.checkIdentifierLike([]) &&
 					!this.checkNext(1, TokenType.LPAREN) &&
 					!this.checkNext(1, TokenType.DOT) &&
-					!this.checkNext(1, TokenType.COMMA) &&
 					!this.isEndOfClause()) {
 					const aliasToken = this.advance();
 					alias = this.getIdentifierValue(aliasToken);
@@ -1031,7 +1030,6 @@ export class Parser {
 			alias = this.getIdentifierValue(this.advance());
 		} else if (this.checkIdentifierLike([]) &&
 			!this.checkNext(1, TokenType.DOT) &&
-			!this.checkNext(1, TokenType.COMMA) &&
 			!this.isJoinToken() &&
 			!this.isEndOfClause()) {
 			alias = this.getIdentifierValue(this.advance());
@@ -1122,7 +1120,6 @@ export class Parser {
 			endToken = aliasToken;
 		} else if (this.checkIdentifierLike([]) &&
 			!this.checkNext(1, TokenType.DOT) &&
-			!this.checkNext(1, TokenType.COMMA) &&
 			!this.isJoinToken() &&
 			!this.isEndOfClause()) {
 			const aliasToken = this.advance();
@@ -1182,7 +1179,6 @@ export class Parser {
 			endToken = aliasToken;
 		} else if (this.checkIdentifierLike([]) &&
 			!this.checkNext(1, TokenType.DOT) &&
-			!this.checkNext(1, TokenType.COMMA) &&
 			!this.isJoinToken() &&
 			!this.isEndOfClause()) {
 			const aliasToken = this.advance();

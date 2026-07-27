@@ -80,3 +80,21 @@ order by label;
 
 drop table u2;
 drop table u1;
+
+-- =============================================================================
+-- Bare (no-AS) aliases followed by more list items — regression coverage for
+-- a parser bug where a bare alias was rejected whenever a comma followed it
+-- =============================================================================
+
+create table b1 (k integer primary key, j integer);
+insert into b1 values (1, 10), (2, 20);
+
+-- Bare column aliases, none of which is the last item in the list
+select k kk, j jj from b1 order by kk;
+→ [{"kk":1,"jj":10},{"kk":2,"jj":20}]
+
+-- Bare alias immediately before a window function column
+select k kk, row_number() over (order by k) rn from b1 order by kk;
+→ [{"kk":1,"rn":1},{"kk":2,"rn":2}]
+
+drop table b1;
