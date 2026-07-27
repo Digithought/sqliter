@@ -1,6 +1,6 @@
 {
   "name": "@quereus/sync",
-  "version": "4.4.0",
+  "version": "4.4.1",
   "type": "module",
   "description": "Fully opaque CRDT sync for Quereus - write normal SQL, get automatic multi-master replication with conflict resolution",
   "keywords": [
