@@ -137,6 +137,105 @@ export const benchmarks = [
 		},
 	},
 	{
+		name: 'order-by-text-10k',
+		iterations: 10,
+		warmup: 2,
+		async setup() { db = await createTextDb(); },
+		async teardown() { await db.close(); db = null; },
+		async fn() {
+			const rows = await collect(
+				db.eval('select * from bench_text_t order by tkey')
+			);
+			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
+		},
+	},
+	{
+		// Every key shares the same 40-char prefix (`PREFIX40`), so the comparator can
+		// never resolve on its fast early bytes — the opposite cost profile of
+		// `order-by-text-10k`, where keys diverge at character 5.
+		name: 'order-by-text-prefix40-10k',
+		iterations: 10,
+		warmup: 2,
+		async setup() { db = await createTextDb(); },
+		async teardown() { await db.close(); db = null; },
+		async fn() {
+			const rows = await collect(
+				db.eval('select * from bench_text_t order by tkey_prefixed')
+			);
+			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
+		},
+	},
+	{
+		// Every key carries an astral emoji + a CJK Extension B ideograph
+		// (`UNICODE_PREFIX`), forcing `compareCodePoints`'s surrogate-aware slow path
+		// (see `util/comparison.ts`) rather than its native `<`/`>` fast path.
+		name: 'order-by-text-unicode-10k',
+		iterations: 10,
+		warmup: 2,
+		async setup() { db = await createTextDb(); },
+		async teardown() { await db.close(); db = null; },
+		async fn() {
+			const rows = await collect(
+				db.eval('select * from bench_text_t order by tkey_unicode')
+			);
+			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
+		},
+	},
+	{
+		name: 'group-by-text-10k',
+		iterations: 10,
+		warmup: 2,
+		async setup() { db = await createTextDb(); },
+		async teardown() { await db.close(); db = null; },
+		async fn() {
+			const rows = await collect(
+				db.eval('select label, count(*) as cnt from bench_text_t group by label')
+			);
+			if (rows.length !== 100) throw new Error(`Expected 100 groups, got ${rows.length}`);
+		},
+	},
+	{
+		// `tkey` is unique per row, so dedup must compare all 10K values rather than
+		// collapsing into `group-by-text-10k`'s 100 low-cardinality groups.
+		name: 'distinct-text-10k',
+		iterations: 10,
+		warmup: 2,
+		async setup() { db = await createTextDb(); },
+		async teardown() { await db.close(); db = null; },
+		async fn() {
+			const rows = await collect(
+				db.eval('select distinct tkey from bench_text_t')
+			);
+			if (rows.length !== 10000) throw new Error(`Expected 10000 distinct rows, got ${rows.length}`);
+		},
+	},
+	{
+		name: 'text-pk-range-scan-10k',
+		iterations: 10,
+		warmup: 2,
+		async setup() { db = await createTextPkDb(); },
+		async teardown() { await db.close(); db = null; },
+		async fn() {
+			const rows = await collect(
+				db.eval("select * from bench_text_pk where tkey >= 'key_03000' and tkey < 'key_04000'")
+			);
+			if (rows.length !== 1000) throw new Error(`Expected 1000 rows, got ${rows.length}`);
+		},
+	},
+	{
+		name: 'text-pk-point-seek-10k',
+		iterations: 10,
+		warmup: 2,
+		async setup() { db = await createTextPkDb(); },
+		async teardown() { await db.close(); db = null; },
+		async fn() {
+			const rows = await collect(
+				db.eval("select * from bench_text_pk where tkey = 'key_05000'")
+			);
+			if (rows.length !== 1) throw new Error(`Expected 1 row, got ${rows.length}`);
+		},
+	},
+	{
 		name: 'join-1kx1k',
 		iterations: 10,
 		warmup: 2,
