@@ -151,6 +151,17 @@ export {
   type PongMessage,
 } from './sync/wire.js';
 
+// Host-driven maintenance pass. The library still schedules nothing — this is
+// only the shape of one pass (ordering, error isolation, single-flight); the
+// host arms the timer around it.
+export {
+  SYNC_MAINTENANCE_INTERVAL_MS,
+  type SyncMaintenanceTarget,
+  type MaintenanceLogger,
+  runSyncMaintenancePass,
+  createSyncMaintenanceTicker,
+} from './sync/maintenance.js';
+
 // Built-in conflict resolvers
 export {
   lwwResolver,

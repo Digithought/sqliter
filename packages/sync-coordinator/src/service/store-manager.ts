@@ -242,11 +242,24 @@ export class StoreManager {
    * Release a store reference. Decrements refCount.
    */
   release(databaseId: string): void {
+    this.decRef(databaseId, true);
+  }
+
+  /**
+   * Release a pin taken by {@link acquireIfOpen}, without refreshing
+   * `lastAccess` — see the NOTE there for why background sweeps must not count
+   * as access.
+   */
+  releasePin(databaseId: string): void {
+    this.decRef(databaseId, false);
+  }
+
+  private decRef(databaseId: string, touch: boolean): void {
     const entry = this.stores.get(databaseId);
     if (!entry) return;
 
     entry.refCount = Math.max(0, entry.refCount - 1);
-    entry.lastAccess = Date.now();
+    if (touch) entry.lastAccess = Date.now();
     serviceLog('Store released: %s, refCount=%d', databaseId, entry.refCount);
   }
 
@@ -262,6 +275,42 @@ export class StoreManager {
    */
   get(databaseId: string): StoreEntry | undefined {
     return this.stores.get(databaseId);
+  }
+
+  /**
+   * Snapshot of the database IDs currently open. A plain array copy, so the
+   * caller can await between entries without tripping over concurrent
+   * open/close mutating the live map.
+   */
+  openDatabaseIds(): string[] {
+    return Array.from(this.stores.keys());
+  }
+
+  /**
+   * Pin an already-open store, or return undefined if it is not open. Unlike
+   * {@link acquire} this never opens (or re-opens) a store — it is for
+   * background work that should touch only what is already resident, e.g. the
+   * periodic sync-maintenance sweep.
+   *
+   * Synchronous by design: the refCount bump lands in the same synchronous
+   * section as the `stores.get`, which makes it atomic with respect to
+   * `closeStore`'s equally-synchronous "guard then delete" section (see the
+   * serialization invariant on {@link closeStore}). So the store cannot be
+   * closed out from under a caller that got an entry back, and a caller that
+   * lost the race gets undefined rather than a half-torn-down handle.
+   *
+   * NOTE: deliberately does NOT touch `lastAccess`. A maintenance sweep is not
+   * user access; refreshing the timestamp on every pass would keep otherwise-idle
+   * stores permanently above the idle-close threshold.
+   */
+  acquireIfOpen(databaseId: string): StoreEntry | undefined {
+    if (this._shuttingDown) return undefined;
+
+    const entry = this.stores.get(databaseId);
+    if (!entry) return undefined;
+
+    entry.refCount++;
+    return entry;
   }
 
   /**

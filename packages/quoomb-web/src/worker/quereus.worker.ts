@@ -16,11 +16,9 @@ import {
   type SyncState,
   type HeldChangesDrainedEvent,
   type BasisTableEvictedEvent,
-} from '@quereus/sync';
-import {
   SYNC_MAINTENANCE_INTERVAL_MS,
   createSyncMaintenanceTicker,
-} from './sync-maintenance.js';
+} from '@quereus/sync';
 import { createLocalCreateDrainListener } from './sync-local-create-drain.js';
 import { SyncClient, type SyncStatus as SyncClientStatus, type SyncEvent as SyncClientEvent } from '@quereus/sync-client';
 import type {

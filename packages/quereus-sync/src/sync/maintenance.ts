@@ -1,29 +1,32 @@
 /**
- * Periodic sync-maintenance tick runner for the quoomb-web worker.
+ * Host-agnostic tick body for the periodic sync-maintenance loop.
  *
- * The `@quereus/sync` library is deliberately timer-free: it exposes the four
- * host-driven sweeps (`drainHeldChanges` / `pruneQuarantine` / `pruneTombstones`
- * / `evictExpiredBasisTables`) but never schedules them — the host owns cadence
- * (`docs/migration.md` § 4 Contract, `docs/sync.md` § Unknown-Table Disposition).
- * This module is that cadence's tick body, extracted from the worker so the
- * re-entrancy and error-isolation logic is unit-testable without Comlink /
- * IndexedDB / a real worker.
+ * `@quereus/sync` is deliberately timer-free: it exposes the four host-driven
+ * sweeps (`drainHeldChanges` / `pruneQuarantine` / `pruneTombstones` /
+ * `evictExpiredBasisTables`) but never schedules them — the host owns cadence
+ * (`docs/sync.md` § Who drives the sweep, `docs/migration.md` § 4 Contract).
+ * What lives here is only the *shape* of one pass — ordering, error isolation,
+ * single-flight — with no timer and no `SyncManager` import, so every host
+ * (browser worker, relay coordinator, native app) runs the same semantics
+ * instead of re-deriving them. Arming a timer around `createSyncMaintenanceTicker`
+ * stays the host's job.
  */
 
 /**
- * Default cadence for the worker's sync-maintenance loop (5 minutes).
+ * Default cadence for a host's sync-maintenance loop (5 minutes).
  *
  * The latency-sensitive sweep is `drainHeldChanges` (held edits replay within
  * one interval once a table reappears); prune/evict act only at horizon
  * granularity (default 30 days) so are latency-insensitive. Every sweep is
- * zero-cost when nothing is held/expired, so minutes is ample. Kept a documented
- * constant rather than a config knob until a host needs to tune it.
+ * zero-cost when nothing is held/expired, so minutes is ample. A host with no
+ * latency-sensitive sweep (a relay, where `drainHeldChanges` is inert) is free
+ * to pick a slower cadence of its own.
  */
 export const SYNC_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
  * Minimal structural view of the four host-driven sweeps the loop calls. Avoids
- * importing the full `SyncManager` surface and keeps the test fake tiny — a
+ * depending on the full `SyncManager` surface and keeps test fakes tiny — a
  * `SyncManager` is structurally assignable to this.
  */
 export interface SyncMaintenanceTarget {
@@ -74,8 +77,8 @@ export async function runSyncMaintenancePass(
 
 /**
  * Build a single-flight maintenance ticker with the re-entrancy and null-target
- * guards folded in, so the worker holds no separate boolean and the guard logic
- * is drivable from a test.
+ * guards folded in, so the host holds no separate boolean and the guard logic is
+ * drivable from a test.
  *
  * - `getTarget` returns the live maintenance target, or null when there is no
  *   sync module yet / after `close()`. A null target is a clean no-op (the timer
@@ -83,6 +86,11 @@ export async function runSyncMaintenancePass(
  * - While a pass is in flight, a concurrent tick is a clean no-op until the
  *   first settles — a pass slower than the interval must not overlap itself. The
  *   in-flight flag lives in the returned closure.
+ *
+ * Note the collapsed tick *does not* join the in-flight pass — it resolves
+ * immediately. That suits a fire-and-forget timer; a host that must await the
+ * running pass (to close its stores at shutdown, say) needs to hold the pass
+ * promise itself rather than rely on this return value.
  */
 export function createSyncMaintenanceTicker(
   getTarget: () => SyncMaintenanceTarget | null,

@@ -1,10 +1,19 @@
-import { describe, it, expect, vi } from 'vitest';
+/**
+ * Tests for the host-agnostic maintenance pass (`src/sync/maintenance.ts`).
+ *
+ * The contract these pin: every sweep runs once per pass in drain-before-prune
+ * order, one failing sweep never suppresses the others, and a pass never
+ * overlaps itself. Moved here from the quoomb-web worker when the tick body was
+ * lifted into the library so both hosts (browser worker, relay coordinator)
+ * share one implementation.
+ */
 
+import { expect } from 'chai';
 import {
   runSyncMaintenancePass,
   createSyncMaintenanceTicker,
   type SyncMaintenanceTarget,
-} from '../worker/sync-maintenance.js';
+} from '../../src/sync/maintenance.js';
 
 /** A manually-settled promise, for modeling a long-running sweep. */
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
@@ -25,6 +34,12 @@ const ALL_SWEEPS: SweepName[] = [
   'pruneTombstones',
   'evictExpiredBasisTables',
 ];
+
+/** Minimal recording logger (mocha/chai has no built-in spy). */
+function makeLogger(): { log: (step: string, error: unknown) => void; entries: [string, unknown][] } {
+  const entries: [string, unknown][] = [];
+  return { entries, log: (step, error) => { entries.push([step, error]); } };
+}
 
 /**
  * Fake maintenance target that records the order sweeps were invoked in. Each
@@ -54,12 +69,12 @@ function makeFakeTarget(
 describe('runSyncMaintenancePass', () => {
   it('runs all four sweeps once, in order (drain → pruneQuarantine → pruneTombstones → evict)', async () => {
     const { target, calls } = makeFakeTarget();
-    const log = vi.fn();
+    const { log, entries } = makeLogger();
 
     await runSyncMaintenancePass(target, log);
 
-    expect(calls).toEqual(ALL_SWEEPS);
-    expect(log).not.toHaveBeenCalled();
+    expect(calls).to.deep.equal(ALL_SWEEPS);
+    expect(entries).to.deep.equal([]);
   });
 
   it('isolates a failing sweep: the other three still run, the pass resolves, the failure is logged once', async () => {
@@ -67,14 +82,13 @@ describe('runSyncMaintenancePass', () => {
     const { target, calls } = makeFakeTarget({
       pruneQuarantine: () => Promise.reject(boom),
     });
-    const log = vi.fn();
+    const { log, entries } = makeLogger();
 
-    await expect(runSyncMaintenancePass(target, log)).resolves.toBeUndefined();
+    expect(await runSyncMaintenancePass(target, log)).to.be.undefined;
 
     // All four were still invoked despite the second one rejecting.
-    expect(calls).toEqual(ALL_SWEEPS);
-    expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith('pruneQuarantine', boom);
+    expect(calls).to.deep.equal(ALL_SWEEPS);
+    expect(entries).to.deep.equal([['pruneQuarantine', boom]]);
   });
 
   it('isolates each failing sweep independently: two failures both run and both log', async () => {
@@ -84,16 +98,17 @@ describe('runSyncMaintenancePass', () => {
       drainHeldChanges: () => Promise.reject(boom1),
       evictExpiredBasisTables: () => Promise.reject(boom2),
     });
-    const log = vi.fn();
+    const { log, entries } = makeLogger();
 
-    await expect(runSyncMaintenancePass(target, log)).resolves.toBeUndefined();
+    expect(await runSyncMaintenancePass(target, log)).to.be.undefined;
 
     // Both failing sweeps and the two healthy ones in between all ran.
-    expect(calls).toEqual(ALL_SWEEPS);
+    expect(calls).to.deep.equal(ALL_SWEEPS);
     // One log per failure, with the right (step, error) pair — no dedup / short-circuit.
-    expect(log).toHaveBeenCalledTimes(2);
-    expect(log).toHaveBeenCalledWith('drainHeldChanges', boom1);
-    expect(log).toHaveBeenCalledWith('evictExpiredBasisTables', boom2);
+    expect(entries).to.deep.equal([
+      ['drainHeldChanges', boom1],
+      ['evictExpiredBasisTables', boom2],
+    ]);
   });
 });
 
@@ -103,7 +118,7 @@ describe('createSyncMaintenanceTicker', () => {
     const { target, calls } = makeFakeTarget({
       drainHeldChanges: () => gate.promise, // first pass parks here
     });
-    const log = vi.fn();
+    const { log, entries } = makeLogger();
     const tick = createSyncMaintenanceTicker(() => target, log);
 
     const first = tick();  // starts a pass, hangs on drainHeldChanges
@@ -112,41 +127,40 @@ describe('createSyncMaintenanceTicker', () => {
 
     // While the first pass is parked, only its first sweep has run; the second
     // tick added nothing.
-    expect(calls).toEqual(['drainHeldChanges']);
+    expect(calls).to.deep.equal(['drainHeldChanges']);
 
     gate.resolve(0); // release the first pass
     await first;
 
     // The first pass completed all four sweeps exactly once.
-    expect(calls).toEqual(ALL_SWEEPS);
+    expect(calls).to.deep.equal(ALL_SWEEPS);
 
     // Once settled, the guard re-arms: a fresh tick runs a full pass again.
     await tick();
-    expect(calls).toEqual([...ALL_SWEEPS, ...ALL_SWEEPS]);
-    expect(log).not.toHaveBeenCalled();
+    expect(calls).to.deep.equal([...ALL_SWEEPS, ...ALL_SWEEPS]);
+    expect(entries).to.deep.equal([]);
   });
 
   it('is a clean no-op when the target is null (no sync module / after close)', async () => {
-    const log = vi.fn();
+    const { log, entries } = makeLogger();
     const tick = createSyncMaintenanceTicker(() => null, log);
 
-    await expect(tick()).resolves.toBeUndefined();
-    expect(log).not.toHaveBeenCalled();
+    expect(await tick()).to.be.undefined;
+    expect(entries).to.deep.equal([]);
   });
 
   it('re-reads the target each tick: goes no-op once the target is cleared', async () => {
-    let current: SyncMaintenanceTarget | null = null;
     const { target, calls } = makeFakeTarget();
-    current = target;
-    const log = vi.fn();
+    let current: SyncMaintenanceTarget | null = target;
+    const { log } = makeLogger();
     const tick = createSyncMaintenanceTicker(() => current, log);
 
     await tick();
-    expect(calls).toEqual(ALL_SWEEPS);
+    expect(calls).to.deep.equal(ALL_SWEEPS);
 
     // Simulate close() nulling the manager: a later timer firing must no-op.
     current = null;
     await tick();
-    expect(calls).toEqual(ALL_SWEEPS); // unchanged — no new sweeps ran
+    expect(calls).to.deep.equal(ALL_SWEEPS); // unchanged — no new sweeps ran
   });
 });

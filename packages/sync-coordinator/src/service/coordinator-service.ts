@@ -36,6 +36,7 @@ import type {
   CoordinatorHooks,
 } from './types.js';
 import { StoreManager, type StoreEntry, type StoreManagerHooks, type StoreContext } from './store-manager.js';
+import { CoordinatorMaintenanceLoop } from './maintenance.js';
 import { type S3StorageConfig, createS3Client } from './s3-config.js';
 import { S3BatchStore } from './s3-batch-store.js';
 import { S3SnapshotStore, type SnapshotScheduleConfig } from './s3-snapshot-store.js';
@@ -68,6 +69,7 @@ export class CoordinatorService {
   private readonly _storeManager: StoreManager;
   private readonly s3BatchStore?: S3BatchStore;
   private readonly s3SnapshotStore?: S3SnapshotStore;
+  private readonly maintenanceLoop: CoordinatorMaintenanceLoop;
 
   /** Active WebSocket sessions by connection ID */
   private readonly sessions = new Map<string, ClientSession>();
@@ -126,6 +128,10 @@ export class CoordinatorService {
     if (diskEvictionIdleMs > 0) {
       serviceLog('Disk eviction enabled: idle threshold %dms', diskEvictionIdleMs);
     }
+
+    // Sync housekeeping (tombstone / quarantine expiry, basis eviction). The
+    // library ships no timer; this is the coordinator's cadence for it.
+    this.maintenanceLoop = new CoordinatorMaintenanceLoop(this._storeManager);
   }
 
   /**
@@ -151,6 +157,8 @@ export class CoordinatorService {
       serviceLog('S3 snapshot store started');
     }
 
+    this.maintenanceLoop.start();
+
     this.initialized = true;
 
     serviceLog('CoordinatorService initialized, ready for multi-tenant connections');
@@ -168,6 +176,10 @@ export class CoordinatorService {
     if (this.s3SnapshotStore) {
       this.s3SnapshotStore.stop();
     }
+
+    // Disarm housekeeping and let any in-flight pass finish before the stores
+    // it is reading are closed below.
+    await this.maintenanceLoop.stop();
 
     // Close all WebSocket connections
     for (const session of this.sessions.values()) {

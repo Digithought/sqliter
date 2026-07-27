@@ -30,6 +30,14 @@ export {
 } from './store-manager.js';
 
 export {
+  CoordinatorMaintenanceLoop,
+  runCoordinatorMaintenancePass,
+  COORDINATOR_MAINTENANCE_INTERVAL_MS,
+  type MaintenanceStoreSource,
+  type StoreMaintenanceLogger,
+} from './maintenance.js';
+
+export {
   type S3StorageConfig,
   type StoragePathResolver,
   createS3Client,
