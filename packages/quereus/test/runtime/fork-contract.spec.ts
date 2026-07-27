@@ -39,6 +39,10 @@ const EXPECTED_FORK_POLICY = {
 	tableContexts: 'forked',
 	tracer: 'shared-sink',
 	activeConnection: 'shared-cooperative',
+	// Deferred-constraint table-name remap: set per entry by the queue on its own
+	// sequential commit-time context and only ever READ (by the scan leaf), so a fork
+	// shares it by reference and treats it as immutable.
+	tableNameRemap: 'shared-frozen',
 	enableMetrics: 'shared-frozen',
 	// Per-row INSERT/envelope ordinal: set+restored synchronously by the sequential
 	// insert path, never mutated inside a parallel fork — each child snapshots it.
@@ -198,6 +202,7 @@ describe('Fork contract (test harness)', () => {
 			parent.params = { 1: 99 };
 			parent.tracer = {} as unknown as RuntimeContext['tracer'];
 			parent.activeConnection = {} as unknown as RuntimeContext['activeConnection'];
+			parent.tableNameRemap = new Map([['main.t', 't2']]);
 			parent.contextTracker = {} as unknown as RuntimeContext['contextTracker'];
 			parent.planStack = [];
 			parent.signal = new AbortController().signal;

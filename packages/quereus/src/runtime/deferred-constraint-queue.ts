@@ -18,6 +18,15 @@ export interface DeferredConstraintRow {
 	connectionId?: string;
 	contextRow?: Row; // Mutation context values
 	contextDescriptor?: RowDescriptor; // Mutation context row descriptor
+	/**
+	 * Lowercase `<schema>.<name>` as this entry's frozen evaluator names a table →
+	 * the name that table carries now. Populated by {@link DeferredConstraintQueue.notifyTableRename}
+	 * for renames that happen AFTER this entry was queued, and handed to the scan
+	 * leaf via `RuntimeContext.tableNameRemap` at evaluation time. Per-entry rather
+	 * than queue-wide because a freed name may be reused by a fresh table in the
+	 * same transaction — only entries queued before the rename may be redirected.
+	 */
+	tableRenames?: Map<string, string>;
 }
 
 type DeferredConstraintBuckets = Map<string, Map<string, DeferredConstraintRow[]>>;
@@ -43,6 +52,67 @@ export class DeferredConstraintQueue {
 			contextRow: contextRow ? contextRow.slice() as Row : undefined,
 			contextDescriptor
 		});
+	}
+
+	/**
+	 * Records an `ALTER TABLE ... RENAME TO` against every entry already queued, so a
+	 * check parked before the rename still finds its tables at commit.
+	 *
+	 * Two halves:
+	 *  - every pending entry learns `<schema>.<oldName>` → `newName`, composing across
+	 *    repeated renames (`pp → pp2 → pp3` leaves `main.pp` → `pp3`). An entry that
+	 *    already maps `<schema>.<oldName>` is left alone on that key: its emit-time table
+	 *    has moved on, and this rename is about whichever table holds the freed name now.
+	 *  - the bucket keyed by the write-time table name moves with the table, so
+	 *    {@link findConnection}'s name fallback keys off the CURRENT name.
+	 *
+	 * NOTE: stamps every pending entry, including entries below the current savepoint
+	 * layer, and `rollbackLayer` does not unstamp them. Correct today because a catalog
+	 * rename is not rolled back either — the built-in modules declare the
+	 * `'non-transactional'` DDL tier, so `rollback to <savepoint>` (and a whole
+	 * `rollback`) leave the rename applied. If transactional DDL ever lands for the
+	 * native backends, this remap has to become layer-scoped alongside the catalog.
+	 */
+	notifyTableRename(schemaName: string, oldName: string, newName: string): void {
+		const oldKey = `${schemaName}.${oldName}`.toLowerCase();
+		const newKey = `${schemaName}.${newName}`.toLowerCase();
+		const oldLower = oldName.toLowerCase();
+
+		const stampStore = (store: DeferredConstraintBuckets): void => {
+			for (const constraints of store.values()) {
+				for (const rows of constraints.values()) {
+					for (const entry of rows) {
+						const renames = entry.tableRenames ?? new Map<string, string>();
+						for (const [key, current] of renames) {
+							if (current.toLowerCase() === oldLower) renames.set(key, newName);
+						}
+						if (!renames.has(oldKey)) renames.set(oldKey, newName);
+						entry.tableRenames = renames;
+					}
+				}
+			}
+			this.rekeyBucket(store, oldKey, newKey);
+		};
+
+		stampStore(this.entries);
+		for (const layer of this.layers) stampStore(layer);
+	}
+
+	/** Moves the `oldKey` bucket to `newKey`, merging per-constraint row lists into an existing destination. */
+	private rekeyBucket(store: DeferredConstraintBuckets, oldKey: string, newKey: string): void {
+		if (oldKey === newKey) return;
+		const bucket = store.get(oldKey);
+		if (!bucket) return;
+		store.delete(oldKey);
+		const dest = store.get(newKey);
+		if (!dest) {
+			store.set(newKey, bucket);
+			return;
+		}
+		for (const [constraintName, rows] of bucket) {
+			if (!dest.has(constraintName)) dest.set(constraintName, []);
+			dest.get(constraintName)!.push(...rows);
+		}
 	}
 
 	beginLayer(): void {
@@ -83,6 +153,9 @@ export class DeferredConstraintQueue {
 				for (const entry of rows) {
 					const connection = this.findConnection(activeConnections, table, entry.connectionId);
 					runtimeCtx.activeConnection = connection;
+					// Per entry: the evaluator was frozen at row-write time, so any table it
+					// names by the pre-rename name resolves through this map in the scan leaf.
+					runtimeCtx.tableNameRemap = entry.tableRenames;
 					await this.evaluateEntry(runtimeCtx, entry);
 				}
 			}
@@ -136,6 +209,7 @@ export class DeferredConstraintQueue {
 						connectionId: entry.connectionId,
 						contextRow: entry.contextRow ? entry.contextRow.slice() as Row : undefined,
 						contextDescriptor: entry.contextDescriptor,
+						tableRenames: entry.tableRenames,
 					})));
 				}
 			}
@@ -170,15 +244,12 @@ export class DeferredConstraintQueue {
 			);
 		}
 		// NOTE: this name fallback is only reached when the enqueue site had no
-		// `activeConnection` to stamp. `tableKey` is the name the row was written under, and a
-		// module whose connections follow an `ALTER TABLE ... RENAME TO` (the memory module
-		// re-keys them; see MemoryTableManager.rekeyRegisteredConnections) will no longer match
-		// it — the entry then evaluates with no active connection and reads committed state
-		// instead of the transaction's own writes. Harmless today: both enqueue sites stamp a
-		// connectionId whenever one exists, and a rename across a queued deferred check already
-		// fails earlier (fix/deferred-foreign-key-breaks-when-table-renamed-in-same-transaction).
-		// If that fix makes rename-then-deferred-check reachable, key the fallback off the
-		// table's CURRENT name rather than the write-time one.
+		// `activeConnection` to stamp. `tableKey` is the table's CURRENT name, not the
+		// write-time one: `notifyTableRename` moves the bucket whenever an
+		// `ALTER TABLE ... RENAME TO` lands mid-transaction, matching the modules that
+		// re-key their connections on rename (see MemoryTableManager.rekeyRegisteredConnections).
+		// Were the two to drift apart, the entry would evaluate with no active connection and
+		// read committed state instead of the transaction's own writes.
 		const normalized = tableKey.toLowerCase();
 		const simple = normalized.includes('.') ? normalized.substring(normalized.lastIndexOf('.') + 1) : normalized;
 		const matches = connections.filter(conn => {

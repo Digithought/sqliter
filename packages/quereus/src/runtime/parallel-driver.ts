@@ -53,8 +53,11 @@ export class ParallelDriver {
 	 *   parent's entries — set/delete in one fork do not leak to siblings or parent;
 	 * - **shared** references to read-mostly state: `db`, `stmt`, `params`,
 	 *   `enableMetrics`, `mutationOrdinal`, `signal`, `tracer`, `activeConnection`,
-	 *   `contextTracker`, `planStack`, `executionMemo`, `scanConnections`, `cacheStates`,
-	 *   `cteMaterializations`, `inSetProbes`.
+	 *   `tableNameRemap`, `contextTracker`, `planStack`, `executionMemo`,
+	 *   `scanConnections`, `cacheStates`, `cteMaterializations`, `inSetProbes`.
+	 *   (`tableNameRemap` is the deferred-constraint queue's per-entry old→new table
+	 *   name map; shared by reference and read-only, so a scan leaf inside a fork
+	 *   resolves the same post-rename name the parent would.)
 	 *   (`signal` is shared so every
 	 *   branch honors the same cooperative cancellation — the table-scan leaf reads
 	 *   `rctx.signal`.) (`mutationOrdinal` is a per-row INSERT/envelope
@@ -121,6 +124,7 @@ export class ParallelDriver {
 				tableContexts: childTableContexts,
 				tracer: rctx.tracer,
 				activeConnection: rctx.activeConnection,
+				tableNameRemap: rctx.tableNameRemap,
 				enableMetrics: rctx.enableMetrics,
 				mutationOrdinal: rctx.mutationOrdinal,
 				signal: rctx.signal,

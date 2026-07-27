@@ -1,0 +1,165 @@
+-- Deferred FK checks queued before an `alter table ... rename to` in the SAME
+-- transaction must still evaluate at commit, against the table's CURRENT name.
+-- Regression for: a queued check whose evaluator was compiled against the
+-- pre-rename name failed the COMMIT with an engine-level "connect failed"
+-- (memory) or a false constraint violation (store) instead of passing.
+
+pragma foreign_keys = true;
+
+-- ===================================
+-- 1. Renaming the PARENT after the deferred check is queued
+-- ===================================
+
+create table dr_p (id integer primary key);
+create table dr_c (id integer primary key,
+	pid integer null references dr_p(id) deferrable initially deferred);
+
+begin;
+insert into dr_c values (10, 1);   -- queues the deferred FK check against dr_p
+alter table dr_p rename to dr_p2;
+insert into dr_p2 values (1);      -- the parent row the check needs
+commit;
+
+select id, pid from dr_c order by id;
+→ [{"id":10,"pid":1}]
+
+select id from dr_p2 order by id;
+→ [{"id":1}]
+
+-- ===================================
+-- 2. Same shape, but the parent row never arrives — the check must still be
+--    evaluated and must REPORT the violation (not an internal error).
+-- ===================================
+
+create table dr_p3 (id integer primary key);
+create table dr_c3 (id integer primary key,
+	pid integer null references dr_p3(id) deferrable initially deferred);
+
+begin;
+insert into dr_c3 values (10, 1);
+alter table dr_p3 rename to dr_p4;
+commit;
+-- error: constraint
+
+select count(*) as cnt from dr_c3;
+→ [{"cnt":0}]
+
+-- ===================================
+-- 3. Self-referential deferred FK + rename (case 10 of
+--    41-fk-cascade-conflict-and-self-ref.sqllogic, plus a rename)
+-- ===================================
+
+create table dr_sd (id integer primary key,
+	pid integer null references dr_sd(id) deferrable initially deferred);
+
+begin;
+insert into dr_sd values (2, 1);   -- forward reference: parent not there yet
+alter table dr_sd rename to dr_sd2;
+insert into dr_sd2 values (1, null);
+commit;
+
+select id, pid from dr_sd2 order by id;
+→ [{"id":1,"pid":null},{"id":2,"pid":1}]
+
+-- ===================================
+-- 4. Renaming only the CHILD (the table the queued row belongs to)
+-- ===================================
+
+create table dr_p5 (id integer primary key);
+create table dr_c5 (id integer primary key,
+	pid integer null references dr_p5(id) deferrable initially deferred);
+
+begin;
+insert into dr_c5 values (10, 1);
+alter table dr_c5 rename to dr_c6;
+insert into dr_p5 values (1);
+commit;
+
+select id, pid from dr_c6 order by id;
+→ [{"id":10,"pid":1}]
+
+-- ===================================
+-- 5. Two renames of the same table in one transaction
+-- ===================================
+
+create table dr_p7 (id integer primary key);
+create table dr_c7 (id integer primary key,
+	pid integer null references dr_p7(id) deferrable initially deferred);
+
+begin;
+insert into dr_c7 values (10, 1);
+alter table dr_p7 rename to dr_p8;
+alter table dr_p8 rename to dr_p9;
+insert into dr_p9 values (1);
+commit;
+
+select id, pid from dr_c7 order by id;
+→ [{"id":10,"pid":1}]
+
+-- ===================================
+-- 6. Renaming a column the deferred check reads, on both sides
+-- ===================================
+
+create table dr_p10 (id integer primary key, tag text);
+create table dr_c10 (id integer primary key,
+	pid integer null references dr_p10(id) deferrable initially deferred);
+
+begin;
+insert into dr_c10 values (10, 1);
+alter table dr_p10 rename column id to key_id;
+alter table dr_c10 rename column pid to parent_id;
+insert into dr_p10 values (1, 'x');
+commit;
+
+select id, parent_id from dr_c10 order by id;
+→ [{"id":10,"parent_id":1}]
+
+-- ===================================
+-- 7. A freed name reused by a FRESH table in the same transaction must NOT be
+--    redirected — this is why the remap is per queued entry, not database-wide.
+-- ===================================
+
+create table dr_p11 (id integer primary key);
+create table dr_c11 (id integer primary key,
+	pid integer null references dr_p11(id) deferrable initially deferred);
+
+begin;
+insert into dr_c11 values (10, 1);
+alter table dr_p11 rename to dr_p12;   -- the FK now points at dr_p12
+insert into dr_p12 values (1);
+create table dr_p11 (id integer primary key);   -- fresh, unrelated table
+insert into dr_p11 values (99);
+commit;
+
+select id, pid from dr_c11 order by id;
+→ [{"id":10,"pid":1}]
+
+select id from dr_p11 order by id;
+→ [{"id":99}]
+
+-- ===================================
+-- 8. …and renaming that reused name again must still not drag the parked check
+--    along: the parked entry already knows where ITS table went.
+-- ===================================
+
+create table dr_p13 (id integer primary key);
+create table dr_c13 (id integer primary key,
+	pid integer null references dr_p13(id) deferrable initially deferred);
+
+begin;
+insert into dr_c13 values (10, 1);
+alter table dr_p13 rename to dr_p14;            -- parked check now reads dr_p14
+insert into dr_p14 values (1);                  -- the parent row it needs
+create table dr_p13 (id integer primary key);   -- fresh table takes the freed name
+insert into dr_p13 values (99);
+alter table dr_p13 rename to dr_p15;            -- must NOT re-point the parked check
+commit;
+
+select id, pid from dr_c13 order by id;
+→ [{"id":10,"pid":1}]
+
+select id from dr_p14 order by id;
+→ [{"id":1}]
+
+select id from dr_p15 order by id;
+→ [{"id":99}]

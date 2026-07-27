@@ -89,6 +89,16 @@ export function emitSeqScan(
 		if (cachedInstance) {
 			vtabInstance = cachedInstance;
 		} else {
+			// `schema.name` is the name this scan was EMITTED against. A deferred constraint
+			// evaluates a plan frozen at row-write time, so an `ALTER TABLE ... RENAME TO`
+			// later in the same transaction leaves that name pointing at nothing. The queue
+			// stamps the entry's old→new mapping onto the context while it evaluates; resolve
+			// through it so we connect under the name the table carries now. Undefined for
+			// every other execution, so this costs one optional lookup. Nothing else in this
+			// scan is name-bound — `schema.columns`, the row descriptor and the `FilterInfo`
+			// are positional, and a table rename changes no column.
+			const effectiveName = runtimeCtx.tableNameRemap?.get(
+				`${schema.schemaName}.${schema.name}`.toLowerCase()) ?? schema.name;
 			try {
 				const options: BaseModuleConfig = {
 					...(schema.vtabArgs ?? {}),
@@ -99,12 +109,12 @@ export function emitSeqScan(
 					capturedModuleInfo.auxData,
 					schema.vtabModuleName,
 					schema.schemaName,
-					schema.name,
+					effectiveName,
 					options
 				);
 			} catch (e: unknown) {
 				const message = e instanceof Error ? e.message : String(e);
-				throw new QuereusError(`Module '${schema.vtabModuleName}' connect failed for table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
+				throw new QuereusError(`Module '${schema.vtabModuleName}' connect failed for table '${effectiveName}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
 			}
 
 			if (connectionCache) {

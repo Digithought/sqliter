@@ -239,6 +239,13 @@ async function runRenameTable(
 	// crosses the wire to a peer is `fix/sync-schema-migrations-replicate-empty-ddl`.
 	rctx.db._getEventEmitter().renameBatchedEvents(tableSchema.schemaName, oldName, newName);
 
+	// Deferred constraint checks this transaction already parked carry evaluators compiled
+	// against the OLD name — their scan leaves would connect to a table that no longer
+	// exists (or, on a store backend, to an empty one, yielding a FALSE violation). Tell
+	// the queue so it re-points those entries and moves the bucket keyed by the table name.
+	// Same placement rationale as the event relabel above.
+	rctx.db.getDeferredConstraints().notifyTableRename(tableSchema.schemaName, oldName, newName);
+
 	// The renamed table's own definition can name itself: a self-referencing FK's
 	// `referencedTable`, a table-qualified CHECK expression, a table-qualified
 	// partial-index predicate. Rewrite those BEFORE the catalog swap and the notify

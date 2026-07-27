@@ -25,6 +25,13 @@ export type RuntimeContext = {
 	tracer?: InstructionTracer;
 	/** Active connection for the current transaction context */
 	activeConnection?: VirtualTableConnection;
+	/**
+	 * Lowercase `<schema>.<name>` as written at emit time → the name that table
+	 * carries NOW. Set only while the deferred-constraint queue evaluates an
+	 * evaluator frozen before an `ALTER TABLE ... RENAME TO`; undefined everywhere
+	 * else, so the scan leaf pays one `?.` on the hot path.
+	 */
+	tableNameRemap?: ReadonlyMap<string, string>;
 	/** Whether to collect runtime execution metrics */
 	enableMetrics: boolean;
 	/**
