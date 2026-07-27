@@ -6,10 +6,9 @@ import type { ConstraintCheck, NotNullDefaultPlan } from '../nodes/constraint-ch
 import { RegisteredScope } from '../scopes/registered.js';
 import type { Scope } from '../scopes/scope.js';
 import { buildExpression } from './expression.js';
-import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
-import type { ScalarPlanNode } from '../nodes/plan-node.js';
-import { PlanNode } from '../nodes/plan-node.js';
+import type { PlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
+import { isRelationalNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import * as AST from '../../parser/ast.js';
 import { validateDeterministicConstraint } from '../validation/determinism-validator.js';
@@ -305,17 +304,25 @@ export function buildNotNullDefaults(
   return result;
 }
 
+/**
+ * True when the CHECK expression reads a relation — i.e. it embeds a subquery of
+ * any shape and therefore cannot be decided from the mutating row alone.
+ *
+ * Detected structurally, by finding a relational node anywhere under the scalar
+ * expression, rather than by listing the scalar node types that wrap a subquery.
+ * The list form missed `x in (select …)`: `InNode` carries its source relation
+ * but reports `PlanNodeType.In`, so a membership CHECK was silently evaluated at
+ * write time against pre-transaction data (bug-deferred-subquery-check-reads-stale-state).
+ * `in (<value list>)` has no relational child and stays immediate, as it should.
+ */
 function containsSubquery(expr: ScalarPlanNode): boolean {
-  const stack: ScalarPlanNode[] = [expr];
+  const stack: PlanNode[] = [expr];
   while (stack.length) {
     const n = stack.pop()!;
-    if (n.nodeType === PlanNodeType.ScalarSubquery || n.nodeType === PlanNodeType.Exists) {
+    if (isRelationalNode(n)) {
       return true;
     }
-    for (const c of n.getChildren()) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      stack.push(c as any);
-    }
+    stack.push(...n.getChildren());
   }
   return false;
 }
