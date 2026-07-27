@@ -128,9 +128,11 @@ drop table set_b;
 create table coll_agg (id integer primary key, val text collate NOCASE);
 insert into coll_agg values (1, 'apple'), (2, 'APPLE'), (3, 'Banana'), (4, 'banana'), (5, 'cherry');
 
--- MIN/MAX under NOCASE: comparison is case-insensitive, so first/last by case-folded order
--- (NOCASE-equal values may resolve to any of the case-equal members; engine picks first encountered)
-select min(val) as mn, max(val) as mx from coll_agg;
+-- MIN/MAX under NOCASE: comparison is case-insensitive, so first/last by case-folded
+-- order. NOCASE-equal values ('apple' vs 'APPLE') tie, so which spelling survives is
+-- unspecified — fold through upper() to assert the extremum without pinning the
+-- representative. 'cherry' is tie-free, so it may be asserted verbatim.
+select upper(min(val)) as mn, max(val) as mx from coll_agg;
 → [{"mn":"APPLE","mx":"cherry"}]
 
 drop table coll_agg;
@@ -373,3 +375,21 @@ select id from rng_rtrim where val > 'cat' order by id;
 → [{"id":3},{"id":4}]
 
 drop table rng_rtrim;
+
+-- min/max under the column's declared collation (not unconditional BINARY):
+-- NOCASE ranks 'a' below 'B', while BINARY would report mn=B, mx=a. The values
+-- carry no NOCASE ties, so the extrema are deterministic; under a tie ('a' vs
+-- 'A') which raw spelling survives is unspecified — same latitude as DISTINCT.
+create table mm_nc (id integer primary key, t text collate NOCASE);
+insert into mm_nc values (1, 'B'), (2, 'a');
+
+-- min/max agree with the ordering sites (order by … limit 1)
+select (min(t) = (select t from mm_nc order by t limit 1)) as min_agrees,
+       (max(t) = (select t from mm_nc order by t desc limit 1)) as max_agrees
+from mm_nc;
+→ [{"min_agrees":true,"max_agrees":true}]
+
+select min(t) as mn, max(t) as mx from mm_nc;
+→ [{"mn":"a","mx":"B"}]
+
+drop table mm_nc;

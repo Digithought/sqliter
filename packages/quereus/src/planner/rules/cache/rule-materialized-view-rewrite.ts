@@ -48,7 +48,8 @@ import { TableReferenceNode, ColumnReferenceNode } from '../../nodes/reference.j
 import { BinaryOpNode } from '../../nodes/scalar.js';
 import { requireVtabModule } from '../../../schema/table.js';
 import { isAggregateFunctionSchema } from '../../../schema/function.js';
-import { createAggregateFunction, createScalarFunction, type AggValue } from '../../../func/registration.js';
+import { bindAggregateSchema, createAggregateFunction, createScalarFunction, type AggValue } from '../../../func/registration.js';
+import type { CollationResolver, LogicalType } from '../../../types/logical-type.js';
 import { FunctionFlags } from '../../../common/constants.js';
 import type { SqlValue } from '../../../common/types.js';
 import { seqScanCost, filterCost, projectCost, aggregateCost, hashJoinCost } from '../../cost/index.js';
@@ -608,13 +609,14 @@ function buildRollupReplacement(aggNode: AggregateNode, match: RewriteMatch, con
 
 	// Flattened re-aggregations; `primIdx[ri]` holds the indices (into this list) recipe
 	// `ri` consumes — a `compose` recipe consumes one per partial (avg → 2), a `merge` one.
+	const resolveCollation = context.db.getCollationResolver();
 	const primitives: { expression: ScalarPlanNode; alias: string }[] = [];
 	const primIdx: number[][] = [];
 	for (const recipe of rollup.aggregates) {
 		const idxs: number[] = [];
 		for (const reagg of mergeReaggsFor(recipe)) {
 			idxs.push(primitives.length);
-			primitives.push(buildReaggAggregate(scope, reagg, backingAttrs));
+			primitives.push(buildReaggAggregate(scope, reagg, backingAttrs, resolveCollation));
 		}
 		primIdx.push(idxs);
 	}
@@ -663,10 +665,20 @@ function buildReaggAggregate(
 	scope: Scope,
 	reagg: MergeReagg,
 	backingAttrs: readonly Attribute[],
+	resolveCollation: CollationResolver,
 ): { expression: ScalarPlanNode; alias: string } {
-	const { schema, backingCol } = reagg;
+	const { backingCol } = reagg;
 	const backingAttr = backingAttrs[backingCol];
 	const colRef = colRefOnto(scope, backingAttr, backingCol);
+	// Bind to the BACKING attribute's comparison context: the fold consumes stored
+	// (finalized) values, whose type is the stored aggregate's result type — for
+	// min/max that equals the argument type, so the bound merge ranks the stored
+	// partials by the same semantic order the store maintained them under.
+	const backingType = backingAttr.type;
+	const schema = bindAggregateSchema(reagg.schema, [{
+		logicalType: backingType.logicalType as LogicalType,
+		collation: backingType.collationName ? resolveCollation(backingType.collationName) : undefined,
+	}]);
 	// The matcher admits this recipe only when merge + decode are declared.
 	const merge = schema.algebra!.merge;
 	const decode = schema.algebra!.decode!;

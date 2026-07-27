@@ -1,5 +1,5 @@
 import type { AggregateFinalizer, AggregateReducer, IntegratedTableValuedFunc, ScalarFunc, TableValuedFunc, ScalarFunctionSchema,
-	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, TVFAdvertisement } from '../schema/function.js';
+	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, AggregateArgBinding, TVFAdvertisement } from '../schema/function.js';
 import { FunctionFlags } from '../common/constants.js';
 import type { ScalarType, RelationType } from '../common/datatype.js';
 import { REAL_TYPE } from '../types/builtin-types.js';
@@ -109,6 +109,9 @@ interface AggregateFuncOptions {
 	/** Optional algebraic structure over the accumulator (merge/negate/decode/decompose).
 	 *  See {@link import('../schema/function.js').AggregateAlgebra} for the author contract. */
 	algebra?: AggregateAlgebra;
+	/** Optional per-call-site specialization to the arguments' comparison context.
+	 *  See {@link import('../schema/function.js').AggregateFunctionSchema.bindArgs}. */
+	bindArgs?: AggregateFunctionSchema['bindArgs'];
 	/** Return type information */
 	returnType?: ScalarType;
 	/**
@@ -253,8 +256,26 @@ export function createAggregateFunction(
 		finalizeFunction: finalizeFunc,
 		initialValue: options.initialValue,
 		algebra: options.algebra,
+		bindArgs: options.bindArgs,
 		replicable: options.replicable,
 		inferReturnType: options.inferReturnType,
 		validateArgTypes: options.validateArgTypes
 	};
+}
+
+/**
+ * Specialize an aggregate schema to one call site's argument comparison context
+ * (declared logical types + resolved collations). A schema with no `bindArgs`
+ * hook — or a hook that declines — is returned unchanged. Idempotent: the bound
+ * schema keeps `bindArgs`, and rebinding with the same arguments yields an
+ * equivalent schema, so no call site has to track whether it already bound.
+ *
+ * Call once per call site at emit / plan-build time, never per row.
+ */
+export function bindAggregateSchema(
+	schema: AggregateFunctionSchema,
+	args: readonly AggregateArgBinding[],
+): AggregateFunctionSchema {
+	const bound = schema.bindArgs?.(args);
+	return bound ? { ...schema, ...bound } : schema;
 }

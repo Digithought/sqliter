@@ -8,6 +8,8 @@ import {
 	countStarFunc, countXFunc, sumFunc, minFunc, maxFunc, avgFunc,
 	totalFunc, groupConcatFuncRev, varPopFunc, varSampFunc, stdDevPopFunc, stdDevSampFunc,
 } from '../../src/func/builtins/aggregate.js';
+import { bindAggregateSchema } from '../../src/func/registration.js';
+import { TIMESPAN_TYPE } from '../../src/types/index.js';
 
 /** Integers + NULL — the exact domain for count/avg (avg sums as floats, so
  *  small integers keep every intermediate sum exact). */
@@ -59,6 +61,40 @@ describe('Aggregate algebra declarations', () => {
 
 		it('avg(x) satisfies the algebra laws, including its sum/count decomposition', () => {
 			assertAggregateAlgebraLaws(avgFunc, intOrNull);
+		});
+
+		/* Bound min/max: the emit-time bindArgs specialization replaces step, merge,
+		 * decode, and finalize with closures over the argument's semantic comparator
+		 * (TIMESPAN → elapsed time). Law-checking the BOUND schema is what catches a
+		 * step/merge comparator mismatch — the defect class that would make
+		 * materialized-view maintenance disagree with direct evaluation.
+		 *
+		 * The domain uses SEMANTICALLY DISTINCT durations only: the harness compares
+		 * finalized values byte-exactly, but a semantic tie with byte-different
+		 * spellings ('PT1H' vs 'PT60M') leaves the surviving representative
+		 * unspecified, so such pairs would fail merge-commutativity spuriously. */
+		const timespanOrNull: fc.Arbitrary<SqlValue> = fc.oneof(
+			fc.constant(null as SqlValue),
+			fc.constantFrom<SqlValue>('PT0S', 'PT10M', 'PT30M', 'PT90M', 'PT2H', 'PT8H', 'P1D', 'P2D'),
+		);
+
+		it('bound min(x) over TIMESPAN satisfies the algebra laws', () => {
+			assertAggregateAlgebraLaws(bindAggregateSchema(minFunc, [{ logicalType: TIMESPAN_TYPE }]), timespanOrNull);
+		});
+
+		it('bound max(x) over TIMESPAN satisfies the algebra laws', () => {
+			assertAggregateAlgebraLaws(bindAggregateSchema(maxFunc, [{ logicalType: TIMESPAN_TYPE }]), timespanOrNull);
+		});
+
+		it('the bound comparator really is semantic: merge of PT90M vs PT2H tightens by elapsed time', () => {
+			const bound = bindAggregateSchema(minFunc, [{ logicalType: TIMESPAN_TYPE }]);
+			const a = bound.stepFunction(null, 'PT2H');
+			const b = bound.stepFunction(null, 'PT90M');
+			expect(bound.finalizeFunction(bound.algebra!.merge(a, b)), 'semantic min').to.equal('PT90M');
+			// The unbound (BINARY) schema keeps text order — 'PT2H' sorts first.
+			const ua = minFunc.stepFunction(null, 'PT2H');
+			const ub = minFunc.stepFunction(null, 'PT90M');
+			expect(minFunc.finalizeFunction(minFunc.algebra!.merge(ua, ub)), 'binary min').to.equal('PT2H');
 		});
 	});
 

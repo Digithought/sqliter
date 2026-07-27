@@ -504,10 +504,13 @@ export interface PrefixDeleteKey {
 export interface DeltaAggregateColumn {
 	/** Backing column index (= body output column index) this aggregate lands at. */
 	readonly backingCol: number;
-	/** The registry-resolved aggregate schema — carries step/finalize/initialValue. */
+	/** The registry-resolved aggregate schema — carries step/finalize/initialValue —
+	 *  bound at plan build to the argument column's comparison context
+	 *  (`bindAggregateSchema`), so a comparison-sensitive aggregate (min/max) steps
+	 *  and merges by the argument's semantic order, matching direct evaluation. */
 	readonly schema: AggregateFunctionSchema;
-	/** `schema.algebra`, narrowed: `merge` + `decode` always; `negate` for a `'group'`
-	 *  column (absent for a `'tighten'` column). */
+	/** `schema.algebra` (bound, see above), narrowed: `merge` + `decode` always;
+	 *  `negate` for a `'group'` column (absent for a `'tighten'` column). */
 	readonly algebra: AggregateAlgebra;
 	/** Delta maintenance class this column belongs to:
 	 *  - `'group'`: an abelian-group aggregate (count/sum — `merge` + `negate` + `decode`).

@@ -588,6 +588,29 @@ export function createTypedOrderByComparator(
 }
 
 /**
+ * The comparator an ordering site uses for a single value of `type` under
+ * `collation`: the type's own `compare` when it carries semantic ordering
+ * ({@link hasSemanticOrdering}), else storage-class + collation ordering. The
+ * scalar form of {@link createSemanticRowComparator}'s per-column routing — one
+ * copy of the routing rule, shared by row identity (DISTINCT/set operations) and
+ * the min/max aggregate binding (`bindArgs` in func/builtins/aggregate.ts).
+ *
+ * `type` may be undefined (untyped/ANY) — such values use the collation
+ * comparator, byte-identical to the historical BINARY default when no collation
+ * is passed. Safe for runtime type drift: the typed path's
+ * storage-class-mismatch guard (see {@link createTypedComparator}) falls back to
+ * storage-class ordering rather than mis-parsing.
+ */
+export function createSemanticValueComparator(
+	type: LogicalType | undefined,
+	collation: CollationFunction = BINARY_COLLATION,
+): (a: SqlValue, b: SqlValue) => number {
+	return hasSemanticOrdering(type)
+		? createTypedComparator(type, collation)
+		: (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation);
+}
+
+/**
  * Row comparator for identity checks (DISTINCT, set operations) that routes each
  * column through its declared logical type's `compare` when — and only when — that
  * type carries semantic ordering ({@link hasSemanticOrdering}); all other columns
@@ -597,21 +620,14 @@ export function createTypedOrderByComparator(
  * text identity on ANY/TEXT columns, whose declared `compare` is not
  * collation-aware and must not be consulted here.
  *
- * `types[i]` may be undefined (untyped/mixed column) — such columns use the
- * collation comparator. Safe for runtime type drift: the typed path's
- * storage-class-mismatch guard (see {@link createTypedComparator}) falls back to
- * storage-class ordering rather than mis-parsing.
+ * Per-column routing is {@link createSemanticValueComparator}.
  */
 export function createSemanticRowComparator(
 	types: readonly (LogicalType | undefined)[],
 	collations: readonly CollationFunction[]
 ): (a: Row, b: Row) => number {
-	const comparators = types.map((type, i) => {
-		const collationFunc = collations[i] ?? BINARY_COLLATION;
-		return hasSemanticOrdering(type)
-			? createTypedComparator(type, collationFunc)
-			: (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collationFunc);
-	});
+	const comparators = types.map((type, i) =>
+		createSemanticValueComparator(type, collations[i] ?? BINARY_COLLATION));
 	const len = comparators.length;
 
 	return (a: Row, b: Row): number => {

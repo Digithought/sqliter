@@ -248,3 +248,21 @@ select count(*) as groups from (select v from jse_t group by v);
 
 select count(*) as c from (select distinct v from jse_t);
 → [{"c":4}]
+
+-- ===================================
+-- 12. min/max rank structurally, agreeing with ORDER BY (docs/types.md
+--     "Semantic ordering"). Canonical-text order would report mn=[10], mx=[9].
+-- ===================================
+create table jse_mm (id integer primary key, d json);
+insert into jse_mm values (1, '[8,1]'), (2, '[9]'), (3, '[10]');
+-- run
+
+select id, d from jse_mm order by d;
+→ [{"id":1,"d":[8,1]},{"id":2,"d":[9]},{"id":3,"d":[10]}]
+
+select min(d) as mn, max(d) as mx from jse_mm;
+→ [{"mn":[8,1],"mx":[10]}]
+
+-- GROUP BY shape (hash aggregate) and DISTINCT agree with the plain form.
+select min(distinct d) as mn, max(distinct d) as mx from jse_mm;
+→ [{"mn":[8,1],"mx":[10]}]

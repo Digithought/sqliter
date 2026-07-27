@@ -1,7 +1,8 @@
 import { createLogger } from '../../common/logger.js';
 import type { SqlValue } from '../../common/types.js';
+import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, AggregateReducer } from '../../schema/function.js';
 import { createAggregateFunction } from '../registration.js';
-import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
+import { compareSqlValuesFast, createSemanticValueComparator, BINARY_COLLATION } from '../../util/comparison.js';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
 
 const log = createLogger('func:builtins:aggregate');
@@ -158,81 +159,78 @@ export const avgFunc = createAggregateFunction(
 	}
 );
 
-// --- MIN(X) ---
-// NOTE: min/max rank by storage-class + BINARY compare — aggregate step functions
-// receive bare runtime values, with no declared-type or collation context to consult.
-// For a TIMESPAN argument this is TEXT order, not elapsed-time order (min('PT2H',
-// 'PT90M') returns 'PT2H' though 90 minutes is smaller), disagreeing with ORDER
-// BY/`<` under the semantic-ordering rule (docs/types.md). Fixing it requires
-// threading the argument's logical type into the aggregate step/merge contract.
-export const minFunc = createAggregateFunction(
-	{
-		name: 'min',
-		numArgs: 1,
-		initialValue: null,
-		// Type inference: return the same type as the input argument
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: true, // MIN can return NULL if all values are NULL or no rows
-			isReadOnly: true
-		}),
-		// Tighten-only: merge but no negate (a retracted min cannot be undone locally).
-		// Same BINARY comparison as the step, so merge and step agree byte-for-byte.
-		algebra: {
-			merge: (a: { min: SqlValue } | null, b: { min: SqlValue } | null): { min: SqlValue } | null => {
-				if (a === null) return b;
-				if (b === null) return a;
-				return compareSqlValuesFast(b.min, a.min, BINARY_COLLATION) < 0 ? b : a;
-			},
-			// Stored NULL (empty group) decodes to the empty accumulator.
-			decode: (stored: SqlValue): { min: SqlValue } | null => stored === null ? null : { min: stored },
-		},
-	},
-	(acc: { min: SqlValue } | null, value: SqlValue): { min: SqlValue } | null => {
-		if (value === null) return acc; // Ignore NULLs
-		if (acc === null) return { min: value }; // First non-null value
-		return compareSqlValuesFast(value, acc.min, BINARY_COLLATION) < 0 ? { min: value } : acc;
-	},
-	(acc: { min: SqlValue } | null): SqlValue | null => {
-		return acc?.min ?? null;
-	}
-);
+// --- MIN(X) / MAX(X) ---
+// One aggregate with the sign flipped: a fold keeping whichever value the
+// comparator ranks first (min) or last (max). The factory derives step, merge,
+// decode, and finalize from ONE comparator, so step and merge can never rank
+// differently — that agreement is what keeps materialized-view maintenance
+// (algebra.merge) byte-identical to direct evaluation (stepFunction).
+//
+// The registered default compares by storage class under BINARY (correct for
+// untyped/ANY arguments, and for any consumer that never binds); `bindArgs`
+// re-derives the whole set over the argument's semantic-ordering comparator
+// (createSemanticValueComparator: TIMESPAN → elapsed time, JSON → structural,
+// collated TEXT → the declared collation), so `min(x)` agrees with
+// `order by x limit 1` at every call site.
+//
+// Ties under a non-BINARY comparator ('a' vs 'A' under NOCASE, 'PT1H' vs
+// 'PT60M' for TIMESPAN) compare equal, so which raw value survives is
+// unspecified — the same latitude DISTINCT and GROUP BY take when choosing a
+// group representative.
+type ExtremumAccumulator = { v: SqlValue } | null;
 
-// --- MAX(X) ---
-export const maxFunc = createAggregateFunction(
-	{
-		name: 'max',
-		numArgs: 1,
-		initialValue: null,
-		// Type inference: return the same type as the input argument
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: true, // MAX can return NULL if all values are NULL or no rows
-			isReadOnly: true
-		}),
-		// Tighten-only: merge but no negate (a retracted max cannot be undone locally).
-		// Same BINARY comparison as the step, so merge and step agree byte-for-byte.
+function extremumParts(
+	direction: 'min' | 'max',
+	compare: (a: SqlValue, b: SqlValue) => number,
+): { stepFunction: AggregateReducer; finalizeFunction: AggregateFinalizer; algebra: AggregateAlgebra } {
+	const wins = direction === 'min'
+		? (candidate: SqlValue, incumbent: SqlValue): boolean => compare(candidate, incumbent) < 0
+		: (candidate: SqlValue, incumbent: SqlValue): boolean => compare(candidate, incumbent) > 0;
+	return {
+		stepFunction: (acc: ExtremumAccumulator, value: SqlValue): ExtremumAccumulator => {
+			if (value === null) return acc; // Ignore NULLs
+			if (acc === null) return { v: value }; // First non-null value
+			return wins(value, acc.v) ? { v: value } : acc;
+		},
+		// Tighten-only: merge but no negate (a retracted extremum cannot be undone locally).
 		algebra: {
-			merge: (a: { max: SqlValue } | null, b: { max: SqlValue } | null): { max: SqlValue } | null => {
+			merge: (a: ExtremumAccumulator, b: ExtremumAccumulator): ExtremumAccumulator => {
 				if (a === null) return b;
 				if (b === null) return a;
-				return compareSqlValuesFast(b.max, a.max, BINARY_COLLATION) > 0 ? b : a;
+				return wins(b.v, a.v) ? b : a;
 			},
 			// Stored NULL (empty group) decodes to the empty accumulator.
-			decode: (stored: SqlValue): { max: SqlValue } | null => stored === null ? null : { max: stored },
+			decode: (stored: SqlValue): ExtremumAccumulator => stored === null ? null : { v: stored },
 		},
-	},
-	(acc: { max: SqlValue } | null, value: SqlValue): { max: SqlValue } | null => {
-		if (value === null) return acc; // Ignore NULLs
-		if (acc === null) return { max: value }; // First non-null value
-		return compareSqlValuesFast(value, acc.max, BINARY_COLLATION) > 0 ? { max: value } : acc;
-	},
-	(acc: { max: SqlValue } | null): SqlValue | null => {
-		return acc?.max ?? null;
-	}
-);
+		finalizeFunction: (acc: ExtremumAccumulator): SqlValue => acc?.v ?? null,
+	};
+}
+
+function createExtremumFunction(direction: 'min' | 'max'): AggregateFunctionSchema {
+	const defaults = extremumParts(direction, (a, b) => compareSqlValuesFast(a, b, BINARY_COLLATION));
+	return createAggregateFunction(
+		{
+			name: direction,
+			numArgs: 1,
+			initialValue: null,
+			// Type inference: return the same type as the input argument
+			inferReturnType: (argTypes) => ({
+				typeClass: 'scalar',
+				logicalType: argTypes[0],
+				nullable: true, // NULL if all values are NULL or no rows
+				isReadOnly: true
+			}),
+			algebra: defaults.algebra,
+			bindArgs: (args) =>
+				extremumParts(direction, createSemanticValueComparator(args[0]?.logicalType, args[0]?.collation)),
+		},
+		defaults.stepFunction,
+		defaults.finalizeFunction,
+	);
+}
+
+export const minFunc = createExtremumFunction('min');
+export const maxFunc = createExtremumFunction('max');
 
 // --- COUNT(X) ---
 // Counts non-NULL values of X

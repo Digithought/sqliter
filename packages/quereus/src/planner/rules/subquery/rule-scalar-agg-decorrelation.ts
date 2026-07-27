@@ -610,6 +610,10 @@ function decorrelateOne(
 function computeEmptyInputValue(schema: AggregateFunctionSchema): { value: SqlValue } | null {
 	let value: unknown;
 	try {
+		// The UNBOUND schema suffices here — no bindAggregateSchema call needed:
+		// finalize of the identity accumulator never compares values, so every
+		// comparison-sensitive aggregate (min/max) yields the same empty-group
+		// value (NULL) under any argument binding.
 		value = schema.finalizeFunction(cloneInitialValue(schema.initialValue));
 	} catch {
 		return null;

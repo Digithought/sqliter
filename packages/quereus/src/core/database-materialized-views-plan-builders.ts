@@ -14,7 +14,8 @@ import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/refere
 import { AggregateFunctionCallNode } from '../planner/nodes/aggregate-function.js';
 import { isAggregateFunctionSchema } from '../schema/function.js';
 import type { AggregateDecomposition } from '../schema/function.js';
-import { PhysicalType } from '../types/logical-type.js';
+import { bindAggregateSchema } from '../func/registration.js';
+import { PhysicalType, type LogicalType } from '../types/logical-type.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { EmissionContext } from '../runtime/emission-context.js';
@@ -585,7 +586,7 @@ export function buildAggregateResidualPlan(
 	// `undefined` on any gate failure — the arm then stays a plain residual, unchanged.
 	const delta = buildDeltaAggregateDescriptor(
 		mv, analyzed, tableRef, groupColumns, backingPkDefinition, backingPkSourceCols,
-		rootAttrs, sourceAttrToCol, producingByAttrId,
+		rootAttrs, sourceAttrToCol, producingByAttrId, ctx.getCollationResolver(),
 	);
 
 	// ── Cost gate ──
@@ -704,6 +705,7 @@ export function buildDeltaAggregateDescriptor(
 	rootAttrs: ReadonlyArray<{ id: number } | undefined>,
 	sourceAttrToCol: Map<number, number>,
 	producingByAttrId: Map<number, ScalarPlanNode>,
+	collationResolver: CollationResolver,
 ): DeltaAggregateDescriptor | undefined {
 	const sourceSchema = tableRef.tableSchema;
 	const groupColumnSet = new Set(groupColumns);
@@ -773,18 +775,37 @@ export function buildDeltaAggregateDescriptor(
 		// change the contribution set, multi-arg has no single raw value to step.
 		if (producing.isDistinct || producing.filter || (producing.orderBy && producing.orderBy.length > 0)) return undefined;
 		if (producing.args.length > 1) return undefined;
-		const schema = producing.functionSchema;
-		if (!isAggregateFunctionSchema(schema)) return undefined;
-		const algebra = schema.algebra;
+		const unboundSchema = producing.functionSchema;
+		if (!isAggregateFunctionSchema(unboundSchema)) return undefined;
 		// A bare source column argument (both classes below step / decompose over the raw
 		// value); a zero-arg (count(*)-shaped) call carries none.
+		//
+		// Bind the schema to the argument's comparison context ONCE here at plan build:
+		// the BOUND schema/algebra are what the delta arm executes (step at statement
+		// accumulation, merge/decode/finalize at flush — database-materialized-views-
+		// apply.ts), so store maintenance ranks by the same comparator as direct
+		// evaluation (min/max over TIMESPAN/JSON/collated text).
+		// Soundness note: the flush's decode reconstructs an accumulator from the STORED
+		// backing value and merges it against step contributions from SOURCE rows. For
+		// min/max the backing column's type is inferReturnType(argType) = argType, so one
+		// binding covers both sides. An aggregate whose result type differed from its
+		// argument type would need two bindings — none exists today that is both
+		// delta-maintainable and comparison-sensitive; state the assumption rather than
+		// generalizing for it.
 		let argSourceCol: number | undefined;
+		let schema = bindAggregateSchema(unboundSchema, []);
 		if (producing.args.length === 1) {
 			const arg = producing.args[0];
 			if (!(arg instanceof ColumnReferenceNode)) return undefined; // bare column args only
 			argSourceCol = resolveTransitiveSourceCol(arg.attributeId, sourceAttrToCol, producingByAttrId);
 			if (argSourceCol === undefined) return undefined;
+			const argType = arg.getType();
+			schema = bindAggregateSchema(unboundSchema, [{
+				logicalType: argType.logicalType as LogicalType,
+				collation: argType.collationName ? collationResolver(argType.collationName) : undefined,
+			}]);
 		}
+		const algebra = schema.algebra;
 		// Class routing — declaration-driven, never an aggregate-name list:
 		//  - **directly delta-maintainable** (`merge` + `negate` (retraction) + `decode` —
 		//    the backing stores finalized values, not accumulators): accumulate it as an

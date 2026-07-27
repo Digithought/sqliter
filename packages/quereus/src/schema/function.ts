@@ -4,7 +4,7 @@ import { FunctionFlags } from '../common/constants.js';
 import type { Database } from '../core/database.js';
 import type { BaseType, ScalarType, RelationType, ColRef } from '../common/datatype.js';
 import type { AggValue } from '../func/registration.js';
-import type { LogicalType } from '../types/logical-type.js';
+import type { CollationFunction, LogicalType } from '../types/logical-type.js';
 import type { ScalarFunctionCallNode } from '../planner/nodes/function.js';
 import type { EmissionContext } from '../runtime/emission-context.js';
 import type { Instruction } from '../runtime/types.js';
@@ -99,6 +99,21 @@ export interface AggregateAlgebra {
 	 *  maintained by delta-maintaining its partials, and lets the read-side rollup
 	 *  recombine it. */
 	decompose?: AggregateDecomposition;
+}
+
+/** Resolved comparison context for ONE argument of an aggregate call site. */
+export interface AggregateArgBinding {
+	/** The argument's declared logical type; undefined when untyped / ANY. */
+	readonly logicalType?: LogicalType;
+	/** The argument's resolved collation; undefined ⇒ BINARY. */
+	readonly collation?: CollationFunction;
+}
+
+/** The pieces a bind may replace. Any field omitted keeps the declared default. */
+export interface AggregateFunctionBinding {
+	readonly stepFunction?: AggregateReducer;
+	readonly finalizeFunction?: AggregateFinalizer;
+	readonly algebra?: AggregateAlgebra;
 }
 
 /**
@@ -331,6 +346,22 @@ export interface AggregateFunctionSchema extends BaseFunctionSchema {
 	 * function resolution or the `schema()` / `function_info()` listings.
 	 */
 	algebra?: AggregateAlgebra;
+	/**
+	 * Optional specialization to the call site's comparison context. Called once per
+	 * call site at emit / plan-build time — NEVER per row — with one binding per
+	 * declared argument (empty for a zero-arg call). Returns replacement closures, or
+	 * undefined to keep the declared defaults. Apply via `bindAggregateSchema`
+	 * (func/registration.ts); binding is idempotent, so a bound schema keeps this
+	 * hook and may be rebound freely.
+	 *
+	 * Author contract (an extension of the {@link AggregateAlgebra} contract): the
+	 * `algebra` returned here MUST use the same comparison as the returned
+	 * `stepFunction` — a `merge` that ranks differently from the step makes
+	 * materialized-view maintenance disagree with direct evaluation. It must also
+	 * declare the same algebra FIELDS as the unbound schema: delta/rollup
+	 * eligibility gates read field presence off the unbound declaration.
+	 */
+	readonly bindArgs?: (args: readonly AggregateArgBinding[]) => AggregateFunctionBinding | undefined;
 	/**
 	 * Optional type inference function for polymorphic aggregate functions.
 	 * If provided, this function will be called at planning time to determine

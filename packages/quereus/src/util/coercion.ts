@@ -80,6 +80,14 @@ export function coerceForComparison(v1: SqlValue, v2: SqlValue): [SqlValue, SqlV
  * Coerces a value for aggregate function arguments.
  * Most aggregate functions should accept numeric strings as numbers.
  * For COUNT, no coercion needed. For SUM/AVG, numeric strings should be converted.
+ *
+ * NOTE: this converts a numeric-looking string for min/max too, so `min('5','10')`
+ * over a plain TEXT column returns the NUMBER 5 — disagreeing with
+ * `order by … limit 1`, which keeps text order. Predates the semantic-ordering
+ * min/max binding and is unchanged by it (the emitters skip this call entirely
+ * when every argument type is numeric or carries semantic ordering — see
+ * `aggregateSkipCoercion` in runtime/emit/aggregate.ts / hash-aggregate.ts). If
+ * TEXT min/max should stop coercing, that is its own behavior-change ticket.
  */
 const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT']);
 

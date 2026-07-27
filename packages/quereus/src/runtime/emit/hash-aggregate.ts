@@ -4,7 +4,7 @@ import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type Row, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import type { FunctionSchema } from '../../schema/function.js';
+import type { AggregateArgBinding, FunctionSchema } from '../../schema/function.js';
 import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
@@ -15,7 +15,7 @@ import { coerceForAggregate } from '../../util/coercion.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
-import { AggValue } from '../../func/registration.js';
+import { AggValue, bindAggregateSchema } from '../../func/registration.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { createTypedComparator, hasSemanticOrdering } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
@@ -109,15 +109,55 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 		}
 	}
 
-	// Pre-compute per-aggregate whether coercion can be skipped
+	// Pre-compute per-aggregate whether coercion can be skipped. Skips when all
+	// argument types are numeric, or when every argument type carries semantic
+	// ordering (TIMESPAN/JSON): coerceForAggregate's numeric-string conversion
+	// must never run ahead of a type-aware comparator.
 	const aggregateSkipCoercion: boolean[] = plan.aggregates.map(agg => {
 		const funcNode = agg.expression;
 		if (!(funcNode instanceof AggregateFunctionCallNode)) return false;
 		const funcName = (funcNode.functionName || '').toUpperCase();
 		if (funcName === 'COUNT' || funcName === 'GROUP_CONCAT' || funcName.startsWith('JSON_')) return false;
 		const args = funcNode.args || [];
-		return args.length > 0 && args.every(arg => arg.getType().logicalType.isNumeric);
+		return args.length > 0 && (
+			args.every(arg => arg.getType().logicalType.isNumeric)
+			|| args.every(arg => hasSemanticOrdering(arg.getType().logicalType as LogicalType))
+		);
 	});
+
+	// Resolve + bind each aggregate's schema ONCE at emit time: the call site's
+	// argument types and collations specialize comparison-sensitive aggregates
+	// (min/max via bindArgs) so their step/merge rank by the argument's semantic
+	// order. Nothing in the per-row path resolves a type or a collation.
+	const aggregateSchemas: FunctionSchema[] = [];
+	const aggregateDistinctFlags: boolean[] = [];
+	for (const agg of plan.aggregates) {
+		const funcNode = agg.expression;
+		if (!(funcNode instanceof AggregateFunctionCallNode)) {
+			quereusError(
+				`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`,
+				StatusCode.INTERNAL
+			);
+		}
+
+		const funcSchema = funcNode.functionSchema;
+		if (!isAggregateFunctionSchema(funcSchema)) {
+			quereusError(
+				`Function ${funcNode.functionName || 'unknown'} is not an aggregate function`,
+				StatusCode.INTERNAL
+			);
+		}
+
+		const argBindings: AggregateArgBinding[] = (funcNode.args || []).map(arg => {
+			const argType = arg.getType();
+			return {
+				logicalType: argType.logicalType as LogicalType,
+				collation: argType.collationName ? ctx.resolveCollation(argType.collationName) : undefined,
+			};
+		});
+		aggregateSchemas.push(bindAggregateSchema(funcSchema, argBindings));
+		aggregateDistinctFlags.push(funcNode.isDistinct);
+	}
 
 	async function* run(
 		ctx: RuntimeContext,
@@ -143,30 +183,6 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 			const aggregateArgs = groupByAndAggregateArgs.slice(aggregateArgOffset, aggregateArgOffset + args.length);
 			aggregateArgFunctions.push(aggregateArgs);
 			aggregateArgOffset += args.length;
-		}
-
-		// Pre-resolve aggregate schemas and distinct flags
-		const aggregateSchemas: FunctionSchema[] = [];
-		const aggregateDistinctFlags: boolean[] = [];
-		for (const agg of plan.aggregates) {
-			const funcNode = agg.expression;
-			if (!(funcNode instanceof AggregateFunctionCallNode)) {
-				quereusError(
-					`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`,
-					StatusCode.INTERNAL
-				);
-			}
-
-			const funcSchema = funcNode.functionSchema;
-			if (!isAggregateFunctionSchema(funcSchema)) {
-				quereusError(
-					`Function ${funcNode.functionName || 'unknown'} is not an aggregate function`,
-					StatusCode.INTERNAL
-				);
-			}
-
-			aggregateSchemas.push(funcSchema);
-			aggregateDistinctFlags.push(funcNode.isDistinct);
 		}
 
 		function createAccumulators(): AggValue[] {

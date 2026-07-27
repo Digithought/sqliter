@@ -275,6 +275,61 @@ describe('Materialized-view query rewrite — aggregate-rollup equivalence (rewr
 	});
 });
 
+/* ── Semantic-ordering rollup (TIMESPAN min/max) ──────────────────────────────
+ * min/max bind to the argument's semantic-ordering comparator (TIMESPAN ranks by
+ * elapsed time, not duration text), and the read-side rollup folds STORED backing
+ * partials through the same bound merge. Deterministic fixtures whose text and
+ * elapsed-time orders disagree ('PT90M' < 'PT2H' semantically, > textually) pin
+ * that a rollup to a coarser key returns the same extrema as the base recompute. */
+
+describe('Materialized-view query rewrite — TIMESPAN min/max rollup equivalence', () => {
+	let db: Database;
+
+	const TS_QUERIES: readonly string[] = [
+		'select k, j, min(dur), max(dur) from t group by k, j', // exact-key
+		'select k, min(dur), max(dur) from t group by k',       // rollup to the coarser key
+		'select min(dur), max(dur) from t',                     // global-scalar rollup
+	];
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec(`
+			create table t (id integer primary key, k integer not null, j integer not null, dur timespan null);
+			create materialized view tmv_kj as
+				select k, j, count(*) as c, min(dur) as mn, max(dur) as mx
+				from t group by k, j;
+			insert into t values
+				(1, 1, 0, 'PT30M'), (2, 1, 0, 'PT2H'), (3, 1, 1, 'PT90M'),
+				(4, 2, 0, 'P1D'), (5, 2, 1, 'PT10M'), (6, 2, 1, null);
+		`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('exact-key / rollup / global TIMESPAN extrema match with the rewrite on vs off', async () => {
+		for (const q of TS_QUERIES) {
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+			const on = await readMultiset(db, q);
+			db.optimizer.updateTuning(REWRITE_OFF);
+			const off = await readMultiset(db, q);
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+			expect(on, `rewrite changed rows for: ${q}`).to.deep.equal(off);
+		}
+	});
+
+	it('the rollup actually rewrites onto the backing, and ranks by elapsed time', async () => {
+		const q = 'select k, min(dur) as mn, max(dur) as mx from t group by k order by k';
+		const plan = serializePlanTree(db.getPlan(q));
+		expect(plan, `expected an MV-table rewrite for: ${q}`).to.contain('"name": "tmv_kj"');
+		const rows: Record<string, SqlValue>[] = [];
+		for await (const row of db.eval(q)) rows.push(row as Record<string, SqlValue>);
+		// Text order would report k=1 mx=PT90M and k=2 mn=P1D.
+		expect(rows).to.deep.equal([
+			{ k: 1, mn: 'PT30M', mx: 'PT2H' },
+			{ k: 2, mn: 'PT10M', mx: 'P1D' },
+		]);
+	});
+});
+
 /* ── Join-subsumption equivalence ─────────────────────────────────────────────
  * Extends the harness with the join arm: an MV `jmv` materializing the 1:1 FK→PK
  * inner join `orders ⋈ customers` answers 1:1-join queries (with driving-side and

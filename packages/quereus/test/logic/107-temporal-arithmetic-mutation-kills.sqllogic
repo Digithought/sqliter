@@ -333,14 +333,69 @@ SELECT id FROM ts_test WHERE dur != 'PT1H' ORDER BY id;
 SELECT id, dur FROM ts_test ORDER BY dur;
 → [{"id":5,"dur":"PT0S"},{"id":1,"dur":"PT30M"},{"id":2,"dur":"PT1H"},{"id":3,"dur":"PT2H"},{"id":4,"dur":"P1D"}]
 
--- MIN / MAX aggregation: still lexicographic — KNOWN GAP, disagrees with the
--- semantic ordering rule (aggregate steps carry no type context; tracked as a
--- fix ticket). When min/max become type-aware this expectation flips to
--- mn=PT0S, mx=P1D.
+-- MIN / MAX aggregation ranks by elapsed time, same as ORDER BY / `<` above
+-- (the aggregate binds to the argument's TIMESPAN type at emit — docs/types.md
+-- "Semantic ordering"). Text order would report mn=P1D, mx=PT30M.
 SELECT min(dur) as mn, max(dur) as mx FROM ts_test;
-→ [{"mn":"P1D","mx":"PT30M"}]
+→ [{"mn":"PT0S","mx":"P1D"}]
+
+-- min/max agree with the ordering sites: order by … limit 1 (asc and desc)
+SELECT (min(dur) = (SELECT dur FROM ts_test ORDER BY dur LIMIT 1)) as min_agrees,
+       (max(dur) = (SELECT dur FROM ts_test ORDER BY dur DESC LIMIT 1)) as max_agrees
+FROM ts_test;
+→ [{"min_agrees":true,"max_agrees":true}]
+
+-- DISTINCT dedup is already semantic; the DISTINCT form must match the plain form
+SELECT min(distinct dur) as mn, max(distinct dur) as mx FROM ts_test;
+→ [{"mn":"PT0S","mx":"P1D"}]
 
 DROP TABLE ts_test;
+
+-- GROUP BY shape (hash aggregate): the bound comparator must reach the grouped
+-- path too, not just the single-group stream aggregate.
+CREATE TABLE ts_grp (id INTEGER PRIMARY KEY, g INTEGER, dur TIMESPAN);
+INSERT INTO ts_grp VALUES
+  (1, 1, 'PT30M'), (2, 1, 'PT2H'), (3, 1, 'PT90M'),
+  (4, 2, 'P1D'), (5, 2, 'PT10M');
+-- run
+
+SELECT g, min(dur) as mn, max(dur) as mx FROM ts_grp GROUP BY g ORDER BY g;
+→ [{"g":1,"mn":"PT30M","mx":"PT2H"},{"g":2,"mn":"PT10M","mx":"P1D"}]
+
+DROP TABLE ts_grp;
+
+-- Materialized view over TIMESPAN min/max: store-maintained values must rank by
+-- the same semantic comparator as direct evaluation, through BOTH maintenance
+-- arms — the delta merge on insert and the tighten residual fallback on a
+-- delete of the extreme.
+CREATE TABLE ts_src (id INTEGER PRIMARY KEY, g INTEGER, dur TIMESPAN);
+INSERT INTO ts_src VALUES (1, 1, 'PT30M'), (2, 1, 'PT2H'), (3, 1, 'PT90M');
+CREATE MATERIALIZED VIEW ts_mv AS
+  SELECT g, count(*) AS c, min(dur) AS mn, max(dur) AS mx FROM ts_src GROUP BY g;
+-- run
+
+-- (a) create-fill: stored equals the directly-evaluated body (text order would
+-- store mn=PT2H, mx=PT90M).
+SELECT g, c, mn, mx FROM ts_mv ORDER BY g;
+→ [{"g":1,"c":3,"mn":"PT30M","mx":"PT2H"}]
+
+-- (b) an insert that lowers the min exercises the delta merge path.
+INSERT INTO ts_src VALUES (4, 1, 'PT10M');
+SELECT g, c, mn, mx FROM ts_mv ORDER BY g;
+→ [{"g":1,"c":4,"mn":"PT10M","mx":"PT2H"}]
+
+-- stored and direct agree after the delta merge
+SELECT g, count(*) AS c, min(dur) AS mn, max(dur) AS mx FROM ts_src GROUP BY g ORDER BY g;
+→ [{"g":1,"c":4,"mn":"PT10M","mx":"PT2H"}]
+
+-- (c) a delete of the extreme exercises the tighten residual fallback (min/max
+-- cannot retract arithmetically — the group re-derives from live source state).
+DELETE FROM ts_src WHERE id = 4;
+SELECT g, c, mn, mx FROM ts_mv ORDER BY g;
+→ [{"g":1,"c":3,"mn":"PT30M","mx":"PT2H"}]
+
+DROP MATERIALIZED VIEW ts_mv;
+DROP TABLE ts_src;
 
 -- ============================================================
 -- Temporal arithmetic in WHERE clause (ensures dispatch path is exercised)

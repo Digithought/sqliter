@@ -296,9 +296,23 @@ point/range predicates re-check through the type-aware residual); with both type
 key bytes now order-faithful the declines are merely conservative — re-opening them
 is tracked in backlog `feat-reopen-timespan-store-seeks`.
 
-Known gap: the built-in `min`/`max` aggregates rank with a bare BINARY compare —
-aggregate step functions receive no type context — so `min(timespan_col)` returns
-the text-order extremum, not the shortest duration (tracked as a fix ticket).
+The `min`/`max` **aggregates** follow the same rule: at emit (and materialized-view
+plan-build) time the call site binds the aggregate to its argument's declared type
+and resolved collation (`AggregateFunctionSchema.bindArgs`, applied via
+`bindAggregateSchema`), replacing step/merge/decode/finalize with closures over the
+argument's semantic comparator. So `min(timespan_col)` returns the shortest
+duration, `min(json_col)` the structurally-least document, and `min` over a
+`collate nocase` column the NOCASE-least value — each agreeing with
+`order by … limit 1` — and store-maintained materialized-view min/max columns
+(delta merge and read-side rollup both execute the bound algebra) agree with
+direct evaluation. Untyped/ANY arguments with no declared collation keep the
+storage-class + BINARY behavior. Under a semantic tie with byte-different
+spellings (`'PT1H'` vs `'PT60M'`), which raw value survives is unspecified — the
+same latitude DISTINCT and GROUP BY take for a group representative.
+
+Known gap: **window** `min(x) over (…)` still ranks with a raw JS compare — the
+window registry (`schema/window-function.ts`) has no binding seam yet (tracked as
+`minmax-window-semantic-ordering`).
 
 ---
 
