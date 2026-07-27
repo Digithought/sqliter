@@ -17,6 +17,10 @@ import {
   parseChangeLogKey,
   buildChangeLogScanBoundsAfter,
   buildColumnVersionKey,
+  parseColumnVersionKey,
+  encodeRawPkIdentity,
+  encodePkIdentity,
+  RAW_PK_KEYING,
 } from '../../src/metadata/keys.js';
 
 const siteA = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -82,7 +86,8 @@ describe('change-log key encoding', () => {
   describe('buildChangeLogKey / parseChangeLogKey', () => {
     it('should round-trip a column entry at the new 30-byte offsets', () => {
       const hlc = createHLC(1000n, 7, siteA, 99);
-      const key = buildChangeLogKey(hlc, 'column', 'main', 'users', [1, 'x'], 'name');
+      const identity = encodeRawPkIdentity([1, 'x']);
+      const key = buildChangeLogKey(hlc, 'column', 'main', 'users', identity, 'name');
       // cl:(3) + hlc(30) + type(1) + suffix
       expect(key.length).to.be.greaterThan(34);
 
@@ -92,19 +97,20 @@ describe('change-log key encoding', () => {
       expect(parsed!.schema).to.equal('main');
       expect(parsed!.table).to.equal('users');
       expect(parsed!.column).to.equal('name');
-      expect(parsed!.pk).to.deep.equal([1, 'x']);
+      expect(parsed!.identity).to.equal(identity);
       expect(parsed!.hlc.opSeq).to.equal(99);
       expect(compareHLC(parsed!.hlc, hlc)).to.equal(0);
     });
 
     it('should round-trip a delete entry (no column)', () => {
       const hlc = createHLC(1000n, 1, siteB, 3);
-      const key = buildChangeLogKey(hlc, 'delete', 'main', 'orders', [42]);
+      const identity = encodeRawPkIdentity([42]);
+      const key = buildChangeLogKey(hlc, 'delete', 'main', 'orders', identity);
       const parsed = parseChangeLogKey(key);
       expect(parsed).to.not.be.null;
       expect(parsed!.entryType).to.equal('delete');
       expect(parsed!.column).to.be.undefined;
-      expect(parsed!.pk).to.deep.equal([42]);
+      expect(parsed!.identity).to.equal(identity);
       expect(parsed!.hlc.opSeq).to.equal(3);
     });
 
@@ -118,7 +124,7 @@ describe('change-log key encoding', () => {
         createHLC(2000n, 0, siteA, 0),
       ];
       const keyFor = (h: HLC): Uint8Array =>
-        buildChangeLogKey(h, 'column', 'main', 't', [1], 'c');
+        buildChangeLogKey(h, 'column', 'main', 't', encodeRawPkIdentity([1]), 'c');
 
       for (const x of hlcs) {
         for (const y of hlcs) {
@@ -140,8 +146,8 @@ describe('change-log key encoding', () => {
       const next = createHLC(1000n, 1, siteA, 6); // next fact, strictly after
       const { gte, lt } = buildChangeLogScanBoundsAfter(since);
 
-      const sinceKey = buildChangeLogKey(since, 'column', 'main', 't', [1], 'c');
-      const nextKey = buildChangeLogKey(next, 'column', 'main', 't', [1], 'c');
+      const sinceKey = buildChangeLogKey(since, 'column', 'main', 't', encodeRawPkIdentity([1]), 'c');
+      const nextKey = buildChangeLogKey(next, 'column', 'main', 't', encodeRawPkIdentity([1]), 'c');
 
       // The boundary entry itself is excluded (key < gte).
       expect(compareBytes(sinceKey, gte)).to.be.lessThan(0);
@@ -154,7 +160,7 @@ describe('change-log key encoding', () => {
       const since = createHLC(5000n, 3, siteB, 10);
       const { gte } = buildChangeLogScanBoundsAfter(since);
       const earlier = createHLC(5000n, 3, siteB, 0);
-      const earlierKey = buildChangeLogKey(earlier, 'delete', 'main', 't', [7]);
+      const earlierKey = buildChangeLogKey(earlier, 'delete', 'main', 't', encodeRawPkIdentity([7]));
       expect(compareBytes(earlierKey, gte)).to.be.lessThan(0);
     });
 
@@ -191,8 +197,40 @@ describe('change-log key encoding', () => {
       expect(Array.from(carried.siteId)).to.deep.equal(Array.from(expectedSite));
 
       // The boundary fact (max opSeq) is therefore excluded by the scan.
-      const boundaryKey = buildChangeLogKey(since, 'column', 'main', 't', [1], 'c');
+      const boundaryKey = buildChangeLogKey(since, 'column', 'main', 't', encodeRawPkIdentity([1]), 'c');
       expect(compareBytes(boundaryKey, gte)).to.be.lessThan(0);
+    });
+  });
+
+  describe('encodePkIdentity / length-prefixed keys', () => {
+    it('bigint and number pks of equal value share one identity (n: tag)', () => {
+      expect(encodeRawPkIdentity([5n])).to.equal(encodeRawPkIdentity([5]));
+      // The former JSON.stringify encoding threw outright on a bigint pk.
+      expect(() => encodeRawPkIdentity([9007199254740993n])).to.not.throw();
+    });
+
+    it('normalizers and transforms shape the identity', () => {
+      const nocase = { normalizers: [(v: string) => v.toLowerCase()], transforms: [undefined] };
+      expect(encodePkIdentity(['APPLE'], nocase)).to.equal(encodePkIdentity(['apple'], nocase));
+      const double = { normalizers: [], transforms: [(v: unknown) => (v as number) * 2] };
+      expect(encodePkIdentity([2], double)).to.equal(encodePkIdentity([2], double));
+      expect(encodePkIdentity([2], double)).to.not.equal(encodePkIdentity([2], RAW_PK_KEYING));
+    });
+
+    it('parses identity and column unambiguously even when both contain separators', () => {
+      // A string pk containing ':' and a column name containing ':' — the length
+      // prefix keeps the split exact where a last-colon split would misparse.
+      const identity = encodeRawPkIdentity(['a:b']);
+      const key = buildColumnVersionKey('main', 't', identity, 'col:on');
+      const parsed = parseColumnVersionKey(key);
+      expect(parsed).to.not.be.null;
+      expect(parsed!.identity).to.equal(identity);
+      expect(parsed!.column).to.equal('col:on');
+    });
+
+    it('null pk members produce a grouping identity, not a poisoned key', () => {
+      expect(encodeRawPkIdentity([null])).to.equal(encodeRawPkIdentity([null]));
+      expect(encodeRawPkIdentity([null])).to.not.equal(encodeRawPkIdentity(['']));
     });
   });
 
@@ -204,7 +242,7 @@ describe('change-log key encoding', () => {
     });
 
     it('still builds a key for a clean identifier', () => {
-      expect(() => buildColumnVersionKey('main', 't', [1], 'c')).to.not.throw();
+      expect(() => buildColumnVersionKey('main', 't', encodeRawPkIdentity([1]), 'c')).to.not.throw();
     });
   });
 });

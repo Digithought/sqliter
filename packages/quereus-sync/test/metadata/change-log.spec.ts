@@ -4,6 +4,7 @@
 
 import { expect } from 'chai';
 import { ChangeLogStore } from '../../src/metadata/change-log.js';
+import { RAW_PK_KEYING } from '../../src/metadata/keys.js';
 import { type HLC, compareHLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { InMemoryKVStore } from '@quereus/store';
@@ -15,7 +16,7 @@ describe('ChangeLogStore', () => {
 
   beforeEach(() => {
     kv = new InMemoryKVStore();
-    store = new ChangeLogStore(kv);
+    store = new ChangeLogStore(kv, () => RAW_PK_KEYING);
     siteId = generateSiteId();
   });
 

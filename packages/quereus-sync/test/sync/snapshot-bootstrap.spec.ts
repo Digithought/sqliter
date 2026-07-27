@@ -29,6 +29,7 @@ import { SyncEventEmitterImpl, type SyncState } from '../../src/sync/events.js';
 import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager, type HLC } from '../../src/clock/hlc.js';
+import { encodeRawPkIdentity } from '../../src/metadata/keys.js';
 import { createInMemoryProvider, collect } from './_peer-harness.js';
 
 /** A whole-table `full` watch — fires on any change with empty hits. */
@@ -47,9 +48,14 @@ function fullWatch(table: string): ChangeScope {
 const upd = (table: string, pk: SqlValue[], columns: Record<string, SqlValue>): DataChangeToApply =>
 	({ type: 'update', schema: 'main', table, pk, columns });
 
-/** A streamed column-version tuple: versionKey = `${encodePK(pk)}:${column}` (encodePK is JSON.stringify). */
-const cvEntry = (pk: SqlValue[], column: string, hlc: HLC, value: SqlValue): [string, HLC, SqlValue] =>
-	[`${JSON.stringify(pk)}:${column}`, hlc, value];
+/**
+ * A streamed column-version tuple: versionKey = `${identity}:${column}`, raw pk
+ * as the 4th element. These fixtures use the raw identity encoding, which for
+ * the lowercase-alphanumeric pks used here equals the receiver's NOCASE-keyed
+ * identity, so post-bootstrap pk-based lookups land on the same keys.
+ */
+const cvEntry = (pk: SqlValue[], column: string, hlc: HLC, value: SqlValue): [string, HLC, SqlValue, SqlValue[]] =>
+	[`${encodeRawPkIdentity(pk)}:${column}`, hlc, value, pk];
 
 async function* toStream(chunks: SnapshotChunk[]): AsyncIterable<SnapshotChunk> {
 	for (const c of chunks) yield c;
@@ -146,7 +152,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		const remoteHLC = new HLCManager(remoteSiteId);
 		const headerHLC = remoteHLC.tick();
 		const ROWS = 150; // > DATA_FLUSH_SIZE (100) → multiple bootstrap flushes
-		const entries: Array<[string, HLC, SqlValue]> = [];
+		const entries: Array<[string, HLC, SqlValue, SqlValue[]]> = [];
 		for (let i = 0; i < ROWS; i++) {
 			entries.push(cvEntry([`r${i}`], 'v', remoteHLC.tick(), `val${i % 3}`));
 		}
@@ -177,9 +183,9 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 
 		const remoteSiteId = generateSiteId();
 		const remoteHLC = new HLCManager(remoteSiteId);
-		const columnVersions = new Map<string, { hlc: HLC; value: SqlValue }>();
+		const columnVersions = new Map<string, { hlc: HLC; value: SqlValue; pk: SqlValue[] }>();
 		for (let i = 0; i < 5; i++) {
-			columnVersions.set(`["r${i}"]:v`, { hlc: remoteHLC.tick(), value: `val${i % 2}` });
+			columnVersions.set(`${encodeRawPkIdentity([`r${i}`])}:v`, { hlc: remoteHLC.tick(), value: `val${i % 2}`, pk: [`r${i}`] });
 		}
 		const snapshot: Snapshot = {
 			siteId: remoteSiteId,
@@ -207,7 +213,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		const remoteSiteId = generateSiteId();
 		const remoteHLC = new HLCManager(remoteSiteId);
 		const ROWS = 150; // would fire the full watch once per flush under per-row capture
-		const entries: Array<[string, HLC, SqlValue]> = [];
+		const entries: Array<[string, HLC, SqlValue, SqlValue[]]> = [];
 		for (let i = 0; i < ROWS; i++) entries.push(cvEntry([`r${i}`], 'v', remoteHLC.tick(), `v${i}`));
 		const snapshotId = 'snap-watch-1';
 		const chunks: SnapshotChunk[] = [
@@ -300,7 +306,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		const remoteSiteId = generateSiteId();
 		const remoteHLC = new HLCManager(remoteSiteId);
 		const snapshotId = 'snap-fail-1';
-		const entries: Array<[string, HLC, SqlValue]> = [];
+		const entries: Array<[string, HLC, SqlValue, SqlValue[]]> = [];
 		for (let i = 0; i < 3; i++) entries.push(cvEntry([`r${i}`], 'v', remoteHLC.tick(), `val${i % 2}`));
 		const buildChunks = (): SnapshotChunk[] => [
 			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
@@ -437,8 +443,8 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 
 			const remoteSiteId = generateSiteId();
 			const remoteHLC = new HLCManager(remoteSiteId);
-			const columnVersions = new Map<string, { hlc: HLC; value: SqlValue }>();
-			columnVersions.set('["r1"]:v', { hlc: remoteHLC.tick(), value: 'x' });
+			const columnVersions = new Map<string, { hlc: HLC; value: SqlValue; pk: SqlValue[] }>();
+			columnVersions.set(`${encodeRawPkIdentity(['r1'])}:v`, { hlc: remoteHLC.tick(), value: 'x', pk: ['r1'] });
 			const snapshot: Snapshot = {
 				siteId: remoteSiteId,
 				hlc: remoteHLC.tick(),

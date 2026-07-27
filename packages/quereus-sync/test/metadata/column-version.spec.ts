@@ -4,6 +4,7 @@
 
 import { expect } from 'chai';
 import { ColumnVersionStore, serializeColumnVersion, deserializeColumnVersion, decodeSqlValue, type ColumnVersion } from '../../src/metadata/column-version.js';
+import { RAW_PK_KEYING } from '../../src/metadata/keys.js';
 import type { HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { InMemoryKVStore } from '@quereus/store';
@@ -14,6 +15,7 @@ describe('ColumnVersion', () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(Date.now()), counter: 42, siteId, opSeq: 0 },
+        pk: [1],
         value: 'test value',
       };
 
@@ -29,6 +31,7 @@ describe('ColumnVersion', () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(1234567890), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         value: null,
       };
 
@@ -42,6 +45,7 @@ describe('ColumnVersion', () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(1234567890), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         value: 42.5,
       };
 
@@ -56,6 +60,7 @@ describe('ColumnVersion', () => {
       const blob = new Uint8Array([0, 1, 127, 255, 65, 66, 67]);
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(1234567890), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         value: blob,
       };
 
@@ -72,6 +77,7 @@ describe('ColumnVersion', () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         value: 'v2',
       };
 
@@ -89,6 +95,7 @@ describe('ColumnVersion', () => {
       const priorHlc: HLC = { wallTime: BigInt(1000), counter: 3, siteId, opSeq: 7 };
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         value: 'v2',
         priorHlc,
         priorValue: 'v1',
@@ -109,6 +116,7 @@ describe('ColumnVersion', () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         value: 'v2',
         priorHlc: { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 },
         priorValue: null,
@@ -126,6 +134,7 @@ describe('ColumnVersion', () => {
       const priorBlob = new Uint8Array([0, 1, 127, 255, 7, 8]);
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         value: 'v2',
         priorHlc: { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 },
         priorValue: priorBlob,
@@ -142,6 +151,7 @@ describe('ColumnVersion', () => {
       const priorBig = 9007199254740993n; // beyond Number.MAX_SAFE_INTEGER
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         value: 'v2',
         priorHlc: { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 },
         priorValue: priorBig,
@@ -181,13 +191,14 @@ describe('ColumnVersion', () => {
 
     beforeEach(() => {
       kv = new InMemoryKVStore();
-      store = new ColumnVersionStore(kv);
+      store = new ColumnVersionStore(kv, () => RAW_PK_KEYING);
     });
 
     it('should store and retrieve column versions', async () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
         hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId, opSeq: 0 },
+        pk: [1],
         value: 'hello',
       };
 

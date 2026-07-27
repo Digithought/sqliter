@@ -4,6 +4,7 @@
 
 import { expect } from 'chai';
 import { TombstoneStore, serializeTombstone, deserializeTombstone, type Tombstone } from '../../src/metadata/tombstones.js';
+import { RAW_PK_KEYING } from '../../src/metadata/keys.js';
 import { type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { InMemoryKVStore } from '@quereus/store';
@@ -14,6 +15,7 @@ describe('Tombstone', () => {
       const siteId = generateSiteId();
       const tombstone: Tombstone = {
         hlc: { wallTime: BigInt(Date.now()), counter: 42, siteId, opSeq: 0 },
+        pk: [1],
         createdAt: Date.now(),
       };
 
@@ -25,17 +27,21 @@ describe('Tombstone', () => {
       expect(deserialized.createdAt).to.equal(tombstone.createdAt);
     });
 
-    it('serializes to the fixed 38-byte head when priorRow is absent', () => {
+    it('always carries the pk payload past the 38-byte head; priorRow stays absent', () => {
       const siteId = generateSiteId();
       const tombstone: Tombstone = {
         hlc: { wallTime: BigInt(1234567890), counter: 7, siteId, opSeq: 0 },
+        pk: [1],
         createdAt: 1700000000000,
       };
 
       const serialized = serializeTombstone(tombstone);
-      expect(serialized.byteLength).to.equal(38);
+      // The payload is unconditional now: the raw pk must always be recoverable
+      // from the value (the key holds only the lossy identity).
+      expect(serialized.byteLength).to.be.greaterThan(38);
 
       const deserialized = deserializeTombstone(serialized);
+      expect(deserialized.pk).to.deep.equal([1]);
       expect(deserialized.priorRow).to.be.undefined;
       expect(deserialized.createdAt).to.equal(tombstone.createdAt);
     });
@@ -44,6 +50,7 @@ describe('Tombstone', () => {
       const siteId = generateSiteId();
       const tombstone: Tombstone = {
         hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         createdAt: 1700000000001,
         priorRow: [1, 'Alice', null],
       };
@@ -59,6 +66,7 @@ describe('Tombstone', () => {
       const big = 9007199254740993n; // beyond Number.MAX_SAFE_INTEGER
       const tombstone: Tombstone = {
         hlc: { wallTime: BigInt(3000), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         createdAt: 1700000000002,
         priorRow: [big, blob, 'x'],
       };
@@ -78,6 +86,7 @@ describe('Tombstone', () => {
       const siteId = generateSiteId();
       const tombstone: Tombstone = {
         hlc: { wallTime: BigInt(4000), counter: 0, siteId, opSeq: 0 },
+        pk: [1],
         createdAt: 1700000000003,
         priorRow: [],
       };
@@ -95,7 +104,7 @@ describe('Tombstone', () => {
 
     beforeEach(() => {
       kv = new InMemoryKVStore();
-      store = new TombstoneStore(kv, TTL);
+      store = new TombstoneStore(kv, TTL, () => RAW_PK_KEYING);
     });
 
     it('should store and retrieve tombstones', async () => {

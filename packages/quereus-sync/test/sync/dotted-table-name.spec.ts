@@ -17,6 +17,7 @@ import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import type { SnapshotChunk } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager, type HLC } from '../../src/clock/hlc.js';
+import { encodeRawPkIdentity } from '../../src/metadata/keys.js';
 import { createInMemoryProvider, collect, makePeer, localWrite, relay, closePeer, settle } from './_peer-harness.js';
 
 const DOTTED_DDL = 'create table "a.b" (id integer primary key, v text) using store';
@@ -138,10 +139,17 @@ describe('dotted table name (quoted identifier containing a dot)', () => {
 				const remoteHLC = new HLCManager(remoteSiteId);
 				const snapshotId = 'snap-resume-dotted-1';
 
-				await syncManager.columnVersions.setColumnVersion('main', 'a.b', ['a1'], 'v', {
-					hlc: remoteHLC.tick(),
-					value: 'survives',
-				});
+				// Identity-based seed: "a.b" does not exist locally in this test (only its
+				// metadata survives via the checkpoint), so a pk-based write — which
+				// resolves the identity through the schema oracle — would throw by design.
+				{
+					const seedBatch = kv.batch();
+					syncManager.columnVersions.setColumnVersionByIdentityBatch(
+						seedBatch, 'main', 'a.b', encodeRawPkIdentity(['a1']), ['a1'], 'v',
+						{ hlc: remoteHLC.tick(), value: 'survives' },
+					);
+					await seedBatch.write();
+				}
 				const checkpoint = {
 					snapshotId,
 					siteId: remoteSiteId,
@@ -169,7 +177,7 @@ describe('dotted table name (quoted identifier containing a dot)', () => {
 					{ type: 'table-start', schema: 'main', table: 'tableB', estimatedEntries: 1 },
 					{
 						type: 'column-versions', schema: 'main', table: 'tableB',
-						entries: [[`${JSON.stringify(['b1'])}:v`, remoteHLC.tick(), 'bval'] as [string, HLC, SqlValue]],
+						entries: [[`${encodeRawPkIdentity(['b1'])}:v`, remoteHLC.tick(), 'bval', ['b1']] as [string, HLC, SqlValue, SqlValue[]]],
 					},
 					{ type: 'table-end', schema: 'main', table: 'tableB', entriesWritten: 1 },
 					{ type: 'footer', snapshotId, totalTables: 2, totalEntries: 1, totalMigrations: 0 },

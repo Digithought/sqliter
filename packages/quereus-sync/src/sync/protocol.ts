@@ -167,6 +167,12 @@ export interface ApplyResult {
 export interface ColumnVersionEntry {
   readonly hlc: HLC;
   readonly value: SqlValue;
+  /**
+   * The row's raw pk (its ADDRESS). Required: the map key groups by the derived
+   * pk IDENTITY, which is lossy and cannot be decoded back to values, so the
+   * receiver takes the applicable pk from here.
+   */
+  readonly pk: SqlValue[];
 }
 
 /**
@@ -176,7 +182,10 @@ export interface TableSnapshot {
   readonly schema: string;
   readonly table: string;
   readonly rows: Row[];
-  /** Column versions for each row, keyed by serialized PK + column name */
+  /**
+   * Column versions for each row, keyed `${pkIdentity}:${column}` — the identity
+   * groups one row's cells; the raw pk rides in each {@link ColumnVersionEntry}.
+   */
   readonly columnVersions: Map<string, ColumnVersionEntry>;
 }
 
@@ -190,6 +199,14 @@ export interface SnapshotTombstone {
   readonly schema: string;
   readonly table: string;
   readonly pk: SqlValue[];
+  /**
+   * The sender's pk IDENTITY for this row (its `tb:` key component). The
+   * receiver files the tombstone under this identity verbatim — its own table
+   * may not exist yet mid-bootstrap (the schema arrives in the same snapshot),
+   * so no local keying can be resolved; sender and receiver share the
+   * replicated schema, so the identities agree.
+   */
+  readonly identity: string;
   readonly hlc: HLC;
   readonly createdAt: number;
   /** Last-known row image before deletion; absent on snapshot-reconstructed tombstones. */
@@ -259,8 +276,13 @@ export interface SnapshotColumnVersionsChunk {
   readonly type: 'column-versions';
   readonly schema: string;
   readonly table: string;
-  /** Column versions as [versionKey, hlc, value] tuples. */
-  readonly entries: Array<[string, HLC, SqlValue]>;
+  /**
+   * Column versions as [versionKey, hlc, value, pk] tuples. `versionKey` is
+   * `${pkIdentity}:${column}` (the identity groups a row's cells but is lossy);
+   * `pk` is the row's raw primary key, which the receiver uses to address the
+   * row when applying data and rebuilding its own metadata keys.
+   */
+  readonly entries: Array<[string, HLC, SqlValue, SqlValue[]]>;
 }
 
 /**
@@ -278,6 +300,8 @@ export interface SnapshotTombstoneChunk {
   readonly table: string;
   readonly entries: ReadonlyArray<{
     readonly pk: SqlValue[];
+    /** Sender's pk identity for this row — see {@link SnapshotTombstone.identity}. */
+    readonly identity: string;
     readonly hlc: HLC;
     readonly createdAt: number;
     /** Last-known row image before deletion; absent on snapshot-reconstructed tombstones. */

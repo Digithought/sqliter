@@ -9,7 +9,8 @@ import type { Row, SqlValue } from '@quereus/quereus';
 import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc.js';
 import { encodeSqlValue, decodeSqlValue } from './column-version.js';
-import { buildTombstoneKey, buildTombstoneScanBounds, decodePK } from './keys.js';
+import { buildTombstoneKey, buildTombstoneScanBounds, encodePkIdentity } from './keys.js';
+import type { PkKeyingResolver } from './pk-identity.js';
 
 /** Fixed-size head of a serialized tombstone: 30 bytes HLC + 8 bytes createdAt. */
 const TOMBSTONE_HEAD_BYTES = 38;
@@ -21,22 +22,38 @@ export interface Tombstone {
   hlc: HLC;
   createdAt: number;  // Wall clock time for TTL calculation
   /**
+   * The deleted row's ADDRESS — its raw primary-key values, one spelling from
+   * the row's equivalence class. UNCONDITIONAL (unlike `priorRow`): the record's
+   * key holds only the lossy pk identity, so the value is the only place the
+   * wire-transportable pk can come from.
+   */
+  pk: SqlValue[];
+  /**
    * Optional last-known row image before deletion (the engine's `oldRow` at delete
    * time). Persisted so it reaches a receiver via `getChangesSince`, which
    * re-resolves deletions from the tombstone. Best-effort audit/undo metadata:
    * absent when the delete carried no `oldRow` and on snapshot-reconstructed
-   * tombstones. A tombstone with no `priorRow` serializes to the fixed 38-byte head.
+   * tombstones.
    */
   priorRow?: Row;
 }
 
 /**
+ * JSON payload trailing the fixed head: the raw pk (always) plus the optional
+ * `priorRow` before-image. All cells go through `encodeSqlValue` so
+ * `Uint8Array`/`bigint`/`null` round-trip.
+ */
+interface SerializedTombstonePayload {
+  k: unknown[];   // encodeSqlValue per raw pk cell
+  pr?: unknown[]; // encodeSqlValue per priorRow cell — present iff priorRow exists
+}
+
+/**
  * Serialize a tombstone for storage.
  *
- * Format: 30 bytes HLC + 8 bytes createdAt, then — only when a `priorRow` is
- * present — a trailing JSON array of the row's values, each through the column
- * version `encodeSqlValue` helper so `Uint8Array`/`bigint`/`null` cells round-trip.
- * A tombstone with no `priorRow` serializes to the unchanged 38-byte head.
+ * Format: 30 bytes HLC + 8 bytes createdAt + JSON payload `{ k, pr? }`
+ * (see {@link SerializedTombstonePayload}). The payload is unconditional — the
+ * pk must always be recoverable from the value.
  */
 export function serializeTombstone(tombstone: Tombstone): Uint8Array {
   const head = new Uint8Array(TOMBSTONE_HEAD_BYTES);
@@ -46,42 +63,53 @@ export function serializeTombstone(tombstone: Tombstone): Uint8Array {
   const view = new DataView(head.buffer);
   view.setBigUint64(30, BigInt(tombstone.createdAt), false);
 
-  if (tombstone.priorRow === undefined) return head;
-
-  const payload = new TextEncoder().encode(JSON.stringify(tombstone.priorRow.map(encodeSqlValue)));
-  const result = new Uint8Array(head.length + payload.length);
+  const payload: SerializedTombstonePayload = {
+    k: tombstone.pk.map(encodeSqlValue),
+    ...(tombstone.priorRow !== undefined ? { pr: tombstone.priorRow.map(encodeSqlValue) } : {}),
+  };
+  const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
+  const result = new Uint8Array(head.length + payloadBytes.length);
   result.set(head, 0);
-  result.set(payload, head.length);
+  result.set(payloadBytes, head.length);
   return result;
 }
 
 /**
- * Deserialize a tombstone from storage. Absent-tolerant: bytes beyond the 38-byte
- * head are the JSON-encoded `priorRow` (see {@link serializeTombstone}); a
- * head-only buffer (no before-image, or a snapshot-reconstructed tombstone)
- * deserializes with `priorRow` absent.
+ * Deserialize a tombstone from storage. The payload's `pr` (before-image) is
+ * optional; the pk is required (see {@link serializeTombstone}).
  */
 export function deserializeTombstone(buffer: Uint8Array): Tombstone {
   const hlc = deserializeHLC(buffer.slice(0, 30));
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   const createdAt = Number(view.getBigUint64(30, false));
-  const tombstone: Tombstone = { hlc, createdAt };
 
-  if (buffer.byteLength > TOMBSTONE_HEAD_BYTES) {
-    const values = JSON.parse(new TextDecoder().decode(buffer.slice(TOMBSTONE_HEAD_BYTES))) as unknown[];
-    tombstone.priorRow = values.map(decodeSqlValue);
+  const payload = JSON.parse(
+    new TextDecoder().decode(buffer.slice(TOMBSTONE_HEAD_BYTES)),
+  ) as SerializedTombstonePayload;
+  const tombstone: Tombstone = { hlc, createdAt, pk: payload.k.map(decodeSqlValue) };
+  if (payload.pr !== undefined) {
+    tombstone.priorRow = payload.pr.map(decodeSqlValue);
   }
   return tombstone;
 }
 
 /**
  * Tombstone store operations.
+ *
+ * Every pk-taking method derives the record key's pk IDENTITY through the
+ * per-table {@link PkKeyingResolver} passed at construction, so callers keep
+ * addressing rows by raw pk while the storage keys collapse spellings.
  */
 export class TombstoneStore {
   constructor(
     private readonly kv: KVStore,
-    private readonly retentionHorizonMs: number
+    private readonly retentionHorizonMs: number,
+    private readonly keying: PkKeyingResolver,
   ) {}
+
+  private identity(schemaName: string, tableName: string, pk: SqlValue[]): string {
+    return encodePkIdentity(pk, this.keying(schemaName, tableName));
+  }
 
   /**
    * Get the tombstone for a row, if it exists.
@@ -91,7 +119,19 @@ export class TombstoneStore {
     tableName: string,
     pk: SqlValue[]
   ): Promise<Tombstone | undefined> {
-    const key = buildTombstoneKey(schemaName, tableName, pk);
+    return this.getTombstoneByIdentity(schemaName, tableName, this.identity(schemaName, tableName, pk));
+  }
+
+  /**
+   * Get the tombstone for a row by pk IDENTITY (as recovered from a parsed
+   * `tb:`/`cl:` key — no raw pk needed).
+   */
+  async getTombstoneByIdentity(
+    schemaName: string,
+    tableName: string,
+    identity: string
+  ): Promise<Tombstone | undefined> {
+    const key = buildTombstoneKey(schemaName, tableName, identity);
     const data = await this.kv.get(key);
     if (!data) return undefined;
     return deserializeTombstone(data);
@@ -108,8 +148,8 @@ export class TombstoneStore {
     hlc: HLC,
     priorRow?: Row
   ): Promise<void> {
-    const key = buildTombstoneKey(schemaName, tableName, pk);
-    const tombstone: Tombstone = { hlc, createdAt: Date.now(), ...(priorRow !== undefined ? { priorRow } : {}) };
+    const key = buildTombstoneKey(schemaName, tableName, this.identity(schemaName, tableName, pk));
+    const tombstone: Tombstone = { hlc, createdAt: Date.now(), pk, ...(priorRow !== undefined ? { priorRow } : {}) };
     await this.kv.put(key, serializeTombstone(tombstone));
   }
 
@@ -125,8 +165,27 @@ export class TombstoneStore {
     hlc: HLC,
     priorRow?: Row
   ): void {
-    const key = buildTombstoneKey(schemaName, tableName, pk);
-    const tombstone: Tombstone = { hlc, createdAt: Date.now(), ...(priorRow !== undefined ? { priorRow } : {}) };
+    this.setTombstoneByIdentityBatch(batch, schemaName, tableName, this.identity(schemaName, tableName, pk), pk, hlc, priorRow);
+  }
+
+  /**
+   * Set tombstone in a batch under a caller-supplied pk IDENTITY — the
+   * snapshot-apply path, where the sender's identity travels on the wire and
+   * the receiving table may not exist locally yet (its schema arrives in the
+   * same snapshot). Sender and receiver share the replicated schema, so the
+   * identities agree.
+   */
+  setTombstoneByIdentityBatch(
+    batch: WriteBatch,
+    schemaName: string,
+    tableName: string,
+    identity: string,
+    pk: SqlValue[],
+    hlc: HLC,
+    priorRow?: Row
+  ): void {
+    const key = buildTombstoneKey(schemaName, tableName, identity);
+    const tombstone: Tombstone = { hlc, createdAt: Date.now(), pk, ...(priorRow !== undefined ? { priorRow } : {}) };
     batch.put(key, serializeTombstone(tombstone));
   }
 
@@ -144,7 +203,7 @@ export class TombstoneStore {
     tableName: string,
     pk: SqlValue[]
   ): Promise<void> {
-    const key = buildTombstoneKey(schemaName, tableName, pk);
+    const key = buildTombstoneKey(schemaName, tableName, this.identity(schemaName, tableName, pk));
     await this.kv.delete(key);
   }
 
@@ -209,14 +268,9 @@ export class TombstoneStore {
     const bounds = buildTombstoneScanBounds(schemaName, tableName);
 
     for await (const entry of this.kv.iterate(bounds)) {
-      // Extract PK from key: tb:{schema}.{table}:{pk_json}
-      const keyStr = new TextDecoder().decode(entry.key);
-      const firstColon = keyStr.indexOf(':');
-      const secondColon = keyStr.indexOf(':', firstColon + 1);
-      const pkJson = keyStr.slice(secondColon + 1);
-      const pk = decodePK(pkJson);
-
-      yield { pk, tombstone: deserializeTombstone(entry.value) };
+      // The key holds only the lossy pk identity; the raw pk comes from the value.
+      const tombstone = deserializeTombstone(entry.value);
+      yield { pk: tombstone.pk, tombstone };
     }
   }
 }

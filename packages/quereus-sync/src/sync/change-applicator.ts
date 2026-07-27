@@ -12,7 +12,7 @@ import { compareHLC, maxHLC, assertWithinDrift } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
-import { encodePK } from '../metadata/keys.js';
+import { encodePkIdentity } from '../metadata/keys.js';
 import type {
 	ChangeSet,
 	Change,
@@ -185,8 +185,8 @@ export async function applyChanges(
 			// resolveChange / dataChangesToApply / commitChangeMetadata, so no CRDT
 			// metadata is written for a table the receiver does not have.
 			const key = tableKey(change.schema, change.table);
-			const known = (ctx.isTableInBasis(change.schema, change.table) || batchCreated.has(key))
-				&& !batchDropped.has(key);
+			const inBasis = ctx.isTableInBasis(change.schema, change.table);
+			const known = (inBasis || batchCreated.has(key)) && !batchDropped.has(key);
 			if (!known) {
 				let group = unknownByTable.get(key);
 				if (!group) {
@@ -197,7 +197,14 @@ export async function applyChanges(
 				continue;
 			}
 
-			const resolved = await resolveChange(ctx, change);
+			// A table known ONLY via this batch's create_table has no local schema
+			// yet (Phase 2 DDL hasn't run) and hence no resolvable pk-identity keying
+			// — and, being locally fresh, no local metadata to resolve against either.
+			// Resolve it read-free rather than throwing from the keying resolver;
+			// Phase 3's metadata commit runs after the DDL, when the keying resolves.
+			const freshLocalTable = !inBasis;
+
+			const resolved = await resolveChange(ctx, change, freshLocalTable);
 			if (resolved.outcome === 'applied') {
 				applied++;
 				appliedChanges.push({ change, siteId: changeSet.siteId });
@@ -530,10 +537,16 @@ export async function drainReappearedTables(
  * Resolve CRDT conflicts for a single change WITHOUT writing metadata.
  *
  * Phase 1 of the 3-phase apply pattern.
+ *
+ * `freshLocalTable` marks a table that exists only via the SAME batch's
+ * create_table: it has no local schema yet (so no pk-identity keying) and no
+ * local metadata, so every read is skipped and the change resolves as a first
+ * write. Phase 3 commits its metadata after the DDL has executed.
  */
 export async function resolveChange(
 	ctx: SyncContext,
 	change: Change,
+	freshLocalTable = false,
 ): Promise<ResolvedChange> {
 	// Skip changes that originated from ourselves (echo prevention)
 	if (siteIdEquals(change.hlc.siteId, ctx.getSiteId())) {
@@ -541,7 +554,7 @@ export async function resolveChange(
 	}
 
 	if (change.type === 'delete') {
-		const existingTombstone = await ctx.tombstones.getTombstone(
+		const existingTombstone = freshLocalTable ? undefined : await ctx.tombstones.getTombstone(
 			change.schema,
 			change.table,
 			change.pk,
@@ -564,7 +577,7 @@ export async function resolveChange(
 		};
 	} else {
 		// Column change: single getColumnVersion read, then decide via resolver or HLC
-		const localVersion = await ctx.columnVersions.getColumnVersion(
+		const localVersion = freshLocalTable ? undefined : await ctx.columnVersions.getColumnVersion(
 			change.schema,
 			change.table,
 			change.pk,
@@ -609,7 +622,7 @@ export async function resolveChange(
 		}
 
 		// Remote wins or no local version — check tombstone blocking
-		const isBlocked = await ctx.tombstones.isDeletedAndBlocking(
+		const isBlocked = freshLocalTable ? false : await ctx.tombstones.isDeletedAndBlocking(
 			change.schema,
 			change.table,
 			change.pk,
@@ -682,9 +695,9 @@ export async function commitChangeMetadata(
 		if (resolved.outcome !== 'applied') continue;
 		const change = resolved.change;
 		if (change.type === 'delete') {
-			keepMaxHLC(deleteWinners, deleteKey(change), resolved);
+			keepMaxHLC(deleteWinners, deleteKey(ctx, change), resolved);
 		} else {
-			keepMaxHLC(columnWinners, columnKey(change), resolved);
+			keepMaxHLC(columnWinners, columnKey(ctx, change), resolved);
 		}
 	}
 
@@ -713,18 +726,18 @@ export async function commitChangeMetadata(
 	}
 }
 
-// Collapse keys reuse encodePK so in-batch grouping matches the canonical pk encoding of
-// the actual KV keys (buildTombstoneKey / buildColumnVersionKey) — two pks collapse here
-// iff they would collide on disk.
+// Collapse keys reuse the pk-identity encoding so in-batch grouping matches the canonical
+// pk identity of the actual KV keys (buildTombstoneKey / buildColumnVersionKey) — two pks
+// collapse here iff they would collide on disk ('apple'/'APPLE' under nocase, 'PT1H'/'PT60M').
 
 /** Stable per-pk key for collapsing repeated delete entries within one batch. */
-function deleteKey(change: RowDeletion): string {
-	return `delete:${change.schema}.${change.table}:${encodePK(change.pk)}`;
+function deleteKey(ctx: SyncContext, change: RowDeletion): string {
+	return `delete:${change.schema}.${change.table}:${encodePkIdentity(change.pk, ctx.getPkKeying(change.schema, change.table))}`;
 }
 
 /** Stable per-(pk, column) key for collapsing repeated column entries within one batch. */
-function columnKey(change: ColumnChange): string {
-	return `column:${change.schema}.${change.table}:${encodePK(change.pk)}:${change.column}`;
+function columnKey(ctx: SyncContext, change: ColumnChange): string {
+	return `column:${change.schema}.${change.table}:${encodePkIdentity(change.pk, ctx.getPkKeying(change.schema, change.table))}:${change.column}`;
 }
 
 /** Keep the max-HLC resolved change per key, collapsing in-batch repeats to one winner. */

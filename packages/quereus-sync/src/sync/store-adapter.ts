@@ -107,6 +107,7 @@
 import type { BackingRowChange, Database, ExternalRowChange, Row, SqlValue, TableIndexSchema, TableSchema } from '@quereus/quereus';
 import { compareSqlValues, generateIndexDDL, generateTableDDL } from '@quereus/quereus';
 import type { ExternalRowOp, SchemaChangeEvent, StoreEventEmitter, StoreModule, StoreTable } from '@quereus/store';
+import { makePkIdentityEncoder } from '../metadata/pk-identity.js';
 import type {
   ApplyToStoreCallback,
   ApplyToStoreOptions,
@@ -210,8 +211,15 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
         // One ExternalRowOp per row group: multiple same-row changes collapse
         // to a single effective op, so the seam's same-row before-image
         // chaining rule is satisfied trivially (oldRow = true pre-batch image).
+        // Rows group by pk IDENTITY (key collation + semantic transform), so two
+        // spellings of one row ('apple'/'APPLE' under nocase) collapse to ONE op
+        // — matching how the store itself keys them.
+        // NOTE: resolves the keying fresh per table per apply invocation; if apply
+        // batches ever get hot enough for this to show up, cache per TableSchema
+        // object like metadata/pk-identity.ts's resolver does.
+        const pkIdentity = makePkIdentityEncoder(table.getSchema(), db.getKeyNormalizerResolver());
         const ops: ExternalRowOp[] = [];
-        for (const rowChanges of groupChangesByRow(tableChanges).values()) {
+        for (const rowChanges of groupChangesByRow(tableChanges, pkIdentity).values()) {
           ops.push(await buildRowOp(table, rowChanges));
         }
 
@@ -323,15 +331,19 @@ function groupChangesByTable(
 }
 
 /**
- * Group data changes by row (schema.table:pk).
+ * Group one table's data changes by row, keyed on the pk IDENTITY (the caller's
+ * `pkIdentity` encoder — key collation + semantic transform), so all spellings
+ * of one row land in one group. Only ever called with a single table's changes,
+ * so the identity alone is a sufficient key.
  */
 function groupChangesByRow(
-  changes: DataChangeToApply[]
+  changes: DataChangeToApply[],
+  pkIdentity: (pk: SqlValue[]) => string
 ): Map<string, DataChangeToApply[]> {
   const grouped = new Map<string, DataChangeToApply[]>();
 
   for (const change of changes) {
-    const rowKey = `${change.schema}.${change.table}:${JSON.stringify(change.pk)}`;
+    const rowKey = pkIdentity(change.pk);
     const existing = grouped.get(rowKey);
     if (existing) {
       existing.push(change);

@@ -10,6 +10,7 @@ import type {
 	SqlValue,
 	Row,
 	Database,
+	KeyNormalizerResolver,
 	LensDeploymentSnapshot,
 	TransactionCommitBatch,
 	DatabaseDataChangeEvent,
@@ -26,7 +27,7 @@ import {
 	deserializeSiteIdentity,
 	siteIdEquals,
 } from '../clock/site.js';
-import { ColumnVersionStore, type ColumnVersion, deserializeColumnVersion } from '../metadata/column-version.js';
+import { ColumnVersionStore, type ColumnVersionData, deserializeColumnVersion } from '../metadata/column-version.js';
 import { TombstoneStore, deserializeTombstone } from '../metadata/tombstones.js';
 import { PeerStateStore } from '../metadata/peer-state.js';
 import { SchemaMigrationStore, deserializeMigration } from '../metadata/schema-migration.js';
@@ -46,13 +47,16 @@ import {
 import type { BasisTableLifecycleEvent } from './events.js';
 import {
 	SYNC_KEY_PREFIX,
+	SYNC_METADATA_FORMAT_VERSION,
 	buildAllColumnVersionsScanBounds,
 	buildAllTombstonesScanBounds,
 	buildAllSchemaMigrationsScanBounds,
 	parseColumnVersionKey,
 	parseTombstoneKey,
 	parseSchemaMigrationKey,
+	type PkKeying,
 } from '../metadata/keys.js';
+import { createPkKeyingResolver, type PkKeyingResolver } from '../metadata/pk-identity.js';
 import type { SyncManager, SnapshotCheckpoint } from './manager.js';
 import type {
 	SyncConfig,
@@ -147,6 +151,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	private readonly getTableSchema?: GetTableSchemaCallback;
 	/** Reclaim-by-name callback for the eviction sweep; absent ⇒ sweep is a no-op. */
 	private readonly dropLocalTable?: DropLocalTableCallback;
+	/**
+	 * Per-table pk-identity keying resolver (see `metadata/pk-identity.ts`),
+	 * threaded into every metadata store so `cv:`/`tb:`/`cl:` keys file under the
+	 * row's collation/transform-normalized identity. Raw keying when no
+	 * `getTableSchema` oracle was wired (relay-only deployment).
+	 */
+	private readonly pkKeying: PkKeyingResolver;
 
 	// Tail-promise chain serializing commit recording. Each commit chains onto the
 	// prior handler's completion so N+1's dedup reads see N's durable writes,
@@ -180,6 +191,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		applyToStore?: ApplyToStoreCallback,
 		getTableSchema?: GetTableSchemaCallback,
 		dropLocalTable?: DropLocalTableCallback,
+		keyNormalizerResolver?: KeyNormalizerResolver,
 	) {
 		this.kv = kv;
 		this.config = config;
@@ -188,10 +200,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.applyToStore = applyToStore;
 		this.getTableSchema = getTableSchema;
 		this.dropLocalTable = dropLocalTable;
-		this.columnVersions = new ColumnVersionStore(kv);
-		this.tombstones = new TombstoneStore(kv, config.retentionHorizonMs);
+		this.pkKeying = createPkKeyingResolver(getTableSchema, keyNormalizerResolver);
+		this.columnVersions = new ColumnVersionStore(kv, this.pkKeying);
+		this.tombstones = new TombstoneStore(kv, config.retentionHorizonMs, this.pkKeying);
 		this.peerStates = new PeerStateStore(kv);
-		this.changeLog = new ChangeLogStore(kv);
+		this.changeLog = new ChangeLogStore(kv, this.pkKeying);
 		this.schemaMigrations = new SchemaMigrationStore(kv);
 		this.quarantine = new QuarantineStore(kv);
 		this.basisLifecycle = new BasisLifecycleStore(kv);
@@ -212,6 +225,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * @param getTableSchema - Optional callback for getting table schema by name
 	 * @param dropLocalTable - Optional reclaim-by-name callback for the basis-table
 	 *   eviction sweep; when absent (e.g. a relay-only coordinator) the sweep is a no-op.
+	 * @param keyNormalizerResolver - Optional collation-name → key-normalizer resolver
+	 *   (pass the engine's `db.getKeyNormalizerResolver()`), used to build pk-identity
+	 *   keys that agree with the database's row identity. When absent, a built-ins-only
+	 *   resolver (BINARY/NOCASE/RTRIM) is used, which throws on custom collation names.
 	 */
 	static async create(
 		kv: KVStore,
@@ -221,12 +238,39 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		applyToStore?: ApplyToStoreCallback,
 		getTableSchema?: GetTableSchemaCallback,
 		dropLocalTable?: DropLocalTableCallback,
+		keyNormalizerResolver?: KeyNormalizerResolver,
 	): Promise<SyncManagerImpl> {
 		// Load or create site identity
 		const siteIdKey = new TextEncoder().encode(SITE_ID_KEY);
 		let siteId: SiteId;
 
 		const existingIdentity = await kv.get(siteIdKey);
+
+		// Sync-metadata format gate: per-row records are keyed by pk IDENTITY since
+		// format 2 (see SYNC_METADATA_FORMAT_VERSION); older metadata is unreadable
+		// under this layout, and writing new-format records beside it would corrupt
+		// both. A replica with existing identity but a missing/mismatched version
+		// must re-bootstrap from a peer snapshot (docs/sync.md § Metadata format
+		// version) — refuse loudly rather than silently mis-keying.
+		const formatData = await kv.get(SYNC_KEY_PREFIX.FORMAT_VERSION);
+		const storedFormat = formatData ? parseInt(new TextDecoder().decode(formatData), 10) : undefined;
+		if (storedFormat === undefined) {
+			if (existingIdentity) {
+				throw new QuereusError(
+					`Sync metadata predates format version ${SYNC_METADATA_FORMAT_VERSION} (pk-identity keys). `
+						+ `Clear this replica's sync metadata and re-bootstrap from a peer snapshot (docs/sync.md § Metadata format version).`,
+					StatusCode.ERROR,
+				);
+			}
+			await kv.put(SYNC_KEY_PREFIX.FORMAT_VERSION, new TextEncoder().encode(String(SYNC_METADATA_FORMAT_VERSION)));
+		} else if (storedFormat !== SYNC_METADATA_FORMAT_VERSION) {
+			throw new QuereusError(
+				`Sync metadata format version ${storedFormat} does not match this build's ${SYNC_METADATA_FORMAT_VERSION}. `
+					+ `Clear this replica's sync metadata and re-bootstrap from a peer snapshot (docs/sync.md § Metadata format version).`,
+				StatusCode.ERROR,
+			);
+		}
+
 		if (existingIdentity) {
 			const identity = deserializeSiteIdentity(existingIdentity);
 			siteId = identity.siteId;
@@ -251,7 +295,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		}
 
 		const hlcManager = new HLCManager(siteId, hlcState);
-		const manager = new SyncManagerImpl(kv, config, hlcManager, syncEvents, applyToStore, getTableSchema, dropLocalTable);
+		const manager = new SyncManagerImpl(kv, config, hlcManager, syncEvents, applyToStore, getTableSchema, dropLocalTable, keyNormalizerResolver);
 
 		// Capture local changes at the engine transaction boundary: one grouped
 		// `onTransactionCommit` batch ⇒ one transaction ⇒ one HLC. The store's
@@ -275,6 +319,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	getCurrentHLC(): HLC {
 		return this.hlcManager.now();
+	}
+
+	/** See {@link SyncContext.getPkKeying}. */
+	getPkKeying(schema: string, table: string): PkKeying {
+		return this.pkKeying(schema, table);
 	}
 
 	/**
@@ -846,7 +895,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				const prior = oldVersion
 					? { priorHlc: oldVersion.hlc, priorValue: oldVersion.value }
 					: undefined;
-				const version: ColumnVersion = { hlc, value: newValue, ...prior };
+				const version: ColumnVersionData = { hlc, value: newValue, ...prior };
 				this.columnVersions.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
 				this.changeLog.recordColumnChangeBatch(batch, hlc, schemaName, tableName, pk, column);
 
@@ -1005,15 +1054,15 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Resolve a change-log entry to the live {@link Change} it references, or
 	 * `null` when the underlying column version / tombstone is gone — a stale log
 	 * entry (e.g. a column overwritten, or a row deleted after the entry was
-	 * written). The authoritative HLC and value come from the current version, not
-	 * the log key.
+	 * written). The authoritative HLC, value AND pk come from the current version
+	 * record, not the log key — the key carries only the lossy pk identity.
 	 */
 	private async resolveLogEntry(logEntry: ChangeLogEntry): Promise<Change | null> {
 		if (logEntry.entryType === 'column') {
-			const cv = await this.columnVersions.getColumnVersion(
+			const cv = await this.columnVersions.getColumnVersionByIdentity(
 				logEntry.schema,
 				logEntry.table,
-				logEntry.pk,
+				logEntry.identity,
 				logEntry.column!,
 			);
 			if (!cv) return null;
@@ -1022,7 +1071,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				type: 'column',
 				schema: logEntry.schema,
 				table: logEntry.table,
-				pk: logEntry.pk,
+				pk: cv.pk,
 				column: logEntry.column!,
 				value: cv.value,
 				hlc: cv.hlc,
@@ -1033,10 +1082,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			return columnChange;
 		}
 
-		const tombstone = await this.tombstones.getTombstone(
+		const tombstone = await this.tombstones.getTombstoneByIdentity(
 			logEntry.schema,
 			logEntry.table,
-			logEntry.pk,
+			logEntry.identity,
 		);
 		if (!tombstone) return null;
 
@@ -1044,7 +1093,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			type: 'delete',
 			schema: logEntry.schema,
 			table: logEntry.table,
-			pk: logEntry.pk,
+			pk: tombstone.pk,
 			hlc: tombstone.hlc,
 			// Re-emit the stored before-image (spread only when present) so a
 			// receiver/relay forwards the origin's last-known row image unchanged.
@@ -1080,7 +1129,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				type: 'column',
 				schema: parsed.schema,
 				table: parsed.table,
-				pk: parsed.pk,
+				pk: cv.pk,
 				column: parsed.column,
 				value: cv.value,
 				hlc: cv.hlc,
@@ -1101,7 +1150,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				type: 'delete',
 				schema: parsed.schema,
 				table: parsed.table,
-				pk: parsed.pk,
+				pk: tombstone.pk,
 				hlc: tombstone.hlc,
 				...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
 			};
@@ -1292,7 +1341,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				batch.delete(entry.key);
 				const parsed = parseTombstoneKey(entry.key);
 				if (parsed) {
-					this.changeLog.deleteEntryBatch(batch, tombstone.hlc, 'delete', parsed.schema, parsed.table, parsed.pk);
+					// Identity-based delete: the parsed key already carries the identity, so
+					// no schema (which a since-retired table may no longer have) is needed.
+					this.changeLog.deleteEntryByIdentityBatch(batch, tombstone.hlc, 'delete', parsed.schema, parsed.table, parsed.identity);
 				} else {
 					console.warn('[Sync] Unparseable tombstone key during prune — its change-log entry is left orphaned');
 				}

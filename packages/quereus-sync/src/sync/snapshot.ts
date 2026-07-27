@@ -19,7 +19,6 @@ import {
 	parseColumnVersionKey,
 	parseTombstoneKey,
 	parseSchemaMigrationKey,
-	encodePK,
 } from '../metadata/keys.js';
 import type {
 	Snapshot,
@@ -50,7 +49,9 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 
 		const cv = deserializeColumnVersion(entry.value);
 		const tableKey = `${parsed.schema}.${parsed.table}`;
-		const rowKey = encodePK(parsed.pk);
+		// The parsed pk IDENTITY groups one row's cells; the raw pk (needed to
+		// address the row on the receiver) rides in each cell's record value.
+		const rowKey = parsed.identity;
 
 		if (!tableData.has(tableKey)) {
 			tableData.set(tableKey, { schema: parsed.schema, table: parsed.table, rows: new Map() });
@@ -67,7 +68,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 	// Build table snapshots
 	const tables: TableSnapshot[] = [];
 	for (const { schema, table, rows } of tableData.values()) {
-		const columnVersions = new Map<string, { hlc: HLC; value: SqlValue }>();
+		const columnVersions = new Map<string, { hlc: HLC; value: SqlValue; pk: SqlValue[] }>();
 		const rowsArray: Row[] = [];
 
 		for (const [rowKey, rowVersionsMap] of rows) {
@@ -76,7 +77,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 
 			for (const [column, cv] of rowVersionsMap) {
 				const versionKey = `${rowKey}:${column}`;
-				columnVersions.set(versionKey, { hlc: cv.hlc, value: cv.value });
+				columnVersions.set(versionKey, { hlc: cv.hlc, value: cv.value, pk: cv.pk });
 			}
 		}
 
@@ -119,7 +120,8 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 		tombstones.push({
 			schema: parsed.schema,
 			table: parsed.table,
-			pk: parsed.pk,
+			pk: ts.pk,
+			identity: parsed.identity,
 			hlc: ts.hlc,
 			createdAt: ts.createdAt,
 			...(ts.priorRow !== undefined ? { priorRow: ts.priorRow } : {}),
@@ -168,6 +170,9 @@ export async function applySnapshot(
 
 	for (const tableSnapshot of snapshot.tables) {
 		const rowsByPk = new Map<string, Record<string, SqlValue>>();
+		// versionKey groups by the (lossy) pk identity; the applicable raw pk is
+		// taken from the entries themselves (any one of a row's entries carries it).
+		const rowPks = new Map<string, SqlValue[]>();
 
 		for (const [versionKey, cvEntry] of tableSnapshot.columnVersions) {
 			const lastColon = versionKey.lastIndexOf(':');
@@ -178,17 +183,17 @@ export async function applySnapshot(
 
 			if (!rowsByPk.has(rowKey)) {
 				rowsByPk.set(rowKey, {});
+				rowPks.set(rowKey, cvEntry.pk);
 			}
 			rowsByPk.get(rowKey)![column] = cvEntry.value;
 		}
 
 		for (const [rowKey, columns] of rowsByPk) {
-			const pk = JSON.parse(rowKey) as SqlValue[];
 			dataChangesToApply.push({
 				type: 'update',
 				schema: tableSnapshot.schema,
 				table: tableSnapshot.table,
-				pk,
+				pk: rowPks.get(rowKey)!,
 				columns,
 			});
 		}
@@ -228,25 +233,30 @@ export async function applySnapshot(
 					const lastColon = versionKey.lastIndexOf(':');
 					if (lastColon === -1) continue;
 
-					const rowKey = versionKey.slice(0, lastColon);
+					// The versionKey carries the SENDER's pk identity + column. File under
+					// that identity verbatim: the receiving table may not exist yet (its
+					// schema arrives in this same snapshot), so no local keying can be
+					// resolved — and sender and receiver share the replicated schema, so
+					// the identities agree.
+					const identity = versionKey.slice(0, lastColon);
 					const column = versionKey.slice(lastColon + 1);
-					const pk = JSON.parse(rowKey) as SqlValue[];
 
-					ctx.columnVersions.setColumnVersionBatch(
+					ctx.columnVersions.setColumnVersionByIdentityBatch(
 						applyBatch,
 						tableSnapshot.schema,
 						tableSnapshot.table,
-						pk,
+						identity,
+						cvEntry.pk,
 						column,
 						{ hlc: cvEntry.hlc, value: cvEntry.value },
 					);
 
-					ctx.changeLog.recordColumnChangeBatch(
+					ctx.changeLog.recordColumnChangeByIdentityBatch(
 						applyBatch,
 						cvEntry.hlc,
 						tableSnapshot.schema,
 						tableSnapshot.table,
-						pk,
+						identity,
 						column,
 					);
 				}
@@ -271,7 +281,8 @@ export async function applySnapshot(
 			// horizon re-bases to bootstrap time rather than preserved. Accepted phase-1
 			// behavior (the tombstone lives a full horizon from bootstrap).
 			for (const ts of snapshot.tombstones) {
-				ctx.tombstones.setTombstoneBatch(applyBatch, ts.schema, ts.table, ts.pk, ts.hlc, ts.priorRow);
+				// Sender-identity write, same reasoning as the column versions above.
+				ctx.tombstones.setTombstoneByIdentityBatch(applyBatch, ts.schema, ts.table, ts.identity, ts.pk, ts.hlc, ts.priorRow);
 			}
 
 			await applyBatch.write();

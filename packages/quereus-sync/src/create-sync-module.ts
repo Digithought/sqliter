@@ -6,7 +6,7 @@
  */
 
 import type { KVStore } from '@quereus/store';
-import type { TableSchema, TransactionCommitBatch } from '@quereus/quereus';
+import type { KeyNormalizerResolver, TableSchema, TransactionCommitBatch } from '@quereus/quereus';
 import { SyncManagerImpl } from './sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from './sync/events.js';
 import { DEFAULT_SYNC_CONFIG, type SyncConfig, type ApplyToStoreCallback, type DropLocalTableCallback } from './sync/protocol.js';
@@ -80,6 +80,17 @@ export interface CreateSyncModuleOptions extends Partial<SyncConfig> {
   dropLocalTable?: DropLocalTableCallback;
 
   /**
+   * Collation-name → key-normalizer resolver used to derive each row's pk
+   * IDENTITY (what per-row sync metadata is filed under). Pass the engine's
+   * `db.getKeyNormalizerResolver()` whenever a `getTableSchema` oracle is wired,
+   * so sync keys rows exactly as the database does — including collations
+   * registered with `db.registerCollation`. When omitted, a built-ins-only
+   * resolver (BINARY/NOCASE/RTRIM) is used, which throws on any custom
+   * collation name rather than mis-keying it.
+   */
+  keyNormalizerResolver?: KeyNormalizerResolver;
+
+  /**
    * Engine transaction-commit source for capturing local changes.
    *
    * When provided (typically the Quereus `Database`), the SyncManager
@@ -132,7 +143,7 @@ export async function createSyncModule(
   kv: KVStore,
   options: CreateSyncModuleOptions = {}
 ): Promise<CreateSyncModuleResult> {
-  const { applyToStore, getTableSchema, dropLocalTable, transactionSource, ...configOverrides } = options;
+  const { applyToStore, getTableSchema, dropLocalTable, keyNormalizerResolver, transactionSource, ...configOverrides } = options;
 
   const fullConfig: SyncConfig = {
     ...DEFAULT_SYNC_CONFIG,
@@ -148,7 +159,8 @@ export async function createSyncModule(
     syncEvents,
     applyToStore,
     getTableSchema,
-    dropLocalTable
+    dropLocalTable,
+    keyNormalizerResolver
   );
 
   return {

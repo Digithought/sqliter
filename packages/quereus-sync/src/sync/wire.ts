@@ -170,8 +170,8 @@ export interface SerializedSnapshotColumnVersionsChunk {
   type: 'column-versions';
   schema: string;
   table: string;
-  /** [versionKey, hlc-base64, encodeSqlValue(value)] tuples. */
-  entries: Array<[string, string, unknown]>;
+  /** [versionKey, hlc-base64, encodeSqlValue(value), encodeSqlValue-per-pk-cell] tuples. */
+  entries: Array<[string, string, unknown, unknown[]]>;
 }
 
 export interface SerializedSnapshotTombstoneChunk {
@@ -180,6 +180,7 @@ export interface SerializedSnapshotTombstoneChunk {
   table: string;
   entries: Array<{
     pk: unknown[];                      // encodeSqlValue per cell
+    identity: string;                   // sender's pk identity (plain string, passes through)
     hlc: string;                        // base64
     createdAt: number;
     priorRow?: unknown[];               // present-only ([] is present)
@@ -384,10 +385,11 @@ export function serializeSnapshotChunk(chunk: SnapshotChunk): SerializedSnapshot
         type: 'column-versions',
         schema: chunk.schema,
         table: chunk.table,
-        entries: chunk.entries.map(([key, hlc, value]) => [
+        entries: chunk.entries.map(([key, hlc, value, pk]) => [
           key,
           serializeHLCForTransport(hlc),
           encodeSqlValue(value),
+          pk.map(v => encodeSqlValue(v)),
         ]),
       };
     case 'tombstone':
@@ -400,6 +402,7 @@ export function serializeSnapshotChunk(chunk: SnapshotChunk): SerializedSnapshot
         table: chunk.table,
         entries: chunk.entries.map(e => ({
           pk: e.pk.map(v => encodeSqlValue(v)),
+          identity: e.identity,
           hlc: serializeHLCForTransport(e.hlc),
           createdAt: e.createdAt,
           ...(e.priorRow !== undefined
@@ -441,10 +444,11 @@ export function deserializeSnapshotChunk(obj: SerializedSnapshotChunk): Snapshot
         type: 'column-versions',
         schema: obj.schema,
         table: obj.table,
-        entries: obj.entries.map(([key, hlc, value]) => [
+        entries: obj.entries.map(([key, hlc, value, pk]) => [
           key,
           deserializeHLCFromTransport(hlc),
           decodeSqlValue(value),
+          pk.map(v => decodeSqlValue(v)) as SqlValue[],
         ]),
       };
     case 'tombstone':
@@ -454,6 +458,7 @@ export function deserializeSnapshotChunk(obj: SerializedSnapshotChunk): Snapshot
         table: obj.table,
         entries: obj.entries.map(e => ({
           pk: e.pk.map(v => decodeSqlValue(v)) as SqlValue[],
+          identity: e.identity,
           hlc: deserializeHLCFromTransport(e.hlc),
           createdAt: e.createdAt,
           ...(e.priorRow !== undefined

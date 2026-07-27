@@ -672,7 +672,15 @@ class QuereusWorker implements QuereusWorkerAPI {
     // per committed transaction.
     const { syncManager, syncEvents } = await createSyncModule(
       this.kvStore,
-      { applyToStore, getTableSchema, dropLocalTable, transactionSource: db }
+      {
+        applyToStore,
+        getTableSchema,
+        dropLocalTable,
+        // Pk-identity keys must agree with the database's own row identity —
+        // resolve collation normalizers through the connection, not built-ins.
+        keyNormalizerResolver: db.getKeyNormalizerResolver(),
+        transactionSource: db,
+      }
     );
 
     this.syncManager = syncManager;

@@ -3,6 +3,7 @@
  */
 
 export * from './keys.js';
+export * from './pk-identity.js';
 export * from './column-version.js';
 export * from './tombstones.js';
 export * from './peer-state.js';

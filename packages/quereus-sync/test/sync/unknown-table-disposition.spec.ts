@@ -32,10 +32,18 @@ import {
   type SchemaMigration,
   type UnknownTableDisposition,
 } from '../../src/sync/protocol.js';
-import { InMemoryKVStore } from '@quereus/store';
+import { InMemoryKVStore, type KVStore } from '@quereus/store';
+import { buildTableColumnVersionScanBounds, buildTombstoneScanBounds } from '../../src/metadata/keys.js';
 import { generateSiteId, siteIdEquals, type SiteId } from '../../src/clock/site.js';
 import { compareHLC, createHLC } from '../../src/clock/hlc.js';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
+
+/** Count keys in a KV range — schema-free probe for "no metadata written". */
+async function countKeys(kv: KVStore, bounds: { gte: Uint8Array; lt: Uint8Array }): Promise<number> {
+  let n = 0;
+  for await (const _entry of kv.iterate(bounds)) n++;
+  return n;
+}
 
 interface ApplyCall {
   data: DataChangeToApply[];
@@ -234,9 +242,11 @@ describe('unknown-table disposition', () => {
         del(h.remoteSite, 1001, RETIRED, 2),
       ])]);
 
-      // No column version, no tombstone for the retired table.
-      expect(await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note')).to.be.undefined;
-      expect(await h.manager.tombstones.getTombstone('main', RETIRED, [2])).to.be.undefined;
+      // No column version, no tombstone for the retired table. Probed by keyspace
+      // scan: the retired table has no schema, so pk-based lookups (which resolve
+      // the pk identity through the schema oracle) would throw by design.
+      expect(await countKeys(h.manager.kv, buildTableColumnVersionScanBounds('main', RETIRED))).to.equal(0);
+      expect(await countKeys(h.manager.kv, buildTombstoneScanBounds('main', RETIRED))).to.equal(0);
 
       // getChangesSince surfaces nothing for the retired table.
       const sets = await h.manager.getChangesSince(generateSiteId());
@@ -334,8 +344,8 @@ describe('unknown-table disposition', () => {
         del(h.remoteSite, 1001, RETIRED, 2),
       ])]);
 
-      expect(await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note')).to.be.undefined;
-      expect(await h.manager.tombstones.getTombstone('main', RETIRED, [2])).to.be.undefined;
+      expect(await countKeys(h.manager.kv, buildTableColumnVersionScanBounds('main', RETIRED))).to.equal(0);
+      expect(await countKeys(h.manager.kv, buildTombstoneScanBounds('main', RETIRED))).to.equal(0);
     });
 
     it('idempotent re-apply keeps exactly one forwardable entry per change', async () => {

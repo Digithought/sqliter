@@ -87,6 +87,8 @@ export async function makePeer(
 		new SyncEventEmitterImpl(),
 		applyToStore,
 		(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
+		undefined,
+		db.getKeyNormalizerResolver(),
 	);
 
 	// Forward a logical `apply schema` lens deployment to the basis-table lifecycle

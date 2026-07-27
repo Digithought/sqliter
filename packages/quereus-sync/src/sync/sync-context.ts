@@ -17,7 +17,7 @@ import type { QuarantineStore } from '../metadata/quarantine.js';
 import type { BasisLifecycleStore } from '../metadata/basis-lifecycle.js';
 import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult, UnknownTableDisposition } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
-import { SYNC_KEY_PREFIX } from '../metadata/keys.js';
+import { SYNC_KEY_PREFIX, type PkKeying } from '../metadata/keys.js';
 
 /**
  * Context shared across sync sub-modules.
@@ -40,6 +40,15 @@ export interface SyncContext {
 
 	getSiteId(): SiteId;
 	getCurrentHLC(): HLC;
+
+	/**
+	 * Per-table pk-identity keying (key collation normalizers + semantic key
+	 * transforms) for building in-memory row-grouping keys that agree with the
+	 * `cv:`/`tb:`/`cl:` storage keys. Throws when the table's schema is
+	 * unavailable and a schema oracle is wired; resolves to the raw keying on a
+	 * relay-only deployment with no oracle (see `metadata/pk-identity.ts`).
+	 */
+	getPkKeying(schema: string, table: string): PkKeying;
 
 	/**
 	 * Whether `(schema, table)` is in the local basis. Backed by the

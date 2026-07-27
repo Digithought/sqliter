@@ -13,18 +13,25 @@ import {
   buildChangeLogScanBoundsAfter,
   buildAllChangeLogScanBounds,
   parseChangeLogKey,
+  encodePkIdentity,
   type ChangeLogEntryType,
 } from './keys.js';
+import type { PkKeyingResolver } from './pk-identity.js';
 
 /**
  * Change log entry stored in KV.
+ *
+ * Carries the pk IDENTITY (the derived, lossy string the row's records are
+ * filed under), NOT the raw pk — the entry's value is empty and the identity
+ * cannot be decoded back. Consumers resolve the entry to its live `cv:`/`tb:`
+ * record (which holds the raw pk in its value) via the `*ByIdentity` getters.
  */
 export interface ChangeLogEntry {
   readonly hlc: HLC;
   readonly entryType: ChangeLogEntryType;
   readonly schema: string;
   readonly table: string;
-  readonly pk: SqlValue[];
+  readonly identity: string;
   readonly column?: string;
 }
 
@@ -34,9 +41,20 @@ export interface ChangeLogEntry {
  * Each mutation (column update or row deletion) creates an entry in the
  * change log, keyed by HLC. This allows efficient range scans to find
  * all changes since a given timestamp.
+ *
+ * Every pk-taking method derives the key's pk IDENTITY through the per-table
+ * {@link PkKeyingResolver} passed at construction; `deleteEntryByIdentityBatch`
+ * serves callers that already hold a parsed identity.
  */
 export class ChangeLogStore {
-  constructor(private readonly kv: KVStore) {}
+  constructor(
+    private readonly kv: KVStore,
+    private readonly keying: PkKeyingResolver,
+  ) {}
+
+  private identity(schema: string, table: string, pk: SqlValue[]): string {
+    return encodePkIdentity(pk, this.keying(schema, table));
+  }
 
   /**
    * Record a column change in the change log.
@@ -48,7 +66,7 @@ export class ChangeLogStore {
     pk: SqlValue[],
     column: string
   ): Promise<void> {
-    const key = buildChangeLogKey(hlc, 'column', schema, table, pk, column);
+    const key = buildChangeLogKey(hlc, 'column', schema, table, this.identity(schema, table, pk), column);
     // Value is empty - all info is in the key
     await this.kv.put(key, new Uint8Array(0));
   }
@@ -64,7 +82,22 @@ export class ChangeLogStore {
     pk: SqlValue[],
     column: string
   ): void {
-    const key = buildChangeLogKey(hlc, 'column', schema, table, pk, column);
+    this.recordColumnChangeByIdentityBatch(batch, hlc, schema, table, this.identity(schema, table, pk), column);
+  }
+
+  /**
+   * Record a column change in a batch under a caller-supplied pk IDENTITY —
+   * the snapshot-apply path (see `ColumnVersionStore.setColumnVersionByIdentityBatch`).
+   */
+  recordColumnChangeByIdentityBatch(
+    batch: WriteBatch,
+    hlc: HLC,
+    schema: string,
+    table: string,
+    identity: string,
+    column: string
+  ): void {
+    const key = buildChangeLogKey(hlc, 'column', schema, table, identity, column);
     batch.put(key, new Uint8Array(0));
   }
 
@@ -77,7 +110,7 @@ export class ChangeLogStore {
     table: string,
     pk: SqlValue[]
   ): Promise<void> {
-    const key = buildChangeLogKey(hlc, 'delete', schema, table, pk);
+    const key = buildChangeLogKey(hlc, 'delete', schema, table, this.identity(schema, table, pk));
     await this.kv.put(key, new Uint8Array(0));
   }
 
@@ -91,7 +124,7 @@ export class ChangeLogStore {
     table: string,
     pk: SqlValue[]
   ): void {
-    const key = buildChangeLogKey(hlc, 'delete', schema, table, pk);
+    const key = buildChangeLogKey(hlc, 'delete', schema, table, this.identity(schema, table, pk));
     batch.put(key, new Uint8Array(0));
   }
 
@@ -176,7 +209,24 @@ export class ChangeLogStore {
     pk: SqlValue[],
     column?: string
   ): void {
-    const key = buildChangeLogKey(hlc, entryType, schema, table, pk, column);
+    this.deleteEntryByIdentityBatch(batch, hlc, entryType, schema, table, this.identity(schema, table, pk), column);
+  }
+
+  /**
+   * Delete a specific change log entry by pk IDENTITY — for callers that hold a
+   * parsed key rather than a raw pk (e.g. the tombstone prune sweep, whose
+   * table may no longer have a resolvable schema).
+   */
+  deleteEntryByIdentityBatch(
+    batch: WriteBatch,
+    hlc: HLC,
+    entryType: ChangeLogEntryType,
+    schema: string,
+    table: string,
+    identity: string,
+    column?: string
+  ): void {
+    const key = buildChangeLogKey(hlc, entryType, schema, table, identity, column);
     batch.delete(key);
   }
 }

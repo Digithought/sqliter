@@ -23,6 +23,7 @@ import {
 import { createStoreAdapter, type SyncStoreAdapterOptions } from '../../src/sync/store-adapter.js';
 import type { ApplyToStoreCallback, DataChangeToApply, Snapshot, SnapshotChunk } from '../../src/sync/protocol.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
+import { encodeRawPkIdentity } from '../../src/metadata/keys.js';
 import { SyncEventEmitterImpl, type SyncState, type UnknownTableEvent, type AssertionViolationEvent } from '../../src/sync/events.js';
 import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
@@ -377,7 +378,7 @@ describe('store-adapter seam integration', () => {
 			const chunks: SnapshotChunk[] = [
 				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
 				{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 0 },
-				{ type: 'column-versions', schema: 'main', table: 't', entries: [['["x"]:v', remoteHLC.tick(), -7]] },
+				{ type: 'column-versions', schema: 'main', table: 't', entries: [[`${encodeRawPkIdentity(['x'])}:v`, remoteHLC.tick(), -7, ['x']]] },
 				{ type: 'table-end', schema: 'main', table: 't', entriesWritten: 1 },
 				{ type: 'footer', snapshotId, totalTables: 1, totalEntries: 1, totalMigrations: 0 },
 			];
@@ -573,8 +574,8 @@ describe('store-adapter seam integration', () => {
 					schema: 'main',
 					table: 'no_such_table',
 					rows: [],
-					// versionKey = `${encodePK(pk)}:${column}` — encodePK is JSON.stringify.
-					columnVersions: new Map([['["k"]:v', { hlc: remoteHLC.tick(), value: 'b' }]]),
+					// versionKey = `${pkIdentity}:${column}`; the raw pk rides in the entry.
+					columnVersions: new Map([[`${encodeRawPkIdentity(['k'])}:v`, { hlc: remoteHLC.tick(), value: 'b', pk: ['k'] }]]),
 				}],
 				schemaMigrations: [],
 				tombstones: [],
@@ -605,7 +606,7 @@ describe('store-adapter seam integration', () => {
 			const chunks: SnapshotChunk[] = [
 				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
 				{ type: 'table-start', schema: 'main', table: 'no_such_table', estimatedEntries: 0 },
-				{ type: 'column-versions', schema: 'main', table: 'no_such_table', entries: [['["k"]:v', remoteHLC.tick(), 'b']] },
+				{ type: 'column-versions', schema: 'main', table: 'no_such_table', entries: [[`${encodeRawPkIdentity(['k'])}:v`, remoteHLC.tick(), 'b', ['k']]] },
 				{ type: 'table-end', schema: 'main', table: 'no_such_table', entriesWritten: 1 },
 				{ type: 'footer', snapshotId, totalTables: 1, totalEntries: 1, totalMigrations: 0 },
 			];
@@ -693,8 +694,12 @@ describe('store-adapter seam integration', () => {
 		// state is wiped and never rewritten (metadata/data divergence).
 		it('omitted completed table survives the clear; re-streamed table applies', async () => {
 			// tableB is re-streamed → its rows flush to the store at table-end, so
-			// the store must be able to resolve it. tableA is skipped entirely.
+			// the store must be able to resolve it. tableA is skipped entirely (but
+			// exists locally, as it would after the earlier session streamed it);
+			// tableC exists too — only its METADATA is stale/non-completed.
 			await db.exec('create table tableB (id text primary key, v text) using store');
+			await db.exec('create table tableA (id text primary key, v text) using store');
+			await db.exec('create table tableC (id text primary key, v text) using store');
 
 			const kv = new InMemoryKVStore();
 			const syncEvents = new SyncEventEmitterImpl();
@@ -750,7 +755,7 @@ describe('store-adapter seam integration', () => {
 			const chunks: SnapshotChunk[] = [
 				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 2, migrationCount: 0, snapshotId },
 				{ type: 'table-start', schema: 'main', table: 'tableB', estimatedEntries: 0 },
-				{ type: 'column-versions', schema: 'main', table: 'tableB', entries: [['["b1"]:v', remoteHLC.tick(), 'bval']] },
+				{ type: 'column-versions', schema: 'main', table: 'tableB', entries: [[`${encodeRawPkIdentity(['b1'])}:v`, remoteHLC.tick(), 'bval', ['b1']]] },
 				{ type: 'table-end', schema: 'main', table: 'tableB', entriesWritten: 1 },
 				{ type: 'footer', snapshotId, totalTables: 2, totalEntries: 1, totalMigrations: 0 },
 			];

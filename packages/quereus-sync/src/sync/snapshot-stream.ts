@@ -22,7 +22,6 @@ import {
 	parseSchemaMigrationKey,
 	parseTombstoneKey,
 	parseChangeLogKey,
-	encodePK,
 } from '../metadata/keys.js';
 import type { SnapshotCheckpoint } from './manager.js';
 import type {
@@ -130,7 +129,7 @@ async function* streamSnapshotChunks(
 		yield tableStart;
 
 		// Stream column versions in chunks (single pass per table)
-		let entries: Array<[string, HLC, SqlValue]> = [];
+		let entries: Array<[string, HLC, SqlValue, SqlValue[]]> = [];
 		let entriesWritten = 0;
 
 		for await (const entry of ctx.kv.iterate(tableCvBounds)) {
@@ -138,8 +137,10 @@ async function* streamSnapshotChunks(
 			if (!parsed) continue;
 
 			const cv = deserializeColumnVersion(entry.value);
-			const versionKey = `${encodePK(parsed.pk)}:${parsed.column}`;
-			entries.push([versionKey, cv.hlc, cv.value]);
+			// versionKey groups one row's cells by pk IDENTITY (lossy); the raw pk
+			// travels as the tuple's 4th element (from the record value).
+			const versionKey = `${parsed.identity}:${parsed.column}`;
+			entries.push([versionKey, cv.hlc, cv.value, cv.pk]);
 			entriesWritten++;
 
 			if (entries.length >= chunkSize) {
@@ -229,7 +230,8 @@ async function* streamSnapshotChunks(
 
 		const tombstone = deserializeTombstone(entry.value);
 		tsEntries.push({
-			pk: parsed.pk,
+			pk: tombstone.pk,
+			identity: parsed.identity,
 			hlc: tombstone.hlc,
 			createdAt: tombstone.createdAt,
 			...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
@@ -416,6 +418,9 @@ export async function applySnapshotStream(
 	let currentTableSchema: string | undefined;
 	let currentTableName: string | undefined;
 	const rowColumns = new Map<string, Record<string, SqlValue>>();
+	// Raw pk per row-grouping key (the versionKey's identity prefix is lossy, so
+	// the applicable pk is taken from the entries themselves).
+	const rowPks = new Map<string, SqlValue[]>();
 
 	for await (const chunk of chunks) {
 		switch (chunk.type) {
@@ -459,39 +464,44 @@ export async function applySnapshotStream(
 				currentTableName = chunk.table;
 				totalEntries += chunk.estimatedEntries;
 				rowColumns.clear();
+				rowPks.clear();
 				break;
 
 			case 'column-versions':
-				for (const [versionKey, hlc, value] of chunk.entries) {
+				for (const [versionKey, hlc, value, pk] of chunk.entries) {
 					const lastColon = versionKey.lastIndexOf(':');
 					if (lastColon === -1) continue;
 
 					const rowKey = versionKey.slice(0, lastColon);
 					const column = versionKey.slice(lastColon + 1);
-					const pk = JSON.parse(rowKey) as SqlValue[];
 
-					// Track column for data application
+					// Track column (and the row's raw pk) for data application
 					if (!rowColumns.has(rowKey)) {
 						rowColumns.set(rowKey, {});
+						rowPks.set(rowKey, pk);
 					}
 					rowColumns.get(rowKey)![column] = value;
 
-					// Write CRDT metadata
-					ctx.columnVersions.setColumnVersionBatch(
+					// Write CRDT metadata under the SENDER's identity (the rowKey prefix):
+					// the receiving table may not exist yet — its schema arrives in this
+					// same snapshot — so no local keying can be resolved, and the
+					// replicated schema makes both sides' identities agree.
+					ctx.columnVersions.setColumnVersionByIdentityBatch(
 						batch,
 						chunk.schema,
 						chunk.table,
+						rowKey,
 						pk,
 						column,
 						{ hlc, value },
 					);
 
-					ctx.changeLog.recordColumnChangeBatch(
+					ctx.changeLog.recordColumnChangeByIdentityBatch(
 						batch,
 						hlc,
 						chunk.schema,
 						chunk.table,
-						pk,
+						rowKey,
 						column,
 					);
 
@@ -521,12 +531,14 @@ export async function applySnapshotStream(
 				// There is NO store data for a deleted row, so nothing is pushed to
 				// `pendingDataChanges`. `clearExistingMetadata` already ran at `header`, so
 				// these writes repopulate the just-cleared tombstone space.
-				for (const { pk, hlc, priorRow } of chunk.entries) {
-					// NOTE: `setTombstoneBatch` stamps `createdAt = Date.now()` internally and
-					// ignores the sender's `entry.createdAt`, so a bootstrapped tombstone's TTL
+				for (const { pk, identity, hlc, priorRow } of chunk.entries) {
+					// Sender-identity write (the receiving table may not exist yet — see the
+					// column-versions handler).
+					// NOTE: the write stamps `createdAt = Date.now()` internally and ignores
+					// the sender's `entry.createdAt`, so a bootstrapped tombstone's TTL
 					// horizon is re-based to bootstrap time rather than preserved. Acceptable
 					// for phase 1 (the tombstone lives a full horizon from bootstrap).
-					ctx.tombstones.setTombstoneBatch(batch, chunk.schema, chunk.table, pk, hlc, priorRow);
+					ctx.tombstones.setTombstoneByIdentityBatch(batch, chunk.schema, chunk.table, identity, pk, hlc, priorRow);
 
 					batchSize++;
 					if (batchSize >= BATCH_FLUSH_SIZE) {
@@ -539,12 +551,11 @@ export async function applySnapshotStream(
 				// Flush accumulated rows to store
 				if (currentTableSchema && currentTableName) {
 					for (const [rowKey, columns] of rowColumns) {
-						const pk = JSON.parse(rowKey) as SqlValue[];
 						pendingDataChanges.push({
 							type: 'update',
 							schema: currentTableSchema,
 							table: currentTableName,
-							pk,
+							pk: rowPks.get(rowKey)!,
 							columns,
 						});
 
@@ -553,6 +564,7 @@ export async function applySnapshotStream(
 						}
 					}
 					rowColumns.clear();
+					rowPks.clear();
 				}
 
 				tablesProcessed++;

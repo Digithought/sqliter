@@ -599,19 +599,68 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 
 | Prefix | Purpose | Format |
 |--------|---------|--------|
-| `cv:{schema}.{table}:{pk}:{col}` | Column version | `{hlc, value}` |
-| `tb:{schema}.{table}:{pk}` | Tombstone | `{hlc, createdAt, priorRow?}` |
+| `cv:{schema}.{table}:{idLen}:{pkIdentity}:{col}` | Column version | `{hlc, value, pk}` |
+| `tb:{schema}.{table}:{pkIdentity}` | Tombstone | `{hlc, createdAt, pk, priorRow?}` |
+| `cl:{hlc}{type}{schema}.{table}:{idLen}:{pkIdentity}[:{col}]` | HLC-ordered change-log index over `cv:`/`tb:` | *(empty — all info in the key)* |
 | `tx:{txId}` | *Reserved — not persisted.* The transaction id is **derived** from the base HLC (see *Deterministic transaction id*), so no transaction record is written. The `tx:` prefix and `buildTransactionKey` remain reserved for a future durable txn log. | — |
 | `ps:{siteId}` | Peer sync state (received watermark) | `{lastSyncHlc}` |
 | `pt:{siteId}` | Peer sent state (sent watermark: highest HLC pushed to a peer and acked) | `{lastSyncHlc}` |
 | `sm:{schema}.{table}:{version}` | Schema migration | `{ddl, hlc}` |
 | `si:` | Site identity | `{siteId, createdAt}` |
 | `hc:` | HLC state | `{wallTime, counter}` |
+| `fv:` | Sync-metadata format version | decimal string (see *Metadata format version*) |
 
 This co-location ensures:
 - Atomic updates of data and metadata within transactions
 - Single storage backend for both LevelDB and IndexedDB
 - No additional database connections needed
+
+### Row identity vs. address
+
+Every per-row record splits the primary key into two roles:
+
+- **Identity** — what the record is *filed under* (the pk component of its key).
+  Derived by `encodePkIdentity` (`metadata/keys.ts`): each pk column is run
+  through its logical type's semantic key transform (TIMESPAN → total seconds,
+  so `'PT1H'` ≡ `'PT60M'`) and then its **key collation** normalizer (`'apple'`
+  ≡ `'APPLE'` under `collate nocase`), producing the engine's type-tagged
+  `serializeKeyNullGrouping` string. This matches how the store and the
+  isolation overlay decide "same row?", so one row files under exactly one
+  identity no matter which spelling a write used. The encoding is numeric-class
+  aware (`5n` and `5` key alike), which also makes bigint pks safe — the former
+  `JSON.stringify` key encoding threw on them. The identity is **lossy and never
+  decoded back**.
+- **Address** — what goes on the wire and into record *values* (`ColumnVersion.pk`,
+  `Tombstone.pk`): a real, type-valid `SqlValue[]`. Any spelling from the row's
+  equivalence class is acceptable; the receiver's store collapses spellings too.
+
+Because the identity freely contains `:` (type tags) and `\0` (member
+separator), the `cv:`/`cl:` key layouts **length-prefix** it (`{idLen}:` is the
+identity's length in string code units), which makes the identity/column split
+unambiguous. The keying is resolved per table from its schema (key collations +
+semantic transforms) via `metadata/pk-identity.ts`; a wired
+`keyNormalizerResolver` (pass `db.getKeyNormalizerResolver()`) keeps custom
+collations keying exactly as the database compares them. A relay-only
+deployment with no `getTableSchema` oracle keys raw values — stable for its
+whole life, since no oracle (and hence no identity flip) can appear later.
+Quarantine (`qt:`) keys always use the raw encoding: a quarantined table is out
+of the local basis, so no schema exists for it, and its `(hlc, type)` component
+already makes the key unique. Snapshot transfers carry the **sender's** identity
+alongside each entry's raw pk, and the receiver files bootstrapped metadata
+under it verbatim — mid-bootstrap the receiving table may not exist yet (its
+schema arrives in the same snapshot), and the replicated schema makes both
+sides' identities agree.
+
+### Metadata format version
+
+The `fv:` record stores the sync-metadata storage format version
+(`SYNC_METADATA_FORMAT_VERSION`, currently **2** — the pk-identity keying above,
+with the raw pk carried in record values). `SyncManagerImpl.create` writes it on
+a fresh replica and refuses to open a replica whose stored version is missing
+(pre-versioning metadata) or different: old keys are unreadable under the new
+layout and mixing the two would corrupt both. Recovery is to clear the
+replica's sync metadata and re-bootstrap from a peer snapshot — there is no
+in-place rewrite pass (backwards compatibility is not yet a concern).
 
 ## Sync Protocol
 
