@@ -25,6 +25,7 @@ import {
 	SNAPSHOT_WIRE_FORMAT_VERSION,
 	type ChangeSet,
 	type ColumnChange,
+	type RowDeletion,
 	type Snapshot,
 	type SnapshotChunk,
 } from '../../src/sync/protocol.js';
@@ -49,6 +50,17 @@ function columnChangeSet(
 ): ChangeSet {
 	const change: ColumnChange = { type: 'column', schema: 'main', table, pk, column, value, hlc };
 	return { siteId: site, transactionId: `tx-${value}`, hlc, changes: [change], schemaMigrations: [] };
+}
+
+/** One-deletion ChangeSet from a foreign site at an explicit HLC. */
+function deleteChangeSet(
+	site: SiteId,
+	hlc: HLC,
+	table: string,
+	pk: (string | number)[],
+): ChangeSet {
+	const change: RowDeletion = { type: 'delete', schema: 'main', table, pk, hlc };
+	return { siteId: site, transactionId: `tx-del-${String(pk[0])}`, hlc, changes: [change], schemaMigrations: [] };
 }
 
 /** Pull every chunk of a manager's snapshot stream into an array. */
@@ -138,6 +150,43 @@ describe('snapshot receiver derives row identity (relay-as-sender bootstrap)', (
 			.filter(c => c.type === 'column' && c.table === 't' && c.column === 'v');
 		expect(cellChanges, 'collapsed cell emitted exactly once').to.have.length(1);
 		expect((cellChanges[0] as ColumnChange).value).to.equal('new');
+	});
+
+	it('nocase: two TOMBSTONE spellings of one deleted row collapse to the later one', async () => {
+		a = await makePeer('A');
+		b = await makePeer('B');
+		relay = await makeRelay();
+
+		await a.db.exec(`create table t (k text collate nocase primary key, v text) using store`);
+		await localWrite(a, `insert into t values ('gone', 'v1')`);
+		await settle();
+		await relay.applyChanges(await a.manager.getChangesSince(relay.getSiteId()));
+
+		// Two foreign deletes of the SAME row under different spellings. The relay
+		// keys raw, so it files TWO tombstones; the receiver must keep only the later.
+		const foreign = generateSiteId();
+		const base = BigInt(Date.now());
+		const earlyDelete = createHLC(base + 10n, 0, foreign);
+		const lateDelete = createHLC(base + 90n, 0, foreign);
+		await relay.applyChanges([deleteChangeSet(foreign, earlyDelete, 't', ['gone'])]);
+		await relay.applyChanges([deleteChangeSet(foreign, lateDelete, 't', ['GONE'])]);
+
+		await b.manager.applySnapshotStream(toStream(await collectStream(relay)));
+
+		expect(await collect(b.db, `select k from t`), 'row is deleted on the receiver').to.deep.equal([]);
+
+		// Both spellings resolve to ONE tombstone carrying the later HLC.
+		const viaLower = await b.manager.tombstones.getTombstone('main', 't', ['gone']);
+		const viaUpper = await b.manager.tombstones.getTombstone('main', 't', ['GONE']);
+		expect(viaLower, 'tombstone findable under either spelling').to.not.equal(undefined);
+		expect(viaUpper?.hlc, 'both spellings hit the same record').to.deep.equal(viaLower?.hlc);
+		expect(viaLower?.hlc, 'the later delete won the collapse').to.deep.equal(lateDelete);
+
+		// Decisive check: a write timestamped BETWEEN the two deletes must stay
+		// blocked. It would resurrect the row had the earlier tombstone survived.
+		const between = createHLC(base + 50n, 0, foreign);
+		await b.manager.applyChanges([columnChangeSet(foreign, between, 't', ['Gone'], 'v', 'resurrected')]);
+		expect(await collect(b.db, `select k from t`), 'in-between write stays blocked').to.deep.equal([]);
 	});
 
 	it('timespan: PT1H/PT60M collapse the same way (semantic key transform, not collation)', async () => {

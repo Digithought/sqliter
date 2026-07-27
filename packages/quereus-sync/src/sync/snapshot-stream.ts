@@ -7,7 +7,7 @@
 
 import type { Row, SqlValue } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
-import { assertWithinDrift, compareHLC } from '../clock/hlc.js';
+import { assertWithinDrift } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import { deserializeColumnVersion } from '../metadata/column-version.js';
 import { deserializeTombstone } from '../metadata/tombstones.js';
@@ -23,7 +23,6 @@ import {
 	parseTombstoneKey,
 	parseChangeLogKey,
 	encodePkIdentity,
-	type PkKeying,
 } from '../metadata/keys.js';
 import type { SnapshotCheckpoint } from './manager.js';
 import {
@@ -43,6 +42,12 @@ import {
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCState, toError } from './sync-context.js';
+import {
+	createSnapshotKeyingResolver,
+	keepMaxHLC,
+	reconcileCell,
+	type ReconciledRow,
+} from './snapshot-identity.js';
 import { applyDataToStore } from './admission.js';
 
 /** Default chunk size for streaming snapshots. */
@@ -436,38 +441,16 @@ export async function applySnapshotStream(
 	// Per-table pk keying, resolved lazily AFTER the table's DDL reached the store
 	// (all schema migrations precede table data in the stream; the first
 	// `table-start` flushes them, so the table exists by the time its entries
-	// arrive). A resolution failure emits `status:'error'` for parity with the
-	// data-apply failure path before propagating.
-	const keyingCache = new Map<string, PkKeying>();
-	const resolveKeying = (schema: string, table: string): PkKeying => {
-		const cacheKey = `${schema}\u0000${table}`;
-		let keying = keyingCache.get(cacheKey);
-		if (!keying) {
-			try {
-				keying = ctx.getPkKeying(schema, table);
-			} catch (error) {
-				ctx.syncEvents.emitSyncStateChange({ status: 'error', error: toError(error) });
-				throw error;
-			}
-			keyingCache.set(cacheKey, keying);
-		}
-		return keying;
-	};
+	// arrive).
+	const resolveKeying = createSnapshotKeyingResolver(ctx);
 
 	// One table section's cells, keyed by the RECEIVER's derived pk identity —
-	// never the sender's grouping. A sender with different keying (e.g. a
-	// raw-keyed relay with no schema oracle) can hold several records for what
-	// this receiver considers ONE row ('apple'/'APPLE' under nocase); reconciling
-	// per (identity, column) by greatest HLC keeps last-writer-wins instead of
-	// batch order, and yields exactly one cell record + one change-log entry per
-	// surviving cell. Memory bound: one table's live cells, the same bound the
-	// pre-reconciliation accumulator already carried.
-	interface RowAccumulator {
-		pk: SqlValue[]; // address to apply — the newest write's spelling (deterministic)
-		pkHlc: HLC;
-		cells: Map<string, { hlc: HLC; value: SqlValue }>;
-	}
-	const tableRows = new Map<string, RowAccumulator>();
+	// never the sender's grouping (see `reconcileCell`).
+	// NOTE: the memory bound is one table's live cells — the bound the
+	// pre-reconciliation accumulator already carried, at a higher constant (an
+	// HLC per cell, not just its value). If a very wide table ever strains this,
+	// reconcile per column-versions chunk rather than per table section.
+	const tableRows = new Map<string, ReconciledRow>();
 
 	// Tombstones for the CURRENT tombstone table, keyed by derived identity,
 	// greatest HLC per identity. NOTE: flushed when the incoming chunk's
@@ -573,23 +556,7 @@ export async function applySnapshotStream(
 				// would fail at the data flush with "Table not found" anyway).
 				const keying = resolveKeying(chunk.schema, chunk.table);
 				for (const entry of chunk.entries) {
-					const identity = encodePkIdentity(entry.pk, keying);
-					let row = tableRows.get(identity);
-					if (!row) {
-						row = { pk: entry.pk, pkHlc: entry.hlc, cells: new Map() };
-						tableRows.set(identity, row);
-					} else if (compareHLC(entry.hlc, row.pkHlc) > 0) {
-						// Address the row by the newest write's spelling — any spelling from
-						// the row's equivalence class is valid; newest keeps it deterministic.
-						row.pk = entry.pk;
-						row.pkHlc = entry.hlc;
-					}
-
-					const cell = row.cells.get(entry.column);
-					if (!cell || compareHLC(entry.hlc, cell.hlc) > 0) {
-						row.cells.set(entry.column, { hlc: entry.hlc, value: entry.value });
-					}
-
+					reconcileCell(tableRows, entry, keying);
 					entriesProcessed++;
 				}
 
@@ -615,10 +582,11 @@ export async function applySnapshotStream(
 				// `tb:` scan is key-sorted, so one table's tombstone chunks are contiguous
 				// in the stream (see the accumulator's declaration).
 				//
-				// Push pending DDL (and any tail of table data) first: a fully-deleted
-				// table has NO `table-start`, so a stream of only migrations + tombstones
-				// would otherwise reach `resolveKeying` before its `create table` ran.
-				// No-op on every later tombstone chunk (both pending arrays stay empty).
+				// Push pending DDL (and the last table's un-flushed row tail) first: a
+				// fully-deleted table has NO `table-start`, so a stream of only migrations
+				// + tombstones would otherwise reach `resolveKeying` before its
+				// `create table` ran. Only the FIRST tombstone chunk can have anything
+				// pending; later ones no-op (both pending arrays stay empty).
 				await flushDataToStore();
 
 				if (chunk.schema !== tombstoneSchema || chunk.table !== tombstoneTable) {
@@ -628,15 +596,11 @@ export async function applySnapshotStream(
 				}
 				const keying = resolveKeying(chunk.schema, chunk.table);
 				for (const entry of chunk.entries) {
-					const identity = encodePkIdentity(entry.pk, keying);
-					const existing = tombstoneRows.get(identity);
-					if (!existing || compareHLC(entry.hlc, existing.hlc) > 0) {
-						tombstoneRows.set(identity, {
-							pk: entry.pk,
-							hlc: entry.hlc,
-							...(entry.priorRow !== undefined ? { priorRow: entry.priorRow } : {}),
-						});
-					}
+					keepMaxHLC(tombstoneRows, encodePkIdentity(entry.pk, keying), {
+						pk: entry.pk,
+						hlc: entry.hlc,
+						...(entry.priorRow !== undefined ? { priorRow: entry.priorRow } : {}),
+					});
 				}
 				break;
 			}

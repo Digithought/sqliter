@@ -186,7 +186,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 			siteId: remoteSiteId,
 			hlc: remoteHLC.tick(),
 			snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
-			tables: [{ schema: 'main', table: 't', rows: [], columnVersions }],
+			tables: [{ schema: 'main', table: 't', columnVersions }],
 			schemaMigrations: [],
 			tombstones: [],
 		};
@@ -447,7 +447,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 				siteId: remoteSiteId,
 				hlc: remoteHLC.tick(),
 				snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
-				tables: [{ schema: 'main', table: 't', rows: [], columnVersions }],
+				tables: [{ schema: 'main', table: 't', columnVersions }],
 				schemaMigrations: [],
 				tombstones: [],
 			};

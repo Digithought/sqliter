@@ -200,10 +200,10 @@ export interface ColumnVersionEntry {
 export interface TableSnapshot {
   readonly schema: string;
   readonly table: string;
-  readonly rows: Row[];
   /**
-   * Every live cell of the table, one record per `(row, column)`. Grouping into
-   * rows is the receiver's job (it groups by its own derived pk identity).
+   * Every live cell of the table, one record per `(row, column)` — the table's
+   * ONLY payload. Grouping cells into rows is the receiver's job (it groups by
+   * its own derived pk identity), so no pre-grouped row images travel.
    */
   readonly columnVersions: ReadonlyArray<ColumnVersionEntry>;
 }

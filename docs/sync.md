@@ -584,6 +584,16 @@ coordinator's S3 store (`s3-snapshot-store.ts`) persists serialized chunk arrays
 rest, and an old stored snapshot deserialized by newer code would otherwise silently
 mis-parse entry shapes. Recovery is to regenerate the snapshot from a live peer.
 
+Operator note for the coordinator's S3 restore path: the refusal throws out of
+`onStoreCreated`, and `StoreManager.openAndRestore` closes the store and rethrows — so a
+coordinator holding a stale-format S3 snapshot **cannot open that database at all** until
+the stale snapshot objects are removed from the bucket. Delete (or move aside) the
+`…/snapshots/` objects for that database; the coordinator then opens empty and
+re-accumulates from the clients that reconnect, and the next snapshot it writes carries
+the current stamp. Whether an unreadable stored snapshot should instead be logged and
+skipped (starting empty, as a missing snapshot already does) is open — see
+`tickets/backlog/bug-coordinator-stale-snapshot-blocks-store-open.md`.
+
 ## Sync Protocol
 
 ### Data Structures
@@ -729,10 +739,9 @@ interface Snapshot {
 interface TableSnapshot {
   schema: string;
   table: string;
-  rows: Row[];
-  // One flat record per live cell; only the raw pk travels. The receiver groups
-  // cells into rows under its own DERIVED identity — no sender identity is on
-  // the wire. See § Row identity vs. address.
+  // One flat record per live cell — the table's ONLY payload; only the raw pk
+  // travels, and no pre-grouped row images do. The receiver groups cells into
+  // rows under its own DERIVED identity. See § Row identity vs. address.
   columnVersions: ReadonlyArray<{ column: string; hlc: HLC; value: SqlValue; pk: SqlValue[] }>;
 }
 

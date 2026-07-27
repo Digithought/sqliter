@@ -591,7 +591,6 @@ describe('store-adapter seam integration', () => {
 				tables: [{
 					schema: 'main',
 					table: 'no_such_table',
-					rows: [],
 					columnVersions: [{ column: 'v', hlc: remoteHLC.tick(), value: 'b', pk: ['k'] }],
 				}],
 				schemaMigrations: [],
