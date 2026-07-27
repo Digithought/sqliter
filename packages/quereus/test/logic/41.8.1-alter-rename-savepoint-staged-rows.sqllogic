@@ -348,3 +348,61 @@ select id, v from co2 order by id;
 
 drop table co2;
 -- run
+
+-- Case P (negative control): a full ROLLBACK, not `rollback to savepoint`. The rename is DDL
+-- and escapes the rollback, but every staged row must still be discarded — the adopt must not
+-- turn an abandoned transaction into a published one.
+create table cp (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cp values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table cp rename to cp2;
+-- run
+rollback;
+-- run
+
+select id, v from cp2 order by id;
+→ []
+
+drop table cp2;
+-- run
+
+-- Case Q: the transaction keeps READING and WRITING after the rename + savepoint rollback.
+-- Every case above only checks the post-COMMIT state, so nothing would catch an adopt that
+-- published the right rows while leaving the transaction's own mid-flight view wrong.
+create table cq (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cq values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into cq values (2, 'b');
+-- run
+alter table cq rename to cq2;
+-- run
+rollback to savepoint s;
+-- run
+
+-- mid-transaction: the pre-savepoint row is visible under the new name, the post-savepoint
+-- row is not
+select id, v from cq2 order by id;
+→ [{"id":1,"v":"a"}]
+
+insert into cq2 values (3, 'c');
+-- run
+commit;
+-- run
+
+select id, v from cq2 order by id;
+→ [{"id":1,"v":"a"},{"id":3,"v":"c"}]
+
+drop table cq2;
+-- run

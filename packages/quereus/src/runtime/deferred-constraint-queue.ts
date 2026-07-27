@@ -169,6 +169,16 @@ export class DeferredConstraintQueue {
 				StatusCode.INTERNAL
 			);
 		}
+		// NOTE: this name fallback is only reached when the enqueue site had no
+		// `activeConnection` to stamp. `tableKey` is the name the row was written under, and a
+		// module whose connections follow an `ALTER TABLE ... RENAME TO` (the memory module
+		// re-keys them; see MemoryTableManager.rekeyRegisteredConnections) will no longer match
+		// it — the entry then evaluates with no active connection and reads committed state
+		// instead of the transaction's own writes. Harmless today: both enqueue sites stamp a
+		// connectionId whenever one exists, and a rename across a queued deferred check already
+		// fails earlier (fix/deferred-foreign-key-breaks-when-table-renamed-in-same-transaction).
+		// If that fix makes rename-then-deferred-check reachable, key the fallback off the
+		// table's CURRENT name rather than the write-time one.
 		const normalized = tableKey.toLowerCase();
 		const simple = normalized.includes('.') ? normalized.substring(normalized.lastIndexOf('.') + 1) : normalized;
 		const matches = connections.filter(conn => {
