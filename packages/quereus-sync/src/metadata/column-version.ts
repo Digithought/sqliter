@@ -215,7 +215,11 @@ export class ColumnVersionStore {
   }
 
   /**
-   * Set column version in a batch.
+   * Set column version in a batch. The key's pk IDENTITY is always derived
+   * locally through this store's keying resolver — there is deliberately no
+   * caller-supplied-identity variant (a snapshot receiver trusting a sender's
+   * identity was the bug fixed by deriving on ingress; see docs/sync.md
+   * § Row identity vs. address).
    */
   setColumnVersionBatch(
     batch: WriteBatch,
@@ -225,26 +229,7 @@ export class ColumnVersionStore {
     column: string,
     version: ColumnVersionData
   ): void {
-    this.setColumnVersionByIdentityBatch(batch, schemaName, tableName, this.identity(schemaName, tableName, pk), pk, column, version);
-  }
-
-  /**
-   * Set column version in a batch under a caller-supplied pk IDENTITY — the
-   * snapshot-apply path, where the sender's identity travels on the wire and
-   * the receiving table may not exist yet (its schema arrives in the same
-   * snapshot), so no local keying can be resolved. Sender and receiver share
-   * the replicated schema, so the identities agree.
-   */
-  setColumnVersionByIdentityBatch(
-    batch: WriteBatch,
-    schemaName: string,
-    tableName: string,
-    identity: string,
-    pk: SqlValue[],
-    column: string,
-    version: ColumnVersionData
-  ): void {
-    const key = buildColumnVersionKey(schemaName, tableName, identity, column);
+    const key = buildColumnVersionKey(schemaName, tableName, this.identity(schemaName, tableName, pk), column);
     batch.put(key, serializeColumnVersion({ ...version, pk }));
   }
 

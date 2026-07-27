@@ -72,7 +72,10 @@ export class ChangeLogStore {
   }
 
   /**
-   * Record a column change in a batch.
+   * Record a column change in a batch. The key's pk IDENTITY is always derived
+   * locally — no caller-supplied-identity WRITE variant exists (see
+   * `ColumnVersionStore.setColumnVersionBatch`); `deleteEntryByIdentityBatch`
+   * below remains for DELETE-side callers holding a parsed key.
    */
   recordColumnChangeBatch(
     batch: WriteBatch,
@@ -82,22 +85,7 @@ export class ChangeLogStore {
     pk: SqlValue[],
     column: string
   ): void {
-    this.recordColumnChangeByIdentityBatch(batch, hlc, schema, table, this.identity(schema, table, pk), column);
-  }
-
-  /**
-   * Record a column change in a batch under a caller-supplied pk IDENTITY —
-   * the snapshot-apply path (see `ColumnVersionStore.setColumnVersionByIdentityBatch`).
-   */
-  recordColumnChangeByIdentityBatch(
-    batch: WriteBatch,
-    hlc: HLC,
-    schema: string,
-    table: string,
-    identity: string,
-    column: string
-  ): void {
-    const key = buildChangeLogKey(hlc, 'column', schema, table, identity, column);
+    const key = buildChangeLogKey(hlc, 'column', schema, table, this.identity(schema, table, pk), column);
     batch.put(key, new Uint8Array(0));
   }
 

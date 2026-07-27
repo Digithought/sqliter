@@ -69,7 +69,10 @@ export {
   type ColumnVersionEntry,
   type TableSnapshot,
   type Snapshot,
+  type SnapshotTombstone,
   type PeerSyncState,
+  // Snapshot wire-format gate (both apply paths refuse a mismatched stamp)
+  SNAPSHOT_WIRE_FORMAT_VERSION,
   // Streaming snapshot types
   type SnapshotChunkType,
   type SnapshotHeaderChunk,

@@ -162,15 +162,34 @@ export interface ApplyResult {
 }
 
 /**
- * Column version entry for snapshot.
+ * Snapshot wire-format version, stamped into both snapshot forms (the streaming
+ * header chunk and the non-streaming `Snapshot`). Both apply paths REFUSE a
+ * snapshot whose stamp is missing or different, before touching any local state
+ * — same posture as the `fv:` sync-metadata format gate in `SyncManagerImpl.create`.
+ * Recovery is to regenerate the snapshot from a live peer (the coordinator's S3
+ * store persists serialized chunks at rest, so an old stored snapshot read by
+ * new code would otherwise silently mis-parse). Bump on ANY breaking change to
+ * snapshot entry shapes.
+ *
+ * Version 1: column-version entries are explicit `{ column, hlc, value, pk }`
+ * records and no snapshot shape carries a pk identity — the receiver always
+ * derives its own (see docs/sync.md § Row identity vs. address).
+ */
+export const SNAPSHOT_WIRE_FORMAT_VERSION = 1;
+
+/**
+ * One column-version entry in a snapshot (streaming chunk or non-streaming
+ * table snapshot).
  */
 export interface ColumnVersionEntry {
+  readonly column: string;
   readonly hlc: HLC;
   readonly value: SqlValue;
   /**
-   * The row's raw pk (its ADDRESS). Required: the map key groups by the derived
-   * pk IDENTITY, which is lossy and cannot be decoded back to values, so the
-   * receiver takes the applicable pk from here.
+   * The row's raw pk (its ADDRESS). The pk IDENTITY deliberately does NOT
+   * travel: the receiver derives its own from this pk and its local table
+   * keying, so a sender with different keying (e.g. a raw-keyed relay) cannot
+   * file the receiver's bookkeeping under unreachable identities.
    */
   readonly pk: SqlValue[];
 }
@@ -183,30 +202,23 @@ export interface TableSnapshot {
   readonly table: string;
   readonly rows: Row[];
   /**
-   * Column versions for each row, keyed `${pkIdentity}:${column}` — the identity
-   * groups one row's cells; the raw pk rides in each {@link ColumnVersionEntry}.
+   * Every live cell of the table, one record per `(row, column)`. Grouping into
+   * rows is the receiver's job (it groups by its own derived pk identity).
    */
-  readonly columnVersions: Map<string, ColumnVersionEntry>;
+  readonly columnVersions: ReadonlyArray<ColumnVersionEntry>;
 }
 
 /**
  * A tombstone (deletion record) carried in a non-streaming snapshot. A GLOBAL
  * collection on `Snapshot` (not nested under `TableSnapshot`) so a fully-deleted
  * row — a tombstone with no live column-versions, hence no `TableSnapshot` — still
- * travels. Mirrors the streaming `SnapshotTombstoneChunk` entry shape.
+ * travels. Mirrors the streaming `SnapshotTombstoneChunk` entry shape. Carries
+ * only the raw pk (the row's address); the receiver derives its own identity.
  */
 export interface SnapshotTombstone {
   readonly schema: string;
   readonly table: string;
   readonly pk: SqlValue[];
-  /**
-   * The sender's pk IDENTITY for this row (its `tb:` key component). The
-   * receiver files the tombstone under this identity verbatim — its own table
-   * may not exist yet mid-bootstrap (the schema arrives in the same snapshot),
-   * so no local keying can be resolved; sender and receiver share the
-   * replicated schema, so the identities agree.
-   */
-  readonly identity: string;
   readonly hlc: HLC;
   readonly createdAt: number;
   /** Last-known row image before deletion; absent on snapshot-reconstructed tombstones. */
@@ -219,6 +231,8 @@ export interface SnapshotTombstone {
 export interface Snapshot {
   readonly siteId: SiteId;
   readonly hlc: HLC;
+  /** Wire-format stamp; see {@link SNAPSHOT_WIRE_FORMAT_VERSION}. */
+  readonly snapshotFormat: number;
   readonly tables: TableSnapshot[];
   readonly schemaMigrations: SchemaMigration[];
   /**
@@ -262,6 +276,8 @@ export interface SnapshotHeaderChunk {
   readonly type: 'header';
   readonly siteId: SiteId;
   readonly hlc: HLC;
+  /** Wire-format stamp; see {@link SNAPSHOT_WIRE_FORMAT_VERSION}. */
+  readonly snapshotFormat: number;
   readonly tableCount: number;
   readonly migrationCount: number;
   /** Unique identifier for this snapshot transfer. */
@@ -287,12 +303,11 @@ export interface SnapshotColumnVersionsChunk {
   readonly schema: string;
   readonly table: string;
   /**
-   * Column versions as [versionKey, hlc, value, pk] tuples. `versionKey` is
-   * `${pkIdentity}:${column}` (the identity groups a row's cells but is lossy);
-   * `pk` is the row's raw primary key, which the receiver uses to address the
-   * row when applying data and rebuilding its own metadata keys.
+   * One record per live cell. No pk identity travels — the receiver groups
+   * cells into rows by DERIVING its own identity from each entry's raw pk
+   * (see {@link ColumnVersionEntry.pk}).
    */
-  readonly entries: Array<[string, HLC, SqlValue, SqlValue[]]>;
+  readonly entries: ReadonlyArray<ColumnVersionEntry>;
 }
 
 /**
@@ -310,8 +325,6 @@ export interface SnapshotTombstoneChunk {
   readonly table: string;
   readonly entries: ReadonlyArray<{
     readonly pk: SqlValue[];
-    /** Sender's pk identity for this row — see {@link SnapshotTombstone.identity}. */
-    readonly identity: string;
     readonly hlc: HLC;
     readonly createdAt: number;
     /** Last-known row image before deletion; absent on snapshot-reconstructed tombstones. */

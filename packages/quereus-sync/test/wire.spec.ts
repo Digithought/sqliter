@@ -269,6 +269,7 @@ describe('wire protocol', () => {
         type: 'header',
         siteId,
         hlc: hlc(1000, 1),
+        snapshotFormat: 1,
         tableCount: 3,
         migrationCount: 2,
         snapshotId: 'snap-1',
@@ -290,8 +291,8 @@ describe('wire protocol', () => {
         schema: 'main',
         table: 't',
         entries: [
-          ['s:pk1:name', hlc(1000, 1), 'alice', ['pk1']],
-          ['s:pk1:data', hlc(1001, 0), new Uint8Array([1, 2, 3]), ['pk1']],
+          { column: 'name', hlc: hlc(1000, 1), value: 'alice', pk: ['pk1'] },
+          { column: 'data', hlc: hlc(1001, 0), value: new Uint8Array([1, 2, 3]), pk: ['pk1'] },
         ],
       });
     });
@@ -304,7 +305,6 @@ describe('wire protocol', () => {
         entries: [
           {
             pk: [1],
-            identity: 'n:1',
             hlc: hlc(1000, 1),
             createdAt: 1700000000000,
             priorRow: [1, 'alice'],
@@ -327,7 +327,7 @@ describe('wire protocol', () => {
         type: 'tombstone',
         schema: 'main',
         table: 't',
-        entries: [{ pk: [1], identity: 'n:1', hlc: hlc(1000, 1), createdAt: 1700000000000 }],
+        entries: [{ pk: [1], hlc: hlc(1000, 1), createdAt: 1700000000000 }],
       };
       const serialized = serializeSnapshotChunk(chunk) as Extract<
         SerializedSnapshotChunk,

@@ -5,9 +5,9 @@
  * management for memory-efficient sync of large databases.
  */
 
-import type { SqlValue } from '@quereus/quereus';
+import type { Row, SqlValue } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
-import { assertWithinDrift } from '../clock/hlc.js';
+import { assertWithinDrift, compareHLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import { deserializeColumnVersion } from '../metadata/column-version.js';
 import { deserializeTombstone } from '../metadata/tombstones.js';
@@ -22,20 +22,24 @@ import {
 	parseSchemaMigrationKey,
 	parseTombstoneKey,
 	parseChangeLogKey,
+	encodePkIdentity,
+	type PkKeying,
 } from '../metadata/keys.js';
 import type { SnapshotCheckpoint } from './manager.js';
-import type {
-	SnapshotChunk,
-	SnapshotProgress,
-	SnapshotHeaderChunk,
-	SnapshotTableStartChunk,
-	SnapshotColumnVersionsChunk,
-	SnapshotTombstoneChunk,
-	SnapshotTableEndChunk,
-	SnapshotSchemaMigrationChunk,
-	SnapshotFooterChunk,
-	DataChangeToApply,
-	SchemaChangeToApply,
+import {
+	SNAPSHOT_WIRE_FORMAT_VERSION,
+	type SnapshotChunk,
+	type SnapshotProgress,
+	type SnapshotHeaderChunk,
+	type SnapshotTableStartChunk,
+	type SnapshotColumnVersionsChunk,
+	type SnapshotTombstoneChunk,
+	type SnapshotTableEndChunk,
+	type SnapshotSchemaMigrationChunk,
+	type SnapshotFooterChunk,
+	type ColumnVersionEntry,
+	type DataChangeToApply,
+	type SchemaChangeToApply,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCState, toError } from './sync-context.js';
@@ -114,6 +118,7 @@ async function* streamSnapshotChunks(
 		type: 'header',
 		siteId,
 		hlc,
+		snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
 		tableCount: tableKeys.size,
 		migrationCount,
 		snapshotId,
@@ -162,7 +167,7 @@ async function* streamSnapshotChunks(
 		yield tableStart;
 
 		// Stream column versions in chunks (single pass per table)
-		let entries: Array<[string, HLC, SqlValue, SqlValue[]]> = [];
+		let entries: ColumnVersionEntry[] = [];
 		let entriesWritten = 0;
 
 		for await (const entry of ctx.kv.iterate(tableCvBounds)) {
@@ -170,10 +175,9 @@ async function* streamSnapshotChunks(
 			if (!parsed) continue;
 
 			const cv = deserializeColumnVersion(entry.value);
-			// versionKey groups one row's cells by pk IDENTITY (lossy); the raw pk
-			// travels as the tuple's 4th element (from the record value).
-			const versionKey = `${parsed.identity}:${parsed.column}`;
-			entries.push([versionKey, cv.hlc, cv.value, cv.pk]);
+			// Only the raw pk (the row's address, from the record value) travels; the
+			// sender's key identity stays local — the receiver derives its own.
+			entries.push({ column: parsed.column, hlc: cv.hlc, value: cv.value, pk: cv.pk });
 			entriesWritten++;
 
 			if (entries.length >= chunkSize) {
@@ -244,7 +248,6 @@ async function* streamSnapshotChunks(
 		const tombstone = deserializeTombstone(entry.value);
 		tsEntries.push({
 			pk: tombstone.pk,
-			identity: parsed.identity,
 			hlc: tombstone.hlc,
 			createdAt: tombstone.createdAt,
 			...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
@@ -429,10 +432,66 @@ export async function applySnapshotStream(
 
 	let currentTableSchema: string | undefined;
 	let currentTableName: string | undefined;
-	const rowColumns = new Map<string, Record<string, SqlValue>>();
-	// Raw pk per row-grouping key (the versionKey's identity prefix is lossy, so
-	// the applicable pk is taken from the entries themselves).
-	const rowPks = new Map<string, SqlValue[]>();
+
+	// Per-table pk keying, resolved lazily AFTER the table's DDL reached the store
+	// (all schema migrations precede table data in the stream; the first
+	// `table-start` flushes them, so the table exists by the time its entries
+	// arrive). A resolution failure emits `status:'error'` for parity with the
+	// data-apply failure path before propagating.
+	const keyingCache = new Map<string, PkKeying>();
+	const resolveKeying = (schema: string, table: string): PkKeying => {
+		const cacheKey = `${schema}\u0000${table}`;
+		let keying = keyingCache.get(cacheKey);
+		if (!keying) {
+			try {
+				keying = ctx.getPkKeying(schema, table);
+			} catch (error) {
+				ctx.syncEvents.emitSyncStateChange({ status: 'error', error: toError(error) });
+				throw error;
+			}
+			keyingCache.set(cacheKey, keying);
+		}
+		return keying;
+	};
+
+	// One table section's cells, keyed by the RECEIVER's derived pk identity —
+	// never the sender's grouping. A sender with different keying (e.g. a
+	// raw-keyed relay with no schema oracle) can hold several records for what
+	// this receiver considers ONE row ('apple'/'APPLE' under nocase); reconciling
+	// per (identity, column) by greatest HLC keeps last-writer-wins instead of
+	// batch order, and yields exactly one cell record + one change-log entry per
+	// surviving cell. Memory bound: one table's live cells, the same bound the
+	// pre-reconciliation accumulator already carried.
+	interface RowAccumulator {
+		pk: SqlValue[]; // address to apply — the newest write's spelling (deterministic)
+		pkHlc: HLC;
+		cells: Map<string, { hlc: HLC; value: SqlValue }>;
+	}
+	const tableRows = new Map<string, RowAccumulator>();
+
+	// Tombstones for the CURRENT tombstone table, keyed by derived identity,
+	// greatest HLC per identity. NOTE: flushed when the incoming chunk's
+	// (schema, table) changes — correct ONLY because the producer's `tb:` scan is
+	// key-sorted, so all tombstone chunks for one table are contiguous in the stream.
+	const tombstoneRows = new Map<string, { pk: SqlValue[]; hlc: HLC; priorRow?: Row }>();
+	let tombstoneSchema: string | undefined;
+	let tombstoneTable: string | undefined;
+
+	const flushTombstones = async (): Promise<void> => {
+		if (tombstoneSchema === undefined || tombstoneTable === undefined) return;
+		for (const ts of tombstoneRows.values()) {
+			// NOTE: the write stamps `createdAt = Date.now()` internally and ignores
+			// the sender's `entry.createdAt`, so a bootstrapped tombstone's TTL
+			// horizon is re-based to bootstrap time rather than preserved. Acceptable
+			// for phase 1 (the tombstone lives a full horizon from bootstrap).
+			ctx.tombstones.setTombstoneBatch(batch, tombstoneSchema, tombstoneTable, ts.pk, ts.hlc, ts.priorRow);
+			batchSize++;
+			if (batchSize >= BATCH_FLUSH_SIZE) {
+				await flushMetadataBatch();
+			}
+		}
+		tombstoneRows.clear();
+	};
 
 	for await (const chunk of chunks) {
 		switch (chunk.type) {
@@ -440,6 +499,21 @@ export async function applySnapshotStream(
 				snapshotId = chunk.snapshotId;
 				snapshotHLC = chunk.hlc;
 				totalTables = chunk.tableCount;
+
+				// Wire-format gate: refuse a snapshot whose stamp is missing or different
+				// BEFORE clearing local metadata or applying any chunk — same posture as
+				// the `fv:` sync-metadata gate in `SyncManagerImpl.create`. An old
+				// serialized snapshot (e.g. the coordinator's S3 store persists chunks at
+				// rest) deserialized by newer code would otherwise silently mis-parse
+				// entry shapes. Recovery: regenerate the snapshot from a live peer.
+				if (chunk.snapshotFormat !== SNAPSHOT_WIRE_FORMAT_VERSION) {
+					const error = new Error(
+						`Snapshot wire format ${chunk.snapshotFormat ?? '(missing)'} does not match this build's `
+							+ `${SNAPSHOT_WIRE_FORMAT_VERSION} — regenerate the snapshot from a live peer`,
+					);
+					ctx.syncEvents.emitSyncStateChange({ status: 'error', error });
+					throw error;
+				}
 
 				// Pre-commit drift validation: reject a snapshot whose header HLC is beyond
 				// the drift bound BEFORE clearing local metadata or applying any chunk — so a
@@ -479,65 +553,44 @@ export async function applySnapshotStream(
 				// returns early when both pending arrays are empty).
 				// NOTE: this trusts the CHUNK ORDER, which outlives the sender process — the
 				// coordinator gzips a chunk array into S3 (`s3-snapshot-store.ts`) and replays
-				// it here on restore, so a snapshot written before DDL-first ordering still
-				// fails on a table larger than DATA_FLUSH_SIZE, exactly as before. Acceptable
-				// while backwards compat is out of scope; if it ever matters, either
-				// re-generate stored snapshots on upgrade or have the receiver buffer all data
-				// until the footer — the memory tradeoff the streaming path exists to avoid.
+				// it here on restore. A stored snapshot from before DDL-first ordering also
+				// predates the wire-format stamp, so the header gate above rejects it loudly
+				// (recovery: regenerate the snapshot) instead of it failing obscurely here.
 				await flushDataToStore();
 
 				currentTable = `${chunk.schema}.${chunk.table}`;
 				currentTableSchema = chunk.schema;
 				currentTableName = chunk.table;
 				totalEntries += chunk.estimatedEntries;
-				rowColumns.clear();
-				rowPks.clear();
+				tableRows.clear();
 				break;
 
-			case 'column-versions':
-				for (const [versionKey, hlc, value, pk] of chunk.entries) {
-					const lastColon = versionKey.lastIndexOf(':');
-					if (lastColon === -1) continue;
-
-					const rowKey = versionKey.slice(0, lastColon);
-					const column = versionKey.slice(lastColon + 1);
-
-					// Track column (and the row's raw pk) for data application
-					if (!rowColumns.has(rowKey)) {
-						rowColumns.set(rowKey, {});
-						rowPks.set(rowKey, pk);
+			case 'column-versions': {
+				// Group cells by the RECEIVER's derived identity — never the sender's.
+				// Keying is resolvable here because every schema migration preceded the
+				// first `table-start`, whose flush pushed the DDL to the store; a table
+				// with no local definition and no migration throws (the same snapshot
+				// would fail at the data flush with "Table not found" anyway).
+				const keying = resolveKeying(chunk.schema, chunk.table);
+				for (const entry of chunk.entries) {
+					const identity = encodePkIdentity(entry.pk, keying);
+					let row = tableRows.get(identity);
+					if (!row) {
+						row = { pk: entry.pk, pkHlc: entry.hlc, cells: new Map() };
+						tableRows.set(identity, row);
+					} else if (compareHLC(entry.hlc, row.pkHlc) > 0) {
+						// Address the row by the newest write's spelling — any spelling from
+						// the row's equivalence class is valid; newest keeps it deterministic.
+						row.pk = entry.pk;
+						row.pkHlc = entry.hlc;
 					}
-					rowColumns.get(rowKey)![column] = value;
 
-					// Write CRDT metadata under the SENDER's identity (the rowKey prefix):
-					// the receiving table may not exist yet — its schema arrives in this
-					// same snapshot — so no local keying can be resolved, and the
-					// replicated schema makes both sides' identities agree.
-					ctx.columnVersions.setColumnVersionByIdentityBatch(
-						batch,
-						chunk.schema,
-						chunk.table,
-						rowKey,
-						pk,
-						column,
-						{ hlc, value },
-					);
+					const cell = row.cells.get(entry.column);
+					if (!cell || compareHLC(entry.hlc, cell.hlc) > 0) {
+						row.cells.set(entry.column, { hlc: entry.hlc, value: entry.value });
+					}
 
-					ctx.changeLog.recordColumnChangeByIdentityBatch(
-						batch,
-						hlc,
-						chunk.schema,
-						chunk.table,
-						rowKey,
-						column,
-					);
-
-					batchSize++;
 					entriesProcessed++;
-
-					if (batchSize >= BATCH_FLUSH_SIZE) {
-						await flushMetadataBatch();
-					}
 				}
 
 				if (onProgress && snapshotId) {
@@ -551,47 +604,90 @@ export async function applySnapshotStream(
 					});
 				}
 				break;
+			}
 
-			case 'tombstone':
-				// Tombstones are pure CRDT metadata: write each into the same batch as
-				// column-versions, honoring the shared BATCH_FLUSH_SIZE / checkpoint path.
-				// There is NO store data for a deleted row, so nothing is pushed to
-				// `pendingDataChanges`. `clearExistingMetadata` already ran at `header`, so
-				// these writes repopulate the just-cleared tombstone space.
-				for (const { pk, identity, hlc, priorRow } of chunk.entries) {
-					// Sender-identity write (the receiving table may not exist yet — see the
-					// column-versions handler).
-					// NOTE: the write stamps `createdAt = Date.now()` internally and ignores
-					// the sender's `entry.createdAt`, so a bootstrapped tombstone's TTL
-					// horizon is re-based to bootstrap time rather than preserved. Acceptable
-					// for phase 1 (the tombstone lives a full horizon from bootstrap).
-					ctx.tombstones.setTombstoneByIdentityBatch(batch, chunk.schema, chunk.table, identity, pk, hlc, priorRow);
+			case 'tombstone': {
+				// Tombstones are pure CRDT metadata: there is NO store data for a deleted
+				// row, so nothing is pushed to `pendingDataChanges`. Accumulate per
+				// (schema, table) keyed by the receiver-derived identity, greatest HLC per
+				// identity — a raw-keyed sender may carry two spellings of one deleted row.
+				// NOTE: flushing on table change is only correct because the producer's
+				// `tb:` scan is key-sorted, so one table's tombstone chunks are contiguous
+				// in the stream (see the accumulator's declaration).
+				//
+				// Push pending DDL (and any tail of table data) first: a fully-deleted
+				// table has NO `table-start`, so a stream of only migrations + tombstones
+				// would otherwise reach `resolveKeying` before its `create table` ran.
+				// No-op on every later tombstone chunk (both pending arrays stay empty).
+				await flushDataToStore();
 
-					batchSize++;
-					if (batchSize >= BATCH_FLUSH_SIZE) {
-						await flushMetadataBatch();
+				if (chunk.schema !== tombstoneSchema || chunk.table !== tombstoneTable) {
+					await flushTombstones();
+					tombstoneSchema = chunk.schema;
+					tombstoneTable = chunk.table;
+				}
+				const keying = resolveKeying(chunk.schema, chunk.table);
+				for (const entry of chunk.entries) {
+					const identity = encodePkIdentity(entry.pk, keying);
+					const existing = tombstoneRows.get(identity);
+					if (!existing || compareHLC(entry.hlc, existing.hlc) > 0) {
+						tombstoneRows.set(identity, {
+							pk: entry.pk,
+							hlc: entry.hlc,
+							...(entry.priorRow !== undefined ? { priorRow: entry.priorRow } : {}),
+						});
 					}
 				}
 				break;
+			}
 
 			case 'table-end':
-				// Flush accumulated rows to store
+				// Write the table's reconciled metadata and rows. Cells were reconciled
+				// per (receiver identity, column) by greatest HLC during accumulation, so
+				// exactly one cell record, one change-log entry, and one data column
+				// survive per cell — collapsed sender spellings resolve by timestamp, not
+				// by batch order.
 				if (currentTableSchema && currentTableName) {
-					for (const [rowKey, columns] of rowColumns) {
+					for (const row of tableRows.values()) {
+						const columns: Record<string, SqlValue> = {};
+						for (const [column, cell] of row.cells) {
+							columns[column] = cell.value;
+
+							ctx.columnVersions.setColumnVersionBatch(
+								batch,
+								currentTableSchema,
+								currentTableName,
+								row.pk,
+								column,
+								{ hlc: cell.hlc, value: cell.value },
+							);
+							ctx.changeLog.recordColumnChangeBatch(
+								batch,
+								cell.hlc,
+								currentTableSchema,
+								currentTableName,
+								row.pk,
+								column,
+							);
+
+							batchSize++;
+							if (batchSize >= BATCH_FLUSH_SIZE) {
+								await flushMetadataBatch();
+							}
+						}
+
 						pendingDataChanges.push({
 							type: 'update',
 							schema: currentTableSchema,
 							table: currentTableName,
-							pk: rowPks.get(rowKey)!,
+							pk: row.pk,
 							columns,
 						});
-
 						if (pendingDataChanges.length >= DATA_FLUSH_SIZE) {
 							await flushDataToStore();
 						}
 					}
-					rowColumns.clear();
-					rowPks.clear();
+					tableRows.clear();
 				}
 
 				tablesProcessed++;
@@ -621,6 +717,10 @@ export async function applySnapshotStream(
 			}
 
 			case 'footer':
+				// Flush the last tombstone table's accumulation (pure metadata; the
+				// tombstone section has no closing chunk of its own).
+				await flushTombstones();
+
 				// Flush remaining data to store
 				await flushDataToStore();
 

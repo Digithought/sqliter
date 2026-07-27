@@ -83,10 +83,11 @@ describe('sync pk identity honours key collation and semantic key transforms', (
 	});
 
 	it('nocase: snapshot bootstrap files metadata the receiver can find by pk', async () => {
-		// A snapshot carries the SENDER's pk identity and the receiver files under it
-		// verbatim (its table may not exist until the snapshot's own create_table runs).
-		// Both sides resolve the same replicated schema, so a later LOCAL pk-based
-		// lookup on the receiver — under either spelling — must hit those records.
+		// A snapshot carries only each row's raw pk; the RECEIVER derives its own pk
+		// identity from it (all DDL precedes table data in the stream, so the table
+		// exists by the time its entries arrive — even on a fresh replica). A later
+		// LOCAL pk-based lookup on the receiver — under either spelling — must hit
+		// those records.
 		a = await makePeer('sender');
 		b = await makePeer('receiver'); // fresh: bootstraps the table from the snapshot
 		await a.db.exec(`create table t (k text collate nocase primary key, v text) using store`);

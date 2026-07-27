@@ -23,13 +23,12 @@ import {
 	type KVStoreProvider,
 } from '@quereus/store';
 import { createStoreAdapter, type SyncStoreAdapterOptions } from '../../src/sync/store-adapter.js';
-import type { ApplyToStoreCallback, DataChangeToApply, Snapshot, SnapshotChunk } from '../../src/sync/protocol.js';
+import type { ApplyToStoreCallback, ColumnVersionEntry, DataChangeToApply, Snapshot, SnapshotChunk } from '../../src/sync/protocol.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl, type SyncState } from '../../src/sync/events.js';
-import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
+import { DEFAULT_SYNC_CONFIG, SNAPSHOT_WIRE_FORMAT_VERSION } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager, type HLC } from '../../src/clock/hlc.js';
-import { encodeRawPkIdentity } from '../../src/metadata/keys.js';
 import { createInMemoryProvider, collect, toStream } from './_peer-harness.js';
 
 /** A whole-table `full` watch — fires on any change with empty hits. */
@@ -49,13 +48,12 @@ const upd = (table: string, pk: SqlValue[], columns: Record<string, SqlValue>): 
 	({ type: 'update', schema: 'main', table, pk, columns });
 
 /**
- * A streamed column-version tuple: versionKey = `${identity}:${column}`, raw pk
- * as the 4th element. These fixtures use the raw identity encoding, which for
- * the lowercase-alphanumeric pks used here equals the receiver's NOCASE-keyed
- * identity, so post-bootstrap pk-based lookups land on the same keys.
+ * A streamed column-version entry: only the raw pk travels — the receiver
+ * derives its own pk identity from it, so post-bootstrap pk-based lookups land
+ * on the receiver's own keys by construction.
  */
-const cvEntry = (pk: SqlValue[], column: string, hlc: HLC, value: SqlValue): [string, HLC, SqlValue, SqlValue[]] =>
-	[`${encodeRawPkIdentity(pk)}:${column}`, hlc, value, pk];
+const cvEntry = (pk: SqlValue[], column: string, hlc: HLC, value: SqlValue): ColumnVersionEntry =>
+	({ column, hlc, value, pk });
 
 
 /** Counters for the three engine entry points the bootstrap path drives. */
@@ -149,13 +147,13 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		const remoteHLC = new HLCManager(remoteSiteId);
 		const headerHLC = remoteHLC.tick();
 		const ROWS = 150; // > DATA_FLUSH_SIZE (100) → multiple bootstrap flushes
-		const entries: Array<[string, HLC, SqlValue, SqlValue[]]> = [];
+		const entries: ColumnVersionEntry[] = [];
 		for (let i = 0; i < ROWS; i++) {
 			entries.push(cvEntry([`r${i}`], 'v', remoteHLC.tick(), `val${i % 3}`));
 		}
 		const snapshotId = 'snap-bootstrap-1';
 		const chunks: SnapshotChunk[] = [
-			{ type: 'header', siteId: remoteSiteId, hlc: headerHLC, tableCount: 1, migrationCount: 0, snapshotId },
+			{ type: 'header', siteId: remoteSiteId, hlc: headerHLC, snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 1, migrationCount: 0, snapshotId },
 			{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: ROWS },
 			{ type: 'column-versions', schema: 'main', table: 't', entries },
 			{ type: 'table-end', schema: 'main', table: 't', entriesWritten: ROWS },
@@ -180,13 +178,14 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 
 		const remoteSiteId = generateSiteId();
 		const remoteHLC = new HLCManager(remoteSiteId);
-		const columnVersions = new Map<string, { hlc: HLC; value: SqlValue; pk: SqlValue[] }>();
+		const columnVersions: ColumnVersionEntry[] = [];
 		for (let i = 0; i < 5; i++) {
-			columnVersions.set(`${encodeRawPkIdentity([`r${i}`])}:v`, { hlc: remoteHLC.tick(), value: `val${i % 2}`, pk: [`r${i}`] });
+			columnVersions.push(cvEntry([`r${i}`], 'v', remoteHLC.tick(), `val${i % 2}`));
 		}
 		const snapshot: Snapshot = {
 			siteId: remoteSiteId,
 			hlc: remoteHLC.tick(),
+			snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
 			tables: [{ schema: 'main', table: 't', rows: [], columnVersions }],
 			schemaMigrations: [],
 			tombstones: [],
@@ -210,11 +209,11 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		const remoteSiteId = generateSiteId();
 		const remoteHLC = new HLCManager(remoteSiteId);
 		const ROWS = 150; // would fire the full watch once per flush under per-row capture
-		const entries: Array<[string, HLC, SqlValue, SqlValue[]]> = [];
+		const entries: ColumnVersionEntry[] = [];
 		for (let i = 0; i < ROWS; i++) entries.push(cvEntry([`r${i}`], 'v', remoteHLC.tick(), `v${i}`));
 		const snapshotId = 'snap-watch-1';
 		const chunks: SnapshotChunk[] = [
-			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 1, migrationCount: 0, snapshotId },
 			{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: ROWS },
 			{ type: 'column-versions', schema: 'main', table: 't', entries },
 			{ type: 'table-end', schema: 'main', table: 't', entriesWritten: ROWS },
@@ -272,7 +271,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 
 		// Resumed stream: header (full table count) + tableB only + footer.
 		const chunks: SnapshotChunk[] = [
-			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 2, migrationCount: 0, snapshotId },
+			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 2, migrationCount: 0, snapshotId },
 			{ type: 'table-start', schema: 'main', table: 'tableB', estimatedEntries: 1 },
 			{ type: 'column-versions', schema: 'main', table: 'tableB', entries: [cvEntry(['b1'], 'v', remoteHLC.tick(), 'bval')] },
 			{ type: 'table-end', schema: 'main', table: 'tableB', entriesWritten: 1 },
@@ -290,9 +289,11 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		expect(await collect(db, 'select v from mvB order by v')).to.deep.equal([{ v: 'bval' }]);
 	});
 
-	it('mid-bootstrap flush failure: no MV converged, snapshot retriable, retry succeeds', async () => {
-		// Table `t` does not exist yet → the bootstrap flush fails to resolve it,
-		// `throwIfApplyErrors` aborts before the footer's finalize.
+	it('mid-bootstrap failure: no MV converged, snapshot retriable, retry succeeds', async () => {
+		// Table `t` does not exist yet (and the snapshot carries no DDL for it) →
+		// the receiver cannot resolve pk keying for its entries and aborts before
+		// the footer's finalize. Same terminal outcome as the old data-flush
+		// failure, hit earlier.
 		const spies = installSpies(db);
 		const kv = new InMemoryKVStore();
 		const syncEvents = new SyncEventEmitterImpl();
@@ -303,10 +304,10 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		const remoteSiteId = generateSiteId();
 		const remoteHLC = new HLCManager(remoteSiteId);
 		const snapshotId = 'snap-fail-1';
-		const entries: Array<[string, HLC, SqlValue, SqlValue[]]> = [];
+		const entries: ColumnVersionEntry[] = [];
 		for (let i = 0; i < 3; i++) entries.push(cvEntry([`r${i}`], 'v', remoteHLC.tick(), `val${i % 2}`));
 		const buildChunks = (): SnapshotChunk[] => [
-			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 1, migrationCount: 0, snapshotId },
 			{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 3 },
 			{ type: 'column-versions', schema: 'main', table: 't', entries },
 			{ type: 'table-end', schema: 'main', table: 't', entriesWritten: 3 },
@@ -319,8 +320,9 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		} catch (e) {
 			thrown = e;
 		}
-		expect(String(thrown)).to.contain('apply-to-store failed');
+		expect(String(thrown)).to.contain('No table schema for main.t');
 		expect(spies.refreshCalls, 'no MV converged on a failed bootstrap').to.equal(0);
+		expect(states.map(s => s.status), 'emitted status:error').to.include('error');
 		expect(states.map(s => s.status), 'never reached synced').to.not.include('synced');
 
 		// Retry: create the table + MV and re-apply the SAME snapshot → converges cleanly.
@@ -350,7 +352,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		const remoteHLC = new HLCManager(remoteSiteId);
 		const snapshotId = 'snap-assertion-trust-1';
 		const chunks: SnapshotChunk[] = [
-			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 1, migrationCount: 0, snapshotId },
 			{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 1 },
 			{ type: 'column-versions', schema: 'main', table: 't', entries: [cvEntry(['r1'], 'v', remoteHLC.tick(), -5)] },
 			{ type: 'table-end', schema: 'main', table: 't', entriesWritten: 1 },
@@ -384,7 +386,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		const remoteHLC = new HLCManager(remoteSiteId);
 		const snapshotId = 'snap-incr-1';
 		const chunks: SnapshotChunk[] = [
-			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 1, migrationCount: 0, snapshotId },
 			{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 2 },
 			{
 				type: 'column-versions', schema: 'main', table: 't',
@@ -440,11 +442,11 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 
 			const remoteSiteId = generateSiteId();
 			const remoteHLC = new HLCManager(remoteSiteId);
-			const columnVersions = new Map<string, { hlc: HLC; value: SqlValue; pk: SqlValue[] }>();
-			columnVersions.set(`${encodeRawPkIdentity(['r1'])}:v`, { hlc: remoteHLC.tick(), value: 'x', pk: ['r1'] });
+			const columnVersions: ColumnVersionEntry[] = [cvEntry(['r1'], 'v', remoteHLC.tick(), 'x')];
 			const snapshot: Snapshot = {
 				siteId: remoteSiteId,
 				hlc: remoteHLC.tick(),
+				snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
 				tables: [{ schema: 'main', table: 't', rows: [], columnVersions }],
 				schemaMigrations: [],
 				tombstones: [],
@@ -468,6 +470,9 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		});
 
 		it('streamed applySnapshotStream whole-batch flush throw emits exactly one status:error, leaves checkpoint', async () => {
+			// The table must exist locally so the receiver's pk-keying derivation
+			// succeeds — this test's subject is the DATA FLUSH throw, which comes after.
+			await db.exec('create table t (id text primary key, v text) using store');
 			const kv = new InMemoryKVStore();
 			const syncEvents = new SyncEventEmitterImpl();
 			const states: SyncState[] = [];
@@ -478,7 +483,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 			const remoteHLC = new HLCManager(remoteSiteId);
 			const snapshotId = 'snap-wholebatch-throw-1';
 			const chunks: SnapshotChunk[] = [
-				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 1, migrationCount: 0, snapshotId },
 				{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 1 },
 				{ type: 'column-versions', schema: 'main', table: 't', entries: [cvEntry(['r1'], 'v', remoteHLC.tick(), 'x')] },
 				{ type: 'table-end', schema: 'main', table: 't', entriesWritten: 1 },

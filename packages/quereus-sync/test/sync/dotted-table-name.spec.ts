@@ -8,7 +8,7 @@
  */
 
 import { expect } from 'chai';
-import { Database, type SqlValue } from '@quereus/quereus';
+import { Database } from '@quereus/quereus';
 import { StoreModule, StoreEventEmitter, InMemoryKVStore } from '@quereus/store';
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
@@ -16,8 +16,10 @@ import { SyncEventEmitterImpl } from '../../src/sync/events.js';
 import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import type { SnapshotChunk } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
-import { HLCManager, type HLC } from '../../src/clock/hlc.js';
-import { encodeRawPkIdentity } from '../../src/metadata/keys.js';
+import { HLCManager } from '../../src/clock/hlc.js';
+import { encodeRawPkIdentity, buildColumnVersionKey } from '../../src/metadata/keys.js';
+import { serializeColumnVersion } from '../../src/metadata/column-version.js';
+import { SNAPSHOT_WIRE_FORMAT_VERSION } from '../../src/sync/protocol.js';
 import { createInMemoryProvider, collect, makePeer, localWrite, relay, closePeer, settle } from './_peer-harness.js';
 
 const DOTTED_DDL = 'create table "a.b" (id integer primary key, v text) using store';
@@ -139,17 +141,14 @@ describe('dotted table name (quoted identifier containing a dot)', () => {
 				const remoteHLC = new HLCManager(remoteSiteId);
 				const snapshotId = 'snap-resume-dotted-1';
 
-				// Identity-based seed: "a.b" does not exist locally in this test (only its
-				// metadata survives via the checkpoint), so a pk-based write — which
-				// resolves the identity through the schema oracle — would throw by design.
-				{
-					const seedBatch = kv.batch();
-					syncManager.columnVersions.setColumnVersionByIdentityBatch(
-						seedBatch, 'main', 'a.b', encodeRawPkIdentity(['a1']), ['a1'], 'v',
-						{ hlc: remoteHLC.tick(), value: 'survives' },
-					);
-					await seedBatch.write();
-				}
+				// Raw-key seed via the key builder directly: "a.b" does not exist locally
+				// in this test (only its metadata survives via the checkpoint), so a
+				// store-level pk-based write — which resolves the identity through the
+				// schema oracle — would throw by design.
+				await kv.put(
+					buildColumnVersionKey('main', 'a.b', encodeRawPkIdentity(['a1']), 'v'),
+					serializeColumnVersion({ hlc: remoteHLC.tick(), value: 'survives', pk: ['a1'] }),
+				);
 				const checkpoint = {
 					snapshotId,
 					siteId: remoteSiteId,
@@ -173,11 +172,11 @@ describe('dotted table name (quoted identifier containing a dot)', () => {
 				await kv.put(new TextEncoder().encode(`sc:${snapshotId}`), new TextEncoder().encode(ckptJson));
 
 				const chunks: SnapshotChunk[] = [
-					{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 2, migrationCount: 0, snapshotId },
+					{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 2, migrationCount: 0, snapshotId },
 					{ type: 'table-start', schema: 'main', table: 'tableB', estimatedEntries: 1 },
 					{
 						type: 'column-versions', schema: 'main', table: 'tableB',
-						entries: [[`${encodeRawPkIdentity(['b1'])}:v`, remoteHLC.tick(), 'bval', ['b1']] as [string, HLC, SqlValue, SqlValue[]]],
+						entries: [{ column: 'v', hlc: remoteHLC.tick(), value: 'bval', pk: ['b1'] }],
 					},
 					{ type: 'table-end', schema: 'main', table: 'tableB', entriesWritten: 1 },
 					{ type: 'footer', snapshotId, totalTables: 2, totalEntries: 1, totalMigrations: 0 },

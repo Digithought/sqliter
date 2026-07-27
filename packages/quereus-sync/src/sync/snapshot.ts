@@ -7,7 +7,7 @@
 
 import type { SqlValue, Row } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
-import { assertWithinDrift } from '../clock/hlc.js';
+import { assertWithinDrift, compareHLC } from '../clock/hlc.js';
 import { deserializeColumnVersion, type ColumnVersion } from '../metadata/column-version.js';
 import { deserializeMigration } from '../metadata/schema-migration.js';
 import { deserializeTombstone } from '../metadata/tombstones.js';
@@ -19,14 +19,18 @@ import {
 	parseColumnVersionKey,
 	parseTombstoneKey,
 	parseSchemaMigrationKey,
+	encodePkIdentity,
+	type PkKeying,
 } from '../metadata/keys.js';
-import type {
-	Snapshot,
-	SnapshotTombstone,
-	SchemaMigration,
-	TableSnapshot,
-	DataChangeToApply,
-	SchemaChangeToApply,
+import {
+	SNAPSHOT_WIRE_FORMAT_VERSION,
+	type Snapshot,
+	type SnapshotTombstone,
+	type SchemaMigration,
+	type TableSnapshot,
+	type ColumnVersionEntry,
+	type DataChangeToApply,
+	type SchemaChangeToApply,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError } from './sync-context.js';
@@ -68,16 +72,18 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 	// Build table snapshots
 	const tables: TableSnapshot[] = [];
 	for (const { schema, table, rows } of tableData.values()) {
-		const columnVersions = new Map<string, { hlc: HLC; value: SqlValue; pk: SqlValue[] }>();
+		const columnVersions: ColumnVersionEntry[] = [];
 		const rowsArray: Row[] = [];
 
-		for (const [rowKey, rowVersionsMap] of rows) {
+		for (const rowVersionsMap of rows.values()) {
 			const row: Row = Array.from(rowVersionsMap.values()).map(cv => cv.value);
 			rowsArray.push(row);
 
 			for (const [column, cv] of rowVersionsMap) {
-				const versionKey = `${rowKey}:${column}`;
-				columnVersions.set(versionKey, { hlc: cv.hlc, value: cv.value, pk: cv.pk });
+				// Flat cell records: only the raw pk travels. The sender's own key
+				// identity (the `rows` grouping key) stays local — the receiver derives
+				// its own identity from each entry's pk.
+				columnVersions.push({ column, hlc: cv.hlc, value: cv.value, pk: cv.pk });
 			}
 		}
 
@@ -121,7 +127,6 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 			schema: parsed.schema,
 			table: parsed.table,
 			pk: ts.pk,
-			identity: parsed.identity,
 			hlc: ts.hlc,
 			createdAt: ts.createdAt,
 			...(ts.priorRow !== undefined ? { priorRow: ts.priorRow } : {}),
@@ -131,6 +136,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 	return {
 		siteId: ctx.getSiteId(),
 		hlc: ctx.getCurrentHLC(),
+		snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
 		tables,
 		schemaMigrations,
 		tombstones,
@@ -144,6 +150,19 @@ export async function applySnapshot(
 	ctx: SyncContext,
 	snapshot: Snapshot,
 ): Promise<void> {
+	// Wire-format gate: refuse a snapshot whose stamp is missing or different
+	// BEFORE touching any local state — same posture as the `fv:` sync-metadata
+	// gate in `SyncManagerImpl.create` and the streaming header gate. Recovery:
+	// regenerate the snapshot from a live peer.
+	if (snapshot.snapshotFormat !== SNAPSHOT_WIRE_FORMAT_VERSION) {
+		const error = new Error(
+			`Snapshot wire format ${snapshot.snapshotFormat ?? '(missing)'} does not match this build's `
+				+ `${SNAPSHOT_WIRE_FORMAT_VERSION} — regenerate the snapshot from a live peer`,
+		);
+		ctx.syncEvents.emitSyncStateChange({ status: 'error', error });
+		throw error;
+	}
+
 	// Pre-commit drift validation (mirrors applyChanges / applySnapshotStream): reject a
 	// snapshot whose HLC is beyond the drift bound BEFORE clearing or writing anything,
 	// so a far-future peer cannot land poison LWW winners. Emit status:'error' first for
@@ -169,32 +188,26 @@ export async function applySnapshot(
 	}
 
 	for (const tableSnapshot of snapshot.tables) {
-		const rowsByPk = new Map<string, Record<string, SqlValue>>();
-		// versionKey groups by the (lossy) pk identity; the applicable raw pk is
-		// taken from the entries themselves (any one of a row's entries carries it).
-		const rowPks = new Map<string, SqlValue[]>();
-
-		for (const [versionKey, cvEntry] of tableSnapshot.columnVersions) {
-			const lastColon = versionKey.lastIndexOf(':');
-			if (lastColon === -1) continue;
-
-			const rowKey = versionKey.slice(0, lastColon);
-			const column = versionKey.slice(lastColon + 1);
-
-			if (!rowsByPk.has(rowKey)) {
-				rowsByPk.set(rowKey, {});
-				rowPks.set(rowKey, cvEntry.pk);
-			}
-			rowsByPk.get(rowKey)![column] = cvEntry.value;
-		}
-
-		for (const [rowKey, columns] of rowsByPk) {
+		// No local keying is resolvable yet — the table may only exist once this
+		// same unit's `create table` migration runs, and both go to the store in
+		// ONE `applyToStore` call. So no receiver identity can group cells into
+		// rows here. Instead: one single-column update per cell, ordered by HLC
+		// ascending across the table. The store collapses pk spellings with the
+		// same rules the identity uses, so a later write lands last and the data
+		// converges to per-cell last-writer-wins — matching the reconciled
+		// metadata `commitMetadata` files below.
+		// NOTE: this multiplies data changes by column count (O(cells), not
+		// O(rows)). Fine for the non-streaming path's small-database contract; if
+		// it ever shows up as slow, use the streaming path (which groups rows
+		// after DDL lands) rather than optimizing here.
+		const sorted = [...tableSnapshot.columnVersions].sort((a, b) => compareHLC(a.hlc, b.hlc));
+		for (const cvEntry of sorted) {
 			dataChangesToApply.push({
 				type: 'update',
 				schema: tableSnapshot.schema,
 				table: tableSnapshot.table,
-				pk: rowPks.get(rowKey)!,
-				columns,
+				pk: cvEntry.pk,
+				columns: { [cvEntry.column]: cvEntry.value },
 			});
 		}
 	}
@@ -210,6 +223,26 @@ export async function applySnapshot(
 		schemaChanges: schemaChangesToApply,
 		applyOptions: { remote: true, bootstrap: true },
 		commitMetadata: async () => {
+			// Runs AFTER the data apply, so every snapshot table (including ones the
+			// snapshot's own `create table` migration installed) has a resolvable
+			// schema — local keying is derivable here. Resolution failures emit
+			// `status:'error'` for parity with the data-apply failure path.
+			const keyingCache = new Map<string, PkKeying>();
+			const resolveKeying = (schema: string, table: string): PkKeying => {
+				const cacheKey = `${schema}\u0000${table}`;
+				let keying = keyingCache.get(cacheKey);
+				if (!keying) {
+					try {
+						keying = ctx.getPkKeying(schema, table);
+					} catch (error) {
+						ctx.syncEvents.emitSyncStateChange({ status: 'error', error: toError(error) });
+						throw error;
+					}
+					keyingCache.set(cacheKey, keying);
+				}
+				return keying;
+			};
+
 			// Clear existing CRDT metadata and apply new
 			const clearBatch = ctx.kv.batch();
 
@@ -225,40 +258,58 @@ export async function applySnapshot(
 
 			await clearBatch.write();
 
-			// Apply snapshot's column versions and rebuild change log
+			// Apply snapshot's column versions and rebuild change log, filed under the
+			// RECEIVER's derived identity. A sender with different keying (a raw-keyed
+			// relay) can carry several records for what this receiver considers ONE
+			// row; reconcile per (identity, column) by greatest HLC so exactly one
+			// cell record + one change-log entry survive per cell — last-writer-wins,
+			// not entry order.
 			const applyBatch = ctx.kv.batch();
 
 			for (const tableSnapshot of snapshot.tables) {
-				for (const [versionKey, cvEntry] of tableSnapshot.columnVersions) {
-					const lastColon = versionKey.lastIndexOf(':');
-					if (lastColon === -1) continue;
+				const keying = resolveKeying(tableSnapshot.schema, tableSnapshot.table);
+				const rows = new Map<string, {
+					pk: SqlValue[];
+					pkHlc: HLC;
+					cells: Map<string, { hlc: HLC; value: SqlValue }>;
+				}>();
 
-					// The versionKey carries the SENDER's pk identity + column. File under
-					// that identity verbatim: the receiving table may not exist yet (its
-					// schema arrives in this same snapshot), so no local keying can be
-					// resolved — and sender and receiver share the replicated schema, so
-					// the identities agree.
-					const identity = versionKey.slice(0, lastColon);
-					const column = versionKey.slice(lastColon + 1);
+				for (const cvEntry of tableSnapshot.columnVersions) {
+					const identity = encodePkIdentity(cvEntry.pk, keying);
+					let row = rows.get(identity);
+					if (!row) {
+						row = { pk: cvEntry.pk, pkHlc: cvEntry.hlc, cells: new Map() };
+						rows.set(identity, row);
+					} else if (compareHLC(cvEntry.hlc, row.pkHlc) > 0) {
+						// Address the row by the newest write's spelling (deterministic).
+						row.pk = cvEntry.pk;
+						row.pkHlc = cvEntry.hlc;
+					}
+					const cell = row.cells.get(cvEntry.column);
+					if (!cell || compareHLC(cvEntry.hlc, cell.hlc) > 0) {
+						row.cells.set(cvEntry.column, { hlc: cvEntry.hlc, value: cvEntry.value });
+					}
+				}
 
-					ctx.columnVersions.setColumnVersionByIdentityBatch(
-						applyBatch,
-						tableSnapshot.schema,
-						tableSnapshot.table,
-						identity,
-						cvEntry.pk,
-						column,
-						{ hlc: cvEntry.hlc, value: cvEntry.value },
-					);
-
-					ctx.changeLog.recordColumnChangeByIdentityBatch(
-						applyBatch,
-						cvEntry.hlc,
-						tableSnapshot.schema,
-						tableSnapshot.table,
-						identity,
-						column,
-					);
+				for (const row of rows.values()) {
+					for (const [column, cell] of row.cells) {
+						ctx.columnVersions.setColumnVersionBatch(
+							applyBatch,
+							tableSnapshot.schema,
+							tableSnapshot.table,
+							row.pk,
+							column,
+							{ hlc: cell.hlc, value: cell.value },
+						);
+						ctx.changeLog.recordColumnChangeBatch(
+							applyBatch,
+							cell.hlc,
+							tableSnapshot.schema,
+							tableSnapshot.table,
+							row.pk,
+							column,
+						);
+					}
 				}
 			}
 
@@ -275,14 +326,23 @@ export async function applySnapshot(
 			}
 
 			// Re-write the snapshot's tombstones (the clearBatch above wiped the
-			// receiver's existing ones). Mirrors the streaming consumer.
+			// receiver's existing ones), one per receiver-derived identity, greatest
+			// HLC winning — mirrors the streaming consumer's reconciliation.
 			// NOTE: `setTombstoneBatch` stamps `createdAt = Date.now()` internally and
 			// ignores the sender's `ts.createdAt`, so a bootstrapped tombstone's TTL
 			// horizon re-bases to bootstrap time rather than preserved. Accepted phase-1
 			// behavior (the tombstone lives a full horizon from bootstrap).
+			const tombstoneWinners = new Map<string, SnapshotTombstone>();
 			for (const ts of snapshot.tombstones) {
-				// Sender-identity write, same reasoning as the column versions above.
-				ctx.tombstones.setTombstoneByIdentityBatch(applyBatch, ts.schema, ts.table, ts.identity, ts.pk, ts.hlc, ts.priorRow);
+				const keying = resolveKeying(ts.schema, ts.table);
+				const key = `${ts.schema}\u0000${ts.table}\u0000${encodePkIdentity(ts.pk, keying)}`;
+				const existing = tombstoneWinners.get(key);
+				if (!existing || compareHLC(ts.hlc, existing.hlc) > 0) {
+					tombstoneWinners.set(key, ts);
+				}
+			}
+			for (const ts of tombstoneWinners.values()) {
+				ctx.tombstones.setTombstoneBatch(applyBatch, ts.schema, ts.table, ts.pk, ts.hlc, ts.priorRow);
 			}
 
 			await applyBatch.write();

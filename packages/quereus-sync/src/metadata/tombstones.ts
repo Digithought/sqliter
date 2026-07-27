@@ -155,7 +155,9 @@ export class TombstoneStore {
 
   /**
    * Set tombstone in a batch. `priorRow` (optional) is the row's last-known image,
-   * persisted as best-effort audit/undo metadata.
+   * persisted as best-effort audit/undo metadata. The key's pk IDENTITY is always
+   * derived locally — no caller-supplied-identity variant exists (see
+   * `ColumnVersionStore.setColumnVersionBatch`).
    */
   setTombstoneBatch(
     batch: WriteBatch,
@@ -165,26 +167,7 @@ export class TombstoneStore {
     hlc: HLC,
     priorRow?: Row
   ): void {
-    this.setTombstoneByIdentityBatch(batch, schemaName, tableName, this.identity(schemaName, tableName, pk), pk, hlc, priorRow);
-  }
-
-  /**
-   * Set tombstone in a batch under a caller-supplied pk IDENTITY — the
-   * snapshot-apply path, where the sender's identity travels on the wire and
-   * the receiving table may not exist locally yet (its schema arrives in the
-   * same snapshot). Sender and receiver share the replicated schema, so the
-   * identities agree.
-   */
-  setTombstoneByIdentityBatch(
-    batch: WriteBatch,
-    schemaName: string,
-    tableName: string,
-    identity: string,
-    pk: SqlValue[],
-    hlc: HLC,
-    priorRow?: Row
-  ): void {
-    const key = buildTombstoneKey(schemaName, tableName, identity);
+    const key = buildTombstoneKey(schemaName, tableName, this.identity(schemaName, tableName, pk));
     const tombstone: Tombstone = { hlc, createdAt: Date.now(), pk, ...(priorRow !== undefined ? { priorRow } : {}) };
     batch.put(key, serializeTombstone(tombstone));
   }

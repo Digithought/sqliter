@@ -551,10 +551,15 @@ compares them. A relay-only deployment with no `getTableSchema` oracle keys raw 
 stable for its whole life, since no oracle (and hence no identity flip) can appear later.
 Quarantine (`qt:`) keys always use the raw encoding: a quarantined table is out of the
 local basis, so no schema exists for it, and its `(hlc, type)` component already makes the
-key unique. Snapshot transfers carry the **sender's** identity alongside each entry's raw
-pk, and the receiver files bootstrapped metadata under it verbatim — mid-bootstrap the
-receiving table may not exist yet, and the replicated schema makes both sides' identities
-agree.
+key unique. Snapshot transfers carry **only each entry's raw pk** — no identity travels on
+the wire, and the receiver always **derives its own** identity from the pk, exactly as the
+delta path does. This is what makes bootstrapping from a differently-keyed sender sound: a
+relay-only coordinator keys raw, so it can hold several records for what a schema-holding
+receiver considers one row (`'Apple'`/`'APPLE'` under `nocase`); the receiver collapses
+them onto its own identity, keeping the greatest-HLC entry per cell (and per tombstone) so
+the collapse resolves by last-writer-wins rather than by chunk order. Mid-bootstrap
+ordering is guaranteed by the stream itself: all schema migrations precede all table data,
+so a table exists by the time its entries need keying.
 
 ### Metadata format version
 
@@ -565,6 +570,19 @@ one whose stored version is missing (pre-versioning) or different: old keys are 
 under the new layout and mixing the two would corrupt both. Recovery is to clear the
 replica's sync metadata and re-bootstrap from a peer snapshot; there is no in-place
 rewrite pass.
+
+### Snapshot wire-format version
+
+Snapshots carry their own format stamp, separate from the storage format above:
+`SNAPSHOT_WIRE_FORMAT_VERSION` (currently **1** — explicit `{column, hlc, value, pk}`
+entry records, no identity on the wire), stamped into the streaming header chunk
+(`snapshotFormat`) and the non-streaming `Snapshot`. Both apply paths
+(`applySnapshotStream`, `applySnapshot`) refuse a snapshot whose stamp is missing or
+different **before touching any local state** — the same posture as the `fv:` gate.
+The stamp matters because serialized snapshots outlive the sender process: the
+coordinator's S3 store (`s3-snapshot-store.ts`) persists serialized chunk arrays at
+rest, and an old stored snapshot deserialized by newer code would otherwise silently
+mis-parse entry shapes. Recovery is to regenerate the snapshot from a live peer.
 
 ## Sync Protocol
 
@@ -700,6 +718,7 @@ interface ApplyResult {
 interface Snapshot {
   siteId: SiteId;
   hlc: HLC;
+  snapshotFormat: number;  // wire-format stamp; see § Snapshot wire-format version
   tables: TableSnapshot[];
   schemaMigrations: SchemaMigration[];
   // Global tombstone pass (table-independent) so a fully-deleted row — a
@@ -711,10 +730,10 @@ interface TableSnapshot {
   schema: string;
   table: string;
   rows: Row[];
-  // Keyed `${pkIdentity}:${column}` — the identity groups one row's cells but is
-  // lossy, so each entry carries the row's raw pk alongside its version.
-  // See § Row identity vs. address.
-  columnVersions: Map<string, { hlc: HLC; value: SqlValue; pk: SqlValue[] }>;
+  // One flat record per live cell; only the raw pk travels. The receiver groups
+  // cells into rows under its own DERIVED identity — no sender identity is on
+  // the wire. See § Row identity vs. address.
+  columnVersions: ReadonlyArray<{ column: string; hlc: HLC; value: SqlValue; pk: SqlValue[] }>;
 }
 
 // ============================================================================
@@ -774,7 +793,7 @@ interface SyncManager {
  * `table-start` (which marks the end of the migration section).
  */
 type SnapshotChunk =
-  | SnapshotHeaderChunk      // First; HLC drift-validated here
+  | SnapshotHeaderChunk      // First; snapshotFormat gated + HLC drift-validated here
   | SnapshotSchemaMigrationChunk  // All DDL, before any table data
   | SnapshotTableStartChunk
   | SnapshotColumnVersionsChunk

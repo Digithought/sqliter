@@ -23,9 +23,8 @@ import {
 import { createStoreAdapter, type SyncStoreAdapterOptions } from '../../src/sync/store-adapter.js';
 import type { ApplyToStoreCallback, DataChangeToApply, Snapshot, SnapshotChunk } from '../../src/sync/protocol.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
-import { encodeRawPkIdentity } from '../../src/metadata/keys.js';
 import { SyncEventEmitterImpl, type SyncState, type UnknownTableEvent, type AssertionViolationEvent } from '../../src/sync/events.js';
-import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
+import { DEFAULT_SYNC_CONFIG, SNAPSHOT_WIRE_FORMAT_VERSION } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager } from '../../src/clock/hlc.js';
 import { createInMemoryProvider, collect } from './_peer-harness.js';
@@ -394,9 +393,9 @@ describe('store-adapter seam integration', () => {
 			const remoteHLC = new HLCManager(remoteSiteId);
 			const snapshotId = 'snap-assert-1';
 			const chunks: SnapshotChunk[] = [
-				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 1, migrationCount: 0, snapshotId },
 				{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 0 },
-				{ type: 'column-versions', schema: 'main', table: 't', entries: [[`${encodeRawPkIdentity(['x'])}:v`, remoteHLC.tick(), -7, ['x']]] },
+				{ type: 'column-versions', schema: 'main', table: 't', entries: [{ column: 'v', hlc: remoteHLC.tick(), value: -7, pk: ['x'] }] },
 				{ type: 'table-end', schema: 'main', table: 't', entriesWritten: 1 },
 				{ type: 'footer', snapshotId, totalTables: 1, totalEntries: 1, totalMigrations: 0 },
 			];
@@ -588,12 +587,12 @@ describe('store-adapter seam integration', () => {
 			const snapshot: Snapshot = {
 				siteId: remoteSiteId,
 				hlc: remoteHLC.tick(),
+				snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
 				tables: [{
 					schema: 'main',
 					table: 'no_such_table',
 					rows: [],
-					// versionKey = `${pkIdentity}:${column}`; the raw pk rides in the entry.
-					columnVersions: new Map([[`${encodeRawPkIdentity(['k'])}:v`, { hlc: remoteHLC.tick(), value: 'b', pk: ['k'] }]]),
+					columnVersions: [{ column: 'v', hlc: remoteHLC.tick(), value: 'b', pk: ['k'] }],
 				}],
 				schemaMigrations: [],
 				tombstones: [],
@@ -622,9 +621,9 @@ describe('store-adapter seam integration', () => {
 			const remoteHLC = new HLCManager(remoteSiteId);
 			const snapshotId = 'snap-err-1';
 			const chunks: SnapshotChunk[] = [
-				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 1, migrationCount: 0, snapshotId },
 				{ type: 'table-start', schema: 'main', table: 'no_such_table', estimatedEntries: 0 },
-				{ type: 'column-versions', schema: 'main', table: 'no_such_table', entries: [[`${encodeRawPkIdentity(['k'])}:v`, remoteHLC.tick(), 'b', ['k']]] },
+				{ type: 'column-versions', schema: 'main', table: 'no_such_table', entries: [{ column: 'v', hlc: remoteHLC.tick(), value: 'b', pk: ['k'] }] },
 				{ type: 'table-end', schema: 'main', table: 'no_such_table', entriesWritten: 1 },
 				{ type: 'footer', snapshotId, totalTables: 1, totalEntries: 1, totalMigrations: 0 },
 			];
@@ -771,9 +770,9 @@ describe('store-adapter seam integration', () => {
 
 			// Resumed stream: header (full table count) + tableB only + footer.
 			const chunks: SnapshotChunk[] = [
-				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 2, migrationCount: 0, snapshotId },
+				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 2, migrationCount: 0, snapshotId },
 				{ type: 'table-start', schema: 'main', table: 'tableB', estimatedEntries: 0 },
-				{ type: 'column-versions', schema: 'main', table: 'tableB', entries: [[`${encodeRawPkIdentity(['b1'])}:v`, remoteHLC.tick(), 'bval', ['b1']]] },
+				{ type: 'column-versions', schema: 'main', table: 'tableB', entries: [{ column: 'v', hlc: remoteHLC.tick(), value: 'bval', pk: ['b1'] }] },
 				{ type: 'table-end', schema: 'main', table: 'tableB', entriesWritten: 1 },
 				{ type: 'footer', snapshotId, totalTables: 2, totalEntries: 1, totalMigrations: 0 },
 			];

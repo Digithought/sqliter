@@ -1323,9 +1323,12 @@ describe('Sync Protocol E2E', () => {
       const snapshot = await host.manager.getSnapshot();
       await guest.manager.applySnapshot(snapshot);
 
-      // Guest's data store should have the rows applied via callback
+      // Guest's data store should have the rows applied via callback. The
+      // non-streaming path emits one single-column update per CELL (2 rows ×
+      // 2 columns), HLC-ascending — no receiver keying is resolvable before the
+      // snapshot's own DDL runs, so cells cannot be grouped into rows here.
       const dataChanges = guest.dataStore.changeLog.filter(c => c.type === 'data');
-      expect(dataChanges.length).to.equal(2, 'Snapshot should apply row data to store');
+      expect(dataChanges.length).to.equal(4, 'Snapshot should apply per-cell row data to store');
 
       // Verify actual row data
       const row1 = guest.dataStore.getRow('main', 'users', [1]);
@@ -1688,14 +1691,18 @@ describe('Sync Protocol E2E', () => {
       const snapshotB = await replicaB.manager.getSnapshot();
 
       expect(snapshotA.tables.length).to.equal(snapshotB.tables.length);
-      // Both should have exactly the same column versions
+      // Both should have exactly the same column versions (entries are flat
+      // per-cell records; match them up by raw pk + column).
+      const cellKey = (e: { pk: SqlValue[]; column: string }): string =>
+        `${JSON.stringify(e.pk)}:${e.column}`;
       for (let i = 0; i < snapshotA.tables.length; i++) {
-        expect(snapshotA.tables[i].columnVersions.size).to.equal(
-          snapshotB.tables[i].columnVersions.size
+        expect(snapshotA.tables[i].columnVersions.length).to.equal(
+          snapshotB.tables[i].columnVersions.length
         );
+        const byKeyB = new Map(snapshotB.tables[i].columnVersions.map(e => [cellKey(e), e]));
         // The winning value should be the same on both
-        for (const [key, entryA] of snapshotA.tables[i].columnVersions) {
-          const entryB = snapshotB.tables[i].columnVersions.get(key);
+        for (const entryA of snapshotA.tables[i].columnVersions) {
+          const entryB = byKeyB.get(cellKey(entryA));
           expect(entryB).to.exist;
           expect(entryA.value).to.equal(entryB!.value);
           expect(compareHLC(entryA.hlc, entryB!.hlc)).to.equal(0);

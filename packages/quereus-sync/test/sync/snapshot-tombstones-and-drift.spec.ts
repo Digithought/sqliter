@@ -16,7 +16,7 @@
  */
 
 import { expect } from 'chai';
-import type { ChangeSet, ColumnChange, SnapshotChunk } from '../../src/sync/protocol.js';
+import { SNAPSHOT_WIRE_FORMAT_VERSION, type ChangeSet, type ColumnChange, type SnapshotChunk } from '../../src/sync/protocol.js';
 import { createHLC, MAX_DRIFT_MS, type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { makePeer, closePeer, localWrite, collect, toStream, type Peer } from './_peer-harness.js';
@@ -196,7 +196,7 @@ describe('clock drift is rejected pre-commit', () => {
 		const driftedHeaderHlc = createHLC(BigInt(Date.now()) + MAX_DRIFT_MS + 5000n, 0, remoteSite);
 		const snapshotId = 'snap-drift-header-1';
 		const chunks: SnapshotChunk[] = [
-			{ type: 'header', siteId: remoteSite, hlc: driftedHeaderHlc, tableCount: 0, migrationCount: 0, snapshotId },
+			{ type: 'header', siteId: remoteSite, hlc: driftedHeaderHlc, snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION, tableCount: 0, migrationCount: 0, snapshotId },
 			{ type: 'footer', snapshotId, totalTables: 0, totalEntries: 0, totalMigrations: 0 },
 		];
 
