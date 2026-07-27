@@ -9,6 +9,11 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import Table from 'cli-table3';
+import { installRemotePluginResolver } from '../plugins/remote-resolver.js';
+
+// Must run before any plugin is loaded — config autoload, saved-plugin autoload,
+// and `.plugin install <url>` all reach the loader through this one resolver.
+installRemotePluginResolver();
 
 /** Options parsed by commander from the `quoomb` argv. */
 interface CliOptions {

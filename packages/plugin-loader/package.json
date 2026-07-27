@@ -20,6 +20,18 @@
     ".": {
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"
+    },
+    "./node": {
+      "types": "./dist/src/node-remote.d.ts",
+      "import": "./dist/src/node-remote.js"
+    }
+  },
+  "//typesVersions": "NOTE: consumers still compile with moduleResolution 'node' (node10), which ignores the exports map above. typesVersions is how the './node' subpath's types resolve for them; drop it once every consumer moves to node16/bundler resolution.",
+  "typesVersions": {
+    "*": {
+      "node": [
+        "./dist/src/node-remote.d.ts"
+      ]
     }
   },
   "scripts": {
@@ -28,7 +40,7 @@
     "lint": "echo 'No lint configured'",
     "//typecheck": "NOTE: the second pass type-checks test/ too (tsconfig.json only includes src/). vitest transpiles specs without checking them, so without this a signature change in src/ would leave the specs silently stale.",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "//test": "NOTE: test/ covers url validation + the loader's protocol allowlist, npm-spec parsing, CDN url building, env detection, loadPlugin dispatch, config interpolation/validation, and the config channel. Known gaps (all need network or a DOM): https:// module loads, manifest fetch from a plugin's package.json, and the real browser+CDN load path. --passWithNoTests is deliberately NOT set, so a glob that stops matching fails loudly instead of reporting green.",
+    "//test": "NOTE: test/ covers url validation + the loader's protocol allowlist, npm-spec parsing, CDN url building, env detection, loadPlugin dispatch, config interpolation/validation, the config channel, and https:// module loads through the Node remote resolver (with fetch injected, so no test touches the network). Known gaps (both need network or a DOM): the manifest fetch from a plugin's package.json, and the real browser+CDN load path. --passWithNoTests is deliberately NOT set, so a glob that stops matching fails loudly instead of reporting green.",
     "test": "vitest run"
   },
   "peerDependencies": {

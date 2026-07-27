@@ -21,6 +21,39 @@ export interface PluginModule {
 	default: (db: Database, config?: Record<string, SqlValue>) => Promise<PluginRegistrations> | PluginRegistrations;
 }
 
+/** What a host learns about a plugin module it fetched over the network. */
+export interface RemoteModuleFetch {
+	/** The URL that was requested (before any redirects). */
+	url: string;
+	/** SHA-256 of the fetched bytes, lowercase hex. */
+	sha256: string;
+	/** Size of the fetched module, in bytes. */
+	bytes: number;
+}
+
+/**
+ * Turns an `https:` module URL into a specifier this runtime's `import()` can
+ * load — under Node, a `file:` URL for a locally fetched copy.
+ *
+ * Node hosts must install one (see `@quereus/plugin-loader/node`), because
+ * Node's ESM loader accepts only `file:` and `data:` URLs. Browsers and workers
+ * need none — `import('https://…')` works there natively.
+ */
+export type RemoteModuleResolver = (url: URL) => Promise<string>;
+
+/**
+ * Module-level singleton rather than a `dynamicLoadModule` option: the loader
+ * has many call sites across the CLI and the web worker, and threading a
+ * resolver through all of them buys nothing over the host installing it once at
+ * startup.
+ */
+let remoteModuleResolver: RemoteModuleResolver | null = null;
+
+/** Installs (or, with `null`, clears) the resolver used for `https:` module loads. */
+export function setRemoteModuleResolver(resolver: RemoteModuleResolver | null): void {
+	remoteModuleResolver = resolver;
+}
+
 interface PackageJson {
 	name?: string;
 	version?: string;
@@ -106,28 +139,87 @@ export async function dynamicLoadModule(
 			);
 		}
 
-		// Add cache-busting timestamp for local development.
-		// NOTE: each reload imports a distinct specifier, so Node keeps every
-		// prior version of the module in its registry. Harmless for a CLI or a
-		// dev session; if a long-lived host starts reloading plugins in a loop,
-		// it needs a real unload story rather than a new query string per load.
-		if (moduleUrl.protocol === 'file:' || moduleUrl.hostname === 'localhost') {
-			moduleUrl.searchParams.set('t', Date.now().toString());
-		}
+		const specifier = await resolveImportSpecifier(moduleUrl);
 
 		// Dynamic import with Vite ignore comment for bundler compatibility
-		const mod: unknown = await import(/* @vite-ignore */ moduleUrl.toString());
+		const mod: unknown = await import(/* @vite-ignore */ specifier);
 
 		assertValidPluginModule(mod, url);
 
 		await registerPlugin(db, mod.default, config);
 		log('Loaded plugin from %s', url);
 
+		// Deliberately the *original* URL, not `specifier`: a remote resolver
+		// hands back a local temp file, and resolving 'package.json' against that
+		// would look in the temp directory instead of beside the plugin.
 		return await tryLoadManifestFromUrl(moduleUrl);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`Failed to load plugin from ${url}: ${message}`);
 	}
+}
+
+/**
+ * Turns a validated plugin module URL into a specifier this runtime's `import()`
+ * can actually load.
+ *
+ * Never mutates `moduleUrl` — the caller still needs the original to resolve the
+ * plugin's `package.json` against.
+ */
+async function resolveImportSpecifier(moduleUrl: URL): Promise<string> {
+	if (moduleUrl.protocol === 'file:') {
+		return withCacheBuster(moduleUrl);
+	}
+
+	// Only `https:` reaches here (the allowlist rejected everything else).
+	// A host-installed resolver wins wherever one exists; failing that, Node
+	// cannot import the URL at all, while browsers and workers do it natively.
+	if (remoteModuleResolver) {
+		return await remoteModuleResolver(moduleUrl);
+	}
+	if (isNodeRuntime()) {
+		throw new Error(
+			`Loading a plugin over https:// is not supported by Node's ESM loader. ` +
+			`Install the Node resolver (installNodeRemoteModuleResolver() from ` +
+			`'@quereus/plugin-loader/node'), or load the plugin from an installed npm ` +
+			`package or a file:// URL.`
+		);
+	}
+
+	// Browser or worker: `import('https://…')` is native. Cache-bust a local dev
+	// server so a rebuilt plugin is picked up without a hard reload.
+	return moduleUrl.hostname === 'localhost' ? withCacheBuster(moduleUrl) : moduleUrl.toString();
+}
+
+/**
+ * True when this runtime is Node, whose ESM loader accepts only `file:` and
+ * `data:` specifiers.
+ *
+ * Deliberately not `resolveEnvironment() === 'node'`: that treats "no `document`"
+ * as Node, and a Web Worker — which is where quoomb-web loads its plugins —
+ * has no `document` yet imports `https:` URLs natively. A bundler's `process`
+ * shim declares no `versions.node`, so it does not trip this either.
+ *
+ * @internal Exported for tests only — see {@link resolveEnvironment}.
+ */
+export function isNodeRuntime(): boolean {
+	const proc = (globalThis as { process?: { versions?: { node?: string } } }).process;
+	return typeof proc?.versions?.node === 'string';
+}
+
+/**
+ * Returns `moduleUrl` with a fresh `?t=` stamp, so a reload re-evaluates the
+ * module instead of getting the copy already in the module registry.
+ *
+ * NOTE: each reload therefore imports a distinct specifier, so Node keeps every
+ * prior version of the module in its registry. Harmless for a CLI or a dev
+ * session; if a long-lived host starts reloading plugins in a loop, it needs a
+ * real unload story rather than a new query string per load.
+ */
+function withCacheBuster(moduleUrl: URL): string {
+	const busted = new URL(moduleUrl.href);
+	busted.searchParams.set('t', Date.now().toString());
+	return busted.toString();
 }
 
 /**

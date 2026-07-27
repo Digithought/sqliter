@@ -8,8 +8,16 @@
  */
 
 // Re-export plugin loader functions
-export { dynamicLoadModule, validatePluginUrl, loadPlugin } from './plugin-loader.js';
-export type { PluginModule, LoadPluginOptions } from './plugin-loader.js';
+export { dynamicLoadModule, validatePluginUrl, loadPlugin, setRemoteModuleResolver } from './plugin-loader.js';
+export type {
+	PluginModule,
+	LoadPluginOptions,
+	RemoteModuleFetch,
+	RemoteModuleResolver
+} from './plugin-loader.js';
+// The Node implementation of the resolver is deliberately NOT re-exported here —
+// it imports node:fs, so it lives behind the '@quereus/plugin-loader/node' subpath
+// where a browser bundle will never reach it.
 
 // Re-export manifest types
 export type {

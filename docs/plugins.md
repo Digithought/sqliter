@@ -881,7 +881,10 @@ const db = new Database();
 // 1) Load from npm package name (Node):
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, { api_key: '...' });
 
-// 2a) Load from a direct https:// URL (Browser only — see note below):
+// 2a) Load from a direct https:// URL. Native in the browser; in Node this
+//     needs the remote resolver installed once at startup (see note below):
+import { installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
+installNodeRemoteModuleResolver();
 await dynamicLoadModule('https://example.com/plugin.js', db, { timeout: 10000 });
 
 // 2b) Load from a direct file:// URL (Node):
@@ -893,7 +896,23 @@ await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, { timeout: 8000 }, { all
 
 Behavior:
 - Allowed module protocols are `https:` and `file:` — enforced inside `dynamicLoadModule`, so any other scheme is refused before an import is attempted.
-- **`https:` module loads work in the browser only.** Node's ESM loader accepts only `file:` and `data:` URLs (network imports were experimental and have been removed), so `dynamicLoadModule('https://…')` under Node fails with `ERR_UNSUPPORTED_ESM_URL_SCHEME`, wrapped as `Failed to load plugin from …`. In Node, load plugins from an installed npm package or a `file://` URL.
+- **`https:` module loads need a resolver under Node.** Browsers `import('https://…')` natively. Node's ESM loader does not — it accepts only `file:` and `data:` URLs (network imports were experimental and have been removed) — so the loader delegates to a resolver the host installs:
+
+  ```typescript
+  import { installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
+
+  installNodeRemoteModuleResolver({
+    // Called after each fetch, before the module is imported. Awaited.
+    onFetched: ({ url, sha256, bytes }) => console.log(`Fetched ${url} (${bytes} B, sha256 ${sha256})`),
+    maxBytes: 5 * 1024 * 1024,   // default
+  });
+  ```
+
+  The resolver fetches the module, checks that redirects stayed on `https:`, enforces the size cap against both the declared `content-length` and the bytes actually received, SHA-256s them, writes them to a temp file (`<tmpdir>/quereus-plugins-<pid>-<random>/<hash>-<n>.mjs`), and hands the loader that file's `file:` URL. The temp directory is removed when the process exits; files are kept until then so stack traces from inside the plugin still resolve.
+
+  It lives behind the `@quereus/plugin-loader/node` subpath, not the package index, so a browser or React Native bundle never pulls in `node:fs`. Any Node host wanting remote plugins installs it — the quoomb CLI does so at startup, and prints one line per fetch. Without it, a Node-side `https:` load fails with a message saying so, rather than `ERR_UNSUPPORTED_ESM_URL_SCHEME`.
+
+  There is no on-disk cache: a plugin saved by URL re-downloads and re-executes remote code on every host start. That is why `onFetched` exists — hosts are expected to surface the fetch rather than let it happen silently. The CLI additionally records the hash in `~/.quoomb/plugins.json` (`PluginRecord.sha256`) and warns when the module behind a URL has changed since it was installed; it warns and continues rather than blocking.
 - npm package resolution prefers the `exports['./plugin']` subpath. In Node, the package is loaded directly. In browsers, npm resolution is disabled by default; enabling it requires `{ allowCdn: true }` and maps to a CDN URL.
 - Version compatibility: if the package declares `engines.quereus` or a `peerDependency` on `@quereus/quereus`, hosts should throw when incompatible (error, not warning).
 

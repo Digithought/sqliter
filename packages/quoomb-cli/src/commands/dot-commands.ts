@@ -6,6 +6,7 @@ import * as path from 'path';
 import Papa from 'papaparse';
 import { dynamicLoadModule, validatePluginUrl } from '@quereus/plugin-loader';
 import type { PluginRecord, PluginSetting } from '@quereus/plugin-loader';
+import { getLastFetchedHash } from '../plugins/remote-resolver.js';
 import type { SqlValue } from '@quereus/quereus';
 import type { Interface as ReadlineInterface } from 'node:readline';
 import os from 'os';
@@ -403,6 +404,42 @@ const savePlugins = async (plugins: PluginRecord[]): Promise<void> => {
   await fs.writeFile(filePath, JSON.stringify(plugins, null, 2));
 };
 
+/**
+ * Reconciles a plugin record's recorded module hash against the bytes actually
+ * fetched for it a moment ago. No-op for plugins that were not fetched over the
+ * network (a `file:` URL never is).
+ *
+ * Remote plugin code can change under a stable URL, so a mismatch is worth
+ * shouting about — but we warn and continue rather than block: refusing to load
+ * changed code is a bigger policy call than the CLI should make on its own.
+ * `adopt` marks a load the user explicitly asked for (install, enable, reload),
+ * where taking the new hash as expected is the point; startup autoload leaves
+ * the record alone so it keeps warning until the user acts on it.
+ *
+ * @returns true when the record changed and the caller should save it.
+ */
+const reconcilePluginHash = (plugin: PluginRecord, adopt: boolean): boolean => {
+  const fetched = getLastFetchedHash(plugin.url);
+  if (!fetched || fetched === plugin.sha256) {
+    return false;
+  }
+
+  // No recorded hash means a legacy record or a first install — trust what we
+  // just fetched and start comparing from here.
+  if (plugin.sha256) {
+    console.log(chalk.yellow(`Warning: the module at ${plugin.url} has changed since it was installed.`));
+    console.log(chalk.yellow(`  recorded sha256 ${plugin.sha256}`));
+    console.log(chalk.yellow(`  fetched  sha256 ${fetched}`));
+    if (!adopt) {
+      console.log(chalk.yellow(`  Run '.plugin reload ${plugin.manifest?.name ?? '<name>'}' to accept the new version.`));
+      return false;
+    }
+  }
+
+  plugin.sha256 = fetched;
+  return true;
+};
+
 const installPluginCommand = async (args: string[], db: Database): Promise<void> => {
   if (args.length === 0) {
     console.log('Usage: .plugin install <url>');
@@ -432,13 +469,15 @@ const installPluginCommand = async (args: string[], db: Database): Promise<void>
       return;
     }
 
-    // Create plugin record
+    // Create plugin record, remembering what was fetched so a later load can
+    // tell that the code behind this URL changed.
     const pluginRecord: PluginRecord = {
       id: crypto.randomUUID(),
       url,
       enabled: true,
       manifest,
       config: {},
+      sha256: getLastFetchedHash(url),
     };
 
     // Add to list and save
@@ -508,6 +547,7 @@ const enablePluginCommand = async (args: string[], db: Database): Promise<void> 
     if (manifest) {
       plugin.manifest = manifest;
     }
+    reconcilePluginHash(plugin, true);
 
     await savePlugins(plugins);
     console.log(`Enabled plugin: ${name}`);
@@ -640,6 +680,9 @@ const configPluginCommand = async (args: string[], db: Database): Promise<void> 
   if (plugin.enabled) {
     try {
       await dynamicLoadModule(plugin.url, db, plugin.config);
+      if (reconcilePluginHash(plugin, true)) {
+        await savePlugins(plugins);
+      }
       console.log(`Updated configuration and reloaded plugin: ${name}`);
     } catch (error) {
       console.log(`Configuration updated but failed to reload plugin: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -673,8 +716,11 @@ const reloadPluginCommand = async (args: string[], db: Database): Promise<void> 
     const manifest = await dynamicLoadModule(plugin.url, db, plugin.config);
 
     // Update manifest if it changed
+    const hashChanged = reconcilePluginHash(plugin, true);
     if (manifest) {
       plugin.manifest = manifest;
+    }
+    if (manifest || hashChanged) {
       await savePlugins(plugins);
     }
 
@@ -693,9 +739,16 @@ export const loadEnabledPlugins = async (db: Database): Promise<void> => {
     try {
       const manifest = await dynamicLoadModule(plugin.url, db, plugin.config);
 
+      // Autoload is not an explicit request for *this* plugin, so a changed hash
+      // only warns here — it is adopted when the user installs or reloads.
+      const hashChanged = reconcilePluginHash(plugin, false);
+
       // Update manifest if it changed
-      if (manifest && (!plugin.manifest || plugin.manifest.version !== manifest.version)) {
+      const manifestChanged = manifest !== undefined && (!plugin.manifest || plugin.manifest.version !== manifest.version);
+      if (manifestChanged) {
         plugin.manifest = manifest;
+      }
+      if (manifestChanged || hashChanged) {
         await savePlugins(plugins);
       }
     } catch (error) {

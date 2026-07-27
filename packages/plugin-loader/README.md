@@ -26,7 +26,7 @@ const db = new Database();
 // Load from npm package (Node.js)
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, { api_key: '...' });
 
-// Load from an https:// URL (Browser only — Node's ESM loader rejects https:)
+// Load from an https:// URL. Native in the browser; Node needs the resolver below.
 await dynamicLoadModule('https://example.com/plugin.js', db, { timeout: 10000 });
 
 // Load from a local file (Node.js)
@@ -35,6 +35,37 @@ await dynamicLoadModule('file:///path/to/plugin.mjs', db, { timeout: 10000 });
 // Browser with CDN (opt-in)
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, {}, { allowCdn: true });
 ```
+
+## Loading plugins over `https:` in Node
+
+Browsers implement `import('https://…')`; Node's ESM loader does not — it accepts
+only `file:` and `data:` URLs. A Node host that wants remote plugins installs the
+resolver from the `./node` subpath once at startup:
+
+```typescript
+import { installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
+
+installNodeRemoteModuleResolver({
+  // Awaited after each fetch, before the module is imported.
+  onFetched: ({ url, sha256, bytes }) => console.log(`Fetched ${url} (${bytes} B, sha256 ${sha256})`),
+  maxBytes: 5 * 1024 * 1024,   // default
+});
+```
+
+The resolver fetches the module, refuses a redirect that leaves `https:`, enforces
+the size cap, SHA-256s the bytes, writes them to a temp file, and hands the loader
+that file's `file:` URL. Temp files live for the life of the process (so plugin
+stack traces resolve) and the directory is removed at exit.
+
+This entry point imports `node:fs` and is therefore deliberately kept out of the
+package index — a browser or React Native bundle never reaches it. Without a
+resolver installed, an `https:` load under Node fails with a message saying which
+resolver to install.
+
+Nothing is cached on disk: each load re-downloads and re-executes the remote
+module, so hosts should use `onFetched` to make that visible. See
+[Plugin System Documentation](https://github.com/gotchoices/quereus/blob/main/docs/plugins.md)
+for the full picture.
 
 ## React Native
 

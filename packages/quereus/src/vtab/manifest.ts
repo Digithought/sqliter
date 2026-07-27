@@ -88,4 +88,11 @@ export interface PluginRecord {
 	enabled: boolean;               // Whether to load at startup
 	manifest?: PluginManifest;      // Cached after first successful load
 	config: Record<string, SqlValue>; // User-configured values
+	/**
+	 * SHA-256 (lowercase hex) of the module bytes last fetched from `url`, when
+	 * the host fetched them over the network. Lets a host notice that remote
+	 * code served from a stable URL has changed since it was installed. Absent
+	 * for records installed before this was recorded, and for `file:` plugins.
+	 */
+	sha256?: string;
 }
