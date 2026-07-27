@@ -531,13 +531,15 @@ async function applySchemaChange(
   change: SchemaChangeToApply,
   _options: ApplyToStoreOptions
 ): Promise<void> {
-  // Every store schema event except `create_table` replicates with a blank `ddl`
-  // (bug-sync-schema-migrations-replicate-empty-ddl). Such a migration runs
-  // nothing, so it also EMITS nothing — registering a remote-event expectation
-  // for it would leave that expectation pending forever (the emitter refcounts
-  // expectations and never expires them), and the next genuine LOCAL DDL of the
-  // same signature would be consumed by it, marked remote, and dropped from the
-  // SyncManager's local-fact capture — silently never replicated.
+  // A blank `ddl` still reaches here: the four object-lifecycle migrations
+  // (create/drop table, add/drop index) now carry canonical text, but the
+  // `*_column` migrations do not, and a peer on an older build still sends blank
+  // drop/index migrations. Such a migration runs nothing, so it also EMITS
+  // nothing — registering a remote-event expectation for it would leave that
+  // expectation pending forever (the emitter refcounts expectations and never
+  // expires them), and the next genuine LOCAL DDL of the same signature would be
+  // consumed by it, marked remote, and dropped from the SyncManager's local-fact
+  // capture — silently never replicated.
   if (change.ddl.trim() === '') return;
 
   // Decide BEFORE registering the remote-event expectation, for the same reason:

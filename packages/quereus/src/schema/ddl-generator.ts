@@ -207,6 +207,13 @@ export function generateIndexDDL(
  * lifecycle. Always fully qualified (same {@link quoteName} policy as the CREATE
  * side) so the statement targets the intended schema regardless of the executing
  * session's current schema — which is what makes it safe to ship to a sync peer.
+ *
+ * NOTE: the two drop generators emit lowercase keywords (the repo convention)
+ * while the CREATE generators above emit uppercase (their output is compared
+ * byte-for-byte against persisted catalog text). Nothing compares drop text —
+ * both sync and the catalog treat a drop as presence, not as a string — so the
+ * split is harmless today. If a drop's text ever becomes a comparison key, the
+ * casing must be pinned on both sides first.
  */
 export function generateDropTableDDL(schemaName: string, tableName: string): string {
 	return `drop table ${quoteName(schemaName)}.${quoteName(tableName)}`;

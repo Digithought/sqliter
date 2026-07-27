@@ -30,6 +30,7 @@ import {
 
 const NOTE_INDEX = 'idx_orders_note';
 const CREATE_NOTE_INDEX = `create index ${NOTE_INDEX} on orders (note)`;
+const UNIQUE_INDEX = 'idx_orders_note_uq';
 
 /** Two peers that each already created the identical `orders` table. */
 async function makeSyncedPair(): Promise<[Peer, Peer]> {
@@ -96,8 +97,10 @@ describe('schema DDL replication', () => {
 			await localWrite(a, 'drop table orders');
 			const sets = await a.manager.getChangesSince(b.manager.getSiteId());
 
-			// Applying the SAME batch twice: the second pass finds the table already
-			// gone and must converge rather than fail "no such table".
+			// Applying the SAME batch twice must converge rather than fail "no such
+			// table". The second pass is absorbed by the migration-version guard in
+			// `change-applicator` (already recorded at that version with an equal HLC),
+			// so the drop never re-executes.
 			await b.manager.applyChanges(sets);
 			await b.manager.applyChanges(sets);
 
@@ -159,12 +162,53 @@ describe('schema DDL replication', () => {
 			await relayAll(a, b);
 
 			expect(findIndex(b, 'orders', NOTE_INDEX), 'index on b').to.not.be.undefined;
-			// Both peers must render the SAME canonical DDL, or the receiver's
-			// already-applied check would report a conflict instead of converging.
+			// Replaying the origin's text must land an index the receiver renders
+			// identically — the receiver's already-applied check compares rendered
+			// strings, so a rendering difference would surface as a conflict.
 			expect(indexDDL(b, 'orders', NOTE_INDEX)).to.equal(indexDDL(a, 'orders', NOTE_INDEX));
 		});
 
+		it('replicates a unique partial index and keeps it enforcing on the receiver', async () => {
+			await localWrite(a, `create unique index ${UNIQUE_INDEX} on orders (note) where note is not null`);
+
+			await relayAll(a, b);
+
+			const replicated = findIndex(b, 'orders', UNIQUE_INDEX);
+			expect(replicated, 'index on b').to.not.be.undefined;
+			expect(replicated!.unique, 'unique flag survived the round trip').to.equal(true);
+			expect(indexDDL(b, 'orders', UNIQUE_INDEX)).to.equal(indexDDL(a, 'orders', UNIQUE_INDEX));
+
+			// The UNIQUE / WHERE clauses are not decoration: a duplicate must be
+			// rejected on the receiver exactly as it would be on the origin.
+			await b.db.exec("insert into orders values (1, 'dup')");
+			let caught: Error | undefined;
+			try {
+				await b.db.exec("insert into orders values (2, 'dup')");
+			} catch (e) {
+				caught = e as Error;
+			}
+			expect(caught, 'duplicate rejected on b').to.be.instanceOf(Error);
+		});
+
+		it('converges through the already-applied branch when the receiver created it first', async () => {
+			// b writes FIRST, so a's migration carries the strictly greater HLC and is
+			// admitted instead of being skipped as HLC-dominated. It therefore reaches
+			// `decideSchemaChange`, which regenerates b's local CREATE INDEX and compares
+			// it byte-for-byte against the text a put on the wire — the only end-to-end
+			// check that an origin's emitted DDL matches what a receiver renders. A
+			// mismatch throws the same conflict as a genuinely divergent definition.
+			await localWrite(b, CREATE_NOTE_INDEX);
+			await localWrite(a, CREATE_NOTE_INDEX);
+
+			await relayAll(a, b);
+
+			expect(findIndex(b, 'orders', NOTE_INDEX), 'index on b').to.not.be.undefined;
+		});
+
 		it('converges when the receiver independently created the identical index', async () => {
+			// The reverse HLC order of the test above: a's migration is dominated by b's
+			// own at the same schema version, so `change-applicator` skips it before the
+			// adapter sees it. Convergence here is the skip, not the DDL comparison.
 			await localWrite(a, CREATE_NOTE_INDEX);
 			await localWrite(b, CREATE_NOTE_INDEX);
 
@@ -174,6 +218,9 @@ describe('schema DDL replication', () => {
 		});
 
 		it('converges when the same batch is applied twice', async () => {
+			// The second pass is absorbed by the migration-version guard in
+			// `change-applicator` (the migration is already recorded at that version
+			// with an equal HLC), so the DDL never re-executes.
 			await localWrite(a, CREATE_NOTE_INDEX);
 			const sets = await a.manager.getChangesSince(b.manager.getSiteId());
 
@@ -231,6 +278,8 @@ describe('schema DDL replication', () => {
 		});
 
 		it('converges when the same batch is applied twice', async () => {
+			// As for create index, the second pass is absorbed by the migration-version
+			// guard in `change-applicator`, not by the adapter.
 			await localWrite(a, CREATE_NOTE_INDEX);
 			await relayAll(a, b);
 			await localWrite(a, `drop index ${NOTE_INDEX}`);
@@ -243,12 +292,18 @@ describe('schema DDL replication', () => {
 		});
 
 		it('converges when the receiver never had the index', async () => {
-			// b never received the create, so the drop arrives for an index it does
-			// not have — the already-applied branch.
+			// Drop the `add_index` migration out of the relayed batch so b genuinely
+			// never creates the index and the `drop_index` arrives for something it does
+			// not have — the adapter's already-applied branch. Relaying the batch intact
+			// would ship the create too, and b would create then drop.
 			await localWrite(a, CREATE_NOTE_INDEX);
 			await localWrite(a, `drop index ${NOTE_INDEX}`);
 
-			await relayAll(a, b);
+			const sets = await a.manager.getChangesSince(b.manager.getSiteId());
+			await b.manager.applyChanges(sets.map(cs => ({
+				...cs,
+				schemaMigrations: cs.schemaMigrations.filter(m => m.type !== 'add_index'),
+			})));
 
 			expect(findIndex(b, 'orders', NOTE_INDEX), 'index on b').to.be.undefined;
 		});

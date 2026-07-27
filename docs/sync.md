@@ -1551,12 +1551,23 @@ private shouldApplySchemaChange(remote: SchemaChange, local: SchemaVersion): boo
 
 ### Idempotent DDL application
 
-Replicated DDL is applied **idempotently**. Two peers that are offline at the
-same time can each run the same `create table orders`, and the migration that
-wins the HLC comparison is then delivered to a peer that already has the table.
-So before executing anything, the store adapter (`store-adapter.ts` §
-`decideSchemaChange`) checks whether the named object is already in the
-migration's wanted state:
+Replicated DDL is applied **idempotently**, by two independent gates.
+
+The **first** is in `change-applicator.ts`, before the adapter is involved at
+all: an incoming migration is looked up by `(schema, object name, schema
+version)`, and if one is already recorded there with an HLC greater than or
+equal to the incoming one, it is skipped and counted. This is what absorbs the
+ordinary cases — the same batch delivered twice, or a migration the receiver
+already originated itself. Note the object identity here is the *object's own
+name*: for an index migration that is the index name, with no table component.
+
+The **second** gate only sees migrations the first admitted: a migration whose
+version slot is free, or whose HLC beats what is recorded there. Two peers that
+were offline at the same time can each run the same `create table orders`, and
+the one that wins the HLC comparison is then delivered to a peer that already
+has the table. So before executing anything, the store adapter
+(`store-adapter.ts` § `decideSchemaChange`) checks whether the named object is
+already in the migration's wanted state:
 
 | Situation | Outcome |
 |---|---|
