@@ -465,10 +465,10 @@ export class MemoryTableManager {
 		// `baseLayer` by ALTER TABLE) or carries an out-of-date schema, leave
 		// it alone — committing such a layer would supplant the schema-aware
 		// committed head with stale data.
+		let refusedSnapshotWrap = false;
 		if (!connection.pendingTransactionLayer
 			&& connection.readLayer !== this._currentCommittedLayer
-			&& connection.readLayer instanceof TransactionLayer
-			&& connection.readLayer.getSchema() === this.tableSchema) {
+			&& connection.readLayer instanceof TransactionLayer) {
 			let walker: Layer | null = connection.readLayer.getParent();
 			let isAhead = false;
 			while (walker) {
@@ -479,18 +479,34 @@ export class MemoryTableManager {
 				walker = walker.getParent();
 			}
 			if (isAhead) {
-				connection.pendingTransactionLayer = new TransactionLayer(connection.readLayer);
-				if (this.eventEmitter?.hasDataListeners?.()) {
-					connection.pendingTransactionLayer.enableChangeTracking();
+				if (connection.readLayer.getSchema() === this.tableSchema) {
+					connection.pendingTransactionLayer = new TransactionLayer(connection.readLayer);
+					if (this.eventEmitter?.hasDataListeners?.()) {
+						connection.pendingTransactionLayer.enableChangeTracking();
+					}
+				} else {
+					// A snapshot AHEAD of the head whose schema object nonetheless predates the
+					// manager's: some schema-mutating arm failed to hand its new TableSchema to
+					// the open layers (`adoptSchemaOnOpenLayers` and friends). Refusing the wrap
+					// is still the safe call, but it discards every row the transaction staged,
+					// so flag it for the warning below rather than let COMMIT report success over
+					// a silent data loss.
+					refusedSnapshotWrap = true;
 				}
 			}
 		}
 
 		const pendingLayer = connection.pendingTransactionLayer;
 		if (!pendingLayer) {
+			if (refusedSnapshotWrap) {
+				logger.warn('Commit Transaction', this._tableName,
+					'Discarding staged rows: savepoint snapshot carries a schema object older than the table\'s. A schema-mutating arm did not adopt its new schema on the open transaction layers.',
+					{ schemaName: this.schemaName, connectionId: connection.connectionId });
+			}
 			// No pending — refresh readLayer to the current committed head so a
 			// stale ancestor (post-schema-change) doesn't leak into the next
-			// statement's view.
+			// statement's view. (The ordinary read-only / no-writes commit lands
+			// here too, which is why the warning above is gated.)
 			connection.readLayer = this._currentCommittedLayer;
 			return;
 		}
@@ -543,6 +559,15 @@ export class MemoryTableManager {
 					// since the pending layer forked. Replaying stale-schema rows onto
 					// the new-schema head is unsafe — abort with BUSY rather than corrupt
 					// the committed head (mirrors the stale-ancestor caution above).
+					//
+					// NOTE: `adoptSchemaOnOpenLayers` only walks the DDL connection's own chain,
+					// so a SIBLING connection's pending layer keeps its creation-time schema
+					// object even after a metadata-only change like `RENAME TO` that moves no
+					// rows — which would make this arm fire spuriously. Not reachable from SQL
+					// today: `renameTable` never calls `ensureSchemaChangeSafety`, and a single
+					// Database runs one transaction at a time. If sibling connections ever hold
+					// concurrent pending layers over one manager, compare column shape here
+					// rather than schema-object identity.
 					if (pendingLayer.getSchema() !== this.tableSchema) {
 						connection.pendingTransactionLayer = null;
 						connection.clearSavepoints();
@@ -1494,10 +1519,28 @@ export class MemoryTableManager {
 
 	public renameTable(newName: string): void {
 		logger.operation('Rename Table', this._tableName, { newName });
-		this._tableName = newName;
 		const renamed = Object.freeze({ ...this.tableSchema, name: newName });
+
+		// Re-key the Database connection registry FIRST, while it still answers to the old
+		// name. Every registry lookup below (`adoptSchemaOnOpenLayers` walks
+		// `openTransactionLayersOldestFirst` -> `ddlConnection` -> `registeredConnections`)
+		// keys on `<schema>.<current name>`, so a sweep run after `_tableName` moves would
+		// match nothing and silently no-op.
+		this.rekeyRegisteredConnections(this._tableName, newName);
+
+		this._tableName = newName;
 		this.tableSchema = renamed;
 		this.baseLayer.tableSchema = renamed;
+
+		// Hand the renamed schema to the open transaction's layers, like every other
+		// schema-mutating arm. A rename rebuilds no `IndexSchema`, so `adoptSchema` is the
+		// right (cheapest) level — each layer keeps its `MemoryIndex` and only swaps the
+		// schema pointer; the reshape pair ADD/DROP COLUMN need would be pure overhead.
+		// Skipping it leaves an eager savepoint snapshot on its frozen pre-rename schema
+		// object, which fails `commitTransaction`'s snapshot-wrap identity check
+		// (`readLayer.getSchema() === this.tableSchema`) and drops the transaction's staged
+		// rows at COMMIT.
+		this.adoptSchemaOnOpenLayers(renamed);
 
 		// Emit schema change event
 		this.eventEmitter?.emitSchemaChange?.({
@@ -3248,6 +3291,33 @@ export class MemoryTableManager {
 			if (mc.readLayer === this.baseLayer) continue;
 			logger.debugLog(`[Schema Safety] Re-pointing registered connection ${mc.connectionId} to base layer`);
 			mc.readLayer = this.baseLayer;
+		}
+	}
+
+	/**
+	 * Moves this manager's Database-registered connections from `<schema>.<oldName>` to
+	 * `<schema>.<newName>`, for `ALTER TABLE ... RENAME TO`.
+	 *
+	 * `MemoryVirtualTableConnection.tableName` is set once at registration, and
+	 * `Database.getConnectionsForTable` matches on exactly that string — so without this
+	 * sweep a rename makes the transaction's own connection invisible to
+	 * {@link registeredConnections} and everything built on it: {@link ddlConnection},
+	 * {@link knownConnections}, {@link repointRegisteredConnections},
+	 * {@link openTransactionLayersOldestFirst}. The visible symptom is a second ALTER in
+	 * the same transaction failing with BUSY — {@link ensureSchemaChangeSafety} exempts
+	 * `ddlConnection()` from its "nobody else may hold open work" sweep, and with the
+	 * registry stale that is `undefined`, so the transaction's own connection is judged a
+	 * stranger. `MemoryTable.ensureConnection` would likewise stop reusing it and register
+	 * a second connection for the same table.
+	 *
+	 * Must run BEFORE `_tableName` moves — it looks the connections up under the old name.
+	 */
+	private rekeyRegisteredConnections(oldName: string, newName: string): void {
+		const newQualifiedName = `${this.schemaName}.${newName}`;
+		for (const c of this.db.getConnectionsForTable(`${this.schemaName}.${oldName}`)) {
+			if (!(c instanceof MemoryVirtualTableConnection)) continue;
+			if (c.getMemoryConnection().tableManager !== this) continue;
+			c.rename(newQualifiedName);
 		}
 	}
 

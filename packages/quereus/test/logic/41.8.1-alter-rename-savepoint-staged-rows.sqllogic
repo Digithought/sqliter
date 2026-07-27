@@ -1,0 +1,350 @@
+-- `ALTER TABLE ... RENAME TO` inside a transaction that also holds a savepoint must not
+-- disturb the rows the transaction has already staged. Companion to
+-- 41.8-alter-savepoint-staged-rows, which covers the column-shape arms (ADD / DROP / RENAME
+-- COLUMN); this file covers the whole-table rename, which used to lose staged rows outright.
+--
+-- Two mechanisms were at fault, and the cases below exercise both:
+--
+--   1. `renameTable` minted a new frozen TableSchema but never handed it to the open
+--      transaction's layers, so an eager savepoint snapshot kept its pre-rename schema
+--      object, failed `commitTransaction`'s snapshot-wrap identity check, and COMMIT
+--      reported success having published nothing (cases B, C, F, G, H, K).
+--   2. the Database connection registry stayed keyed on the OLD qualified name, so every
+--      by-name lookup the renamed table's manager makes found nothing — and a second ALTER
+--      in the same transaction was refused with "another connection has uncommitted
+--      changes" (cases L, M, N).
+--
+-- A savepoint gets involved far more often than the SQL suggests: the DML executor takes
+-- internal savepoints for statement- and row-level rollback, so this is reachable without
+-- writing `savepoint` at all.
+
+-- Case A (control): savepoint with no ALTER at all — the pre-savepoint row survives.
+create table ca (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into ca values (1, 'a');
+-- run
+savepoint s;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from ca order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table ca;
+-- run
+
+-- Case B: insert; savepoint; rename; rollback to savepoint. The rename is DDL and escapes
+-- the rollback (the table stays renamed); the pre-savepoint row must still commit.
+create table cb (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cb values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table cb rename to cb2;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from cb2 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table cb2;
+-- run
+
+-- Case C: the same shape, released rather than rolled back.
+create table cc (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cc values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table cc rename to cc2;
+-- run
+release savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from cc2 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table cc2;
+-- run
+
+-- Case D (control): the DROP COLUMN twin of case B, which already worked — kept here so a
+-- regression in the shared adopt path shows up next to the rename cases.
+create table cd (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cd values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table cd drop column v;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id from cd order by id;
+→ [{"id":1}]
+
+drop table cd;
+-- run
+
+-- Case E (control): rename with NO savepoint anywhere. Always worked — the connection holds
+-- a pending layer, so the snapshot-wrap path is never reached.
+create table ce (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into ce values (1, 'a');
+-- run
+alter table ce rename to ce2;
+-- run
+commit;
+-- run
+
+select id, v from ce2 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table ce2;
+-- run
+
+-- Case F: savepoint taken AFTER the rename, then rolled back. The row was staged before
+-- both, so it survives.
+create table cf (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cf values (1, 'a');
+-- run
+alter table cf rename to cf2;
+-- run
+savepoint s;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from cf2 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table cf2;
+-- run
+
+-- Case G: savepoint after the rename, released.
+create table cg (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cg values (1, 'a');
+-- run
+alter table cg rename to cg2;
+-- run
+savepoint s;
+-- run
+release savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from cg2 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table cg2;
+-- run
+
+-- Case H: savepoint after the rename, left OPEN through COMMIT (the commit resolves it).
+create table ch (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into ch values (1, 'a');
+-- run
+alter table ch rename to ch2;
+-- run
+savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from ch2 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table ch2;
+-- run
+
+-- Case I: rename FIRST, then stage the row, then a savepoint above it.
+create table ci (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+alter table ci rename to ci2;
+-- run
+insert into ci2 values (1, 'a');
+-- run
+savepoint s;
+-- run
+release savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from ci2 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table ci2;
+-- run
+
+-- Case K: two renames in one transaction with a savepoint between them — each rename has to
+-- re-key the registry AND adopt its schema, or the second one loses the first one's work.
+create table ck (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into ck values (1, 'a');
+-- run
+alter table ck rename to ck2;
+-- run
+savepoint s;
+-- run
+alter table ck2 rename to ck3;
+-- run
+release savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from ck3 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table ck3;
+-- run
+
+-- Case L: rename followed by a CONSOLIDATING alter (ADD COLUMN) in the same transaction.
+-- This is the connection-registry defect: with the registry stale the transaction's own
+-- connection looked like a stranger holding uncommitted work and the ADD COLUMN was refused
+-- with BUSY. The staged row must survive and be backfilled.
+create table cl (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cl values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table cl rename to cl2;
+-- run
+alter table cl2 add column w text default 'x';
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v, w from cl2 order by id;
+→ [{"id":1,"v":"a","w":"x"}]
+
+drop table cl2;
+-- run
+
+-- Case M: rename then DROP COLUMN — the narrowing flavor of case L.
+create table cm (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cm values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table cm rename to cm2;
+-- run
+alter table cm2 drop column v;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id from cm2 order by id;
+→ [{"id":1}]
+
+drop table cm2;
+-- run
+
+-- Case N: the same pair in the other order — DROP COLUMN then rename.
+create table cn (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into cn values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table cn drop column v;
+-- run
+alter table cn rename to cn2;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id from cn2 order by id;
+→ [{"id":1}]
+
+drop table cn2;
+-- run
+
+-- Case O (negative control): the insert happens AFTER the savepoint, so the rollback must
+-- still discard it. The fix must not resurrect rows the ledger says are gone.
+create table co (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+alter table co rename to co2;
+-- run
+savepoint s;
+-- run
+insert into co2 values (1, 'a');
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from co2 order by id;
+→ []
+
+drop table co2;
+-- run

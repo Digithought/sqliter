@@ -10,13 +10,33 @@ const log = createLogger('vtab:memory:vtab-connection');
  */
 export class MemoryVirtualTableConnection implements VirtualTableConnection {
 	public readonly connectionId: string;
-	public readonly tableName: string;
+	private _tableName: string;
 	private memoryConnection: MemoryTableConnection;
 
 	constructor(tableName: string, memoryConnection: MemoryTableConnection) {
 		this.connectionId = `memory-${tableName}-${memoryConnection.connectionId}`;
-		this.tableName = tableName;
+		this._tableName = tableName;
 		this.memoryConnection = memoryConnection;
+	}
+
+	/** Qualified `<schema>.<table>` name this connection is registered under. */
+	get tableName(): string {
+		return this._tableName;
+	}
+
+	/**
+	 * Re-keys this connection to a new qualified name after `ALTER TABLE ... RENAME TO`.
+	 * The single legal mutation site for {@link tableName}: `Database.getConnectionsForTable`
+	 * matches on exactly this string, so a connection left on the old name is invisible to
+	 * every by-name lookup the renamed table's manager makes (see
+	 * `MemoryTableManager.rekeyRegisteredConnections`).
+	 *
+	 * {@link connectionId} deliberately keeps the creation-time name it embeds: it is the
+	 * opaque key of `Database.activeConnections`, and changing it would orphan the map entry.
+	 */
+	rename(newTableName: string): void {
+		log(`RENAME connection ${this.connectionId}: ${this._tableName} -> ${newTableName}`);
+		this._tableName = newTableName;
 	}
 
 	/** Begins a transaction on this connection */

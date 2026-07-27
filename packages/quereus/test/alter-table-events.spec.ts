@@ -472,11 +472,9 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.equal(events.length, 1);
 			assert.equal(events[0].tableName, 't2');
 			assert.deepEqual(events[0].newRow, [1, 'a']);
-			// NOTE: the DROP COLUMN twin above also asserts the committed row survives.
-			// That assertion is deliberately absent here: on the memory module a RENAME TO
-			// combined with ANY savepoint in the same transaction currently loses the
-			// transaction's rows outright — see fix/memory-table-rename-with-savepoint-
-			// loses-transaction-rows. Restore the row check when that lands.
+			const rows: unknown[] = [];
+			for await (const row of db.eval('select * from t2')) rows.push(row);
+			assert.deepEqual(rows, [{ id: 1, v: 'a' }]);
 		});
 
 		it('a RENAME on one table leaves another table\'s batched events alone', async () => {

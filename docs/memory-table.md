@@ -401,9 +401,7 @@ re-deliver them at the transaction's commit once the base becomes the collection
 `PendingChange` records carry no table name, and `commitTransaction` stamps
 `event.tableName` from `this._tableName` as it drains them — which `renameTable` has already
 moved. The delivered event therefore names the table as it exists at commit, with no relabel
-pass. (Note that unlike `renameColumn`, `renameTable` does *not* currently re-point the open
-layers at the renamed schema object, which loses the transaction's staged rows when a savepoint
-is also in play — see `tickets/fix/memory-table-rename-with-savepoint-loses-transaction-rows`.)
+pass. (The staged *rows* do need work from `renameTable` — see the adopt/re-key section below.)
 
 (The same delivered contract is enforced for the module's *other* two event producers — the
 engine's auto-events and the store module's coordinator queue — by
@@ -419,6 +417,36 @@ mirroring the base-side `handleColumnRename` rebuild. Skipping the adopt leaves 
 snapshot on its frozen pre-rename schema, which fails the commit-time snapshot wrap's
 `readLayer.getSchema() === tableSchema` check — and the transaction's staged rows are dropped at
 `COMMIT` even without any rollback.
+
+**`RENAME TO` adopts too — after re-keying the connection registry.** The whole-table rename mints
+a fresh frozen `TableSchema` (only `name` differs) and so hits exactly the same snapshot-wrap
+identity check: without `adoptSchemaOnOpenLayers` a transaction that renames a table *and* holds a
+savepoint loses every row it staged, with `COMMIT` still reporting success. It rebuilds no
+`IndexSchema` — a table name is not part of an index key — so `adoptSchema` is the right level, not
+the reshape pair.
+
+The adopt only works if the connection registry moves first. `MemoryVirtualTableConnection`
+registers under the qualified `<schema>.<table>` name and `Database.getConnectionsForTable` matches
+on exactly that string, so a rename that leaves the field alone makes the transaction's own
+connection unfindable by every by-name lookup the manager makes: `registeredConnections`, and
+through it `ddlConnection`, `knownConnections`, `repointRegisteredConnections`, and
+`openTransactionLayersOldestFirst` — which is the chain `adoptSchemaOnOpenLayers` itself walks, so
+adopting after the name moves is a silent no-op. `renameTable` therefore calls
+`rekeyRegisteredConnections` (`MemoryVirtualTableConnection.rename`, the one legal mutation site for
+`tableName`) *before* moving `_tableName`. `connectionId` embeds the creation-time name and is left
+alone — it is the opaque key of `Database.activeConnections`, and changing it would orphan the
+entry.
+
+The stale registry has a second, louder symptom: a *further* ALTER in the same transaction is
+refused with `Cannot perform schema change on table … while another connection has uncommitted
+changes`. `ensureSchemaChangeSafety` exempts `ddlConnection()` from its "nobody else may hold open
+work" sweep; with the registry stale that is `undefined`, and the transaction's own connection is
+judged a stranger. `MemoryTable.ensureConnection` would likewise stop reusing it and register a
+second connection for the same table.
+
+The snapshot-wrap refusal is also now logged at warning level (`commitTransaction`), naming the
+schema, table and connection, so a future arm that forgets to adopt shows up in a log rather than
+as silently vanished rows.
 
 **A savepoint's *restore view* is re-pointed at the base too.** A `SAVEPOINT` taken while the
 connection holds no pending layer stores a lazy marker naming the layer it was *reading* —
