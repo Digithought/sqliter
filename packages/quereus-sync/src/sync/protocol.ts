@@ -595,8 +595,13 @@ export interface SyncConfig {
 
   /**
    * Whether deleted rows can be resurrected by later writes.
-   * If false (default), a deletion prevents any column write with earlier HLC.
-   * If true, an insert/update with later HLC can resurrect a deleted row.
+   * If false (default), a tombstoned row blocks EVERY subsequent column write —
+   * regardless of the write's HLC — until the tombstone is pruned
+   * (see TombstoneStore.isDeletedAndBlocking).
+   * If true, an insert/update with HLC later than the tombstone's can resurrect
+   * a deleted row; writes at or before it stay blocked.
+   * A delete arriving in the same apply batch as column writes for its row blocks
+   * them by this same rule (change-applicator's in-batch reconciliation).
    */
   allowResurrection: boolean;
 

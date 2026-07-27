@@ -159,8 +159,10 @@ when the incoming change carried no prior, and they do **not** affect default re
 Deletions are recorded as "tombstones" with an HLC timestamp. Tombstones prevent deleted rows from being resurrected by older writes that arrive later.
 
 **Resurrection Policy** (configurable):
-- **Default: Delete Wins** - A deletion with HLC(T1) prevents any column write with HLC < T1
-- **Optional: Resurrection Allowed** - An insert/update with HLC > T1 can resurrect a deleted row
+- **Default: Delete Wins** (`allowResurrection: false`) - once a row is tombstoned, **all** subsequent column writes for it are blocked — regardless of the write's HLC — until the tombstone is pruned at the retention horizon
+- **Optional: Resurrection Allowed** (`allowResurrection: true`) - an insert/update with HLC > the tombstone's T1 resurrects the row; writes with HLC ≤ T1 stay blocked
+
+**The rule applies within one apply batch too**: a delete carried in an `applyChanges` batch blocks that same batch's column changes for its row exactly as an already-stored tombstone would (the row's max-HLC in-batch delete is the blocker; under `allowResurrection` a column change with a later HLC survives it). One batch therefore produces the same result as the same changes applied across separate batches — a relay or reconnecting client that receives a delete and a re-creation of one row in a single sync round converges identically to a peer that received them one round at a time.
 
 **Tombstone TTL**: Tombstones are retained for a configurable duration (default: 30 days). Sync attempts after TTL expiration should fall back to full snapshot transfer.
 

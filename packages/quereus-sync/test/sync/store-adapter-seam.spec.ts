@@ -167,8 +167,8 @@ describe('store-adapter seam integration', () => {
 		});
 	});
 
-	describe('delete-wins row grouping', () => {
-		it('a delete and updates for one row in one batch resolve to delete, either order', async () => {
+	describe('net-effect row grouping', () => {
+		it('collapses each row group to its net effect in batch order', async () => {
 			await db.exec('create table t (id text primary key, v text) using store');
 			await db.exec(`insert into t values ('x', 'local'), ('y', 'local')`);
 
@@ -180,7 +180,25 @@ describe('store-adapter seam integration', () => {
 			], [], { remote: true });
 
 			expect(res.errors).to.have.length(0);
-			expect(await collect(db, 'select id from t')).to.deep.equal([]);
+			// x: update then delete → deleted (the delete erases the earlier update).
+			// y: delete then update → re-created (a write past a same-batch delete
+			// lands, matching what the changes applied one at a time would leave).
+			expect(await collect(db, 'select id, v from t')).to.deep.equal([{ id: 'y', v: 'remote' }]);
+		});
+
+		it('rebuilds a re-created row from PK+nulls, not the pre-delete image', async () => {
+			await db.exec('create table t (id text primary key, a text, b text) using store');
+			await db.exec(`insert into t values ('x', '1', '2')`);
+
+			const res = await applyToStore([
+				del('t', ['x']),
+				upd('t', ['x'], { a: '9' }),
+			], [], { remote: true });
+
+			expect(res.errors).to.have.length(0);
+			// The delete already erased b='2'; the partial re-creation must not
+			// resurrect it.
+			expect(await collect(db, 'select id, a, b from t')).to.deep.equal([{ id: 'x', a: '9', b: null }]);
 		});
 	});
 

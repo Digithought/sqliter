@@ -112,22 +112,31 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
  * apply (`commitChangeMetadata`) — which must stay symmetric: a relay runs almost
  * exclusively the latter.
  *
- * KNOWN LIMITATION (pre-dates this helper; tracked as
- * `sync-delete-cleanup-misses-same-batch-writes`): the scan reads COMMITTED store
- * state, so it neither sees nor is seen by writes still pending in the caller's own
- * batch. When one transaction/apply carries both a delete and a write for the same
- * pk, the two disagree: locally the row's versions survive its delete (leaking the
- * very `cv:`/`cl:` pair this helper exists to reclaim), and on the apply path a
- * higher-HLC reinsert that already won LWW is wiped back out.
+ * `keepColumns` names columns whose cell record must SURVIVE this cleanup: on the
+ * inbound path, a column write in the same apply batch that beat the delete under
+ * `allowResurrection` (see change-applicator's `reconcileInBatchDeletes`). The scan
+ * reads committed storage, which by cleanup time already includes those records —
+ * both the `cv:` delete and its paired `cl:` delete skip them. Empty/absent for
+ * every caller unless resurrection is on.
+ *
+ * KNOWN LIMITATION (pre-dates this helper; the LOCAL half of
+ * `sync-delete-cleanup-misses-same-batch-writes`, tracked as
+ * `sync-local-capture-read-your-own-writes`): the scan reads COMMITTED store
+ * state, so on the local-capture path it neither sees nor is seen by writes still
+ * pending in the transaction's own batch — a row's versions survive its same-
+ * transaction delete, leaking the very `cv:`/`cl:` pair this helper exists to
+ * reclaim. The inbound-apply half (a same-batch reinsert wiped back out) is fixed
+ * by the reconciliation + `keepColumns` above.
  */
 export async function deleteRowVersionsAndLogEntries(
 	ctx: SyncContext,
 	schema: string,
 	table: string,
 	pk: SqlValue[],
+	keepColumns?: ReadonlySet<string>,
 ): Promise<void> {
 	const batch = ctx.kv.batch();
-	const removed = await ctx.columnVersions.deleteRowVersionsBatch(batch, schema, table, pk);
+	const removed = await ctx.columnVersions.deleteRowVersionsBatch(batch, schema, table, pk, keepColumns);
 	if (removed.size === 0) return;
 
 	for (const [column, version] of removed) {

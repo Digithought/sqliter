@@ -277,7 +277,10 @@ export class ColumnVersionStore {
 
   /**
    * Queue deletion of every column version of a row into `batch`, returning the
-   * versions that were removed (column → version).
+   * versions that were removed (column → version). A column in `keepColumns` is
+   * skipped entirely — neither staged for deletion nor included in the returned
+   * map (its paired `cl:` entry must survive too; see
+   * `deleteRowVersionsAndLogEntries`).
    *
    * The returned map is what lets a caller drop the paired `cl:` change-log
    * entries in the SAME batch — each entry's key embeds the version's HLC, which
@@ -292,11 +295,16 @@ export class ColumnVersionStore {
     batch: WriteBatch,
     schemaName: string,
     tableName: string,
-    pk: SqlValue[]
+    pk: SqlValue[],
+    keepColumns?: ReadonlySet<string>
   ): Promise<Map<string, ColumnVersion>> {
     const identity = this.identity(schemaName, tableName, pk);
     const versions = await this.getRowVersions(schemaName, tableName, pk);
-    for (const column of versions.keys()) {
+    for (const column of [...versions.keys()]) {
+      if (keepColumns?.has(column)) {
+        versions.delete(column);
+        continue;
+      }
       batch.delete(buildColumnVersionKey(schemaName, tableName, identity, column));
     }
     return versions;

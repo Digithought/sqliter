@@ -15,13 +15,27 @@
 import { expect } from 'chai';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from '../../src/sync/events.js';
-import { DEFAULT_SYNC_CONFIG, type SyncConfig, type ChangeSet } from '../../src/sync/protocol.js';
+import {
+  DEFAULT_SYNC_CONFIG,
+  type ApplyResult,
+  type SyncConfig,
+  type ChangeSet,
+} from '../../src/sync/protocol.js';
 import { InMemoryKVStore } from '@quereus/store';
 import { generateSiteId } from '../../src/clock/site.js';
 import { buildAllChangeLogScanBounds } from '../../src/metadata/keys.js';
-import type { HLC } from '../../src/clock/hlc.js';
+import { compareHLC, type HLC } from '../../src/clock/hlc.js';
 import type { SqlValue, TableSchema } from '@quereus/quereus';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
+import {
+  COLUMNS_PER_FRESH_INSERT,
+  closePeer,
+  collect,
+  flattenSets,
+  localWrite,
+  makePeer,
+  relay,
+} from './_peer-harness.js';
 
 /** Local-change capture runs fire-and-forget after the commit; let it settle. */
 const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 25));
@@ -219,6 +233,221 @@ describe('change log orphan cleanup', () => {
 
       expect(await relay.pruneTombstones()).to.equal(rows);
       expect(await countChangeLog(relay)).to.equal(0);
+    });
+
+    // A delete and a re-creation of ONE row arriving in a single applyChanges
+    // batch must resolve exactly as they would arriving in separate batches —
+    // Phase 1 resolves only against pre-batch state, so the in-batch delete has
+    // to be reconciled against the in-batch column writes explicitly
+    // (change-applicator's reconcileInBatchDeletes).
+    describe('in-batch delete + re-creation', () => {
+      const RESURRECT: Partial<SyncConfig> = { allowResurrection: true };
+
+      /**
+       * Origin does three separate local transactions on `main.users` row 1:
+       * insert x,y,z; delete; re-insert a,b,c. The origin's own delete cleanup
+       * removes the first insert's entries, so a fresh receiver pulls exactly
+       * two transactions: the delete, then the re-creation.
+       */
+      async function makeOriginWithRecreatedRow(): Promise<SyncManagerImpl> {
+        const source = new FakeTransactionSource();
+        const origin = await SyncManagerImpl.create(
+          new InMemoryKVStore(), source, { ...DEFAULT_SYNC_CONFIG }, new SyncEventEmitterImpl(),
+        );
+        source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['x', 'y', 'z'] });
+        await settle();
+        source.commitData({ type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'] });
+        await settle();
+        source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a', 'b', 'c'] });
+        await settle();
+        return origin;
+      }
+
+      const makeRelay = (config: Partial<SyncConfig> = {}): Promise<SyncManagerImpl> =>
+        SyncManagerImpl.create(
+          new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG, ...config }, new SyncEventEmitterImpl(),
+        );
+
+      /** Everything the parity assertion compares between two relays. */
+      async function relayState(manager: SyncManagerImpl): Promise<unknown> {
+        const versions = await manager.columnVersions.getRowVersions('main', 'users', [1]);
+        return {
+          cells: [...versions.entries()].sort(([a], [b]) => a.localeCompare(b)),
+          logCount: await countChangeLog(manager),
+          tombstones: await countTombstones(manager),
+        };
+      }
+
+      /** Apply the same origin's changesets to `batched` in ONE call and to `separate` one per call. */
+      async function applyBothWays(
+        origin: SyncManagerImpl,
+        batched: SyncManagerImpl,
+        separate: SyncManagerImpl,
+      ): Promise<{ batchedResult: ApplyResult; separateResults: ApplyResult[] }> {
+        const batchedResult = await batched.applyChanges(await origin.getChangesSince(batched.getSiteId()));
+
+        const sets = await origin.getChangesSince(separate.getSiteId());
+        // The delete and the re-creation really are distinct transactions — the
+        // separate-applies leg genuinely splits them.
+        expect(sets.length).to.be.greaterThan(1);
+        const separateResults: ApplyResult[] = [];
+        for (const changeSet of sets) separateResults.push(await separate.applyChanges([changeSet]));
+
+        return { batchedResult, separateResults };
+      }
+
+      const sumResults = (results: ApplyResult[]): { applied: number; skipped: number; conflicts: number } =>
+        results.reduce(
+          (acc, r) => ({ applied: acc.applied + r.applied, skipped: acc.skipped + r.skipped, conflicts: acc.conflicts + r.conflicts }),
+          { applied: 0, skipped: 0, conflicts: 0 },
+        );
+
+      // Pre-fix: the batched relay ended with 0 cell records — Phase 3's delete
+      // cleanup wiped the re-created row's versions right after writing them.
+      it('allowResurrection: true — one batch keeps the re-created row and matches separate applies', async () => {
+        const origin = await makeOriginWithRecreatedRow();
+        const batched = await makeRelay(RESURRECT);
+        const separate = await makeRelay(RESURRECT);
+
+        const { batchedResult, separateResults } = await applyBothWays(origin, batched, separate);
+
+        // The re-creation won conflict resolution and survives: 3 cell records,
+        // their 3 column change-log entries plus the tombstone's delete entry.
+        const versions = await batched.columnVersions.getRowVersions('main', 'users', [1]);
+        expect([...versions.keys()].sort()).to.deep.equal(['col_0', 'col_1', 'col_2']);
+        expect([...versions.values()].map(v => v.value)).to.have.members(['a', 'b', 'c']);
+        expect(await countChangeLog(batched)).to.equal(4);
+
+        // Parity: state, counters, and what a third peer would receive.
+        expect(await relayState(batched)).to.deep.equal(await relayState(separate));
+        expect({ applied: batchedResult.applied, skipped: batchedResult.skipped, conflicts: batchedResult.conflicts })
+          .to.deep.equal(sumResults(separateResults));
+
+        const third = generateSiteId();
+        const fromBatched = flattenSets(await batched.getChangesSince(third));
+        expect(fromBatched).to.deep.equal(flattenSets(await separate.getChangesSince(third)));
+        const reEmittedValues = fromBatched.filter(c => c.type === 'column').map(c => c.value).sort();
+        expect(reEmittedValues).to.deep.equal(['a', 'b', 'c']);
+      });
+
+      // Pre-fix: the batched relay reported applied:4 / skipped:0 and emitted the
+      // blocked column changes as applied, even though their metadata was wiped.
+      it('allowResurrection: false (default) — one batch blocks the re-creation and matches separate applies', async () => {
+        const origin = await makeOriginWithRecreatedRow();
+        const batched = await makeRelay();
+        const separate = await makeRelay();
+
+        const { batchedResult, separateResults } = await applyBothWays(origin, batched, separate);
+
+        // The in-batch delete blocks every column change for the row: only the
+        // delete lands, and `skipped` counts the blocked column changes.
+        expect(batchedResult.applied).to.equal(1);
+        expect(batchedResult.skipped).to.equal(3);
+        expect((await batched.columnVersions.getRowVersions('main', 'users', [1])).size).to.equal(0);
+        expect(await countChangeLog(batched)).to.equal(1);
+
+        expect(await relayState(batched)).to.deep.equal(await relayState(separate));
+        expect({ applied: batchedResult.applied, skipped: batchedResult.skipped, conflicts: batchedResult.conflicts })
+          .to.deep.equal(sumResults(separateResults));
+      });
+
+      // Reverse order — the column writes are OLDER than the same-batch delete.
+      // Already the pre-fix behavior; pinned so the reconciliation can't regress it.
+      it('keeps the row deleted when the same-batch column writes are older than the delete (both settings)', async () => {
+        for (const config of [{}, RESURRECT]) {
+          const insertSource = new FakeTransactionSource();
+          const inserter = await SyncManagerImpl.create(
+            new InMemoryKVStore(), insertSource, { ...DEFAULT_SYNC_CONFIG }, new SyncEventEmitterImpl(),
+          );
+          const deleteSource = new FakeTransactionSource();
+          const deleter = await SyncManagerImpl.create(
+            new InMemoryKVStore(), deleteSource, { ...DEFAULT_SYNC_CONFIG }, new SyncEventEmitterImpl(),
+          );
+
+          insertSource.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['x', 'y', 'z'] });
+          await settle();
+          deleteSource.commitData({ type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'] });
+          await settle();
+
+          const receiver = await makeRelay(config);
+          const batch = [
+            ...await inserter.getChangesSince(receiver.getSiteId()),
+            ...await deleter.getChangesSince(receiver.getSiteId()),
+          ];
+          // Guard the premise: the delete's HLC really is the row's max.
+          const changes = flattenSets(batch);
+          const deleteHlc = changes.find(c => c.type === 'delete')!.hlc;
+          for (const c of changes.filter(c => c.type === 'column')) {
+            expect(compareHLC(deleteHlc, c.hlc)).to.be.greaterThan(0);
+          }
+
+          await receiver.applyChanges(batch);
+          expect((await receiver.columnVersions.getRowVersions('main', 'users', [1])).size).to.equal(0);
+          expect(await countChangeLog(receiver)).to.equal(1);   // the delete entry only
+        }
+      });
+
+      // Store-backed: the row's DATA outcome must match the metadata outcome.
+      // Pre-fix the store adapter collapsed each row group with delete-wins, so a
+      // re-creation that won resolution still vanished from the actual table.
+      it('store-backed: one batch re-creates the table row like separate applies (allowResurrection: true)', async () => {
+        const origin = await makePeer('origin', { createOrders: true });
+        const batched = await makePeer('batched', { createOrders: true, config: RESURRECT });
+        const separate = await makePeer('separate', { createOrders: true, config: RESURRECT });
+        try {
+          await localWrite(origin, "insert into orders (id, note) values (1, 'x')");
+          await localWrite(origin, 'delete from orders where id = 1');
+          await localWrite(origin, "insert into orders (id, note) values (1, 'a')");
+
+          await relay(origin, batched);
+          const sets = await origin.manager.getChangesSince(separate.manager.getSiteId());
+          for (const changeSet of sets) {
+            await separate.manager.applyChanges([{ ...changeSet, schemaMigrations: [] }]);
+          }
+
+          const batchedRows = await collect(batched.db, 'select id, note from orders');
+          expect(batchedRows).to.deep.equal([{ id: 1, note: 'a' }]);
+          expect(batchedRows).to.deep.equal(await collect(separate.db, 'select id, note from orders'));
+
+          const cells = await batched.manager.columnVersions.getRowVersions('main', 'orders', [1]);
+          expect(cells.size).to.equal(COLUMNS_PER_FRESH_INSERT);
+          expect(await countChangeLog(batched.manager)).to.equal(COLUMNS_PER_FRESH_INSERT + 1);
+          expect(await countChangeLog(separate.manager)).to.equal(COLUMNS_PER_FRESH_INSERT + 1);
+        } finally {
+          await closePeer(origin);
+          await closePeer(batched);
+          await closePeer(separate);
+        }
+      });
+
+      it('store-backed: one batch leaves the table row deleted like separate applies (default)', async () => {
+        const origin = await makePeer('origin', { createOrders: true });
+        const batched = await makePeer('batched', { createOrders: true });
+        const separate = await makePeer('separate', { createOrders: true });
+        try {
+          await localWrite(origin, "insert into orders (id, note) values (1, 'x')");
+          await localWrite(origin, 'delete from orders where id = 1');
+          await localWrite(origin, "insert into orders (id, note) values (1, 'a')");
+
+          const batchedResult = await relay(origin, batched);
+          const sets = await origin.manager.getChangesSince(separate.manager.getSiteId());
+          for (const changeSet of sets) {
+            await separate.manager.applyChanges([{ ...changeSet, schemaMigrations: [] }]);
+          }
+
+          expect(batchedResult.applied).to.equal(1);
+          expect(batchedResult.skipped).to.equal(COLUMNS_PER_FRESH_INSERT);
+          expect(await collect(batched.db, 'select id, note from orders')).to.deep.equal([]);
+          expect(await collect(separate.db, 'select id, note from orders')).to.deep.equal([]);
+          expect((await batched.manager.columnVersions.getRowVersions('main', 'orders', [1])).size).to.equal(0);
+          expect(await countChangeLog(batched.manager)).to.equal(1);
+          expect(await countChangeLog(separate.manager)).to.equal(1);
+        } finally {
+          await closePeer(origin);
+          await closePeer(batched);
+          await closePeer(separate);
+        }
+      });
     });
   });
 });

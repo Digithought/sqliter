@@ -12,7 +12,7 @@ import { compareHLC, maxHLC, assertWithinDrift } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
-import { encodePkIdentity } from '../metadata/keys.js';
+import { encodePkIdentity, RAW_PK_KEYING } from '../metadata/keys.js';
 import type {
 	ChangeSet,
 	Change,
@@ -39,6 +39,17 @@ export interface ResolvedChange {
 	oldColumnVersion?: ColumnVersion;
 	/** For delete changes: the prior tombstone whose stale delete entry to clean up in the change log. */
 	oldTombstone?: Tombstone;
+	/**
+	 * For a row's winning in-batch delete under `allowResurrection`: columns of this
+	 * row whose same-batch write beat the delete, so the post-commit cleanup keeps
+	 * them. Filled by {@link reconcileInBatchDeletes}.
+	 */
+	keepColumns?: Set<string>;
+	/**
+	 * Table exists only via this same batch's create_table — no local schema (and so
+	 * no resolvable pk-identity keying) until Phase 2's DDL runs.
+	 */
+	freshLocalTable?: boolean;
 }
 
 /**
@@ -110,6 +121,10 @@ export async function applyChanges(
 	const schemaChangesToApply: SchemaChangeToApply[] = [];
 	const appliedChanges: Array<{ change: Change; siteId: SiteId }> = [];
 	const resolvedDataChanges: ResolvedChange[] = [];
+	// Every data-change resolution in batch order, with its relaying changeset's
+	// siteId. Counters and apply lists are built from these AFTER the in-batch
+	// delete reconciliation below, not inside the resolve loop.
+	const dataResolutions: Array<{ resolved: ResolvedChange; siteId: SiteId }> = [];
 	const pendingSchemaMigrations: Array<{
 		migration: SchemaMigration;
 		schemaVersion: number;
@@ -205,18 +220,32 @@ export async function applyChanges(
 			const freshLocalTable = !inBasis;
 
 			const resolved = await resolveChange(ctx, change, freshLocalTable);
-			if (resolved.outcome === 'applied') {
-				applied++;
-				appliedChanges.push({ change, siteId: changeSet.siteId });
-				resolvedDataChanges.push(resolved);
-				if (resolved.dataChange) {
-					dataChangesToApply.push(resolved.dataChange);
-				}
-			} else if (resolved.outcome === 'skipped') {
-				skipped++;
-			} else if (resolved.outcome === 'conflict') {
-				conflicts++;
+			if (freshLocalTable) resolved.freshLocalTable = true;
+			dataResolutions.push({ resolved, siteId: changeSet.siteId });
+		}
+	}
+
+	// In-batch delete reconciliation: Phase 1 resolved each change against
+	// PRE-batch stored state only, so a delete and a column change for the same
+	// row in this one batch never saw each other. Apply the tombstone-blocking
+	// rule across the batch BEFORE any data or metadata write, then build the
+	// counters, the store apply list, and the emitted-change list from the
+	// reconciled outcomes — so `ApplyResult` and `onRemoteChange` reflect what is
+	// actually written.
+	const reconciled = reconcileInBatchDeletes(ctx, dataResolutions.map(entry => entry.resolved));
+	for (let i = 0; i < reconciled.length; i++) {
+		const resolved = reconciled[i];
+		if (resolved.outcome === 'applied') {
+			applied++;
+			appliedChanges.push({ change: resolved.change, siteId: dataResolutions[i].siteId });
+			resolvedDataChanges.push(resolved);
+			if (resolved.dataChange) {
+				dataChangesToApply.push(resolved.dataChange);
 			}
+		} else if (resolved.outcome === 'skipped') {
+			skipped++;
+		} else {
+			conflicts++;
 		}
 	}
 
@@ -436,6 +465,7 @@ async function drainTableGroup(
 	let applied = 0;
 	let skipped = 0;
 
+	const resolutions: ResolvedChange[] = [];
 	for (const change of group.changes) {
 		// Schema-drift filter: a held column change for a column the re-created table
 		// no longer has is resolved-and-dropped (never sent to resolveChange or the
@@ -449,14 +479,20 @@ async function drainTableGroup(
 
 		// Identical LWW / tombstone-blocking / allowResurrection semantics as a fresh
 		// receive — the held change is just an older inbound change resolved late.
-		const resolved = await resolveChange(ctx, change);
+		resolutions.push(await resolveChange(ctx, change));
+	}
+
+	// Same in-batch delete reconciliation as applyChanges: a held delete and a held
+	// column write for one row drain together and must block each other exactly as
+	// they would arriving in one wire batch.
+	for (const resolved of reconcileInBatchDeletes(ctx, resolutions)) {
 		if (resolved.outcome === 'applied') {
 			applied++;
 			resolvedDataChanges.push(resolved);
 			if (resolved.dataChange) dataChangesToApply.push(resolved.dataChange);
 			// Group revival events by the held change's ORIGINAL origin (its HLC
 			// siteId) — a held change carries no relaying changeset.
-			appliedEntries.push({ change, siteId: change.hlc.siteId });
+			appliedEntries.push({ change: resolved.change, siteId: resolved.change.hlc.siteId });
 		} else {
 			skipped++;
 		}
@@ -664,6 +700,56 @@ export async function resolveChange(
 }
 
 /**
+ * Re-resolve column changes against deletes that landed in the SAME batch.
+ *
+ * Phase 1 compares each change only to PRE-batch stored state, so an in-batch
+ * delete is invisible to an in-batch column change for the same row. This pass
+ * applies the same tombstone-blocking rule as
+ * `TombstoneStore.isDeletedAndBlocking`, with each row's max-HLC in-batch
+ * APPLIED delete as the blocker:
+ *   - `allowResurrection: false` (default): every same-row column change in the
+ *     batch is blocked, whatever its HLC;
+ *   - `allowResurrection: true`: a column change at or below the delete's HLC is
+ *     blocked; one that beats it survives and is recorded on the winning
+ *     delete's {@link ResolvedChange.keepColumns} so `commitChangeMetadata`'s
+ *     post-commit cleanup keeps its cell record and change-log entry.
+ *
+ * Returns a same-length, same-order list with each blocked column change flipped
+ * to `'skipped'` (its `dataChange` dropped, so it never reaches the store).
+ * Net effect: one apply batch produces the same result as the same changes split
+ * across separate applies.
+ */
+function reconcileInBatchDeletes(
+	ctx: SyncContext,
+	resolved: ResolvedChange[],
+): ResolvedChange[] {
+	// Max-HLC applied in-batch delete per row identity. Ties keep the first, the
+	// same preference keepMaxHLC applies, so the annotated delete below is the
+	// object commitChangeMetadata's deleteWinners collapse keeps.
+	const deleteWinnersByRow = new Map<string, ResolvedChange>();
+	for (const entry of resolved) {
+		if (entry.outcome !== 'applied' || entry.change.type !== 'delete') continue;
+		const key = rowIdentityKey(ctx, entry.change, entry.freshLocalTable);
+		const prev = deleteWinnersByRow.get(key);
+		if (!prev || compareHLC(entry.change.hlc, prev.change.hlc) > 0) {
+			deleteWinnersByRow.set(key, entry);
+		}
+	}
+	if (deleteWinnersByRow.size === 0) return resolved;
+
+	return resolved.map(entry => {
+		if (entry.outcome !== 'applied' || entry.change.type !== 'column') return entry;
+		const winner = deleteWinnersByRow.get(rowIdentityKey(ctx, entry.change, entry.freshLocalTable));
+		if (!winner) return entry;
+		if (ctx.config.allowResurrection && compareHLC(entry.change.hlc, winner.change.hlc) > 0) {
+			(winner.keepColumns ??= new Set()).add(entry.change.column);
+			return entry;
+		}
+		return { outcome: 'skipped', change: entry.change };
+	});
+}
+
+/**
  * Commit CRDT metadata for resolved changes.
  *
  * Phase 3 of the 3-phase apply pattern: called AFTER data is written to store.
@@ -679,6 +765,11 @@ export async function resolveChange(
  * pre-batch prior entry is deleted once. Mirrors the local write-path dedup in
  * `recordDataEvent` / `recordColumnVersions`, keeping the delete and column paths
  * symmetric.
+ *
+ * Cross-type (delete vs column) same-row collisions were already settled upstream by
+ * {@link reconcileInBatchDeletes}: every column change still `'applied'` here is one
+ * that must be written, and a winning delete's {@link ResolvedChange.keepColumns}
+ * names the columns its cleanup must leave alone.
  */
 export async function commitChangeMetadata(
 	ctx: SyncContext,
@@ -718,26 +809,42 @@ export async function commitChangeMetadata(
 	// delete (losers were never written, so there is nothing of theirs to clean). The
 	// row's change-log column entries go in the same batch as its versions: an inbound
 	// delete must leave no more index garbage behind than a local one, and this is the
-	// path a relay runs almost exclusively.
+	// path a relay runs almost exclusively. `keepColumns` spares the cell records this
+	// same batch wrote past the delete (allowResurrection winners) — the scan reads
+	// committed storage, which by now INCLUDES them.
 	for (const resolved of deleteWinners.values()) {
 		const change = resolved.change;
 		if (change.type !== 'delete') continue;
-		await deleteRowVersionsAndLogEntries(ctx, change.schema, change.table, change.pk);
+		await deleteRowVersionsAndLogEntries(ctx, change.schema, change.table, change.pk, resolved.keepColumns);
 	}
 }
 
-// Collapse keys reuse the pk-identity encoding so in-batch grouping matches the canonical
+// Grouping keys reuse the pk-identity encoding so in-batch grouping matches the canonical
 // pk identity of the actual KV keys (buildTombstoneKey / buildColumnVersionKey) — two pks
 // collapse here iff they would collide on disk ('apple'/'APPLE' under nocase, 'PT1H'/'PT60M').
 
+/**
+ * Row-identity grouping key shared by the collapse maps and the in-batch delete
+ * reconciliation. A fresh-local table (created by this same batch, pre-DDL) has no
+ * resolvable keying yet, so its changes group under the raw encoding — internally
+ * consistent within the batch, which is all the reconciliation needs. (The Phase-3
+ * collapse runs post-DDL with the resolved keying; for a fresh table with
+ * collation-variant pk spellings in ONE batch the two groupings can disagree, an
+ * edge accepted here.)
+ */
+function rowIdentityKey(ctx: SyncContext, change: Change, freshLocalTable?: boolean): string {
+	const keying = freshLocalTable ? RAW_PK_KEYING : ctx.getPkKeying(change.schema, change.table);
+	return `${change.schema}.${change.table}:${encodePkIdentity(change.pk, keying)}`;
+}
+
 /** Stable per-pk key for collapsing repeated delete entries within one batch. */
 function deleteKey(ctx: SyncContext, change: RowDeletion): string {
-	return `delete:${change.schema}.${change.table}:${encodePkIdentity(change.pk, ctx.getPkKeying(change.schema, change.table))}`;
+	return `delete:${rowIdentityKey(ctx, change)}`;
 }
 
 /** Stable per-(pk, column) key for collapsing repeated column entries within one batch. */
 function columnKey(ctx: SyncContext, change: ColumnChange): string {
-	return `column:${change.schema}.${change.table}:${encodePkIdentity(change.pk, ctx.getPkKeying(change.schema, change.table))}:${change.column}`;
+	return `column:${rowIdentityKey(ctx, change)}:${change.column}`;
 }
 
 /** Keep the max-HLC resolved change per key, collapsing in-batch repeats to one winner. */
