@@ -198,12 +198,13 @@ select id from s2.dr_x2 order by id;
 --     (constraint-builder's `needsDeferred`), so this parks a check that reads
 --     `dr_lookup` — a table neither side of any FK — and then renames it.
 --
---     NOTE: this case passes with the rename remap disabled too. A deferred
---     subquery CHECK never re-reads its table at commit — the IN probe is frozen
---     when the row is written, so it also misses same-transaction writes to that
---     table (`fix/bug-deferred-subquery-check-reads-stale-state`). It is here to
---     pin the user-visible outcome across a rename, NOT as a guard on the remap;
---     cases 1/2/5/7/8/9 are the ones that discriminate that.
+--     The value the check needs is inserted into the RENAMED table, after the
+--     rename and before commit. This discriminates the remap for real: the
+--     check is genuinely deferred to COMMIT and re-reads the live table there
+--     (`bug-deferred-subquery-check-reads-stale-state`), so a broken
+--     `notifyTableRename` remap — or a regression back to immediate
+--     evaluation — would read the wrong table state and reject 'z', which
+--     only exists under the table's post-rename name.
 -- ===================================
 
 create table dr_lookup (code text primary key);
@@ -212,12 +213,13 @@ create table dr_ck (id integer primary key, code text,
 	constraint dr_ck_code check (code in (select code from dr_lookup)));
 
 begin;
-insert into dr_ck values (1, 'a');
+insert into dr_ck values (1, 'z');
 alter table dr_lookup rename to dr_lookup2;
+insert into dr_lookup2 values ('z');
 commit;
 
 select id, code from dr_ck order by id;
-→ [{"id":1,"code":"a"}]
+→ [{"id":1,"code":"z"}]
 
 -- …and the violation is still REPORTED as a constraint failure across a rename.
 begin;

@@ -404,12 +404,28 @@ async function checkCheckConstraints(
 
 		if (metadata.shouldDefer && !mustEvaluateNow) {
 			const activeConnectionId = rctx.activeConnection?.connectionId;
+			// Wrap so the deferred queue's evaluation at COMMIT throws the same
+			// attributed message (name + expression hint) as the immediate path
+			// below, instead of the queue's generic name-only fallback — matches
+			// the pattern derived-row-validator.ts already uses for maintained
+			// tables. The wrapper always throws before returning falsy, so the
+			// queue's own generic message never fires for this entry.
+			const constraintName = metadata.constraintName;
+			const exprHint = metadata.constraintExpr.length <= 60 ? ` (${metadata.constraintExpr})` : '';
+			const deferredEvaluator = async (dctx: RuntimeContext): Promise<SqlValue> => {
+				const rawResult = evaluator(dctx);
+				const result = (rawResult instanceof Promise ? await rawResult : rawResult) as SqlValue;
+				if (result !== null && !isTruthy(result)) {
+					throw new ConstraintError(`CHECK constraint failed: ${constraintName}${exprHint}`);
+				}
+				return result;
+			};
 			rctx.db._queueDeferredConstraintRow(
 				metadata.baseTable,
 				metadata.constraintName,
 				flatRow,
 				metadata.flatRowDescriptor,
-				evaluator,
+				deferredEvaluator,
 				activeConnectionId,
 				metadata.contextRow,
 				metadata.contextDescriptor

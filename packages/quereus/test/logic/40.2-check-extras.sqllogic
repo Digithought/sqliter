@@ -172,6 +172,69 @@ select g from t_compound_gen;
 drop table t_compound_gen;
 
 -- ===================================
+-- 8. Deferred subquery CHECK reads the transaction's OWN writes, not a
+-- snapshot frozen at row-write time. Regression for
+-- bug-deferred-subquery-check-reads-stale-state: `x in (select …)` builds as
+-- an InNode, which the old containsSubquery() (a list of specific scalar
+-- node types) did not recognize as subquery-bearing, so the check ran
+-- immediately like an ordinary CHECK instead of deferring to COMMIT.
+-- ===================================
+
+-- read-your-own-writes: the value the check needs arrives LATER in the same
+-- transaction. Immediate (buggy) evaluation would reject this at the INSERT
+-- into zt, before zl has the row.
+create table zl (code text primary key);
+create table zt (id integer primary key, code text,
+	constraint zt_ck check (code in (select code from zl)));
+
+begin;
+insert into zt values (1, 'a');
+insert into zl values ('a');
+commit;
+
+select id, code from zt;
+→ [{"id":1,"code":"a"}]
+
+drop table zt;
+drop table zl;
+
+-- the reverse: the value the check needs is REMOVED later in the same
+-- transaction. Immediate (buggy) evaluation would pass at the INSERT and
+-- never re-check after the delete; a genuinely deferred check catches it at
+-- COMMIT.
+create table zl2 (code text primary key);
+insert into zl2 values ('a');
+create table zt2 (id integer primary key, code text,
+	constraint zt2_ck check (code in (select code from zl2)));
+
+begin;
+insert into zt2 values (1, 'a');
+delete from zl2 where code = 'a';
+commit;
+-- error: CHECK
+
+select count(*) as cnt from zt2;
+→ [{"cnt":0}]
+
+drop table zt2;
+drop table zl2;
+
+-- negative control: a plain value-list `in (...)` has no relational child and
+-- must stay immediate — it still fails INSIDE the open transaction, at the
+-- INSERT itself, not deferred to COMMIT.
+create table zt3 (id integer primary key, code text, check (code in ('a', 'b')));
+
+begin;
+insert into zt3 values (1, 'z');
+-- error: CHECK
+rollback;
+
+select count(*) as cnt from zt3;
+→ [{"cnt":0}]
+
+drop table zt3;
+
+-- ===================================
 -- Table-qualified self-references in CHECK expressions
 -- `t.col` (or `schema.t.col`) on the owning table resolves like the
 -- unqualified column: NEW for INSERT/UPDATE, OLD for DELETE. Regression for
