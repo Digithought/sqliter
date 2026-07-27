@@ -756,14 +756,30 @@ interface SyncManager {
   resumeSnapshotStream(checkpoint: SnapshotCheckpoint): AsyncIterable<SnapshotChunk>;
 }
 
-/** Snapshot chunk types for streaming */
+/**
+ * Snapshot chunk types for streaming.
+ *
+ * Emission ORDER is load-bearing — DDL precedes table data:
+ *
+ *   header → schema-migration* → [table-start, column-versions…, table-end]*
+ *          → tombstone* → footer
+ *
+ * The receiver cannot buffer a whole snapshot: `applySnapshotStream` flushes
+ * accumulated rows to the store every 100 pending row changes, and the store
+ * adapter applies DDL before DML only WITHIN one flush. A `create table` emitted
+ * after its rows would therefore arrive too late for every flush the table's rows
+ * already triggered, and on a receiver that does not yet have the table each of
+ * those rows fails with "Table not found for external write". The receiver
+ * correspondingly flushes its pending schema changes when it reaches the first
+ * `table-start` (which marks the end of the migration section).
+ */
 type SnapshotChunk =
   | SnapshotHeaderChunk      // First; HLC drift-validated here
+  | SnapshotSchemaMigrationChunk  // All DDL, before any table data
   | SnapshotTableStartChunk
   | SnapshotColumnVersionsChunk
-  | SnapshotTombstoneChunk   // Global pass; carries fully-deleted rows
   | SnapshotTableEndChunk
-  | SnapshotSchemaMigrationChunk
+  | SnapshotTombstoneChunk   // Global pass; carries fully-deleted rows
   | SnapshotFooterChunk;     // Last; carries stats
 
 /** Progress info during snapshot streaming */
@@ -1156,6 +1172,12 @@ B: ADD COLUMN bar TEXT     @ HLC(2000, 1, B)
 Within a sync batch, **all DDL is applied before any DML**, destructive operations first
 (DROP TABLE, then DROP COLUMN, then ALTER/ADD), and INSERT/UPDATE/DELETE then land on the
 now-correct schema — so structures always exist before data referencing them arrives.
+
+"Within a batch" is the whole guarantee: a streamed snapshot is many batches (the
+receiver flushes every 100 pending row changes), so DDL that reaches the receiver
+*after* a flush cannot help that flush. The streaming snapshot protocol therefore
+puts every `schema-migration` chunk ahead of all table data — see § Streaming
+Snapshot API for the chunk order.
 
 ### Schema Change Types
 

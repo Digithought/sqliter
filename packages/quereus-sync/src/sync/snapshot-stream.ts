@@ -112,6 +112,31 @@ async function* streamSnapshotChunks(
 	};
 	yield header;
 
+	// Stream schema migrations BEFORE any table data. The receiver flushes accumulated
+	// rows to the store every DATA_FLUSH_SIZE entries, so a table with more rows than
+	// that bound would otherwise reach the store before its `create table` did — and on
+	// a receiver that does not already have the table, every row in that early flush
+	// fails. DDL-first makes the streaming bootstrap work for tables of any size;
+	// `applySnapshotStream` depends on this order.
+	for await (const entry of ctx.kv.iterate(smBounds)) {
+		const parsed = parseSchemaMigrationKey(entry.key);
+		if (!parsed) continue;
+
+		const migration = deserializeMigration(entry.value);
+		const migrationChunk: SnapshotSchemaMigrationChunk = {
+			type: 'schema-migration',
+			migration: {
+				type: migration.type,
+				schema: parsed.schema,
+				table: parsed.table,
+				ddl: migration.ddl,
+				hlc: migration.hlc,
+				schemaVersion: migration.schemaVersion,
+			},
+		};
+		yield migrationChunk;
+	}
+
 	// Stream each table, skipping completed ones
 	let totalEntries = initialEntryCount ?? 0;
 	for (const [tableKey, { schema, table }] of tableKeys) {
@@ -176,26 +201,6 @@ async function* streamSnapshotChunks(
 		yield tableEnd;
 
 		totalEntries += entriesWritten;
-	}
-
-	// Stream schema migrations
-	for await (const entry of ctx.kv.iterate(smBounds)) {
-		const parsed = parseSchemaMigrationKey(entry.key);
-		if (!parsed) continue;
-
-		const migration = deserializeMigration(entry.value);
-		const migrationChunk: SnapshotSchemaMigrationChunk = {
-			type: 'schema-migration',
-			migration: {
-				type: migration.type,
-				schema: parsed.schema,
-				table: parsed.table,
-				ddl: migration.ddl,
-				hlc: migration.hlc,
-				schemaVersion: migration.schemaVersion,
-			},
-		};
-		yield migrationChunk;
 	}
 
 	// Stream tombstones — a GLOBAL pass over every tombstone (not a per-`tableKeys`
@@ -459,6 +464,20 @@ export async function applySnapshotStream(
 			}
 
 			case 'table-start':
+				// The sender emits every schema migration before the first `table-start`,
+				// so reaching one means the migration section has ended: push the pending
+				// DDL to the store now, ahead of any row that a mid-table DATA_FLUSH_SIZE
+				// flush would otherwise deliver to a table that does not exist yet. Later
+				// `table-start`s find nothing pending and this is a no-op (`applyDataToStore`
+				// returns early when both pending arrays are empty).
+				// NOTE: this trusts the sender's chunk order. A pre-DDL-first sender (one
+				// that emits `schema-migration` after the table sections) still fails on a
+				// table larger than DATA_FLUSH_SIZE, exactly as before. If cross-version
+				// snapshot interop ever becomes a requirement, the receiver would have to
+				// buffer all data until the footer instead — a memory tradeoff the whole
+				// streaming path exists to avoid.
+				await flushDataToStore();
+
 				currentTable = `${chunk.schema}.${chunk.table}`;
 				currentTableSchema = chunk.schema;
 				currentTableName = chunk.table;

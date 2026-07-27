@@ -235,14 +235,24 @@ export interface Snapshot {
 
 /**
  * Snapshot chunk types for streaming.
+ *
+ * Listed in EMISSION ORDER, which is load-bearing — all DDL precedes all table data:
+ *
+ *   header → schema-migration* → [table-start, column-versions*, table-end]*
+ *          → tombstone* → footer
+ *
+ * The receiver flushes rows to the store in bounded batches rather than buffering
+ * the whole snapshot, and DDL only beats DML *within* one flush — so a `create
+ * table` emitted after its rows arrives too late for the flushes those rows already
+ * triggered. See docs/sync.md § Streaming Snapshot API.
  */
 export type SnapshotChunkType =
   | 'header'
+  | 'schema-migration'
   | 'table-start'
   | 'column-versions'
-  | 'tombstone'
   | 'table-end'
-  | 'schema-migration'
+  | 'tombstone'
   | 'footer';
 
 /**
