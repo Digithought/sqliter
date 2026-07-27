@@ -76,6 +76,9 @@ export function coerceForComparison(v1: SqlValue, v2: SqlValue): [SqlValue, SqlV
 	return [v1, v2];
 }
 
+/** Aggregates that never want their argument read as a number. */
+const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT']);
+
 /**
  * Coerces a value for aggregate function arguments.
  * Most aggregate functions should accept numeric strings as numbers.
@@ -86,11 +89,9 @@ export function coerceForComparison(v1: SqlValue, v2: SqlValue): [SqlValue, SqlV
  * `order by … limit 1`, which keeps text order. Predates the semantic-ordering
  * min/max binding and is unchanged by it (the emitters skip this call entirely
  * when every argument type is numeric or carries semantic ordering — see
- * `aggregateSkipCoercion` in runtime/emit/aggregate.ts / hash-aggregate.ts). If
- * TEXT min/max should stop coercing, that is its own behavior-change ticket.
+ * `computeAggregateSkipCoercion` in runtime/emit/aggregate-setup.ts). Tracked as
+ * backlog `bug-text-minmax-numeric-coercion`.
  */
-const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT']);
-
 export function coerceForAggregate(value: SqlValue, functionName: string): SqlValue {
 	const upperName = functionName.toUpperCase();
 	if (NON_NUMERIC_AGGREGATES.has(upperName) || upperName.startsWith('JSON_')) {

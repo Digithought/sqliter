@@ -330,6 +330,55 @@ describe('Materialized-view query rewrite — TIMESPAN min/max rollup equivalenc
 	});
 });
 
+/* ── Collated-argument rollup (NOCASE min/max) ────────────────────────────────
+ * The collation half of the same rule, and the harder half: an aggregate's result
+ * type carries the argument's logical type but NOT its collation, so `min(v)` over a
+ * `collate nocase` column lands in a BINARY-declared backing column. The rollup binds
+ * to the matcher's recorded ARGUMENT collation instead, so folding stored partials
+ * ranks them the same way the query would without the view ('a' < 'B' under NOCASE,
+ * 'B' < 'a' under BINARY). */
+
+describe('Materialized-view query rewrite — NOCASE min/max rollup equivalence', () => {
+	let db: Database;
+
+	const NC_QUERIES: readonly string[] = [
+		'select k, min(v), max(v) from t group by k', // exact-key
+		'select min(v), max(v) from t',               // global-scalar rollup across groups
+	];
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec(`
+			create table t (id integer primary key, k integer not null, v text collate nocase);
+			create materialized view nmv_k as
+				select k, count(*) as c, min(v) as mn, max(v) as mx from t group by k;
+			insert into t values (1, 1, 'B'), (2, 2, 'a'), (3, 2, 'C');
+		`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('exact-key / global NOCASE extrema match with the rewrite on vs off', async () => {
+		for (const q of NC_QUERIES) {
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+			const on = await readMultiset(db, q);
+			db.optimizer.updateTuning(REWRITE_OFF);
+			const off = await readMultiset(db, q);
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+			expect(on, `rewrite changed rows for: ${q}`).to.deep.equal(off);
+		}
+	});
+
+	it('the global rollup rewrites onto the backing and ranks under NOCASE', async () => {
+		const q = 'select min(v) as mn, max(v) as mx from t';
+		expect(serializePlanTree(db.getPlan(q)), `expected an MV-table rewrite for: ${q}`)
+			.to.contain('"name": "nmv_k"');
+		const rows: Record<string, SqlValue>[] = [];
+		for await (const row of db.eval(q)) rows.push(row as Record<string, SqlValue>);
+		// BINARY order over the stored partials ('B', 'a') would report mn=B, mx=a.
+		expect(rows).to.deep.equal([{ mn: 'a', mx: 'C' }]);
+	});
+});
+
 /* ── Join-subsumption equivalence ─────────────────────────────────────────────
  * Extends the harness with the join arm: an MV `jmv` materializing the 1:1 FK→PK
  * inner join `orders ⋈ customers` answers 1:1-join queries (with driving-side and

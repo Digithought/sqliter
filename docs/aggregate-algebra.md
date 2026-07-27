@@ -65,12 +65,25 @@ assertAggregateAlgebraLaws(mySchema, valueArb /* legal argument values, incl. NU
 
 It property-checks laws 1–5 for whichever fields are present and throws naming the violated law. Pick a `valueArb` matching the value-domain the declaration is exact for (integers for sum — float sums drift, which is a value-domain property the write side gates on, not something the declaration can express).
 
+### Call-site binding (`bindArgs`)
+
+An aggregate whose result depends on how its arguments *compare* cannot be declared once for all call sites: `min(x)` must rank by elapsed time when `x` is a `timespan`, structurally when it is `json`, and under the declared collation when it is collated text — the same ordering [`ORDER BY` uses](types.md#semantic-ordering). A schema may therefore declare an optional `bindArgs(args)` hook, called **once per call site** at emit / materialized-view plan-build time — never per row — with one `{ logicalType?, collation? }` per declared argument. It returns replacement `stepFunction` / `finalizeFunction` / `algebra` closures, or `undefined` to keep the declared defaults. Apply it with `bindAggregateSchema(schema, args)` (`func/registration.ts`), which is idempotent — a bound schema keeps the hook, so no call site has to track whether it already bound.
+
+Two obligations beyond the laws above:
+
+- **The bound `algebra` must compare the same way the bound `stepFunction` does.** A `merge` that ranks differently from the step makes materialized-view maintenance disagree with direct evaluation. Deriving both from one comparator (as the builtin min/max factory does) makes this structural rather than a review item.
+- **The bound `algebra` must declare the same FIELDS as the unbound declaration.** Delta-maintenance and rollup eligibility are decided from field presence on the *unbound* schema; a binding that dropped `decode` would be gated in and then fail.
+
+Bound and unbound schemas are both worth law-checking — `test/incremental/aggregate-algebra.spec.ts` runs the harness over `bindAggregateSchema(minFunc, [{ logicalType: TIMESPAN_TYPE }])` as well as the registered default, since a step/merge comparator mismatch only shows up in the bound pair.
+
+One consequence to keep in mind when consuming *stored* results: an aggregate's result type carries its argument's logical type but **not** the argument's collation, so anything re-ranking stored partials must take the collation from the argument rather than from the column the partials landed in (see `MergeReagg.argCollation`).
+
 ### Builtin declarations
 
 | aggregate | merge | negate | decode | decodeExact | decompose |
 |---|---|---|---|---|---|
 | `count(*)`, `count(x)` | `a+b` | `-a` | stored int (finalize is identity) | yes | — |
 | `sum(x)` | add (bigint-promoting) | yes | stored v → non-empty accumulator with an absorbing (Infinity) count witness; NULL → empty | — (witness) | — |
-| `min(x)` / `max(x)` | binary-min/max (same BINARY comparison as step) | — (tighten-only) | stored v → accumulator; NULL → empty | — | — |
+| `min(x)` / `max(x)` | keeps whichever value the call site's comparator ranks first/last (the same comparator as step — see [Call-site binding](#call-site-binding-bindargs)) | — (tighten-only) | stored v → accumulator; NULL → empty | — | — |
 | `avg(x)` | sum+count pairwise | yes | — (quotient forgets the count) | — | `sum(x)`, `count(x)` → real division; count 0/NULL ⇒ NULL |
 | `total`, `group_concat`, `var_*`, `stddev_*` | — | — | — | — | — (deliberately residual-only; e.g. total's float running sum drifts under retraction) |

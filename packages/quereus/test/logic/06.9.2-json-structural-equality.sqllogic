@@ -263,6 +263,11 @@ select id, d from jse_mm order by d;
 select min(d) as mn, max(d) as mx from jse_mm;
 → [{"mn":[8,1],"mx":[10]}]
 
--- GROUP BY shape (hash aggregate) and DISTINCT agree with the plain form.
+-- DISTINCT agrees with the plain form.
 select min(distinct d) as mn, max(distinct d) as mx from jse_mm;
 → [{"mn":[8,1],"mx":[10]}]
+
+-- GROUP BY shape (hash aggregate) reaches the same bound comparator: group 1
+-- holds [8,1] and [10], whose structural and canonical-text orders disagree.
+select id % 2 as g, min(d) as mn, max(d) as mx from jse_mm group by id % 2 order by g;
+→ [{"g":0,"mn":[9],"mx":[9]},{"g":1,"mn":[8,1],"mx":[10]}]

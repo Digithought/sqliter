@@ -189,6 +189,12 @@ export interface MergeReagg {
 	/** The stored aggregate's registered schema — carries `algebra.merge`/`decode`,
 	 *  `finalizeFunction`, `initialValue`, and the return type. */
 	readonly schema: AggregateFunctionSchema;
+	/** Declared collation of the aggregate's base-column argument (`undefined` for a
+	 *  zero-argument aggregate). A comparison-sensitive aggregate's stored partials were
+	 *  chosen under THIS collation, so the rollup's `merge` must rank them under it too —
+	 *  the aggregate's result type does not carry the argument's collation, so the backing
+	 *  column alone cannot supply it. */
+	readonly argCollation?: string;
 }
 
 /** The aggregate-rollup descriptor on a {@link RewriteMatch}. */
@@ -1274,7 +1280,10 @@ function recipeForRollup(
 	if (algebra.decode) {
 		const backingCol = findStored(stored, qa.funcName, qa.argBaseCol);
 		if (backingCol === undefined) return undefined;
-		return { outAttr: qa.outAttr, kind: 'merge', reagg: { backingCol, schema } };
+		return {
+			outAttr: qa.outAttr, kind: 'merge',
+			reagg: { backingCol, schema, argCollation: argCollationOf(baseTable, qa.argBaseCol) },
+		};
 	}
 
 	return undefined; // merge-without-decode or algebra-less ⇒ not decomposable.
@@ -1314,7 +1323,14 @@ function resolveMergeablePartial(
 	// algebra; `decode` is the reconstruct the re-aggregation needs.
 	const schema = resolveAggregate(p.func, storedArgc);
 	if (!schema || !schema.algebra?.decode) return undefined;
-	return { backingCol, schema };
+	const argBaseCol = storedArgc === 0 ? undefined : partialArgBaseCol;
+	return { backingCol, schema, argCollation: argCollationOf(baseTable, argBaseCol) };
+}
+
+/** The declared collation of an aggregate's base-column argument; `undefined` for a
+ *  zero-argument aggregate. See {@link MergeReagg.argCollation}. */
+function argCollationOf(baseTable: TableSchema, argBaseCol: number | undefined): string | undefined {
+	return argBaseCol === undefined ? undefined : baseTable.columns[argBaseCol]?.collation;
 }
 
 /** The registry argument count of an aggregate call: `0` for `count(*)` (no argument),

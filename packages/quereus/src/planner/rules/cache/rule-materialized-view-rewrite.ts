@@ -670,14 +670,23 @@ function buildReaggAggregate(
 	const { backingCol } = reagg;
 	const backingAttr = backingAttrs[backingCol];
 	const colRef = colRefOnto(scope, backingAttr, backingCol);
-	// Bind to the BACKING attribute's comparison context: the fold consumes stored
-	// (finalized) values, whose type is the stored aggregate's result type — for
-	// min/max that equals the argument type, so the bound merge ranks the stored
-	// partials by the same semantic order the store maintained them under.
+	// Bind to the stored partials' comparison context: the fold consumes stored
+	// (finalized) values, whose type is the stored aggregate's result type.
+	// NOTE (soundness assumption): for min/max that result type equals the argument
+	// type, so the BACKING attribute supplies the logical type; an aggregate whose
+	// result type differed from its argument type would need its own binding — none
+	// exists today that is both rollup-eligible and comparison-sensitive.
+	// The collation does NOT follow the type, though: an aggregate's result type
+	// drops the argument's collation, so a `min(v)` over a `collate nocase` column
+	// lands in a BINARY-declared backing column. Take the collation from the matcher's
+	// recorded argument collation instead, falling back to the backing column's — else
+	// the rollup would rank NOCASE-chosen partials under BINARY and disagree with the
+	// same query evaluated without the view.
 	const backingType = backingAttr.type;
+	const collationName = reagg.argCollation ?? backingType.collationName;
 	const schema = bindAggregateSchema(reagg.schema, [{
 		logicalType: backingType.logicalType as LogicalType,
-		collation: backingType.collationName ? resolveCollation(backingType.collationName) : undefined,
+		collation: collationName ? resolveCollation(collationName) : undefined,
 	}]);
 	// The matcher admits this recipe only when merge + decode are declared.
 	const merge = schema.algebra!.merge;

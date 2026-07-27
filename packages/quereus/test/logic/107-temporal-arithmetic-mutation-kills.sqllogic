@@ -379,14 +379,17 @@ CREATE MATERIALIZED VIEW ts_mv AS
 SELECT g, c, mn, mx FROM ts_mv ORDER BY g;
 → [{"g":1,"c":3,"mn":"PT30M","mx":"PT2H"}]
 
--- (b) an insert that lowers the min exercises the delta merge path.
-INSERT INTO ts_src VALUES (4, 1, 'PT10M');
+-- (b) an insert exercises the delta merge path. 'P1D' is chosen because its text
+-- and elapsed-time orders disagree against BOTH stored extrema: it sorts before
+-- 'PT30M' textually (a text merge would wrongly drop mn to P1D) yet is the longest
+-- duration here (a text merge would wrongly leave mx at PT2H).
+INSERT INTO ts_src VALUES (4, 1, 'P1D');
 SELECT g, c, mn, mx FROM ts_mv ORDER BY g;
-→ [{"g":1,"c":4,"mn":"PT10M","mx":"PT2H"}]
+→ [{"g":1,"c":4,"mn":"PT30M","mx":"P1D"}]
 
 -- stored and direct agree after the delta merge
 SELECT g, count(*) AS c, min(dur) AS mn, max(dur) AS mx FROM ts_src GROUP BY g ORDER BY g;
-→ [{"g":1,"c":4,"mn":"PT10M","mx":"PT2H"}]
+→ [{"g":1,"c":4,"mn":"PT30M","mx":"P1D"}]
 
 -- (c) a delete of the extreme exercises the tighten residual fallback (min/max
 -- cannot retract arithmetically — the group re-derives from live source state).

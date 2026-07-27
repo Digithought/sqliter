@@ -277,5 +277,15 @@ export function bindAggregateSchema(
 	args: readonly AggregateArgBinding[],
 ): AggregateFunctionSchema {
 	const bound = schema.bindArgs?.(args);
-	return bound ? { ...schema, ...bound } : schema;
+	if (!bound) return schema;
+	// Merge field-by-field rather than spreading `bound`: an explicitly-`undefined`
+	// field must read as "keep the declared default", matching the documented
+	// contract. A spread would strip it instead — and a stripped `algebra` silently
+	// disables delta maintenance and rollup, whose gates read field presence.
+	return {
+		...schema,
+		stepFunction: bound.stepFunction ?? schema.stepFunction,
+		finalizeFunction: bound.finalizeFunction ?? schema.finalizeFunction,
+		algebra: bound.algebra ?? schema.algebra,
+	};
 }

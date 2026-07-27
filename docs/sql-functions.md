@@ -108,7 +108,10 @@ Aggregate functions perform a calculation on a set of values and return a single
 - `sum(X)`: Returns the sum of all non-NULL values of X
 - `avg(X)`: Returns the average of all non-NULL values of X
 - `min(X)`: Returns the minimum value of all non-NULL values of X
-- `max(X)`: Returns the maximum value of all non-NULL values of X
+- `max(X)`: Returns the maximum value of all non-NULL values of X — `min`/`max`
+  rank X the same way `order by X` does, so a `timespan` column compares by
+  elapsed time, a `json` column by structure, and a collated text column under
+  its declared collation (see [Type System § Semantic ordering](types.md#semantic-ordering))
 - `group_concat(X[, Y])`: Returns a string concatenating non-NULL values of X, separated by Y (default ',')
 - `total(X)`: Returns the sum as a floating-point value (returns 0.0 for empty set)
 - `var_pop(X)`: Returns the population variance
@@ -280,7 +283,10 @@ window_function([arguments]) over (
 - `count(*)`, `count(expr)`: Count of rows or non-NULL values
 - `sum(expr)`: Sum of values in the window frame
 - `avg(expr)`: Average of values in the window frame
-- `min(expr)`, `max(expr)`: Minimum/maximum values in the window frame
+- `min(expr)`, `max(expr)`: Minimum/maximum values in the window frame. Unlike
+  their plain-aggregate forms these still rank with a raw value comparison, so a
+  `timespan` / `json` / collated-text argument can disagree with `order by`
+  (tracked as `minmax-window-semantic-ordering`)
 
 **Navigation Functions (Planned):**
 - `lead(expr[, offset[, default]])`: Accesses data from subsequent rows

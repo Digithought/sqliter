@@ -310,6 +310,13 @@ storage-class + BINARY behavior. Under a semantic tie with byte-different
 spellings (`'PT1H'` vs `'PT60M'`), which raw value survives is unspecified — the
 same latitude DISTINCT and GROUP BY take for a group representative.
 
+An aggregate's *result* type carries its argument's logical type but **not** the
+argument's collation, so a materialized view over `min(nocase_col)` has a
+BINARY-declared backing column. Anything that re-ranks stored partials must
+therefore take the collation from the argument, not from the backing column — the
+read-side rollup does so via the collation the rewrite matcher records alongside
+each stored partial (`MergeReagg.argCollation`).
+
 Known gap: **window** `min(x) over (…)` still ranks with a raw JS compare — the
 window registry (`schema/window-function.ts`) has no binding seam yet (tracked as
 `minmax-window-semantic-ordering`).

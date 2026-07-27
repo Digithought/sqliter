@@ -4,12 +4,12 @@ import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type Row, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import type { AggregateArgBinding, FunctionSchema } from '../../schema/function.js';
 import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
 import type { PlanNode, RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { isRelationalNode } from '../../planner/nodes/plan-node.js';
-import { createTypedComparator, hasSemanticOrdering } from '../../util/comparison.js';
+import { createTypedComparator } from '../../util/comparison.js';
+import { bindAggregateSchemas, buildDistinctComparators, computeAggregateSkipCoercion } from './aggregate-setup.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { BTree } from 'inheritree';
 import { createLogger } from '../../common/logger.js';
@@ -18,7 +18,7 @@ import { coerceForAggregate } from '../../util/coercion.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
-import { AggValue, bindAggregateSchema, cloneInitialValue } from '../../func/registration.js';
+import { AggValue, cloneInitialValue } from '../../func/registration.js';
 import type { ContextInstaller } from '../context-helpers.js';
 
 export const ctxLog = createLogger('runtime:context');
@@ -107,94 +107,10 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 		return 0;
 	}
 
-	// Pre-resolve typed comparators for DISTINCT aggregate tracking per aggregate
-	const distinctComparators: ((a: SqlValue | SqlValue[], b: SqlValue | SqlValue[]) => number)[] = [];
-	for (const agg of plan.aggregates) {
-		const funcNode = agg.expression;
-		if (funcNode instanceof AggregateFunctionCallNode) {
-			const args = funcNode.args || [];
-			if (args.length === 1) {
-				// Single-arg: compare as scalar
-				const argType = args[0].getType();
-				const collation = argType.collationName ? ctx.resolveCollation(argType.collationName) : undefined;
-				const cmp = createTypedComparator(argType.logicalType as LogicalType, collation);
-				distinctComparators.push((a, b) => cmp(a as SqlValue, b as SqlValue));
-			} else if (args.length > 1) {
-				// Multi-arg: compare element-wise
-				const argComparators = args.map(arg => {
-					const argType = arg.getType();
-					const collation = argType.collationName ? ctx.resolveCollation(argType.collationName) : undefined;
-					return createTypedComparator(argType.logicalType as LogicalType, collation);
-				});
-				distinctComparators.push((a, b) => {
-					const arrA = a as SqlValue[];
-					const arrB = b as SqlValue[];
-					for (let i = 0; i < argComparators.length; i++) {
-						const cmp = argComparators[i](arrA[i], arrB[i]);
-						if (cmp !== 0) return cmp;
-					}
-					return 0;
-				});
-			} else {
-				// No args (e.g., COUNT(*)) - identity comparator
-				distinctComparators.push(() => 0);
-			}
-		} else {
-			distinctComparators.push(() => 0);
-		}
-	}
-
-	// Pre-compute per-aggregate whether coercion can be skipped.
-	// If all args to a numeric aggregate are already numeric types, skip coerceForAggregate().
-	const aggregateSkipCoercion: boolean[] = plan.aggregates.map(agg => {
-		const funcNode = agg.expression;
-		if (!(funcNode instanceof AggregateFunctionCallNode)) return false;
-		const funcName = (funcNode.functionName || '').toUpperCase();
-		// Non-numeric aggregates (COUNT, GROUP_CONCAT, JSON_*) never need coercion anyway
-		if (funcName === 'COUNT' || funcName === 'GROUP_CONCAT' || funcName.startsWith('JSON_')) return false;
-		// If all args have numeric plan types, no coercion needed. Likewise when every
-		// argument type carries semantic ordering (TIMESPAN/JSON): coerceForAggregate's
-		// numeric-string conversion must never run ahead of a type-aware comparator.
-		const args = funcNode.args || [];
-		return args.length > 0 && (
-			args.every(arg => arg.getType().logicalType.isNumeric)
-			|| args.every(arg => hasSemanticOrdering(arg.getType().logicalType as LogicalType))
-		);
-	});
-
-	// Resolve + bind each aggregate's schema ONCE at emit time: the call site's
-	// argument types and collations specialize comparison-sensitive aggregates
-	// (min/max via bindArgs) so their step/merge rank by the argument's semantic
-	// order. Nothing in the per-row path resolves a type or a collation.
-	const aggregateSchemas: FunctionSchema[] = [];
-	const aggregateDistinctFlags: boolean[] = [];
-	for (const agg of plan.aggregates) {
-		const funcNode = agg.expression;
-		if (!(funcNode instanceof AggregateFunctionCallNode)) {
-			quereusError(
-				`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`,
-				StatusCode.INTERNAL
-			);
-		}
-
-		const funcSchema = funcNode.functionSchema;
-		if (!isAggregateFunctionSchema(funcSchema)) {
-			quereusError(
-				`Function ${funcNode.functionName || 'unknown'} is not an aggregate function`,
-				StatusCode.INTERNAL
-			);
-		}
-
-		const argBindings: AggregateArgBinding[] = (funcNode.args || []).map(arg => {
-			const argType = arg.getType();
-			return {
-				logicalType: argType.logicalType as LogicalType,
-				collation: argType.collationName ? ctx.resolveCollation(argType.collationName) : undefined,
-			};
-		});
-		aggregateSchemas.push(bindAggregateSchema(funcSchema, argBindings));
-		aggregateDistinctFlags.push(funcNode.isDistinct);
-	}
+	const distinctComparators = buildDistinctComparators(plan.aggregates, ctx);
+	const aggregateSkipCoercion = computeAggregateSkipCoercion(plan.aggregates);
+	const { schemas: aggregateSchemas, distinctFlags: aggregateDistinctFlags } =
+		bindAggregateSchemas(plan.aggregates, ctx);
 
 	async function* run(
 		ctx: RuntimeContext,

@@ -13,7 +13,7 @@ import { type PlanNode, type RowDescriptor, type ScalarPlanNode } from '../plann
 import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
 import { AggregateFunctionCallNode } from '../planner/nodes/aggregate-function.js';
 import { isAggregateFunctionSchema } from '../schema/function.js';
-import type { AggregateDecomposition } from '../schema/function.js';
+import type { AggregateArgBinding, AggregateDecomposition } from '../schema/function.js';
 import { bindAggregateSchema } from '../func/registration.js';
 import { PhysicalType, type LogicalType } from '../types/logical-type.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
@@ -785,7 +785,7 @@ export function buildDeltaAggregateDescriptor(
 		// accumulation, merge/decode/finalize at flush — database-materialized-views-
 		// apply.ts), so store maintenance ranks by the same comparator as direct
 		// evaluation (min/max over TIMESPAN/JSON/collated text).
-		// Soundness note: the flush's decode reconstructs an accumulator from the STORED
+		// NOTE (soundness assumption): the flush's decode reconstructs an accumulator from the STORED
 		// backing value and merges it against step contributions from SOURCE rows. For
 		// min/max the backing column's type is inferReturnType(argType) = argType, so one
 		// binding covers both sides. An aggregate whose result type differed from its
@@ -793,18 +793,19 @@ export function buildDeltaAggregateDescriptor(
 		// delta-maintainable and comparison-sensitive; state the assumption rather than
 		// generalizing for it.
 		let argSourceCol: number | undefined;
-		let schema = bindAggregateSchema(unboundSchema, []);
+		const argBindings: AggregateArgBinding[] = [];
 		if (producing.args.length === 1) {
 			const arg = producing.args[0];
 			if (!(arg instanceof ColumnReferenceNode)) return undefined; // bare column args only
 			argSourceCol = resolveTransitiveSourceCol(arg.attributeId, sourceAttrToCol, producingByAttrId);
 			if (argSourceCol === undefined) return undefined;
 			const argType = arg.getType();
-			schema = bindAggregateSchema(unboundSchema, [{
+			argBindings.push({
 				logicalType: argType.logicalType as LogicalType,
 				collation: argType.collationName ? collationResolver(argType.collationName) : undefined,
-			}]);
+			});
 		}
+		const schema = bindAggregateSchema(unboundSchema, argBindings);
 		const algebra = schema.algebra;
 		// Class routing — declaration-driven, never an aggregate-name list:
 		//  - **directly delta-maintainable** (`merge` + `negate` (retraction) + `decode` —
