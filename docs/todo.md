@@ -280,6 +280,18 @@ The logical type system enables significant runtime performance improvements by 
 - [ ] **Computed Columns**: Columns with derived values
 - [ ] **ALTER TABLE**: More comprehensive ALTER TABLE operations
 - [ ] **Materialized Views**: Views with cached results
+- [ ] **Atomic store catalog rename**: fold the old-entry delete and every dependent
+  rewrite into one `provider.beginAtomicBatch` commit, removing the crash residues
+  documented in [`schema.md` § Store catalog persistence](schema.md#store-catalog-persistence-bundled-index-ddl).
+  Needs an atomic provider and a larger engine↔module change.
+
+**Runtime — parallel and validation follow-ups**
+- [ ] **Per-branch equi-pair surface on `FanOutBranchSpec`**: would let
+  `FanOutLookupJoinNode.computePhysical` tighten its ordering/FD derivation without
+  changing the emitter (see [`runtime.md`](runtime.md#fanoutlookupjoinnode-per-row-fan-out-lookup-join)).
+- [ ] **Relax the connection lock for fully-reentrant modules**: once a module advertises
+  `'fully-reentrant'`, the optimizer predicate and the lock policy can refine in tandem
+  for that module (see [`runtime.md`](runtime.md#connection-lock-contract-under-impure-subtrees)).
 
 **Performance & Scalability (Medium-term)**
 - [ ] **Memory Pooling**: Reduce allocation overhead in hot paths
@@ -430,6 +442,10 @@ Core sync is complete (see [`sync.md`](sync.md)); these are refinements and cove
 - [ ] Consider `TransactionCoordinator` in the store adapter for batched writes
 - [ ] Update the sync store adapter to use `UnifiedIndexedDBModule` for atomic sync writes
 - [ ] Leverage Store-level isolation (memory vtab's `TransactionLayer` pattern) for true ACID sync semantics
+
+**Storage cost**
+- [ ] Config flag to opt out of the tombstone row before-image (`priorRow`), whose cost is
+  bounded but non-trivial for wide rows (see [`sync.md`](sync.md#data-structures))
 
 **Testing**
 - [ ] Tombstone TTL expiration and fallback to snapshot

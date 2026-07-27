@@ -2,59 +2,34 @@
 
 > **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
 
-This document describes the architecture for `quereus-sync`, a fully automatic multi-master CRDT replication system for Quereus. It enables offline-first applications where multiple replicas can independently modify data and converge to a consistent state.
+The architecture of `quereus-sync`, a fully automatic multi-master CRDT replication system for Quereus. It enables offline-first applications where multiple replicas independently modify data and converge to a consistent state.
 
 ## Design Goals
 
-- **Fully Automatic**: All tables in the store are automatically CRDT-enabled. No opt-in required.
-- **Automatic Schema Evolution**: Schema changes are tracked and synchronized without special handling.
-- **Transport Agnostic**: Exposes sync data structures and APIs without assuming any transport layer.
-- **Backend Agnostic**: Works with both LevelDB (Node.js) and IndexedDB (browser) via the store plugin.
-- **Reactive**: Exposes hooks for UI reactivity when data changes from local or remote sources.
-- **Transaction-Aware**: Changes are grouped by transaction for atomic sync operations.
+- **Fully Automatic**: every table in the store is CRDT-enabled; no opt-in.
+- **Automatic Schema Evolution**: schema changes are tracked and synchronized without special handling.
+- **Transport Agnostic**: exposes sync data structures and APIs, assuming no transport layer.
+- **Backend Agnostic**: LevelDB (Node.js) and IndexedDB (browser), via the store plugin.
+- **Reactive**: hooks for UI reactivity on local or remote data changes.
+- **Transaction-Aware**: changes are grouped by transaction for atomic sync operations.
 
 ## Architecture Overview
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                         Application Layer                                   │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────────────────┐ │
-│  │   Quereus   │  │ Sync Hooks  │  │     Transport (user-provided)       │ │
-│  │  Database   │  │ (reactive)  │  │  WebSocket / HTTP / WebRTC / etc.   │ │
-│  └──────┬──────┘  └──────┬──────┘  └─────────────────┬───────────────────┘ │
-│         │                │                           │                      │
-├─────────┼────────────────┼───────────────────────────┼──────────────────────┤
-│         ▼                ▼                           ▼                      │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                      quereus-sync                                    │  │
-│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────────┐  │  │
-│  │  │    HLC     │  │  Metadata  │  │   Sync     │  │    Schema      │  │  │
-│  │  │   Clock    │  │   Store    │  │  Protocol  │  │   Tracker      │  │  │
-│  │  └────────────┘  └────────────┘  └────────────┘  └────────────────┘  │  │
-│  │                                                                       │  │
-│  │  ┌────────────────────────────────────────────────────────────────┐  │  │
-│  │  │                    SyncModule (wrapper)                         │  │  │
-│  │  │  Intercepts mutations → Records CRDT metadata → Delegates       │  │  │
-│  │  └────────────────────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-│                                    │                                        │
-├────────────────────────────────────┼────────────────────────────────────────┤
-│                                    ▼                                        │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                      quereus-store                                   │  │
-│  │  ┌─────────────────────────┐  ┌─────────────────────────┐            │  │
-│  │  │   LevelDB (Node.js)     │  │   IndexedDB (Browser)   │            │  │
-│  │  │   Data + CRDT Metadata  │  │   Data + CRDT Metadata  │            │  │
-│  │  └─────────────────────────┘  └─────────────────────────┘            │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+Three layers:
+
+- **Application** — the Quereus `Database`, the reactive sync hooks, and a user-provided
+  transport (WebSocket / HTTP / WebRTC / …).
+- **`quereus-sync`** — the HLC clock, the metadata store, the sync protocol and the schema
+  tracker, wrapped by `SyncModule`, which intercepts mutations, records CRDT metadata, and
+  delegates to the layer below.
+- **`quereus-store`** — LevelDB (Node.js) or IndexedDB (browser), holding data *and* CRDT
+  metadata in one backend.
 
 ## Core Concepts
 
 ### Hybrid Logical Clock (HLC)
 
-The sync module uses a Hybrid Logical Clock to establish causal ordering of events across distributed replicas. HLC combines:
+A Hybrid Logical Clock establishes causal ordering of events across distributed replicas, combining:
 
 - **Physical Time**: Wall clock time in milliseconds for rough ordering
 - **Logical Counter**: Disambiguates events within the same millisecond
@@ -70,19 +45,16 @@ interface HLC {
 }
 ```
 
-HLC ordering: `(wallTime, counter, siteId, opSeq)` compared lexicographically. This ensures:
-- Events with higher wall time are considered newer
-- Events at the same wall time are ordered by counter
-- Ties are broken deterministically by site ID
-- Facts of the *same* transaction (same `wallTime`, `counter`, `siteId`) are ordered
-  by `opSeq`
+HLC ordering: `(wallTime, counter, siteId, opSeq)` compared lexicographically. Higher wall
+time is newer; equal wall times order by counter; ties break deterministically by site ID;
+and facts of the *same* transaction (same `wallTime`, `counter`, `siteId`) order by `opSeq`.
 
-`opSeq` is the data-model layer for "HLC = transaction" grouping: it is a
-contiguous, 0-based sub-order assigned per transaction. Because `siteId` is
-compared **before** `opSeq`, two different sites never reach the `opSeq` tiebreak,
-so `opSeq` only ever discriminates facts produced by one site at one
-`(wallTime, counter)` — i.e. within a single transaction. It is **transaction-local**:
-it resets every transaction and is **not** persisted in the `hc:` clock state.
+`opSeq` is the data-model layer for "HLC = transaction" grouping: a contiguous,
+0-based sub-order assigned per transaction. Because `siteId` is compared **before**
+`opSeq`, two different sites never reach the `opSeq` tiebreak, so `opSeq` only ever
+discriminates facts produced by one site at one `(wallTime, counter)` — i.e. within a
+single transaction. It is **transaction-local**: it resets every transaction and is
+**not** persisted in the `hc:` clock state.
 
 Encoding widths: the comparison key serializes as 30 bytes —
 8 (`wallTime`) + 2 (`counter`) + 16 (`siteId`) + 4 (`opSeq`, big-endian uint32) —
@@ -94,17 +66,16 @@ key order matches `compareHLC`.
 the local wall time by more than `MAX_DRIFT_MS` (60 s) is rejected: a peer with a
 badly-wrong clock would otherwise land far-future LWW winners that permanently beat
 every legitimate future write. The check (`assertWithinDrift` in `clock/hlc.ts`) is a
-side-effect-free bound that both the apply paths and `HLCManager.receive` share. It
-runs as **pre-commit validation** — the wire path checks the batch's maximum fact HLC
-at the top of `applyChanges`, and the snapshot path checks the header HLC before
-`clearExistingMetadata`, both **before any data or CRDT metadata is written**. So a
-rejected drifted batch/snapshot lands **nothing** (the receiver's existing metadata is
-not even cleared); `receive`'s own late check remains only as a harmless last-line
-defense.
+side-effect-free bound shared by the apply paths and `HLCManager.receive`, and runs as
+**pre-commit validation** — the wire path on the batch's maximum fact HLC at the top of
+`applyChanges`, the snapshot path on the header HLC before `clearExistingMetadata`,
+both **before any data or CRDT metadata is written**. A rejected drifted batch/snapshot
+therefore lands **nothing** (the receiver's existing metadata is not even cleared);
+`receive`'s own late check is a last-line defense.
 
 ### Conflict Resolution: Column-Level Last-Write-Wins (LWW)
 
-Each column of each row is tracked independently. When the same column is modified on multiple replicas, the write with the highest HLC wins.
+Each column of each row is tracked independently; when the same column is modified on multiple replicas, the highest-HLC write wins.
 
 ```
 Replica A: UPDATE users SET name = 'Alice' WHERE id = 1  @ HLC(1000, 1, A)
@@ -117,23 +88,14 @@ This is more fine-grained than row-level LWW, preserving more user intent.
 
 #### Pluggable Conflict Resolution
 
-The default LWW strategy can be replaced by setting `conflictResolver` on `SyncConfig`. The resolver is called for every column-level conflict where a local version already exists.
+Setting `conflictResolver` on `SyncConfig` replaces the default LWW strategy. The resolver is called for every column-level conflict where a local version already exists.
 
 ```typescript
 import { createSyncModule, localWinsResolver, remoteWinsResolver } from '@quereus/sync';
 import type { ConflictResolver } from '@quereus/sync';
 
-// Built-in: always keep local value (target-wins)
-const { syncManager } = await createSyncModule(kv, storeEvents, {
-  conflictResolver: localWinsResolver,
-});
-
-// Built-in: always accept remote value (source-wins)
-const { syncManager } = await createSyncModule(kv, storeEvents, {
-  conflictResolver: remoteWinsResolver,
-});
-
-// Custom: per-column policy
+// Custom: per-column policy. Built-ins: localWinsResolver (target-wins),
+// remoteWinsResolver (source-wins).
 const resolver: ConflictResolver = (ctx) => {
   if (ctx.column === 'counter') return 'remote';  // max-wins simulation
   return 'local';                                  // default: keep local
@@ -147,100 +109,94 @@ When no `conflictResolver` is configured, the fast-path HLC comparison is used d
 
 The `ctx` (`ConflictContext`) also carries the incoming change's optional before-image as
 `ctx.remotePriorValue` / `ctx.remotePriorHlc` — the value (and its HLC) the remote write
-overwrote at its origin (see § Data Structures → per-cell before-image). This lets a
-resolver or transition validator see what the source changed *from* (e.g. accept the
-remote only if it transitioned from the value the receiver still holds). Both are absent
-when the incoming change carried no prior, and they do **not** affect default resolution.
+overwrote at its origin (see § Data Structures → per-cell before-image) — so a resolver or
+transition validator can see what the source changed *from* (e.g. accept the remote only if
+it transitioned from the value the receiver still holds). Both are absent when the incoming
+change carried no prior, and neither affects default resolution.
 
 > **Future Work**: The architecture supports extending to other CRDT types (counters, sets, RGA for text) by tracking different metadata per column type.
 
 ### Tombstones and Deletions
 
-Deletions are recorded as "tombstones" with an HLC timestamp. Tombstones prevent deleted rows from being resurrected by older writes that arrive later.
+Deletions are recorded as "tombstones" with an HLC timestamp, preventing deleted rows from being resurrected by older writes arriving later.
 
 **Resurrection Policy** (configurable):
 - **Default: Delete Wins** (`allowResurrection: false`) - once a row is tombstoned, **all** subsequent column writes for it are blocked — regardless of the write's HLC — until the tombstone is pruned at the retention horizon
 - **Optional: Resurrection Allowed** (`allowResurrection: true`) - an insert/update with HLC > the tombstone's T1 resurrects the row; writes with HLC ≤ T1 stay blocked
 
-**The rule applies within one apply batch too**: a delete carried in an `applyChanges` batch blocks that same batch's column changes for its row exactly as an already-stored tombstone would (the row's max-HLC in-batch delete is the blocker; under `allowResurrection` a column change with a later HLC survives it). One batch therefore leaves the same **state** as the same changes applied across separate batches — a relay or reconnecting client that receives a delete and a re-creation of one row in a single sync round converges identically to a peer that received them one round at a time, and re-emits identical changes onward. The *event stream* is not identical: resolution events (`onConflictResolved`) are emitted before the in-batch reconciliation runs, so a change that ends up blocked can still have emitted one, and a delete + re-creation collapses to a single net store event rather than a delete followed by an insert.
+**The rule applies within one apply batch too**: a delete carried in an `applyChanges` batch blocks that same batch's column changes for its row exactly as an already-stored tombstone would (the row's max-HLC in-batch delete is the blocker; under `allowResurrection` a column change with a later HLC survives it). One batch therefore leaves the same **state** as the same changes applied across separate batches, and re-emits identical changes onward. The *event stream* is not identical: `onConflictResolved` fires before the in-batch reconciliation runs, so a change that ends up blocked can still have emitted one, and a delete + re-creation collapses to a single net store event rather than a delete followed by an insert.
 
-**Tombstone TTL**: Tombstones are retained for a configurable duration (default: 30 days). Sync attempts after TTL expiration should fall back to full snapshot transfer.
+**Tombstone TTL**: retained for a configurable duration (default 30 days); sync attempts after expiry should fall back to full snapshot transfer.
 
-**Tombstones travel in snapshots**: The **streaming** snapshot (`getSnapshotStream` / `applySnapshotStream`) carries its tombstones alongside column-versions, so a fresh replica bootstrapped from a streamed snapshot ends with the sender's tombstones — a row deleted before the snapshot stays deleted, and a later stale write for it stays tombstone-blocked. The streamed form is a global `tombstone`-chunk pass (see the Streaming Snapshot section). One caveat: `createdAt` is re-based to bootstrap time on the receiver — a bootstrapped tombstone lives a full TTL horizon from the bootstrap, not from the original deletion. **The non-streaming whole-snapshot path (`getSnapshot` / `applySnapshot`) carries tombstones the same way** — `Snapshot` has a global `tombstones: SnapshotTombstone[]` field (flat, not nested under `TableSnapshot`, so a fully-deleted row with no live column-versions still travels), `getSnapshot` fills it from a global tombstone scan, and `applySnapshot` re-writes them after the metadata clear (same `createdAt` re-base caveat).
+**Tombstones travel in snapshots**, on **both** paths, so a fresh replica ends with the sender's tombstones — a row deleted before the snapshot stays deleted, and a later stale write for it stays tombstone-blocked. The streaming path (`getSnapshotStream` / `applySnapshotStream`) carries them as a global `tombstone`-chunk pass; the non-streaming path as `Snapshot.tombstones: SnapshotTombstone[]`, filled from a global tombstone scan and re-written after the metadata clear. Both forms are **global**, not nested under `TableSnapshot`, so a fully-deleted row with no live column-versions still travels. Caveat on both: `createdAt` is re-based to bootstrap time on the receiver, so a bootstrapped tombstone lives a full TTL horizon from the bootstrap, not from the original deletion.
 
 ### Unknown-Table Disposition
 
-After a basis table retires everywhere (see [migration.md § Contract](migration.md#4-contract--retire-the-old-table)), a long-offline **straggler** can reconnect and send changes for a table the receiver no longer has. The receiver detects this **structurally** during Phase 1 of `applyChanges` — the table simply isn't in the local basis (`getTableSchema` returns nothing); there is no version negotiation. Detection unions the current basis with the batch's own in-flight DDL, so a `create_table` earlier in the same batch makes its table known and a `drop_table` makes one unknown. The self-origin echo skip runs first, so a peer never quarantines its own change.
+After a basis table retires everywhere (see [migration.md § Contract](migration.md#4-contract--retire-the-old-table)), a long-offline **straggler** can reconnect and send changes for a table the receiver no longer has. The receiver detects this **structurally** in Phase 1 of `applyChanges` — the table simply isn't in the local basis (`getTableSchema` returns nothing); there is no version negotiation. Detection unions the current basis with the batch's own in-flight DDL, so a `create_table` earlier in the same batch makes its table known and a `drop_table` makes one unknown. The self-origin echo skip runs first, so a peer never quarantines its own change.
 
-Diverted changes are **never resolved, applied, or recorded as CRDT metadata** — keeping the change log clean for a table the receiver does not have — and are handled per `SyncConfig.unknownTableDisposition`:
+Diverted changes are **never resolved, applied, or recorded as CRDT metadata** — that keeps the change log clean for a table the receiver does not have — and are handled per `SyncConfig.unknownTableDisposition`:
 
 | Disposition | Behavior |
 |---|---|
-| `quarantine` (default) | Durably hold each diverted `Change` verbatim under a `qt:` key, HLC-keyed (idempotent re-apply: one entry per change), committed inside the same admission unit as the data/metadata so a crash cannot strand a straggler's write. Inspect with `QuarantineStore.list`; GC at the retention horizon via `pruneQuarantine()` (same `now - receivedAt > retentionHorizonMs` test tombstones use). |
+| `quarantine` (default) | Durably hold each diverted `Change` verbatim under a `qt:` key, HLC-keyed (one entry per change, so re-apply is idempotent), committed inside the same admission unit as the data/metadata so a crash cannot strand a straggler's write. Inspect with `QuarantineStore.list`; GC at the retention horizon via `pruneQuarantine()` (the same `now - receivedAt > retentionHorizonMs` test tombstones use). |
 | `ignore` | Drop the diverted changes (nothing durable written). The deliberate opt-out — write loss is intentional and observable, not silent. |
-| `store-and-forward` | Hold each diverted `Change` exactly as `quarantine` does (HLC-keyed, same admission unit, horizon-bounded GC) **and** mark it *forwardable*, so this peer relays it to peers that still have the table via the existing outbound delta sync (see § Store-and-forward relay below). Inspect forwardable holds with `QuarantineStore.listForwardable`. |
+| `store-and-forward` | Hold each diverted `Change` exactly as `quarantine` does **and** mark it *forwardable*, so this peer relays it to peers that still have the table via the existing outbound delta sync (see § Store-and-forward relay). Inspect forwardable holds with `QuarantineStore.listForwardable`. |
 
 **Telemetry fires either way**, because the failure mode the disposition guards against is otherwise silent write loss the straggler never learns about:
 
 - `onUnknownTable(listener)` — one `UnknownTableEvent` per distinct unknown table per apply (see § Reactive Hooks).
-- `getUnknownTableStats()` — cumulative, observe-only: `{ ignored, quarantined, forwarded, relayed, byTable }` (counts of diverted changes by disposition and by `schema.table`). `forwarded` counts changes held forwardable at apply time (held once); `relayed` counts forwardable changes re-offered through `getChangesSince` (relay activity — one held entry is relayed possibly many times until it GCs). Mirrors the engine's `getMaterializedViewCollisionStats()` pattern.
+- `getUnknownTableStats()` — cumulative, observe-only: `{ ignored, quarantined, forwarded, relayed, byTable }` (diverted-change counts by disposition and by `schema.table`). `forwarded` counts changes held forwardable at apply time (held once); `relayed` counts forwardable changes re-offered through `getChangesSince` — one held entry may relay many times until it GCs.
 - `ApplyResult.unknownTable` — count of changes diverted this apply, for callers that don't subscribe.
 
 When `getTableSchema` is absent (e.g. a relay-only coordinator with no basis oracle) detection is **inert**, and the store adapter's defensive `Table not found for external write` throw remains the fallback. Snapshot bootstrap paths (`applySnapshot` / `applySnapshotStream`) are out of scope — they transfer a whole basis, not a straggler delta, so an unknown table there still hits that defensive throw.
 
 #### Store-and-forward relay
 
-The `store-and-forward` disposition holds diverted changes identically to `quarantine` but marks each *forwardable*, and this peer re-offers them to peers that still have the table. The re-offer rides the existing outbound delta path: `getChangesSince` folds `QuarantineStore.listForwardable()` into its merged `ChangeSet[]` return — **no new transport surface**, so `quereus-sync-client` / `sync-coordinator` need no change. Each forwarded change keeps its **original `hlc` + `siteId`** (the straggler's fact), which makes the relay convergent and loop-free with **no per-table peer-membership oracle** (none exists):
+This peer re-offers its forwardable holds to peers that still have the table, riding the existing outbound delta path: `getChangesSince` folds `QuarantineStore.listForwardable()` into its merged `ChangeSet[]` return — **no new transport surface**, so `quereus-sync-client` / `sync-coordinator` need no change. Each forwarded change keeps its **original `hlc` + `siteId`** (the straggler's fact), which makes the relay convergent and loop-free with **no per-table peer-membership oracle** (none exists):
 
-- **Watermark-safe.** Forwardable changes are filtered `HLC > sinceHLC` before merge, exactly like change-log changes. A consumer advances its per-peer `lastSyncHLC` to `max(ChangeSet.hlc)`; without the filter, a forwarded-only round carrying an old HLC would regress that watermark and trigger a re-scan/re-deliver flood. With it, the merged response is a contiguous prefix and the advance loses nothing.
-- **Loop-free.** A receiver that still lacks the table re-disposes the forwarded change per its own config (re-quarantine / re-forward). Because the HLC + siteId are preserved, a peer that already holds the change re-holds it idempotently (one HLC-keyed entry), and the per-peer watermark stops re-send after one exchange — so two non-holders ping-ponging a change quiesce instead of looping.
-- **Bound + ordering.** The change-log scan early-exits at a transaction cut `C`; the forwardable scan is full (all `> sinceHLC`); `buildTransactionChangeSets` re-bounds the union at `batchSize` at a transaction boundary `M ≤ C`. Everything `≤ M` from both sources is present, so the returned prefix stays contiguous and a forwarded change interleaves with change-log changes in global HLC order. Forwardable entries beyond `M` are re-collected next round. A forwarded change re-forms the straggler's original transaction by `deterministicTxnId`, so if the straggler wrote both a live and a (now-retired-here) table in one transaction, the applied part and the forwarded part rejoin into one ChangeSet.
-- **Accepted limitation.** A straggler whose change is causally older than the holder's sync recency with a peer (`HLC ≤ sinceHLC`) is not relayed via this delta path — the same scalar-watermark limitation the base delta layer already has (a causally-old change learned late from a peer is delivered by direct sync / snapshot, not re-propagated via delta). store-and-forward targets the transitional uneven-retirement window where the straggler's writes are recent enough to exceed holder watermarks; quarantine already prevents write loss outside it.
-- **Snapshot carve-out.** Forwardable entries are **delta-only**. A snapshot transfers the offering peer's own basis; a forwarded change is for a table that peer does not have, so it has no place in a basis snapshot. The snapshot collectors scan only `cv:` / `tb:` / `sm:` and never carry forwardable (`qt:`) entries.
+- **Watermark-safe.** Forwardable changes are filtered `HLC > sinceHLC` before merge, like change-log changes. A consumer advances its per-peer `lastSyncHLC` to `max(ChangeSet.hlc)`; without the filter, a forwarded-only round carrying an old HLC would regress that watermark and trigger a re-scan/re-deliver flood.
+- **Loop-free.** A receiver that still lacks the table re-disposes the forwarded change per its own config (re-quarantine / re-forward). Because HLC + siteId are preserved, a peer that already holds it re-holds it idempotently (one HLC-keyed entry), and the per-peer watermark stops re-send after one exchange — so two non-holders ping-ponging a change quiesce instead of looping.
+- **Bound + ordering.** The change-log scan early-exits at a transaction cut `C`; the forwardable scan is full (all `> sinceHLC`); `buildTransactionChangeSets` re-bounds the union at `batchSize` at a transaction boundary `M ≤ C`. Everything `≤ M` from both sources is present, so the returned prefix stays contiguous and a forwarded change interleaves with change-log changes in global HLC order; entries beyond `M` are re-collected next round. A forwarded change re-forms the straggler's original transaction by `deterministicTxnId`, so a straggler transaction touching both a live and a now-retired-here table rejoins into one ChangeSet.
+- **Accepted limitation.** A straggler change causally older than the holder's sync recency with a peer (`HLC ≤ sinceHLC`) is not relayed via this delta path — the same scalar-watermark limitation the base delta layer has (such a change arrives by direct sync / snapshot instead). store-and-forward targets the transitional uneven-retirement window where the straggler's writes are recent enough to exceed holder watermarks; quarantine prevents write loss outside it.
+- **Snapshot carve-out.** Forwardable entries are **delta-only**: a snapshot transfers the offering peer's own basis, and a forwarded change is for a table that peer does not have. The snapshot collectors scan only `cv:` / `tb:` / `sm:`, never `qt:`.
 - **GC vs in-flight relay.** A forwardable entry pruned at the horizon while a slow peer still needed it is acceptable — that peer was already past the delivery guarantee. After `pruneQuarantine` removes it, `getChangesSince` no longer relays it.
-
-The metadata-layer mechanics above are covered by `store-and-forward-relay.spec.ts`; that a relayed change actually materializes as a live SQL row on the holder (real `Database` + `StoreModule` + store adapter, queried back with `select`, carrying the straggler's origin HLC) is covered end-to-end by `store-and-forward-relay-e2e.spec.ts`.
 
 #### Revival / drain
 
-A retired table can come **back** — re-created app-side, a `create_table` for it arrives in an inbound batch, or a local lens redeploy re-maps it back into the basis. When it does, its held changes (both `quarantine` and forwardable `store-and-forward` — a held change is a held change regardless of *why* it was held) are **replayed into the now-present table** rather than waiting on horizon GC, via `SyncManager.drainHeldChanges(schema?, table?)` — a sibling of `pruneTombstones` / `pruneQuarantine` / `evictExpiredBasisTables`, called from the host's periodic maintenance path (or right after the host re-creates a table). The library adds **no timer** for that sweep; it *also* drains **reactively** on the two library-internal reappearance paths — an inbound `create_table`, or a lens redeploy's `detached → present` re-map (*Low-latency reappearance* below) — and the **host** can drive an equally eager drain on an app-side local `create table` (*Who drives the sweep* below). The invariant is "never **interleaves** drain into the admitting batch", not "never drains inline" — a reactive drain runs as its own post-commit apply unit, distinct from the batch it follows.
+A retired table can come **back** — re-created app-side, a `create_table` arriving in an inbound batch, or a local lens redeploy re-mapping it into the basis. Its held changes (both `quarantine` and forwardable `store-and-forward`; a held change is a held change regardless of *why*) are then **replayed into the now-present table** rather than waiting on horizon GC, via `SyncManager.drainHeldChanges(schema?, table?)` — a sibling of `pruneTombstones` / `pruneQuarantine` / `evictExpiredBasisTables`, called from the host's maintenance path. The library adds **no timer**; it *also* drains **reactively** on the two library-internal reappearance paths (*Low-latency reappearance* below), and the **host** can drive an equally eager drain on an app-side local `create table` (*Who drives the sweep* below).
 
-- **Scope** mirrors `QuarantineStore.list`: `(schema, table)` drains one table, `(schema)` a schema, the no-arg form sweeps every held entry whose table is back. Returns the number of held entries cleared.
-- **Resolution** runs each held change against the reappeared table exactly like a fresh inbound change (LWW / tombstone-blocking / `allowResurrection`), then **clears it from the hold on resolution whether or not it applied** — a held change that lost LWW or was tombstone-blocked resolves identically on any later sweep, so holding it longer is pointless; only entries for still-absent tables stay held. A held column change for a column the re-created table no longer has is **drift-dropped** (resolved-and-cleared, never sent to the store), so one stale entry cannot poison the table's whole drain admission.
-- **Ordering.** Drain runs as a *separate* apply, **after** any re-creating batch has committed, so the fresh data lands first and the older held changes simply LWW-resolve against it — no intra-admission interleaving and no re-merge of the (already-merged) HLC watermark. The whole call is one `admitGroup` unit (data first → CRDT metadata + held-entry deletes second), so a crash before the metadata commit leaves the entries held and a re-drain re-resolves them idempotently.
-- **Events.** Applied changes fire `onRemoteChange` (so MV maintenance / `Database.watch` / UI react to the revival), grouped by each held change's **original origin** `hlc.siteId`; each drained table fires `onHeldChangesDrained` (`{ schema, table, drained, applied, skipped }`, with `applied + skipped === drained`). A forwarded entry that drains stops being relay-offered and rides the normal change log thereafter (it is a real local version now).
-- **No-oracle no-op.** Without `getTableSchema` a relay-only coordinator cannot tell which held tables are present, so `drainHeldChanges` returns 0 and touches nothing — exactly as unknown-table detection is inert there. Zero-cost when nothing is held.
-- **Low-latency reappearance.** Both reappearance paths replay the held edits **immediately** — the moment the revival has committed — instead of waiting up to one sweep interval, by running the scoped drain as a **separate post-commit apply unit** after the admitting batch / deploy has fully committed (fresh data lands first, the older held edits LWW-resolve against it — never interleaved into the admitting batch). Both share the `SyncConfig.drainOnReappear` flag (default **on**; set `false` to leave all drain timing to the host sweep), are **advisory** (a drain throw is logged + swallowed — the revival is already committed, so held entries simply stay held for the next sweep), and **idempotent** with the periodic sweep (a second drain of an already-drained table returns 0). Inert on a relay-only / no-oracle peer, exactly like the sweep.
-  - **Inbound `create_table`.** When a remote peer re-creates the table mid-sync, `applyChanges` runs the drain after the admitting batch commits. Only an *applied* `create_table` triggers it — an HLC-dominated duplicate that lost resolution does not — and a `create_table` + `drop_table` of the same table in one batch leaves it absent, so the drain is a no-op.
-  - **Lens redeploy.** When a local `apply schema` redeploy re-maps a basis table from `detached` back into the basis, `recordLensDeployment` runs the drain after its lifecycle records are durable and their `onBasisTableLifecycle` events have fired (so the basis oracle sees the re-attached table). Only the precise `detached → present` transition triggers it — an idempotent re-deploy with no transition, and a brand-new table with no prior record, both skip the scoped scan (the oracle gate makes any over-trigger a harmless no-op regardless). The drain cannot abort the deploy, itself advisory bookkeeping. **Re-entrancy / deferral:** the `notifyLensDeployment` module hook is awaited *inside* the firing `apply schema` statement, which holds the engine exec mutex; the drain re-enters the engine via the store adapter's `db.ingestExternalRowChanges`, which acquires that same mutex (awaiting it inline would deadlock — the statement cannot release the mutex until the hook returns). So when the engine reports it is mid-statement (`Database._isExecuting()`), the drain is **deferred to fire-and-forget**: it queues on the mutex and runs the instant `apply schema` commits and releases it. The reappearance is therefore *eventually*-immediate (one event-loop turn after commit, observable after the local-change-capture settle), not synchronously-awaited by the deploy — unlike the inbound-`create_table` path, whose drain runs from `applyChanges` (no exec mutex held) and so is awaited inline. Outside a live statement (e.g. a metadata-only unit test over a stub store that never touches the engine mutex) the drain still awaits inline.
+- **Scope** mirrors `QuarantineStore.list`: `(schema, table)` drains one table, `(schema)` a schema, the no-arg form every held entry whose table is back. Returns the number of held entries cleared.
+- **Resolution** runs each held change against the reappeared table exactly like a fresh inbound change (LWW / tombstone-blocking / `allowResurrection`), then **clears it from the hold whether or not it applied** — one that lost LWW or was tombstone-blocked resolves identically on any later sweep, so holding it longer is pointless; only entries for still-absent tables stay held. A held column change for a column the re-created table no longer has is **drift-dropped** (resolved-and-cleared, never sent to the store), so one stale entry cannot poison the table's whole drain admission.
+- **Ordering — never interleaved.** Drain always runs as a *separate* apply unit, **after** the re-creating batch or deploy has committed, so the fresh data lands first and the older held changes LWW-resolve against it — no intra-admission interleaving, no re-merge of the already-merged HLC watermark. The whole call is one `admitGroup` unit (data first → CRDT metadata + held-entry deletes second), so a crash before the metadata commit leaves the entries held and a re-drain re-resolves them idempotently.
+- **Events.** Applied changes fire `onRemoteChange` (so MV maintenance / `Database.watch` / UI react to the revival), grouped by each held change's **original origin** `hlc.siteId`; each drained table fires `onHeldChangesDrained` (`{ schema, table, drained, applied, skipped }`, `applied + skipped === drained`). A forwarded entry that drains stops being relay-offered and rides the normal change log thereafter.
+- **No-oracle no-op.** Without `getTableSchema` a relay-only coordinator cannot tell which held tables are present, so `drainHeldChanges` returns 0 and touches nothing — as unknown-table detection is inert there. Zero-cost when nothing is held.
+- **Low-latency reappearance.** Both library-internal paths replay the held edits the moment the revival commits, rather than waiting up to one sweep interval. Both share `SyncConfig.drainOnReappear` (default **on**; `false` leaves all drain timing to the host sweep), are **advisory** (a drain throw is logged + swallowed — the revival is already committed, so held entries stay held for the next sweep), **idempotent** with the periodic sweep (a second drain of an already-drained table returns 0), and inert on a relay-only / no-oracle peer.
+  - **Inbound `create_table`.** When a remote peer re-creates the table mid-sync, `applyChanges` runs the drain after the admitting batch commits. Only an *applied* `create_table` triggers it — an HLC-dominated duplicate does not — and a `create_table` + `drop_table` of the same table in one batch leaves it absent, so the drain is a no-op. No exec mutex is held here, so this drain is awaited inline.
+  - **Lens redeploy.** When a local `apply schema` redeploy re-maps a basis table from `detached` back into the basis, `recordLensDeployment` runs the drain after its lifecycle records are durable and their `onBasisTableLifecycle` events have fired (so the basis oracle sees the re-attached table). Only the precise `detached → present` transition triggers it; an idempotent re-deploy and a brand-new table both skip the scoped scan, and the oracle gate makes any over-trigger a harmless no-op. The drain cannot abort the deploy. **Re-entrancy:** the `notifyLensDeployment` hook is awaited *inside* the firing `apply schema` statement, which holds the engine exec mutex, and the drain re-enters the engine via `db.ingestExternalRowChanges`, which acquires that same mutex — awaiting it inline would deadlock. So when the engine reports it is mid-statement (`Database._isExecuting()`), the drain is **deferred to fire-and-forget**: it queues on the mutex and runs the instant `apply schema` releases it, making the reappearance *eventually*-immediate rather than awaited by the deploy. Outside a live statement (e.g. a metadata-only unit test over a stub store) it still awaits inline.
 
-The metadata-layer mechanics above are covered by the `drainHeldChanges (revival)` and `reactive drain on inbound create_table (revival)` blocks in `unknown-table-disposition.spec.ts`, plus the `recordLensDeployment — low-latency drain on detached → re-mapped` block in `basis-lifecycle-recorder.spec.ts` for the lens-redeploy path (CRDT-metadata + in-memory stub-store level); that a held change actually materializes as a live SQL row on the re-created table through the real store adapter — queried back with `select`, carrying the straggler's origin HLC, and driving `Database.watch` capture + materialized-view maintenance (the derived effects the stub cannot fire) — is covered end-to-end by `sync-drain-e2e.spec.ts`. That suite proves **both** reactive reappearance triggers at real-engine fidelity: an inbound `create_table` (which also pins the absent-pk-delete store no-op, the forwardable→drain→relay-stops lifecycle, and the schema-drift drop against a really-re-created-without-the-column table), and a real `apply schema` lens redeploy that re-maps a `detached` table back into the basis (`drop table` → empty-lens redeploy → `detached`, then re-create + re-map → reactive drain) — the latter being the case that surfaced the exec-mutex re-entrancy deferral above (the in-memory stub never re-enters the engine, so it could not).
+**Who drives the sweep.** The library schedules nothing; the host owns cadence. It does ship the *shape* of one pass — sweep order, per-sweep error isolation, the single-flight guard — as `runSyncMaintenancePass` / `createSyncMaintenanceTicker` (`src/sync/maintenance.ts`), so every host runs the same semantics instead of re-deriving them; arming a timer around that is still the host's job.
 
-**Who drives the sweep.** The library schedules nothing; the host owns cadence. It does ship the *shape* of one pass — sweep order, per-sweep error isolation, the single-flight guard — as `runSyncMaintenancePass` / `createSyncMaintenanceTicker` (`src/sync/maintenance.ts`), so every host runs the same semantics instead of re-deriving them; arming a timer around that is still the host's job. The **quoomb-web worker** is the concrete host: it runs `drainHeldChanges` alongside `pruneQuarantine` / `pruneTombstones` / `evictExpiredBasisTables` on one periodic maintenance loop (5-minute default cadence, all four sweeps per pass, plus an immediate pass when the sync module initializes), so a reappeared table's held changes replay within one interval rather than waiting on horizon GC. The loop is owned by the sync **module** (starts on init, stops on `close()`, survives `disconnectSync()` so held changes drain even while offline); passes are single-flight and per-sweep error-isolated. Beyond the periodic loop, the worker also subscribes `db.onSchemaChange` and fires an **immediate** scoped `drainHeldChanges(schema, table)` the moment the app **locally** re-creates a table — a `{type:'create', objectType:'table', remote:false}` event, which the engine emits post-commit (after the creating transaction's `flushBatch`), so the table is durable when the listener runs. It is fire-and-forget (a drain throw is logged, never re-thrown into the user's `create table`) and **not** gated by `drainOnReappear` — that flag governs only the two library-internal reactive paths; the host calls the public primitive unconditionally. A remote `create_table` is excluded (`remote:true`), since the library already drains it reactively; `alter`/`drop` and `index`/`column` events never revive a held table and are filtered out. Like the loop, the listener is registered on module init and torn down on `close()` (surviving `disconnectSync()`).
+The **quoomb-web worker** runs all four sweeps on one periodic loop (5-minute default cadence, plus an immediate pass at sync-module init), owned by the sync module: started on init, stopped on `close()`, surviving `disconnectSync()` so held changes drain even while offline. It also subscribes `db.onSchemaChange` and fires an **immediate** scoped `drainHeldChanges(schema, table)` when the app **locally** re-creates a table — a `{type:'create', objectType:'table', remote:false}` event, emitted post-commit so the table is durable when the listener runs. That listener is fire-and-forget (a throw is logged, never re-thrown into the user's `create table`) and **not** gated by `drainOnReappear`, which governs only the two library-internal paths. Remote `create_table` is excluded (already drained reactively); `alter`/`drop` and `index`/`column` events never revive a held table and are filtered out.
 
-The relay-only **`sync-coordinator`** runs the same pass on its own loop (`src/service/maintenance.ts`), started in `CoordinatorService.initialize()` and stopped in `shutdown()`. Three differences from the browser host, all following from the coordinator being a multi-tenant relay:
+The relay-only **`sync-coordinator`** runs the same pass on its own loop (`src/service/maintenance.ts`), started in `CoordinatorService.initialize()` and stopped in `shutdown()`, differing in three ways because it is a multi-tenant relay:
 
-- **Cadence is hourly, not 5-minutely.** Two of the four sweeps are inert on a relay and return 0 without touching anything: `drainHeldChanges` (no `getTableSchema` oracle, so it cannot tell which held tables are back) and `evictExpiredBasisTables` (no `dropLocalTable` callback, so there is no local table storage to reclaim). `drainHeldChanges` is also the only latency-sensitive sweep — in the browser a reappeared table's held edits gate a visible UI update — so with it inert there is nothing to be prompt about. The two that do real work here, `pruneTombstones` and `pruneQuarantine`, act at horizon granularity (`retentionHorizonMs`, default 30 days), and hourly expires records well inside that. The inert two are still called, for symmetry with the shared pass and because they cost nothing.
-- **One pass sweeps every open database.** A coordinator holds many stores; the pass iterates the `StoreManager`'s open set, pinning each store by refcount for the duration of its sweep so a concurrent idle-close cannot pull the LevelDB handle out from under a scan. A store closed between the pass snapshotting the open set and reaching it is skipped. Failures are isolated twice over — per sweep (by the library pass) and per store — so one bad tenant cannot starve the rest.
-- **Only already-open databases are swept.** The pass never opens a database in order to sweep it; a database closed on disk waits until a client next opens it and a later tick catches it. An eager scan of every database directory was rejected because it would open — and, where disk eviction is enabled, re-download from S3 — databases nobody is using, turning a cheap housekeeping tick into an unbounded I/O storm.
+- **Cadence is hourly, not 5-minutely**, because two sweeps are inert on a relay and return 0 — `drainHeldChanges` (no `getTableSchema` oracle) and `evictExpiredBasisTables` (no `dropLocalTable` reclaim callback) — and the drain is the only latency-sensitive one. `pruneTombstones` and `pruneQuarantine`, the two that do real work here, act at horizon granularity (`retentionHorizonMs`, default 30 days). The inert two are still called, for symmetry and because they cost nothing.
+- **One pass sweeps every open database**, iterating the `StoreManager`'s open set and pinning each store by refcount for its sweep so a concurrent idle-close cannot pull the LevelDB handle out from under a scan. A store closed between the pass snapshotting the open set and reaching it is skipped. Failures are isolated per sweep *and* per store, so one bad tenant cannot starve the rest.
+- **Only already-open databases are swept**; one closed on disk waits until a client next opens it. An eager scan of every database directory was rejected: it would open — and, where disk eviction is enabled, re-download from S3 — databases nobody is using, turning a cheap housekeeping tick into an unbounded I/O storm.
 
 ### Transaction-Based Change Grouping
 
-Changes are grouped by transaction. When syncing:
-- All changes within a transaction are sent as a unit
-- Applying changes is atomic per transaction
-- This preserves referential integrity across related writes
+Changes are grouped by transaction: all changes within a transaction are sent as a unit and applied atomically, preserving referential integrity across related writes.
 
 **The grouping boundary is the engine, not the store.** The authoritative
-"one logical transaction = one group" anchor is the Quereus engine's
-`DatabaseEventEmitter` (`packages/quereus/src/core/database-events.ts`). It hooks
-every module's event emitter and **batches all data and schema events of the
-whole logical transaction** — `startBatch()` at `beginTransaction`,
-`flushBatch()` at `commitTransaction`, `discardBatch()` at `rollbackTransaction`
-(`database-transaction.ts`), with savepoint layers discarded on
-`ROLLBACK TO SAVEPOINT`. At the commit flush point the complete, ordered,
-multi-table fact set of exactly one transaction is known, so the engine exposes
-it as a single grouped delivery:
+"one logical transaction = one group" anchor is the engine's `DatabaseEventEmitter`
+(`packages/quereus/src/core/database-events.ts`), which hooks every module's event
+emitter and **batches all data and schema events of the whole logical transaction** —
+`startBatch()` at `beginTransaction`, `flushBatch()` at `commitTransaction`,
+`discardBatch()` at `rollbackTransaction` (`database-transaction.ts`), with savepoint
+layers discarded on `ROLLBACK TO SAVEPOINT`. At the commit flush point the complete,
+ordered, multi-table fact set of one transaction is known, so it is exposed as a single
+grouped delivery:
 
 ```typescript
 interface TransactionCommitBatch {
@@ -257,27 +213,23 @@ This is the boundary the sync layer anchors an HLC to: one `onTransactionCommit`
 batch ⇒ one transaction ⇒ one HLC. It is purely additive — the per-event
 `onDataChange` / `onSchemaChange` channels are untouched.
 
-**Why not the store coordinator.** The store has one `TransactionCoordinator`
-*per module* (`store-module.ts` `getCoordinator()`), shared by every table. A
-single-module transaction now commits through that one coordinator, but a
-**cross-module** transaction (e.g. a store source plus a memory source, or two
-durable modules) still spans several coordinators/emitters, each firing its own
-event burst — so a per-coordinator commit would split such a logical transaction
-into multiple groups and assign it multiple HLCs, breaking the
-referential-integrity property above. Only the engine emitter sees the whole
-transaction at once.
+**Why not the store coordinator.** The store has one `TransactionCoordinator` *per
+module* (`store-module.ts` `getCoordinator()`), shared by every table. A **cross-module**
+transaction (e.g. a store source plus a memory source, or two durable modules) spans
+several coordinators/emitters, each firing its own event burst, so a per-coordinator
+commit would split one logical transaction into multiple groups and assign it multiple
+HLCs, breaking the referential-integrity property above. Only the engine emitter sees the
+whole transaction at once.
 
-Ordering within a batch is the engine flush order: base batch then each savepoint
-layer in push order — i.e. per-module/per-table arrival order at commit, not
-global DML-interleave order (store coordinators buffer per-table and fire at their
-own commit). This is deterministic and replayable, which is what downstream
-`opSeq` assignment needs.
+Ordering within a batch is the engine flush order: base batch then each savepoint layer
+in push order — i.e. per-module/per-table arrival order at commit, not global
+DML-interleave order (store coordinators buffer per-table and fire at their own commit).
+This is deterministic and replayable, which is what downstream `opSeq` assignment needs.
 
 #### Write side: one tick per commit, `opSeq` per fact
 
 The sync layer's local-change capture (`SyncManagerImpl.handleTransactionCommit`)
-consumes exactly this grouped batch and records the whole transaction under **one**
-base HLC:
+consumes that grouped batch and records the whole transaction under **one** base HLC:
 
 ```
 onTransactionCommit(batch):
@@ -302,60 +254,54 @@ of the transaction shares that triple and differs only in `opSeq` — exactly th
 identity the read side groups on. DDL events take the lowest `opSeq`s so they sort
 below the same transaction's DML (§ DDL Application Order).
 
-**Local capture is best-effort at TABLE granularity.** A table that is out of basis at
-capture time — the schema oracle no longer knows it, typically because this same
-transaction dropped it and the schema is gone when the commit group is delivered — has
-no sound pk identity, so it costs its own rows; the transaction's other tables and all
-its schema migrations still record. The filter (`filterCapturableDataEvents`) runs
-*before* the tick, so a fully-skipped transaction consumes no HLC and nothing is ever
-half-staged into the shared KV batch. Each skipped table is logged once with its change
-count — informationally when this transaction dropped it, as a warning otherwise. The
-gate is basis membership, not "this transaction dropped the table":
-`drop t; create t; insert into t` leaves `t` in basis and is captured in full. Only the
-unknown-table case is skipped: any other keying failure (e.g. a pk collation the wired
-normalizer resolver does not know) still fails the transaction loudly. A relay-only
-manager (no schema oracle) reports every table in basis, so nothing is skipped there.
+**Local capture is best-effort at TABLE granularity.** A table out of basis at capture
+time — the schema oracle no longer knows it, typically because this same transaction
+dropped it — has no sound pk identity, so it costs its own rows; the transaction's other
+tables and all its schema migrations still record. The filter
+(`filterCapturableDataEvents`) runs *before* the tick, so a fully-skipped transaction
+consumes no HLC and nothing is half-staged into the shared KV batch. Each skipped table
+is logged once with its change count — informationally when this transaction dropped it,
+as a warning otherwise. The gate is basis membership, not "this transaction dropped the
+table": `drop t; create t; insert into t` leaves `t` in basis and is captured in full.
+Only the unknown-table case is skipped; any other keying failure still fails the
+transaction loudly. A relay-only manager (no schema oracle) reports every table in basis,
+so nothing is skipped there.
 
-**Commit recording is serialized.** `handleTransactionCommit` does async dedup reads
-(the prior column-version / tombstone lookups that delete a superseded change-log entry)
-before its single `kvBatch.write()`. Two rapid commits must not interleave at those
-awaits, or commit N+1's dedup would read pre-N-write state, miss the prior version, and
-leave a stale change-log entry — breaking the *at most one surviving entry per key*
-invariant the read side relies on (§ Read side). `SyncManagerImpl` therefore chains each
-commit onto a tail promise (`enqueueTransactionCommit`), so N+1's reads always observe
-N's durable writes. The tick itself is synchronous and already ordered; only the
-post-tick dedup reads need this serialization.
+**Commit recording is serialized.** `handleTransactionCommit` does async dedup reads (the
+prior column-version / tombstone lookups that delete a superseded change-log entry) before
+its single `kvBatch.write()`. Two rapid commits must not interleave at those awaits, or
+commit N+1's dedup would read pre-N-write state, miss the prior version, and leave a stale
+change-log entry — breaking the *at most one surviving entry per key* invariant the read
+side relies on. `SyncManagerImpl` therefore chains each commit onto a tail promise
+(`enqueueTransactionCommit`). The tick itself is synchronous and already ordered; only the
+post-tick dedup reads need this.
 
-**Local capture reads its own writes.** Within one transaction, every metadata read
-(the prior column version / tombstone dedup lookups, and the delete cleanup's column
-set) consults a per-transaction staged-metadata overlay
-(`staged-transaction-metadata.ts`) *before* committed storage, because the
-transaction's own writes are still pending in its single `kvBatch`. A transaction
-that touches one row more than once — update then update, insert then delete, delete
-then reinsert then delete — therefore records exactly the metadata the equivalent
-sequence of separate transactions would: the later event sees the earlier one's
-staged cell versions and tombstone, dedupes the right change-log entry, chains the
-right before-image, and the delete cleanup removes staged cells as well as committed
-ones (staging its removals into the same `kvBatch`; the batch's later-op-wins
-ordering resolves put-then-delete and delete-then-put per key). Staging the cleanup
-into `kvBatch` also makes the pseudocode's atomicity claim complete: *all* of a
-transaction's metadata — including the delete cleanup — lands in one atomic batch.
+**Local capture reads its own writes.** Within one transaction, every metadata read (the
+dedup lookups and the delete cleanup's column set) consults a per-transaction
+staged-metadata overlay (`staged-transaction-metadata.ts`) *before* committed storage,
+because the transaction's own writes are still pending in its single `kvBatch`. A
+transaction that touches one row more than once — update then update, insert then delete,
+delete then reinsert then delete — therefore records exactly the metadata the equivalent
+separate transactions would: the later event sees the earlier one's staged cell versions
+and tombstone, dedupes the right change-log entry, chains the right before-image, and the
+delete cleanup removes staged cells as well as committed ones. The cleanup stages its
+removals into the same `kvBatch` (whose later-op-wins ordering resolves put-then-delete
+and delete-then-put per key), which also completes the pseudocode's atomicity claim:
+*all* of a transaction's metadata lands in one atomic batch.
 
 `opSeq` ordering semantics: **intra-table** order is true write order (a coordinator
 buffers its table's events in DML order); **cross-table** order is the deterministic
-per-coordinator commit order, not the global DML interleave. This is sufficient for
+per-coordinator commit order, not the global DML interleave. That suffices for
 intra-transaction atomicity, intra-table parent-before-child, and full determinism
-(same facts ⇒ same `opSeq` on every peer). Cross-table order being the per-coordinator
-commit order — not the DML interleave — is **not** an apply-correctness hazard: the
-apply path re-validates no declared constraint (child-side FK existence included — see
-§ Transactional Integrity During Sync → *Apply-time validation*), so a child fact
+(same facts ⇒ same `opSeq` on every peer), and is **not** an apply-correctness hazard:
+the apply path re-validates no declared constraint (child-side FK existence included —
+see § Transactional Integrity During Sync → *Apply-time validation*), so a child fact
 landing before its parent cannot trip one. It matters only to the opt-in parent-side
 FK *actions* path.
 
 Edge cases:
-- **Rollback / discard** — the engine fires no group, so `tick()` is never called
-  and no HLC/`opSeq` is consumed; a later committed transaction's ordering is never
-  polluted by a discarded one.
+- **Rollback / discard** — the engine fires no group, so `tick()` is never called and no
+  HLC/`opSeq` is consumed; a discarded transaction never pollutes a later one's ordering.
 - **All-remote group (echo)** — a pure sync-apply transaction (every event
   `remote: true`) is skipped entirely; its metadata was already recorded on apply.
 - **Mixed group** — local + remote in one transaction records only the local facts,
@@ -374,8 +320,8 @@ from the change-log facts' shared base), so no separate `tx:` record is persiste
 #### Read side: one ChangeSet per transaction
 
 `getChangesSince(peerSiteId, sinceHLC?)` returns **one `ChangeSet` per source
-transaction** — never splitting a commit across ChangeSets, never merging two
-commits into one (`change-grouping.ts` `buildTransactionChangeSets`):
+transaction** — never splitting a commit, never merging two
+(`change-grouping.ts` `buildTransactionChangeSets`):
 
 ```
 getChangesSince(peerSiteId, sinceHLC):
@@ -394,13 +340,11 @@ getChangesSince(peerSiteId, sinceHLC):
 ```
 
 The HLC scan is already ordered by `(wallTime, counter, siteId, opSeq)` (the
-change-log key, from `sync-hlc-opseq-foundation`), so a transaction's facts are
-contiguous and in `opSeq` order. Because a transaction is wholly one site's,
-filtering the peer's own facts (echo prevention) drops *whole* transactions — never
-a half-empty ChangeSet.
+change-log key), so a transaction's facts are contiguous and in `opSeq` order.
 
-- **Echo filter** — facts/migrations whose `hlc.siteId == peerSiteId` are excluded;
-  a transaction wholly from `peerSiteId` yields no ChangeSet.
+- **Echo filter** — facts/migrations whose `hlc.siteId == peerSiteId` are excluded.
+  Because a transaction is wholly one site's, this drops *whole* transactions — never
+  a half-empty ChangeSet.
 - **DDL-only transaction** — a `create table` with no DML forms its own ChangeSet
   (`changes: []`, one migration), `hlc` = the migration HLC.
 - **DDL + DML in one transaction** — migration and data share the base, so they land
@@ -409,68 +353,55 @@ a half-empty ChangeSet.
 
 **Transaction-granularity bounding.** `batchSize` caps the response by accumulating
 **whole** transactions: once a completed transaction pushes the cumulative `changes`
-count `>= batchSize`, extraction stops and returns — the remaining transactions come
-on the next `getChangesSince` call (the consumer advances its watermark to the last
-returned `ChangeSet.hlc` and re-fetches). A transaction is **never** split to hit the
-bound.
+count `>= batchSize`, extraction stops and returns — the rest come on the next
+`getChangesSince` call. A transaction is **never** split to hit the bound.
 
-The bound applies at **scan time**, not just response time. On the delta path
-(`sinceHLC` given), the change-log scan is HLC-ordered, so `collectChangesSince`
-detects each transaction boundary and stops scanning the moment enough whole
-transactions accumulate — `batchSize` caps the scan footprint, not only the returned
-array. Two scans are *not* bounded this way: the from-zero full scan
-(`collectAllChanges`, used when `sinceHLC` is absent) reads `cv:`/`tb:` keyed by
-table/pk rather than HLC, so it cannot early-exit (a large initial range is served by
-a snapshot instead); and the `sm:` schema-migration scan is not HLC-ordered, so it is
-drained in full (migrations are few, and grouping drops any that sort past the bounded
-fact watermark — over-scan costs work, never correctness).
+The bound applies at **scan time**, not just response time: on the delta path the
+change-log scan is HLC-ordered, so `collectChangesSince` detects each transaction
+boundary and stops scanning the moment enough whole transactions accumulate. Two scans
+are *not* bounded this way — the from-zero full scan (`collectAllChanges`, used when
+`sinceHLC` is absent) reads `cv:`/`tb:` keyed by table/pk rather than HLC, so it cannot
+early-exit (a large initial range is served by a snapshot instead); and the `sm:`
+schema-migration scan is not HLC-ordered, so it is drained in full (migrations are few,
+and grouping drops any that sort past the bounded fact watermark — over-scan costs work,
+never correctness).
 
 Scan-time boundary detection keys off the *log entry's* HLC while grouping keys off the
-*resolved version's* HLC; the two agree because **both entry kinds are deduped on
-overwrite**, so at most one change-log entry survives per key with HLC equal to the
-current version. Column entries are deduped when a newer value overwrites the prior one;
-delete entries are deduped when a newer tombstone overwrites the prior one — so a
-`delete → reinsert → delete` key reuse no longer leaves a stale delete entry that could
-re-attribute to the later tombstone's HLC and split that transaction across rounds. The
-overwrite dedup covers entries written across *separate* writes/applies; repeats
-*within* one local transaction are covered by the write side's staged-metadata overlay
-(§ Write side → *Local capture reads its own writes*), which makes the later touch see
-— and dedupe — the earlier touch's staged entry. The apply path
-(`commitChangeMetadata`) additionally **collapses in-batch repeats**: when two versions
-of one key arrive in a single `applyChanges` call they resolve against the same
-pre-batch prior version, so neither sees the other — only the max-HLC winner per key is
-written, keeping a single surviving entry whose HLC equals the current version's no
-matter how many versions of a key were batched (e.g. concurrent deletes of the same pk
-relayed together).
+*resolved version's* HLC; the two agree because **at most one change-log entry survives
+per key**, with HLC equal to the current version. Three mechanisms keep that true:
+**overwrite dedup** across separate writes/applies (a newer value dedupes the prior
+column entry, a newer tombstone the prior delete entry — so a `delete → reinsert →
+delete` key reuse leaves no stale delete entry to re-attribute to the later tombstone's
+HLC and split that transaction across rounds); the **staged-metadata overlay** for
+repeats within one local transaction (§ Write side → *Local capture reads its own
+writes*); and **in-batch collapse** on apply (`commitChangeMetadata`), where two versions
+of one key in a single `applyChanges` call resolve against the same pre-batch prior
+version, so only the max-HLC winner per key is written (e.g. concurrent deletes of the
+same pk relayed together).
 
 **Entries die with their target.** The change log is a *derived index* over the live
 `cv:`/`tb:` records — `resolveLogEntry` returns `null` for an entry whose record is
-gone, and the scan drops it. So every entry is deleted in the same `WriteBatch` as the
-record it points at:
-
-| record removed | entries removed with it | where |
-|---|---|---|
-| a row's column versions, on delete | that row's `column` entries | `deleteRowVersionsAndLogEntries`, called from both the local write path (`recordDataEvent`) and apply (`commitChangeMetadata`) |
-| an expired tombstone | that pk's `delete` entry | `SyncManagerImpl.pruneTombstones` |
-
-This bounds the change log to **live cells + live tombstones** rather than to the
-replica's lifetime delete volume: a replica that repeatedly inserts and deletes the same
-row keeps a constant-size log. The removal is lossless by construction — a dropped entry
-already resolved to `null` and could never have appeared in any `ChangeSet`.
+gone — so every entry is deleted in the same `WriteBatch` as the record it points at:
+a row's `column` entries with its column versions on delete
+(`deleteRowVersionsAndLogEntries`, called from the local write path `recordDataEvent`
+and from apply's `commitChangeMetadata`), and a pk's `delete` entry with its expired
+tombstone (`SyncManagerImpl.pruneTombstones`). This bounds the change log to **live
+cells + live tombstones** rather than to the replica's lifetime delete volume, and is
+lossless by construction — a dropped entry already resolved to `null` and could never
+have appeared in any `ChangeSet`.
 
 Pruning entries by a *time* horizon (`ChangeLogStore.pruneEntriesBefore`) is a different,
-deliberately **unwired** operation: it drops entries for cells that are still live, which
-is only safe once the server refuses delta sync for a too-old `sinceHLC`
-(`SyncManager.canDeltaSync`, likewise not yet called by the coordinator).
+deliberately **unwired** operation: it drops entries for still-live cells, safe only once
+the server refuses delta sync for a too-old `sinceHLC` (`SyncManager.canDeltaSync`,
+likewise not yet called by the coordinator).
 
-**Oversized transaction.** A single transaction whose fact count exceeds `batchSize`
-is returned **whole** as one ChangeSet and telemetered (a `console.warn`), never
-silently chunked — splitting it would violate the one-ChangeSet-per-transaction
-contract.
+**Oversized transaction.** A transaction whose fact count exceeds `batchSize` is returned
+**whole** as one ChangeSet and telemetered (a `console.warn`), never silently chunked —
+splitting it would violate the one-ChangeSet-per-transaction contract.
 
-**Watermark halts at transaction boundaries.** Because every returned ChangeSet is a
-whole transaction whose `hlc` is the commit's max fact HLC, a consumer that sets
-`lastSyncHLC = max(applied ChangeSet.hlc)` always lands on a real commit boundary —
+**Watermark halts at transaction boundaries.** Every returned ChangeSet is a whole
+transaction whose `hlc` is the commit's max fact HLC, so a consumer setting
+`lastSyncHLC = max(applied ChangeSet.hlc)` always lands on a real commit boundary;
 `buildChangeLogScanBoundsAfter` then excludes everything `<=` it, so re-fetch resumes
 strictly *after* the last whole transaction (no repeats, no gaps, no mid-transaction
 resume). A partially applied transaction never advances the watermark: `applyChanges`
@@ -480,125 +411,85 @@ boundary.
 
 ### Transactional Integrity During Sync
 
-When applying remote changes, the sync system must write to two separate stores:
-1. **CRDT metadata** → sync metadata store (column versions, tombstones, peer state)
-2. **Actual table data** → each table's data store
+Applying remote changes writes to two separate stores: **CRDT metadata** (column versions, tombstones, peer state) into the sync metadata store, and **table data** into each table's data store. In IndexedDB each table has its own database, so no single atomic transaction can span the metadata store and multiple table stores; LevelDB uses one database with key prefixes and commits an atomic `WriteBatch` across tables.
 
-**Challenge**: In IndexedDB, each table has its own database, so we cannot have a single atomic transaction spanning both the metadata store and multiple table stores. LevelDB uses a single database with key prefixes, allowing atomic `WriteBatch` commits across tables.
+**Write Order**: crash safety requires **data first**, **metadata second**. A crash before the data write leaves nothing written and re-sync retries; a crash between the two leaves the CRDT state "dirty" so the same changes re-apply on the next sync, safe because CRDT operations are idempotent (same HLC → same LWW outcome); a crash after the metadata write leaves a complete, consistent state. The reverse order is dangerous: crashing after metadata but before data leaves the CRDT state believing the change landed while the data is missing — and re-sync will not retry it.
 
-**Write Order**: To ensure crash safety, changes must be applied in this order:
-1. **Data first**: Write table data to the data store
-2. **Metadata second**: Write CRDT metadata to the sync store
-
-This order is safe because:
-- If crash occurs before data: nothing written, re-sync will retry
-- If crash occurs after data but before metadata: CRDT state is "dirty" and will re-apply the same changes on next sync. Since CRDT operations are idempotent (same HLC → same LWW outcome), re-applying is safe.
-- If crash occurs after metadata: all writes complete, consistent state
-
-The reverse order (metadata first) would be dangerous: if we crash after writing metadata but before data, the CRDT state believes the change is applied but data is missing—and re-sync won't retry.
-
-**Clock-drift rejection is pre-commit validation** (not a post-commit failure). Both apply paths validate the incoming clock — the wire path the batch's maximum fact HLC at the top of `applyChanges`, the snapshot path the header HLC before `clearExistingMetadata` — **before** any data or CRDT metadata is written (see the HLC section's *Clock-drift bound*). A drifted batch/snapshot is therefore rejected with **nothing landed**; it does not first commit far-future poison winners and then throw. This is orthogonal to the data-first/metadata-second ordering below, which governs a batch that passed validation.
+**Clock-drift rejection is pre-commit validation**, orthogonal to the ordering below (which governs a batch that passed validation): both apply paths check the incoming clock before any data or metadata is written, so a drifted batch/snapshot lands **nothing** (see the HLC section's *Clock-drift bound*).
 
 **Invariant — metadata follows a landed data write**: CRDT metadata must **not** be committed for any change whose data write did not land. This covers two failure shapes, handled identically:
-- **Whole-batch throw**: the `applyToStore` callback throws (e.g. the seam commit fails on a connection error or a deferred row constraint). The exception propagates; no metadata is committed. A commit-time **global-assertion** violation is *not* one of these — it is detect-and-notify (see *Apply-time validation* below), so it does not throw and does not block the metadata commit.
+- **Whole-batch throw**: the `applyToStore` callback throws (e.g. the seam commit fails on a connection error or a deferred row constraint). The exception propagates; no metadata is committed. A commit-time **global-assertion** violation is *not* one of these — it is detect-and-notify (below), so it neither throws nor blocks the metadata commit.
 - **Per-change failure**: the store adapter does *not* throw on a single change's failure — it keeps applying the other tables (maximizing idempotent storage progress) and records each failure in `ApplyToStoreResult.errors`. The **consumer** treats any non-empty `errors` exactly like a whole-batch throw: it emits `status: 'error'` and throws **before** committing any metadata.
 
-In the **mixed case** — one batch carries *both* a per-change `errors` failure (change A) *and* a reported global-assertion violation tripped by a successfully-applied change (change B) — the consumer (`applyDataToStore`) emits the `onAssertionViolation` event **before** the per-change abort throws. B's violating row already committed in report mode (its data + derived effects are durable; the abort blocks only the metadata commit, not the storage write), so the violation is a fact about committed data and must be surfaced regardless. The abort still blocks the metadata commit and the batch still re-resolves; on retry B is a value-identical no-op (B contributes nothing to the seam batch, so the assertion over B's table is not re-evaluated — assertions fire only when their referenced tables changed), so the violation does not double-fire. Were the emit deferred to after the abort, the mixed-batch violation would be permanently lost — the throw skips it and the retry's suppression prevents re-collection.
+In the **mixed case** — one batch carrying *both* a per-change `errors` failure and a reported global-assertion violation tripped by a successfully-applied change B — `applyDataToStore` emits `onAssertionViolation` **before** the abort throws. B's violating row already committed in report mode (the abort blocks the metadata commit, not the storage write), so the violation is a fact about committed data. On retry B contributes nothing to the seam batch, so the assertion over B's table is not re-evaluated (assertions fire only when their referenced tables changed) and does not double-fire; deferring the emit past the abort would lose it permanently.
 
-**Unified admission core** (`admission.ts`): both failure shapes — and the data-first/metadata-second/abort-with-no-metadata ordering — are centralized in one seam so every ingress modality behaves identically. `applyDataToStore` is the data-first half: it runs `applyToStore`, emits `status: 'error'` and rethrows on a whole-batch throw, then aborts via `throwIfApplyErrors` on any per-change `errors` (the two are mutually exclusive, so the error state is emitted at most once). `admitGroup` wraps it as a full group-atomic unit — data first, then the caller's `commitMetadata`, then the local HLC clock watermark — used by the wire path (`change-applicator`) and the non-streaming snapshot (`snapshot`). The streaming snapshot (`snapshot-stream`) keeps its own checkpoint-based model (interleaved metadata/data flushes, resume on a saved checkpoint) but reuses `applyDataToStore` for each flush, so a whole-batch flush throw now emits the same `status: 'error'` event the other paths do.
+**Unified admission core** (`admission.ts`) centralizes both failure shapes and the ordering in one seam, so every ingress modality behaves identically. `applyDataToStore` is the data-first half: it runs `applyToStore`, emits `status: 'error'` and rethrows on a whole-batch throw, then aborts via `throwIfApplyErrors` on any per-change `errors` (the two are mutually exclusive, so the error state is emitted at most once). `admitGroup` wraps it as a group-atomic unit — data, then the caller's `commitMetadata`, then the local HLC clock watermark — used by the wire path (`change-applicator`) and the non-streaming snapshot (`snapshot`). The streaming snapshot (`snapshot-stream`) keeps its checkpoint-based model but reuses `applyDataToStore` per flush, so a flush throw emits the same `status: 'error'` event.
 
-In all cases no metadata is committed, so the caller does not advance its per-peer `lastSyncHLC` watermark and the **whole batch re-resolves and re-applies on the next sync**. Re-application is idempotent: value-identical upserts are suppressed by the adapter, so converged rows do no redundant work and only the previously-failed change is genuinely retried. (A change that *always* fails blocks its whole batch forever — an accepted "poison batch" property of the throw path; detection/recovery is the host's.)
-
-Selective commit (commit the succeeded subset, skip the failed) is intentionally **not** done: a batch spans multiple HLCs but peer re-fetch is governed by a single `lastSyncHLC` watermark, which cannot express "all but the failed change", so a skipped change would never be re-sent. The wire batch is therefore admitted as **one** all-or-nothing `admitGroup` unit, not once per `ChangeSet`.
-
-**Current Status**: ✓ Data is written first (`applyToStore`), then metadata, aborting with no metadata on any whole-batch throw or per-change `ApplyToStoreResult.errors`. The unified admission core (`admitGroup` + `applyDataToStore`, `admission.ts`) centralizes this for the wire and non-streaming snapshot paths; the streaming path reuses the `applyDataToStore` seam for consistent error emission while keeping its checkpoint-based model.
+With no metadata committed the caller does not advance its per-peer `lastSyncHLC` watermark, so the **whole batch re-resolves and re-applies on the next sync**, idempotently — value-identical upserts are suppressed by the adapter, so only the previously-failed change is genuinely retried. (A change that *always* fails blocks its batch forever: an accepted "poison batch" property; detection/recovery is the host's.) Selective commit (commit the succeeded subset, skip the failed) is intentionally **not** done — a batch spans multiple HLCs but re-fetch is governed by a single `lastSyncHLC` watermark, which cannot express "all but the failed change", so a skipped change would never be re-sent. The wire batch is therefore **one** all-or-nothing `admitGroup` unit, not one per `ChangeSet`.
 
 **Apply-time validation — trust-the-origin.** The apply path does **not** re-run the
 engine's constraint machinery. The production adapter (`createStoreAdapter`, the
 `applyToStore` implementation) writes inbound data straight to module storage via
 `StoreTable.applyExternalRowChanges` — bypassing the DML executor, so there is **no**
 per-row CHECK / NOT NULL / UNIQUE / **child-side FK-existence** check at write time —
-then makes a single end-of-invocation seam call, `db.ingestExternalRowChanges`, which
-drives the post-write pipeline: capture for `Database.watch`, commit-time **global
-assertions**, materialized-view maintenance, and *opt-in* parent-side FK actions. The
-seam explicitly re-validates nothing — it trusts that the origin already enforced every
-declared constraint at its own commit, and merging the origin's already-consistent
-facts into the receiver cannot violate a per-row / child-side constraint that held at
+then makes a single end-of-invocation seam call, `db.ingestExternalRowChanges`, driving
+the post-write pipeline: capture for `Database.watch`, commit-time **global assertions**,
+materialized-view maintenance, and *opt-in* parent-side FK actions. The seam re-validates
+nothing: the origin enforced every declared constraint at its own commit, and merging
+already-consistent facts cannot violate a per-row / child-side constraint that held at
 the source.
 
-**Global assertions are detect-and-notify, not block.** A cross-origin *merge* — unlike
-a single origin's commit — can produce a global-invariant violation no single origin
-ever saw, and that is exactly what a global assertion declared on the receiver guards.
-But trust-the-origin means the merged data must still land: a local assertion can only
-usefully *notify*, not reject (rejecting would diverge the receiver from the converged
-truth the network agrees on). So the adapter drives the incremental seam in **report
+**Global assertions are detect-and-notify, not block.** A cross-origin *merge* can
+produce a global-invariant violation no single origin ever saw — exactly what a
+receiver-side global assertion guards. But the merged data must still land: rejecting
+would diverge the receiver from the converged truth the network agrees on, so a local
+assertion can only usefully *notify*. The adapter drives the incremental seam in **report
 mode** (`assertionFailureMode: 'report'`): a violation is **collected and returned**
 instead of thrown, and the batch **commits** — the violating row's derived effects (MV
 maintenance, `Database.watch` capture) land on the **first** apply, so the MV stays
-consistent with the base table and there is no divergence and no retry. The consumer
-then surfaces each collected violation to the host as an **`onAssertionViolation`**
-event (see § Reactive Hooks). The host owns policy: alert, audit, or trigger an
-out-of-band reconciliation. (Snapshot bootstrap does not evaluate assertions at all —
-it installs one origin's already-converged state wholesale, so there is no merge to
-introduce a violation; see `store-adapter.ts`.)
+consistent with the base table, with no divergence and no retry. The consumer surfaces
+each violation as an **`onAssertionViolation`** event (see § Reactive Hooks); the host
+owns policy. (Snapshot bootstrap does not evaluate assertions at all — it installs one
+origin's already-converged state wholesale, so there is no merge to introduce a
+violation; see `store-adapter.ts`.)
 
-Consequence for cross-table ordering: because child-side FK existence is never checked
-on apply, a child fact carrying a lower `opSeq` than its parent (the per-coordinator
-commit order putting the child's table first) is harmless — there is no fact-granular
-FK check to trip. The two facets that *are* enforced are order-independent for
-realistic batch shapes: **global assertions** — the home for referential invariants you
-want the replica itself to enforce, and which cover self-referential and cyclic FKs that
-no topological table sort can handle — and **opt-in FK actions** (`applyForeignKeyActions`,
-default off). The FK-actions facet is order-independent because the adapter writes every
-table's rows to storage *before* the single seam call, so the cascade DML re-reads the
-fully-merged post-write state regardless of which parent's change entry appears first in
-the seam batch.
+**Consequence for cross-table ordering.** A child fact carrying a lower `opSeq` than its
+parent is harmless: there is no fact-granular FK check to trip. The two facets that *are*
+enforced stay order-independent — **global assertions**, the home for referential
+invariants the replica itself should enforce and the only form covering self-referential
+and cyclic FKs that no topological table sort handles; and **opt-in FK actions**
+(`applyForeignKeyActions`, default off), order-independent because the adapter writes
+every table's rows to storage *before* the single seam call, so cascade DML re-reads the
+fully-merged post-write state.
 
-**Parent-side RESTRICT is not enforced on apply.** Trust-the-origin means the origin
-already enforced RESTRICT at its own commit; re-enforcing it on the receiver would *wedge*
-the stream (the RESTRICT throw aborts the batch → no metadata commit → the same batch is
-re-resolved and re-applied → it throws again, forever). So the apply path skips parent-side
-RESTRICT entirely and propagates only the non-RESTRICT actions (cascade / set-null /
-set-default), at **every cascade depth**. This is implemented as an **apply-mode RESTRICT
-suppression** threaded through the whole DML pipeline: the seam sets a flag for the duration
-of the batch (mutex held, restored in a `finally`), and it is honored uniformly by the
-runtime RESTRICT pre-checks (`runtime/foreign-key-actions.ts`), by every **nested cascade
-DML** and **MV-maintenance** FK pass those re-enter, and — crucially — by the **plan-time
+**Parent-side RESTRICT is not enforced on apply.** The origin already enforced it at its
+own commit; re-enforcing it on the receiver would *wedge* the stream (RESTRICT throw →
+batch abort → no metadata commit → same batch re-applied → throws again, forever). So the
+apply path skips parent-side RESTRICT entirely and propagates only cascade / set-null /
+set-default, at **every cascade depth**. This is an **apply-mode RESTRICT suppression**
+threaded through the whole DML pipeline: the seam sets a flag for the batch's duration
+(mutex held, restored in a `finally`), honored uniformly by the runtime RESTRICT
+pre-checks (`runtime/foreign-key-actions.ts`), by every **nested cascade DML** and
+**MV-maintenance** FK pass those re-enter, and — crucially — by the **plan-time
 parent-side FK check** synthesized into each cascade statement's plan
-(`runtime/emit/constraint-check.ts`, the `fk-parent` constraint kind), which is the primary
-enforcer a depth-≥1 cascade would otherwise trip. A replica-only RESTRICT invariant is, **by
-design, not enforced on apply**; if the receiver must be *notified* of a referential
-invariant, express it as a **global assertion** (detect-and-notify), which covers
-self-referential and cyclic shapes that no table sort can.
+(`runtime/emit/constraint-check.ts`, the `fk-parent` constraint kind), the primary
+enforcer a depth-≥1 cascade would otherwise trip. A replica-only RESTRICT invariant is
+**by design not enforced on apply**; express it as a global assertion if the receiver
+must be notified.
 
-The one exotic limitation that no seam-batch ordering fixes: **(F)** a child of two parents
-with diverging actions (cascade-delete vs. set-null) where the final child state depends on
-evaluation order — the seam batch carries no intra-transaction DML order to reconstruct it.
-(**(E)** — a child referenced by two FKs where one parent's CASCADE relieves the same row
-another parent's RESTRICT blocks — is now moot: RESTRICT never throws on apply, so it no
-longer wedges; at worst the cascade outcome on the shared child depends on which cascade
-fires first, the same evaluation-order caveat as (F).) Both are handled by keeping
-`applyForeignKeyActions` off (the default — let the stream carry the origin's cascade
-effects) or by expressing the referential invariant as a **global assertion** (evaluated
-over merged state at the batch boundary; order-independent by construction and able to
-cover self-referential and cyclic shapes).
+One exotic limitation no seam-batch ordering fixes: **(F)** a child of two parents with
+diverging actions (cascade-delete vs. set-null) whose final state depends on evaluation
+order — the seam batch carries no intra-transaction DML order to reconstruct it.
+(**(E)**, a child whose two FKs pit one parent's CASCADE against another's RESTRICT, is
+moot since RESTRICT never throws on apply; at worst the outcome depends on which cascade
+fires first, the same caveat as (F).) Both are handled by keeping `applyForeignKeyActions`
+off (the default) or by expressing the referential invariant as a **global assertion**.
 
-**Per-Table Batching**: Within each table, changes should be applied using `WriteBatch` for atomicity. The `TransactionCoordinator` in the Store module provides this capability.
-
-**Atomicity Gap (IndexedDB)**: The legacy `IndexedDBModule` uses separate databases per table. The new `UnifiedIndexedDBModule` (Store Phase 7) solves this by placing all tables in a single database with object stores, enabling atomic cross-table transactions via `MultiStoreWriteBatch`.
-
-**Isolation Gap**: Even with correct write ordering, readers may see partially-applied state during sync. True isolation would require Store-level support—see [Future: Store Isolation](#store-isolation-store-phase-8---future) below.
+Two gaps remain. **Per-table atomicity**: within each table, changes *should* be applied through the Store module's `TransactionCoordinator` `WriteBatch`, and the legacy per-table-database `IndexedDBModule` cannot span tables at all — the `UnifiedIndexedDBModule` (Store Phase 7) fixes that with `MultiStoreWriteBatch`. **Isolation**: even with correct write ordering, readers may see partially-applied state during sync; true isolation needs Store-level support — see [Future: Store Isolation](#store-isolation-store-phase-8---future) below.
 
 ### Single-Database Architecture (Store Phase 7) ✓
 
-The `UnifiedIndexedDBModule` uses a single IndexedDB database with multiple object stores (one per table). This enables atomic cross-table transactions.
-
-| UnifiedIndexedDBModule | Legacy IndexedDBModule |
-|------------------------|------------------------|
-| ✅ Native cross-table IDB transactions | ❌ No cross-DB transactions |
-| ✅ Sync metadata + data in one transaction | ❌ Sequential commits |
-| ✅ No WAL needed for crash recovery | ⚠️ Would need WAL |
-| ✅ Same storage quota | ✅ Same storage quota |
+The `UnifiedIndexedDBModule` uses a single IndexedDB database with multiple object stores (one per table), which buys native cross-table IDB transactions — sync metadata and data commit together, with no WAL needed for crash recovery, at the same storage quota. The legacy `IndexedDBModule` has none of that: separate databases per table, sequential commits, and it would need a WAL.
 
 With `UnifiedIndexedDBModule`, sync can use `MultiStoreWriteBatch`:
 ```typescript
@@ -611,21 +502,7 @@ await batch.write();  // Native atomicity across all stores
 
 ### Store Isolation (Store Phase 8 - Future)
 
-Longer-term, the Store module should provide transaction isolation similar to the memory vtab's layered architecture:
-
-1. **TransactionLayer pattern**: Writers work on an isolated layer; readers see committed snapshot
-2. **Copy-on-write semantics**: Inherited from memory vtab's BTree layering
-3. **Atomic visibility**: All changes become visible at once on commit
-
-If Store provides this primitive, sync can leverage it:
-```
-store.beginTransaction()    // Isolated write context
-// Apply all data changes   (invisible to readers)
-// Apply all CRDT metadata  (invisible to readers)
-store.commit()              // Atomically visible
-```
-
-This would eliminate the isolation gap, providing true ACID semantics for sync operations across multiple tables. This is tracked in store.md as Phase 8.
+Store-level transaction isolation (a TransactionLayer/copy-on-write model like the memory vtab's, giving atomic visibility on commit) would let sync stage data and CRDT metadata invisibly and make them visible atomically, eliminating the isolation gap. Unimplemented; tracked in store.md as Phase 8 and in [`docs/todo.md` § Sync Engine Remaining Work](todo.md#sync-engine-remaining-work).
 
 ## Storage Layout
 
@@ -644,10 +521,7 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 | `hc:` | HLC state | `{wallTime, counter}` |
 | `fv:` | Sync-metadata format version | decimal string (see *Metadata format version*) |
 
-This co-location ensures:
-- Atomic updates of data and metadata within transactions
-- Single storage backend for both LevelDB and IndexedDB
-- No additional database connections needed
+Co-location buys atomic data+metadata updates within a transaction, one storage backend for both LevelDB and IndexedDB, and no additional database connections.
 
 ### Row identity vs. address
 
@@ -658,43 +532,39 @@ Every per-row record splits the primary key into two roles:
   through its logical type's semantic key transform (TIMESPAN → total seconds,
   so `'PT1H'` ≡ `'PT60M'`) and then its **key collation** normalizer (`'apple'`
   ≡ `'APPLE'` under `collate nocase`), producing the engine's type-tagged
-  `serializeKeyNullGrouping` string. This matches how the store and the
+  `serializeKeyNullGrouping` string. That matches how the store and the
   isolation overlay decide "same row?", so one row files under exactly one
   identity no matter which spelling a write used. The encoding is numeric-class
-  aware (`5n` and `5` key alike), which also makes bigint pks safe — the former
-  `JSON.stringify` key encoding threw on them. The identity is **lossy and never
-  decoded back**.
+  aware (`5n` and `5` key alike), which also makes bigint pks safe. The identity
+  is **lossy and never decoded back**.
 - **Address** — what goes on the wire and into record *values* (`ColumnVersion.pk`,
   `Tombstone.pk`): a real, type-valid `SqlValue[]`. Any spelling from the row's
   equivalence class is acceptable; the receiver's store collapses spellings too.
 
-Because the identity freely contains `:` (type tags) and `\0` (member
-separator), the `cv:`/`cl:` key layouts **length-prefix** it (`{idLen}:` is the
-identity's length in string code units), which makes the identity/column split
-unambiguous. The keying is resolved per table from its schema (key collations +
-semantic transforms) via `metadata/pk-identity.ts`; a wired
-`keyNormalizerResolver` (pass `db.getKeyNormalizerResolver()`) keeps custom
-collations keying exactly as the database compares them. A relay-only
-deployment with no `getTableSchema` oracle keys raw values — stable for its
-whole life, since no oracle (and hence no identity flip) can appear later.
-Quarantine (`qt:`) keys always use the raw encoding: a quarantined table is out
-of the local basis, so no schema exists for it, and its `(hlc, type)` component
-already makes the key unique. Snapshot transfers carry the **sender's** identity
-alongside each entry's raw pk, and the receiver files bootstrapped metadata
-under it verbatim — mid-bootstrap the receiving table may not exist yet (its
-schema arrives in the same snapshot), and the replicated schema makes both
-sides' identities agree.
+Because the identity freely contains `:` (type tags) and `\0` (member separator), the
+`cv:`/`cl:` key layouts **length-prefix** it (`{idLen}:` is the identity's length in
+string code units), making the identity/column split unambiguous. Keying is resolved per
+table from its schema (key collations + semantic transforms) via
+`metadata/pk-identity.ts`; a wired `keyNormalizerResolver` (pass
+`db.getKeyNormalizerResolver()`) keeps custom collations keying exactly as the database
+compares them. A relay-only deployment with no `getTableSchema` oracle keys raw values —
+stable for its whole life, since no oracle (and hence no identity flip) can appear later.
+Quarantine (`qt:`) keys always use the raw encoding: a quarantined table is out of the
+local basis, so no schema exists for it, and its `(hlc, type)` component already makes the
+key unique. Snapshot transfers carry the **sender's** identity alongside each entry's raw
+pk, and the receiver files bootstrapped metadata under it verbatim — mid-bootstrap the
+receiving table may not exist yet, and the replicated schema makes both sides' identities
+agree.
 
 ### Metadata format version
 
 The `fv:` record stores the sync-metadata storage format version
-(`SYNC_METADATA_FORMAT_VERSION`, currently **2** — the pk-identity keying above,
-with the raw pk carried in record values). `SyncManagerImpl.create` writes it on
-a fresh replica and refuses to open a replica whose stored version is missing
-(pre-versioning metadata) or different: old keys are unreadable under the new
-layout and mixing the two would corrupt both. Recovery is to clear the
-replica's sync metadata and re-bootstrap from a peer snapshot — there is no
-in-place rewrite pass (backwards compatibility is not yet a concern).
+(`SYNC_METADATA_FORMAT_VERSION`, currently **2** — the pk-identity keying above, raw pk in
+record values). `SyncManagerImpl.create` writes it on a fresh replica and refuses to open
+one whose stored version is missing (pre-versioning) or different: old keys are unreadable
+under the new layout and mixing the two would corrupt both. Recovery is to clear the
+replica's sync metadata and re-bootstrap from a peer snapshot; there is no in-place
+rewrite pass.
 
 ## Sync Protocol
 
@@ -732,23 +602,23 @@ before-image mirroring Lamina's `UpdateCellFact(new_value, prior_value?, prior_h
 It carries the cell version this write replaced, so a receiver can see *what changed
 from what* (audit trails, undo, conflict debugging) without a separate lookup.
 
-- **Source = the prior tracked cell version**, not the engine's `oldRow[i]`. `oldRow`
-  has no HLC and can diverge from the CRDT cell lineage; the before-image is the prior
-  `ColumnVersion` (`{ hlc, value }`), so it pairs semantically with `value`/`hlc`.
+- **Source = the prior tracked cell version**, not the engine's `oldRow[i]`, which has
+  no HLC and can diverge from the CRDT cell lineage. The prior `ColumnVersion`
+  (`{ hlc, value }`) pairs semantically with `value`/`hlc`.
 - **Replica-local lineage.** Stored on each `ColumnVersion` as "what this write replaced
   *here*" (`oldVersion` on the local write path, `oldColumnVersion` on apply). In
   causal-order delivery that equals the origin's prior, so a relaying receiver re-emits
   the origin's chain (the prior's own origin HLC, never reset to the receiver's clock).
-- **Best-effort.** Both fields are absent on the first write of a cell and on
-  snapshot-reconstructed cells (a snapshot is a fresh basis with no history). Producers
-  may omit them; receivers ignore them when absent; the no-`conflictResolver` HLC fast
-  path is unchanged. Repeated local overwrites before a pull keep one change-log entry
-  per cell, whose prior is the *immediately* overwritten version — "what the winning
-  write overwrote", not "the value at last sync" (intended Lamina semantics).
-- **Not used to skip the receiver's re-read.** The receiver's own `localValue` still
-  comes from its `getColumnVersion` read; the before-image is exposed only for the
-  resolver/validator. The "skip the re-read" optimization is intentionally **not** taken
-  (it would risk regressing the fast path).
+- **Best-effort.** Both fields are absent on a cell's first write and on
+  snapshot-reconstructed cells. Producers may omit them; receivers ignore them when
+  absent; the no-`conflictResolver` HLC fast path is unchanged. Repeated local overwrites
+  before a pull keep one change-log entry per cell, whose prior is the *immediately*
+  overwritten version — "what the winning write overwrote", not "the value at last sync"
+  (intended Lamina semantics).
+- **Not used to skip the receiver's re-read.** `localValue` still comes from the
+  receiver's `getColumnVersion` read; the before-image is exposed only for the
+  resolver/validator. Skipping the re-read is intentionally **not** done — it would risk
+  regressing the fast path.
 ```typescript
 
 /** A row deletion */
@@ -766,23 +636,20 @@ type Change = ColumnChange | RowDeletion;
 
 **Row before-image (`priorRow`).** The row-level companion to the per-cell
 before-image: an optional, purely additive last-known row image carried on a
-deletion, so a receiver can show or undo *what was removed* without having
-reconstructed it beforehand.
+deletion, so a receiver can show or undo *what was removed*.
 
-- **Source = the engine's `oldRow`**, captured at delete time (already on the
-  event, no extra read). Unlike the per-cell `priorValue` — which comes from the
-  prior tracked cell version — the row image is the column-ordered row the engine
-  deleted.
+- **Source = the engine's `oldRow`**, captured at delete time (already on the event, no
+  extra read) — the column-ordered row the engine deleted, unlike the per-cell
+  `priorValue`, which comes from the prior tracked cell version.
 - **Persisted on the tombstone.** `getChangesSince` re-resolves deletions from the
   `TombstoneStore`, so the image is stored on the `Tombstone` (the row analog of
   storing the cell prior on the `ColumnVersion`) and survives re-emission/relay.
 - **Best-effort.** Absent when the delete carried no `oldRow` (relayed/synthesized
-  deletes) and on snapshot-reconstructed tombstones (a snapshot is a fresh basis
-  with no history). Producers may omit it; receivers ignore it when absent. A
-  tombstone with no `priorRow` serializes to its unchanged fixed-size form.
-- **Storage cost.** Every tombstone may now hold a full row image, retained until
-  retention-horizon GC. Bounded but non-trivial for wide rows; an opt-out config
-  flag is a possible future follow-up.
+  deletes) and on snapshot-reconstructed tombstones. Producers may omit it; receivers
+  ignore it when absent. A tombstone with no `priorRow` serializes to its unchanged
+  fixed-size form.
+- **Storage cost.** Every tombstone may hold a full row image, retained until
+  retention-horizon GC — bounded but non-trivial for wide rows.
 ```typescript
 
 /** A schema modification */
@@ -806,41 +673,28 @@ interface SyncManager {
   /** Get current HLC for state comparison */
   getCurrentHLC(): HLC;
 
-  /**
-   * Get all changes since a peer's last known state.
-   * For initial sync, omit sinceHLC to get full snapshot.
-   */
+  /** All changes since a peer's last known state; omit sinceHLC for initial sync. */
   getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]>;
 
-  /**
-   * Apply changes received from a peer.
-   * Returns statistics about what was applied.
-   */
+  /** Apply changes received from a peer; returns statistics about what was applied. */
   applyChanges(changes: ChangeSet[]): Promise<ApplyResult>;
 
-  /**
-   * Check if delta sync is possible or if snapshot is required.
-   * Returns false if tombstone TTL has expired for relevant data.
-   */
+  /** False if a snapshot is required instead — e.g. tombstone TTL expired for relevant data. */
   canDeltaSync(peerSiteId: SiteId, sinceHLC: HLC): Promise<boolean>;
 
-  /**
-   * Get a full snapshot for initial sync or TTL expiration recovery.
-   */
+  /** A full snapshot, for initial sync or TTL-expiration recovery. */
   getSnapshot(): Promise<Snapshot>;
 
-  /**
-   * Apply a full snapshot (replaces all local data).
-   */
+  /** Apply a full snapshot (replaces all local data). */
   applySnapshot(snapshot: Snapshot): Promise<void>;
 }
 
 interface ApplyResult {
   applied: number;      // Changes successfully applied
-  skipped: number;      // Changes already present (no-op due to LWW)
+  skipped: number;      // Already present (LWW no-op)
   conflicts: number;    // Conflicts resolved (remote won or lost)
-  transactions: number; // Number of transactions processed
-  unknownTable?: number; // Changes diverted for out-of-basis tables (see § Unknown-Table Disposition)
+  transactions: number; // Transactions processed
+  unknownTable?: number; // Diverted for out-of-basis tables (§ Unknown-Table Disposition)
 }
 
 interface Snapshot {
@@ -870,27 +724,22 @@ interface TableSnapshot {
 interface SyncManager {
   // ... existing methods ...
 
-  /**
-   * Stream a snapshot as chunks for memory-efficient transfer.
-   * Use this instead of getSnapshot() for large databases.
-   */
+  /** Stream a snapshot as chunks; use instead of getSnapshot() for large databases. */
   getSnapshotStream(chunkSize?: number): AsyncIterable<SnapshotChunk>;
 
   /**
-   * Apply a streamed snapshot with progress tracking.
-   * Supports resumption via checkpoint tracking.
+   * Apply a streamed snapshot with progress tracking, resumable via checkpoint.
    *
    * A fresh apply replaces all local CRDT metadata: the up-front clear wipes
    * column versions, tombstones, and the change log before the chunks rewrite
    * them. Tombstones ARE carried in the stream (a global `tombstone`-chunk pass,
    * separate from the per-table column-version sections), so a deleted row stays
-   * deleted after bootstrap — a later stale write for it stays tombstone-blocked
-   * instead of resurrecting. On a *resumed* apply the sender skips already-completed
+   * deleted after bootstrap. On a *resumed* apply the sender skips already-completed
    * tables and never re-emits their metadata, so the receiver consults the persisted
-   * checkpoint (saved under `sc:{snapshotId}`) and preserves those completed
-   * tables through the clear — otherwise their CRDT state would be wiped and
-   * never rewritten, diverging from the row data still in the store. (Tombstones
-   * are re-emitted wholesale on resume and re-written idempotently.)
+   * checkpoint (saved under `sc:{snapshotId}`) and preserves those completed tables
+   * through the clear — otherwise their CRDT state would be wiped and never
+   * rewritten, diverging from the row data still in the store. (Tombstones are
+   * re-emitted wholesale on resume and re-written idempotently.)
    *
    * The header HLC is drift-validated before the clear (see the HLC section): a
    * far-future snapshot is rejected before any local metadata is touched.
@@ -900,26 +749,22 @@ interface SyncManager {
     onProgress?: (progress: SnapshotProgress) => void
   ): Promise<void>;
 
-  /**
-   * Get a resumable checkpoint for an in-progress snapshot.
-   */
+  /** A resumable checkpoint for an in-progress snapshot. */
   getSnapshotCheckpoint(snapshotId: string): Promise<SnapshotCheckpoint | undefined>;
 
-  /**
-   * Resume a snapshot transfer from a checkpoint.
-   */
+  /** Resume a snapshot transfer from a checkpoint. */
   resumeSnapshotStream(checkpoint: SnapshotCheckpoint): AsyncIterable<SnapshotChunk>;
 }
 
 /** Snapshot chunk types for streaming */
 type SnapshotChunk =
-  | SnapshotHeaderChunk      // Sent first with metadata (HLC drift-validated here)
-  | SnapshotTableStartChunk  // Marks beginning of a table
-  | SnapshotColumnVersionsChunk  // Batch of column versions
-  | SnapshotTombstoneChunk   // Batch of deletion records (global pass; carries fully-deleted rows)
-  | SnapshotTableEndChunk    // Marks end of a table
-  | SnapshotSchemaMigrationChunk  // Schema migration
-  | SnapshotFooterChunk;     // Sent last with stats
+  | SnapshotHeaderChunk      // First; HLC drift-validated here
+  | SnapshotTableStartChunk
+  | SnapshotColumnVersionsChunk
+  | SnapshotTombstoneChunk   // Global pass; carries fully-deleted rows
+  | SnapshotTableEndChunk
+  | SnapshotSchemaMigrationChunk
+  | SnapshotFooterChunk;     // Last; carries stats
 
 /** Progress info during snapshot streaming */
 interface SnapshotProgress {
@@ -955,68 +800,20 @@ interface SnapshotCheckpoint {
 
 For the primary use case of a master server syncing to many frontend replicas:
 
-```
-┌─────────────┐                              ┌─────────────┐
-│   Master    │                              │  Frontend   │
-│   Server    │                              │  Replica    │
-└──────┬──────┘                              └──────┬──────┘
-       │                                            │
-       │  1. Frontend connects, sends:              │
-       │     { mySiteId, lastSyncHLC }              │
-       │◄───────────────────────────────────────────│
-       │                                            │
-       │  2. Master checks canDeltaSync()           │
-       │     If false: send full snapshot           │
-       │     If true: getChangesSince()             │
-       │                                            │
-       │  3. Master sends ChangeSet[]               │
-       │────────────────────────────────────────────►
-       │                                            │
-       │  4. Frontend applies changes               │
-       │     applyChanges(changeSets)               │
-       │                                            │
-       │  5. Frontend sends its local changes       │
-       │     (changes made while offline)           │
-       │◄───────────────────────────────────────────│
-       │                                            │
-       │  6. Master applies frontend changes        │
-       │     Conflicts resolved via LWW             │
-       │                                            │
-       │  7. If conflicts, master re-sends winners  │
-       │────────────────────────────────────────────►
-       │                                            │
-```
+1. Frontend connects, sending `{ mySiteId, lastSyncHLC }`
+2. Master checks `canDeltaSync()` — if false a full snapshot, if true `getChangesSince()`
+3. Master sends `ChangeSet[]`; frontend applies them with `applyChanges(changeSets)`
+4. Frontend sends its own local changes (those made while offline)
+5. Master applies them, resolving conflicts via LWW, and re-sends any winners
 
 ### WebSocket Sync Protocol
 
-The WebSocket protocol provides real-time bidirectional synchronization. This is the recommended transport for interactive applications.
+The WebSocket protocol gives real-time bidirectional synchronization — the recommended transport for interactive applications.
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                        WebSocket Message Flow                               │
-├────────────────────────────────────────────────────────────────────────────┤
-│                                                                            │
-│  CLIENT                                            SERVER                  │
-│    │                                                  │                    │
-│    │─── { type: "handshake", …, protocolVersion } ───►│                    │
-│    │                                                  │                    │
-│    │◄─ { type: "handshake_ack", …, protocolVersion } ─│                    │
-│    │                                                  │                    │
-│    │──────── { type: "get_changes", sinceHLC? } ─────►│                    │
-│    │                                                  │                    │
-│    │◄─────── { type: "changes", changeSets: [...] } ──│                    │
-│    │                                                  │                    │
-│    │─── { type: "apply_changes", requestId, changes } ►│  (local changes)   │
-│    │                                                  │                    │
-│    │◄── { type: "apply_result", requestId, applied } ─│                    │
-│    │                                                  │                    │
-│    │◄────── { type: "push_changes", changeSets } ─────│  (from other peer) │
-│    │                                                  │                    │
-│    │──────── { type: "ping" } ───────────────────────►│  (heartbeat)       │
-│    │◄─────── { type: "pong" } ────────────────────────│                    │
-│    │                                                  │                    │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+A session runs `handshake` → `handshake_ack` (both carrying `protocolVersion`), then
+`get_changes` → `changes`; the client pushes its own work as `apply_changes` →
+`apply_result` (correlated by `requestId`), the server pushes another peer's as
+fire-and-forget `push_changes`, and `ping` / `pong` keep the socket alive.
 
 #### Message Types
 
@@ -1042,162 +839,102 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 | `error` | Error response | `{ code, message }` |
 | `pong` | Heartbeat response | (none) |
 
-**Push/ack correlation (`requestId`).** Each `apply_changes` the client sends to
-advance its delta-sync watermark carries a monotonic `requestId` (`apply-1`,
-`apply-2`, …). The server keeps no state — it reflects the id back verbatim on
-the resulting `apply_result`. The client promotes its `lastSentHLC` watermark
-only for the ack whose `requestId` matches the batch that produced it, and only
-ever forward. This makes a stale, duplicate, or out-of-order ack (e.g.
-redelivered across a reconnect) inert, rather than crediting the wrong batch and
-mis-advancing the watermark. Pushes with no watermark to promote (a peer-relay
-`apply_changes`) omit the id; the server then echoes none, and the client leaves
-its watermark untouched.
+**Push/ack correlation (`requestId`).** Each `apply_changes` that advances the client's
+delta-sync watermark carries a monotonic `requestId` (`apply-1`, `apply-2`, …). The
+server keeps no state — it reflects the id back verbatim on the resulting
+`apply_result`. The client promotes `lastSentHLC` only for the ack whose `requestId`
+matches the batch that produced it, and only ever forward, which makes a stale,
+duplicate, or out-of-order ack (e.g. redelivered across a reconnect) inert rather than
+crediting the wrong batch. Pushes with no watermark to promote (a peer-relay
+`apply_changes`) omit the id; the server then echoes none and the client leaves its
+watermark untouched.
 
 #### Protocol version
 
-The `handshake` and `handshake_ack` both carry `protocolVersion` — the integer
+`handshake` and `handshake_ack` both carry `protocolVersion` — the integer
 `PROTOCOL_VERSION` exported from `@quereus/sync` (`sync/wire.ts`), the single wire
-definition the client and coordinator share. The check is **strict integer
-equality**, run at connect time:
+definition client and coordinator share. The check is **strict integer equality**, at
+connect time:
 
-- The coordinator reads the client's `protocolVersion` **before authenticating**.
-  If it is absent or `!== PROTOCOL_VERSION`, it replies
-  `{ type: "error", code: "PROTOCOL_VERSION_MISMATCH", fatal: true }` and closes
-  the socket (code `4003`) without touching the store.
-- The coordinator echoes its own `protocolVersion` in `handshake_ack`. The client
-  checks it in `handleHandshakeAck`; on mismatch (or absence — an old
-  coordinator) it sets a lasting `error` status and stops reconnecting, the same
-  fatal path a `fatal: true` server error takes.
+- The coordinator reads the client's `protocolVersion` **before authenticating**. If it
+  is absent or `!== PROTOCOL_VERSION`, it replies
+  `{ type: "error", code: "PROTOCOL_VERSION_MISMATCH", fatal: true }` and closes the
+  socket (code `4003`) without touching the store.
+- The coordinator echoes its own `protocolVersion` in `handshake_ack`. The client checks
+  it in `handleHandshakeAck`; on mismatch (or absence — an old coordinator) it sets a
+  lasting `error` status and stops reconnecting, the same fatal path a `fatal: true`
+  server error takes.
 
-A peer that predates versioning sends no `protocolVersion`; that is treated as a
-mismatch, not silently accepted — silent drift is exactly what this guards
-against. Because all sync packages are lockstep-versioned in this monorepo,
-`PROTOCOL_VERSION` is bumped on any breaking change to a message shape or the
-codec, and there is no min/max range negotiation. If rolling upgrades across
-mixed versions ever become a real requirement, `PROTOCOL_VERSION`'s doc comment
-in `wire.ts` describes the range-negotiation upgrade path.
+A peer predating versioning sends no `protocolVersion`; that is a mismatch, not silently
+accepted — silent drift is what this guards against. Because all sync packages are
+lockstep-versioned in this monorepo, `PROTOCOL_VERSION` is bumped on any breaking change
+to a message shape or the codec, with no min/max range negotiation; `PROTOCOL_VERSION`'s
+doc comment in `wire.ts` describes the range-negotiation upgrade path should
+mixed-version rolling upgrades ever be required.
 
 #### Connection Lifecycle
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                        Client Connection State Machine                      │
-├────────────────────────────────────────────────────────────────────────────┤
-│                                                                            │
-│   ┌─────────────┐                                                          │
-│   │ DISCONNECTED│◄─────────────────────────────────────────────┐           │
-│   └──────┬──────┘                                              │           │
-│          │ connectSync(url, token)                             │           │
-│          ▼                                                     │           │
-│   ┌─────────────┐                                              │           │
-│   │ CONNECTING  │──────────────────────────────────────────────┤           │
-│   └──────┬──────┘  WebSocket error or close                    │           │
-│          │ onopen → send handshake                             │           │
-│          ▼                                                     │           │
-│   ┌─────────────┐                                              │           │
-│   │   SYNCING   │──────────────────────────────────────────────┤           │
-│   └──────┬──────┘  handshake_ack → get_changes                 │           │
-│          │ changes received → applyChanges()                   │           │
-│          ▼                                                     │           │
-│   ┌─────────────┐                                              │           │
-│   │   SYNCED    │◄─────┐                                       │           │
-│   └──────┬──────┘      │ apply_result or push_changes applied  │           │
-│          │             │                                       │           │
-│          └─────────────┘ local change → apply_changes          │           │
-│          │                                                     │           │
-│          │ WebSocket close (unintentional)                     │           │
-│          ▼                                                     │           │
-│   ┌─────────────┐                                              │           │
-│   │ RECONNECTING│─── exponential backoff (1s, 2s, 4s... 60s) ──┘           │
-│   └─────────────┘                                                          │
-│                                                                            │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+The client state machine:
+
+- **DISCONNECTED** → `connectSync(url, token)` → **CONNECTING**
+- **CONNECTING** → `onopen`, send handshake → **SYNCING**
+- **SYNCING** → `handshake_ack` → `get_changes`; changes received → `applyChanges()` → **SYNCED**
+- **SYNCED** stays put across `apply_result` / applied `push_changes`, and re-enters itself on a local change → `apply_changes`
+- Any of CONNECTING / SYNCING / SYNCED, on a WebSocket error or unintentional close → **RECONNECTING** → exponential backoff (1s, 2s, 4s … 60s) → DISCONNECTED and retry
 
 #### Delta Sync Optimization
 
 To minimize data transfer, clients track sync progress with the server. Every
 watermark is a **`ChangeSet.hlc`** — a transaction commit boundary (the max over
-`changeSets[].hlc`, computed by the shared `maxHLC` clock helper), never a per-change max or a
-batch-slice boundary — so advancing it can only ever land *between* whole
-transactions (§ Transaction-Based Change Grouping → Read side):
+`changeSets[].hlc`, via the shared `maxHLC` helper), never a per-change max or a
+batch-slice boundary — so advancing it can only land *between* whole transactions
+(§ Transaction-Based Change Grouping → Read side):
 
-1. **Receiving changes**: Only the ordered `changes` reply (contiguous, gap-free) advances `peerSyncState[serverSiteId]` (the *received* watermark) to the max `ChangeSet.hlc` received. A `push_changes` **broadcast** is applied idempotently but must **not** advance the watermark — broadcast delivery is fire-and-forget, so a dropped broadcast is invisible to the coordinator; leaving the watermark below it means the next `get_changes sinceHLC=<watermark>` redelivers (and harmlessly re-applies) it, closing the fire-and-forget change-loss hole
-2. **Sending changes**: Client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values. On each confirmed ack the client persists `lastSentHLC` durably per peer via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)
-3. **Reconnection / restart**: On reconnect, client sends `get_changes` with `sinceHLC` from the received watermark, and re-seeds `lastSentHLC` from the persisted sent watermark (`getPeerSentState`) so a fresh process resumes delta-push from the last confirmed HLC instead of replaying its entire local history. A manual `disconnect()` clears only the in-memory copy; the persisted watermark is intentionally retained
-4. **Server tracking**: Server uses client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity
+1. **Receiving changes**: Only the ordered `changes` reply (contiguous, gap-free) advances `peerSyncState[serverSiteId]` (the *received* watermark) to the max `ChangeSet.hlc` received. A `push_changes` **broadcast** is applied idempotently but must **not** advance it — broadcast delivery is fire-and-forget, so a dropped broadcast is invisible to the coordinator; leaving the watermark below it means the next `get_changes sinceHLC=<watermark>` redelivers (and harmlessly re-applies) it, closing the change-loss hole
+2. **Sending changes**: The client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values, persisting `lastSentHLC` per peer on each confirmed ack via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)
+3. **Reconnection / restart**: On reconnect the client sends `get_changes` with `sinceHLC` from the received watermark, and re-seeds `lastSentHLC` from the persisted sent watermark (`getPeerSentState`), so a fresh process resumes delta-push from the last confirmed HLC instead of replaying its entire local history. A manual `disconnect()` clears only the in-memory copy; the persisted watermark is intentionally retained
+4. **Server tracking**: The server uses the client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Delta Sync State Tracking                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Client State:                     Server State:                            │
-│  ┌─────────────────────────────┐   ┌─────────────────────────────┐          │
-│  │ peerSyncState[serverSiteId] │   │ Change Log (HLC-indexed)    │          │
-│  │   └─ lastReceivedHLC        │   │   └─ All changes since T0   │          │
-│  │                             │   │                             │          │
-│  │ lastSentHLC (confirmed)     │   │ Per-client session:         │          │
-│  │ pendingSentHLC (in-flight)  │   │   └─ lastSyncHLC            │          │
-│  └─────────────────────────────┘   └─────────────────────────────┘          │
-│                                                                             │
-│  On reconnect:                                                              │
-│  1. Client: get_changes { sinceHLC: peerSyncState[serverSiteId] }           │
-│  2. Server: Returns only whole transactions with ChangeSet.hlc > sinceHLC   │
-│  3. Client: applyChanges(), updates peerSyncState                           │
-│                                                                             │
-│  On local change:                                                           │
-│  1. Local change triggers debounced send (50ms window)                      │
-│  2. Client: getChangesSince(serverSiteId, lastSentHLC) → per-tx ChangeSets  │
-│  3. Client: apply_changes { requestId: apply-N, changes }                   │
-│  4. Client: pendingSentHLCs[requestId] = max ChangeSet.hlc of sent txns     │
-│  5. Server: apply_result { requestId, applied, ... }  (id echoed verbatim)  │
-│  6. Client: on matching requestId, lastSentHLC = that HLC (forward-only),   │
-│     persisted per peer (updatePeerSentState) for restart resume             │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The push loop, end to end: a local change triggers the debounced send (50 ms window);
+the client calls `getChangesSince(serverSiteId, lastSentHLC)` for per-transaction
+ChangeSets, sends `apply_changes { requestId: apply-N, changes }`, and records
+`pendingSentHLCs[requestId] = max ChangeSet.hlc of sent txns`; the server replies
+`apply_result { requestId, ... }` with the id echoed verbatim; on a matching id the
+client sets `lastSentHLC` to that HLC (forward-only) and persists it per peer.
 
 #### Reconnection with Exponential Backoff
 
-When the WebSocket connection drops unexpectedly:
-
-1. Client schedules reconnect with exponential backoff: `delay = min(1s × 2^attempt, 60s)`
-2. On successful reconnect, attempt counter resets to 0
-3. Manual `disconnectSync()` sets `intentionalDisconnect = true` to prevent auto-reconnect
-4. Reconnect attempts use the same URL and token from the original connection
+When the WebSocket connection drops unexpectedly, the client schedules a reconnect with
+`delay = min(1s × 2^attempt, 60s)`, reusing the original connection's URL and token, and
+resets the attempt counter to 0 on success. A manual `disconnectSync()` sets
+`intentionalDisconnect = true`, preventing auto-reconnect.
 
 #### Server Errors: Fatal vs Transient
 
-A server `error` message does **not** by itself stop the client. Reconnect is
-gated by two independent flags: `intentionalDisconnect` (set **only** when the
-client calls `disconnect()`) and `stopReconnect` (set only by a fatal server
-error). The coordinator tags each `error` message with a `fatal` boolean:
+A server `error` message does **not** by itself stop the client. Reconnect is gated by two
+independent flags: `intentionalDisconnect` (set **only** when the client calls
+`disconnect()`) and `stopReconnect` (set only by a fatal server error). The coordinator
+tags each `error` with a `fatal` boolean:
 
-- **Fatal** (`fatal: true`) — the session is unrecoverable and the coordinator
-  typically also closes the socket: `AUTH_FAILED`, `MISSING_DATABASE_ID`,
-  `ALREADY_AUTHENTICATED`. The client sets `status: 'error'`, settles any pending
-  `connect()`, and sets `stopReconnect` so auto-reconnect halts (a bare retry
-  would just fail again).
-- **Transient** (`fatal` absent or false) — one request failed but the session
-  is fine: `APPLY_CHANGES_ERROR`, `GET_CHANGES_ERROR`, `SNAPSHOT_ERROR`,
-  `NOT_AUTHENTICATED`, `UNKNOWN_MESSAGE`, `MESSAGE_ERROR`. The client surfaces the
-  error (`error` sync event + `onError`) but keeps the connection **and its
-  auto-reconnect** intact, and does not enter a lasting `error` status. A single
-  transient per-request error never disables auto-reconnect.
+- **Fatal** (`fatal: true`) — the session is unrecoverable and the coordinator typically
+  also closes the socket: `AUTH_FAILED`, `MISSING_DATABASE_ID`, `ALREADY_AUTHENTICATED`.
+  The client sets `status: 'error'`, settles any pending `connect()`, and sets
+  `stopReconnect` so auto-reconnect halts (a bare retry would just fail again).
+- **Transient** (`fatal` absent or false) — one request failed but the session is fine:
+  `APPLY_CHANGES_ERROR`, `GET_CHANGES_ERROR`, `SNAPSHOT_ERROR`, `NOT_AUTHENTICATED`,
+  `UNKNOWN_MESSAGE`, `MESSAGE_ERROR`. The client surfaces it (`error` sync event +
+  `onError`) but keeps the connection **and its auto-reconnect** intact and does not enter
+  a lasting `error` status.
 
-For coordinators predating the `fatal` flag, the client falls back to a small
-built-in set of known-fatal codes (the three fatal codes above); every other
-code is treated as transient.
+For coordinators predating the `fatal` flag, the client falls back to a built-in
+known-fatal set (the three codes above); every other code is treated as transient.
 
 #### Local Change Debouncing
 
-Rapid local changes are batched to reduce network overhead:
-
-1. On local change event, start/reset a 50ms debounce timer
-2. When timer fires, collect all changes since `lastSentHLC`
-3. Send batched changes in a single `apply_changes` message
-4. This reduces WebSocket messages from N per edit to 1 per burst
+Rapid local changes are batched to reduce network overhead: each local change event
+starts or resets a 50 ms debounce timer, and when it fires the client collects every
+change since `lastSentHLC` and sends them in one `apply_changes` message — N messages
+per edit become 1 per burst.
 
 ## Reactive Hooks
 
@@ -1205,30 +942,28 @@ The sync module exposes reactive hooks for UI integration:
 
 ```typescript
 interface SyncEventEmitter {
-  /** Fired when remote changes are applied locally */
+  /** Remote changes applied locally */
   onRemoteChange(listener: (event: RemoteChangeEvent) => void): () => void;
 
-  /** Fired when local changes are ready to sync */
+  /** Local changes ready to sync */
   onLocalChange(listener: (event: LocalChangeEvent) => void): () => void;
 
-  /** Fired when sync state changes (connected, syncing, error) */
+  /** Sync state changed (connected, syncing, error) */
   onSyncStateChange(listener: (state: SyncState) => void): () => void;
 
-  /** Fired when a conflict is resolved */
+  /** A conflict was resolved */
   onConflictResolved(listener: (event: ConflictEvent) => void): () => void;
 
   /**
-   * Fired when inbound changes reference a table outside the local basis
-   * (an out-of-basis straggler delta), regardless of the configured
-   * disposition. See § Unknown-Table Disposition.
+   * Inbound changes reference a table outside the local basis (an out-of-basis
+   * straggler delta), whatever the disposition. See § Unknown-Table Disposition.
    */
   onUnknownTable(listener: (event: UnknownTableEvent) => void): () => void;
 
   /**
-   * Fired when an inbound batch's merged row state trips a local commit-time
-   * global assertion. Detect-and-notify: the data has already converged (the
-   * batch committed in report mode), so this is informational — the host
-   * decides policy. See § Apply-time validation.
+   * An inbound batch's merged row state tripped a local commit-time global
+   * assertion. Detect-and-notify: the data has already converged, so this is
+   * informational and the host decides policy. See § Apply-time validation.
    */
   onAssertionViolation(listener: (event: AssertionViolationEvent) => void): () => void;
 }
@@ -1292,29 +1027,19 @@ reactive events fire **exactly once** for each change, whether local or remote.
 
 > **Why the engine emitter, not the per-table store emitter.** The per-table
 > `StoreEventEmitter` / `TransactionCoordinator` sits **below** the transaction
-> boundary: each table has its own coordinator, so a cross-table commit fires
-> several separate bursts and cannot be grouped into one transaction. The single
-> boundary that sees one logical transaction whole — across every table — is the
-> engine's `DatabaseEventEmitter.onTransactionCommit`. The grouped batch preserves
-> each event's `remote` flag, so the write side still filters remote-origin events
-> out of the group (an all-remote group is a pure sync-apply echo and is skipped).
-> A relay-only deployment (e.g. a coordinator) that produces no local DML simply
-> omits `transactionSource` and captures nothing.
+> boundary — each table has its own coordinator, so a cross-table commit fires several
+> separate bursts that cannot be grouped into one transaction. The grouped batch
+> preserves each event's `remote` flag, so the write side still filters remote-origin
+> events out (an all-remote group is a pure sync-apply echo and is skipped). A
+> relay-only deployment that produces no local DML simply omits `transactionSource`
+> and captures nothing.
 
 #### Event Flow
 
-**Local Changes:**
-```
-User SQL → engine commits txn → db.onTransactionCommit (grouped, remote=false)
-        → SyncManager records metadata under one HLC → UI receives per-event store events
-```
+- **Local**: user SQL → engine commits txn → `db.onTransactionCommit` (grouped, `remote=false`) → SyncManager records metadata under one HLC → UI receives the per-event store events.
+- **Remote**: SyncManager applies the change via `applyToStore` → store executes and emits with `remote=true` → SyncManager ignores its own echo → UI receives the event.
 
-**Remote Changes:**
-```
-SyncManager receives remote change → Updates metadata → Calls applyToStore → Store executes → Store emits event (remote=true) → SyncManager ignores → UI receives event
-```
-
-In both cases, the UI receives exactly one event from the Store. The `remote` flag determines whether the SyncManager should record CRDT metadata (local) or skip (remote).
+Either way the UI receives exactly one event from the Store. The `remote` flag decides whether the SyncManager records CRDT metadata (local) or skips (remote).
 
 #### The `remote` Flag
 
@@ -1352,82 +1077,46 @@ from `oldRow`/`newRow`; an ALTER does not change that.)
 
 #### Sync Module Event Handling
 
-The SyncManager subscribes once to the engine transaction boundary and records the
-whole committed transaction under one HLC, emitting a single local-change event:
-
-```typescript
-// Sync module subscribes to the engine transaction-commit boundary.
-db.onTransactionCommit((batch) => {
-  const localSchema = batch.schemaEvents.filter((e) => !e.remote);
-  const localData = batch.dataEvents.filter((e) => !e.remote);
-  if (localSchema.length === 0 && localData.length === 0) return; // all-remote echo
-
-  const base = hlcManager.tick();                 // ONE HLC per transaction
-  const transactionId = deterministicTxnId(base); // stable across peers
-  let opSeq = 0;
-  const kvBatch = kv.batch();
-
-  for (const e of localSchema) recordMigration(kvBatch, e, base, opSeq++);   // DDL first
-  for (const e of localData)   recordFacts(kvBatch, e, base, () => opSeq++);  // then DML
-  persistHlcState(kvBatch);
-  await kvBatch.write();
-
-  // One local-change event per committed transaction, for UI reactivity.
-  syncEventEmitter.emitLocalChange({ transactionId, changes, pendingSync: true });
-});
-```
+The SyncManager subscribes once to `db.onTransactionCommit`, filters out remote-origin
+events, returns early on an all-remote echo, records the whole committed transaction
+under one HLC in one `kvBatch` (DDL migrations first, then DML facts, then the persisted
+clock state), and emits a single local-change event `{ transactionId, changes,
+pendingSync: true }` for UI reactivity. See § Transaction-Based Change Grouping →
+*Write side* for the pseudocode.
 
 #### Applying Remote Changes
 
-When the SyncManager applies remote changes, it must execute SQL in a way that the resulting store events are marked with `remote: true`:
+When the SyncManager applies remote changes, it must execute SQL in a way that the
+resulting store events are marked with `remote: true`, so the SyncManager ignores its
+own echo. The data write lands first; CRDT metadata is committed only after it succeeds
+(see the write-ordering invariant under Transactional Integrity During Sync).
 
-```typescript
-// SyncManager applies a remote changeset
-async applyRemoteChangeset(changeset: ChangeSet): Promise<void> {
-  // 1. Apply to store with remote flag (the data write must land first)
-  await this.applyToStore(changeset.changes, { remote: true });
-  // Store emits events with remote=true, SyncManager ignores them
-
-  // 2. Commit CRDT metadata only after the data write succeeded — see the
-  //    write-ordering invariant under Transactional Integrity During Sync.
-  for (const change of changeset.changes) {
-    await this.updateMetadataForRemote(change);
-  }
-}
-```
-
-The store plugin provides a mechanism to execute SQL with the remote flag:
+The store plugin provides the mechanism:
 
 ```typescript
 interface ApplyOptions {
   remote?: boolean;  // Mark resulting events as remote
 }
 
-// Store implementation ensures emitted events have remote=true
-async applyChanges(changes: Change[], options: ApplyOptions): Promise<void> {
-  for (const change of changes) {
-    // Execute SQL...
-    // When emitting event, include remote flag from options
-    this.events.emitDataChange({ ...event, remote: options.remote });
-  }
-}
+// Store implementation ensures emitted events carry the flag:
+//   this.events.emitDataChange({ ...event, remote: options.remote });
 ```
 
 ## Schema Synchronization
 
-Schema (catalog) changes are synchronized using the same CRDT approach as data, ensuring eventual convergence across all replicas without requiring a perpetual migration log.
+Schema (catalog) changes use the same CRDT approach as data, giving eventual convergence across all replicas with no perpetual migration log.
 
 ### Design Principles
 
-1. **Catalog as Data**: Schema elements (tables, columns, indexes) are tracked with HLCs just like row data
-2. **Column-Level Granularity**: Each column definition has its own HLC, enabling parallel schema changes
-3. **Most Destructive Wins**: DROP operations take precedence over modifications
-4. **DDL Before DML**: Sync batches always apply schema changes before data changes
-5. **No Perpetual Log**: Only current state is tracked, not a history of migrations
+1. **Catalog as Data**: schema elements (tables, columns, indexes) carry HLCs like row data
+2. **Column-Level Granularity**: each column definition has its own HLC, enabling parallel schema changes
+3. **Most Destructive Wins**: DROP takes precedence over modification
+4. **DDL Before DML**: sync batches apply schema changes before data changes
+5. **No Perpetual Log**: only current state is tracked, not a migration history
 
 ### Schema Metadata Storage
 
-Schema metadata is stored alongside data metadata using the same patterns:
+Schema metadata is stored alongside data metadata, same patterns:
 
 | Key Pattern | Purpose | Value |
 |-------------|---------|-------|
@@ -1449,35 +1138,24 @@ Within the same level of destructiveness, Last-Write-Wins (LWW) applies based on
 **Examples:**
 
 ```
-Replica A: DROP COLUMN foo      @ HLC(1000, 1, A)
-Replica B: ALTER COLUMN foo...  @ HLC(2000, 1, B)
+A: DROP COLUMN foo      @ HLC(1000, 1, A)
+B: ALTER COLUMN foo...  @ HLC(2000, 1, B)
+⇒ DROP wins (more destructive), even though B has the higher HLC.
 
-Resolution: DROP wins (more destructive), even though B has higher HLC.
-```
+A: ALTER COLUMN foo SET DEFAULT 'x'  @ HLC(1000, 1, A)
+B: ALTER COLUMN foo SET DEFAULT 'y'  @ HLC(2000, 1, B)
+⇒ B wins (same level, higher HLC).
 
-```
-Replica A: ALTER COLUMN foo SET DEFAULT 'x'  @ HLC(1000, 1, A)
-Replica B: ALTER COLUMN foo SET DEFAULT 'y'  @ HLC(2000, 1, B)
-
-Resolution: B wins (same level, higher HLC).
-```
-
-```
-Replica A: ADD COLUMN bar INTEGER  @ HLC(1000, 1, A)
-Replica B: ADD COLUMN bar TEXT     @ HLC(2000, 1, B)
-
-Resolution: B wins (same level, higher HLC). Column ends up as TEXT.
+A: ADD COLUMN bar INTEGER  @ HLC(1000, 1, A)
+B: ADD COLUMN bar TEXT     @ HLC(2000, 1, B)
+⇒ B wins (same level, higher HLC); the column ends up TEXT.
 ```
 
 ### DDL Application Order
 
-When applying a sync batch:
-
-1. **Schema changes first**: All DDL operations are applied before any DML
-2. **Destructive operations first**: DROP TABLE, then DROP COLUMN, then ALTER/ADD
-3. **Data changes second**: INSERT/UPDATE/DELETE applied to the now-correct schema
-
-This ensures that structures always exist before data referencing them arrives.
+Within a sync batch, **all DDL is applied before any DML**, destructive operations first
+(DROP TABLE, then DROP COLUMN, then ALTER/ADD), and INSERT/UPDATE/DELETE then land on the
+now-correct schema — so structures always exist before data referencing them arrives.
 
 ### Schema Change Types
 
@@ -1509,65 +1187,39 @@ interface SchemaChange {
 
 ### Applying Remote Schema Changes
 
-When a remote schema change is received:
-
-1. Compare HLCs using the "most destructive wins" rule
-2. If remote wins, update local schema metadata
-3. Execute the DDL against the database (with `remote: true` flag)
-4. The store emits schema change events for UI reactivity
+On receiving a remote schema change: compare HLCs under "most destructive wins"; if the
+remote wins, update local schema metadata and execute the DDL against the database with
+the `remote: true` flag, whereupon the store emits schema change events for UI reactivity.
+The precedence test (`shouldApplySchemaChange`) is:
 
 ```typescript
-async applySchemaChange(change: SchemaChange): Promise<'applied' | 'skipped'> {
-  const local = await this.getSchemaVersion(change.schema, change.table, change.column);
-
-  if (local && !this.shouldApplySchemaChange(change, local)) {
-    return 'skipped';
-  }
-
-  // Update metadata
-  await this.setSchemaVersion(change.schema, change.table, change.column, {
-    hlc: change.hlc,
-    definition: change.definition,
-    deleted: change.deleted,
-  });
-
-  // Execute DDL via callback (store applies with remote flag)
-  if (change.definition) {
-    await this.applyDDL(change.definition, { remote: true });
-  }
-
-  return 'applied';
-}
-
-private shouldApplySchemaChange(remote: SchemaChange, local: SchemaVersion): boolean {
-  // Most destructive wins
-  if (remote.deleted && !local.deleted) return true;   // DROP beats non-DROP
-  if (!remote.deleted && local.deleted) return false;  // non-DROP loses to DROP
-
-  // Same level: LWW
-  return compareHLC(remote.hlc, local.hlc) > 0;
-}
+// Most destructive wins
+if (remote.deleted && !local.deleted) return true;   // DROP beats non-DROP
+if (!remote.deleted && local.deleted) return false;  // non-DROP loses to DROP
+return compareHLC(remote.hlc, local.hlc) > 0;        // same level: LWW
 ```
+
+When it passes, `applySchemaChange` writes the new `SchemaVersion` (`hlc`, `definition`,
+`deleted`) and, if the change carries a `definition`, executes the DDL via
+`applyDDL(definition, { remote: true })`; otherwise it returns `'skipped'`.
 
 ### Idempotent DDL application
 
 Replicated DDL is applied **idempotently**, by two independent gates.
 
-The **first** is in `change-applicator.ts`, before the adapter is involved at
-all: an incoming migration is looked up by `(schema, object name, schema
-version)`, and if one is already recorded there with an HLC greater than or
-equal to the incoming one, it is skipped and counted. This is what absorbs the
-ordinary cases — the same batch delivered twice, or a migration the receiver
-already originated itself. Note the object identity here is the *object's own
-name*: for an index migration that is the index name, with no table component.
+The **first**, in `change-applicator.ts`, runs before the adapter is involved: an incoming
+migration is looked up by `(schema, object name, schema version)`, and skipped and counted
+if one is already recorded there with an HLC ≥ the incoming one. That absorbs the ordinary
+cases — the same batch delivered twice, or a migration the receiver originated itself. The
+object identity here is the *object's own name*: for an index migration, the index name,
+with no table component.
 
-The **second** gate only sees migrations the first admitted: a migration whose
-version slot is free, or whose HLC beats what is recorded there. Two peers that
-were offline at the same time can each run the same `create table orders`, and
-the one that wins the HLC comparison is then delivered to a peer that already
-has the table. So before executing anything, the store adapter
-(`store-adapter.ts` § `decideSchemaChange`) checks whether the named object is
-already in the migration's wanted state:
+The **second** gate only sees migrations the first admitted: a migration whose version
+slot is free, or whose HLC beats what is recorded there. Two peers offline at the same
+time can each run the same `create table orders`, and the HLC winner is then delivered to
+a peer that already has the table. So before executing anything, the store adapter
+(`store-adapter.ts` § `decideSchemaChange`) checks whether the named object is already in
+the migration's wanted state:
 
 | Situation | Outcome |
 |---|---|
@@ -1576,28 +1228,26 @@ already in the migration's wanted state:
 | Object already exists with a **different** definition | Error naming the object and printing both definitions |
 
 "Definition matches" is decided by regenerating the canonical DDL from the local
-`TableSchema` / `IndexSchema` (`generateTableDDL` / `generateIndexDDL`, with no
-`db` argument, which is exactly how the origin produced the DDL it put on the
-wire) and comparing it against the received DDL after a small normalization —
-trim, drop a trailing `;`, collapse whitespace runs, compare case-insensitively.
+`TableSchema` / `IndexSchema` (`generateTableDDL` / `generateIndexDDL` with no `db`
+argument — exactly how the origin produced the DDL it put on the wire) and comparing it
+against the received DDL after a small normalization: trim, drop a trailing `;`, collapse
+whitespace runs, compare case-insensitively.
 
-The silent-convergence case matters beyond noise reduction. A throw from a schema
-change is collected into `ApplyToStoreResult.errors`, and any non-empty `errors`
-aborts the whole admission unit *before* its CRDT metadata is committed (see §
-Transactional Integrity During Sync). A duplicate create that threw therefore
-blocked every other change in the same batch from ever committing metadata, and
-the peer watermark never advanced — so the receiver re-applied and re-failed the
-same batch on every subsequent sync, permanently. Converging the duplicate lets
-the batch commit and the peers finish syncing.
+Silent convergence matters beyond noise reduction: a schema-change throw lands in
+`ApplyToStoreResult.errors`, and any non-empty `errors` aborts the whole admission unit
+*before* its CRDT metadata commits (see § Transactional Integrity During Sync), so a
+throwing duplicate create would block every other change in the batch from ever
+committing metadata, the peer watermark would never advance, and the receiver would
+re-apply and re-fail the same batch on every sync, permanently.
 
-A **divergent** same-name definition is deliberately still an error, and there is
-no automatic convergence path for it: two peers with the same table name but
-different column layouts would interpret each other's rows under different
-shapes, so quietly keeping the local shape and committing the metadata would
-record "converged" for a divergence that is not. That batch keeps aborting and
-retrying until an operator resolves it. Resolving it automatically would require
-last-writer-wins over schema *definitions* (apply the higher-HLC shape as a
-migration, rewriting the local table), which is substantially more machinery.
+A **divergent** same-name definition is deliberately still an error, with no automatic
+convergence path: two peers with the same table name but different column layouts would
+interpret each other's rows under different shapes, so quietly keeping the local shape
+and committing the metadata would record "converged" for a divergence that is not. That
+batch keeps aborting and retrying until an operator resolves it. Resolving it
+automatically would require last-writer-wins over schema *definitions* (apply the
+higher-HLC shape as a migration, rewriting the local table) — substantially more
+machinery.
 
 ### What replicates
 
@@ -1608,43 +1258,37 @@ and `create index` via `generateTableDDL` / `generateIndexDDL`, the two drops vi
 `generateDropTableDDL` / `generateDropIndexDDL` (all in
 `packages/quereus/src/schema/ddl-generator.ts`). The memory virtual-table module
 attaches the same four, so a host that wires it an event emitter sees the same
-DDL; there is no end-to-end sync path for memory-backed tables today, so those
-are covered by direct event assertions rather than a peer relay.
+DDL; there is no end-to-end sync path for memory-backed tables today.
 
 ALTER TABLE does **not** replicate. A column add / drop / alter records an
-`alter_column` migration whose DDL is still blank, so it crosses the wire as an
-empty statement and changes nothing on the receiver — a peer that alters a table
-stays silently diverged in shape. This is a known gap, not a bug to work around:
-the event a table alteration emits (`alter` / `table` plus the table name) does
-not describe *what* was altered, a rename reports only the new name, and a
-declarative `apply schema` applies its diff as several separate alterations in
-one transaction (each its own event) — so attaching the originating DDL to the
-event is real design work, tracked separately in
+`alter_column` migration whose DDL is blank, so it crosses the wire as an empty
+statement and changes nothing on the receiver — a peer that alters a table stays
+silently diverged in shape. This is a known gap, not a bug to work around: a table
+alteration's event (`alter` / `table` plus the table name) does not describe *what* was
+altered, a rename reports only the new name, and a declarative `apply schema` applies its
+diff as several separate alterations in one transaction, each its own event — so
+attaching the originating DDL to the event is real design work, tracked in
 `feat-sync-replicate-alter-table`.
 
-Both ends log the gap rather than staying silent about it. The origin warns in
-`recordSchemaMigration` when it records an `alter_column` migration with no DDL,
-naming the schema and table and stating plainly that the alteration will not
-reach other devices — one warning per altering event, so a multi-alteration
-`apply schema` names each one. The receiver warns in `applySchemaChange`, inside
-the blank-DDL early return below, naming the migration type, schema and table;
-that one is deliberately **not** scoped to `alter_column`, so a blank drop/index
-migration from a peer on an older build is reported too. Neither warning changes
-behavior — the migration is still recorded (and
-still advances the table's schema version, which the destructiveness comparison
-above depends on) and the blank-DDL migration is still skipped exactly as
-before.
+Both ends log the gap. The origin warns in `recordSchemaMigration` when it records a
+DDL-less `alter_column` migration, naming the schema and table and stating that the
+alteration will not reach other devices — one warning per altering event, so a
+multi-alteration `apply schema` names each one. The receiver warns in
+`applySchemaChange`, in the blank-DDL early return, naming the migration type, schema
+and table; that one is deliberately **not** scoped to `alter_column`, so a blank
+drop/index migration from a peer on an older build is reported too. Neither warning
+changes behavior: the migration is still recorded (and still advances the table's schema
+version, which the destructiveness comparison depends on) and still skipped.
 
-A migration with a blank DDL is skipped outright — counted applied, but neither
-executed nor given a pending remote-event expectation. That last part matters:
-expectations are refcounted and never expire, so one registered for a statement
-that emits no event would linger and consume the next genuine *local* DDL of the
-same signature, marking it remote — and remote events are filtered out of the
-SyncManager's local-fact capture, so that local change would never replicate.
-The same one-expectation-per-migration accounting is why the executed forms must
-each emit exactly one module event: `drop table` over an indexed table emits one
-`drop`/`table` event and no per-index drop, so its single expectation is matched
-exactly once.
+A blank-DDL migration is skipped outright — counted applied, but neither executed nor
+given a pending remote-event expectation. That last part matters: expectations are
+refcounted and never expire, so one registered for a statement that emits no event would
+linger and consume the next genuine *local* DDL of the same signature, marking it remote
+— and remote events are filtered out of local-fact capture, so that local change would
+never replicate. The same one-expectation-per-migration accounting is why each executed
+form must emit exactly one module event: `drop table` over an indexed table emits one
+`drop`/`table` event and no per-index drop, so its single expectation is matched exactly
+once.
 
 ## Configuration
 
@@ -1676,23 +1320,18 @@ interface SyncConfig {
    * evicts once the table has been quiet for `horizonMs` (default
    * `retentionHorizonMs`); `'never'` keeps storage forever; `'immediate'`
    * reclaims on the first sweep after detach. A per-table `quereus.sync.evict`
-   * reserved tag overrides this. The sweep — `evictExpiredBasisTables(now?)` — is
-   * host-driven (like `pruneTombstones` / `pruneQuarantine`; no library timer) and
-   * a no-op when no `dropLocalTable` reclaim callback is wired.
+   * reserved tag overrides this. The sweep, `evictExpiredBasisTables(now?)`, is
+   * host-driven (no library timer) and a no-op when no `dropLocalTable` reclaim
+   * callback is wired.
    */
   basisEviction?: { mode: 'horizon' | 'never' | 'immediate'; horizonMs?: number };
 
   /** Site ID (auto-generated if not provided) */
   siteId?: Uint8Array;
 }
-
-// Usage
-const sync = createSyncModule(storeModule, storeEventEmitter, {
-  retentionHorizonMs: 30 * 24 * 60 * 60 * 1000,  // 30 days
-  allowResurrection: false,
-  batchSize: 1000,
-});
 ```
+
+See § Usage Example for how the config is passed to `createSyncModule`.
 
 ## Usage Example
 
@@ -1701,56 +1340,39 @@ import { Database } from '@quereus/quereus';
 import { LevelDBModule, LevelDBStore, StoreEventEmitter } from 'quereus-store';
 import { createSyncModule } from '@quereus/sync';
 
-// 1. Set up store with event emitter
+// 1. Store + event emitter
 const storeEvents = new StoreEventEmitter();
 const store = new LevelDBModule(storeEvents);
 
-// 2. Open a KV store for sync metadata
+// 2. KV store for sync metadata
 const kvStore = await LevelDBStore.open({ path: './sync-meta' });
 
-// 3. Create sync module
+// 3. Sync module
 const { syncManager, syncEvents } = await createSyncModule(kvStore, storeEvents, {
   retentionHorizonMs: 30 * 24 * 60 * 60 * 1000,
 });
 
-// 4. Register store module with database
+// 4. Register the store module with the database
 const db = new Database();
 db.registerModule('store', store);
 
-// 5. Create tables (sync automatically tracks changes via storeEvents)
+// 5. Create tables (sync tracks changes automatically via storeEvents)
 await db.exec(`
-  create table users (
-    id integer primary key,
-    name text,
-    email text
-  ) using store(path='./data')
+  create table users (id integer primary key, name text, email text)
+  using store(path='./data')
 `);
 
-// 6. Subscribe to sync events for UI
-syncEvents.onRemoteChange((event) => {
-  console.log('Remote changes applied:', event.changes.length);
-  // Update UI, invalidate caches, etc.
-});
-
-syncEvents.onConflictResolved((event) => {
-  console.log(`Conflict on ${event.table}.${event.column}: ${event.winner} won`);
-});
+// 6. Subscribe to sync events for UI (update UI, invalidate caches, …)
+syncEvents.onRemoteChange((event) => { /* event.changes */ });
+syncEvents.onConflictResolved((event) => { /* event.table/column/winner */ });
 
 // 7. Implement your transport layer
 async function syncWithServer(ws: WebSocket) {
-  // Get changes to send
-  const localChanges = await syncManager.getChangesSince(
-    serverSiteId,
-    lastServerHLC
-  );
-
-  // Send via your transport
+  const localChanges = await syncManager.getChangesSince(serverSiteId, lastServerHLC);
   ws.send(JSON.stringify({ type: 'changes', data: localChanges }));
 
-  // Receive and apply server changes
   ws.onmessage = async (msg) => {
-    const serverChanges = JSON.parse(msg.data);
-    const result = await syncManager.applyChanges(serverChanges);
+    const result = await syncManager.applyChanges(JSON.parse(msg.data));
     console.log(`Applied ${result.applied} changes`);
   };
 }
@@ -1758,7 +1380,7 @@ async function syncWithServer(ws: WebSocket) {
 
 ### Streaming Snapshot Example
 
-For large databases, use streaming snapshots to avoid loading everything into memory:
+For large databases, stream snapshots instead of loading everything into memory:
 
 ```typescript
 // Server: Stream snapshot to client
@@ -1778,31 +1400,24 @@ async function receiveSnapshot(ws: WebSocket) {
   });
 }
 
-// Client: ask the server to resume an interrupted snapshot
-import { serializeSnapshotCheckpoint } from '@quereus/sync';
-
+// Client: ask the server to resume an interrupted snapshot. The checkpoint MUST go
+// through serializeSnapshotCheckpoint — it holds a Uint8Array siteId and a bigint
+// HLC wallTime, and JSON.stringify throws on the bigint.
 async function requestResume(ws: WebSocket, snapshotId: string) {
   const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
   if (!checkpoint) return;  // nothing saved — fall back to a fresh get_snapshot
-
-  // The checkpoint MUST go through serializeSnapshotCheckpoint: it holds a
-  // Uint8Array siteId and a bigint HLC wallTime, and JSON.stringify throws on
-  // the bigint.
   ws.send(JSON.stringify({
     type: 'resume_snapshot',
     checkpoint: serializeSnapshotCheckpoint(checkpoint),
   }));
-
   // Chunks come back exactly as for a fresh snapshot — apply them the same way
   await syncManager.applySnapshotStream(receiveChunks(ws));
 }
 
 // Server: resume streaming from the client's checkpoint
-import { deserializeSnapshotCheckpoint } from '@quereus/sync';
-
 async function handleResume(ws: WebSocket, message: { checkpoint: SerializedSnapshotCheckpoint }) {
-  const checkpoint = deserializeSnapshotCheckpoint(message.checkpoint);
-  for await (const chunk of syncManager.resumeSnapshotStream(checkpoint)) {
+  for await (const chunk of syncManager.resumeSnapshotStream(
+    deserializeSnapshotCheckpoint(message.checkpoint))) {
     ws.send(JSON.stringify(chunk));
   }
 }
@@ -1810,38 +1425,24 @@ async function handleResume(ws: WebSocket, message: { checkpoint: SerializedSnap
 
 ### Store Adapter for Remote Changes
 
-The `createStoreAdapter` function creates a unified adapter for applying remote changes to LevelDB and IndexedDB stores:
+`createStoreAdapter` builds a unified adapter for applying remote changes to LevelDB and IndexedDB stores:
 
 ```typescript
 import { createStoreAdapter } from '@quereus/sync';
-import { LevelDBStore, StoreEventEmitter } from '@quereus/store';
 
-// Create event emitter for store events
-const storeEvents = new StoreEventEmitter();
-
-// Open your KV store
-const kvStore = await LevelDBStore.open({ path: './data' });
-
-// Create the store adapter
 const applyToStore = createStoreAdapter(kvStore, storeEvents);
-
-// Use with SyncManager - remote changes are applied via the adapter
 const syncManager = new SyncManagerImpl(metadataKvStore, storeEvents, applyToStore, {
   retentionHorizonMs: 30 * 24 * 60 * 60 * 1000,
 });
-
-// When remote changes arrive, the adapter:
-// 1. Handles UPSERT semantics (insert if row doesn't exist, update if it does)
-// 2. Deletes rows by primary key
-// 3. Executes DDL for schema changes
-// 4. Emits events with remote=true to prevent re-recording CRDT metadata
 ```
+
+On inbound changes the adapter handles UPSERT semantics, deletes rows by primary key, executes DDL for schema changes, and emits events with `remote=true` so CRDT metadata is not re-recorded.
 
 ## Current limitations
 
-The sync engine core is complete: HLC clocks, column-level LWW conflict resolution,
-tombstones, transaction-grouped change extraction, streaming snapshots, schema
-synchronization, reactive hooks, the LevelDB/IndexedDB store adapters, and the
+The engine core is complete: HLC clocks, column-level LWW, tombstones,
+transaction-grouped change extraction, streaming snapshots, schema synchronization,
+reactive hooks, the LevelDB/IndexedDB store adapters, and the
 [`@quereus/sync-client`](../packages/quereus-sync-client/) WebSocket client.
 
 Known gaps, tracked in [`docs/todo.md` § Sync Engine Remaining Work](todo.md#sync-engine-remaining-work):
@@ -1857,53 +1458,27 @@ Known gaps, tracked in [`docs/todo.md` § Sync Engine Remaining Work](todo.md#sy
 
 ## Schema Seed: App Provider as Sync Peer
 
-This section describes how to distribute app schema migrations as a static "seed" that syncs into the user's database using the existing sync infrastructure. This pattern treats the app provider as a read-only peer with a well-known site ID.
+How to distribute app schema migrations as a static "seed" that syncs into the user's database using the existing sync infrastructure, treating the app provider as a read-only peer with a well-known site ID.
 
 ### Motivation
 
-When distributing an app with Quereus, the initial database schema (and optionally seed data) must be applied to each user's local database. Rather than using imperative migrations or version checks, we can leverage the CRDT sync infrastructure:
+An app's initial schema (and optionally seed data) must reach each user's local database. Rather than imperative migrations or version checks, leverage the CRDT sync infrastructure:
 
 1. **Build time**: Generate a JSON bundle containing sync metadata for the app's schema
 2. **Runtime**: Sync from the bundled seed into the user's database using `applyChanges()`
 3. **Updates**: On app updates, only new schema changes are applied (delta sync)
 
-This approach:
-- Reuses existing sync code paths (no new migration infrastructure)
-- Handles user customizations naturally via CRDT semantics
-- Enables efficient delta sync on app updates (only new schema since last sync)
-- Works offline (seed is bundled with the app)
-
-Because the seed is applied through `applyChanges()`, it rides the wire path's group-atomic admission core (`admitGroup`, see [Transactional Integrity During Sync](#transactional-integrity-during-sync)) and inherits the same data-first/metadata-second/abort-with-no-metadata write-ordering guarantees with no seed-specific code.
+This reuses existing sync code paths (no new migration infrastructure), handles user customizations naturally via CRDT semantics, delta-syncs efficiently on app updates, and works offline. Because the seed is applied through `applyChanges()`, it rides the wire path's group-atomic admission core (`admitGroup`, see [Transactional Integrity During Sync](#transactional-integrity-during-sync)) and inherits the same data-first/metadata-second/abort-with-no-metadata write-ordering guarantees with no seed-specific code.
 
 ### Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              BUILD TIME                                      │
-│                                                                              │
-│   DDL Statements ──▶ SyncManager ──▶ Serialize ──▶ schema-seed.json         │
-│   (CREATE TABLE...)   (in-memory)     Metadata                               │
-│                                                                              │
-│   • Fixed APP_PROVIDER_SITE_ID (well-known, e.g., all zeros)                │
-│   • Build timestamp as HLC base                                              │
-│   • Records: SchemaMigrations, ColumnVersions for table columns              │
-└─────────────────────────────────────────────────────────────────────────────┘
+**Build time**: DDL statements are run against an in-memory `SyncManager` and its metadata
+serialized to `schema-seed.json` — a fixed well-known `APP_PROVIDER_SITE_ID`, the build
+timestamp as HLC base, recording `SchemaMigration`s plus `ColumnVersion`s for table columns.
 
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              RUNTIME                                         │
-│                                                                              │
-│   ┌──────────────┐    getChangesSince()     ┌──────────────────────────┐    │
-│   │  Seed Store  │ ─────────────────────▶   │   User's SyncManager     │    │
-│   │  (read-only) │                          │                          │    │
-│   └──────────────┘                          │   applyChanges()         │    │
-│         │                                   │         │                │    │
-│         │ lastSeedHLC                       │         ▼                │    │
-│         │ (user metadata)                   │   Schema DDL executed    │    │
-│         ▼                                   │   CRDT metadata recorded │    │
-│   Only changes after lastSeedHLC            └──────────────────────────┘    │
-│   are returned (efficient delta sync)                                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Runtime**: the read-only seed store's `getChangesSince()` (bounded by the `lastSeedHLC`
+kept in user metadata, so only changes after it are returned) feeds the user's
+`SyncManager.applyChanges()`, which executes the schema DDL and records CRDT metadata.
 
 ### The Well-Known App Provider Site ID
 
@@ -1917,70 +1492,39 @@ const APP_PROVIDER_SITE_ID = new Uint8Array(16); // 16 bytes of 0x00
 const APP_PROVIDER_SITE_ID = siteIdFromBase64('AAAAAAAAAAAAAAAAAAAAAA');
 ```
 
-This ensures:
-- The app provider's site ID is consistent across builds
-- User's local changes (with random site IDs) won't conflict with seed schema
-- Easy to identify seed-originated changes in debugging
+So the provider's site ID is consistent across builds, the user's local changes (random site IDs) never collide with seed schema, and seed-originated changes are easy to identify in debugging.
 
 ### Efficient Delta Sync
 
-The change log in the seed enables efficient delta sync:
-
-1. **First launch**: `lastSeedHLC` is undefined, all seed entries are applied
-2. **App update**: `lastSeedHLC` points to previous seed's latest HLC
-3. **Query**: Filter change log entries where `hlc > lastSeedHLC`
-4. **Result**: Only new schema changes are processed (O(k) where k = new changes)
+The change log in the seed enables efficient delta sync. On first launch `lastSeedHLC` is
+undefined and every seed entry applies; on an app update it points at the previous seed's
+latest HLC, and filtering change-log entries by `hlc > lastSeedHLC` processes only new
+schema changes — O(k) in the number of new changes.
 
 ### User Schema Customizations
 
-Because the sync uses standard CRDT semantics, user schema customizations are handled naturally:
+Standard CRDT semantics handle user customizations: app schema is the baseline, user edits layer on top, conflicts resolve deterministically.
 
-1. **User adds a column**: User's column has their site ID with later HLC, preserved
-2. **App adds same column in update**: LWW resolves (later HLC wins, or user's if concurrent)
-3. **User drops a table**: "Most destructive wins" - drop persists even if app's seed has the table
-
-This means:
-- App schema is the baseline
-- User customizations layer on top
-- Conflicts resolve deterministically
+1. **User adds a column**: their column carries their site ID with a later HLC, preserved
+2. **App adds the same column in an update**: LWW resolves (later HLC wins, or the user's if concurrent)
+3. **User drops a table**: "most destructive wins" — the drop persists even if the app's seed has the table
 
 ### What's Provided by Quereus
 
-All the primitives needed for schema seeds are available in Quereus packages:
-
-| Component | Package | Status |
-|-----------|---------|--------|
-| `SyncManager.applyChanges()` | `quereus-sync` | ✅ Available |
-| `SyncManager.getPeerSyncState()` | `quereus-sync` | ✅ Available |
-| `SyncManager.updatePeerSyncState()` | `quereus-sync` | ✅ Available |
-| `compareHLC()`, `hlcToJson()`, `hlcFromJson()` | `quereus-sync` | ✅ Available |
-| `SerializedHLC` type | `quereus-sync` | ✅ Available |
-| `InMemoryKVStore` | `quereus-store` | ✅ Available |
-| `siteIdToBase64()`, `siteIdFromBase64()` | `quereus-sync` | ✅ Available |
-| `toBase64Url()`, `fromBase64Url()` | `quereus-sync` | ✅ Available |
-
-**Usage:**
-```typescript
-import {
-  SyncManager, compareHLC,
-  hlcToJson, hlcFromJson, type SerializedHLC,
-  siteIdToBase64, siteIdFromBase64,
-  toBase64Url, fromBase64Url
-} from '@quereus/sync';
-import { InMemoryKVStore } from '@quereus/store';
-```
+Every primitive a schema seed needs already ships: from `@quereus/sync`,
+`SyncManager.applyChanges()` / `.getPeerSyncState()` / `.updatePeerSyncState()`,
+`compareHLC()`, `hlcToJson()` / `hlcFromJson()`, the `SerializedHLC` type,
+`siteIdToBase64()` / `siteIdFromBase64()`, and `toBase64Url()` / `fromBase64Url()`;
+from `@quereus/store`, `InMemoryKVStore`.
 
 ### What's App-Specific
 
-The following should be implemented in your application:
+Implement in your application:
 
 1. **`SchemaSeed` interface**: Define the JSON structure for your seed files
 2. **`generateSchemaSeed()`**: Build-time script to create seeds from DDL
 3. **`syncFromSchemaSeed()`**: Runtime function to apply seeds
 
-These are app-specific because:
-- Seed format may vary (JSON, MessagePack, etc.)
-- Generation may integrate with your build system (Vite, webpack, etc.)
-- Application may have custom sync logic or validation
+These stay app-specific because the seed format may vary (JSON, MessagePack, …), generation integrates with your build system, and applications may add custom sync logic or validation.
 
 
