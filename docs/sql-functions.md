@@ -283,10 +283,10 @@ window_function([arguments]) over (
 - `count(*)`, `count(expr)`: Count of rows or non-NULL values
 - `sum(expr)`: Sum of values in the window frame
 - `avg(expr)`: Average of values in the window frame
-- `min(expr)`, `max(expr)`: Minimum/maximum values in the window frame. Unlike
-  their plain-aggregate forms these still rank with a raw value comparison, so a
-  `timespan` / `json` / collated-text argument can disagree with `order by`
-  (tracked as `minmax-window-semantic-ordering`)
+- `min(expr)`, `max(expr)`: Minimum/maximum values in the window frame. These rank
+  by the same comparison as their plain-aggregate forms and as `order by` — the
+  argument's logical type semantics for `timespan` / `json`, the argument's
+  collation for text (see `docs/types.md`, "Semantic ordering")
 
 **Navigation Functions (Planned):**
 - `lead(expr[, offset[, default]])`: Accesses data from subsequent rows

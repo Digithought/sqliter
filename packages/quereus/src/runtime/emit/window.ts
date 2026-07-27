@@ -5,7 +5,7 @@ import type { OutputValue, Row, SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { bindWindowSchema, resolveWindowFunction, type WindowFunctionSchema } from '../../schema/window-function.js';
-import type { AggregateArgBinding } from '../../schema/function.js';
+import { argComparisonContext } from './aggregate-setup.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { createTypedComparator, createTypedOrderByComparator, hasSemanticOrdering } from '../../util/comparison.js';
@@ -35,13 +35,7 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 		if (!schema) {
 			throw new QuereusError(`Window function ${func.functionName} not found`, StatusCode.INTERNAL);
 		}
-		const argBindings: AggregateArgBinding[] = (plan.functionArguments[fi] ?? []).map(argPlan => {
-			const argType = argPlan.getType();
-			return {
-				logicalType: argType.logicalType as LogicalType,
-				collation: argType.collationName ? ctx.resolveCollation(argType.collationName) : undefined,
-			};
-		});
+		const argBindings = (plan.functionArguments[fi] ?? []).map(argPlan => argComparisonContext(argPlan, ctx));
 		return bindWindowSchema(schema, argBindings);
 	});
 
@@ -1167,7 +1161,7 @@ async function* runStreaming(
 					stepRunningAgg(entry, fi, fs, fc, argVal, isRangeMode);
 					break;
 				case 'slidingAgg':
-					handleSlidingArrival(entry, fi, fs, fc.schema, argVal, orderByVal0Num);
+					handleSlidingArrival(entry, fc, fs, argVal, orderByVal0Num);
 					break;
 			}
 		}
@@ -1350,7 +1344,7 @@ async function* finalizePartition(
 	for (let fi = 0; fi < funcContexts.length; fi++) {
 		const fs = state.funcStates[fi];
 		if (fs.mode.kind !== 'slidingAgg') continue;
-		finalizeSlidingTrailing(fi, fs, funcContexts[fi].schema);
+		finalizeSlidingTrailing(funcContexts[fi], fs);
 	}
 	// Yield queued entries in order. Promote our slot to each entry's row so
 	// downstream attribute resolution sees the correct row.
@@ -1455,22 +1449,21 @@ function slidingScanSum(buf: SlidingBufEntry[], lo: number, hi: number): { sum: 
 	return { sum, count };
 }
 
-/** Per-row dispatch for slidingAgg functions. `schema` is the emit-time-bound
+/** Per-row dispatch for slidingAgg functions. `fc` carries the emit-time-bound
  *  registry schema, consulted by the MIN/MAX scans. */
 function handleSlidingArrival(
 	entry: StreamingRowEntry,
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
-	schema: WindowFunctionSchema,
 	argVal: SqlValue,
 	orderByVal0Num: number,
 ): void {
 	const m = fs.mode as Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>;
 	fs.slidingBuffer!.push({ argVal, orderByVal0: orderByVal0Num });
 	if (m.frameMode === 'rows') {
-		handleSlidingRowsArrival(entry, fi, fs, schema, m, argVal);
+		handleSlidingRowsArrival(entry, fc, fs, m, argVal);
 	} else {
-		handleSlidingRangeArrival(entry, fi, fs, schema, m, orderByVal0Num);
+		handleSlidingRangeArrival(entry, fc, fs, m, orderByVal0Num);
 	}
 }
 
@@ -1478,9 +1471,8 @@ function handleSlidingArrival(
 
 function handleSlidingRowsArrival(
 	entry: StreamingRowEntry,
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
-	schema: WindowFunctionSchema,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 	argVal: SqlValue,
 ): void {
@@ -1489,14 +1481,13 @@ function handleSlidingRowsArrival(
 	}
 	fs.slidingPending!.push(entry);
 	while (fs.slidingPending!.length > m.following) {
-		finalizeSlidingRowsEntry(fi, fs, schema, m);
+		finalizeSlidingRowsEntry(fc, fs, m);
 	}
 }
 
 function finalizeSlidingRowsEntry(
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
-	schema: WindowFunctionSchema,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 ): void {
 	const j = fs.slidingNextFinalizeIdx!;
@@ -1521,7 +1512,7 @@ function finalizeSlidingRowsEntry(
 			break;
 		case 'min':
 		case 'max':
-			value = slidingScanExtremum(schema, buf, lo, hi);
+			value = slidingScanExtremum(fc.schema, buf, lo, hi);
 			break;
 		case 'first_value':
 			value = lo > hi ? null : buf[lo].argVal;
@@ -1533,7 +1524,7 @@ function finalizeSlidingRowsEntry(
 			value = null;
 	}
 	const targetEntry = fs.slidingPending!.shift()!;
-	fillSlot(targetEntry, fi, value);
+	fillSlot(targetEntry, fc.fi, value);
 	fs.slidingNextFinalizeIdx!++;
 }
 
@@ -1541,9 +1532,8 @@ function finalizeSlidingRowsEntry(
 
 function handleSlidingRangeArrival(
 	entry: StreamingRowEntry,
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
-	schema: WindowFunctionSchema,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 	orderByVal0Num: number,
 ): void {
@@ -1571,7 +1561,7 @@ function handleSlidingRangeArrival(
 	}
 
 	while (pending.length > 0 && pending[0].rightClosed) {
-		finalizeSlidingRangeEntry(fi, fs, schema, m);
+		finalizeSlidingRangeEntry(fc, fs, m);
 	}
 }
 
@@ -1620,9 +1610,8 @@ function findNonFinitePeerSpan(buf: SlidingBufEntry[]): { lo: number; hi: number
 }
 
 function finalizeSlidingRangeEntry(
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
-	schema: WindowFunctionSchema,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 ): void {
 	const pending = fs.slidingRangePending!;
@@ -1656,7 +1645,7 @@ function finalizeSlidingRangeEntry(
 			}
 			case 'min':
 			case 'max':
-				value = slidingScanExtremum(schema, buf, lo, hi);
+				value = slidingScanExtremum(fc.schema, buf, lo, hi);
 				break;
 			case 'first_value':
 				value = buf[lo].argVal;
@@ -1668,7 +1657,7 @@ function finalizeSlidingRangeEntry(
 				value = null;
 		}
 	}
-	fillSlot(head.entry, fi, value);
+	fillSlot(head.entry, fc.fi, value);
 	pending.shift();
 
 	// Trim buffer rows that no remaining pending entry needs.
@@ -1723,15 +1712,15 @@ function trimSlidingRangeBuffer(
 	}
 }
 
-function finalizeSlidingTrailing(fi: number, fs: StreamingFuncState, schema: WindowFunctionSchema): void {
+function finalizeSlidingTrailing(fc: StreamingFunctionContext, fs: StreamingFuncState): void {
 	const m = fs.mode as Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>;
 	if (m.frameMode === 'rows') {
 		while (fs.slidingPending!.length > 0) {
-			finalizeSlidingRowsEntry(fi, fs, schema, m);
+			finalizeSlidingRowsEntry(fc, fs, m);
 		}
 	} else {
 		while (fs.slidingRangePending!.length > 0) {
-			finalizeSlidingRangeEntry(fi, fs, schema, m);
+			finalizeSlidingRangeEntry(fc, fs, m);
 		}
 	}
 }

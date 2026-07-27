@@ -237,7 +237,9 @@ its right edge has been seen.
 - **ROWS** — entries finalize when row `j + following` arrives. SUM/COUNT/AVG
   maintain a `{ sum, count }` accumulator with step+unstep (skipping NULL
   argVals); MIN/MAX/FIRST_VALUE/LAST_VALUE recompute from the live buffer
-  slice. Memory is `O(preceding + following + 1)` per function per partition.
+  slice — MIN/MAX by folding the slice through the *bound* schema's own
+  `step`/`final`, so they cannot rank differently from the buffered emitter.
+  Memory is `O(preceding + following + 1)` per function per partition.
 - **RANGE** — entries finalize when a later arrival's value strictly exceeds
   `v_j + following` (right edge has passed). Frame values are computed by
   scanning the buffer for rows with `v ∈ [v_j - preceding, v_j + following]`
@@ -294,6 +296,17 @@ type from `argTypes[0]` (the value expression) rather than the fixed
 `returnType`. For `LAG`/`LEAD` the offset and default arguments do not widen the
 result. When no argument types are available the planner falls back to the
 declared `returnType`.
+
+**Comparison context.** A function whose result depends on how values *compare*
+(`MIN`, `MAX`) also supplies `bindArgs(args) => { step?, final? }`. The emitter
+calls it once per call site — never per row — with each argument's declared
+logical type and resolved collation, and runs the returned closures in place of
+the declared ones (`bindWindowSchema`, `schema/window-function.ts`); an omitted
+field keeps the declared default. Route the comparison through
+`createSemanticValueComparator` (`util/comparison.ts`) so the window ranks
+exactly as the matching aggregate and `order by` do — see `docs/types.md`,
+"Semantic ordering". Resolving a type or a collation inside `step` instead is a
+bug: `step` runs per row.
 
 ## Future Enhancements
 

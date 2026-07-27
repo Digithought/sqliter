@@ -69,9 +69,10 @@ export function getAllWindowFunctions(): WindowFunctionSchema[] {
  * unchanged. Idempotent: the bound schema keeps `bindArgs`, so no call site has
  * to track whether it already bound.
  *
- * Call once per call site at emit time, never per row. Both window execution
- * shapes (the buffered frame walk and the streaming fast path) must run the SAME
- * bound schema, or they rank differently for the same query.
+ * Call once per call site at emit time, never per row. All three window execution
+ * shapes (the buffered frame walk, the streaming running accumulator and the
+ * streaming sliding-frame scan) must run the SAME bound schema, or they rank
+ * differently for the same query.
  */
 export function bindWindowSchema(
 	schema: WindowFunctionSchema,
@@ -86,25 +87,4 @@ export function bindWindowSchema(
 		step: bound.step ?? schema.step,
 		final: bound.final ?? schema.final,
 	};
-}
-
-// Helper to create ranking function state
-export function createRankingState() {
-	return {
-		rowNumber: 0,
-		rank: 0,
-		denseRank: 0,
-		lastValues: null as SqlValue[] | null
-	};
-}
-
-// Helper for aggregate window function state
-export function createAggregateState(schema: WindowFunctionSchema) {
-	if (schema.step && schema.final) {
-		return {
-			accumulator: null,
-			rowCount: 0
-		};
-	}
-	return null;
 }

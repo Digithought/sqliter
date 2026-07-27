@@ -1,10 +1,10 @@
 import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
 import type { ScalarPlanNode } from '../../planner/nodes/plan-node.js';
-import type { FunctionSchema } from '../../schema/function.js';
+import type { AggregateArgBinding, FunctionSchema } from '../../schema/function.js';
 import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { bindAggregateSchema } from '../../func/registration.js';
 import { createTypedComparator, hasSemanticOrdering } from '../../util/comparison.js';
-import type { CollationFunction, LogicalType } from '../../types/logical-type.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -13,6 +13,10 @@ import type { EmissionContext } from '../emission-context.js';
  * Emit-time setup shared by the stream and hash aggregate emitters: both walk the
  * same `{ expression, alias }` aggregate list and need the same per-aggregate
  * pre-resolutions. Everything here runs ONCE per emit — never per row.
+ *
+ * {@link argComparisonContext} is shared more widely still: the window emitter
+ * binds its own registry's comparison-sensitive functions from the same context,
+ * so `min(x) over (…)` and the `min(x)` aggregate read the call site identically.
  */
 
 /** One entry of a stream/hash aggregate node's `aggregates` list. */
@@ -22,12 +26,16 @@ export type AggregateExpr = { readonly expression: ScalarPlanNode; readonly alia
  *  single argument, element-wise for several, constant for `count(*)`). */
 export type DistinctComparator = (a: SqlValue | SqlValue[], b: SqlValue | SqlValue[]) => number;
 
-/** The declared logical type and resolved collation of one aggregate argument at this
- *  call site — the comparison context both `bindArgs` and DISTINCT tracking rank under. */
-function argComparisonContext(
+/** The declared logical type and resolved collation of one aggregate or window
+ *  argument at this call site — the comparison context `bindArgs` (aggregate and
+ *  window alike) and DISTINCT tracking all rank under. A missing collation name
+ *  stays undefined, which every consumer reads as BINARY. The logical type is
+ *  always known here (narrower than {@link AggregateArgBinding}, which allows an
+ *  untyped argument), so callers may compare with it directly. */
+export function argComparisonContext(
 	arg: ScalarPlanNode,
 	ctx: EmissionContext,
-): { logicalType: LogicalType; collation?: CollationFunction } {
+): Required<Pick<AggregateArgBinding, 'logicalType'>> & AggregateArgBinding {
 	const argType = arg.getType();
 	return {
 		logicalType: argType.logicalType as LogicalType,

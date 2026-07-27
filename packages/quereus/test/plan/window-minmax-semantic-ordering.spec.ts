@@ -42,6 +42,10 @@ describe('Window min/max semantic ordering', () => {
 		await db.exec("insert into bl values (1, x'ff00'),(2, x'0102'),(3, x'80')");
 		await db.exec('create table pg (id integer primary key, g integer, dur timespan)');
 		await db.exec("insert into pg values (1,1,'PT30M'),(2,1,'P1D'),(3,2,'PT2H'),(4,2,'PT90M')");
+		// Rows 6 and 7 give the sliding cases an all-NULL frame.
+		// Quereus columns are NOT NULL by default (docs/sql.md), hence the explicit `null`.
+		await db.exec('create table nul (id integer primary key, dur timespan null)');
+		await db.exec("insert into nul values (1,null),(2,'PT2H'),(3,null),(4,'PT30M'),(5,null),(6,null),(7,null)");
 		return db;
 	}
 
@@ -203,6 +207,23 @@ describe('Window min/max semantic ordering', () => {
 			]);
 		});
 
+		it('a RANGE sliding frame ranks by elapsed time too', async () => {
+			// The RANGE finalizer is a separate scan from the ROWS one — bounds advance by
+			// ORDER BY value rather than row offset — and had its own copy of the raw `<`.
+			const sql =
+				'select id, min(dur) over (order by id range between 1 preceding and 1 following) as mn,'
+				+ ' max(dur) over (order by id range between 1 preceding and 1 following) as mx'
+				+ ' from ts order by id';
+			expect(await isStreamingWindow(streamingDb, sql), 'RANGE sliding frame streams').to.be.true;
+			expect(await bothShapes(sql)).to.deep.equal([
+				{ id: 1, mn: 'PT30M', mx: 'PT1H' },
+				{ id: 2, mn: 'PT30M', mx: 'PT2H' },
+				{ id: 3, mn: 'PT1H', mx: 'P1D' },
+				{ id: 4, mn: 'PT0S', mx: 'P1D' },
+				{ id: 5, mn: 'PT0S', mx: 'P1D' },
+			]);
+		});
+
 		it('a running NOCASE frame tightens case-insensitively', async () => {
 			expect(await bothShapes(
 				'select id, min(t) over (order by id rows unbounded preceding) as mn from nc order by id'
@@ -210,6 +231,32 @@ describe('Window min/max semantic ordering', () => {
 				{ id: 1, mn: 'B' },
 				{ id: 2, mn: 'a' },
 				{ id: 3, mn: 'a' },
+			]);
+		});
+	});
+
+	describe('NULL arguments', () => {
+		it('NULLs are skipped, matching the aggregate', async () => {
+			expect(await bothShapes(
+				`select distinct
+					min(dur) over () as mn,
+					max(dur) over () as mx,
+					(min(dur) over () = (select min(dur) from nul)) as min_agrees
+				 from nul`
+			)).to.deep.equal([{ mn: 'PT30M', mx: 'PT2H', min_agrees: true }]);
+		});
+
+		it('an all-NULL sliding frame yields NULL, not the empty accumulator', async () => {
+			expect(await bothShapes(
+				'select id, min(dur) over (order by id rows between 1 preceding and 1 following) as mn from nul order by id'
+			)).to.deep.equal([
+				{ id: 1, mn: 'PT2H' },
+				{ id: 2, mn: 'PT2H' },
+				{ id: 3, mn: 'PT30M' },
+				{ id: 4, mn: 'PT30M' },
+				{ id: 5, mn: 'PT30M' },
+				{ id: 6, mn: null },
+				{ id: 7, mn: null },
 			]);
 		});
 	});

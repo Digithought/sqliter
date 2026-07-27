@@ -249,6 +249,13 @@ export function registerBuiltinWindowFunctions(): void {
 		final: (state: AggValue) => state || 0
 	});
 
+	// NOTE: SUM/AVG coerce with `Number(value)` and take no type context — the same
+	// "no comparison/arithmetic context in the step" shape the MIN/MAX bindArgs hook
+	// below removes. Harmless today: over a logical type with no numeric meaning
+	// (TIMESPAN, JSON) both these and the plain aggregates yield NULL, so they agree.
+	// If a future logical type gains a meaningful `Number()` coercion, or the plain
+	// aggregates start summing one, give SUM/AVG a `bindArgs` too — and mirror it in
+	// `slidingStepNum`/`slidingScanSum` (runtime/emit/window.ts), which coerce again.
 	registerWindowFunction({
 		name: 'SUM',
 		argCount: 1,
