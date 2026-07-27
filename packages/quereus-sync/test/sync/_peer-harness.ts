@@ -116,12 +116,33 @@ export async function localWrite(peer: Peer, sql: string): Promise<void> {
 /**
  * One-directional full DATA relay (from-zero, schema migrations stripped).
  * Returns the full ApplyResult so callers can inspect `.applied` or other fields.
+ *
+ * Schema migrations are stripped because these peers are built by
+ * {@link makePeer} with `createOrders`, so BOTH already have `orders` — the
+ * data-focused specs care about row convergence, not about re-running the DDL
+ * they already ran. Use {@link relayAll} when the schema migrations themselves
+ * are the subject under test.
  */
 export async function relay(from: Peer, to: Peer): Promise<ApplyResult> {
 	await settle();
 	const sets = await from.manager.getChangesSince(to.manager.getSiteId());
 	const dataOnly = sets.map(cs => ({ ...cs, schemaMigrations: [] }));
 	const res = await to.manager.applyChanges(dataOnly);
+	await settle();
+	await to.manager.updatePeerSyncState(from.manager.getSiteId(), from.manager.getCurrentHLC());
+	return res;
+}
+
+/**
+ * One-directional FULL relay — identical to {@link relay} but keeps each
+ * ChangeSet's `schemaMigrations`, so replicated DDL actually reaches the
+ * receiver's `applyToStore`. This is the wire shape a real transport carries;
+ * `relay`'s stripping is a test-only narrowing.
+ */
+export async function relayAll(from: Peer, to: Peer): Promise<ApplyResult> {
+	await settle();
+	const sets = await from.manager.getChangesSince(to.manager.getSiteId());
+	const res = await to.manager.applyChanges(sets);
 	await settle();
 	await to.manager.updatePeerSyncState(from.manager.getSiteId(), from.manager.getCurrentHLC());
 	return res;

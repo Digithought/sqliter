@@ -1463,6 +1463,51 @@ private shouldApplySchemaChange(remote: SchemaChange, local: SchemaVersion): boo
 }
 ```
 
+### Idempotent DDL application
+
+Replicated DDL is applied **idempotently**. Two peers that are offline at the
+same time can each run the same `create table orders`, and the migration that
+wins the HLC comparison is then delivered to a peer that already has the table.
+So before executing anything, the store adapter (`store-adapter.ts` §
+`decideSchemaChange`) checks whether the named object is already in the
+migration's wanted state:
+
+| Situation | Outcome |
+|---|---|
+| Object absent (create) / present (drop) | Execute the DDL |
+| Object already in the wanted state, definition matches | **Converge silently** — nothing is executed, the change still counts as applied and its migration metadata commits |
+| Object already exists with a **different** definition | Error naming the object and printing both definitions |
+
+"Definition matches" is decided by regenerating the canonical DDL from the local
+`TableSchema` / `IndexSchema` (`generateTableDDL` / `generateIndexDDL`, with no
+`db` argument, which is exactly how the origin produced the DDL it put on the
+wire) and comparing it against the received DDL after a small normalization —
+trim, drop a trailing `;`, collapse whitespace runs, compare case-insensitively.
+
+The silent-convergence case matters beyond noise reduction. A throw from a schema
+change is collected into `ApplyToStoreResult.errors`, and any non-empty `errors`
+aborts the whole admission unit *before* its CRDT metadata is committed (see §
+Transactional Integrity During Sync). A duplicate create that threw therefore
+blocked every other change in the same batch from ever committing metadata, and
+the peer watermark never advanced — so the receiver re-applied and re-failed the
+same batch on every subsequent sync, permanently. Converging the duplicate lets
+the batch commit and the peers finish syncing.
+
+A **divergent** same-name definition is deliberately still an error, and there is
+no automatic convergence path for it: two peers with the same table name but
+different column layouts would interpret each other's rows under different
+shapes, so quietly keeping the local shape and committing the metadata would
+record "converged" for a divergence that is not. That batch keeps aborting and
+retrying until an operator resolves it. Resolving it automatically would require
+last-writer-wins over schema *definitions* (apply the higher-HLC shape as a
+migration, rewriting the local table), which is substantially more machinery.
+
+Note that only `create_table` currently reaches a peer with a non-empty DDL
+string; every other schema event the store module emits carries no DDL, so those
+migrations replicate as an empty statement and change nothing on the receiver.
+The drop / index branches above are implemented and tested against synthetic
+migrations so they are correct once real DDL flows for them.
+
 ## Configuration
 
 ```typescript

@@ -10,7 +10,12 @@
  *
  * Per `applyToStore(dataChanges, schemaChanges, options)` invocation:
  *   1. Schema changes execute first via `db.exec` (DDL before DML), with the
- *      resulting module schema events pre-marked remote.
+ *      resulting module schema events pre-marked remote. Replicated DDL is
+ *      applied IDEMPOTENTLY: an object already in the migration's wanted state
+ *      with a matching definition is counted applied without re-exec'ing, so two
+ *      peers that independently created the same table converge instead of the
+ *      receiver failing "already exists" on every sync (see
+ *      {@link decideSchemaChange}).
  *   2. Data changes are grouped per table, then per row; each row group
  *      collapses to ONE `ExternalRowOp` (a delete in the group wins over
  *      column updates; column updates merge onto the pre-read existing row,
@@ -99,9 +104,9 @@
  * MV refresh).
  */
 
-import type { BackingRowChange, Database, ExternalRowChange, Row, SqlValue, TableSchema } from '@quereus/quereus';
-import { compareSqlValues } from '@quereus/quereus';
-import type { ExternalRowOp, StoreEventEmitter, StoreModule, StoreTable } from '@quereus/store';
+import type { BackingRowChange, Database, ExternalRowChange, Row, SqlValue, TableIndexSchema, TableSchema } from '@quereus/quereus';
+import { compareSqlValues, generateIndexDDL, generateTableDDL } from '@quereus/quereus';
+import type { ExternalRowOp, SchemaChangeEvent, StoreEventEmitter, StoreModule, StoreTable } from '@quereus/store';
 import type {
   ApplyToStoreCallback,
   ApplyToStoreOptions,
@@ -339,7 +344,168 @@ function groupChangesByRow(
 }
 
 /**
- * Apply schema changes (DDL) to the database.
+ * What to do with one replicated DDL statement, decided BEFORE any database or
+ * event-expectation state is touched.
+ */
+type SchemaChangeAction =
+  /** Run the DDL as-is. */
+  | 'execute'
+  /** The object is already in the migration's wanted state — count it applied, exec nothing. */
+  | 'already-applied';
+
+/**
+ * Normalize a DDL string for definition comparison: trim, drop a trailing `;`,
+ * collapse whitespace runs to a single space, lowercase.
+ *
+ * Case-insensitive is deliberate — Quereus identifiers are already
+ * case-insensitive (`SchemaManager.getTable` lowercases), and a peer whose table
+ * was created through a different module may emit different keyword casing.
+ *
+ * NOTE: the whitespace collapse and the lowercase both reach inside string
+ * literals, so two definitions differing ONLY inside a literal (e.g.
+ * `default 'a  b'` vs `default 'a b'`, or `default 'X'` vs `default 'x'`) compare
+ * equal and the duplicate create is treated as converged. Harmless for the shapes
+ * canonical DDL emits today; if literal-sensitive column defaults ever matter
+ * here, compare the parsed schemas instead of their rendered strings.
+ */
+function normalizeDDL(ddl: string): string {
+  // Strip the trailing `;` (with any whitespace after it) BEFORE collapsing, then
+  // trim again — collapsing first would leave the `;`-adjacent space behind.
+  return ddl.replace(/;\s*$/, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * Locate the table owning `indexName` in `schemaName`, case-insensitively.
+ *
+ * There is no direct index accessor on the schema manager, so this mirrors the
+ * owner scan `SchemaManager.dropIndex` performs.
+ */
+function findIndexOwner(
+  db: Database,
+  schemaName: string,
+  indexName: string,
+): { table: TableSchema; index: TableIndexSchema } | undefined {
+  const schema = db.schemaManager.getSchema(schemaName);
+  if (!schema) return undefined;
+
+  const lowerIndexName = indexName.toLowerCase();
+  for (const table of schema.getAllTables()) {
+    const index = table.indexes?.find(idx => idx.name.toLowerCase() === lowerIndexName);
+    if (index) return { table, index };
+  }
+  return undefined;
+}
+
+/**
+ * The object named by the migration already exists locally: converge silently if
+ * its definition matches the replicated one, otherwise throw a conflict naming
+ * both definitions.
+ *
+ * NOTE: a genuinely DIVERGENT concurrent `create_table` (same name, different
+ * shape on two peers) has no automatic convergence path — this throw aborts the
+ * batch's metadata commit, so the batch re-resolves and re-fails until an
+ * operator intervenes. Resolving it automatically would need last-writer-wins
+ * over schema definitions (apply the higher-HLC shape as a migration, rewriting
+ * the local table), which is a much larger change. If divergent concurrent
+ * creates start showing up in practice, that is the work to do.
+ */
+function assertDefinitionMatches(
+  change: SchemaChangeToApply,
+  localDDL: string,
+): void {
+  if (normalizeDDL(localDDL) === normalizeDDL(change.ddl)) return;
+
+  throw new Error(
+    `Schema conflict applying remote ${change.type} for ${change.schema}.${change.table}: ` +
+    `a different definition already exists locally.\n` +
+    `  local:  ${localDDL}\n` +
+    `  remote: ${change.ddl}`
+  );
+}
+
+/**
+ * Decide whether a replicated DDL statement still needs to run.
+ *
+ * Replication delivers a migration to peers that may already be in its wanted
+ * state — two offline peers can each `create table orders`, and whichever
+ * migration wins the HLC comparison is then admitted at a peer that already has
+ * the table. Re-exec'ing raw DDL there throws ("Table main.orders already
+ * exists"), which aborts the whole admission unit and permanently blocks that
+ * peer's metadata commit. So decide first, and only execute when the object is
+ * NOT already in the wanted state.
+ *
+ * Throws on a same-name/different-definition collision — silently keeping the
+ * local shape and committing the metadata would record "converged" for a
+ * divergence that is not converged (see {@link assertDefinitionMatches}).
+ */
+function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaChangeAction {
+  // Blank DDL replicates as a no-op `db.exec('')` today — every schema event the
+  // store module emits except `create_table` carries no `ddl` (tracked separately
+  // as bug-sync-schema-migrations-replicate-empty-ddl). Leave that path exactly as
+  // it was rather than inferring intent from the migration type: a blank statement
+  // can neither be compared against a local definition nor change any state.
+  if (change.ddl.trim() === '') return 'execute';
+
+  switch (change.type) {
+    case 'create_table': {
+      const local = db.schemaManager.getTable(change.schema, change.table);
+      if (!local) return 'execute';
+      // Both sides render through `generateTableDDL` with no `db` argument, so
+      // the strings are fully qualified and session-independent — directly
+      // comparable against the DDL the origin put on the wire.
+      assertDefinitionMatches(change, generateTableDDL(local));
+      return 'already-applied';
+    }
+    case 'drop_table':
+      return db.schemaManager.getTable(change.schema, change.table) ? 'execute' : 'already-applied';
+    case 'add_index': {
+      // For an index migration `change.table` holds the INDEX name, not the
+      // table name (see `mapSchemaMigrationType` / `recordSchemaMigration`).
+      const owner = findIndexOwner(db, change.schema, change.table);
+      if (!owner) return 'execute';
+      assertDefinitionMatches(change, generateIndexDDL(owner.index, owner.table));
+      return 'already-applied';
+    }
+    case 'drop_index':
+      return findIndexOwner(db, change.schema, change.table) ? 'execute' : 'already-applied';
+    default:
+      // Column-level migrations (add_column / drop_column / alter_column) carry
+      // no object-lifecycle state to compare; run them as before.
+      return 'execute';
+  }
+}
+
+/**
+ * The module schema-event signature the migration's DDL will produce — the exact
+ * inverse of `mapSchemaMigrationType` (sync-manager-impl.ts), which is what
+ * recorded the migration on the origin in the first place.
+ *
+ * Keeping the two inverse is load-bearing: the signature is what pre-marks the
+ * emitted event remote, and a signature that never matches means the receiver
+ * records the replicated DDL as its OWN local migration and broadcasts it back
+ * out. Deriving it from the migration type by string-shape (`startsWith('drop')`,
+ * `includes('table')`) does not survive the `add_index` / `*_column` names, so
+ * map explicitly.
+ */
+function schemaEventSignature(
+  type: SchemaChangeToApply['type'],
+): { type: SchemaChangeEvent['type']; objectType: SchemaChangeEvent['objectType'] } {
+  switch (type) {
+    case 'create_table': return { type: 'create', objectType: 'table' };
+    case 'drop_table': return { type: 'drop', objectType: 'table' };
+    case 'add_index': return { type: 'create', objectType: 'index' };
+    case 'drop_index': return { type: 'drop', objectType: 'index' };
+    // Column-level migrations replay as an ALTER of the owning table — matching
+    // the `'table' alter → alter_column` direction of mapSchemaMigrationType.
+    case 'add_column':
+    case 'drop_column':
+    case 'alter_column':
+      return { type: 'alter', objectType: 'table' };
+  }
+}
+
+/**
+ * Apply one schema change (DDL) to the database, idempotently.
  */
 async function applySchemaChange(
   db: Database,
@@ -347,9 +513,18 @@ async function applySchemaChange(
   change: SchemaChangeToApply,
   _options: ApplyToStoreOptions
 ): Promise<void> {
-  // Determine the event signature
-  const eventType = change.type.startsWith('drop') ? 'drop' : change.type.startsWith('create') ? 'create' : 'alter';
-  const objectType = change.type.includes('table') ? 'table' : 'index';
+  // Decide BEFORE registering the remote-event expectation: an expectation for
+  // DDL that is then not executed would linger and mis-mark a later genuine
+  // LOCAL DDL of the same signature as remote (so the SyncManager would never
+  // record it).
+  if (decideSchemaChange(db, change) === 'already-applied') {
+    console.debug(
+      `[Sync] Remote ${change.type} for ${change.schema}.${change.table} already applied locally — converging without re-executing DDL`
+    );
+    return;
+  }
+
+  const { type: eventType, objectType } = schemaEventSignature(change.type);
 
   // Register this as an expected remote event BEFORE executing DDL.
   // When the module emits the event, it will be automatically marked as
