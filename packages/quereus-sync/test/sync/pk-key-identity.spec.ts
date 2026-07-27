@@ -1,5 +1,10 @@
 import { expect } from 'chai';
+import type { SnapshotChunk } from '../../src/sync/protocol.js';
 import { makePeer, closePeer, localWrite, relay, collect, changesFor, type Peer } from './_peer-harness.js';
+
+async function* toStream(chunks: SnapshotChunk[]): AsyncIterable<SnapshotChunk> {
+	for (const c of chunks) yield c;
+}
 
 describe('sync pk identity honours key collation and semantic key transforms', () => {
 	let a: Peer;
@@ -79,6 +84,34 @@ describe('sync pk identity honours key collation and semantic key transforms', (
 		expect(await collect(a.db, `select d from t`), 'delete wins on A').to.deep.equal([]);
 		await relay(a, b);
 		expect(await collect(b.db, `select d from t`), 'later delete not undone').to.deep.equal([]);
+	});
+
+	it('nocase: snapshot bootstrap files metadata the receiver can find by pk', async () => {
+		// A snapshot carries the SENDER's pk identity and the receiver files under it
+		// verbatim (its table may not exist until the snapshot's own create_table runs).
+		// Both sides resolve the same replicated schema, so a later LOCAL pk-based
+		// lookup on the receiver — under either spelling — must hit those records.
+		a = await makePeer('sender');
+		b = await makePeer('receiver'); // fresh: bootstraps the table from the snapshot
+		await a.db.exec(`create table t (k text collate nocase primary key, v text) using store`);
+		await localWrite(a, `insert into t values ('apple', 'v1')`);
+		await localWrite(a, `insert into t values ('Banana', 'v2')`);
+		await localWrite(a, `delete from t where k = 'BANANA'`);
+
+		const chunks: SnapshotChunk[] = [];
+		for await (const c of a.manager.getSnapshotStream()) chunks.push(c);
+		await b.manager.applySnapshotStream(toStream(chunks));
+
+		expect(await collect(b.db, `select k, v from t`), 'live row bootstrapped')
+			.to.deep.equal([{ k: 'apple', v: 'v1' }]);
+		expect(
+			await b.manager.columnVersions.getColumnVersion('main', 't', ['APPLE'], 'v'),
+			'cv findable under the other spelling',
+		).to.not.equal(undefined);
+		expect(
+			await b.manager.tombstones.getTombstone('main', 't', ['banana']),
+			'tombstone findable under the other spelling',
+		).to.not.equal(undefined);
 	});
 
 	it('bigint: an integer pk beyond the double-safe range still replicates', async () => {

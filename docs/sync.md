@@ -823,7 +823,10 @@ interface TableSnapshot {
   schema: string;
   table: string;
   rows: Row[];
-  columnVersions: Map<string, HLC>;  // Per-column HLC for each row
+  // Keyed `${pkIdentity}:${column}` — the identity groups one row's cells but is
+  // lossy, so each entry carries the row's raw pk alongside its version.
+  // See § Row identity vs. address.
+  columnVersions: Map<string, { hlc: HLC; value: SqlValue; pk: SqlValue[] }>;
 }
 
 // ============================================================================

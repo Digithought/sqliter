@@ -172,9 +172,10 @@ describe('change-log key encoding', () => {
       // arguments via `assertNoUnpairedSurrogate` (imported from `@quereus/store`) before
       // building the key.
       const hlc = createHLC(1000n, 1, siteA, 0);
-      expect(() => buildChangeLogKey(hlc, 'column', 'main', '\uD800', [1], 'c'))
+      const identity = encodeRawPkIdentity([1]);
+      expect(() => buildChangeLogKey(hlc, 'column', 'main', '\uD800', identity, 'c'))
         .to.throw(/unpaired surrogate/i);
-      expect(() => buildChangeLogKey(hlc, 'column', 'main', 't', [1], '\uD800'))
+      expect(() => buildChangeLogKey(hlc, 'column', 'main', 't', identity, '\uD800'))
         .to.throw(/unpaired surrogate/i);
     });
 
@@ -236,9 +237,10 @@ describe('change-log key encoding', () => {
 
   describe('buildColumnVersionKey', () => {
     it('rejects a schema, table, or column name carrying an unpaired surrogate', () => {
-      expect(() => buildColumnVersionKey('\uD800', 't', [1], 'c')).to.throw(/unpaired surrogate/i);
-      expect(() => buildColumnVersionKey('main', '\uD800', [1], 'c')).to.throw(/unpaired surrogate/i);
-      expect(() => buildColumnVersionKey('main', 't', [1], '\uD800')).to.throw(/unpaired surrogate/i);
+      const identity = encodeRawPkIdentity([1]);
+      expect(() => buildColumnVersionKey('\uD800', 't', identity, 'c')).to.throw(/unpaired surrogate/i);
+      expect(() => buildColumnVersionKey('main', '\uD800', identity, 'c')).to.throw(/unpaired surrogate/i);
+      expect(() => buildColumnVersionKey('main', 't', identity, '\uD800')).to.throw(/unpaired surrogate/i);
     });
 
     it('still builds a key for a clean identifier', () => {

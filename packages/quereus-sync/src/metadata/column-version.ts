@@ -19,6 +19,11 @@ import type { PkKeyingResolver } from './pk-identity.js';
  * under the derived, lossy pk IDENTITY (see `keys.ts`) which cannot be decoded
  * back to values.
  *
+ * NOTE: this repeats the pk in EVERY cell record of a row, so metadata size grows
+ * with (pk width × column count). Fine at current scale; if sync metadata volume
+ * ever becomes a concern for wide tables with long pks, add one per-row
+ * identity→pk record and drop `pk` from the cell records.
+ *
  * `priorHlc`/`priorValue` are an optional per-cell before-image: the cell version
  * this one replaced (its replica-local lineage). They are written together (both
  * present or both absent) and are absent on the first write of a cell and on

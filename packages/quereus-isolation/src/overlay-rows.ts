@@ -74,6 +74,10 @@ export async function collectOverlayEntries(
  *
  * NULL-grouping (rather than `serializeRowKey`'s NULL-poisoning) so a degenerate
  * nullable PK column still produces a usable key instead of collapsing to `null`.
+ *
+ * `@quereus/sync`'s `resolvePkKeying` (packages/quereus-sync/src/metadata/pk-identity.ts)
+ * duplicates this rule to key its per-row CRDT metadata. The two must agree on "same
+ * row?" — change one, change both.
  */
 export function makePkKeySerializer(db: Database, schema: TableSchema): (pk: readonly SqlValue[]) => string {
 	const resolver = db.getKeyNormalizerResolver();
