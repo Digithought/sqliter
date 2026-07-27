@@ -363,12 +363,16 @@ const EXPOSE_IMPLICIT_INDEX_TAG = 'quereus.expose_implicit_index';
  * index is the user's, always shown. The flag is `true` when the constraint
  * carries {@link EXPOSE_IMPLICIT_INDEX_TAG} (surface it), `false` otherwise
  * (hide). Index names absent from the map are ordinary indexes (always shown).
+ *
+ * Keys are **lowercased** — index names are matched case-insensitively
+ * everywhere else in the engine (`createIndex`, `dropIndex`, `updateIndexTags`
+ * all compare on `toLowerCase()`), so callers must look up a lowercased name.
  */
 function implicitCoveringIndexExposure(tableSchema: TableSchema): Map<string, boolean> {
 	const map = new Map<string, boolean>();
 	for (const uc of tableSchema.uniqueConstraints ?? []) {
 		if (uc.derivedFromIndex) continue;
-		map.set(implicitIndexName(tableSchema, uc), uc.tags?.[EXPOSE_IMPLICIT_INDEX_TAG] === true);
+		map.set(implicitIndexName(tableSchema, uc).toLowerCase(), uc.tags?.[EXPOSE_IMPLICIT_INDEX_TAG] === true);
 	}
 	return map;
 }
@@ -466,10 +470,29 @@ export function findExposedImplicitConstraintIndex(tableSchema: TableSchema, ind
  * user-addressable object, so `ALTER INDEX … SET TAGS` treats it as NOTFOUND (its
  * tags live on the originating constraint — use `ALTER TABLE … ALTER CONSTRAINT
  * … SET TAGS`). An *exposed* implicit index (flag true) and any ordinary index
- * are not hidden. Match is by exact stored index name (as the catalog uses it).
+ * are not hidden. Match is case-insensitive, like every other index-name
+ * comparison in the engine.
  */
 export function isHiddenImplicitIndex(tableSchema: TableSchema, indexName: string): boolean {
-	return implicitCoveringIndexExposure(tableSchema).get(indexName) === false;
+	return implicitCoveringIndexExposure(tableSchema).get(indexName.toLowerCase()) === false;
+}
+
+/**
+ * True when `indexName` names an implicit covering structure on `tableSchema` —
+ * the auto-built secondary BTree backing a declared UNIQUE constraint — whether
+ * that structure is hidden or {@link EXPOSE_IMPLICIT_INDEX_TAG}-exposed. The
+ * broader counterpart of {@link isHiddenImplicitIndex}.
+ *
+ * This is what excludes implicit structures from the *schema-wide* index-name
+ * namespace that `SchemaManager.createIndex` enforces: a constraint name is
+ * unique per table, not per schema, so two tables may each carry a
+ * `constraint uq_email unique (email)` and hence each materialize an index
+ * literally named `uq_email`. That is legal and must stay legal.
+ *
+ * Match is case-insensitive.
+ */
+export function isImplicitCoveringIndex(tableSchema: TableSchema, indexName: string): boolean {
+	return implicitCoveringIndexExposure(tableSchema).has(indexName.toLowerCase());
 }
 
 function indexSchemaToCatalog(

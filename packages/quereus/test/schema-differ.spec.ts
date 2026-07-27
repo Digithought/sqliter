@@ -237,6 +237,49 @@ describe('Schema Differ', () => {
 		});
 	});
 
+	describe('duplicate declared index names (unique per schema)', () => {
+		it('throws when two declared indexes on different tables share a name', () => {
+			// `declaredIndexes` is keyed schema-wide by lowercased name, so the second
+			// declaration used to silently overwrite the first — last-writer-wins, with
+			// t1's index never created and no diagnostic.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, note text }
+					table t2 { id integer primary key, note text }
+					index idx_note on t1 (note)
+					index idx_note on t2 (note)
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /Index 'idx_note' is declared more than once in schema 'main'/);
+		});
+
+		it('throws on a case-divergent duplicate declared index name', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, note text }
+					table t2 { id integer primary key, note text }
+					index idx_note on t1 (note)
+					index IDX_NOTE on t2 (note)
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /declared more than once/);
+		});
+
+		it('accepts distinct index names across tables', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, note text }
+					table t2 { id integer primary key, note text }
+					index idx_note_1 on t1 (note)
+					index idx_note_2 on t2 (note)
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
+		});
+	});
+
 	describe('reserved-tag validation (registry-governed, physical declarative path)', () => {
 		it('throws on a typo in a physical declared table tag (was silently soft-warned)', () => {
 			// Headline regression-closer: a `quereus.*` typo on a physical declared

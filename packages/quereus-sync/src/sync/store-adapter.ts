@@ -392,6 +392,13 @@ function normalizeDDL(ddl: string): string {
  *
  * There is no direct index accessor on the schema manager, so this mirrors the
  * owner scan `SchemaManager.dropIndex` performs.
+ *
+ * NOTE: first-match is unambiguous only because `SchemaManager.createIndex`
+ * rejects an index name already taken by a user index elsewhere in the same
+ * schema. A replicated `drop index "main"."idx"` carries no table name (the
+ * DROP INDEX grammar has no slot for one), so without that invariant each
+ * receiver would resolve the owner by its own table-registration order and two
+ * devices could drop different indexes while both believing they converged.
  */
 function findIndexOwner(
   db: Database,

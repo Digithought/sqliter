@@ -283,6 +283,13 @@ export function computeSchemaDiff(
 	// these physical sites; an MV's hint validates (over-permissive: the differ
 	// supports no MV rename and simply ignores it — harmless, see Decision 1).
 	const tagDiagnostics: TagDiagnostic[] = [];
+	// First duplicate declared index name, if any — index names are unique per
+	// schema (enforced imperatively by `SchemaManager.createIndex`), and
+	// `declaredIndexes` is keyed schema-wide by lowercased name, so a duplicate
+	// used to silently last-writer-wins and half-apply the declaration. Recorded
+	// here and raised below, AFTER the tag diagnostics, so a reserved-tag typo
+	// still surfaces first (same deterministic order the tag/rename split has).
+	let duplicateDeclaredIndex: { name: string; firstTable: string; secondTable: string } | undefined;
 	for (const item of declaredSchema.items) {
 		switch (item.type) {
 			case 'declaredTable':
@@ -328,10 +335,20 @@ export function computeSchemaDiff(
 				declaredMaterializedViews.set(item.viewStmt.view.name.toLowerCase(), item);
 				tagDiagnostics.push(...validateReservedTags(item.viewStmt.tags, 'view-ddl'));
 				break;
-			case 'declaredIndex':
-				declaredIndexes.set(item.indexStmt.index.name.toLowerCase(), item);
+			case 'declaredIndex': {
+				const indexKey = item.indexStmt.index.name.toLowerCase();
+				const priorIndex = declaredIndexes.get(indexKey);
+				if (priorIndex && !duplicateDeclaredIndex) {
+					duplicateDeclaredIndex = {
+						name: item.indexStmt.index.name,
+						firstTable: priorIndex.indexStmt.table.name,
+						secondTable: item.indexStmt.table.name,
+					};
+				}
+				declaredIndexes.set(indexKey, item);
 				tagDiagnostics.push(...validateReservedTags(item.indexStmt.tags, 'physical-index'));
 				break;
+			}
 			case 'declaredAssertion':
 				declaredAssertions.set(item.assertionStmt.name.toLowerCase(), item);
 				break;
@@ -340,6 +357,15 @@ export function computeSchemaDiff(
 	raiseReservedTagDiagnostics(tagDiagnostics, {
 		log: (d) => warnLog('reserved tag advisory (%s) on %s: %s', d.reason, d.site, d.message),
 	});
+
+	if (duplicateDeclaredIndex) {
+		const { name, firstTable, secondTable } = duplicateDeclaredIndex;
+		throw new QuereusError(
+			`Index '${name}' is declared more than once in schema '${targetSchemaName}'`
+				+ ` (on '${firstTable}' and '${secondTable}') — index names are unique per schema`,
+			StatusCode.ERROR,
+		);
+	}
 
 	// Normalize every declared `materialized view` into the TABLE category: a
 	// declared table whose `maintained` clause carries the body (no declared

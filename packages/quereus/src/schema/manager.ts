@@ -14,7 +14,7 @@ import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateF
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
-import { isHiddenImplicitIndex, findExposedImplicitConstraintIndex } from './catalog.js';
+import { isHiddenImplicitIndex, isImplicitCoveringIndex, findExposedImplicitConstraintIndex } from './catalog.js';
 import { assertCatalogObjectPersistable } from './catalog-persistability.js';
 import { buildLensBasisFkGate } from './lens-fk-discovery.js';
 import { createLogger } from '../common/logger.js';
@@ -2336,6 +2336,22 @@ export class SchemaManager {
 			throw new QuereusError(`Index ${indexName} already exists on table ${tableName}`, StatusCode.CONSTRAINT, undefined, stmt.index.loc?.start.line, stmt.index.loc?.start.column);
 		}
 
+		// Index names are unique per schema, not per table (docs/sql-ddl.md §6.3).
+		// Every by-name index resolver — `dropIndex`, `updateIndexTags`, sync's
+		// `findIndexOwner` — locates the owning table by first-match scan over the
+		// schema's tables, and "first" is registration order, which is not stable
+		// across devices. Rejecting the collision here is what makes all of them
+		// unambiguous by construction. Deliberately NOT suppressed by IF NOT EXISTS:
+		// an index of that name on a *different* table is a different object, so
+		// silently skipping would leave the requested index absent with no signal.
+		const collidingOwner = this.findIndexNameOwnerElsewhere(targetSchemaName, tableSchema.name, indexName);
+		if (collidingOwner) {
+			throw new QuereusError(
+				`Index '${indexName}' already exists in schema '${targetSchemaName}' on table '${collidingOwner.name}'`,
+				StatusCode.CONSTRAINT, undefined, stmt.index.loc?.start.line, stmt.index.loc?.start.column,
+			);
+		}
+
 		const indexSchema = this.buildIndexSchema(stmt, tableSchema, tableName, indexName);
 
 		try {
@@ -2414,6 +2430,44 @@ export class SchemaManager {
 			predicate: stmt.where,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
+	}
+
+	/**
+	 * The table in `targetSchemaName` — other than `ownerTableName` — that already
+	 * carries a **user** index named `indexName`, or `undefined` when the name is
+	 * free. Backs the schema-wide index-name uniqueness rule enforced by
+	 * {@link createIndex} and warned about by {@link importIndex}.
+	 *
+	 * Implicit covering structures are skipped. The auto-built secondary BTree
+	 * backing a `UNIQUE` constraint is named after that constraint (or `_uc_<cols>`),
+	 * and constraint names are unique per *table*, so two tables may legitimately
+	 * each declare `constraint uq_email unique (email)` and each materialize an
+	 * index named `uq_email`. Counting those would reject a valid schema.
+	 *
+	 * NOTE: an *exposed* implicit covering index (constraint tagged
+	 * `quereus.expose_implicit_index`) IS user-addressable by `ALTER INDEX`, so two
+	 * tables exposing the same implicit name leave a residual first-match ambiguity
+	 * there. It cannot be closed here — that collision is created by `create table`,
+	 * not `create index` — and closing it would mean making constraint names unique
+	 * per schema.
+	 */
+	private findIndexNameOwnerElsewhere(
+		targetSchemaName: string,
+		ownerTableName: string,
+		indexName: string,
+	): TableSchema | undefined {
+		const schema = this.getSchema(targetSchemaName);
+		if (!schema) return undefined;
+
+		const lowerIndexName = indexName.toLowerCase();
+		const lowerOwnerName = ownerTableName.toLowerCase();
+		for (const table of schema.getAllTables()) {
+			if (table.name.toLowerCase() === lowerOwnerName) continue;
+			const matched = table.indexes?.find(idx => idx.name.toLowerCase() === lowerIndexName);
+			if (!matched || isImplicitCoveringIndex(table, matched.name)) continue;
+			return table;
+		}
+		return undefined;
 	}
 
 	/**
@@ -3202,6 +3256,20 @@ export class SchemaManager {
 			predicate: stmt.where,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
+
+		// Rehydration must not brick an open. A database written before `createIndex`
+		// enforced schema-wide index-name uniqueness can legitimately contain a
+		// collision; refusing to import would strand the data. Warn (naming both
+		// owners) and import anyway — by-name resolution of that index stays
+		// first-match until an operator renames one of them.
+		const collidingOwner = this.findIndexNameOwnerElsewhere(targetSchemaName, tableSchema.name, indexName);
+		if (collidingOwner) {
+			warnLog(
+				`Imported index '%s' on table '%s' collides with an existing index of the same name on table '%s' in schema '%s'; `
+					+ `index names are expected to be unique per schema — DROP/ALTER INDEX by this name resolves to whichever table registered first`,
+				indexName, tableSchema.name, collidingOwner.name, targetSchemaName,
+			);
+		}
 
 		// Append the index (and synthesize the derived UNIQUE constraint when
 		// unique) without calling module.createIndex() — the storage already exists.

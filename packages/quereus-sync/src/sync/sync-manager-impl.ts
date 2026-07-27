@@ -877,6 +877,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			);
 		}
 
+		// NOTE: for an index migration `objectName` is the INDEX name, so this key
+		// is `<schema>.<index name>` — index-vs-index it is unambiguous only because
+		// `SchemaManager.createIndex` enforces index names unique per schema. Two
+		// same-named indexes on different tables would otherwise share one version
+		// counter and suppress each other's migrations. (An index name colliding
+		// with a *table* name still shares a counter — the key carries no object
+		// kind; tracked separately as bug-sync-migration-version-key-ignores-object-kind.)
 		const counterKey = `${schemaName}.${objectName}`;
 		let version = versionCounters.get(counterKey);
 		if (version === undefined) {

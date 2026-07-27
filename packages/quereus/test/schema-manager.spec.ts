@@ -615,6 +615,97 @@ describe('Schema Manager', () => {
 		});
 	});
 
+	// ────────────────── Index name uniqueness (per schema) ──────────────────
+	describe('Index names are unique per schema', () => {
+		it('should reject a case-divergent index name already used by another table', async () => {
+			// Index names compare case-insensitively everywhere else (dropIndex,
+			// updateIndexTags, findIndexOwner), so the cross-table check must be
+			// case-insensitive too — else `IDX_NOTE` slips past and DROP INDEX
+			// resolves by table-registration order again.
+			await db.exec('create table t1 (id integer primary key, note text)');
+			await db.exec('create table t2 (id integer primary key, note text)');
+			await db.exec('create index idx_note on t1 (note)');
+
+			let error: Error | undefined;
+			try {
+				await db.exec('create index IDX_NOTE on t2 (note)');
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error, 'case-divergent collision must be rejected').to.exist;
+			expect(error!.message).to.match(/already exists in schema 'main' on table 't1'/);
+			expect(db.schemaManager.findTable('t2')!.indexes ?? []).to.have.lengthOf(0);
+		});
+
+		it('should not let IF NOT EXISTS suppress a cross-table collision', async () => {
+			await db.exec('create table t1 (id integer primary key, note text)');
+			await db.exec('create table t2 (id integer primary key, note text)');
+			await db.exec('create index idx_note on t1 (note)');
+
+			let error: Error | undefined;
+			try {
+				await db.exec('create index if not exists idx_note on t2 (note)');
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error, 'IF NOT EXISTS must not hide a different-table collision').to.exist;
+			expect(error!.message).to.match(/already exists in schema 'main' on table 't1'/);
+		});
+
+		it('should scope the check to one schema (same index name in two schemas is fine)', async () => {
+			db.schemaManager.addSchema('aux');
+			await db.exec('create table main.t1 (id integer primary key, note text)');
+			await db.exec('create table aux.t2 (id integer primary key, note text)');
+			await db.exec('create index idx_note on main.t1 (note)');
+			await db.exec('create index idx_note on aux.t2 (note)');
+
+			expect(db.schemaManager.getTable('main', 't1')!.indexes!.map(i => i.name)).to.deep.equal(['idx_note']);
+			expect(db.schemaManager.getTable('aux', 't2')!.indexes!.map(i => i.name)).to.deep.equal(['idx_note']);
+		});
+
+		it('should exclude implicit covering structures of UNIQUE constraints from the namespace', async () => {
+			// A constraint name is unique per TABLE, so two tables may each carry
+			// `constraint uq_email unique (email)` — and in memory mode each
+			// materializes an index literally named uq_email. Counting those would
+			// reject a valid schema, and would block an unrelated CREATE INDEX that
+			// happens to reuse the name.
+			await db.exec('create table a (id integer primary key, email text, constraint uq_email unique (email))');
+			await db.exec('create table b (id integer primary key, email text, constraint uq_email unique (email))');
+			expect(db.schemaManager.findTable('a')!.indexes!.map(i => i.name)).to.include('uq_email');
+			expect(db.schemaManager.findTable('b')!.indexes!.map(i => i.name)).to.include('uq_email');
+
+			await db.exec('create table c (id integer primary key, email text)');
+			await db.exec('create index uq_email on c (email)');
+			expect(db.schemaManager.findTable('c')!.indexes!.map(i => i.name)).to.deep.equal(['uq_email']);
+		});
+
+		it('should still raise the same-table error for a name held by that table\'s implicit index', async () => {
+			// The pre-existing per-table check owns this case and must keep owning it
+			// (it is the one IF NOT EXISTS keys off).
+			await db.exec('create table b (id integer primary key, email text, constraint uq_email unique (email))');
+			let error: Error | undefined;
+			try {
+				await db.exec('create index uq_email on b (email)');
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error).to.exist;
+			expect(error!.message).to.match(/already exists on table b/);
+		});
+
+		it('should leave DROP INDEX unambiguous once the collision is rejected', async () => {
+			await db.exec('create table t1 (id integer primary key, note text)');
+			await db.exec('create table t2 (id integer primary key, note text)');
+			await db.exec('create index idx_note on t1 (note)');
+			await db.exec('drop index idx_note');
+			expect(db.schemaManager.findTable('t1')!.indexes ?? []).to.have.lengthOf(0);
+			// Name is free again, and lands on the table that asked for it.
+			await db.exec('create index idx_note on t2 (note)');
+			expect(db.schemaManager.findTable('t2')!.indexes!.map(i => i.name)).to.deep.equal(['idx_note']);
+			expect(db.schemaManager.findTable('t1')!.indexes ?? []).to.have.lengthOf(0);
+		});
+	});
+
 	// ────────────────── Schema items in specific schemas ──────────────────
 	describe('getSchemaItem with explicit schema', () => {
 		it('should find items in specified schema', async () => {
