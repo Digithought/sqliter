@@ -59,7 +59,13 @@ async function createTextDb() {
 	for (let batch = 0; batch < 20; batch++) {
 		const values = Array.from({ length: 500 }, (_, j) => {
 			const id = batch * 500 + j + 1;
-			const suffix = String(id).padStart(5, '0');
+			// Scramble the key so it does NOT ascend with insertion order. V8's sort is
+			// TimSort, which spends exactly n-1 comparisons on an already-ordered input —
+			// an ascending key would make these `order by` benchmarks O(n) comparisons
+			// instead of O(n log n) and hide most of the per-comparison cost they exist to
+			// measure. `7919` is coprime with 100000, so the map stays injective (`tkey`
+			// unique, as `distinct-text-10k` asserts).
+			const suffix = String((id * 7919) % 100000).padStart(5, '0');
 			return `(${id}, 'key_${suffix}', 'group_${id % 100}', '${PREFIX40}${suffix}', '${UNICODE_PREFIX}${suffix}')`;
 		}).join(', ');
 		await db.exec(`insert into bench_text_t values ${values}`);
@@ -153,6 +159,11 @@ export const benchmarks = [
 		// Every key shares the same 40-char prefix (`PREFIX40`), so the comparator can
 		// never resolve on its fast early bytes — the opposite cost profile of
 		// `order-by-text-10k`, where keys diverge at character 5.
+		//
+		// NOTE: this is by far the most expensive entry in the suite (~380 ms/iteration,
+		// ~4.5 s of the total run). If `yarn bench` wall-clock ever becomes a problem, lower
+		// THIS entry's `iterations` rather than shortening `PREFIX40` — the long prefix is
+		// the whole point of the benchmark.
 		name: 'order-by-text-prefix40-10k',
 		iterations: 10,
 		warmup: 2,
@@ -182,6 +193,10 @@ export const benchmarks = [
 		},
 	},
 	{
+		// NOTE: grouping is hash-based (`runtime/emit/hash-aggregate.ts` serializes each key
+		// through a collation key normalizer into a `Map`), so this measures the text
+		// key-serialization path, NOT `compareCodePoints` — a pure comparator regression does
+		// not move this number. `distinct-text-10k` is the comparator-sensitive dedup case.
 		name: 'group-by-text-10k',
 		iterations: 10,
 		warmup: 2,
