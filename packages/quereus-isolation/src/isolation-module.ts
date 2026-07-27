@@ -1424,6 +1424,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			);
 		}
 
+		this.assertColumnNameNotTombstone(schemaName, tableName, change);
+
 		// Build the addColumn backfill context up front (undefined for other change types).
 		// Derived purely from `change` + the session nullability option — no post-alter
 		// schema needed — so it is valid here, before the underlying is mutated, and the
@@ -1551,6 +1553,35 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		}
 
 		return updated;
+	}
+
+	/**
+	 * Rejects an ADD / RENAME COLUMN that would give a base column the same name as the
+	 * overlay's private tombstone flag, BEFORE `underlying.alterTable` runs.
+	 *
+	 * Every overlay carries one extra column named {@link tombstoneColumn}, so a base column
+	 * of that name collides with it. Forwarding the change to an open overlay makes the
+	 * overlay module raise a duplicate-name `ERROR`, which is not a data condition and so
+	 * rethrows out of {@link applyInPlaceOverlayChange} — after the underlying has already
+	 * (irreversibly) applied. The catalog then keeps the pre-alter column set while the base
+	 * holds the new one, and the next write to the table lands values against the wrong
+	 * columns. Rejecting up front keeps the atomic-abort guarantee this method documents.
+	 *
+	 * NOTE: the check is unconditional — not gated on an overlay existing — so the answer
+	 * does not depend on whether some connection happens to have a transaction open. That
+	 * also stops a table from acquiring the colliding name while idle and hitting
+	 * {@link createOverlaySchema}'s (silent) duplicate at the next BEGIN. A CREATE TABLE
+	 * declaring the name still gets that duplicate — tracked separately.
+	 */
+	private assertColumnNameNotTombstone(schemaName: string, tableName: string, change: SchemaChangeInfo): void {
+		const newName = change.type === 'addColumn' ? change.columnDef.name
+			: change.type === 'renameColumn' ? change.newName
+			: undefined;
+		if (newName?.toLowerCase() !== this.tombstoneColumn.toLowerCase()) return;
+		throw new QuereusError(
+			`Cannot name a column of '${schemaName}.${tableName}' '${newName}': the transaction-isolation layer reserves that name for its per-connection overlay's deletion marker.`,
+			StatusCode.UNSUPPORTED,
+		);
 	}
 
 	/**
@@ -2026,6 +2057,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 *   column lands ahead of the tombstone flag and the flag stays LAST — the layout
 	 *   every read/write path of this package assumes. A bare forward would append after
 	 *   the flag and every value written to the new column would be dropped on read.
+	 *   A caller that named its own position keeps it: the overlay's data columns mirror
+	 *   the base's one-for-one below the flag, so the base's index is the overlay's too.
+	 *   (SQL always appends, so today the caller never names one — but silently ignoring
+	 *   it would diverge the two layouts.)
 	 * - The column definition is made NULLABLE. The overlay's ADD re-runs the overlay
 	 *   module's own NOT NULL validation against a different row population than the
 	 *   base's: tombstone rows carry placeholder NULL in every non-PK column, so a
@@ -2054,7 +2089,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		return {
 			...change,
 			columnDef: { ...change.columnDef, constraints },
-			insertAtIndex: tombstoneIdx,
+			insertAtIndex: change.insertAtIndex ?? tombstoneIdx,
 			backfillEvaluator: (overlayRow: Row) => this.computeAddColumnValue(addColumnCtx, overlayRow, tombstoneIdx),
 		};
 	}
@@ -2362,6 +2397,16 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 *
 	 * `IsolatedTable.mergedSecondaryIndexQuery` wants exactly the live overlay rows out of
 	 * these indexes, so narrowing them is what it already expects.
+	 *
+	 * NOTE: a base column already named {@link tombstoneColumn} lands here as a SECOND column
+	 * of that name, and `columnIndexMap` resolves the name to the appended flag. Harmless
+	 * today — every consumer reaches the flag by index, and reads, merged scans, a unique
+	 * secondary index over that column and a staged deletion all behave exactly as they do
+	 * for a non-colliding name. If anything ever resolves the overlay's columns BY NAME (a
+	 * hand-built overlay predicate, a module that re-derives its own index map from the
+	 * column list), give the overlay a collision-free flag name here instead. ALTER into the
+	 * name is rejected outright — see {@link assertColumnNameNotTombstone} for why that one
+	 * cannot be tolerated.
 	 */
 	createOverlaySchema(baseSchema: TableSchema): TableSchema {
 		const tombstoneColumn = {

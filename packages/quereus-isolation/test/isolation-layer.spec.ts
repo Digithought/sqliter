@@ -2115,6 +2115,53 @@ describe('IsolationModule', () => {
 			const rows = await asyncIterableToArray(db.eval(`SELECT id, v, w FROM asp_tb ORDER BY id`));
 			expect(rows.map((r: any) => [r.id, r.v, r.w]), 'pre-savepoint DELETE still lands').to.deep.equal([[2, 'b', 'z']]);
 		});
+
+		// A base column named exactly like the overlay's private tombstone flag collides with
+		// it. The forward would make the overlay module raise a duplicate-name ERROR — not a
+		// data condition, so it rethrows — AFTER the underlying has irreversibly applied,
+		// leaving the catalog a column behind the base. Both directions are rejected up front
+		// instead (`assertColumnNameNotTombstone`).
+		const expectTombstoneNameRejected = (err: unknown): void => {
+			expect(err, 'the reserved overlay column name must be rejected').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+			expect((err as QuereusError).message).to.contain('_tombstone');
+		};
+
+		it('ADD COLUMN named like the tombstone flag is rejected before the underlying mutates', async () => {
+			await db.exec(`CREATE TABLE asp_res (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO asp_res VALUES (1, 'a')`);
+			let err: unknown;
+			try { await db.exec(`ALTER TABLE asp_res ADD COLUMN _tombstone TEXT DEFAULT 'z'`); } catch (e) { err = e; }
+			expectTombstoneNameRejected(err);
+
+			// Atomic abort: base and catalog both still hold the pre-alter column set.
+			const underlying = isolatedModule.getUnderlyingState('main', 'asp_res')!.underlyingTable;
+			expect(underlying.tableSchema?.columns.map(c => c.name), 'underlying untouched').to.deep.equal(['id', 'v']);
+			expect(db.schemaManager.getTable('main', 'asp_res')?.columns.map(c => c.name), 'catalog untouched').to.deep.equal(['id', 'v']);
+
+			// ...and the transaction is still usable: its staged row commits under that layout.
+			await db.exec(`INSERT INTO asp_res VALUES (2, 'b')`);
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM asp_res ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a'], [2, 'b']]);
+		});
+
+		it('RENAME COLUMN onto the tombstone flag name is rejected, with no overlay open', async () => {
+			// Unconditional: a table must not acquire the colliding name while idle either, or
+			// the next BEGIN builds an overlay whose two columns share it.
+			await db.exec(`CREATE TABLE asp_res2 (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO asp_res2 VALUES (1, 'a')`);
+
+			let err: unknown;
+			try { await db.exec(`ALTER TABLE asp_res2 RENAME COLUMN v TO _tombstone`); } catch (e) { err = e; }
+			expectTombstoneNameRejected(err);
+
+			const underlying = isolatedModule.getUnderlyingState('main', 'asp_res2')!.underlyingTable;
+			expect(underlying.tableSchema?.columns.map(c => c.name), 'underlying untouched').to.deep.equal(['id', 'v']);
+			expect(db.schemaManager.getTable('main', 'asp_res2')?.columns.map(c => c.name), 'catalog untouched').to.deep.equal(['id', 'v']);
+		});
 	});
 
 	describe('constraint & retype ALTER inside a transaction preserves the overlay savepoint chain', () => {
