@@ -60,9 +60,12 @@ export class DeferredConstraintQueue {
 	 *
 	 * Two halves:
 	 *  - every pending entry learns `<schema>.<oldName>` → `newName`, composing across
-	 *    repeated renames (`pp → pp2 → pp3` leaves `main.pp` → `pp3`). An entry that
-	 *    already maps `<schema>.<oldName>` is left alone on that key: its emit-time table
-	 *    has moved on, and this rename is about whichever table holds the freed name now.
+	 *    repeated renames (`pp → pp2 → pp3` leaves `main.pp` → `pp3`). Composition is
+	 *    confined to keys in the renamed table's own schema — map VALUES are bare names,
+	 *    so a same-named table in another schema must not follow this rename. An entry
+	 *    that already maps `<schema>.<oldName>` is left alone on that key: its emit-time
+	 *    table has moved on, and this rename is about whichever table holds the freed
+	 *    name now.
 	 *  - the bucket keyed by the write-time table name moves with the table, so
 	 *    {@link findConnection}'s name fallback keys off the CURRENT name.
 	 *
@@ -72,11 +75,18 @@ export class DeferredConstraintQueue {
 	 * `'non-transactional'` DDL tier, so `rollback to <savepoint>` (and a whole
 	 * `rollback`) leave the rename applied. If transactional DDL ever lands for the
 	 * native backends, this remap has to become layer-scoped alongside the catalog.
+	 *
+	 * NOTE: walks every queued entry per rename, and each entry owns its own map — so a
+	 * bulk load that parks a very large number of deferred rows and then renames pays
+	 * O(entries) per rename plus one Map per entry. Fine at today's scale (renames inside
+	 * a write transaction are rare); if that combination ever shows up hot, share one
+	 * copy-on-write rename map across the entries queued between two renames.
 	 */
 	notifyTableRename(schemaName: string, oldName: string, newName: string): void {
 		const oldKey = `${schemaName}.${oldName}`.toLowerCase();
 		const newKey = `${schemaName}.${newName}`.toLowerCase();
 		const oldLower = oldName.toLowerCase();
+		const schemaPrefix = `${schemaName.toLowerCase()}.`;
 
 		const stampStore = (store: DeferredConstraintBuckets): void => {
 			for (const constraints of store.values()) {
@@ -84,7 +94,9 @@ export class DeferredConstraintQueue {
 					for (const entry of rows) {
 						const renames = entry.tableRenames ?? new Map<string, string>();
 						for (const [key, current] of renames) {
-							if (current.toLowerCase() === oldLower) renames.set(key, newName);
+							if (key.startsWith(schemaPrefix) && current.toLowerCase() === oldLower) {
+								renames.set(key, newName);
+							}
 						}
 						if (!renames.has(oldKey)) renames.set(oldKey, newName);
 						entry.tableRenames = renames;

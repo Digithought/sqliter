@@ -163,3 +163,68 @@ select id from dr_p14 order by id;
 
 select id from dr_p15 order by id;
 → [{"id":99}]
+
+-- ===================================
+-- 9. Cross-schema: the remap keys are `<schema>.<name>`, so a rename in ONE
+--    schema must never follow a same-named table in another. Here the parked
+--    check reads `s2.dr_x`, which is renamed to `dr_x2`; renaming the unrelated
+--    `main.dr_x2` afterwards must leave the parked check pointing at `s2.dr_x2`.
+-- ===================================
+
+declare schema s2 {}
+apply schema s2;
+-- run
+
+create table s2.dr_x (id integer primary key);
+create table dr_x2 (id integer primary key);   -- main, colliding bare name
+create table dr_cx (id integer primary key,
+	pid integer null references s2.dr_x(id) deferrable initially deferred);
+
+begin;
+insert into dr_cx values (10, 1);
+alter table s2.dr_x rename to dr_x2;   -- parked check now reads s2.dr_x2
+insert into s2.dr_x2 values (1);       -- the parent row it needs
+alter table dr_x2 rename to dr_x3;     -- main.dr_x2 — must NOT drag the check along
+commit;
+
+select id, pid from dr_cx order by id;
+→ [{"id":10,"pid":1}]
+
+select id from s2.dr_x2 order by id;
+→ [{"id":1}]
+
+-- ===================================
+-- 10. The other deferred shape: a CHECK containing a subquery is auto-deferred
+--     (constraint-builder's `needsDeferred`), so this parks a check that reads
+--     `dr_lookup` — a table neither side of any FK — and then renames it.
+--
+--     NOTE: this case passes with the rename remap disabled too. A deferred
+--     subquery CHECK never re-reads its table at commit — the IN probe is frozen
+--     when the row is written, so it also misses same-transaction writes to that
+--     table (`fix/bug-deferred-subquery-check-reads-stale-state`). It is here to
+--     pin the user-visible outcome across a rename, NOT as a guard on the remap;
+--     cases 1/2/5/7/8/9 are the ones that discriminate that.
+-- ===================================
+
+create table dr_lookup (code text primary key);
+insert into dr_lookup values ('a'), ('b');
+create table dr_ck (id integer primary key, code text,
+	constraint dr_ck_code check (code in (select code from dr_lookup)));
+
+begin;
+insert into dr_ck values (1, 'a');
+alter table dr_lookup rename to dr_lookup2;
+commit;
+
+select id, code from dr_ck order by id;
+→ [{"id":1,"code":"a"}]
+
+-- …and the violation is still REPORTED as a constraint failure across a rename.
+begin;
+insert into dr_ck values (2, 'zzz');
+alter table dr_lookup2 rename to dr_lookup3;
+commit;
+-- error: constraint
+
+select count(*) as cnt from dr_ck;
+→ [{"cnt":1}]

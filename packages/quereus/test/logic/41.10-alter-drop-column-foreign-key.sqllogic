@@ -236,3 +236,39 @@ select count(*) as c from foreign_key_info('FkAdded');
 alter table FkAdded drop column fkcol;
 select count(*) as c from foreign_key_info('FkAdded');
 → [{"c":0}]
+
+-- ===================================================================
+-- 11. DROP COLUMN lands *between* a deferred check being queued and the COMMIT
+--     that evaluates it. The parked check carries a row image and a plan frozen
+--     at write time, so a column vanishing under it on either side is the shape
+--     most likely to mismatch arity. Case 8 above drops before the transaction;
+--     these drop inside it.
+-- ===================================================================
+
+-- parent side
+create table FkMidP (pid integer primary key, extra text);
+create table FkMidC (id integer primary key,
+	fkcol integer null references FkMidP(pid) deferrable initially deferred);
+
+begin;
+insert into FkMidC values (10, 1);
+insert into FkMidP values (1, 'x');
+alter table FkMidP drop column extra;
+commit;
+
+select id, fkcol from FkMidC;
+→ [{"id":10,"fkcol":1}]
+
+-- child side (the table the parked row itself belongs to)
+create table FkMid2P (pid integer primary key);
+create table FkMid2C (id integer primary key, extra text,
+	fkcol integer null references FkMid2P(pid) deferrable initially deferred);
+
+begin;
+insert into FkMid2C values (10, 'x', 1);
+insert into FkMid2P values (1);
+alter table FkMid2C drop column extra;
+commit;
+
+select id, fkcol from FkMid2C;
+→ [{"id":10,"fkcol":1}]
