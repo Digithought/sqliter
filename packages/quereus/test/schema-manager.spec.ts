@@ -704,6 +704,23 @@ describe('Schema Manager', () => {
 			expect(db.schemaManager.findTable('t2')!.indexes!.map(i => i.name)).to.deep.equal(['idx_note']);
 			expect(db.schemaManager.findTable('t1')!.indexes ?? []).to.have.lengthOf(0);
 		});
+
+		it('should import a colliding index rather than fail the rehydration', async () => {
+			// Rehydration must not brick an open: a database written before this rule
+			// can legitimately hold a cross-table collision, and `importIndex` warns
+			// (naming both owners) instead of throwing. Refusing would strand the data.
+			await db.exec('create table t1 (id integer primary key, note text)');
+			await db.exec('create table t2 (id integer primary key, note text)');
+
+			const imported = await db.schemaManager.importCatalog([
+				'create index idx_note on t1 (note)',
+				'create index idx_note on t2 (note)',
+			]);
+
+			expect(imported.indexes, 'both indexes import').to.deep.equal(['main.t1.idx_note', 'main.t2.idx_note']);
+			expect(db.schemaManager.findTable('t1')!.indexes!.map(i => i.name)).to.deep.equal(['idx_note']);
+			expect(db.schemaManager.findTable('t2')!.indexes!.map(i => i.name)).to.deep.equal(['idx_note']);
+		});
 	});
 
 	// ────────────────── Schema items in specific schemas ──────────────────

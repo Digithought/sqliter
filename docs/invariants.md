@@ -954,7 +954,23 @@ Reserved.
 
 ## SCH — Schema
 
-Reserved.
+### SCH-001 — Index names are unique per schema
+
+- code: `packages/quereus/src/schema/manager.ts` — `findIndexNameOwnerElsewhere`
+- code: `packages/quereus/src/schema/catalog.ts` — `isImplicitCoveringIndex`
+- code: `packages/quereus/src/schema/schema-differ.ts` — `computeSchemaDiff`
+- guard: `packages/quereus/test/schema-manager.spec.ts` — `Index names are unique per schema`
+- doc: [SQL DDL § 6.3 Indexes on Virtual Tables](sql-ddl.md#63-indexes-on-virtual-tables)
+
+Within one schema at most one table carries a **user** index of a given name, matched
+case-insensitively. `createIndex` rejects a name already held by a user index on another
+table in the same schema (`IF NOT EXISTS` does not suppress it), and `computeSchemaDiff`
+rejects two `index` declarations sharing a name. Implicit covering structures are excluded
+by `isImplicitCoveringIndex`: a UNIQUE constraint's auto-built index takes the constraint's
+name, which is unique only per *table*. An **exposed** implicit structure is likewise
+outside the guarantee. This is what makes the by-name resolvers carrying no table name —
+`dropIndex`, `ALTER INDEX … SET TAGS`, sync's `findIndexOwner` and its migration version
+key — unambiguous. `importIndex` warns rather than fails, so an older database still opens.
 
 ## SYNC — Sync
 

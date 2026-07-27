@@ -3262,6 +3262,11 @@ export class SchemaManager {
 		// collision; refusing to import would strand the data. Warn (naming both
 		// owners) and import anyway — by-name resolution of that index stays
 		// first-match until an operator renames one of them.
+		//
+		// NOTE: unlike `createIndex` (one statement, one scan), rehydration runs this
+		// once per imported index, so a cold open costs O(indexes × tables). Fine at
+		// present schema sizes; if opening a large catalog ever shows up as slow, build
+		// one name→owner map for the whole import instead of re-scanning per index.
 		const collidingOwner = this.findIndexNameOwnerElsewhere(targetSchemaName, tableSchema.name, indexName);
 		if (collidingOwner) {
 			warnLog(
