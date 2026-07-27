@@ -1903,11 +1903,13 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	/**
 	 * Index DDL delegates to the module rather than driving the underlying and the overlay
 	 * directly. The module owns the full protocol — validating against the issuing
-	 * connection's effective rows, then REBUILDING every affected overlay under the new
-	 * schema — and a bare `underlying.createIndex()` + `overlay.createIndex()` pair silently
-	 * skips both halves. The engine only ever reaches the module-level hook, so these
-	 * instance methods exist for a module that wraps `IsolationModule` in turn; routing them
-	 * through the module keeps that path on the same protocol.
+	 * connection's effective rows, then adopting the change IN PLACE into every affected
+	 * overlay (narrowed to live rows, and with a foreign overlay's rejection poisoning it
+	 * rather than losing its staged rows) — and a bare `underlying.createIndex()` +
+	 * `overlay.createIndex()` pair silently skips both halves. The engine only ever reaches the
+	 * module-level hook, so these instance methods exist for a module that wraps
+	 * `IsolationModule` in turn; routing them through the module keeps that path on the same
+	 * protocol.
 	 */
 	async createIndex(indexInfo: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
 		await this.isolationModule.createIndex(this.db, this.schemaName, this.tableName, indexInfo, rows);

@@ -1119,8 +1119,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// Take the index back off the underlying's refreshed schema rather than reusing the
 		// caller's object: that is the canonical post-create form (resolved column indices,
 		// any normalization the underlying applied), and the overlay's copy is derived from it.
-		const updatedSchema = this.assertIndexPresent(state.underlyingTable, schemaName, tableName, indexSchema.name);
-		const created = updatedSchema.indexes!.find(idx => idx.name.toLowerCase() === indexSchema.name.toLowerCase())!;
+		const { schema: updatedSchema, index: created } =
+			this.assertIndexPresent(state.underlyingTable, schemaName, tableName, indexSchema.name);
 		await this.applyIndexChangeToOverlays(
 			db, schemaName, tableName, `create index '${indexSchema.name}'`,
 			overlayState => this.createOverlayIndex(overlayState, updatedSchema.name, created),
@@ -1154,24 +1154,25 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Reads back the underlying table instance's post-`createIndex` schema, asserting it now
-	 * carries the new index.
+	 * Reads back the underlying table instance's post-`createIndex` schema plus the entry it now
+	 * carries for the new index — the canonical post-create form each overlay's copy is derived
+	 * from ({@link createOverlayIndex}).
 	 *
 	 * Both bundled underlyings refresh the instance's cached `tableSchema` (memory through
-	 * `MemoryTable.createIndex`, the store through `StoreTable.updateSchema`), and the overlay
-	 * rebuild below copies its index/constraint set from it. A third-party underlying that
-	 * refreshed only its module-level schema would silently rebuild overlays under the PRE-index
-	 * schema, re-opening the very hole this method exists to close — so assert rather than assume.
+	 * `MemoryTable.createIndex`, the store through `StoreTable.updateSchema`). A third-party
+	 * underlying that refreshed only its module-level schema would leave every overlay without
+	 * the index — silently re-opening the very hole `createIndex`'s forward exists to close — so
+	 * assert rather than assume.
 	 */
 	private assertIndexPresent(
 		underlyingTable: VirtualTable,
 		schemaName: string,
 		tableName: string,
 		indexName: string,
-	): TableSchema {
-		const updatedSchema = underlyingTable.tableSchema;
-		const present = updatedSchema && this.schemaHasIndex(updatedSchema, indexName);
-		if (!updatedSchema || !present) {
+	): { schema: TableSchema; index: IndexSchema } {
+		const schema = underlyingTable.tableSchema;
+		const index = schema && this.findSchemaIndex(schema, indexName);
+		if (!schema || !index) {
 			throw new QuereusError(
 				`Isolation layer: underlying table '${schemaName}.${tableName}' did not refresh its cached tableSchema after `
 				+ `creating index '${indexName}'. The per-connection overlays cannot adopt an index the underlying does not `
@@ -1179,13 +1180,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 				StatusCode.INTERNAL,
 			);
 		}
-		return updatedSchema;
+		return { schema, index };
+	}
+
+	/** `schema`'s index named `indexName` (case-insensitively), if it declares one. */
+	private findSchemaIndex(schema: TableSchema, indexName: string): IndexSchema | undefined {
+		const lower = indexName.toLowerCase();
+		return schema.indexes?.find(idx => idx.name.toLowerCase() === lower);
 	}
 
 	/** Case-insensitive "does `schema` declare an index named `indexName`". */
 	private schemaHasIndex(schema: TableSchema, indexName: string): boolean {
-		const lower = indexName.toLowerCase();
-		return schema.indexes?.some(idx => idx.name.toLowerCase() === lower) ?? false;
+		return this.findSchemaIndex(schema, indexName) !== undefined;
 	}
 
 	/**
@@ -1196,6 +1202,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * so MemoryTable.tableSchema stays fresh), prefer that. Otherwise fall back
 	 * to the module-level dropIndex (e.g. StoreModule, which refreshes the
 	 * StoreTable's cached tableSchema and tears down the index store).
+	 *
+	 * Mirrors createIndex's early return when neither hook exists too: an underlying that
+	 * declares indexes at CREATE TABLE time but cannot drop one still has them, and dropping
+	 * from the overlays alone would leave each overlay enforcing LESS than the base it flushes
+	 * into — a silent divergence surfacing only as a commit-time rejection.
 	 */
 	async dropIndex(
 		db: Database,
@@ -1208,6 +1219,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			await state.underlyingTable.dropIndex(indexName);
 		} else if (this.underlying.dropIndex) {
 			await this.underlying.dropIndex(db, schemaName, tableName, indexName);
+		} else {
+			return; // underlying cannot drop indexes; nothing was dropped, nothing to forward
 		}
 
 		await this.applyIndexChangeToOverlays(
@@ -1295,6 +1308,13 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		try {
 			await apply();
 		} catch (e) {
+			// NOTE: a rethrow here abandons the rest of the caller's overlay walk, and the DDL has
+			// already landed on the shared underlying — so overlays not yet visited neither adopt
+			// the change nor get poisoned. Safe today: every non-CONSTRAINT source is a
+			// layer-invariant violation (INTERNAL), which no overlay could have satisfied anyway.
+			// If the overlay module ever reports a per-overlay DATA condition under some other
+			// code (a BUSY out of its own schema-change safety check, say), route that code here
+			// too — otherwise it degrades to silent partial enforcement across connections.
 			if (!(e instanceof QuereusError) || e.code !== StatusCode.CONSTRAINT) throw e;
 			if (isIssuer) throw this.issuerOverlayDriftError(schemaName, tableName, ddlDescription, e);
 			overlayState.poison = { message: this.buildInPlaceAdoptPoisonMessage(schemaName, tableName, ddlDescription, e.message) };

@@ -1786,8 +1786,8 @@ describe('IsolationModule', () => {
 			// tableSchemaAtCreation captured the synthesized UC. A bare
 			// overlay.dropIndex() forward refreshes the manager but not that frozen
 			// per-layer schema, so the next overlay write still fires UNIQUE inside
-			// MemoryTable.update against `_overlay_<table>_<id>`. The fix rebuilds
-			// the overlay against the post-drop schema.
+			// MemoryTable.update against `_overlay_<table>_<id>`. `TransactionLayer.adoptSchema`
+			// grew a removal branch, so the bare forward now reaches the open layer too.
 			await db.exec(`CREATE TABLE iso_dut (a INTEGER PRIMARY KEY, b INTEGER) USING isolated`);
 			await db.exec(`CREATE UNIQUE INDEX iso_dut_b ON iso_dut (b)`);
 
@@ -1804,9 +1804,8 @@ describe('IsolationModule', () => {
 		});
 
 		it('preserves staged tombstones across DROP INDEX inside an active transaction', async () => {
-			// Verifies the overlay rebuild copies tombstone rows verbatim, so a
-			// DELETE staged before DROP INDEX still results in the row being
-			// removed at COMMIT.
+			// Verifies the in-place adopt leaves tombstone rows alone, so a DELETE staged
+			// before DROP INDEX still results in the row being removed at COMMIT.
 			await db.exec(`CREATE TABLE iso_dtb (a INTEGER PRIMARY KEY, b INTEGER) USING isolated`);
 			await db.exec(`INSERT INTO iso_dtb VALUES (1, 100), (2, 200)`);
 			await db.exec(`CREATE UNIQUE INDEX iso_dtb_b ON iso_dtb (b)`);
@@ -1911,6 +1910,84 @@ describe('IsolationModule', () => {
 
 			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM iso_spd ORDER BY id`));
 			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[2, 'b']]);
+		});
+	});
+
+	describe('index DDL adopted into an already-open overlay', () => {
+		// The structural half of the in-place adopt: `createOverlayIndexSchema` must hand an
+		// already-open overlay an index that is *structurally identical* to one the overlay would
+		// have copied in at creation time — the predicate ANDed with `<tombstone> = 0` and its
+		// self-qualifier rescoped from the base table's name onto the overlay's generated
+		// `_overlay_<table>_<id>` name (a stale qualifier makes the memory module's
+		// `compilePredicate` reject the index at build time). Only exercised indirectly, through
+		// `createOverlaySchema`, before these.
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('a SELF-QUALIFIED partial unique index created mid-transaction is rescoped onto the overlay', async () => {
+			// `iso_pix.status` names the BASE table. Handed to the overlay unrescoped it would name
+			// a table the overlay's MemoryIndex is not scoped to, and `compilePredicate` rejects a
+			// foreign qualifier at index-build time — so a missing rescope fails this statement.
+			await db.exec(`CREATE TABLE iso_pix (id INTEGER PRIMARY KEY, code TEXT, status TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			// Two staged rows share `code`, but only one satisfies the predicate — so the index
+			// must build (an un-narrowed one would reject) and see exactly that row.
+			await db.exec(`INSERT INTO iso_pix VALUES (1, 'x', 'active'), (2, 'x', 'archived')`);
+			await db.exec(`CREATE UNIQUE INDEX iso_pix_code ON iso_pix (code) WHERE iso_pix.status = 'active'`);
+			// A further row outside the predicate is still accepted.
+			await db.exec(`INSERT INTO iso_pix VALUES (3, 'x', 'archived')`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id FROM iso_pix ORDER BY id`));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1, 2, 3]);
+		});
+
+		it('a PARTIAL unique index created mid-transaction is enforced over the overlay\'s own staged rows', async () => {
+			// The conflicting row is staged, not committed, so only the overlay's own copy of the
+			// index can catch it — `IsolatedTable.findMergedUniqueConflict` scans the underlying.
+			await db.exec(`CREATE TABLE iso_pix2 (id INTEGER PRIMARY KEY, code TEXT, status TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO iso_pix2 VALUES (1, 'x', 'active')`);
+			await db.exec(`CREATE UNIQUE INDEX iso_pix2_code ON iso_pix2 (code) WHERE status = 'active'`);
+
+			let dupErr: unknown;
+			try { await db.exec(`INSERT INTO iso_pix2 VALUES (2, 'x', 'active')`); } catch (e) { dupErr = e; }
+			expect(dupErr, 'the adopted partial index must reject a staged duplicate').to.be.instanceOf(Error);
+			expect((dupErr as Error).message.toLowerCase()).to.include('unique');
+
+			await db.exec(`ROLLBACK`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT id FROM iso_pix2`));
+			expect(rows.length, 'the rejected transaction staged nothing').to.equal(0);
+		});
+
+		it('DROP then CREATE an index of the same name mid-transaction lands the NEW definition', async () => {
+			// `createOverlayIndex` skips an index the overlay already carries, keyed on name alone.
+			// The preceding DROP must therefore really have removed it from the overlay, or this
+			// re-create would silently no-op and the overlay would keep enforcing the OLD column.
+			await db.exec(`CREATE TABLE iso_rix (id INTEGER PRIMARY KEY, v TEXT, w TEXT) USING isolated`);
+			await db.exec(`CREATE UNIQUE INDEX iso_rix_ix ON iso_rix (v)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO iso_rix VALUES (1, 'a', 'p')`);
+			await db.exec(`DROP INDEX iso_rix_ix`);
+			await db.exec(`CREATE UNIQUE INDEX iso_rix_ix ON iso_rix (w)`);
+			// v is no longer unique.
+			await db.exec(`INSERT INTO iso_rix VALUES (2, 'a', 'q')`);
+			// w now is — against a row staged in this same transaction.
+			let dupErr: unknown;
+			try { await db.exec(`INSERT INTO iso_rix VALUES (3, 'b', 'q')`); } catch (e) { dupErr = e; }
+			expect(dupErr, 'the re-created index must enforce its NEW column').to.be.instanceOf(Error);
+			expect((dupErr as Error).message.toLowerCase()).to.include('unique');
+
+			await db.exec(`ROLLBACK`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT id FROM iso_rix`));
+			expect(rows.length).to.equal(0);
 		});
 	});
 
@@ -2730,10 +2807,12 @@ describe('IsolationModule', () => {
 		 * The issuer's own rows are judged before the index is built (see
 		 * `IsolationModule.issuerEffectiveRows`), but a FOREIGN overlay is not — its rows are
 		 * that connection's problem, exactly as a concurrent duplicate insert would be. What
-		 * must not happen is the overlay rebuild quietly dropping the row it cannot re-insert:
-		 * `MemoryTable.update` RETURNS `{status:'constraint'}` rather than throwing, and the
-		 * rebuild loop used to ignore it. The foreign connection would then commit a
-		 * transaction missing a row it believed it had written.
+		 * must not happen is B losing a staged row to the new index. `MemoryTableManager.createIndex`
+		 * pre-validates the overlay's staged rows before mutating anything, so the CONSTRAINT it
+		 * raises leaves B's overlay exactly as it was — and `applyInPlaceOverlayChange` poisons
+		 * it, so B errors out rather than committing a transaction missing a row it believed it
+		 * had written. (Historically the layer REBUILT the overlay here and the copy loop ignored
+		 * `MemoryTable.update`'s `{status:'constraint'}` return, silently dropping that row.)
 		 */
 		it('poisons a foreign overlay whose staged rows violate a newly created UNIQUE index', async () => {
 			await injectOverlay(dbB, [[10, 7], [11, 7]]); // B stages two rows that collide on x
@@ -2749,8 +2828,8 @@ describe('IsolationModule', () => {
 			expect(bState.poison!.message).to.match(/UNIQUE constraint failed/);
 			expect(bState.poison!.message).to.match(/roll back this transaction/i);
 
-			// The poisoned overlay keeps BOTH staged rows — the rebuild that rejected the second
-			// one was discarded whole, never installed with a row missing.
+			// The poisoned overlay keeps BOTH staged rows — the rejection fired in the
+			// pre-validation pass, before the overlay's index map or layers were touched.
 			const bRows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
 			expect(bRows.map(r => r[0]), 'no staged row was dropped').to.deep.equal([10, 11]);
 
@@ -2881,15 +2960,19 @@ describe('IsolationModule', () => {
 			const poisonMsg = overlayState(dbB)!.poison!.message;
 			const staleOverlay = overlayState(dbB)!.overlayTable;
 
-			// dropIndex rebuilds affected overlays under the post-drop schema. A poisoned overlay
-			// holds rows in the narrower pre-alter layout — rebuilding would copy layout-mismatched
-			// rows and drop the poison. It must be skipped, staying poisoned for its owner.
+			// dropIndex adopts the change into every non-poisoned overlay. A poisoned overlay holds
+			// rows in the narrower pre-alter layout and its owner must roll back regardless, so it
+			// is skipped entirely rather than mutated — and its poison message stays the original.
 			await iso.dropIndex(dbA, 'main', 't', 't_idx');
 
 			const bState = overlayState(dbB)!;
 			expect(bState.poison, 'poison survives an unrelated DROP INDEX').to.not.be.undefined;
 			expect(bState.poison!.message).to.equal(poisonMsg);
-			expect(bState.overlayTable, 'poisoned overlay not rebuilt').to.equal(staleOverlay);
+			expect(bState.overlayTable, 'poisoned overlay left untouched').to.equal(staleOverlay);
+			expect(
+				bState.overlayTable.tableSchema!.indexes?.some(i => i.name === 't_idx'),
+				'the skipped overlay still carries the dropped index',
+			).to.equal(true);
 		});
 
 		// ── ALTER COLUMN … SET NOT NULL over staged overlay rows. Same tier structure as the
@@ -5429,7 +5512,8 @@ describe('IsolationModule — overlay staging tables are released (no leak)', ()
 	// Regression for bug-isolation-overlay-tables-never-released: every path that abandons a
 	// per-connection overlay MUST free the overlay's staging table from the overlay module's
 	// registry, or MemoryTableModule.tables grows one dead `_overlay_<table>_<id>` entry per
-	// writing transaction (and one more per rebuild), unbounded. The overlay module holds ONLY
+	// writing transaction (and one more per `alter primary key` overlay swap — the only DDL path
+	// left that replaces an overlay rather than adopting in place), unbounded. The overlay module holds ONLY
 	// overlays — the base table lives in the SEPARATE underlying module — so its table count
 	// returns to a baseline of 0 after every completed cycle. That is the assertion that pins
 	// the whole class of bug.
@@ -5466,16 +5550,16 @@ describe('IsolationModule — overlay staging tables are released (no leak)', ()
 		expect(overlayTables.size, 'overlay freed after rollback').to.equal(0);
 	});
 
-	it('write + create index (overlay rebuild) + commit leaves no overlay', async () => {
+	it('write + create index (in-place overlay adopt) + commit leaves no overlay', async () => {
 		await db.exec('begin');
 		await db.exec("insert into t values (1, 'a')");
 		await db.exec('create index t_v on t(v)');
-		expect(overlayTables.size, 'rebuild swaps a fresh overlay in and frees the old').to.equal(1);
+		expect(overlayTables.size, 'the index is adopted in place — no second staging table').to.equal(1);
 		await db.exec('commit');
 		expect(overlayTables.size).to.equal(0);
 	});
 
-	it('write + drop index (overlay rebuild) + commit leaves no overlay', async () => {
+	it('write + drop index (in-place overlay adopt) + commit leaves no overlay', async () => {
 		await db.exec('create index t_v on t(v)');
 		await db.exec('begin');
 		await db.exec("insert into t values (1, 'a')");
@@ -5530,12 +5614,12 @@ describe('IsolationModule — overlay staging tables are released (no leak)', ()
 	});
 });
 
-describe('IsolationModule — a rebuild-poisoned overlay is freed on rollback (no leak)', () => {
-	// The rebuild-FAILURE corner of the leak: when CREATE UNIQUE INDEX rebuilds a FOREIGN
-	// connection's overlay whose staged rows violate the new constraint, the half-built new
-	// overlay must be freed (the builder's own catch) and the OLD overlay is kept, poisoned,
-	// for its owner to roll back — at which point IT is freed too. Two Database instances share
-	// one IsolationModule so each is a distinct connection (the module keys overlays by db id).
+describe('IsolationModule — a poisoned overlay is freed on rollback (no leak)', () => {
+	// The DDL-FAILURE corner of the leak: when CREATE UNIQUE INDEX cannot be adopted by a FOREIGN
+	// connection's overlay (its staged rows violate the new constraint), that overlay is kept
+	// installed and poisoned — no fresh staging table is created for it, and nothing is freed
+	// until its owner rolls back, at which point it is. Two Database instances share one
+	// IsolationModule so each is a distinct connection (the module keys overlays by db id).
 	let iso: IsolationModule;
 	let overlayTables: Map<string, unknown>;
 	let dbA: Database; // issues the UNIQUE index
@@ -5557,7 +5641,7 @@ describe('IsolationModule — a rebuild-poisoned overlay is freed on rollback (n
 		await dbB.close();
 	});
 
-	it('frees the half-built rebuild overlay on failure and the poisoned overlay on rollback', async () => {
+	it('creates no second staging table on failure and frees the poisoned overlay on rollback', async () => {
 		// dbB stages two rows sharing x = 7 — legal now, before any UNIQUE index on x exists.
 		const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
 		const overlay = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlying.tableSchema!));
@@ -5566,11 +5650,11 @@ describe('IsolationModule — a rebuild-poisoned overlay is freed on rollback (n
 		iso.setConnectionOverlay(dbB, 'main', 't', { overlayTable: overlay, hasChanges: true, db: dbB });
 		expect(overlayTables.size, 'dbB overlay staged').to.equal(1);
 
-		// dbA declares UNIQUE(x). Rebuilding dbB's overlay hits the duplicate: the half-built new
-		// overlay is discarded and dbB's OLD overlay is poisoned (kept, unmigrated). A leaked
-		// half-built table would make the count 2.
+		// dbA declares UNIQUE(x). Adopting it into dbB's overlay hits the duplicate, so dbB's
+		// overlay is kept as-is and poisoned. The count stays at 1 — a path that reached for a
+		// fresh staging table and leaked it would make it 2.
 		await dbA.exec('create unique index ux on t(x)');
-		expect(overlayTables.size, 'poisoned overlay kept; half-built rebuild freed').to.equal(1);
+		expect(overlayTables.size, 'the poisoned overlay is kept, and nothing extra allocated').to.equal(1);
 		expect(iso.getConnectionOverlay(dbB, 'main', 't')!.poison, 'dbB overlay is poisoned').to.not.be.undefined;
 
 		// dbB rolls back — routed through clearConnectionOverlay — freeing its poisoned overlay.
