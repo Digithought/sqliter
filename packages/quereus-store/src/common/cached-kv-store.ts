@@ -263,6 +263,10 @@ class CachedWriteBatch implements WriteBatch {
 		for (const op of this.ops) {
 			this.cache.invalidate(op.key);
 		}
+		// NOTE: `ops` is intentionally NOT cleared here — the inner batch clears its own
+		// queue, so a reuse only re-invalidates already-invalid keys (harmless). If a
+		// caller ever reuses one batch handle across many commits, this array grows
+		// unbounded; clear it here at that point.
 	}
 
 	clear(): void {

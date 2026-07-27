@@ -86,6 +86,11 @@ export interface WriteBatch {
  * Stores are addressed by {@link KVStore} handle (matching how the transaction
  * coordinator already tracks each op's target store), not by name — so it
  * composes with the coordinator's per-store bucketing without a name lookup.
+ *
+ * Same-key ordering matches {@link WriteBatch}: queued ops apply in queue order,
+ * so for one (store, key) pair the later op wins. The coordinator replays its
+ * pending ops into one atomic batch without collapsing duplicates, so a
+ * transaction that writes then deletes the same row depends on this.
  */
 export interface AtomicBatch {
 	/** Queue a put against the given store. */

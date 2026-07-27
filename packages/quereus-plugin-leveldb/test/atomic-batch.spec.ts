@@ -70,6 +70,26 @@ describe('LevelDB atomic batch', () => {
 		expect(await dataStore.get(K2)).to.deep.equal(V2);
 	});
 
+	it('same-key ops in one batch resolve to the last one queued', async () => {
+		// The coordinator replays a transaction's pending ops into one atomic batch
+		// without collapsing duplicates, so a transaction that writes then deletes
+		// the same row lands both ops here and depends on queue order.
+		const dataStore = await provider.getStore('main', 't');
+		await dataStore.put(K1, V1);
+
+		const putThenDelete = provider.beginAtomicBatch()!;
+		putThenDelete.put(dataStore, K1, V2);
+		putThenDelete.delete(dataStore, K1);
+		await putThenDelete.write();
+		expect(await dataStore.get(K1)).to.be.undefined;
+
+		const deleteThenPut = provider.beginAtomicBatch()!;
+		deleteThenPut.delete(dataStore, K1);
+		deleteThenPut.put(dataStore, K1, V2);
+		await deleteThenPut.write();
+		expect(await dataStore.get(K1)).to.deep.equal(V2);
+	});
+
 	it('clear() discards queued ops (nothing is committed)', async () => {
 		const dataStore = await provider.getStore('main', 't');
 		const batch = provider.beginAtomicBatch()!;
