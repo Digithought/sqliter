@@ -593,9 +593,12 @@ async function applySchemaChange(
  *
  * NOTE: "net effect in order" assumes the batch arrives in HLC order, which
  * `getChangesSince` guarantees (`DataChangeToApply` carries no HLC to re-sort
- * by). A transport that reordered changesets within one batch could mis-net a
- * same-row delete+update group; if such a transport ever appears, thread the
- * HLC through `DataChangeToApply` and sort here.
+ * by). The change-applicator's in-batch delete reconciliation decides the SAME
+ * question by HLC instead, so on a batch whose changesets were reordered the two
+ * disagree: under `allowResurrection` a resurrected row keeps its cell records
+ * and change-log entries while this collapse deletes it from the table, leaving
+ * the replica relaying a row it does not have. Tracked as
+ * `bug-sync-apply-order-splits-data-from-metadata`.
  */
 async function buildRowOp(
   table: StoreTable,

@@ -46,6 +46,14 @@ export interface ResolvedChange {
 	 */
 	keepColumns?: Set<string>;
 	/**
+	 * For a column change that BEAT a same-batch delete under `allowResurrection`:
+	 * the delete erased this cell's local lineage before the write landed, so the
+	 * write records no before-image. {@link oldColumnVersion} still travels with it
+	 * — its stale `cl:` entry must be dropped, and the delete's cleanup now skips
+	 * this column. Filled by {@link reconcileInBatchDeletes}.
+	 */
+	priorErasedByInBatchDelete?: boolean;
+	/**
 	 * Table exists only via this same batch's create_table — no local schema (and so
 	 * no resolvable pk-identity keying) until Phase 2's DDL runs.
 	 */
@@ -743,7 +751,12 @@ function reconcileInBatchDeletes(
 		if (!winner) return entry;
 		if (ctx.config.allowResurrection && compareHLC(entry.change.hlc, winner.change.hlc) > 0) {
 			(winner.keepColumns ??= new Set()).add(entry.change.column);
-			return entry;
+			// Phase 1 read this cell's PRE-batch version as the before-image, but the
+			// in-batch delete erases that lineage: applied in separate batches the
+			// resurrecting write finds no version at all and records no prior (which is
+			// also what the ORIGIN recorded past its own delete). Drop the prior so the
+			// stored version — and everything getChangesSince relays from it — matches.
+			return { ...entry, priorErasedByInBatchDelete: true };
 		}
 		return { outcome: 'skipped', change: entry.change };
 	});
@@ -801,7 +814,7 @@ export async function commitChangeMetadata(
 	for (const resolved of columnWinners.values()) {
 		const change = resolved.change;
 		if (change.type !== 'column') continue; // homogeneous map; narrows the union
-		commitColumnMetadata(ctx, batch, change, resolved.oldColumnVersion);
+		commitColumnMetadata(ctx, batch, change, resolved.oldColumnVersion, resolved.priorErasedByInBatchDelete);
 	}
 	await batch.write();
 
@@ -886,8 +899,11 @@ function commitColumnMetadata(
 	batch: WriteBatch,
 	change: ColumnChange,
 	oldColumnVersion: ColumnVersion | undefined,
+	priorErasedByInBatchDelete = false,
 ): void {
-	// Delete the prior (pk, column) change-log entry if one exists.
+	// Delete the prior (pk, column) change-log entry if one exists. Still required
+	// when the prior lineage is erased below — the entry is real storage, and the
+	// winning delete's cleanup skips this column (see ResolvedChange.keepColumns).
 	if (oldColumnVersion) {
 		ctx.changeLog.deleteEntryBatch(batch, oldColumnVersion.hlc, 'column', change.schema, change.table, change.pk, change.column);
 	}
@@ -895,8 +911,9 @@ function commitColumnMetadata(
 	// write replaced here (`oldColumnVersion`). In causal-order delivery that equals
 	// the origin's prior, so re-relay forwards the origin's chain (the prior's own
 	// origin HLC, never reset to this receiver's clock). A first write here records
-	// no prior, matching the local write path in `recordColumnVersions`.
-	const prior = oldColumnVersion
+	// no prior, matching the local write path in `recordColumnVersions` — as does a
+	// write that resurrected past a same-batch delete, which erased that lineage.
+	const prior = oldColumnVersion && !priorErasedByInBatchDelete
 		? { priorHlc: oldColumnVersion.hlc, priorValue: oldColumnVersion.value }
 		: undefined;
 	ctx.columnVersions.setColumnVersionBatch(

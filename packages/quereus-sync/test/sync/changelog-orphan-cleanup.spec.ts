@@ -330,6 +330,50 @@ describe('change log orphan cleanup', () => {
         expect(reEmittedValues).to.deep.equal(['a', 'b', 'c']);
       });
 
+      // The receivers above were empty, so Phase 1 found no prior cell version to
+      // record as the resurrecting write's before-image. A receiver that already
+      // HOLDS the row does find one — the pre-delete value — even though the
+      // same-batch delete erases that lineage. The origin (past its own delete) and
+      // a separate-applies twin both record no prior, so keeping it would persist a
+      // deleted value as the before-image and put it on the wire for a third peer.
+      it('allowResurrection: true — a receiver that already holds the row records no stale before-image', async () => {
+        const source = new FakeTransactionSource();
+        const origin = await SyncManagerImpl.create(
+          new InMemoryKVStore(), source, { ...DEFAULT_SYNC_CONFIG }, new SyncEventEmitterImpl(),
+        );
+        source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['x', 'y', 'z'] });
+        await settle();
+
+        const batched = await makeRelay(RESURRECT);
+        const separate = await makeRelay(RESURRECT);
+        await batched.applyChanges(await origin.getChangesSince(batched.getSiteId()));
+        await separate.applyChanges(await origin.getChangesSince(separate.getSiteId()));
+
+        source.commitData({ type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'] });
+        await settle();
+        source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a', 'b', 'c'] });
+        await settle();
+
+        const { batchedResult, separateResults } = await applyBothWays(origin, batched, separate);
+
+        // The re-created cells carry the new values and NO before-image — matching
+        // the origin's own records for the same three facts.
+        const versions = await batched.columnVersions.getRowVersions('main', 'users', [1]);
+        expect([...versions.values()].map(v => v.value).sort()).to.deep.equal(['a', 'b', 'c']);
+        expect([...versions.values()].map(v => v.priorHlc)).to.deep.equal([undefined, undefined, undefined]);
+        expect([...versions.entries()].sort(([a], [b]) => a.localeCompare(b)))
+          .to.deep.equal([...(await origin.columnVersions.getRowVersions('main', 'users', [1])).entries()]
+            .sort(([a], [b]) => a.localeCompare(b)));
+
+        expect(await relayState(batched)).to.deep.equal(await relayState(separate));
+        expect({ applied: batchedResult.applied, skipped: batchedResult.skipped, conflicts: batchedResult.conflicts })
+          .to.deep.equal(sumResults(separateResults));
+
+        const third = generateSiteId();
+        expect(flattenSets(await batched.getChangesSince(third)))
+          .to.deep.equal(flattenSets(await separate.getChangesSince(third)));
+      });
+
       // Pre-fix: the batched relay reported applied:4 / skipped:0 and emitted the
       // blocked column changes as applied, even though their metadata was wiped.
       it('allowResurrection: false (default) — one batch blocks the re-creation and matches separate applies', async () => {

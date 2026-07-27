@@ -609,6 +609,34 @@ describe('unknown-table disposition', () => {
       expect(siteIdEquals(h.remoteChanges[0].siteId, h.remoteSite)).to.be.true;
     });
 
+    // A drain resolves a whole table's held changes as one unit, so a held delete
+    // and a held column write for ONE row must block each other exactly as they
+    // would arriving in a single wire batch (change-applicator's
+    // reconcileInBatchDeletes, which the drain shares with applyChanges).
+    // Pre-fix: the later column write applied and the delete's cleanup then wiped
+    // its metadata back out, reporting `applied: 2` for one surviving fact.
+    it('a held delete blocks a held column write for the same row', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [
+        del(h.remoteSite, 2000, RETIRED, 1),
+        col(h.remoteSite, 3000, RETIRED, 1, 'note', 'resurrect'),
+      ])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(2);
+
+      reappear(h, RETIRED, ['note']);
+      expect(await h.manager.drainHeldChanges('main', RETIRED)).to.equal(2);
+
+      // Default `allowResurrection: false` — the tombstone blocks the later write
+      // unconditionally, so only the delete lands.
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.not.exist;
+      expect(await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note')).to.not.exist;
+      expect(await h.manager.tombstones.getTombstone('main', RETIRED, [1])).to.exist;
+      expect(h.drained[0]).to.include({ drained: 2, applied: 1, skipped: 1 });
+      // Only the delete is republished to downstream listeners.
+      const revived = h.remoteChanges.flatMap(e => e.changes).filter(c => c.table === RETIRED);
+      expect(revived.map(c => c.type)).to.deep.equal(['delete']);
+    });
+
     it('sweep form drains present tables and leaves still-absent ones held', async () => {
       const h = await makeHarness();
       await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [
