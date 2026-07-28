@@ -48,7 +48,7 @@ export interface SetOpColumnTypeMerge {
 	readonly convert?: 'left' | 'right';
 }
 
-/** The three builtin numeric types rule 3 knows how to promote among. */
+/** The three builtin numeric types rule 3 accepts; any other numeric falls to ANY. */
 function isBuiltinNumeric(t: LogicalType): boolean {
 	return t === INTEGER_TYPE || t === REAL_TYPE || t === NUMERIC_TYPE;
 }
@@ -66,22 +66,16 @@ export function mergeSetOpColumnType(left: LogicalType, right: LogicalType): Set
 	if (left === NULL_TYPE) return { logicalType: right };
 	if (right === NULL_TYPE) return { logicalType: left };
 
-	// 3. Numeric promotion: any DIFFERING pair of builtin numerics advertises
-	// NUMERIC (rule 1 already consumed the identical pairs). NUMERIC's value
-	// space is `number | bigint` — it is the only builtin numeric type the
-	// unconverted mixed stream actually inhabits, so the claim holds with no
-	// branch conversion. A non-builtin numeric type has no principled promotion —
-	// fall through to ANY (rule 5) rather than guess.
+	// 3. Any DIFFERING pair of builtin numerics → NUMERIC (rule 1 already consumed
+	// the identical pairs): `number | bigint` is the only builtin numeric value
+	// space the unconverted mixed stream inhabits. A non-builtin numeric type has
+	// no principled promotion — fall through to ANY (rule 5) rather than guess.
 	//
-	// This deliberately DIVERGES from `BinaryOpNode.generateType` / `findCommonType`,
-	// which promote INTEGER + REAL to REAL. That is right for arithmetic: it yields
-	// ONE value in ONE form, and REAL describes it exactly. A set operation yields a
-	// STREAM MIXING BOTH forms — the branches are passed through untouched — and only
-	// NUMERIC describes that. Advertising REAL here would be a lie downstream trusts:
-	// `buildRowCoercion` skips conversion on an identity match, so a bigint would land
-	// unconverted in a REAL-declared column (ticket
-	// `set-op-numeric-promotion-skips-conversion`). Do not "restore consistency" by
-	// changing the arithmetic rules — they are correct as they stand.
+	// Do NOT "restore consistency" with `BinaryOpNode.generateType` / `findCommonType`,
+	// which promote INTEGER + REAL to REAL — correct there (one value in one form),
+	// wrong here (a stream mixing both). Advertising REAL makes `buildRowCoercion`
+	// skip conversion on the identity match, landing a bigint unconverted in a
+	// REAL-declared column (ticket `set-op-numeric-promotion-skips-conversion`).
 	if (left.isNumeric && right.isNumeric) {
 		if (isBuiltinNumeric(left) && isBuiltinNumeric(right)) return { logicalType: NUMERIC_TYPE };
 		return { logicalType: ANY_TYPE };

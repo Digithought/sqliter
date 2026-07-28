@@ -250,7 +250,9 @@ export const NUMERIC_TYPE: LogicalType = {
 	// NOTE: labelled REAL although the value space includes bigint. Harmless today —
 	// nothing encodes or rounds by physicalType (the store keys off the JS value type).
 	// If a storage/encoding path ever switches on physicalType, a bigint-holding NUMERIC
-	// would be mislabelled here and lose precision on the way out.
+	// would be mislabelled here and lose precision on the way out. Set-op type merging
+	// now routes every mixed builtin-numeric pair through NUMERIC, so plain
+	// `select 1 union all select 2.5` reaches this — the blast radius is no longer niche.
 	physicalType: PhysicalType.REAL,
 	isNumeric: true,
 

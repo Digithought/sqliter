@@ -194,3 +194,24 @@ select cast(v as text) as t from sobt_nk order by v;
 -- get rounded on the way out.
 select cast(v as text) as t from (select 9007199254740993 as v union all select 2.5) as s;
 → [{"t":"9007199254740993"},{"t":"2.5"}]
+
+-- Three or more `union all` arms collapse into AsyncGatherNode, which folds the
+-- same merge across every branch — the mixed pair must still reach NUMERIC there.
+create table sobt_g (v real primary key);
+insert into sobt_g (v) select 2.5 union all select 9007199254740993 union all select 7;
+-- run
+
+select cast(v as text) as t from sobt_g order by v;
+→ [{"t":"2.5"},{"t":"7"},{"t":"9007199254740992"}]
+
+-- Deduplicating set operations compare across branches under the merged type, so
+-- the whole-number and decimal spellings of one value must collapse (and not
+-- throw out of the comparator on the bigint operand).
+select v from (select 1 as v union select 1.0) as s;
+→ [{"v":1}]
+
+select v from (select 3 as v intersect select 3.0) as s;
+→ [{"v":3}]
+
+select v from (select 3 as v except select 3.0) as s;
+→ []
