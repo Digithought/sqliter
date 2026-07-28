@@ -135,6 +135,21 @@ describe('Plan shape: subquery decorrelation', () => {
 		it('non-column left side keeps the In node', async () => {
 			await keepsIn("SELECT * FROM a WHERE a.x + 1 IN (SELECT b.x FROM b)");
 		});
+
+		it('COLLATE-wrapped left side keeps the In node', async () => {
+			await keepsIn("SELECT * FROM a WHERE a.name COLLATE NOCASE IN (SELECT b.label FROM b)");
+		});
+
+		it('non-deterministic inner keeps the In node', async () => {
+			// The `isFunctional` gate: a non-deterministic source must keep its
+			// per-outer-row evaluation semantics rather than being drained once
+			// into a hash build. (`random() * 0` keeps the answer stable so the
+			// result assertion below is deterministic.)
+			const q = "SELECT a.name FROM a WHERE a.x IN (SELECT cast(b.x + random() * 0 AS INTEGER) FROM b) ORDER BY a.id";
+			await keepsIn(q);
+			const results = await allRows<{ name: string }>(db, q);
+			expect(results.map(r => r.name)).to.deep.equal(['alpha', 'beta']);
+		});
 	});
 
 	describe('cost-quadrant guard: large outer × large inner plans as hash', () => {

@@ -163,6 +163,23 @@ INSERT INTO fkemp VALUES (10, 1), (20, 2);
 SELECT id FROM fkemp WHERE dept_id IN (SELECT id FROM fkdept) ORDER BY id;
 → [{"id":10},{"id":20}]
 
+-- ===== The one other place an IN decides row fate: CHECK =====
+
+-- A CHECK constraint's IN is a scalar expression on a constraint node, not a
+-- Filter predicate, so the rewrite can never reach it — and must not, because
+-- a CHECK passes on IN's three-valued "unknown". A NULL value is accepted; a
+-- non-member is rejected.
+CREATE TABLE chk_allowed (id INTEGER PRIMARY KEY, code INTEGER);
+INSERT INTO chk_allowed VALUES (1, 1), (2, 2);
+CREATE TABLE chk_t (id INTEGER PRIMARY KEY, code INTEGER NULL, CHECK (code IN (SELECT code FROM chk_allowed)));
+
+INSERT INTO chk_t VALUES (1, NULL), (2, 2);
+SELECT id, code FROM chk_t ORDER BY id;
+→ [{"id":1,"code":null},{"id":2,"code":2}]
+
+INSERT INTO chk_t VALUES (3, 9);
+-- error: CHECK constraint failed
+
 -- ===== DML with the semi join as the mutation source =====
 
 CREATE TABLE dml_t (id INTEGER PRIMARY KEY, x INTEGER NULL, mark INTEGER);
@@ -189,6 +206,8 @@ SELECT id FROM selfd ORDER BY id;
 → [{"id":1},{"id":3}]
 
 -- Cleanup
+DROP TABLE chk_t;
+DROP TABLE chk_allowed;
 DROP TABLE selfd;
 DROP TABLE dml_keys;
 DROP TABLE dml_t;

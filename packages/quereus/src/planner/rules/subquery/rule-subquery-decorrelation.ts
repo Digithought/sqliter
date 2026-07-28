@@ -72,8 +72,6 @@ interface DecorrelationCandidate {
 	subqueryNode: ExistsNode | InNode;
 	/** 'semi' or 'anti' */
 	joinType: JoinType;
-	/** The scalar node in the filter predicate that matched (ExistsNode, UnaryOpNode wrapping ExistsNode, or InNode) */
-	predicateNode: ScalarPlanNode;
 	/**
 	 * True for the uncorrelated filter-position IN arm: the subquery tree is used
 	 * verbatim as the join's right side via `extractUncorrelatedIn` instead of the
@@ -89,7 +87,7 @@ function identifyCandidate(node: ScalarPlanNode): DecorrelationCandidate | null 
 	// EXISTS(subquery)
 	if (node instanceof ExistsNode) {
 		if (isCorrelatedSubquery(node.subquery)) {
-			return { subqueryNode: node, joinType: 'semi', predicateNode: node };
+			return { subqueryNode: node, joinType: 'semi' };
 		}
 		return null;
 	}
@@ -99,7 +97,7 @@ function identifyCandidate(node: ScalarPlanNode): DecorrelationCandidate | null 
 		if (node.operand instanceof ExistsNode) {
 			const exists = node.operand;
 			if (isCorrelatedSubquery(exists.subquery)) {
-				return { subqueryNode: exists, joinType: 'anti', predicateNode: node };
+				return { subqueryNode: exists, joinType: 'anti' };
 			}
 		}
 		return null;
@@ -108,12 +106,12 @@ function identifyCandidate(node: ScalarPlanNode): DecorrelationCandidate | null 
 	// col IN (subquery) — correlated and uncorrelated take different extractions
 	if (node instanceof InNode && node.source && !node.values) {
 		if (isCorrelatedSubquery(node.source)) {
-			return { subqueryNode: node, joinType: 'semi', predicateNode: node };
+			return { subqueryNode: node, joinType: 'semi' };
 		}
 		// Uncorrelated filter-position IN: semi join ≡ IN under WHERE's NULL
 		// collapse (see the rule header). Gates live in extractUncorrelatedIn;
 		// any decline leaves the InNode on the runtime set-probe path.
-		return { subqueryNode: node, joinType: 'semi', predicateNode: node, uncorrelatedIn: true };
+		return { subqueryNode: node, joinType: 'semi', uncorrelatedIn: true };
 	}
 
 	return null;
