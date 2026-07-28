@@ -1,0 +1,114 @@
+-- 08.4-key-set-semi-join.sqllogic — behaviour of the key-set semi join rewrite
+--
+-- `where col in (select …)` over a secondary-indexed column plans as a
+-- KeySetSemiJoin under the memory vtab: the inner set is materialized once and,
+-- when small enough, handed to the module as a plan=5 multi-seek. These cases
+-- pin the OBSERVABLE behaviour only (rows, counts) — the same answers must come
+-- back whether the runtime seeks or scans. Plan-shape and seek-vs-scan
+-- assertions live in test/optimizer/key-set-seek.spec.ts and
+-- test/vtab/key-set-semi-join-runtime.spec.ts.
+
+-- Setup: target with a secondary index on v, key source, and data.
+CREATE TABLE big (pk INTEGER PRIMARY KEY, v INTEGER NULL, w INTEGER NULL);
+CREATE INDEX idx_big_v ON big(v);
+CREATE TABLE small (id INTEGER PRIMARY KEY, k INTEGER NULL);
+
+INSERT INTO big VALUES (1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4), (5, NULL, 5);
+INSERT INTO small VALUES (1, 10), (2, 30), (3, 999);
+
+-- ===== Key set contents =====
+
+-- Basic membership: only matching rows return, each exactly once.
+SELECT pk FROM big WHERE v IN (SELECT k FROM small) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- Duplicates in the inner must not fan out the target.
+INSERT INTO small VALUES (4, 10), (5, 10);
+SELECT pk FROM big WHERE v IN (SELECT k FROM small) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- Inner NULLs are skipped; non-NULL members still match.
+INSERT INTO small VALUES (6, NULL);
+SELECT pk FROM big WHERE v IN (SELECT k FROM small) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- A NULL target value never matches anything.
+SELECT pk FROM big WHERE v IN (SELECT k FROM small) AND pk = 5;
+→ []
+
+-- Empty inner ⇒ no rows.
+SELECT pk FROM big WHERE v IN (SELECT k FROM small WHERE k > 10000);
+→ []
+
+-- All-NULL inner ⇒ no rows.
+SELECT pk FROM big WHERE v IN (SELECT k FROM small WHERE k IS NULL);
+→ []
+
+-- ORDER BY above the semi join stays correct whichever access path runs.
+SELECT pk, v FROM big WHERE v IN (SELECT k FROM small) ORDER BY v DESC;
+→ [{"pk":3,"v":30},{"pk":1,"v":10}]
+
+-- ===== Types and collation =====
+
+-- NOCASE target column and index: case variants of a member match.
+CREATE TABLE ci (pk INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE);
+CREATE INDEX idx_ci_s ON ci(s);
+CREATE TABLE ssrc (id INTEGER PRIMARY KEY, s TEXT);
+INSERT INTO ci VALUES (1, 'Alpha'), (2, 'beta'), (3, 'GAMMA');
+INSERT INTO ssrc VALUES (1, 'alpha'), (2, 'gamma');
+SELECT pk FROM ci WHERE s IN (SELECT s FROM ssrc) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- BINARY target column and index, BINARY keys: exact-case only.
+CREATE TABLE bin (pk INTEGER PRIMARY KEY, s TEXT);
+CREATE INDEX idx_bin_s ON bin(s);
+INSERT INTO bin VALUES (1, 'Alpha'), (2, 'alpha');
+SELECT pk FROM bin WHERE s IN (SELECT s FROM ssrc) ORDER BY pk;
+→ [{"pk":2}]
+
+-- TIMESPAN keys decline the seek but keep semantic equality:
+-- 'PT1H' still matches 'PT60M' through the surviving hash semi join.
+CREATE TABLE spans (pk INTEGER PRIMARY KEY, d TIMESPAN);
+CREATE INDEX idx_spans_d ON spans(d);
+CREATE TABLE spansrc (id INTEGER PRIMARY KEY, d TIMESPAN);
+INSERT INTO spans VALUES (1, timespan('PT1H')), (2, timespan('P1D'));
+INSERT INTO spansrc VALUES (1, timespan('PT60M'));
+SELECT pk FROM spans WHERE d IN (SELECT d FROM spansrc);
+→ [{"pk":1}]
+
+-- ===== DML =====
+
+-- DELETE with an IN-subquery source.
+DELETE FROM big WHERE v IN (SELECT k FROM small);
+SELECT pk FROM big ORDER BY pk;
+→ [{"pk":2},{"pk":4},{"pk":5}]
+
+-- UPDATE with an IN-subquery source.
+INSERT INTO small VALUES (7, 20);
+UPDATE big SET w = -1 WHERE v IN (SELECT k FROM small);
+SELECT pk, w FROM big ORDER BY pk;
+→ [{"pk":2,"w":-1},{"pk":4,"w":4},{"pk":5,"w":5}]
+
+-- Self-referencing DELETE: the key set drains before the target opens, so the
+-- pre-statement snapshot decides membership.
+CREATE TABLE selfref (pk INTEGER PRIMARY KEY, x INTEGER NULL);
+CREATE INDEX idx_selfref_x ON selfref(x);
+INSERT INTO selfref VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+DELETE FROM selfref WHERE x IN (SELECT x FROM selfref WHERE x <= 20);
+SELECT pk FROM selfref ORDER BY pk;
+→ [{"pk":3},{"pk":4}]
+
+-- Multi-row DELETE inside an explicit transaction: each seek window is a
+-- distinct key; deleting rows mid-statement must not disturb later windows.
+CREATE TABLE txt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_txt_v ON txt(v);
+CREATE TABLE txkeys (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO txt VALUES (1, 100), (2, 200), (3, 300), (4, 400), (5, 500);
+INSERT INTO txkeys VALUES (1, 200), (2, 400), (3, 500);
+BEGIN;
+DELETE FROM txt WHERE v IN (SELECT k FROM txkeys);
+SELECT pk FROM txt ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+COMMIT;
+SELECT pk FROM txt ORDER BY pk;
+→ [{"pk":1},{"pk":3}]

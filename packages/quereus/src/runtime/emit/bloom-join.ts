@@ -7,9 +7,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
-import { serializeKey, serializeRowKey } from '../../util/key-serializer.js';
-import { semanticKeyTransform } from '../../util/comparison.js';
-import { effectiveCollationOfTypes, hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
+import { buildJoinKeyExtractor } from './join-key-extractor.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:bloom-join');
@@ -28,10 +26,9 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 	const leftRowDescriptor = buildRowDescriptor(leftAttributes);
 	const rightRowDescriptor = buildRowDescriptor(rightAttributes);
 
-	// Pre-resolve equi-pair column indices and collation normalizers from attribute IDs
+	// Pre-resolve equi-pair column indices from attribute IDs
 	const leftIndices: number[] = [];
 	const rightIndices: number[] = [];
-	const keyNormalizers: ((s: string) => string)[] = [];
 	const leftIndex = plan.left.getAttributeIndex();
 	const rightIndex = plan.right.getAttributeIndex();
 	for (const pair of plan.equiPairs) {
@@ -42,47 +39,16 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		}
 		leftIndices.push(li);
 		rightIndices.push(ri);
-		// Resolve the pair's comparison collation through the shared provenance
-		// lattice so the probe- and build-side key normalization agree and match
-		// every other join algorithm and the nested-loop fallback. The symmetric
-		// resolution is what makes MISMATCHED-collation pairs (declared NOCASE vs
-		// defaulted BINARY — tagged `collationsMatch: false` by
-		// `equi-pair-extractor`) hash-joinable: both sides' keys normalize under
-		// the one resolved collation, exactly what `=` would compare under.
-		// Throws on an explicit/declared conflict — a loud backstop; the
-		// extractor declines conflicting pairs (they stay in the residual), so
-		// this is unreachable for admitted pairs.
-		const leftType = leftAttributes[li].type;
-		const rightType = rightAttributes[ri].type;
-		const collationName = effectiveCollationOfTypes(leftType, rightType);
-		keyNormalizers.push(ctx.resolveKeyNormalizer(hashKeyCollationName(collationName, [leftType, rightType])));
 	}
 
-	// Hash-key canonicalizers for semantic-ordering key types: the serialized key IS
-	// the join match (no re-verify), so values `=` treats as equal (TIMESPAN
-	// 'PT1H' ≡ 'PT60M') must serialize identically. Mirrors GROUP BY in
-	// hash-aggregate.ts; per equi-pair, active only when both sides declare the same
-	// semantic-ordering logical type with a groupKey hook. LOCKSTEP: a MIXED pair
-	// (one side semantic-ordering, the other not) can no longer reach here —
-	// `equi-pair-extractor`'s semantic-ordering gate demotes it to the residual, so
-	// the `=` operator evaluates it in the generic join. Canonicalizing such a pair
-	// instead of declining would be unsound anyway (TIMESPAN's groupKey yields a
-	// NUMBER, which would hash-match a timespan-vs-integer pair that `=` calls
-	// unequal); see the gate's docstring.
-	const keyCanonicalizers = plan.equiPairs.map((_pair, i) => {
-		const leftLogical = leftAttributes[leftIndices[i]].type.logicalType;
-		const rightLogical = rightAttributes[rightIndices[i]].type.logicalType;
-		return leftLogical === rightLogical ? semanticKeyTransform(leftLogical) : undefined;
-	});
-	const hasKeyCanonicalizer = keyCanonicalizers.some(c => c !== undefined);
-	const extractKey = (row: Row, indices: number[]): string | null => {
-		if (!hasKeyCanonicalizer) return serializeRowKey(row, indices, keyNormalizers);
-		const values = indices.map((idx, i) => {
-			const v = row[idx];
-			return keyCanonicalizers[i] ? keyCanonicalizers[i]!(v) : v;
-		});
-		return serializeKey(values, keyNormalizers);
-	};
+	// Collation normalizers + semantic-ordering canonicalizers, shared with the
+	// key-set semi join emitter — see join-key-extractor.ts for the resolution
+	// and LOCKSTEP notes.
+	const extractKey = buildJoinKeyExtractor(
+		plan.equiPairs.map((_pair, i) =>
+			[leftAttributes[leftIndices[i]].type, rightAttributes[rightIndices[i]].type] as const),
+		ctx,
+	);
 
 	const rightColCount = rightAttributes.length;
 

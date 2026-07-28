@@ -21,6 +21,7 @@ import { ruleMaterializedViewRewrite } from './rules/cache/rule-materialized-vie
 import { ruleSelectAccessPath } from './rules/access/rule-select-access-path.js';
 import { ruleLensAuxiliaryAccess } from './rules/access/rule-lens-auxiliary-access.js';
 import { ruleMonotonicLimitPushdown } from './rules/access/rule-monotonic-limit-pushdown.js';
+import { ruleKeySetSeek } from './rules/access/rule-key-set-seek.js';
 import { ruleMonotonicRangeAccess } from './rules/access/rule-monotonic-range-access.js';
 import { ruleAsofStrategySelect } from './rules/access/rule-asof-strategy-select.js';
 import { ruleGrowRetrieve } from './rules/retrieve/rule-grow-retrieve.js';
@@ -914,6 +915,26 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		// Slides LIMIT/OFFSET into a physical access leaf via OrdinalSlice;
 		// only fires when the chain peels to a SeqScan/IndexScan/IndexSeek
 		// (all read-only by construction).
+		sideEffectMode: 'safe',
+	},
+
+	// Key-set seek: replace a single-pair hash SEMI join over a full-scan leaf
+	// with a KeySetSemiJoin that materializes the key set at runtime and, when
+	// small enough, multi-seeks the target with it. Runs after
+	// `join-physical-selection` (the hash semi join must exist) and after
+	// `monotonic-limit-pushdown` — the two peels are mutually exclusive
+	// (each rejects the other's output node) and whichever runs first wins;
+	// LIMIT pushdown is the more valuable of the two on the shapes where both
+	// could apply, so it keeps priority.
+	{
+		pass: PassId.PostOptimization,
+		id: 'key-set-seek',
+		nodeType: PlanNodeType.HashJoin,
+		phase: 'impl',
+		fn: ruleKeySetSeek,
+		// The rule declines when either side has side effects (and when the key
+		// source is correlated or non-deterministic), so the surviving rewrite
+		// only ever reorders read-only subtrees.
 		sideEffectMode: 'safe',
 	},
 

@@ -60,6 +60,7 @@ import { emitAlterTable } from './emit/alter-table.js';
 import { emitSetObjectTags } from './emit/set-object-tags.js';
 import { emitLoopJoin } from './emit/join.js';
 import { emitBloomJoin } from './emit/bloom-join.js';
+import { emitKeySetSemiJoin } from './emit/key-set-semi-join.js';
 import { emitMergeJoin } from './emit/merge-join.js';
 import { emitAsofScan } from './emit/asof-scan.js';
 import { emitCache } from './emit/cache.js';
@@ -179,6 +180,7 @@ export function registerEmitters() {
 	// Join emitters
 	registerEmitter(PlanNodeType.Join, emitLoopJoin as EmitterFunc);
 	registerEmitter(PlanNodeType.HashJoin, emitBloomJoin as EmitterFunc);
+	registerEmitter(PlanNodeType.KeySetSemiJoin, emitKeySetSemiJoin as EmitterFunc);
 	registerEmitter(PlanNodeType.MergeJoin, emitMergeJoin as EmitterFunc);
 	registerEmitter(PlanNodeType.AsofScan, emitAsofScan as EmitterFunc);
 

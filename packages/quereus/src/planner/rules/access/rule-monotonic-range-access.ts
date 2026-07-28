@@ -122,6 +122,7 @@ function leafWithRangeBound(leaf: AccessLeaf, rb: PhysicalProperties['rangeBound
 			leaf.advertisement,
 			rb,
 			leaf.suppressMonotonic,
+			leaf.orderingLoadBearing,
 		);
 	}
 	// IndexSeekNode
@@ -156,6 +157,7 @@ function leafWithMonotonicSuppressed(leaf: AccessLeaf): AccessLeaf {
 			leaf.advertisement,
 			leaf.rangeBoundedOn,
 			true,
+			leaf.orderingLoadBearing,
 		);
 	}
 	return new IndexSeekNode(

@@ -31,6 +31,16 @@ export interface IndexStyleContext {
 	residualPredicate?: ScalarPlanNode;
 	/** Constraints extracted from the pushed-down predicate. */
 	originalConstraints: PredicateConstraint[];
+	/**
+	 * True when a SortNode was DROPPED on the strength of this plan's
+	 * `providesOrdering` (`trySortAbsorbViaIndexOrdering`): the leaf's emission
+	 * order is now the only thing standing between the query and a wrong ORDER
+	 * BY. Re-grows must carry it forward, and the physical leaf lifts it as
+	 * `IndexScanNode.orderingLoadBearing` so later rewrites that would change
+	 * the leaf's emission order (`rule-key-set-seek`) know to decline. Absent /
+	 * false ⇒ any advertised ordering is vacuous — nothing consumed it.
+	 */
+	orderingLoadBearing?: boolean;
 }
 
 /**

@@ -435,12 +435,16 @@ function fallbackIndexSupports(
 		}
 	}
 
-	// Store context for later use in ruleSelectAccessPath
+	// Store context for later use in ruleSelectAccessPath. A re-grow over a
+	// Retrieve whose ordering already absorbed a Sort must keep the
+	// load-bearing marker — the Sort is gone either way.
 	const indexCtx: IndexStyleContext = {
 		kind: 'index-style',
 		accessPlan,
 		residualPredicate,
-		originalConstraints: plannerConstraints ? [...plannerConstraints] : []
+		originalConstraints: plannerConstraints ? [...plannerConstraints] : [],
+		...(isIndexStyleContext(existingCtx) && existingCtx.orderingLoadBearing
+			? { orderingLoadBearing: true } : {}),
 	};
 
 	return {
@@ -582,12 +586,16 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 
 	// Equip the Retrieve with index-style context so rule-select-access-path
 	// uses this plan. Existing source pipeline (which may already contain
-	// pushed-down filters) is preserved.
+	// pushed-down filters) is preserved. The dropped Sort makes the plan's
+	// ordering load-bearing: the physical leaf's emission order is now the only
+	// thing producing the requested ORDER BY, so leaf rewrites that change
+	// emission order must see the marker and decline.
 	const indexCtx: IndexStyleContext = {
 		kind: 'index-style',
 		accessPlan,
 		residualPredicate,
 		originalConstraints: [...constraints],
+		orderingLoadBearing: true,
 	};
 	const newRetrieve = retrieveNode.withPipeline(retrieveNode.source, indexCtx, retrieveNode.bindings);
 

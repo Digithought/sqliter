@@ -115,9 +115,14 @@ SELECT d.name FROM departments d WHERE d.id = (SELECT min(dept_id) FROM employee
 
 -- ===== query_plan() introspection: verify semi/anti join appears =====
 
--- Verify correlated EXISTS produces a semi join (node_type and joinType property)
-SELECT node_type, json_extract(properties, '$.joinType') as jt FROM query_plan('SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id)') WHERE node_type IN ('Join', 'HashJoin') ORDER BY id;
-→ [{"node_type":"HashJoin","jt":"semi"}]
+-- Verify correlated EXISTS produces a semi join. The physical node is
+-- backend-dependent: under the memory vtab rule-key-set-seek rewrites the hash
+-- semi join into a KeySetSemiJoin (the module accepts a runtime key-set
+-- multi-seek on the primary key), while the store module declines the
+-- runtime-set probe on its PK arm and keeps the HashJoin. Either way the
+-- joinType stays 'semi', which is what this pins.
+SELECT json_extract(properties, '$.joinType') as jt FROM query_plan('SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id)') WHERE node_type IN ('Join', 'HashJoin', 'KeySetSemiJoin') ORDER BY id;
+→ [{"jt":"semi"}]
 
 -- Verify NOT EXISTS produces an anti join
 SELECT node_type, json_extract(properties, '$.joinType') as jt FROM query_plan('SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id)') WHERE node_type IN ('Join', 'HashJoin') ORDER BY id;

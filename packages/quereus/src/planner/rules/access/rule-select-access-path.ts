@@ -157,7 +157,9 @@ export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanN
 		log('Using index-style context provided by grow-retrieve');
 		const accessPlan = retrieveNode.moduleCtx.accessPlan;
 		const originalConstraints = retrieveNode.moduleCtx.originalConstraints;
-		const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, originalConstraints);
+		const physicalLeaf: RelationalPlanNode = selectPhysicalNode(
+			retrieveNode.tableRef, accessPlan, originalConstraints,
+			retrieveNode.moduleCtx.orderingLoadBearing === true);
 		if (retrieveNode.moduleCtx.residualPredicate) {
 			return new FilterNode(retrieveNode.scope, physicalLeaf, retrieveNode.moduleCtx.residualPredicate);
 		}
@@ -224,6 +226,7 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 	let accessPlan: BestAccessPlanResult;
 	let constraints: PlannerPredicateConstraint[];
 	let residualPredicate: ScalarPlanNode | undefined;
+	let orderingLoadBearing = false;
 
 	if (isIndexStyleContext(retrieveNode.moduleCtx)) {
 		// Use pre-computed access plan from grow rule
@@ -231,6 +234,7 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 		accessPlan = retrieveNode.moduleCtx.accessPlan;
 		constraints = retrieveNode.moduleCtx.originalConstraints;
 		residualPredicate = retrieveNode.moduleCtx.residualPredicate;
+		orderingLoadBearing = retrieveNode.moduleCtx.orderingLoadBearing === true;
 	} else {
 		// Extract constraints from grown pipeline in source using table instance key
 		const tInfo = createTableInfoFromNode(retrieveNode.tableRef, `${tableSchema.schemaName}.${tableSchema.name}`);
@@ -254,7 +258,7 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 	}
 
 	// Choose physical node based on access plan
-	const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, constraints);
+	const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, constraints, orderingLoadBearing);
 
 	// If the Retrieve source contained a pipeline (e.g., Filter/Sort/Project), rebuild it above the physical leaf.
 	//
@@ -361,12 +365,17 @@ function reattachUnconsumedConstraints(
 }
 
 /**
- * Select the appropriate physical node based on access plan
+ * Select the appropriate physical node based on access plan.
+ *
+ * `orderingLoadBearing` records that a SortNode was dropped on the strength of
+ * this plan's `providesOrdering` (sort absorption) — lifted onto the
+ * ordering-only IndexScan leaf so emission-order-changing rewrites decline.
  */
 function selectPhysicalNode(
 	tableRef: TableReferenceNode,
 	accessPlan: BestAccessPlanResult,
-	constraints: PlannerPredicateConstraint[]
+	constraints: PlannerPredicateConstraint[],
+	orderingLoadBearing = false,
 ): RelationalPlanNode {
 
 	// Empty result optimization (e.g., IS NULL on NOT NULL column)
@@ -390,8 +399,8 @@ function selectPhysicalNode(
 	// --- Index-aware path: use module-provided index identity ---
 	// --- Legacy fallback: infer access method from constraints and PK definition ---
 	const leaf = (accessPlan.indexName && accessPlan.seekColumnIndexes && accessPlan.seekColumnIndexes.length > 0)
-		? selectPhysicalNodeFromPlan(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed)
-		: selectPhysicalNodeLegacy(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed);
+		? selectPhysicalNodeFromPlan(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing)
+		: selectPhysicalNodeLegacy(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing);
 
 	return reattachUnconsumedConstraints(tableRef, accessPlan, constraints, consumed, leaf);
 }
@@ -406,7 +415,8 @@ function selectPhysicalNodeFromPlan(
 	constraints: PlannerPredicateConstraint[],
 	filterInfo: FilterInfo,
 	providesOrdering: { column: number; desc: boolean }[] | undefined,
-	consumed: ConsumedSet
+	consumed: ConsumedSet,
+	orderingLoadBearing = false,
 ): RelationalPlanNode {
 	const advertisement = extractAdvertisement(accessPlan);
 	// Whether this module's runtime honours the index collation for range bounds —
@@ -951,6 +961,9 @@ function selectPhysicalNodeFromPlan(
 			providesOrdering,
 			accessPlan.cost,
 			advertisement,
+			undefined,
+			false,
+			orderingLoadBearing,
 		);
 	}
 
@@ -969,7 +982,8 @@ function selectPhysicalNodeLegacy(
 	constraints: PlannerPredicateConstraint[],
 	filterInfo: FilterInfo,
 	providesOrdering: { column: number; desc: boolean }[] | undefined,
-	consumed: ConsumedSet
+	consumed: ConsumedSet,
+	orderingLoadBearing = false,
 ): RelationalPlanNode {
 	const advertisement = extractAdvertisement(accessPlan);
 	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
@@ -1133,6 +1147,9 @@ function selectPhysicalNodeLegacy(
 			providesOrdering,
 			accessPlan.cost,
 			advertisement,
+			undefined,
+			false,
+			orderingLoadBearing,
 		);
 	}
 
@@ -1424,8 +1441,12 @@ function primaryKeyCollationLookup(tableSchema: TableSchema): (colIdx: number) =
  * `honorsCollatedRangeBounds` is the module's advertisement (off by default) that its
  * runtime filters range bounds under the index collation rather than BINARY; it gates
  * the non-BINARY range MATCH and is ignored for equality.
+ *
+ * Exported for `rule-key-set-seek`, which applies the same equality lattice to its
+ * runtime-materialized multi-seek (accepting MATCH and COARSER_SAFE, declining
+ * MISMATCH_UNSAFE) rather than restating it.
  */
-function classifyConstraintCover(predColl: string, indexColl: string, isEquality: boolean, honorsCollatedRangeBounds: boolean): CollationCover {
+export function classifyConstraintCover(predColl: string, indexColl: string, isEquality: boolean, honorsCollatedRangeBounds: boolean): CollationCover {
 	if (isEquality) {
 		if (predColl === indexColl) return 'MATCH';
 		// BINARY equality ⟹ equal under any collation, so a non-BINARY index over-fetches

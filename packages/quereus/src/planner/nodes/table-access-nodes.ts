@@ -241,6 +241,15 @@ export class IndexScanNode extends TableAccessNode {
 		public readonly rangeBoundedOn?: PhysicalProperties['rangeBoundedOn'],
 		/** When true, suppress the lifted `monotonicOn` advertisement (defensive escalation). */
 		public readonly suppressMonotonic: boolean = false,
+		/**
+		 * True when a SortNode was dropped on the strength of this scan's
+		 * `providesOrdering` (sort absorption in `rule-grow-retrieve`): the
+		 * scan's emission order is the only thing producing the requested
+		 * ORDER BY. Rewrites that change this leaf's emission order
+		 * (`rule-key-set-seek`) must decline. False for a vacuously-advertised
+		 * ordering nothing consumed.
+		 */
+		public readonly orderingLoadBearing: boolean = false,
 	) {
 		super(scope, source, filterInfo, estimatedCostOverride);
 	}
@@ -319,6 +328,7 @@ export class IndexScanNode extends TableAccessNode {
 			this.advertisement,
 			this.rangeBoundedOn,
 			this.suppressMonotonic,
+			this.orderingLoadBearing,
 		);
 	}
 }

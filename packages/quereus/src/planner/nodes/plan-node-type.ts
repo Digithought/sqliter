@@ -55,6 +55,8 @@ export enum PlanNodeType {
   NestedLoopJoin = 'NestedLoopJoin',
   HashJoin = 'HashJoin',
   MergeJoin = 'MergeJoin',
+  KeySetSemiJoin = 'KeySetSemiJoin',  // Semi join that materializes the key set, then multi-seeks the target with it
+
   AsofScan = 'AsofScan',            // Streaming asof join: per left row, latest right with key ≤ left's
   OrdinalSlice = 'OrdinalSlice',    // O(log N) seek to kth row over a monotonic, ordinal-seek-capable leaf
   Materialize = 'Materialize',      // Materialize intermediate results
