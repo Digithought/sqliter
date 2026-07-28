@@ -11,7 +11,8 @@ import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { operandCollation } from '../../analysis/comparison-collation.js';
-import { normalizeCollationName } from '../../../util/comparison.js';
+import { normalizeCollationName, semanticOrderingsAgree } from '../../../util/comparison.js';
+import type { LogicalType } from '../../../types/logical-type.js';
 
 export interface EquiPairExtraction {
 	equiPairs: EquiJoinPair[];
@@ -154,6 +155,21 @@ export function combineResidual(
  * doesn't fire and the generic join evaluates the whole condition. (Tickets
  * `collation-blind-equality-fact-extraction`,
  * `join-key-collation-resolution-alignment`.)
+ *
+ * **Semantic-ordering gate.** A pair is likewise recognized only when both sides
+ * agree on semantic ordering — neither declares a semantic-ordering logical type,
+ * or both declare the SAME one ({@link semanticOrderingsAgree}). A MIXED pair
+ * (`timespan_col = text_col`) is what `=` evaluates through its generic path's
+ * runtime duration check, so it matches 'PT1H' against 'PT60M'; a physical join
+ * key comparing raw text would silently drop that row. The gate DECLINES rather
+ * than canonicalizing the key, because merge join also needs both inputs
+ * physically sorted in its comparator's order and a `timespan` side is sorted by
+ * elapsed time while a `text` side is sorted by text — no single comparator merges
+ * those two orders, so canonicalizing would fix hash join and leave merge join
+ * unsound. Declined pairs demote to the residual (or, for USING, sink the whole
+ * extraction) and the `=` operator's own semantics apply. See `docs/types.md`
+ * § "Semantic ordering"; ticket
+ * `mixed-type-equi-join-key-drops-semantic-matches`.
  */
 export function extractEquiPairs(
 	condition: ScalarPlanNode | undefined,
@@ -178,7 +194,8 @@ export function extractEquiPairs(
 		let isEqui = false;
 		if (n instanceof BinaryOpNode && n.expression.operator === '=') {
 			if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode
-				&& operandCollation(n.left) === operandCollation(n.right)) {
+				&& operandCollation(n.left) === operandCollation(n.right)
+				&& semanticOrderingsAgree(n.left.getType().logicalType, n.right.getType().logicalType)) {
 				const lId = n.left.attributeId;
 				const rId = n.right.attributeId;
 
@@ -207,18 +224,31 @@ export function extractEquiPairs(
 }
 
 /**
+ * The slice of an {@link import('../../nodes/plan-node.js').Attribute} the USING
+ * extractor reads. Structural rather than the full `Attribute` so tests can pass a
+ * literal; both production call sites pass real attributes.
+ */
+type UsingAttr = {
+	id: number;
+	name: string;
+	type?: { collationName?: string; logicalType?: LogicalType };
+};
+
+/**
  * Convert USING-column names into equi-pairs given the left/right attributes.
  * Returns null if no pairs could be matched.
  *
- * Applies the same matched-collation gate as {@link extractEquiPairs}: a
- * USING pair over columns with differing declared collations is rejected
- * outright (USING has no residual to demote into — the whole extraction
- * returns null so the generic join handles the condition).
+ * Applies the same matched-collation and semantic-ordering gates as
+ * {@link extractEquiPairs}: a USING pair over columns with differing declared
+ * collations, or with disagreeing semantic ordering (one side `timespan`, the
+ * other plain `text`), is rejected outright (USING has no residual to demote
+ * into — the whole extraction returns null so the generic join handles the
+ * condition).
  */
 export function extractEquiPairsFromUsing(
 	usingColumns: readonly string[] | undefined,
-	leftAttrs: ReadonlyArray<{ id: number; name: string; type?: { collationName?: string } }>,
-	rightAttrs: ReadonlyArray<{ id: number; name: string; type?: { collationName?: string } }>,
+	leftAttrs: ReadonlyArray<UsingAttr>,
+	rightAttrs: ReadonlyArray<UsingAttr>,
 ): EquiPairExtraction | null {
 	if (!usingColumns || usingColumns.length === 0) return null;
 	const equiPairs: EquiJoinPair[] = [];
@@ -230,6 +260,7 @@ export function extractEquiPairsFromUsing(
 			const lColl = normalizeCollationName(leftAttr.type?.collationName ?? 'BINARY');
 			const rColl = normalizeCollationName(rightAttr.type?.collationName ?? 'BINARY');
 			if (lColl !== rColl) return null;
+			if (!semanticOrderingsAgree(leftAttr.type?.logicalType, rightAttr.type?.logicalType)) return null;
 			equiPairs.push({ leftAttrId: leftAttr.id, rightAttrId: rightAttr.id });
 		}
 	}

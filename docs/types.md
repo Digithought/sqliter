@@ -269,13 +269,36 @@ order-dependent — a NULL wipes the running minimum, so `least(1, null, 3)` is 
 Pinned by `test/logic/24-builtin-branches.sqllogic` and tracked as
 `tickets/backlog/bug-least-null-handling-order-dependent`.
 
-One surface does **not** yet follow the rule, because it compares without any
-type context:
+**Join keys: the mixed-pair rule.** A physical equi-join key (hash / bloom / merge)
+compares with no type context, so it can only carry a pair whose two sides agree on
+semantic ordering — either neither declares a semantic-ordering type, or both declare
+the SAME one. A **mixed** pair, `timespan_col = text_col`, is inadmissible: `=` runs
+its generic path's runtime duration check and matches 'PT1H' against 'PT60M', which a
+raw-text hash key or merge co-walk does not. The equi-pair extractor
+(`planner/rules/join/equi-pair-extractor.ts`) declines such a pair, demoting it to the
+join's residual predicate — or, for `using (…)`, sinking the whole extraction to the
+generic nested-loop join — so the `=` operator's own semantics decide the match. The
+cost is that a rare shape drops to nested-loop; losing rows is worse.
 
-- A **join key pairing a semantic-ordering column with a plain one** —
-  `timespan_col = text_col` — matches on raw text in the hash and merge join
-  algorithms, so `from a join b on a.d = b.s` drops rows that the same predicate in
-  a `where` clause returns. Tracked as `tickets/fix/mixed-type-equi-join-key-drops-semantic-matches`.
+Declining rather than canonicalizing the key is deliberate. Merge join needs both
+inputs physically sorted in its comparator's order, and a `timespan` side is sorted by
+elapsed time while a `text` side is sorted by text — no single comparator merges those
+two orders, so canonicalizing would fix hash join and leave merge join unsound.
+Canonicalizing also introduces a false-positive hazard: TIMESPAN's `groupKey` returns a
+*number*, so a `timespan` ↔ `integer` pair would hash-match values `=` reports unequal.
+
+`using (k)` is the same equality, so the generic join's USING comparison routes through
+`makeOperandComparator` — the one copy of the comparison routing rule `=` uses — and a
+mixed USING pair matches exactly what `=` matches. One gap remains: USING skips the
+plan-time cross-type coercion `=` gets, so a JSON column joined `using` a TEXT column
+still compares OBJECT against TEXT and never matches. Tracked as
+`tickets/backlog/bug-using-join-skips-cross-type-coercion`.
+
+**AS OF** match/partition columns are the one surface that still does **not** follow the
+rule: they compare by storage class + collation. Correct for the canonical AS OF column
+types (DATE/DATETIME, whose ISO text order is their semantic order), wrong for a TIMESPAN
+or JSON match column. AS OF has no residual to demote into, so the join gate does not
+apply. Tracked as `tickets/backlog/bug-asof-match-column-ignores-semantic-ordering`.
 
 Hash-keyed identity (GROUP BY, window PARTITION BY, hash-join build/probe) cannot
 call `compare` pairwise, so a semantic-ordering type whose stored form is not

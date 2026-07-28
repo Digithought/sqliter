@@ -5,9 +5,11 @@ import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
 import type { Row, SubProgram, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
-import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
+import { BINARY_COLLATION } from '../../util/comparison.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
+import { makeOperandComparator, type OperandComparator } from './operand-comparator.js';
+import { ANY_TYPE } from '../../types/builtin-types.js';
 
 import { createRowSlot } from '../context-helpers.js';
 import { joinOutputRow } from './join-output.js';
@@ -38,10 +40,13 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 	const rightAttributes = plan.right.getAttributes();
 	const rightRowDescriptor = buildRowDescriptor(rightAttributes);
 
-	// Pre-resolve USING column indices and collation-based comparators at emit time.
-	// USING compares the two sides' same-named columns, so each pair resolves
-	// through the shared provenance lattice — `using (k)` agrees with the
-	// spelled-out `l.k = r.k` regardless of side order.
+	// Pre-resolve USING column indices and per-column comparators at emit time.
+	// USING compares the two sides' same-named columns, so each pair resolves its
+	// collation through the shared provenance lattice — `using (k)` agrees with the
+	// spelled-out `l.k = r.k` regardless of side order — and its comparator through
+	// `makeOperandComparator`, the one copy of the routing rule `emitComparisonOp`
+	// uses, so the two also agree on declared-type semantics (see
+	// {@link evaluateUsingCondition}).
 	const usingResolved = plan.usingColumns?.map(columnName => {
 		const lowerName = columnName.toLowerCase();
 		const leftIndex = leftAttributes.findIndex(attr => attr.name.toLowerCase() === lowerName);
@@ -51,7 +56,11 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 		const collationFunc = leftType && rightType
 			? ctx.resolveCollation(effectiveCollationOfTypes(leftType, rightType))
 			: BINARY_COLLATION;
-		return { leftIndex, rightIndex, collationFunc };
+		const compare = makeOperandComparator(
+			leftType?.logicalType ?? ANY_TYPE,
+			rightType?.logicalType ?? ANY_TYPE,
+			collationFunc);
+		return { leftIndex, rightIndex, compare };
 	});
 
 	// Existence (`exists … as`) flags appended after both sides. The flag is the
@@ -237,29 +246,37 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 type ResolvedUsingColumn = {
 	leftIndex: number;
 	rightIndex: number;
-	collationFunc: (a: string, b: string) => number;
+	compare: OperandComparator;
 };
 
 /**
- * Evaluates USING condition using pre-resolved column indices and collation functions.
- * All index lookups and collation resolution are done at emit time.
- * Uses compareSqlValuesFast for safe cross-type comparison.
+ * Evaluates a USING condition from pre-resolved column indices and comparators.
+ * All index lookups, collation resolution and comparator routing happen at emit time.
  *
- * NOTE: USING equality is storage-class + collation, not semantic-ordering-aware —
- * a TIMESPAN USING column treats 'PT1H'/'PT60M' as distinct where `l.d = r.d`
- * treats them equal. Fine while USING on semantic-ordering columns stays unused;
- * if it shows up, resolve per-column comparators like emitMergeJoin does.
+ * `using (k)` means exactly `l.k = r.k`, so each column compares through
+ * {@link makeOperandComparator} — the one copy of the routing rule
+ * `emitComparisonOp` uses. A USING column pairing a semantic-ordering type with a
+ * plain one (TIMESPAN `d` against TEXT `d`) therefore takes the same runtime
+ * duration check `=` takes and reports 'PT1H' ≡ 'PT60M'; a same-type pair takes the
+ * type's own compare. There is deliberately no NULL short-circuit here:
+ * `makeOperandComparator` reports 0 for a NULL/NULL pair on every branch, exactly as
+ * the `compareSqlValuesFast` call it replaced did, so NULL behavior is unchanged by
+ * the swap.
+ *
+ * NOTE: USING skips the plan-time cross-type coercion `=` gets, so a JSON column
+ * paired with a TEXT one still compares as OBJECT-vs-TEXT storage classes and never
+ * matches. Tracked as `bug-using-join-skips-cross-type-coercion`.
  */
 function evaluateUsingCondition(
 	leftRow: Row,
 	rightRow: Row,
 	resolved: readonly ResolvedUsingColumn[]
 ): boolean {
-	for (const { leftIndex, rightIndex, collationFunc } of resolved) {
+	for (const { leftIndex, rightIndex, compare } of resolved) {
 		if (leftIndex === -1 || rightIndex === -1) {
 			return false;
 		}
-		if (compareSqlValuesFast(leftRow[leftIndex], rightRow[rightIndex], collationFunc) !== 0) {
+		if (compare(leftRow[leftIndex], rightRow[rightIndex]) !== 0) {
 			return false;
 		}
 	}

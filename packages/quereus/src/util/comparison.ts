@@ -535,6 +535,40 @@ export function comparisonSemanticsDiffer(a: LogicalType, b: LogicalType): boole
 }
 
 /**
+ * True when two declared logical types may share ONE physical equi-join key — i.e. when
+ * comparing their values with a single type-blind comparator (a serialized hash key, a
+ * merge co-walk) reproduces what `=` says about them.
+ *
+ * The admissible shapes are "neither side declares a semantic-ordering type" or "both
+ * declare the SAME one". A **mixed** pair (`timespan` ↔ `text`) is the defect this gates:
+ * `=` runs the generic comparison path, which applies a runtime duration check whenever
+ * either side is temporal, so 'PT1H' = 'PT60M'; a hash or merge join comparing raw text
+ * disagrees and silently drops the row. Merge join cannot be rescued by canonicalizing
+ * the key either — it needs both inputs physically sorted in its comparator's order, and
+ * a `timespan` side is sorted by elapsed time while a `text` side is sorted by text, so
+ * no single comparator merges the two. Declining is the only sound answer; the pair
+ * demotes to the residual / generic join, where `=`'s own semantics apply.
+ *
+ * NOT {@link comparisonSemanticsDiffer}, which asks a different question (may an ordered
+ * structure keyed under `a` be reused under `b`) by comparing `compare` identity. EVERY
+ * builtin type carries its own `compare`, so that predicate reports "differ" for an
+ * ordinary `integer` ↔ `real` join key and would cost a hash join for no correctness
+ * gain. This one keys on the `semanticOrdering` flag, which is exactly the set of types
+ * whose order is not reproducible from storage class + collation.
+ *
+ * See `docs/types.md` § "Semantic ordering".
+ */
+export function semanticOrderingsAgree(
+	a: LogicalType | undefined,
+	b: LogicalType | undefined,
+): boolean {
+	const semA = hasSemanticOrdering(a);
+	const semB = hasSemanticOrdering(b);
+	if (!semA && !semB) return true;
+	return semA && semB && a === b;
+}
+
+/**
  * Canonical key-identity transform for a declared logical type, or undefined when raw
  * values already key faithfully. Defined exactly when the type carries semantic ordering
  * AND a `groupKey` hook (TIMESPAN — its stored text is not canonical for equality:

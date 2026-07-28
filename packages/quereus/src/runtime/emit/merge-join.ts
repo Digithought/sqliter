@@ -83,7 +83,13 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 		// JSON), advance/match under the type's compare — the inputs are sorted by it
 		// (Sort and index order are typed since the semantic-ordering change), so a
 		// collation/text compare here would advance the wrong side and drop matches.
-		// Mixed or plain pairs keep the storage-class + collation compare.
+		// Plain pairs (neither side semantic-ordering) keep the storage-class +
+		// collation compare. LOCKSTEP: a MIXED pair never arrives —
+		// `equi-pair-extractor`'s semantic-ordering gate declines it, because merge
+		// needs both inputs sorted in THIS comparator's order and a `timespan` side is
+		// sorted by elapsed time while a `text` side is sorted by text, so no single
+		// comparator merges them. That is why the gate declines rather than
+		// canonicalizing; see its docstring.
 		const leftLogical = leftAttributes[li].type.logicalType;
 		const rightLogical = rightAttributes[ri].type.logicalType;
 		keyComparators.push(leftLogical === rightLogical && hasSemanticOrdering(leftLogical)

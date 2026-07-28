@@ -224,6 +224,108 @@ select dt.id as l, jt2.id as r from dt join jt2 on dt.d = jt2.d order by l;
 drop table jt2;
 drop table dt;
 
+-- === Mixed-type equi-join keys agree with `=` ===
+--
+-- A join key pairing a semantic-ordering column with a plain one is not a valid
+-- PHYSICAL key: hash/bloom serialize the raw text and merge co-walks two
+-- incompatible orders (elapsed time on one side, text on the other), so both drop
+-- matches that `=` makes. The equi-pair extractor declines such a pair, demoting it
+-- to the residual — or, for USING, sinking the whole extraction — so the generic
+-- join evaluates it with the `=` operator's own semantics. Every spelling below
+-- must therefore agree with the `where` form.
+-- Regression for `mixed-type-equi-join-key-drops-semantic-matches` (all the `on` /
+-- `using` / `exists` forms previously returned no rows).
+
+create table mxa (id integer primary key, d timespan);
+create table mxb (id integer primary key, s text);
+insert into mxa values (1, 'PT1H'), (2, 'PT30M');
+insert into mxb values (10, 'PT60M'), (20, 'PT45M');
+
+-- Baseline: the comparison in a `where` clause has always matched.
+select mxa.id as l, mxb.id as r from mxa cross join mxb where mxa.d = mxb.s;
+→ [{"l":1,"r":10}]
+
+-- The same comparison spelled as an ON condition must agree.
+select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s;
+→ [{"l":1,"r":10}]
+
+-- Flipped operand order resolves to the same pair.
+select mxa.id as l, mxb.id as r from mxa join mxb on mxb.s = mxa.d;
+→ [{"l":1,"r":10}]
+
+-- Correlated EXISTS (planned as a semi-join over the same extraction).
+select id from mxa where exists (select 1 from mxb where mxb.s = mxa.d);
+→ [{"id":1}]
+
+-- LEFT JOIN + null test: the unmatched left row must be the one whose elapsed time
+-- has no counterpart, not both of them.
+select mxa.id as l from mxa left join mxb on mxa.d = mxb.s where mxb.id is not null;
+→ [{"l":1}]
+
+select mxa.id as l from mxa left join mxb on mxa.d = mxb.s where mxb.id is null;
+→ [{"l":2}]
+
+drop table mxb;
+drop table mxa;
+
+-- USING over a mixed pair: `using (d)` means `l.d = r.d`, so the generic join's
+-- USING comparison routes through the same comparator the operator does.
+create table uma (id integer primary key, d timespan);
+create table umb (d text, tag text, primary key (d, tag));
+insert into uma values (1, 'PT1H');
+insert into umb values ('PT60M', 'y'), ('PT45M', 'n');
+
+select tag from umb join uma using (d);
+→ [{"tag":"y"}]
+
+select tag from uma join umb using (d);
+→ [{"tag":"y"}]
+
+drop table umb;
+drop table uma;
+
+-- Control: when BOTH sides declare TIMESPAN the pair IS admissible and keeps the
+-- physical (hash/merge) key path. These must stay green — a gate that
+-- over-declines would still answer correctly here but via nested loop, while a
+-- gate that broke the same-type path would drop the rows outright.
+create table sma (id integer primary key, d timespan);
+create table smb (id integer primary key, d timespan);
+insert into sma values (1, 'PT1H'), (2, 'PT30M');
+insert into smb values (10, 'PT60M'), (20, 'PT45M');
+
+select sma.id as l, smb.id as r from sma join smb on sma.d = smb.d;
+→ [{"l":1,"r":10}]
+
+select sma.id as l, smb.id as r from sma join smb using (d);
+→ [{"l":1,"r":10}]
+
+drop table smb;
+drop table sma;
+
+-- JSON ↔ TEXT counterpart. These already passed before the gate landed, for a
+-- structural reason worth pinning: `insertCrossTypeCoercion` wraps the text side in
+-- `cast(… as json)`, so the ON operand is a CastNode rather than a bare column
+-- reference and was never recognized as an equi-pair in the first place. If that
+-- coercion ever stops firing, the semantic-ordering gate is what must catch the
+-- pair instead — and these assertions are what notice.
+create table jma (id integer primary key, doc json);
+create table jmb (id integer primary key, s text);
+insert into jma values (1, '{"a":1}');
+insert into jmb values (10, '{ "a" : 1 }'), (20, '{"a":2}');
+
+select jma.id as l, jmb.id as r from jma cross join jmb where jma.doc = jmb.s;
+→ [{"l":1,"r":10}]
+
+select jma.id as l, jmb.id as r from jma join jmb on jma.doc = jmb.s;
+→ [{"l":1,"r":10}]
+
+-- No JSON ↔ TEXT `using` case here on purpose: USING skips cross-type coercion
+-- entirely, so the two sides still compare as OBJECT vs TEXT storage classes and
+-- match nothing. Tracked as `bug-using-join-skips-cross-type-coercion`.
+
+drop table jmb;
+drop table jma;
+
 -- === nullif / greatest / least route through declared semantic ordering ===
 --
 -- The three comparison builtins resolve their operand group's declared type and

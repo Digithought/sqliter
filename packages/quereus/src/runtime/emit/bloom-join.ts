@@ -58,7 +58,13 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 	// the join match (no re-verify), so values `=` treats as equal (TIMESPAN
 	// 'PT1H' ≡ 'PT60M') must serialize identically. Mirrors GROUP BY in
 	// hash-aggregate.ts; per equi-pair, active only when both sides declare the same
-	// semantic-ordering logical type with a groupKey hook.
+	// semantic-ordering logical type with a groupKey hook. LOCKSTEP: a MIXED pair
+	// (one side semantic-ordering, the other not) can no longer reach here —
+	// `equi-pair-extractor`'s semantic-ordering gate demotes it to the residual, so
+	// the `=` operator evaluates it in the generic join. Canonicalizing such a pair
+	// instead of declining would be unsound anyway (TIMESPAN's groupKey yields a
+	// NUMBER, which would hash-match a timespan-vs-integer pair that `=` calls
+	// unequal); see the gate's docstring.
 	const keyCanonicalizers = plan.equiPairs.map((_pair, i) => {
 		const leftLogical = leftAttributes[leftIndices[i]].type.logicalType;
 		const rightLogical = rightAttributes[rightIndices[i]].type.logicalType;
