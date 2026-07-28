@@ -203,22 +203,33 @@ error, not as this message.
 - code: `packages/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts` — `fallbackIndexSupports`
 - code: `packages/quereus/src/planner/rules/predicate/rule-predicate-pushdown.ts`
 - guard: `packages/quereus/test/optimizer/remote-grow-retrieve.spec.ts` — `Retrieve growth with supports() (remote query)`
-- guard: `packages/quereus/test/filter-lost-under-index-order.spec.ts` — `Filter conjunct lost under index ordering`
 - doc: [Retrieve § Supported-only placement policy](optimizer-retrieve.md#supported-only-placement-policy)
 
 Everything beneath a `RetrieveNode` is an operation the module committed to executing —
 `supports()` accepted the candidate pipeline, or the index-style `getBestAccessPlan()`
 fallback did. Anything else stays above the boundary as a residual. Both rules that move work
 across the boundary construct a supported-only fragment and leave the remainder above;
-neither pushes a predicate speculatively, and neither pushes into a `Retrieve` whose
-index-style `moduleCtx` is already committed (that context, not `Retrieve.source`, is what
-`rule-select-access-path` physicalizes, so a fragment placed below the boundary afterwards
-would silently never execute). Growth over a `supports()` module is purely
+neither pushes a predicate speculatively. Growth over a `supports()` module is purely
 structural; the index-style fallback additionally demands the access plan beat a sequential
 scan, or provide the required ordering, before `fallbackIndexSupports` returns an assessment.
 Either way the decision is a function of the plan alone, so a given plan always reaches the
 same segment boundary — which is what makes the later join-enumeration cost comparisons
 meaningful.
+
+### OPT-023 — Nothing is pushed into a Retrieve whose access path is committed
+
+- code: `packages/quereus/src/planner/rules/predicate/rule-predicate-pushdown.ts` — `isIndexStyleContext`
+- guard: `packages/quereus/test/filter-lost-under-index-order.spec.ts` — `Filter conjunct lost under index ordering`
+- doc: [Retrieve § Supported-only placement policy](optimizer-retrieve.md#supported-only-placement-policy)
+
+Once a `Retrieve` carries an index-style `moduleCtx`, that context — not `Retrieve.source` —
+is what `rule-select-access-path` physicalizes, so a fragment placed below the boundary
+afterwards would execute nowhere and the query would return unfiltered rows. Pushdown
+therefore declines outright and leaves the `Filter` above the boundary, where grow-retrieve
+re-probes `getBestAccessPlan()` with the constraint on the next fixed-point iteration and
+residualizes whatever the module declines — so nothing is lost by declining. `Retrieve.source`
+stays populated for the readers that still walk it (binding collection, and the constraint
+sweep in `trySortAbsorbViaIndexOrdering`); it is dead only as an *execution* channel.
 
 ### OPT-024 — An unconsumed seek constraint is reattached
 

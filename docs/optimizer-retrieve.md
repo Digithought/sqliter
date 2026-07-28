@@ -36,6 +36,7 @@ RetrieveNode
 ### Supported-only placement policy
 
 > **Invariant:** [OPT-022](invariants.md#opt-022--a-retrieve-pipeline-holds-only-supported-operations)
+> **Invariant:** [OPT-023](invariants.md#opt-023--nothing-is-pushed-into-a-retrieve-whose-access-path-is-committed)
 
 - **Pushdown rule**: When sliding a `Filter` down into a `Retrieve`, the optimizer:
   - Normalizes the predicate, extracts constraints for the `Retrieve` table, and constructs a supported-only predicate fragment.
