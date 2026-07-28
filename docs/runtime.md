@@ -172,27 +172,17 @@ import {
 import type { MyOperationNode } from '../../planner/nodes/my-operation-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
-import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode } from '../emitters.js';
+import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
 
 export function emitMyOperation(plan: MyOperationNode, ctx: EmissionContext): Instruction {
 	const sourceInstruction = emitPlanNode(plan.source, ctx);
 
-	// Create row descriptor for source attributes
-	const sourceRowDescriptor: RowDescriptor = [];
-	const sourceAttributes = plan.source.getAttributes();
-	sourceAttributes.forEach((attr, index) => {
-		sourceRowDescriptor[attr.id] = index;
-	});
-
-	// Create output row descriptor (if this node transforms attributes)
-	const outputRowDescriptor: RowDescriptor = [];
-	const outputAttributes = plan.getAttributes();
-	outputAttributes.forEach((attr, index) => {
-		outputRowDescriptor[attr.id] = index;
-	});
+	// Row descriptors for the source and, if this node transforms attributes, the output
+	const sourceRowDescriptor = buildRowDescriptor(plan.source.getAttributes());
+	const outputRowDescriptor = buildRowDescriptor(plan.getAttributes());
 
 	// Common run function pattern: streaming with row slot
 	async function* run(rctx: RuntimeContext, inputRows: AsyncIterable<Row>): AsyncIterable<Row> {
@@ -354,6 +344,21 @@ runtime by the off-by-default `QUEREUS_CONTEXT_STRICT` harness — see § Strict
 context-shadow test mode. The mirror **child-shadows-operator** direction is
 deliberately *not* checked: recency cannot distinguish a forgotten `reactivate()`
 from a correct newest write.
+
+### Filter conjunct early exit
+
+`emitFilter` (`runtime/emit/filter.ts`) splits a conjunctive predicate into its
+top-level `AND` conjuncts (`splitConjunctsOrdered` — source order, no cost
+reordering), compiles each as its own callback, and drops the row at the first
+conjunct that is not true. So `where cheap and expensive_udf()` pays for
+`expensive_udf()` only on rows `cheap` kept.
+
+No three-valued-logic reasoning is needed at that boundary: a filter keeps a row only
+when the predicate is *true*, and under `AND` a `false` **or** `NULL` conjunct
+rejects it either way — only evaluation counts change, never the row set. Splitting
+is top-level only; a nested `AND` (under `NOT`, inside `CASE`, below `OR`) still goes
+through `emitLogicalOp`. A single conjunct keeps the exact pre-split instruction;
+N > 1 is marked `[N conjuncts, early exit]` in the instruction note.
 
 ## Scheduler Execution Model
 
@@ -1505,21 +1510,20 @@ take the promise branch.
 
 #### Short-circuiting operators reuse this pattern
 
-`CASE` (`runtime/emit/case.ts`) and `AND`/`OR` (`runtime/emit/binary.ts`) both emit
-their deferrable operands as on-demand callbacks (`emitCallFromPlan`) and invoke only
-the branches SQL semantics require. Each `run` returns `MaybePromise<SqlValue>` and
-stays fully synchronous whenever the invoked callbacks resolve synchronously — the
-`instanceof Promise` branch above is taken only for a genuinely async branch (e.g. a
-scalar-subquery operand). Two consequences worth pinning:
+`CASE` (`emit/case.ts`), `AND`/`OR` (`emit/binary.ts`), and `Filter` conjuncts
+(`emit/filter.ts`) all emit their deferrable operands as on-demand callbacks
+(`emitCallFromPlan`) and invoke only what SQL semantics require. Each `run` returns
+`MaybePromise<SqlValue>` and stays synchronous whenever the callbacks do — the
+`instanceof Promise` branch above is taken only for a genuinely async operand (e.g. a
+scalar subquery). Two consequences worth pinning:
 
 - **`CASE` always short-circuits — no cost gate.** SQL evaluates `WHEN` clauses
-  left-to-right, stops at the first match, and evaluates *only* the selected result.
-  So every `WHEN`/`THEN`/`ELSE` is deferred unconditionally (the simple-`CASE` base
-  expr stays an eager param, evaluated once). A branch that would throw, divide by
-  zero, or run a subquery therefore never executes unless selected:
-  `select case when 1=1 then 'ok' else throwing_udf() end` returns `'ok'`.
-  `AND`/`OR`, by contrast, defer only a subquery-bearing right operand (perf, not
-  correctness — see `emitLogicalOp`).
+  left-to-right and evaluates *only* the selected result, so every
+  `WHEN`/`THEN`/`ELSE` defers unconditionally (the simple-`CASE` base expr stays an
+  eager param). A branch that would throw or run a subquery therefore never executes
+  unless selected: `select case when 1=1 then 'ok' else throwing_udf() end` returns
+  `'ok'`. `AND`/`OR` in scalar position, by contrast, defer only a subquery-bearing
+  right operand (perf, not correctness — see `emitLogicalOp`).
 - **The synchronous return matters beyond perf.** The materialized-view row-time
   projection gate (`compileSourceRowEvaluator` in
   `database-materialized-views-analysis.ts`) rejects a `Promise` result for a gated
