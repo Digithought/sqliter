@@ -1,6 +1,8 @@
 -- Dropping a UNIQUE index / constraint inside an open transaction must stop enforcing it
 -- for the rest of that transaction.
 --
+-- requires-capability: standalone-index-ddl
+--
 -- A `TransactionLayer` freezes its schema at construction and enforces UNIQUE off that frozen
 -- schema, so a `drop index` / `alter table … drop constraint` that ran after the layer forked
 -- used to keep rejecting rows against a constraint that no longer exists. The manager now hands

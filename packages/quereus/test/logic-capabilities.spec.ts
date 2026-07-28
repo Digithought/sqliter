@@ -233,5 +233,30 @@ describe('sqllogic capability directive', () => {
 			expect(missingCapability(required, new Set())).to.equal(INDEX_DDL);
 			expect(missingCapability(required, MEMORY_BACKEND_CAPABILITIES)).to.be.undefined;
 		});
+
+		// Pins the corpus-sweep ticket's result: files whose *subject* is index DDL (not
+		// merely a scenario that reaches for an index) carry the directive. A regression here
+		// means the sweep's annotations were lost or a file was renamed without updating them.
+		it('declares standalone-index-ddl on every file whose subject is index DDL', () => {
+			const subjectFiles = [
+				'06.3-schema.sqllogic',
+				'06.9.3-json-index-range-seek.sqllogic',
+				'10.1.3-ddl-drop-in-transaction.sqllogic',
+				'10.5-indexes.sqllogic',
+				'10.5.1-partial-indexes.sqllogic',
+				'10.5.2-expression-indexes.sqllogic',
+				'10.5.3-desc-index-ordering.sqllogic',
+				'10.5.4-composite-pk-index-update-phantom.sqllogic',
+				'10.5.5-index-name-uniqueness.sqllogic',
+				'47.3.1-upsert-conflict-index-derived-collation.sqllogic',
+				'drop-unique-index.sqllogic',
+			];
+
+			for (const file of subjectFiles) {
+				const content = fs.readFileSync(path.join(logicTestDir, file), 'utf-8');
+				const required = parseRequiredCapabilities(file, content);
+				expect([...required], `${file} should declare standalone-index-ddl`).to.include(INDEX_DDL);
+			}
+		});
 	});
 });

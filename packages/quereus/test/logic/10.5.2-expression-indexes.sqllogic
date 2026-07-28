@@ -3,6 +3,8 @@
 -- Quereus's parser accepts expressions in indexed-column lists, but the schema
 -- manager rejects them at index-build time. This fixture pins the rejection so
 -- that future support can flip the assertions in one place.
+--
+-- requires-capability: standalone-index-ddl
 
 -- =====================================================
 -- 1. Function-call expression in CREATE INDEX is rejected

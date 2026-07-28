@@ -1,6 +1,8 @@
 -- DROP INDEX on a UNIQUE index must also remove the synthesized
 -- UniqueConstraintSchema (tagged with derivedFromIndex). Without that, the
 -- mutation manager keeps enforcing the unique check after the index is gone.
+--
+-- requires-capability: standalone-index-ddl
 
 -- =====================================================
 -- 1. Happy path: DROP UNIQUE INDEX clears the uniqueness check

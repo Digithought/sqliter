@@ -2,6 +2,8 @@
 -- DESC indexes for output ordering. Companion to 40.1-pk-desc-direction (PK DESC)
 -- and 10.5-indexes (single-column DESC creation). Pins composite mixed-direction
 -- indexes, NULL ordering through DESC indexes, and range queries on DESC indexes.
+--
+-- requires-capability: standalone-index-ddl
 
 -- =====================================================
 -- 1. Single-column DESC index — descending traversal

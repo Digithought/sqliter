@@ -1,4 +1,6 @@
 -- schema-indexes.sqllogic - Testing schema() introspection for indexes
+--
+-- requires-capability: standalone-index-ddl
 
 CREATE TABLE products (
 	id INTEGER PRIMARY KEY,

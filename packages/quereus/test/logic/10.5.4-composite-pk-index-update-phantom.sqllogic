@@ -1,4 +1,7 @@
 -- 10.5.4-composite-pk-index-update-phantom.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
 -- Regression: a composite-PK table with a secondary index on a non-PK column.
 -- Updating (or deleting) the indexed column must drop the OLD index entry's
 -- primary key so a later seek of the OLD value yields no phantom row.

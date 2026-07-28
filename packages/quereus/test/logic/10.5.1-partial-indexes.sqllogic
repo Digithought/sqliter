@@ -3,6 +3,8 @@
 -- Quereus's parser accepts partial indexes; this fixture pins the runtime semantics:
 -- only rows matching the WHERE clause participate in the index, but query results must
 -- remain correct regardless of which rows the index covers.
+--
+-- requires-capability: standalone-index-ddl
 
 -- =====================================================
 -- 1. Basic partial index — rows outside WHERE still queryable

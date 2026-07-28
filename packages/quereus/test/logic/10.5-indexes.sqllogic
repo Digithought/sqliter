@@ -1,4 +1,6 @@
 -- indexes.sqllogic - Testing index creation and usage
+--
+-- requires-capability: standalone-index-ddl
 
 -- Setup base table for index testing
 CREATE TABLE idx_test (

@@ -1,5 +1,7 @@
 -- Index-derived UNIQUE enforcement collation via ON CONFLICT upsert.
 --
+-- requires-capability: standalone-index-ddl
+--
 -- Carved out of 47.3-upsert-conflict-target-collation: every other section of
 -- 47.3 enforces UNIQUE through a column- or table-level constraint, but this
 -- scenario derives its UNIQUE from a standalone `create unique index` whose key

@@ -1,4 +1,7 @@
 -- 10.5.5-index-name-uniqueness.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
 -- Index names are unique per schema, not per table (docs/sql-ddl.md §6.3).
 -- DROP INDEX / ALTER INDEX / sync all resolve an index by name alone, so a
 -- duplicate name would resolve by table-registration order.

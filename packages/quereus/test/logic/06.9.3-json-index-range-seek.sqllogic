@@ -8,6 +8,8 @@
 -- misread as a composite key tuple and every bound / prefix / NULL check compared
 -- against its first element.
 --
+-- requires-capability: standalone-index-ddl
+--
 -- Every query below is asserted against BOTH tables with the SAME expected rows,
 -- and the expectations agree with the `order by v` sequence at the end of section 1.
 -- No `using memory`, so store mode runs this too (the store encodes JSON key members
