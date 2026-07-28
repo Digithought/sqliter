@@ -14,6 +14,7 @@ import type { PhysicalProperties } from '../../src/planner/nodes/plan-node.js';
 import { FilterNode, DEFAULT_FILTER_SELECTIVITY } from '../../src/planner/nodes/filter.js';
 import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
 import { combineConjunctive, combineDisjunctive } from '../../src/planner/stats/selectivity-combine.js';
+import { CROSS_RELATION_INEQUALITY_SELECTIVITY } from '../../src/planner/rules/predicate/rule-filter-selectivity.js';
 import { Parser } from '../../src/parser/parser.js';
 import type { TableSchema } from '../../src/schema/table.js';
 import type * as AST from '../../src/parser/ast.js';
@@ -130,15 +131,147 @@ describe('rule-filter-selectivity (end-to-end through the optimizer)', () => {
 		expect(f!.physical?.estimatedRows).to.be.at.least(1);
 	});
 
-	it('leaves selectivity unstamped for a multi-table (join) filter source', async () => {
+	it('leaves an UN-ANALYZED join filter source unstamped (the statistics gate)', async () => {
 		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, age INTEGER) USING memory');
 		await db.exec("INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20)");
 		// `a.age > b.age` references both sides, so it cannot push to one table; the
-		// residual Filter sits over the join, where extractTableSchema declines.
+		// residual Filter sits over the join. Without ANALYZE there are no real
+		// statistics behind either relation, so the multi-relation path declines
+		// rather than stamping a fabricated naive number.
 		const f = optimizedFilter(db, 'SELECT * FROM t a JOIN t b ON a.id = b.id WHERE a.age > b.age');
 		if (f) {
-			expect(f.selectivity, 'join-source filter must not be stamped').to.be.undefined;
+			expect(f.selectivity, 'un-analyzed join-source filter must not be stamped').to.be.undefined;
 		}
+	});
+});
+
+describe('multi-relation filter selectivity (filter over a join)', () => {
+	let db: Database;
+	/** Distinct counts recorded by ANALYZE, keyed by `table.column`. */
+	let ndv: Record<string, number>;
+
+	beforeEach(async () => {
+		db = new Database();
+		// `o.qty` (3 values) and `o.rid` (20 values) have deliberately different
+		// distinct counts so a cross-relation equality on them is distinguishable
+		// from the single-table estimate a mis-attribution would produce.
+		await db.exec('CREATE TABLE o (id INTEGER PRIMARY KEY, cat TEXT, qty INTEGER, rid INTEGER) USING memory');
+		await db.exec('CREATE TABLE r (id INTEGER PRIMARY KEY, cat TEXT, qty INTEGER) USING memory');
+		// `u` is intentionally never ANALYZEd.
+		await db.exec('CREATE TABLE u (id INTEGER PRIMARY KEY, cat TEXT) USING memory');
+		for (let i = 1; i <= 100; i++) {
+			await db.exec(`INSERT INTO o VALUES (${i}, '${['a', 'b', 'c', 'd'][i % 4]}', ${i % 3}, ${1 + (i % 20)})`);
+		}
+		for (let i = 1; i <= 20; i++) {
+			await db.exec(`INSERT INTO r VALUES (${i}, '${['x', 'y', 'z'][i % 3]}', ${i % 5})`);
+			await db.exec(`INSERT INTO u VALUES (${i}, '${['p', 'q'][i % 2]}')`);
+		}
+		for await (const _ of db.eval('ANALYZE o')) { /* consume */ }
+		for await (const _ of db.eval('ANALYZE r')) { /* consume */ }
+
+		ndv = {};
+		for (const [tbl, cols] of [['o', ['cat', 'qty', 'rid']], ['r', ['cat', 'qty']]] as const) {
+			const stats = db.schemaManager.findTable(tbl)?.statistics;
+			expect(stats, `ANALYZE should record statistics for ${tbl}`).to.not.be.undefined;
+			for (const col of cols) {
+				const n = stats!.columnStats.get(col)?.distinctCount;
+				expect(n, `distinct count for ${tbl}.${col}`).to.be.a('number');
+				ndv[`${tbl}.${col}`] = n as number;
+			}
+		}
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('attributes each conjunct to its own table and combines the per-table estimates', () => {
+		// Neither conjunct can push below the join, so both live in one Filter above it.
+		const f = optimizedFilter(db, "SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.cat = 'a' AND r.cat = 'x'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+
+		const expected = combineConjunctive([1 / ndv['o.cat'], 1 / ndv['r.cat']]);
+		expect(f!.selectivity).to.be.closeTo(expected, 1e-12);
+		// The whole point: strictly better than the flat last-resort default.
+		expect(f!.selectivity).to.be.lessThan(DEFAULT_FILTER_SELECTIVITY);
+	});
+
+	it('estimates a cross-relation inequality with the uniform constant', () => {
+		const f = optimizedFilter(db, 'SELECT * FROM o a JOIN o b ON a.id = b.id WHERE a.qty > b.qty');
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(CROSS_RELATION_INEQUALITY_SELECTIVITY, 1e-12);
+	});
+
+	it('treats the two sides of a self-join as distinct relations', () => {
+		// `a.qty = b.rid` compares columns with different distinct counts. Attributing
+		// it to ONE relation (keying on TableSchema rather than on the table-reference
+		// identity) would yield 1/ndv(qty) — the estimate for "qty equals a constant".
+		// The cross-relation path yields 1/max(ndv(qty), ndv(rid)) instead.
+		const f = optimizedFilter(db, 'SELECT * FROM o a JOIN o b ON a.id = b.id WHERE a.qty = b.rid');
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+
+		const crossRelation = 1 / Math.max(ndv['o.qty'], ndv['o.rid']);
+		expect(f!.selectivity).to.be.closeTo(crossRelation, 1e-12);
+		expect(f!.selectivity, 'must not be the single-table estimate')
+			.to.not.be.closeTo(1 / ndv['o.qty'], 1e-9);
+	});
+
+	it('estimates an equi cross-relation conjunct in the WHERE from joinSelectivity', () => {
+		const f = optimizedFilter(db, 'SELECT * FROM o JOIN r ON o.id = r.id WHERE o.qty = r.qty');
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / Math.max(ndv['o.qty'], ndv['r.qty']), 1e-12);
+	});
+
+	it('counts only the analyzed side when the other table has no statistics', () => {
+		// `u` was never ANALYZEd, so its conjunct contributes nothing; the estimate is
+		// exactly the `o.cat` conjunct's, un-combined.
+		const f = optimizedFilter(db, "SELECT * FROM o JOIN u ON o.rid = u.id WHERE o.cat = 'a' AND u.cat = 'p'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / ndv['o.cat'], 1e-12);
+	});
+
+	it('leaves a predicate over a computed projection unstamped', () => {
+		// `o.qty + 1` is minted by the Project above the join, so it has no base-table
+		// origin and no column statistics to consult.
+		const f = optimizedFilter(db, 'SELECT o.qty + 1 AS s FROM o JOIN r ON o.rid = r.id WHERE o.qty + 1 = 3');
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		expect(f!.selectivity, 'computed-column predicate must not be stamped').to.be.undefined;
+	});
+
+	it('skips a join existence flag and estimates the remaining conjunct', async () => {
+		const db2 = new Database();
+		try {
+			await db2.exec('CREATE TABLE ec (cc INTEGER PRIMARY KEY, pr INTEGER NULL, cv INTEGER) USING memory');
+			await db2.exec('CREATE TABLE ep (pp INTEGER PRIMARY KEY, pv INTEGER) USING memory');
+			for (let i = 1; i <= 20; i++) {
+				await db2.exec(`INSERT INTO ec VALUES (${i}, ${i % 7}, ${i * 10})`);
+				await db2.exec(`INSERT INTO ep VALUES (${i}, ${i})`);
+			}
+			for await (const _ of db2.eval('ANALYZE ec')) { /* consume */ }
+			for await (const _ of db2.eval('ANALYZE ep')) { /* consume */ }
+
+			// `hasP` is an existence flag minted by the join, not a base column. Selecting
+			// it keeps it demanded so the probe is not recovered into a semi-join.
+			const f = optimizedFilter(db2,
+				'SELECT c.cc, hasP FROM ec c LEFT JOIN ep p ON p.pp = c.pr EXISTS RIGHT AS hasP WHERE hasP AND c.cv > 100');
+			expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+
+			// Only `c.cv > 100` was estimable; combineConjunctive of one value is that
+			// value, so the stamp must equal the single-table estimate for that conjunct.
+			const solo = optimizedFilter(db2, 'SELECT * FROM ec WHERE cv > 100 AND cc > 0');
+			expect(solo?.selectivity, 'baseline single-table estimate').to.be.a('number');
+			expect(f!.selectivity).to.be.closeTo(solo!.selectivity as number, 1e-12);
+		} finally {
+			await db2.close();
+		}
+	});
+
+	it('is idempotent: re-optimizing an already-stamped plan changes nothing', () => {
+		const sql = "SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.cat = 'a' AND r.cat = 'x'";
+		const plan = (db as unknown as { getPlan(s: string): PlanNode }).getPlan(sql);
+		const first = findFilter(plan);
+		expect(first?.selectivity, 'first pass should stamp').to.be.a('number');
+
+		const again = db.optimizer.optimize(plan, db);
+		const second = findFilter(again);
+		expect(second?.selectivity).to.equal(first!.selectivity);
 	});
 });
 
