@@ -38,7 +38,9 @@ describe('set-op-type-merge', () => {
 	});
 
 	it('rule 3: numeric promotion (never the CASE arms-differ-⇒-TEXT rule)', () => {
-		expectMerge(INTEGER_TYPE, REAL_TYPE, REAL_TYPE);
+		// NUMERIC, not REAL: neither branch is converted, so the advertised type must
+		// cover an unconverted bigint as well as a number.
+		expectMerge(INTEGER_TYPE, REAL_TYPE, NUMERIC_TYPE);
 		expectMerge(INTEGER_TYPE, NUMERIC_TYPE, NUMERIC_TYPE);
 		expectMerge(REAL_TYPE, NUMERIC_TYPE, NUMERIC_TYPE);
 	});
@@ -62,7 +64,7 @@ describe('set-op-type-merge', () => {
 		expect(mergeSetOpAdvertisedType(TEXT_TYPE, JSON_TYPE)).to.equal(ANY_TYPE);
 		// Non-converting merges advertise the merged type itself.
 		expect(mergeSetOpAdvertisedType(JSON_TYPE, JSON_TYPE)).to.equal(JSON_TYPE);
-		expect(mergeSetOpAdvertisedType(INTEGER_TYPE, REAL_TYPE)).to.equal(REAL_TYPE);
+		expect(mergeSetOpAdvertisedType(INTEGER_TYPE, REAL_TYPE)).to.equal(NUMERIC_TYPE);
 		expect(mergeSetOpAdvertisedType(NULL_TYPE, DATE_TYPE)).to.equal(DATE_TYPE);
 		expect(mergeSetOpAdvertisedType(DATE_TYPE, TEXT_TYPE)).to.equal(ANY_TYPE);
 	});
@@ -112,8 +114,8 @@ describe('SetOperationNode cross-branch output type', () => {
 	});
 
 	it('advertises the merged logical type, independent of arm order', () => {
-		expect(outputType(scalar(INTEGER_TYPE, false), scalar(REAL_TYPE, false)).logicalType).to.equal(REAL_TYPE);
-		expect(outputType(scalar(REAL_TYPE, false), scalar(INTEGER_TYPE, false)).logicalType).to.equal(REAL_TYPE);
+		expect(outputType(scalar(INTEGER_TYPE, false), scalar(REAL_TYPE, false)).logicalType).to.equal(NUMERIC_TYPE);
+		expect(outputType(scalar(REAL_TYPE, false), scalar(INTEGER_TYPE, false)).logicalType).to.equal(NUMERIC_TYPE);
 		expect(outputType(scalar(DATE_TYPE, false), scalar(TEXT_TYPE, false)).logicalType).to.equal(ANY_TYPE);
 		expect(outputType(scalar(NULL_TYPE, true), scalar(DATE_TYPE, false)).logicalType).to.equal(DATE_TYPE);
 	});

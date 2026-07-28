@@ -13,10 +13,11 @@
  *  1. Identical logical types → that type (registry singletons, identity compare).
  *  2. Either side is NULL → the other side's type (a `select null` branch is a
  *     valid member of every type and must not poison a well-typed union).
- *  3. Both numeric → the usual numeric promotion (NUMERIC ⊃ REAL ⊃ INTEGER),
- *     matching `BinaryOpNode.generateType` arithmetic promotion and
- *     `findCommonType` for polymorphic builtins. NOT the CASE rule ("arms differ
- *     ⇒ TEXT") — `1 union all 2.5` must stay numeric.
+ *  3. Both builtin numeric (and differing) → NUMERIC, whose value space
+ *     (`number | bigint`) covers both branches as they actually are — no branch
+ *     conversion needed. NOT the CASE rule ("arms differ ⇒ TEXT") — `1 union all
+ *     2.5` must stay numeric; and NOT arithmetic's INTEGER + REAL → REAL, which
+ *     describes one value, not a stream mixing both forms.
  *  4. Exactly one side object-physical (JSON today) → the object side's type,
  *     with the other operand marked `convert` — the same rule and direction
  *     `insertCrossTypeCoercion` applies to comparisons (casting the JSON side to
@@ -65,23 +66,24 @@ export function mergeSetOpColumnType(left: LogicalType, right: LogicalType): Set
 	if (left === NULL_TYPE) return { logicalType: right };
 	if (right === NULL_TYPE) return { logicalType: left };
 
-	// 3. Numeric promotion. NUMERIC (number|bigint) contains both INTEGER and
-	// REAL value spaces, so any pair involving it promotes to NUMERIC; otherwise
-	// the INTEGER/REAL pair promotes to REAL. A non-builtin numeric type has no
-	// principled promotion — fall through to ANY (rule 5) rather than guess.
-	// KNOWN DEFECT (ticket `set-op-numeric-promotion-skips-conversion`): rule 3
-	// promotes WITHOUT converting either branch, so a bigint INTEGER cell rides
-	// the advertised REAL into a REAL-declared column, skips the DML conversion
-	// (`buildRowCoercion` sees REAL === REAL) and is stored as a bigint — and a
-	// REAL-declared key throws out of `REAL_TYPE.compare`. Reachable today:
-	// `insert into t(v real) select 9007199254740993 union all select 2.5`.
-	// The fix is either to convert the differing branch (as rule 4 does) or to
-	// advertise a type the pair honestly inhabits; see the ticket.
+	// 3. Numeric promotion: any DIFFERING pair of builtin numerics advertises
+	// NUMERIC (rule 1 already consumed the identical pairs). NUMERIC's value
+	// space is `number | bigint` — it is the only builtin numeric type the
+	// unconverted mixed stream actually inhabits, so the claim holds with no
+	// branch conversion. A non-builtin numeric type has no principled promotion —
+	// fall through to ANY (rule 5) rather than guess.
+	//
+	// This deliberately DIVERGES from `BinaryOpNode.generateType` / `findCommonType`,
+	// which promote INTEGER + REAL to REAL. That is right for arithmetic: it yields
+	// ONE value in ONE form, and REAL describes it exactly. A set operation yields a
+	// STREAM MIXING BOTH forms — the branches are passed through untouched — and only
+	// NUMERIC describes that. Advertising REAL here would be a lie downstream trusts:
+	// `buildRowCoercion` skips conversion on an identity match, so a bigint would land
+	// unconverted in a REAL-declared column (ticket
+	// `set-op-numeric-promotion-skips-conversion`). Do not "restore consistency" by
+	// changing the arithmetic rules — they are correct as they stand.
 	if (left.isNumeric && right.isNumeric) {
-		if (isBuiltinNumeric(left) && isBuiltinNumeric(right)) {
-			if (left === NUMERIC_TYPE || right === NUMERIC_TYPE) return { logicalType: NUMERIC_TYPE };
-			return { logicalType: REAL_TYPE };
-		}
+		if (isBuiltinNumeric(left) && isBuiltinNumeric(right)) return { logicalType: NUMERIC_TYPE };
 		return { logicalType: ANY_TYPE };
 	}
 

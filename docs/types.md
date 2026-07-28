@@ -519,14 +519,20 @@ arms cannot change the result), OR-merging nullability alongside:
 1. **Identical logical types** → that type (the overwhelmingly common case).
 2. **Either side NULL** → the other side's type — a `select null` branch is a
    valid member of every type and must not poison a well-typed union.
-3. **Both numeric** → the usual promotion (NUMERIC ⊃ REAL ⊃ INTEGER) — the same
-   promotion arithmetic (`BinaryOpNode.generateType`) and polymorphic builtins
-   (`findCommonType`) apply. Deliberately *not* CASE's "arms differ ⇒ TEXT":
-   `1 union all 2.5` stays numeric. **Known defect:** unlike rule 4, rule 3
-   converts neither branch, so a bigint from the INTEGER arm rides the
-   advertised REAL past the DML skip rule and is stored unconverted in a
-   REAL-declared column (a REAL-declared key then throws) — ticket
-   `set-op-numeric-promotion-skips-conversion`.
+3. **Both builtin numeric** (and differing — rule 1 already took the identical
+   pairs) → `NUMERIC`, whatever the pair. Deliberately *not* CASE's "arms differ
+   ⇒ TEXT": `1 union all 2.5` stays numeric. Also deliberately *not* the
+   `INTEGER + REAL → REAL` promotion arithmetic (`BinaryOpNode.generateType`) and
+   polymorphic builtins (`findCommonType`) use — because unlike rule 4, rule 3
+   converts **neither branch**. Arithmetic yields one value in one form, which
+   `REAL` describes exactly; a set operation yields a *stream mixing both* forms
+   (`number` from the REAL arm, `bigint` from the INTEGER arm), and only
+   `NUMERIC` — whose value space is `number | bigint` — describes that. Claiming
+   `REAL` was a lie the DML skip rule believed: a bigint rode it unconverted into
+   a `real`-declared column, and a `real`-declared key then threw out of
+   `REAL_TYPE.compare`. Because no branch is converted, the read side is
+   untouched: `select <big int> union all select 2.5` still returns each row in
+   its own storage class, matching SQLite.
 4. **Exactly one side object-physical** (JSON today) → the object side's type,
    and the construction factory (`SetOperationNode.create`) wraps the other
    branch in a *lenient* CAST so it actually produces that type — the same rule

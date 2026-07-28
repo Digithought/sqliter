@@ -111,8 +111,9 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
    * Resolve each DATA column's cross-input output metadata:
    *
    * **Logical type** — the symmetric merge (`mergeSetOpAdvertisedType`): identical
-   * types keep theirs, NULL yields to the other side, numerics promote
-   * (INTEGER ∪ REAL → REAL), and an irreconcilable pair advertises ANY. A rule-4
+   * types keep theirs, NULL yields to the other side, differing builtin numerics
+   * merge to NUMERIC (whose `number | bigint` value space covers both branches
+   * unconverted), and an irreconcilable pair advertises ANY. A rule-4
    * pair (object-physical vs other) also collapses to ANY *here*, because this
    * node performs no conversion itself — {@link SetOperationNode.create} aligns
    * such operands with a lenient CAST up front, so an aligned tree lands on the

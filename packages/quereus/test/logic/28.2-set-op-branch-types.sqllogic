@@ -132,3 +132,65 @@ select json_quote(x) as q from sobt_v order by 1;
 
 select j from sobt_j union select '"9"' union select '"abc"';
 → [{"j":"abc"},{"j":"9"}]
+
+-- ============================================================
+-- Mixed whole-number/decimal branches (ticket
+-- set-op-numeric-promotion-skips-conversion). Neither branch is converted, so
+-- the merge advertises NUMERIC — a type the mixed stream genuinely inhabits —
+-- rather than REAL, which the DML write pass would have believed and skipped
+-- conversion for. Small integers cannot discriminate (both internal forms
+-- coincide) and the harness normalizes BigInt to Number before comparing rows,
+-- so the stored-form assertions all go through `cast(v as text)`.
+-- ============================================================
+
+create table sobt_r (id integer primary key, v real);
+
+-- Baseline: a direct insert converts to the REAL (floating point) form, which
+-- rounds 2^53+1 down to 2^53.
+insert into sobt_r values (1, 9007199254740993);
+-- run
+
+select cast(v as text) as t from sobt_r;
+→ [{"t":"9007199254740992"}]
+
+-- Whole-number arm on the LEFT: the REAL column must store exactly what the
+-- direct insert stored.
+delete from sobt_r;
+insert into sobt_r (id, v) select 1, 9007199254740993 union all select 2, 2.5;
+-- run
+
+select cast(v as text) as t from sobt_r order by id;
+→ [{"t":"9007199254740992"},{"t":"2.5"}]
+
+-- Whole-number arm on the RIGHT: same result — the merge is order-independent.
+delete from sobt_r;
+insert into sobt_r (id, v) select 2, 2.5 union all select 1, 9007199254740993;
+-- run
+
+select cast(v as text) as t from sobt_r order by id;
+→ [{"t":"9007199254740992"},{"t":"2.5"}]
+
+-- A REAL-declared KEY fed by the same mix: an unconverted bigint used to reach
+-- REAL_TYPE.compare and throw ("Cannot convert a BigInt value to a number").
+create table sobt_rk (v real primary key);
+insert into sobt_rk (v) select 9007199254740993 union all select 2.5;
+-- run
+
+select cast(v as text) as t from sobt_rk order by v;
+→ [{"t":"2.5"},{"t":"9007199254740992"}]
+
+-- A NUMERIC-declared KEY: conversion IS legitimately skipped here (NUMERIC holds
+-- both forms), so the bigint reaches NUMERIC_TYPE.compare and must be ordered,
+-- not rejected (ticket numeric-comparator-rejects-bigint), and stored intact.
+create table sobt_nk (v numeric primary key);
+insert into sobt_nk (v) select 9007199254740993 union all select 2.5;
+-- run
+
+select cast(v as text) as t from sobt_nk order by v;
+→ [{"t":"2.5"},{"t":"9007199254740993"}]
+
+-- READ side is untouched by this fix: each row keeps its own storage class
+-- through a compound select (as SQLite does), so a big whole number does NOT
+-- get rounded on the way out.
+select cast(v as text) as t from (select 9007199254740993 as v union all select 2.5) as s;
+→ [{"t":"9007199254740993"},{"t":"2.5"}]
