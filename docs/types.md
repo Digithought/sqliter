@@ -299,12 +299,24 @@ UNKNOWN) and the hash path (which never inserts NULL keys). The nested-loop emit
 needs its own guard for that: the comparators it routes through are *ordering*
 functions, and ordering ranks NULL/NULL as equal.
 
-One surface still does **not** follow the rule.
+Two surfaces still do **not** follow the rule — one observable, one latent.
 
 **AS OF** match/partition columns compare by storage class + collation. Correct for the canonical AS OF column
 types (DATE/DATETIME, whose ISO text order is their semantic order), wrong for a TIMESPAN
 or JSON match column. AS OF has no residual to demote into, so the join gate does not
 apply. Tracked as `tickets/backlog/bug-asof-match-column-ignores-semantic-ordering`.
+
+**Filter-level equality facts.** `extractEqualityFds`
+(`planner/util/fd-utils.ts`) mints the same value-level claims from `where`
+equalities — mirror FDs and an EC pair from `col1 = col2`, an `∅ → col` FD plus a
+constant binding from `col = literal` — and gates on collation only. Both claims are
+false for a semantic-ordering operand: `where d = 'PT60M'` also matches rows storing
+`'PT1H'`, so `d` is not pinned to one value. No consumer turns those facts into a
+wrong answer today (probed across constant substitution, `distinct`, `group by`,
+`order by` transfer, IN/EXISTS and transitive two-conjunct pins), which is why the
+gate has not been added: declining every pin on a TIMESPAN/JSON column would cost
+real optimizations for no present correctness gain. Tracked as
+`tickets/backlog/debt-filter-equality-facts-ignore-semantic-ordering`.
 
 Hash-keyed identity (GROUP BY, window PARTITION BY, hash-join build/probe) cannot
 call `compare` pairwise, so a semantic-ordering type whose stored form is not
