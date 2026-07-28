@@ -130,8 +130,12 @@ export function effectiveCollationOfTypes(left: ScalarType, right: ScalarType, e
  * same-rank explicit/declared conflict (normally unreachable past plan-time
  * validation in `BinaryOpNode.generateType`).
  */
-export function effectiveComparisonCollation(left: ScalarPlanNode, right: ScalarPlanNode): string {
-	return effectiveCollationOfTypes(left.getType(), right.getType());
+export function effectiveComparisonCollation(
+	left: ScalarPlanNode,
+	right: ScalarPlanNode,
+	expr?: AST.Expression,
+): string {
+	return effectiveCollationOfTypes(left.getType(), right.getType(), expr);
 }
 
 /**

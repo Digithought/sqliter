@@ -138,7 +138,9 @@ function insertCrossTypeCoercion(
  * Scoped to the object-physical pairing on purpose. The numeric ↔ textual arm has
  * never been applied to either site (`int_col in ('1')` is false today for the same
  * underlying reason), and turning it on here would change unrelated behavior; that
- * case is tracked separately.
+ * case is tracked by `bug-numeric-text-coercion-skips-in-and-case`. Note `=` and
+ * BETWEEN DO apply it, so those two forms currently disagree with IN / simple CASE
+ * on a numeric column compared against a numeric-looking string.
  *
  * The probe is shared by every value, so it is wrapped at most once — if any value
  * is object-physical while the probe is not, the probe is cast first and the values

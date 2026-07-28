@@ -11,6 +11,46 @@ import { formatOperandCollationNote, makeOperandComparator, type OperandComparat
 /** On-demand branch callback — evaluates its sub-expression only when invoked. */
 type BranchFn = (ctx: RuntimeContext) => MaybePromise<SqlValue>;
 
+/** Per-WHEN-clause comparison setup of a simple CASE; both arrays are empty for a searched CASE. */
+interface WhenComparison {
+	readonly collationNames: string[];
+	readonly comparators: OperandComparator[];
+}
+
+/**
+ * Resolve how each WHEN clause of a simple CASE decides its match: `case base when v`
+ * decides exactly as `base = v` does. The collation comes from the shared provenance
+ * lattice (explicit COLLATE > declared column collation > defaults > BINARY), and the
+ * routing between the declared type's own compare / storage-class compare / runtime
+ * temporal check is the one shared with BETWEEN and `=` (see operand-comparator.ts).
+ * Without this, `case n when 'BOB'` compared raw bytes and disagreed with `n = 'BOB'`
+ * on a NOCASE column and on semantic-ordering types like TIMESPAN.
+ *
+ * Resolution is INDEPENDENT per clause (mirroring BETWEEN's two bounds, not IN's single
+ * merged collation), so two differently-collated WHEN operands are not a conflict with
+ * each other. A genuine conflict — explicit COLLATE on the base AND a different explicit
+ * COLLATE on a WHEN operand — throws, exactly as `=` throws for the same operand pair.
+ *
+ * NOTE: that throw happens at emit time, where `=` validates in `BinaryOpNode.generateType`.
+ * Both surface inside `db.prepare` today (even a fully-constant CASE is emitted so the
+ * folder can evaluate it). If a rule ever rewrites a `CaseExprNode` away without emitting
+ * it, move this resolution into `CaseExprNode.generateType` and read the cached result here.
+ */
+function resolveWhenComparison(plan: CaseExprNode, ctx: EmissionContext): WhenComparison {
+	const base = plan.baseExpr;
+	if (!base) return { collationNames: [], comparators: [] };
+
+	const baseLogical = base.getType().logicalType;
+	const collationNames = plan.whenThenClauses.map(
+		clause => effectiveComparisonCollation(base, clause.when, plan.expression));
+	const comparators = plan.whenThenClauses.map((clause, i) => makeOperandComparator(
+		baseLogical,
+		clause.when.getType().logicalType,
+		ctx.resolveCollation(collationNames[i]),
+	));
+	return { collationNames, comparators };
+}
+
 export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruction {
 	// CASE must ALWAYS short-circuit: SQL evaluates WHEN clauses left-to-right,
 	// stops at the first match, and evaluates ONLY the selected result. An
@@ -31,28 +71,10 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 	// break that gate.
 	const clauseCount = plan.whenThenClauses.length;
 
-	// Simple CASE decides `base WHEN v` exactly as `base = v` does, resolved
-	// INDEPENDENTLY per clause (mirroring how BETWEEN resolves its two bounds):
-	// the collation comes from the shared provenance lattice (explicit COLLATE >
-	// declared column collation > defaults > BINARY), and the routing between the
-	// declared type's own compare / storage-class compare / runtime temporal check
-	// is the one shared with BETWEEN and `=` (see operand-comparator.ts). Without
-	// this, `case n when 'BOB'` compared raw bytes and disagreed with `n = 'BOB'`
-	// on a NOCASE column and on semantic-ordering types like TIMESPAN.
-	//
-	// A genuine collation conflict (explicit COLLATE on the base AND a different
-	// explicit COLLATE on a WHEN operand) throws here, exactly as `=` throws for
-	// the same operand pair.
-	const whenCollationNames = plan.baseExpr
-		? plan.whenThenClauses.map(clause => effectiveComparisonCollation(plan.baseExpr!, clause.when))
-		: [];
-	const whenComparators: OperandComparator[] = plan.baseExpr
-		? plan.whenThenClauses.map((clause, i) => makeOperandComparator(
-			plan.baseExpr!.getType().logicalType,
-			clause.when.getType().logicalType,
-			ctx.resolveCollation(whenCollationNames[i]),
-		))
-		: [];
+	// A simple CASE compares its base against each WHEN under a per-clause
+	// collation + type routing (searched CASE compares nothing here).
+	const { collationNames: whenCollationNames, comparators: whenComparators } =
+		resolveWhenComparison(plan, ctx);
 
 	// Searched CASE: CASE WHEN c1 THEN r1 ... ELSE e END
 	// args layout: [when0, then0, when1, then1, ..., else?]
