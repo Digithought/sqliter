@@ -151,3 +151,15 @@ split work doesn't have to re-discover them.
 
 Zero-behavior-change note: annotating none of these 33 keeps them exactly as red/green as they are today on a
 backend without `standalone-index-ddl` — that is the whole point (see "Why it's backlog and not urgent" above).
+
+## Two annotated files carry a small non-index tail
+
+The split above is the main direction of the work, but two of the twelve *annotated* files lean the other way:
+their subject is index DDL, yet a short self-contained section at the end needs no index at all, and a backend
+skipping the file loses it. Both are small enough that annotating whole-file was the right call; if this ticket
+is worked, carve them out too rather than leaving the asymmetry:
+
+- `06.3-schema` — lines 45-58: three `schema()` queries about **views** (view row present, view `sql` preserved,
+  `view` appears in the type list). Only the last of the three needs an index to exist, and only incidentally.
+- `10.1.3-ddl-drop-in-transaction` — lines 51-78 (§2): `alter table … drop constraint unique` inside a
+  transaction, the constraint-side twin of §1. No index DDL anywhere in the section.

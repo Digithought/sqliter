@@ -253,6 +253,9 @@ describe('sqllogic capability directive', () => {
 			];
 
 			for (const file of subjectFiles) {
+				// Named explicitly: a rename would otherwise surface as a bare ENOENT.
+				expect(files, `${file} was renamed or removed; update this list`).to.include(file);
+
 				const content = fs.readFileSync(path.join(logicTestDir, file), 'utf-8');
 				const required = parseRequiredCapabilities(file, content);
 				expect([...required], `${file} should declare standalone-index-ddl`).to.include(INDEX_DDL);
