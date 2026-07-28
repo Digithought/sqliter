@@ -302,6 +302,24 @@ describe('Type System', () => {
 				expect(NUMERIC_TYPE.parse!('42')).to.equal(42);
 				expect(NUMERIC_TYPE.parse!('3.14')).to.equal(3.14);
 			});
+
+			it('should compare bigint magnitudes past 2^53 without precision loss', () => {
+				// A Number()-based comparator would round both operands to the same
+				// double and report 0; the true ordering differs by 1.
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, 9007199254740992)).to.equal(1);
+				expect(NUMERIC_TYPE.compare!(9007199254740992, 9007199254740993n)).to.equal(-1);
+			});
+
+			it('should not throw on bigint operands', () => {
+				expect(() => NUMERIC_TYPE.compare!(9007199254740993n, 3)).to.not.throw();
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, 3)).to.equal(1);
+			});
+
+			it('should place NaN smallest, matching REAL', () => {
+				expect(NUMERIC_TYPE.compare!(NaN, 1)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(1, NaN)).to.equal(1);
+				expect(NUMERIC_TYPE.compare!(NaN, NaN)).to.equal(0);
+			});
 		});
 
 		describe('ANY_TYPE', () => {

@@ -269,8 +269,18 @@ export const NUMERIC_TYPE: LogicalType = {
 	},
 
 	compare: (a, b) => {
-		// Use REAL comparison
-		return REAL_TYPE.compare!(a, b);
+		const nullCmp = compareNulls(a, b);
+		if (nullCmp !== undefined) return nullCmp;
+
+		// NUMERIC's value space is number | bigint (unlike REAL, which is number-only),
+		// so we can't delegate to REAL_TYPE.compare: isNaN() throws on a bigint operand.
+		const aIsNaN = typeof a === 'number' && isNaN(a);
+		const bIsNaN = typeof b === 'number' && isNaN(b);
+		if (aIsNaN) return bIsNaN ? 0 : -1;
+		if (bIsNaN) return 1;
+
+		// Plain < / > compares number and bigint exactly, without precision loss
+		return (a as number | bigint) < (b as number | bigint) ? -1 : (a as number | bigint) > (b as number | bigint) ? 1 : 0;
 	},
 };
 

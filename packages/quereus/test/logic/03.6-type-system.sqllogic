@@ -349,3 +349,16 @@ select null = '42' as r;
 
 select 42 = null as r;
 → [{"r":null}]
+
+-- === NUMERIC comparator across the number/bigint boundary (regression) ===
+-- A NUMERIC column accepts both number and bigint; ordering must not throw
+-- and must not lose precision past 2^53 by round-tripping through Number().
+
+CREATE TABLE numeric_big (v NUMERIC PRIMARY KEY);
+INSERT INTO numeric_big VALUES (9007199254740993);
+INSERT INTO numeric_big VALUES (3);
+
+select cast(v as text) as v from numeric_big order by v;
+→ [{"v":"3"},{"v":"9007199254740993"}]
+
+DROP TABLE numeric_big;
