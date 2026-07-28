@@ -40,7 +40,7 @@ import type {
 	LensDeploymentSnapshot,
 	CatalogObjectKind,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, hasSemanticOrdering, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
 import type { CompiledPredicate, EffectiveRowSource, KeyNormalizer, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
@@ -174,9 +174,44 @@ function resolveMaxBatchBytes(raw: SqlValue | undefined): number {
  * handled only when it falls in the group the engine's access-path rule will consume.
  */
 const EQ_OPS = ['='] as const;
+/**
+ * Secondary-index arm ONLY: an IN-list is N equalities served as one multi-seek
+ * (`plan=5`). The primary-key arms deliberately keep {@link EQ_OPS} — a `_primary_`
+ * multi-seek's emission order would break the isolation layer's primary-key merge.
+ * PK IN support is deferred; see tickets/backlog/feat-store-pk-in-list-multiseek.
+ */
+const EQ_OR_IN_OPS = ['=', 'IN'] as const;
 const LOWER_BOUND_OPS = ['>', '>='] as const;
 const UPPER_BOUND_OPS = ['<', '<='] as const;
 const RANGE_OPS = [...LOWER_BOUND_OPS, ...UPPER_BOUND_OPS] as readonly string[];
+
+/**
+ * Ceiling on the seek keys a single IN-list multi-seek may claim (the cross-product
+ * for a composite seek). Above it the plan declines to cost-only — residual retained,
+ * answer right, only the speed-up lost. The FK RESTRICT batch chunks at 500 keys, so
+ * 1000 leaves headroom while stopping an `a in (1..100) and b in (1..100)` 10k-seek
+ * explosion.
+ */
+const MAX_MULTI_SEEK_KEYS = 1000;
+
+/** Cost of positioning one index seek, in the same unit as the per-row fetch cost. */
+const INDEX_SEEK_COST = 0.5;
+
+/**
+ * The seek cardinality a filter contributes when filling an equality role: 1 for `=`,
+ * the list length for a well-formed `IN` (non-empty array — elements may be
+ * `undefined` for parameter bindings, so only the LENGTH is meaningful at plan time),
+ * and null when the filter cannot fill an equality role. Mirrors the exact predicate
+ * `rule-select-access-path`'s `eqBySeekCol` uses to pick its per-column equality
+ * constraint, so this module's positional claim and the rule's pick cannot disagree.
+ */
+function equalitySeekCardinality(f: PredicateConstraint): number | null {
+	if (f.op === '=') return 1;
+	if (f.op === 'IN' && Array.isArray(f.value) && (f.value as unknown[]).length > 0) {
+		return (f.value as unknown[]).length;
+	}
+	return null;
+}
 
 /** One (column, operator-group) slot that the access-path rule fills from a single filter. */
 interface SeekRole {
@@ -207,7 +242,12 @@ function claimFirstPerRole(
 ): boolean[] {
 	const claimed = new Set<number>();
 	for (const { colIdx, ops } of roles) {
-		const i = filters.findIndex(f => f.columnIndex === colIdx && ops.includes(f.op));
+		// An 'IN' fills an equality role only when well-formed (non-empty array) — the
+		// same shape gate the rule's pick applies, so a malformed IN is neither claimed
+		// here nor seeked there and survives as a residual.
+		const i = filters.findIndex(f =>
+			f.columnIndex === colIdx && ops.includes(f.op)
+			&& (f.op !== 'IN' || equalitySeekCardinality(f) !== null));
 		if (i >= 0) claimed.add(i);
 	}
 	return filters.map((_f, i) => claimed.has(i));
@@ -218,9 +258,13 @@ function rangeRoles(colIdx: number): SeekRole[] {
 	return [{ colIdx, ops: LOWER_BOUND_OPS }, { colIdx, ops: UPPER_BOUND_OPS }];
 }
 
-/** The one equality role each seek column of an equality/prefix seek fills. */
-function equalityRoles(colIdxs: readonly number[]): SeekRole[] {
-	return colIdxs.map(colIdx => ({ colIdx, ops: EQ_OPS }));
+/**
+ * The one equality role each seek column of an equality/prefix seek fills. `ops` is
+ * explicit so the PK arm ({@link EQ_OPS}) and the secondary-index arm
+ * ({@link EQ_OR_IN_OPS}) cannot drift into each other — see the note on EQ_OR_IN_OPS.
+ */
+function equalityRoles(colIdxs: readonly number[], ops: readonly string[]): SeekRole[] {
+	return colIdxs.map(colIdx => ({ colIdx, ops }));
 }
 
 /**
@@ -2875,7 +2919,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			// Full PK match - point lookup (single row; no monotonic advertisement)
 			return AccessPlanBuilder
 				.eqMatch(1, 0.1)
-				.setHandledFilters(claimFirstPerRole(request.filters, equalityRoles(pkColumns)))
+				.setHandledFilters(claimFirstPerRole(request.filters, equalityRoles(pkColumns, EQ_OPS)))
 				.setIsSet(true)
 				.setIndexName('_primary_')
 				.setExplanation('Store primary key lookup')
@@ -3006,11 +3050,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		const indexColIndexes = index.columns.map(c => c.index);
 
-		// Contiguous leading-prefix EQ → point/prefix seek.
+		// Contiguous leading-prefix equality → point/prefix seek. An IN-list filter
+		// counts as an equality here (it is N equalities, served as one multi-seek by
+		// StoreTable.scanMultiSeek); `inCount` is the cross-product of the per-column
+		// list sizes (1 for a plain '='), matching the rule's seek-key count. The FIRST
+		// role-filling filter per column is what the rule seeks on, so its cardinality
+		// is the one that counts.
 		const eqCols: number[] = [];
+		let inCount = 1;
 		for (const colIdx of indexColIndexes) {
-			if (!request.filters.some(f => f.columnIndex === colIdx && f.op === '=')) break;
+			const eqFilter = request.filters.find(f => f.columnIndex === colIdx && equalitySeekCardinality(f) !== null);
+			if (!eqFilter) break;
 			eqCols.push(colIdx);
+			inCount *= equalitySeekCardinality(eqFilter)!;
 		}
 		const leadingCol = indexColIndexes[0];
 		const hasLeadingRange = request.filters.some(
@@ -3070,11 +3122,40 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			return costOnly('cost-only; key collation may under-fetch');
 		}
 
+		// Multi-seek declines. Cost-only keeps the residual, so the answer stays right
+		// and only the speed-up is lost.
+		if (inCount > MAX_MULTI_SEEK_KEYS) {
+			return costOnly(`cost-only; IN cross-product of ${inCount} exceeds the ${MAX_MULTI_SEEK_KEYS}-seek cap`);
+		}
+		if (inCount > 1 && seekCols.some(colIdx => hasSemanticOrdering(tableInfo.columns[colIdx]?.logicalType))) {
+			// A plain EQ on a TIMESPAN/JSON column degrades safely (StoreTable.analyzeIndexAccess
+			// breaks its prefix there and the full-scan residual re-filters under the type's
+			// compare), but a multi-seek drops the residual and its byte-equality windows
+			// under-fetch the type's equality ('PT1H' ≡ 'PT60M', byte-distinct raw values).
+			return costOnly('cost-only; semantic-ordering seek column cannot multi-seek');
+		}
+
 		// Claim positionally — see {@link claimFirstPerRole}.
 		const handledFilters = claimFirstPerRole(
 			request.filters,
-			isRange ? rangeRoles(leadingCol) : equalityRoles(eqCols),
+			isRange ? rangeRoles(leadingCol) : equalityRoles(eqCols, EQ_OR_IN_OPS),
 		);
+
+		if (inCount > 1) {
+			// Multi-seek (plan=5): inCount point seeks, `rows` matched per seek key. The
+			// per-seek positioning term keeps a 500-key IN over a 10-row table from pricing
+			// below a full scan and issuing 500 seeks to read 10 rows. `isSet` false mirrors
+			// MemoryTableModule.evaluateIndexAccess's setIsSet(!isMultiSeek). No ordering is
+			// advertised — window emission order is encoded-key order, not any column order.
+			const multiRows = Math.min(estimatedRows, inCount * rows);
+			return AccessPlanBuilder.eqMatch(multiRows, inCount * INDEX_SEEK_COST)
+				.setIsSet(false)
+				.setHandledFilters(handledFilters)
+				.setIndexName(index.name)
+				.setSeekColumns(seekCols)
+				.setExplanation(`Store index multi-seek(${inCount}) on ${index.name}`)
+				.build();
+		}
 
 		return (isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
 			.setHandledFilters(handledFilters)

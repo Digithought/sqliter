@@ -50,6 +50,16 @@ The store module uses separate logical stores for different data types:
   decoding the index key's PK suffix (that suffix is encoded lossily for a NOCASE/RTRIM
   PK column, so it is not recoverable to SQL values). Entries are not covering — the row
   itself always lives in the data store.
+
+An `IN`-list on an indexed column (`where v in (1, 2, 3)`, including parameter-bound
+lists) is served from the index as one deduplicated, key-ordered point seek per distinct
+list value — a "multi-seek" — instead of a full scan with a residual filter. `NULL` list
+values match nothing and are skipped, duplicate values yield their rows once, and a
+composite index serves the cross-product of per-column lists (`a in (1,2) and b in
+(10,20)` is four seeks). Very large lists (over 1000 seek keys) and lists on
+semantically-ordered column types (TIMESPAN, JSON) fall back to the scan path — still
+correct, just not accelerated. `IN` on the primary key currently scans (see backlog
+`feat-store-pk-in-list-multiseek`).
 - **Catalog keys**:
   - Tables: `{schema}.{table}` as a string (the `CREATE TABLE` bundle, with its index DDL and any exposed-implicit-index tag DDL)
   - Views: `\x00view\x00{schema}.{view}` (reserved-prefix; `generateViewDDL`)

@@ -29,11 +29,16 @@ import {
  */
 class CountingKVStore extends InMemoryKVStore {
 	public iterateEntryCount = 0;
+	public getCount = 0;
 	override async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
 		for await (const entry of super.iterate(options)) {
 			this.iterateEntryCount++;
 			yield entry;
 		}
+	}
+	override async get(key: Uint8Array): Promise<Uint8Array | undefined> {
+		this.getCount++;
+		return super.get(key);
 	}
 }
 
@@ -898,6 +903,214 @@ describe('StoreModule predicate pushdown', () => {
 			expect(await ids(`select id from t where a = 5 order by id`)).to.deep.equal([1, 2, 4]);
 			expect(await ids(`select id from t where a = 5 and b > 15 order by id`)).to.deep.equal([2, 4]);
 			expect(await ids(`select id from t where a > 5 order by id`)).to.deep.equal([3]);
+		});
+
+		// IN-list multi-seek (feat-store-in-list-index-pushdown): an IN on an indexed
+		// column is served as one deduplicated, key-ordered point seek per distinct
+		// list value (`plan=5`) instead of a full scan + residual. The runtime is the
+		// authority for NULL-skip and dedup — parameter-bound lists reach it unreduced.
+		describe('IN-list multi-seek (feat-store-in-list-index-pushdown)', () => {
+			const ids = async (q: string, params?: SqlValue[]) =>
+				(await asyncIterableToArray(db.eval(q, params))).map(r => r.id as number);
+
+			describe('single-column index', () => {
+				beforeEach(async () => {
+					await db.exec(`create table t (id integer primary key, v integer) using store`);
+					await db.exec(`create index ix_v on t (v)`);
+					await db.exec(`insert into t values (1, 10), (2, 20), (3, 30), (4, 40), (5, 20)`);
+				});
+
+				it('IN on the indexed column picks the index seek, not a scan', async () => {
+					const ops = await planOps(`select id from t where v in (10, 30)`);
+					expect(ops).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+					expect(ops).to.not.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
+				});
+
+				it('basic IN list returns exactly the matching rows', async () =>
+					expect(await ids(`select id from t where v in (10, 30) order by id`)).to.deep.equal([1, 3]));
+
+				it('an IN value matching several rows returns them all', async () =>
+					expect(await ids(`select id from t where v in (20, 40) order by id`)).to.deep.equal([2, 4, 5]));
+
+				it('duplicate literal values yield each row once', async () =>
+					expect(await ids(`select id from t where v in (30, 30, 10) order by id`)).to.deep.equal([1, 3]));
+
+				it('NULL in the list is ignored', async () =>
+					expect(await ids(`select id from t where v in (10, null, 30) order by id`)).to.deep.equal([1, 3]));
+
+				it('no matching values yields no rows', async () =>
+					expect(await ids(`select id from t where v in (99, 123)`)).to.deep.equal([]));
+
+				it('single-element IN still works (routed through the plain eq seek)', async () =>
+					expect(await ids(`select id from t where v in (20) order by id`)).to.deep.equal([2, 5]));
+
+				it('parameter-bound list seeks and returns correct rows (runtime dedup)', async () =>
+					expect(await ids(`select id from t where v in (?, ?, ?) order by id`, [30, 10, 30])).to.deep.equal([1, 3]));
+
+				it('parameter list with a NULL among values ignores the NULL', async () =>
+					expect(await ids(`select id from t where v in (?, ?) order by id`, [null, 20])).to.deep.equal([2, 5]));
+
+				it('all-NULL parameter list yields no rows', async () =>
+					expect(await ids(`select id from t where v in (?, ?)`, [null, null])).to.deep.equal([]));
+
+				it('single-element parameter IN still works', async () =>
+					expect(await ids(`select id from t where v in (?)`, [40])).to.deep.equal([4]));
+
+				it('IN plus limit 1 returns a single row', async () =>
+					expect(await ids(`select id from t where v in (10, 30) limit 1`)).to.have.lengthOf(1));
+
+				it('unsorted list with ORDER BY returns sorted rows (no ordering claimed)', async () => {
+					const vals = (await asyncIterableToArray(db.eval(`select v from t where v in (30, 10, 20) order by v`))).map(r => r.v);
+					expect(vals).to.deep.equal([10, 20, 20, 30]);
+				});
+			});
+
+			it('NOCASE column: case-variant list entries match case-insensitively, each row once', async () => {
+				await db.exec(`create table s (id integer primary key, name text collate nocase) using store`);
+				await db.exec(`create index ix_name on s (name)`);
+				await db.exec(`insert into s values (1, 'Alice'), (2, 'bob'), (3, 'ALICE'), (4, 'carol')`);
+				const q = `select id from s where name in ('alice', 'Alice', 'BOB') order by id`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect((await asyncIterableToArray(db.eval(q))).map(r => r.id)).to.deep.equal([1, 2, 3]);
+			});
+
+			it('BINARY column under the NOCASE key collation: case-variant values each find their row', async () => {
+				// K = NOCASE (store default) is strictly coarser than the column's BINARY
+				// comparison collation, so 'a' and 'A' share ONE K-encoded window; the scan
+				// must apply BOTH tuples' residuals to that window — a single tuple's
+				// residual would silently drop the other value's row.
+				await db.exec(`create table b (id integer primary key, v text) using store`);
+				await db.exec(`create index ix_v on b (v)`);
+				await db.exec(`insert into b values (1, 'a'), (2, 'A'), (3, 'b')`);
+				const q = `select id from b where v in ('a', 'A') order by id`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await ids(q)).to.deep.equal([1, 2]);
+			});
+
+			it('DESC index column: IN list seeks under byte inversion and returns correct rows', async () => {
+				await db.exec(`create table dt (id integer primary key, v integer) using store`);
+				await db.exec(`create index ix_dv on dt (v desc)`);
+				await db.exec(`insert into dt values (1, 10), (2, 20), (3, 30), (4, 40)`);
+				const q = `select id from dt where v in (10, 40) order by id`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await ids(q)).to.deep.equal([1, 4]);
+			});
+
+			describe('composite index (a, b)', () => {
+				beforeEach(async () => {
+					await db.exec(`create table ct (id integer primary key, a integer, b integer) using store`);
+					await db.exec(`create index ix_ab on ct (a, b)`);
+					await db.exec(`insert into ct values (1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 20), (5, 3, 10)`);
+				});
+
+				it('IN × IN cross-product seeks and returns exactly the matching rows', async () => {
+					const q = `select id from ct where a in (1, 2) and b in (10, 20) order by id`;
+					expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+					expect(await ids(q)).to.deep.equal([1, 2, 3, 4]);
+				});
+
+				it('IN × EQ returns the matching rows', async () =>
+					expect(await ids(`select id from ct where a in (1, 3) and b = 10 order by id`)).to.deep.equal([1, 5]));
+
+				it('EQ × IN returns the matching rows', async () =>
+					expect(await ids(`select id from ct where a = 2 and b in (10, 20) order by id`)).to.deep.equal([3, 4]));
+
+				it('parameter-bound cross-product with a NULL component drops only that tuple', async () =>
+					expect(await ids(`select id from ct where a in (?, ?) and b in (?, ?) order by id`, [1, null, 10, 20])).to.deep.equal([1, 2]));
+			});
+
+			it('an IN list over the multi-seek cap declines to scan + residual and stays correct', async () => {
+				await db.exec(`create table big (id integer primary key, v integer) using store`);
+				await db.exec(`create index ix_bv on big (v)`);
+				await db.exec(`insert into big values (1, 5), (2, 500), (3, 2000)`);
+				const list = Array.from({ length: 1001 }, (_, i) => i).join(', ');
+				const q = `select id from big where v in (${list}) order by id`;
+				expect(await planOps(q)).to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await ids(q)).to.deep.equal([1, 2]);
+			});
+
+			it('IN on an indexed TIMESPAN column declines the seek but stays correct', async () => {
+				// A multi-seek drops the residual, and the byte windows would address raw
+				// value bytes while the index holds the semantic key transform's — so the
+				// plan must decline. The scan-path residual compares by elapsed time:
+				// 'PT60M' matches the listed 'PT1H'.
+				await db.exec(`create table ts (id integer primary key, d timespan) using store`);
+				await db.exec(`create index ix_d on ts (d)`);
+				await db.exec(`insert into ts values (1, 'PT60M'), (2, 'PT2H')`);
+				const q = `select id from ts where d in ('PT1H', 'PT3H') order by id`;
+				expect(await planOps(q)).to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await ids(q)).to.deep.equal([1]);
+			});
+
+			it('IN-list results match the memory-module oracle', async () => {
+				const seed = async (name: string, using: string) => {
+					await db.exec(`create table ${name} (id integer primary key, v integer, s text collate nocase) ${using}`);
+					await db.exec(`create index ix_${name}_v on ${name} (v)`);
+					await db.exec(`insert into ${name} values (1, 10, 'ant'), (2, 20, 'Bee'), (3, 30, 'cat'), (4, 20, 'BEE')`);
+				};
+				await seed('ostore', 'using store');
+				await seed('omem', '');
+				for (const where of [
+					`v in (10, 30)`,
+					`v in (20)`,
+					`v in (20, 99, 20)`,
+					`s in ('bee', 'CAT')`,
+				]) {
+					const q = (t: string) => `select id from ${t} where ${where} order by id`;
+					const storeRows = await asyncIterableToArray(db.eval(q('ostore')));
+					const memRows = await asyncIterableToArray(db.eval(q('omem')));
+					expect(storeRows, where).to.deep.equal(memRows);
+				}
+			});
+
+			it('reads-own-writes: an uncommitted row whose indexed value is in the list surfaces', async () => {
+				await db.exec(`create table rw (id integer primary key, v integer) using store`);
+				await db.exec(`create index ix_rw on rw (v)`);
+				await db.exec(`insert into rw values (1, 10), (2, 20)`);
+				await db.exec('begin');
+				await db.exec(`insert into rw values (3, 30)`);
+				const rows = await ids(`select id from rw where v in (20, 30) order by id`);
+				await db.exec('commit');
+				expect(rows).to.deep.equal([2, 3]);
+			});
+		});
+
+		// Narrowing proof: rows alone cannot distinguish a multi-seek from a full scan
+		// + residual, so count the DATA store's operations. Index entries live in the
+		// (plain) index store; the seek resolves each matched entry with one data-store
+		// `get`, while a full scan would ITERATE all 100 data rows.
+		describe('IN-list multi-seek narrowing (counting data store)', () => {
+			let cdb: Database;
+			let cprovider: KVStoreProvider;
+			let dataStores: Map<string, CountingKVStore>;
+
+			beforeEach(() => {
+				dataStores = new Map();
+				cprovider = createCountingProvider(dataStores);
+				cdb = new Database();
+				cdb.registerModule('store', new StoreModule(cprovider));
+			});
+
+			afterEach(async () => {
+				await cprovider.closeAll();
+			});
+
+			it('IN-list on an indexed column reads only the matching data rows, not the table', async () => {
+				await cdb.exec(`create table nums (id integer primary key, v integer) using store`);
+				await cdb.exec(`create index ix_v on nums (v)`);
+				const vals = Array.from({ length: 100 }, (_, i) => `(${i}, ${i})`).join(', ');
+				await cdb.exec(`insert into nums values ${vals}`);
+				const store = dataStores.get('main.nums')!;
+				store.iterateEntryCount = 0;
+				store.getCount = 0;
+
+				const rows = await asyncIterableToArray(cdb.eval(`select id from nums where v in (5, 7, 9) order by id`));
+				expect(rows.map(r => r.id)).to.deep.equal([5, 7, 9]);
+				// No data-store scan at all (a full scan would iterate all 100 rows) …
+				expect(store.iterateEntryCount, 'no data-store iteration').to.equal(0);
+				// … and only the 3 matched index entries resolve to data-store gets.
+				expect(store.getCount, 'one get per matched entry').to.be.within(1, 6);
+			});
 		});
 	});
 });

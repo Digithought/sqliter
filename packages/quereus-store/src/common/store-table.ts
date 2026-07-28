@@ -28,11 +28,13 @@ import {
 	coerceRowToSchema,
 	compilePredicate,
 	decodeIdxStr,
+	planKindFromCode,
 	maintainedTableUniqueViolationError,
 	uniqueEnforcementCollations,
 	logicalTypeCanHoldText,
 	pkKeyCollationName,
 	JSON_TYPE,
+	type IdxStrSpec,
 	type LogicalType,
 	type Database,
 	type DatabaseInternal,
@@ -1163,6 +1165,17 @@ export class StoreTable extends VirtualTable {
 	async *query(filterInfo: FilterInfo): AsyncIterable<Row> {
 		const store = await this.ensureStore();
 
+		// Multi-seek (`plan=5`, an IN-list served as N point seeks) dispatches FIRST —
+		// before analyzePKAccess: the FilterInfo carries N*W EQ constraints, so on a
+		// table whose PK column is also the leading column of the chosen index,
+		// analyzePKAccess would match the FIRST equality and answer a single-value
+		// point lookup — one list value's rows, a silent wrong result.
+		const idxSpec = decodeIdxStr(filterInfo.idxStr);
+		if (idxSpec && planKindFromCode(idxSpec.plan) === 'multiSeek') {
+			yield* this.scanMultiSeek(idxSpec, filterInfo);
+			return;
+		}
+
 		const pkAccess = this.analyzePKAccess(filterInfo);
 
 		if (pkAccess.type === 'point') {
@@ -1611,12 +1624,14 @@ export class StoreTable extends VirtualTable {
 		indexStore: KVStore,
 		access: IndexAccessPattern,
 		filterInfo: FilterInfo,
+		multi?: MultiSeekWindowContext,
 	): AsyncIterable<Row> {
 		// Re-check each resolved row under the INDEX's per-column collation (see
 		// matchesFilters): the planner dropped the residual based on the index
 		// column's collation, which an explicit index `COLLATE` can make differ from
 		// the table column's declared collation.
-		const indexCollations = this.resolveFilterCollations(filterInfo, this.indexColumnCollations(access.index));
+		const indexCollations = multi?.collations
+			?? this.resolveFilterCollations(filterInfo, this.indexColumnCollations(access.index));
 		for await (const entry of this.iterateEffective(indexStore, access.bounds)) {
 			// NOTE: a legacy index store (written before index values carried the data
 			// key) holds EMPTY values; a zero-length data key is not a row key, so skip
@@ -1630,6 +1645,13 @@ export class StoreTable extends VirtualTable {
 			// durable fix is to version-stamp the index store and rebuild on open, or to
 			// fall back to a full scan the first time an empty value is seen.
 			if (entry.value.length === 0) continue;
+			// Cross-window dedup for a multi-seek: a data key an earlier window already
+			// YIELDED is skipped before the data-store read, so a duplicate costs no
+			// extra `get`. The seen-set is only ever ADDED to on a yield (below) — adding
+			// at visit time would let a stale index entry that fails its residual poison
+			// the set and suppress the row's live entry in a later window.
+			const dataKeyHex = multi ? bytesToHex(entry.value) : undefined;
+			if (dataKeyHex !== undefined && multi!.seen.has(dataKeyHex)) continue;
 			// NOTE: one extra data-store `get` per matched index entry — the row lives
 			// in the data store, not the index (the index value carries only the data
 			// key, no covering payload). Fine now; if index-covered scans ever dominate
@@ -1637,7 +1659,224 @@ export class StoreTable extends VirtualTable {
 			// at the cost of an index rewrite on EVERY column change (not just indexed
 			// columns) — deliberately not done here.
 			const row = await this.readEffectiveRowByKey(entry.value);
-			if (row && this.matchesFilters(row, filterInfo, indexCollations)) {
+			if (!row) continue;
+			if (this.matchesFilters(row, filterInfo, indexCollations)
+				|| (multi !== undefined && multi.extraTuples.some(fi => this.matchesFilters(row, fi, indexCollations)))) {
+				if (dataKeyHex !== undefined) multi!.seen.add(dataKeyHex);
+				yield row;
+			}
+		}
+	}
+
+	/**
+	 * Fail loudly on a multi-seek FilterInfo this table cannot serve. The plan already
+	 * dropped the residual Filter, and {@link matchesFilters} ANDs every pushed
+	 * constraint — so falling through to the scan arm would AND N mutually-exclusive
+	 * equalities and return zero rows: a silent wrong answer, not a slow one.
+	 */
+	private multiSeekMalformed(filterInfo: FilterInfo, why: string): never {
+		throw new QuereusError(
+			`Malformed multi-seek FilterInfo (idxStr '${filterInfo.idxStr}') on ${this.schemaName}.${this.tableName}: ${why}`,
+			StatusCode.INTERNAL,
+		);
+	}
+
+	/**
+	 * Decode a multi-seek FilterInfo into its N seek tuples of width W. Tuple i pairs
+	 * `args[i*W … i*W+W-1]` with the same slice of `constraints` (argvIndex runs
+	 * 1…N*W in order — see rule-select-access-path's multiSeek emission). A tuple with
+	 * a NULL/undefined component is dropped: IN is set membership and a NULL component
+	 * matches nothing. The planner pre-reduces literal lists, but a parameter-bound /
+	 * mixed-binding list reaches here unreduced, so this skip is the only line of
+	 * defense for those.
+	 */
+	private decodeMultiSeekTuples(
+		spec: IdxStrSpec,
+		filterInfo: FilterInfo,
+	): { tuples: MultiSeekTuple[]; seekWidth: number } {
+		const seekWidth = Number.parseInt(spec.params.get('seekWidth') ?? '1', 10);
+		const inCount = Number.parseInt(spec.params.get('inCount') ?? '0', 10);
+		if (!Number.isInteger(seekWidth) || seekWidth < 1) {
+			this.multiSeekMalformed(filterInfo, `seekWidth=${spec.params.get('seekWidth')}`);
+		}
+		if (!Number.isInteger(inCount) || inCount < 1) {
+			this.multiSeekMalformed(filterInfo, `inCount=${spec.params.get('inCount')}`);
+		}
+		const constraints = filterInfo.constraints ?? [];
+		if (constraints.length < inCount * seekWidth) {
+			this.multiSeekMalformed(filterInfo, `${constraints.length} constraints for ${inCount}×${seekWidth} seek keys`);
+		}
+		if (filterInfo.args.length < inCount * seekWidth) {
+			this.multiSeekMalformed(filterInfo, `${filterInfo.args.length} args for ${inCount}×${seekWidth} seek keys`);
+		}
+
+		const tuples: MultiSeekTuple[] = [];
+		for (let t = 0; t < inCount; t++) {
+			const entries = constraints.slice(t * seekWidth, (t + 1) * seekWidth);
+			if (entries.some(e => e.constraint.op !== IndexConstraintOp.EQ || e.argvIndex <= 0)) {
+				this.multiSeekMalformed(filterInfo, `seek tuple ${t} carries a non-EQ or unbound constraint`);
+			}
+			const values = entries.map(e => filterInfo.args[e.argvIndex - 1]);
+			if (values.some(v => v === null || v === undefined)) continue;
+			tuples.push({ entries, values });
+		}
+		return { tuples, seekWidth };
+	}
+
+	/**
+	 * Order one tuple's values to match `keyCols` (the leading index columns, or the
+	 * PK definition) using each constraint entry's column. The plan's seek columns and
+	 * the constraint list must agree; a tuple that does not cover exactly those
+	 * columns is malformed.
+	 */
+	private orderTupleValues(
+		tuple: MultiSeekTuple,
+		keyCols: readonly number[],
+		filterInfo: FilterInfo,
+	): SqlValue[] {
+		const byCol = new Map<number, SqlValue>();
+		tuple.entries.forEach((e, i) => byCol.set(e.constraint.iColumn, tuple.values[i]));
+		if (byCol.size !== keyCols.length) {
+			this.multiSeekMalformed(filterInfo, `seek tuple covers ${byCol.size} columns, expected ${keyCols.length}`);
+		}
+		return keyCols.map(colIdx => {
+			if (!byCol.has(colIdx)) this.multiSeekMalformed(filterInfo, `seek tuple missing column ${colIdx}`);
+			return byCol.get(colIdx)!;
+		});
+	}
+
+	/**
+	 * Serve a multi-seek (`plan=5`) FilterInfo: one point window per distinct
+	 * IN-list tuple, scanned in ascending encoded-key order.
+	 *
+	 * Window order is not cosmetic. Encoded-byte order IS index-key order (per-column
+	 * DESC inversion is baked into the bytes), and the isolation overlay merges an
+	 * index scan with its pending rows by (indexKey, PK) — an out-of-order underlying
+	 * stream misplaces overlay rows in the output. Two overlap hazards are folded
+	 * away before scanning:
+	 *   - Tuples whose K-encoded prefix byte-matches (duplicate bound parameters, or
+	 *     case variants under a NOCASE table key collation) share ONE window, each
+	 *     kept as a residual alternative — see {@link MultiSeekWindowContext} for why
+	 *     a single tuple's residual would drop rows when the comparison collation is
+	 *     finer than K.
+	 *   - A window with no finite upper bound (all-0xff prefix — see
+	 *     buildIndexPrefixBounds) contains every later-sorting window outright (any
+	 *     key ≥ an all-0xff prefix necessarily starts with it), so those windows fold
+	 *     into it instead of re-scanning an overlapping range out of order.
+	 *
+	 * Emission is lazy per window — `… in (…) limit 1` stops after the first yielded
+	 * row without materializing the remaining windows. Each window goes through
+	 * {@link scanIndex} → {@link iterateEffective}, so read-your-own-writes and the
+	 * stale-entry / deleted-row defenses hold per seek key.
+	 */
+	protected async *scanMultiSeek(spec: IdxStrSpec, filterInfo: FilterInfo): AsyncIterable<Row> {
+		const { tuples, seekWidth } = this.decodeMultiSeekTuples(spec, filterInfo);
+
+		if (spec.indexName === '_primary_') {
+			yield* this.scanMultiSeekPrimary(tuples, seekWidth, filterInfo);
+			return;
+		}
+
+		const index = this.resolveIndexFromIdxStr(filterInfo.idxStr);
+		if (!index) this.multiSeekMalformed(filterInfo, `no index named '${spec.indexName}'`);
+		const indexCols = index.columns.map(c => c.index);
+		const indexDirections = index.columns.map(c => !!c.desc);
+		if (seekWidth > indexCols.length) {
+			this.multiSeekMalformed(filterInfo, `seekWidth ${seekWidth} exceeds ${index.name}'s ${indexCols.length} columns`);
+		}
+		const seekCols = indexCols.slice(0, seekWidth);
+		// The K-encoded byte windows below carry no residual able to resurrect a
+		// skipped row, so a seek column whose byte equality under-fetches the type's
+		// equality (TIMESPAN, JSON — see pkHasSemanticOrderingMember) cannot be
+		// multi-seeked. StoreModule.tryIndexAccessPlan declines such plans; one
+		// arriving anyway is malformed.
+		if (seekCols.some(colIdx => hasSemanticOrdering(this.tableSchema!.columns[colIdx]?.logicalType))) {
+			this.multiSeekMalformed(filterInfo, 'semantic-ordering seek column');
+		}
+
+		// One window per distinct K-encoded tuple prefix; K-equal tuples merge into
+		// one window, each kept as a residual alternative.
+		const windows = new Map<string, MultiSeekWindow>();
+		for (const tuple of tuples) {
+			const ordered = this.orderTupleValues(tuple, seekCols, filterInfo);
+			const bounds = buildIndexPrefixBounds(ordered, this.encodeOptions, indexDirections.slice(0, seekWidth));
+			const hex = bytesToHex(bounds.gte);
+			const info: FilterInfo = { ...filterInfo, constraints: tuple.entries };
+			const existing = windows.get(hex);
+			if (existing) existing.infos.push(info);
+			else windows.set(hex, { bounds, infos: [info] });
+		}
+		if (windows.size === 0) return; // every tuple had a NULL component — nothing matches
+
+		const sorted = [...windows.values()].sort((a, b) => compareBytes(a.bounds.gte, b.bounds.gte));
+		const disjoint: MultiSeekWindow[] = [];
+		for (const w of sorted) {
+			const last = disjoint[disjoint.length - 1];
+			if (last && last.bounds.lt === undefined) last.infos.push(...w.infos);
+			else disjoint.push(w);
+		}
+
+		const indexStore = await this.ensureIndexStore(index.name);
+		// Identical for every window (resolveFilterCollations dedups by column), so
+		// resolve once and thread it through.
+		const collations = this.resolveFilterCollations(filterInfo, this.indexColumnCollations(index));
+		const seen = new Set<string>();
+		for (const w of disjoint) {
+			yield* this.scanIndex(
+				indexStore,
+				{ index, type: 'point', bounds: w.bounds },
+				w.infos[0],
+				{ seen, collations, extraTuples: w.infos.slice(1) },
+			);
+		}
+	}
+
+	/**
+	 * Multi-seek over the PRIMARY key: each tuple is a full PK, resolved by a point
+	 * read in ascending encoded-data-key order (the table's native emission order).
+	 *
+	 * NOT reachable from this module's own plans today: `StoreModule.computeBestAccessPlan`
+	 * claims IN-list filters only for secondary indexes (see its EQ_OPS vs EQ_OR_IN_OPS
+	 * split and tickets/backlog/feat-store-pk-in-list-multiseek). The branch exists so
+	 * a `_primary_` multi-seek arriving from a future plan gets a correct answer rather
+	 * than the scan arm's silent zero rows, and it is what PK-IN enablement will build on.
+	 */
+	protected async *scanMultiSeekPrimary(
+		tuples: MultiSeekTuple[],
+		seekWidth: number,
+		filterInfo: FilterInfo,
+	): AsyncIterable<Row> {
+		const pkColumns = this.tableSchema!.primaryKeyDefinition.map(pk => pk.index);
+		if (pkColumns.length === 0) {
+			this.multiSeekMalformed(filterInfo, 'primary-key multi-seek on a table with no primary key');
+		}
+		if (seekWidth !== pkColumns.length) {
+			this.multiSeekMalformed(filterInfo, `seekWidth ${seekWidth} does not cover the ${pkColumns.length}-column primary key`);
+		}
+		// Mirrors analyzePKAccess's conservative decline of the point arm for such PKs
+		// (see pkHasSemanticOrderingMember); with the residual gone there is no scan to
+		// degrade to, so fail loudly rather than risk an under-fetch.
+		if (this.pkHasSemanticOrderingMember()) {
+			this.multiSeekMalformed(filterInfo, 'semantic-ordering primary-key member');
+		}
+
+		// Dedup by encoded data key (collapses K-equal tuples), keeping every merged
+		// tuple's residual as an alternative — same rationale as the index branch.
+		const points = new Map<string, { key: Uint8Array; infos: FilterInfo[] }>();
+		for (const tuple of tuples) {
+			const ordered = this.orderTupleValues(tuple, pkColumns, filterInfo);
+			const key = this.encodeDataKey(ordered);
+			const hex = bytesToHex(key);
+			const info: FilterInfo = { ...filterInfo, constraints: tuple.entries };
+			const existing = points.get(hex);
+			if (existing) existing.infos.push(info);
+			else points.set(hex, { key, infos: [info] });
+		}
+
+		const collations = this.resolveFilterCollations(filterInfo);
+		for (const p of [...points.values()].sort((a, b) => compareBytes(a.key, b.key))) {
+			const row = await this.readEffectiveRowByKey(p.key);
+			if (row && p.infos.some(fi => this.matchesFilters(row, fi, collations))) {
 				yield row;
 			}
 		}
@@ -3054,4 +3293,49 @@ interface IndexAccessPattern {
 	index: TableIndexSchema;
 	type: 'point' | 'range';
 	bounds: IterateOptions;
+}
+
+/** One pushed-constraint entry, as {@link FilterInfo.constraints} carries it. */
+type ConstraintEntry = FilterInfo['constraints'][number];
+
+/**
+ * One multi-seek tuple: its W constraint entries and their bound values, in
+ * constraint order (see {@link StoreTable.decodeMultiSeekTuples}).
+ */
+interface MultiSeekTuple {
+	entries: ConstraintEntry[];
+	values: SqlValue[];
+}
+
+/** One multi-seek byte window and the tuples (as per-tuple FilterInfos) it serves. */
+interface MultiSeekWindow {
+	bounds: { gte: Uint8Array; lt?: Uint8Array };
+	infos: FilterInfo[];
+}
+
+/**
+ * Per-window context a multi-seek passes to {@link StoreTable.scanIndex} (absent for
+ * ordinary single-window scans).
+ *
+ * `seen` — data-key hexes already YIELDED by an earlier window. Checked before the
+ * data-store read (a cross-window duplicate costs no extra `get`), added only on a
+ * yield: adding at visit time would let a stale index entry (row re-keyed since
+ * indexing) that FAILS its residual poison the set and suppress the row's live entry
+ * in a later window.
+ *
+ * `collations` — the constraint collation map, resolved once per multi-seek (it is
+ * identical for every window).
+ *
+ * `extraTuples` — additional seek tuples whose K-encoded window byte-equals this
+ * window's (duplicate bound parameters, or case-variant values under a NOCASE table
+ * key collation K). A row is yielded when it matches the primary FilterInfo OR any of
+ * these: when the column's comparison collation C is strictly finer than K (K=NOCASE
+ * over a BINARY column — the one coarser pairing the plan admits), the merged tuples
+ * are C-distinct and each admits different rows, so a single tuple's residual would
+ * silently drop the other tuples' rows.
+ */
+interface MultiSeekWindowContext {
+	seen: Set<string>;
+	collations: ReadonlyMap<number, CollationFunction>;
+	extraTuples: readonly FilterInfo[];
 }
