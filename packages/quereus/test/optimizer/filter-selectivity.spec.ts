@@ -273,6 +273,69 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		const second = findFilter(again);
 		expect(second?.selectivity).to.equal(first!.selectivity);
 	});
+
+	it('estimates a cross-relation <> as the complement of the equality estimate', () => {
+		const f = optimizedFilter(db, 'SELECT * FROM o a JOIN o b ON a.id = b.id WHERE a.qty <> b.rid');
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		// The catalog only models `=`, so the complement rides on the naive join
+		// estimate — which is capped at 0.5, bounding the result to [0.5, 1]. That
+		// bound is the guarantee: a cross-relation `<>` can only ever relax the
+		// estimate, never claim a reduction the statistics do not support.
+		expect(f!.selectivity).to.be.within(0.5, 1);
+		expect(f!.selectivity, 'true value is near 1').to.be.greaterThan(0.8);
+	});
+
+	it('resolves boolean structure inside a conjunct rather than declining it', () => {
+		// `NOT (o.cat = 'a')` has no bare column operand of its own; the estimate has
+		// to come from the provider recursing into the negated comparison.
+		const f = optimizedFilter(db, "SELECT * FROM o JOIN r ON o.rid = r.id WHERE NOT (o.cat = 'a')");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 - 1 / ndv['o.cat'], 1e-12);
+	});
+
+	it('leaves a function-wrapped column unstamped despite the table being analyzed', () => {
+		// The gate is `statsOnlySelectivity`, not "does this table have statistics":
+		// `CatalogStatsProvider` reads the column off a DIRECT child of the comparison,
+		// so `lower(o.cat)` puts the conjunct out of reach of the stats that exist and
+		// the fabricated naive number must not be stamped in their place.
+		const f = optimizedFilter(db, "SELECT * FROM o JOIN r ON o.rid = r.id WHERE lower(o.cat) = 'a'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity, 'wrapped column has no reachable statistics').to.be.undefined;
+	});
+
+	it('leaves a conjunct spanning three relations unstamped', () => {
+		const f = optimizedFilter(db,
+			'SELECT * FROM o a JOIN o b ON a.id = b.id JOIN r c ON c.id = a.id WHERE a.qty + b.qty = c.qty');
+		expect(f, 'expected a residual Filter over the joins').to.not.be.undefined;
+		expect(f!.selectivity, 'no model for a three-relation conjunct').to.be.undefined;
+	});
+
+	it('leaves an OR spanning two relations unstamped', () => {
+		// splitConjuncts hands the whole OR back as one conjunct; it spans two
+		// relations but is not a comparison, so no cross-relation model applies.
+		const f = optimizedFilter(db, "SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.cat = 'a' OR r.cat = 'x'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity).to.be.undefined;
+	});
+
+	it('does not attribute a set-operation output to its left branch', () => {
+		// `z.cat` forwards the left branch's attribute id but carries rows from BOTH
+		// branches, so `o`'s statistics do not describe it. Attributing it anyway would
+		// stamp 1/ndv(o.cat) for a relation whose distribution is a blend.
+		const f = optimizedFilter(db,
+			"SELECT * FROM (SELECT id, cat FROM o UNION ALL SELECT id, cat FROM r) z WHERE z.cat = 'a'");
+		expect(f, 'expected a Filter over the set operation').to.not.be.undefined;
+		expect(f!.selectivity, 'set-operation output is not a base column').to.be.undefined;
+	});
+
+	it('still estimates the base-table side of a join whose other side is a set operation', () => {
+		const f = optimizedFilter(db,
+			"SELECT * FROM o JOIN (SELECT id, cat FROM r UNION ALL SELECT id, cat FROM r) z ON z.id = o.id "
+			+ "WHERE o.cat = 'a' AND z.cat = 'x'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		// Only `o.cat` is attributable; `z.cat` is skipped, so the fold is that one value.
+		expect(f!.selectivity).to.be.closeTo(1 / ndv['o.cat'], 1e-12);
+	});
 });
 
 describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {

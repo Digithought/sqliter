@@ -102,15 +102,24 @@ export class CatalogStatsProvider implements StatsProvider {
 	}
 
 	selectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined {
-		const stats = table.statistics;
-		if (!stats) return this.fallback.selectivity(table, predicate);
-
-		const sel = this.estimatePredicateSelectivity(stats, predicate);
+		const sel = this.statsOnlySelectivity(table, predicate);
 		if (sel !== undefined) {
 			log('Predicate selectivity for %s on %s: %f (catalog)', predicate.nodeType, table.name, sel);
 			return sel;
 		}
 		return this.fallback.selectivity(table, predicate);
+	}
+
+	/**
+	 * The catalog half of {@link selectivity}: undefined rather than a naive guess
+	 * when the table carries no statistics, or when the predicate's shape puts it out
+	 * of reach of the ones it has (`lower(cat) = 'x'` — {@link extractColumnFromPredicate}
+	 * reads the column off a direct child of the comparison and finds none).
+	 */
+	statsOnlySelectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined {
+		const stats = table.statistics;
+		if (!stats) return undefined;
+		return this.estimatePredicateSelectivity(stats, predicate);
 	}
 
 	joinSelectivity(leftTable: TableSchema, rightTable: TableSchema, joinCondition: ScalarPlanNode): number | undefined {

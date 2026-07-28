@@ -29,6 +29,22 @@ export interface StatsProvider {
 	selectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined;
 
 	/**
+	 * Selectivity derived from REAL statistics only, with no heuristic fallback.
+	 *
+	 * `selectivity` always answers, substituting a fabricated per-nodeType guess when
+	 * the catalog cannot say anything. Callers that must distinguish "the statistics
+	 * say 0.25" from "nobody knows, here is 0.1" use this instead; undefined means the
+	 * backing statistics could not answer. A provider that never fabricates may alias
+	 * this to `selectivity`; one that only ever guesses should leave it unimplemented,
+	 * which reads as "no real statistics".
+	 *
+	 * @param table Table schema
+	 * @param predicate Predicate expression
+	 * @returns Selectivity factor (0.0 to 1.0), or undefined if real statistics cannot answer
+	 */
+	statsOnlySelectivity?(table: TableSchema, predicate: ScalarPlanNode): number | undefined;
+
+	/**
 	 * Get join selectivity estimate
 	 * @param leftTable Left table schema
 	 * @param rightTable Right table schema

@@ -133,8 +133,11 @@ function multiRelationSelectivity(filter: FilterNode, context: OptContext): numb
 	if (known.length === 0) return undefined;
 
 	const combined = combineConjunctive(known);
-	log('Filter over %d relations: %d/%d conjuncts estimated, stamping %f',
-		countRelations(origins), known.length, conjuncts.length, combined);
+	// countRelations walks the whole origin map; keep it off the hot path.
+	if (log.enabled) {
+		log('Filter over %d relations: %d/%d conjuncts estimated, stamping %f',
+			countRelations(origins), known.length, conjuncts.length, combined);
+	}
 	return combined;
 }
 
@@ -150,14 +153,14 @@ function estimateConjunct(
 	origins: ReadonlyMap<number, ColumnOrigin>,
 	context: OptContext,
 ): number | undefined {
-	const byRelation = conjunctOrigins(conjunct, origins);
-	if (byRelation === undefined) return undefined;
+	const refs = conjunctRelations(conjunct, origins);
+	if (refs === undefined) return undefined;
 
-	if (byRelation.size === 1) {
-		const [cols] = [...byRelation.values()];
-		return singleRelationConjunct(cols, conjunct, context);
+	if (refs.size === 1) {
+		const [ref] = refs;
+		return singleRelationConjunct(ref.tableSchema, conjunct, context);
 	}
-	if (byRelation.size === 2) {
+	if (refs.size === 2) {
 		return crossRelationConjunct(conjunct, origins, context);
 	}
 	// Three or more relations in one conjunct: no model for it here.
@@ -165,55 +168,54 @@ function estimateConjunct(
 }
 
 /**
- * Group the conjunct's column references by originating relation.
+ * The distinct relations a conjunct's column references come from.
  *
  * Returns undefined when the conjunct references no column at all, or references
  * any attribute that is not a base-table column (a computed projection, an
- * aggregate output, a join existence flag, a column of a table inside a scalar
- * subquery) — in either case there are no statistics to consult.
+ * aggregate output, a join existence flag, a set-operation output, a column of a
+ * table inside a scalar subquery) — in either case there are no statistics to
+ * consult.
  */
-function conjunctOrigins(
+function conjunctRelations(
 	conjunct: ScalarPlanNode,
 	origins: ReadonlyMap<number, ColumnOrigin>,
-): Map<TableReferenceNode, ColumnOrigin[]> | undefined {
-	const byRelation = new Map<TableReferenceNode, ColumnOrigin[]>();
+): Set<TableReferenceNode> | undefined {
+	const refs = new Set<TableReferenceNode>();
 	const stack: PlanNode[] = [conjunct];
-	let sawColumn = false;
 
 	while (stack.length > 0) {
 		const n = stack.pop()!;
 		if (n instanceof ColumnReferenceNode) {
-			sawColumn = true;
 			const origin = origins.get(n.attributeId);
 			if (!origin) return undefined;
-			const cols = byRelation.get(origin.ref);
-			if (cols) cols.push(origin); else byRelation.set(origin.ref, [origin]);
+			refs.add(origin.ref);
 			continue;
 		}
 		for (const child of n.getChildren()) stack.push(child);
 	}
 
-	return sawColumn ? byRelation : undefined;
+	return refs.size > 0 ? refs : undefined;
 }
 
 /**
  * A conjunct over exactly one relation: hand it to the provider as if it were a
  * single-table predicate.
  *
- * Gated on real column statistics. `context.stats.selectivity` ALWAYS returns a
- * number for a stats-less table (CatalogStatsProvider falls through to
- * NaiveStatsProvider, which answers 0.1 for any BinaryOp), so without this gate the
- * rule would replace 0.5 with 0.1 on essentially every filter-over-join in the
- * codebase — including the many tests that never run ANALYZE — churning plan shapes
- * with no actual information behind the change.
+ * `statsOnlySelectivity` — not `selectivity` — IS the statistics gate. `selectivity`
+ * always returns a number (CatalogStatsProvider falls through to NaiveStatsProvider,
+ * which answers a flat 0.1 for any BinaryOp), so using it here would replace 0.5 with
+ * 0.1 on essentially every filter-over-join in the codebase — including the many tests
+ * that never run ANALYZE — churning plan shapes with no information behind the change.
+ * It also covers the subtler case of an analyzed table with a predicate the catalog
+ * cannot read (`lower(o.cat) = 'x'`), which a column-stats-presence check would let
+ * through. A provider that does not implement it is treated as having no statistics.
  */
 function singleRelationConjunct(
-	cols: readonly ColumnOrigin[],
+	table: TableSchema,
 	conjunct: ScalarPlanNode,
 	context: OptContext,
 ): number | undefined {
-	if (!cols.every(hasColumnStats)) return undefined;
-	return context.stats.selectivity(cols[0].table, conjunct);
+	return context.stats.statsOnlySelectivity?.(table, conjunct);
 }
 
 function hasColumnStats(origin: ColumnOrigin): boolean {
@@ -225,8 +227,10 @@ function hasColumnStats(origin: ColumnOrigin): boolean {
  * (`o.qty > l.qty`, `a.id = b.id`). Only a plain binary comparison with a bare
  * column reference on each side is modelled; anything else is unknown.
  *
- * Gated on both tables carrying real statistics, for the same reason as
- * {@link singleRelationConjunct}.
+ * Gated on real column statistics for BOTH compared columns, for the same reason as
+ * {@link singleRelationConjunct}: `joinSelectivity` falls back to
+ * `NaiveStatsProvider`'s `1/max(rowCount)` whenever it cannot read a distinct count,
+ * so table-level `statistics` being present is not enough on its own.
  */
 function crossRelationConjunct(
 	conjunct: ScalarPlanNode,
@@ -240,12 +244,17 @@ function crossRelationConjunct(
 	const leftOrigin = origins.get(conjunct.left.attributeId);
 	const rightOrigin = origins.get(conjunct.right.attributeId);
 	if (!leftOrigin || !rightOrigin) return undefined;
-	if (!leftOrigin.table.statistics || !rightOrigin.table.statistics) return undefined;
+	if (!hasColumnStats(leftOrigin) || !hasColumnStats(rightOrigin)) return undefined;
 
 	const op = conjunct.expression.operator;
 
 	if (op === '=' || op === '==') return equiJoinSelectivity(conjunct, leftOrigin, rightOrigin, context);
 
+	// `extractEquiJoinColumns` accepts only `=`, so the catalog declines a `<>` and
+	// `joinSelectivity` answers from NaiveStatsProvider, which is capped at 0.5. The
+	// complement is therefore bounded to [0.5, 1] — it can only ever relax the
+	// estimate relative to DEFAULT_FILTER_SELECTIVITY, and the true value for a
+	// cross-relation `<>` is near 1, so the bound errs in the right direction.
 	if (op === '!=' || op === '<>') {
 		const eq = equiJoinSelectivity(conjunct, leftOrigin, rightOrigin, context);
 		return eq === undefined ? undefined : 1 - eq;

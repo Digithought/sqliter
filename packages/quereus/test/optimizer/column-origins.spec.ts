@@ -140,6 +140,41 @@ describe('collectColumnOrigins', () => {
 		expect(collectColumnOrigins(filter!.source).size).to.equal(0);
 	});
 
+	it('attributes nothing under a set operation', () => {
+		// A set operation forwards its LEFT branch's attribute ids while carrying rows
+		// from both branches, so those ids describe no single base-table column.
+		const plan = optimized(db, "select * from (select id, cat from o union all select id, cat from r) z where z.cat = 'a'");
+		const filter = findFirst(plan, FilterNode);
+		expect(filter, 'expected a Filter over the set operation').to.not.be.undefined;
+
+		expect(collectColumnOrigins(filter!.source).size).to.equal(0);
+	});
+
+	it('attributes the base-table side of a join whose other side is a set operation', () => {
+		const plan = optimized(db,
+			'select * from o join (select id, cat from r union all select id, cat from r) z on z.id = o.id');
+		const origins = collectColumnOrigins(findJoin(plan));
+
+		// Only `o`'s four columns; nothing from under the union.
+		expect(origins.size).to.equal(4);
+		expect(distinctRefs(origins).size).to.equal(1);
+		expect([...distinctSchemas(origins)][0].name).to.equal('o');
+	});
+
+	it('does not reach a table referenced only inside a predicate subquery', () => {
+		// The walk descends relations, so a subquery hanging off the Filter's PREDICATE
+		// is never traversed: its inner columns stay out of the map and any conjunct
+		// referencing them reads as unknown instead of being matched by column name.
+		const plan = optimized(db, 'select * from o join r on o.rid = r.id where o.qty = (select max(qty) from r r2)');
+		const filter = findFirst(plan, FilterNode);
+		expect(filter, 'expected a residual Filter over the join').to.not.be.undefined;
+
+		const origins = collectColumnOrigins(filter!.source);
+		// `o` (4 columns) and the joined `r` (3) only — `r2` contributes nothing.
+		expect(origins.size).to.equal(7);
+		expect(distinctRefs(origins).size).to.equal(2);
+	});
+
 	it('dedupes shared subtrees rather than walking them twice', () => {
 		// A CTE referenced twice can put the same node instance under both sides.
 		const plan = optimized(db, 'with c as (select id, qty from o) select * from c x join c y on x.id = y.id');
