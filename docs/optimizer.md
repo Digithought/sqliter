@@ -250,6 +250,22 @@ Cost estimation is centralized in `src/planner/cost/index.ts`:
 - Tunable parameters via `OptimizerTuning`
 - Clear units (rows, cost units, bytes)
 
+#### Conjunct cost tiers
+
+`cost/conjunct-cost.ts` ranks WHERE/HAVING conjuncts for
+`rule-filter-conjunct-ordering` on a two-part key: a coarse `ConjunctCostTier`
+(`Pure` < `Volatile` < `Subquery`) first, `getTotalCost()` only as the
+within-tier tiebreak. Raw subtree cost alone misorders: node-count-derived cost
+does not model "opens a whole sub-program per row", so a tableless scalar
+subquery (`(select f())`, ≈0.051) costs *less* than a three-term arithmetic
+expression (≈0.053) and barely more than a modulo — pure cost would run the
+subquery before the arithmetic. The tier is the structural signal instead: any
+relational descendant ⇒ `Subquery`, else any non-deterministic node ⇒
+`Volatile`, else `Pure`. The module is deliberately **not** re-exported from
+`cost/index.ts` — `nodes/filter.ts` imports `cost/index.ts`, and conjunct-cost
+imports plan-node + characteristics, so a re-export would create an import
+cycle.
+
 #### Self-cost-only convention
 
 > **Invariant:** [OPT-016](invariants.md#opt-016--estimatedcost-is-self-cost-only), [OPT-018](invariants.md#opt-018--the-total-cost-memo-is-invalidated-on-mutation)

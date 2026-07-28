@@ -25,8 +25,10 @@ import { createScalarFunction } from '../src/func/registration.js';
  *     instruction and note; only N > 1 takes the early-exit path.
  *
  * Evaluation *ordering* (putting the cheap conjunct first) is deliberately NOT this
- * ticket's job — a predicate written expensive-conjunct-first still pays for every
- * row, and that is asserted here so a later cost-ordering change is a visible diff.
+ * suite's job — that is `rule-filter-conjunct-ordering` (PostOptimization), covered
+ * by where-conjunct-ordering.spec.ts. One cross-check below pins that the two
+ * features compose: an expensive conjunct written first is reordered behind the
+ * cheap one and then early-exited like any other.
  */
 
 async function collect(db: Database, sql: string): Promise<Array<Record<string, SqlValue>>> {
@@ -86,13 +88,13 @@ describe('Filter conjunct early exit', () => {
 			expect(calls).to.equal(3);
 		});
 
-		// Ordering is a separate concern (cost-based conjunct ordering); the split
-		// preserves source order, so an expensive conjunct written first still runs
-		// for every row. Pinned so a later ordering change shows up as a diff here.
-		it('an expensive conjunct written FIRST still runs for every row (ordering is not split)', async () => {
+		// The split preserves source order; ordering is `rule-filter-conjunct-ordering`
+		// (PostOptimization), which puts the cheap conjunct first so early exit pays
+		// off for BOTH written orders. This pinned 12 calls before that rule landed.
+		it('an expensive conjunct written FIRST is reordered and then early-exited', async () => {
 			const rows = await collect(db, 'select id from t where sidefx() = 1 and v % 5 = 2 order by id');
 			expect(rows.map(r => r.id)).to.deep.equal([2, 7, 12]);
-			expect(calls).to.equal(12);
+			expect(calls, 'cost ordering runs the volatile conjunct only for surviving rows').to.equal(3);
 		});
 
 		it('a NULL conjunct rejects every row and stops before the next conjunct', async () => {
@@ -219,6 +221,9 @@ describe('Filter conjunct early exit', () => {
 		// the ORDER BY here once that lands.
 		// A genuinely pending conjunct between two synchronous ones: the loop must await
 		// it, resume on the right row, and still stop at the first non-true conjunct.
+		// The trailing conjunct is a (cached) subquery rather than `v > 2` so that
+		// `rule-filter-conjunct-ordering` (Pure < Volatile < Subquery) keeps the async
+		// volatile call in the MIDDLE — a bare pure conjunct would sort ahead of it.
 		it('an asynchronous conjunct interleaves with synchronous ones', async () => {
 			// Registered through the internal factory: `Database.createScalarFunction`
 			// types its callback as synchronous, while the engine's `ScalarFunc` accepts
@@ -231,8 +236,8 @@ describe('Filter conjunct early exit', () => {
 					return 1;
 				},
 			));
-			const rows = await collect(db, 'select id from t where v % 5 = 2 and slowfx() = 1 and v > 2 order by id');
-			expect(rows.map(r => r.id)).to.deep.equal([7, 12]);
+			const rows = await collect(db, 'select id from t where v % 5 = 2 and slowfx() = 1 and (select max(id) from t t2) >= 10 order by id');
+			expect(rows.map(r => r.id)).to.deep.equal([2, 7, 12]);
 			expect(calls, 'the async conjunct runs only for the 3 rows the first conjunct kept').to.equal(3);
 		});
 

@@ -6,10 +6,9 @@ The catalog of optimizer rewrite rules, plus deep-dives on the predicate and
 cardinality families. The pass framework these rules register into, and the audit
 discipline every rule declares, live in [the optimizer hub](optimizer.md).
 
-> **NOTE:** this doc has no ratchet entry, so the 12,000-word cap governs it, and it is
-> already within ~1,700 words of that cap. When the catalog outgrows it, split at the
-> `src/planner/rules/` subdirectory boundary — the predicate and cardinality deep-dives
-> below the catalog come out cleanly as their own topic doc.
+> **NOTE:** unratcheted — the 12,000-word cap governs, and this doc sits AT it. Next
+> addition: split at the `src/planner/rules/` subdirectory boundary; the deep-dives
+> below the catalog become their own topic doc.
 
 ## Optimization Rules
 
@@ -24,8 +23,8 @@ Rules are organized by optimization family in `src/planner/rules/`:
 
 **Caching** (`cache/`)
 - `ruleCteOptimization`: Adds caching to frequently-accessed CTEs
-- *(retired)* Uncorrelated IN-subquery caching. Previously `ruleInSubqueryCache` wrapped the source in an eager CacheNode; that mechanism degraded to O(N×K) once the inner result crossed the cache threshold and re-drove the subquery per outer row. `emitIn` now materializes an uncorrelated, functional `x IN (subquery)` source once per execution into a probed lookup set (O(K + N·log K), zero statistics — see `docs/runtime-caching.md` § IN-subquery set probe and quereus-in-subquery-set-probe). Correlated / non-deterministic sources keep the per-outer-row streaming path.
-- `MaterializationAdvisory`: Global analysis for cache injection. Runs once over the whole plan as a dedicated custom-`execute` pass (`PassId.Materialization`, order 35), not as a per-node rule.
+- *(retired)* Uncorrelated IN-subquery caching (`ruleInSubqueryCache`): superseded by `emitIn`'s once-per-execution probed lookup set (`docs/runtime-caching.md` § IN-subquery set probe); correlated / non-deterministic sources keep the per-outer-row streaming path.
+- `MaterializationAdvisory`: Global cache-injection analysis; a dedicated custom-`execute` pass (`PassId.Materialization`, order 35) over the whole plan, not a per-node rule.
 - `ruleMaterializedViewRewrite`: Automatic materialized-view query rewrite (read side). Rewrites an *arbitrary* scan-projection-filter, 1:1-join, or grouped-aggregate query that never names an MV to scan (and, for an aggregate rollup, re-aggregate) the MV's backing table when a covering MV answers it — including eliminating a 1:1 inner/cross join at read time. Registered on both `Project` (projection-filter + join arms) and `Aggregate`. See § [Materialized-view query rewrite (read side)](#materialized-view-query-rewrite-read-side).
 - `ruleMutatingSubqueryCache`: Ensures mutating subqueries execute once
 - `ruleScalarCSE`: Scalar common subexpression elimination. Detects duplicate deterministic scalar expressions across a ProjectNode and its child chain (Filter, Sort), injects a lower ProjectNode that computes each deduplicated expression once, and replaces duplicates with column references. Skips bare column references, literals, and non-deterministic expressions. Runs in the Structural pass.
@@ -54,6 +53,7 @@ Rules are organized by optimization family in `src/planner/rules/`:
 - `ruleSargableRangeRewrite`: Rewrites `f(col) = c` into `col >= lower(c) AND col < upper(c)` using `LogicalType.bucketBounds`, restoring sargability for bare-column equality on lossy-monotone transforms (notably `date(ts) = D`). Structural pass — ahead of `aggregate-predicate-pushdown` / `predicate-pushdown` so the rewritten range flows through the rest of the predicate pipeline. See § [Sargable range rewrites](#sargable-range-rewrites) for the wiring (function-schema `rangeRewriteOnArg` trait + per-type `bucketBounds`) and the identity/null/parameter guards.
 - `ruleFilterContradiction`: Recognises when a Filter's predicate, conjoined with the source's `domainConstraints` and literal `constantBindings`, is provably unsatisfiable and emits `EmptyRelationNode` carrying the Filter's own attribute IDs / RelationType. Structural pass, downstream of `rule-empty-relation-folding` so the cascade can collapse the surrounding subtree. Reasoning is per-column range/enum intersection (`planner/analysis/sat-checker.ts`); OR / CASE / cross-column arithmetic stay out of scope. See § [Predicate contradiction detection](#predicate-contradiction-detection).
 - `ruleEmptyRelationFolding`: Cascades `EmptyRelationNode` up through immediate `Filter` / `Project` / `Sort` / `LimitOffset` / `Distinct` / inner-or-cross-or-semi-anti joins, lifting the host's attribute IDs / RelationType onto the new empty result. Also folds `Filter(_, false|null|0)` directly. Structural pass — after the IND rules so anti-join-to-empty rewrites can cascade in the same visit. See § [Empty-relation folding](#empty-relation-folding).
+- `ruleFilterConjunctOrdering` (id `filter-conjunct-ordering`): Sorts a Filter's top-level AND conjuncts cheapest-first by conjunct cost tier ([Cost Model Integration](optimizer.md#cost-model-integration)) so early exit skips expensive conjuncts for rows a cheap one rejects. Stable sort (ties keep source order). Sound: AND commutes under three-valued logic and a Filter rejects `false` and `NULL` alike. Refuses side-effecting subtrees, returns null when already ordered (the fixed point), preserves the stamped `selectivity`. PostOptimization, registered last — after all Structural predicate reshapes, `filter-selectivity`, and (bottom-up) `scalar-subquery-cache`.
 
 **Subquery** (`subquery/`)
 - `ruleSubqueryDecorrelation`: Transforms correlated EXISTS/IN subqueries in WHERE-clause filters into semi/anti joins, enabling hash join selection and eliminating per-row re-execution. Handles: correlated EXISTS → semi join, NOT EXISTS → anti join, correlated IN → semi join. NOT IN is deferred (NULL semantics complexity). Runs in the Structural pass (after predicate pushdown).
@@ -62,8 +62,7 @@ Rules are organized by optimization family in `src/planner/rules/`:
 - `ruleSemiJoinFkTrivial`: `SemiJoin(L, R)` whose equi-pairs cover a non-null FK on L referencing R's PK (with R a row-preserving path to its base table) rewrites to `L` when every FK column is `NOT NULL`, otherwise to `Filter(L, fk_col IS NOT NULL AND …)`. Structural pass, after `rule-subquery-decorrelation` has materialized `EXISTS / IN` as semi joins. See § [Inclusion-dependency reasoning](#key-driven-row-count-reduction).
 - `ruleAntiJoinFkEmpty`: `AntiJoin(L, R)` with the same preconditions rewrites to `EmptyRelationNode` carrying L's attribute IDs and `RelationType` — every (non-null) L row is guaranteed a parent in R, so the anti-join is empty. Structural pass; the empty result then feeds `rule-empty-relation-folding` for further cascade. See § [Inclusion-dependency reasoning](#key-driven-row-count-reduction).
 
-**Constant Folding** (pass)
-- Constant folding pass: Evaluates constant expressions at plan time
+**Constant Folding** (pass): evaluates constant expressions at plan time
 
 ## Materialized-view query rewrite (read side)
 

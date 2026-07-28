@@ -31,6 +31,7 @@ import { ruleFilterMerge } from './rules/predicate/rule-filter-merge.js';
 import { rulePredicateInferenceEquivalence } from './rules/predicate/rule-predicate-inference-equivalence.js';
 import { ruleSargableRangeRewrite } from './rules/predicate/rule-sargable-range-rewrite.js';
 import { ruleFilterSelectivity } from './rules/predicate/rule-filter-selectivity.js';
+import { ruleFilterConjunctOrdering } from './rules/predicate/rule-filter-conjunct-ordering.js';
 import { ruleJoinKeyInference } from './rules/join/rule-join-key-inference.js';
 import { ruleJoinGreedyCommute } from './rules/join/rule-join-greedy-commute.js';
 import { ruleJoinElimination, ruleJoinEliminationUnderAggregate } from './rules/join/rule-join-elimination.js';
@@ -1128,6 +1129,26 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		fn: ruleScalarSubqueryCache,
 		// Gates on isFunctional(inner) (deterministic + read-only).
 		sideEffectMode: 'aware',
+	},
+
+	// Conjunct ordering: reorder a Filter's top-level AND conjuncts cheapest-first
+	// so the emitter's early exit skips expensive conjuncts. Placed at the END of
+	// the PostOptimization block: every rule that reshapes a predicate
+	// (sargable-range-rewrite, predicate-pushdown, filter-merge,
+	// predicate-inference-equivalence — all Structural) has finished, and
+	// filter-selectivity (Physical) has stamped its estimate, so the conjunct set
+	// is final and ordering it once is stable. PostOptimization is bottom-up, so a
+	// conjunct's subquery subtree has already been through scalar-subquery-cache
+	// when the Filter above it is visited — the cost read is the final one.
+	{
+		pass: PassId.PostOptimization,
+		id: 'filter-conjunct-ordering',
+		nodeType: PlanNodeType.Filter,
+		phase: 'rewrite',
+		fn: ruleFilterConjunctOrdering,
+		// Reordering changes per-conjunct evaluation counts under early exit;
+		// the rule refuses when any conjunct's subtree has side effects.
+		sideEffectMode: 'safe',
 	},
 
 	// NOTE: The materialization advisory no longer registers per-node-type rules.

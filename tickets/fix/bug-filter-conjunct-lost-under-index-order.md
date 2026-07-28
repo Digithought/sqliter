@@ -33,7 +33,13 @@ All four together. Change any one and the query is correct again:
 - An `order by` the table's own index already satisfies — `order by id` on the
   primary key breaks it, `order by id desc` does not.
 - The filtered column is **not** in the select list. `select id, flag from o …`
-  with the same `where` and `order by` returns the right row.
+  with the same `where` and `order by` returns the right row. **Caveat (found
+  while testing conjunct cost ordering):** this near-miss holds only for the
+  two-conjunct shape. With THREE conjuncts — a pushable column comparison, a
+  non-pushable arithmetic one, and a sub-select — the pushed conjunct is dropped
+  even when its column IS selected: `select id, k from t where k = 2 and
+  v % 5 = 2 and (select count(*) from t) = 12 order by id` loses `k = 2`.
+  `order by id desc` remains a working dodge in that shape.
 
 Not affected: `delete from o where …` with the same predicate deletes the
 correct row.
@@ -86,3 +92,7 @@ and absent from the plan.
 - `packages/quereus/test/filter-conjunct-early-exit.spec.ts` has a test
   (`a subquery conjunct is skipped for rows an earlier conjunct rejected`) whose
   `order by id` was removed to dodge this bug; restore it once this lands.
+- `packages/quereus/test/where-conjunct-ordering.spec.ts` and
+  `packages/quereus/test/logic/07.7.4-where-conjunct-ordering.sqllogic` each
+  carry a `NOTE:`-tagged `order by id desc` dodge for the three-conjunct shape
+  above; restore ascending order there too.
