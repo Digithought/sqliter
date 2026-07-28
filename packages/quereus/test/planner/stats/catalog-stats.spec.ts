@@ -8,6 +8,12 @@ import type { ScalarPlanNode } from '../../../src/planner/nodes/plan-node.js';
 import type { SqlValue } from '../../../src/common/types.js';
 import { NaiveStatsProvider } from '../../../src/planner/stats/index.js';
 
+// What NaiveStatsProvider answers for a UnaryOp when the catalog declines — its
+// `estimatePredicateSelectivity` switch does not list UnaryOp, so the fallback is
+// `defaultSelectivity`. Asserting this (rather than just "is a number") is what
+// distinguishes "fell back" from "estimated".
+const NAIVE_UNARY_SELECTIVITY = 0.3;
+
 // ── Mock factories ──────────────────────────────────────────────────────
 
 function mockColumnRef(name: string): ScalarPlanNode {
@@ -242,9 +248,12 @@ describe('CatalogStatsProvider', () => {
 			const provider = new CatalogStatsProvider();
 			const table = makeTableSchema('t', makeStats(100, { col: { distinctCount: 10 } }));
 			// A bare column reference carries no comparison to estimate, so the inner
-			// estimate is unknown and NOT has nothing to negate.
-			const sel = provider.selectivity(table, mockUnaryOp('NOT', mockColumnRef('col')));
-			expect(sel).to.be.a('number');
+			// estimate is unknown and NOT has nothing to negate. Assert through
+			// statsOnlySelectivity: `selectivity` always answers, so it cannot tell a
+			// real estimate apart from the naive guess.
+			const pred = mockUnaryOp('NOT', mockColumnRef('col'));
+			expect(provider.statsOnlySelectivity(table, pred)).to.be.undefined;
+			expect(provider.selectivity(table, pred)).to.equal(NAIVE_UNARY_SELECTIVITY);
 		});
 
 		it('NOT negates an estimable operand (1 - inner)', () => {
@@ -257,8 +266,42 @@ describe('CatalogStatsProvider', () => {
 		it('unsupported UnaryOp (e.g. unary minus) returns undefined → fallback', () => {
 			const provider = new CatalogStatsProvider();
 			const table = makeTableSchema('t', makeStats(100, { col: { distinctCount: 10 } }));
-			const sel = provider.selectivity(table, mockUnaryOp('-', mockColumnRef('col')));
-			expect(sel).to.be.a('number');
+			const pred = mockUnaryOp('-', mockColumnRef('col'));
+			expect(provider.statsOnlySelectivity(table, pred)).to.be.undefined;
+			expect(provider.selectivity(table, pred)).to.equal(NAIVE_UNARY_SELECTIVITY);
+		});
+	});
+
+	// ── selectivity: boolean recursion depth ───────────────────────────
+	//
+	// AND / OR decomposition cannot be driven from these mocks: `splitConjuncts`
+	// gates on `instanceof BinaryOpNode`, so a plain object claiming
+	// `nodeType: 'BinaryOp'` never splits. That coverage lives in
+	// test/optimizer/filter-selectivity.spec.ts, which builds real plan nodes from
+	// SQL. NOT dispatches on nodeType alone, so the depth cap is reachable here.
+
+	describe('selectivity — boolean recursion depth', () => {
+		const provider = new CatalogStatsProvider();
+		/** 100 rows, `col` with 10 distinct values → `col = 5` is 1/10. */
+		const table = makeTableSchema('t', makeStats(100, { col: { distinctCount: 10 } }));
+		const eq = (): ScalarPlanNode => mockBinaryOp('=', mockColumnRef('col'), mockLiteral(5));
+
+		const nestNot = (depth: number): ScalarPlanNode => {
+			let pred = eq();
+			for (let i = 0; i < depth; i++) pred = mockUnaryOp('NOT', pred);
+			return pred;
+		};
+
+		it('estimates nesting within the cap', () => {
+			// An even number of NOTs negates back to the operand's own estimate.
+			expect(provider.statsOnlySelectivity(table, nestNot(8))).to.be.closeTo(1 / 10, 1e-12);
+		});
+
+		it('declines past MAX_BOOLEAN_DEPTH instead of recursing without bound', () => {
+			// Well past the cap of 16: the innermost estimate is never reached and
+			// `undefined` propagates back out through every NOT.
+			expect(provider.statsOnlySelectivity(table, nestNot(40))).to.be.undefined;
+			expect(provider.selectivity(table, nestNot(40))).to.equal(NAIVE_UNARY_SELECTIVITY);
 		});
 	});
 

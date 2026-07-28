@@ -247,6 +247,13 @@ export class CatalogStatsProvider implements StatsProvider {
 				if (!operand) return undefined;
 				const inner = this.estimateNode(stats, operand, depth + 1);
 				if (inner === undefined) return undefined;
+				// NOTE: estimateConjunction's "unknown conjunct counts as 1.0" makes an AND
+				// estimate an UPPER bound, and negating flips that into a LOWER bound — so
+				// `not (a = 1 and lower(s) = 'x')` errs low where the AND path claims to err
+				// high. Bounded (the true value is between this and 1) and the direction only
+				// inverts under an explicit NOT, which the planner rarely leaves standing. If
+				// negated mixed-knowledge predicates ever drive a bad plan, track per-estimate
+				// bound direction instead of a bare number.
 				return 1 - inner;
 			}
 		}

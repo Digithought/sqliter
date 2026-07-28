@@ -355,6 +355,12 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 		}
 		for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
 
+		// A deliberately tiny table for the one-row floor: 4 rows, `p`/`q` fully
+		// distinct and non-key, so backoff lands below 1/rowCount.
+		await db.exec('CREATE TABLE tiny (id INTEGER PRIMARY KEY, p INTEGER, q INTEGER) USING memory');
+		for (let i = 1; i <= 4; i++) await db.exec(`INSERT INTO tiny VALUES (${i}, ${i}, ${i})`);
+		for await (const _ of db.eval('ANALYZE tiny')) { /* consume */ }
+
 		table = db.schemaManager.findTable('m') as TableSchema;
 		const stats = table?.statistics;
 		expect(stats, 'ANALYZE should record statistics for m').to.not.be.undefined;
@@ -421,7 +427,21 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 		expect(f, 'expected a residual Filter').to.not.be.undefined;
 		// NaiveStatsProvider's flat BinaryOp heuristic — NOT a combined value.
 		expect(f!.selectivity).to.be.closeTo(0.1, 1e-12);
-		expect(f!.selectivity).to.not.be.closeTo(combineDisjunctive([1 / ndv.a, 1]), 1e-12);
+		// Giving up costs real information: `a = 1` alone already proves the
+		// disjunction cannot be more selective than 1/ndv(a), and the naive answer
+		// sits below that bound. Tracked in backlog feat-or-selectivity-lower-bound.
+		expect(f!.selectivity).to.be.lessThan(1 / ndv.a);
+	});
+
+	it('estimates a mixed known/unknown AND nested under an OR', () => {
+		// Unlike the bare `a = 1 and lower(s) = 'x1'`, nothing can be pushed out of a
+		// disjunct, so this shape reaches the provider fused — the mixed AND is
+		// observable end-to-end here.
+		const f = optimizedFilter(db, "SELECT * FROM m WHERE (a = 1 AND lower(s) = 'x1') OR b = 2");
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		// The AND contributes 1/ndv(a) (unknown conjunct counts as 1.0), then the OR
+		// combines it with `b = 2` assuming independence.
+		expect(f!.selectivity).to.be.closeTo(combineDisjunctive([1 / ndv.a, 1 / ndv.b]), 1e-12);
 	});
 
 	it('keeps many-conjunct estimates in [0, 1] and well above the plain product', () => {
@@ -445,21 +465,33 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 		expect(five!.selectivity).to.be.closeTo(combineConjunctive(participating), 1e-12);
 	});
 
-	it('handles degenerate and mixed boolean nesting without throwing', () => {
-		const cases = [
-			'SELECT * FROM m WHERE ((a = 1))',
-			'SELECT * FROM m WHERE NOT (NOT (a = 1))',
-			'SELECT * FROM m WHERE a = 1 AND (b = 2 OR b = 3)',
-			'SELECT * FROM m WHERE (a = 1 OR b = 2) AND (c = 3 OR d = 4)',
-			"SELECT * FROM m WHERE (a = 1 AND b = 2) OR lower(s) = 'x1'",
-			'SELECT * FROM m WHERE NOT (a = 1 OR b = 2)',
+	it('composes AND / OR / NOT through degenerate and mixed nesting', () => {
+		// Each expectation is written as the composition the recursion should perform,
+		// so a change to either combinator shows up here as a real disagreement rather
+		// than a stale magic number.
+		const cases: [sql: string, expected: () => number][] = [
+			// Redundant parentheses collapse to the bare comparison.
+			['SELECT * FROM m WHERE ((a = 1))', () => 1 / ndv.a],
+			// Double negation returns the operand's own estimate.
+			['SELECT * FROM m WHERE NOT (NOT (a = 1))', () => 1 / ndv.a],
+			// AND over [leaf, OR].
+			['SELECT * FROM m WHERE a = 1 AND (b = 2 OR b = 3)',
+				() => combineConjunctive([1 / ndv.a, combineDisjunctive([1 / ndv.b, 1 / ndv.b])])],
+			// AND over [OR, OR] — two levels of alternation.
+			['SELECT * FROM m WHERE (a = 1 OR b = 2) AND (c = 3 OR d = 4)',
+				() => combineConjunctive([
+					combineDisjunctive([1 / ndv.a, 1 / ndv.b]),
+					combineDisjunctive([1 / ndv.c, 1 / ndv.d]),
+				])],
+			// NOT over an OR.
+			['SELECT * FROM m WHERE NOT (a = 1 OR b = 2)',
+				() => 1 - combineDisjunctive([1 / ndv.a, 1 / ndv.b])],
+			// An unestimable disjunct sinks the whole OR, naive fallback regardless of
+			// the estimable AND on the other side.
+			["SELECT * FROM m WHERE (a = 1 AND b = 2) OR lower(s) = 'x1'", () => 0.1],
 		];
-		for (const sql of cases) {
-			const sel = providerSelectivity(sql);
-			if (sel !== undefined) {
-				expect(sel, sql).to.be.at.least(0);
-				expect(sel, sql).to.be.at.most(1);
-			}
+		for (const [sql, expected] of cases) {
+			expect(providerSelectivity(sql), sql).to.be.closeTo(expected(), 1e-12);
 		}
 	});
 
@@ -467,5 +499,17 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 		const stats = table.statistics!;
 		const sel = providerSelectivity('SELECT * FROM m WHERE a = 1 AND b = 2 AND c = 3 AND d = 4 AND e = 5');
 		expect(sel).to.be.at.least(1 / stats.rowCount);
+	});
+
+	it('the one-row floor binds when backoff would go below it', () => {
+		// Four rows, two non-key columns each fully distinct: backoff gives
+		// 0.25 · √0.25 = 0.125, which is under 1/4 — one row out of four. The floor
+		// must lift it back to exactly 1/4, so the filter cannot claim a fractional row.
+		const raw = 1 / 4 * Math.sqrt(1 / 4);
+		expect(raw, 'the unfloored product must actually be below the floor').to.be.lessThan(1 / 4);
+
+		const f = optimizedFilter(db, 'SELECT * FROM tiny WHERE p = 1 AND q = 2');
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / 4, 1e-12);
 	});
 });

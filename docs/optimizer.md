@@ -327,7 +327,7 @@ The default provider is `CatalogStatsProvider`, which reads real statistics from
 **Boolean decomposition.** `CatalogStatsProvider` estimates recursively over the predicate's boolean structure (`planner/stats/catalog-stats.ts`), so `a = 1 and b = 2` combines two per-column estimates instead of collapsing to one flat guess:
 
 - **`AND`** — flatten with `splitConjuncts`, estimate each, combine the ones that produced a number. A conjunct the provider cannot estimate counts as selectivity `1.0` (no reduction claimed) rather than as the naive `0.1`: the naive number is fabricated, and multiplying it in biases the estimate downward, whereas over-estimating surviving rows is the safer error direction for plan choice. If *every* conjunct is unestimable the provider returns `undefined` and the whole-predicate naive fallback runs as before.
-- **`OR`** — flatten with `splitDisjuncts` and combine with independence, `1 - Π(1 - sᵢ)`. A single unestimable disjunct makes the whole disjunction `undefined`, since an unknown branch cannot be assumed to contribute nothing.
+- **`OR`** — flatten with `splitDisjuncts` and combine with independence, `1 - Π(1 - sᵢ)`. A single unestimable disjunct makes the whole disjunction `undefined`, since an unknown branch cannot be assumed to contribute nothing. This discards a bound the provider already holds — a disjunction is never more selective than its most selective estimable branch, so the naive `0.1` that follows can sit *below* a provable floor; lifting it is parked in backlog `feat-or-selectivity-lower-bound`.
 - **`NOT`** — `1 - inner`; `undefined` propagates.
 - Recursion is capped at `MAX_BOOLEAN_DEPTH` (16); anything else is a leaf and goes through the existing per-node column-statistics switch.
 
