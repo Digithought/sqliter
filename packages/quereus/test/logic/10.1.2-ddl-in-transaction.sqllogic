@@ -6,6 +6,14 @@
 --
 -- Runs against every backend (memory, store). Each statement is its own block so an
 -- expected failure is attributed to exactly one statement.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- NOTE: §3 and §5 exercise `alter table ... add constraint ... unique`, a different statement
+-- from `create index`. Capability granularity is whole-file, so they ride along under the same
+-- token. That is right today — no backend is known to support one and not the other. If a
+-- backend ever reports it supports `add constraint ... unique` but not standalone index DDL,
+-- split this file rather than adding a second token speculatively.
 
 -- ===================================
 -- 1. create unique index over rows the transaction just inserted

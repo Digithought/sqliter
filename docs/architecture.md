@@ -214,6 +214,7 @@ Quereus employs a multi-faceted testing strategy:
 1.  **SQL Logic Tests (`test/logic/`)**
 	*   Inspired by SQLite's own testing methodology.
 	*   Uses simple text files (`*.sqllogic`) containing SQL statements and their expected JSON results (using `→` marker) or expected error messages (using `-- error:` directive).
+	*   `-- requires-capability: <tokens>` lets a file declare database features it needs, so a backend that deliberately lacks one skips the whole file instead of maintaining its own file list. The corpus is shared across projects, so the format is a cross-repo contract — spec lives in [`packages/quereus/test/README.md`](../packages/quereus/test/README.md) § `-- requires-capability:` directive.
 	*   Driven by a Mocha test runner (`test/logic.spec.ts`) that executes the SQL against a fresh `Database` instance for each file.
 	*   **Configurable Diagnostics** — on unexpected failures, the test runner provides clean error messages by default with optional detailed diagnostics controlled by command line arguments:
 		*   `yarn test --verbose` — show execution progress during tests

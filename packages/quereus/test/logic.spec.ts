@@ -9,6 +9,13 @@ import { QuereusError } from '../src/common/errors.js';
 import { safeJsonStringify } from '../src/util/serialization.js';
 import { CollectingInstructionTracer } from '../src/runtime/types.js';
 import { formatPlanTree, formatPlanSummary, type PlanDisplayOptions } from '../src/planner/debug.js';
+import {
+	parseRequiredCapabilities,
+	missingCapability,
+	MEMORY_BACKEND_CAPABILITIES,
+	STORE_BACKEND_CAPABILITIES,
+	type SqllogicCapability,
+} from './logic-capabilities.js';
 
 config.truncateThreshold = 1000;
 config.includeStack = true;
@@ -35,7 +42,17 @@ const __dirname = path.dirname(__filename);
 // Store mode configuration
 const USE_STORE_MODULE = process.env.QUEREUS_TEST_STORE === 'true' || process.env.QUEREUS_TEST_STORE === '1';
 
-// Files that are explicitly memory-module-specific and should be skipped in store mode
+// What this backend accepts, for the `-- requires-capability:` directive in .sqllogic files
+// (see logic-capabilities.ts and test/README.md).
+const BACKEND_CAPABILITIES = USE_STORE_MODULE ? STORE_BACKEND_CAPABILITIES : MEMORY_BACKEND_CAPABILITIES;
+
+// Files that are explicitly memory-module-specific and should be skipped in store mode.
+//
+// Split rule vs the capability directive: capability-shaped divergence — the store deliberately
+// does not accept some whole class of SQL statement — belongs in a `-- requires-capability:`
+// line in the file itself, so every consumer of the shared corpus honours it. This set is for
+// everything else: memory-engine quirks, cost-model choices, harness-config assertions,
+// white-box internals, and tracked store bugs. None of the entries below is capability-shaped.
 const MEMORY_ONLY_FILES = new Set([
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
   // '10.1.3.1-ddl-drop-savepoint-memory.sqllogic' was folded into 10.1.3-ddl-drop-in-transaction.sqllogic § 4. It was memory-only because the STORE leg diverged: store mode runs behind the isolation layer, which used to rebuild its staging overlay on index DDL and so lost rows staged before the savepoint. With that adopt now in place (bug-isolation-index-ddl-rebuild-drops-savepoint-writes) the store leg matches plain memory on the whole sequence — pre-savepoint rows kept, and the DROP not undone by `rollback to savepoint`
@@ -478,6 +495,30 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 	});
 
 	for (const file of files) {
+		const filePath = path.join(logicTestDir, file);
+		const content = fs.readFileSync(filePath, 'utf-8');
+
+		// A malformed directive must fail exactly one file, not abort suite registration.
+		let required: ReadonlySet<SqllogicCapability>;
+		try {
+			required = parseRequiredCapabilities(file, content);
+		} catch (parseError: any) {
+			const error = parseError instanceof Error ? parseError : new Error(String(parseError));
+			describe(`File: ${file}`, () => {
+				it('should declare valid capability directives', () => { throw error; });
+			});
+			continue;
+		}
+
+		// Capability skip is evaluated before MEMORY_ONLY_FILES so its more specific message wins.
+		const missing = missingCapability(required, BACKEND_CAPABILITIES);
+		if (missing) {
+			describe(`File: ${file}`, () => {
+				it.skip(`skipped: backend lacks capability "${missing}"`, () => {});
+			});
+			continue;
+		}
+
 		// Skip memory-only files in store mode
 		if (USE_STORE_MODULE && MEMORY_ONLY_FILES.has(file)) {
 			describe(`File: ${file}`, () => {
@@ -485,9 +526,6 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 			});
 			continue;
 		}
-
-		const filePath = path.join(logicTestDir, file);
-		const content = fs.readFileSync(filePath, 'utf-8');
 
 		describe(`File: ${file}`, () => {
 			let db: Database;
