@@ -12,11 +12,20 @@ import type { StatsProvider } from './index.js';
 import { NaiveStatsProvider } from './index.js';
 import { createLogger } from '../../common/logger.js';
 import { selectivityFromHistogram } from './histogram.js';
+import { combineConjunctive, combineDisjunctive } from './selectivity-combine.js';
+import { splitConjuncts, splitDisjuncts } from '../analysis/predicate-conjuncts.js';
 import type { BinaryOpNode, LiteralNode, BetweenNode, UnaryOpNode } from '../nodes/scalar.js';
 import type { ColumnReferenceNode } from '../nodes/reference.js';
 import type { InNode } from '../nodes/subquery.js';
 
 const log = createLogger('optimizer:stats:catalog');
+
+/**
+ * Guard against unbounded recursion through nested OR / NOT structures.
+ * (AND and OR levels are each flattened in one step, so this only bites on
+ * genuinely alternating boolean nesting.)
+ */
+const MAX_BOOLEAN_DEPTH = 16;
 
 // ── Statistics data structures ──────────────────────────────────────────
 
@@ -185,12 +194,140 @@ export class CatalogStatsProvider implements StatsProvider {
 		return colStats?.distinctCount;
 	}
 
+	/**
+	 * Entry point for predicate selectivity: short-circuit the empty table, then
+	 * walk the predicate's boolean structure.
+	 */
 	private estimatePredicateSelectivity(
 		stats: TableStatistics,
 		predicate: ScalarPlanNode
 	): number | undefined {
 		if (stats.rowCount === 0) return 0;
+		return this.estimateNode(stats, predicate, 0);
+	}
 
+	/**
+	 * Recurse over the boolean structure (AND / OR / NOT) of a predicate,
+	 * delegating anything else to {@link estimateLeaf}.
+	 *
+	 * Returns undefined when nothing useful can be said, which lets `selectivity`
+	 * fall through to the naive provider exactly as it did before this recursion
+	 * existed.
+	 */
+	private estimateNode(
+		stats: TableStatistics,
+		node: ScalarPlanNode,
+		depth: number
+	): number | undefined {
+		if (depth > MAX_BOOLEAN_DEPTH) return undefined;
+
+		if (node.nodeType === 'BinaryOp') {
+			// Planner convention is uppercase 'AND' / 'OR' (see predicate-normalizer).
+			const op = (node as unknown as BinaryOpNode).expression.operator;
+			if (op === 'AND') return this.estimateConjunction(stats, node, depth);
+			if (op === 'OR') return this.estimateDisjunction(stats, node, depth);
+		}
+
+		if (node.nodeType === 'UnaryOp') {
+			// 'NOT' is boolean structure; the other unary operators ('IS NULL' etc.)
+			// are leaves and fall through to estimateLeaf below.
+			if ((node as unknown as UnaryOpNode).expression.operator === 'NOT') {
+				// Read the operand through getChildren() rather than `.operand`, matching
+				// how the rest of this file introspects nodes structurally.
+				const operand = node.getChildren()[0] as ScalarPlanNode | undefined;
+				if (!operand) return undefined;
+				const inner = this.estimateNode(stats, operand, depth + 1);
+				if (inner === undefined) return undefined;
+				return 1 - inner;
+			}
+		}
+
+		return this.estimateLeaf(stats, node);
+	}
+
+	/**
+	 * AND: estimate each conjunct and combine the ones we could estimate.
+	 *
+	 * An unestimable conjunct is treated as selectivity 1.0 (claim no reduction)
+	 * rather than handed to NaiveStatsProvider's flat 0.1. That number is
+	 * fabricated, and multiplying it in biases the whole estimate downward;
+	 * over-estimating surviving rows is the safer error direction for plan choice.
+	 * Concretely `a = 1 and lower(b) = 'x'` now estimates 1/ndv(a) where it used to
+	 * estimate 0.1 — a deliberate change, not a regression.
+	 *
+	 * If *every* conjunct is unknown we return undefined so the whole-predicate
+	 * naive fallback in `selectivity()` still runs.
+	 */
+	private estimateConjunction(
+		stats: TableStatistics,
+		node: ScalarPlanNode,
+		depth: number
+	): number | undefined {
+		const conjuncts = splitConjuncts(node);
+		// splitConjuncts only descends through real BinaryOpNode instances; if it
+		// handed back the node itself there is nothing to decompose.
+		if (conjuncts.length === 1 && conjuncts[0] === node) return this.estimateLeaf(stats, node);
+
+		const known: number[] = [];
+		for (const conjunct of conjuncts) {
+			const sel = this.estimateNode(stats, conjunct, depth + 1);
+			if (sel !== undefined) known.push(sel);
+		}
+		if (known.length === 0) return undefined;
+
+		// NOTE: conjuncts on the *same* column (`a > 1 and a < 10`) are strongly
+		// anti-correlated and are not paired into a single range here. Exponential
+		// backoff damps the error (0.333 · √0.333 ≈ 0.19 instead of 0.11) but does
+		// not remove it; same-column range pairing would.
+		return this.floorCombined(stats, combineConjunctive(known), known.length);
+	}
+
+	/**
+	 * OR: estimate every disjunct, or give up.
+	 *
+	 * Unlike AND there is no safe default for an unknown disjunct — assuming 1.0
+	 * would make the whole disjunction 1.0 (safe but useless), and assuming 0
+	 * would silently drop a branch that may match everything. So a single unknown
+	 * disjunct makes the whole OR unknown.
+	 */
+	private estimateDisjunction(
+		stats: TableStatistics,
+		node: ScalarPlanNode,
+		depth: number
+	): number | undefined {
+		const disjuncts = splitDisjuncts(node);
+		// See estimateConjunction: nothing to decompose when the walk is a no-op.
+		if (disjuncts.length === 1 && disjuncts[0] === node) return this.estimateLeaf(stats, node);
+
+		const sels: number[] = [];
+		for (const disjunct of disjuncts) {
+			const sel = this.estimateNode(stats, disjunct, depth + 1);
+			if (sel === undefined) return undefined;
+			sels.push(sel);
+		}
+		if (sels.length === 0) return undefined;
+
+		return this.floorCombined(stats, combineDisjunctive(sels), sels.length);
+	}
+
+	/**
+	 * Never claim fewer than one surviving row once two or more selectivities were
+	 * actually combined. Deliberately not applied to a single leaf estimate:
+	 * `IS NULL` on a column with nullCount 0 legitimately returns 0 today, and
+	 * `FilterNode.estimatedRows` already floors the row count at 1.
+	 */
+	private floorCombined(stats: TableStatistics, sel: number, combinedCount: number): number {
+		if (combinedCount < 2) return sel;
+		// rowCount === 0 short-circuits in estimatePredicateSelectivity, so the
+		// max() here only guards against a negative / absent count.
+		return Math.max(sel, 1 / Math.max(stats.rowCount, 1));
+	}
+
+	/** Estimate a single (non-boolean) comparison against column statistics. */
+	private estimateLeaf(
+		stats: TableStatistics,
+		predicate: ScalarPlanNode
+	): number | undefined {
 		// Try to extract column reference from the predicate for column-level estimation
 		const colInfo = extractColumnFromPredicate(predicate);
 		if (!colInfo) return undefined;
@@ -281,6 +418,11 @@ export class CatalogStatsProvider implements StatsProvider {
 
 function extractColumnFromPredicate(predicate: ScalarPlanNode): { columnName: string } | undefined {
 	// BinaryOp, In, Between, UnaryOp all typically have a column child
+	// NOTE: for a column-vs-column comparison on one table (`where x = y`) this
+	// picks the first ColumnReference and the caller finds no literal, so `=`
+	// yields 1/ndv(x) — wrong, since it models "x equals a constant" rather than
+	// "x equals another varying column". Pre-existing; fixing it needs a real
+	// two-sided comparison classifier.
 	const children = predicate.getChildren();
 	for (const child of children) {
 		if (child.nodeType === 'ColumnReference') {
@@ -307,7 +449,10 @@ function extractConstantValue(predicate: ScalarPlanNode): SqlValue | undefined {
 function extractInListSize(predicate: ScalarPlanNode): number | undefined {
 	const node = predicate as unknown as InNode;
 	if (Array.isArray(node.values)) return node.values.length;
-	// Some IN nodes store the list in children after the first (column) child
+	// Some IN nodes store the list in children after the first (column) child.
+	// NOTE: `x in (select …)` has no value list, so this falls to children.length-1
+	// === 1 and the caller reports 1/ndv — the estimate for a single equality
+	// rather than for the subquery's real cardinality. Pre-existing.
 	const children = predicate.getChildren();
 	if (children.length > 1) return children.length - 1;
 	return undefined;

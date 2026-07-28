@@ -238,10 +238,26 @@ describe('CatalogStatsProvider', () => {
 			expect(provider.selectivity(table, mockUnaryOp('IS NOT NULL', mockColumnRef('col')))).to.equal(1 - 40 / 200);
 		});
 
-		it('unsupported UnaryOp (e.g. NOT) returns undefined → fallback', () => {
+		it('NOT over an unestimable operand returns undefined → fallback', () => {
 			const provider = new CatalogStatsProvider();
 			const table = makeTableSchema('t', makeStats(100, { col: { distinctCount: 10 } }));
+			// A bare column reference carries no comparison to estimate, so the inner
+			// estimate is unknown and NOT has nothing to negate.
 			const sel = provider.selectivity(table, mockUnaryOp('NOT', mockColumnRef('col')));
+			expect(sel).to.be.a('number');
+		});
+
+		it('NOT negates an estimable operand (1 - inner)', () => {
+			const provider = new CatalogStatsProvider();
+			const table = makeTableSchema('t', makeStats(100, { col: { distinctCount: 10 } }));
+			const inner = mockBinaryOp('=', mockColumnRef('col'), mockLiteral(5)); // 1/10
+			expect(provider.selectivity(table, mockUnaryOp('NOT', inner))).to.be.closeTo(1 - 1 / 10, 1e-12);
+		});
+
+		it('unsupported UnaryOp (e.g. unary minus) returns undefined → fallback', () => {
+			const provider = new CatalogStatsProvider();
+			const table = makeTableSchema('t', makeStats(100, { col: { distinctCount: 10 } }));
+			const sel = provider.selectivity(table, mockUnaryOp('-', mockColumnRef('col')));
 			expect(sel).to.be.a('number');
 		});
 	});

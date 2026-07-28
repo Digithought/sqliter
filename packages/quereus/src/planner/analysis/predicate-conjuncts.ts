@@ -2,9 +2,10 @@
  * Conjunct helpers for predicate rewriting.
  *
  * `splitConjuncts` flattens an AND-tree into its individual conjuncts;
- * `combineConjuncts` rebuilds an AND-tree from a list. Operators that need to
- * partition / push / inspect predicates conjunct-by-conjunct (subquery
- * decorrelation, aggregate predicate pushdown, etc.) share these.
+ * `combineConjuncts` rebuilds an AND-tree from a list. `splitDisjuncts` is the
+ * OR mirror of `splitConjuncts`. Operators that need to partition / push /
+ * inspect predicates conjunct-by-conjunct (subquery decorrelation, aggregate
+ * predicate pushdown, selectivity estimation, etc.) share these.
  */
 
 import type { ScalarPlanNode } from '../nodes/plan-node.js';
@@ -17,6 +18,21 @@ export function splitConjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
 	while (stack.length) {
 		const n = stack.pop()!;
 		if (n instanceof BinaryOpNode && n.expression.operator === 'AND') {
+			stack.push(n.left, n.right);
+		} else {
+			result.push(n);
+		}
+	}
+	return result;
+}
+
+/** Split an OR-tree into its disjuncts. Non-OR predicates yield a single-element list. */
+export function splitDisjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
+	const result: ScalarPlanNode[] = [];
+	const stack: ScalarPlanNode[] = [pred];
+	while (stack.length) {
+		const n = stack.pop()!;
+		if (n instanceof BinaryOpNode && n.expression.operator === 'OR') {
 			stack.push(n.left, n.right);
 		} else {
 			result.push(n);

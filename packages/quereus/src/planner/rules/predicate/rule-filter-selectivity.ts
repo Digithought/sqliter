@@ -37,11 +37,10 @@ export function ruleFilterSelectivity(node: PlanNode, context: OptContext): Plan
 	const tableSchema = extractTableSchema(filter.source);
 	if (!tableSchema) return null;
 
-	// NOTE: conjunctive predicates (`a = 1 and b = 2`) are NOT decomposed. The
-	// CatalogStatsProvider finds no single column child on the AND root and falls
-	// back to NaiveStatsProvider's coarse per-nodeType heuristic (0.1 for any
-	// BinaryOp). Crude but not a regression vs. the old flat 0.5 — conjunction
-	// decomposition is parked in backlog feat-conjunction-and-join-selectivity.
+	// CatalogStatsProvider recurses over the predicate's boolean structure, so
+	// `a = 1 and b = 2` combines the two per-column estimates rather than falling
+	// back to a flat per-nodeType guess. It still returns undefined when it can say
+	// nothing at all, in which case the naive heuristic applies as before.
 	const sel = context.stats.selectivity(tableSchema, filter.predicate);
 	if (sel === undefined) return null;
 
