@@ -203,13 +203,17 @@ error, not as this message.
 - code: `packages/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts` — `fallbackIndexSupports`
 - code: `packages/quereus/src/planner/rules/predicate/rule-predicate-pushdown.ts`
 - guard: `packages/quereus/test/optimizer/remote-grow-retrieve.spec.ts` — `Retrieve growth with supports() (remote query)`
+- guard: `packages/quereus/test/filter-lost-under-index-order.spec.ts` — `Filter conjunct lost under index ordering`
 - doc: [Retrieve § Supported-only placement policy](optimizer-retrieve.md#supported-only-placement-policy)
 
 Everything beneath a `RetrieveNode` is an operation the module committed to executing —
 `supports()` accepted the candidate pipeline, or the index-style `getBestAccessPlan()`
 fallback did. Anything else stays above the boundary as a residual. Both rules that move work
 across the boundary construct a supported-only fragment and leave the remainder above;
-neither pushes a predicate speculatively. Growth over a `supports()` module is purely
+neither pushes a predicate speculatively, and neither pushes into a `Retrieve` whose
+index-style `moduleCtx` is already committed (that context, not `Retrieve.source`, is what
+`rule-select-access-path` physicalizes, so a fragment placed below the boundary afterwards
+would silently never execute). Growth over a `supports()` module is purely
 structural; the index-style fallback additionally demands the access plan beat a sequential
 scan, or provide the required ordering, before `fallbackIndexSupports` returns an assessment.
 Either way the decision is a function of the plan alone, so a given plan always reaches the

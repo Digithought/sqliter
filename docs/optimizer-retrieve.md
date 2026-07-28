@@ -42,6 +42,7 @@ RetrieveNode
   - Inserts only that fragment as a `Filter` inside the `Retrieve` pipeline.
   - Leaves any residual (unsupported) predicate above the `Retrieve` boundary.
   - Merges newly referenced bindings (parameters/correlations) into `Retrieve.bindings`.
+  - **Declines outright once the access path is committed**: if the target `Retrieve` already carries an index-style `moduleCtx`, no predicate is pushed into it at all. From that point `rule-select-access-path` builds the physical leaf from `accessPlan` + `moduleCtx.residualPredicate` and never reads `Retrieve.source`, so a fragment placed there would execute nowhere and the query would return unfiltered rows. The `Filter` stays above the boundary instead, where grow-retrieve re-probes `getBestAccessPlan()` with the constraint on the next fixed-point iteration and residualizes whatever the module declines — so nothing is lost by declining. `Retrieve.source` remains populated for the readers that still walk it (binding collection, and the constraint sweep in `trySortAbsorbViaIndexOrdering`); it is dead only as an *execution* channel.
 
 - **Grow-retrieve rule**: When sliding `Retrieve` upward over a `Filter` (index-style fallback):
   - The rule mirrors the pushdown behavior: only supported fragments of the enveloped node are placed beneath `Retrieve` as a new `Filter`. The residual remains above.

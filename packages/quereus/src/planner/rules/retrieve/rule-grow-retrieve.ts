@@ -130,11 +130,13 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 
 	if (isIndexStyleContext(assessment.ctx)) {
 		// Index-style fallback: only place supported fragments under Retrieve; keep residuals above
-		// NOTE: the Filter built below is decorative — `ruleSelectAccessPath`'s index-style
+		// NOTE: the Filter built below never executes — `ruleSelectAccessPath`'s index-style
 		// branch physicalizes from moduleCtx alone and never reads `Retrieve.source`. It is
-		// written anyway because `collectBindingsInPlan` walks it to gather correlated
-		// bindings. Any rule that writes a predicate into a committed Retrieve's `source`
-		// expecting it to execute will lose it (see rule-predicate-pushdown's guard).
+		// written anyway because two later readers walk it: `collectBindingsInPlan` (below)
+		// gathers correlated bindings from it, and `trySortAbsorbViaIndexOrdering` sweeps it
+		// for constraints when deciding whether a Sort can be absorbed. Any rule that writes
+		// a predicate into a committed Retrieve's `source` expecting it to EXECUTE will lose
+		// it (see rule-predicate-pushdown's guard).
 		newPipeline = candidatePipeline as RelationalPlanNode;
 		if (node instanceof FilterNode) {
 			const tableInfo: TableInfo = createTableInfoFromNode(retrieveChild.tableRef, tableSchema.name);

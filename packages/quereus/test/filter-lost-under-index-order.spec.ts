@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
 import type { SqlValue } from '../src/common/types.js';
+import { topLevelProgram } from './util/debug-program.js';
 
 /**
  * A WHERE conjunct must survive ORDER BY absorption.
@@ -25,20 +26,6 @@ async function collect(db: Database, sql: string): Promise<Array<Record<string, 
 	const rows: Array<Record<string, SqlValue>> = [];
 	for await (const r of db.eval(sql)) rows.push(r);
 	return rows;
-}
-
-function programOf(db: Database, sql: string): string {
-	const stmt = db.prepare(sql);
-	try {
-		return stmt.getDebugProgram();
-	} finally {
-		void stmt.finalize();
-	}
-}
-
-/** Everything before the sub-program dump — the top-level pipeline only. */
-function topLevelProgram(db: Database, sql: string): string {
-	return programOf(db, sql).split('=== SUB-PROGRAMS ===')[0];
 }
 
 const FAILING = 'select id from o where flag = 0 and (select max(id) from o o2) > 0 order by id';

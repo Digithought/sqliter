@@ -7,6 +7,7 @@ import { PlanNode } from '../src/planner/nodes/plan-node.js';
 import { FilterNode } from '../src/planner/nodes/filter.js';
 import { combineConjuncts, splitConjuncts } from '../src/planner/analysis/predicate-conjuncts.js';
 import { createScalarFunction } from '../src/func/registration.js';
+import { programOf } from './util/debug-program.js';
 
 /**
  * Filter conjunct early exit (runtime/emit/filter.ts `emitFilter`).
@@ -35,15 +36,6 @@ async function collect(db: Database, sql: string): Promise<Array<Record<string, 
 	const rows: Array<Record<string, SqlValue>> = [];
 	for await (const r of db.eval(sql)) rows.push(r);
 	return rows;
-}
-
-function programOf(db: Database, sql: string): string {
-	const stmt = db.prepare(sql);
-	try {
-		return stmt.getDebugProgram();
-	} finally {
-		void stmt.finalize();
-	}
 }
 
 const EARLY_EXIT = 'conjuncts, early exit';

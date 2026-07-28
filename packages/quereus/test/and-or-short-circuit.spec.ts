@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
 import type { SqlValue } from '../src/common/types.js';
+import { programOf as dumpProgram } from './util/debug-program.js';
 
 /**
  * AND/OR short-circuit deferral (runtime/emit/binary.ts `emitLogicalOp`).
@@ -239,14 +240,7 @@ describe('AND/OR short-circuit deferral', () => {
 			await db.exec('insert into c values (1, 1), (2, 2)');
 		});
 
-		function programOf(sql: string): string {
-			const stmt = db.prepare(sql);
-			try {
-				return stmt.getDebugProgram();
-			} finally {
-				void stmt.finalize();
-			}
-		}
+		const programOf = (sql: string): string => dumpProgram(db, sql);
 
 		it('a trivial two-column AND stays on the eager path (no callback)', () => {
 			const prog = programOf('select (c.k = 1 and c.k = 2) as r from c');

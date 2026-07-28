@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { Database } from '../../src/index.js';
 import type { SqlValue } from '../../src/common/types.js';
+import { programOf as dumpProgram } from '../util/debug-program.js';
 
 /**
  * Simple-CASE comparison collation (runtime/emit/case.ts + emit/operand-comparator.ts).
@@ -29,14 +30,7 @@ describe('simple CASE comparison collation', () => {
 		await db.close();
 	});
 
-	function programOf(sql: string): string {
-		const stmt = db.prepare(sql);
-		try {
-			return stmt.getDebugProgram();
-		} finally {
-			void stmt.finalize();
-		}
-	}
+	const programOf = (sql: string): string => dumpProgram(db, sql);
 
 	async function collect(sql: string, params?: SqlValue[]): Promise<Array<Record<string, SqlValue>>> {
 		const rows: Array<Record<string, SqlValue>> = [];
