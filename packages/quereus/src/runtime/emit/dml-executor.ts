@@ -13,7 +13,8 @@ import type { UpdateArgs, VirtualTable } from '../../vtab/table.js';
 import type { TableSchema } from '../../schema/table.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { hasNativeEventSupport } from '../../util/event-support.js';
-import { sqlValueIdentical, compareSqlValuesFast, BINARY_COLLATION, type CollationFunction } from '../../util/comparison.js';
+import { sqlValueIdentical, compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
+import { uniqueEnforcementComparators } from '../../schema/unique-enforcement.js';
 import { validateAndParse } from '../../types/validation.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { withAsyncRowContext } from '../context-helpers.js';
@@ -39,12 +40,14 @@ let stmtSavepointCounter = 0;
 interface RuntimeUpsertClause {
 	conflictTargetIndices?: number[];
 	/**
-	 * Per-conflict-target-column enforcement collation function, index-aligned with
-	 * {@link conflictTargetIndices}. Resolved once at emit from the plan's collation
-	 * NAMES; the conflict-target match compares each target column under it (an absent
-	 * array falls back to BINARY, i.e. the pre-fix byte-identity behavior).
+	 * Per-conflict-target-column comparison function, index-aligned with
+	 * {@link conflictTargetIndices}. Built once at emit by
+	 * {@link uniqueEnforcementComparators} — the same rule every UNIQUE re-validator
+	 * uses — so a semantic-ordering column compares by its declared type's `compare`
+	 * and every other column by the resolved enforcement collation. An absent array
+	 * falls back to BINARY collation compare, i.e. the pre-fix byte-identity behavior.
 	 */
-	conflictTargetCollationFns?: CollationFunction[];
+	conflictTargetComparators?: Array<(a: SqlValue, b: SqlValue) => number>;
 	action: 'nothing' | 'update';
 	/** Indices into the evaluators array for each assignment (column index -> evaluator index) */
 	assignmentIndices?: Map<number, number>;
@@ -65,12 +68,13 @@ interface RuntimeUpsertClause {
 
 /**
  * True when a proposed value equals the stored existing value at one conflict-target
- * column the way the targeted constraint ENFORCES: compared under the column's
- * precomputed enforcement collation. Both sides are already in declared (stored)
- * form — `existing` is a stored row and the proposed row was converted by the
- * INSERT emitter's static-type pass — so no per-row conversion happens here.
+ * column the way the targeted constraint ENFORCES: through the column's precomputed
+ * comparator (declared-type `compare` for a semantic-ordering column, else the
+ * enforcement collation). Both sides are already in declared (stored) form —
+ * `existing` is a stored row and the proposed row was converted by the INSERT
+ * emitter's static-type pass — so no per-row conversion happens here.
  *
- * `targetPos` indexes the clause's per-target collation array (aligned with
+ * `targetPos` indexes the clause's per-target comparator array (aligned with
  * `conflictTargetIndices`). When absent — a defensively-old plan — it degrades to
  * BINARY, i.e. the byte-identity semantics of `sqlValueIdentical`, preserving its
  * numeric-storage-class tolerance via {@link compareSqlValuesFast}.
@@ -81,8 +85,9 @@ function conflictTargetValuesMatch(
 	clause: RuntimeUpsertClause,
 	targetPos: number,
 ): boolean {
-	const collationFn = clause.conflictTargetCollationFns?.[targetPos] ?? BINARY_COLLATION;
-	return compareSqlValuesFast(existing, proposed, collationFn) === 0;
+	const compare = clause.conflictTargetComparators?.[targetPos];
+	if (compare) return compare(existing, proposed) === 0;
+	return compareSqlValuesFast(existing, proposed, BINARY_COLLATION) === 0;
 }
 
 /**
@@ -357,12 +362,20 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			};
 
 			// Resolve the per-target-column enforcement collation NAMES to functions once
-			// here (recording the collation dependency so a redefined collation re-emits).
-			// Consumed by matchUpsertClause so a collation-equal conflict on the targeted
-			// constraint routes to DO UPDATE / DO NOTHING instead of aborting.
+			// here (recording the collation dependency so a redefined collation re-emits),
+			// then build the per-column comparators through the shared UNIQUE-enforcement
+			// rule. Consumed by matchUpsertClause so a conflict the targeted constraint
+			// considers a duplicate — collation-equal, or semantically equal under a
+			// semantic-ordering declared type — routes to DO UPDATE / DO NOTHING instead
+			// of aborting.
 			if (clause.conflictTargetIndices && clause.conflictTargetCollations) {
-				runtime.conflictTargetCollationFns = clause.conflictTargetCollations.map(
+				const collationFns = clause.conflictTargetCollations.map(
 					name => ctx.resolveCollation(name ?? 'BINARY'),
+				);
+				runtime.conflictTargetComparators = uniqueEnforcementComparators(
+					tableSchema.columns,
+					clause.conflictTargetIndices,
+					collationFns,
 				);
 			}
 

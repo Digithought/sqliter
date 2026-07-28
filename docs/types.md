@@ -358,6 +358,20 @@ all call, so the backends cannot drift. Concretely, in a
 violation, `insert or ignore` drops it, and `insert or replace` evicts the existing
 row — the same on memory and store.
 
+`insert … on conflict (<cols>) do update / do nothing` routes on that same identity.
+The virtual table reports the conflicting row but not which constraint fired, so the
+DML executor decides which `on conflict` clause a violation belongs to by comparing
+the proposed and existing rows at the clause's target columns — through comparators
+built by the same `uniqueEnforcementComparators` (per-column enforcement collations
+resolved at plan time by `resolveConflictTargetEnforcement` in
+`planner/building/insert.ts`, comparators built once at emit in
+`runtime/emit/dml-executor.ts`). So `on conflict (d) do update` fires for a re-spelled
+TIMESPAN duration rather than aborting with a UNIQUE error, while a NOCASE/RTRIM
+column keeps routing by its collation. One residual corner is unfixable by value
+comparison and stays out of scope: an insert violating the targeted constraint *and*
+another one at once is suppressed by the matching clause, because the vtab
+short-circuits on the first violation and never reports the second.
+
 The persistent store follows the same rule for both identity and order (resolved by
 `quereus-store`'s `storeSemanticKeyTransform`): a TIMESPAN key member is encoded
 through `groupKey`, so `'PT1H'` and `'PT60M'` collide on one physical key — duplicate

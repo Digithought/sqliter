@@ -553,6 +553,70 @@ select count(*) as c from ut;
 
 drop table ut;
 
+-- An explicit `on conflict (<col>)` target routes on the SAME identity the
+-- constraint enforces: naming a semantic-ordering column does not narrow the match
+-- back to byte equality. (Regression: the executor decided which clause a violation
+-- belonged to by comparing the target columns under storage class + collation only,
+-- so 'PT1H' vs 'PT60M' matched no clause and the UNIQUE error was re-raised.)
+create table ux (id integer primary key, d timespan unique, n integer);
+insert into ux values (1, 'PT1H', 10);
+
+insert into ux values (2, 'PT60M', 20) on conflict (d) do update set n = 99;
+select id, timespan_total_seconds(d) as s, n from ux;
+→ [{"id":1,"s":3600,"n":99}]
+
+insert into ux values (4, 'PT60M', 40) on conflict (d) do nothing;
+select id, timespan_total_seconds(d) as s, n from ux;
+→ [{"id":1,"s":3600,"n":99}]
+
+-- The untargeted form matches any constraint and never compares values — unchanged.
+insert into ux values (5, 'PT3600S', 50) on conflict do update set n = 77;
+select id, timespan_total_seconds(d) as s, n from ux;
+→ [{"id":1,"s":3600,"n":77}]
+
+-- A conflict on a DIFFERENT constraint than the target still aborts: the target
+-- columns disagree, so no clause covers it.
+insert into ux values (1, 'PT5M', 60) on conflict (d) do update set n = 1;
+-- error: constraint failed
+
+drop table ux;
+
+-- Composite target with a TIMESPAN member: the re-spelled member still names the
+-- same key, a differing leading column is a distinct key (plain insert).
+create table uxc (id integer primary key, k integer, d timespan, n integer, unique (k, d));
+insert into uxc values (1, 1, 'PT1H', 10);
+
+insert into uxc values (2, 1, 'PT60M', 20) on conflict (k, d) do update set n = 99;
+insert into uxc values (3, 2, 'PT60M', 30) on conflict (k, d) do update set n = 88;
+select id, k, timespan_total_seconds(d) as s, n from uxc order by id;
+→ [{"id":1,"k":1,"s":3600,"n":99},{"id":3,"k":2,"s":3600,"n":30}]
+
+drop table uxc;
+
+-- JSON is the other semantic-ordering type. Its values reach the executor already
+-- canonicalized, so both sides of the match were equal even before this fix; pinned
+-- so the routing stays correct whichever layer canonicalizes.
+create table uxj (id integer primary key, v json unique, n integer);
+insert into uxj values (1, json('{"a":1,"b":2}'), 10);
+
+insert into uxj values (2, json('{"b":2,"a":1}'), 20) on conflict (v) do update set n = 99;
+select id, n from uxj order by id;
+→ [{"id":1,"n":99}]
+
+drop table uxj;
+
+-- Negative control: a TEXT conflict target keeps text identity — a differently
+-- spelled duration is a new row, and the same spelling still routes to DO UPDATE.
+create table uxt (id integer primary key, d text unique, n integer);
+insert into uxt values (1, 'PT1H', 10);
+
+insert into uxt values (2, 'PT60M', 20) on conflict (d) do update set n = 99;
+insert into uxt values (3, 'PT1H', 30) on conflict (d) do update set n = 55;
+select id, d, n from uxt order by id;
+→ [{"id":1,"d":"PT1H","n":55},{"id":2,"d":"PT60M","n":20}]
+
+drop table uxt;
+
 -- === Untyped expressions keep storage-class/text ordering ===
 
 -- Text literals (no declared TIMESPAN type): DISTINCT keeps both spellings.
