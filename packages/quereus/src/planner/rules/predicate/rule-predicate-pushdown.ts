@@ -10,7 +10,9 @@
  * - Across Alias: safe because AliasNode only renames relationName; attribute IDs are unchanged
  * - Across Project: only if predicate references attribute IDs available below the Project source
  *   (we verify attribute-id coverage), and we keep predicate unchanged (IDs preserved by design)
- * - Into Retrieve: wrap Retrieve.source with a Filter
+ * - Into Retrieve: wrap Retrieve.source with a Filter — EXCEPT when the Retrieve already
+ *   carries an index-style moduleCtx (see the guard in tryPushDown), because that access
+ *   path is already committed and `Retrieve.source` is no longer read at physicalization
  *
  * Non-moves (for now):
  * - Across Limit/Offset (changes semantics)
@@ -34,6 +36,7 @@ import type { ScalarPlanNode } from '../../nodes/plan-node.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { collectBindingsInExpr } from '../../analysis/binding-collector.js';
 import { extractConstraints, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
+import { isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:predicate-pushdown');
 
@@ -64,6 +67,16 @@ function tryPushDown(child: RelationalPlanNode, predicate: ScalarPlanNode, scope
 
 	// Reach a Retrieve boundary: insert only the supported portion inside pipeline
 	if (child instanceof RetrieveNode) {
+		// Once ruleGrowRetrieve has equipped this Retrieve with an index-style context,
+		// ruleSelectAccessPath physicalizes from moduleCtx alone and never reads
+		// `source` — a predicate pushed in here would be silently dropped. Decline;
+		// the Filter stays above the Retrieve, where grow-retrieve can still absorb it
+		// into a fresh access-plan probe (which residualizes what the module declines).
+		if (isIndexStyleContext(child.moduleCtx)) {
+			log('Retrieve already committed to an index-style access plan; not pushing');
+			return null;
+		}
+
 		log('Pushing predicate into Retrieve pipeline (supported-only)');
 		const tableInfo = createTableInfoFromNode(child.tableRef, `${child.tableRef.tableSchema.name}`);
 		const extraction = extractConstraints(predicate, [tableInfo]);

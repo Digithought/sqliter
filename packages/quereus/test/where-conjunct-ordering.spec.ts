@@ -98,20 +98,14 @@ describe('WHERE conjunct cost ordering', () => {
 			expect(calls, 'the volatile conjunct must run only for rows the pure conjunct kept').to.equal(3);
 		});
 
-		// NOTE: these two use `order by id desc`, not `order by id`. An ascending
-		// order the primary-key scan already satisfies trips the pre-existing
-		// planner defect `bug-filter-conjunct-lost-under-index-order` — the pushed
-		// `k = 2` filter is dropped entirely and every v % 5 = 2 row comes back
-		// (reproduces with this rule disabled, and in a 3-conjunct shape even with
-		// `k` in the select list). Restore ascending order once that fix lands.
 		it('subquery-first is reordered: (select sidefx()) = 1 and k = 2 and v % 5 = 2 → 1 call', async () => {
-			const rows = await collect(db, 'select id from t where (select sidefx()) = 1 and k = 2 and v % 5 = 2 order by id desc');
+			const rows = await collect(db, 'select id from t where (select sidefx()) = 1 and k = 2 and v % 5 = 2 order by id');
 			expect(rows.map(r => r.id)).to.deep.equal([12]);
 			expect(calls, 'the subquery conjunct must run only for the single row both pure conjuncts keep').to.equal(1);
 		});
 
 		it('subquery-last stays last: k = 2 and v % 5 = 2 and (select sidefx()) = 1 → 1 call', async () => {
-			const rows = await collect(db, 'select id from t where k = 2 and v % 5 = 2 and (select sidefx()) = 1 order by id desc');
+			const rows = await collect(db, 'select id from t where k = 2 and v % 5 = 2 and (select sidefx()) = 1 order by id');
 			expect(rows.map(r => r.id)).to.deep.equal([12]);
 			expect(calls).to.equal(1);
 		});
@@ -121,9 +115,8 @@ describe('WHERE conjunct cost ordering', () => {
 			await db.exec('create table i (id integer primary key, oid integer, val integer)');
 			await db.exec('insert into o values (1, 1), (2, 1), (3, 0)');
 			await db.exec('insert into i values (10, 1, 100), (20, 1, 300), (30, 2, 50)');
-			// `flag` selected for the same bug-dodging reason as above.
-			const a = await collect(db, 'select id, flag from o where (select max(val) from i where i.oid = o.id) > 150 and flag = 1 order by id');
-			const b = await collect(db, 'select id, flag from o where flag = 1 and (select max(val) from i where i.oid = o.id) > 150 order by id');
+			const a = await collect(db, 'select id from o where (select max(val) from i where i.oid = o.id) > 150 and flag = 1 order by id');
+			const b = await collect(db, 'select id from o where flag = 1 and (select max(val) from i where i.oid = o.id) > 150 order by id');
 			expect(a).to.deep.equal(b);
 			expect(a.map(r => r.id)).to.deep.equal([1]);
 		});

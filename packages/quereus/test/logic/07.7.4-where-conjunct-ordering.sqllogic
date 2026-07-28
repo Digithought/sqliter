@@ -25,15 +25,10 @@ select id from t where (select length('x')) = 1 and v % 5 = 2 order by id;
 select id from t where v % 5 = 2 and (select length('x')) = 1 order by id;
 → [{"id":2},{"id":7},{"id":12}]
 
--- NOTE: `order by id desc`, not ascending. An ascending order the primary-key
--- scan already satisfies trips the pre-existing planner defect
--- `bug-filter-conjunct-lost-under-index-order` — the pushed `k = 2` filter is
--- dropped entirely. Restore ascending order once that fix lands.
-
-select id from t where (select count(*) from t) = 13 and k = 2 and v % 5 = 2 order by id desc;
+select id from t where (select count(*) from t) = 13 and k = 2 and v % 5 = 2 order by id;
 → [{"id":12}]
 
-select id from t where k = 2 and v % 5 = 2 and (select count(*) from t) = 13 order by id desc;
+select id from t where k = 2 and v % 5 = 2 and (select count(*) from t) = 13 order by id;
 → [{"id":12}]
 
 -- =============================================================================

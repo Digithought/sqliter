@@ -214,11 +214,6 @@ describe('Filter conjunct early exit', () => {
 			expect(rows.map(r => r.id)).to.deep.equal([1]);
 		});
 
-		// NOTE: no `order by id` here. Adding an ORDER BY that the primary-key scan
-		// already satisfies makes the engine silently drop the `flag = 0` conjunct and
-		// return every row — a pre-existing planner defect unrelated to conjunct early
-		// exit, tracked as ticket `bug-filter-conjunct-lost-under-index-order`. Restore
-		// the ORDER BY here once that lands.
 		// A genuinely pending conjunct between two synchronous ones: the loop must await
 		// it, resume on the right row, and still stop at the first non-true conjunct.
 		// The trailing conjunct wraps `v > 2` in a (cached) subquery so that
@@ -245,7 +240,7 @@ describe('Filter conjunct early exit', () => {
 		});
 
 		it('a subquery conjunct is skipped for rows an earlier conjunct rejected', async () => {
-			const rows = await collect(db, 'select id from o where flag = 0 and (select sidefx()) = 1');
+			const rows = await collect(db, 'select id from o where flag = 0 and (select sidefx()) = 1 order by id');
 			expect(rows.map(r => r.id)).to.deep.equal([3]);
 			expect(calls, 'only the single flag = 0 row reaches the subquery conjunct').to.equal(1);
 		});

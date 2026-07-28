@@ -10,6 +10,13 @@
  *
  * Use {@link isIndexStyleContext} at the retrieval site to validate the shape and
  * narrow `moduleCtx` from `unknown` — never blind-cast.
+ *
+ * NOTE: once this context is present on a Retrieve, it is the SOLE authority for what
+ * the table access applies — `ruleSelectAccessPath` builds the physical leaf from
+ * `accessPlan` + `residualPredicate` and never reads `RetrieveNode.source`. Rules must
+ * therefore not push a predicate into a committed Retrieve's `source`; it would be
+ * silently dropped. Amend this context instead, or leave the Filter above the Retrieve
+ * so `ruleGrowRetrieve` can re-probe the module with it.
  */
 
 import type { BestAccessPlanResult } from '../../../vtab/best-access-plan.js';

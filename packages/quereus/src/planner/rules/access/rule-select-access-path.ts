@@ -153,6 +153,14 @@ export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanN
 	// even when no specialized support is available.
 
 	// If grow-retrieve established an index-style context, reuse it directly
+	// NOTE: `retrieveNode.source` is intentionally NOT rebuilt on this path. Once an
+	// index-style moduleCtx exists it is the sole authority for what the access applies
+	// (accessPlan + handledFilters + residualPredicate); `source` is decorative. A
+	// predicate written into `source` after the ctx is set is silently lost — which is
+	// exactly the bug rule-predicate-pushdown's isIndexStyleContext guard prevents.
+	// Rebuilding from `source` here is NOT the fix: this branch also legitimately
+	// discards a Sort/LimitOffset that sort-absorption already elided, so rebuilding
+	// would resurrect them.
 	if (isIndexStyleContext(retrieveNode.moduleCtx)) {
 		log('Using index-style context provided by grow-retrieve');
 		const accessPlan = retrieveNode.moduleCtx.accessPlan;
