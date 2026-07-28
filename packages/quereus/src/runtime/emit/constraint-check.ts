@@ -46,6 +46,21 @@ interface NotNullDefaultRuntime {
 }
 
 /**
+ * The violation message for a failing constraint — single source of truth for the
+ * immediate (row-time) and deferred (commit-time) paths, which must report a row
+ * identically no matter when the check happened to run.
+ *
+ * Engine-level CHECK and synthesized FK existence checks share the
+ * "CHECK constraint failed" prefix for backward compatibility with existing
+ * assertions; downstream consumers identify FK by name. The expression text is
+ * appended as a hint only when short enough to stay readable.
+ */
+function constraintViolationMessage(metadata: ConstraintMetadataEntry): string {
+	const exprHint = metadata.constraintExpr.length <= 60 ? ` (${metadata.constraintExpr})` : '';
+	return `CHECK constraint failed: ${metadata.constraintName}${exprHint}`;
+}
+
+/**
  * Resolve the effective conflict action for a single failure.
  *
  * Precedence: statement-level OR clause > per-constraint default > ABORT.
@@ -405,18 +420,18 @@ async function checkCheckConstraints(
 		if (metadata.shouldDefer && !mustEvaluateNow) {
 			const activeConnectionId = rctx.activeConnection?.connectionId;
 			// Wrap so the deferred queue's evaluation at COMMIT throws the same
-			// attributed message (name + expression hint) as the immediate path
-			// below, instead of the queue's generic name-only fallback — matches
-			// the pattern derived-row-validator.ts already uses for maintained
-			// tables. The wrapper always throws before returning falsy, so the
-			// queue's own generic message never fires for this entry.
-			const constraintName = metadata.constraintName;
-			const exprHint = metadata.constraintExpr.length <= 60 ? ` (${metadata.constraintExpr})` : '';
+			// attributed message as the immediate path below, instead of the queue's
+			// generic name-only fallback — matches the pattern derived-row-validator.ts
+			// already uses for maintained tables. The wrapper always throws before
+			// returning falsy, so the queue's own generic message never fires here.
+			// Only ABORT reaches this branch (see mustEvaluateNow), so throwing is the
+			// whole of the deferred failure contract — no IGNORE/REPLACE leg needed.
+			const message = constraintViolationMessage(metadata);
 			const deferredEvaluator = async (dctx: RuntimeContext): Promise<SqlValue> => {
 				const rawResult = evaluator(dctx);
 				const result = (rawResult instanceof Promise ? await rawResult : rawResult) as SqlValue;
 				if (result !== null && !isTruthy(result)) {
-					throw new ConstraintError(`CHECK constraint failed: ${constraintName}${exprHint}`);
+					throw new ConstraintError(message);
 				}
 				return result;
 			};
@@ -439,13 +454,7 @@ async function checkCheckConstraints(
 
 		// CHECK passes if truthy or NULL; fails otherwise (shared isTruthy semantics).
 		if (result !== null && !isTruthy(result)) {
-			const exprHint = metadata.constraintExpr.length <= 60
-				? ` (${metadata.constraintExpr})`
-				: '';
-			// Both engine-level CHECK and synthetic FK existence checks share the
-			// same "CHECK constraint failed" prefix for backward compatibility with
-			// existing assertions; downstream consumers identify FK by name.
-			const baseMessage = `CHECK constraint failed: ${metadata.constraintName}${exprHint}`;
+			const baseMessage = constraintViolationMessage(metadata);
 
 			if (effectiveAction === ConflictResolution.IGNORE) {
 				return { skip: true };

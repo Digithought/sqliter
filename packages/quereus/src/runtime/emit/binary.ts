@@ -5,8 +5,8 @@ import type { Instruction, RuntimeContext } from "../types.js";
 import { asRun } from "../types.js";
 import type { BinaryOpNode } from "../../planner/nodes/scalar.js";
 import { LiteralNode } from "../../planner/nodes/scalar.js";
-import type { ScalarPlanNode, PlanNode } from "../../planner/nodes/plan-node.js";
-import { isRelationalNode } from "../../planner/nodes/plan-node.js";
+import type { ScalarPlanNode } from "../../planner/nodes/plan-node.js";
+import { hasRelationalDescendant } from "../../planner/analysis/scalar-subqueries.js";
 import { emitPlanNode, emitCallFromPlan } from "../emitters.js";
 import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, isTruthy } from "../../util/comparison.js";
 import type { LogicalType } from "../../types/logical-type.js";
@@ -343,26 +343,6 @@ export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 	};
 }
 
-/**
- * True iff `node`'s subtree contains a relational descendant — i.e. a subquery
- * (scalar-subquery / IN-subquery / EXISTS), each of which exposes its relational
- * child via `getChildren()`. Pure scalar operands (column refs, literals,
- * arithmetic, direct function calls) have no relational descendant.
- *
- * Cheap emit-time walk used by {@link emitLogicalOp} to decide whether an AND/OR
- * right operand is worth deferring behind a short-circuit callback. Mirrors
- * `conjunctHasSubquery` in planner/analysis/query-rewrite-matcher.ts.
- */
-function containsSubquery(node: ScalarPlanNode): boolean {
-	for (const child of node.getChildren()) {
-		if (isRelationalNode(child as PlanNode)) return true;
-		// Only scalar children reach here (relational ones returned above), so the
-		// recursive cast to ScalarPlanNode is sound.
-		if (containsSubquery(child as ScalarPlanNode)) return true;
-	}
-	return false;
-}
-
 export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
 	// Normalize operator to uppercase for case-insensitive matching
 	const operator = plan.expression.operator.toUpperCase();
@@ -425,7 +405,7 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 	// operands are rare and the dominant expensive case in SQL is the subquery;
 	// if a non-subquery volatile/expensive scalar operand ever shows up hot,
 	// extend this gate with a cost or volatility check.
-	if ((operator === 'AND' || operator === 'OR') && containsSubquery(plan.right)) {
+	if ((operator === 'AND' || operator === 'OR') && hasRelationalDescendant(plan.right)) {
 		const rightCall = emitCallFromPlan(plan.right, ctx);
 
 		function runShortCircuit(

@@ -175,9 +175,10 @@ drop table t_compound_gen;
 -- 8. Deferred subquery CHECK reads the transaction's OWN writes, not a
 -- snapshot frozen at row-write time. Regression for
 -- bug-deferred-subquery-check-reads-stale-state: `x in (select …)` builds as
--- an InNode, which the old containsSubquery() (a list of specific scalar
--- node types) did not recognize as subquery-bearing, so the check ran
--- immediately like an ordinary CHECK instead of deferring to COMMIT.
+-- an InNode, which the old subquery test (a list of specific scalar node
+-- types, since replaced by the structural hasRelationalDescendant) did not
+-- recognize as subquery-bearing, so the check ran immediately like an
+-- ordinary CHECK instead of deferring to COMMIT.
 -- ===================================
 
 -- read-your-own-writes: the value the check needs arrives LATER in the same
@@ -211,7 +212,11 @@ begin;
 insert into zt2 values (1, 'a');
 delete from zl2 where code = 'a';
 commit;
--- error: CHECK
+-- the full message is asserted, not merely "CHECK": a deferred violation must be
+-- attributed exactly like an immediate one (name + expression hint), which is only
+-- true because the queued evaluator throws its own message rather than falling
+-- through to DeferredConstraintQueue's generic name-only fallback.
+-- error: CHECK constraint failed: zt2_ck (code in (select code from zl2))
 
 select count(*) as cnt from zt2;
 → [{"cnt":0}]
@@ -222,11 +227,14 @@ drop table zl2;
 -- negative control: a plain value-list `in (...)` has no relational child and
 -- must stay immediate — it still fails INSIDE the open transaction, at the
 -- INSERT itself, not deferred to COMMIT.
-create table zt3 (id integer primary key, code text, check (code in ('a', 'b')));
+create table zt3 (id integer primary key, code text,
+	constraint zt3_ck check (code in ('a', 'b')));
 
 begin;
 insert into zt3 values (1, 'z');
--- error: CHECK
+-- the immediate half of the parity assertion above: same message shape, produced
+-- by the row-time path.
+-- error: CHECK constraint failed: zt3_ck (code in ('a', 'b'))
 rollback;
 
 select count(*) as cnt from zt3;

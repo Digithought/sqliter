@@ -8,7 +8,7 @@ import type { Scope } from '../scopes/scope.js';
 import { buildExpression } from './expression.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import type { PlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
-import { isRelationalNode } from '../nodes/plan-node.js';
+import { hasRelationalDescendant } from '../analysis/scalar-subqueries.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import * as AST from '../../parser/ast.js';
 import { validateDeterministicConstraint } from '../validation/determinism-validator.js';
@@ -191,11 +191,12 @@ export function buildConstraintChecks(
         validateDeterministicConstraint(expression, constraintName, tableSchema.name);
       }
 
-      // Heuristic: auto-defer if the expression contains a subquery
-      // or references committed.* state (which necessarily implies a subquery, but
+      // Auto-defer when the expression reads a relation — a subquery of any shape
+      // means the check cannot be decided from the mutating row alone — or when it
+      // references committed.* state (which necessarily implies a subquery, but
       // this defensive check ensures committed-ref constraints are always deferred
       // even if subquery detection logic changes).
-      const needsDeferred = containsSubquery(expression) || containsCommittedRef(expression);
+      const needsDeferred = hasRelationalDescendant(expression) || containsCommittedRef(expression);
 
       return {
         constraint,
@@ -302,29 +303,6 @@ export function buildNotNullDefaults(
   }
 
   return result;
-}
-
-/**
- * True when the CHECK expression reads a relation — i.e. it embeds a subquery of
- * any shape and therefore cannot be decided from the mutating row alone.
- *
- * Detected structurally, by finding a relational node anywhere under the scalar
- * expression, rather than by listing the scalar node types that wrap a subquery.
- * The list form missed `x in (select …)`: `InNode` carries its source relation
- * but reports `PlanNodeType.In`, so a membership CHECK was silently evaluated at
- * write time against pre-transaction data (bug-deferred-subquery-check-reads-stale-state).
- * `in (<value list>)` has no relational child and stays immediate, as it should.
- */
-function containsSubquery(expr: ScalarPlanNode): boolean {
-  const stack: PlanNode[] = [expr];
-  while (stack.length) {
-    const n = stack.pop()!;
-    if (isRelationalNode(n)) {
-      return true;
-    }
-    stack.push(...n.getChildren());
-  }
-  return false;
 }
 
 /**

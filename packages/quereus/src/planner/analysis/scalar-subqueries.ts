@@ -1,11 +1,40 @@
 /**
- * Shared helpers for rules that recognize and rewrite `ScalarSubqueryNode`s
- * embedded in projection scalar expression trees (`rule-fanout-lookup-join`,
- * `rule-scalar-agg-decorrelation`).
+ * Shared helpers for recognizing subqueries embedded in scalar expression trees:
+ * the `ScalarSubqueryNode` collect/substitute pair used by the rewrite rules
+ * (`rule-fanout-lookup-join`, `rule-scalar-agg-decorrelation`), plus the
+ * node-type-agnostic {@link hasRelationalDescendant} test.
  */
 
 import type { PlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
+import { isRelationalNode } from '../nodes/plan-node.js';
 import { ScalarSubqueryNode } from '../nodes/subquery.js';
+
+/**
+ * True iff `expr`'s subtree contains a relational descendant — i.e. it embeds a
+ * subquery of ANY shape (scalar-subquery, `EXISTS`, `IN (select …)`, …), each of
+ * which exposes its relational body via `getChildren()`. Pure scalar operands
+ * (column refs, literals, arithmetic, `IN (<value list>)`, direct function calls)
+ * have no relational descendant.
+ *
+ * Detecting the relational child structurally, rather than listing the scalar
+ * node types that wrap a subquery, is what makes this safe against new subquery
+ * shapes: the list form missed `x in (select …)`, whose `InNode` carries its
+ * source relation but reports `PlanNodeType.In`
+ * (bug-deferred-subquery-check-reads-stale-state).
+ *
+ * Callers: CHECK auto-deferral (`planner/building/constraint-builder.ts`), the
+ * MV-rewrite residual gate (`query-rewrite-matcher.ts`), and AND/OR
+ * short-circuit deferral (`runtime/emit/binary.ts`).
+ */
+export function hasRelationalDescendant(expr: ScalarPlanNode): boolean {
+	const stack: PlanNode[] = [expr];
+	while (stack.length) {
+		const node = stack.pop()!;
+		if (node !== expr && isRelationalNode(node)) return true;
+		stack.push(...node.getChildren());
+	}
+	return false;
+}
 
 /**
  * Collect every `ScalarSubqueryNode` reachable in a projection's scalar

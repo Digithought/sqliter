@@ -50,7 +50,7 @@
  */
 
 import type { RelationalPlanNode, ScalarPlanNode, GuardClause, Attribute, PlanNode } from '../nodes/plan-node.js';
-import { isRelationalNode } from '../nodes/plan-node.js';
+import { hasRelationalDescendant } from './scalar-subqueries.js';
 import { ProjectNode } from '../nodes/project-node.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
@@ -955,7 +955,10 @@ export function matchJoinFragmentToMv(
 	//      predicate over stored `T`/`P` columns so it re-binds onto the backing. ----
 	const backingColOfSourceAttrId = storedSourceAttrIds(fragDriving, fragLookup, stored);
 	for (const conjunct of shape.conjuncts) {
-		if (conjunctHasSubquery(conjunct)) return fail('predicate-not-entailed');
+		// A subquery-bearing predicate is not re-bindable onto a flat backing scan, so
+		// the join arm forgoes it (matching the foundation's no-subquery invariant that
+		// licenses `sideEffectMode: 'safe'`).
+		if (hasRelationalDescendant(conjunct)) return fail('predicate-not-entailed');
 		for (const attrId of conjunctColumnAttrIds(conjunct)) {
 			if (!backingColOfSourceAttrId.has(attrId)) return fail('missing-column');
 		}
@@ -1163,18 +1166,6 @@ function findTableRef(node: RelationalPlanNode, qualified: string): TableReferen
 		if (found) return found;
 	}
 	return undefined;
-}
-
-/** True iff `conjunct` embeds a relational subquery (an Exists/In/scalar-subquery
- *  whose child is a relation). Such a predicate is not re-bindable onto a flat
- *  backing scan, so the join arm forgoes it (matching the foundation's no-subquery
- *  invariant that licenses `sideEffectMode: 'safe'`). */
-function conjunctHasSubquery(node: ScalarPlanNode): boolean {
-	for (const child of node.getChildren()) {
-		if (isRelationalNode(child as PlanNode)) return true;
-		if (conjunctHasSubquery(child as ScalarPlanNode)) return true;
-	}
-	return false;
 }
 
 /** Every `ColumnReferenceNode` attribute id referenced (transitively) by a
