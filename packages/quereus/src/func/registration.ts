@@ -49,6 +49,10 @@ interface ScalarFuncOptions {
 	 *  function callable and visible to `function_info()`. See
 	 *  {@link import('../schema/function.js').BaseFunctionSchema.hidden}. */
 	hidden?: boolean;
+	/** Argument positions this function compares against one another (`'all'` for a
+	 *  variadic function that ranks every argument). See
+	 *  {@link import('../schema/function.js').BaseFunctionSchema.comparesArgs}. */
+	comparesArgs?: 'all' | readonly number[];
 }
 
 /**
@@ -157,6 +161,7 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 		monotoneOnArgs: options.monotoneOnArgs,
 		rangeRewriteOnArg: options.rangeRewriteOnArg,
 		hidden: options.hidden,
+		comparesArgs: options.comparesArgs,
 	};
 }
 

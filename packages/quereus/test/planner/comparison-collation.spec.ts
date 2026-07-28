@@ -11,6 +11,8 @@ import {
 	collationContribution,
 	resolveComparisonCollation,
 	resolveInCollation,
+	resolveGroupCollation,
+	effectiveGroupCollation,
 	resolveSetOpColumnCollation,
 	mergePropagatedCollation,
 	effectiveComparisonCollation,
@@ -156,6 +158,73 @@ describe('comparison-collation provenance lattice', () => {
 		it('condition vs merged RHS resolves through the same lattice (conflict included)', () => {
 			expect(resolveInCollation(t('NOCASE', 'declared'), [t('RTRIM', 'declared')]).kind).to.equal('conflict');
 			expectResolved(resolveInCollation(t('NOCASE', 'declared'), [t('BINARY', 'explicit')]), 'BINARY');
+		});
+	});
+
+	describe('resolveGroupCollation (N-ary comparison group: greatest/least)', () => {
+		it('no operands / no contributions → BINARY floor', () => {
+			expectResolved(resolveGroupCollation([]), 'BINARY');
+			expectResolved(resolveGroupCollation([t(), t('BINARY', 'default'), t()]), 'BINARY');
+		});
+
+		it('a single explicit contributor wins over defaulted ones', () => {
+			expectResolved(
+				resolveGroupCollation([t('RTRIM', 'default'), t('NOCASE', 'explicit'), t('RTRIM', 'default')]),
+				'NOCASE');
+		});
+
+		it('a single declared contributor drives an otherwise-plain group', () => {
+			expectResolved(resolveGroupCollation([t(), t('NOCASE', 'declared'), t()]), 'NOCASE');
+		});
+
+		it('same rank, same name across the group → that name', () => {
+			expectResolved(
+				resolveGroupCollation([t('NOCASE', 'declared'), t('nocase', 'declared'), t('NOCASE', 'declared')]),
+				'NOCASE');
+		});
+
+		it('equal-rank name conflict at rank ≥ 2 is a conflict, reported once', () => {
+			expect(resolveGroupCollation([t(), t('NOCASE', 'declared'), t('RTRIM', 'declared')]))
+				.to.deep.equal({ kind: 'conflict', level: 'declared', left: 'NOCASE', right: 'RTRIM' });
+			expect(resolveGroupCollation([t('NOCASE', 'explicit'), t('RTRIM', 'explicit'), t('NOCASE', 'explicit')]).kind)
+				.to.equal('conflict');
+		});
+
+		it('rank-1 conflict resolves to BINARY silently (defaults are preferences)', () => {
+			expectResolved(resolveGroupCollation([t('NOCASE', 'default'), t('RTRIM', 'default')]), 'BINARY');
+		});
+
+		it('a higher-ranked contributor overrides a lower-rank disagreement', () => {
+			expectResolved(
+				resolveGroupCollation([t('NOCASE', 'declared'), t('RTRIM', 'default'), t('NOCASE', 'default')]),
+				'NOCASE');
+		});
+
+		it('order-independent: permuting the group never changes the outcome', () => {
+			const group = [t('RTRIM', 'default'), t('NOCASE', 'explicit'), t('NOCASE', 'declared')];
+			expectResolved(resolveGroupCollation(group), 'NOCASE');
+			expectResolved(resolveGroupCollation([...group].reverse()), 'NOCASE');
+		});
+
+		it('reduces to resolveComparisonCollation for two operands', () => {
+			const cases: Array<[ScalarType, ScalarType]> = [
+				[t(), t()],
+				[t('NOCASE', 'declared'), t('BINARY', 'default')],
+				[t('BINARY', 'explicit'), t('NOCASE', 'declared')],
+				[t('NOCASE', 'default'), t('RTRIM', 'default')],
+				[t('NOCASE', 'declared'), t('RTRIM', 'declared')],
+			];
+			for (const [a, b] of cases) {
+				expect(resolveGroupCollation([a, b])).to.deep.equal(resolveComparisonCollation(a, b));
+			}
+		});
+
+		it('effectiveGroupCollation throws QuereusError on a conflict, resolves otherwise', () => {
+			expect(() => effectiveGroupCollation([t('NOCASE', 'declared'), t('RTRIM', 'declared')]))
+				.to.throw(QuereusError, /ambiguous collation .* NOCASE vs RTRIM/);
+			expect(() => effectiveGroupCollation([t('NOCASE', 'explicit'), t('RTRIM', 'explicit')]))
+				.to.throw(QuereusError, /conflicting COLLATE clauses .* NOCASE vs RTRIM/);
+			expect(effectiveGroupCollation([t(), t('nocase', 'declared')])).to.equal('NOCASE');
 		});
 	});
 

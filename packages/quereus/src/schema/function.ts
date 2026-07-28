@@ -188,6 +188,12 @@ interface BaseFunctionSchema {
 	 * user-facing schema catalog without preventing them from resolving.
 	 */
 	hidden?: boolean;
+	/** Argument positions this function compares against one another. `'all'` for a
+	 *  variadic function that ranks every argument. Drives (a) plan-time cross-type
+	 *  coercion across the group (`planner/building/coercion.ts`
+	 *  `coerceComparisonGroup`) and (b) the emit-time comparator binding, so a
+	 *  comparison-based builtin agrees with the `=` operator on the same operands. */
+	readonly comparesArgs?: 'all' | readonly number[];
 	/**
 	 * Argument indices on which this function is injective when all other
 	 * arguments are held constant. Combines with operand-level recursion in

@@ -493,3 +493,86 @@ select min(t) as mn, max(t) as mx from mm_nc;
 → [{"mn":"a","mx":"B"}]
 
 drop table mm_nc;
+
+-- =============================================================================
+-- nullif / greatest / least resolve their comparison exactly as `=` does
+-- =============================================================================
+-- All three builtins declare their arguments as one comparison group, so each
+-- call site resolves ONE collation through the same provenance lattice `=` uses
+-- (explicit COLLATE > declared column collation > defaults > BINARY) and
+-- compares under it. Each assertion sits next to the corresponding `=` form so
+-- a future divergence shows up in one place. Regression for
+-- `nullif-greatest-least-comparison-seam` (previously all three compared raw
+-- bytes under BINARY and disagreed with `=` on collated columns).
+
+create table nf (id integer primary key, n text collate NOCASE, m text collate NOCASE);
+insert into nf values (1, 'a', 'B');
+
+-- The declared NOCASE collation governs `=` and nullif alike.
+select (n = 'A') as r from nf;
+→ [{"r":true}]
+
+select nullif(n, 'A') as r from nf;
+→ [{"r":null}]
+
+-- A NOCASE-distinct value still comes through unchanged.
+select nullif(n, 'x') as r from nf;
+→ [{"r":"a"}]
+
+-- greatest/least rank under NOCASE: 'a' < 'B' (BINARY would rank 'B' < 'a').
+-- The values are NOCASE-distinct, so no tie-representative is pinned.
+select greatest(n, m) as g, least(n, m) as l from nf;
+→ [{"g":"B","l":"a"}]
+
+drop table nf;
+
+-- Explicit COLLATE on either operand governs the group (a BINARY-defaulted
+-- column must not shadow it) — same rule as `=`.
+create table nfx (id integer primary key, n text);
+insert into nfx values (1, 'a');
+
+select (n collate NOCASE = 'A') as r from nfx;
+→ [{"r":true}]
+
+select nullif(n collate NOCASE, 'A') as r from nfx;
+→ [{"r":null}]
+
+select nullif(n, 'A' collate NOCASE) as r from nfx;
+→ [{"r":null}]
+
+-- Plain BINARY stays case-sensitive.
+select nullif(n, 'A') as r from nfx;
+→ [{"r":"a"}]
+
+-- greatest/least under an explicit NOCASE: 'a' < 'B' (BINARY would flip both).
+select greatest(n collate NOCASE, 'B') as g, least(n collate NOCASE, 'B') as l from nfx;
+→ [{"g":"B","l":"a"}]
+
+-- An explicit-COLLATE conflict inside the group is the same error `=` raises
+-- for the same operand pair.
+select nullif(n collate NOCASE, 'A' collate RTRIM) as r from nfx;
+-- error: conflicting COLLATE clauses in comparison
+
+select greatest(n collate NOCASE, 'A' collate RTRIM) as r from nfx;
+-- error: conflicting COLLATE clauses in comparison
+
+select (n collate NOCASE = 'A' collate RTRIM) as r from nfx;
+-- error: conflicting COLLATE clauses in comparison
+
+drop table nfx;
+
+-- Declared-collation conflict between two differently-collated columns is the
+-- ambiguity error, matching `=`.
+create table nfc (id integer primary key, a text collate NOCASE, b text collate RTRIM);
+insert into nfc values (1, 'x', 'x');
+
+select (a = b) as r from nfc;
+-- error: ambiguous collation for comparison
+
+select nullif(a, b) as r from nfc;
+-- error: ambiguous collation for comparison
+
+select least(a, b) as r from nfc;
+-- error: ambiguous collation for comparison
+
+drop table nfc;

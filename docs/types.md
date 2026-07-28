@@ -250,18 +250,23 @@ See the JSON entry above. Probes of a different storage class (an integer litera
 against a TIMESPAN column) order by storage class and never falsely compare equal
 (`createTypedComparator`'s mismatch fallback).
 
-Two surfaces do **not** yet follow the rule, both because they compare without any
+The comparison builtins follow the rule through a schema declaration: `nullif`,
+`greatest` and `least` mark the argument positions they compare as one group
+(`BaseFunctionSchema.comparesArgs`), which drives the same plan-time
+object-physical coercion `=`/IN/simple CASE apply and an emit-time comparator
+bound through the shared collation lattice — so `nullif(d, 'PT120M')` matches
+exactly when `d = 'PT120M'` does, and `greatest`/`least` rank a TIMESPAN or
+collated-TEXT group the way ORDER BY would. Which raw value `greatest`/`least`
+return for values a non-BINARY comparator ties ('PT1H' vs 'PT60M') is
+unspecified, the same latitude the min/max aggregate and DISTINCT take.
+
+One surface does **not** yet follow the rule, because it compares without any
 type context:
 
 - A **join key pairing a semantic-ordering column with a plain one** —
   `timespan_col = text_col` — matches on raw text in the hash and merge join
   algorithms, so `from a join b on a.d = b.s` drops rows that the same predicate in
   a `where` clause returns. Tracked as `tickets/fix/mixed-type-equi-join-key-drops-semantic-matches`.
-- **Simple `case x when v`** and **`nullif(x, y)`** compare under storage-class +
-  BINARY, ignoring both the declared type and the resolved collation, so
-  `case d when 'PT60M' …` misses a `'PT1H'` row that `d = 'PT60M'` matches (and the
-  same holds for a `collate nocase` column). Tracked as
-  `tickets/fix/case-and-nullif-ignore-collation-and-type`.
 
 Hash-keyed identity (GROUP BY, window PARTITION BY, hash-join build/probe) cannot
 call `compare` pairwise, so a semantic-ordering type whose stored form is not
@@ -656,8 +661,9 @@ if (column.collation && column.logicalType.supportedCollations) {
 
 ### Comparison collation resolution
 
-A comparison (`=`, `!=`, `<`, `<=`, `>`, `>=`, plus IN, each BETWEEN bound and
-each simple-`CASE` WHEN clause)
+A comparison (`=`, `!=`, `<`, `<=`, `>`, `>=`, plus IN, each BETWEEN bound,
+each simple-`CASE` WHEN clause, and the declared argument group of a comparison
+builtin — `nullif` pairwise, `greatest`/`least` as one N-ary merge)
 resolves ONE effective collation from its operands' types via a
 **provenance-ranked lattice** (implemented once in
 `planner/analysis/comparison-collation.ts`, shared by every plan-time

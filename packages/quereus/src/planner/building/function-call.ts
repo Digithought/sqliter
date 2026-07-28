@@ -7,6 +7,7 @@ import * as AST from "../../parser/ast.js";
 import { ScalarPlanNode } from "../nodes/plan-node.js";
 import { isAggregateFunctionSchema, isScalarFunctionSchema } from '../../schema/function.js';
 import { buildExpression } from "./expression.js";
+import { coerceComparisonGroup } from "./coercion.js";
 import { ScalarFunctionCallNode } from "../nodes/function.js";
 import { resolveFunctionSchema } from "./schema-resolution.js";
 import { CapabilityDetectors } from '../framework/characteristics.js';
@@ -105,6 +106,14 @@ export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, 
 	} else {
 		// Regular scalar function
 		const args = expr.args.map(arg => buildExpression(ctx, arg, allowAggregates));
+
+		// Reconcile a declared comparison group's object-physical operands the way
+		// `=` / IN / simple CASE do, so e.g. `nullif(json_col, '<text>')` compares
+		// JSON against JSON. Must run BEFORE inferReturnType: coercion inserts
+		// CastNodes, which changes the argument types inference sees.
+		if (isScalarFunctionSchema(functionSchema) && functionSchema.comparesArgs) {
+			coerceComparisonGroup(ctx.scope, functionSchema.comparesArgs, args);
+		}
 
 		// Perform type inference if available
 		let inferredType: ScalarType | undefined;

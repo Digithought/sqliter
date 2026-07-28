@@ -195,6 +195,28 @@ export function resolveInCollation(condition: ScalarType, rhs: ReadonlyArray<Sca
 	return resolveContributions(collationContribution(condition), merged.contribution);
 }
 
+/**
+ * Pure N-ary resolution for a group of operands that are all compared against
+ * one another (a variadic comparison builtin like `greatest`/`least` ranks
+ * every argument): one symmetric merge of every contribution under the lattice —
+ * highest rank wins; distinct names at rank ≥ 2 are a single conflict reported
+ * with the winning pair; rank-1 disagreement resolves to the BINARY floor
+ * silently. For two operands this is exactly
+ * {@link resolveComparisonCollation}.
+ */
+export function resolveGroupCollation(types: ReadonlyArray<ScalarType>): CollationResolution {
+	const merged = mergeContributions(types.map(collationContribution));
+	if (merged.kind === 'conflict') {
+		return { kind: 'conflict', level: merged.level, left: merged.left, right: merged.right };
+	}
+	return merged.contribution ? { kind: 'resolved', name: merged.contribution.name } : RESOLVED_BINARY;
+}
+
+/** Throwing form of {@link resolveGroupCollation}, for emit-time sites. */
+export function effectiveGroupCollation(types: ReadonlyArray<ScalarType>, expr?: AST.Expression): string {
+	return resolvedOrThrow(resolveGroupCollation(types), expr);
+}
+
 /** RHS contribution sources of an InNode: list element types, or the subquery's single output column. */
 export function inRhsTypes(node: InNode): ReadonlyArray<ScalarType> {
 	if (node.values) return node.values.map(v => v.getType());

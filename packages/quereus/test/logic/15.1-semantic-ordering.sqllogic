@@ -224,6 +224,66 @@ select dt.id as l, jt2.id as r from dt join jt2 on dt.d = jt2.d order by l;
 drop table jt2;
 drop table dt;
 
+-- === nullif / greatest / least route through declared semantic ordering ===
+--
+-- The three comparison builtins resolve their operand group's declared type and
+-- collation at plan/emit time, so they agree with `=` and ORDER BY on TIMESPAN
+-- and JSON columns. Regression for `nullif-greatest-least-comparison-seam`
+-- (previously they compared raw bytes/text).
+
+create table gnl (id integer primary key, d timespan, e timespan);
+insert into gnl values (1, 'PT2H', 'PT90M');
+
+-- nullif matches whenever `=` matches: PT120M ≡ PT2H by elapsed time.
+select (d = 'PT120M') as r from gnl;
+→ [{"r":true}]
+
+select nullif(d, 'PT120M') as r from gnl;
+→ [{"r":null}]
+
+-- A different elapsed time still comes through unchanged.
+select nullif(d, 'PT119M') as r from gnl;
+→ [{"r":"PT2H"}]
+
+-- greatest/least rank by elapsed time (text order says 'PT2H' < 'PT90M'). The
+-- durations are semantically distinct, so no tie-representative is pinned.
+select greatest(d, e) as g, least(d, e) as l from gnl;
+→ [{"g":"PT2H","l":"PT90M"}]
+
+drop table gnl;
+
+-- JSON: a textual operand coerces to the JSON side at plan-build time (the same
+-- synthetic cast `=`, IN and simple CASE insert), so the comparison is
+-- structural — whitespace and key order are insignificant.
+create table jnl (id integer primary key, doc json, doc2 json);
+insert into jnl values (1, '{"a":1}', '{ "a" : 1 }');
+
+select (doc = '{ "a" : 1 }') as r from jnl;
+→ [{"r":true}]
+
+-- Both sides JSON columns: structural before this ticket already.
+select nullif(doc, doc2) as r from jnl;
+→ [{"r":null}]
+
+-- One side a text literal: the plan-time cast makes it structural too.
+select nullif(doc, '{ "a" : 1 }') as r from jnl;
+→ [{"r":null}]
+
+-- A structurally different document still comes through.
+select nullif(doc, '{"a":2}') as r from jnl;
+→ [{"r":{"a":1}}]
+
+drop table jnl;
+
+-- Negative control: bare text literals declare TEXT, not TIMESPAN — text
+-- ordering is correct for them ('PT2H' vs 'PT120M' are two distinct strings,
+-- and 'PT90M' > 'PT2H' as text).
+select nullif('PT2H', 'PT120M') as r;
+→ [{"r":"PT2H"}]
+
+select greatest('PT2H', 'PT90M') as g, least('PT2H', 'PT90M') as l;
+→ [{"g":"PT90M","l":"PT2H"}]
+
 -- === TIMESPAN UNIQUE enforcement: identity, not spelling ===
 --
 -- A UNIQUE constraint over a semantic-ordering column compares candidates through
