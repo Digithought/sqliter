@@ -2661,6 +2661,14 @@ describe('IsolationModule', () => {
 			expect((err as QuereusError).message).to.match(/commit\/rollback and retry/i);
 			expect(underlyingCollation('mkd', 'k'), 'refused BEFORE the shared table was re-keyed').to.equal('BINARY');
 
+			// Both markers are back, VERBATIM. This shape also exercises the marker/marker
+			// collapse (one of the two is dropped for the pre-flight), and because these markers
+			// were minted by deleting rows this transaction had already staged they carry the
+			// deleted rows' values — a marker rebuilt from its primary key alone restores NULLs.
+			const staged = (await overlayRows('mkd')).map(r => [r[0], r[1], r[2]]);
+			expect(staged.sort(), 'both deletion markers restored unchanged')
+				.to.deep.equal([['A', 'x', 1], ['a', 'y', 1]]);
+
 			await db.exec(`COMMIT`);
 			const rows = await asyncIterableToArray(db.eval(`SELECT k FROM mkd`));
 			expect(rows, 'the transaction still deleted everything it inserted').to.deep.equal([]);

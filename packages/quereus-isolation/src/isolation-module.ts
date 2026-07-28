@@ -1,5 +1,5 @@
 import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, UpdateResult, CatalogObjectKind, ViewSchema } from '@quereus/quereus';
-import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema, isConstraintViolation, inferType, validateAndParse, validateCollationForType } from '@quereus/quereus';
+import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema, isConstraintViolation, inferType, validateAndParse, validateCollationForType, formatKeyValue } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
 import { applyOverlayToUnderlying } from './flush.js';
@@ -174,12 +174,14 @@ interface PkRekeyContext {
 
 /**
  * One post-re-key key's staged rows, as {@link IsolationModule.collectPkRekeyGroups} buckets
- * them: the OLD primary-key tuples of the live rows and of the deletion markers that land on
- * that key. Old tuples, because they are what a pre-re-key overlay write addresses.
+ * them: the OLD primary-key tuples of the live rows, and the whole overlay rows of the deletion
+ * markers that land on that key. Old tuples, because they are what a pre-re-key overlay write
+ * addresses; whole marker rows, because a drop that has to be undone must restore the row
+ * byte-for-byte (see {@link IsolationModule.reinsertPkRekeyMarkers}).
  */
 interface PkRekeyGroup {
 	livePks: SqlValue[][];
-	markerPks: SqlValue[][];
+	markerRows: Row[];
 }
 
 /**
@@ -1521,8 +1523,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// The drops happen BEFORE `underlying.alterTable`, and a dropped marker un-shadows the
 		// committed row it deletes in `issuerEffectiveRows`'s merged stream — so the effective
 		// rows are SNAPSHOTTED first, and the underlying judges the pre-drop view.
-		let droppedMarkerPks: SqlValue[][] = [];
-		if (pkRekeyCtx && ownEntry && ownEntry[1].hasChanges && ownEntry[1].overlayTable.alterSchema && change.type === 'alterColumn') {
+		let droppedMarkerRows: Row[] = [];
+		if (pkRekeyCtx && ownEntry && ownEntry[1].hasChanges && ownEntry[1].overlayTable.alterSchema) {
 			const ownOverlayState = ownEntry[1];
 			const plan = await this.planPkRekeyMarkerDrops(ownOverlayState, pkRekeyCtx);
 			if (plan.length > 0) {
@@ -1535,13 +1537,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					for await (const row of rowSource()) snapshot.push(row);
 					rowSource = () => (async function* () { yield* snapshot; })();
 				}
-				droppedMarkerPks = plan;
-				await this.applyPkRekeyMarkerDrops(ownOverlayState, plan);
+				droppedMarkerRows = plan;
+				await this.applyPkRekeyMarkerDrops(ownOverlayState, pkRekeyCtx, plan);
 			}
 			try {
+				// NOTE: unenforced contract — an overlay module that ignores `validateOnly` (see
+				// VirtualTable.alterSchema / IsolationModuleConfig.overlay) applies the re-key
+				// here for real, and a later refusal would then reinsert the markers into an
+				// already-re-keyed overlay. If host-injected overlay modules ever become common,
+				// gate this call on a module capability rather than on the documented contract.
 				await ownOverlayState.overlayTable.alterSchema!(change, true);
 			} catch (e) {
-				await this.reinsertPkRekeyMarkers(ownOverlayState, pkRekeyCtx, droppedMarkerPks);
+				await this.reinsertPkRekeyMarkers(ownOverlayState, droppedMarkerRows);
 				throw e;
 			}
 		}
@@ -1550,9 +1557,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		try {
 			updated = await this.underlying.alterTable(db, schemaName, tableName, change, rowSource);
 		} catch (e) {
-			if (droppedMarkerPks.length > 0 && ownEntry) {
-				await this.reinsertPkRekeyMarkers(ownEntry[1], pkRekeyCtx!, droppedMarkerPks);
-			}
+			if (ownEntry) await this.reinsertPkRekeyMarkers(ownEntry[1], droppedMarkerRows);
 			throw e;
 		}
 
@@ -2041,9 +2046,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * (which refuses a group holding two live rows) and the migrate-step marker drop (which
 	 * discards collapsed markers), so the two passes cannot disagree about what collapses.
 	 *
-	 * NOTE: materializes one serialized key + one PK tuple per staged row, once per pass of one
-	 * ALTER. If an overlay with very many staged rows ever makes this ALTER slow, group lazily
-	 * or reuse the merge `effectiveRowsFor` already builds.
+	 * NOTE: materializes one serialized key + one PK tuple per staged row (plus the marker rows
+	 * themselves), once per pass of one ALTER. If an overlay with very many staged rows ever
+	 * makes this ALTER slow, group lazily or reuse the merge `effectiveRowsFor` already builds.
 	 */
 	private async collectPkRekeyGroups(
 		overlay: VirtualTable,
@@ -2056,10 +2061,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			const key = ctx.keyOf(pk);
 			let group = groups.get(key);
 			if (!group) {
-				group = { livePks: [], markerPks: [] };
+				group = { livePks: [], markerRows: [] };
 				groups.set(key, group);
 			}
-			(row[tombstoneIdx] === 1 ? group.markerPks : group.livePks).push(pk);
+			if (row[tombstoneIdx] === 1) group.markerRows.push(row);
+			else group.livePks.push(pk);
 		}
 		return groups;
 	}
@@ -2118,10 +2124,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// schema stages nothing and runs none of the fallible checks.
 		if (!(oldState.hasChanges && oldOverlaySchema && oldOverlay.query)) return;
 
-		const oldTombstoneIdx = oldOverlaySchema.columnIndexMap.get(this.tombstoneColumn.toLowerCase());
-		if (oldTombstoneIdx === undefined) {
-			throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
-		}
+		const oldTombstoneIdx = this.requireTombstoneIndex(oldOverlaySchema);
 
 		if (addColumnCtx) {
 			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
@@ -2162,7 +2165,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		if (pkRekeyCtx) {
 			for (const group of (await this.collectPkRekeyGroups(oldOverlay, oldTombstoneIdx, pkRekeyCtx)).values()) {
 				if (group.livePks.length < 2) continue;
-				const keyDesc = group.livePks[1].map(formatPkKeyValue).join(', ');
+				const keyDesc = group.livePks[1].map(formatKeyValue).join(', ');
 				throw new QuereusError(
 					`UNIQUE constraint failed: ${pkRekeyCtx.tableName} primary key collides under new collation (key: ${keyDesc})`,
 					StatusCode.CONSTRAINT,
@@ -2367,11 +2370,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		ctx: PkRekeyContext,
 	): Promise<void> {
 		const plan = await this.planPkRekeyMarkerDrops(overlayState, ctx);
-		await this.applyPkRekeyMarkerDrops(overlayState, plan);
+		await this.applyPkRekeyMarkerDrops(overlayState, ctx, plan);
 	}
 
 	/**
-	 * The OLD primary keys of every deletion marker {@link dropCollapsedPkRekeyMarkers} will
+	 * The whole overlay rows of every deletion marker {@link dropCollapsedPkRekeyMarkers} will
 	 * discard, computed without mutating anything. Re-planning after the drops finds nothing
 	 * (each group then holds at most one marker and no marker beside a live row), so the
 	 * issuer path — which drops in tier 2 for the pre-flight — can safely run the shared
@@ -2380,14 +2383,19 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	private async planPkRekeyMarkerDrops(
 		overlayState: ConnectionOverlayState,
 		ctx: PkRekeyContext,
-	): Promise<SqlValue[][]> {
+	): Promise<Row[]> {
 		const overlay = overlayState.overlayTable;
 		const overlaySchema = overlay.tableSchema;
 		if (!overlaySchema || !overlay.query) return [];
 		const tombstoneIdx = this.requireTombstoneIndex(overlaySchema);
-		const toDrop: SqlValue[][] = [];
+		const toDrop: Row[] = [];
 		for (const group of (await this.collectPkRekeyGroups(overlay, tombstoneIdx, ctx)).values()) {
-			toDrop.push(...(group.livePks.length > 0 ? group.markerPks : group.markerPks.slice(1)));
+			// NOTE: the marker-only arm (`slice(1)`) is defensive — no marker-only collapse can
+			// currently SURVIVE the ALTER. Two markers share a post-change key only if the rows
+			// they shadow did too, and such a pair is refused one level down: by the underlying's
+			// re-key (a committed pair) or by the overlay's own (a staged-then-deleted pair). It
+			// still runs, and is still undone, on the way to those refusals.
+			toDrop.push(...(group.livePks.length > 0 ? group.markerRows : group.markerRows.slice(1)));
 		}
 		return toDrop;
 	}
@@ -2395,16 +2403,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	/** Deletes each planned marker by its OLD primary key through the overlay's ordinary write path. */
 	private async applyPkRekeyMarkerDrops(
 		overlayState: ConnectionOverlayState,
-		toDrop: readonly SqlValue[][],
+		ctx: PkRekeyContext,
+		toDrop: readonly Row[],
 	): Promise<void> {
 		const overlay = overlayState.overlayTable;
 		const overlaySchema = overlay.tableSchema;
 		if (!overlaySchema || toDrop.length === 0) return;
-		for (const pk of toDrop) {
+		for (const markerRow of toDrop) {
+			const pk = ctx.pkIndices.map(i => markerRow[i] as SqlValue);
 			const result: UpdateResult = await overlay.update({
 				operation: 'delete',
 				values: undefined,
-				oldKeyValues: pk as SqlValue[],
+				oldKeyValues: pk,
 			});
 			// A bare delete of a staged marker has no data condition to hit, so a non-ok result
 			// is a layer-invariant violation — raise INTERNAL (which applyInPlaceOverlayChange
@@ -2421,29 +2431,26 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	/**
 	 * Undoes {@link applyPkRekeyMarkerDrops} after a refusal that aborts the whole ALTER —
 	 * the overlay pre-flight's or the underlying's (see the tier-2 re-key block in
-	 * {@link alterTable}). Each marker row is reconstructed rather than saved: a deletion
-	 * marker is fully determined by its primary key — NULL at every other data column, flag 1
-	 * (see the tombstone-insert branch of `IsolatedTable.update`). The reinserts land in the
-	 * same savepoint frame the drops did, so the pair nets to nothing.
+	 * {@link alterTable}). Reinserts each marker row verbatim: a marker minted for a committed
+	 * row carries NULL at every non-key data column, but one made by deleting a row this
+	 * transaction had already staged keeps that row's values (the convert-to-tombstone branch
+	 * of `IsolatedTable.update`), so a reconstructed-from-PK row would not restore what was
+	 * dropped. The reinserts land in the same savepoint frame the drops did, so the pair nets
+	 * to nothing.
 	 */
 	private async reinsertPkRekeyMarkers(
 		overlayState: ConnectionOverlayState,
-		ctx: PkRekeyContext,
-		droppedPks: readonly SqlValue[][],
+		droppedRows: readonly Row[],
 	): Promise<void> {
-		if (droppedPks.length === 0) return;
+		if (droppedRows.length === 0) return;
 		const overlay = overlayState.overlayTable;
 		const overlaySchema = overlay.tableSchema;
 		if (!overlaySchema) return;
-		const tombstoneIdx = this.requireTombstoneIndex(overlaySchema);
-		for (const pk of droppedPks) {
-			const values: SqlValue[] = new Array(overlaySchema.columns.length).fill(null);
-			ctx.pkIndices.forEach((colIdx, i) => { values[colIdx] = pk[i]; });
-			values[tombstoneIdx] = 1;
-			const result: UpdateResult = await overlay.update({ operation: 'insert', values });
+		for (const markerRow of droppedRows) {
+			const result: UpdateResult = await overlay.update({ operation: 'insert', values: [...markerRow] as SqlValue[] });
 			if (isConstraintViolation(result)) {
 				throw new QuereusError(
-					`Restoring a deletion marker (pk=[${pk.join(', ')}]) to overlay '${overlaySchema.name}' after a refused ALTER hit a ${result.constraint} constraint: ${result.message ?? 'no message'}`,
+					`Restoring a deletion marker (row=[${markerRow.join(', ')}]) to overlay '${overlaySchema.name}' after a refused ALTER hit a ${result.constraint} constraint: ${result.message ?? 'no message'}`,
 					StatusCode.INTERNAL,
 				);
 			}
@@ -2811,19 +2818,6 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 function andPredicate(base: Predicate | undefined, extra: Predicate): Predicate {
 	return base ? { type: 'binary', operator: 'AND', left: base, right: extra } : extra;
-}
-
-/**
- * One primary-key value as the engine's constraint diagnostics print it (the un-exported
- * `formatKeyValue` in `schema/constraint-builder.ts`) — the pre-validation collision message in
- * {@link IsolationModule.validateOverlayMigration} must read like the underlying's own
- * `primary key collides under new collation (key: …)`, which uses that formatter.
- */
-function formatPkKeyValue(v: SqlValue): string {
-	if (v === null || v === undefined) return 'null';
-	if (typeof v === 'string') return `'${v}'`;
-	if (v instanceof Uint8Array) return `x'…'`;
-	return String(v);
 }
 
 /**

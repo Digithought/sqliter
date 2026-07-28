@@ -184,7 +184,7 @@ export { SchemaManager } from './schema/manager.js';
 export type { ImportCatalogOptions } from './schema/manager.js';
 export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent } from './schema/change-events.js';
 export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema } from './schema/table.js';
-export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError } from './schema/constraint-builder.js';
+export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './schema/table.js';
 // Per-column UNIQUE-enforcement collation resolver, plus the per-column comparators
 // built from it — the single source of truth shared by store/isolation re-validators
