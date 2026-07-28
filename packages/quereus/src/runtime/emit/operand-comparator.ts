@@ -7,40 +7,54 @@ import { tryTemporalCompare } from "./temporal-arithmetic.js";
 export type OperandComparator = (probe: SqlValue, operand: SqlValue) => number;
 
 /**
- * Comparator for ONE operand of a "probe against N independently-typed operands"
- * construct (a BETWEEN bound, a simple-CASE WHEN value), selecting the SAME path
- * `emitComparisonOp` would select for the equivalent binary comparison, so those
- * constructs and their desugared forms never disagree:
- *  - both sides declare the same semantic-ordering type (TIMESPAN, JSON) ⇒ the type's
- *    compare, matching the operator's typed fast path;
- *  - neither side is temporal and both share a category (numeric/numeric or
- *    textual/textual) ⇒ plain storage-class + collation compare, matching the
- *    operator's same-category fast path. Notably a plain TEXT column holding
- *    duration-shaped text ('PT30M') stays text-ordered here, exactly as `>=` leaves it;
+ * Comparator for a group of declared operand types that are all compared against
+ * one another, selecting the SAME path `emitComparisonOp` would select for the
+ * equivalent binary comparison, so every comparison construct and its desugared
+ * form agree:
+ *  - every operand declares the same semantic-ordering type (TIMESPAN, JSON) ⇒ that
+ *    type's compare, matching the operator's typed fast path;
+ *  - no operand is temporal and all share a category (all numeric or all textual) ⇒
+ *    plain storage-class + collation compare, matching the operator's same-category
+ *    fast path. Notably a plain TEXT column holding duration-shaped text ('PT30M')
+ *    stays text-ordered here, exactly as `>=` leaves it;
  *  - otherwise ⇒ a runtime duration check first, matching the operator's generic path.
+ *    This is what makes `greatest(timespan_col, 'PT30M')` rank by elapsed time even
+ *    though the literal declares TEXT.
  *
- * This is THE one copy of the routing rule for those sites — `between.ts` and
- * `case.ts` both call it, so BETWEEN, `=` and simple CASE cannot drift apart.
- * The collation must already be resolved through the shared provenance lattice
- * (`planner/analysis/comparison-collation.ts`) by the caller.
+ * This is THE one copy of the routing rule — {@link makeOperandComparator} is the
+ * two-operand case of it — so BETWEEN, `=`, simple CASE and the comparison builtins
+ * cannot drift apart. The collation must already be resolved through the shared
+ * provenance lattice (`planner/analysis/comparison-collation.ts`) by the caller.
+ */
+export function makeGroupComparator(
+	logicals: readonly LogicalType[],
+	collationFunc: CollationFunction,
+): OperandComparator {
+	const first = logicals[0];
+	if (first && logicals.every(l => l === first) && hasSemanticOrdering(first)) {
+		return createTypedComparator(first, collationFunc);
+	}
+
+	const needsTemporalCheck = logicals.some(l => l.isTemporal);
+	const sameCategory = logicals.every(l => l.isNumeric) || logicals.every(l => l.isTextual);
+	if (!needsTemporalCheck && sameCategory) {
+		return (a, b) => compareSqlValuesFast(a, b, collationFunc);
+	}
+
+	return (a, b) => tryTemporalCompare(a, b) ?? compareSqlValuesFast(a, b, collationFunc);
+}
+
+/**
+ * Comparator for ONE operand of a "probe against N independently-typed operands"
+ * construct (a BETWEEN bound, a simple-CASE WHEN value, a `nullif` pair) — the
+ * two-operand case of {@link makeGroupComparator}.
  */
 export function makeOperandComparator(
 	probeLogical: LogicalType,
 	operandLogical: LogicalType,
 	collationFunc: CollationFunction,
 ): OperandComparator {
-	if (probeLogical === operandLogical && hasSemanticOrdering(probeLogical)) {
-		return createTypedComparator(probeLogical, collationFunc);
-	}
-
-	const needsTemporalCheck = probeLogical.isTemporal || operandLogical.isTemporal;
-	const bothSameCategory = (probeLogical.isNumeric && operandLogical.isNumeric)
-		|| (probeLogical.isTextual && operandLogical.isTextual);
-	if (!needsTemporalCheck && bothSameCategory) {
-		return (probe, operand) => compareSqlValuesFast(probe, operand, collationFunc);
-	}
-
-	return (probe, operand) => tryTemporalCompare(probe, operand) ?? compareSqlValuesFast(probe, operand, collationFunc);
+	return makeGroupComparator([probeLogical, operandLogical], collationFunc);
 }
 
 /**

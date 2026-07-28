@@ -189,10 +189,13 @@ interface BaseFunctionSchema {
 	 */
 	hidden?: boolean;
 	/** Argument positions this function compares against one another. `'all'` for a
-	 *  variadic function that ranks every argument. Drives (a) plan-time cross-type
+	 *  variadic function that ranks every argument. Drives plan-time cross-type
 	 *  coercion across the group (`planner/building/coercion.ts`
-	 *  `coerceComparisonGroup`) and (b) the emit-time comparator binding, so a
-	 *  comparison-based builtin agrees with the `=` operator on the same operands. */
+	 *  `coerceComparisonGroup`), so a comparison-based builtin reconciles its
+	 *  operands exactly as the `=` operator does. A builtin that declares this must
+	 *  also supply a {@link BaseFunctionSchema.customEmitter} binding the matching
+	 *  comparator over the same positions (`emitNullif` / `emitExtremum` in
+	 *  `func/builtins/scalar.ts`) — the emitter is not derived from this field. */
 	readonly comparesArgs?: 'all' | readonly number[];
 	/**
 	 * Argument indices on which this function is injective when all other

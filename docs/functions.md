@@ -71,8 +71,8 @@ select clamp(15, 0, 10);  -- 10
 | `nullif(X, Y)` | 2 | any | `NULL` if X = Y, else X |
 | `iif(X, Y, Z)` | 3 | any | If X is truthy then Y, else Z |
 | `typeof(X)` | 1 | TEXT | Type name: `'null'`, `'integer'`, `'real'`, `'text'`, `'blob'`, `'json'` |
-| `greatest(X, Y, ...)` | variadic | any | Largest value using SQL comparison |
-| `least(X, Y, ...)` | variadic | any | Smallest value using SQL comparison |
+| `greatest(X, Y, ...)` | variadic | any | Largest value using SQL comparison; NULLs are skipped |
+| `least(X, Y, ...)` | variadic | any | Smallest value using SQL comparison. NULL handling is order-dependent — see caveat below |
 | `choose(N, V1, V2, ...)` | variadic | any | Returns the N-th value (1-based index). `NULL` if out of range |
 
 ```sql
@@ -84,6 +84,15 @@ select greatest(3, 1, 2);          -- 3
 select least(3, 1, 2);             -- 1
 select choose(2, 'a', 'b', 'c');   -- 'b'
 ```
+
+`nullif`, `greatest` and `least` compare exactly as the `=` operator and `order by`
+do — honoring a column's declared collation, semantic-ordering types like TIMESPAN,
+and JSON documents — rather than raw bytes. See
+[types.md](types.md#comparison-collation-resolution).
+
+A NULL argument to `least` wipes the running minimum, so the answer depends on
+argument order: `least(1, null, 3)` is `3`, not `1`. `greatest` skips NULLs
+instead. Tracked as `tickets/backlog/bug-least-null-handling-order-dependent`.
 
 ---
 

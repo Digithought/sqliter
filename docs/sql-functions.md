@@ -53,8 +53,11 @@ select
 - `pow(X, Y)`, `power(X, Y)`: Returns X raised to the power of Y
 - `sqrt(X)`: Returns the square root of X
 - `clamp(X, min, max)`: Constrains X to be between min and max
-- `greatest(X, Y, ...)`: Returns the largest value from the arguments
-- `least(X, Y, ...)`: Returns the smallest value from the arguments
+- `greatest(X, Y, ...)`: Returns the largest value from the arguments, skipping NULLs
+- `least(X, Y, ...)`: Returns the smallest value from the arguments. A NULL argument
+  wipes the running minimum, so the answer depends on argument order —
+  `least(1, null, 3)` is `3`. Tracked as
+  `tickets/backlog/bug-least-null-handling-order-dependent`
 - `random()`: Returns a random integer
 - `randomblob(N)`: Returns a blob containing N bytes of pseudo-random data
 
@@ -77,9 +80,12 @@ select
 
 #### Conditional Functions
 - `coalesce(X, Y, ...)`: Returns the first non-NULL value
-- `nullif(X, Y)`: Returns NULL if X equals Y, otherwise returns X
+- `nullif(X, Y)`: Returns NULL if X equals Y, otherwise returns X. "Equals" means
+  exactly what the `=` operator means at that call site — the operands' declared
+  collation and semantic-ordering type apply, not raw byte comparison. The same
+  holds for `greatest`/`least`; see [types.md](types.md#comparison-collation-resolution)
 - `iif(X, Y, Z)`: If X is true, returns Y, otherwise returns Z
-- `choose(index, val0, val1, ...)`: Returns the value at the given index (0-based)
+- `choose(index, val1, val2, ...)`: Returns the value at the given index (1-based)
 
 **Examples:**
 ```sql

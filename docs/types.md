@@ -256,9 +256,18 @@ The comparison builtins follow the rule through a schema declaration: `nullif`,
 object-physical coercion `=`/IN/simple CASE apply and an emit-time comparator
 bound through the shared collation lattice — so `nullif(d, 'PT120M')` matches
 exactly when `d = 'PT120M'` does, and `greatest`/`least` rank a TIMESPAN or
-collated-TEXT group the way ORDER BY would. Which raw value `greatest`/`least`
-return for values a non-BINARY comparator ties ('PT1H' vs 'PT60M') is
-unspecified, the same latitude the min/max aggregate and DISTINCT take.
+collated-TEXT group the way ORDER BY would. A `greatest`/`least` group whose
+operands do not all declare one type (a TIMESPAN column against a bare text
+literal) routes through the same generic path a mixed `>` does, so the runtime
+duration check still applies. Which raw value `greatest`/`least` return for
+values a non-BINARY comparator ties ('PT1H' vs 'PT60M') is unspecified, the same
+latitude the min/max aggregate and DISTINCT take.
+
+`greatest`/`least` NULL handling is a separate, pre-existing wrinkle the
+comparison work deliberately left alone: `greatest` skips NULLs, but `least` is
+order-dependent — a NULL wipes the running minimum, so `least(1, null, 3)` is 3.
+Pinned by `test/logic/24-builtin-branches.sqllogic` and tracked as
+`tickets/backlog/bug-least-null-handling-order-dependent`.
 
 One surface does **not** yet follow the rule, because it compares without any
 type context:

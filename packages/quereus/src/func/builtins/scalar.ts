@@ -1,6 +1,6 @@
 import type { SqlValue, DeepReadonly } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
-import { compareSqlValues, createSemanticValueComparator, getSqlDataTypeName } from '../../util/comparison.js';
+import { compareSqlValues, getSqlDataTypeName } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { ANY_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
 import type { CustomEmitterHook } from '../../schema/function.js';
@@ -10,7 +10,7 @@ import type { Instruction, RuntimeContext } from '../../runtime/types.js';
 import { asRun } from '../../runtime/types.js';
 import { emitPlanNode } from '../../runtime/emitters.js';
 import { effectiveComparisonCollation, effectiveGroupCollation } from '../../planner/analysis/comparison-collation.js';
-import { makeOperandComparator, formatOperandCollationNote } from '../../runtime/emit/operand-comparator.js';
+import { makeGroupComparator, makeOperandComparator, formatOperandCollationNote } from '../../runtime/emit/operand-comparator.js';
 
 /**
  * Find the common type among multiple logical types.
@@ -153,6 +153,14 @@ export const coalesceFunc = createScalarFunction(
  * check) is the one `=`, BETWEEN and simple CASE share. Resolved ONCE at emit,
  * never per row. A same-rank explicit/declared collation conflict between the
  * two operands throws here, exactly as `x = y` throws for the same pair.
+ *
+ * NOTE: that throw happens at emit time, where `=` validates in
+ * `BinaryOpNode.generateType` — the same deferral simple CASE has (see the
+ * matching note in `runtime/emit/case.ts`). Both surface inside `db.prepare`
+ * today, since even a fully-constant call is emitted for the folder to evaluate.
+ * If a rule ever rewrites a `ScalarFunctionCallNode` away without emitting it,
+ * move the resolution into the node's `generateType` and read the cached result
+ * here. Applies to `emitExtremum` below identically.
  */
 function emitNullif(
 	plan: ScalarFunctionCallNode,
@@ -413,10 +421,10 @@ export const clampFunc = createScalarFunction(
  * would rank a column of the group's declared type and collation. ONE collation
  * resolves for the group through the lattice's N-ary merge
  * (`effectiveGroupCollation` — a same-rank explicit/declared conflict among the
- * arguments throws, matching `=`), and ONE comparator serves the fold: when
- * every argument declares the same semantic-ordering type its compare rules
- * (TIMESPAN by elapsed time, JSON structurally); any mixed group falls back to
- * storage class + the resolved collation. `direction` is +1 for greatest, -1
+ * arguments throws, matching `=`), and ONE comparator serves the fold, routed by
+ * `makeGroupComparator` — the N-ary form of the same rule `=`, BETWEEN and
+ * simple CASE route through, so a TIMESPAN column ranked against a bare text
+ * literal still compares by elapsed time. `direction` is +1 for greatest, -1
  * for least — sharing the comparator keeps the two directions mirror images.
  *
  * The fold is byte-for-byte the unemitted default's reduce with only the
@@ -428,11 +436,7 @@ function emitExtremum(direction: 1 | -1): CustomEmitterHook {
 	return (plan, ctx, _defaultEmit) => {
 		const types = plan.operands.map(op => op.getType());
 		const collationName = effectiveGroupCollation(types, plan.expression);
-		const logicals = types.map(t => t.logicalType);
-		const groupLogical = logicals.length > 0 && logicals.every(l => l === logicals[0])
-			? logicals[0]
-			: undefined;
-		const compare = createSemanticValueComparator(groupLogical, ctx.resolveCollation(collationName));
+		const compare = makeGroupComparator(types.map(t => t.logicalType), ctx.resolveCollation(collationName));
 
 		function run(_rctx: RuntimeContext, ...args: SqlValue[]): SqlValue {
 			if (args.length === 0) return null;

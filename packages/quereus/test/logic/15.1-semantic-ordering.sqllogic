@@ -250,6 +250,28 @@ select nullif(d, 'PT119M') as r from gnl;
 select greatest(d, e) as g, least(d, e) as l from gnl;
 → [{"g":"PT2H","l":"PT90M"}]
 
+-- A MIXED group — TIMESPAN column against a bare TEXT literal — still ranks by
+-- elapsed time: the group comparator falls through to the runtime duration
+-- check, the same route `d > 'PT30M'` takes. Plain text order says
+-- 'PT2H' < 'PT30M' and would flip both answers.
+select (d > 'PT30M') as r from gnl;
+→ [{"r":true}]
+
+select greatest(d, 'PT30M') as g, least(d, 'PT30M') as l from gnl;
+→ [{"g":"PT2H","l":"PT30M"}]
+
+-- Three-operand mixed group, so the fold takes the duration route repeatedly.
+select greatest(d, e, 'PT30M') as g, least(d, e, 'PT30M') as l from gnl;
+→ [{"g":"PT2H","l":"PT30M"}]
+
+-- NULL handling is the plain fold's, unchanged by the comparator swap: greatest
+-- skips NULLs, least replaces a NULL accumulator but ranks a later NULL lowest.
+select greatest(d, null) as g, least(d, null) as l, least(null, d) as l2 from gnl;
+→ [{"g":"PT2H","l":null,"l2":"PT2H"}]
+
+select nullif(d, null) as a, nullif(null, d) as b from gnl;
+→ [{"a":"PT2H","b":null}]
+
 drop table gnl;
 
 -- JSON: a textual operand coerces to the JSON side at plan-build time (the same
@@ -272,6 +294,20 @@ select nullif(doc, '{ "a" : 1 }') as r from jnl;
 -- A structurally different document still comes through.
 select nullif(doc, '{"a":2}') as r from jnl;
 → [{"r":{"a":1}}]
+
+-- Flipped orientation: the TEXT literal is the group's probe, so it carries the
+-- synthetic cast. The comparison is still structural, but a non-match returns the
+-- PARSED document rather than the original text spelling (and the call declares a
+-- JSON return type) — the same probe-cast semantics IN and simple CASE have.
+select nullif('{ "a" : 1 }', doc) as r from jnl;
+→ [{"r":null}]
+
+select nullif('{ "a" : 2 }', doc) as r from jnl;
+→ [{"r":{"a":2}}]
+
+-- greatest/least over a JSON group rank structurally, not by text spelling.
+select greatest(doc, '{"a":2}') as g, least(doc, '{"a":2}') as l from jnl;
+→ [{"g":{"a":2},"l":{"a":1}}]
 
 drop table jnl;
 
