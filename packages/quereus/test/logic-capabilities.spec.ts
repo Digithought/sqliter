@@ -144,6 +144,27 @@ describe('sqllogic capability directive', () => {
 			expect(() => parseRequiredCapabilities('bad.sqllogic', content))
 				.to.throw(/leading comment block/i);
 		});
+
+		it('accepts a directive with no space after the comment marker', () => {
+			const content = '--requires-capability:standalone-index-ddl\nselect 1;\n';
+			expect(tokens(parseRequiredCapabilities('t.sqllogic', content))).to.deep.equal([INDEX_DDL]);
+		});
+
+		it('tolerates redundant separators around the tokens', () => {
+			const content = '-- requires-capability:  ,standalone-index-ddl,\t\nselect 1;\n';
+			expect(tokens(parseRequiredCapabilities('t.sqllogic', content))).to.deep.equal([INDEX_DDL]);
+		});
+
+		it('returns an empty set for an empty file and for a comment-only file', () => {
+			expect(tokens(parseRequiredCapabilities('t.sqllogic', ''))).to.deep.equal([]);
+			expect(tokens(parseRequiredCapabilities('t.sqllogic', '-- just prose.\n\n-- more prose.\n')))
+				.to.deep.equal([]);
+		});
+
+		it('names the offending line number in the error', () => {
+			const content = '-- header\n-- more header\n-- requires-capability: frobnicate\nselect 1;\n';
+			expect(() => parseRequiredCapabilities('bad.sqllogic', content)).to.throw(/bad\.sqllogic:3/);
+		});
 	});
 
 	describe('missingCapability', () => {
@@ -188,15 +209,17 @@ describe('sqllogic capability directive', () => {
 
 		it('returns an empty set for every file that does not mention the directive', () => {
 			// Zero behavior change for the un-annotated bulk of the corpus. A regression here
-			// would skip or fail files wholesale.
-			let checked = 0;
-			for (const file of files) {
+			// would skip or fail files wholesale. The count of annotated files is expected to
+			// grow, so assert only that unannotated files exist — never a magic threshold.
+			const unannotated = files.filter(
+				file => !/requires-capability/i.test(fs.readFileSync(path.join(logicTestDir, file), 'utf-8')),
+			);
+			expect(unannotated.length, 'corpus should still contain unannotated files').to.be.greaterThan(0);
+
+			for (const file of unannotated) {
 				const content = fs.readFileSync(path.join(logicTestDir, file), 'utf-8');
-				if (/requires-capability/i.test(content)) continue;
 				expect([...parseRequiredCapabilities(file, content)], `for ${file}`).to.deep.equal([]);
-				checked++;
 			}
-			expect(checked).to.be.greaterThan(files.length - 5);
 		});
 
 		// Pins the corpus to the mechanism: quereus's own backends produce no skips, so without

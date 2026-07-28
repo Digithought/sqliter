@@ -39,6 +39,11 @@ const DIRECTIVE_RE = /^--\s*requires-capability\s*:\s*(.*)$/i;
  * unrecognized `--` line, so without this guard a typo'd directive (`-- require-capability:`,
  * `-- requires_capability:`) would vanish silently and the file would run with nobody the wiser.
  * Matches on the canonical form too — check `DIRECTIVE_RE` first.
+ *
+ * NOTE: deliberately loose, so it also fires on prose that merely opens a comment line with
+ * "requires capability" / "required capability" (no colon needed). No corpus file does that today.
+ * If a legitimate header comment ever trips it, rephrase the prose — do not narrow this regex,
+ * since a narrower one lets a real typo through silently.
  */
 const NEAR_MISS_RE = /^--\s*require[sd]?[-_ ]?capabilit/i;
 

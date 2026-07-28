@@ -502,7 +502,7 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 		let required: ReadonlySet<SqllogicCapability>;
 		try {
 			required = parseRequiredCapabilities(file, content);
-		} catch (parseError: any) {
+		} catch (parseError: unknown) {
 			const error = parseError instanceof Error ? parseError : new Error(String(parseError));
 			describe(`File: ${file}`, () => {
 				it('should declare valid capability directives', () => { throw error; });
