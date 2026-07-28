@@ -75,6 +75,13 @@ After join ordering (QuickPick), the optimizer selects a physical join algorithm
 
 The selection rule (`ruleJoinPhysicalSelection`) extracts equi-join pairs from AND-of-equalities in the ON condition (or USING columns), performs a three-way cost comparison (nested-loop vs hash vs merge), and selects the cheapest physical algorithm.
 
+**Two admissibility gates in `rules/join/equi-pair-extractor.ts`** decide whether a candidate pair may become a physical key at all. Both exist because a physical key compares with no type context, so it must reproduce what the `=` operator says:
+
+- **Matched collation** — both operands' collation names must agree (detail under each algorithm below).
+- **Agreeing semantic ordering** (`semanticOrderingsAgree`) — either neither side declares a semantic-ordering logical type, or both declare the *same* one. A **mixed** pair such as `timespan_col = text_col` is inadmissible: `=` runs its generic path's runtime duration check and matches `'PT1H'` against `'PT60M'`, which a raw-text hash key or merge co-walk does not. Declining rather than canonicalizing is deliberate — merge join needs both inputs physically sorted in its comparator's order, and no single comparator merges "sorted by elapsed time" with "sorted by text". See `docs/types.md` § Semantic ordering.
+
+A pair failing either gate demotes to the join's residual predicate — or, for `USING` (which has no residual), sinks the whole extraction — so the generic nested-loop join evaluates it with the `=` operator's own semantics.
+
 ### Bloom (Hash) Join
 
 - **Build phase**: Materializes the smaller input into a `Map<string, Row[]>` keyed by serialized equi-join column values

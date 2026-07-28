@@ -49,6 +49,14 @@ export interface ExistenceColumnSpec {
  * unaffected — it uses its own extractor (`rules/join/equi-pair-extractor.ts`)
  * and resolves collations at emit time.
  *
+ * The gate is collation-only, which is **not** enough: a pair whose two sides
+ * disagree on semantic ordering (`timespan_col = text_col`) matches rows that are
+ * NOT value-equal ('PT1H' against 'PT60M'), yet still mints a pair here. The
+ * physical extractor declines such a pair (`semanticOrderingsAgree`); this one
+ * does not, and `rule-predicate-inference-equivalence` turns the resulting
+ * equivalence class into a row-dropping constant substitution. Tracked as
+ * `tickets/fix/equality-fact-extraction-ignores-semantic-ordering`.
+ *
  * Operands must be **bare** `ColumnReferenceNode`s: a `COLLATE`-wrapped side
  * (`l.x = r.b collate nocase`) is structurally rejected. That exclusion is
  * load-bearing — do not "improve" this with a collate-unwrapping step without

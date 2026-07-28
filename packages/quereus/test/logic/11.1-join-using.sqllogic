@@ -141,3 +141,29 @@ select cf_a.id as aid, cf_b.id as bid from cf_a join cf_b on cf_a.name = cf_b.na
 
 drop table cf_a;
 drop table cf_b;
+-- run
+
+-- ===== NULL USING keys never match =====
+-- `using (k)` is `l.k = r.k`, and `null = null` is UNKNOWN, so two NULL keys do
+-- NOT join — on either physical path. The nested-loop emitter compares through an
+-- ORDERING comparator, which ranks NULL/NULL as equal, so it carries its own NULL
+-- guard; the hash path drops NULL keys by construction. The two must agree with
+-- each other and with the spelled-out ON form.
+create table nu_l (id integer primary key, k text null);
+create table nu_r (id integer primary key, k text null);
+insert into nu_l values (1, null), (2, 'a');
+insert into nu_r values (10, null), (20, 'a');
+
+select nu_l.id as lid, nu_r.id as rid from nu_l join nu_r using (k) order by nu_l.id;
+→ [{"lid":2,"rid":20}]
+
+select nu_l.id as lid, nu_r.id as rid from nu_l join nu_r on nu_l.k = nu_r.k order by nu_l.id;
+→ [{"lid":2,"rid":20}]
+
+-- LEFT JOIN: the NULL-keyed left row survives, null-extended, rather than pairing
+-- with the NULL-keyed right row.
+select nu_l.id as lid, nu_r.id as rid from nu_l left join nu_r using (k) order by nu_l.id;
+→ [{"lid":1,"rid":null},{"lid":2,"rid":20}]
+
+drop table nu_l;
+drop table nu_r;

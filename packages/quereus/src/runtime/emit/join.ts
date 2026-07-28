@@ -258,10 +258,12 @@ type ResolvedUsingColumn = {
  * `emitComparisonOp` uses. A USING column pairing a semantic-ordering type with a
  * plain one (TIMESPAN `d` against TEXT `d`) therefore takes the same runtime
  * duration check `=` takes and reports 'PT1H' ≡ 'PT60M'; a same-type pair takes the
- * type's own compare. There is deliberately no NULL short-circuit here:
- * `makeOperandComparator` reports 0 for a NULL/NULL pair on every branch, exactly as
- * the `compareSqlValuesFast` call it replaced did, so NULL behavior is unchanged by
- * the swap.
+ * type's own compare. A NULL on either side fails the column outright, mirroring
+ * `emitComparisonOp`'s `v1 === null || v2 === null ⇒ null` guard: `l.k = r.k` is
+ * UNKNOWN, not true, when both are NULL. The comparators themselves rank NULL/NULL as
+ * equal (they are ordering functions, where NULL is a value), so the guard belongs
+ * here — without it a nested-loop USING join emits rows the hash-keyed path and the
+ * spelled-out ON form both drop.
  *
  * NOTE: USING skips the plan-time cross-type coercion `=` gets, so a JSON column
  * paired with a TEXT one still compares as OBJECT-vs-TEXT storage classes and never
@@ -276,7 +278,12 @@ function evaluateUsingCondition(
 		if (leftIndex === -1 || rightIndex === -1) {
 			return false;
 		}
-		if (compare(leftRow[leftIndex], rightRow[rightIndex]) !== 0) {
+		const leftValue = leftRow[leftIndex];
+		const rightValue = rightRow[rightIndex];
+		if (leftValue === null || rightValue === null) {
+			return false;
+		}
+		if (compare(leftValue, rightValue) !== 0) {
 			return false;
 		}
 	}

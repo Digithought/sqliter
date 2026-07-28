@@ -284,6 +284,24 @@ select tag from uma join umb using (d);
 drop table umb;
 drop table uma;
 
+-- A declined mixed pair lands on the nested-loop USING emitter, whose comparator
+-- ranks NULL/NULL as EQUAL (it is an ordering function). Without the emitter's own
+-- NULL guard this join would report a match that neither `=` nor the hash-keyed
+-- path reports. The `on` form is the oracle.
+create table una (id integer primary key, d timespan null);
+create table unb (id integer primary key, d text null);
+insert into una values (1, null), (2, 'PT1H');
+insert into unb values (10, null), (20, 'PT60M');
+
+select una.id as l, unb.id as r from una join unb using (d);
+→ [{"l":2,"r":20}]
+
+select una.id as l, unb.id as r from una join unb on una.d = unb.d;
+→ [{"l":2,"r":20}]
+
+drop table unb;
+drop table una;
+
 -- Control: when BOTH sides declare TIMESPAN the pair IS admissible and keeps the
 -- physical (hash/merge) key path. These must stay green — a gate that
 -- over-declines would still answer correctly here but via nested loop, while a
