@@ -9,7 +9,7 @@ import type { JoinCapable, PredicateSourceCapable } from '../framework/character
 import { hashJoinCost } from '../cost/index.js';
 import type { JoinType } from './join-node.js';
 import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
-import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinFds, propagateJoinInds, type EquiJoinPair } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, describeEquiPairs, estimateJoinRows, propagateJoinFds, propagateJoinInds, valueFactPairs, type EquiJoinPair } from './join-utils.js';
 
 export type { EquiJoinPair } from './join-utils.js';
 
@@ -63,22 +63,9 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return this.attributesCache.value;
 	}
 
-	/**
-	 * The subset of `equiPairs` that may mint value-level facts (keys, FDs,
-	 * equivalence classes). A non-`valueDiscriminating` pair still keys the
-	 * hash build/probe (the emitter reads the full `equiPairs`), but its matched
-	 * rows are not value-equal, so fact propagation must not see it — mirrors
-	 * the `isValueDiscriminatingEquality` gate on the logical JoinNode's
-	 * `extractEquiPairsFromCondition`.
-	 *
-	 * NOTE: this is a deliberate under-claim for matched-NOCASE pairs whose
-	 * covered key is itself NOCASE-enforced (there the coverage would be sound);
-	 * if NOCASE-keyed join plans regress from the lost key coverage / row
-	 * estimates, consider a collation-aware coverage check instead of this
-	 * blanket filter.
-	 */
+	/** Pairs this join may mint value-level facts from — see {@link valueFactPairs}. */
 	private factPairs(): readonly EquiJoinPair[] {
-		return this.equiPairs.filter(p => p.valueDiscriminating);
+		return valueFactPairs(this.equiPairs);
 	}
 
 	getType(): RelationType {
@@ -197,14 +184,7 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return {
 			joinType: this.joinType,
 			algorithm: 'bloom',
-			// Non-default flags surface in plan dumps so a mismatched-collation
-			// pair (hash-joinable, merge-declined, no value facts) is visible.
-			equiPairs: this.equiPairs.map(p => ({
-				left: p.leftAttrId,
-				right: p.rightAttrId,
-				...(p.collationsMatch ? {} : { collationsMatch: false }),
-				...(p.valueDiscriminating ? {} : { valueDiscriminating: false }),
-			})),
+			equiPairs: describeEquiPairs(this.equiPairs),
 			hasResidual: !!this.residualCondition,
 			leftRows: this.left.estimatedRows,
 			rightRows: this.right.estimatedRows,

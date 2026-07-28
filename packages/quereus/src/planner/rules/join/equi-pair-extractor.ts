@@ -13,12 +13,11 @@ import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import {
 	operandCollation,
 	isValueDiscriminatingEquality,
+	isValueDiscriminatingTypePair,
 	resolveComparisonCollation,
-	logicalTypeCanHoldText,
-	type CollationCarrier,
+	type TypeSlice,
 } from '../../analysis/comparison-collation.js';
 import { normalizeCollationName, semanticOrderingsAgree } from '../../../util/comparison.js';
-import type { LogicalType } from '../../../types/logical-type.js';
 
 export interface EquiPairExtraction {
 	equiPairs: EquiJoinPair[];
@@ -246,20 +245,8 @@ export function extractEquiPairs(
 type UsingAttr = {
 	id: number;
 	name: string;
-	type?: CollationCarrier & { logicalType?: LogicalType };
+	type?: TypeSlice;
 };
-
-/**
- * The USING analogue of {@link isValueDiscriminatingEquality}, over declared
- * attribute slices rather than plan nodes: both sides' declared collations are
- * BINARY, or neither side's static type can ever hold text at runtime.
- */
-function isValueDiscriminatingUsingPair(left: UsingAttr, right: UsingAttr): boolean {
-	const lColl = normalizeCollationName(left.type?.collationName ?? 'BINARY');
-	const rColl = normalizeCollationName(right.type?.collationName ?? 'BINARY');
-	if (lColl === 'BINARY' && rColl === 'BINARY') return true;
-	return !logicalTypeCanHoldText(left.type?.logicalType) && !logicalTypeCanHoldText(right.type?.logicalType);
-}
 
 /**
  * Convert USING-column names into equi-pairs given the left/right attributes.
@@ -294,7 +281,7 @@ export function extractEquiPairsFromUsing(
 				leftAttrId: leftAttr.id,
 				rightAttrId: rightAttr.id,
 				collationsMatch: lColl === rColl,
-				valueDiscriminating: isValueDiscriminatingUsingPair(leftAttr, rightAttr),
+				valueDiscriminating: isValueDiscriminatingTypePair(leftAttr.type, rightAttr.type),
 			});
 		}
 	}

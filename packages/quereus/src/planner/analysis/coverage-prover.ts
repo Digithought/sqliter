@@ -184,9 +184,6 @@ import { SortNode } from '../nodes/sort.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
 import type { EquiJoinPair } from '../nodes/join-utils.js';
-
-/** Attribute-id pairing slice of {@link EquiJoinPair} — all the coverage proofs read. */
-export type JoinAttrPair = Pick<EquiJoinPair, 'leftAttrId' | 'rightAttrId'>;
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../../schema/table.js';
@@ -196,6 +193,9 @@ import type { ColumnIndexResolver } from './predicate-shape.js';
 import { normalizePredicate } from './predicate-normalizer.js';
 import { isUnique } from '../util/fd-utils.js';
 import { lookupCoveringFK } from '../util/ind-utils.js';
+
+/** Attribute-id pairing slice of {@link EquiJoinPair} — all the coverage proofs read. */
+export type JoinAttrPair = Pick<EquiJoinPair, 'leftAttrId' | 'rightAttrId'>;
 
 export type CoverageFailureReason =
 	| 'shape'

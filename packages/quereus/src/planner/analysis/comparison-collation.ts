@@ -453,6 +453,23 @@ export function isValueDiscriminatingEquality(left: ScalarPlanNode, right: Scala
 	return isStaticallyNonTextual(left) && isStaticallyNonTextual(right);
 }
 
+/** A declared type slice: the collation lattice's inputs plus textuality. */
+export type TypeSlice = CollationCarrier & { logicalType?: LogicalType };
+
+/**
+ * The declared-type-slice variant of {@link isValueDiscriminatingEquality}, for
+ * sites that compare two *attribute types* rather than two plan nodes (the
+ * `USING` equi-pair extractor, which has no operand expressions). Same rule,
+ * same order: both declared collations BINARY, else neither side can ever hold
+ * text. Absent slice ⇒ no collation (BINARY) and unknown textuality.
+ */
+export function isValueDiscriminatingTypePair(left: TypeSlice | undefined, right: TypeSlice | undefined): boolean {
+	const lColl = normalizeCollationName(left?.collationName ?? 'BINARY');
+	const rColl = normalizeCollationName(right?.collationName ?? 'BINARY');
+	if (lColl === 'BINARY' && rColl === 'BINARY') return true;
+	return isNonTextualLogicalType(left?.logicalType) && isNonTextualLogicalType(right?.logicalType);
+}
+
 /**
  * Per-column declared metadata consumed by the schema-level (AST) variant of
  * the value-discrimination gate. `ColumnSchema` is structurally assignable;

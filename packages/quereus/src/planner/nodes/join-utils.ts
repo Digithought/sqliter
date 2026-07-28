@@ -52,6 +52,38 @@ export interface EquiJoinPair {
 }
 
 /**
+ * The subset of `pairs` that may mint value-level facts (keys, FDs, equivalence
+ * classes, monotonicity). A non-`valueDiscriminating` pair still keys the hash
+ * build/probe and drives the merge comparator — the emitters read the full pair
+ * list — but its matched rows are not value-equal, so fact propagation must not
+ * see it. Mirrors the `isValueDiscriminatingEquality` gate on the logical
+ * JoinNode's `extractEquiPairsFromCondition`.
+ *
+ * NOTE: this is a deliberate under-claim for matched-NOCASE pairs whose covered
+ * key is itself NOCASE-enforced (there the coverage would be sound); if
+ * NOCASE-keyed join plans regress from the lost key coverage / row estimates,
+ * consider a collation-aware coverage check instead of this blanket filter.
+ */
+export function valueFactPairs(pairs: readonly EquiJoinPair[]): readonly EquiJoinPair[] {
+	return pairs.filter(p => p.valueDiscriminating);
+}
+
+/**
+ * Plan-dump rendering of a physical join's equi-pairs. The flags serialize only
+ * when non-default, so existing plan goldens stay byte-identical while a
+ * mismatched-collation pair (hash-joinable, merge-declined, no value facts) is
+ * visible in `query_plan()`.
+ */
+export function describeEquiPairs(pairs: readonly EquiJoinPair[]): Record<string, unknown>[] {
+	return pairs.map(p => ({
+		left: p.leftAttrId,
+		right: p.rightAttrId,
+		...(p.collationsMatch ? {} : { collationsMatch: false }),
+		...(p.valueDiscriminating ? {} : { valueDiscriminating: false }),
+	}));
+}
+
+/**
  * Build the output attributes for a join node.
  *
  * If `preserveAttributeIds` is supplied (physical join nodes created from a
