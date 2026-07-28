@@ -99,8 +99,9 @@ which the engine may materialize and push down as a seek) exactly as it does for
 `in (1, 2, 3)`: the pushed window has the same shape either way, and this layer cannot —
 and need not — tell them apart.
 
-One ordering caveat. The **primary-key** merge walks both streams in ascending key order.
-The engine sorts a run-time key set before pushing it, so that path arrives in order. A
+One ordering caveat. The **primary-key** merge walks both streams in the primary key's own
+declared order — ascending, or descending for a `primary key (… desc)`. The engine sorts a
+run-time key set into that same order before pushing it, so that path arrives in order. A
 **literal** list does not: `where pk in (3, 1, 2)` is visited in list order, and with rows
 staged in the transaction the merge mis-pairs them — a staged update can surface alongside
 the stale stored row, and a staged delete can reappear. That is tracked as

@@ -205,6 +205,53 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 		});
 	});
 
+	describe('DESC leading key column', () => {
+		// The `seekDescending` arm of the same sort: for a DESC key column the seek keys
+		// are sorted descending, because THAT is index-key order there. Both merge paths
+		// derive their comparator from the index descriptor's key columns, so an ascending
+		// sort would pit an ascending overlay against a descending underlying stream.
+
+		it('merges staged rows against a DESC secondary index', async () => {
+			await db.exec(`create table t (pk integer primary key, v integer, tag text) using isolated`);
+			await db.exec(`create index ix_v on t (v desc)`);
+			await db.exec(`create table ksrc (id integer primary key, k integer) using isolated`);
+			await db.exec(`insert into t values (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')`);
+			await db.exec(`insert into ksrc values (1, 20), (2, 30), (3, 50)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (5, 50, 'e')`);
+			await db.exec(`update t set tag = 'rewritten' where pk = 3`);
+			mem.reset();
+			expect(await rowsOf(`select pk, v, tag from t where v in (select k from ksrc)`)).to.deep.equal([
+				{ pk: 2, v: 20, tag: 'b' },
+				{ pk: 3, v: 30, tag: 'rewritten' },
+				{ pk: 5, v: 50, tag: 'e' },
+			]);
+			expect(mem.seen('t')[0], 'the DESC index was seeked').to.match(multiSeekRe('ix_v'));
+			await db.exec(`rollback`);
+		});
+
+		it('merges staged rows against a DESC primary key', async () => {
+			// The order-sensitive path AND the descending sort at once: `mergeStreams` walks
+			// a `primary key (pk desc)` table in descending key order, so the stamped seek
+			// keys must descend too.
+			await db.exec(`create table t (pk integer, v text, primary key (pk desc)) using isolated`);
+			await db.exec(`create table ksrc (id integer primary key, k integer) using isolated`);
+			await db.exec(`insert into t values (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')`);
+			await db.exec(`insert into ksrc values (1, 3), (2, 1), (3, 2)`);
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 'new' where pk = 1`);
+			mem.reset();
+			expect(await rowsOf(`select pk, v from t where pk in (select k from ksrc)`),
+				'no stale duplicate of pk 1').to.deep.equal([
+				{ pk: 1, v: 'new' },
+				{ pk: 2, v: 'two' },
+				{ pk: 3, v: 'three' },
+			]);
+			expect(mem.seen('t')[0]).to.match(multiSeekRe('_primary_'));
+			await db.exec(`rollback`);
+		});
+	});
+
 	describe('primary-key merge (mergeStreams)', () => {
 		// The memory backend DOES serve a runtime key set on the primary key as a
 		// `_primary_` `plan=5` multi-seek, so the order-sensitive primary merge is
@@ -222,13 +269,18 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 		// under the index's leading-key collation before stamping them. These tests
 		// exist to keep that sort load-bearing: drop it and they fail the same way the
 		// literal list does.
+		//
+		// NOTE: this package's mocha run resolves `@quereus/quereus` to its built `dist`,
+		// not its `src`. Editing the engine and re-running only this file therefore tests
+		// the PREVIOUS build — `yarn build` first, or the check above passes vacuously.
 		const KEY_SET_QUERY = `select pk, v from t where pk in (select k from ksrc)`;
 
 		beforeEach(async () => {
 			await db.exec(`create table t (pk integer primary key, v text) using isolated`);
 			await db.exec(`create table ksrc (id integer primary key, k integer) using isolated`);
 			await db.exec(`insert into t values (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')`);
-			// Emitted DESCENDING by pk, so the set is only in key order if something sorts it.
+			// Scanned in ksrc's own pk order, so the keys arrive 3, 1, 2 — out of target-key
+			// order, and only sorted if something sorts them.
 			await db.exec(`insert into ksrc values (1, 3), (2, 1), (3, 2)`);
 		});
 

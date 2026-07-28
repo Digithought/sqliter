@@ -54,6 +54,13 @@ function multiSeekRe(indexName: string): RegExp {
 }
 
 /**
+ * A plain `plan=0` walk — what the store is handed when the runtime declines to seek.
+ * Asserted positively wherever "it scanned instead" is the point: a bare
+ * `not.match(/plan=5/)` is also satisfied by never having queried the store at all.
+ */
+const SCAN_RE = /^idx=\S+;plan=0$/;
+
+/**
  * In-memory data store that tallies how many entries its `iterate` yields and how
  * many point `get`s it serves — the only way to tell a narrow seek from a full scan
  * that post-filters to the same rows.
@@ -290,6 +297,19 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				expect(remaining[0].c).to.equal(197);
 				expect(await pks(`select pk from big where pk in (2, 4, 6)`)).to.deep.equal([]);
 			});
+
+			it('an UPDATE driven by the key set seeks, and only the matched rows change', async () => {
+				// A different write path from the DELETE above: the victims are read through
+				// the seek, then rewritten — which also rewrites the very index the seek is
+				// walking (w is unindexed here, so the walked windows stay put).
+				await db.exec(`insert into ksrc values (1, 20), (2, 40)`);
+				mod.reset();
+				// `w` is seeded positive for every row, so -1 marks exactly what this ran on.
+				await db.exec(`update big set w = -1 where v in (select k from ksrc)`);
+				expect(mod.seen('big')[0], 'the update read its victims through the seek')
+					.to.match(multiSeekRe('ix_v'));
+				expect(await pks(`select pk from big where w = -1`)).to.deep.equal([2, 4]);
+			});
 		});
 
 		it('seeks a DESC index column (seek keys sorted to match encoded-byte order)', async () => {
@@ -489,8 +509,8 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				expect(at.idxStr).to.contain(`inCount=${ENGINE_SEEK_CEILING}`);
 
 				const over = await runWithKeys(ENGINE_SEEK_CEILING + 1);
-				expect(over.idxStr, 'one key above it the store never sees a multi-seek')
-					.to.not.match(/plan=5/);
+				expect(over.idxStr, 'one key above it the store is walked, not seeked')
+					.to.match(SCAN_RE);
 
 				const allPks = Array.from({ length: 1000 }, (_, i) => i + 1);
 				expect(at.pks, 'seek path').to.deep.equal(allPks);
@@ -561,7 +581,7 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				expect(at.idxStr).to.contain('inCount=7');
 
 				const over = await runWithKeys(8);
-				expect(over.idxStr, '8 keys — over the break-even — scans').to.not.match(/plan=5/);
+				expect(over.idxStr, '8 keys — over the break-even — scans').to.match(SCAN_RE);
 
 				expect(at.pks).to.deep.equal([1, 2, 3, 4, 5, 6, 7]);
 				expect(over.pks, 'the scan path returns the 7-key rows plus the 8th match')
