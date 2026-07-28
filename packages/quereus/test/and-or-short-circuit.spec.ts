@@ -133,11 +133,12 @@ describe('AND/OR short-circuit deferral', () => {
 			expect(rows.map(r => r.id)).to.deep.equal([1, 2, 3]);
 		});
 
-		// NB: a top-level AND in WHERE is decomposed by the optimizer into separate
-		// filter nodes, so the binary-op short-circuit does NOT apply there (that case
-		// is governed by filter ordering, not this ticket — see the review handoff).
-		// The AND short-circuit is observable wherever the AND survives as a scalar
-		// binary op — here, a SELECT-list projection.
+		// NB: a top-level AND in WHERE never reaches this emitter — the optimizer
+		// decomposes it into separate filter nodes, and whatever survives is split into
+		// conjuncts by `emitFilter`, which runs its own early exit (see
+		// test/filter-conjunct-early-exit.spec.ts). The AND short-circuit here is
+		// observable wherever the AND survives as a scalar binary op — a SELECT-list
+		// projection, an ON clause, a CASE arm.
 		it('AND (SELECT-list): RHS runs only for rows whose left operand is true', async () => {
 			const rows = await collect(
 				db,

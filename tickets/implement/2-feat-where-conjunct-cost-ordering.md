@@ -101,8 +101,8 @@ satisfies `isRelationalNode`, else `Volatile` if any node reports
 exporting `ruleFilterConjunctOrdering(node, context)`:
 
 - Bail unless `node.nodeType === PlanNodeType.Filter`.
-- Split with `splitConjunctsOrdered` (added by ticket 1 — source order, unlike
-  `splitConjuncts`, which returns reverse source order). Bail if `< 2` conjuncts.
+- Split with `splitConjuncts` (returns conjuncts in left-to-right source order).
+  Bail if `< 2` conjuncts.
 - **Refuse when any conjunct's subtree has side effects**
   (`PlanNodeCharacteristics.subtreeHasSideEffects`). Predicates are pure today,
   but reordering with early exit changes evaluation counts, so gate explicitly
@@ -188,9 +188,9 @@ the `Filter` above it is visited — the cost read is the final one.
   `UPDATE_PLANS=true` on the golden spec and **review the diff by eye**: every
   changed golden should show only a conjunct permutation, never a structural
   change. A structural diff means the rule did more than reorder — stop and fix.
-- **`splitConjuncts` vs `splitConjunctsOrdered`** — the rule must use the ordered
-  variant. Using the scrambling one would make "already ordered?" comparisons
-  meaningless and reintroduce oscillation.
+- **`splitConjuncts` is source-ordered** — there is one splitter and it preserves
+  left-to-right order (the earlier scrambling variant was removed in review of
+  ticket 1). "Already ordered?" comparisons can rely on that.
 
 ## TODO
 

@@ -1,6 +1,12 @@
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
 import type { SqlValue } from '../src/common/types.js';
+import { Parser } from '../src/parser/parser.js';
+import type * as AST from '../src/parser/ast.js';
+import { PlanNode } from '../src/planner/nodes/plan-node.js';
+import { FilterNode } from '../src/planner/nodes/filter.js';
+import { combineConjuncts, splitConjuncts } from '../src/planner/analysis/predicate-conjuncts.js';
+import { createScalarFunction } from '../src/func/registration.js';
 
 /**
  * Filter conjunct early exit (runtime/emit/filter.ts `emitFilter`).
@@ -165,6 +171,13 @@ describe('Filter conjunct early exit', () => {
 			expect(programOf(db, `select id from t where ${chain}`)).to.contain('[50 conjuncts');
 		});
 
+		// Two conjuncts that are the same expression: each still gets its own callback,
+		// so a shared plan node cannot alias one sub-program across both params.
+		it('a repeated conjunct keeps the same rows', async () => {
+			const rows = await collect(db, 'select id from t where v % 5 = 2 and v % 5 = 2 order by id');
+			expect(rows.map(r => r.id)).to.deep.equal([2, 7, 12]);
+		});
+
 		it('HAVING with a conjunctive predicate is unchanged', async () => {
 			const rows = await collect(
 				db,
@@ -204,10 +217,61 @@ describe('Filter conjunct early exit', () => {
 		// return every row — a pre-existing planner defect unrelated to conjunct early
 		// exit, tracked as ticket `bug-filter-conjunct-lost-under-index-order`. Restore
 		// the ORDER BY here once that lands.
+		// A genuinely pending conjunct between two synchronous ones: the loop must await
+		// it, resume on the right row, and still stop at the first non-true conjunct.
+		it('an asynchronous conjunct interleaves with synchronous ones', async () => {
+			// Registered through the internal factory: `Database.createScalarFunction`
+			// types its callback as synchronous, while the engine's `ScalarFunc` accepts
+			// a promise.
+			db.registerFunction(createScalarFunction(
+				{ name: 'slowfx', numArgs: 0, deterministic: false },
+				async () => {
+					calls++;
+					await Promise.resolve();
+					return 1;
+				},
+			));
+			const rows = await collect(db, 'select id from t where v % 5 = 2 and slowfx() = 1 and v > 2 order by id');
+			expect(rows.map(r => r.id)).to.deep.equal([7, 12]);
+			expect(calls, 'the async conjunct runs only for the 3 rows the first conjunct kept').to.equal(3);
+		});
+
 		it('a subquery conjunct is skipped for rows an earlier conjunct rejected', async () => {
 			const rows = await collect(db, 'select id from o where flag = 0 and (select sidefx()) = 1');
 			expect(rows.map(r => r.id)).to.deep.equal([3]);
 			expect(calls, 'only the single flag = 0 row reaches the subquery conjunct').to.equal(1);
+		});
+	});
+
+	describe('splitConjuncts ordering', () => {
+		/** The first FilterNode in a logically-planned statement. */
+		function findFilter(sql: string): FilterNode {
+			const ast = new Parser().parse(sql) as unknown as AST.Statement;
+			const { plan } = db._buildPlan([ast]);
+			let found: FilterNode | undefined;
+			const visit = (n: PlanNode): void => {
+				if (found) return;
+				if (n instanceof FilterNode) { found = n; return; }
+				for (const c of n.getChildren()) visit(c);
+				for (const r of n.getRelations()) visit(r);
+			};
+			visit(plan);
+			if (!found) throw new Error(`no FilterNode in plan for: ${sql}`);
+			return found;
+		}
+
+		// Source order is the contract the early exit rests on, and the baseline a later
+		// cost-based reordering rule compares against. Asserted directly on the splitter
+		// so a regression names the cause instead of surfacing as an evaluation count.
+		it('returns conjuncts in left-to-right source order', () => {
+			const filter = findFilter('select id from t where v = 1 and v = 2 and v = 3');
+			expect(splitConjuncts(filter.predicate).map(c => c.toString())).to.deep.equal(['v = 1', 'v = 2', 'v = 3']);
+		});
+
+		it('round-trips through combineConjuncts without permuting the predicate', () => {
+			const filter = findFilter('select id from t where v = 1 and v = 2 and v = 3');
+			const rebuilt = combineConjuncts(splitConjuncts(filter.predicate));
+			expect(rebuilt?.toString()).to.equal(filter.predicate.toString());
 		});
 	});
 

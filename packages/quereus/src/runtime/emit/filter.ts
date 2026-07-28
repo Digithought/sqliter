@@ -9,7 +9,7 @@ import { createRowSlot } from '../context-helpers.js';
 import { QuereusError } from '../../common/errors.js';
 import { isTruthy } from '../../util/comparison.js';
 import { resolveMaybe } from '../async-util.js';
-import { splitConjunctsOrdered } from '../../planner/analysis/predicate-conjuncts.js';
+import { splitConjuncts } from '../../planner/analysis/predicate-conjuncts.js';
 
 function asPredicateScalar(value: unknown): SqlValue {
 	if (value === null) return null;
@@ -48,43 +48,18 @@ function evaluatePredicate(rctx: RuntimeContext, predicate: SubProgram): MaybePr
  */
 export function emitFilter(plan: FilterNode, ctx: EmissionContext): Instruction {
 	const sourceInstruction = emitPlanNode(plan.source, ctx);
-	const conjuncts = splitConjunctsOrdered(plan.predicate);
-
-	// Create row descriptor for source attributes
+	const conjuncts = splitConjuncts(plan.predicate);
+	// NOTE: each conjunct becomes its own sub-program, so N cheap conjuncts that all
+	// pass cost N callback invocations per row where the unsplit AND tree cost one
+	// (measured ~5-10% on a 3-conjunct all-true scan of 20k memory rows; any conjunct
+	// that rejects more than pays it back). If wide all-passing filters ever show up
+	// as hot, fuse the cheap side-effect-free conjuncts back into one sub-program.
+	const conjunctFuncs = conjuncts.map(conjunct => emitCallFromPlan(conjunct, ctx));
 	const sourceRowDescriptor = buildRowDescriptor(plan.source.getAttributes());
 
-	// Single conjunct (the overwhelmingly common shape): one callback, one truthiness
-	// test, no loop bookkeeping — byte-identical to the pre-split emitter.
-	if (conjuncts.length === 1) {
-		const predicateFunc = emitCallFromPlan(conjuncts[0], ctx);
-
-		async function* run(rctx: RuntimeContext, source: AsyncIterable<Row>, predicate: SubProgram): AsyncIterable<Row> {
-			const sourceSlot = createRowSlot(rctx, sourceRowDescriptor);
-			try {
-				for await (const sourceRow of source) {
-					sourceSlot.set(sourceRow);
-					const decision = evaluatePredicate(rctx, predicate);
-					if (decision instanceof Promise ? await decision : decision) {
-						yield sourceRow;
-					}
-				}
-			} finally {
-				sourceSlot.close();
-			}
-		}
-
-		return {
-			params: [sourceInstruction, predicateFunc],
-			run: asRun(run),
-			note: `filter(${plan.predicate.toString()})`
-		};
-	}
-
-	const conjunctFuncs = conjuncts.map(conjunct => emitCallFromPlan(conjunct, ctx));
-
-	// Variable arity: the conjunct callbacks arrive as a rest tuple, per asRun's
-	// requirement for an emitter whose param count is decided at emit time.
-	async function* runConjuncts(rctx: RuntimeContext, source: AsyncIterable<Row>, ...predicates: SubProgram[]): AsyncIterable<Row> {
+	// Variable arity: the conjunct callbacks arrive as a rest tuple, since the param
+	// count is decided at emit time.
+	async function* run(rctx: RuntimeContext, source: AsyncIterable<Row>, ...predicates: SubProgram[]): AsyncIterable<Row> {
 		const sourceSlot = createRowSlot(rctx, sourceRowDescriptor);
 		try {
 			for await (const sourceRow of source) {
@@ -108,9 +83,10 @@ export function emitFilter(plan: FilterNode, ctx: EmissionContext): Instruction 
 		}
 	}
 
+	const earlyExit = conjuncts.length > 1 ? ` [${conjuncts.length} conjuncts, early exit]` : '';
 	return {
 		params: [sourceInstruction, ...conjunctFuncs],
-		run: asRun(runConjuncts),
-		note: `filter(${plan.predicate.toString()}) [${conjuncts.length} conjuncts, early exit]`
+		run: asRun(run),
+		note: `filter(${plan.predicate.toString()})${earlyExit}`
 	};
 }

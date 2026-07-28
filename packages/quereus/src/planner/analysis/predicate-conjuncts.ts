@@ -12,23 +12,22 @@ import type { ScalarPlanNode } from '../nodes/plan-node.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
 
 /**
- * Flatten a boolean tree on `operator`; anything else becomes a leaf of the result.
+ * Flatten a boolean tree on `operator` into left-to-right source order; anything
+ * else becomes a leaf of the result.
  *
  * Iterative (an explicit stack, not recursion) so a pathological chain of a few
- * thousand ANDs cannot overflow. `ordered` pushes the right child first so the
- * left child pops first, yielding left-to-right source order.
+ * thousand ANDs cannot overflow. Pushing the right child first makes the left child
+ * pop first, which is what keeps the result in source order — order is observable
+ * wherever a caller decides *evaluation* order (the Filter emitter's conjunct early
+ * exit) or rebuilds a tree with {@link combineConjuncts}.
  */
-function splitOn(pred: ScalarPlanNode, operator: 'AND' | 'OR', ordered = false): ScalarPlanNode[] {
+function splitOn(pred: ScalarPlanNode, operator: 'AND' | 'OR'): ScalarPlanNode[] {
 	const result: ScalarPlanNode[] = [];
 	const stack: ScalarPlanNode[] = [pred];
 	while (stack.length) {
 		const n = stack.pop()!;
 		if (n instanceof BinaryOpNode && n.expression.operator === operator) {
-			if (ordered) {
-				stack.push(n.right, n.left);
-			} else {
-				stack.push(n.left, n.right);
-			}
+			stack.push(n.right, n.left);
 		} else {
 			result.push(n);
 		}
@@ -37,32 +36,14 @@ function splitOn(pred: ScalarPlanNode, operator: 'AND' | 'OR', ordered = false):
 }
 
 /**
- * Split an AND-tree into its conjuncts. Non-AND predicates yield a single-element list.
- *
- * NOTE: the result is **not** in source order — the push-left-then-right stack walk
- * scrambles it (`(select x) = 1 and v = 2` splits to `[v = 2, (select x) = 1]`).
- * Every current caller treats the result as an unordered set, and this ordering is
- * not worth changing under them. An order-sensitive caller (anything that decides
- * *evaluation* order, e.g. the Filter emitter's conjunct early exit) must use
- * {@link splitConjunctsOrdered} instead.
+ * Split an AND-tree into its conjuncts, in source order. Non-AND predicates yield a
+ * single-element list.
  */
 export function splitConjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
 	return splitOn(pred, 'AND');
 }
 
-/**
- * Split an AND-tree into its conjuncts in left-to-right source order.
- *
- * Use this wherever the conjunct order is observable — evaluation order, early
- * exit, cost-based reordering — so that "the order the user wrote" is the order
- * the engine starts from. {@link splitConjuncts} is cheaper to reason about only
- * when order is irrelevant; it returns the same set in a scrambled order.
- */
-export function splitConjunctsOrdered(pred: ScalarPlanNode): ScalarPlanNode[] {
-	return splitOn(pred, 'AND', true);
-}
-
-/** Split an OR-tree into its disjuncts. Non-OR predicates yield a single-element list. */
+/** Split an OR-tree into its disjuncts, in source order. Non-OR predicates yield a single-element list. */
 export function splitDisjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
 	return splitOn(pred, 'OR');
 }

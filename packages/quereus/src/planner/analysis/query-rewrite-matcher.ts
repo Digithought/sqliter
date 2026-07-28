@@ -57,7 +57,7 @@ import { RetrieveNode } from '../nodes/retrieve-node.js';
 import { AliasNode } from '../nodes/alias-node.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { SeqScanNode, IndexScanNode } from '../nodes/table-access-nodes.js';
-import { BinaryOpNode } from '../nodes/scalar.js';
+import { splitConjuncts } from './predicate-conjuncts.js';
 import { AggregateNode } from '../nodes/aggregate-node.js';
 import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
 import { JoinNode } from '../nodes/join-node.js';
@@ -306,7 +306,7 @@ function walkScanFilterChain(
 			break;
 		}
 		if (node instanceof FilterNode) {
-			splitConjuncts(node.predicate, conjuncts);
+			conjuncts.push(...splitConjuncts(node.predicate));
 			node = node.source;
 			continue;
 		}
@@ -868,7 +868,7 @@ function walkToFragmentJoin(
 	while (node) {
 		if (node instanceof JoinNode) return { joinNode: node, conjuncts };
 		if (node instanceof FilterNode) {
-			splitConjuncts(node.predicate, conjuncts);
+			conjuncts.push(...splitConjuncts(node.predicate));
 			node = node.source;
 			continue;
 		}
@@ -1417,16 +1417,6 @@ function backingPkIsGroupKey(
 function singleRelation(node: RelationalPlanNode): RelationalPlanNode | undefined {
 	const rels = node.getRelations();
 	return rels.length === 1 ? rels[0] : undefined;
-}
-
-/** Flatten a predicate into its top-level AND conjuncts (plan-node level). */
-function splitConjuncts(predicate: ScalarPlanNode, out: ScalarPlanNode[]): void {
-	if (predicate instanceof BinaryOpNode && predicate.expression.operator === 'AND') {
-		splitConjuncts(predicate.left, out);
-		splitConjuncts(predicate.right, out);
-		return;
-	}
-	out.push(predicate);
 }
 
 /** The originating AST of a scalar plan node, or undefined when it has none. */

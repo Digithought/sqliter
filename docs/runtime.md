@@ -348,17 +348,17 @@ from a correct newest write.
 ### Filter conjunct early exit
 
 `emitFilter` (`runtime/emit/filter.ts`) splits a conjunctive predicate into its
-top-level `AND` conjuncts (`splitConjunctsOrdered` — source order, no cost
-reordering), compiles each as its own callback, and drops the row at the first
-conjunct that is not true. So `where cheap and expensive_udf()` pays for
-`expensive_udf()` only on rows `cheap` kept.
+top-level `AND` conjuncts (`splitConjuncts` — source order, no cost reordering),
+compiles each as its own callback, and drops the row at the first conjunct that is
+not true. So `where cheap and expensive_udf()` pays for `expensive_udf()` only on
+rows `cheap` kept.
 
 No three-valued-logic reasoning is needed at that boundary: a filter keeps a row only
 when the predicate is *true*, and under `AND` a `false` **or** `NULL` conjunct
 rejects it either way — only evaluation counts change, never the row set. Splitting
 is top-level only; a nested `AND` (under `NOT`, inside `CASE`, below `OR`) still goes
-through `emitLogicalOp`. A single conjunct keeps the exact pre-split instruction;
-N > 1 is marked `[N conjuncts, early exit]` in the instruction note.
+through `emitLogicalOp`. A multi-conjunct filter is marked
+`[N conjuncts, early exit]` in the instruction note.
 
 ## Scheduler Execution Model
 
