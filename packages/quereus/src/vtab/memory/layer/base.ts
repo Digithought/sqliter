@@ -197,10 +197,12 @@ export class BaseLayer implements Layer {
 	 * (e.g. a PK-column collation change BINARY→NOCASE) — throwing CONSTRAINT and
 	 * leaving the live tree intact for the caller's rollback.
 	 *
-	 * `MemoryTableManager.validateRekeyedPrimaryKey` proves these rows collision-free
-	 * before calling, so the throw is an invariant check rather than the enforcement
-	 * path (it is what a caller sees when the base is *not* the whole story — e.g. a
-	 * new call site that forgets the pre-pass).
+	 * `MemoryTableManager.validateRekeyedPrimaryKey`'s LAYER-WALK pass — its BUSY-raising
+	 * walk over the manager's own chain, base included — proves these rows collision-free
+	 * before calling; its effective-row pass judges a different set (a wrapper's merged
+	 * stream) and says nothing about the base. So the throw is an invariant check rather
+	 * than the enforcement path (it is what a caller sees when the base is *not* the
+	 * whole story — e.g. a new call site that forgets the layer walk).
 	 *
 	 * The tree object is REPLACED, so any layer inheriting the old one must be
 	 * re-pointed at the new one — that is `TransactionLayer.rekeyPrimaryKey`.

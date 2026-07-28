@@ -11,7 +11,7 @@ import { MemoryVirtualTableConnection } from '../connection.js';
 import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
-import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
+import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError, formatKeyValue } from '../../../schema/constraint-builder.js';
 import { indexEnforcesUnique, uniqueEnforcementCollations, uniqueEnforcementComparators } from '../../../schema/unique-enforcement.js';
 import { generateIndexDDL, generateDropIndexDDL } from '../../../schema/ddl-generator.js';
 import { compareSqlValues, rowsValueIdentical, normalizeCollationName, comparisonSemanticsDiffer } from '../../../util/comparison.js';
@@ -2564,15 +2564,12 @@ export class MemoryTableManager {
 				);
 			} else if (structuresRekeyed) {
 				await this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex, rows);
-				// NOTE: `validateRekeyedPrimaryKey` deliberately ignores `rows`. It asserts that no
-				// LAYER of this manager's own chain holds a PK collision under the new comparator —
-				// a physical property of the structures it is about to re-key, which a wrapper's
-				// merged row stream cannot speak to. A wrapper's staged rows live in the wrapper's
-				// own overlay, which enforces the PK itself, so the pair "one staged row + one
-				// committed row that collide only under the new collation" is checked by neither
-				// side. Rejecting it here would need the wrapper to expose its overlay's PK set, not
-				// just its merged rows.
-				if (pkColumnRekeyed) this.validateRekeyedPrimaryKey(finalNewTableSchema);
+				// Unlike the secondary-structure pass above — which only ever judges the effective
+				// rows — the PK pass judges TWO row sets: the effective rows (`rows` when a wrapper
+				// supplies them) decide whether the change is LEGAL, and this manager's own layer
+				// chain decides whether the re-keyed trees can PHYSICALLY carry it. See
+				// `validateRekeyedPrimaryKey` for why the sets differ and which status each raises.
+				if (pkColumnRekeyed) await this.validateRekeyedPrimaryKey(finalNewTableSchema, rows);
 			}
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
@@ -3512,21 +3509,35 @@ export class MemoryTableManager {
 	 * PRIMARY KEY arm of the `alter column … set collate` pre-pass. Runs before anything is
 	 * mutated, so a rejection leaves the table, the schema and the transaction untouched.
 	 *
-	 * The primary tree is a map, not a multi-map, so — unlike a secondary index — it cannot
-	 * physically hold two rows whose keys collapse under the new comparator. Every layer the
-	 * DDL connection still reads through therefore has to be collision-free, not just the
-	 * transaction's effective view:
+	 * Asks two questions, in order, over two DIFFERENT row sets:
 	 *
-	 *  1. **The effective view collides** → `CONSTRAINT`. The duplicate is visible to a `select`
-	 *     in this transaction; the change is simply illegal.
-	 *  2. **A layer beneath it collides** → `BUSY`. Those rows are not visible now, but every
-	 *     such layer is the copy-on-write base the view reads through, and one of them may be a
-	 *     savepoint snapshot a `rollback to savepoint` must restore. A re-keyed tree could not
-	 *     represent the pair at all. Committing (or rolling back) settles the transaction and
-	 *     the ALTER can be retried — the same "commit/rollback and retry" posture as
-	 *     {@link ensureSchemaChangeSafety}.
+	 *  1. **Is the change legal at all?** — probes the rows the DDL transaction can SEE: the
+	 *     wrapper-supplied `rows` when a wrapper module (the isolation layer) holds the
+	 *     transaction's pending rows outside this manager, otherwise this manager's own
+	 *     layered view ({@link effectiveDdlRows}). A duplicate here is visible to a `select`
+	 *     in this transaction, so the change is simply illegal → `CONSTRAINT`, naming the
+	 *     colliding key.
+	 *  2. **Can the structures physically carry it?** — probes every layer of this manager's
+	 *     own chain. The primary tree is a map, not a multi-map, so — unlike a secondary
+	 *     index — no tree that a `rollback` / `rollback to savepoint` could restore may hold
+	 *     two rows whose keys collapse under the new comparator. A collision confined to
+	 *     committed rows the transaction has DELETED is therefore refused by physical
+	 *     necessity, not because the data is invalid: the base must keep both rows for a
+	 *     rollback, and a base re-keyed under the new collation could not represent the pair
+	 *     at all → `BUSY` with the same "commit/rollback and retry" posture as
+	 *     {@link ensureSchemaChangeSafety}. The persistent store backend refuses the same
+	 *     shape for the same reason (its committed rows equally survive a rollback — see
+	 *     `backlog/bug-store-pk-collate-rejects-deleted-row-collision`); accepting it would
+	 *     take transaction-scoped DDL (`backlog/feat-transactional-ddl-native-backends`),
+	 *     which Quereus does not have.
 	 *
-	 * Case 2 is deliberately conservative. The chain holds one immutable layer per statement
+	 * The passes judge different sets because a wrapper's effective stream and this manager's
+	 * layers genuinely diverge: staged inserts exist only in the stream, deleted committed
+	 * rows only in the layers. When `rows` is supplied, the view layer holds the COMMITTED
+	 * rows — not a subset of what pass 1 judged — so pass 2 starts AT the view; when `rows`
+	 * is absent, pass 1 judged exactly the view's rows and pass 2 starts at its parent.
+	 *
+	 * Pass 2 is deliberately conservative. The chain holds one immutable layer per statement
 	 * boundary (see `MemoryTableConnection.createSavepoint`'s eager path), so it rejects any
 	 * transaction that has held a colliding pair at ANY statement boundary — even one whose
 	 * final view is clean and whose intermediate layer no savepoint can reach. Narrowing that
@@ -3538,24 +3549,23 @@ export class MemoryTableManager {
 	 * with no collisions anywhere in the chain, every primary key resolves to at most one row
 	 * in each layer under the new comparator.
 	 */
-	private validateRekeyedPrimaryKey(newSchema: TableSchema): void {
+	private async validateRekeyedPrimaryKey(newSchema: TableSchema, rows?: EffectiveRowSource): Promise<void> {
 		const newPkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
 		const connection = this.ddlConnection();
 		const view: Layer = connection
 			? (connection.pendingTransactionLayer ?? connection.readLayer)
 			: this.baseLayer;
 
-		this.assertNoPrimaryKeyCollision(
-			view,
+		await this.assertNoPrimaryKeyCollisionInRows(
+			rows ? rows() : this.effectiveDdlRows(),
 			newPkFunctions,
-			StatusCode.CONSTRAINT,
-			`UNIQUE constraint failed: ${this._tableName} primary key collides under new collation`,
+			primaryKeyArity(newSchema) !== 1,
 		);
 
 		// `ensureSchemaChangeSafety` has already drained every committed layer into the base and
-		// rejected sibling connections with open work, so the chain below the view holds only
-		// this transaction's own layers.
-		for (let layer: Layer | null = view.getParent(); layer; layer = layer.getParent()) {
+		// rejected sibling connections with open work, so this walk covers the transaction's own
+		// layers plus the base — every tree a rollback could restore.
+		for (let layer: Layer | null = rows ? view : view.getParent(); layer; layer = layer.getParent()) {
 			this.assertNoPrimaryKeyCollision(
 				layer,
 				newPkFunctions,
@@ -3564,6 +3574,34 @@ export class MemoryTableManager {
 				+ `rows this transaction has removed still collide under the new collation and must survive a rollback. `
 				+ `Commit/rollback and retry.`,
 			);
+		}
+	}
+
+	/**
+	 * Raises `CONSTRAINT` when two of the given rows share a primary key under `pkFunctions`,
+	 * naming the colliding key. Effective-row sibling of {@link assertNoPrimaryKeyCollision}:
+	 * this one judges the rows the DDL transaction can SEE (a wrapper's merged async stream,
+	 * or this manager's own layered view), that one a single layer's physical tree.
+	 */
+	private async assertNoPrimaryKeyCollisionInRows(
+		rows: Iterable<Row> | AsyncIterable<Row>,
+		pkFunctions: PrimaryKeyFunctions,
+		keyIsTuple: boolean,
+	): Promise<void> {
+		const probe = new BTree<BTreeKeyForPrimary, Row>(
+			(row: Row): BTreeKeyForPrimary => pkFunctions.extractFromRow(row),
+			pkFunctions.compare,
+		);
+		for await (const row of rows) {
+			const key = pkFunctions.extractFromRow(row);
+			if (probe.get(key) !== undefined) {
+				const keyDesc = keyParts(key, keyIsTuple).map(formatKeyValue).join(', ');
+				throw new QuereusError(
+					`UNIQUE constraint failed: ${this._tableName} primary key collides under new collation (key: ${keyDesc})`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			probe.insert(row);
 		}
 	}
 

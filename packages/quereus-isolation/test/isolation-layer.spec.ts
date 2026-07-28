@@ -2427,6 +2427,113 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	describe('SET COLLATE on a PRIMARY KEY column judges the transaction\'s effective rows', () => {
+		// `alter column … set collate` on a PK member asks two questions (see
+		// MemoryTableManager.validateRekeyedPrimaryKey): are the rows this transaction can SEE
+		// collision-free under the new comparator (CONSTRAINT if not), and can the underlying's
+		// committed trees — which must survive a rollback — physically carry the re-key (BUSY
+		// if not). Under this wrapper the two sets genuinely differ: staged rows live only in
+		// the overlay, rows the transaction deleted only in the underlying. Pre-fix the
+		// underlying judged its own committed rows for both questions, so a deleted-only
+		// collision produced a false CONSTRAINT ("your data is invalid") and two staged
+		// colliders slipped past validation and surfaced as INTERNAL after the shared table
+		// had already been re-keyed.
+		let iso: IsolationModule;
+
+		beforeEach(() => {
+			iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', iso);
+		});
+
+		/**
+		 * Live collation of `main.<table>`'s column, read via the underlying MemoryTable's
+		 * canonical `getSchema()` — NOT the `tableSchema` field, a connect-time snapshot the
+		 * module-level ALTER never refreshes (see the ADD COLUMN atomicity suite's helper).
+		 */
+		function underlyingCollation(table: string, column: string): string {
+			const underlying = iso.getUnderlyingState('main', table)!.underlyingTable as unknown as {
+				getSchema(): { columns: readonly { name: string; collation?: string }[] } | undefined;
+			};
+			return underlying.getSchema()!.columns.find(c => c.name === column)?.collation ?? 'BINARY';
+		}
+
+		async function expectAlterError(sql: string): Promise<QuereusError> {
+			let err: unknown;
+			try { await db.exec(sql); } catch (e) { err = e; }
+			expect(err, `${sql} must throw`).to.be.instanceOf(QuereusError);
+			return err as QuereusError;
+		}
+
+		it('raises BUSY (not CONSTRAINT) when the only colliding rows are ones this transaction deleted', async () => {
+			await db.exec(`CREATE TABLE ecp_del (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO ecp_del VALUES ('A', 'x'), ('a', 'y'), ('b', 'z')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM ecp_del WHERE k IN ('A', 'a')`);
+
+			const err = await expectAlterError(`ALTER TABLE ecp_del ALTER COLUMN k SET COLLATE NOCASE`);
+			expect(err.code, 'the data the transaction sees is valid — the refusal is retryable').to.equal(StatusCode.BUSY);
+			expect(err.message).to.match(/commit\/rollback and retry/i);
+			expect(underlyingCollation('ecp_del', 'k'), 'underlying untouched').to.equal('BINARY');
+
+			await db.exec(`ROLLBACK`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT k FROM ecp_del ORDER BY k`));
+			expect(rows.map((r: any) => r.k), 'rollback restores the colliding pair').to.deep.equal(['A', 'a', 'b']);
+		});
+
+		it('raises the same BUSY when only one of the two colliders is deleted', async () => {
+			await db.exec(`CREATE TABLE ecp_one (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO ecp_one VALUES ('A', 'x'), ('a', 'y')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM ecp_one WHERE k = 'a'`);
+
+			const err = await expectAlterError(`ALTER TABLE ecp_one ALTER COLUMN k SET COLLATE NOCASE`);
+			expect(err.code).to.equal(StatusCode.BUSY);
+			expect(err.message).to.match(/commit\/rollback and retry/i);
+			expect(underlyingCollation('ecp_one', 'k'), 'underlying untouched').to.equal('BINARY');
+			await db.exec(`ROLLBACK`);
+		});
+
+		it('refuses two staged live colliders with CONSTRAINT, naming the key, before anything is mutated', async () => {
+			// Pre-fix shape: both rows staged in the overlay, the underlying's committed base
+			// empty, so the PK pre-pass saw no collision — the ALTER "succeeded", re-keyed the
+			// shared table, and the overlay migration then raised INTERNAL.
+			await db.exec(`CREATE TABLE ecp_stg (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO ecp_stg VALUES ('A', 'x'), ('a', 'y')`);
+
+			const err = await expectAlterError(`ALTER TABLE ecp_stg ALTER COLUMN k SET COLLATE NOCASE`);
+			expect(err.code, 'two visible rows collide — the change is illegal').to.equal(StatusCode.CONSTRAINT);
+			expect(err.message).to.match(/UNIQUE constraint failed/i);
+			expect(err.message, 'names the colliding key').to.match(/key: '[Aa]'/);
+			expect(underlyingCollation('ecp_stg', 'k'), 'refused before the shared table was re-keyed').to.equal('BINARY');
+
+			// The transaction survives the rejection; both rows are distinct under BINARY.
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT k FROM ecp_stg ORDER BY k`));
+			expect(rows.map((r: any) => r.k)).to.deep.equal(['A', 'a']);
+		});
+
+		it('still refuses committed colliders visible to the transaction with CONSTRAINT', async () => {
+			// Passes pre-fix too — pinned so the two-pass rewrite cannot regress it. The staged
+			// unrelated insert keeps the overlay active, forcing the wrapper to hand the
+			// underlying its merged effective stream rather than no stream at all.
+			await db.exec(`CREATE TABLE ecp_cmt (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO ecp_cmt VALUES ('A', 'x'), ('a', 'y')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO ecp_cmt VALUES ('c', 'z')`);
+
+			const err = await expectAlterError(`ALTER TABLE ecp_cmt ALTER COLUMN k SET COLLATE NOCASE`);
+			expect(err.code).to.equal(StatusCode.CONSTRAINT);
+			expect(err.message).to.match(/UNIQUE constraint failed/i);
+			expect(underlyingCollation('ecp_cmt', 'k'), 'underlying untouched').to.equal('BINARY');
+			await db.exec(`ROLLBACK`);
+		});
+	});
+
 	describe('in-transaction column-shape ALTER keeps the overlay tombstone flag last', () => {
 		// The overlay stages rows as [data columns..., tombstone flag] and every read/write
 		// path assumes the flag is LAST. A bare addColumn forward to the overlay would append
