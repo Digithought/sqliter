@@ -251,10 +251,9 @@ writes never reach `pendingTransactionLayer`, so the manager's own effective row
 the committed base. The wrapper therefore supplies the rows to judge through the optional
 `EffectiveRowSource` parameter on `createIndex` / `alterTable`, and every validation site above
 prefers it over `effectiveDdlRows()`. See [module-authoring.md](module-authoring.md) § "When the
-pending rows live outside your module". One check deliberately ignores it:
-`validateRekeyedPrimaryKey` asserts that no *layer of this manager's own chain* holds a PK
-collision under the new comparator, which is a property of the structures it is about to re-key,
-not of the wrapper's merged rows.
+pending rows live outside your module". `validateRekeyedPrimaryKey` consumes it too, but as only
+*half* of what it judges — see rule 3 below: legality is decided over the supplied rows, physical
+representability over this manager's own layers.
 
 **2. The rule is enforced for the remainder of that transaction, and after it commits.** A
 `TransactionLayer` freezes its schema at construction, so a layer created before the DDL would
@@ -480,14 +479,29 @@ so re-keying it can never lose a row. The primary tree cannot: two rows whose ke
 the new comparator have nowhere to go. And every layer of the chain — the committed base, each
 savepoint snapshot, each statement-boundary layer — physically holds rows that a `ROLLBACK` or
 `ROLLBACK TO SAVEPOINT` must be able to restore, so *none* of them may hold such a pair, not just
-the transaction's effective view. `validateRekeyedPrimaryKey` checks all of them before anything
-is mutated:
+the transaction's effective view. `validateRekeyedPrimaryKey` asks two questions before anything
+is mutated, over two **different** row sets:
 
-*   the **effective view** collides → `CONSTRAINT`; the duplicate is one a `SELECT` in this
-    transaction can see, so the change is simply illegal.
-*   a **layer beneath it** collides → `BUSY`, with the "commit/rollback and retry" message. The
-    duplicate is invisible right now (this transaction deleted it, or a later statement did) but
-    it is still resident and still restorable.
+*   **Is the change legal?** — over the rows the transaction can SEE: the wrapper-supplied
+    `EffectiveRowSource` when there is one, else `effectiveDdlRows()`. A duplicate here is one a
+    `SELECT` in this transaction returns, so the change is simply illegal → `CONSTRAINT`, naming
+    the colliding key.
+*   **Can the structures carry it?** — over every layer of this manager's own chain. A duplicate
+    here is invisible right now (this transaction deleted it, or a later statement did) but is
+    still resident and still restorable → `BUSY`, with the "commit/rollback and retry" message.
+
+The sets diverge only under a wrapper, and in both directions: rows the transaction staged exist
+only in the wrapper's stream, rows it deleted only in these layers. So when `EffectiveRowSource`
+is supplied the second walk starts **at** the view layer (its committed rows are not a subset of
+what the first pass judged); when it is absent the first pass judged exactly the view, and the
+walk starts at the view's parent.
+
+A collision confined to committed rows the transaction has DELETED is therefore refused, on both
+legs, by physical necessity rather than because the data is invalid — the base must keep both
+rows for a rollback and a re-keyed base cannot represent the pair. The persistent store backend
+refuses the same shape for the same reason
+(`tickets/backlog/bug-store-pk-collate-rejects-deleted-row-collision.md`); accepting it needs
+transaction-scoped DDL (`tickets/backlog/feat-transactional-ddl-native-backends.md`).
 
 The `BUSY` arm is deliberately conservative: a transaction that has held a colliding pair at
 *any* statement boundary is refused, even when its final view is clean and no savepoint can reach

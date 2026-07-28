@@ -3566,69 +3566,80 @@ export class MemoryTableManager {
 		// rejected sibling connections with open work, so this walk covers the transaction's own
 		// layers plus the base — every tree a rollback could restore.
 		for (let layer: Layer | null = rows ? view : view.getParent(); layer; layer = layer.getParent()) {
-			this.assertNoPrimaryKeyCollision(
-				layer,
-				newPkFunctions,
-				StatusCode.BUSY,
-				`Cannot change the collation of a primary key column of table ${this._tableName}: `
-				+ `rows this transaction has removed still collide under the new collation and must survive a rollback. `
-				+ `Commit/rollback and retry.`,
-			);
+			this.assertNoPrimaryKeyCollisionInLayer(layer, newPkFunctions);
 		}
 	}
 
 	/**
-	 * Raises `CONSTRAINT` when two of the given rows share a primary key under `pkFunctions`,
-	 * naming the colliding key. Effective-row sibling of {@link assertNoPrimaryKeyCollision}:
-	 * this one judges the rows the DDL transaction can SEE (a wrapper's merged async stream,
-	 * or this manager's own layered view), that one a single layer's physical tree.
+	 * A duplicate-key detector over the new primary key functions: feed it rows, and it returns
+	 * the key the moment one repeats. Shared by both arms of {@link validateRekeyedPrimaryKey}
+	 * so the async (effective-row) arm and the sync (layer-tree) arm cannot disagree about what
+	 * counts as a collision.
+	 *
+	 * NOTE: the probe holds every row it has seen, because the BTree derives its key from the
+	 * stored value — so an ALTER over a large table transiently doubles that table's row
+	 * references. If a wide table ever makes this the memory peak, key the probe by the PK
+	 * encoding (`primaryKeyFunctions.encode`) into a `Set` instead of by the row.
+	 */
+	private makePrimaryKeyProbe(pkFunctions: PrimaryKeyFunctions): (row: Row) => BTreeKeyForPrimary | undefined {
+		const probe = new BTree<BTreeKeyForPrimary, Row>(
+			(row: Row): BTreeKeyForPrimary => pkFunctions.extractFromRow(row),
+			pkFunctions.compare,
+		);
+		return (row: Row): BTreeKeyForPrimary | undefined => {
+			const key = pkFunctions.extractFromRow(row);
+			if (probe.get(key) !== undefined) return key;
+			probe.insert(row);
+			return undefined;
+		};
+	}
+
+	/**
+	 * Legality arm of {@link validateRekeyedPrimaryKey}: raises `CONSTRAINT`, naming the key,
+	 * when two of the rows the DDL transaction can SEE share a primary key under `pkFunctions`.
+	 * Takes a wrapper's merged async stream or this manager's own synchronous layered view.
 	 */
 	private async assertNoPrimaryKeyCollisionInRows(
 		rows: Iterable<Row> | AsyncIterable<Row>,
 		pkFunctions: PrimaryKeyFunctions,
 		keyIsTuple: boolean,
 	): Promise<void> {
-		const probe = new BTree<BTreeKeyForPrimary, Row>(
-			(row: Row): BTreeKeyForPrimary => pkFunctions.extractFromRow(row),
-			pkFunctions.compare,
-		);
+		const seen = this.makePrimaryKeyProbe(pkFunctions);
 		for await (const row of rows) {
-			const key = pkFunctions.extractFromRow(row);
-			if (probe.get(key) !== undefined) {
-				const keyDesc = keyParts(key, keyIsTuple).map(formatKeyValue).join(', ');
-				throw new QuereusError(
-					`UNIQUE constraint failed: ${this._tableName} primary key collides under new collation (key: ${keyDesc})`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-			probe.insert(row);
+			const key = seen(row);
+			if (key === undefined) continue;
+			const keyDesc = keyParts(key, keyIsTuple).map(formatKeyValue).join(', ');
+			throw new QuereusError(
+				`UNIQUE constraint failed: ${this._tableName} primary key collides under new collation (key: ${keyDesc})`,
+				StatusCode.CONSTRAINT,
+			);
 		}
 	}
 
 	/**
-	 * Raises `code` when two of `layer`'s rows share a primary key under `pkFunctions`.
+	 * Representability arm of {@link validateRekeyedPrimaryKey}: raises `BUSY` when two of
+	 * `layer`'s physical rows share a primary key under `pkFunctions`. Its rows are ones a
+	 * rollback could restore, not ones the transaction can see, so this is never a statement
+	 * about the data's validity — hence the retryable status and wording.
 	 *
 	 * NOTE: O(rows) per layer, so O(layers × rows) for a whole chain — one more full pass than
 	 * the base rebuild the caller is about to do anyway. Fine for a statement this rare; if a
 	 * deep savepoint stack over a large table ever makes an ALTER slow, note that a layer's rows
 	 * differ from its parent's only at the keys it wrote, so the walk can be narrowed to those.
 	 */
-	private assertNoPrimaryKeyCollision(
-		layer: Layer,
-		pkFunctions: PrimaryKeyFunctions,
-		code: StatusCode,
-		message: string,
-	): void {
+	private assertNoPrimaryKeyCollisionInLayer(layer: Layer, pkFunctions: PrimaryKeyFunctions): void {
 		const tree = layer.getModificationTree('primary');
 		if (!tree) return;
-		const probe = new BTree<BTreeKeyForPrimary, Row>(
-			(row: Row): BTreeKeyForPrimary => pkFunctions.extractFromRow(row),
-			pkFunctions.compare,
-		);
+		const seen = this.makePrimaryKeyProbe(pkFunctions);
 		for (const row of iteratePrimaryRows(tree)) {
-			const key = pkFunctions.extractFromRow(row);
-			if (probe.get(key) !== undefined) throw new QuereusError(message, code);
-			probe.insert(row);
+			if (seen(row) !== undefined) {
+				throw new QuereusError(
+					`Cannot change the collation of a primary key column of table ${this._tableName}: `
+					+ `rows this transaction has removed still collide under the new collation and must survive a rollback. `
+					+ `Commit/rollback and retry.`,
+					StatusCode.BUSY,
+				);
+			}
 		}
 	}
 

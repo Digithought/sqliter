@@ -759,6 +759,22 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(await values(`select v from t order by v`)).to.deep.equal(['A', 'a']);
 		});
 
+		it('names the colliding key, joining the parts of a composite primary key', async () => {
+			// The CONSTRAINT message renders the key through `keyParts(key, arity !== 1)`; a
+			// composite PK is the arm where that flag matters, and a scalar key mis-flagged as a
+			// tuple (or the reverse) renders garbage rather than the value the user must fix.
+			await db.exec(`create table c (a text, b text, primary key (a, b))`);
+			await db.exec(`begin`);
+			await db.exec(`insert into c values ('x', 'q'), ('x', 'Q')`);
+
+			await expectError(
+				() => db.exec(`alter table c alter column b set collate nocase`),
+				StatusCode.CONSTRAINT,
+				/key: 'x', '[Qq]'/,
+			);
+			await db.exec(`rollback`);
+		});
+
 		it('raises BUSY for a committed duplicate the transaction has deleted', async () => {
 			// The effective rows are collision-free, so the change is not illegal — but the base
 			// tree still physically holds both rows, and a rollback has to restore them.

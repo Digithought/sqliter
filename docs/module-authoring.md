@@ -700,9 +700,15 @@ judge row CONTENT against:
 *   Every row-content check — UNIQUE duplicate detection, collation-rekey collision detection,
     value-rewrite collapse detection (`SET DATA TYPE` / `SET NOT NULL` backfill, judged with the
     altered column already converted) — reads this stream.
-*   The module MUST NOT reject the DDL over a duplicate that exists only in its own committed
-    data. That duplicate may be a row the issuing transaction has already deleted; rejecting it
-    is a false positive the caller cannot work around.
+*   The module MUST NOT reject the DDL as a *constraint violation* over a duplicate that exists
+    only in its own committed data. That duplicate may be a row the issuing transaction has
+    already deleted; calling it invalid data is a false positive the caller cannot work around.
+    **One narrow exception:** a structure that physically cannot *hold* the duplicate — a re-keyed
+    PRIMARY KEY tree, which is a map, not a multi-map, and whose committed rows must survive a
+    rollback — may still refuse. It must do so as `BUSY` ("commit/rollback and retry"), never
+    `CONSTRAINT`: the data is valid, the storage merely cannot represent it while those rows are
+    still resident. Both bundled backends do exactly this for `ALTER COLUMN … SET COLLATE` on a
+    PK member.
 *   Physical structures are still built from the module's OWN rows. Building an index over
     committed rows while validating over the merged view is deliberate and sound: an index entry
     with no live row behind it is harmless, because every reader resolves an entry back to its
