@@ -15,6 +15,7 @@ import { ColumnReferenceNode } from './reference.js';
 import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds } from './join-utils.js';
 import { isValueDiscriminatingEquality } from '../analysis/comparison-collation.js';
 import { deriveJoinUpdateLineage, type JoinExistenceSite } from '../analysis/update-lineage.js';
+import { semanticOrderingsAgree } from '../../util/comparison.js';
 
 export type JoinType = 'inner' | 'left' | 'right' | 'full' | 'cross' | 'semi' | 'anti';
 
@@ -49,13 +50,10 @@ export interface ExistenceColumnSpec {
  * unaffected — it uses its own extractor (`rules/join/equi-pair-extractor.ts`)
  * and resolves collations at emit time.
  *
- * The gate is collation-only, which is **not** enough: a pair whose two sides
- * disagree on semantic ordering (`timespan_col = text_col`) matches rows that are
- * NOT value-equal ('PT1H' against 'PT60M'), yet still mints a pair here. The
- * physical extractor declines such a pair (`semanticOrderingsAgree`); this one
- * does not, and `rule-predicate-inference-equivalence` turns the resulting
- * equivalence class into a row-dropping constant substitution. Tracked as
- * `tickets/fix/equality-fact-extraction-ignores-semantic-ordering`.
+ * The gate also requires the two sides to agree on semantic ordering
+ * (`semanticOrderingsAgree`): a pair whose sides disagree (`timespan_col = text_col`)
+ * matches rows that are NOT value-equal ('PT1H' against 'PT60M'), so no pair is minted
+ * for it, mirroring the physical extractor (`rules/join/equi-pair-extractor.ts`).
  *
  * Operands must be **bare** `ColumnReferenceNode`s: a `COLLATE`-wrapped side
  * (`l.x = r.b collate nocase`) is structurally rejected. That exclusion is
@@ -87,7 +85,8 @@ export function extractEquiPairsFromCondition(
 			}
 			if (op === '=') {
 				if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode
-					&& isValueDiscriminatingEquality(n.left, n.right)) {
+					&& isValueDiscriminatingEquality(n.left, n.right)
+					&& semanticOrderingsAgree(n.left.getType().logicalType, n.right.getType().logicalType)) {
 					let lIdx = leftIdToIndex.get(n.left.attributeId);
 					let rIdx = rightIdToIndex.get(n.right.attributeId);
 					if (lIdx !== undefined && rIdx !== undefined) {

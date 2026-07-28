@@ -265,6 +265,41 @@ select mxa.id as l from mxa left join mxb on mxa.d = mxb.s where mxb.id is not n
 select mxa.id as l from mxa left join mxb on mxa.d = mxb.s where mxb.id is null;
 → [{"l":2}]
 
+-- A further filter pinning one side to a constant must not leak into the other
+-- side via the join equality: the logical equi-pair extractor previously minted
+-- a value-level pairing fact even when the two sides disagreed on semantic
+-- ordering, and predicate-inference substituted the pin's constant across the
+-- pair, comparing it as text against the untyped side and dropping the match.
+-- Regression for `equality-fact-extraction-ignores-semantic-ordering`. Each
+-- `on … where` form below must agree with the `cross join … where` oracle.
+
+select mxa.id as l, mxb.id as r from mxa cross join mxb where mxa.d = mxb.s and mxa.d = 'PT1H';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s where mxa.d = 'PT1H';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxb.s = mxa.d where mxa.d = 'PT1H';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa cross join mxb where mxa.d = mxb.s and mxb.s = 'PT60M';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s where mxb.s = 'PT60M';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxb.s = mxa.d where mxb.s = 'PT60M';
+→ [{"l":1,"r":10}]
+
+-- Pinning the TEXT side to a spelling that only matches under semantic-ordering
+-- comparison, not as plain text, correctly finds nothing — this asymmetry is
+-- intended, not a regression.
+select mxa.id as l, mxb.id as r from mxa cross join mxb where mxa.d = mxb.s and mxb.s = 'PT1H';
+→ []
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s where mxb.s = 'PT1H';
+→ []
+
 drop table mxb;
 drop table mxa;
 

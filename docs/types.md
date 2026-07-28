@@ -299,16 +299,7 @@ UNKNOWN) and the hash path (which never inserts NULL keys). The nested-loop emit
 needs its own guard for that: the comparators it routes through are *ordering*
 functions, and ordering ranks NULL/NULL as equal.
 
-Two surfaces still do **not** follow the rule.
-
-**Equality-fact extraction.** `planner/nodes/join-node.ts`'s
-`extractEquiPairsFromCondition` mints value-level facts (equivalence classes,
-functional dependencies, key coverage, join elimination) and gates only on collation,
-so it accepts a mixed pair on the claim that matched rows are *value*-equal — false
-when 'PT1H' matches 'PT60M'. `rule-predicate-inference-equivalence` then substitutes a
-constant across the equivalence class (`where a.d = 'PT1H'` becomes an additional
-`b.s = 'PT1H'`, compared as text) and drops rows. Tracked as
-`tickets/fix/equality-fact-extraction-ignores-semantic-ordering`.
+One surface still does **not** follow the rule.
 
 **AS OF** match/partition columns compare by storage class + collation. Correct for the canonical AS OF column
 types (DATE/DATETIME, whose ISO text order is their semantic order), wrong for a TIMESPAN
