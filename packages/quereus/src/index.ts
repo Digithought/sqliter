@@ -91,9 +91,16 @@ export type {
 	ConstraintOp,
 	ColumnMeta,
 	PredicateConstraint,
+	RuntimeSetSpec,
 	OrderingSpec
 } from './vtab/best-access-plan.js';
-export { AccessPlanBuilder, validateAccessPlan } from './vtab/best-access-plan.js';
+export {
+	AccessPlanBuilder,
+	validateAccessPlan,
+	validateAccessPlanRequest,
+	equalitySeekKeyCount,
+	isMultiValueEquality,
+} from './vtab/best-access-plan.js';
 
 // Collation and comparison functions
 export type { CollationFunction } from './util/comparison.js';

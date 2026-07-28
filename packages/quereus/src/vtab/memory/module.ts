@@ -12,7 +12,7 @@ import { MemoryVirtualTableConnection } from './connection.js';
 import type { MemoryTableConnection } from './layer/connection.js';
 import type { MemoryTableConfig } from './types.js';
 import { createMemoryTableLoggers } from './utils/logging.js';
-import { AccessPlanBuilder, validateAccessPlan } from '../best-access-plan.js';
+import { AccessPlanBuilder, equalitySeekKeyCount, isMultiValueEquality, validateAccessPlan } from '../best-access-plan.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, PredicateConstraint } from '../best-access-plan.js';
 import type { VTableEventEmitter } from '../events.js';
 import type { ModuleCapabilities } from '../capabilities.js';
@@ -53,14 +53,15 @@ function estimateSortCost(rows: number): number {
 /**
  * Collect column indexes bound by an equality predicate (`=` or single-value `IN`).
  * These columns are constants for the access plan and don't contribute ordering.
+ *
+ * A runtime-valued `IN` set never qualifies: `isMultiValueEquality` reports it as
+ * multi-valued because its member count is unknown at plan time.
  */
 function collectEqualityBoundColumns(filters: readonly PredicateConstraint[]): ReadonlySet<number> {
 	const cols = new Set<number>();
 	for (const f of filters) {
 		if (!f.usable) continue;
-		if (f.op === '=') {
-			cols.add(f.columnIndex);
-		} else if (f.op === 'IN' && Array.isArray(f.value) && (f.value as unknown[]).length === 1) {
+		if (equalitySeekKeyCount(f) !== null && !isMultiValueEquality(f)) {
 			cols.add(f.columnIndex);
 		}
 	}
@@ -423,12 +424,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		request: BestAccessPlanRequest,
 		availableIndexes: IndexSchema[],
 	): Pick<BestAccessPlanResult, 'monotonicOn' | 'supportsAsofRight'> {
-		// Multi-value IN multi-seek visits values in IN-list order; OR_RANGE
-		// concatenates disjoint ranges. Neither emits in monotonic order.
+		// Multi-value IN multi-seek visits values in seek-key order (a runtime-valued
+		// set included); OR_RANGE concatenates disjoint ranges. Neither emits in
+		// monotonic order.
 		for (let i = 0; i < bestPlan.handledFilters.length; i++) {
 			if (!bestPlan.handledFilters[i]) continue;
 			const f = request.filters[i];
-			if (f.op === 'IN' && Array.isArray(f.value) && (f.value as unknown[]).length > 1) return {};
+			if (isMultiValueEquality(f)) return {};
 			if (f.op === 'OR_RANGE') return {};
 		}
 
@@ -566,8 +568,16 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 	/**
 	 * Find equality matches for index columns (prefix matching).
-	 * Handles `=`, single-value `IN`, and multi-value `IN` as equality constraints.
-	 * Returns the total cardinality (product of IN list sizes) for cost estimation.
+	 * Handles `=`, single-value `IN`, multi-value `IN`, and a runtime-valued `IN` set as
+	 * equality constraints — {@link equalitySeekKeyCount} is the single well-formedness
+	 * test, so the four cannot drift apart. Returns the total cardinality (the product of
+	 * the per-column seek-key counts) for cost estimation; for a runtime set that count is
+	 * its `maxCount` ceiling, the worst case the engine may deliver.
+	 *
+	 * Claims the FIRST role-filling filter per column, matching the positional pick
+	 * `rule-select-access-path` makes — so a request carrying both a runtime set and a
+	 * literal `IN` on one column seeks whichever came first in `filters` order, and the
+	 * other survives as a residual.
 	 */
 	private findEqualityMatches(
 		indexCols: ReadonlyArray<IndexColumnSchema>,
@@ -583,23 +593,17 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				const filter = filters[i];
 				if (filter.columnIndex !== indexCol.index || !filter.usable) continue;
 
-				// Direct equality (value may be undefined for parameter bindings —
-				// the actual value is supplied at runtime via seek key expressions)
-				if (filter.op === '=') {
-					handledFilters[i] = true;
-					foundMatch = true;
-					matchCount++;
-					break;
-				}
+				// `=` (whose value may be undefined for parameter bindings — the actual
+				// value is supplied at runtime via seek key expressions), a well-formed
+				// literal `IN`, or a runtime-valued `IN` set. Anything else is null.
+				const keyCount = equalitySeekKeyCount(filter);
+				if (keyCount === null) continue;
 
-				// IN constraint — treat as equality for prefix matching
-				if (filter.op === 'IN' && Array.isArray(filter.value) && (filter.value as unknown[]).length > 0) {
-					handledFilters[i] = true;
-					foundMatch = true;
-					matchCount++;
-					inCardinality *= (filter.value as unknown[]).length;
-					break;
-				}
+				handledFilters[i] = true;
+				foundMatch = true;
+				matchCount++;
+				inCardinality *= keyCount;
+				break;
 			}
 			if (!foundMatch) {
 				break; // Can't use remaining index columns
@@ -712,9 +716,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		);
 		const usesMultiInOnOrderedCol = request.filters.some(
 			(f, i) => plan.handledFilters[i]
-				&& f.op === 'IN'
-				&& Array.isArray(f.value)
-				&& (f.value as unknown[]).length > 1
+				&& isMultiValueEquality(f)
 				&& orderingColumns.has(f.columnIndex)
 		);
 		const planACanClaimOrdering = filterSatisfies && !usesOrRange && !usesMultiInOnOrderedCol;
@@ -776,17 +778,16 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			// See whether this index can also serve as a filter seek/range.
 			const candidate = this.evaluateIndexAccess(index, request, estimatedTableSize);
 
-			// A useful filter pattern that breaks ordering (multi-IN multi-seek
-			// on an ordering column or OR_RANGE) cannot claim ordering — fall
-			// back to a pure scan that doesn't push those filters.
+			// A useful filter pattern that breaks ordering (multi-IN multi-seek — literal
+			// or runtime-valued — on an ordering column, or OR_RANGE) cannot claim
+			// ordering: a multi-seek visits the index in seek-key order, not column
+			// order, so claiming it would elide a Sort the plan needs. Fall back to a
+			// pure scan that doesn't push those filters.
 			const breaksOrdering = request.filters.some(
 				(f, i) => candidate.handledFilters[i]
 					&& (
 						f.op === 'OR_RANGE'
-						|| (f.op === 'IN'
-							&& Array.isArray(f.value)
-							&& (f.value as unknown[]).length > 1
-							&& orderingColumns.has(f.columnIndex))
+						|| (isMultiValueEquality(f) && orderingColumns.has(f.columnIndex))
 					)
 			);
 

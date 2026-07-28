@@ -188,6 +188,32 @@ Three corollaries worth spelling out:
   preceding seek column is pinned by a *single-valued* equality (`a = 1`, or `a in (1)`
   — not `a in (1, 2)`). Otherwise the planner declines the seek entirely and scans.
 
+**Runtime-valued `IN` sets**:
+
+`where col in (select …)` has no plan-time values. It arrives with `op: 'IN'`, **no
+`value`**, and `runtimeSet: { maxCount, estimatedCount? }` instead — *"an `IN` over
+`columnIndex` with 1..`maxCount` values I cannot name"*. The two fields are mutually
+exclusive; `estimatedCount` is advisory.
+
+Accepting it (`handledFilters[i] = true`, plus `indexName` and `seekColumnIndexes`)
+promises one thing: you can serve that column as a multi-seek on the named index. In
+return, `query()` gets an ordinary `plan=5` multi-seek `FilterInfo` — `K` EQ constraints
+and `K` values in `args`, `1 ≤ K ≤ maxCount` — indistinguishable from a literal list, so
+**your runtime does not change**. The engine, not the module, enforces `maxCount`: an empty
+or oversized set falls back to a scan and never reaches you. Only single-column runtime
+sets exist today.
+
+Declining is always correct; only the speed-up is lost. A module predating `runtimeSet`
+declines automatically, since `Array.isArray(f.value) && f.value.length > 0` is false.
+
+If you accept one: never claim `providesOrdering` or `monotonicOn` over its column (a
+multi-seek walks in seek-key order, so the planner would elide a `Sort` it needs), and
+apply your existing safety gates — collation windows that may under-fetch, semantically
+compared seek columns, your own cross-product cap — against `maxCount`, the worst case you
+could be handed. Use the exported `equalitySeekKeyCount(filter)` (seek keys it contributes
+as an equality, or `null` when it fills no equality role) and `isMultiValueEquality(filter)`
+rather than re-deriving the four `IN` shapes.
+
 **Naming the chosen index — `indexName` and `indexDescriptor`**:
 
 When a module sets `indexName` (and `seekColumnIndexes`) the engine records the choice on
@@ -237,36 +263,7 @@ descriptor path is a correctness bug in the module, not a slow path. Name the pr
 
 **When to use**: Most modules (in-memory tables, file-based storage, traditional indexes).
 
-**Example**: Memory table with primary key index:
-```typescript
-getBestAccessPlan(
-  db: Database,
-  tableInfo: TableSchema,
-  request: BestAccessPlanRequest
-): BestAccessPlanResult {
-  // Check for equality on the primary key (column 0). Claim the FIRST '=' only —
-  // a second `id = ...` is redundant, is never seeked, and must stay residual.
-  const pkIndex = request.filters.findIndex(f => f.op === '=' && f.columnIndex === 0);
-
-  if (pkIndex >= 0) {
-    return {
-      handledFilters: request.filters.map((_f, i) => i === pkIndex),
-      cost: 1,                    // Very cheap
-      rows: 1,                    // Unique lookup
-      isSet: true,                // Guarantees unique rows
-      explains: 'Primary key index seek'
-    };
-  }
-
-  // Fall back to full scan
-  return {
-    handledFilters: request.filters.map(() => false),
-    cost: this.data.length,
-    rows: this.data.length,
-    explains: 'Full table scan'
-  };
-}
-```
+**Example**: [Indexed Table](#indexed-table), under Common Patterns.
 
 ### 3. Concurrency Mode (Parallel Runtime)
 
@@ -899,37 +896,21 @@ It is the template for the no-silent-divergence rule. Modules that can re-key in
 
 ## Best Practices
 
-### 1. Accurate Cost Estimation
+### 1. Estimate honestly
 
-Provide realistic cost estimates in `BestAccessPlan`:
-- **Sequential scan**: `O(n)` where n is row count
-- **Index seek**: `O(log n)` for balanced indexes
-- **Index scan**: `O(k + log n)` where k is result size
+`cost` and `rows` drive join order, aggregation strategy, and materialization decisions, so
+a wrong estimate buys a wrong plan. Charge `O(n)` for a sequential scan, `O(log n)` for an
+index seek, `O(k + log n)` for an index scan returning `k` rows. Push filtering in wherever
+you can: what you decline stays a residual above the boundary, so a pushed filter costs
+nothing and saves transfer.
 
-Inaccurate costs lead to suboptimal query plans.
+### 2. Report capabilities conservatively
 
-### 2. Conservative Capability Reporting
+If `supports()` returns a result, the module must execute that pipeline correctly; if
+`getBestAccessPlan()` marks a filter handled, the module must apply it. Over-reporting
+yields silent wrong answers, not slow ones.
 
-Only report capabilities you can reliably implement:
-- If `supports()` returns a result, the module must execute that pipeline correctly
-- If `getBestAccessPlan()` marks a filter as handled, the module must apply it
-- Incorrect reporting causes silent data corruption
-
-### 3. Efficient Filtering
-
-Push as much filtering as possible into the module:
-- Reduces data transferred to Quereus
-- Enables module-specific optimizations (indexes, partitioning)
-- Improves overall query performance
-
-### 4. Proper Cardinality Estimation
-
-Accurate row count estimates enable:
-- Better join order selection
-- Appropriate aggregation strategy
-- Correct materialization decisions
-
-### 5. Preserve Attribute IDs
+### 3. Preserve Attribute IDs
 
 When implementing `xExecutePlan()`, preserve the attribute IDs from the input plan:
 - Column references use stable attribute IDs
@@ -938,44 +919,22 @@ When implementing `xExecutePlan()`, preserve the attribute IDs from the input pl
 
 ## Common Patterns
 
-### Simple In-Memory Table
-
-```typescript
-class SimpleTable extends VirtualTable {
-  constructor(private data: Row[]) { super(...); }
-
-  getBestAccessPlan(req: BestAccessPlanRequest): BestAccessPlanResult {
-    return {
-      handledFilters: req.filters.map(() => false),
-      cost: this.data.length,
-      rows: this.data.length
-    };
-  }
-
-  async* query(): AsyncIterable<Row> {
-    for (const row of this.data) yield row;
-  }
-
-  async update(op: string, values?: Row, oldKeys?: Row): Promise<Row | undefined> {
-    if (op === 'insert' && values) this.data.push(values);
-    return undefined;
-  }
-
-  async disconnect(): Promise<void> {}
-}
-```
-
 ### Indexed Table
+
+A scan-only module is this one minus the seek arm: return `handledFilters` all-false with
+scan cost and let every predicate stay residual.
 
 ```typescript
 class IndexedTable extends VirtualTable {
   private index = new Map<SqlValue, Row[]>();
 
   getBestAccessPlan(req: BestAccessPlanRequest): BestAccessPlanResult {
-    const eqFilters = req.filters.filter(f => f.op === '=' && f.columnIndex === 0);
-    if (eqFilters.length > 0) {
+    // Claim the FIRST '=' on column 0 only — a second `id = ...` is never seeked
+    // and must stay residual. See "Claiming handledFilters" above.
+    const eqIndex = req.filters.findIndex(f => f.op === '=' && f.columnIndex === 0);
+    if (eqIndex >= 0) {
       return {
-        handledFilters: req.filters.map(f => eqFilters.includes(f)),
+        handledFilters: req.filters.map((_f, i) => i === eqIndex),
         cost: 1,
         rows: 1,
         isSet: true,

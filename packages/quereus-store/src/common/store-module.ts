@@ -40,7 +40,7 @@ import type {
 	LensDeploymentSnapshot,
 	CatalogObjectKind,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, hasSemanticOrdering, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, equalitySeekKeyCount, hasSemanticOrdering, inferType, isMultiValueEquality, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
 import type { CompiledPredicate, EffectiveRowSource, KeyNormalizer, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
@@ -175,10 +175,12 @@ function resolveMaxBatchBytes(raw: SqlValue | undefined): number {
  */
 const EQ_OPS = ['='] as const;
 /**
- * Secondary-index arm ONLY: an IN-list is N equalities served as one multi-seek
- * (`plan=5`). The primary-key arms deliberately keep {@link EQ_OPS} — a `_primary_`
- * multi-seek's emission order would break the isolation layer's primary-key merge.
- * PK IN support is deferred; see tickets/backlog/feat-store-pk-in-list-multiseek.
+ * Secondary-index arm ONLY: an IN is N equalities served as one multi-seek (`plan=5`),
+ * whether its members are a literal list or a runtime-valued set. The primary-key arms
+ * deliberately keep {@link EQ_OPS} — a `_primary_` multi-seek's emission order would
+ * break the isolation layer's primary-key merge — so an IN on the PK declines here,
+ * runtime-valued or not. PK IN support is deferred; see
+ * tickets/backlog/feat-store-pk-in-list-multiseek.
  */
 const EQ_OR_IN_OPS = ['=', 'IN'] as const;
 const LOWER_BOUND_OPS = ['>', '>='] as const;
@@ -196,22 +198,6 @@ const MAX_MULTI_SEEK_KEYS = 1000;
 
 /** Cost of positioning one index seek, in the same unit as the per-row fetch cost. */
 const INDEX_SEEK_COST = 0.5;
-
-/**
- * The seek cardinality a filter contributes when filling an equality role: 1 for `=`,
- * the list length for a well-formed `IN` (non-empty array — elements may be
- * `undefined` for parameter bindings, so only the LENGTH is meaningful at plan time),
- * and null when the filter cannot fill an equality role. Mirrors the exact predicate
- * `rule-select-access-path`'s `eqBySeekCol` uses to pick its per-column equality
- * constraint, so this module's positional claim and the rule's pick cannot disagree.
- */
-function equalitySeekCardinality(f: PredicateConstraint): number | null {
-	if (f.op === '=') return 1;
-	if (f.op === 'IN' && Array.isArray(f.value) && (f.value as unknown[]).length > 0) {
-		return (f.value as unknown[]).length;
-	}
-	return null;
-}
 
 /** One (column, operator-group) slot that the access-path rule fills from a single filter. */
 interface SeekRole {
@@ -242,12 +228,12 @@ function claimFirstPerRole(
 ): boolean[] {
 	const claimed = new Set<number>();
 	for (const { colIdx, ops } of roles) {
-		// An 'IN' fills an equality role only when well-formed (non-empty array) — the
-		// same shape gate the rule's pick applies, so a malformed IN is neither claimed
-		// here nor seeked there and survives as a residual.
+		// An 'IN' fills an equality role only when well-formed — a non-empty literal list
+		// or a runtime-valued set. Same shape gate the rule's pick applies, so a malformed
+		// IN is neither claimed here nor seeked there and survives as a residual.
 		const i = filters.findIndex(f =>
 			f.columnIndex === colIdx && ops.includes(f.op)
-			&& (f.op !== 'IN' || equalitySeekCardinality(f) !== null));
+			&& (f.op !== 'IN' || equalitySeekKeyCount(f) !== null));
 		if (i >= 0) claimed.add(i);
 	}
 	return filters.map((_f, i) => claimed.has(i));
@@ -2886,6 +2872,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest
 	): BestAccessPlanResult {
+		// NOTE: this module does not call `validateAccessPlan` / `validateAccessPlanRequest`,
+		// so a malformed request (e.g. a `runtimeSet` whose `maxCount` is not a positive
+		// integer) is not rejected at this boundary the way it is for the memory module. It
+		// degrades safely instead: `equalitySeekKeyCount` returns null for every malformed
+		// shape, so the filter is simply never claimed and survives as a residual. If an
+		// engine bug ever needs catching here rather than absorbing, call
+		// `validateAccessPlan(request, plan)` on the way out.
 		return { ...this.computeBestAccessPlan(db, tableInfo, request), honorsCollatedRangeBounds: true };
 	}
 
@@ -3050,20 +3043,31 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		const indexColIndexes = index.columns.map(c => c.index);
 
-		// Contiguous leading-prefix equality → point/prefix seek. An IN-list filter
-		// counts as an equality here (it is N equalities, served as one multi-seek by
+		// Contiguous leading-prefix equality → point/prefix seek. An IN filter counts as
+		// an equality here (it is N equalities, served as one multi-seek by
 		// StoreTable.scanMultiSeek); `inCount` is the cross-product of the per-column
-		// list sizes (1 for a plain '='), matching the rule's seek-key count. The FIRST
-		// role-filling filter per column is what the rule seeks on, so its cardinality
-		// is the one that counts.
+		// seek-key counts (1 for a plain '='), matching the rule's seek-key count. The
+		// FIRST role-filling filter per column is what the rule seeks on, so its
+		// cardinality is the one that counts.
+		//
+		// A runtime-valued IN set contributes its `maxCount` ceiling — the worst case the
+		// engine may deliver — so every gate below (the MAX_MULTI_SEEK_KEYS cap, the
+		// semantic-ordering decline) judges it against the largest multi-seek it could
+		// ever be asked to perform.
 		const eqCols: number[] = [];
 		let inCount = 1;
+		// A runtime set is a multi-seek even at `maxCount === 1`: the engine still delivers
+		// it as a `plan=5` multi-seek, so the gates below must judge it as one rather than
+		// as the plain EQ its ceiling arithmetic would otherwise suggest.
+		let isMultiSeek = false;
 		for (const colIdx of indexColIndexes) {
-			const eqFilter = request.filters.find(f => f.columnIndex === colIdx && equalitySeekCardinality(f) !== null);
+			const eqFilter = request.filters.find(f => f.columnIndex === colIdx && equalitySeekKeyCount(f) !== null);
 			if (!eqFilter) break;
 			eqCols.push(colIdx);
-			inCount *= equalitySeekCardinality(eqFilter)!;
+			inCount *= equalitySeekKeyCount(eqFilter)!;
+			if (isMultiValueEquality(eqFilter)) isMultiSeek = true;
 		}
+		if (inCount > 1) isMultiSeek = true;
 		const leadingCol = indexColIndexes[0];
 		const hasLeadingRange = request.filters.some(
 			f => f.columnIndex === leadingCol && RANGE_OPS.includes(f.op),
@@ -3127,7 +3131,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		if (inCount > MAX_MULTI_SEEK_KEYS) {
 			return costOnly(`cost-only; IN cross-product of ${inCount} exceeds the ${MAX_MULTI_SEEK_KEYS}-seek cap`);
 		}
-		if (inCount > 1 && seekCols.some(colIdx => hasSemanticOrdering(tableInfo.columns[colIdx]?.logicalType))) {
+		if (isMultiSeek && seekCols.some(colIdx => hasSemanticOrdering(tableInfo.columns[colIdx]?.logicalType))) {
 			// A plain EQ on a TIMESPAN/JSON column degrades safely (StoreTable.analyzeIndexAccess
 			// breaks its prefix there and the full-scan residual re-filters under the type's
 			// compare), but a multi-seek drops the residual and its byte-equality windows
@@ -3141,7 +3145,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			isRange ? rangeRoles(leadingCol) : equalityRoles(eqCols, EQ_OR_IN_OPS),
 		);
 
-		if (inCount > 1) {
+		if (isMultiSeek) {
 			// Multi-seek (plan=5): inCount point seeks, `rows` matched per seek key. The
 			// per-seek positioning term keeps a 500-key IN over a 10-row table from pricing
 			// below a full scan and issuing 500 seeks to read 10 rows. `isSet` false mirrors

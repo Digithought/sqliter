@@ -39,6 +39,31 @@ export interface RangeSpec {
 }
 
 /**
+ * Describes an `IN` constraint whose member values are produced at execution time
+ * (typically from a subquery), so the planner cannot name them. Present ⇒ `value`
+ * is absent.
+ *
+ * A module that accepts such a constraint (`handledFilters[i] = true`, plus
+ * `indexName` and `seekColumnIndexes`) promises only that it can serve the column as
+ * a multi-seek on the named index. In exchange the engine promises that at `query()`
+ * time the module receives an ordinary `plan=5` multi-seek `FilterInfo` — the same
+ * shape a literal `IN (…)` list produces, with `1 ≤ K ≤ maxCount` seek keys — so no
+ * module runtime needs to change and nothing distinguishes a runtime-derived set from
+ * a hand-written list. Declining is always safe. See `docs/module-authoring.md`
+ * § "Runtime-valued `IN` sets".
+ */
+export interface RuntimeSetSpec {
+	/**
+	 * Hard ceiling on the number of seek keys the engine will deliver at query() time.
+	 * The engine enforces it: a larger set never reaches the module — the engine falls
+	 * back to a full scan on its own.
+	 */
+	readonly maxCount: number;
+	/** Planner's estimate of the actual count, when it has one. Advisory. */
+	readonly estimatedCount?: number;
+}
+
+/**
  * A predicate constraint extracted from WHERE clause
  */
 export interface PredicateConstraint {
@@ -52,6 +77,66 @@ export interface PredicateConstraint {
 	usable: boolean;
 	/** Range specifications for OR_RANGE constraints */
 	ranges?: RangeSpec[];
+	/**
+	 * Set only when `op === 'IN'` and the members are not known at plan time.
+	 * Mutually exclusive with `value` — see {@link RuntimeSetSpec}.
+	 */
+	readonly runtimeSet?: RuntimeSetSpec;
+}
+
+/**
+ * Number of seek keys an equality-role filter contributes at plan time, or null when
+ * the filter cannot fill an equality role at all:
+ *
+ *   `=`                    → 1
+ *   literal `IN`           → `value.length` (elements may be `undefined` for parameter
+ *                            bindings — only the LENGTH is meaningful at plan time)
+ *   runtime-set `IN`       → `runtimeSet.maxCount`, the WORST case; the delivered count
+ *                            is anywhere in `1..maxCount`
+ *   anything else          → null
+ *
+ * A malformed shape — an empty literal list, a `maxCount` that is not a positive integer —
+ * returns null, so a module declines it and it survives as a residual. That mirrors the
+ * literal arm's long-standing non-empty-array gate and holds even when
+ * {@link validateAccessPlanRequest} was never called (the store module, for one, does not
+ * call it), so a bad request degrades to a scan rather than to a zero-key seek.
+ *
+ * For plan-time-known values this mirrors the exact predicate
+ * `rule-select-access-path`'s `eqBySeekCol` uses to pick its per-column equality
+ * constraint, so a module's positional claim and the rule's pick cannot disagree. The
+ * runtime-set arm has no counterpart there because nothing in the planner emits
+ * `runtimeSet` yet — `feat-key-set-semi-join` supplies the engine half and lowers a
+ * runtime set to a literal seek-key list before the rule ever sees it.
+ */
+export function equalitySeekKeyCount(f: PredicateConstraint): number | null {
+	if (f.op === '=') return 1;
+	if (f.op === 'IN') {
+		if (f.runtimeSet) {
+			const { maxCount } = f.runtimeSet;
+			return Number.isInteger(maxCount) && maxCount > 0 ? maxCount : null;
+		}
+		if (Array.isArray(f.value) && (f.value as unknown[]).length > 0) {
+			return (f.value as unknown[]).length;
+		}
+	}
+	return null;
+}
+
+/**
+ * True when the filter may seek more than one key — i.e. it walks the index in seek-key
+ * order rather than column order, so a plan built on it cannot claim `providesOrdering`
+ * over that column and is not a scan-constant.
+ *
+ * A well-formed runtime set is ALWAYS multi-valued here, even at `maxCount === 1`: the
+ * delivered count is not knowable at plan time, and mistaking a multi-seek for a constant
+ * would elide a `Sort` the plan needs. (That is the one case where this disagrees with
+ * `equalitySeekKeyCount(f) > 1`; the conservative answer is the safe one.) A malformed
+ * one fills no equality role at all, so it is not multi-valued either.
+ */
+export function isMultiValueEquality(f: PredicateConstraint): boolean {
+	if (f.op !== 'IN') return false;
+	if (f.runtimeSet) return equalitySeekKeyCount(f) !== null;
+	return Array.isArray(f.value) && (f.value as unknown[]).length > 1;
 }
 
 /**
@@ -328,6 +413,41 @@ export class AccessPlanBuilder {
 }
 
 /**
+ * Validate the REQUEST the engine hands a module, before the module can improvise on a
+ * shape it was never promised. Called from {@link validateAccessPlan}, so every module
+ * that follows the validate-your-plan convention gets it without a second call site.
+ *
+ * The checks are all on {@link RuntimeSetSpec}: it must ride an `IN`, it must not carry
+ * plan-time `value`s (a module reading `value` on a runtime set would seek on garbage),
+ * and its ceiling must be a usable count.
+ */
+export function validateAccessPlanRequest(request: BestAccessPlanRequest): void {
+	for (const filter of request.filters) {
+		if (!filter.runtimeSet) continue;
+
+		if (filter.op !== 'IN') {
+			quereusError(
+				`runtimeSet is only valid on an 'IN' constraint, got '${filter.op}' on column ${filter.columnIndex}`,
+				StatusCode.FORMAT
+			);
+		}
+		if (filter.value !== undefined) {
+			quereusError(
+				`runtimeSet and value are mutually exclusive (column ${filter.columnIndex}); a runtime set has no plan-time members`,
+				StatusCode.FORMAT
+			);
+		}
+		const maxCount = filter.runtimeSet.maxCount;
+		if (!Number.isInteger(maxCount) || maxCount < 1) {
+			quereusError(
+				`runtimeSet.maxCount must be an integer >= 1, got ${maxCount} on column ${filter.columnIndex}`,
+				StatusCode.FORMAT
+			);
+		}
+	}
+}
+
+/**
  * Validation function for access plan results
  * Throws if the plan violates basic contracts
  */
@@ -335,6 +455,8 @@ export function validateAccessPlan(
 	request: BestAccessPlanRequest,
 	result: BestAccessPlanResult
 ): void {
+	validateAccessPlanRequest(request);
+
 	// Validate handledFilters array length
 	if (result.handledFilters.length !== request.filters.length) {
 		quereusError(
