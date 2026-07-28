@@ -221,9 +221,11 @@ describe('Filter conjunct early exit', () => {
 		// the ORDER BY here once that lands.
 		// A genuinely pending conjunct between two synchronous ones: the loop must await
 		// it, resume on the right row, and still stop at the first non-true conjunct.
-		// The trailing conjunct is a (cached) subquery rather than `v > 2` so that
+		// The trailing conjunct wraps `v > 2` in a (cached) subquery so that
 		// `rule-filter-conjunct-ordering` (Pure < Volatile < Subquery) keeps the async
 		// volatile call in the MIDDLE — a bare pure conjunct would sort ahead of it.
+		// It still has to REJECT a row (id 2), which is what pins "stop at the first
+		// non-true conjunct" for the position *after* the awaited one.
 		it('an asynchronous conjunct interleaves with synchronous ones', async () => {
 			// Registered through the internal factory: `Database.createScalarFunction`
 			// types its callback as synchronous, while the engine's `ScalarFunc` accepts
@@ -236,8 +238,9 @@ describe('Filter conjunct early exit', () => {
 					return 1;
 				},
 			));
-			const rows = await collect(db, 'select id from t where v % 5 = 2 and slowfx() = 1 and (select max(id) from t t2) >= 10 order by id');
-			expect(rows.map(r => r.id)).to.deep.equal([2, 7, 12]);
+			// max(id) = 12, so the trailing conjunct is `2 < v` — it rejects id 2.
+			const rows = await collect(db, 'select id from t where v % 5 = 2 and slowfx() = 1 and (select max(id) from t t2) - 10 < v order by id');
+			expect(rows.map(r => r.id)).to.deep.equal([7, 12]);
 			expect(calls, 'the async conjunct runs only for the 3 rows the first conjunct kept').to.equal(3);
 		});
 

@@ -1146,9 +1146,12 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		nodeType: PlanNodeType.Filter,
 		phase: 'rewrite',
 		fn: ruleFilterConjunctOrdering,
-		// Reordering changes per-conjunct evaluation counts under early exit;
-		// the rule refuses when any conjunct's subtree has side effects.
-		sideEffectMode: 'safe',
+		// 'aware', not 'safe': the rule MOVES conjunct subtrees relative to the
+		// emitter's early exit, so it changes how often each one runs, and it
+		// leans on an explicit `subtreeHasSideEffects` refusal rather than on its
+		// structural shape. Declaring 'aware' is also what enrolls it in the
+		// OPT-003 static guard, so deleting that refusal fails the audit.
+		sideEffectMode: 'aware',
 	},
 
 	// NOTE: The materialization advisory no longer registers per-node-type rules.

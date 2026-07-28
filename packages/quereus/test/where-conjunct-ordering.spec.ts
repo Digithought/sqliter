@@ -163,6 +163,24 @@ describe('WHERE conjunct cost ordering', () => {
 			expect(pushed, 'k = 2 must remain a pushed Filter').to.not.be.undefined;
 		});
 
+		it('all three tiers sort Pure → Volatile → Subquery from any written order', () => {
+			// No pushable column conjunct here, so all three stay in one residual
+			// Filter and the full tier ordering is observable in its detail.
+			for (const sql of [
+				'select id from t where (select max(id) from t t2) = 12 and sidefx() = 1 and v % 5 = 2',
+				'select id from t where sidefx() = 1 and v % 5 = 2 and (select max(id) from t t2) = 12',
+				'select id from t where v % 5 = 2 and (select max(id) from t t2) = 12 and sidefx() = 1',
+			]) {
+				const detail = filterDetailContaining(sql, 'sidefx');
+				const pure = detail.indexOf('v % 5');
+				const volatileAt = detail.indexOf('sidefx');
+				const subquery = detail.indexOf('max');
+				expect([pure, volatileAt, subquery], detail).to.not.include(-1);
+				expect(pure, `Pure before Volatile in: ${detail}`).to.be.lessThan(volatileAt);
+				expect(volatileAt, `Volatile before Subquery in: ${detail}`).to.be.lessThan(subquery);
+			}
+		});
+
 		it('equal-cost conjuncts keep source order (stable sort)', () => {
 			const forward = filterDetailContaining('select id from t where v % 5 = 2 and v % 3 = 1', 'v %');
 			expect(forward.indexOf('v % 5'), forward).to.be.lessThan(forward.indexOf('v % 3'));

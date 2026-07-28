@@ -1146,7 +1146,7 @@ describe('Optimizer Equivalence', function () {
 
 	// Rule groups by category (rewrite rules only — safe to disable without
 	// preventing physical plan generation)
-	const PREDICATE_RULES = ['predicate-pushdown', 'filter-merge'];
+	const PREDICATE_RULES = ['predicate-pushdown', 'filter-merge', 'filter-conjunct-ordering'];
 	const JOIN_REWRITE_RULES = ['join-greedy-commute', 'join-key-inference'];
 	const SUBQUERY_RULES = ['subquery-decorrelation'];
 	const CACHE_RULES = ['cte-optimization', 'mutating-subquery-cache', 'scalar-cse'];

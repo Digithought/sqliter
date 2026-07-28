@@ -11,6 +11,18 @@
  * keeps the row set identical. Reordering changes only evaluation COUNTS,
  * which is why the rule refuses when any conjunct's subtree carries a side
  * effect.
+ *
+ * NOTE (tripwire): "row set identical" is a claim about VALUES, not about
+ * thrown errors. A conjunct written after a guard (`v <> 0 and 10 / v > 1`)
+ * may run on rows the guard would have rejected once it sorts ahead of the
+ * guard. Harmless today — every arithmetic edge quereus defines returns NULL
+ * rather than throwing (division by zero included, pinned in
+ * test/logic/07.7.4-where-conjunct-ordering.sqllogic), and a cheap guard
+ * already sorts first. It only becomes real if a scalar function that THROWS
+ * on bad input ships and a query guards it with a conjunct in a more expensive
+ * tier (e.g. `exists (...) and parse(x) > 0`). At that point either gate the
+ * reorder on a per-function "may raise" trait or tell users to guard with
+ * CASE, as PostgreSQL does.
  */
 
 import { createLogger } from '../../../common/logger.js';

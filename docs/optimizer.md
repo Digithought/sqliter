@@ -266,6 +266,14 @@ relational descendant ⇒ `Subquery`, else any non-deterministic node ⇒
 imports plan-node + characteristics, so a re-export would create an import
 cycle.
 
+Reordering preserves the row set (AND commutes under three-valued logic, and a
+Filter rejects `false` and `NULL` alike) but it does **not** preserve which
+conjuncts get evaluated, so a guard idiom (`v <> 0 and 10 / v > 1`) is only
+safe while no scalar expression raises. Every arithmetic edge quereus defines
+returns NULL rather than throwing, so this is inert today; if a scalar function
+that throws on bad input ever ships, gate the reorder on a per-function
+"may raise" trait, or require CASE for guarding as PostgreSQL does.
+
 #### Self-cost-only convention
 
 > **Invariant:** [OPT-016](invariants.md#opt-016--estimatedcost-is-self-cost-only), [OPT-018](invariants.md#opt-018--the-total-cost-memo-is-invalidated-on-mutation)
