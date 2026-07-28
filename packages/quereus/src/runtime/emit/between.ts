@@ -2,13 +2,10 @@ import type { SqlValue } from "../../common/types.js";
 import type { Instruction, RuntimeContext } from "../types.js";
 import { asRun } from "../types.js";
 import type { BetweenNode } from "../../planner/nodes/scalar.js";
-import type { ScalarPlanNode } from "../../planner/nodes/plan-node.js";
 import { emitPlanNode } from "../emitters.js";
-import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering } from "../../util/comparison.js";
-import type { CollationFunction, LogicalType } from "../../types/logical-type.js";
 import type { EmissionContext } from "../emission-context.js";
 import { effectiveBetweenBoundCollation } from "../../planner/analysis/comparison-collation.js";
-import { tryTemporalCompare } from "./temporal-arithmetic.js";
+import { formatOperandCollationNote, makeOperandComparator } from "./operand-comparator.js";
 
 export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instruction {
 	// BETWEEN desugars to `expr >= lower AND expr <= upper`; each comparison
@@ -24,8 +21,8 @@ export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instructio
 	const upperCollationFunc = ctx.resolveCollation(upperCollationName);
 
 	const exprLogical = plan.expr.getType().logicalType;
-	const lowerCompare = makeBoundComparator(exprLogical, plan.lower, lowerCollationFunc);
-	const upperCompare = makeBoundComparator(exprLogical, plan.upper, upperCollationFunc);
+	const lowerCompare = makeOperandComparator(exprLogical, plan.lower.getType().logicalType, lowerCollationFunc);
+	const upperCompare = makeOperandComparator(exprLogical, plan.upper.getType().logicalType, upperCollationFunc);
 
 	// Cross-category coercion is handled at plan time via explicit CastNodes,
 	// so no runtime coercion is needed here.
@@ -50,47 +47,6 @@ export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instructio
 	return {
 		params: [valueExpr, lowerExpr, upperExpr],
 		run: asRun(run),
-		note: `${notPrefix}BETWEEN${formatBetweenCollationNote(lowerCollationName, upperCollationName)}`
+		note: `${notPrefix}BETWEEN${formatOperandCollationNote([lowerCollationName, upperCollationName])}`
 	};
-}
-
-/**
- * Comparator for one BETWEEN bound, selecting the SAME path `emitComparisonOp` would
- * select for the desugared `expr >= lower` / `expr <= upper`, so BETWEEN and its
- * desugared form never disagree:
- *  - both sides declare the same semantic-ordering type (TIMESPAN, JSON) ⇒ the type's
- *    compare, matching the operator's typed fast path;
- *  - neither side is temporal and both share a category (numeric/numeric or
- *    textual/textual) ⇒ plain storage-class + collation compare, matching the
- *    operator's same-category fast path. Notably a plain TEXT column holding
- *    duration-shaped text ('PT30M') stays text-ordered here, exactly as `>=` leaves it;
- *  - otherwise ⇒ a runtime duration check first, matching the operator's generic path.
- */
-function makeBoundComparator(
-	exprLogical: LogicalType,
-	boundNode: ScalarPlanNode,
-	collationFunc: CollationFunction,
-): (v: SqlValue, bound: SqlValue) => number {
-	const boundLogical = boundNode.getType().logicalType;
-	if (exprLogical === boundLogical && hasSemanticOrdering(exprLogical)) {
-		return createTypedComparator(exprLogical, collationFunc);
-	}
-
-	const needsTemporalCheck = exprLogical.isTemporal || boundLogical.isTemporal;
-	const bothSameCategory = (exprLogical.isNumeric && boundLogical.isNumeric)
-		|| (exprLogical.isTextual && boundLogical.isTextual);
-	if (!needsTemporalCheck && bothSameCategory) {
-		return (v, bound) => compareSqlValuesFast(v, bound, collationFunc);
-	}
-
-	return (v, bound) => tryTemporalCompare(v, bound) ?? compareSqlValuesFast(v, bound, collationFunc);
-}
-
-/** Build the collation suffix for a BETWEEN note: nothing when both bounds are
- *  BINARY, a single name when they agree, or `lower/upper` when they differ. */
-function formatBetweenCollationNote(lowerColl: string, upperColl: string): string {
-	if (lowerColl === upperColl) {
-		return lowerColl !== 'BINARY' ? ` ${lowerColl}` : '';
-	}
-	return ` ${lowerColl}/${upperColl}`;
 }

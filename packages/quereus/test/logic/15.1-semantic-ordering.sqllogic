@@ -203,6 +203,18 @@ select id from dt where d in (select d from dt where id = 2) order by id;
 select id from dt where d in ('PT59M', 'not-a-duration') order by id;
 → []
 
+-- A simple CASE compares its base against each WHEN through the same routing, so
+-- `case d when 'PT60M'` must agree with `d = 'PT60M'` and `d in ('PT60M')` above.
+-- Regression for `simple-case-comparison-collation-and-type` (previously the
+-- CASE match compared raw text and reported a miss).
+select id, case d when 'PT60M' then 'hit' else 'miss' end as r from dt order by id;
+→ [{"id":1,"r":"hit"},{"id":2,"r":"hit"}]
+
+-- Per-clause: a non-member spelling still misses, and a later matching clause wins.
+select id, case d when 'PT59M' then 'hit1' when 'PT3600S' then 'hit2' else 'miss' end as r
+  from dt order by id;
+→ [{"id":1,"r":"hit2"},{"id":2,"r":"hit2"}]
+
 -- Equi-join matches across spellings (any join algorithm must agree with `=`).
 create table jt2 (id integer primary key, d timespan);
 insert into jt2 values (10, 'PT60M');
@@ -319,6 +331,17 @@ select id from txt where v between 'PT100M' and 'PT3H' order by id;
 select id from txt where v >= 'PT100M' and v <= 'PT3H' order by id;
 → [{"id":1},{"id":2}]
 
+-- A simple CASE over the same plain TEXT column stays text-compared too: 'PT30M'
+-- and 'PT0.5H' are one elapsed time but two distinct strings, and only a declared
+-- semantic-ordering type changes that. Must agree with `=`.
+select id, (v = 'PT0.5H') as eq, case v when 'PT0.5H' then 'hit' else 'miss' end as c
+  from txt where id = 1;
+→ [{"id":1,"eq":false,"c":"miss"}]
+
+-- The exact spelling still matches under text comparison.
+select id from txt where case v when 'PT30M' then 1 else 0 end = 1;
+→ [{"id":1}]
+
 drop table txt;
 
 -- === JSON: structural ordering ===
@@ -352,6 +375,12 @@ select (json('{"a":1,"b":2}') = json('{"b":2,"a":1}')) as r;
 -- BETWEEN over a JSON column agrees with the structural comparisons it desugars to.
 select id from jv where v between json('{"a":1}') and json('{"a":5}');
 → [{"id":2}]
+
+-- Simple CASE over a JSON column compares structurally (whitespace and key order
+-- are insignificant), unchanged by the collation/type routing rework: the plan-time
+-- cast the builder inserts on the WHEN operands already put both sides in JSON.
+select id, case v when '{ "a" : 2 }' then 'hit' else 'miss' end as r from jv order by id;
+→ [{"id":1,"r":"miss"},{"id":2,"r":"hit"}]
 
 -- JSON row identity: key order is insignificant, so two reordered spellings of one
 -- document are one value to DISTINCT, GROUP BY and set operations. (JSON needs no

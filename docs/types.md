@@ -656,7 +656,8 @@ if (column.collation && column.logicalType.supportedCollations) {
 
 ### Comparison collation resolution
 
-A comparison (`=`, `!=`, `<`, `<=`, `>`, `>=`, plus IN and each BETWEEN bound)
+A comparison (`=`, `!=`, `<`, `<=`, `>`, `>=`, plus IN, each BETWEEN bound and
+each simple-`CASE` WHEN clause)
 resolves ONE effective collation from its operands' types via a
 **provenance-ranked lattice** (implemented once in
 `planner/analysis/comparison-collation.ts`, shared by every plan-time
@@ -751,6 +752,18 @@ Related forms:
   `expr <= hi`); each bound resolves against the tested expression
   separately. Two differently-collated bounds are NOT a conflict with each
   other.
+- **Simple `CASE`** — `case x when v1 … when vn` decides each match exactly as
+  `x = v1` … `x = vn` would, resolved **per clause** (like BETWEEN's two
+  bounds, not like IN's single merged collation). Two differently-collated WHEN
+  operands are therefore not a conflict with each other; an explicit `COLLATE`
+  on the base *and* a different explicit `COLLATE` on one WHEN operand is the
+  same conflict error `=` raises for that pair. The routing between the declared
+  type's own `compare`, storage-class comparison and the runtime duration check
+  is shared with BETWEEN and `=` (`runtime/emit/operand-comparator.ts`), so a
+  `timespan` column matches `case d when 'PT120M'` on elapsed time and a plain
+  `text` column holding duration-shaped text stays text-compared. A *searched*
+  `CASE` (`case when <predicate>`) does no comparison of its own — its WHEN is an
+  ordinary boolean expression that already resolved through the lattice.
 - **USING joins** — each same-named column pair resolves through the lattice,
   so `using (k)` agrees with the spelled-out `l.k = r.k`. The four pairwise
   join-key surfaces (USING comparator, merge / bloom / asof) all resolve their

@@ -212,6 +212,106 @@ select id, case when status = 'active' collate NOCASE then 'match' else 'other' 
 drop table coll_case;
 
 -- =============================================================================
+-- Simple CASE resolves its collation exactly as `=` / IN do
+-- =============================================================================
+-- `case x when v` must decide each match the way `x = v` would, resolved
+-- independently per WHEN clause through the provenance lattice (explicit COLLATE >
+-- declared column collation > defaults > BINARY). Each assertion sits next to the
+-- corresponding `=` / `in` assertion so a future divergence shows up in one place.
+-- Regression for `simple-case-comparison-collation-and-type` (previously the
+-- simple-CASE match compared raw bytes under BINARY and disagreed with `=`).
+
+create table case_nc (id integer primary key, n text collate NOCASE);
+insert into case_nc values (1, 'bob');
+
+-- The declared NOCASE column collation governs all three surfaces alike.
+select n = 'BOB' as r from case_nc;
+→ [{"r":true}]
+
+select n in ('BOB') as r from case_nc;
+→ [{"r":true}]
+
+select case n when 'BOB' then 'hit' else 'miss' end as r from case_nc;
+→ [{"r":"hit"}]
+
+-- No spurious matches: a NOCASE-distinct value still misses.
+select case n when 'bill' then 'hit' else 'miss' end as r from case_nc;
+→ [{"r":"miss"}]
+
+drop table case_nc;
+
+-- Explicit COLLATE on the base expression, and on the WHEN operand, each govern
+-- the comparison on their own (a BINARY-defaulted column must not shadow either).
+create table case_bin (id integer primary key, n text);
+insert into case_bin values (1, 'a');
+
+select case n collate NOCASE when 'A' then 'hit' else 'miss' end as r from case_bin;
+→ [{"r":"hit"}]
+
+select case n when 'A' collate NOCASE then 'hit' else 'miss' end as r from case_bin;
+→ [{"r":"hit"}]
+
+-- Desugared parity: the same operand pair under `=`.
+select (n collate NOCASE = 'A') as r from case_bin;
+→ [{"r":true}]
+
+-- Plain BINARY stays case-sensitive.
+select case n when 'A' then 'hit' else 'miss' end as r from case_bin;
+→ [{"r":"miss"}]
+
+drop table case_bin;
+
+-- Per-clause resolution: clause 1 resolves under the column's NOCASE, clause 2
+-- under its own explicit RTRIM, clause 3 under an explicit BINARY. Mirrors how
+-- BETWEEN resolves its two bounds independently.
+create table case_mix (id integer primary key, n text collate NOCASE);
+insert into case_mix values (1, 'bob'), (2, 'cat  '), (3, 'dog');
+
+select id, case n
+             when 'BOB' then 'nocase-hit'
+             when 'cat' collate RTRIM then 'rtrim-hit'
+             when 'DOG' collate BINARY then 'binary-hit'
+             else 'miss'
+           end as r
+  from case_mix order by id;
+→ [{"id":1,"r":"nocase-hit"},{"id":2,"r":"rtrim-hit"},{"id":3,"r":"miss"}]
+
+drop table case_mix;
+
+-- Collation conflict: an explicit COLLATE on the base AND a different explicit
+-- COLLATE on a WHEN operand is the same error `=` raises for that operand pair.
+create table case_conflict (id integer primary key, n text);
+insert into case_conflict values (1, 'a');
+
+select case n collate RTRIM when 'A' collate NOCASE then 'hit' else 'miss' end as r
+  from case_conflict;
+-- error: conflicting COLLATE clauses in comparison
+
+-- Same pair under `=` — identical error.
+select (n collate RTRIM = 'A' collate NOCASE) as r from case_conflict;
+-- error: conflicting COLLATE clauses in comparison
+
+-- Declared-collation conflict between two NOCASE/RTRIM columns is the ambiguity error.
+create table case_conflict2 (id integer primary key, a text collate NOCASE, b text collate RTRIM);
+insert into case_conflict2 values (1, 'x', 'x');
+
+select case a when b then 'hit' else 'miss' end as r from case_conflict2;
+-- error: ambiguous collation for comparison
+
+drop table case_conflict2;
+drop table case_conflict;
+
+-- A searched CASE is unaffected — its WHEN is an ordinary boolean expression whose
+-- own comparison already resolved through the lattice.
+create table case_searched (id integer primary key, n text collate NOCASE);
+insert into case_searched values (1, 'bob');
+
+select case when n = 'BOB' then 'hit' else 'miss' end as r from case_searched;
+→ [{"r":"hit"}]
+
+drop table case_searched;
+
+-- =============================================================================
 -- COLLATE on a BETWEEN *bound* (scan form)
 -- =============================================================================
 -- BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison resolves its

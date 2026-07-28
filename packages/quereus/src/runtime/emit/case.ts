@@ -4,8 +4,9 @@ import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { compareSqlValues } from '../../util/comparison.js';
 import { isTruthy } from '../../util/comparison.js';
+import { effectiveComparisonCollation } from '../../planner/analysis/comparison-collation.js';
+import { formatOperandCollationNote, makeOperandComparator, type OperandComparator } from './operand-comparator.js';
 
 /** On-demand branch callback — evaluates its sub-expression only when invoked. */
 type BranchFn = (ctx: RuntimeContext) => MaybePromise<SqlValue>;
@@ -29,6 +30,29 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 	// declaring the run `async` would force every CASE result into a Promise and
 	// break that gate.
 	const clauseCount = plan.whenThenClauses.length;
+
+	// Simple CASE decides `base WHEN v` exactly as `base = v` does, resolved
+	// INDEPENDENTLY per clause (mirroring how BETWEEN resolves its two bounds):
+	// the collation comes from the shared provenance lattice (explicit COLLATE >
+	// declared column collation > defaults > BINARY), and the routing between the
+	// declared type's own compare / storage-class compare / runtime temporal check
+	// is the one shared with BETWEEN and `=` (see operand-comparator.ts). Without
+	// this, `case n when 'BOB'` compared raw bytes and disagreed with `n = 'BOB'`
+	// on a NOCASE column and on semantic-ordering types like TIMESPAN.
+	//
+	// A genuine collation conflict (explicit COLLATE on the base AND a different
+	// explicit COLLATE on a WHEN operand) throws here, exactly as `=` throws for
+	// the same operand pair.
+	const whenCollationNames = plan.baseExpr
+		? plan.whenThenClauses.map(clause => effectiveComparisonCollation(plan.baseExpr!, clause.when))
+		: [];
+	const whenComparators: OperandComparator[] = plan.baseExpr
+		? plan.whenThenClauses.map((clause, i) => makeOperandComparator(
+			plan.baseExpr!.getType().logicalType,
+			clause.when.getType().logicalType,
+			ctx.resolveCollation(whenCollationNames[i]),
+		))
+		: [];
 
 	// Searched CASE: CASE WHEN c1 THEN r1 ... ELSE e END
 	// args layout: [when0, then0, when1, then1, ..., else?]
@@ -64,10 +88,11 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 		const baseValue = args[0] as SqlValue;
 		const branch = (idx: number): BranchFn => args[idx] as BranchFn;
 
-		// NULL base never matches any WHEN — falls through to ELSE/NULL.
-		const matches = (whenValue: SqlValue): boolean =>
+		// NULL base never matches any WHEN — falls through to ELSE/NULL. Each clause
+		// compares under its OWN pre-resolved comparator (collation + type routing).
+		const matches = (i: number, whenValue: SqlValue): boolean =>
 			baseValue !== null && whenValue !== null &&
-			compareSqlValues(baseValue, whenValue) === 0;
+			whenComparators[i](baseValue, whenValue) === 0;
 
 		const noMatch = (): MaybePromise<SqlValue> =>
 			plan.elseExpr ? branch(1 + clauseCount * 2)(runtimeCtx) : null;
@@ -78,9 +103,9 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 			const thenFn = branch(1 + i * 2 + 1);
 			const w = whenFn(runtimeCtx);
 			if (w instanceof Promise) {
-				return w.then(wv => (matches(wv) ? thenFn(runtimeCtx) : step(i + 1)));
+				return w.then(wv => (matches(i, wv) ? thenFn(runtimeCtx) : step(i + 1)));
 			}
-			return matches(w) ? thenFn(runtimeCtx) : step(i + 1);
+			return matches(i, w) ? thenFn(runtimeCtx) : step(i + 1);
 		};
 
 		return step(0);
@@ -109,5 +134,6 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 		params: paramInstructions,
 		run: plan.baseExpr ? asRun(runSimpleCase) : asRun(runSearchedCase),
 		note: `case(short-circuit, ${clauseCount} when clauses${plan.elseExpr ? ', else' : ''})`
+			+ formatOperandCollationNote(whenCollationNames)
 	};
 }
