@@ -137,6 +137,15 @@ This ensures type information flows through the entire planning and execution pi
 - Comparison: Numeric ordering with NaN handling
 - Collations: None
 
+**NUMERIC** (SQLite's NUMERIC affinity — integer if it fits, else real)
+- Physical: `PhysicalType.REAL`
+- Values: `number` or `bigint` — both halves are accepted by `validate`/`parse`, so a
+  NUMERIC column can hold a whole number past 2^53 in exact `bigint` form
+- Comparison: numeric ordering with REAL's NaN handling (NaN sorts smallest, NaN = NaN).
+  Mixed `number`/`bigint` pairs are ordered by exact mathematical value — NUMERIC has its
+  own comparator rather than delegating to REAL's, whose `isNaN` throws on a bigint
+- Collations: None
+
 **BOOLEAN**
 - Physical: `PhysicalType.BOOLEAN`
 - Values: `boolean` (true/false)

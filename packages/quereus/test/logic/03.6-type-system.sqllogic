@@ -361,4 +361,19 @@ INSERT INTO numeric_big VALUES (3);
 select cast(v as text) as v from numeric_big order by v;
 → [{"v":"3"},{"v":"9007199254740993"}]
 
+-- Adjacent bigints past 2^53, negatives, and a fractional double interleaved:
+-- key placement must use exact value order, not a rounded double.
+INSERT INTO numeric_big VALUES (9007199254740994);
+INSERT INTO numeric_big VALUES (-9007199254740993);
+INSERT INTO numeric_big VALUES (2.5);
+
+select cast(v as text) as v from numeric_big order by v;
+→ [{"v":"-9007199254740993"},{"v":"2.5"},{"v":"3"},{"v":"9007199254740993"},{"v":"9007199254740994"}]
+
+select cast(v as text) as v from numeric_big where v > 9007199254740993 order by v;
+→ [{"v":"9007199254740994"}]
+
+select count(*) as c from numeric_big;
+→ [{"c":5}]
+
 DROP TABLE numeric_big;

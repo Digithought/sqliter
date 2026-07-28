@@ -319,6 +319,28 @@ describe('Type System', () => {
 				expect(NUMERIC_TYPE.compare!(NaN, 1)).to.equal(-1);
 				expect(NUMERIC_TYPE.compare!(1, NaN)).to.equal(1);
 				expect(NUMERIC_TYPE.compare!(NaN, NaN)).to.equal(0);
+				// NaN vs a bigint must not throw either — the check is typeof-guarded
+				expect(NUMERIC_TYPE.compare!(NaN, 9007199254740993n)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, NaN)).to.equal(1);
+			});
+
+			it('should order bigint pairs and negatives', () => {
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, 9007199254740994n)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, 9007199254740993n)).to.equal(0);
+				expect(NUMERIC_TYPE.compare!(-9007199254740993n, -9007199254740992)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(-9007199254740993n, 3)).to.equal(-1);
+			});
+
+			it('should order a bigint against a fractional double exactly', () => {
+				expect(NUMERIC_TYPE.compare!(2n, 2.5)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(3n, 2.5)).to.equal(1);
+				expect(NUMERIC_TYPE.compare!(2n, 2.0)).to.equal(0);
+			});
+
+			it('should sort NULL before any value, per the shared convention', () => {
+				expect(NUMERIC_TYPE.compare!(null, 9007199254740993n)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, null)).to.equal(1);
+				expect(NUMERIC_TYPE.compare!(null, null)).to.equal(0);
 			});
 		});
 

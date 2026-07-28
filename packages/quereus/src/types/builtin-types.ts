@@ -2,6 +2,18 @@ import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js'
 import { compareSqlValuesFast, BINARY_COLLATION } from '../util/comparison.js';
 
 /**
+ * Orders a non-null `number | bigint` pair. JS relational operators compare the two
+ * representations by exact mathematical value, so no precision is lost past 2^53
+ * (unlike converting the bigint side through `Number()`).
+ *
+ * Callers must handle NULL and NaN first: both `<` and `>` are false for a NaN operand,
+ * which would report "equal" here.
+ */
+function compareNumericValues(a: number | bigint, b: number | bigint): number {
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
  * NULL type - represents null values
  */
 export const NULL_TYPE: LogicalType = {
@@ -54,8 +66,7 @@ export const INTEGER_TYPE: LogicalType = {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
 
-		// Use direct < / > which JS supports across number and bigint without precision loss
-		return (a as number | bigint) < (b as number | bigint) ? -1 : (a as number | bigint) > (b as number | bigint) ? 1 : 0;
+		return compareNumericValues(a as number | bigint, b as number | bigint);
 	},
 };
 
@@ -236,6 +247,10 @@ export const BOOLEAN_TYPE: LogicalType = {
  */
 export const NUMERIC_TYPE: LogicalType = {
 	name: 'NUMERIC',
+	// NOTE: labelled REAL although the value space includes bigint. Harmless today —
+	// nothing encodes or rounds by physicalType (the store keys off the JS value type).
+	// If a storage/encoding path ever switches on physicalType, a bigint-holding NUMERIC
+	// would be mislabelled here and lose precision on the way out.
 	physicalType: PhysicalType.REAL,
 	isNumeric: true,
 
@@ -279,8 +294,7 @@ export const NUMERIC_TYPE: LogicalType = {
 		if (aIsNaN) return bIsNaN ? 0 : -1;
 		if (bIsNaN) return 1;
 
-		// Plain < / > compares number and bigint exactly, without precision loss
-		return (a as number | bigint) < (b as number | bigint) ? -1 : (a as number | bigint) > (b as number | bigint) ? 1 : 0;
+		return compareNumericValues(a as number | bigint, b as number | bigint);
 	},
 };
 
