@@ -163,8 +163,10 @@ describe('Cache rules', () => {
 
 		it('uncorrelated IN subquery no longer produces a CACHE node', async () => {
 			// The retired `rule-in-subquery-cache` used to wrap the source in a CACHE.
-			// `emitIn` now materializes the result once per execution into a probed
-			// lookup set (quereus-in-subquery-set-probe), so no CacheNode is injected.
+			// Filter-position shapes now decorrelate to a hash semi join (whose build
+			// side materializes once with no CacheNode); shapes that stay on `emitIn`
+			// use its once-per-execution probed lookup set instead
+			// (quereus-in-subquery-set-probe). Neither path injects a CacheNode.
 			const sql = "SELECT id FROM t WHERE category IN (SELECT name FROM cats)";
 			const ops = await queryPlanOps(sql);
 			expect(ops).not.to.include('CACHE');

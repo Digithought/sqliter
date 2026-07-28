@@ -101,6 +101,16 @@ data. The gate (uncorrelated + functional) matches the retired rule: correlated
 sources must re-evaluate per outer row, and non-deterministic sources keep their
 per-row semantics — both route to the streaming (early-exit) path instead.
 
+Fewer shapes reach this probe than the gate alone suggests: the optimizer
+rewrites an uncorrelated, deterministic **filter-position** `x IN (subquery)`
+into a hash semi join first (`rule-subquery-decorrelation`, uncorrelated arm —
+see `docs/optimizer-rules.md`), whose build side drains the source once with the
+same scan-count guarantee. The set probe remains the path for
+projection-position IN (which must keep its three-valued answer), `NOT IN`,
+correlated or non-deterministic sources, and any shape the rewrite's gates
+decline (non-column left side, collation conflict, mixed semantic-ordering
+pair).
+
 ## Shared CTE materialization (multi-reference CTEs)
 
 A non-recursive CTE referenced more than once (or hinted `MATERIALIZED`) is

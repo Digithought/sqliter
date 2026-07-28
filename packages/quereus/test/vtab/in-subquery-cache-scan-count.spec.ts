@@ -5,20 +5,27 @@ import { CountingMemoryModule } from './_counting-memory-module.js';
 import type { OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
 
 /**
- * Runtime execution-count checks for the uncorrelated IN-subquery set probe.
+ * Runtime execution-count checks for uncorrelated `x IN (subquery)`.
  *
- * `emitIn` materializes an uncorrelated, functional `x IN (subquery)` source into
- * a lookup set exactly once per statement execution and probes it per outer row
- * (`src/runtime/emit/subquery.ts`, `runSetProbe`). This replaced the earlier
- * eager-CacheNode mechanism, whose threshold could abandon the cache and re-drive
- * the subquery per outer row (see quereus-in-subquery-set-probe). The guarantee
- * these tests pin: the source is scanned exactly once per execution, independent
- * of outer cardinality and of any cache-threshold tuning.
+ * Two paths can serve the shape, and the guarantee pinned here is identical on
+ * both: the subquery source is scanned exactly once per statement execution,
+ * independent of outer cardinality and of any cache-threshold tuning.
+ *
+ * - Filter-position IN is rewritten by `rule-subquery-decorrelation`
+ *   (uncorrelated arm) into a hash semi join, whose build side drains the
+ *   source once. The filter-position tests below exercise this path — a plan
+ *   assertion verifies it, so a silently declined rewrite cannot turn these
+ *   into set-probe tests without failing.
+ * - Projection-position IN (and any shape the rewrite's gates decline) stays on
+ *   `emitIn`'s set probe (`src/runtime/emit/subquery.ts`, `runSetProbe`), which
+ *   materializes the lookup set once per execution. This replaced the earlier
+ *   eager-CacheNode mechanism, whose threshold could abandon the cache and
+ *   re-drive the subquery per outer row (see quereus-in-subquery-set-probe).
  *
  * These tests assert on `scanCounts.get('counting')` — the number of `query()`
  * opens on the subquery source table.
  */
-describe('IN-subquery set probe: scan count', () => {
+describe('Uncorrelated IN subquery (semi join / set probe): scan count', () => {
 	let db: Database;
 	let module: CountingMemoryModule;
 
@@ -44,11 +51,29 @@ describe('IN-subquery set probe: scan count', () => {
 		return rows;
 	}
 
+	async function planNodeTypes(sql: string): Promise<string[]> {
+		const types: string[] = [];
+		for await (const r of db.eval("SELECT node_type FROM query_plan(?)", [sql])) {
+			types.push((r as { node_type: string }).node_type);
+		}
+		return types;
+	}
+
+	it('plans filter-position IN as a join and projection-position IN as a set probe', async () => {
+		// Guards which path the scan-count tests below actually exercise: if the
+		// decorrelation gates ever silently decline this shape, the filter tests
+		// would quietly revert to measuring the set probe.
+		const filterTypes = await planNodeTypes('select id from probe where x in (select k from counting)');
+		expect(filterTypes, 'filter-position IN must rewrite to a semi join').to.not.include('In');
+		const projTypes = await planNodeTypes('select id, x in (select k from counting) as m from probe');
+		expect(projTypes, 'projection-position IN must keep the set-probe InNode').to.include('In');
+	});
+
 	it('scans the subquery source exactly once when every outer row matches', async () => {
 		// Every probe.x ∈ {1,2,3} matches counting {1,2,3} — the match-heavy case
 		// that defeated the old streaming cache (IN short-circuited on first match
-		// before the cache committed). The set probe builds once and answers every
-		// outer row from the set.
+		// before the cache committed). The semi join's build side drains once and
+		// answers every outer row from the built table.
 		await db.exec("INSERT INTO probe VALUES (1, 1), (2, 2), (3, 3)");
 
 		module.scanCounts.clear();
@@ -62,9 +87,9 @@ describe('IN-subquery set probe: scan count', () => {
 	});
 
 	it('still scans once when a leading NULL-condition outer row precedes matches', async () => {
-		// A NULL IN-expression makes emitIn return NULL WITHOUT iterating the source,
-		// so that eval drives no scan; the set builds lazily on the first eval that
-		// actually needs it. Total scans stay 1 regardless of row order.
+		// A NULL outer key never matches (semi join) / returns NULL without forcing
+		// the build (set probe). Either way total scans stay 1 regardless of row
+		// order.
 		await db.exec("INSERT INTO probe VALUES (1, NULL), (2, 2), (3, 3)");
 
 		module.scanCounts.clear();
@@ -81,9 +106,10 @@ describe('IN-subquery set probe: scan count', () => {
 	it('scans once regardless of the (now-irrelevant) cache threshold', async () => {
 		// Regression for the O(N×K) cliff: the old eager CacheNode abandoned its
 		// buffer once the source exceeded `cte.maxCacheThreshold`, then re-drove the
-		// subquery per outer row (one scan per outer row). The set probe has no size
-		// threshold, so forcing the tuning knob low must NOT reintroduce re-scans —
-		// the source is still drained exactly once.
+		// subquery per outer row (one scan per outer row). Neither the hash semi
+		// join's build nor the set probe has a size threshold, so forcing the tuning
+		// knob low must NOT reintroduce re-scans — the source is still drained
+		// exactly once.
 		const base = db.optimizer.tuning;
 		db.optimizer.updateTuning({
 			...base,
@@ -114,15 +140,34 @@ describe('IN-subquery set probe: scan count', () => {
 			expect(run1).to.have.lengthOf(3);
 			expect(module.scanCounts.get('counting'), 'first execution scans once').to.equal(1);
 
-			// A fresh RuntimeContext per execution means a fresh set build — not a
+			// A fresh RuntimeContext per execution means a fresh build — not a
 			// stale replay of run 1, and not zero scans.
 			module.scanCounts.clear();
 			const run2: Record<string, unknown>[] = [];
 			for await (const row of stmt.all()) run2.push(row);
 			expect(run2).to.have.lengthOf(3);
-			expect(module.scanCounts.get('counting'), 'second execution re-builds the set once').to.equal(1);
+			expect(module.scanCounts.get('counting'), 'second execution re-builds once').to.equal(1);
 		} finally {
 			await stmt.finalize();
 		}
+	});
+
+	it('projection-position IN (set-probe path) also scans exactly once', async () => {
+		// The shape the semi-join rewrite must NOT touch: the three-valued result
+		// is projected per row, and the set probe still drains the source once.
+		await db.exec("INSERT INTO probe VALUES (1, 1), (2, NULL), (3, 9)");
+
+		module.scanCounts.clear();
+		const rows = await allRows<{ id: number; m: unknown }>(
+			'select id, x in (select k from counting) as m from probe order by id'
+		);
+		expect(rows).to.deep.equal([
+			{ id: 1, m: true },
+			{ id: 2, m: null },
+			{ id: 3, m: false },
+		]);
+		expect(module.scanCounts.get('counting'),
+			'the set probe materializes the lookup set exactly once per execution'
+		).to.equal(1);
 	});
 });

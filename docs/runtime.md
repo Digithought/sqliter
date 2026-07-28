@@ -1209,12 +1209,13 @@ an impure-path implementation that applies two contracts:
   re-driving the inner DML once per run.
 
 Both contracts are gated by `physical.readonly === false` on the inner — pure
-subqueries take a non-impure path. For `IN`, that path splits again: an
-uncorrelated + functional source is materialized once per execution into a
-probed lookup set (`runSetProbe`; see [Runtime caching § IN-subquery set probe](runtime-caching.md#in-subquery-set-probe)),
-while a correlated or non-deterministic source keeps the per-outer-row streaming
-short-circuit. Scalar / `EXISTS` pure inners take their unchanged short-circuit
-fast path. See `src/runtime/emit/subquery.ts` for the emitter source.
+subqueries take a non-impure path. `IN` splits again: an uncorrelated +
+functional source is materialized once per execution into a probed lookup set
+([Runtime caching § IN-subquery set probe](runtime-caching.md#in-subquery-set-probe)
+— filter-position shapes mostly decorrelate to semi joins and skip
+`emitIn`), while correlated / non-deterministic sources keep the
+per-outer-row streaming short-circuit. Scalar / `EXISTS` pure inners keep their
+short-circuit fast path (`src/runtime/emit/subquery.ts`).
 
 DML in expression position is rejected as a view body at view-creation time
 (`src/planner/building/create-view.ts`). A view body re-evaluates on every
