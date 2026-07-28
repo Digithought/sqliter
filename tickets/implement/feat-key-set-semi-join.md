@@ -216,8 +216,10 @@ is nothing to gain.
 scan is a cost question, and cost authority belongs to the module. Two probes give the
 module's real numbers at two points; the linear fit between them is an approximation, but it
 is the module's approximation, not a second cost model living in the optimizer. Probe A uses
-`maxCount: 2` rather than 1 deliberately: at 1 the store returns a plain `eqSeek` plan on a
-different cost basis, which would skew the line.
+`maxCount: 2` rather than 1 only to keep the two probe points distinct; both modules now
+take the multi-seek arm at `maxCount: 1` too (a runtime set is delivered as a `plan=5`
+multi-seek whatever its ceiling), so 1 would price on the same basis — it just gives a
+shorter, noisier baseline for the slope.
 
 ### Rewrite
 

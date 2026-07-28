@@ -158,6 +158,15 @@ describe('StoreModule runtime-valued IN sets (feat-runtime-key-set-protocol)', (
 			expect(result.explains).to.match(/exceeds the 1000-seek cap/);
 		});
 
+		it('takes the multi-seek arm at maxCount=1 rather than the plain-EQ arm', () => {
+			// The ceiling arithmetic says one seek key, but the engine still delivers a
+			// `plan=5` multi-seek — so the plan must not advertise a unique-row EQ seek.
+			const result = plan('t', [runtimeSetFilter(1, 1)]);
+			expect(result.handledFilters).to.deep.equal([true]);
+			expect(result.isSet, 'a multi-seek is not a set').to.be.false;
+			expect(result.explains).to.match(/multi-seek\(1\)/);
+		});
+
 		it('ignores estimatedCount: present and absent plan identically', () => {
 			expect(plan('t', [runtimeSetFilter(1, 25, 3)])).to.deep.equal(plan('t', [runtimeSetFilter(1, 25)]));
 		});

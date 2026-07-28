@@ -59,7 +59,16 @@ export interface RuntimeSetSpec {
 	 * back to a full scan on its own.
 	 */
 	readonly maxCount: number;
-	/** Planner's estimate of the actual count, when it has one. Advisory. */
+	/**
+	 * Planner's estimate of the actual count, when it has one. Advisory — a module may
+	 * price against it but must still be correct for any count in `1..maxCount`. When
+	 * present it is an integer in `0..maxCount` (0 meaning "probably empty").
+	 *
+	 * NOTE: no shipped module reads this — both price against `maxCount`, i.e. worst case.
+	 * If the engine ever probes with a large ceiling for a typically tiny set, those plans
+	 * will look more expensive than they are and may lose to a scan they should beat;
+	 * blend `estimatedCount` into the cost (not into the safety gates) at that point.
+	 */
 	readonly estimatedCount?: number;
 }
 
@@ -419,7 +428,9 @@ export class AccessPlanBuilder {
  *
  * The checks are all on {@link RuntimeSetSpec}: it must ride an `IN`, it must not carry
  * plan-time `value`s (a module reading `value` on a runtime set would seek on garbage),
- * and its ceiling must be a usable count.
+ * its ceiling must be a usable count, and an advisory `estimatedCount` must fall within
+ * that ceiling — an estimate above `maxCount` describes a set the engine has promised
+ * never to deliver, so it is an engine bug rather than a pessimistic guess.
  */
 export function validateAccessPlanRequest(request: BestAccessPlanRequest): void {
 	for (const filter of request.filters) {
@@ -437,10 +448,16 @@ export function validateAccessPlanRequest(request: BestAccessPlanRequest): void 
 				StatusCode.FORMAT
 			);
 		}
-		const maxCount = filter.runtimeSet.maxCount;
+		const { maxCount, estimatedCount } = filter.runtimeSet;
 		if (!Number.isInteger(maxCount) || maxCount < 1) {
 			quereusError(
 				`runtimeSet.maxCount must be an integer >= 1, got ${maxCount} on column ${filter.columnIndex}`,
+				StatusCode.FORMAT
+			);
+		}
+		if (estimatedCount !== undefined && (!Number.isInteger(estimatedCount) || estimatedCount < 0 || estimatedCount > maxCount)) {
+			quereusError(
+				`runtimeSet.estimatedCount must be an integer in 0..${maxCount}, got ${estimatedCount} on column ${filter.columnIndex}`,
 				StatusCode.FORMAT
 			);
 		}

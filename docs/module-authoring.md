@@ -193,7 +193,7 @@ Three corollaries worth spelling out:
 `where col in (select …)` has no plan-time values. It arrives with `op: 'IN'`, **no
 `value`**, and `runtimeSet: { maxCount, estimatedCount? }` instead — *"an `IN` over
 `columnIndex` with 1..`maxCount` values I cannot name"*. The two fields are mutually
-exclusive; `estimatedCount` is advisory.
+exclusive; `estimatedCount` is an advisory integer in `0..maxCount`.
 
 Accepting it (`handledFilters[i] = true`, plus `indexName` and `seekColumnIndexes`)
 promises one thing: you can serve that column as a multi-seek on the named index. In

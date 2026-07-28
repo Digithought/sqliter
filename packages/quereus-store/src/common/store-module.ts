@@ -3056,9 +3056,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// ever be asked to perform.
 		const eqCols: number[] = [];
 		let inCount = 1;
-		// A runtime set is a multi-seek even at `maxCount === 1`: the engine still delivers
-		// it as a `plan=5` multi-seek, so the gates below must judge it as one rather than
-		// as the plain EQ its ceiling arithmetic would otherwise suggest.
+		// `isMultiSeek` is NOT `inCount > 1`: a runtime set is delivered as a `plan=5`
+		// multi-seek even at `maxCount === 1`, so the gates below must judge it as one
+		// rather than as the plain EQ its ceiling arithmetic would otherwise suggest.
+		// (`inCount > 1` implies this flag — every factor above 1 is a multi-value
+		// equality — so the flag only ever *adds* the maxCount-1 runtime-set case.)
 		let isMultiSeek = false;
 		for (const colIdx of indexColIndexes) {
 			const eqFilter = request.filters.find(f => f.columnIndex === colIdx && equalitySeekKeyCount(f) !== null);
@@ -3067,7 +3069,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			inCount *= equalitySeekKeyCount(eqFilter)!;
 			if (isMultiValueEquality(eqFilter)) isMultiSeek = true;
 		}
-		if (inCount > 1) isMultiSeek = true;
 		const leadingCol = indexColIndexes[0];
 		const hasLeadingRange = request.filters.some(
 			f => f.columnIndex === leadingCol && RANGE_OPS.includes(f.op),

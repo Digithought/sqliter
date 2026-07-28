@@ -144,6 +144,19 @@ describe('runtime-valued IN sets (feat-runtime-key-set-protocol)', () => {
 			expect(() => validateAccessPlan(request(runtimeSetFilter(0, 2.5)), scanResult)).to.throw(/maxCount must be an integer/i);
 			expect(() => validateAccessPlan(request(runtimeSetFilter(0, Number.NaN)), scanResult)).to.throw(/maxCount must be an integer/i);
 		});
+
+		it('accepts an estimatedCount of 0 ("probably empty")', () => {
+			expect(() => validateAccessPlan(request(runtimeSetFilter(0, 10, 0)), scanResult)).not.to.throw();
+		});
+
+		it('rejects an estimatedCount outside 0..maxCount or not an integer', () => {
+			// An estimate above the ceiling describes a set the engine promised never to
+			// deliver — an engine bug, not a pessimistic guess.
+			for (const bad of [11, -1, 2.5, Number.NaN]) {
+				expect(() => validateAccessPlan(request(runtimeSetFilter(0, 10, bad)), scanResult), `estimatedCount = ${bad}`)
+					.to.throw(/estimatedCount must be an integer in 0\.\.10/i);
+			}
+		});
 	});
 
 	// A third-party module written before `runtimeSet` existed: its only IN
@@ -278,6 +291,18 @@ describe('runtime-valued IN sets (feat-runtime-key-set-protocol)', () => {
 
 			const runtime = plan('ct', [runtimeSetFilter(1, 1)], orderByB);
 			expect(runtime.providesOrdering, 'a maxCount=1 runtime set does not pin a').to.be.undefined;
+		});
+
+		it('reports a maxCount=1 runtime set as a multi-seek, not a unique-row seek', () => {
+			// A literal `IN (x)` is one seek key and yields a set; a runtime set is delivered
+			// as a `plan=5` multi-seek whatever its ceiling, so `isSet` must not be claimed.
+			// This is the same divergence the store module's `isMultiSeek` flag encodes.
+			const runtime = plan('t', [runtimeSetFilter(1, 1)]);
+			expect(runtime.handledFilters).to.deep.equal([true]);
+			expect(runtime.isSet, 'a multi-seek is not a set').to.be.false;
+			expect(runtime.explains).to.match(/multi-seek/i);
+
+			expect(plan('t', [literalInFilter(1, 1)]).isSet, 'a single-valued literal IN still is').to.be.true;
 		});
 
 		it('claims the FIRST role-filling filter when a runtime set and a literal IN share a column', () => {

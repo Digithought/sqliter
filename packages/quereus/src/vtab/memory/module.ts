@@ -490,8 +490,12 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		if (equalityMatches.matchCount === indexCols.length) {
 			// Perfect equality match on all index columns - index seek (or multi-seek for IN)
 			const seekCols = indexCols.slice(0, equalityMatches.matchCount).map(c => c.index);
-			const { inCardinality } = equalityMatches;
-			const isMultiSeek = inCardinality > 1;
+			const { inCardinality, isMultiSeek } = equalityMatches;
+			// NOTE: no seek-key cap and no per-seek positioning term here (the store has both:
+			// MAX_MULTI_SEEK_KEYS and inCount * INDEX_SEEK_COST), so a large multi-seek over a
+			// small memory table prices optimistically. Harmless while every seek-key list is a
+			// literal the author typed; if runtime-valued IN sets start arriving with large
+			// ceilings, add the positioning term so the two modules stay comparable.
 			return AccessPlanBuilder
 				.eqMatch(inCardinality)
 				.setHandledFilters(equalityMatches.handledFilters)
@@ -578,14 +582,19 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * `rule-select-access-path` makes — so a request carrying both a runtime set and a
 	 * literal `IN` on one column seeks whichever came first in `filters` order, and the
 	 * other survives as a residual.
+	 *
+	 * `isMultiSeek` is NOT `inCardinality > 1`: a runtime set is delivered as a multi-seek
+	 * whatever its ceiling, so a `maxCount === 1` set has cardinality 1 yet still walks the
+	 * index in seek-key order. {@link isMultiValueEquality} is the authority.
 	 */
 	private findEqualityMatches(
 		indexCols: ReadonlyArray<IndexColumnSchema>,
 		filters: readonly PredicateConstraint[]
-	): { matchCount: number; handledFilters: boolean[]; inCardinality: number } {
+	): { matchCount: number; handledFilters: boolean[]; inCardinality: number; isMultiSeek: boolean } {
 		const handledFilters = new Array(filters.length).fill(false);
 		let matchCount = 0;
 		let inCardinality = 1;
+		let isMultiSeek = false;
 
 		for (const indexCol of indexCols) {
 			let foundMatch = false;
@@ -603,6 +612,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				foundMatch = true;
 				matchCount++;
 				inCardinality *= keyCount;
+				if (isMultiValueEquality(filter)) isMultiSeek = true;
 				break;
 			}
 			if (!foundMatch) {
@@ -610,7 +620,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			}
 		}
 
-		return { matchCount, handledFilters, inCardinality };
+		return { matchCount, handledFilters, inCardinality, isMultiSeek };
 	}
 
 	/**
