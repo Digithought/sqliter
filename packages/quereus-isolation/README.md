@@ -84,6 +84,29 @@ The isolation layer operates at the **row level**, merging query results from tw
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Reading a pushed index window
+
+When the underlying serves a read through an index seek, the overlay must be narrowed to
+the same window — otherwise a staged row outside it would leak into the answer. The
+overlay is full-scanned (it cannot resolve an index name the underlying minted for its own
+plan), and `IsolatedTable`'s constraint matcher re-applies the pushed window itself. Several
+equality constraints on the *same* column are read as an **IN set**, not as an AND: that is
+how an `IN`-list seek is encoded — one equality per seek value — so an AND reading would
+match nothing and silently drop every staged row.
+
+This holds for a set of values that only exists at run time (`where v in (select …)`,
+which the engine may materialize and push down as a seek) exactly as it does for a literal
+`in (1, 2, 3)`: the pushed window has the same shape either way, and this layer cannot —
+and need not — tell them apart.
+
+One ordering caveat. The **primary-key** merge walks both streams in ascending key order.
+The engine sorts a run-time key set before pushing it, so that path arrives in order. A
+**literal** list does not: `where pk in (3, 1, 2)` is visited in list order, and with rows
+staged in the transaction the merge mis-pairs them — a staged update can surface alongside
+the stale stored row, and a staged delete can reappear. That is tracked as
+`backlog/bug-isolation-multiseek-merge-order`; the secondary-index merge is unaffected
+(it sorts the overlay itself and excludes shadowed rows by primary key).
+
 ## Isolation Level
 
 The guarantee this layer actually provides is closer to **read-committed with

@@ -98,6 +98,45 @@ DELETE FROM selfref WHERE x IN (SELECT x FROM selfref WHERE x <= 20);
 SELECT pk FROM selfref ORDER BY pk;
 → [{"pk":3},{"pk":4}]
 
+-- ===== Shapes that leave the runtime free to seek =====
+--
+-- Every case above pins its rows with `ORDER BY <a column the target's own walk
+-- already provides>`. Both backends absorb that sort into the target leaf, which
+-- marks the leaf's emission order load-bearing and makes the rewrite decline — so
+-- those cases exercise the surviving hash semi join, not the seek. The aggregate
+-- forms below need no ORDER BY, so the runtime may push the multi-seek. Same
+-- answers either way, which is exactly the property being pinned.
+
+CREATE TABLE seekt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_seekt_v ON seekt(v);
+CREATE TABLE seekk (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO seekt VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, NULL);
+INSERT INTO seekk VALUES (1, 10), (2, 30), (3, 30), (4, 777);
+
+SELECT count(*) AS c, sum(v) AS s FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":2,"s":40}]
+
+-- Empty key set through the same shape.
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk WHERE k > 10000);
+→ [{"c":0}]
+
+-- Read-your-own-writes: rows staged in an open transaction must be visible through
+-- whichever access path the runtime chose — a seek reads each window through the
+-- same effective-row merge a full scan does.
+BEGIN;
+INSERT INTO seekt VALUES (6, 777);
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":3}]
+UPDATE seekt SET v = 30 WHERE pk = 2;
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":4}]
+DELETE FROM seekt WHERE pk = 1;
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":3}]
+COMMIT;
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":3}]
+
 -- Multi-row DELETE inside an explicit transaction: each seek window is a
 -- distinct key; deleting rows mid-statement must not disturb later windows.
 CREATE TABLE txt (pk INTEGER PRIMARY KEY, v INTEGER NULL);

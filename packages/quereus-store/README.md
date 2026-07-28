@@ -68,6 +68,16 @@ still correct, just not accelerated. `IN` on the primary key currently scans (se
 `feat-store-pk-in-list-multiseek`). Index choice among several usable indexes is
 first-match, not cheapest — see backlog `bug-store-index-choice-ignores-cost`.
 
+The same multi-seek path also serves an `IN` whose values only exist once the query runs
+— `where v in (select … )`, which the engine may materialize into a set and hand down as
+a seek (its `KeySetSemiJoin`). **Nothing in this module distinguishes the two.** The
+engine stamps a `FilterInfo` byte-identical in shape to a literal list's, so every gate
+above applies unchanged: the 1000-key cap, the semantic-ordering decline, the key-collation
+guard, the partial-index exclusion, and the primary-key arm's refusal of any `IN`. At plan
+time such a set describes itself only by a ceiling (`PredicateConstraint.runtimeSet.maxCount`),
+which is what the cost and cap arithmetic judges. The engine also re-checks every row the
+seek returns, so an over-fetching window costs only time.
+
 **Catalog DDL is re-persisted on catalog-only mutations.** `ALTER … SET TAGS` (and the programmatic `setTableTags` / `setColumnTags` / `setConstraintTags` / `setViewTags` / `setMaterializedViewTags`), plus `CREATE`/`DROP VIEW` and `CREATE`/`DROP MATERIALIZED VIEW`, never reach `module.alterTable`/`module.destroy`. The module subscribes to the engine's schema-change events (`table_modified`, the `view_*` events, and the `materialized_view_*` events) and writes the matching `__catalog__` entry when its `generate*DDL` output changes — table / column / constraint / **index** / **view** / **materialized-view** tags, and view/MV lifecycle, all survive close → reopen. A table's bundle is its `CREATE TABLE` DDL, one `CREATE [UNIQUE] INDEX` line per secondary index, and one trailing `alter index … set tags (…)` line per *exposed implicit index* carrying user tags (an exposed implicit index is never materialized in the store's *engine-facing* schema — only in its internal enforcement schema, see the implicit-index note below — so its `UniqueConstraintSchema.exposedIndexTags` has no `CREATE INDEX` line to ride; the alter line re-applies silently on import). These async writes are serialized and drained by `closeAll()` (or the `whenCatalogPersisted()` barrier) before the provider closes. On reopen, `rehydrateCatalog` classifies entries by key prefix and imports them in phases — tables → views → materialized views, all through the engine's `importCatalog` (MVs re-materialize silently via the shared create core, dependency-ordered for MV-over-MV by fixpoint retry). See [`docs/schema.md`](../../docs/schema.md#view-and-materialized-view-persistence) for the full design.
 
 **How a UNIQUE constraint is enforced.** For each row written, the store looks for a conflicting row through the cheapest sound route available:
