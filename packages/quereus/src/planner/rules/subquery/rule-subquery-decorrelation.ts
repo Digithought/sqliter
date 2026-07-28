@@ -1,21 +1,39 @@
 /**
  * Rule: Subquery Decorrelation
  *
- * Transforms correlated EXISTS and IN subqueries in WHERE-clause FilterNode
- * predicates into equivalent semi/anti joins, enabling hash join selection
- * and eliminating per-row re-execution of the inner query.
+ * Transforms EXISTS and IN subqueries in WHERE-clause FilterNode predicates
+ * into equivalent semi/anti joins, enabling hash join selection and
+ * eliminating per-row re-execution (correlated) or set-probe evaluation
+ * (uncorrelated) of the inner query.
  *
  * Transformations:
  *   Filter[EXISTS(correlated)](outer)  →  SemiJoin[corr_pred](outer, inner)
  *   Filter[NOT EXISTS(correlated)](outer) → AntiJoin[corr_pred](outer, inner)
  *   Filter[col IN (correlated subquery)](outer) → SemiJoin[col = inner.col](outer, inner)
+ *   Filter[col IN (uncorrelated subquery)](outer) → SemiJoin[col = inner.col0](outer, inner)
  *
  * Applicability:
  * - FilterNode with top-level ExistsNode, NOT ExistsNode, or InNode (subquery variant)
- * - Subquery is correlated (references outer attributes)
- * - Correlation predicate is a simple equi-join condition (col = col across inner/outer)
+ * - Correlated arms: subquery references outer attributes and the correlation
+ *   predicate is a simple equi-join condition (col = col across inner/outer)
+ * - Uncorrelated IN arm: bare outer column on the left of IN, deterministic
+ *   read-only inner, hashable synthesized equi-pair, and agreeing IN/`=`
+ *   collation resolutions (see `extractUncorrelatedIn`). The inner tree is used
+ *   VERBATIM as the join's right side — no descent, so inner LIMIT / DISTINCT /
+ *   set-ops / CTE bodies are preserved as-is.
  *
- * NOT IN is deferred due to NULL semantics complexity.
+ * Why the uncorrelated IN rewrite is sound in WHERE position ONLY: `x IN S` is
+ * three-valued — it yields NULL (not FALSE) when `x` is NULL, or when there is
+ * no match and `S` contains a NULL. A FilterNode predicate collapses NULL to
+ * "drop the row", and a semi join also drops a row with no match (NULL never
+ * equals under `=`), so under a WHERE filter the two agree on every case.
+ * Projection-position IN must keep its three-valued answer and stays on the
+ * runtime set-probe path (`emitIn`), which also remains the fallback whenever
+ * any gate declines.
+ *
+ * NOT IN is deferred due to NULL semantics complexity (the parser builds it as
+ * UnaryOp(NOT) over the InNode, so it never matches these top-level-conjunct
+ * shapes).
  *
  * A SECOND ANCHOR (`ruleExistsInSelectDecorrelation`, ProjectNode) handles the
  * same subqueries appearing in a SELECT list, where a semi/anti join cannot be
@@ -44,6 +62,8 @@ import { PlanNodeType } from '../../nodes/plan-node-type.js';
 import { splitConjuncts, combineConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { isEquiCorrelation, collectDefinedAttrIds, referencesAnyAttr } from '../../analysis/equi-correlation.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { extractEquiPairs } from '../join/equi-pair-extractor.js';
+import { resolveComparisonCollation, resolveInCollationForNode } from '../../analysis/comparison-collation.js';
 
 const log = createLogger('optimizer:rule:subquery-decorrelation');
 
@@ -54,6 +74,12 @@ interface DecorrelationCandidate {
 	joinType: JoinType;
 	/** The scalar node in the filter predicate that matched (ExistsNode, UnaryOpNode wrapping ExistsNode, or InNode) */
 	predicateNode: ScalarPlanNode;
+	/**
+	 * True for the uncorrelated filter-position IN arm: the subquery tree is used
+	 * verbatim as the join's right side via `extractUncorrelatedIn` instead of the
+	 * correlation-lifting `extractInCorrelation` descent.
+	 */
+	uncorrelatedIn?: boolean;
 }
 
 /**
@@ -79,12 +105,15 @@ function identifyCandidate(node: ScalarPlanNode): DecorrelationCandidate | null 
 		return null;
 	}
 
-	// col IN (correlated subquery)
+	// col IN (subquery) — correlated and uncorrelated take different extractions
 	if (node instanceof InNode && node.source && !node.values) {
 		if (isCorrelatedSubquery(node.source)) {
 			return { subqueryNode: node, joinType: 'semi', predicateNode: node };
 		}
-		return null;
+		// Uncorrelated filter-position IN: semi join ≡ IN under WHERE's NULL
+		// collapse (see the rule header). Gates live in extractUncorrelatedIn;
+		// any decline leaves the InNode on the runtime set-probe path.
+		return { subqueryNode: node, joinType: 'semi', predicateNode: node, uncorrelatedIn: true };
 	}
 
 	return null;
@@ -269,88 +298,198 @@ function extractInCorrelation(
 	};
 }
 
-export function ruleSubqueryDecorrelation(node: PlanNode, _context: OptContext): PlanNode | null {
-	if (!(node instanceof FilterNode)) return null;
+interface UncorrelatedInRewrite {
+	/**
+	 * `inNode.source`, verbatim — no descent through Project/Alias, so the first
+	 * output attribute is exposed by construction, no inner predicate can be
+	 * dropped, and an inner LIMIT / DISTINCT / set-op / CTE body is preserved
+	 * as-is.
+	 */
+	right: RelationalPlanNode;
+	/** The synthesized `outer.col = right.col0` equi-join condition. */
+	condition: ScalarPlanNode;
+}
 
+/**
+ * Recognize an uncorrelated filter-position `col IN (subquery)` and build the
+ * semi-join right side + condition. Every gate declines to `null`, leaving the
+ * InNode on the runtime set-probe path (`emitIn`) — the O(K + N·log K) floor;
+ * a decline only costs the better plan, never correctness.
+ */
+function extractUncorrelatedIn(
+	inNode: InNode,
+	outerAttrIds: Set<number>
+): UncorrelatedInRewrite | null {
+	const right = inNode.source;
+	if (!right) return null;
+
+	// Gate: bare outer column on the left of IN. A non-column left side would
+	// fail the equi-pair gate below anyway; requiring it up front keeps the
+	// decline reason in one place.
+	if (!(inNode.condition instanceof ColumnReferenceNode)) return null;
+	const outerColRef = inNode.condition;
+	if (!outerAttrIds.has(outerColRef.attributeId)) return null;
+
+	// Gate: mirror the runtime set probe's own admission (emitIn's uncorrelated
+	// arm requires a functional source) so the two paths accept the same shapes.
+	// A non-deterministic inner must keep its per-outer-row evaluation
+	// semantics; side effects were already refused by the caller.
+	if (!PlanNodeCharacteristics.isFunctional(right)) return null;
+
+	// Build-time validation guarantees an IN subquery exposes exactly one column.
+	const innerAttr = right.getAttributes()[0];
+	if (!innerAttr) return null;
+
+	// Synthesize `outer.col = inner.col0`, giving the inner reference its OWN
+	// AST rather than reusing the outer column's expression (which is why the
+	// correlated arm's condition renders as the nonsense `a.x = a.x` in EXPLAIN).
+	const innerColRef = new ColumnReferenceNode(
+		outerColRef.scope,
+		{ type: 'column', name: innerAttr.name },
+		innerAttr.type,
+		innerAttr.id,
+		0 // column index in the inner relation
+	);
+	const condition = new BinaryOpNode(
+		outerColRef.scope,
+		{ type: 'binary', operator: '=', left: outerColRef.expression, right: innerColRef.expression },
+		outerColRef,
+		innerColRef
+	);
+
+	// Gate (the O(N×K)-floor guardrail): the synthesized condition must survive
+	// the SAME extraction rule-join-physical-selection uses, as exactly one
+	// equi-pair with no residual. That is that rule's only structural
+	// precondition, so the join always reaches its hash/merge/NL cost
+	// comparison with a usable hashable pair — the inner side is materialized
+	// once (hash build) rather than re-driven per outer row. This also folds in
+	// the collation-conflict and semantic-ordering-agreement declines (a mixed
+	// TIMESPAN/TEXT pair keeps the set-probe path, whose semanticKeyTransform
+	// handles it).
+	// NOTE: nested loop can still win the cost comparison when the OUTER is
+	// tiny (L ≤ ~2 under current COST_CONSTANTS); rule-nested-loop-right-cache
+	// then wraps the uncorrelated right in a CacheNode whose abandon threshold
+	// is the subject of backlog/bug-cache-threshold-abandon-cliff. A one-row
+	// outer scanning the inner once is not a cliff, so that interaction is
+	// confined to the harmless quadrant.
+	const rightAttrIds = new Set(right.getAttributes().map(a => a.id));
+	const extraction = extractEquiPairs(condition, outerAttrIds, rightAttrIds);
+	if (!extraction || extraction.equiPairs.length !== 1 || extraction.residual) return null;
+
+	// Gate: the IN membership collation and the synthesized `=`'s collation
+	// must both resolve (no conflict) to the SAME name — a divergence would
+	// silently change which rows match. `inRhsTypes` reduces a subquery RHS to
+	// its single output column's type, the same operand pair the `=` sees, so
+	// agreement is expected; assert it rather than assume it.
+	const inResolution = resolveInCollationForNode(inNode);
+	const eqResolution = resolveComparisonCollation(inNode.condition.getType(), innerAttr.type);
+	if (inResolution.kind !== 'resolved' || eqResolution.kind !== 'resolved'
+		|| inResolution.name !== eqResolution.name) {
+		return null;
+	}
+
+	return { right, condition };
+}
+
+/**
+ * Decorrelate the first rewritable EXISTS/IN conjunct of one FilterNode.
+ * Returns the semi/anti join (with any remaining conjuncts re-wrapped in a
+ * FilterNode above it), or null when no conjunct rewrites.
+ */
+function decorrelateOneConjunct(node: FilterNode): PlanNode | null {
 	const outerSource = node.source;
 	const outerAttrIds = new Set(outerSource.getAttributes().map(a => a.id));
 
 	// Split the filter predicate into conjuncts
 	const conjuncts = splitConjuncts(node.predicate);
 
-	// Find the first decorrelation candidate
-	let candidateIndex = -1;
-	let candidate: DecorrelationCandidate | null = null;
-
 	for (let i = 0; i < conjuncts.length; i++) {
-		candidate = identifyCandidate(conjuncts[i]);
-		if (candidate) {
-			candidateIndex = i;
-			break;
+		const candidate = identifyCandidate(conjuncts[i]);
+		if (!candidate) continue;
+
+		// Decorrelating EXISTS/IN into a semi/anti join changes how many times the
+		// inner subquery's subtree executes (per outer row → once per matching outer
+		// row in the semi-join driver). Refuse on impure inners so DML-bearing
+		// subqueries keep their declared per-row firing.
+		const innerRoot = candidate.subqueryNode instanceof ExistsNode
+			? candidate.subqueryNode.subquery
+			: (candidate.subqueryNode as InNode).source;
+		if (innerRoot && PlanNodeCharacteristics.subtreeHasSideEffects(innerRoot)) {
+			log('Decorrelation skipped: inner subquery has side effects');
+			continue;
 		}
+
+		log('Found %s decorrelation candidate in filter predicate', candidate.joinType);
+
+		// Extract the join right side and condition based on the candidate arm
+		let joinRight: RelationalPlanNode;
+		let joinCondition: ScalarPlanNode;
+
+		if (candidate.uncorrelatedIn) {
+			const rewrite = extractUncorrelatedIn(candidate.subqueryNode as InNode, outerAttrIds);
+			if (!rewrite) {
+				log('Uncorrelated IN gates declined; conjunct keeps the set-probe path');
+				continue;
+			}
+			joinRight = rewrite.right;
+			joinCondition = rewrite.condition;
+		} else {
+			const extraction = candidate.subqueryNode instanceof ExistsNode
+				? extractExistsCorrelation(candidate.subqueryNode.subquery, outerAttrIds)
+				: extractInCorrelation(candidate.subqueryNode as InNode, outerAttrIds);
+			if (!extraction) {
+				log('Could not extract simple equi-correlation; skipping conjunct');
+				continue;
+			}
+			// If there are residual inner-only predicates, wrap the inner in a FilterNode
+			joinRight = extraction.residualInnerFilter
+				? new FilterNode(extraction.innerSource.scope, extraction.innerSource, extraction.residualInnerFilter)
+				: extraction.innerSource;
+			joinCondition = extraction.correlationCondition;
+		}
+
+		// Build the semi/anti join
+		const joinNode = new JoinNode(
+			outerSource.scope,
+			outerSource,
+			joinRight,
+			candidate.joinType,
+			joinCondition
+		);
+
+		log('Decorrelated %s subquery into %s JOIN', candidate.subqueryNode.nodeType, candidate.joinType.toUpperCase());
+
+		// If there are remaining conjuncts in the original filter, wrap in a new FilterNode
+		const remainingConjuncts = conjuncts.filter((_, j) => j !== i);
+		if (remainingConjuncts.length > 0) {
+			const residualPredicate = combineConjuncts(remainingConjuncts)!;
+			return new FilterNode(node.scope, joinNode, residualPredicate);
+		}
+
+		return joinNode;
 	}
 
-	if (!candidate || candidateIndex === -1) return null;
+	return null;
+}
 
-	// Decorrelating EXISTS/IN into a semi/anti join changes how many times the
-	// inner subquery's subtree executes (per outer row → once per matching outer
-	// row in the semi-join driver). Refuse on impure inners so DML-bearing
-	// subqueries keep their declared per-row firing.
-	const innerRoot = candidate.subqueryNode instanceof ExistsNode
-		? candidate.subqueryNode.subquery
-		: (candidate.subqueryNode as InNode).source;
-	if (innerRoot && PlanNodeCharacteristics.subtreeHasSideEffects(innerRoot)) {
-		log('Decorrelation skipped: inner subquery has side effects');
-		return null;
+export function ruleSubqueryDecorrelation(node: PlanNode, _context: OptContext): PlanNode | null {
+	if (!(node instanceof FilterNode)) return null;
+
+	// The engine never re-offers a rule its own output (see pass.ts), so loop
+	// internally: each iteration decorrelates ONE conjunct, and a residual
+	// FilterNode output feeds the next iteration. Two IN conjuncts in one WHERE
+	// thus become two stacked semi joins (the second joins against the first as
+	// its outer). Terminates: every successful iteration removes one conjunct.
+	let result: PlanNode | null = null;
+	let current: FilterNode = node;
+	for (;;) {
+		const rewritten = decorrelateOneConjunct(current);
+		if (!rewritten) break;
+		result = rewritten;
+		if (!(rewritten instanceof FilterNode)) break;
+		current = rewritten;
 	}
-
-	log('Found %s decorrelation candidate in filter predicate', candidate.joinType);
-
-	// Extract correlation info based on subquery type
-	let extraction: {
-		innerSource: RelationalPlanNode;
-		correlationCondition: ScalarPlanNode;
-		residualInnerFilter: ScalarPlanNode | null;
-	} | null = null;
-
-	if (candidate.subqueryNode instanceof ExistsNode) {
-		extraction = extractExistsCorrelation(candidate.subqueryNode.subquery, outerAttrIds);
-	} else if (candidate.subqueryNode instanceof InNode) {
-		extraction = extractInCorrelation(candidate.subqueryNode, outerAttrIds);
-	}
-
-	if (!extraction) {
-		log('Could not extract simple equi-correlation; skipping decorrelation');
-		return null;
-	}
-
-	const { innerSource, correlationCondition, residualInnerFilter } = extraction;
-
-	// Build the inner side: if there are residual inner-only predicates, wrap in FilterNode
-	let joinRight: RelationalPlanNode = innerSource;
-	if (residualInnerFilter) {
-		joinRight = new FilterNode(innerSource.scope, innerSource, residualInnerFilter);
-	}
-
-	// Build the semi/anti join
-	const joinNode = new JoinNode(
-		outerSource.scope,
-		outerSource,
-		joinRight,
-		candidate.joinType,
-		correlationCondition
-	);
-
-	log('Decorrelated %s subquery into %s JOIN', candidate.subqueryNode.nodeType, candidate.joinType.toUpperCase());
-
-	// If there are remaining conjuncts in the original filter, wrap in a new FilterNode
-	const remainingConjuncts = conjuncts.filter((_, i) => i !== candidateIndex);
-	if (remainingConjuncts.length > 0) {
-		const residualPredicate = combineConjuncts(remainingConjuncts)!;
-		return new FilterNode(node.scope, joinNode, residualPredicate);
-	}
-
-	return joinNode;
+	return result;
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
