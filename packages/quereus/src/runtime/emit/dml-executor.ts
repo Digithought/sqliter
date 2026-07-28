@@ -434,18 +434,13 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				return clause;
 			}
 
-			// Match when the proposed values equal the existing row at the clause's
-			// conflict-target columns — i.e. the conflict is on those columns —
-			// compared the way the constraint ENFORCES: under the constraint's
-			// enforcement collation. Both rows are already in declared (stored)
-			// form — the INSERT emitter converted the proposed row by static type —
-			// so an affinity-coerced conflict (`'1'` proposed into an INTEGER key
-			// holding `1`) arrives converted, and a collation-equal conflict (NOCASE
-			// case-variant, RTRIM trailing-space) is routed by the collation compare
-			// to the DO UPDATE / DO NOTHING arm rather than aborting with a UNIQUE
-			// error. The per-column collation functions are precomputed at emit; a
-			// BINARY, byte-identical key still compares 0 (well-formed seeds
-			// re-present byte-identical literals, so seed idempotency is unaffected).
+			// The conflict is on this clause's target columns when the proposed row
+			// equals the existing one there, compared the way the constraint ENFORCES
+			// (see {@link conflictTargetValuesMatch}): an affinity-coerced, a
+			// collation-equal or a semantically-equal conflict all route to the DO
+			// UPDATE / DO NOTHING arm rather than aborting with a UNIQUE error, while
+			// a BINARY byte-identical key still compares 0 (so seed idempotency, which
+			// re-presents identical literals, is unaffected).
 			//
 			// NOTE: one residual corner remains out of scope — multi-constraint
 			// coincidence. If an insert violates the targeted constraint AND another
@@ -464,7 +459,6 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		}
 		return undefined;
 	}
-
 
 	/**
 	 * Execute the DO UPDATE path for an UPSERT clause.

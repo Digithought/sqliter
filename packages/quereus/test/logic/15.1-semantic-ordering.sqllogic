@@ -558,6 +558,10 @@ drop table ut;
 -- back to byte equality. (Regression: the executor decided which clause a violation
 -- belonged to by comparing the target columns under storage class + collation only,
 -- so 'PT1H' vs 'PT60M' matched no clause and the UNIQUE error was re-raised.)
+-- NOTE: these assert through timespan_total_seconds, like the rest of this file, so
+-- they pin the identity but not WHICH spelling of d survives a DO UPDATE (the
+-- existing row's, since d is unassigned). If a backend is ever changed to adopt the
+-- proposed row's key spelling, add a raw `select d` here to pin it.
 create table ux (id integer primary key, d timespan unique, n integer);
 insert into ux values (1, 'PT1H', 10);
 
@@ -592,6 +596,22 @@ select id, k, timespan_total_seconds(d) as s, n from uxc order by id;
 → [{"id":1,"k":1,"s":3600,"n":99},{"id":3,"k":2,"s":3600,"n":30}]
 
 drop table uxc;
+
+-- A PRIMARY KEY target resolves its enforcement collation down the other branch
+-- (the PK column definition, not a UNIQUE constraint) — the semantic identity has
+-- to survive that branch too. `excluded.` values reach the assignment normally.
+create table uxp (d timespan primary key, n integer);
+insert into uxp values ('PT1H', 10);
+
+insert into uxp values ('PT60M', 20) on conflict (d) do update set n = excluded.n;
+select timespan_total_seconds(d) as s, n from uxp;
+→ [{"s":3600,"n":20}]
+
+insert into uxp values ('PT90M', 30) on conflict (d) do update set n = excluded.n;
+select timespan_total_seconds(d) as s, n from uxp order by s;
+→ [{"s":3600,"n":20},{"s":5400,"n":30}]
+
+drop table uxp;
 
 -- JSON is the other semantic-ordering type. Its values reach the executor already
 -- canonicalized, so both sides of the match were equal even before this fix; pinned

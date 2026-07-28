@@ -83,11 +83,14 @@ insert into table_name (columns) values (...)
 
 A targeted conflict is matched the way the named constraint *enforces* uniqueness: the target
 column's affinity is applied to the proposed value and it is compared under the constraint's
-collation. So a conflict that arises only through collation (e.g. `'abc'` proposed against a
-stored `'ABC'` under `COLLATE NOCASE`) or through affinity (e.g. `'1'` proposed against a stored
-integer `1` on an `INTEGER` key) still routes to the `DO UPDATE` / `DO NOTHING` arm rather than
-aborting with a UNIQUE error. A conflict on a *different* unique constraint than the one named
-still aborts.
+collation, or — for a column whose declared type defines its own notion of equal values
+(TIMESPAN, JSON; see [types.md § Semantic ordering](types.md)) — under that type. So a conflict
+that arises only through collation (e.g. `'abc'` proposed against a stored `'ABC'` under
+`COLLATE NOCASE`), through affinity (e.g. `'1'` proposed against a stored integer `1` on an
+`INTEGER` key), or through a re-spelling of the same value (`'PT60M'` against a stored `'PT1H'`
+on a `TIMESPAN` key) still routes to the `DO UPDATE` / `DO NOTHING` arm rather than aborting
+with a UNIQUE error. A conflict on a *different* unique constraint than the one named still
+aborts.
 
 **Actions:**
 - `DO NOTHING` — Silently skip the conflicting row (equivalent to `INSERT OR IGNORE`)
