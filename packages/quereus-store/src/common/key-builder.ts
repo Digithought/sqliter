@@ -347,13 +347,14 @@ export function buildFullScanBounds(): { gte: Uint8Array } {
  * with a 0xff type byte) — the same trap {@link buildFullScanBounds} documents
  * for data stores.
  *
- * NOTE: both `StoreTable` callers (`analyzeIndexAccess`, `buildIndexRangeBounds`)
- * pass NO `transforms` — sound only because both decline a semantic-ordering
- * column before they get here (the EQ-prefix loop breaks on `hasSemanticOrdering`;
- * the range arm is gated on `keyOrderMatchesCollation`). If backlog
- * `feat-reopen-timespan-store-seeks` re-opens either arm, thread the column's
- * transforms through first or the bounds will address raw-value bytes while the
- * index holds transformed ones.
+ * NOTE: all three `StoreTable` callers (`analyzeIndexAccess`, `buildIndexRangeBounds`,
+ * `scanMultiSeek`) pass NO `transforms` — sound only because each declines a
+ * semantic-ordering column before it gets here (the EQ-prefix loop breaks on
+ * `hasSemanticOrdering`; the range arm is gated on `keyOrderMatchesCollation`; the
+ * multi-seek throws INTERNAL, its plan having already been declined by
+ * `StoreModule.tryIndexAccessPlan`). If backlog `feat-reopen-timespan-store-seeks`
+ * re-opens any arm, thread the column's transforms through first or the bounds will
+ * address raw-value bytes while the index holds transformed ones.
  */
 export function buildIndexPrefixBounds(
 	prefixValues: SqlValue[],

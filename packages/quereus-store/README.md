@@ -50,22 +50,23 @@ The store module uses separate logical stores for different data types:
   decoding the index key's PK suffix (that suffix is encoded lossily for a NOCASE/RTRIM
   PK column, so it is not recoverable to SQL values). Entries are not covering — the row
   itself always lives in the data store.
-
-An `IN`-list on an indexed column (`where v in (1, 2, 3)`, including parameter-bound
-lists) is served from the index as one deduplicated, key-ordered point seek per distinct
-list value — a "multi-seek" — instead of a full scan with a residual filter. `NULL` list
-values match nothing and are skipped, duplicate values yield their rows once, and a
-composite index serves the cross-product of per-column lists (`a in (1,2) and b in
-(10,20)` is four seeks). Very large lists (over 1000 seek keys) and lists on
-semantically-ordered column types (TIMESPAN, JSON) fall back to the scan path — still
-correct, just not accelerated. `IN` on the primary key currently scans (see backlog
-`feat-store-pk-in-list-multiseek`).
 - **Catalog keys**:
   - Tables: `{schema}.{table}` as a string (the `CREATE TABLE` bundle, with its index DDL and any exposed-implicit-index tag DDL)
   - Views: `\x00view\x00{schema}.{view}` (reserved-prefix; `generateViewDDL`)
   - Materialized views: `\x00mview\x00{schema}.{mv}` (reserved-prefix; `generateMaterializedViewDDL`)
 
 This design eliminates redundant prefixes and groups related stores together by table name. The leading-`0x00` view/MV prefixes never collide with an unprefixed table key, so a view/MV may safely share a name with a table; a full catalog scan returns all three kinds intermixed and rehydrate classifies each by its key prefix.
+
+**`IN`-list index seeks ("multi-seek").** An `IN`-list on an indexed column
+(`where v in (1, 2, 3)`, including parameter-bound lists) is served from the index as one
+deduplicated, key-ordered point seek per distinct list value, instead of a full scan with
+a residual filter. `NULL` list values match nothing and are skipped, duplicate values
+yield their rows once, and a composite index serves the cross-product of per-column lists
+(`a in (1,2) and b in (10,20)` is four seeks). Very large lists (over 1000 seek keys) and
+lists on semantically-ordered column types (TIMESPAN, JSON) fall back to the scan path —
+still correct, just not accelerated. `IN` on the primary key currently scans (see backlog
+`feat-store-pk-in-list-multiseek`). Index choice among several usable indexes is
+first-match, not cheapest — see backlog `bug-store-index-choice-ignores-cost`.
 
 **Catalog DDL is re-persisted on catalog-only mutations.** `ALTER … SET TAGS` (and the programmatic `setTableTags` / `setColumnTags` / `setConstraintTags` / `setViewTags` / `setMaterializedViewTags`), plus `CREATE`/`DROP VIEW` and `CREATE`/`DROP MATERIALIZED VIEW`, never reach `module.alterTable`/`module.destroy`. The module subscribes to the engine's schema-change events (`table_modified`, the `view_*` events, and the `materialized_view_*` events) and writes the matching `__catalog__` entry when its `generate*DDL` output changes — table / column / constraint / **index** / **view** / **materialized-view** tags, and view/MV lifecycle, all survive close → reopen. A table's bundle is its `CREATE TABLE` DDL, one `CREATE [UNIQUE] INDEX` line per secondary index, and one trailing `alter index … set tags (…)` line per *exposed implicit index* carrying user tags (an exposed implicit index is never materialized in the store's *engine-facing* schema — only in its internal enforcement schema, see the implicit-index note below — so its `UniqueConstraintSchema.exposedIndexTags` has no `CREATE INDEX` line to ride; the alter line re-applies silently on import). These async writes are serialized and drained by `closeAll()` (or the `whenCatalogPersisted()` barrier) before the provider closes. On reopen, `rehydrateCatalog` classifies entries by key prefix and imports them in phases — tables → views → materialized views, all through the engine's `importCatalog` (MVs re-materialize silently via the shared create core, dependency-ordered for MV-over-MV by fixpoint retry). See [`docs/schema.md`](../../docs/schema.md#view-and-materialized-view-persistence) for the full design.
 

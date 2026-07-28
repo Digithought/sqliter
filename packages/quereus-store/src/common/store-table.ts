@@ -3322,6 +3322,10 @@ interface MultiSeekWindow {
  * yield: adding at visit time would let a stale index entry (row re-keyed since
  * indexing) that FAILS its residual poison the set and suppress the row's live entry
  * in a later window.
+ * NOTE: holds one hex string per row the multi-seek yields, for the whole seek — the
+ * only unbounded allocation on this path. Windows are byte-disjoint, so the only real
+ * duplicate source is a stale index entry; if a large-result `IN` ever shows up as a
+ * memory problem, the set can be scoped per window (or dropped for a consistent store).
  *
  * `collations` — the constraint collation map, resolved once per multi-seek (it is
  * identical for every window).

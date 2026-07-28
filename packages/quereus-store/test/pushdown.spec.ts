@@ -1073,6 +1073,42 @@ describe('StoreModule predicate pushdown', () => {
 				await db.exec('commit');
 				expect(rows).to.deep.equal([2, 3]);
 			});
+
+			it('index whose leading column IS the primary key: the multi-seek is not hijacked by the PK point arm', async () => {
+				// StoreTable.query must test for `plan=5` BEFORE analyzePKAccess. The
+				// FilterInfo carries N EQ constraints on the same column; analyzePKAccess
+				// takes the FIRST of them as a full PK match and point-reads one value,
+				// whose matchesFilters then ANDs all N mutually-exclusive equalities —
+				// zero rows, silently. Only an index over the PK column reaches that arm.
+				await db.exec(`create table pk (k integer primary key, other text) using store`);
+				await db.exec(`create index ix_k on pk (k)`);
+				await db.exec(`insert into pk values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`);
+				const q = `select k from pk where k in (1, 3) order by k`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect((await asyncIterableToArray(db.eval(q))).map(r => r.k)).to.deep.equal([1, 3]);
+			});
+
+			it('composite index with mixed ASC/DESC columns cross-products correctly', async () => {
+				// Each seek window is encoded with its own column's DESC inversion, and the
+				// windows are then sorted by raw bytes — so a per-column direction mix is
+				// the case where a single shared direction would silently misorder them.
+				await db.exec(`create table md (id integer primary key, a integer, b text) using store`);
+				await db.exec(`create index ix_md on md (a asc, b desc)`);
+				await db.exec(`insert into md values (1,1,'x'), (2,1,'y'), (3,2,'x'), (4,2,'y'), (5,3,'z')`);
+				const q = `select id from md where a in (1, 2) and b in ('x', 'y') order by id`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await ids(q)).to.deep.equal([1, 2, 3, 4]);
+			});
+
+			it('a list of exactly the cap still seeks (the cap is exclusive)', async () => {
+				await db.exec(`create table cap (id integer primary key, v integer) using store`);
+				await db.exec(`create index ix_cap on cap (v)`);
+				await db.exec(`insert into cap values (1, 5), (2, 999), (3, 5000)`);
+				const list = Array.from({ length: 1000 }, (_, i) => i).join(', ');
+				const q = `select id from cap where v in (${list}) order by id`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await ids(q)).to.deep.equal([1, 2]);
+			});
 		});
 
 		// Narrowing proof: rows alone cannot distinguish a multi-seek from a full scan

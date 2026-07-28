@@ -509,6 +509,39 @@ describe('Isolated Store Module', () => {
 			expect(rows).to.deep.equal([{ id: 3 }, { id: 5 }]);
 			await db.exec('ROLLBACK');
 		});
+
+		it('an IN-list multi-seek interleaves overlay rows between its seek windows in index order', async () => {
+			// The store serves an IN list as one byte window per list value, scanned in
+			// ascending index-key order. The isolation layer merges that stream with its
+			// full-scanned overlay by (index key, PK), which is only sound if the
+			// underlying stream really is ascending across windows — so assert the RAW
+			// emission order (no ORDER BY, which would hide a misordered merge behind a
+			// Sort). Overlay values 20 and 40 fall BETWEEN committed windows 10/30/50.
+			await db.exec(`insert into t values (5, 50)`);
+			await db.exec('BEGIN');
+			await db.exec(`insert into t values (4, 40), (6, 15)`);
+			const rows = await asyncIterableToArray(
+				db.eval(`select id, v from t where v in (50, 10, 15, 40, 30)`),
+			);
+			expect(rows).to.deep.equal([
+				{ id: 1, v: 10 }, { id: 6, v: 15 }, { id: 3, v: 30 }, { id: 4, v: 40 }, { id: 5, v: 50 },
+			]);
+			await db.exec('ROLLBACK');
+		});
+
+		it('an IN-list multi-seek honours overlay updates and tombstones per seek window', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`update t set v = 35 where id = 3`); // moves out of the v=30 window
+			await db.exec(`delete from t where id = 1`);       // removes the v=10 window's row
+			expect(await asyncIterableToArray(db.eval(`select id, v from t where v in (10, 20, 35)`)))
+				.to.deep.equal([{ id: 2, v: 20 }, { id: 3, v: 35 }]);
+			// The pre-update value must not resurface from the underlying index.
+			expect(await asyncIterableToArray(db.eval(`select id from t where v in (10, 30)`)))
+				.to.deep.equal([]);
+			await db.exec('ROLLBACK');
+			expect(await asyncIterableToArray(db.eval(`select id from t where v in (10, 30) order by id`)))
+				.to.deep.equal([{ id: 1 }, { id: 3 }]);
+		});
 	});
 
 	// Note: The following tests verify the isolation layer infrastructure when wrapping
