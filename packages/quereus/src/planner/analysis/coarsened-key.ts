@@ -42,9 +42,10 @@
  * source key a *false* identity — e.g. `group by b collate nocase, c` covers
  * source PK {b} by lineage while the output holds many rows per b — so the
  * walk admits only row-preserving/row-reducing links (Project / Filter / Sort
- * / physical access nodes) over exactly one base table. Anything else
- * (joins, set ops, aggregates, DISTINCT, window, TVFs, row caps) abstains and
- * the caller keeps today's bag rejection.
+ * / physical access nodes, plus the probe side of a semi/anti join) over
+ * exactly one base table. Anything else (row-combining joins, set ops,
+ * aggregates, DISTINCT, window, TVFs, row caps) abstains and the caller keeps
+ * today's bag rejection.
  */
 
 import type { RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
@@ -52,6 +53,8 @@ import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { CastNode, CollateNode } from '../nodes/scalar.js';
 import { isNoOpCast } from './scalar-invertibility.js';
+import { BINARY_JOIN_TYPES } from '../nodes/join-utils.js';
+import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { TableSchema } from '../../schema/table.js';
 
 /** One column of a derived coarsened backing key. */
@@ -154,6 +157,31 @@ export function resolveValuePreservingSourceCol(
 	return undefined;
 }
 
+/**
+ * The probe (left) input of a **semi/anti** join, or `undefined` for any other
+ * node. A semi/anti join is a filter written as a join: it yields the probe row
+ * verbatim at most once (`joinOutputRow`) and publishes the probe side's
+ * attributes unchanged (`buildJoinAttributes`), so it is a row-reducing,
+ * lineage-preserving link exactly like a {@link FilterNode} — the chain walk
+ * descends it and keeps tracing through the same attribute ids.
+ *
+ * This is the shape an uncorrelated `where col in (select …)` body optimizes to
+ * (`ruleSubqueryDecorrelation`'s uncorrelated-IN arm), so without this link a
+ * migration-shaped MV body with an `IN`-subquery WHERE would lose its coarsened
+ * backing key and be rejected as a bag.
+ *
+ * Row-COMBINING join types (inner/left/right/full/cross) are deliberately not
+ * descended: they publish both sides' attributes and can emit many output rows
+ * per source row, which would make a lineage-covered source key a false backing
+ * identity.
+ */
+function semiAntiProbeSide(node: RelationalPlanNode): RelationalPlanNode | undefined {
+	if (!BINARY_JOIN_TYPES.has(node.nodeType) || !CapabilityDetectors.isJoin(node)) return undefined;
+	const joinType = node.getJoinType();
+	if (joinType !== 'semi' && joinType !== 'anti') return undefined;
+	return node.getLeftSource();
+}
+
 /** Minimal duck-type for nodes (Project, physical aggregates) exposing attribute provenance. */
 interface HasProducingExprs { getProducingExprs(): Map<number, ScalarPlanNode>; }
 
@@ -190,6 +218,8 @@ export function deriveCoarsenedBackingKey(root: RelationalPlanNode): CoarsenedBa
 			tableRef = node;
 			break;
 		}
+		const probeSide = semiAntiProbeSide(node);
+		if (probeSide) { node = probeSide; continue; }
 		if (!ROW_PRESERVING_CHAIN.has(node.nodeType)) return undefined;
 		collectProducing(node, producingByAttrId);
 		const relations = node.getRelations();

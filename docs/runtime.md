@@ -1225,50 +1225,15 @@ Inner-scan connection reuse, `CacheNode` row-cache lifetime, and shared
 
 ## Query Optimizer Integration
 
-The Quereus optimizer transforms logical plan nodes into physical execution plans between the builder and runtime phases.
-
-### Optimizer Overview
-
-The optimizer uses a single plan node hierarchy with logical-to-physical transformation:
-- **Logical nodes**: Created by the builder - may or may not have physical emitters
-- **Physical nodes**: Transformed by the optimizer with execution properties
-- **Attribute preservation**: Column references use stable attribute IDs that survive optimization
-
-Key optimizer guarantees for emitter authors:
-- Every node reaching the emitter phase has `physical` properties set
-- The optimizer respects virtual table capabilities via `BestAccessPlan`
-
-### Physical Properties
-
-Physical properties capture execution characteristics used by both optimizer and runtime:
-```typescript
-interface PhysicalProperties {
-  ordering?: Ordering[];        // Output row ordering
-  estimatedRows?: number;       // Cardinality estimate
-  uniqueKeys?: number[][];      // Attribute IDs forming unique keys
-  deterministic: boolean;       // Pure and repeatable
-  readonly: boolean;            // No side effects
-}
-```
-
-Override the `computePhysical()` plan node method to set them; otherwise they are inherited from child nodes or defaulted.
-```typescript
-computePhysical(): Partial<PhysicalProperties> {
-  return {
-    readonly: false,  // Side-effecting (should only be set if the node directly mutates)
-    estimatedRows: this.source.estimatedRows,
-    uniqueKeys: this.source.getType().keys.map(key => key.map(colRef => colRef.index)),
-  };
-}
-```
-
-### Attribute ID System
-
-Runtime column lookup uses attribute IDs, not names or positions, and the
-optimizer's `withChildren()` infrastructure preserves them — which is what makes
-resolution robust across arbitrary plan transformations.
-
-For comprehensive optimizer details, see the [Optimizer Documentation](optimizer.md).
+Between the builder and runtime phases the optimizer rewrites **logical** nodes
+into **physical** ones over a single node hierarchy, attaching
+[physical properties](#physical-properties-system) — override `computePhysical()`
+to set them, otherwise they are inherited from children or defaulted. Every node
+reaching the emitter phase has `physical` set, and virtual-table capabilities are
+respected via `BestAccessPlan`. Column references carry stable attribute IDs that
+`withChildren()` preserves, so runtime column lookup (by attribute ID, never by
+name or position) survives arbitrary plan transformations. See the
+[Optimizer Documentation](optimizer.md).
 
 ## ParallelDriver (Runtime Primitive)
 

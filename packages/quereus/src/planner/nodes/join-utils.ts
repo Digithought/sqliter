@@ -1,5 +1,6 @@
 import type { Attribute, ConstantBinding, DomainConstraint, FunctionalDependency, InclusionDependency, MonotonicOnInfo, PhysicalProperties } from './plan-node.js';
 import type { JoinType, ExistenceColumnSpec } from './join-node.js';
+import { PlanNodeType } from './plan-node-type.js';
 import type { RelationType, ColRef, ColumnDef, ScalarType } from '../../common/datatype.js';
 import { BOOLEAN_TYPE } from '../../types/builtin-types.js';
 import {
@@ -50,6 +51,23 @@ export interface EquiJoinPair {
 	 */
 	valueDiscriminating: boolean;
 }
+
+/**
+ * Binary (left/right/inner/cross/semi/anti) join node types a structural plan
+ * walk may descend through. These all implement `JoinCapable` (logical
+ * `JoinNode`, `BloomJoinNode` = `HashJoin`, `MergeJoinNode`), so
+ * `CapabilityDetectors.isJoin` exposes `getJoinType` / `getLeftSource` /
+ * `getRightSource`. `FanOutLookupJoin` and `AsofScan` are deliberately absent —
+ * they are not `JoinCapable` and must fall through to each walk's rejection.
+ * Shared by the coverage prover's `walkToConstrainedBase` and the
+ * coarsened-backing-key lineage walk so the admitted node set is defined once.
+ */
+export const BINARY_JOIN_TYPES: ReadonlySet<PlanNodeType> = new Set([
+	PlanNodeType.Join,
+	PlanNodeType.NestedLoopJoin,
+	PlanNodeType.HashJoin,
+	PlanNodeType.MergeJoin,
+]);
 
 /**
  * The subset of `pairs` that may mint value-level facts (keys, FDs, equivalence

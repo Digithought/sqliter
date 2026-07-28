@@ -183,7 +183,7 @@ import { AliasNode } from '../nodes/alias-node.js';
 import { SortNode } from '../nodes/sort.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
-import type { EquiJoinPair } from '../nodes/join-utils.js';
+import { BINARY_JOIN_TYPES, type EquiJoinPair } from '../nodes/join-utils.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../../schema/table.js';
@@ -265,21 +265,6 @@ const PASS_THROUGH: ReadonlySet<PlanNodeType> = new Set([
 	PlanNodeType.IndexScan,
 	PlanNodeType.IndexSeek,
 	PlanNodeType.TableSeek,
-]);
-
-/**
- * Binary (left/right/inner/cross/semi/anti) join node types the shape walk may
- * descend through. These all implement `JoinCapable` (logical `JoinNode`,
- * `BloomJoinNode` = `HashJoin`, `MergeJoinNode`), so `CapabilityDetectors.isJoin`
- * exposes `getJoinType` / `getLeftSource` / `getRightSource`. `FanOutLookupJoin`
- * and `AsofScan` are deliberately absent — they are not `JoinCapable` and fall
- * through to the walk's `shape` rejection.
- */
-const BINARY_JOIN_TYPES: ReadonlySet<PlanNodeType> = new Set([
-	PlanNodeType.Join,
-	PlanNodeType.NestedLoopJoin,
-	PlanNodeType.HashJoin,
-	PlanNodeType.MergeJoin,
 ]);
 
 /**
