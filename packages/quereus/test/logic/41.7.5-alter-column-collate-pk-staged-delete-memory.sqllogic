@@ -1,0 +1,57 @@
+-- ALTER COLUMN ... SET COLLATE on a PRIMARY KEY column, interleaved with rows the
+-- transaction deleted and re-inserted at a case-variant key.
+--
+-- MEMORY-ONLY (listed in MEMORY_ONLY_FILES): under `yarn test:store` this file runs the
+-- store module behind the isolation layer, and the store's primary-key re-key still judges
+-- its own committed rows instead of the transaction's effective rows — so the
+-- delete-then-reinsert sequence in § 1 is refused there
+-- (backlog/bug-store-pk-collate-rejects-deleted-row-collision). The isolation layer's own
+-- coverage of these sequences lives in
+-- packages/quereus-isolation/test/isolation-layer.spec.ts ("collapses overlay deletion
+-- markers").
+
+-- ===================================
+-- 1. Delete a row, re-insert a case-variant replacement, then re-key: the deleted row
+--    must not block the change, and the replacement survives the commit.
+-- ===================================
+
+create table t_rk (k text primary key, v text);
+insert into t_rk values ('A', 'x');
+
+begin;
+delete from t_rk where k = 'A';
+insert into t_rk values ('a', 'y');
+alter table t_rk alter column k set collate nocase;
+commit;
+
+select k, v from t_rk;
+→ [{"k":"a","v":"y"}]
+
+drop table t_rk;
+
+-- ===================================
+-- 2. Rows inserted AND deleted inside one transaction leave the case-colliding pair in the
+--    transaction's history; the re-key's conservative representability check refuses it as
+--    retryable (BUSY), the transaction's own work still commits, and the retry succeeds.
+-- ===================================
+
+create table t_rk2 (k text primary key, v text);
+-- run
+
+begin;
+insert into t_rk2 values ('A', 'x'), ('a', 'y');
+delete from t_rk2 where k in ('A', 'a');
+-- run
+
+alter table t_rk2 alter column k set collate nocase;
+-- error: still collide under the new collation
+
+commit;
+select count(*) as n from t_rk2;
+→ [{"n":0}]
+
+alter table t_rk2 alter column k set collate nocase;
+select name, collation from table_info('t_rk2') order by cid;
+→ [{"name":"k","collation":"NOCASE"},{"name":"v","collation":"BINARY"}]
+
+drop table t_rk2;

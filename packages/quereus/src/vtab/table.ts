@@ -244,9 +244,17 @@ export abstract class VirtualTable {
 	/**
 	 * Modifies the schema of this virtual table
 	 * @param changeInfo Object describing the schema modification
+	 * @param validateOnly When true, run every pre-mutation validation the change would run
+	 *   and throw exactly what the real application would throw, but mutate NOTHING — a
+	 *   dry-run. A caller coordinating this table's change with another irreversible
+	 *   mutation (the isolation layer sequencing a per-connection overlay against the
+	 *   shared underlying table) uses it to surface a refusal while everything is still
+	 *   untouched. Support is per-module (the bundled memory module supports it for
+	 *   `alterColumn`); a module that cannot validate without mutating must throw rather
+	 *   than silently apply.
 	 * @throws QuereusError or ConstraintError on failure
 	 */
-	alterSchema?(changeInfo: SchemaChangeInfo): Promise<void>;
+	alterSchema?(changeInfo: SchemaChangeInfo, validateOnly?: boolean): Promise<void>;
 
 	/**
 	 * Creates a secondary index on the virtual table

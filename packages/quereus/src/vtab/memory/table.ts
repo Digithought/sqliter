@@ -342,7 +342,17 @@ export class MemoryTable extends VirtualTable {
 
 
 	/** Handles schema changes via the manager */
-	async alterSchema(changeInfo: SchemaChangeInfo): Promise<void> {
+	async alterSchema(changeInfo: SchemaChangeInfo, validateOnly = false): Promise<void> {
+		// Validate-only dry run (see VirtualTable.alterSchema): supported for exactly the
+		// change type that has a caller needing it — the isolation layer pre-flights an
+		// `alter column` against a per-connection overlay before the shared underlying
+		// mutates irreversibly. Refuse the rest rather than silently validating nothing.
+		if (validateOnly && changeInfo.type !== 'alterColumn') {
+			throw new QuereusError(
+				`MemoryTable.alterSchema: validate-only is supported for 'alterColumn' changes, not '${changeInfo.type}'`,
+				StatusCode.UNSUPPORTED,
+			);
+		}
 		const originalManagerSchema = this.manager.tableSchema; // For potential error recovery
 		try {
 			switch (changeInfo.type) {
@@ -379,7 +389,7 @@ export class MemoryTable extends VirtualTable {
 						setDataType: changeInfo.setDataType,
 						setDefault: changeInfo.setDefault,
 						setCollation: changeInfo.setCollation,
-					});
+					}, undefined, validateOnly);
 					break;
 				default: {
 					const exhaustiveCheck: never = changeInfo;

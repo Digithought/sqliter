@@ -2274,6 +2274,13 @@ export class MemoryTableManager {
 	 * Apply a single-attribute ALTER COLUMN change (NOT NULL, DEFAULT, DATA TYPE).
 	 * The caller supplies exactly one populated change; multi-attribute combinations
 	 * are rejected by the runtime before reaching this method.
+	 *
+	 * `validateOnly` runs everything up to (and including) the pre-mutation validation
+	 * passes — the effective-row NULL / conversion scans, the re-keyed UNIQUE probe, and
+	 * the primary-key re-key legality/representability passes — and returns before the
+	 * first mutation, throwing exactly what the real application would throw. The
+	 * isolation layer uses it to pre-flight an overlay's migration before the shared
+	 * underlying table mutates irreversibly (see `VirtualTable.alterSchema`).
 	 */
 	async alterColumn(change: {
 		columnName: string;
@@ -2281,7 +2288,7 @@ export class MemoryTableManager {
 		setDataType?: string;
 		setDefault?: Expression | null;
 		setCollation?: string;
-	}, rows?: EffectiveRowSource): Promise<void> {
+	}, rows?: EffectiveRowSource, validateOnly = false): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -2571,6 +2578,11 @@ export class MemoryTableManager {
 				// `validateRekeyedPrimaryKey` for why the sets differ and which status each raises.
 				if (pkColumnRekeyed) await this.validateRekeyedPrimaryKey(finalNewTableSchema, rows);
 			}
+
+			// Dry run ends here: everything above validates without mutating (the one earlier
+			// side effect, ensureSchemaChangeSafety's committed-layer drain, is semantically
+			// neutral bookkeeping), and everything below mutates. See the method doc.
+			if (validateOnly) return;
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
 

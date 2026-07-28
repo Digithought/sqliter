@@ -285,12 +285,15 @@ export class TransactionLayer implements Layer {
 	 * in the parent, so a deletion removes exactly the row this layer removed and an upsert
 	 * lands at exactly one key.
 	 *
-	 * NOTE: the deletion replay assumes a key this layer deleted was a key the PARENT held.
-	 * That holds because every DML operation gets its own layer (`MemoryTableConnection`'s
-	 * statement savepoints), so no layer both creates and destroys a key. If a single layer
-	 * ever does, `rekeyed.find(key)` can land on a *colliding* parent row and delete it: at
-	 * that point the deletion needs to verify, under the OLD comparator, that the row it found
-	 * is the row it removed.
+	 * The deletion replay verifies, under the OLD comparator, that the row it finds is the row
+	 * it removed (see {@link installNetOwnWrites}'s `deletionTargets`). Without that check a
+	 * deletion whose old key collapses onto a DIFFERENT row's new key deletes that other row:
+	 * stage an upsert at key `'a'` in one layer, delete the colliding `'A'` from a LATER layer,
+	 * and the later layer's replayed deletion lands on the parent's `'a'` — silently removing
+	 * the row the transaction just wrote. `validateRekeyedPrimaryKey`'s chain walk refuses any
+	 * chain that holds a colliding pair before this method runs, which makes a cross-row land
+	 * unreachable today — the verify is insurance, so the replay's own correctness does not
+	 * hinge on that caller-side pass staying exactly as conservative as it is.
 	 */
 	public rekeyPrimaryKey(newSchema: TableSchema): void {
 		// The pending-change EVENT log is deliberately NOT rewritten here: a collation
@@ -298,7 +301,8 @@ export class TransactionLayer implements Layer {
 		// untouched — so the recorded `pk`/`oldRow`/`newRow` images stay accurate as-is.
 		// (Contrast convertColumn / installReshapedColumns, which do rewrite the log.)
 		const preRekeyTree = this.primaryModifications;
-		const preRekeyEncode = this.pkFunctions.encode;
+		const preRekeyFunctions = this.pkFunctions;
+		const preRekeyEncode = preRekeyFunctions.encode;
 
 		this.tableSchemaAtCreation = newSchema;
 		this.pkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
@@ -318,7 +322,10 @@ export class TransactionLayer implements Layer {
 			else upserts.push(effectiveRow);
 		}
 
-		this.installNetOwnWrites(deletions, upserts);
+		// Only the re-key can make a deletion's find() land on a colliding OTHER row, so only
+		// this caller passes the old-comparator identity check (see the method doc above).
+		this.installNetOwnWrites(deletions, upserts, (deletionKey, foundRow) =>
+			preRekeyFunctions.compare(deletionKey, preRekeyFunctions.extractFromRow(foundRow)) === 0);
 	}
 
 	/**
@@ -352,12 +359,24 @@ export class TransactionLayer implements Layer {
 	 * can produce that collision (two old keys collapsing under the new comparator); where key
 	 * values are invariant a key is classified as either a deletion or an upsert, never both, so
 	 * the filter is a no-op.
+	 *
+	 * `deletionTargets` guards each deletion's replay: `find(key)` runs under the NEW comparator,
+	 * so a re-key can land it on a colliding row this layer never removed — a row a PARENT layer
+	 * upserted at what is now the same key. Only {@link rekeyPrimaryKey} passes it (an
+	 * old-comparator identity check); the column-set/value rebuilds leave key values untouched,
+	 * where find() can only land on the deleted key itself.
 	 */
-	private installNetOwnWrites(deletions: readonly BTreeKeyForPrimary[], upserts: readonly Row[]): void {
+	private installNetOwnWrites(
+		deletions: readonly BTreeKeyForPrimary[],
+		upserts: readonly Row[],
+		deletionTargets?: (deletionKey: BTreeKeyForPrimary, foundRow: Row) => boolean,
+	): void {
 		const rebuilt = this.newPrimaryTreeOverParent();
 		for (const primaryKey of deletions) {
 			const path = rebuilt.find(primaryKey);
-			if (path.on) rebuilt.deleteAt(path);
+			if (!path.on) continue;
+			if (deletionTargets && !deletionTargets(primaryKey, rebuilt.at(path)!)) continue;
+			rebuilt.deleteAt(path);
 		}
 		for (const row of upserts) {
 			rebuilt.upsert(row);

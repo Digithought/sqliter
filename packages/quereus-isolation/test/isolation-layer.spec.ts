@@ -2534,6 +2534,220 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	describe('SET COLLATE on a PRIMARY KEY column collapses overlay deletion markers', () => {
+		// A transaction that deletes a row and re-inserts a case-variant replacement stages a
+		// deletion marker AND a live row that become ONE key under the new collation. The marker
+		// is that row's before-image, not a second row: the migrate step discards it before the
+		// re-key is forwarded (IsolationModule.dropCollapsedPkRekeyMarkers), so the ALTER
+		// succeeds. Pre-fix the forward raised the issuer drift INTERNAL after the shared table
+		// had already re-keyed, and a COMMIT afterwards silently lost the replacement row (the
+		// flush deleted what it had just inserted). Two live rows on one key stay a real
+		// duplicate — covered by the previous suite for the issuer, and by the foreign-overlay
+		// poison test below.
+		let iso: IsolationModule;
+
+		beforeEach(() => {
+			iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', iso);
+		});
+
+		function overlayRows(table: string): Promise<Row[]> {
+			const state = iso.getConnectionOverlay(db, 'main', table)!;
+			return asyncIterableToArray(state.overlayTable.query!(makeFullScanFilterInfo()));
+		}
+
+		/** Live collation via the underlying's canonical getSchema() — see the previous suite's helper. */
+		function underlyingCollation(table: string, column: string): string {
+			const underlying = iso.getUnderlyingState('main', table)!.underlyingTable as unknown as {
+				getSchema(): { columns: readonly { name: string; collation?: string }[] } | undefined;
+			};
+			return underlying.getSchema()!.columns.find(c => c.name === column)?.collation ?? 'BINARY';
+		}
+
+		it('delete then re-insert at a case-colliding key survives the ALTER and the COMMIT', async () => {
+			await db.exec(`CREATE TABLE mkc (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO mkc VALUES ('A', 'x')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM mkc WHERE k = 'A'`);
+			await db.exec(`INSERT INTO mkc VALUES ('a', 'y')`);
+			await db.exec(`ALTER TABLE mkc ALTER COLUMN k SET COLLATE NOCASE`);
+
+			// The marker collapsed onto its replacement: the overlay holds exactly the live row.
+			const staged = await overlayRows('mkc');
+			expect(staged.map(r => [r[0], r[1], r[2]])).to.deep.equal([['a', 'y', 0]]);
+
+			const inTxn = await asyncIterableToArray(db.eval(`SELECT k, v FROM mkc`));
+			expect(inTxn.map((r: any) => [r.k, r.v])).to.deep.equal([['a', 'y']]);
+
+			await db.exec(`COMMIT`);
+			// Pre-fix shape of the loss: continuing past the INTERNAL and committing reported
+			// success and left the table EMPTY.
+			const rows = await asyncIterableToArray(db.eval(`SELECT k, v FROM mkc`));
+			expect(rows.map((r: any) => [r.k, r.v]), 'the replacement row survives the commit').to.deep.equal([['a', 'y']]);
+		});
+
+		it('rollback to a savepoint taken between the delete and the insert restores the deletion marker', async () => {
+			await db.exec(`CREATE TABLE mks (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO mks VALUES ('A', 'x')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM mks WHERE k = 'A'`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO mks VALUES ('a', 'y')`);
+			await db.exec(`ALTER TABLE mks ALTER COLUMN k SET COLLATE NOCASE`);
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			// The in-place migration kept the overlay's savepoint chain: unwinding past the
+			// insert (and the marker drop that rode in the same frame) restores the marker.
+			const staged = await overlayRows('mks');
+			expect(staged.map(r => [r[0], r[2]]), 'the deletion marker is back').to.deep.equal([['A', 1]]);
+			const inTxn = await asyncIterableToArray(db.eval(`SELECT k FROM mks`));
+			expect(inTxn, "the table reads as 'A' deleted").to.deep.equal([]);
+
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT k FROM mks`));
+			expect(rows).to.deep.equal([]);
+		});
+
+		it('a savepoint taken after the staged pair refuses the ALTER atomically with BUSY', async () => {
+			// `ROLLBACK TO s` must restore BOTH the marker and its case-variant replacement —
+			// two rows the re-keyed overlay cannot hold at one key. The overlay module's own
+			// representability check (the same conservative BUSY the plain memory table raises
+			// for restorable colliding rows) refuses the re-key; what this test pins is the
+			// TIMING: the tier-2 pre-flight surfaces that refusal BEFORE the shared underlying
+			// mutates, the marker drop is undone, and the transaction continues intact.
+			await db.exec(`CREATE TABLE mkp (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO mkp VALUES ('A', 'x')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM mkp WHERE k = 'A'`);
+			await db.exec(`INSERT INTO mkp VALUES ('a', 'y')`);
+			await db.exec(`SAVEPOINT s`);
+
+			let err: unknown;
+			try { await db.exec(`ALTER TABLE mkp ALTER COLUMN k SET COLLATE NOCASE`); } catch (e) { err = e; }
+			expect(err, 'the re-key must be refused').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code, 'refused as retryable, not as data-invalid').to.equal(StatusCode.BUSY);
+			expect(underlyingCollation('mkp', 'k'), 'refused BEFORE the shared table was re-keyed').to.equal('BINARY');
+
+			// The dropped marker was restored: the overlay still stages the delete + replacement.
+			const staged = await overlayRows('mkp');
+			expect(staged.map(r => [r[0], r[2]]).sort(), 'marker and replacement both intact').to.deep.equal([['A', 1], ['a', 0]]);
+
+			// The transaction survives the refusal and commits its actual work.
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT k, v FROM mkp`));
+			expect(rows.map((r: any) => [r.k, r.v])).to.deep.equal([['a', 'y']]);
+		});
+
+		it('two case-variant in-transaction deletions refuse the ALTER atomically with BUSY, matching plain memory', async () => {
+			// Statement boundaries leave the overlay's pre-delete live pair {'A','a'} in an
+			// immutable history layer, and the overlay module's representability check refuses
+			// any chain that ever held a colliding pair — exactly as the PLAIN memory table
+			// refuses this same statement sequence (its own history holds the same pair). What
+			// this test pins: the refusal is surfaced by the tier-2 pre-flight BEFORE the shared
+			// underlying re-keys, the transaction survives, and its deletes still commit.
+			await db.exec(`CREATE TABLE mkd (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO mkd VALUES ('A', 'x'), ('a', 'y')`);
+			await db.exec(`DELETE FROM mkd WHERE k IN ('A', 'a')`);
+
+			let err: unknown;
+			try { await db.exec(`ALTER TABLE mkd ALTER COLUMN k SET COLLATE NOCASE`); } catch (e) { err = e; }
+			expect(err, 'the re-key must be refused').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.BUSY);
+			expect((err as QuereusError).message).to.match(/commit\/rollback and retry/i);
+			expect(underlyingCollation('mkd', 'k'), 'refused BEFORE the shared table was re-keyed').to.equal('BINARY');
+
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT k FROM mkd`));
+			expect(rows, 'the transaction still deleted everything it inserted').to.deep.equal([]);
+
+			// And with the transaction committed, the retry the BUSY suggested succeeds.
+			await db.exec(`ALTER TABLE mkd ALTER COLUMN k SET COLLATE NOCASE`);
+			expect(underlyingCollation('mkd', 'k')).to.equal('NOCASE');
+		});
+
+		describe('foreign overlays under a cross-connection PK re-key', () => {
+			// White-box, following the poison-semantics suite: two Databases share one
+			// IsolationModule, overlays are injected directly, and the ALTER is driven through
+			// iso.alterTable(dbA, …). Here injected rows carry an explicit tombstone flag so a
+			// staged deletion marker can be planted.
+			let isoShared: IsolationModule;
+			let dbA: Database; // the ALTER issuer
+			let dbB: Database; // the foreign connection
+
+			const setCollateNocase: SchemaChangeInfo = { type: 'alterColumn', columnName: 'k', setCollation: 'NOCASE' };
+
+			beforeEach(async () => {
+				isoShared = new IsolationModule({ underlying: new MemoryTableModule() });
+				dbA = new Database();
+				dbB = new Database();
+				dbA.registerModule('isolated', isoShared);
+				await dbA.exec(`create table ct (k text primary key, v text) using isolated`);
+				await dbA.exec(`insert into ct values ('A', 'x')`); // committed row for the marker below
+			});
+
+			afterEach(async () => {
+				await dbA.close();
+				await dbB.close();
+			});
+
+			/** Injects a staged overlay for `forDb`; rows are FULL overlay rows `[k, v, tombstoneFlag]`. */
+			async function injectOverlayRows(forDb: Database, rows: SqlValue[][]): Promise<void> {
+				const underlying = isoShared.getUnderlyingState('main', 'ct')!.underlyingTable;
+				const overlay = await isoShared.overlayModule.create(forDb, isoShared.createOverlaySchema(underlying.tableSchema!));
+				for (const r of rows) {
+					await overlay.update({ operation: 'insert', values: r });
+				}
+				isoShared.setConnectionOverlay(forDb, 'main', 'ct', { overlayTable: overlay, hasChanges: true, db: forDb });
+			}
+
+			it('poisons a foreign overlay whose two staged live rows collide under the new collation', async () => {
+				await injectOverlayRows(dbB, [['b', 'y', 0], ['B', 'z', 0]]);
+
+				const updated = await isoShared.alterTable(dbA, 'main', 'ct', setCollateNocase);
+				expect(updated.columns.find(c => c.name === 'k')!.collation, 'the ALTER applied for the issuer').to.equal('NOCASE');
+
+				const bState = isoShared.getConnectionOverlay(dbB, 'main', 'ct')!;
+				expect(bState.poison, 'a real staged duplicate must poison, not migrate').to.not.be.undefined;
+				expect(bState.poison!.message).to.match(/collation/i);
+				expect(bState.poison!.message).to.match(/roll back this transaction/i);
+
+				// The rejection fired in the pre-validation pass: both staged rows are intact.
+				const bRows = await asyncIterableToArray(bState.overlayTable.query!(makeFullScanFilterInfo()));
+				expect(bRows.map(r => r[0]).sort(), 'no staged row was dropped').to.deep.equal(['B', 'b']);
+
+				let commitErr: unknown;
+				try { await isoShared.commitConnectionOverlays(dbB); } catch (e) { commitErr = e; }
+				expect(commitErr, 'poisoned overlay must abort the commit').to.be.instanceOf(QuereusError);
+				expect((commitErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			});
+
+			it('migrates a foreign overlay whose marker/live pair collapses cleanly, in place', async () => {
+				await injectOverlayRows(dbB, [['A', null, 1], ['a', 'y', 0]]);
+				const before = isoShared.getConnectionOverlay(dbB, 'main', 'ct')!.overlayTable;
+
+				await isoShared.alterTable(dbA, 'main', 'ct', setCollateNocase);
+
+				const bState = isoShared.getConnectionOverlay(dbB, 'main', 'ct')!;
+				expect(bState.poison, 'a collapsible pair must adopt the change, not poison').to.be.undefined;
+				expect(bState.overlayTable, 'adopted IN PLACE — same staging table object').to.equal(before);
+
+				const bRows = await asyncIterableToArray(bState.overlayTable.query!(makeFullScanFilterInfo()));
+				expect(bRows.map(r => [r[0], r[1], r[2]]), 'the marker collapsed onto the live row').to.deep.equal([['a', 'y', 0]]);
+
+				// And the foreign transaction commits its replacement over the committed 'A'.
+				await isoShared.commitConnectionOverlays(dbB);
+				const committed = await asyncIterableToArray(
+					isoShared.getUnderlyingState('main', 'ct')!.underlyingTable.query!(makeFullScanFilterInfo()));
+				expect(committed.map(r => [r[0], r[1]])).to.deep.equal([['a', 'y']]);
+			});
+		});
+	});
+
 	describe('in-transaction column-shape ALTER keeps the overlay tombstone flag last', () => {
 		// The overlay stages rows as [data columns..., tombstone flag] and every read/write
 		// path assumes the flag is LAST. A bare addColumn forward to the overlay would append
