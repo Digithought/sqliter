@@ -70,13 +70,14 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 		// lattice (explicit > declared > default > BINARY) so a merge key compares
 		// identically to the same `l.k = r.k` under any other join algorithm and the
 		// nested-loop fallback. Throws on an explicit/declared conflict — a loud
-		// backstop: `equi-pair-extractor`'s matched-collation gate keeps
-		// conflicting/asymmetric pairs out of the merge path (LOCKSTEP: the merge
-		// algorithm also needs both inputs sorted under THIS collation, and the
-		// physical ordering property is collation-blind — the gate is what makes the
-		// resolved key collation equal each input's declared sort collation; see the
-		// gate's docstring in equi-pair-extractor.ts), so this is unreachable for
-		// legitimately-admitted pairs.
+		// backstop: the extractor declines conflicting pairs outright. LOCKSTEP:
+		// merge additionally needs both inputs sorted under THIS collation, and the
+		// physical ordering property is collation-blind — so the selection rules
+		// (`rule-join-physical-selection`, `rule-monotonic-merge-join`) admit merge
+		// only for pairs tagged `collationsMatch` (both sides declare the same
+		// collation, making the resolved key collation equal each input's declared
+		// sort collation; see EquiJoinPair.collationsMatch in join-utils.ts).
+		// Mismatched pairs go to hash join, whose emitter has no ordering premise.
 		const collationName = effectiveCollationOfTypes(leftAttributes[li].type, rightAttributes[ri].type);
 		const collationFunc = ctx.resolveCollation(collationName);
 		// When both sides declare the SAME semantic-ordering logical type (TIMESPAN,

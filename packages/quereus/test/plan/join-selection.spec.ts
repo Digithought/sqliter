@@ -76,6 +76,87 @@ describe('Plan shape: join algorithm selection', () => {
 		});
 	});
 
+	describe('mismatched-collation join keys (NOCASE vs defaulted BINARY)', () => {
+		// The default shape of every fk→pk text join on the persistent store: the
+		// PK column carries NOCASE, the FK column defaults to BINARY. The pair is
+		// hash-joinable (the emitter resolves the comparison collation
+		// symmetrically) but never merge-joinable (merge needs both inputs
+		// physically ordered under the resolved collation, and the ordering
+		// property is collation-blind).
+		it('selects HashJoin when the PK side declares NOCASE and the FK side is plain', async () => {
+			await db.exec("CREATE TABLE txn (id TEXT COLLATE NOCASE PRIMARY KEY, d TEXT) USING memory");
+			await db.exec("CREATE TABLE entry (id INTEGER PRIMARY KEY, txn_id TEXT) USING memory");
+			await db.exec("INSERT INTO txn VALUES ('t1','a'), ('t2','b'), ('t3','c')");
+			await db.exec("INSERT INTO entry VALUES (1,'t1'), (2,'T2'), (3,'t3'), (4,'t1')");
+
+			const ops = await planOps(db, "SELECT e.id, t.d FROM entry e JOIN txn t ON t.id = e.txn_id");
+			expect(ops, 'mismatched-collation equi-join must hash join').to.include('HASHJOIN');
+			expect(ops, 'merge join is unsound on a mismatched-collation key').to.not.include('MERGEJOIN');
+		});
+
+		it('selects HashJoin when the FK side carries the COLLATE instead', async () => {
+			await db.exec("CREATE TABLE txn (id TEXT PRIMARY KEY, d TEXT) USING memory");
+			await db.exec("CREATE TABLE entry (id INTEGER PRIMARY KEY, txn_id TEXT COLLATE NOCASE) USING memory");
+			await db.exec("INSERT INTO txn VALUES ('t1','a'), ('t2','b'), ('t3','c')");
+			await db.exec("INSERT INTO entry VALUES (1,'t1'), (2,'T2'), (3,'t3'), (4,'t1')");
+
+			const ops = await planOps(db, "SELECT e.id, t.d FROM entry e JOIN txn t ON t.id = e.txn_id");
+			expect(ops).to.include('HASHJOIN');
+			expect(ops).to.not.include('MERGEJOIN');
+		});
+
+		it('selects HashJoin for a mismatched-collation LEFT join', async () => {
+			await db.exec("CREATE TABLE txn (id TEXT COLLATE NOCASE PRIMARY KEY, d TEXT) USING memory");
+			await db.exec("CREATE TABLE entry (id INTEGER PRIMARY KEY, txn_id TEXT) USING memory");
+			await db.exec("INSERT INTO txn VALUES ('t1','a'), ('t2','b'), ('t3','c')");
+			await db.exec("INSERT INTO entry VALUES (1,'t1'), (2,'T2'), (3,'zz'), (4,'t1')");
+
+			const ops = await planOps(db, "SELECT e.id, t.d FROM entry e LEFT JOIN txn t ON t.id = e.txn_id");
+			expect(ops).to.include('HASHJOIN');
+			expect(ops).to.not.include('MERGEJOIN');
+		});
+
+		it('never selects MergeJoin for a mismatched pair even when both inputs are ordered on the key', async () => {
+			// Both scans advertise PK ordering on the join key, which is the shape
+			// that would tempt merge — but each side's advertised order is under its
+			// OWN declared collation (NOCASE vs BINARY), so no single merge
+			// comparator co-walks them. Hash join must win instead.
+			await db.exec("CREATE TABLE a1 (k TEXT COLLATE NOCASE PRIMARY KEY, v INTEGER) USING memory");
+			await db.exec("CREATE TABLE b1 (k TEXT PRIMARY KEY, w INTEGER) USING memory");
+			await db.exec("INSERT INTO a1 VALUES ('a',1), ('b',2), ('c',3)");
+			await db.exec("INSERT INTO b1 VALUES ('a',10), ('B',20), ('c',30), ('d',40)");
+
+			const ops = await planOps(db, "SELECT a1.v, b1.w FROM a1 JOIN b1 ON a1.k = b1.k");
+			expect(ops).to.not.include('MERGEJOIN');
+			expect(ops).to.include('HASHJOIN');
+		});
+
+		it('mismatched-collation hash join returns the same rows the = operator matches', async () => {
+			await db.exec("CREATE TABLE txn (id TEXT COLLATE NOCASE PRIMARY KEY, d TEXT) USING memory");
+			await db.exec("CREATE TABLE entry (id INTEGER PRIMARY KEY, txn_id TEXT) USING memory");
+			await db.exec("INSERT INTO txn VALUES ('t1','a'), ('t2','b'), ('t3','c')");
+			await db.exec("INSERT INTO entry VALUES (1,'t1'), (2,'T2'), (3,'zz'), (4,'t1')");
+
+			// Declared NOCASE beats defaulted BINARY: 'T2' joins 't2'; 'zz' drops.
+			const rows = await allRows<{ id: number; d: string }>(db,
+				"SELECT e.id, t.d FROM entry e JOIN txn t ON t.id = e.txn_id ORDER BY e.id");
+			expect(rows).to.deep.equal([
+				{ id: 1, d: 'a' }, { id: 2, d: 'b' }, { id: 4, d: 'a' },
+			]);
+		});
+
+		it('matched non-BINARY collations still select a physical join', async () => {
+			await db.exec("CREATE TABLE p2 (k TEXT COLLATE NOCASE PRIMARY KEY, v INTEGER) USING memory");
+			await db.exec("CREATE TABLE c2 (id INTEGER PRIMARY KEY, fk TEXT COLLATE NOCASE) USING memory");
+			await db.exec("INSERT INTO p2 VALUES ('a',1), ('b',2), ('c',3)");
+			await db.exec("INSERT INTO c2 VALUES (1,'A'), (2,'b'), (3,'C'), (4,'a')");
+
+			const ops = await planOps(db, "SELECT c2.id, p2.v FROM c2 JOIN p2 ON c2.fk = p2.k");
+			expect(ops.includes('HASHJOIN') || ops.includes('MERGEJOIN'),
+				'matched-NOCASE equi-join should still pick a physical join').to.equal(true);
+		});
+	});
+
 	describe('nested-loop join for non-equi conditions', () => {
 		beforeEach(async () => {
 			await db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER) USING memory");

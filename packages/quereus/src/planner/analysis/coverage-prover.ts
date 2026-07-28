@@ -184,6 +184,9 @@ import { SortNode } from '../nodes/sort.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
 import type { EquiJoinPair } from '../nodes/join-utils.js';
+
+/** Attribute-id pairing slice of {@link EquiJoinPair} — all the coverage proofs read. */
+export type JoinAttrPair = Pick<EquiJoinPair, 'leftAttrId' | 'rightAttrId'>;
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../../schema/table.js';
@@ -720,8 +723,17 @@ function pureColumnEquiConjunctCount(cond: ScalarPlanNode): number | undefined {
  * than leaning on predicate pushdown to have hoisted it below the join. A bare
  * cross join (no condition / no equi-pairs) yields an empty list, which the
  * caller treats as "no FK to align".
+ *
+ * Returned pairs are the attribute-id slice only ({@link JoinAttrPair}) — the
+ * proofs here read the pairing, not the `EquiJoinPair` collation flags. A
+ * physical join may carry non-`valueDiscriminating` pairs (e.g. a NOCASE key);
+ * that is fine for the no-row-loss direction — a coarser-than-value-equality
+ * comparison only ever matches MORE rows, never dropping the FK-aligned parent
+ * row the inclusion guarantees — and the complementary ≤1/no-fan-out gates read
+ * key uniqueness from the join OUTPUT (which the physical nodes derive from
+ * value-discriminating pairs only), not from these pairs.
  */
-export function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly EquiJoinPair[] | undefined {
+export function pureJoinEquiAttrPairs(join: RelationalPlanNode): readonly JoinAttrPair[] | undefined {
 	if (join instanceof BloomJoinNode || join instanceof MergeJoinNode) {
 		return join.residualCondition === undefined ? join.equiPairs : undefined;
 	}
@@ -865,7 +877,7 @@ function innerJoinRetainsConstrainedTable(
  * single `lookupCoveringFK(T, P, …)` call can prove.
  */
 function indDerivedNoRowLoss(
-	equiPairs: readonly EquiJoinPair[],
+	equiPairs: readonly JoinAttrPair[],
 	tSide: RelationalPlanNode,
 	lookupRef: TableReferenceNode,
 ): boolean {

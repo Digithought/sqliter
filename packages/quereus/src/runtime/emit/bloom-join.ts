@@ -44,10 +44,14 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		rightIndices.push(ri);
 		// Resolve the pair's comparison collation through the shared provenance
 		// lattice so the probe- and build-side key normalization agree and match
-		// every other join algorithm and the nested-loop fallback. Throws on an
-		// explicit/declared conflict — a loud backstop; `equi-pair-extractor`'s
-		// matched-collation gate keeps such pairs out of this path (see the lockstep
-		// note there).
+		// every other join algorithm and the nested-loop fallback. The symmetric
+		// resolution is what makes MISMATCHED-collation pairs (declared NOCASE vs
+		// defaulted BINARY — tagged `collationsMatch: false` by
+		// `equi-pair-extractor`) hash-joinable: both sides' keys normalize under
+		// the one resolved collation, exactly what `=` would compare under.
+		// Throws on an explicit/declared conflict — a loud backstop; the
+		// extractor declines conflicting pairs (they stay in the residual), so
+		// this is unreachable for admitted pairs.
 		const leftType = leftAttributes[li].type;
 		const rightType = rightAttributes[ri].type;
 		const collationName = effectiveCollationOfTypes(leftType, rightType);

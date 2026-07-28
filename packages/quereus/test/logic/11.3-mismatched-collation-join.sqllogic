@@ -1,0 +1,74 @@
+-- 11.3-mismatched-collation-join.sqllogic - joins over differently-collated key columns
+--
+-- The planner hash-joins these shapes (ticket join-collation-gate-blocks-hash-join):
+-- a NOCASE-declared column joined to a defaulted-BINARY column resolves to a NOCASE
+-- comparison through the symmetric provenance lattice, so case-variant matches MUST
+-- be returned — identical to what the nested-loop `=` evaluation produced before the
+-- planner change. Merge join is never eligible for these pairs.
+
+-- ===== Collation on the parent (PK) side =====
+
+create table parent (k text collate nocase primary key, v integer);
+create table child (id integer primary key, fk text);
+insert into parent values ('Bob', 1), ('X', 2);
+insert into child values (1, 'bob'), (2, 'BOB'), (3, 'x'), (4, 'zz');
+
+-- INNER: case-variant FK values match the NOCASE parent key
+select c.id as id, p.v as v from child c join parent p on c.fk = p.k order by c.id;
+→ [{"id":1,"v":1},{"id":2,"v":1},{"id":3,"v":2}]
+
+-- INNER with operands flipped in the ON clause (resolution is symmetric)
+select c.id as id, p.v as v from child c join parent p on p.k = c.fk order by c.id;
+→ [{"id":1,"v":1},{"id":2,"v":1},{"id":3,"v":2}]
+
+-- LEFT: the unmatched child row null-pads
+select c.id as id, p.v as v from child c left join parent p on c.fk = p.k order by c.id;
+→ [{"id":1,"v":1},{"id":2,"v":1},{"id":3,"v":2},{"id":4,"v":null}]
+
+-- SEMI via IN: condition contributes nothing (defaulted BINARY), subquery column
+-- contributes declared NOCASE — resolved NOCASE
+select id from child where fk in (select k from parent) order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- SEMI via correlated EXISTS
+select id from child c where exists (select 1 from parent p where p.k = c.fk) order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- ANTI via NOT EXISTS
+select id from child c where not exists (select 1 from parent p where p.k = c.fk);
+→ [{"id":4}]
+
+-- ===== Collation on the child (FK) side; fan-out on the BINARY parent column =====
+
+-- A NOCASE probe value matches BOTH binary-distinct parent values 'Bob' and 'bob':
+-- the join must not claim at-most-one match per child row. (`k` is deliberately
+-- NOT the primary key: on the persistent store an undecorated text PK defaults
+-- to the table key collation NOCASE, which would collapse the case-variant rows.)
+create table parent2 (id integer primary key, k text, v integer);
+create table child2 (id integer primary key, fk text collate nocase);
+insert into parent2 values (1, 'Bob', 1), (2, 'bob', 2), (3, 'X', 3), (4, 'zz', 4);
+insert into child2 values (1, 'BOB'), (2, 'x');
+
+select c.id as id, p.v as v from child2 c join parent2 p on c.fk = p.k order by c.id, p.v;
+→ [{"id":1,"v":1},{"id":1,"v":2},{"id":2,"v":3}]
+
+-- DISTINCT over the fanned-out join must not be elided by a false key claim
+select distinct c.id as id from child2 c join parent2 p on c.fk = p.k order by c.id;
+→ [{"id":1},{"id":2}]
+
+-- SEMI: each child row emits once despite the double match
+select id from child2 c where exists (select 1 from parent2 p where p.k = c.fk) order by id;
+→ [{"id":1},{"id":2}]
+
+-- ===== USING over differently-collated columns =====
+
+create table u1 (k text collate nocase, a integer);
+create table u2 (k text, b integer);
+insert into u1 values ('Bob', 1), ('zz', 2);
+insert into u2 values ('bob', 10), ('BOB', 20), ('yy', 30);
+
+select a, b from u1 join u2 using (k) order by a, b;
+→ [{"a":1,"b":10},{"a":1,"b":20}]
+
+select a, b from u1 left join u2 using (k) order by a, b;
+→ [{"a":1,"b":10},{"a":1,"b":20},{"a":2,"b":null}]

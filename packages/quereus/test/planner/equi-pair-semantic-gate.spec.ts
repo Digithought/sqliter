@@ -61,15 +61,18 @@ describe('semantic-ordering gate on equi-join keys', () => {
 	});
 
 	describe('extractEquiPairsFromUsing', () => {
-		const attr = (id: number, name: string, logicalType: LogicalType, collationName = 'BINARY') =>
-			({ id, name, type: { collationName, logicalType } });
+		const attr = (id: number, name: string, logicalType: LogicalType, collationName = 'BINARY',
+			collationSource?: 'explicit' | 'declared' | 'default') =>
+			({ id, name, type: { collationName, collationSource, logicalType } });
 
 		it('extracts a pair when both sides agree on semantic ordering', () => {
 			const result = extractEquiPairsFromUsing(
 				['d'],
 				[attr(1, 'd', TIMESPAN_TYPE)],
 				[attr(2, 'd', TIMESPAN_TYPE)]);
-			expect(result?.equiPairs).to.deep.equal([{ leftAttrId: 1, rightAttrId: 2 }]);
+			expect(result?.equiPairs).to.deep.equal([
+				{ leftAttrId: 1, rightAttrId: 2, collationsMatch: true, valueDiscriminating: true },
+			]);
 			expect(result?.residual).to.equal(undefined);
 		});
 
@@ -87,18 +90,46 @@ describe('semantic-ordering gate on equi-join keys', () => {
 				[attr(2, 'k', TEXT_TYPE), attr(4, 'd', TEXT_TYPE)])).to.equal(null);
 		});
 
-		it('still sinks on mismatched collations (the pre-existing gate)', () => {
+		it('extracts a mismatched-collation pair tagged for hash join only (no value facts)', () => {
+			// Formerly the matched-collation gate sank the whole extraction; now the
+			// pair is admitted with collationsMatch=false (merge declines it) and
+			// valueDiscriminating=false (the resolved NOCASE comparison matches
+			// value-different rows, so no key/FD/EC facts may be minted from it).
 			expect(extractEquiPairsFromUsing(
 				['k'],
-				[attr(1, 'k', TEXT_TYPE, 'NOCASE')],
-				[attr(2, 'k', TEXT_TYPE, 'BINARY')])).to.equal(null);
+				[attr(1, 'k', TEXT_TYPE, 'NOCASE', 'declared')],
+				[attr(2, 'k', TEXT_TYPE, 'BINARY')])?.equiPairs).to.deep.equal([
+				{ leftAttrId: 1, rightAttrId: 2, collationsMatch: false, valueDiscriminating: false },
+			]);
+		});
+
+		it('tags a matched non-BINARY pair merge-eligible but still not value-discriminating', () => {
+			expect(extractEquiPairsFromUsing(
+				['k'],
+				[attr(1, 'k', TEXT_TYPE, 'NOCASE', 'declared')],
+				[attr(2, 'k', TEXT_TYPE, 'NOCASE', 'declared')])?.equiPairs).to.deep.equal([
+				{ leftAttrId: 1, rightAttrId: 2, collationsMatch: true, valueDiscriminating: false },
+			]);
+		});
+
+		it('sinks the extraction on a same-rank declared collation conflict', () => {
+			// NOCASE vs RTRIM, both declared: the lattice reports `conflict` — a
+			// plan-time user error surfaced elsewhere; extraction must neither throw
+			// nor admit the pair, and USING has no residual, so the whole extraction
+			// sinks and the generic join evaluates (and surfaces) the comparison.
+			expect(extractEquiPairsFromUsing(
+				['k'],
+				[attr(1, 'k', TEXT_TYPE, 'NOCASE', 'declared')],
+				[attr(2, 'k', TEXT_TYPE, 'RTRIM', 'declared')])).to.equal(null);
 		});
 
 		it('matches USING column names case-insensitively and skips absent columns', () => {
 			expect(extractEquiPairsFromUsing(
 				['D'],
 				[attr(1, 'd', TEXT_TYPE)],
-				[attr(2, 'd', TEXT_TYPE)])?.equiPairs).to.deep.equal([{ leftAttrId: 1, rightAttrId: 2 }]);
+				[attr(2, 'd', TEXT_TYPE)])?.equiPairs).to.deep.equal([
+				{ leftAttrId: 1, rightAttrId: 2, collationsMatch: true, valueDiscriminating: true },
+			]);
 			expect(extractEquiPairsFromUsing(
 				['missing'],
 				[attr(1, 'd', TEXT_TYPE)],

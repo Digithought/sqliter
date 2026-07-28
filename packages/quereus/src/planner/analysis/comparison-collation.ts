@@ -50,6 +50,13 @@ export interface CollationContribution {
 	readonly rank: 3 | 2 | 1;
 }
 
+/**
+ * The slice of a `ScalarType` the contribution lattice reads. Structural so
+ * sites holding attribute-type fragments rather than full `ScalarType`s (the
+ * USING equi-pair extractor) can resolve through the same lattice.
+ */
+export type CollationCarrier = Pick<ScalarType, 'collationName' | 'collationSource'>;
+
 const RANK_BY_SOURCE: Record<CollationSource, 3 | 2 | 1> = { explicit: 3, declared: 2, default: 1 };
 const SOURCE_BY_RANK: Record<3 | 2 | 1, CollationSource> = { 3: 'explicit', 2: 'declared', 1: 'default' };
 
@@ -60,7 +67,7 @@ const SOURCE_BY_RANK: Record<3 | 2 | 1, CollationSource> = { 3: 'explicit', 2: '
  * `collationName` is treated as `'default'` (the safe floor for any
  * construction site the provenance sweep missed).
  */
-export function collationContribution(t: ScalarType): CollationContribution | undefined {
+export function collationContribution(t: CollationCarrier): CollationContribution | undefined {
 	if (t.collationName === undefined) return undefined;
 	const rank = RANK_BY_SOURCE[t.collationSource ?? 'default'];
 	const name = normalizeCollationName(t.collationName);
@@ -95,7 +102,7 @@ function resolveContributions(
  * lattice. Pure — never throws; conflicts are returned for the caller to
  * surface (plan-time validation) or gate on (the predicate normalizer).
  */
-export function resolveComparisonCollation(left: ScalarType, right: ScalarType): CollationResolution {
+export function resolveComparisonCollation(left: CollationCarrier, right: CollationCarrier): CollationResolution {
 	return resolveContributions(collationContribution(left), collationContribution(right));
 }
 

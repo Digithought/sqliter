@@ -63,7 +63,11 @@ export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): Pl
 	// ordering-based path produces a multi-key merge join with full
 	// unique-key propagation; demoting pairs to residual here would lose that
 	// propagation. Our rule is meant to *extend* recognition, not regress it.
-	if (isMergeReadyOnAllPairs(node.left, node.right, extracted.equiPairs)) return null;
+	// Defer only when that rule can actually take merge: it requires EVERY
+	// pair `collationsMatch` (see EquiJoinPair.collationsMatch) — with any
+	// mismatched pair it never merges, so there is nothing to defer to.
+	if (extracted.equiPairs.every(p => p.collationsMatch)
+		&& isMergeReadyOnAllPairs(node.left, node.right, extracted.equiPairs)) return null;
 
 	const leftMon = PlanNodeCharacteristics.getMonotonicOn(node.left);
 	const rightMon = PlanNodeCharacteristics.getMonotonicOn(node.right);
@@ -72,9 +76,14 @@ export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): Pl
 	// Find equi-pairs where BOTH sides are MonotonicOn on their respective
 	// attrId with matching direction. v1 requires ASC because the merge-join
 	// emitter assumes ASC; DESC-DESC streaming would need a reversed compareKeys.
+	// The driving merge key must have matched declared collations: each side's
+	// monotonicOn (like `ordering`) is implicitly under its OWN declared
+	// collation, and the merge comparator resolves the pair's collation — only
+	// a matched pair makes those the same order (see EquiJoinPair.collationsMatch).
 	const matchedIndices: number[] = [];
 	for (let i = 0; i < extracted.equiPairs.length; i++) {
 		const pair = extracted.equiPairs[i];
+		if (!pair.collationsMatch) continue;
 		const l = leftMon.find(m => m.attrId === pair.leftAttrId && m.direction === 'asc');
 		if (!l) continue;
 		const r = rightMon.find(m => m.attrId === pair.rightAttrId && m.direction === 'asc');

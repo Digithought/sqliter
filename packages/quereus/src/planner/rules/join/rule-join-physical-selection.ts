@@ -105,6 +105,16 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 	const probeRows = Math.max(leftRows, rightRows);
 	const hashCostValue = hashJoinCost(buildRows, probeRows);
 
+	// Merge join is a candidate only when EVERY pair has matched declared
+	// collations: merge needs both inputs physically ordered under the key's
+	// comparison collation, and the ordering property is collation-blind — a
+	// matched declared collation is what makes each input's advertised order
+	// equal the merge comparator's order (see EquiJoinPair.collationsMatch).
+	// Any mismatched pair ⇒ merge unavailable; hash vs nested-loop compete.
+	// (Merging on just the matched subset would be sound but is deliberately
+	// not attempted — rare shape, minimal-change tradeoff.)
+	const mergeAvailable = extracted.equiPairs.every(p => p.collationsMatch);
+
 	// Merge join cost: depends on whether inputs are already sorted.
 	// Try reordering equi-pairs to match the source orderings first.
 	let mergeEquiPairs = extracted.equiPairs;
@@ -118,7 +128,9 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 			rightOrdered = true;
 		}
 	}
-	const mergeCostValue = mergeJoinCost(leftRows, rightRows, !leftOrdered, !rightOrdered);
+	const mergeCostValue = mergeAvailable
+		? mergeJoinCost(leftRows, rightRows, !leftOrdered, !rightOrdered)
+		: Infinity;
 
 	// Pick the cheapest physical join algorithm
 	type JoinAlgo = 'nested-loop' | 'hash' | 'merge';
@@ -189,8 +201,9 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 		// Swap: left becomes build, right becomes probe
 		probeSource = node.right;
 		buildSource = node.left;
-		// Flip equi-pair directions
+		// Flip equi-pair directions; spread so the collation flags survive.
 		equiPairs = extracted.equiPairs.map(p => ({
+			...p,
 			leftAttrId: p.rightAttrId,
 			rightAttrId: p.leftAttrId
 		}));

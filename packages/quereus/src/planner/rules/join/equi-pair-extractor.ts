@@ -10,7 +10,13 @@ import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
-import { operandCollation } from '../../analysis/comparison-collation.js';
+import {
+	operandCollation,
+	isValueDiscriminatingEquality,
+	resolveComparisonCollation,
+	logicalTypeCanHoldText,
+	type CollationCarrier,
+} from '../../analysis/comparison-collation.js';
 import { normalizeCollationName, semanticOrderingsAgree } from '../../../util/comparison.js';
 import type { LogicalType } from '../../../types/logical-type.js';
 
@@ -131,30 +137,37 @@ export function combineResidual(
  * Extract equi-join pairs and residual predicates from an ON condition.
  * Returns null if no equi-pairs are found.
  *
- * **Collation gate.** A `l = r` column pair is recognized only when both
- * columns contribute the same collation. Every physical join algorithm this
- * extraction feeds (hash / merge / bloom) now resolves the pair's comparison
- * collation through the SAME provenance lattice as the canonical scalar
- * comparison (`resolveComparisonCollation` — symmetric, so the result no longer
- * depends on which side the algorithm reads first; ticket
- * `join-key-collation-resolution-alignment`). So the historical
- * resolution-order disagreement is gone — but the gate is **deliberately kept
- * conservative** for a second, independent reason: a *merge* join also requires
- * both inputs physically ordered under the key's comparison collation, and the
- * physical ordering property (`PhysicalProperties.ordering`) is collation-blind
- * (`{column, desc}` only) — a column's advertised ordering is implicitly under
- * its OWN declared collation. Admitting an asymmetric pair (declared NOCASE vs
- * defaulted BINARY → resolves NOCASE) would compare under NOCASE a side sorted
- * under BINARY, silently breaking the merge. Requiring matched collations keeps
- * the resolved key collation equal to each input's declared sort collation, so
- * the merge stays sound without the ordering property having to carry collation.
- * Loosening this gate is therefore an optimization gated on teaching the planner
- * ordering to track collation end-to-end — out of scope here. Mismatched pairs
- * demote to the residual, where the canonical scalar comparison (right-first but
- * via the same lattice) evaluates them; if no matched pair remains, the rule
- * doesn't fire and the generic join evaluates the whole condition. (Tickets
- * `collation-blind-equality-fact-extraction`,
- * `join-key-collation-resolution-alignment`.)
+ * **Collation handling — tagged, not gated.** A `l = r` column pair is
+ * extracted regardless of whether the two sides declare the same collation;
+ * every physical join algorithm this extraction feeds resolves the pair's
+ * comparison collation through the SAME symmetric provenance lattice as the
+ * canonical scalar comparison (`resolveComparisonCollation`; ticket
+ * `join-key-collation-resolution-alignment`), so a hash/bloom key over an
+ * asymmetric pair (declared NOCASE vs defaulted BINARY → resolves NOCASE)
+ * normalizes both sides identically and matches exactly what `=` matches.
+ * The two collation-derived properties that DO differ per pair travel on the
+ * pair itself (see {@link EquiJoinPair}):
+ *
+ * - `collationsMatch` — merge join's admission bit. Merge additionally needs
+ *   both inputs physically ordered under the key's comparison collation, and
+ *   `PhysicalProperties.ordering` is collation-blind (`{column, desc}` only);
+ *   a matched declared collation is what makes each input's advertised order
+ *   equal the merge comparator's order. The selection rules
+ *   (`rule-join-physical-selection`, `rule-monotonic-merge-join`) consider
+ *   merge only for matched pairs; hash/bloom take every pair.
+ * - `valueDiscriminating` — the fact-minting bit
+ *   (`isValueDiscriminatingEquality`). A non-BINARY comparison passes
+ *   value-DIFFERENT rows ('Bob' = 'bob' NOCASE), so the physical join nodes
+ *   exclude such pairs from key coverage / FD / EC / monotonicity
+ *   propagation while still keying the join on them. (Ticket
+ *   `collation-blind-equality-fact-extraction`.)
+ *
+ * One collation shape is still declined outright: a same-rank
+ * explicit/declared *conflict* (`resolveComparisonCollation` → `conflict`,
+ * e.g. declared NOCASE vs declared RTRIM). That is a plan-time user error
+ * surfaced by `BinaryOpNode.generateType`; extraction must neither throw nor
+ * admit the pair (the emitters' lattice resolution would throw), so the
+ * conjunct stays in the residual and the error surfaces at its own site.
  *
  * **Semantic-ordering gate.** A pair is likewise recognized only when both sides
  * agree on semantic ordering — neither declares a semantic-ordering logical type,
@@ -194,17 +207,19 @@ export function extractEquiPairs(
 		let isEqui = false;
 		if (n instanceof BinaryOpNode && n.expression.operator === '=') {
 			if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode
-				&& operandCollation(n.left) === operandCollation(n.right)
-				&& semanticOrderingsAgree(n.left.getType().logicalType, n.right.getType().logicalType)) {
+				&& semanticOrderingsAgree(n.left.getType().logicalType, n.right.getType().logicalType)
+				&& resolveComparisonCollation(n.left.getType(), n.right.getType()).kind !== 'conflict') {
 				const lId = n.left.attributeId;
 				const rId = n.right.attributeId;
+				const collationsMatch = operandCollation(n.left) === operandCollation(n.right);
+				const valueDiscriminating = isValueDiscriminatingEquality(n.left, n.right);
 
 				if (leftAttrIds.has(lId) && rightAttrIds.has(rId)) {
-					equiPairs.push({ leftAttrId: lId, rightAttrId: rId });
+					equiPairs.push({ leftAttrId: lId, rightAttrId: rId, collationsMatch, valueDiscriminating });
 					equiPairNodes.push(n);
 					isEqui = true;
 				} else if (leftAttrIds.has(rId) && rightAttrIds.has(lId)) {
-					equiPairs.push({ leftAttrId: rId, rightAttrId: lId });
+					equiPairs.push({ leftAttrId: rId, rightAttrId: lId, collationsMatch, valueDiscriminating });
 					equiPairNodes.push(n);
 					isEqui = true;
 				}
@@ -231,19 +246,33 @@ export function extractEquiPairs(
 type UsingAttr = {
 	id: number;
 	name: string;
-	type?: { collationName?: string; logicalType?: LogicalType };
+	type?: CollationCarrier & { logicalType?: LogicalType };
 };
+
+/**
+ * The USING analogue of {@link isValueDiscriminatingEquality}, over declared
+ * attribute slices rather than plan nodes: both sides' declared collations are
+ * BINARY, or neither side's static type can ever hold text at runtime.
+ */
+function isValueDiscriminatingUsingPair(left: UsingAttr, right: UsingAttr): boolean {
+	const lColl = normalizeCollationName(left.type?.collationName ?? 'BINARY');
+	const rColl = normalizeCollationName(right.type?.collationName ?? 'BINARY');
+	if (lColl === 'BINARY' && rColl === 'BINARY') return true;
+	return !logicalTypeCanHoldText(left.type?.logicalType) && !logicalTypeCanHoldText(right.type?.logicalType);
+}
 
 /**
  * Convert USING-column names into equi-pairs given the left/right attributes.
  * Returns null if no pairs could be matched.
  *
- * Applies the same matched-collation and semantic-ordering gates as
- * {@link extractEquiPairs}: a USING pair over columns with differing declared
- * collations, or with disagreeing semantic ordering (one side `timespan`, the
- * other plain `text`), is rejected outright (USING has no residual to demote
- * into — the whole extraction returns null so the generic join handles the
- * condition).
+ * Collation is handled as in {@link extractEquiPairs}: a pair over columns with
+ * differing declared collations IS extracted, tagged `collationsMatch: false`
+ * (hash/bloom join it; merge declines) and with `valueDiscriminating` per the
+ * value-discrimination gate. Two shapes still sink the whole extraction to
+ * `null` (USING has no residual to demote into — the generic join evaluates
+ * the condition instead): a same-rank explicit/declared collation *conflict*,
+ * and disagreeing semantic ordering (one side `timespan`, the other plain
+ * `text` — see the semantic-ordering gate on {@link extractEquiPairs}).
  */
 export function extractEquiPairsFromUsing(
 	usingColumns: readonly string[] | undefined,
@@ -257,11 +286,16 @@ export function extractEquiPairsFromUsing(
 		const leftAttr = leftAttrs.find(a => a.name.toLowerCase() === lower);
 		const rightAttr = rightAttrs.find(a => a.name.toLowerCase() === lower);
 		if (leftAttr && rightAttr) {
+			if (resolveComparisonCollation(leftAttr.type ?? {}, rightAttr.type ?? {}).kind === 'conflict') return null;
+			if (!semanticOrderingsAgree(leftAttr.type?.logicalType, rightAttr.type?.logicalType)) return null;
 			const lColl = normalizeCollationName(leftAttr.type?.collationName ?? 'BINARY');
 			const rColl = normalizeCollationName(rightAttr.type?.collationName ?? 'BINARY');
-			if (lColl !== rColl) return null;
-			if (!semanticOrderingsAgree(leftAttr.type?.logicalType, rightAttr.type?.logicalType)) return null;
-			equiPairs.push({ leftAttrId: leftAttr.id, rightAttrId: rightAttr.id });
+			equiPairs.push({
+				leftAttrId: leftAttr.id,
+				rightAttrId: rightAttr.id,
+				collationsMatch: lColl === rColl,
+				valueDiscriminating: isValueDiscriminatingUsingPair(leftAttr, rightAttr),
+			});
 		}
 	}
 	if (equiPairs.length === 0) return null;

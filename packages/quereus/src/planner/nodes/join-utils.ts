@@ -19,10 +19,36 @@ import {
 /**
  * An equi-join pair: left attribute = right attribute.
  * Attribute IDs are stable across plan transformations.
+ *
+ * Both flags are REQUIRED at every construction site — an implicit `true`
+ * default would silently reproduce the over-claims they exist to prevent.
  */
 export interface EquiJoinPair {
 	leftAttrId: number;
 	rightAttrId: number;
+
+	/**
+	 * True when both sides declare the SAME collation (`operandCollation`
+	 * equality). Only merge join reads this: it requires both inputs physically
+	 * ordered under the key's comparison collation, and
+	 * `PhysicalProperties.ordering` is collation-blind (`{column, desc}` only) —
+	 * a matched declared collation is what makes each input's advertised order
+	 * equal the merge comparator's order. Hash/Bloom join does not care — its
+	 * emitter resolves the pair collation symmetrically
+	 * (`effectiveCollationOfTypes`) and normalizes both sides' keys under it.
+	 */
+	collationsMatch: boolean;
+
+	/**
+	 * True when rows this pair matches are genuinely value-equal
+	 * (`isValueDiscriminatingEquality`). False for any possibly-text pair whose
+	 * comparison collation is non-BINARY: such a comparison matches
+	 * value-DIFFERENT rows ('Bob' = 'bob' under NOCASE), so the pair must not
+	 * mint equivalence classes, determination FDs, key coverage, or
+	 * monotonicity claims. It remains a perfectly good *join condition* — the
+	 * runtime emitters key/compare under the resolved collation regardless.
+	 */
+	valueDiscriminating: boolean;
 }
 
 /**

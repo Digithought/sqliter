@@ -16,6 +16,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { keysOf, isAtMostOneRow, extractEqualityFds } from '../../src/planner/util/fd-utils.js';
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
+import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { EmptyScope } from '../../src/planner/scopes/empty.js';
 import { BinaryOpNode, CollateNode, LiteralNode } from '../../src/planner/nodes/scalar.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
@@ -209,21 +210,70 @@ describe('Collation soundness of plan-time equality facts', () => {
 			}
 		});
 
-		it('USING over asymmetric declared collations mints no key claims (gate returns null → generic join)', async () => {
+		it('USING over asymmetric declared collations mints no key claims (pair is hash-joinable but not value-discriminating)', async () => {
 			await db.exec('create table j7 (a integer primary key, k text collate nocase) using memory');
 			await db.exec('create table j8 (k text primary key, z integer) using memory');
 			await db.exec("insert into j7 values (1,'BOB')");
 			await db.exec("insert into j8 values ('Bob',1), ('bob',2)");
-			// extractEquiPairsFromUsing rejects the mismatched pair, so no physical
-			// equi-join (and no pair-derived key coverage) may fire; the generic
-			// join resolves the USING comparison through the provenance lattice
-			// (declared NOCASE beats the right side's defaulted BINARY),
-			// matching BOTH right case-variants — duplicated `a` on the output.
+			// extractEquiPairsFromUsing now ADMITS the mismatched pair (tagged
+			// collationsMatch=false / valueDiscriminating=false), so a hash join may
+			// fire — but whichever algorithm runs, the pair mints no key coverage,
+			// and the comparison resolves through the provenance lattice (declared
+			// NOCASE beats the right side's defaulted BINARY), matching BOTH right
+			// case-variants — duplicated `a` on the output.
 			const q = 'select j7.a as a, j8.z as z from j7 join j8 using (k)';
 			const root = rootOf(db, q);
 			const rows = await collect(db, q);
 			expect(rows.length).to.equal(2);
 			expect(keysOf(root).some(k => k.length === 1 && k[0] === 0), 'key {a} over-claimed with duplicated a').to.equal(false);
+		});
+
+		it('a matched-NOCASE physical hash/merge join publishes no cross-side equivalence or determination FDs', async () => {
+			// The physical join nodes must apply the same value-discrimination gate
+			// the logical JoinNode's extractEquiPairsFromCondition applies: a NOCASE
+			// pair matches rows like 'Bob'/'bob' that are NOT value-equal, so no
+			// equivalence class or per-pair determination FD may couple the sides.
+			// (Composite key FDs spanning both sides are fine — they claim
+			// row-uniqueness of the combined key, not value equality of the pair.)
+			await db.exec('create table m1 (a integer primary key, k text collate nocase) using memory');
+			await db.exec('create table m2 (d text collate nocase primary key, z integer) using memory');
+			await db.exec("insert into m1 values (1,'BOB'), (2,'bob'), (3,'x'), (4,'zz')");
+			await db.exec("insert into m2 values ('Bob',1), ('X',2), ('Y',3)");
+			const q = 'select m1.a as a, m2.z as z from m1 join m2 on m1.k = m2.d';
+			const root = rootOf(db, q);
+
+			const findPhysicalJoin = (node: PlanNode): PlanNode | undefined => {
+				if (node.nodeType === PlanNodeType.HashJoin || node.nodeType === PlanNodeType.MergeJoin) return node;
+				for (const child of node.getChildren()) {
+					const found = findPhysicalJoin(child);
+					if (found) return found;
+				}
+				return undefined;
+			};
+			const join = findPhysicalJoin(root as unknown as PlanNode);
+			expect(join, 'expected a physical hash/merge join for the matched-NOCASE equi-join').to.exist;
+
+			const leftCols = (join as unknown as { left: RelationalPlanNode }).left.getAttributes().length;
+			const phys = (join as unknown as {
+				physical?: {
+					equivClasses?: ReadonlyArray<ReadonlyArray<number>>;
+					fds?: ReadonlyArray<{ determinants: ReadonlyArray<number>; dependents: ReadonlyArray<number>; kind?: string }>;
+				};
+			}).physical;
+			const crossSide = (indices: ReadonlyArray<number>) =>
+				indices.some(i => i < leftCols) && indices.some(i => i >= leftCols);
+			for (const ec of phys?.equivClasses ?? []) {
+				expect(crossSide(ec), `equivalence class [${ec}] couples the two sides of a NOCASE join`).to.equal(false);
+			}
+			for (const fd of phys?.fds ?? []) {
+				if (fd.kind !== 'determination') continue;
+				expect(crossSide([...fd.determinants, ...fd.dependents]),
+					`determination FD [${fd.determinants}]→[${fd.dependents}] couples the two sides of a NOCASE join`).to.equal(false);
+			}
+
+			// Behavior control: the join itself still matches case-insensitively.
+			const rows = await collect(db, q + ' order by a');
+			expect(rows).to.deep.equal([{ a: 1, z: 1 }, { a: 2, z: 1 }, { a: 3, z: 2 }]);
 		});
 
 		it('matched-collation (NOCASE=NOCASE) joins still match case-insensitively', async () => {

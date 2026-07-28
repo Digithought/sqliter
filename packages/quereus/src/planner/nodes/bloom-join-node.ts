@@ -63,12 +63,30 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return this.attributesCache.value;
 	}
 
+	/**
+	 * The subset of `equiPairs` that may mint value-level facts (keys, FDs,
+	 * equivalence classes). A non-`valueDiscriminating` pair still keys the
+	 * hash build/probe (the emitter reads the full `equiPairs`), but its matched
+	 * rows are not value-equal, so fact propagation must not see it — mirrors
+	 * the `isValueDiscriminatingEquality` gate on the logical JoinNode's
+	 * `extractEquiPairsFromCondition`.
+	 *
+	 * NOTE: this is a deliberate under-claim for matched-NOCASE pairs whose
+	 * covered key is itself NOCASE-enforced (there the coverage would be sound);
+	 * if NOCASE-keyed join plans regress from the lost key coverage / row
+	 * estimates, consider a collation-aware coverage check instead of this
+	 * blanket filter.
+	 */
+	private factPairs(): readonly EquiJoinPair[] {
+		return this.equiPairs.filter(p => p.valueDiscriminating);
+	}
+
 	getType(): RelationType {
 		const leftType = this.left.getType();
 		const rightType = this.right.getType();
 		const leftIndex = this.left.getAttributeIndex();
 		const rightIndex = this.right.getAttributeIndex();
-		const indexPairs = this.equiPairs.map(p => ({
+		const indexPairs = this.factPairs().map(p => ({
 			left: leftIndex.get(p.leftAttrId) ?? -1,
 			right: rightIndex.get(p.rightAttrId) ?? -1,
 		})).filter(p => p.left >= 0 && p.right >= 0);
@@ -83,8 +101,9 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		const leftIndex = this.left.getAttributeIndex();
 		const rightIndex = this.right.getAttributeIndex();
 
-		// Map attribute-ID-based equi-pairs to column-index-based pairs
-		const indexPairs = this.equiPairs.map(p => ({
+		// Map attribute-ID-based equi-pairs to column-index-based pairs.
+		// Value-fact consumers only — see `factPairs`.
+		const indexPairs = this.factPairs().map(p => ({
 			left: leftIndex.get(p.leftAttrId) ?? -1,
 			right: rightIndex.get(p.rightAttrId) ?? -1,
 		}));
@@ -178,7 +197,14 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return {
 			joinType: this.joinType,
 			algorithm: 'bloom',
-			equiPairs: this.equiPairs.map(p => ({ left: p.leftAttrId, right: p.rightAttrId })),
+			// Non-default flags surface in plan dumps so a mismatched-collation
+			// pair (hash-joinable, merge-declined, no value facts) is visible.
+			equiPairs: this.equiPairs.map(p => ({
+				left: p.leftAttrId,
+				right: p.rightAttrId,
+				...(p.collationsMatch ? {} : { collationsMatch: false }),
+				...(p.valueDiscriminating ? {} : { valueDiscriminating: false }),
+			})),
 			hasResidual: !!this.residualCondition,
 			leftRows: this.left.estimatedRows,
 			rightRows: this.right.estimatedRows,
