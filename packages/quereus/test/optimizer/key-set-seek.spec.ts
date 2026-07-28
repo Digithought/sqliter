@@ -122,6 +122,14 @@ describe('key-set-seek plan shape', () => {
 		)).to.have.lengthOf(0);
 	});
 
+	it('never fires on a non-deterministic key source', () => {
+		// The key source is drained exactly once, so a per-execution-varying
+		// inner must keep the hash join's own (equally one-shot, but unrewritten)
+		// semantics rather than additionally steering an access path.
+		const sql = 'select pk from big where v in (select cast(random() * 10 as integer) from small)';
+		expect(keySetNodes(sql)).to.have.lengthOf(0);
+	});
+
 	it('never fires on a correlated IN', () => {
 		expect(keySetNodes(
 			'select pk from big b where v in (select id from small s where s.id = b.pk)',

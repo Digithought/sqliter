@@ -19,6 +19,8 @@ import type { MemoryTableConfig } from '../../src/vtab/memory/types.js';
 import type { FilterInfo } from '../../src/vtab/filter-info.js';
 import type { Row } from '../../src/common/types.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult } from '../../src/vtab/best-access-plan.js';
+import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { isAbortError } from '../../src/common/errors.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { CountingMemoryModule } from './_counting-memory-module.js';
 
@@ -93,12 +95,67 @@ class BreakEvenModule extends IdxStrCapturingModule {
 	}
 }
 
+/**
+ * Cost-model variants of {@link BreakEvenModule} that pin the two interpolation
+ * arms the linear fit takes outside the ordinary "seek gets dearer with keys"
+ * case. `flat` keeps the runtime-set cost independent of key count (slope ≤ 0 ⇒
+ * a seek never loses, so the engine ceiling becomes the threshold); `scan-wins`
+ * keeps the seek cost rising but prices the plain scan below even a two-key seek
+ * (break-even interpolates below 1 ⇒ the rule must decline outright and leave
+ * the hash semi join).
+ */
+class CostArmModule extends IdxStrCapturingModule {
+	constructor(private readonly arm: 'flat' | 'scan-wins') {
+		super();
+	}
+
+	override getBestAccessPlan(
+		db: Database,
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+	): BestAccessPlanResult {
+		const plan = MemoryTableModule.prototype.getBestAccessPlan.call(this, db, tableInfo, request) as BestAccessPlanResult;
+		if (tableInfo.name.toLowerCase() !== 'big') return plan;
+		const runtimeSet = request.filters.find(f => f.runtimeSet)?.runtimeSet;
+		if (this.arm === 'flat') {
+			if (runtimeSet) return { ...plan, cost: 50 };
+			if (request.filters.length === 0) return { ...plan, cost: 1000 };
+			return plan;
+		}
+		if (runtimeSet) return { ...plan, cost: 500 + runtimeSet.maxCount };
+		if (request.filters.length === 0) return { ...plan, cost: 1 };
+		return plan;
+	}
+}
+
+/** Memory module that answers the engine's synthesized runtime-set probe with a
+ *  self-contradictory plan (it claims to have handled a filter it was never
+ *  given), which `validateAccessPlan` rejects. */
+class InvalidProbeModule extends IdxStrCapturingModule {
+	override getBestAccessPlan(
+		db: Database,
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+	): BestAccessPlanResult {
+		const plan = MemoryTableModule.prototype.getBestAccessPlan.call(this, db, tableInfo, request) as BestAccessPlanResult;
+		if (tableInfo.name.toLowerCase() !== 'big' || !request.filters.some(f => f.runtimeSet)) return plan;
+		return { ...plan, handledFilters: [...plan.handledFilters, true] };
+	}
+}
+
 const MULTI_SEEK_RE = /^idx=idx_v\(0\);plan=5;inCount=(\d+)$/;
 
 async function allRows<T>(db: Database, sql: string): Promise<T[]> {
 	const rows: T[] = [];
 	for await (const r of db.eval(sql)) rows.push(r as T);
 	return rows;
+}
+
+/** Every node type in a plan tree, for shape assertions that need no node identity. */
+function collectNodeTypes(root: PlanNode): string[] {
+	const types: string[] = [root.nodeType];
+	for (const child of root.getChildren()) types.push(...collectNodeTypes(child as PlanNode));
+	return types;
 }
 
 describe('KeySetSemiJoin runtime', () => {
@@ -250,6 +307,109 @@ describe('KeySetSemiJoin runtime', () => {
 			expect(rows, 'the case variant the index over-fetched is trimmed').to.deep.equal([{ pk: 1 }]);
 			expect((module.idxStrs.get('ct') ?? [])[0], 'the coarser index was seeked (probe did the trimming)')
 				.to.match(/^idx=idx_ci\(0\);plan=5;inCount=1$/);
+		});
+
+		it('an abort during the drain never opens the target', async () => {
+			await db.exec('insert into small values (1, 100), (2, 300)');
+			module.reset();
+			const controller = new AbortController();
+			controller.abort();
+			let caught: unknown;
+			try {
+				for await (const _row of db.eval(
+					'select pk from big where v in (select k from small)', [], { signal: controller.signal })) {
+					// unreachable — the abort fires before the key set is built
+				}
+			} catch (e) {
+				caught = e;
+			}
+			expect(isAbortError(caught), 'the abort surfaces as an AbortError').to.equal(true);
+			expect(module.scanCounts.get('big'), 'target query() never called').to.equal(undefined);
+		});
+	});
+
+	describe('descending seek index', () => {
+		it('seeks a DESC index and returns the matching rows', async () => {
+			const db = new Database();
+			const module = new IdxStrCapturingModule();
+			db.registerModule('countmem', module);
+			try {
+				await db.exec('create table small (id integer primary key, k integer null) using countmem()');
+				await db.exec('create table big (pk integer primary key, v integer null) using countmem()');
+				// The seek keys are emitted in the index's own (descending) key order.
+				await db.exec('create index idx_v on big(v desc)');
+				await db.exec('insert into big values (1, 10), (2, 20), (3, 30), (4, 40)');
+				await db.exec('insert into small values (1, 30), (2, 10), (3, 40)');
+				module.reset();
+				// No ORDER BY: an absorbed sort would mark the leaf's emission order
+				// load-bearing and the rule would (correctly) decline.
+				const rows = await allRows<{ pk: number }>(db,
+					'select pk from big where v in (select k from small)');
+				expect(rows.map(r => r.pk).sort((a, b) => a - b)).to.deep.equal([1, 3, 4]);
+				expect((module.idxStrs.get('big') ?? [])[0], 'the DESC index was seeked')
+					.to.match(/^idx=idx_v\(0\);plan=5;inCount=3$/);
+			} finally {
+				await db.close();
+			}
+		});
+	});
+
+	describe('cost-model arms', () => {
+		async function setup(module: IdxStrCapturingModule, keyCount: number): Promise<Database> {
+			const db = new Database();
+			db.registerModule('armmem', module);
+			await db.exec('create table small (id integer primary key, k integer null) using armmem()');
+			await db.exec('create table big (pk integer primary key, v integer null) using armmem()');
+			await db.exec('create index idx_v on big(v)');
+			await db.exec(`insert into big values ${
+				Array.from({ length: 30 }, (_v, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
+			await db.exec(`insert into small values ${
+				Array.from({ length: keyCount }, (_v, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
+			module.reset();
+			return db;
+		}
+
+		it('a key-count-independent seek cost (slope <= 0) seeks up to the engine ceiling', async () => {
+			const module = new CostArmModule('flat');
+			const db = await setup(module, 20);
+			try {
+				const rows = await allRows(db, 'select pk from big where v in (select k from small)');
+				expect(rows).to.have.lengthOf(20);
+				// A flat cost never overtakes the scan, so 20 keys — far past the
+				// interpolated break-even of any rising curve — still seeks.
+				expect((module.idxStrs.get('big') ?? [])[0]).to.match(MULTI_SEEK_RE);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('a scan cheaper than a two-key seek declines the rewrite entirely', async () => {
+			const module = new CostArmModule('scan-wins');
+			const db = await setup(module, 3);
+			try {
+				const sql = 'select pk from big where v in (select k from small)';
+				const plan = db.getPlan(sql);
+				expect(collectNodeTypes(plan), 'no KeySetSemiJoin — the hash semi join survives')
+					.to.not.include('KeySetSemiJoin');
+				expect(collectNodeTypes(plan)).to.include('HashJoin');
+				expect(await allRows(db, sql), 'the surviving hash join still answers').to.have.lengthOf(3);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('declines when the module answers a synthesized probe with an invalid plan', async () => {
+			const module = new InvalidProbeModule();
+			const db = await setup(module, 3);
+			try {
+				const sql = 'select pk from big where v in (select k from small)';
+				// The rule must swallow the module's contract violation and leave the
+				// hash semi join — not fail a query the user's predicate ran fine on.
+				expect(collectNodeTypes(db.getPlan(sql))).to.not.include('KeySetSemiJoin');
+				expect(await allRows(db, sql)).to.have.lengthOf(3);
+			} finally {
+				await db.close();
+			}
 		});
 	});
 

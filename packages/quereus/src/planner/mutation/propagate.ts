@@ -74,6 +74,7 @@ function reasonForOperator(nodeType: PlanNodeType): MutationDiagnosticReason {
 		case PlanNodeType.NestedLoopJoin:
 		case PlanNodeType.HashJoin:
 		case PlanNodeType.MergeJoin:
+		case PlanNodeType.KeySetSemiJoin:
 		case PlanNodeType.AsofScan:
 		case PlanNodeType.FanOutLookupJoin:
 			return 'unsupported-join';

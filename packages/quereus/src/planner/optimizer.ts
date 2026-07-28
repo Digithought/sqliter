@@ -926,6 +926,12 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// (each rejects the other's output node) and whichever runs first wins;
 	// LIMIT pushdown is the more valuable of the two on the shapes where both
 	// could apply, so it keeps priority.
+	// NOTE: a rewritten semi join is no longer a HashJoin, so `eager-prefetch-probe`
+	// (registered later in this pass) stops seeing it. That is required for the seek
+	// path — the target must not open before the key set is drained — but it also
+	// costs the *scan* path its concurrent probe-side prefetch. Only matters on a
+	// high-first-row-latency vtab; if one regresses here, teach the KeySetSemiJoin
+	// emitter to prefetch the target itself once it has decided to scan.
 	{
 		pass: PassId.PostOptimization,
 		id: 'key-set-seek',

@@ -221,6 +221,7 @@ const JOIN_NODE_TYPES = new Set<PlanNodeType>([
 	PlanNodeType.NestedLoopJoin,
 	PlanNodeType.HashJoin,
 	PlanNodeType.MergeJoin,
+	PlanNodeType.KeySetSemiJoin,
 	PlanNodeType.FanOutLookupJoin,
 	PlanNodeType.AsofScan,
 ]);
