@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-28T08:07:52.839Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\feat-conjunction-selectivity.review.2026-07-28T08-07-52-839Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ----
 description: Row-count estimates for a WHERE clause with several AND/OR conditions now use each condition's own column statistics instead of one flat guess for the whole clause.
 files: packages/quereus/src/planner/stats/selectivity-combine.ts (new), packages/quereus/src/planner/stats/catalog-stats.ts, packages/quereus/src/planner/analysis/predicate-conjuncts.ts, packages/quereus/src/planner/rules/predicate/rule-filter-selectivity.ts, packages/quereus/test/optimizer/selectivity-combine.spec.ts (new), packages/quereus/test/optimizer/filter-selectivity.spec.ts, packages/quereus/test/planner/stats/catalog-stats.spec.ts, docs/optimizer.md

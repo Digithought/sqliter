@@ -11,13 +11,13 @@
 import type { ScalarPlanNode } from '../nodes/plan-node.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
 
-/** Split an AND-tree into its conjuncts. Non-AND predicates yield a single-element list. */
-export function splitConjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
+/** Flatten a boolean tree on `operator`; anything else becomes a leaf of the result. */
+function splitOn(pred: ScalarPlanNode, operator: 'AND' | 'OR'): ScalarPlanNode[] {
 	const result: ScalarPlanNode[] = [];
 	const stack: ScalarPlanNode[] = [pred];
 	while (stack.length) {
 		const n = stack.pop()!;
-		if (n instanceof BinaryOpNode && n.expression.operator === 'AND') {
+		if (n instanceof BinaryOpNode && n.expression.operator === operator) {
 			stack.push(n.left, n.right);
 		} else {
 			result.push(n);
@@ -26,19 +26,14 @@ export function splitConjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
 	return result;
 }
 
+/** Split an AND-tree into its conjuncts. Non-AND predicates yield a single-element list. */
+export function splitConjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
+	return splitOn(pred, 'AND');
+}
+
 /** Split an OR-tree into its disjuncts. Non-OR predicates yield a single-element list. */
 export function splitDisjuncts(pred: ScalarPlanNode): ScalarPlanNode[] {
-	const result: ScalarPlanNode[] = [];
-	const stack: ScalarPlanNode[] = [pred];
-	while (stack.length) {
-		const n = stack.pop()!;
-		if (n instanceof BinaryOpNode && n.expression.operator === 'OR') {
-			stack.push(n.left, n.right);
-		} else {
-			result.push(n);
-		}
-	}
-	return result;
+	return splitOn(pred, 'OR');
 }
 
 /** Combine conjuncts back into a left-associative AND-tree; returns null when empty. */
