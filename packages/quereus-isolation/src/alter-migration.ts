@@ -1,5 +1,5 @@
 import type { Database, TableSchema, SchemaChangeInfo, Row, SqlValue, VirtualTable, UpdateResult } from '@quereus/quereus';
-import { QuereusError, StatusCode, foldDefaultToType, columnDefToSchema, isConstraintViolation, inferType, validateAndParse, validateCollationForType, formatKeyValue } from '@quereus/quereus';
+import { QuereusError, StatusCode, foldDefaultToType, columnDefToSchema, isConstraintViolation, planRetypeConversion, validateCollationForType, formatKeyValue } from '@quereus/quereus';
 import type { ConnectionOverlayState, Predicate } from './isolation-types.js';
 import { makeFullScanFilterInfo } from './filter-info.js';
 import { makePkKeySerializer } from './overlay-rows.js';
@@ -340,18 +340,17 @@ function deriveSetNotNullBackfill(
 /**
  * Precomputes the per-ALTER constants an `alter column … set data type` overlay conversion
  * needs: the retyped column's index and a per-value `convert`. Returns undefined unless this
- * is a retype with at least one overlay to convert, and undefined for an ALIAS retype (the
- * new logical type IS the old type object — `inferType` flattens `varchar(50)` to
- * `TEXT_TYPE`) — both underlyings gate their value rewrite on that exact identity
- * comparison, so mirroring it here keeps overlay and committed rows moving together should
- * "what counts as a value-rewriting retype" ever change. A same-storage-class retype between
- * different types (text → date) DOES convert: staged values are validated and normalized to
- * the new type's canonical spelling, exactly as the underlyings treat their committed rows.
+ * is a retype with at least one overlay to convert, and undefined for an ALIAS retype — both
+ * underlyings gate their value rewrite on that same identity comparison, so mirroring it here
+ * keeps overlay and committed rows moving together should "what counts as a value-rewriting
+ * retype" ever change. A same-storage-class retype between different types (text → date) DOES
+ * convert: staged values are validated and normalized to the new type's canonical spelling,
+ * exactly as the underlyings treat their committed rows.
  *
- * `inferType` never throws (an unknown type name falls through SQLite-style affinity rules),
- * so deriving this BEFORE the underlying mutation is safe. `convert` is the literal mirror of
- * `MemoryTableManager.alterColumn` / `StoreModule.alterColumnSetDataType`: `validateAndParse`,
- * rethrowing failure as the same MISMATCH message, so the two legs cannot drift.
+ * `convert` comes from {@link planRetypeConversion}, the same decide-and-convert helper
+ * `MemoryTableManager.alterColumn` and `StoreModule.alterColumnSetDataType` call for their own
+ * committed rows — so the three legs (rethrowing failure as the same MISMATCH message) cannot
+ * drift apart.
  */
 function deriveSetDataTypeConvert(
 	change: SchemaChangeInfo,
@@ -364,24 +363,9 @@ function deriveSetDataTypeConvert(
 	if (colIndex === undefined) return undefined;
 	const oldCol = overlaySchema.columns[colIndex];
 	if (!oldCol) return undefined;
-	const newLogicalType = inferType(change.setDataType);
-	// Alias retype (same logical type object): the underlying rewrites nothing, so neither do we.
-	if (newLogicalType === oldCol.logicalType) return undefined;
-	const setDataType = change.setDataType;
-	const columnName = change.columnName;
-	return {
-		colIndex,
-		convert: (v: SqlValue): SqlValue => {
-			try {
-				return validateAndParse(v, newLogicalType, columnName) as SqlValue;
-			} catch {
-				throw new QuereusError(
-					`Cannot convert value in '${columnName}' to ${setDataType}`,
-					StatusCode.MISMATCH,
-				);
-			}
-		},
-	};
+	const { convert } = planRetypeConversion(change.setDataType, oldCol.logicalType, change.columnName);
+	if (!convert) return undefined;
+	return { colIndex, convert };
 }
 
 /**

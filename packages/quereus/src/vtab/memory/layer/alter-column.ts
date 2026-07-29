@@ -3,8 +3,7 @@ import type { ColumnSchema } from '../../../schema/column.js';
 import { buildColumnIndexMap, validateCollationForType, type TableSchema } from '../../../schema/table.js';
 import { StatusCode, type SqlValue } from '../../../common/types.js';
 import { QuereusError } from '../../../common/errors.js';
-import { inferType } from '../../../types/registry.js';
-import { foldDefaultToType, validateAndParse } from '../../../types/validation.js';
+import { foldDefaultToType, planRetypeConversion } from '../../../types/validation.js';
 import { comparisonSemanticsDiffer } from '../../../util/comparison.js';
 import type { Row } from '../../../common/types.js';
 
@@ -250,9 +249,9 @@ function hasNullValue(ctx: AlterColumnContext): Promise<boolean> {
  */
 export async function planSetDataType(ctx: AlterColumnContext, dataType: string): Promise<ColumnAttributeChange> {
 	const oldCol = ctx.schema.columns[ctx.colIndex];
-	const newLogicalType = inferType(dataType);
+	const { newLogicalType, convert } = planRetypeConversion(dataType, oldCol.logicalType, ctx.columnName);
 	const newCol: ColumnSchema = { ...oldCol, logicalType: newLogicalType };
-	if (newLogicalType === oldCol.logicalType) return metadataOnly(newCol);
+	if (!convert) return metadataOnly(newCol);
 
 	// Retyping a PRIMARY KEY column moves the key bytes (a class change), the tree's ordering (a
 	// comparator move), or at minimum the key values' canonical spelling — and neither the base
@@ -274,17 +273,6 @@ export async function planSetDataType(ctx: AlterColumnContext, dataType: string)
 	// Tracked separately from the value rewrite because SET COLLATE shares the re-key machinery
 	// without rewriting values.
 	const comparatorChanged = comparisonSemanticsDiffer(oldCol.logicalType, newLogicalType);
-
-	const convert = (v: SqlValue): SqlValue => {
-		try {
-			return validateAndParse(v, newLogicalType, ctx.columnName) as SqlValue;
-		} catch {
-			throw new QuereusError(
-				`Cannot convert value in '${ctx.columnName}' to ${dataType}`,
-				StatusCode.MISMATCH,
-			);
-		}
-	};
 
 	await assertEveryValueConverts(ctx, convert);
 

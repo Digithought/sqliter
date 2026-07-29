@@ -176,9 +176,11 @@ export {
 	validateAndParse,
 	coerceRowToSchema,
 	foldDefaultToType,
+	planRetypeConversion,
 	isValidForType,
 	tryParse
 } from './types/validation.js';
+export type { RetypeConversion } from './types/validation.js';
 
 // SQL Parser and Compiler
 export { Parser } from './parser/parser.js';

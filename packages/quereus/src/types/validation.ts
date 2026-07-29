@@ -5,6 +5,7 @@ import type { LogicalType } from './logical-type.js';
 import type { ColumnSchema } from '../schema/column.js';
 import type { Expression } from '../parser/ast.js';
 import { tryFoldLiteral } from '../parser/utils.js';
+import { inferType } from './registry.js';
 
 /**
  * Validate a value against a logical type.
@@ -190,6 +191,60 @@ export function foldDefaultToType(
 	const folded = tryFoldLiteral(expr);
 	if (folded === undefined) return undefined;
 	return validateAndParse(folded, logicalType, columnName);
+}
+
+/** What {@link planRetypeConversion} decided for one `alter column … set data type`. */
+export interface RetypeConversion {
+	/** The target's logical type, resolved via {@link inferType}. */
+	readonly newLogicalType: LogicalType;
+	/**
+	 * `null` for a metadata-only (alias) retype — nothing to rewrite. Otherwise converts one
+	 * non-NULL value; callers route NULLs around it themselves (`set data type` leaves them
+	 * untouched, a NOT NULL backfill maps them to DEFAULT before this ever sees them).
+	 */
+	readonly convert: ((value: SqlValue) => SqlValue) | null;
+}
+
+/**
+ * Decide whether `alter column … set data type` rewrites stored values, and if so, build the
+ * per-value converter. Shared by every backend that implements SET DATA TYPE (the memory
+ * module, the KV store module, and the isolation overlay's staged-row migration) so the
+ * "does this retype touch anything" gate and the conversion failure's message/status code
+ * cannot drift between them — the isolation layer keys its own error routing off that status
+ * code, deciding whether another connection's staged rows are marked unusable rather than
+ * aborting the ALTER outright.
+ *
+ * Gated on logical-type IDENTITY, not physical storage class: {@link inferType} flattens
+ * aliases to the shared type object (`varchar(50)` IS `TEXT_TYPE`), so an alias retype
+ * returns a `null` converter. Any other retype — including a same-storage-class move like
+ * text → date — returns one that validates AND normalizes to the new type's canonical
+ * spelling, rethrowing a parse/validate failure as `QuereusError(MISMATCH)`.
+ *
+ * @param dataType The target type name as written in the ALTER statement (echoed into the
+ *   failure message verbatim)
+ * @param oldLogicalType The column's CURRENT logical type
+ * @param columnName The column name (echoed into the failure message)
+ */
+export function planRetypeConversion(
+	dataType: string,
+	oldLogicalType: LogicalType,
+	columnName: string,
+): RetypeConversion {
+	const newLogicalType = inferType(dataType);
+	if (newLogicalType === oldLogicalType) return { newLogicalType, convert: null };
+	return {
+		newLogicalType,
+		convert: (value: SqlValue): SqlValue => {
+			try {
+				return validateAndParse(value, newLogicalType, columnName);
+			} catch {
+				throw new QuereusError(
+					`Cannot convert value in '${columnName}' to ${dataType}`,
+					StatusCode.MISMATCH,
+				);
+			}
+		},
+	};
 }
 
 /**

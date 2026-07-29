@@ -24,8 +24,7 @@ import {
 	StatusCode,
 	buildColumnIndexMap,
 	foldDefaultToType,
-	inferType,
-	validateAndParse,
+	planRetypeConversion,
 	validateCollationForType,
 } from '@quereus/quereus';
 import { StoreTable } from './store-table.js';
@@ -376,26 +375,15 @@ async function alterColumnSetDataType(
 	colIndex: number,
 	change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
 ): Promise<AlterColumnAttrChange> {
-	const newLogicalType = inferType(change.setDataType!);
+	const { newLogicalType, convert } = planRetypeConversion(change.setDataType!, oldCol.logicalType, change.columnName);
 	let valueConvert: ((v: SqlValue) => SqlValue) | undefined;
-	if (newLogicalType !== oldCol.logicalType) {
+	if (convert) {
 		if (oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
 			throw new QuereusError(
 				`Cannot change the data type of primary key column '${change.columnName}' of table '${oldSchema.name}'.`,
 				StatusCode.CONSTRAINT,
 			);
 		}
-		// Conversion required — walk every row and attempt parse.
-		const convert = (v: SqlValue): SqlValue => {
-			try {
-				return validateAndParse(v, newLogicalType, change.columnName) as SqlValue;
-			} catch {
-				throw new QuereusError(
-					`Cannot convert value in '${change.columnName}' to ${change.setDataType}`,
-					StatusCode.MISMATCH,
-				);
-			}
-		};
 		// Throw-only pass over the LIVE rows, so an unconvertible value this
 		// transaction inserted rejects the ALTER with the transaction still intact.
 		// The rewrite itself is DEFERRED: the caller flushes + `mapRowsAtIndex`es
