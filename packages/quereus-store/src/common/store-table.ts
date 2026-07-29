@@ -2743,6 +2743,16 @@ export class StoreTable extends VirtualTable {
 		// INDEX yields fresh constraint objects, so such a cache invalidates itself.
 		// Reads the MATERIALIZED index set so the hidden `_uc_*` realizing a plain UNIQUE
 		// is visible (the engine-facing `tableSchema` carries only explicit/derived indexes).
+		//
+		// NOTE: `withImplicitUniqueIndexes` APPENDS `_uc_*` after the explicit indexes, so
+		// when both exist (a collation-mismatched index that `findReusableIndexForUnique`
+		// refused) the `find` below picks the EXPLICIT one and the `_uc_*` is maintained
+		// but never seeked. Harmless today — index keys are encoded under the table key
+		// collation for every index alike, so the two are byte-identical — but if index
+		// keys ever move to per-column collations
+		// (`plan/debt-store-index-keys-use-column-collation`), this seek would then
+		// under-fetch and silently accept a duplicate. Prefer the constraint's own
+		// `_uc_*` by name here as part of that change.
 		const indexes = this.materializedSchema.indexes;
 		if (!indexes || indexes.length === 0) return undefined;
 

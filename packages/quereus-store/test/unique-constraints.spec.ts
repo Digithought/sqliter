@@ -1285,6 +1285,130 @@ describe('StoreTable UNIQUE constraints', () => {
 			await rdb.exec(`INSERT INTO ra VALUES (3, 'b@x')`);
 			expect(await collect(rdb, `SELECT count(*) AS n FROM ra`)).to.deep.equal([{ n: 2 }]);
 		});
+
+		it('UPDATE through the reused index rejects a collision and frees the vacated value', async () => {
+			await rdb.exec(`CREATE TABLE rb (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX rb_email ON rb (email)`);
+			await rdb.exec(`INSERT INTO rb VALUES (1, 'a@x'), (2, 'b@x')`);
+
+			await rejects(`UPDATE rb SET email = 'a@x' WHERE id = 2`);
+			await rdb.exec(`UPDATE rb SET email = 'a@x' WHERE id = 1`); // self-collision is not one
+			await rdb.exec(`UPDATE rb SET email = 'c@x' WHERE id = 2`);
+			await rdb.exec(`INSERT INTO rb VALUES (3, 'b@x')`);         // vacated value is free again
+			expect(tracking.indexStoreNames('rb')).to.deep.equal(['rb_email']);
+			expect(tracking.indexEntryCount('rb', 'rb_email'), 'one entry per live row').to.equal(3);
+		});
+
+		it('OR IGNORE / OR REPLACE resolve against the reused index', async () => {
+			await rdb.exec(`CREATE TABLE rc (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX rc_email ON rc (email)`);
+			await rdb.exec(`INSERT INTO rc VALUES (1, 'a@x')`);
+			await rdb.exec(`INSERT OR IGNORE INTO rc VALUES (2, 'a@x')`);
+			expect(await collect(rdb, `SELECT id FROM rc`)).to.deep.equal([{ id: 1 }]);
+			await rdb.exec(`INSERT OR REPLACE INTO rc VALUES (3, 'a@x')`);
+			expect(await collect(rdb, `SELECT id FROM rc`)).to.deep.equal([{ id: 3 }]);
+			expect(tracking.indexEntryCount('rc', 'rc_email'), 'the replaced row leaves no entry').to.equal(1);
+		});
+
+		it('a multi-column UNIQUE reuses a same-ORDER index but not a reversed one', async () => {
+			// Index keys are a positional concatenation, so only a same-order index seeks
+			// the window the constraint needs.
+			await rdb.exec(`CREATE TABLE rd (id INTEGER PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b)) USING store`);
+			await rdb.exec(`CREATE INDEX rd_ab ON rd (a, b)`);
+			await rdb.exec(`INSERT INTO rd VALUES (1, 'x', 'y')`);
+			expect(tracking.indexStoreNames('rd')).to.deep.equal(['rd_ab']);
+			await rejects(`INSERT INTO rd VALUES (2, 'x', 'y')`);
+			await rdb.exec(`INSERT INTO rd VALUES (3, 'x', 'z')`);
+
+			await rdb.exec(`CREATE TABLE re (id INTEGER PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b)) USING store`);
+			await rdb.exec(`CREATE INDEX re_ba ON re (b, a)`);
+			await rdb.exec(`INSERT INTO re VALUES (1, 'x', 'y')`);
+			expect(tracking.indexStoreNames('re'), 'reversed order is not reusable')
+				.to.deep.equal(['_uc_a_b', 're_ba']);
+			await rejects(`INSERT INTO re VALUES (2, 'x', 'y')`);
+		});
+
+		it('an index with EXTRA columns is not reused (its keys are a different shape)', async () => {
+			await rdb.exec(`CREATE TABLE rf (id INTEGER PRIMARY KEY, email TEXT UNIQUE, nick TEXT) USING store`);
+			await rdb.exec(`CREATE INDEX rf_en ON rf (email, nick)`);
+			await rdb.exec(`INSERT INTO rf VALUES (1, 'a@x', 'al')`);
+			expect(tracking.indexStoreNames('rf')).to.deep.equal(['_uc_email', 'rf_en']);
+			await rejects(`INSERT INTO rf VALUES (2, 'a@x', 'bo')`);
+		});
+
+		it('a NOCASE column reuses a plain index and still enforces NOCASE', async () => {
+			// The index declares no COLLATE, so it inherits the column's — reuse-eligible,
+			// unlike the explicitly BINARY index above.
+			await rdb.exec(`CREATE TABLE rg (id INTEGER PRIMARY KEY, email TEXT COLLATE NOCASE, UNIQUE (email)) USING store`);
+			await rdb.exec(`CREATE INDEX rg_email ON rg (email)`);
+			await rdb.exec(`INSERT INTO rg VALUES (1, 'a@x')`);
+			expect(tracking.indexStoreNames('rg')).to.deep.equal(['rg_email']);
+			await rejects(`INSERT INTO rg VALUES (2, 'A@X')`);
+		});
+
+		it('with two covering indexes, only the LAST one dropped rebuilds the `_uc_*`', async () => {
+			await rdb.exec(`CREATE TABLE rh (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX rh_a ON rh (email)`);
+			await rdb.exec(`CREATE INDEX rh_b ON rh (email)`);
+			await rdb.exec(`INSERT INTO rh VALUES (1, 'a@x')`);
+			expect(tracking.indexStoreNames('rh')).to.deep.equal(['rh_a', 'rh_b']);
+
+			await rdb.exec(`DROP INDEX rh_a`);
+			expect(tracking.indexStoreNames('rh'), 'the survivor still realizes the UNIQUE')
+				.to.deep.equal(['rh_b']);
+			await rejects(`INSERT INTO rh VALUES (2, 'a@x')`);
+
+			await rdb.exec(`DROP INDEX rh_b`);
+			expect(tracking.indexStoreNames('rh')).to.deep.equal(['_uc_email']);
+			expect(tracking.indexEntryCount('rh', '_uc_email')).to.equal(1);
+			await rejects(`INSERT INTO rh VALUES (3, 'a@x')`);
+		});
+
+		it('DROP COLUMN renumbering leaves the reuse decision intact', async () => {
+			await rdb.exec(`CREATE TABLE ri (id INTEGER PRIMARY KEY, junk TEXT, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX ri_email ON ri (email)`);
+			await rdb.exec(`INSERT INTO ri VALUES (1, 'j', 'a@x')`);
+			await rdb.exec(`ALTER TABLE ri DROP COLUMN junk`);
+			expect(tracking.indexStoreNames('ri')).to.deep.equal(['ri_email']);
+			await rejects(`INSERT INTO ri VALUES (2, 'a@x')`);
+			await rdb.exec(`INSERT INTO ri VALUES (3, 'b@x')`);
+		});
+
+		// A teardown deletes a KVStore the coordinator may hold buffered ops against, so
+		// the store DDL-commits first (`ddlTransactionality: 'auto-commit'`). Without that
+		// flush the commit replays into a closed store and throws.
+		it('CREATE INDEX mid-transaction over a written UNIQUE column commits', async () => {
+			await rdb.exec(`CREATE TABLE rj (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`BEGIN`);
+			await rdb.exec(`INSERT INTO rj VALUES (1, 'a@x')`);
+			await rdb.exec(`CREATE INDEX rj_email ON rj (email)`);
+			await rdb.exec(`COMMIT`);
+			expect(await collect(rdb, `SELECT count(*) AS n FROM rj`)).to.deep.equal([{ n: 1 }]);
+			expect(tracking.indexStoreNames('rj')).to.deep.equal(['rj_email']);
+			await rejects(`INSERT INTO rj VALUES (2, 'a@x')`);
+		});
+
+		it('DROP INDEX mid-transaction after writes commits and keeps enforcing', async () => {
+			await rdb.exec(`CREATE TABLE rk (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX rk_email ON rk (email)`);
+			await rdb.exec(`BEGIN`);
+			await rdb.exec(`INSERT INTO rk VALUES (1, 'a@x')`);
+			await rdb.exec(`DROP INDEX rk_email`);
+			await rdb.exec(`COMMIT`);
+			expect(await collect(rdb, `SELECT count(*) AS n FROM rk`)).to.deep.equal([{ n: 1 }]);
+			expect(tracking.indexStoreNames('rk')).to.deep.equal(['_uc_email']);
+			await rejects(`INSERT INTO rk VALUES (2, 'a@x')`);
+		});
+
+		it('ALTER TABLE DROP CONSTRAINT mid-transaction after writes commits', async () => {
+			await rdb.exec(`CREATE TABLE rl (id INTEGER PRIMARY KEY, email TEXT, CONSTRAINT u UNIQUE (email)) USING store`);
+			await rdb.exec(`BEGIN`);
+			await rdb.exec(`INSERT INTO rl VALUES (1, 'a@x')`);
+			await rdb.exec(`ALTER TABLE rl DROP CONSTRAINT u`);
+			await rdb.exec(`COMMIT`);
+			expect(await collect(rdb, `SELECT count(*) AS n FROM rl`)).to.deep.equal([{ n: 1 }]);
+			await rdb.exec(`INSERT INTO rl VALUES (2, 'a@x')`); // no longer constrained
+		});
 	});
 
 	// The physical `_uc_*` store must be BUILT when a UNIQUE is added, TORN DOWN when it

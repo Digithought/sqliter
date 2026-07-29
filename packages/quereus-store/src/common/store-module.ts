@@ -1105,15 +1105,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// schema (`findReusableIndexForUnique`). Nothing maintains that `_uc_*` any more,
 		// so tear its physical store down — leaving it would rot into a store whose
 		// entries no longer track the rows, which a later `DROP INDEX` would hand back to
-		// the constraint as if current. A no-op for every index that covers no UNIQUE.
-		//
-		// NOTE: like `dropIndex`'s own teardown, this closes and deletes a store the
-		// module coordinator may still hold buffered ops against (pending ops are keyed on
-		// the KVStore HANDLE), so a `CREATE INDEX` issued mid-transaction after writes to
-		// the constrained column can fail at commit. Same exposure `DROP INDEX` has had
-		// all along, and store DDL already declares `ddlTransactionality: 'auto-commit'`;
-		// if DDL-in-transaction is ever made safe, both sites need the buffered ops for
-		// the doomed store drained first.
+		// the constraint as if current. A no-op for every index that covers no UNIQUE —
+		// which is what keeps the DDL-commit the teardown forces (see
+		// {@link reconcileImplicitUniqueIndexStores}) off every ordinary CREATE INDEX.
 		await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, tableSchema);
 
 		// Emit schema change event. `updatedSchema` (not the pre-create
@@ -1192,6 +1186,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// underlying KVStore. `deleteIndexStore` (if the provider implements
 		// it) closes the handle before removing the directory; otherwise we
 		// just close it.
+		//
+		// Flush first: the coordinator keys buffered ops on the KVStore HANDLE, so ops
+		// this transaction queued against the index being dropped would be replayed into
+		// a closed store at commit and throw. Same posture (and same reason) as the
+		// teardown in `reconcileImplicitUniqueIndexStores` and the row-rewriting ALTER
+		// arms — see {@link ddlCommitPendingOps}.
+		await this.ddlCommitPendingOps();
 		await table.releaseIndexStore(indexName);
 		if (this.provider.deleteIndexStore) {
 			await this.provider.deleteIndexStore(schemaName, tableName, indexName);
@@ -1646,9 +1647,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const oldNames = implicitUniqueIndexNameMap(oldSchema);
 		const newNames = implicitUniqueIndexNameMap(newSchema);
 
-		// Tear down each store whose implicit index no longer exists.
-		for (const [lower, name] of oldNames) {
-			if (!newNames.has(lower)) {
+		// Tear down each store whose implicit index no longer exists. A teardown closes
+		// and deletes a KVStore handle the module coordinator may still hold buffered ops
+		// against (pending ops are keyed on the HANDLE), and the eventual commit would
+		// write into the closed store and throw — so flush first, the same DDL-commit
+		// posture the row-rewriting ALTER arms take and what this module's declared
+		// `ddlTransactionality: 'auto-commit'` promises. Only when something is actually
+		// doomed: a pure BUILD writes index entries outside the coordinator and deletes
+		// nothing, so it must not force-commit the caller's transaction.
+		const doomed = [...oldNames].filter(([lower]) => !newNames.has(lower));
+		if (doomed.length > 0) {
+			await this.ddlCommitPendingOps();
+			for (const [, name] of doomed) {
 				await this.tearDownImplicitUniqueIndexStore(schemaName, tableName, table, name);
 			}
 		}
@@ -2112,8 +2122,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// `uniqueConstraints`, so `table.updateSchema` below de-materializes its implicit
 		// `_uc_*` index and `reconcileImplicitUniqueIndexStores` (after this arm returns)
 		// tears down the now-orphaned physical store — without which a later re-ADD would
-		// reopen stale entries. A UNIQUE derived from a CREATE UNIQUE INDEX is rejected
-		// upstream (drop the index instead), and has no `_uc_*` anyway.
+		// reopen stale entries. That teardown DDL-commits the module's pending transaction
+		// first (a deleted store's buffered ops cannot be replayed at commit — see
+		// {@link reconcileImplicitUniqueIndexStores}), so this arm is schema-only for the
+		// CATALOG but not transaction-neutral. A UNIQUE derived from a CREATE UNIQUE INDEX
+		// is rejected upstream (drop the index instead), and has no `_uc_*` anyway.
 		const constraintClass = resolveNamedConstraintClass(oldSchema, change.constraintName);
 		const lower = change.constraintName.toLowerCase();
 		let updatedSchema: TableSchema;
