@@ -535,7 +535,7 @@ the honest choice.
 | `addColumn` | append column; backfill; NOT-NULL gated by `delegatesNotNullBackfill`; honor `insertAtIndex` **or throw `UNSUPPORTED`** | ✓ (honors a position) | ✓ (append only — rejects a position) |
 | `dropColumn` | remove slot + reindex | ✓ | ✓ |
 | `renameColumn` | schema-only | ✓ | ✓ |
-| `alterPrimaryKey` | re-key in place **or throw `UNSUPPORTED`** | throws `UNSUPPORTED` → engine `runAlterPrimaryKey` catches → **generic rebuild** | in-place re-key |
+| `alterPrimaryKey` | re-key in place **or throw `UNSUPPORTED`** | in-place re-key (open-transaction pending layers and their change events re-keyed too) | in-place re-key |
 | `addConstraint` | materialize + validate (unique / fk) | ✓ | ✓ unique / fk; throws `UNSUPPORTED` for others |
 | `dropConstraint` / `renameConstraint` | schema rewrite | ✓ | ✓ |
 | `alterColumn.setNotNull` | backfill from default or throw `CONSTRAINT` | ✓ | ✓ |
@@ -892,7 +892,7 @@ The hard rule for every arm: **a module that cannot honor the invoked change MUS
 
 The `alterPrimaryKey` variant is dispatched for `ALTER TABLE ... ALTER PRIMARY KEY (...)`. Each entry in `newPkColumns` gives the column `index` (0-based position in the table's column list) and whether the column is `desc`. An empty array means the table reverts to an implicit key.
 
-It is the template for the no-silent-divergence rule. Modules that can re-key in place should handle the change directly and return an updated `TableSchema`. Modules that **cannot** re-key in place should throw `QuereusError(StatusCode.UNSUPPORTED)` — `runAlterPrimaryKey` catches that specific code and falls back to a generic table rebuild that copies all rows from the old table into a new table with the updated PK definition, then swaps it in place (the memory module takes exactly this path; the store re-keys natively). Any other thrown error propagates unchanged.
+It is the template for the no-silent-divergence rule. Modules that can re-key in place should handle the change directly and return an updated `TableSchema` — both built-in modules do (the memory module re-keys its trees, secondary indexes, and any open transaction's pending layers and pending change events; the store physically re-keys the data store). Modules that **cannot** re-key in place should throw `QuereusError(StatusCode.UNSUPPORTED)` — `runAlterPrimaryKey` catches that specific code and falls back to a generic shadow-table rebuild that copies all rows from the old table into a new table with the updated PK definition, then swaps it in place. Any other thrown error propagates unchanged. Beware what the fallback cannot do: a shadow rebuild copies **committed** rows only, so a module that owns transactional pending state must either re-key it natively or refuse the change with a non-`UNSUPPORTED` error (`BUSY` reads best) while a transaction holds uncommitted writes — an `UNSUPPORTED` refusal is swallowed by the fallback and the pending writes are silently lost.
 
 ## Best Practices
 

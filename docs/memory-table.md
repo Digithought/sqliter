@@ -92,7 +92,7 @@ detection lives in `quereus-isolation`.
 
 ### **Schema Evolution:**
 *   **Dynamic Schema Changes:** `ALTER TABLE` support for adding, dropping, and renaming columns
-*   **Primary Key Alteration:** `ALTER TABLE ... ALTER PRIMARY KEY` is supported via an automatic table rebuild. The rebuild creates a new table with the new PK definition, copies all rows, and swaps it in place. If duplicate-key violations occur during the rebuild, the operation fails cleanly without data loss (the original table is unchanged).
+*   **Primary Key Alteration:** `ALTER TABLE ... ALTER PRIMARY KEY` re-keys the table **in place** (`MemoryTableManager.alterPrimaryKey`): the base tree, every secondary index, and — inside an open transaction — every pending layer and its pending change events are re-derived under the new key, so the transaction's uncommitted writes survive the statement. A duplicate under the new key is rejected up front with `CONSTRAINT`, before anything mutates (the table is unchanged); a collision confined to rows only a rollback could restore is refused with a retryable `BUSY`, mirroring the `SET COLLATE` re-key.
 *   **Index Management:** Runtime creation and deletion of secondary indexes
 *   **Schema Safety:** Operations ensure consistency across all active transactions
 
@@ -533,6 +533,20 @@ collapse into one; `rekeyPrimaryKey` therefore **rewrites the log to its net eff
 one entry per key, deletions first, and a deletion whose key an upsert now occupies dropped. Every
 later reader of that log replays the rewritten form: the index rebuild, a `CREATE INDEX` later in
 the same transaction, and the commit-time rebase.
+
+**`ALTER PRIMARY KEY` shares this machinery, with two additions for a change of the key's
+COLUMNS rather than its comparator** (`MemoryTableManager.alterPrimaryKey`). First, a logged
+deletion carries only its (old-shaped) key, so its new key must be re-derived from the row image
+the parent layer holds — which only the intact pre-rebuild chain can resolve. The open-layer
+adoption is therefore a two-phase prepare/install pair
+(`TransactionLayer.prepareRekeyedPrimaryKeyColumns` / `installRekeyedPrimaryKeyColumns`, modeled
+on the `ADD`/`DROP COLUMN` reshape pair): every layer's prepare runs before the first mutation
+anywhere, the installs after the base rebuild, oldest-first. Second, each layer's pending
+change-event log is rewritten with keys re-derived from each event's own row image (an update's
+two images are tie-broken against the recorded key, mirroring the engine emitter's
+`rekeyBatchedDataEvents`), because the commit-time delivery shapes each key by the arity of the
+schema at delivery. A collation-only re-key deliberately skips that rewrite — no stored value or
+key value moves, so the recorded images stay accurate.
 
 **Rule 1 assumes the transaction commits.** DDL is not undone by `ROLLBACK` or `ROLLBACK TO
 SAVEPOINT` (see `tickets/backlog/feat-ddl-transaction-capability.md`), but the rows it validated

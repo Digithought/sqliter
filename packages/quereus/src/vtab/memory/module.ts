@@ -971,10 +971,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				await manager.renameColumn(change.oldName, change.newColumnDefAst);
 				break;
 			case 'alterPrimaryKey':
-				throw new QuereusError(
-					'MemoryTable does not support in-place primary key alteration',
-					StatusCode.UNSUPPORTED,
-				);
+				await manager.alterPrimaryKey(change.newPkColumns, rows);
+				break;
 			case 'addConstraint':
 				await manager.addConstraint(change.constraint, rows);
 				break;

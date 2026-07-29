@@ -6418,11 +6418,10 @@ describe('IsolationModule — ALTER PRIMARY KEY over per-connection overlays', (
 	// staged rows after the underlying applies, and swaps a CLEAN overlay for a fresh
 	// staging table under the new key.
 	//
-	// The memory underlying rejects alterPrimaryKey outright (UNSUPPORTED), so the
-	// post-underlying paths are reachable only through a PK-capable underlying (the store
-	// module). `PkAcceptingMemoryModule` stands in for one: it answers alterPrimaryKey
-	// with the re-keyed schema (no physical re-key — the overlay handling under test
-	// never reads the underlying's rows) and delegates everything else to memory.
+	// `PkAcceptingMemoryModule` answers alterPrimaryKey with the re-keyed schema and no
+	// physical re-key — the overlay handling under test never reads the underlying's rows,
+	// and the stub keeps these tests pinned to the wrapper's own behavior rather than the
+	// memory module's in-place re-key (which it performs natively too).
 	let iso: IsolationModule;
 	let dbA: Database; // the ALTER issuer
 	let dbB: Database; // a foreign connection
@@ -6515,8 +6514,18 @@ describe('IsolationModule — ALTER PRIMARY KEY over per-connection overlays', (
 		expect(overlayTables.size, 'old staging table released — no leak').to.equal(1);
 	});
 
-	it('a memory underlying\'s UNSUPPORTED propagates with every overlay untouched', async () => {
-		const memIso = new IsolationModule({ underlying: new MemoryTableModule() });
+	it('an underlying\'s UNSUPPORTED propagates with every overlay untouched', async () => {
+		// The memory module now re-keys in place, so a refusing underlying is stubbed here —
+		// the contract under test is the wrapper's: it must not swallow the rejection.
+		class PkRefusingMemoryModule extends MemoryTableModule {
+			async alterTable(db: Database, schemaName: string, tableName: string, change: SchemaChangeInfo, rows?: any): Promise<TableSchema> {
+				if (change.type === 'alterPrimaryKey') {
+					throw new QuereusError('stub module does not support in-place primary key alteration', StatusCode.UNSUPPORTED);
+				}
+				return super.alterTable(db, schemaName, tableName, change, rows);
+			}
+		}
+		const memIso = new IsolationModule({ underlying: new PkRefusingMemoryModule() });
 		const dbM = new Database();
 		dbM.registerModule('isolated', memIso);
 		await dbM.exec('create table m (id integer primary key, x integer) using isolated');
@@ -6525,6 +6534,24 @@ describe('IsolationModule — ALTER PRIMARY KEY over per-connection overlays', (
 		try { await memIso.alterTable(dbM, 'main', 'm', alterPkToX); } catch (e) { err = e; }
 		expect(err, 'the wrapper must not swallow the underlying rejection').to.be.instanceOf(QuereusError);
 		expect((err as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+		await dbM.close();
+	});
+
+	it('a MEMORY underlying with a clean issuer overlay honors the ALTER natively end-to-end', async () => {
+		// The counterpart of the stubbed tests above: real memory module, no stub. The
+		// wrapper forwards to memory's in-place re-key and swaps its clean overlay.
+		const memIso = new IsolationModule({ underlying: new MemoryTableModule() });
+		const dbM = new Database();
+		dbM.registerModule('isolated', memIso);
+		await dbM.exec('create table m (id integer primary key, x integer not null) using isolated');
+		await dbM.exec('insert into m values (1, 10), (2, 20)');
+
+		const updated = await memIso.alterTable(dbM, 'main', 'm', alterPkToX);
+		expect(updated.primaryKeyDefinition.map(d => d.index), 'PK moved to x').to.deep.equal([1]);
+
+		const rows: unknown[] = [];
+		for await (const row of dbM.eval('select * from m order by x')) rows.push(row);
+		expect(rows, 'rows survive the native re-key').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
 		await dbM.close();
 	});
 });

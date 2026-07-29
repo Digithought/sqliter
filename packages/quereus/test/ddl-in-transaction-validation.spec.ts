@@ -786,7 +786,7 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			await expectError(
 				() => db.exec(`alter table t alter column v set collate nocase`),
 				StatusCode.BUSY,
-				/primary key column.*Commit\/rollback and retry/is,
+				/re-key the primary key.*Commit\/rollback and retry/is,
 			);
 
 			// Rollback restores both rows, still under the original collation.
@@ -807,7 +807,7 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			await expectError(
 				() => db.exec(`alter table t alter column v set collate nocase`),
 				StatusCode.BUSY,
-				/primary key column/i,
+				/re-key the primary key/i,
 			);
 
 			// The transaction survives the rejection and still compares under BINARY.
@@ -826,7 +826,7 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			await expectError(
 				() => db.exec(`alter table t alter column v set collate nocase`),
 				StatusCode.BUSY,
-				/primary key column/i,
+				/re-key the primary key/i,
 			);
 			await db.exec(`rollback`);
 			expect(await rowCount(db, 't')).to.equal(0);

@@ -874,7 +874,7 @@ An overlay's layer trees are keyed by the table's **old** primary key, and a sta
 - **Foreign overlay with staged rows** — poisoned, exactly as an unconvertible retype poisons one.
 - **Clean overlay (nothing staged)** — swapped for a fresh empty staging table built from the post-alter schema, so the rest of the transaction's writes key by the new primary key. There are no pre-existing staged rows to lose, and the fresh table's connection registers on its first write, which replays the active savepoint stack onto it.
 
-The bundled `MemoryTableModule` rejects `alter primary key` outright (`UNSUPPORTED`), so this path is only reachable with a store-backed underlying that accepts it.
+The bundled `MemoryTableModule` now re-keys `alter primary key` in place (as the store always has), so this path is reachable with either built-in underlying. The refusal for an issuer with staged rows is about the OVERLAY's representation — a staged tombstone's identity columns are meaningless under the new key — not about the underlying's capability.
 
 ##### DROP TABLE: discard, or poison
 

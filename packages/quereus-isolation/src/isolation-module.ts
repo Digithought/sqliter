@@ -1326,9 +1326,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const toMigrate = ownEntry ? [ownEntry, ...foreign] : foreign;
 
 		// ALTER PRIMARY KEY cannot be carried by any overlay: the staging table's layer
-		// trees are keyed by the OLD primary key, a staged tombstone identifies the row it
-		// deletes BY that key, and the (memory) overlay module rejects in-place PK
-		// alteration. When the ISSUER's own transaction has staged rows, reject up front —
+		// trees are keyed by the OLD primary key, and a staged tombstone identifies the row
+		// it deletes BY that key — under a new key its identity columns may be placeholder
+		// NULLs. (The memory overlay module can now re-key its OWN trees in place, but that
+		// does not repair the tombstone representation, so the refusal stands.) When the
+		// ISSUER's own transaction has staged rows, reject up front —
 		// before the underlying mutates — so the ALTER fails atomically rather than
 		// stranding rows it cannot re-key. Foreign overlays with staged rows are poisoned
 		// after the underlying applies, and clean overlays are swapped for a fresh staging

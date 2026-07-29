@@ -621,7 +621,7 @@ There is no in-place "redefine constraint" primitive. When a **declarative** sch
 ALTER TABLE table_name ALTER PRIMARY KEY (col_name [ASC|DESC] [, ...]);
 ```
 
-Replaces the table's primary key definition. All named columns must have a NOT NULL constraint. The empty-PK case `ALTER PRIMARY KEY ()` is permitted (the table reverts to an implicit rowid-style key). Modules that support re-keying in place handle the change directly; modules that cannot (including the built-in MemoryTable) use an automatic rebuild fallback that copies all rows into a new table with the updated PK and swaps it in place.
+Replaces the table's primary key definition. All named columns must have a NOT NULL constraint. The empty-PK case `ALTER PRIMARY KEY ()` is permitted (the table reverts to an implicit rowid-style key). Modules that support re-keying in place handle the change directly — both built-in modules do (MemoryTable re-keys its trees, indexes, and any open transaction's pending layers; the store physically re-keys the data store and rebuilds secondary indexes). A third-party module that cannot re-key throws `UNSUPPORTED`, and the engine falls back to an automatic shadow-table rebuild that copies all rows into a new table with the updated PK and swaps it in place.
 
 **ALTER COLUMN**
 

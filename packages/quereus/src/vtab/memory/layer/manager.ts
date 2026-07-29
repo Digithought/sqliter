@@ -4,7 +4,7 @@ import { keyParts, type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer, iteratePrimaryRows, populateIndexFromRows, populateIndexFromRowsAsync } from './base.js';
-import { TransactionLayer, type OwnWrite, type PreparedColumnReshape } from './transaction.js';
+import { TransactionLayer, type OwnWrite, type PreparedColumnReshape, type PreparedPrimaryKeyRekey } from './transaction.js';
 import type { Layer } from './interface.js';
 import { MemoryTableConnection } from './connection.js';
 import { MemoryVirtualTableConnection } from '../connection.js';
@@ -1559,31 +1559,6 @@ export class MemoryTableManager {
 		});
 	}
 
-	/** Iterates all committed rows from the current committed layer (for rebuild). */
-	scanAllRows(): Row[] {
-		const tree = this._currentCommittedLayer.getModificationTree('primary');
-		if (!tree) return [];
-		const rows: Row[] = [];
-		for (const path of tree.ascending(tree.first())) {
-			rows.push(tree.at(path)!);
-		}
-		return rows;
-	}
-
-	/** Inserts a row directly into the base layer (for rebuild, bypasses transaction).
-	 *  Throws on duplicate primary key. */
-	insertRow(row: Row): void {
-		const key = this.primaryKeyFunctions.extractFromRow(row);
-		const path = this.baseLayer.primaryTree.find(key);
-		if (path.on) {
-			throw new QuereusError(
-				`UNIQUE constraint failed: ${this._tableName} PK.`,
-				StatusCode.CONSTRAINT,
-			);
-		}
-		this.baseLayer.primaryTree.insert(row);
-	}
-
 	/**
 	 * Atomically replaces the entire committed contents with `rows` by building a
 	 * fresh {@link BaseLayer} and swapping it in under the SchemaChange latch.
@@ -2349,6 +2324,157 @@ export class MemoryTableManager {
 		} finally {
 			release();
 		}
+	}
+
+	/**
+	 * Apply `alter table … alter primary key` in place — the table's rows, the open
+	 * transaction's pending writes, and its pending change events all survive under the new
+	 * key. Follows {@link alterColumn}'s ordering contract: resolve and pre-validate the new
+	 * definition (mutating nothing) → probe the re-keyed primary structures
+	 * ({@link validateRekeyedPrimaryKey}, the same pass the `set collate` re-key runs) →
+	 * rebuild the base → swap this manager's schema → propagate to the open transaction's
+	 * layers → emit. What differs from the `set collate` re-key is WHAT moves: the key's
+	 * columns rather than its comparator, so each open layer's net deletions and its pending
+	 * event log must be re-derived from row images — a two-phase prepare/install pair
+	 * ({@link TransactionLayer.prepareRekeyedPrimaryKeyColumns}), with every prepare running
+	 * BEFORE the first mutation because a deletion's image resolves only through the intact
+	 * old layer chain.
+	 *
+	 * `validateOnly` runs everything up to (and including) the pre-mutation validation and
+	 * returns before the first mutation, throwing exactly what the real application would
+	 * throw — the same dry-run contract as {@link alterColumn}'s, for a wrapper (the
+	 * isolation layer) that must pre-flight before a shared underlying mutates irreversibly.
+	 *
+	 * NOTE: like the store's native arm and the engine's retired rebuild fallback, this swaps
+	 * `primaryKeyDefinition` only — the per-column `primaryKey` / `pkOrder` flags keep their
+	 * CREATE-time values. Everything that decides key membership reads the definition
+	 * (`table_info`, the DDL generator's multi-column path, key extraction); the flags feed
+	 * planner uniqueness hints, which were equally stale on both prior paths.
+	 */
+	async alterPrimaryKey(
+		newPkColumns: ReadonlyArray<{ index: number; desc?: boolean }>,
+		rows?: EffectiveRowSource,
+		validateOnly = false,
+	): Promise<void> {
+		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
+		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
+		const release = await this.db.latches.acquire(lockKey);
+		const originalManagerSchema = this.tableSchema;
+		const undo: AlterColumnUndo = { basePrimaryTree: null };
+		try {
+			await this.ensureSchemaChangeSafety();
+
+			const newSchema = this.buildRekeyedPrimaryKeySchema(newPkColumns);
+
+			// Pre-validate before any mutation: the effective rows decide whether the change
+			// is LEGAL (CONSTRAINT on a visible collision), the manager's own layer chain
+			// whether the re-keyed trees can PHYSICALLY carry it (BUSY when only rows a
+			// rollback must restore collide). A throw leaves everything as it was.
+			await this.validateRekeyedPrimaryKey(newSchema, rows);
+
+			// Dry run ends here: everything above validates without mutating, everything
+			// below mutates. See the method doc.
+			if (validateOnly) return;
+
+			// Compute every open layer's re-derived net writes and event log BEFORE the
+			// first mutation: a net deletion's new key comes from the parent's row image at
+			// the old key, which only the intact old chain can still resolve.
+			const newPkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
+			const plans: Array<{ layer: TransactionLayer; prepared: PreparedPrimaryKeyRekey }> =
+				this.openTransactionLayersOldestFirst().map(layer => ({
+					layer,
+					prepared: layer.prepareRekeyedPrimaryKeyColumns(newPkFunctions),
+				}));
+
+			// Base rebuild, mirroring alterColumn's `set collate` arm: secondary indexes
+			// first (each entry's key encoding embeds the primary key), then the strict
+			// primary rebuild LAST so its throw — a live invariant check; the pre-pass has
+			// already proven the base collision-free — leaves the live tree intact for the
+			// rollback below.
+			this.baseLayer.updateSchema(newSchema);
+			this.baseLayer.rebuildAllSecondaryIndexes();
+			undo.basePrimaryTree = this.baseLayer.primaryTree;
+			this.baseLayer.rebuildPrimaryTreeStrict();
+
+			this.tableSchema = newSchema;
+			this.initializePrimaryKeyFunctions();
+
+			// Oldest-first (the plans were gathered in that order): each layer's rebuilt tree
+			// inherits copy-on-write from its parent's NEW one. Synchronous and mutation-only.
+			for (const { layer, prepared } of plans) {
+				layer.installRekeyedPrimaryKeyColumns(newSchema, prepared);
+			}
+
+			this.eventEmitter?.emitSchemaChange?.({
+				type: 'alter',
+				objectType: 'table',
+				schemaName: this.schemaName,
+				objectName: this._tableName,
+			});
+
+			logger.operation('Alter Primary Key', this._tableName, {
+				columns: newSchema.primaryKeyDefinition.map(def => def.index),
+			});
+		} catch (e: unknown) {
+			// Restore the prior schema and primary tree, then re-key the secondary indexes
+			// back to it — the same safety net as alterColumn's catch: both pre-passes run
+			// before any mutation, so nothing in the apply steps is expected to throw.
+			this.baseLayer.updateSchema(originalManagerSchema);
+			if (undo.basePrimaryTree) this.baseLayer.primaryTree = undo.basePrimaryTree;
+			this.baseLayer.rebuildAllSecondaryIndexes();
+			this.tableSchema = originalManagerSchema;
+			this.initializePrimaryKeyFunctions();
+			logger.error('Alter Primary Key', this._tableName, e);
+			throw e;
+		} finally {
+			release();
+		}
+	}
+
+	/**
+	 * Resolve `alter primary key`'s column list against the current schema — bounds, no
+	 * duplicates, every member NOT NULL — and return the new schema with
+	 * `primaryKeyDefinition` swapped. The engine's emitter validates the same three by
+	 * column NAME before dispatch; re-checking by index here keeps a wrapper driving the
+	 * module API directly (the isolation layer) from installing an unkeyable definition.
+	 * Each member carries its column's collation, as `create table`'s PK builder records it
+	 * — dropping it would silently re-key a NOCASE column's structures under BINARY.
+	 */
+	private buildRekeyedPrimaryKeySchema(
+		newPkColumns: ReadonlyArray<{ index: number; desc?: boolean }>,
+	): TableSchema {
+		const columns = this.tableSchema.columns;
+		const seen = new Set<number>();
+		for (const pk of newPkColumns) {
+			if (pk.index < 0 || pk.index >= columns.length) {
+				throw new QuereusError(
+					`Primary key column index ${pk.index} is out of bounds for table '${this._tableName}'.`,
+					StatusCode.ERROR,
+				);
+			}
+			if (seen.has(pk.index)) {
+				throw new QuereusError(
+					`Duplicate column '${columns[pk.index].name}' in PRIMARY KEY definition`,
+					StatusCode.ERROR,
+				);
+			}
+			seen.add(pk.index);
+			if (!columns[pk.index].notNull) {
+				throw new QuereusError(
+					`Column '${columns[pk.index].name}' must be NOT NULL to participate in PRIMARY KEY`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
+
+		return Object.freeze({
+			...this.tableSchema,
+			primaryKeyDefinition: Object.freeze(newPkColumns.map(pk => ({
+				index: pk.index,
+				desc: pk.desc ?? false,
+				collation: columns[pk.index].collation || 'BINARY',
+			}))),
+		});
 	}
 
 	/**
@@ -3322,8 +3448,11 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * PRIMARY KEY arm of the `alter column … set collate` pre-pass. Runs before anything is
-	 * mutated, so a rejection leaves the table, the schema and the transaction untouched.
+	 * The primary-key re-key pre-pass, shared by both statements that move the key:
+	 * `alter column … set collate` on a PK member (the comparator moves) and
+	 * `alter table … alter primary key` (the key columns move — {@link alterPrimaryKey}).
+	 * Runs before anything is mutated, so a rejection leaves the table, the schema and the
+	 * transaction untouched.
 	 *
 	 * Asks two questions, in order, over two DIFFERENT row sets:
 	 *
@@ -3361,9 +3490,10 @@ export class MemoryTableManager {
 	 * rebase that savepoint snapshots exist to avoid. The tradeoff is a rare false BUSY on a
 	 * statement sequence the user can retry after committing, versus losing a row on rollback.
 	 *
-	 * This precondition is also what makes `TransactionLayer.rekeyPrimaryKey`'s replay sound:
-	 * with no collisions anywhere in the chain, every primary key resolves to at most one row
-	 * in each layer under the new comparator.
+	 * This precondition is also what makes the open-layer replays sound — both
+	 * `TransactionLayer.rekeyPrimaryKey`'s and `installRekeyedPrimaryKeyColumns`'s: with no
+	 * collisions anywhere in the chain, every primary key resolves to at most one row in
+	 * each layer under the new definition.
 	 */
 	private async validateRekeyedPrimaryKey(newSchema: TableSchema, rows?: EffectiveRowSource): Promise<void> {
 		const newPkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
@@ -3426,7 +3556,7 @@ export class MemoryTableManager {
 			if (key === undefined) continue;
 			const keyDesc = keyParts(key, keyIsTuple).map(formatKeyValue).join(', ');
 			throw new QuereusError(
-				`UNIQUE constraint failed: ${this._tableName} primary key collides under new collation (key: ${keyDesc})`,
+				`UNIQUE constraint failed: ${this._tableName} primary key collides under the new key definition (key: ${keyDesc})`,
 				StatusCode.CONSTRAINT,
 			);
 		}
@@ -3450,8 +3580,8 @@ export class MemoryTableManager {
 		for (const row of iteratePrimaryRows(tree)) {
 			if (seen(row) !== undefined) {
 				throw new QuereusError(
-					`Cannot change the collation of a primary key column of table ${this._tableName}: `
-					+ `rows this transaction has removed still collide under the new collation and must survive a rollback. `
+					`Cannot re-key the primary key of table ${this._tableName}: `
+					+ `rows this transaction has removed still collide under the new key definition and must survive a rollback. `
 					+ `Commit/rollback and retry.`,
 					StatusCode.BUSY,
 				);

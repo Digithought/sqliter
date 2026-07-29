@@ -41,6 +41,38 @@ export interface OwnWrite {
 }
 
 /**
+ * One layer's net own-writes re-derived under a NEW primary key definition (`alter table …
+ * alter primary key`), computed without mutation by
+ * {@link TransactionLayer.prepareRekeyedPrimaryKeyColumns} and installed by
+ * {@link TransactionLayer.installRekeyedPrimaryKeyColumns}. Split into two phases because a
+ * net DELETION's new key can only be derived from the row image the PARENT layer holds at
+ * the old key ({@link OwnWrite} carries no image for a delete) — and by install time,
+ * oldest-first processing has already replaced the parent's tree with one keyed by the new
+ * definition, where an old-shaped key means nothing. So every layer's prepare runs against
+ * the intact old chain, before the first rebuild anywhere.
+ */
+export interface PreparedPrimaryKeyRekey {
+	/**
+	 * The layer's net deletions: `newKey` re-derived from the parent's row image (what the
+	 * rebuilt tree is keyed by), `oldKey` as the write recorded it (the replay's identity
+	 * check — proof the row `find(newKey)` lands on is the row this layer deleted).
+	 */
+	deletions: Array<{ newKey: BTreeKeyForPrimary; oldKey: BTreeKeyForPrimary }>;
+	/** The layer's net effective rows. A key-column change moves no stored value, so rows pass verbatim. */
+	upserts: Row[];
+	/**
+	 * The layer's {@link PendingChange} event log with every recorded `pk` re-derived from
+	 * the event's own row image, or null when change tracking is disabled. The commit-time
+	 * delivery shapes each event's key by the arity of the schema AT DELIVERY
+	 * (`MemoryTableManager.commitTransaction`), so a key recorded at the retired arity
+	 * would be mis-shaped — unlike a collation-only re-key, where the recorded keys stay
+	 * accurate (see {@link TransactionLayer.rekeyPrimaryKey}). Not deduplicated — every
+	 * recorded write stays a separate event, the delivered contract.
+	 */
+	rekeyedPendingChanges: PendingChange[] | null;
+}
+
+/**
  * One layer's net own-writes at the post-ADD/DROP-COLUMN arity, computed fallibly by
  * {@link TransactionLayer.prepareReshapedColumns} and installed infallibly by
  * {@link TransactionLayer.installReshapedColumns} — see those methods for why the
@@ -80,9 +112,10 @@ export class TransactionLayer implements Layer {
 	 * transaction: by {@link adoptSchema} for additive index/constraint DDL, a secondary-index
 	 * re-key from `alter column … set collate`, and index/constraint removal (`drop index` /
 	 * `drop constraint`); by {@link rekeyPrimaryKey} when that collate change lands on a
-	 * primary-key column; and by {@link installReshapedColumns} when `add column` / `drop
-	 * column` changes the column set itself. Every swap except the last keeps the column set
-	 * identical.
+	 * primary-key column; by {@link installRekeyedPrimaryKeyColumns} when `alter primary key`
+	 * moves the key's column set; and by {@link installReshapedColumns} when `add column` /
+	 * `drop column` changes the column set itself. Every swap except the last keeps the
+	 * column set identical.
 	 */
 	private tableSchemaAtCreation: TableSchema;
 
@@ -90,6 +123,7 @@ export class TransactionLayer implements Layer {
 	 * Derived from {@link tableSchemaAtCreation}'s primary key definition, so the primary
 	 * tree, every inherited secondary index, and every scan share one comparator/encoder
 	 * set — and one pass of collation resolution. Rebuilt only by {@link rekeyPrimaryKey},
+	 * {@link installRekeyedPrimaryKeyColumns}, and {@link installReshapedColumns}, each of
 	 * which rebuilds the structures keyed by them in the same call.
 	 */
 	private pkFunctions: PrimaryKeyFunctions;
@@ -326,6 +360,151 @@ export class TransactionLayer implements Layer {
 		// this caller passes the old-comparator identity check (see the method doc above).
 		this.installNetOwnWrites(deletions, upserts, (deletionKey, foundRow) =>
 			preRekeyFunctions.compare(deletionKey, preRekeyFunctions.extractFromRow(foundRow)) === 0);
+	}
+
+	/**
+	 * Phase 1 of adopting `alter table … alter primary key` — a change of the key's COLUMNS,
+	 * where {@link rekeyPrimaryKey} handles only a change of its comparator — applied while
+	 * THIS layer's transaction is still open. Computes, without mutating anything, the net
+	 * per-key effect of the layer's own writes re-derived under `newPkFunctions`: see
+	 * {@link PreparedPrimaryKeyRekey} for each piece and the field docs for why the phases
+	 * are split (a deletion's new key comes from the parent's row image, which only the
+	 * intact OLD chain can resolve).
+	 *
+	 * A deletion whose old key resolves to no parent row was a no-op when recorded
+	 * (`recordDelete` tolerates a missing key) and is dropped — there is no image to re-key
+	 * and nothing for the replay to remove.
+	 *
+	 * An UPSERT can owe a deletion too. Under the OLD key an upsert shadowed the parent's
+	 * row at the same key; under the new definition the two images can land at DIFFERENT
+	 * keys — a pending `update t set b = 7` before `alter primary key (a, b)` moves the
+	 * row from `(a, 5)` to `(a, 7)` — and replaying only the upsert would leave the
+	 * parent's pre-update image visible beside it. So each upsert that shadows a parent
+	 * row landing elsewhere also emits a deletion of that parent image's new key.
+	 *
+	 * Soundness of the per-write collapse rests on the same precondition as
+	 * {@link rekeyPrimaryKey}'s: `MemoryTableManager.validateRekeyedPrimaryKey` has proven no
+	 * layer's merged view holds two rows that collide under the new definition, so every
+	 * surviving deletion's `newKey` is distinct and every upsert lands at exactly one key.
+	 */
+	public prepareRekeyedPrimaryKeyColumns(newPkFunctions: PrimaryKeyFunctions): PreparedPrimaryKeyRekey {
+		const oldFunctions = this.pkFunctions;
+		const parentTree = this.parentLayer.getModificationTree('primary');
+
+		const seen = new Set<string>();
+		const deletions: Array<{ newKey: BTreeKeyForPrimary; oldKey: BTreeKeyForPrimary }> = [];
+		const upserts: Row[] = [];
+		for (const write of this.ownWrites) {
+			const encoded = oldFunctions.encode(write.primaryKey);
+			if (seen.has(encoded)) continue;
+			seen.add(encoded);
+
+			// `get` traverses the inheritance chain, so this is the layer's EFFECTIVE row:
+			// undefined when the layer deleted the key, the layer's own row otherwise.
+			const effectiveRow = this.primaryModifications.get(write.primaryKey);
+			const parentRow = parentTree?.get(write.primaryKey);
+			if (effectiveRow !== undefined) {
+				upserts.push(effectiveRow);
+				// The shadowed parent image, if its new key diverges from the upsert's —
+				// see the method doc. Same-key shadows are handled by the replay's upsert.
+				if (parentRow !== undefined
+					&& newPkFunctions.compare(
+						newPkFunctions.extractFromRow(parentRow),
+						newPkFunctions.extractFromRow(effectiveRow)) !== 0) {
+					deletions.push({ newKey: newPkFunctions.extractFromRow(parentRow), oldKey: write.primaryKey });
+				}
+				continue;
+			}
+			if (parentRow === undefined) continue; // deletion of a key that never existed below — a no-op
+			deletions.push({ newKey: newPkFunctions.extractFromRow(parentRow), oldKey: write.primaryKey });
+		}
+
+		// Re-derive each recorded event's `pk` from the event's own row image. An update
+		// carries two images and the producers disagree about which one's key it recorded
+		// when the update itself moved the key (`fix/bug-update-event-key-disagrees-across-
+		// producers`) — so, exactly like the engine emitter's `rekeyBatchedDataEvents`
+		// tie-break, test both against the recorded key under the OLD functions and re-key
+		// from whichever matches. One entry per recorded write is kept — no dedup — because
+		// every recorded write is a separately delivered event.
+		let rekeyedPendingChanges: PendingChange[] | null = null;
+		if (this.pendingChanges) {
+			rekeyedPendingChanges = this.pendingChanges.map(change => {
+				const image = this.selectEventKeySourceImage(change, oldFunctions);
+				if (image === undefined) {
+					warnLog('Primary-key re-key: %s event on %s has no usable row image; leaving its key at the retired shape',
+						change.type, this.tableSchemaAtCreation.name);
+					return { ...change };
+				}
+				return { ...change, pk: newPkFunctions.extractFromRow(image) };
+			});
+		}
+
+		return { deletions, upserts, rekeyedPendingChanges };
+	}
+
+	/**
+	 * The row image a {@link PendingChange}'s recorded `pk` was derived from — the image a
+	 * primary-key re-key must re-project so the rewritten key still addresses the row the
+	 * producer meant. Insert and delete carry one meaningful image each; an update's two can
+	 * disagree when the update moved the key, so the recorded key picks between them.
+	 */
+	private selectEventKeySourceImage(change: PendingChange, oldFunctions: PrimaryKeyFunctions): Row | undefined {
+		if (change.type === 'insert') return change.newRow;
+		if (change.type === 'delete') return change.oldRow;
+
+		const matches = (row: Row | undefined): boolean =>
+			row !== undefined && oldFunctions.compare(change.pk, oldFunctions.extractFromRow(row)) === 0;
+		const oldMatches = matches(change.oldRow);
+		const newMatches = matches(change.newRow);
+		if (oldMatches && !newMatches) return change.oldRow;
+		if (newMatches && !oldMatches) return change.newRow;
+		return change.newRow ?? change.oldRow;
+	}
+
+	/**
+	 * Phase 2 of adopting `alter table … alter primary key`: installs what
+	 * {@link prepareRekeyedPrimaryKeyColumns} computed. Swaps in the new schema, rebuilds
+	 * {@link pkFunctions}, replays the net own-writes into a tree over the parent's
+	 * already-rebuilt one, rebuilds every secondary index (each embeds the primary key in its
+	 * entries), and installs the re-keyed event log. Synchronous and mutation-only.
+	 *
+	 * Like every whole-layer rebuild, the caller MUST apply this oldest-first with the base
+	 * already re-keyed: the rebuilt tree inherits copy-on-write from the parent's NEW one.
+	 *
+	 * The deletion replay verifies the row it finds is the row this layer deleted, by
+	 * comparing the found row's OLD key against the deletion's recorded one — the same
+	 * insurance {@link rekeyPrimaryKey} buys with its old-comparator check, phrased through
+	 * the prepared `oldKey` because here find() runs under a key whose columns the old
+	 * comparator cannot read. The old extractor stays valid: a primary-key change moves no
+	 * column, so the old key columns still exist in every row.
+	 */
+	public installRekeyedPrimaryKeyColumns(newSchema: TableSchema, prepared: PreparedPrimaryKeyRekey): void {
+		const oldFunctions = this.pkFunctions;
+		this.tableSchemaAtCreation = newSchema;
+		this.pkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
+
+		// Every surviving deletion's newKey is distinct (see the prepare doc), so the
+		// encoded-key map cannot clobber an entry.
+		const oldKeyByNewEncoded = new Map<string, BTreeKeyForPrimary>();
+		for (const { newKey, oldKey } of prepared.deletions) {
+			oldKeyByNewEncoded.set(this.pkFunctions.encode(newKey), oldKey);
+		}
+		this.installNetOwnWrites(
+			prepared.deletions.map(d => d.newKey),
+			prepared.upserts,
+			(deletionKey, foundRow) => {
+				const oldKey = oldKeyByNewEncoded.get(this.pkFunctions.encode(deletionKey));
+				return oldKey !== undefined
+					&& oldFunctions.compare(oldKey, oldFunctions.extractFromRow(foundRow)) === 0;
+			},
+		);
+
+		// Install the re-keyed event log the prepare phase computed (null ⇔ tracking
+		// disabled), so the keys delivered at this table's commit have the arity the
+		// delivery-time schema expects.
+		if (prepared.rekeyedPendingChanges !== null) {
+			this.pendingChanges = prepared.rekeyedPendingChanges;
+		}
 	}
 
 	/**

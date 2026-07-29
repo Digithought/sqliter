@@ -344,12 +344,12 @@ export class MemoryTable extends VirtualTable {
 	/** Handles schema changes via the manager */
 	async alterSchema(changeInfo: SchemaChangeInfo, validateOnly = false): Promise<void> {
 		// Validate-only dry run (see VirtualTable.alterSchema): supported for exactly the
-		// change type that has a caller needing it — the isolation layer pre-flights an
-		// `alter column` against a per-connection overlay before the shared underlying
+		// change types whose manager arms implement it — the isolation layer pre-flights a
+		// re-keying change against a per-connection overlay before the shared underlying
 		// mutates irreversibly. Refuse the rest rather than silently validating nothing.
-		if (validateOnly && changeInfo.type !== 'alterColumn') {
+		if (validateOnly && changeInfo.type !== 'alterColumn' && changeInfo.type !== 'alterPrimaryKey') {
 			throw new QuereusError(
-				`MemoryTable.alterSchema: validate-only is supported for 'alterColumn' changes, not '${changeInfo.type}'`,
+				`MemoryTable.alterSchema: validate-only is supported for 'alterColumn' and 'alterPrimaryKey' changes, not '${changeInfo.type}'`,
 				StatusCode.UNSUPPORTED,
 			);
 		}
@@ -369,10 +369,8 @@ export class MemoryTable extends VirtualTable {
 					await this.manager.renameColumn(changeInfo.oldName, changeInfo.newColumnDefAst as ASTColumnDef);
 					break;
 				case 'alterPrimaryKey':
-					throw new QuereusError(
-						'MemoryTable does not support in-place primary key alteration',
-						StatusCode.UNSUPPORTED,
-					);
+					await this.manager.alterPrimaryKey(changeInfo.newPkColumns, undefined, validateOnly);
+					break;
 				case 'addConstraint':
 					await this.manager.addConstraint(changeInfo.constraint);
 					break;

@@ -12,7 +12,6 @@ import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resol
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
-import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
 import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
@@ -1522,10 +1521,11 @@ async function runAlterPrimaryKey(
 }
 
 /**
- * Rebuilds a table with a new column projection and/or primary key.
- * For MemoryTable: builds a new table via the module API and copies rows directly,
- * bypassing SQL execution to avoid transaction-layer isolation issues.
- * For other modules: uses shadow-table SQL approach with DROP+RENAME.
+ * Rebuilds a table with a new column projection and/or primary key, via the
+ * shadow-table SQL approach with DROP+RENAME. This is the fallback for a module
+ * whose `alterTable` throws `UNSUPPORTED` for `alterPrimaryKey` (or omits the
+ * hook); the built-in memory and store modules both re-key in place and never
+ * reach it.
  */
 async function rebuildTableWithNewShape(
 	rctx: RuntimeContext,
@@ -1536,13 +1536,8 @@ async function rebuildTableWithNewShape(
 ): Promise<void> {
 	const tableName = tableSchema.name;
 	const schemaName = tableSchema.schemaName;
-	const module = requireVtabModule(tableSchema);
 
-	if (module instanceof MemoryTableModule) {
-		await rebuildMemoryTable(rctx, tableSchema, schema, module, survivingColumns, newPkDef);
-	} else {
-		await rebuildViaShadowTable(rctx, tableSchema, schema, survivingColumns, newPkDef);
-	}
+	await rebuildViaShadowTable(rctx, tableSchema, schema, survivingColumns, newPkDef);
 
 	const finalSchema = schema.getTable(tableName);
 	if (finalSchema) {
@@ -1553,100 +1548,6 @@ async function rebuildTableWithNewShape(
 			oldObject: tableSchema,
 			newObject: finalSchema,
 		});
-	}
-}
-
-/**
- * MemoryTable rebuild: builds a new table via module.create() and copies rows
- * directly from the old manager, then swaps in the module and catalog.
- */
-async function rebuildMemoryTable(
-	rctx: RuntimeContext,
-	tableSchema: TableSchema,
-	schema: import('../../schema/schema.js').Schema,
-	module: MemoryTableModule,
-	survivingColumns: string[],
-	newPkDef: PrimaryKeyColumnDefinition[],
-): Promise<void> {
-	const tableName = tableSchema.name;
-	const schemaName = tableSchema.schemaName;
-	const oldKey = `${schemaName}.${tableName}`.toLowerCase();
-	const oldMgr = module.tables.get(oldKey);
-	if (!oldMgr) {
-		throw new QuereusError(`Table '${tableName}' not found in module`, StatusCode.INTERNAL);
-	}
-
-	// Build column index mapping: old column index → new column index
-	const survivingIndices: number[] = [];
-	const newColumns: import('../../schema/column.js').ColumnSchema[] = [];
-	for (const colName of survivingColumns) {
-		const oldIdx = tableSchema.columnIndexMap.get(colName.toLowerCase());
-		if (oldIdx === undefined) continue;
-		survivingIndices.push(oldIdx);
-		newColumns.push(tableSchema.columns[oldIdx]);
-	}
-
-	// Remap PK indices from old schema to new column order
-	const remappedPk: PrimaryKeyColumnDefinition[] = newPkDef.map(pk => {
-		const newIdx = survivingIndices.indexOf(pk.index);
-		if (newIdx === -1) {
-			throw new QuereusError(`PK column index ${pk.index} not in surviving columns`, StatusCode.INTERNAL);
-		}
-		return { ...pk, index: newIdx };
-	});
-
-	// Build new schema
-	const newSchema: TableSchema = Object.freeze({
-		...tableSchema,
-		columns: Object.freeze(newColumns),
-		columnIndexMap: buildColumnIndexMap(newColumns),
-		primaryKeyDefinition: Object.freeze(remappedPk),
-		indexes: Object.freeze([]),
-	});
-
-	// Create the new table via the module API (goes directly to base layer)
-	const shadowName = `${tableName}__rekey_${Date.now()}`;
-	const shadowSchema: TableSchema = Object.freeze({ ...newSchema, name: shadowName });
-	await module.create(rctx.db, shadowSchema);
-	const shadowMgr = module.tables.get(`${schemaName}.${shadowName}`.toLowerCase());
-	if (!shadowMgr) {
-		throw new QuereusError(`Shadow table manager not found after create`, StatusCode.INTERNAL);
-	}
-
-	try {
-		// Copy rows from old table to new, projecting surviving columns
-		const rows = oldMgr.scanAllRows();
-		for (const oldRow of rows) {
-			const newRow = survivingIndices.map(i => oldRow[i]);
-			shadowMgr.insertRow(newRow);
-		}
-
-		// Swap: remove old, remove shadow, re-register shadow under old name
-		module.tables.delete(oldKey);
-		module.tables.delete(`${schemaName}.${shadowName}`.toLowerCase());
-		shadowMgr.renameTable(tableName);
-		module.tables.set(oldKey, shadowMgr);
-
-		// Update catalog
-		schema.removeTable(tableName);
-		schema.addTable(shadowMgr.tableSchema);
-
-		// The old manager is now orphaned. Any active VirtualTableConnection bound
-		// to it (e.g. from a prior insert in this session) is stale and must not be
-		// reused against the rebuilt table — a reused-stale + fresh connection pair
-		// leaves two candidates registered for the same table name, which trips
-		// DeferredConstraintQueue.findConnection at the next commit. Mirror the
-		// drop-table path's cleanup (schema/manager.ts dropTable). The orphaned
-		// manager and its pending layer are discarded with the old manager, so no
-		// rollback is needed; this intentionally bypasses implicit-transaction
-		// deferral, exactly as drop table relies on.
-		rctx.db.removeConnectionsForTable(schemaName, tableName);
-	} catch (e) {
-		// Clean up shadow on failure
-		try {
-			module.tables.delete(`${schemaName}.${shadowName}`.toLowerCase());
-		} catch { /* ignore */ }
-		throw e;
 	}
 }
 
@@ -1780,12 +1681,13 @@ async function runDropMaintained(
 }
 
 /**
- * Generic rebuild via shadow table SQL for non-memory modules.
+ * Generic rebuild via shadow table SQL, for a module without a native
+ * `alterPrimaryKey`.
  */
 async function rebuildViaShadowTable(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
-	schema: import('../../schema/schema.js').Schema,
+	_schema: import('../../schema/schema.js').Schema,
 	survivingColumns: string[],
 	newPkDef: PrimaryKeyColumnDefinition[],
 ): Promise<void> {

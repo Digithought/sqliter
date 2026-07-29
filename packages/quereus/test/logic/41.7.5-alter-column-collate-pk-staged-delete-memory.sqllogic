@@ -44,7 +44,7 @@ delete from t_rk2 where k in ('A', 'a');
 -- run
 
 alter table t_rk2 alter column k set collate nocase;
--- error: still collide under the new collation
+-- error: still collide under the new key definition
 
 commit;
 select count(*) as n from t_rk2;

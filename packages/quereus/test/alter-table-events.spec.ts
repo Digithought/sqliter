@@ -367,13 +367,17 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 
 		// ── ALTER PRIMARY KEY: the recorded `key` follows the key the table has at delivery ──
 		//
-		// NOTE: these assert the delivered `key` ONLY, never row survival. The memory module
-		// rejects an in-place re-key (StatusCode.UNSUPPORTED), so this path takes the rebuild
-		// fallback, which silently discards the rows the transaction itself wrote — that is
-		// `fix/bug-alter-primary-key-mid-transaction-loses-memory-rows`, independent of and
-		// more severe than the re-key. The store path re-keys in place, so the paired
-		// `key`-vs-committed-row assertions live in
-		// packages/quereus-store/test/alter-events.spec.ts.
+		// The memory module re-keys in place (MemoryTableManager.alterPrimaryKey), so these
+		// arms assert row survival alongside the delivered `key` — the paired coverage the
+		// store path carries in packages/quereus-store/test/alter-events.spec.ts, and the
+		// dedicated survival matrix lives in alter-primary-key-in-transaction.spec.ts.
+
+		/** All of t's rows, in primary-key order. */
+		async function tRows(): Promise<unknown[]> {
+			const rows: unknown[] = [];
+			for await (const row of db.eval('select * from t')) rows.push(row);
+			return rows;
+		}
 
 		it('ALTER PRIMARY KEY widening re-keys an insert recorded before it', async () => {
 			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
@@ -384,6 +388,7 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 
 			assert.equal(events.length, 1);
 			assert.deepEqual(events[0].key, [1, 9]);
+			assert.deepEqual(await tRows(), [{ a: 1, b: 9, v: 'x' }]);
 		});
 
 		it('ALTER PRIMARY KEY narrowing re-keys an insert recorded before it', async () => {
@@ -395,6 +400,7 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 
 			assert.equal(events.length, 1);
 			assert.deepEqual(events[0].key, [1]);
+			assert.deepEqual(await tRows(), [{ a: 1, b: 9, v: 'x' }]);
 		});
 
 		it('ALTER PRIMARY KEY re-keys to a column that was not in the old key at all', async () => {
@@ -406,6 +412,7 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 
 			assert.equal(events.length, 1);
 			assert.deepEqual(events[0].key, [9]);
+			assert.deepEqual(await tRows(), [{ a: 1, b: 9, v: 'x' }]);
 		});
 
 		it('an update crossing an ALTER PRIMARY KEY is re-keyed from its own row image', async () => {
@@ -421,6 +428,7 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.equal(events.length, 1);
 			assert.equal(events[0].type, 'update');
 			assert.deepEqual(events[0].key, [1, 9]);
+			assert.deepEqual(await tRows(), [{ a: 1, b: 9, v: 'y' }]);
 		});
 
 		it('an update that MOVES the primary key keeps whichever image the producer keyed it by', async () => {
@@ -464,6 +472,7 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.equal(events.length, 1);
 			assert.equal(events[0].type, 'delete');
 			assert.deepEqual(events[0].key, [1, 9]);
+			assert.deepEqual(await tRows(), []);
 		});
 
 		it('ALTER PRIMARY KEY re-keys events sitting in an open savepoint layer', async () => {
@@ -477,6 +486,7 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			await db.exec('commit');
 
 			assert.deepEqual(events.map(e => e.key), [[1, 9], [2, 8]]);
+			assert.deepEqual(await tRows(), [{ a: 1, b: 9, v: 'x' }, { a: 2, b: 8, v: 'y' }]);
 		});
 
 		it('an autocommit ALTER PRIMARY KEY does not re-key an already-delivered event', async () => {

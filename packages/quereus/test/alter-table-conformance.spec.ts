@@ -179,11 +179,11 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
-		label: 'alterPrimaryKey (memory: engine rebuild)',
+		label: 'alterPrimaryKey (memory: native in-place re-key)',
 		seed: u => [`create table t (id integer primary key, code integer not null)${u}`, `insert into t values (1, 100), (2, 200)`],
 		alter: `alter table t alter primary key (code)`,
 		memory: { kind: 'honored' },
-		stubUnsupported: false, // memory throws UNSUPPORTED; the engine catches it and rebuilds
+		stubUnsupported: false, // no-alterTable modules still get the engine's shadow-rebuild fallback
 		confirm: async (db, outcome) => {
 			if (outcome === 'honored') {
 				expect(await pkColumns(db), 'PK re-keyed to code').to.deep.equal(['code']);
