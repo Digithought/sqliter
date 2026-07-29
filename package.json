@@ -63,7 +63,7 @@
     "pub:ui": "node scripts/publish-package.js shared-ui",
     "pub:cli": "node scripts/publish-package.js quoomb-cli",
     "pub:planviz": "node scripts/publish-package.js tools/planviz",
-    "//pub": "NOTE: this publish order is still hand-maintained and is NO LONGER kept in lockstep with the build order — `build` now derives its order from tsconfig references (tsc -b), so adding/reordering a package updates the build automatically but NOT this chain. Keep this list in dependency order (a package must publish after everything it depends on) by hand; if you add a package to tsconfig.build.json, add its pub:* step here too.",
+    "//pub": "NOTE: this publish order is still hand-maintained and is NO LONGER kept in lockstep with the build order — `build` now derives its order from tsconfig references (tsc -b), so adding/reordering a package updates the build automatically but NOT this chain. Keep this list in dependency order (a package must publish after everything it depends on) by hand; if you add a package to tsconfig.build.json, add its pub:* step here too. scripts/check-docs.mjs parses this chain (each step must call publish-package.js) to derive which packages need a stability banner, so a new step also needs an entry in docs/.stability.json.",
     "pub": "yarn pub:quereus && yarn pub:loader && yarn pub:isolation && yarn pub:store && yarn pub:plugin-indexeddb && yarn pub:plugin-leveldb && yarn pub:plugin-rn && yarn pub:plugin-ns && yarn pub:sync && yarn pub:sync-client && yarn pub:sync-coordinator && yarn pub:ui && yarn pub:cli && yarn pub:planviz"
   },
   "devDependencies": {

@@ -2,7 +2,7 @@
 
 // Documentation integrity gate. Cheapest link in `yarn check`, so it runs first.
 //
-// Four independent checks, all reporting to one failure list:
+// Five independent checks, all reporting to one failure list:
 //
 //   A. Link integrity   — every markdown link and every `docs/*.md` reference in
 //                         the source tree names a file that exists, and every
@@ -17,6 +17,10 @@
 //                         tiered doc carries exactly one header banner naming its
 //                         recorded tier, and every tier named anywhere is one that
 //                         `docs/stability.md` defines.
+//   E. Package tiers    — the same three-way agreement for package `README.md` banners:
+//                         every package `yarn pub` publishes is classified in
+//                         `docs/.stability.json`, and its README carries exactly one
+//                         well-formed banner naming its recorded tier.
 //
 // Usage:
 //   node scripts/check-docs.mjs                    run every check; exit 1 on any failure
@@ -77,12 +81,30 @@ function walk(dir, predicate, found = []) {
 	return found;
 }
 
+/**
+ * Every workspace directory: `packages/*` plus `packages/tools/*`, mirroring the `workspaces`
+ * globs in the root `package.json`.
+ *
+ * NOTE: a directory under `packages/` with no `package.json` of its own is a grouping folder,
+ * not a package, so we descend one level into it. Before this, `packages/tools` was treated as
+ * a package — it has no `README.md` and no `src/` — and `packages/tools/planviz` was invisible
+ * to every check that walks packages.
+ */
 function packageDirs() {
 	const pkgRoot = join(ROOT, 'packages');
 	if (!existsSync(pkgRoot)) return [];
-	return readdirSync(pkgRoot, { withFileTypes: true })
-		.filter((e) => e.isDirectory() && !SKIP_DIRS.has(e.name))
-		.map((e) => join(pkgRoot, e.name));
+
+	const children = (dir) =>
+		readdirSync(dir, { withFileTypes: true })
+			.filter((e) => e.isDirectory() && !SKIP_DIRS.has(e.name))
+			.map((e) => join(dir, e.name));
+
+	const dirs = [];
+	for (const dir of children(pkgRoot)) {
+		if (existsSync(join(dir, 'package.json'))) dirs.push(dir);
+		else dirs.push(...children(dir).filter((sub) => existsSync(join(sub, 'package.json'))));
+	}
+	return dirs;
 }
 
 /** `docs/**\/*.md`, minus the frozen review artifacts. */
@@ -590,10 +612,11 @@ function banners(strippedContent, doc, fail) {
  * line-count bound is a fallback for a doc whose H1 is followed by a long intro before its
  * first `##`. Returns `null` when the doc has no H1.
  *
- * NOTE: every doc today puts its banner on the line right below the H1, so the six-line bound
- * has no bite. If a doc ever needs a longer preamble above its banner, raise the bound rather
- * than dropping it — a banner buried in an intro reads as a section override, and the doc then
- * fails as if it had no header banner at all.
+ * NOTE: every doc puts its banner on the line right below the H1, so the six-line bound has no
+ * bite there. Package READMEs (Check E) are closer to it — `packages/quereus/README.md` spends
+ * a logo line plus a four-line banner, five of the six. If a README ever needs badges above its
+ * banner, or a banner longer than four lines, raise the bound rather than dropping it: a banner
+ * outside the window is reported as sitting below the header, not as missing.
  */
 function headerWindow(lines) {
 	const h1 = lines.findIndex((line) => /^# /.test(line));
@@ -637,10 +660,16 @@ function readStability() {
 		throw new Error(`missing ${repoPath(STABILITY_PATH)} — the stability map has no data`);
 	}
 	const stability = JSON.parse(readText(STABILITY_PATH));
-	const shape = [['tiers', Array.isArray], ['untiered', Array.isArray], ['docs', isObject]];
-	for (const [key, wellShaped] of shape) {
+	const shape = [
+		['tiers', Array.isArray, 'an array'],
+		['untiered', Array.isArray, 'an array'],
+		['docs', isObject, 'an object'],
+		['packages', isObject, 'an object'],
+		['packagesSpanning', Array.isArray, 'an array'],
+	];
+	for (const [key, wellShaped, label] of shape) {
 		if (!wellShaped(stability[key])) {
-			throw new Error(`${repoPath(STABILITY_PATH)}: '${key}' is missing or is not ${key === 'docs' ? 'an object' : 'an array'}`);
+			throw new Error(`${repoPath(STABILITY_PATH)}: '${key}' is missing or is not ${label}`);
 		}
 	}
 	return stability;
@@ -735,6 +764,182 @@ function checkStability(fail) {
 			checkTieredDoc(doc, tiered.get(doc), found, headerWindow(content.split('\n')), vocabulary, fail);
 		}
 	}
+
+	// Check E reads the same file and the same tier vocabulary; parse and validate them once.
+	return { stability, vocabulary };
+}
+
+// ---------------------------------------------------------------------------
+// Check E — package README banners
+// ---------------------------------------------------------------------------
+
+const ROOT_PACKAGE_PATH = join(ROOT, 'package.json');
+
+/** The classification of a package whose README declares no single tier — today only the engine. */
+const SPANS = Symbol('spans tiers');
+
+/**
+ * The package directories `yarn pub` publishes, derived from the root `package.json` rather than
+ * restated here. `pub` chains `yarn pub:<step>` calls; each step runs
+ * `node scripts/publish-package.js <dir>`, where `<dir>` is relative to `packages/`.
+ *
+ * Deriving it is the point. The first pass at the package banners hand-listed the packages and
+ * silently missed two that publish, which is exactly the drift this check exists to catch.
+ */
+function publishedPackages(scripts) {
+	const chain = scripts.pub;
+	if (typeof chain !== 'string') {
+		throw new Error(`package.json: no 'pub' script — cannot derive the list of published packages`);
+	}
+
+	const dirs = [];
+	for (const [, step] of chain.matchAll(/\byarn\s+(pub:[\w:-]+)/g)) {
+		const command = scripts[step];
+		if (typeof command !== 'string') throw new Error(`package.json: 'pub' runs '${step}', which is not a script`);
+
+		const arg = /publish-package\.js\s+(\S+)/.exec(command);
+		if (!arg) throw new Error(`package.json: '${step}' does not call scripts/publish-package.js — cannot tell which package it publishes`);
+		dirs.push(`packages/${arg[1]}`);
+	}
+	if (!dirs.length) throw new Error(`package.json: the 'pub' script chains no 'yarn pub:*' steps`);
+	return dirs;
+}
+
+/** The `docs/stability.md` target a README in `pkgDir` must link — `../../docs/stability.md`, one deeper under `packages/tools/`. */
+const stabilityLinkFrom = (pkgDir) => toPosix(relative(resolve(ROOT, pkgDir), join(ROOT, 'docs', 'stability.md')));
+
+/** Anything a reader would call a package banner: the line that opens the blockquote. */
+const PACKAGE_BANNER_ISH = /^>\s*\*\*Stability\b/;
+
+// A package banner is not a doc banner. The clause after the em dash spells out what the tier
+// means for *this* package — the on-disk format for `@quereus/store`, the wire protocol for the
+// sync packages — so it is free-form prose and wraps across several lines. Only the head and the
+// trailing link are pinned; `parsePackageBanner` also requires a closing full stop.
+const PACKAGE_TIER = /^\*\*Stability:\s+(\w+)\*\*\s+—\s+\S/;
+const PACKAGE_SPANS = /^\*\*Stability\*\*\s+—\s+\S/;
+
+/**
+ * Every blockquote in `lines` that opens with `**Stability`, as `{ line, text }` with the `> `
+ * prefixes stripped and the lines joined by single spaces. Matching line by line the way Check D
+ * does would see only the banner's first line, which rarely reaches the link.
+ */
+function packageBannerBlocks(lines) {
+	const blocks = [];
+	for (let i = 0; i < lines.length; i++) {
+		if (!PACKAGE_BANNER_ISH.test(lines[i])) continue;
+
+		const text = [];
+		let end = i;
+		while (end < lines.length && lines[end].startsWith('>')) {
+			text.push(lines[end].replace(/^>\s?/, '').trim());
+			end++;
+		}
+		blocks.push({ line: i + 1, text: text.join(' ').trim() });
+		i = end;
+	}
+	return blocks;
+}
+
+/**
+ * `{ tier }` for a single-tier banner, `{ spans: true }` for the `**Stability**` form the engine
+ * package uses, `null` for anything that is not a well-formed banner.
+ */
+function parsePackageBanner(text, pkgDir) {
+	if (!text.endsWith('.')) return null;
+	if (!text.includes(`[Stability Tiers](${stabilityLinkFrom(pkgDir)}#tiers)`)) return null;
+
+	const tier = PACKAGE_TIER.exec(text);
+	if (tier) return { tier: tier[1] };
+	return PACKAGE_SPANS.test(text) ? { spans: true } : null;
+}
+
+/** Rule 1: a package is classified at most once, and every package that publishes is classified. */
+function classifyPackages(stability, published, fail) {
+	const classified = new Map(Object.entries(stability.packages));
+	for (const pkgDir of stability.packagesSpanning) {
+		if (classified.has(pkgDir)) {
+			fail(`docs/.stability.json: '${pkgDir}' is classified twice — it is in both 'packages' and 'packagesSpanning'`);
+		}
+		classified.set(pkgDir, SPANS);
+	}
+
+	for (const pkgDir of published) {
+		if (!classified.has(pkgDir)) {
+			fail(`docs/.stability.json: '${pkgDir}' publishes to npm but is not classified — add it to 'packages' with a tier, or to 'packagesSpanning' if its README declares no single tier`);
+		}
+	}
+	return classified;
+}
+
+/** Rules 2 and 3: exactly one banner, sitting under the H1, agreeing with the map. */
+function checkPackageBanner(readme, pkgDir, expected, blocks, window, fail) {
+	if (!blocks.length) {
+		fail(`${readme}: no stability banner — a classified package states its tier under its '#' heading`);
+		return;
+	}
+	if (blocks.length > 1) {
+		fail(`${readme}:${blocks[1].line}: a second stability banner — a package declares exactly one tier`);
+		return;
+	}
+
+	const [block] = blocks;
+	if (window === null) fail(`${readme}: has no '#' heading — cannot locate the header window`);
+	else if (!window.has(block.line)) {
+		fail(`${readme}:${block.line}: stability banner sits below the header window — it belongs under the '#' heading, before the intro`);
+	}
+
+	const parsed = parsePackageBanner(block.text, pkgDir);
+	if (!parsed) {
+		fail(`${readme}:${block.line}: malformed stability banner — expected '> **Stability: <Tier>** — <what that means for this package>' closing with '[Stability Tiers](${stabilityLinkFrom(pkgDir)}#tiers).'`);
+		return;
+	}
+
+	if (expected === SPANS) {
+		if (!parsed.spans) fail(`${readme}:${block.line}: banner names tier '${parsed.tier}' but docs/.stability.json lists this package under 'packagesSpanning'`);
+	} else if (parsed.spans) {
+		fail(`${readme}:${block.line}: banner declares no single tier but docs/.stability.json records '${expected}'`);
+	} else if (parsed.tier !== expected) {
+		fail(`${readme}:${block.line}: banner says '${parsed.tier}' but docs/.stability.json records '${expected}'`);
+	}
+}
+
+function checkPackageReadme(pkgDir, expected, fail) {
+	const readme = `${pkgDir}/README.md`;
+	const abs = resolve(ROOT, readme);
+	// Unlike a ratchet orphan, a stale entry here is not inert: it is a tier assignment nobody
+	// can read, and re-adding the package would pass on a classification nobody reviewed.
+	if (!existsSync(abs)) {
+		fail(`docs/.stability.json: '${pkgDir}' is classified but has no README.md — drop the entry, or restore the file`);
+		return;
+	}
+
+	// Fences first, for the same reason Check D strips them: a README may show a banner as an
+	// illustration, and an illustration is not a declaration.
+	const lines = stripFences(readText(abs)).split('\n');
+	checkPackageBanner(readme, pkgDir, expected, packageBannerBlocks(lines), headerWindow(lines), fail);
+}
+
+function checkPackages(stability, vocabulary, fail) {
+	const published = publishedPackages(JSON.parse(readText(ROOT_PACKAGE_PATH)).scripts ?? {});
+	const classified = classifyPackages(stability, published, fail);
+
+	for (const [pkgDir, tier] of classified) {
+		if (tier !== SPANS && !vocabulary.has(tier)) {
+			fail(`docs/.stability.json: '${pkgDir}' is tiered '${tier}', which is not defined in docs/stability.md`);
+		}
+		checkPackageReadme(pkgDir, tier, fail);
+	}
+
+	// Rule 4. A banner on a README nobody classifies is a tier claim under no gate at all. The
+	// classified set names every top-level package README that may carry one; anything else under
+	// `packages/` — a nested `src/README.md`, or a package left out of the map — must not.
+	for (const file of readmeFiles()) {
+		const readme = repoPath(file);
+		if (classified.has(readme.replace(/\/README\.md$/, ''))) continue;
+		for (const block of packageBannerBlocks(stripFences(readText(file)).split('\n'))) {
+			fail(`${readme}:${block.line}: stability banner in an unclassified README — classify its package in docs/.stability.json, or drop the banner`);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -807,6 +1012,7 @@ function selfTest(fail) {
 	if (headerWindow(['no h1 here']) !== null) fail(`scripts/check-docs.mjs: headerWindow must report a missing H1 as null`);
 
 	stabilitySelfTest(fail);
+	packageSelfTest(fail);
 }
 
 /** Run something that reports through a `fail` callback; return the messages it produced, in order. */
@@ -857,6 +1063,78 @@ function stabilitySelfTest(fail) {
 	expectFailures(tiered([at('Beta', 2), at('Stable', 9)], header), [], 'a well-formed section override', fail);
 }
 
+/**
+ * Check E's rules, against injected inputs. `checkPackageReadme` is the only part that touches
+ * the filesystem, and it is a four-line wrapper over `checkPackageBanner`.
+ */
+function packageSelfTest(fail) {
+	const published = publishedPackages({
+		pub: 'yarn pub:engine && yarn pub:viz',
+		'pub:engine': 'node scripts/publish-package.js quereus',
+		'pub:viz': 'node scripts/publish-package.js tools/planviz',
+	}).join(',');
+	if (published !== 'packages/quereus,packages/tools/planviz') {
+		fail(`scripts/check-docs.mjs: publishedPackages read '${published}' from a chain publishing quereus and tools/planviz`);
+	}
+
+	// The nesting depth is load-bearing: a `packages/tools/*` README is one level further out.
+	if (stabilityLinkFrom('packages/x') !== '../../docs/stability.md') fail(`scripts/check-docs.mjs: a packages/* README no longer links '../../docs/stability.md'`);
+	if (stabilityLinkFrom('packages/tools/x') !== '../../../docs/stability.md') fail(`scripts/check-docs.mjs: a packages/tools/* README no longer links '../../../docs/stability.md'`);
+
+	const link = (pkgDir) => `[Stability Tiers](${stabilityLinkFrom(pkgDir)}#tiers)`;
+	const banner = (tier) => `**Stability: ${tier}** — complete and tested, but the surface is still being shaped. See ${link('packages/x')}.`;
+	const spans = `**Stability** — this package spans tiers: some areas are Stable, others Beta. See ${link('packages/x')} for the per-area assignment.`;
+
+	if (parsePackageBanner(banner('Beta'), 'packages/x')?.tier !== 'Beta') fail(`scripts/check-docs.mjs: the canonical package stability banner no longer parses`);
+	if (!parsePackageBanner(spans, 'packages/x')?.spans) fail(`scripts/check-docs.mjs: the spans-tiers package banner no longer parses`);
+
+	const nearMisses = [
+		`**Stability: Beta** - complete and tested. See ${link('packages/x')}.`, // hyphen, not an em dash
+		`**Stability: Beta** —complete and tested. See ${link('packages/x')}.`, // no space after the em dash
+		`**Stability: Beta** — complete and tested. See Stability Tiers.`, // no link
+		`**Stability: Beta** — complete and tested. See ${link('packages/x')}`, // no full stop
+		`**Stability: Beta** — complete and tested. See ${link('packages/tools/x')}.`, // link relative to the wrong depth
+		`**stability: Beta** — complete and tested. See ${link('packages/x')}.`, // lowercase
+		`**Stability:** Beta — complete and tested. See ${link('packages/x')}.`, // colon outside the bold
+	];
+	for (const text of nearMisses) {
+		if (parsePackageBanner(text, 'packages/x')) fail(`scripts/check-docs.mjs: the package banner parser tolerates a near-miss: ${text}`);
+	}
+
+	// A package banner wraps; the block must rejoin before it can be parsed at all.
+	const wrapped = ['# Package', '', '> **Stability: Beta** — complete and tested, but the', '> surface is still being shaped. See', `> ${link('packages/x')}.`, '', 'Intro.'];
+	const blocks = packageBannerBlocks(wrapped);
+	if (blocks.length !== 1 || blocks[0].line !== 3 || parsePackageBanner(blocks[0].text, 'packages/x')?.tier !== 'Beta') {
+		fail(`scripts/check-docs.mjs: a wrapped package banner no longer joins into one block: ${JSON.stringify(blocks)}`);
+	}
+
+	expectFailures(
+		collectFailures((f) => classifyPackages(
+			{ packages: { 'packages/a': 'Stable', 'packages/both': 'Beta' }, packagesSpanning: ['packages/both'] },
+			['packages/a', 'packages/new'],
+			f,
+		)),
+		[`'packages/both' is classified twice`, `'packages/new' publishes to npm but is not classified`],
+		'classifyPackages',
+		fail,
+	);
+
+	const window = new Set([3]);
+	const at = (line, text) => ({ line, text });
+	const checked = (found, win, expected) => collectFailures((f) => checkPackageBanner('packages/x/README.md', 'packages/x', expected, found, win, f));
+
+	expectFailures(checked([], window, 'Beta'), [`no stability banner`], 'a classified package with no banner', fail);
+	expectFailures(checked([at(3, banner('Beta')), at(9, banner('Beta'))], window, 'Beta'), [`a second stability banner`], 'a package declaring its tier twice', fail);
+	expectFailures(checked([at(3, banner('Beta'))], null, 'Beta'), [`has no '#' heading`], 'a README with no H1', fail);
+	expectFailures(checked([at(9, banner('Beta'))], window, 'Beta'), [`sits below the header window`], 'a banner below the header window', fail);
+	expectFailures(checked([at(3, '**Stability** is important around here.')], window, 'Beta'), [`malformed stability banner`], 'a banner-ish line that is not a banner', fail);
+	expectFailures(checked([at(3, banner('Stable'))], window, 'Beta'), [`banner says 'Stable' but docs/.stability.json records 'Beta'`], 'a banner disagreeing with the map', fail);
+	expectFailures(checked([at(3, spans)], window, 'Beta'), [`declares no single tier`], 'a spans banner on a single-tier package', fail);
+	expectFailures(checked([at(3, banner('Beta'))], window, SPANS), [`banner names tier 'Beta'`], 'a single-tier banner on a spanning package', fail);
+	expectFailures(checked([at(3, banner('Beta'))], window, 'Beta'), [], 'a well-formed package banner', fail);
+	expectFailures(checked([at(3, spans)], window, SPANS), [], 'a well-formed spans-tiers banner', fail);
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -882,7 +1160,8 @@ function main() {
 	selfTest(fail);
 	checkLinks(fail);
 	checkInvariants(fail);
-	checkStability(fail);
+	const { stability, vocabulary } = checkStability(fail);
+	checkPackages(stability, vocabulary, fail);
 	checkRatchet(fail);
 
 	if (failures.length) {
@@ -890,7 +1169,7 @@ function main() {
 		console.error(`\n${failures.length} documentation failure(s). See docs/doc-conventions.md.`);
 		process.exit(1);
 	}
-	console.log('Docs OK: links resolve, invariants well-formed, sizes within ratchet, tiers declared.');
+	console.log('Docs OK: links resolve, invariants well-formed, sizes within ratchet, doc and package tiers declared.');
 }
 
 main();

@@ -116,7 +116,11 @@ describe how the project is built rather than what it promises, and carry no tie
 `docs/review.md` and `docs/review.html` are frozen review artifacts and are exempt from
 every doc check.
 
-The machine-readable form of this table is [`docs/.stability.json`](.stability.json).
+The machine-readable form of this table is [`docs/.stability.json`](.stability.json), which
+carries a `docs` map for the per-doc banners and a `packages` map for the per-package ones.
+`yarn docs:check` fails the build when either map, its banners, or the set of packages
+`yarn pub` publishes fall out of agreement — see
+[Documentation Conventions](doc-conventions.md#in-a-package-readme).
 
 ## Three edge calls
 

@@ -136,9 +136,24 @@ means for *this* package rather than stopping at the link — the on-disk format
 the `## Assignment` table in `stability.md`; a README states its tier and never redefines
 one.
 
-Nothing gates this: `docs:check` reads package READMEs for link integrity only, so a
-README's tier is correct by review rather than by check. Changing a package's tier means
-editing both the assignment table and that package's README by hand.
+`docs:check` gates this the same way it gates a doc banner. `docs/.stability.json` carries a
+`packages` map — keys are package *directories*, values are tiers — plus a `packagesSpanning`
+list for a README that declares no single tier, which today is only `packages/quereus`. The
+checker derives the list of packages that must appear from the `pub` script chain in the root
+`package.json`, so a package added to that chain without an entry in the map fails the build
+rather than becoming silently exempt. `quoomb-web` and the VS Code extension do not publish
+but carry a banner, so they are listed too; `packages/sample-plugins` has no README and is the
+one intended omission.
+
+A README banner is checked for form, position, and agreement — exactly one banner, under the
+`#` heading, opening `**Stability: <Tier>**` (or `**Stability**` for a spanning package),
+closing with a full stop, and containing the `[Stability Tiers](…#tiers)` link at the right
+relative depth. Its prose is free-form, so nothing between the em dash and the link is
+checked. A banner in a README that the map does not classify — a nested `src/README.md`, say —
+also fails: a tier claim under no gate is what this check exists to prevent.
+
+Changing a package's tier still means three edits: the assignment table in `stability.md`, the
+`packages` map, and that package's README. The checker tells you when you have done fewer.
 
 ## The size ratchet
 

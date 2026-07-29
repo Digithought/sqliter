@@ -1,5 +1,5 @@
 {
-	"note": "Tier assignment per doc. A new docs/*.md must appear in `docs` or `untiered` or the docs gate fails. Definitions and the per-area table live in docs/stability.md.",
+	"note": "Tier assignment per doc and per package. A new docs/*.md must appear in `docs` or `untiered`, and a package `yarn pub` publishes must appear in `packages` or `packagesSpanning`, or the docs gate fails. Definitions and the per-area table live in docs/stability.md.",
 	"tiers": ["Stable", "Beta", "Experimental", "Internal"],
 	"docs": {
 		"docs/aggregate-algebra.md": "Beta",
@@ -68,5 +68,26 @@
 		"docs/stability.md",
 		"docs/todo.md",
 		"docs/zero-bug-plan.md"
+	],
+	"packagesNote": "Keys are package directories, not npm names. Every package `yarn pub` publishes must be listed here or in `packagesSpanning`; quoomb-web and the VS Code extension do not publish but carry a banner, so they are listed too. packages/sample-plugins has no README and is the one intended omission.",
+	"packages": {
+		"packages/plugin-loader": "Stable",
+		"packages/quereus-isolation": "Beta",
+		"packages/quereus-plugin-indexeddb": "Beta",
+		"packages/quereus-plugin-leveldb": "Beta",
+		"packages/quereus-plugin-nativescript-sqlite": "Beta",
+		"packages/quereus-plugin-react-native-leveldb": "Beta",
+		"packages/quereus-store": "Beta",
+		"packages/quereus-sync": "Experimental",
+		"packages/quereus-sync-client": "Experimental",
+		"packages/quereus-vscode": "Beta",
+		"packages/quoomb-cli": "Beta",
+		"packages/quoomb-web": "Beta",
+		"packages/shared-ui": "Beta",
+		"packages/sync-coordinator": "Experimental",
+		"packages/tools/planviz": "Beta"
+	},
+	"packagesSpanning": [
+		"packages/quereus"
 	]
 }
