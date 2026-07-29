@@ -7,8 +7,8 @@
  * all need the same primitives:
  *   - find a declared FK on the child that covers a given set of equi-pairs
  *     against a parent table,
- *   - extract the underlying `TableSchema` of a relational subtree (through
- *     standard row-preserving wrappers),
+ *   - resolve the underlying `TableSchema` of a relational subtree together
+ *     with the map from its output columns back to that table's columns,
  *   - decide whether a relational subtree exposes the full row set of its
  *     underlying base table (no row-reducing wrapper between the join and the
  *     table).
@@ -16,8 +16,8 @@
  * `extractTableSchema` and `checkFkPkAlignment` live in `key-utils.ts` because
  * they also serve non-IND callers (key coverage, FD propagation). This file
  * adds the IND-specific extensions: a covering-FK lookup that *returns* the
- * matched FK (so callers can inspect nullability), and the row-preserving
- * path walker.
+ * matched FK (so callers can inspect nullability), the output-column →
+ * table-column mapping, and the row-preserving path walker.
  */
 
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
@@ -27,7 +27,7 @@ import { TableReferenceNode } from '../nodes/reference.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
 import { AliasNode } from '../nodes/alias-node.js';
 import { SortNode } from '../nodes/sort.js';
-import { extractTableSchema } from './key-utils.js';
+import { ProjectNode } from '../nodes/project-node.js';
 
 /**
  * Result of a successful covering-FK lookup.
@@ -199,12 +199,81 @@ export function seedTableForeignKeyInds(
 }
 
 /**
- * Convenience wrapper around `extractTableSchema` — same behaviour, exported
- * under a name that matches the IND-rules' vocabulary so callers don't need
- * to reach into key-utils for an unrelated import.
+ * Where each output column of a relational subtree comes from in the single
+ * base table that subtree reads.
+ *
+ * `columnOf[i]` is the base-table column index behind output column `i`, or
+ * `undefined` when output column `i` is not a bare base-table column (a
+ * computed projection, an aggregate result, a synthesized flag, …).
+ *
+ * Rules that pair a subtree's *output* column indices against a `TableSchema`
+ * (FK↔PK alignment) must translate through this map first: an intervening
+ * projection can rename, reorder, or drop columns, so an output index is not
+ * interchangeable with a table column index.
  */
-export function tableSchemaOf(node: RelationalPlanNode): TableSchema | undefined {
-	return extractTableSchema(node);
+export interface TableColumnMapping {
+	schema: TableSchema;
+	columnOf: ReadonlyArray<number | undefined>;
+}
+
+/**
+ * The single base table `node` reads, or `undefined` when the subtree reads
+ * zero or several tables (a join, a set operation, a values list, …).
+ *
+ * Descends single-relation wrappers; a `RetrieveNode` resolves directly to its
+ * `tableRef` (its pipeline reads that table by construction).
+ */
+function findBaseTableReference(node: RelationalPlanNode): TableReferenceNode | undefined {
+	if (node instanceof TableReferenceNode) return node;
+	if (node instanceof RetrieveNode) return node.tableRef;
+
+	const relations = node.getRelations();
+	if (relations.length === 1) return findBaseTableReference(relations[0]);
+	return undefined;
+}
+
+/**
+ * Resolve `node` to the base table it reads plus the output-column → table-column
+ * map described by {@link TableColumnMapping}. Returns `undefined` when the
+ * subtree does not bottom out in exactly one table.
+ *
+ * The map is built by attribute *identity*: a `TableReferenceNode` mints one
+ * attribute per table column in column order, and every wrapper that merely
+ * passes a column through (Filter, Sort, Alias, Retrieve, Distinct, a bare
+ * column projection) republishes that same attribute id. So an output column
+ * whose attribute id is one of the table's maps to that column, and anything
+ * derived — which carries a fresh attribute id — maps to `undefined`.
+ */
+export function resolveTableColumnMapping(node: RelationalPlanNode): TableColumnMapping | undefined {
+	const tableRef = findBaseTableReference(node);
+	if (!tableRef) return undefined;
+
+	const colByAttrId = new Map<number, number>();
+	tableRef.getAttributes().forEach((attr, index) => colByAttrId.set(attr.id, index));
+
+	return {
+		schema: tableRef.tableSchema,
+		columnOf: node.getAttributes().map(attr => colByAttrId.get(attr.id)),
+	};
+}
+
+/**
+ * Translate output column indices into base-table column indices via
+ * {@link TableColumnMapping}. Returns `undefined` when any column has no
+ * base-table origin — the caller must then decline rather than pair an
+ * unrelated index against the table schema.
+ */
+export function mapColumnsToTable(
+	cols: ReadonlyArray<number>,
+	mapping: TableColumnMapping,
+): number[] | undefined {
+	const out: number[] = [];
+	for (const col of cols) {
+		const tableCol = mapping.columnOf[col];
+		if (tableCol === undefined) return undefined;
+		out.push(tableCol);
+	}
+	return out;
 }
 
 /**
@@ -215,23 +284,35 @@ export function tableSchemaOf(node: RelationalPlanNode): TableSchema | undefined
  * Allowed wrappers: TableReferenceNode (base), RetrieveNode whose pipeline is
  * the bare TableReferenceNode (no pushed-down pipeline filter), AliasNode,
  * SortNode — all preserve row count *and* attribute-id mapping of their
- * source. ProjectNode is intentionally excluded: it may reorder/drop columns
- * which would invalidate the table-column-index→attribute-index assumption
- * the FK→PK alignment check relies on. Anything else (Filter, LimitOffset,
- * Distinct, Project, Join, Aggregate, Window, CTE, SetOperation, …)
- * disqualifies.
+ * source. Anything else (Filter, LimitOffset, Distinct, Join, Aggregate,
+ * Window, CTE, SetOperation, …) disqualifies.
  *
- * Used by: INNER join elimination (PK side must be unfiltered) and aggregate
+ * `ProjectNode` is excluded by default even though a projection never removes
+ * rows: it may rename, reorder, or drop columns, which breaks the
+ * table-column-index ≡ output-index assumption callers who pass raw output
+ * indices to the FK→PK alignment check rely on. Callers that translate their
+ * column indices through {@link resolveTableColumnMapping} first are immune to
+ * that and pass `throughProject: true` to peel projections as well.
+ *
+ * Used by: INNER join elimination (PK side must be unfiltered), aggregate
  * elimination over FK-covered joins (same reason — a row-reducing wrapper on
- * the eliminable side would have dropped rows the FK→PK guarantee assumes
- * are present).
+ * the eliminable side would have dropped rows the FK→PK guarantee assumes are
+ * present), and the semi/anti-join FK folds (which opt into `throughProject`,
+ * since the uncorrelated `IN` arm hands the join a bare `Project` over the
+ * parent table).
  */
-export function isRowPreservingPathToTable(node: RelationalPlanNode): boolean {
+export function isRowPreservingPathToTable(
+	node: RelationalPlanNode,
+	options: { throughProject?: boolean } = {},
+): boolean {
 	if (node instanceof TableReferenceNode) return true;
 	if (node instanceof RetrieveNode) {
 		return node.source instanceof TableReferenceNode;
 	}
-	if (node instanceof AliasNode) return isRowPreservingPathToTable(node.source);
-	if (node instanceof SortNode) return isRowPreservingPathToTable(node.source);
+	if (node instanceof AliasNode) return isRowPreservingPathToTable(node.source, options);
+	if (node instanceof SortNode) return isRowPreservingPathToTable(node.source, options);
+	if (options.throughProject && node instanceof ProjectNode) {
+		return isRowPreservingPathToTable(node.source, options);
+	}
 	return false;
 }

@@ -154,14 +154,43 @@ SELECT id FROM spans WHERE d IN (SELECT t FROM spantext) ORDER BY id;
 
 -- ===== FK-backed IN =====
 
--- A declared NOT NULL FK covering the join key: whether or not the FK fold
--- (rule-semi-join-fk-trivial) fires, every child row survives.
+-- A declared NOT NULL FK covering the join key: rule-semi-join-fk-trivial drops
+-- the semi join (the plan shape is pinned in test/plan/subquery-decorrelation),
+-- so every child row survives without the parent ever being read.
 CREATE TABLE fkdept (id INTEGER PRIMARY KEY, dname TEXT);
 CREATE TABLE fkemp (id INTEGER PRIMARY KEY, dept_id INTEGER NOT NULL REFERENCES fkdept(id));
 INSERT INTO fkdept VALUES (1, 'eng'), (2, 'sales');
 INSERT INTO fkemp VALUES (10, 1), (20, 2);
 SELECT id FROM fkemp WHERE dept_id IN (SELECT id FROM fkdept) ORDER BY id;
 → [{"id":10},{"id":20}]
+
+-- A nullable FK column folds to `WHERE fk IS NOT NULL` instead: a NULL never
+-- matches under `=`, so the NULL row must not survive.
+CREATE TABLE fkemp_opt (id INTEGER PRIMARY KEY, dept_id INTEGER NULL REFERENCES fkdept(id));
+INSERT INTO fkemp_opt VALUES (10, 1), (20, NULL), (30, 2);
+SELECT id FROM fkemp_opt WHERE dept_id IN (SELECT id FROM fkdept) ORDER BY id;
+→ [{"id":10},{"id":30}]
+
+-- A projection that reorders the parent's columns still folds — the equi
+-- column is translated back to the parent's own column index first.
+SELECT id FROM fkemp WHERE dept_id IN (SELECT id FROM (SELECT dname, id FROM fkdept)) ORDER BY id;
+→ [{"id":10},{"id":20}]
+
+-- ...but a filtered parent must NOT fold: the FK guarantees the parent row
+-- exists, not that it survives the subquery's WHERE.
+SELECT id FROM fkemp WHERE dept_id IN (SELECT id FROM fkdept WHERE dname = 'eng') ORDER BY id;
+→ [{"id":10}]
+
+-- Nor may an equality against a NON-referenced parent column fold. dname is the
+-- subquery's output column 0 — the same index as the referenced column
+-- fkdept.id — so an untranslated index comparison would spuriously align.
+SELECT id FROM fkemp WHERE dept_id IN (SELECT dname FROM fkdept) ORDER BY id;
+→ []
+
+-- Same hazard on the child side: the IN is on fkemp.id, which a reordering
+-- derived table puts at the index the FK column occupies in fkemp.
+SELECT e.id FROM (SELECT dept_id, id FROM fkemp) e WHERE e.id IN (SELECT id FROM fkdept) ORDER BY e.id;
+→ []
 
 -- ===== The one other place an IN decides row fate: CHECK =====
 
@@ -211,6 +240,7 @@ DROP TABLE chk_allowed;
 DROP TABLE selfd;
 DROP TABLE dml_keys;
 DROP TABLE dml_t;
+DROP TABLE fkemp_opt;
 DROP TABLE fkemp;
 DROP TABLE fkdept;
 DROP TABLE spantext;

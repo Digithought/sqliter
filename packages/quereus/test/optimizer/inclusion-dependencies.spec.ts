@@ -9,7 +9,7 @@ import {
 	shiftInds,
 	MAX_INDS_PER_NODE,
 } from '../../src/planner/util/fd-utils.js';
-import { fkChildNullable, seedTableForeignKeyInds } from '../../src/planner/util/ind-utils.js';
+import { fkChildNullable, mapColumnsToTable, resolveTableColumnMapping, seedTableForeignKeyInds } from '../../src/planner/util/ind-utils.js';
 import { propagateJoinInds } from '../../src/planner/nodes/join-utils.js';
 import type { JoinType } from '../../src/planner/nodes/join-node.js';
 import {
@@ -248,6 +248,62 @@ describe('seedTableForeignKeyInds', () => {
 			foreignKeys: [makeFk([1], 'missing', ['id'])],
 		});
 		expect(seedTableForeignKeyInds(child, () => undefined)).to.have.length(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// resolveTableColumnMapping / mapColumnsToTable
+// ---------------------------------------------------------------------------
+//
+// The FK rules pair a subtree's OUTPUT column indices against a TableSchema. An
+// intervening projection can rename, reorder, or drop columns, so those indices
+// must be translated back to base-table column indices first — otherwise an
+// output index that coincides with an unrelated table column index "aligns"
+// against the FK and folds a join that was never redundant.
+
+describe('resolveTableColumnMapping', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table dept (id integer primary key, dname text null) using memory');
+		await db.exec('create table emp (id integer primary key, dept_id integer not null references dept(id)) using memory');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	/** Root relational node of the optimized plan for `sql`. */
+	function root(sql: string): RelationalPlanNode {
+		const block = db.getPlan(sql) as any;
+		return block.getRelations()[0] as RelationalPlanNode;
+	}
+
+	it('maps a bare scan 1:1 onto the table columns', () => {
+		const mapping = resolveTableColumnMapping(root('select * from dept'));
+		expect(mapping?.schema.name).to.equal('dept');
+		expect(mapping?.columnOf).to.deep.equal([0, 1]);
+	});
+
+	it('translates a reordering projection back to table columns', () => {
+		const mapping = resolveTableColumnMapping(root('select dname, id from dept'));
+		expect(mapping?.columnOf).to.deep.equal([1, 0]);
+	});
+
+	it('reports a computed column as having no table origin', () => {
+		const mapping = resolveTableColumnMapping(root('select id + 0 from dept'));
+		expect(mapping?.columnOf).to.deep.equal([undefined]);
+	});
+
+	it('returns undefined for a subtree spanning two tables', () => {
+		expect(resolveTableColumnMapping(root('select emp.id, dept.id from emp cross join dept'))).to.equal(undefined);
+	});
+
+	it('mapColumnsToTable declines when any column has no table origin', () => {
+		const mapping = resolveTableColumnMapping(root('select dname, id + 0 from dept'))!;
+		expect(mapColumnsToTable([0], mapping)).to.deep.equal([1]);
+		expect(mapColumnsToTable([0, 1], mapping)).to.equal(undefined);
 	});
 });
 

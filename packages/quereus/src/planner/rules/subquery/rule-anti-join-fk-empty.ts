@@ -36,7 +36,7 @@ import type { OptContext } from '../../framework/context.js';
 import { JoinNode, extractEquiPairsFromCondition } from '../../nodes/join-node.js';
 import { EmptyRelationNode } from '../../nodes/empty-relation-node.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
-import { lookupCoveringFK, isRowPreservingPathToTable, tableSchemaOf } from '../../util/ind-utils.js';
+import { lookupCoveringFK, isRowPreservingPathToTable, resolveTableColumnMapping, mapColumnsToTable } from '../../util/ind-utils.js';
 import { isAndOfColumnEqualities } from '../join/rule-join-elimination.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
@@ -55,12 +55,20 @@ export function ruleAntiJoinFkEmpty(node: PlanNode, _context: OptContext): PlanN
 	const pairs = extractEquiPairsFromCondition(node.condition, leftAttrs, rightAttrs);
 	if (pairs.length === 0) return null;
 
-	const leftSchema = tableSchemaOf(node.left);
-	const rightSchema = tableSchemaOf(node.right);
-	if (!leftSchema || !rightSchema) return null;
+	// Equi-pairs index each side's OUTPUT columns; the FK lookup speaks base-table
+	// column indices. Translate before comparing — a projection on either side can
+	// rename, reorder, or drop columns, and a derived column has no table origin
+	// at all (mapColumnsToTable then declines).
+	const leftMapping = resolveTableColumnMapping(node.left);
+	const rightMapping = resolveTableColumnMapping(node.right);
+	if (!leftMapping || !rightMapping) return null;
 
-	const childEquiCols = pairs.map(p => p.left);
-	const parentEquiCols = pairs.map(p => p.right);
+	const childEquiCols = mapColumnsToTable(pairs.map(p => p.left), leftMapping);
+	const parentEquiCols = mapColumnsToTable(pairs.map(p => p.right), rightMapping);
+	if (!childEquiCols || !parentEquiCols) return null;
+
+	const leftSchema = leftMapping.schema;
+	const rightSchema = rightMapping.schema;
 	const match = lookupCoveringFK(leftSchema, rightSchema, childEquiCols, parentEquiCols);
 	if (!match) return null;
 
@@ -69,8 +77,10 @@ export function ruleAntiJoinFkEmpty(node: PlanNode, _context: OptContext): PlanN
 	if (match.nullable) return null;
 
 	// The parent side must expose the full base-table row set — otherwise the
-	// IND `L.fk ⊆ R.pk` doesn't guarantee a match in the filtered relation.
-	if (!isRowPreservingPathToTable(node.right)) return null;
+	// IND `L.fk ⊆ R.pk` doesn't guarantee a match in the filtered relation. A
+	// projection is peeled (it never drops rows); its column renaming is already
+	// accounted for by the mapping above.
+	if (!isRowPreservingPathToTable(node.right, { throughProject: true })) return null;
 
 	// Refuse to fold to Empty when either participating subtree carries a write —
 	// the anti-join collapses to EmptyRelation(L's attrs), dropping both sides.

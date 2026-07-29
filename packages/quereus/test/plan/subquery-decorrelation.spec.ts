@@ -176,22 +176,86 @@ describe('Plan shape: subquery decorrelation', () => {
 	});
 
 	describe('FK-backed uncorrelated IN', () => {
-		it('answers correctly whether or not the FK fold fires', async () => {
-			// The semi join reaches rule-semi-join-fk-trivial, but that fold
-			// currently declines: the verbatim right side is Project(...), which
-			// isRowPreservingPathToTable rejects (see
-			// backlog/feat-semi-join-fk-fold-through-project). Assert the answer
-			// and that the InNode is gone; tolerate either the fold or the join.
+		// `extractUncorrelatedIn` hands the semi join the IN subquery VERBATIM, so
+		// the join's right side is `Project(dept)`. rule-semi-join-fk-trivial peels
+		// that projection and remaps the equi-pair's parent column — an output
+		// column index of the projection — back to dept's column index before
+		// consulting the FK, so the fold fires and dept never executes.
+		beforeEach(async () => {
 			await db.exec("CREATE TABLE dept (id INTEGER PRIMARY KEY, dname TEXT) USING memory");
+			// Columns default to NOT NULL in quereus, so `emp_opt.dept_id` spells
+			// its nullability explicitly to exercise the IS NOT NULL fold.
 			await db.exec("CREATE TABLE emp (id INTEGER PRIMARY KEY, dept_id INTEGER NOT NULL REFERENCES dept(id)) USING memory");
+			await db.exec("CREATE TABLE emp_opt (id INTEGER PRIMARY KEY, dept_id INTEGER NULL REFERENCES dept(id)) USING memory");
 			await db.exec("INSERT INTO dept VALUES (1, 'eng'), (2, 'sales')");
 			await db.exec("INSERT INTO emp VALUES (10, 1), (20, 2)");
+			await db.exec("INSERT INTO emp_opt VALUES (10, 1), (20, null)");
+		});
 
+		/** True when any plan node reads `main.<table>`. */
+		const readsTable = async (q: string, table: string): Promise<boolean> => {
+			const rows = await planRows(db, q);
+			return rows.some(r => r.object_name === `main.${table}`);
+		};
+
+		it('folds a NOT NULL FK to a bare scan of the child table', async () => {
 			const q = "SELECT id FROM emp WHERE dept_id IN (SELECT id FROM dept) ORDER BY id";
-			const types = await planNodeTypes(db, q);
-			expect(types).to.not.include('In');
-			const results = await allRows<{ id: number }>(db, q);
-			expect(results).to.deep.equal([{ id: 10 }, { id: 20 }]);
+			expect(await countSemiJoins(q), 'the semi join should be folded away').to.equal(0);
+			expect(await readsTable(q, 'dept'), 'the parent table must never execute').to.equal(false);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 10 }, { id: 20 }]);
+		});
+
+		it('folds a nullable FK to Filter(fk IS NOT NULL)', async () => {
+			const q = "SELECT id FROM emp_opt WHERE dept_id IN (SELECT id FROM dept) ORDER BY id";
+			const rows = await planRows(db, q);
+			expect(await countSemiJoins(q)).to.equal(0);
+			expect(await readsTable(q, 'dept')).to.equal(false);
+			expect(
+				rows.some(r => r.op === 'FILTER' && /is not null/i.test(r.detail)),
+				'expected the NULL-rejecting filter the fold leaves behind',
+			).to.equal(true);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 10 }]);
+		});
+
+		it('folds through a projection that reorders the parent columns', async () => {
+			// dept.id sits at output index 1 of the inner derived table; the fold is
+			// only sound because that index is translated back to dept's column 0.
+			const q = "SELECT id FROM emp WHERE dept_id IN (SELECT id FROM (SELECT dname, id FROM dept)) ORDER BY id";
+			expect(await countSemiJoins(q)).to.equal(0);
+			expect(await readsTable(q, 'dept')).to.equal(false);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 10 }, { id: 20 }]);
+		});
+
+		it('keeps the semi join when the parent subquery filters rows', async () => {
+			// The FK guarantees a parent ROW exists, not that it survives a WHERE.
+			const q = "SELECT id FROM emp WHERE dept_id IN (SELECT id FROM dept WHERE dname = 'eng') ORDER BY id";
+			expect(await countSemiJoins(q), 'a filtered parent must not fold').to.equal(1);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 10 }]);
+		});
+
+		it('keeps the semi join when the parent column is computed', async () => {
+			// `id + 0` has no base-table column of its own, so the FK lookup has
+			// nothing to align against.
+			const q = "SELECT id FROM emp WHERE dept_id IN (SELECT id + 0 FROM dept) ORDER BY id";
+			expect(await countSemiJoins(q)).to.equal(1);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 10 }, { id: 20 }]);
+		});
+
+		it('keeps the semi join when the equi column is not the referenced parent column', async () => {
+			// dept.dname is the projection's output column 0 — the same index as the
+			// FK's referenced column dept.id. Comparing raw output indices would
+			// spuriously "align"; the mapping resolves dname to dept column 1.
+			const q = "SELECT id FROM emp WHERE dept_id IN (SELECT dname FROM dept) ORDER BY id";
+			expect(await countSemiJoins(q)).to.equal(1);
+			expect(await allRows(db, q)).to.deep.equal([]);
+		});
+
+		it('keeps the semi join when a child-side projection moves the FK column', async () => {
+			// The IN is on emp.id (output index 1 of the derived table), which is the
+			// FK column's index in emp — the child side needs the same translation.
+			const q = "SELECT e.id FROM (SELECT dept_id, id FROM emp) e WHERE e.id IN (SELECT id FROM dept) ORDER BY e.id";
+			expect(await countSemiJoins(q)).to.equal(1);
+			expect(await allRows(db, q)).to.deep.equal([]);
 		});
 	});
 
