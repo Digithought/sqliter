@@ -153,7 +153,10 @@ checked. A banner in a README that the map does not classify — a nested `src/R
 also fails: a tier claim under no gate is what this check exists to prevent.
 
 Changing a package's tier still means three edits: the assignment table in `stability.md`, the
-`packages` map, and that package's README. The checker tells you when you have done fewer.
+`packages` map, and that package's README. The checker pins the last two to each other, so
+editing one without the other fails. It cannot read the assignment table — that table is prose
+— so a tier changed there alone leaves the build green and the table disagreeing with the
+banners. Edit all three.
 
 ## The size ratchet
 

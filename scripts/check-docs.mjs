@@ -585,8 +585,9 @@ function updateRatchet(force) {
 // banner check has already forced to be wrong.
 const BANNER = /^>\s+\*\*Stability:\s+(\w+)\*\*\s+—\s+see \[Stability Tiers\]\(stability\.md#tiers\)\.$/;
 
-// Anything a reader would call a banner. Matching this but not BANNER is a malformed banner,
-// reported as such — otherwise a wrong dash reads as "no banner at all".
+// Anything a reader would call a banner — a blockquote opening with `**Stability`. Matching this
+// but not BANNER is a malformed banner, reported as such — otherwise a wrong dash reads as "no
+// banner at all". Check E opens its package banner blocks on the same pattern.
 const BANNER_ISH = /^>\s*\*\*Stability\b/;
 
 /** `> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).` → `{ tier }`; anything else → `null`. */
@@ -612,11 +613,14 @@ function banners(strippedContent, doc, fail) {
  * line-count bound is a fallback for a doc whose H1 is followed by a long intro before its
  * first `##`. Returns `null` when the doc has no H1.
  *
+ * The bound counts only the lines *above* the banner: the window test asks whether the banner's
+ * opening line is inside, so a banner of any length passes once it starts inside.
+ *
  * NOTE: every doc puts its banner on the line right below the H1, so the six-line bound has no
- * bite there. Package READMEs (Check E) are closer to it — `packages/quereus/README.md` spends
- * a logo line plus a four-line banner, five of the six. If a README ever needs badges above its
- * banner, or a banner longer than four lines, raise the bound rather than dropping it: a banner
- * outside the window is reported as sitting below the header, not as missing.
+ * bite there. Package READMEs (Check E) spend more of it — `packages/quereus/README.md` puts a
+ * logo line above its banner — but the worst case today still leaves four lines spare. If a
+ * README ever needs six lines of badges above its banner, raise the bound rather than dropping
+ * it: a banner outside the window is reported as sitting below the header, not as missing.
  */
 function headerWindow(lines) {
 	const h1 = lines.findIndex((line) => /^# /.test(line));
@@ -808,9 +812,6 @@ function publishedPackages(scripts) {
 /** The `docs/stability.md` target a README in `pkgDir` must link — `../../docs/stability.md`, one deeper under `packages/tools/`. */
 const stabilityLinkFrom = (pkgDir) => toPosix(relative(resolve(ROOT, pkgDir), join(ROOT, 'docs', 'stability.md')));
 
-/** Anything a reader would call a package banner: the line that opens the blockquote. */
-const PACKAGE_BANNER_ISH = /^>\s*\*\*Stability\b/;
-
 // A package banner is not a doc banner. The clause after the em dash spells out what the tier
 // means for *this* package — the on-disk format for `@quereus/store`, the wire protocol for the
 // sync packages — so it is free-form prose and wraps across several lines. Only the head and the
@@ -826,7 +827,7 @@ const PACKAGE_SPANS = /^\*\*Stability\*\*\s+—\s+\S/;
 function packageBannerBlocks(lines) {
 	const blocks = [];
 	for (let i = 0; i < lines.length; i++) {
-		if (!PACKAGE_BANNER_ISH.test(lines[i])) continue;
+		if (!BANNER_ISH.test(lines[i])) continue;
 
 		const text = [];
 		let end = i;
@@ -931,13 +932,19 @@ function checkPackages(stability, vocabulary, fail) {
 	}
 
 	// Rule 4. A banner on a README nobody classifies is a tier claim under no gate at all. The
-	// classified set names every top-level package README that may carry one; anything else under
-	// `packages/` — a nested `src/README.md`, or a package left out of the map — must not.
+	// classified set names every README that may carry one; every other README Check A walks — the
+	// repo root's, a nested `src/README.md`, a package left out of the map — must not.
+	//
+	// NOTE: this catches a *claimed* tier, not a missing one. A package that carries a README, is
+	// not published, and is not in the map is silently exempt — every package README today is
+	// classified, so there is nothing to exempt. If a future non-publishing package needs no tier,
+	// give packages an `untiered`-style escape list and require classification for every package
+	// README, rather than leaving the exemption implicit.
 	for (const file of readmeFiles()) {
 		const readme = repoPath(file);
 		if (classified.has(readme.replace(/\/README\.md$/, ''))) continue;
 		for (const block of packageBannerBlocks(stripFences(readText(file)).split('\n'))) {
-			fail(`${readme}:${block.line}: stability banner in an unclassified README — classify its package in docs/.stability.json, or drop the banner`);
+			fail(`${readme}:${block.line}: stability banner in a README docs/.stability.json does not classify — only a classified package's top-level README declares a tier; classify the package, or drop the banner`);
 		}
 	}
 }
@@ -1010,6 +1017,13 @@ function selfTest(fail) {
 	const window = headerWindow(`# Doc\n\n${banner}\n\n## Section\n\n${banner}\n`.split('\n'));
 	if (!window.has(3) || window.has(7)) fail(`scripts/check-docs.mjs: the header window no longer ends at the first subsequent heading`);
 	if (headerWindow(['no h1 here']) !== null) fail(`scripts/check-docs.mjs: headerWindow must report a missing H1 as null`);
+
+	// The six-line bound counts non-blank lines above the banner, blanks excluded. A package README
+	// spends some of it on a logo or badges, so pin where it starts to bite.
+	const filler = (n) => Array.from({ length: n }, () => ['badge', '']).flat();
+	const padded = (n) => headerWindow(['# Doc', '', ...filler(n), banner, ''].join('\n').split('\n'));
+	if (!padded(5).has(13)) fail(`scripts/check-docs.mjs: the header window no longer admits a banner under five lines of preamble`);
+	if (padded(6).has(15)) fail(`scripts/check-docs.mjs: the header window no longer stops at six non-blank lines`);
 
 	stabilitySelfTest(fail);
 	packageSelfTest(fail);
