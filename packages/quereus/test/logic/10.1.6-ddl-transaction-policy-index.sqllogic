@@ -1,0 +1,143 @@
+-- 10.1.6-ddl-transaction-policy-index.sqllogic — the `ddl_transaction_policy` gate over index DDL.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 10.1.4-ddl-transaction-policy: the gate treats every
+-- module-dispatching DDL statement alike (CREATE/DROP TABLE/INDEX, ALTER TABLE,
+-- CREATE/DROP/REFRESH MATERIALIZED VIEW), and 10.1.4 still proves each behavior with
+-- table, ALTER TABLE, materialized-view and `apply schema` statements. This file is
+-- the CREATE/DROP INDEX instance of the same cases, so a backend without standalone
+-- index DDL keeps the rest of the policy coverage.
+--
+-- Runs against every backend (memory, store). Neither declares
+-- ddlTransactionality='transactional', so strict refuses on both; the permissive
+-- section must behave identically on both. Each statement is its own block so an
+-- expected failure is attributed to exactly one statement.
+
+-- ===================================
+-- 1. Permissive default: create index inside a transaction is allowed
+-- ===================================
+
+create table perm_t (id integer primary key, v text);
+-- run
+begin;
+-- run
+insert into perm_t values (1, 'a');
+-- run
+create index perm_ix on perm_t (v);
+-- run
+insert into perm_t values (2, 'b');
+-- run
+commit;
+-- run
+
+select count(*) as cnt from perm_t;
+→ [{ "cnt": 2 }]
+
+drop index perm_ix;
+-- run
+
+drop table perm_t;
+-- run
+
+-- ===================================
+-- 2. strict: create index inside begin is refused; the transaction survives
+-- ===================================
+
+pragma ddl_transaction_policy = 'strict';
+-- run
+
+create table strict_t (id integer primary key, v text);
+-- run
+insert into strict_t values (1, 'a');
+-- run
+begin;
+-- run
+insert into strict_t values (2, 'b');
+-- run
+create index strict_ix on strict_t (v);
+-- error: ddl_transaction_policy = strict
+
+-- The refusal left the transaction open and usable: insert again and commit.
+insert into strict_t values (3, 'c');
+-- run
+commit;
+-- run
+
+-- Both buffered rows landed and the index was never created.
+select count(*) as cnt from strict_t;
+→ [{ "cnt": 3 }]
+
+-- ===================================
+-- 3. strict: the same statement is allowed OUTSIDE a transaction (autocommit)
+-- ===================================
+
+create index strict_ix on strict_t (v);
+-- run
+drop index strict_ix;
+-- run
+
+-- ===================================
+-- 4. strict: drop index is refused inside begin (index still present after)
+-- ===================================
+
+create index strict_ix2 on strict_t (v);
+-- run
+begin;
+-- run
+drop index strict_ix2;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+drop index strict_ix2;
+-- run
+
+-- ===================================
+-- 5. strict: a create-index refusal inside a savepoint leaves the savepoint usable
+-- ===================================
+
+create table sp_t (id integer primary key, v text);
+-- run
+insert into sp_t values (1, 'a');
+-- run
+begin;
+-- run
+savepoint sp1;
+-- run
+insert into sp_t values (2, 'b');
+-- run
+create index sp_ix on sp_t (v);
+-- error: ddl_transaction_policy = strict
+
+-- The savepoint is still usable: roll back to it (undoing row 2), continue, commit.
+rollback to savepoint sp1;
+-- run
+insert into sp_t values (3, 'c');
+-- run
+commit;
+-- run
+
+select id from sp_t order by id;
+→ [{ "id": 1 }, { "id": 3 }]
+
+drop table sp_t;
+-- run
+
+-- ===================================
+-- 6. Reset to permissive; index DDL inside a transaction works again
+-- ===================================
+
+pragma ddl_transaction_policy = 'permissive';
+-- run
+
+begin;
+-- run
+create index perm_again_ix on strict_t (v);
+-- run
+commit;
+-- run
+
+drop index perm_again_ix;
+-- run
+drop table strict_t;
+-- run

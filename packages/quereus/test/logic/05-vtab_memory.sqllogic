@@ -1,4 +1,4 @@
--- vtab_memory.sqllogic - Testing MemoryTable specific features, especially indexing
+-- vtab_memory.sqllogic - Testing MemoryTable specific features, especially access paths
 
 PRAGMA default_vtab_module='memory';
 
@@ -46,28 +46,5 @@ SELECT name FROM mem_t WHERE id > 1 AND age = 30;
 
 DROP TABLE mem_t;
 
--- ===================================
--- Explicit unique-index collation governs enforcement (not the column's)
--- ===================================
--- A unique index declaring a COARSER collation than its column unifies
--- case-variants: enforcement runs through the index's comparator, and the
--- conflict validator re-compares candidates under the index's per-column
--- collation (checkUniqueViaIndex) — re-checking under the column's BINARY
--- collation would skip the case-variants the index legitimately unifies.
--- (The converse — a FINER index over a NOCASE column admitting both
--- variants — is pinned by test/planner/collation-soundness.spec.ts.)
-
-CREATE TABLE mem_uci (id INTEGER PRIMARY KEY, b TEXT);
-CREATE UNIQUE INDEX mem_uci_b ON mem_uci (b COLLATE NOCASE);
-INSERT INTO mem_uci VALUES (1, 'Bob');
-
--- a case-variant collides under the index's NOCASE collation
-INSERT INTO mem_uci VALUES (2, 'BOB');
--- error: UNIQUE constraint failed
-
--- a genuinely different value still inserts
-INSERT INTO mem_uci VALUES (3, 'Carol');
-SELECT id, b FROM mem_uci ORDER BY id;
-→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
-
-DROP TABLE mem_uci;
+-- Explicit unique-index collation governing enforcement lives in
+-- 05.0.1-vtab-memory-unique-index-collation (it needs standalone CREATE INDEX).

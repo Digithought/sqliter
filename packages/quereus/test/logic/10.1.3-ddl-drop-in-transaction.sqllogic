@@ -50,31 +50,9 @@ select count(*) as cnt from drop_tx_a;
 -- ===================================
 -- 2. alter table … drop constraint unique inside a transaction stops enforcing it
 -- ===================================
-
-create table drop_tx_b (id integer primary key, v text, constraint drop_tx_b_u unique (v));
--- run
-begin;
--- run
-insert into drop_tx_b values (1, 'a');
--- run
-alter table drop_tx_b drop constraint drop_tx_b_u;
--- run
-
--- The unique constraint is gone, so a colliding row is now accepted mid-transaction.
-insert into drop_tx_b values (2, 'a');
--- run
-commit;
--- run
-
-select id, v from drop_tx_b order by id;
-→ [{ "id": 1, "v": "a" }, { "id": 2, "v": "a" }]
-
--- After commit the constraint is genuinely gone: a fresh duplicate is still accepted.
-insert into drop_tx_b values (3, 'a');
--- run
-
-select count(*) as cnt from drop_tx_b;
-→ [{ "cnt": 3 }]
+-- The constraint-side twin of § 1 needs no index DDL, so it lives in
+-- 10.1.3.1-drop-constraint-in-transaction and stays runnable on backends that skip
+-- this file.
 
 -- ===================================
 -- 3. Dropping one unique index leaves a sibling unique index still enforced
@@ -198,8 +176,6 @@ select id, v from drop_sp_c order by id;
 
 -- Cleanup
 drop table drop_tx_a;
--- run
-drop table drop_tx_b;
 -- run
 drop table drop_tx_c;
 -- run

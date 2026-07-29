@@ -1,0 +1,74 @@
+-- 41.3.1-alter-rename-index-propagation.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 41.3-alter-rename-propagation: the bulk of that file (CHECK constraints,
+-- FOREIGN KEY references, views, the CTE-shadowing matrix, self-joins, aliased bodies)
+-- proves rename propagation with no index DDL. These sections propagate a rename into an
+-- INDEX definition, which needs standalone CREATE INDEX.
+--
+-- Subject: RENAME TABLE / RENAME COLUMN must rewrite a partial index's stored WHERE
+-- predicate (bare and table-qualified), and an index over an expression is still rejected.
+
+-- ===================================
+-- 2. RENAME TABLE referenced by a partial-index WHERE clause
+-- ===================================
+
+create table t_pidx (id integer primary key, v integer not null);
+create index ix_t_pidx on t_pidx(v) where v > 0;
+
+alter table t_pidx rename to t_pidx2;
+
+insert into t_pidx2 values (1, 5), (2, -1);
+
+select v from t_pidx2 where v > 0 order by v;
+→ [{"v":5}]
+
+drop table t_pidx2;
+
+-- ===================================
+-- 2b. RENAME TABLE with a table-qualified partial-index WHERE
+-- ===================================
+-- The stored predicate qualifier must follow the rename (catalog DDL would
+-- otherwise persist `... ON t_pidxq2 ... WHERE t_pidxq.v > 0`).
+
+create table t_pidxq (id integer primary key, v integer not null);
+create index ix_t_pidxq on t_pidxq(v) where t_pidxq.v > 0;
+
+alter table t_pidxq rename to t_pidxq2;
+
+insert into t_pidxq2 values (1, 5), (2, -1);
+
+select v from t_pidxq2 where v > 0 order by v;
+→ [{"v":5}]
+
+drop table t_pidxq2;
+
+-- ===================================
+-- 2c. RENAME COLUMN referenced by a partial-index WHERE
+-- ===================================
+-- The stored predicate must rewrite `v` → `w`; the index keeps maintaining
+-- (and excluding out-of-scope rows) under the new column name.
+
+create table t_pidxc (id integer primary key, v integer not null);
+create index ix_t_pidxc on t_pidxc(v) where v > 0;
+
+alter table t_pidxc rename column v to w;
+
+insert into t_pidxc values (1, 5), (2, -1);
+
+select w from t_pidxc where w > 0 order by w;
+→ [{"w":5}]
+
+drop table t_pidxc;
+
+-- ===================================
+-- 7. RENAME COLUMN referenced inside an index expression
+-- ===================================
+
+-- Quereus doesn't support indices on expressions yet; rename propagation tested elsewhere
+create table t_idxc (id integer primary key, v integer not null);
+create index ix_idxc on t_idxc(v + 1);
+-- error: not supported
+
+drop table if exists t_idxc;

@@ -12,6 +12,11 @@
 -- ddlTransactionality='transactional', so strict refuses on both; the permissive
 -- sections must behave identically on both. Each statement is its own block so an
 -- expected failure is attributed to exactly one statement.
+--
+-- The gate is verb-agnostic, and every case below is asserted with a table,
+-- ALTER TABLE, materialized-view or `apply schema` statement. The CREATE/DROP INDEX
+-- instance of the same cases lives in 10.1.6-ddl-transaction-policy-index, which
+-- needs standalone index DDL.
 
 -- ===================================
 -- 1. Permissive default: DDL inside a transaction is allowed (unchanged behavior)
@@ -23,9 +28,9 @@ begin;
 -- run
 insert into perm_t values (1, 'a');
 -- run
-create index perm_ix on perm_t (v);
+alter table perm_t add column w text null;
 -- run
-insert into perm_t values (2, 'b');
+insert into perm_t values (2, 'b', null);
 -- run
 commit;
 -- run
@@ -33,11 +38,11 @@ commit;
 select count(*) as cnt from perm_t;
 → [{ "cnt": 2 }]
 
-drop index perm_ix;
+alter table perm_t drop column w;
 -- run
 
 -- ===================================
--- 2. strict: create index inside begin is refused; the transaction survives
+-- 2. strict: alter table inside begin is refused; the transaction survives
 -- ===================================
 
 pragma ddl_transaction_policy = 'strict';
@@ -51,7 +56,7 @@ begin;
 -- run
 insert into strict_t values (2, 'b');
 -- run
-create index strict_ix on strict_t (v);
+alter table strict_t add column w text null;
 -- error: ddl_transaction_policy = strict
 
 -- The refusal left the transaction open and usable: insert again and commit.
@@ -60,7 +65,7 @@ insert into strict_t values (3, 'c');
 commit;
 -- run
 
--- Both buffered rows landed and the index was never created.
+-- Both buffered rows landed and the column was never added.
 select count(*) as cnt from strict_t;
 → [{ "cnt": 3 }]
 
@@ -68,9 +73,9 @@ select count(*) as cnt from strict_t;
 -- 3. strict: the same statement is allowed OUTSIDE a transaction (autocommit)
 -- ===================================
 
-create index strict_ix on strict_t (v);
+alter table strict_t add column w text null;
 -- run
-drop index strict_ix;
+alter table strict_t drop column w;
 -- run
 
 -- ===================================
@@ -85,18 +90,18 @@ rollback;
 -- run
 
 -- ===================================
--- 5. strict: drop index is refused inside begin (index still present after)
+-- 5. strict: drop table is refused inside begin (table still present after)
 -- ===================================
 
-create index strict_ix2 on strict_t (v);
+create table strict_t2 (id integer primary key);
 -- run
 begin;
 -- run
-drop index strict_ix2;
+drop table strict_t2;
 -- error: ddl_transaction_policy = strict
 rollback;
 -- run
-drop index strict_ix2;
+drop table strict_t2;
 -- run
 
 -- ===================================
@@ -128,7 +133,7 @@ savepoint sp1;
 -- run
 insert into sp_t values (2, 'b');
 -- run
-create index sp_ix on sp_t (v);
+create table sp_t2 (id integer primary key);
 -- error: ddl_transaction_policy = strict
 
 -- The savepoint is still usable: roll back to it (undoing row 2), continue, commit.

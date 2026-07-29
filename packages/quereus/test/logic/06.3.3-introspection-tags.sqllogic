@@ -19,13 +19,9 @@ CREATE VIEW ActiveOrders AS SELECT * FROM Orders WHERE id > 0
 
 CREATE VIEW PlainView AS SELECT * FROM PlainTable;
 
-CREATE INDEX idx_orders_name ON Orders (name)
-    WITH TAGS (purpose = 'name lookup');
-
-CREATE INDEX idx_orders_plain ON Orders (id);
-
 -- ===================================================================
--- schema() — tags on tables / views / indexes; null for untagged & functions
+-- schema() — tags on tables / views; null for untagged & functions
+-- (index tags live in 06.3.3.1-introspection-tags-index — they need index DDL)
 -- ===================================================================
 
 SELECT name, json_extract(tags, '$.display_name') AS display_name
@@ -41,13 +37,6 @@ SELECT json_extract(tags, '$.cacheable') AS cacheable,
 → [{"cacheable":true,"purpose":"active orders filter"}]
 
 SELECT tags FROM schema() WHERE type = 'view' AND name = 'PlainView';
-→ [{"tags":null}]
-
-SELECT name, json_extract(tags, '$.purpose') AS purpose
-    FROM schema() WHERE type = 'index' AND name = 'idx_orders_name';
-→ [{"name":"idx_orders_name","purpose":"name lookup"}]
-
-SELECT tags FROM schema() WHERE type = 'index' AND name = 'idx_orders_plain';
 → [{"tags":null}]
 
 -- Functions never carry tags
@@ -118,25 +107,10 @@ SELECT tags FROM foreign_key_info('CompositeChild')
 → []
 
 -- ===================================================================
--- index_info() — column-by-column index layout, partial/unique/tags
+-- index_info() — empty on a table with no indexes
+-- (the populated column-by-column layout lives in
+--  06.3.3.1-introspection-tags-index — it needs index DDL)
 -- ===================================================================
-
-CREATE TABLE IdxTable (
-    id INTEGER PRIMARY KEY,
-    a TEXT,
-    b INTEGER,
-    status TEXT
-);
-
-CREATE INDEX idx_a_asc ON IdxTable (a) WITH TAGS (purpose = 'lookup');
-CREATE INDEX idx_b_desc ON IdxTable (b DESC);
-CREATE UNIQUE INDEX idx_a_unique ON IdxTable (a);
-CREATE INDEX idx_a_partial ON IdxTable (a) WHERE status = 'active';
-
-SELECT index_name, seq, column_name, "desc", "unique", partial,
-       json_extract(tags, '$.purpose') AS purpose
-    FROM index_info('IdxTable') ORDER BY index_name, seq;
-→ [{"index_name":"idx_a_asc","seq":0,"column_name":"a","desc":0,"unique":0,"partial":0,"purpose":"lookup"},{"index_name":"idx_a_partial","seq":0,"column_name":"a","desc":0,"unique":0,"partial":1,"purpose":null},{"index_name":"idx_a_unique","seq":0,"column_name":"a","desc":0,"unique":1,"partial":0,"purpose":null},{"index_name":"idx_b_desc","seq":0,"column_name":"b","desc":1,"unique":0,"partial":0,"purpose":null}]
 
 -- Empty result on a table with no indexes
 SELECT count(*) AS cnt FROM index_info('PlainTable') WHERE index_name LIKE 'idx_%';
@@ -180,16 +154,8 @@ SELECT id, name, seq, column_name, partial,
     FROM unique_constraint_info('UqTable') ORDER BY id, seq;
 → [{"id":0,"name":"uq_email","seq":0,"column_name":"email","partial":0,"msg":"email must be unique"},{"id":1,"name":null,"seq":0,"column_name":"region","partial":0,"msg":null},{"id":1,"name":null,"seq":1,"column_name":"code","partial":0,"msg":null}]
 
--- Partial unique index synthesizes a partial unique constraint
-CREATE TABLE PuTable (
-    id INTEGER PRIMARY KEY,
-    code TEXT NOT NULL,
-    status TEXT NOT NULL
-);
-CREATE UNIQUE INDEX uq_pu_active ON PuTable (code) WHERE status = 'active';
-
-SELECT name, partial FROM unique_constraint_info('PuTable');
-→ [{"name":"uq_pu_active","partial":1}]
+-- A partial unique INDEX synthesizing a partial unique constraint lives in
+-- 06.3.3.1-introspection-tags-index (it needs standalone CREATE UNIQUE INDEX).
 
 -- ===================================================================
 -- assertion_info() — CREATE ASSERTION listing
@@ -220,10 +186,8 @@ SELECT count(*) AS cnt FROM assertion_info() WHERE json_valid(dependent_tables) 
 DROP ASSERTION val_bounded;
 DROP ASSERTION val_positive;
 DROP TABLE AssertData;
-DROP TABLE PuTable;
 DROP TABLE UqTable;
 DROP TABLE ChkTable;
-DROP TABLE IdxTable;
 DROP TABLE CompositeChild;
 DROP TABLE CompositeParent;
 DROP TABLE FkChild;

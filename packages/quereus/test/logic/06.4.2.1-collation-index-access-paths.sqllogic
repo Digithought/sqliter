@@ -1,0 +1,140 @@
+-- 06.4.2.1-collation-index-access-paths.sqllogic — collation through standalone index DDL.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 06.4.2-collation-extras: the bulk of that file (ORDER BY, JOIN,
+-- DISTINCT, set operations, MIN/MAX, CASE, BETWEEN, and the PRIMARY-KEY range /
+-- BETWEEN seeks) proves collation propagation with no index DDL at all. The three
+-- sections below need an explicit `create index`, either to give a key a collation
+-- that differs from its column's or to place a SECONDARY index in the access path,
+-- so they move here and leave the rest portable.
+--
+-- Subject: (1) `create index … (col collate X)` resolves to a per-column index
+-- collation (and a genuine expression index is still rejected), (2) an equality or
+-- range whose predicate collation does not match the index collation must decline the
+-- seek and fall back to scan + residual rather than return the index's rows, and
+-- (3) a matching-collation SECONDARY index seek returns the collation-correct rows.
+
+-- =============================================================================
+-- INDEX with an explicit per-column COLLATE
+-- =============================================================================
+-- The parser folds `name COLLATE NOCASE` into a collate expression over the column;
+-- the live CREATE INDEX path resolves it to a per-column collation (it is NOT a
+-- genuine expression index). A non-column operand like lower(name) is still rejected.
+
+create table coll_idx (id integer primary key, name text);
+insert into coll_idx values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+
+create index idx_name_nc on coll_idx (name collate NOCASE);
+
+-- index_info reports the resolved per-column collation.
+select column_name, collation from index_info('coll_idx');
+→ [{"column_name":"name","collation":"NOCASE"}]
+
+-- A genuine expression index (non-column operand) is still rejected.
+create index idx_name_lower on coll_idx (lower(name));
+-- error: Indices on expressions are not supported
+
+-- Equality search whose predicate carries its own COLLATE NOCASE matches
+-- case-insensitively (consistent with the NOCASE index, so correct either way).
+select id from coll_idx where name = 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- A plain BINARY equality (`where name = 'BOB'`) over the coarser NOCASE index
+-- must re-apply the BINARY predicate as a residual filter above the seek, so the
+-- collation-equal-but-BINARY-distinct 'Bob' (id 4) is discarded. (Previously a
+-- latent planner bug returned id 2 AND 4, fixed by access-path collation cover.)
+select id from coll_idx where name = 'BOB' order by id;
+→ [{"id":2}]
+
+-- A BINARY range over the NOCASE index must not walk the reordered index window;
+-- the access path declines the seek and falls back to a scan + residual so the
+-- BINARY-correct rows are returned ('charlie' id 3 and 'Bob' id 4 are both
+-- BINARY-greater than 'BOB', while a NOCASE index seek would have missed 'Bob').
+select id from coll_idx where name > 'BOB' order by id;
+→ [{"id":3},{"id":4}]
+
+drop table coll_idx;
+
+-- =============================================================================
+-- Symmetric case: BINARY index, NOCASE-collated predicate (finer index)
+-- =============================================================================
+-- A BINARY index cannot satisfy a NOCASE equality (it UNDER-fetches: a residual
+-- cannot recover the rows the seek never visited), so the access path declines the
+-- index and scans + residual — all case variants are returned.
+
+create table coll_idx_bin (id integer primary key, name text);
+insert into coll_idx_bin values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+create index idx_name_bin on coll_idx_bin (name);
+
+select id from coll_idx_bin where name = 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- Plain BINARY equality over the matching BINARY index is unaffected (no residual).
+select id from coll_idx_bin where name = 'Bob' order by id;
+→ [{"id":4}]
+
+drop table coll_idx_bin;
+
+-- =============================================================================
+-- COLLATE on a BETWEEN bound over an index (access-path cover classification)
+-- =============================================================================
+-- The access path resolves each bound's effective collation per-constraint
+-- (lower → `>=`, upper → `<=`) and either keeps the seek (collations match) or
+-- declines to a scan + residual (mismatch). All forms must agree with the scan.
+
+create table btw_nc (id integer primary key, name text);
+insert into btw_nc values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+create index idx_btw_nc on btw_nc (name collate NOCASE);
+
+-- Both bounds NOCASE over a NOCASE index: collations match on both bounds, so the
+-- seek is usable and returns the NOCASE-'bob'-equal rows directly.
+select id from btw_nc where name between 'bob' collate NOCASE and 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- Mixed bounds over the NOCASE index (lower NOCASE matches, upper BINARY does not):
+-- the access path declines the seek and scans + residual, matching the scan form.
+select id from btw_nc where name between 'bob' collate NOCASE and 'bob' order by id;
+→ [{"id":2},{"id":4}]
+
+drop table btw_nc;
+
+-- BINARY index, both bounds NOCASE: the NOCASE bound collations do not match the
+-- BINARY index, so the seek is declined (it would under-fetch in BINARY order) and
+-- the scan + residual returns the NOCASE-correct rows. Previously the bound collation
+-- was ignored and the seek silently returned the wrong rows.
+create table btw_bin (id integer primary key, name text);
+insert into btw_bin values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+create index idx_btw_bin on btw_bin (name);
+
+select id from btw_bin where name between 'bob' collate NOCASE and 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+drop table btw_bin;
+-- =============================================================================
+-- Collation-matched non-BINARY range over a matching-collation SECONDARY index
+-- =============================================================================
+-- Same subject as 06.4.2's primary-key range/BETWEEN section (the module's own bound
+-- filter produces these rows, no residual Filter), one level down on a secondary index.
+
+-- NOCASE secondary index over case-variant rows (non-unique index): the >= bound
+-- includes both 'Banana' and 'BANANA'.
+create table rng_sec_nc (id integer primary key, name text collate NOCASE);
+insert into rng_sec_nc values (1, 'apple'), (2, 'Banana'), (3, 'CHERRY'), (4, 'date'), (5, 'BANANA');
+create index idx_rng_sec_nc on rng_sec_nc (name);
+
+select id from rng_sec_nc where name >= 'banana' order by id;
+→ [{"id":2},{"id":3},{"id":4},{"id":5}]
+
+drop table rng_sec_nc;
+
+-- RTRIM range: trailing spaces ignored on both the bound and the stored values.
+create table rng_rtrim (id integer primary key, val text collate RTRIM);
+insert into rng_rtrim values (1, 'cat'), (2, 'cat  '), (3, 'dog'), (4, 'doe '), (5, 'ant');
+create index idx_rng_rtrim on rng_rtrim (val);
+
+select id from rng_rtrim where val > 'cat' order by id;
+→ [{"id":3},{"id":4}]
+
+drop table rng_rtrim;
+

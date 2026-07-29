@@ -55,6 +55,7 @@ const BACKEND_CAPABILITIES = USE_STORE_MODULE ? STORE_BACKEND_CAPABILITIES : MEM
 // white-box internals, and tracked store bugs. None of the entries below is capability-shaped.
 const MEMORY_ONLY_FILES = new Set([
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
+  '05.0.1-vtab-memory-unique-index-collation.sqllogic',  // Split out of 05-vtab_memory (needs standalone index DDL); memory-only for the same reason as its parent
   // '10.1.3.1-ddl-drop-savepoint-memory.sqllogic' was folded into 10.1.3-ddl-drop-in-transaction.sqllogic § 4. It was memory-only because the STORE leg diverged: store mode runs behind the isolation layer, which used to rebuild its staging overlay on index DDL and so lost rows staged before the savepoint. With that adopt now in place (bug-isolation-index-ddl-rebuild-drops-savepoint-writes) the store leg matches plain memory on the whole sequence — pre-savepoint rows kept, and the DROP not undone by `rollback to savepoint`
   '10.2.2-default-collation-memory.sqllogic',  // Asserts the memory-side BINARY default for an undecorated text PK; the store applies NOCASE (see docs/schema.md §"Per-column PK key collation")
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
@@ -69,6 +70,7 @@ const MEMORY_ONLY_FILES = new Set([
   // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
   '103-database-options-edge-cases.sqllogic',  // Asserts default_vtab_module='memory'; store-mode harness sets it to 'store'
   '105-vtab-memory-mutation-kills.sqllogic',  // White-box mutation tests targeting src/vtab/memory/ internals
+  '105.1-vtab-memory-index-mutation-kills.sqllogic',  // Split out of 105 (needs standalone index DDL); white-box for the same reason as its parent
 ]);
 
 // Determine project root - if we're in dist/test, go up two levels, otherwise just one

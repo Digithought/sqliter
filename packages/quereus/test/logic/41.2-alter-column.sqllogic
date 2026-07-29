@@ -96,12 +96,12 @@ drop table t_pk;
 
 -- ===================================
 -- 7. SET DATA TYPE text -> integer converts existing rows in place
--- (values must be physically rewritten, not left as text, and an
--- index on the column must find rows by the new numeric value)
+-- (values must be physically rewritten, not left as text, and a lookup on the
+-- column must find rows by the new numeric value; the secondary-index variant is
+-- 41.2.2-alter-column-retype-index-rebuild)
 -- ===================================
 
 create table t_conv (id integer primary key, v text);
-create index t_conv_v on t_conv (v);
 insert into t_conv values (1, '10'), (2, '9');
 alter table t_conv alter column v set data type integer;
 
@@ -295,7 +295,6 @@ drop table t_tx;
 -- ===================================
 
 create table t_idx (id integer primary key, v text unique);
-create index t_idx_v2 on t_idx (v);
 insert into t_idx values (1, '2024-06-05T00:00:00Z'), (2, '2024-01-02');
 alter table t_idx alter column v set data type date;
 
@@ -317,27 +316,8 @@ select id, v from t_idx where v = '2024-07-04';
 
 drop table t_idx;
 
--- 16b. …the same inside the DDL transaction: the transaction's own pending
--- row is converted AND re-indexed, before and after commit.
-create table t_idxtx (id integer primary key, v text);
-create index t_idxtx_v on t_idxtx (v);
-insert into t_idxtx values (1, '2024-01-02');
-begin;
-insert into t_idxtx values (2, '2024-06-05T00:00:00Z');
-alter table t_idxtx alter column v set data type date;
-
-select id from t_idxtx where v = '2024-06-05';
-→ [{"id": 2}]
-
-commit;
-
-select id from t_idxtx where v = '2024-06-05';
-→ [{"id": 2}]
-
-select id, v from t_idxtx order by v;
-→ [{"id": 1, "v": "2024-01-02"}, {"id": 2, "v": "2024-06-05"}]
-
-drop table t_idxtx;
+-- 16b. …the same inside the DDL transaction, where the structure keyed by the column
+-- is a SECONDARY INDEX, lives in 41.2.2-alter-column-retype-index-rebuild § 3.
 
 -- 16c. …and the pending-row collision the normalization creates is judged over the
 -- transaction's EFFECTIVE rows: the ALTER rejects and the transaction stays usable.

@@ -118,7 +118,7 @@ select id from wn where val = 10 or val = null order by id;
 → [{"id":1}]
 
 -- =============================================================================
--- NULL comparisons against key/indexed columns must not become seek bounds
+-- NULL comparisons against key columns must not become seek bounds
 -- (key ordering sorts NULL below everything, so a pushed `> NULL` lower bound
 -- would wrongly match every row)
 -- =============================================================================
@@ -141,23 +141,11 @@ select id from wn where id between 1 and null order by id;
 select id from wn where (+ null) < id order by id;
 → []
 
-create index wn_val on wn (val);
-
-select id from wn where val > null order by id;
-→ []
-
-select id from wn where null < val order by id;
-→ []
-
-select id from wn where val between null and 30 order by id;
-→ []
-
--- Sanity: non-NULL bounds on the same columns still seek correctly
+-- Sanity: non-NULL bounds on the same column still seek correctly
 select id from wn where id > 3 order by id;
 → [{"id":4}]
 
-select id from wn where val between 10 and 30 order by id;
-→ [{"id":1},{"id":3}]
+-- The same assertions against a SECONDARY-INDEXED column live in
+-- 21.1.1-where-null-comparisons-secondary-index (they need standalone CREATE INDEX).
 
-drop index wn_val;
 drop table wn;

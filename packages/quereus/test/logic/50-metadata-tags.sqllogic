@@ -94,22 +94,7 @@ SELECT json_extract(tags, '$.cacheable') AS cacheable,
 -- ===================================================================
 -- Phase 5: Index-level tags
 -- ===================================================================
-
-CREATE INDEX idx_product_name ON Products (name)
-    WITH TAGS (purpose = 'search optimization');
-
--- Verify index works
-SELECT name FROM Products WHERE name = 'Widget';
-→ [{"name":"Widget"}]
-
--- Round-trip: index tags via schema() and index_info()
-SELECT json_extract(tags, '$.purpose') AS purpose
-    FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
-→ [{"purpose":"search optimization"}]
-
-SELECT index_name, column_name, json_extract(tags, '$.purpose') AS purpose
-    FROM index_info('Products') WHERE index_name = 'idx_product_name';
-→ [{"index_name":"idx_product_name","column_name":"name","purpose":"search optimization"}]
+-- Lives in 50.0.1-metadata-tags-index (it needs standalone CREATE INDEX).
 
 -- ===================================================================
 -- Phase 6: Tag value types
@@ -334,26 +319,7 @@ SELECT tags FROM schema() WHERE type = 'view' AND name = 'ActiveOrders';
 -- ===================================================================
 -- Phase 18: ALTER INDEX ... SET TAGS (whole-set replace + clear)
 -- ===================================================================
-
--- idx_product_name (Phase 5) was created with a purpose tag.
-SELECT json_extract(tags, '$.purpose') AS purpose
-    FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
-→ [{"purpose":"search optimization"}]
-
--- Whole-set replace.
-ALTER INDEX idx_product_name SET TAGS (owner = 'search-team', purpose = 'fulltext');
-SELECT index_name, json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.purpose') AS purpose
-    FROM index_info('Products') WHERE index_name = 'idx_product_name';
-→ [{"index_name":"idx_product_name","owner":"search-team","purpose":"fulltext"}]
-
--- The index still answers lookups after the tag mutation.
-SELECT name FROM Products WHERE name = 'Widget';
-→ [{"name":"Widget"}]
-
--- Clear all tags → tags IS NULL.
-ALTER INDEX idx_product_name SET TAGS ();
-SELECT tags FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
-→ [{"tags":null}]
+-- Lives in 50.0.1-metadata-tags-index (it needs standalone CREATE INDEX).
 
 -- ===================================================================
 -- Phase 19: ALTER MATERIALIZED VIEW ... SET TAGS (no re-materialization)
@@ -399,9 +365,7 @@ ALTER MATERIALIZED VIEW NoSuchMv SET TAGS (a = 1);
 ALTER VIEW ActiveOrders SET TAGS ("quereus.update.taget" = 1);
 -- error: reserved tag
 
--- physical-index site rejects an unknown reserved key.
-ALTER INDEX idx_product_name SET TAGS ("quereus.bogus" = 1);
--- error: reserved tag
+-- The physical-index site of the same rejection is in 50.0.1-metadata-tags-index.
 
 -- ===================================================================
 -- Phase 22: hidden implicit covering index is not addressable (NOTFOUND)
@@ -414,7 +378,7 @@ ALTER INDEX uq_email SET TAGS (a = 1);
 -- error: not found
 
 -- ===================================================================
--- Phase 23: reserved-tag validation on the direct CREATE TABLE / CREATE INDEX paths
+-- Phase 23: reserved-tag validation on the direct CREATE TABLE path
 -- ===================================================================
 
 -- The direct CREATE path now validates reserved `quereus.*` tags at plan-build,
@@ -442,9 +406,7 @@ CREATE TABLE RsvBadCon (
 CREATE TABLE RsvMissite (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.lens.access.id" = 'eq');
 -- error: not allowed
 
--- CREATE INDEX unknown reserved key rejected (physical-index site).
-CREATE INDEX ix_rsv_bad ON Products (price) WITH TAGS ("quereus.bogus" = 1);
--- error: reserved tag
+-- The CREATE INDEX form of this rejection is in 50.0.1-metadata-tags-index.
 
 -- Multiple offending tags in one statement: diagnostics accumulate table → column,
 -- and the first error (the table-level one) is raised — deterministic ordering.
@@ -549,15 +511,7 @@ SELECT name, json_extract(tags, '$."quereus.id"') AS qid
     FROM table_info('RsvInlineUnnamed') WHERE name = 'x';
 → [{"name":"x","qid":"col-x-tag"}]
 
--- Valid quereus.id accepted on an index and round-trips through schema() / index_info().
-CREATE INDEX ix_rsv_ok ON RsvOkCol (x) WITH TAGS ("quereus.id" = 'idx-thing');
-SELECT json_extract(tags, '$."quereus.id"') AS qid
-    FROM schema() WHERE type = 'index' AND name = 'ix_rsv_ok';
-→ [{"qid":"idx-thing"}]
-
-SELECT index_name, json_extract(tags, '$."quereus.id"') AS qid
-    FROM index_info('RsvOkCol') WHERE index_name = 'ix_rsv_ok';
-→ [{"index_name":"ix_rsv_ok","qid":"idx-thing"}]
+-- The same quereus.id round-trip on an INDEX is in 50.0.1-metadata-tags-index.
 
 -- Free-form (non-quereus.*) tags are unaffected and still create cleanly
 -- (guard against over-rejection — validateReservedTags skips non-reserved keys).
@@ -944,35 +898,7 @@ SELECT * FROM VTagged ORDER BY id;
 -- ===================================================================
 -- Phase 33: ALTER INDEX ... ADD / DROP TAGS (per-key merge + delete)
 -- ===================================================================
-
-CREATE TABLE ITbl (id INTEGER PRIMARY KEY, name TEXT);
-INSERT INTO ITbl VALUES (1, 'Widget'), (2, 'Gadget');
-CREATE INDEX ix_itbl_name ON ITbl (name) WITH TAGS (purpose = 'search');
-
--- ADD merges onto the index's live tags.
-ALTER INDEX ix_itbl_name ADD TAGS (owner = 'team', purpose = 'fulltext');
-SELECT json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.purpose') AS purpose
-    FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
-→ [{"owner":"team","purpose":"fulltext"}]
-
--- The index still answers lookups after the merge.
-SELECT name FROM ITbl WHERE name = 'Widget';
-→ [{"name":"Widget"}]
-
--- DROP one key, keep the rest.
-ALTER INDEX ix_itbl_name DROP TAGS (owner);
-SELECT json_type(tags, '$.owner') AS owner_type, json_extract(tags, '$.purpose') AS purpose
-    FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
-→ [{"owner_type":null,"purpose":"fulltext"}]
-
--- DROP of an absent key → NOTFOUND (atomic).
-ALTER INDEX ix_itbl_name DROP TAGS (nope);
--- error: not found
-
--- Drop the last key → tags IS NULL.
-ALTER INDEX ix_itbl_name DROP TAGS (purpose);
-SELECT tags FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
-→ [{"tags":null}]
+-- Lives in 50.0.1-metadata-tags-index (it needs standalone CREATE INDEX).
 
 -- ===================================================================
 -- Phase 34: ALTER MATERIALIZED VIEW ... ADD / DROP TAGS (no re-materialization)
@@ -1027,16 +953,14 @@ SELECT tags FROM schema() WHERE type = 'view' AND name = 'EView';
 → [{"tags":null}]
 
 -- ===================================================================
--- Phase 36: ADD validates reserved keys; DROP does not (view + index)
+-- Phase 36: ADD validates reserved keys; DROP does not (view)
 -- ===================================================================
 
 -- ADD rejects an unknown reserved key at the view-ddl site (same as SET TAGS).
 ALTER VIEW VTagged ADD TAGS ("quereus.bogus" = 1);
 -- error: reserved tag
 
--- ADD rejects an unknown reserved key at the physical-index site.
-ALTER INDEX ix_itbl_name ADD TAGS ("quereus.bogus" = 1);
--- error: reserved tag
+-- The physical-index site of the same ADD rejection is in 50.0.1-metadata-tags-index.
 
 -- A valid reserved key at the right site is stored by ADD (quereus.id is legal at
 -- view-ddl), then DROP removes it without value validation — dropping a reserved
@@ -1048,13 +972,7 @@ ALTER VIEW VTagged DROP TAGS ("quereus.id");
 SELECT tags FROM schema() WHERE type = 'view' AND name = 'VTagged';
 → [{"tags":null}]
 
--- Same for an index: quereus.id is legal at physical-index; DROP removes it.
-ALTER INDEX ix_itbl_name ADD TAGS ("quereus.id" = 'idx-thing');
-SELECT json_extract(tags, '$."quereus.id"') AS qid FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
-→ [{"qid":"idx-thing"}]
-ALTER INDEX ix_itbl_name DROP TAGS ("quereus.id");
-SELECT tags FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
-→ [{"tags":null}]
+-- The index equivalent (quereus.id added then dropped) is in 50.0.1-metadata-tags-index.
 
 -- ===================================================================
 -- Phase 37: hidden implicit covering index is not addressable for ADD / DROP

@@ -1,0 +1,41 @@
+-- 15.1.2-semantic-ordering-index.sqllogic — semantic ordering through standalone index DDL.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 15.1-semantic-ordering: that file proves the semantic-ordering rule
+-- (docs/types.md "Semantic ordering") across ORDER BY, comparisons, BETWEEN, PK
+-- order and range scans, DISTINCT/GROUP BY/set-operation identity, windows and
+-- joins — none of which needs index DDL. Two scenarios reached the same rule via a
+-- standalone index (one a secondary-index access path, one a `create unique index`
+-- restatement of a UNIQUE identity check the file already makes via a table-level
+-- constraint), so they move here.
+--
+-- Subject: the typed compare governs a secondary index's seek/range/ordering, and
+-- an index-derived UNIQUE enforces the same identity at write time.
+
+-- Secondary index: seek, range and ordering all run under the tree's typed order.
+create table si (id integer primary key, d timespan);
+create index si_d on si(d);
+insert into si values (1, 'PT2H'), (2, 'PT90M'), (3, 'PT30M');
+
+select id from si order by d;
+→ [{"id":3},{"id":2},{"id":1}]
+
+select id from si where d > 'PT90M';
+→ [{"id":1}]
+
+select id from si where d = 'PT120M';
+→ [{"id":1}]
+
+drop table si;
+
+-- `create unique index` enforces the same identity at WRITE time (the build-time
+-- dedup over pre-existing rows already did).
+create table ui (id integer primary key, d timespan);
+create unique index ui_d on ui (d);
+insert into ui values (1, 'PT1H');
+
+insert into ui values (2, 'PT60M');
+-- error: UNIQUE constraint failed
+
+drop table ui;

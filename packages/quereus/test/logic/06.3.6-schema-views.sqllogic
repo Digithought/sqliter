@@ -1,0 +1,29 @@
+-- 06.3.6-schema-views.sqllogic - Testing schema() introspection for views
+--
+-- Carved out of 06.3-schema, which is annotated `requires-capability: standalone-index-ddl`
+-- because its subject is schema() over INDEXES. These three view assertions sit at the end
+-- of that file and need no index at all, so a backend skipping 06.3 would have lost them
+-- for no reason.
+--
+-- Subject: a view appears in schema() with its own name as tbl_name, its `sql` text is
+-- preserved verbatim, and `view` shows up in the distinct object-type list.
+
+CREATE TABLE products (
+	id INTEGER PRIMARY KEY,
+	name TEXT,
+	category TEXT
+);
+
+CREATE VIEW active_products AS SELECT id, name FROM products WHERE category = 'active';
+
+SELECT type, name, tbl_name FROM schema() WHERE type = 'view';
+→ [{"type":"view","name":"active_products","tbl_name":"active_products"}]
+
+-- Verify view sql is preserved
+SELECT sql FROM schema() WHERE name = 'active_products';
+→ [{"sql":"create view active_products as select id, name from products where category = 'active'"}]
+
+-- Verify 'view' is in the list of schema object types
+-- (the 'index' member of the same list is asserted in 06.3-schema)
+SELECT DISTINCT type FROM schema() ORDER BY type;
+→ [{"type":"function"},{"type":"table"},{"type":"view"}]

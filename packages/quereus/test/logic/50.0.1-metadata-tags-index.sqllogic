@@ -1,0 +1,141 @@
+-- 50.0.1-metadata-tags-index.sqllogic - Tag round-trips on INDEX objects.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 50-metadata-tags: the `with tags` system applies to every schema-object
+-- kind, and 50-metadata-tags exercises the whole system (SET / ADD / DROP TAGS, reserved
+-- key validation and mis-siting, NOTFOUND, implicit covering structures) on tables,
+-- columns, constraints, views and materialized views without index DDL. The phases whose
+-- object is a user-created index need `create index`, so they live here.
+--
+-- Phase numbers keep their original 50-metadata-tags labels so cross-references resolve.
+--
+-- Subject: tags declared on CREATE INDEX round-trip through schema() and index_info();
+-- ALTER INDEX SET / ADD / DROP TAGS replace, merge and delete them; and reserved
+-- `quereus.*` keys are validated at the physical-index site on every one of those paths.
+
+CREATE TABLE Products (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    price REAL NOT NULL
+);
+INSERT INTO Products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99);
+
+-- ===================================================================
+-- Phase 5: Index-level tags
+-- ===================================================================
+
+CREATE INDEX idx_product_name ON Products (name)
+    WITH TAGS (purpose = 'search optimization');
+
+-- Verify index works
+SELECT name FROM Products WHERE name = 'Widget';
+→ [{"name":"Widget"}]
+
+-- Round-trip: index tags via schema() and index_info()
+SELECT json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"purpose":"search optimization"}]
+
+SELECT index_name, column_name, json_extract(tags, '$.purpose') AS purpose
+    FROM index_info('Products') WHERE index_name = 'idx_product_name';
+→ [{"index_name":"idx_product_name","column_name":"name","purpose":"search optimization"}]
+
+-- ===================================================================
+-- Phase 18: ALTER INDEX ... SET TAGS (whole-set replace + clear)
+-- ===================================================================
+
+-- idx_product_name (Phase 5) was created with a purpose tag.
+SELECT json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"purpose":"search optimization"}]
+
+-- Whole-set replace.
+ALTER INDEX idx_product_name SET TAGS (owner = 'search-team', purpose = 'fulltext');
+SELECT index_name, json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.purpose') AS purpose
+    FROM index_info('Products') WHERE index_name = 'idx_product_name';
+→ [{"index_name":"idx_product_name","owner":"search-team","purpose":"fulltext"}]
+
+-- The index still answers lookups after the tag mutation.
+SELECT name FROM Products WHERE name = 'Widget';
+→ [{"name":"Widget"}]
+
+-- Clear all tags → tags IS NULL.
+ALTER INDEX idx_product_name SET TAGS ();
+SELECT tags FROM schema() WHERE type = 'index' AND name = 'idx_product_name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 21: reserved-tag typo rejection on the index ALTER path
+-- ===================================================================
+
+-- physical-index site rejects an unknown reserved key.
+ALTER INDEX idx_product_name SET TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- ===================================================================
+-- Phase 23: reserved-tag validation on the direct CREATE INDEX path
+-- ===================================================================
+
+-- CREATE INDEX unknown reserved key rejected (physical-index site).
+CREATE INDEX ix_rsv_bad ON Products (price) WITH TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Valid quereus.id accepted on an index and round-trips through schema() / index_info().
+CREATE INDEX ix_rsv_ok ON Products (price) WITH TAGS ("quereus.id" = 'idx-thing');
+SELECT json_extract(tags, '$."quereus.id"') AS qid
+    FROM schema() WHERE type = 'index' AND name = 'ix_rsv_ok';
+→ [{"qid":"idx-thing"}]
+
+SELECT index_name, json_extract(tags, '$."quereus.id"') AS qid
+    FROM index_info('Products') WHERE index_name = 'ix_rsv_ok';
+→ [{"index_name":"ix_rsv_ok","qid":"idx-thing"}]
+
+-- ===================================================================
+-- Phase 33: ALTER INDEX ... ADD / DROP TAGS (per-key merge + delete)
+-- ===================================================================
+
+CREATE TABLE ITbl (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO ITbl VALUES (1, 'Widget'), (2, 'Gadget');
+CREATE INDEX ix_itbl_name ON ITbl (name) WITH TAGS (purpose = 'search');
+
+-- ADD merges onto the index's live tags.
+ALTER INDEX ix_itbl_name ADD TAGS (owner = 'team', purpose = 'fulltext');
+SELECT json_extract(tags, '$.owner') AS owner, json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"owner":"team","purpose":"fulltext"}]
+
+-- The index still answers lookups after the merge.
+SELECT name FROM ITbl WHERE name = 'Widget';
+→ [{"name":"Widget"}]
+
+-- DROP one key, keep the rest.
+ALTER INDEX ix_itbl_name DROP TAGS (owner);
+SELECT json_type(tags, '$.owner') AS owner_type, json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"owner_type":null,"purpose":"fulltext"}]
+
+-- DROP of an absent key → NOTFOUND (atomic).
+ALTER INDEX ix_itbl_name DROP TAGS (nope);
+-- error: not found
+
+-- Drop the last key → tags IS NULL.
+ALTER INDEX ix_itbl_name DROP TAGS (purpose);
+SELECT tags FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- Phase 36: ADD validates reserved keys at the physical-index site; DROP does not
+-- ===================================================================
+
+-- ADD rejects an unknown reserved key at the physical-index site.
+ALTER INDEX ix_itbl_name ADD TAGS ("quereus.bogus" = 1);
+-- error: reserved tag
+
+-- Same for an index: quereus.id is legal at physical-index; DROP removes it.
+ALTER INDEX ix_itbl_name ADD TAGS ("quereus.id" = 'idx-thing');
+SELECT json_extract(tags, '$."quereus.id"') AS qid FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"qid":"idx-thing"}]
+ALTER INDEX ix_itbl_name DROP TAGS ("quereus.id");
+SELECT tags FROM schema() WHERE type = 'index' AND name = 'ix_itbl_name';
+→ [{"tags":null}]

@@ -22,36 +22,10 @@
 -- file runs on both legs.
 
 -- ===================================
--- 1. Colliding rows under an explicit `create unique index` → the ALTER is REJECTED, and
---    the rejection changes nothing: values, declared type and writability all survive.
+-- 1. Colliding rows under an explicit `create unique index` -> the ALTER is REJECTED.
 -- ===================================
-
-create table sem1 (id integer primary key, v text);
-create unique index sem1_v on sem1 (v);
-insert into sem1 values (1, 'PT1H'), (2, 'PT60M');
--- run
-
-alter table sem1 alter column v set data type timespan;
--- error: UNIQUE constraint failed
-
--- the declared type is unchanged — a rejected ALTER must not leave a new type over
--- structures still keyed the old way
-select name, type from table_info('sem1') where name = 'v';
-→ [{"name":"v","type":"TEXT"}]
-
-select id, v from sem1 order by id;
-→ [{"id":1,"v":"PT1H"},{"id":2,"v":"PT60M"}]
-
--- still writable, and the index still enforces TEXTUAL uniqueness under the unchanged type,
--- so a third spelling of the same duration is accepted
-insert into sem1 values (3, 'PT3600S');
-select count(*) as n from sem1;
-→ [{"n":3}]
-
-insert into sem1 values (4, 'PT1H');
--- error: UNIQUE constraint failed
-
-drop table sem1;
+-- Lives in 41.7.4.1-alter-column-retype-semantic-index-memory (it needs standalone index
+-- DDL); section 2 below is the same collision through an inline `v text unique`.
 
 -- ===================================
 -- 2. Same collision through an inline `v text unique` (the auto-built covering index
@@ -78,8 +52,7 @@ drop table sem2;
 --    index — this is the case the old code got wrong WITHOUT any uniqueness violation.
 -- ===================================
 
-create table sem3 (id integer primary key, v text);
-create unique index sem3_v on sem3 (v);
+create table sem3 (id integer primary key, v text, unique (v));
 insert into sem3 values (1, 'PT1H'), (2, 'PT2H');
 -- run
 
@@ -113,25 +86,13 @@ select id from sem3 where v = 'PT1800S';
 drop table sem3;
 
 -- ===================================
--- 4. Non-unique index: no uniqueness to violate, but the index still has to be re-sorted or
---    the lookup misses rows. The answer must match the same table with NO index, and the
---    same table declared TIMESPAN from the start.
+-- 4. Non-unique index: no uniqueness to violate, but the index still has to be re-sorted
+--    or the lookup misses rows.
 -- ===================================
+-- The indexed legs (4 and 4c) live in 41.7.4.1-alter-column-retype-semantic-index-memory;
+-- the unindexed leg stays here as the answer they must match.
 
-create table sem4 (id integer primary key, v text);
-create index sem4_v on sem4 (v);
-insert into sem4 values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
--- run
-
-alter table sem4 alter column v set data type timespan;
--- run
-
-select id from sem4 where v = 'PT3600S' order by id;
-→ [{"id":1},{"id":2}]
-
-drop table sem4;
-
--- 4b. …the identical table with no index at all
+-- 4b. the identical table with no index at all
 create table sem4b (id integer primary key, v text);
 insert into sem4b values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
 -- run
@@ -144,24 +105,12 @@ select id from sem4b where v = 'PT3600S' order by id;
 
 drop table sem4b;
 
--- 4c. …and the same rows under a natively-declared TIMESPAN column
-create table sem4c (id integer primary key, v timespan);
-create index sem4c_v on sem4c (v);
-insert into sem4c values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
--- run
-
-select id from sem4c where v = 'PT3600S' order by id;
-→ [{"id":1},{"id":2}]
-
-drop table sem4c;
-
 -- ===================================
 -- 5. Reverse direction, TIMESPAN → TEXT: comparison becomes textual again, so the spellings
 --    separate and a duration that was a duplicate becomes insertable.
 -- ===================================
 
-create table sem5 (id integer primary key, v timespan);
-create unique index sem5_v on sem5 (v);
+create table sem5 (id integer primary key, v timespan, unique (v));
 insert into sem5 values (1, 'PT1H'), (2, 'PT2H');
 -- run
 
@@ -194,8 +143,7 @@ drop table sem5;
 --    guard must not re-validate or re-sort on every `text → varchar` widening.
 -- ===================================
 
-create table sem6 (id integer primary key, v text);
-create unique index sem6_v on sem6 (v);
+create table sem6 (id integer primary key, v text, unique (v));
 insert into sem6 values (1, 'PT1H'), (2, 'PT60M');
 -- run
 
@@ -212,8 +160,7 @@ select id from sem6 where v = 'PT60M';
 drop table sem6;
 
 -- 6b. integer → bigint, likewise a no-op
-create table sem6b (id integer primary key, n integer);
-create unique index sem6b_n on sem6b (n);
+create table sem6b (id integer primary key, n integer, unique (n));
 insert into sem6b values (1, 10), (2, 9);
 -- run
 
@@ -242,8 +189,7 @@ drop table sem6b;
 --    persisted and would flip on a reopen.
 -- ===================================
 
-create table sem7 (id integer primary key, d text collate nocase);
-create unique index sem7_d on sem7 (d);
+create table sem7 (id integer primary key, d text collate nocase, unique (d));
 insert into sem7 values (1, '2024-01-01'), (2, '2024-02-01');
 -- run
 
@@ -271,8 +217,7 @@ drop table sem7;
 -- only collation DATE accepts). DATE compares exactly as BINARY text does, so this one
 -- re-sorts into the order it was already in — the point is that it stays correct and stays
 -- accepted. This is the surviving re-key coverage now that section 7 rejects.
-create table sem7b (id integer primary key, d text);
-create unique index sem7b_d on sem7b (d);
+create table sem7b (id integer primary key, d text, unique (d));
 insert into sem7b values (1, '2024-02-01'), (2, '2024-01-01');
 -- run
 
@@ -289,8 +234,7 @@ drop table sem7b;
 
 -- 7c. …the remedy for section 7: drop the illegal collation first, then retype. Two statements,
 -- both accepted, and the resulting column is a shape CREATE TABLE could have produced directly.
-create table sem7c (id integer primary key, d text collate nocase);
-create unique index sem7c_d on sem7c (d);
+create table sem7c (id integer primary key, d text collate nocase, unique (d));
 insert into sem7c values (1, '2024-02-01'), (2, '2024-01-01');
 -- run
 
@@ -397,8 +341,7 @@ pragma default_collation = 'binary';
 --    has staged but not committed MUST reject the retype, and the transaction stays usable.
 -- ===================================
 
-create table sem8 (id integer primary key, v text);
-create unique index sem8_v on sem8 (v);
+create table sem8 (id integer primary key, v text, unique (v));
 insert into sem8 values (1, 'PT1H');
 -- run
 
@@ -428,8 +371,7 @@ select id from sem8 where v = 'PT3600S';
 drop table sem8;
 
 -- 8b. …and a collision only among rows the transaction has DELETED does NOT block it.
-create table sem8b (id integer primary key, v text);
-create unique index sem8b_v on sem8b (v);
+create table sem8b (id integer primary key, v text, unique (v));
 insert into sem8b values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
 -- run
 
@@ -456,8 +398,7 @@ drop table sem8b;
 --    two. Same contract as the TIMESPAN sections above.
 -- ===================================
 
-create table sem9 (id integer primary key, v text);
-create unique index sem9_v on sem9 (v);
+create table sem9 (id integer primary key, v text, unique (v));
 insert into sem9 values (1, '{"a":1}'), (2, '{ "a" : 1 }');
 -- run
 
@@ -472,8 +413,7 @@ drop table sem9;
 -- 9b. …the accepted case: distinct documents, so the retype lands and the index enforces
 -- uniqueness by structure rather than by spelling. The retyped column must answer exactly as
 -- a column declared `json` from the start does — which is what 9c pins.
-create table sem9b (id integer primary key, v text);
-create unique index sem9b_v on sem9b (v);
+create table sem9b (id integer primary key, v text, unique (v));
 insert into sem9b values (1, '{"a":1}'), (2, '{"b":2}');
 -- run
 
@@ -492,8 +432,7 @@ select id from sem9b where v = '{ "a" : 1 }';
 drop table sem9b;
 
 -- 9c. …and the natively-declared column the retyped one has to match, spelling for spelling.
-create table sem9c (id integer primary key, v json);
-create unique index sem9c_v on sem9c (v);
+create table sem9c (id integer primary key, v json, unique (v));
 insert into sem9c values (1, '{"a":1}'), (2, '{"b":2}');
 -- run
 

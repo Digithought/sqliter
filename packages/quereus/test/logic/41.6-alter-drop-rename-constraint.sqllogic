@@ -201,16 +201,8 @@ alter table e_coll rename constraint u1 to u2;
 drop table e_coll;
 -- run
 
--- A UNIQUE derived from CREATE UNIQUE INDEX cannot be dropped as a constraint
-create table e_der (id integer primary key, a integer);
-create unique index uq_idx on e_der (a);
--- run
-
-alter table e_der drop constraint uq_idx;
--- error: backed by index
-
-drop table e_der;
--- run
+-- The negative control for a UNIQUE derived from CREATE UNIQUE INDEX (DROP CONSTRAINT
+-- cannot target it) lives in 41.6.1-alter-drop-constraint-index-derived.
 
 -- ============================================================
 -- 8. DROP CONSTRAINT (CHECK) invalidates optimizer folding

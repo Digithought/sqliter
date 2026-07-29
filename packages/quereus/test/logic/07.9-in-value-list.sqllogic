@@ -102,28 +102,9 @@ select distinct id, c_real2 from t1 where c_real2 in (0, null, 0, 820) order by 
 drop table t1;
 
 -- ===== (e) Composite-index IN (cross-product) with a duplicate and a NULL =====
-
-create table c (id integer primary key, a integer, b integer);
-create index idx_ab on c(a, b);
-insert into c values (1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 20);
-
--- Cross-product (a∈{1,1} × b∈{10,null}): the NULL-bearing tuples drop, the
--- (1,10) duplicate collapses → a single row.
-select id from c where a in (1, 1) and b in (10, null) order by id;
-→ [{"id":1}]
-
--- Duplicate values on both columns must not multiply matches.
-select id from c where a in (1, 2, 2) and b in (10, 20, 20) order by id;
-→ [{"id":1},{"id":2},{"id":3},{"id":4}]
-
--- Duplicate + NULL collapsing to a two-row subset.
-select id from c where a in (1, 1, 2) and b in (10, null) order by id;
-→ [{"id":1},{"id":3}]
-
-select distinct id from c where a in (1, 1, 2) and b in (10, null) order by id;
-→ [{"id":1},{"id":3}]
-
-drop table c;
+-- Lives in 07.9.1-in-value-list-composite-index: the composite seek needs a
+-- standalone `create index`, where every scenario here reaches the multi-seek
+-- through an inline PRIMARY KEY / UNIQUE column.
 
 -- ===== Non-indexed column: residual scalar IN filter path =====
 -- w has no index, so IN stays a residual InNode filter rather than a multi-seek.

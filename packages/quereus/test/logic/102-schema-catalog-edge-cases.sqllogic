@@ -50,22 +50,7 @@ DROP TABLE rt_composite;
 -- ===================================
 -- Table with indexes
 -- ===================================
-
-CREATE TABLE rt_indexed (id INTEGER PRIMARY KEY, name TEXT, category TEXT);
-CREATE INDEX idx_name ON rt_indexed (name);
-CREATE INDEX idx_cat ON rt_indexed (category);
-INSERT INTO rt_indexed VALUES (1, 'Alice', 'A'), (2, 'Bob', 'B');
-
--- Verify indexes are used (data accessible via indexed columns)
-SELECT id FROM rt_indexed WHERE name = 'Alice';
-→ [{"id": 1}]
-
-SELECT id FROM rt_indexed WHERE category = 'B';
-→ [{"id": 2}]
-
-DROP INDEX idx_name;
-DROP INDEX idx_cat;
-DROP TABLE rt_indexed;
+-- Lives in 102.0.1-schema-catalog-indexed-table (it needs standalone CREATE INDEX).
 
 -- ===================================
 -- Table with CHECK constraints

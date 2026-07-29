@@ -80,23 +80,9 @@ select id from sn order by d nulls last;
 
 drop table sn;
 
--- === Index and composite-key access paths over a TIMESPAN column ===
-
--- Secondary index: seek, range and ordering all run under the tree's typed order.
-create table si (id integer primary key, d timespan);
-create index si_d on si(d);
-insert into si values (1, 'PT2H'), (2, 'PT90M'), (3, 'PT30M');
-
-select id from si order by d;
-→ [{"id":3},{"id":2},{"id":1}]
-
-select id from si where d > 'PT90M';
-→ [{"id":1}]
-
-select id from si where d = 'PT120M';
-→ [{"id":1}]
-
-drop table si;
+-- === Composite-key access paths over a TIMESPAN column ===
+-- (the secondary-index access path lives in 15.1.2-semantic-ordering-index —
+-- it needs standalone CREATE INDEX)
 
 -- Composite PK with a TIMESPAN trailing member: the equality prefix and the
 -- trailing range bound must both compare under the tree's order.
@@ -516,16 +502,8 @@ select count(*) as c from uc;
 
 drop table uc;
 
--- `create unique index` enforces the same identity at WRITE time (the build-time
--- dedup over pre-existing rows already did).
-create table ui (id integer primary key, d timespan);
-create unique index ui_d on ui (d);
-insert into ui values (1, 'PT1H');
-
-insert into ui values (2, 'PT60M');
--- error: UNIQUE constraint failed
-
-drop table ui;
+-- The index-derived variant of the same write-time identity check lives in
+-- 15.1.2-semantic-ordering-index (it needs standalone CREATE UNIQUE INDEX).
 
 -- UPDATE: re-spelling a row's OWN value is not a self-conflict; moving a row onto
 -- ANOTHER row's identity is.

@@ -1,0 +1,91 @@
+-- 41.7.4.1-alter-column-retype-semantic-index-memory.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 41.7.4-alter-column-retype-semantic-memory. That file's subject is
+-- retype semantics for same-storage-class types that carry their own comparison
+-- (text <-> timespan / json / date): the change must re-sort and re-validate under the
+-- NEW type's compare. It makes every one of those points through inline / table-level
+-- `unique` or through a plain scan, so it needs no index DDL. Two things there genuinely
+-- do: an index-DERIVED unique (a distinct enforcement path from a declared one), and a
+-- NON-unique secondary index, which has no declarative spelling at all.
+--
+-- Subject: (1) an index-derived UNIQUE rejects a retype whose converted values collide,
+-- changing nothing; (2) a non-unique secondary index over the retyped column is re-sorted,
+-- so a lookup through it answers exactly as the unindexed table and the natively-declared
+-- column do.
+
+-- ===================================
+-- 1. Colliding rows under an explicit `create unique index` → the ALTER is REJECTED, and
+--    the rejection changes nothing: values, declared type and writability all survive.
+-- ===================================
+
+create table sem1 (id integer primary key, v text);
+create unique index sem1_v on sem1 (v);
+insert into sem1 values (1, 'PT1H'), (2, 'PT60M');
+-- run
+
+alter table sem1 alter column v set data type timespan;
+-- error: UNIQUE constraint failed
+
+-- the declared type is unchanged — a rejected ALTER must not leave a new type over
+-- structures still keyed the old way
+select name, type from table_info('sem1') where name = 'v';
+→ [{"name":"v","type":"TEXT"}]
+
+select id, v from sem1 order by id;
+→ [{"id":1,"v":"PT1H"},{"id":2,"v":"PT60M"}]
+
+-- still writable, and the index still enforces TEXTUAL uniqueness under the unchanged type,
+-- so a third spelling of the same duration is accepted
+insert into sem1 values (3, 'PT3600S');
+select count(*) as n from sem1;
+→ [{"n":3}]
+
+insert into sem1 values (4, 'PT1H');
+-- error: UNIQUE constraint failed
+
+drop table sem1;
+
+-- ===================================
+-- 4. Non-unique index: no uniqueness to violate, but the index still has to be re-sorted or
+--    the lookup misses rows. The answer must match the same table with NO index, and the
+--    same table declared TIMESPAN from the start.
+-- ===================================
+
+create table sem4 (id integer primary key, v text);
+create index sem4_v on sem4 (v);
+insert into sem4 values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+alter table sem4 alter column v set data type timespan;
+-- run
+
+select id from sem4 where v = 'PT3600S' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table sem4;
+
+-- 4b. …the identical table with no index at all
+create table sem4b (id integer primary key, v text);
+insert into sem4b values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+alter table sem4b alter column v set data type timespan;
+-- run
+
+select id from sem4b where v = 'PT3600S' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table sem4b;
+
+-- 4c. …and the same rows under a natively-declared TIMESPAN column
+create table sem4c (id integer primary key, v timespan);
+create index sem4c_v on sem4c (v);
+insert into sem4c values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+select id from sem4c where v = 'PT3600S' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table sem4c;

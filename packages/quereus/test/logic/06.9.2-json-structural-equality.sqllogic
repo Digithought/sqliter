@@ -130,46 +130,8 @@ select id from jse_t where v in ('not json', '{"a":1,"b":2}');
 -- ===================================
 -- 6. The same set with a UNIQUE index on the JSON column
 -- ===================================
--- Before the fix, an indexed JSON column raised `Unknown literal type object` at plan
--- time for the forms that DID work unindexed (`= json(...)` / `= cast(... as json)`),
--- because the seek key was rebuilt as a LiteralNode with no type.
-create table jse_ix (id integer primary key, v json);
-create unique index jse_ix_v on jse_ix (v);
-insert into jse_ix values (1, '{"a":1,"b":2}'), (2, '[1,2,3]');
--- run
-
-select id from jse_ix where v = '{"a":1,"b":2}';
-→ [{"id":1}]
-
-select id from jse_ix where v = '{ "b" : 2 , "a" : 1 }';
-→ [{"id":1}]
-
-select id from jse_ix where v = json('{"b":2,"a":1}');
-→ [{"id":1}]
-
-select id from jse_ix where v = cast('{ "a" : 1 , "b" : 2 }' as json);
-→ [{"id":1}]
-
-select id from jse_ix where v in ('{"b":2,"a":1}', '[1,2,3]') order by id;
-→ [{"id":1},{"id":2}]
-
--- A range over the index: the tree, `<`/`>` and BETWEEN all rank JSON documents by the
--- same structural compare, so the indexed answer equals the unindexed one. Ranges over a
--- corpus of every JSON kind (including array-valued documents) are covered in
--- 06.9.3-json-index-range-seek.sqllogic.
-select id from jse_ix where v between '{"a":1,"b":1}' and '{"a":1,"b":3}';
-→ [{"id":1}]
-
-select id from jse_ix where v = 'not json';
-→ []
-
--- The index still enforces uniqueness by structure, and `=` now agrees with it.
-insert into jse_ix values (3, '{ "b" : 2 , "a" : 1 }');
--- error: UNIQUE constraint failed
-
--- The seek returns the stored native document, not the literal's text.
-select v from jse_ix where v = '{"b":2,"a":1}';
-→ [{"v":{"a":1,"b":2}}]
+-- Lives in 06.9.2.1-json-structural-equality-index: the indexed answers and the
+-- structural UNIQUE enforcement need a standalone `create unique index`.
 
 -- ===================================
 -- 7. Cross-column: a TEXT column compared against a JSON column
@@ -199,11 +161,8 @@ alter table jse_re alter column v set data type json;
 select id from jse_re where v = '{ "a" : 1 }';
 → [{"id":1}]
 
-create unique index jse_re_v on jse_re (v);
--- run
-
-select id from jse_re where v = '{ "a" : 1 }';
-→ [{"id":1}]
+-- The indexed half of this check (same retype, then `create unique index`) lives in
+-- 06.9.2.1-json-structural-equality-index § 2.
 
 -- ===================================
 -- 9. Two DIFFERENT JSON comparisons in one statement stay different

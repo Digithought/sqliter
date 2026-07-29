@@ -663,24 +663,10 @@ update xs1u_v set cv = pv where cid = 1;
 select cid, cv from xs1u_c order by cid;
 → [{"cid":1,"cv":100},{"cid":2,"cv":2}]
 
--- Cross-source `set` where the partner's only unique key on the join column is a PARTIAL
--- UNIQUE index (it carries a predicate) -> REJECTED. A partial unique key bounds uniqueness
--- only within its predicate scope, so it cannot prove the owner joins at most one partner.
--- Here xs1pp_p has TWO rows with pcode=500 (one, pv=-5, outside the partial scope pv>0), so
--- the child cid=1 genuinely joins both parents -> the proof correctly fails and the write is
--- rejected at plan time rather than failing at runtime with "more than one row".
-create table xs1pp_p (pid integer primary key, pcode integer, pv integer);
-create table xs1pp_c (cid integer primary key, cref integer, cv integer);
-create unique index xs1pp_ux on xs1pp_p(pcode) where pv > 0;
-insert into xs1pp_p values (10, 500, 100), (20, 500, -5);
-insert into xs1pp_c values (1, 500, 1);
-create view xs1pp_v as
-    select c.cid as cid, c.cv as cv, p.pv as pv
-    from xs1pp_c c join xs1pp_p p on p.pcode = c.cref;
-update xs1pp_v set cv = pv where cid = 1;
--- error: assigned side joins more than one
-select cid, cv from xs1pp_c order by cid;
-→ [{"cid":1,"cv":1}]
+-- The PARTIAL-unique-key variant of this cardinality proof (rejected, because a partial
+-- unique key bounds uniqueness only inside its predicate) lives in
+-- 93.4.1-view-mutation-partial-unique-cardinality — a partial UNIQUE can only be spelled
+-- as `create unique index … where …`, so it needs standalone index DDL.
 
 -- Self-join body -> accepted: `e` and `m` are distinct aliases of one base table,
 -- routed by alias (the column's producing scan), not table name. `mv = m.v` routes to

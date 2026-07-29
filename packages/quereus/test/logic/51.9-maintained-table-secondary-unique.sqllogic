@@ -97,27 +97,8 @@ select count(*) as n from mn;
 -- ===================================
 -- 5. partial UNIQUE (unique index … where): only in-scope rows collide
 -- ===================================
-
-create table psrc (id integer primary key, code text, status text);
-insert into psrc values (1, 'c1', 'active'), (2, 'c1', 'archived');
-create table mp (id integer primary key, code text, status text);
-create unique index mp_active_code on mp(code) where status = 'active';
-alter table mp set maintained as select id, code, status from psrc;
-
--- an out-of-scope duplicate is fine
-insert into psrc values (3, 'c1', 'archived');
-select count(*) as n from mp;
-→ [{"n":3}]
-
--- an in-scope duplicate rejects
-insert into psrc values (4, 'c1', 'active');
--- error: row derived into maintained table 'main.mp'
-
--- a source write transitioning a row INTO the predicate's scope collides too
-update psrc set status = 'active' where id = 2;
--- error: row derived into maintained table 'main.mp'
-select count(*) as n from mp;
-→ [{"n":3}]
+-- Lives in 51.9.1-maintained-table-partial-unique: a partial UNIQUE can only be
+-- spelled as `create unique index … where …`, so it needs standalone index DDL.
 
 -- ===================================
 -- 6. a declared per-constraint conflict default never masks a derivation

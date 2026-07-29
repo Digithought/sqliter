@@ -1,5 +1,11 @@
 -- 08.4-key-set-semi-join.sqllogic — behaviour of the key-set semi join rewrite
 --
+-- requires-capability: standalone-index-ddl
+--
+-- Whole-file directive rather than a split: the rewrite under test only plans over a
+-- SECONDARY-INDEXED column, so the index in the setup is load-bearing for every scenario
+-- here — there is no index-free remainder to carve out.
+--
 -- `where col in (select …)` over a secondary-indexed column plans as a
 -- KeySetSemiJoin under the memory vtab: the inner set is materialized once and,
 -- when small enough, handed to the module as a plan=5 multi-seek. These cases

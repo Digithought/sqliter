@@ -25,35 +25,10 @@
 
 -- ===================================
 -- 1. text → integer collision under an explicit `create unique index` → rejected,
---    and the rejection changes nothing: values, type and writability all survive.
+--    and the rejection changes nothing.
 -- ===================================
-
-create table ri (id integer primary key, v text);
-create unique index ri_v on ri (v);
-insert into ri values (1, '1'), (2, '01');
--- run
-
-alter table ri alter column v set data type integer;
--- error: UNIQUE constraint failed
-
--- rolled back: both rows survive as their original TEXT values
-select id, v, typeof(v) from ri order by id;
-→ [{"id":1,"v":"1","typeof(v)":"text"},{"id":2,"v":"01","typeof(v)":"text"}]
-
--- ...and the DECLARED type is unchanged too — a rejection must not leave rewritten values
--- behind a stale catalog type, nor a changed catalog over old values
-select name, type from table_info('ri') where name = 'v';
-→ [{"name":"v","type":"TEXT"}]
-
--- the table is still writable, and the index still enforces under the unchanged type
-insert into ri values (3, '001');
-select count(*) as n from ri;
-→ [{"n":3}]
-
-insert into ri values (4, '1');
--- error: UNIQUE constraint failed
-
-drop table ri;
+-- Lives in 41.7.3.2-alter-column-retype-unique-index (it needs standalone index DDL);
+-- § 2 below is the same collision seen through a table-level `unique (v)`.
 
 -- ===================================
 -- 2. Same collision under a table-level `unique (v)` constraint, caught through the
@@ -94,8 +69,7 @@ drop table rr;
 --    the same DEFAULT literal → rejected, and the column stays nullable.
 -- ===================================
 
-create table rn (id integer primary key, v text null);
-create unique index rn_v on rn (v);
+create table rn (id integer primary key, v text null, unique (v));
 insert into rn (id, v) values (1, null), (2, null);
 -- run
 
@@ -117,8 +91,7 @@ drop table rn;
 
 -- 4b. A backfill that collides with an EXISTING non-null row is rejected too: one NULL
 --     plus a row already holding the DEFAULT value.
-create table rn2 (id integer primary key, v text null);
-create unique index rn2_v on rn2 (v);
+create table rn2 (id integer primary key, v text null, unique (v));
 insert into rn2 (id, v) values (1, 'x'), (2, null);
 -- run
 
@@ -135,8 +108,7 @@ drop table rn2;
 
 -- 4c. A single NULL with no colliding partner backfills fine (the guard must not
 --     reject every backfill).
-create table rn3 (id integer primary key, v text null);
-create unique index rn3_v on rn3 (v);
+create table rn3 (id integer primary key, v text null, unique (v));
 insert into rn3 (id, v) values (1, 'a'), (2, null);
 -- run
 
@@ -156,8 +128,7 @@ drop table rn3;
 --    rewritten, and an index-backed lookup finds rows by the NEW value.
 -- ===================================
 
-create table ok1 (id integer primary key, v text);
-create unique index ok1_v on ok1 (v);
+create table ok1 (id integer primary key, v text, unique (v));
 insert into ok1 values (1, '10'), (2, '9');
 -- run
 
@@ -186,8 +157,7 @@ drop table ok1;
 --    several of them is not a collision.
 -- ===================================
 
-create table ok2 (id integer primary key, v text null);
-create unique index ok2_v on ok2 (v);
+create table ok2 (id integer primary key, v text null, unique (v));
 insert into ok2 (id, v) values (1, null), (2, null), (3, '7');
 -- run
 
@@ -247,8 +217,7 @@ drop table rc;
 --    transaction has DELETED must NOT block the retype.
 -- ===================================
 
-create table tx1 (id integer primary key, v text);
-create unique index tx1_v on tx1 (v);
+create table tx1 (id integer primary key, v text, unique (v));
 insert into tx1 values (1, '1'), (2, '01'), (3, '5');
 -- run
 
@@ -271,8 +240,7 @@ drop table tx1;
 --    reject the retype.
 -- ===================================
 
-create table tx2 (id integer primary key, v text);
-create unique index tx2_v on tx2 (v);
+create table tx2 (id integer primary key, v text, unique (v));
 insert into tx2 values (1, '1');
 -- run
 
@@ -299,8 +267,7 @@ drop table tx2;
 --     rows — bug-isolation-retype-leaves-staged-rows-unconverted.)
 -- ===================================
 
-create table tx3 (id integer primary key, v text);
-create unique index tx3_v on tx3 (v);
+create table tx3 (id integer primary key, v text, unique (v));
 insert into tx3 values (1, '1');
 -- run
 

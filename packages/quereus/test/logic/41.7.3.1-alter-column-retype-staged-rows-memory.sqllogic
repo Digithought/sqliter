@@ -9,8 +9,10 @@
 -- which removes this entry. The rejection/retry half of this scenario (without a staged
 -- insert surviving to commit) runs cross-module in 41.7.3 § 10.
 
-create table tx3 (id integer primary key, v text);
-create unique index tx3_v on tx3 (v);
+-- The UNIQUE is declared inline rather than through `create unique index`: the staged-row
+-- conversion this file is about is identical either way, and an inline constraint keeps the
+-- file runnable on backends without standalone index DDL.
+create table tx3 (id integer primary key, v text unique);
 insert into tx3 values (1, '1');
 -- run
 

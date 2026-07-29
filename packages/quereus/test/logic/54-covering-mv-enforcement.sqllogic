@@ -113,25 +113,8 @@ select x, y, id from pk_ix order by x, y;
 -- ===================================
 -- 5. Partial covering MV — a source row outside the predicate is not checked.
 -- ===================================
-
-create table p (id integer primary key, x integer not null, y integer not null, active integer not null);
-create unique index p_uq on p (x, y) where active = 1;
-create materialized view p_ix as select x, y, id from p where active = 1 order by x, y;
-
-insert into p values (1, 5, 5, 1);
--- an out-of-scope row sharing (x,y) does NOT conflict
-insert into p values (2, 5, 5, 0);
--- two out-of-scope rows sharing (x,y) do NOT conflict
-insert into p values (3, 8, 8, 0), (4, 8, 8, 0);
-select count(*) as n from p;
-→ [{"n":4}]
-
--- a second in-scope row sharing (x,y) DOES conflict
-insert into p values (5, 5, 5, 1);
--- error: UNIQUE constraint failed
-
-select count(*) as n from p;
-→ [{"n":4}]
+-- Lives in 54.1-covering-mv-partial-enforcement: a partial UNIQUE can only be spelled
+-- as `create unique index … where …`, so it needs standalone index DDL.
 
 -- ===================================
 -- 6. A covering MV declared with bare DDL (the only form now — every MV is

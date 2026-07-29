@@ -580,38 +580,10 @@ drop view v_new;
 drop table vr_t;
 
 -- ===================================
--- 17. Hinted INDEX rename, body unchanged → drop + recreate
+-- 17. Hinted INDEX rename, body unchanged -> drop + recreate
 -- ===================================
-
-create table ir_t (id integer primary key, category text);
-create index ix_old on ir_t (category);
-
-declare schema main {
-	table ir_t {
-		id integer primary key,
-		category text
-	}
-
-	index ix_new on ir_t (category) with tags ("quereus.previous_name" = 'ix_old')
-}
-
--- run
-
-diff schema main;
-→ [{"ddl": "DROP INDEX IF EXISTS ix_old"}, {"ddl": "create index ix_new on ir_t (category) with tags (\"quereus.previous_name\" = 'ix_old')"}]
-
-apply schema main;
-
--- run
-
-select name, tbl_name from schema() where type = 'index';
-→ [{"name": "ix_new", "tbl_name": "ir_t"}]
-
-diff schema main;
-→ []
-
-drop index ix_new;
-drop table ir_t;
+-- Lives in 50.2.1-declare-schema-index-renames (it needs standalone index DDL);
+-- the VIEW-kind twin of this case is section 16 above.
 
 -- ===================================
 -- 18. Hinted VIEW rename + non-hint tag drift → recreate carries the tags
@@ -693,50 +665,20 @@ drop table cr_t;
 -- ===================================
 -- 20. Hinted INDEX rename + in-diff COLUMN rename of its table
 -- ===================================
-
-create table irc_t (id integer primary key, amount integer not null);
-create index irc_old on irc_t (amount);
-
-declare schema main {
-	table irc_t {
-		id integer primary key,
-		qty integer not null with tags ("quereus.previous_name" = 'amount')
-	}
-
-	index irc_new on irc_t (qty) with tags ("quereus.previous_name" = 'irc_old')
-}
-
--- run
-
--- The recreate names the OLD column (RENAME COLUMN runs after creates); the
--- propagation rewrites the fresh index's columns.
-diff schema main;
-→ [{"ddl": "DROP INDEX IF EXISTS irc_old"}, {"ddl": "create index irc_new on irc_t (amount) with tags (\"quereus.previous_name\" = 'irc_old')"}, {"ddl": "ALTER TABLE irc_t RENAME COLUMN amount TO qty"}]
-
-apply schema main;
-
--- run
-
-select name from schema() where type = 'index';
-→ [{"name": "irc_new"}]
-
-diff schema main;
-→ []
-
-drop index irc_new;
-drop table irc_t;
+-- Lives in 50.2.1-declare-schema-index-renames (it needs standalone index DDL);
+-- section 19 above is the VIEW-kind twin.
 
 -- ===================================
--- 21. require-hint: hinted view + index renames apply cleanly
+-- 21. require-hint: a hinted VIEW rename applies cleanly
 -- ===================================
 
 -- A hinted rename's drop+create pair is deliberate, not an ambiguous unhinted
--- rename — it must not trip the require-hint guard (excluded from the counts,
--- like the body-change recreates of §14).
+-- rename -- it must not trip the require-hint guard (excluded from the counts,
+-- like the body-change recreates of section 14). The same case with an index
+-- rename alongside is in 50.2.1-declare-schema-index-renames.
 
 create table rh2_t (id integer primary key, v integer);
 create view rh2_vold as select id, v from rh2_t;
-create index rh2_ixold on rh2_t (v);
 
 declare schema main {
 	table rh2_t {
@@ -745,8 +687,6 @@ declare schema main {
 	}
 
 	view rh2_vnew as select id, v from rh2_t with tags ("quereus.previous_name" = 'rh2_vold')
-
-	index rh2_ixnew on rh2_t (v) with tags ("quereus.previous_name" = 'rh2_ixold')
 }
 
 -- run
@@ -761,58 +701,13 @@ diff schema main;
 select name from schema() where type = 'view';
 → [{"name": "rh2_vnew"}]
 
-select name from schema() where type = 'index';
-→ [{"name": "rh2_ixnew"}]
-
 drop view rh2_vnew;
-drop index rh2_ixnew;
 drop table rh2_t;
 
 -- ===================================
 -- 22. Hinted VIEW + INDEX rename + in-diff TABLE rename of their source
 -- ===================================
-
--- The recreates keep the DECLARED table name (no inverse table pass): table
--- renames emit FIRST in migration order, so the new name is live by the time
--- the view/index creates plan their bodies.
-
-create table src_old (id integer primary key, v integer);
-create view trv_old as select id, v from src_old;
-create index tri_old on src_old (v);
-insert into src_old values (1, 10);
-
-declare schema main {
-	table src_new {
-		id integer primary key,
-		v integer
-	} with tags ("quereus.previous_name" = 'src_old')
-
-	view trv_new as select id, v from src_new with tags ("quereus.previous_name" = 'trv_old')
-
-	index tri_new on src_new (v) with tags ("quereus.previous_name" = 'tri_old')
-}
-
--- run
-
-diff schema main;
-→ [{"ddl": "ALTER TABLE src_old RENAME TO src_new"}, {"ddl": "DROP VIEW IF EXISTS trv_old"}, {"ddl": "DROP INDEX IF EXISTS tri_old"}, {"ddl": "create view trv_new as select id, v from src_new with tags (\"quereus.previous_name\" = 'trv_old')"}, {"ddl": "create index tri_new on src_new (v) with tags (\"quereus.previous_name\" = 'tri_old')"}]
-
-apply schema main;
-
--- run
-
-select * from trv_new order by id;
-→ [{"id": 1, "v": 10}]
-
-select name, tbl_name from schema() where type = 'index';
-→ [{"name": "tri_new", "tbl_name": "src_new"}]
-
-diff schema main;
-→ []
-
-drop view trv_new;
-drop index tri_new;
-drop table src_new;
+-- Lives in 50.2.1-declare-schema-index-renames (it needs standalone index DDL).
 
 -- ===================================
 -- 23. Hinted VIEW rename + with defaults + in-diff COLUMN rename

@@ -1,0 +1,34 @@
+-- 05.0.1-vtab-memory-unique-index-collation.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 05-vtab_memory: that file's subject is MemoryTable access-path
+-- behavior (PK point lookup, PK range scan, full scan, ORDER BY consumption,
+-- transactions), none of which needs index DDL. This trailing section was the
+-- file's only `create unique index`, and kept a backend without standalone index
+-- DDL from running any of the access-path coverage.
+--
+-- Subject: a unique index declaring a COARSER collation than its column unifies
+-- case-variants — enforcement runs through the index's comparator, and the
+-- conflict validator re-compares candidates under the index's per-column
+-- collation (checkUniqueViaIndex) — re-checking under the column's BINARY
+-- collation would skip the case-variants the index legitimately unifies.
+-- (The converse — a FINER index over a NOCASE column admitting both
+-- variants — is pinned by test/planner/collation-soundness.spec.ts.)
+
+PRAGMA default_vtab_module='memory';
+
+CREATE TABLE mem_uci (id INTEGER PRIMARY KEY, b TEXT);
+CREATE UNIQUE INDEX mem_uci_b ON mem_uci (b COLLATE NOCASE);
+INSERT INTO mem_uci VALUES (1, 'Bob');
+
+-- a case-variant collides under the index's NOCASE collation
+INSERT INTO mem_uci VALUES (2, 'BOB');
+-- error: UNIQUE constraint failed
+
+-- a genuinely different value still inserts
+INSERT INTO mem_uci VALUES (3, 'Carol');
+SELECT id, b FROM mem_uci ORDER BY id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
+
+DROP TABLE mem_uci;

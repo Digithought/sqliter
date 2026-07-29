@@ -1,0 +1,22 @@
+-- 41.6.1-alter-drop-constraint-index-derived.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 41.6-alter-drop-rename-constraint: every other section there drops or
+-- renames a named CHECK, UNIQUE or FOREIGN KEY declared in the table definition, with
+-- no index DDL. This one negative control needs a UNIQUE that came from a standalone
+-- `create unique index`, which is the whole point of the case.
+--
+-- Subject: a UNIQUE derived from CREATE UNIQUE INDEX is owned by the index, so
+-- ALTER TABLE … DROP CONSTRAINT refuses to target it.
+
+-- A UNIQUE derived from CREATE UNIQUE INDEX cannot be dropped as a constraint
+create table e_der (id integer primary key, a integer);
+create unique index uq_idx on e_der (a);
+-- run
+
+alter table e_der drop constraint uq_idx;
+-- error: backed by index
+
+drop table e_der;
+-- run

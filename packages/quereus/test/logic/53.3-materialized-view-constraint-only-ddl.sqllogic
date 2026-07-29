@@ -179,20 +179,20 @@ drop materialized view mvg;
 drop table g;
 
 -- ===================================
--- 7b. CREATE/DROP INDEX and a tag-only ALTER are equally body-irrelevant:
---     each fires table_modified on the source, none stales the MV
+-- 7b. A tag-only ALTER is body-irrelevant: it fires table_modified on the source
+--     but does not stale the MV
 -- ===================================
+-- (the CREATE/DROP INDEX instance of the same classification lives in
+--  53.3.1-materialized-view-index-ddl-irrelevance — it needs standalone index DDL)
 
 create table g2 (id integer primary key, v integer not null);
 insert into g2 values (1, 1);
 create materialized view mvg2 as select id, v from g2;
 
-create index ig2 on g2 (v);
 insert into g2 values (2, 2);
 select * from mvg2 order by id;
 → [{"id":1,"v":1},{"id":2,"v":2}]
 
-drop index ig2;
 insert into g2 values (3, 3);
 select * from mvg2 order by id;
 → [{"id":1,"v":1},{"id":2,"v":2},{"id":3,"v":3}]

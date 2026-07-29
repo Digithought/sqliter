@@ -122,23 +122,8 @@ select id from feat where not flag is true order by id;
 select id from feat where not (flag is true) order by id;
 → [{"id":2},{"id":3}]
 
--- ===========================================================================
--- Partial-index smoke: all four operators must compile in a partial-index
--- WHERE (exercises compileUnary in vtab/memory/utils/predicate.ts), and
--- queries must stay correct regardless of which rows the index covers.
--- ===========================================================================
-
-create index ix_feat_t  on feat(name) where flag is true;
-create index ix_feat_nt on feat(name) where flag is not true;
-create index ix_feat_f  on feat(name) where flag is false;
-create index ix_feat_nf on feat(name) where flag is not false;
-
--- Re-query through the now-indexed table; results must be unchanged.
-select id from feat where flag is true order by id;
-→ [{"id":1},{"id":4}]
-
-select id from feat where flag is false order by id;
-→ [{"id":2}]
+-- The partial-index compilation smoke test for these four operators lives in
+-- 03.9.1-is-bool-predicate-partial-index (it needs standalone CREATE INDEX).
 
 drop table feat;
 

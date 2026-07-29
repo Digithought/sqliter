@@ -1,0 +1,121 @@
+-- 10.4.1-schema-scale-indexes.sqllogic - Performance test for large schema operations: many indexes
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 10.4-schema-scale: the table-scale half of that stress rig (20 tables,
+-- cross-table joins, schema() table counts, bulk drop) needs no index DDL. This half
+-- puts 22 secondary indexes over the same 20 tables, so it lives here.
+--
+-- The 20-table rig is rebuilt below rather than shared — the two files run as separate
+-- databases, and only t01/t02/t03 need rows for the lookups asserted here.
+--
+-- Subject: the schema manager holds 22 indexes across 20 tables, schema() counts them,
+-- and point lookups through indexed columns answer correctly.
+
+-- ===================================
+-- 1. Create 20 tables with varied schemas
+-- ===================================
+
+create table t01 (id integer primary key, name text, value integer);
+create table t02 (id integer primary key, code text, amount real);
+create table t03 (id integer primary key, label text, count integer, active integer);
+create table t04 (id integer primary key, title text, score real);
+create table t05 (id integer primary key, details text, quantity integer);
+create table t06 (id integer primary key, tag text, price real);
+create table t07 (id integer primary key, category text, stock integer);
+create table t08 (id integer primary key, type text, level integer);
+create table t09 (id integer primary key, status text, priority integer);
+create table t10 (id integer primary key, role text, rank integer);
+create table t11 (id integer primary key, name text, value integer);
+create table t12 (id integer primary key, code text, amount real);
+create table t13 (id integer primary key, label text, count integer, active integer);
+create table t14 (id integer primary key, title text, score real);
+create table t15 (id integer primary key, details text, quantity integer);
+create table t16 (id integer primary key, tag text, price real);
+create table t17 (id integer primary key, category text, stock integer);
+create table t18 (id integer primary key, type text, level integer);
+create table t19 (id integer primary key, status text, priority integer);
+create table t20 (id integer primary key, role text, rank integer);
+
+-- ===================================
+-- 2. Insert data into the tables the lookups below read
+-- ===================================
+
+insert into t01 values (1, 'a1', 10), (2, 'a2', 20), (3, 'a3', 30);
+insert into t02 values (1, 'b1', 1.5), (2, 'b2', 2.5), (3, 'b3', 3.5);
+insert into t03 values (1, 'c1', 100, 1), (2, 'c2', 200, 0), (3, 'c3', 300, 1);
+
+-- ===================================
+-- 3. Create indexes on several tables
+-- ===================================
+
+create index idx_t01_name on t01 (name);
+create index idx_t01_value on t01 (value);
+create index idx_t02_code on t02 (code);
+create index idx_t03_label on t03 (label);
+create index idx_t03_active on t03 (active);
+create index idx_t04_title on t04 (title);
+create index idx_t05_details on t05 (details);
+create index idx_t06_tag on t06 (tag);
+create index idx_t07_category on t07 (category);
+create index idx_t08_type on t08 (type);
+create index idx_t09_status on t09 (status);
+create index idx_t10_role on t10 (role);
+create index idx_t11_name on t11 (name);
+create index idx_t12_code on t12 (code);
+create index idx_t13_label on t13 (label);
+create index idx_t14_title on t14 (title);
+create index idx_t15_details on t15 (details);
+create index idx_t16_tag on t16 (tag);
+create index idx_t17_category on t17 (category);
+create index idx_t18_type on t18 (type);
+create index idx_t19_status on t19 (status);
+create index idx_t20_role on t20 (role);
+
+-- ===================================
+-- 4. Verify indexes are working
+-- ===================================
+
+select name from t01 where name = 'a2';
+→ [{"name":"a2"}]
+
+select code from t02 where code = 'b3';
+→ [{"code":"b3"}]
+
+select label from t03 where active = 1 order by id;
+→ [{"label":"c1"},{"label":"c3"}]
+
+-- ===================================
+-- 5. Verify all indexes exist in schema
+-- ===================================
+
+select count(*) as index_count from schema() where type = 'index' and tbl_name like 't%';
+→ [{"index_count":22}]
+
+-- ===================================
+-- 6. Drop all tables (indexes go with them)
+-- ===================================
+
+drop table t01;
+drop table t02;
+drop table t03;
+drop table t04;
+drop table t05;
+drop table t06;
+drop table t07;
+drop table t08;
+drop table t09;
+drop table t10;
+drop table t11;
+drop table t12;
+drop table t13;
+drop table t14;
+drop table t15;
+drop table t16;
+drop table t17;
+drop table t18;
+drop table t19;
+drop table t20;
+
+select count(*) as index_count from schema() where type = 'index' and tbl_name like 't%';
+→ [{"index_count":0}]
