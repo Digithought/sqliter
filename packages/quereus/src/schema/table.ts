@@ -1232,6 +1232,10 @@ export function validateAddColumnGeneratedRefs(
 	const columnIndexMap = buildColumnIndexMap(existingColumns);
 	const tableNameLower = tableName.toLowerCase();
 	const newColLower = newColumnName.toLowerCase();
+	// `add column v … generated always as (v * 2)` where `v` ALREADY exists is a duplicate
+	// column, not a cycle; the reference resolves to the existing sibling. Leave the
+	// rejection to `runAddColumn`'s duplicate check so the message names the real problem.
+	const newColumnIsDuplicate = columnIndexMap.has(newColLower);
 
 	traverseAst(expr as AST.AstNode, {
 		enterNode: (node: AST.AstNode) => {
@@ -1253,7 +1257,7 @@ export function validateAddColumnGeneratedRefs(
 			}
 
 			const lower = name.toLowerCase();
-			if (lower === newColLower) {
+			if (lower === newColLower && !newColumnIsDuplicate) {
 				throw new QuereusError(
 					`Cyclic dependency in generated columns: '${newColumnName}'`,
 					StatusCode.ERROR,

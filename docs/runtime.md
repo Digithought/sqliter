@@ -1095,12 +1095,37 @@ to `module.alterTable`, so `new.<column>` resolves to the existing row's sibling
 Each module applies the evaluator while appending the column, staging locally
 (memory builds a new tree, the store accumulates a batch) and publishing only after
 every row migrates, and enforces the column's NOT NULL on the produced value before
-commit. CHECK enforcement splits by default kind:
+commit.
+
+`ALTER TABLE ADD COLUMN … GENERATED ALWAYS AS (…)` takes that **same** per-row route:
+`buildAddColumnBackfill` sources its scalar from the `generated` clause when there is
+one, so a generated column added to a populated table is computed for the existing
+rows. Three differences from the DEFAULT arm, all of them forced by a generated column
+having no stored `defaultValue`:
+
+- It is **never** folded to a bulk-written literal — even `generated always as (2)` is
+  evaluated per row, since there is no `defaultValue` for the module to write.
+- Determinism is checked with `validateDeterministicGenerated` (message: *GENERATED
+  ALWAYS AS for column …*) rather than the DEFAULT validator, and the shared
+  `validateAddColumnDefault` pre-check is skipped — it rejects bare column references,
+  which a generated expression is written with by definition.
+- Unresolvable and self-referencing names are pre-flighted by
+  `validateAddColumnGeneratedRefs` (`schema/table.ts`) before the compile, so they get
+  the same two messages `CREATE TABLE` gives (*Column 'x' referenced by generated column
+  …*, *Cyclic dependency in generated columns …*) instead of a generic `Column not
+  found`. The emitter's own `withGeneratedColumnGraph` rebuild still runs, so the
+  pre-flight only moves those rejections earlier.
+
+An evaluator's presence — not the kind of DEFAULT written — is what each module's "NOT
+NULL needs a value source" gate keys on, so a mandatory generated column is accepted on
+a non-empty table and filled per row.
+
+CHECK enforcement splits by value-source kind:
 
 - **Literal / NULL default** — new CHECK constraints are validated against the
   backfilled rows by a post-`alterTable` scan, reverting the column add on a
   violation.
-- **Non-foldable (per-row) default** — each column-level CHECK is compiled at
+- **Per-row source (non-foldable default or `GENERATED ALWAYS AS`)** — each column-level CHECK is compiled at
   plan-build time (against the existing columns plus the new column) and evaluated
   *inside the per-row backfill hook* against `[...existingRow, backfilledValue]`,
   mirroring the per-row NOT NULL path. A violating row throws mid-loop, so the
@@ -1175,7 +1200,8 @@ accepted afterwards. Consequences of routing through the module:
 - CHECK constraints validated when building constraint checks (full
   column-scope resolution happens here)
 - `GENERATED ALWAYS AS` expressions validated when building the generated
-  column projection (INSERT) or assignment chain (UPDATE)
+  column projection (INSERT), assignment chain (UPDATE), or ADD COLUMN backfill
+  (`ALTER TABLE ADD COLUMN`, at plan-build — see above)
 
 **ALTER TABLE ADD CONSTRAINT:**
 - Validation deferred to first INSERT/UPDATE (constraints may reference NEW/OLD)

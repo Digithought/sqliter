@@ -296,3 +296,131 @@ select id, v, g from t_decl order by id;
 
 drop table t_decl;
 -- run
+
+-- ============================================================
+-- 10. Rows staged in the open transaction backfill too
+--
+-- The ALTER runs while the transaction holds an uncommitted row. Both the committed
+-- row and the staged one must carry the computed value, and the staged row must
+-- still commit. (Memory stages in its transaction layers, the store in the isolation
+-- overlay; both run the same evaluator over the staged rows.)
+-- ============================================================
+
+create table t_staged (id integer primary key, v integer);
+insert into t_staged values (1, 5);
+-- run
+
+begin;
+-- run
+
+insert into t_staged values (2, 7);
+-- run
+
+alter table t_staged add column g integer null generated always as (v * 2);
+-- run
+
+select id, v, g from t_staged order by id;
+→ [{"id":1,"v":5,"g":10},{"id":2,"v":7,"g":14}]
+
+insert into t_staged (id, v) values (3, 9);
+-- run
+
+commit;
+-- run
+
+select id, v, g from t_staged order by id;
+→ [{"id":1,"v":5,"g":10},{"id":2,"v":7,"g":14},{"id":3,"v":9,"g":18}]
+
+drop table t_staged;
+-- run
+
+-- ============================================================
+-- 11. An inline UNIQUE over the new column sees the backfilled values
+--
+-- The constraint-install loop runs after the backfill, so the covering structure is
+-- built over real computed values — distinct ones are accepted, colliding ones reject
+-- the whole ALTER.
+-- ============================================================
+
+create table t_uniq (id integer primary key, v integer);
+insert into t_uniq values (1, 5), (2, 6);
+-- run
+
+alter table t_uniq add column g integer null generated always as (v * 2) unique;
+-- run
+
+select id, g from t_uniq order by id;
+→ [{"id":1,"g":10},{"id":2,"g":12}]
+
+drop table t_uniq;
+-- run
+
+create table t_uniq_bad (id integer primary key, v integer);
+insert into t_uniq_bad values (1, 5), (2, 5);
+-- run
+
+alter table t_uniq_bad add column g integer null generated always as (v * 2) unique;
+-- error: UNIQUE constraint failed
+
+-- Reverted whole: the column is gone and the rows are unchanged.
+select * from t_uniq_bad order by id;
+→ [{"id":1,"v":5},{"id":2,"v":5}]
+
+drop table t_uniq_bad;
+-- run
+
+-- ============================================================
+-- 12. A generated column whose name is already taken is a DUPLICATE, not a cycle
+--
+-- The self-reference rejection in section 8 must not swallow this: `v` here resolves
+-- to the existing sibling, and the real problem is that the table already has a `v`.
+-- ============================================================
+
+create table t_dup (id integer primary key, v integer);
+insert into t_dup values (1, 5);
+-- run
+
+alter table t_dup add column v integer null generated always as (v * 2);
+-- error: Column 'v' already exists in table 't_dup'
+
+alter table t_dup add column v integer null generated always as (id + 1);
+-- error: Column 'v' already exists in table 't_dup'
+
+select * from t_dup order by id;
+→ [{"id":1,"v":5}]
+
+drop table t_dup;
+-- run
+
+-- ============================================================
+-- 13. The added column is a first-class generated column afterwards
+--
+-- Backfilling is only half the job: the ALTER must also register the column in the
+-- table's generated-column graph, so UPDATEing a source column recomputes it and
+-- writing to it directly is refused — exactly as for a CREATE TABLE-declared one.
+-- ============================================================
+
+create table t_after (id integer primary key, v integer);
+insert into t_after values (1, 5);
+-- run
+
+alter table t_after add column g integer null generated always as (v * 2);
+-- run
+
+update t_after set v = 20 where id = 1;
+-- run
+
+select id, v, g from t_after order by id;
+→ [{"id":1,"v":20,"g":40}]
+
+update t_after set g = 1 where id = 1;
+-- error: Cannot UPDATE generated column 'g'
+
+insert into t_after (id, v, g) values (2, 3, 99);
+-- error: Cannot INSERT into generated column 'g'
+
+select id, v, g from t_after order by id;
+→ [{"id":1,"v":20,"g":40}]
+
+drop table t_after;
+-- run
