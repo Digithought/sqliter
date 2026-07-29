@@ -45,7 +45,7 @@ export type StreamingWindowFunctionMode =
 		/** Underlying aggregate / value function name (lower-case). */
 		name: 'sum' | 'count' | 'avg' | 'min' | 'max' | 'first_value' | 'last_value';
 		frameMode: 'rows' | 'range';
-		/** Non-negative integer literal for ROWS; non-negative numeric literal for RANGE. */
+		/** Non-negative integer literal, in both frame modes. `CURRENT ROW` is 0. */
 		preceding: number;
 		/** Same constraints as preceding. */
 		following: number;

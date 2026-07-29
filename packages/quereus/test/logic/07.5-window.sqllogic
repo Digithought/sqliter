@@ -727,6 +727,22 @@ SELECT id, val, SUM(val) OVER (ORDER BY val RANGE BETWEEN 5 PRECEDING AND 5 FOLL
 FROM range_null ORDER BY id;
 → [{"id":1,"val":null,"s":null},{"id":2,"val":null,"s":null},{"id":3,"val":10,"s":10},{"id":4,"val":20,"s":20},{"id":5,"val":30,"s":30}]
 
+-- Same, with an interval that reaches down to zero. NULL is not zero: the two
+-- NULL rows must still stay out of val=10's frame. (Regression — the buffered
+-- frame walk read the ORDER BY value with a bare `Number(...)`, which turns
+-- NULL into 0 and pulled both NULL rows in.)
+-- val=NULL (id=1,2): the NULL peer group → no non-null vals → SUM=NULL.
+-- val=10: [0,10] → 10.  val=20: [10,20] → 30.  val=30: [20,30] → 50.
+SELECT id, val, SUM(val) OVER (ORDER BY val RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS s
+FROM range_null ORDER BY id;
+→ [{"id":1,"val":null,"s":null},{"id":2,"val":null,"s":null},{"id":3,"val":10,"s":10},{"id":4,"val":20,"s":30},{"id":5,"val":30,"s":50}]
+
+-- A fractional RANGE offset is not a supported frame offset on either physical
+-- path — it must raise, not quietly depend on which plan the optimizer picks.
+SELECT val, SUM(val) OVER (ORDER BY val RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s
+FROM range_null ORDER BY val, id;
+-- error: Invalid window frame offset
+
 DROP TABLE range_slide;
 DROP TABLE range_null;
 

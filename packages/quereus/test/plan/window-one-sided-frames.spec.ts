@@ -45,6 +45,13 @@ describe('Window one-sided sliding frames', () => {
 		await db.exec('create table rtext (id integer primary key, kt text, v integer)');
 		await db.exec('create index rtext_kt on rtext (kt)');
 		await db.exec("insert into rtext values (1,'a',1),(2,'a',2),(3,'b',4),(4,'c',8)");
+		// A nullable numeric ordering key, indexed. NULLs sort first and are peers
+		// of each other, but they are outside every finite row's RANGE interval —
+		// including one whose interval spans zero, where a `Number(null) === 0`
+		// coercion would silently pull them in.
+		await db.exec('create table rnull (id integer primary key, k integer null, v integer)');
+		await db.exec('create index rnull_k on rnull (k)');
+		await db.exec('insert into rnull values (1,null,1),(2,null,2),(3,10,4),(4,20,8),(5,20,16),(6,30,32)');
 		// Partitioned fixture.
 		await db.exec('create table p (id integer primary key, g text, v integer)');
 		await db.exec("insert into p values (1,'A',10),(2,'A',20),(3,'A',30),(4,'B',40),(5,'B',50)");
@@ -85,6 +92,16 @@ describe('Window one-sided sliding frames', () => {
 		const buffered = await allRows(bufferedDb, sql);
 		expect(streamed, `streaming vs buffered disagree for: ${sql}`).to.deep.equal(buffered);
 		return streamed;
+	}
+
+	/** Message of the error `sql` raises, or `''` if it unexpectedly succeeds. */
+	async function errorOf(db: Database, sql: string): Promise<string> {
+		try {
+			await allRows(db, sql);
+			return '';
+		} catch (e) {
+			return (e as Error).message;
+		}
 	}
 
 	/**
@@ -198,6 +215,11 @@ describe('Window one-sided sliding frames', () => {
 		});
 	});
 
+	// NOTE: these cases stream only because the optimizer picks the `r_k` / `rnull_k`
+	// index scan for `order by k`. A cost-model change that prefers a different access
+	// path would drop them to the buffered walk, and `expectStreamingModes` would fail
+	// pointing at the window rule — the frame recognition, not the plan choice, is what
+	// it looks like it is accusing. Check the chosen index first.
 	describe('RANGE mode with peer ties', () => {
 		// k = 10, 10, 20, 25, 40 — the two k=10 rows are peers, so `CURRENT ROW`
 		// must cover both of them at either edge of the frame.
@@ -259,6 +281,39 @@ describe('Window one-sided sliding frames', () => {
 				expect(await windowModes(streamingDb, sql), sql).to.deep.equal([null]);
 				await bothShapes(sql);
 			}
+		});
+
+		it('a NULL ordering key stays outside every finite row\'s interval', async () => {
+			// Regression: the buffered walk read the ORDER BY value with a bare
+			// `Number(...)`, so a NULL key became 0 and fell inside any interval
+			// reaching down to zero — `k=10` with `10 preceding` summed the two
+			// NULL-keyed rows in, while the streaming scan (NULL ⇒ NaN) did not.
+			const sql = 'select k, sum(v) over (order by k range between 10 preceding and current row) as s'
+				+ ' from rnull order by k, id';
+			await expectStreamingModes(sql, [['slidingAgg']]);
+			expect(await bothShapes(sql)).to.deep.equal([
+				// The NULL peer group sees only itself, and v is 1 and 2 there.
+				{ k: null, s: 3 },
+				{ k: null, s: 3 },
+				{ k: 10, s: 4 },              // [0,10] → 4, NOT 4+1+2
+				{ k: 20, s: 28 },             // [10,20] → 4+8+16
+				{ k: 20, s: 28 },
+				{ k: 30, s: 56 },             // [20,30] → 8+16+32
+			]);
+		});
+
+		it('a NULL ordering key is its own peer group under CURRENT ROW', async () => {
+			const sql = 'select k, count(*) over (order by k range between current row and current row) as c'
+				+ ' from rnull order by k, id';
+			await expectStreamingModes(sql, [['slidingAgg']]);
+			expect(await bothShapes(sql)).to.deep.equal([
+				{ k: null, c: 2 },
+				{ k: null, c: 2 },
+				{ k: 10, c: 1 },
+				{ k: 20, c: 2 },
+				{ k: 20, c: 2 },
+				{ k: 30, c: 1 },
+			]);
 		});
 
 		it('the start-only spelling RANGE n PRECEDING means the same frame', async () => {
@@ -365,6 +420,24 @@ describe('Window one-sided sliding frames', () => {
 			for (const sql of buffered) {
 				expect(await windowModes(streamingDb, sql), sql).to.deep.equal([null]);
 				expect(await bothShapes(sql), sql).to.deep.equal(await allRows(bufferedDb, sql));
+			}
+		});
+
+		it('a fractional RANGE offset raises on both shapes rather than one', async () => {
+			// The buffered frame walk rejects any offset that is not a non-negative
+			// integer. If the rule recognized fractional RANGE offsets, the very
+			// same query would return rows on a table with a usable index and raise
+			// on one without — so the rule must decline them too.
+			for (const bounds of [
+				'between 1.5 preceding and current row',
+				'between current row and 0.5 following',
+				'between 5.5 preceding and 0.5 following',
+			]) {
+				const sql = `select k, sum(v) over (order by k range ${bounds}) as s from r order by k, id`;
+				expect(await windowModes(streamingDb, sql), sql).to.deep.equal([null]);
+				for (const db of [streamingDb, bufferedDb]) {
+					expect(await errorOf(db, sql), sql).to.match(/Invalid window frame offset/);
+				}
 			}
 		});
 	});

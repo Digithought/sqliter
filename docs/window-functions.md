@@ -119,6 +119,15 @@ SELECT date, price,
 FROM products;
 ```
 
+Frame offsets must be non-negative **integer** literals, in `RANGE` as well as
+`ROWS`; anything else (a fraction, a parameter, an expression) raises
+`Invalid window frame offset`.
+
+In `RANGE` mode, a row whose ORDER BY value is NULL has no position on the
+numeric line, so its frame is its peer group — every other NULL-keyed row, and
+nothing else. Symmetrically, NULL-keyed rows never fall inside a non-NULL row's
+`[v - n, v + m]` interval, not even one that spans zero.
+
 ### Navigation Functions
 
 ```sql
@@ -208,7 +217,7 @@ WindowNode are individually recognized):
 | `LAG`, `LEAD` | yes | offset must be a non-negative integer literal |
 | `FIRST_VALUE`, `LAST_VALUE` | yes | LAST_VALUE only under default frame; both also stream under sliding frames (see below) |
 | Running `SUM`, `COUNT`, `AVG`, `MIN`, `MAX` | yes | default frame (`UNBOUNDED PRECEDING TO CURRENT ROW`, ROWS or RANGE) |
-| Sliding `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE` | yes | `ROWS BETWEEN n PRECEDING AND m FOLLOWING` (literal `n,m ≥ 0`) or `RANGE BETWEEN <num> PRECEDING AND <num> FOLLOWING` (single numeric ORDER BY key, literal non-negative offsets) |
+| Sliding `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE` | yes | `ROWS BETWEEN n PRECEDING AND m FOLLOWING`, or `RANGE BETWEEN n PRECEDING AND m FOLLOWING` over a single numeric ORDER BY key. `n` and `m` must be non-negative **integer** literals in both modes — that is the whole set of offsets Quereus accepts anywhere (a fractional RANGE offset raises `Invalid window frame offset`) |
 | One-sided sliding (`n PRECEDING AND CURRENT ROW`, `CURRENT ROW AND m FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) | yes | `CURRENT ROW` is the offset-zero case of the bound it replaces, so these run the same sliding state machine. The start-only spellings (`ROWS n PRECEDING`, `RANGE n PRECEDING`, `ROWS CURRENT ROW`) mean `... AND CURRENT ROW` and stream too |
 | `NTILE`, `PERCENT_RANK`, `CUME_DIST` | no | need partition size up-front |
 | Unbounded-on-one-side sliding (`UNBOUNDED PRECEDING AND m FOLLOWING`, `n PRECEDING AND UNBOUNDED FOLLOWING`) | no | future work — no bounded buffer |
@@ -239,6 +248,17 @@ WindowNode are individually recognized):
   type arithmetic applies to. The buffered walk falls back to peer-group
   scanning for a non-numeric key and the streaming scan does not, so the rule
   leaves that case buffered rather than answer differently.
+- A frame offset that is not a non-negative *integer* literal. The buffered
+  frame walk raises `Invalid window frame offset` for those, so recognizing a
+  wider set here would make the query's success depend on the chosen plan.
+
+**Both paths must return the same rows.** A shape the rule recognizes runs a
+different piece of code from the same shape with the rule disabled, so any
+divergence is a bug in one of them, not a licensed difference. Two rules of
+thumb keep them aligned: never recognize an offset the buffered walk rejects
+(above), and treat a NULL ORDER BY key as *outside* every finite interval —
+`NULL` is not zero, on either path. `test/plan/window-one-sided-frames.spec.ts`
+runs every case on both shapes and deep-compares.
 
 ### Sliding-frame state machine
 

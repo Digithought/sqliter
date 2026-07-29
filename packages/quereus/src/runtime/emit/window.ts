@@ -606,14 +606,14 @@ function getFrameBounds(
 	} else if (frame.start.type === 'preceding') {
 		const offset = getFrameOffset(frame.start.value);
 		if (isRange) {
-			start = findRangeOffsetStart(currentIndex, totalRows, orderByValues, -offset);
+			start = rangeOffsetStart(currentIndex, totalRows, orderByValues, equalityComparators, -offset);
 		} else {
 			start = currentIndex - offset;
 		}
 	} else if (frame.start.type === 'following') {
 		const offset = getFrameOffset(frame.start.value);
 		if (isRange) {
-			start = findRangeOffsetStart(currentIndex, totalRows, orderByValues, offset);
+			start = rangeOffsetStart(currentIndex, totalRows, orderByValues, equalityComparators, offset);
 		} else {
 			start = currentIndex + offset;
 		}
@@ -636,14 +636,14 @@ function getFrameBounds(
 	} else if (frame.end.type === 'preceding') {
 		const offset = getFrameOffset(frame.end.value);
 		if (isRange) {
-			end = findRangeOffsetEnd(currentIndex, totalRows, orderByValues, -offset);
+			end = rangeOffsetEnd(currentIndex, totalRows, orderByValues, equalityComparators, -offset);
 		} else {
 			end = currentIndex - offset;
 		}
 	} else if (frame.end.type === 'following') {
 		const offset = getFrameOffset(frame.end.value);
 		if (isRange) {
-			end = findRangeOffsetEnd(currentIndex, totalRows, orderByValues, offset);
+			end = rangeOffsetEnd(currentIndex, totalRows, orderByValues, equalityComparators, offset);
 		} else {
 			end = currentIndex + offset;
 		}
@@ -710,23 +710,40 @@ function arePeerRows(
 }
 
 /**
- * For RANGE N PRECEDING/FOLLOWING: find the first row whose ORDER BY value
- * is >= (currentValue + offset). Uses the first ORDER BY expression only
- * (SQL standard requires single ORDER BY for numeric RANGE offsets).
+ * Numeric form of an ORDER BY value for RANGE offset arithmetic. SQL NULL must
+ * become NaN, not `Number(null) === 0` — a NULL-keyed row is outside every
+ * finite-valued row's `[v - n, v + m]` interval, and coercing it to zero would
+ * silently pull the NULL rows into any frame whose interval happens to span
+ * zero. Mirrors the streaming emitter's `orderByVal0Num`, so both paths agree.
  */
-function findRangeOffsetStart(
+function rangeOrdinal(value: SqlValue): number {
+	return value === null ? NaN : Number(value);
+}
+
+/**
+ * RANGE `n PRECEDING` / `n FOLLOWING` start bound. A row whose ordering key has
+ * no place on the numeric line — SQL NULL above all — is not `offset` away from
+ * anything, so its frame is its peer group, exactly the reading `CURRENT ROW`
+ * gets. The streaming emitter's non-finite peer span is the same rule; the two
+ * paths must not answer differently for the same frame.
+ */
+function rangeOffsetStart(
 	currentIndex: number,
 	totalRows: number,
 	orderByValues: SqlValue[][],
+	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
 	offset: number // negative for PRECEDING, positive for FOLLOWING
 ): number {
-	const currentVal = Number(orderByValues[currentIndex][0]);
-	if (!Number.isFinite(currentVal)) return currentIndex;
-	const targetVal = currentVal + offset;
+	const currentVal = rangeOrdinal(orderByValues[currentIndex][0]);
+	if (!Number.isFinite(currentVal)) {
+		return findFirstPeer(currentIndex, totalRows, orderByValues, equalityComparators);
+	}
 
-	// Scan from beginning to find first row >= targetVal
+	// First row whose ordering value is >= the target. Uses the first ORDER BY
+	// expression only (a numeric RANGE offset requires a single sort key).
+	const targetVal = currentVal + offset;
 	for (let i = 0; i < totalRows; i++) {
-		const rowVal = Number(orderByValues[i][0]);
+		const rowVal = rangeOrdinal(orderByValues[i][0]);
 		if (Number.isFinite(rowVal) && rowVal >= targetVal) {
 			return i;
 		}
@@ -734,23 +751,24 @@ function findRangeOffsetStart(
 	return totalRows; // No matching row (empty frame start)
 }
 
-/**
- * For RANGE N PRECEDING/FOLLOWING: find the last row whose ORDER BY value
- * is <= (currentValue + offset).
- */
-function findRangeOffsetEnd(
+/** End-bound counterpart of {@link rangeOffsetStart}: last row whose ordering
+ *  value is <= (currentValue + offset), or the peer group's last row when the
+ *  current row's key is non-finite. */
+function rangeOffsetEnd(
 	currentIndex: number,
 	totalRows: number,
 	orderByValues: SqlValue[][],
+	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
 	offset: number
 ): number {
-	const currentVal = Number(orderByValues[currentIndex][0]);
-	if (!Number.isFinite(currentVal)) return currentIndex;
-	const targetVal = currentVal + offset;
+	const currentVal = rangeOrdinal(orderByValues[currentIndex][0]);
+	if (!Number.isFinite(currentVal)) {
+		return findLastPeer(currentIndex, totalRows, orderByValues, equalityComparators);
+	}
 
-	// Scan from end to find last row <= targetVal
+	const targetVal = currentVal + offset;
 	for (let i = totalRows - 1; i >= 0; i--) {
-		const rowVal = Number(orderByValues[i][0]);
+		const rowVal = rangeOrdinal(orderByValues[i][0]);
 		if (Number.isFinite(rowVal) && rowVal <= targetVal) {
 			return i;
 		}
