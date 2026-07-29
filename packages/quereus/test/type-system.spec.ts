@@ -33,9 +33,11 @@ import {
 	parseValue,
 	validateAndParse,
 	coerceRowToSchema,
+	foldDefaultToType,
 	isValidForType,
 	tryParse,
 } from '../src/types/validation.js';
+import type * as AST from '../src/parser/ast.js';
 import { createDefaultColumnSchema } from '../src/schema/column.js';
 import type { ColumnSchema } from '../src/schema/column.js';
 import { QuereusError } from '../src/common/errors.js';
@@ -561,6 +563,48 @@ describe('Type System', () => {
 		it('should surface the offending column name when a cell fails validation', () => {
 			expect(() => coerceRowToSchema(['ok', 'abc'], columns(TEXT_TYPE, INTEGER_TYPE), 't'))
 				.to.throw(/c1/);
+		});
+	});
+
+	// ──────────────────── foldDefaultToType ────────────────────
+	// The shared fold+convert every ALTER backfill site uses, so a backfilled cell
+	// holds what a fresh INSERT under the same DEFAULT would store.
+	describe('foldDefaultToType', () => {
+		const lit = (value: AST.LiteralExpr['value']): AST.Expression => ({ type: 'literal', value });
+		const neg = (expr: AST.Expression): AST.Expression => ({ type: 'unary', operator: '-', expr });
+		const col = (name: string): AST.Expression => ({ type: 'column', name, table: 'new' });
+
+		it('should return undefined for a missing default', () => {
+			expect(foldDefaultToType(undefined, INTEGER_TYPE, 'n')).to.equal(undefined);
+			expect(foldDefaultToType(null, INTEGER_TYPE, 'n')).to.equal(undefined);
+		});
+
+		it('should return undefined for a non-foldable expression', () => {
+			// `new.<col>` — the caller's per-row evaluator path owns this case.
+			expect(foldDefaultToType(col('b'), INTEGER_TYPE, 'n')).to.equal(undefined);
+		});
+
+		it('should return null for a default that folds to NULL', () => {
+			expect(foldDefaultToType(lit(null), INTEGER_TYPE, 'n')).to.equal(null);
+		});
+
+		it('should convert a text literal to the column type', () => {
+			expect(foldDefaultToType(lit('7'), INTEGER_TYPE, 'n')).to.equal(7);
+		});
+
+		it('should parse a JSON source literal into its stored form', () => {
+			// The raw source text '"abc"' is NOT the stored form any write path produces.
+			expect(foldDefaultToType(lit('"abc"'), JSON_TYPE, 'n')).to.equal('abc');
+		});
+
+		it('should fold a signed numeric literal (a UnaryExpr, not a bare literal)', () => {
+			expect(foldDefaultToType(neg(lit(123.0)), REAL_TYPE, 'n')).to.equal(-123);
+		});
+
+		it('should throw MISMATCH naming the column when the literal cannot be converted', () => {
+			expect(() => foldDefaultToType(lit('abc'), INTEGER_TYPE, 'n'))
+				.to.throw(QuereusError, "Type conversion failed for column 'n'")
+				.with.property('code', StatusCode.MISMATCH);
 		});
 	});
 

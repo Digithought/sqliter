@@ -23,6 +23,7 @@ import {
 	QuereusError,
 	StatusCode,
 	buildColumnIndexMap,
+	foldDefaultToType,
 	inferType,
 	validateAndParse,
 	validateCollationForType,
@@ -294,12 +295,12 @@ async function alterColumnSetNotNull(
 	let newCol: ColumnSchema;
 	let valueConvert: ((v: SqlValue) => SqlValue) | undefined;
 	if (change.setNotNull === true && !oldCol.notNull) {
-		// Backfill NULLs from a literal DEFAULT, or throw.
-		let defaultLiteral: SqlValue | undefined;
-		const expr = oldCol.defaultValue;
-		if (expr && (expr as { type?: string }).type === 'literal') {
-			defaultLiteral = (expr as { value?: SqlValue }).value ?? null;
-		}
+		// Backfill NULLs from a literal DEFAULT, or throw. Routed through the shared
+		// `foldDefaultToType` so (a) a signed numeric default (`default -5`, a UnaryExpr)
+		// is recognized here exactly as the memory module recognizes it, and (b) the
+		// literal is converted to the column's declared type, so a backfilled cell matches
+		// what an INSERT under the same DEFAULT would store.
+		const defaultLiteral = foldDefaultToType(oldCol.defaultValue, oldCol.logicalType, change.columnName);
 		// Decide reject-vs-backfill over the DDL transaction's EFFECTIVE rows. `rows()` (the
 		// isolation overlay) sees the issuer's pending inserts; `rowsWithNullAtIndex` (run
 		// directly, no wrapper) sees the store's own effective rows. Either way a NULL the

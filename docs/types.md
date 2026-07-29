@@ -509,6 +509,29 @@ Conversion errors surface from the emitter (for INSERT, before the row reaches
 constraint checking), but the message text is unchanged — the same
 `validateAndParse` produces it.
 
+**ALTER backfills follow the same rule.** `alter table … add column … default <x>`
+and `alter column … set not null` write existing rows outside the DML pipeline, so
+they convert explicitly:
+
+- A DEFAULT that folds to a literal goes through `foldDefaultToType`
+  (`types/validation.ts`), which folds *and* converts to the new column's declared
+  type. Every site shares it — the memory module, `quereus-store`, the isolation
+  overlay's staged rows (which write `preCoerced: true` and so cannot pick the
+  conversion up implicitly), and the batched data-change-event remaps — so a
+  backfilled cell is indistinguishable from one a fresh INSERT under the same
+  DEFAULT would produce. No identity guard is needed here: an AST literal is always
+  raw source form. A literal that cannot convert (`add column n integer default
+  'abc'`) raises the same `MISMATCH` the equivalent INSERT raises, and does so
+  whether or not the table holds any rows, so DDL acceptance does not depend on the
+  data. Note the deliberate asymmetry with `CREATE TABLE`, which still accepts an
+  unconvertible literal DEFAULT and only fails at the first INSERT.
+- A non-foldable DEFAULT (`default (new.<col>)`) is evaluated per existing row, and
+  its result converts only when the default expression's static type is not already
+  the new column's type — the same object-identity check `buildRowCoercion` makes,
+  for the same reason (`add column k json default (new.j)` over an existing JSON
+  column must copy, not re-parse). The conversion runs before the per-row CHECK
+  predicates, matching `emitInsert`.
+
 Because every `JSON_TYPE.compare` caller is guaranteed to hold parsed values, a
 JS string reaching `compare` is unambiguously a JSON **string scalar** and is
 never re-parsed: `compare('9', 9)` ranks the number first (number < string)

@@ -263,7 +263,15 @@ function buildAddColumnBackfill(
 
   const rowDescriptor: RowDescriptor = [];
   rowAttrs.forEach((attr, index) => { rowDescriptor[attr.id] = index; });
-  return { node, rowDescriptor };
+
+  // The evaluated value has to reach storage in the new column's declared form, exactly as an
+  // INSERT's would. Skip the conversion when the default's static type already IS that type
+  // (identity comparison — the registry hands out one shared LogicalType instance per type),
+  // mirroring `buildRowCoercion`: re-converting an already-converted value is destructive for
+  // JSON. See `AddColumnBackfill.coerceTo`.
+  const newColumnType = inferType(columnDef.dataType);
+  const coerceTo = node.getType().logicalType === newColumnType ? undefined : newColumnType;
+  return { node, rowDescriptor, coerceTo };
 }
 
 /**

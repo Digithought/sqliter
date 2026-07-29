@@ -21,7 +21,7 @@ import type { ColumnSchema } from '../../../schema/column.js';
 import { scanLayer as scanLayerImpl } from './scan-layer.js';
 import { createPrimaryKeyFunctions, buildPrimaryKeyFromValues, primaryKeyArity, type PrimaryKeyFunctions } from '../utils/primary-key.js';
 import { createMemoryTableLoggers } from '../utils/logging.js';
-import { tryFoldLiteral } from '../../../parser/utils.js';
+import { foldDefaultToType } from '../../../types/validation.js';
 import { coerceRowToSchema } from '../../../types/validation.js';
 import type { VTableEventEmitter } from '../../events.js';
 import { compilePredicate } from '../utils/predicate.js';
@@ -1912,7 +1912,10 @@ export class MemoryTableManager {
 			let defaultIsLiteral = false;
 			const defaultConstraint = columnDefAst.constraints.find(c => c.type === 'default');
 			if (defaultConstraint && defaultConstraint.expr) {
-				const folded = tryFoldLiteral(defaultConstraint.expr);
+				// Fold AND convert to the new column's declared type, so the backfilled cell
+				// is the value a fresh INSERT under the same DEFAULT would store. An
+				// unconvertible literal (`integer default 'abc'`) throws MISMATCH here.
+				const folded = foldDefaultToType(defaultConstraint.expr, newColumnSchema.logicalType, newColumnSchema.name);
 				if (folded !== undefined) {
 					defaultValue = folded;
 					defaultIsLiteral = true;

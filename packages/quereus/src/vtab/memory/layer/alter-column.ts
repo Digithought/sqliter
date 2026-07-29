@@ -3,9 +3,8 @@ import type { ColumnSchema } from '../../../schema/column.js';
 import { buildColumnIndexMap, validateCollationForType, type TableSchema } from '../../../schema/table.js';
 import { StatusCode, type SqlValue } from '../../../common/types.js';
 import { QuereusError } from '../../../common/errors.js';
-import { tryFoldLiteral } from '../../../parser/utils.js';
 import { inferType } from '../../../types/registry.js';
-import { validateAndParse } from '../../../types/validation.js';
+import { foldDefaultToType, validateAndParse } from '../../../types/validation.js';
 import { comparisonSemanticsDiffer } from '../../../util/comparison.js';
 import type { Row } from '../../../common/types.js';
 
@@ -202,9 +201,17 @@ export async function planSetNotNull(ctx: AlterColumnContext, setNotNull: boolea
  */
 async function planTightenNotNull(ctx: AlterColumnContext, oldCol: ColumnSchema): Promise<ColumnAttributeChange> {
 	const newCol: ColumnSchema = { ...oldCol, notNull: true };
+
+	// Fold AND convert to the column's declared type, so a backfilled cell matches what an
+	// INSERT under the same DEFAULT would store. Folded BEFORE the NULL scan so an
+	// unconvertible literal (`integer default 'abc'`) rejects the ALTER with MISMATCH
+	// uniformly, rather than only when the table happens to hold a NULL — the same
+	// "acceptance must not depend on the rows" rule the ADD COLUMN arm follows, and the
+	// same point the store leg and the isolation overlay fold at.
+	const defaultLiteral = foldDefaultToType(oldCol.defaultValue, oldCol.logicalType, ctx.columnName);
+
 	if (!await hasNullValue(ctx)) return metadataOnly(newCol);
 
-	const defaultLiteral = oldCol.defaultValue ? tryFoldLiteral(oldCol.defaultValue) : undefined;
 	if (defaultLiteral === undefined || defaultLiteral === null) {
 		throw new QuereusError(`column ${ctx.columnName} contains NULL values`, StatusCode.CONSTRAINT);
 	}

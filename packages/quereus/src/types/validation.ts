@@ -3,6 +3,8 @@ import { StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 import type { LogicalType } from './logical-type.js';
 import type { ColumnSchema } from '../schema/column.js';
+import type { Expression } from '../parser/ast.js';
+import { tryFoldLiteral } from '../parser/utils.js';
 
 /**
  * Validate a value against a logical type.
@@ -155,6 +157,34 @@ export function buildRowCoercion(
 		}
 		return out;
 	};
+}
+
+/**
+ * Fold a DEFAULT expression to a literal AND convert it to the column's declared
+ * logical type — the value a fresh INSERT under the same DEFAULT would store. Every
+ * ALTER backfill site (ADD COLUMN literal default, SET NOT NULL backfill, and their
+ * event-image remaps, across the memory module, the store module and the isolation
+ * overlay) goes through here, so a backfilled cell is indistinguishable from an
+ * inserted one and the sites cannot drift apart.
+ *
+ * Returns `undefined` when the expression does not fold to a literal (the caller's
+ * per-row evaluator path owns that case) and `null` when it folds to NULL. An AST
+ * literal is always raw source form (a TEXT literal `'"abc"'`, never an already-parsed
+ * JSON value), so unlike {@link buildRowCoercion} this needs no identity guard — the
+ * conversion is always the first one applied to the value.
+ *
+ * @throws QuereusError (MISMATCH) when the literal cannot be converted, carrying the
+ *   same message text the INSERT path produces.
+ */
+export function foldDefaultToType(
+	expr: Expression | null | undefined,
+	logicalType: LogicalType,
+	columnName: string,
+): SqlValue | undefined {
+	if (!expr) return undefined;
+	const folded = tryFoldLiteral(expr);
+	if (folded === undefined) return undefined;
+	return validateAndParse(folded, logicalType, columnName);
 }
 
 /**

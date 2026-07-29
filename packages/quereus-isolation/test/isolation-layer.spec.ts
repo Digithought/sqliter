@@ -2063,6 +2063,45 @@ describe('IsolationModule', () => {
 			expect(rows.map((r: any) => [r.id, r.v, r.w]), "w backfilled from the staged row's own v").to.deep.equal([[1, 'a', 'a']]);
 		});
 
+		it('ADD COLUMN converts the literal DEFAULT for staged rows, before and after commit', async () => {
+			// bug-add-column-default-not-coerced: the overlay writes its staged rows with
+			// `preCoerced: true`, so it can never pick the declared-type conversion up
+			// implicitly. Without the explicit fold+convert the staged row held the raw text
+			// '7' where the committed store held the integer 7 — an overlay/store divergence.
+			await db.exec(`CREATE TABLE asp_coerce (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO asp_coerce VALUES (0, 'committed')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO asp_coerce VALUES (1, 'staged')`);
+			await db.exec(`ALTER TABLE asp_coerce ADD COLUMN n INTEGER DEFAULT '7'`);
+
+			// Read back through the overlay, before commit.
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, n, typeof(n) AS t FROM asp_coerce ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.n, r.t]), 'staged and committed rows agree on the CONVERTED value')
+				.to.deep.equal([[0, 7, 'integer'], [1, 7, 'integer']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, n, typeof(n) AS t FROM asp_coerce ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.n, r.t]), 'and still agree once the overlay merged into the store')
+				.to.deep.equal([[0, 7, 'integer'], [1, 7, 'integer']]);
+		});
+
+		it('SET NOT NULL converts the literal DEFAULT when backfilling a staged NULL', async () => {
+			await db.exec(`CREATE TABLE asp_nn_coerce (id INTEGER PRIMARY KEY, n INTEGER NULL DEFAULT '5') USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO asp_nn_coerce VALUES (1, NULL)`);
+			await db.exec(`ALTER TABLE asp_nn_coerce ALTER COLUMN n SET NOT NULL`);
+
+			let rows = await asyncIterableToArray(db.eval(`SELECT id, n, typeof(n) AS t FROM asp_nn_coerce ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.n, r.t]), 'staged NULL filled with the CONVERTED default')
+				.to.deep.equal([[1, 5, 'integer']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT id, n, typeof(n) AS t FROM asp_nn_coerce ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.n, r.t])).to.deep.equal([[1, 5, 'integer']]);
+		});
+
 		it('DROP COLUMN (middle) keeps pre-savepoint rows, discards post-savepoint ones, and realigns values', async () => {
 			// The committed row also pins the underlying side: the forwarded BEGIN/SAVEPOINT
 			// leave the underlying connection holding a LAZY savepoint marker (no own writes —

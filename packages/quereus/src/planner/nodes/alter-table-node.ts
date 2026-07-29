@@ -4,6 +4,7 @@ import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
+import type { LogicalType } from '../../types/logical-type.js';
 
 /**
  * The per-row backfill of an ADD COLUMN whose DEFAULT does not fold to a literal
@@ -16,6 +17,17 @@ import type { SqlValue } from '../../common/types.js';
 export interface AddColumnBackfill {
 	readonly node: ScalarPlanNode;
 	readonly rowDescriptor: RowDescriptor;
+	/**
+	 * The new column's logical type, applied to each evaluated value so a backfilled cell
+	 * matches what an INSERT under the same DEFAULT would store. Undefined when the default
+	 * expression's static type already IS that type — conversion is skipped there, exactly as
+	 * {@link import('../../types/validation.js').buildRowCoercion} skips an identity match,
+	 * because re-converting is destructive for some types: JSON's `parse` reads a plain JS
+	 * string as JSON *source*, so re-parsing an already-stored JSON value either changes it
+	 * (stored text `9` becomes the number 9) or throws (stored text `abc` is not valid JSON).
+	 * `add column k json default (new.j)` over an existing `json` column is exactly that case.
+	 */
+	readonly coerceTo?: LogicalType;
 }
 
 /**

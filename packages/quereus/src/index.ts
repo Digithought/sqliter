@@ -175,6 +175,7 @@ export {
 	parseValue,
 	validateAndParse,
 	coerceRowToSchema,
+	foldDefaultToType,
 	isValidForType,
 	tryParse
 } from './types/validation.js';

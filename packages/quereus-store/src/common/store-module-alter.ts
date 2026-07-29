@@ -26,11 +26,11 @@ import {
 	buildForeignKeyConstraintSchema,
 	buildUniqueConstraintSchema,
 	columnDefToSchema,
+	foldDefaultToType,
 	renameColumnInCheckConstraints,
 	renameColumnInIndexPredicates,
 	resolveNamedConstraintClass,
 	shiftSchemaIndicesForDrop,
-	tryFoldLiteral,
 	validateForeignKeyOverExistingRows,
 } from '@quereus/quereus';
 import { StoreTable } from './store-table.js';
@@ -151,13 +151,15 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'), (n) => db.isCollationRegistered(n));
 
 		// Extract default value from column def constraints. Use the shared
-		// `tryFoldLiteral` helper so signed numerics like `-123.0`
-		// (a UnaryExpr in the AST) are recognized — matching the
-		// memory-mode path and the engine-level ALTER validation.
+		// `foldDefaultToType` helper so signed numerics like `-123.0`
+		// (a UnaryExpr in the AST) are recognized AND the folded literal is converted
+		// to the new column's declared type — matching the memory-mode path, the
+		// isolation overlay, and what a fresh INSERT under the same DEFAULT stores.
+		// An unconvertible literal (`integer default 'abc'`) throws MISMATCH here.
 		let defaultValue: SqlValue = null;
 		const defaultConstraint = change.columnDef.constraints?.find(c => c.type === 'default');
 		if (defaultConstraint?.expr) {
-			const folded = tryFoldLiteral(defaultConstraint.expr);
+			const folded = foldDefaultToType(defaultConstraint.expr, newColSchema.logicalType, newColSchema.name);
 			if (folded !== undefined) {
 				defaultValue = folded;
 			}

@@ -19,10 +19,9 @@ import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
-import { tryFoldLiteral } from '../../parser/utils.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
-import { validateAndParse } from '../../types/validation.js';
+import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
 	snapshotStaleMaterializedViews,
 	propagateTableRenameToMaterializedViews,
@@ -437,10 +436,13 @@ async function runAddColumn(
 	// and, when it does not fold to a literal, compiled into `backfill` — the default
 	// evaluated against the existing row, so `new.<column>` reads that row's sibling.
 	const defaultConstraint = columnDef.constraints?.find(c => c.type === 'default');
-	// Folded literal default; undefined when there is no default or it does not fold
+	// Folded literal default, converted to the new column's declared type — the value a
+	// fresh INSERT under the same DEFAULT would store, and the same value each module
+	// folds for its own rows. Undefined when there is no default or it does not fold
 	// (the latter carries `backfill` instead). Used by the NOT NULL gate below and by
-	// the batched-event remap's backfill value.
-	const foldedDefault = defaultConstraint?.expr ? tryFoldLiteral(defaultConstraint.expr) : undefined;
+	// the batched-event remap's backfill value. An unconvertible literal
+	// (`integer default 'abc'`) throws MISMATCH here, before anything is mutated.
+	const foldedDefault = foldDefaultToType(defaultConstraint?.expr, inferType(columnDef.dataType), columnDef.name);
 
 	// Call module.alterTable for data + schema update
 	const module = requireVtabModule(tableSchema);
@@ -505,7 +507,15 @@ async function runAddColumn(
 		? async (row: Row): Promise<SqlValue> => {
 			rowSlot.set(row);
 			const valueRaw = backfillCb(rctx);
-			const value = (valueRaw instanceof Promise ? await valueRaw : valueRaw) as SqlValue;
+			const evaluated = (valueRaw instanceof Promise ? await valueRaw : valueRaw) as SqlValue;
+			// Convert to the new column's declared type BEFORE the CHECK predicates see it,
+			// matching the write path (`emitInsert` coerces at the top of the DML pipeline, so
+			// constraint checking and storage both see the declared form). `coerceTo` is unset
+			// when the default's static type already IS the column's type — see
+			// `AddColumnBackfill.coerceTo` for why re-converting there would be destructive.
+			const value = backfill.coerceTo
+				? validateAndParse(evaluated, backfill.coerceTo, columnDef.name)
+				: evaluated;
 			if (checkSlot && checkPredicates.length > 0 && checkCbs) {
 				checkSlot.set([...row, value]);
 				for (let i = 0; i < checkPredicates.length; i++) {
@@ -1248,11 +1258,17 @@ function alterColumnEventValueRemap(
 		};
 	}
 	if (action.setNotNull === true) {
-		// SET NOT NULL backfill: null → the folded literal DEFAULT, the same map the
-		// module applies. No usable literal default means the module either found no
-		// NULLs (nothing to remap) or rejected the ALTER before reaching here.
-		const defaultExpr = tableSchema.columns[colIndex].defaultValue;
-		const folded = defaultExpr ? tryFoldLiteral(defaultExpr) : undefined;
+		// SET NOT NULL backfill: null → the folded-and-CONVERTED literal DEFAULT, the same
+		// map the module applies to its rows. No usable literal default means the module
+		// either found no NULLs (nothing to remap) or rejected the ALTER before reaching here.
+		//
+		// NOTE: `foldDefaultToType` throws MISMATCH on an unconvertible literal, and this
+		// runs AFTER the module mutated. Unreachable today — every module folds the same
+		// DEFAULT through the same helper up front and rejects the ALTER there, so a literal
+		// that fails here would already have failed. If a module ever stops folding eagerly,
+		// catch here and return undefined rather than aborting a completed ALTER.
+		const col = tableSchema.columns[colIndex];
+		const folded = foldDefaultToType(col.defaultValue, col.logicalType, col.name);
 		if (folded === undefined || folded === null) return undefined;
 		return (v) => (v === null ? folded : v);
 	}

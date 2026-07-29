@@ -1,5 +1,5 @@
 import type { Database, TableSchema, SchemaChangeInfo, Row, SqlValue, VirtualTable, UpdateResult } from '@quereus/quereus';
-import { QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema, isConstraintViolation, inferType, validateAndParse, validateCollationForType, formatKeyValue } from '@quereus/quereus';
+import { QuereusError, StatusCode, foldDefaultToType, columnDefToSchema, isConstraintViolation, inferType, validateAndParse, validateCollationForType, formatKeyValue } from '@quereus/quereus';
 import type { ConnectionOverlayState, Predicate } from './isolation-types.js';
 import { makeFullScanFilterInfo } from './filter-info.js';
 import { makePkKeySerializer } from './overlay-rows.js';
@@ -273,15 +273,19 @@ function deriveAddColumnBackfill(
 ): AddColumnBackfillContext | undefined {
 	if (change.type !== 'addColumn') return undefined;
 	const defaultExpr = change.columnDef.constraints?.find(c => c.type === 'default')?.expr;
-	// tryFoldLiteral returns undefined for a non-foldable expr and null for one that
-	// folds to NULL; collapse both to null (the no-usable-literal default).
-	const foldedDefault: SqlValue = defaultExpr ? (tryFoldLiteral(defaultExpr) ?? null) : null;
 	const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
 	// Thread the session `default_collation` for symmetry with the underlying memory/store
 	// ADD COLUMN sites. This site only reads `.notNull`/`.name` off the result (the
 	// underlying materializes the real column), so it does not affect collation here — but
 	// keeping the call signature identical avoids drift and is correct for any future reader.
 	const newColumn = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'), (n) => db.isCollationRegistered(n));
+	// foldDefaultToType returns undefined for a non-foldable expr and null for one that
+	// folds to NULL; collapse both to null (the no-usable-literal default). It also converts
+	// the literal to the new column's declared type — the staged overlay row writes with
+	// `preCoerced: true`, so it can never pick that conversion up implicitly, and without it
+	// an overlay row would hold the raw literal where the committed store holds the converted
+	// one. An unconvertible literal throws MISMATCH here, before the underlying is mutated.
+	const foldedDefault: SqlValue = foldDefaultToType(defaultExpr, newColumn.logicalType, newColumn.name) ?? null;
 	return {
 		foldedDefault,
 		evaluator: change.backfillEvaluator,
@@ -313,10 +317,16 @@ function deriveSetNotNullBackfill(
 	if (!overlaySchema) return undefined;
 	const colIndex = overlaySchema.columnIndexMap.get(change.columnName.toLowerCase());
 	if (colIndex === undefined) return undefined;
-	const defaultExpr = overlaySchema.columns[colIndex]?.defaultValue;
-	// tryFoldLiteral returns undefined for a non-foldable expr and null for one that folds to
-	// NULL; both mean "no usable literal default" — the staged NULL must reject, not backfill.
-	const folded = defaultExpr ? tryFoldLiteral(defaultExpr) : undefined;
+	const oldCol = overlaySchema.columns[colIndex];
+	if (!oldCol) return undefined;
+	// foldDefaultToType returns undefined for a non-foldable expr and null for one that folds
+	// to NULL; both mean "no usable literal default" — the staged NULL must reject, not
+	// backfill. It also converts the literal to the column's declared type, so a backfilled
+	// staged row and a backfilled committed row hold the same value (the overlay writes with
+	// `preCoerced: true` and cannot pick the conversion up implicitly). An unconvertible
+	// literal throws MISMATCH here, before the underlying is mutated — the same point both
+	// underlyings fold at.
+	const folded = foldDefaultToType(oldCol.defaultValue, oldCol.logicalType, change.columnName);
 	const hasDefault = folded !== undefined && folded !== null;
 	return {
 		colIndex,
