@@ -388,7 +388,12 @@ The store module integrates with Quereus's transaction coordinator to provide mu
 4. **Transaction Commit**: Quereus calls `commit()` on connections; the coordinator writes the batch atomically
 5. **Transaction Rollback**: The coordinator discards the pending batch; no changes are persisted
 
-**Same-key ordering within a batch**: a `WriteBatch`'s queued operations apply in the order they were queued, so when two operations target the same key, the later one wins — `put(k, a); delete(k)` leaves `k` absent, `delete(k); put(k, a)` leaves `k` set to `a`. Every backend (in-memory, LevelDB, IndexedDB, React Native LevelDB, NativeScript SQLite) honors this; it's part of the `WriteBatch` contract, covered by the shared conformance suite. `AtomicBatch` (the cross-store commit path used when a provider exposes `beginAtomicBatch`) applies the same rule per `(store, key)` pair — the coordinator replays its pending ops into one atomic batch without collapsing duplicates, so a transaction that writes then deletes the same row relies on it.
+**Same-key ordering within a batch**: a `WriteBatch`'s queued operations apply in the order they were queued, so when two operations target the same key, the later one wins — `put(k, a); delete(k)` leaves `k` absent, `delete(k); put(k, a)` leaves `k` set to `a`. Every backend (in-memory, LevelDB, IndexedDB, React Native LevelDB, NativeScript SQLite) honors this; it's part of the `WriteBatch` contract, covered by the shared conformance suite. `AtomicBatch` (the cross-store commit path used when a provider exposes `beginAtomicBatch`) applies the same rule per `(store, key)` pair — the coordinator replays its pending ops into one atomic batch without collapsing duplicates, so a transaction that writes then deletes the same row relies on it. Both persistent backends
+run the shared `runKVProviderConformance` battery (`@quereus/store/testing`) over their
+`beginAtomicBatch`, so the whole provider-level contract — cross-store commit, deferred
+visibility until `write()`, same-key ordering, `clear()`, the empty write, and `MISUSE` on
+a handle from another provider — is asserted from one place rather than per backend. A
+batch is single-use: write it once and drop it (see `AtomicBatch` in `kv-store.ts`).
 
 ### DDL that implicitly commits
 

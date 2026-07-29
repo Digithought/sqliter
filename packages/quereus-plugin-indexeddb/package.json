@@ -79,7 +79,7 @@
     "clean": "rimraf dist",
     "build": "tsc",
     "lint": "echo 'No lint configured'",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "cd ../.. && node --import ./packages/quereus-plugin-indexeddb/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-plugin-indexeddb/test/**/*.spec.ts\" --reporter min --colors"
   },
   "dependencies": {

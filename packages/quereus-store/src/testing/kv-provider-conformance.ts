@@ -24,6 +24,10 @@
  * committed op-by-op instead of in one physical write would still pass. If a backend
  * ever grows a fault-injection seam (a store that throws on the Nth physical write),
  * add a torn-write case asserting nothing from the batch is visible afterwards.
+ *
+ * Nothing here reuses a batch after `write()` either: {@link AtomicBatch} declares that
+ * unspecified (LevelDB's chained batch is closed by write, IndexedDB's resets), so pinning
+ * a behavior would be inventing contract rather than asserting it.
  */
 
 import assert from 'node:assert/strict';
@@ -123,6 +127,40 @@ export function runKVProviderConformance(name: string, makeProviderBackend: () =
 			// so a provider that mixed handles up would still commit, just to the wrong place.
 			assert.strictEqual(await indexStore.get(K1), undefined, 'data op must not reach the index store');
 			assert.strictEqual(await dataStore.get(K2), undefined, 'index op must not reach the data store');
+		});
+
+		it('queued ops are not visible until write()', async () => {
+			const dataStore = await provider.getStore('main', 't');
+			const indexStore = await provider.getIndexStore('main', 't', 'ix');
+			await dataStore.put(K1, V1);
+
+			const batch = beginBatch(provider);
+			batch.delete(dataStore, K1);
+			batch.put(indexStore, K2, V2);
+
+			// Queueing commits nothing: reads still see the pre-batch state. On a caching
+			// backend these reads also warm the cache, so the post-write reads below fail
+			// unless the commit invalidates what it touched.
+			assertBytes(await dataStore.get(K1), V1, 'queued delete must not apply before write()');
+			assert.strictEqual(await indexStore.get(K2), undefined, 'queued put must not apply before write()');
+
+			await batch.write();
+			assert.strictEqual(await dataStore.get(K1), undefined);
+			assertBytes(await indexStore.get(K2), V2);
+		});
+
+		it('a batched delete of a missing key is a no-op, not an error', async () => {
+			// The coordinator replays whatever a transaction queued; an index-maintenance
+			// delete for an entry that was never written reaches the batch verbatim.
+			const dataStore = await provider.getStore('main', 't');
+
+			const batch = beginBatch(provider);
+			batch.delete(dataStore, K1); // never written
+			batch.put(dataStore, K2, V2);
+			await batch.write();
+
+			assert.strictEqual(await dataStore.get(K1), undefined);
+			assertBytes(await dataStore.get(K2), V2);
 		});
 
 		it('a delete and a put in one batch both apply', async () => {

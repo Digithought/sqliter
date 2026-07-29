@@ -209,8 +209,9 @@ See `test/kv-conformance.spec.ts` (in-memory), and the LevelDB / IndexedDB plugi
 entry point exports `runKVProviderConformance(name, makeProviderBackend)` — the battery for
 the provider-level contract that ops queued across SEVERAL of the provider's stores commit
 in one durable, all-or-nothing physical write (multi-store commit landing only in each op's
-own store, mixed put + delete, same-key last-op-wins, `clear()` discarding, the empty
-`write()` no-op, and `MISUSE` on a store handle from a different provider):
+own store, nothing visible until `write()`, mixed put + delete, a delete of a missing key,
+same-key last-op-wins, `clear()` discarding, the empty `write()` no-op, and `MISUSE` on a
+store handle from a different provider):
 
 ```typescript
 import { runKVProviderConformance } from '@quereus/store/testing';

@@ -91,6 +91,16 @@ export interface WriteBatch {
  * so for one (store, key) pair the later op wins. The coordinator replays its
  * pending ops into one atomic batch without collapsing duplicates, so a
  * transaction that writes then deletes the same row depends on this.
+ *
+ * SINGLE USE: a batch is spent once `write()` resolves — queue one commit's ops, write
+ * once, drop it (what the coordinator does). Reuse after `write()` is deliberately
+ * unspecified and backends differ: LevelDB's chained batch is closed by `write()` and
+ * throws on any later call, while IndexedDB's merely resets its op list and keeps working.
+ *
+ * NOTE: there is also no dispose — a batch that is built and then abandoned without
+ * `write()` (only reachable today if queueing throws MISUSE, i.e. a programming error)
+ * leaks whatever the backend holds until GC. If an abandoned-batch path ever becomes
+ * ordinary, give this interface a `close()` and make both behaviors conformance-tested.
  */
 export interface AtomicBatch {
 	/** Queue a put against the given store. */

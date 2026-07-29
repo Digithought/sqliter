@@ -27,7 +27,14 @@ import { IndexedDBManager } from '../src/manager.js';
 // collision-free across the suite's many tests within one process.
 let seq = 0;
 
-/** Delete a fake-indexeddb database by name and await completion. */
+/**
+ * Delete a fake-indexeddb database by name and await completion.
+ *
+ * NOTE: no `onblocked` handler — per the IndexedDB spec a blocked delete still completes
+ * (success fires) once the remaining connections close, so rejecting there would be wrong.
+ * If teardown ever leaves a connection open for good, this settles never and the test
+ * surfaces as a Mocha hook timeout; hook `onblocked` up to a diagnostic log then.
+ */
 function deleteDatabase(dbName: string): Promise<void> {
 	return new Promise<void>((resolve, reject) => {
 		const req = indexedDB.deleteDatabase(dbName);
