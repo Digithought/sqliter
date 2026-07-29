@@ -199,10 +199,11 @@ export async function resolveImportSpecifier(moduleUrl: URL): Promise<string> {
  * True when this runtime is Node, whose ESM loader accepts only `file:` and
  * `data:` specifiers.
  *
- * Deliberately not `resolveEnvironment() === 'node'`: that treats "no `document`"
- * as Node, and a Web Worker — which is where quoomb-web loads its plugins —
- * has no `document` yet imports `https:` URLs natively. A bundler's `process`
- * shim declares no `versions.node`, so it does not trip this either.
+ * {@link resolveEnvironment} is defined in terms of this rather than "no
+ * `document`": a Web Worker — which is where quoomb-web loads its plugins —
+ * has no `document` yet is not Node, and should be treated as a browser. A
+ * bundler's `process` shim declares no `versions.node`, so it does not trip
+ * this either.
  *
  * @internal Exported for tests only — see {@link resolveEnvironment}.
  */
@@ -325,12 +326,7 @@ export async function loadPlugin(
  */
 export function resolveEnvironment(env?: 'auto' | 'browser' | 'node'): 'browser' | 'node' {
 	if (env && env !== 'auto') return env;
-	return isBrowserEnv() ? 'browser' : 'node';
-}
-
-function isBrowserEnv(): boolean {
-	return typeof globalThis !== 'undefined'
-		&& typeof (globalThis as unknown as { document?: unknown }).document !== 'undefined';
+	return isNodeRuntime() ? 'node' : 'browser';
 }
 
 /**

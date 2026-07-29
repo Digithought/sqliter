@@ -8,7 +8,7 @@
  * refuses the right input" level — nothing here reaches the network.
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import type { Database } from '@quereus/quereus';
 import { loadPlugin } from '../src/index.js';
 import { parseNpmSpec, toCdnUrl, resolveEnvironment } from '../src/plugin-loader.js';
@@ -125,7 +125,7 @@ describe('toCdnUrl', () => {
 
 describe('resolveEnvironment', () => {
 	afterEach(() => {
-		delete (globalThis as unknown as { document?: unknown }).document;
+		vi.unstubAllGlobals();
 	});
 
 	it('honours an explicit environment', () => {
@@ -133,20 +133,30 @@ describe('resolveEnvironment', () => {
 		expect(resolveEnvironment('browser')).toBe('browser');
 	});
 
-	it('auto-detects Node when there is no document global', () => {
+	it('auto-detects Node from the runtime, not from a DOM global', () => {
 		expect(resolveEnvironment('auto')).toBe('node');
 		expect(resolveEnvironment(undefined)).toBe('node');
 	});
 
-	it('auto-detects a browser when a document global exists', () => {
-		(globalThis as unknown as { document?: unknown }).document = {};
+	it('auto-detects a browser when there is no Node process', () => {
+		vi.stubGlobal('process', { env: {} });
 		expect(resolveEnvironment('auto')).toBe('browser');
 		expect(resolveEnvironment()).toBe('browser');
+	});
+
+	it('treats a DOM-less Web Worker as a browser, not Node', () => {
+		// A worker has no `document` but is also not Node — quoomb-web loads
+		// plugins from exactly this environment. Detecting by DOM absence would
+		// misclassify it as Node.
+		vi.stubGlobal('document', undefined);
+		vi.stubGlobal('process', { env: {} });
+		expect(resolveEnvironment('auto')).toBe('browser');
 	});
 });
 
 describe('loadPlugin dispatch', () => {
 	afterEach(async () => {
+		vi.unstubAllGlobals();
 		clearCapturedConfig(CAPTURE_KEY);
 		await cleanupTempModules();
 	});
@@ -194,5 +204,13 @@ describe('loadPlugin dispatch', () => {
 	it('tells the Node path user which export shape is expected', async () => {
 		await expect(loadPlugin(`npm:${MISSING_PACKAGE}@1.0.0`, db, {}, { env: 'node' }))
 			.rejects.toThrow(/Ensure it exports '\.\/plugin' or a default module/);
+	});
+
+	it('asks for allowCdn on an npm spec auto-detected in a DOM-less, non-Node runtime (e.g. a Web Worker), instead of attempting a package import', async () => {
+		vi.stubGlobal('document', undefined);
+		vi.stubGlobal('process', { env: {} });
+
+		await expect(loadPlugin(`npm:${MISSING_PACKAGE}`, db, {}))
+			.rejects.toThrow(/requires allowCdn=true/);
 	});
 });
