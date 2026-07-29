@@ -1,5 +1,5 @@
 import type { Database } from '../../../core/database.js';
-import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, validateCollationForType } from '../../../schema/table.js';
+import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass } from '../../../schema/table.js';
 import { keyParts, type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
@@ -14,7 +14,7 @@ import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint }
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError, formatKeyValue } from '../../../schema/constraint-builder.js';
 import { indexEnforcesUnique, uniqueEnforcementCollations, uniqueEnforcementComparators } from '../../../schema/unique-enforcement.js';
 import { generateIndexDDL, generateDropIndexDDL } from '../../../schema/ddl-generator.js';
-import { compareSqlValues, rowsValueIdentical, normalizeCollationName, comparisonSemanticsDiffer } from '../../../util/comparison.js';
+import { compareSqlValues, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
@@ -22,10 +22,8 @@ import { scanLayer as scanLayerImpl } from './scan-layer.js';
 import { createPrimaryKeyFunctions, buildPrimaryKeyFromValues, primaryKeyArity, type PrimaryKeyFunctions } from '../utils/primary-key.js';
 import { createMemoryTableLoggers } from '../utils/logging.js';
 import { tryFoldLiteral } from '../../../parser/utils.js';
-import { validateAndParse, coerceRowToSchema } from '../../../types/validation.js';
+import { coerceRowToSchema } from '../../../types/validation.js';
 import type { VTableEventEmitter } from '../../events.js';
-import { inferType } from '../../../types/registry.js';
-import type { Expression } from '../../../parser/ast.js';
 import { compilePredicate } from '../utils/predicate.js';
 import { renameColumnInIndexPredicates, type ResolveColumnInSource } from '../../../schema/rename-rewriter.js';
 import { MemoryIndex } from '../index.js';
@@ -33,6 +31,7 @@ import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
 import type { EffectiveRowSource } from '../../module.js';
 import { convertRowAtIndex, mapRows, mapRowsAsync, type RowMapper } from './row-convert.js';
+import { buildAlterColumnPlan, planColumnAttributeChange, type AlterColumnChange, type AlterColumnPlan, type EffectiveRows } from './alter-column.js';
 
 let tableManagerCounter = 0;
 const logger = createMemoryTableLoggers('layer:manager');
@@ -65,6 +64,15 @@ export interface ImplicitCoveringStructure {
 	indexName: string;
 	/** Always `'implicit-from-unique-constraint'` — the auto-built secondary BTree. */
 	origin: 'implicit-from-unique-constraint';
+}
+
+/**
+ * Rollback state for {@link MemoryTableManager.alterColumn}: the base primary tree the apply step
+ * REPLACED, if any. A mutable box rather than a return value so it is recorded *before* the
+ * replacement — a rebuild that throws mid-flight must still leave the `catch` a tree to restore.
+ */
+interface AlterColumnUndo {
+	basePrimaryTree: BTree<BTreeKeyForPrimary, Row> | null;
 }
 
 /** A copy of `items` with `value` inserted at `at` (`at === items.length` ⇒ append). */
@@ -2271,9 +2279,16 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * Apply a single-attribute ALTER COLUMN change (NOT NULL, DEFAULT, DATA TYPE).
+	 * Apply a single-attribute ALTER COLUMN change (NOT NULL, DEFAULT, DATA TYPE, COLLATE).
 	 * The caller supplies exactly one populated change; multi-attribute combinations
 	 * are rejected by the runtime before reaching this method.
+	 *
+	 * The body is the ordering contract, and only that: resolve the column → decide the change
+	 * and pre-validate it (`alter-column.ts`, which mutates nothing) → probe the re-keyed
+	 * structures ({@link validateAlterColumnPlan}) → rebuild the base
+	 * ({@link applyAlterColumnToBase}, the first write) → swap this manager's schema →
+	 * propagate to open layers ({@link propagateAlterColumnToOpenLayers}) → emit. Each step's
+	 * own reasoning lives on the step.
 	 *
 	 * `validateOnly` runs everything up to (and including) the pre-mutation validation
 	 * passes — the effective-row NULL / conversion scans, the re-keyed UNIQUE probe, and
@@ -2282,19 +2297,12 @@ export class MemoryTableManager {
 	 * isolation layer uses it to pre-flight an overlay's migration before the shared
 	 * underlying table mutates irreversibly (see `VirtualTable.alterSchema`).
 	 */
-	async alterColumn(change: {
-		columnName: string;
-		setNotNull?: boolean;
-		setDataType?: string;
-		setDefault?: Expression | null;
-		setCollation?: string;
-	}, rows?: EffectiveRowSource, validateOnly = false): Promise<void> {
+	async alterColumn(change: AlterColumnChange, rows?: EffectiveRowSource, validateOnly = false): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
-		/** The base primary tree `rebuildPrimaryTreeStrict` replaced, for the catch's rollback. */
-		let basePrimaryTreeBeforeRekey: BTree<BTreeKeyForPrimary, Row> | null = null;
+		const undo: AlterColumnUndo = { basePrimaryTree: null };
 		try {
 			await this.ensureSchemaChangeSafety();
 
@@ -2303,369 +2311,36 @@ export class MemoryTableManager {
 			if (colIndex === -1) {
 				throw new QuereusError(`Column '${change.columnName}' not found.`, StatusCode.ERROR);
 			}
-			const oldCol = this.tableSchema.columns[colIndex];
-			let newCol: ColumnSchema = oldCol;
-			// A collation change re-keys any PK / UNIQUE / index that orders by this
-			// column, so it needs the structure re-sort + uniqueness re-validation below.
-			let collationChanged = false;
-			// Set when a SET DATA TYPE moves to a type that ORDERS values differently
-			// (comparisonSemanticsDiffer). Same consequence as a collation change — every
-			// structure keyed by the column has to be re-sorted and its uniqueness re-judged —
-			// but a separate flag, because the index-column collation propagation and the
-			// `pkColumnRekeyed` primary-tree path below belong to SET COLLATE alone. Usually
-			// coincides with `valueConvert` (every non-alias retype sets that); the rebuild
-			// chains below test `valueConvert` FIRST, whose full-rebuild path subsumes the
-			// comparator-only re-sort.
-			let comparatorChanged = false;
-			// Set to the per-value conversion function when a physical value rewrite is needed:
-			// SET DATA TYPE (every non-alias retype — values normalize to the new type's
-			// canonical spelling even when the storage class is unchanged) or SET NOT NULL
-			// backfill (map null → DEFAULT). Both REPLACE the base primary tree with a
-			// freshly-built one (never an in-place mutation, which inheritree forbids while the
-			// open transaction's layers derive from it) and convert the transaction's
-			// own-written rows in every open layer, after `updateSchema` (see the rebuild
-			// section and convertColumnOnOpenLayers).
-			let valueConvert: ((v: SqlValue) => SqlValue) | null = null;
-			// SET NOT NULL backfill also routes NULL values through `valueConvert`; SET DATA TYPE
-			// leaves nulls untouched. Selects the null-including path in convertBaseRows/convertColumn.
-			let convertNulls = false;
 
-			if (change.setCollation !== undefined) {
-				const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName, (n) => this.db.isCollationRegistered(n));
-				const nameMatches = normalized === (oldCol.collation || 'BINARY');
-				if (nameMatches && oldCol.collationExplicit) {
-					return; // already explicit in the desired collation — nothing to do
-				}
-				// SET COLLATE is a user declaration with the same standing as a
-				// CREATE-time COLLATE clause, so mark the collation explicit (rank 2 in
-				// the comparison lattice) regardless of the column's creation history —
-				// including SET COLLATE binary. When only the name matches but the column
-				// was not yet explicit (a defaulted collation, or one inherited from
-				// session default_collation), flip the flag as a METADATA-ONLY change:
-				// the collation bytes are unchanged, so keep collationChanged false and
-				// skip the physical re-sort / re-key / UNIQUE re-validation below. A
-				// different name takes the full path AND sets the flag.
-				newCol = { ...oldCol, collation: normalized, collationExplicit: true };
-				collationChanged = !nameMatches;
-			} else if (change.setNotNull !== undefined) {
-				if (change.setNotNull === true && !oldCol.notNull) {
-					// Tightening: scan the DDL transaction's EFFECTIVE rows for NULLs — committed rows
-					// overlaid with this transaction's own pending writes — exactly as the setDataType
-					// arm does. A pending NULL the transaction can SEE rejects the ALTER; one only in a
-					// row it has DELETED does not block it. `rows` is the wrapper-supplied effective set
-					// (the isolation overlay); when absent, effectiveDdlRows() is the layered view.
-					const defaultExpr = oldCol.defaultValue;
-					const defaultLiteral = defaultExpr ? tryFoldLiteral(defaultExpr) : undefined;
+			// Decide + validate, in that order and both before any mutation: `planColumnAttributeChange`
+			// runs the attribute's own pre-validation (the NULL scan, the convertibility scan, the
+			// primary-key carve-outs) over the effective rows, and `validateAlterColumnPlan` runs the
+			// re-keyed UNIQUE / primary-key probes over the schema it produced. Nothing above
+			// `applyAlterColumnToBase` writes, so a throw from either leaves the table as it was.
+			const attributeChange = await planColumnAttributeChange({
+				schema: this.tableSchema,
+				tableName: this._tableName,
+				columnName: change.columnName,
+				colIndex,
+				effectiveRows: this.effectiveRowSource(rows),
+				isCollationRegistered: (n) => this.db.isCollationRegistered(n),
+			}, change);
+			if (attributeChange === null) return; // already in the requested state — nothing to do
 
-					let anyNull = false;
-					if (rows) {
-						for await (const row of rows()) {
-							if (row[colIndex] === null) { anyNull = true; break; }
-						}
-					} else {
-						for (const row of this.effectiveDdlRows()) {
-							if (row[colIndex] === null) { anyNull = true; break; }
-						}
-					}
-
-					if (anyNull) {
-						if (defaultLiteral === undefined || defaultLiteral === null) {
-							throw new QuereusError(
-								`column ${change.columnName} contains NULL values`,
-								StatusCode.CONSTRAINT,
-							);
-						}
-						// Backfill: map null → the folded DEFAULT literal, routed through the SAME
-						// base-replacement + open-layer conversion machinery setDataType uses — no
-						// logical-type change, no PK re-key, no in-place base mutation. The old in-place
-						// `tree.upsert` backfill could not fill the transaction's pending rows (they live
-						// in the pending layer, not the base) and mutated a base the open layers derive
-						// from — both fixed by the unified path.
-						const literal = defaultLiteral;
-						valueConvert = (v: SqlValue) => (v === null ? literal : v);
-						convertNulls = true;
-					}
-
-					newCol = { ...oldCol, notNull: true };
-				} else if (change.setNotNull === false && oldCol.notNull) {
-					if (this.tableSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
-						throw new QuereusError(
-							`Cannot DROP NOT NULL on PRIMARY KEY column '${change.columnName}'`,
-							StatusCode.CONSTRAINT,
-						);
-					}
-					newCol = { ...oldCol, notNull: false };
-				} else {
-					// No-op (already in desired state).
-					return;
-				}
-			} else if (change.setDataType !== undefined) {
-				const newLogicalType = inferType(change.setDataType);
-				// Gate on logical-type IDENTITY, not the physical storage class: `inferType`
-				// flattens aliases to the shared type object (`varchar(50)` IS `TEXT_TYPE`,
-				// `bigint` IS `INTEGER_TYPE`), so an alias retype is schema-only — no scan, no
-				// rewrite, no re-key. Every OTHER retype validates AND normalizes every value,
-				// whether or not the storage class changes: a same-class move (text → date)
-				// must reject values the new type refuses ('hello') and rewrite the rest to
-				// the new type's canonical spelling ('2024-06-05T00:00:00Z' → '2024-06-05'),
-				// or the column holds values no INSERT could have produced — unfindable by
-				// equality (DATE compares BINARY over the stored text) and invisible to UNIQUE.
-				// NOTE: the rewrite is unconditional once the types differ, even when every
-				// converted value comes back byte-identical (already-canonical ISO durations on a
-				// text → timespan). That costs a full base-tree + secondary-index rebuild here, and
-				// a physical rewrite of every row on the store leg. If ALTER on large tables ever
-				// shows up as slow, have the convert pre-pass record whether any value actually
-				// moved and, when none did, fall through to the comparator-only re-key.
-				if (newLogicalType !== oldCol.logicalType) {
-					// Retyping a PRIMARY KEY column moves the key bytes (a class change), the
-					// tree's ordering (a comparator move), or at minimum the key values'
-					// canonical spelling — and neither the base rewrite below nor the
-					// transaction-layer conversion re-keys the primary tree. The engine already
-					// refuses SET DATA TYPE on any PK column (runtime/emit/alter-table.ts);
-					// this guards direct module calls. Reject rather than corrupt — the
-					// type-change analogue of the SET COLLATE primary-key carve-out
-					// (`alter-collate-pk-in-transaction`).
-					if (this.tableSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
-						throw new QuereusError(
-							`Cannot change the data type of primary key column '${change.columnName}' of table '${this._tableName}'.`,
-							StatusCode.CONSTRAINT,
-						);
-					}
-
-					// Every MemoryIndex builds its comparator from the column's LOGICAL type
-					// (`createTypedComparator(columnSchema.logicalType, …)` in vtab/memory/index.ts),
-					// so a move to a differently-ordering type (text ↔ timespan: 'PT1H' ≡ 'PT60M';
-					// text ↔ date/time/datetime: binary, ignoring the column's collation) re-sorts
-					// every structure keyed by the column. Tracked separately from the value rewrite
-					// because SET COLLATE shares the re-key machinery without rewriting values.
-					comparatorChanged = comparisonSemanticsDiffer(oldCol.logicalType, newLogicalType);
-
-					const convert = (v: SqlValue): SqlValue => {
-						try {
-							return validateAndParse(v, newLogicalType, change.columnName) as SqlValue;
-						} catch {
-							throw new QuereusError(
-								`Cannot convert value in '${change.columnName}' to ${change.setDataType}`,
-								StatusCode.MISMATCH,
-							);
-						}
-					};
-
-					// Validate BEFORE any mutation, over the DDL transaction's EFFECTIVE rows
-					// (committed rows overlaid with this transaction's own pending writes): an
-					// unconvertible value the transaction can SEE rejects the ALTER, and one only in
-					// a row it has DELETED does not block it. A throw here leaves the schema, the base
-					// and the transaction untouched. `rows` is the wrapper-supplied effective set (the
-					// isolation overlay); when absent, `effectiveDdlRows()` is the layered view.
-					if (rows) {
-						for await (const row of rows()) {
-							const val = row[colIndex];
-							if (val !== null) convert(val as SqlValue);
-						}
-					} else {
-						for (const row of this.effectiveDdlRows()) {
-							const val = row[colIndex];
-							if (val !== null) convert(val as SqlValue);
-						}
-					}
-
-					// The base rows are converted below, AFTER `updateSchema`, by REPLACING the base
-					// primary tree with a fresh one (see the `valueConvert` branch) — never by an
-					// in-place mutation, which inheritree forbids while the open transaction's layers
-					// derive from that tree (`MutatedBaseError`). `valueConvert` drives both the base
-					// replacement and the transaction-layer conversion.
-					valueConvert = convert;
-				}
-				newCol = { ...oldCol, logicalType: newLogicalType };
-			} else if (change.setDefault !== undefined) {
-				newCol = { ...oldCol, defaultValue: change.setDefault };
-			} else {
-				throw new QuereusError('ALTER COLUMN requires an attribute to change', StatusCode.INTERNAL);
-			}
-
-			const updatedCols = this.tableSchema.columns.map((c, i) => i === colIndex ? newCol : c);
-
-			// The changes that move the COMPARATOR the structures are keyed by: SET COLLATE
-			// (values untouched) and a retype into a differently-ordering type (which, unless it
-			// is an alias retype, ALSO rewrites values — `valueConvert` — and its full-rebuild
-			// path below subsumes the comparator-only re-sort). Both need fresh IndexSchema
-			// objects and, when no rewrite runs, the re-validate / re-sort / adopt sequence.
-			const structuresRekeyed = collationChanged || comparatorChanged;
-
-			// Propagate a collation change into every PK-definition entry and index
-			// column that orders by this column, so their comparators re-key under it.
-			const updatedPkDef = collationChanged
-				? this.tableSchema.primaryKeyDefinition.map(def =>
-					def.index === colIndex ? { ...def, collation: newCol.collation } : def)
-				: this.tableSchema.primaryKeyDefinition;
-			// Every re-keying change also REBUILDS the IndexSchema objects, because their identity is
-			// the discriminator `TransactionLayer.adoptSchema` uses to decide an open layer's
-			// MemoryIndex must be replaced rather than kept (an index it holds under an object the new
-			// schema still carries is left alone). SET COLLATE has a field to write — the index
-			// column's own collation. A comparator-only retype has none: an index column carries no
-			// logical type, it reads the column's from `newSchema.columns`, so the fresh object IS the
-			// whole signal. Without it the base rebuilt its trees under the new comparator while the
-			// DDL transaction's own layers went on comparing the old way — and shadowed the base's
-			// rebuilt trees once the pending layer became the committed head.
-			const updatedIndexes = (structuresRekeyed && this.tableSchema.indexes)
-				? this.tableSchema.indexes.map(idx => ({
-					...idx,
-					columns: idx.columns.map(ic =>
-						(ic.index === colIndex && collationChanged) ? { ...ic, collation: newCol.collation } : ic),
-				}))
-				: this.tableSchema.indexes;
-
-			const finalNewTableSchema: TableSchema = Object.freeze({
-				...this.tableSchema,
-				columns: Object.freeze(updatedCols),
-				columnIndexMap: buildColumnIndexMap(updatedCols),
-				primaryKeyDefinition: Object.freeze(updatedPkDef),
-				indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
-			});
-
-			const pkColumnRekeyed = collationChanged && updatedPkDef.some(def => def.index === colIndex);
-
-			// Validate BEFORE any mutation, over the DDL transaction's EFFECTIVE rows: a pair
-			// the transaction inserted that collides under the NEW schema must reject the
-			// change, and one it has deleted must not block it. A throw here leaves the schema,
-			// the base layer and the index map exactly as they were.
-			//
-			// A value-REWRITING change (`valueConvert`: SET DATA TYPE, or a SET NOT NULL null →
-			// DEFAULT backfill) probes the CONVERTED rows — the same per-row conversion the base
-			// rewrite below applies — under the NEW schema's comparators, so one call covers both
-			// ways an ALTER can collapse two previously-distinct rows: the VALUES converge
-			// (`'1'`/`'01'` → 1; two NULLs → one DEFAULT; '2024-06-05T00:00:00Z' → '2024-06-05')
-			// and/or the COMPARATOR moves (text → timespan makes 'PT1H'/'PT60M' one value). A
-			// same-storage-class retype sets `valueConvert` AND `structuresRekeyed`, so the
-			// rewrite arm is tested FIRST — its converted-row probe subsumes the comparator-only
-			// one. The rebuild that follows is deliberately non-enforcing, so this is the only
-			// guard.
-			//
-			// The comparator-MOVING arm without a rewrite has one trigger left: SET COLLATE. The
-			// values are untouched — hence no `mapRow` — and only the comparator the structures
-			// are keyed by moves. `newSchema` carries the new collations, so the probe indexes
-			// compare as the rebuilt ones will.
-			//
-			// The primary key: SET COLLATE on a PK member gets a stricter pre-pass
-			// (`validateRekeyedPrimaryKey`): no layer in the chain, base included, may hold a
-			// collision. That is what lets every step below succeed unconditionally, and what
-			// `TransactionLayer.rekeyPrimaryKey` relies on. The rewrite arm needs no PK pre-pass
-			// and cannot shadow one: a retype of a PK column is rejected upstream, the backfill
-			// only fires on a column holding NULLs (which a PK member cannot — the engine
-			// enforces NOT NULL on every PK member regardless of the declared nullability), and
-			// `pkColumnRekeyed` is set only by SET COLLATE, which never sets `valueConvert` — so
-			// whenever `pkColumnRekeyed` is true, the `structuresRekeyed` arm still runs.
-			// NOTE: if PK members ever become genuinely nullable, the backfill arm gains a PK
-			// collision path (two NULL keys → one DEFAULT) and needs `validateRekeyedPrimaryKey`
-			// plus a primary-tree re-key of its own.
-			if (valueConvert) {
-				const convert = valueConvert;
-				const nulls = convertNulls;
-				await this.validateRekeyedUniqueStructures(
-					finalNewTableSchema, colIndex, rows,
-					// Unlike `convertBaseRows`, a conversion failure here is NOT swallowed. Every row
-					// the probe sees is visible to the transaction, and the setDataType pre-pass above
-					// already proved each one convertible, so a throw is unreachable; surfacing it as
-					// MISMATCH still beats probing a stale value that could mask a collision.
-					row => convertRowAtIndex(row, colIndex, convert, nulls),
-				);
-			} else if (structuresRekeyed) {
-				await this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex, rows);
-				// Unlike the secondary-structure pass above — which only ever judges the effective
-				// rows — the PK pass judges TWO row sets: the effective rows (`rows` when a wrapper
-				// supplies them) decide whether the change is LEGAL, and this manager's own layer
-				// chain decides whether the re-keyed trees can PHYSICALLY carry it. See
-				// `validateRekeyedPrimaryKey` for why the sets differ and which status each raises.
-				if (pkColumnRekeyed) await this.validateRekeyedPrimaryKey(finalNewTableSchema, rows);
-			}
+			const plan = buildAlterColumnPlan(this.tableSchema, colIndex, attributeChange);
+			await this.validateAlterColumnPlan(plan, rows);
 
 			// Dry run ends here: everything above validates without mutating (the one earlier
 			// side effect, ensureSchemaChangeSafety's committed-layer drain, is semantically
 			// neutral bookkeeping), and everything below mutates. See the method doc.
 			if (validateOnly) return;
 
-			this.baseLayer.updateSchema(finalNewTableSchema);
+			this.applyAlterColumnToBase(plan, undo);
 
-			// Both arms rebuild the base's structures under the schema `updateSchema` above just
-			// swapped in — each MemoryIndex rebuilds its comparator from the CURRENT schema's
-			// collation and logical type. The secondary rebuilds are NON-enforcing (the pre-pass
-			// above owns uniqueness, and the base's rows are not a subset of the effective rows);
-			// the SET COLLATE PK rebuild is strict, since a PK collision cannot be represented at
-			// all — the pre-pass has already proved the base collision-free, so the strict
-			// rebuild is a live invariant check, not the enforcement path. It runs LAST so its
-			// throw leaves the live tree intact for the catch's rollback.
-			if (valueConvert) {
-				// SET DATA TYPE / SET NOT NULL backfill: convert the committed base rows and REPLACE
-				// the primary tree with a fresh one holding them (not an in-place upsert — inheritree
-				// forbids mutating a base while the open transaction's layers derive from it).
-				// `rebuildPrimaryTreeFromRows` also rebuilds every secondary index from the converted
-				// rows under the new comparators, so index-backed lookups see the new values — which
-				// is why this arm runs first and subsumes `rebuildAllSecondaryIndexes` when a
-				// same-storage-class retype sets `structuresRekeyed` too. The old tree is saved for
-				// the catch's rollback, exactly as the PK-rekey path does.
-				// NOTE: rebuilds EVERY secondary index, not only those covering the altered column;
-				// if a wide-index table ever shows this as slow, filter to indexes whose columns
-				// include colIndex. Mirrors the collationChanged path's unconditional rebuild.
-				//
-				// SET DATA TYPE: a base value that fails to convert is kept as-is — validation over
-				// the effective view already rejected any unconvertible value the transaction can SEE,
-				// so a surviving one is shadowed by a pending delete/overwrite and is never read back
-				// (a ROLLBACK re-exposes it under the new type — DDL is not undone by rollback, the
-				// known behavior of `feat-ddl-transaction-capability`).
-				// SET NOT NULL (`convertNulls`): null base values are mapped to the DEFAULT literal.
-				const convertedBaseRows = this.convertBaseRows(colIndex, valueConvert, convertNulls);
-				basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
-				this.baseLayer.rebuildPrimaryTreeFromRows(convertedBaseRows);
-			} else if (structuresRekeyed) {
-				this.baseLayer.rebuildAllSecondaryIndexes();
-				if (pkColumnRekeyed) {
-					basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
-					this.baseLayer.rebuildPrimaryTreeStrict();
-				}
-			}
-
-			this.tableSchema = finalNewTableSchema;
+			this.tableSchema = plan.newSchema;
 			this.initializePrimaryKeyFunctions();
 
-			// The base rebuild handed every secondary index a fresh tree under the new
-			// comparator; the DDL transaction's own layers still inherit the old ones and froze
-			// the old schema at construction. Re-key them, or the rest of the transaction — and
-			// everything after the pending layer becomes the committed head at commit — keeps
-			// comparing under the old collation / old logical type.
-			//
-			// When the altered column is part of the primary key, `rebuildPrimaryTreeStrict` also
-			// swapped the base primary tree object out from under those layers' copy-on-write
-			// bases and invalidated their `pkFunctions`; `rekeyPrimaryKey` rebuilds both, plus
-			// every secondary index (each derives its PK comparator/encoder from the PK
-			// definition). Outside a transaction there are no open layers and both are no-ops.
-			if (valueConvert) {
-				// SET DATA TYPE / SET NOT NULL backfill converted the base above; the DDL
-				// transaction's own open layers still froze the old schema and hold their own-written
-				// rows unconverted. Swap the schema and convert those values so the rest of the
-				// transaction — and the committed head at commit — read the new value. For SET NOT
-				// NULL this fills the transaction's OWN pending NULL rows (which live in the pending
-				// layer, never reached by the old in-place base upsert). `convertColumn` installs the
-				// new schema and rebuilds every one of the layer's secondary indexes from it, so it
-				// subsumes `adoptSchema` when a same-storage-class retype moved the comparators too.
-				// No-op in autocommit.
-				this.convertColumnOnOpenLayers(finalNewTableSchema, colIndex, valueConvert, convertNulls);
-			} else if (structuresRekeyed) {
-				this.adoptSchemaOnOpenLayers(finalNewTableSchema, pkColumnRekeyed);
-			} else {
-				// The remaining changes (SET DEFAULT, DROP NOT NULL, a SET NOT NULL that needed no
-				// backfill, a retype between aliases of one logical type) touch nothing a layer
-				// DERIVES — its index set, its `uniqueConstraints` enforcement and its MemoryIndex
-				// comparators all stay put, and DEFAULT application / NOT NULL enforcement happen
-				// above the module, off the catalog schema. But the frozen schema OBJECT is itself
-				// observable: `commitTransaction` only wraps a swapped-in savepoint snapshot back
-				// into the committed chain when `readLayer.getSchema() === this.tableSchema`. Left
-				// stale, a `rollback to savepoint` taken across one of these ALTERs restores a
-				// snapshot the wrap then skips, and the transaction's staged rows are silently
-				// dropped at COMMIT. Adoption is cheap here — every IndexSchema object is carried
-				// over unchanged, so `adoptSchema` keeps each layer's MemoryIndex and only swaps
-				// the schema reference.
-				this.adoptSchemaOnOpenLayers(finalNewTableSchema);
-			}
+			this.propagateAlterColumnToOpenLayers(plan);
 
 			this.eventEmitter?.emitSchemaChange?.({
 				type: 'alter',
@@ -2678,19 +2353,19 @@ export class MemoryTableManager {
 			logger.operation('Alter Column', this._tableName, { columnName: change.columnName });
 		} catch (e: unknown) {
 			// Restore the prior schema and primary tree, then re-key the secondary indexes back
-			// to it. Both pre-passes now run before any mutation, so nothing below `updateSchema`
-			// is expected to throw; the restores are the safety net for an unexpected one (and
-			// for `rebuildPrimaryTreeStrict`'s invariant check, whose precondition
-			// `validateRekeyedPrimaryKey` has already established).
+			// to it. Both pre-passes run before any mutation, so nothing inside
+			// `applyAlterColumnToBase` is expected to throw; the restores are the safety net for
+			// an unexpected one (and for `rebuildPrimaryTreeStrict`'s invariant check, whose
+			// precondition `validateRekeyedPrimaryKey` has already established).
 			//
-			// NOTE: a throw from a pre-pass (or from `setNotNull`'s NULL scan) mutated nothing,
+			// NOTE: a throw from a pre-pass (or from `set not null`'s NULL scan) mutated nothing,
 			// so this rebuild only swaps the base's index trees for fresh, content-identical
 			// ones — an O(rows) cost on a pure rejection. Harmless (a pending layer keeps
 			// reading its orphaned but content-correct copy-on-write base), but if a rejected
 			// ALTER on a large table ever shows up as slow, gate the rebuild on a "mutation
-			// started" flag set just before `updateSchema`.
+			// started" flag set just before `applyAlterColumnToBase`.
 			this.baseLayer.updateSchema(originalManagerSchema);
-			if (basePrimaryTreeBeforeRekey) this.baseLayer.primaryTree = basePrimaryTreeBeforeRekey;
+			if (undo.basePrimaryTree) this.baseLayer.primaryTree = undo.basePrimaryTree;
 			this.baseLayer.rebuildAllSecondaryIndexes();
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -2699,6 +2374,160 @@ export class MemoryTableManager {
 		} finally {
 			release();
 		}
+	}
+
+	/**
+	 * The re-keyed-structure pre-pass for {@link alterColumn}, over the DDL transaction's EFFECTIVE
+	 * rows: a pair the transaction inserted that collides under the NEW schema must reject the
+	 * change, and one it has deleted must not block it. Runs before any mutation, so a throw leaves
+	 * the schema, the base layer and the index map exactly as they were.
+	 *
+	 * A value-REWRITING change (`set data type`, or a `set not null` null → DEFAULT backfill) probes
+	 * the CONVERTED rows — the same per-row conversion the base rewrite applies — under the NEW
+	 * schema's comparators, so one call covers both ways an ALTER can collapse two previously-distinct
+	 * rows: the VALUES converge (`'1'`/`'01'` → 1; two NULLs → one DEFAULT;
+	 * '2024-06-05T00:00:00Z' → '2024-06-05') and/or the COMPARATOR moves (text → timespan makes
+	 * 'PT1H'/'PT60M' one value). A same-storage-class retype sets both `rewrite` and
+	 * `structuresRekeyed`, so the rewrite arm is tested FIRST — its converted-row probe subsumes the
+	 * comparator-only one. The rebuild that follows is deliberately non-enforcing, so this is the
+	 * only guard.
+	 *
+	 * The comparator-MOVING arm without a rewrite has one trigger left: `set collate`. The values are
+	 * untouched — hence no `mapRow` — and only the comparator the structures are keyed by moves.
+	 * `newSchema` carries the new collations, so the probe indexes compare as the rebuilt ones will.
+	 *
+	 * The primary key: `set collate` on a PK member gets a stricter pre-pass
+	 * ({@link validateRekeyedPrimaryKey}): no layer in the chain, base included, may hold a collision.
+	 * That is what lets every apply step succeed unconditionally, and what
+	 * `TransactionLayer.rekeyPrimaryKey` relies on. The rewrite arm needs no PK pre-pass and cannot
+	 * shadow one: a retype of a PK column is rejected upstream, the backfill only fires on a column
+	 * holding NULLs (which a PK member cannot — the engine enforces NOT NULL on every PK member
+	 * regardless of the declared nullability), and `pkColumnRekeyed` is set only by `set collate`,
+	 * which never sets `rewrite` — so whenever `pkColumnRekeyed` is true, the `structuresRekeyed` arm
+	 * still runs.
+	 * NOTE: if PK members ever become genuinely nullable, the backfill arm gains a PK collision path
+	 * (two NULL keys → one DEFAULT) and needs `validateRekeyedPrimaryKey` plus a primary-tree re-key
+	 * of its own.
+	 */
+	private async validateAlterColumnPlan(plan: AlterColumnPlan, rows?: EffectiveRowSource): Promise<void> {
+		if (plan.rewrite) {
+			const { convert, convertNulls } = plan.rewrite;
+			await this.validateRekeyedUniqueStructures(
+				plan.newSchema, plan.colIndex, rows,
+				// Unlike `convertBaseRows`, a conversion failure here is NOT swallowed. Every row
+				// the probe sees is visible to the transaction, and the `set data type` pre-pass
+				// already proved each one convertible, so a throw is unreachable; surfacing it as
+				// MISMATCH still beats probing a stale value that could mask a collision.
+				row => convertRowAtIndex(row, plan.colIndex, convert, convertNulls),
+			);
+		} else if (plan.structuresRekeyed) {
+			await this.validateRekeyedUniqueStructures(plan.newSchema, plan.colIndex, rows);
+			// Unlike the secondary-structure pass above — which only ever judges the effective
+			// rows — the PK pass judges TWO row sets: the effective rows (`rows` when a wrapper
+			// supplies them) decide whether the change is LEGAL, and this manager's own layer
+			// chain decides whether the re-keyed trees can PHYSICALLY carry it. See
+			// `validateRekeyedPrimaryKey` for why the sets differ and which status each raises.
+			if (plan.pkColumnRekeyed) await this.validateRekeyedPrimaryKey(plan.newSchema, rows);
+		}
+	}
+
+	/**
+	 * First mutation of {@link alterColumn}: install the new schema on the base layer and rebuild its
+	 * structures under it — each MemoryIndex rebuilds its comparator from the CURRENT schema's
+	 * collation and logical type. The secondary rebuilds are NON-enforcing ({@link validateAlterColumnPlan}
+	 * owns uniqueness, and the base's rows are not a subset of the effective rows); the `set collate`
+	 * PK rebuild is strict, since a PK collision cannot be represented at all — the pre-pass has
+	 * already proved the base collision-free, so the strict rebuild is a live invariant check, not
+	 * the enforcement path. It runs LAST so its throw leaves the live tree intact for the rollback.
+	 *
+	 * Records the primary tree it is about to REPLACE in `undo` *before* replacing it, so a throw
+	 * from either rebuild still leaves the caller's `catch` a tree to restore.
+	 */
+	private applyAlterColumnToBase(plan: AlterColumnPlan, undo: AlterColumnUndo): void {
+		this.baseLayer.updateSchema(plan.newSchema);
+
+		if (plan.rewrite) {
+			// `set data type` / `set not null` backfill: convert the committed base rows and REPLACE
+			// the primary tree with a fresh one holding them (not an in-place upsert — inheritree
+			// forbids mutating a base while the open transaction's layers derive from it).
+			// `rebuildPrimaryTreeFromRows` also rebuilds every secondary index from the converted
+			// rows under the new comparators, so index-backed lookups see the new values — which
+			// is why this arm runs first and subsumes `rebuildAllSecondaryIndexes` when a
+			// same-storage-class retype sets `structuresRekeyed` too.
+			// NOTE: rebuilds EVERY secondary index, not only those covering the altered column;
+			// if a wide-index table ever shows this as slow, filter to indexes whose columns
+			// include colIndex. Mirrors the `set collate` path's unconditional rebuild.
+			//
+			// `set data type`: a base value that fails to convert is kept as-is — validation over
+			// the effective view already rejected any unconvertible value the transaction can SEE,
+			// so a surviving one is shadowed by a pending delete/overwrite and is never read back
+			// (a ROLLBACK re-exposes it under the new type — DDL is not undone by rollback, the
+			// known behavior of `feat-ddl-transaction-capability`).
+			// `set not null` (`convertNulls`): null base values are mapped to the DEFAULT literal.
+			const convertedBaseRows = this.convertBaseRows(plan.colIndex, plan.rewrite.convert, plan.rewrite.convertNulls);
+			undo.basePrimaryTree = this.baseLayer.primaryTree;
+			this.baseLayer.rebuildPrimaryTreeFromRows(convertedBaseRows);
+		} else if (plan.structuresRekeyed) {
+			this.baseLayer.rebuildAllSecondaryIndexes();
+			if (plan.pkColumnRekeyed) {
+				undo.basePrimaryTree = this.baseLayer.primaryTree;
+				this.baseLayer.rebuildPrimaryTreeStrict();
+			}
+		}
+	}
+
+	/**
+	 * Hand the post-{@link alterColumn} schema to the DDL transaction's own open layers.
+	 *
+	 * The base rebuild handed every secondary index a fresh tree under the new comparator; those
+	 * layers still inherit the old ones and froze the old schema at construction. Re-key them, or
+	 * the rest of the transaction — and everything after the pending layer becomes the committed
+	 * head at commit — keeps comparing under the old collation / old logical type.
+	 *
+	 * When the altered column is part of the primary key, `rebuildPrimaryTreeStrict` also swapped the
+	 * base primary tree object out from under those layers' copy-on-write bases and invalidated their
+	 * `pkFunctions`; `rekeyPrimaryKey` rebuilds both, plus every secondary index (each derives its PK
+	 * comparator/encoder from the PK definition). Outside a transaction there are no open layers and
+	 * every arm is a no-op.
+	 */
+	private propagateAlterColumnToOpenLayers(plan: AlterColumnPlan): void {
+		if (plan.rewrite) {
+			// `set data type` / `set not null` backfill converted the base; the open layers still hold
+			// their own-written rows unconverted. Swap the schema and convert those values so the rest
+			// of the transaction — and the committed head at commit — read the new value. For
+			// `set not null` this fills the transaction's OWN pending NULL rows (which live in the
+			// pending layer, never reached by an in-place base upsert). `convertColumn` installs the
+			// new schema and rebuilds every one of the layer's secondary indexes from it, so it
+			// subsumes `adoptSchema` when a same-storage-class retype moved the comparators too.
+			this.convertColumnOnOpenLayers(plan.newSchema, plan.colIndex, plan.rewrite.convert, plan.rewrite.convertNulls);
+		} else if (plan.structuresRekeyed) {
+			this.adoptSchemaOnOpenLayers(plan.newSchema, plan.pkColumnRekeyed);
+		} else {
+			// The remaining changes (`set default`, `drop not null`, a `set not null` that needed no
+			// backfill, a retype between aliases of one logical type) touch nothing a layer
+			// DERIVES — its index set, its `uniqueConstraints` enforcement and its MemoryIndex
+			// comparators all stay put, and DEFAULT application / NOT NULL enforcement happen
+			// above the module, off the catalog schema. But the frozen schema OBJECT is itself
+			// observable: `commitTransaction` only wraps a swapped-in savepoint snapshot back
+			// into the committed chain when `readLayer.getSchema() === this.tableSchema`. Left
+			// stale, a `rollback to savepoint` taken across one of these ALTERs restores a
+			// snapshot the wrap then skips, and the transaction's staged rows are silently
+			// dropped at COMMIT. Adoption is cheap here — every IndexSchema object is carried
+			// over unchanged, so `adoptSchema` keeps each layer's MemoryIndex and only swaps
+			// the schema reference.
+			this.adoptSchemaOnOpenLayers(plan.newSchema);
+		}
+	}
+
+	/**
+	 * The rows the `alter column` pre-validation scans judge: `rows` when a wrapper module supplies
+	 * them (the isolation overlay holds the transaction's pending rows outside this manager, so only
+	 * it can name the rows the issuing connection actually sees), else this manager's own layered
+	 * view ({@link effectiveDdlRows}) — which stays a SYNC iterable on purpose, so a scan over it
+	 * cannot be interleaved with another connection's write. See `scanEffectiveRows`.
+	 */
+	private effectiveRowSource(rows?: EffectiveRowSource): EffectiveRows {
+		return rows ?? (() => this.effectiveDdlRows());
 	}
 
 	async createIndex(newIndexSchemaEntry: IndexSchema, ifNotExistsFromAst?: boolean, rows?: EffectiveRowSource): Promise<void> {
