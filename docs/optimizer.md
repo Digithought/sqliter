@@ -13,7 +13,8 @@ subsystems that grew large enough to read on their own, live in the topic docume
 
 | Document | Covers |
 | --- | --- |
-| [Optimizer Rules](optimizer-rules.md) | The rule catalog, plus the predicate, constant-folding, and cardinality/key families. |
+| [Optimizer Rules](optimizer-rules.md) | The rule catalog — one line per rule, grouped by `src/planner/rules/` subdirectory. |
+| [Optimizer Rule Families](optimizer-rule-families.md) | Deep-dives: materialized-view read-side rewrite, constant folding, the predicate family, cardinality/key reasoning. |
 | [Optimizer Joins](optimizer-joins.md) | Join ordering (QuickPick), physical join selection, fan-out lookup joins, join key propagation. |
 | [Optimizer Retrieve Push-down](optimizer-retrieve.md) | The `RetrieveNode` module boundary, access-path selection, correlated access, TVF property declarations. |
 | [Optimizer Streaming Recognition](optimizer-streaming.md) | Asof scan, and the monotonic LIMIT/OFFSET, range-scan, and window recognitions. |
@@ -432,7 +433,7 @@ The base class returns conservative defaults (`{ injective: false }` / `{ monoto
 
 The function-call traits compose with the operand's own `monotonicityIn` / `isInjectiveIn`, so `f(g(x))` is treated correctly when both layers are annotated. `rangeRewriteIn` is intentionally tighter: it only rewrites the `f(x) op c` case, requiring the operand to be a bare `ColumnReferenceNode` for the queried attribute (anything else would conflate value spaces).
 
-Consumers (key propagation through non-trivial projections, sargable predicate rewrites for `date(ts) = D`, etc.) build on this surface — see [Rules § Sargable range rewrites](optimizer-rules.md#sargable-range-rewrites).
+Consumers (key propagation through non-trivial projections, sargable predicate rewrites for `date(ts) = D`, etc.) build on this surface — see [Rule Families § Sargable range rewrites](optimizer-rule-families.md#sargable-range-rewrites).
 
 ### Constant folding
 
@@ -440,7 +441,7 @@ Constant expressions are evaluated at plan time rather than at runtime, via a th
 classify / border-detect / replace algorithm that folds even expressions whose column
 references resolve to constants further up the tree. See
 [Constant Folding System](optimizer-const.md) for the algorithm and
-[Rules § Constant Folding Subsystem](optimizer-rules.md#constant-folding-subsystem) for the
+[Rule Families § Constant Folding Subsystem](optimizer-rule-families.md#constant-folding-subsystem) for the
 `constant` property's requirements and the `ConstantNode` contract.
 
 ### Sargable range rewrites
@@ -448,7 +449,7 @@ references resolve to constants further up the tree. See
 A predicate of the form `f(col) = c` — notably `date(ts) = D` — is rewritten to the
 half-open range `col >= lower(c) and col < upper(c)`, restoring a bare `col op literal`
 shape the constraint extractor can push into an index seek. See
-[Rules § Sargable range rewrites](optimizer-rules.md#sargable-range-rewrites).
+[Rule Families § Sargable range rewrites](optimizer-rule-families.md#sargable-range-rewrites).
 
 ### TVF property declarations
 
@@ -797,7 +798,7 @@ which pins the predicate's contract and the negative-fold cases.
 Filter predicates are normalized, split into constraints, and pushed as far toward the data
 as each module will accept — the supported-only placement policy keeps unsupported residuals
 above the `Retrieve` boundary. See
-[Rules § Predicate Analysis and Pushdown](optimizer-rules.md#predicate-analysis-and-pushdown).
+[Rule Families § Predicate Analysis and Pushdown](optimizer-rule-families.md#predicate-analysis-and-pushdown).
 
 ### Property Propagation
 ```typescript
@@ -1048,7 +1049,7 @@ Equality on every column of a unique key caps a relation at one row; foreign key
 inclusion dependencies that let a semi-join fold to its left side and an anti-join fold to
 empty; an unsatisfiable predicate folds to `EmptyRelationNode`, which then cascades. These
 rules and the key-propagation rules that feed them are in
-[Optimizer Rules](optimizer-rules.md#key-driven-row-count-reduction).
+[Optimizer Rule Families](optimizer-rule-families.md#key-driven-row-count-reduction).
 
 ## Parallel-track recognition
 

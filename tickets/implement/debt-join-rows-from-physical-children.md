@@ -1,5 +1,6 @@
 description: The planner cannot say how many rows a join will produce once the query has been fully optimized, so every row estimate above a join is blank — which makes the join-filter row estimates the planner just learned to compute invisible.
 files: packages/quereus/src/planner/nodes/join-node.ts, packages/quereus/src/planner/util/key-utils.ts, packages/quereus/src/planner/nodes/table-access-nodes.ts
+prereq: debt-access-node-catalog-cardinality
 ----
 
 ## What's wrong

@@ -77,7 +77,7 @@ export interface LogicalType {
   // For monotone-but-lossy transforms (e.g. `date(ts) = D`), compute the
   // half-open range `[lowerInclusive, upperExclusive)` on the input value.
   // `kind` is named by the function schema's `rangeRewriteOnArg` trait;
-  // see docs/optimizer-rules.md § "Sargable range rewrites".
+  // see docs/optimizer-rule-families.md § "Sargable range rewrites".
   bucketBounds?(
     kind: string,
     value: SqlValue,

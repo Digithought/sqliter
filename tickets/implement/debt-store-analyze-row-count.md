@@ -5,6 +5,7 @@ files:
   - packages/quereus/src/runtime/emit/analyze.ts            # ANALYZE: calls vtab.getStatistics() when the table has one
   - packages/quereus/src/planner/stats/catalog-stats.ts     # where a collected count would be read back from
   - packages/quereus-store/test/pushdown.spec.ts            # where a regression test would sit
+prereq: debt-access-node-catalog-cardinality
 difficulty: medium
 ---
 

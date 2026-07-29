@@ -156,7 +156,7 @@ Bindings are closed over equivalence classes: at every node that contributes bin
 
 > **Invariant:** [OPT-042](invariants.md#opt-042--an-outer-join-drops-the-null-padded-sides-facts), [OPT-048](invariants.md#opt-048--dependency-facts-index-output-columns)
 
-This table is canonical. [Rules § Key-driven row-count reduction](optimizer-rules.md#key-driven-row-count-reduction) restates the join arms from `analyzeJoinKeyCoverage`'s point of view; if the two ever disagree, this one is right.
+This table is canonical. [Rule Families § Key-driven row-count reduction](optimizer-rule-families.md#key-driven-row-count-reduction) restates the join arms from `analyzeJoinKeyCoverage`'s point of view; if the two ever disagree, this one is right.
 
 | Operator                                  | FDs / ECs added or transformed                                                                                                              |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -228,7 +228,7 @@ type IndTarget =
 | `AggregateNode` / `SetOperationNode` / `WindowNode`            | Emit none — these reshape relational identity.                                                                                             |
 | `AsyncGatherNode` (crossProduct)                               | Could shift+merge like FDs, but **deferred** (no consumer) — left undefined with a code comment.                                           |
 
-**Relationship to the FK-declaration helpers.** The propagated IND set is a **parallel derivation surface**, not a migration of `util/ind-utils.ts`. The three FK rules (`rule-anti-join-fk-empty`, `rule-semi-join-fk-trivial`, `rule-join-elimination`) and the `lookupCoveringFK` / `isRowPreservingPathToTable` helpers still consume the FK *declaration* directly — they need the nullability split and positional composite pairing that a coarse `child ⊆ parent` fact does not carry. The **only consumer** of `PhysicalProperties.inds` is the coverage prover: its inner/cross no-row-loss obligation tries the propagated IND surface first and falls back to the structural `lookupCoveringFK` check (see [Coverage proving](#coverage-proving) below). See [Optimizer Rules § Key-driven row-count reduction](optimizer-rules.md#key-driven-row-count-reduction) for the on-demand helpers and rules.
+**Relationship to the FK-declaration helpers.** The propagated IND set is a **parallel derivation surface**, not a migration of `util/ind-utils.ts`. The three FK rules (`rule-anti-join-fk-empty`, `rule-semi-join-fk-trivial`, `rule-join-elimination`) and the `lookupCoveringFK` / `isRowPreservingPathToTable` helpers still consume the FK *declaration* directly — they need the nullability split and positional composite pairing that a coarse `child ⊆ parent` fact does not carry. The **only consumer** of `PhysicalProperties.inds` is the coverage prover: its inner/cross no-row-loss obligation tries the propagated IND surface first and falls back to the structural `lookupCoveringFK` check (see [Coverage proving](#coverage-proving) below). See [Optimizer Rule Families § Key-driven row-count reduction](optimizer-rule-families.md#key-driven-row-count-reduction) for the on-demand helpers and rules.
 
 ## Check-derived contributions
 

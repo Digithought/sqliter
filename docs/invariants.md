@@ -483,7 +483,7 @@ rewriting its inherited logical keys.
 
 The read-side rewrite and the coverage prover are optimizer concerns, not MV ones: a view no
 query rewrites onto is still correct. See
-[Optimizer Rules](optimizer-rules.md#materialized-view-query-rewrite-read-side).
+[Optimizer Rule Families](optimizer-rule-families.md#materialized-view-query-rewrite-read-side).
 
 ### MV-001 — A materialized view is a faster plain view
 

@@ -157,7 +157,7 @@ export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanN
 - `SeqScanNode`: Full table scan
 - `IndexScanNode`: Index-based scan with filters
 - `IndexSeekNode`: Index-based point/range lookups
-- `EmptyResultNode`: Zero-row short-circuit at the access boundary (e.g., `IS NULL` on NOT NULL column). Sibling node `EmptyRelationNode` (`planner/nodes/empty-relation-node.ts`) covers the schema-polymorphic empty case for general fold rules — `EmptyResultNode` stays bound to a `TableReferenceNode` (for EXPLAIN), while `EmptyRelationNode` is detached from any specific source. See [Rules § Empty-relation folding](optimizer-rules.md#empty-relation-folding).
+- `EmptyResultNode`: Zero-row short-circuit at the access boundary (e.g., `IS NULL` on NOT NULL column). Sibling node `EmptyRelationNode` (`planner/nodes/empty-relation-node.ts`) covers the schema-polymorphic empty case for general fold rules — `EmptyResultNode` stays bound to a `TableReferenceNode` (for EXPLAIN), while `EmptyRelationNode` is detached from any specific source. See [Rule Families § Empty-relation folding](optimizer-rule-families.md#empty-relation-folding).
 
 ### Parameterization hand-off
 

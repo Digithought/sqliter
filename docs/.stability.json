@@ -26,6 +26,7 @@
 		"docs/optimizer-joins.md": "Internal",
 		"docs/optimizer-parallel.md": "Internal",
 		"docs/optimizer-retrieve.md": "Internal",
+		"docs/optimizer-rule-families.md": "Internal",
 		"docs/optimizer-rules.md": "Internal",
 		"docs/optimizer-streaming.md": "Internal",
 		"docs/optimizer.md": "Internal",

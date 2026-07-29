@@ -43,3 +43,15 @@ A type error in a sync spec fails a normal local/CI gate.
   `lint`) actually run theirs. Worth one sweep rather than a per-package fix —
   but check each package passes before wiring it in; one with pre-existing spec
   type errors needs those fixed first and may deserve its own ticket.
+
+## Folded from duplicate `debt-sync-typecheck-test-files`
+
+A second measurement (during review of `1-sync-changelog-orphan-cleanup`) ran a
+throwaway strict `tsconfig.test.json` over `quereus-sync` and found the only
+failures were **13 `TS6133` unused-declaration errors** across three spec files —
+no genuine type errors. Whether these surface depends on `noUnusedLocals`; wire
+the config with the same strictness `src/` uses and clear them as part of this
+ticket. Two of the unused bindings may be masking a dropped assertion rather than
+being clutter — `sync-protocol-e2e.spec.ts` computes `changeLogAfterFirst` and
+`deleteHlc` and never asserts on either. Check whether an assertion went missing
+before deleting them reflexively.

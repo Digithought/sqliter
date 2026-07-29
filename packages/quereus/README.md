@@ -183,7 +183,7 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 * [Runtime](../../docs/runtime.md) — instruction-based execution and opcodes
 * [Error Handling](../../docs/errors.md) — error types and status codes
 * [Plugin System](../../docs/plugins.md) — virtual tables, functions, and collations
-* [Optimizer](../../docs/optimizer.md) — hub; topic docs for [Rules](../../docs/optimizer-rules.md), [Joins](../../docs/optimizer-joins.md), [Retrieve Push-down](../../docs/optimizer-retrieve.md), [Streaming](../../docs/optimizer-streaming.md), [Parallel](../../docs/optimizer-parallel.md), [Assertions](../../docs/optimizer-assertions.md), [Functional Dependencies](../../docs/optimizer-fd.md), [Conventions](../../docs/optimizer-conventions.md)
+* [Optimizer](../../docs/optimizer.md) — hub; topic docs for [Rules](../../docs/optimizer-rules.md), [Rule Families](../../docs/optimizer-rule-families.md), [Joins](../../docs/optimizer-joins.md), [Retrieve Push-down](../../docs/optimizer-retrieve.md), [Streaming](../../docs/optimizer-streaming.md), [Parallel](../../docs/optimizer-parallel.md), [Assertions](../../docs/optimizer-assertions.md), [Functional Dependencies](../../docs/optimizer-fd.md), [Conventions](../../docs/optimizer-conventions.md)
 * [Change-scope Introspection](../../docs/change-scope.md) — what a prepared statement reads from
 * [TODO List](../../docs/todo.md) — planned features
 
