@@ -9,8 +9,9 @@
  * These assertions read the `inCount=` token straight off the chosen
  * IndexSeekNode's `filterInfo.idxStr` (the string handed to xFilter), which is
  * where the lie used to live. The companion result-correctness coverage is in
- * `test/logic/07.9-in-value-list.sqllogic` and
- * `test/optimizer/secondary-index-access.spec.ts`.
+ * `test/logic/07.9-in-value-list.sqllogic` (PK / inline-UNIQUE multi-seeks),
+ * `test/logic/07.9.1-in-value-list-composite-index.sqllogic` (the composite
+ * `create index` cross-product) and `test/optimizer/secondary-index-access.spec.ts`.
  */
 
 import { expect } from 'chai';

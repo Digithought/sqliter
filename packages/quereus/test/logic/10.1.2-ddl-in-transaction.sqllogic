@@ -9,11 +9,9 @@
 --
 -- requires-capability: standalone-index-ddl
 --
--- NOTE: §3 and §5 exercise `alter table ... add constraint ... unique`, a different statement
--- from `create index`. Capability granularity is whole-file, so they ride along under the same
--- token. That is right today — no backend is known to support one and not the other. If a
--- backend ever reports it supports `add constraint ... unique` but not standalone index DDL,
--- split this file rather than adding a second token speculatively.
+-- The `alter table ... add constraint ... unique` twins of §1 and §4 need no index DDL at all,
+-- so they live in 10.1.2.1-add-constraint-in-transaction and run on every backend. Everything
+-- left here builds the constraint through `create unique index`.
 
 -- ===================================
 -- 1. create unique index over rows the transaction just inserted
@@ -57,22 +55,7 @@ select count(*) as cnt from ddl_tx_a;
 -- ===================================
 -- 3. add constraint ... unique over rows the transaction just inserted
 -- ===================================
-
-create table ddl_tx_b (id integer primary key, v text);
--- run
-begin;
--- run
-insert into ddl_tx_b values (1, 'a');
--- run
-insert into ddl_tx_b values (2, 'a');
--- run
-alter table ddl_tx_b add constraint ddl_tx_b_u unique (v);
--- error: UNIQUE constraint failed
-rollback;
--- run
-
-select count(*) as cnt from ddl_tx_b;
-→ [{ "cnt": 0 }]
+-- Lives in 10.1.2.1-add-constraint-in-transaction § 1 (it needs no index DDL).
 
 -- ===================================
 -- 4. Accepted DDL enforces the new constraint for the rest of the transaction
@@ -105,24 +88,7 @@ insert into ddl_tx_c values (4, 'b');
 -- ===================================
 -- 5. Same, through add constraint ... unique
 -- ===================================
-
-create table ddl_tx_d (id integer primary key, v text);
--- run
-begin;
--- run
-insert into ddl_tx_d values (1, 'a');
--- run
-alter table ddl_tx_d add constraint ddl_tx_d_u unique (v);
--- run
-insert into ddl_tx_d values (2, 'a');
--- error: UNIQUE constraint failed
-insert into ddl_tx_d values (3, 'b');
--- run
-commit;
--- run
-
-select id, v from ddl_tx_d order by id;
-→ [{ "id": 1, "v": "a" }, { "id": 3, "v": "b" }]
+-- Lives in 10.1.2.1-add-constraint-in-transaction § 2 (it needs no index DDL).
 
 -- ===================================
 -- 6. A pending DELETE removes a committed duplicate, so the build is legal
@@ -169,11 +135,7 @@ select count(*) as cnt from ddl_tx_f;
 -- Cleanup
 drop table ddl_tx_a;
 -- run
-drop table ddl_tx_b;
--- run
 drop table ddl_tx_c;
--- run
-drop table ddl_tx_d;
 -- run
 drop table ddl_tx_e;
 -- run

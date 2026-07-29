@@ -763,6 +763,7 @@ dependency returns — never a silent pass.
 - code: `packages/quereus/src/vtab/memory/layer/manager.ts` — `enforceSecondaryUniqueOnMaintenance`
 - code: `packages/quereus-store/src/common/store-table-constraints.ts` — `enforceSecondaryUniqueForMaintenance`
 - guard: `packages/quereus/test/logic/51.9-maintained-table-secondary-unique.sqllogic`
+- guard: `packages/quereus/test/logic/51.9.1-maintained-table-partial-unique.sqllogic` — the partial-UNIQUE scope case (split out because a partial UNIQUE can only be spelled as `create unique index … where …`)
 - doc: [Derived-Row Constraints § Declared secondary UNIQUE](mv-constraints.md#declared-secondary-unique)
 
 A UNIQUE collision is a property of a *pair* of rows, so it does not fit the per-row

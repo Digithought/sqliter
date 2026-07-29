@@ -580,10 +580,10 @@ drop view v_new;
 drop table vr_t;
 
 -- ===================================
--- 17. Hinted INDEX rename, body unchanged -> drop + recreate
+-- 17. Hinted INDEX rename, body unchanged → drop + recreate
 -- ===================================
 -- Lives in 50.2.1-declare-schema-index-renames (it needs standalone index DDL);
--- the VIEW-kind twin of this case is section 16 above.
+-- the VIEW-kind twin of this case is § 16 above.
 
 -- ===================================
 -- 18. Hinted VIEW rename + non-hint tag drift → recreate carries the tags
@@ -666,15 +666,15 @@ drop table cr_t;
 -- 20. Hinted INDEX rename + in-diff COLUMN rename of its table
 -- ===================================
 -- Lives in 50.2.1-declare-schema-index-renames (it needs standalone index DDL);
--- section 19 above is the VIEW-kind twin.
+-- § 19 above is the VIEW-kind twin.
 
 -- ===================================
 -- 21. require-hint: a hinted VIEW rename applies cleanly
 -- ===================================
 
 -- A hinted rename's drop+create pair is deliberate, not an ambiguous unhinted
--- rename -- it must not trip the require-hint guard (excluded from the counts,
--- like the body-change recreates of section 14). The same case with an index
+-- rename — it must not trip the require-hint guard (excluded from the counts,
+-- like the body-change recreates of § 14). The same case with an index
 -- rename alongside is in 50.2.1-declare-schema-index-renames.
 
 create table rh2_t (id integer primary key, v integer);

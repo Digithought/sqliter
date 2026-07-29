@@ -41,7 +41,10 @@ const DIRECTIVE_RE = /^--\s*requires-capability\s*:\s*(.*)$/i;
  * Matches on the canonical form too — check `DIRECTIVE_RE` first.
  *
  * NOTE: deliberately loose, so it also fires on prose that merely opens a comment line with
- * "requires capability" / "required capability" (no colon needed). No corpus file does that today.
+ * "requires capability" / "required capability" (no colon needed). No corpus file trips it today,
+ * but the split-out sibling files (`06.3.6-schema-views`, `10.1.2.1-add-constraint-in-transaction`,
+ * `10.1.3.1-drop-constraint-in-transaction`) name the directive in their header prose and stay
+ * clear only because they backtick-quote it — dropping the backticks would hard-error the file.
  * If a legitimate header comment ever trips it, rephrase the prose — do not narrow this regex,
  * since a narrower one lets a real typo through silently.
  */

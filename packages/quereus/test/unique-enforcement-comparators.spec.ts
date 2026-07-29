@@ -11,7 +11,9 @@
  *     it would silently drop those enforcement semantics.
  *
  * The end-to-end behavior lives in `test/logic/15.1-semantic-ordering.sqllogic` and
- * `test/logic/102.2-unique-collation.sqllogic`; this suite pins the rule itself, so
+ * `test/logic/102.2-unique-collation.sqllogic`, with the index-derived halves of both
+ * in their `15.1.2-…-index` / `102.2.1-…-index-derived` siblings (split out because
+ * they need standalone index DDL); this suite pins the rule itself, so
  * a re-validator that stops calling the helper still leaves the contract asserted.
  */
 

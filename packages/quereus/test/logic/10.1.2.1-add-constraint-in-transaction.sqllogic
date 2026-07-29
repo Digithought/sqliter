@@ -1,0 +1,59 @@
+-- Adding a UNIQUE constraint inside an open transaction must see the rows that transaction
+-- has written but not yet committed, and must stay enforced for the rest of it.
+--
+-- Carved out of 10.1.2-ddl-in-transaction, which is annotated
+-- `requires-capability: standalone-index-ddl` because its subject is `create unique index`.
+-- These two sections are the constraint-side twins of that file's § 1 and § 4 and use no
+-- index DDL, so a backend skipping 10.1.2 would have lost them for no reason.
+--
+-- Runs against every backend (memory, store). Each statement is its own block so an
+-- expected failure is attributed to exactly one statement.
+
+-- ===================================
+-- 1. add constraint ... unique over rows the transaction just inserted
+-- ===================================
+
+create table ddl_tx_b (id integer primary key, v text);
+-- run
+begin;
+-- run
+insert into ddl_tx_b values (1, 'a');
+-- run
+insert into ddl_tx_b values (2, 'a');
+-- run
+alter table ddl_tx_b add constraint ddl_tx_b_u unique (v);
+-- error: UNIQUE constraint failed
+rollback;
+-- run
+
+-- The rejected transaction left nothing behind.
+select count(*) as cnt from ddl_tx_b;
+→ [{ "cnt": 0 }]
+
+-- ===================================
+-- 2. An accepted add constraint enforces for the rest of the transaction
+-- ===================================
+
+create table ddl_tx_d (id integer primary key, v text);
+-- run
+begin;
+-- run
+insert into ddl_tx_d values (1, 'a');
+-- run
+alter table ddl_tx_d add constraint ddl_tx_d_u unique (v);
+-- run
+insert into ddl_tx_d values (2, 'a');
+-- error: UNIQUE constraint failed
+insert into ddl_tx_d values (3, 'b');
+-- run
+commit;
+-- run
+
+select id, v from ddl_tx_d order by id;
+→ [{ "id": 1, "v": "a" }, { "id": 3, "v": "b" }]
+
+-- Cleanup
+drop table ddl_tx_b;
+-- run
+drop table ddl_tx_d;
+-- run

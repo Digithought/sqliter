@@ -8,7 +8,9 @@
  *  - Plan time: constraint extraction declines literal-NULL range/BETWEEN
  *    conjuncts (they stay residual filters), and the access-path rule emits
  *    an EmptyResult for literal-NULL equality seeks. Literal coverage lives
- *    in `test/logic/21.1-where-null-comparisons.sqllogic`.
+ *    in `test/logic/21.1-where-null-comparisons.sqllogic` (PK columns) and
+ *    `test/logic/21.1.1-where-null-comparisons-secondary-index.sqllogic`
+ *    (secondary-indexed columns).
  *  - Runtime: `planAppliesToKey` rejects every key when a bound value or
  *    equality-prefix component is NULL — the only guard for parameters bound
  *    to NULL, which is what this spec exercises (sqllogic can't bind params).

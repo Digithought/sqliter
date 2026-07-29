@@ -22,10 +22,10 @@
 -- file runs on both legs.
 
 -- ===================================
--- 1. Colliding rows under an explicit `create unique index` -> the ALTER is REJECTED.
+-- 1. Colliding rows under an explicit `create unique index` → the ALTER is REJECTED.
 -- ===================================
 -- Lives in 41.7.4.1-alter-column-retype-semantic-index-memory (it needs standalone index
--- DDL); section 2 below is the same collision through an inline `v text unique`.
+-- DDL); § 2 below is the same collision through an inline `v text unique`.
 
 -- ===================================
 -- 2. Same collision through an inline `v text unique` (the auto-built covering index

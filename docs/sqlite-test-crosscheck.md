@@ -209,7 +209,7 @@ These exercise design differences from SQLite. Listed so reviewers don't try to 
 - `50-declarative-schema.sqllogic`, `50.1-declare-schema-pk.sqllogic`, `50-metadata-tags.sqllogic` — declarative schema.
 - `80-grow-retrieve-pass.sqllogic`, `81-quickpick.sqllogic`, `82-bloom-join.sqllogic`, `83-merge-join.sqllogic`, `91-merge-join-edge-cases.sqllogic`, `84-key-cardinality.sqllogic`, `85-relational-const-folding.sqllogic`, `86-scalar-cse.sqllogic`, `100-predicate-normalization-edge-cases.sqllogic`, `108-cardinality-estimation.sqllogic`, `109-aggregate-physical-selection.sqllogic` — optimizer rules and plan-shape decisions.
 - `95-assertions.sqllogic` — `CREATE ASSERTION`.
-- `101-builtin-mutation-kills.sqllogic`, `104-emit-mutation-kills.sqllogic`, `105-vtab-memory-mutation-kills.sqllogic`, `106-constraint-extractor-mutation-kills.sqllogic`, `107-temporal-arithmetic-mutation-kills.sqllogic`, `110-scan-emitter-mutation-kills.sqllogic` — mutation-testing kill files.
+- `101-builtin-mutation-kills.sqllogic`, `104-emit-mutation-kills.sqllogic`, `105-vtab-memory-mutation-kills.sqllogic`, `105.1-vtab-memory-index-mutation-kills.sqllogic`, `106-constraint-extractor-mutation-kills.sqllogic`, `107-temporal-arithmetic-mutation-kills.sqllogic`, `110-scan-emitter-mutation-kills.sqllogic`, `110.1-scan-emitter-index-scan-kills.sqllogic` — mutation-testing kill files (the `.1` siblings hold the sections that need standalone index DDL).
 - `15-timespan.sqllogic` — interval/timespan type.
 - `06.4-schema-search-path.sqllogic`, `06.3.1-schema-all-schemas.sqllogic` — multi-schema search path.
 - `14-utilities.sqllogic`, `pushdown-test.sqllogic` — internal utilities.
