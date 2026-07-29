@@ -214,7 +214,7 @@ batch ⇒ one transaction ⇒ one HLC. It is purely additive — the per-event
 `onDataChange` / `onSchemaChange` channels are untouched.
 
 **Why not the store coordinator.** The store has one `TransactionCoordinator` *per
-module* (`store-module.ts` `getCoordinator()`), shared by every table. A **cross-module**
+module* (`store-module-base.ts` `getCoordinator()`), shared by every table. A **cross-module**
 transaction (e.g. a store source plus a memory source, or two durable modules) spans
 several coordinators/emitters, each firing its own event burst, so a per-coordinator
 commit would split one logical transaction into multiple groups and assign it multiple

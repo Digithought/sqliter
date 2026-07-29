@@ -385,7 +385,7 @@ describe('materialized views `using store` (end-to-end)', () => {
 		it('a narrowing retype reshapes the durable store backing against the reconciled body, not the stale rows (no MISMATCH)', async () => {
 			// Store analogue of the memory `narrowing retype validates the reconciled
 			// body` regression (`maintained-table-reshape-narrowing-attr-on-stale-data`).
-			// Pins `store-module.ts`'s `alterColumn` setDataType arm under a narrowing:
+			// Pins `store-module-alter-column.ts`'s setDataType arm under a narrowing:
 			// the backing goes stale on an unrelated source add, so a source data-fix is
 			// NOT maintained in (the durable backing keeps the un-convertible 'abc'). The
 			// deferred post-reconcile retype must validate the clean re-derived body.

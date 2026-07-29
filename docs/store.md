@@ -649,7 +649,7 @@ string leaf or an object key raises exactly as `encodeText` raises for a text co
 Identifiers are guarded the same way. `buildCatalogKey`, `buildViewCatalogKey`,
 `buildMaterializedViewCatalogKey`, and `buildStatsKey` (`key-builder.ts`) all raise before
 encoding a schema/table/view name carrying an unpaired surrogate, and the full persisted DDL
-text (`saveTableDDL` and the other catalog-write sites in `store-module.ts`) is guarded too —
+text (`saveTableDDL` and the other catalog-write sites in `store-module-catalog.ts`) is guarded too —
 a lone surrogate in a quoted column name or a `default`/`check` string literal is caught even
 when the table's own name is clean.
 
@@ -734,7 +734,17 @@ packages/quereus-store/                # Core (platform-agnostic)
       store-table-constraints.ts # StoreTableConstraints: secondary-index maintenance + UNIQUE enforcement
       store-table.ts    # Generic StoreTable (uses KVStore abstraction) — the write path
       store-connection.ts  # Generic transaction connection
-      store-module.ts   # Generic StoreModule
+      store-module-base.ts         # StoreModuleBase: module state, store handles, coordinator, name-collision guard
+      store-module-catalog.ts      # StoreModuleCatalog: the catalog store (DDL entries, shutdown marker, stale-MV set)
+      store-module-schema-sync.ts  # StoreModuleSchemaSync: rehydration + engine schema-change subscription
+      store-module-index.ts        # StoreModuleIndex: CREATE/DROP INDEX and the `_uc_*` store reconcile
+      store-module-index-build.ts  # Index population + UNIQUE validation helpers (free functions)
+      store-module-alter-column.ts # StoreModuleAlterColumn: ALTER COLUMN + its pure per-attribute sub-branches
+      store-module-alter.ts        # StoreModuleAlter: ALTER TABLE dispatch and every other arm
+      store-module-rename.ts       # StoreModuleRename: two-phase RENAME TABLE
+      store-module-access-plan.ts  # Access planning (free functions) — mirror of store-table-scan.ts
+      store-module-schema-rewrite.ts # Pure schema rewrites: PK collation reconcile, self-FK retarget
+      store-module.ts   # Generic StoreModule — lifecycle, capabilities, backing host
       transaction.ts    # Transaction coordinator
       index.ts          # Common module exports
 
@@ -773,10 +783,50 @@ divide the file. A layer may call downward (a scan may read the base's effective
 iterator) but never upward. Nothing enforces that rule explicitly — it holds because a
 base class cannot name a subclass member, so an upward call fails to compile.
 
-- NOTE: the two largest layers sit near 900 lines each. If either passes ~1,000, split it
-  the same way — the scan layer's natural next seam is the multi-seek group
+`StoreModule` is layered the same way, over more files because it does more jobs:
+
+```
+StoreModuleBase          store-module-base.ts        provider/store handles, the module's
+                                                     StoreTable map, the shared coordinator,
+                                                     the catalog-write queue, name collisions
+  └ StoreModuleCatalog   store-module-catalog.ts     catalog entries for tables/views/MVs,
+                                                     clean-shutdown marker, stale-MV set
+    └ StoreModuleSchemaSync
+                         store-module-schema-sync.ts rehydrate at open, lazy table reconnect,
+                                                     engine schema-change subscription
+      └ StoreModuleIndex store-module-index.ts       create/drop index, `_uc_*` reconcile
+        └ StoreModuleAlterColumn
+                         store-module-alter-column.ts alter column (value rewrites, re-keys)
+          └ StoreModuleAlter
+                         store-module-alter.ts       alter table: every other arm
+            └ StoreModuleRename
+                         store-module-rename.ts      two-phase rename table
+              └ StoreModule
+                         store-module.ts             create/connect/destroy, capabilities,
+                                                     backing host, closeAll
+```
+
+Three groups came out as free functions instead of layers, because they read no module
+state: `store-module-access-plan.ts` (which access path to advertise),
+`store-module-index-build.ts` (populating an index store, validating uniqueness over a row
+stream) and `store-module-schema-rewrite.ts` (schema-to-schema rewrites). Prefer that shape
+where it works — a free function is testable without constructing a module.
+
+`store-module-access-plan.ts` is the deliberate mirror of `store-table-scan.ts`: the
+planner decides which access path to advertise, the scan layer executes it, and several
+soundness predicates (the collation-cover guards, the partial-index and semantic-ordering
+declines) are duplicated across the two on purpose. A plan that claims a filter the scan
+cannot honor drops the residual `Filter` and returns wrong rows, so the two must be changed
+together.
+
+- NOTE: the two largest `StoreTable` layers sit near 900 lines each. If either passes
+  ~1,000, split it the same way — the scan layer's natural next seam is the multi-seek group
   (`decodeMultiSeekTuples` / `orderTupleValues` / `scanMultiSeek` / `scanMultiSeekPrimary`),
   and the base's is the statistics block.
+- NOTE: no `StoreModule` layer is above ~620 lines today. `store-module-alter.ts` is the
+  one most likely to grow, since every new ALTER arm lands there; if it passes ~900, the
+  natural next seam is the three constraint arms (`alterAddConstraint` /
+  `alterDropConstraint` / `alterRenameConstraint`), which touch no row data.
 
 ## Implementation Status
 

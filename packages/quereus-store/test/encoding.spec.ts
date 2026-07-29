@@ -299,7 +299,7 @@ describe('Key Encoding', () => {
     describe('assertNoUnpairedSurrogate / findUnpairedSurrogate (shared, exported guard)', () => {
       // encodeText's own unpaired-surrogate coverage lives in the describe block above;
       // these tests exercise the exported guard directly — the same one `key-builder.ts`
-      // and `store-module.ts` call for identifiers and persisted DDL text.
+      // and `store-module-catalog.ts` call for identifiers and persisted DDL text.
       const LONE_HIGH = '\uD800';
       const LONE_LOW = '\uDC00';
       const ASTRAL = '\u{10000}';

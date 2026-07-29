@@ -121,8 +121,11 @@ export { StoreConnection } from './store-connection.js';
 // Materialized-view backing host (engine backing-host capability over a store table)
 export { StoreBackingHost } from './backing-host.js';
 
-// Generic store module
-export { StoreModule, type StoreModuleConfig, type RehydrationResult, type RehydrationError, type LensDeploymentListener } from './store-module.js';
+// Generic store module. The class is layered across a chain of files (see the header of
+// store-module.ts); these three own the names the package exports.
+export { StoreModule } from './store-module.js';
+export { type StoreModuleConfig, type LensDeploymentListener } from './store-module-base.js';
+export { type RehydrationResult, type RehydrationError } from './store-module-schema-sync.js';
 
 // Isolation layer utilities
 export {
