@@ -307,6 +307,10 @@ export function isRowPreservingPathToTable(
 ): boolean {
 	if (node instanceof TableReferenceNode) return true;
 	if (node instanceof RetrieveNode) {
+		// NOTE: `throughProject` deliberately stops at the Retrieve boundary — a
+		// pushed-down pipeline is only accepted when it is the bare table. If a
+		// module ever accepts projection pushdown on a semi/anti-join parent side,
+		// this declines a fold it could take; recurse with `options` then.
 		return node.source instanceof TableReferenceNode;
 	}
 	if (node instanceof AliasNode) return isRowPreservingPathToTable(node.source, options);

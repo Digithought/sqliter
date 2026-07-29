@@ -257,6 +257,62 @@ describe('Plan shape: subquery decorrelation', () => {
 			expect(await countSemiJoins(q)).to.equal(1);
 			expect(await allRows(db, q)).to.deep.equal([]);
 		});
+
+		it('folds an anti join through a reordering projection', async () => {
+			// The anti folder peels the same projection. A derived parent table is
+			// the shape that reaches it: the plain `NOT EXISTS` descent strips its
+			// own projection, so without the derived table there is nothing to peel.
+			const q = "SELECT id FROM emp WHERE NOT EXISTS (SELECT 1 FROM (SELECT dname, id FROM dept) d WHERE d.id = emp.dept_id) ORDER BY id";
+			const rows = await planRows(db, q);
+			expect(
+				rows.filter(r => r.op.includes('JOIN') && r.detail.includes('ANTI')),
+				'the anti join should fold to empty',
+			).to.have.lengthOf(0);
+			expect(rows.some(r => r.object_name === 'main.dept'), 'the parent table must never execute').to.equal(false);
+			expect(await allRows(db, q)).to.deep.equal([]);
+		});
+
+		it('keeps the anti join when the equi column is not the referenced parent column', async () => {
+			// `other` is the derived table's output column 0 — the index the FK
+			// references — so an untranslated comparison would fold to empty and
+			// wrongly drop every row. (Its own table pair: the equi column must be
+			// INTEGER, or the implicit cast changes the shape under test.)
+			await db.exec("CREATE TABLE deptx (id INTEGER PRIMARY KEY, other INTEGER) USING memory");
+			await db.exec("CREATE TABLE empx (id INTEGER PRIMARY KEY, dept_id INTEGER NOT NULL REFERENCES deptx(id)) USING memory");
+			await db.exec("INSERT INTO deptx VALUES (1, 99), (2, 98)");
+			await db.exec("INSERT INTO empx VALUES (10, 1), (20, 2)");
+
+			const q = "SELECT id FROM empx WHERE NOT EXISTS (SELECT 1 FROM (SELECT other, id FROM deptx) d WHERE d.other = empx.dept_id) ORDER BY id";
+			const rows = await planRows(db, q);
+			expect(rows.filter(r => r.op.includes('JOIN') && r.detail.includes('ANTI'))).to.have.lengthOf(1);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 10 }, { id: 20 }]);
+		});
+	});
+
+	describe('FK-backed composite key', () => {
+		// A two-column FK is where the positional pairing inside `lookupCoveringFK`
+		// and the per-side index translation have to agree: both equi columns must
+		// be translated, and the FK's declared (fa→a, fb→b) pairing must survive.
+		beforeEach(async () => {
+			await db.exec("CREATE TABLE p (a INTEGER, b INTEGER, extra TEXT, PRIMARY KEY (a, b)) USING memory");
+			await db.exec("CREATE TABLE c (id INTEGER PRIMARY KEY, fa INTEGER NOT NULL, fb INTEGER NOT NULL, FOREIGN KEY (fa, fb) REFERENCES p(a, b)) USING memory");
+			await db.exec("INSERT INTO p VALUES (1, 2, 'x'), (3, 4, 'y')");
+			await db.exec("INSERT INTO c VALUES (10, 1, 2), (20, 3, 4)");
+		});
+
+		it('folds through a derived table that reorders both key columns', async () => {
+			const q = "SELECT id FROM c WHERE EXISTS (SELECT 1 FROM (SELECT b, a, extra FROM p) q WHERE q.a = c.fa AND q.b = c.fb) ORDER BY id";
+			expect(await countSemiJoins(q), 'both equi columns translate back to p(a, b)').to.equal(0);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 10 }, { id: 20 }]);
+		});
+
+		it('keeps the semi join when the equi pairs are permuted against the FK', async () => {
+			// `(fa, fb) REFERENCES p(a, b)` guarantees fa→a and fb→b in that pairing
+			// only; `q.a = c.fb AND q.b = c.fa` is a different, uncovered inclusion.
+			const q = "SELECT id FROM c WHERE EXISTS (SELECT 1 FROM (SELECT b, a, extra FROM p) q WHERE q.a = c.fb AND q.b = c.fa) ORDER BY id";
+			expect(await countSemiJoins(q)).to.equal(1);
+			expect(await allRows(db, q)).to.deep.equal([]);
+		});
 	});
 
 	describe('NOT EXISTS decorrelated into anti-join', () => {
