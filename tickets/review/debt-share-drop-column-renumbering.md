@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-29T07:21:31.226Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\debt-share-drop-column-renumbering.review.2026-07-29T07-21-31-226Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Two storage backends each kept their own copy of the bookkeeping for renumbering a table's positional fields when a column is dropped, and the copies had already drifted apart once and caused a bug; this folds them into one shared routine.
 files:
   - packages/quereus/src/schema/table.ts                    # new shiftSchemaIndicesForDrop (~line 491)
