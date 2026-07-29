@@ -1,43 +1,47 @@
 ---
-description: One source file in the transaction-isolation package has grown to roughly 2,500 lines and now holds two unrelated jobs; split it so each file does one thing.
+description: Two source files in the transaction-isolation package are still around 1,800 and 2,100 lines each; keep splitting them so each file does one job. Part of this was already done — the ALTER TABLE half of the first file has moved out.
 files:
-  - packages/quereus-isolation/src/isolation-module.ts   # ~2,500 lines — the file to split
-  - packages/quereus-isolation/src/isolated-table.ts     # ~2,100 lines — same problem, second candidate
+  - packages/quereus-isolation/src/isolated-table.ts     # 2,077 lines — the bigger remaining candidate
+  - packages/quereus-isolation/src/isolation-module.ts   # 1,825 lines — down from ~2,845; still mixes several jobs
+  - packages/quereus-isolation/src/alter-migration.ts    # 1,078 lines — the piece already split out, for reference
 ---
 
-# Split `isolation-module.ts`
+# Keep splitting the oversized isolation-layer files
 
-`packages/quereus-isolation/src/isolation-module.ts` is ~2,500 lines. It mixes two
-concerns that share almost no state:
+## What already landed
 
-1. **Module lifecycle and bookkeeping** — creating/connecting/destroying tables, the
-   per-connection overlay registry, commit and rollback, savepoint tracking, renames.
-2. **Schema-change forwarding** — the machinery that carries an open overlay across a
-   DDL statement: deriving the backfill/conversion context for each `ALTER TABLE`
-   variant, dry-run validating a connection's staged rows against the pending change,
-   then forwarding the change into the overlay (column shape, column attributes,
-   constraints, primary key), plus the shared error routing and the "poison" messages.
+The `ALTER TABLE` overlay-migration machinery — deriving the per-change-type constants,
+dry-run validating a connection's staged rows against a pending change, and reshaping the
+overlay forward — moved out of `isolation-module.ts` into `alter-migration.ts` (ticket
+`debt-isolation-module-alter-migration-extract`). That took `isolation-module.ts` from
+~2,845 lines to 1,825. **Do not redo that work.**
 
-Job 2 arrived incrementally over a run of tickets and is now roughly 700 lines — the
-bulk of the file's growth. It is cohesive enough to live in its own module (say
-`alter-forward.ts`), reachable from `IsolationModule.alterTable` through a small
-surface, with the overlay-schema construction helpers alongside it.
+## What is left
 
-`isolated-table.ts` (~2,100 lines) has the same shape of problem and is worth the same
-look, but it is a separate split — do not bundle them.
+Two candidates, and they are separate splits — do not bundle them.
+
+**`isolated-table.ts` (2,077 lines)** is now the largest file in the package and has had no
+split at all. It is the per-connection table handle: merged reads, write routing into the
+overlay, cross-layer PK/UNIQUE conflict detection, key ordering and collation resolution,
+savepoint bookkeeping. Several of those are separable subjects.
+
+**`isolation-module.ts` (1,825 lines)** still holds module lifecycle and bookkeeping
+(create/connect/destroy, the per-connection overlay registry, commit and rollback,
+savepoint tracking, renames) alongside the secondary-index DDL forwarding and the
+overlay-schema construction helpers. Those last two are plausible next seams, but the file
+is no longer the emergency it was — judge whether the churn is worth it before splitting
+again.
 
 ## Why it matters
 
-The project's own guidance asks for small single-purpose files and decomposed
-sub-functions. At this size the file is expensive to read, expensive to review, and
-every ticket that touches the isolation layer pays for it. There is no behavior change
-here — this is a pure move-and-reorganize, so it should be verifiable by the existing
-test suite staying green with no test edits.
+The project's own guidance asks for small single-purpose files and decomposed sub-functions.
+At this size a file is expensive to read, expensive to review, and every ticket that touches
+the isolation layer pays for it.
 
 ## Expectations
 
-- No behavior change. `yarn build`, `yarn test`, `yarn lint`, `yarn typecheck` green,
-  with **no** edits to existing test assertions.
+- No behavior change. `yarn build`, `yarn test`, `yarn lint`, `yarn typecheck` green, with
+  **no** edits to existing test assertions.
 - Public exports of `@quereus/isolation` unchanged.
 - The long explanatory doc comments move with the code they explain; cross-references
   between the split files stay resolvable.

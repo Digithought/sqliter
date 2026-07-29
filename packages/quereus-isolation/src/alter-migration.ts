@@ -704,10 +704,7 @@ function buildOverlayAddColumnChange(
 	addColumnCtx: AddColumnBackfillContext,
 	overlayTable: VirtualTable,
 ): SchemaChangeInfo {
-	const tombstoneIdx = overlayTable.tableSchema?.columnIndexMap.get(host.tombstoneColumn.toLowerCase());
-	if (tombstoneIdx === undefined) {
-		throw new QuereusError(`Tombstone column '${host.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
-	}
+	const tombstoneIdx = requireTombstoneIndex(host, overlayTable.tableSchema);
 	const constraints = (change.columnDef.constraints ?? []).filter(c => c.type !== 'notNull');
 	if (!constraints.some(c => c.type === 'null')) constraints.push({ type: 'null' });
 	return {
@@ -887,9 +884,12 @@ export async function reinsertPkRekeyMarkers(
 	}
 }
 
-/** The overlay's tombstone-flag column index, or INTERNAL if the schema lost it. */
-function requireTombstoneIndex(host: AlterMigrationHost, overlaySchema: TableSchema): number {
-	const tombstoneIdx = overlaySchema.columnIndexMap.get(host.tombstoneColumn.toLowerCase());
+/**
+ * The overlay's tombstone-flag column index, or INTERNAL if the schema lost it — or has no
+ * queryable schema at all, which is the same defect from the caller's point of view.
+ */
+function requireTombstoneIndex(host: AlterMigrationHost, overlaySchema: TableSchema | undefined): number {
+	const tombstoneIdx = overlaySchema?.columnIndexMap.get(host.tombstoneColumn.toLowerCase());
 	if (tombstoneIdx === undefined) {
 		throw new QuereusError(`Tombstone column '${host.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
 	}
