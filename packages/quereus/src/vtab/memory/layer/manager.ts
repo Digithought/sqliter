@@ -2072,11 +2072,14 @@ export class MemoryTableManager {
 
 			// Drop the implicit covering index of each removed constraint outright (matched by
 			// the same `uc.name ?? '_uc_<cols>'` convention DROP CONSTRAINT uses, so a user
-			// index that merely shares columns is left untouched). A *single*-column covering
-			// index collapses to empty and is already dropped by `shiftSchemaIndicesForDrop`'s
-			// own `length > 0` filter regardless; this exclusion is what tears down a
-			// *multi*-column covering index, which would otherwise survive orphaned — narrowed
-			// to its surviving columns — in `index_info` and on every write.
+			// index that merely shares columns is left untouched). Only this backend needs the
+			// pass: the covering index deliberately carries no `unique: true` flag (enforcement
+			// routes through `uniqueConstraints`), so `shiftSchemaIndicesForDrop`'s own
+			// drop-unique-indexes-outright rule does not see it. A *single*-column covering index
+			// collapses to empty and is dropped by the helper's `length > 0` filter regardless;
+			// this exclusion is what tears down a *multi*-column one, which would otherwise
+			// survive orphaned — narrowed to its surviving columns — in `index_info` and on every
+			// write.
 			const droppedUcKeys = shifted.removedUniqueConstraints.map(uc => uc.name ?? this.implicitIndexNameFor(uc));
 			const droppedCoveringIndexNames = new Set(droppedUcKeys.map(k => k.toLowerCase()));
 			const updatedIndexes = shifted.indexes.filter(idx => !droppedCoveringIndexNames.has(idx.name.toLowerCase()));

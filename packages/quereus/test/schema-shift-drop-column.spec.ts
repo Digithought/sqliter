@@ -68,6 +68,11 @@ describe('shiftSchemaIndicesForDrop', () => {
 			expect(shiftSchemaIndicesForDrop(schemaFixture(), 3).columns.map(c => c.name)).to.deep.equal(['a', 'b', 'c']);
 		});
 
+		it('rejects an out-of-range index rather than silently no-op shifting', () => {
+			expect(() => shiftSchemaIndicesForDrop(schemaFixture(), -1)).to.throw(/out of range/);
+			expect(() => shiftSchemaIndicesForDrop(schemaFixture(), 4)).to.throw(/out of range/);
+		});
+
 		it('leaves the input schema untouched', () => {
 			const schema = schemaFixture({ uniqueConstraints: Object.freeze([uc([1, 2])]), foreignKeys: Object.freeze([fk([2])]) });
 			shiftSchemaIndicesForDrop(schema, 1);
@@ -169,8 +174,32 @@ describe('shiftSchemaIndicesForDrop', () => {
 		});
 
 		it('preserves index-level fields of a survivor', () => {
-			const schema = schemaFixture({ indexes: Object.freeze([{ ...index('idx_bc', [{ index: 1 }, { index: 2 }]), unique: true }]) });
-			expect(shiftSchemaIndicesForDrop(schema, 1).indexes[0].unique).to.be.true;
+			const tags = Object.freeze({ origin: 'user' });
+			const schema = schemaFixture({ indexes: Object.freeze([{ ...index('idx_bc', [{ index: 1 }, { index: 2 }]), tags }]) });
+			const survivor = shiftSchemaIndicesForDrop(schema, 1).indexes[0];
+			expect(survivor.columns.map(ic => ic.index), 'narrowed to its surviving column').to.deep.equal([1]);
+			expect(survivor.tags).to.equal(tags);
+		});
+
+		it('removes a UNIQUE index naming the dropped column outright rather than narrowing it', () => {
+			// Narrowing `unique (b, c)` to `unique (c)` would invent a constraint the table never
+			// declared — and one nothing enforces, since the matching `derivedFromIndex` UNIQUE
+			// constraint is removed. `index_info`, the planner's at-most-one-partner-row proof, and
+			// the regenerated DDL all read the `unique` flag and would take it at face value.
+			const schema = schemaFixture({
+				indexes: Object.freeze([{ ...index('ux_bc', [{ index: 1 }, { index: 2 }]), unique: true }]),
+				uniqueConstraints: Object.freeze([{ ...uc([1, 2], 'ux_bc'), derivedFromIndex: 'ux_bc' }]),
+			});
+			const shifted = shiftSchemaIndicesForDrop(schema, 1);
+			expect(shifted.indexes, 'index gone, not narrowed to (c)').to.deep.equal([]);
+			expect(shifted.uniqueConstraints, 'derived constraint gone too').to.be.undefined;
+		});
+
+		it('narrows a UNIQUE index that keeps every one of its columns', () => {
+			const schema = schemaFixture({ indexes: Object.freeze([{ ...index('ux_cd', [{ index: 2 }, { index: 3 }]), unique: true }]) });
+			const shifted = shiftSchemaIndicesForDrop(schema, 1);
+			expect(indexColumns(shifted.indexes, 'ux_cd'), 'shifted, still unique').to.deep.equal([1, 2]);
+			expect(shifted.indexes[0].unique).to.be.true;
 		});
 
 		it('returns an empty array (never undefined) when the schema had no indexes', () => {

@@ -1,0 +1,85 @@
+-- 41.10.1-alter-drop-column-unique-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Subject: `ALTER TABLE … DROP COLUMN` over a multi-column `CREATE UNIQUE INDEX` that
+-- spans the dropped column. The index must be removed OUTRIGHT, not narrowed to its
+-- surviving columns — narrowing invents a UNIQUE the table never declared, and one
+-- nothing enforces (the matching derived UNIQUE constraint is removed, since a
+-- constraint missing one of its columns is a different, stronger constraint). A
+-- narrowed survivor would then be reported by index_info, trusted by the planner's
+-- at-most-one-matching-row proofs, and re-persisted as a real CREATE UNIQUE INDEX.
+--
+-- Both cases run under the memory module (`yarn test`) and the store module
+-- (`yarn test:store`); the assertions read module-agnostic engine introspection.
+
+-- ===================================================================
+-- 1. A UNIQUE index spanning the dropped column is removed outright
+-- ===================================================================
+
+create table DcUx (id integer primary key, b integer, c integer);
+create unique index ux_bc on DcUx (b, c);
+alter table DcUx drop column b;
+-- run
+
+-- Neither the index nor its derived constraint survives.
+select count(*) as c from index_info('DcUx');
+→ [{"c":0}]
+select count(*) as c from unique_constraint_info('DcUx');
+→ [{"c":0}]
+
+-- And nothing is enforced over the surviving column: duplicate c values are accepted,
+-- which is correct — no UNIQUE over (c) was ever declared.
+insert into DcUx values (1, 5);
+insert into DcUx values (2, 5);
+select count(*) as c from DcUx;
+→ [{"c":2}]
+
+drop table DcUx;
+-- run
+
+-- ===================================================================
+-- 2. A UNIQUE index that keeps every column is renumbered, not dropped
+-- ===================================================================
+
+create table DcKeep (id integer primary key, b integer, c integer, d integer);
+create unique index ux_cd on DcKeep (c, d);
+insert into DcKeep values (1, 9, 10, 11);
+alter table DcKeep drop column b;
+-- run
+
+-- Survives over its own (renumbered) columns, still unique.
+select index_name, column_name from index_info('DcKeep') order by column_name;
+→ [{"index_name":"ux_cd","column_name":"c"},{"index_name":"ux_cd","column_name":"d"}]
+
+insert into DcKeep values (2, 10, 11);
+-- error: UNIQUE
+
+insert into DcKeep values (3, 10, 12);
+select count(*) as c from DcKeep;
+→ [{"c":2}]
+
+drop table DcKeep;
+-- run
+
+-- ===================================================================
+-- 3. A plain (non-unique) index spanning the dropped column is narrowed —
+--    it constrains nothing, so the surviving columns remain a usable index
+-- ===================================================================
+
+create table DcPlain (id integer primary key, b integer, c integer);
+create index ix_bc on DcPlain (b, c);
+alter table DcPlain drop column b;
+-- run
+
+select index_name, column_name from index_info('DcPlain');
+→ [{"index_name":"ix_bc","column_name":"c"}]
+
+-- Duplicates are fine on a plain index, and the index still serves lookups.
+insert into DcPlain values (1, 5);
+insert into DcPlain values (2, 5);
+select count(*) as c from DcPlain where c = 5;
+→ [{"c":2}]
+
+drop table DcPlain;
+-- run

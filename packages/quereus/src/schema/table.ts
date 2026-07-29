@@ -498,8 +498,15 @@ export function appendIndexToTableSchema(tableSchema: TableSchema, indexSchema: 
  *
  * A PRIMARY KEY member, UNIQUE constraint, or foreign key that names the dropped column is
  * removed outright rather than narrowed — one missing a column is a different, stronger
- * constraint, not a subset of the same one. An index entry that loses every column this way is
- * dropped too. Every survivor has its column indices shifted down over the removed slot.
+ * constraint, not a subset of the same one. A UNIQUE index is removed outright for the same
+ * reason: narrowing `unique (b, c)` to `unique (c)` invents a constraint the table never
+ * declared, and the matching `derivedFromIndex` UNIQUE constraint (the thing that actually
+ * enforces it, see {@link appendIndexToTableSchema}) is removed by the rule above — so a
+ * narrowed survivor would advertise uniqueness nothing checks — which the planner's
+ * at-most-one-partner-row proof (`planner/mutation/multi-source.ts`) reads, `index_info` reports,
+ * and `generateTableDDL` re-persists as a real `CREATE UNIQUE INDEX`. A plain index is narrowed
+ * (it constrains nothing), and one that loses every column is dropped. Every survivor has its
+ * column indices shifted down over the removed slot.
  *
  * `removedUniqueConstraints` (pre-shift, original column indices) is returned alongside so a
  * caller that materializes a physical structure per UNIQUE constraint — the memory module's
@@ -527,6 +534,16 @@ export function shiftSchemaIndicesForDrop(schema: TableSchema, colIndex: number)
 	foreignKeys: ReadonlyArray<ForeignKeyConstraintSchema> | undefined;
 	removedUniqueConstraints: ReadonlyArray<UniqueConstraintSchema>;
 } {
+	if (colIndex < 0 || colIndex >= schema.columns.length) {
+		// Reachable only from a caller that skipped its own name lookup. Out of range, every
+		// shift below is a silent no-op and the schema keeps a column the module has removed.
+		quereusError(
+			`shiftSchemaIndicesForDrop: column index ${colIndex} out of range for table '${schema.name}' `
+				+ `(${schema.columns.length} columns)`,
+			StatusCode.INTERNAL,
+		);
+	}
+
 	const shift = (index: number): number => index > colIndex ? index - 1 : index;
 
 	const columns = Object.freeze(schema.columns.filter((_, idx) => idx !== colIndex));
@@ -544,6 +561,7 @@ export function shiftSchemaIndicesForDrop(schema: TableSchema, colIndex: number)
 		.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(shift)) }));
 
 	const indexes = (schema.indexes ?? [])
+		.filter(idx => !(idx.unique && idx.columns.some(ic => ic.index === colIndex)))
 		.map(idx => ({
 			...idx,
 			columns: idx.columns

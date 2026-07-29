@@ -255,7 +255,16 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// engine-facing `.indexes` never carries the hidden `_uc_*` covering index for a plain
 		// UNIQUE (see `StoreModuleBase.materializedIndexNames`), so there is no by-name exclusion to apply —
 		// `StoreModuleIndex.reconcileImplicitUniqueIndexStores` tears down the physical `_uc_*` store
-		// generically, by diffing the old and new constraint sets after this arm returns.
+		// generically, by diffing the old and new constraint sets after this arm returns. A *user*
+		// `CREATE UNIQUE INDEX` spanning the dropped column is removed from the schema by the helper
+		// itself.
+		//
+		// An index the helper removes outright (unique-spanning-the-slot, or a single-column index
+		// whose only column this is) leaves its physical `{table}_idx_{name}` store behind: nothing
+		// here calls `deleteIndexStore`, and `reconcileImplicitUniqueIndexStores` only covers
+		// `_uc_*` names. Pre-existing (the single-column collapse predates the shared helper) and
+		// tracked by `bug-drop-column-leaks-index-store` — a later `CREATE INDEX` reusing the same
+		// name adopts the stale store rather than a fresh one.
 		const shifted = shiftSchemaIndicesForDrop(oldSchema, colIndex);
 
 		const updatedSchema: TableSchema = {
