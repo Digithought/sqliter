@@ -1908,7 +1908,6 @@ export class MemoryTableManager {
 				throw new QuereusError(`Duplicate column name: ${newColumnSchema.name}`, StatusCode.ERROR);
 			}
 			let defaultValue: SqlValue = null;
-			let defaultIsLiteral = false;
 			const defaultConstraint = columnDefAst.constraints.find(c => c.type === 'default');
 			if (defaultConstraint && defaultConstraint.expr) {
 				// Fold AND convert to the new column's declared type, so the backfilled cell
@@ -1917,7 +1916,6 @@ export class MemoryTableManager {
 				const folded = foldDefaultToType(defaultConstraint.expr, newColumnSchema.logicalType, newColumnSchema.name);
 				if (folded !== undefined) {
 					defaultValue = folded;
-					defaultIsLiteral = true;
 				} else {
 					// A non-literal expression default (e.g. `new.<col>`) is written as NULL
 					// here; the engine backfills these rows per-row immediately after.
@@ -1933,18 +1931,12 @@ export class MemoryTableManager {
 			// each existing row right after this returns, and NOT NULL is then enforced on the
 			// computed values (`BaseLayer.recreatePrimaryTreeWithNewColumn`, plus the
 			// pending-row pass below). Asking only which KIND of DEFAULT was written used to
-			// reject a NOT NULL generated column on a non-empty table the evaluator could fill.
-			//
-			// NOTE: the two DEFAULT-kind clauses are kept alongside it, so this gate stays
-			// laxer than the store's for `default null` on a column that is NOT NULL only by
-			// the session `default_column_nullability` — the store rejects that, memory admits
-			// it and leaves NULLs behind. Tracked as `bug-add-column-default-null-notnull-hole`;
-			// deliberately not changed here, since tightening it is a user-visible DDL
-			// rejection unrelated to the generated-column backfill.
+			// reject a NOT NULL generated column on a non-empty table the evaluator could fill,
+			// and (in the other direction) to admit `default null` on a column that is NOT NULL
+			// only by the session `default_column_nullability`. The gate is value-based now, so
+			// it matches `StoreModuleBase.alterAddColumn` word for word.
 			const tableHasRows = this.baseLayer.primaryTree.at(this.baseLayer.primaryTree.first()) !== undefined;
-			const hasDefaultExpr = !!(defaultConstraint && defaultConstraint.expr);
-			if (newColumnSchema.notNull && defaultValue === null && !defaultIsLiteral && !hasDefaultExpr
-				&& !backfillEvaluator && tableHasRows) {
+			if (newColumnSchema.notNull && defaultValue === null && !backfillEvaluator && tableHasRows) {
 				throw new QuereusError(
 					`Cannot add NOT NULL column '${newColumnSchema.name}' to non-empty table `
 						+ `'${this.schemaName}.${this._tableName}' without a DEFAULT value`,

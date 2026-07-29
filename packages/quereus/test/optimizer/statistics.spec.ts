@@ -585,7 +585,7 @@ describe('VTab-supplied statistics', () => {
 		}
 
 		// ALTER TABLE ADD COLUMN produces a frozen TableSchema in the catalog
-		await db.exec('ALTER TABLE frozen_test ADD COLUMN extra TEXT DEFAULT null');
+		await db.exec('ALTER TABLE frozen_test ADD COLUMN extra TEXT NULL DEFAULT null');
 
 		// Verify the schema is frozen (the memory module freezes it)
 		const schemaBeforeAnalyze = db.schemaManager.findTable('frozen_test');

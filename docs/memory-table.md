@@ -369,9 +369,10 @@ compute phase and an infallible install phase because the ADD backfill can throw
 even when every committed row converts cleanly: all computation runs *before* the first mutation
 anywhere, so a failure — a throwing evaluator, or a per-row DEFAULT that yields NULL for a
 `NOT NULL` column on a pending row — rejects the ALTER with the schema, the base, and every layer
-untouched. (`ADD COLUMN ... NOT NULL` with no usable DEFAULT is rejected earlier still, by the
-emitter's `validateNotNullBackfill`, which queries the DDL connection's *effective* rows and so
-already counts pending ones.) As with every schema
+untouched. (An `ADD COLUMN` whose column is NOT NULL — explicitly, or by the session
+`default_column_nullability` — with no usable DEFAULT is rejected earlier still, by the emitter's
+`validateNotNullBackfill`, which queries the DDL connection's *effective* rows and so already
+counts pending ones. A DEFAULT that folds to NULL counts as "no DEFAULT" there.) As with every schema
 change here, the ALTER itself is **not** undone by `ROLLBACK` / `ROLLBACK TO SAVEPOINT` (DDL is
 non-transactional — see the declared-contract paragraph above); what the reshape guarantees is
 that the transaction's DML — including rows inserted before a savepoint — survives at the new

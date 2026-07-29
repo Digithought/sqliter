@@ -721,3 +721,101 @@ select count(*) as c from t_perrow_bad;
 → [{"c":2}]
 
 drop table t_perrow_bad;
+-- run
+
+-- ===================================
+-- 8. `DEFAULT null` is not a value source
+--
+-- Quereus resolves mandatoriness from the session `default_column_nullability`
+-- (shipped as `not_null`), so a column declared without `null` is NOT NULL even when
+-- the statement text says nothing. A DEFAULT that folds to NULL supplies no value for
+-- the rows that already exist, so the pair is refused on a non-empty table — the same
+-- answer both storage modules give, since the gate asks "is there a value?" and not
+-- "which kind of DEFAULT was written?".
+-- ===================================
+
+-- 8a. Mandatory-by-session-option + `default null` over rows → refused.
+create table t_dn (id integer primary key, name text null);
+insert into t_dn values (1, 'a');
+-- run
+
+alter table t_dn add column extra text default null;
+-- error: NOT NULL
+
+-- The ALTER did not half-apply: the column is absent and writes still work.
+select count(*) as c from table_info('t_dn') where name = 'extra';
+→ [{"c":0}]
+
+insert into t_dn values (2, 'b');
+select count(*) as c from t_dn;
+→ [{"c":2}]
+
+drop table t_dn;
+-- run
+
+-- 8b. Parenthesized `default (null)` is refused identically — the gate is value-based.
+create table t_dn2 (id integer primary key);
+insert into t_dn2 values (1);
+-- run
+
+alter table t_dn2 add column extra text default (null);
+-- error: NOT NULL
+
+select count(*) as c from table_info('t_dn2') where name = 'extra';
+→ [{"c":0}]
+
+drop table t_dn2;
+-- run
+
+-- 8c. Spelled nullable, the same DEFAULT is legal: NULL is a value the column admits.
+create table t_dn3 (id integer primary key, name text null);
+insert into t_dn3 values (1, 'a');
+-- run
+
+alter table t_dn3 add column extra text null default null;
+-- run
+
+select id, extra from t_dn3 order by id;
+→ [{"id":1,"extra":null}]
+
+-- and later inserts over the original column list still work
+insert into t_dn3 (id, name) values (2, 'b');
+select id, name, extra from t_dn3 order by id;
+→ [{"id":1,"name":"a","extra":null},{"id":2,"name":"b","extra":null}]
+
+drop table t_dn3;
+-- run
+
+-- 8d. Empty table → nothing to backfill, so the mandatory column is admitted
+-- (SQLite-compatible), and NOT NULL enforces forward from the first write.
+create table t_dn4 (id integer primary key, name text null);
+-- run
+
+alter table t_dn4 add column extra text default null;
+-- run
+
+select count(*) as c from table_info('t_dn4') where name = 'extra' and notnull = 1;
+→ [{"c":1}]
+
+insert into t_dn4 (id, name) values (1, 'a');
+-- error: NOT NULL
+
+insert into t_dn4 values (2, 'b', 'x');
+select id, extra from t_dn4 order by id;
+→ [{"id":2,"extra":"x"}]
+
+drop table t_dn4;
+-- run
+
+-- 8e. A bare mandatory add (no DEFAULT at all) over rows is refused the same way.
+create table t_dn5 (id integer primary key);
+insert into t_dn5 values (1);
+-- run
+
+alter table t_dn5 add column extra text;
+-- error: NOT NULL
+
+select count(*) as c from table_info('t_dn5') where name = 'extra';
+→ [{"c":0}]
+
+drop table t_dn5;

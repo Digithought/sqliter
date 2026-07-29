@@ -8,7 +8,7 @@ import { QuereusError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition } from '../../schema/table.js';
-import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
+import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType, columnDefToSchema } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
@@ -464,14 +464,29 @@ async function runAddColumn(
 	// backfill, which rejects the ALTER if any row evaluates to NULL. If the table is
 	// non-empty and there is no usable source, reject before mutating any schema or data.
 	//
+	// Mandatoriness is RESOLVED, not read off the statement text: a column is NOT NULL
+	// either by an explicit `not null` or by the session `default_column_nullability`
+	// (which ships as `not_null`), so `add column x text default null` is a mandatory
+	// column with no value for the existing rows and must be refused. `columnDefToSchema`
+	// is the same resolver the memory module, the store module and the isolation layer's
+	// `deriveAddColumnBackfill` use, so a fourth spelling of the rule cannot drift. It
+	// also validates an explicit COLLATE and rejects DEFAULT + GENERATED ALWAYS AS on one
+	// column — both previously raised by the module mid-work, now pre-mutation.
+	//
 	// A module may opt out of this engine-generic rejection via the
 	// `delegatesNotNullBackfill` capability (structurally-total modules that
 	// carry pre-existing rows forward and enforce NOT NULL at write time). When
 	// it declares the capability, the decision is left entirely to its
 	// `alterTable`. Native modules leave it off, so this still fires for them.
 	const delegatesBackfill = module.getCapabilities?.().delegatesNotNullBackfill === true;
-	const hasNotNull = columnDef.constraints?.some(c => c.type === 'notNull') ?? false;
-	if (hasNotNull && !delegatesBackfill && !backfill) {
+	const defaultNotNull = rctx.db.options.getStringOption('default_column_nullability') === 'not_null';
+	const resolvedNotNull = columnDefToSchema(
+		columnDef,
+		defaultNotNull,
+		rctx.db.options.getStringOption('default_collation'),
+		(n) => rctx.db.isCollationRegistered(n),
+	).notNull;
+	if (resolvedNotNull && !delegatesBackfill && !backfill) {
 		const defaultIsNullish = !defaultConstraint?.expr || foldedDefault === null;
 		if (defaultIsNullish) {
 			await validateNotNullBackfill(rctx, tableSchema, columnDef.name);
