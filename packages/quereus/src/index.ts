@@ -265,6 +265,13 @@ export { Latches } from './util/latches.js';
 // any caller that DOES hold one must resolve through `db.getKeyNormalizerResolver()`.
 export { BUILTIN_NORMALIZERS, serializeKey, serializeRowKey, serializeKeyNullGrouping } from './util/key-serializer.js';
 
+// The ONE pk row-identity recipe ("are these two primary keys the same row?"): per pk
+// column, its semantic key transform then its key-collation normalizer, serialized via
+// `serializeKeyNullGrouping`. Shared by `@quereus/isolation`'s overlay row-alignment key and
+// `@quereus/sync`'s per-row CRDT metadata key, so the two layers can never disagree.
+export { makePkIdentitySerializer, resolvePkIdentityKeying } from './util/key-serializer.js';
+export type { PkIdentityColumn, PkIdentityTable, PkIdentityKeying } from './util/key-serializer.js';
+
 // Whether a column's declared type can ever hold text, and therefore whether a key
 // built over it needs a key normalizer at all. Out-of-package hash-key sites (the
 // isolation overlay's modified-PK set) must gate on this exactly as the engine's own

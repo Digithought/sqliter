@@ -4,10 +4,11 @@
  * The sync layer files every per-row record (`cv:`/`tb:`/`cl:`) under the row's
  * IDENTITY — the same "same row?" answer the rest of the engine gives: each pk
  * column normalized under its KEY COLLATION ('apple' ≡ 'APPLE' under nocase) and
- * its logical type's semantic key transform ('PT1H' ≡ 'PT60M' for TIMESPAN).
- * This module resolves that keying from a table's schema, mirroring
- * `makePkKeySerializer` in `@quereus/isolation` (the overlay's row-alignment
- * key) so the two layers can never disagree on row identity.
+ * its logical type's semantic key transform ('PT1H' ≡ 'PT60M' for TIMESPAN). This
+ * module resolves that keying from a table's schema by calling into
+ * `@quereus/quereus`'s `resolvePkIdentityKeying` — the ONE implementation of that
+ * recipe, also used by `makePkKeySerializer` in `@quereus/isolation` (the overlay's
+ * row-alignment key) — so the two layers can never disagree on row identity.
  *
  * Identity is derived and lossy; the row's ADDRESS (a real, type-valid
  * `SqlValue[]` — any spelling from the equivalence class) lives in the record
@@ -15,8 +16,7 @@
  */
 
 import {
-	pkKeyCollationName,
-	semanticKeyTransform,
+	resolvePkIdentityKeying,
 	type KeyNormalizerResolver,
 	type SqlValue,
 	type TableSchema,
@@ -32,31 +32,22 @@ import { encodePkIdentity, RAW_PK_KEYING, type PkKeying } from './keys.js';
 export type PkKeyingResolver = (schemaName: string, tableName: string) => PkKeying;
 
 /**
- * Resolve a table's {@link PkKeying} from its schema:
- *  - normalizers: each pk column's key collation via {@link pkKeyCollationName}
- *    (its own declared collation for a textual column — the store reconciles an
- *    undecorated text pk to the table key collation at CREATE, so the registered
- *    schema always carries it; BINARY for text-capable-but-not-textual columns;
- *    identity for never-text columns via `resolver(undefined)`).
- *  - transforms: the engine's {@link semanticKeyTransform} (the logical type's
- *    `groupKey` — today TIMESPAN → total seconds). Deliberately the ENGINE
- *    transform, not the store's byte-order variant: identity strings need
- *    equality, not memcmp order, so JSON's canonical text is already faithful.
+ * Resolve a table's {@link PkKeying} from its schema. Delegates entirely to
+ * `@quereus/quereus`'s {@link resolvePkIdentityKeying} (per pk column: key collation
+ * via `pkKeyCollationName` — its own declared collation for a textual column, since
+ * the store reconciles an undecorated text pk to the table key collation at CREATE,
+ * so the registered schema always carries it; BINARY for text-capable-but-not-textual
+ * columns; identity for never-text columns — plus the engine's `semanticKeyTransform`,
+ * the logical type's `groupKey`, today TIMESPAN → total seconds. Deliberately the
+ * ENGINE transform, not the store's byte-order variant: identity strings need
+ * equality, not memcmp order, so JSON's canonical text is already faithful), whose
+ * shape is exactly {@link PkKeying}'s. That shared function is also defensive about a
+ * missing `primaryKeyDefinition` or column `logicalType` (test oracles stub minimal
+ * schemas — `{ columns: [{ name }] }` only), degrading a missing piece to the identity
+ * normalizer (raw value identity) instead of crashing.
  */
 export function resolvePkKeying(schema: TableSchema, resolver: KeyNormalizerResolver): PkKeying {
-	// Defensive `?? []` / logicalType guard: a real TableSchema always carries
-	// primaryKeyDefinition and typed columns, but test oracles stub minimal
-	// schemas ({ columns: [{ name }] } only). A missing piece degrades that
-	// position to the identity normalizer (raw value identity) — the same
-	// treatment a keyless stub got before — instead of crashing.
-	const pkDef = schema.primaryKeyDefinition ?? [];
-	return {
-		normalizers: pkDef.map(def => {
-			const column = schema.columns[def.index];
-			return resolver(column?.logicalType ? pkKeyCollationName(column) : undefined);
-		}),
-		transforms: pkDef.map(def => semanticKeyTransform(schema.columns[def.index]?.logicalType)),
-	};
+	return resolvePkIdentityKeying(schema, resolver);
 }
 
 /**

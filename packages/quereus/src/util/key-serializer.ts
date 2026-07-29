@@ -8,6 +8,10 @@
 import type { Row, SqlValue } from '../common/types.js';
 import type { JSONValue } from '../common/json-types.js';
 import { canonicalJsonString } from './json-canonical.js';
+import type { KeyNormalizerResolver } from '../types/logical-type.js';
+import type { LogicalType } from '../types/logical-type.js';
+import { pkKeyCollationName } from '../planner/analysis/comparison-collation.js';
+import { semanticKeyTransform } from './comparison.js';
 
 /** Identity normalizer for BINARY collation (no-op). */
 const IDENTITY_NORMALIZER = (s: string) => s;
@@ -148,4 +152,79 @@ export function serializeRowKey(
 		key += part;
 	}
 	return key;
+}
+
+/** Column shape the pk-identity recipe reads: only what {@link pkKeyCollationName} and
+ *  `semanticKeyTransform` need, so a caller holding a lighter structural stub than the full
+ *  `ColumnSchema` (a test oracle, a schema-less shim) can still use it. */
+export interface PkIdentityColumn {
+	readonly logicalType?: LogicalType;
+	readonly collation?: string;
+}
+
+/** Table shape the pk-identity recipe reads: the primary key's column order, and the
+ *  column definitions it indexes into. Structurally compatible with `TableSchema`. */
+export interface PkIdentityTable {
+	readonly columns: ReadonlyArray<PkIdentityColumn>;
+	readonly primaryKeyDefinition?: ReadonlyArray<{ readonly index: number }>;
+}
+
+/** Per-pk-column normalization and semantic-transform, resolved once from a table's schema. */
+export interface PkIdentityKeying {
+	readonly normalizers: ReadonlyArray<(s: string) => string>;
+	readonly transforms: ReadonlyArray<((v: SqlValue) => SqlValue) | undefined>;
+}
+
+/**
+ * Resolves the ONE recipe for "are these two primary keys the same row?": for each pk
+ * column, its key-collation normalizer ({@link pkKeyCollationName}, resolved through
+ * `resolveNormalizer`) and its logical type's semantic key transform (`semanticKeyTransform`
+ * — TIMESPAN's `groupKey`, so 'PT1H' and 'PT60M' agree).
+ *
+ * Two independent callers key rows by this recipe and must never disagree: the
+ * transaction-isolation overlay (`@quereus/isolation`'s `makePkKeySerializer`, via
+ * {@link makePkIdentitySerializer} below) and the sync engine (`@quereus/sync`'s
+ * `resolvePkKeying`, which returns this shape directly). Change the recipe once, here.
+ *
+ * A missing `primaryKeyDefinition` or a pk column with no `logicalType` degrades that
+ * position to no normalizer/transform (raw value identity) rather than throwing — a real
+ * `TableSchema` never hits either case; the defensiveness is for callers holding a lighter
+ * schema stub.
+ */
+export function resolvePkIdentityKeying(
+	table: PkIdentityTable,
+	resolveNormalizer: KeyNormalizerResolver,
+): PkIdentityKeying {
+	const pkDef = table.primaryKeyDefinition ?? [];
+	return {
+		normalizers: pkDef.map(def => {
+			const column = table.columns[def.index];
+			const logicalType = column?.logicalType;
+			return resolveNormalizer(
+				logicalType ? pkKeyCollationName({ logicalType, collation: column?.collation }) : undefined,
+			);
+		}),
+		transforms: pkDef.map(def => semanticKeyTransform(table.columns[def.index]?.logicalType)),
+	};
+}
+
+/**
+ * Builds the row-identity function for a table's primary key, composing
+ * {@link resolvePkIdentityKeying} with {@link serializeKeyNullGrouping}: each pk value runs
+ * through its column's semantic transform (if any), then the whole list is serialized under
+ * the resolved normalizers. NULL-grouping (not NULL-poisoning), so a degenerate nullable pk
+ * column still produces a usable identity instead of collapsing to `null`.
+ */
+export function makePkIdentitySerializer(
+	table: PkIdentityTable,
+	resolveNormalizer: KeyNormalizerResolver,
+): (pk: readonly SqlValue[]) => string {
+	const { normalizers, transforms } = resolvePkIdentityKeying(table, resolveNormalizer);
+	return pk => serializeKeyNullGrouping(
+		pk.map((v, i) => {
+			const transform = transforms[i];
+			return transform && v !== null ? transform(v) : v;
+		}),
+		normalizers,
+	);
 }
