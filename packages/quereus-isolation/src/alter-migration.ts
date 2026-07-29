@@ -340,10 +340,10 @@ function deriveSetNotNullBackfill(
 /**
  * Precomputes the per-ALTER constants an `alter column … set data type` overlay conversion
  * needs: the retyped column's index and a per-value `convert`. Returns undefined unless this
- * is a retype with at least one overlay to convert, and undefined for an ALIAS retype — both
- * underlyings gate their value rewrite on that same identity comparison, so mirroring it here
- * keeps overlay and committed rows moving together should "what counts as a value-rewriting
- * retype" ever change. A same-storage-class retype between different types (text → date) DOES
+ * is a retype with at least one overlay to convert, and undefined for an ALIAS retype — the
+ * same decision the underlyings gate their own value rewrite on, taken from the same shared
+ * helper, so overlay and committed rows keep moving together should "what counts as a
+ * value-rewriting retype" ever change. A same-storage-class retype between types (text → date) DOES
  * convert: staged values are validated and normalized to the new type's canonical spelling,
  * exactly as the underlyings treat their committed rows.
  *

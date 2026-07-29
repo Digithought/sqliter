@@ -34,6 +34,7 @@ import {
 	validateAndParse,
 	coerceRowToSchema,
 	foldDefaultToType,
+	planRetypeConversion,
 	isValidForType,
 	tryParse,
 } from '../src/types/validation.js';
@@ -605,6 +606,45 @@ describe('Type System', () => {
 			expect(() => foldDefaultToType(lit('abc'), INTEGER_TYPE, 'n'))
 				.to.throw(QuereusError, "Type conversion failed for column 'n'")
 				.with.property('code', StatusCode.MISMATCH);
+		});
+	});
+
+	// ──────────────────── ALTER COLUMN … SET DATA TYPE planning ────────────────────
+	describe('planRetypeConversion', () => {
+		it('should report no conversion for an alias retype (same logical type object)', () => {
+			const plan = planRetypeConversion('varchar(50)', TEXT_TYPE, 'c');
+			expect(plan.newLogicalType).to.equal(TEXT_TYPE);
+			expect(plan.convert).to.equal(null);
+		});
+
+		it('should report no conversion when the declared type is spelled differently but infers the same', () => {
+			expect(planRetypeConversion('bigint', INTEGER_TYPE, 'c').convert).to.equal(null);
+		});
+
+		it('should convert values when the storage class changes', () => {
+			const plan = planRetypeConversion('integer', TEXT_TYPE, 'c');
+			expect(plan.newLogicalType).to.equal(INTEGER_TYPE);
+			expect(plan.convert!('7')).to.equal(7);
+		});
+
+		it('should normalize values on a same-storage-class retype (text → date)', () => {
+			const plan = planRetypeConversion('date', TEXT_TYPE, 'c');
+			expect(plan.newLogicalType).to.equal(DATE_TYPE);
+			expect(plan.convert).to.not.equal(null);
+			expect(plan.convert!('2024-06-05T00:00:00Z')).to.equal('2024-06-05');
+		});
+
+		it('should throw MISMATCH naming the column and the declared type verbatim', () => {
+			const plan = planRetypeConversion('INTEGER', TEXT_TYPE, 'c');
+			expect(() => plan.convert!('hello'))
+				.to.throw(QuereusError, "Cannot convert value in 'c' to INTEGER")
+				.with.property('code', StatusCode.MISMATCH);
+		});
+
+		it('should infer an unknown type name by affinity rather than throwing', () => {
+			// `inferType` falls through SQLite-style affinity rules, so deriving a plan is
+			// always safe — call sites derive it BEFORE mutating anything.
+			expect(() => planRetypeConversion('wibble', TEXT_TYPE, 'c')).to.not.throw();
 		});
 	});
 
