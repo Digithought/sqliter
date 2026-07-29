@@ -595,6 +595,57 @@ SELECT id,
 FROM stream_s_null ORDER BY id;
 → [{"id":1,"s":10,"c":1},{"id":2,"s":40,"c":2},{"id":3,"s":30,"c":1},{"id":4,"s":30,"c":1}]
 
+-- One-sided frames. `CURRENT ROW` is the offset-zero case of the bound it
+-- replaces, so these run the same streaming sliding-buffer state machine as
+-- the two-sided forms above.
+
+-- ROWS BETWEEN 2 PRECEDING AND CURRENT ROW — the trailing moving sum.
+SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":10},{"id":2,"s":30},{"id":3,"s":60},{"id":4,"s":90},{"id":5,"s":120},{"id":6,"s":150}]
+
+-- The start-only spelling `ROWS 2 PRECEDING` means the same frame.
+SELECT id, SUM(val) OVER (ORDER BY id ROWS 2 PRECEDING) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":10},{"id":2,"s":30},{"id":3,"s":60},{"id":4,"s":90},{"id":5,"s":120},{"id":6,"s":150}]
+
+-- ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING — the leading moving sum.
+SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":60},{"id":2,"s":90},{"id":3,"s":120},{"id":4,"s":150},{"id":5,"s":110},{"id":6,"s":60}]
+
+-- ROWS BETWEEN CURRENT ROW AND CURRENT ROW — the single current row.
+SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":10},{"id":2,"s":20},{"id":3,"s":30},{"id":4,"s":40},{"id":5,"s":50},{"id":6,"s":60}]
+
+-- Trailing MIN / MAX (the running min-max shape over an ordered table).
+SELECT id,
+       MIN(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS mn,
+       MAX(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS mx
+FROM stream_s ORDER BY id;
+→ [{"id":1,"mn":10,"mx":10},{"id":2,"mn":10,"mx":20},{"id":3,"mn":20,"mx":30},{"id":4,"mn":30,"mx":40},{"id":5,"mn":40,"mx":50},{"id":6,"mn":50,"mx":60}]
+
+-- A one-sided frame and the default (running) frame in one query: distinct
+-- frames land in distinct window nodes and each keeps its own strategy.
+SELECT id,
+       SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS trailing,
+       SUM(val) OVER (ORDER BY id) AS running
+FROM stream_s ORDER BY id;
+→ [{"id":1,"trailing":10,"running":10},{"id":2,"trailing":30,"running":30},{"id":3,"trailing":50,"running":60},{"id":4,"trailing":70,"running":100},{"id":5,"trailing":90,"running":150},{"id":6,"trailing":110,"running":210}]
+
+-- Trailing frame with PARTITION BY: the frame restarts at each partition.
+SELECT id, SUM(val) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":10},{"id":2,"s":30},{"id":3,"s":50},{"id":4,"s":40},{"id":5,"s":90},{"id":6,"s":110}]
+
+-- One-sided frame over NULL argument values: NULLs still don't contribute.
+SELECT id,
+       SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s,
+       COUNT(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS c
+FROM stream_s_null ORDER BY id;
+→ [{"id":1,"s":10,"c":1},{"id":2,"s":10,"c":1},{"id":3,"s":30,"c":1},{"id":4,"s":30,"c":1}]
+
 DROP TABLE stream_s;
 DROP TABLE stream_s_one;
 DROP TABLE stream_s_null;
@@ -627,6 +678,41 @@ SELECT val,
        MAX(val) OVER (ORDER BY val RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS mx
 FROM range_slide ORDER BY val, id;
 → [{"val":10,"mn":10,"mx":20},{"val":15,"mn":10,"mx":25},{"val":15,"mn":10,"mx":25},{"val":20,"mn":10,"mx":25},{"val":25,"mn":15,"mx":25},{"val":40,"mn":40,"mx":40}]
+
+-- One-sided RANGE frames. In RANGE mode `CURRENT ROW` means the whole peer
+-- group, which is exactly the offset-zero interval [v, v] — so the two 15s
+-- must be treated identically at either edge of the frame.
+
+-- val=10: [0,10] → 10
+-- val=15 (twice): [5,15] → 10,15,15 = 40
+-- val=20: [10,20] → 10,15,15,20 = 60
+-- val=25: [15,25] → 15,15,20,25 = 75
+-- val=40: [30,40] → 40
+SELECT val, SUM(val) OVER (ORDER BY val RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS s
+FROM range_slide ORDER BY val, id;
+→ [{"val":10,"s":10},{"val":15,"s":40},{"val":15,"s":40},{"val":20,"s":60},{"val":25,"s":75},{"val":40,"s":40}]
+
+-- The start-only spelling `RANGE 10 PRECEDING` means the same frame.
+SELECT val, SUM(val) OVER (ORDER BY val RANGE 10 PRECEDING) AS s
+FROM range_slide ORDER BY val, id;
+→ [{"val":10,"s":10},{"val":15,"s":40},{"val":15,"s":40},{"val":20,"s":60},{"val":25,"s":75},{"val":40,"s":40}]
+
+-- val=10: [10,20] → 10,15,15,20 = 60
+-- val=15 (twice): [15,25] → 15,15,20,25 = 75
+-- val=20: [20,30] → 20,25 = 45
+-- val=25: [25,35] → 25
+-- val=40: [40,50] → 40
+SELECT val, SUM(val) OVER (ORDER BY val RANGE BETWEEN CURRENT ROW AND 10 FOLLOWING) AS s
+FROM range_slide ORDER BY val, id;
+→ [{"val":10,"s":60},{"val":15,"s":75},{"val":15,"s":75},{"val":20,"s":45},{"val":25,"s":25},{"val":40,"s":40}]
+
+-- RANGE BETWEEN CURRENT ROW AND CURRENT ROW is exactly the peer group, so the
+-- two val=15 rows each see a frame of 2 rows and everything else sees 1.
+SELECT val,
+       COUNT(*) OVER (ORDER BY val RANGE BETWEEN CURRENT ROW AND CURRENT ROW) AS c,
+       SUM(val) OVER (ORDER BY val RANGE BETWEEN CURRENT ROW AND CURRENT ROW) AS s
+FROM range_slide ORDER BY val, id;
+→ [{"val":10,"c":1,"s":10},{"val":15,"c":2,"s":30},{"val":15,"c":2,"s":30},{"val":20,"c":1,"s":20},{"val":25,"c":1,"s":25},{"val":40,"c":1,"s":40}]
 
 -- NULL ordering values: a NULL-val row's RANGE window is the contiguous NULL
 -- peer span. Finite-val rows' RANGE windows exclude NULL rows entirely.

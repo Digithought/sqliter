@@ -209,8 +209,9 @@ WindowNode are individually recognized):
 | `FIRST_VALUE`, `LAST_VALUE` | yes | LAST_VALUE only under default frame; both also stream under sliding frames (see below) |
 | Running `SUM`, `COUNT`, `AVG`, `MIN`, `MAX` | yes | default frame (`UNBOUNDED PRECEDING TO CURRENT ROW`, ROWS or RANGE) |
 | Sliding `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE` | yes | `ROWS BETWEEN n PRECEDING AND m FOLLOWING` (literal `n,m ≥ 0`) or `RANGE BETWEEN <num> PRECEDING AND <num> FOLLOWING` (single numeric ORDER BY key, literal non-negative offsets) |
+| One-sided sliding (`n PRECEDING AND CURRENT ROW`, `CURRENT ROW AND m FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) | yes | `CURRENT ROW` is the offset-zero case of the bound it replaces, so these run the same sliding state machine. The start-only spellings (`ROWS n PRECEDING`, `RANGE n PRECEDING`, `ROWS CURRENT ROW`) mean `... AND CURRENT ROW` and stream too |
 | `NTILE`, `PERCENT_RANK`, `CUME_DIST` | no | need partition size up-front |
-| Asymmetric sliding (`UNBOUNDED PRECEDING AND m FOLLOWING`, `n PRECEDING AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND m FOLLOWING`) | no | future work |
+| Unbounded-on-one-side sliding (`UNBOUNDED PRECEDING AND m FOLLOWING`, `n PRECEDING AND UNBOUNDED FOLLOWING`) | no | future work — no bounded buffer |
 | `DISTINCT` aggregates | no | future work |
 
 **Bail conditions** (any one drops to the buffered path):
@@ -218,21 +219,36 @@ WindowNode are individually recognized):
 - The leading ORDER BY key is not a trivial column reference, or doesn't match
   source's `monotonicOn` direction.
 - Source's `physical.ordering` doesn't cover the full ORDER BY key set.
-- PARTITION BY columns aren't an emit-order prefix of the source ordering.
+- PARTITION BY columns aren't an emit-order prefix of the source ordering. In
+  practice this rules out *every* partitioned window today: a table access
+  advertises `monotonicOn` for its leading unbound index column only, so on an
+  index `(g, k)` the advertisement names `g` and the leading-ORDER-BY-key check
+  fails for `partition by g order by k`. Widening that advertisement is what
+  would unlock partitioned streaming windows.
 - Any partition-by expression is non-trivial (not a column reference).
 - Any function falls outside the recognized set.
 - Frame is anything other than the default (or the explicit equivalent
   `UNBOUNDED PRECEDING TO CURRENT ROW`), or a supported sliding shape (see
-  the table above).
-- For RANGE-mode sliding frames: more than one ORDER BY key (numeric RANGE
-  offsets require a single sort key per the SQL standard).
+  the table above). Note that `UNBOUNDED PRECEDING AND CURRENT ROW` keeps
+  routing to the cheaper running-accumulator path, not to the sliding buffer.
+- Frame carries an exclusion other than `NO OTHERS` (not currently parseable
+  either — see *Future Enhancements*).
+- For RANGE-mode sliding frames: more than one ORDER BY key, or a single key
+  whose logical type is not numeric. A numeric RANGE offset is arithmetic on
+  the ORDER BY value, which the SQL standard only defines for one sort key of a
+  type arithmetic applies to. The buffered walk falls back to peer-group
+  scanning for a non-numeric key and the streaming scan does not, so the rule
+  leaves that case buffered rather than answer differently.
 
 ### Sliding-frame state machine
 
 Under a sliding frame, `runStreaming` keeps a per-function `slidingBuffer` of
 `{argVal, orderByVal0}` for rows currently in scope plus a list of pending
 entries awaiting finalization. Each pending entry's slot is filled as soon as
-its right edge has been seen.
+its right edge has been seen. `rule-monotonic-window` normalizes every
+recognized frame to a `(preceding, following)` offset pair before it gets here,
+so a one-sided frame is simply that pair with a zero on one side — the state
+machine below has no separate case for it.
 
 - **ROWS** — entries finalize when row `j + following` arrives. SUM/COUNT/AVG
   maintain a `{ sum, count }` accumulator with step+unstep (skipping NULL

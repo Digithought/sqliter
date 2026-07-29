@@ -217,7 +217,7 @@ Window functions over a stream that already arrives in `[PARTITION BY..., ORDER 
 - PARTITION BY columns are an emit-order prefix of the source ordering (any permutation; the rule reorders).
 - All partition-by expressions are trivial column references.
 - Every function in the `WindowNode` is individually recognised (see the [streaming fast-path table](./window-functions.md#streaming-fast-path-over-monotonicon) for the supported set).
-- The frame is either absent (default) or the explicit equivalent of `UNBOUNDED PRECEDING TO CURRENT ROW` (in `ROWS` or `RANGE` mode). Sliding frames are deferred to a follow-up.
+- The frame is either absent (default), the explicit equivalent of `UNBOUNDED PRECEDING TO CURRENT ROW` (in `ROWS` or `RANGE` mode), or a bounded sliding frame — each of its two bounds being a non-negative literal offset or `CURRENT ROW`, which is that bound at offset zero. See the [streaming fast-path table](./window-functions.md#streaming-fast-path-over-monotonicon).
 - No function is `DISTINCT`.
 
 **Output invariant**: a streaming `WindowNode` preserves the source's `monotonicOn` unchanged (the streaming runtime is row-pass-through, no sort intervenes). Downstream rules that key off `physical.monotonicOn` — `monotonic-limit-pushdown`, `monotonic-merge-join`, `monotonic-range-access` — compose naturally above streaming windows.
