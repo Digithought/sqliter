@@ -1235,6 +1235,12 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 				if (e.code === StatusCode.BUSY) throw e;
 				throw this.issuerOverlayDriftError(schemaName, tableName, ddlDescription, e);
 			}
+			// NOTE: preparation the failed `apply()` already performed is NOT undone here — the
+			// PK-re-key arm drops collapsed deletion markers before forwarding the re-key
+			// (`dropCollapsedPkRekeyMarkers`), and a refusal after that leaves them dropped.
+			// Inert while poison is terminal: the only exit is a rollback that discards the
+			// overlay whole. If poison ever becomes recoverable, this overlay must be restored
+			// the way the issuer's is (`reinsertPkRekeyMarkers`) before it can be un-poisoned.
 			overlayState.poison = { message: this.buildInPlaceAdoptPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
 		}
 	}

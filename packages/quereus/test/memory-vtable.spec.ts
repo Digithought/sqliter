@@ -4,14 +4,14 @@ import { Database } from "../src/index.js";
 import { MemoryTableModule } from "../src/vtab/memory/module.js";
 import { MemoryTable } from "../src/vtab/memory/table.js";
 import { TransactionLayer } from "../src/vtab/memory/layer/transaction.js";
-import { BaseLayer } from "../src/vtab/memory/layer/base.js";
+import { BaseLayer, iteratePrimaryRows } from "../src/vtab/memory/layer/base.js";
 import type { TableSchema, IndexSchema } from "../src/schema/table.js";
 import type { ColumnSchema } from "../src/schema/column.js";
 import type { FilterInfo } from "../src/vtab/filter-info.js";
 import { ConflictResolution } from "../src/common/constants.js";
 import type * as AST from "../src/parser/ast.js";
 import { INTEGER_TYPE, TEXT_TYPE, REAL_TYPE, BLOB_TYPE } from "../src/types/index.js";
-import type { UpdateResult } from "../src/common/types.js";
+import type { Row, UpdateResult } from "../src/common/types.js";
 
 /** Assert an UpdateResult succeeded and narrow it to the `'ok'` branch so `.row` is accessible. */
 function expectOk(result: UpdateResult): asserts result is Extract<UpdateResult, { status: 'ok' }> {
@@ -710,6 +710,94 @@ describe("Memory VTable Module", () => {
 
 			expect(innerLayer.hasChanges()).to.be.true;
 			expect(outerLayer.hasChanges()).to.be.false;
+		});
+	});
+
+	describe("TransactionLayer.rekeyPrimaryKey deletion replay", () => {
+		// Changing a primary-key column's collation re-sorts every open transaction layer.
+		// Each layer's deletions are replayed by looking the deleted key up in the already
+		// re-sorted parent — and under the new order that lookup can land on a DIFFERENT row
+		// whose key now compares equal. `installNetOwnWrites`'s `deletionTargets` guard checks,
+		// under the OLD comparator, that the row it found is the row this layer removed.
+		//
+		// `MemoryTableManager.validateRekeyedPrimaryKey` refuses every chain that could reach
+		// that arrangement before `rekeyPrimaryKey` ever runs, so the guard is pure insurance
+		// in the live engine and no end-to-end test can exercise it. These build the layer
+		// chain directly, bypassing the manager (and hence that validation pass), which is the
+		// only way to reach the check — see `rekeyPrimaryKey`'s doc comment.
+
+		const rekeyColumns: ColumnSchema[] = [
+			{ name: 'k', logicalType: TEXT_TYPE, notNull: true, primaryKey: true, pkOrder: 0, defaultValue: null, collation: 'BINARY', generated: false },
+			{ name: 'v', logicalType: TEXT_TYPE, notNull: false, primaryKey: false, pkOrder: 0, defaultValue: null, collation: 'BINARY', generated: false },
+		];
+
+		/** Pre-ALTER shape: a case-SENSITIVE text primary key, so 'A' and 'a' are distinct. */
+		function binaryKeySchema(): TableSchema {
+			return createTableSchema('rekey_replay', rekeyColumns, ['k']);
+		}
+
+		/**
+		 * Post-ALTER shape: the same table with the key column re-collated NOCASE, so 'A' and
+		 * 'a' collapse onto one key. The collation must go on the PK DEFINITION, not just the
+		 * column — `createPrimaryKeyFunctions` reads the comparator's collation from there.
+		 */
+		function nocaseKeySchema(): TableSchema {
+			const base = binaryKeySchema();
+			return {
+				...base,
+				columns: Object.freeze(rekeyColumns.map((col, i) => (i === 0 ? { ...col, collation: 'NOCASE' } : col))),
+				primaryKeyDefinition: Object.freeze([{ index: 0, desc: false, collation: 'NOCASE' }]),
+			};
+		}
+
+		/** This layer's effective rows (its own tree, inheriting the parent's copy-on-write). */
+		function rowsOf(layer: TransactionLayer): Row[] {
+			return [...iteratePrimaryRows(layer.getModificationTree('primary')!)];
+		}
+
+		/**
+		 * A two-layer chain over an EMPTY base: the parent stages a row at `parentKey`, the
+		 * child deletes `childDeleteKey`. Returns both layers already re-keyed NOCASE,
+		 * oldest-first as every whole-chain rebuild requires.
+		 */
+		function rekeyedChain(parentKey: string, childDeleteKey: string): { parent: TransactionLayer; child: TransactionLayer } {
+			const base = new BaseLayer(binaryKeySchema(), db.getCollationResolver());
+			const parent = new TransactionLayer(base);
+			parent.recordUpsert(parentKey, [parentKey, 'parent-write'], null);
+			const child = new TransactionLayer(parent);
+			child.recordDelete(childDeleteKey, [childDeleteKey, 'child-delete']);
+
+			const nocase = nocaseKeySchema();
+			base.updateSchema(nocase);
+			base.rebuildPrimaryTreeStrict();
+			parent.rekeyPrimaryKey(nocase);
+			child.rekeyPrimaryKey(nocase);
+			return { parent, child };
+		}
+
+		it("leaves an unrelated row alone when a replayed deletion's key collapses onto it", () => {
+			// The parent staged 'a'; the child deleted 'A', which under BINARY matched nothing.
+			// After the re-key the child's replayed deletion finds the parent's 'a' — a row the
+			// child never removed. Deleting it would silently discard a row the transaction just
+			// wrote.
+			const { child } = rekeyedChain('a', 'A');
+
+			expect(rowsOf(child), "the parent's row must survive the child's replayed deletion")
+				.to.deep.equal([['a', 'parent-write']]);
+			// The deletion is also dropped from the replay log, so a later rebase / index rebuild
+			// cannot re-apply it against the same row.
+			expect(child.getOwnWrites(), 'a deletion that matched nothing leaves no own write').to.deep.equal([]);
+		});
+
+		it("still applies a replayed deletion that targets its own row", () => {
+			// The mirror case, pinning that the guard is an identity check and not a blanket
+			// "skip every deletion whose key was re-sorted": here the child deleted the very row
+			// the parent staged, so the replay must remove it.
+			const { child } = rekeyedChain('a', 'a');
+
+			expect(rowsOf(child), "the child's own deletion must still take effect").to.deep.equal([]);
+			expect(child.getOwnWrites(), 'the surviving deletion is kept in the replay log')
+				.to.deep.equal([{ type: 'delete', primaryKey: 'a' }]);
 		});
 	});
 });

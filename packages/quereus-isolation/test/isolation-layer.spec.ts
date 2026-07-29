@@ -2713,6 +2713,43 @@ describe('IsolationModule', () => {
 				isoShared.setConnectionOverlay(forDb, 'main', 'ct', { overlayTable: overlay, hasChanges: true, db: forDb });
 			}
 
+			/**
+			 * Same as {@link injectOverlayRows}, but the rows are staged inside a REAL open
+			 * transaction on the staging table and then frozen behind a savepoint.
+			 *
+			 * That distinction is the whole point: `injectOverlayRows`'s writes autocommit into
+			 * the staging table's base layer, so its history is one layer deep and the staging
+			 * module can always re-sort it. Here `begin()` opens an explicit transaction (which
+			 * also registers the staging table's connection with `forDb`, so its own DDL pass can
+			 * find it) and `savepoint(0)` turns the pending layer into an immutable snapshot a
+			 * later `rollback to` could restore — the shape whose re-key the staging module
+			 * refuses as retryable rather than as invalid data.
+			 */
+			async function injectOverlayRowsBehindSavepoint(forDb: Database, rows: SqlValue[][]): Promise<void> {
+				const underlying = isoShared.getUnderlyingState('main', 'ct')!.underlyingTable;
+				const overlay = await isoShared.overlayModule.create(forDb, isoShared.createOverlaySchema(underlying.tableSchema!));
+				await overlay.begin!();
+				for (const r of rows) {
+					await overlay.update({ operation: 'insert', values: r });
+				}
+				await overlay.savepoint!(0);
+				isoShared.setConnectionOverlay(forDb, 'main', 'ct', { overlayTable: overlay, hasChanges: true, db: forDb });
+			}
+
+			/**
+			 * Live collation of `column` on a memory table, read through its canonical
+			 * `getSchema()` rather than the per-instance `tableSchema` snapshot (which the
+			 * module-level alterTable never refreshes — see the ADD COLUMN suite's note).
+			 * `getSchema()` is MemoryTable-specific, so we narrow structurally; sound because
+			 * this suite pins both the underlying and the overlay to the memory module.
+			 */
+			function liveCollation(table: VirtualTable, column: string): string {
+				const memory = table as unknown as {
+					getSchema(): { columns: readonly { name: string; collation?: string }[] } | undefined;
+				};
+				return memory.getSchema()!.columns.find(c => c.name === column)?.collation ?? 'BINARY';
+			}
+
 			it('poisons a foreign overlay whose two staged live rows collide under the new collation', async () => {
 				await injectOverlayRows(dbB, [['b', 'y', 0], ['B', 'z', 0]]);
 
@@ -2752,6 +2789,52 @@ describe('IsolationModule', () => {
 				const committed = await asyncIterableToArray(
 					isoShared.getUnderlyingState('main', 'ct')!.underlyingTable.query!(makeFullScanFilterInfo()));
 				expect(committed.map(r => [r[0], r[1]])).to.deep.equal([['a', 'y']]);
+			});
+
+			it('poisons a foreign overlay whose staging table refuses the re-key as RETRYABLE', async () => {
+				// The second refusal kind. B's staged rows are individually fine — one deletion
+				// marker for the committed 'A' plus its case-variant replacement 'a', the very
+				// pair the previous test migrates cleanly — but here they sit behind a savepoint.
+				// A `rollback to` that savepoint would have to restore BOTH, and a NOCASE-keyed
+				// staging table cannot hold two rows on one key, so the staging module refuses
+				// the re-sort with BUSY ("commit/rollback and retry") rather than CONSTRAINT.
+				//
+				// BUSY must route exactly like the duplicate: poison this one overlay, leave the
+				// issuer's ALTER standing. It must NOT rethrow (that would abort A's ALTER after
+				// the shared table had already re-keyed) and must NOT be swallowed as a silent
+				// migration (B's rows would be left claiming a layout they never adopted).
+				await injectOverlayRowsBehindSavepoint(dbB, [['A', null, 1], ['a', 'y', 0]]);
+				const before = isoShared.getConnectionOverlay(dbB, 'main', 'ct')!.overlayTable;
+				const underlying = isoShared.getUnderlyingState('main', 'ct')!.underlyingTable;
+
+				const updated = await isoShared.alterTable(dbA, 'main', 'ct', setCollateNocase);
+
+				// Not rethrown: the issuer's ALTER completed and the shared table is re-keyed.
+				expect(updated.columns.find(c => c.name === 'k')!.collation, "the issuer's ALTER still applies").to.equal('NOCASE');
+				expect(liveCollation(underlying, 'k'), 'the shared table re-keyed').to.equal('NOCASE');
+
+				// Not silently migrated: B is poisoned, and its staging table never adopted the
+				// re-key (the refusal fires in the staging module's pre-mutation pass).
+				const bState = isoShared.getConnectionOverlay(dbB, 'main', 'ct')!;
+				expect(bState.poison, 'a retryable refusal poisons rather than rethrowing').to.not.be.undefined;
+				expect(bState.overlayTable, 'the overlay stays installed, not swapped').to.equal(before);
+				expect(liveCollation(bState.overlayTable, 'k'), 'the staging table never adopted the re-key').to.equal('BINARY');
+
+				// The poison message names the DDL and quotes the staging module's own retry
+				// wording, so B's owner can tell a representability refusal from a real duplicate.
+				expect(bState.poison!.message).to.match(/alter table \(alterColumn\)/i);
+				expect(bState.poison!.message).to.match(/commit\/rollback and retry/i);
+				expect(bState.poison!.message).to.match(/roll back this transaction/i);
+
+				// And B is told at its commit, exactly as the duplicate case is.
+				let commitErr: unknown;
+				try { await isoShared.commitConnectionOverlays(dbB); } catch (e) { commitErr = e; }
+				expect(commitErr, 'poisoned overlay must abort the commit').to.be.instanceOf(QuereusError);
+				expect((commitErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+
+				// A's committed row is untouched by B's failed adoption.
+				const committed = await asyncIterableToArray(underlying.query!(makeFullScanFilterInfo()));
+				expect(committed.map(r => [r[0], r[1]]), "the issuer's committed rows survive").to.deep.equal([['A', 'x']]);
 			});
 		});
 	});
