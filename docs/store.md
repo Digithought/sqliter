@@ -727,7 +727,12 @@ packages/quereus-store/                # Core (platform-agnostic)
       kv-store.ts       # KVStore and KVStoreProvider interfaces
       events.ts         # Schema and data change event emitter
       ddl-generator.ts  # Generate CREATE TABLE/INDEX DDL from schemas
-      store-table.ts    # Generic StoreTable (uses KVStore abstraction)
+      pk-key-resolution.ts       # Per-column KEY collation / transform / order-safety for PK + index columns
+      implicit-unique-index.ts   # Hidden `_uc_*` index materialized per plain UNIQUE constraint
+      store-table-base.ts        # StoreTableBase: state, store handles, stats, transaction lifecycle
+      store-table-scan.ts        # StoreTableScan: the read path (predicate -> byte window -> rows)
+      store-table-constraints.ts # StoreTableConstraints: secondary-index maintenance + UNIQUE enforcement
+      store-table.ts    # Generic StoreTable (uses KVStore abstraction) — the write path
       store-connection.ts  # Generic transaction connection
       store-module.ts   # Generic StoreModule
       transaction.ts    # Transaction coordinator
@@ -749,6 +754,23 @@ packages/quereus-plugin-indexeddb/     # Browser IndexedDB plugin
     plugin.ts           # Plugin entry point for registerPlugin()
     index.ts            # Package exports
 ```
+
+`StoreTable` is one class split across four files, each layer adding one job to the one
+below it — so a change to (say) the read path touches one file rather than a 3,400-line
+one:
+
+```
+StoreTableBase        store-table-base.ts        state, store handles, stats, txn lifecycle,
+                                                 effective-row reads (committed + pending)
+  └ StoreTableScan    store-table-scan.ts        query: predicate -> byte window -> rows
+    └ StoreTableConstraints
+                      store-table-constraints.ts secondary-index maintenance, UNIQUE enforcement
+      └ StoreTable    store-table.ts             update(), bulk row rewrites for ALTER
+```
+
+Only `StoreTable` is exported; the intermediate layers are `abstract` and exist purely to
+divide the file. A layer may call downward (a scan may read the base's effective-row
+iterator) but never upward.
 
 ## Implementation Status
 

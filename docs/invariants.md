@@ -761,7 +761,7 @@ dependency returns — never a silent pass.
 ### MV-019 — Secondary UNIQUE is enforced by the host, post-batch
 
 - code: `packages/quereus/src/vtab/memory/layer/manager.ts` — `enforceSecondaryUniqueOnMaintenance`
-- code: `packages/quereus-store/src/common/store-table.ts` — `enforceSecondaryUniqueForMaintenance`
+- code: `packages/quereus-store/src/common/store-table-constraints.ts` — `enforceSecondaryUniqueForMaintenance`
 - guard: `packages/quereus/test/logic/51.9-maintained-table-secondary-unique.sqllogic`
 - doc: [Derived-Row Constraints § Declared secondary UNIQUE](mv-constraints.md#declared-secondary-unique)
 

@@ -103,16 +103,16 @@ export { InMemoryKVStore } from './memory-store.js';
 export { CachedKVStore, type CacheOptions } from './cached-kv-store.js';
 
 // Generic store table and connection
+export { StoreTable, type ExternalRowOp } from './store-table.js';
+export { type StoreTableConfig, type StoreTableModule } from './store-table-base.js';
+
+// Physical key properties of primary-key / index columns
 export {
-  StoreTable,
   resolvePkKeyCollations,
   resolvePkKeyTransforms,
   resolveIndexKeyTransforms,
   storeSemanticKeyTransform,
-  type StoreTableConfig,
-  type StoreTableModule,
-  type ExternalRowOp,
-} from './store-table.js';
+} from './pk-key-resolution.js';
 
 // Structural key encoding for declared-JSON key members
 export { jsonStructuralKey } from './json-key.js';

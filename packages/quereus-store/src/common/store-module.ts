@@ -48,7 +48,10 @@ import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import { StoreBackingHost } from './backing-host.js';
-import { StoreTable, resolvePkKeyCollations, resolvePkKeyTransforms, resolveIndexKeyTransforms, storeSemanticKeyTransform, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, withImplicitUniqueIndexes, implicitUniqueIndexName, findReusableIndexForUnique, type StoreTableConfig, type StoreTableModule } from './store-table.js';
+import { StoreTable } from './store-table.js';
+import { type StoreTableConfig, type StoreTableModule } from './store-table-base.js';
+import { resolvePkKeyCollations, resolvePkKeyTransforms, resolveIndexKeyTransforms, storeSemanticKeyTransform, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength } from './pk-key-resolution.js';
+import { withImplicitUniqueIndexes, implicitUniqueIndexName, findReusableIndexForUnique } from './implicit-unique-index.js';
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
