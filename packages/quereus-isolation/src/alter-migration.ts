@@ -54,7 +54,7 @@ export interface AddColumnBackfillContext {
 	foldedDefault: SqlValue;
 	/** Per-row evaluator for a non-foldable `new.<col>` default; absent for a literal default. */
 	evaluator?: (row: Row) => SqlValue | Promise<SqlValue>;
-	/** Whether the new column is NOT NULL (enforced on the evaluator path only). */
+	/** Whether the new column is NOT NULL (enforced on both the evaluator and folded-default paths). */
 	newColNotNull: boolean;
 	/** New column name, for the NOT NULL error message. */
 	newColName: string;
@@ -467,8 +467,12 @@ async function collectPkRekeyGroups(
  * - A clean overlay (`!hasChanges`) stages no rows, so there is nothing to validate.
  * - A missing tombstone column throws INTERNAL here, before the underlying is touched.
  * - For addColumn, each staged row runs through `computeAddColumnValue`: tombstone
- *   rows short-circuit to `null` (the evaluator never runs), and a NOT-NULL-violating
- *   evaluated row throws CONSTRAINT here, atomically. Computed values are discarded.
+ *   rows short-circuit to `null` (the evaluator never runs), and a NOT-NULL violation
+ *   throws CONSTRAINT here, atomically. Computed values are discarded. Two distinct
+ *   sources reject: an evaluator that produces NULL for a staged row, and a mandatory
+ *   column with no usable DEFAULT (nothing to fill an appended row with) — the latter
+ *   matters because the engine's own pre-mutation probe only covers the ISSUING
+ *   connection, never a foreign one's staged rows.
  *
  * For `set not null` with NO usable DEFAULT (`plan.setNotNull.hasDefault === false`), a staged
  * non-tombstone NULL at the now-NOT-NULL column throws CONSTRAINT here — for the issuer this
@@ -580,9 +584,11 @@ async function *stagedLiveRows(overlay: VirtualTable, tombstoneIdx: number): Asy
  *   so append `null` and never run the evaluator against them (it could reference
  *   NULL siblings or spuriously trip the NOT NULL check).
  * - With a per-row evaluator, derive the value from the existing-columns slice and
- *   enforce NOT NULL on that path only (a literal/NULL default's nullability is gated
- *   up-front by the engine, exactly as `base.ts` does).
- * - Otherwise use the folded literal default.
+ *   enforce NOT NULL on that path.
+ * - Otherwise use the folded literal default, enforcing NOT NULL on it too: the engine's own
+ *   pre-mutation probe (`validateNotNullBackfill`) only sees the ISSUING connection's rows
+ *   (committed + its own staged rows), never a foreign connection's, so a mandatory column
+ *   with no usable DEFAULT must be re-checked here for every staged row this pass reaches.
  */
 async function computeAddColumnValue(
 	ctx: AddColumnBackfillContext,
@@ -600,6 +606,12 @@ async function computeAddColumnValue(
 			);
 		}
 		return value;
+	}
+	if (ctx.newColNotNull && ctx.foldedDefault === null) {
+		throw new QuereusError(
+			`NOT NULL constraint failed: column '${ctx.tableName}.${ctx.newColName}' has no usable DEFAULT for a staged row`,
+			StatusCode.CONSTRAINT,
+		);
 	}
 	return ctx.foldedDefault;
 }

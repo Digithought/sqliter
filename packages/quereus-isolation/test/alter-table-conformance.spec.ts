@@ -414,6 +414,68 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		await db.exec('rollback');
 	});
 
+	// A SECOND connection sharing the same underlying table via the same IsolationModule —
+	// covers the hole where `computeAddColumnValue`'s folded-DEFAULT branch appended a staged
+	// row's value unchecked. The issuing connection's own pre-mutation NOT NULL probe
+	// (`validateNotNullBackfill`) only ever sees rows the ISSUER can see (committed + its own
+	// overlay), so it cannot catch a NULL staged only in a FOREIGN connection's overlay. That is
+	// only reachable while the committed table is empty — any committed row makes the underlying's
+	// own "NOT NULL column on non-empty table" check reject the ALTER first — so both connections
+	// below share one freshly created, still-empty table.
+	//
+	// `create table` on the second `Database` would build a SECOND underlying, so mirror the
+	// first connection's catalog entry instead: `dbB` then resolves `t` to the SAME underlying
+	// via `IsolationModule.connect`. `dbB`'s catalog does not learn about `dbA`'s ALTER (a
+	// separate, tracked gap — see `bug-schema-change-not-propagated-to-other-connections-catalog`
+	// in `tickets/backlog/`), so this does not assert on `dbB`'s post-ALTER column names.
+	for (const spelling of ['not null', 'integer'] as const) {
+		const label = spelling === 'not null'
+			? 'explicit NOT NULL'
+			: 'bare (mandatory under the shipped default_column_nullability)';
+		it(`ADD COLUMN ${label}, no DEFAULT: poisons a foreign connection's staged row instead of committing a NULL into it`, async () => {
+			const dbA = new Database();
+			const dbB = new Database();
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			dbA.registerModule('isolated', iso);
+			dbB.registerModule('isolated', iso);
+			try {
+				await dbA.exec(`create table t (id integer primary key, name text) using isolated`);
+				dbB.schemaManager.getMainSchema().addTable(dbA.schemaManager.getTable('main', 't')!);
+
+				await dbB.exec('begin');
+				await dbB.exec(`insert into t values (1, 'Alice')`); // lives only in B's overlay; committed table stays empty
+
+				await dbA.exec(`alter table t add column c ${spelling === 'not null' ? 'integer not null' : 'integer'}`);
+
+				// A's ALTER succeeds and A sees no rows — B's staged row is invisible to A.
+				expect(await rows(dbA, 'select * from t')).to.deep.equal([]);
+
+				// B is poisoned: its next read and its commit both throw CONSTRAINT rather than
+				// silently landing a NULL in the new mandatory column. `db.exec` on a bare SELECT
+				// does not drain the cursor (see the "register the IsolatedConnection" comment
+				// elsewhere in this test suite), so the read must go through `rows()` (`db.eval`
+				// iterated to completion) to actually reach the poison check.
+				let readErr: QuereusError | null = null;
+				try { await rows(dbB, 'select * from t'); } catch (e) {
+					if (!(e instanceof QuereusError)) throw e;
+					readErr = e;
+				}
+				expect(readErr, "B's next read must throw, not return the staged row with a NULL").to.be.instanceOf(QuereusError);
+				expect(readErr!.code).to.equal(StatusCode.CONSTRAINT);
+
+				const commitErr = await attemptAlter(dbB, 'commit');
+				expect(commitErr, "B's commit must throw, not silently persist the NULL").to.be.instanceOf(QuereusError);
+				expect(commitErr!.code).to.equal(StatusCode.CONSTRAINT);
+
+				// The committed table holds no row afterwards — B's row never lands with a NULL.
+				expect(await rows(dbA, 'select * from t'), 'no row committed').to.deep.equal([]);
+			} finally {
+				await dbA.close();
+				await dbB.close();
+			}
+		});
+	}
+
 	it('honored DROP COLUMN drops the column from a staged overlay row', async () => {
 		await db.exec(`create table t (id integer primary key, name text, extra text) using isolated`);
 		await db.exec('begin');

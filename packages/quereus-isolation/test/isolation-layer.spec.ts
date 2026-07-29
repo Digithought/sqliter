@@ -3223,6 +3223,40 @@ describe('IsolationModule', () => {
 			expect(aRows[0][2], 'committed row backfilled c = x = 5').to.equal(5);
 		});
 
+		// A mandatory column with NEITHER a DEFAULT NOR a backfillEvaluator: the appended
+		// value for every staged row is the folded literal default, which here is `null`
+		// (there is no DEFAULT at all). This is the OTHER source of a rejectable staged
+		// NULL — the sibling test above covers an evaluator that PRODUCES NULL; this one
+		// covers there being no value source to begin with. Only reachable while the
+		// committed table is empty (any committed row makes the underlying's own
+		// "NOT NULL column on non-empty table" check reject the ALTER first), so this uses
+		// its own empty table rather than the shared 't' (which this beforeEach seeds with
+		// one committed row).
+		it('poisons a foreign overlay whose staged row has no DEFAULT to fill a newly added mandatory column', async () => {
+			await dbA.exec('create table te (id integer primary key, x integer null) using isolated');
+			const underlyingTe = iso.getUnderlyingState('main', 'te')!.underlyingTable;
+			const overlayTe = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlyingTe.tableSchema!));
+			await overlayTe.update({ operation: 'insert', values: [10, 5, 0] }); // live staged row; committed 'te' stays empty
+			iso.setConnectionOverlay(dbB, 'main', 'te', { overlayTable: overlayTe, hasChanges: true, db: dbB });
+
+			const noDefaultCol: SchemaChangeInfo = {
+				type: 'addColumn',
+				columnDef: { name: 'c', dataType: 'INTEGER', constraints: [{ type: 'notNull' }] },
+			};
+			const updated = await iso.alterTable(dbA, 'main', 'te', noDefaultCol);
+			expect(updated.columns.some(col => col.name === 'c'), 'the ALTER applies for the issuer').to.equal(true);
+
+			const bState = iso.getConnectionOverlay(dbB, 'main', 'te')!;
+			expect(bState.poison, 'B overlay must be poisoned — nothing to fill the mandatory column with').to.not.be.undefined;
+			expect(bState.poison!.message).to.match(/cannot satisfy/i);
+
+			// A committed-snapshot reader confirms nothing was committed with a NULL. `reader()`
+			// is hardcoded to table 't' (the shared fixture), so connect to 'te' directly.
+			const teReader = await iso.connect(dbA, undefined, 'isolated', 'main', 'te', {} as BaseModuleConfig) as IsolatedTable;
+			const teRows = await asyncIterableToArray(teReader.query(fullScan()));
+			expect(teRows.length, "'te' has no committed rows").to.equal(0);
+		});
+
 		it('errors a poisoned connection at read, write, and commit; committed reads still succeed', async () => {
 			await injectOverlay(dbB, [[10, null]]);
 			await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
