@@ -303,7 +303,7 @@ insert into audit (id) values (1);
 *subsequent* DDL / DML only; tables already created retain whatever expressions they
 were created with. The option is not baked into any persisted schema.
 
-**See also:** [Determinism Validation](runtime.md#determinism-validation) for the full
+**See also:** [Determinism Validation](determinism.md) for the full
 replay-contract discussion, and [Mutation Statements](module-authoring.md#mutation-statements)
 for how the captured artifact is structured.
 

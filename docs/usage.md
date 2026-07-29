@@ -458,7 +458,7 @@ await db.exec("rollback");
 
 Savepoint semantics are also supported: events within a savepoint are tracked separately and discarded on `ROLLBACK TO SAVEPOINT` or merged on `RELEASE`.
 
-For module-level event integration (implementing events in custom virtual table modules), see the [Module Authoring Guide](./module-authoring.md).
+For module-level event integration (implementing events in custom virtual table modules), see [Database-Level Event System](./module-events.md).
 
 ## Database Options
 

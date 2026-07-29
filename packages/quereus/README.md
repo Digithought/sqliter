@@ -78,7 +78,7 @@ The database-level event system aggregates events from all modules automatically
 
 SQL values use native JavaScript types (`string`, `number`, `bigint`, `Uint8Array`, `null`). Temporal types are ISO 8601 strings. Results stream as async iterators.
 
-See the [Usage Guide](../../docs/usage.md) for complete API reference and [Module Authoring Guide](../../docs/module-authoring.md) for event system details.
+See the [Usage Guide](../../docs/usage.md) for complete API reference and [Database-Level Event System](../../docs/module-events.md) for event system details.
 
 ## Platform Support & Storage
 
@@ -178,7 +178,8 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 * [Type System](../../docs/types.md) — logical/physical types, temporal types, JSON, custom types
 * [Functions](../../docs/functions.md) — built-in scalar, aggregate, window, and JSON functions
 * [Memory Tables](../../docs/memory-table.md) — built-in MemoryTable module
-* [Module Authoring](../../docs/module-authoring.md) — virtual table module development and event system
+* [Module Authoring](../../docs/module-authoring.md) — virtual table module development
+* [Database-Level Event System](../../docs/module-events.md) — data and schema change events
 * [Date/Time Handling](../../docs/datetime.md) — temporal parsing, functions, and ISO 8601 formats
 * [Runtime](../../docs/runtime.md) — instruction-based execution and opcodes
 * [Error Handling](../../docs/errors.md) — error types and status codes

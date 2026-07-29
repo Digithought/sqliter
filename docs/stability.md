@@ -89,7 +89,7 @@ report the user-visible symptom, not the internal detail.
 | View updateability — write-through for views, CTEs, and subqueries-in-`from` | Beta | [view-updateability.md](view-updateability.md) |
 | Declarative schema — `declare schema` / `apply schema` | Beta | [sql-ddl.md](sql-ddl.md) § 2.0 (section banner) |
 | Change-scope introspection and `Database.watch` | Beta | [change-scope.md](change-scope.md), [usage.md](usage.md) § Change-scope (section banner) |
-| Database event hooks — `onDataChange`, `onSchemaChange` | Beta | [schema.md](schema.md) |
+| Database event hooks — `onDataChange`, `onSchemaChange` | Beta | [module-events.md](module-events.md), [schema.md](schema.md) |
 | `SchemaManager` API and DDL generation | Beta | [schema.md](schema.md) |
 | Persistent store — `@quereus/store` and the LevelDB / IndexedDB / React-Native-LevelDB / NativeScript-SQLite plugins. Its on-disk key encoding is **not** frozen, carries no format-version marker, and has no in-place upgrade tooling today: a format change would be published with a documented migration procedure, not applied for you. | Beta | [store.md](store.md) |
 | Isolation layer — `@quereus/isolation` | Beta | [store.md](store.md#isolation-gap), [design-isolation-layer.md](design-isolation-layer.md) |

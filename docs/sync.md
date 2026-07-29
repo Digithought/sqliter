@@ -485,11 +485,11 @@ moot since RESTRICT never throws on apply; at worst the outcome depends on which
 fires first, the same caveat as (F).) Both are handled by keeping `applyForeignKeyActions`
 off (the default) or by expressing the referential invariant as a **global assertion**.
 
-Two gaps remain. **Per-table atomicity**: within each table, changes *should* be applied through the Store module's `TransactionCoordinator` `WriteBatch`, and the legacy per-table-database `IndexedDBModule` cannot span tables at all — the `UnifiedIndexedDBModule` (Store Phase 7) fixes that with `MultiStoreWriteBatch`. **Isolation**: even with correct write ordering, readers may see partially-applied state during sync; true isolation needs Store-level support — see [Future: Store Isolation](#store-isolation-store-phase-8---future) below.
+Two gaps remain, both addressed below. **Per-table atomicity**: changes *should* be applied through the Store module's `TransactionCoordinator` `WriteBatch`, and the legacy per-table-database `IndexedDBModule` cannot span tables at all. **Isolation**: even with correct write ordering, readers may see partially-applied state during sync, which needs Store-level support.
 
 ### Single-Database Architecture (Store Phase 7) ✓
 
-The `UnifiedIndexedDBModule` uses a single IndexedDB database with multiple object stores (one per table), which buys native cross-table IDB transactions — sync metadata and data commit together, with no WAL needed for crash recovery, at the same storage quota. The legacy `IndexedDBModule` has none of that: separate databases per table, sequential commits, and it would need a WAL.
+The `UnifiedIndexedDBModule` uses a single IndexedDB database with multiple object stores (one per table), which buys native cross-table IDB transactions — sync metadata and data commit together, with no WAL needed for crash recovery, at the same storage quota. The legacy `IndexedDBModule` has none of that: separate databases per table, sequential commits, and it needs a WAL.
 
 With `UnifiedIndexedDBModule`, sync can use `MultiStoreWriteBatch`:
 ```typescript
@@ -502,7 +502,7 @@ await batch.write();  // Native atomicity across all stores
 
 ### Store Isolation (Store Phase 8 - Future)
 
-Store-level transaction isolation (a TransactionLayer/copy-on-write model like the memory vtab's, giving atomic visibility on commit) would let sync stage data and CRDT metadata invisibly and make them visible atomically, eliminating the isolation gap. Unimplemented; tracked in store.md as Phase 8 and in [`docs/todo.md` § Sync Engine Remaining Work](todo.md#sync-engine-remaining-work).
+Store-level transaction isolation (a TransactionLayer/copy-on-write model like the memory vtab's) would let sync stage data and CRDT metadata invisibly and reveal them atomically on commit, closing the isolation gap. Unimplemented; tracked as Phase 8 in store.md and in [`docs/todo.md` § Sync Engine Remaining Work](todo.md#sync-engine-remaining-work).
 
 ## Storage Layout
 
@@ -545,13 +545,13 @@ Because the identity freely contains `:` (type tags) and `\0` (member separator)
 `cv:`/`cl:` key layouts **length-prefix** it (`{idLen}:` is the identity's length in
 string code units), making the identity/column split unambiguous. Keying is resolved per
 table from its schema (key collations + semantic transforms) via
-`metadata/pk-identity.ts`, which is a thin wrapper over the engine's
-`resolvePkIdentityKeying` (`@quereus/quereus`, `util/key-serializer.ts`) — the single
-implementation of that rule, shared with the isolation overlay's row-alignment key, so the
-two layers cannot drift; a wired `keyNormalizerResolver` (pass
-`db.getKeyNormalizerResolver()`) keeps custom collations keying exactly as the database
-compares them. A relay-only deployment with no `getTableSchema` oracle keys raw values —
-stable for its whole life, since no oracle (and hence no identity flip) can appear later.
+`metadata/pk-identity.ts`, a thin wrapper over the engine's `resolvePkIdentityKeying`
+(`@quereus/quereus`, `util/key-serializer.ts`) — one implementation, shared with the
+isolation overlay's row-alignment key, so the layers cannot drift. A wired
+`keyNormalizerResolver` (`db.getKeyNormalizerResolver()`) keeps custom collations keying
+exactly as the database compares them. A relay-only deployment with no `getTableSchema`
+oracle keys raw values — stable for life, since no oracle (hence no identity flip) can
+appear later.
 Quarantine (`qt:`) keys always use the raw encoding: a quarantined table is out of the
 local basis, so no schema exists for it, and its `(hlc, type)` component already makes the
 key unique. Snapshot transfers carry **only each entry's raw pk** — no identity travels on

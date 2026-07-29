@@ -763,7 +763,6 @@ dependency returns — never a silent pass.
 - code: `packages/quereus/src/vtab/memory/layer/manager.ts` — `enforceSecondaryUniqueOnMaintenance`
 - code: `packages/quereus-store/src/common/store-table-constraints.ts` — `enforceSecondaryUniqueForMaintenance`
 - guard: `packages/quereus/test/logic/51.9-maintained-table-secondary-unique.sqllogic`
-- guard: `packages/quereus/test/logic/51.9.1-maintained-table-partial-unique.sqllogic` — the partial-UNIQUE scope case (split out because a partial UNIQUE can only be spelled as `create unique index … where …`)
 - doc: [Derived-Row Constraints § Declared secondary UNIQUE](mv-constraints.md#declared-secondary-unique)
 
 A UNIQUE collision is a property of a *pair* of rows, so it does not fit the per-row
@@ -772,7 +771,9 @@ contents after the batch lands. Post-batch is load-bearing: a `'replace-all'` di
 upserts before deletes, so a per-op check would false-positive whenever the derived set
 merely moves a value between keys. Checking only written images is complete, since any
 colliding pair contains one. The probe never routes through a covering view, which lags the
-batch. Always a hard abort.
+batch. Always a hard abort. The partial-UNIQUE scope case lives in the sibling
+`51.9.1-maintained-table-partial-unique.sqllogic`, split out because a partial UNIQUE can
+only be spelled as `create unique index … where …`.
 
 ### MV-020 — A maintenance write fires parent-side referential actions
 
