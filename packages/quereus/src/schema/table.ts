@@ -489,6 +489,84 @@ export function appendIndexToTableSchema(tableSchema: TableSchema, indexSchema: 
 }
 
 /**
+ * The renumbered position-bearing fields of `schema` after column `colIndex` is dropped, to be
+ * spread over the schema alongside the caller's own new `columns` array — the DROP COLUMN mirror
+ * of `shiftSchemaIndicesForInsert` (`vtab/memory/layer/manager.ts`, the ADD-COLUMN-at-a-position
+ * equivalent). Shared by the memory module's `MemoryTableManager.dropColumn` and the store
+ * module's `StoreModule.alterDropColumn`, whose position-renumbering logic had drifted apart
+ * once already (the foreign-key pass was missing from both).
+ *
+ * A PRIMARY KEY member, UNIQUE constraint, or foreign key that names the dropped column is
+ * removed outright rather than narrowed — one missing a column is a different, stronger
+ * constraint, not a subset of the same one. An index entry that loses every column this way is
+ * dropped too. Every survivor has its column indices shifted down over the removed slot.
+ *
+ * `removedUniqueConstraints` (pre-shift, original column indices) is returned alongside so a
+ * caller that materializes a physical structure per UNIQUE constraint — the memory module's
+ * auto-built covering index, the store module's hidden `_uc_*` store — can tear down exactly the
+ * ones this drop removes. That teardown, and the naming convention it keys off
+ * (`uc.name ?? '_uc_<cols>'`), stays with each caller: neither structure is a `TableSchema` field,
+ * and the two backends materialize them differently (index array entry vs. separate physical
+ * store), so this function has no need to know it.
+ *
+ * `columnIndexMap` is rebuilt from the new column list by the caller, not returned here, matching
+ * every other schema-mutation site. `checkConstraints` and each backend's own name/AST-keyed
+ * bookkeeping need no shift. `generatedColumnDependencies` / `generatedColumnTopoOrder` are
+ * likewise left to the caller: the engine recomputes them from column names right after DROP
+ * COLUMN returns (`withGeneratedColumnGraph` in `runDropColumn`), so only a caller driving a
+ * module's API directly ever observes a stale map — mirroring the same carve-out on the insert
+ * side. `referencedColumns` on a foreign key is not touched, for the same reason as on the insert
+ * side: enforcement resolves the parent indices on demand from `referencedColumnNames` against
+ * the parent's CURRENT schema.
+ */
+export function shiftSchemaIndicesForDrop(schema: TableSchema, colIndex: number): {
+	columns: ReadonlyArray<ColumnSchema>;
+	primaryKeyDefinition: ReadonlyArray<PrimaryKeyColumnDefinition>;
+	indexes: ReadonlyArray<IndexSchema>;
+	uniqueConstraints: ReadonlyArray<UniqueConstraintSchema> | undefined;
+	foreignKeys: ReadonlyArray<ForeignKeyConstraintSchema> | undefined;
+	removedUniqueConstraints: ReadonlyArray<UniqueConstraintSchema>;
+} {
+	const shift = (index: number): number => index > colIndex ? index - 1 : index;
+
+	const columns = Object.freeze(schema.columns.filter((_, idx) => idx !== colIndex));
+
+	const primaryKeyDefinition = Object.freeze(
+		schema.primaryKeyDefinition
+			.filter(def => def.index !== colIndex)
+			.map(def => ({ ...def, index: shift(def.index) }))
+	);
+
+	const oldUniqueConstraints = schema.uniqueConstraints ?? [];
+	const removedUniqueConstraints = Object.freeze(oldUniqueConstraints.filter(uc => uc.columns.includes(colIndex)));
+	const remainingUniqueConstraints = oldUniqueConstraints
+		.filter(uc => !uc.columns.includes(colIndex))
+		.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(shift)) }));
+
+	const indexes = (schema.indexes ?? [])
+		.map(idx => ({
+			...idx,
+			columns: idx.columns
+				.filter(ic => ic.index !== colIndex)
+				.map(ic => ({ ...ic, index: shift(ic.index) })),
+		}))
+		.filter(idx => idx.columns.length > 0);
+
+	const remainingForeignKeys = (schema.foreignKeys ?? [])
+		.filter(fk => !fk.columns.includes(colIndex))
+		.map(fk => ({ ...fk, columns: Object.freeze(fk.columns.map(shift)) }));
+
+	return {
+		columns,
+		primaryKeyDefinition,
+		indexes: Object.freeze(indexes),
+		uniqueConstraints: remainingUniqueConstraints.length > 0 ? Object.freeze(remainingUniqueConstraints) : undefined,
+		foreignKeys: remainingForeignKeys.length > 0 ? Object.freeze(remainingForeignKeys) : undefined,
+		removedUniqueConstraints,
+	};
+}
+
+/**
  * Creates a basic TableSchema with minimal configuration
  *
  * @param name Table name

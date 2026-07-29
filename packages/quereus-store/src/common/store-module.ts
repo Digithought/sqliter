@@ -40,7 +40,7 @@ import type {
 	LensDeploymentSnapshot,
 	CatalogObjectKind,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, equalitySeekKeyCount, hasSemanticOrdering, inferType, isMultiValueEquality, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, appendIndexToTableSchema, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, equalitySeekKeyCount, hasSemanticOrdering, inferType, isMultiValueEquality, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, appendIndexToTableSchema, shiftSchemaIndicesForDrop, logicalTypeCanHoldText, serializeKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
 import type { CompiledPredicate, EffectiveRowSource, KeyNormalizer, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
@@ -1800,62 +1800,27 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			throw new QuereusError(`Column '${change.columnName}' not found.`, StatusCode.ERROR);
 		}
 
-		// Build updated schema: remove column and reindex PK/indexes
-		// Filter by original index BEFORE remapping to avoid incorrectly
-		// removing columns that remap to the dropped column's position.
-		const updatedColumns = oldSchema.columns.filter((_, idx) => idx !== colIndex);
-		const updatedPkDef = oldSchema.primaryKeyDefinition
-			.filter(def => def.index !== colIndex)
-			.map(def => ({
-				...def,
-				index: def.index > colIndex ? def.index - 1 : def.index,
-			}));
-		const updatedIndexes = (oldSchema.indexes || [])
-			.map(idx => ({
-				...idx,
-				columns: idx.columns
-					.filter(ic => ic.index !== colIndex)
-					.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index })),
-			}))
-			.filter(idx => idx.columns.length > 0);
-
-		// Prune any UNIQUE constraint over the dropped column, mirroring the index
-		// filtering above. Store-backed UNIQUE is enforced by a full scan over
-		// `uniqueConstraints`, so a stranded constraint whose column index dangles past
-		// the column array would break the next insert's validation (and the persisted
-		// DDL). A UNIQUE that includes the dropped column is removed outright; remaining
-		// constraints have their column indices shifted to track the removed slot. This
-		// also covers the engine's ADD COLUMN + inline-UNIQUE revert, which drops the
-		// just-added (uniquely-constrained) column.
-		const updatedUniqueConstraints = (oldSchema.uniqueConstraints ?? [])
-			.filter(uc => !uc.columns.includes(colIndex))
-			.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(i => i > colIndex ? i - 1 : i)) }));
-
-		// Shift or prune this table's own foreign keys, mirroring the UNIQUE pruning above
-		// and the memory module's `dropColumn`. `foreignKeys[].columns` are indices into
-		// THIS table, so they renumber over the removed slot; a key that loses ANY of its
-		// child columns is removed outright (a key missing a child column is a different
-		// constraint against the parent's key, not a narrowed one). Left unshifted, a
-		// surviving key's index dangles past the column array or silently slides onto an
-		// unrelated column — and `saveTableDDL` below persists whichever it ends up being.
-		// `referencedColumnNames` is resolved against the parent by name at enforcement
-		// time, so the parent side needs nothing here.
-		const updatedForeignKeys = (oldSchema.foreignKeys ?? [])
-			.filter(fk => !fk.columns.includes(colIndex))
-			.map(fk => ({ ...fk, columns: Object.freeze(fk.columns.map(i => i > colIndex ? i - 1 : i)) }));
+		// Renumber every position-bearing field over the removed slot — shared with the
+		// memory module's `dropColumn`, the mirror of `shiftSchemaIndicesForInsert`. Store-backed
+		// UNIQUE is enforced by a full scan over `uniqueConstraints`, so a stranded constraint
+		// whose column index dangles past the column array would break the next insert's
+		// validation (and the persisted DDL); a foreign key left unshifted would either dangle
+		// the same way or silently slide onto an unrelated column and enforce against the parent
+		// there. `removedUniqueConstraints` is unused here: unlike the memory module, the store's
+		// engine-facing `.indexes` never carries the hidden `_uc_*` covering index for a plain
+		// UNIQUE (see {@link materializedIndexNames}), so there is no by-name exclusion to apply —
+		// {@link reconcileImplicitUniqueIndexStores} tears down the physical `_uc_*` store
+		// generically, by diffing the old and new constraint sets after this arm returns.
+		const shifted = shiftSchemaIndicesForDrop(oldSchema, colIndex);
 
 		const updatedSchema: TableSchema = {
 			...oldSchema,
-			columns: Object.freeze(updatedColumns),
-			columnIndexMap: buildColumnIndexMap(updatedColumns),
-			primaryKeyDefinition: Object.freeze(updatedPkDef),
-			indexes: Object.freeze(updatedIndexes),
-			uniqueConstraints: updatedUniqueConstraints.length > 0
-				? Object.freeze(updatedUniqueConstraints)
-				: undefined,
-			foreignKeys: updatedForeignKeys.length > 0
-				? Object.freeze(updatedForeignKeys)
-				: undefined,
+			columns: shifted.columns,
+			columnIndexMap: buildColumnIndexMap(shifted.columns),
+			primaryKeyDefinition: shifted.primaryKeyDefinition,
+			indexes: shifted.indexes,
+			uniqueConstraints: shifted.uniqueConstraints,
+			foreignKeys: shifted.foreignKeys,
 		};
 
 		// Physical rewrite ahead — flush buffered writes so `migrateRows` re-encodes
@@ -1865,7 +1830,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Migrate rows: remove the dropped column slot
 		const remap = buildColumnRemap(
 			oldSchema.columns.map(c => c.name),
-			updatedColumns.map(c => c.name),
+			shifted.columns.map(c => c.name),
 		);
 		await table.migrateRows(remap, null);
 

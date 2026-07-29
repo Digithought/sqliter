@@ -1,5 +1,5 @@
 import type { Database } from '../../../core/database.js';
-import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass } from '../../../schema/table.js';
+import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, shiftSchemaIndicesForDrop } from '../../../schema/table.js';
 import { keyParts, type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
@@ -2050,60 +2050,21 @@ export class MemoryTableManager {
 				throw new QuereusError(`Cannot drop PK column "${columnName}".`, StatusCode.CONSTRAINT);
 			}
 
-			const updatedColumnsSchema = this.tableSchema.columns.filter((_, idx) => idx !== colIndex);
-			const updatedPkDefinition = this.tableSchema.primaryKeyDefinition.map(def => ({
-				...def, index: def.index > colIndex ? def.index - 1 : def.index
-			}));
-			const updatedPrimaryKeyNames = updatedPkDefinition.map(def => updatedColumnsSchema[def.index]?.name).filter(Boolean) as string[];
-
-			// Prune any UNIQUE constraint over the dropped column. A UNIQUE that includes the
-			// dropped column is removed outright (a UNIQUE missing one of its columns is a
-			// different, stronger constraint, not a silently-narrowed one); the auto-built
-			// covering index it backed is torn down with it (see the index exclusion below).
-			// Remaining constraints have their column indices shifted to track the removed slot.
-			// Without this, dropping a uniquely-constrained column (including the ADD COLUMN +
-			// inline-UNIQUE revert path) would strand a constraint whose column index dangles
-			// past the end of the column array.
-			const oldUniqueConstraints = this.tableSchema.uniqueConstraints ?? [];
-			const droppedUcKeys = oldUniqueConstraints
-				.filter(uc => uc.columns.includes(colIndex))
-				.map(uc => uc.name ?? this.implicitIndexNameFor(uc));
-			const remainingUniqueConstraints = oldUniqueConstraints
-				.filter(uc => !uc.columns.includes(colIndex))
-				.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(i => i > colIndex ? i - 1 : i)) }));
+			// Renumber every position-bearing field over the removed slot — shared with the
+			// store module's `alterDropColumn`, the mirror of `shiftSchemaIndicesForInsert`.
+			const shifted = shiftSchemaIndicesForDrop(this.tableSchema, colIndex);
+			const updatedPrimaryKeyNames = shifted.primaryKeyDefinition.map(def => shifted.columns[def.index]?.name).filter(Boolean) as string[];
 
 			// Drop the implicit covering index of each removed constraint outright (matched by
 			// the same `uc.name ?? '_uc_<cols>'` convention DROP CONSTRAINT uses, so a user
-			// index that merely shares columns is left untouched), then shift/prune the rest
-			// over the removed slot. A *single*-column covering index collapses to empty and is
-			// filtered by the trailing `length > 0` regardless; the explicit name exclusion is
-			// what tears down a *multi*-column covering index, which would otherwise survive
-			// orphaned — narrowed to its surviving columns — in `index_info` and on every write.
+			// index that merely shares columns is left untouched). A *single*-column covering
+			// index collapses to empty and is already dropped by `shiftSchemaIndicesForDrop`'s
+			// own `length > 0` filter regardless; this exclusion is what tears down a
+			// *multi*-column covering index, which would otherwise survive orphaned — narrowed
+			// to its surviving columns — in `index_info` and on every write.
+			const droppedUcKeys = shifted.removedUniqueConstraints.map(uc => uc.name ?? this.implicitIndexNameFor(uc));
 			const droppedCoveringIndexNames = new Set(droppedUcKeys.map(k => k.toLowerCase()));
-			const updatedIndexes = (this.tableSchema.indexes || [])
-				.filter(idx => !droppedCoveringIndexNames.has(idx.name.toLowerCase()))
-				.map(idx => ({
-					...idx,
-					columns: idx.columns
-						.filter(ic => ic.index !== colIndex)
-						.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index }))
-				})).filter(idx => idx.columns.length > 0);
-
-			// Shift or prune the table's own foreign keys. `foreignKeys[].columns` are indices
-			// into THIS table, so they renumber over the removed slot exactly as the PK and the
-			// UNIQUE constraints above do. A foreign key that loses ANY of its child columns is
-			// removed outright, the same call the UNIQUE pruning makes: a key missing one of its
-			// child columns is a different constraint against the parent's key, not a narrowed
-			// one. Both halves matter — left unshifted, a surviving key's index either dangles
-			// past the end of the column array or, worse, silently slides onto an unrelated
-			// column and starts enforcing against the parent there.
-			//
-			// `referencedColumns` is not touched: enforcement resolves the parent indices on
-			// demand from `referencedColumnNames` against the parent's current schema. See
-			// `shiftSchemaIndicesForInsert`, the ADD-COLUMN-at-a-position mirror of this block.
-			const remainingForeignKeys = (this.tableSchema.foreignKeys ?? [])
-				.filter(fk => !fk.columns.includes(colIndex))
-				.map(fk => ({ ...fk, columns: Object.freeze(fk.columns.map(i => i > colIndex ? i - 1 : i)) }));
+			const updatedIndexes = shifted.indexes.filter(idx => !droppedCoveringIndexNames.has(idx.name.toLowerCase()));
 
 			// NOTE: the generated-column bookkeeping (`generatedColumnDependencies` /
 			// `generatedColumnTopoOrder`, also index-keyed) is likewise unshifted, but the
@@ -2114,17 +2075,13 @@ export class MemoryTableManager {
 			// `primaryKey` below is not a TableSchema field at all — nothing reads it.
 			const finalNewTableSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
-				columns: Object.freeze(updatedColumnsSchema),
-				columnIndexMap: buildColumnIndexMap(updatedColumnsSchema),
-				primaryKeyDefinition: Object.freeze(updatedPkDefinition),
+				columns: shifted.columns,
+				columnIndexMap: buildColumnIndexMap(shifted.columns),
+				primaryKeyDefinition: shifted.primaryKeyDefinition,
 				primaryKey: Object.freeze(updatedPrimaryKeyNames),
 				indexes: Object.freeze(updatedIndexes),
-				uniqueConstraints: remainingUniqueConstraints.length > 0
-					? Object.freeze(remainingUniqueConstraints)
-					: undefined,
-				foreignKeys: remainingForeignKeys.length > 0
-					? Object.freeze(remainingForeignKeys)
-					: undefined,
+				uniqueConstraints: shifted.uniqueConstraints,
+				foreignKeys: shifted.foreignKeys,
 			});
 
 			// Phase 1 of reaching the open transaction's own pending rows. The rewrite here is
