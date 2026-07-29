@@ -93,6 +93,53 @@ function createCountingProvider(): KVStoreProvider & { dataEntriesScanned(table:
 	};
 }
 
+/**
+ * An in-memory provider that lets a test see WHICH physical index stores exist and
+ * how many entries each holds — the only way to observe that a UNIQUE constraint is
+ * enforced through an explicit index instead of a duplicate hidden `_uc_*`.
+ *
+ * Implements `deleteIndexStore` (which `createInMemoryProvider` above does not) so a
+ * torn-down store is really gone and a later reopen under the SAME name yields a
+ * fresh, open store — matching the LevelDB / IndexedDB providers. Without it a
+ * teardown would leave the closed instance in the map and the reopen would throw.
+ */
+function createIndexTrackingProvider(): KVStoreProvider & {
+	indexStoreNames(table: string): string[];
+	indexEntryCount(table: string, index: string): number;
+} {
+	const stores = new Map<string, InMemoryKVStore>();
+	const indexKey = (s: string, t: string, i: string) => `${s}.${t}_idx_${i}`;
+	const get = (key: string) => {
+		if (!stores.has(key)) stores.set(key, new InMemoryKVStore());
+		return stores.get(key)!;
+	};
+	return {
+		indexStoreNames(table: string) {
+			const prefix = `main.${table}_idx_`;
+			return [...stores.keys()].filter(k => k.startsWith(prefix)).map(k => k.slice(prefix.length)).sort();
+		},
+		indexEntryCount(table: string, index: string) {
+			return stores.get(indexKey('main', table, index))?.size ?? 0;
+		},
+		async getStore(s, t) { return get(`${s}.${t}`); },
+		async getIndexStore(s, t, i) { return get(indexKey(s, t, i)); },
+		async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
+		async getCatalogStore() { return get('__catalog__'); },
+		async closeStore() {},
+		async closeIndexStore() {},
+		async deleteIndexStore(s, t, i) {
+			const key = indexKey(s, t, i);
+			const store = stores.get(key);
+			if (store) await store.close();
+			stores.delete(key);
+		},
+		async closeAll() {
+			for (const store of stores.values()) await store.close();
+			stores.clear();
+		},
+	};
+}
+
 describe('StoreTable UNIQUE constraints', () => {
 	let db: Database;
 	let provider: KVStoreProvider;
@@ -1027,13 +1074,16 @@ describe('StoreTable UNIQUE constraints', () => {
 			expect((registered.indexes ?? []).map(i => i.name), 'engine schema shows no _uc_*').to.deep.equal([]);
 		});
 
-		it('an explicit index and the implicit index coexist; dropping the explicit one still enforces', async () => {
+		it('an explicit index REPLACES the implicit index; dropping the explicit one still enforces', async () => {
+			// The explicit index covers the UNIQUE's columns, so only IT is maintained —
+			// the hidden `_uc_email` is neither built nor kept (see the reuse tests below
+			// for the physical-store assertions). Enforcement is unchanged either way.
 			await db.exec(`CREATE TABLE co (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
 			await db.exec(`CREATE INDEX co_email ON co (email)`);
 			await db.exec(`INSERT INTO co VALUES (1, 'a@x')`);
-			// Both maintained; the UNIQUE still rejects a duplicate.
+			// The UNIQUE rejects a duplicate through the reused index.
 			await rejects(`INSERT INTO co VALUES (2, 'a@x')`);
-			// Drop the explicit index — the implicit `_uc_email` keeps enforcing.
+			// Drop the explicit index — `_uc_email` is rebuilt and keeps enforcing.
 			await db.exec(`DROP INDEX co_email`);
 			await rejects(`INSERT INTO co VALUES (3, 'a@x')`);
 			await db.exec(`INSERT INTO co VALUES (4, 'b@x')`);
@@ -1057,6 +1107,183 @@ describe('StoreTable UNIQUE constraints', () => {
 			expect(await collect(db, `SELECT count(*) AS n FROM gk`)).to.deep.equal([{ n: 1 }]);
 			await db.exec(`INSERT INTO gk VALUES (3, 'Carol')`);
 			expect(await collect(db, `SELECT count(*) AS n FROM gk`)).to.deep.equal([{ n: 2 }]);
+		});
+	});
+
+	// A plain UNIQUE whose columns are already covered by a collation-compatible FULL
+	// explicit index is enforced THROUGH that index — no duplicate `_uc_*` is built, so
+	// every write maintains one structure instead of two. The reuse decision is part of
+	// the materialized schema, so `CREATE INDEX` / `DROP INDEX` over a constrained
+	// column are transitions: the redundant `_uc_*` store must be torn down on create
+	// and rebuilt from the live rows on drop.
+	describe('implicit unique index — explicit-index reuse', () => {
+		let rdb: Database;
+		let rmod: StoreModule;
+		let tracking: ReturnType<typeof createIndexTrackingProvider>;
+
+		beforeEach(() => {
+			tracking = createIndexTrackingProvider();
+			rdb = new Database();
+			rmod = new StoreModule(tracking);
+			rdb.registerModule('store', rmod);
+		});
+
+		afterEach(async () => {
+			await rdb.close();
+			await tracking.closeAll();
+		});
+
+		async function rejects(sql: string): Promise<void> {
+			let err: Error | null = null;
+			try { await rdb.exec(sql); } catch (e) { err = e as Error; }
+			expect(err, `expected "${sql}" to be rejected`).to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+		}
+
+		it('an index created BEFORE any rows leaves the UNIQUE with no `_uc_*` store at all', async () => {
+			await rdb.exec(`CREATE TABLE r1 (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX r1_email ON r1 (email)`);
+			await rdb.exec(`INSERT INTO r1 VALUES (1, 'a@x'), (2, 'b@x')`);
+
+			expect(tracking.indexStoreNames('r1'), 'only the explicit index is materialized')
+				.to.deep.equal(['r1_email']);
+			expect(tracking.indexEntryCount('r1', 'r1_email'), 'one entry per row').to.equal(2);
+			// Enforcement runs through the reused index.
+			await rejects(`INSERT INTO r1 VALUES (3, 'a@x')`);
+		});
+
+		it('CREATE INDEX over an already-populated UNIQUE tears the redundant `_uc_*` store down', async () => {
+			await rdb.exec(`CREATE TABLE r2 (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`INSERT INTO r2 VALUES (1, 'a@x'), (2, 'b@x')`);
+			expect(tracking.indexEntryCount('r2', '_uc_email'), 'the hidden index backs the UNIQUE at first').to.equal(2);
+
+			await rdb.exec(`CREATE INDEX r2_email ON r2 (email)`);
+			expect(tracking.indexStoreNames('r2'), 'the hidden store is gone').to.deep.equal(['r2_email']);
+			expect(tracking.indexEntryCount('r2', 'r2_email')).to.equal(2);
+
+			// One structure maintained from here on: a later write must not resurrect `_uc_*`.
+			await rdb.exec(`INSERT INTO r2 VALUES (3, 'c@x')`);
+			expect(tracking.indexStoreNames('r2')).to.deep.equal(['r2_email']);
+			expect(tracking.indexEntryCount('r2', 'r2_email')).to.equal(3);
+			await rejects(`INSERT INTO r2 VALUES (4, 'c@x')`);
+		});
+
+		it('DROP INDEX rebuilds the `_uc_*` store from the live rows, including post-create writes', async () => {
+			await rdb.exec(`CREATE TABLE r3 (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`INSERT INTO r3 VALUES (1, 'a@x')`);
+			await rdb.exec(`CREATE INDEX r3_email ON r3 (email)`);
+			await rdb.exec(`INSERT INTO r3 VALUES (2, 'b@x')`);   // written while reusing
+			await rdb.exec(`DELETE FROM r3 WHERE id = 1`);        // gone before the rebuild
+
+			await rdb.exec(`DROP INDEX r3_email`);
+			expect(tracking.indexStoreNames('r3'), 'the hidden index is back, the explicit one gone')
+				.to.deep.equal(['_uc_email']);
+			// Rebuilt from the LIVE rows: the deleted row leaves no phantom entry...
+			expect(tracking.indexEntryCount('r3', '_uc_email')).to.equal(1);
+			await rdb.exec(`INSERT INTO r3 VALUES (3, 'a@x')`); // ...so its value is free again
+			// ...and the row written during reuse is still enforced.
+			await rejects(`INSERT INTO r3 VALUES (4, 'b@x')`);
+			expect(await collect(rdb, `SELECT count(*) AS n FROM r3`)).to.deep.equal([{ n: 2 }]);
+		});
+
+		it('a UNIQUE index is reusable too, and its own derived UNIQUE survives the drop of neither', async () => {
+			await rdb.exec(`CREATE TABLE r4 (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE UNIQUE INDEX r4_email ON r4 (email)`);
+			await rdb.exec(`INSERT INTO r4 VALUES (1, 'a@x')`);
+			expect(tracking.indexStoreNames('r4')).to.deep.equal(['r4_email']);
+			await rejects(`INSERT INTO r4 VALUES (2, 'a@x')`);
+
+			// Dropping it removes the derived UNIQUE with it, but the DECLARED one remains
+			// and gets its hidden index back.
+			await rdb.exec(`DROP INDEX r4_email`);
+			expect(tracking.indexStoreNames('r4')).to.deep.equal(['_uc_email']);
+			await rejects(`INSERT INTO r4 VALUES (3, 'a@x')`);
+		});
+
+		it('a DESC index is reused and still enforces (probes follow the index own direction)', async () => {
+			await rdb.exec(`CREATE TABLE r5 (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX r5_email ON r5 (email DESC)`);
+			await rdb.exec(`INSERT INTO r5 VALUES (1, 'a@x')`);
+			expect(tracking.indexStoreNames('r5')).to.deep.equal(['r5_email']);
+			await rejects(`INSERT INTO r5 VALUES (2, 'a@x')`);
+			await rdb.exec(`INSERT INTO r5 VALUES (3, 'b@x')`);
+			expect(await collect(rdb, `SELECT count(*) AS n FROM r5`)).to.deep.equal([{ n: 2 }]);
+		});
+
+		it('a PARTIAL index is NOT reused — it omits rows the full UNIQUE still covers', async () => {
+			await rdb.exec(`CREATE TABLE r6 (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX r6_email ON r6 (email) WHERE id > 100`);
+			await rdb.exec(`INSERT INTO r6 VALUES (1, 'a@x')`);
+			expect(tracking.indexStoreNames('r6'), 'both structures exist').to.deep.equal(['_uc_email', 'r6_email']);
+			// The out-of-scope row is in the hidden index only — and is still enforced.
+			expect(tracking.indexEntryCount('r6', '_uc_email')).to.equal(1);
+			expect(tracking.indexEntryCount('r6', 'r6_email')).to.equal(0);
+			await rejects(`INSERT INTO r6 VALUES (2, 'a@x')`);
+		});
+
+		it('a collation-mismatched index is NOT reused', async () => {
+			// The index declares BINARY over a NOCASE-declared column, so it is not
+			// interchangeable with the constraint's own structure — build both (mirrors
+			// `MemoryTableManager.indexCollationsMatchDeclared`).
+			await rdb.exec(`CREATE TABLE r7 (id INTEGER PRIMARY KEY, email TEXT COLLATE NOCASE, UNIQUE (email)) USING store`);
+			await rdb.exec(`CREATE INDEX r7_email ON r7 (email COLLATE BINARY)`);
+			await rdb.exec(`INSERT INTO r7 VALUES (1, 'a@x')`);
+			expect(tracking.indexStoreNames('r7')).to.deep.equal(['_uc_email', 'r7_email']);
+			await rejects(`INSERT INTO r7 VALUES (2, 'A@X')`); // NOCASE-equal ⇒ rejected
+		});
+
+		it('an index over DIFFERENT columns leaves the `_uc_*` alone', async () => {
+			await rdb.exec(`CREATE TABLE r8 (id INTEGER PRIMARY KEY, email TEXT UNIQUE, nick TEXT) USING store`);
+			await rdb.exec(`CREATE INDEX r8_nick ON r8 (nick)`);
+			await rdb.exec(`INSERT INTO r8 VALUES (1, 'a@x', 'al')`);
+			expect(tracking.indexStoreNames('r8')).to.deep.equal(['_uc_email', 'r8_nick']);
+			await rejects(`INSERT INTO r8 VALUES (2, 'a@x', 'bo')`);
+			// Dropping the unrelated index must not disturb the hidden one.
+			await rdb.exec(`DROP INDEX r8_nick`);
+			expect(tracking.indexStoreNames('r8')).to.deep.equal(['_uc_email']);
+			expect(tracking.indexEntryCount('r8', '_uc_email')).to.equal(1);
+			await rejects(`INSERT INTO r8 VALUES (3, 'a@x', 'cy')`);
+		});
+
+		it('ADD CONSTRAINT UNIQUE over an existing index builds nothing; DROP CONSTRAINT keeps the index', async () => {
+			await rdb.exec(`CREATE TABLE r9 (id INTEGER PRIMARY KEY, email TEXT) USING store`);
+			await rdb.exec(`CREATE INDEX r9_email ON r9 (email)`);
+			await rdb.exec(`INSERT INTO r9 VALUES (1, 'a@x')`);
+
+			await rdb.exec(`ALTER TABLE r9 ADD CONSTRAINT u UNIQUE (email)`);
+			expect(tracking.indexStoreNames('r9'), 'the existing index realizes the new constraint')
+				.to.deep.equal(['r9_email']);
+			await rejects(`INSERT INTO r9 VALUES (2, 'a@x')`);
+
+			// Dropping the constraint must NOT tear down the user's index.
+			await rdb.exec(`ALTER TABLE r9 DROP CONSTRAINT u`);
+			expect(tracking.indexStoreNames('r9')).to.deep.equal(['r9_email']);
+			expect(tracking.indexEntryCount('r9', 'r9_email')).to.equal(1);
+			await rdb.exec(`INSERT INTO r9 VALUES (2, 'a@x')`); // no longer constrained
+			expect(tracking.indexEntryCount('r9', 'r9_email')).to.equal(2);
+		});
+
+		it('reuse survives close → reopen (the decision is re-derived, not persisted)', async () => {
+			await rdb.exec(`CREATE TABLE ra (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await rdb.exec(`CREATE INDEX ra_email ON ra (email)`);
+			await rdb.exec(`INSERT INTO ra VALUES (1, 'a@x')`);
+			await rmod.whenCatalogPersisted();
+			await rdb.close();
+
+			// Fresh Database + module over the SAME provider: the persisted catalog carries
+			// the explicit `CREATE INDEX` and the UNIQUE, and nothing else — the reuse
+			// decision is recomputed from them on open.
+			rdb = new Database();
+			rmod = new StoreModule(tracking);
+			rdb.registerModule('store', rmod);
+			const rehydrated = await rmod.rehydrateCatalog(rdb);
+			expect(rehydrated.errors, 'catalog rehydrates cleanly').to.have.lengthOf(0);
+
+			await rejects(`INSERT INTO ra VALUES (2, 'a@x')`);
+			expect(tracking.indexStoreNames('ra'), 'still one structure after reopen')
+				.to.deep.equal(['ra_email']);
+			await rdb.exec(`INSERT INTO ra VALUES (3, 'b@x')`);
+			expect(await collect(rdb, `SELECT count(*) AS n FROM ra`)).to.deep.equal([{ n: 2 }]);
 		});
 	});
 

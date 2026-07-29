@@ -48,7 +48,7 @@ import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import { StoreBackingHost } from './backing-host.js';
-import { StoreTable, resolvePkKeyCollations, resolvePkKeyTransforms, resolveIndexKeyTransforms, storeSemanticKeyTransform, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, withImplicitUniqueIndexes, implicitUniqueIndexName, type StoreTableConfig, type StoreTableModule } from './store-table.js';
+import { StoreTable, resolvePkKeyCollations, resolvePkKeyTransforms, resolveIndexKeyTransforms, storeSemanticKeyTransform, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, withImplicitUniqueIndexes, implicitUniqueIndexName, findReusableIndexForUnique, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
@@ -135,15 +135,23 @@ const DEFAULT_MAX_BATCH_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 /**
  * Map of `lowercased implicit index name → actual name` for every NON-DERIVED
- * UNIQUE constraint of `schema` — the set of `_uc_*` stores that SHOULD exist for
- * that constraint set. Derived from `uniqueConstraints` (not `.indexes`), so it is
- * correct whether or not `schema` is materialized; the diff of two such maps drives
- * {@link StoreModule.reconcileImplicitUniqueIndexStores}.
+ * UNIQUE constraint of `schema` that needs a `_uc_*` of its own — the set of
+ * `_uc_*` stores that SHOULD exist for that schema. The diff of two such maps
+ * drives {@link StoreModule.reconcileImplicitUniqueIndexStores}.
+ *
+ * Reads `uniqueConstraints` for the NAMES (so it is correct whether or not
+ * `schema` is materialized) and `.indexes` for the REUSE decision, exactly as
+ * `withImplicitUniqueIndexes` does — the two must agree, or the reconcile would
+ * build a store no DML maintains, or tear down one that is still being seeked.
+ * A UC realized by an explicit index (`findReusableIndexForUnique`) contributes
+ * no entry, which is what makes `create index` / `drop index` over a constrained
+ * column a teardown / rebuild transition rather than a no-op.
  */
 function implicitUniqueIndexNameMap(schema: TableSchema): Map<string, string> {
 	const map = new Map<string, string>();
 	for (const uc of schema.uniqueConstraints ?? []) {
 		if (uc.derivedFromIndex) continue;
+		if (findReusableIndexForUnique(schema, uc)) continue;
 		const name = implicitUniqueIndexName(schema, uc);
 		map.set(name.toLowerCase(), name);
 	}
@@ -1092,6 +1100,22 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		await this.saveTableDDL(updatedSchema);
 		table.markDdlSaved();
 
+		// The new index may now REALIZE a plain UNIQUE over the same columns, which
+		// `updateSchema` above has already dropped from the materialized enforcement
+		// schema (`findReusableIndexForUnique`). Nothing maintains that `_uc_*` any more,
+		// so tear its physical store down — leaving it would rot into a store whose
+		// entries no longer track the rows, which a later `DROP INDEX` would hand back to
+		// the constraint as if current. A no-op for every index that covers no UNIQUE.
+		//
+		// NOTE: like `dropIndex`'s own teardown, this closes and deletes a store the
+		// module coordinator may still hold buffered ops against (pending ops are keyed on
+		// the KVStore HANDLE), so a `CREATE INDEX` issued mid-transaction after writes to
+		// the constrained column can fail at commit. Same exposure `DROP INDEX` has had
+		// all along, and store DDL already declares `ddlTransactionality: 'auto-commit'`;
+		// if DDL-in-transaction is ever made safe, both sites need the buffered ops for
+		// the doomed store drained first.
+		await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, tableSchema);
+
 		// Emit schema change event. `updatedSchema` (not the pre-create
 		// `tableSchema`) is the owner the canonical CREATE INDEX renders against —
 		// it is only read for the table's qualified name and column names, but
@@ -1174,6 +1198,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		} else {
 			await this.provider.closeIndexStore(schemaName, tableName, indexName);
 		}
+
+		// The dropped index may have been the structure REALIZING a plain UNIQUE over its
+		// columns; `updateSchema` above has re-materialized that constraint's own `_uc_*`,
+		// which has no physical store yet. Build it from the current rows so the very next
+		// insert is still enforced by a seek rather than an empty index. Deliberately AFTER
+		// the teardown: the build reads the DATA store, so the dropped index's store is
+		// dead weight by then. A no-op for every index no UNIQUE was reusing.
+		await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, tableSchema);
 
 		this.eventEmitter?.emitSchemaChange({
 			type: 'drop',
@@ -1567,22 +1599,29 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 	/**
 	 * Build / tear down the physical index stores backing implicit UNIQUE indexes
-	 * (`_uc_*`) after an ALTER, by diffing the implicit-index NAMES of the old vs new
-	 * constraint sets:
-	 *   - a name newly PRESENT (ADD CONSTRAINT UNIQUE, or the target half of a
-	 *     RENAME CONSTRAINT / rename of an unnamed UC's column) has its physical store
+	 * (`_uc_*`) after a DDL statement, by diffing the implicit-index NAMES the old vs
+	 * new schema call for ({@link implicitUniqueIndexNameMap}):
+	 *   - a name newly PRESENT (ADD CONSTRAINT UNIQUE, the target half of a
+	 *     RENAME CONSTRAINT / rename of an unnamed UC's column, or a DROP INDEX that
+	 *     retires the explicit index a UNIQUE was reusing) has its physical store
 	 *     populated from this module's effective rows;
-	 *   - a name newly ABSENT (DROP CONSTRAINT UNIQUE, or the source half of a rename)
-	 *     has its store torn down, so a later re-ADD does not reopen stale entries.
+	 *   - a name newly ABSENT (DROP CONSTRAINT UNIQUE, the source half of a rename, or
+	 *     a CREATE INDEX whose new index now realizes the UNIQUE) has its store torn
+	 *     down, so nothing maintains it and a later rebuild does not reopen stale
+	 *     entries.
 	 *
 	 * The SCHEMA entry itself is materialized/removed by `withImplicitUniqueIndexes`
-	 * on the arm's `table.updateSchema`; only the physical store needs this. Runs after
-	 * every ALTER but is a no-op whenever the implicit-index name set is unchanged
-	 * (incl. PK / collation / data-type ALTERs, whose same-name physical re-encode is
-	 * already done by {@link rebuildSecondaryIndexes}).
+	 * on the caller's `table.updateSchema`; only the physical store needs this. Called
+	 * after every ALTER TABLE and after `createIndex` / `dropIndex`, and a no-op
+	 * whenever the implicit-index name set is unchanged — the common case, including
+	 * every PK / collation / data-type ALTER (whose same-name physical re-encode is
+	 * already done by {@link rebuildSecondaryIndexes}) and every CREATE / DROP INDEX
+	 * that does not cover a plain UNIQUE's columns.
 	 *
-	 * `oldSchema` carries the pre-ALTER `uniqueConstraints` (its `.indexes` may be
-	 * de-materialized — the diff reads `uniqueConstraints`, not `.indexes`).
+	 * `oldSchema` is the pre-DDL schema: its `uniqueConstraints` give the old names and
+	 * its `.indexes` the old reuse decisions. Either the engine-facing or the
+	 * materialized copy works — `findReusableIndexForUnique` skips a constraint's own
+	 * `_uc_*`, so a materialized input yields the same name set.
 	 *
 	 * NOTE: the build populates from THIS module's own effective rows (committed + this
 	 * transaction's pending), never a wrapper's — mirroring `createIndex`. Under the

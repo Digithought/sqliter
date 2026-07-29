@@ -32,6 +32,7 @@ import {
 	maintainedTableUniqueViolationError,
 	uniqueEnforcementCollations,
 	logicalTypeCanHoldText,
+	normalizeCollationName,
 	pkKeyCollationName,
 	JSON_TYPE,
 	type IdxStrSpec,
@@ -356,6 +357,89 @@ export function implicitUniqueIndexName(schema: TableSchema, uc: UniqueConstrain
 }
 
 /**
+ * True when every column of `idx` carries the same effective collation as the
+ * column `uc` declares — the reuse gate of {@link findReusableIndexForUnique}.
+ *
+ * Positions align because the caller has already matched the column SET
+ * (`idx.columns[i]` ↔ `uc.columns[i]`). An index column with no explicit COLLATE
+ * has `collation === undefined` and falls back to the declared column collation,
+ * so the common `create index ix on t(email)` case stays reuse-eligible.
+ *
+ * Store index KEYS are today encoded under the table key collation K for every
+ * index alike (`buildIndexKey` passes `this.encodeOptions`), so a same-column
+ * index is byte-identical to the `_uc_*` it would replace REGARDLESS of the
+ * declared per-column COLLATE — this gate is stricter than today's encoding
+ * requires. It is deliberately kept strict: it mirrors
+ * `MemoryTableManager.indexCollationsMatchDeclared` (so both backends reuse the
+ * same set of indexes), and if store index keys ever move to per-column
+ * collations, reusing a BINARY-collated index for a NOCASE-declared UNIQUE would
+ * make the enforcement seek UNDER-fetch and silently accept a duplicate. The
+ * cost of the strictness is one duplicate hidden index in a rare declaration.
+ */
+function indexCollationsMatchDeclared(
+	schema: TableSchema,
+	idx: TableIndexSchema,
+	uc: UniqueConstraintSchema,
+): boolean {
+	return uc.columns.every((colIdx, i) => {
+		const declared = normalizeCollationName(schema.columns[colIdx]?.collation ?? 'BINARY');
+		const indexCollation = normalizeCollationName(
+			idx.columns[i]?.collation ?? schema.columns[colIdx]?.collation ?? 'BINARY',
+		);
+		return indexCollation === declared;
+	});
+}
+
+/**
+ * The existing `schema.indexes` entry that already realizes `uc`, or undefined
+ * when none does and {@link withImplicitUniqueIndexes} must materialize a hidden
+ * `_uc_*` of its own.
+ *
+ * A FULL (non-partial) index over exactly the constrained columns physically
+ * holds an entry for every live row, keyed by the same bytes the `_uc_*` would
+ * use — so {@link StoreTable.findUniqueConflictViaIndex} can seek it directly and
+ * a second identical structure would only double DML maintenance. Reuse is
+ * refused for:
+ *
+ *  - an index-DERIVED UC (`derivedFromIndex`) — it already names its index;
+ *  - a PARTIAL UNIQUE (`uc.predicate`) — the co-scoped `_uc_*` carries the SAME
+ *    predicate OBJECT, which {@link StoreTable.findIndexForUniqueConstraint}
+ *    matches on identity; a user index with an equal-but-distinct predicate
+ *    physically omits rows the constraint still covers;
+ *  - a PARTIAL index — it omits out-of-scope rows a full UNIQUE still covers;
+ *  - a collation-mismatched index (see {@link indexCollationsMatchDeclared}).
+ *
+ * A DESC index IS reusable: every writer and reader of an index derives its
+ * direction flags from that index's own `columns[].desc`
+ * ({@link StoreTable.updateSecondaryIndexes},
+ * {@link StoreTable.findUniqueConflictViaIndex}), so the enforcement probe lands
+ * on the same window a DESC-encoded entry was written to.
+ *
+ * Reuse makes a plain UNIQUE's hidden index depend on the set of EXPLICIT
+ * indexes, so `StoreModule.createIndex` / `dropIndex` must reconcile the physical
+ * `_uc_*` store on the transition — see
+ * `StoreModule.reconcileImplicitUniqueIndexStores`.
+ */
+export function findReusableIndexForUnique(
+	schema: TableSchema,
+	uc: UniqueConstraintSchema,
+): TableIndexSchema | undefined {
+	if (uc.derivedFromIndex || uc.predicate) return undefined;
+	// Skip the constraint's OWN `_uc_*`, so an ALREADY-MATERIALIZED schema answers the
+	// same as its engine-facing original: without this a UC would "reuse" the very index
+	// it asked for, and a caller diffing the implicit set
+	// (`StoreModule.implicitUniqueIndexNameMap`) would conclude the `_uc_*` is not needed
+	// and tear its store down.
+	const ownName = implicitUniqueIndexName(schema, uc).toLowerCase();
+	return (schema.indexes ?? []).find(idx =>
+		idx.name.toLowerCase() !== ownName
+		&& !idx.predicate
+		&& idx.columns.length === uc.columns.length
+		&& idx.columns.every((col, i) => col.index === uc.columns[i])
+		&& indexCollationsMatchDeclared(schema, idx, uc));
+}
+
+/**
  * Return `schema` with a synthetic secondary index materialized into
  * `schema.indexes` for every NON-DERIVED UNIQUE constraint that lacks one — the
  * store analogue of `MemoryTableManager.ensureUniqueConstraintIndexes`.
@@ -380,6 +464,11 @@ export function implicitUniqueIndexName(schema: TableSchema, uc: UniqueConstrain
  * `schema.indexes`). A partial UNIQUE's synthetic index carries the SAME
  * `uc.predicate` object reference, which
  * {@link StoreTable.findIndexForUniqueConstraint} matches on identity.
+ *
+ * A UC whose columns are already covered by a collation-compatible EXPLICIT full
+ * index is left WITHOUT a `_uc_*` — that index enforces it (see
+ * {@link findReusableIndexForUnique}), so building a byte-identical twin would
+ * only double the work of every INSERT / UPDATE / DELETE.
  */
 export function withImplicitUniqueIndexes(schema: TableSchema): TableSchema {
 	const ucs = schema.uniqueConstraints;
@@ -392,6 +481,7 @@ export function withImplicitUniqueIndexes(schema: TableSchema): TableSchema {
 		if (uc.derivedFromIndex) continue;
 		const name = implicitUniqueIndexName(schema, uc);
 		if (present.has(name.toLowerCase())) continue;
+		if (findReusableIndexForUnique(schema, uc)) continue;
 		present.add(name.toLowerCase());
 		additions.push({
 			name,
@@ -552,9 +642,10 @@ export class StoreTable extends VirtualTable {
 
 	/**
 	 * {@link tableSchema} with a hidden `_uc_*` secondary index materialized per
-	 * non-derived UNIQUE constraint (see {@link withImplicitUniqueIndexes}) — the
-	 * schema that drives UNIQUE ENFORCEMENT ({@link findIndexForUniqueConstraint})
-	 * and physical index MAINTENANCE ({@link updateSecondaryIndexes}).
+	 * non-derived UNIQUE constraint that no explicit index already covers (see
+	 * {@link withImplicitUniqueIndexes}) — the schema that drives UNIQUE ENFORCEMENT
+	 * ({@link findIndexForUniqueConstraint}) and physical index MAINTENANCE
+	 * ({@link updateSecondaryIndexes}).
 	 *
 	 * Deliberately SEPARATE from the engine-facing {@link tableSchema}: the engine
 	 * reads `tableInstance.tableSchema` at CREATE (`SchemaManager.finalizeCreatedTableSchema`)
@@ -2618,10 +2709,12 @@ export class StoreTable extends VirtualTable {
 	 * The `schema.indexes` entry whose physical index store can serve `uc`'s
 	 * conflict search as a point seek, or undefined when none can.
 	 *
-	 * Every non-derived UNIQUE now carries a materialized implicit index
-	 * (`_uc_*`, see {@link withImplicitUniqueIndexes}), so — like the memory
-	 * backend — a plain column- or table-level `UNIQUE` is index-servable, not
-	 * only an explicit `CREATE INDEX`. A UC is index-servable when:
+	 * Every non-derived UNIQUE is realized by an index in the materialized schema
+	 * — a hidden `_uc_*`, or the explicit index it reuses when one covers the same
+	 * columns (see {@link withImplicitUniqueIndexes} /
+	 * {@link findReusableIndexForUnique}) — so, like the memory backend, a plain
+	 * column- or table-level `UNIQUE` is index-servable, not only an explicit
+	 * `CREATE INDEX`. A UC is index-servable when:
 	 *
 	 *  - it is index-derived (`derivedFromIndex`, from `CREATE UNIQUE INDEX`) and
 	 *    its named index is still present — the index's partial predicate then
