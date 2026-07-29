@@ -770,7 +770,13 @@ StoreTableBase        store-table-base.ts        state, store handles, stats, tx
 
 Only `StoreTable` is exported; the intermediate layers are `abstract` and exist purely to
 divide the file. A layer may call downward (a scan may read the base's effective-row
-iterator) but never upward.
+iterator) but never upward. Nothing enforces that rule explicitly — it holds because a
+base class cannot name a subclass member, so an upward call fails to compile.
+
+- NOTE: the two largest layers sit near 900 lines each. If either passes ~1,000, split it
+  the same way — the scan layer's natural next seam is the multi-seek group
+  (`decodeMultiSeekTuples` / `orderTupleValues` / `scanMultiSeek` / `scanMultiSeekPrimary`),
+  and the base's is the statistics block.
 
 ## Implementation Status
 

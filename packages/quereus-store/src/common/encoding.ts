@@ -56,7 +56,7 @@ export const BUILTIN_KEY_NORMALIZER_RESOLVER: KeyNormalizerResolver = (collation
 
 /**
  * Per-column key value transform (resolved by `storeSemanticKeyTransform` in
- * store-table.ts): applied to a value BEFORE type-dispatched encoding, so a
+ * pk-key-resolution.ts): applied to a value BEFORE type-dispatched encoding, so a
  * semantic-ordering type keys in its `compare` order and identity. Two transforms
  * exist today:
  *

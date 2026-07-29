@@ -2,7 +2,7 @@
  * Shared UNIQUE-enforcement collation helpers. {@link uniqueEnforcementCollations}
  * is the single source of truth across packages — it is re-exported from the
  * package index (`@quereus/quereus`) and reached by the store and isolation
- * re-validators (`quereus-store/store-table.ts`,
+ * re-validators (`quereus-store/store-table-constraints.ts`,
  * `quereus-isolation/isolated-table.ts`) through
  * {@link resolveUniqueEnforcementCollations}, which pairs it with the owning
  * database's collation resolver. Cross-package drift is eliminated by construction

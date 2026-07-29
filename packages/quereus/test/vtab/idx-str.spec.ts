@@ -12,7 +12,7 @@ import {
 
 /**
  * The seven `idxStr` shapes `rule-select-access-path.ts` emits. These strings are the
- * regression net: module runtimes (`scan-plan.ts`, `store-table.ts`) parse them, and
+ * regression net: module runtimes (`scan-plan.ts`, `store-table-scan.ts`) parse them, and
  * `test/vtab/scan-plan-bounds.spec.ts` / `test/optimizer/in-multiseek-incount.spec.ts`
  * assert against their text.
  */

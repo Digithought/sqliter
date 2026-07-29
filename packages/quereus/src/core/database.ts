@@ -2447,7 +2447,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  `cache` is the optional per-statement {@link BackingConnectionCache} the DML
 	 *  generator threads in so the backing-connection resolution is amortized over the
 	 *  whole statement (one scan per backing, not one per source row). The cold
-	 *  eviction callers (memory `checkUniqueViaMaterializedView`, store-table.ts) omit
+	 *  eviction callers (memory `checkUniqueViaMaterializedView`, store-table-constraints.ts) omit
 	 *  it and re-resolve the same connection deterministically — the `DatabaseInternal`
 	 *  surface deliberately exposes only the two-arg form (a host reporting writes from
 	 *  OUTSIDE a statement uses the batch-amortized {@link ingestExternalRowChanges}

@@ -57,7 +57,7 @@
  * `compareCodePoints` (BINARY) for a string-vs-string pair when no collation is
  * supplied. So the ORDERING paths (the isolation merge, UNIQUE enforcement, the
  * memory BTree's collation-carrying comparator) and the PK-EQUALITY-only paths
- * (`resolvePkSemanticEquality` in store-table.ts, the isolation layer's
+ * (`resolvePkSemanticEquality` in pk-key-resolution.ts, the isolation layer's
  * `getPkSemanticComparators`) all agree with these key bytes for JSON string leaves.
  *
  * ## Identity
@@ -105,7 +105,7 @@ const utf8 = new TextEncoder();
 
 /**
  * Encode a JSON value into structural key bytes — the store's key transform for
- * columns declared `json` (see `storeSemanticKeyTransform` in store-table.ts).
+ * columns declared `json` (see `storeSemanticKeyTransform` in pk-key-resolution.ts).
  * NULL never reaches a key transform (`encodeCompositeKey` exempts it), but a
  * NESTED JSON null is a real node and encodes with its own tag.
  */

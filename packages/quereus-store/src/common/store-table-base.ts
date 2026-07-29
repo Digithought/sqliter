@@ -102,6 +102,12 @@ export interface StoreTableModule {
  * store handles and transaction coordinator, its statistics accounting, and the
  * effective-row reads every higher layer issues. Platform-specific behavior is
  * delegated to the {@link StoreTableModule}.
+ *
+ * NOTE: `export` here is required, not intentional API surface — `StoreTable extends`
+ * this class transitively, so TypeScript cannot emit its declaration unless every base
+ * in the chain is nameable (TS4020). The package index deliberately does not re-export
+ * this class or the two layers above it; if an API-surface extractor is ever added, it
+ * should treat them as internal rather than prompt a re-export.
  */
 export abstract class StoreTableBase extends VirtualTable {
 	protected storeModule: StoreTableModule;
@@ -770,7 +776,7 @@ export abstract class StoreTableBase extends VirtualTable {
 	 * Effective (pending-over-committed) point read by PK values — the public
 	 * read an external writer issues before an upsert to learn the row's current
 	 * image. Thin wrapper over the same private point-lookup that backs
-	 * {@link query}'s point arm, so an external read merges pending-over-committed
+	 * `StoreTableScan.query`'s point arm, so an external read merges pending-over-committed
 	 * exactly like an engine read does.
 	 */
 	readRowByPk(pk: SqlValue[]): Promise<Row | null> {

@@ -60,7 +60,7 @@ export abstract class VirtualTable {
 	 * `create()`/`connect()` was called with, and every consumer that wants the qualified form
 	 * composes `` `${schemaName}.${tableName}` `` itself. A module that stores a qualified name
 	 * here doubles the schema in each of those compositions:
-	 * - `vtab/memory/table.ts` and `quereus-store/src/common/store-table.ts` name the
+	 * - `vtab/memory/table.ts` and `quereus-store/src/common/store-table-base.ts` name the
 	 *   `VirtualTableConnection` they register with the database. The engine matches that name
 	 *   against `<schema>.<table>` when resolving a connection (see
 	 *   `runtime/deferred-constraint-queue.ts`), so a doubled name never matches.

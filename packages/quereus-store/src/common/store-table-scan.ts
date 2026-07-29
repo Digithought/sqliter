@@ -775,8 +775,8 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * The name for a column is its DECLARED collation (absent ⇒ BINARY) — the same
 	 * resolution the access path's collation-cover analysis uses
 	 * (indexColumnCollationLookup / primaryKeyCollationLookup) when it decides a
-	 * pushed constraint is fully covered, and the same source this file's UNIQUE
-	 * checks compare under. On a collation MATCH the planner drops the residual
+	 * pushed constraint is fully covered, and the same source `StoreTableConstraints`'
+	 * UNIQUE checks compare under. On a collation MATCH the planner drops the residual
 	 * Filter, so {@link matchesFilters} alone must reproduce the predicate.
 	 *
 	 * `indexCollationNames` (from {@link indexColumnCollations}) overrides the
