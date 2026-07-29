@@ -34,8 +34,8 @@ import {
 
 /**
  * Planner-side constraint operator groups, as `BestAccessPlanRequest.filters` spells
- * them. Kept as one source of truth for the access-plan code below: `getBestAccessPlan`
- * classifies each pushed filter with these, and `tryIndexAccessPlan` claims a filter as
+ * them. Kept as one source of truth for the access-plan code below: {@link computeBestAccessPlan}
+ * classifies each pushed filter with these, and {@link tryIndexAccessPlan} claims a filter as
  * handled only when it falls in the group the engine's access-path rule will consume.
  */
 const EQ_OPS = ['='] as const;

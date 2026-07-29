@@ -111,7 +111,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 	/**
 	 * True when a byte window over the LEADING PK column reproduces the comparator's order
 	 * — the precondition {@link buildPKRangeBounds} needs, and the exact condition
-	 * `StoreModule.computeBestAccessPlan` uses before claiming the range filters handled.
+	 * `computeBestAccessPlan` (store-module-access-plan.ts) uses before claiming the range filters handled.
 	 * When false, the range arm degrades to a full scan + `matchesFilters` residual.
 	 */
 	protected leadingPkRangeIsOrderSafe(): boolean {
@@ -230,7 +230,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * partition, and a built-in NAME may be re-registered with a comparator + normalizer
 	 * pair that preserves equality while inverting order. This method is therefore only
 	 * ever reached under {@link leadingPkRangeIsOrderSafe} — enforced by
-	 * {@link analyzePKAccess} here and mirrored by `StoreModule.computeBestAccessPlan`
+	 * {@link analyzePKAccess} here and mirrored by `computeBestAccessPlan` (store-module-access-plan.ts)
 	 * before it claims the range filters handled. A collation without the
 	 * `orderPreserving` assertion costs the seek, never a row.
 	 */
@@ -322,7 +322,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * Index-column bytes are encoded under the table key collation K (NOT the index's
 	 * per-column declared collation — see `buildIndexKey`), while `matchesFilters` compares
 	 * under the index column's effective collation C. The EQ/prefix window is a superset
-	 * whenever K is coarser-or-equal to C, which `StoreModule.tryIndexAccessPlan` checked
+	 * whenever K is coarser-or-equal to C, which `tryIndexAccessPlan` (store-module-access-plan.ts) checked
 	 * before it named this index. The RANGE window additionally needs byte order to BE
 	 * comparator order, so it is gated on {@link keyOrderMatchesCollation} (which demands
 	 * `C === K` plus K's `orderPreserving` assertion); when that fails we return null and
@@ -381,7 +381,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 
 	/**
 	 * True when a byte window over `leadingCol` of `index` reproduces the comparator's
-	 * order. Mirrors the range arm of `StoreModule.tryIndexAccessPlan`: the window's bytes
+	 * order. Mirrors the range arm of `tryIndexAccessPlan` (store-module-access-plan.ts): the window's bytes
 	 * come from the table key collation K, the residual compares under the index column's
 	 * effective collation C, so both must be the same order-preserving collation.
 	 */
@@ -626,7 +626,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 		// The K-encoded byte windows below carry no residual able to resurrect a
 		// skipped row, so a seek column whose byte equality under-fetches the type's
 		// equality (TIMESPAN, JSON — see pkHasSemanticOrderingMember) cannot be
-		// multi-seeked. StoreModule.tryIndexAccessPlan declines such plans; one
+		// multi-seeked. `tryIndexAccessPlan` (store-module-access-plan.ts) declines such plans; one
 		// arriving anyway is malformed.
 		if (seekCols.some(colIdx => hasSemanticOrdering(this.tableSchema!.columns[colIdx]?.logicalType))) {
 			this.multiSeekMalformed(filterInfo, 'semantic-ordering seek column');
@@ -673,7 +673,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * Multi-seek over the PRIMARY key: each tuple is a full PK, resolved by a point
 	 * read in ascending encoded-data-key order (the table's native emission order).
 	 *
-	 * NOT reachable from this module's own plans today: `StoreModule.computeBestAccessPlan`
+	 * NOT reachable from this module's own plans today: `computeBestAccessPlan` (store-module-access-plan.ts)
 	 * claims IN-list filters only for secondary indexes (see its EQ_OPS vs EQ_OR_IN_OPS
 	 * split and tickets/backlog/feat-store-pk-in-list-multiseek). The branch exists so
 	 * a `_primary_` multi-seek arriving from a future plan gets a correct answer rather

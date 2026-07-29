@@ -69,7 +69,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// The engine-facing schema carries no `_uc_*` (the store keeps the materialized
 		// enforcement copy internal), so the arms build `updatedSchema` off a clean schema
 		// exactly as before this feature; `table.updateSchema` recomputes the enforcement
-		// copy, and `StoreModuleIndex.reconcileImplicitUniqueIndexStores` (below) moves the physical
+		// copy, and `StoreModuleIndex.reconcileImplicitUniqueIndexStores` moves the physical
 		// stores for any constraint-set change.
 		const oldSchema = table.getSchema();
 		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';

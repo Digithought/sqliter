@@ -53,8 +53,8 @@ import { jsonStructuralKey } from './json-key.js';
  * key — unregistered, or registered with a comparator but no normalizer — is rejected
  * at DDL time by `StoreTableBase.validateKeyCollations`, so no encode call ever has
  * to fall back. Shared by `StoreTable` (data-key + index-maintenance) and
- * `StoreModule.buildIndexEntries` (index rebuild) so the PK suffix encoding can
- * never drift between the two.
+ * the index rebuild `buildIndexEntries` (store-module-index-build.ts) so the PK suffix
+ * encoding can never drift between the two.
  */
 export function resolvePkKeyCollations(
 	pkDef: ReadonlyArray<{ index: number }>,
@@ -160,7 +160,7 @@ export function resolvePkSemanticEquality(
  * encoding. The `ColumnSchema`-shaped wrapper over the engine's
  * {@link logicalTypeCanHoldText}; both collation-safety guards over the store's
  * secondary indexes — the write-side `StoreTableConstraints.indexSeekHonorsEnforcementCollation`
- * and the read-side `StoreModule.tryIndexAccessPlan` — exempt a never-text column
+ * and the read-side `tryIndexAccessPlan` (store-module-access-plan.ts) — exempt a never-text column
  * from their K-vs-C comparison, so a false "non-text" answer is a silent
  * wrong-result (a seek under the wrong collation, with the residual dropped).
  */
@@ -178,7 +178,7 @@ export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
  *
  *  - **Same collation on both sides** (`compareCollation === keyCollation`). A `keyCollation`
  *    merely COARSER than `compareCollation` — the relaxation the EQUALITY seek is allowed to
- *    make, see `StoreModule.tryIndexAccessPlan` — is not enough here: it would need the key
+ *    make, see `tryIndexAccessPlan` (store-module-access-plan.ts) — is not enough here: it would need the key
  *    normalizer to be monotone with respect to the OTHER collation's order. It generally is
  *    not, even for built-ins: with `keyCollation = NOCASE` and `compareCollation = BINARY`,
  *    'K' (U+212A KELVIN SIGN) is `> 'z'` under BINARY, yet its key bytes are

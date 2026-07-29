@@ -28,6 +28,10 @@ import {
 } from './pk-key-resolution.js';
 import { buildDataKey, buildIndexKey } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
+// NOTE: this one constant is the only thing tying this file to the module chain (the graph
+// stays acyclic — the base layer is a leaf). If these helpers ever need to be usable without
+// loading the chain, move `DEFAULT_MAX_BATCH_BYTES` to a constants leaf and have the base
+// import it from there instead.
 import { DEFAULT_MAX_BATCH_BYTES } from './store-module-base.js';
 
 /**

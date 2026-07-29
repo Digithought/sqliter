@@ -540,13 +540,13 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		// shape, so the filter is simply never claimed and survives as a residual. If an
 		// engine bug ever needs catching here rather than absorbing, call
 		// `validateAccessPlan(request, plan)` on the way out.
-	// Table key collation K (default NOCASE). Any K reaching here has a key normalizer:
-	// `StoreTable`'s constructor rejects one that cannot key, and a name we cannot resolve
-	// to a table falls back to the built-in NOCASE. `||`, not `??`, so an empty-string
-	// `config.collation` reads as the default here exactly as it does in
-	// `StoreTable.encodeOptions` — the two must agree or `analyzePKAccess` would decline a
-	// window `computeBestAccessPlan` already marked handled.
-	const tableKeyCollation = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation || 'NOCASE').toUpperCase();
+		// Table key collation K (default NOCASE). Any K reaching here has a key normalizer:
+		// `StoreTable`'s constructor rejects one that cannot key, and a name we cannot resolve
+		// to a table falls back to the built-in NOCASE. `||`, not `??`, so an empty-string
+		// `config.collation` reads as the default here exactly as it does in
+		// `StoreTable.encodeOptions` — the two must agree or `analyzePKAccess` would decline a
+		// window `computeBestAccessPlan` already marked handled.
+		const tableKeyCollation = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation || 'NOCASE').toUpperCase();
 		return { ...computeBestAccessPlan(db, tableInfo, request, tableKeyCollation), honorsCollatedRangeBounds: true };
 	}
 

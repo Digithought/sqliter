@@ -65,7 +65,7 @@ export interface StoreTableConfig {
 	collation?: 'BINARY' | 'NOCASE';
 	/**
 	 * Serialized-byte budget for a single index-build write batch (see
-	 * `StoreModule.buildIndexEntries`). Parsed from the `max_batch_bytes` module
+	 * `buildIndexEntries` (store-module-index-build.ts)). Parsed from the `max_batch_bytes` module
 	 * arg; undefined falls back to the module default.
 	 */
 	maxBatchBytes?: number;

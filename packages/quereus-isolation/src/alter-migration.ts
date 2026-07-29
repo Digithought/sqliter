@@ -563,7 +563,7 @@ async function *stagedLiveRows(overlay: VirtualTable, tombstoneIdx: number): Asy
 /**
  * Computes one staged row's value for a freshly added column, mirroring the
  * committed-row backfill (see `base.ts` `recreatePrimaryTreeWithNewColumn` and
- * `store-module.ts` `migrateRows`):
+ * `store-table.ts` `migrateRows`):
  *
  * - Tombstone rows carry NULL placeholders and their appended value is never read,
  *   so append `null` and never run the evaluator against them (it could reference

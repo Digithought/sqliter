@@ -434,7 +434,7 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 	 *    reject, so the caller full-scans.
 	 *
 	 * Same direction and same admitted cases as the read-side guard in
-	 * `StoreModule.tryIndexAccessPlan`; conservative rather than exhaustive
+	 * `tryIndexAccessPlan` (store-module-access-plan.ts); conservative rather than exhaustive
 	 * (K = RTRIM over C = BINARY is provably safe but declined), which costs an
 	 * optimization, never correctness. The coarseness test is only sound for the
 	 * built-in names: a custom K equals a custom C only when the index column names
