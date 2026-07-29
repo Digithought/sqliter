@@ -13,7 +13,7 @@ The `MemoryTable` implementation (`src/vtab/memory/`) provides a sophisticated, 
 *   **`MemoryTableModule`** (`src/vtab/memory/module.ts`): Factory for creating and managing memory table instances
 *   **`MemoryTable`** (`src/vtab/memory/table.ts`): Connection-specific table interface that delegates to the manager
 *   **`MemoryTableManager`** (`src/vtab/memory/layer/manager.ts`): Shared state manager handling schema, connections, and layer lifecycle
-*   **`alter column` planning** (`src/vtab/memory/layer/alter-column.ts`): The decide-and-validate half of `MemoryTableManager.alterColumn` — one handler per attribute (`SET COLLATE`, `SET / DROP NOT NULL`, `SET DATA TYPE`, `SET / DROP DEFAULT`), each running its own pre-validation over the effective rows and returning the post-change column schema plus whether the structures re-key and whether the stored values must be rewritten. Everything in that file is a function of the pre-change schema and those rows: it throws to reject, but never mutates. The apply half (base rebuild, open-layer propagation, rollback) stays on the manager, which owns that state. That split is how the "validate before anything is mutated" rule under [DDL and transactions](#ddl-and-transactions) is kept structural rather than a matter of comment discipline.
+*   **`alter column` planning** (`src/vtab/memory/layer/alter-column.ts`): The decide-and-validate half of `MemoryTableManager.alterColumn` — one pre-validating handler per attribute, mutating nothing (see [DDL and transactions](#ddl-and-transactions))
 *   **Layer System**: MVCC implementation with inherited BTrees
     *   **`BaseLayer`** (`src/vtab/memory/layer/base.ts`): Root layer containing the canonical table data
     *   **`TransactionLayer`** (`src/vtab/memory/layer/transaction.ts`): Transaction-specific modifications using inherited BTrees
@@ -245,6 +245,20 @@ exactly as the rebuilt structure will. Two families qualify:
 Only a retype between **aliases of one logical type** (`TEXT` → `VARCHAR(50)`, `INTEGER` →
 `BIGINT` — `inferType` returns the same shared type object) is a metadata-only no-op that skips
 all of this.
+
+For `ALTER COLUMN`, "validate before anything is mutated" is structural rather than a matter of
+comment discipline. The decide half lives in `layer/alter-column.ts` — one handler per attribute
+(`SET COLLATE`, `SET`/`DROP NOT NULL`, `SET DATA TYPE`, `SET`/`DROP DEFAULT`), each running its own
+pre-validation over the effective rows and returning the post-change `ColumnSchema` plus whether the
+structures re-key and whether the stored values must be rewritten. That file is a pure function of
+the pre-change schema and those rows: it throws to reject, and has no access to the manager, the
+base layer or any open layer. The apply half — base rebuild, open-layer propagation, rollback —
+stays on `MemoryTableManager`, which owns that state, behind the single named first-write step
+`applyAlterColumnToBase`. One consequence worth preserving: the manager's own effective-row view is
+a **synchronous** iterable, and the scan helper keeps it that way (branching on the source's flavour
+instead of routing everything through `for await`) so no microtask gap opens mid-scan for another
+connection's autocommit write to land in — the schema-change latch serializes DDL, not DML. A
+wrapper-supplied `EffectiveRowSource` is genuinely async and has no such atomicity to lose.
 
 When the table is wrapped by a module that stages the transaction's writes *outside* this
 manager — the isolation layer, whose per-connection overlay this manager cannot see — those

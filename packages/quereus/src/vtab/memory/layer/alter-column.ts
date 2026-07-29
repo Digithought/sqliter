@@ -291,7 +291,7 @@ export async function planSetDataType(ctx: AlterColumnContext, dataType: string)
 async function assertEveryValueConverts(ctx: AlterColumnContext, convert: (v: SqlValue) => SqlValue): Promise<void> {
 	await scanEffectiveRows(ctx, row => {
 		const val = row[ctx.colIndex];
-		if (val !== null) convert(val as SqlValue); // throws MISMATCH to reject the retype
+		if (val !== null) convert(val); // throws MISMATCH to reject the retype
 		return false; // every row must convert — never stop early
 	});
 }
