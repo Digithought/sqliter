@@ -387,7 +387,10 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		await db.exec(`create table t (id integer primary key, name text) using isolated`);
 		await db.exec('begin');
 		await db.exec(`insert into t values (1, 'Alice')`); // lives only in the overlay
-		await db.exec(`alter table t add column score integer`);
+		// Explicit `null`: the session `default_column_nullability` ships as `not_null`, so a bare
+		// `score integer` would be a mandatory column with no value for the staged row and would be
+		// refused by the NOT NULL backfill gate (see the reject arm below).
+		await db.exec(`alter table t add column score integer null`);
 
 		const row = await db.get(`select id, name, score from t where id = 1`);
 		expect(row, 'staged row survives the ALTER').to.deep.equal({ id: 1, name: 'Alice', score: null });

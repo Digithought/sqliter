@@ -616,7 +616,10 @@ describe('Isolated Store Module', () => {
 
 			await db.exec('BEGIN');
 			await db.exec(`INSERT INTO t VALUES (1, 'Alice')`);
-			await db.exec(`ALTER TABLE t ADD COLUMN score INTEGER`);
+			// Explicit NULL: `default_column_nullability` ships as `not_null`, so a bare
+			// `score INTEGER` is mandatory and the NOT NULL backfill gate refuses it here
+			// (the overlay row has no value for it).
+			await db.exec(`ALTER TABLE t ADD COLUMN score INTEGER NULL`);
 
 			const row = await db.get('SELECT * FROM t WHERE id = 1');
 			expect(row?.id).to.equal(1);
