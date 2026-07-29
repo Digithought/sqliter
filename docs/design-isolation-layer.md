@@ -528,7 +528,11 @@ normalizer per PK column, drawn from that column's declared collation — **not*
 collation, so under a NOCASE PK a case-only key rewrite (`'abc'` → `'ABC'`) would
 fail to shadow the underlying row and surface both. The canonical encoder tags
 bigint safely and maps collation-equal keys to identical strings, agreeing with
-`getComparePK`/`keysEqual`.
+`getComparePK`/`keysEqual`. The encoder is built by `makePkKeySerializer`
+(`overlay-rows.ts`), a thin wrapper over the engine's `makePkIdentitySerializer`
+(`@quereus/quereus`, `util/key-serializer.ts`) — the single implementation of "are these
+two primary keys the same row?", shared with the sync engine's per-row metadata keying, so
+the two layers cannot drift.
 
 Those normalizers resolve through the **owning connection** (`db.getKeyNormalizerResolver()`,
 bound in the `IsolatedTable` constructor beside `getCollationResolver()`), never a

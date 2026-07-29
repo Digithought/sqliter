@@ -8,8 +8,11 @@
 import type { Row, SqlValue } from '../common/types.js';
 import type { JSONValue } from '../common/json-types.js';
 import { canonicalJsonString } from './json-canonical.js';
-import type { KeyNormalizerResolver } from '../types/logical-type.js';
-import type { LogicalType } from '../types/logical-type.js';
+import type { KeyNormalizerResolver, LogicalType } from '../types/logical-type.js';
+// NOTE: the only util→planner *value* import in this package. It is acyclic today —
+// comparison-collation.ts pulls util/comparison.js, planner/analysis/predicate-shape.js,
+// and common/, none of which reach back here. Adding a key-serializer import to any of
+// those closes the cycle; move `pkKeyCollationName` down into types/ if that day comes.
 import { pkKeyCollationName } from '../planner/analysis/comparison-collation.js';
 import { semanticKeyTransform } from './comparison.js';
 

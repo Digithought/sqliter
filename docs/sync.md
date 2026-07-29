@@ -545,7 +545,10 @@ Because the identity freely contains `:` (type tags) and `\0` (member separator)
 `cv:`/`cl:` key layouts **length-prefix** it (`{idLen}:` is the identity's length in
 string code units), making the identity/column split unambiguous. Keying is resolved per
 table from its schema (key collations + semantic transforms) via
-`metadata/pk-identity.ts`; a wired `keyNormalizerResolver` (pass
+`metadata/pk-identity.ts`, which is a thin wrapper over the engine's
+`resolvePkIdentityKeying` (`@quereus/quereus`, `util/key-serializer.ts`) — the single
+implementation of that rule, shared with the isolation overlay's row-alignment key, so the
+two layers cannot drift; a wired `keyNormalizerResolver` (pass
 `db.getKeyNormalizerResolver()`) keeps custom collations keying exactly as the database
 compares them. A relay-only deployment with no `getTableSchema` oracle keys raw values —
 stable for its whole life, since no oracle (and hence no identity flip) can appear later.
