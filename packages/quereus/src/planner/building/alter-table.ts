@@ -9,12 +9,13 @@ import { PlanNode, type VoidNode, type ScalarPlanNode, type Attribute, type RowD
 import type { TableReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { buildRowDefaultScope } from './default-scope.js';
-import { validateDeterministicDefault } from '../validation/determinism-validator.js';
+import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
 import { inferType } from '../../types/registry.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
+import { validateAddColumnGeneratedRefs } from '../../schema/table.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { planViewBody } from './create-view.js';
 
@@ -74,7 +75,10 @@ export function buildAlterTableStmt(
       // columns / non-determinism rejected; `new.<column>` accepted with its build
       // deferred). This runs before building the backfill so a bare-column default
       // is rejected here rather than silently resolving against the existing columns
-      // the backfill scope exposes.
+      // the backfill scope exposes. DEFAULT only: a GENERATED ALWAYS AS expression is
+      // written with bare column references by definition, so this validator would
+      // reject every legal one. Its determinism is checked inside
+      // `buildAddColumnBackfill` instead, with the generated-flavoured validator.
       const defaultConstraint = column.constraints?.find(c => c.type === 'default');
       if (defaultConstraint?.expr) {
         const hasMutationContext = !!tableReference.tableSchema.mutationContext
@@ -84,12 +88,13 @@ export function buildAlterTableStmt(
         );
       }
       const backfill = buildAddColumnBackfill(ctx, tableReference, column);
-      // For the per-row (evaluator) default path, enforce any CHECK on the new column
-      // against each backfilled row by compiling the predicates here and evaluating them
-      // inside the per-row backfill hook (mirrors the NOT NULL per-row path) — a violating
-      // row aborts the ALTER before any tree/batch swap. The literal-default path is left to
-      // the post-backfill scan (`validateBackfillAgainstChecks`), so checks are only
-      // compiled when a backfill is present.
+      // For the per-row (evaluator) path — a non-foldable DEFAULT or a GENERATED ALWAYS AS
+      // expression — enforce any CHECK on the new column against each backfilled row by
+      // compiling the predicates here and evaluating them inside the per-row backfill hook
+      // (mirrors the NOT NULL per-row path) — a violating row aborts the ALTER before any
+      // tree/batch swap. The literal-default path is left to the post-backfill scan
+      // (`validateBackfillAgainstChecks`), so checks are only compiled when a backfill is
+      // present.
       const checks = backfill ? buildAddColumnChecks(ctx, tableReference, column) : undefined;
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'addColumn',
@@ -225,29 +230,46 @@ export function buildAlterTableStmt(
 }
 
 /**
- * Compile the per-row backfill of an ADD COLUMN whose DEFAULT does not fold to a
- * literal (e.g. `new.<col>`). Mirrors the single-source INSERT row-expansion and the
- * view-write key default: the default is built against the table's *existing* columns
- * as the "supplied" row, so `new.<col>` resolves to the existing row's sibling during
- * backfill. Returns `undefined` for a missing or literal-folding default (the module
- * bulk-writes those), so the common case allocates nothing.
+ * Compile the per-row backfill of an ADD COLUMN that carries a per-row value source:
+ * a DEFAULT that does not fold to a literal (e.g. `new.<col>`), or a GENERATED ALWAYS
+ * AS expression (whatever its VIRTUAL / STORED spelling — this engine materializes a
+ * generated value at write time either way). Mirrors the single-source INSERT
+ * row-expansion and the view-write key default: the expression is built against the
+ * table's *existing* columns as the "supplied" row, so both `new.<col>` and the bare
+ * `<col>` a generated expression uses resolve to the existing row's sibling during
+ * backfill. Returns `undefined` when the column carries neither, or for a
+ * literal-folding DEFAULT (the module bulk-writes that from the column's
+ * `defaultValue`), so the common case allocates nothing.
  */
 function buildAddColumnBackfill(
   ctx: PlanningContext,
   tableReference: TableReferenceNode,
   columnDef: AST.ColumnDef,
 ): AddColumnBackfill | undefined {
+  // A column declares a DEFAULT or a GENERATED ALWAYS AS, never both —
+  // `columnDefToSchema` rejects the pair — so at most one arm applies.
+  const generatedExpr = columnDef.constraints?.find(c => c.type === 'generated')?.generated?.expr;
   const defaultExpr = columnDef.constraints?.find(c => c.type === 'default')?.expr;
-  if (!defaultExpr) return undefined;
-  // Literal / NULL defaults fold and are bulk-written by the module — no per-row node.
-  if (tryFoldLiteral(defaultExpr) !== undefined) return undefined;
+  const sourceExpr = generatedExpr ?? defaultExpr;
+  if (!sourceExpr) return undefined;
+  // Literal / NULL DEFAULTs fold and are bulk-written by the module — no per-row node.
+  // Deliberately NOT taken on the generated arm: a generated column has no
+  // `defaultValue` for the module to bulk-write, so short-circuiting a constant
+  // generated expression (`generated always as (2)`) would leave every existing row
+  // NULL. The generated arm always builds the per-row node.
+  if (!generatedExpr && tryFoldLiteral(sourceExpr) !== undefined) return undefined;
 
   const tableSchema = tableReference.tableSchema;
-  // Fresh attributes for the existing columns, referenced only by this default's
-  // `new.<col>` column refs and resolved at runtime via the row slot the emitter
-  // installs over each existing row. Minting fresh (rather than reusing the table
-  // reference's attributes) keeps the node self-contained so the optimizer can't
-  // dangle it.
+  // Report a bad generated expression the way CREATE TABLE reports it, before the
+  // compile below turns an unresolvable (or self-referencing) name into a generic
+  // "Column not found".
+  if (generatedExpr) {
+    validateAddColumnGeneratedRefs(generatedExpr, columnDef.name, tableSchema.columns, tableSchema.name);
+  }
+  // Fresh attributes for the existing columns, referenced only by this expression's
+  // column refs and resolved at runtime via the row slot the emitter installs over
+  // each existing row. Minting fresh (rather than reusing the table reference's
+  // attributes) keeps the node self-contained so the optimizer can't dangle it.
   const rowAttrs: Attribute[] = tableSchema.columns.map(column => ({
     id: PlanNode.nextAttrId(),
     name: column.name,
@@ -255,17 +277,24 @@ function buildAddColumnBackfill(
     sourceRelation: 'add-column-backfill',
   }));
   const rowScope = buildRowDefaultScope(ctx.scope, tableSchema.columns, rowAttrs);
-  const node = buildExpression({ ...ctx, scope: rowScope }, defaultExpr) as ScalarPlanNode;
+  const node = buildExpression({ ...ctx, scope: rowScope }, sourceExpr) as ScalarPlanNode;
 
+  // Same validator each arm's write-path build site uses, so an ALTER accepts exactly
+  // what the equivalent CREATE TABLE + INSERT accepts. Both honour
+  // `nondeterministic_schema`, so the escape hatch is unchanged.
   if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
-    validateDeterministicDefault(node, columnDef.name, tableSchema.name);
+    if (generatedExpr) {
+      validateDeterministicGenerated(node, columnDef.name, tableSchema.name);
+    } else {
+      validateDeterministicDefault(node, columnDef.name, tableSchema.name);
+    }
   }
 
   const rowDescriptor: RowDescriptor = [];
   rowAttrs.forEach((attr, index) => { rowDescriptor[attr.id] = index; });
 
   // The evaluated value has to reach storage in the new column's declared form, exactly as an
-  // INSERT's would. Skip the conversion when the default's static type already IS that type
+  // INSERT's would. Skip the conversion when the expression's static type already IS that type
   // (identity comparison — the registry hands out one shared LogicalType instance per type),
   // mirroring `buildRowCoercion`: re-converting an already-converted value is destructive for
   // JSON. See `AddColumnBackfill.coerceTo`.
@@ -275,8 +304,9 @@ function buildAddColumnBackfill(
 }
 
 /**
- * Compile the column-level CHECK predicates of an ADD COLUMN whose DEFAULT does not fold
- * to a literal, so they can be enforced per backfilled row inside the backfill hook. Each
+ * Compile the column-level CHECK predicates of an ADD COLUMN that backfills per row (a
+ * non-foldable DEFAULT or a GENERATED ALWAYS AS expression), so they can be enforced per
+ * backfilled row inside the backfill hook. Each
  * predicate is built against a row scope covering the table's *existing* columns plus the
  * *new* column, so a CHECK referencing the new column (bare `<col>` or `new.<col>`) and any
  * existing sibling resolves. The new column sits at position `existingColumns.length` in the

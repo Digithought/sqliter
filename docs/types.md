@@ -509,9 +509,9 @@ Conversion errors surface from the emitter (for INSERT, before the row reaches
 constraint checking), but the message text is unchanged — the same
 `validateAndParse` produces it.
 
-**ALTER backfills follow the same rule.** `alter table … add column … default <x>`
-and `alter column … set not null` write existing rows outside the DML pipeline, so
-they convert explicitly:
+**ALTER backfills follow the same rule.** `alter table … add column … default <x>`,
+`alter table … add column … generated always as (<x>)` and `alter column … set not
+null` write existing rows outside the DML pipeline, so they convert explicitly:
 
 - A DEFAULT that folds to a literal goes through `foldDefaultToType`
   (`types/validation.ts`), which folds *and* converts to the new column's declared
@@ -531,6 +531,13 @@ they convert explicitly:
   for the same reason (`add column k json default (new.j)` over an existing JSON
   column must copy, not re-parse). The conversion runs before the per-row CHECK
   predicates, matching `emitInsert`.
+- A `generated always as (<x>)` expression takes that same identity-guarded
+  `coerceTo` path — one `AddColumnBackfill` serves both kinds — so a backfilled
+  generated cell holds what an INSERT computing the same expression would store
+  (`add column g integer generated always as (v || '0')` over a text `v` stores the
+  integer). It differs from the DEFAULT arm in one respect: it is *never* folded to a
+  bulk-written literal, because a generated column has no `defaultValue` a module
+  could write, so even `generated always as (2)` is evaluated per row.
 
 Because every `JSON_TYPE.compare` caller is guaranteed to hold parsed values, a
 JS string reaching `compare` is unambiguously a JSON **string scalar** and is

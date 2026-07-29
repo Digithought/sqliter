@@ -1925,13 +1925,26 @@ export class MemoryTableManager {
 				}
 			}
 			// Check for NOT NULL constraint (could be explicit or from default behavior).
-			// Allow NOT NULL without DEFAULT if the table is empty (SQLite-compatible).
-			// A non-literal *expression* default (e.g. `new.<col>`) is backfilled per-row by
-			// the engine right after this returns, which then enforces NOT NULL on the
-			// backfilled values — so don't reject it here as "without a DEFAULT".
+			// Allow NOT NULL without a value source if the table is empty (SQLite-compatible).
+			//
+			// `!backfillEvaluator` is the load-bearing clause, and mirrors
+			// `StoreModuleBase.alterAddColumn`: an engine-supplied evaluator — a non-foldable
+			// expression default (`new.<col>`) OR a `generated always as` expression — fills
+			// each existing row right after this returns, and NOT NULL is then enforced on the
+			// computed values (`BaseLayer.recreatePrimaryTreeWithNewColumn`, plus the
+			// pending-row pass below). Asking only which KIND of DEFAULT was written used to
+			// reject a NOT NULL generated column on a non-empty table the evaluator could fill.
+			//
+			// NOTE: the two DEFAULT-kind clauses are kept alongside it, so this gate stays
+			// laxer than the store's for `default null` on a column that is NOT NULL only by
+			// the session `default_column_nullability` — the store rejects that, memory admits
+			// it and leaves NULLs behind. Tracked as `bug-add-column-default-null-notnull-hole`;
+			// deliberately not changed here, since tightening it is a user-visible DDL
+			// rejection unrelated to the generated-column backfill.
 			const tableHasRows = this.baseLayer.primaryTree.at(this.baseLayer.primaryTree.first()) !== undefined;
 			const hasDefaultExpr = !!(defaultConstraint && defaultConstraint.expr);
-			if (newColumnSchema.notNull && defaultValue === null && !defaultIsLiteral && !hasDefaultExpr && tableHasRows) {
+			if (newColumnSchema.notNull && defaultValue === null && !defaultIsLiteral && !hasDefaultExpr
+				&& !backfillEvaluator && tableHasRows) {
 				throw new QuereusError(
 					`Cannot add NOT NULL column '${newColumnSchema.name}' to non-empty table `
 						+ `'${this.schemaName}.${this._tableName}' without a DEFAULT value`,
@@ -2003,9 +2016,10 @@ export class MemoryTableManager {
 				},
 			);
 			this.baseLayer.updateSchema(finalNewTableSchema);
-			// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
-			// its own value via the engine-supplied evaluator; a literal/NULL default
-			// uses the single folded `defaultValue` for every row.
+			// A per-row value source — a non-foldable DEFAULT (e.g. `new.<col>`) or a
+			// `generated always as` expression — backfills each existing row from its own
+			// value via the engine-supplied evaluator; a literal/NULL default uses the
+			// single folded `defaultValue` for every row.
 			await this.baseLayer.addColumnToBase(newColumnSchema, defaultValue, backfillEvaluator, targetIndex);
 			this.tableSchema = finalNewTableSchema;
 			this.initializePrimaryKeyFunctions();

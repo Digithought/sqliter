@@ -1207,6 +1207,69 @@ export function extractGeneratedColumnDependencies(
 }
 
 /**
+ * Pre-flight for `ALTER TABLE ADD COLUMN … GENERATED ALWAYS AS (<expr>)`, run at
+ * plan-build BEFORE the expression is compiled against a scope holding only the
+ * table's existing columns. Without it, a reference the table cannot satisfy surfaces
+ * as the generic `Column not found: <name>` from expression resolution — and for a
+ * self-reference (`add column g … generated always as (g + 1)`) that names the very
+ * column the statement is declaring, which reads as nonsense.
+ *
+ * Raises the same two errors the equivalent `CREATE TABLE` raises — from
+ * {@link extractGeneratedColumnDependencies} and {@link topoSortGeneratedColumns},
+ * which still run in the emitter afterwards — so the two authoring surfaces report a
+ * bad generated expression identically. It only moves those rejections EARLIER; it
+ * cannot reject anything they would accept.
+ *
+ * A self-reference is the only cycle ADD COLUMN can create: an existing column's
+ * expression cannot name a column that does not exist yet.
+ */
+export function validateAddColumnGeneratedRefs(
+	expr: AST.Expression,
+	newColumnName: string,
+	existingColumns: ReadonlyArray<ColumnSchema>,
+	tableName: string,
+): void {
+	const columnIndexMap = buildColumnIndexMap(existingColumns);
+	const tableNameLower = tableName.toLowerCase();
+	const newColLower = newColumnName.toLowerCase();
+
+	traverseAst(expr as AST.AstNode, {
+		enterNode: (node: AST.AstNode) => {
+			// Same ref shapes and same skip rules as extractGeneratedColumnDependencies:
+			// a ref qualified to another table belongs to an outer scope, and a bare
+			// `identifier` may legitimately resolve to something that is not a column of
+			// this table — so only the unambiguous `column` shape yields "not found".
+			let name: string | undefined;
+			if (node.type === 'column') {
+				const ref = node as AST.ColumnExpr;
+				if (ref.table && ref.table.toLowerCase() !== tableNameLower) return;
+				name = ref.name;
+			} else if (node.type === 'identifier') {
+				const ref = node as AST.IdentifierExpr;
+				if (ref.schema) return;
+				name = ref.name;
+			} else {
+				return;
+			}
+
+			const lower = name.toLowerCase();
+			if (lower === newColLower) {
+				throw new QuereusError(
+					`Cyclic dependency in generated columns: '${newColumnName}'`,
+					StatusCode.ERROR,
+				);
+			}
+			if (node.type === 'column' && !columnIndexMap.has(lower)) {
+				throw new QuereusError(
+					`Column '${name}' referenced by generated column '${newColumnName}' not found in table '${tableName}'`,
+					StatusCode.ERROR,
+				);
+			}
+		},
+	});
+}
+
+/**
  * Topologically sorts generated columns so a generated column's dependencies
  * come before it. Throws on any cycle (including self-edges).
  *

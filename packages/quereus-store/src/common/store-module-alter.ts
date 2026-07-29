@@ -165,13 +165,14 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			}
 		}
 
-		// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
-		// its own value via the engine-supplied evaluator (mirrors the memory path).
+		// A per-row value source — a non-foldable DEFAULT (e.g. `new.<col>`) or a
+		// `generated always as` expression — backfills each existing row from its own
+		// value via the engine-supplied evaluator (mirrors the memory path).
 		const backfillEvaluator = change.backfillEvaluator;
 
-		// Refuse NOT NULL without a usable DEFAULT on a non-empty table
+		// Refuse NOT NULL without a usable value source on a non-empty table
 		// (SQLite-compatible). A per-row evaluator IS usable — its NOT NULL is enforced
-		// per row during migration — so it is exempt from this no-default rejection.
+		// per row during migration — so it is exempt from this rejection.
 		if (newColSchema.notNull && defaultValue === null && !backfillEvaluator) {
 			if (await table.hasAnyRows()) {
 				throw new QuereusError(

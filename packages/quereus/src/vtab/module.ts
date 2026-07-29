@@ -594,12 +594,17 @@ export type SchemaChangeInfo =
 		type: 'addColumn';
 		columnDef: ColumnDef;
 		/**
-		 * Per-row backfill for a non-foldable DEFAULT (e.g. `new.<col>`): given an
-		 * existing row, returns that row's value for the new column. Absent for a
-		 * literal / NULL default (the module bulk-writes the folded value). The engine
-		 * builds this from the column's DEFAULT evaluated against the existing row, so a
-		 * module that appends the new column should call it per existing row instead of
-		 * writing a single default value.
+		 * Per-row backfill for a column whose value is a function of its row: a
+		 * non-foldable DEFAULT (e.g. `new.<col>`), or a GENERATED ALWAYS AS expression.
+		 * Given an existing row, returns that row's value for the new column. Absent for
+		 * a literal / NULL default (the module bulk-writes the folded value) and for a
+		 * column with neither. The engine builds it from the column's DEFAULT / generated
+		 * expression evaluated against the existing row, so a module that appends the new
+		 * column should call it per existing row instead of writing a single value.
+		 *
+		 * Its presence is also what a module's "NOT NULL needs a value source" gate should
+		 * key on: an evaluator IS a usable source, and a row it evaluates to NULL is
+		 * rejected per row during the backfill.
 		 */
 		backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>;
 		/**

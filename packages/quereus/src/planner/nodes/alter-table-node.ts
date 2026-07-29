@@ -7,20 +7,23 @@ import type { SqlValue } from '../../common/types.js';
 import type { LogicalType } from '../../types/logical-type.js';
 
 /**
- * The per-row backfill of an ADD COLUMN whose DEFAULT does not fold to a literal
- * (e.g. `new.<col>`). `node` is the default compiled against the table's existing
- * columns as the "supplied" row; `rowDescriptor` maps those fresh attribute ids to
- * existing-row positions. The emitter installs a row slot over each existing row and
- * evaluates `node` to produce that row's value for the new column. A literal default
- * folds and is bulk-written by the module instead, so it carries no backfill node.
+ * The per-row backfill of an ADD COLUMN that carries a per-row value source: a DEFAULT
+ * that does not fold to a literal (e.g. `new.<col>`), or a GENERATED ALWAYS AS
+ * expression. `node` is that expression compiled against the table's existing columns as
+ * the "supplied" row; `rowDescriptor` maps those fresh attribute ids to existing-row
+ * positions. The emitter installs a row slot over each existing row and evaluates `node`
+ * to produce that row's value for the new column. A literal DEFAULT folds and is
+ * bulk-written by the module instead, so it carries no backfill node; a generated column
+ * always carries one, since it has no `defaultValue` for the module to write.
  */
 export interface AddColumnBackfill {
 	readonly node: ScalarPlanNode;
 	readonly rowDescriptor: RowDescriptor;
 	/**
 	 * The new column's logical type, applied to each evaluated value so a backfilled cell
-	 * matches what an INSERT under the same DEFAULT would store. Undefined when the default
-	 * expression's static type already IS that type — conversion is skipped there, exactly as
+	 * matches what an INSERT under the same DEFAULT / GENERATED ALWAYS AS would store.
+	 * Undefined when the expression's static type already IS that type — conversion is
+	 * skipped there, exactly as
 	 * {@link import('../../types/validation.js').buildRowCoercion} skips an identity match,
 	 * because re-converting is destructive for some types: JSON's `parse` reads a plain JS
 	 * string as JSON *source*, so re-parsing an already-stored JSON value either changes it
@@ -31,8 +34,9 @@ export interface AddColumnBackfill {
 }
 
 /**
- * Per-row CHECK enforcement for an ADD COLUMN whose DEFAULT does not fold to a literal
- * (e.g. `new.<col>`). Each predicate is compiled against a row scope covering the
+ * Per-row CHECK enforcement for an ADD COLUMN that backfills per row (a non-foldable
+ * DEFAULT such as `new.<col>`, or a GENERATED ALWAYS AS expression). Each predicate is
+ * compiled against a row scope covering the
  * existing columns plus the new column; `rowDescriptor` maps those attribute ids to
  * positions (existing columns at their index, the new column at `existingColumns.length`).
  * The emitter feeds each backfilled row's `[...existingRow, newValue]` into the scope and

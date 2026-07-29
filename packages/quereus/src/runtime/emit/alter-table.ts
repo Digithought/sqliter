@@ -48,12 +48,13 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 	const tableSchema = plan.table.tableSchema;
 	const action = plan.action;
 
-	// An ADD COLUMN with a non-foldable DEFAULT carries a backfill scalar; emit it as a
-	// scheduled sub-program so the scheduler resolves it into a callback the run() body
-	// evaluates per existing row (via a row slot over the default's row descriptor). When the
-	// new column also carries a CHECK, its predicates ride alongside as further callbacks,
-	// evaluated per backfilled row against `[...existingRow, backfilledValue]`. Slot order is
-	// fixed: backfill first (present whenever checks are), then the checks in order.
+	// An ADD COLUMN with a per-row value source — a non-foldable DEFAULT, or a GENERATED
+	// ALWAYS AS expression — carries a backfill scalar; emit it as a scheduled sub-program
+	// so the scheduler resolves it into a callback the run() body evaluates per existing row
+	// (via a row slot over the backfill's row descriptor). When the new column also carries a
+	// CHECK, its predicates ride alongside as further callbacks, evaluated per backfilled row
+	// against `[...existingRow, backfilledValue]`. Slot order is fixed: backfill first
+	// (present whenever checks are), then the checks in order.
 	const backfill: AddColumnBackfill | undefined = action.type === 'addColumn' ? action.backfill : undefined;
 	const checks: AddColumnCheck | undefined = action.type === 'addColumn' ? action.checks : undefined;
 	const params: Instruction[] = [
@@ -435,12 +436,15 @@ async function runAddColumn(
 	// (bind params / bare columns / non-determinism rejected; `new.<column>` accepted)
 	// and, when it does not fold to a literal, compiled into `backfill` — the default
 	// evaluated against the existing row, so `new.<column>` reads that row's sibling.
+	// A GENERATED ALWAYS AS expression takes the same `backfill` route (always, since a
+	// generated column has no `defaultValue` any module could bulk-write), validated at
+	// plan-build with the generated-flavoured determinism check.
 	const defaultConstraint = columnDef.constraints?.find(c => c.type === 'default');
 	// Folded literal default, converted to the new column's declared type — the value a
 	// fresh INSERT under the same DEFAULT would store, and the same value each module
-	// folds for its own rows. Undefined when there is no default or it does not fold
-	// (the latter carries `backfill` instead). Used by the NOT NULL gate below and by
-	// the batched-event remap's backfill value. An unconvertible literal
+	// folds for its own rows. Undefined when there is no default (a generated column
+	// included) or it does not fold — those carry `backfill` instead. Used by the NOT NULL
+	// gate below and by the batched-event remap's backfill value. An unconvertible literal
 	// (`integer default 'abc'`) throws MISMATCH here, before anything is mutated.
 	const foldedDefault = foldDefaultToType(defaultConstraint?.expr, inferType(columnDef.dataType), columnDef.name);
 
@@ -453,11 +457,12 @@ async function runAddColumn(
 		);
 	}
 
-	// NOT NULL without a usable DEFAULT cannot backfill existing rows. A DEFAULT whose
-	// folded value is NULL is equivalent to "no DEFAULT" for this purpose. A non-foldable
-	// expression default (carried in `backfill`) IS usable — its NOT NULL enforcement is
-	// deferred to the post-backfill scan — so it is not rejected here. If the table is
-	// non-empty and the default is nullish, reject before mutating any schema or data.
+	// NOT NULL without a usable value source cannot backfill existing rows. A DEFAULT whose
+	// folded value is NULL is equivalent to "no DEFAULT" for this purpose. A per-row source
+	// (carried in `backfill` — a non-foldable expression default or a GENERATED ALWAYS AS
+	// expression) IS usable: its NOT NULL enforcement is deferred to the module's per-row
+	// backfill, which rejects the ALTER if any row evaluates to NULL. If the table is
+	// non-empty and there is no usable source, reject before mutating any schema or data.
 	//
 	// A module may opt out of this engine-generic rejection via the
 	// `delegatesNotNullBackfill` capability (structurally-total modules that
@@ -491,9 +496,10 @@ async function runAddColumn(
 		...extractColumnLevelForeignKeys(columnDef),
 	];
 
-	// A non-foldable default backfills each existing row from its own value. Install a row
-	// slot over the default's row descriptor; the evaluator the module calls per existing
-	// row sets the slot to that row, so the default's `new.<col>` refs resolve to it.
+	// A per-row backfill derives each existing row's value from that row. Install a row slot
+	// over the backfill's row descriptor; the evaluator the module calls per existing row
+	// sets the slot to that row, so the expression's `new.<col>` refs (and the bare `<col>`
+	// refs a GENERATED ALWAYS AS expression uses) resolve to it.
 	const rowSlot = backfill ? createRowSlot(rctx, backfill.rowDescriptor) : undefined;
 	// When the new column carries a CHECK, install a second slot over the existing columns
 	// plus the new column; we evaluate each predicate against `[...existingRow, value]` after
@@ -511,7 +517,7 @@ async function runAddColumn(
 			// Convert to the new column's declared type BEFORE the CHECK predicates see it,
 			// matching the write path (`emitInsert` coerces at the top of the DML pipeline, so
 			// constraint checking and storage both see the declared form). `coerceTo` is unset
-			// when the default's static type already IS the column's type — see
+			// when the expression's static type already IS the column's type — see
 			// `AddColumnBackfill.coerceTo` for why re-converting there would be destructive.
 			const value = backfill.coerceTo
 				? validateAndParse(evaluated, backfill.coerceTo, columnDef.name)
@@ -627,9 +633,10 @@ async function runAddColumn(
 		schema.addTable(columnOnlySchema);
 
 		// Validate the backfilled values against each inline CHECK, for the literal-default
-		// path only. A per-row (evaluator) default already enforced its CHECKs inside the
-		// backfill hook above — against the freshly-computed value rather than this scan's
-		// stale pre-backfill snapshot — and the module enforces NOT NULL there too. Runs
+		// path only. A per-row (evaluator) backfill — non-foldable DEFAULT or GENERATED
+		// ALWAYS AS — already enforced its CHECKs inside the backfill hook above, against the
+		// freshly-computed value rather than this scan's stale pre-backfill snapshot, and the
+		// module enforces NOT NULL there too. Runs
 		// before the whole install loop below, so on a column declaring several kinds a
 		// CHECK violation is reported ahead of a UNIQUE or FK one.
 		if (!backfill && inlineChecks.length > 0) {
@@ -817,9 +824,10 @@ async function validateBackfillAgainstChecks(
 }
 
 /**
- * Rejects ADD COLUMN ... NOT NULL when no usable DEFAULT is supplied and the
- * table already has rows. The pre-mutation form means no rollback is needed —
- * the schema and module state are still untouched at this point.
+ * Rejects ADD COLUMN ... NOT NULL when no usable value source is supplied (no DEFAULT,
+ * a DEFAULT folding to NULL, and no per-row backfill) and the table already has rows.
+ * The pre-mutation form means no rollback is needed — the schema and module state are
+ * still untouched at this point.
  */
 async function validateNotNullBackfill(
 	rctx: RuntimeContext,

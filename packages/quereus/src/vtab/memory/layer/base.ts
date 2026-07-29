@@ -388,10 +388,11 @@ export class BaseLayer implements Layer {
 
 		for (const path of oldTree.ascending(oldTree.first())) {
 			const oldRow = oldTree.at(path)!;
-			// A non-foldable DEFAULT (e.g. `new.<col>`) derives the new column's value from
-			// the existing row; a literal/NULL default uses the single folded value.
+			// A per-row value source — a non-foldable DEFAULT (e.g. `new.<col>`) or a
+			// `generated always as` expression — derives the new column's value from the
+			// existing row; a literal/NULL default uses the single folded value.
 			const value = backfillEvaluator ? await backfillEvaluator(oldRow) : defaultValue;
-			// A per-row default that produces NULL for a NOT NULL column cannot backfill that
+			// A per-row source that produces NULL for a NOT NULL column cannot backfill that
 			// row; reject before swapping the tree (the caller reverts the column add). This
 			// applies only to the per-row evaluator path — a literal/NULL default's nullability
 			// is gated up-front by the engine and the manager's pre-check.

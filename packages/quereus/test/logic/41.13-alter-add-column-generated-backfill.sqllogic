@@ -1,0 +1,298 @@
+-- ALTER TABLE ADD COLUMN ... GENERATED ALWAYS AS backfills the existing rows.
+--
+-- A generated column's value is a pure function of its row, so adding one to a
+-- populated table must compute it for the rows that are already there — the same
+-- value the identical declaration in CREATE TABLE would produce, and the same value
+-- a fresh INSERT produces afterwards. Anything the recomputation cannot honour
+-- (NOT NULL left NULL, an inline CHECK violated) rejects the whole ALTER and leaves
+-- the table exactly as it was.
+--
+-- Runs under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`).
+
+-- ============================================================
+-- 1. Every spelling backfills: bare, VIRTUAL, STORED
+--
+-- VIRTUAL and STORED are not distinguished by this engine — a generated column's
+-- value is materialized at write time either way — so all three must agree.
+-- ============================================================
+
+create table t_bare (id integer primary key, v integer);
+insert into t_bare values (1, 5);
+-- run
+
+alter table t_bare add column g integer generated always as (v * 2);
+-- run
+
+-- Row 2 arrives AFTER the ALTER, through the ordinary write path. The backfilled
+-- row and the inserted row must agree.
+insert into t_bare (id, v) values (2, 7);
+-- run
+
+select id, v, g from t_bare order by id;
+→ [{"id":1,"v":5,"g":10},{"id":2,"v":7,"g":14}]
+
+drop table t_bare;
+-- run
+
+create table t_virtual (id integer primary key, v integer);
+insert into t_virtual values (1, 5);
+-- run
+
+alter table t_virtual add column g integer null generated always as (v * 2) virtual;
+-- run
+
+insert into t_virtual (id, v) values (2, 7);
+-- run
+
+select id, v, g from t_virtual order by id;
+→ [{"id":1,"v":5,"g":10},{"id":2,"v":7,"g":14}]
+
+drop table t_virtual;
+-- run
+
+create table t_stored (id integer primary key, v integer);
+insert into t_stored values (1, 5);
+-- run
+
+alter table t_stored add column g integer null generated always as (v * 2) stored;
+-- run
+
+insert into t_stored (id, v) values (2, 7);
+-- run
+
+select id, v, g from t_stored order by id;
+→ [{"id":1,"v":5,"g":10},{"id":2,"v":7,"g":14}]
+
+-- The column reports as generated in the catalog (1 = VIRTUAL, 2 = STORED). The
+-- distinction is informational only — both spellings materialize at write time.
+select name, "generated" from table_info('t_stored') where name = 'g';
+→ [{"name":"g","generated":2}]
+
+drop table t_stored;
+-- run
+
+-- ============================================================
+-- 2. A constant generated expression still backfills
+--
+-- A generated column has no DEFAULT to bulk-write, so the literal-folding
+-- shortcut the DEFAULT path takes must NOT apply here — folding it would leave
+-- every existing row NULL.
+-- ============================================================
+
+create table t_const (id integer primary key, v integer);
+insert into t_const values (1, 5);
+-- run
+
+alter table t_const add column g integer null generated always as (2);
+-- run
+
+insert into t_const (id, v) values (2, 7);
+-- run
+
+select id, g from t_const order by id;
+→ [{"id":1,"g":2},{"id":2,"g":2}]
+
+drop table t_const;
+-- run
+
+-- ============================================================
+-- 3. A generated expression over an existing generated column
+--
+-- `h` is already materialized in every stored row, so `g` reads it during the
+-- backfill exactly as it would during an INSERT.
+-- ============================================================
+
+create table t_chain (id integer primary key, v integer, h integer generated always as (v + 1));
+insert into t_chain (id, v) values (1, 5);
+-- run
+
+alter table t_chain add column g integer null generated always as (h * 10);
+-- run
+
+insert into t_chain (id, v) values (2, 7);
+-- run
+
+select id, v, h, g from t_chain order by id;
+→ [{"id":1,"v":5,"h":6,"g":60},{"id":2,"v":7,"h":8,"g":80}]
+
+drop table t_chain;
+-- run
+
+-- ============================================================
+-- 4. Type conversion: the backfilled cell matches what an INSERT stores
+-- ============================================================
+
+create table t_coerce (id integer primary key, v text);
+insert into t_coerce values (1, '7');
+-- run
+
+alter table t_coerce add column g integer null generated always as (v || '0');
+-- run
+
+insert into t_coerce (id, v) values (2, '2');
+-- run
+
+select id, g, typeof(g) as t from t_coerce order by id;
+→ [{"id":1,"g":70,"t":"integer"},{"id":2,"g":20,"t":"integer"}]
+
+drop table t_coerce;
+-- run
+
+-- ============================================================
+-- 5. NOT NULL generated: accepted when the expression is total ...
+-- ============================================================
+
+create table t_nn (id integer primary key, v integer);
+insert into t_nn values (1, 5), (2, 7);
+-- run
+
+alter table t_nn add column g integer not null generated always as (v * 2);
+-- run
+
+insert into t_nn (id, v) values (3, 9);
+-- run
+
+select id, g from t_nn order by id;
+→ [{"id":1,"g":10},{"id":2,"g":14},{"id":3,"g":18}]
+
+drop table t_nn;
+-- run
+
+-- ... and rejected, table untouched, when it yields NULL for an existing row.
+create table t_nn_bad (id integer primary key, v integer null);
+insert into t_nn_bad values (1, 5), (2, null);
+-- run
+
+alter table t_nn_bad add column g integer not null generated always as (v * 2);
+-- error: NOT NULL constraint failed
+
+-- The ALTER was reverted whole: the column is gone and the rows are unchanged.
+select * from t_nn_bad order by id;
+→ [{"id":1,"v":5},{"id":2,"v":null}]
+
+drop table t_nn_bad;
+-- run
+
+-- ============================================================
+-- 6. An inline CHECK over the new column is enforced per backfilled row
+--
+-- Before the backfill existed the CHECK saw NULL and `not (null > 100)` is NULL,
+-- so the violation went unnoticed. With a real value the ALTER must reject.
+-- ============================================================
+
+create table t_check (id integer primary key, v integer);
+insert into t_check values (1, 5);
+-- run
+
+alter table t_check add column g integer null generated always as (v * 2) check (g > 100);
+-- error: CHECK constraint failed
+
+select * from t_check order by id;
+→ [{"id":1,"v":5}]
+
+-- The same declaration whose values satisfy the CHECK is accepted.
+alter table t_check add column g integer null generated always as (v * 2) check (g > 0);
+-- run
+
+select id, g from t_check order by id;
+→ [{"id":1,"g":10}]
+
+drop table t_check;
+-- run
+
+-- ============================================================
+-- 7. A non-deterministic generated expression is rejected at ALTER time
+--
+-- Matches the DEFAULT arm, which validates at plan-build regardless of row count,
+-- rather than deferring the failure to the next INSERT.
+-- ============================================================
+
+create table t_nondet (id integer primary key, v integer);
+insert into t_nondet values (1, 5);
+-- run
+
+alter table t_nondet add column g integer null generated always as (random());
+-- error: Non-deterministic expression not allowed in GENERATED ALWAYS AS
+
+select * from t_nondet order by id;
+→ [{"id":1,"v":5}]
+
+drop table t_nondet;
+-- run
+
+-- Empty table: same rejection, so DDL acceptance does not depend on the data.
+create table t_nondet_empty (id integer primary key, v integer);
+-- run
+
+alter table t_nondet_empty add column g integer null generated always as (random());
+-- error: Non-deterministic expression not allowed in GENERATED ALWAYS AS
+
+drop table t_nondet_empty;
+-- run
+
+-- ============================================================
+-- 8. A bad generated expression is reported the way CREATE TABLE reports it
+--
+-- The expression is compiled against a scope holding only the EXISTING columns, so
+-- without a pre-flight an unknown name — or the new column's own name — would surface
+-- as a bare "Column not found". Both must keep naming the generated column.
+-- ============================================================
+
+create table t_badref (id integer primary key, v integer);
+insert into t_badref values (1, 5);
+-- run
+
+alter table t_badref add column g integer null generated always as (nope * 2);
+-- error: Column 'nope' referenced by generated column 'g' not found in table 't_badref'
+
+alter table t_badref add column g integer null generated always as (g + 1);
+-- error: Cyclic dependency in generated columns: 'g'
+
+select * from t_badref order by id;
+→ [{"id":1,"v":5}]
+
+drop table t_badref;
+-- run
+
+-- ============================================================
+-- 9. The declarative route (declare schema + apply schema)
+--
+-- The differ emits the same ADD COLUMN through the same emitter, so a generated
+-- column declared onto a populated table backfills identically.
+-- ============================================================
+
+declare schema main {
+	table t_decl {
+		id INTEGER PRIMARY KEY,
+		v INTEGER
+	}
+}
+-- run
+
+apply schema main;
+-- run
+
+insert into t_decl values (1, 5);
+-- run
+
+declare schema main {
+	table t_decl {
+		id INTEGER PRIMARY KEY,
+		v INTEGER,
+		g INTEGER NULL GENERATED ALWAYS AS (v * 2)
+	}
+}
+-- run
+
+apply schema main;
+-- run
+
+insert into t_decl (id, v) values (2, 7);
+-- run
+
+select id, v, g from t_decl order by id;
+→ [{"id":1,"v":5,"g":10},{"id":2,"v":7,"g":14}]
+
+drop table t_decl;
+-- run
