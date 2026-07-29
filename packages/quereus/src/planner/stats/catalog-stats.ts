@@ -35,10 +35,15 @@ const MAX_BOOLEAN_DEPTH = 16;
  * - `complete` — the statistics answered for the predicate as a whole; `value` is
  *   the estimate.
  * - `lowerBound` — an `OR` had at least one branch out of reach of the statistics,
- *   so `value` is a proven FLOOR rather than an estimate: `a or b` keeps at least
- *   as many rows as `a` alone, so the most permissive branch that could be read
- *   bounds the whole disjunction from below. The true selectivity lies somewhere
- *   in `[value, 1]`.
+ *   so `value` is a FLOOR rather than an estimate: `a or b` keeps at least as many
+ *   rows as `a` alone, so the most permissive branch that could be read bounds the
+ *   whole disjunction from below. The true selectivity lies somewhere in `[value, 1]`.
+ *   NOTE: the floor is only exact when the readable branch is itself exact. An AND
+ *   branch drops its unknown conjuncts, so it reports an UPPER bound of its own
+ *   value, and a floor built from it can sit above the truth. The error direction is
+ *   the same one AND deliberately takes (over-estimate surviving rows), so nothing
+ *   downstream is worse off; if an exact floor is ever needed, an AND with a dropped
+ *   conjunct would have to be excluded from the max here.
  *
  * `undefined` in place of an `Estimate` means nothing could be established at all.
  */
@@ -380,6 +385,9 @@ export class CatalogStatsProvider implements StatsProvider {
 				continue;
 			}
 			// A branch's own lower bound is still a lower bound on the disjunction.
+			// NOTE: unreachable today — splitDisjuncts flattens nested ORs, and no other
+			// node kind produces a lowerBound, so no disjunct can carry one. Kept because
+			// it is the correct handling the moment another kind does.
 			if (est.kind === 'lowerBound') anyUnreadable = true;
 			sels.push(est.value);
 		}

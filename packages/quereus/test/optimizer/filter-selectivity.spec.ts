@@ -303,6 +303,17 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		expect(f!.selectivity, 'wrapped column has no reachable statistics').to.be.undefined;
 	});
 
+	it('leaves a partly-readable OR over one relation unstamped', () => {
+		// `o.cat = 'a'` alone floors the disjunction, and the single-table path would
+		// stamp that floor — but this path's gate is `statsOnlySelectivity`, which means
+		// "real statistics answered THE PREDICATE". A floor is not an answer, so the
+		// conjunct contributes nothing and the Filter stays unstamped.
+		const f = optimizedFilter(db,
+			"SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.cat = 'a' OR lower(o.cat) = 'x'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity, 'a floor must not pass the statistics gate').to.be.undefined;
+	});
+
 	it('leaves a conjunct spanning three relations unstamped', () => {
 		const f = optimizedFilter(db,
 			'SELECT * FROM o a JOIN o b ON a.id = b.id JOIN r c ON c.id = a.id WHERE a.qty + b.qty = c.qty');
@@ -461,6 +472,17 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 		expect(floor).to.be.lessThan(combineDisjunctive([1 / ndv.a, 1 / ndv.b]));
 	});
 
+	it('floors a partly-known OR at a readable AND branch', () => {
+		// The readable branch is a whole AND, so its own combined estimate is the floor.
+		// `b <> 2` rather than `b = 2`: combineConjunctive([1/4, 1/5]) is exactly the
+		// naive 0.1 on this table, which would make the case pass under the old
+		// give-up-and-guess behaviour too.
+		const floor = combineConjunctive([1 / ndv.a, 1 - 1 / ndv.b]);
+		expect(floor, 'the floor must bind over the naive 0.1').to.be.greaterThan(0.1);
+		expect(providerSelectivity("SELECT * FROM m WHERE (a = 1 AND b <> 2) OR lower(s) = 'x1'"))
+			.to.be.closeTo(floor, 1e-12);
+	});
+
 	it('treats a partly-known OR conjunct as unknown inside an AND', () => {
 		// A floor folded into a conjunctive product would drag the whole estimate down;
 		// AND deliberately errs high, so the partial OR counts as 1.0 like any other
@@ -540,12 +562,6 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 			// NOT over an OR.
 			['SELECT * FROM m WHERE NOT (a = 1 OR b = 2)',
 				() => 1 - combineDisjunctive([1 / ndv.a, 1 / ndv.b])],
-			// An unestimable disjunct downgrades the OR to a floor; the readable branch
-			// here is the whole AND, so its own estimate is what the naive guess lifts to.
-			// (For this table the two happen to coincide at 0.1, so the composition is
-			// written out rather than the number.)
-			["SELECT * FROM m WHERE (a = 1 AND b = 2) OR lower(s) = 'x1'",
-				() => Math.max(0.1, combineConjunctive([1 / ndv.a, 1 / ndv.b]))],
 		];
 		for (const [sql, expected] of cases) {
 			expect(providerSelectivity(sql), sql).to.be.closeTo(expected(), 1e-12);
