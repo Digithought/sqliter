@@ -8,6 +8,7 @@ import {
   serializeChangeSet,
   serializeHLCForTransport,
   PROTOCOL_VERSION,
+  SNAPSHOT_WIRE_FORMAT_VERSION,
   type SyncManager,
   type HLC,
   type ChangeSet,
@@ -147,7 +148,14 @@ class MockSyncManager implements SyncManager {
   }
 
   async getSnapshot(): Promise<Snapshot> {
-    return { siteId: this.siteId, hlc: this.getCurrentHLC(), tables: [], schemaMigrations: [], tombstones: [] };
+    return {
+      siteId: this.siteId,
+      hlc: this.getCurrentHLC(),
+      snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
+      tables: [],
+      schemaMigrations: [],
+      tombstones: [],
+    };
   }
 
   async applySnapshot(_snapshot: Snapshot): Promise<void> {}

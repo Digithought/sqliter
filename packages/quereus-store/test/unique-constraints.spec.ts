@@ -392,7 +392,7 @@ describe('StoreTable UNIQUE constraints', () => {
 				nonDeterministicSources: [],
 				unboundParameters: [],
 			};
-			const sub = db.watch(scope, e => watchEvents.push(e));
+			const sub = db.watch(scope, e => { watchEvents.push(e); });
 
 			await db.exec(`INSERT OR REPLACE INTO pe VALUES (2, 'a@x')`);
 			sub.unsubscribe();

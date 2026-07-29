@@ -37,7 +37,7 @@
     "clean": "rimraf dist",
     "build": "tsc",
     "lint": "echo 'No lint configured'",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "cd ../.. && node --import ./packages/quereus-sync-client/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-sync-client/test/**/*.spec.ts\" --reporter min --colors",
     "test:single": "cd ../.. && node --import ./packages/quereus-sync-client/register.mjs node_modules/mocha/bin/mocha.js --bail"
   },

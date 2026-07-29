@@ -23,7 +23,7 @@
  * (flush + put counters) and an optional injected write failure on the Nth flush.
  */
 
-import { describe, it, beforeEach, afterEach } from 'mocha';
+import { describe, it, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, asyncIterableToArray, type SqlValue } from '@quereus/quereus';
 import {

@@ -1672,7 +1672,7 @@ describe('SyncManager', () => {
       const origWarn = console.warn;
       console.warn = (msg: string) => warnings.push(msg);
       try {
-        const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+        await SyncManagerImpl.create(kv, source, config, syncEvents);
 
         // Emit data change without key or pk
         source.commitData({
@@ -1704,7 +1704,7 @@ describe('SyncManager', () => {
         return batch;
       };
 
-      const manager = await SyncManagerImpl.create(failingKv, source, config, syncEvents);
+      await SyncManagerImpl.create(failingKv, source, config, syncEvents);
 
       source.commitData({
         type: 'insert',
@@ -1727,10 +1727,9 @@ describe('SyncManager', () => {
 
       // Create a manager with a KV store that will fail
       const failingKv = new InMemoryKVStore();
-      const manager = await SyncManagerImpl.create(failingKv, source, config, syncEvents);
+      await SyncManagerImpl.create(failingKv, source, config, syncEvents);
 
       // Sabotage the KV store after creation so schemaMigrations.getCurrentVersion fails
-      const origIterate = failingKv.iterate.bind(failingKv);
       failingKv.iterate = () => {
         throw new Error('iterate failed');
       };

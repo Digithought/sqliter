@@ -1633,6 +1633,9 @@ describe('Sync Protocol E2E', () => {
       // Snapshot state should be identical
       const snapshot2 = await guest.manager.getSnapshot();
       expect(snapshot2.tables.length).to.equal(snapshot1.tables.length);
+
+      // Re-applying already-applied changes must not grow the change log
+      expect(guest.dataStore.changeLog.length).to.equal(changeLogAfterFirst);
     });
 
     it('should produce identical state when applying the same deletion twice', async () => {
@@ -1876,7 +1879,7 @@ describe('Sync Protocol E2E', () => {
       const remoteHLC = new HLCManager(remoteSiteId);
 
       // Apply a delete first with a later HLC
-      const deleteHlc = remoteHLC.tick();
+      remoteHLC.tick();
       await new Promise(r => setTimeout(r, 5));
       const laterDeleteHlc = remoteHLC.tick();
 

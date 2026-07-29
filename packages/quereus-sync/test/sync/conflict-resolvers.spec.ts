@@ -11,8 +11,6 @@ import { SyncEventEmitterImpl, type ConflictEvent } from '../../src/sync/events.
 import {
 	DEFAULT_SYNC_CONFIG,
 	type SyncConfig,
-	type DataChangeToApply,
-	type SchemaChangeToApply,
 	type ApplyToStoreCallback,
 	type ConflictContext,
 	type ConflictResolver,
@@ -332,7 +330,7 @@ describe('Pluggable Conflict Resolution', () => {
 	describe('No local version (first write)', () => {
 		it('should apply remote change without calling resolver when no local version exists', async () => {
 			let resolverCalled = false;
-			const spy: ConflictResolver = (ctx) => {
+			const spy: ConflictResolver = (_ctx) => {
 				resolverCalled = true;
 				return 'local';
 			};
@@ -388,6 +386,7 @@ describe('Pluggable Conflict Resolution', () => {
 
 			// The write should be skipped due to tombstone, not applied
 			// (applied=0 for the column changes since they're blocked by tombstone)
+			expect(result.applied).to.equal(0);
 			const row = host.dataStore.getRow('main', 'users', [1]);
 			// Row should be deleted (no columns remaining after delete)
 			expect(row).to.be.undefined;

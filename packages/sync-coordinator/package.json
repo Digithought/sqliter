@@ -38,7 +38,7 @@
     "build": "tsc",
     "lint": "echo 'No lint configured'",
     "dev": "tsx watch --clear-screen=false src/bin/sync-coordinator.ts --port 8080",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "cd ../.. && node --import ./packages/sync-coordinator/register.mjs node_modules/mocha/bin/mocha.js \"packages/sync-coordinator/test/**/*.spec.ts\" --reporter min --colors",
     "test:single": "cd ../.. && node --import ./packages/sync-coordinator/register.mjs node_modules/mocha/bin/mocha.js --bail",
     "start": "npx sync-coordinator --port 8080 --debug 'sync-coordinator:*'"

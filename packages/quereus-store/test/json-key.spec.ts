@@ -106,20 +106,27 @@ describe('jsonStructuralKey', () => {
 		})();
 		const pick = <T>(items: readonly T[]): T => items[Math.floor(nextRandom() * items.length)];
 
-		const SCALARS: readonly SqlValue[] = [
+		// A JSON-shaped subset of SqlValue: excludes bigint/Uint8Array, which SqlValue
+		// permits at the top level but which are never valid nested JSON container
+		// elements. generate() needs this narrower type so Array.from()/object-literal
+		// results infer structurally assignable back to SqlValue.
+		type JsonScalar = string | number | boolean | null;
+		type JsonGenerated = JsonScalar | JsonGenerated[] | { [key: string]: JsonGenerated };
+
+		const SCALARS: readonly JsonScalar[] = [
 			null, false, true,
 			-1e308, -1, -0.5, 0, 1e-320, 0.5, 1, 2, 3, 10, 1e308, Infinity,
 			'', '1', '9', '10', 'a', 'ab', 'A', 'é', 'é', '￿', '\u{1F600}', '\u{10FFFF}',
 		];
 		const KEYS: readonly string[] = ['', 'a', 'ab', 'b', 'A', 'é', '￿', '\u{1F600}'];
 
-		const generate = (depth: number): SqlValue => {
+		const generate = (depth: number): JsonGenerated => {
 			if (depth <= 0 || nextRandom() < 0.5) return pick(SCALARS);
 			const length = Math.floor(nextRandom() * 4);
 			if (nextRandom() < 0.5) {
 				return Array.from({ length }, () => generate(depth - 1));
 			}
-			const object: Record<string, SqlValue> = {};
+			const object: Record<string, JsonGenerated> = {};
 			for (let i = 0; i < length; i++) object[pick(KEYS)] = generate(depth - 1);
 			return object;
 		};
