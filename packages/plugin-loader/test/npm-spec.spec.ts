@@ -136,6 +136,12 @@ describe('resolveEnvironment', () => {
 	it('auto-detects Node from the runtime, not from a DOM global', () => {
 		expect(resolveEnvironment('auto')).toBe('node');
 		expect(resolveEnvironment(undefined)).toBe('node');
+
+		// A DOM alongside a real Node process (jsdom, an Electron renderer with
+		// node integration) is still Node: `import('some-package')` resolves there,
+		// so it must not be routed down the CDN path.
+		vi.stubGlobal('document', {});
+		expect(resolveEnvironment('auto')).toBe('node');
 	});
 
 	it('auto-detects a browser when there is no Node process', () => {

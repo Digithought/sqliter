@@ -321,6 +321,13 @@ export async function loadPlugin(
 // ---------------------------------------------------------------------------
 
 /**
+ * NOTE: auto-detection is binary — anything that is not Node is treated as a
+ * browser, so React Native / NativeScript answer `'browser'` and an npm spec
+ * there fails asking for `allowCdn` rather than attempting a package import.
+ * Neither path actually works on those runtimes (they must register plugins
+ * statically — see the package README); if one ever gains a real dynamic
+ * loading story, this needs a third environment rather than a wider `if`.
+ *
  * @internal Exported for tests only — not re-exported from `index.js`, so it is
  * not part of the package's public API.
  */
