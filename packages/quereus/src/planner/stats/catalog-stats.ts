@@ -27,6 +27,28 @@ const log = createLogger('optimizer:stats:catalog');
  */
 const MAX_BOOLEAN_DEPTH = 16;
 
+// ── Boolean-walk result ─────────────────────────────────────────────────
+
+/**
+ * What a walk over a predicate's boolean structure managed to establish.
+ *
+ * - `complete` — the statistics answered for the predicate as a whole; `value` is
+ *   the estimate.
+ * - `lowerBound` — an `OR` had at least one branch out of reach of the statistics,
+ *   so `value` is a proven FLOOR rather than an estimate: `a or b` keeps at least
+ *   as many rows as `a` alone, so the most permissive branch that could be read
+ *   bounds the whole disjunction from below. The true selectivity lies somewhere
+ *   in `[value, 1]`.
+ *
+ * `undefined` in place of an `Estimate` means nothing could be established at all.
+ */
+type Estimate =
+	| { readonly kind: 'complete'; readonly value: number }
+	| { readonly kind: 'lowerBound'; readonly value: number };
+
+const complete = (value: number): Estimate => ({ kind: 'complete', value });
+const lowerBound = (value: number): Estimate => ({ kind: 'lowerBound', value });
+
 // ── Statistics data structures ──────────────────────────────────────────
 
 /**
@@ -102,12 +124,23 @@ export class CatalogStatsProvider implements StatsProvider {
 	}
 
 	selectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined {
-		const sel = this.statsOnlySelectivity(table, predicate);
-		if (sel !== undefined) {
-			log('Predicate selectivity for %s on %s: %f (catalog)', predicate.nodeType, table.name, sel);
-			return sel;
+		const estimate = this.estimate(table, predicate);
+		if (estimate?.kind === 'complete') {
+			log('Predicate selectivity for %s on %s: %f (catalog)', predicate.nodeType, table.name, estimate.value);
+			return estimate.value;
 		}
-		return this.fallback.selectivity(table, predicate);
+
+		const naive = this.fallback.selectivity(table, predicate);
+		if (estimate === undefined) return naive;
+
+		// A partly-known OR: keep the naive guess's caution, but never report below the
+		// floor the statistics already prove. Reporting the floor on its own would be
+		// wrong in the other direction — an unread branch may match far more rows than
+		// the branch that was read.
+		const lifted = naive === undefined ? estimate.value : Math.max(naive, estimate.value);
+		log('Predicate selectivity for %s on %s: %f (naive %o against catalog floor %f)',
+			predicate.nodeType, table.name, lifted, naive, estimate.value);
+		return lifted;
 	}
 
 	/**
@@ -115,11 +148,14 @@ export class CatalogStatsProvider implements StatsProvider {
 	 * when the table carries no statistics, or when the predicate's shape puts it out
 	 * of reach of the ones it has (`lower(cat) = 'x'` — {@link extractColumnFromPredicate}
 	 * reads the column off a direct child of the comparison and finds none).
+	 *
+	 * A partly-known OR reads as undefined here: this method means "real statistics
+	 * answered *the predicate*", and `rule-filter-selectivity` uses it as its
+	 * does-this-relation-have-usable-statistics gate. A floor is not an answer.
 	 */
 	statsOnlySelectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined {
-		const stats = table.statistics;
-		if (!stats) return undefined;
-		return this.estimatePredicateSelectivity(stats, predicate);
+		const estimate = this.estimate(table, predicate);
+		return estimate?.kind === 'complete' ? estimate.value : undefined;
 	}
 
 	joinSelectivity(leftTable: TableSchema, rightTable: TableSchema, joinCondition: ScalarPlanNode): number | undefined {
@@ -204,14 +240,13 @@ export class CatalogStatsProvider implements StatsProvider {
 	}
 
 	/**
-	 * Entry point for predicate selectivity: short-circuit the empty table, then
-	 * walk the predicate's boolean structure.
+	 * Entry point for predicate selectivity: no statistics at all, or the empty
+	 * table, short-circuit; otherwise walk the predicate's boolean structure.
 	 */
-	private estimatePredicateSelectivity(
-		stats: TableStatistics,
-		predicate: ScalarPlanNode
-	): number | undefined {
-		if (stats.rowCount === 0) return 0;
+	private estimate(table: TableSchema, predicate: ScalarPlanNode): Estimate | undefined {
+		const stats = table.statistics;
+		if (!stats) return undefined;
+		if (stats.rowCount === 0) return complete(0);
 		return this.estimateNode(stats, predicate, 0);
 	}
 
@@ -227,7 +262,7 @@ export class CatalogStatsProvider implements StatsProvider {
 		stats: TableStatistics,
 		node: ScalarPlanNode,
 		depth: number
-	): number | undefined {
+	): Estimate | undefined {
 		if (depth > MAX_BOOLEAN_DEPTH) return undefined;
 
 		if (node.nodeType === 'BinaryOp') {
@@ -246,19 +281,27 @@ export class CatalogStatsProvider implements StatsProvider {
 				const operand = node.getChildren()[0] as ScalarPlanNode | undefined;
 				if (!operand) return undefined;
 				const inner = this.estimateNode(stats, operand, depth + 1);
-				if (inner === undefined) return undefined;
+				// A lower bound negates into an UPPER bound, which nothing downstream
+				// models, so a partly-known operand makes the negation unknown.
+				if (inner?.kind !== 'complete') return undefined;
 				// NOTE: estimateConjunction's "unknown conjunct counts as 1.0" makes an AND
 				// estimate an UPPER bound, and negating flips that into a LOWER bound — so
 				// `not (a = 1 and lower(s) = 'x')` errs low where the AND path claims to err
 				// high. Bounded (the true value is between this and 1) and the direction only
 				// inverts under an explicit NOT, which the planner rarely leaves standing. If
-				// negated mixed-knowledge predicates ever drive a bad plan, track per-estimate
-				// bound direction instead of a bare number.
-				return 1 - inner;
+				// negated mixed-knowledge predicates ever drive a bad plan, widen `Estimate`
+				// to carry an upper-bound kind as well.
+				return complete(1 - inner.value);
 			}
 		}
 
-		return this.estimateLeaf(stats, node);
+		return this.leafEstimate(stats, node);
+	}
+
+	/** {@link estimateLeaf} lifted into the {@link Estimate} vocabulary. */
+	private leafEstimate(stats: TableStatistics, node: ScalarPlanNode): Estimate | undefined {
+		const sel = this.estimateLeaf(stats, node);
+		return sel === undefined ? undefined : complete(sel);
 	}
 
 	/**
@@ -273,21 +316,25 @@ export class CatalogStatsProvider implements StatsProvider {
 	 *
 	 * If *every* conjunct is unknown we return undefined so the whole-predicate
 	 * naive fallback in `selectivity()` still runs.
+	 *
+	 * A conjunct that only produced a lower bound (a partly-known OR) counts as
+	 * unknown here for the same reason: folding a floor into the product would drag
+	 * the result down, and AND deliberately errs high.
 	 */
 	private estimateConjunction(
 		stats: TableStatistics,
 		node: ScalarPlanNode,
 		depth: number
-	): number | undefined {
+	): Estimate | undefined {
 		const conjuncts = splitConjuncts(node);
 		// splitConjuncts only descends through real BinaryOpNode instances; if it
 		// handed back the node itself there is nothing to decompose.
-		if (conjuncts.length === 1 && conjuncts[0] === node) return this.estimateLeaf(stats, node);
+		if (conjuncts.length === 1 && conjuncts[0] === node) return this.leafEstimate(stats, node);
 
 		const known: number[] = [];
 		for (const conjunct of conjuncts) {
-			const sel = this.estimateNode(stats, conjunct, depth + 1);
-			if (sel !== undefined) known.push(sel);
+			const est = this.estimateNode(stats, conjunct, depth + 1);
+			if (est?.kind === 'complete') known.push(est.value);
 		}
 		if (known.length === 0) return undefined;
 
@@ -295,35 +342,52 @@ export class CatalogStatsProvider implements StatsProvider {
 		// anti-correlated and are not paired into a single range here. Exponential
 		// backoff damps the error (0.333 · √0.333 ≈ 0.19 instead of 0.11) but does
 		// not remove it; same-column range pairing would.
-		return this.floorCombined(stats, combineConjunctive(known), known.length);
+		return complete(this.floorCombined(stats, combineConjunctive(known), known.length));
 	}
 
 	/**
-	 * OR: estimate every disjunct, or give up.
+	 * OR: estimate every disjunct; combine them when all were readable, otherwise
+	 * report what was proved as a lower bound.
 	 *
 	 * Unlike AND there is no safe default for an unknown disjunct — assuming 1.0
-	 * would make the whole disjunction 1.0 (safe but useless), and assuming 0
-	 * would silently drop a branch that may match everything. So a single unknown
-	 * disjunct makes the whole OR unknown.
+	 * would make the whole disjunction 1.0 (safe but useless), and assuming 0 would
+	 * silently drop a branch that may match everything. But giving up outright
+	 * discards a bound already in hand: `a or b` keeps at least as many rows as `a`,
+	 * so the most permissive branch that COULD be read floors the whole disjunction.
+	 * That floor travels out as a `lowerBound`, which `selectivity` uses to lift the
+	 * naive guess (see there) and `statsOnlySelectivity` still reports as unknown.
+	 *
+	 * The floor is the max of the readable branches, NOT their disjunctive
+	 * combination: `1 - Π(1 - sᵢ)` assumes the branches are independent, which is an
+	 * estimate rather than a proof — if one readable branch subsumes another the true
+	 * value is only the max.
 	 */
 	private estimateDisjunction(
 		stats: TableStatistics,
 		node: ScalarPlanNode,
 		depth: number
-	): number | undefined {
+	): Estimate | undefined {
 		const disjuncts = splitDisjuncts(node);
 		// See estimateConjunction: nothing to decompose when the walk is a no-op.
-		if (disjuncts.length === 1 && disjuncts[0] === node) return this.estimateLeaf(stats, node);
+		if (disjuncts.length === 1 && disjuncts[0] === node) return this.leafEstimate(stats, node);
 
 		const sels: number[] = [];
+		let anyUnreadable = false;
 		for (const disjunct of disjuncts) {
-			const sel = this.estimateNode(stats, disjunct, depth + 1);
-			if (sel === undefined) return undefined;
-			sels.push(sel);
+			const est = this.estimateNode(stats, disjunct, depth + 1);
+			if (est === undefined) {
+				anyUnreadable = true;
+				continue;
+			}
+			// A branch's own lower bound is still a lower bound on the disjunction.
+			if (est.kind === 'lowerBound') anyUnreadable = true;
+			sels.push(est.value);
 		}
 		if (sels.length === 0) return undefined;
 
-		return this.floorCombined(stats, combineDisjunctive(sels), sels.length);
+		if (anyUnreadable) return lowerBound(Math.max(...sels));
+
+		return complete(this.floorCombined(stats, combineDisjunctive(sels), sels.length));
 	}
 
 	/**

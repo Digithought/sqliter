@@ -422,15 +422,69 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 			.to.be.closeTo(0.1, 1e-12);
 	});
 
-	it('falls back to the naive estimate when any OR disjunct is unestimable', () => {
+	it('lifts the naive estimate to the provable floor when an OR disjunct is unestimable', () => {
+		// `a = 1` alone proves the disjunction keeps at least 1/ndv(a) of the rows, so
+		// NaiveStatsProvider's flat 0.1 for a BinaryOp would contradict statistics
+		// already in hand. The floor wins.
+		expect(1 / ndv.a, 'the floor must actually bind for this case to mean anything')
+			.to.be.greaterThan(0.1);
+
 		const f = optimizedFilter(db, "SELECT * FROM m WHERE a = 1 OR lower(s) = 'x1'");
 		expect(f, 'expected a residual Filter').to.not.be.undefined;
-		// NaiveStatsProvider's flat BinaryOp heuristic — NOT a combined value.
-		expect(f!.selectivity).to.be.closeTo(0.1, 1e-12);
-		// Giving up costs real information: `a = 1` alone already proves the
-		// disjunction cannot be more selective than 1/ndv(a), and the naive answer
-		// sits below that bound. Tracked in backlog feat-or-selectivity-lower-bound.
-		expect(f!.selectivity).to.be.lessThan(1 / ndv.a);
+		expect(f!.selectivity).to.be.closeTo(1 / ndv.a, 1e-12);
+	});
+
+	it('keeps the naive guess when it already exceeds the floor', () => {
+		// The other half of the bound: a partly-known OR must not report the readable
+		// branch's estimate as if it were the whole answer. `id` is the PK — 100
+		// distinct values over 100 rows — so `id = 5` proves only 1/100, well under the
+		// naive 0.1, and the naive caution stands.
+		//
+		// Provider-level, because the optimizer would otherwise absorb `id = 5` into a
+		// key seek and there would be no OR left in the residual Filter.
+		const idNdv = table.statistics!.columnStats.get('id')?.distinctCount;
+		expect(idNdv, 'ANALYZE should record a distinct count for id').to.equal(100);
+		expect(providerSelectivity("SELECT * FROM m WHERE id = 5 OR lower(s) = 'x1'"))
+			.to.be.closeTo(0.1, 1e-12);
+	});
+
+	it('floors a partly-known OR at the most permissive readable branch', () => {
+		// Two readable branches and one unreadable. The floor is max(…), NOT
+		// combineDisjunctive(…): independence-combining assumes the readable branches
+		// do not overlap, which is an estimate, not a proof — if `b = 2` were a subset
+		// of `a = 1` the true value would be exactly the max.
+		const floor = Math.max(1 / ndv.a, 1 / ndv.b);
+		expect(floor, 'the floor must bind over the naive 0.1').to.be.greaterThan(0.1);
+		expect(providerSelectivity("SELECT * FROM m WHERE a = 1 OR b = 2 OR lower(s) = 'x1'"))
+			.to.be.closeTo(floor, 1e-12);
+		// Distinct from what a fully-readable OR of the same two branches would give.
+		expect(floor).to.be.lessThan(combineDisjunctive([1 / ndv.a, 1 / ndv.b]));
+	});
+
+	it('treats a partly-known OR conjunct as unknown inside an AND', () => {
+		// A floor folded into a conjunctive product would drag the whole estimate down;
+		// AND deliberately errs high, so the partial OR counts as 1.0 like any other
+		// unknown conjunct and only `a = 1` contributes.
+		expect(providerSelectivity("SELECT * FROM m WHERE a = 1 AND (b = 2 OR lower(s) = 'x1')"))
+			.to.be.closeTo(1 / ndv.a, 1e-12);
+	});
+
+	it('declines to negate a partly-known OR', () => {
+		// Negating a lower bound yields an UPPER bound, which nothing downstream models,
+		// so the whole predicate falls back to the naive guess (0.3 — the naive switch
+		// has no UnaryOp case).
+		expect(providerSelectivity("SELECT * FROM m WHERE NOT (a = 1 OR lower(s) = 'x1')"))
+			.to.be.closeTo(0.3, 1e-12);
+	});
+
+	it('reports a partly-known OR as unknown to statsOnlySelectivity', () => {
+		// The gate `rule-filter-selectivity` uses for filters over joins means "real
+		// statistics answered the predicate". A floor is not an answer, so it must keep
+		// reading as undefined there even though `selectivity` now returns a number.
+		const predicate = rawFilter(db, "SELECT * FROM m WHERE a = 1 OR lower(s) = 'x1'").predicate;
+		const provider = new CatalogStatsProvider();
+		expect(provider.statsOnlySelectivity(table, predicate)).to.be.undefined;
+		expect(provider.selectivity(table, predicate)).to.be.closeTo(1 / ndv.a, 1e-12);
 	});
 
 	it('estimates a mixed known/unknown AND nested under an OR', () => {
@@ -486,9 +540,12 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 			// NOT over an OR.
 			['SELECT * FROM m WHERE NOT (a = 1 OR b = 2)',
 				() => 1 - combineDisjunctive([1 / ndv.a, 1 / ndv.b])],
-			// An unestimable disjunct sinks the whole OR, naive fallback regardless of
-			// the estimable AND on the other side.
-			["SELECT * FROM m WHERE (a = 1 AND b = 2) OR lower(s) = 'x1'", () => 0.1],
+			// An unestimable disjunct downgrades the OR to a floor; the readable branch
+			// here is the whole AND, so its own estimate is what the naive guess lifts to.
+			// (For this table the two happen to coincide at 0.1, so the composition is
+			// written out rather than the number.)
+			["SELECT * FROM m WHERE (a = 1 AND b = 2) OR lower(s) = 'x1'",
+				() => Math.max(0.1, combineConjunctive([1 / ndv.a, 1 / ndv.b]))],
 		];
 		for (const [sql, expected] of cases) {
 			expect(providerSelectivity(sql), sql).to.be.closeTo(expected(), 1e-12);
