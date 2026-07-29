@@ -253,8 +253,9 @@ function probeOverlaySchema(toMigrate: readonly [string, ConnectionOverlayState]
 
 /**
  * Precomputes the per-ALTER constants an `addColumn` overlay backfill needs:
- * the folded literal DEFAULT (the `tryFoldLiteral` of the DEFAULT expr, or `null`
- * when there is no DEFAULT or it folds to NULL), the engine-supplied per-row
+ * the folded literal DEFAULT (the `foldDefaultToType` of the DEFAULT expr — folded and
+ * converted to the new column's declared type — or `null` when there is no DEFAULT or it
+ * folds to NULL), the engine-supplied per-row
  * evaluator (present only for a non-foldable `new.<col>` default), and whether
  * the new column is NOT NULL. Returns undefined for every non-`addColumn` change
  * so the row loop appends nothing.

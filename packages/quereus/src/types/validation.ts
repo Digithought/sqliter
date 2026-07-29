@@ -173,6 +173,11 @@ export function buildRowCoercion(
  * JSON value), so unlike {@link buildRowCoercion} this needs no identity guard — the
  * conversion is always the first one applied to the value.
  *
+ * NOTE: that "raw source form" invariant holds because every DEFAULT expression here comes
+ * from the parser (schema round-trips re-stringify and re-parse it). If a path ever
+ * synthesizes a DEFAULT AST node from an already-stored value, this becomes a second
+ * conversion and needs the same identity guard `buildRowCoercion` carries.
+ *
  * @throws QuereusError (MISMATCH) when the literal cannot be converted, carrying the
  *   same message text the INSERT path produces.
  */

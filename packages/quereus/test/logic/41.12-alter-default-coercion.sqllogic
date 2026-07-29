@@ -72,6 +72,33 @@ drop table t_json;
 -- run
 
 -- ============================================================
+-- 2b. ADD COLUMN, literal default on temporal columns
+--
+-- A temporal type's parse CANONICALIZES, so the backfilled cell must hold the
+-- canonical spelling (the one `set data type` rewrites to and an INSERT stores),
+-- not the DEFAULT's raw source text.
+-- ============================================================
+
+create table t_temporal (a integer primary key, b integer);
+insert into t_temporal values (1, 10);
+-- run
+
+alter table t_temporal add column d date default '2024-06-05T00:00:00Z';
+-- run
+
+alter table t_temporal add column sp timespan default '1 hour';
+-- run
+
+insert into t_temporal (a, b) values (2, 20);
+-- run
+
+select a, d, sp from t_temporal order by a;
+→ [{"a":1,"d":"2024-06-05","sp":"PT1H"},{"a":2,"d":"2024-06-05","sp":"PT1H"}]
+
+drop table t_temporal;
+-- run
+
+-- ============================================================
 -- 3. ADD COLUMN, per-row `new.<col>` evaluator default across types
 -- ============================================================
 

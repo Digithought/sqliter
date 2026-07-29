@@ -82,6 +82,31 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.deepEqual(events[0].newRow, [1, 'a', 'z']);
 		});
 
+		it('ADD COLUMN fills earlier inserts with the default CONVERTED to the new column type', async () => {
+			// The batched-event backfill value comes from the same fold+convert the module
+			// applies to its rows, so a listener never sees the raw literal ('7') where the
+			// table holds the converted one (7).
+			await db.exec('create table t (id integer primary key, v text)');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 'a')");
+			await db.exec("alter table t add column w integer default '7'");
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].newRow, [1, 'a', 7]);
+		});
+
+		it('ADD COLUMN with a per-row expression default converts each event image too', async () => {
+			await db.exec('create table t (id integer primary key, v text)');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, '7')");
+			await db.exec('alter table t add column w integer default (new.v)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].newRow, [1, '7', 7]);
+		});
+
 		it('ADD COLUMN without a default fills earlier inserts with NULL', async () => {
 			// `null` declared explicitly: under the default `default_column_nullability`
 			// a bare ADD COLUMN is NOT NULL and is (correctly) rejected over pending rows.
@@ -268,6 +293,17 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 
 			assert.equal(events.length, 1);
 			assert.deepEqual(events[0].newRow, [1, 'd']);
+		});
+
+		it('SET NOT NULL backfill maps recorded NULLs to the CONVERTED folded default', async () => {
+			await db.exec("create table t (id integer primary key, v integer null default '5')");
+			await db.exec('begin');
+			await db.exec('insert into t values (1, null)');
+			await db.exec('alter table t alter column v set not null');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].newRow, [1, 5]);
 		});
 
 		it('events recorded inside a savepoint layer are reshaped too', async () => {
@@ -562,6 +598,18 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			const dml = events.filter(e => e.tableName === 't');
 			assert.equal(dml.length, 1);
 			assert.deepEqual(dml[0].newRow, [1, 'a', 'z']);
+		});
+
+		it('ADD COLUMN reshapes the pending-change log with the CONVERTED default', async () => {
+			await db.exec('create table t (id integer primary key, v text)');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 'a')");
+			await db.exec("alter table t add column w integer default '7'");
+			await db.exec('commit');
+
+			const dml = events.filter(e => e.tableName === 't');
+			assert.equal(dml.length, 1);
+			assert.deepEqual(dml[0].newRow, [1, 'a', 7]);
 		});
 
 		it('SET DATA TYPE converts recorded values in the pending-change log', async () => {
