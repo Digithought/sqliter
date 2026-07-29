@@ -6,6 +6,27 @@ import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
 import { makeFullScanFilterInfo } from '../src/filter-info.js';
 
+/**
+ * A memory table's LIVE schema, read through its canonical `getSchema()` — the schema the
+ * table's manager mutates in place — NOT the per-instance `tableSchema` field, which is a
+ * connect-time snapshot the module-level `alterTable` this layer drives never refreshes.
+ * Reading that stale field makes an atomicity assertion vacuous: it reports the pre-ALTER
+ * shape even when the underlying HAS been mutated, so it would pass against the pre-fix
+ * mutate-then-validate ordering too.
+ *
+ * `getSchema()` is MemoryTable-specific (not on the base `VirtualTable`), so we narrow
+ * structurally — sound because every suite using this pins its tables to the memory module,
+ * as the isolation layer's underlying or as an overlay staging table.
+ */
+function liveSchema(table: VirtualTable): TableSchema {
+	return (table as unknown as { getSchema(): TableSchema }).getSchema();
+}
+
+/** Live collation of `column` on a memory table — see {@link liveSchema}. */
+function liveCollation(table: VirtualTable, column: string): string {
+	return liveSchema(table).columns.find(c => c.name === column)?.collation ?? 'BINARY';
+}
+
 describe('IsolationModule', () => {
 	let db: Database;
 
@@ -2445,16 +2466,9 @@ describe('IsolationModule', () => {
 			db.registerModule('isolated', iso);
 		});
 
-		/**
-		 * Live collation of `main.<table>`'s column, read via the underlying MemoryTable's
-		 * canonical `getSchema()` — NOT the `tableSchema` field, a connect-time snapshot the
-		 * module-level ALTER never refreshes (see the ADD COLUMN atomicity suite's helper).
-		 */
+		/** Live collation of `main.<table>`'s column on the shared underlying. */
 		function underlyingCollation(table: string, column: string): string {
-			const underlying = iso.getUnderlyingState('main', table)!.underlyingTable as unknown as {
-				getSchema(): { columns: readonly { name: string; collation?: string }[] } | undefined;
-			};
-			return underlying.getSchema()!.columns.find(c => c.name === column)?.collation ?? 'BINARY';
+			return liveCollation(iso.getUnderlyingState('main', table)!.underlyingTable, column);
 		}
 
 		async function expectAlterError(sql: string): Promise<QuereusError> {
@@ -2556,12 +2570,9 @@ describe('IsolationModule', () => {
 			return asyncIterableToArray(state.overlayTable.query!(makeFullScanFilterInfo()));
 		}
 
-		/** Live collation via the underlying's canonical getSchema() — see the previous suite's helper. */
+		/** Live collation of `main.<table>`'s column on the shared underlying. */
 		function underlyingCollation(table: string, column: string): string {
-			const underlying = iso.getUnderlyingState('main', table)!.underlyingTable as unknown as {
-				getSchema(): { columns: readonly { name: string; collation?: string }[] } | undefined;
-			};
-			return underlying.getSchema()!.columns.find(c => c.name === column)?.collation ?? 'BINARY';
+			return liveCollation(iso.getUnderlyingState('main', table)!.underlyingTable, column);
 		}
 
 		it('delete then re-insert at a case-colliding key survives the ALTER and the COMMIT', async () => {
@@ -2736,20 +2747,6 @@ describe('IsolationModule', () => {
 				isoShared.setConnectionOverlay(forDb, 'main', 'ct', { overlayTable: overlay, hasChanges: true, db: forDb });
 			}
 
-			/**
-			 * Live collation of `column` on a memory table, read through its canonical
-			 * `getSchema()` rather than the per-instance `tableSchema` snapshot (which the
-			 * module-level alterTable never refreshes — see the ADD COLUMN suite's note).
-			 * `getSchema()` is MemoryTable-specific, so we narrow structurally; sound because
-			 * this suite pins both the underlying and the overlay to the memory module.
-			 */
-			function liveCollation(table: VirtualTable, column: string): string {
-				const memory = table as unknown as {
-					getSchema(): { columns: readonly { name: string; collation?: string }[] } | undefined;
-				};
-				return memory.getSchema()!.columns.find(c => c.name === column)?.collation ?? 'BINARY';
-			}
-
 			it('poisons a foreign overlay whose two staged live rows collide under the new collation', async () => {
 				await injectOverlayRows(dbB, [['b', 'y', 0], ['B', 'z', 0]]);
 
@@ -2825,6 +2822,16 @@ describe('IsolationModule', () => {
 				expect(bState.poison!.message).to.match(/alter table \(alterColumn\)/i);
 				expect(bState.poison!.message).to.match(/commit\/rollback and retry/i);
 				expect(bState.poison!.message).to.match(/roll back this transaction/i);
+
+				// Pinning what the poisoned overlay is LEFT holding: the collapsed 'A' marker was
+				// dropped in preparation for the re-key and is NOT restored on this path (the
+				// issuer's is, via reinsertPkRekeyMarkers). Harmless only because poison is
+				// terminal — see the NOTE on the poison branch in IsolationModule
+				// .applyInPlaceOverlayChange. If this assertion ever has to change, that NOTE is
+				// the thing to re-read.
+				const bRows = await asyncIterableToArray(bState.overlayTable.query!(makeFullScanFilterInfo()));
+				expect(bRows.map(r => [r[0], r[2]]), 'the dropped marker is not restored under poison')
+					.to.deep.equal([['a', 0]]);
 
 				// And B is told at its commit, exactly as the duplicate case is.
 				let commitErr: unknown;
@@ -2925,21 +2932,12 @@ describe('IsolationModule', () => {
 		});
 
 		/**
-		 * Live underlying column count for `main.<table>`. Read via the MemoryTable's
-		 * `getSchema()` — the canonical schema the underlying manager mutates in place —
-		 * NOT the `underlyingTable.tableSchema` field, which is a per-instance snapshot
-		 * taken at connect time and is never refreshed by the module-level `alterTable`
-		 * this layer drives. Reading the stale field would report the pre-ALTER count
-		 * even when the underlying HAS been mutated, making the atomicity assertion
-		 * vacuous (it would pass against the pre-fix mutate-then-validate ordering too).
-		 * `getSchema()` is MemoryTable-specific (not on the base `VirtualTable`), so we
-		 * narrow structurally — sound because this suite pins the underlying to memory.
+		 * Live underlying column count for `main.<table>` — the white-box check that the
+		 * irreversible `underlying.alterTable` never ran (see {@link liveSchema} for why the
+		 * instance `tableSchema` field would make it vacuous).
 		 */
 		function underlyingColumnCount(table: string): number {
-			const underlying = isolatedModule.getUnderlyingState('main', table)!.underlyingTable as unknown as {
-				getSchema(): { columns: readonly unknown[] } | undefined;
-			};
-			return underlying.getSchema()!.columns.length;
+			return liveSchema(isolatedModule.getUnderlyingState('main', table)!.underlyingTable).columns.length;
 		}
 
 		it('rejects atomically when a per-row NOT NULL backfill yields NULL for a staged row', async () => {
@@ -3155,17 +3153,9 @@ describe('IsolationModule', () => {
 			return iso.getConnectionOverlay(forDb, 'main', 't');
 		}
 
-		/**
-		 * Live underlying column count via the MemoryTable's getSchema() — the canonical
-		 * schema the manager mutates in place. The per-instance `.tableSchema` field is a
-		 * connect-time snapshot the module-level alterTable never refreshes, so reading it
-		 * would make the atomicity assertion vacuous (companion ticket's note).
-		 */
+		/** Live underlying column count — see {@link liveSchema}. */
 		function underlyingColumnCount(): number {
-			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable as unknown as {
-				getSchema(): TableSchema | undefined;
-			};
-			return underlying.getSchema()!.columns.length;
+			return liveSchema(iso.getUnderlyingState('main', 't')!.underlyingTable).columns.length;
 		}
 
 		async function reader(forDb: Database, readCommitted = false): Promise<IsolatedTable> {
@@ -3445,12 +3435,9 @@ describe('IsolationModule', () => {
 			return { type: 'alterColumn', columnName: 'x', setNotNull: true };
 		}
 
-		/** notNull flag of `x` on the live underlying manager schema (not the stale instance field). */
+		/** notNull flag of `x` on the live underlying manager schema — see {@link liveSchema}. */
 		function underlyingXNotNull(): boolean {
-			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable as unknown as {
-				getSchema(): TableSchema | undefined;
-			};
-			return underlying.getSchema()!.columns.find(c => c.name === 'x')?.notNull ?? false;
+			return liveSchema(iso.getUnderlyingState('main', 't')!.underlyingTable).columns.find(c => c.name === 'x')?.notNull ?? false;
 		}
 
 		it('SET NOT NULL applies and poisons a foreign overlay whose staged NULL cannot backfill', async () => {

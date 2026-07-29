@@ -721,10 +721,11 @@ describe("Memory VTable Module", () => {
 		// under the OLD comparator, that the row it found is the row this layer removed.
 		//
 		// `MemoryTableManager.validateRekeyedPrimaryKey` refuses every chain that could reach
-		// that arrangement before `rekeyPrimaryKey` ever runs, so the guard is pure insurance
-		// in the live engine and no end-to-end test can exercise it. These build the layer
-		// chain directly, bypassing the manager (and hence that validation pass), which is the
-		// only way to reach the check — see `rekeyPrimaryKey`'s doc comment.
+		// that arrangement before `rekeyPrimaryKey` ever runs — a layer holding the colliding
+		// pair fails its representability walk — so the guard is pure insurance in the live
+		// engine and no end-to-end test can exercise it. These build the layer chain directly,
+		// bypassing the manager (and hence that validation pass), which is the only way to
+		// reach the check — see `rekeyPrimaryKey`'s doc comment.
 
 		const rekeyColumns: ColumnSchema[] = [
 			{ name: 'k', logicalType: TEXT_TYPE, notNull: true, primaryKey: true, pkOrder: 0, defaultValue: null, collation: 'BINARY', generated: false },
@@ -755,17 +756,41 @@ describe("Memory VTable Module", () => {
 			return [...iteratePrimaryRows(layer.getModificationTree('primary')!)];
 		}
 
+		interface ChainSpec {
+			/** Keys the base layer already holds as committed rows. */
+			committed: string[];
+			/** Key the parent layer stages a live row at, if any. */
+			parentUpsert?: string;
+			/** Key the child layer deletes; must resolve to a row the chain holds. */
+			childDelete?: string;
+			/** Key the child layer stages a live row at, recorded AFTER its deletion. */
+			childUpsert?: string;
+		}
+
 		/**
-		 * A two-layer chain over an EMPTY base: the parent stages a row at `parentKey`, the
-		 * child deletes `childDeleteKey`. Returns both layers already re-keyed NOCASE,
+		 * A base + two transaction layers built to `spec`, all three already re-keyed NOCASE,
 		 * oldest-first as every whole-chain rebuild requires.
+		 *
+		 * `childDelete` must name a key the chain holds: every `recordDelete` call site in
+		 * `MemoryTableManager` resolves an effective row first and skips the call when there is
+		 * none, so a deletion of a key no layer holds is not an arrangement the engine can
+		 * produce — building one here would test the replay against a shape it never sees.
 		 */
-		function rekeyedChain(parentKey: string, childDeleteKey: string): { parent: TransactionLayer; child: TransactionLayer } {
+		function rekeyedChain(spec: ChainSpec): { parent: TransactionLayer; child: TransactionLayer } {
 			const base = new BaseLayer(binaryKeySchema(), db.getCollationResolver());
+			for (const key of spec.committed) base.primaryTree.insert([key, 'committed']);
 			const parent = new TransactionLayer(base);
-			parent.recordUpsert(parentKey, [parentKey, 'parent-write'], null);
+			if (spec.parentUpsert) parent.recordUpsert(spec.parentUpsert, [spec.parentUpsert, 'parent-write'], null);
+
 			const child = new TransactionLayer(parent);
-			child.recordDelete(childDeleteKey, [childDeleteKey, 'child-delete']);
+			if (spec.childDelete) {
+				// Resolve the row being deleted the way MemoryTableManager does, so the recorded
+				// old row is the real one and the precondition above is structurally enforced.
+				const deleted = parent.getModificationTree('primary')!.get(spec.childDelete);
+				expect(deleted, `the chain must hold a row at '${spec.childDelete}' to delete`).to.not.be.undefined;
+				child.recordDelete(spec.childDelete, deleted!);
+			}
+			if (spec.childUpsert) child.recordUpsert(spec.childUpsert, [spec.childUpsert, 'child-write'], null);
 
 			const nocase = nocaseKeySchema();
 			base.updateSchema(nocase);
@@ -776,28 +801,44 @@ describe("Memory VTable Module", () => {
 		}
 
 		it("leaves an unrelated row alone when a replayed deletion's key collapses onto it", () => {
-			// The parent staged 'a'; the child deleted 'A', which under BINARY matched nothing.
+			// The exact shape `rekeyPrimaryKey`'s doc describes: 'A' is committed, the parent
+			// stages a distinct (under BINARY) 'a', and the child deletes the committed 'A'.
 			// After the re-key the child's replayed deletion finds the parent's 'a' — a row the
-			// child never removed. Deleting it would silently discard a row the transaction just
-			// wrote.
-			const { child } = rekeyedChain('a', 'A');
+			// child never removed, and the only row the pair's net effect leaves standing.
+			// Deleting it would silently discard a row the transaction just wrote.
+			const { child } = rekeyedChain({ committed: ['A'], parentUpsert: 'a', childDelete: 'A' });
 
 			expect(rowsOf(child), "the parent's row must survive the child's replayed deletion")
 				.to.deep.equal([['a', 'parent-write']]);
 			// The deletion is also dropped from the replay log, so a later rebase / index rebuild
 			// cannot re-apply it against the same row.
-			expect(child.getOwnWrites(), 'a deletion that matched nothing leaves no own write').to.deep.equal([]);
+			expect(child.getOwnWrites(), 'a deletion the guard refused leaves no own write').to.deep.equal([]);
 		});
 
 		it("still applies a replayed deletion that targets its own row", () => {
 			// The mirror case, pinning that the guard is an identity check and not a blanket
 			// "skip every deletion whose key was re-sorted": here the child deleted the very row
-			// the parent staged, so the replay must remove it.
-			const { child } = rekeyedChain('a', 'a');
+			// the parent staged, so the replay must remove it — including the committed 'A' it
+			// now shadows.
+			const { child } = rekeyedChain({ committed: ['A'], parentUpsert: 'a', childDelete: 'a' });
 
 			expect(rowsOf(child), "the child's own deletion must still take effect").to.deep.equal([]);
 			expect(child.getOwnWrites(), 'the surviving deletion is kept in the replay log')
 				.to.deep.equal([{ type: 'delete', primaryKey: 'a' }]);
+		});
+
+		it("drops a replayed deletion whose key an upsert in the same layer now occupies", () => {
+			// The companion filter in `installNetOwnWrites`: one layer deletes 'A' and stages
+			// 'a' (a single `update t set k = 'a' where k = 'A'`), two distinct keys that the
+			// re-key collapses into one. The deletion is applied — its target IS the row it
+			// removed — but the upsert then re-occupies that key, so keeping the deletion in
+			// the replay log would make the log claim both a delete and an upsert of one key,
+			// and a later rebase or index rebuild could replay the delete over the upsert.
+			const { child } = rekeyedChain({ committed: ['A'], childDelete: 'A', childUpsert: 'a' });
+
+			expect(rowsOf(child), 'the staged replacement is the net effect').to.deep.equal([['a', 'child-write']]);
+			expect(child.getOwnWrites(), 'the re-occupied deletion is dropped from the replay log')
+				.to.deep.equal([{ type: 'upsert', primaryKey: 'a', newRow: ['a', 'child-write'] }]);
 		});
 	});
 });
