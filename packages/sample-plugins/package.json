@@ -8,6 +8,7 @@
     "clean": "rimraf dist",
     "build": "tsc",
     "lint": "echo 'No lint configured'",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "dev": "tsc --watch",
     "serve": "npx http-server -p 8080 --cors",
     "test": "cd ../.. && node --import ./packages/sample-plugins/register.mjs node_modules/mocha/bin/mocha.js \"packages/sample-plugins/test/**/*.spec.ts\" --reporter min --colors"

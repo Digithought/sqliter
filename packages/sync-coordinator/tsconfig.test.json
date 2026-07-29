@@ -1,9 +1,7 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "rootDir": ".",
-    "noUnusedLocals": false,
-    "noUnusedParameters": false
+    "rootDir": "."
   },
   "include": ["src/**/*", "test/**/*"],
   "exclude": ["node_modules", "dist"]
