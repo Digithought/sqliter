@@ -1,7 +1,8 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
 import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, serializeKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
-import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
+import type { IsolationModule } from './isolation-module.js';
+import type { ConnectionOverlayState } from './isolation-types.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
 import type { MergeEntry, MergeConfig } from './merge-types.js';

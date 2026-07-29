@@ -846,6 +846,8 @@ An adoption that a staged row rejects never leaves a half-changed overlay: the o
 
 `alterTable` is the one DDL that can change row shape (ADD/DROP COLUMN) *and* rewrite row values (`alter column … set not null` filling staged NULLs from the column's DEFAULT, `alter column … set data type` converting every staged value), so its overlay handling is the most involved. The underlying converts only its own committed rows, so each of those value rewrites has an overlay-side half here — without it an accepted retype would commit staged rows still holding the OLD physical type. Because the underlying base auto-commits irreversibly, the blast radius is made **isolation-faithful**: an ALTER never depends on another connection's uncommitted data.
 
+The machinery that does the carrying — deriving the per-change-type constants, dry-running one overlay against them, reshaping it forward, and building the poison message — lives in `alter-migration.ts` as free functions over one overlay. `IsolationModule.alterTable` in `isolation-module.ts` owns the surrounding lifecycle: which overlays are in scope, the issuer/foreign tiering below, error routing, and the `alter primary key` overlay swap.
+
 The affected overlays are partitioned into the **issuer's own** (the connection that ran the ALTER) and **foreign** ones, handled in three tiers:
 
 1. **Partition.** Compare each affected overlay's key against the issuer's `makeConnectionOverlayKey(db, …)`. Foreign overlays already marked poisoned (from an earlier ALTER) are skipped entirely — they hold pre-alter rows and must not be re-read or re-migrated.
