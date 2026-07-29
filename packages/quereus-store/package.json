@@ -32,14 +32,14 @@
       "import": "./dist/src/index.js"
     },
     "./testing": {
-      "types": "./dist/src/testing/kv-conformance.d.ts",
-      "import": "./dist/src/testing/kv-conformance.js"
+      "types": "./dist/src/testing/index.d.ts",
+      "import": "./dist/src/testing/index.js"
     }
   },
   "typesVersions": {
     "*": {
       "testing": [
-        "./dist/src/testing/kv-conformance.d.ts"
+        "./dist/src/testing/index.d.ts"
       ]
     }
   },

@@ -205,6 +205,29 @@ runKVStoreConformance('MyCustomStore', () => ({
 See `test/kv-conformance.spec.ts` (in-memory), and the LevelDB / IndexedDB plugins'
 `test/conformance.spec.ts` for worked adapters.
 
+**If your provider implements `beginAtomicBatch`, also run the provider suite.** The same
+entry point exports `runKVProviderConformance(name, makeProviderBackend)` — the battery for
+the provider-level contract that ops queued across SEVERAL of the provider's stores commit
+in one durable, all-or-nothing physical write (multi-store commit landing only in each op's
+own store, mixed put + delete, same-key last-op-wins, `clear()` discarding, the empty
+`write()` no-op, and `MISUSE` on a store handle from a different provider):
+
+```typescript
+import { runKVProviderConformance } from '@quereus/store/testing';
+
+runKVProviderConformance('MyCustomProvider atomic batch', () => ({
+  open: async () => new MyCustomProvider(/* fresh, empty keyspace */),
+  // A SECOND provider over a DIFFERENT keyspace — source of the foreign handle that
+  // must be rejected with MISUSE.
+  openForeign: async () => new MyCustomProvider(/* another keyspace */),
+  teardown: async () => { /* close both, remove backing storage */ },
+}));
+```
+
+The LevelDB / IndexedDB plugins' `test/atomic-batch.spec.ts` run it, keeping only their
+backend-specific cases (LevelDB's "no batch before the shared root is open", IndexedDB's
+post-write read-cache invalidation) alongside.
+
 ## KVStore Interface
 
 The `KVStore` interface is the foundation for all storage backends:

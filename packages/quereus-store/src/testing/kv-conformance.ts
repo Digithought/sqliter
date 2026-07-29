@@ -27,6 +27,7 @@ import type { SqlValue } from '@quereus/quereus';
 import type { KVStore, IterateOptions } from '../common/kv-store.js';
 import { compareBytes } from '../common/bytes.js';
 import { encodeCompositeKey } from '../common/encoding.js';
+import { assertBytes, b, u8 } from './kv-assert.js';
 
 // Module-local Mocha globals. Scoped to this module (the file is an ES module), so
 // they shadow — never redeclare — any ambient `@types/mocha` globals present at
@@ -57,22 +58,6 @@ export interface KVBackend {
 // Assertion + iteration helpers
 // ============================================================================
 
-/**
- * Normalize a backend-returned buffer to a plain `Uint8Array`. LevelDB may hand back
- * a `Buffer` (a `Uint8Array` subclass), which `assert.deepStrictEqual` treats as a
- * DIFFERENT type from a plain `Uint8Array` of identical bytes — copying through
- * `new Uint8Array(x)` erases that prototype difference so content comparison is fair.
- */
-function u8(x: Uint8Array): Uint8Array {
-	return new Uint8Array(x);
-}
-
-/** Assert a present value equals `expected` bytes (and is NOT the missing-key `undefined`). */
-function assertBytes(actual: Uint8Array | undefined, expected: Uint8Array, message?: string): void {
-	assert.notStrictEqual(actual, undefined, message ?? 'expected a value, got undefined (missing key)');
-	assert.deepStrictEqual(u8(actual as Uint8Array), u8(expected), message);
-}
-
 /** Collect the keys an iterate() yields, normalized to plain `Uint8Array`. */
 async function keysOf(store: KVStore, options?: IterateOptions): Promise<Uint8Array[]> {
 	const out: Uint8Array[] = [];
@@ -84,8 +69,6 @@ async function keysOf(store: KVStore, options?: IterateOptions): Promise<Uint8Ar
 function sortedByBytes(keys: Uint8Array[]): Uint8Array[] {
 	return [...keys].sort(compareBytes);
 }
-
-const b = (...bytes: number[]): Uint8Array => new Uint8Array(bytes);
 
 /** Seed single-byte keys 1..5 with value [i*10] — the shared range-bound fixture. */
 async function seed1to5(store: KVStore): Promise<void> {
