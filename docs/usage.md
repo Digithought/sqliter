@@ -341,7 +341,7 @@ The `DatabaseDataChangeEvent` interface:
 | `moduleName` | `string` | The virtual table module that raised the event |
 | `schemaName` | `string` | Schema containing the table |
 | `tableName` | `string` | Table name |
-| `key` | `SqlValue[]` | Primary key values (if available) |
+| `key` | `SqlValue[]` | Primary key values of the row (if available), under the primary key the table has at delivery |
 | `oldRow` | `Row` | Previous row data (for update/delete) |
 | `newRow` | `Row` | New row data (for insert/update) |
 | `changedColumns` | `string[]` | Column names that changed (for updates) |
@@ -362,6 +362,17 @@ compose within a transaction (`t` → `t2` → `t3` delivers `t3`), and a rename
 *between* transactions changes nothing about events already delivered, which correctly carry
 the name the table had when they were delivered. `key` and `oldRow`/`newRow` are untouched by
 a rename, which moves no value.
+
+`key` is as-of-delivery too: it holds the values of the primary key the table has **at
+delivery**, so a consumer that addresses rows by `key` (an incremental cache, a sync change
+log) can always pair the event with a row the table now contains. A mid-transaction `ALTER
+TABLE … ALTER PRIMARY KEY` re-derives the `key` of every event the transaction already
+recorded, projecting it out of that event's own row image — widening `(a)` to `(a, b)` turns
+a recorded `[1]` into `[1, 9]`, and narrowing turns `[1, 9]` back into `[1]`. Without that,
+the delivered key would carry the retired key's arity and match no row at all. As with the
+other two families, an ALTER PRIMARY KEY *between* transactions leaves already-delivered
+events alone: they correctly carry the key the table had at the time. A `RENAME TO` still
+leaves `key` untouched (it moves no value); only an ALTER PRIMARY KEY rewrites it.
 
 `changedColumns` is present on an update event only if the owning module supplies it — the
 memory module and the engine's auto-event path do; the store module deliberately omits it and

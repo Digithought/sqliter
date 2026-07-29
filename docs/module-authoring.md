@@ -1165,7 +1165,7 @@ Quereus provides a unified event system at the database level that aggregates ev
 4. **Transaction Batching**: Events are batched during transactions and only delivered after successful commit; on rollback, events are discarded
 5. **Savepoint Support**: Events respect savepoint semantics - `ROLLBACK TO SAVEPOINT` discards events from that savepoint forward, while `RELEASE SAVEPOINT` merges them into the parent transaction
 
-### Row-Shape and Table-Name Contract Across Mid-Transaction ALTER
+### Row-Shape, Table-Name, and Row-Key Contract Across Mid-Transaction ALTER
 
 `oldRow` / `newRow` are positional — a consumer pairs value *i* with column *i* of the table's
 schema. The delivered contract is: **every event's row images match the schema current at
@@ -1194,7 +1194,7 @@ Who upholds it depends on where the not-yet-delivered event sits at ALTER time:
 The same as-of-delivery rule covers `tableName` across `ALTER TABLE … RENAME TO`: an event a
 commit delivers names the table as it exists at delivery, never a name the rename retired. Row
 images and `key` are untouched (a rename moves no value), so only the label changes. Same split
-of responsibility:
+of responsibility as above:
 
 - Events sitting in the engine's batch are relabelled by the engine — `runRenameTable` calls
   `DatabaseEventEmitter.renameBatchedEvents` after the module's `renameTable` returns, walking
@@ -1203,6 +1203,21 @@ of responsibility:
 - A module holding its own queue across the rename must either stamp the table name at emit
   time from its current name — what the memory module does, so it needs no relabel — or
   relabel its queue itself inside `renameTable`.
+
+`key` follows the same rule across `ALTER TABLE … ALTER PRIMARY KEY`: a delivered event
+identifies its row by the primary key the table has **at delivery**, so a consumer that
+addresses rows by `key` (an incremental cache, the sync change log) can pair it with a row the
+table now holds — a key left at the retired arity matches nothing, and the commit still reports
+success. A column-index shift (`ADD`/`DROP`/`RENAME COLUMN`) needs no equivalent: `key` is a
+value list, not an index list. Same split:
+
+- Both arms of `runAlterPrimaryKey` call `DatabaseEventEmitter.rekeyBatchedDataEvents` after
+  the module's `alterTable` (or the rebuild fallback) returns, walking the base batch and every
+  open savepoint layer. Each new key is projected from that event's **own** image: `newRow` for
+  an insert, `oldRow` for a delete, and for an update whichever image reproduces the recorded
+  key under the retired key's columns. Best-effort like the image remap — no key, no usable
+  image, or an image too short for the new key columns keeps the key as-is and logs.
+- A module holding its own queue across the ALTER re-derives `key` itself, by the same rule.
 
 Batched **schema** events are deliberately not relabelled. A schema event records a DDL
 operation, not current state; relabelling its `objectName` without rewriting its `ddl` text
@@ -1218,7 +1233,7 @@ interface DatabaseDataChangeEvent {
   moduleName: string;       // Which module raised this event
   schemaName: string;
   tableName: string;
-  key?: SqlValue[];         // Primary key values
+  key?: SqlValue[];         // Primary key values, under the key the table has at delivery
   oldRow?: Row;             // Previous values (update/delete)
   newRow?: Row;             // New values (insert/update)
   changedColumns?: string[]; // Column names that changed (update only)

@@ -1,19 +1,23 @@
 /**
  * Regression: a mid-transaction ALTER TABLE must rewrite the data-change events the
  * transaction already recorded, so every event a commit delivers describes the table as
- * it is at delivery — not as it was at write time. Two families:
+ * it is at delivery — not as it was at write time. Three families:
  *
  *  - ROW SHAPE (ADD/DROP COLUMN, RENAME COLUMN, ALTER COLUMN SET DATA TYPE / SET NOT NULL
  *    backfill): `newRow.length === columns.length`, value i belongs to column i, `oldRow`
  *    the same, and `changedColumns` names only columns that exist.
  *  - TABLE NAME (RENAME TO): `tableName` is the name the table has at delivery, so a
  *    listener never files rows under a table that no longer exists.
+ *  - ROW KEY (ALTER PRIMARY KEY): `key` holds the primary key the table has at delivery, so
+ *    a listener that addresses rows by `key` can still pair the event with a row the table
+ *    now contains — a key of the retired arity matches nothing at all.
  *
  * Two of the three producer paths are covered here (the third — the store module —
  * lives in packages/quereus-store/test/alter-events.spec.ts):
  *  - the engine auto-event path (default `new Database()`: memory module without an
  *    emitter, events recorded by the DML executor into DatabaseEventEmitter), fixed by
- *    DatabaseEventEmitter.remapBatchedDataEvents (shape) and .renameBatchedEvents (name);
+ *    DatabaseEventEmitter.remapBatchedDataEvents (shape), .renameBatchedEvents (name) and
+ *    .rekeyBatchedDataEvents (key);
  *  - the memory module's native path (`new MemoryTableModule(emitter)`, events held in
  *    each TransactionLayer's pending-change log until the table's own commit), fixed by
  *    the pending-change reshape in TransactionLayer. It stamps `tableName` at commit from
@@ -359,6 +363,180 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.equal(events[1].type, 'insert');
 			assert.deepEqual(events[1].key, ['A']);
 			assert.deepEqual(events[1].newRow, ['A', 2]);
+		});
+
+		// ── ALTER PRIMARY KEY: the recorded `key` follows the key the table has at delivery ──
+		//
+		// NOTE: these assert the delivered `key` ONLY, never row survival. The memory module
+		// rejects an in-place re-key (StatusCode.UNSUPPORTED), so this path takes the rebuild
+		// fallback, which silently discards the rows the transaction itself wrote — that is
+		// `fix/bug-alter-primary-key-mid-transaction-loses-memory-rows`, independent of and
+		// more severe than the re-key. The store path re-keys in place, so the paired
+		// `key`-vs-committed-row assertions live in
+		// packages/quereus-store/test/alter-events.spec.ts.
+
+		it('ALTER PRIMARY KEY widening re-keys an insert recorded before it', async () => {
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].key, [1, 9]);
+		});
+
+		it('ALTER PRIMARY KEY narrowing re-keys an insert recorded before it', async () => {
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a, b))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec('alter table t alter primary key (a)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].key, [1]);
+		});
+
+		it('ALTER PRIMARY KEY re-keys to a column that was not in the old key at all', async () => {
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec('alter table t alter primary key (b)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].key, [9]);
+		});
+
+		it('an update crossing an ALTER PRIMARY KEY is re-keyed from its own row image', async () => {
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec("insert into t values (1, 9, 'x')");
+			events.length = 0;
+
+			await db.exec('begin');
+			await db.exec("update t set v = 'y' where a = 1");
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.equal(events[0].type, 'update');
+			assert.deepEqual(events[0].key, [1, 9]);
+		});
+
+		it('an update that MOVES the primary key keeps whichever image the producer keyed it by', async () => {
+			// The three producers disagree about whether a PK-moving update's `key` holds the
+			// pre- or the post-update key (fix/bug-update-event-key-disagrees-across-producers);
+			// this path records the PRE-update one, the store module the post-update one. The
+			// re-key must be neutral to that, re-projecting the SAME image the producer used —
+			// so learn the choice from a run with no ALTER, then require the re-keyed run to
+			// deliver exactly that key with `b` appended.
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec("insert into t values (1, 9, 'x')");
+			events.length = 0;
+			await db.exec('update t set a = 2 where a = 1');
+			assert.equal(events.length, 1);
+			assert.equal(events[0].key?.length, 1);
+			const producerKeyedBy = events[0].key![0];
+
+			await db.exec('create table u (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec("insert into u values (1, 9, 'x')");
+			events.length = 0;
+			await db.exec('begin');
+			await db.exec('update u set a = 2 where a = 1');
+			await db.exec('alter table u alter primary key (a, b)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.equal(events[0].type, 'update');
+			assert.deepEqual(events[0].key, [producerKeyedBy, 9]);
+		});
+
+		it('a delete crossing an ALTER PRIMARY KEY is re-keyed from oldRow', async () => {
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec("insert into t values (1, 9, 'x')");
+			events.length = 0;
+
+			await db.exec('begin');
+			await db.exec('delete from t where a = 1');
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.equal(events[0].type, 'delete');
+			assert.deepEqual(events[0].key, [1, 9]);
+		});
+
+		it('ALTER PRIMARY KEY re-keys events sitting in an open savepoint layer', async () => {
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec('savepoint s1');
+			await db.exec("insert into t values (2, 8, 'y')");
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('release s1');
+			await db.exec('commit');
+
+			assert.deepEqual(events.map(e => e.key), [[1, 9], [2, 8]]);
+		});
+
+		it('an autocommit ALTER PRIMARY KEY does not re-key an already-delivered event', async () => {
+			// Nothing is batched, so the earlier write was delivered under the key the table
+			// had at the time — correct, and it must stay put.
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec('alter table t alter primary key (a, b)');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].key, [1]);
+		});
+
+		it('an ALTER PRIMARY KEY on one table leaves another table\'s batched keys alone', async () => {
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec('create table u (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec("insert into u values (2, 8, 'y')");
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('commit');
+
+			assert.deepEqual(events.map(e => [e.tableName, e.key]), [
+				['t', [1, 9]],
+				['u', [2]],
+			]);
+		});
+
+		it('a DROP COLUMN then an ALTER PRIMARY KEY in one transaction compose', async () => {
+			// The re-key projects the ALREADY-remapped image, so its column indices must be
+			// read against the post-drop layout, not the one the statement was written in.
+			await db.exec('create table t (a integer not null, z text, b integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 'zz', 9, 'x')");
+			await db.exec('alter table t drop column z');
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].key, [1, 9]);
+			assert.deepEqual(events[0].newRow, [1, 9, 'x']);
+		});
+
+		it('onTransactionCommit carries the re-keyed key too', async () => {
+			const batches: TransactionCommitBatch[] = [];
+			const unsubBatch = db.onTransactionCommit(b => batches.push(b));
+			try {
+				await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+				await db.exec('begin');
+				await db.exec("insert into t values (1, 9, 'x')");
+				await db.exec('alter table t alter primary key (a, b)');
+				await db.exec('commit');
+			} finally {
+				unsubBatch();
+			}
+
+			const dataEvents = batches.flatMap(b => [...b.dataEvents]);
+			assert.equal(dataEvents.length, 1);
+			assert.deepEqual(dataEvents[0].key, [1, 9]);
+			assert.deepEqual(events[0].key, [1, 9]);
 		});
 
 		it('onTransactionCommit delivers the same remapped shapes', async () => {

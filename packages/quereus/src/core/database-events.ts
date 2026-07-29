@@ -12,6 +12,7 @@
 
 import { createLogger } from '../common/logger.js';
 import type { Row, SqlValue } from '../common/types.js';
+import { sqlValueIdentical } from '../util/comparison.js';
 import type { VTableDataChangeEvent, VTableSchemaChangeEvent, VTableEventEmitter } from '../vtab/events.js';
 
 const log = createLogger('core:database-events');
@@ -183,9 +184,9 @@ const DEFAULT_MAX_LISTENERS = 100;
 
 /**
  * Whether a batched event names `(schemaLower, tableLower)` — the single matching rule
- * every batched-event rewrite (row-shape remap, table-name relabel) applies, on both the
- * data and the maintenance-collision channel. Both operands are compared lowercased, so
- * callers pass already-lowercased names.
+ * every batched-event rewrite (row-shape remap, table-name relabel, primary-key re-key)
+ * applies, on both the data and the maintenance-collision channel. Both operands are
+ * compared lowercased, so callers pass already-lowercased names.
  */
 function namesTable(
 	event: { schemaName: string; tableName: string },
@@ -194,6 +195,61 @@ function namesTable(
 ): boolean {
 	return event.schemaName.toLowerCase() === schemaLower
 		&& event.tableName.toLowerCase() === tableLower;
+}
+
+/**
+ * Project `row` through `indices`, or `undefined` when any index is out of bounds for
+ * it. Shared by the re-key itself and its update-image tie-break, so both refuse the
+ * same partial projection rather than emitting an `undefined` key slot.
+ */
+function projectKey(row: Row, indices: readonly number[]): SqlValue[] | undefined {
+	const out: SqlValue[] = [];
+	for (const i of indices) {
+		if (i < 0 || i >= row.length) return undefined;
+		out.push(row[i]);
+	}
+	return out;
+}
+
+/**
+ * Whether projecting `row` through `indices` reproduces `key` value-for-value —
+ * the test that identifies which image an event's recorded `key` was derived from.
+ */
+function keyMatchesImage(row: Row, indices: readonly number[], key: readonly SqlValue[]): boolean {
+	if (indices.length !== key.length) return false;
+	const projected = projectKey(row, indices);
+	if (!projected) return false;
+	return projected.every((v, i) => sqlValueIdentical(v, key[i]));
+}
+
+/**
+ * The row image whose projection through the RETIRED primary key produced the event's
+ * recorded `key` — the image {@link DatabaseEventEmitter.rekeyBatchedDataEvents} must
+ * re-project through the new key so the re-key preserves whichever row the producer
+ * was addressing.
+ *
+ * `insert` and `delete` carry one meaningful image each. `update` carries two, and the
+ * three producers disagree about which one's PK an update's `key` holds when the update
+ * itself changes a PK column (`fix/bug-update-event-key-disagrees-across-producers`); so
+ * rather than pick, test both against the recorded `key` and keep the one that matches.
+ * Both match (the ordinary case — the update touched no PK column) or neither does ⇒
+ * `newRow`, falling back to `oldRow`.
+ */
+function selectKeySourceImage(
+	event: VTableDataChangeEvent,
+	oldPkIndices: readonly number[],
+): Row | undefined {
+	if (event.type === 'insert') return event.newRow;
+	if (event.type === 'delete') return event.oldRow;
+
+	const key = event.key;
+	if (key) {
+		const oldMatches = event.oldRow !== undefined && keyMatchesImage(event.oldRow, oldPkIndices, key);
+		const newMatches = event.newRow !== undefined && keyMatchesImage(event.newRow, oldPkIndices, key);
+		if (oldMatches && !newMatches) return event.oldRow;
+		if (newMatches && !oldMatches) return event.newRow;
+	}
+	return event.newRow ?? event.oldRow;
 }
 
 /**
@@ -900,6 +956,81 @@ export class DatabaseEventEmitter {
 		if (relabelled > 0) {
 			log('Relabelled %d batched events from %s.%s to %s after mid-transaction RENAME TO',
 				relabelled, schemaName, oldTableName, newTableName);
+		}
+	}
+
+	/**
+	 * Re-derive the `key` of every BATCHED data event for one table from the event's own
+	 * row image, after a mid-transaction `ALTER TABLE … ALTER PRIMARY KEY`. Covers
+	 * {@link batchedDataEvents} and every {@link dataEventLayers} savepoint layer, so a
+	 * commit delivers each event under the primary key the table has at delivery — a
+	 * consumer that addresses rows by `key` (an incremental cache, the sync engine's change
+	 * log) can still pair the event with a row the table now contains. Without it a widened
+	 * key delivers too few values and a narrowed one too many, and the arity mismatch alone
+	 * makes the event unmatchable.
+	 *
+	 * `oldPkIndices` / `newPkIndices` are column indices into the row images as they stand
+	 * NOW: ALTER PRIMARY KEY changes no column, and any earlier ALTER in the same
+	 * transaction already remapped the images via {@link remapBatchedDataEvents}.
+	 *
+	 * The image each event's key is projected from is picked by {@link selectKeySourceImage}
+	 * — `newRow` for an insert, `oldRow` for a delete, and for an update whichever image
+	 * reproduces the recorded `key` under `oldPkIndices`.
+	 *
+	 * No-op when not batching: in autocommit the earlier events were already delivered under
+	 * the key the table had at the time, which is correct.
+	 *
+	 * Like {@link renameBatchedEvents} this is synchronous and needs no per-event `try` — it
+	 * reads no schema and evaluates no expression, only projecting values already present in
+	 * the row image. BEST-EFFORT in the same sense as {@link remapBatchedDataEvents}: an
+	 * event with no `key`, no usable image, or an image too short for `newPkIndices` keeps
+	 * its `key` as-is (logged at warn) rather than aborting an otherwise-valid ALTER.
+	 *
+	 * The maintenance-collision channel needs no counterpart: every structural ALTER on a
+	 * maintained table is rejected up front, so a materialized view's primary key cannot
+	 * change mid-transaction.
+	 */
+	rekeyBatchedDataEvents(
+		schemaName: string,
+		tableName: string,
+		oldPkIndices: readonly number[],
+		newPkIndices: readonly number[],
+	): void {
+		if (!this.isBatching) return;
+
+		const schemaLower = schemaName.toLowerCase();
+		const tableLower = tableName.toLowerCase();
+		let rekeyed = 0;
+
+		for (const store of this.allDataEventStores()) {
+			for (const entry of store) {
+				const event = entry.event;
+				if (!namesTable(event, schemaLower, tableLower)) continue;
+				if (!event.key) {
+					warnLog('rekeyBatchedDataEvents: %s event on %s.%s carries no key, leaving as-is',
+						event.type, event.schemaName, event.tableName);
+					continue;
+				}
+				const image = selectKeySourceImage(event, oldPkIndices);
+				if (image === undefined) {
+					warnLog('rekeyBatchedDataEvents: %s event on %s.%s has no usable row image, leaving key as-is',
+						event.type, event.schemaName, event.tableName);
+					continue;
+				}
+				const nextKey = projectKey(image, newPkIndices);
+				if (!nextKey) {
+					warnLog('rekeyBatchedDataEvents: new key column out of bounds for the %s image on %s.%s (arity %d), leaving key as-is',
+						event.type, event.schemaName, event.tableName, image.length);
+					continue;
+				}
+				entry.event = { ...event, key: nextKey };
+				rekeyed++;
+			}
+		}
+
+		if (rekeyed > 0) {
+			log('Re-keyed %d batched data events on %s.%s after mid-transaction ALTER PRIMARY KEY',
+				rekeyed, schemaName, tableName);
 		}
 	}
 

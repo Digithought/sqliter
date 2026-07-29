@@ -1454,6 +1454,13 @@ async function runAlterPrimaryKey(
 		seen.add(pk.index);
 	}
 
+	// Column indices of the key being retired and the one replacing it. Both index the
+	// CURRENT column layout — ALTER PRIMARY KEY adds and drops no column — so they are
+	// also indices into the batched events' row images, which any earlier ALTER in this
+	// transaction has already remapped to that layout.
+	const oldPkIndices = tableSchema.primaryKeyDefinition.map(pk => pk.index);
+	const newPkIndices = newPkDef.map(pk => pk.index);
+
 	// Try native module re-key first
 	const module = requireVtabModule(tableSchema);
 	if (module.alterTable) {
@@ -1463,6 +1470,17 @@ async function runAlterPrimaryKey(
 				rctx.db, tableSchema.schemaName, tableSchema.name,
 				{ type: 'alterPrimaryKey', newPkColumns: schemaChangePk },
 			);
+
+			// Events this transaction already recorded identify their rows by the RETIRED
+			// key; re-derive each from its own row image so the commit delivers every event
+			// under the key the table has at delivery. AFTER the module call (a module
+			// failure must leave the batch as untouched as the catalog, and the store's
+			// `ddlCommitPendingOps` flushes its queued events into our batch DURING that
+			// call — those must be in the batch before we walk it), BEFORE the catalog swap,
+			// matching where the other ALTER arms call `remapBatchedDataEvents`.
+			rctx.db._getEventEmitter().rekeyBatchedDataEvents(
+				tableSchema.schemaName, tableSchema.name, oldPkIndices, newPkIndices);
+
 			schema.addTable(updatedTableSchema);
 			rctx.db.schemaManager.getChangeNotifier().notifyChange({
 				type: 'table_modified',
@@ -1484,6 +1502,13 @@ async function runAlterPrimaryKey(
 
 	// Rebuild fallback
 	await rebuildTableWithNewShape(rctx, tableSchema, schema, tableSchema.columns.map(c => c.name), newPkDef);
+
+	// Same re-key as the native arm, for the same reason — the rebuild reaches the catalog
+	// itself, so this runs after it returns. Every column survives the rebuild in order
+	// (`survivingColumns` above is the full list), so the indices still line up with the
+	// event images.
+	rctx.db._getEventEmitter().rekeyBatchedDataEvents(
+		tableSchema.schemaName, tableSchema.name, oldPkIndices, newPkIndices);
 
 	log('Altered primary key of %s.%s (rebuild)', tableSchema.schemaName, tableSchema.name);
 	return null;
