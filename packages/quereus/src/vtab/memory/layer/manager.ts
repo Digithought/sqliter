@@ -1935,6 +1935,13 @@ export class MemoryTableManager {
 			// and (in the other direction) to admit `default null` on a column that is NOT NULL
 			// only by the session `default_column_nullability`. The gate is value-based now, so
 			// it matches `StoreModuleBase.alterAddColumn` word for word.
+			//
+			// NOTE: that agreement — here, in the store module, and in the engine's own
+			// pre-check in `runAddColumn` — is held together only by section 8 of
+			// `test/logic/41.4-alter-add-column-constraints.sqllogic` running under both
+			// `yarn test` and `yarn test:store`. Nothing enforces it mechanically. If a
+			// fourth site ever needs the same rule, hoist it to one shared predicate
+			// rather than adding another copy.
 			const tableHasRows = this.baseLayer.primaryTree.at(this.baseLayer.primaryTree.first()) !== undefined;
 			if (newColumnSchema.notNull && defaultValue === null && !backfillEvaluator && tableHasRows) {
 				throw new QuereusError(

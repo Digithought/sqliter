@@ -819,3 +819,37 @@ select count(*) as c from table_info('t_dn5') where name = 'extra';
 → [{"c":0}]
 
 drop table t_dn5;
+-- run
+
+-- 8f. The inverse: with `default_column_nullability = 'nullable'` the same `default null`
+-- add is LEGAL over rows, because the column is then optional — the gate resolves
+-- mandatoriness rather than pattern-matching the DEFAULT. An explicit `not null` in the
+-- same session is still refused, so the rule tracks the resolved column, not the pragma.
+pragma default_column_nullability = 'nullable';
+create table t_dn6 (id integer primary key, name text);
+insert into t_dn6 values (1, 'a');
+-- run
+
+alter table t_dn6 add column extra text default null;
+-- run
+
+select id, extra from t_dn6 order by id;
+→ [{"id":1,"extra":null}]
+
+select count(*) as c from table_info('t_dn6') where name = 'extra' and notnull = 0;
+→ [{"c":1}]
+
+-- inserts that omit the (now optional) column keep working
+insert into t_dn6 (id, name) values (2, 'b');
+select count(*) as c from t_dn6;
+→ [{"c":2}]
+
+-- explicit `not null` under the same pragma is still refused, pre-mutation
+alter table t_dn6 add column mandatory text not null default null;
+-- error: NOT NULL
+
+select count(*) as c from table_info('t_dn6') where name = 'mandatory';
+→ [{"c":0}]
+
+drop table t_dn6;
+pragma default_column_nullability = 'not_null';

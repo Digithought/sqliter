@@ -16,11 +16,26 @@ import { Database } from '../src/index.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import type { Database as DatabaseType } from '../src/core/database.js';
 import type { TableSchema } from '../src/schema/table.js';
-import { buildColumnIndexMap } from '../src/schema/table.js';
+import { buildColumnIndexMap, columnDefToSchema } from '../src/schema/table.js';
+import { tryFoldLiteral } from '../src/parser/utils.js';
 import type { SchemaChangeInfo } from '../src/vtab/module.js';
 import type { ModuleCapabilities } from '../src/vtab/capabilities.js';
 import type { ColumnDef } from '../src/parser/ast.js';
 import type { SqlValue } from '../src/common/types.js';
+
+/**
+ * Whether the column definition carries something that can fill an existing row:
+ * a `GENERATED ALWAYS AS` expression, or a DEFAULT that is not literally NULL (a
+ * non-foldable one arrives as a per-row evaluator and counts; `default null` does
+ * not, since NULL is exactly what a mandatory column forbids).
+ */
+function hasValueSource(columnDef: ColumnDef): boolean {
+	const constraints = columnDef.constraints ?? [];
+	if (constraints.some(c => c.type === 'generated')) return true;
+	const defaultExpr = constraints.find(c => c.type === 'default')?.expr;
+	if (!defaultExpr) return false;
+	return tryFoldLiteral(defaultExpr) !== null;
+}
 
 /**
  * A structurally-total memory module. It advertises
@@ -30,6 +45,12 @@ import type { SqlValue } from '../src/common/types.js';
  * base manager (so the manager's own backfill doesn't reject), then presents
  * the declared NOT NULL shape in the returned schema — modelling a module
  * that enforces NOT NULL at write time going forward.
+ *
+ * Nullability is RESOLVED through `columnDefToSchema`, not read off the statement
+ * text: under the shipped `default_column_nullability = 'not_null'` a bare
+ * `add column tier text` is already mandatory, so scanning for a literal `not null`
+ * constraint would skip the relaxation and let the base manager reject the add the
+ * capability exists to permit. This mirrors the engine's own gate in `runAddColumn`.
  */
 class TotalMemoryModule extends MemoryTableModule {
 	override getCapabilities(): ModuleCapabilities {
@@ -46,12 +67,13 @@ class TotalMemoryModule extends MemoryTableModule {
 			return super.alterTable(db, schemaName, tableName, change);
 		}
 
-		const declaredNotNull = (change.columnDef.constraints ?? []).some(c => c.type === 'notNull');
-		const hasDefault = (change.columnDef.constraints ?? []).some(c => c.type === 'default');
+		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
+		const resolvedNotNull = columnDefToSchema(change.columnDef, defaultNotNull).notNull;
+		const needsRelax = resolvedNotNull && !hasValueSource(change.columnDef);
 
-		// Relax NOT NULL (with no DEFAULT) to nullable so the base manager
+		// Relax NOT NULL (with no value source) to nullable so the base manager
 		// backfills NULL into existing rows instead of rejecting.
-		const relaxedColumnDef: ColumnDef = (declaredNotNull && !hasDefault)
+		const relaxedColumnDef: ColumnDef = needsRelax
 			? {
 				...change.columnDef,
 				constraints: [
@@ -66,7 +88,7 @@ class TotalMemoryModule extends MemoryTableModule {
 			columnDef: relaxedColumnDef,
 		});
 
-		if (!declaredNotNull || hasDefault) return schema;
+		if (!needsRelax) return schema;
 
 		// Present the declared NOT NULL shape (enforced at write time going forward).
 		const newName = change.columnDef.name.toLowerCase();
@@ -134,6 +156,48 @@ describe('ALTER TABLE ADD COLUMN NOT NULL backfill delegation', () => {
 			{ id: 1, required: null },
 			{ id: 2, required: null },
 		]);
+	});
+
+	it('delegating module: a column mandatory only via the session option is delegated too', async () => {
+		db = new Database();
+		db.registerModule('total', new TotalMemoryModule());
+		db.setDefaultVtabName('total');
+
+		await db.exec(`create table t (id integer primary key)`);
+		await db.exec(`insert into t values (1), (2)`);
+
+		// No `not null` in the statement text, but `default_column_nullability` ships as
+		// `not_null`, so the column IS mandatory. The engine gate must skip it (delegated)
+		// and the module must relax it — a gate that pattern-matched the text on either
+		// side would reject an add the capability exists to permit.
+		await db.exec(`alter table t add column tier text`);
+
+		const col = db.schemaManager.getTable('main', 't')!.columns.find(c => c.name === 'tier');
+		expect(col!.notNull, 'column carries the resolved NOT NULL shape').to.equal(true);
+
+		const rows = await collect(db, `select id, tier from t order by id`);
+		expect(rows).to.deep.equal([
+			{ id: 1, tier: null },
+			{ id: 2, tier: null },
+		]);
+	});
+
+	it('delegating module: `default null` supplies no value and is delegated too', async () => {
+		db = new Database();
+		db.registerModule('total', new TotalMemoryModule());
+		db.setDefaultVtabName('total');
+
+		await db.exec(`create table t (id integer primary key)`);
+		await db.exec(`insert into t values (1)`);
+
+		// A DEFAULT that folds to NULL is not a value source; the module must treat it as
+		// it treats a missing DEFAULT rather than handing a mandatory column to the base
+		// manager, which would reject it.
+		await db.exec(`alter table t add column extra text default null`);
+
+		const col = db.schemaManager.getTable('main', 't')!.columns.find(c => c.name === 'extra');
+		expect(col!.notNull).to.equal(true);
+		expect(await collect(db, `select id, extra from t`)).to.deep.equal([{ id: 1, extra: null }]);
 	});
 
 	it('APPLY SCHEMA over a delegating module does not abort on NOT NULL ADD COLUMN', async () => {
