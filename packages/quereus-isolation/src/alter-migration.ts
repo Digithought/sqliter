@@ -466,13 +466,9 @@ async function collectPkRekeyGroups(
  *
  * - A clean overlay (`!hasChanges`) stages no rows, so there is nothing to validate.
  * - A missing tombstone column throws INTERNAL here, before the underlying is touched.
- * - For addColumn, each staged row runs through `computeAddColumnValue`: tombstone
- *   rows short-circuit to `null` (the evaluator never runs), and a NOT-NULL violation
- *   throws CONSTRAINT here, atomically. Computed values are discarded. Two distinct
- *   sources reject: an evaluator that produces NULL for a staged row, and a mandatory
- *   column with no usable DEFAULT (nothing to fill an appended row with) — the latter
- *   matters because the engine's own pre-mutation probe only covers the ISSUING
- *   connection, never a foreign one's staged rows.
+ * - For addColumn, each staged row runs through {@link computeAddColumnValue}, which owns
+ *   both NOT NULL reject sources and short-circuits tombstone rows; a violation throws
+ *   CONSTRAINT here, atomically. Computed values are discarded.
  *
  * For `set not null` with NO usable DEFAULT (`plan.setNotNull.hasDefault === false`), a staged
  * non-tombstone NULL at the now-NOT-NULL column throws CONSTRAINT here — for the issuer this
@@ -514,6 +510,10 @@ export async function validateOverlayMigration(
 	const oldTombstoneIdx = requireTombstoneIndex(host, oldOverlaySchema);
 
 	if (plan.addColumn) {
+		// NOTE: full-scans every staged row even when nothing can fail (a nullable column with no
+		// evaluator rejects nothing) and even when the reject is row-independent (a mandatory
+		// column with no DEFAULT rejects on the first live row). If overlays ever get large, gate
+		// the scan on `newColNotNull` and stop at the first live row on the no-evaluator path.
 		for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
 			// Discard the result — this is validation only. A NOT NULL violation throws here.
 			await computeAddColumnValue(plan.addColumn, oldRow, oldTombstoneIdx);

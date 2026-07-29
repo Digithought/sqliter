@@ -3257,6 +3257,38 @@ describe('IsolationModule', () => {
 			expect(teRows.length, "'te' has no committed rows").to.equal(0);
 		});
 
+		// The companion to the test above: the mandatory-column-with-no-DEFAULT rejection must
+		// stay BELOW the tombstone short-circuit in `computeAddColumnValue`. Its condition is
+		// row-independent (`newColNotNull && foldedDefault === null`), so hoisting it above the
+		// per-row tombstone check reads as a harmless simplification and would silently poison
+		// every connection holding nothing but staged DELETEs.
+		//
+		// Reachable for real: B deletes a committed row (staging a marker), A commits a delete of
+		// that same row, leaving the committed table empty — so A's mandatory ADD COLUMN gets past
+		// the underlying's "non-empty table" refusal while B's overlay holds only that marker. The
+		// overlay is injected directly here for the same determinism reason as its siblings.
+		it('does NOT poison a foreign overlay holding only a deletion marker when the new mandatory column has no DEFAULT', async () => {
+			await dbA.exec('create table td (id integer primary key, x integer null) using isolated');
+			const underlyingTd = iso.getUnderlyingState('main', 'td')!.underlyingTable;
+			const overlayTd = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlyingTd.tableSchema!));
+			await overlayTd.update({ operation: 'insert', values: [10, null, 1] }); // trailing 1 = deletion marker
+			iso.setConnectionOverlay(dbB, 'main', 'td', { overlayTable: overlayTd, hasChanges: true, db: dbB });
+
+			const noDefaultCol: SchemaChangeInfo = {
+				type: 'addColumn',
+				columnDef: { name: 'c', dataType: 'INTEGER', constraints: [{ type: 'notNull' }] },
+			};
+			await iso.alterTable(dbA, 'main', 'td', noDefaultCol);
+
+			const bState = iso.getConnectionOverlay(dbB, 'main', 'td')!;
+			expect(bState.poison, 'a marker carries no value to reject — B stays healthy').to.be.undefined;
+			expect(bState.overlayTable, 'overlay adopted in place, not rebuilt').to.equal(overlayTd);
+			const stagedRows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
+			// [id, x, c, _tombstone] — the new column lands AHEAD of the tombstone flag.
+			expect(stagedRows.map(r => [r[0], r[2], r[3]]), 'marker carried forward with a NULL in the new column')
+				.to.deep.equal([[10, null, 1]]);
+		});
+
 		it('errors a poisoned connection at read, write, and commit; committed reads still succeed', async () => {
 			await injectOverlay(dbB, [[10, null]]);
 			await iso.alterTable(dbA, 'main', 't', addNotNullCol('c'));
