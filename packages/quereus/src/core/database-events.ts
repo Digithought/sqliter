@@ -232,8 +232,12 @@ function keyMatchesImage(row: Row, indices: readonly number[], key: readonly Sql
  * three producers disagree about which one's PK an update's `key` holds when the update
  * itself changes a PK column (`fix/bug-update-event-key-disagrees-across-producers`); so
  * rather than pick, test both against the recorded `key` and keep the one that matches.
- * Both match (the ordinary case — the update touched no PK column) or neither does ⇒
+ * Both match (the ordinary case — the update touched no PK column) ⇒ either will do, so
  * `newRow`, falling back to `oldRow`.
+ *
+ * NEITHER matching means the recorded `key` was not projected from either image under the
+ * retired key — a producer that normalizes key values, or a key of an arity the retired key
+ * never had. The re-key is then guessing which row the event addresses, so it says so.
  */
 function selectKeySourceImage(
 	event: VTableDataChangeEvent,
@@ -248,6 +252,10 @@ function selectKeySourceImage(
 		const newMatches = event.newRow !== undefined && keyMatchesImage(event.newRow, oldPkIndices, key);
 		if (oldMatches && !newMatches) return event.oldRow;
 		if (newMatches && !oldMatches) return event.newRow;
+		if (!oldMatches && !newMatches && (event.oldRow !== undefined || event.newRow !== undefined)) {
+			warnLog('rekeyBatchedDataEvents: neither image of the update on %s.%s reproduces its recorded key %O under the retired key columns %O; re-keying from newRow',
+				event.schemaName, event.tableName, key, oldPkIndices);
+		}
 	}
 	return event.newRow ?? event.oldRow;
 }
@@ -973,6 +981,12 @@ export class DatabaseEventEmitter {
 	 * NOW: ALTER PRIMARY KEY changes no column, and any earlier ALTER in the same
 	 * transaction already remapped the images via {@link remapBatchedDataEvents}.
 	 *
+	 * NOTE: that assumes the earlier remap succeeded. Its per-image failures are best-effort
+	 * and leave an image at its pre-ALTER layout; an index long enough for such an image
+	 * projects the wrong column rather than bailing out, since only out-of-bounds is
+	 * detectable here. If those failures ever become something other than a logged rarity,
+	 * pass the current column count through and skip any image that does not match it.
+	 *
 	 * The image each event's key is projected from is picked by {@link selectKeySourceImage}
 	 * — `newRow` for an insert, `oldRow` for a delete, and for an update whichever image
 	 * reproduces the recorded `key` under `oldPkIndices`.
@@ -1007,7 +1021,11 @@ export class DatabaseEventEmitter {
 				const event = entry.event;
 				if (!namesTable(event, schemaLower, tableLower)) continue;
 				if (!event.key) {
-					warnLog('rekeyBatchedDataEvents: %s event on %s.%s carries no key, leaving as-is',
+					// Not anomalous: `key` is optional on the public event and a module may
+					// legitimately never populate it, so this is debug, not warn — a producer
+					// that omits the key omits it for every event, and an ALTER PRIMARY KEY
+					// mid-transaction would otherwise warn once per batched event.
+					log('rekeyBatchedDataEvents: %s event on %s.%s carries no key, leaving as-is',
 						event.type, event.schemaName, event.tableName);
 					continue;
 				}

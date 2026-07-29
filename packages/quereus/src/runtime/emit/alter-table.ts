@@ -1478,6 +1478,13 @@ async function runAlterPrimaryKey(
 			// `ddlCommitPendingOps` flushes its queued events into our batch DURING that
 			// call — those must be in the batch before we walk it), BEFORE the catalog swap,
 			// matching where the other ALTER arms call `remapBatchedDataEvents`.
+			//
+			// NOTE: this sits inside the try whose catch falls through to the rebuild, so an
+			// UNSUPPORTED raised BELOW it (only reachable via a `table_modified` listener, as
+			// `schema.addTable` raises no UNSUPPORTED) would re-key twice. The second pass is
+			// idempotent for every event except a PK-moving update, whose image tie-break no
+			// longer recognizes the already-rewritten key. If anything below this line gains
+			// a real UNSUPPORTED path, narrow the try to the `module.alterTable` call.
 			rctx.db._getEventEmitter().rekeyBatchedDataEvents(
 				tableSchema.schemaName, tableSchema.name, oldPkIndices, newPkIndices);
 

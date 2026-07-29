@@ -520,6 +520,74 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.deepEqual(events[0].newRow, [1, 9, 'x']);
 		});
 
+		it('ROLLBACK TO SAVEPOINT does not revert the ALTER PRIMARY KEY, so the re-keyed events stay consistent with the schema', async () => {
+			// The re-key rewrites events in the BASE batch, which a later ROLLBACK TO does not
+			// discard. That is only correct because the rollback does not revert the DDL either
+			// — same as the shape and rename families. If DDL ever becomes savepoint-scoped,
+			// all three fixups need undo, not just this one.
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec('savepoint s1');
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('rollback to s1');
+			await db.exec('commit');
+
+			const pkColumns: string[] = [];
+			for await (const row of db.eval("select name from table_info('t') where pk > 0 order by pk")) {
+				pkColumns.push(String(row.name));
+			}
+			assert.deepEqual(pkColumns, ['a', 'b']);
+			assert.equal(events.length, 1);
+			assert.deepEqual(events[0].key, [1, 9]);
+		});
+
+		it('a RENAME TO then an ALTER PRIMARY KEY in one transaction compose', async () => {
+			// The re-key matches batched events by the table's CURRENT name, which the rename
+			// relabel already wrote onto them — so it only finds them if `runAlterPrimaryKey`
+			// resolved the live schema rather than a build-time snapshot naming `t`.
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec('alter table t rename to t2');
+			await db.exec('alter table t2 alter primary key (a, b)');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.equal(events[0].tableName, 't2');
+			assert.deepEqual(events[0].key, [1, 9]);
+		});
+
+		it('an ALTER PRIMARY KEY then a RENAME TO in one transaction compose', async () => {
+			// Reverse order: the re-key runs under the old name, and the later relabel must
+			// leave the new key alone (a rename moves no value).
+			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('alter table t rename to t2');
+			await db.exec('commit');
+
+			assert.equal(events.length, 1);
+			assert.equal(events[0].tableName, 't2');
+			assert.deepEqual(events[0].key, [1, 9]);
+		});
+
+		it('two ALTER PRIMARY KEYs in one transaction leave the last key in force', async () => {
+			// The second re-key reads the FIRST one's key as the retired one, both for the
+			// column indices and for the update image tie-break, so an event must not be
+			// re-keyed from a key two generations stale.
+			await db.exec('create table t (a integer not null, b integer not null, c integer not null, v text, primary key (a))');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 7, 'x')");
+			await db.exec("update t set v = 'y' where a = 1");
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('alter table t alter primary key (c)');
+			await db.exec('commit');
+
+			assert.deepEqual(events.map(e => e.key), [[7], [7]]);
+		});
+
 		it('onTransactionCommit carries the re-keyed key too', async () => {
 			const batches: TransactionCommitBatch[] = [];
 			const unsubBatch = db.onTransactionCommit(b => batches.push(b));
