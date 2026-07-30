@@ -68,4 +68,35 @@ describe('Plan shape: converting CAST blocks index seek', () => {
 		const ops = await planOps(db, "SELECT x FROM t WHERE CAST(x AS NVARCHAR) = '1'");
 		expect(ops).to.include('INDEXSEEK');
 	});
+
+	describe('IN value list (bug-numeric-text-coercion-skips-in-and-case)', () => {
+		// `coerceComparisonSet` casts each VALUE (not the probe) when the probe is
+		// numeric, so a numeric-keyed IN list keeps its seek: the casts are
+		// constant-foldable and must collapse to plain literals before access-path
+		// selection runs, exactly as the reverse pairing already blocks the seek
+		// on a TEXT key (`x = 1` above).
+		let dbi: Database;
+
+		beforeEach(async () => {
+			dbi = new Database();
+			await dbi.exec("CREATE TABLE ti (x INTEGER PRIMARY KEY) USING memory");
+			await dbi.exec("INSERT INTO ti VALUES (1), (2), (3)");
+		});
+
+		afterEach(async () => {
+			await dbi.close();
+		});
+
+		it('numeric probe, textual IN-list values → casts fold away, seek survives', async () => {
+			const ops = await planOps(dbi, "SELECT x FROM ti WHERE x IN ('1', '2')");
+			expect(ops).to.include('INDEXSEEK');
+			expect(ops).to.not.include('FILTER');
+		});
+
+		it('textual probe, numeric IN-list values → hoisted probe cast blocks the seek, same as `x = 1`', async () => {
+			const ops = await planOps(db, "SELECT x FROM t WHERE x IN (1, 2)");
+			expect(ops).to.not.include('INDEXSEEK');
+			expect(ops).to.include('FILTER');
+		});
+	});
 });

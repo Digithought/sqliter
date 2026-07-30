@@ -214,6 +214,43 @@ describe('Plan shape: subquery decorrelation', () => {
 		});
 	});
 
+	describe('cross-type coercion in IN decorrelation (bug-numeric-text-coercion-skips-in-and-case)', () => {
+		// `coerceComparisonSet` reconciles both decorrelation arms' synthesized `=`
+		// the same way a hand-written one is. The uncorrelated arm's cast wrapper
+		// fails its own equi-pair gate and declines the rewrite entirely; the
+		// correlated arm has no such gate at this stage — it always builds the
+		// semi join, with the cast riding in the join's residual condition
+		// (usable by a merge/nested-loop probe, just not a hash equi-pair).
+		beforeEach(async () => {
+			await db.exec("CREATE TABLE ci (id INTEGER PRIMARY KEY, x INTEGER) USING memory");
+			await db.exec("CREATE TABLE ct (id INTEGER PRIMARY KEY, label TEXT) USING memory");
+			await db.exec("INSERT INTO ci VALUES (1, 10), (2, 20)");
+			await db.exec("INSERT INTO ct VALUES (1, '10'), (2, '30')");
+		});
+
+		it('uncorrelated INTEGER-vs-TEXT IN declines decorrelation, keeps the InNode, and matches the set probe', async () => {
+			const q = "SELECT id FROM ci WHERE x IN (SELECT label FROM ct) ORDER BY id";
+			const types = await planNodeTypes(db, q);
+			expect(types, 'expected InNode retained').to.include('In');
+			expect(await countSemiJoins(q), 'expected no semi join').to.equal(0);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 1 }]);
+		});
+
+		it('correlated INTEGER-vs-TEXT IN still decorrelates into a semi join, with the cast in the residual', async () => {
+			const q = "SELECT id FROM ci WHERE x IN (SELECT label FROM ct WHERE ct.id = ci.id) ORDER BY id";
+			const rows = await planRows(db, q);
+			expect(await countSemiJoins(q), 'expected exactly one semi join').to.equal(1);
+			// The cast-wrapped equality must survive somewhere in the join's
+			// condition tree (it fails the equi-pair gate, so it cannot be the
+			// join's hash/merge key, but it must still be evaluated).
+			expect(
+				rows.some(r => r.node_type === 'Cast' && /AS INTEGER/i.test(r.detail)),
+				'expected a CAST(... AS INTEGER) node reconciling the comparison',
+			).to.equal(true);
+			expect(await allRows(db, q)).to.deep.equal([{ id: 1 }]);
+		});
+	});
+
 	describe('cost-quadrant guard: large outer × large inner plans as hash', () => {
 		it('100 × 100 uncorrelated IN is a hash semi join, not a nested loop', async () => {
 			// This pins the O(N×K)-floor guarantee against future cost-constant

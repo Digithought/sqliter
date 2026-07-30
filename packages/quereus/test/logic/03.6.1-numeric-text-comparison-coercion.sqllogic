@@ -1,0 +1,148 @@
+-- 03.6.1-numeric-text-comparison-coercion.sqllogic
+-- Regression coverage for bug-numeric-text-coercion-skips-in-and-case:
+-- `insertCrossTypeCoercion` (planner/building/coercion.ts) casts the textual side
+-- of a numeric-vs-textual comparison so `int_col = '1'` reads as `int_col = 1`.
+-- That rule used to apply only at the `=`/BETWEEN build sites; `IN` value lists,
+-- simple CASE, nullif/greatest/least, the IN-subquery runtime path
+-- (`inMembershipKeys`, runtime/emit/subquery.ts) and both IN decorrelation
+-- rewrites (rule-subquery-decorrelation.ts) skipped it, so the SAME comparison
+-- answered differently depending on how it was spelled. This file pins every
+-- form agreeing with each other over an INTEGER column, a REAL column and a
+-- TEXT column.
+
+create table nn (id integer primary key, i integer, r real);
+insert into nn values (1, 1, 2.5);
+-- run
+
+create table tt (id integer primary key, t text);
+insert into tt values (1, '1');
+-- run
+
+-- ===================================
+-- 1. INTEGER column `i` (value 1) against textual operands — every form agrees
+-- ===================================
+select (i = '1') as v from nn;
+→ [{"v":true}]
+
+select (i between '0' and '2') as v from nn;
+→ [{"v":true}]
+
+select i in ('1') as v from nn;
+→ [{"v":true}]
+
+select i in (select t from tt) as v from nn;
+→ [{"v":true}]
+
+select case i when '1' then 'hit' else 'miss' end as v from nn;
+→ [{"v":"hit"}]
+
+select nullif(i, '1') as v from nn;
+→ [{"v":null}]
+
+select greatest(i, '2') as v from nn;
+→ [{"v":2}]
+
+-- `least` is unaffected here (1 is already the smaller value either way) — kept
+-- as a control that the coercion did not change an already-correct answer.
+select least(i, '2') as v from nn;
+→ [{"v":1}]
+
+-- The existing `=` semantics truncate on an INTEGER target (`cast('1.9' as
+-- integer)` is 1) — not something this fix introduced, but every form must now
+-- agree on it the same way they agree above.
+select (i = '1.9') as v from nn;
+→ [{"v":true}]
+
+select i in ('1.9') as v from nn;
+→ [{"v":true}]
+
+select case i when '1.9' then 'hit' else 'miss' end as v from nn;
+→ [{"v":"hit"}]
+
+-- ===================================
+-- 2. REAL column `r` (value 2.5) against textual operands
+-- ===================================
+select (r = '2.5') as v from nn;
+→ [{"v":true}]
+
+select (r between '2' and '3') as v from nn;
+→ [{"v":true}]
+
+select r in ('2.5') as v from nn;
+→ [{"v":true}]
+
+select case r when '2.5' then 'hit' else 'miss' end as v from nn;
+→ [{"v":"hit"}]
+
+-- ===================================
+-- 3. TEXT column `t` (value '1') against numeric operands — the reverse pairing
+-- ===================================
+select (t = 1) as v from tt;
+→ [{"v":true}]
+
+select (t between 0 and 2) as v from tt;
+→ [{"v":true}]
+
+select t in (1) as v from tt;
+→ [{"v":true}]
+
+select t in (select i from nn) as v from tt;
+→ [{"v":true}]
+
+select case t when 1 then 'hit' else 'miss' end as v from tt;
+→ [{"v":"hit"}]
+
+-- ===================================
+-- 4. Negative controls — must NOT change, and are the things a future
+--    "simplification" of the coercion would most likely break
+-- ===================================
+
+-- A non-numeric textual value never matches, in any form.
+select i in ('abc') as v from nn;
+→ [{"v":false}]
+
+-- IN with a NULL member stays three-valued: NULL, not false.
+select i in (null) as v from nn;
+→ [{"v":null}]
+
+-- NOT IN is the plain complement over a NULL-free list.
+select i not in ('2') as v from nn;
+→ [{"v":true}]
+
+-- Mixed-WHEN simple CASE: `i` is numeric, so each WHEN casts independently —
+-- this is the per-value path, not the hoisted-probe one, and is not the gap
+-- below. (The parser requires a THEN per WHEN, so `when '1' when 2` is a
+-- syntax error, not a shape to test.)
+select case i when 'abc' then 'a' when '1' then 'b' else 'c' end as v from nn;
+→ [{"v":"b"}]
+
+-- ===================================
+-- 5. The one remaining known gap: a TEXTUAL probe against a value list mixing
+--    numeric and textual values. `coerceComparisonSet` deliberately declines to
+--    hoist a probe cast over a MIXED list — `cast('abc' as real)` is 0, so
+--    hoisting would make `s in (1, 'abc')` true for a stored '0'. The trade is a
+--    visible disagreement with the `=` disjunction on the numeric member; see
+--    the NOTE on `coerceComparisonSet` (planner/building/coercion.ts) and
+--    docs/types.md "Type Coercion in Comparisons" for why closing it needs a
+--    per-value probe that IN cannot express.
+-- ===================================
+create table nc_mix (id integer primary key, s text);
+insert into nc_mix values (1, '0'), (2, '1');
+-- run
+
+-- Stored '0': IN and the `=` disjunction agree (both false) — this one is fine.
+select s in (1, 'abc') as v from nc_mix where id = 1;
+→ [{"v":false}]
+
+select (s = 1 or s = 'abc') as v from nc_mix where id = 1;
+→ [{"v":false}]
+
+-- Stored '1': THIS is where the gap is visible. `s in (1, 'abc')` stays
+-- uncoerced (false), but `s = 1 or s = 'abc'` reconciles the pairwise `=` and
+-- matches (true). Pinned deliberately as a known, documented divergence —
+-- not a typo.
+select s in (1, 'abc') as v from nc_mix where id = 2;
+→ [{"v":false}]
+
+select (s = 1 or s = 'abc') as v from nc_mix where id = 2;
+→ [{"v":true}]
