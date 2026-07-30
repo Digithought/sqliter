@@ -699,6 +699,37 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		const info = await columnInfo(db, 'v');
 		expect(info?.notnull, 'column tightened to NOT NULL').to.equal(1);
 	});
+
+	// ALTER PRIMARY KEY over staged overlay rows must reject BUSY (retryable), not UNSUPPORTED.
+	// UNSUPPORTED from `alterTable` tells the engine "fall back to a shadow-table rebuild" —
+	// which copies only committed rows, so the transaction's staged writes would be silently
+	// lost on `rollback` while the rebuilt table survives. This goes through SQL (not a direct
+	// `iso.alterTable` call) specifically so the engine's ALTER PRIMARY KEY path — and its
+	// UNSUPPORTED-triggered fallback — is actually exercised; a direct module call cannot catch
+	// the swallow, since the swallow lives in the engine, not the wrapper.
+	it('ALTER PRIMARY KEY rejects BUSY (not UNSUPPORTED) when the issuer has staged rows, and never invokes the shadow-rebuild fallback', async () => {
+		await db.exec(`create table t (a integer not null, b integer not null, v text, primary key (a)) using isolated`);
+		await db.exec(`insert into t values (5, 5, 'pre')`); // committed before the transaction
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, 9, 'x')`); // staged only in this connection's overlay
+
+		const err = await attemptAlter(db, `alter table t alter primary key (a, b)`);
+		expect(err, 'staged rows must block the primary-key change').to.be.instanceOf(QuereusError);
+		expect(err!.code, 'BUSY, not UNSUPPORTED — UNSUPPORTED would trigger the engine\'s rebuild fallback').to.equal(StatusCode.BUSY);
+		expect(await pkColumns(db), 'primary key unchanged after the rejected ALTER').to.deep.equal(['a']);
+
+		// The transaction must still be open: a second statement in it should see the staged row.
+		expect(await rows(db, `select * from t where a = 1`))
+			.to.deep.equal([{ a: 1, b: 9, v: 'x' }]);
+
+		await db.exec('rollback');
+
+		// The committed row must have survived — the shadow-rebuild fallback would have copied it
+		// into a replacement table that `rollback` then discards, losing it.
+		expect(await rows(db, `select * from t`), 'committed row survives the rejected ALTER + rollback')
+			.to.deep.equal([{ a: 5, b: 5, v: 'pre' }]);
+		expect(await pkColumns(db), 'primary key still unchanged after rollback').to.deep.equal(['a']);
+	});
 });
 
 // ── Wrapper-specific: a constraint declared INLINE on an added column.

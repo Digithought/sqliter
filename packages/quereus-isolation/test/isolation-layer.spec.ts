@@ -6475,7 +6475,7 @@ describe('IsolationModule — ALTER PRIMARY KEY over per-connection overlays', (
 		let err: unknown;
 		try { await iso.alterTable(dbA, 'main', 't', alterPkToX); } catch (e) { err = e; }
 		expect(err, 'issuer with staged rows must be rejected').to.be.instanceOf(QuereusError);
-		expect((err as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+		expect((err as QuereusError).code).to.equal(StatusCode.BUSY);
 		expect((err as QuereusError).message).to.match(/primary key/i);
 
 		// Atomic: the underlying was never asked to mutate, and A's overlay is intact.

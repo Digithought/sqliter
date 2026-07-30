@@ -1335,10 +1335,16 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// stranding rows it cannot re-key. Foreign overlays with staged rows are poisoned
 		// after the underlying applies, and clean overlays are swapped for a fresh staging
 		// table (see replaceOverlayForPrimaryKeyChange).
+		//
+		// BUSY, not UNSUPPORTED: this is retryable pending state, not a missing capability.
+		// The engine treats an UNSUPPORTED `alterTable` refusal as "use the shadow-table
+		// rebuild fallback" (see runAlterPrimaryKey in runtime/emit/alter-table.ts), which
+		// copies committed rows only — it would silently drop this transaction's staged
+		// writes. See docs/module-authoring.md § alterPrimaryKey.
 		if (change.type === 'alterPrimaryKey' && ownEntry?.[1].hasChanges) {
 			throw new QuereusError(
 				`Cannot alter the primary key of '${schemaName}.${tableName}' while this transaction has uncommitted changes staged for it; commit or roll back first.`,
-				StatusCode.UNSUPPORTED,
+				StatusCode.BUSY,
 			);
 		}
 

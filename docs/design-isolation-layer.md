@@ -870,7 +870,7 @@ Some shapes remain unrepresentable and are refused as retryable `BUSY` — notab
 
 An overlay's layer trees are keyed by the table's **old** primary key, and a staged deletion marker identifies the row it deletes *by that key* — under a new key its identity columns may be placeholder NULLs, i.e. garbage. So `alter primary key` cannot be forwarded to an overlay at all, and gets its own three-way handling:
 
-- **Issuer with staged rows** — rejected `UNSUPPORTED` **before** `underlying.alterTable` runs, so the ALTER fails atomically rather than stranding rows it cannot re-key. The connection commits or rolls back first, then retries.
+- **Issuer with staged rows** — rejected `BUSY` (retryable, not `UNSUPPORTED` — the engine treats `UNSUPPORTED` from `alterTable` as "fall back to a shadow-table rebuild", which copies committed rows only and would silently drop this transaction's staged writes) **before** `underlying.alterTable` runs, so the ALTER fails atomically rather than stranding rows it cannot re-key. The connection commits or rolls back first, then retries.
 - **Foreign overlay with staged rows** — poisoned, exactly as an unconvertible retype poisons one.
 - **Clean overlay (nothing staged)** — swapped for a fresh empty staging table built from the post-alter schema, so the rest of the transaction's writes key by the new primary key. There are no pre-existing staged rows to lose, and the fresh table's connection registers on its first write, which replays the active savepoint stack onto it.
 
