@@ -67,6 +67,8 @@ The `origin` vocabulary (`'implicit-from-unique-constraint'`) lives only on the 
 
 **Introspection.** The implicit covering structure (a UNIQUE constraint's auto-built index) is a backing detail, **omitted from `collectSchemaCatalog` / schema export by default**. It is surfaced only when the originating constraint carries the tag `quereus.expose_implicit_index = true`. Indexes from an explicit `CREATE [UNIQUE] INDEX` are always shown.
 
+**Lifecycle.** The structure's lifecycle belongs to its constraint, not to `CREATE`/`DROP INDEX`, on **every** backend — exposed or not. `isImplicitCoveringIndex(tableSchema, name)` (`catalog.ts`, reading only `uniqueConstraints`, so it answers identically on memory and store) is the predicate three write paths consult: `createIndex` rejects the name as a same-table duplicate, `dropIndex`'s owner scan skips past it and keeps searching, and `emitDropIndex`'s strict-DDL-policy gate skips it for the same reason. `ALTER TABLE … DROP CONSTRAINT` is what removes the structure. See [sql-ddl.md §6.3](sql-ddl.md#63-indexes-on-virtual-tables) for the user-facing rules.
+
 Once exposed, the implicit index is **addressable and introspectable identically across backends** — it appears in `schema()` and `index_info()`, and `ALTER INDEX … {SET|ADD|DROP} TAGS` targets it. Backends differ only in *where the user tags live*: memory materializes the implicit index as an `IndexSchema`, so its tags sit on `IndexSchema.tags`; backends that do not materialize it (the store, which enforces UNIQUE by full-scan over `uniqueConstraints`) derive a synthetic exposed index from the constraint in the read paths (`exposedImplicitIndexes` in `catalog.ts`) and route `ALTER INDEX … TAGS` onto a separate `UniqueConstraintSchema.exposedIndexTags` field. The asymmetry is internal; observable behavior is identical. A *hidden* implicit index (tag absent/false) stays unaddressable (`NOTFOUND`) on both — its tags live on the constraint, reached via `ALTER TABLE … ALTER CONSTRAINT … TAGS`. `exposedIndexTags` survives a store close→reopen via a trailing `alter index … set tags (…)` line in the table's catalog bundle (see [Store catalog persistence](#store-catalog-persistence-bundled-index-ddl)) that `importDDL` re-applies silently on rehydrate. One deliberate divergence: tags are addressable — and *persisted* — only while the constraint is exposed. Dropping the exposure flag (`ALTER TABLE … ALTER CONSTRAINT … DROP TAGS`) leaves `exposedIndexTags` dormant in-session (re-exposing resurrects it), but the bundle emits no `alter index` line for an unexposed constraint, so after a reopen taken while unexposed, re-exposing yields no tags.
 
 ## SchemaManager API
@@ -169,10 +171,11 @@ registry.
 
 Creates a secondary index from a parsed `CreateIndexStmt`:
 1. Validates the target table exists and its module supports `createIndex`
-2. Builds `IndexSchema` from column references
-3. Delegates to `module.createIndex()`
-4. Appends the index to the table's schema
-5. Emits `table_modified` change event
+2. Rejects the name if it is taken on this table — by a materialized `IndexSchema` or by a UNIQUE constraint's implicit covering structure (`IF NOT EXISTS` skips instead) — or, unsuppressibly, by a user index on another table in the schema
+3. Builds `IndexSchema` from column references
+4. Delegates to `module.createIndex()`
+5. Appends the index to the table's schema
+6. Emits `table_modified` change event
 
 #### `dropTable(schemaName, tableName, ifExists?): Promise<boolean>`
 

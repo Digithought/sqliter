@@ -3297,6 +3297,13 @@ export class SchemaManager {
 		// once per imported index, so a cold open costs O(indexes × tables). Fine at
 		// present schema sizes; if opening a large catalog ever shows up as slow, build
 		// one name→owner map for the whole import instead of re-scanning per index.
+		//
+		// NOTE: this path deliberately does NOT consult `isImplicitCoveringIndex`, so a
+		// catalog written before `createIndex` refused a name held by that table's own
+		// UNIQUE constraint still imports its shadowing index — after which the name
+		// resolves to a real index that `dropIndex` then refuses to drop. Only reachable
+		// by opening such a pre-existing database; if that ever needs handling, reject or
+		// rename the shadowing index here rather than loosening the write-path guards.
 		const collidingOwner = this.findIndexNameOwnerElsewhere(targetSchemaName, tableSchema.name, indexName);
 		if (collidingOwner) {
 			warnLog(

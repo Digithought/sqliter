@@ -178,6 +178,43 @@ create index uq_email on iul_a (email);
 drop index uq_email;
 -- run
 
+-- ============================================================
+-- 8. The strict-DDL-policy gate skips implicit structures the same way
+-- ============================================================
+-- `emitDropIndex` resolves the owning table before the `ddl_transaction_policy`
+-- gate fires, so its scan must apply the same skip. A name held ONLY by a
+-- constraint's structure has no droppable owner, so the statement fails with
+-- `no such index` and never reaches the gate; a real index of that name on
+-- another table IS found past the skip, so the gate does fire for it.
+
+pragma ddl_transaction_policy = 'strict';
+-- run
+
+-- Allowed in autocommit; iul_b still carries the `uq_shared` constraint.
+create index uq_shared on iul_c (email);
+-- run
+
+begin;
+-- run
+drop index uq_shared;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
+begin;
+-- run
+drop index UQ_Email;
+-- error: no such index
+rollback;
+-- run
+
+pragma ddl_transaction_policy = 'permissive';
+-- run
+
+-- The gate refused rather than dropped: the index is still there.
+drop index uq_shared;
+-- run
+
 drop table iul_c;
 drop table iul_b;
 drop table iul_z;

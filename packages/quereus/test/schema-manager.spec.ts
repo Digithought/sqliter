@@ -766,6 +766,31 @@ describe('Schema Manager', () => {
 			expect(db.schemaManager.findTable('a')!.uniqueConstraints!.map(uc => uc.name)).to.deep.equal(['uq_email']);
 		});
 
+		it('should keep the skip-past-implicit scan inside one schema', async () => {
+			// The scan walks one schema's tables, so aux's real `uq_email` must NOT be
+			// reachable from main just because main's only match was skipped.
+			db.schemaManager.addSchema('aux');
+			await db.exec('create table main.t (id integer primary key, email text, constraint uq_email unique (email))');
+			await db.exec('create table aux.t2 (id integer primary key, email text)');
+			await db.exec('create index uq_email on aux.t2 (email)');
+
+			let error: Error | undefined;
+			try {
+				await db.exec('drop index uq_email');
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error, "aux's index must not be reachable from main").to.exist;
+			expect(error!.message).to.match(/no such index/);
+			expect(db.schemaManager.getTable('aux', 't2')!.indexes!.map(i => i.name)).to.deep.equal(['uq_email']);
+
+			// Qualifying the schema reaches it, and main's constraint stays intact.
+			await db.exec('drop index aux.uq_email');
+			expect(db.schemaManager.getTable('aux', 't2')!.indexes ?? []).to.have.lengthOf(0);
+			expect(db.schemaManager.getTable('main', 't')!.uniqueConstraints!.map(uc => uc.name)).to.deep.equal(['uq_email']);
+			expect(db.schemaManager.getTable('main', 't')!.indexes!.map(i => i.name)).to.deep.equal(['uq_email']);
+		});
+
 		it('should leave DROP INDEX unambiguous once the collision is rejected', async () => {
 			await db.exec('create table t1 (id integer primary key, note text)');
 			await db.exec('create table t2 (id integer primary key, note text)');
