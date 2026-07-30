@@ -378,7 +378,7 @@ One statement raises **no** data events even though it moves every row: `ALTER T
 PRIMARY KEY` on a backend that cannot re-key in place falls back to an engine-internal rebuild
 (copy every row into a shadow table with the new key, then swap it in), and that rebuild is
 deliberately silent on all three channels. A re-key changes no row, so announcing the copy as a
-row-per-`insert` would be wrong. See [`sql-ddl.md`](sql-ddl.md) § ALTER PRIMARY KEY. Both
+row-per-`insert` would be wrong. See [`sql-alter.md`](sql-alter.md) § ALTER PRIMARY KEY. Both
 built-in modules re-key in place and never take that path.
 
 `changedColumns` is present on an update event only if the owning module supplies it — the
@@ -456,7 +456,7 @@ alongside the `create` / `drop` events the same apply already raised.
 
 `ALTER TABLE … ALTER PRIMARY KEY` on a backend that cannot re-key in place reports its one
 `alter`/`table` event like any other backend, but stays silent about the engine-internal rebuild
-that carries it out (see above, and [`sql-ddl.md`](sql-ddl.md) § ALTER PRIMARY KEY): that rebuild
+that carries it out (see above, and [`sql-alter.md`](sql-alter.md) § ALTER PRIMARY KEY): that rebuild
 runs with this channel suppressed, so a subscriber that mirrors the catalog is never told that a
 machine-named `<table>__rekey_<ms>` shadow table was created and the real one dropped — neither
 of which is a change the application made.

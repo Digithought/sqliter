@@ -36,6 +36,7 @@
 		"docs/runtime-caching.md": "Internal",
 		"docs/runtime.md": "Internal",
 		"docs/schema.md": "Beta",
+		"docs/sql-alter.md": "Stable",
 		"docs/sql-ddl.md": "Stable",
 		"docs/sql-dml.md": "Stable",
 		"docs/sql-functions.md": "Stable",

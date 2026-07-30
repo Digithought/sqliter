@@ -35,7 +35,8 @@ Key features:
 | --- | --- |
 | [SELECT, clauses & expressions](sql-select.md) | Query expressions, `SELECT`, `FROM` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`, CTEs (`WITH`), operators and functions-in-expressions. |
 | [Data manipulation (DML)](sql-dml.md) | `INSERT`, `UPDATE`, `DELETE`, conflict resolution (`OR` clause), UPSERT (`ON CONFLICT`), and `RETURNING` with `NEW` / `OLD`. |
-| [Schema definition (DDL)](sql-ddl.md) | Declarative schema, `CREATE` / `ALTER TABLE`, assertions, mutation context, metadata tags, virtual tables, constraints and indexes. |
+| [Schema definition (DDL)](sql-ddl.md) | Declarative schema, `CREATE TABLE`, assertions, mutation context, metadata tags, virtual tables, constraints and indexes. |
+| [Schema modification (ALTER)](sql-alter.md) | `ALTER TABLE` — rename, add / drop / alter column, constraints, primary key, maintained lifecycle — and the tag verbs on views, materialized views, and indexes. |
 | [Views & materialized views](sql-views.md) | `CREATE VIEW`, updatable views, `CREATE MATERIALIZED VIEW`, logical schemas and lenses. |
 | [Functions](sql-functions.md) | Scalar, aggregate, JSON, date/time, window, and table-valued functions. |
 | [Transactions & PRAGMA](sql-txn.md) | `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints, and `PRAGMA` statements. |

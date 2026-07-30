@@ -69,7 +69,7 @@ The `origin` vocabulary (`'implicit-from-unique-constraint'`) lives only on the 
 
 **Lifecycle.** The structure's lifecycle belongs to its constraint, not to `CREATE`/`DROP INDEX`, on **every** backend — exposed or not. `isImplicitCoveringIndex(tableSchema, name)` (`catalog.ts`, reading only `uniqueConstraints`, so it answers identically on memory and store) is the predicate the write paths consult: `createIndex` rejects the name as a same-table duplicate, and `SchemaManager.findIndexOwner` — the single by-name owner resolver behind `dropIndex`, `emitDropIndex`'s strict-DDL-policy gate, the `createIndex` uniqueness check and sync's replicated index DDL — skips past such a match and keeps searching at its default `'user-indexes'` scope. (`ALTER INDEX … TAGS` asks for the wider `'tag-addressable'` scope, which admits an *exposed* structure but still skips a hidden one.) `ALTER TABLE … DROP CONSTRAINT` is what removes the structure. See [sql-ddl.md §6.3](sql-ddl.md#63-indexes-on-virtual-tables) for the user-facing rules.
 
-Once exposed, the implicit index is **addressable and introspectable identically across backends** — it appears in `schema()` and `index_info()`, and `ALTER INDEX … {SET|ADD|DROP} TAGS` targets it. Backends differ only in *where the user tags live*: memory materializes the implicit index as an `IndexSchema`, so its tags sit on `IndexSchema.tags`; backends that do not materialize it (the store, which enforces UNIQUE by full-scan over `uniqueConstraints`) derive a synthetic exposed index from the constraint in the read paths (`exposedImplicitIndexes` in `catalog.ts`) and route `ALTER INDEX … TAGS` onto a separate `UniqueConstraintSchema.exposedIndexTags` field. The asymmetry is internal; observable behavior is identical. A *hidden* implicit index (tag absent/false) stays unaddressable (`NOTFOUND`) on both — its tags live on the constraint, reached via `ALTER TABLE … ALTER CONSTRAINT … TAGS`. `exposedIndexTags` survives a store close→reopen via a trailing `alter index … set tags (…)` line in the table's catalog bundle (see [Store catalog persistence](#store-catalog-persistence-bundled-index-ddl)) that `importDDL` re-applies silently on rehydrate. One deliberate divergence: tags are addressable — and *persisted* — only while the constraint is exposed. Dropping the exposure flag (`ALTER TABLE … ALTER CONSTRAINT … DROP TAGS`) leaves `exposedIndexTags` dormant in-session (re-exposing resurrects it), but the bundle emits no `alter index` line for an unexposed constraint, so after a reopen taken while unexposed, re-exposing yields no tags.
+Once exposed, the implicit index is **addressable and introspectable identically across backends** — it appears in `schema()` and `index_info()`, and `ALTER INDEX … {SET|ADD|DROP} TAGS` targets it. Backends differ only in *where the user tags live*: memory materializes the implicit index as an `IndexSchema`, so its tags sit on `IndexSchema.tags`; backends that do not materialize it (the store, which enforces UNIQUE by full-scan over `uniqueConstraints`) derive a synthetic exposed index from the constraint in the read paths (`exposedImplicitIndexes` in `catalog.ts`) and route `ALTER INDEX … TAGS` onto a separate `UniqueConstraintSchema.exposedIndexTags` field. The asymmetry is internal; observable behavior is identical. A *hidden* implicit index (tag absent/false) stays unaddressable (`NOTFOUND`) on both — its tags live on the constraint, reached via `ALTER TABLE … ALTER CONSTRAINT … TAGS`. `exposedIndexTags` survives a store close→reopen via a trailing `alter index … set tags (…)` line in the table's catalog bundle (see [Store catalog persistence](store.md#catalog-persistence-bundled-index-ddl)) that `importDDL` re-applies silently on rehydrate. One deliberate divergence: tags are addressable — and *persisted* — only while the constraint is exposed. Dropping the exposure flag (`ALTER TABLE … ALTER CONSTRAINT … DROP TAGS`) leaves `exposedIndexTags` dormant in-session (re-exposing resurrects it), but the bundle emits no `alter index` line for an unexposed constraint, so after a reopen taken while unexposed, re-exposing yields no tags.
 
 ## SchemaManager API
 
@@ -107,7 +107,7 @@ Once exposed, the implicit index is **addressable and introspectable identically
 | `findSchemasContainingTable(tableName)` | Returns all schema names containing the table — useful for error messages |
 | `findFunction(funcName, nArg)` | Finds a function by name and argument count |
 
-**Persistence of catalog-only tag swaps (store-backed tables).** The tag setters above (and `ALTER … SET TAGS`) are catalog-only — they swap the in-memory schema and fire a change event but deliberately do **not** call `module.alterTable`. The generic store module (`@quereus/store`) re-persists them anyway by subscribing to `table_modified` and re-writing the table's catalog DDL (`generateTableDDL`) whenever the serialized form changes, so **table**, **column**, and **named-constraint** tags survive close → reopen → `rehydrateCatalog` for `using store` tables. The re-write is a read-compare-write keyed by `{schema}.{table}`: a table with no catalog entry (a memory table, or a store table never persisted) is skipped, and a structural ALTER — whose own `alterTable` already wrote the final DDL — produces identical bytes and is skipped (no double-write). The same subscription persists **views** and **materialized views** (and, via a trailing `alter index … set tags` line, an exposed implicit index's tags) — see [Store catalog persistence](#store-catalog-persistence-bundled-index-ddl) and [View and materialized-view persistence](#view-and-materialized-view-persistence).
+**Persistence of catalog-only tag swaps (store-backed tables).** The tag setters above (and `ALTER … SET TAGS`) are catalog-only — they swap the in-memory schema and fire a change event but deliberately do **not** call `module.alterTable`. The generic store module (`@quereus/store`) re-persists them anyway by subscribing to `table_modified` and re-writing the table's catalog DDL (`generateTableDDL`) whenever the serialized form changes, so **table**, **column**, and **named-constraint** tags survive close → reopen → `rehydrateCatalog` for `using store` tables. The re-write is a read-compare-write keyed by `{schema}.{table}`: a table with no catalog entry (a memory table, or a store table never persisted) is skipped, and a structural ALTER — whose own `alterTable` already wrote the final DDL — produces identical bytes and is skipped (no double-write). The same subscription persists **views** and **materialized views** (and, via a trailing `alter index … set tags` line, an exposed implicit index's tags) — see [Store catalog persistence](store.md#catalog-persistence-bundled-index-ddl) and [View and materialized-view persistence](#view-and-materialized-view-persistence).
 
 ### DDL Operations
 
@@ -302,245 +302,12 @@ A **synthesized all-columns key** (a table with no declared PRIMARY KEY) emits *
 import { generateTableDDL } from '@quereus/store';
 ```
 
-### Store catalog persistence (bundled index DDL)
+### Store catalog persistence
 
-`@quereus/store` persists each table's secondary indexes **inside the same
-catalog entry as the table**, keyed `{schema}.{table}` (no per-index key
-namespace). The entry is a newline-joined bundle: the `CREATE TABLE` statement
-first, then one `CREATE [UNIQUE] INDEX` line per persistable index, then one
-`alter index … set tags (…)` line per *exposed implicit index* carrying user
-tags:
-
-```
-CREATE TABLE "main"."t" (...) USING store
-CREATE INDEX "ix_b" ON "main"."t" ("b")
-CREATE UNIQUE INDEX "uq_email" ON "main"."t" ("email" COLLATE NOCASE) WHERE "email" IS NOT NULL
-alter index main.uq_vin set tags (purpose = 'lookup')
-```
-
-`StoreModule.buildCatalogEntry` produces the bundle (table DDL + every index DDL,
-both in the persistence-safe no-`db` form; the `alter index` lines via
-`generateIndexTagsDDL`, a schema→AST-lift over the shared `alterIndexToString`
-emitter — its lowercase keywords are cosmetic, both forms re-parse). Hidden
-implicit covering indexes (the auto-built BTree backing a declared inline
-`UNIQUE`) are excluded — they round-trip via the table's `UNIQUE` constraint,
-not as a standalone `CREATE INDEX`. An *exposed* implicit index is likewise
-never emitted as a `CREATE INDEX` (a re-import would materialize a real
-`IndexSchema`, changing the store-mode shape); only its user tags
-(`UniqueConstraintSchema.exposedIndexTags`) persist, as a whole-set
-`alter index … set tags` statement (the canonical replace form; empty tag records
-emit no line). On reopen, `rehydrateCatalog` feeds each bundle to
-`importCatalog`, whose `parser.parseAll` splits it by AST (never on `\n`, so a
-newline inside a `DEFAULT` / `CHECK` / partial-predicate string literal is safe)
-and imports table-before-indexes; the trailing `alter index` lines re-apply
-silently (no change event, no import-result entry) against the just-imported
-table, whose `CREATE TABLE` earlier in the bundle carries the constraint and its
-exposure flag.
-
-**Why bundle rather than a per-index key:** every existing re-persist path carries
-the indexes for free —
-
-- `CREATE INDEX` / `DROP INDEX` rewrite the bundle (`StoreModule.createIndex` /
-  `dropIndex` call `saveTableDDL` after updating the connected table's schema).
-- `DROP TABLE` deletes the single key, so the indexes vanish with it (no orphan
-  catalog entries).
-- `RENAME TABLE` regenerates the bundle under the new name (index DDL references
-  the renamed table automatically).
-- `ALTER INDEX … SET/ADD/DROP TAGS` fires `table_modified` on the *owning* table;
-  the store's catalog listener regenerates the bundle (index tags live in
-  `tableSchema.indexes`; exposed-implicit-index tags on the originating
-  constraint's `exposedIndexTags`) with no index-specific plumbing.
-- Structural ALTERs that reindex columns already re-persist the table, so the
-  bundle's index lines track the reindexed columns.
-- `RENAME TABLE` / `RENAME COLUMN` rewrite every self-naming part of the table's own
-  definition — partial-index `WHERE` predicates, `CHECK` expressions, and a
-  self-referencing foreign key's target — **before** writing the bundle, from inside
-  the module's own hook. The engine's rename propagation runs only after the hook
-  returns, so a module that persisted first would durably write a definition naming the
-  pre-rename table or column, and a crash in that window strands an un-rehydratable bundle
-  on disk. The expression rewrites are idempotent and mutate the AST in place (shared by
-  reference with the catalog schema and with a unique partial index's derived `UNIQUE`
-  constraint), so the later propagation pass finds nothing to change and its event
-  compare-skips; the foreign-key retarget is a copy, since it touches a name field
-  rather than an AST.
-- `RENAME TABLE` also rewrites the renamed table's own definition **inside the engine**,
-  before the catalog swap and the `table_modified` notify (`runRenameTable`) — otherwise
-  the store's catalog listener, firing on that notify, re-persists a bundle whose self-FK
-  still points at the vanished old name, a second durable stale write the module's hook
-  cannot prevent.
-- `RENAME TABLE` corrects **other** objects too — a cross-schema FK, a `CHECK` expression,
-  a view or materialized-view body naming the renamed table — which live in *other*
-  catalog entries the module's single-table hook cannot know about. The engine rewrites them
-  in its post-hook propagation (`propagateTableRename`), which enqueues their corrective
-  catalog writes. So that a crash cannot strand a dependent naming a vanished table, the
-  rename is **two-phase** at the module boundary: `module.renameTable` writes the
-  new entry and moves physical storage but leaves the **old** name's catalog entry in place;
-  the engine then calls `module.finalizeRename` at the end of `runRenameTable`, after
-  propagation, and the store drains the dependents' writes to durability **before** deleting
-  the old entry. Both entries coexist on disk during the window, so every
-  intermediate catalog set rehydrates into a working database. The guarantee is
-  *"no durable catalog set ever names a vanished table"* — short of full cross-table atomicity
-  (see best-effort residue below).
-
-**Reattach, not rebuild.** The physical index KV store survives a logical close,
-so rehydrate does **not** scan rows to rebuild it. After the import loop,
-`rehydrateCatalog` refreshes each connected `StoreTable`'s cached schema from the
-now-current registry (import updates the registry, not the live table instance), so
-DML maintains the rehydrated index and the derived `UNIQUE` enforces. The backing
-store is reattached lazily on first access via `provider.getIndexStore`. Partial
-indexes are maintained on DML too: the index-update path honors the index `WHERE`
-predicate, matching the build-time filtering.
-
-**Best-effort durability.** Persistence follows the store's best-effort contract:
-if the catalog write fails after a `CREATE INDEX` built the physical index store,
-the in-memory schema has the index but the catalog does not, so on reopen the
-index is missing and its store is orphaned — no two-phase protocol here.
-
-The `RENAME TABLE` `finalizeRename` protocol (above) orders the *catalog* writes but
-does not make the whole rename atomic. Two accepted residues remain, both safer than the
-"child cannot be written to" failure they replace, neither occurring on a clean
-(crash-free) rename:
-
-- **Physical-move orphan.** `renameTableStores` *moves* (not copies) the old table's data
-  store into the new name inside `renameTable`, while the old catalog entry is still present.
-  A crash there, then reopen, rehydrates the old name as an **empty** table (a fresh store
-  is minted on connect) — a visible, droppable orphan.
-- **Old-entry delete failure.** The deferred old-entry delete is best-effort (logged, not
-  fatal); a failure leaves both entries on disk — again a droppable orphan, not a stranded
-  dependent.
-
-Full cross-table atomicity would remove even these residues; it is unimplemented — see
-`docs/todo.md`.
-
-**Per-column PK key collation.** The store enforces PRIMARY KEY uniqueness/ordering
-*physically* in the key bytes, encoding each PK column under its own declared collation
-(`StoreTable.pkKeyCollations` — `BINARY` / `NOCASE` / `RTRIM`, the registered key
-encoders). So **any** declared PK collation is honored natively (`x text collate binary
-primary key` keys under BINARY, `collate nocase` under NOCASE), at parity with the memory
-module. The table-level key collation K (`config.collation`, `BINARY` or `NOCASE`, default
-`NOCASE`) is only a **default** for an undecorated PK column whose logical type is
-`isTextual` (i.e. `text`), plus the collation used for secondary-index *column* values. The
-schema entry points:
-
-- **A PK column that can hold text but is not `isTextual`** — `any`, `json`, and the
-  temporal types `date` / `time` / `datetime` / `timespan` — is keyed under **hard-coded
-  `BINARY`**, never under its declared collation and never under K. Each of these types
-  supplies its own `compare`, and none lets the collation argument `createTypedComparator`
-  hands it influence the result (`TEXT_TYPE.compare` is the only one that applies it). Keying
-  such a column under anything but BINARY would enforce uniqueness under one collation and
-  compare under another — `'A'` and `'a'` are distinct BINARY values that would collide at one
-  NOCASE key, so a second `insert` would be spuriously rejected and an `insert or replace`
-  would silently destroy the first row.
-  `create table t (k any collate nocase primary key)` is *accepted* (`NOCASE` is a registered
-  built-in, so it passes the registry-aware column-DDL gate on `ANY_TYPE`, which declares no
-  supported-collation list; an *unregistered* name is rejected there), but the
-  `nocase` is inert — honored neither in the key bytes nor in the comparison. Its one cost:
-  `pkOrderPreservingPrefixLength` finds the BINARY key collation unequal to the declared
-  NOCASE and conservatively declines the range seek — an optimization lost, never a row.
-
-- **What the PK-order advertisement is measured against.** A range seek and a
-  `providesOrdering` advertisement claim that memcmp over the key bytes reproduces the order
-  the planner's `Sort` would have produced. `Sort`, like every scalar comparison in the engine,
-  orders under the operand's *collation* (`compareSqlValuesFast`), never through
-  `logicalType.compare`. So BINARY key bytes are order-faithful for these columns even where
-  the type's own `compare` disagrees (`TIMESPAN.compare` ranks by `Temporal.Duration` total,
-  `JSON_TYPE.compare` structurally — neither runs under `order by` or `where`). `MemoryTable`
-  is the exception: its primary-key BTree *is* keyed by `createTypedComparator`, so it
-  advertises an order its own `Sort` disagrees with — a memory-module defect, not a contract
-  the store must match.
-
-- **CREATE.** `module.create` applies the store default K to an *implicit*-default text PK
-  column (the engine's BINARY column default becomes NOCASE under K = NOCASE), so an
-  undecorated text PK keeps the store's NOCASE-keyed behavior; an *explicit*
-  `COLLATE` clause — even one diverging from K — is left exactly as declared and keyed
-  under it. So `create table t (x text primary key)` yields **BINARY under memory**
-  (`'a'` and `'A'` distinct) and **NOCASE under the store** (they collide). This is
-  intentional: memory honors the session `default_collation` (BINARY out of box, via
-  `resolveDefaultCollation` in `quereus/src/schema/table.ts`) while the store preserves its
-  on-disk NOCASE semantics for undecorated text PKs. An authored lens (bijection inverse)
-  for a text PK is therefore read-only under the store default but writable under memory,
-  because the value-discriminating check needs BINARY-level distinct `'a'`/`'A'` to prove
-  injectivity. (The explicit-vs-implicit distinction rides on `ColumnSchema.collationExplicit`,
-  set by `columnDefToSchema` for a `COLLATE` clause and — for a **materialized-view backing
-  column** — by `deriveBackingShape` (`materialized-view-helpers.ts`) when the body output
-  column's collation provenance is `explicit` or `declared`. So an MV key column publishing a deliberate
-  collation — an explicit `collate …` projection or a passthrough of a declared-collation
-  source column — is keyed under it across the reconcile, while a genuinely-implicit MV
-  column keeps the store-default reconcile, like an undecorated base-table PK.) Non-text PK columns (e.g. `integer primary key`) keep their declared
-  collation — collation governs key bytes only for text.
-- **Load path (`connect` / rehydrate).** The load path does **not** reconcile — the
-  persisted DDL is the source of truth. The per-column key collation round-trips through
-  the column's `COLLATE` clause (`generateTableDDL` elides the default `BINARY`, emits
-  any non-`BINARY` collation explicitly), and the engine import path defaults a
-  no-`COLLATE` column to `BINARY`, so the reloaded collation matches what the physical
-  keys were written under. (A persisted DDL whose declared collation does not match its
-  key bytes loads as-declared — see `store-pk-collate-legacy-reopen-divergence`.)
-- **`ALTER COLUMN … SET COLLATE` on a PK column** is honored by a **physical re-key**:
-  `StoreTable.rekeyRows` re-encodes every data-store key under the column's new collation
-  and `rebuildSecondaryIndexes` rebuilds each secondary index (whose keys embed the PK
-  suffix). A re-key that would collide under the new collation (e.g. `'a'`/`'A'` distinct
-  under BINARY but colliding under NOCASE) throws `CONSTRAINT` in the validation pass
-  **without mutating the store** — all-or-nothing, mirroring `ALTER PRIMARY KEY`. A target
-  equal to the column's current collation is a schema-only no-op (no re-key).
-
-The store carries no on-disk format version stamp and no rebuild-on-open path: a store whose
-non-textual PK bytes were written under any collation but BINARY must be recreated.
-
-See [`docs/sql.md` § ALTER COLUMN](sql-ddl.md#27-alter-table-statement) for the
-full SET COLLATE contract, including the non-PK UNIQUE re-validation. Physical key bytes
-and existing-row dedup both resolve the collation's key normalizer against the connection's
-registry, so a custom or overridden collation is honored; a comparator-only collation
-(no `normalizer`) is rejected rather than silently keyed under someone else's bytes.
-
-**JSON (OBJECT-class) PK / index key encoding.** A JSON value keyed as a PK or index
-column encodes through a **canonical JSON string** (`canonicalJsonString` from
-`@quereus/quereus` — recursive object-key sort, array order preserved), not a bare
-`JSON.stringify`. So reorder-equal objects encode to identical key bytes and collide as one
-row (matching `deepCompareJson` and the memory module), while array order stays
-significant. The canonical form governs only the *key* bytes — the stored/displayed row
-value keeps its insertion order (rows round-trip through `serializeRow`/`deserializeRow`,
-independent of the key). Collation still applies to the canonical string as for text.
-
-**Index-derived UNIQUE enforcement collation.** A `CREATE UNIQUE INDEX … (col COLLATE x)`
-synthesizes a `derivedFromIndex` UNIQUE constraint whose DML enforcement resolves each
-column's comparison collation from the **index's** per-column `COLLATE` clause (falling
-back to the declared column collation when the index column carries none) —
-`StoreTable.uniqueEnforcementCollations`, matching memory's `checkUniqueViaIndex`, the
-store's own `buildIndexEntries` build-time dedup, and SQLite (a unique index enforces
-under the index's collation). So a *finer* index (`COLLATE BINARY` over a `NOCASE` column)
-admits case-variants the column would unify, and a *coarser* index (`COLLATE NOCASE` over a
-`BINARY` column) unifies case-variants the column would keep distinct. When **two** UNIQUE
-indexes cover the same column-set with differing collations, each derived constraint enforces
-under **its own** index's collation regardless of creation order — both backends resolve the
-enforcing index BY NAME (memory's `findIndexForConstraint` off `uc.derivedFromIndex`; the
-store's by-name `uniqueEnforcementCollations`), where a by-column-set resolution would collapse
-both onto the first-listed index and under-enforce the coarser one
-(`memory-multi-index-unique-collation-resolution`). `ALTER COLUMN … SET
-COLLATE` on a column under such an index propagates the new collation into the index
-column (metadata-only — the store's index *key* bytes use the table-level collation K, so
-no entry re-encode is required), mirroring memory.
-
-A non-derived (table-level / column) UNIQUE always enforces under the declared column
-collation, even when a *finer* same-column-set `CREATE UNIQUE INDEX` exists (either DDL
-order). Memory does **not** reuse that finer index as the constraint's realizing structure:
-it builds the constraint's own declared-collation covering index and resolves the non-derived
-UC to it BY NAME (via `getImplicitCoveringStructure`), so the two indexes coexist and each
-enforces its own equivalence — matching SQLite and the store, which never reused the user
-index (`memory-nonderived-unique-reused-finer-index-under-enforcement`). When a row-time
-covering materialized view is *also* linked to such a constraint, a finer/incomparable index
-collation disqualifies the MV from answering it (see the [covering-MV collation eligibility
-gate](mv-constraints.md#enforcement-through-a-covering-mv)), so enforcement falls back to
-this per-scan / auto-index path, still under the index collation. That gate reads the same
-`index.columns[i].collation` this resolver does, so the two stay consistent across an `ALTER
-COLUMN … SET COLLATE`.
-
-A **semantic-ordering** column (TIMESPAN, JSON — see [types.md § Semantic
-ordering](types.md#semantic-ordering)) is the one exception: its enforcement comparison is
-the declared type's `compare`, so neither the index nor the column `COLLATE` participates
-and `'PT1H'`/`'PT60M'` conflict under any collation. The resolved collation is still passed
-to the type's `compare` (types whose ordering is partly textual may consult it). Every
-backend builds these comparators from the resolved collations through one helper,
-`uniqueEnforcementComparators` (`schema/unique-enforcement.ts`).
+How `@quereus/store` durably persists table, index, constraint and tag state — the
+bundled `CREATE TABLE` + index DDL catalog entry, its rehydration, and the rename
+protocol that orders those writes — lives in
+[store.md § Catalog persistence](store.md#catalog-persistence-bundled-index-ddl).
 
 ### View and materialized-view persistence
 
@@ -915,7 +682,7 @@ For **column renames this is correctness-critical, not just churn-avoidance**: `
 
 #### Tag-drift detection
 
-`computeTableAlterDiff` also detects **metadata-tag drift** at three sites — the table (`TableAlterDiff.tableTagsChange`), each surviving column (`ColumnAttributeChange.tags`, computed in `computeColumnAttributeChange`), and each name-matched named constraint (`TableAlterDiff.constraintTagsChanges`). The schema hash deliberately excludes tags, so drift is detected **structurally** (an order-independent `stableStringify` compare) rather than via the hash. The rename-hint keys `quereus.id` and `quereus.previous_name` are excluded (they drive rename detection, not data state, so a hint-only declaration does not churn a `SET TAGS` after the rename); all other reserved tags (`quereus.lens.*`, `quereus.expose_implicit_index`, …) *are* compared. `generateMigrationDDL` emits the drift as `ALTER TABLE … SET TAGS (…)` / `ALTER TABLE … ALTER COLUMN … SET TAGS (…)` / `ALTER TABLE … ALTER CONSTRAINT … SET TAGS (…)` **after** the structural ALTER phases, so a tag set lands on the post-rename column / constraint name. These `SET TAGS` mutations are **catalog-only** (in-memory swap plus `table_modified`, no `module.alterTable`), and table / column / named-constraint / index / view / materialized-view tag mutations all survive reconnect for store tables through the store's event subscription — see [Store catalog persistence](#store-catalog-persistence-bundled-index-ddl). The same in-place catalog path backs the imperative per-key `ALTER TABLE … ADD TAGS` / `DROP TAGS` ergonomics, which the differ never emits (it always computes the full desired set and emits whole-set `SET TAGS`).
+`computeTableAlterDiff` also detects **metadata-tag drift** at three sites — the table (`TableAlterDiff.tableTagsChange`), each surviving column (`ColumnAttributeChange.tags`, computed in `computeColumnAttributeChange`), and each name-matched named constraint (`TableAlterDiff.constraintTagsChanges`). The schema hash deliberately excludes tags, so drift is detected **structurally** (an order-independent `stableStringify` compare) rather than via the hash. The rename-hint keys `quereus.id` and `quereus.previous_name` are excluded (they drive rename detection, not data state, so a hint-only declaration does not churn a `SET TAGS` after the rename); all other reserved tags (`quereus.lens.*`, `quereus.expose_implicit_index`, …) *are* compared. `generateMigrationDDL` emits the drift as `ALTER TABLE … SET TAGS (…)` / `ALTER TABLE … ALTER COLUMN … SET TAGS (…)` / `ALTER TABLE … ALTER CONSTRAINT … SET TAGS (…)` **after** the structural ALTER phases, so a tag set lands on the post-rename column / constraint name. These `SET TAGS` mutations are **catalog-only** (in-memory swap plus `table_modified`, no `module.alterTable`), and table / column / named-constraint / index / view / materialized-view tag mutations all survive reconnect for store tables through the store's event subscription — see [Store catalog persistence](store.md#catalog-persistence-bundled-index-ddl). The same in-place catalog path backs the imperative per-key `ALTER TABLE … ADD TAGS` / `DROP TAGS` ergonomics, which the differ never emits (it always computes the full desired set and emits whole-set `SET TAGS`).
 
 The differ detects the same drift on the other tagged catalog objects — **views**, **materialized views**, and **indexes** — on a name-matched object (no rename), surfacing it through `SchemaDiff.viewTagsChanges` / `materializedViewTagsChanges` / `indexTagsChanges`. `generateMigrationDDL` emits these as `ALTER VIEW … SET TAGS` / `ALTER MATERIALIZED VIEW … SET TAGS` / `ALTER INDEX … SET TAGS` (leaf metadata writes in the alter phase). A view or materialized-view **tag-only** change takes this in-place path instead of a drop+recreate — an MV does **not** re-materialize the body; a definition change still drops+recreates (carrying the declared tags — see [View / materialized-view definition-change detection](#view--materialized-view-definition-change-detection-droprecreate)), and the two are mutually exclusive per object. The view / MV setters re-register the in-memory schema object (firing `view_modified` / `materialized_view_modified` — distinct from the create events, so they invalidate cached write-through plans without re-registering maintenance); the index setter swaps the owning table's `IndexSchema` and fires `table_modified`. These setters likewise back the imperative per-key `ALTER VIEW` / `ALTER MATERIALIZED VIEW` / `ALTER INDEX … ADD TAGS` / `DROP TAGS` ergonomics.
 

@@ -1,0 +1,195 @@
+# SQL Schema Modification — ALTER
+
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
+The `ALTER` statements: restructuring an existing table, and the tag verbs on views,
+materialized views, and indexes. Creation and the declarative pipeline live in
+[SQL Schema Definition — DDL](sql-ddl.md).
+
+## 2.7 ALTER TABLE Statement
+
+Modifies an existing table's structure or name.
+
+**RENAME TABLE**
+
+```sql
+ALTER TABLE old_name RENAME TO new_name;
+```
+
+Renames a table. The old name becomes invalid immediately. Fails if the new name already exists. References to the old name in dependent objects are rewritten in place: CHECK expressions on every table in the schema, FOREIGN KEY `referencedTable` entries (across all schemas), partial-index `WHERE` predicates (a table-qualified self-reference like `where t.active = 1` follows the rename, including in the derived UNIQUE constraint of a unique partial index, which shares the predicate AST), view bodies (`selectAst` and the cached `sql` text), view/MV `with defaults` clauses (now stored inside the body select, so an expr subquery referencing the renamed table is rewritten by the body walk — a clause-only rewrite still fires the modified event), and materialized-view bodies (which additionally re-key their derived fields and re-register row-time maintenance, staying live — see [mv-schema-change.md § Rename propagation](mv-schema-change.md#rename-propagation-mv--faster-view)). The rewrite is best-effort AST replacement — a CTE that intentionally shadowed the old name is not preserved.
+
+A rename inside a transaction also follows any **deferred constraint check** the transaction has already parked (a `deferrable initially deferred` FK evaluates at `COMMIT`, against a plan compiled when the row was written). Each parked check records the renames that happened after it was queued and resolves its table reads through them, so the check still finds the table under its current name at commit — whether the renamed table is the one that owns the row or the one the check reads. The record is per parked check, so a **freed name reused by a fresh table** in the same transaction is not redirected: after `alter table pp rename to pp2; create table pp (...)`, a check parked before the rename still reads the original table (now `pp2`), while anything written afterwards reads the new `pp`.
+
+**RENAME COLUMN**
+
+```sql
+ALTER TABLE table_name RENAME COLUMN old_col TO new_col;
+```
+
+Renames a column. Data is preserved. Fails if the new name conflicts with an existing column or the old name doesn't exist. As with `RENAME TABLE`, references in CHECK expressions, FOREIGN KEY `referencedColumnNames`, partial-index `WHERE` predicates (unqualified and table-qualified refs on the renamed table, resolved against the indexed table the same way an implicit CHECK seed is; the derived UNIQUE constraint of a unique partial index shares the rewritten AST), view bodies, view/MV `with defaults` clauses (stored inside the body select; the clause's target names a base column of the view's FROM table — usually projected away — and rewrites via the same scope-aware synthetic-probe path a `with inverse` target uses, so a clause-only rewrite still fires the modified event; expr subqueries rewrite scope-aware — see [vu-inverses.md § View defaults](vu-inverses.md#view-defaults)), and materialized-view bodies (a bare passthrough projection's exposed output name follows the rename, carried onto the backing table in place — see [mv-schema-change.md § Rename propagation](mv-schema-change.md#rename-propagation-mv--faster-view)) are propagated. Inside dependent SELECTs the rewrite follows scope: unqualified column references resolve when the renamed table (or a CTE that re-exposes the renamed column under the same name) is in the unaliased FROM scope; qualified references resolve via the alias map. A CTE re-exposes the renamed column when it has no explicit column list (`with c as ...` not `with c(x) as ...`) and at least one result column is a passthrough of the renamed column (an unaliased `select k`, `t.k`, or `select *` from the renamed table).
+
+A partial index on the renamed table survives as a **live structure**, not just a catalog entry: the module rewrites the predicate as part of the rename, before rebuilding its index structures against the new column list. If the rewrite or the rebuild fails, the whole `RENAME COLUMN` fails and both the table and the stored predicate are left untouched — a rename never silently loses an index the catalog still advertises.
+
+**ADD COLUMN**
+
+```sql
+ALTER TABLE table_name ADD COLUMN col_name type [constraints];
+```
+
+Adds a new column to the table. Existing rows are backfilled from whatever value source the column declares: its DEFAULT, its `GENERATED ALWAYS AS` expression, or NULL when it has neither. A literal default is bulk-written to every existing row; a non-foldable expression default (including one that reads `new.<column>`) and a generated expression are evaluated **per existing row** against that row — `new.<column>` resolves to that row's own sibling value (the existing-row backfill semantics described under *Default Values* above), and a generated expression's bare column references resolve the same way (see *Generated Columns*). Restrictions:
+
+- Cannot add a PRIMARY KEY column.
+- The backfilled value is **converted to the new column's declared type**, so a backfilled row and a row inserted afterwards under the same DEFAULT hold the same value: `ADD COLUMN n INTEGER DEFAULT '7'` stores the integer `7`, not the text `'7'`. A literal DEFAULT the column's type cannot accept (`ADD COLUMN n INTEGER DEFAULT 'abc'`) fails with `MISMATCH` — the same error the equivalent INSERT gives — whether or not the table has any rows. (`CREATE TABLE` is deliberately laxer: it accepts such a DEFAULT and only fails at the first INSERT.) A per-row expression default converts too, except when its static type already **is** the new column's type — `ADD COLUMN k JSON DEFAULT (new.j)` over an existing `JSON` column copies the stored value rather than re-parsing it. See [Type System § Where coercion happens](types.md#where-coercion-happens-and-why-exactly-once).
+- Cannot add a NOT NULL column without a value source for the existing rows if the table has any — see *ADD COLUMN over a non-empty table needs a value for the rows that already exist* under §2.6 *Default Values* for the exact rule: NOT NULL is the **resolved** nullability (an explicit `NOT NULL` **or** the session `default_column_nullability`, which ships as `not_null`), and a DEFAULT that folds to NULL (`DEFAULT null`, `DEFAULT (null)`) counts as no value source, while a non-foldable expression DEFAULT or a `GENERATED ALWAYS AS` expression counts as one. The rejection happens unless the table's module advertises the `delegatesNotNullBackfill` capability, in which case the engine skips this pre-check and the module's `alterTable` owns the decision (intended for structurally-total modules that carry pre-existing rows forward and enforce NOT NULL at write time going forward). Native modules (memory, store) leave the capability off, so this restriction applies to them. A NOT NULL column *with* a per-row source (expression default or generated expression) whose backfill yields NULL for some existing row is likewise rejected (after backfill), and the column add is reverted.
+
+A **UNIQUE**, **CHECK** or **FOREIGN KEY** (`REFERENCES`) declared inline on the added column — named or unnamed — is handed to the table's module through the **same** `addConstraint` path `ALTER TABLE ADD CONSTRAINT` uses, once the column itself is materialized. All three therefore end up **inside the module's schema**, exactly like the same constraint written in `CREATE TABLE`: they survive every later structural ALTER (a constraint the module never learned about would be dropped the next time `DROP COLUMN` / `RENAME COLUMN` replaced the catalog entry with the module's answer), and a store-backed table still has them after a reconnect.
+
+Each kind validates the already-backfilled rows before it goes live, and a violation **reverts the whole ALTER** — the just-added column is dropped again, any constraint already installed on it is handed back, and the original catalog entry is restored, so the table is left exactly as it was:
+
+- **UNIQUE** builds (or reuses) the covering structure and rejects a literal DEFAULT that duplicates a value across existing rows. NULLs are distinct, so rows backfilled with NULL never collide.
+- **CHECK** is validated against the backfilled values: for a literal DEFAULT by a scan after the backfill, and for a per-row source (expression DEFAULT or `GENERATED ALWAYS AS`) inside the backfill itself, against each freshly-computed value.
+- **FOREIGN KEY** runs the same existing-row validation as `ADD CONSTRAINT` — `pragma foreign_keys`-gated, MATCH SIMPLE (a NULL-backfilled column is exempt) — plus the same declaration-time rejection of a conflicting child/parent collation.
+
+Validation deliberately runs against a catalog that carries the new **column** but not yet the new **constraint**: the optimizer treats a declared constraint as a proven invariant and would otherwise fold the validating scan away to nothing, making validation trust the very thing it is checking.
+
+An explicit constraint name round-trips (through `unique_constraint_info` / `check_constraint_info` / `foreign_key_info`). An unnamed one is auto-named with the **same** convention the `CREATE TABLE` spelling uses — `_check_<column>` for a CHECK, `_fk_<table>_<column>` for a foreign key.
+
+**DROP COLUMN**
+
+```sql
+ALTER TABLE table_name DROP COLUMN col_name;
+```
+
+Removes a column from the table and all its data. Restrictions:
+
+- Cannot drop a PRIMARY KEY column.
+- Cannot drop the last remaining column.
+- Cannot drop a column named by a **partial index's `WHERE` clause** — the index would be left with a predicate it cannot evaluate. Drop the index first. (A column used only as an index *key* column is fine: the index is narrowed to its surviving key columns, and dropped outright when none survive.)
+
+Any UNIQUE constraint over the dropped column is removed with it — a single-column UNIQUE outright, and a **multi-column** UNIQUE in full (a UNIQUE missing one of its columns is a different, stronger constraint, not a silently-narrowed one). The auto-built covering index backing such a constraint is torn down at the same time, leaving no orphan in `index_info`. A UNIQUE whose columns do **not** include the dropped column survives, with its column indices shifted over the removed slot. (SQLite rejects dropping a column that participates in a UNIQUE; Quereus permits it and drops the constraint.)
+
+The table's own **FOREIGN KEY** constraints follow the same shift-or-remove rule. A foreign key that uses the dropped column as one of its child columns is removed in full — single-column and multi-column alike — since a key missing one of its child columns is a different constraint against the parent's key, not a narrowed one. A foreign key whose child columns do **not** include the dropped column survives and keeps constraining exactly the columns it did before, its recorded child-column positions shifted over the removed slot. (SQLite likewise rejects this drop; Quereus permits it and drops the key.) A foreign key in *another* table pointing **at** the dropped column is unaffected by this rule: it resolves the parent column by name at enforcement time.
+
+**ADD / DROP / RENAME CONSTRAINT**
+
+```sql
+ALTER TABLE table_name ADD CONSTRAINT con_name <constraint-body>;  -- CHECK (...) / UNIQUE (...) / FOREIGN KEY (...)
+ALTER TABLE table_name DROP CONSTRAINT con_name;
+ALTER TABLE table_name RENAME CONSTRAINT old_con TO new_con;
+```
+
+Manages a **named** table-level constraint (CHECK / UNIQUE / FOREIGN KEY) over its lifetime. All three resolve a name across the constraint classes in the fixed order CHECK → UNIQUE → FOREIGN KEY; a name present in more than one class is rejected as **ambiguous**, and an unknown name raises `NOTFOUND`. Constraint names are local to their table — there are no cross-object references to rewrite on rename.
+
+- **ADD CONSTRAINT** adds a new named (or, for the unnamed `ADD UNIQUE (...)` / `ADD FOREIGN KEY (...)` form, auto-named) constraint. A CHECK is added in place and begins enforcing on the next INSERT/UPDATE. A UNIQUE / FOREIGN KEY add routes through the table's module, which **re-validates the existing rows** against the new constraint and fails atomically with `CONSTRAINT` (leaving the schema unchanged) when the current data violates it; otherwise it installs forward enforcement. UNIQUE validation honors SQL NULL semantics (multiple NULLs are distinct) and any partial predicate. FOREIGN KEY existing-row validation is **gated by `pragma foreign_keys`** — when off, the add succeeds without a validating scan and enforcement is deferred to subsequent writes — and follows MATCH SIMPLE (a child row with any NULL FK column is exempt). A declarative add of a named UNIQUE / FK to an already-existing table now converges via this path.
+- **DROP CONSTRAINT** removes the named constraint. Dropping a UNIQUE also tears down the auto-built secondary index that backs it. A UNIQUE constraint synthesized from a `CREATE UNIQUE INDEX` cannot be dropped this way (the index is the user's object) — use `DROP INDEX`, which removes both.
+- **RENAME CONSTRAINT** changes a named constraint's name; the new name must not already address a constraint. For a UNIQUE backed by an implicit covering index named after the constraint, the index is renamed in lock-step. (A UNIQUE derived from a `CREATE UNIQUE INDEX` is likewise managed via its index, not renamed here.)
+
+These are schema-catalog operations that round-trip through the module's `alterTable`, so store-backed tables re-persist their DDL across reconnect.
+
+There is no in-place "redefine constraint" primitive. When a **declarative** schema (`apply schema`) changes the *body* of a named constraint while keeping its name — an edited CHECK expression, a changed FK `ON DELETE`/`ON UPDATE` action or referenced table/columns, a changed UNIQUE column set or `ON CONFLICT` — the differ realizes it as **DROP CONSTRAINT + ADD CONSTRAINT** (drop the old, add the new). For **UNIQUE / FOREIGN KEY**, the re-add re-validates existing rows against the new rule and fails atomically with `CONSTRAINT` (leaving the schema unchanged) if any current row violates the new body. For **CHECK**, the re-add is **forward-enforcing only** — it installs the new predicate but does **not** re-validate rows already in the table (a pre-existing limitation of the CHECK add path), so an existing row that violates the new predicate survives and is checked only on its next write. A change to a constraint's **tags** only is *not* a body change — it takes `ALTER CONSTRAINT … SET TAGS` (no drop+recreate). If a constraint is both renamed (via a `quereus.previous_name`/`quereus.id` hint) and has a changed body, the drop+recreate subsumes the rename (the new body must re-validate regardless). Note that the DROP and ADD are two separate statements and the migration is **not atomic** on the memory backend: if the re-add fails re-validation, the old constraint has already been dropped (see `docs/schema.md` for the atomicity caveat).
+
+**ALTER PRIMARY KEY**
+
+```sql
+ALTER TABLE table_name ALTER PRIMARY KEY (col_name [ASC|DESC] [, ...]);
+```
+
+Replaces the table's primary key definition. All named columns must have a NOT NULL constraint. The empty-PK case `ALTER PRIMARY KEY ()` is permitted (the table reverts to an implicit rowid-style key). Modules that support re-keying in place handle the change directly — both built-in modules do (MemoryTable re-keys its trees, indexes, and any open transaction's pending layers; the store physically re-keys the data store and rebuilds secondary indexes). A third-party module that cannot re-key throws `UNSUPPORTED`, and the engine falls back to an automatic shadow-table rebuild that copies all rows into a new table with the updated PK and swaps it in place.
+
+That fallback has two preconditions, and the statement is **refused** rather than rebuilt when either fails — in both cases a rebuild has no correct outcome, so a sited error is strictly better than a statement that reports success:
+
+- **The module must implement `renameTable`.** The rebuild finishes by renaming the shadow table over the original; a module that never hears about the rename keeps its rows filed under the shadow name while the catalog says otherwise, and the rebuilt table cannot be opened at all. Missing hook ⇒ `UNSUPPORTED`, in any transaction state.
+- **The statement must not be inside an explicit (`BEGIN`-opened) transaction.** The rebuild's two halves have different lifetimes: the schema half (`DROP` + `RENAME`) survives `ROLLBACK`, while the row copy is staged in the transaction and is undone by it — so a rollback would keep the new *empty* table and discard the copy of the rows it replaced, destroying data committed before the transaction began. Inside a transaction ⇒ `ERROR` (deliberately not `BUSY`: a retry inside the same transaction can never succeed). `COMMIT` or `ROLLBACK` first, then re-issue in autocommit mode. This refusal applies under the default `ddl_transaction_policy = permissive` too — it is narrower but stricter than that pragma's `strict` gate, which refuses module-dispatching DDL merely because the schema change *escapes* rollback; this rebuild also destroys committed rows.
+
+Neither refusal touches the catalog, the table, or the enclosing transaction: a module that raised `UNSUPPORTED` has by contract mutated nothing, and the checks run before the rebuild starts.
+
+**The rebuild is notification-silent.** Its four internal statements run with the public event channels (`db.onDataChange` / `db.onSchemaChange` / `db.onTransactionCommit`) suppressed, so a subscriber is told nothing at all by a re-key on this path — no `insert` for the rows the copy moved (a re-key changes no row), and no `create`/`drop` pair for the shadow table (a re-key replaces no table; the shadow name is machine-generated and not even stable across runs). Suppression covers only those application-facing channels: the engine's internal catalog invalidation keeps firing, so the rebuilt table is immediately plannable under its new key. The *statement* is not silent, though: the arm raises its own positive `alter`/`table` event naming the real table, from outside the suppression scope — so a subscriber learns that the primary key changed while learning nothing about the four internal statements that carried it out. In-place re-keys are unaffected: a module with its own event emitter reports the change however it normally does. See [`usage.md`](usage.md#what-each-alter-table-arm-reports) for the per-arm event shapes.
+
+**ALTER COLUMN**
+
+```sql
+ALTER TABLE table_name ALTER COLUMN col_name SET NOT NULL;
+ALTER TABLE table_name ALTER COLUMN col_name DROP NOT NULL;
+ALTER TABLE table_name ALTER COLUMN col_name SET DATA TYPE type_name;
+ALTER TABLE table_name ALTER COLUMN col_name SET DEFAULT expr;
+ALTER TABLE table_name ALTER COLUMN col_name DROP DEFAULT;
+ALTER TABLE table_name ALTER COLUMN col_name SET COLLATE collation_name;
+```
+
+Changes a single column attribute. Each statement carries exactly one attribute; combine multiple attributes by issuing multiple statements. Restrictions:
+
+- `SET NOT NULL` scans existing rows. If any are NULL and the column has a literal DEFAULT, NULL rows are backfilled with that default; otherwise the statement fails with `CONSTRAINT`. The backfilled value is converted to the column's declared type, exactly as `ADD COLUMN`'s is, and a literal DEFAULT the type cannot accept fails with `MISMATCH` (regardless of whether the column actually holds a NULL, so acceptance does not depend on the data).
+- `DROP NOT NULL` is rejected on PRIMARY KEY columns.
+- `SET DATA TYPE` between any two *different* logical types re-validates and converts each row's value — whether or not the two types share a physical representation — failing with `MISMATCH` on any value the new type cannot coerce, and rewriting every accepted value to the new type's **canonical form** (the value an `INSERT` would have stored): `TEXT` → `DATE` turns `'2024-06-05T00:00:00Z'` into `'2024-06-05'`, `TEXT` → `TIMESPAN` turns `'1 hour'` into `'PT1H'`. Without the rewrite the stored spellings would be invisible to equality (`DATE`/`TIME`/`DATETIME` compare `BINARY` over the stored text) and undetectable by UNIQUE. Rejected on PRIMARY KEY columns. When the two types also *compare* differently — `TEXT` ↔ `TIMESPAN`, where `'PT1H'`, `'PT60M'` and `'PT3600S'` are one value; `TEXT` ↔ `JSON`, where `'{"a":1}'` and `'{ "a" : 1 }'` are one value; `TEXT` ↔ `DATE`/`TIME`/`DATETIME` as above — every PRIMARY KEY, UNIQUE, or index that orders by the column is additionally re-keyed and re-validated exactly as `SET COLLATE` does (next-but-one bullet). Only a retype between *aliases of one type* (`TEXT` → `VARCHAR(50)`, `INTEGER` → `BIGINT`) is genuinely schema-only — no value is scanned or rewritten. Declared lengths such as `VARCHAR(n)` are not enforced (matching SQLite): `VARCHAR(2)` is an alias of `TEXT`, so retyping to it neither validates nor truncates over-length values, and inserts do not either.
+- `SET DATA TYPE` keeps the column's existing collation, so the **new** type must accept it: the collation is re-checked with the same validator (and the same `Unknown collation '…' for type '…'` error) `CREATE TABLE` uses, before anything is mutated. A `TEXT COLLATE NOCASE` column therefore cannot be retyped to `DATE`/`TIME`/`DATETIME`/`TIMESPAN`/`JSON` — those accept `BINARY` only — because the result would be a column shape `CREATE TABLE` refuses and whose generated DDL does not re-parse (a store-backed table with such a column is dropped on reopen). Drop the collation first: `ALTER COLUMN d SET COLLATE BINARY;` then `ALTER COLUMN d SET DATA TYPE DATE;`. The rejection is uniform — it does not matter whether the collation was written explicitly or inherited from `pragma default_collation`, since that distinction is not persisted and would otherwise flip across a reopen. `INTEGER`/`REAL`/`BLOB` declare no collation list and accept any registered collation, so retypes into them are unaffected.
+- Every change that can make two previously-distinct rows collide **re-validates every UNIQUE constraint covering the column, before anything is mutated** — a duplicate fails with `CONSTRAINT`, leaving the table unchanged. Two ways to collide, and a `SET DATA TYPE` can do both at once: the *values* collapse (`'1'` and `'01'` are distinct text but one integer; `'2024-06-05'` and `'2024-06-05T00:00:00Z'` are distinct text but one canonical `DATE`; a `SET NOT NULL` DEFAULT backfill: several NULLs are mutually distinct under SQL UNIQUE but backfill to one DEFAULT), and/or the *comparison* moves (`SET COLLATE` with the values untouched, or the semantic retype above). The probe judges the **converted** rows under the **new** comparison, so the combined case is caught too. The LevelDB store honors this: it defers its physical value rewrite until after the same re-validation, so a rejection leaves the stored values, the declared type and the enclosing transaction untouched.
+- `SET/DROP DEFAULT` is schema-only; existing rows are not touched.
+- `SET COLLATE` changes the column's collation (its comparison/ordering rule, default `BINARY`). The collation name is validated against the column's logical type up front — an unknown/unsupported collation is rejected with `Unknown collation '…' for type '…'`, the same error shape as `CREATE TABLE`. Because collation is **semantic** (it changes `=` and `ORDER BY`), the module re-keys / re-sorts any PRIMARY KEY, UNIQUE, or index that orders by the column and **re-validates uniqueness under the new collation**: a value set that was unique under `BINARY` but collides under `NOCASE` fails with `CONSTRAINT`, leaving the table unchanged. `SET COLLATE` is permitted on PRIMARY KEY columns (the primary structure is re-keyed). `SET COLLATE BINARY` restores the default. Unlike `SET TAGS`, a collation change **does move the schema hash** (`explain schema` reports a new hash). Query-layer `=` / `ORDER BY` / `table_info().collation` pick up the new collation regardless. A durable module honors the same contract by physically re-keying: see [Store § Catalog persistence](store.md#catalog-persistence-bundled-index-ddl) for the LevelDB store's re-key and existing-row dedup, including the one collation shape it rejects outright (**comparator-only** — registered with no normalizer, so its rows cannot be bucketed).
+
+The declarative schema differ (`diff schema`) detects column-attribute drift and emits the matching `ALTER COLUMN` statements with the two comparison-domain changes (`SET DATA TYPE`, `SET COLLATE`) first, then `SET/DROP DEFAULT`, then `SET/DROP NOT NULL` — so a newly-declared DEFAULT is in place before any NOT NULL tightening relies on it for backfill. The two comparison-domain statements order **relative to each other by the target collation**, because `SET DATA TYPE` carries the column's current collation into the new type (previous-but-two bullet): a target of `BINARY` emits `SET COLLATE` **first** (every type accepts `BINARY`, and the retype would otherwise be rejected when narrowing to a `BINARY`-only type — `TEXT COLLATE NOCASE` → `DATE`), any other target emits it **after** the retype (only the new type declares support for it — `DATE` → `TEXT COLLATE NOCASE`). A declared `COLLATE BINARY` and an absent `COLLATE` are treated as equal — no spurious diff.
+
+**SET TAGS / ADD TAGS / DROP TAGS**
+
+```sql
+ALTER TABLE table_name SET TAGS (key = value [, ...]);                       -- replace the whole table tag set
+ALTER TABLE table_name SET TAGS ();                                          -- clear all table tags
+ALTER TABLE table_name ADD TAGS (key = value [, ...]);                       -- merge: set/overwrite the listed keys, keep the rest
+ALTER TABLE table_name DROP TAGS (key [, ...]);                              -- delete the listed keys
+ALTER TABLE table_name ALTER COLUMN col_name SET TAGS (key = value [, ...]);     -- column: replace
+ALTER TABLE table_name ALTER COLUMN col_name ADD TAGS (key = value [, ...]);     -- column: merge
+ALTER TABLE table_name ALTER COLUMN col_name DROP TAGS (key [, ...]);            -- column: delete keys
+ALTER TABLE table_name ALTER CONSTRAINT con_name SET TAGS (key = value [, ...]); -- named constraint: replace
+ALTER TABLE table_name ALTER CONSTRAINT con_name ADD TAGS (key = value [, ...]); -- named constraint: merge
+ALTER TABLE table_name ALTER CONSTRAINT con_name DROP TAGS (key [, ...]);        -- named constraint: delete keys
+```
+
+Mutates the metadata tags on the table itself, one of its columns, or one of its **named** table-level constraints (CHECK / UNIQUE / FOREIGN KEY). The three verbs differ only in how they combine with the existing tags; all are catalog-only, schema-hash-neutral, and read the *live* tag set at execution time. Semantics and restrictions:
+
+- **Whole-set replacement vs. per-key merge / delete.** `SET TAGS` replaces the *entire* tag set at the target with the listed tags — an empty list `SET TAGS ()` clears all tags. `ADD TAGS (k = v[, …])` **merges**: it sets/overwrites the listed keys and keeps every other existing key (the ergonomic "touch one tag" form — no need to restate the whole set). `DROP TAGS (k[, …])` **deletes** the listed keys. After any of these the introspection TVFs (`schema()`, `table_info()`, `check_constraint_info()`, …) report the resulting set, and `tags IS NULL` once the set is empty.
+- **DROP of an absent key fails atomically.** `DROP TAGS` validates that **every** listed key is currently present *before* mutating anything; if any is absent it raises `NOTFOUND` naming the missing key(s) and drops **nothing** (so a typo like `DROP TAGS (audt)` fails loudly rather than silently no-op'ing). Dropping the last remaining key(s) leaves `tags IS NULL`, exactly like `SET TAGS ()`. There is no `IF EXISTS` form.
+- **Empty list is a no-op for ADD / DROP.** `ADD TAGS ()` and `DROP TAGS ()` change nothing — deliberately distinct from `SET TAGS ()`, which clears.
+- **Case-sensitive / verbatim keys.** Tag keys are stored exactly as authored (`display_name`, `audit`, `quereus.id`) with no case-folding; `ADD`/`DROP` match keys verbatim.
+- **`null` is a stored value, not a delete.** `ADD TAGS (k = null)` stores `k` present with value null (a legal stored value) — distinct from `DROP TAGS (k)`, which removes the key. (This is why there is a dedicated `DROP TAGS` rather than overloading `SET k = null`.)
+- **Catalog-only.** Tags are pure informational metadata: they touch no stored row and no physical layout, so none of these round-trips through the module's `alterTable`, and they succeed even on modules that don't implement it. (Caveat: store-backed modules re-persist DDL only through `alterTable`; the generic store recovers tag changes by subscribing to the `table_modified` event these fire, so table / column / named-constraint tag mutations — SET, ADD, and DROP alike — survive reconnect for store tables.)
+- **Reserved-tag validation.** `SET TAGS` and `ADD TAGS` validate any `quereus.*` key against the reserved-tag registry at the matching site (table / column / constraint) exactly as on `CREATE TABLE` / `declare schema`, so a misspelled or mis-sited reserved key (e.g. `"quereus.previuos_name"`) fails loudly at plan-build rather than being stored. `DROP TAGS` does **no** value validation — it removes by key — so dropping a reserved key (e.g. removing a stale `quereus.previous_name` hint) is legitimate and succeeds.
+- **Schema hash unaffected.** Tags are excluded from the schema hash, so `explain schema` reports the same hash after any tag-only `ALTER` (SET / ADD / DROP).
+- **Only named constraints are addressable.** `ALTER CONSTRAINT` targets a constraint by name; an unnamed constraint (e.g. an inline `CHECK` whose trailing `WITH TAGS` attaches to its column) has no addressable name and its tags are immutable post-create. A name that does not match any named constraint raises `NOTFOUND`; a name present in more than one constraint class (lookup order CHECK → UNIQUE → FOREIGN KEY) is rejected as ambiguous.
+- **Attribute-preserving.** A tag mutation on a column changes only its `tags`; nullability, type, default, generated-ness, and PK membership are untouched.
+
+The declarative schema differ detects tag drift at all three sites and emits the matching **whole-set** `SET TAGS` statements (it computes the full desired set) **after** the structural ALTER phases (rename/add/alter/pk/drop), so a tag set lands on the post-rename column / constraint name. `ADD TAGS` / `DROP TAGS` are an imperative-only convenience and are **not** emitted by the differ. The rename-hint keys `"quereus.id"` and `"quereus.previous_name"` are excluded from the tag-drift comparison (they drive rename detection, not data state, so a declaration carrying only a hint does not churn out a `SET TAGS` after the rename completes); all other reserved tags (`quereus.lens.*`, `quereus.expose_implicit_index`, …) *are* compared.
+
+### SET MAINTAINED / DROP MAINTAINED — derivation lifecycle
+
+```sql
+ALTER TABLE table_name SET MAINTAINED AS query_expr [WITH DEFAULTS (column = expr [, ...])];
+ALTER TABLE table_name DROP MAINTAINED;
+```
+
+`SET MAINTAINED AS` attaches a derivation to a plain table — making it a [maintained table](materialized-views.md) — or atomically replaces an already-maintained table's derivation. The body must derive the table's exact declared shape (names included; alias body outputs to match), and the table's current contents are reconciled against the derived contents by keyed diff (identical content writes nothing; divergence resolves derived-wins, reporting only genuine changes). There is no `using` clause — the module is the table's identity. A body closing a derivation cycle (including self-reference) and duplicate derived keys are rejected with the table untouched. `DROP MAINTAINED` detaches the derivation: catalog-only — the table keeps its rows and becomes an ordinary, user-writable table; maintenance stops. The declared-shape create form (`create table … maintained as <body>`) and the full attach/detach semantics are specified in [materialized-views.md § DDL statements](materialized-views.md#ddl-statements).
+
+### SET / ADD / DROP TAGS on views, materialized views, and indexes
+
+The other tagged catalog objects — views, materialized views, and indexes — also carry their tags from `CREATE` time, and can be re-tagged in place with the same three verbs as `ALTER TABLE`:
+
+```sql
+ALTER VIEW view_name               SET TAGS (key = value [, ...]);  -- view: replace whole set
+ALTER VIEW view_name               ADD TAGS (key = value [, ...]);  -- view: merge (set/overwrite listed keys, keep rest)
+ALTER VIEW view_name               DROP TAGS (key [, ...]);         -- view: delete listed keys
+ALTER MATERIALIZED VIEW mv_name    SET TAGS (key = value [, ...]);  -- materialized-view: replace / add / drop
+ALTER MATERIALIZED VIEW mv_name    ADD TAGS (key = value [, ...]);
+ALTER MATERIALIZED VIEW mv_name    DROP TAGS (key [, ...]);
+ALTER INDEX index_name             SET TAGS (key = value [, ...]);  -- index: replace / add / drop
+ALTER INDEX index_name             ADD TAGS (key = value [, ...]);
+ALTER INDEX index_name             DROP TAGS (key [, ...]);
+ALTER VIEW view_name               SET TAGS ();                     -- clear all tags (any kind)
+```
+
+The three verbs carry **exactly the `ALTER TABLE … {SET|ADD|DROP} TAGS` semantics** documented above — `SET` is whole-set replacement (empty list clears, after which `schema()` / `index_info()` report `tags IS NULL`); `ADD` merges (empty list is a no-op, *not* a clear); `DROP` deletes the listed keys atomically (every key must be present, else `NOTFOUND` names the missing key(s) and drops nothing; dropping the last key leaves `tags IS NULL`; empty list is a no-op). Keys are matched verbatim (case-sensitive), all forms are catalog-only (no module / data round-trip; the tag change re-registers the in-memory schema object only) and schema-hash-neutral, and the live tag set is read at execution time. Notes specific to these objects:
+
+- **Reserved-tag validation site (SET / ADD only; DROP does not validate).** A `quereus.*` key on `ALTER VIEW` / `ALTER MATERIALIZED VIEW … SET TAGS` / `ADD TAGS` is validated at the `view-ddl` site, and on `ALTER INDEX … SET TAGS` / `ADD TAGS` at the `physical-index` site — the same registry and sites `CREATE` / `declare schema` use, so a typo (e.g. `"quereus.bogus"`) fails loudly at plan-build. `DROP TAGS` removes by key with no value validation, so dropping a reserved key (e.g. `DROP TAGS ("quereus.id")`) is legitimate and succeeds.
+- **Materialized views never re-materialize.** Any MV tag change — `SET`, `ADD`, or `DROP` — is a pure metadata write; it does **not** touch the backing table or re-run the body. The declarative differ enforces this: a tag-only MV change takes the in-place `SET TAGS` path, while a **body** change still drops+recreates (carrying the declared tags through the recreate) — the two are mutually exclusive per MV in one migration.
+- **View tag changes reach prepared statements.** No reserved tag drives write-through behavior (routing is per-row presence/membership columns; omitted-insert defaults are the body select's `with defaults (…)` clause — see [§2.9](sql-views.md#29-updatable-views)), but reserved-tag *validation* re-runs whenever a write-through plan is built — and the change applies to both newly planned statements *and* already-prepared ones: an `ALTER VIEW … {SET|ADD|DROP} TAGS` fires `view_modified` (and the `ALTER MATERIALIZED VIEW` forms fire `materialized_view_modified`), and every view-/MV-mediated write records a `view` plan dependency, so a cached prepared statement that writes through the view is invalidated and re-planned on its next execution — exactly as a table tag change invalidates via `table_modified` — surfacing, e.g., a newly-added invalid reserved key. (Read-only `select … from v` is intentionally *not* invalidated: view tags do not affect read results.)
+- **Index resolution and implicit covering structures.** `ALTER INDEX` resolves the owning table from the index name; that is unambiguous because `create index` rejects a name already used by an index elsewhere in the schema (see [§6.3](sql-ddl.md#63-indexes-on-virtual-tables)). The auto-built covering structure backing a UNIQUE constraint is **not** a user-addressable index — `ALTER INDEX … {SET|ADD|DROP} TAGS` on its name raises `NOTFOUND` and `DROP INDEX` on it raises `no such index` (`IF EXISTS`: a no-op); its tags live on the originating constraint (`ALTER TABLE … ALTER CONSTRAINT … {SET|ADD|DROP} TAGS`), unless the constraint opted the structure into visibility via `quereus.expose_implicit_index`. Exposure makes the structure tag-addressable only: its **lifecycle** still belongs to the constraint, so `DROP INDEX` stays refused and the structure goes away with `ALTER TABLE … DROP CONSTRAINT` (see [§6.3](sql-ddl.md#63-indexes-on-virtual-tables)).
+- **Tags are the only `ALTER` verb for these objects.** There is no structural `ALTER VIEW` / `ALTER MATERIALIZED VIEW` / `ALTER INDEX` (rename, recolumn, …) yet; structural changes still go through drop+recreate (which the declarative pipeline drives automatically).
+
+The declarative schema differ detects tag drift on a name-matched view / materialized view / index and emits the corresponding **whole-set** `SET TAGS` in the migration's alter phase (`ADD` / `DROP TAGS` are an imperative-only convenience and are not emitted by the differ).
