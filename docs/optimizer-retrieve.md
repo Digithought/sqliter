@@ -52,6 +52,36 @@ RetrieveNode
 
 This policy ensures the `Retrieve` pipeline is always a precise description of what the module/index can handle; unsupported parts never enter the boundary.
 
+### Constraint sweep scope
+
+> **Invariant:** [OPT-025](invariants.md#opt-025--a-predicate-constrains-only-tables-in-its-own-relational-input)
+
+`extractConstraintsForTable(plan, key)` answers "which predicates in this subtree constrain
+table instance `key`?". Both callers that place work on an access path use it:
+`rule-select-access-path` sweeps `Retrieve.source`, and `trySortAbsorbViaIndexOrdering`
+(grow-retrieve) sweeps the whole subtree beneath an absorbed `Sort` — the only caller that
+looks past a single `Filter`'s own predicate, which is why a bug here needs an `ORDER BY` the
+table's own key walk satisfies.
+
+The subtree is not the same thing as the scope. A subquery body is a `RelationalPlanNode`
+hanging beneath a *scalar* expression, so `where exists (select 1 from t where t.s = a.i)`
+puts the inner `t.s = a.i` inside the outer `Filter`'s subtree. The sweep (`walkPredicatesConstraining`)
+therefore descends into everything but only *visits* a predicate when the target table
+reference is reachable through relational-child links from the predicate's own node — i.e.
+when the table is genuinely in that predicate's input. An inner scan of the same table still
+collects its own predicates, because the recursion still enters subquery bodies; what it finds
+there simply cannot mark an enclosing node's input.
+
+Note the distinction from correlation. A constraint whose **value** side references an outer
+attribute (`PredicateConstraint.correlated`) is a supported feature — it is how a correlated
+seek is pushed into an inner scan. What is never legal is attributing an inner scope's
+predicate to an **outer** table: the unhandled-constraint path turns it into
+`moduleCtx.residualPredicate`, and `rule-select-access-path` then materializes a `Filter`
+reading a column the outer relation does not have (runtime "No row context found for column
+…"), or — under `NOT EXISTS`, where the hoisted conjunct happens to be satisfiable — silently
+drops rows. The same gate keeps `extractCoveredKeysForTable` from counting a subquery's
+`a.id = 5` as covering the *outer* `a`'s primary key.
+
 ### Set operations and growth boundaries
 
 - `SetOperation` (`UNION`, `INTERSECT`, `EXCEPT`, `DIFF`) is excluded from the grow-retrieve structural pass. Sliding a `Retrieve` boundary across set operations can cause structural oscillation and provides little benefit to index-style modules. Predicate push-down into the branches remains supported via the supported-only policy.

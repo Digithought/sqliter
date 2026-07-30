@@ -246,6 +246,21 @@ redundant filter, never a wrong answer. Filters outside the seek family (`IS NUL
 `NOT IN`, …) are never pushed into `FilterInfo`, so a module claiming one is taken at its
 word.
 
+### OPT-025 — A predicate constrains only tables in its own relational input
+
+- code: `packages/quereus/src/planner/analysis/constraint-extractor.ts` — `walkPredicatesConstraining`
+- guard: `packages/quereus/test/plan/correlated-predicate-scope.spec.ts` — `Plan shape: a correlated subquery predicate stays in its own scope`
+- doc: [Retrieve § Constraint sweep scope](optimizer-retrieve.md#constraint-sweep-scope)
+
+A subquery body hangs off a scalar expression, so a `Filter`'s subtree contains predicates
+belonging to a different row scope. The constraint sweep therefore visits a predicate only
+when the target table reference sits in that predicate's own relational **input** — a
+relational node reached through a scalar child is a different scope. Without the gate,
+`where exists (select 1 from t where t.s = a.i)` yields a
+constraint on `a`, which becomes a residual `Filter` reading `t.s` over the scan of `a` — a
+"no row context" error, or (under `not exists`) silently wrong rows. A constraint whose
+*value* side references an outer attribute stays legal: that is correlated seek pushdown.
+
 ### OPT-030 — Uniqueness is read through one surface
 
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `keysOf`

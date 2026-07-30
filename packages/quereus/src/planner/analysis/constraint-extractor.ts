@@ -4,6 +4,7 @@
  */
 
 import type { ScalarPlanNode, RelationalPlanNode, PlanNode, FunctionalDependency } from '../nodes/plan-node.js';
+import { isRelationalNode } from '../nodes/plan-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import type { ColumnReferenceNode } from '../nodes/reference.js';
 import { BinaryOpNode, BetweenNode, CastNode, UnaryOpNode } from '../nodes/scalar.js';
@@ -1027,22 +1028,17 @@ export function extractConstraintsForTable(
 	targetTableRelationKey: string
 ): PredicateConstraint[] {
 	const constraints: PredicateConstraint[] = [];
+	const tableInfos = createTableInfosFromPlan(plan).filter(
+		info => info.relationKey === targetTableRelationKey
+	);
+	if (tableInfos.length === 0) return constraints;
 
-	// Walk the plan tree looking for filter predicates
-	walkPlanForPredicates(plan, (predicate, sourceNode) => {
-		// Create table info for the target table only
-		const tableInfos = createTableInfosFromPlan(plan).filter(
-			info => info.relationKey === targetTableRelationKey
-		);
-
-		if (tableInfos.length > 0) {
-			const result = extractConstraints(predicate, tableInfos);
-			const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
-			if (tableConstraints) {
-				constraints.push(...tableConstraints);
-				log('Found %d constraints for table %s from %s',
-					tableConstraints.length, targetTableRelationKey, sourceNode);
-			}
+	walkPredicatesConstraining(plan, targetTableRelationKey, predicate => {
+		const result = extractConstraints(predicate, tableInfos);
+		const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
+		if (tableConstraints) {
+			constraints.push(...tableConstraints);
+			log('Found %d constraints for table %s', tableConstraints.length, targetTableRelationKey);
 		}
 	});
 
@@ -1050,31 +1046,55 @@ export function extractConstraintsForTable(
 }
 
 /**
- * Extract constraints and combined residual predicate for a specific table
+ * Visit every predicate in `plan` that can constrain the table instance
+ * `targetTableRelationKey` — i.e. every predicate whose own relational INPUT
+ * contains that table reference.
+ *
+ * A plain "walk everything" sweep is unsound here: a subquery body hangs off a
+ * scalar predicate, so `where exists (select 1 from t where t.s = a.i)` puts the
+ * inner `t.s = a.i` inside the outer Filter's subtree. Attributing it to `a`
+ * turns it into a constraint (and then a residual predicate) on `a`'s access
+ * path, which hoists a predicate reading column `s` over a relation that has no
+ * such column. The subquery's own scans stay reachable — an inner scan of the
+ * target legitimately collects its own correlated predicate — but a predicate is
+ * never attributed to a table outside its input.
+ *
+ * The target is matched on the instance-unique `#<nodeId>` suffix that
+ * {@link createTableInfoFromNode} appends, so callers that build the key with a
+ * bare table name and callers that schema-qualify it both work.
+ *
+ * @returns whether the target table reference sits in this node's relational input
  */
-export function extractConstraintsAndResidualForTable(
-    plan: RelationalPlanNode,
-    targetTableRelationKey: string
-): { constraints: PredicateConstraint[]; residualPredicate?: ScalarPlanNode } {
-    const constraints: PredicateConstraint[] = [];
-    const residuals: ScalarPlanNode[] = [];
+function walkPredicatesConstraining(
+	plan: PlanNode,
+	targetTableRelationKey: string,
+	callback: (predicate: ScalarPlanNode) => void,
+): boolean {
+	if (!plan) return false;
 
-    walkPlanForPredicates(plan, (predicate) => {
-        const tableInfos = createTableInfosFromPlan(plan).filter(
-            info => info.relationKey === targetTableRelationKey
-        );
-        if (tableInfos.length === 0) return;
-        const result = extractConstraints(predicate, tableInfos);
-        const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
-        if (tableConstraints && tableConstraints.length) {
-            constraints.push(...tableConstraints);
-        }
-        if (result.residualPredicate) {
-            residuals.push(result.residualPredicate);
-        }
-    });
+	// NOTE: recursive over the native stack (as the sweep this replaced was). Plan depth is
+	// bounded by query nesting today; if a generated query ever overflows here, convert to the
+	// explicit-stack shape `PlanNode.computePostOrder` uses — the post-order return value
+	// (`inScope` bubbling up) is what makes the recursion convenient rather than necessary.
+	const idSuffix = `#${plan.id ?? 'unknown'}`;
+	let inScope = plan instanceof TableReferenceNode && targetTableRelationKey.endsWith(idSuffix);
 
-    return { constraints, residualPredicate: combineResiduals(residuals) };
+	for (const child of plan.getChildren()) {
+		const foundBelow = walkPredicatesConstraining(child as unknown as PlanNode, targetTableRelationKey, callback);
+		// Only a RELATIONAL child of a RELATIONAL node feeds that node's input. A
+		// relational node reached through a scalar expression is a subquery body —
+		// a different scope — so what it contains must not put the target in scope
+		// here (its own predicates were already collected inside the recursion).
+		if (foundBelow && isRelationalNode(child) && isRelationalNode(plan)) inScope = true;
+	}
+
+	if (inScope && CapabilityDetectors.isPredicateSource(plan)) {
+		for (const predicate of plan.getPredicates() as ReadonlyArray<ScalarPlanNode>) {
+			callback(predicate);
+		}
+	}
+
+	return inScope;
 }
 
 /**
@@ -1501,40 +1521,6 @@ function classifyForAggregate(
 
     // Recurse into the aggregate's source for further nested identity-breaking nodes
     classifyForIdentityBreakingNodes(aggNode.source as unknown as PlanNode, classifications, groupKeys, tableInfos);
-}
-
-function combineResiduals(predicates: ScalarPlanNode[]): ScalarPlanNode | undefined {
-    if (predicates.length === 0) return undefined;
-    if (predicates.length === 1) return predicates[0];
-    let acc = predicates[0];
-    for (let i = 1; i < predicates.length; i++) {
-        const right = predicates[i];
-        const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
-        acc = new BinaryOpNode(acc.scope, ast, acc, right);
-    }
-    return acc;
-}
-
-/**
- * Walk a plan tree and call callback for each predicate found
- */
-function walkPlanForPredicates(
-  plan: PlanNode,
-  callback: (predicate: ScalarPlanNode, sourceNode: string) => void
-): void {
-  if (!plan) return;
-  // If node exposes predicates via characteristic, collect them
-  if (CapabilityDetectors.isPredicateSource(plan)) {
-    const preds = plan.getPredicates() as ReadonlyArray<ScalarPlanNode>;
-    for (const p of preds) {
-      callback(p, 'PredicateSource');
-    }
-  }
-
-  // Recurse into all children (scalar and relational)
-  for (const child of plan.getChildren()) {
-    walkPlanForPredicates(child as unknown as PlanNode, callback);
-  }
 }
 
 /**

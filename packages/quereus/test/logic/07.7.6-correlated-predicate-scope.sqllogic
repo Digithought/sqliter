@@ -1,0 +1,148 @@
+-- 07.7.6-correlated-predicate-scope.sqllogic - a subquery's predicate must not
+-- constrain the outer relation
+--
+-- Regression guard for `bug-correlated-predicate-hoisted-onto-outer`. When an
+-- ORDER BY is satisfied by the outer table's primary-key walk, `rule-grow-retrieve`
+-- takes the `trySortAbsorbViaIndexOrdering` path, which sweeps constraints out of a
+-- whole subtree rather than out of one Filter's own predicate. A correlated subquery
+-- body hangs off a scalar predicate, so that subtree contains the *inner* comparison
+-- (`t.s = a.i`). Attributing it to the outer table `a` turned it into an unhandled
+-- constraint, then into a residual predicate, and finally into a Filter reading
+-- column `s` placed over the scan of `a` — which has no such column. The failure
+-- surfaced as "No row context found for column s".
+--
+-- The correlated conjunct only survives inside the subquery when the comparison is
+-- cross-type: with matching types (`t.id = a.i`) the decorrelation rule rewrites the
+-- EXISTS into a semi join and there is nothing left inside a subquery to mis-attribute.
+-- Both shapes are covered below so the decorrelating path stays exercised too.
+--
+-- Invariant pinned here (OPT-025): for each shape, the `order by` variants return the
+-- same row set as the same query with no `order by`.
+
+create table a (id integer primary key, i integer);
+create table t (id integer primary key, s text);
+insert into a values (1, 1), (2, 2), (3, 3);
+insert into t values (1, '1'), (2, '2');
+
+-- =============================================================================
+-- EXISTS with a cross-type correlated comparison — the original repro.
+-- =============================================================================
+
+select a.id from a where exists (select 1 from t where t.s = a.i);
+→ [{"id":1},{"id":2}]
+
+select a.id from a where exists (select 1 from t where t.s = a.i) order by a.id;
+→ [{"id":1},{"id":2}]
+
+select a.id from a where exists (select 1 from t where t.s = a.i) order by a.id desc;
+→ [{"id":2},{"id":1}]
+
+-- The correlated column in the select list: the Project no longer prunes `i`,
+-- a different plan shape with the same requirement.
+
+select a.id, a.i from a where exists (select 1 from t where t.s = a.i) order by a.id;
+→ [{"id":1,"i":1},{"id":2,"i":2}]
+
+-- Written with the operands the other way round.
+
+select a.id from a where exists (select 1 from t where a.i = t.s) order by a.id;
+→ [{"id":1},{"id":2}]
+
+-- =============================================================================
+-- NOT EXISTS over the same shape. Hoisting the inner predicate onto the outer
+-- scan here yields a WRONG ANSWER rather than an error, so a row-set check is
+-- the only thing that catches it.
+-- =============================================================================
+
+select a.id from a where not exists (select 1 from t where t.s = a.i);
+→ [{"id":3}]
+
+select a.id from a where not exists (select 1 from t where t.s = a.i) order by a.id;
+→ [{"id":3}]
+
+select a.id from a where not exists (select 1 from t where t.s = a.i) order by a.id desc;
+→ [{"id":3}]
+
+-- =============================================================================
+-- IN over a correlated subquery whose inner predicate is cross-type.
+-- =============================================================================
+
+select a.id from a where a.i in (select t.id from t where t.s = a.i);
+→ [{"id":1},{"id":2}]
+
+select a.id from a where a.i in (select t.id from t where t.s = a.i) order by a.id;
+→ [{"id":1},{"id":2}]
+
+select a.id from a where a.i in (select t.id from t where t.s = a.i) order by a.id desc;
+→ [{"id":2},{"id":1}]
+
+-- =============================================================================
+-- Same-type correlated predicate: the decorrelation rule turns this into a semi
+-- join, so nothing is left inside a subquery. Kept so that path stays covered.
+-- =============================================================================
+
+select a.id from a where exists (select 1 from t where t.id = a.i);
+→ [{"id":1},{"id":2}]
+
+select a.id from a where exists (select 1 from t where t.id = a.i) order by a.id;
+→ [{"id":1},{"id":2}]
+
+select a.id from a where exists (select 1 from t where t.id = a.i) order by a.id desc;
+→ [{"id":2},{"id":1}]
+
+select a.id from a where not exists (select 1 from t where t.id = a.i) order by a.id;
+→ [{"id":3}]
+
+-- =============================================================================
+-- An outer conjunct alongside the correlated subquery: the outer predicate is
+-- genuinely a constraint on `a` and must still be applied, while the inner one
+-- must still be ignored.
+-- =============================================================================
+
+select a.id from a where a.id > 1 and exists (select 1 from t where t.s = a.i) order by a.id;
+→ [{"id":2}]
+
+select a.id from a where a.id > 1 and not exists (select 1 from t where t.s = a.i) order by a.id;
+→ [{"id":3}]
+
+-- =============================================================================
+-- A self-referencing subquery over the SAME table as the outer relation. The
+-- inner scan is a distinct instance, so its equality on the primary key must not
+-- be counted as covering the outer instance's key (which would claim <=1 row for
+-- a relation that has three).
+-- =============================================================================
+
+select a.id from a where exists (select 1 from a a2 where a2.id = 2) order by a.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select a.id from a where not exists (select 1 from a a2 where a2.id = 99) order by a.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+select a.id from a where exists (select 1 from a a2 where a2.id = a.i + 1) order by a.id;
+→ [{"id":1},{"id":2}]
+
+drop table a;
+drop table t;
+
+-- =============================================================================
+-- The mutation planner walks the same Retrieve/access-path rules, so the same
+-- mis-attribution there would delete or update the wrong rows.
+-- =============================================================================
+
+create table m (id integer primary key, i integer);
+create table n (id integer primary key, s text);
+insert into m values (1, 1), (2, 2), (3, 3);
+insert into n values (1, '1'), (2, '2');
+
+delete from m where not exists (select 1 from n where n.s = m.i);
+
+select id from m order by id;
+→ [{"id":1},{"id":2}]
+
+update m set i = 9 where exists (select 1 from n where n.s = m.i and n.id = 1);
+
+select id, i from m order by id;
+→ [{"id":1,"i":9},{"id":2,"i":2}]
+
+drop table m;
+drop table n;

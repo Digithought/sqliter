@@ -155,10 +155,14 @@ export function wrapInCast(
 	operand: ScalarPlanNode,
 	targetType: string,
 ): CastNode {
-	// Synthesise a minimal AST.CastExpr — `targetType` is the only field CastNode reads.
+	// Synthesise an AST.CastExpr. `targetType` is the only field CastNode itself
+	// reads, but `formatExpression` renders a node from its AST rather than from
+	// its children — a `literal null` placeholder here made every coerced operand
+	// print as `cast(null as integer)` in EXPLAIN while the real operand child was
+	// intact. Carrying the operand's own AST keeps the rendering truthful.
 	const syntheticExpr: AST.CastExpr = {
 		type: 'cast',
-		expr: { type: 'literal', value: null } as AST.LiteralExpr, // placeholder
+		expr: operand.expression,
 		targetType,
 	};
 	return new CastNode(scope, syntheticExpr, operand);
