@@ -11,6 +11,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import type { Scope } from '../scopes/scope.js';
 import { MultiScope } from '../scopes/multi.js';
 import { ShadowScope } from '../scopes/shadow.js';
+import { EmptyScope } from '../scopes/empty.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { buildExpression } from './expression.js';
 import { FilterNode } from '../nodes/filter.js';
@@ -336,14 +337,21 @@ export function buildValuesStmt(
 /**
  * Registers each column of a relational node as a symbol in a new scope,
  * wrapped with an AliasedScope for qualified name resolution.
+ *
+ * The scope is deliberately parented on {@link EmptyScope} — a FROM source's scope
+ * holds ONLY its own columns and answers "no" for anything else. The fallback to the
+ * enclosing query is composed exactly once by the consumer (`buildSelectStmt`'s
+ * `ShadowScope`, `buildJoin`'s LATERAL `ShadowScope`). Chaining each source scope to
+ * the caller's scope instead would make `MultiScope`'s first-match reach the outer
+ * scope through peer #1 before peer #2 is ever consulted, so a join's own right-hand
+ * source loses name lookup to a same-named enclosing symbol.
  */
 function registerColumnScope(
-	parentScope: Scope,
 	node: RelationalPlanNode,
 	scopeName: string,
 	alias: string,
 ): Scope {
-	const registered = new RegisteredScope(parentScope);
+	const registered = new RegisteredScope(EmptyScope.instance);
 	const attributes = node.getAttributes();
 	node.getType().columns.forEach((c, i) => {
 		const attr = attributes[i];
@@ -389,7 +397,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				}
 				fromTable = internalRefNode;
 
-				columnScope = registerColumnScope(parentContext.scope, fromTable, tableName, fromClause.alias?.toLowerCase() ?? tableName);
+				columnScope = registerColumnScope(fromTable, tableName, fromClause.alias?.toLowerCase() ?? tableName);
 			} else {
 				// Regular CTE reference - cache by CTE name + alias to ensure consistent attribute IDs
 				const cacheKey = `${tableName}:${fromClause.alias || tableName}`;
@@ -411,7 +419,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					logger(`Created new CTE reference ${cacheKey}, attrs=[${attrs.map(a => a.id).join(',')}]`);
 				}
 
-				columnScope = registerColumnScope(parentContext.scope, cteRefNode, tableName, fromClause.alias?.toLowerCase() ?? tableName);
+				columnScope = registerColumnScope(cteRefNode, tableName, fromClause.alias?.toLowerCase() ?? tableName);
 
 				fromTable = cteRefNode;
 			}
@@ -504,7 +512,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					fromTable = viewSelectNode;
 				}
 
-				columnScope = registerColumnScope(parentContext.scope, fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
+				columnScope = registerColumnScope(fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
 			} else if (maintainedTable) {
 				// Maintained table (materialized view): resolves through the ORDINARY
 				// table path — the table IS the materialization, one catalog record.
@@ -541,7 +549,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 
 				fromTable = tableNode;
 
-				columnScope = registerColumnScope(parentContext.scope, fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
+				columnScope = registerColumnScope(fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
 			} else {
 				// Regular table
 				let tableNode: RelationalPlanNode = buildTableReference(fromClause, parentContext);
@@ -553,7 +561,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 
 				fromTable = tableNode;
 
-				columnScope = registerColumnScope(parentContext.scope, fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
+				columnScope = registerColumnScope(fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
 			}
 		}
 
@@ -566,7 +574,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 		}
 		fromTable = funcNode;
 
-		columnScope = registerColumnScope(parentContext.scope, fromTable, '', fromClause.alias?.toLowerCase() ?? fromClause.name.name.toLowerCase());
+		columnScope = registerColumnScope(fromTable, '', fromClause.alias?.toLowerCase() ?? fromClause.name.name.toLowerCase());
 
 	} else if (fromClause.type === 'subquerySource') {
 		// Build the subquery body. SubquerySource now carries any QueryExpr;
@@ -605,8 +613,9 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 			? new AliasNode(parentContext.scope, subqueryNode, alias)
 			: subqueryNode;
 
-		// Create scope for subquery columns
-		const subqueryScope = new RegisteredScope(parentContext.scope);
+		// Create scope for subquery columns. Own-only, parented on EmptyScope, for the
+		// same reason as registerColumnScope — see its doc comment.
+		const subqueryScope = new RegisteredScope(EmptyScope.instance);
 		const subqueryAttributes = fromTable.getAttributes();
 
 		// Use provided column names or infer from subquery

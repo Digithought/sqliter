@@ -1,0 +1,81 @@
+-- 07.7.7-join-source-scope-shadowing.sqllogic - an inner join's own sources must
+-- shadow a same-named source in the enclosing query
+--
+-- Second symptom of `bug-cte-reference-as-second-join-source-fails-at-runtime`, with no
+-- CTE involved and — worse — no error: it silently returned wrong rows.
+--
+-- A join combines its two peer source scopes with MultiScope (first match wins). Each
+-- source scope used to fall back to the *enclosing* query's scope, so when MultiScope
+-- asked the LEFT peer about a name the left peer did not own, it forwarded the question
+-- outward and answered from there instead of letting the RIGHT peer answer. When the
+-- right peer's alias also names an outer source, the inner reference bound to the OUTER
+-- one — turning an uncorrelated subquery into a correlated one.
+--
+-- Fix: a FROM source's scope holds only its own columns; the enclosing-query fallback is
+-- composed once by the consumer (ShadowScope), after both peers have been consulted.
+--
+-- Invariant pinned here: the subquery below is uncorrelated (its `x` is its own `t1`), so
+-- `n` is the same constant on every outer row. Pre-fix it returned 3, 3, 0.
+
+create table t1 (id integer primary key, v integer);
+insert into t1 values (1, 10), (2, 20), (3, 30);
+
+create table t2 (id integer primary key, v integer);
+insert into t2 values (1, 100), (2, 200);
+
+-- =============================================================================
+-- Inner join's RIGHT peer aliased the same as an outer source. `x.id` inside the
+-- subquery must be the inner `t1 as x`, giving 2 matches on every outer row.
+-- =============================================================================
+
+select x.id, (select count(*) from t2 join t1 as x on x.id = t2.id) as n
+from t1 as x order by x.id;
+→ [{"id":1,"n":2},{"id":2,"n":2},{"id":3,"n":2}]
+
+-- Operand-swapped condition — `x.id` is looked up second rather than first.
+
+select x.id, (select count(*) from t2 join t1 as x on t2.id = x.id) as n
+from t1 as x order by x.id;
+→ [{"id":1,"n":2},{"id":2,"n":2},{"id":3,"n":2}]
+
+-- Non-key join column, so the join is not answered by a primary-key seek.
+
+select x.id, (select count(*) from t2 join t1 as x on x.v = t2.v) as n
+from t1 as x order by x.id;
+→ [{"id":1,"n":0},{"id":2,"n":0},{"id":3,"n":0}]
+
+-- =============================================================================
+-- Same shape with the inner LEFT peer an inline subquery source, which builds its
+-- scope on a separate code path (the `subquerySource` branch of buildFrom).
+-- =============================================================================
+
+select x.id, (select count(*) from (select id from t2) s join t1 as x on x.id = s.id) as n
+from t1 as x order by x.id;
+→ [{"id":1,"n":2},{"id":2,"n":2},{"id":3,"n":2}]
+
+-- The inline subquery on the RIGHT instead: the outer `s` must not capture `s.id`.
+
+select s.id, (select count(*) from t1 as x join (select id from t2) s on x.id = s.id) as n
+from t1 as s order by s.id;
+→ [{"id":1,"n":2},{"id":2,"n":2},{"id":3,"n":2}]
+
+-- =============================================================================
+-- A genuinely correlated subquery over the same alias names still correlates —
+-- the fix must not sever the enclosing-scope fallback, only reorder it after the
+-- join's own peers. `outer_t.id` is not a name either inner peer owns.
+-- =============================================================================
+
+select outer_t.id,
+       (select count(*) from t2 join t1 as x on x.id = t2.id where x.id = outer_t.id) as n
+from t1 as outer_t order by outer_t.id;
+→ [{"id":1,"n":1},{"id":2,"n":1},{"id":3,"n":0}]
+
+-- LATERAL still sees the left peer's columns from the right peer's body.
+
+select l.id, r.doubled from t1 as l
+cross join lateral (select l.v * 2 as doubled) as r
+order by l.id;
+→ [{"id":1,"doubled":20},{"id":2,"doubled":40},{"id":3,"doubled":60}]
+
+drop table t2;
+drop table t1;

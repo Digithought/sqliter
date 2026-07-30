@@ -1299,6 +1299,18 @@ scalar subquery). Two consequences worth pinning:
   from its `MultiScope`, a wrong scope order (earlier scopes shadow later ones), or
   projection outputs and original qualified columns both needing to stay reachable after a
   `ProjectNode`. See [Column Reference Resolution](#column-reference-resolution).
+  Invariant: **a FROM source's scope holds only its own columns.** `registerColumnScope`
+  and the `subquerySource` branch of `buildFrom` parent their `RegisteredScope` on
+  `EmptyScope.instance`, so a source answers "no" for any name it does not own. The
+  fallback to the enclosing query is composed *once* by the consumer — `buildSelectStmt`'s
+  `ShadowScope([...sourceScopes, outerScope])`, and `buildJoin`'s LATERAL
+  `ShadowScope([leftOutputScope, outerScope])` — never by chaining each source scope to
+  its parent. Chaining breaks `MultiScope`: its first-match walk asks peer #1, which
+  forwards the miss to the outer scope and answers from there, so peer #2 is never
+  consulted and a join's own right-hand source loses to a same-named enclosing symbol
+  (silently wrong rows when an inner alias shadows an outer one; a runtime "No row
+  context found for column …" when the enclosing symbol is bound to attribute ids nothing
+  below publishes).
 - **Context lifecycle.** Manage row context only through the helpers in
   `src/runtime/context-helpers.ts` — `createRowSlot` for streaming, `withRowContext` /
   `withAsyncRowContext` for one-off evaluation (see
