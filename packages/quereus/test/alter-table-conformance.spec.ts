@@ -29,10 +29,9 @@
 
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
-import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import { QuereusError } from '../src/common/errors.js';
 import { StatusCode, type SqlValue } from '../src/common/types.js';
-import type { AnyVirtualTableModule } from '../src/vtab/module.js';
+import { makeNoAlterModule } from './no-alter-module.js';
 
 // ── Outcome contract ────────────────────────────────────────────────────────
 
@@ -196,11 +195,16 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
-		label: 'alterPrimaryKey (memory: native in-place re-key)',
+		// Memory honors this natively (in-place re-key of its trees, indexes and pending layers).
+		label: 'alterPrimaryKey',
 		seed: u => [`create table t (id integer primary key, code integer not null)${u}`, `insert into t values (1, 100), (2, 200)`],
 		alter: `alter table t alter primary key (code)`,
 		memory: { kind: 'honored' },
-		stubUnsupported: false, // no-alterTable modules still get the engine's shadow-rebuild fallback
+		// A module with no `alterTable` AND no `renameTable` cannot take the shadow-rebuild
+		// fallback either — the rebuild ends in a RENAME the module would never hear about — so
+		// the engine refuses with a sited UNSUPPORTED. The rebuild leg is covered separately
+		// below, with a stub that keeps `renameTable`.
+		stubUnsupported: true,
 		confirm: async (db, outcome) => {
 			if (outcome === 'honored') {
 				expect(await pkColumns(db), 'PK re-keyed to code').to.deep.equal(['code']);
@@ -209,9 +213,8 @@ const ARMS: Arm[] = [
 			} else {
 				expect(await pkColumns(db), 'PK unchanged on reject').to.deep.equal(['id']);
 			}
-			// Both legs of this arm (memory's native re-key and the no-`alterTable`
-			// shadow-rebuild fallback) must leave the per-column flags mirroring the
-			// definition, honored or rejected.
+			// Both legs of this arm (memory's native re-key and the refused no-hook stub) must
+			// leave the per-column flags mirroring the definition, honored or rejected.
 			expectKeyFlagsAgreeWithDefinition(db);
 		},
 	},
@@ -534,27 +537,6 @@ const ARMS: Arm[] = [
 	},
 ];
 
-// ── No-`alterTable` stub: a module that omits the hook entirely. Every routed
-// arm must surface the engine's sited `UNSUPPORTED` ("does not support …"), not
-// a crash. Built by delegating create/connect/destroy to a memory module while
-// omitting `alterTable`/`renameTable` (it is NOT a MemoryTableModule subclass, so
-// the ALTER-PRIMARY-KEY memory-rebuild fast path is not mistakenly taken).
-
-function makeNoAlterModule(opts: { withRenameTable?: boolean } = {}): AnyVirtualTableModule {
-	const inner = new MemoryTableModule();
-	return {
-		concurrencyMode: inner.concurrencyMode,
-		create: inner.create.bind(inner),
-		connect: inner.connect.bind(inner),
-		destroy: inner.destroy.bind(inner),
-		getCapabilities: inner.getCapabilities.bind(inner),
-		getBestAccessPlan: inner.getBestAccessPlan.bind(inner),
-		// alterTable intentionally omitted. `renameTable` too by default; the ALTER PRIMARY
-		// KEY rebuild test below opts it back in because that fallback ends in a RENAME.
-		...(opts.withRenameTable ? { renameTable: inner.renameTable.bind(inner) } : {}),
-	};
-}
-
 // ── Drivers ──────────────────────────────────────────────────────────────────
 
 async function runArm(db: Database, arm: Arm, using: string, expectation: Expectation): Promise<void> {
@@ -599,10 +581,11 @@ describe('ALTER conformance matrix — module without alterTable (sited UNSUPPOR
 		if (db) await db.close();
 	});
 
-	// Only arms with NO engine-side fallback. ADD CHECK is engine-side; ALTER
-	// PRIMARY KEY has a rebuild fallback; RENAME COLUMN degrades to a schema-only
-	// rename — all three would be (legitimately) honored without alterTable, so
-	// they are exempt and covered separately below.
+	// Only arms with NO engine-side fallback. Two arms are exempt because they WOULD be
+	// (legitimately) honored without alterTable, and are covered separately below: ADD CHECK is
+	// enforced engine-side, and RENAME COLUMN degrades to a documented schema-only rename.
+	// ALTER PRIMARY KEY is NOT exempt — it has a rebuild fallback, but this stub also omits
+	// `renameTable`, which the rebuild's closing RENAME requires.
 	for (const arm of ARMS.filter(a => a.stubUnsupported)) {
 		it(`${arm.label} → UNSUPPORTED`, async () => {
 			db = new Database();
@@ -619,17 +602,15 @@ describe('ALTER conformance matrix — module without alterTable (sited UNSUPPOR
 	// when the module omits alterTable (module.ts: "renameColumn degrades to an
 	// engine-side schema-only rename instead"). Assert that contract explicitly —
 	// it is honored, and the read-back proves it is not a silent no-op.
-	// ALTER PRIMARY KEY is likewise exempt from the UNSUPPORTED sweep: `runAlterPrimaryKey`
-	// falls back to a shadow-table rebuild. That path ends at a PARSER-built schema, so its
+	// ALTER PRIMARY KEY's honored leg needs the `renameTable`-keeping stub, because the
+	// rebuild finishes with DROP + RENAME: a module that omits `renameTable` would leave its
+	// internal table map keyed under the shadow name and the rebuilt table could not be
+	// connected at all, which is why the engine refuses that shape outright (the sweep above).
+	// With the hook present the rebuild runs, ending at a PARSER-built schema, so its
 	// per-column PK flags come out consistent with the definition for free — assert it
 	// rather than assume, since it is the third producer of a re-keyed schema (after the
 	// memory module and the store) and the only one not routed through
 	// `rekeySchemaPrimaryKey`.
-	//
-	// Uses the `renameTable`-keeping stub: the rebuild finishes with DROP + RENAME, so a
-	// module that omits `renameTable` leaves its internal table map keyed under the shadow
-	// name and the rebuilt table cannot be connected at all. That gap is orthogonal to the
-	// PK flags under test here.
 	it('alterPrimaryKey → honored via engine-side shadow rebuild, flags consistent', async () => {
 		db = new Database();
 		db.registerModule('noalter', makeNoAlterModule({ withRenameTable: true }));

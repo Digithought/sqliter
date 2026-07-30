@@ -19,7 +19,7 @@ import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } fro
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
-import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
+import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
 	snapshotStaleMaterializedViews,
@@ -33,6 +33,7 @@ import { isMaintainedTable } from '../../schema/derivation.js';
 import { inferType } from '../../types/registry.js';
 
 const log = createLogger('runtime:emit:alter-table');
+const warnLog = log.extend('warn');
 
 /** A scheduled sub-program resolved to a callback the emitter invokes per row. */
 
@@ -1499,14 +1500,48 @@ async function runAlterPrimaryKey(
 			return null;
 		} catch (e) {
 			if (e instanceof QuereusError && e.code === StatusCode.UNSUPPORTED) {
-				// Fall through to rebuild
+				// Fall through to rebuild. The swallow is the documented protocol
+				// (docs/module-authoring.md § `alterPrimaryKey`), but a swallowed error must
+				// still leave a trace — this is the only record that the native re-key was
+				// attempted and declined.
+				warnLog(
+					'Module %s declined an in-place re-key of %s.%s (UNSUPPORTED: %s); falling back to a shadow-table rebuild',
+					tableSchema.vtabModuleName ?? '<unknown>', tableSchema.schemaName, tableSchema.name, e.message,
+				);
 			} else {
 				throw e;
 			}
 		}
 	}
 
-	// Rebuild fallback
+	// Rebuild fallback. Two preconditions, both refusals rather than repairs — see
+	// `rebuildViaShadowTable` for why neither has a correct outcome. Checked here, after the
+	// native attempt, so both entry paths into the rebuild (no `alterTable` hook at all; the
+	// hook raised UNSUPPORTED) are covered by one check each; a module that raised
+	// UNSUPPORTED has by contract mutated nothing, so a refusal here leaves the catalog, the
+	// table and the enclosing transaction untouched. Capability first: it is unconditional,
+	// so it is the more informative answer when both apply.
+	if (!module.renameTable) {
+		throw new QuereusError(
+			`Module '${tableSchema.vtabModuleName ?? '<unknown>'}' does not support ALTER PRIMARY KEY on table `
+				+ `'${tableSchema.name}': the module implements neither 'alterTable' (to re-key in place) nor `
+				+ `'renameTable', and the engine's fallback rebuild finishes by renaming a shadow table over `
+				+ `this one — without 'renameTable' the module would keep the rows under the shadow name and `
+				+ `the rebuilt table could not be opened.`,
+			StatusCode.UNSUPPORTED,
+		);
+	}
+	if (isExplicitTransactionOpen(rctx.db)) {
+		throw new QuereusError(
+			`ALTER PRIMARY KEY on table '${tableSchema.name}' is not allowed inside an explicit transaction: `
+				+ `module '${tableSchema.vtabModuleName ?? '<unknown>'}' cannot re-key in place, so the statement `
+				+ `would fall back to a shadow-table rebuild whose DROP + RENAME survives ROLLBACK while its row `
+				+ `copy does not — a rollback would leave an empty table and destroy rows committed before this `
+				+ `transaction began. COMMIT or ROLLBACK first, then re-issue in autocommit mode.`,
+			StatusCode.ERROR,
+		);
+	}
+
 	await rebuildTableWithNewShape(rctx, tableSchema, schema, tableSchema.columns.map(c => c.name), newPkDef);
 
 	// Same re-key as the native arm, for the same reason — the rebuild reaches the catalog
@@ -1525,7 +1560,8 @@ async function runAlterPrimaryKey(
  * shadow-table SQL approach with DROP+RENAME. This is the fallback for a module
  * whose `alterTable` throws `UNSUPPORTED` for `alterPrimaryKey` (or omits the
  * hook); the built-in memory and store modules both re-key in place and never
- * reach it.
+ * reach it. See `rebuildViaShadowTable` for the two preconditions
+ * `runAlterPrimaryKey` checks before calling this.
  */
 async function rebuildTableWithNewShape(
 	rctx: RuntimeContext,
@@ -1683,6 +1719,22 @@ async function runDropMaintained(
 /**
  * Generic rebuild via shadow table SQL, for a module without a native
  * `alterPrimaryKey`.
+ *
+ * Two preconditions the caller (`runAlterPrimaryKey`) enforces, because this rebuild has no
+ * correct outcome without them:
+ *
+ *  - **The module must implement `renameTable`.** The last step renames the shadow table over
+ *    the original; a module that files its rows under the table's name and never hears about
+ *    the rename keeps them under the shadow name while the catalog says otherwise, and the
+ *    rebuilt table cannot be connected at all.
+ *  - **No explicit transaction may be open.** The two halves have different transactional
+ *    lifetimes: the schema half (DROP + RENAME) escapes ROLLBACK on every
+ *    `DdlTransactionality` tier a built-in module reaches, while the row copy is staged in the
+ *    transaction and IS undone. A ROLLBACK would therefore keep the new empty table and
+ *    discard the copy of the rows it replaced — destroying data committed before the
+ *    transaction began. Making the schema half roll back needs transactional DDL no module
+ *    offers; making the data half survive would commit part of the user's transaction behind
+ *    their back.
  */
 async function rebuildViaShadowTable(
 	rctx: RuntimeContext,

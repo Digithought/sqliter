@@ -22,10 +22,13 @@ import {
 	Database,
 	DefaultVTableEventEmitter,
 	MemoryTableModule,
+	QuereusError,
+	StatusCode,
 	type DatabaseDataChangeEvent,
 	type VTableDataChangeEvent,
 } from '../src/index.js';
 import type { MemoryTableManager } from '../src/vtab/memory/layer/manager.js';
+import { makeNoAlterModule } from './no-alter-module.js';
 
 async function allRows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
 	const rows: Record<string, unknown>[] = [];
@@ -423,5 +426,110 @@ describe('ALTER PRIMARY KEY mid-transaction keeps the transaction\'s writes (mem
 			assert.equal(uEvents.length, 1);
 			assert.deepEqual(uEvents[0].key, [9]);
 		});
+	});
+});
+
+/**
+ * The other half of the same data-loss family, for a module that CANNOT re-key in place and so
+ * takes the engine's shadow-table rebuild. There the loss is worse than a lost pending write:
+ * the rebuild's DROP + RENAME survives ROLLBACK while its row copy does not, so a rollback
+ * keeps the new empty table and discards the copy of the rows it replaced — destroying rows
+ * committed BEFORE the transaction began. No outcome is correct (see `rebuildViaShadowTable`),
+ * so `runAlterPrimaryKey` refuses the rebuild while an explicit transaction is open.
+ */
+describe('ALTER PRIMARY KEY rebuild fallback is refused inside an explicit transaction', () => {
+	let db: Database;
+
+	/** The table's key, by column name, in key order. */
+	async function pkNames(table = 't'): Promise<string[]> {
+		const r = await allRows(db, `select name from table_info('${table}') where pk > 0 order by pk`);
+		return r.map(x => String(x.name));
+	}
+
+	async function attempt(sql: string): Promise<QuereusError> {
+		try {
+			await db.exec(sql);
+		} catch (e) {
+			assert.ok(e instanceof QuereusError, `expected a QuereusError, got ${String(e)}`);
+			return e;
+		}
+		throw new assert.AssertionError({ message: `expected '${sql}' to be refused, but it succeeded` });
+	}
+
+	beforeEach(async () => {
+		db = new Database();
+		// Keeps `renameTable` (so the rebuild is otherwise available) but omits `alterTable`,
+		// which is what sends the statement down the rebuild in the first place.
+		db.registerModule('noalter', makeNoAlterModule({ withRenameTable: true }));
+		await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a)) using noalter');
+		await db.exec("insert into t values (5, 5, 'pre')");
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('refuses with ERROR, leaves the transaction open, and ROLLBACK keeps the committed row', async () => {
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 9, 'x')");
+
+		const err = await attempt('alter table t alter primary key (a, b)');
+		assert.equal(err.code, StatusCode.ERROR, err.message);
+		assert.match(err.message, /explicit transaction/i);
+		assert.match(err.message, /\bt\b/, 'message must be sited on the table');
+
+		// The refusal must not have disturbed the transaction: still open, still usable, and
+		// the pending write is still visible to it.
+		assert.equal(db.getAutocommit(), false, 'the explicit transaction must still be open');
+		assert.deepEqual(await allRows(db, 'select * from t order by a'), [
+			{ a: 1, b: 9, v: 'x' },
+			{ a: 5, b: 5, v: 'pre' },
+		]);
+		await db.exec("insert into t values (2, 2, 'y')");
+
+		await db.exec('rollback');
+
+		// The whole point: the row committed before the transaction is still here, and the key
+		// is untouched.
+		assert.deepEqual(await allRows(db, 'select * from t'), [{ a: 5, b: 5, v: 'pre' }]);
+		assert.deepEqual(await pkNames(), ['a']);
+	});
+
+	it('a COMMIT after the refusal keeps the transaction\'s own writes', async () => {
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 9, 'x')");
+		await attempt('alter table t alter primary key (a, b)');
+		await db.exec('commit');
+
+		assert.deepEqual(await allRows(db, 'select * from t order by a'), [
+			{ a: 1, b: 9, v: 'x' },
+			{ a: 5, b: 5, v: 'pre' },
+		]);
+		assert.deepEqual(await pkNames(), ['a']);
+	});
+
+	it('the same statement is honored in autocommit mode', async () => {
+		// The guard must key off an EXPLICIT transaction only. The ALTER's own
+		// `_ensureTransaction()` opens an IMPLICIT one in autocommit mode, so a naive
+		// `getAutocommit()` check would refuse the one case the rebuild handles correctly.
+		await db.exec('alter table t alter primary key (a, b)');
+
+		assert.deepEqual(await pkNames(), ['a', 'b']);
+		assert.deepEqual(await allRows(db, 'select * from t'), [{ a: 5, b: 5, v: 'pre' }]);
+	});
+
+	it('a module missing renameTable is refused with UNSUPPORTED even in autocommit', async () => {
+		db.registerModule('norename', makeNoAlterModule());
+		await db.exec('create table s (a integer not null, b integer not null, v text, primary key (a)) using norename');
+		await db.exec("insert into s values (5, 5, 'pre')");
+
+		const err = await attempt('alter table s alter primary key (a, b)');
+		assert.equal(err.code, StatusCode.UNSUPPORTED, err.message);
+		assert.match(err.message, /does not support|not support/i);
+
+		// Still readable, still keyed as declared — the failure mode was a table the rebuild
+		// left unopenable.
+		assert.deepEqual(await allRows(db, 'select * from s'), [{ a: 5, b: 5, v: 'pre' }]);
+		assert.deepEqual(await pkNames('s'), ['a']);
 	});
 });

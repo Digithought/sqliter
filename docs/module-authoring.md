@@ -904,6 +904,13 @@ It returns a frozen schema with a frozen `primaryKeyDefinition` (each member car
 
 It is the template for the no-silent-divergence rule. Modules that can re-key in place should handle the change directly and return an updated `TableSchema` — both built-in modules do (the memory module re-keys its trees, secondary indexes, and any open transaction's pending layers and pending change events; the store physically re-keys the data store). Modules that **cannot** re-key in place should throw `QuereusError(StatusCode.UNSUPPORTED)` — `runAlterPrimaryKey` catches that specific code and falls back to a generic shadow-table rebuild that copies all rows from the old table into a new table with the updated PK definition, then swaps it in place. Any other thrown error propagates unchanged. Beware what the fallback cannot do: a shadow rebuild copies **committed** rows only, so a module that owns transactional pending state must either re-key it natively or refuse the change with a non-`UNSUPPORTED` error (`BUSY` reads best) while a transaction holds uncommitted writes — an `UNSUPPORTED` refusal is swallowed by the fallback and the pending writes are silently lost.
 
+The engine will also decline to run the fallback at all in two cases, raising a sited error instead (so "throws `UNSUPPORTED`" does not guarantee the statement then succeeds):
+
+- **The module implements no `renameTable`.** The rebuild finishes by renaming the shadow table over the original, and a module that never hears about that rename keeps its rows under the shadow name — the rebuilt table cannot be connected. Refused with `UNSUPPORTED` regardless of transaction state. A module that wants the fallback must implement `renameTable`.
+- **An explicit (`BEGIN`-opened) transaction is in progress.** The rebuild's `DROP` + `RENAME` survives `ROLLBACK` while its row copy does not, so a rollback would leave an empty table and destroy rows committed before the transaction began. Refused with `ERROR` (not `BUSY` — retrying inside the same transaction can never succeed). This is the engine's backstop for *any* module; it does not remove a module's own obligation to refuse with `BUSY` when it holds uncommitted writes, since that refusal has to happen even when the module's own `alterTable` is present.
+
+Neither check runs before your `alterTable` — both sit between it and the rebuild, so a module raising `UNSUPPORTED` (which by contract has mutated nothing) still sees the catalog, the table and the transaction left untouched by the refusal.
+
 ## Best Practices
 
 ### 1. Estimate honestly

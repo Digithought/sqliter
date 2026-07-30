@@ -623,6 +623,13 @@ ALTER TABLE table_name ALTER PRIMARY KEY (col_name [ASC|DESC] [, ...]);
 
 Replaces the table's primary key definition. All named columns must have a NOT NULL constraint. The empty-PK case `ALTER PRIMARY KEY ()` is permitted (the table reverts to an implicit rowid-style key). Modules that support re-keying in place handle the change directly — both built-in modules do (MemoryTable re-keys its trees, indexes, and any open transaction's pending layers; the store physically re-keys the data store and rebuilds secondary indexes). A third-party module that cannot re-key throws `UNSUPPORTED`, and the engine falls back to an automatic shadow-table rebuild that copies all rows into a new table with the updated PK and swaps it in place.
 
+That fallback has two preconditions, and the statement is **refused** rather than rebuilt when either fails — in both cases a rebuild has no correct outcome, so a sited error is strictly better than a statement that reports success:
+
+- **The module must implement `renameTable`.** The rebuild finishes by renaming the shadow table over the original; a module that never hears about the rename keeps its rows filed under the shadow name while the catalog says otherwise, and the rebuilt table cannot be opened at all. Missing hook ⇒ `UNSUPPORTED`, in any transaction state.
+- **The statement must not be inside an explicit (`BEGIN`-opened) transaction.** The rebuild's two halves have different lifetimes: the schema half (`DROP` + `RENAME`) survives `ROLLBACK`, while the row copy is staged in the transaction and is undone by it — so a rollback would keep the new *empty* table and discard the copy of the rows it replaced, destroying data committed before the transaction began. Inside a transaction ⇒ `ERROR` (deliberately not `BUSY`: a retry inside the same transaction can never succeed). `COMMIT` or `ROLLBACK` first, then re-issue in autocommit mode. This refusal applies under the default `ddl_transaction_policy = permissive` too — it is narrower but stricter than that pragma's `strict` gate, which refuses module-dispatching DDL merely because the schema change *escapes* rollback; this rebuild also destroys committed rows.
+
+Neither refusal touches the catalog, the table, or the enclosing transaction: a module that raised `UNSUPPORTED` has by contract mutated nothing, and the checks run before the rebuild starts.
+
 **ALTER COLUMN**
 
 ```sql
