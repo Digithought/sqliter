@@ -585,6 +585,61 @@ export function shiftSchemaIndicesForDrop(schema: TableSchema, colIndex: number)
 }
 
 /**
+ * `schema` re-keyed to `newPkColumns` — a frozen copy whose `primaryKeyDefinition` AND
+ * per-column `primaryKey` / `pkOrder` flags both describe the NEW key. The
+ * `ALTER TABLE … ALTER PRIMARY KEY` sibling of {@link shiftSchemaIndicesForDrop} (same
+ * role: one schema mutation shared by both built-in modules — the memory module's
+ * `MemoryTableManager.buildRekeyedPrimaryKeySchema` and the store module's
+ * `StoreModuleAlter.alterPrimaryKeyChange`).
+ *
+ * A table records its key twice: `primaryKeyDefinition` (authoritative — what
+ * `table_info`, key extraction and the DDL generator read) and the per-column flags (a
+ * CREATE-time mirror feeding the planner's uniqueness hints and the `ColumnDef` AST
+ * that `RENAME COLUMN` reconstructs). Swapping only the definition leaves the flags
+ * naming the retired key, so this helper rebuilds both together and is the only way
+ * a module should re-key.
+ *
+ * Each member's `collation` is carried from its column (as `create table`'s PK builder
+ * records it) — dropping it would silently re-key a NOCASE column's structures under
+ * BINARY. `pkDirection` is deliberately NOT written: only an *inline*
+ * `a integer primary key desc` populates it at CREATE time (a table-level
+ * `primary key (a desc)` leaves it `undefined`), so direction is not a field this mirror
+ * is expected to carry. It lives in `primaryKeyDefinition.desc`, which is what the DDL
+ * generator reads. See the NOTE on {@link ColumnSchema.pkDirection}.
+ *
+ * The incoming `columns` are never mutated — a fresh array of fresh `ColumnSchema`
+ * objects is built. The pre-ALTER schema is handed onward as `oldObject` on the
+ * `table_modified` notification and kept by the memory manager as its rollback
+ * snapshot, and `ColumnSchema` objects are not frozen, so in-place mutation would
+ * silently corrupt both with nothing to catch it.
+ *
+ * No validation here (bounds / duplicates / NOT NULL): the memory manager keeps its own
+ * pre-checks by index and the engine emitter (`runAlterPrimaryKey`) validates by column
+ * name before dispatch.
+ */
+export function rekeySchemaPrimaryKey(
+	schema: TableSchema,
+	newPkColumns: ReadonlyArray<{ index: number; desc?: boolean }>,
+): TableSchema {
+	const primaryKeyDefinition = Object.freeze(newPkColumns.map(pk => ({
+		index: pk.index,
+		desc: pk.desc ?? false,
+		collation: schema.columns[pk.index]?.collation || 'BINARY',
+	})));
+
+	// 1-based position in the new key, 0 for a non-member.
+	const pkOrderByIndex = new Map<number, number>();
+	newPkColumns.forEach((pk, i) => pkOrderByIndex.set(pk.index, i + 1));
+
+	const columns = Object.freeze(schema.columns.map((col, index) => {
+		const pkOrder = pkOrderByIndex.get(index) ?? 0;
+		return { ...col, primaryKey: pkOrder > 0, pkOrder };
+	}));
+
+	return Object.freeze({ ...schema, columns, primaryKeyDefinition });
+}
+
+/**
  * Creates a basic TableSchema with minimal configuration
  *
  * @param name Table name

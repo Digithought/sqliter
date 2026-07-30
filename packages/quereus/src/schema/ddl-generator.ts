@@ -115,10 +115,21 @@ function generateTableDDLInternal(
 	// the key and preserves nullability (see isSynthesizedAllColumnsKey).
 	const synthesizedKey = isSynthesizedAllColumnsKey(tableSchema);
 
+	// The one column that carries the inline `PRIMARY KEY` clause, or -1 when there is
+	// none to emit (no key, a composite key — rendered table-level below — or a
+	// synthesized all-columns key). Resolved from `primaryKeyDefinition`, the
+	// authoritative key record, NOT from the per-column `primaryKey` flag: the flag is a
+	// CREATE-time mirror that `ALTER TABLE … ALTER PRIMARY KEY` producers may leave
+	// pointing at the retired key, and rendering from it emitted DDL that re-parsed to
+	// the OLD key (and, on a composite→single move, two inline clauses).
+	const inlinePkIndex = !synthesizedKey && tableSchema.primaryKeyDefinition.length === 1
+		? tableSchema.primaryKeyDefinition[0].index
+		: -1;
+
 	const columnDefs: string[] = [];
-	for (const col of tableSchema.columns) {
-		columnDefs.push(formatColumnDef(col, tableSchema, ctx.defaultNotNull, synthesizedKey));
-	}
+	tableSchema.columns.forEach((col, columnIndex) => {
+		columnDefs.push(formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex));
+	});
 
 	// Table-level PRIMARY KEY: empty () for singleton, (a, b, ...) for composite.
 	// Single-column PK is emitted inline on the column above. A synthesized
@@ -479,7 +490,13 @@ function qualifiedName(schemaName: string | undefined, name: string, currentSche
 	return `${quoteName(schemaName)}.${quotedName}`;
 }
 
-function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined, synthesizedKey: boolean): string {
+/**
+ * Renders one column definition. `isInlinePk` is decided by the caller from
+ * `primaryKeyDefinition` (see `generateTableDDLInternal`) — this function never
+ * consults the per-column `primaryKey` flag, so flag drift from any ALTER producer
+ * cannot reach the emitted DDL.
+ */
+function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined, isInlinePk: boolean): string {
 	let colDef = quoteName(col.name);
 	// NOTE: emits the flattened col.logicalType.name (e.g. 'INTEGER'), not col.declaredType
 	// (e.g. 'BIGINT'). That's intentional today — declaredType is informational-only, read
@@ -506,7 +523,7 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 	// synthesized single-column key (a one-column no-PK table) emits no PK clause.
 	// DESC is emitted so a descending key survives the round-trip (the re-parse
 	// would otherwise silently re-key ascending).
-	if (col.primaryKey && tableSchema.primaryKeyDefinition.length === 1 && !synthesizedKey) {
+	if (isInlinePk) {
 		colDef += tableSchema.primaryKeyDefinition[0].desc ? ' PRIMARY KEY DESC' : ' PRIMARY KEY';
 	}
 

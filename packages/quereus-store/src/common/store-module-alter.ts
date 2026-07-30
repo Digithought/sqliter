@@ -27,6 +27,7 @@ import {
 	buildUniqueConstraintSchema,
 	columnDefToSchema,
 	foldDefaultToType,
+	rekeySchemaPrimaryKey,
 	renameColumnInCheckConstraints,
 	renameColumnInIndexPredicates,
 	resolveNamedConstraintClass,
@@ -402,12 +403,12 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		change: Extract<SchemaChangeInfo, { type: 'alterPrimaryKey' }>,
 	): Promise<TableSchema> {
 		const newPkColumns = change.newPkColumns;
-		const updatedSchema: TableSchema = {
-			...oldSchema,
-			primaryKeyDefinition: Object.freeze(
-				newPkColumns.map(pk => ({ index: pk.index, desc: pk.desc })),
-			),
-		};
+		// Shared with the memory module's native arm: rebuilds `primaryKeyDefinition` AND the
+		// per-column `primaryKey` / `pkOrder` flags together, so the DDL this arm persists (and
+		// the planner's uniqueness hints) describe the NEW key. Each member also carries its
+		// column's collation, which this arm previously dropped — the store keys PK columns
+		// under their declared collation (`StoreTable.pkKeyCollations`).
+		const updatedSchema: TableSchema = rekeySchemaPrimaryKey(oldSchema, newPkColumns);
 
 		// Physical re-key ahead — flush buffered writes so every live row is
 		// re-keyed and no stale-schema op replays over the rewritten store.

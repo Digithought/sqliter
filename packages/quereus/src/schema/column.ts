@@ -44,7 +44,20 @@ export interface ColumnSchema {
 	generatedExpr?: Expression;
 	/** Whether the generated value is stored (true) or virtual/computed on read (false) */
 	generatedStored?: boolean;
-	/** Sort direction for primary key ('asc' | 'desc') */
+	/**
+	 * Sort direction for primary key ('asc' | 'desc').
+	 *
+	 * NOTE: only ONE authoring form populates this — an inline `a integer primary key desc`
+	 * column constraint. A table-level `primary key (a desc)` records the direction on
+	 * `TableSchema.primaryKeyDefinition` and leaves this `undefined`, and
+	 * `rekeySchemaPrimaryKey` (the shared ALTER PRIMARY KEY mutation) deliberately does not
+	 * write it either. So for the table-level and post-ALTER shapes,
+	 * `buildConstraintsFromColumn` (`runtime/emit/alter-table.ts`, the `RENAME COLUMN`
+	 * AST rebuild) emits `direction: undefined` for a genuinely descending key. Harmless
+	 * today because every consumer reads `primaryKeyDefinition.desc`; if a module is ever
+	 * added that rebuilds its key from that reconstructed `ColumnDef`, a `desc` key would
+	 * silently flip ascending.
+	 */
 	pkDirection?: 'asc' | 'desc';
 	/**
 	 * Default conflict resolution declared at the column level for this column's

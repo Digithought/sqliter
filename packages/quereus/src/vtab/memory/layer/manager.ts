@@ -1,5 +1,5 @@
 import type { Database } from '../../../core/database.js';
-import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, shiftSchemaIndicesForDrop } from '../../../schema/table.js';
+import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from '../../../schema/table.js';
 import { keyParts, type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
@@ -2344,12 +2344,6 @@ export class MemoryTableManager {
 	 * returns before the first mutation, throwing exactly what the real application would
 	 * throw — the same dry-run contract as {@link alterColumn}'s, for a wrapper (the
 	 * isolation layer) that must pre-flight before a shared underlying mutates irreversibly.
-	 *
-	 * NOTE: like the store's native arm and the engine's retired rebuild fallback, this swaps
-	 * `primaryKeyDefinition` only — the per-column `primaryKey` / `pkOrder` flags keep their
-	 * CREATE-time values. Everything that decides key membership reads the definition
-	 * (`table_info`, the DDL generator's multi-column path, key extraction); the flags feed
-	 * planner uniqueness hints, which were equally stale on both prior paths.
 	 */
 	async alterPrimaryKey(
 		newPkColumns: ReadonlyArray<{ index: number; desc?: boolean }>,
@@ -2438,12 +2432,12 @@ export class MemoryTableManager {
 
 	/**
 	 * Resolve `alter primary key`'s column list against the current schema — bounds, no
-	 * duplicates, every member NOT NULL — and return the new schema with
-	 * `primaryKeyDefinition` swapped. The engine's emitter validates the same three by
-	 * column NAME before dispatch; re-checking by index here keeps a wrapper driving the
-	 * module API directly (the isolation layer) from installing an unkeyable definition.
-	 * Each member carries its column's collation, as `create table`'s PK builder records it
-	 * — dropping it would silently re-key a NOCASE column's structures under BINARY.
+	 * duplicates, every member NOT NULL — and return the re-keyed schema. The engine's
+	 * emitter validates the same three by column NAME before dispatch; re-checking by index
+	 * here keeps a wrapper driving the module API directly (the isolation layer) from
+	 * installing an unkeyable definition. The schema construction itself (definition +
+	 * per-column flag rebuild, member collations carried) is delegated to the shared
+	 * {@link rekeySchemaPrimaryKey}, which the store's native arm uses too.
 	 */
 	private buildRekeyedPrimaryKeySchema(
 		newPkColumns: ReadonlyArray<{ index: number; desc?: boolean }>,
@@ -2472,14 +2466,7 @@ export class MemoryTableManager {
 			}
 		}
 
-		return Object.freeze({
-			...this.tableSchema,
-			primaryKeyDefinition: Object.freeze(newPkColumns.map(pk => ({
-				index: pk.index,
-				desc: pk.desc ?? false,
-				collation: columns[pk.index].collation || 'BINARY',
-			}))),
-		});
+		return rekeySchemaPrimaryKey(this.tableSchema, newPkColumns);
 	}
 
 	/**

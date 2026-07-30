@@ -85,6 +85,23 @@ async function pkColumns(db: Database, table = 't'): Promise<string[]> {
 	return (await rows(db, `select name from table_info('${table}') where pk > 0 order by pk`)).map(r => String(r.name));
 }
 
+/**
+ * Asserts the two records of a table's key agree: the authoritative
+ * `primaryKeyDefinition` and the per-column `primaryKey` / `pkOrder` flags (a
+ * CREATE-time mirror feeding the planner's uniqueness hints and the `ColumnDef` AST
+ * that RENAME COLUMN reconstructs). ALTER PRIMARY KEY is the only operation that can
+ * break the agreement — each producer must rebuild both, via `rekeySchemaPrimaryKey`.
+ */
+function expectKeyFlagsAgreeWithDefinition(db: Database, table = 't'): void {
+	const schema = db.schemaManager.findTable(table)!;
+	const expected = schema.columns.map((_, i) => {
+		const pos = schema.primaryKeyDefinition.findIndex(pk => pk.index === i);
+		return { primaryKey: pos >= 0, pkOrder: pos >= 0 ? pos + 1 : 0 };
+	});
+	const actual = schema.columns.map(c => ({ primaryKey: c.primaryKey, pkOrder: c.pkOrder }));
+	expect(actual, `per-column PK flags must mirror primaryKeyDefinition on '${table}'`).to.deep.equal(expected);
+}
+
 /** Runs an ALTER, returning the thrown QuereusError or null. Re-throws non-Quereus errors (a crash is not a clean reject). */
 async function attemptAlter(db: Database, sql: string): Promise<QuereusError | null> {
 	try {
@@ -192,6 +209,10 @@ const ARMS: Arm[] = [
 			} else {
 				expect(await pkColumns(db), 'PK unchanged on reject').to.deep.equal(['id']);
 			}
+			// Both legs of this arm (memory's native re-key and the no-`alterTable`
+			// shadow-rebuild fallback) must leave the per-column flags mirroring the
+			// definition, honored or rejected.
+			expectKeyFlagsAgreeWithDefinition(db);
 		},
 	},
 	{
@@ -519,7 +540,7 @@ const ARMS: Arm[] = [
 // omitting `alterTable`/`renameTable` (it is NOT a MemoryTableModule subclass, so
 // the ALTER-PRIMARY-KEY memory-rebuild fast path is not mistakenly taken).
 
-function makeNoAlterModule(): AnyVirtualTableModule {
+function makeNoAlterModule(opts: { withRenameTable?: boolean } = {}): AnyVirtualTableModule {
 	const inner = new MemoryTableModule();
 	return {
 		concurrencyMode: inner.concurrencyMode,
@@ -528,7 +549,9 @@ function makeNoAlterModule(): AnyVirtualTableModule {
 		destroy: inner.destroy.bind(inner),
 		getCapabilities: inner.getCapabilities.bind(inner),
 		getBestAccessPlan: inner.getBestAccessPlan.bind(inner),
-		// alterTable + renameTable intentionally omitted.
+		// alterTable intentionally omitted. `renameTable` too by default; the ALTER PRIMARY
+		// KEY rebuild test below opts it back in because that fallback ends in a RENAME.
+		...(opts.withRenameTable ? { renameTable: inner.renameTable.bind(inner) } : {}),
 	};
 }
 
@@ -596,6 +619,30 @@ describe('ALTER conformance matrix — module without alterTable (sited UNSUPPOR
 	// when the module omits alterTable (module.ts: "renameColumn degrades to an
 	// engine-side schema-only rename instead"). Assert that contract explicitly —
 	// it is honored, and the read-back proves it is not a silent no-op.
+	// ALTER PRIMARY KEY is likewise exempt from the UNSUPPORTED sweep: `runAlterPrimaryKey`
+	// falls back to a shadow-table rebuild. That path ends at a PARSER-built schema, so its
+	// per-column PK flags come out consistent with the definition for free — assert it
+	// rather than assume, since it is the third producer of a re-keyed schema (after the
+	// memory module and the store) and the only one not routed through
+	// `rekeySchemaPrimaryKey`.
+	//
+	// Uses the `renameTable`-keeping stub: the rebuild finishes with DROP + RENAME, so a
+	// module that omits `renameTable` leaves its internal table map keyed under the shadow
+	// name and the rebuilt table cannot be connected at all. That gap is orthogonal to the
+	// PK flags under test here.
+	it('alterPrimaryKey → honored via engine-side shadow rebuild, flags consistent', async () => {
+		db = new Database();
+		db.registerModule('noalter', makeNoAlterModule({ withRenameTable: true }));
+		await db.exec(`create table t (id integer primary key, code integer not null) using noalter`);
+		await db.exec(`insert into t values (1, 100), (2, 200)`);
+		await db.exec(`alter table t alter primary key (code)`);
+
+		expect(await pkColumns(db), 'PK re-keyed to code by the rebuild').to.deep.equal(['code']);
+		const r = await rows(db, `select id from t where code = 100`);
+		expect(r[0]?.id, 'rows survived the rebuild and are reachable under the new key').to.equal(1);
+		expectKeyFlagsAgreeWithDefinition(db);
+	});
+
 	it('renameColumn → honored via engine-side schema-only fallback', async () => {
 		db = new Database();
 		db.registerModule('noalter', makeNoAlterModule());
