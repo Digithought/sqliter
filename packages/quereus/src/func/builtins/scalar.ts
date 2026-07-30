@@ -2,7 +2,7 @@ import type { SqlValue, DeepReadonly } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { compareSqlValues, getSqlDataTypeName } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { ANY_TYPE, INTEGER_TYPE, REAL_TYPE, isNumericOrUnknownType } from '../../types/builtin-types.js';
+import { ANY_TYPE, INTEGER_TYPE, NULL_TYPE, REAL_TYPE, isNumericOrUnknownType } from '../../types/builtin-types.js';
 import type { CustomEmitterHook } from '../../schema/function.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
@@ -511,14 +511,22 @@ function emitExtremum(direction: 1 | -1): CustomEmitterHook {
  * A mixed-category group (`greatest(int_col, '2')` can return the text `'2'`)
  * declares ANY rather than {@link findCommonType}'s first-argument fallback, which
  * would advertise INTEGER for a value that is text.
+ *
+ * A NULL-typed argument contributes no value the declaration has to cover — the
+ * only thing it can win with is NULL, which `nullable: true` already allows — so
+ * it is dropped before the test rather than dragged into a mixed-category ANY:
+ * `greatest(int_col, null)` stays INTEGER.
  */
 function extremumReturnType(
 	argTypes: ReadonlyArray<DeepReadonly<LogicalType>>,
 ): DeepReadonly<LogicalType> {
-	if (argTypes.length === 0) return ANY_TYPE;
-	const allSame = argTypes.every(t => t.name === argTypes[0].name);
-	const allNumeric = argTypes.every(t => t.isNumeric === true);
-	return allSame || allNumeric ? findCommonType(argTypes) : ANY_TYPE;
+	const valued = argTypes.filter(t => t.name !== NULL_TYPE.name);
+	// Nothing but NULLs (or no arguments at all) — findCommonType already answers
+	// NULL / ANY respectively.
+	if (valued.length === 0) return findCommonType(argTypes);
+	const allSame = valued.every(t => t.name === valued[0].name);
+	const allNumeric = valued.every(t => t.isNumeric === true);
+	return allSame || allNumeric ? findCommonType(valued) : ANY_TYPE;
 }
 
 // Greatest-of function

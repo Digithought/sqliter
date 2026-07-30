@@ -307,7 +307,10 @@ value that was never an argument. A comparison builtin that returns a *fresh*
 value leaves `returnsArg` unset and keeps the plan-time rewrite. Because the
 arguments the planner sees are then the ones the user wrote, `greatest`/`least`
 declare `ANY` for a group that is neither all-one-type nor all-numeric, rather
-than advertising the first argument's type for a value that may not have it.
+than advertising the first argument's type for a value that may not have it. A
+NULL-typed argument is left out of that test — the only value it can win with is
+NULL, which the declaration is nullable for anyway — so `greatest(int_col, null)`
+still declares INTEGER.
 
 `greatest`/`least` NULL handling is a separate, pre-existing wrinkle the
 comparison work deliberately left alone: `greatest` skips NULLs, but `least` is

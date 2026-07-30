@@ -211,6 +211,13 @@ interface BaseFunctionSchema {
 	 * A function that returns a FRESH value computed from a compared group (a
 	 * hypothetical `same_value(a, b)` returning a boolean) leaves this unset and
 	 * keeps the plan-time rewrite. See `planner/building/coercion.ts`.
+	 *
+	 * NOTE: nothing validates that a schema setting this also supplies a
+	 * {@link BaseFunctionSchema.customEmitter} calling `makeComparisonGroup`. Setting
+	 * it without one turns the declared group OFF rather than moving it, since the
+	 * plan-time rewrite is skipped and no emit-time conversion replaces it. Harmless
+	 * while the three builtins are the only setters; if third-party registrations
+	 * start using it, reject the pairing in `Database.registerFunction`.
 	 */
 	readonly returnsArg?: boolean;
 	/**
