@@ -988,7 +988,7 @@ Reserved.
 
 ### SCH-001 — Index names are unique per schema
 
-- code: `packages/quereus/src/schema/manager.ts` — `findIndexNameOwnerElsewhere`
+- code: `packages/quereus/src/schema/manager.ts` — `findIndexOwner`, `findIndexNameOwnerElsewhere`
 - code: `packages/quereus/src/schema/catalog.ts` — `isImplicitCoveringIndex`
 - code: `packages/quereus/src/schema/schema-differ.ts` — `computeSchemaDiff`
 - guard: `packages/quereus/test/schema-manager.spec.ts` — `Index names are unique per schema`
@@ -1000,9 +1000,12 @@ table in the same schema (`IF NOT EXISTS` does not suppress it), and `computeSch
 rejects two `index` declarations sharing a name. Implicit covering structures are excluded
 by `isImplicitCoveringIndex`: a UNIQUE constraint's auto-built index takes the constraint's
 name, which is unique only per *table*. An **exposed** implicit structure is likewise
-outside the guarantee. This is what makes the by-name resolvers carrying no table name —
-`dropIndex`, `ALTER INDEX … SET TAGS`, sync's `findIndexOwner` and its migration version
-key — unambiguous. `importIndex` warns rather than fails, so an older database still opens.
+outside the guarantee. This is what makes by-name resolution carrying no table name
+unambiguous. There is one such resolver — `SchemaManager.findIndexOwner`, used by
+`dropIndex`, its strict-DDL-policy gate, `ALTER INDEX … SET TAGS` (at the wider
+`tag-addressable` scope, which admits an exposed implicit structure), the `createIndex`
+uniqueness check itself, and sync's replicated index DDL plus its migration version key.
+`importIndex` warns rather than fails, so an older database still opens.
 
 ### SCH-002 — The per-column primary-key flags mirror `primaryKeyDefinition`
 

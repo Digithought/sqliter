@@ -57,6 +57,31 @@ export interface ReferencingForeignKey {
 const EMPTY_REFERENCING_FKS: readonly ReferencingForeignKey[] = Object.freeze([]);
 
 /**
+ * How much of a schema's index namespace a by-name owner lookup
+ * ({@link SchemaManager.findIndexOwner}) should consider.
+ */
+export type IndexLookupScope =
+	/**
+	 * Only indexes a user may create, drop or rename. An implicit covering
+	 * structure — the auto-built secondary BTree backing a declared `UNIQUE`
+	 * constraint — is excluded whether hidden or exposed: its lifecycle belongs to
+	 * the constraint, so removing it means `ALTER TABLE … DROP CONSTRAINT`. Default.
+	 */
+	| 'user-indexes'
+	/**
+	 * Additionally admits an *exposed* implicit covering structure (constraint
+	 * tagged `quereus.expose_implicit_index`), which IS addressable by
+	 * `ALTER INDEX … TAGS`. Hidden ones stay excluded.
+	 */
+	| 'tag-addressable';
+
+/** The table owning a by-name index match, paired with the matched index. */
+export interface IndexOwnerMatch {
+	readonly table: TableSchema;
+	readonly index: IndexSchema;
+}
+
+/**
  * Generic options passed to VTab modules during CREATE TABLE.
  * Modules are responsible for interpreting these.
  */
@@ -1234,12 +1259,13 @@ export class SchemaManager {
 		// Primary path: a materialized IndexSchema — every real index, plus the
 		// memory backend's materialized implicit covering index. Tags live on the
 		// matched IndexSchema. A *hidden* implicit index is not user-addressable and
-		// is skipped here; it then fails the exposed-constraint fallback below
-		// (its name is materialized, so it is not "exposed and unmaterialized") and
-		// surfaces as NOTFOUND — preserving Phase 22/37 behavior.
-		for (const table of schema.getAllTables()) {
-			const matched = table.indexes?.find(idx => idx.name.toLowerCase() === lower);
-			if (!matched || isHiddenImplicitIndex(table, matched.name)) continue;
+		// is skipped by the `tag-addressable` scope; it then fails the
+		// exposed-constraint fallback below (its name is materialized, so it is not
+		// "exposed and unmaterialized") and surfaces as NOTFOUND — preserving
+		// Phase 22/37 behavior.
+		const match = this.findIndexOwner(targetSchemaName, indexName, { scope: 'tag-addressable' });
+		if (match) {
+			const { table, index: matched } = match;
 			// Compute before rebuilding the index array so a drop-of-absent NOTFOUND
 			// aborts before any swap.
 			const nextTags = compute(matched.tags);
@@ -2438,16 +2464,68 @@ export class SchemaManager {
 	}
 
 	/**
+	 * The table in `schemaName` owning the index named `indexName`, paired with the
+	 * matched {@link IndexSchema} — or `undefined` when nothing in scope carries the
+	 * name. The one by-name index-owner resolver: `DROP INDEX` ({@link dropIndex} and
+	 * the strict-DDL-policy gate in `runtime/emit/drop-index.ts`),
+	 * `ALTER INDEX … TAGS` ({@link resolveIndexTagSwap}), `CREATE INDEX`'s
+	 * schema-wide name-uniqueness check ({@link findIndexNameOwnerElsewhere}) and
+	 * `@quereus/sync`'s replicated index DDL all funnel here.
+	 *
+	 * Index names are unique per schema, not per table (docs/sql-ddl.md §6.3), and
+	 * {@link createIndex} rejects a name already taken elsewhere in the schema, so
+	 * first-match is unambiguous by construction. That invariant is what makes
+	 * replication safe: a replicated `drop index "main"."idx"` carries no table name
+	 * (the DROP INDEX grammar has no slot for one), so without it each receiver would
+	 * resolve the owner by its own table-registration order and two devices could drop
+	 * different indexes while both believing they converged.
+	 *
+	 * An out-of-scope match is **skipped and the scan continues** — never stopped at.
+	 * That is what lets one table's constraint-backed `uq_email` coexist with another
+	 * table's real index of the same name (constraint names are unique per *table*, so
+	 * two tables may each declare `constraint uq_email unique (email)`). Both scope
+	 * predicates read only `uniqueConstraints`, which every backend carries, so the
+	 * filter behaves the same on the store as in memory.
+	 *
+	 * Case-insensitive on both `indexName` and `options.excludeTable`, like every
+	 * other index-name comparison in the engine. An unknown `schemaName` yields
+	 * `undefined` rather than throwing — callers that must distinguish a missing
+	 * schema from a missing index check for it themselves first.
+	 *
+	 * @param options.scope Which part of the namespace to consider; defaults to
+	 *   `'user-indexes'` (see {@link IndexLookupScope}).
+	 * @param options.excludeTable Skip this table entirely — used by the
+	 *   name-uniqueness check, which asks about *other* tables only.
+	 */
+	findIndexOwner(
+		schemaName: string,
+		indexName: string,
+		options?: { scope?: IndexLookupScope; excludeTable?: string },
+	): IndexOwnerMatch | undefined {
+		const schema = this.getSchema(schemaName);
+		if (!schema) return undefined;
+
+		const outOfScope = options?.scope === 'tag-addressable' ? isHiddenImplicitIndex : isImplicitCoveringIndex;
+		const lowerIndexName = indexName.toLowerCase();
+		const lowerExcluded = options?.excludeTable?.toLowerCase();
+		for (const table of schema.getAllTables()) {
+			if (lowerExcluded !== undefined && table.name.toLowerCase() === lowerExcluded) continue;
+			const index = table.indexes?.find(idx => idx.name.toLowerCase() === lowerIndexName);
+			if (!index || outOfScope(table, index.name)) continue;
+			return { table, index };
+		}
+		return undefined;
+	}
+
+	/**
 	 * The table in `targetSchemaName` — other than `ownerTableName` — that already
 	 * carries a **user** index named `indexName`, or `undefined` when the name is
 	 * free. Backs the schema-wide index-name uniqueness rule enforced by
 	 * {@link createIndex} and warned about by {@link importIndex}.
 	 *
-	 * Implicit covering structures are skipped. The auto-built secondary BTree
-	 * backing a `UNIQUE` constraint is named after that constraint (or `_uc_<cols>`),
-	 * and constraint names are unique per *table*, so two tables may legitimately
-	 * each declare `constraint uq_email unique (email)` and each materialize an
-	 * index named `uq_email`. Counting those would reject a valid schema.
+	 * Implicit covering structures are skipped (the default
+	 * {@link findIndexOwner} scope): counting them would reject a valid schema in
+	 * which two tables each declare `constraint uq_email unique (email)`.
 	 *
 	 * NOTE: an *exposed* implicit covering index (constraint tagged
 	 * `quereus.expose_implicit_index`) IS user-addressable by `ALTER INDEX`, so two
@@ -2461,18 +2539,7 @@ export class SchemaManager {
 		ownerTableName: string,
 		indexName: string,
 	): TableSchema | undefined {
-		const schema = this.getSchema(targetSchemaName);
-		if (!schema) return undefined;
-
-		const lowerIndexName = indexName.toLowerCase();
-		const lowerOwnerName = ownerTableName.toLowerCase();
-		for (const table of schema.getAllTables()) {
-			if (table.name.toLowerCase() === lowerOwnerName) continue;
-			const matched = table.indexes?.find(idx => idx.name.toLowerCase() === lowerIndexName);
-			if (!matched || isImplicitCoveringIndex(table, matched.name)) continue;
-			return table;
-		}
-		return undefined;
+		return this.findIndexOwner(targetSchemaName, indexName, { excludeTable: ownerTableName })?.table;
 	}
 
 	/**
@@ -2501,25 +2568,19 @@ export class SchemaManager {
 			throw new QuereusError(`Schema not found: ${schemaName}`, StatusCode.ERROR);
 		}
 
-		// Find which table owns this index
+		// Find which table owns this index.
 		// NOTE: a table may hold a UNIQUE constraint whose name equals an unrelated
 		// user index's name on that same table (`create index foo on t (b); alter
 		// table t add constraint foo unique (a);` — both succeed today). There the
-		// predicate is true and this refuses the drop even though a real index also
-		// carries the name. That state is already broken in worse ways (memory
-		// materializes two entries literally named `foo`) and is tracked as
+		// out-of-scope predicate is true and this refuses the drop even though a real
+		// index also carries the name. That state is already broken in worse ways
+		// (memory materializes two entries literally named `foo`) and is tracked as
 		// bug-unique-constraint-name-collides-with-index-name; refusing is the
 		// conservative outcome — do not shape-match around it here.
 		const lowerIndexName = indexName.toLowerCase();
-		let ownerTable: TableSchema | undefined;
-		for (const table of schema.getAllTables()) {
-			const matched = table.indexes?.find(idx => idx.name.toLowerCase() === lowerIndexName);
-			if (!matched || isImplicitCoveringIndex(table, matched.name)) continue;
-			ownerTable = table;
-			break;
-		}
+		const ownerMatch = this.findIndexOwner(schemaName, indexName);
 
-		if (!ownerTable) {
+		if (!ownerMatch) {
 			if (ifExists) {
 				log(`Index %s.%s not found, but IF EXISTS specified`, schemaName, indexName);
 				return;
@@ -2527,15 +2588,15 @@ export class SchemaManager {
 			throw new QuereusError(`no such index: ${indexName}`, StatusCode.ERROR);
 		}
 
+		const ownerTable = ownerMatch.table;
 		// Stored display casing of the dropped index — the raw `indexName` arg may
-		// differ in case. Computed *before* the module call so module.dropIndex
-		// receives the stored name (the module-facing stored-name contract; see
-		// canonicalSchemaName), keeping a case-divergent `DROP INDEX iDx` from
-		// missing a module handle/registry keyed by the stored `idx` (e.g. the
-		// store's StoreTable.indexStores cache). Also reused by the events below.
-		const storedIndexName = ownerTable.indexes!.find(
-			idx => idx.name.toLowerCase() === lowerIndexName
-		)!.name;
+		// differ in case. Taken from the matched IndexSchema, i.e. *before* the module
+		// call, so module.dropIndex receives the stored name (the module-facing
+		// stored-name contract; see canonicalSchemaName), keeping a case-divergent
+		// `DROP INDEX iDx` from missing a module handle/registry keyed by the stored
+		// `idx` (e.g. the store's StoreTable.indexStores cache). Also reused by the
+		// events below.
+		const storedIndexName = ownerMatch.index.name;
 
 		// Call module.dropIndex if the module supports it
 		const moduleReg = ownerTable.vtabModuleName ? this.getModule(ownerTable.vtabModuleName) : undefined;

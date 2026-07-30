@@ -192,6 +192,10 @@ export { quoteIdentifier } from './emit/ast-stringify.js';
 // Schema management
 export { SchemaManager } from './schema/manager.js';
 export type { ImportCatalogOptions } from './schema/manager.js';
+// The one by-name index-owner resolver (SchemaManager.findIndexOwner) and its
+// scope/result types — `@quereus/sync` resolves a replicated index migration's
+// owning table through it rather than re-scanning the schema itself.
+export type { IndexLookupScope, IndexOwnerMatch } from './schema/manager.js';
 export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent } from './schema/change-events.js';
 export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from './schema/table.js';
 export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';

@@ -4,7 +4,6 @@ import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import type { SqlValue } from '../../common/types.js';
 import { requireVtabModule } from '../../schema/table.js';
-import { isImplicitCoveringIndex } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy, isDdlPolicyStrict } from './ddl-transaction-policy.js';
 
 export function emitDropIndex(plan: DropIndexNode, _ctx: EmissionContext): Instruction {
@@ -15,15 +14,10 @@ export function emitDropIndex(plan: DropIndexNode, _ctx: EmissionContext): Instr
 		// If nothing owns the index, skip the gate and let dropIndex handle IF EXISTS /
 		// not-found.
 		if (isDdlPolicyStrict(rctx.db)) {
-			const schema = rctx.db.schemaManager.getSchema(plan.schemaName);
-			const lowerIndexName = plan.indexName.toLowerCase();
-			// Skip implicit covering structures for the same reason SchemaManager.dropIndex
-			// does — otherwise the policy gate fires against a table whose index is not
-			// the one dropIndex will resolve (or against no droppable index at all).
-			const owner = schema && Array.from(schema.getAllTables()).find(t => {
-				const matched = t.indexes?.find(idx => idx.name.toLowerCase() === lowerIndexName);
-				return matched !== undefined && !isImplicitCoveringIndex(t, matched.name);
-			});
+			// Same resolver, same default scope, as the drop itself — so the policy gate
+			// can never fire against a table whose index is not the one dropIndex will
+			// resolve (or against no droppable index at all).
+			const owner = rctx.db.schemaManager.findIndexOwner(plan.schemaName, plan.indexName)?.table;
 			if (owner) {
 				assertDdlTransactionPolicy(
 					rctx.db, requireVtabModule(owner), owner.vtabModuleName,

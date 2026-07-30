@@ -105,7 +105,7 @@
  * MV refresh).
  */
 
-import type { BackingRowChange, Database, ExternalRowChange, Row, SqlValue, TableIndexSchema, TableSchema } from '@quereus/quereus';
+import type { BackingRowChange, Database, ExternalRowChange, Row, SqlValue, TableSchema } from '@quereus/quereus';
 import { compareSqlValues, generateIndexDDL, generateTableDDL } from '@quereus/quereus';
 import type { ExternalRowOp, SchemaChangeEvent, StoreEventEmitter, StoreModule, StoreTable } from '@quereus/store';
 import { makePkIdentityEncoder } from '../metadata/pk-identity.js';
@@ -388,35 +388,6 @@ function normalizeDDL(ddl: string): string {
 }
 
 /**
- * Locate the table owning `indexName` in `schemaName`, case-insensitively.
- *
- * There is no direct index accessor on the schema manager, so this mirrors the
- * owner scan `SchemaManager.dropIndex` performs.
- *
- * NOTE: first-match is unambiguous only because `SchemaManager.createIndex`
- * rejects an index name already taken by a user index elsewhere in the same
- * schema. A replicated `drop index "main"."idx"` carries no table name (the
- * DROP INDEX grammar has no slot for one), so without that invariant each
- * receiver would resolve the owner by its own table-registration order and two
- * devices could drop different indexes while both believing they converged.
- */
-function findIndexOwner(
-  db: Database,
-  schemaName: string,
-  indexName: string,
-): { table: TableSchema; index: TableIndexSchema } | undefined {
-  const schema = db.schemaManager.getSchema(schemaName);
-  if (!schema) return undefined;
-
-  const lowerIndexName = indexName.toLowerCase();
-  for (const table of schema.getAllTables()) {
-    const index = table.indexes?.find(idx => idx.name.toLowerCase() === lowerIndexName);
-    if (index) return { table, index };
-  }
-  return undefined;
-}
-
-/**
  * The object named by the migration already exists locally: converge silently if
  * its definition matches the replicated one, otherwise throw a conflict naming
  * both definitions.
@@ -486,13 +457,16 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
     case 'add_index': {
       // For an index migration `change.table` holds the INDEX name, not the
       // table name (see `mapSchemaMigrationType` / `recordSchemaMigration`).
-      const owner = findIndexOwner(db, change.schema, change.table);
+      // `findIndexOwner` is the engine's own by-name owner resolver — the same one
+      // `DROP INDEX` uses, at the same default scope — so the receiver's verdict
+      // here can never disagree with what the replicated DDL would then resolve to.
+      const owner = db.schemaManager.findIndexOwner(change.schema, change.table);
       if (!owner) return 'execute';
       assertDefinitionMatches(change, generateIndexDDL(owner.index, owner.table));
       return 'already-applied';
     }
     case 'drop_index':
-      return findIndexOwner(db, change.schema, change.table) ? 'execute' : 'already-applied';
+      return db.schemaManager.findIndexOwner(change.schema, change.table) ? 'execute' : 'already-applied';
     default:
       // Column-level migrations (add_column / drop_column / alter_column) carry
       // no object-lifecycle state to compare; run them as before.
