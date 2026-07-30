@@ -989,6 +989,24 @@ outside the guarantee. This is what makes the by-name resolvers carrying no tabl
 `dropIndex`, `ALTER INDEX … SET TAGS`, sync's `findIndexOwner` and its migration version
 key — unambiguous. `importIndex` warns rather than fails, so an older database still opens.
 
+### SCH-002 — The per-column primary-key flags mirror `primaryKeyDefinition`
+
+- code: `packages/quereus/src/schema/table.ts` — `rekeySchemaPrimaryKey`
+- code: `packages/quereus/src/schema/ddl-generator.ts` — `generateTableDDLInternal`
+- code: `packages/quereus/src/schema/column.ts` — `pkOrder`
+- guard: `packages/quereus/test/schema-rekey-primary-key.spec.ts` — `rekeySchemaPrimaryKey`
+- doc: [Schema § DDL Generation](schema.md#ddl-generation)
+
+`TableSchema.primaryKeyDefinition` is the authoritative ordered key. The per-column
+`ColumnSchema.primaryKey` / `pkOrder` fields are a **mirror** of it, read by the planner's
+uniqueness hints and by the `ColumnDef` AST that `RENAME COLUMN` reconstructs. DDL
+generation renders both the inline and the table-level `PRIMARY KEY` clause from the
+definition alone, never from the mirror. Every module re-keying a table rebuilds both
+records together through `rekeySchemaPrimaryKey`; moving the definition without the mirror
+leaves the generator emitting a key the table no longer has, and on a composite→single move
+emits two inline `PRIMARY KEY` clauses that a re-parse silently merges back into the
+retired composite key.
+
 ## SYNC — Sync
 
 Reserved.
