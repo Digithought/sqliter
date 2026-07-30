@@ -228,23 +228,6 @@ function extractInCorrelation(
 	if (innerAttrs.length === 0) return null;
 	const innerFirstAttr = innerAttrs[0];
 
-	// Build the equi-join condition: outer.col = inner.firstCol
-	// We need a BinaryOpNode with = between the outer column ref and an inner column ref
-	const innerColRef = new ColumnReferenceNode(
-		outerColRef.scope,
-		outerColRef.expression,  // reuse expression for formatting
-		innerFirstAttr.type,
-		innerFirstAttr.id,
-		0 // column index in the inner relation
-	);
-
-	const equiCondition = new BinaryOpNode(
-		outerColRef.scope,
-		{ type: 'binary', operator: '=', left: outerColRef.expression, right: innerColRef.expression },
-		outerColRef,
-		innerColRef
-	);
-
 	// Walk through the subquery to find any additional correlation filters
 	let current: RelationalPlanNode = subqueryRoot;
 
@@ -256,9 +239,45 @@ function extractInCorrelation(
 		current = source;
 	}
 
+	// Gate: a LIMIT/OFFSET reached by the descent sits ABOVE the correlated
+	// filter, so it applies per outer row — a single semi join cannot express
+	// that. (A LIMIT *below* the correlated filter, inside a derived table, is
+	// uncorrelated and never reached here.)
+	if (current.nodeType === PlanNodeType.LimitOffset) return null;
+
+	// Whatever the descent landed on becomes the join's right side (minus the
+	// correlated filter, when one was found).
+	const innerSource = current instanceof FilterNode ? current.source : current;
+
+	// Gate: the right side must actually expose the IN comparison target. A bare
+	// column projection preserves the source column's attribute id, but a
+	// COMPUTED projection (`select b.x + 0 …`) mints a fresh id that nothing
+	// below defines — the join condition would reference an attribute no side
+	// provides. Mirrors the SELECT-list sibling's key-attribute lookup.
+	const innerKeyIndex = innerSource.getAttributes().findIndex(a => a.id === innerFirstAttr.id);
+	if (innerKeyIndex < 0) return null;
+
+	// Build the equi-join condition: outer.col = inner.firstCol. The inner
+	// reference gets its OWN AST — reusing the outer column's expression made
+	// EXPLAIN render every decorrelated IN condition as the nonsense `a.x = a.x`.
+	const innerColRef = new ColumnReferenceNode(
+		outerColRef.scope,
+		{ type: 'column', name: innerFirstAttr.name },
+		innerFirstAttr.type,
+		innerFirstAttr.id,
+		innerKeyIndex
+	);
+
+	const equiCondition = new BinaryOpNode(
+		outerColRef.scope,
+		{ type: 'binary', operator: '=', left: outerColRef.expression, right: innerColRef.expression },
+		outerColRef,
+		innerColRef
+	);
+
 	// If there's a filter with additional correlation, extract it
 	if (current instanceof FilterNode) {
-		const innerAttrIds = collectDefinedAttrIds(current.source);
+		const innerAttrIds = collectDefinedAttrIds(innerSource);
 		const conjuncts = splitConjuncts(current.predicate);
 		const additionalCorrelation: ScalarPlanNode[] = [];
 		const innerOnly: ScalarPlanNode[] = [];
@@ -282,7 +301,7 @@ function extractInCorrelation(
 		const residualInnerFilter = combineConjuncts(innerOnly);
 
 		return {
-			innerSource: current.source,
+			innerSource,
 			correlationCondition,
 			residualInnerFilter,
 		};
@@ -290,7 +309,7 @@ function extractInCorrelation(
 
 	// No inner filter — the only correlation is the IN condition itself
 	return {
-		innerSource: current,
+		innerSource,
 		correlationCondition: equiCondition,
 		residualInnerFilter: null,
 	};
@@ -444,6 +463,17 @@ function decorrelateOneConjunct(node: FilterNode): PlanNode | null {
 				? new FilterNode(extraction.innerSource.scope, extraction.innerSource, extraction.residualInnerFilter)
 				: extraction.innerSource;
 			joinCondition = extraction.correlationCondition;
+
+			// Correctness backstop: every correlation must have been LIFTED into the
+			// join condition. Anything still referencing an outer scope from inside
+			// the right side would be driven as if uncorrelated (a semi join does not
+			// re-establish the outer row context), so decline and leave the conjunct
+			// on the per-row path. Mirrors the SELECT-list sibling's
+			// `collectExternalReferences(distinctRight)` check.
+			if (collectExternalReferences(joinRight).size !== 0) {
+				log('Right side retains external references after extraction; skipping conjunct');
+				continue;
+			}
 		}
 
 		// Build the semi/anti join
