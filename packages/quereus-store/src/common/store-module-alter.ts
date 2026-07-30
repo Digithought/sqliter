@@ -16,6 +16,7 @@ import type {
 	ResolveColumnInSource,
 	SchemaChangeInfo,
 	SqlValue,
+	TableIndexSchema,
 	TableSchema,
 } from '@quereus/quereus';
 import {
@@ -81,7 +82,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 				updated = await this.alterAddColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
 				break;
 			case 'dropColumn':
-				updated = await this.alterDropColumn(schemaName, tableName, table, oldSchema, change);
+				updated = await this.alterDropColumn(db, schemaName, tableName, table, oldSchema, change);
 				break;
 			case 'renameColumn':
 				updated = await this.alterRenameColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
@@ -232,8 +233,10 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 	}
 
 	/** DROP COLUMN arm of {@link alterTable}: drop the column slot, reindex PK / indexes /
-	 *  UNIQUE, migrate rows, and persist. Behavior-preserving extraction. */
+	 *  UNIQUE, migrate rows, re-encode or tear down the affected physical index stores,
+	 *  and persist. */
 	private async alterDropColumn(
+		db: Database,
 		schemaName: string,
 		tableName: string,
 		table: StoreTable,
@@ -259,14 +262,46 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// generically, by diffing the old and new constraint sets after this arm returns. A *user*
 		// `CREATE UNIQUE INDEX` spanning the dropped column is removed from the schema by the helper
 		// itself.
-		//
-		// An index the helper removes outright (unique-spanning-the-slot, or a single-column index
-		// whose only column this is) leaves its physical `{table}_idx_{name}` store behind: nothing
-		// here calls `deleteIndexStore`, and `reconcileImplicitUniqueIndexStores` only covers
-		// `_uc_*` names. Pre-existing (the single-column collapse predates the shared helper) and
-		// tracked by `bug-drop-column-leaks-index-store` — a later `CREATE INDEX` reusing the same
-		// name adopts the stale store rather than a fresh one.
 		const shifted = shiftSchemaIndicesForDrop(oldSchema, colIndex);
+
+		// Every physical consequence the schema rewrite implies for the `{table}_idx_{name}`
+		// stores falls out of one diff: old index list vs post-shift list, by name.
+		//
+		//   REMOVED  — the helper dropped the index outright (UNIQUE spanning the dropped
+		//              column, or a single-column index whose only column this was). Its store
+		//              must be torn down, mirroring `DROP INDEX`: nothing else reclaims it
+		//              (`reconcileImplicitUniqueIndexStores` covers only `_uc_*` names), and a
+		//              later `CREATE INDEX` of the same name would ADOPT the stale entries —
+		//              `getIndexStore` hands back the existing store, `buildIndexEntries`
+		//              appends, and `assertStoreNameFree` cannot catch it (it compares against
+		//              REGISTERED schema objects, and this index is no longer one), so a range
+		//              scan through the reused index yields rows twice.
+		//   NARROWED — the index survives having lost one of its columns, so its key layout
+		//              (one fewer value ahead of the PK suffix) changed and every pre-existing
+		//              entry still carries the WIDE encoding while all later maintenance uses
+		//              the narrow one — lookups miss rows and deletes orphan entries. Rebuild
+		//              the store, as the PK / collation arms do. Only a column-count change
+		//              matters: a survivor that keeps every column has its column INDICES
+		//              shifted but encodes the same values in the same order, so its key bytes
+		//              are unchanged.
+		//
+		// Both sets are drawn from the ENGINE-FACING schemas, which carry no `_uc_*` (see
+		// `StoreModuleBase.materializedIndexNames`), so the implicit UNIQUE stores stay out of
+		// both — they remain owned by `reconcileImplicitUniqueIndexStores`, which runs after
+		// this arm returns. A `_uc_*` never narrows anyway: a UNIQUE constraint spanning the
+		// dropped column is removed outright and a survivor keeps its whole column set.
+		const oldIndexes = oldSchema.indexes ?? [];
+		const survivors = new Map(shifted.indexes.map(ix => [ix.name.toLowerCase(), ix]));
+		const removedIndexes: TableIndexSchema[] = [];
+		const narrowedIndexes: TableIndexSchema[] = [];
+		for (const before of oldIndexes) {
+			const after = survivors.get(before.name.toLowerCase());
+			if (!after) {
+				removedIndexes.push(before);
+			} else if (after.columns.length !== before.columns.length) {
+				narrowedIndexes.push(after);
+			}
+		}
 
 		const updatedSchema: TableSchema = {
 			...oldSchema,
@@ -289,9 +324,49 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		);
 		await table.migrateRows(remap, null);
 
+		// Re-encode every narrowed index against the now-re-encoded data store. AFTER
+		// `migrateRows`: the rebuild reads the data store and encodes each entry from the
+		// NEW column layout. `rebuildSecondaryIndexes` clears and rebuilds every index in
+		// the schema it is handed, so handing it a schema whose `.indexes` holds only the
+		// narrowed ones keeps the pass off the untouched indexes. A narrowed index is
+		// necessarily non-UNIQUE (a UNIQUE one spanning the slot was removed outright), so
+		// the build's in-pass duplicate check is never exercised; and the engine rejects a
+		// DROP COLUMN whose column is named by a partial index's WHERE clause, so the pass
+		// can never meet a predicate over the departed column.
+		//
+		// NOTE: this widens a failure window the arm already had — `migrateRows` above has
+		// already re-encoded the rows outside the coordinator while the catalog still
+		// describes the OLD schema, so an IO error anywhere from there to `saveTableDDL`
+		// leaves the two diverged until the statement is re-run. Same shape as
+		// `alterPrimaryKeyChange` (rekey → rebuild → persist). If either arm ever needs to
+		// be crash-safe, the fix is one durable marker covering the whole physical rewrite,
+		// not a reordering here.
+		if (narrowedIndexes.length > 0) {
+			await this.rebuildSecondaryIndexes(
+				schemaName,
+				tableName,
+				table,
+				{ ...updatedSchema, indexes: narrowedIndexes },
+				db.getKeyNormalizerResolver(),
+			);
+		}
+
 		// Update table schema and persist DDL
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
+
+		// Tear down each removed index's physical store — after the catalog write, for the
+		// same reason `dropIndex` orders it that way: the bundle must already omit the index
+		// so a failed physical delete cannot resurrect it on reopen.
+		//
+		// No second `ddlCommitPendingOps()` here (unlike `dropIndex`, which flushes
+		// immediately before its own teardown): the flush above already ran, and both
+		// `migrateRows` and `rebuildSecondaryIndexes` write straight to their stores outside
+		// the coordinator — so no buffered ops have accumulated against the doomed index
+		// handles in between, and the teardown cannot strand any at commit.
+		for (const removed of removedIndexes) {
+			await this.tearDownIndexStore(schemaName, tableName, table, removed.name);
+		}
 
 		this.eventEmitter?.emitSchemaChange({
 			type: 'alter',

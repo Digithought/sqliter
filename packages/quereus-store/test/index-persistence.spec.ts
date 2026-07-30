@@ -401,6 +401,137 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(names, 'index absent after reopen').to.not.include('ix_b');
 	});
 
+	// ── ALTER TABLE … DROP COLUMN and the physical index stores it reshapes
+	// (bug-drop-column-leaks-index-store). `shiftSchemaIndicesForDrop` removes an index
+	// outright when the dropped column was its ONLY column or when it is UNIQUE and spans
+	// the column, and NARROWS a plain multi-column index that merely loses one column. The
+	// removed index's store must be torn down and the narrowed one's re-encoded — its key
+	// layout loses one value ahead of the PK suffix.
+
+	it('DROP COLUMN collapsing a single-column index tears its backing store down', async () => {
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`insert into t values (1, 10, 100), (2, 20, 200)`);
+		expect(indexStoreSize('t', 'ix_b'), 'one entry per row before the drop').to.equal(2);
+
+		await db.exec(`alter table t drop column b`);
+
+		// Schema drops the index (its only column is gone) — and so must the store.
+		expect((await indexInfo(db, 't')).map(r => r.index_name), 'index gone from the schema')
+			.to.not.include('ix_b');
+		expect(provider.stores.has('main.t_idx_ix_b'), 'backing store torn down, not leaked')
+			.to.equal(false);
+	});
+
+	it('DROP COLUMN removing a UNIQUE index that spans the column tears its backing store down', async () => {
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create unique index ux_bc on t (b, c)`);
+		await db.exec(`insert into t values (1, 10, 100), (2, 20, 200)`);
+		expect(indexStoreSize('t', 'ux_bc')).to.equal(2);
+
+		// A UNIQUE index spanning the dropped column is removed outright rather than
+		// narrowed (narrowing would claim a constraint the table never declared).
+		await db.exec(`alter table t drop column b`);
+
+		expect((await indexInfo(db, 't')).map(r => r.index_name)).to.not.include('ux_bc');
+		expect(provider.stores.has('main.t_idx_ux_bc'), 'backing store torn down, not leaked')
+			.to.equal(false);
+	});
+
+	it('a same-named CREATE INDEX after DROP COLUMN builds a fresh store (no adopted stale entries)', async () => {
+		// The user-visible consequence of a leaked store: `getIndexStore` hands the existing
+		// store back and `buildIndexEntries` APPENDS to it, so the new index carries both
+		// encodings. `assertStoreNameFree` cannot catch it — the dropped index is no longer a
+		// registered schema object. A range scan then yields each row twice, because a stale
+		// key's leading bytes can fall inside the seek window and the row it resolves to does
+		// satisfy the predicate.
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`insert into t values (1, 10, 100), (2, 20, 200)`);
+
+		await db.exec(`alter table t drop column b`);
+		await db.exec(`create index ix_b on t (c)`);
+
+		expect(indexStoreSize('t', 'ix_b'), 'exactly one entry per row (no adopted stale entries)')
+			.to.equal(2);
+		expect(await rows(db, `select id from t where c = 100`)).to.deep.equal([{ id: 1 }]);
+		expect(await rows(db, `select id from t where c > 0 order by id`), 'each row exactly once')
+			.to.deep.equal([{ id: 1 }, { id: 2 }]);
+	});
+
+	it('DROP COLUMN narrowing a multi-column index re-encodes entries written before the drop', async () => {
+		// Rows inserted BEFORE the drop are what exposes this: their entries carry the WIDE
+		// key (b's value ahead of c's) while every later seek and every write-time delete
+		// computes the NARROW one, so a lookup misses the row and a delete orphans its entry.
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create index ix_bc on t (b, c)`);
+		await db.exec(`insert into t values (1, 10, 100), (2, 20, 200)`);
+		expect(indexStoreSize('t', 'ix_bc')).to.equal(2);
+
+		await db.exec(`alter table t drop column b`);
+
+		// The index survives over its remaining column, and the plan seeks through it.
+		expect(await rows(db, `select index_name, column_name from index_info('t')`))
+			.to.deep.equal([{ index_name: 'ix_bc', column_name: 'c' }]);
+		const planRows = await rows(db, `select json_group_array(op) as ops from query_plan('select id from t where c = 100')`);
+		expect(planRows[0].ops as string).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+
+		expect(indexStoreSize('t', 'ix_bc'), 'entry count preserved across the re-encode').to.equal(2);
+		expect(await rows(db, `select id from t where c = 100`), 'pre-drop row still found via the index')
+			.to.deep.equal([{ id: 1 }]);
+		expect(await rows(db, `select id from t where c > 0 order by id`), 'each pre-drop row exactly once')
+			.to.deep.equal([{ id: 1 }, { id: 2 }]);
+
+		// DELETE recomputes each index key under the narrow encoding: a fully-drained index
+		// store proves the rebuild and write-time maintenance agree on it.
+		await db.exec(`delete from t`);
+		expect(indexStoreSize('t', 'ix_bc'), 'no orphaned entries after the re-encode + delete').to.equal(0);
+	});
+
+	it('DROP COLUMN narrowing a PARTIAL index re-encodes only the in-scope rows', async () => {
+		// The narrowed rebuild compiles the surviving WHERE predicate against the POST-drop
+		// column list (the engine rejects a DROP COLUMN whose column the predicate names, so
+		// the predicate can only reference survivors). Out-of-scope rows must stay unindexed.
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create index ix_bc on t (b, c) where c > 0`);
+		await db.exec(`insert into t values (1, 10, 100), (2, 20, -5)`);
+		expect(indexStoreSize('t', 'ix_bc'), 'only the in-scope row is indexed at build').to.equal(1);
+
+		await db.exec(`alter table t drop column b`);
+
+		expect(indexStoreSize('t', 'ix_bc'), 'still only the in-scope row after the re-encode').to.equal(1);
+		expect(await rows(db, `select id from t where c = 100`)).to.deep.equal([{ id: 1 }]);
+
+		// Write-time maintenance agrees with the re-encoded entries in both scope directions.
+		await db.exec(`insert into t values (3, 300)`);
+		expect(indexStoreSize('t', 'ix_bc'), 'in-scope insert indexed').to.equal(2);
+		await db.exec(`insert into t values (4, -7)`);
+		expect(indexStoreSize('t', 'ix_bc'), 'out-of-scope insert excluded').to.equal(2);
+		await db.exec(`delete from t`);
+		expect(indexStoreSize('t', 'ix_bc'), 'no orphaned entries after the re-encode + delete').to.equal(0);
+	});
+
+	it('DROP COLUMN then reopen: the removed index does not resurrect from a leaked store', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`insert into t values (1, 10, 100), (2, 20, 200)`);
+
+		await db.exec(`alter table t drop column b`);
+		expect(await catalogEntry('t'), 'bundle no longer carries the index DDL').to.not.match(/CREATE INDEX/i);
+		await mod.closeAll();
+
+		const { db: db2 } = await reopen();
+		expect((await indexInfo(db2, 't')).map(r => r.index_name), 'index absent after reopen')
+			.to.not.include('ix_b');
+		expect(provider.stores.has('main.t_idx_ix_b'), 'store still absent after reopen').to.equal(false);
+	});
+
 	it('DROP TABLE then reopen: no table/index resurrection, no orphan catalog entry', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key, b integer) using store`);

@@ -142,12 +142,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 			// Best-effort teardown: guard it against its own throw so a teardown failure
 			// never masks the original build error the caller must see.
 			try {
-				await table.releaseIndexStore(indexSchema.name);
-				if (this.provider.deleteIndexStore) {
-					await this.provider.deleteIndexStore(schemaName, tableName, indexSchema.name);
-				} else {
-					await this.provider.closeIndexStore(schemaName, tableName, indexSchema.name);
-				}
+				await this.tearDownIndexStore(schemaName, tableName, table, indexSchema.name);
 			} catch (teardownError) {
 				console.warn(
 					`[StoreModule] failed to tear down index store '${indexSchema.name}' on `
@@ -260,10 +255,8 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		await this.saveTableDDL(updatedSchema);
 		table.markDdlSaved();
 
-		// Drop the cached handle on the table side and tear down the
-		// underlying KVStore. `deleteIndexStore` (if the provider implements
-		// it) closes the handle before removing the directory; otherwise we
-		// just close it.
+		// Drop the cached handle on the table side and tear down the underlying KVStore
+		// ({@link tearDownIndexStore}).
 		//
 		// Flush first: the coordinator keys buffered ops on the KVStore HANDLE, so ops
 		// this transaction queued against the index being dropped would be replayed into
@@ -271,12 +264,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		// teardown in `reconcileImplicitUniqueIndexStores` and the row-rewriting ALTER
 		// arms — see `StoreModuleBase.ddlCommitPendingOps`.
 		await this.ddlCommitPendingOps();
-		await table.releaseIndexStore(indexName);
-		if (this.provider.deleteIndexStore) {
-			await this.provider.deleteIndexStore(schemaName, tableName, indexName);
-		} else {
-			await this.provider.closeIndexStore(schemaName, tableName, indexName);
-		}
+		await this.tearDownIndexStore(schemaName, tableName, table, indexName);
 
 		// The dropped index may have been the structure REALIZING a plain UNIQUE over its
 		// columns; `updateSchema` above has re-materialized that constraint's own `_uc_*`,
@@ -419,7 +407,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		if (doomed.length > 0) {
 			await this.ddlCommitPendingOps();
 			for (const [, name] of doomed) {
-				await this.tearDownImplicitUniqueIndexStore(schemaName, tableName, table, name);
+				await this.tearDownIndexStore(schemaName, tableName, table, name);
 			}
 		}
 
@@ -452,8 +440,20 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		}
 	}
 
-	/** Close + delete the physical store of an implicit UNIQUE index. Mirrors `dropIndex`. */
-	private async tearDownImplicitUniqueIndexStore(
+	/**
+	 * Close + delete one index's physical store: release the table's cached handle, then
+	 * `deleteIndexStore` when the provider implements it (it closes the handle before
+	 * removing the directory), else just `closeIndexStore`.
+	 *
+	 * The single teardown every path shares — `dropIndex`, `createIndex`'s build-failure
+	 * rollback, the implicit `_uc_*` reconcile above, and `DROP COLUMN`'s removed-index
+	 * pass (`StoreModuleAlter.alterDropColumn`). Each caller owns the surrounding
+	 * posture, which deliberately differs: the DDL-commit flush (buffered ops are keyed
+	 * on the KVStore HANDLE, so a doomed store's queued ops would replay into a closed
+	 * store at commit — see `StoreModuleBase.ddlCommitPendingOps`) and, for
+	 * `createIndex`, swallowing a teardown throw so it cannot mask the build error.
+	 */
+	protected async tearDownIndexStore(
 		schemaName: string,
 		tableName: string,
 		table: StoreTable,
