@@ -26,6 +26,14 @@ export function tryCoerceToNumber(value: SqlValue): SqlValue {
  * Converts a value to a number for arithmetic contexts.
  * Non-numeric strings become 0 (SQL arithmetic semantics).
  * Used for +, -, *, /, % operations.
+ *
+ * NOTE: return type is `number`, so a numeric string past
+ * Number.MAX_SAFE_INTEGER (e.g. `'9007199254740993' + 0`) rounds here —
+ * unlike CAST/comparison, which go through INTEGER_TYPE.parse/NUMERIC_TYPE.parse
+ * (types/builtin-types.ts) and preserve exact bigint precision past 2^53. Fixing
+ * this means widening this function's return type to `number | bigint` and
+ * propagating that into mixedBigIntArithmetic (runtime/emit/binary.ts) — separate
+ * blast radius from the CAST/comparison/insert fix this note sits next to.
  */
 export function coerceToNumberForArithmetic(value: SqlValue): number {
 	if (typeof value === 'number') {

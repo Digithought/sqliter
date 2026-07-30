@@ -53,11 +53,17 @@ export const INTEGER_TYPE: LogicalType = {
 		if (typeof v === 'string') {
 			const trimmed = v.trim();
 			if (trimmed === '') return null;
-			const parsed = parseInt(trimmed, 10);
-			if (isNaN(parsed)) {
+			// Leading integer run only (mirrors parseInt's prefix leniency: '12abc' -> 12).
+			// Past 2^53 rebuild from the digit string, not the rounded number — same
+			// safe-integer boundary as the lexer's number() for INTEGER literals.
+			const m = /^[+-]?\d+/.exec(trimmed);
+			if (!m) {
 				throw new TypeError(`Cannot convert '${v}' to INTEGER`);
 			}
-			return parsed;
+			const digits = m[0];
+			const parsed = Number(digits);
+			if (Number.isSafeInteger(parsed)) return parsed;
+			return BigInt(digits[0] === '+' ? digits.slice(1) : digits);
 		}
 		throw new TypeError(`Cannot convert ${typeof v} to INTEGER`);
 	},
@@ -269,10 +275,13 @@ export const NUMERIC_TYPE: LogicalType = {
 			const trimmed = v.trim();
 			if (trimmed === '') return null;
 
-			// Try integer first
+			// Try integer first. Past 2^53 rebuild from the digit string, not the
+			// rounded number — same safe-integer boundary as the lexer's number()
+			// for INTEGER literals.
 			if (/^-?\d+$/.test(trimmed)) {
-				const parsed = parseInt(trimmed, 10);
-				if (!isNaN(parsed)) return parsed;
+				const parsed = Number(trimmed);
+				if (Number.isSafeInteger(parsed)) return parsed;
+				return BigInt(trimmed);
 			}
 
 			// Fall back to real

@@ -377,3 +377,76 @@ select count(*) as c from numeric_big;
 → [{"c":5}]
 
 DROP TABLE numeric_big;
+
+-- === TEXT -> INTEGER / NUMERIC conversion past 2^53 (regression) ===
+-- The string arm of parse() used to go through parseInt/parseFloat, which
+-- returns a `number` and silently rounds once the value exceeds 2^53. Both
+-- CAST and cross-category comparison (which CASTs the text operand at plan
+-- time) funnel through the same parse(), so one fix covers both symptoms.
+-- No 64-bit clamp: Quereus literals are already arbitrary-precision
+-- (`select 99999999999999999999999999` is exact), so the text path must
+-- agree rather than clamp to SQLite's INT64_MAX.
+--
+-- Bigint results below are compared via cast(... as text), not the raw numeric
+-- column: the test harness's JSON-diff path normalizes an actual bigint through
+-- Number() before comparing, which rounds a wrong result and a correct one to the
+-- same double — a raw-number assertion here would pass even if the fix regressed.
+
+select cast(v as text) as v from (select cast('9007199254740993' as integer) as v);
+→ [{"v":"9007199254740993"}]
+
+select cast(v as text) as v from (select cast('9007199254740993' as numeric) as v);
+→ [{"v":"9007199254740993"}]
+
+select cast(v as text) as v from (select cast('-9007199254740993' as integer) as v);
+→ [{"v":"-9007199254740993"}]
+
+select cast(v as text) as v from (select cast('9223372036854775807' as integer) as v);
+→ [{"v":"9223372036854775807"}]
+
+-- Arbitrary precision, past SQLite's INT64_MAX: matches the literal path, not SQLite.
+select cast(v as text) as v from (select cast('99999999999999999999999999' as integer) as v);
+→ [{"v":"99999999999999999999999999"}]
+
+-- A fractional form is not all-digit, so it falls through to parseFloat and stays
+-- a REAL (double) even past 2^53 — this matches SQLite and is unaffected by the fix.
+select cast('9007199254740993.0' as numeric) as v;
+→ [{"v":9007199254740992}]
+
+-- Prefix semantics (parseInt-style leading-digit-run) are preserved, matching SQLite.
+select cast('9e18' as integer) as v;
+→ [{"v":9}]
+
+select cast(v as text) as v from (select cast('9007199254740993abc' as integer) as v);
+→ [{"v":"9007199254740993"}]
+
+-- Unaffected existing behavior: prefix parse, plain doubles, whitespace trim.
+select cast('12abc' as integer) as v;
+→ [{"v":12}]
+
+select cast('3.14' as numeric) as v;
+→ [{"v":3.14}]
+
+select cast('  42  ' as integer) as v;
+→ [{"v":42}]
+
+select cast('abc' as integer) as v;
+→ [{"v":0}]
+
+select cast('' as integer) as v;
+→ [{"v":null}]
+
+-- Cross-category comparison: text past 2^53 must compare equal to the matching
+-- integer literal, not to its Number()-rounded neighbor.
+select 9007199254740993 = '9007199254740993' as r;
+→ [{"r":true}]
+
+select 9007199254740993 = '9007199254740992' as r;
+→ [{"r":false}]
+
+-- Insert-side: a text value past 2^53 written into a NUMERIC column reads back exact.
+CREATE TABLE numeric_text_insert (v NUMERIC);
+INSERT INTO numeric_text_insert VALUES ('9007199254740993');
+select cast(v as text) as v from numeric_text_insert;
+→ [{"v":"9007199254740993"}]
+DROP TABLE numeric_text_insert;
