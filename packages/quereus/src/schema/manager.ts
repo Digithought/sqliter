@@ -2577,8 +2577,14 @@ export class SchemaManager {
 	 * fires for it. If a module without native events ever needs to replicate,
 	 * thread the object schema in and call the `schema/ddl-generator.ts` generators
 	 * here the way the store and memory modules do at their own emit sites.
+	 *
+	 * Public because the `ALTER TABLE` arms live outside this class
+	 * (`runtime/emit/alter-table.ts`, `runtime/emit/add-constraint.ts`) and must reach the
+	 * SAME gate. Re-deciding "no listener / module has its own emitter" at a second site is
+	 * exactly what produced the data-channel double-emit the store package's
+	 * `database-events.spec.ts` guards against — keep one gate.
 	 */
-	private emitAutoSchemaEventIfNeeded(
+	emitAutoSchemaEventIfNeeded(
 		moduleName: string | undefined,
 		event: VTableSchemaChangeEvent
 	): void {

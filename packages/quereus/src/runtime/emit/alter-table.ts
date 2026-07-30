@@ -20,6 +20,7 @@ import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
+import { emitAlterSchemaEvent } from './alter-schema-event.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
 	snapshotStaleMaterializedViews,
@@ -311,6 +312,12 @@ async function runRenameTable(
 	// that keeps no per-name catalog) simply omits the hook.
 	await module.finalizeRename?.(rctx.db, tableSchema.schemaName, oldName, newName);
 
+	// The public schema-change event, for a module with no emitter of its own — see
+	// {@link emitAlterSchemaEvent} for why every arm emits at its tail rather than
+	// alongside the module call. Names only the NEW table: `DatabaseSchemaChangeEvent`
+	// has no old-object-name field, and the emitting backends have the identical gap.
+	emitAlterSchemaEvent(rctx, tableSchema, { type: 'alter', objectType: 'table', objectName: newName });
+
 	log('Renamed table %s.%s to %s', tableSchema.schemaName, oldName, newName);
 	return null;
 }
@@ -407,6 +414,13 @@ async function runRenameColumn(
 	// Propagate the rename into dependent objects (CHECK / FK / partial-index
 	// predicates in this and other tables, view and materialized-view bodies).
 	await propagateColumnRename(rctx, tableSchema.schemaName, tableSchema.name, oldName, newName, preStaleMvs, resolveColumnInSource);
+
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'column',
+		objectName: tableSchema.name,
+		columnName: newName,
+		oldColumnName: oldName,
+	});
 
 	log('Renamed column %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
 	return null;
@@ -717,6 +731,18 @@ async function runAddColumn(
 		newObject: finalTableSchema,
 	});
 
+	// ONE event for the whole statement, even when the column declared inline constraints.
+	// The install loop above makes a second `module.alterTable(addConstraint)` round-trip per
+	// inline constraint, and an emitter-backed module therefore announces `alter`/`column`
+	// followed by an `alter`/`table` per constraint — an artifact of its internal call
+	// pattern, not a second thing the application did. The deliberate divergence from that
+	// shape: do not "fix" this into two events.
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'column',
+		objectName: tableSchema.name,
+		columnName: columnDef.name,
+	});
+
 	log('Added column %s to table %s.%s', columnDef.name, tableSchema.schemaName, tableSchema.name);
 	return null;
 }
@@ -994,6 +1020,14 @@ async function runDropColumn(
 		newObject: finalSchema,
 	});
 
+	// `drop`, not `alter` — the arm removes an object. Matches what an emitter-backed module
+	// reports for the same statement.
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'drop', objectType: 'column',
+		objectName: tableSchema.name,
+		columnName,
+	});
+
 	log('Dropped column %s from table %s.%s', columnName, tableSchema.schemaName, tableSchema.name);
 	return null;
 }
@@ -1040,6 +1074,11 @@ async function runDropConstraint(
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
 		newObject: updatedTableSchema,
+	});
+
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'table',
+		objectName: tableSchema.name,
 	});
 
 	log('Dropped constraint %s from table %s.%s', constraintName, tableSchema.schemaName, tableSchema.name);
@@ -1097,6 +1136,13 @@ async function runRenameConstraint(
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
 		newObject: updatedTableSchema,
+	});
+
+	// A named constraint is not an `objectType` of its own, so the arm reports the TABLE it
+	// reshaped — same as an emitter-backed module does.
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'table',
+		objectName: tableSchema.name,
 	});
 
 	log('Renamed constraint %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
@@ -1240,6 +1286,15 @@ async function runAlterColumn(
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
 		newObject: updatedTableSchema,
+	});
+
+	// All four attribute forms (SET/DROP NOT NULL, SET DATA TYPE, SET/DROP DEFAULT,
+	// SET COLLATE) report the same `alter`/`column` shape — the event says which column
+	// changed, not which attribute.
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'column',
+		objectName: tableSchema.name,
+		columnName: action.columnName,
 	});
 
 	log('Altered column %s.%s.%s', tableSchema.schemaName, tableSchema.name, action.columnName);
@@ -1496,6 +1551,15 @@ async function runAlterPrimaryKey(
 				oldObject: tableSchema,
 				newObject: updatedTableSchema,
 			});
+
+			// NOTE: inside the try whose catch falls through to the rebuild — same caveat as
+			// the re-key above. The emit raises no UNSUPPORTED (the gate either emits or
+			// does not), so it cannot itself trigger the fallback.
+			emitAlterSchemaEvent(rctx, tableSchema, {
+				type: 'alter', objectType: 'table',
+				objectName: tableSchema.name,
+			});
+
 			log('Altered primary key of %s.%s (native)', tableSchema.schemaName, tableSchema.name);
 			return null;
 		} catch (e) {
@@ -1559,6 +1623,15 @@ async function runAlterPrimaryKey(
 	// would still line up with the event images.
 	rctx.db._getEventEmitter().rekeyBatchedDataEvents(
 		tableSchema.schemaName, tableSchema.name, oldPkIndices, newPkIndices);
+
+	// The rebuild's own four statements are silent (`rebuildViaShadowTable` runs them inside
+	// `withPublicEventsSuppressed`, which also swallows the inner RENAME TO arm's event). This
+	// emit is OUTSIDE that scope, so the re-key itself reports exactly one `alter`/`table` —
+	// the same shape the native branch above reports.
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'table',
+		objectName: tableSchema.name,
+	});
 
 	log('Altered primary key of %s.%s (rebuild)', tableSchema.schemaName, tableSchema.name);
 	return null;

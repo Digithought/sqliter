@@ -9,6 +9,7 @@ import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import { opsToMask, requireVtabModule } from '../../schema/table.js';
 import { buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
+import { emitAlterSchemaEvent } from './alter-schema-event.js';
 
 const log = createLogger('runtime:emit:add-constraint');
 
@@ -99,6 +100,13 @@ async function runAddCheckEngineSide(
 		newObject: updatedTableSchema
 	});
 
+	// A module with no `alterTable` hook is exactly the backend this fallback exists for, so
+	// this path reports too — same `alter`/`table` shape as the module-routed one below.
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'table',
+		objectName: tableSchema.name,
+	});
+
 	log('Added CHECK constraint %s to table %s.%s', constraintSchema.name, tableSchema.schemaName, tableSchema.name);
 
 	return null;
@@ -155,6 +163,11 @@ async function runAddConstraintViaModule(
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
 		newObject: updatedTableSchema,
+	});
+
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'table',
+		objectName: tableSchema.name,
 	});
 
 	log('Added %s constraint %s to table %s.%s',

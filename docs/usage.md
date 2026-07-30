@@ -416,12 +416,46 @@ The `DatabaseSchemaChangeEvent` interface:
 | `ddl` | `string` | DDL statement if available |
 | `remote` | `boolean` | `true` if the change originated from a remote source |
 
-`ALTER TABLE … ALTER PRIMARY KEY` on a backend that cannot re-key in place is the one DDL
-statement that reports nothing here. Its engine-internal rebuild (see above, and
-[`sql-ddl.md`](sql-ddl.md) § ALTER PRIMARY KEY) runs with this channel suppressed, so a
-subscriber that mirrors the catalog is never told that a machine-named `<table>__rekey_<ms>`
-shadow table was created and the real one dropped — neither of which is a change the
-application made.
+#### What each `ALTER TABLE` arm reports
+
+Every structural `ALTER TABLE` arm raises exactly **one** event, whether or not the storage
+backend ships an emitter of its own — a backend without one is covered by the engine's own
+fallback, so a subscriber sees the same facts either way:
+
+| Statement | `type` | `objectType` | `objectName` | `columnName` | `oldColumnName` |
+|---|---|---|---|---|---|
+| `rename to` | `alter` | `table` | **new** table name | — | — |
+| `rename column` | `alter` | `column` | table | **new** column name | old column name |
+| `add column` | `alter` | `column` | table | added column | — |
+| `drop column` | **`drop`** | `column` | table | dropped column | — |
+| `alter column …` (all four attribute forms) | `alter` | `column` | table | altered column | — |
+| `alter primary key` | `alter` | `table` | table | — | — |
+| `add constraint` | `alter` | `table` | table | — | — |
+| `drop constraint` | `alter` | `table` | table | — | — |
+| `rename constraint` | `alter` | `table` | table | — | — |
+
+Note `drop column` reports `type: 'drop'`, not `'alter'` — the arm removes an object.
+
+The event is raised on the statement's **success** path only: an ALTER that throws (including
+one that fails partway and unwinds, like an `add column` whose inline `CHECK` the existing rows
+violate) announces nothing at all. Like every other event, delivery is batched to commit and
+dropped on rollback.
+
+`add column` with inline constraints (`add column w text null unique`) still reports **one**
+event on the engine's fallback path. A backend that emits for itself may report an extra
+`alter`/`table` per inline constraint, reflecting its own internal call pattern rather than a
+second change the application made.
+
+Two arm families report nothing on either path: the metadata-tag arms (`set tags`, `add tags`,
+`drop tags`) and the materialized-view lifecycle arms (`set maintained`, `drop maintained`).
+Both are catalog-only and no backend announces them.
+
+`ALTER TABLE … ALTER PRIMARY KEY` on a backend that cannot re-key in place reports its one
+`alter`/`table` event like any other backend, but stays silent about the engine-internal rebuild
+that carries it out (see above, and [`sql-ddl.md`](sql-ddl.md) § ALTER PRIMARY KEY): that rebuild
+runs with this channel suppressed, so a subscriber that mirrors the catalog is never told that a
+machine-named `<table>__rekey_<ms>` shadow table was created and the real one dropped — neither
+of which is a change the application made.
 
 ### Per-Table Subscription via `db.getTable(...)`
 

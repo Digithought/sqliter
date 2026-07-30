@@ -12,7 +12,12 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import assert from 'node:assert/strict';
-import { Database, type DatabaseDataChangeEvent, type TransactionCommitBatch } from '@quereus/quereus';
+import {
+	Database,
+	type DatabaseDataChangeEvent,
+	type DatabaseSchemaChangeEvent,
+	type TransactionCommitBatch,
+} from '@quereus/quereus';
 import {
 	StoreModule,
 	StoreEventEmitter,
@@ -164,6 +169,36 @@ describe('Database-level events: store-backed DML single-emit', () => {
 		try {
 			await db.exec('create table t2 (id integer primary key) using store');
 			assert.equal(schemaEvents.length, 1, `expected 1 schema event, got ${schemaEvents.length}`);
+		} finally {
+			unsub();
+		}
+	});
+
+	// Same gate, ALTER side. The engine now raises its own schema event from every ALTER TABLE
+	// arm for backends that ship no emitter — so a store-backed table (which HAS one) is exactly
+	// where a second producer would show up as a doubled event.
+	it('DDL alter table add column over a store table emits exactly 1 onSchemaChange event', async () => {
+		const schemaEvents: DatabaseSchemaChangeEvent[] = [];
+		const unsub = db.onSchemaChange(e => schemaEvents.push(e));
+		try {
+			await db.exec('alter table t add column w text null');
+			assert.equal(schemaEvents.length, 1,
+				`expected 1 schema event, got ${schemaEvents.length}: ${JSON.stringify(schemaEvents)}`);
+			assert.equal(schemaEvents[0].type, 'alter');
+			assert.equal(schemaEvents[0].objectName, 't');
+		} finally {
+			unsub();
+		}
+	});
+
+	it('DDL alter table rename to over a store table emits exactly 1 onSchemaChange event', async () => {
+		const schemaEvents: DatabaseSchemaChangeEvent[] = [];
+		const unsub = db.onSchemaChange(e => schemaEvents.push(e));
+		try {
+			await db.exec('alter table t rename to t_renamed');
+			assert.equal(schemaEvents.length, 1,
+				`expected 1 schema event, got ${schemaEvents.length}: ${JSON.stringify(schemaEvents)}`);
+			assert.equal(schemaEvents[0].type, 'alter');
 		} finally {
 			unsub();
 		}

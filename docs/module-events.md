@@ -8,7 +8,7 @@ Quereus provides a unified event system at the database level that aggregates ev
 
 1. **Event Aggregation**: The `Database` class provides `onDataChange()` and `onSchemaChange()` methods that receive events from all modules
 2. **Native Module Events**: Modules that implement their own event emitter (via `getEventEmitter()`) have their events automatically forwarded to the database level
-3. **Automatic Events**: For modules without native event support, the engine automatically emits events after successful DML and DDL operations
+3. **Automatic Events**: For modules without native event support, the engine automatically emits events after successful DML operations and after the DDL statements listed under [For Modules without Native Events](#for-modules-without-native-events)
 4. **Transaction Batching**: Events are batched during transactions and only delivered after successful commit; on rollback, events are discarded
 5. **Savepoint Support**: Events respect savepoint semantics - `ROLLBACK TO SAVEPOINT` discards events from that savepoint forward, while `RELEASE SAVEPOINT` merges them into the parent transaction
 
@@ -177,17 +177,33 @@ class MyTable extends VirtualTable {
 
 ### For Modules without Native Events
 
-If your module doesn't need custom event logic (e.g., remote change tracking), simply don't implement `getEventEmitter()`. The engine will automatically emit events for all successful DML operations. These auto-emitted events:
+If your module doesn't need custom event logic (e.g., remote change tracking), simply don't implement `getEventEmitter()`. The engine will automatically emit events for all successful DML operations, and for the DDL statements listed below. These auto-emitted events:
 
 - Have `remote: false` (local changes only)
 - Include all event fields (`key`, `oldRow`, `newRow`, `changedColumns`)
 - Are batched within transactions and delivered after commit
 
+#### DDL coverage of the auto path
+
+The engine's fallback raises a schema-change event for:
+
+- `CREATE TABLE` / `CREATE INDEX` / `DROP INDEX`
+- **every structural `ALTER TABLE` arm** — `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`, all four `ALTER COLUMN` attribute forms, `ALTER PRIMARY KEY`, `ADD CONSTRAINT`, `DROP CONSTRAINT`, `RENAME CONSTRAINT`
+
+One event per statement, on its success path only, in the same shape a natively-emitting backend reports — see [usage.md § What each `ALTER TABLE` arm reports](usage.md#what-each-alter-table-arm-reports) for the per-arm table. The engine emits at the *end* of the arm (after its catalog swap), where a natively-emitting module emits from inside its own `alterTable`; the ordering difference is not observable, since each arm produces one event and delivery is batched to commit.
+
+Two `ALTER TABLE` arm families are **excluded** on both paths, so no asymmetry is introduced:
+
+- the metadata-tag arms (`SET TAGS`, `ADD TAGS`, `DROP TAGS`) — catalog-only; they never reach `module.alterTable`, and no backend announces them
+- the materialized-view lifecycle arms (`SET MAINTAINED`, `DROP MAINTAINED`) — these raise only *internal* catalog notifications (`materialized_view_added` / `_modified` / `_removed`)
+
+Auto DDL events carry no `ddl` text (the fallback has only the schema/object names at the emit site). A module that needs replication should implement its own emitter and render the DDL itself, as the memory and store modules do.
+
 ### Engine-Internal Scaffolding Is Silent
 
 A few statements the engine issues on its own behalf are not statements the application made, and are deliberately invisible on both channels. The engine runs them inside a suppression scope (`DatabaseEventEmitter.withPublicEventsSuppressed`): while it is open, no auto event is generated, and an event forwarded from a module's own emitter is discarded (with a debug log line) instead of delivered or batched.
 
-Today there is exactly one such scope: the shadow-table rebuild behind `ALTER TABLE … ALTER PRIMARY KEY` on a module that cannot re-key in place. It creates a shadow table with the new key, copies every row into it, drops the original, and renames the shadow over it — none of which is a change the application asked for, so a subscriber hears nothing. See [sql-ddl.md § ALTER PRIMARY KEY](sql-ddl.md) for the user-facing consequence.
+Today there is exactly one such scope: the shadow-table rebuild behind `ALTER TABLE … ALTER PRIMARY KEY` on a module that cannot re-key in place. It creates a shadow table with the new key, copies every row into it, drops the original, and renames the shadow over it — none of which is a change the application asked for, so a subscriber hears nothing about any of it. (The `ALTER PRIMARY KEY` statement's own `alter`/`table` event is raised *outside* the scope, so the re-key itself still reports.) See [sql-ddl.md § ALTER PRIMARY KEY](sql-ddl.md) for the user-facing consequence.
 
 What this means for a module with a native emitter:
 

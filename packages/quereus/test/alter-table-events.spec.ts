@@ -1011,10 +1011,11 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
  * a timestamped `<table>__rekey_<ms>` plus a `drop` of the real table. A re-key changes no row
  * and replaces no table, so the correct answer on both public channels is silence.
  *
- * The consequence — a subscriber gets NO notification that the primary key changed on this
- * path — is deliberate and documented (docs/sql-ddl.md § ALTER PRIMARY KEY): the positive
- * `alter` event belongs to every ALTER TABLE arm, not this one, and is tracked separately
- * (fix/bug-alter-table-emits-no-schema-event-without-native-module-emitter).
+ * What the subscriber DOES get is the arm's own positive event: exactly one `alter`/`table`
+ * naming the real table, raised by `runAlterPrimaryKey` after the rebuild returns — i.e.
+ * outside the suppression scope, so the re-key reports while its four internal statements stay
+ * hidden. The per-arm shapes live in `alter-table-schema-events.spec.ts`; what this describe
+ * pins is that the rebuild adds nothing to that one event.
  */
 describe('ALTER PRIMARY KEY via shadow-table rebuild: the rebuild is notification-silent', () => {
 	let db: Database;
@@ -1050,7 +1051,7 @@ describe('ALTER PRIMARY KEY via shadow-table rebuild: the rebuild is notificatio
 		assert.deepEqual(events, [], 'the row copy must not announce pre-existing rows as inserts');
 	});
 
-	it('delivers zero schema-change events, and nothing naming the shadow table', async () => {
+	it('delivers exactly the arm\'s own event, and nothing naming the shadow table', async () => {
 		const events: DatabaseSchemaChangeEvent[] = [];
 		const unsub = db.onSchemaChange(e => events.push(e));
 		try {
@@ -1060,13 +1061,14 @@ describe('ALTER PRIMARY KEY via shadow-table rebuild: the rebuild is notificatio
 		}
 
 		assert.deepEqual(
-			events.map(e => `${e.type} ${e.objectName}`), [],
-			'the rebuild must not report a create of a timestamped shadow table nor a drop of the real one',
+			events.map(e => `${e.type} ${e.objectType} ${e.objectName}`), ['alter table t'],
+			'the re-key reports itself, but the rebuild must not report a create of a timestamped '
+				+ 'shadow table, a drop of the real one, nor the shadow rename',
 		);
 		assert.equal(events.some(e => /__rekey_/.test(e.objectName)), false);
 	});
 
-	it('groups nothing on the transaction-commit channel either', async () => {
+	it('groups exactly that one event on the transaction-commit channel, with no data events', async () => {
 		const batches: TransactionCommitBatch[] = [];
 		const unsub = db.onTransactionCommit(b => batches.push(b));
 		try {
@@ -1075,7 +1077,10 @@ describe('ALTER PRIMARY KEY via shadow-table rebuild: the rebuild is notificatio
 			unsub();
 		}
 
-		assert.deepEqual(batches, [], 'the copy is not part of any batch the application should see');
+		assert.equal(batches.length, 1, `expected one batch, got ${batches.length}`);
+		assert.equal(batches[0].schemaEvents.length, 1, 'the re-key itself, and nothing from the rebuild');
+		assert.equal(batches[0].schemaEvents[0].objectName, 't');
+		assert.deepEqual(batches[0].dataEvents, [], 'the copy is not part of any batch the application should see');
 	});
 
 	it('still does the work: the table is re-keyed, readable, and its rows unchanged', async () => {
