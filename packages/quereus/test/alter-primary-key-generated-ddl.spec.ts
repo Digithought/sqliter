@@ -83,6 +83,15 @@ const CASES: Case[] = [
 		expectedClauses: 0,
 	},
 	{
+		// The empty-key singleton: the retired inline clause must go and the table-level
+		// `PRIMARY KEY ()` take its place, or the re-parse re-keys on the old column.
+		label: 'single → empty (the `primary key ()` singleton)',
+		create: `create table t (id integer primary key, code integer not null)`,
+		alter: `alter table t alter primary key ()`,
+		expectedKey: [],
+		expectedClauses: 1,
+	},
+	{
 		label: 'composite → composite reordered',
 		create: `create table t (a integer not null, b integer not null, v integer null, primary key (a, b))`,
 		alter: `alter table t alter primary key (b, a desc)`,
@@ -127,7 +136,7 @@ describe('ALTER PRIMARY KEY — generated DDL names the new key', () => {
 		});
 	}
 
-	it('leaves an unaltered table\'s DDL byte-identical (no CREATE-time change)', async () => {
+	it('round-trips an unaltered table\'s DDL byte-identically (CREATE-time output unmoved)', async () => {
 		const shapes = [
 			`create table t (id integer primary key, v text null)`,
 			`create table t (id integer primary key desc, v text null)`,

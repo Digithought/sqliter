@@ -14,9 +14,17 @@ export interface ColumnSchema {
 	logicalType: LogicalType;
 	/** Whether the column has a NOT NULL constraint */
 	notNull: boolean;
-	/** Whether the column is part of the primary key */
+	/**
+	 * Whether the column is part of the primary key.
+	 *
+	 * A MIRROR of `TableSchema.primaryKeyDefinition`, which is authoritative: the
+	 * definition is what `table_info`, key extraction and the canonical DDL generator
+	 * read, while this flag feeds the planner's uniqueness hints and the `ColumnDef` AST
+	 * that `RENAME COLUMN` reconstructs. Any code re-keying a table must rebuild both
+	 * together — use `rekeySchemaPrimaryKey`, never assign the definition alone.
+	 */
 	primaryKey: boolean;
-	/** Order within the primary key (1-based) or 0 if not PK */
+	/** Order within the primary key (1-based) or 0 if not PK. Mirrors {@link primaryKey}. */
 	pkOrder: number;
 	/** Default value expression */
 	defaultValue: Expression | null;
@@ -53,10 +61,12 @@ export interface ColumnSchema {
 	 * `rekeySchemaPrimaryKey` (the shared ALTER PRIMARY KEY mutation) deliberately does not
 	 * write it either. So for the table-level and post-ALTER shapes,
 	 * `buildConstraintsFromColumn` (`runtime/emit/alter-table.ts`, the `RENAME COLUMN`
-	 * AST rebuild) emits `direction: undefined` for a genuinely descending key. Harmless
-	 * today because every consumer reads `primaryKeyDefinition.desc`; if a module is ever
-	 * added that rebuilds its key from that reconstructed `ColumnDef`, a `desc` key would
-	 * silently flip ascending.
+	 * AST rebuild) emits `direction: undefined` for a genuinely descending key — and,
+	 * symmetrically, still emits `direction: 'desc'` for a column an ALTER has since
+	 * re-keyed ascending. Harmless today because every consumer reads
+	 * `primaryKeyDefinition.desc` (`RENAME COLUMN` itself carries the definition over
+	 * untouched); if a module is ever added that rebuilds its key from that reconstructed
+	 * `ColumnDef`, a `desc` key would silently flip ascending or vice versa.
 	 */
 	pkDirection?: 'asc' | 'desc';
 	/**

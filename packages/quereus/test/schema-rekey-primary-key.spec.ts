@@ -64,6 +64,20 @@ describe('rekeySchemaPrimaryKey', () => {
 		});
 	});
 
+	describe('self-inconsistent input rejected', () => {
+		// Not user-facing rejections (the engine emitter and the memory manager validate the
+		// column list first) — these are the two shapes that would otherwise yield a schema
+		// whose definition and flag mirror cannot agree, so they assert as INTERNAL.
+		it('throws on an out-of-range column index rather than minting a member addressing no column', () => {
+			expect(() => rekeySchemaPrimaryKey(schemaFixture(), [{ index: 3 }])).to.throw(/out of range/i);
+			expect(() => rekeySchemaPrimaryKey(schemaFixture(), [{ index: -1 }])).to.throw(/out of range/i);
+		});
+
+		it('throws on a repeated column index rather than minting more members than the mirror can order', () => {
+			expect(() => rekeySchemaPrimaryKey(schemaFixture(), [{ index: 1 }, { index: 1 }])).to.throw(/repeated/i);
+		});
+	});
+
 	describe('per-column flags', () => {
 		it('mirrors the new definition: membership and 1-based pkOrder, non-members zeroed', () => {
 			const out = rekeySchemaPrimaryKey(schemaFixture(), [{ index: 2 }, { index: 1 }]);

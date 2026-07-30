@@ -613,23 +613,44 @@ export function shiftSchemaIndicesForDrop(schema: TableSchema, colIndex: number)
  * snapshot, and `ColumnSchema` objects are not frozen, so in-place mutation would
  * silently corrupt both with nothing to catch it.
  *
- * No validation here (bounds / duplicates / NOT NULL): the memory manager keeps its own
- * pre-checks by index and the engine emitter (`runAlterPrimaryKey`) validates by column
- * name before dispatch.
+ * User-level validation stays with the callers: the memory manager pre-checks by index and
+ * the engine emitter (`runAlterPrimaryKey`) validates by column name before dispatch, so
+ * NOT NULL membership is not re-checked here. What IS asserted — as {@link
+ * shiftSchemaIndicesForDrop} asserts its column index — are the two inputs that would
+ * otherwise yield a SELF-INCONSISTENT schema rather than a rejected statement: an
+ * out-of-range index (a definition member addressing no column) and a repeated index (a
+ * definition with more members than the mirror can order). Both mean a caller skipped its
+ * own resolution, hence `INTERNAL`.
  */
 export function rekeySchemaPrimaryKey(
 	schema: TableSchema,
 	newPkColumns: ReadonlyArray<{ index: number; desc?: boolean }>,
 ): TableSchema {
+	// 1-based position in the new key, 0 for a non-member.
+	const pkOrderByIndex = new Map<number, number>();
+	for (const [position, pk] of newPkColumns.entries()) {
+		if (pk.index < 0 || pk.index >= schema.columns.length) {
+			quereusError(
+				`rekeySchemaPrimaryKey: primary key column index ${pk.index} out of range for table `
+					+ `'${schema.name}' (${schema.columns.length} columns)`,
+				StatusCode.INTERNAL,
+			);
+		}
+		if (pkOrderByIndex.has(pk.index)) {
+			quereusError(
+				`rekeySchemaPrimaryKey: column '${schema.columns[pk.index].name}' repeated in the new `
+					+ `primary key for table '${schema.name}'`,
+				StatusCode.INTERNAL,
+			);
+		}
+		pkOrderByIndex.set(pk.index, position + 1);
+	}
+
 	const primaryKeyDefinition = Object.freeze(newPkColumns.map(pk => ({
 		index: pk.index,
 		desc: pk.desc ?? false,
-		collation: schema.columns[pk.index]?.collation || 'BINARY',
+		collation: schema.columns[pk.index].collation || 'BINARY',
 	})));
-
-	// 1-based position in the new key, 0 for a non-member.
-	const pkOrderByIndex = new Map<number, number>();
-	newPkColumns.forEach((pk, i) => pkOrderByIndex.set(pk.index, i + 1));
 
 	const columns = Object.freeze(schema.columns.map((col, index) => {
 		const pkOrder = pkOrderByIndex.get(index) ?? 0;

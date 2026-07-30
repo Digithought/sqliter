@@ -126,10 +126,8 @@ function generateTableDDLInternal(
 		? tableSchema.primaryKeyDefinition[0].index
 		: -1;
 
-	const columnDefs: string[] = [];
-	tableSchema.columns.forEach((col, columnIndex) => {
-		columnDefs.push(formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex));
-	});
+	const columnDefs: string[] = tableSchema.columns.map((col, columnIndex) =>
+		formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex));
 
 	// Table-level PRIMARY KEY: empty () for singleton, (a, b, ...) for composite.
 	// Single-column PK is emitted inline on the column above. A synthesized
