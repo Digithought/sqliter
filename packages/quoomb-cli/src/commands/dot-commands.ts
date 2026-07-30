@@ -60,13 +60,7 @@ Available commands:
   .export <sql> <file>     Export query results to file
 
 Plugin commands:
-  .plugin install <url>    Install plugin from URL
-  .plugin list            List installed plugins
-  .plugin enable <name>   Enable a plugin
-  .plugin disable <name>  Disable a plugin
-  .plugin remove <name>   Remove a plugin
-  .plugin config <name>   Configure a plugin
-  .plugin reload <name>   Reload a plugin
+${PLUGIN_HELP_LINES.join('\n')}
 
 SQL commands:
   Enter any SQL statement to execute it
@@ -334,6 +328,18 @@ export const handleDotCommand = async (
   return false;
 };
 
+/** `.plugin` usage, shown by both `.help` and a bare/unrecognized `.plugin`. */
+const PLUGIN_HELP_LINES = [
+  '  .plugin install <url>       Install plugin from URL',
+  '  .plugin list                List installed plugins',
+  '  .plugin enable <name|url>   Enable a plugin',
+  '  .plugin disable <name|url>  Disable a plugin',
+  '  .plugin remove <name|url>   Remove a plugin',
+  '  .plugin config <name|url>   Configure a plugin',
+  '  .plugin reload <name|url>   Reload a plugin',
+  '  <name> is whatever `.plugin list` shows; the install URL works too.',
+];
+
 const handlePluginCommand = async (line: string, db: Database): Promise<void> => {
   const args = line.split(/\s+/).slice(1);
   const subcommand = args[0];
@@ -362,13 +368,7 @@ const handlePluginCommand = async (line: string, db: Database): Promise<void> =>
       break;
     default:
       console.log('Plugin management commands:');
-      console.log('  .plugin install <url>     - Install plugin from URL');
-      console.log('  .plugin list             - List installed plugins');
-      console.log('  .plugin enable <name>    - Enable a plugin');
-      console.log('  .plugin disable <name>   - Disable a plugin');
-      console.log('  .plugin remove <name>    - Remove a plugin');
-      console.log('  .plugin config <name>    - Configure a plugin');
-      console.log('  .plugin reload <name>    - Reload a plugin');
+      console.log(PLUGIN_HELP_LINES.join('\n'));
       break;
   }
 };
@@ -390,6 +390,10 @@ const loadPlugins = async (): Promise<PluginRecord[]> => {
   }
 };
 
+// NOTE: every subcommand read-modify-writes the whole file, so two CLI sessions
+// running side by side can have the later save drop the earlier one's change.
+// Harmless for one interactive user; if plugin state ever gets written from
+// anything concurrent, this needs a merge on the record `id` or a lock file.
 const savePlugins = async (plugins: PluginRecord[]): Promise<void> => {
   const filePath = getPluginsFilePath();
   const configDir = path.dirname(filePath);
@@ -424,12 +428,47 @@ const deriveNameFromUrl = (url: string): string => {
  * The identifier `.plugin list` prints and every other `.plugin` subcommand
  * accepts: the manifest name when one loaded, otherwise a name derived from
  * the URL so a manifest-less plugin is still addressable.
+ *
+ * A manifest name containing whitespace cannot be used — `.plugin <sub> <name>`
+ * splits its arguments on whitespace, so such a name is not typeable. That is
+ * reachable: a package.json without a `name` field manifests as the loader's
+ * `'Unknown Plugin'` placeholder. Derive from the URL in that case too.
  */
-const displayName = (plugin: PluginRecord): string => plugin.manifest?.name ?? deriveNameFromUrl(plugin.url);
+const displayName = (plugin: PluginRecord): string => {
+  const manifestName = plugin.manifest?.name;
+  return manifestName && !/\s/.test(manifestName) ? manifestName : deriveNameFromUrl(plugin.url);
+};
 
-/** Finds an installed plugin by display name or by its exact install URL. */
-const findPlugin = (plugins: PluginRecord[], identifier: string): PluginRecord | undefined =>
-  plugins.find(p => displayName(p) === identifier || p.url === identifier);
+/**
+ * Resolves a user-typed identifier — a display name, or the exact URL `list`
+ * prints — to a single installed plugin, reporting not-found and ambiguity
+ * itself so every subcommand words them the same way.
+ */
+const resolvePlugin = (plugins: PluginRecord[], identifier: string): PluginRecord | undefined => {
+  const byUrl = plugins.find(p => p.url === identifier);
+  if (byUrl) {
+    return byUrl;
+  }
+
+  const byName = plugins.filter(p => displayName(p) === identifier);
+  if (byName.length === 0) {
+    console.log(`Plugin '${identifier}' not found`);
+    return undefined;
+  }
+
+  // Two manifest-less plugins whose URLs end in the same file name derive the
+  // same display name. Acting on whichever installed first would be a guess,
+  // and for `remove` a destructive one.
+  if (byName.length > 1) {
+    console.log(`Plugin name '${identifier}' is ambiguous — ${byName.length} installed plugins go by it. Pass one of these URLs instead:`);
+    for (const p of byName) {
+      console.log(`  ${p.url}`);
+    }
+    return undefined;
+  }
+
+  return byName[0];
+};
 
 /**
  * Reconciles a plugin record's recorded module hash against the bytes actually
@@ -554,21 +593,18 @@ const listPluginsCommand = async (): Promise<void> => {
 
 const enablePluginCommand = async (args: string[], db: Database): Promise<void> => {
   if (args.length === 0) {
-    console.log('Usage: .plugin enable <name>');
+    console.log('Usage: .plugin enable <name|url>');
     return;
   }
 
-  const name = args[0];
   const plugins = await loadPlugins();
-  const plugin = findPlugin(plugins, name);
-
+  const plugin = resolvePlugin(plugins, args[0]);
   if (!plugin) {
-    console.log(`Plugin '${name}' not found`);
     return;
   }
 
   if (plugin.enabled) {
-    console.log(`Plugin '${name}' is already enabled`);
+    console.log(`Plugin '${displayName(plugin)}' is already enabled`);
     return;
   }
 
@@ -584,7 +620,7 @@ const enablePluginCommand = async (args: string[], db: Database): Promise<void> 
     reconcilePluginHash(plugin, true);
 
     await savePlugins(plugins);
-    console.log(`Enabled plugin: ${name}`);
+    console.log(`Enabled plugin: ${displayName(plugin)}`);
   } catch (error) {
     console.log(`Error enabling plugin: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
@@ -592,64 +628,58 @@ const enablePluginCommand = async (args: string[], db: Database): Promise<void> 
 
 const disablePluginCommand = async (args: string[]): Promise<void> => {
   if (args.length === 0) {
-    console.log('Usage: .plugin disable <name>');
+    console.log('Usage: .plugin disable <name|url>');
     return;
   }
 
-  const name = args[0];
   const plugins = await loadPlugins();
-  const plugin = findPlugin(plugins, name);
-
+  const plugin = resolvePlugin(plugins, args[0]);
   if (!plugin) {
-    console.log(`Plugin '${name}' not found`);
     return;
   }
 
   if (!plugin.enabled) {
-    console.log(`Plugin '${name}' is already disabled`);
+    console.log(`Plugin '${displayName(plugin)}' is already disabled`);
     return;
   }
 
   plugin.enabled = false;
   await savePlugins(plugins);
-  console.log(`Disabled plugin: ${name}`);
+  console.log(`Disabled plugin: ${displayName(plugin)}`);
   console.log('Note: Plugin will be unloaded on next restart');
 };
 
 const removePluginCommand = async (args: string[]): Promise<void> => {
   if (args.length === 0) {
-    console.log('Usage: .plugin remove <name>');
+    console.log('Usage: .plugin remove <name|url>');
     return;
   }
 
-  const name = args[0];
   const plugins = await loadPlugins();
-  const pluginIndex = plugins.findIndex(p => displayName(p) === name || p.url === name);
-
-  if (pluginIndex === -1) {
-    console.log(`Plugin '${name}' not found`);
+  const plugin = resolvePlugin(plugins, args[0]);
+  if (!plugin) {
     return;
   }
 
-  plugins.splice(pluginIndex, 1);
+  const removedName = displayName(plugin);
+  plugins.splice(plugins.indexOf(plugin), 1);
   await savePlugins(plugins);
-  console.log(`Removed plugin: ${name}`);
+  console.log(`Removed plugin: ${removedName}`);
 };
 
 const configPluginCommand = async (args: string[], db: Database): Promise<void> => {
   if (args.length === 0) {
-    console.log('Usage: .plugin config <name> [key=value ...]');
+    console.log('Usage: .plugin config <name|url> [key=value ...]');
     return;
   }
 
-  const name = args[0];
   const plugins = await loadPlugins();
-  const plugin = findPlugin(plugins, name);
-
+  const plugin = resolvePlugin(plugins, args[0]);
   if (!plugin) {
-    console.log(`Plugin '${name}' not found`);
     return;
   }
+
+  const name = displayName(plugin);
 
   if (args.length === 1) {
     // Show current configuration
@@ -728,21 +758,18 @@ const configPluginCommand = async (args: string[], db: Database): Promise<void> 
 
 const reloadPluginCommand = async (args: string[], db: Database): Promise<void> => {
   if (args.length === 0) {
-    console.log('Usage: .plugin reload <name>');
+    console.log('Usage: .plugin reload <name|url>');
     return;
   }
 
-  const name = args[0];
   const plugins = await loadPlugins();
-  const plugin = findPlugin(plugins, name);
-
+  const plugin = resolvePlugin(plugins, args[0]);
   if (!plugin) {
-    console.log(`Plugin '${name}' not found`);
     return;
   }
 
   if (!plugin.enabled) {
-    console.log(`Plugin '${name}' is disabled`);
+    console.log(`Plugin '${displayName(plugin)}' is disabled`);
     return;
   }
 
@@ -758,7 +785,7 @@ const reloadPluginCommand = async (args: string[], db: Database): Promise<void> 
       await savePlugins(plugins);
     }
 
-    console.log(`Reloaded plugin: ${name}`);
+    console.log(`Reloaded plugin: ${displayName(plugin)}`);
   } catch (error) {
     console.log(`Error reloading plugin: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }

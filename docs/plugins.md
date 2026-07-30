@@ -1127,6 +1127,10 @@ In Quoomb Web, the Plugin Manager accepts either:
 
 The UI reads `package.json.quereus.settings` to render configuration, and surfaces `quereus.provides` as capability badges. The manifest is automatically extracted from the plugin's `package.json` when loaded.
 
+### CLI
+
+The quoomb CLI installs plugins with `.plugin install <url>` and keeps them in `~/.quoomb/plugins.json` (see [`packages/quoomb-cli/README.md`](../packages/quoomb-cli/README.md) for the full subcommand list). Its other subcommands address a plugin by name, so a plugin whose `package.json` probe 404s — normal for a lone `.mjs` on a static host — still needs a name: the CLI derives one from the last path segment of the URL, and accepts the install URL as an identifier as well. The web UI has no such need, since it addresses plugins by the record `id` it assigns at install.
+
 
 
 ## Troubleshooting
