@@ -1,6 +1,5 @@
 ---
 description: Attaching, changing, or removing the descriptive labels stored alongside a table, column, or constraint currently notifies nobody — an application watching the database for structural changes hears nothing, on every storage backend.
-prereq: bug-alter-table-emits-no-schema-event-without-native-module-emitter
 files:
   - packages/quereus/src/runtime/emit/alter-table.ts    # runSetTableTags and its 8 siblings (lines 1315-1419)
   - packages/quereus/src/core/database-events.ts        # DatabaseSchemaChangeEvent
@@ -37,9 +36,10 @@ the backend or from the engine's fallback on the way through; the tag arms pass 
 
 ## Why it is filed separately from the sibling ticket
 
-The prerequisite ticket makes the engine report the *structural* ALTER arms (rename, add/drop
-column, retype, constraint changes) so that a subscriber sees the same facts whichever storage
-backend is in use. Tags are not that: **no** backend reports them, so there is no parity to
+The sibling ticket (`bug-alter-table-emits-no-schema-event-without-native-module-emitter`, now
+complete) made the engine report the *structural* ALTER arms (rename, add/drop column, retype,
+constraint changes) so that a subscriber sees the same facts whichever storage backend is in
+use. Tags are not that: **no** backend reports them, so there is no parity to
 restore and nothing is currently inconsistent. Adding the event is a new capability.
 
 That also makes it the wrong thing to bolt onto the sibling fix. The engine's fallback is

@@ -1,8 +1,5 @@
 ---
-description: |
-  Materialized views that order their rows currently fold the sort column into the table's hidden primary
-  key, which creates a class of schema contradictions. Replace that with a proper secondary index so the
-  primary key stays the logical key.
+description: A view whose stored copy is kept in sorted order gets that ordering by a trick that can force a column to reject blank values even when the view itself says blanks are allowed; keep the sort in a separate index instead, so the two stop contradicting each other.
 files:
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # computeBackingPrimaryKey (~236) and the two // NOTE: sites that reference this rework
 ---
@@ -10,6 +7,12 @@ files:
 # Replace ordering-seeded physical PK with a proper materialized secondary index
 
 ## Background
+
+A **materialized view** is a query whose results the engine stores in a real table and keeps up to
+date. Every such table needs a **primary key** — the set of columns that identifies a row uniquely
+— and a primary key column is never allowed to be empty (NULL). The problem below is that the
+engine reuses the primary key to also record *sort order*, which drags the sort column under that
+no-empty rule even when the view's own definition permits empty values there.
 
 When a materialized view's body carries `order by <col>`, the engine currently "seeds" the ordering
 columns into the **physical** primary key of the backing table (`computeBackingPrimaryKey` in

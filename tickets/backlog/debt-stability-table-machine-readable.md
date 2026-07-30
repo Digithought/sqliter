@@ -1,4 +1,5 @@
 description: The table in the docs that says which parts of the project are stable is written as prose, so nobody notices when someone edits it and forgets to update the matching labels elsewhere.
+prereq: debt-check-docs-script-too-large
 files:
   - docs/stability.md (the `## Assignment` table — the human-readable source of truth)
   - docs/.stability.json (the machine-readable `docs` and `packages` maps the build gate reads)
@@ -56,6 +57,15 @@ Two shapes are plausible and the choice is part of the work:
   which is a larger change to a hand-edited file.
 
 Either way the outcome is the same: a reviewer editing one tier is told about the other two.
+
+## Why the prerequisite
+
+Whichever shape is chosen, this ticket adds a sixth check to `scripts/check-docs.mjs`, which
+today holds five (A through E) in a single ~1,190-line file. `debt-check-docs-script-too-large`
+splits that same file into one module per check. Doing this one first means writing the new
+check into the monolith and then having it moved again by the split — two edits to the same
+region and an avoidable conflict. After the split, this becomes a new module alongside the
+others, which is both smaller and easier to review.
 
 ## Out of scope
 

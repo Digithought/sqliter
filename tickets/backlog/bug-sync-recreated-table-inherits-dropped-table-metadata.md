@@ -1,5 +1,4 @@
 description: If you drop a table and later create a new one with the same name, the sync engine still holds the old table's deletion records, so rows arriving from another device can be silently rejected as "already deleted" even though they belong to the brand-new table.
-prereq:
 files:
   - packages/quereus-sync/src/metadata/tombstones.ts            # isDeletedAndBlocking — "any tombstone blocks" when allowResurrection is false
   - packages/quereus-sync/src/sync/change-applicator.ts         # ~line 625 — the blocking check on the apply path

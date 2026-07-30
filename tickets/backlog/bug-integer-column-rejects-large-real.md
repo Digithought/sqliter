@@ -1,6 +1,5 @@
 ---
 description: Storing a very large round number written in scientific notation into a whole-number column fails with a type-mismatch error, even though the identical value written as text or as plain digits is accepted.
-prereq:
 files:
   - packages/quereus/src/types/builtin-types.ts   # INTEGER_TYPE.parse (number arm, ~line 46) and INTEGER_TYPE.validate (~line 36)
   - packages/quereus/src/types/validation.ts      # validateAndParse — parse-then-validate, where the two disagree

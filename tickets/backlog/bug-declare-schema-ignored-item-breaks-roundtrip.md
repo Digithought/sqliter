@@ -1,6 +1,5 @@
 ----
 description: Turning a parsed schema declaration back into SQL text produces broken SQL whenever the declaration contained a kind of item the engine doesn't understand yet — the rest of the declaration gets commented out and can no longer be read back.
-prereq:
 files:
   - packages/quereus/src/parser/parser.ts (`sourceSlice` ~4148 — stub returning `''`; `declareIgnoredItem` ~3682)
   - packages/quereus/src/emit/ast-stringify.ts (`declareItemToString` case `'declareIgnored'` ~1427; `declareSchemaToString` ~1392)

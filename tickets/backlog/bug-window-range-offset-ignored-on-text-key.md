@@ -1,6 +1,5 @@
 ---
 description: Asking for a window frame like "all rows within 10 of the current row's value" silently ignores the "within 10" part when the ordering column holds text instead of numbers, returning a different answer than requested rather than reporting the mistake.
-prereq:
 files:
   - packages/quereus/src/runtime/emit/window.ts        # rangeOffsetStart / rangeOffsetEnd, getFrameBounds
   - packages/quereus/src/planner/rules/window/rule-monotonic-window.ts   # isRangeSlidingEligible already declines to stream this

@@ -1,6 +1,5 @@
 ----
 description: On the in-memory tables, adding an index on a column that already has a uniqueness rule leaves the database maintaining two identical hidden structures forever; the persistent store now collapses them into one and memory should match.
-prereq:
 files:
   - packages/quereus/src/vtab/memory/layer/manager.ts        # ensureUniqueConstraintIndexes — runs at construction only
   - packages/quereus-store/src/common/store-table.ts         # findReusableIndexForUnique — the store-side equivalent

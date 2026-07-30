@@ -1,6 +1,6 @@
 ---
 description: When a very large whole number is stored as text and then added, summed, or averaged, the answer comes back wrong in its last few digits — even though comparing or converting that same text keeps every digit.
-prereq:
+prereq: debt-sqllogic-bigint-assertions-lossy
 files:
   - packages/quereus/src/util/coercion.ts                # coerceToNumberForArithmetic, tryCoerceToNumber — both return `number`
   - packages/quereus/src/runtime/emit/binary.ts          # mixedBigIntArithmetic — consumer of the arithmetic coercion
@@ -68,9 +68,15 @@ ticket is only about precision once the engine has decided to coerce.
 "TEXT -> INTEGER / NUMERIC conversion past 2^53" block covering the fixed
 paths; the arithmetic and aggregate cases belong alongside it.
 
-**Test-harness caveat that will bite here:** the sqllogic runner compares an
-actual big-integer result by first converting it through JavaScript's `Number()`
-— which rounds it right back. A raw numeric assertion would therefore pass even
-against a still-broken engine. Route every big-integer assertion through
-`cast(… as text)`, as the existing block does. (The harness weakness itself is
-tracked as `debt-sqllogic-bigint-assertions-lossy`.)
+**Test-harness caveat that will bite here — and the reason for the `prereq:`.**
+The sqllogic runner compares an actual big-integer result by first converting it
+through JavaScript's `Number()`, which rounds it right back. It applies the same
+lossy conversion to the *expected* value too, so both sides round identically and
+a raw numeric assertion passes even against a still-broken engine. That means the
+fix this ticket asks for cannot be *asserted* by a test until the harness is
+fixed: `debt-sqllogic-bigint-assertions-lossy` is listed as a prerequisite for
+that reason, not because of any code dependency.
+
+The existing workaround — routing every big-integer assertion through
+`cast(… as text)`, as the existing block does — still works and can be used for
+spot checks in the meantime, but it is a workaround, not coverage.

@@ -1,5 +1,4 @@
 description: A materialized view — a table whose contents the engine keeps up to date from a query — appears on other synced devices as an ordinary empty table that never updates, because the instruction sent over the wire leaves out the query that defines it.
-prereq:
 files:
   - packages/quereus-store/src/common/store-module.ts:695 (the create-table schema event)
   - packages/quereus/src/schema/ddl-generator.ts (generateTableDDL vs generateMaintainedTableDDL)

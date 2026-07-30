@@ -1,6 +1,5 @@
 ---
 description: A safety check that stops the engine from rebuilding a table when the storage backend cannot handle a table rename can be fooled by a wrapper backend — the wrapper always looks capable even when the backend it wraps is not, so the unsafe rebuild still runs and rows can end up stranded under a temporary table name.
-prereq:
 files:
   - packages/quereus/src/runtime/emit/alter-table.ts        # runAlterPrimaryKey, `if (!module.renameTable)` guard (~1524)
   - packages/quereus-isolation/src/isolation-module.ts      # alterTable (~1284), renameTable (~1506) — both always defined, delegate conditionally

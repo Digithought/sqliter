@@ -1,6 +1,5 @@
 ---
-description: Queries that match a table's primary key against a list of values still read the whole table on the persistent storage backend; the same list lookup already works for other indexed columns, but enabling it for primary keys first needs an ordering bug in the transaction-isolation layer resolved.
-prereq: bug-isolation-multiseek-merge-order
+description: Queries that match a table's primary key against a list of values still read the whole table on the persistent storage backend, even though the same list lookup already works for other indexed columns.
 files: packages/quereus-store/src/common/store-module.ts, packages/quereus-store/src/common/store-table.ts
 ---
 
@@ -16,18 +15,18 @@ point lookup per tuple, deduplicated and emitted in primary-key order). What is 
 planner half — `StoreModule`'s primary-key equality arm still matches only `=`, so it never
 names a primary-key multi-seek plan.
 
-## Why it was held back
+## Why it was held back (no longer a blocker)
 
 When the isolation layer wraps the store, a primary-key scan is merged row-by-row with the
 transaction's staged writes by walking two streams that must be in the same key order
 (`mergeStreams`, `packages/quereus-isolation/src/merge-iterator.ts`). A list lookup emits rows
-in list order, not key order, and the staged-writes side and the stored side do not agree on
-that order — which can surface a stale row alongside its updated copy, or resurrect a deleted
-one. That defect is filed separately as `bug-isolation-multiseek-merge-order`; it is reachable
-today through the in-memory backend, independently of this ticket.
+in list order, not key order, and the staged-writes side and the stored side did not agree on
+that order — which could surface a stale row alongside its updated copy, or resurrect a deleted
+one. That defect was filed separately as `bug-isolation-multiseek-merge-order` and has since
+been fixed, so nothing outside this ticket stands in the way now.
 
-Once that is fixed (either by making both sides emit in key order, or by having the merge stop
-assuming an order the plan never promised), enabling the primary-key claim here is small.
+Re-confirm the merge behaves under an open transaction when the work is picked up, but expect
+the remaining change to be small: it is the planner half only.
 
 ## Expected behavior
 

@@ -1,6 +1,5 @@
 ---
 description: Window queries that group rows with PARTITION BY always fall back to sorting and holding every row in memory, even when the data already arrives in the right order and a one-pass streaming plan would work.
-prereq:
 files:
   - packages/quereus/src/vtab/memory/module.ts                            # buildMonotonicAdvertisement — the thing to widen
   - packages/quereus/src/planner/rules/window/rule-monotonic-window.ts     # the NOTE: comment explaining today's dead end

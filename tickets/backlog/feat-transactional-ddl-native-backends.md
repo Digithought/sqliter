@@ -1,6 +1,5 @@
 ----
 description: Make schema changes (creating indexes, altering tables) roll back together with the rest of the transaction on the built-in storage backends, so a cancelled transaction leaves no schema change behind.
-prereq: feat-ddl-transaction-capability
 files:
   - packages/quereus/src/schema/                            # SchemaManager — no transaction-scoped catalog today
   - packages/quereus/src/vtab/memory/layer/manager.ts       # DDL mutates the base layer directly

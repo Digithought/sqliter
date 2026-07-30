@@ -1,6 +1,5 @@
 ---
 description: A test in the main SQL test suite that expects a very large whole number can pass even when the engine returns the wrong answer, because the comparison rounds both the expected and actual values the same way before checking them.
-prereq:
 files:
   - packages/quereus/test/logic.spec.ts                    # normalizeBigInts (~line 25), assertion site (~line 723)
   - packages/quereus/test/logic/03.6-type-system.sqllogic  # blocks that work around this today
