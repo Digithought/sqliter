@@ -405,6 +405,33 @@ const savePlugins = async (plugins: PluginRecord[]): Promise<void> => {
 };
 
 /**
+ * Derives a display name from a plugin's URL for when no manifest was
+ * available to name it (e.g. package.json 404s beside the module).
+ * Falls back to the full URL if it cannot be parsed into segments.
+ */
+const deriveNameFromUrl = (url: string): string => {
+  try {
+    const { pathname, hostname } = new URL(url);
+    const segments = pathname.split('/').filter(Boolean);
+    const last = segments[segments.length - 1] || hostname;
+    return last.replace(/\.m?js$/i, '');
+  } catch {
+    return url;
+  }
+};
+
+/**
+ * The identifier `.plugin list` prints and every other `.plugin` subcommand
+ * accepts: the manifest name when one loaded, otherwise a name derived from
+ * the URL so a manifest-less plugin is still addressable.
+ */
+const displayName = (plugin: PluginRecord): string => plugin.manifest?.name ?? deriveNameFromUrl(plugin.url);
+
+/** Finds an installed plugin by display name or by its exact install URL. */
+const findPlugin = (plugins: PluginRecord[], identifier: string): PluginRecord | undefined =>
+  plugins.find(p => displayName(p) === identifier || p.url === identifier);
+
+/**
  * Reconciles a plugin record's recorded module hash against the bytes actually
  * fetched for it a moment ago. No-op for plugins that were not fetched over the
  * network (a `file:` URL never is).
@@ -438,7 +465,7 @@ const reconcilePluginHash = (plugin: PluginRecord, adopt: boolean): boolean => {
     console.log(chalk.yellow(`  recorded sha256 ${plugin.sha256}`));
     console.log(chalk.yellow(`  fetched  sha256 ${fetched}`));
     if (!adopt) {
-      console.log(chalk.yellow(`  Run '.plugin reload ${plugin.manifest?.name ?? '<name>'}' to accept the new version.`));
+      console.log(chalk.yellow(`  Run '.plugin reload ${displayName(plugin)}' to accept the new version.`));
       return false;
     }
   }
@@ -491,7 +518,7 @@ const installPluginCommand = async (args: string[], db: Database): Promise<void>
     plugins.push(pluginRecord);
     await savePlugins(plugins);
 
-    console.log(`Successfully installed plugin: ${manifest?.name || 'Unknown'}`);
+    console.log(`Successfully installed plugin: ${displayName(pluginRecord)}`);
     if (manifest?.description) {
       console.log(`  ${manifest.description}`);
     }
@@ -514,7 +541,7 @@ const listPluginsCommand = async (): Promise<void> => {
   console.log('Installed plugins:');
   for (const plugin of plugins) {
     const status = plugin.enabled ? '✓' : '✗';
-    const name = plugin.manifest?.name || 'Unknown';
+    const name = displayName(plugin);
     const version = plugin.manifest?.version || '';
     console.log(`  ${status} ${name} ${version ? `(v${version})` : ''}`);
     console.log(`    ${plugin.url}`);
@@ -533,7 +560,7 @@ const enablePluginCommand = async (args: string[], db: Database): Promise<void> 
 
   const name = args[0];
   const plugins = await loadPlugins();
-  const plugin = plugins.find(p => p.manifest?.name === name);
+  const plugin = findPlugin(plugins, name);
 
   if (!plugin) {
     console.log(`Plugin '${name}' not found`);
@@ -571,7 +598,7 @@ const disablePluginCommand = async (args: string[]): Promise<void> => {
 
   const name = args[0];
   const plugins = await loadPlugins();
-  const plugin = plugins.find(p => p.manifest?.name === name);
+  const plugin = findPlugin(plugins, name);
 
   if (!plugin) {
     console.log(`Plugin '${name}' not found`);
@@ -597,7 +624,7 @@ const removePluginCommand = async (args: string[]): Promise<void> => {
 
   const name = args[0];
   const plugins = await loadPlugins();
-  const pluginIndex = plugins.findIndex(p => p.manifest?.name === name);
+  const pluginIndex = plugins.findIndex(p => displayName(p) === name || p.url === name);
 
   if (pluginIndex === -1) {
     console.log(`Plugin '${name}' not found`);
@@ -617,7 +644,7 @@ const configPluginCommand = async (args: string[], db: Database): Promise<void> 
 
   const name = args[0];
   const plugins = await loadPlugins();
-  const plugin = plugins.find(p => p.manifest?.name === name);
+  const plugin = findPlugin(plugins, name);
 
   if (!plugin) {
     console.log(`Plugin '${name}' not found`);
@@ -707,7 +734,7 @@ const reloadPluginCommand = async (args: string[], db: Database): Promise<void> 
 
   const name = args[0];
   const plugins = await loadPlugins();
-  const plugin = plugins.find(p => p.manifest?.name === name);
+  const plugin = findPlugin(plugins, name);
 
   if (!plugin) {
     console.log(`Plugin '${name}' not found`);
@@ -759,18 +786,16 @@ export const loadEnabledPlugins = async (db: Database): Promise<void> => {
         await savePlugins(plugins);
       }
     } catch (error) {
-      console.log(`Warning: Failed to load plugin ${plugin.manifest?.name || plugin.url}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      console.log(`Warning: Failed to load plugin ${displayName(plugin)}: ${error instanceof Error ? error.message : 'Unknown error'}`);
 
       // Disable the plugin if it failed to load. Say so — a remote plugin can
       // fail for a reason that has nothing to do with the plugin (the host was
       // offline), and a silent disable leaves the user with no idea why it
-      // stopped loading. `.plugin enable` matches on the manifest name, so it is
-      // only worth naming when a manifest was cached.
+      // stopped loading. `displayName` always resolves to something typeable,
+      // even when no manifest was ever cached.
       plugin.enabled = false;
       await savePlugins(plugins);
-      console.log(plugin.manifest?.name
-        ? `  Disabled it; run '.plugin enable ${plugin.manifest.name}' to try again.`
-        : `  Disabled it.`);
+      console.log(`  Disabled it; run '.plugin enable ${displayName(plugin)}' to try again.`);
     }
   }
 };
