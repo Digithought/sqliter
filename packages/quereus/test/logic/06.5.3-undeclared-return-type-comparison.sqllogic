@@ -183,4 +183,41 @@ select clamp('a', 1, 2) as r;
 select abs(d) as r from urt;
 -- error: Invalid argument types for function abs
 
+-- ===================================
+-- 8. Arithmetic and aggregation over an ANY-typed value
+-- ===================================
+-- These were WRONG under the REAL default, not merely unspecialized: emitArithmeticOp
+-- took its numeric-fast path (`runtime/emit/binary.ts`), which trusts the declared type
+-- and applies the JS operator to the raw value. strftime returns the string '2024', so
+-- `'2024' + 1` concatenated to '20241', failed the Number.isFinite check and came back
+-- NULL. ANY routes to the generic path, which coerces first.
+select strftime('%Y', d) + 1 as r from urt where id = 1;
+→ [{"r":2025}]
+
+select abs(strftime('%Y', d)) as r from urt where id = 1;
+→ [{"r":2024}]
+
+-- Aggregates: an ANY-typed argument no longer skips coerceForAggregate
+-- (`computeAggregateSkipCoercion`, runtime/emit/aggregate-setup.ts).
+select sum(strftime('%Y', d)) as s, avg(strftime('%Y', d)) as a from urt;
+→ [{"s":4047,"a":2023.5}]
+
+-- ===================================
+-- 9. The deliberate loss: a numeric-looking STRING no longer coerces
+-- ===================================
+-- Not guessing REAL costs exactly this much. `json_extract(...) = '5'` was TRUE (the
+-- planner cast '5' to REAL 5); it is now FALSE, because an ANY operand gives the
+-- numeric↔textual arm of insertCrossTypeCoercion nothing to key on and the runtime
+-- compares an integer against text — different storage classes. Same shape as
+-- `int_col in ('1')` being false today (bug-numeric-text-coercion-skips-in-and-case).
+-- Pinned so the next change to the numeric↔text story is a deliberate one; declaring a
+-- real `returnType` restores the coercion (ticket
+-- builtin-scalar-function-declared-return-types does that for the builtins).
+select json_extract('{"n":5}', '$.n') = '5' as r;
+→ [{"r":false}]
+
+-- Against an actual number it is true, as it always was.
+select json_extract('{"n":5}', '$.n') = 5 as r;
+→ [{"r":true}]
+
 drop table urt;

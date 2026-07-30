@@ -300,10 +300,12 @@ export const sqrtFunc = createScalarFunction(
 		name: 'sqrt',
 		numArgs: 1,
 		deterministic: true,
-		// Type inference: sqrt always returns REAL (even for INTEGER input)
+		// Type inference: keep the input type. The value is always real-valued, but
+		// declaring REAL would change comparison coercion for `sqrt(int_col) = '2'`, so
+		// that belongs to the declared-return-type work, not here.
 		inferReturnType: (argTypes) => ({
 			typeClass: 'scalar',
-			logicalType: argTypes[0].name === 'INTEGER' ? argTypes[0] : argTypes[0], // Keep input type
+			logicalType: argTypes[0],
 			nullable: false,
 			isReadOnly: true
 		}),

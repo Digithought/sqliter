@@ -51,6 +51,14 @@ export class WindowFunctionCallNode extends PlanNode implements ZeroAryScalarNod
 			}
 
 			// Fallback: unknown window functions behave like numeric windows for now.
+			// NOTE: unreachable — building a windowFunction expression rejects an
+			// unregistered name first (planner/building/expression.ts). It is also the last
+			// "guess REAL when the type is unknown" default left in the engine; if window
+			// functions ever become resolvable from something other than the static
+			// registry (a user-defined aggregate used with OVER, say), make this ANY_TYPE
+			// instead — a false isNumeric makes insertCrossTypeCoercion cast the other side
+			// of a comparison to REAL, which is what ticket
+			// scalar-function-default-return-type-any removed elsewhere.
 			return { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: false, isReadOnly: true } satisfies ScalarType;
 		});
 	}
