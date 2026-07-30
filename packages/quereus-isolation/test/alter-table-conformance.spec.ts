@@ -701,12 +701,17 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 	});
 
 	// ALTER PRIMARY KEY over staged overlay rows must reject BUSY (retryable), not UNSUPPORTED.
-	// UNSUPPORTED from `alterTable` tells the engine "fall back to a shadow-table rebuild" —
-	// which copies only committed rows, so the transaction's staged writes would be silently
-	// lost on `rollback` while the rebuilt table survives. This goes through SQL (not a direct
-	// `iso.alterTable` call) specifically so the engine's ALTER PRIMARY KEY path — and its
-	// UNSUPPORTED-triggered fallback — is actually exercised; a direct module call cannot catch
-	// the swallow, since the swallow lives in the engine, not the wrapper.
+	// UNSUPPORTED from `alterTable` tells the engine "fall back to a shadow-table rebuild",
+	// which copies only committed rows — the transaction's staged writes would be silently lost.
+	// This goes through SQL (not a direct `iso.alterTable` call) so the engine's ALTER PRIMARY
+	// KEY path — including its UNSUPPORTED-triggered fallback — is actually exercised; a direct
+	// module call cannot see the swallow, which lives in the engine, not the wrapper.
+	//
+	// The discriminating assertion is the status CODE, not the surviving rows: the engine also
+	// refuses the rebuild outright while an explicit transaction is open (`isExplicitTransactionOpen`
+	// in runtime/emit/alter-table.ts), so a regression to UNSUPPORTED surfaces as that generic
+	// ERROR rather than as data loss. The row/PK assertions below still pin the rest of the
+	// contract: nothing changed, and the transaction remains usable.
 	it('ALTER PRIMARY KEY rejects BUSY (not UNSUPPORTED) when the issuer has staged rows, and never invokes the shadow-rebuild fallback', async () => {
 		await db.exec(`create table t (a integer not null, b integer not null, v text, primary key (a)) using isolated`);
 		await db.exec(`insert into t values (5, 5, 'pre')`); // committed before the transaction
@@ -724,8 +729,8 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 
 		await db.exec('rollback');
 
-		// The committed row must have survived — the shadow-rebuild fallback would have copied it
-		// into a replacement table that `rollback` then discards, losing it.
+		// The committed row must have survived: a shadow rebuild would have copied it into a
+		// replacement table that outlives the `rollback` discarding the copy.
 		expect(await rows(db, `select * from t`), 'committed row survives the rejected ALTER + rollback')
 			.to.deep.equal([{ a: 5, b: 5, v: 'pre' }]);
 		expect(await pkColumns(db), 'primary key still unchanged after rollback').to.deep.equal(['a']);

@@ -1341,6 +1341,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// rebuild fallback" (see runAlterPrimaryKey in runtime/emit/alter-table.ts), which
 		// copies committed rows only — it would silently drop this transaction's staged
 		// writes. See docs/module-authoring.md § alterPrimaryKey.
+		//
+		// NOTE: an already-poisoned own overlay leaves `ownEntry` undefined (skipped above), so this
+		// refusal never fires for it — harmless while poison is terminal (rollback is the only exit,
+		// and it discards those old-key rows). If poison ever becomes recoverable, this check has to
+		// consult the poisoned own overlay too.
 		if (change.type === 'alterPrimaryKey' && ownEntry?.[1].hasChanges) {
 			throw new QuereusError(
 				`Cannot alter the primary key of '${schemaName}.${tableName}' while this transaction has uncommitted changes staged for it; commit or roll back first.`,
