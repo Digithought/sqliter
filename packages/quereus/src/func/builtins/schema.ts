@@ -8,7 +8,7 @@ import type { FunctionSchema } from "../../schema/function.js";
 import { isScalarFunctionSchema, isTableValuedFunctionSchema, isAggregateFunctionSchema } from "../../schema/function.js";
 import { isWindowFunction } from "../../schema/window-function.js";
 import { Schema } from "../../schema/schema.js";
-import { exposedImplicitIndexes, type SyntheticExposedIndex } from "../../schema/catalog.js";
+import { exposedImplicitIndexes, isHiddenImplicitIndex, type SyntheticExposedIndex } from "../../schema/catalog.js";
 import { isMaintainedTable } from "../../schema/derivation.js";
 import { generateMaintainedTableDDL } from "../../schema/ddl-generator.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
@@ -149,6 +149,7 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 					// Process Indexes for this table
 					if (tableSchema.indexes) {
 						for (const indexSchema of tableSchema.indexes) {
+							if (isHiddenImplicitIndex(tableSchema, indexSchema.name)) continue;
 							yield [
 								schemaName,
 								'index',
@@ -407,7 +408,7 @@ export const indexInfoFunc = createIntegratedTableValuedFunction(
 		// matches across backends. Synthetic descriptors carry no `unique` flag —
 		// UNIQUE enforcement routes through `uniqueConstraints` — so they report
 		// `unique = 0`, mirroring the memory materialized entry.
-		const realIndexes = table.indexes ?? [];
+		const realIndexes = (table.indexes ?? []).filter(idx => !isHiddenImplicitIndex(table, idx.name));
 		const synthetic: ReadonlyArray<SyntheticExposedIndex> = exposedImplicitIndexes(table);
 		if (realIndexes.length === 0 && synthetic.length === 0) return;
 

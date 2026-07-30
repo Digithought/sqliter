@@ -158,6 +158,56 @@ drop index uq_shared;
 -- run
 
 -- ============================================================
+-- 6a. `schema()` / `index_info()` hide the backing structure on BOTH backends
+-- ============================================================
+-- Named constraint (iul_a's uq_email): absent from schema()...
+select count(*) as c from schema() where type = 'index' and name = 'uq_email' and tbl_name = 'iul_a';
+→ [{"c":0}]
+
+-- ...and from index_info().
+select count(*) as c from index_info('iul_a') where index_name = 'uq_email';
+→ [{"c":0}]
+
+-- Unnamed constraint's auto-name (iul_u's _uc_email): same.
+select count(*) as c from schema() where type = 'index' and name = '_uc_email' and tbl_name = 'iul_u';
+→ [{"c":0}]
+
+select count(*) as c from index_info('iul_u') where index_name = '_uc_email';
+→ [{"c":0}]
+
+-- Mixed-case constraint name (iul_z's UQ_Email): the predicate folds case.
+select count(*) as c from schema() where type = 'index' and lower(name) = 'uq_email' and tbl_name = 'iul_z';
+→ [{"c":0}]
+
+select count(*) as c from index_info('iul_z') where lower(index_name) = 'uq_email';
+→ [{"c":0}]
+
+-- The EXPOSED implicit structure (iul_e's uq_vin) keeps showing up, with tags,
+-- via index_info() too — it already does via schema() per section 4 above.
+select count(*) as c from index_info('iul_e') where index_name = 'uq_vin';
+→ [{"c":1}]
+
+select json_extract(tags, '$.purpose') as purpose from index_info('iul_e') where index_name = 'uq_vin';
+→ [{"purpose":"lookup"}]
+
+-- `create unique index` synthesizes a constraint for enforcement, but the index
+-- is the user's own object (not an implicit covering structure) and must keep
+-- showing up on both introspection surfaces.
+create table iul_d (id integer primary key, email text);
+insert into iul_d values (1, 'd@x');
+create unique index uq_d_email on iul_d (email);
+-- run
+
+select count(*) as c from schema() where type = 'index' and name = 'uq_d_email';
+→ [{"c":1}]
+
+select count(*) as c from index_info('iul_d') where index_name = 'uq_d_email';
+→ [{"c":1}]
+
+drop table iul_d;
+-- run
+
+-- ============================================================
 -- 7. DROP CONSTRAINT is the way to remove the structure
 -- ============================================================
 alter table iul_a drop constraint uq_email;

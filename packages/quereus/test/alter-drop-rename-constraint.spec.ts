@@ -7,7 +7,12 @@
  * MemoryTable-specific and have no store analogue: the implicit covering index a
  * named inline UNIQUE auto-builds (named after the constraint) is torn down on
  * DROP CONSTRAINT and renamed in lock-step on RENAME CONSTRAINT — so neither
- * leaves an orphan index in `index_info` / the catalog.
+ * leaves an orphan index in `tableSchema.indexes` (the in-memory materialization).
+ *
+ * `index_info()` hides this structure while the constraint is hidden-implicit
+ * (see `isHiddenImplicitIndex`), so it can't be used to observe the covering
+ * index's lifecycle here — these assertions read the memory-specific
+ * `TableSchema.indexes` array directly instead.
  */
 
 import { expect } from 'chai';
@@ -19,9 +24,9 @@ async function collect(db: Database, sql: string): Promise<Array<Record<string, 
 	return rows;
 }
 
-async function indexNames(db: Database, table: string): Promise<string[]> {
-	const rows = await collect(db, `select distinct index_name from index_info('${table}')`);
-	return rows.map(r => String(r.index_name)).sort();
+function indexNames(db: Database, table: string): string[] {
+	const tableSchema = db._findTable(table);
+	return (tableSchema?.indexes ?? []).map(idx => idx.name).sort();
 }
 
 describe('ALTER TABLE DROP/RENAME CONSTRAINT (memory covering-index behaviour)', () => {
@@ -34,14 +39,14 @@ describe('ALTER TABLE DROP/RENAME CONSTRAINT (memory covering-index behaviour)',
 		await db.exec('create table t (id integer primary key, email text, constraint uq_email unique (email))');
 
 		// The auto-built covering index is named after the constraint.
-		expect(await indexNames(db, 't')).to.deep.equal(['uq_email']);
+		expect(indexNames(db, 't')).to.deep.equal(['uq_email']);
 
 		await db.exec('alter table t drop constraint uq_email');
 
 		// Constraint and its covering index are both gone.
 		const ucs = await collect(db, `select count(*) as c from unique_constraint_info('t') where name = 'uq_email'`);
 		expect(ucs[0].c).to.equal(0);
-		expect(await indexNames(db, 't'), 'covering index torn down').to.deep.equal([]);
+		expect(indexNames(db, 't'), 'covering index torn down').to.deep.equal([]);
 
 		// Duplicate emails now allowed.
 		await db.exec("insert into t values (1, 'a@x'), (2, 'a@x')");
@@ -56,7 +61,7 @@ describe('ALTER TABLE DROP/RENAME CONSTRAINT (memory covering-index behaviour)',
 		await db.exec('alter table t rename constraint uq_email to uq_user_email');
 
 		// The covering index follows the constraint name — no orphan under the old name.
-		expect(await indexNames(db, 't')).to.deep.equal(['uq_user_email']);
+		expect(indexNames(db, 't')).to.deep.equal(['uq_user_email']);
 		const ucs = await collect(db, `select name from unique_constraint_info('t')`);
 		expect(ucs.map(r => r.name)).to.deep.equal(['uq_user_email']);
 
@@ -70,15 +75,15 @@ describe('ALTER TABLE DROP/RENAME CONSTRAINT (memory covering-index behaviour)',
 		await db.exec('create table t (id integer primary key, sku text, constraint uq_sku unique (sku))');
 		await db.exec('alter table t rename constraint uq_sku to uq_product_sku');
 		await db.exec('alter table t drop constraint uq_product_sku');
-		expect(await indexNames(db, 't'), 'no index survives the rename+drop').to.deep.equal([]);
+		expect(indexNames(db, 't'), 'no index survives the rename+drop').to.deep.equal([]);
 	});
 
 	it('dropping one UNIQUE leaves a sibling UNIQUE (and its index) intact', async () => {
 		await db.exec('create table t (id integer primary key, a text, b text, constraint uq_a unique (a), constraint uq_b unique (b))');
-		expect(await indexNames(db, 't')).to.deep.equal(['uq_a', 'uq_b']);
+		expect(indexNames(db, 't')).to.deep.equal(['uq_a', 'uq_b']);
 
 		await db.exec('alter table t drop constraint uq_a');
-		expect(await indexNames(db, 't'), 'sibling index retained').to.deep.equal(['uq_b']);
+		expect(indexNames(db, 't'), 'sibling index retained').to.deep.equal(['uq_b']);
 
 		// uq_b still enforces.
 		await db.exec("insert into t values (1, 'x', 'y')");
@@ -97,6 +102,6 @@ describe('ALTER TABLE DROP/RENAME CONSTRAINT (memory covering-index behaviour)',
 		expect(err!.message).to.match(/backed by index/i);
 
 		// The index (and its enforcement) survive the rejected drop.
-		expect(await indexNames(db, 't')).to.deep.equal(['uq_a']);
+		expect(indexNames(db, 't')).to.deep.equal(['uq_a']);
 	});
 });
