@@ -250,8 +250,11 @@ describe('Schema Differ', () => {
 					index idx_note on t2 (note)
 				}`
 			);
+			// Pin the whole message: the owning-table pair is rendered from the two
+			// recorded declarations, so a mix-up there would otherwise pass silently.
 			expect(() => computeSchemaDiff(declared, makeCatalog()))
-				.to.throw(QuereusError, /Index 'idx_note' is declared more than once in schema 'main'/);
+				.to.throw(QuereusError, "Index 'idx_note' is declared more than once in schema 'main'"
+					+ " (on 't1' and 't2') — index names are unique per schema");
 		});
 
 		it('throws on a case-divergent duplicate declared index name', () => {

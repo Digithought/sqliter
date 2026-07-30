@@ -170,6 +170,75 @@ declare schema dup_seed using (default_vtab_module = 'memory') {
 diff schema dup_seed;
 -- error: No declared schema found for 'dup_seed'
 
+-- Target table names compare case-insensitively here too.
+declare schema dup_seed_case using (default_vtab_module = 'memory') {
+	table t {
+		id integer primary key,
+		n integer
+	}
+
+	seed T (
+		(1, 10)
+	)
+
+	seed t (
+		(2, 20)
+	)
+}
+-- error: Seed data for table 't' is declared more than once in schema 'dup_seed_case'
+
+-- A rejected declaration leaves an EARLIER good one for the same schema intact:
+-- the guard runs before `clearSeedData` and `setDeclaredSchema`, so neither the
+-- stored declaration nor the stored seed rows are touched.
+declare schema seed_keep using (default_vtab_module = 'memory') {
+	table t {
+		id integer primary key,
+		n integer
+	}
+
+	seed t (
+		(1, 10)
+	)
+}
+
+-- run
+
+apply schema seed_keep with seed;
+
+-- run
+
+declare schema seed_keep using (default_vtab_module = 'memory') {
+	table t {
+		id integer primary key,
+		n integer
+	}
+
+	seed t (
+		(2, 20)
+	)
+
+	seed t (
+		(3, 30)
+	)
+}
+-- error: Seed data for table 't' is declared more than once in schema 'seed_keep'
+
+-- The prior declaration survives (the diff still converges) ...
+diff schema seed_keep;
+→ []
+
+-- ... and so do its stored seed rows: wipe the table and re-seed from the store.
+delete from seed_keep.t;
+
+-- run
+
+apply schema seed_keep with seed;
+
+-- run
+
+select n from seed_keep.t;
+→ [{"n":10}]
+
 -- ===================================
 -- 4. Positive control — distinct names apply cleanly
 -- ===================================

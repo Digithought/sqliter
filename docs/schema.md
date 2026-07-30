@@ -922,7 +922,7 @@ The differ detects the same drift on the other tagged catalog objects — **view
 
 **Constraint siting.** A **table-level** constraint validates at `physical-constraint` whether named or not (its `WITH TAGS` is consumed regardless). An **inline column** constraint carries tags only when *named* (`qty integer constraint chk check (qty>0) with tags (...)`) — those validate at `physical-constraint`; an *unnamed* inline constraint defers its trailing tags to the column, validating once at `physical-column` (no double-validation). Rename detection still keys off named constraints only.
 
-**Declarative path** (`computeSchemaDiff`, before rename resolution) routes every declared object's tags through `validateReservedTags(tags, site)`, raising via `raiseReservedTagDiagnostics`, so a misspelled / mis-sited key fails `diff` / `apply schema`. The two rename hints carry value-schema `'string'` (a `quereus.id` may contain a hyphen), so the rename flow is unchanged; an MV's `quereus.id` validates but is ignored (the differ supports no materialized-view rename).
+**Declarative path** (`computeSchemaDiff`, before rename resolution) routes every declared object's tags through `validateReservedTags(tags, site)`, raising via `raiseReservedTagDiagnostics`, so a misspelled / mis-sited key fails `diff` / `apply schema`. The two rename hints carry value-schema `'string'` (a `quereus.id` may contain a hyphen), so the rename flow is unchanged; an MV's `quereus.id` validates but is ignored (the differ supports no materialized-view rename). The duplicate-name check (SCH-003) raises right after, so a tag typo surfaces first.
 
 **Build-time paths** — direct `CREATE TABLE` / `CREATE INDEX … WITH TAGS` and imperative `ALTER … ADD` / `ALTER … SET`|`ADD TAGS` — all validate at plan-build and raise through one sited helper, `raiseStmtTagDiagnostics`, so they cannot drift. `CREATE TABLE` mirrors the differ's four physical surfaces (table / each column / each table-level constraint / each *named* inline constraint), plus `physical-index` for `CREATE INDEX`; the per-column legs (a column's own tags + its inline constraints') come from the shared `columnTagDiagnostics` helper the `ALTER … ADD COLUMN` path also calls, accumulating table → per-column → table-constraints, the first error raised once at the statement's source location. `ADD CONSTRAINT … WITH TAGS` checks at `physical-constraint`; `ADD COLUMN … WITH TAGS` at `physical-column` **plus** each inline named constraint at `physical-constraint`. `SET TAGS` and `ADD TAGS` share the `setTags` build case and validate at the matching site (`physical-table`/`-column`/`-constraint` for `ALTER TABLE`; `view-ddl`/`physical-index` for `ALTER VIEW` / `ALTER MATERIALIZED VIEW` / `ALTER INDEX`). Validation fires even under `IF NOT EXISTS` (build-time, before the runtime existence check) and regardless of the `nondeterministic_schema` option (tags are not expressions).
 
@@ -942,16 +942,18 @@ If `beginSchemaBatch` itself throws, already-started modules receive `endSchemaB
 
 Declared schemas can include seed data (`seed <tableName> values ...`). Under `apply schema ... with seed`:
 
-1. Each declared seed row is written as `INSERT INTO <tbl> VALUES (…) ON CONFLICT (<pk-cols>) DO NOTHING` — the application is **idempotent**: re-applying a schema whose tables already hold their seed rows skips the seed PKs rather than colliding on them. User-edited seed rows and non-seed rows are left in place, so a reopen never destroys user data and no `ON DELETE CASCADE` fires for unchanged parents. (A table whose PK is empty — a `primary key ()` singleton — falls back to the untargeted `ON CONFLICT DO NOTHING`.)
-2. Per-table, after all structural migrations complete (and after `endSchemaBatch` has fired).
+1. Each declared seed row is written as `INSERT INTO <tbl> VALUES (…) ON CONFLICT (<pk-cols>) DO NOTHING` — **idempotent**: a re-apply skips seed PKs already present rather than colliding. User-edited and non-seed rows stay in place, so a reopen never destroys user data and fires no `ON DELETE CASCADE`. (A table whose PK is empty — a `primary key ()` singleton — falls back to the untargeted `ON CONFLICT DO NOTHING`.)
+2. Per-table, after all structural migrations complete (and after `endSchemaBatch` fires).
+
+**One block per table** (SCH-003): `setSeedData` overwrites by key, so a repeat drops the first block's rows. `declare schema` rejects it before storing anything; the differ never sees `seed` items, so the guard cannot live at diff time.
 
 #### Rejected alternatives
 
-- **Wipe-then-reseed** (`DELETE FROM <tbl>` unless the table is freshly created). Freshness is decided by diffing the in-memory catalog, which a reopen does not rehydrate for host-backed row data, so an already-seeded table reads as fresh, the wipe is skipped, and the bare `INSERT`s collide with the persisted rows.
-- **`OR REPLACE`.** Delete-then-insert on a conflicting row, so re-seeding a parent referenced by `ON DELETE CASCADE` children fires that cascade on every reopen — even when the replaced values are byte-for-byte identical.
-- **`OR IGNORE`.** Skips a row on **any** constraint failure (SQLite semantics), so a malformed seed row — a typo violating a `CHECK`, a missing `NOT NULL` value, a child-side FK to a missing parent — vanishes without a diagnostic.
+- **Wipe-then-reseed** (`DELETE FROM <tbl>` unless freshly created). Freshness comes from diffing the in-memory catalog, which a reopen does not rehydrate for host-backed row data, so an already-seeded table reads as fresh, the wipe is skipped, and the bare `INSERT`s collide with persisted rows.
+- **`OR REPLACE`.** Delete-then-insert, so re-seeding a parent with `ON DELETE CASCADE` children fires that cascade on every reopen — even when the values are byte-for-byte identical.
+- **`OR IGNORE`.** Skips a row on **any** constraint failure (SQLite semantics), so a malformed seed row — a `CHECK` violation, a missing `NOT NULL`, a dangling child FK — vanishes without a diagnostic.
 
-Targeting the conflict at the seed table's PRIMARY KEY keeps idempotency without a wipe or a cascade, and keeps errors visible: `DO NOTHING` suppresses a row only when the conflicting row matches at the PK columns. Every other violation aborts the apply, including a duplicate on a **secondary** `UNIQUE` index (whose conflicting row carries a *different* PK).
+Targeting the PK keeps errors visible: `DO NOTHING` suppresses a row only when the conflict is at the PK columns. Every other violation aborts the apply, including a duplicate on a **secondary** `UNIQUE` index (whose conflicting row carries a *different* PK).
 
 ### Schema Hashing
 

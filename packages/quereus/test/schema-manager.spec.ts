@@ -127,7 +127,10 @@ describe('Schema Manager', () => {
 				error = e;
 			}
 			expect(error).to.be.instanceOf(Error);
-			expect((error as Error).message).to.match(/view/i);
+			// `createTable` reports the colliding item by its actual kind, so a CREATE
+			// TABLE blocked by a view says "View ... already exists" (the wordier
+			// "a VIEW with the same name already exists" is the IF NOT EXISTS variant).
+			expect((error as Error).message).to.match(/^View main\.dual_name_2 already exists/);
 		});
 	});
 

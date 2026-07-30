@@ -296,6 +296,10 @@ function findDuplicateDeclaredName(items: readonly AST.DeclareItem[]): Duplicate
 			case 'declaredAssertion':
 				duplicate = record(assertions, item.assertionStmt.name, { kind: 'assertion' });
 				break;
+			// NOTE: `declareIgnored` (domain / collation / import) is skipped — the parser
+			// keeps it as an opaque snippet with no parsed name, so there is nothing to key
+			// on. If any of those becomes first-class, it needs its own namespace decision
+			// here. `declaredSeed` is keyed by target table, guarded in schema-declarative.ts.
 		}
 		if (duplicate) return duplicate;
 	}
@@ -366,17 +370,17 @@ export function computeSchemaDiff(
 	// create/drop-table. A logical schema's actual catalog views ARE its lens
 	// bodies (a logical schema has no user views), so compare declared logical
 	// tables against the registered views. Basis storage is untouched.
+	const targetSchemaName = actualCatalog.schemaName;
+
 	if (declaredSchema.isLogical) {
 		// Raise here rather than deferring to the physical raise point below: the
 		// logical path returns before any tag validation, and `computeLogicalSchemaDiff`
 		// dedupes declared table names into a Set — so a duplicate would silently
 		// collapse into one attach with the first declaration lost.
 		const duplicate = findDuplicateDeclaredName(declaredSchema.items);
-		if (duplicate) throw duplicateDeclaredNameError(duplicate, actualCatalog.schemaName);
+		if (duplicate) throw duplicateDeclaredNameError(duplicate, targetSchemaName);
 		return computeLogicalSchemaDiff(declaredSchema, actualCatalog, diff);
 	}
-
-	const targetSchemaName = actualCatalog.schemaName;
 
 	// Extract schema-level default module settings
 	const defaultVtabModule = declaredSchema.using?.defaultVtabModule;
