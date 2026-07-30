@@ -187,7 +187,7 @@ If your module doesn't need custom event logic (e.g., remote change tracking), s
 
 The engine's fallback raises a schema-change event for:
 
-- `CREATE TABLE` / `CREATE INDEX` / `DROP INDEX`
+- `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`
 - **every structural `ALTER TABLE` arm** — `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`, all four `ALTER COLUMN` attribute forms, `ALTER PRIMARY KEY`, `ADD CONSTRAINT`, `DROP CONSTRAINT`, `RENAME CONSTRAINT`
 
 One event per statement, on its success path only, in the same shape a natively-emitting backend reports — see [usage.md § What each `ALTER TABLE` arm reports](usage.md#what-each-alter-table-arm-reports) for the per-arm table. The engine emits at the *end* of the arm (after its catalog swap), where a natively-emitting module emits from inside its own `alterTable`; the ordering difference is not observable, since each arm produces one event and delivery is batched to commit.

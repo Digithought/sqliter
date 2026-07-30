@@ -1513,16 +1513,12 @@ export class SchemaManager {
 				oldObject: tableSchema
 			});
 
-			// Emit auto schema event for modules without native event support
-			const moduleReg = tableSchema.vtabModuleName ? this.getModule(tableSchema.vtabModuleName) : undefined;
-			if (this.db._needsSchemaEvents() && !hasNativeEventSupport(moduleReg?.module)) {
-				this.db._getEventEmitter().emitAutoSchemaEvent(tableSchema.vtabModuleName ?? 'memory', {
-					type: 'drop',
-					objectType: 'table',
-					schemaName: tableSchema.schemaName,
-					objectName: tableSchema.name,
-				});
-			}
+			this.emitAutoSchemaEventIfNeeded(tableSchema.vtabModuleName, {
+				type: 'drop',
+				objectType: 'table',
+				schemaName: tableSchema.schemaName,
+				objectName: tableSchema.name,
+			});
 		}
 
 		return removed; // True if removed from schema, false if not found and ifExists was true.

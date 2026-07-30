@@ -286,6 +286,29 @@ describe('ALTER TABLE raises a schema-change event on the engine\'s own path', (
 		});
 	});
 
+	describe('a declarative apply reports its generated ALTERs', () => {
+		// `apply schema` runs the differ's migration DDL through the ordinary statement path
+		// (no suppression scope), so each generated ALTER reports exactly as if it had been
+		// typed. That is the intended reading — a declarative apply IS a schema change the
+		// application asked for, and its generated `create table` already reported — but it is
+		// a behaviour this change introduced, so pin it rather than leave it to drift.
+		it('an apply that widens a table raises the arm\'s own event', async () => {
+			await db.exec('create table t (id integer primary key, v text null)');
+			await db.exec(`
+				declare schema main {
+					table t {
+						id INTEGER PRIMARY KEY,
+						v TEXT NULL,
+						w TEXT NULL
+					}
+				}
+			`);
+			await db.exec('apply schema main;');
+
+			assert.deepEqual(alterEvents().map(shape), ['alter/column/t/w']);
+		});
+	});
+
 	describe('a module with no alterTable hook at all', () => {
 		// The backend this fallback exists for: `ADD CONSTRAINT … CHECK` takes the engine-side
 		// append in add-constraint.ts, which must report just like the module-routed path.
@@ -375,5 +398,14 @@ describe('ALTER TABLE on an emitter-backed module emits exactly once', () => {
 		await db.exec('alter table t rename constraint ck to ck2');
 		await db.exec('alter table t drop constraint ck2');
 		assert.deepEqual(alterEvents().map(shape), ['alter/table/t', 'alter/table/t']);
+	});
+
+	// The one knowing divergence from the engine's fallback, pinned on BOTH sides so neither
+	// can drift unnoticed: the arm's extra `alterTable(addConstraint)` round-trip is visible
+	// here as a second event, where the fallback reports one (see the engine describe above).
+	it('add column with an inline constraint reports the module\'s extra constraint event', async () => {
+		await db.exec('create table t (id integer primary key)');
+		await db.exec('alter table t add column w text null unique');
+		assert.deepEqual(alterEvents().map(shape), ['alter/column/t/w', 'alter/table/t']);
 	});
 });

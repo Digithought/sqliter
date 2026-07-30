@@ -1628,6 +1628,14 @@ async function runAlterPrimaryKey(
 	// `withPublicEventsSuppressed`, which also swallows the inner RENAME TO arm's event). This
 	// emit is OUTSIDE that scope, so the re-key itself reports exactly one `alter`/`table` —
 	// the same shape the native branch above reports.
+	//
+	// NOTE: this arm is the one place where a module WITH its own emitter can end up reporting
+	// nothing — it raised UNSUPPORTED instead of emitting, and the gate below then suppresses
+	// the engine's fallback because the module registration advertises native support. No such
+	// module exists today (memory re-keys in place, the store handles `alterPrimaryKey`
+	// natively), so the path is unreachable. If an emitter-backed module ever declines the
+	// re-key, teach the gate that a rebuild fallback owns the event regardless of the module's
+	// emitter.
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'table',
 		objectName: tableSchema.name,

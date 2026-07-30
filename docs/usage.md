@@ -450,6 +450,10 @@ Two arm families report nothing on either path: the metadata-tag arms (`set tags
 `drop tags`) and the materialized-view lifecycle arms (`set maintained`, `drop maintained`).
 Both are catalog-only and no backend announces them.
 
+A declarative `apply schema` runs its generated migration DDL through the ordinary statement
+path, so each `alter table` the differ generates reports exactly as if you had typed it —
+alongside the `create` / `drop` events the same apply already raised.
+
 `ALTER TABLE … ALTER PRIMARY KEY` on a backend that cannot re-key in place reports its one
 `alter`/`table` event like any other backend, but stays silent about the engine-internal rebuild
 that carries it out (see above, and [`sql-ddl.md`](sql-ddl.md) § ALTER PRIMARY KEY): that rebuild
