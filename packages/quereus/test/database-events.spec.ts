@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
 	Database,
 	DatabaseEventEmitter,
+	DefaultVTableEventEmitter,
 	type DatabaseDataChangeEvent,
 	type DatabaseSchemaChangeEvent,
 	type TransactionCommitBatch,
@@ -589,5 +590,147 @@ describe('Transaction-Commit Grouping', () => {
 		assert.equal(goodCalled, true);
 		offBad();
 		offGood();
+	});
+});
+
+/**
+ * `withPublicEventsSuppressed` — the scope the engine's internal scaffolding runs inside so its
+ * statements do not surface on the application-facing channels (its one caller today is the
+ * shadow-table rebuild behind ALTER PRIMARY KEY; see alter-table-events.spec.ts for that
+ * end-to-end). Here: only the counter's own mechanics — the gates report false inside, events
+ * arriving at the four record chokepoints are dropped, nesting behaves, and a throw restores.
+ */
+describe('DatabaseEventEmitter.withPublicEventsSuppressed', () => {
+	let emitter: DatabaseEventEmitter;
+	let dataEvents: DatabaseDataChangeEvent[];
+	let schemaEvents: DatabaseSchemaChangeEvent[];
+
+	const anInsert = () => ({
+		type: 'insert' as const, schemaName: 'main', tableName: 't',
+		key: [1], newRow: [1, 'a'],
+	});
+	const aCreate = () => ({
+		type: 'create' as const, objectType: 'table' as const, schemaName: 'main', objectName: 't',
+	});
+
+	beforeEach(() => {
+		emitter = new DatabaseEventEmitter();
+		dataEvents = [];
+		schemaEvents = [];
+		emitter.onDataChange(e => dataEvents.push(e));
+		emitter.onSchemaChange(e => schemaEvents.push(e));
+	});
+
+	it('closes both gates inside the scope and reopens them after', async () => {
+		assert.equal(emitter.needsDataEvents(), true);
+		assert.equal(emitter.needsSchemaEvents(), true);
+
+		await emitter.withPublicEventsSuppressed(async () => {
+			assert.equal(emitter.needsDataEvents(), false);
+			assert.equal(emitter.needsSchemaEvents(), false);
+			assert.equal(emitter.isPublicEventsSuppressed(), true);
+		});
+
+		assert.equal(emitter.needsDataEvents(), true);
+		assert.equal(emitter.needsSchemaEvents(), true);
+		assert.equal(emitter.isPublicEventsSuppressed(), false);
+	});
+
+	it('drops events that arrive anyway, and delivers them again once the scope closes', async () => {
+		await emitter.withPublicEventsSuppressed(async () => {
+			emitter.emitAutoDataEvent('memory', anInsert());
+			emitter.emitAutoSchemaEvent('memory', aCreate());
+		});
+
+		assert.equal(dataEvents.length, 0, 'suppressed data event must not be delivered');
+		assert.equal(schemaEvents.length, 0, 'suppressed schema event must not be delivered');
+
+		emitter.emitAutoDataEvent('memory', anInsert());
+		emitter.emitAutoSchemaEvent('memory', aCreate());
+		assert.equal(dataEvents.length, 1);
+		assert.equal(schemaEvents.length, 1);
+	});
+
+	it('drops rather than batches, so a commit after the scope flushes nothing', async () => {
+		emitter.startBatch();
+		await emitter.withPublicEventsSuppressed(async () => {
+			emitter.emitAutoDataEvent('memory', anInsert());
+			emitter.emitAutoSchemaEvent('memory', aCreate());
+		});
+		emitter.flushBatch();
+
+		assert.equal(dataEvents.length, 0, 'a suppressed event must not survive in the batch');
+		assert.equal(schemaEvents.length, 0);
+	});
+
+	it('nests: the inner scope exiting does not reopen the gates', async () => {
+		await emitter.withPublicEventsSuppressed(async () => {
+			await emitter.withPublicEventsSuppressed(async () => {
+				assert.equal(emitter.needsDataEvents(), false);
+			});
+			assert.equal(emitter.needsDataEvents(), false, 'outer scope still suppresses');
+			assert.equal(emitter.needsSchemaEvents(), false);
+		});
+		assert.equal(emitter.needsDataEvents(), true);
+		assert.equal(emitter.needsSchemaEvents(), true);
+	});
+
+	it('restores the gates when the body throws, and propagates the error', async () => {
+		await assert.rejects(
+			() => emitter.withPublicEventsSuppressed(async () => { throw new Error('boom'); }),
+			/boom/,
+		);
+		assert.equal(emitter.needsDataEvents(), true);
+		assert.equal(emitter.needsSchemaEvents(), true);
+		assert.equal(emitter.isPublicEventsSuppressed(), false);
+	});
+
+	it('restores from a throw inside a nested scope, leaving the outer one intact', async () => {
+		await emitter.withPublicEventsSuppressed(async () => {
+			await assert.rejects(
+				() => emitter.withPublicEventsSuppressed(async () => { throw new Error('inner'); }),
+				/inner/,
+			);
+			assert.equal(emitter.isPublicEventsSuppressed(), true, 'outer scope survives the inner throw');
+		});
+		assert.equal(emitter.isPublicEventsSuppressed(), false);
+	});
+
+	it('returns the body value', async () => {
+		const v = await emitter.withPublicEventsSuppressed(async () => 42);
+		assert.equal(v, 42);
+	});
+
+	it('drops events forwarded from a module emitter too (they consult no gate)', async () => {
+		// The gates only stop the engine's own producers. A module with its own emitter
+		// delivers straight into handleModuleDataEvent/handleModuleSchemaEvent, so those
+		// chokepoints have to drop on their own — this is the case the gates cannot cover.
+		const moduleEmitter = new DefaultVTableEventEmitter();
+		emitter.hookModuleEmitter('mod', moduleEmitter);
+
+		await emitter.withPublicEventsSuppressed(async () => {
+			moduleEmitter.emitDataChange(anInsert());
+			moduleEmitter.emitSchemaChange(aCreate());
+		});
+		assert.equal(dataEvents.length, 0);
+		assert.equal(schemaEvents.length, 0);
+
+		moduleEmitter.emitDataChange(anInsert());
+		moduleEmitter.emitSchemaChange(aCreate());
+		assert.equal(dataEvents.length, 1, 'forwarding resumes once the scope closes');
+		assert.equal(schemaEvents.length, 1);
+	});
+
+	it('leaves the transaction-commit channel out of the batch too', async () => {
+		const batches: TransactionCommitBatch[] = [];
+		emitter.onTransactionCommit(b => batches.push(b));
+
+		emitter.startBatch();
+		await emitter.withPublicEventsSuppressed(async () => {
+			emitter.emitAutoDataEvent('memory', anInsert());
+		});
+		emitter.flushBatch();
+
+		assert.equal(batches.length, 0, 'a transaction whose only events were suppressed groups nothing');
 	});
 });

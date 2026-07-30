@@ -374,6 +374,13 @@ other two families, an ALTER PRIMARY KEY *between* transactions leaves already-d
 events alone: they correctly carry the key the table had at the time. A `RENAME TO` still
 leaves `key` untouched (it moves no value); only an ALTER PRIMARY KEY rewrites it.
 
+One statement raises **no** data events even though it moves every row: `ALTER TABLE … ALTER
+PRIMARY KEY` on a backend that cannot re-key in place falls back to an engine-internal rebuild
+(copy every row into a shadow table with the new key, then swap it in), and that rebuild is
+deliberately silent on all three channels. A re-key changes no row, so announcing the copy as a
+row-per-`insert` would be wrong. See [`sql-ddl.md`](sql-ddl.md) § ALTER PRIMARY KEY. Both
+built-in modules re-key in place and never take that path.
+
 `changedColumns` is present on an update event only if the owning module supplies it — the
 memory module and the engine's auto-event path do; the store module deliberately omits it and
 leaves the per-column diff to the consumer. That per-module choice is stable: a mid-transaction
@@ -408,6 +415,13 @@ The `DatabaseSchemaChangeEvent` interface:
 | `oldColumnName` | `string` | Previous column name (for renames) |
 | `ddl` | `string` | DDL statement if available |
 | `remote` | `boolean` | `true` if the change originated from a remote source |
+
+`ALTER TABLE … ALTER PRIMARY KEY` on a backend that cannot re-key in place is the one DDL
+statement that reports nothing here. Its engine-internal rebuild (see above, and
+[`sql-ddl.md`](sql-ddl.md) § ALTER PRIMARY KEY) runs with this channel suppressed, so a
+subscriber that mirrors the catalog is never told that a machine-named `<table>__rekey_<ms>`
+shadow table was created and the real one dropped — neither of which is a change the
+application made.
 
 ### Per-Table Subscription via `db.getTable(...)`
 

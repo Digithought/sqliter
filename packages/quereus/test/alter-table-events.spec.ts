@@ -23,6 +23,11 @@
  *    the pending-change reshape in TransactionLayer. It stamps `tableName` at commit from
  *    the manager's current `_tableName`, so RENAME TO already lands correctly there — the
  *    test below pins that, to catch a refactor that starts stamping at write time.
+ *
+ * A fourth family lives in its own top-level describe at the end of this file: the events an
+ * ALTER must NOT raise. `ALTER PRIMARY KEY` on a backend that cannot re-key itself is carried
+ * out by an engine-internal shadow-table rebuild, whose four statements must stay invisible on
+ * the public channels — see that describe's header.
  */
 
 import assert from 'node:assert/strict';
@@ -31,9 +36,12 @@ import {
 	DefaultVTableEventEmitter,
 	MemoryTableModule,
 	type DatabaseDataChangeEvent,
+	type DatabaseSchemaChangeEvent,
+	type SqlValue,
 	type TransactionCommitBatch,
 	type VTableDataChangeEvent,
 } from '../src/index.js';
+import { makeNoAlterModule } from './no-alter-module.js';
 
 describe('ALTER TABLE mid-transaction: batched data events keep the delivered schema shape', () => {
 
@@ -991,5 +999,127 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.deepEqual(dml[1].oldRow, [1, 'a']);
 			assert.deepEqual(dml[1].newRow, [1, 'b']);
 		});
+	});
+});
+
+/**
+ * ALTER PRIMARY KEY on a backend that cannot re-key itself takes the engine's generic
+ * fallback: create a shadow table with the new key, copy every row into it, drop the original,
+ * rename the shadow over it. Those four statements are ordinary SQL, so before the suppression
+ * scope in `rebuildViaShadowTable` they raised ordinary notifications — an `insert` for every
+ * row the copy moved (relabelled onto the real table by the trailing rename), and a `create` of
+ * a timestamped `<table>__rekey_<ms>` plus a `drop` of the real table. A re-key changes no row
+ * and replaces no table, so the correct answer on both public channels is silence.
+ *
+ * The consequence — a subscriber gets NO notification that the primary key changed on this
+ * path — is deliberate and documented (docs/sql-ddl.md § ALTER PRIMARY KEY): the positive
+ * `alter` event belongs to every ALTER TABLE arm, not this one, and is tracked separately
+ * (fix/bug-alter-table-emits-no-schema-event-without-native-module-emitter).
+ */
+describe('ALTER PRIMARY KEY via shadow-table rebuild: the rebuild is notification-silent', () => {
+	let db: Database;
+
+	async function rows(d: Database, sql: string): Promise<Record<string, SqlValue>[]> {
+		const out: Record<string, SqlValue>[] = [];
+		for await (const r of d.eval(sql)) out.push(r);
+		return out;
+	}
+
+	beforeEach(async () => {
+		db = new Database();
+		// Backend shape that takes the rebuild: no `alterTable` hook (so it cannot re-key in
+		// place), but `renameTable` present (the rebuild's closing RENAME requires it).
+		db.registerModule('noalter', makeNoAlterModule({ withRenameTable: true }));
+		await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a)) using noalter');
+		await db.exec("insert into t values (5, 5, 'pre')");
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('delivers zero data-change events for the copied rows', async () => {
+		const events: DatabaseDataChangeEvent[] = [];
+		const unsub = db.onDataChange(e => events.push(e));
+		try {
+			await db.exec('alter table t alter primary key (a, b)');
+		} finally {
+			unsub();
+		}
+
+		assert.deepEqual(events, [], 'the row copy must not announce pre-existing rows as inserts');
+	});
+
+	it('delivers zero schema-change events, and nothing naming the shadow table', async () => {
+		const events: DatabaseSchemaChangeEvent[] = [];
+		const unsub = db.onSchemaChange(e => events.push(e));
+		try {
+			await db.exec('alter table t alter primary key (a, b)');
+		} finally {
+			unsub();
+		}
+
+		assert.deepEqual(
+			events.map(e => `${e.type} ${e.objectName}`), [],
+			'the rebuild must not report a create of a timestamped shadow table nor a drop of the real one',
+		);
+		assert.equal(events.some(e => /__rekey_/.test(e.objectName)), false);
+	});
+
+	it('groups nothing on the transaction-commit channel either', async () => {
+		const batches: TransactionCommitBatch[] = [];
+		const unsub = db.onTransactionCommit(b => batches.push(b));
+		try {
+			await db.exec('alter table t alter primary key (a, b)');
+		} finally {
+			unsub();
+		}
+
+		assert.deepEqual(batches, [], 'the copy is not part of any batch the application should see');
+	});
+
+	it('still does the work: the table is re-keyed, readable, and its rows unchanged', async () => {
+		// The suppression must silence the notifications, not the rebuild. The point lookup on
+		// the NEW key doubles as the proof that the internal catalog change notifier was left
+		// alone — a stale cached schema would still plan against the retired key.
+		// (`alter-table-conformance.spec.ts`'s 'alterPrimaryKey → honored via engine-side shadow
+		// rebuild' asserts the same rebuild without any listener subscribed; this repeats it with
+		// both channels subscribed, which is the state that opens the gates the scope closes.)
+		const unsubData = db.onDataChange(() => { /* subscribed so the gates would be open */ });
+		const unsubSchema = db.onSchemaChange(() => { /* ditto */ });
+		try {
+			await db.exec('alter table t alter primary key (a, b)');
+		} finally {
+			unsubData();
+			unsubSchema();
+		}
+
+		assert.deepEqual(
+			(await rows(db, `select name from table_info('t') where pk > 0 order by pk`)).map(r => r.name),
+			['a', 'b'], 'both a and b are primary key columns after the re-key');
+
+		assert.deepEqual(
+			await rows(db, 'select a, b, v from t where a = 5 and b = 5'),
+			[{ a: 5, b: 5, v: 'pre' }], 'the seeded row survives, reachable under the new key');
+
+		assert.deepEqual(
+			await rows(db, 'select count(*) as n from t'),
+			[{ n: 1 }], 'the rebuild neither dropped nor duplicated rows');
+	});
+
+	it('a write AFTER the rebuild is still reported normally', async () => {
+		// The scope must not leak past the statement that opened it.
+		const events: DatabaseDataChangeEvent[] = [];
+		await db.exec('alter table t alter primary key (a, b)');
+		const unsub = db.onDataChange(e => events.push(e));
+		try {
+			await db.exec("insert into t values (6, 7, 'post')");
+		} finally {
+			unsub();
+		}
+
+		assert.equal(events.length, 1);
+		assert.equal(events[0].type, 'insert');
+		assert.deepEqual(events[0].key, [6, 7], 'and under the new primary key');
 	});
 });

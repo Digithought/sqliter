@@ -1548,10 +1548,15 @@ async function runAlterPrimaryKey(
 
 	await rebuildTableWithNewShape(rctx, tableSchema, schema, tableSchema.columns.map(c => c.name), newPkDef);
 
-	// Same re-key as the native arm, for the same reason — the rebuild reaches the catalog
-	// itself, so this runs after it returns. Every column survives the rebuild in order
-	// (`survivingColumns` above is the full list), so the indices still line up with the
-	// event images.
+	// A DEFENSIVE NO-OP on this path today, not the working re-key the native arm above does.
+	// Nothing can be in the batch for this table by now: the rebuild's own events are
+	// suppressed (see `rebuildViaShadowTable`), the ALTER statement writes no rows of its own,
+	// and the explicit-transaction refusal above rules out earlier same-transaction writes.
+	// Kept anyway — it costs one walk of an empty batch, and it is the correct call the moment
+	// that transaction guard is loosened; deleting it would quietly make this arm's
+	// as-of-delivery `key` guarantee depend on the guard staying exactly as it is. Every column
+	// survives the rebuild in order (`survivingColumns` above is the full list), so the indices
+	// would still line up with the event images.
 	rctx.db._getEventEmitter().rekeyBatchedDataEvents(
 		tableSchema.schemaName, tableSchema.name, oldPkIndices, newPkIndices);
 
@@ -1739,6 +1744,9 @@ async function runDropMaintained(
  *    transaction began. Making the schema half roll back needs transactional DDL no module
  *    offers; making the data half survive would commit part of the user's transaction behind
  *    their back.
+ *
+ * The four statements are engine scaffolding, not statements the application issued, so the
+ * whole rebuild runs with the PUBLIC event channels suppressed — see the scope inside.
  */
 async function rebuildViaShadowTable(
 	rctx: RuntimeContext,
@@ -1756,25 +1764,46 @@ async function rebuildViaShadowTable(
 	const createDdl = buildShadowTableDdl(tableSchema, shadowName, survivingColumns, newPkDef);
 	const projection = survivingColumns.map(c => quoteIdentifier(c)).join(', ');
 
-	try {
-		await rctx.db._execWithinTransaction(createDdl);
-		await rctx.db._execWithinTransaction(
-			`insert into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
-		);
-		await rctx.db._execWithinTransaction(
-			`drop table ${qualifiedTable}`
-		);
-		await rctx.db._execWithinTransaction(
-			`alter table ${qualifiedShadow} rename to ${quoteIdentifier(tableName)}`
-		);
-	} catch (e) {
+	// The rebuild's statements are ordinary SQL, so without this scope they would raise
+	// ordinary notifications describing the scaffolding rather than what the user asked for:
+	// the copy announces every existing row as a fresh `insert` (relabelled onto the real
+	// table by the trailing rename), and the create/drop pair announces a timestamped table
+	// created and the real one dropped. A re-key changes no row and replaces no table, so all
+	// of that is wrong. Covers the failure cleanup below too — a shadow table nobody was told
+	// about must not announce its own drop.
+	//
+	// Only the PUBLIC channels are suppressed. The internal catalog change notifier keeps
+	// firing throughout (it is what invalidates the optimizer's and the write path's cached
+	// schemas), which is why the rebuilt table is immediately plannable under its new key.
+	//
+	// NOTE: a module whose own emitter defers delivery to its own commit — rather than
+	// emitting during the write — can still leak the copy's inserts, because its events
+	// arrive after this scope has closed. Conditional, not a live defect: no module that
+	// reaches this rebuild behaves that way (memory and the store both re-key in place and
+	// never enter it). If one ever does, suppression has to become name-keyed (covering the
+	// shadow name as well as the real one) or the events have to be dropped out of the batch
+	// after the fact.
+	await rctx.db._getEventEmitter().withPublicEventsSuppressed(async () => {
 		try {
+			await rctx.db._execWithinTransaction(createDdl);
 			await rctx.db._execWithinTransaction(
-				`drop table if exists ${qualifiedShadow}`
+				`insert into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
 			);
-		} catch { /* ignore */ }
-		throw e;
-	}
+			await rctx.db._execWithinTransaction(
+				`drop table ${qualifiedTable}`
+			);
+			await rctx.db._execWithinTransaction(
+				`alter table ${qualifiedShadow} rename to ${quoteIdentifier(tableName)}`
+			);
+		} catch (e) {
+			try {
+				await rctx.db._execWithinTransaction(
+					`drop table if exists ${qualifiedShadow}`
+				);
+			} catch { /* ignore */ }
+			throw e;
+		}
+	});
 }
 
 /**

@@ -313,6 +313,13 @@ export class DatabaseEventEmitter {
 	/** Whether we're currently in a transaction (batching mode) */
 	private isBatching = false;
 
+	/**
+	 * Nesting depth of open {@link withPublicEventsSuppressed} scopes. Non-zero ⇒ the
+	 * application-facing channels are suppressed. A counter rather than a flag so an inner
+	 * scope's exit cannot leave suppression stuck on (or off) for the outer one.
+	 */
+	private publicEventSuppressionDepth = 0;
+
 	/** Map of module emitters we've subscribed to, for cleanup */
 	private moduleSubscriptions = new Map<string, { dataUnsub?: () => void; schemaUnsub?: () => void }>();
 
@@ -445,8 +452,12 @@ export class DatabaseEventEmitter {
 	 * events, so the auto-event generation gate must open for it too even when no
 	 * per-event data listener is subscribed. Consulted by the DML executor's
 	 * auto-event gate (see `dml-executor.ts`).
+	 *
+	 * Always false inside a {@link withPublicEventsSuppressed} scope — the cheapest place
+	 * to suppress is before the event is ever built.
 	 */
 	needsDataEvents(): boolean {
+		if (this.publicEventSuppressionDepth > 0) return false;
 		return this.dataListeners.size > 0 || this.transactionCommitListeners.size > 0;
 	}
 
@@ -455,9 +466,81 @@ export class DatabaseEventEmitter {
 	 * any per-event {@link onSchemaChange} listener OR any {@link onTransactionCommit}
 	 * listener is registered. Companion to {@link needsDataEvents}; consulted by the
 	 * schema manager's auto-event gate (see `schema/manager.ts`).
+	 *
+	 * Always false inside a {@link withPublicEventsSuppressed} scope, as above.
 	 */
 	needsSchemaEvents(): boolean {
+		if (this.publicEventSuppressionDepth > 0) return false;
 		return this.schemaListeners.size > 0 || this.transactionCommitListeners.size > 0;
+	}
+
+	/**
+	 * Run `fn` with the PUBLIC event channels suppressed: {@link onDataChange},
+	 * {@link onSchemaChange}, and — because a suppressed statement contributes nothing to the
+	 * group — {@link onTransactionCommit}. While the scope is open,
+	 * {@link needsDataEvents}/{@link needsSchemaEvents} report false so the engine's own
+	 * producers never build an event, and any event that arrives anyway (a module with its own
+	 * emitter reaches {@link handleModuleDataEvent}/{@link handleModuleSchemaEvent} without
+	 * consulting a gate) is dropped with a log line rather than silently.
+	 *
+	 * This covers ONLY those application-facing channels. It deliberately does **not** touch
+	 * the internal catalog change notifier
+	 * (`db.schemaManager.getChangeNotifier().notifyChange`), which invalidates the optimizer's
+	 * and the write path's cached schemas: that is engine plumbing, and a suppressed scope's
+	 * own DDL must keep firing it or those caches go stale mid-statement. The
+	 * maintenance-collision channel ({@link queueCollision}) is likewise untouched — no
+	 * suppressed scope today writes through materialized-view maintenance.
+	 *
+	 * For engine-internal scaffolding the application never issued. Sole caller today: the
+	 * shadow-table rebuild behind `ALTER TABLE … ALTER PRIMARY KEY` on a module that cannot
+	 * re-key in place (`runtime/emit/alter-table.ts`).
+	 *
+	 * Nests, and restores the previous depth even when `fn` throws.
+	 */
+	async withPublicEventsSuppressed<T>(fn: () => Promise<T>): Promise<T> {
+		this.publicEventSuppressionDepth++;
+		log('Suppressing public event channels (depth: %d)', this.publicEventSuppressionDepth);
+		try {
+			return await fn();
+		} finally {
+			this.publicEventSuppressionDepth--;
+			log('Restoring public event channels (depth: %d)', this.publicEventSuppressionDepth);
+		}
+	}
+
+	/**
+	 * Whether a {@link withPublicEventsSuppressed} scope is currently open.
+	 */
+	isPublicEventsSuppressed(): boolean {
+		return this.publicEventSuppressionDepth > 0;
+	}
+
+	/**
+	 * Whether an arriving data event must be dropped because a
+	 * {@link withPublicEventsSuppressed} scope is open — logging it when so, so a discarded
+	 * event stays traceable.
+	 */
+	private dropDataEventWhileSuppressed(
+		origin: string,
+		moduleName: string,
+		event: VTableDataChangeEvent,
+	): boolean {
+		if (this.publicEventSuppressionDepth === 0) return false;
+		log('Dropped %s data event from %s while public events are suppressed: %s on %s.%s',
+			origin, moduleName, event.type, event.schemaName, event.tableName);
+		return true;
+	}
+
+	/** Schema-channel counterpart of {@link dropDataEventWhileSuppressed}. */
+	private dropSchemaEventWhileSuppressed(
+		origin: string,
+		moduleName: string,
+		event: VTableSchemaChangeEvent,
+	): boolean {
+		if (this.publicEventSuppressionDepth === 0) return false;
+		log('Dropped %s schema event from %s while public events are suppressed: %s %s %s',
+			origin, moduleName, event.type, event.objectType, event.objectName);
+		return true;
 	}
 
 	/**
@@ -577,6 +660,7 @@ export class DatabaseEventEmitter {
 	 * If batching, queue the event; otherwise emit immediately.
 	 */
 	private handleModuleDataEvent(moduleName: string, event: VTableDataChangeEvent): void {
+		if (this.dropDataEventWhileSuppressed('module', moduleName, event)) return;
 		if (this.isBatching) {
 			this.getActiveDataStore().push({ moduleName, event });
 			log('Batched data event from %s: %s on %s.%s', moduleName, event.type, event.schemaName, event.tableName);
@@ -591,6 +675,7 @@ export class DatabaseEventEmitter {
 	 * but we support batching for consistency.
 	 */
 	private handleModuleSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
+		if (this.dropSchemaEventWhileSuppressed('module', moduleName, event)) return;
 		if (this.isBatching) {
 			this.getActiveSchemaStore().push({ moduleName, event });
 			log('Batched schema event from %s: %s %s', moduleName, event.type, event.objectName);
@@ -607,6 +692,7 @@ export class DatabaseEventEmitter {
 	 * @param event The event to emit (will be converted to DatabaseDataChangeEvent)
 	 */
 	emitAutoDataEvent(moduleName: string, event: VTableDataChangeEvent): void {
+		if (this.dropDataEventWhileSuppressed('auto', moduleName, event)) return;
 		if (this.isBatching) {
 			this.getActiveDataStore().push({ moduleName, event });
 			log('Batched auto data event from %s: %s on %s.%s', moduleName, event.type, event.schemaName, event.tableName);
@@ -623,6 +709,7 @@ export class DatabaseEventEmitter {
 	 * @param event The event to emit
 	 */
 	emitAutoSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
+		if (this.dropSchemaEventWhileSuppressed('auto', moduleName, event)) return;
 		if (this.isBatching) {
 			this.getActiveSchemaStore().push({ moduleName, event });
 		} else {
