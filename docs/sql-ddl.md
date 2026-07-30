@@ -109,6 +109,16 @@ explicitly (`from t1 as materialized`), quote it (`from t1 "materialized"`), or
 separate the items with `;`. Outside a declaration block nothing is reserved:
 `select a from t1 materialized` still aliases `t1` as `materialized`.
 
+The restriction applies only where an item could actually begin — the item body's
+top level. Inside an open `(` (a subquery source, a scalar subquery) a bare alias
+is unaffected:
+
+```sql
+declare schema main {
+  view v1 as select id from t1 where exists (select 1 from t2 materialized)
+}                                                          -- ^ still an alias
+```
+
 An item kind the parser doesn't model yet (`domain`, `collation`, `import`) is
 skipped up to the next `;`, the closing `}`, or the next item keyword — separate
 those items with `;` when their body could itself contain an item keyword.

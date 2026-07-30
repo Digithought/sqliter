@@ -70,9 +70,10 @@ export class Parser {
 	 * parsed, the leading keywords of a *sibling* item must not be absorbed as an
 	 * implicit alias — block items carry no required separator, so the alias slot
 	 * and the next item's first token compete for the same position. Scoped by a
-	 * stack so it never leaks into ordinary statements.
+	 * stack so it never leaks into ordinary statements, and by the paren depth the
+	 * item started at, since a sibling item cannot begin inside an open `(`.
 	 */
-	private aliasBarriers: ReadonlySet<string>[] = [];
+	private aliasBarriers: { words: ReadonlySet<string>; parenDepth: number }[] = [];
 
 	/**
 	 * Initialize the parser with tokens from a SQL string
@@ -2331,7 +2332,7 @@ export class Parser {
 	 * See {@link aliasBarriers}; nesting is supported and the barrier always pops.
 	 */
 	private withAliasBarrier<T>(words: ReadonlySet<string>, parse: () => T): T {
-		this.aliasBarriers.push(words);
+		this.aliasBarriers.push({ words, parenDepth: this.parenStack.length });
 		try {
 			return parse();
 		} finally {
@@ -2339,7 +2340,12 @@ export class Parser {
 		}
 	}
 
-	/** True when the cursor sits on a bare identifier an active barrier reserves. */
+	/**
+	 * True when the cursor sits on a bare identifier an active barrier reserves.
+	 * Only fires at the paren depth the barrier was pushed at: an alias inside an
+	 * open `(` — a subquery source, a scalar subquery — cannot be confused with the
+	 * start of a sibling item, so `from t2 materialized` keeps working there.
+	 */
 	private atAliasBarrier(): boolean {
 		if (this.aliasBarriers.length === 0) return false;
 		const token = this.peek();
@@ -2347,7 +2353,8 @@ export class Parser {
 		// `"materialized"` stays usable as an alias.
 		if (token.type !== TokenType.IDENTIFIER || token.literal !== undefined) return false;
 		const upper = token.lexeme.toUpperCase();
-		return this.aliasBarriers.some(set => set.has(upper));
+		const depth = this.parenStack.length;
+		return this.aliasBarriers.some(b => b.parenDepth === depth && b.words.has(upper));
 	}
 
 	/**
