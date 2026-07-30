@@ -821,6 +821,60 @@ describe('Schema Manager', () => {
 		});
 	});
 
+	// ────────────────── The by-name index-owner resolver ──────────────────
+	describe('findIndexOwner', () => {
+		it('should skip a constraint-backing structure and keep scanning for the real index', async () => {
+			// The skip-and-continue rule, asserted on the resolver itself rather than
+			// only through DROP INDEX: `uq_email` is a's backing structure AND c's
+			// ordinary index, and the default scope must resolve to c.
+			await db.exec('create table a (id integer primary key, email text, constraint uq_email unique (email))');
+			await db.exec('create table c (id integer primary key, email text)');
+			await db.exec('create index uq_email on c (email)');
+
+			const match = db.schemaManager.findIndexOwner('main', 'uq_email');
+			expect(match, 'the real index is found').to.exist;
+			expect(match!.table.name).to.equal('c');
+			expect(match!.index.name).to.equal('uq_email');
+		});
+
+		it('should find nothing when only a constraint-backing structure carries the name', async () => {
+			await db.exec('create table a (id integer primary key, email text, constraint uq_email unique (email))');
+			expect(db.schemaManager.findIndexOwner('main', 'uq_email')).to.be.undefined;
+		});
+
+		it('should admit an exposed backing structure only at the tag-addressable scope', async () => {
+			await db.exec('create table t (id integer primary key, email text, constraint uq_email unique (email) with tags ("quereus.expose_implicit_index" = true))');
+
+			expect(db.schemaManager.findIndexOwner('main', 'uq_email'), 'default scope excludes it').to.be.undefined;
+			const tagMatch = db.schemaManager.findIndexOwner('main', 'uq_email', { scope: 'tag-addressable' });
+			expect(tagMatch, 'ALTER INDEX … TAGS can reach it').to.exist;
+			expect(tagMatch!.table.name).to.equal('t');
+		});
+
+		it('should exclude a hidden backing structure at both scopes', async () => {
+			await db.exec('create table t (id integer primary key, email text, constraint uq_email unique (email))');
+			expect(db.schemaManager.findIndexOwner('main', 'uq_email', { scope: 'tag-addressable' })).to.be.undefined;
+		});
+
+		it('should compare index name, schema name and excludeTable case-insensitively', async () => {
+			await db.exec('create table t1 (id integer primary key, note text)');
+			await db.exec('create index idx_note on t1 (note)');
+
+			expect(db.schemaManager.findIndexOwner('MAIN', 'IDX_NOTE')!.table.name).to.equal('t1');
+			expect(
+				db.schemaManager.findIndexOwner('main', 'idx_note', { excludeTable: 'T1' }),
+				'excludeTable must not depend on the caller matching stored casing',
+			).to.be.undefined;
+			expect(db.schemaManager.findIndexOwner('main', 'idx_note', { excludeTable: 'other' })!.table.name).to.equal('t1');
+		});
+
+		it('should return undefined for an unknown schema rather than throwing', () => {
+			// Callers that must tell a missing schema from a missing index (dropIndex,
+			// resolveIndexTagSwap) resolve the schema themselves first.
+			expect(db.schemaManager.findIndexOwner('nosuch', 'idx')).to.be.undefined;
+		});
+	});
+
 	// ────────────────── Schema items in specific schemas ──────────────────
 	describe('getSchemaItem with explicit schema', () => {
 		it('should find items in specified schema', async () => {

@@ -466,6 +466,9 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       return 'already-applied';
     }
     case 'drop_index':
+      // No owner in the default scope ⇒ nothing a `DROP INDEX` could remove, so
+      // converge silently rather than exec a statement that would throw
+      // `no such index` and abort the admission unit.
       return db.schemaManager.findIndexOwner(change.schema, change.table) ? 'execute' : 'already-applied';
     default:
       // Column-level migrations (add_column / drop_column / alter_column) carry
