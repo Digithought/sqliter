@@ -153,6 +153,12 @@ select t.id from jse_txt t where t.s in (select v from jse_t);
 select j.id from jse_t j where j.v in (select t.s from jse_txt t where t.id = j.id);
 → [{"id":1}]
 
+-- Correlated in the REVERSE direction (TEXT outer, JSON inner). Same rewrite, but now it
+-- is the OUTER operand `coerceObjectPhysicalSet` wraps — the probe-side branch of the
+-- decorrelation coercion, which the forward case above never exercises.
+select t.id from jse_txt t where t.s in (select j.v from jse_t j where j.id = t.id);
+→ [{"id":1}]
+
 -- SELECT-list position: an undeclared column is NOT NULL in this engine, so both sides
 -- are non-nullable and the existence-flag LEFT JOIN arm (decorrelateExistsInProjection)
 -- fires. Its join condition carries the same synthesized `v = cast(s as json)`, verified
@@ -221,6 +227,24 @@ select id from jse_t where v in (select s from jse_null);
 
 select id from jse_t where v not in (select s from jse_null);
 → []
+
+-- NOT IN over a NULL-free inner is the plain complement: the coerced member excludes its
+-- own row and nothing else. (The two NOT IN cases above both land on UNKNOWN, so neither
+-- pins the FALSE-becomes-TRUE direction of the negation.)
+select id from jse_t where v not in (select s from jse_txt where id = 1) order by id;
+→ [{"id":2},{"id":3},{"id":4}]
+
+-- The impure arm (a DML-with-RETURNING inner) drains rather than short-circuiting, and
+-- coerces its drained rows the same way. `count(*)` on the sink pins that the drain still
+-- covers every row past the match.
+create table jse_log (s text);
+-- run
+
+select cast('{"b":2,"a":1}' as json) in (insert into jse_log values ('{ "a" : 1 , "b" : 2 }'), ('nope') returning s) as found;
+→ [{"found":true}]
+
+select count(*) as c from jse_log;
+→ [{"c":2}]
 
 -- ===================================
 -- 5.2 The numeric ↔ textual pairing was NOT widened

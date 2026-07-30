@@ -90,7 +90,10 @@ An uncorrelated, functional `x IN (subquery)` is **not** row-cached. `emitIn`
 exactly once per statement execution into a `BTree` keyed under the membership
 collation, tracking whether the inner produced any NULL, then probes that set per
 outer row: hit → `true`; miss → `NULL` if the inner had a NULL else `false`;
-condition NULL → `NULL` (without forcing the build). This is O(K + N·log K) with
+condition NULL → `NULL` (without forcing the build — and a condition the
+membership conversion coerces to NULL short-circuits the same way, so the key is
+computed before the build, not after; see `inMembershipKeys` and `docs/types.md`
+§ JSON). This is O(K + N·log K) with
 **zero statistics** — it replaced the retired eager-CacheNode mechanism, whose
 threshold could abandon the buffer and re-drive the subquery per outer row
 (O(N×K); see quereus-in-subquery-set-probe). The probe set lives on the

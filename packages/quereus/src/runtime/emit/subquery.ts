@@ -459,20 +459,21 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 		} else {
 			// Some values are expressions - build tree at runtime
 			function runDynamicValues(_rctx: RuntimeContext, condition: SqlValue, ...values: SqlValue[]): SqlValue {
-				// If condition is NULL, result is NULL
-				if (condition === null) {
+				// If condition is NULL — or coerces to NULL — the result is NULL
+				const conditionKey = condition === null ? null : probeKey(condition);
+				if (conditionKey === null) {
 					return null;
 				}
 
 				// Linear scan is optimal since we're only doing one lookup per execution
-				const conditionKey = memberKey(condition);
 				let hasNull = false;
 				for (const value of values) {
-					if (value === null) {
+					const valueKey = value === null ? null : memberKey(value);
+					if (valueKey === null) {
 						hasNull = true;
 						continue;
 					}
-					if (compareSqlValuesFast(conditionKey, memberKey(value), collation) === 0) {
+					if (compareSqlValuesFast(conditionKey, valueKey, collation) === 0) {
 						return true; // Found a match
 					}
 				}

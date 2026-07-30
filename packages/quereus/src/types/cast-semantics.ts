@@ -55,6 +55,12 @@ export function castFallback(value: SqlValue, type: LogicalType): SqlValue {
  * the caller still advertises the target type — the very shape castFallback exists to
  * prevent. Unreachable today: NULL is the only builtin without `parse`, and the parser
  * rejects it as a CAST target. If a plugin ever registers a parse-less type, validate here.
+ *
+ * NOTE: the fallback path costs one *thrown* exception per call, and both callers run
+ * per row — so a scan whose operands mostly fail to parse (`json_col in (select
+ * free_text from big_table)`) pays V8 exception construction on every row. Fine at
+ * current scale; if it ever shows up in a profile, give LogicalType an optional
+ * non-throwing `tryParse` and prefer it here.
  */
 export function lenientCast(value: SqlValue, type: LogicalType): SqlValue {
 	if (value === null) return null;
