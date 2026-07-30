@@ -60,6 +60,68 @@ describe('Plan shape: subquery decorrelation', () => {
 			const results = await allRows<{ name: string }>(db, q);
 			expect(results.map(r => r.name)).to.deep.equal(['alpha', 'beta']);
 		});
+
+		it('renders the join condition as `a.x = x`, not the nonsense `a.x = a.x`', async () => {
+			// Regression guard for bug-in-decorrelation-inner-shape-unchecked: the inner
+			// ColumnReferenceNode used to reuse the OUTER column's AST, so EXPLAIN
+			// rendered every decorrelated IN condition as `a.x = a.x`. The inner side
+			// now carries its own AST built from the inner attribute's name.
+			const q = "SELECT * FROM a WHERE a.x IN (SELECT b.x FROM b WHERE b.id = a.id)";
+			const rows = await planRows(db, q);
+			const joinRow = rows.find(r => r.op.includes('JOIN') && r.detail.includes('SEMI'));
+			expect(joinRow, 'expected a semi join').to.not.equal(undefined);
+			const conditionRow = rows.find(r => r.node_type === 'BinaryOp' && r.parent_id === joinRow!.id);
+			expect(conditionRow, 'expected the join condition as a child of the join').to.not.equal(undefined);
+			expect(conditionRow!.detail).to.equal('a.x = x');
+		});
+	});
+
+	describe('correlated IN inner-shape gates (bug-in-decorrelation-inner-shape-unchecked)', () => {
+		// Each of these used to throw "No row context found for column …" at
+		// runtime: extractInCorrelation built the join condition against the
+		// subquery's first OUTPUT column but then descended past Project/Alias and
+		// used whatever it landed on as the join's right side — a mismatch whenever
+		// the descent didn't stop exactly where the condition was built from, or
+		// didn't reach a FilterNode at all (DISTINCT / set-ops / LIMIT above the
+		// correlation). All must now decline the semi-join rewrite and keep
+		// correctness via the runtime set-probe `In` node.
+		const declinesToInNode = async (q: string): Promise<void> => {
+			const types = await planNodeTypes(db, q);
+			expect(types, `expected InNode retained for: ${q}`).to.include('In');
+			expect(await countSemiJoins(q), `expected no semi join for: ${q}`).to.equal(0);
+		};
+
+		it('declines when the inner projection is computed (fresh attribute id)', async () => {
+			await declinesToInNode("SELECT * FROM a WHERE a.x IN (SELECT b.x + 0 FROM b WHERE b.id = a.id)");
+		});
+
+		it('declines when the inner subquery is DISTINCT', async () => {
+			await declinesToInNode("SELECT * FROM a WHERE a.x IN (SELECT DISTINCT b.x FROM b WHERE b.id = a.id)");
+		});
+
+		it('declines when the inner subquery has LIMIT above the correlated filter', async () => {
+			await declinesToInNode("SELECT * FROM a WHERE a.x IN (SELECT b.x FROM b WHERE b.id = a.id LIMIT 1)");
+		});
+
+		it('declines when the inner subquery is a UNION', async () => {
+			await declinesToInNode("SELECT * FROM a WHERE a.x IN (SELECT b.x FROM b WHERE b.id = a.id UNION SELECT 99)");
+		});
+
+		it('declines when the inner subquery has an ORDER BY', async () => {
+			await declinesToInNode("SELECT * FROM a WHERE a.x IN (SELECT b.x FROM b WHERE b.id = a.id ORDER BY b.x)");
+		});
+
+		it('still decorrelates when a LIMIT sits below the correlated filter, inside a derived table', async () => {
+			// A LIMIT *inside* an uncorrelated derived table applies once, globally —
+			// unrelated to the LIMIT-above-the-filter case the rule must decline.
+			const q = "SELECT * FROM a WHERE a.x IN (SELECT t.x FROM (SELECT b.x FROM b LIMIT 2) t WHERE t.x = a.x)";
+			expect(await countSemiJoins(q), 'an uncorrelated inner LIMIT should not block decorrelation').to.equal(1);
+		});
+
+		it('still decorrelates through a bare pass-through derived table', async () => {
+			const q = "SELECT * FROM a WHERE a.x IN (SELECT t.x FROM (SELECT * FROM b) t WHERE t.id = a.id)";
+			expect(await countSemiJoins(q), 'a non-computed derived table should not block decorrelation').to.equal(1);
+		});
 	});
 
 	describe('uncorrelated filter-position IN decorrelated into semi-join', () => {

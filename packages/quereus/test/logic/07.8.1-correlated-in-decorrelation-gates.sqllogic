@@ -1,0 +1,115 @@
+-- 07.8.1-correlated-in-decorrelation-gates.sqllogic
+--
+-- Regression guard for bug-in-decorrelation-inner-shape-unchecked. A correlated
+-- `col IN (subquery)` gets rewritten by rule-subquery-decorrelation into a semi
+-- join (see rule-subquery-decorrelation.ts). Two assumptions in that rewrite were
+-- unchecked: the join condition was built from the subquery's first OUTPUT
+-- column but the join's right side came from wherever a Project/Alias descent
+-- landed (a mismatch for a COMPUTED projection, whose output column has no base
+-- attribute for the right side to expose), and the descent only recognized
+-- Project/Alias, so DISTINCT / LIMIT / set-ops / ORDER BY above the correlated
+-- filter were silently treated as if absent. Both produced a runtime crash:
+-- "No row context found for column ...". The fix adds gates that decline the
+-- rewrite for all of these shapes, falling back to the correct (if slower)
+-- runtime set-probe IN evaluation — every query below must return the right
+-- answer whether the rule fires or declines.
+--
+-- b.id is a PRIMARY KEY, so `b.id = a.id` matches at most one row — DISTINCT and
+-- LIMIT never change which rows the *plain* correlated shapes return; they are
+-- here to pin that the decline is safe, not to change the result set. id=8
+-- exercises COALESCE actually changing the outcome (a genuine NULL-vs-default
+-- distinction), and the UNION cases append a constant unrelated to correlation
+-- so a wrongly-decorrelated plan (which would silently drop the outer-row
+-- context) is caught by a changed expected result.
+
+create table a (id integer primary key, x integer null);
+create table b (id integer primary key, x integer null);
+
+-- id=3: outer x is NULL (never matches under three-valued IN, regardless of the
+--       inner). id=4: no matching b row (empty subquery). id=5: matching inner
+--       row has NULL x. id=8: matching inner row has NULL x, but outer x = 0 —
+--       distinguishes COALESCE(b.x, 0) from bare b.x.
+insert into a values (1, 10), (2, 20), (3, null), (4, 40), (5, 50), (6, 60), (7, 21), (8, 0);
+insert into b values (1, 10), (2, 20), (3, 30), (5, null), (6, 65), (7, 20), (8, null);
+
+-- ===== Plain correlated IN (the baseline the gated shapes are compared to) =====
+
+select a.x from a where a.x in (select b.x from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- ===== Computed inner projection: the right side's attribute id is fresh, so =====
+-- ===== the join-key-exposure gate must decline (defect 1) =====
+
+select a.x from a where a.x in (select b.x + 0 from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- Computed projection with a residual inner-only predicate alongside the
+-- correlation (b.x > 5 excludes the id=5/id=8 NULL rows via WHERE's NULL drop)
+select a.x from a where a.x in (select b.x * 1 from b where b.id = a.id and b.x > 5) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- COALESCE: id=8's inner NULL becomes 0, matching outer x=0 — only correct if
+-- the computed projection's own value (not some other column) is compared
+select a.x from a where a.x in (select coalesce(b.x, 0) from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20},{"x":0}]
+
+-- ===== DISTINCT / LIMIT above the correlated filter: descent used to stop =====
+-- ===== silently with no inner FilterNode found (defect 2) =====
+
+select a.x from a where a.x in (select distinct b.x from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20}]
+
+select a.x from a where a.x in (select b.x from b where b.id = a.id limit 1) order by a.id;
+→ [{"x":10},{"x":20}]
+
+select a.x from a where a.x in (select b.x from b where b.id = a.id limit 1 offset 0) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- ===== Set operations / ORDER BY above the correlated filter =====
+
+-- UNION appends a constant (40) unrelated to any a.id's correlation; id=4 (no
+-- matching b row) picks it up only because IN evaluates per-row, not because
+-- the rewrite silently dropped the correlation
+select a.x from a where a.x in (select b.x from b where b.id = a.id union select 40) order by a.id;
+→ [{"x":10},{"x":20},{"x":40}]
+
+select a.x from a where a.x in (select b.x from b where b.id = a.id union all select 40) order by a.id;
+→ [{"x":10},{"x":20},{"x":40}]
+
+select a.x from a where a.x in (select b.x from b where b.id = a.id order by b.x) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- ===== The inner *derived table* still decorrelates: only the outer subquery =====
+-- ===== root's own shape gates the rewrite, not an uncorrelated shape nested =====
+-- ===== further inside =====
+
+select a.x from a where a.x in (select t.x from (select * from b) t where t.id = a.id) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- ===== Two correlated IN conjuncts in one WHERE: exercises the rule's internal =====
+-- ===== per-conjunct loop (each becomes its own stacked semi join) =====
+
+select a.x from a where a.x in (select b.x from b where b.id = a.id) and a.x in (select b.x + 0 from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- ===== NOT IN: parses as NOT over the InNode, so it never matches the rule's =====
+-- ===== top-level-conjunct shape and always stays on the per-row path — pinned =====
+-- ===== here for NULL-semantics correctness across the same inner shapes =====
+
+select a.x from a where a.x not in (select b.x from b where b.id = a.id) order by a.id;
+→ [{"x":40},{"x":60},{"x":21}]
+
+select a.x from a where a.x not in (select b.x + 0 from b where b.id = a.id) order by a.id;
+→ [{"x":40},{"x":60},{"x":21}]
+
+-- ===== NOT EXISTS over the same gated inner shapes (existence only, so the =====
+-- ===== presence/absence of a matching b row is what matters) =====
+
+select a.x from a where not exists (select distinct 1 from b where b.id = a.id) order by a.id;
+→ [{"x":40}]
+
+select a.x from a where not exists (select 1 from b where b.id = a.id limit 1) order by a.id;
+→ [{"x":40}]
+
+drop table a;
+drop table b;
