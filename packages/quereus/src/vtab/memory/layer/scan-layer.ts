@@ -22,6 +22,33 @@ function seekKeyHasNull(key: BTreeKey, keyIsTuple: boolean): boolean {
 }
 
 /**
+ * A multi-seek's keys arrive in seek-argument order (the order the `IN` list appears in
+ * the SQL text), which need not match the scanned structure's own key order. `quereus-isolation`
+ * merges this scan with a staged-row stream assuming both arrive in structure order (see
+ * merge-iterator.ts), so sort them under that structure's own comparator — the same contract
+ * the store backend already honors (see store-table-scan.ts). Reversed for a descending walk,
+ * which emits the structure's keys backwards too. Both comparators already fold each key
+ * column's logical type, collation and `DESC` direction, so this is the tree's physical order.
+ *
+ * Keys pass through untouched for an index name the layer's schema does not know; the scan
+ * body reports that with a better message than a sort could.
+ */
+function orderSeekKeys(
+	keys: readonly BTreeKey[],
+	plan: ScanPlan,
+	layer: Layer,
+	primaryKeyComparator: (a: BTreeKey, b: BTreeKey) => number,
+): readonly BTreeKey[] {
+	const compare = plan.indexName === 'primary'
+		? primaryKeyComparator
+		: layer.getSecondaryIndex(plan.indexName)?.compareKeys;
+	if (!compare) return keys;
+	return plan.descending
+		? [...keys].sort((a, b) => -compare(a, b))
+		: [...keys].sort(compare);
+}
+
+/**
  * Scans a layer (base or transaction) according to a ScanPlan, yielding matching rows.
  * Operates on the Layer interface — the inherited BTrees handle data inheritance transparently.
  *
@@ -67,25 +94,7 @@ function* scanLayerResolved(
 		const { primaryKeyExtractorFromRow, primaryKeyEncoder: encodePk, primaryKeyComparator } =
 			layer.getPkExtractorsAndComparators(seekSchema);
 		const seen = new Set<string>();
-		// `quereus-isolation` merges this scan with a staged-row stream under the
-		// assumption both arrive in the scanned structure's own key order (see
-		// merge-iterator.ts). A multi-seek's keys arrive in seek-argument order
-		// (the order the IN-list appears in the SQL text), which need not match —
-		// sort them under the scanned structure's own comparator so this backend
-		// keeps the same emission-order contract the store backend already honors
-		// (see store-table-scan.ts). Reversed when the physical walk is descending,
-		// since a reverse walk of the structure emits its keys backwards too.
-		const keyComparator = plan.indexName === 'primary'
-			? primaryKeyComparator
-			: layer.getSecondaryIndex(plan.indexName)?.compareKeys;
-		let orderedKeys = plan.equalityKeys;
-		if (keyComparator) {
-			const cmp = keyComparator;
-			orderedKeys = [...plan.equalityKeys].sort(plan.descending
-				? (a, b) => -cmp(a, b)
-				: cmp);
-		}
-		for (const key of orderedKeys) {
+		for (const key of orderSeekKeys(plan.equalityKeys, plan, layer, primaryKeyComparator)) {
 			if (seekKeyHasNull(key, comparators.keyIsTuple)) continue;
 			const singlePlan: ScanPlan = { ...plan, equalityKey: key, equalityKeys: undefined };
 			for (const row of scanLayerResolved(layer, singlePlan, comparators)) {
@@ -235,6 +244,11 @@ function* scanLayerResolved(
 		// insertion order, so fetch the PK-comparator-sorted view from the MemoryIndex
 		// (memoized there). The inline sort is a defensive fallback for an index name the
 		// layer's schema does not know (`primaryKeyComparator` is already in scope).
+		// This view is ASCENDING by PK for both walk directions, whereas the overlay merge
+		// reverses the WHOLE sort key (PK tie-break included) for a reversed scan. Nothing
+		// asks this backend for a reversed secondary-index scan today — no engine path emits
+		// `ordCons=DESC` and `scanEffective` only ever walks the primary tree — so the
+		// mismatch is unreachable; see backlog/debt-memory-reverse-secondary-pk-order.
 		const secondaryIndex = layer.getSecondaryIndex(plan.indexName);
 		const sortedPrimaryKeys = (indexEntry: MemoryIndexEntry): readonly BTreeKeyForPrimary[] =>
 			secondaryIndex

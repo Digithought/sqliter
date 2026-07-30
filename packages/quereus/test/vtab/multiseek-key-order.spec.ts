@@ -16,10 +16,15 @@
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
 
-async function evalRows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
+async function evalRows(
+	db: Database,
+	sql: string,
+	params?: SqlValue[],
+): Promise<Record<string, unknown>[]> {
 	const rows: Record<string, unknown>[] = [];
-	for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
+	for await (const r of db.eval(sql, params)) rows.push(r as Record<string, unknown>);
 	return rows;
 }
 
@@ -76,6 +81,32 @@ describe('multi-seek emission order (bug-isolation-multiseek-merge-order)', () =
 			{ id: 2, k: 10 },
 			{ id: 3, k: 20 },
 			{ id: 1, k: 30 },
+		]);
+	});
+
+	// The sort keys off the built seek keys, not off how they were written, so these two
+	// non-literal sources of the same plan must order identically. `rule-select-access-path`
+	// reaches the multi-seek from either an `IN` list or a collapsed `OR` chain, and the
+	// key values can arrive as runtime parameters rather than literals.
+	it('serves a parameter-bound multi-seek in ascending key order', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec("insert into t values (1, 'a'), (2, 'b'), (3, 'c')");
+		const rows = await evalRows(db, 'select id, v from t where id in (?, ?, ?)', [3, 1, 2]);
+		expect(rows).to.deep.equal([
+			{ id: 1, v: 'a' },
+			{ id: 2, v: 'b' },
+			{ id: 3, v: 'c' },
+		]);
+	});
+
+	it('serves an OR-collapsed multi-seek in ascending key order', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec("insert into t values (1, 'a'), (2, 'b'), (3, 'c')");
+		const rows = await evalRows(db, 'select id, v from t where id = 3 or id = 1 or id = 2');
+		expect(rows).to.deep.equal([
+			{ id: 1, v: 'a' },
+			{ id: 2, v: 'b' },
+			{ id: 3, v: 'c' },
 		]);
 	});
 
