@@ -30,12 +30,18 @@
  * flows through `estimatedRows` automatically.
  *
  * Two paths:
- *   - **single-table** — `extractTableSchema` finds one base table under the
- *     Filter; hand the whole predicate to the provider, which decomposes its
- *     boolean structure itself.
- *   - **multi-relation** — the source spans several tables (a join). Split the
- *     predicate into conjuncts, attribute each to the base table(s) its columns
- *     come from, estimate per conjunct, and combine.
+ *   - **single-table** — `extractRowSourceTableSchema` finds one base table under
+ *     the Filter *whose rows are the ones arriving at it*; hand the whole predicate
+ *     to the provider, which decomposes its boolean structure itself.
+ *   - **multi-relation** — the source spans several tables (a join), or the strict
+ *     walk declined. Split the predicate into conjuncts, attribute each to the base
+ *     table(s) its columns come from, estimate per conjunct, and combine.
+ *
+ * The strict walk matters because the provider resolves a column reference by its
+ * AST **name**: over `select cat, count(*) as qty from o group by cat having qty > 2`
+ * the permissive `extractTableSchema` reaches `o` through the aggregate and the alias
+ * `qty` then reads `o.qty`'s histogram — a fraction of `o`'s rows, describing neither
+ * the group count nor the aggregate's output. Rename the alias and the answer changes.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -45,7 +51,7 @@ import type { TableSchema } from '../../../schema/table.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode, type TableReferenceNode } from '../../nodes/reference.js';
-import { extractTableSchema } from '../../util/key-utils.js';
+import { extractRowSourceTableSchema } from '../../util/key-utils.js';
 import { collectColumnOrigins, type ColumnOrigin } from '../../util/column-origins.js';
 import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { combineConjunctive } from '../../stats/selectivity-combine.js';
@@ -68,10 +74,12 @@ export function ruleFilterSelectivity(node: PlanNode, context: OptContext): Plan
 	// makes the rule safe on any already-stamped node regardless.)
 	if (filter.selectivity !== undefined) return null;
 
-	// extractTableSchema walks single-child wrappers (Filter/Project/Sort/Retrieve/
-	// TableReference) to the base table. It returns undefined for a join / other
-	// multi-relation source, which is what the second path handles.
-	const tableSchema = extractTableSchema(filter.source);
+	// extractRowSourceTableSchema walks single-child wrappers (Filter/Project/Sort/
+	// Retrieve/TableReference) to the base table, but stops at any operator whose
+	// output rows are not its source's rows (aggregate, recursive CTE, set operation).
+	// It returns undefined for those and for a join / other multi-relation source,
+	// which is what the second path handles.
+	const tableSchema = extractRowSourceTableSchema(filter.source);
 	const sel = tableSchema
 		? singleTableSelectivity(tableSchema, filter, context)
 		: multiRelationSelectivity(filter, context);

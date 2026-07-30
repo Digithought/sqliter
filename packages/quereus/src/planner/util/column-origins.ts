@@ -36,8 +36,7 @@
  */
 
 import { TableReferenceNode } from '../nodes/reference.js';
-import { SetOperationNode } from '../nodes/set-operation-node.js';
-import { RecursiveCTENode } from '../nodes/recursive-cte-node.js';
+import { isRowMerging } from './row-population.js';
 import type { PlanNode, RelationalPlanNode } from '../nodes/plan-node.js';
 import type { TableSchema } from '../../schema/table.js';
 
@@ -79,14 +78,6 @@ export function collectColumnOrigins(node: RelationalPlanNode): Map<number, Colu
 	}
 
 	return origins;
-}
-
-/**
- * Does this node publish one branch's attribute ids over rows drawn from several
- * branches? Such an id describes no single base-table column.
- */
-function isRowMerging(node: RelationalPlanNode): boolean {
-	return node instanceof SetOperationNode || node instanceof RecursiveCTENode;
 }
 
 /** Zip a table reference's attributes with its schema columns (1:1 by construction). */

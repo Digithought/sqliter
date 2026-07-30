@@ -16,6 +16,8 @@ import { FilterNode, DEFAULT_FILTER_SELECTIVITY } from '../../src/planner/nodes/
 import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
 import { combineConjunctive, combineDisjunctive } from '../../src/planner/stats/selectivity-combine.js';
 import { CROSS_RELATION_INEQUALITY_SELECTIVITY } from '../../src/planner/rules/predicate/rule-filter-selectivity.js';
+import { extractTableSchema, extractRowSourceTableSchema } from '../../src/planner/util/key-utils.js';
+import type { RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { Parser } from '../../src/parser/parser.js';
 import type { TableSchema } from '../../src/schema/table.js';
 import type * as AST from '../../src/parser/ast.js';
@@ -23,6 +25,13 @@ import type * as AST from '../../src/parser/ast.js';
 function walk(node: PlanNode, fn: (n: PlanNode) => void): void {
 	fn(node);
 	for (const child of node.getChildren()) walk(child as PlanNode, fn);
+}
+
+/** First node of `type` in the plan, outermost first. */
+function findNodeOfType(root: PlanNode, type: PlanNodeType): PlanNode | undefined {
+	let found: PlanNode | undefined;
+	walk(root, (n) => { if (!found && n.nodeType === type) found = n; });
+	return found;
 }
 
 function findFilter(root: PlanNode): FilterNode | undefined {
@@ -656,5 +665,126 @@ describe('boolean-structure selectivity (AND / OR / NOT decomposition)', () => {
 		const f = optimizedFilter(db, 'SELECT * FROM tiny WHERE p = 1 AND q = 2');
 		expect(f, 'expected a residual Filter').to.not.be.undefined;
 		expect(f!.selectivity).to.be.closeTo(1 / 4, 1e-12);
+	});
+});
+
+describe('single-table selectivity declines when the source changes the row population', () => {
+	let db: Database;
+	/** Distinct counts recorded by ANALYZE for `o`, keyed by column name. */
+	let ndv: Record<string, number>;
+
+	beforeEach(async () => {
+		db = new Database();
+		// `qty` deliberately shares its name with the `count(*)` alias used below, so a
+		// walk that reaches `o` through the aggregate would read `o.qty`'s histogram for
+		// the aggregate's output.
+		await db.exec('CREATE TABLE o (id INTEGER PRIMARY KEY, cat TEXT, qty INTEGER) USING memory');
+		for (let i = 1; i <= 100; i++) {
+			await db.exec(`INSERT INTO o VALUES (${i}, '${['a', 'b', 'c', 'd'][i % 4]}', ${i % 7})`);
+		}
+		for await (const _ of db.eval('ANALYZE o')) { /* consume */ }
+
+		const stats = db.schemaManager.findTable('o')?.statistics;
+		expect(stats, 'ANALYZE should record statistics for o').to.not.be.undefined;
+		ndv = {};
+		for (const col of ['cat', 'qty']) {
+			const n = stats!.columnStats.get(col)?.distinctCount;
+			expect(n, `distinct count for ${col}`).to.be.a('number');
+			ndv[col] = n as number;
+		}
+		expect(ndv.qty, 'qty should have 7 distinct values').to.equal(7);
+	});
+	afterEach(async () => { await db.close(); });
+
+	const RECURSIVE_SQL =
+		'WITH RECURSIVE c(qty) AS ('
+		+ ' SELECT qty FROM o'
+		+ ' UNION ALL'
+		+ ' SELECT qty + 1 FROM c WHERE qty < 50)'
+		+ ' SELECT * FROM c WHERE qty = 3';
+
+	it('leaves a filter over a recursive CTE unstamped rather than reading the seed table', () => {
+		// The CTE emits far more rows than `o` holds, drawn from a different value
+		// distribution, so 1/ndv(o.qty) describes neither. Every Filter in this plan
+		// must decline: the outer one over the CTE, and the recursive case's own
+		// `qty < 50` over the internal ref.
+		const plan = (db as unknown as { getPlan(s: string): PlanNode }).getPlan(RECURSIVE_SQL);
+		const filters = findFilters(plan);
+		expect(filters.length, 'expected at least the outer filter').to.be.at.least(1);
+		for (const f of filters) {
+			// `.not.equal` rather than `.not.closeTo`: the latter rejects undefined outright,
+			// and the buggy value was exactly `1 / ndv`, computed the same way.
+			expect(f.selectivity, 'specifically not 1/ndv of the seed table column')
+				.to.not.equal(1 / ndv.qty);
+			expect(f.selectivity, 'filter over a recursive CTE must not be stamped').to.be.undefined;
+		}
+	});
+
+	it('gives the same (unstamped) answer for a HAVING alias that collides with a base column', () => {
+		// Both queries are the same query. Before the fix the first read `o.qty`'s
+		// histogram through the aggregate (because the provider resolves a column
+		// reference by AST *name*) and the second fell to the naive BinaryOp guess —
+		// two different answers for one query, decided by the alias spelling.
+		const collides = optimizedFilter(db, 'SELECT cat, count(*) AS qty FROM o GROUP BY cat HAVING qty > 2');
+		const distinctName = optimizedFilter(db, 'SELECT cat, count(*) AS ct FROM o GROUP BY cat HAVING ct > 2');
+
+		expect(collides, 'expected a HAVING filter').to.not.be.undefined;
+		expect(distinctName, 'expected a HAVING filter').to.not.be.undefined;
+		expect(collides!.selectivity, 'aggregate output has no base-table statistics').to.be.undefined;
+		expect(distinctName!.selectivity, 'aggregate output has no base-table statistics').to.be.undefined;
+		expect(collides!.selectivity).to.equal(distinctName!.selectivity);
+	});
+
+	it('still stamps a HAVING on a group key, which is pushed below the aggregate', () => {
+		// `rule-aggregate-predicate-pushdown` moves this below the aggregate, so the
+		// Filter genuinely sits over `o`'s rows and the base-table fraction applies.
+		const f = optimizedFilter(db, "SELECT cat, count(*) AS c FROM o GROUP BY cat HAVING cat = 'a'");
+		expect(f, 'expected a Filter for the pushed-down group-key predicate').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / ndv.cat, 1e-12);
+	});
+
+	it('still stamps a filter over row-preserving wrappers (the permissive shapes must not regress)', () => {
+		// Project / Sort / Limit / Distinct all emit a subset of `o`'s own rows, so the
+		// base-table fraction stays the right answer and the strict walk must pass through.
+		const cases: [label: string, sql: string][] = [
+			['project', "SELECT * FROM (SELECT id, cat, qty + 1 AS q1 FROM o) x WHERE x.cat = 'a'"],
+			['sort', "SELECT * FROM (SELECT id, cat FROM o ORDER BY cat) x WHERE x.cat = 'a'"],
+			['limit', "SELECT * FROM (SELECT id, cat FROM o LIMIT 50) x WHERE x.cat = 'a'"],
+			['distinct', "SELECT * FROM (SELECT DISTINCT cat FROM o) x WHERE x.cat = 'a'"],
+		];
+		for (const [label, sql] of cases) {
+			const f = optimizedFilter(db, sql);
+			expect(f, `${label}: expected a residual Filter`).to.not.be.undefined;
+			expect(f!.selectivity, `${label}: must still be stamped from o's statistics`)
+				.to.be.closeTo(1 / ndv.cat, 1e-12);
+		}
+	});
+
+	// ── The two walks, directly ───────────────────────────────────────────────
+
+	it('extractTableSchema still resolves through an aggregate where the strict walk declines', () => {
+		const plan = (db as unknown as { getPlan(s: string): PlanNode }).getPlan(
+			'SELECT cat, count(*) AS ct FROM o GROUP BY cat HAVING ct > 2');
+		const agg = findNodeOfType(plan, PlanNodeType.HashAggregate)
+			?? findNodeOfType(plan, PlanNodeType.StreamAggregate)
+			?? findNodeOfType(plan, PlanNodeType.Aggregate);
+		expect(agg, 'expected an aggregate node in the plan').to.not.be.undefined;
+
+		expect(extractTableSchema(agg as RelationalPlanNode)?.name,
+			'the permissive walk (FK/key analysis) still reaches the base table').to.equal('o');
+		expect(extractRowSourceTableSchema(agg as RelationalPlanNode),
+			'the strict walk declines: these rows are groups, not o\'s rows').to.be.undefined;
+	});
+
+	it('extractTableSchema still resolves through a recursive CTE where the strict walk declines', () => {
+		const plan = (db as unknown as { getPlan(s: string): PlanNode }).getPlan(RECURSIVE_SQL);
+		const cte = findNodeOfType(plan, PlanNodeType.RecursiveCTE);
+		expect(cte, 'expected a RecursiveCTE node in the plan').to.not.be.undefined;
+
+		// `RecursiveCTENode.getRelations()` returns only the base case, so the permissive
+		// walk descends the seed and reports `o` — which is exactly why the strict walk
+		// has to stop here instead.
+		expect(extractTableSchema(cte as RelationalPlanNode)?.name).to.equal('o');
+		expect(extractRowSourceTableSchema(cte as RelationalPlanNode)).to.be.undefined;
 	});
 });

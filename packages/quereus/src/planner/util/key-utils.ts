@@ -6,6 +6,7 @@ import { resolveReferencedColumns } from '../../schema/table.js';
 import { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { LiteralNode } from '../nodes/scalar.js';
 import { isAtMostOneRow, isUnique, isUniqueDeterminant, keysOf, type KeyRel } from './fd-utils.js';
+import { changesRowPopulation } from './row-population.js';
 
 /**
  * Project unique keys through a projection mapping.
@@ -490,8 +491,33 @@ export function analyzeJoinKeyCoverage(
 /**
  * Extract TableSchema from a plan node by walking down through common wrappers
  * to find a RetrieveNode or TableReferenceNode.
+ *
+ * Permissive: answers "which table does this subtree ultimately read?", walking
+ * through ANY single-relation operator including aggregates and recursive CTEs.
+ * That is what FK/PK and key analysis want. When the question is instead "whose
+ * statistics describe the rows arriving here", use
+ * {@link extractRowSourceTableSchema}.
  */
 export function extractTableSchema(node: RelationalPlanNode): TableSchema | undefined {
+	return walkToTableSchema(node, false);
+}
+
+/**
+ * The base table whose rows actually reach `node` — declines at any operator that
+ * changes the row population (aggregate, recursive CTE, set operation) rather than
+ * walking through it. Use this when the question is "whose statistics describe these
+ * rows"; use {@link extractTableSchema} when the question is "which table does this
+ * subtree read" (FK/key analysis).
+ */
+export function extractRowSourceTableSchema(node: RelationalPlanNode): TableSchema | undefined {
+	return walkToTableSchema(node, true);
+}
+
+/**
+ * Shared descent for both variants. `strict` stops the single-relation descent at
+ * any row-population-changing operator so the two walks cannot drift apart.
+ */
+function walkToTableSchema(node: RelationalPlanNode, strict: boolean): TableSchema | undefined {
 	// Use duck typing to avoid circular imports
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const n = node as any;
@@ -506,10 +532,17 @@ export function extractTableSchema(node: RelationalPlanNode): TableSchema | unde
 		return n.tableRef.tableSchema as TableSchema | undefined;
 	}
 
+	// A row-population-changing node still has exactly one relation in some shapes
+	// (an aggregate's source, a recursive CTE's base case), so the strict walk must
+	// decline BEFORE the single-child descent below would step through it.
+	if (strict && changesRowPopulation(node)) {
+		return undefined;
+	}
+
 	// Walk through single-child wrappers (Filter, Project, Sort, etc.)
 	const relations = node.getRelations?.() ?? [];
 	if (relations.length === 1) {
-		return extractTableSchema(relations[0] as RelationalPlanNode);
+		return walkToTableSchema(relations[0] as RelationalPlanNode, strict);
 	}
 
 	return undefined;
