@@ -1524,13 +1524,17 @@ async function runAlterPrimaryKey(
 	if (!module.renameTable) {
 		throw new QuereusError(
 			`Module '${tableSchema.vtabModuleName ?? '<unknown>'}' does not support ALTER PRIMARY KEY on table `
-				+ `'${tableSchema.name}': the module implements neither 'alterTable' (to re-key in place) nor `
-				+ `'renameTable', and the engine's fallback rebuild finishes by renaming a shadow table over `
+				+ `'${tableSchema.name}': it cannot re-key in place (it implements no 'alterTable' hook, or the `
+				+ `hook declined), and the engine's fallback rebuild finishes by renaming a shadow table over `
 				+ `this one — without 'renameTable' the module would keep the rows under the shadow name and `
 				+ `the rebuilt table could not be opened.`,
 			StatusCode.UNSUPPORTED,
 		);
 	}
+	// NOTE: refused on every `DdlTransactionality` tier, including a module declaring
+	// 'transactional'. None does today; if one appears its DROP + RENAME would roll back
+	// together with the row copy, making this refusal over-broad — exempt that tier then, the
+	// way `assertDdlTransactionPolicy` already does.
 	if (isExplicitTransactionOpen(rctx.db)) {
 		throw new QuereusError(
 			`ALTER PRIMARY KEY on table '${tableSchema.name}' is not allowed inside an explicit transaction: `

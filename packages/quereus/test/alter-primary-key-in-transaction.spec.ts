@@ -508,6 +508,38 @@ describe('ALTER PRIMARY KEY rebuild fallback is refused inside an explicit trans
 		assert.deepEqual(await pkNames(), ['a']);
 	});
 
+	it('refuses under a SAVEPOINT opened without BEGIN', async () => {
+		// SAVEPOINT upgrades the statement's implicit transaction to explicit
+		// (`TransactionManager.upgradeToExplicitTransaction`), so the rebuild's DROP + RENAME
+		// would outlive a `rollback to` just as it outlives a plain ROLLBACK.
+		await db.exec('savepoint sp1');
+		await db.exec("insert into t values (1, 9, 'x')");
+
+		const err = await attempt('alter table t alter primary key (a, b)');
+		assert.equal(err.code, StatusCode.ERROR, err.message);
+		assert.match(err.message, /explicit transaction/i);
+
+		// The savepoint stack survives the refusal and still governs the writes above it.
+		await db.exec('rollback to sp1');
+		await db.exec('release sp1');
+		await db.exec('rollback');
+
+		assert.deepEqual(await allRows(db, 'select * from t'), [{ a: 5, b: 5, v: 'pre' }]);
+		assert.deepEqual(await pkNames(), ['a']);
+	});
+
+	it('refuses the empty-key form too', async () => {
+		// `alter primary key ()` is legal (the table reverts to an implicit rowid-style key)
+		// and reaches the same rebuild, so it must meet the same guard.
+		await db.exec('begin');
+		const err = await attempt('alter table t alter primary key ()');
+		assert.equal(err.code, StatusCode.ERROR, err.message);
+		assert.match(err.message, /explicit transaction/i);
+		await db.exec('rollback');
+
+		assert.deepEqual(await pkNames(), ['a']);
+	});
+
 	it('the same statement is honored in autocommit mode', async () => {
 		// The guard must key off an EXPLICIT transaction only. The ALTER's own
 		// `_ensureTransaction()` opens an IMPLICIT one in autocommit mode, so a naive
