@@ -195,8 +195,24 @@ interface BaseFunctionSchema {
 	 *  operands exactly as the `=` operator does. A builtin that declares this must
 	 *  also supply a {@link BaseFunctionSchema.customEmitter} binding the matching
 	 *  comparator over the same positions (`emitNullif` / `emitExtremum` in
-	 *  `func/builtins/scalar.ts`) — the emitter is not derived from this field. */
+	 *  `func/builtins/scalar.ts`) — the emitter is not derived from this field.
+	 *  A function that also declares {@link BaseFunctionSchema.returnsArg} skips the
+	 *  plan-time rewrite and coerces at emit time instead. */
 	readonly comparesArgs?: 'all' | readonly number[];
+	/**
+	 * When `true`, this function returns one of its arguments verbatim, so its
+	 * {@link BaseFunctionSchema.comparesArgs} group must NOT be rewritten with
+	 * plan-time casts — the cast's output would become the returned value
+	 * (`least('abc', 1)` returning `0`, a value that was never an argument). Such a
+	 * function's emitter compares *converted copies* of the argument values through
+	 * `makeComparisonGroup` (`runtime/emit/operand-comparator.ts`) and returns the
+	 * raw argument. Set by `nullif`, `greatest` and `least`.
+	 *
+	 * A function that returns a FRESH value computed from a compared group (a
+	 * hypothetical `same_value(a, b)` returning a boolean) leaves this unset and
+	 * keeps the plan-time rewrite. See `planner/building/coercion.ts`.
+	 */
+	readonly returnsArg?: boolean;
 	/**
 	 * Argument indices on which this function is injective when all other
 	 * arguments are held constant. Combines with operand-level recursion in

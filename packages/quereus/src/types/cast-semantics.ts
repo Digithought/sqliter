@@ -1,4 +1,5 @@
 import type { SqlValue } from '../common/types.js';
+import type { ScalarType } from '../common/datatype.js';
 import type { LogicalType } from './logical-type.js';
 import { TEXT_TYPE, BLOB_TYPE } from './builtin-types.js';
 
@@ -47,20 +48,22 @@ export function castFallback(value: SqlValue, type: LogicalType): SqlValue {
  * {@link castFallback} when it rejects the operand. CAST stays lenient and never throws.
  *
  * THE one definition of "convert to this type the way CAST does". `emitCast` is the
- * expression-level caller; `emitIn`'s membership evaluation is the other, converting a
- * per-row subquery value where the plan-time coercion (`insertCrossTypeCoercion`) has no
- * fixed operand to wrap.
+ * expression-level caller; `emitIn`'s membership evaluation converts a per-row subquery
+ * value where the plan-time coercion (`insertCrossTypeCoercion`) has no fixed operand to
+ * wrap; `makeComparisonGroup` (`runtime/emit/operand-comparator.ts`) converts a per-row
+ * *copy* of a comparison builtin's argument, where wrapping the operand would corrupt the
+ * value that builtin returns.
  *
  * NOTE: a type with no `parse` defines no conversion, so the operand passes through while
  * the caller still advertises the target type — the very shape castFallback exists to
  * prevent. Unreachable today: NULL is the only builtin without `parse`, and the parser
  * rejects it as a CAST target. If a plugin ever registers a parse-less type, validate here.
  *
- * NOTE: the fallback path costs one *thrown* exception per call, and both callers run
+ * NOTE: the fallback path costs one *thrown* exception per call, and every caller runs
  * per row — so a scan whose operands mostly fail to parse (`json_col in (select
- * free_text from big_table)`) pays V8 exception construction on every row. Fine at
- * current scale; if it ever shows up in a profile, give LogicalType an optional
- * non-throwing `tryParse` and prefer it here.
+ * free_text from big_table)`, or `least(free_text, 1)` over a text column of prose) pays
+ * V8 exception construction on every row. Fine at current scale; if it ever shows up in
+ * a profile, give LogicalType an optional non-throwing `tryParse` and prefer it here.
  */
 export function lenientCast(value: SqlValue, type: LogicalType): SqlValue {
 	if (value === null) return null;
@@ -91,4 +94,33 @@ export function lenientCast(value: SqlValue, type: LogicalType): SqlValue {
  */
 export function castCanYieldNull(type: LogicalType): boolean {
 	return type !== TEXT_TYPE && type !== BLOB_TYPE;
+}
+
+/**
+ * The ScalarType a conversion to `target` advertises for an operand of
+ * `operandType` — THE one derivation of "what does the converted value look like
+ * statically". {@link import('../planner/nodes/scalar.js').CastNode} is the
+ * plan-time caller; `makeComparisonGroup` (`runtime/emit/operand-comparator.ts`)
+ * is the emit-time one, so an emit-time comparison key resolves its collation and
+ * comparator routing off exactly the types a plan-time cast would have produced.
+ *
+ * A converting CAST is nullable even from a non-null operand: `cast('' as integer)`
+ * is null because INTEGER's parse maps the empty string to null, and a conversion
+ * that fails outright yields null rather than the unconverted operand. A cast to
+ * the operand's own type converts nothing, and TEXT/BLOB convert every non-null
+ * operand ({@link castCanYieldNull}), so both keep the operand's nullability.
+ *
+ * Collation survives only into a textual target: a number or a JSON document has
+ * no collation to compare under.
+ */
+export function castedScalarType(operandType: ScalarType, target: LogicalType): ScalarType {
+	return {
+		typeClass: 'scalar',
+		logicalType: target,
+		nullable: operandType.nullable
+			|| (target !== operandType.logicalType && castCanYieldNull(target)),
+		isReadOnly: operandType.isReadOnly,
+		collationName: target.isTextual ? operandType.collationName : undefined,
+		collationSource: target.isTextual ? operandType.collationSource : undefined,
+	};
 }

@@ -10,8 +10,9 @@ import type { Instruction, RuntimeContext } from '../../runtime/types.js';
 import { asRun } from '../../runtime/types.js';
 import { emitPlanNode } from '../../runtime/emitters.js';
 import { BLOB_RETURN, INTEGER_RETURN_NOT_NULL, REAL_RETURN, TEXT_RETURN_NOT_NULL } from './return-types.js';
-import { effectiveComparisonCollation, effectiveGroupCollation } from '../../planner/analysis/comparison-collation.js';
-import { makeGroupComparator, makeOperandComparator, formatOperandCollationNote } from '../../runtime/emit/operand-comparator.js';
+import { effectiveCollationOfTypes, effectiveGroupCollation } from '../../planner/analysis/comparison-collation.js';
+import type { ComparisonGroup } from '../../runtime/emit/operand-comparator.js';
+import { makeComparisonGroup, makeGroupComparator, makeOperandComparator, formatOperandCollationNote } from '../../runtime/emit/operand-comparator.js';
 
 /**
  * Find the common type among multiple logical types.
@@ -45,10 +46,17 @@ function findCommonType(types: ReadonlyArray<DeepReadonly<LogicalType>>): DeepRe
 	}
 
 	// For non-numeric types, return the first type (conservative)
-	// In a more sophisticated implementation, we could:
-	// - Find a common supertype
-	// - Return ANY_TYPE if types are incompatible
-	// - Throw an error for incompatible types
+	// NOTE: this fallback is DISHONEST for a value-returning function over a
+	// mixed-category group — `coalesce(int_col, text_col)` advertises INTEGER while
+	// it can return the text. Benign today because the write path converts or
+	// rejects rather than storing the wrong storage class (`insert into int_col
+	// select coalesce(null, text_col)` converts; a VALUES insert of unconvertible
+	// text raises `Type conversion failed`), and no reader trusts the declared type
+	// over the runtime value. `greatest`/`least` opted out via `extremumReturnType`
+	// because their fix made the divergence newly *visible*. If a consumer ever
+	// starts trusting a declared type without re-checking the value — a storage
+	// encoder keyed off it, say — every caller here (coalesce, iif, choose) needs
+	// the same ANY_TYPE treatment.
 	return firstType;
 }
 
@@ -148,12 +156,31 @@ export const coalesceFunc = createScalarFunction(
 // --- nullif(X, Y) ---
 
 /**
+ * The call site's comparison group, with its cross-type coercion resolved at emit
+ * time. `nullif`/`greatest`/`least` declare `returnsArg`, so `buildFunctionCall`
+ * deliberately leaves their arguments un-rewritten (a plan-time cast would replace
+ * the RETURNED value); the group converts *copies* for the comparison instead. A
+ * schema that names no group yields an identity group — raw values, raw types.
+ */
+function callComparisonGroup(plan: ScalarFunctionCallNode): ComparisonGroup {
+	return makeComparisonGroup(
+		plan.operands.map(op => op.getType()),
+		plan.functionSchema.comparesArgs ?? [],
+	);
+}
+
+/**
  * Emit `nullif(x, y)` deciding the match exactly as `x = y` would: the pair's
- * collation resolves through the shared provenance lattice and the comparator
- * routing (declared semantic-ordering type / storage class / runtime temporal
- * check) is the one `=`, BETWEEN and simple CASE share. Resolved ONCE at emit,
- * never per row. A same-rank explicit/declared collation conflict between the
- * two operands throws here, exactly as `x = y` throws for the same pair.
+ * cross-type coercion, collation (through the shared provenance lattice) and
+ * comparator routing (declared semantic-ordering type / storage class / runtime
+ * temporal check) are the ones `=`, BETWEEN and simple CASE share. All resolved
+ * ONCE at emit, never per row. A same-rank explicit/declared collation conflict
+ * between the two operands throws here, exactly as `x = y` throws for the same
+ * pair.
+ *
+ * The comparison runs over coerced KEYS while the returned value is the raw first
+ * argument — `nullif('abc', 1)` compares `0` against `1` (no match) and returns
+ * `'abc'`, not the `0` the conversion produced.
  *
  * NOTE: that throw happens at emit time, where `=` validates in
  * `BinaryOpNode.generateType` — the same deferral simple CASE has (see the
@@ -168,18 +195,18 @@ function emitNullif(
 	ctx: EmissionContext,
 	_defaultEmit: (plan: ScalarFunctionCallNode, ctx: EmissionContext) => Instruction,
 ): Instruction {
-	const [x, y] = plan.operands;
-	const collationName = effectiveComparisonCollation(x, y, plan.expression);
+	const group = callComparisonGroup(plan);
+	const collationName = effectiveCollationOfTypes(group.types[0], group.types[1], plan.expression);
 	const comparator = makeOperandComparator(
-		x.getType().logicalType,
-		y.getType().logicalType,
+		group.types[0].logicalType,
+		group.types[1].logicalType,
 		ctx.resolveCollation(collationName),
 	);
 
 	// Same shape as the unemitted default: every comparator route ranks NULL
 	// first (NULL/NULL → 0), so NULL handling is unchanged.
 	function run(_rctx: RuntimeContext, argX: SqlValue, argY: SqlValue): SqlValue {
-		return comparator(argX, argY) === 0 ? null : argX;
+		return comparator(group.key(0, argX), group.key(1, argY)) === 0 ? null : argX;
 	}
 
 	return {
@@ -195,7 +222,10 @@ export const nullifFunc = createScalarFunction(
 		numArgs: 2,
 		deterministic: true,
 		comparesArgs: [0, 1],
-		// Type inference: return the type of the first argument (nullable)
+		returnsArg: true,
+		// Type inference: return the type of the first argument (nullable). Honest
+		// because `returnsArg` keeps the plan-time cast off that argument — the value
+		// handed back really is the first argument as written.
 		inferReturnType: (argTypes) => ({
 			typeClass: 'scalar',
 			logicalType: argTypes[0],
@@ -203,8 +233,16 @@ export const nullifFunc = createScalarFunction(
 			isReadOnly: true
 		})
 	},
-	// BINARY default for any caller that reaches the implementation without
-	// emitting; the custom emitter binds the call site's collation + type routing.
+	// NOTE: BINARY and UNCOERCED — the plain fallback for any caller that reaches the
+	// implementation without emitting; the custom emitter binds the call site's
+	// cross-type coercion, collation and type routing. Unreachable today
+	// (`emitScalarFunctionCall` always prefers `customEmitter`), and it used to be
+	// coerced anyway because the plan-time cast rewrote the arguments before the
+	// implementation saw them. If a path ever DOES evaluate a comparison builtin
+	// without emitting — a folder that calls `implementation` directly, or a plugin
+	// that re-registers one of these names without the emitter — it will silently
+	// compare raw values; route it through the emitter instead of duplicating the
+	// coercion here. Same applies to `greatest`/`least` below.
 	(argX: SqlValue, argY: SqlValue): SqlValue => {
 		const comparison = compareSqlValues(argX, argY);
 		return comparison === 0 ? null : argX;
@@ -419,34 +457,43 @@ export const clampFunc = createScalarFunction(
 
 /**
  * Emit `greatest`/`least` ranking the whole argument group the way `order by`
- * would rank a column of the group's declared type and collation. ONE collation
- * resolves for the group through the lattice's N-ary merge
- * (`effectiveGroupCollation` — a same-rank explicit/declared conflict among the
- * arguments throws, matching `=`), and ONE comparator serves the fold, routed by
- * `makeGroupComparator` — the N-ary form of the same rule `=`, BETWEEN and
- * simple CASE route through, so a TIMESPAN column ranked against a bare text
- * literal still compares by elapsed time. `direction` is +1 for greatest, -1
- * for least — sharing the comparator keeps the two directions mirror images.
+ * would rank a column of the group's declared type and collation. The group's
+ * cross-type coercion, ONE collation (through the lattice's N-ary merge
+ * `effectiveGroupCollation` — a same-rank explicit/declared conflict among the
+ * arguments throws, matching `=`) and ONE comparator (`makeGroupComparator`, the
+ * N-ary form of the rule `=`, BETWEEN and simple CASE route through, so a TIMESPAN
+ * column ranked against a bare text literal still compares by elapsed time) all
+ * resolve once at emit. `direction` is +1 for greatest, -1 for least — sharing the
+ * comparator keeps the two directions mirror images.
  *
- * The fold is byte-for-byte the unemitted default's reduce with only the
- * comparator swapped, so NULL handling is unchanged. Ties under a non-BINARY
- * comparator leave which raw value survives unspecified (same latitude as the
- * min/max aggregate, DISTINCT, and GROUP BY).
+ * The fold ranks coerced KEYS but tracks the winning INDEX and returns the raw
+ * argument there, so `greatest(t, 1)` over the stored text `'3'` hands back `'3'`
+ * rather than the integer the conversion produced. The `best === null` test rides
+ * on the running key, exactly where it sat before this split (it used to read the
+ * cast operand, and `cast('' as integer)` is null from a non-null operand), so
+ * NULL handling is unchanged: `greatest` skips NULLs, `least`'s NULL wipes the
+ * running minimum. Ties under a non-BINARY comparator leave which argument
+ * survives unspecified (same latitude as the min/max aggregate, DISTINCT, and
+ * GROUP BY) — but it is always one of the arguments.
  */
 function emitExtremum(direction: 1 | -1): CustomEmitterHook {
 	return (plan, ctx, _defaultEmit) => {
-		const types = plan.operands.map(op => op.getType());
-		const collationName = effectiveGroupCollation(types, plan.expression);
-		const compare = makeGroupComparator(types.map(t => t.logicalType), ctx.resolveCollation(collationName));
+		const group = callComparisonGroup(plan);
+		const collationName = effectiveGroupCollation(group.types, plan.expression);
+		const compare = makeGroupComparator(group.types.map(t => t.logicalType), ctx.resolveCollation(collationName));
 
 		function run(_rctx: RuntimeContext, ...args: SqlValue[]): SqlValue {
 			if (args.length === 0) return null;
-			return args.reduce((best, current) => {
-				if (best === null || compare(current, best) * direction > 0) {
-					return current;
+			let bestIndex = 0;
+			let bestKey = group.key(0, args[0]);
+			for (let i = 1; i < args.length; i++) {
+				const currentKey = group.key(i, args[i]);
+				if (bestKey === null || compare(currentKey, bestKey) * direction > 0) {
+					bestIndex = i;
+					bestKey = currentKey;
 				}
-				return best;
-			}, args[0]);
+			}
+			return args[bestIndex];
 		}
 
 		return {
@@ -457,6 +504,23 @@ function emitExtremum(direction: 1 | -1): CustomEmitterHook {
 	};
 }
 
+/**
+ * Declared return type of `greatest`/`least`. The fold returns one of its
+ * arguments verbatim (`returnsArg`), so the declaration must cover every argument
+ * it could pick: only an all-same or an all-numeric group has a type that does.
+ * A mixed-category group (`greatest(int_col, '2')` can return the text `'2'`)
+ * declares ANY rather than {@link findCommonType}'s first-argument fallback, which
+ * would advertise INTEGER for a value that is text.
+ */
+function extremumReturnType(
+	argTypes: ReadonlyArray<DeepReadonly<LogicalType>>,
+): DeepReadonly<LogicalType> {
+	if (argTypes.length === 0) return ANY_TYPE;
+	const allSame = argTypes.every(t => t.name === argTypes[0].name);
+	const allNumeric = argTypes.every(t => t.isNumeric === true);
+	return allSame || allNumeric ? findCommonType(argTypes) : ANY_TYPE;
+}
+
 // Greatest-of function
 export const greatestFunc = createScalarFunction(
 	{
@@ -464,16 +528,16 @@ export const greatestFunc = createScalarFunction(
 		numArgs: -1,
 		deterministic: true,
 		comparesArgs: 'all',
-		// Type inference: find the common type among all arguments
+		returnsArg: true,
+		// Type inference: the common type when every argument shares one, else ANY
 		inferReturnType: (argTypes) => ({
 			typeClass: 'scalar',
-			logicalType: findCommonType(argTypes),
+			logicalType: extremumReturnType(argTypes),
 			nullable: true,
 			isReadOnly: true
 		})
 	},
-	// BINARY default for any caller that reaches the implementation without
-	// emitting; the custom emitter binds the group's collation + type routing.
+	// BINARY, uncoerced fallback — see the NOTE on `nullif`'s implementation above.
 	(...args: SqlValue[]): SqlValue => {
 		if (args.length === 0) return null;
 		return args.reduce((max, current) => {
@@ -494,16 +558,16 @@ export const leastFunc = createScalarFunction(
 		numArgs: -1,
 		deterministic: true,
 		comparesArgs: 'all',
-		// Type inference: find the common type among all arguments
+		returnsArg: true,
+		// Type inference: the common type when every argument shares one, else ANY
 		inferReturnType: (argTypes) => ({
 			typeClass: 'scalar',
-			logicalType: findCommonType(argTypes),
+			logicalType: extremumReturnType(argTypes),
 			nullable: true,
 			isReadOnly: true
 		})
 	},
-	// BINARY default for any caller that reaches the implementation without
-	// emitting; the custom emitter binds the group's collation + type routing.
+	// BINARY, uncoerced fallback — see the NOTE on `nullif`'s implementation above.
 	(...args: SqlValue[]): SqlValue => {
 		if (args.length === 0) return null;
 		return args.reduce((min, current) => {

@@ -9,6 +9,11 @@
 -- answered differently depending on how it was spelled. This file pins every
 -- form agreeing with each other over an INTEGER column, a REAL column and a
 -- TEXT column.
+--
+-- Section 6 pins the follow-on rule from
+-- bug-comparison-coercion-corrupts-returned-value: the three builtins that RETURN
+-- one of their arguments convert only a copy for the comparison, so the value
+-- handed back is the argument as written.
 
 create table nn (id integer primary key, i integer, r real);
 insert into nn values (1, 1, 2.5);
@@ -39,13 +44,12 @@ select case i when '1' then 'hit' else 'miss' end as v from nn;
 select nullif(i, '1') as v from nn;
 → [{"v":null}]
 
--- NOTE: the returned 2 is the INTEGER the coercion produced, not the original
--- text '2'. `greatest`/`least`/`nullif` return one of their arguments, and the
--- comparison coercion currently replaces that argument with its cast — tracked
--- by `bug-comparison-coercion-corrupts-returned-value`. When that lands this
--- expectation becomes the text '2'; the comparison itself is what this file pins.
+-- `greatest`/`least`/`nullif` compare CONVERTED copies but return the ORIGINAL
+-- argument, so the winner here is the text '2' the user wrote, not the INTEGER 2
+-- the conversion produced. Section 6 pins that rule on its own; here the point is
+-- that the comparison still ranks '2' above the integer 1.
 select greatest(i, '2') as v from nn;
-→ [{"v":2}]
+→ [{"v":"2"}]
 
 -- `least` is unaffected here (1 is already the smaller value either way) — kept
 -- as a control that the coercion did not change an already-correct answer.
@@ -171,3 +175,68 @@ select s in (1, 'abc') as v from nc_mix where id = 2;
 
 select (s = 1 or s = 'abc') as v from nc_mix where id = 2;
 → [{"v":true}]
+
+-- ===================================
+-- 6. Comparison answers unchanged, RETURNED values original
+--    (bug-comparison-coercion-corrupts-returned-value)
+--
+--    `nullif`, `greatest` and `least` each return one of their arguments. The
+--    coercion above used to REPLACE that argument with its cast, so the cast's
+--    output was what came back: `greatest(t, 1)` handed back the integer 3 for the
+--    stored text '3', and `least('abc', 1)` handed back 0 — a value that was never
+--    an argument at all (`cast('abc' as integer)` is 0). Those three now coerce
+--    comparison KEYS at emit time (`makeComparisonGroup`,
+--    runtime/emit/operand-comparator.ts) and return the raw argument.
+-- ===================================
+
+create table t3 (id integer primary key, s text);
+insert into t3 values (1, '3');
+-- run
+
+-- The returned value is the argument as written, storage class included.
+select nullif('3', 1) as v, typeof(nullif('3', 1)) as t;
+→ [{"v":"3","t":"text"}]
+
+select nullif(s, 1) as v, typeof(nullif(s, 1)) as ty from t3;
+→ [{"v":"3","ty":"text"}]
+
+-- A non-numeric text argument: the comparison converts it to 0 and so does not
+-- match 1, but 0 must never be the RESULT.
+select nullif('abc', 1) as v;
+→ [{"v":"abc"}]
+
+-- Regression guard against over-correcting: the comparison itself must still
+-- coerce, so a matching numeric text still nulls out (and '1.9' still truncates
+-- to 1 on the INTEGER side, exactly as `i = '1.9'` does in section 1).
+select nullif(i, '1') as a, nullif(i, '1.9') as b from nn;
+→ [{"a":null,"b":null}]
+
+-- Both orientations of the mixed pair. Argument order decides which side carries
+-- the conversion (probe cast vs value cast), so both must be covered; either way
+-- the result is one of the arguments, never 0.
+select least('abc', 1) as v, typeof(least('abc', 1)) as t;
+→ [{"v":"abc","t":"text"}]
+
+select least(1, 'abc') as v, typeof(least(1, 'abc')) as t;
+→ [{"v":"abc","t":"text"}]
+
+-- The comparison still picks the numerically larger/smaller argument across the
+-- category boundary — it is only the returned spelling that changed.
+select greatest(1, '2') as g, typeof(greatest(1, '2')) as gt;
+→ [{"g":"2","gt":"text"}]
+
+select least(1, '2') as l, typeof(least(1, '2')) as lt;
+→ [{"l":1,"lt":"integer"}]
+
+-- A TEXT column on the probe side, the shape from the bug report.
+select greatest(s, 1) as g, typeof(greatest(s, 1)) as gt from t3;
+→ [{"g":"3","gt":"text"}]
+
+-- Control: `coalesce` picks by nullness, not by comparison, so it declares no
+-- comparison group and was never affected — it already returned its argument.
+select coalesce(s, 1) as v, typeof(coalesce(s, 1)) as ty from t3;
+→ [{"v":"3","ty":"text"}]
+
+-- Control: a same-category group still returns the plain winner.
+select greatest(1, 2) as g, least(1, 2) as l;
+→ [{"g":2,"l":1}]

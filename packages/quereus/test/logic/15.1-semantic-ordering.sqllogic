@@ -415,9 +415,12 @@ select nullif(d, null) as a, nullif(null, d) as b from gnl;
 
 drop table gnl;
 
--- JSON: a textual operand coerces to the JSON side at plan-build time (the same
--- synthetic cast `=`, IN and simple CASE insert), so the comparison is
--- structural — whitespace and key order are insignificant.
+-- JSON: a textual operand is converted to the JSON side for the COMPARISON (the
+-- same conversion `=`, IN and simple CASE apply through their synthetic cast), so
+-- the comparison is structural — whitespace and key order are insignificant.
+-- `nullif`/`greatest`/`least` return one of their arguments, so they convert only
+-- a copy: the value handed back is the argument as written, never the parsed
+-- document the comparison was run over.
 create table jnl (id integer primary key, doc json, doc2 json);
 insert into jnl values (1, '{"a":1}', '{ "a" : 1 }');
 
@@ -428,27 +431,30 @@ select (doc = '{ "a" : 1 }') as r from jnl;
 select nullif(doc, doc2) as r from jnl;
 → [{"r":null}]
 
--- One side a text literal: the plan-time cast makes it structural too.
+-- One side a text literal: converting it for the comparison makes that structural
+-- too, so the whitespace-different spelling matches.
 select nullif(doc, '{ "a" : 1 }') as r from jnl;
 → [{"r":null}]
 
--- A structurally different document still comes through.
+-- A structurally different document still comes through — as the column's own
+-- parsed value, since the column is the returned argument here.
 select nullif(doc, '{"a":2}') as r from jnl;
 → [{"r":{"a":1}}]
 
--- Flipped orientation: the TEXT literal is the group's probe, so it carries the
--- synthetic cast. The comparison is still structural, but a non-match returns the
--- PARSED document rather than the original text spelling (and the call declares a
--- JSON return type) — the same probe-cast semantics IN and simple CASE have.
+-- Flipped orientation: the TEXT literal is the group's probe, so it is the side
+-- that converts. The comparison stays structural (whitespace-insensitive), and a
+-- non-match returns the literal AS WRITTEN — the text, not the parsed document.
 select nullif('{ "a" : 1 }', doc) as r from jnl;
 → [{"r":null}]
 
-select nullif('{ "a" : 2 }', doc) as r from jnl;
-→ [{"r":{"a":2}}]
+select nullif('{ "a" : 2 }', doc) as r, typeof(nullif('{ "a" : 2 }', doc)) as t from jnl;
+→ [{"r":"{ \"a\" : 2 }","t":"text"}]
 
--- greatest/least over a JSON group rank structurally, not by text spelling.
+-- greatest/least over a JSON group rank structurally, not by text spelling — and
+-- each returns its winning argument untouched: the text literal wins `greatest`
+-- and comes back as text, while the column wins `least` and comes back parsed.
 select greatest(doc, '{"a":2}') as g, least(doc, '{"a":2}') as l from jnl;
-→ [{"g":{"a":2},"l":{"a":1}}]
+→ [{"g":"{\"a\":2}","l":{"a":1}}]
 
 drop table jnl;
 

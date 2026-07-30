@@ -91,11 +91,13 @@ JSON documents, and the numeric reading of a numeric-looking string (`nullif(int
 '1')` matches, as `int_col = '1'` does) — rather than raw bytes. See
 [types.md](types.md#comparison-collation-resolution).
 
-That reconciliation currently rewrites the *argument*, not just the comparison, so
-the converted form is also what comes back: `nullif('3', 1)` returns the integer
-`3` rather than the text `'3'`, and `least('abc', 1)` returns `0` — a value that
-was never an argument. Tracked as
-`tickets/fix/bug-comparison-coercion-corrupts-returned-value`.
+The reconciliation applies to the *comparison* only. All three return one of their
+arguments verbatim, so a converted copy is what gets compared and the original
+argument is what comes back — `nullif('3', 1)` returns the text `'3'`,
+`greatest(int_col, '2')` returns the text `'2'` when the literal wins, and
+`least('abc', 1)` returns `'abc'` (the comparison reads `'abc'` as `0`, which loses
+to `1`, but `0` is never a result). Storage class survives too:
+`typeof(nullif('3', 1))` is `text`.
 
 A NULL argument to `least` wipes the running minimum, so the answer depends on
 argument order: `least(1, null, 3)` is `3`, not `1`. `greatest` skips NULLs

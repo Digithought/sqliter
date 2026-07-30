@@ -53,6 +53,10 @@ interface ScalarFuncOptions {
 	 *  variadic function that ranks every argument). See
 	 *  {@link import('../schema/function.js').BaseFunctionSchema.comparesArgs}. */
 	comparesArgs?: 'all' | readonly number[];
+	/** This function returns one of its arguments verbatim, so its comparison group
+	 *  coerces at emit time instead of being rewritten with plan-time casts. See
+	 *  {@link import('../schema/function.js').BaseFunctionSchema.returnsArg}. */
+	returnsArg?: boolean;
 }
 
 /**
@@ -170,6 +174,7 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 		rangeRewriteOnArg: options.rangeRewriteOnArg,
 		hidden: options.hidden,
 		comparesArgs: options.comparesArgs,
+		returnsArg: options.returnsArg,
 	};
 }
 

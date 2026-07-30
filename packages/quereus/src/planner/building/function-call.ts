@@ -108,10 +108,15 @@ export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, 
 		const args = expr.args.map(arg => buildExpression(ctx, arg, allowAggregates));
 
 		// Reconcile a declared comparison group's object-physical operands the way
-		// `=` / IN / simple CASE do, so e.g. `nullif(json_col, '<text>')` compares
+		// `=` / IN / simple CASE do, so e.g. `same_value(json_col, '<text>')` compares
 		// JSON against JSON. Must run BEFORE inferReturnType: coercion inserts
 		// CastNodes, which changes the argument types inference sees.
-		if (isScalarFunctionSchema(functionSchema) && functionSchema.comparesArgs) {
+		//
+		// Skipped for a function that returns one of its arguments (`returnsArg` —
+		// nullif/greatest/least): the cast would replace the RETURNED value too. Those
+		// coerce comparison keys at emit time (`makeComparisonGroup`) instead, which
+		// also lets inferReturnType see the arguments the user actually wrote.
+		if (isScalarFunctionSchema(functionSchema) && functionSchema.comparesArgs && !functionSchema.returnsArg) {
 			coerceComparisonGroup(ctx.scope, functionSchema.comparesArgs, args);
 		}
 

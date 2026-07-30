@@ -283,16 +283,31 @@ against a TIMESPAN column) order by storage class and never falsely compare equa
 
 The comparison builtins follow the rule through a schema declaration: `nullif`,
 `greatest` and `least` mark the argument positions they compare as one group
-(`BaseFunctionSchema.comparesArgs`), which drives the same plan-time
-object-physical coercion `=`/IN/simple CASE apply and an emit-time comparator
-bound through the shared collation lattice — so `nullif(d, 'PT120M')` matches
-exactly when `d = 'PT120M'` does, and `greatest`/`least` rank a TIMESPAN or
-collated-TEXT group the way ORDER BY would. A `greatest`/`least` group whose
-operands do not all declare one type (a TIMESPAN column against a bare text
-literal) routes through the same generic path a mixed `>` does, so the runtime
-duration check still applies. Which raw value `greatest`/`least` return for
-values a non-BINARY comparator ties ('PT1H' vs 'PT60M') is unspecified, the same
-latitude the min/max aggregate and DISTINCT take.
+(`BaseFunctionSchema.comparesArgs`), which drives the same object-physical
+coercion `=`/IN/simple CASE apply and an emit-time comparator bound through the
+shared collation lattice — so `nullif(d, 'PT120M')` matches exactly when
+`d = 'PT120M'` does, and `greatest`/`least` rank a TIMESPAN or collated-TEXT group
+the way ORDER BY would. A `greatest`/`least` group whose operands do not all
+declare one type (a TIMESPAN column against a bare text literal) routes through
+the same generic path a mixed `>` does, so the runtime duration check still
+applies. Which raw value `greatest`/`least` return for values a non-BINARY
+comparator ties ('PT1H' vs 'PT60M') is unspecified, the same latitude the min/max
+aggregate and DISTINCT take.
+
+All three of them *return* one of their arguments, so they also declare
+`BaseFunctionSchema.returnsArg` and their coercion runs at emit time rather than
+as a plan-time cast: `makeComparisonGroup` (`runtime/emit/operand-comparator.ts`)
+converts a per-row *copy* of each argument for the comparison and the emitter hands
+back the raw argument. Both paths make the identical conversion (a plan-time
+`CastNode` runs the same `lenientCast`), so only the returned value differs —
+`greatest(json_col, '{"a":2}')` compares structurally but returns the text literal
+as written when the literal wins. Rewriting the argument instead would make the
+cast's output the result, which is how `least('abc', 1)` used to return `0`, a
+value that was never an argument. A comparison builtin that returns a *fresh*
+value leaves `returnsArg` unset and keeps the plan-time rewrite. Because the
+arguments the planner sees are then the ones the user wrote, `greatest`/`least`
+declare `ANY` for a group that is neither all-one-type nor all-numeric, rather
+than advertising the first argument's type for a value that may not have it.
 
 `greatest`/`least` NULL handling is a separate, pre-existing wrinkle the
 comparison work deliberately left alone: `greatest` skips NULLs, but `least` is
@@ -740,7 +755,7 @@ When the planner encounters a comparison between operands of different type cate
 
 **Same-category comparisons** (both numeric, both textual, etc.) require no conversion and use a direct comparison path at runtime.
 
-**One probe against many values.** `IN` value lists, simple `CASE` and the scalar builtins that declare a comparison group (`nullif`, `greatest`, `least`) compare ONE probe expression against N value expressions. They share the `=` rule through `coerceComparisonSet` (`planner/building/coercion.ts`), so `i in ('1')` and `case i when '1'` answer exactly as `i = '1'` does. The probe is a single plan node, so it can only be cast ONCE, which is the one place these sites differ from a plain pairwise comparison:
+**One probe against many values.** `IN` value lists, simple `CASE` and the scalar builtins that declare a comparison group (`nullif`, `greatest`, `least`) compare ONE probe expression against N value expressions. They share the `=` rule through `comparisonGroupCoercions` (`types/comparison-coercion.ts`) — which `coerceComparisonSet` (`planner/building/coercion.ts`) turns into plan-time casts and `makeComparisonGroup` (`runtime/emit/operand-comparator.ts`) turns into emit-time comparison keys for the value-returning builtins — so `i in ('1')` and `case i when '1'` answer exactly as `i = '1'` does. The probe is a single operand, so it can only be converted ONCE, which is the one place these sites differ from a plain pairwise comparison:
 
 - A **value-side** cast is decided per value and never conflicts, so a mixed list (`case i when 'abc' when '1'` over an integer `i`) gets a per-clause decision.
 - A **probe-side** cast is hoisted, so it is applied only when unambiguous. For the JSON pairing it always is (the cast is lenient, so a non-JSON textual value survives as itself). For the numeric pairing it is not — `cast('abc' as real)` is `0` — so the probe casts only when every non-NULL value is numeric. A textual probe against a list mixing numeric and textual values (`text_col in (1, 'abc')`) is therefore left uncoerced and still differs from the `=` disjunction on the numeric member; closing that needs a per-value probe, which `IN` cannot express because its members share one key space.
@@ -1106,7 +1121,7 @@ what makes `abs(null)` return null instead of raising `Invalid argument types`.)
 The following built-in functions use type inference:
 
 - **Numeric functions**: `abs()`, `round()`, `nullif()`, `sqrt()`, `floor()`, `ceil()`, `ceiling()`, `clamp()`
-- **Common type resolution**: `coalesce()`, `iif()`, `greatest()`, `least()`, `choose()`
+- **Common type resolution**: `coalesce()`, `iif()`, `greatest()`, `least()`, `choose()` — `greatest()`/`least()` fall back to `ANY` for a group that is neither all-one-type nor all-numeric, since they return one of their arguments (see "Semantic ordering")
 - **String functions**: `length()`, `upper()`, `lower()`, `trim()`, `ltrim()`, `rtrim()`, `substr()`, `substring()`, `replace()`, `reverse()`, `lpad()`, `rpad()`, `instr()`
 - **Aggregate functions**: `MIN()`, `MAX()`
 - **Arithmetic operators**: `+`, `-`, `*`, `/`, `%` with numeric type promotion (INTEGER + INTEGER → INTEGER, INTEGER + REAL → REAL, etc.)
