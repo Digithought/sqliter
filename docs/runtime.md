@@ -1303,14 +1303,19 @@ scalar subquery). Two consequences worth pinning:
   and the `subquerySource` branch of `buildFrom` parent their `RegisteredScope` on
   `EmptyScope.instance`, so a source answers "no" for any name it does not own. The
   fallback to the enclosing query is composed *once* by the consumer — `buildSelectStmt`'s
-  `ShadowScope([...sourceScopes, outerScope])`, and `buildJoin`'s LATERAL
-  `ShadowScope([leftOutputScope, outerScope])` — never by chaining each source scope to
-  its parent. Chaining breaks `MultiScope`: its first-match walk asks peer #1, which
+  `ShadowScope([...sourceScopes, outerScope])`, `buildJoin`'s ON-condition
+  `ShadowScope([MultiScope([leftScope, rightScope]), outerScope])`, and `buildJoin`'s
+  LATERAL `ShadowScope([leftOutputScope, outerScope])` — never by chaining each source
+  scope to its parent. Every consumer owes that fallback: without it an ON condition
+  cannot name a correlated outer column or a bind parameter at all. Chaining, on the
+  other hand, breaks `MultiScope`: its first-match walk asks peer #1, which
   forwards the miss to the outer scope and answers from there, so peer #2 is never
   consulted and a join's own right-hand source loses to a same-named enclosing symbol
   (silently wrong rows when an inner alias shadows an outer one; a runtime "No row
   context found for column …" when the enclosing symbol is bound to attribute ids nothing
-  below publishes).
+  below publishes). The same rule applies to what `buildFrom`/`buildJoin` publish into
+  `ctx.outputScopes`: that entry is the node's *own* columns only, because its consumer
+  may be another join that has to consult its sibling peer first.
 - **Context lifecycle.** Manage row context only through the helpers in
   `src/runtime/context-helpers.ts` — `createRowSlot` for streaming, `withRowContext` /
   `withAsyncRowContext` for one-off evaluation (see

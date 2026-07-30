@@ -122,6 +122,45 @@ with c as (select cat, qty, rid from o)
 select c.cat from r;
 -- error: c.cat
 
+-- =============================================================================
+-- The shapes that ONLY the deleted registration could plausibly have served: a
+-- `cteName.column` reference from somewhere other than the CTE's own SELECT list.
+-- Each one names the CTE in a FROM, so it resolves through the reference's own
+-- republished attribute ids — the ids that actually reach the runtime.
+-- =============================================================================
+
+-- CTE column read from a nested subquery, with the CTE in the OUTER from.
+
+with c as (select rid, cat from o)
+select c.rid, (select count(*) from r where r.id = c.rid) as n from c order by c.rid, c.cat;
+→ [{"rid":1,"n":1},{"rid":2,"n":1},{"rid":2,"n":1},{"rid":9,"n":0}]
+
+-- CTE in an UPDATE's WHERE subquery.
+
+with c as (select rid from o where cat = 'x')
+update r set label = 'hit' where id in (select c.rid from c);
+select id, label from r order by id;
+→ [{"id":1,"label":"hit"},{"id":2,"label":"b"},{"id":3,"label":"c"}]
+
+-- CTE in an UPDATE's SET subquery, correlated to the update target.
+
+with c as (select rid, cat from o where cat <> 'z')
+update r set label = coalesce((select c.cat from c where c.rid = r.id), label);
+select id, label from r order by id;
+→ [{"id":1,"label":"x"},{"id":2,"label":"y"},{"id":3,"label":"c"}]
+
+-- CTE in a DELETE's WHERE subquery, with RETURNING.
+
+with c as (select rid from o where cat = 'y')
+delete from r where id in (select c.rid from c) returning id, label;
+→ [{"id":2,"label":"y"}]
+
+-- CTE read from an UPDATE's RETURNING clause.
+
+with c as (select rid from o)
+update r set qty = qty + 1 returning id, (select count(*) from c) as total;
+→ [{"id":1,"total":4},{"id":3,"total":4}]
+
 drop table s;
 drop table o;
 drop table r;

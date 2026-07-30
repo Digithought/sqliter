@@ -29,20 +29,16 @@ export function buildWithContext(
 } {
 	// Start with parent CTEs - either from parameter or from context
 	const cteNodes: Map<string, CTEScopeNode> = new Map(parentCTEs.size > 0 ? parentCTEs : (ctx.cteNodes ?? new Map()));
-	let contextWithCTEs = ctx;
 
 	if (stmt.withClause) {
-		const newCteNodes = buildWithClause(ctx, stmt.withClause);
 		// Merge parent CTEs with new ones (new ones take precedence)
-		for (const [name, node] of newCteNodes) {
+		for (const [name, node] of buildWithClause(ctx, stmt.withClause)) {
 			cteNodes.set(name, node);
 		}
-
-		contextWithCTEs = { ...ctx, cteNodes, cteReferenceCache: ctx.cteReferenceCache };
-	} else if (cteNodes.size > 0) {
-		// No WITH clause but we have parent CTEs — thread them through unchanged.
-		contextWithCTEs = { ...ctx, cteNodes, cteReferenceCache: ctx.cteReferenceCache };
 	}
+
+	// The only contribution is the definition map; scope is left untouched.
+	const contextWithCTEs = cteNodes.size > 0 ? { ...ctx, cteNodes } : ctx;
 
 	return { contextWithCTEs, cteNodes };
 }

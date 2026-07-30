@@ -98,6 +98,11 @@ export function buildSelectStmt(
 	}
 
 	// Phase 2: Create the main scope for this SELECT statement
+	// NOTE: the `|| ft.scope` fallback only fires for the FROM-less SingleRowNode, which
+	// buildFrom never registers. Every scope buildFrom does register is own-only (see
+	// registerColumnScope); a node's own `.scope` is the enclosing chain, so if this
+	// fallback ever starts firing for a real source it silently reinstates the chaining
+	// this ShadowScope exists to replace.
 	const columnScopes = fromTables.map(ft => ctx.outputScopes.get(ft) || ft.scope).filter(Boolean);
 	const selectScope = new ShadowScope([...columnScopes, contextWithCTEs.scope]);
 	let selectContext: PlanningContext = { ...contextWithCTEs, scope: selectScope };
@@ -340,11 +345,11 @@ export function buildValuesStmt(
  *
  * The scope is deliberately parented on {@link EmptyScope} — a FROM source's scope
  * holds ONLY its own columns and answers "no" for anything else. The fallback to the
- * enclosing query is composed exactly once by the consumer (`buildSelectStmt`'s
- * `ShadowScope`, `buildJoin`'s LATERAL `ShadowScope`). Chaining each source scope to
- * the caller's scope instead would make `MultiScope`'s first-match reach the outer
- * scope through peer #1 before peer #2 is ever consulted, so a join's own right-hand
- * source loses name lookup to a same-named enclosing symbol.
+ * enclosing query is composed exactly once by each consumer (`buildSelectStmt`'s
+ * `ShadowScope`, `buildJoin`'s ON-condition and LATERAL `ShadowScope`s). Chaining each
+ * source scope to the caller's scope instead would make `MultiScope`'s first-match reach
+ * the outer scope through peer #1 before peer #2 is ever consulted, so a join's own
+ * right-hand source loses name lookup to a same-named enclosing symbol.
  */
 function registerColumnScope(
 	node: RelationalPlanNode,
@@ -679,10 +684,13 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 	// Create a combined scope for the join that includes both left and right columns
 	const combinedScope = new MultiScope([leftScope, rightScope]);
 
-	// Create a new planning context with the combined scope for condition evaluation
+	// Context for building the ON condition: the join's own two peers first, then the
+	// enclosing query. Both peers are own-only scopes (see registerColumnScope), so
+	// neither can answer for the other, and everything they do not own — a correlated
+	// outer column, a bind parameter — must still resolve, one level later.
 	const joinContext: PlanningContext = {
 		...parentContext,
-		scope: combinedScope
+		scope: new ShadowScope([combinedScope, parentContext.scope])
 	};
 
 	let condition: ScalarPlanNode | undefined;
