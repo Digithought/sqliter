@@ -593,6 +593,8 @@ group by expression [, expression...]
 - Each expression in the group by must be a column name, an expression, or a positive integer representing a position in the select list.
 - Aggregate functions (`count()`, `sum()`, etc.) can be used with group by to calculate summary statistics for each group.
 - Columns in the select list that are not aggregated must appear in the group by clause.
+- A group by with no aggregate function anywhere is legal and yields one row per distinct group.
+- Output column order follows the select list, not the group by list. `select *` over a grouped query therefore emits the source columns in table order even when `group by` names them in another order.
 
 **Examples:**
 ```sql

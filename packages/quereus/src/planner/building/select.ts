@@ -141,14 +141,17 @@ export function buildSelectStmt(
 	// is taken when those promote a non-aggregate query into an aggregate one.
 	let hasAggregates = hasAggregatesInSelect;
 
-	// Handle SELECT * separately
-	const starProjections: Projection[] = [];
+	// Handle SELECT * separately. Keyed by the AST column so the aggregate path can
+	// expand each star back to *its own* columns — a select list may hold more than
+	// one star (`select a.*, b.* from a join b`).
+	const starProjectionsByColumn = new Map<AST.ResultColumn, Projection[]>();
 	for (const column of stmt.columns) {
 		if (column.type === 'all') {
-			starProjections.push(...buildStarProjections(column, input, selectScope));
+			const expanded = buildStarProjections(column, input, selectScope);
+			starProjectionsByColumn.set(column, expanded);
+			projections.push(...expanded);
 		}
 	}
-	projections.push(...starProjections);
 
 	// Add non-star projections
 	projections.push(...columnProjections);
@@ -202,7 +205,7 @@ export function buildSelectStmt(
 				aggregateResult.aggregateNode,
 				aggregates,
 				aggregateResult.groupByExpressions,
-				starProjections
+				starProjectionsByColumn
 			);
 			// When HAVING-only or ORDER-BY-only aggregates were added, don't preserve
 			// input columns so they are stripped from the output (they exist only for

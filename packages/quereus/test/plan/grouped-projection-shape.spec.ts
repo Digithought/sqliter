@@ -23,6 +23,12 @@ describe('Plan shape: grouped-query final projection', () => {
 		db = new Database();
 		await db.exec("CREATE TABLE gk (v INTEGER PRIMARY KEY, g TEXT) USING memory");
 		await db.exec("INSERT INTO gk VALUES (1,'a'),(2,'b'),(3,'a')");
+		await db.exec("CREATE TABLE t2 (k INTEGER PRIMARY KEY, w TEXT) USING memory");
+		await db.exec("INSERT INTO t2 VALUES (1,'p'),(2,'q'),(3,'r')");
+		// No primary key, so the functional-dependency GROUP BY reduction cannot fire
+		// and rewrite the grouping keys out from under the column-order assertions.
+		await db.exec("CREATE TABLE nk (a TEXT, b TEXT) USING memory");
+		await db.exec("INSERT INTO nk VALUES ('x','1'),('y','2'),('x','3')");
 	});
 
 	afterEach(async () => {
@@ -118,6 +124,24 @@ describe('Plan shape: grouped-query final projection', () => {
 
 		it('a grouped SELECT-list alias survives to the output name', async () => {
 			expect(await columnNames("SELECT cast(v AS text) AS x FROM gk GROUP BY v ORDER BY v")).to.deep.equal(['x']);
+		});
+
+		// `gk` has a PK among its grouping keys, so the FD-driven GROUP BY reduction
+		// can rewrite `GROUP BY g, v` to `GROUP BY v` and hand back source order by
+		// accident. `nk` has no PK, so the aggregate really does output GROUP BY
+		// order and only the final projection can restore source order.
+		it('SELECT * restores source-column order when GROUP BY reverses it', async () => {
+			expect(await columnNames("SELECT * FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b']);
+			expect(await columnNames("SELECT nk.* FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b']);
+			expect(await columnNames("SELECT b, a FROM nk GROUP BY b, a")).to.deep.equal(['b', 'a']);
+		});
+
+		// Regression: the star expansion used to replay *every* expanded star column
+		// for *each* star in the SELECT list, so N stars emitted N x the columns.
+		it('expands each star in the SELECT list exactly once', async () => {
+			expect(await columnNames("SELECT gk.*, t2.* FROM gk JOIN t2 ON gk.v = t2.k GROUP BY gk.v, gk.g, t2.k, t2.w"))
+				.to.deep.equal(['v', 'g', 'k', 'w']);
+			expect(await columnNames("SELECT *, * FROM nk GROUP BY a, b")).to.deep.equal(['a', 'b', 'a:1', 'b:1']);
 		});
 	});
 });

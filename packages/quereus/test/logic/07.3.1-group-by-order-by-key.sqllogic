@@ -102,6 +102,16 @@ select * from gk group by g, v order by v;
 select gk.* from gk group by v, g order by v;
 → [{"v":1,"g":"a"},{"v":2,"g":"b"},{"v":3,"g":"a"}]
 
+-- Two stars in one grouped SELECT list. Each expands once: replaying every
+-- expanded star column for each star emitted the whole set N times over.
+create table gj (k integer primary key, w text);
+insert into gj values (1,'p'),(2,'q'),(3,'r');
+
+select gk.*, gj.* from gk join gj on gk.v = gj.k group by gk.v, gk.g, gj.k, gj.w order by v;
+→ [{"v":1,"g":"a","k":1,"w":"p"},{"v":2,"g":"b","k":2,"w":"q"},{"v":3,"g":"a","k":3,"w":"r"}]
+
+drop table gj;
+
 -- ---------------------------------------------------------------------------
 -- The grouped, aggregate-free select must compose everywhere a relation can go.
 -- ---------------------------------------------------------------------------

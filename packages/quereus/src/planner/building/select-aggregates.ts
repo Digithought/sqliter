@@ -680,7 +680,7 @@ export function buildFinalAggregateProjections(
 	aggregateNode: RelationalPlanNode,
 	aggregates: { expression: ScalarPlanNode; alias: string }[],
 	groupByExpressions: ScalarPlanNode[],
-	starProjections: readonly Projection[] = []
+	starProjectionsByColumn: ReadonlyMap<AST.ResultColumn, readonly Projection[]> = new Map()
 ): Projection[] {
 	const finalProjections: Projection[] = [];
 	const aggregateAttributes = aggregateNode.getAttributes();
@@ -727,11 +727,17 @@ export function buildFinalAggregateProjections(
 
 	for (const column of stmt.columns) {
 		if (column.type === 'all') {
-			for (const starProj of starProjections) {
-				if (!CapabilityDetectors.isColumnReference(starProj.node)) continue;
+			for (const starProj of starProjectionsByColumn.get(column) ?? []) {
+				const gbIdx = starGroupKeyIndex(starProj, groupKeyByAttrId);
+				if (gbIdx === undefined) {
+					// validateAggregateProjections already rejected every star column that
+					// is not a grouping key, so reaching here means the two disagree.
+					throw new QuereusError(
+						`Internal: SELECT * column '${starProj.alias ?? '?'}' is not a GROUP BY key`,
+						StatusCode.INTERNAL
+					);
+				}
 				const starRef = starProj.node as ColumnReferenceNode;
-				const gbIdx = groupKeyByAttrId.get(starRef.attributeId);
-				if (gbIdx === undefined) continue;
 				const colRef = buildGroupKeyColumnRef(aggregateOutputScope, aggregateAttributes[gbIdx], starRef.expression, gbIdx);
 				finalProjections.push({
 					node: colRef,
@@ -780,6 +786,15 @@ export function buildFinalAggregateProjections(
 	}
 
 	return finalProjections;
+}
+
+/**
+ * Resolves one expanded `SELECT *` column to the GROUP BY index it was grouped on,
+ * or `undefined` if it is not a bare reference to a grouping key.
+ */
+function starGroupKeyIndex(starProj: Projection, groupKeyByAttrId: ReadonlyMap<number, number>): number | undefined {
+	if (!CapabilityDetectors.isColumnReference(starProj.node)) return undefined;
+	return groupKeyByAttrId.get((starProj.node as ColumnReferenceNode).attributeId);
 }
 
 /**
