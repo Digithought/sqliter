@@ -156,7 +156,11 @@ export function buildAggregatePhase(
 	// Determine if final projection is needed.
 	// Force a final projection when HAVING-only or ORDER-BY-only aggregates were
 	// added, to strip them from the output (they exist only for those clauses).
-	const needsFinalProjection = hasHavingOnlyAggregates || hasOrderByOnlyAggregates || hasWrappedAggregates || checkNeedsFinalProjection(projections);
+	const needsFinalProjection = hasHavingOnlyAggregates || hasOrderByOnlyAggregates || hasWrappedAggregates || checkNeedsFinalProjection(projections)
+		// A GROUP BY with no aggregate functions has no other projection step: the
+		// select list must be projected over the AggregateNode output here, or the
+		// output would be the raw group keys in GROUP BY order.
+		|| Boolean(hasGroupBy && !hasAggregates && projections.length > 0);
 
 	return {
 		output: currentInput,
@@ -666,7 +670,8 @@ export function buildFinalAggregateProjections(
 	aggregateOutputScope: RegisteredScope,
 	aggregateNode: RelationalPlanNode,
 	aggregates: { expression: ScalarPlanNode; alias: string }[],
-	groupByExpressions: ScalarPlanNode[]
+	groupByExpressions: ScalarPlanNode[],
+	starProjections: readonly Projection[] = []
 ): Projection[] {
 	const finalProjections: Projection[] = [];
 	const aggregateAttributes = aggregateNode.getAttributes();
@@ -700,7 +705,33 @@ export function buildFinalAggregateProjections(
 		if (!groupByFingerprints.has(fp)) groupByFingerprints.set(fp, index);
 	});
 
+	// Bare source columns that are themselves group keys map straight to the
+	// aggregate's group output column. Used to expand `SELECT *` in a grouped
+	// query, which must emit source-column order rather than GROUP BY order.
+	const groupKeyByAttrId = new Map<number, number>();
+	groupByExpressions.forEach((expr, index) => {
+		if (CapabilityDetectors.isColumnReference(expr)) {
+			const attrId = (expr as ColumnReferenceNode).attributeId;
+			if (!groupKeyByAttrId.has(attrId)) groupKeyByAttrId.set(attrId, index);
+		}
+	});
+
 	for (const column of stmt.columns) {
+		if (column.type === 'all') {
+			for (const starProj of starProjections) {
+				if (!CapabilityDetectors.isColumnReference(starProj.node)) continue;
+				const starRef = starProj.node as ColumnReferenceNode;
+				const gbIdx = groupKeyByAttrId.get(starRef.attributeId);
+				if (gbIdx === undefined) continue;
+				const colRef = buildGroupKeyColumnRef(aggregateOutputScope, aggregateAttributes[gbIdx], starRef.expression, gbIdx);
+				finalProjections.push({
+					node: colRef,
+					alias: starProj.alias,
+					attributeId: colRef.attributeId
+				});
+			}
+			continue;
+		}
 		if (column.type === 'column') {
 			// Bare columns (`type === 'column'`) already resolve against the aggregate
 			// group symbol (registered under the column name) in recompute, so their

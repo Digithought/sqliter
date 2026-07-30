@@ -142,12 +142,13 @@ export function buildSelectStmt(
 	let hasAggregates = hasAggregatesInSelect;
 
 	// Handle SELECT * separately
+	const starProjections: Projection[] = [];
 	for (const column of stmt.columns) {
 		if (column.type === 'all') {
-			const starProjections = buildStarProjections(column, input, selectScope);
-			projections.push(...starProjections);
+			starProjections.push(...buildStarProjections(column, input, selectScope));
 		}
 	}
+	projections.push(...starProjections);
 
 	// Add non-star projections
 	projections.push(...columnProjections);
@@ -200,7 +201,8 @@ export function buildSelectStmt(
 				aggregateResult.aggregateScope,
 				aggregateResult.aggregateNode,
 				aggregates,
-				aggregateResult.groupByExpressions
+				aggregateResult.groupByExpressions,
+				starProjections
 			);
 			// When HAVING-only or ORDER-BY-only aggregates were added, don't preserve
 			// input columns so they are stripped from the output (they exist only for
@@ -274,8 +276,14 @@ export function buildSelectStmt(
 		}
 	}
 
-	// Handle final projections for non-aggregate, non-window cases
-	if (!hasAggregates && !hasWindowFunctions) {
+	// Handle final projections for non-aggregate, non-window cases.
+	// A GROUP BY with no aggregate functions anywhere still went through the
+	// aggregate phase (which built its own final projection against the
+	// AggregateNode output); re-running buildFinalProjections here would emit a
+	// second projection whose column references still point at *pre-aggregate*
+	// attributes, which the AggregateNode does not output.
+	const hasGrouping = Boolean(aggregateResult.aggregateScope);
+	if (!hasGrouping && !hasWindowFunctions) {
 		const finalResult = buildFinalProjections(input, projections, selectScope, stmt, selectContext, preserveInputColumns, selectListAsts);
 		input = finalResult.output;
 		selectContext = finalResult.finalContext;
