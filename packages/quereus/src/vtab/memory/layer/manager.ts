@@ -2364,6 +2364,11 @@ export class MemoryTableManager {
 		try {
 			await this.ensureSchemaChangeSafety();
 
+			// NOTE: no early return for a definition equal to the current one (unlike
+			// `alterColumn`'s already-in-the-requested-state exit) — the statement is rare and
+			// its only producer, the declarative differ, emits it solely on a genuine change.
+			// If a caller ever re-issues an unchanged key, add the comparison here: the work
+			// below is a full O(rows × layers) rebuild.
 			const newSchema = this.buildRekeyedPrimaryKeySchema(newPkColumns);
 
 			// Pre-validate before any mutation: the effective rows decide whether the change
@@ -3554,9 +3559,12 @@ export class MemoryTableManager {
 		for await (const row of rows) {
 			const key = seen(row);
 			if (key === undefined) continue;
-			const keyDesc = keyParts(key, keyIsTuple).map(formatKeyValue).join(', ');
+			// An empty new key (`alter primary key ()`, the singleton table) has no components
+			// to name: every row IS the one key, so say that rather than render "(key: )".
+			const parts = keyParts(key, keyIsTuple).map(formatKeyValue);
+			const keyDesc = parts.length > 0 ? `(key: ${parts.join(', ')})` : '(the empty key admits one row)';
 			throw new QuereusError(
-				`UNIQUE constraint failed: ${this._tableName} primary key collides under the new key definition (key: ${keyDesc})`,
+				`UNIQUE constraint failed: ${this._tableName} primary key collides under the new key definition ${keyDesc}`,
 				StatusCode.CONSTRAINT,
 			);
 		}

@@ -14,10 +14,10 @@ difficulty: medium
 
 `alter table … alter primary key` first asks the table's backend to re-key itself. A backend
 that cannot do that raises `UNSUPPORTED`, and the engine falls back to rebuilding the table.
-There are two rebuilds. One is a fast path used only for the built-in in-memory backend
-(that path's own data-loss defect is
-`implement/bug-alter-primary-key-mid-transaction-loses-memory-rows`). The other —
-`rebuildViaShadowTable` — is the generic one, and works by running ordinary SQL:
+There used to be two rebuilds; the fast path for the built-in in-memory backend has since been
+deleted (the in-memory backend now re-keys itself in place — ticket
+`bug-alter-primary-key-mid-transaction-loses-memory-rows`), leaving one:
+`rebuildViaShadowTable`, the generic one, which works by running ordinary SQL:
 
 ```
 create table <shadow> (… new primary key …)

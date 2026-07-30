@@ -344,9 +344,13 @@ export class MemoryTable extends VirtualTable {
 	/** Handles schema changes via the manager */
 	async alterSchema(changeInfo: SchemaChangeInfo, validateOnly = false): Promise<void> {
 		// Validate-only dry run (see VirtualTable.alterSchema): supported for exactly the
-		// change types whose manager arms implement it — the isolation layer pre-flights a
-		// re-keying change against a per-connection overlay before the shared underlying
-		// mutates irreversibly. Refuse the rest rather than silently validating nothing.
+		// change types whose manager arms implement it. `alterColumn` has the live caller —
+		// the isolation layer pre-flights a `set collate` PK re-key against a per-connection
+		// overlay before the shared underlying mutates irreversibly; `alterPrimaryKey` is
+		// offered because `MemoryTableManager.alterPrimaryKey` honors the same dry-run
+		// contract, though no wrapper drives it today (the isolation layer never forwards
+		// `alter primary key` to an overlay). Refuse the rest rather than silently
+		// validating nothing.
 		if (validateOnly && changeInfo.type !== 'alterColumn' && changeInfo.type !== 'alterPrimaryKey') {
 			throw new QuereusError(
 				`MemoryTable.alterSchema: validate-only is supported for 'alterColumn' and 'alterPrimaryKey' changes, not '${changeInfo.type}'`,

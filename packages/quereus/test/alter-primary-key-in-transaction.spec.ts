@@ -25,11 +25,21 @@ import {
 	type DatabaseDataChangeEvent,
 	type VTableDataChangeEvent,
 } from '../src/index.js';
+import type { MemoryTableManager } from '../src/vtab/memory/layer/manager.js';
 
 async function allRows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
 	const rows: Record<string, unknown>[] = [];
 	for await (const row of db.eval(sql)) rows.push(row);
 	return rows;
+}
+
+/** The memory manager backing `main.<tableName>`, for driving a sibling connection directly. */
+function getManager(db: Database, tableName: string): MemoryTableManager {
+	const mod = db._getVtabModule('memory')?.module as MemoryTableModule | undefined;
+	if (!mod) throw new Error('memory module not registered');
+	const manager = mod.tables.get(`main.${tableName}`.toLowerCase());
+	if (!manager) throw new Error(`no memory manager for table '${tableName}'`);
+	return manager;
 }
 
 describe('ALTER PRIMARY KEY mid-transaction keeps the transaction\'s writes (memory module)', () => {
@@ -185,6 +195,97 @@ describe('ALTER PRIMARY KEY mid-transaction keeps the transaction\'s writes (mem
 			await db.exec('commit');
 
 			assert.deepEqual(await allRows(db, 'select * from t'), [{ a: 5, b: 7, v: 'pre' }]);
+		});
+
+		it('a collision only a ROLLBACK could restore is refused with a retryable BUSY', async () => {
+			// (1, 5) collides with the committed (5, 5) under key (b) — but only in the base,
+			// which must keep both rows for a rollback. The effective view is collision-free,
+			// so this is a representability refusal, not an invalid-data one.
+			await db.exec("insert into t values (1, 5, 'other')");
+			await db.exec('begin');
+			await db.exec('delete from t where a = 1');
+			await assert.rejects(
+				db.exec('alter table t alter primary key (b)'),
+				/re-key the primary key.*Commit\/rollback and retry/is,
+			);
+
+			// The rejection mutated nothing: the delete still stands, the key is still (a).
+			assert.deepEqual(await allRows(db, 'select * from t'), [{ a: 5, b: 5, v: 'pre' }]);
+			await db.exec('rollback');
+			assert.deepEqual(await allRows(db, 'select * from t order by a'), [
+				{ a: 1, b: 5, v: 'other' },
+				{ a: 5, b: 5, v: 'pre' },
+			]);
+		});
+
+		it('ROLLBACK TO SAVEPOINT after the re-key restores the pre-savepoint rows under the new key', async () => {
+			// The savepoint snapshot is a layer of its own: if the re-key skipped it, its rows
+			// would still be keyed by (a) and the commit would silently drop them.
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'keep')");
+			await db.exec('savepoint s1');
+			await db.exec("insert into t values (2, 8, 'discard')");
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('rollback to s1');
+			await db.exec('commit');
+
+			assert.deepEqual(await allRows(db, 'select * from t order by a'), [
+				{ a: 1, b: 9, v: 'keep' },
+				{ a: 5, b: 5, v: 'pre' },
+			]);
+		});
+
+		it('re-keying to the EMPTY (singleton) key rejects while the transaction holds a second row', async () => {
+			// Arity 0 makes every row the same key, so the pre-pass must reject any pair —
+			// including one whose second row exists only in the open transaction.
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'x')");
+			await assert.rejects(db.exec('alter table t alter primary key ()'), /UNIQUE|collides/i);
+
+			// Both rows still commit under the untouched key.
+			await db.exec('commit');
+			assert.deepEqual(await allRows(db, 'select * from t order by a'), [
+				{ a: 1, b: 9, v: 'x' },
+				{ a: 5, b: 5, v: 'pre' },
+			]);
+		});
+
+		it('the new key carries each member column\'s declared collation', async () => {
+			// Dropping the collation would re-key a NOCASE column's structures under BINARY:
+			// the pre-pass would miss the 'A'/'a' collision, and the tree would then accept a
+			// duplicate the column's own comparator forbids.
+			await db.exec('create table k (a integer not null, s text not null collate nocase, primary key (a))');
+			await db.exec("insert into k values (1, 'A'), (2, 'a')");
+			await assert.rejects(db.exec('alter table k alter primary key (s)'), /UNIQUE|collides/i);
+
+			await db.exec('delete from k where a = 2');
+			await db.exec('alter table k alter primary key (s)');
+			await assert.rejects(db.exec("insert into k values (2, 'a')"), /UNIQUE|constraint/i);
+			assert.deepEqual(await allRows(db, 'select * from k'), [{ a: 1, s: 'A' }]);
+		});
+
+		it('a SIBLING connection\'s commit before the re-key still commits our re-keyed writes', async () => {
+			// The head moves under our open transaction, so our layer's own-write log is
+			// replayed onto the new head at commit (MemoryTableManager.commitTransaction's
+			// rebase). The log was rewritten to new-arity keys by the re-key, so the replay
+			// must still land every row.
+			const manager = getManager(db, 't');
+			await db.exec('begin');
+			await db.exec("insert into t values (1, 9, 'ours')");
+
+			const sibling = manager.connect();
+			sibling.begin();
+			await manager.performMutation(sibling, 'insert', [2, 8, 'theirs']);
+			await sibling.commit();
+
+			await db.exec('alter table t alter primary key (a, b)');
+			await db.exec('commit');
+
+			assert.deepEqual(await allRows(db, 'select * from t order by a'), [
+				{ a: 1, b: 9, v: 'ours' },
+				{ a: 2, b: 8, v: 'theirs' },
+				{ a: 5, b: 5, v: 'pre' },
+			]);
 		});
 
 		it('a secondary index keeps answering across the mid-transaction re-key', async () => {

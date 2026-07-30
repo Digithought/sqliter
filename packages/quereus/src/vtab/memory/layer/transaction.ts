@@ -341,17 +341,10 @@ export class TransactionLayer implements Layer {
 		this.tableSchemaAtCreation = newSchema;
 		this.pkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
 
-		// Net per-key effect of this layer's own writes, read out of the pre-rekey tree
-		// (`get` traverses the inheritance chain, so it yields the layer's EFFECTIVE row).
+		// Net per-key effect of this layer's own writes, read out of the pre-rekey tree.
 		const deletions: BTreeKeyForPrimary[] = [];
 		const upserts: Row[] = [];
-		const seen = new Set<string>();
-		for (const write of this.ownWrites) {
-			const encoded = preRekeyEncode(write.primaryKey);
-			if (seen.has(encoded)) continue;
-			seen.add(encoded);
-
-			const effectiveRow = preRekeyTree.get(write.primaryKey);
+		for (const { write, effectiveRow } of this.netOwnWriteEffects(preRekeyTree, preRekeyEncode)) {
 			if (effectiveRow === undefined) deletions.push(write.primaryKey);
 			else upserts.push(effectiveRow);
 		}
@@ -391,17 +384,9 @@ export class TransactionLayer implements Layer {
 		const oldFunctions = this.pkFunctions;
 		const parentTree = this.parentLayer.getModificationTree('primary');
 
-		const seen = new Set<string>();
 		const deletions: Array<{ newKey: BTreeKeyForPrimary; oldKey: BTreeKeyForPrimary }> = [];
 		const upserts: Row[] = [];
-		for (const write of this.ownWrites) {
-			const encoded = oldFunctions.encode(write.primaryKey);
-			if (seen.has(encoded)) continue;
-			seen.add(encoded);
-
-			// `get` traverses the inheritance chain, so this is the layer's EFFECTIVE row:
-			// undefined when the layer deleted the key, the layer's own row otherwise.
-			const effectiveRow = this.primaryModifications.get(write.primaryKey);
+		for (const { write, effectiveRow } of this.netOwnWriteEffects(this.primaryModifications, oldFunctions.encode)) {
 			const parentRow = parentTree?.get(write.primaryKey);
 			if (effectiveRow !== undefined) {
 				upserts.push(effectiveRow);
@@ -522,8 +507,34 @@ export class TransactionLayer implements Layer {
 	}
 
 	/**
-	 * Shared tail of the three whole-layer rebuilds — {@link rekeyPrimaryKey},
-	 * {@link convertColumn}, {@link installReshapedColumns}. Each has already swapped in its new
+	 * Shared HEAD of every whole-layer rebuild: each key {@link ownWrites} touched, exactly
+	 * once, paired with the layer's EFFECTIVE row at that key — `undefined` when the layer
+	 * finally deleted it, the layer's own row otherwise (`get` traverses the inheritance
+	 * chain). Collapsing the ordered log to one entry per key is what lets a rebuild replay
+	 * the net effect instead of the history; see each caller's doc for why its own rebuild
+	 * needs that.
+	 *
+	 * `tree` and `encode` are passed rather than read off `this` because a re-key consumes
+	 * this AFTER swapping {@link pkFunctions}, and must still dedup under the OLD encoding of
+	 * the OLD tree.
+	 */
+	private *netOwnWriteEffects(
+		tree: BTree<BTreeKeyForPrimary, Row>,
+		encode: (pk: BTreeKeyForPrimary) => string,
+	): Generator<{ write: OwnWrite; effectiveRow: Row | undefined }> {
+		const seen = new Set<string>();
+		for (const write of this.ownWrites) {
+			const encoded = encode(write.primaryKey);
+			if (seen.has(encoded)) continue;
+			seen.add(encoded);
+			yield { write, effectiveRow: tree.get(write.primaryKey) };
+		}
+	}
+
+	/**
+	 * Shared tail of the four whole-layer rebuilds — {@link rekeyPrimaryKey},
+	 * {@link installRekeyedPrimaryKeyColumns}, {@link convertColumn},
+	 * {@link installReshapedColumns}. Each has already swapped in its new
 	 * schema (and, where the key changed, its new {@link pkFunctions}) and collapsed
 	 * {@link ownWrites} to the net per-key effect passed here; this replays that effect into a
 	 * tree built over the parent's fresh one, installs it, rewrites the own-write log to match,
@@ -534,16 +545,17 @@ export class TransactionLayer implements Layer {
 	 * from `pkFunctions`.
 	 *
 	 * A deletion an upsert has since re-occupied is dropped from the log — keeping it would make
-	 * the log claim both a deletion and an upsert of the same key. Only {@link rekeyPrimaryKey}
-	 * can produce that collision (two old keys collapsing under the new comparator); where key
-	 * values are invariant a key is classified as either a deletion or an upsert, never both, so
-	 * the filter is a no-op.
+	 * the log claim both a deletion and an upsert of the same key. Only the two re-keys can
+	 * produce that collision (two old keys collapsing under the new comparator, or a shadowed
+	 * parent image whose new key another write's row now occupies); where key values are
+	 * invariant a key is classified as either a deletion or an upsert, never both, so the filter
+	 * is a no-op.
 	 *
-	 * `deletionTargets` guards each deletion's replay: `find(key)` runs under the NEW comparator,
-	 * so a re-key can land it on a colliding row this layer never removed — a row a PARENT layer
-	 * upserted at what is now the same key. Only {@link rekeyPrimaryKey} passes it (an
-	 * old-comparator identity check); the column-set/value rebuilds leave key values untouched,
-	 * where find() can only land on the deleted key itself.
+	 * `deletionTargets` guards each deletion's replay: `find(key)` runs under the NEW key, so a
+	 * re-key can land it on a colliding row this layer never removed — a row a PARENT layer
+	 * upserted at what is now the same key. Only the two re-keys pass it (each an old-key
+	 * identity check on the found row); the column-set/value rebuilds leave key values
+	 * untouched, where find() can only land on the deleted key itself.
 	 */
 	private installNetOwnWrites(
 		deletions: readonly BTreeKeyForPrimary[],
@@ -624,17 +636,9 @@ export class TransactionLayer implements Layer {
 		// is either finally-deleted or finally-upserted, never both, and no key can collapse onto
 		// another (unlike rekeyPrimaryKey). The net per-key effect is read out of the
 		// pre-conversion tree.
-		const seen = new Set<string>();
 		const survivingDeletions: BTreeKeyForPrimary[] = [];
 		const upserts: Row[] = [];
-		for (const write of this.ownWrites) {
-			const encoded = this.pkFunctions.encode(write.primaryKey);
-			if (seen.has(encoded)) continue;
-			seen.add(encoded);
-
-			// `get` traverses the inheritance chain, so this is the layer's EFFECTIVE row:
-			// undefined when the layer deleted the key, the layer's own row otherwise.
-			const effectiveRow = preTree.get(write.primaryKey);
+		for (const { write, effectiveRow } of this.netOwnWriteEffects(preTree, this.pkFunctions.encode)) {
 			if (effectiveRow === undefined) {
 				survivingDeletions.push(write.primaryKey);
 				continue;
@@ -697,17 +701,9 @@ export class TransactionLayer implements Layer {
 		reshapeRow: (row: Row) => Row | Promise<Row>,
 		reshapeEventRow: (row: Row) => Row | Promise<Row>,
 	): Promise<PreparedColumnReshape> {
-		const seen = new Set<string>();
 		const survivingDeletions: BTreeKeyForPrimary[] = [];
 		const upserts: Row[] = [];
-		for (const write of this.ownWrites) {
-			const encoded = this.pkFunctions.encode(write.primaryKey);
-			if (seen.has(encoded)) continue;
-			seen.add(encoded);
-
-			// `get` traverses the inheritance chain, so this is the layer's EFFECTIVE row:
-			// undefined when the layer deleted the key, the layer's own row otherwise.
-			const effectiveRow = this.primaryModifications.get(write.primaryKey);
+		for (const { write, effectiveRow } of this.netOwnWriteEffects(this.primaryModifications, this.pkFunctions.encode)) {
 			if (effectiveRow === undefined) {
 				survivingDeletions.push(write.primaryKey);
 				continue;

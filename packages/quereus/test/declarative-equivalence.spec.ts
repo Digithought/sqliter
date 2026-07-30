@@ -3418,8 +3418,8 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 		// UNIQUE + self-FK reconciliation cleanly. (Renaming the PK column instead is
 		// now reconciled by the PK pass too — ticket pk-column-rename-reconciliation —
 		// so it emits ONLY a RENAME COLUMN with no `primaryKeyChange`; that path has its
-		// own dedicated tests. The orthogonal rebuildMemoryTable engine fix is guarded by
-		// the sibling REGRESSION case below via a genuine ALTER PRIMARY KEY.)
+		// own dedicated tests. The orthogonal end-to-end ALTER PRIMARY KEY + deferred
+		// self-FK case is guarded by the sibling REGRESSION case below.)
 		const db = new Database();
 		try {
 			await db.exec('pragma foreign_keys = true');
@@ -4116,20 +4116,20 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 	});
 
 	it('REGRESSION: a genuine ALTER PRIMARY KEY on a self-referential-FK table commits with the deferred self-FK enforced', async function () {
-		// Engine-fix guard (rebuildMemoryTable connection cleanup), isolated from any
-		// column rename. A genuine PK change — here flipping the key to descending —
-		// emits an ALTER PRIMARY KEY, which on a memory table rebuilds the manager
-		// (rebuildMemoryTable). That rebuild used to orphan the old manager while leaving
+		// A genuine PK change — here flipping the key to descending — emits an ALTER
+		// PRIMARY KEY, isolated from any column rename. This case guarded an engine fix
+		// to the memory-table REBUILD path, which orphaned the old manager while leaving
 		// its VirtualTableConnection registered; the next insert then registered a second
 		// connection under the same name, tripping DeferredConstraintQueue.findConnection
 		// ("multiple candidate connections") when the deferred self-FK fired at commit.
-		// rebuildMemoryTable now removes the stale connections after the swap, so the
-		// post-rebuild insert commits and the self-FK enforces normally.
+		// The memory module now re-keys in place and keeps its manager, so the whole
+		// stale-connection shape is structurally unreachable — this stays as the
+		// end-to-end guard that a genuine PK change commits with the self-FK enforced.
 		//
 		// This case formerly drove the ALTER PRIMARY KEY via a *pure PK-column rename*;
 		// ticket pk-column-rename-reconciliation now reconciles such a rename to emit ONLY
 		// a RENAME COLUMN (no ALTER PRIMARY KEY), so a genuine PK change is used here to
-		// keep exercising the rebuild path.
+		// keep exercising the ALTER PRIMARY KEY path.
 		const db = new Database();
 		try {
 			await db.exec('pragma foreign_keys = true');
@@ -4144,7 +4144,7 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 			await db.exec('insert into node values (1, null), (2, 1)');
 
 			// Genuine PK change: flip the key to descending. Emits an ALTER PRIMARY KEY
-			// that rebuilds the memory table; the self-FK still references node(code).
+			// that re-keys the memory table; the self-FK still references node(code).
 			await db.exec(`declare schema main {
 				table node {
 					code INTEGER PRIMARY KEY desc,
@@ -4153,11 +4153,11 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 				}
 			}`);
 
-			// Confirm this is a genuine PK change — it must reach ALTER PRIMARY KEY (the
-			// memory-table rebuild), not silently no-op.
+			// Confirm this is a genuine PK change — it must reach ALTER PRIMARY KEY, not
+			// silently no-op.
 			const pkDiff = diffOf(db);
 			const nodeAlter = pkDiff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'node');
-			expect(nodeAlter?.primaryKeyChange, 'genuine PK change emits ALTER PRIMARY KEY (rebuild path)').to.not.be.undefined;
+			expect(nodeAlter?.primaryKeyChange, 'genuine PK change emits ALTER PRIMARY KEY').to.not.be.undefined;
 			expect(nodeAlter?.columnsToRename ?? [], 'no column rename in this case').to.deep.equal([]);
 
 			await db.exec('apply schema main');
