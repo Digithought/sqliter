@@ -633,9 +633,10 @@ name that misses the registry but matches an affinity rule (`nvarchar` → TEXT)
 which made a value-preserving cast read as converting and block an index seek.
 
 Standing regression coverage for "convert exactly once" (several JSON text
-scalars, across ordinary writes and the row-rewriting paths — `ALTER TABLE`,
-transactions, savepoints, `INSERT OR REPLACE`, primary-key relocation, index
-creation) lives in `test/logic/06.9.1-json-coerce-once.sqllogic` and its
+scalars, across ordinary writes and the row-rewriting paths — `ALTER TABLE`
+(add/drop/rename column, retype, add constraint, `SET NOT NULL` backfill),
+transactions, savepoints, rollback, `INSERT OR REPLACE`, primary-key
+relocation, index DDL) lives in `test/logic/06.9.1-json-coerce-once.sqllogic` and its
 capability-gated sibling `test/logic/06.9.1.1-json-coerce-once-index.sqllogic`.
 
 ### Explicit Conversion

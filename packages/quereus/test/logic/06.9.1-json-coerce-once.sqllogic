@@ -6,6 +6,9 @@
 -- plain JS string as JSON source, so re-converting the stored text `9` turns it
 -- into the number 9, and re-converting `abc` (not valid JSON source) throws.
 -- No `using memory`, so store mode exercises the same rules on the store path.
+-- Sibling file 06.9.1.1-json-coerce-once-index.sqllogic carries the index-DDL
+-- cases; they need the `standalone-index-ddl` capability, which is declared
+-- per file, so they cannot live here without gating this whole file.
 
 -- UPDATE of a NON-JSON column must leave an untouched JSON column byte-identical:
 -- a JSON string scalar whose text looks numeric must not silently become a number.
@@ -370,3 +373,45 @@ update jco_wp_repeat set v = v + 1;
 
 select id, json_quote(j) as jq, v from jco_wp_repeat order by id;
 → [{"id":1,"jq":"\"9\"","v":4},{"id":2,"jq":"\"true\"","v":5},{"id":3,"jq":"\"[1,2]\"","v":6}]
+
+-- ALTER TABLE ... DROP COLUMN reshapes every row (one cell narrower), so the
+-- surviving JSON cell moves position — a rebuild that must copy, not reconvert.
+create table jco_wp_dropcol (id integer primary key, x integer, j json);
+insert into jco_wp_dropcol values (1, 7, '"9"'), (2, 8, '"null"');
+alter table jco_wp_dropcol drop column x;
+-- run
+
+select id, json_quote(j) as jq from jco_wp_dropcol order by id;
+→ [{"id":1,"jq":"\"9\""},{"id":2,"jq":"\"null\""}]
+
+-- ALTER COLUMN ... SET NOT NULL backfills the sibling column's NULLs from its
+-- DEFAULT, rewriting exactly the rows that held NULL.
+create table jco_wp_setnn (id integer primary key, j json, v integer null default 7);
+insert into jco_wp_setnn values (1, '"9"', null), (2, '"null"', 5);
+alter table jco_wp_setnn alter column v set not null;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_setnn order by id;
+→ [{"id":1,"jq":"\"9\"","v":7},{"id":2,"jq":"\"null\"","v":5}]
+
+-- ALTER TABLE ... RENAME COLUMN of a sibling: schema-only in principle, but it
+-- reissues the table's schema, which is where a re-coercing rebuild would hide.
+create table jco_wp_rencol (id integer primary key, j json, v text);
+insert into jco_wp_rencol values (1, '"9"', 'a'), (2, '"null"', 'b');
+alter table jco_wp_rencol rename column v to w;
+-- run
+
+select id, json_quote(j) as jq, w from jco_wp_rencol order by id;
+→ [{"id":1,"jq":"\"9\"","w":"a"},{"id":2,"jq":"\"null\"","w":"b"}]
+
+-- Whole-transaction ROLLBACK (not just to a savepoint): the discarded staged
+-- rows must leave the committed JSON values exactly as they were.
+create table jco_wp_rollback (id integer primary key, j json, v integer);
+insert into jco_wp_rollback values (1, '"9"', 1), (2, '"[1,2]"', 2);
+begin;
+update jco_wp_rollback set v = 99;
+rollback;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_rollback order by id;
+→ [{"id":1,"jq":"\"9\"","v":1},{"id":2,"jq":"\"[1,2]\"","v":2}]
