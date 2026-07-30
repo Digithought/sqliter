@@ -112,8 +112,8 @@ instead. Tracked as `tickets/backlog/bug-least-null-handling-order-dependent`.
 | `instr(X, Y)` | 2 | INTEGER | 1-based position of first occurrence of Y in X. 0 if not found. `NULL` if either input is `NULL` || `reverse(X)` | 1 | TEXT | Reverse the string. Unicode-aware |
 | `lpad(X, N, P)` | 3 | TEXT | Left-pad X to length N using pad string P |
 | `rpad(X, N, P)` | 3 | TEXT | Right-pad X to length N using pad string P |
-| `like(pattern, string)` | 2 | INTEGER | LIKE match: `%` = any chars, `_` = one char. Case-sensitive |
-| `glob(pattern, string)` | 2 | INTEGER | GLOB match: `*` = any chars, `?` = one char. Case-sensitive |
+| `like(pattern, string)` | 2 | BOOLEAN | LIKE match: `%` = any chars, `_` = one char. Case-sensitive. `NULL` if either argument is `NULL` |
+| `glob(pattern, string)` | 2 | BOOLEAN | GLOB match: `*` = any chars, `?` = one char. Case-sensitive. `NULL` if either argument is `NULL` |
 
 ```sql
 select lower('Quereus');             -- 'quereus'
@@ -283,14 +283,14 @@ select epoch_s_frac('2024-07-26 12:30:45.5');-- 1721997045.5
 
 | Function | Returns | Description |
 |---|---|---|
-| `IsISODate(text)` | INTEGER | 1 if valid `YYYY-MM-DD` (leap-year aware), 0 otherwise |
-| `IsISODateTime(text)` | INTEGER | 1 if valid ISO 8601 datetime with `T` separator, 0 otherwise |
+| `IsISODate(text)` | BOOLEAN | `true` if valid `YYYY-MM-DD` (leap-year aware), `false` otherwise. Never `NULL` |
+| `IsISODateTime(text)` | BOOLEAN | `true` if valid ISO 8601 datetime with `T` separator, `false` otherwise. Never `NULL` |
 
 ```sql
-select IsISODate('2024-02-29');         -- 1 (leap year)
-select IsISODate('2023-02-29');         -- 0
-select IsISODateTime('2024-01-01T00:00:00Z'); -- 1
-select IsISODateTime('2024-01-01 00:00:00');  -- 0 (space not allowed)
+select IsISODate('2024-02-29');         -- true (leap year)
+select IsISODate('2023-02-29');         -- false
+select IsISODateTime('2024-01-01T00:00:00Z'); -- true
+select IsISODateTime('2024-01-01 00:00:00');  -- false (space not allowed)
 ```
 
 ---
@@ -346,7 +346,7 @@ JSON paths use `$` as root, `.key` for object members, and `[N]` for array indic
 
 | Function | Args | Returns | Description |
 |---|---|---|---|
-| `json_valid(json)` | 1 | INTEGER | 1 if well-formed JSON, 0 otherwise |
+| `json_valid(json)` | 1 | BOOLEAN | `true` if well-formed JSON, `false` otherwise. Never `NULL` |
 | `json_type(json, path?)` | 1-2 | TEXT | JSON type: `'null'`, `'true'`, `'false'`, `'integer'`, `'real'`, `'text'`, `'array'`, `'object'` |
 | `json_extract(json, path, ...)` | variadic | any | Extract value at first matching path. Nested arrays/objects returned as native JSON |
 | `json_array_length(json, path?)` | 1-2 | INTEGER | Length of JSON array (0 if not an array) |
@@ -358,7 +358,7 @@ The `->` and `->>` operators are syntactic sugar for `json_extract()`:
 Path shorthand: `'name'` becomes `'$.name'`, `0` becomes `'$[0]'`.
 
 ```sql
-select json_valid('{"a":1}');           -- 1
+select json_valid('{"a":1}');           -- true
 select json_type('{"a":1}', '$.a');     -- 'integer'
 select json_extract('{"a":[1,2]}', '$.a[1]'); -- 2
 select json_array_length('[1,2,3]');    -- 3
@@ -411,7 +411,7 @@ select json_patch('{"a":1}', '[{"op":"add","path":"/b","value":2}]');
 
 ### Schema Validation
 
-**`json_schema(json, schema_definition)`** -- Validates JSON against a TypeScript-like structural schema (powered by [moat-maker](https://github.com/theScottyJam/moat-maker)). Returns 1 if valid, 0 otherwise.
+**`json_schema(json, schema_definition)`** -- Validates JSON against a TypeScript-like structural schema (powered by [moat-maker](https://github.com/theScottyJam/moat-maker)). Returns BOOLEAN: `true` if valid, `false` otherwise (never `NULL`).
 
 **Schema syntax:**
 - Base types: `number`, `string`, `boolean`, `null`, `any`
@@ -424,9 +424,9 @@ select json_patch('{"a":1}', '[{"op":"add","path":"/b","value":2}]');
 When the schema argument is a constant (e.g., in CHECK constraints), the validator is compiled once and cached with the query plan.
 
 ```sql
-select json_schema('[1, 2, 3]', 'number[]');  -- 1
-select json_schema('{"x":42}', '{ x: number }'); -- 1
-select json_schema('[1,"mixed"]', 'number[]');    -- 0
+select json_schema('[1, 2, 3]', 'number[]');  -- true
+select json_schema('{"x":42}', '{ x: number }'); -- true
+select json_schema('[1,"mixed"]', 'number[]');    -- false
 
 create table events (
   id integer primary key,

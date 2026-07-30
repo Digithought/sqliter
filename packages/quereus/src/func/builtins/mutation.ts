@@ -3,7 +3,7 @@ import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
 import type { Instruction, RuntimeContext } from '../../runtime/types.js';
 import { asRun } from '../../runtime/types.js';
-import { INTEGER_TYPE } from '../../types/builtin-types.js';
+import { INTEGER_RETURN_NOT_NULL } from './return-types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type OutputValue, type SqlValue } from '../../common/types.js';
 
@@ -56,7 +56,7 @@ export const mutationOrdinalFunc = createScalarFunction(
 		name: 'mutation_ordinal',
 		numArgs: 0,
 		deterministic: true,
-		returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true },
+		returnType: INTEGER_RETURN_NOT_NULL,
 	},
 	// The custom emitter handles every call; this direct implementation is only a
 	// guard for an unexpected non-emitted invocation.

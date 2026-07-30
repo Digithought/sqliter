@@ -1078,7 +1078,13 @@ Declaring neither `returnType` nor `inferReturnType` yields `ANY_TYPE` — the e
   rather than on the argument types, declares `ANY_TYPE` explicitly. The shared shape
   constants live in `func/builtins/return-types.ts` (`TEXT_RETURN`, `INTEGER_RETURN`,
   `REAL_RETURN`, `BOOLEAN_RETURN`, `BLOB_RETURN`, `JSON_RETURN`, `ANY_RETURN`, plus
-  `_NOT_NULL` variants) — use them rather than re-spelling the four-field literal.
+  `_NOT_NULL` variants and the `scalarReturn(type, nullable)` builder for the types with
+  no constant). Every built-in scalar, aggregate and window function declares through
+  them — use them rather than re-spelling the four-field literal.
+- A function whose result is not closed over its argument's type must declare the wider
+  type rather than infer the argument's. `sqrt`, `pow` and `power` all declare REAL for
+  this reason: `sqrt(int_col)` claiming INTEGER would make the write path skip conversion
+  and store `1.4142135623730951` in an INTEGER column.
 
 Because of that default, **`validateArgTypes` must let an argument through whose type the
 planner cannot classify** — rejecting `ANY` at plan time makes the function unusable over

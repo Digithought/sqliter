@@ -197,6 +197,9 @@ export const jsonQuoteFunc = createScalarFunction(
 );
 
 // json_array(X, Y, ...) — returns native array
+// NOTE: JSON_RETURN is nullable, but this one provably never returns null. Declaring the
+// looser truth keeps every JSON-returning builtin on one constant. If a NOT NULL
+// inference ever keys off scalar-function nullability, give this a not-null variant.
 export const jsonArrayFunc = createScalarFunction(
 	{ name: 'json_array', numArgs: -1, deterministic: true, returnType: JSON_RETURN },
 	(...args: SqlValue[]): SqlValue => {

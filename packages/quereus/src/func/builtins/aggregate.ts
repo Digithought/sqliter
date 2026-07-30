@@ -3,7 +3,7 @@ import type { SqlValue } from '../../common/types.js';
 import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, AggregateReducer } from '../../schema/function.js';
 import { createAggregateFunction } from '../registration.js';
 import { compareSqlValuesFast, createSemanticValueComparator, BINARY_COLLATION } from '../../util/comparison.js';
-import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
+import { INTEGER_RETURN_NOT_NULL, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN } from './return-types.js';
 
 const log = createLogger('func:builtins:aggregate');
 const warnLog = log.extend('warn');
@@ -26,7 +26,7 @@ function addWithPromotion(a: number | bigint, b: number | bigint): number | bigi
 export const countStarFunc = createAggregateFunction(
 	{
 		name: 'count', numArgs: 0, initialValue: 0,
-		returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true },
+		returnType: INTEGER_RETURN_NOT_NULL,
 		algebra: {
 			merge: (a: number, b: number): number => a + b,
 			negate: (a: number): number => -a,
@@ -49,7 +49,7 @@ type SumAccumulator = { sum: number | bigint; count: number } | null;
 export const sumFunc = createAggregateFunction(
 	{
 		name: 'sum', numArgs: 1, initialValue: null,
-		returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true },
+		returnType: REAL_RETURN,
 		// NOTE: declared unconditionally; exactness under retraction is a value-domain
 		// property (floats drift) the function cannot see, so the write-side delta arm
 		// gates on the argument's static type before exploiting negate.
@@ -116,7 +116,7 @@ interface AvgAccumulator { sum: number; count: number }
 export const avgFunc = createAggregateFunction(
 	{
 		name: 'avg', numArgs: 1, initialValue: { sum: 0, count: 0 },
-		returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true },
+		returnType: REAL_RETURN,
 		// No decode — the stored quotient forgets the count and cannot reconstruct
 		// an accumulator. Maintained/rolled up via its decomposition instead.
 		algebra: {
@@ -237,7 +237,7 @@ export const maxFunc = createExtremumFunction('max');
 export const countXFunc = createAggregateFunction(
 	{
 		name: 'count', numArgs: 1, initialValue: 0,
-		returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true },
+		returnType: INTEGER_RETURN_NOT_NULL,
 		algebra: {
 			merge: (a: number, b: number): number => a + b,
 			negate: (a: number): number => -a,
@@ -259,7 +259,7 @@ interface GroupConcatAccumulator {
 	separator: string;
 }
 export const groupConcatFuncRev = createAggregateFunction(
-	{ name: 'group_concat', numArgs: -1, initialValue: () => ({ values: [], separator: ',' }), returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'group_concat', numArgs: -1, initialValue: () => ({ values: [], separator: ',' }), returnType: TEXT_RETURN },
 	(acc: GroupConcatAccumulator, value: SqlValue, separator: SqlValue = ','): GroupConcatAccumulator => {
 		const currentSeparator = (separator === undefined || separator === null) ? acc.separator : String(separator);
 		acc.separator = currentSeparator;
@@ -285,7 +285,7 @@ export const groupConcatFuncRev = createAggregateFunction(
 // maintenance-equivalence oracle compares byte-exactly. Residual-only is correct,
 // just not incremental. Same for group_concat / var_* / stddev_* below.
 export const totalFunc = createAggregateFunction(
-	{ name: 'total', numArgs: 1, initialValue: 0.0, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: false, isReadOnly: true } },
+	{ name: 'total', numArgs: 1, initialValue: 0.0, returnType: REAL_RETURN_NOT_NULL },
 	(acc: number, value: SqlValue): number => {
 		let numValue = 0.0;
 		if (value !== null) {
@@ -335,7 +335,7 @@ const statReducer = (acc: StatAccumulator, value: SqlValue): StatAccumulator => 
 
 // Population Variance (VAR_POP)
 export const varPopFunc = createAggregateFunction(
-	{ name: 'var_pop', numArgs: 1, initialValue: { count: 0, sum: 0, sumSq: 0 }, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'var_pop', numArgs: 1, initialValue: { count: 0, sum: 0, sumSq: 0 }, returnType: REAL_RETURN },
 	statReducer,
 	(acc: StatAccumulator): number | null => {
 		if (acc.count === 0) return null; // NULL for empty set
@@ -347,7 +347,7 @@ export const varPopFunc = createAggregateFunction(
 
 // Sample Variance (VAR_SAMP)
 export const varSampFunc = createAggregateFunction(
-	{ name: 'var_samp', numArgs: 1, initialValue: { count: 0, sum: 0, sumSq: 0 }, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'var_samp', numArgs: 1, initialValue: { count: 0, sum: 0, sumSq: 0 }, returnType: REAL_RETURN },
 	statReducer,
 	(acc: StatAccumulator): number | null => {
 		if (acc.count <= 1) return null; // NULL if count is 0 or 1
@@ -359,7 +359,7 @@ export const varSampFunc = createAggregateFunction(
 
 // Population Standard Deviation (STDDEV_POP)
 export const stdDevPopFunc = createAggregateFunction(
-	{ name: 'stddev_pop', numArgs: 1, initialValue: { count: 0, sum: 0, sumSq: 0 }, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'stddev_pop', numArgs: 1, initialValue: { count: 0, sum: 0, sumSq: 0 }, returnType: REAL_RETURN },
 	statReducer,
 	(acc: StatAccumulator): number | null => {
 		if (acc.count === 0) return null;
@@ -371,7 +371,7 @@ export const stdDevPopFunc = createAggregateFunction(
 
 // Sample Standard Deviation (STDDEV_SAMP)
 export const stdDevSampFunc = createAggregateFunction(
-	{ name: 'stddev_samp', numArgs: 1, initialValue: { count: 0, sum: 0, sumSq: 0 }, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'stddev_samp', numArgs: 1, initialValue: { count: 0, sum: 0, sumSq: 0 }, returnType: REAL_RETURN },
 	statReducer,
 	(acc: StatAccumulator): number | null => {
 		if (acc.count <= 1) return null;

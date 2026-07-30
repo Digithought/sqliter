@@ -1,6 +1,6 @@
 import { registerWindowFunction, type WindowFunctionBinding } from '../../schema/window-function.js';
 import { AggValue } from '../registration.js';
-import { INTEGER_TYPE, REAL_TYPE } from '../../types/builtin-types.js';
+import { INTEGER_RETURN_NOT_NULL, REAL_RETURN, REAL_RETURN_NOT_NULL } from './return-types.js';
 import type { ScalarType } from '../../common/datatype.js';
 import type { DeepReadonly, SqlValue } from '../../common/types.js';
 import type { LogicalType } from '../../types/logical-type.js';
@@ -60,12 +60,7 @@ function registerExtremumWindowFunction(direction: 'min' | 'max'): void {
 	registerWindowFunction({
 		name: direction.toUpperCase(),
 		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN,
 		// MIN/MAX pass the argument value through unchanged, so the result follows
 		// the argument's logical type (mirrors the aggregate minFunc/maxFunc).
 		inferReturnType: passThroughArgType,
@@ -86,12 +81,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'ROW_NUMBER',
 		argCount: 0,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: INTEGER_TYPE,
-			nullable: false,
-			isReadOnly: true
-		},
+		returnType: INTEGER_RETURN_NOT_NULL,
 		requiresOrderBy: true,
 		kind: 'ranking'
 	});
@@ -99,12 +89,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'RANK',
 		argCount: 0,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: INTEGER_TYPE,
-			nullable: false,
-			isReadOnly: true
-		},
+		returnType: INTEGER_RETURN_NOT_NULL,
 		requiresOrderBy: true,
 		kind: 'ranking'
 	});
@@ -112,12 +97,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'DENSE_RANK',
 		argCount: 0,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: INTEGER_TYPE,
-			nullable: false,
-			isReadOnly: true
-		},
+		returnType: INTEGER_RETURN_NOT_NULL,
 		requiresOrderBy: true,
 		kind: 'ranking'
 	});
@@ -125,12 +105,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'NTILE',
 		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: INTEGER_TYPE,
-			nullable: false,
-			isReadOnly: true
-		},
+		returnType: INTEGER_RETURN_NOT_NULL,
 		requiresOrderBy: true,
 		kind: 'ranking'
 	});
@@ -139,12 +114,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'LAG',
 		argCount: 'variadic',
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN,
 		// LAG passes arg[0] (the value expression) through unchanged; arg[1] is the
 		// offset and arg[2] is an optional default — their types do not widen the result.
 		inferReturnType: passThroughArgType,
@@ -155,12 +125,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'LEAD',
 		argCount: 'variadic',
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN,
 		// LEAD passes arg[0] (the value expression) through unchanged; arg[1] is the
 		// offset and arg[2] is an optional default — their types do not widen the result.
 		inferReturnType: passThroughArgType,
@@ -172,12 +137,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'FIRST_VALUE',
 		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN,
 		// FIRST_VALUE passes its argument value through unchanged, so the result
 		// follows the argument's logical type (mirrors the MIN/MAX pattern).
 		inferReturnType: passThroughArgType,
@@ -188,12 +148,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'LAST_VALUE',
 		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN,
 		// LAST_VALUE passes its argument value through unchanged, so the result
 		// follows the argument's logical type (mirrors the MIN/MAX pattern).
 		inferReturnType: passThroughArgType,
@@ -205,12 +160,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'PERCENT_RANK',
 		argCount: 0,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: false,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN_NOT_NULL,
 		requiresOrderBy: true,
 		kind: 'ranking'
 	});
@@ -218,12 +168,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'CUME_DIST',
 		argCount: 0,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: false,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN_NOT_NULL,
 		requiresOrderBy: true,
 		kind: 'ranking'
 	});
@@ -232,12 +177,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'COUNT',
 		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: INTEGER_TYPE,
-			nullable: false,
-			isReadOnly: true
-		},
+		returnType: INTEGER_RETURN_NOT_NULL,
 		requiresOrderBy: false,
 		kind: 'aggregate',
 		step: (state: AggValue, value: AggValue) => {
@@ -259,12 +199,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'SUM',
 		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN,
 		requiresOrderBy: false,
 		kind: 'aggregate',
 		step: (state: AggValue, value: AggValue) => {
@@ -280,12 +215,7 @@ export function registerBuiltinWindowFunctions(): void {
 	registerWindowFunction({
 		name: 'AVG',
 		argCount: 1,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: REAL_TYPE,
-			nullable: true,
-			isReadOnly: true
-		},
+		returnType: REAL_RETURN,
 		requiresOrderBy: false,
 		kind: 'aggregate',
 		step: (state: AggValue, value: AggValue) => {

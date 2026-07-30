@@ -2,14 +2,14 @@ import type { SqlValue, DeepReadonly } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { compareSqlValues, getSqlDataTypeName } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { ANY_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, isNumericOrUnknownType } from '../../types/builtin-types.js';
+import { ANY_TYPE, INTEGER_TYPE, REAL_TYPE, isNumericOrUnknownType } from '../../types/builtin-types.js';
 import type { CustomEmitterHook } from '../../schema/function.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
 import type { Instruction, RuntimeContext } from '../../runtime/types.js';
 import { asRun } from '../../runtime/types.js';
 import { emitPlanNode } from '../../runtime/emitters.js';
-import { BLOB_RETURN, INTEGER_RETURN_NOT_NULL, REAL_RETURN } from './return-types.js';
+import { BLOB_RETURN, INTEGER_RETURN_NOT_NULL, REAL_RETURN, TEXT_RETURN_NOT_NULL } from './return-types.js';
 import { effectiveComparisonCollation, effectiveGroupCollation } from '../../planner/analysis/comparison-collation.js';
 import { makeGroupComparator, makeOperandComparator, formatOperandCollationNote } from '../../runtime/emit/operand-comparator.js';
 
@@ -224,12 +224,7 @@ export const typeofFunc = createScalarFunction(
 		name: 'typeof',
 		numArgs: 1,
 		deterministic: true,
-		returnType: {
-			typeClass: 'scalar',
-			logicalType: TEXT_TYPE,
-			nullable: false,
-			isReadOnly: true
-		}
+		returnType: TEXT_RETURN_NOT_NULL
 	},
 	(arg: SqlValue): SqlValue => {
 		return getSqlDataTypeName(arg);
@@ -301,15 +296,12 @@ export const sqrtFunc = createScalarFunction(
 		name: 'sqrt',
 		numArgs: 1,
 		deterministic: true,
-		// Type inference: keep the input type. The value is always real-valued, but
-		// declaring REAL would change comparison coercion for `sqrt(int_col) = '2'`, so
-		// that belongs to the declared-return-type work, not here.
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: false,
-			isReadOnly: true
-		}),
+		// REAL rather than inferred-from-input, for the same reason as pow/power below:
+		// Math.sqrt is not closed over the integers, so `sqrt(int_col)` claiming INTEGER
+		// is a lie the write path acts on — it would skip conversion and store
+		// 1.4142135623730951 in an INTEGER column. Nullable because a negative or NULL
+		// argument yields NULL.
+		returnType: REAL_RETURN,
 		validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 	},
 	(arg: SqlValue): SqlValue => {

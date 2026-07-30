@@ -26,8 +26,8 @@ Scalar functions operate on single values and return a single value per row.
 - `lpad(X, Y[, Z])`: Left-pads string X to length Y with string Z (default space)
 - `rpad(X, Y[, Z])`: Right-pads string X to length Y with string Z (default space)
 - `reverse(X)`: Returns string X with characters in reverse order
-- `like(X, Y)`: Returns 1 if X matches pattern Y, 0 otherwise
-- `glob(X, Y)`: Returns 1 if X matches glob pattern Y, 0 otherwise
+- `like(pattern, X)`: Returns BOOLEAN — `true` if X matches `pattern`, `false` otherwise, `NULL` if either argument is `NULL`
+- `glob(pattern, X)`: Returns BOOLEAN — `true` if X matches glob `pattern`, `false` otherwise, `NULL` if either argument is `NULL`
 
 **Examples:**
 ```sql
@@ -155,9 +155,9 @@ Quereus provides comprehensive functions for working with JSON data.
 
 **JSON Query Functions:**
 - `json_extract(json, path, ...)`: Extracts values from JSON using JSONPath
-- `json_type(json[, path])`: Returns the type of JSON value ('object', 'array', 'string', 'number', 'boolean', 'null')
-- `json_valid(json)`: Checks if a string is valid JSON (returns 1 or 0)
-- `json_schema(json, schema_def)`: Validates JSON against a structural schema (returns 1 or 0)
+- `json_type(json[, path])`: Returns the type of JSON value as TEXT ('object', 'array', 'text', 'integer', 'real', 'true', 'false', 'null')
+- `json_valid(json)`: Checks if a string is valid JSON (returns BOOLEAN)
+- `json_schema(json, schema_def)`: Validates JSON against a structural schema (returns BOOLEAN)
 - `json_array_length(json[, path])`: Returns the length of a JSON array
 
 **JSON Construction Functions:**

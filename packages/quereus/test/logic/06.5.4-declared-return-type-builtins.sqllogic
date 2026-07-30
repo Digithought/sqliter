@@ -101,6 +101,15 @@ select timespan_seconds('PT1.5S') as r;
 select timespan_total_seconds('P1D') as a, timespan_total_hours('P1D') as b;
 → [{"a":86400,"b":24}]
 
+-- sqrt is REAL for the same reason as pow: Math.sqrt is not closed over the integers, so
+-- inferring the argument's type would claim INTEGER for a value like sqrt(2). The write
+-- path acts on that claim — see section 7.
+select sqrt(2) as a, typeof(sqrt(2)) as t;
+→ [{"a":1.4142135623730951,"t":"real"}]
+
+select sqrt(4) = '2' as r;
+→ [{"r":true}]
+
 -- ===================================
 -- 4. TEXT-returning functions
 -- ===================================
@@ -159,6 +168,12 @@ select json_replace(j, '$.a', 'y') = json_object('a','y') as r from drt;
 select typeof(json_object('a','x')) as r;
 → [{"r":"json"}]
 
+-- A JSON mutator can yield a JSON *scalar* rather than an object. typeof reports the
+-- storage class of a JSON scalar, so it reads 'integer' — the same answer `json('5')`
+-- gives, and unchanged by the JSON declaration.
+select json_set('{}', '$', 5) as r, typeof(json_set('{}', '$', 5)) as t, typeof(json('5')) as j;
+→ [{"r":5,"t":"integer","j":"integer"}]
+
 -- ===================================
 -- 7. Write path: convert exactly once
 -- ===================================
@@ -175,6 +190,30 @@ select id, typeof(j) as t from jw order by id;
 
 select count(*) as c from jw where j = json_object('a','x');
 → [{"c":2}]
+
+-- The mirror case: a REAL-declared result into an INTEGER column does NOT match the
+-- column type, so conversion runs and the stored value is a whole number. Declaring the
+-- argument's type instead would skip the conversion and leave 1.4142135623730951 in an
+-- INTEGER column.
+create table iw (id integer primary key, v integer);
+insert into iw(id, v) select 1, sqrt(2);
+insert into iw(id, v) select 2, pow(2, 0.5);
+-- run
+
+select id, v, typeof(v) as t from iw order by id;
+→ [{"id":1,"v":1,"t":"integer"},{"id":2,"v":1,"t":"integer"}]
+
+-- Nullability is declared, not enforced: a nullable BOOLEAN that resolves to NULL still
+-- meets the column's NOT NULL check at runtime rather than slipping past it.
+create table bw (id integer primary key, ok boolean not null);
+insert into bw(id, ok) select 1, json_valid('{}');
+-- run
+
+select ok from bw;
+→ [{"ok":true}]
+
+insert into bw(id, ok) select 2, like('a%', null);
+-- error: NOT NULL constraint failed: bw.ok
 
 -- ===================================
 -- 8. The variadic date/time/datetime functions declare TEXT, not DATE/TIME/DATETIME
@@ -214,6 +253,36 @@ select date(d, '+1 day') = '2024-03-05' as r from drt;
 select date('2024-03-04', '+1 day') + 'P1D' as r;
 → [{"r":"2024-03-06"}]
 
+-- ===================================
+-- 9. The plans actually changed — the point of the whole exercise
+-- ===================================
+-- Sections 1-8 prove the answers did not move; this one proves the declarations bought
+-- something. `scheduler_program()` exposes each instruction's note, and the comparison
+-- emitter tags itself with the path it chose (runtime/emit/binary.ts):
+--   compare-fast  — both operands the same category (numeric/textual), no coercion
+--   compare-typed — both operands the same logical type with semantic ordering (JSON)
+--   compare       — the generic path: temporal check plus coercion
+-- Every one of these read `compare` while the function rode the ANY default.
+select count(*) as c from scheduler_program('select json_quote(j) = ''text'' from drt')
+	where description = '=(compare-fast)';
+→ [{"c":1}]
+
+select count(*) as c from scheduler_program('select epoch_s(d) = 1 from drt')
+	where description = '=(compare-fast)';
+→ [{"c":1}]
+
+select count(*) as c from scheduler_program('select json_object(''a'',''x'') = j from drt')
+	where description = '=(compare-typed)';
+→ [{"c":1}]
+
+-- json_extract is the deliberate ANY holdout, so it still takes the generic path. This is
+-- the control: it is what every row above looked like before the declarations landed.
+select count(*) as c from scheduler_program('select json_extract(j, ''$.a'') = ''x'' from drt')
+	where description = '=(compare)';
+→ [{"c":1}]
+
+drop table bw;
+drop table iw;
 drop table dw;
 drop table jw;
 drop table drt;
