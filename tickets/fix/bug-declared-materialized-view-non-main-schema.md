@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-30T05:55:14.880Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\bug-declared-materialized-view-non-main-schema.fix.2026-07-30T05-55-14-880Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ----
 description: Declaring a materialized view in a schema other than the default one and then applying that declaration fails — the generated statement forgets which schema it belongs to and cannot find its own source table.
 files:
