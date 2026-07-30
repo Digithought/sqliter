@@ -672,6 +672,7 @@ order by expression [asc | desc] [nulls first | nulls last]
 - `nulls last`: NULL values sort after non-NULL values
 - Expression can be a column name, alias, expression, or a positive integer representing a position in the select list (1-based; out-of-range raises an error)
 - Aggregate functions are permitted when the query is itself an aggregate query (has aggregates in `select`/`having`, or has `group by`)
+- Any expression legal in `group by` is also legal in `order by` of the same query and sorts by the grouped value — regardless of how, or whether, the select list projects it. This holds even when the select list contains no aggregate function at all
 
 **Examples:**
 ```sql
@@ -696,6 +697,9 @@ select grp, count(*) as cnt from t group by grp order by count(*) desc;
 
 -- Aggregate referenced only in ORDER BY (not in SELECT)
 select grp from t group by grp order by max(val) desc;
+
+-- Grouping key in ORDER BY while the select list only projects an expression over it
+select cast(grp as text) as g from t group by grp order by grp;
 ```
 
 ### 3.6 LIMIT and OFFSET Clauses

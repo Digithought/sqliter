@@ -1,0 +1,154 @@
+-- ORDER BY a GROUP BY key in a grouped query whose SELECT list contains no
+-- aggregate function at all.
+--
+-- Regression for bug-order-by-group-key-not-in-select-list: the planner used to
+-- decide the final-projection path from "does the SELECT list contain an
+-- aggregate function" rather than "did a grouping phase run". A `group by` with
+-- no aggregate anywhere therefore took *both* paths and emitted a second,
+-- stale projection whose column references still pointed at pre-aggregate
+-- attributes. A bare-column `order by` over a grouping key inserted a blocking
+-- Sort underneath that stale projection, the source row context was gone by the
+-- time it ran, and the query failed with "No row context found for column v".
+-- Adding any aggregate (`count(*)`) or sorting by the output alias hid the bug.
+--
+-- The rule pinned here: any expression legal in GROUP BY is legal in ORDER BY of
+-- the same query and sorts by the grouped value, regardless of how — or
+-- whether — the SELECT list projects it.
+--
+-- Plan shape (exactly one Project, Sort above it) is asserted separately in
+-- test/plan/grouped-projection-shape.spec.ts; this file pins the results.
+
+create table gk (v integer primary key, g text);
+insert into gk values (1,'a'),(2,'b'),(3,'a');
+
+-- The original repro: grouping key wrapped in an expression in the SELECT list,
+-- ORDER BY names the bare key.
+select cast(v as text) x from gk group by v order by v;
+→ [{"x":"1"},{"x":"2"},{"x":"3"}]
+
+-- DESC behaves the same.
+select cast(v as text) x from gk group by v order by v desc;
+→ [{"x":"3"},{"x":"2"},{"x":"1"}]
+
+-- Arithmetic instead of CAST.
+select v+0 x from gk group by v order by v;
+→ [{"x":1},{"x":2},{"x":3}]
+
+-- Function call over a text grouping key.
+select upper(g) x from gk group by g order by g;
+→ [{"x":"A"},{"x":"B"}]
+
+select upper(g) x from gk group by g order by g desc;
+→ [{"x":"B"},{"x":"A"}]
+
+-- Bare grouping key in the SELECT list (no expression wrapper, still no aggregate):
+-- output keeps the SELECT-list name, not the raw group column.
+select g from gk group by g order by g;
+→ [{"g":"a"},{"g":"b"}]
+
+-- ORDER BY an *expression over* a grouping key.
+select cast(v as text) x from gk group by v order by -v;
+→ [{"x":"3"},{"x":"2"},{"x":"1"}]
+
+-- HAVING over a grouping key combined with the bare-column ORDER BY.
+select cast(v as text) x from gk group by v having v > 1 order by v;
+→ [{"x":"2"},{"x":"3"}]
+
+select upper(g) x from gk group by g having g > 'a' order by g;
+→ [{"x":"B"}]
+
+-- DISTINCT over the projected expression.
+select distinct upper(g) x from gk group by g order by g;
+→ [{"x":"A"},{"x":"B"}]
+
+-- LIMIT / OFFSET above the sort.
+select upper(g) x from gk group by g order by g limit 1;
+→ [{"x":"A"}]
+
+select cast(v as text) x from gk group by v order by v limit 1 offset 1;
+→ [{"x":"2"}]
+
+-- Multiple grouping keys, ORDER BY both as bare columns.
+select cast(v as text) x from gk group by g, v order by g, v;
+→ [{"x":"1"},{"x":"3"},{"x":"2"}]
+
+-- Grouping key projected both bare and wrapped.
+select g, upper(g) x from gk group by g order by g;
+→ [{"g":"a","x":"A"},{"g":"b","x":"B"}]
+
+-- Contrast: the same shape *with* an aggregate always worked; it must keep working.
+select cast(v as text) x, count(*) c from gk group by v order by v;
+→ [{"x":"1","c":1},{"x":"2","c":1},{"x":"3","c":1}]
+
+-- Contrast: the non-grouped path still applies ORDER BY before the projection
+-- (this is what `shouldApplyOrderByBeforeProjection` exists for) — 'a' appears
+-- twice because there is no grouping here.
+select upper(g) x from gk order by g;
+→ [{"x":"A"},{"x":"A"},{"x":"B"}]
+
+-- ---------------------------------------------------------------------------
+-- SELECT * / bare column list over a grouped query.
+-- The forced final projection must emit *source-column* order (v, g), not
+-- GROUP BY order (g, v). Column order itself is asserted in the plan-shape spec
+-- (row objects compare key-order-insensitively here); these cases pin that each
+-- name still carries its own column's value.
+-- ---------------------------------------------------------------------------
+select v, g from gk group by g, v order by v;
+→ [{"v":1,"g":"a"},{"v":2,"g":"b"},{"v":3,"g":"a"}]
+
+select * from gk group by g, v order by v;
+→ [{"v":1,"g":"a"},{"v":2,"g":"b"},{"v":3,"g":"a"}]
+
+select gk.* from gk group by v, g order by v;
+→ [{"v":1,"g":"a"},{"v":2,"g":"b"},{"v":3,"g":"a"}]
+
+-- ---------------------------------------------------------------------------
+-- The grouped, aggregate-free select must compose everywhere a relation can go.
+-- ---------------------------------------------------------------------------
+
+-- As a derived table, re-sorted by the outer query.
+select x from (select upper(g) x from gk group by g order by g) order by x desc;
+→ [{"x":"B"},{"x":"A"}]
+
+-- As a CTE.
+with c as (select upper(g) x from gk group by g order by g) select * from c;
+→ [{"x":"A"},{"x":"B"}]
+
+-- As an IN subquery.
+select v from gk where v in (select v from gk group by v order by v) order by v;
+→ [{"v":1},{"v":2},{"v":3}]
+
+-- As a scalar subquery.
+select (select upper(g) from gk where v = 1 group by g) s;
+→ [{"s":"A"}]
+
+-- As a compound-select branch.
+select upper(g) x from gk group by g union all select 'z';
+→ [{"x":"A"},{"x":"B"},{"x":"z"}]
+
+-- As a materialized view body.
+create materialized view mvg as select g from gk group by g;
+select g from mvg order by g;
+→ [{"g":"a"},{"g":"b"}]
+
+drop materialized view mvg;
+drop table gk;
+
+-- ---------------------------------------------------------------------------
+-- NULL grouping key. NULLs collapse into one group and the bare-column ORDER BY
+-- places them per the explicit NULLS clause (the *default* placement under DESC
+-- is deliberately not asserted — see 10.5.3-desc-index-ordering).
+-- ---------------------------------------------------------------------------
+create table gkn (v integer primary key, g text null);
+insert into gkn values (1,'a'),(2,null),(3,'b'),(4,null);
+
+select upper(g) x from gkn group by g order by g nulls first;
+→ [{"x":null},{"x":"A"},{"x":"B"}]
+
+select upper(g) x from gkn group by g order by g nulls last;
+→ [{"x":"A"},{"x":"B"},{"x":null}]
+
+select upper(g) x from gkn group by g order by g desc nulls last;
+→ [{"x":"B"},{"x":"A"},{"x":null}]
+
+drop table gkn;

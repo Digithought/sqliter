@@ -160,6 +160,15 @@ export function buildAggregatePhase(
 		// A GROUP BY with no aggregate functions has no other projection step: the
 		// select list must be projected over the AggregateNode output here, or the
 		// output would be the raw group keys in GROUP BY order.
+		// NOTE: the `!hasAggregates` guard is load-bearing. Forcing the projection for
+		// every grouped query changes the plan shape of a grouped materialized-view body
+		// (`select k, count(*), sum(a) … group by k`) and re-routes its incremental
+		// maintenance from residual-recompute to full-rebuild — see
+		// test/incremental/delta-aggregate.spec.ts. It is also why an aggregate-only
+		// select list still leaks its grouping key into the output
+		// (backlog/bug-grouped-aggregate-only-select-returns-extra-column); fixing that
+		// means reconciling the projection with maintenance routing, not just dropping
+		// this guard.
 		|| Boolean(hasGroupBy && !hasAggregates && projections.length > 0);
 
 	return {
