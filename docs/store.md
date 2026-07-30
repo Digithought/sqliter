@@ -402,7 +402,7 @@ Some DDL rewrites or relocates storage directly, bypassing the coordinator's buf
 The statements with this behavior:
 
 - `ALTER TABLE ... RENAME TO` (the physical stores move)
-- `ALTER TABLE ... ADD COLUMN` / `DROP COLUMN` (every stored row is re-encoded to the new column layout)
+- `ALTER TABLE ... ADD COLUMN` / `DROP COLUMN` (every stored row is re-encoded to the new column layout; `DROP COLUMN` also re-encodes the keys of every index it *narrows* — one fewer column value ahead of the PK suffix — and deletes the index store of every index it removes outright, so nothing is left for a later same-named `CREATE INDEX` to adopt)
 - `ALTER TABLE ... ALTER PRIMARY KEY` (every data key, and every secondary-index key, is re-encoded)
 - `ALTER TABLE ... ALTER COLUMN <pk-member> SET COLLATE` (same re-key, driven by the column's new key collation)
 - `ALTER TABLE ... ALTER COLUMN <non-pk-member> SET DATA TYPE`, for any move between two *different* logical types — the physical representation need not change (every row's value is re-parsed and re-stored in the new type's canonical form). Retyping a **primary-key member** to a different logical type is rejected with `CONSTRAINT` before anything is scanned or written: the value rewrite is payload-only and would leave the row's key bytes encoded under the old type. The engine refuses this for every backend already (see [SQL DDL § ALTER TABLE](sql-ddl.md#27-alter-table-statement)); the store repeats the check for direct module calls, as the memory backend does

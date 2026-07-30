@@ -516,6 +516,82 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(indexStoreSize('t', 'ix_bc'), 'no orphaned entries after the re-encode + delete').to.equal(0);
 	});
 
+	it('one DROP COLUMN reshapes every affected index and leaves the unaffected one alone', async () => {
+		// All three fates in one statement: `ix_b` removed (its only column goes), `ix_bc`
+		// narrowed to (c), `ix_c` untouched (same column count — its indices shift but its
+		// key bytes do not). The narrowed rebuild is handed only the narrowed list, so a bug
+		// there shows up as either a missed re-encode or a clobbered `ix_c`.
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`create index ix_bc on t (b, c)`);
+		await db.exec(`create index ix_c on t (c)`);
+		await db.exec(`insert into t values (1, 10, 100), (2, 20, 200)`);
+
+		await db.exec(`alter table t drop column b`);
+
+		expect(provider.stores.has('main.t_idx_ix_b'), 'collapsed index torn down').to.equal(false);
+		expect((await indexInfo(db, 't')).map(r => r.index_name).sort())
+			.to.deep.equal(['ix_bc', 'ix_c']);
+		expect(indexStoreSize('t', 'ix_bc'), 'narrowed index re-encoded, one entry per row').to.equal(2);
+		expect(indexStoreSize('t', 'ix_c'), 'untouched index intact').to.equal(2);
+		expect(await rows(db, `select id from t where c = 100`)).to.deep.equal([{ id: 1 }]);
+
+		// Both survivors drain, so write-time maintenance agrees with each one's entries.
+		await db.exec(`delete from t`);
+		expect(indexStoreSize('t', 'ix_bc'), 'narrowed index drained').to.equal(0);
+		expect(indexStoreSize('t', 'ix_c'), 'untouched index drained').to.equal(0);
+	});
+
+	it('DROP COLUMN narrowing a DESC / NOCASE index re-encodes under the same direction and collation', async () => {
+		// The rebuild must carry the surviving column's `desc` flag and the table key
+		// collation into the new key bytes, not re-encode ASC / BINARY: a case-insensitive
+		// match on a pre-drop row is what catches a collation regression, and the DESC
+		// ordering below what catches a direction one.
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer, name text collate nocase) using store`);
+		await db.exec(`create index ix_bn on t (b, name desc)`);
+		await db.exec(`insert into t values (1, 10, 'Alice'), (2, 20, 'bob')`);
+
+		await db.exec(`alter table t drop column b`);
+
+		const info = await indexInfo(db, 't');
+		expect(info.map(r => [r.index_name, r.column_name, r.desc]), 'narrowed to the DESC column')
+			.to.deep.equal([['ix_bn', 'name', 1]]);
+		expect(indexStoreSize('t', 'ix_bn'), 'entry per row after the re-encode').to.equal(2);
+		expect(await rows(db, `select id from t where name = 'ALICE'`), 'NOCASE match on a pre-drop row')
+			.to.deep.equal([{ id: 1 }]);
+		expect(await rows(db, `select id from t where name > 'a' order by name desc`))
+			.to.deep.equal([{ id: 2 }, { id: 1 }]);
+		await db.exec(`delete from t`);
+		expect(indexStoreSize('t', 'ix_bn'), 'no orphaned entries after the re-encode + delete').to.equal(0);
+	});
+
+	it('DROP COLUMN inside an open transaction strands no ops against the reshaped stores', async () => {
+		// The arm flushes ONCE, before the row migration, and then writes the data and index
+		// stores outside the coordinator — so the teardown of a doomed store takes no second
+		// flush. A pending write against the doomed index before the statement is what would
+		// expose a stranded op: it would replay into a closed store at commit.
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`create index ix_bc on t (b, c)`);
+		await db.exec(`insert into t values (1, 10, 100)`);
+
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (2, 20, 200)`);
+		// DDL that rewrites rows force-commits the module transaction (`ddlTransactionality:
+		// 'auto-commit'`), so the pending row above is part of the migrated set.
+		await db.exec(`alter table t drop column b`);
+		await db.exec(`insert into t values (3, 300)`);
+		await db.exec(`commit`);
+
+		expect(provider.stores.has('main.t_idx_ix_b'), 'doomed store torn down').to.equal(false);
+		expect(indexStoreSize('t', 'ix_bc'), 'every row indexed under the narrow encoding').to.equal(3);
+		expect(await rows(db, `select id from t where c > 0 order by id`))
+			.to.deep.equal([{ id: 1 }, { id: 2 }, { id: 3 }]);
+	});
+
 	it('DROP COLUMN then reopen: the removed index does not resurrect from a leaked store', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);

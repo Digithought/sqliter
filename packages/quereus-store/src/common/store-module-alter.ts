@@ -265,43 +265,14 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		const shifted = shiftSchemaIndicesForDrop(oldSchema, colIndex);
 
 		// Every physical consequence the schema rewrite implies for the `{table}_idx_{name}`
-		// stores falls out of one diff: old index list vs post-shift list, by name.
-		//
-		//   REMOVED  — the helper dropped the index outright (UNIQUE spanning the dropped
-		//              column, or a single-column index whose only column this was). Its store
-		//              must be torn down, mirroring `DROP INDEX`: nothing else reclaims it
-		//              (`reconcileImplicitUniqueIndexStores` covers only `_uc_*` names), and a
-		//              later `CREATE INDEX` of the same name would ADOPT the stale entries —
-		//              `getIndexStore` hands back the existing store, `buildIndexEntries`
-		//              appends, and `assertStoreNameFree` cannot catch it (it compares against
-		//              REGISTERED schema objects, and this index is no longer one), so a range
-		//              scan through the reused index yields rows twice.
-		//   NARROWED — the index survives having lost one of its columns, so its key layout
-		//              (one fewer value ahead of the PK suffix) changed and every pre-existing
-		//              entry still carries the WIDE encoding while all later maintenance uses
-		//              the narrow one — lookups miss rows and deletes orphan entries. Rebuild
-		//              the store, as the PK / collation arms do. Only a column-count change
-		//              matters: a survivor that keeps every column has its column INDICES
-		//              shifted but encodes the same values in the same order, so its key bytes
-		//              are unchanged.
-		//
-		// Both sets are drawn from the ENGINE-FACING schemas, which carry no `_uc_*` (see
+		// stores falls out of one diff — see {@link partitionIndexesByDropFate}. Both inputs
+		// are ENGINE-FACING schemas, which carry no `_uc_*` (see
 		// `StoreModuleBase.materializedIndexNames`), so the implicit UNIQUE stores stay out of
-		// both — they remain owned by `reconcileImplicitUniqueIndexStores`, which runs after
-		// this arm returns. A `_uc_*` never narrows anyway: a UNIQUE constraint spanning the
-		// dropped column is removed outright and a survivor keeps its whole column set.
-		const oldIndexes = oldSchema.indexes ?? [];
-		const survivors = new Map(shifted.indexes.map(ix => [ix.name.toLowerCase(), ix]));
-		const removedIndexes: TableIndexSchema[] = [];
-		const narrowedIndexes: TableIndexSchema[] = [];
-		for (const before of oldIndexes) {
-			const after = survivors.get(before.name.toLowerCase());
-			if (!after) {
-				removedIndexes.push(before);
-			} else if (after.columns.length !== before.columns.length) {
-				narrowedIndexes.push(after);
-			}
-		}
+		// both buckets — they remain owned by `reconcileImplicitUniqueIndexStores`, which runs
+		// after this arm returns. A `_uc_*` never narrows anyway: a UNIQUE constraint spanning
+		// the dropped column is removed outright and a survivor keeps its whole column set.
+		const { removed: removedIndexes, narrowed: narrowedIndexes } =
+			partitionIndexesByDropFate(oldSchema.indexes ?? [], shifted.indexes);
 
 		const updatedSchema: TableSchema = {
 			...oldSchema,
@@ -327,12 +298,12 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// Re-encode every narrowed index against the now-re-encoded data store. AFTER
 		// `migrateRows`: the rebuild reads the data store and encodes each entry from the
 		// NEW column layout. `rebuildSecondaryIndexes` clears and rebuilds every index in
-		// the schema it is handed, so handing it a schema whose `.indexes` holds only the
-		// narrowed ones keeps the pass off the untouched indexes. A narrowed index is
-		// necessarily non-UNIQUE (a UNIQUE one spanning the slot was removed outright), so
-		// the build's in-pass duplicate check is never exercised; and the engine rejects a
-		// DROP COLUMN whose column is named by a partial index's WHERE clause, so the pass
-		// can never meet a predicate over the departed column.
+		// the schema it is handed, so a schema whose `.indexes` holds only the narrowed ones
+		// keeps the pass off the untouched indexes. A narrowed index is necessarily
+		// non-UNIQUE (a UNIQUE one spanning the slot was removed outright), so the build's
+		// in-pass duplicate check is never exercised; and the engine rejects a DROP COLUMN
+		// whose column is named by a partial index's WHERE clause, so the pass can never
+		// meet a predicate over the departed column.
 		//
 		// NOTE: this widens a failure window the arm already had — `migrateRows` above has
 		// already re-encoded the rows outside the coordinator while the catalog still
@@ -686,4 +657,42 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 
 		return updatedSchema;
 	}
+}
+
+/**
+ * Which of `before`'s indexes DROP COLUMN's schema rewrite (`shiftSchemaIndicesForDrop`)
+ * left needing physical work, matched by lowercased name against the post-shift `after`:
+ *
+ *  - `removed` — gone from `after` outright (UNIQUE spanning the dropped column, or a
+ *    single-column index whose only column this was). Its store must be torn down,
+ *    mirroring `DROP INDEX`: nothing else reclaims it, and a later `CREATE INDEX` of the
+ *    same name would ADOPT the stale entries — `getIndexStore` hands back the existing
+ *    store, `buildIndexEntries` appends, and `assertStoreNameFree` cannot catch it (it
+ *    compares against REGISTERED schema objects, and this index is no longer one), so a
+ *    range scan through the reused index yields each row twice. Carries the PRE-shift
+ *    entry; only its name is used.
+ *  - `narrowed` — survives with a different column COUNT, so its key layout lost one
+ *    value ahead of the PK suffix while every pre-existing entry still carries the WIDE
+ *    encoding: lookups miss those rows and deletes orphan their entries. Its store must be
+ *    re-encoded. Carries the POST-shift entry, which is what the rebuild encodes from.
+ *
+ * A survivor whose column count is unchanged is in neither bucket: its column INDICES
+ * shifted, but it encodes the same values in the same order, so its key bytes do not move.
+ */
+function partitionIndexesByDropFate(
+	before: ReadonlyArray<TableIndexSchema>,
+	after: ReadonlyArray<TableIndexSchema>,
+): { removed: TableIndexSchema[]; narrowed: TableIndexSchema[] } {
+	const survivors = new Map(after.map(ix => [ix.name.toLowerCase(), ix]));
+	const removed: TableIndexSchema[] = [];
+	const narrowed: TableIndexSchema[] = [];
+	for (const old of before) {
+		const survivor = survivors.get(old.name.toLowerCase());
+		if (!survivor) {
+			removed.push(old);
+		} else if (survivor.columns.length !== old.columns.length) {
+			narrowed.push(survivor);
+		}
+	}
+	return { removed, narrowed };
 }
