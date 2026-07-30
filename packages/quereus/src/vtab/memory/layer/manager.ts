@@ -2,6 +2,7 @@ import type { Database } from '../../../core/database.js';
 import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from '../../../schema/table.js';
 import { keyParts, type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
+import { createValueSet } from '../../../util/value-set.js';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer, iteratePrimaryRows, populateIndexFromRows, populateIndexFromRowsAsync } from './base.js';
 import { TransactionLayer, type OwnWrite, type PreparedColumnReshape, type PreparedPrimaryKeyRekey } from './transaction.js';
@@ -1739,10 +1740,9 @@ export class MemoryTableManager {
 					}
 
 					// New-row keys (same PK comparator) for the delete pass's membership test.
-					const newKeys = new BTree<BTreeKeyForPrimary, BTreeKeyForPrimary>(
-						k => k,
-						this.comparePrimaryKeys,
-					);
+					// Entry is the bare PK value, so it must be a non-freezing set: a
+					// single-column BLOB PK is a `Uint8Array`, which `Object.freeze` rejects.
+					const newKeys = createValueSet<BTreeKeyForPrimary>(this.comparePrimaryKeys);
 
 					// Insert/update/skip-identical pass, in new-row order.
 					for (const newRow of op.rows) {

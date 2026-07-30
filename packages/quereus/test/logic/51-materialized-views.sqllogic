@@ -338,3 +338,39 @@ select tags from schema() where name = 'um_mv';
 
 drop materialized view um_mv;
 drop table um_src;
+
+-- ===================================
+-- BLOB backing primary key under the full-rebuild floor
+-- ===================================
+-- A `select distinct` body is maintained by the full-rebuild floor, which applies
+-- a single keyed 'replace-all' diff against the backing. That diff builds an
+-- in-memory set of the new rows' primary keys; a single-column BLOB PK is stored
+-- in it as a bare Uint8Array, which inheritree's default freeze-on-insert cannot
+-- hold (bug-in-subquery-blob-values-crash — Object.freeze rejects a non-empty
+-- array buffer view). Any source write to such an MV crashed.
+
+create table bpk_src (id integer primary key, b blob);
+insert into bpk_src values (1, x'6162'), (2, x'6164');
+create materialized view bpk_mv as select distinct b from bpk_src;
+
+select count(*) as n from bpk_mv;
+→ [{"n":2}]
+
+-- a source insert drives the rebuild diff: new key, and a duplicate that must not
+-- add a row
+insert into bpk_src values (3, x'6169'), (4, x'6162');
+select count(*) as n from bpk_mv;
+→ [{"n":3}]
+
+-- a delete that removes the last occurrence of a value drops it from the backing
+delete from bpk_src where b = x'6169';
+select count(*) as n from bpk_mv;
+→ [{"n":2}]
+
+-- explicit full rebuild over the same BLOB-keyed backing
+refresh materialized view bpk_mv;
+select count(*) as n from bpk_mv;
+→ [{"n":2}]
+
+drop materialized view bpk_mv;
+drop table bpk_src;

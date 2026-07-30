@@ -2,7 +2,11 @@ import { BTree } from 'inheritree';
 import type { SqlValue } from '../common/types.js';
 
 /**
- * BTree used as a set of SQL scalar values (IN membership, DISTINCT aggregates).
+ * BTree used as a set whose entry IS the value: IN membership, DISTINCT
+ * aggregates, primary-key membership in the backing 'replace-all' diff.
+ *
+ * Any BTree whose entry is a bare `SqlValue` (as opposed to a `Row` or a wrapper
+ * object, where freezing is shallow and harmless) must be built here.
  *
  * `freeze: false` is required, not an optimization: inheritree freezes each
  * stored entry by default, and `Object.freeze` throws on a non-empty
