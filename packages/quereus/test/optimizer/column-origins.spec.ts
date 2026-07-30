@@ -13,8 +13,7 @@ import { Database } from '../../src/core/database.js';
 import { PlanNode, type RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { FilterNode } from '../../src/planner/nodes/filter.js';
 import { ProjectNode } from '../../src/planner/nodes/project-node.js';
-import { TableReferenceNode } from '../../src/planner/nodes/reference.js';
-import { collectColumnOrigins, type ColumnOrigin } from '../../src/planner/util/column-origins.js';
+import { collectColumnOrigins, type ColumnOrigin, type RelationInstance } from '../../src/planner/util/column-origins.js';
 import type { TableSchema } from '../../src/schema/table.js';
 
 function walk(node: PlanNode, fn: (n: PlanNode) => void): void {
@@ -48,10 +47,10 @@ function findJoin(root: PlanNode): RelationalPlanNode {
 	return found;
 }
 
-/** Distinct originating TableReferenceNodes in an origin map. */
-function distinctRefs(origins: ReadonlyMap<number, ColumnOrigin>): Set<TableReferenceNode> {
-	const refs = new Set<TableReferenceNode>();
-	for (const o of origins.values()) refs.add(o.ref);
+/** Distinct originating relation instances in an origin map. */
+function distinctRefs(origins: ReadonlyMap<number, ColumnOrigin>): Set<RelationInstance> {
+	const refs = new Set<RelationInstance>();
+	for (const o of origins.values()) refs.add(o.relation);
 	return refs;
 }
 

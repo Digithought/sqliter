@@ -49,7 +49,10 @@
  * source attribute id for a bare column reference and mints a fresh one for a
  * computed expression, which is exactly the distinction wanted: `select cat as qty`
  * still reads `o.cat`'s statistics, while `select id * 7 as qty` reads none rather
- * than borrowing `o.qty`'s because the alias happens to collide.
+ * than borrowing `o.qty`'s because the alias happens to collide. A CTE reference
+ * republishes its body's columns under per-reference relation instances, so a `with`
+ * clause estimates like the equivalent subquery while the two arms of a CTE self-join
+ * still count as two relations — see `column-origins.ts`.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -58,9 +61,9 @@ import type { OptContext } from '../../framework/context.js';
 import type { TableSchema } from '../../../schema/table.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { BinaryOpNode } from '../../nodes/scalar.js';
-import { ColumnReferenceNode, type TableReferenceNode } from '../../nodes/reference.js';
+import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { extractRowSourceTableSchema } from '../../util/key-utils.js';
-import { collectColumnOrigins, type ColumnOrigin } from '../../util/column-origins.js';
+import { collectColumnOrigins, type ColumnOrigin, type RelationInstance } from '../../util/column-origins.js';
 import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { combineConjunctive } from '../../stats/selectivity-combine.js';
 import type { ColumnStatsResolver } from '../../stats/index.js';
@@ -211,9 +214,9 @@ function multiRelationSelectivity(
 }
 
 function countRelations(origins: ReadonlyMap<number, ColumnOrigin>): number {
-	const refs = new Set<TableReferenceNode>();
-	for (const origin of origins.values()) refs.add(origin.ref);
-	return refs.size;
+	const relations = new Set<RelationInstance>();
+	for (const origin of origins.values()) relations.add(origin.relation);
+	return relations.size;
 }
 
 /** Estimate one conjunct, or undefined when it cannot be attributed / estimated. */
@@ -222,19 +225,19 @@ function estimateConjunct(
 	origins: ReadonlyMap<number, ColumnOrigin>,
 	context: OptContext,
 ): number | undefined {
-	const refs = conjunctRelations(conjunct, origins);
-	if (refs === undefined) return undefined;
+	const relations = conjunctRelations(conjunct, origins);
+	if (relations === undefined) return undefined;
 
-	if (refs.size === 1) {
-		const [ref] = refs;
-		// Reference identity, not schema: `from t a join t b` gives two
-		// TableReferenceNodes sharing one TableSchema, so schema equality would not
-		// separate the sides. `conjunctRelations` has already established that this
-		// conjunct touches exactly this one reference.
-		const resolve = makeResolver(origins, origin => origin.ref === ref);
-		return singleRelationConjunct(ref.tableSchema, conjunct, resolve, context);
+	if (relations.size === 1) {
+		const [[relation, table]] = relations;
+		// Relation-instance identity, not schema: `from t a join t b` gives two
+		// instances sharing one TableSchema, so schema equality would not separate the
+		// sides. `conjunctRelations` has already established that this conjunct touches
+		// exactly this one instance.
+		const resolve = makeResolver(origins, origin => origin.relation === relation);
+		return singleRelationConjunct(table, conjunct, resolve, context);
 	}
-	if (refs.size === 2) {
+	if (relations.size === 2) {
 		return crossRelationConjunct(conjunct, origins, context);
 	}
 	// Three or more relations in one conjunct: no model for it here.
@@ -242,7 +245,8 @@ function estimateConjunct(
 }
 
 /**
- * The distinct relations a conjunct's column references come from.
+ * The distinct relation instances a conjunct's column references come from, each
+ * mapped to the schema whose statistics describe it.
  *
  * Returns undefined when the conjunct references no column at all, or references
  * any attribute that is not a base-table column (a computed projection, an
@@ -253,8 +257,8 @@ function estimateConjunct(
 function conjunctRelations(
 	conjunct: ScalarPlanNode,
 	origins: ReadonlyMap<number, ColumnOrigin>,
-): Set<TableReferenceNode> | undefined {
-	const refs = new Set<TableReferenceNode>();
+): Map<RelationInstance, TableSchema> | undefined {
+	const relations = new Map<RelationInstance, TableSchema>();
 	const stack: PlanNode[] = [conjunct];
 
 	while (stack.length > 0) {
@@ -262,13 +266,13 @@ function conjunctRelations(
 		if (n instanceof ColumnReferenceNode) {
 			const origin = origins.get(n.attributeId);
 			if (!origin) return undefined;
-			refs.add(origin.ref);
+			relations.set(origin.relation, origin.table);
 			continue;
 		}
 		for (const child of n.getChildren()) stack.push(child);
 	}
 
-	return refs.size > 0 ? refs : undefined;
+	return relations.size > 0 ? relations : undefined;
 }
 
 /**
