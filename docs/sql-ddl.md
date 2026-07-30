@@ -89,6 +89,30 @@ declare schema schema_name
 }
 ```
 
+#### Item keywords and bare aliases
+
+Items in a declaration block need no separator, so the leading keyword of an item
+sits exactly where the previous item's body would accept a bare (no-`as`) alias.
+To keep the boundary unambiguous, an item keyword — `table`, `index`, `unique`,
+`materialized`, `view`, `seed`, `assertion`, `domain`, `collation`, `import` —
+cannot be used as a *bare* alias at a position where an item could begin:
+
+```sql
+declare schema main {
+  view v1 as select id from t1 materialized   -- `materialized` is NOT an alias here
+  materialized view m2 as select id from t1
+}
+```
+
+If you want one of those words as an alias inside a declaration block, write it
+explicitly (`from t1 as materialized`), quote it (`from t1 "materialized"`), or
+separate the items with `;`. Outside a declaration block nothing is reserved:
+`select a from t1 materialized` still aliases `t1` as `materialized`.
+
+An item kind the parser doesn't model yet (`domain`, `collation`, `import`) is
+skipped up to the next `;`, the closing `}`, or the next item keyword — separate
+those items with `;` when their body could itself contain an item keyword.
+
 ### Diffing and Applying
 
 ```sql

@@ -323,12 +323,8 @@ describe('Schema Differ', () => {
 		});
 
 		it('throws on a duplicate declared materialized view name', () => {
-			// Both MV bodies are FROM-less: a `materialized view` item written directly
-			// after an item whose body ends at a FROM source is misparsed as a plain
-			// view (`materialized` is taken as a table alias — see ticket
-			// bug-declare-schema-materialized-swallowed-as-table-alias). Assert the
-			// item types so a parser regression cannot quietly turn this into a
-			// duplicate-*view* test.
+			// Assert the item types so a parser regression cannot quietly turn this into
+			// a duplicate-*view* test — see the bare-alias barrier in the parser.
 			const declared = parseDeclaredSchema(
 				`declare schema main {
 					materialized view mv as select 1 as one
@@ -337,6 +333,23 @@ describe('Schema Differ', () => {
 			);
 			expect(declared.items.map(i => i.type))
 				.to.deep.equal(['declaredMaterializedView', 'declaredMaterializedView']);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /Materialized view 'mv' is declared more than once in schema 'main'/);
+		});
+
+		it('throws on a duplicate materialized view whose bodies end at a FROM source', () => {
+			// `materialized` used to be absorbed as the preceding body's bare table
+			// alias, so the second item parsed as a plain view and the diagnostic read
+			// "declared as both a materialized view and a view" instead.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key }
+					materialized view mv as select id from t1
+					materialized view mv as select id from t1
+				}`
+			);
+			expect(declared.items.map(i => i.type))
+				.to.deep.equal(['declaredTable', 'declaredMaterializedView', 'declaredMaterializedView']);
 			expect(() => computeSchemaDiff(declared, makeCatalog()))
 				.to.throw(QuereusError, /Materialized view 'mv' is declared more than once in schema 'main'/);
 		});

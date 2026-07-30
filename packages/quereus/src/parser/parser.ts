@@ -37,6 +37,21 @@ function _createLoc(startToken: Token, endToken: Token): AST.AstNode['loc'] {
 }
 
 /**
+ * Leading keywords of a `declare schema { … }` item. Items carry no required
+ * separator, so these are barred from the bare-alias slot while an item body is
+ * parsed (see {@link Parser.withAliasBarrier}). The reserved ones are already safe
+ * — they lex to their own TokenType — but listing them keeps the set readable as
+ * "the item keywords". `DOMAIN` / `COLLATION` / `IMPORT` are the ignored kinds.
+ */
+const DECLARE_ITEM_KEYWORDS: ReadonlySet<string> = new Set([
+	'TABLE', 'INDEX', 'UNIQUE', 'MATERIALIZED', 'VIEW', 'SEED', 'ASSERTION',
+	'DOMAIN', 'COLLATION', 'IMPORT',
+]);
+
+/** Leading keyword of a `declare lens { … }` override; same separator-less shape. */
+const LENS_OVERRIDE_KEYWORDS: ReadonlySet<string> = new Set(['VIEW']);
+
+/**
  * IMPORTANT: Any changes to parsed syntax must also be reflected in the corresponding emitters:
  *   - packages/quereus/src/emit/ast-stringify.ts          (AST-to-SQL string conversion)
  *   - packages/quereus/src/schema/catalog.ts              (CREATE ASSERTION DDL for catalog/hashing)
@@ -50,6 +65,14 @@ export class Parser {
 	private parameterPosition = 1;
 	// Track opening parentheses for accurate error locations
 	private parenStack: Token[] = [];
+	/**
+	 * Bare (no-`as`) alias barrier. While a declaration-block item body is being
+	 * parsed, the leading keywords of a *sibling* item must not be absorbed as an
+	 * implicit alias — block items carry no required separator, so the alias slot
+	 * and the next item's first token compete for the same position. Scoped by a
+	 * stack so it never leaks into ordinary statements.
+	 */
+	private aliasBarriers: ReadonlySet<string>[] = [];
 
 	/**
 	 * Initialize the parser with tokens from a SQL string
@@ -62,6 +85,7 @@ export class Parser {
 		this.current = 0;
 		this.parameterPosition = 1; // Reset parameter counter
 		this.parenStack = [];
+		this.aliasBarriers = [];
 
 		// Check for errors from lexer
 		const errorToken = this.tokens.find(t => t.type === TokenType.ERROR);
@@ -907,7 +931,8 @@ export class Parser {
 				else if (this.checkIdentifierLike([]) &&
 					!this.checkNext(1, TokenType.LPAREN) &&
 					!this.checkNext(1, TokenType.DOT) &&
-					!this.isEndOfClause()) {
+					!this.isEndOfClause() &&
+					!this.atAliasBarrier()) {
 					const aliasToken = this.advance();
 					alias = this.getIdentifierValue(aliasToken);
 				}
@@ -2294,10 +2319,35 @@ export class Parser {
 		if (!this.checkIdentifierLike([]) ||
 			this.checkNext(1, TokenType.DOT) ||
 			this.isJoinToken() ||
-			this.isEndOfClause()) {
+			this.isEndOfClause() ||
+			this.atAliasBarrier()) {
 			return undefined;
 		}
 		return this.advance();
+	}
+
+	/**
+	 * Runs `parse` with `words` (uppercase lexemes) barred from the bare-alias slot.
+	 * See {@link aliasBarriers}; nesting is supported and the barrier always pops.
+	 */
+	private withAliasBarrier<T>(words: ReadonlySet<string>, parse: () => T): T {
+		this.aliasBarriers.push(words);
+		try {
+			return parse();
+		} finally {
+			this.aliasBarriers.pop();
+		}
+	}
+
+	/** True when the cursor sits on a bare identifier an active barrier reserves. */
+	private atAliasBarrier(): boolean {
+		if (this.aliasBarriers.length === 0) return false;
+		const token = this.peek();
+		// A quoted identifier carries `literal`; only bare words are ambiguous, so
+		// `"materialized"` stays usable as an alias.
+		if (token.type !== TokenType.IDENTIFIER || token.literal !== undefined) return false;
+		const upper = token.lexeme.toUpperCase();
+		return this.aliasBarriers.some(set => set.has(upper));
 	}
 
 	/**
@@ -2317,6 +2367,9 @@ export class Parser {
 	// NOTE: this is also the stop set for bare (no-`as`) aliases. Any new clause keyword
 	// that can follow a select item or table source must be added here, or it will be
 	// swallowed as an alias — unless it lexes to its own TokenType, which keeps it safe.
+	// A keyword that is only reserved *inside* an enclosing block (e.g. `materialized`
+	// between `declare schema` items) does not belong here — that is a different idea,
+	// handled by the scoped {@link atAliasBarrier} check at both bare-alias sites.
 	private isEndOfClause(): boolean {
 		const token = this.peek().type;
 		return token === TokenType.FROM ||
@@ -3568,40 +3621,12 @@ export class Parser {
 
 		while (!this.check(TokenType.RBRACE)) {
 			if (this.isAtEnd()) break;
-			// table ...
-			if (this.peekKeyword('TABLE')) {
-				this.advance();
-				items.push(this.declareTableItem());
-			} else if (this.peekKeyword('INDEX')) {
-				this.advance();
-				items.push(this.declareIndexItem(false));
-			} else if (this.peekKeyword('UNIQUE')) {
-				this.advance();
-				this.consumeKeyword('INDEX', "Expected 'INDEX' after 'UNIQUE'.");
-				items.push(this.declareIndexItem(true));
-			} else if (this.peekKeyword('MATERIALIZED')) {
-				this.advance();
-				this.consumeKeyword('VIEW', "Expected 'VIEW' after 'MATERIALIZED'.");
-				items.push(this.declareMaterializedViewItem());
-			} else if (this.peekKeyword('VIEW')) {
-				this.advance();
-				items.push(this.declareViewItem());
-			} else if (this.peekKeyword('SEED')) {
-				this.advance();
-				items.push(this.declareSeedItem());
-			} else if (this.peekKeyword('ASSERTION')) {
-				this.advance();
-				items.push(this.declareAssertionItem());
-			} else {
-				// Fallback: ignore unrecognized item (domain, collation, import)
-				const start = this.peek();
-				// consume until semicolon
-				while (!this.isAtEnd() && !this.check(TokenType.SEMICOLON) && !(this.check(TokenType.IDENTIFIER) && this.peek().lexeme === '}')) {
-					this.advance();
-				}
-				const endTok = this.previous();
-				items.push({ type: 'declareIgnored', kind: 'domain', text: this.sourceSlice(start.startOffset, endTok.endOffset) } as unknown as AST.DeclareIgnoredItem);
-			}
+			// A stray separator is not an item — otherwise it lands as an empty ignored one.
+			if (this.match(TokenType.SEMICOLON)) continue;
+			// Items need no separator, so a sibling item's leading keyword sits exactly
+			// where the previous body's bare alias would go. Bar those keywords from the
+			// alias slot for the duration of the item.
+			items.push(this.withAliasBarrier(DECLARE_ITEM_KEYWORDS, () => this.declareBlockItem()));
 			this.match(TokenType.SEMICOLON);
 		}
 
@@ -3609,6 +3634,95 @@ export class Parser {
 
 		const endTok = this.previous();
 		return { type: 'declareSchema', schemaName, version, using, items, ...(isLogical ? { isLogical: true } : {}), loc: _createLoc(startToken, endTok) };
+	}
+
+	/** Parses one item of a `declare schema { … }` block, dispatched on its leading keyword. */
+	private declareBlockItem(): AST.DeclareItem {
+		if (this.peekKeyword('TABLE')) {
+			this.advance();
+			return this.declareTableItem();
+		}
+		if (this.peekKeyword('INDEX')) {
+			this.advance();
+			return this.declareIndexItem(false);
+		}
+		if (this.peekKeyword('UNIQUE')) {
+			this.advance();
+			this.consumeKeyword('INDEX', "Expected 'INDEX' after 'UNIQUE'.");
+			return this.declareIndexItem(true);
+		}
+		if (this.peekKeyword('MATERIALIZED')) {
+			this.advance();
+			this.consumeKeyword('VIEW', "Expected 'VIEW' after 'MATERIALIZED'.");
+			return this.declareMaterializedViewItem();
+		}
+		if (this.peekKeyword('VIEW')) {
+			this.advance();
+			return this.declareViewItem();
+		}
+		if (this.peekKeyword('SEED')) {
+			this.advance();
+			return this.declareSeedItem();
+		}
+		if (this.peekKeyword('ASSERTION')) {
+			this.advance();
+			return this.declareAssertionItem();
+		}
+		return this.declareIgnoredItem();
+	}
+
+	/**
+	 * Fallback for an item kind the parser doesn't model yet (domain, collation, import):
+	 * skip its tokens and keep a placeholder so the surrounding block still parses.
+	 *
+	 * NOTE: an unrecognized item is retained only as opaque text — a typo'd item keyword
+	 * is therefore accepted and silently ignored rather than diagnosed. Diagnosing it
+	 * needs a real grammar for these kinds, not a tighter skip.
+	 */
+	private declareIgnoredItem(): AST.DeclareIgnoredItem {
+		const start = this.peek();
+		this.skipToDeclareItemBoundary();
+		const endTok = this.previous();
+		return { type: 'declareIgnored', kind: 'domain', text: this.sourceSlice(start.startOffset, endTok.endOffset) };
+	}
+
+	/**
+	 * Advances past the current declaration-block item, stopping at nesting depth 0 on
+	 * a `;`, the block's closing `}`, or the leading keyword of the next item. Brace and
+	 * paren depth is tracked so a braced column list or a parenthesized payload inside
+	 * the item doesn't end the scan early.
+	 *
+	 * NOTE: stopping on an item keyword is a heuristic — these kinds have no grammar
+	 * here, so the word `table` inside an unmodeled item would cut the skip short.
+	 * Separating the items with `;` is exact; if domain/collation/import ever gain real
+	 * bodies, give them a grammar rather than widening this scan.
+	 */
+	private skipToDeclareItemBoundary(): void {
+		// The item's own leading word may itself be an item keyword (`domain`, …), so
+		// always consume one token before testing for the next item's start.
+		this.advance();
+		let depth = 0;
+		while (!this.isAtEnd()) {
+			const type = this.peek().type;
+			if (depth === 0) {
+				if (type === TokenType.SEMICOLON || type === TokenType.RBRACE) return;
+				if (this.atDeclareItemStart()) return;
+			}
+			if (type === TokenType.LBRACE || type === TokenType.LPAREN) {
+				depth++;
+			} else if (type === TokenType.RBRACE || type === TokenType.RPAREN) {
+				depth--;
+			}
+			this.advance();
+		}
+	}
+
+	/** True when the cursor sits on a keyword that can begin a declaration-block item. */
+	private atDeclareItemStart(): boolean {
+		for (const keyword of DECLARE_ITEM_KEYWORDS) {
+			if (this.peekKeyword(keyword)) return true;
+		}
+		return false;
 	}
 
 	/**
@@ -3631,7 +3745,9 @@ export class Parser {
 			this.consumeKeyword('VIEW', "Expected 'view' to begin a lens override.");
 			const table = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected the logical table name after 'view'.");
 			this.consumeKeyword('AS', "Expected 'AS' after the logical table name.");
-			const body = this.parseQueryExpr();
+			// Overrides need no separator either; bar `view` from the body's alias slot
+			// (harmless today — `view` is reserved — but the shape is the same hazard).
+			const body = this.withAliasBarrier(LENS_OVERRIDE_KEYWORDS, () => this.parseQueryExpr());
 			if (body.type !== 'select') {
 				throw this.error(this.previous(), `A lens override body must be a SELECT; got '${body.type}'.`);
 			}
