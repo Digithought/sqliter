@@ -493,6 +493,17 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		expect(f!.selectivity).to.be.closeTo(combineConjunctive([1 / ndv['o.cat'], 1 / ndv['r.cat']]), 1e-12);
 	});
 
+	it('estimates a filter over a CTE reference inside a correlated subquery', () => {
+		// The correlation becomes the join condition and `c.cat = 'a'` stays as a residual
+		// Filter directly over the CTE reference — a shape the walk only reaches because
+		// `rule-filter-selectivity` fires on every Filter in the plan, not only the outermost.
+		const f = optimizedFilter(db,
+			'WITH c AS (SELECT cat, qty FROM o) SELECT * FROM r '
+			+ "WHERE EXISTS (SELECT 1 FROM c WHERE c.qty = r.qty AND c.cat = 'a')");
+		expect(f, 'expected a residual Filter over the CTE reference').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / ndv['o.cat'], 1e-12);
+	});
+
 	it('leaves a filter over a CTE whose body merges or regroups rows unstamped', () => {
 		// The remap stops where the body's own attribution stops: a set operation
 		// publishes one branch's ids over rows from both, and an aggregate's output is a
@@ -1008,6 +1019,25 @@ describe('single-table selectivity matches columns by identity, not by name', ()
 			expect(f, `${label}: expected a residual Filter`).to.not.be.undefined;
 			expect(f!.selectivity, `${label}: must read o.qty's statistics`).to.be.closeTo(1 / ndv.qty, 1e-12);
 		}
+	});
+
+	it('reads a base column through a CTE whose body reads a view', async () => {
+		// A view expands into the plan as an ordinary subquery, so the CTE's positional
+		// remap has to survive the extra Project the expansion adds.
+		await db.exec('CREATE VIEW ov AS SELECT id, cat, qty FROM o');
+		const f = optimizedFilter(db, 'WITH c AS (SELECT cat, qty FROM ov) SELECT * FROM c WHERE c.qty = 3');
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / ndv.qty, 1e-12);
+	});
+
+	it('reads a base column through a CTE referenced from a DML statement', () => {
+		// A `with` clause attached to INSERT/UPDATE/DELETE plans the same CTEReferenceNode
+		// as a SELECT does; the rule fires on the Filter inside the mutation's source.
+		const f = optimizedFilter(db,
+			'WITH c AS (SELECT id, cat, qty FROM o) '
+			+ 'INSERT INTO o (id, cat, qty) SELECT id + 1000, cat, qty FROM c WHERE c.qty = 3');
+		expect(f, 'expected a residual Filter over the CTE reference').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / ndv.qty, 1e-12);
 	});
 
 	it('does not charge a column computed inside a CTE body the statistics of its namesake', () => {

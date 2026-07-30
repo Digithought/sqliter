@@ -217,6 +217,18 @@ describe('collectColumnOrigins', () => {
 		}
 	});
 
+	it('gives three references to one CTE three distinct relation instances', () => {
+		// Two references only prove the instance is not the body's; a third proves the
+		// mint is per reference rather than a single alternate token shared by all of them.
+		const plan = optimized(db,
+			'with c as (select id, qty from o) select * from c x join c y on x.id = y.id join c z on z.id = x.id');
+		const origins = collectColumnOrigins(findJoin(plan));
+
+		expect(origins.size, 'two columns from each of the three references').to.equal(6);
+		expect(distinctRefs(origins).size, 'three distinct relation instances').to.equal(3);
+		expect(distinctSchemas(origins).size, 'one shared schema').to.equal(1);
+	});
+
 	it('omits a column computed inside a CTE body', () => {
 		const plan = optimized(db, 'with c as (select id, qty * 2 as q2 from o) select * from c where c.q2 = 3');
 		const ref = findFirst(plan, CTEReferenceNode);
