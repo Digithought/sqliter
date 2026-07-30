@@ -1,0 +1,20 @@
+-- 06.9.1.1-json-coerce-once-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 06.9.1-json-coerce-once (ticket
+-- json-native-form-write-path-coverage): CREATE INDEX needs standalone index
+-- DDL, which not every backend implements, and the requires-capability
+-- directive is whole-file — putting this case into the parent file would make
+-- its much larger scenario set skippable too. Kept minimal on purpose.
+--
+-- Subject: CREATE INDEX on a JSON column rebuilds every existing row's index
+-- entry; the stored JSON text scalar must survive untouched (not re-parsed).
+
+create table jco_ix (id integer primary key, j json);
+insert into jco_ix values (1, '"9"'), (2, '"null"');
+create index jco_ix_j on jco_ix (j);
+-- run
+
+select id, json_quote(j) as jq from jco_ix order by id;
+→ [{"id":1,"jq":"\"9\""},{"id":2,"jq":"\"null\""}]

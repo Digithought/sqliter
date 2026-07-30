@@ -29,6 +29,21 @@ update jco_txt set v = 'X';
 select j, v from jco_txt;
 → [{"j":"abc","v":"X"}]
 
+-- The same UPDATE-of-a-sibling-column shape for the three text scalars that
+-- would land in a DIFFERENT type if ever re-parsed: "true" (→ boolean),
+-- "null" (→ SQL NULL — a present value would vanish), "[1,2]" (→ a list).
+-- json_quote is the assertion of choice: it distinguishes the text scalar
+-- "9" from the number 9, which a bare select of the column does not.
+create table jco_shapes (j json primary key, v text);
+insert into jco_shapes values ('"true"', 'a'), ('"null"', 'b'), ('"[1,2]"', 'c');
+update jco_shapes set v = 'X' where v = 'a';
+update jco_shapes set v = 'Y' where v = 'b';
+update jco_shapes set v = 'Z' where v = 'c';
+-- run
+
+select json_quote(j) as jq, v from jco_shapes order by v;
+→ [{"jq":"\"true\"","v":"X"},{"jq":"\"null\"","v":"Y"},{"jq":"\"[1,2]\"","v":"Z"}]
+
 -- INSERT ... SELECT of a JSON column: the source cell is already a JSON value
 -- (static type JSON → skip conversion), so copying rows must neither re-parse
 -- nor throw.
@@ -218,3 +233,140 @@ insert into jco_u_dst select id, j from jco_u_src union all select 9, j from jco
 
 select id, json_quote(j) as q from jco_u_dst order by id;
 → [{"id":1,"q":"\"abc\""},{"id":9,"q":"\"abc\""}]
+
+-- ---------------------------------------------------------------------------
+-- Write-path coverage (ticket json-native-form-write-path-coverage). The
+-- scenarios above pin ordinary UPDATE, INSERT ... SELECT, upsert and generated
+-- columns. The paths below all rewrite EXISTING rows through a different code
+-- path — ALTER TABLE, transactions, savepoints, INSERT OR REPLACE, primary-key
+-- relocation — and are where a future regression in the "convert exactly
+-- once" invariant would actually land, because they rebuild rows rather than
+-- passing them through untouched. (standalone CREATE INDEX is covered
+-- separately, in 06.9.1.1-json-coerce-once-index.sqllogic — see the note
+-- there on why it can't live in this file.)
+
+-- ALTER TABLE ... ADD COLUMN with a plain default rewrites every row.
+create table jco_wp_addcol (id integer primary key, j json);
+insert into jco_wp_addcol values (1, '"9"'), (2, '"null"');
+alter table jco_wp_addcol add column x integer default 5;
+-- run
+
+select id, json_quote(j) as jq, x from jco_wp_addcol order by id;
+→ [{"id":1,"jq":"\"9\"","x":5},{"id":2,"jq":"\"null\"","x":5}]
+
+-- ...and with a NOT NULL default, which must also be satisfied per row.
+create table jco_wp_addcol_nn (id integer primary key, j json);
+insert into jco_wp_addcol_nn values (1, '"9"'), (2, '"null"');
+alter table jco_wp_addcol_nn add column x text not null default 'z';
+-- run
+
+select id, json_quote(j) as jq, x from jco_wp_addcol_nn order by id;
+→ [{"id":1,"jq":"\"9\"","x":"z"},{"id":2,"jq":"\"null\"","x":"z"}]
+
+-- ALTER TABLE ... ADD CONSTRAINT ... CHECK validates every existing row.
+create table jco_wp_chk (id integer primary key, j json, v integer);
+insert into jco_wp_chk values (1, '"9"', 1), (2, '"null"', 2);
+alter table jco_wp_chk add constraint jco_wp_chk_v check (v > 0);
+-- run
+
+select id, json_quote(j) as jq from jco_wp_chk order by id;
+→ [{"id":1,"jq":"\"9\""},{"id":2,"jq":"\"null\""}]
+
+-- ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE on a SIBLING column rewrites
+-- every row to convert that column — the untouched JSON column must ride along.
+create table jco_wp_retype (id integer primary key, j json, v text);
+insert into jco_wp_retype values (1, '"9"', '10'), (2, '"null"', '20');
+alter table jco_wp_retype alter column v set data type integer;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_retype order by id;
+→ [{"id":1,"jq":"\"9\"","v":10},{"id":2,"jq":"\"null\"","v":20}]
+
+-- INSERT OR REPLACE onto an existing JSON primary key deletes and re-inserts
+-- the row; the surviving key must be the CONFLICTING key, byte-identical.
+create table jco_wp_replace (j json primary key, v text);
+insert into jco_wp_replace values ('"9"', 'a');
+insert or replace into jco_wp_replace values ('"9"', 'X');
+-- run
+
+select json_quote(j) as jq, v from jco_wp_replace;
+→ [{"jq":"\"9\"","v":"X"}]
+
+-- DELETE then re-INSERT of the same JSON key exercises the same key bytes
+-- through two separate DML statements rather than one.
+create table jco_wp_delreins (j json primary key, v text);
+insert into jco_wp_delreins values ('"9"', 'a');
+delete from jco_wp_delreins where v = 'a';
+insert into jco_wp_delreins values ('"9"', 'b');
+-- run
+
+select json_quote(j) as jq, v from jco_wp_delreins;
+→ [{"jq":"\"9\"","v":"b"}]
+
+-- Two UPDATEs inside one transaction, then COMMIT.
+create table jco_wp_tx (id integer primary key, j json, v integer);
+insert into jco_wp_tx values (1, '"9"', 1), (2, '"null"', 2);
+begin;
+update jco_wp_tx set v = 10 where id = 1;
+update jco_wp_tx set v = 20 where id = 2;
+commit;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_tx order by id;
+→ [{"id":1,"jq":"\"9\"","v":10},{"id":2,"jq":"\"null\"","v":20}]
+
+-- UPDATE, SAVEPOINT, UPDATE, ROLLBACK TO SAVEPOINT, COMMIT: the row touched
+-- before the savepoint keeps its change; the row touched after it reverts.
+create table jco_wp_savepoint (id integer primary key, j json, v integer);
+insert into jco_wp_savepoint values (1, '"9"', 1), (2, '"null"', 2);
+begin;
+update jco_wp_savepoint set v = 10 where id = 1;
+savepoint s1;
+update jco_wp_savepoint set v = 99 where id = 2;
+rollback to savepoint s1;
+commit;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_savepoint order by id;
+→ [{"id":1,"jq":"\"9\"","v":10},{"id":2,"jq":"\"null\"","v":2}]
+
+-- Relocate a JSON primary key (changing the key value moves the row's storage
+-- position), then UPDATE the relocated row's sibling column.
+create table jco_wp_reloc (j json primary key, v text);
+insert into jco_wp_reloc values ('"9"', 'a');
+update jco_wp_reloc set j = '"null"' where v = 'a';
+-- run
+
+select json_quote(j) as jq, v from jco_wp_reloc;
+→ [{"jq":"\"null\"","v":"a"}]
+
+update jco_wp_reloc set v = 'b' where v = 'a';
+-- run
+
+select json_quote(j) as jq, v from jco_wp_reloc;
+→ [{"jq":"\"null\"","v":"b"}]
+
+-- Repeated writes: non-repeatable conversion decays PROGRESSIVELY, so
+-- checking only the last of several writes could miss a corruption introduced
+-- (and then further corrupted) partway through. Check after each of three
+-- successive UPDATEs of a sibling column, across all three shapes at once.
+create table jco_wp_repeat (id integer primary key, j json, v integer);
+insert into jco_wp_repeat values (1, '"9"', 1), (2, '"true"', 2), (3, '"[1,2]"', 3);
+
+update jco_wp_repeat set v = v + 1;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_repeat order by id;
+→ [{"id":1,"jq":"\"9\"","v":2},{"id":2,"jq":"\"true\"","v":3},{"id":3,"jq":"\"[1,2]\"","v":4}]
+
+update jco_wp_repeat set v = v + 1;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_repeat order by id;
+→ [{"id":1,"jq":"\"9\"","v":3},{"id":2,"jq":"\"true\"","v":4},{"id":3,"jq":"\"[1,2]\"","v":5}]
+
+update jco_wp_repeat set v = v + 1;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_repeat order by id;
+→ [{"id":1,"jq":"\"9\"","v":4},{"id":2,"jq":"\"true\"","v":5},{"id":3,"jq":"\"[1,2]\"","v":6}]
