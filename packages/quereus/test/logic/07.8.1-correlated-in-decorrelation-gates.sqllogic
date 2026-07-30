@@ -111,5 +111,46 @@ select a.x from a where not exists (select distinct 1 from b where b.id = a.id) 
 select a.x from a where not exists (select 1 from b where b.id = a.id limit 1) order by a.id;
 → [{"x":40}]
 
+-- ===== More inner roots the Project/Alias descent cannot step through. Each =====
+-- ===== leaves the correlated filter buried below, so the external-reference =====
+-- ===== backstop declines and the per-row path answers. =====
+
+-- CTE body inside the subquery
+select a.x from a where a.x in (with c as (select b.x from b where b.id = a.id) select c.x from c) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- aggregate root (one row per outer row, so IN sees a single value)
+select a.x from a where a.x in (select max(b.x) from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- grouped root
+select a.x from a where a.x in (select b.x from b where b.id = a.id group by b.x) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- window function in the inner projection
+select a.x from a where a.x in (select max(b.x) over () from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20}]
+
+-- EXCEPT / INTERSECT (the set-op cases beyond UNION)
+select a.x from a where a.x in (select b.x from b where b.id = a.id except select 99) order by a.id;
+→ [{"x":10},{"x":20}]
+
+select a.x from a where a.x in (select b.x from b where b.id = a.id intersect select 10) order by a.id;
+→ [{"x":10}]
+
+-- ===== Plain (non-negated) EXISTS over the same gated inner shapes: the =====
+-- ===== external-reference backstop sits on the shared correlated arm, so it =====
+-- ===== gates the EXISTS rewrite too. Every a row with a matching b row. =====
+
+select a.x from a where exists (select distinct b.x from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20},{"x":null},{"x":50},{"x":60},{"x":21},{"x":0}]
+
+select a.x from a where exists (select b.x + 0 from b where b.id = a.id) order by a.id;
+→ [{"x":10},{"x":20},{"x":null},{"x":50},{"x":60},{"x":21},{"x":0}]
+
+-- UNION arm adds a row unconditionally, so EXISTS is true for every a row
+select a.x from a where exists (select b.x from b where b.id = a.id union select 40) order by a.id;
+→ [{"x":10},{"x":20},{"x":null},{"x":40},{"x":50},{"x":60},{"x":21},{"x":0}]
+
 drop table a;
 drop table b;

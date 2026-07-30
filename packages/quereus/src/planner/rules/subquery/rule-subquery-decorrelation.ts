@@ -231,7 +231,11 @@ function extractInCorrelation(
 	// Walk through the subquery to find any additional correlation filters
 	let current: RelationalPlanNode = subqueryRoot;
 
-	// Skip Project and Alias nodes
+	// Skip Project and Alias nodes.
+	// NOTE: every other root (Distinct, SetOperation, Sort, CTE body, Aggregate, …)
+	// is caught only by the post-build external-reference backstop in
+	// decorrelateOneConjunct — widening this descent without keeping that backstop
+	// would silently bury the correlation inside the join's right side again.
 	while (current.nodeType === PlanNodeType.Project || current.nodeType === PlanNodeType.Alias) {
 		const children = current.getChildren();
 		const source = children[0];
