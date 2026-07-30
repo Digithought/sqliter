@@ -894,6 +894,22 @@ describe('introspection hiding', () => {
 		}
 	});
 
+	it('omits it under a MIXED-CASE constraint name too (exposure map is keyed lowercased)', async () => {
+		// The map `implicitCoveringIndexExposure` builds is lowercase-keyed. An
+		// unfolded lookup missed a mixed-case name, so the hidden structure landed in
+		// `catalog.indexes` unmarked — and the differ then read it as a real index to
+		// DROP (see the idempotency case below).
+		const db = await freshDb([
+			'create table t (id integer primary key, email text, constraint UQ_Email unique (email))',
+		]);
+		try {
+			const catalog = collectSchemaCatalog(db, 'main');
+			expect(catalog.indexes.find(i => i.tableName === 't'), 'no implicit index surfaced').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('surfaces it when the constraint carries quereus.expose_implicit_index = true', async () => {
 		const db = await freshDb([
 			'create table t (id integer primary key, x integer not null, constraint uq unique (x) with tags ("quereus.expose_implicit_index" = true))',
@@ -996,6 +1012,49 @@ describe('declarative idempotency — exposed implicit covering index', () => {
 			await db.close();
 		}
 	});
+});
+
+/**
+ * Declarative idempotency for a HIDDEN covering structure whose constraint name is
+ * mixed case. The exposure map is lowercase-keyed, so an unfolded lookup in
+ * `collectSchemaCatalog` let the structure through as an ordinary, unmarked index —
+ * one the declaration never mentions, so the differ scheduled a phantom
+ * `DROP INDEX "UQ_Email"` against a converged schema (ticket
+ * bug-drop-index-removes-unique-constraint-backing). Lowercase names never hit the
+ * bug, which is why it survived; the assertion is the diff is empty.
+ */
+describe('declarative idempotency — mixed-case hidden covering structure', () => {
+	const DECL = `declare schema main {
+		table MixedCaseUq {
+			id INTEGER PRIMARY KEY,
+			email TEXT,
+			constraint UQ_Email unique (email)
+		}
+	}`;
+
+	for (const policy of ['allow', 'require-hint'] as const) {
+		it(`converged schema diffs empty under rename_policy = '${policy}' (no phantom DROP INDEX)`, async () => {
+			const db = new Database();
+			try {
+				await db.exec(DECL);
+				await db.exec('apply schema main');
+
+				const catalog = collectSchemaCatalog(db, 'main');
+				expect(
+					catalog.indexes.find(i => i.tableName === 'MixedCaseUq'),
+					'hidden structure stays out of the catalog regardless of name casing',
+				).to.be.undefined;
+
+				const declared = db.declaredSchemaManager.getDeclaredSchema('main')!;
+				const diff = computeSchemaDiff(declared, catalog, policy);
+				expect(diff.indexesToDrop, 'no phantom DROP INDEX for the hidden structure').to.deep.equal([]);
+				expect(diff.indexesToCreate, 'no index create').to.deep.equal([]);
+				expect(generateMigrationDDL(diff, 'main'), 'converged: no migration DDL').to.deep.equal([]);
+			} finally {
+				await db.close();
+			}
+		});
+	}
 });
 
 /**

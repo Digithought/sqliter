@@ -205,7 +205,11 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 		if (tableSchema.indexes && tableSchema.indexes.length > 0) {
 			const implicit = implicitCoveringIndexExposure(tableSchema);
 			for (const indexSchema of tableSchema.indexes) {
-				const exposed = implicit.get(indexSchema.name);
+				// Map keys are lowercased (see `implicitCoveringIndexExposure`); without
+				// the fold a mixed-case constraint name leaks its hidden backing structure
+				// into the catalog as an ordinary index, which the declarative differ then
+				// tries to DROP.
+				const exposed = implicit.get(indexSchema.name.toLowerCase());
 				if (exposed === false) continue; // hidden implicit covering structure
 				// Mark only the *exposed* implicit covering structure (exposed === true);
 				// an ordinary index (absent from the exposure map ⇒ undefined) stays

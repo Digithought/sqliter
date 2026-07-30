@@ -2324,7 +2324,16 @@ export class SchemaManager {
 		}
 
 		const existingIndex = tableSchema.indexes?.find(idx => idx.name.toLowerCase() === indexName.toLowerCase());
-		if (existingIndex) {
+		// The implicit-covering term is what makes this refusal backend-independent.
+		// Memory materializes a constraint's backing structure as a real `IndexSchema`
+		// entry (so `existingIndex` alone catches it); the store keeps it out of the
+		// engine-facing `indexes` list entirely, and without this term `create index
+		// uq_email` would land on the *same* physical key-value store as the
+		// constraint's backing structure (`buildIndexStoreName` is a pure function of
+		// schema + table + index name). `isImplicitCoveringIndex` reads only
+		// `uniqueConstraints`, which both backends carry, so one term covers both.
+		const shadowsConstraintStructure = isImplicitCoveringIndex(tableSchema, indexName);
+		if (existingIndex || shadowsConstraintStructure) {
 			if (stmt.ifNotExists) {
 				log(`Skipping CREATE INDEX: Index %s.%s already exists (IF NOT EXISTS).`, targetSchemaName, indexName);
 				return;
@@ -2470,6 +2479,17 @@ export class SchemaManager {
 	 * Drops a secondary index from the table that owns it.
 	 * Searches all tables in the target schema to find the owning table.
 	 *
+	 * An implicit covering structure — the auto-built secondary BTree backing a
+	 * declared `UNIQUE` constraint, named after that constraint (or `_uc_<cols>`) —
+	 * is NOT droppable this way, exposed or not: its lifecycle belongs to the
+	 * constraint, so removing it means `ALTER TABLE … DROP CONSTRAINT`. The owner
+	 * scan therefore *skips and keeps scanning* past such a match rather than
+	 * stopping at it, so a real user index of the same name on another table is
+	 * still found (constraint names are unique per table, not per schema — see
+	 * {@link findIndexNameOwnerElsewhere}). With no owner found this falls through
+	 * to the `IF EXISTS` / `no such index` handling below, matching what
+	 * `ALTER INDEX … SET TAGS` already does with the same name.
+	 *
 	 * @param schemaName The schema to search in (e.g., "main")
 	 * @param indexName The name of the index to drop
 	 * @param ifExists If true, silently return if the index is not found
@@ -2482,13 +2502,21 @@ export class SchemaManager {
 		}
 
 		// Find which table owns this index
+		// NOTE: a table may hold a UNIQUE constraint whose name equals an unrelated
+		// user index's name on that same table (`create index foo on t (b); alter
+		// table t add constraint foo unique (a);` — both succeed today). There the
+		// predicate is true and this refuses the drop even though a real index also
+		// carries the name. That state is already broken in worse ways (memory
+		// materializes two entries literally named `foo`) and is tracked as
+		// bug-unique-constraint-name-collides-with-index-name; refusing is the
+		// conservative outcome — do not shape-match around it here.
 		const lowerIndexName = indexName.toLowerCase();
 		let ownerTable: TableSchema | undefined;
 		for (const table of schema.getAllTables()) {
-			if (table.indexes?.some(idx => idx.name.toLowerCase() === lowerIndexName)) {
-				ownerTable = table;
-				break;
-			}
+			const matched = table.indexes?.find(idx => idx.name.toLowerCase() === lowerIndexName);
+			if (!matched || isImplicitCoveringIndex(table, matched.name)) continue;
+			ownerTable = table;
+			break;
 		}
 
 		if (!ownerTable) {

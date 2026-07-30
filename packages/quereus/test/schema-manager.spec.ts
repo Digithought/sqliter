@@ -715,6 +715,57 @@ describe('Schema Manager', () => {
 			expect(error!.message).to.match(/already exists on table b/);
 		});
 
+		it('should refuse DROP INDEX on a hidden implicit covering index', async () => {
+			// The structure's lifecycle belongs to the constraint (ALTER INDEX already
+			// treats the name as NOTFOUND); DROP INDEX must agree rather than delete it
+			// behind the still-registered constraint's back.
+			await db.exec('create table t (id integer primary key, email text, constraint uq_email unique (email))');
+			let error: Error | undefined;
+			try {
+				await db.exec('drop index uq_email');
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error, 'implicit covering structure is not droppable by name').to.exist;
+			expect(error!.message).to.match(/no such index/);
+			// The constraint and its backing structure are both intact.
+			expect(db.schemaManager.findTable('t')!.uniqueConstraints!.map(uc => uc.name)).to.deep.equal(['uq_email']);
+			expect(db.schemaManager.findTable('t')!.indexes!.map(i => i.name)).to.deep.equal(['uq_email']);
+
+			// IF EXISTS degrades to a no-op, not a silent delete.
+			await db.exec('drop index if exists uq_email');
+			expect(db.schemaManager.findTable('t')!.indexes!.map(i => i.name)).to.deep.equal(['uq_email']);
+		});
+
+		it('should refuse DROP INDEX on an EXPOSED implicit covering index', async () => {
+			// Exposure makes the structure addressable for TAGS only — lifecycle still
+			// belongs to the constraint.
+			await db.exec('create table t (id integer primary key, email text, constraint uq_email unique (email) with tags ("quereus.expose_implicit_index" = true))');
+			let error: Error | undefined;
+			try {
+				await db.exec('drop index uq_email');
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error).to.exist;
+			expect(error!.message).to.match(/no such index/);
+			expect(db.schemaManager.findTable('t')!.indexes!.map(i => i.name)).to.deep.equal(['uq_email']);
+		});
+
+		it('should skip past an implicit match and keep scanning for the real owner', async () => {
+			// `uq_email` is a's constraint-backing structure AND c's ordinary index. The
+			// owner scan must not stop at a — otherwise DROP INDEX would delete a's
+			// backing structure and leave c's index in place.
+			await db.exec('create table a (id integer primary key, email text, constraint uq_email unique (email))');
+			await db.exec('create table c (id integer primary key, email text)');
+			await db.exec('create index uq_email on c (email)');
+
+			await db.exec('drop index uq_email');
+			expect(db.schemaManager.findTable('c')!.indexes ?? [], "c's real index dropped").to.have.lengthOf(0);
+			expect(db.schemaManager.findTable('a')!.indexes!.map(i => i.name), "a's backing structure untouched").to.deep.equal(['uq_email']);
+			expect(db.schemaManager.findTable('a')!.uniqueConstraints!.map(uc => uc.name)).to.deep.equal(['uq_email']);
+		});
+
 		it('should leave DROP INDEX unambiguous once the collision is rejected', async () => {
 			await db.exec('create table t1 (id integer primary key, note text)');
 			await db.exec('create table t2 (id integer primary key, note text)');

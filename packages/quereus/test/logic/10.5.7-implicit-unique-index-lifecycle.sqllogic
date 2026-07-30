@@ -1,0 +1,187 @@
+-- 10.5.7-implicit-unique-index-lifecycle.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- The implicit covering structure a declared UNIQUE constraint builds for
+-- enforcement is named after that constraint (or `_uc_<cols>` when unnamed), but
+-- it is NOT a user-addressable index: its lifecycle belongs to the constraint.
+-- `DROP INDEX <that name>` therefore raises `no such index` (IF EXISTS: no-op)
+-- and `CREATE INDEX <that name>` on the same table is refused as a duplicate.
+-- Removing the structure means dropping the constraint.
+--
+-- Runs on BOTH backends deliberately: memory materializes the structure as a
+-- real index entry, the store does not, and the guard reads `uniqueConstraints`
+-- (present on both) so the observable behavior must match.
+
+-- ============================================================
+-- 1. Named UNIQUE constraint — DROP INDEX refused, enforcement intact
+-- ============================================================
+create table iul_a (id integer primary key, email text, constraint uq_email unique (email));
+insert into iul_a values (1, 'a@x');
+-- run
+
+drop index uq_email;
+-- error: no such index
+
+drop index if exists uq_email;
+-- run
+
+-- Enforcement survives both attempts.
+insert into iul_a values (2, 'a@x');
+-- error: unique
+
+select count(*) as c from iul_a;
+→ [{"c":1}]
+
+-- The constraint is still registered.
+select count(*) as c from unique_constraint_info('iul_a') where name = 'uq_email';
+→ [{"c":1}]
+
+-- ============================================================
+-- 2. Named UNIQUE constraint — CREATE INDEX of the same name on the same table
+-- ============================================================
+create index uq_email on iul_a (email);
+-- error: already exists on table iul_a
+
+-- IF NOT EXISTS skips silently rather than erroring...
+create index if not exists uq_email on iul_a (email);
+-- run
+
+-- ...and adds nothing: the name is still only the constraint's backing structure.
+create index uq_email on iul_a (email);
+-- error: already exists on table iul_a
+
+-- ============================================================
+-- 3. Unnamed UNIQUE constraint — same rules under the auto-name `_uc_<cols>`
+-- ============================================================
+create table iul_u (id integer primary key, email text, unique (email));
+insert into iul_u values (1, 'u@x');
+-- run
+
+drop index _uc_email;
+-- error: no such index
+
+drop index if exists _uc_email;
+-- run
+
+create index _uc_email on iul_u (email);
+-- error: already exists on table iul_u
+
+insert into iul_u values (2, 'u@x');
+-- error: unique
+
+-- ============================================================
+-- 4. EXPOSED implicit structure — addressable for TAGS, still not for lifecycle
+-- ============================================================
+create table iul_e (id integer primary key, vin text,
+    constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true));
+insert into iul_e values (1, 'VIN1');
+-- run
+
+-- Exposure makes it visible and tag-addressable...
+alter index uq_vin add tags (purpose = 'lookup');
+select json_extract(tags, '$.purpose') as purpose from schema() where type = 'index' and name = 'uq_vin';
+→ [{"purpose":"lookup"}]
+
+-- ...but its lifecycle still belongs to the constraint.
+drop index uq_vin;
+-- error: no such index
+
+drop index if exists uq_vin;
+-- run
+
+create index uq_vin on iul_e (vin);
+-- error: already exists on table iul_e
+
+insert into iul_e values (2, 'VIN1');
+-- error: unique
+
+-- Still exposed after the refused drops.
+select count(*) as c from schema() where type = 'index' and name = 'uq_vin';
+→ [{"c":1}]
+
+-- ============================================================
+-- 5. Mixed-case constraint name — the guards fold case like every index compare
+-- ============================================================
+create table iul_z (id integer primary key, email text, constraint UQ_Email unique (email));
+insert into iul_z values (1, 'z@x');
+-- run
+
+drop index UQ_Email;
+-- error: no such index
+
+drop index uq_email;
+-- error: no such index
+
+create index uq_email on iul_z (email);
+-- error: already exists on table iul_z
+
+insert into iul_z values (2, 'z@x');
+-- error: unique
+
+-- ============================================================
+-- 6. An implicit name on ANOTHER table is a real, droppable index
+-- ============================================================
+-- Constraint names are unique per TABLE, so `uq_shared` may be a constraint on
+-- iul_b and an ordinary index on iul_c at the same time. The owner scan must
+-- skip past iul_b's implicit match and keep going, not stop at it.
+create table iul_b (id integer primary key, email text, constraint uq_shared unique (email));
+create table iul_c (id integer primary key, email text);
+create index uq_shared on iul_c (email);
+insert into iul_b values (1, 'b@x');
+insert into iul_c values (1, 'c@x'), (2, 'c2@x');
+-- run
+
+select id from iul_c where email = 'c2@x';
+→ [{"id":2}]
+
+-- Resolves to iul_c's real index, not iul_b's backing structure.
+drop index uq_shared;
+-- run
+
+-- iul_b's constraint is untouched and still enforcing.
+select count(*) as c from unique_constraint_info('iul_b') where name = 'uq_shared';
+→ [{"c":1}]
+
+insert into iul_b values (2, 'b@x');
+-- error: unique
+
+-- iul_c's rows survive the index drop and are still readable by the column.
+select id from iul_c where email = 'c2@x';
+→ [{"id":2}]
+
+-- The name is free again on iul_c.
+create index uq_shared on iul_c (email);
+-- run
+
+drop index uq_shared;
+-- run
+
+-- ============================================================
+-- 7. DROP CONSTRAINT is the way to remove the structure
+-- ============================================================
+alter table iul_a drop constraint uq_email;
+-- run
+
+select count(*) as c from unique_constraint_info('iul_a') where name = 'uq_email';
+→ [{"c":0}]
+
+-- Duplicate accepted once the constraint (and its backing structure) is gone.
+insert into iul_a values (2, 'a@x');
+select count(*) as c from iul_a;
+→ [{"c":2}]
+
+-- ...and the name is now an ordinary one on that table.
+create index uq_email on iul_a (email);
+-- run
+
+drop index uq_email;
+-- run
+
+drop table iul_c;
+drop table iul_b;
+drop table iul_z;
+drop table iul_e;
+drop table iul_u;
+drop table iul_a;
+-- run

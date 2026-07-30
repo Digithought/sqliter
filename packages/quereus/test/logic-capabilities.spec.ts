@@ -248,6 +248,7 @@ describe('sqllogic capability directive', () => {
 				'10.5.3-desc-index-ordering.sqllogic',
 				'10.5.4-composite-pk-index-update-phantom.sqllogic',
 				'10.5.5-index-name-uniqueness.sqllogic',
+				'10.5.7-implicit-unique-index-lifecycle.sqllogic',
 				'47.3.1-upsert-conflict-index-derived-collation.sqllogic',
 				'drop-unique-index.sqllogic',
 			];
