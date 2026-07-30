@@ -1040,9 +1040,34 @@ export const absFunc = createScalarFunction({
     logicalType: argTypes[0], // Return same type as input
     nullable: false
   }),
-  validateArgTypes: (argTypes) => argTypes[0].isNumeric
+  validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 }, absImpl);
 ```
+
+### Omitting the return type
+
+Declaring neither `returnType` nor `inferReturnType` yields `ANY_TYPE` — the engine's
+"unknown scalar type". This is safe but not free:
+
+- `ANY_TYPE` sets neither `isNumeric` nor `isTextual`, so `insertCrossTypeCoercion`
+  (`planner/building/coercion.ts`) leaves both operands of a comparison alone and the
+  generic runtime comparison decides. That is the correct answer for an unknown type, but
+  it forfeits plan-time typing and comparison specialization (the `compare-fast` path in
+  `runtime/emit/binary.ts`).
+- So **declare the real type whenever you know it**. A wrong declared type is worse than
+  none: while the default was `REAL_TYPE`, the planner believed every undeclared function
+  returned a number and cast the *other* side of a comparison to REAL, so
+  `my_text_func(x) = 'abc'` silently became `… = 0` and was always false.
+- `Database.createScalarFunction` / `createAggregateFunction` never pass a `returnType`, so
+  every user- and plugin-registered function lands on this default.
+
+Because of that default, **`validateArgTypes` must let an argument through whose type the
+planner cannot classify** — rejecting `ANY` at plan time makes the function unusable over
+any user-defined function's result. Use the shared
+`isNumericOrUnknownType` predicate (`types/builtin-types.ts`) rather than a bare
+`isNumeric` check: it accepts a numeric type, `ANY`, or `NULL`, and defers the decision to
+the implementation, which returns null for input it cannot use. (Accepting `NULL` is also
+what makes `abs(null)` return null instead of raising `Invalid argument types`.)
 
 ### Built-in Polymorphic Functions
 

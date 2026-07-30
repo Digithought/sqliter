@@ -2,7 +2,7 @@ import type { AggregateFinalizer, AggregateReducer, IntegratedTableValuedFunc, S
 	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, AggregateArgBinding, TVFAdvertisement } from '../schema/function.js';
 import { FunctionFlags } from '../common/constants.js';
 import type { ScalarType, RelationType } from '../common/datatype.js';
-import { REAL_TYPE } from '../types/builtin-types.js';
+import { ANY_TYPE } from '../types/builtin-types.js';
 import type { LogicalType } from '../types/logical-type.js';
 import type { DeepReadonly } from '../common/types.js';
 
@@ -141,9 +141,17 @@ interface AggregateFuncOptions {
  * @returns A FunctionSchema ready for registration
  */
 export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarFunc): ScalarFunctionSchema {
+	// An undeclared return type is genuinely unknown, so it defaults to ANY rather
+	// than guessing. A concrete guess is worse than no answer: while this defaulted to
+	// REAL, the planner believed every undeclared function returned a number and
+	// `insertCrossTypeCoercion` cast the *other* side of a comparison to REAL —
+	// `my_text_udf(x) = 'abc'` silently became `… = 0`. ANY sets neither isNumeric nor
+	// isTextual, so coercion leaves both operands alone and the generic runtime
+	// comparison decides. Declare `returnType` when you know it: ANY is safe but
+	// forfeits plan-time typing and comparison specialization.
 	const returnType: ScalarType = options.returnType ?? {
 		typeClass: 'scalar',
-		logicalType: REAL_TYPE,
+		logicalType: ANY_TYPE,
 		nullable: true,
 		isReadOnly: true
 	};
@@ -245,9 +253,13 @@ export function createAggregateFunction(
 	stepFunc: AggregateReducer,
 	finalizeFunc: AggregateFinalizer
 ): AggregateFunctionSchema {
+	// Unknown rather than guessed — see the note in createScalarFunction. No built-in
+	// aggregate rides this default (every one declares a type or supplies
+	// inferReturnType); it guards user-defined aggregates registered through
+	// Database.createAggregateFunction.
 	const returnType: ScalarType = options.returnType ?? {
 		typeClass: 'scalar',
-		logicalType: REAL_TYPE,
+		logicalType: ANY_TYPE,
 		nullable: true,
 		isReadOnly: true
 	};

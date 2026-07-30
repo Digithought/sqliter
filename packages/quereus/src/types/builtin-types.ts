@@ -1,5 +1,6 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { compareSqlValuesFast, BINARY_COLLATION } from '../util/comparison.js';
+import type { DeepReadonly } from '../common/types.js';
 
 /**
  * Orders a non-null `number | bigint` pair. JS relational operators compare the two
@@ -326,4 +327,25 @@ export const ANY_TYPE: LogicalType = {
 
 	compare: (a, b) => compareSqlValuesFast(a, b, BINARY_COLLATION),
 };
+
+/**
+ * Plan-time argument gate for the numeric builtins (`abs`, `round`, `sqrt`, `floor`,
+ * `ceil`, `clamp`, …), for use from `validateArgTypes`. Accepts three things:
+ *
+ * - a numeric type — the intended case;
+ * - `ANY` — a type the planner cannot classify, e.g. a function registered without a
+ *   declared `returnType`. Rejecting it at plan time would make `abs(my_udf(x))`
+ *   unusable for no gain, so the decision defers to the implementation, which returns
+ *   null for input it cannot use;
+ * - `NULL` — `abs(null)` is null in SQL, not an error, and every numeric builtin's
+ *   implementation already short-circuits a null argument.
+ *
+ * Textual/blob/boolean arguments are still rejected at plan time, as before.
+ */
+export function isNumericOrUnknownType(type: DeepReadonly<LogicalType>): boolean {
+	// NOTE: identity against the singletons, matching how coercion.ts tests NULL_TYPE.
+	// If a plugin ever registers its own distinct type object named 'ANY' or 'NULL'
+	// (types/registry.ts), this stops recognizing it — switch to a `name` comparison then.
+	return type.isNumeric === true || type === ANY_TYPE || type === NULL_TYPE;
+}
 

@@ -1,0 +1,186 @@
+-- undeclared-return-type-comparison.sqllogic
+-- A function registered without a declared `returnType` reports ANY (unknown), not REAL.
+-- While the default was REAL, the planner believed every such function returned a number,
+-- so `insertCrossTypeCoercion` cast the TEXT side of a comparison to REAL — the literal
+-- 'object' became 0 and `json_type(j) = 'object'` was FALSE. Most builtins declare no
+-- return type (all of datetime.ts, nearly all of json.ts and string.ts), so the whole
+-- family was affected; ticket 1-scalar-function-default-return-type-any.
+--
+-- The user-defined-function half of this (Database.createScalarFunction never passes a
+-- returnType) lives in test/core-api-features.spec.ts — a .sqllogic file cannot register
+-- one.
+--
+-- No `using memory`, so store mode exercises the persisted path too.
+
+create table urt (id integer primary key, j json, d text, n integer);
+insert into urt values (1, '{"a":"x"}', '2024-03-04', 5);
+-- run
+
+-- ===================================
+-- 1. The reproducing comparisons — every one of these was FALSE
+-- ===================================
+select json_type(j) = 'object' as r from urt;
+→ [{"r":true}]
+
+select json_extract(j, '$.a') = 'x' as r from urt;
+→ [{"r":true}]
+
+select strftime('%Y', d) = '2024' as r from urt;
+→ [{"r":true}]
+
+-- json_quote returns the JSON source as TEXT, so this compares two plain strings.
+select json_quote(j) = '{"a":"x"}' as r from urt;
+→ [{"r":true}]
+
+-- Literal on the LEFT is the same coercion, mirrored.
+select 'object' = json_type(j) as r from urt;
+→ [{"r":true}]
+
+-- The complement is honest too (it was TRUE for every row before).
+select json_type(j) <> 'object' as r from urt;
+→ [{"r":false}]
+
+-- Unequal text is still unequal — the fix is not "always true".
+select json_type(j) = 'array' as r from urt;
+→ [{"r":false}]
+
+-- WHERE position, not just the select list.
+select id from urt where json_type(j) = 'object';
+→ [{"id":1}]
+
+select id from urt where strftime('%Y', d) = '2024';
+→ [{"id":1}]
+
+-- ===================================
+-- 2. The other comparison sites agree with `=`
+-- ===================================
+select json_type(j) in ('object') as r from urt;
+→ [{"r":true}]
+
+select case json_type(j) when 'object' then 'yes' else 'no' end as r from urt;
+→ [{"r":"yes"}]
+
+select json_type(j) between 'a' and 'z' as r from urt;
+→ [{"r":true}]
+
+select json_type(j) like 'obj%' as r from urt;
+→ [{"r":true}]
+
+-- An ANY-typed value against a number is simply unequal, not an error.
+select json_type(j) = 3 as r from urt;
+→ [{"r":false}]
+
+-- ===================================
+-- 3. ANY vs JSON still takes the object-physical arm of insertCrossTypeCoercion
+-- ===================================
+-- ANY is not NULL, so the arm is not skipped: the ANY side is cast to JSON. 'object' is
+-- not JSON source, so the lenient cast leaves it as the raw string, which does not equal
+-- the object {"a":"x"}. Same answer a TEXT operand gives. Pinned deliberately.
+select json_type(j) = j as r from urt;
+→ [{"r":false}]
+
+-- The JSON source text spelled by json_quote DOES parse, so it matches structurally.
+select json_quote(j) = j as r from urt;
+→ [{"r":true}]
+
+-- ===================================
+-- 4. An ANY-typed value still works everywhere else it has always worked
+-- ===================================
+select json_type(j) || '!' as r from urt;
+→ [{"r":"object!"}]
+
+select length(json_type(j)) as r from urt;
+→ [{"r":6}]
+
+select coalesce(json_type(j), 'none') as r from urt;
+→ [{"r":"object"}]
+
+select nullif(json_type(j), 'object') as r from urt;
+→ [{"r":null}]
+
+select cast(json_type(j) as text) = 'object' as r from urt;
+→ [{"r":true}]
+
+select typeof(json_type(j)) as r from urt;
+→ [{"r":"text"}]
+
+-- Identity sites (ORDER BY / GROUP BY / DISTINCT / min / max) rank an ANY-typed value
+-- as text, as they always did.
+insert into urt values (2, '[1]', '2023-01-02', 7);
+-- run
+
+select json_type(j) as r from urt order by json_type(j);
+→ [{"r":"array"},{"r":"object"}]
+
+select min(json_type(j)) as mn, max(json_type(j)) as mx from urt;
+→ [{"mn":"array","mx":"object"}]
+
+select json_type(j) as g, count(*) as c from urt group by json_type(j) order by g;
+→ [{"g":"array","c":1},{"g":"object","c":1}]
+
+select count(*) as c from (select distinct json_type(j) from urt);
+→ [{"c":2}]
+
+-- ===================================
+-- 5. The numeric builtins accept an unclassifiable argument
+-- ===================================
+-- abs/round/sqrt/floor/ceil/clamp gate their argument at plan time on isNumeric. With an
+-- honest ANY default that gate has to mean "numeric, or not yet known"
+-- (isNumericOrUnknownType) or `abs(<undeclared function>)` becomes unusable.
+select abs(json_extract(j, '$.a')) as r from urt where id = 1;
+→ [{"r":null}]
+
+-- ===================================
+-- 6. NULL passes the same gate: abs(null) is null in SQL, not an error
+-- ===================================
+-- These all threw "Invalid argument types for function <name>" before, including at HEAD
+-- before the default changed.
+select abs(null) as r;
+→ [{"r":null}]
+
+select round(null) as r;
+→ [{"r":null}]
+
+select round(null, 1) as r;
+→ [{"r":null}]
+
+select sqrt(null) as r;
+→ [{"r":null}]
+
+select floor(null) as r;
+→ [{"r":null}]
+
+select ceil(null) as r;
+→ [{"r":null}]
+
+select ceiling(null) as r;
+→ [{"r":null}]
+
+-- clamp's implementation reaches Number() for all three arguments at once, so its null
+-- short-circuit is explicit — Number(null) is 0, which would return the lower bound.
+select clamp(null, 1, 2) as r;
+→ [{"r":null}]
+
+select clamp(5, null, 10) as r;
+→ [{"r":null}]
+
+select clamp(5, 1, null) as r;
+→ [{"r":null}]
+
+-- ===================================
+-- 7. A textual argument is still rejected at plan time
+-- ===================================
+-- Widening the gate to ANY and NULL must not widen it to TEXT.
+select abs('abc') as r;
+-- error: Invalid argument types for function abs
+
+select floor('abc') as r;
+-- error: Invalid argument types for function floor
+
+select clamp('a', 1, 2) as r;
+-- error: Invalid argument types for function clamp
+
+select abs(d) as r from urt;
+-- error: Invalid argument types for function abs
+
+drop table urt;

@@ -2,7 +2,7 @@ import type { SqlValue, DeepReadonly } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { compareSqlValues, getSqlDataTypeName } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { ANY_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
+import { ANY_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, isNumericOrUnknownType } from '../../types/builtin-types.js';
 import type { CustomEmitterHook } from '../../schema/function.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
@@ -64,8 +64,8 @@ export const absFunc = createScalarFunction(
 			nullable: false,
 			isReadOnly: true
 		}),
-		// Validate that the argument is numeric
-		validateArgTypes: (argTypes) => argTypes[0].isNumeric === true
+		// Validate that the argument is numeric (or unclassifiable — see the helper)
+		validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 	},
 	(arg: SqlValue): SqlValue => {
 		if (arg === null) return null;
@@ -107,7 +107,7 @@ const roundSchemaBase = {
 		nullable: false,
 		isReadOnly: true
 	}),
-	validateArgTypes: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => argTypes[0].isNumeric === true
+	validateArgTypes: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => isNumericOrUnknownType(argTypes[0])
 };
 
 export const roundFunc1 = createScalarFunction(
@@ -307,7 +307,7 @@ export const sqrtFunc = createScalarFunction(
 			nullable: false,
 			isReadOnly: true
 		}),
-		validateArgTypes: (argTypes) => argTypes[0].isNumeric === true
+		validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 	},
 	(arg: SqlValue): SqlValue => {
 		if (arg === null) return null;
@@ -350,7 +350,7 @@ export const floorFunc = createScalarFunction(
 			nullable: false,
 			isReadOnly: true
 		}),
-		validateArgTypes: (argTypes) => argTypes[0].isNumeric === true
+		validateArgTypes: (argTypes) => isNumericOrUnknownType(argTypes[0])
 	},
 	(arg: SqlValue): SqlValue => {
 		if (arg === null) return null;
@@ -376,7 +376,7 @@ const ceilTypeInference = {
 		nullable: false,
 		isReadOnly: true
 	}),
-	validateArgTypes: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => argTypes[0].isNumeric === true
+	validateArgTypes: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => isNumericOrUnknownType(argTypes[0])
 };
 
 export const ceilFunc = createScalarFunction(
@@ -402,9 +402,13 @@ export const clampFunc = createScalarFunction(
 			nullable: true,
 			isReadOnly: true
 		}),
-		validateArgTypes: (argTypes) => argTypes[0].isNumeric === true && argTypes[1].isNumeric === true && argTypes[2].isNumeric === true
+		validateArgTypes: (argTypes) => argTypes.every(isNumericOrUnknownType)
 	},
 	(value: SqlValue, min: SqlValue, max: SqlValue): SqlValue => {
+		// Unlike the other numeric builtins, clamp's arguments reach Number() together,
+		// so the null short-circuit has to be explicit: Number(null) is 0, which would
+		// make clamp(null, 1, 2) return 1 instead of null.
+		if (value === null || min === null || max === null) return null;
 		const v = Number(value);
 		const minVal = Number(min);
 		const maxVal = Number(max);
