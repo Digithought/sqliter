@@ -65,12 +65,45 @@ function buildSeedConflictClause(tableSchema: TableSchema): string {
 		: ' on conflict do nothing';
 }
 
+/**
+ * First table named by two `seed` blocks in one declaration, or undefined. Pure walk.
+ *
+ * Seed data is stored one block per table (`setSeedData` is a `Map.set` keyed by
+ * lowercased table name), so a second block for the same table used to silently
+ * discard the first block's rows. Two blocks for one table have no defined meaning
+ * today — rejecting loses nothing an author can rely on, and appending would be a
+ * new semantic, not a bug fix. Invisible to the differ, which ignores seed items
+ * entirely, so the guard lives here at declare time. See SCH-003.
+ *
+ * Returns the table name as written on the SECOND block.
+ */
+function findDuplicateSeedTable(items: readonly AST.DeclareItem[]): string | undefined {
+	const seen = new Set<string>();
+	for (const item of items) {
+		if (item.type !== 'declaredSeed') continue;
+		const key = item.tableName.toLowerCase();
+		if (seen.has(key)) return item.tableName;
+		seen.add(key);
+	}
+	return undefined;
+}
+
 export function emitDeclareSchema(plan: PlanNode, _ctx: EmissionContext): Instruction {
 	const declareStmt = (plan as unknown as { statementAst: AST.DeclareSchemaStmt }).statementAst;
 
 	const run = (rctx: RuntimeContext): Row => {
 		const schemaName = declareStmt.schemaName || 'main';
 		log('DECLARE SCHEMA %s', schemaName);
+
+		// Reject before touching any stored state, so a rejected declaration
+		// neither stores seed rows nor clobbers the prior declaration.
+		const duplicateSeed = findDuplicateSeedTable(declareStmt.items);
+		if (duplicateSeed) {
+			throw new QuereusError(
+				`Seed data for table '${duplicateSeed}' is declared more than once in schema '${schemaName}'`,
+				StatusCode.ERROR,
+			);
+		}
 
 		// Clear previous declaration and seed data for this schema
 		rctx.db.declaredSchemaManager.clearSeedData(schemaName);

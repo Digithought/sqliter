@@ -1022,6 +1022,22 @@ leaves the generator emitting a key the table no longer has, and on a composite�
 emits two inline `PRIMARY KEY` clauses that a re-parse silently merges back into the
 retired composite key.
 
+### SCH-003 — A declared schema names each object once
+
+- code: `packages/quereus/src/schema/schema-differ.ts` — `findDuplicateDeclaredName`
+- code: `packages/quereus/src/runtime/emit/schema-declarative.ts` — `findDuplicateSeedTable`
+- guard: `packages/quereus/test/schema-differ.spec.ts` — `duplicate declared object names (SCH-003)`
+- doc: [SQL DDL § Declaration Syntax](sql-ddl.md#declaration-syntax)
+
+Every map the differ collects declarations into is keyed schema-wide by lowercased name, so a
+repeated declaration would last-writer-wins and drop the first silently. `computeSchemaDiff`
+rejects the first collision in declaration order, on both the physical and the logical path,
+after the reserved-tag diagnostics so a tag typo still surfaces first. Three namespaces:
+`table` / `view` / `materialized view` share one (the engine enforces that too, so a cross-kind
+clash could only half-apply then fail mid-migration), while `index` (SCH-001) and `assertion`
+each have their own. Seed blocks are keyed by target table and guarded at declare time — the
+differ never sees them.
+
 ## SYNC — Sync
 
 Reserved.

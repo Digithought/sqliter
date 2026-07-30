@@ -1,0 +1,211 @@
+-- 50.3-declare-schema-duplicate-names.sqllogic
+--
+-- A declared schema names each object once (docs/invariants.md SCH-003).
+-- Every `declared*` map in the differ's collection loop is keyed schema-wide by
+-- lowercased name, so a repeated declaration used to silently last-writer-wins:
+-- the first declaration never reached the migration and no diagnostic fired.
+
+-- ===================================
+-- 1. Same-kind duplicates
+-- ===================================
+
+declare schema dup_table using (default_vtab_module = 'memory') {
+	table t1 {
+		id integer primary key,
+		a text
+	}
+
+	table t1 {
+		id integer primary key,
+		b text
+	}
+}
+
+-- run
+
+diff schema dup_table;
+-- error: Table 't1' is declared more than once in schema 'dup_table'
+
+-- `apply schema` surfaces the same rejection, before any DDL runs.
+apply schema dup_table;
+-- error: Table 't1' is declared more than once in schema 'dup_table'
+
+-- Names compare case-insensitively.
+declare schema dup_table_case using (default_vtab_module = 'memory') {
+	table T1 {
+		id integer primary key,
+		a text
+	}
+
+	table t1 {
+		id integer primary key,
+		b text
+	}
+}
+
+-- run
+
+diff schema dup_table_case;
+-- error: Table 't1' is declared more than once in schema 'dup_table_case'
+
+declare schema dup_view using (default_vtab_module = 'memory') {
+	table t1 {
+		id integer primary key,
+		a text
+	}
+
+	view v as select id as x from t1
+
+	view v as select a as y from t1
+}
+
+-- run
+
+diff schema dup_view;
+-- error: View 'v' is declared more than once in schema 'dup_view'
+
+-- Both materialized-view bodies are FROM-less on purpose: a `materialized view`
+-- item written directly after an item whose body ends at a FROM source is
+-- misparsed (`materialized` is taken as a table alias) — see ticket
+-- bug-declare-schema-materialized-swallowed-as-table-alias.
+declare schema dup_mv using (default_vtab_module = 'memory') {
+	materialized view mv as select 1 as one
+
+	materialized view mv as select 2 as two
+}
+
+-- run
+
+diff schema dup_mv;
+-- error: Materialized view 'mv' is declared more than once in schema 'dup_mv'
+
+-- Assertions live in main.
+declare schema main {
+	table dup_assert_t {
+		id integer primary key,
+		n integer
+	}
+
+	assertion ck check (not exists (select 1 from dup_assert_t where n < 0))
+
+	assertion ck check (not exists (select 1 from dup_assert_t where n < 1))
+}
+
+-- run
+
+diff schema main;
+-- error: Assertion 'ck' is declared more than once in schema 'main'
+
+-- ===================================
+-- 2. Cross-kind duplicates (table / view / materialized view share one namespace)
+-- ===================================
+
+-- `Schema.addView` rejects a view whose name a table already holds, so this
+-- declaration could never apply — it used to emit both CREATEs, run the table
+-- create, then fail deep in the migration loop leaving the table behind.
+declare schema dup_cross using (default_vtab_module = 'memory') {
+	table dual {
+		id integer primary key
+	}
+
+	view dual as select 1 as one
+}
+
+-- run
+
+diff schema dup_cross;
+-- error: 'dual' is declared as both a table and a view in schema 'dup_cross'
+
+-- Kinds are named in declaration order.
+declare schema dup_cross_rev using (default_vtab_module = 'memory') {
+	view dual as select 1 as one
+
+	table dual {
+		id integer primary key
+	}
+}
+
+-- run
+
+diff schema dup_cross_rev;
+-- error: 'dual' is declared as both a view and a table in schema 'dup_cross_rev'
+
+declare schema dup_cross_mv using (default_vtab_module = 'memory') {
+	table mv {
+		id integer primary key
+	}
+
+	materialized view mv as select 1 as one
+}
+
+-- run
+
+diff schema dup_cross_mv;
+-- error: 'mv' is declared as both a table and a materialized view in schema 'dup_cross_mv'
+
+-- ===================================
+-- 3. Duplicate seed blocks (rejected at declare time, not diff time)
+-- ===================================
+
+-- Seed rows are stored one block per table, so a second block for the same table
+-- used to discard the first block's rows. The differ never sees seed items, so
+-- the guard runs when the declaration is stored — nothing is stored at all.
+declare schema dup_seed using (default_vtab_module = 'memory') {
+	table t {
+		id integer primary key,
+		n integer
+	}
+
+	seed t (
+		(1, 10)
+	)
+
+	seed t (
+		(2, 20)
+	)
+}
+-- error: Seed data for table 't' is declared more than once in schema 'dup_seed'
+
+-- The rejected declaration was not stored.
+diff schema dup_seed;
+-- error: No declared schema found for 'dup_seed'
+
+-- ===================================
+-- 4. Positive control — distinct names apply cleanly
+-- ===================================
+
+declare schema dup_ok using (default_vtab_module = 'memory') {
+	table t1 {
+		id integer primary key,
+		a text
+	}
+
+	table t2 {
+		id integer primary key,
+		b text
+	}
+
+	seed t1 (
+		(1, 'alpha')
+	)
+
+	seed t2 (
+		(2, 'beta')
+	)
+}
+
+-- run
+
+apply schema dup_ok with seed;
+
+-- run
+
+select a from dup_ok.t1 where id = 1;
+→ [{"a":"alpha"}]
+
+select b from dup_ok.t2 where id = 2;
+→ [{"b":"beta"}]
+
+-- Re-applying stays clean: the declaration is unambiguous, so the diff converges.
+diff schema dup_ok;
+→ []

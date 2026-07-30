@@ -280,6 +280,189 @@ describe('Schema Differ', () => {
 		});
 	});
 
+	describe('duplicate declared object names (SCH-003)', () => {
+		// Each `declared*` map in the collection loop is keyed schema-wide by
+		// lowercased name, so a repeated declaration used to silently
+		// last-writer-wins — the first declaration never reached the migration.
+
+		it('throws on a duplicate declared table name', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, a text }
+					table t1 { id integer primary key, b text }
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /Table 't1' is declared more than once in schema 'main'/);
+		});
+
+		it('throws on a case-divergent duplicate declared table name', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table T1 { id integer primary key, a text }
+					table t1 { id integer primary key, b text }
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /Table 't1' is declared more than once in schema 'main'/);
+		});
+
+		it('throws on a duplicate declared view name', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, a text }
+					view v as select id as x from t1
+					view v as select a as y from t1
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /View 'v' is declared more than once in schema 'main'/);
+		});
+
+		it('throws on a duplicate declared materialized view name', () => {
+			// Both MV bodies are FROM-less: a `materialized view` item written directly
+			// after an item whose body ends at a FROM source is misparsed as a plain
+			// view (`materialized` is taken as a table alias — see ticket
+			// bug-declare-schema-materialized-swallowed-as-table-alias). Assert the
+			// item types so a parser regression cannot quietly turn this into a
+			// duplicate-*view* test.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					materialized view mv as select 1 as one
+					materialized view mv as select 2 as two
+				}`
+			);
+			expect(declared.items.map(i => i.type))
+				.to.deep.equal(['declaredMaterializedView', 'declaredMaterializedView']);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /Materialized view 'mv' is declared more than once in schema 'main'/);
+		});
+
+		it('throws on a duplicate declared assertion name', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, a integer }
+					assertion ck check (not exists (select 1 from t1 where a < 0))
+					assertion ck check (not exists (select 1 from t1 where a < 1))
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /Assertion 'ck' is declared more than once in schema 'main'/);
+		});
+
+		it('throws when a name is declared as both a table and a view', () => {
+			// `Schema.addView` rejects a view whose name a table holds (and
+			// `SchemaManager.createTable` the mirror case), so this declaration could
+			// never apply — it used to half-apply and then fail deep in the migration
+			// loop, leaving the table behind.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table dual { id integer primary key }
+					view dual as select 1 as one
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /'dual' is declared as both a table and a view in schema 'main'/);
+		});
+
+		it('names the kinds in declaration order for a view-then-table clash', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					view dual as select 1 as one
+					table dual { id integer primary key }
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /'dual' is declared as both a view and a table in schema 'main'/);
+		});
+
+		it('throws when a name is declared as both a table and a materialized view', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table mv { id integer primary key }
+					materialized view mv as select 1 as one
+				}`
+			);
+			expect(declared.items.map(i => i.type))
+				.to.deep.equal(['declaredTable', 'declaredMaterializedView']);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /'mv' is declared as both a table and a materialized view in schema 'main'/);
+		});
+
+		it('throws when a name is declared as both a materialized view and a view', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					materialized view mv as select 1 as one
+					view mv as select 2 as two
+				}`
+			);
+			expect(declared.items.map(i => i.type))
+				.to.deep.equal(['declaredMaterializedView', 'declaredView']);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /'mv' is declared as both a materialized view and a view in schema 'main'/);
+		});
+
+		it('accepts distinct names across every declared kind', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, note text }
+					table t2 { id integer primary key, note text }
+					view v as select id from t1
+					index idx_note on t1 (note)
+					assertion ck check (not exists (select 1 from t1 where note is null))
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
+		});
+
+		it('accepts an index sharing a declared table name (separate namespace)', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, note text }
+					index t1 on t1 (note)
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
+		});
+
+		it('accepts an assertion sharing a declared table name (separate namespace)', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, note text }
+					assertion t1 check (not exists (select 1 from t1 where note is null))
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog())).to.not.throw();
+		});
+
+		it('raises the reserved-tag diagnostic ahead of a duplicate name', () => {
+			// Deterministic ordering: tag diagnostics are accumulated across the whole
+			// schema and raised BEFORE the duplicate-name check, so a typo'd
+			// `quereus.*` key surfaces first even when a duplicate is also present.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t1 { id integer primary key, x integer } with tags ("quereus.update.taget" = 'x')
+					table t1 { id integer primary key, y integer }
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /quereus\.update\.taget/);
+		});
+
+		it('throws on a duplicate declared table in a logical schema', () => {
+			// The logical path returns before any tag validation and dedupes declared
+			// table names into a Set, so a duplicate used to collapse into one attach.
+			const declared = parseDeclaredSchema(
+				`declare logical schema app {
+					table t1 { id integer primary key, a text }
+					table t1 { id integer primary key, b text }
+				}`
+			);
+			expect(() => computeSchemaDiff(declared, makeCatalog()))
+				.to.throw(QuereusError, /Table 't1' is declared more than once/);
+		});
+	});
+
 	describe('reserved-tag validation (registry-governed, physical declarative path)', () => {
 		it('throws on a typo in a physical declared table tag (was silently soft-warned)', () => {
 			// Headline regression-closer: a `quereus.*` typo on a physical declared

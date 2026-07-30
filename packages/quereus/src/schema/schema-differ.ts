@@ -211,6 +211,123 @@ export interface TableAlterDiff {
 	maintainedModuleMigration?: { fromModule: string; toModule: string };
 }
 
+/** Kind label as it appears in the duplicate-declaration diagnostic. */
+type DeclaredObjectKind = 'table' | 'view' | 'materialized view' | 'index' | 'assertion';
+
+/** A name declared twice inside one `declare schema` block. */
+interface DuplicateDeclaredName {
+	/** The name as written on the SECOND declaration. */
+	name: string;
+	/** Kind of the second declaration. */
+	kind: DeclaredObjectKind;
+	/** Kind of the first declaration — equal to `kind` for a same-kind duplicate. */
+	priorKind: DeclaredObjectKind;
+	/** Owning table of each declaration; indexes only, for the index diagnostic. */
+	firstTable?: string;
+	secondTable?: string;
+}
+
+/** One recorded declaration, for collision reporting. */
+interface DeclaredNameEntry {
+	kind: DeclaredObjectKind;
+	/** Owning table — indexes only. */
+	table?: string;
+}
+
+/**
+ * First name collision in declaration order, or undefined. Pure — never throws,
+ * so the caller decides when to raise (the physical path defers to the
+ * reserved-tag diagnostics first).
+ *
+ * Three namespaces, matching what the engine enforces imperatively:
+ *   - `table` / `view` / `materialized view` share ONE namespace (`Schema.addView`
+ *     rejects a view whose name a table holds, and `SchemaManager.createTable` the
+ *     mirror case), so a cross-kind clash here would emit DDL that can never apply
+ *     — it half-applies and then throws deep in the migration loop.
+ *   - `index` — its own namespace, unique per schema (SCH-001). An index sharing a
+ *     table's name is legal and stays legal.
+ *   - `assertion` — its own namespace; likewise free to share a table's name.
+ *
+ * Only the FIRST collision is reported, matching the surrounding structural
+ * conflicts (rename resolution, tag diagnostics stop at their first raise point).
+ */
+function findDuplicateDeclaredName(items: readonly AST.DeclareItem[]): DuplicateDeclaredName | undefined {
+	// table / view / materialized view all land in `sharedObjects`.
+	const sharedObjects = new Map<string, DeclaredNameEntry>();
+	const indexes = new Map<string, DeclaredNameEntry>();
+	const assertions = new Map<string, DeclaredNameEntry>();
+
+	/** First-write-wins record; returns the collision when the name is taken. */
+	const record = (
+		registry: Map<string, DeclaredNameEntry>,
+		name: string,
+		entry: DeclaredNameEntry,
+	): DuplicateDeclaredName | undefined => {
+		const key = name.toLowerCase();
+		const prior = registry.get(key);
+		if (prior) {
+			return {
+				name,
+				kind: entry.kind,
+				priorKind: prior.kind,
+				firstTable: prior.table,
+				secondTable: entry.table,
+			};
+		}
+		registry.set(key, entry);
+		return undefined;
+	};
+
+	for (const item of items) {
+		let duplicate: DuplicateDeclaredName | undefined;
+		switch (item.type) {
+			case 'declaredTable':
+				duplicate = record(sharedObjects, item.tableStmt.table.name, { kind: 'table' });
+				break;
+			case 'declaredView':
+				duplicate = record(sharedObjects, item.viewStmt.view.name, { kind: 'view' });
+				break;
+			case 'declaredMaterializedView':
+				duplicate = record(sharedObjects, item.viewStmt.view.name, { kind: 'materialized view' });
+				break;
+			case 'declaredIndex':
+				duplicate = record(indexes, item.indexStmt.index.name, { kind: 'index', table: item.indexStmt.table.name });
+				break;
+			case 'declaredAssertion':
+				duplicate = record(assertions, item.assertionStmt.name, { kind: 'assertion' });
+				break;
+		}
+		if (duplicate) return duplicate;
+	}
+	return undefined;
+}
+
+/** Renders the diagnostic for a duplicate declared name. */
+function duplicateDeclaredNameError(dup: DuplicateDeclaredName, schemaName: string): QuereusError {
+	const { name, kind, priorKind, firstTable, secondTable } = dup;
+	if (kind !== priorKind) {
+		// Cross-kind is only reachable inside the shared table/view/MV namespace,
+		// so both labels take the article "a". Kinds read in declaration order.
+		return new QuereusError(
+			`'${name}' is declared as both a ${priorKind} and a ${kind} in schema '${schemaName}'`,
+			StatusCode.ERROR,
+		);
+	}
+	if (kind === 'index') {
+		// Pinned wording — documented in docs/sql-ddl.md § 6.3 and SCH-001.
+		return new QuereusError(
+			`Index '${name}' is declared more than once in schema '${schemaName}'`
+				+ ` (on '${firstTable}' and '${secondTable}') — index names are unique per schema`,
+			StatusCode.ERROR,
+		);
+	}
+	const label = kind.charAt(0).toUpperCase() + kind.slice(1);
+	return new QuereusError(
+		`${label} '${name}' is declared more than once in schema '${schemaName}'`,
+		StatusCode.ERROR,
+	);
+}
+
 /**
  * Computes the difference between declared schema and actual catalog
  */
@@ -250,6 +367,12 @@ export function computeSchemaDiff(
 	// bodies (a logical schema has no user views), so compare declared logical
 	// tables against the registered views. Basis storage is untouched.
 	if (declaredSchema.isLogical) {
+		// Raise here rather than deferring to the physical raise point below: the
+		// logical path returns before any tag validation, and `computeLogicalSchemaDiff`
+		// dedupes declared table names into a Set — so a duplicate would silently
+		// collapse into one attach with the first declaration lost.
+		const duplicate = findDuplicateDeclaredName(declaredSchema.items);
+		if (duplicate) throw duplicateDeclaredNameError(duplicate, actualCatalog.schemaName);
 		return computeLogicalSchemaDiff(declaredSchema, actualCatalog, diff);
 	}
 
@@ -283,13 +406,10 @@ export function computeSchemaDiff(
 	// these physical sites; an MV's hint validates (over-permissive: the differ
 	// supports no MV rename and simply ignores it — harmless, see Decision 1).
 	const tagDiagnostics: TagDiagnostic[] = [];
-	// First duplicate declared index name, if any — index names are unique per
-	// schema (enforced imperatively by `SchemaManager.createIndex`), and
-	// `declaredIndexes` is keyed schema-wide by lowercased name, so a duplicate
-	// used to silently last-writer-wins and half-apply the declaration. Recorded
-	// here and raised below, AFTER the tag diagnostics, so a reserved-tag typo
-	// still surfaces first (same deterministic order the tag/rename split has).
-	let duplicateDeclaredIndex: { name: string; firstTable: string; secondTable: string } | undefined;
+	// Every `declared*` map below is keyed schema-wide by lowercased name, so a
+	// repeated declaration would silently last-writer-wins and half-apply the
+	// declaration. `findDuplicateDeclaredName` (called right after the tag
+	// diagnostics are raised) rejects that up front — see SCH-003.
 	for (const item of declaredSchema.items) {
 		switch (item.type) {
 			case 'declaredTable':
@@ -335,20 +455,10 @@ export function computeSchemaDiff(
 				declaredMaterializedViews.set(item.viewStmt.view.name.toLowerCase(), item);
 				tagDiagnostics.push(...validateReservedTags(item.viewStmt.tags, 'view-ddl'));
 				break;
-			case 'declaredIndex': {
-				const indexKey = item.indexStmt.index.name.toLowerCase();
-				const priorIndex = declaredIndexes.get(indexKey);
-				if (priorIndex && !duplicateDeclaredIndex) {
-					duplicateDeclaredIndex = {
-						name: item.indexStmt.index.name,
-						firstTable: priorIndex.indexStmt.table.name,
-						secondTable: item.indexStmt.table.name,
-					};
-				}
-				declaredIndexes.set(indexKey, item);
+			case 'declaredIndex':
+				declaredIndexes.set(item.indexStmt.index.name.toLowerCase(), item);
 				tagDiagnostics.push(...validateReservedTags(item.indexStmt.tags, 'physical-index'));
 				break;
-			}
 			case 'declaredAssertion':
 				declaredAssertions.set(item.assertionStmt.name.toLowerCase(), item);
 				break;
@@ -358,14 +468,10 @@ export function computeSchemaDiff(
 		log: (d) => warnLog('reserved tag advisory (%s) on %s: %s', d.reason, d.site, d.message),
 	});
 
-	if (duplicateDeclaredIndex) {
-		const { name, firstTable, secondTable } = duplicateDeclaredIndex;
-		throw new QuereusError(
-			`Index '${name}' is declared more than once in schema '${targetSchemaName}'`
-				+ ` (on '${firstTable}' and '${secondTable}') — index names are unique per schema`,
-			StatusCode.ERROR,
-		);
-	}
+	// Raised AFTER the tag diagnostics so a reserved-tag typo still surfaces first
+	// (the same deterministic order the tag/rename split has).
+	const duplicateDeclaration = findDuplicateDeclaredName(declaredSchema.items);
+	if (duplicateDeclaration) throw duplicateDeclaredNameError(duplicateDeclaration, targetSchemaName);
 
 	// Normalize every declared `materialized view` into the TABLE category: a
 	// declared table whose `maintained` clause carries the body (no declared
@@ -377,12 +483,9 @@ export function computeSchemaDiff(
 	// (a fresh maintained table renders the `create materialized view` sugar, since
 	// a column-less `create table … maintained as` has no parseable DDL).
 	for (const [name, declaredMv] of declaredMaterializedViews) {
-		if (declaredTables.has(name)) {
-			throw new QuereusError(
-				`'${name}' is declared as both a table and a materialized view`,
-				StatusCode.ERROR,
-			);
-		}
+		// No clobber check needed: `findDuplicateDeclaredName` above shares ONE
+		// namespace across table / view / materialized view, so a declared table of
+		// this name has already raised.
 		declaredTables.set(name, materializedViewToDeclaredTable(declaredMv));
 	}
 

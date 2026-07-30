@@ -103,12 +103,31 @@ describe('Schema Manager', () => {
 			expect(item).to.exist;
 		});
 
-		it('views should shadow tables of the same name in getSchemaItem', async () => {
-			// getSchemaItem checks views first
+		it('rejects a view whose name a table already holds (shared namespace)', async () => {
+			// Tables and views share one namespace — there is no shadowing to test.
+			// This is the imperative half of SCH-003; `computeSchemaDiff` rejects the
+			// declarative equivalent so it can never reach a half-applied migration.
 			await db.exec('create table dual_name (id integer primary key)');
-			await db.exec('create view dual_name_view as select 1 as x');
-			const item = db.schemaManager.getSchemaItem(null, 'dual_name_view');
-			expect(item).to.exist;
+			let error: unknown;
+			try {
+				await db.exec('create view dual_name as select 1 as x');
+			} catch (e) {
+				error = e;
+			}
+			expect(error).to.be.instanceOf(Error);
+			expect((error as Error).message).to.match(/a table with the same name already exists/i);
+		});
+
+		it('rejects a table whose name a view already holds (mirror case)', async () => {
+			await db.exec('create view dual_name_2 as select 1 as x');
+			let error: unknown;
+			try {
+				await db.exec('create table dual_name_2 (id integer primary key)');
+			} catch (e) {
+				error = e;
+			}
+			expect(error).to.be.instanceOf(Error);
+			expect((error as Error).message).to.match(/view/i);
 		});
 	});
 

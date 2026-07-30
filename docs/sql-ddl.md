@@ -132,6 +132,19 @@ apply schema main to version '1.0.0' options (
 - Tables, indexes, and views can be declared in any order within the `{...}` block.
 - Forward references are allowed (e.g., foreign keys to tables declared later).
 
+**Each declared name appears once.** A repeated name used to last-writer-wins silently, so the first declaration never reached the migration. `diff schema` / `apply schema` now reject it up front, naming the object:
+- `table`, `view`, and `materialized view` share **one** namespace — the engine enforces it imperatively too (`create view` refuses a name a table holds, and vice versa), so a cross-kind clash could only ever half-apply and then fail mid-migration. Both the same-kind and the cross-kind case are errors:
+  ```sql
+  -- error: Table 't1' is declared more than once in schema 'main'
+  -- error: 'dual' is declared as both a table and a view in schema 'main'
+  ```
+- `index` has its own namespace (unique per schema — see §6.3), as does `assertion`. An index or assertion may share a table's name; only a duplicate *within* its own namespace is rejected.
+- A repeated `seed` block for one table is rejected when the declaration is stored, not at diff time — two blocks for one table have no defined meaning, and the second used to discard the first's rows:
+  ```sql
+  -- error: Seed data for table 't1' is declared more than once in schema 'main'
+  ```
+- Names compare case-insensitively, so `table T1` and `table t1` collide.
+
 **Flexible Syntax:**
 - Column definitions accept brace syntax `{...}` or traditional parentheses `(...)`.
 - Identifiers are only quoted when they are reserved keywords or contain special characters.
@@ -869,7 +882,7 @@ create index idx_note on t2 (note);
 - **`IF NOT EXISTS` does not suppress a cross-table collision.** It means "skip if *this* index already exists"; an index of that name on a *different* table is a different object, and skipping would silently leave the requested index absent from the target table. Only a same-name index on the *same* table is skipped.
 - **A UNIQUE constraint's implicit covering structure is not part of that namespace.** The auto-built secondary structure backing a plain `UNIQUE` constraint takes the constraint's name (or `_uc_<cols>` when unnamed), and constraint names are unique per *table*, so two tables may each declare `constraint uq_email unique (email)`. Those implicit structures are skipped by the schema-wide check. A `create index uq_email on b (email)` where `b` already carries an implicit `uq_email` still fails the ordinary same-table check.
 - **Rehydration warns instead of failing.** Opening a database written before this rule that already contains a collision logs a warning naming both owning tables and proceeds; by-name resolution of that index stays first-match until one is renamed.
-- **`declare schema` rejects duplicates up front.** Two `index` declarations sharing a name (on any tables) are an error at diff time rather than a silently half-applied declaration.
+- **`declare schema` rejects duplicates up front.** Two `index` declarations sharing a name (on any tables) are an error at diff time rather than a silently half-applied declaration — one case of the general rule that each declared name appears once (see §2.0 *Declaration Syntax*).
 
 ## 7. Constraints and Indexes
 
