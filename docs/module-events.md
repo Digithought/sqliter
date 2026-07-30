@@ -183,6 +183,17 @@ If your module doesn't need custom event logic (e.g., remote change tracking), s
 - Include all event fields (`key`, `oldRow`, `newRow`, `changedColumns`)
 - Are batched within transactions and delivered after commit
 
+### Engine-Internal Scaffolding Is Silent
+
+A few statements the engine issues on its own behalf are not statements the application made, and are deliberately invisible on both channels. The engine runs them inside a suppression scope (`DatabaseEventEmitter.withPublicEventsSuppressed`): while it is open, no auto event is generated, and an event forwarded from a module's own emitter is discarded (with a debug log line) instead of delivered or batched.
+
+Today there is exactly one such scope: the shadow-table rebuild behind `ALTER TABLE … ALTER PRIMARY KEY` on a module that cannot re-key in place. It creates a shadow table with the new key, copies every row into it, drops the original, and renames the shadow over it — none of which is a change the application asked for, so a subscriber hears nothing. See [sql-ddl.md § ALTER PRIMARY KEY](sql-ddl.md) for the user-facing consequence.
+
+What this means for a module with a native emitter:
+
+- **Emit during the write, not at your own commit.** Events you emit while the engine's statement is executing are correctly suppressed. Events you defer to a later tick or to your own commit callback arrive after the scope has closed and would leak the rebuild's row copy to subscribers.
+- Suppression covers only the application-facing channels. The internal catalog-change notifier keeps firing, so cached schemas are invalidated normally and the rebuilt table is immediately usable under its new key.
+
 ## Remote vs Local Events
 
 The `remote` field distinguishes the origin of changes:
@@ -213,7 +224,7 @@ applyRemoteChange(change: RemoteChange): void {
 
 1. **Timing**: Events are emitted after successful commit, never during rollback
 2. **Ordering**: Events are delivered in the order operations occurred within a transaction
-3. **Completeness**: All successful mutations generate events (either native or auto)
+3. **Completeness**: All successful mutations generate events (either native or auto), with one deliberate exception — see [Engine-internal scaffolding is silent](#engine-internal-scaffolding-is-silent)
 4. **Listener Errors**: Exceptions in listeners are logged but don't affect other listeners
 5. **Listener Order**: Listeners are called in registration order
 6. **Savepoints**: Events within a savepoint are tracked separately; `ROLLBACK TO SAVEPOINT` discards those events while `RELEASE SAVEPOINT` merges them into the parent

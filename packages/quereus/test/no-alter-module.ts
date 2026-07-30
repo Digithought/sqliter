@@ -9,7 +9,8 @@
  * the shadow table's name. Pass `withRenameTable: true` for the backend shape that CAN take
  * the rebuild.
  *
- * Shared by `alter-table-conformance.spec.ts` and `alter-primary-key-in-transaction.spec.ts`.
+ * Shared by `alter-table-conformance.spec.ts`, `alter-primary-key-in-transaction.spec.ts`, and
+ * `alter-table-events.spec.ts`.
  */
 
 import { MemoryTableModule } from '../src/vtab/memory/module.js';

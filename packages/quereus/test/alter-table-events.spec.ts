@@ -1122,4 +1122,43 @@ describe('ALTER PRIMARY KEY via shadow-table rebuild: the rebuild is notificatio
 		assert.equal(events[0].type, 'insert');
 		assert.deepEqual(events[0].key, [6, 7], 'and under the new primary key');
 	});
+
+	it('a rebuild that fails mid-copy stays silent and reopens the channels', async () => {
+		// The reachable failure: the new key is not unique over the existing rows, so the row
+		// copy raises partway through and the `catch` drops the shadow table.
+		//
+		// The silence assertions below are belt-and-braces — the statement's implicit
+		// transaction rolls back, and `discardBatch` would drop the partial copy's events even
+		// with no suppression at all. The teeth are the two after the refusal: the table is
+		// untouched (statements 3 and 4, DROP + RENAME, never ran), and the channels are open
+		// again, i.e. the scope's `finally` released on the throwing path.
+		await db.exec("insert into t values (6, 5, 'dup')");   // duplicate b, so pk (b) cannot hold
+
+		const dataEvents: DatabaseDataChangeEvent[] = [];
+		const schemaEvents: DatabaseSchemaChangeEvent[] = [];
+		const unsubData = db.onDataChange(e => dataEvents.push(e));
+		const unsubSchema = db.onSchemaChange(e => schemaEvents.push(e));
+		try {
+			await assert.rejects(() => db.exec('alter table t alter primary key (b)'));
+
+			assert.equal(dataEvents.length, 0, 'a partial copy must not announce the rows it managed to move');
+			assert.deepEqual(
+				schemaEvents.map(e => `${e.type} ${e.objectName}`), [],
+				'nor the shadow table it created and then dropped again');
+
+			// The refusal left the table alone: statements 3 and 4 (DROP + RENAME) never ran.
+			assert.deepEqual(
+				(await rows(db, `select name from table_info('t') where pk > 0 order by pk`)).map(r => r.name),
+				['a'], 'the original primary key is intact');
+			assert.deepEqual(await rows(db, 'select count(*) as n from t'), [{ n: 2 }], 'both rows survive');
+
+			// And the channels are open again — the failure did not leave suppression stuck on.
+			await db.exec("insert into t values (7, 7, 'after')");
+			assert.equal(dataEvents.length, 1, 'a write after the failed rebuild is reported');
+			assert.deepEqual(dataEvents[0].key, [7], 'under the unchanged primary key');
+		} finally {
+			unsubData();
+			unsubSchema();
+		}
+	});
 });
