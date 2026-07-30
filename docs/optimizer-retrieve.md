@@ -79,8 +79,17 @@ predicate to an **outer** table: the unhandled-constraint path turns it into
 `moduleCtx.residualPredicate`, and `rule-select-access-path` then materializes a `Filter`
 reading a column the outer relation does not have (runtime "No row context found for column
 …"), or — under `NOT EXISTS`, where the hoisted conjunct happens to be satisfiable — silently
-drops rows. The same gate keeps `extractCoveredKeysForTable` from counting a subquery's
-`a.id = 5` as covering the *outer* `a`'s primary key.
+drops rows.
+
+The gate is also the only protection against one shape the `correlated` flag cannot see: an
+**outer** column compared to a **constant** inside the subquery body
+(`where not exists (select 1 from t where a.i = 2)`). Its value side is a literal, so
+`computeCoveredKeysForConstraints` would treat it as an ordinary covering equality on `a` —
+letting `extractCoveredKeysForTable` claim ≤1 row for a relation with many, and letting
+`rule-select-access-path` seek on it, which drops every row under `NOT EXISTS`. A subquery
+over the same *table* is not this shape: the inner scan is a distinct
+`TableReferenceNode` with its own attribute ids, so `exists (select 1 from a a2 where
+a2.id = 2)` never matched the outer instance's attributes in the first place.
 
 ### Set operations and growth boundaries
 

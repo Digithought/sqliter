@@ -106,10 +106,40 @@ select a.id from a where a.id > 1 and not exists (select 1 from t where t.s = a.
 → [{"id":3}]
 
 -- =============================================================================
+-- An OUTER column compared to a CONSTANT inside the subquery body. This is the
+-- shape the `correlated` guard in computeCoveredKeysForConstraints cannot catch:
+-- the value side is a literal, so the constraint looks like an ordinary covering
+-- equality on `a`. Only the scope gate keeps it inside the subquery. Under
+-- NOT EXISTS the hoisted copy silently drops every row.
+-- =============================================================================
+
+select a.id from a where not exists (select 1 from t where a.i = 2);
+→ [{"id":1},{"id":3}]
+
+select a.id from a where not exists (select 1 from t where a.i = 2) order by a.id;
+→ [{"id":1},{"id":3}]
+
+select a.id from a where not exists (select 1 from t where a.i = 2) order by a.id desc;
+→ [{"id":3},{"id":1}]
+
+select a.id from a where exists (select 1 from t where a.i = 2) order by a.id;
+→ [{"id":2}]
+
+-- Mixed with a genuinely correlated conjunct, so the subquery cannot be reduced
+-- to an outer-only test.
+
+select a.id from a where not exists (select 1 from t where t.s = a.i and a.i = 2) order by a.id;
+→ [{"id":1},{"id":3}]
+
+select a.id from a where exists (select 1 from t where t.s = a.i and a.i = 2) order by a.id;
+→ [{"id":2}]
+
+-- =============================================================================
 -- A self-referencing subquery over the SAME table as the outer relation. The
--- inner scan is a distinct instance, so its equality on the primary key must not
--- be counted as covering the outer instance's key (which would claim <=1 row for
--- a relation that has three).
+-- inner scan is a distinct TableReferenceNode with its own attribute ids, so
+-- `a2.id = 2` never matched the outer instance even before the scope gate — these
+-- pass pre-fix. Kept as cheap coverage that the gate did not break the self-
+-- reference shape, not as a regression guard.
 -- =============================================================================
 
 select a.id from a where exists (select 1 from a a2 where a2.id = 2) order by a.id;

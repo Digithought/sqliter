@@ -1070,22 +1070,30 @@ function walkPredicatesConstraining(
 	targetTableRelationKey: string,
 	callback: (predicate: ScalarPlanNode) => void,
 ): boolean {
-	if (!plan) return false;
-
 	// NOTE: recursive over the native stack (as the sweep this replaced was). Plan depth is
 	// bounded by query nesting today; if a generated query ever overflows here, convert to the
 	// explicit-stack shape `PlanNode.computePostOrder` uses — the post-order return value
 	// (`inScope` bubbling up) is what makes the recursion convenient rather than necessary.
+	//
+	// NOTE: scope is followed through `getChildren()` only. Three nodes override
+	// `getRelations()` to expose a relation that is NOT a child — `InsertNode.table`,
+	// `AddConstraintNode.table`, `AlterTableNode.table` — so a target key naming one of those
+	// DML/DDL target references is unreachable here and yields no constraints. Harmless today:
+	// those references carry their own attribute ids, which no predicate in the plan mentions,
+	// so the old unguarded sweep found nothing for them either, and `binding-extractor` falls
+	// back to `{kind: 'global'}` on an empty covered-key set. If a caller ever needs
+	// constraints for a DML target reference, walk `getRelations()` here too.
 	const idSuffix = `#${plan.id ?? 'unknown'}`;
 	let inScope = plan instanceof TableReferenceNode && targetTableRelationKey.endsWith(idSuffix);
 
+	// Only a RELATIONAL child of a RELATIONAL node feeds that node's input. A relational node
+	// reached through a scalar expression is a subquery body — a different scope — so what it
+	// contains must not put the target in scope here (its own predicates were already collected
+	// inside the recursion).
+	const planIsRelational = isRelationalNode(plan);
 	for (const child of plan.getChildren()) {
-		const foundBelow = walkPredicatesConstraining(child as unknown as PlanNode, targetTableRelationKey, callback);
-		// Only a RELATIONAL child of a RELATIONAL node feeds that node's input. A
-		// relational node reached through a scalar expression is a subquery body —
-		// a different scope — so what it contains must not put the target in scope
-		// here (its own predicates were already collected inside the recursion).
-		if (foundBelow && isRelationalNode(child) && isRelationalNode(plan)) inScope = true;
+		const foundBelow = walkPredicatesConstraining(child, targetTableRelationKey, callback);
+		if (foundBelow && planIsRelational && isRelationalNode(child)) inScope = true;
 	}
 
 	if (inScope && CapabilityDetectors.isPredicateSource(plan)) {
