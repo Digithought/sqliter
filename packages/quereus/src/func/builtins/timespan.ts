@@ -1,6 +1,7 @@
 import { Temporal } from 'temporal-polyfill';
 import { type SqlValue } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
+import { INTEGER_RETURN, REAL_RETURN } from './return-types.js';
 
 /**
  * Helper to parse a value as a Temporal.Duration
@@ -22,7 +23,7 @@ function parseDuration(value: SqlValue): Temporal.Duration | null {
  * timespan_years() - Extract years component from timespan
  */
 export const timespanYearsFunc = createScalarFunction(
-	{ name: 'timespan_years', numArgs: 1, deterministic: true },
+	{ name: 'timespan_years', numArgs: 1, deterministic: true, returnType: INTEGER_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -34,7 +35,7 @@ export const timespanYearsFunc = createScalarFunction(
  * timespan_months() - Extract months component from timespan
  */
 export const timespanMonthsFunc = createScalarFunction(
-	{ name: 'timespan_months', numArgs: 1, deterministic: true },
+	{ name: 'timespan_months', numArgs: 1, deterministic: true, returnType: INTEGER_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -46,7 +47,7 @@ export const timespanMonthsFunc = createScalarFunction(
  * timespan_weeks() - Extract weeks component from timespan
  */
 export const timespanWeeksFunc = createScalarFunction(
-	{ name: 'timespan_weeks', numArgs: 1, deterministic: true },
+	{ name: 'timespan_weeks', numArgs: 1, deterministic: true, returnType: INTEGER_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -58,7 +59,7 @@ export const timespanWeeksFunc = createScalarFunction(
  * timespan_days() - Extract days component from timespan
  */
 export const timespanDaysFunc = createScalarFunction(
-	{ name: 'timespan_days', numArgs: 1, deterministic: true },
+	{ name: 'timespan_days', numArgs: 1, deterministic: true, returnType: INTEGER_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -70,7 +71,7 @@ export const timespanDaysFunc = createScalarFunction(
  * timespan_hours() - Extract hours component from timespan
  */
 export const timespanHoursFunc = createScalarFunction(
-	{ name: 'timespan_hours', numArgs: 1, deterministic: true },
+	{ name: 'timespan_hours', numArgs: 1, deterministic: true, returnType: INTEGER_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -82,7 +83,7 @@ export const timespanHoursFunc = createScalarFunction(
  * timespan_minutes() - Extract minutes component from timespan
  */
 export const timespanMinutesFunc = createScalarFunction(
-	{ name: 'timespan_minutes', numArgs: 1, deterministic: true },
+	{ name: 'timespan_minutes', numArgs: 1, deterministic: true, returnType: INTEGER_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -92,9 +93,12 @@ export const timespanMinutesFunc = createScalarFunction(
 
 /**
  * timespan_seconds() - Extract seconds component from timespan
+ *
+ * REAL, not INTEGER like its six sibling component extractors: this one folds the
+ * sub-second components into its result, so 'PT1.5S' returns 1.5.
  */
 export const timespanSecondsFunc = createScalarFunction(
-	{ name: 'timespan_seconds', numArgs: 1, deterministic: true },
+	{ name: 'timespan_seconds', numArgs: 1, deterministic: true, returnType: REAL_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -108,7 +112,7 @@ export const timespanSecondsFunc = createScalarFunction(
  * timespan_total_seconds() - Convert entire timespan to seconds
  */
 export const timespanTotalSecondsFunc = createScalarFunction(
-	{ name: 'timespan_total_seconds', numArgs: 1, deterministic: true },
+	{ name: 'timespan_total_seconds', numArgs: 1, deterministic: true, returnType: REAL_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -126,7 +130,7 @@ export const timespanTotalSecondsFunc = createScalarFunction(
  * timespan_total_minutes() - Convert entire timespan to minutes
  */
 export const timespanTotalMinutesFunc = createScalarFunction(
-	{ name: 'timespan_total_minutes', numArgs: 1, deterministic: true },
+	{ name: 'timespan_total_minutes', numArgs: 1, deterministic: true, returnType: REAL_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -144,7 +148,7 @@ export const timespanTotalMinutesFunc = createScalarFunction(
  * timespan_total_hours() - Convert entire timespan to hours
  */
 export const timespanTotalHoursFunc = createScalarFunction(
-	{ name: 'timespan_total_hours', numArgs: 1, deterministic: true },
+	{ name: 'timespan_total_hours', numArgs: 1, deterministic: true, returnType: REAL_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;
@@ -162,7 +166,7 @@ export const timespanTotalHoursFunc = createScalarFunction(
  * timespan_total_days() - Convert entire timespan to days
  */
 export const timespanTotalDaysFunc = createScalarFunction(
-	{ name: 'timespan_total_days', numArgs: 1, deterministic: true },
+	{ name: 'timespan_total_days', numArgs: 1, deterministic: true, returnType: REAL_RETURN },
 	(value: SqlValue): SqlValue => {
 		const duration = parseDuration(value);
 		if (!duration) return null;

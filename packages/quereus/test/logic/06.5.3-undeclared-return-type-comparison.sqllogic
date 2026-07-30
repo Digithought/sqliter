@@ -2,9 +2,14 @@
 -- A function registered without a declared `returnType` reports ANY (unknown), not REAL.
 -- While the default was REAL, the planner believed every such function returned a number,
 -- so `insertCrossTypeCoercion` cast the TEXT side of a comparison to REAL — the literal
--- 'object' became 0 and `json_type(j) = 'object'` was FALSE. Most builtins declare no
--- return type (all of datetime.ts, nearly all of json.ts and string.ts), so the whole
--- family was affected; ticket 1-scalar-function-default-return-type-any.
+-- 'object' became 0 and `json_type(j) = 'object'` was FALSE. At the time, most builtins
+-- declared no return type (all of datetime.ts, nearly all of json.ts and string.ts), so
+-- the whole family was affected; ticket 1-scalar-function-default-return-type-any.
+--
+-- Those builtins now declare their real return types (ticket
+-- 2-builtin-scalar-function-declared-return-types), so most of the cases below reach the
+-- right answer by a shorter route than ANY. `json_extract` is the one builtin still
+-- deliberately ANY — genuinely polymorphic — so the ANY behavior stays exercised here.
 --
 -- The user-defined-function half of this (Database.createScalarFunction never passes a
 -- returnType) lives in test/core-api-features.spec.ts — a .sqllogic file cannot register
@@ -71,12 +76,16 @@ select json_type(j) = 3 as r from urt;
 → [{"r":false}]
 
 -- ===================================
--- 3. ANY vs JSON still takes the object-physical arm of insertCrossTypeCoercion
+-- 3. A non-JSON operand vs JSON still takes the object-physical arm of insertCrossTypeCoercion
 -- ===================================
--- ANY is not NULL, so the arm is not skipped: the ANY side is cast to JSON. 'object' is
--- not JSON source, so the lenient cast leaves it as the raw string, which does not equal
--- the object {"a":"x"}. Same answer a TEXT operand gives. Pinned deliberately.
+-- Neither ANY nor TEXT is NULL, so the arm is not skipped: the non-JSON side is cast to
+-- JSON. 'object' is not JSON source, so the lenient cast leaves it as the raw string,
+-- which does not equal the object {"a":"x"}. Pinned deliberately.
 select json_type(j) = j as r from urt;
+→ [{"r":false}]
+
+-- Same shape with a still-ANY operand (json_extract), so the ANY arm stays covered.
+select json_extract(j, '$.a') = j as r from urt;
 → [{"r":false}]
 
 -- The JSON source text spelled by json_quote DOES parse, so it matches structurally.
@@ -84,7 +93,7 @@ select json_quote(j) = j as r from urt;
 → [{"r":true}]
 
 -- ===================================
--- 4. An ANY-typed value still works everywhere else it has always worked
+-- 4. json_type's value still works everywhere else it has always worked
 -- ===================================
 select json_type(j) || '!' as r from urt;
 → [{"r":"object!"}]
@@ -104,8 +113,8 @@ select cast(json_type(j) as text) = 'object' as r from urt;
 select typeof(json_type(j)) as r from urt;
 → [{"r":"text"}]
 
--- Identity sites (ORDER BY / GROUP BY / DISTINCT / min / max) rank an ANY-typed value
--- as text, as they always did.
+-- Identity sites (ORDER BY / GROUP BY / DISTINCT / min / max) rank the value as text,
+-- as they always did.
 insert into urt values (2, '[1]', '2023-01-02', 7);
 -- run
 
@@ -194,7 +203,16 @@ select abs(d) as r from urt;
 select strftime('%Y', d) + 1 as r from urt where id = 1;
 → [{"r":2025}]
 
+-- `abs(strftime(...))` was 2024 while strftime rode the ANY default: the numeric
+-- builtins' plan-time gate accepts "numeric OR unclassifiable", and ANY is
+-- unclassifiable. Ticket 2-builtin-scalar-function-declared-return-types declared
+-- strftime's real return type (TEXT), so the argument is now classifiable and the gate
+-- rejects it — the same rejection `abs(d)` gets in section 7, for the same reason.
+-- Write `abs(integer(strftime(...)))` to convert first.
 select abs(strftime('%Y', d)) as r from urt where id = 1;
+-- error: Invalid argument types for function abs
+
+select abs(integer(strftime('%Y', d))) as r from urt where id = 1;
 → [{"r":2024}]
 
 -- Aggregates: an ANY-typed argument no longer skips coerceForAggregate
@@ -210,9 +228,10 @@ select sum(strftime('%Y', d)) as s, avg(strftime('%Y', d)) as a from urt;
 -- numeric↔textual arm of insertCrossTypeCoercion nothing to key on and the runtime
 -- compares an integer against text — different storage classes. Same shape as
 -- `int_col in ('1')` being false today (bug-numeric-text-coercion-skips-in-and-case).
--- Pinned so the next change to the numeric↔text story is a deliberate one; declaring a
--- real `returnType` restores the coercion (ticket
--- builtin-scalar-function-declared-return-types does that for the builtins).
+-- Pinned so the next change to the numeric↔text story is a deliberate one. json_extract
+-- is deliberately still ANY (its result shape depends on the data), so the loss is real
+-- here; every builtin that CAN name a type now does, which restores the coercion — see
+-- 06.5.4-declared-return-type-builtins.sqllogic.
 select json_extract('{"n":5}', '$.n') = '5' as r;
 → [{"r":false}]
 

@@ -1,0 +1,219 @@
+-- declared-return-type-builtins.sqllogic
+-- Ticket 2-builtin-scalar-function-declared-return-types gave every built-in scalar
+-- function that used to ride the default an honest `returnType` (json.ts, datetime.ts,
+-- timespan.ts, plus random/randomblob/pow/power and like/glob). `json_extract` is the one
+-- deliberate holdout — genuinely polymorphic — and 06.5.3 covers that.
+--
+-- The declarations are supposed to change PLANS, not ANSWERS: a known return type routes
+-- comparisons through the specialized `compare-fast` / `compare-typed` paths and lets
+-- cross-type coercion fire, but the value each query produces must be the same. This file
+-- pins the answers on both sides of the category boundaries the declarations cross.
+--
+-- No `using memory`, so store mode exercises the persisted path too.
+
+create table drt (id integer primary key, j json, d text, ts timespan);
+insert into drt values (1, '{"a":"x"}', '2024-03-04', 'P3D');
+-- run
+
+-- ===================================
+-- 1. BOOLEAN-returning predicates compare against numbers as they always did
+-- ===================================
+-- json_valid used to type as ANY (BOOLEAN vs INTEGER now, ANY vs INTEGER before) — both
+-- routes end in the same numeric comparison, because boolean is a NUMERIC storage class.
+select json_valid('{}') = 1 as r;
+→ [{"r":true}]
+
+select json_valid(j) = 1 as r from drt;
+→ [{"r":true}]
+
+select json_valid('not json') = 0 as r;
+→ [{"r":true}]
+
+select json_schema(j, 'string') = 0 as r from drt;
+→ [{"r":true}]
+
+select IsISODate('2024-03-04') as a, IsISODate('04/03/2024') as b;
+→ [{"a":true,"b":false}]
+
+select IsISODateTime('2024-03-04T05:06:07') as a, IsISODateTime('2024-03-04') as b;
+→ [{"a":true,"b":false}]
+
+-- like/glob stay NULLABLE booleans: a null operand is NULL, not false.
+select like('obj%', 'object') as a, glob('obj*', 'object') as b;
+→ [{"a":true,"b":true}]
+
+select like('obj%', null) as a, glob(null, 'object') as b;
+→ [{"a":null,"b":null}]
+
+-- ===================================
+-- 2. INTEGER-returning functions
+-- ===================================
+select timespan_days(timespan('P3D')) = 3 as r;
+→ [{"r":true}]
+
+select timespan_days(ts) = 3 as r from drt;
+→ [{"r":true}]
+
+select timespan_hours(timespan('PT5H')) as r;
+→ [{"r":5}]
+
+select json_array_length('[1,2,3]') as r;
+→ [{"r":3}]
+
+-- The point of declaring INTEGER: the numeric↔textual arm of insertCrossTypeCoercion now
+-- has something to key on, so a numeric-looking string literal is cast instead of being
+-- compared across storage classes. This was FALSE while these functions typed as ANY.
+select json_array_length('[1,2,3]') = '3' as r;
+→ [{"r":true}]
+
+select epoch_s('2024-03-04') as r;
+→ [{"r":1709510400}]
+
+select epoch_s(d) = '1709510400' as r from drt;
+→ [{"r":true}]
+
+select epoch_ms(d) = '1709510400000' as r from drt;
+→ [{"r":true}]
+
+select typeof(random()) as r;
+→ [{"r":"integer"}]
+
+-- ===================================
+-- 3. REAL-returning functions
+-- ===================================
+select pow(2, -1) as a, power(2, -1) as b;
+→ [{"a":0.5,"b":0.5}]
+
+select pow(2, 3) = '8' as r;
+→ [{"r":true}]
+
+select julianday('2024-03-04') as r;
+→ [{"r":2460373.5}]
+
+select epoch_s_frac('2024-03-04T00:00:00.500Z') as r;
+→ [{"r":1709510400.5}]
+
+-- timespan_seconds is REAL, not INTEGER like its six sibling component extractors: it
+-- folds the sub-second components into its result.
+select timespan_seconds('PT1.5S') as r;
+→ [{"r":1.5}]
+
+select timespan_total_seconds('P1D') as a, timespan_total_hours('P1D') as b;
+→ [{"a":86400,"b":24}]
+
+-- ===================================
+-- 4. TEXT-returning functions
+-- ===================================
+select json_type(j) as r from drt;
+→ [{"r":"object"}]
+
+select json_quote(j) = '{"a":"x"}' as r from drt;
+→ [{"r":true}]
+
+select typeof(json_quote(j)) as r from drt;
+→ [{"r":"text"}]
+
+select strftime('%Y', d) = '2024' as r from drt;
+→ [{"r":true}]
+
+-- A TEXT-typed value is not a number: the numeric builtins reject it at plan time, the
+-- same way they reject a text column. Convert first with integer()/real().
+select abs(strftime('%Y', d)) as r from drt;
+-- error: Invalid argument types for function abs
+
+select abs(integer(strftime('%Y', d))) as r from drt;
+→ [{"r":2024}]
+
+-- ===================================
+-- 5. BLOB-returning randomblob
+-- ===================================
+select typeof(randomblob(4)) as t, length(randomblob(4)) as n;
+→ [{"t":"blob","n":4}]
+
+select randomblob(0) = randomblob(0) as r;
+→ [{"r":true}]
+
+-- ===================================
+-- 6. JSON-returning functions compare structurally against a JSON column
+-- ===================================
+-- Both sides now declare JSON, so `=` routes through JSON_TYPE.compare (structural)
+-- rather than the object-cast arm. The answer must not move.
+select json_object('a','x') = j as r from drt;
+→ [{"r":true}]
+
+select json_array(1,2) = json_array(1,2) as r;
+→ [{"r":true}]
+
+select json_set(j, '$.b', 1) = json_object('a','x','b',1) as r from drt;
+→ [{"r":true}]
+
+select json_remove(json_object('a','x','b',1), '$.b') = j as r from drt;
+→ [{"r":true}]
+
+select json_insert(j, '$.b', 2) = json_object('a','x','b',2) as r from drt;
+→ [{"r":true}]
+
+select json_replace(j, '$.a', 'y') = json_object('a','y') as r from drt;
+→ [{"r":true}]
+
+select typeof(json_object('a','x')) as r;
+→ [{"r":"json"}]
+
+-- ===================================
+-- 7. Write path: convert exactly once
+-- ===================================
+-- A JSON-declared function's result matches a JSON column's type exactly, so
+-- buildRowCoercion skips conversion and the native object is stored directly — no
+-- second parse. Storing text (json_quote) into the same column DOES convert, once.
+create table jw (id integer primary key, j json);
+insert into jw(id, j) select 1, json_object('a','x');
+insert into jw(id, j) select 2, json_quote(j) from drt;
+-- run
+
+select id, typeof(j) as t from jw order by id;
+→ [{"id":1,"t":"json"},{"id":2,"t":"json"}]
+
+select count(*) as c from jw where j = json_object('a','x');
+→ [{"c":2}]
+
+-- ===================================
+-- 8. The variadic date/time/datetime functions declare TEXT, not DATE/TIME/DATETIME
+-- ===================================
+-- They emit SQLite's display spelling, which is NOT the canonical stored spelling of the
+-- temporal types: datetime() uses a space separator and time(...,'subsec') always emits
+-- three fractional digits. Declaring the temporal type would make the write path treat
+-- those as already-canonical and store the display spelling, which the temporal types
+-- compare as binary text — so a canonically-written value would stop matching. TEXT keeps
+-- the conversion, and these are the values that conversion must produce.
+select date('2024-03-04', '+1 day') as a, time('12:00:00', 'subsec') as b,
+	datetime('2024-03-04 05:06:07', '+1 day') as c;
+→ [{"a":"2024-03-05","b":"12:00:00.000","c":"2024-03-05 05:06:07"}]
+
+create table dw (id integer primary key, dd date, tt time, dt datetime);
+insert into dw(id, dd, tt, dt)
+	select 1, date('2024-03-04', '+1 day'), time('12:00:00', 'subsec'),
+		datetime('2024-03-04 05:06:07', '+1 day');
+-- run
+
+-- Stored in each type's canonical spelling — 'T' separator, trimmed milliseconds.
+select dd, tt, dt from dw;
+→ [{"dd":"2024-03-05","tt":"12:00:00","dt":"2024-03-05T05:06:07"}]
+
+select dt = '2024-03-05T05:06:07' as r from dw;
+→ [{"r":true}]
+
+-- Comparing the function's own result against a literal is unchanged.
+select date('2024-03-04', '+1 day') = '2024-03-05' as r;
+→ [{"r":true}]
+
+select date(d, '+1 day') = '2024-03-05' as r from drt;
+→ [{"r":true}]
+
+-- Temporal arithmetic over the result still works — it is dispatched on the runtime
+-- value's shape, not on the declared type.
+select date('2024-03-04', '+1 day') + 'P1D' as r;
+→ [{"r":"2024-03-06"}]
+
+drop table dw;
+drop table jw;
+drop table drt;

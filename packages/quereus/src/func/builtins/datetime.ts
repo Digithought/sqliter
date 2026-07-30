@@ -3,6 +3,7 @@ import { Temporal } from 'temporal-polyfill';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { quereusError } from '../../common/errors.js';
+import { BOOLEAN_RETURN_NOT_NULL, INTEGER_RETURN, REAL_RETURN, TEXT_RETURN } from './return-types.js';
 
 const log = createLogger('func:builtins:datetime');
 const warnLog = log.extend('warn');
@@ -453,8 +454,25 @@ function formatDateTime(dt: Temporal.ZonedDateTime, subsec: boolean): string {
 
 // All date/time functions are non-deterministic because they accept 'now'.
 
+// TEXT, not DATE / TIME / DATETIME, for the three variadic modifier-accepting forms
+// below — a deliberate divergence from their single-argument conversion siblings
+// (`date/1`, `time/1`, `datetime/1` in conversion.ts), which DO declare the temporal
+// types. These functions emit SQLite's *display* spelling, which is not the canonical
+// stored spelling of those types:
+//   - datetime() separates date and time with a SPACE; DATETIME_TYPE.parse canonicalizes
+//     to the ISO 'T' form.
+//   - time(..., 'subsec') always emits three fractional digits ('12:00:00.000');
+//     TIME_TYPE.parse trims them ('12:00:00').
+// Declaring the temporal type would tell buildRowCoercion the value is already in
+// declared form, so `insert into t(dt) select datetime(x, '+1 day')` would store the
+// display spelling verbatim into a DATETIME column — where `compare` is binary text, so
+// the row would stop matching the canonical spelling every other write produces.
+// `date()` alone is canonical (YYYY-MM-DD either way), but typing it apart from its two
+// siblings is a worse trap than typing all three the same. Reconciling the two families
+// (canonicalize the output, or teach the write path) is tracked by
+// `debt-variadic-datetime-functions-not-temporally-typed`.
 export const dateFunc = createScalarFunction(
-	{ name: 'date', numArgs: -1, deterministic: false },
+	{ name: 'date', numArgs: -1, deterministic: false, returnType: TEXT_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		const { dt } = processDateTimeArgs(args);
 		return dt ? formatDate(dt) : null;
@@ -462,7 +480,7 @@ export const dateFunc = createScalarFunction(
 );
 
 export const timeFunc = createScalarFunction(
-	{ name: 'time', numArgs: -1, deterministic: false },
+	{ name: 'time', numArgs: -1, deterministic: false, returnType: TEXT_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		const { dt, subsec } = processDateTimeArgs(args);
 		return dt ? formatTime(dt, subsec) : null;
@@ -470,7 +488,7 @@ export const timeFunc = createScalarFunction(
 );
 
 export const datetimeFunc = createScalarFunction(
-	{ name: 'datetime', numArgs: -1, deterministic: false },
+	{ name: 'datetime', numArgs: -1, deterministic: false, returnType: TEXT_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		const { dt, subsec } = processDateTimeArgs(args);
 		return dt ? formatDateTime(dt, subsec) : null;
@@ -478,7 +496,7 @@ export const datetimeFunc = createScalarFunction(
 );
 
 export const juliandayFunc = createScalarFunction(
-	{ name: 'julianday', numArgs: -1, deterministic: false },
+	{ name: 'julianday', numArgs: -1, deterministic: false, returnType: REAL_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		const { dt } = processDateTimeArgs(args);
 		return dt ? toJulianDay(dt) : null;
@@ -496,7 +514,7 @@ export const juliandayFunc = createScalarFunction(
  * 1970-01-01 00:00:00 UTC.
  */
 export const epochSFunc = createScalarFunction(
-	{ name: 'epoch_s', numArgs: -1, deterministic: false },
+	{ name: 'epoch_s', numArgs: -1, deterministic: false, returnType: INTEGER_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		const dt = processStrictArgs(args);
 		return dt ? toEpochSeconds(dt) : null;
@@ -509,7 +527,7 @@ export const epochSFunc = createScalarFunction(
  * Epoch values are always relative to UTC regardless of timezone modifiers.
  */
 export const epochMsFunc = createScalarFunction(
-	{ name: 'epoch_ms', numArgs: -1, deterministic: false },
+	{ name: 'epoch_ms', numArgs: -1, deterministic: false, returnType: INTEGER_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		const dt = processStrictArgs(args);
 		return dt ? toEpochMilliseconds(dt) : null;
@@ -522,7 +540,7 @@ export const epochMsFunc = createScalarFunction(
  * Same strict parsing as epoch_s. Use epoch_s() when integer precision suffices.
  */
 export const epochSFracFunc = createScalarFunction(
-	{ name: 'epoch_s_frac', numArgs: -1, deterministic: false },
+	{ name: 'epoch_s_frac', numArgs: -1, deterministic: false, returnType: REAL_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		const dt = processStrictArgs(args);
 		return dt ? toEpochSecondsFractional(dt) : null;
@@ -602,7 +620,7 @@ function formatStrftimeSpecifier(spec: string, dt: Temporal.ZonedDateTime): stri
 }
 
 export const strftimeFunc = createScalarFunction(
-	{ name: 'strftime', numArgs: -1, deterministic: false },
+	{ name: 'strftime', numArgs: -1, deterministic: false, returnType: TEXT_RETURN },
 	(format: SqlValue, ...timeArgs: SqlValue[]): SqlValue => {
 		if (typeof format !== 'string') return null;
 		const { dt } = processDateTimeArgs(timeArgs);
@@ -620,7 +638,7 @@ export const strftimeFunc = createScalarFunction(
 // --- ISO Validation Functions --- //
 
 export const isISODateFunc = createScalarFunction(
-	{ name: 'IsISODate', numArgs: 1, deterministic: true },
+	{ name: 'IsISODate', numArgs: 1, deterministic: true, returnType: BOOLEAN_RETURN_NOT_NULL },
 	(value: SqlValue): SqlValue => {
 		if (typeof value !== 'string') return false;
 		const s = value.trim();
@@ -631,7 +649,7 @@ export const isISODateFunc = createScalarFunction(
 );
 
 export const isISODateTimeFunc = createScalarFunction(
-	{ name: 'IsISODateTime', numArgs: 1, deterministic: true },
+	{ name: 'IsISODateTime', numArgs: 1, deterministic: true, returnType: BOOLEAN_RETURN_NOT_NULL },
 	(value: SqlValue): SqlValue => {
 		if (typeof value !== 'string') return false;
 		const s = value.trim();

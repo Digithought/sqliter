@@ -214,6 +214,19 @@ This ensures type information flows through the entire planning and execution pi
 - Arithmetic: Supports addition/subtraction with DATE, TIME, DATETIME types
 - Human-readable parsing: `timespan('1 hour 30 minutes')` → `"PT1H30M"`
 
+**Two families of date/time functions, typed differently.** The single-argument
+conversion functions `date(x)`, `time(x)`, `datetime(x)` (`func/builtins/conversion.ts`)
+return DATE / TIME / DATETIME and produce each type's canonical spelling. The
+modifier-accepting variadic forms `date(x, …)`, `time(x, …)`, `datetime(x, …)`
+(`func/builtins/datetime.ts`) return **TEXT**: they emit SQLite's *display* spelling,
+which is not canonical — `datetime()` separates date and time with a space rather than
+`T`, and `time(…, 'subsec')` always emits three fractional digits where TIME trims them.
+Declaring the temporal type on those would make the write path treat the value as already
+in declared form (see "Where coercion happens (and why exactly once)") and store the
+display spelling into a temporal column, where comparison is binary text — so the row
+would stop matching canonically-written values. Reconciling the two families is tracked by
+`debt-variadic-datetime-functions-not-temporally-typed`.
+
 ### Special Types
 
 **NULL**
@@ -1060,6 +1073,12 @@ Declaring neither `returnType` nor `inferReturnType` yields `ANY_TYPE` — the e
   `my_text_func(x) = 'abc'` silently became `… = 0` and was always false.
 - `Database.createScalarFunction` / `createAggregateFunction` never pass a `returnType`, so
   every user- and plugin-registered function lands on this default.
+- Every **built-in** scalar function now declares a `returnType` or an `inferReturnType`,
+  with one deliberate exception: `json_extract`, whose result shape depends on the data
+  rather than on the argument types, declares `ANY_TYPE` explicitly. The shared shape
+  constants live in `func/builtins/return-types.ts` (`TEXT_RETURN`, `INTEGER_RETURN`,
+  `REAL_RETURN`, `BOOLEAN_RETURN`, `BLOB_RETURN`, `JSON_RETURN`, `ANY_RETURN`, plus
+  `_NOT_NULL` variants) — use them rather than re-spelling the four-field literal.
 
 Because of that default, **`validateArgTypes` must let an argument through whose type the
 planner cannot classify** — rejecting `ANY` at plan time makes the function unusable over

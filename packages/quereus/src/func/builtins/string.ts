@@ -3,6 +3,7 @@ import type { Row, SqlValue, DeepReadonly } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import { simpleLike, simpleGlob } from '../../util/patterns.js';
 import { INTEGER_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
+import { BOOLEAN_RETURN } from './return-types.js';
 import type { LogicalType } from '../../types/logical-type.js';
 
 const log = createLogger('func:builtins:scalar');
@@ -91,8 +92,9 @@ export const substringFunc = createScalarFunction(
 	substrImpl
 );
 
+// Nullable: `like(null, x)` and `like(p, null)` are NULL, not false.
 export const likeFunc = createScalarFunction(
-	{ name: 'like', numArgs: 2, deterministic: true },
+	{ name: 'like', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN },
 	(pattern: SqlValue, text: SqlValue): SqlValue => {
 		if (text === null || pattern === null) return null;
 		return simpleLike(String(pattern), String(text));
@@ -100,7 +102,7 @@ export const likeFunc = createScalarFunction(
 );
 
 export const globFunc = createScalarFunction(
-	{ name: 'glob', numArgs: 2, deterministic: true },
+	{ name: 'glob', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN },
 	(pattern: SqlValue, text: SqlValue): SqlValue => {
 		if (text === null || pattern === null) return null;
 		return simpleGlob(String(pattern), String(text));

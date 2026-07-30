@@ -9,6 +9,7 @@ import type { EmissionContext } from '../../runtime/emission-context.js';
 import type { Instruction, RuntimeContext } from '../../runtime/types.js';
 import { asRun } from '../../runtime/types.js';
 import { emitPlanNode } from '../../runtime/emitters.js';
+import { BLOB_RETURN, INTEGER_RETURN_NOT_NULL, REAL_RETURN } from './return-types.js';
 import { effectiveComparisonCollation, effectiveGroupCollation } from '../../planner/analysis/comparison-collation.js';
 import { makeGroupComparator, makeOperandComparator, formatOperandCollationNote } from '../../runtime/emit/operand-comparator.js';
 
@@ -237,7 +238,7 @@ export const typeofFunc = createScalarFunction(
 
 // --- random() ---
 export const randomFunc = createScalarFunction(
-	{ name: 'random', numArgs: 0, deterministic: false },
+	{ name: 'random', numArgs: 0, deterministic: false, returnType: INTEGER_RETURN_NOT_NULL },
 	(): SqlValue => {
 		const randomInt = Math.floor(Math.random() * (Number.MAX_SAFE_INTEGER - Number.MIN_SAFE_INTEGER + 1)) + Number.MIN_SAFE_INTEGER;
 		return BigInt(randomInt);
@@ -246,7 +247,7 @@ export const randomFunc = createScalarFunction(
 
 // --- randomblob(N) ---
 export const randomblobFunc = createScalarFunction(
-	{ name: 'randomblob', numArgs: 1, deterministic: false },
+	{ name: 'randomblob', numArgs: 1, deterministic: false, returnType: BLOB_RETURN },
 	(nVal: SqlValue): SqlValue => {
 		if (typeof nVal !== 'number' && typeof nVal !== 'bigint') return null;
 		const n = Number(nVal);
@@ -329,13 +330,15 @@ const pow = (base: SqlValue, exponent: SqlValue): SqlValue => {
 	return Math.pow(numBase, numExp);
 };
 
+// REAL rather than inferred-from-input: unlike abs/round/floor/ceil, Math.pow is not
+// closed over the integers (`pow(2, -1)` is 0.5), so the input type is not the answer.
 export const powFunc = createScalarFunction(
-	{ name: 'pow', numArgs: 2, deterministic: true },
+	{ name: 'pow', numArgs: 2, deterministic: true, returnType: REAL_RETURN },
 	pow
 );
 
 export const powerFunc = createScalarFunction(
-	{ name: 'power', numArgs: 2, deterministic: true },
+	{ name: 'power', numArgs: 2, deterministic: true, returnType: REAL_RETURN },
 	pow
 );
 
