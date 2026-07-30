@@ -166,3 +166,21 @@ SELECT a, b FROM agg_fd_ec WHERE a = b GROUP BY a, b ORDER BY a;
 → [{"a":1,"b":1},{"a":2,"b":2},{"a":3,"b":3}]
 
 DROP TABLE agg_fd_ec;
+
+-- count(distinct blob_col) — the DISTINCT tree's entry is the bare BLOB scalar
+-- (a Uint8Array), which inheritree's default freeze-on-insert cannot store
+-- (bug-in-subquery-blob-values-crash). Without GROUP BY (single accumulator)
+-- and with GROUP BY (per-group tree), covering both the no-group and
+-- streaming-group branches of the stream-aggregate emitter.
+CREATE TABLE agg_blob (id INTEGER PRIMARY KEY, grp TEXT, b BLOB NULL);
+INSERT INTO agg_blob VALUES
+	(1, 'a', x'6162'), (2, 'a', x'6162'), (3, 'a', x'6164'),
+	(4, 'b', x'6162'), (5, 'b', null);
+
+SELECT count(distinct b) AS cd FROM agg_blob;
+→ [{"cd":2}]
+
+SELECT grp, count(distinct b) AS cd FROM agg_blob GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","cd":2},{"grp":"b","cd":1}]
+
+DROP TABLE agg_blob;

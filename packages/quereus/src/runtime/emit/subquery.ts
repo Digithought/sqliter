@@ -6,8 +6,8 @@ import type { SqlValue, Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { BTree } from 'inheritree';
 import { compareSqlValuesFast, hasSemanticOrdering, semanticKeyTransform } from '../../util/comparison.js';
+import { createValueSet } from '../../util/value-set.js';
 import { ConstantNode } from '../../planner/nodes/plan-node.js';
 import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
 import { effectiveInCollation, inRhsTypes } from '../../planner/analysis/comparison-collation.js';
@@ -227,8 +227,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				if (!probe) {
 					// First evaluation that needs the set: drain the source once into a
 					// BTree keyed under the membership collation, tracking inner NULLs.
-					const tree = new BTree<SqlValue, SqlValue>(
-						(val: SqlValue) => val,
+					const tree = createValueSet<SqlValue>(
 						(a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation)
 					);
 					let hasNull = false;
@@ -309,8 +308,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 		if (allConstant) {
 			// Pre-build BTree at emit time for constant values
-			const tree = new BTree<SqlValue, SqlValue>(
-				(val: SqlValue) => val,
+			const tree = createValueSet<SqlValue>(
 				(a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation)
 			);
 			let hasNull = false;

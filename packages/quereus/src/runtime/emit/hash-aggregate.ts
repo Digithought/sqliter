@@ -8,7 +8,8 @@ import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { isRelationalNode } from '../../planner/nodes/plan-node.js';
-import { BTree } from 'inheritree';
+import type { BTree } from 'inheritree';
+import { createValueSet } from '../../util/value-set.js';
 import { logContextPush, logContextPop } from '../utils.js';
 import { coerceForAggregate } from '../../util/coercion.js';
 import { quereusError } from '../../common/errors.js';
@@ -108,10 +109,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 		function createDistinctTrees(): (BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]> | null)[] {
 			return aggregateDistinctFlags.map((isDistinct, i) =>
-				isDistinct ? new BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]>(
-					(val: SqlValue | SqlValue[]) => val,
-					distinctComparators[i]
-				) : null
+				isDistinct ? createValueSet<SqlValue | SqlValue[]>(distinctComparators[i]) : null
 			);
 		}
 

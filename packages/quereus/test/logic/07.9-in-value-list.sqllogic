@@ -123,3 +123,32 @@ select distinct w from t2 where w in (5, null, 5, 9) order by w;
 → [{"w":5}]
 
 drop table t2;
+
+-- ===== BLOB constant value list (bug-in-subquery-blob-values-crash) =====
+-- This path pre-builds a BTree at plan-emit time, so a BLOB element crashed
+-- unconditionally, even before any row was scanned: inheritree freezes each
+-- stored entry by default, and Object.freeze throws on a non-empty
+-- Uint8Array, which is exactly what a BLOB scalar is.
+
+create table t3 (id integer primary key, b blob null);
+insert into t3 values (1, x'6162'), (2, x'6164'), (3, null);
+
+select id from t3 where b in (x'6162', x'6164') order by id;
+→ [{"id":1},{"id":2}]
+
+-- A NULL list element contributes no match, but turns a miss into NULL
+select id from t3 where b in (x'6162', null) order by id;
+→ [{"id":1}]
+
+select id, b in (x'6162', null) as r from t3 order by id;
+→ [{"id":1,"r":true},{"id":2,"r":null},{"id":3,"r":null}]
+
+-- Empty BLOB literal x'' is a distinct, valid zero-length value, not NULL:
+-- a miss against a NULL-bearing list is still NULL, and it matches itself.
+select x'' in (x'6162', null) as r;
+→ [{"r":null}]
+
+select x'' in (x'', x'6162') as r;
+→ [{"r":true}]
+
+drop table t3;

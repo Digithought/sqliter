@@ -11,7 +11,8 @@ import { isRelationalNode } from '../../planner/nodes/plan-node.js';
 import { createTypedComparator } from '../../util/comparison.js';
 import { bindAggregateSchemas, buildDistinctComparators, computeAggregateSkipCoercion } from './aggregate-setup.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { BTree } from 'inheritree';
+import type { BTree } from 'inheritree';
+import { createValueSet } from '../../util/value-set.js';
 import { createLogger } from '../../common/logger.js';
 import { logContextPush, logContextPop } from '../utils.js';
 import { coerceForAggregate } from '../../util/coercion.js';
@@ -149,10 +150,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 			// For DISTINCT aggregates, track unique values using BTree with pre-resolved typed comparators
 			const distinctTrees: (BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]> | null)[] = aggregateDistinctFlags.map((isDistinct, i) =>
-				isDistinct ? new BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]>(
-					(val: SqlValue | SqlValue[]) => val,
-					distinctComparators[i]
-				) : null
+				isDistinct ? createValueSet<SqlValue | SqlValue[]>(distinctComparators[i]) : null
 			);
 
 			// Track the last source row for representative row in combined descriptor
@@ -372,10 +370,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 							return cloneInitialValue(isAggregateFunctionSchema(schema) ? schema.initialValue : undefined);
 						});
 						currentDistinctTrees = aggregateDistinctFlags.map((isDistinct, i) =>
-							isDistinct ? new BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]>(
-								(val: SqlValue | SqlValue[]) => val,
-								distinctComparators[i]
-							) : null
+							isDistinct ? createValueSet<SqlValue | SqlValue[]>(distinctComparators[i]) : null
 						);
 						// Set representative row for the new group (which is the current row)
 						currentSourceRow = row;
@@ -387,10 +382,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 							return cloneInitialValue(isAggregateFunctionSchema(schema) ? schema.initialValue : undefined);
 						});
 						currentDistinctTrees = aggregateDistinctFlags.map((isDistinct, i) =>
-							isDistinct ? new BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]>(
-								(val: SqlValue | SqlValue[]) => val,
-								distinctComparators[i]
-							) : null
+							isDistinct ? createValueSet<SqlValue | SqlValue[]>(distinctComparators[i]) : null
 						);
 						// Set representative row for the first group
 						currentSourceRow = row;
