@@ -64,10 +64,28 @@ function* scanLayerResolved(
 		// of the seen-set is not), so a Set of the lossless, type-aware PK encoding
 		// (collation-independent — see utils/primary-key-encode.ts) is lighter than a
 		// full BTree and keys on the same value-identity the PK comparator would.
-		const { primaryKeyExtractorFromRow, primaryKeyEncoder: encodePk } =
+		const { primaryKeyExtractorFromRow, primaryKeyEncoder: encodePk, primaryKeyComparator } =
 			layer.getPkExtractorsAndComparators(seekSchema);
 		const seen = new Set<string>();
-		for (const key of plan.equalityKeys) {
+		// `quereus-isolation` merges this scan with a staged-row stream under the
+		// assumption both arrive in the scanned structure's own key order (see
+		// merge-iterator.ts). A multi-seek's keys arrive in seek-argument order
+		// (the order the IN-list appears in the SQL text), which need not match —
+		// sort them under the scanned structure's own comparator so this backend
+		// keeps the same emission-order contract the store backend already honors
+		// (see store-table-scan.ts). Reversed when the physical walk is descending,
+		// since a reverse walk of the structure emits its keys backwards too.
+		const keyComparator = plan.indexName === 'primary'
+			? primaryKeyComparator
+			: layer.getSecondaryIndex(plan.indexName)?.compareKeys;
+		let orderedKeys = plan.equalityKeys;
+		if (keyComparator) {
+			const cmp = keyComparator;
+			orderedKeys = [...plan.equalityKeys].sort(plan.descending
+				? (a, b) => -cmp(a, b)
+				: cmp);
+		}
+		for (const key of orderedKeys) {
 			if (seekKeyHasNull(key, comparators.keyIsTuple)) continue;
 			const singlePlan: ScanPlan = { ...plan, equalityKey: key, equalityKeys: undefined };
 			for (const row of scanLayerResolved(layer, singlePlan, comparators)) {
@@ -215,9 +233,9 @@ function* scanLayerResolved(
 		// merges the overlay scan with this scan using sort key `[indexKeyParts…, pkParts…]`
 		// and assumes both streams share that order. The entry's `primaryKeys` Map is in
 		// insertion order, so fetch the PK-comparator-sorted view from the MemoryIndex
-		// (memoized there). The inline sort is a defensive fallback for a layer that does
-		// not expose `getSecondaryIndex` (`primaryKeyComparator` is already in scope).
-		const secondaryIndex = layer.getSecondaryIndex?.(plan.indexName);
+		// (memoized there). The inline sort is a defensive fallback for an index name the
+		// layer's schema does not know (`primaryKeyComparator` is already in scope).
+		const secondaryIndex = layer.getSecondaryIndex(plan.indexName);
 		const sortedPrimaryKeys = (indexEntry: MemoryIndexEntry): readonly BTreeKeyForPrimary[] =>
 			secondaryIndex
 				? secondaryIndex.getSortedPrimaryKeys(indexEntry)

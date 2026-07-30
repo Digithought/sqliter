@@ -563,6 +563,19 @@ the planner's typed, validated {@link AccessPath} record (`resolveScanIndex` in
 | `index`, `role: 'secondary'` | `(indexKey…, pk…)`, using the descriptor's full `keyColumns`   |
 | `unresolvedIndex`            | **INTERNAL error** (see below)                                |
 
+This holds **regardless of the plan kind**, not only for a plain unbounded or bounded-range
+scan: a `multiSeek` (`plan=5`, e.g. `WHERE pk IN (3, 1, 2)`) on an index with `role:
+'primary'` still merges by primary key, so the underlying module owes ascending (or, for a
+`DESC` leading key, descending) primary-key emission order for its multi-seek too — not the
+order its seek keys were handed to it (seek-argument order, i.e. the order the `IN` list
+appears in the SQL text). A multi-seek that visits keys in seek-argument order instead
+mis-pairs overlay rows against stale stored rows whenever that order does not already
+happen to match key order (fix/bug-isolation-multiseek-merge-order). Both shipped
+backends — the in-memory table (`scan-layer.ts`) and the persistent store
+(`store-table-scan.ts`) — sort their multi-seek keys under the index's own key comparator
+before visiting them for exactly this reason; see `docs/module-authoring.md` for the
+contract as stated to third-party module authors.
+
 `role` is authoritative, not `name`. A module that mints a per-plan alias for its primary
 key (lamina-quereus appends a counter: `_primary_` → `_primary_1`, `_primary_2`, …) is still
 recognised as a PK walk because it returns an `indexDescriptor` with `role: 'primary'`. When

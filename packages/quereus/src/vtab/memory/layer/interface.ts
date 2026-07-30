@@ -63,8 +63,8 @@ export interface Layer {
 	/** Helper to get the specific BTree for a secondary index's underlying data */
 	getSecondaryIndexTree(indexName: string): BTree<BTreeKeyForIndex, MemoryIndexEntry> | null;
 
-	/** Returns the MemoryIndex object for a named secondary index, or undefined */
-	getSecondaryIndex?(indexName: string): MemoryIndex | undefined;
+	/** Returns the MemoryIndex object for a named secondary index, or undefined if none exists */
+	getSecondaryIndex(indexName: string): MemoryIndex | undefined;
 
 	/**
 	 * This method provides PK extractor and comparator based on a given schema (usually its own)

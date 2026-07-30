@@ -255,6 +255,20 @@ scan direction rather than writing a direction marker anywhere text-visible — 
 isolation overlay's merged read) has no way to learn the underlying stream is reversed and merges
 it against a forward comparator, scrambling row order.
 
+**Multi-seek key order is a hard requirement, independent of `providesOrdering`.** A
+`multiSeek` access path (`plan=5`) must emit its rows in the scanned index's own key
+order, never in seek-argument order (the order the `IN` list appears in the SQL text, or
+a runtime set's iteration order) — even though the guidance above says not to *claim*
+`providesOrdering` over such a plan. The transaction-isolation overlay's merge assumes an
+index access path emits in index-key order for any plan kind whose resolved index has
+`role: 'primary'` or names a known secondary index (see Scan direction, above, for the
+`reverse` half of the same contract); it mis-pairs overlay rows against stale stored rows
+when that assumption is violated (fix/bug-isolation-multiseek-merge-order). Both shipped
+backends (the in-memory table and the persistent store) sort their multi-seek keys under
+the index's own key comparator before visiting them for exactly this reason. A module
+whose multi-seek does not sort equivalently corrupts reads for any table wrapped in
+`create table ... using isolated`.
+
 A module that aliases an index name **without** supplying a matching `indexDescriptor` has its
 access path recorded as `{ kind: 'unresolvedIndex' }` (and the engine logs a warning). Order-
 sensitive consumers refuse an unresolved plan rather than guess — so the alias-without-

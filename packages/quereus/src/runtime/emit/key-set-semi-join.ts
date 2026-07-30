@@ -100,6 +100,12 @@ export function emitKeySetSemiJoin(plan: KeySetSemiJoinNode, ctx: EmissionContex
 	// Seek keys are sorted under the INDEX's leading-key-column collation so the
 	// stamped multi-seek arrives in index-key order — required by the isolation
 	// overlay's ascending-merge assumption and what makes emission deterministic.
+	// NOTE: both memory-table branches (scan-layer.ts) and the persistent store
+	// (store-table-scan.ts) now also sort a multiSeek's keys into index order
+	// themselves (fix/bug-isolation-multiseek-merge-order), so this sort is
+	// redundant against those backends today. It is NOT dead: it is the only sort
+	// for a backend that does not, and dropping it would silently reintroduce an
+	// ordering dependency on backend internals. Keep it.
 	const seekCollation = ctx.resolveCollation(
 		normalizeCollationName(plan.pushdown.accessPath.index.keyColumns[0].collation ?? 'BINARY'));
 	const seekSign = plan.pushdown.seekDescending ? -1 : 1;
