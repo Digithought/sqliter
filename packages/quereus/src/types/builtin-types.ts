@@ -277,11 +277,13 @@ export const NUMERIC_TYPE: LogicalType = {
 
 			// Try integer first. Past 2^53 rebuild from the digit string, not the
 			// rounded number — same safe-integer boundary as the lexer's number()
-			// for INTEGER literals.
-			if (/^-?\d+$/.test(trimmed)) {
+			// for INTEGER literals. An explicit '+' is accepted here so this arm
+			// agrees with INTEGER_TYPE.parse, but stripped before BigInt(), which
+			// rejects the sign that Number() accepts.
+			if (/^[+-]?\d+$/.test(trimmed)) {
 				const parsed = Number(trimmed);
 				if (Number.isSafeInteger(parsed)) return parsed;
-				return BigInt(trimmed);
+				return BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed);
 			}
 
 			// Fall back to real

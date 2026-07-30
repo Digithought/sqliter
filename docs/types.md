@@ -130,6 +130,12 @@ This ensures type information flows through the entire planning and execution pi
 - Values: `number` (safe integers) or `bigint`
 - Comparison: Numeric ordering
 - Collations: None
+- Text conversion (`cast('…' as integer)`, `integer('…')`, and the plan-time cast the
+  planner inserts for a numeric-vs-text comparison) reads the leading integer run and
+  returns a `number` while it stays a safe integer, an exact `bigint` beyond that —
+  the same boundary the lexer applies to INTEGER literals. There is **no 64-bit clamp**:
+  `cast('99999999999999999999999999' as integer)` is exact rather than SQLite's
+  `INT64_MAX`, matching Quereus' arbitrary-precision integer literals.
 
 **REAL**
 - Physical: `PhysicalType.REAL`
@@ -140,7 +146,10 @@ This ensures type information flows through the entire planning and execution pi
 **NUMERIC** (SQLite's NUMERIC affinity — integer if it fits, else real)
 - Physical: `PhysicalType.REAL`
 - Values: `number` or `bigint` — both halves are accepted by `validate`/`parse`, so a
-  NUMERIC column can hold a whole number past 2^53 in exact `bigint` form
+  NUMERIC column can hold a whole number past 2^53 in exact `bigint` form, including one
+  written as text (`insert into t(numeric_col) values ('9007199254740993')`). Only an
+  all-digit string takes that integer arm; a fractional spelling (`'9007199254740993.0'`)
+  falls through to REAL and rounds, as in SQLite
 - Comparison: numeric ordering with REAL's NaN handling (NaN sorts smallest, NaN = NaN).
   Mixed `number`/`bigint` pairs are ordered by exact mathematical value — NUMERIC has its
   own comparator rather than delegating to REAL's, whose `isNaN` throws on a bigint

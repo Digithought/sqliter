@@ -408,6 +408,22 @@ select cast(v as text) as v from (select cast('9223372036854775807' as integer) 
 select cast(v as text) as v from (select cast('99999999999999999999999999' as integer) as v);
 → [{"v":"99999999999999999999999999"}]
 
+-- Explicit leading '+': BigInt() rejects the '+' that Number() accepts, so the sign is
+-- stripped before the bigint is rebuilt. Without that, this would fall to castFallback (0).
+select cast(v as text) as v from (select cast('+9007199254740993' as integer) as v);
+→ [{"v":"9007199254740993"}]
+
+select cast(v as text) as v from (select cast('+9007199254740993' as numeric) as v);
+→ [{"v":"9007199254740993"}]
+
+select cast('+42' as numeric) as v;
+→ [{"v":42}]
+
+-- The integer() conversion function shares INTEGER_TYPE.parse with CAST, and the docs
+-- prefer it over CAST syntax — it must agree past 2^53.
+select cast(v as text) as v from (select integer('9007199254740993') as v);
+→ [{"v":"9007199254740993"}]
+
 -- A fractional form is not all-digit, so it falls through to parseFloat and stays
 -- a REAL (double) even past 2^53 — this matches SQLite and is unaffected by the fix.
 select cast('9007199254740993.0' as numeric) as v;
@@ -449,4 +465,13 @@ CREATE TABLE numeric_text_insert (v NUMERIC);
 INSERT INTO numeric_text_insert VALUES ('9007199254740993');
 select cast(v as text) as v from numeric_text_insert;
 → [{"v":"9007199254740993"}]
+
+-- Same for a declared INTEGER column, which runs a different parse() than NUMERIC.
+-- INTEGER_TYPE.validate only accepts a number that is a SAFE integer, so a write-time
+-- parse that yielded a rounded (unsafe) number would fail the column type check outright.
+CREATE TABLE integer_text_insert (v INTEGER);
+INSERT INTO integer_text_insert VALUES ('9007199254740993');
+select cast(v as text) as v from integer_text_insert;
+→ [{"v":"9007199254740993"}]
+DROP TABLE integer_text_insert;
 DROP TABLE numeric_text_insert;
