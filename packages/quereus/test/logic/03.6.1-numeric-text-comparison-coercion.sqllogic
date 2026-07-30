@@ -39,6 +39,11 @@ select case i when '1' then 'hit' else 'miss' end as v from nn;
 select nullif(i, '1') as v from nn;
 → [{"v":null}]
 
+-- NOTE: the returned 2 is the INTEGER the coercion produced, not the original
+-- text '2'. `greatest`/`least`/`nullif` return one of their arguments, and the
+-- comparison coercion currently replaces that argument with its cast — tracked
+-- by `bug-comparison-coercion-corrupts-returned-value`. When that lands this
+-- expectation becomes the text '2'; the comparison itself is what this file pins.
 select greatest(i, '2') as v from nn;
 → [{"v":2}]
 
@@ -91,6 +96,26 @@ select t in (select i from nn) as v from tt;
 
 select case t when 1 then 'hit' else 'miss' end as v from tt;
 → [{"v":"hit"}]
+
+-- A NULL member does not defeat the hoisted probe cast (it is filtered out of the
+-- all-numeric test), and the three-valued result still holds: a hit is true, a
+-- miss over a list containing NULL is NULL rather than false.
+select t in (1, null) as v from tt;
+→ [{"v":true}]
+
+select t in (9, null) as v from tt;
+→ [{"v":null}]
+
+select t not in (0, 2) as v from tt;
+→ [{"v":true}]
+
+select t not in (1, 2) as v from tt;
+→ [{"v":false}]
+
+-- Mixed INTEGER/REAL member list widens the hoisted probe cast to NUMERIC rather
+-- than picking a lossy winner, so a textual '1' still matches the integer member.
+select t in (1, 2.5) as v from tt;
+→ [{"v":true}]
 
 -- ===================================
 -- 4. Negative controls — must NOT change, and are the things a future

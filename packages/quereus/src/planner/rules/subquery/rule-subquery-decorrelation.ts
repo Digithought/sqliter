@@ -393,6 +393,11 @@ function extractUncorrelatedIn(
 	// row. That decline is the point: a hash join keyed on the RAW values would rank a
 	// number against a numeric-looking string by storage class and match nothing,
 	// disagreeing with every other spelling of the comparison.
+	// NOTE: the decline costs the hash-join shape for cross-type uncorrelated INs — the
+	// set probe materializes the inner side once and probes per outer row, which is fine
+	// at current inner sizes. If a cross-type `col in (select …)` over a large inner ever
+	// shows up as slow, the move is a coercion-aware equi-pair (key both sides on the
+	// cast result), not reverting the coercion.
 	const [coercedOuter, [coercedInner]] = coerceComparisonSet(outerColRef.scope, outerColRef, [innerColRef]);
 	const condition = new BinaryOpNode(
 		outerColRef.scope,

@@ -91,6 +91,12 @@ JSON documents, and the numeric reading of a numeric-looking string (`nullif(int
 '1')` matches, as `int_col = '1'` does) — rather than raw bytes. See
 [types.md](types.md#comparison-collation-resolution).
 
+That reconciliation currently rewrites the *argument*, not just the comparison, so
+the converted form is also what comes back: `nullif('3', 1)` returns the integer
+`3` rather than the text `'3'`, and `least('abc', 1)` returns `0` — a value that
+was never an argument. Tracked as
+`tickets/fix/bug-comparison-coercion-corrupts-returned-value`.
+
 A NULL argument to `least` wipes the running minimum, so the answer depends on
 argument order: `least(1, null, 3)` is `3`, not `1`. `greatest` skips NULLs
 instead. Tracked as `tickets/backlog/bug-least-null-handling-order-dependent`.
