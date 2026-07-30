@@ -9,6 +9,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type { PhysicalProperties } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
@@ -744,13 +745,17 @@ describe('single-table selectivity declines when the source changes the row popu
 	});
 
 	it('still stamps a filter over row-preserving wrappers (the permissive shapes must not regress)', () => {
-		// Project / Sort / Limit / Distinct all emit a subset of `o`'s own rows, so the
-		// base-table fraction stays the right answer and the strict walk must pass through.
+		// Project / Sort / Limit / Distinct / Window all emit a subset of `o`'s own rows
+		// (Window emits exactly one row per input row), so the base-table fraction stays
+		// the right answer and the strict walk must pass through.
 		const cases: [label: string, sql: string][] = [
 			['project', "SELECT * FROM (SELECT id, cat, qty + 1 AS q1 FROM o) x WHERE x.cat = 'a'"],
 			['sort', "SELECT * FROM (SELECT id, cat FROM o ORDER BY cat) x WHERE x.cat = 'a'"],
 			['limit', "SELECT * FROM (SELECT id, cat FROM o LIMIT 50) x WHERE x.cat = 'a'"],
 			['distinct', "SELECT * FROM (SELECT DISTINCT cat FROM o) x WHERE x.cat = 'a'"],
+			// A window function does not change the row population, so a predicate on a
+			// column it merely passes through still reaches `o`'s statistics.
+			['window', "SELECT * FROM (SELECT cat, row_number() OVER (ORDER BY id) AS rn FROM o) x WHERE x.cat = 'a'"],
 		];
 		for (const [label, sql] of cases) {
 			const f = optimizedFilter(db, sql);
@@ -786,5 +791,64 @@ describe('single-table selectivity declines when the source changes the row popu
 		// has to stop here instead.
 		expect(extractTableSchema(cte as RelationalPlanNode)?.name).to.equal('o');
 		expect(extractRowSourceTableSchema(cte as RelationalPlanNode)).to.be.undefined;
+	});
+});
+
+/**
+ * `rule-async-gather-union-all` (PostOptimization) replaces a unionAll
+ * `SetOperationNode` with an `AsyncGatherNode` that keeps the first branch's
+ * attribute ids verbatim. The rule's cost gate needs `expectedLatencyMs` above
+ * `tuning.parallel.gatherThresholdMs`, which memory-vtab leaves never reach — hence
+ * the synthetic module below, mirroring `parallel-async-gather.spec.ts`.
+ *
+ * `filter-selectivity-restamp` runs in that same pass, so without recognising the
+ * gather, `collectColumnOrigins` would descend into the branches and credit a union
+ * output column to the first branch's base table.
+ */
+class HighLatencyMemoryModule extends MemoryTableModule {
+	readonly expectedLatencyMs = 25;
+}
+
+describe('set-operation attribution survives the async-gather rewrite', () => {
+	let db: Database;
+	/** Distinct count ANALYZE recorded for `o.cat` — the number that must NOT be stamped. */
+	let ndvOCat: number;
+
+	beforeEach(async () => {
+		db = new Database();
+		db.registerModule('hi_lat_memory', new HighLatencyMemoryModule());
+		// Both branches high-latency so the gather's cost gate passes. The two `cat`
+		// distributions deliberately diverge (4 values vs 40, no overlap), so crediting
+		// the union to `o` alone is visibly wrong rather than coincidentally close.
+		await db.exec('CREATE TABLE o (id INTEGER PRIMARY KEY, cat TEXT) USING hi_lat_memory');
+		await db.exec('CREATE TABLE r (id INTEGER PRIMARY KEY, cat TEXT) USING hi_lat_memory');
+		for (let i = 1; i <= 100; i++) {
+			await db.exec(`INSERT INTO o VALUES (${i}, '${['a', 'b', 'c', 'd'][i % 4]}')`);
+			await db.exec(`INSERT INTO r VALUES (${i}, 'x${i % 40}')`);
+		}
+		for await (const _ of db.eval('ANALYZE')) { /* consume */ }
+
+		const n = db.schemaManager.findTable('o')?.statistics?.columnStats.get('cat')?.distinctCount;
+		expect(n, 'ANALYZE should record a distinct count for o.cat').to.be.a('number');
+		ndvOCat = n as number;
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('leaves a filter over a gathered union all unstamped', () => {
+		const plan = (db as unknown as { getPlan(s: string): PlanNode }).getPlan(
+			"SELECT * FROM (SELECT id, cat FROM o UNION ALL SELECT id, cat FROM r) z WHERE z.cat = 'a'");
+
+		// Guard the premise: if the gather rewrite stops firing this test silently
+		// degrades into a duplicate of the plain set-operation case above.
+		expect(findNodeOfType(plan, PlanNodeType.AsyncGather),
+			'expected the unionAll gather rewrite to have fired').to.not.be.undefined;
+		expect(findNodeOfType(plan, PlanNodeType.SetOperation),
+			'the gather replaces the SetOperation outright').to.be.undefined;
+
+		const f = findFilter(plan);
+		expect(f, 'expected a Filter over the gather').to.not.be.undefined;
+		expect(f!.selectivity, 'specifically not the left branch\'s 1/ndv(o.cat)')
+			.to.not.equal(1 / ndvOCat);
+		expect(f!.selectivity, 'a gathered union all output is not a base-table column').to.be.undefined;
 	});
 });

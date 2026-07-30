@@ -31,8 +31,29 @@ import { PlanNodeType } from '../nodes/plan-node-type.js';
  * branch's id while carrying both distributions.
  */
 export function isRowMerging(node: RelationalPlanNode): boolean {
-	return node.nodeType === PlanNodeType.SetOperation
-		|| node.nodeType === PlanNodeType.RecursiveCTE;
+	switch (node.nodeType) {
+		case PlanNodeType.SetOperation:
+		case PlanNodeType.RecursiveCTE:
+			return true;
+		case PlanNodeType.AsyncGather:
+			// `rule-async-gather-union-all` (PostOptimization) REPLACES a unionAll
+			// SetOperation with a gather that keeps children[0]'s attribute ids
+			// verbatim — same forwarding, same hazard, no SetOperation left in the
+			// plan to recognise. Its other combinators are safe: `crossProduct`
+			// concatenates every branch's own ids and `zipByKey` mints fresh ids for
+			// the merged key columns.
+			return asyncGatherCombinatorKind(node) === 'unionAll';
+		default:
+			return false;
+	}
+}
+
+/**
+ * `AsyncGatherNode.combinator.kind`, read structurally so this module stays a leaf
+ * (importing the node class would put `key-utils.ts` at risk of a cycle).
+ */
+function asyncGatherCombinatorKind(node: RelationalPlanNode): string | undefined {
+	return (node as RelationalPlanNode & { combinator?: { kind?: string } }).combinator?.kind;
 }
 
 /**

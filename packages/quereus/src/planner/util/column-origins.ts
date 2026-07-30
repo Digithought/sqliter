@@ -33,6 +33,10 @@
  * caller one branch's statistics as if they described the whole relation. The walk
  * therefore stops at such a node and records nothing beneath it — a conjunct over a
  * union reads as unknown, exactly like one over a computed projection.
+ *
+ * `rule-async-gather-union-all` rewrites a unionAll set operation into an
+ * `AsyncGatherNode` that forwards the same ids, so `isRowMerging` recognises that
+ * gather too — see `row-population.ts`.
  */
 
 import { TableReferenceNode } from '../nodes/reference.js';
