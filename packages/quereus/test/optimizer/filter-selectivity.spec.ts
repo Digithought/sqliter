@@ -11,6 +11,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type { PhysicalProperties } from '../../src/planner/nodes/plan-node.js';
+import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { FilterNode, DEFAULT_FILTER_SELECTIVITY } from '../../src/planner/nodes/filter.js';
 import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
 import { combineConjunctive, combineDisjunctive } from '../../src/planner/stats/selectivity-combine.js';
@@ -27,6 +28,20 @@ function walk(node: PlanNode, fn: (n: PlanNode) => void): void {
 function findFilter(root: PlanNode): FilterNode | undefined {
 	let found: FilterNode | undefined;
 	walk(root, (n) => { if (!found && n instanceof FilterNode) found = n; });
+	return found;
+}
+
+/** Every FilterNode in the plan, outermost first. */
+function findFilters(root: PlanNode): FilterNode[] {
+	const found: FilterNode[] = [];
+	walk(root, (n) => { if (n instanceof FilterNode) found.push(n); });
+	return found;
+}
+
+/** Does `node`'s subtree contain a scalar subquery? */
+function hasScalarSubquery(node: PlanNode): boolean {
+	let found = false;
+	walk(node, (n) => { if (n.nodeType === PlanNodeType.ScalarSubquery) found = true; });
 	return found;
 }
 
@@ -261,6 +276,63 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		} finally {
 			await db2.close();
 		}
+	});
+
+	// ── Re-stamping after a PostOptimization predicate rewrite ────────────────
+	//
+	// `scalar-subquery-cache` (PostOptimization) wraps an uncorrelated scalar
+	// subquery's inner in a CacheNode. PostOptimization is bottom-up, so that rewrite
+	// re-mints every scalar ancestor up to the Filter's predicate, and
+	// `FilterNode.withChildren` drops the Physical-pass stamp on the way. The
+	// `filter-selectivity-restamp` registration re-derives the estimate against the
+	// final predicate — on the FIRST optimize(), not on a hypothetical second pass.
+
+	it('re-stamps a filter-over-join whose predicate was re-minted by scalar-subquery-cache', () => {
+		const f = optimizedFilter(db,
+			"SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.qty = (SELECT max(qty) FROM r r2) AND o.cat = 'a'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(hasScalarSubquery(f!.predicate), 'the Filter must be the re-minted one').to.be.true;
+
+		// The subquery conjunct references an attribute minted INSIDE the subquery, so
+		// `collectColumnOrigins` cannot attribute it; `o.cat = 'a'` is the one estimable
+		// conjunct and combineConjunctive of one value is that value.
+		expect(f!.selectivity).to.be.closeTo(combineConjunctive([1 / ndv['o.cat']]), 1e-12);
+	});
+
+	it('leaves that same Filter unstamped when the re-stamp registration is disabled', () => {
+		// Negative control: pins the assertion above to the new PostOptimization
+		// registration rather than to some other path happening to stamp the node.
+		const prev = db.optimizer.tuning;
+		db.optimizer.updateTuning({
+			...prev,
+			disabledRules: new Set([...(prev.disabledRules ?? []), 'filter-selectivity-restamp']),
+		});
+		const f = optimizedFilter(db,
+			"SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.qty = (SELECT max(qty) FROM r r2) AND o.cat = 'a'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity, 'the Physical-pass stamp is dropped by the predicate re-mint')
+			.to.be.undefined;
+	});
+
+	it('re-stamps the single-table Filter above a subquery predicate, without clobbering the one below', () => {
+		// No join here: the optimizer leaves two stacked Filters —
+		// `o.qty = (subquery)` over `o.cat = 'a'`. Only the upper one's predicate holds a
+		// subquery, so only it is re-minted; the lower one must keep the stamp it got in
+		// the Physical pass (the re-stamp rule fills in, it never overwrites).
+		const filters = findFilters(
+			(db as unknown as { getPlan(s: string): PlanNode }).getPlan(
+				"SELECT * FROM o WHERE o.qty = (SELECT max(qty) FROM r r2) AND o.cat = 'a'"));
+		const withSubquery = filters.filter(f => hasScalarSubquery(f.predicate));
+		const withoutSubquery = filters.filter(f => !hasScalarSubquery(f.predicate));
+		expect(withSubquery.length, 'expected one Filter carrying the subquery conjunct').to.equal(1);
+		expect(withoutSubquery.length, 'expected one Filter carrying only o.cat').to.equal(1);
+
+		// Single-table path: the provider reads `o.qty` off a direct child of the
+		// comparison and answers 1/ndv(qty) regardless of what the other side is.
+		expect(withSubquery[0].selectivity, 'upper Filter re-stamped')
+			.to.be.closeTo(1 / ndv['o.qty'], 1e-12);
+		expect(withoutSubquery[0].selectivity, 'lower Filter keeps its Physical-pass stamp')
+			.to.be.closeTo(1 / ndv['o.cat'], 1e-12);
 	});
 
 	it('is idempotent: re-optimizing an already-stamped plan changes nothing', () => {

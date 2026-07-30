@@ -249,12 +249,19 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		// The stamped selectivity is predicate-specific: carry it through ONLY when
 		// the predicate is unchanged; drop it (undefined → recompute default until
 		// re-stamped) when the predicate changes.
+		//
+		// Dropping it here is routine, not exceptional: PostOptimization re-mints
+		// stamped Filters whenever it rewrites something inside their predicate
+		// (`scalar-subquery-cache` wrapping a scalar subquery's inner is the common
+		// case). The `filter-selectivity-restamp` PostOptimization registration of
+		// `rule-filter-selectivity` is what recovers the estimate — it re-derives a
+		// number against the NEW predicate rather than carrying the old one forward.
+		//
 		// NOTE (tripwire): a carried selectivity was computed against THIS source's
-		// table. If a later pass ever re-sources a stamped Filter (same predicate,
-		// different source), the carried estimate goes slightly stale. In practice the
-		// Physical pass is the last rule-bearing pass over Filters, so nothing
-		// re-sources a stamped one. If that ever changes, also drop selectivity when
-		// `newSource !== this.source`.
+		// table. If a pass ever re-sources a stamped Filter (same predicate object,
+		// different source), the carried estimate goes slightly stale and nothing
+		// re-derives it — the re-stamp rule declines on an already-stamped Filter. If
+		// that shape appears, also drop selectivity when `newSource !== this.source`.
 		const preservedSelectivity = newPredicate === this.predicate ? this.selectivity : undefined;
 
 		// Create new instance preserving attributes (filter preserves source attributes)

@@ -861,6 +861,41 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	},
 
 	// ── Post-optimization pass (bottom-up) ──────────────────────────────────
+
+	// Selectivity re-stamp. `FilterNode.withChildren` drops the Physical-pass stamp
+	// whenever the predicate child is a different object, and PostOptimization
+	// rewrites predicates: `scalar-subquery-cache` wraps an uncorrelated scalar
+	// subquery's inner in a CacheNode, which (bottom-up) re-mints every scalar
+	// ancestor up to the Filter's predicate, so a Filter with a subquery in its
+	// `where` arrives here unstamped. Re-running the rule re-derives the estimate
+	// against the final predicate; it declines instantly on any Filter whose stamp
+	// survived, so plans that were already correct are untouched. The Physical
+	// registration stays — its stamp is what the physical/PostOptimization cost
+	// readers (join-physical-selection, monotonic-limit-pushdown, key-set-seek, the
+	// materialization advisory) consult, so this is an addition, not a move.
+	//
+	// FIRST in the PostOptimization block, so it precedes `filter-conjunct-ordering`
+	// (which copies the stamp forward into its reordered Filter) rather than relying
+	// on `applyPassRules`' fixpoint loop to get there.
+	//
+	// NOTE: any pass that runs AFTER PostOptimization and re-mints a Filter's
+	// predicate loses the stamp again — `PassId.Materialization` (order 35) walks
+	// scalar children and can wrap a relational node inside a predicate. No query
+	// exhibiting this was found (the obvious CTE-shared-between-two-scalar-subqueries
+	// shape has nothing estimable to stamp in the first place). If one turns up, the
+	// fix is to move this re-stamp behind the materialization pass.
+	{
+		pass: PassId.PostOptimization,
+		id: 'filter-selectivity-restamp',
+		nodeType: PlanNodeType.Filter,
+		phase: 'impl',
+		fn: ruleFilterSelectivity,
+		// Same justification as the Physical entry: rebuilds the identical Filter
+		// (same scope, source, predicate, same output attribute ids) with only an
+		// added row estimate.
+		sideEffectMode: 'safe',
+	},
+
 	// Physical join selection runs here (after Physical pass) so QuickPick can see
 	// the full logical join tree before any physical conversion happens.
 	// Monotonic-aware merge-join recognition runs first so it can recognise cases

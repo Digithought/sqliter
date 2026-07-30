@@ -4,10 +4,25 @@
  * Stamps a stats-derived selectivity onto a FilterNode so its `estimatedRows`
  * reflects real column statistics instead of the flat DEFAULT_FILTER_SELECTIVITY.
  *
- * Runs in the Physical pass (bottom-up), which fires AFTER the Structural pass —
- * predicate-pushdown / grow-retrieve have already put the Filter in its final
- * position over its final source, so the source subtree is settled (and may carry
- * physical access nodes between the join and its table references).
+ * Registered TWICE, both bottom-up:
+ *
+ *   - `filter-selectivity` (Physical pass), which fires AFTER the Structural pass —
+ *     predicate-pushdown / grow-retrieve have already put the Filter in its final
+ *     position over its final source, so the source subtree is settled (and may carry
+ *     physical access nodes between the join and its table references). This stamp is
+ *     what the physical and PostOptimization cost readers consult.
+ *   - `filter-selectivity-restamp` (PostOptimization pass, registered first in that
+ *     pass), which recovers the estimate for a Filter whose stamp was dropped by
+ *     `FilterNode.withChildren` because PostOptimization rewrote something inside its
+ *     predicate — `scalar-subquery-cache` wrapping an uncorrelated scalar subquery's
+ *     inner re-mints every scalar ancestor up to the predicate. Without it, any query
+ *     with a subquery in its `where` plans on the flat DEFAULT_FILTER_SELECTIVITY.
+ *
+ * The `selectivity !== undefined` guard below makes the second registration a no-op on
+ * every Filter whose stamp survived, so it only ever fills in, never overwrites. Both
+ * firings read a physical source subtree (`select-access-path` has already replaced
+ * Retrieve with an access node by the Physical pass's own bottom-up order);
+ * PostOptimization sources are the same shape or further lowered.
  *
  * Node-level accessors (`estimatedRows` / `computePhysical`) carry no OptContext,
  * so a Filter cannot consult `context.stats` from inside itself. This rule holds
