@@ -37,6 +37,19 @@
  * `rule-async-gather-union-all` rewrites a unionAll set operation into an
  * `AsyncGatherNode` that forwards the same ids, so `isRowMerging` recognises that
  * gather too — see `row-population.ts`.
+ *
+ * ## Known gap: a CTE reference's columns are not attributed
+ *
+ * `CTEReferenceNode` mints FRESH attribute ids for every column it republishes
+ * (`cte-reference-node.ts`), so nothing under a `with` lands in this map and a
+ * predicate over a CTE column reads as unknown even when it is a plain base-table
+ * column. Since `rule-filter-selectivity` now resolves statistics through this map,
+ * that costs a real estimate: `with c as (select * from o) select * from c where
+ * c.qty = 3` falls back to the naive guess. Mapping the fresh ids positionally back
+ * to the CTE body's is not enough on its own — two references to one CTE share a
+ * single subtree, so both would resolve to the SAME `ref` and a self-join over a CTE
+ * would mis-read as a single-relation predicate. Tracked in the fix ticket
+ * `bug-cte-reference-loses-column-origin-attribution`.
  */
 
 import { TableReferenceNode } from '../nodes/reference.js';

@@ -252,6 +252,13 @@ export class CatalogStatsProvider implements StatsProvider {
 		return this.fallback.distinctValues?.(table, columnName);
 	}
 
+	/**
+	 * NOTE: no {@link ColumnStatsResolver} is threaded here, so the delegated estimate
+	 * matches columns by AST name. Nothing in the engine calls this today (only its own
+	 * tests do), so nothing is wrong now — but the first production caller must widen
+	 * this signature to take a resolver and pass it down, or it will silently get the
+	 * name matching the selectivity family no longer uses.
+	 */
 	indexSelectivity(table: TableSchema, indexName: string, predicate: ScalarPlanNode): number | undefined {
 		// Delegate to base selectivity — real column stats already improve this
 		const sel = this.selectivity(table, predicate);

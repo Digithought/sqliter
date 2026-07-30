@@ -16,10 +16,15 @@ const NAIVE_UNARY_SELECTIVITY = 0.3;
 
 // ── Mock factories ──────────────────────────────────────────────────────
 
-function mockColumnRef(name: string): ScalarPlanNode {
+/**
+ * `attributeId` matters only to the `ColumnStatsResolver` tests below; every other
+ * test exercises the no-resolver path, where the provider reads `expression.name`.
+ */
+function mockColumnRef(name: string, attributeId = 0): ScalarPlanNode {
 	return {
 		nodeType: 'ColumnReference',
 		expression: { name },
+		attributeId,
 		getChildren: () => [],
 		getRelations: () => [],
 	} as unknown as ScalarPlanNode;
@@ -594,6 +599,99 @@ describe('CatalogStatsProvider', () => {
 			const cond = mockBinaryOp('=', leftRef, rightRef);
 			const sel = provider.joinSelectivity(left, right, cond);
 			expect(sel).to.be.a('number');
+		});
+	});
+
+	// ── ColumnStatsResolver ─────────────────────────────────────────────
+
+	/**
+	 * The `resolve` parameter shared by `selectivity`, `statsOnlySelectivity` and
+	 * `joinSelectivity`. `rule-filter-selectivity` builds one from `collectColumnOrigins`
+	 * so a predicate's columns are matched to statistics by ATTRIBUTE IDENTITY; these
+	 * tests pin the provider half of that contract directly, with a hand-built resolver
+	 * that deliberately disagrees with the AST names.
+	 */
+	describe('ColumnStatsResolver', () => {
+		// `a` and `b` have different distinct counts, so which one was read is visible.
+		const stats = () => makeStats(100, { a: { distinctCount: 4 }, b: { distinctCount: 20 } });
+		// What NaiveStatsProvider answers for a BinaryOp once the catalog declines.
+		const NAIVE_BINARY_SELECTIVITY = 0.1;
+
+		it('reads the resolved column, not the one the reference is NAMED after', () => {
+			const provider = new CatalogStatsProvider();
+			const table = makeTableSchema('t', stats());
+			const pred = mockBinaryOp('=', mockColumnRef('a', 7), mockLiteral(5));
+
+			expect(provider.selectivity(table, pred, id => (id === 7 ? 'b' : undefined))).to.equal(1 / 20);
+			// Same predicate, no resolver → the AST name wins, as the optional contract says.
+			expect(provider.selectivity(table, pred)).to.equal(1 / 4);
+		});
+
+		it('declines to the naive guess when the attribute resolves to nothing', () => {
+			const provider = new CatalogStatsProvider();
+			const table = makeTableSchema('t', stats());
+			// An attribute minted above the base table: real statistics exist for a column
+			// spelled `a`, but this reference is not that column.
+			const pred = mockBinaryOp('=', mockColumnRef('a', 7), mockLiteral(5));
+
+			expect(provider.selectivity(table, pred, () => undefined)).to.equal(NAIVE_BINARY_SELECTIVITY);
+			expect(provider.statsOnlySelectivity(table, pred, () => undefined)).to.be.undefined;
+		});
+
+		it('declines the whole leaf on the FIRST unresolvable column reference', () => {
+			const provider = new CatalogStatsProvider();
+			const table = makeTableSchema('t', stats());
+			// `computed = b`: the leaf extractor stops at the unresolvable left operand
+			// rather than falling through to the right one, so "the compared column has no
+			// statistics" is the answer.
+			const pred = mockBinaryOp('=', mockColumnRef('a', 7), mockColumnRef('b', 8));
+
+			expect(provider.statsOnlySelectivity(table, pred, id => (id === 8 ? 'b' : undefined))).to.be.undefined;
+			// Reversed operands, same resolver: the left operand now resolves and is used,
+			// so the answer depends on operand order. Same pre-existing asymmetry the
+			// `NOTE:` on `extractColumnFromPredicate` records for column-vs-column.
+			const flipped = mockBinaryOp('=', mockColumnRef('b', 8), mockColumnRef('a', 7));
+			expect(provider.statsOnlySelectivity(table, flipped, id => (id === 8 ? 'b' : undefined))).to.equal(1 / 20);
+		});
+
+		it('resolves both sides of an equi-join condition by identity', () => {
+			const provider = new CatalogStatsProvider();
+			const left = makeTableSchema('t1', makeStats(100, { c1: { distinctCount: 50 } }));
+			const right = makeTableSchema('t2', makeStats(200, { c2: { distinctCount: 80 } }));
+			// Neither AST name exists in either table's statistics, so only the resolver
+			// can find the distinct counts.
+			const cond = mockBinaryOp('=', mockColumnRef('alias_l', 1), mockColumnRef('alias_r', 2));
+
+			const resolve = (id: number) => (id === 1 ? 'c1' : id === 2 ? 'c2' : undefined);
+			expect(provider.joinSelectivity(left, right, cond, resolve)).to.equal(1 / 80);
+			// Without the resolver the names find nothing and the naive fallback answers.
+			expect(provider.joinSelectivity(left, right, cond)).to.not.equal(1 / 80);
+		});
+
+		it('declines an equi-join whose side resolves to nothing', () => {
+			const provider = new CatalogStatsProvider();
+			const left = makeTableSchema('t1', makeStats(100, { c1: { distinctCount: 50 } }));
+			const right = makeTableSchema('t2', makeStats(200, { c2: { distinctCount: 80 } }));
+			const cond = mockBinaryOp('=', mockColumnRef('c1', 1), mockColumnRef('c2', 2));
+
+			// Falls back to NaiveStatsProvider rather than reading c1/c2 by name.
+			const sel = provider.joinSelectivity(left, right, cond, id => (id === 1 ? 'c1' : undefined));
+			expect(sel).to.not.equal(1 / 80);
+			expect(sel).to.be.a('number');
+		});
+
+		it('threads the resolver down through a NOT to its operand', () => {
+			// AND / OR cannot be driven from these mocks (see the note above the boolean
+			// decomposition block); `UnaryOp` recursion has no such gate, so it is the one
+			// non-leaf hop the resolver can be pinned on here.
+			const provider = new CatalogStatsProvider();
+			const table = makeTableSchema('t', stats());
+			const negated = mockUnaryOp('NOT', mockBinaryOp('=', mockColumnRef('a', 7), mockLiteral(5)));
+
+			expect(provider.statsOnlySelectivity(table, negated, id => (id === 7 ? 'b' : undefined)))
+				.to.be.closeTo(1 - 1 / 20, 1e-12);
+			// Unresolved operand → the negation is unknown rather than 1 - 1/ndv(a).
+			expect(provider.statsOnlySelectivity(table, negated, () => undefined)).to.be.undefined;
 		});
 	});
 
