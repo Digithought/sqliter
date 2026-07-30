@@ -304,11 +304,29 @@ describe('Plan shape: subquery decorrelation', () => {
 		});
 
 		it('keeps the semi join when the equi column is not the referenced parent column', async () => {
-			// dept.dname is the projection's output column 0 — the same index as the
-			// FK's referenced column dept.id. Comparing raw output indices would
-			// spuriously "align"; the mapping resolves dname to dept column 1.
-			const q = "SELECT id FROM emp WHERE dept_id IN (SELECT dname FROM dept) ORDER BY id";
+			// deptn.other is the projection's output column 0 — the same index as the
+			// FK's referenced column deptn.id. Comparing raw output indices would
+			// spuriously "align"; the mapping resolves other to deptn column 1.
+			// (Its own table pair, like the anti-join sibling below: the equi column
+			// must be INTEGER, or the implicit numeric ↔ textual cast fails the
+			// equi-pair gate and declines decorrelation before the FK is consulted.)
+			await db.exec("CREATE TABLE deptn (id INTEGER PRIMARY KEY, other INTEGER) USING memory");
+			await db.exec("CREATE TABLE empn (id INTEGER PRIMARY KEY, dept_id INTEGER NOT NULL REFERENCES deptn(id)) USING memory");
+			await db.exec("INSERT INTO deptn VALUES (1, 99), (2, 98)");
+			await db.exec("INSERT INTO empn VALUES (10, 1), (20, 2)");
+
+			const q = "SELECT id FROM empn WHERE dept_id IN (SELECT other FROM deptn) ORDER BY id";
 			expect(await countSemiJoins(q)).to.equal(1);
+			expect(await allRows(db, q)).to.deep.equal([]);
+		});
+
+		it('declines decorrelation when the IN operands need a cross-type cast', async () => {
+			// INTEGER child column against a TEXT parent column: the synthesized `=`
+			// carries the same cast a hand-written one gets, which fails the equi-pair
+			// gate, so the conjunct stays on the set-probe path (`emitIn`) whose own
+			// numeric ↔ textual arm answers it. The answer must match `dept_id = dname`.
+			const q = "SELECT id FROM emp WHERE dept_id IN (SELECT dname FROM dept) ORDER BY id";
+			expect(await countSemiJoins(q)).to.equal(0);
 			expect(await allRows(db, q)).to.deep.equal([]);
 		});
 

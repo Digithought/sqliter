@@ -247,12 +247,12 @@ select count(*) as c from jse_log;
 → [{"c":2}]
 
 -- ===================================
--- 5.2 The numeric ↔ textual pairing was NOT widened
+-- 5.2 The numeric ↔ textual pairing takes the SAME route
 -- ===================================
--- `int_col in ('1')` is false today (bug-numeric-text-coercion-skips-in-and-case); the
--- JSON fix is gated on PhysicalType.OBJECT, so both the uncorrelated and the correlated
--- subquery forms must keep missing too — otherwise the subquery form would start
--- disagreeing with the value-list form in the other direction.
+-- `int_col in ('1')` is true, exactly as `int_col = '1'` is
+-- (bug-numeric-text-coercion-skips-in-and-case). The value list is reconciled at plan
+-- time, the subquery forms at membership-evaluation time, and the decorrelating rewrite
+-- declines to the set probe — three routes that must land on one answer.
 create table jse_num (id integer primary key, n integer);
 insert into jse_num values (1, 1), (2, 2);
 create table jse_numtxt (id integer primary key, s text);
@@ -260,25 +260,25 @@ insert into jse_numtxt values (1, '1'), (2, '2');
 -- run
 
 select id from jse_num where n in ('1');
-→ []
+→ [{"id":1}]
 
--- These two decorrelate to a semi join (INTEGER and TEXT agree on semantic ordering —
--- neither has any — so the equi-pair gate lets them through), and the join's key
--- encoding keeps a number and a numeric-looking string distinct.
+-- Both decorrelation arms now reconcile their synthesized `=` the way a hand-written one
+-- is: the uncorrelated arm's cast wrapper fails the equi-pair gate and falls back to the
+-- set probe, the correlated arm keeps the cast in the join's residual.
 select id from jse_num where n in (select s from jse_numtxt);
-→ []
+→ [{"id":1},{"id":2}]
 
 select m.id from jse_num m where m.n in (select t.s from jse_numtxt t where t.id = m.id);
-→ []
+→ [{"id":1},{"id":2}]
 
 -- These two DO reach emitIn's membership evaluation — a non-column left side and a
 -- projection-position IN both decline decorrelation — so they are what actually pins
--- `inMembershipKeys` to the object-physical pairing only.
+-- `inMembershipKeys`' numeric ↔ textual arm.
 select id from jse_num where n + 0 in (select s from jse_numtxt);
-→ []
+→ [{"id":1},{"id":2}]
 
 select id, (n in (select s from jse_numtxt)) as m from jse_num order by id;
-→ [{"id":1,"m":false},{"id":2,"m":false}]
+→ [{"id":1,"m":true},{"id":2,"m":true}]
 
 -- ===================================
 -- 6. The same set with a UNIQUE index on the JSON column

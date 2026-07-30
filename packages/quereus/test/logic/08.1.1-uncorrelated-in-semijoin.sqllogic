@@ -129,17 +129,15 @@ INSERT INTO reals VALUES (1, 10.0), (2, 20.5);
 SELECT id FROM souter WHERE x IN (SELECT r FROM reals) ORDER BY id;
 → [{"id":1}]
 
--- TEXT inner against INTEGER outer currently matches nothing — a known
--- engine-wide divergence between IN and a written `=` (the build-time
--- cross-type cast is not applied to IN;
--- backlog/bug-numeric-text-coercion-skips-in-and-case). The synthesized `=`
--- in the semi join is built in the optimizer and gets no cast either, so the
--- rewrite preserves this answer. Pinned so a future coercion fix moves both
--- paths together instead of silently splitting them.
+-- TEXT inner against INTEGER outer matches on the numeric reading, exactly as
+-- `x = '10'` does. The synthesized `=` is reconciled through the same coercion
+-- a hand-written one gets, so the cast wrapper fails the equi-pair gate and the
+-- conjunct declines to the set probe, whose own numeric ↔ textual arm answers.
+-- Pinned so the rewrite and the set probe cannot silently split.
 CREATE TABLE texts (id INTEGER PRIMARY KEY, t TEXT);
 INSERT INTO texts VALUES (1, '10'), (2, '20');
 SELECT id FROM souter WHERE x IN (SELECT t FROM texts) ORDER BY id;
-→ []
+→ [{"id":1},{"id":2}]
 
 -- Mixed semantic-ordering pair (TIMESPAN outer, TEXT inner): the equi-pair
 -- gate declines, the set probe answers, and its semantic key transform still

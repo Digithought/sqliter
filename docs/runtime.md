@@ -1158,6 +1158,7 @@ SQL requires different coercion strategies for different contexts. Quereus coerc
 **Comparison Context** (plan-time):
 - When one operand is numeric and the other textual, the planner wraps the textual operand in a CastNode targeting the numeric type
 - Example: `42 = '42'` → planner rewrites to `42 = cast('42' as INTEGER)`, both sides are numeric at runtime
+- `IN` value lists, simple `CASE` and the comparison-group builtins share that rule through `coerceComparisonSet`; an `IN` **subquery** has no operand list to wrap and converts per row instead (`inMembershipKeys`, `runtime/emit/subquery.ts`)
 - The generic runtime comparison path only handles temporal checks
 
 **Arithmetic Context** (`coerceToNumberForArithmetic`):

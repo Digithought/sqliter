@@ -1,7 +1,7 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { LiteralNode, BinaryOpNode, UnaryOpNode, CaseExprNode, CastNode, CollateNode, BetweenNode } from '../nodes/scalar.js';
-import { insertCrossTypeCoercion, coerceObjectPhysicalSet } from './coercion.js';
+import { insertCrossTypeCoercion, coerceComparisonSet } from './coercion.js';
 import { ScalarSubqueryNode, InNode, ExistsNode } from '../nodes/subquery.js';
 import { WindowFunctionCallNode } from '../nodes/window-function.js';
 import type { ScalarPlanNode, RelationalPlanNode } from '../nodes/plan-node.js';
@@ -135,7 +135,7 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
       // object-physical reconciliation an IN list gets — otherwise
       // `case json_col when '{"a":1}'` disagrees with `json_col = '{"a":1}'`.
       if (baseExpr) {
-        const [coercedBase, coercedWhens] = coerceObjectPhysicalSet(
+        const [coercedBase, coercedWhens] = coerceComparisonSet(
           ctx.scope, baseExpr, whenThenClauses.map(c => c.when));
         baseExpr = coercedBase;
         coercedWhens.forEach((when, i) => { whenThenClauses[i].when = when; });
@@ -242,7 +242,7 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
                } else if (expr.values) {
           // IN value list: expr IN (value1, value2, ...)
           const rawValueExprs = expr.values.map(val => buildExpression(ctx, val, allowAggregates));
-          const [inLeft, valueExprs] = coerceObjectPhysicalSet(ctx.scope, leftExpr, rawValueExprs);
+          const [inLeft, valueExprs] = coerceComparisonSet(ctx.scope, leftExpr, rawValueExprs);
           const inListNode = new InNode(ctx.scope, expr, inLeft, undefined, valueExprs);
           // Same eager collation-lattice validation as the subquery form.
           inListNode.getType();

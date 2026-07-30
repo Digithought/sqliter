@@ -2,8 +2,9 @@ import type * as AST from '../../parser/ast.js';
 import type { Scope } from '../scopes/scope.js';
 import { CastNode } from '../nodes/scalar.js';
 import type { ScalarPlanNode } from '../nodes/plan-node.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { PhysicalType } from '../../types/logical-type.js';
-import { NULL_TYPE } from '../../types/builtin-types.js';
+import { NULL_TYPE, NUMERIC_TYPE } from '../../types/builtin-types.js';
 
 /**
  * Plan-build cross-type coercion for comparison sites. Every construct that
@@ -90,41 +91,81 @@ export function insertCrossTypeCoercion(
 }
 
 /**
- * Apply the object-physical arm of {@link insertCrossTypeCoercion} across the
- * one-probe-against-many-values shape shared by an IN value list and a simple
- * CASE, so `json_col in ('{"a":1}')` and `case json_col when '{"a":1}' …` agree
- * with `json_col = '{"a":1}'`.
+ * Apply {@link insertCrossTypeCoercion} across the one-probe-against-many-values
+ * shape shared by an IN value list, a simple CASE and a scalar builtin's
+ * comparison group, so `json_col in ('{"a":1}')`, `int_col in ('1')` and
+ * `case int_col when '1' …` all agree with the `=` spelling of the same
+ * comparison.
  *
- * Scoped to the object-physical pairing on purpose. The numeric ↔ textual arm has
- * never been applied to either site (`int_col in ('1')` is false today for the same
- * underlying reason), and turning it on here would change unrelated behavior; that
- * case is tracked by `bug-numeric-text-coercion-skips-in-and-case`. Note `=` and
- * BETWEEN DO apply it, so those two forms currently disagree with IN / simple CASE
- * on a numeric column compared against a numeric-looking string.
+ * The probe is a single plan node shared by every value, so it can be wrapped at
+ * most once — which is what makes this more than a `map` over the pairwise
+ * function:
  *
- * The probe is shared by every value, so it is wrapped at most once — if any value
- * is object-physical while the probe is not, the probe is cast first and the values
- * are then reconciled against it.
+ * - **A value-side cast is per value** and never conflicts: an object-physical or
+ *   numeric probe leaves the probe alone and casts each value independently, so a
+ *   mixed list (`case i when '1' when 2 …`) gets a per-clause decision for free.
+ * - **A probe-side cast is hoisted** and therefore has to be unambiguous. For the
+ *   object arm it always is: a cast to JSON is lenient, so a textual value that is
+ *   not JSON source survives as itself and still compares as text. For the numeric
+ *   arm it is NOT — `cast('abc' as real)` is `0`, so hoisting a probe cast over a
+ *   MIXED list would make `t in (1, 'abc')` true for the stored text `'0'`, which
+ *   `t = 1 or t = 'abc'` is not. So the numeric probe cast is applied only when
+ *   every non-NULL value is numeric.
+ *
+ * NOTE: the leftover gap is a textual probe against a list mixing numeric and
+ * textual values (`text_col in (1, 'abc')`), which stays uncoerced and so still
+ * disagrees with the `=` disjunction on the numeric member. Closing it needs a
+ * per-value probe, which `IN` cannot express — its members live in ONE key space
+ * (a BTree keyed under one collation, `runtime/emit/subquery.ts`). If that shape
+ * ever matters, desugar a mixed `IN` list into an `OR` of `=` comparisons at build
+ * time rather than widening the hoist here.
  */
-export function coerceObjectPhysicalSet(
+export function coerceComparisonSet(
 	scope: Scope,
 	probe: ScalarPlanNode,
 	values: ScalarPlanNode[],
 ): [ScalarPlanNode, ScalarPlanNode[]] {
-	const isObject = (node: ScalarPlanNode): boolean =>
-		node.getType().logicalType.physicalType === PhysicalType.OBJECT;
+	const probeType = probe.getType().logicalType;
+	const isObject = (type: LogicalType): boolean => type.physicalType === PhysicalType.OBJECT;
 
-	const objectValue = values.find(isObject);
-	if (!isObject(probe) && !objectValue) return [probe, values];
+	// Object arm: cast the non-object side, exactly as the pairwise function does.
+	const objectValue = values.find(val => isObject(val.getType().logicalType));
+	if (isObject(probeType) || objectValue) {
+		const coercedProbe = isObject(probeType)
+			? probe
+			: wrapInCast(scope, probe, objectValue!.getType().logicalType.name);
+		return [coercedProbe, values.map(val => insertCrossTypeCoercion(scope, coercedProbe, val)[1])];
+	}
 
-	const coercedProbe = isObject(probe)
-		? probe
-		: wrapInCast(scope, probe, objectValue!.getType().logicalType.name);
-	return [coercedProbe, values.map(val => insertCrossTypeCoercion(scope, coercedProbe, val)[1])];
+	// Numeric probe: every textual value casts to the probe's numeric type, independently.
+	if (probeType.isNumeric) {
+		return [probe, values.map(val => insertCrossTypeCoercion(scope, probe, val)[1])];
+	}
+
+	// Textual probe: one hoisted cast, but only over an all-numeric value list.
+	if (probeType.isTextual) {
+		const valueTypes = values.map(val => val.getType().logicalType).filter(type => type !== NULL_TYPE);
+		if (valueTypes.length > 0 && valueTypes.every(type => type.isNumeric)) {
+			return [wrapInCast(scope, probe, commonNumericTypeName(valueTypes)), values];
+		}
+	}
+
+	return [probe, values];
 }
 
 /**
- * Apply {@link coerceObjectPhysicalSet} across the argument positions a scalar
+ * The cast target for a hoisted probe cast over an all-numeric value list. One
+ * shared type name means one key space; NUMERIC is the fallback because its value
+ * space (`number | bigint`) covers INTEGER and REAL together, so a list mixing a
+ * bigint literal with a real one does not have to pick a lossy winner.
+ */
+function commonNumericTypeName(valueTypes: readonly LogicalType[]): string {
+	const first = valueTypes[0];
+	return valueTypes.every(type => type === first) ? first.name : NUMERIC_TYPE.name;
+}
+
+/**
+ * Apply {@link coerceComparisonSet} across the argument positions a scalar
  * function declares as one comparison group
  * ({@link import('../../schema/function.js').BaseFunctionSchema.comparesArgs}),
  * so `nullif(json_col, '{"a":1}')` reconciles its operands exactly as
@@ -144,7 +185,7 @@ export function coerceComparisonGroup(
 	if (indices.length < 2) return;
 
 	const [probeIdx, ...valueIdx] = indices;
-	const [probe, values] = coerceObjectPhysicalSet(scope, args[probeIdx], valueIdx.map(i => args[i]));
+	const [probe, values] = coerceComparisonSet(scope, args[probeIdx], valueIdx.map(i => args[i]));
 	args[probeIdx] = probe;
 	valueIdx.forEach((argIdx, j) => { args[argIdx] = values[j]; });
 }

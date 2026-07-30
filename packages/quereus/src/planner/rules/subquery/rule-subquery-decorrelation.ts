@@ -64,7 +64,7 @@ import { isEquiCorrelation, collectDefinedAttrIds, referencesAnyAttr } from '../
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { extractEquiPairs } from '../join/equi-pair-extractor.js';
 import { resolveComparisonCollation, resolveInCollationForNode } from '../../analysis/comparison-collation.js';
-import { coerceObjectPhysicalSet } from '../../building/coercion.js';
+import { coerceComparisonSet } from '../../building/coercion.js';
 
 const log = createLogger('optimizer:rule:subquery-decorrelation');
 
@@ -276,17 +276,16 @@ function extractInCorrelation(
 	// Reconcile the two operands exactly as a hand-written `=` would be. Building the
 	// BinaryOpNode raw bypassed the plan-build coercion every other comparison site gets,
 	// so `json_col in (select text_col …)` compared a native JS object against a string
-	// and never matched. `coerceObjectPhysicalSet` is the IN-shaped helper (the same one
-	// the IN value-list and simple-CASE builders call) and applies ONLY the
-	// object-physical arm; `insertCrossTypeCoercion` would also apply its
-	// numeric-vs-textual arm, which would make a correlated `int_col in (select text_col
-	// …)` start matching while the uncorrelated form of the same query keeps missing.
+	// and never matched, and `int_col in (select text_col …)` compared a number against a
+	// string. `coerceComparisonSet` is the IN-shaped helper — the same one the IN
+	// value-list and simple-CASE builders call, and the same one `extractUncorrelatedIn`
+	// calls, so the two decorrelation arms and the runtime set probe cannot split.
 	//
 	// The now-CastNode-wrapped side demotes this conjunct out of `extractEquiPairs`
 	// (which requires two bare column references) into the join's residual — the correct
 	// destination, since the residual is where `=`'s own semantics apply, and the join
 	// still keys on the genuine correlation pair.
-	const [coercedOuter, [coercedInner]] = coerceObjectPhysicalSet(outerColRef.scope, outerColRef, [innerColRef]);
+	const [coercedOuter, [coercedInner]] = coerceComparisonSet(outerColRef.scope, outerColRef, [innerColRef]);
 	const equiCondition = new BinaryOpNode(
 		outerColRef.scope,
 		{ type: 'binary', operator: '=', left: coercedOuter.expression, right: coercedInner.expression },
@@ -386,11 +385,20 @@ function extractUncorrelatedIn(
 		innerAttr.id,
 		0 // column index in the inner relation
 	);
+	// Reconcile the operands exactly as a hand-written `=` would be, for the same
+	// reason `extractInCorrelation` does: this raw BinaryOpNode bypasses the coercion
+	// `buildExpression` applies. When a cast IS inserted (a JSON/TEXT or numeric/TEXT
+	// pair), the wrapper fails the equi-pair gate below and the conjunct declines to
+	// the set-probe path — whose `inMembershipKeys` performs the same conversion per
+	// row. That decline is the point: a hash join keyed on the RAW values would rank a
+	// number against a numeric-looking string by storage class and match nothing,
+	// disagreeing with every other spelling of the comparison.
+	const [coercedOuter, [coercedInner]] = coerceComparisonSet(outerColRef.scope, outerColRef, [innerColRef]);
 	const condition = new BinaryOpNode(
 		outerColRef.scope,
-		{ type: 'binary', operator: '=', left: outerColRef.expression, right: innerColRef.expression },
-		outerColRef,
-		innerColRef
+		{ type: 'binary', operator: '=', left: coercedOuter.expression, right: coercedInner.expression },
+		coercedOuter,
+		coercedInner
 	);
 
 	// Gate (the O(N×K)-floor guardrail): the synthesized condition must survive

@@ -13,7 +13,7 @@ import { PlanNodeCharacteristics } from '../../planner/framework/characteristics
 import { effectiveInCollation, inRhsTypes } from '../../planner/analysis/comparison-collation.js';
 import { isCorrelatedSubquery } from '../../planner/cache/correlation-detector.js';
 import { PhysicalType, type LogicalType } from '../../types/logical-type.js';
-import { NULL_TYPE } from '../../types/builtin-types.js';
+import { NULL_TYPE, NUMERIC_TYPE } from '../../types/builtin-types.js';
 import { lenientCast } from '../../types/cast-semantics.js';
 
 /**
@@ -140,11 +140,18 @@ const isObjectPhysical = (type: LogicalType): boolean => type.physicalType === P
  *    document `"[1,2]"` is stored as the plain JS string `[1,2]`, and re-parsing would turn
  *    it into the JSON *array* `[1,2]`, colliding two distinct documents.
  *
- *    The gate is `physicalType === OBJECT`, **not** `semanticOrdering`, and deliberately
- *    does NOT extend to the numeric-vs-textual pairing: `int_col in ('1')` is false today
- *    (tracked by `bug-numeric-text-coercion-skips-in-and-case`) and must stay false here,
- *    or the subquery form would start disagreeing with the value-list form in the other
- *    direction. A NULL-typed side is left alone — the membership test is UNKNOWN anyway.
+ *    The gate is `physicalType === OBJECT`, **not** `semanticOrdering`. A NULL-typed side
+ *    is left alone — the membership test is UNKNOWN anyway.
+ *
+ * 1b. **Numeric vs textual.** The same pairing `=` reconciles by casting the textual side
+ *    to the numeric side's type, for the same reason: a number and a string are different
+ *    storage classes, so `int_col in (select text_col …)` could never match. Applied here
+ *    only when the RHS is UNIFORM — every non-NULL member type numeric, or every one
+ *    textual. A subquery RHS always is (one column, one type); a value list has been
+ *    reconciled at plan time, EXCEPT the one shape `coerceComparisonSet` deliberately
+ *    leaves alone (a textual probe against a list mixing numeric and textual values). The
+ *    uniformity gate is what keeps that shape out of here, so the two paths cannot
+ *    disagree about it.
  *
  * 2. **Semantic normalization (symmetric).** When an operand declares a semantic-ordering
  *    logical type (see {@link hasSemanticOrdering}) the probe AND every RHS value are
@@ -188,6 +195,29 @@ function inMembershipKeys(plan: InNode): InMembershipKeys {
 			member: IDENTITY_KEY,
 			note: ` probe as ${objectRhs.name}`,
 		};
+	}
+
+	// Arm 1b: numeric vs textual, over a uniform RHS.
+	const rhsNonNull = rhsTypes.filter(type => type !== NULL_TYPE);
+	if (rhsNonNull.length > 0 && conditionType !== NULL_TYPE) {
+		if (conditionType.isNumeric && rhsNonNull.every(type => type.isTextual)) {
+			return {
+				probe: IDENTITY_KEY,
+				member: (value: SqlValue) => lenientCast(value, conditionType),
+				note: ` member as ${conditionType.name}`,
+			};
+		}
+		if (conditionType.isTextual && rhsNonNull.every(type => type.isNumeric)) {
+			// One key space, so a mixed INTEGER/REAL member list widens to NUMERIC —
+			// the same choice `coerceComparisonSet` makes for a hoisted probe cast.
+			const first = rhsNonNull[0];
+			const target = rhsNonNull.every(type => type === first) ? first : NUMERIC_TYPE;
+			return {
+				probe: (value: SqlValue) => lenientCast(value, target),
+				member: IDENTITY_KEY,
+				note: ` probe as ${target.name}`,
+			};
+		}
 	}
 
 	// Arm 2: symmetric semantic normalization.

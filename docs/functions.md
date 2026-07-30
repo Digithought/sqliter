@@ -87,7 +87,8 @@ select choose(2, 'a', 'b', 'c');   -- 'b'
 
 `nullif`, `greatest` and `least` compare exactly as the `=` operator and `order by`
 do — honoring a column's declared collation, semantic-ordering types like TIMESPAN,
-and JSON documents — rather than raw bytes. See
+JSON documents, and the numeric reading of a numeric-looking string (`nullif(int_col,
+'1')` matches, as `int_col = '1'` does) — rather than raw bytes. See
 [types.md](types.md#comparison-collation-resolution).
 
 A NULL argument to `least` wipes the running minimum, so the answer depends on

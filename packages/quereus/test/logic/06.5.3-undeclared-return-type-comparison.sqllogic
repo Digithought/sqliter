@@ -226,8 +226,10 @@ select sum(strftime('%Y', d)) as s, avg(strftime('%Y', d)) as a from urt;
 -- Not guessing REAL costs exactly this much. `json_extract(...) = '5'` was TRUE (the
 -- planner cast '5' to REAL 5); it is now FALSE, because an ANY operand gives the
 -- numeric↔textual arm of insertCrossTypeCoercion nothing to key on and the runtime
--- compares an integer against text — different storage classes. Same shape as
--- `int_col in ('1')` being false today (bug-numeric-text-coercion-skips-in-and-case).
+-- compares an integer against text — different storage classes. Note this is NOT the gap
+-- bug-numeric-text-coercion-skips-in-and-case closed: that one was about the coercion
+-- being skipped at some comparison SITES; here every site applies it and there is simply
+-- no declared numeric type to key on.
 -- Pinned so the next change to the numeric↔text story is a deliberate one. json_extract
 -- is deliberately still ANY (its result shape depends on the data), so the loss is real
 -- here; every builtin that CAN name a type now does, which restores the coercion — see
