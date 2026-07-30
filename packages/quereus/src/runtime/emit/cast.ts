@@ -4,7 +4,7 @@ import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import { type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { castFallback } from '../../types/cast-semantics.js';
+import { lenientCast } from '../../types/cast-semantics.js';
 
 export function emitCast(plan: CastNode, ctx: EmissionContext): Instruction {
 	// The node's own resolved target type — never re-resolve the name here, or the
@@ -15,24 +15,9 @@ export function emitCast(plan: CastNode, ctx: EmissionContext): Instruction {
 		_runtimeCtx: RuntimeContext,
 		operandValue: SqlValue
 	): SqlValue {
-		if (operandValue === null) return null;
-
-		if (logicalType.parse) {
-			try {
-				return logicalType.parse(operandValue);
-			} catch {
-				// CAST failures in SQL return 0 for numeric targets, '' for text, etc.
-				// This matches SQLite's lenient CAST behavior.
-				return castFallback(operandValue, logicalType);
-			}
-		}
-
-		// NOTE: a type with no `parse` defines no conversion, so the operand passes
-		// through while the cast still advertises the target type — the very shape
-		// castFallback exists to prevent. Unreachable today: NULL is the only builtin
-		// without `parse`, and the parser rejects it as a CAST target. If a plugin
-		// ever registers a parse-less type, validate here too.
-		return operandValue;
+		// Shared with emitIn's membership coercion — see lenientCast for the
+		// parse/fallback contract and the parse-less-type note.
+		return lenientCast(operandValue, logicalType);
 	}
 
 	return {

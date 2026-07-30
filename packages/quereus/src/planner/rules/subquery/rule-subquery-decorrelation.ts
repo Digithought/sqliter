@@ -64,6 +64,7 @@ import { isEquiCorrelation, collectDefinedAttrIds, referencesAnyAttr } from '../
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { extractEquiPairs } from '../join/equi-pair-extractor.js';
 import { resolveComparisonCollation, resolveInCollationForNode } from '../../analysis/comparison-collation.js';
+import { coerceObjectPhysicalSet } from '../../building/coercion.js';
 
 const log = createLogger('optimizer:rule:subquery-decorrelation');
 
@@ -272,11 +273,25 @@ function extractInCorrelation(
 		innerKeyIndex
 	);
 
+	// Reconcile the two operands exactly as a hand-written `=` would be. Building the
+	// BinaryOpNode raw bypassed the plan-build coercion every other comparison site gets,
+	// so `json_col in (select text_col …)` compared a native JS object against a string
+	// and never matched. `coerceObjectPhysicalSet` is the IN-shaped helper (the same one
+	// the IN value-list and simple-CASE builders call) and applies ONLY the
+	// object-physical arm; `insertCrossTypeCoercion` would also apply its
+	// numeric-vs-textual arm, which would make a correlated `int_col in (select text_col
+	// …)` start matching while the uncorrelated form of the same query keeps missing.
+	//
+	// The now-CastNode-wrapped side demotes this conjunct out of `extractEquiPairs`
+	// (which requires two bare column references) into the join's residual — the correct
+	// destination, since the residual is where `=`'s own semantics apply, and the join
+	// still keys on the genuine correlation pair.
+	const [coercedOuter, [coercedInner]] = coerceObjectPhysicalSet(outerColRef.scope, outerColRef, [innerColRef]);
 	const equiCondition = new BinaryOpNode(
 		outerColRef.scope,
-		{ type: 'binary', operator: '=', left: outerColRef.expression, right: innerColRef.expression },
-		outerColRef,
-		innerColRef
+		{ type: 'binary', operator: '=', left: coercedOuter.expression, right: coercedInner.expression },
+		coercedOuter,
+		coercedInner
 	);
 
 	// If there's a filter with additional correlation, extract it

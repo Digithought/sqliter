@@ -43,6 +43,32 @@ export function castFallback(value: SqlValue, type: LogicalType): SqlValue {
 }
 
 /**
+ * What `cast(<value> as type)` produces: the target type's `parse`, falling back to
+ * {@link castFallback} when it rejects the operand. CAST stays lenient and never throws.
+ *
+ * THE one definition of "convert to this type the way CAST does". `emitCast` is the
+ * expression-level caller; `emitIn`'s membership evaluation is the other, converting a
+ * per-row subquery value where the plan-time coercion (`insertCrossTypeCoercion`) has no
+ * fixed operand to wrap.
+ *
+ * NOTE: a type with no `parse` defines no conversion, so the operand passes through while
+ * the caller still advertises the target type — the very shape castFallback exists to
+ * prevent. Unreachable today: NULL is the only builtin without `parse`, and the parser
+ * rejects it as a CAST target. If a plugin ever registers a parse-less type, validate here.
+ */
+export function lenientCast(value: SqlValue, type: LogicalType): SqlValue {
+	if (value === null) return null;
+	if (!type.parse) return value;
+	try {
+		return type.parse(value);
+	} catch {
+		// CAST failures in SQL return 0 for numeric targets, '' for text, etc.
+		// This matches SQLite's lenient CAST behavior.
+		return castFallback(value, type);
+	}
+}
+
+/**
  * Can `cast(<non-null operand> as type)` produce NULL? Answers the static
  * nullability of a converting CAST ({@link import('../planner/nodes/scalar.js').CastNode}).
  *

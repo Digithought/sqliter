@@ -12,7 +12,9 @@ import { ConstantNode } from '../../planner/nodes/plan-node.js';
 import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
 import { effectiveInCollation, inRhsTypes } from '../../planner/analysis/comparison-collation.js';
 import { isCorrelatedSubquery } from '../../planner/cache/correlation-detector.js';
-import type { LogicalType } from '../../types/logical-type.js';
+import { PhysicalType, type LogicalType } from '../../types/logical-type.js';
+import { NULL_TYPE } from '../../types/builtin-types.js';
+import { lenientCast } from '../../types/cast-semantics.js';
 
 /**
  * Once-per-execution memo for impure (DML-bearing) subquery inners. The cell
@@ -102,30 +104,97 @@ export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContex
 const IDENTITY_KEY = (value: SqlValue): SqlValue => value;
 
 /**
- * Membership key transform for `condition IN (...)`. IN is an identity test, so when
- * an operand declares a semantic-ordering logical type (see
- * {@link hasSemanticOrdering}) the probe AND every RHS value are normalized through
- * that type's canonical group key before comparing. Without it, `d IN ('PT120M')` on a
- * TIMESPAN column compares raw duration text and misses, while `d = 'PT120M'` matches
- * on elapsed time — IN must not disagree with the equality it desugars to.
- *
- * Normalizing (rather than routing the type's `compare` straight into the comparator,
- * as `emitComparisonOp`/BETWEEN do) is what keeps the BTree paths sound: the keys are
- * ranked by plain storage-class + collation order, which is total even when a list
- * literal is not a valid value of the type — `TIMESPAN.compare` mixes elapsed-time and
- * text ordering in that case and is not.
- *
- * A mixed pair (typed column vs plain text literal) still normalizes, matching
- * `emitComparisonOp`'s generic path, whose runtime temporal check compares
- * duration-vs-text semantically. Types with semantic ordering but no `groupKey` (JSON,
- * whose canonical text is already identity-faithful) take no transform, as do
- * membership tests whose operands declare two different semantic types.
+ * The two membership key transforms of one `condition IN (...)` site: one applied to the
+ * probe (the `condition` value), one applied to every right-hand member value. They are
+ * the same function for the symmetric semantic-normalization arm and deliberately
+ * asymmetric for the object-physical arm — see {@link inMembershipKeys}.
  */
-function inMembershipKey(plan: InNode): (value: SqlValue) => SqlValue {
-	const types: LogicalType[] = [plan.condition.getType().logicalType, ...inRhsTypes(plan).map(t => t.logicalType)];
-	const semantic = new Set(types.filter(hasSemanticOrdering));
-	if (semantic.size !== 1) return IDENTITY_KEY;
-	return semanticKeyTransform(semantic.values().next().value) ?? IDENTITY_KEY;
+interface InMembershipKeys {
+	/** Applied to the probe (the `condition` value). */
+	readonly probe: (value: SqlValue) => SqlValue;
+	/** Applied to every right-hand member value. */
+	readonly member: (value: SqlValue) => SqlValue;
+	/** EXPLAIN note suffix describing the transform; '' when both sides are identity. */
+	readonly note: string;
+}
+
+const IDENTITY_KEYS: InMembershipKeys = { probe: IDENTITY_KEY, member: IDENTITY_KEY, note: '' };
+
+const isObjectPhysical = (type: LogicalType): boolean => type.physicalType === PhysicalType.OBJECT;
+
+/**
+ * Membership key transforms for `condition IN (...)`. IN is an identity test, so it must
+ * not disagree with the equality it desugars to. Two arms, resolved in this order:
+ *
+ * 1. **Object-physical vs anything else.** JSON is the engine's only logical type whose
+ *    runtime values are native JS objects, a storage class `compareSqlValuesFast` never
+ *    calls equal to a string. Every other comparison site reconciles this at PLAN time by
+ *    wrapping the non-object side in `cast(… as json)`
+ *    ({@link import('../../planner/building/coercion.js').coerceObjectPhysicalSet}); the IN
+ *    *subquery* form has no fixed operand list to wrap, so the same conversion happens
+ *    here, per row, via {@link lenientCast}.
+ *
+ *    The asymmetry is load-bearing, not tidiness: only the NON-object side converts,
+ *    exactly as the plan-time helper does. Running the object side back through
+ *    `JSON_TYPE.parse` would re-parse JSON **string scalars** — a JSON column holding the
+ *    document `"[1,2]"` is stored as the plain JS string `[1,2]`, and re-parsing would turn
+ *    it into the JSON *array* `[1,2]`, colliding two distinct documents.
+ *
+ *    The gate is `physicalType === OBJECT`, **not** `semanticOrdering`, and deliberately
+ *    does NOT extend to the numeric-vs-textual pairing: `int_col in ('1')` is false today
+ *    (tracked by `bug-numeric-text-coercion-skips-in-and-case`) and must stay false here,
+ *    or the subquery form would start disagreeing with the value-list form in the other
+ *    direction. A NULL-typed side is left alone — the membership test is UNKNOWN anyway.
+ *
+ * 2. **Semantic normalization (symmetric).** When an operand declares a semantic-ordering
+ *    logical type (see {@link hasSemanticOrdering}) the probe AND every RHS value are
+ *    normalized through that type's canonical group key before comparing. Without it,
+ *    `d IN ('PT120M')` on a TIMESPAN column compares raw duration text and misses, while
+ *    `d = 'PT120M'` matches on elapsed time.
+ *
+ *    Normalizing (rather than routing the type's `compare` straight into the comparator,
+ *    as `emitComparisonOp`/BETWEEN do) is what keeps the BTree paths sound: the keys are
+ *    ranked by plain storage-class + collation order, which is total even when a list
+ *    literal is not a valid value of the type — `TIMESPAN.compare` mixes elapsed-time and
+ *    text ordering in that case and is not.
+ *
+ *    A mixed pair (typed column vs plain text literal) still normalizes, matching
+ *    `emitComparisonOp`'s generic path, whose runtime temporal check compares
+ *    duration-vs-text semantically. TIMESPAN is the only type with a `groupKey` hook, so
+ *    this arm is identity for everything else — including JSON, whose canonical text is
+ *    already identity-faithful once arm 1 has put both sides in the object storage class
+ *    (`compareSqlValuesFast`'s OBJECT branch compares canonical JSON text, so
+ *    reorder-equal documents land on ONE BTree key). Membership tests whose operands
+ *    declare two different semantic types also take no transform.
+ */
+function inMembershipKeys(plan: InNode): InMembershipKeys {
+	const conditionType = plan.condition.getType().logicalType;
+	const rhsTypes: LogicalType[] = inRhsTypes(plan).map(t => t.logicalType);
+
+	// Arm 1: exactly one side object-physical. For a subquery RHS there is a single
+	// member type; a value list has already been reconciled at plan time, so a mixed
+	// list cannot reach here (every non-NULL element carries the object type too).
+	const objectRhs = rhsTypes.find(isObjectPhysical);
+	if (isObjectPhysical(conditionType) && !objectRhs && rhsTypes.some(t => t !== NULL_TYPE)) {
+		return {
+			probe: IDENTITY_KEY,
+			member: (value: SqlValue) => lenientCast(value, conditionType),
+			note: ` member as ${conditionType.name}`,
+		};
+	}
+	if (objectRhs && !isObjectPhysical(conditionType) && conditionType !== NULL_TYPE) {
+		return {
+			probe: (value: SqlValue) => lenientCast(value, objectRhs),
+			member: IDENTITY_KEY,
+			note: ` probe as ${objectRhs.name}`,
+		};
+	}
+
+	// Arm 2: symmetric semantic normalization.
+	const semantic = new Set([conditionType, ...rhsTypes].filter(hasSemanticOrdering));
+	if (semantic.size !== 1) return IDENTITY_KEYS;
+	const transform = semanticKeyTransform(semantic.values().next().value);
+	return transform ? { probe: transform, member: transform, note: ' semantic' } : IDENTITY_KEYS;
 }
 
 export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
@@ -136,9 +205,9 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 	const collationName = effectiveInCollation(plan);
 	const collation = ctx.resolveCollation(collationName);
 
-	// Canonical identity key applied to both sides of every comparison below.
-	const memberKey = inMembershipKey(plan);
-	const keyNote = memberKey === IDENTITY_KEY ? '' : ' semantic';
+	// Canonical identity keys — `probeKey` for the condition, `memberKey` for every
+	// right-hand value. Asymmetric for the object-physical arm; see inMembershipKeys.
+	const { probe: probeKey, member: memberKey, note: keyNote } = inMembershipKeys(plan);
 
 	if (plan.source) {
 		const isImpure = PlanNodeCharacteristics.subtreeHasSideEffects(plan.source);
@@ -155,15 +224,18 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 				let matched = false;
 				let hasNull = false;
-				const shouldCompare = condition !== null;
-				const conditionKey = shouldCompare ? memberKey(condition) : null;
+				// Keyed FIRST, then null-checked: an object-arm coercion can yield NULL
+				// (a blob is a JSON value under no reading), which is UNKNOWN, not false.
+				const conditionKey = condition === null ? null : probeKey(condition);
+				const shouldCompare = conditionKey !== null;
 
 				for await (const row of input) {
 					if (row.length > 0) {
 						const rowValue = row[0];
-						if (rowValue === null) {
+						const rowKey = rowValue === null ? null : memberKey(rowValue);
+						if (rowKey === null) {
 							hasNull = true;
-						} else if (shouldCompare && !matched && compareSqlValuesFast(conditionKey, memberKey(rowValue), collation) === 0) {
+						} else if (shouldCompare && !matched && compareSqlValuesFast(conditionKey, rowKey, collation) === 0) {
 							matched = true;
 						}
 					}
@@ -211,7 +283,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			// symbol — never the tree — so the set resets between executions and a
 			// re-run re-drains the source with current data. Same rule as the
 			// impure-IN memo and emitCache.
-			const probeKey = Symbol('IN(set-probe)');
+			const probeSlot = Symbol('IN(set-probe)');
 
 			// NOTE: the set holds deduplicated scalar values — strictly less memory
 			// than the row cache it replaces, and the literal `IN (a, b, …)` path is
@@ -219,11 +291,17 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			// need bounding, add a threshold that spills to the streaming path.
 			async function runSetProbe(rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
 				// Condition NULL → NULL, and do NOT force the build (short-circuit).
+				// A condition that COERCES to NULL under the object arm is UNKNOWN too,
+				// and must not force the build either — so key before the build, not after.
 				if (condition === null) {
 					return null;
 				}
+				const conditionKey = probeKey(condition);
+				if (conditionKey === null) {
+					return null;
+				}
 
-				let probe = rctx.inSetProbes?.get(probeKey);
+				let probe = rctx.inSetProbes?.get(probeSlot);
 				if (!probe) {
 					// First evaluation that needs the set: drain the source once into a
 					// BTree keyed under the membership collation, tracking inner NULLs.
@@ -234,21 +312,24 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 					for await (const row of input) {
 						if (row.length > 0) {
 							const rowValue = row[0];
-							if (rowValue === null) {
+							// A member that coerces to NULL is not a member — it makes the
+							// miss case UNKNOWN, exactly as a literal inner NULL does.
+							const rowKey = rowValue === null ? null : memberKey(rowValue);
+							if (rowKey === null) {
 								hasNull = true;
 							} else {
 								// Duplicate keys are a no-op insert — the set only tracks membership.
-								tree.insert(memberKey(rowValue));
+								tree.insert(rowKey);
 							}
 						}
 					}
 					probe = { tree, hasNull };
-					(rctx.inSetProbes ??= new Map()).set(probeKey, probe);
+					(rctx.inSetProbes ??= new Map()).set(probeSlot, probe);
 				}
 
 				// Three-valued membership, identical to the streaming and value-list paths:
 				// hit → true; miss → NULL if the inner had a NULL, else false.
-				if (probe.tree.find(memberKey(condition)).on) {
+				if (probe.tree.find(conditionKey).on) {
 					return true;
 				}
 				return probe.hasNull ? null : false;
@@ -272,17 +353,23 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 				return null;
 			}
 
-			const conditionKey = memberKey(condition);
+			const conditionKey = probeKey(condition);
+			// A condition that coerces to NULL is UNKNOWN, like a NULL condition.
+			if (conditionKey === null) {
+				return null;
+			}
+
 			let hasNull = false;
 			for await (const row of input) {
 				if (row.length > 0) {
 					const rowValue = row[0];
-					if (rowValue === null) {
+					const rowKey = rowValue === null ? null : memberKey(rowValue);
+					if (rowKey === null) {
 						hasNull = true;
 						continue;
 					}
 					// Check for match immediately - no need to materialize
-					if (compareSqlValuesFast(conditionKey, memberKey(rowValue), collation) === 0) {
+					if (compareSqlValuesFast(conditionKey, rowKey, collation) === 0) {
 						return true; // Found a match
 					}
 				}
@@ -314,13 +401,14 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 			let hasNull = false;
 
 			function innerConstantRun(_rctx: RuntimeContext, condition: SqlValue): SqlValue {
-				// If condition is NULL, result is NULL
-				if (condition === null) {
+				// If condition is NULL — or coerces to NULL — the result is NULL
+				const conditionKey = condition === null ? null : probeKey(condition);
+				if (conditionKey === null) {
 					return null;
 				}
 
 				// Check if condition exists in pre-built tree
-				const path = tree.find(memberKey(condition));
+				const path = tree.find(conditionKey);
 				if (path.on) {
 					return true; // Found a match
 				}
@@ -339,22 +427,24 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 					const resolved = await Promise.all(values);
 
 					for (const value of resolved) {
-						if (value === null) {
+						const valueKey = value === null ? null : memberKey(value as SqlValue);
+						if (valueKey === null) {
 							hasNull = true;
 							continue;
 						}
-						tree.insert(memberKey(value as SqlValue));
+						tree.insert(valueKey);
 					}
 
 					return innerConstantRun(rctx, condition);
 				});
 			} else {
 				for (const value of values) {
-					if (value === null) {
+					const valueKey = value === null ? null : memberKey(value as SqlValue);
+					if (valueKey === null) {
 						hasNull = true;
 						continue;
 					}
-					tree.insert(memberKey(value as SqlValue));
+					tree.insert(valueKey);
 				}
 				runFunc = asRun(innerConstantRun);
 			}
