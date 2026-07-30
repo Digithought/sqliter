@@ -224,6 +224,31 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		expect(f!.selectivity).to.be.closeTo(CROSS_RELATION_INEQUALITY_SELECTIVITY, 1e-12);
 	});
 
+	it('reads a renamed base column\'s own statistics on the cross-relation path', () => {
+		// `rid AS qty` renames a 20-distinct column to the name of a 3-distinct one.
+		// Resolving the comparison by AST name credits `o.qty`, giving 1/max(3, 5);
+		// resolving by attribute identity credits `o.rid`, giving 1/max(20, 5).
+		const f = optimizedFilter(db,
+			'SELECT * FROM (SELECT id, rid AS qty FROM o) x JOIN r ON x.id = r.id WHERE x.qty = r.qty');
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+
+		expect(f!.selectivity).to.be.closeTo(1 / Math.max(ndv['o.rid'], ndv['r.qty']), 1e-12);
+		expect(f!.selectivity, 'must not be the estimate for the column the alias merely NAMES')
+			.to.not.be.closeTo(1 / Math.max(ndv['o.qty'], ndv['r.qty']), 1e-9);
+	});
+
+	it('still estimates a single-relation conjunct over one side of a self-join', () => {
+		// Pins the `origin.ref === ref` narrowing: both sides share one TableSchema, so
+		// the resolver keyed on reference identity must still accept `a.cat` rather than
+		// rejecting it because `b` also owns a column of that name.
+		const f = optimizedFilter(db,
+			"SELECT * FROM o a JOIN o b ON a.id = b.id WHERE a.cat = 'a' AND a.qty > b.qty");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+
+		const expected = combineConjunctive([1 / ndv['o.cat'], CROSS_RELATION_INEQUALITY_SELECTIVITY]);
+		expect(f!.selectivity).to.be.closeTo(expected, 1e-12);
+	});
+
 	it('treats the two sides of a self-join as distinct relations', () => {
 		// `a.qty = b.rid` compares columns with different distinct counts. Attributing
 		// it to ONE relation (keying on TableSchema rather than on the table-reference
@@ -791,6 +816,85 @@ describe('single-table selectivity declines when the source changes the row popu
 		// has to stop here instead.
 		expect(extractTableSchema(cte as RelationalPlanNode)?.name).to.equal('o');
 		expect(extractRowSourceTableSchema(cte as RelationalPlanNode)).to.be.undefined;
+	});
+});
+
+describe('single-table selectivity matches columns by identity, not by name', () => {
+	let db: Database;
+	/** Distinct counts recorded by ANALYZE for `o`, keyed by column name. */
+	let ndv: Record<string, number>;
+
+	beforeEach(async () => {
+		db = new Database();
+		// `cat` (4 distinct) and `qty` (7 distinct) have deliberately different distinct
+		// counts, so an alias that borrows the wrong column's statistics is visible.
+		await db.exec('CREATE TABLE o (id INTEGER PRIMARY KEY, cat TEXT, qty INTEGER) USING memory');
+		for (let i = 1; i <= 100; i++) {
+			await db.exec(`INSERT INTO o VALUES (${i}, '${['a', 'b', 'c', 'd'][i % 4]}', ${i % 7})`);
+		}
+		for await (const _ of db.eval('ANALYZE o')) { /* consume */ }
+
+		const stats = db.schemaManager.findTable('o')?.statistics;
+		expect(stats, 'ANALYZE should record statistics for o').to.not.be.undefined;
+		ndv = {};
+		for (const col of ['cat', 'qty']) {
+			const n = stats!.columnStats.get(col)?.distinctCount;
+			expect(n, `distinct count for ${col}`).to.be.a('number');
+			ndv[col] = n as number;
+		}
+		expect(ndv.cat, 'cat should have 4 distinct values').to.equal(4);
+		expect(ndv.qty, 'qty should have 7 distinct values').to.equal(7);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('does not charge a computed column the statistics of the base column it is named after', () => {
+		// `id * 7` is a fresh attribute minted by the Project; the alias `qty` collides
+		// with a real column of `o` purely by spelling. The durable assertion is that the
+		// two spellings agree — renaming an alias must not move the estimate. (Both land
+		// on the naive BinaryOp guess, but pinning that constant would be pinning the
+		// fallback rather than the fix.)
+		const collides = optimizedFilter(db, 'SELECT * FROM (SELECT cat, id * 7 AS qty FROM o) x WHERE x.qty = 3');
+		const distinctName = optimizedFilter(db, 'SELECT * FROM (SELECT cat, id * 7 AS zz FROM o) x WHERE x.zz = 3');
+
+		expect(collides, 'expected a residual Filter').to.not.be.undefined;
+		expect(distinctName, 'expected a residual Filter').to.not.be.undefined;
+		expect(collides!.selectivity).to.equal(distinctName!.selectivity);
+		expect(collides!.selectivity, 'specifically not 1/ndv(o.qty)').to.not.be.closeTo(1 / ndv.qty, 1e-9);
+	});
+
+	it('does not charge a window function output the statistics of a same-named base column', () => {
+		// A window function emits one row per input row, so the strict walk still reaches
+		// `o` — but `row_number()` is its own attribute and no column of `o` describes it.
+		const collides = optimizedFilter(db,
+			'SELECT * FROM (SELECT cat, row_number() OVER (ORDER BY id) AS qty FROM o) x WHERE x.qty = 3');
+		const distinctName = optimizedFilter(db,
+			'SELECT * FROM (SELECT cat, row_number() OVER (ORDER BY id) AS rn FROM o) x WHERE x.rn = 3');
+
+		expect(collides, 'expected a residual Filter').to.not.be.undefined;
+		expect(distinctName, 'expected a residual Filter').to.not.be.undefined;
+		expect(collides!.selectivity).to.equal(distinctName!.selectivity);
+		expect(collides!.selectivity, 'specifically not 1/ndv(o.qty)').to.not.be.closeTo(1 / ndv.qty, 1e-9);
+	});
+
+	it('recovers a plainly renamed base column\'s own statistics', () => {
+		// The positive half: `cat AS qty` keeps `o.cat`'s attribute id, so identity
+		// resolution reads `o.cat`'s distinct count. Name resolution found no column
+		// called `qty` among the projected ones and fell back to the naive guess.
+		const f = optimizedFilter(db, "SELECT * FROM (SELECT cat AS qty FROM o) x WHERE x.qty = 'a'");
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / ndv.cat, 1e-12);
+	});
+
+	it('still reads a pass-through projection\'s column (guards against over-declining)', () => {
+		const f = optimizedFilter(db, 'SELECT * FROM (SELECT cat, qty FROM o) x WHERE x.qty = 3');
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / ndv.qty, 1e-12);
+	});
+
+	it('still reads a bare base-table filter', () => {
+		const f = optimizedFilter(db, 'SELECT * FROM o WHERE qty = 3');
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / ndv.qty, 1e-12);
 	});
 });
 

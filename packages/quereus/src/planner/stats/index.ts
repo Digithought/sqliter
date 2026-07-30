@@ -10,7 +10,24 @@ import { createLogger } from '../../common/logger.js';
 const log = createLogger('optimizer:stats');
 
 /**
+ * Resolves the attribute id of a column reference appearing in a predicate to the
+ * name of the base-table column whose statistics describe it.
+ *
+ * Returns undefined when the attribute was minted above the base table (a computed
+ * projection, an aggregate or window output, a set-operation output) — such a column
+ * has no base-table statistics, whatever it happens to be named.
+ */
+export type ColumnStatsResolver = (attributeId: number) => string | undefined;
+
+/**
  * Statistics provider interface for optimizer
+ *
+ * The `resolve` parameter on the selectivity family identifies a predicate's columns
+ * by attribute identity rather than by the name in their AST. A caller holding a plan
+ * tree MUST pass one: without it a provider falls back to the syntactic name, and a
+ * computed column aliased to a base column's name silently borrows that column's
+ * statistics. It stays optional only for callers with no plan context (direct unit
+ * tests over hand-built nodes).
  */
 export interface StatsProvider {
 	/**
@@ -24,9 +41,10 @@ export interface StatsProvider {
 	 * Get selectivity estimate for a predicate on a table
 	 * @param table Table schema
 	 * @param predicate Predicate expression
+	 * @param resolve Attribute id → base-column name; see {@link ColumnStatsResolver}
 	 * @returns Selectivity factor (0.0 to 1.0), or undefined if unknown
 	 */
-	selectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined;
+	selectivity(table: TableSchema, predicate: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined;
 
 	/**
 	 * Selectivity derived from REAL statistics only, with no heuristic fallback.
@@ -40,18 +58,20 @@ export interface StatsProvider {
 	 *
 	 * @param table Table schema
 	 * @param predicate Predicate expression
+	 * @param resolve Attribute id → base-column name; see {@link ColumnStatsResolver}
 	 * @returns Selectivity factor (0.0 to 1.0), or undefined if real statistics cannot answer
 	 */
-	statsOnlySelectivity?(table: TableSchema, predicate: ScalarPlanNode): number | undefined;
+	statsOnlySelectivity?(table: TableSchema, predicate: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined;
 
 	/**
 	 * Get join selectivity estimate
 	 * @param leftTable Left table schema
 	 * @param rightTable Right table schema
 	 * @param joinCondition Join condition
+	 * @param resolve Attribute id → base-column name; see {@link ColumnStatsResolver}
 	 * @returns Join selectivity factor, or undefined if unknown
 	 */
-	joinSelectivity?(leftTable: TableSchema, rightTable: TableSchema, joinCondition: ScalarPlanNode): number | undefined;
+	joinSelectivity?(leftTable: TableSchema, rightTable: TableSchema, joinCondition: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined;
 
 	/**
 	 * Get number of distinct values for a column

@@ -37,11 +37,19 @@
  *     walk declined. Split the predicate into conjuncts, attribute each to the base
  *     table(s) its columns come from, estimate per conjunct, and combine.
  *
- * The strict walk matters because the provider resolves a column reference by its
- * AST **name**: over `select cat, count(*) as qty from o group by cat having qty > 2`
- * the permissive `extractTableSchema` reaches `o` through the aggregate and the alias
- * `qty` then reads `o.qty`'s histogram — a fraction of `o`'s rows, describing neither
- * the group count nor the aggregate's output. Rename the alias and the answer changes.
+ * The strict walk matters because an aggregate's output rows are a different
+ * population from its source's, so no fraction of the base table describes them at
+ * all: over `select cat, count(*) as ct from o group by cat having ct > 2` the
+ * permissive `extractTableSchema` reaches `o` through the aggregate, but `o`'s row
+ * count and column distributions say nothing about how many GROUPS survive `ct > 2`.
+ *
+ * Both paths hand the provider a {@link ColumnStatsResolver} built from
+ * `collectColumnOrigins`, so a column in the predicate is matched to statistics by
+ * ATTRIBUTE IDENTITY rather than by the name in its AST. `ProjectNode` forwards the
+ * source attribute id for a bare column reference and mints a fresh one for a
+ * computed expression, which is exactly the distinction wanted: `select cat as qty`
+ * still reads `o.cat`'s statistics, while `select id * 7 as qty` reads none rather
+ * than borrowing `o.qty`'s because the alias happens to collide.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -55,6 +63,7 @@ import { extractRowSourceTableSchema } from '../../util/key-utils.js';
 import { collectColumnOrigins, type ColumnOrigin } from '../../util/column-origins.js';
 import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { combineConjunctive } from '../../stats/selectivity-combine.js';
+import type { ColumnStatsResolver } from '../../stats/index.js';
 
 const log = createLogger('optimizer:rule:filter-selectivity');
 
@@ -80,9 +89,23 @@ export function ruleFilterSelectivity(node: PlanNode, context: OptContext): Plan
 	// It returns undefined for those and for a join / other multi-relation source,
 	// which is what the second path handles.
 	const tableSchema = extractRowSourceTableSchema(filter.source);
+
+	// Attribute id → base-table column, for every base column under the Filter. Both
+	// paths need it: the multi-relation path to route a conjunct to a relation, and
+	// both paths to identify a predicate's columns by identity rather than by name.
+	//
+	// NOTE: this walk covers the whole source subtree and this rule fires per
+	// FilterNode, so a stack of N filters over one large subtree costs O(N·subtree) —
+	// and unlike before, it now runs for EVERY Filter, not only filters over joins.
+	// The walk is cheap per node and filter stacks are shallow; if it ever shows up in
+	// optimizer profiles, either cache the map per pass on OptContext, or — for the
+	// single-table path only — build the resolver from the one TableReferenceNode the
+	// strict walk already found, which is O(columns) instead of O(subtree).
+	const origins = collectColumnOrigins(filter.source);
+
 	const sel = tableSchema
-		? singleTableSelectivity(tableSchema, filter, context)
-		: multiRelationSelectivity(filter, context);
+		? singleTableSelectivity(tableSchema, filter, origins, context)
+		: multiRelationSelectivity(filter, origins, context);
 	if (sel === undefined) return null;
 
 	const clamped = Math.min(1, Math.max(0, sel));
@@ -92,11 +115,31 @@ export function ruleFilterSelectivity(node: PlanNode, context: OptContext): Plan
 	return new FilterNode(filter.scope, filter.source, filter.predicate, undefined, clamped);
 }
 
+// ── Column identity ─────────────────────────────────────────────────────
+
+/**
+ * A resolver over `origins`, restricted to the origins `accept` allows.
+ *
+ * An attribute with no origin — or one belonging to a relation the caller is not
+ * currently estimating — resolves to undefined, which the provider reads as "this
+ * column has no statistics" rather than falling back to its AST name.
+ */
+function makeResolver(
+	origins: ReadonlyMap<number, ColumnOrigin>,
+	accept: (origin: ColumnOrigin) => boolean,
+): ColumnStatsResolver {
+	return (attributeId) => {
+		const origin = origins.get(attributeId);
+		return origin && accept(origin) ? origin.columnName : undefined;
+	};
+}
+
 // ── Single-table path ───────────────────────────────────────────────────
 
 function singleTableSelectivity(
 	tableSchema: TableSchema,
 	filter: FilterNode,
+	origins: ReadonlyMap<number, ColumnOrigin>,
 	context: OptContext,
 ): number | undefined {
 	// CatalogStatsProvider recurses over the predicate's boolean structure, so
@@ -107,7 +150,12 @@ function singleTableSelectivity(
 	// NOTE: this path is deliberately NOT gated on real statistics existing — it may
 	// still stamp a NaiveStatsProvider number, as it always has. The multi-relation
 	// path below IS gated; see the comment there for why the asymmetry is on purpose.
-	const sel = context.stats.selectivity(tableSchema, filter.predicate);
+	//
+	// Schema equality is the right narrowing here: the strict walk established that
+	// exactly this table's rows arrive at the Filter, so any origin under it belongs
+	// to that one reference anyway.
+	const resolve = makeResolver(origins, origin => origin.table === tableSchema);
+	const sel = context.stats.selectivity(tableSchema, filter.predicate, resolve);
 	if (sel === undefined) return undefined;
 	log('Filter over %s: stamping selectivity %f', tableSchema.name, sel);
 	return sel;
@@ -136,14 +184,12 @@ function singleTableSelectivity(
  * node (SeqScan/IndexScan over a Retrieve) exposes none — so the join reports
  * undefined rows and the Filter has nothing to multiply. Tracked in backlog
  * `debt-join-rows-from-physical-children`; nothing here needs to change when it lands.
- *
- * NOTE: `collectColumnOrigins` walks the whole source subtree and this rule fires
- * per FilterNode, so a stack of N filters over one large subtree costs O(N·subtree).
- * Filters over joins are few and the walk is cheap per node; if this ever shows up
- * in optimizer profiles, compute the map once per pass and cache it on OptContext.
  */
-function multiRelationSelectivity(filter: FilterNode, context: OptContext): number | undefined {
-	const origins = collectColumnOrigins(filter.source);
+function multiRelationSelectivity(
+	filter: FilterNode,
+	origins: ReadonlyMap<number, ColumnOrigin>,
+	context: OptContext,
+): number | undefined {
 	if (origins.size === 0) return undefined;
 
 	const conjuncts = splitConjuncts(filter.predicate);
@@ -181,7 +227,12 @@ function estimateConjunct(
 
 	if (refs.size === 1) {
 		const [ref] = refs;
-		return singleRelationConjunct(ref.tableSchema, conjunct, context);
+		// Reference identity, not schema: `from t a join t b` gives two
+		// TableReferenceNodes sharing one TableSchema, so schema equality would not
+		// separate the sides. `conjunctRelations` has already established that this
+		// conjunct touches exactly this one reference.
+		const resolve = makeResolver(origins, origin => origin.ref === ref);
+		return singleRelationConjunct(ref.tableSchema, conjunct, resolve, context);
 	}
 	if (refs.size === 2) {
 		return crossRelationConjunct(conjunct, origins, context);
@@ -236,9 +287,10 @@ function conjunctRelations(
 function singleRelationConjunct(
 	table: TableSchema,
 	conjunct: ScalarPlanNode,
+	resolve: ColumnStatsResolver,
 	context: OptContext,
 ): number | undefined {
-	return context.stats.statsOnlySelectivity?.(table, conjunct);
+	return context.stats.statsOnlySelectivity?.(table, conjunct, resolve);
 }
 
 function hasColumnStats(origin: ColumnOrigin): boolean {
@@ -271,7 +323,12 @@ function crossRelationConjunct(
 
 	const op = conjunct.expression.operator;
 
-	if (op === '=' || op === '==') return equiJoinSelectivity(conjunct, leftOrigin, rightOrigin, context);
+	// Both origins were resolved and stats-checked by identity just above, so no
+	// further narrowing is needed — the resolver only has to replace the AST names
+	// with the base columns those two attributes actually are.
+	const resolve = makeResolver(origins, () => true);
+
+	if (op === '=' || op === '==') return equiJoinSelectivity(conjunct, leftOrigin, rightOrigin, resolve, context);
 
 	// `extractEquiJoinColumns` accepts only `=`, so the catalog declines a `<>` and
 	// `joinSelectivity` answers from NaiveStatsProvider, which is capped at 0.5. The
@@ -279,7 +336,7 @@ function crossRelationConjunct(
 	// estimate relative to DEFAULT_FILTER_SELECTIVITY, and the true value for a
 	// cross-relation `<>` is near 1, so the bound errs in the right direction.
 	if (op === '!=' || op === '<>') {
-		const eq = equiJoinSelectivity(conjunct, leftOrigin, rightOrigin, context);
+		const eq = equiJoinSelectivity(conjunct, leftOrigin, rightOrigin, resolve, context);
 		return eq === undefined ? undefined : 1 - eq;
 	}
 
@@ -300,7 +357,8 @@ function equiJoinSelectivity(
 	conjunct: ScalarPlanNode,
 	leftOrigin: ColumnOrigin,
 	rightOrigin: ColumnOrigin,
+	resolve: ColumnStatsResolver,
 	context: OptContext,
 ): number | undefined {
-	return context.stats.joinSelectivity?.(leftOrigin.table, rightOrigin.table, conjunct);
+	return context.stats.joinSelectivity?.(leftOrigin.table, rightOrigin.table, conjunct, resolve);
 }

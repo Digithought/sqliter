@@ -8,7 +8,7 @@
 import type { SqlValue } from '../../common/types.js';
 import type { ScalarPlanNode } from '../nodes/plan-node.js';
 import type { TableSchema } from '../../schema/table.js';
-import type { StatsProvider } from './index.js';
+import type { ColumnStatsResolver, StatsProvider } from './index.js';
 import { NaiveStatsProvider } from './index.js';
 import { createLogger } from '../../common/logger.js';
 import { selectivityFromHistogram } from './histogram.js';
@@ -53,6 +53,18 @@ type Estimate =
 
 const complete = (value: number): Estimate => ({ kind: 'complete', value });
 const lowerBound = (value: number): Estimate => ({ kind: 'lowerBound', value });
+
+/**
+ * What the recursive estimate walk carries down: the table's statistics, plus the
+ * optional resolver that identifies a predicate's columns by attribute identity
+ * rather than by the name written in their AST (see {@link ColumnStatsResolver}).
+ *
+ * Bundled into one object so the walk's six methods keep two-parameter signatures.
+ */
+interface EstimateContext {
+	readonly stats: TableStatistics;
+	readonly resolve?: ColumnStatsResolver;
+}
 
 // ── Statistics data structures ──────────────────────────────────────────
 
@@ -128,8 +140,8 @@ export class CatalogStatsProvider implements StatsProvider {
 		return this.fallback.tableRows(table);
 	}
 
-	selectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined {
-		const estimate = this.estimate(table, predicate);
+	selectivity(table: TableSchema, predicate: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined {
+		const estimate = this.estimate(table, predicate, resolve);
 		if (estimate?.kind === 'complete') {
 			log('Predicate selectivity for %s on %s: %f (catalog)', predicate.nodeType, table.name, estimate.value);
 			return estimate.value;
@@ -151,21 +163,31 @@ export class CatalogStatsProvider implements StatsProvider {
 	/**
 	 * The catalog half of {@link selectivity}: undefined rather than a naive guess
 	 * when the table carries no statistics, or when the predicate's shape puts it out
-	 * of reach of the ones it has (`lower(cat) = 'x'` — {@link extractColumnFromPredicate}
-	 * reads the column off a direct child of the comparison and finds none).
+	 * of reach of the ones it has —
+	 *
+	 * - the column is not a direct child of the comparison (`lower(cat) = 'x'` —
+	 *   {@link extractColumnFromPredicate} looks one level down and finds none), or
+	 * - the column was minted above the base table (a computed projection, an
+	 *   aggregate or window output), which a caller-supplied
+	 *   {@link ColumnStatsResolver} reports by resolving the attribute to nothing.
 	 *
 	 * A partly-known OR reads as undefined here: this method means "real statistics
 	 * answered *the predicate*", and `rule-filter-selectivity` uses it as its
 	 * does-this-relation-have-usable-statistics gate. A floor is not an answer.
 	 */
-	statsOnlySelectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined {
-		const estimate = this.estimate(table, predicate);
+	statsOnlySelectivity(table: TableSchema, predicate: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined {
+		const estimate = this.estimate(table, predicate, resolve);
 		return estimate?.kind === 'complete' ? estimate.value : undefined;
 	}
 
-	joinSelectivity(leftTable: TableSchema, rightTable: TableSchema, joinCondition: ScalarPlanNode): number | undefined {
+	joinSelectivity(
+		leftTable: TableSchema,
+		rightTable: TableSchema,
+		joinCondition: ScalarPlanNode,
+		resolve?: ColumnStatsResolver,
+	): number | undefined {
 		// For equi-joins, use 1/max(ndv_left, ndv_right) if we can extract columns
-		const colNames = extractEquiJoinColumns(joinCondition);
+		const colNames = extractEquiJoinColumns(joinCondition, resolve);
 		if (colNames) {
 			// Check FK→PK: if one side has an FK referencing the other's PK,
 			// use 1/ndv_pk for tighter selectivity
@@ -248,11 +270,15 @@ export class CatalogStatsProvider implements StatsProvider {
 	 * Entry point for predicate selectivity: no statistics at all, or the empty
 	 * table, short-circuit; otherwise walk the predicate's boolean structure.
 	 */
-	private estimate(table: TableSchema, predicate: ScalarPlanNode): Estimate | undefined {
+	private estimate(
+		table: TableSchema,
+		predicate: ScalarPlanNode,
+		resolve?: ColumnStatsResolver,
+	): Estimate | undefined {
 		const stats = table.statistics;
 		if (!stats) return undefined;
 		if (stats.rowCount === 0) return complete(0);
-		return this.estimateNode(stats, predicate, 0);
+		return this.estimateNode({ stats, resolve }, predicate, 0);
 	}
 
 	/**
@@ -264,7 +290,7 @@ export class CatalogStatsProvider implements StatsProvider {
 	 * existed.
 	 */
 	private estimateNode(
-		stats: TableStatistics,
+		ctx: EstimateContext,
 		node: ScalarPlanNode,
 		depth: number
 	): Estimate | undefined {
@@ -273,8 +299,8 @@ export class CatalogStatsProvider implements StatsProvider {
 		if (node.nodeType === 'BinaryOp') {
 			// Planner convention is uppercase 'AND' / 'OR' (see predicate-normalizer).
 			const op = (node as unknown as BinaryOpNode).expression.operator;
-			if (op === 'AND') return this.estimateConjunction(stats, node, depth);
-			if (op === 'OR') return this.estimateDisjunction(stats, node, depth);
+			if (op === 'AND') return this.estimateConjunction(ctx, node, depth);
+			if (op === 'OR') return this.estimateDisjunction(ctx, node, depth);
 		}
 
 		if (node.nodeType === 'UnaryOp') {
@@ -285,7 +311,7 @@ export class CatalogStatsProvider implements StatsProvider {
 				// how the rest of this file introspects nodes structurally.
 				const operand = node.getChildren()[0] as ScalarPlanNode | undefined;
 				if (!operand) return undefined;
-				const inner = this.estimateNode(stats, operand, depth + 1);
+				const inner = this.estimateNode(ctx, operand, depth + 1);
 				// A lower bound negates into an UPPER bound, which nothing downstream
 				// models, so a partly-known operand makes the negation unknown.
 				if (inner?.kind !== 'complete') return undefined;
@@ -300,12 +326,12 @@ export class CatalogStatsProvider implements StatsProvider {
 			}
 		}
 
-		return this.leafEstimate(stats, node);
+		return this.leafEstimate(ctx, node);
 	}
 
 	/** {@link estimateLeaf} lifted into the {@link Estimate} vocabulary. */
-	private leafEstimate(stats: TableStatistics, node: ScalarPlanNode): Estimate | undefined {
-		const sel = this.estimateLeaf(stats, node);
+	private leafEstimate(ctx: EstimateContext, node: ScalarPlanNode): Estimate | undefined {
+		const sel = this.estimateLeaf(ctx, node);
 		return sel === undefined ? undefined : complete(sel);
 	}
 
@@ -327,18 +353,18 @@ export class CatalogStatsProvider implements StatsProvider {
 	 * the result down, and AND deliberately errs high.
 	 */
 	private estimateConjunction(
-		stats: TableStatistics,
+		ctx: EstimateContext,
 		node: ScalarPlanNode,
 		depth: number
 	): Estimate | undefined {
 		const conjuncts = splitConjuncts(node);
 		// splitConjuncts only descends through real BinaryOpNode instances; if it
 		// handed back the node itself there is nothing to decompose.
-		if (conjuncts.length === 1 && conjuncts[0] === node) return this.leafEstimate(stats, node);
+		if (conjuncts.length === 1 && conjuncts[0] === node) return this.leafEstimate(ctx, node);
 
 		const known: number[] = [];
 		for (const conjunct of conjuncts) {
-			const est = this.estimateNode(stats, conjunct, depth + 1);
+			const est = this.estimateNode(ctx, conjunct, depth + 1);
 			if (est?.kind === 'complete') known.push(est.value);
 		}
 		if (known.length === 0) return undefined;
@@ -347,7 +373,7 @@ export class CatalogStatsProvider implements StatsProvider {
 		// anti-correlated and are not paired into a single range here. Exponential
 		// backoff damps the error (0.333 · √0.333 ≈ 0.19 instead of 0.11) but does
 		// not remove it; same-column range pairing would.
-		return complete(this.floorCombined(stats, combineConjunctive(known), known.length));
+		return complete(this.floorCombined(ctx.stats, combineConjunctive(known), known.length));
 	}
 
 	/**
@@ -368,18 +394,18 @@ export class CatalogStatsProvider implements StatsProvider {
 	 * value is only the max.
 	 */
 	private estimateDisjunction(
-		stats: TableStatistics,
+		ctx: EstimateContext,
 		node: ScalarPlanNode,
 		depth: number
 	): Estimate | undefined {
 		const disjuncts = splitDisjuncts(node);
 		// See estimateConjunction: nothing to decompose when the walk is a no-op.
-		if (disjuncts.length === 1 && disjuncts[0] === node) return this.leafEstimate(stats, node);
+		if (disjuncts.length === 1 && disjuncts[0] === node) return this.leafEstimate(ctx, node);
 
 		const sels: number[] = [];
 		let anyUnreadable = false;
 		for (const disjunct of disjuncts) {
-			const est = this.estimateNode(stats, disjunct, depth + 1);
+			const est = this.estimateNode(ctx, disjunct, depth + 1);
 			if (est === undefined) {
 				anyUnreadable = true;
 				continue;
@@ -395,7 +421,7 @@ export class CatalogStatsProvider implements StatsProvider {
 
 		if (anyUnreadable) return lowerBound(Math.max(...sels));
 
-		return complete(this.floorCombined(stats, combineDisjunctive(sels), sels.length));
+		return complete(this.floorCombined(ctx.stats, combineDisjunctive(sels), sels.length));
 	}
 
 	/**
@@ -413,17 +439,17 @@ export class CatalogStatsProvider implements StatsProvider {
 
 	/** Estimate a single (non-boolean) comparison against column statistics. */
 	private estimateLeaf(
-		stats: TableStatistics,
+		ctx: EstimateContext,
 		predicate: ScalarPlanNode
 	): number | undefined {
 		// Try to extract column reference from the predicate for column-level estimation
-		const colInfo = extractColumnFromPredicate(predicate);
+		const colInfo = extractColumnFromPredicate(predicate, ctx.resolve);
 		if (!colInfo) return undefined;
 
-		const colStats = stats.columnStats.get(colInfo.columnName.toLowerCase());
+		const colStats = ctx.stats.columnStats.get(colInfo.columnName.toLowerCase());
 		if (!colStats) return undefined;
 
-		const { rowCount } = stats;
+		const { rowCount } = ctx.stats;
 
 		switch (predicate.nodeType) {
 			case 'BinaryOp': {
@@ -504,7 +530,10 @@ export class CatalogStatsProvider implements StatsProvider {
 // These extract structural info from plan nodes using typed imports of the
 // concrete node classes (BinaryOpNode, UnaryOpNode, etc.).
 
-function extractColumnFromPredicate(predicate: ScalarPlanNode): { columnName: string } | undefined {
+function extractColumnFromPredicate(
+	predicate: ScalarPlanNode,
+	resolve?: ColumnStatsResolver,
+): { columnName: string } | undefined {
 	// BinaryOp, In, Between, UnaryOp all typically have a column child
 	// NOTE: for a column-vs-column comparison on one table (`where x = y`) this
 	// picks the first ColumnReference and the caller finds no literal, so `=`
@@ -514,7 +543,17 @@ function extractColumnFromPredicate(predicate: ScalarPlanNode): { columnName: st
 	const children = predicate.getChildren();
 	for (const child of children) {
 		if (child.nodeType === 'ColumnReference') {
-			const name = (child as unknown as ColumnReferenceNode).expression.name;
+			const col = child as unknown as ColumnReferenceNode;
+			if (resolve) {
+				// Identity path: an attribute minted above the base table resolves to
+				// nothing, and the estimate declines rather than borrowing whichever base
+				// column happens to share its AST name. Note this returns outright instead
+				// of trying the next child — "the compared column has no statistics" is the
+				// answer, not a reason to read the other operand.
+				const resolved = resolve(col.attributeId);
+				return resolved === undefined ? undefined : { columnName: resolved };
+			}
+			const name = col.expression.name;
 			if (name) return { columnName: name };
 		}
 	}
@@ -561,7 +600,10 @@ function extractBetweenBounds(predicate: ScalarPlanNode): { low: SqlValue; high:
 	return undefined;
 }
 
-function extractEquiJoinColumns(condition: ScalarPlanNode): { left: string; right: string } | undefined {
+function extractEquiJoinColumns(
+	condition: ScalarPlanNode,
+	resolve?: ColumnStatsResolver,
+): { left: string; right: string } | undefined {
 	if (condition.nodeType !== 'BinaryOp') return undefined;
 	const op = (condition as unknown as BinaryOpNode).expression.operator;
 	if (op !== '=' && op !== '==') return undefined;
@@ -573,9 +615,17 @@ function extractEquiJoinColumns(condition: ScalarPlanNode): { left: string; righ
 	const right = children[1];
 	if (left.nodeType !== 'ColumnReference' || right.nodeType !== 'ColumnReference') return undefined;
 
-	const leftName = (left as unknown as ColumnReferenceNode).expression.name;
-	const rightName = (right as unknown as ColumnReferenceNode).expression.name;
+	const leftName = columnStatsName(left as unknown as ColumnReferenceNode, resolve);
+	const rightName = columnStatsName(right as unknown as ColumnReferenceNode, resolve);
 	if (!leftName || !rightName) return undefined;
 
 	return { left: leftName, right: rightName };
+}
+
+/**
+ * The base-table column a reference's statistics live under: by attribute identity
+ * when a resolver is available, otherwise by the name in the AST.
+ */
+function columnStatsName(col: ColumnReferenceNode, resolve?: ColumnStatsResolver): string | undefined {
+	return resolve ? resolve(col.attributeId) : col.expression.name;
 }
