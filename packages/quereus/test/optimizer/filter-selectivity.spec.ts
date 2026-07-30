@@ -436,6 +436,82 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		expect(f!.selectivity).to.be.undefined;
 	});
 
+	// ── CTE references ────────────────────────────────────────────────────────
+	//
+	// A `CTEReferenceNode` mints fresh attribute ids for every column it republishes,
+	// so `collectColumnOrigins` maps its body's origins positionally onto those ids —
+	// but under a relation instance minted PER REFERENCE, because two references to one
+	// `with` clause share a single body subtree. These cases pin both halves.
+
+	it('treats the two arms of a CTE self-join as distinct relations', () => {
+		// `a.qty = b.rid` compares columns with different distinct counts. Pairing both
+		// references with the shared body's own relation instances would collapse the arms
+		// into one relation and read this as "qty equals a constant" — 1/ndv(qty).
+		const f = optimizedFilter(db,
+			'WITH c AS (SELECT * FROM o) SELECT * FROM c a JOIN c b ON a.id = b.id WHERE a.qty = b.rid');
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+
+		expect(f!.selectivity).to.be.closeTo(1 / Math.max(ndv['o.qty'], ndv['o.rid']), 1e-12);
+		expect(f!.selectivity, 'must not be the single-relation estimate')
+			.to.not.be.closeTo(1 / ndv['o.qty'], 1e-9);
+	});
+
+	it('still estimates a single-relation conjunct over one arm of a CTE self-join', () => {
+		const f = optimizedFilter(db,
+			"WITH c AS (SELECT * FROM o) SELECT * FROM c a JOIN c b ON a.id = b.id "
+			+ "WHERE a.cat = 'a' AND a.qty > b.qty");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+
+		const expected = combineConjunctive([1 / ndv['o.cat'], CROSS_RELATION_INEQUALITY_SELECTIVITY]);
+		expect(f!.selectivity).to.be.closeTo(expected, 1e-12);
+	});
+
+	it('keeps the two sides of a join inside one CTE body distinct', () => {
+		// One reference, two underlying relations: the remap mints an instance per
+		// (reference, underlying relation) pair, so `o` and `r` stay separable through it.
+		const f = optimizedFilter(db,
+			'WITH c AS (SELECT o.cat AS ocat, o.qty AS oqty, r.cat AS rcat, r.qty AS rqty '
+			+ 'FROM o JOIN r ON o.rid = r.id) '
+			+ "SELECT * FROM c WHERE c.ocat = 'a' AND c.rcat = 'x'");
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(combineConjunctive([1 / ndv['o.cat'], 1 / ndv['r.cat']]), 1e-12);
+	});
+
+	it('estimates a cross-relation equality between two columns of one CTE reference', () => {
+		const f = optimizedFilter(db,
+			'WITH c AS (SELECT o.qty AS oqty, r.qty AS rqty FROM o JOIN r ON o.rid = r.id) '
+			+ 'SELECT * FROM c WHERE c.oqty = c.rqty');
+		expect(f, 'expected a residual Filter').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(1 / Math.max(ndv['o.qty'], ndv['r.qty']), 1e-12);
+	});
+
+	it('estimates a CTE joined to a real table', () => {
+		const f = optimizedFilter(db,
+			'WITH c AS (SELECT cat, qty, rid FROM o) SELECT * FROM c JOIN r ON c.rid = r.id '
+			+ "WHERE c.cat = 'a' AND r.cat = 'x'");
+		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(f!.selectivity).to.be.closeTo(combineConjunctive([1 / ndv['o.cat'], 1 / ndv['r.cat']]), 1e-12);
+	});
+
+	it('leaves a filter over a CTE whose body merges or regroups rows unstamped', () => {
+		// The remap stops where the body's own attribution stops: a set operation
+		// publishes one branch's ids over rows from both, and an aggregate's output is a
+		// different row population altogether.
+		const cases: [label: string, sql: string][] = [
+			['UNION ALL body',
+				'WITH c AS (SELECT id, cat FROM o UNION ALL SELECT id, cat FROM r) '
+				+ "SELECT * FROM c WHERE c.cat = 'a'"],
+			['GROUP BY body',
+				'WITH c AS (SELECT cat, count(*) AS ct FROM o GROUP BY cat) '
+				+ 'SELECT * FROM c WHERE c.ct > 2'],
+		];
+		for (const [label, sql] of cases) {
+			const f = optimizedFilter(db, sql);
+			expect(f, `${label}: expected a Filter`).to.not.be.undefined;
+			expect(f!.selectivity, `${label}: no base-table column describes these rows`).to.be.undefined;
+		}
+	});
+
 	it('does not attribute a set-operation output to its left branch', () => {
 		// `z.cat` forwards the left branch's attribute id but carries rows from BOTH
 		// branches, so `o`'s statistics do not describe it. Attributing it anyway would
@@ -895,6 +971,59 @@ describe('single-table selectivity matches columns by identity, not by name', ()
 		const f = optimizedFilter(db, 'SELECT * FROM o WHERE qty = 3');
 		expect(f, 'expected a residual Filter').to.not.be.undefined;
 		expect(f!.selectivity).to.be.closeTo(1 / ndv.qty, 1e-12);
+	});
+
+	// ── Through a WITH clause ─────────────────────────────────────────────────
+
+	it('reads a base column through a WITH clause exactly as through a subquery', () => {
+		// A CTE reference republishes its body's columns under fresh attribute ids, so
+		// without the positional remap in `collectColumnOrigins` this spelling loses the
+		// trail and falls to the naive BinaryOp guess while the subquery spelling — the
+		// same query — reads o.qty's distinct count.
+		const cte = optimizedFilter(db, 'WITH c AS (SELECT cat, qty FROM o) SELECT * FROM c WHERE c.qty = 3');
+		const subquery = optimizedFilter(db, 'SELECT * FROM (SELECT cat, qty FROM o) x WHERE x.qty = 3');
+
+		expect(cte, 'expected a residual Filter over the CTE reference').to.not.be.undefined;
+		expect(subquery, 'expected a residual Filter over the subquery').to.not.be.undefined;
+
+		expect(cte!.selectivity).to.be.closeTo(1 / ndv.qty, 1e-12);
+		// The durable half: two spellings of one query must not disagree.
+		expect(cte!.selectivity, 'the WITH and subquery spellings must agree')
+			.to.equal(subquery!.selectivity);
+	});
+
+	it('reads a base column through every CTE spelling that only varies the column list', () => {
+		const cases: [label: string, sql: string][] = [
+			['select *', 'WITH c AS (SELECT * FROM o) SELECT * FROM c WHERE c.qty = 3'],
+			['column-alias list', 'WITH c(x, y) AS (SELECT cat, qty FROM o) SELECT * FROM c WHERE c.y = 3'],
+			['nested CTEs',
+				'WITH a AS (SELECT cat, qty FROM o), b AS (SELECT * FROM a) SELECT * FROM b WHERE b.qty = 3'],
+			['MATERIALIZED hint',
+				'WITH c AS MATERIALIZED (SELECT cat, qty FROM o) SELECT * FROM c WHERE c.qty = 3'],
+			['NOT MATERIALIZED hint',
+				'WITH c AS NOT MATERIALIZED (SELECT cat, qty FROM o) SELECT * FROM c WHERE c.qty = 3'],
+		];
+		for (const [label, sql] of cases) {
+			const f = optimizedFilter(db, sql);
+			expect(f, `${label}: expected a residual Filter`).to.not.be.undefined;
+			expect(f!.selectivity, `${label}: must read o.qty's statistics`).to.be.closeTo(1 / ndv.qty, 1e-12);
+		}
+	});
+
+	it('does not charge a column computed inside a CTE body the statistics of its namesake', () => {
+		// The CTE analogue of the computed-projection case above: `id * 7` mints a fresh
+		// attribute, so the alias colliding with a real column of `o` must not move the
+		// estimate. Both spellings land on the naive guess; the assertion that matters is
+		// that they agree and that neither borrows `o.qty`'s distinct count.
+		const collides = optimizedFilter(db,
+			'WITH c AS (SELECT cat, id * 7 AS qty FROM o) SELECT * FROM c WHERE c.qty = 3');
+		const distinctName = optimizedFilter(db,
+			'WITH c AS (SELECT cat, id * 7 AS zz FROM o) SELECT * FROM c WHERE c.zz = 3');
+
+		expect(collides, 'expected a residual Filter').to.not.be.undefined;
+		expect(distinctName, 'expected a residual Filter').to.not.be.undefined;
+		expect(collides!.selectivity).to.equal(distinctName!.selectivity);
+		expect(collides!.selectivity, 'specifically not 1/ndv(o.qty)').to.not.be.closeTo(1 / ndv.qty, 1e-9);
 	});
 });
 

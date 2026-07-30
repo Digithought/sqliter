@@ -13,6 +13,7 @@ import { Database } from '../../src/core/database.js';
 import { PlanNode, type RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { FilterNode } from '../../src/planner/nodes/filter.js';
 import { ProjectNode } from '../../src/planner/nodes/project-node.js';
+import { CTEReferenceNode } from '../../src/planner/nodes/cte-reference-node.js';
 import { collectColumnOrigins, type ColumnOrigin, type RelationInstance } from '../../src/planner/util/column-origins.js';
 import type { TableSchema } from '../../src/schema/table.js';
 
@@ -174,13 +175,78 @@ describe('collectColumnOrigins', () => {
 		expect(distinctRefs(origins).size).to.equal(2);
 	});
 
-	it('dedupes shared subtrees rather than walking them twice', () => {
-		// A CTE referenced twice can put the same node instance under both sides.
-		const plan = optimized(db, 'with c as (select id, qty from o) select * from c x join c y on x.id = y.id');
-		const origins = collectColumnOrigins(findJoin(plan));
-		// Whatever the shape, every entry must address a real column of its table.
+	// ── CTE references ────────────────────────────────────────────────────────
+
+	it('republishes a CTE body\'s base columns under the reference\'s own ids', () => {
+		const plan = optimized(db, 'with c as (select id, cat, qty from o) select * from c where c.qty = 3');
+		const ref = findFirst(plan, CTEReferenceNode);
+		expect(ref, 'expected a CTEReference in the plan').to.not.be.undefined;
+
+		const origins = collectColumnOrigins(ref!);
+		expect(origins.size, 'one entry per republished column').to.equal(3);
+		expect(distinctRefs(origins).size, 'one relation instance').to.equal(1);
+		expect([...distinctSchemas(origins)][0].name).to.equal('o');
+
+		// The keys must be the REFERENCE's fresh attribute ids, not the body's — the
+		// body's ids never appear above the reference, so mapping them would be inert.
+		const refIds = new Set(ref!.getAttributes().map(a => a.id));
+		for (const id of origins.keys()) {
+			expect(refIds.has(id), 'every key must be an attribute id the reference publishes').to.be.true;
+		}
+		const names = [...origins.values()].map(o => o.columnName).sort();
+		expect(names).to.deep.equal(['cat', 'id', 'qty']);
 		for (const o of origins.values()) {
 			expect(o.table.columns[o.columnIndex].name).to.equal(o.columnName);
 		}
+	});
+
+	it('gives two references to one CTE distinct relation instances sharing one schema', () => {
+		// Both references hang off the SAME body subtree, which the walk dedupes (and
+		// memoizes) — so the per-reference relation instance is the only thing keeping the
+		// two arms apart. Pairing them with the body's own instances instead would make
+		// `x.qty > y.qty` read as a single-relation predicate. This is the CTE analogue of
+		// the self-join case above.
+		const plan = optimized(db, 'with c as (select id, qty from o) select * from c x join c y on x.id = y.id');
+		const origins = collectColumnOrigins(findJoin(plan));
+
+		expect(origins.size, 'two columns from each of the two references').to.equal(4);
+		expect(distinctRefs(origins).size, 'two distinct relation instances').to.equal(2);
+		expect(distinctSchemas(origins).size, 'one shared schema').to.equal(1);
+		for (const o of origins.values()) {
+			expect(o.table.columns[o.columnIndex].name).to.equal(o.columnName);
+		}
+	});
+
+	it('omits a column computed inside a CTE body', () => {
+		const plan = optimized(db, 'with c as (select id, qty * 2 as q2 from o) select * from c where c.q2 = 3');
+		const ref = findFirst(plan, CTEReferenceNode);
+		expect(ref, 'expected a CTEReference in the plan').to.not.be.undefined;
+
+		const origins = collectColumnOrigins(ref!);
+		const attrs = ref!.getAttributes();
+		const passThrough = attrs.find(a => a.name === 'id');
+		const computed = attrs.find(a => a.name === 'q2');
+		expect(passThrough, 'expected a republished attribute named id').to.not.be.undefined;
+		expect(computed, 'expected a republished attribute named q2').to.not.be.undefined;
+
+		expect(origins.has(passThrough!.id), 'the pass-through column keeps its origin').to.be.true;
+		expect(origins.has(computed!.id), 'the computed column has none').to.be.false;
+		expect(origins.size).to.equal(1);
+	});
+
+	it('attributes nothing under a recursive CTE reference', () => {
+		// A recursive CTE's rows come from its base case AND its recursive case, so no
+		// base-table column describes them — the same reasoning as a set operation. The
+		// positional remap must not reach through it to the seed table.
+		const plan = optimized(db,
+			'with recursive c(qty) as ('
+			+ ' select qty from o'
+			+ ' union all'
+			+ ' select qty + 1 from c where qty < 50)'
+			+ ' select * from c where qty = 3');
+		const ref = findFirst(plan, CTEReferenceNode);
+		expect(ref, 'expected a CTEReference in the plan').to.not.be.undefined;
+
+		expect(collectColumnOrigins(ref!).size).to.equal(0);
 	});
 });
