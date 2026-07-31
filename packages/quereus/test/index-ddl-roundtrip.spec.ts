@@ -246,8 +246,10 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 		// the materialized structure in `tableSchema.indexes`), but CREATE TABLE runs no
 		// such check, so the declaration below reaches `ensureUniqueConstraintIndexes` with
 		// two constraints wanting one name. It now ADOPTS the held name instead of pushing
-		// a second entry under it. Only reachable by typing the engine-reserved `_uc_`
-		// prefix into a constraint name — see the NOTE on `findIndexShadowedByUniqueConstraint`.
+		// a second entry under it. Reachable two ways — the reserved `_uc_` prefix written into
+		// a constraint name (here), and the `_`-joined auto-name colliding on ORDINARY column
+		// names (the sibling test below) — see the NOTE on
+		// `findIndexShadowedByUniqueConstraint`.
 		//
 		// NOTE: adoption is damage LIMITATION, not a fix. The adopting constraint is left
 		// enforced by a structure keyed on the OTHER constraint's column, so `unique (c)`
@@ -271,6 +273,32 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 			let err: Error | undefined;
 			try { await dst.exec('insert into t values (2, 6, 7)'); } catch (e) { err = e as Error; }
 			expect(err?.message, 'the owning UNIQUE still enforces').to.match(/UNIQUE constraint failed/i);
+		} finally {
+			await dst.close();
+		}
+	});
+
+	it('the same collision is reachable with ordinary column names', async () => {
+		// `_uc_<cols>` joins the covered column names with `_`, so a single column named
+		// `a_b` derives the name the pair `(a, b)` derives. No reserved prefix, no unusual
+		// spelling — two plain UNIQUE declarations. The duplicate-constraint guard does not
+		// fire (different column SETS, genuinely different rules) and CREATE TABLE runs no
+		// derived-name check, so both constraints land on one structure.
+		//
+		// NOTE: shape only, deliberately — the second constraint is then enforced by a
+		// structure keyed on the FIRST one's column, so `unique (a, b)` silently accepts
+		// duplicates on the memory backend. The store backend resolves the serving index by
+		// COLUMNS rather than by name (`findIndexForUniqueConstraint`), finds none, and falls
+		// back to a correct full scan — so this is a memory-backend defect, filed as
+		// `backlog/bug-create-table-unique-derived-name-collision`. Asserting the enforcement
+		// loss here would bless it; the shape assertion below flips visibly when it is fixed.
+		const dst = new Database();
+		try {
+			await dst.exec('create table t (id integer primary key, a_b integer, a integer, b integer, unique (a_b), unique (a, b))');
+
+			const t = dst._findTable('t')!;
+			expect(t.uniqueConstraints, 'both constraints registered').to.have.length(2);
+			expect((t.indexes ?? []).map(idx => idx.name), 'one entry under the shared name').to.deep.equal(['_uc_a_b']);
 		} finally {
 			await dst.close();
 		}

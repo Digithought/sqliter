@@ -845,6 +845,17 @@ create table bookings (
 );
 ```
 
+**A table may not carry the same plain UNIQUE twice.** Two *unnamed*, non-partial UNIQUE
+constraints over the same column set are refused with `CONSTRAINT` — neither has a name
+for `DROP CONSTRAINT` to address, so neither could be removed short of recreating the
+table, while every write pays the identical check twice. Column order is not identity
+(`unique (a, b)` and `unique (b, a)` are one rule) and column names fold case. The rule
+holds identically at `CREATE TABLE` (both the column-level and table-level spellings, and
+across the two), `ALTER TABLE … ADD CONSTRAINT`, and `ALTER TABLE … ADD COLUMN … unique`
+— see [ALTER § ADD CONSTRAINT](sql-alter.md) for the two carve-outs (a *named* UNIQUE
+beside an unnamed one stays legal, as do partial UNIQUEs with a `where` predicate).
+Reading the catalog of a database written before the rule is unaffected.
+
 ### 7.4 CHECK Constraint
 
 The check constraint ensures that values in a column satisfy a specific condition.

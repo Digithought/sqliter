@@ -1,5 +1,5 @@
 ----
-description: If someone names a uniqueness rule using a prefix the engine reserves for its own internal names, and that name happens to be the one the engine would generate for a different rule on the same table, one of the two rules quietly stops working. Changing the table later is refused for the same reason, but creating it is not.
+description: When two uniqueness rules on one table end up wanting the same internal name for the hidden structure that enforces them, one of the two quietly stops working. Changing the table later is refused for that reason, but creating it is not — and ordinary column names can trigger it, no unusual spelling needed.
 files:
   - packages/quereus/src/schema/manager.ts                     # createTable — where the CREATE-time constraint checks live, ~2767
   - packages/quereus/src/schema/catalog.ts                     # assertUniqueConstraintIndexNameFree + its NOTE on the backend-dependent input
@@ -42,15 +42,48 @@ it and therefore checks the wrong column. The rule that owns the name is unharme
 
 This was measured on the in-memory backend only. The persistent store does not
 materialize hidden indexes into the table's index list at all, so the shape there is
-different and was not checked — do that during the fix.
+different — see the store note under the second route below, which found it unaffected.
 
-## Why it is filed rather than fixed
+## Second route — no reserved prefix, no unusual spelling (found in review, 2026-07-31)
 
-Reaching it requires typing an engine-reserved prefix into a constraint name, which
+The generated name joins the covered column names with `_`. So a single column named
+`a_b` generates the same name as the column pair `(a, b)`, and two perfectly ordinary
+`UNIQUE` declarations collide:
+
+```sql
+create table t (id integer primary key, a_b integer, a integer, b integer,
+                unique (a_b), unique (a, b));
+
+insert into t values (1, 1, 1, 1);
+insert into t values (2, 2, 1, 1);   -- accepted; `unique (a, b)` should reject it
+insert into t values (3, 1, 3, 3);   -- rejected, as expected: `unique (a_b)` works
+```
+
+Measured on the in-memory backend, current tree (`repro: verified`). The table ends up
+with one hidden index, `_uc_a_b`, keyed on `a_b`; the pair rule adopts it and checks the
+wrong column. The duplicate-rule guard added by
+`bug-duplicate-unnamed-unique-constraint` does not and should not fire here — `(a_b)`
+and `(a, b)` are genuinely different rules.
+
+The persistent store is **not** affected: it resolves a rule's serving index by
+comparing *columns* rather than names (`findIndexForUniqueConstraint` in
+`quereus-store/src/common/store-table-constraints.ts`), finds none that matches, and
+falls back to a correct full scan. So this is an in-memory-backend defect, and the two
+backends silently disagree on whether the second rule enforces.
+
+This route raises the priority: the original one needed a user to type an
+engine-reserved prefix, this one needs only a column named with an underscore beside a
+two-column rule over those names. Whoever picks this up should consider promoting it out
+of `backlog/` rather than treating it as a corner case.
+
+## Why it was originally filed rather than fixed
+
+The first route requires typing an engine-reserved prefix into a constraint name, which
 no ordinary schema does. The existing behavior is also already documented as a known
 corner (see the note on `findIndexShadowedByUniqueConstraint` in `schema/catalog.ts`,
 which records that the two backends disagree here). It is nevertheless a silent loss
-of enforcement, not a cosmetic quirk, which is why it is a bug rather than debt.
+of enforcement, not a cosmetic quirk, which is why it is a bug rather than debt. The
+second route above removes the "no ordinary schema does that" argument.
 
 ## Expected behavior
 

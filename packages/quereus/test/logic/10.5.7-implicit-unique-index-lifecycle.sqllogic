@@ -782,6 +782,32 @@ select count(distinct id) as c from unique_constraint_info('dup_pt');
 alter table dup_pt add unique (c);
 -- error: an equivalent UNIQUE constraint on (c) already exists
 
+-- 10f. A column name is compared as a whole name, never as text spliced together
+-- A quoted identifier may contain anything, including whatever character the guard
+-- uses to concatenate a column set. `unique ("a,b")` covers ONE column and must not
+-- read as the pair `(a, b)`; refusing it would turn away a legal declaration.
+create table dup_sep (id integer primary key, "a,b" integer, a integer, b integer, unique (a, b));
+alter table dup_sep add unique ("a,b");
+-- run
+
+select count(distinct id) as c from unique_constraint_info('dup_sep');
+→ [{"c":2}]
+
+-- Both enforce, independently.
+insert into dup_sep values (1, 1, 1, 1);
+-- run
+
+insert into dup_sep values (2, 2, 1, 1);
+-- error: unique
+
+insert into dup_sep values (3, 1, 3, 3);
+-- error: unique
+
+-- ...and the repeat of the single-column one is still refused.
+alter table dup_sep add unique ("a,b");
+-- error: an equivalent UNIQUE constraint on (a,b) already exists
+
+drop table dup_sep;
 drop table dup_pt;
 drop table dup_nm;
 drop table dup_ct;
@@ -820,3 +846,16 @@ select id from as_t where b = 'q';
 
 drop table as_t;
 -- run
+
+-- The CREATE TABLE arm reaches its guard the same way: a declared table carrying the
+-- same plain UNIQUE twice is emitted as an ordinary CREATE TABLE and refused there.
+declare schema main {
+	table as_dup (id integer primary key, c integer, unique (c), unique (c))
+}
+-- run
+
+apply schema main;
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+select count(*) as c from schema() where type = 'table' and name = 'as_dup';
+→ [{"c":0}]

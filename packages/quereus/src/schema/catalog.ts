@@ -447,12 +447,13 @@ function implicitIndexNameForColumns(constraintName: string | undefined, columnN
  * index is in `tableSchema.indexes` on every backend, so the collision this exists to
  * catch is refused identically everywhere. Another constraint's backing structure is
  * NOT — the memory module materializes one into `.indexes`, the store module does not
- * — so a constraint whose structure is named like another's (only reachable when the
- * user writes the engine's reserved `_uc_` prefix into a constraint name, e.g.
- * `constraint _uc_z unique (b)` beside `unique (z)`) is refused under memory and
- * accepted under store. If a caller ever needs the two to agree there, compare against
- * the derived names of the table's other UNIQUE constraints as well, not just
- * `.indexes`.
+ * — so a constraint whose structure is named like another's is refused under memory and
+ * accepted under store. Two shapes reach that: a constraint name carrying the engine's
+ * reserved `_uc_` prefix (`constraint _uc_z unique (b)` beside `unique (z)`), and the
+ * `_`-joined auto-name colliding on ordinary names (`unique (a_b)` beside
+ * `unique (a, b)` — both derive `_uc_a_b`). If a caller ever needs the two to agree
+ * there, compare against the derived names of the table's other UNIQUE constraints as
+ * well, not just `.indexes`.
  */
 function findIndexShadowedByUniqueConstraint(
 	tableSchema: TableSchema,
@@ -508,9 +509,14 @@ export function assertUniqueConstraintIndexNameFree(
  * share a key — while their derived structure names (`_uc_a_b` / `_uc_b_a`) do not,
  * which is exactly why the duplicate test cannot go through those names.
  * Case-folded like every other column-name comparison in the engine.
+ *
+ * JSON-encoded rather than joined on a separator character: a column name may
+ * legally contain any character (`"a,b"` is one quoted identifier), and a plain
+ * `join(',')` would key it identically to the two-column set `(a, b)` — refusing a
+ * legal declaration. JSON escaping makes the encoding injective.
  */
 export function uniqueConstraintColumnSetKey(columnNames: ReadonlyArray<string>): string {
-	return [...new Set(columnNames.map(n => n.toLowerCase()))].sort().join(',');
+	return JSON.stringify([...new Set(columnNames.map(n => n.toLowerCase()))].sort());
 }
 
 /**
