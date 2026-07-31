@@ -38,6 +38,15 @@ export function ruleCteOptimization(node: PlanNode, context: OptContext): PlanNo
 	// 1. CTE has materialization hint
 	// 2. CTE is estimated to be reasonably sized
 	// 3. CTE is not already cached
+	// NOTE: the `sourceSize > 0` gate below decides caching on a number that cannot
+	// carry the answer. A never-`ANALYZE`d table reports 0 rows, and that 0 means
+	// "unknown", not "empty" (`SchemaManager` hardcodes `TableSchema.estimatedRows`
+	// to 0 at CREATE TABLE), so today whether a CTE is cached turns on whether
+	// ANALYZE has run — and the rule never consults the reference count, so once a
+	// real estimate arrives it caches single-reference CTEs too, and double-buffers
+	// multi-reference ones against the materialization-advisory pass (see the NOTE
+	// below). Tracked in backlog `bug-cte-cache-gate-reads-unknown-as-empty`; do not
+	// paper over it with a `|| default` here, which caches single-reference CTEs.
 	const sourceSize = PlanNodeCharacteristics.estimatesRows(source);
 	const isAlreadyCached = CapabilityDetectors.isCached(source) && source.isCached();
 	const shouldCache = (

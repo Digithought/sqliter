@@ -20,6 +20,8 @@ import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { FilterNode } from '../../src/planner/nodes/filter.js';
 import { joinPhysicalRows, estimateJoinRows } from '../../src/planner/nodes/join-utils.js';
+import { physicalSourceRows } from '../../src/planner/util/row-estimates.js';
+import type { PhysicalProperties, RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 
 /** Every physical shape the optimizer may pick for a binary join. */
 const JOIN_TYPES: ReadonlySet<PlanNodeType> = new Set([
@@ -51,6 +53,34 @@ function findNodeOfType(root: PlanNode, type: PlanNodeType): PlanNode | undefine
 	walk(root, (n) => { if (!found && n.nodeType === type) found = n; });
 	return found;
 }
+
+describe('physicalSourceRows (unit)', () => {
+	const phys = (estimatedRows: number | undefined): PhysicalProperties =>
+		({ estimatedRows }) as PhysicalProperties;
+	const logical = (estimatedRows: number | undefined): RelationalPlanNode =>
+		({ estimatedRows }) as RelationalPlanNode;
+
+	it('prefers the physical count over the logical getter', () => {
+		expect(physicalSourceRows(phys(7), logical(99))).to.equal(7);
+	});
+
+	it('falls back to the logical getter when the child stamped none', () => {
+		// Children that never stamp a physical count (a set operation, a CTE
+		// reference) still expose the pre-optimization number.
+		expect(physicalSourceRows(phys(undefined), logical(99))).to.equal(99);
+		expect(physicalSourceRows(undefined, logical(99))).to.equal(99);
+	});
+
+	it('keeps a physical 0 instead of falling through to the logical getter', () => {
+		// `??`, not `||`: a never-ANALYZEd table stamps 0, and reading the logical
+		// getter behind it would report a different number for the same relation.
+		expect(physicalSourceRows(phys(0), logical(99))).to.equal(0);
+	});
+
+	it('stays undefined when neither view has a count', () => {
+		expect(physicalSourceRows(undefined, logical(undefined))).to.be.undefined;
+	});
+});
 
 describe('joinPhysicalRows (unit)', () => {
 	it('prefers a proven coverage cap over the heuristic', () => {
@@ -141,12 +171,23 @@ describe('join row estimates survive the physical pass', () => {
 		// Aliases sit between each access node and the join; without their physical
 		// relay the join sees `undefined` on both sides no matter what it reads.
 		const alias = findNodeOfType(plan, PlanNodeType.Alias);
-		if (alias) {
-			expect(alias.physical?.estimatedRows, 'alias physical estimatedRows').to.be.a('number');
-		}
+		expect(alias, 'expected an Alias between each access node and the join').to.not.be.undefined;
+		// The `o` alias is found first (pre-order walk) — it relays the orders scan.
+		expect(alias!.physical?.estimatedRows, 'alias physical estimatedRows').to.equal(100);
+
 		const project = findNodeOfType(plan, PlanNodeType.Project);
 		expect(project, 'expected a Project at the top of the select').to.not.be.undefined;
 		expect(project!.physical?.estimatedRows, 'project physical estimatedRows').to.be.a('number');
+	});
+
+	it('estimates a left join with no key coverage from its physical left side', () => {
+		// `o.status = r.name` covers no unique key on either side, so the coverage
+		// analysis proves no cap and `joinPhysicalRows` supplies the `left` heuristic
+		// (one row per left row) over the physical child counts.
+		const plan = db.getPlan('select * from orders o left join regions r on o.status = r.name');
+		const join = findJoin(plan);
+		expect(join, 'expected a join in the optimized plan').to.not.be.undefined;
+		expect(join!.physical?.estimatedRows).to.equal(100);
 	});
 
 	it('carries the estimate through an ORDER BY above the join', () => {

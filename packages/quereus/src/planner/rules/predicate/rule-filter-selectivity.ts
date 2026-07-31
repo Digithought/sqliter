@@ -181,12 +181,12 @@ function singleTableSelectivity(
  * the base-table fraction is applied to post-aggregate cardinality. Imprecise but
  * not unsound; deliberately not special-cased.
  *
- * NOTE: the stamped number is currently visible on `FilterNode.selectivity` but does
- * NOT yet move `estimatedRows` above a join: `JoinNode.computePhysical` derives its
- * own cardinality from its children's LOGICAL `estimatedRows`, and a physical access
- * node (SeqScan/IndexScan over a Retrieve) exposes none — so the join reports
- * undefined rows and the Filter has nothing to multiply. Tracked in backlog
- * `debt-join-rows-from-physical-children`; nothing here needs to change when it lands.
+ * NOTE: the stamped number does move `estimatedRows` above a join — the join family
+ * derives its physical cardinality from its children's PHYSICAL counts
+ * (`physicalSourceRows` / `joinPhysicalRows`), so a Filter over a join has a real
+ * number to multiply. It still has nothing to multiply above a `union`/`union all`,
+ * where `SetOperationNode` stamps no count at all (backlog
+ * `debt-row-estimates-die-at-set-operations`).
  */
 function multiRelationSelectivity(
 	filter: FilterNode,

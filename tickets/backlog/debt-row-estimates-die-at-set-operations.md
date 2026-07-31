@@ -1,5 +1,5 @@
 description: The planner can no longer say how many rows a query produces once the results of two queries are combined (UNION and friends), so every decision above that point falls back to a fixed guess.
-files: packages/quereus/src/planner/nodes/set-operation-node.ts, packages/quereus/src/planner/nodes/async-gather-node.ts, packages/quereus/src/planner/nodes/delete-node.ts, packages/quereus/src/planner/nodes/dml-executor-node.ts, packages/quereus/src/planner/nodes/returning-node.ts, packages/quereus/src/planner/util/row-estimates.ts
+files: packages/quereus/src/planner/nodes/set-operation-node.ts, packages/quereus/src/planner/nodes/async-gather-node.ts, packages/quereus/src/planner/nodes/cte-node.ts, packages/quereus/src/planner/nodes/cte-reference-node.ts, packages/quereus/src/planner/nodes/delete-node.ts, packages/quereus/src/planner/nodes/dml-executor-node.ts, packages/quereus/src/planner/nodes/returning-node.ts, packages/quereus/src/planner/nodes/insert-node.ts, packages/quereus/src/planner/nodes/remote-query-node.ts, packages/quereus/src/planner/util/row-estimates.ts
 ----
 
 ## Background
@@ -10,7 +10,12 @@ the optimizer's Physical pass). The physical one is what cost decisions above th
 
 `debt-join-rows-from-physical-children` made the single-source operators and the join family
 compute their physical count from their children's *physical* counts, via one shared helper
-(`physicalSourceRows` in `planner/util/row-estimates.ts`). Three groups of nodes were left out.
+(`physicalSourceRows` in `planner/util/row-estimates.ts`). Four groups of nodes were left out.
+
+One caution that applies to every site below: a table that has never been `ANALYZE`d reports **0**
+rows, and that 0 means *unknown*, not *empty*. Any consumer that reads the new estimate as a
+magnitude has to spell that out; the CTE caching rule does not, which is its own ticket
+(`bug-cte-cache-gate-reads-unknown-as-empty`). Check consumers, not just producers.
 
 ## What is still missing
 
@@ -28,9 +33,23 @@ and the getter reads its children's logical getters — which are blank once tho
 physical access nodes. So the composition it already implements never actually produces a number
 in an optimized plan.
 
+**Common table expressions (`with … as (…)`).** Found during review of the earlier ticket, and the
+same shape as the two above. Neither `CTENode` nor `CTEReferenceNode` declares a row estimate in
+either view — no logical getter, no physical stamp — so a query that names a CTE reports no row
+count from the reference upward, even though the subquery underneath it now has one. Verified on
+`with c as (select id, a from t where a = 1) select * from c x join c y on x.id = y.id`: the
+`Project` inside the CTE reports a count, and the `CTE`, `CTEReference` and the join above all
+report nothing. A CTE reference emits exactly the rows of the CTE's source, so this is the plain
+relay edit; rank it above the data-modifying statements below.
+
 **Data-modifying statements.** `DeleteNode`, `DmlExecutorNode` and `ReturningNode` still relay the
-logical getter of their source. Lower value than the two above — a `returning` clause's row count
-rarely drives a plan choice — but it is the same one-line change.
+logical getter of their source; `InsertNode` declares no row estimate at all. Lower value than the
+two above — a `returning` clause's row count rarely drives a plan choice — but it is the same
+one-line change.
+
+`RemoteQueryNode` also declares no estimate in either view. It is a leaf rather than a relay, so it
+needs a number chosen (whatever the remote side advertises, else nothing) rather than a relay edit;
+mention it here so the sweep does not stop one file short.
 
 ## Shape of the fix
 

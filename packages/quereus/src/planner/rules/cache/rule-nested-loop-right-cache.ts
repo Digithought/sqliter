@@ -72,8 +72,10 @@ function subtreeTouchesCte(node: PlanNode): boolean {
  *
  * We can't just read `right.physical.estimatedRows`. Two gaps make the top of
  * the subtree read too low:
- *  - Pass-through nodes (e.g. AliasNode) don't propagate the physical estimate,
- *    so the subtree top can be `undefined` while the leaf underneath has it.
+ *  - Not every node propagates the physical estimate. The single-source relays and
+ *    the join family do (`physicalSourceRows`), but a set operation, an async
+ *    gather, or a CTE reference in between still stamps nothing, so the subtree top
+ *    can be `undefined` while the leaf underneath has a count.
  *  - An access leaf's `physical.estimatedRows` is the *table* row count, but the
  *    module's own access-plan estimate (getBestAccessPlan `rows`, the true "how
  *    many rows will this scan hand back" — e.g. a high-latency vtab reporting
@@ -84,8 +86,8 @@ function subtreeTouchesCte(node: PlanNode): boolean {
  * NOTE: this over-estimates a large base scan that a selective Filter shrinks —
  * output rows may be few, yet the max reflects the pre-filter scan. That biases
  * toward NOT caching such a right side (a missed optimization, never a memory
- * hazard). If a real workload wants those cached, propagate physical
- * estimatedRows through the pass-through nodes and read the top estimate instead.
+ * hazard). If a real workload wants those cached, read the subtree top instead of
+ * the max — the Filter's own physical estimate now carries the post-filter count.
  */
 function estimateRightRows(node: PlanNode): number | undefined {
 	let max: number | undefined;

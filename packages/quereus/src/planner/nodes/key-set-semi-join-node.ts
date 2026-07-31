@@ -111,15 +111,6 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		return estimateJoinRows(this.left.estimatedRows, this.keySource.estimatedRows, 'semi');
 	}
 
-	/**
-	 * `estimatedRows` over explicitly-supplied cardinalities, so `computePhysical`
-	 * can feed it the PHYSICAL child counts (the logical getters read `undefined`
-	 * through the physical access node this semi-join targets).
-	 */
-	private rowsFrom(targetRows: number | undefined, keyRows: number | undefined): number | undefined {
-		return estimateJoinRows(targetRows, keyRows, 'semi');
-	}
-
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const targetPhysical = childrenPhysical[0];
 		// The output is a row-subset of the target with identical attributes, so
@@ -137,9 +128,13 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		// join this node replaces could have been built on the leaf's order —
 		// losing those properties is the status quo, not a regression.
 		return {
-			estimatedRows: this.rowsFrom(
+			// Same formula as the logical getter, over the PHYSICAL child counts —
+			// the logical getters read `undefined` through the physical access node
+			// this semi-join targets.
+			estimatedRows: estimateJoinRows(
 				physicalSourceRows(targetPhysical, this.left),
 				physicalSourceRows(childrenPhysical[1], this.keySource),
+				'semi',
 			),
 			fds: targetPhysical?.fds,
 			equivClasses: targetPhysical?.equivClasses,

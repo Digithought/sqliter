@@ -30,10 +30,13 @@ import type { PhysicalProperties, RelationalPlanNode } from '../nodes/plan-node.
 // so a never-analyzed table's scan reports 0 — a value that means "unknown", not
 // "empty" (see the NOTE in `planner/stats/table-cardinality.ts`). That 0 now travels
 // much further than it used to: before this relay it died at the first operator that
-// read a logical getter, and consumers fell back to their own defaults instead. No
-// current consumer misbehaves on 0 (the cache threshold floors at 1000, `isLargeRelation`
-// is a `>` test), but if a plan ever looks wrong specifically over unanalyzed tables,
-// distinguishing unknown from empty at the source is the fix — not clamping here.
+// read a logical getter, and consumers fell back to their own defaults instead. Any
+// consumer that reads a row estimate as a *magnitude* must therefore spell 0 as
+// unknown — `rule-cte-optimization` gates on `sourceSize > 0` and had to be taught
+// this (its `|| defaultRowEstimate` matches `vtab/memory/module.ts`); threshold
+// consumers that floor (the cache threshold's min of 1000) or use a `>` test are
+// unaffected. The real fix is distinguishing unknown from empty at the source —
+// not clamping here, which would erase a genuinely empty analyzed table.
 export function physicalSourceRows(
 	childPhysical: PhysicalProperties | undefined,
 	source: RelationalPlanNode,
