@@ -527,6 +527,15 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		// other direct catalog write in the module is followed by a queued
 		// `table_modified` (or, for RENAME, a queued `removeTableDDL`) that re-establishes
 		// the truth; a drop has no such follow-up, so it drains explicitly.
+		//
+		// NOTE: the drain assumes no `persistQueue` task ever reaches teardown — a queued
+		// task calling `destroy`/`reclaimDetachedTable` would await the very chain it is a
+		// link in and hang. Holds today: every queued task body is a catalog read/write
+		// (`persistTableCatalogEntryIfChanged`, `persistCatalogIfChanged`, the view/MV
+		// saves and removes, `writeDurableStaleMvSet`, `removeTableDDL`), and the only
+		// caller of `reclaimDetachedTable` is the host-driven basis-eviction sweep. If a
+		// persist task ever needs to drop a table, give teardown a captured queue tail
+		// instead of the live one.
 		await this.whenCatalogPersisted();
 		await this.removeTableDDL(schemaName, tableName);
 	}
@@ -587,12 +596,12 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		// `create index`) so subsequent source writes never reached its backing. Carrying
 		// the names lets the next open exclude exactly those from the adopt fast path.
 		//
-		// No subscribed db (this module was opened but never rehydrated and never had a
-		// store table created/connected) ⇒ the empty set: every path that can mark an MV
-		// stale requires a session in which this module observed the db — a store source
-		// create/connect (both call `ensureSchemaSubscription`) or `rehydrateCatalog`
-		// (subscribes up front) — so a session without `subscribedDb` never detached any
-		// persisted MV's maintenance. Memory-backed MVs that appear in the set are
+		// No subscribed db ⇒ the empty set. `onRegister` subscribes at
+		// `Database.registerModule`, so that case now means a module never registered on
+		// any `Database` (constructed and closed directly), which by construction observed
+		// no schema at all and so detached no persisted MV's maintenance. A module that IS
+		// registered but otherwise idle takes the normal path and enumerates its db's
+		// maintained tables — an empty list when it has none. Memory-backed MVs that appear in the set are
 		// harmless: their catalog entries always refill (no phase-1 pre-existing backing),
 		// so withholding trust from them is a no-op.
 		const staleAtClose = this.computeStaleMvSet();

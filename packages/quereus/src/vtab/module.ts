@@ -543,10 +543,13 @@ export interface VirtualTableModule<
 	 * table hook — subscribes to `db.schemaManager.getChangeNotifier()` here rather than
 	 * waiting for its first table hook to hand it a `db`.
 	 *
-	 * Synchronous and side-effect-light by contract: it runs inside `registerModule`, and
-	 * throwing fails the registration. Registering the SAME module instance on a second
-	 * `Database` therefore surfaces whatever a module does about that at registration time
-	 * rather than at first table use. Omit ⇒ never called (today's behavior).
+	 * Synchronous and side-effect-light by contract: it runs inside `registerModule`, which
+	 * is itself synchronous, so an async hook could not be awaited. It is called LAST, after
+	 * the module is registered and its events are hooked, so a throw propagates out of
+	 * `registerModule` but does NOT unregister the module — do not use it to reject a
+	 * registration. Registering the SAME module instance on a second `Database` surfaces
+	 * whatever a module does about that here rather than at first table use.
+	 * Omit ⇒ never called (today's behavior).
 	 */
 	onRegister?(db: Database, moduleName: string): void;
 

@@ -147,9 +147,9 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	 * The catalog entry a plain table would be persisted as: its `{schema}.{table}` key
 	 * (which {@link buildCatalogKey} refuses for an unencodable identifier) plus the DDL
 	 * bundle {@link buildCatalogEntry} produces. Counterpart of {@link viewCatalogEntry} /
-	 * {@link maintainedViewCatalogEntry}, and shared the same way — by the write path
-	 * ({@link saveTableDDL}) and by the pre-flight veto
-	 * ({@link assertCatalogObjectPersistable}) — so the two cannot drift.
+	 * {@link maintainedViewCatalogEntry}, and shared the same way — by both write paths
+	 * ({@link saveTableDDL}, {@link persistTableCatalogEntryIfChanged}) and by the
+	 * pre-flight veto ({@link assertCatalogObjectPersistable}) — so they cannot drift.
 	 */
 	private tableCatalogEntry(tableSchema: TableSchema): CatalogEntry {
 		return {
@@ -316,10 +316,12 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	 * Not ours ⇒ no entry ⇒ no check, which is what keeps a memory-backed dependent table in
 	 * a database that also has store tables from being refused.
 	 *
-	 * Where this is STRICTER than the write path — a store-owned table whose catalog entry
-	 * has not been written yet, which `persistCatalogIfChanged` would skip — refusing is the
-	 * safe side: that table's eventual lazy `saveTableDDL` would throw on the diverged text
-	 * anyway, on the same swallowing path with nothing left to tell the user.
+	 * It now agrees exactly with the `table_added` write path, which applies this same
+	 * filter and then compare-writes ({@link persistTableCatalogEntryIfChanged}) with no
+	 * absent → skip. It stays STRICTER than the `table_modified` write path
+	 * ({@link persistCatalogIfChanged}), which skips an absent entry; refusing there is the
+	 * safe side, since that table's own catalog write would throw on the diverged text
+	 * anyway, on the swallowing persist queue with nothing left to tell the user.
 	 */
 	protected ownsTableCatalogEntry(table: TableSchema): boolean {
 		const tableKey = `${table.schemaName}.${table.name}`.toLowerCase();

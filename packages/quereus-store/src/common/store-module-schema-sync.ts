@@ -75,11 +75,12 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 	 * Rehydrate the persisted catalog into the in-memory schema manager, in
 	 * dependency order.
 	 *
-	 * Establishes the engine schema-change subscription up front (so a reopened DB
-	 * persists subsequent DDL even when its first post-reopen statement is a view/MV,
-	 * which never routes through a module hook — all the lazy subscription points are
-	 * table hooks). Then loads every catalog entry once, classifies each by its key
-	 * prefix into {tables, views, materialized views}, and imports in three phases:
+	 * Re-asserts the engine schema-change subscription up front — normally already
+	 * established by `StoreModule.onRegister` at `Database.registerModule`, but this
+	 * entry point is also reachable with a `db` this module was never registered on, and
+	 * phase 3 cannot observe MV staleness without it. Then loads every catalog entry
+	 * once, classifies each by its key prefix into {tables, views, materialized views},
+	 * and imports in three phases:
 	 *
 	 *   1. **Tables** — `importCatalog` (connect to existing storage; refresh connected
 	 *      `StoreTable` schemas).
@@ -497,10 +498,10 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 	 * backing-invalidation), so its durable backing may be behind. The single source of
 	 * truth for both the clean-shutdown marker payload and the durable stale-MV set.
 	 *
-	 * No subscribed db ⇒ the empty set: every path that can mark an MV stale requires a
-	 * session in which this module observed the db (a store source create/connect or
-	 * `rehydrateCatalog`, both of which subscribe), so a session without `subscribedDb`
-	 * never detached any persisted MV's maintenance. Memory-backed MVs that appear here
+	 * No subscribed db ⇒ the empty set. Since `StoreModule.onRegister` subscribes at
+	 * `Database.registerModule`, that now means a module never registered on any
+	 * `Database` (constructed and closed directly) — which by construction observed no
+	 * schema at all, so it detached no persisted MV's maintenance. Memory-backed MVs that appear here
 	 * are harmless — their catalog entries always refill (no phase-1 pre-existing
 	 * backing), so withholding trust from them is a no-op.
 	 */

@@ -627,17 +627,25 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
 		});
 
-		it('a close with no subscribed db writes an empty stale set (next session adopts)', async () => {
+		it('a close that observed no schema writes an empty stale set (next session adopts)', async () => {
 			// Session 1: seed + clean close.
 			await seedSession();
 			await plantSentinel('main.mv', [99, 990]);
 
-			// Session 2: a module that never rehydrates and never touches a store table.
-			// Its closeAll has no `subscribedDb` ⇒ writes an empty stale set, re-arming
-			// the fast path rather than skipping the marker or writing garbage.
+			// Session 2a: a module never registered on any Database — `computeStaleMvSet`
+			// takes its no-`subscribedDb` arm. (Since `onRegister` subscribes at
+			// `registerModule`, this is now the ONLY way to reach that arm.)
+			const unregistered = new StoreModule(provider);
+			await unregistered.closeAll();
+			expect(await markerValue(), 'unobserved close writes an empty stale set').to.equal('[]');
+
+			// Session 2b: a registered module that never rehydrates and never touches a
+			// store table. It IS subscribed, so it enumerates its own (empty) db and
+			// reaches the same empty set — re-arming the fast path rather than skipping
+			// the marker or writing garbage.
 			const { mod: mod2 } = open();
 			await mod2.closeAll();
-			expect(await markerValue(), 'no-subscribed-db close writes an empty stale set').to.equal('[]');
+			expect(await markerValue(), 'registered-but-idle close writes an empty stale set').to.equal('[]');
 
 			// Session 3: adopts (empty stale set ⇒ full trust) — the sentinel survives.
 			const { db: db3, result } = await reopen();
