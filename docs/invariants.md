@@ -447,10 +447,13 @@ resolved at plan time exactly as the runtime resolves it, through the shared hel
 TIMESPAN and JSON compare by meaning, not stored text (`'PT1H'` = `'PT60M'`). A `col1 = col2`
 fact — mirror FDs, an equivalence class, a join equi-pair — is false when the two sides
 disagree on semantic ordering: rows can agree on the semantic column while holding different
-strings in the plain one. Every extractor minting such a fact requires `semanticOrderingsAgree`
-on both declared logical types. The gate is on cross-**column** facts only: a constant pin
-(`d = 'PT60M'` ⇒ `∅ → d` plus a binding) stays ungated, because it claims the column *compares
-equal to* that value under its own comparison — which is true.
+strings in the plain one. Each of the three extractors above requires `semanticOrderingsAgree`
+on both declared logical types. Cross-**column** facts only: a constant pin stays ungated —
+it claims the column *compares equal to* that value under its own comparison, which is true.
+
+Known hole: CHECK / assertion extraction (`planner/analysis/check-extraction.ts`) lifts the
+same fact ungated and returns wrong rows today — ticket
+`check-derived-equivalence-ignores-semantic-ordering`.
 
 ### OPT-052 — Provenance is informational
 

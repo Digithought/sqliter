@@ -344,12 +344,19 @@ column compares structurally), the
 collation lattice, the mixed-pair rule above, and NULL handling (`null = null` is
 UNKNOWN, so a NULL key never matches on either physical path).
 
-One surface still does **not** follow the rule.
+Two surfaces still do **not** follow the rule.
 
 **AS OF** match/partition columns compare by storage class + collation. Correct for the canonical AS OF column
 types (DATE/DATETIME, whose ISO text order is their semantic order), wrong for a TIMESPAN
 or JSON match column. AS OF has no residual to demote into, so the join gate does not
 apply. Tracked as `tickets/backlog/bug-asof-match-column-ignores-semantic-ordering`.
+
+**CHECK / assertion-derived equality facts.** `check-extraction.ts` lifts the same
+cross-column mirror FDs and equivalence class from `check (d = s)` with no semantic-ordering
+gate, onto the table reference itself — where predicate inference reads it directly. `create
+table ck (d timespan, s text, check (d = s))` holding a row `('PT1H', 'PT60M')` loses that row
+from `select … where d = 'PT1H'`. Tracked as
+`tickets/fix/check-derived-equivalence-ignores-semantic-ordering`.
 
 **Filter-level equality facts** follow it, with one deliberate asymmetry.
 `extractEqualityFds` (`planner/util/fd-utils.ts`) mints value-level claims from `where`

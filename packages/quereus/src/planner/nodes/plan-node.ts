@@ -222,8 +222,11 @@ export type ConstantValue =
  *  - `rules/predicate/rule-predicate-inference-equivalence.ts` re-synthesizes
  *    `otherCol = <value>` and types the synthesized literal from the TARGET
  *    attribute, so the comparison it emits is the target column's own. Sound
- *    because equivalence-class transfers are semantic-ordering-gated at
- *    extraction (invariant OPT-051), so the target shares the source's type.
+ *    only while the equivalence class it transfers along is itself
+ *    semantic-ordering-gated at extraction (invariant OPT-051), so the target
+ *    shares the source's type. The predicate/join extractors are; CHECK
+ *    extraction is NOT yet, and its ungated EC makes this transfer drop rows —
+ *    ticket `check-derived-equivalence-ignores-semantic-ordering`.
  *  - `analysis/update-lineage.ts` (`deriveFilterAttributeDefaults`) uses the
  *    binding as the omitted-column default when inserting through a filtered
  *    view; it needs a value that SATISFIES the view predicate, which is exactly
