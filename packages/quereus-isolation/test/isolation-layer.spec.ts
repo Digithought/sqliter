@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, MemoryTableModule, VirtualTable, AccessPlanBuilder, IndexConstraintOp, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
-import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs, UpdateResult, IndexDescriptor } from '@quereus/quereus';
+import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs, UpdateResult, IndexDescriptor, EffectiveRowSource } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
 import { makeFullScanFilterInfo } from '../src/filter-info.js';
@@ -2953,6 +2953,239 @@ describe('IsolationModule', () => {
 			await db.exec(`COMMIT`);
 			rows = await asyncIterableToArray(db.eval(`SELECT id, x FROM lay_dc ORDER BY id`));
 			expect(rows.map((r: any) => [r.id, r.x]), 'post-commit read').to.deep.equal([[0, 100], [1, 10]]);
+		});
+	});
+
+	describe('ADD COLUMN at a caller-chosen position (isolation layer)', () => {
+		// `buildOverlayAddColumnChange` honours a caller-named `insertAtIndex` and only falls
+		// back to the tombstone flag's own index (append, ahead of the flag) when the caller
+		// names none. SQL never names one; `PositionedIsolationModule` stands in for the
+		// in-process module wrapper that can — mirroring `PositionedMemoryModule` in
+		// `packages/quereus/test/alter-column-open-transaction-layer.spec.ts`. The sibling
+		// block above ('in-transaction column-shape ALTER keeps the overlay tombstone flag
+		// last') only drives the no-position arm; these pin the caller-named one.
+		class PositionedIsolationModule extends IsolationModule {
+			public insertAt: number | undefined;
+
+			override async alterTable(
+				db: Database,
+				schemaName: string,
+				tableName: string,
+				change: SchemaChangeInfo,
+				rows?: EffectiveRowSource,
+			): Promise<TableSchema> {
+				const positioned: SchemaChangeInfo = change.type === 'addColumn' && this.insertAt !== undefined
+					? { ...change, insertAtIndex: this.insertAt }
+					: change;
+				return super.alterTable(db, schemaName, tableName, positioned, rows);
+			}
+		}
+
+		let isolatedModule: PositionedIsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new PositionedIsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		function columnOrder(tableName: string): string[] {
+			const table = db.schemaManager.getTable('main', tableName);
+			expect(table, `table ${tableName} should exist`).to.exist;
+			return table!.columns.map(c => c.name);
+		}
+
+		it('inserts at position 0 ahead of committed and staged rows alike', async () => {
+			await db.exec(`CREATE TABLE pos_zero (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO pos_zero VALUES (1, 'a')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_zero VALUES (2, 'b')`);
+			isolatedModule.insertAt = 0;
+			await db.exec(`ALTER TABLE pos_zero ADD COLUMN w TEXT DEFAULT 'z'`);
+
+			expect(columnOrder('pos_zero')).to.deep.equal(['w', 'id', 'v']);
+			let rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_zero ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v]), 'in-transaction read').to.deep.equal([['z', 1, 'a'], ['z', 2, 'b']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_zero ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v]), 'post-commit read').to.deep.equal([['z', 1, 'a'], ['z', 2, 'b']]);
+		});
+
+		it('a write after the reshape targets the new column by name, not by row position', async () => {
+			// The case that would catch a row/schema layout disagreement: a value written to
+			// the new column must read back under that column's name.
+			await db.exec(`CREATE TABLE pos_writes (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO pos_writes VALUES (1, 'a')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_writes VALUES (2, 'b')`);
+			isolatedModule.insertAt = 0;
+			await db.exec(`ALTER TABLE pos_writes ADD COLUMN w TEXT DEFAULT 'z'`);
+
+			await db.exec(`UPDATE pos_writes SET w = 'upd' WHERE id = 2`);
+			await db.exec(`INSERT INTO pos_writes VALUES ('fresh', 3, 'c')`); // new layout: w, id, v
+			await db.exec(`DELETE FROM pos_writes WHERE id = 1`);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_writes ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v])).to.deep.equal([['upd', 2, 'b'], ['fresh', 3, 'c']]);
+		});
+
+		it('a staged deletion survives a positioned ALTER', async () => {
+			await db.exec(`CREATE TABLE pos_del (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO pos_del VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM pos_del WHERE id = 1`);
+			await db.exec(`INSERT INTO pos_del VALUES (3, 'c')`);
+			isolatedModule.insertAt = 1;
+			await db.exec(`ALTER TABLE pos_del ADD COLUMN w TEXT DEFAULT 'z'`);
+
+			expect(columnOrder('pos_del')).to.deep.equal(['id', 'w', 'v']);
+			await db.exec(`COMMIT`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_del ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.w, r.v]), 'the deleted row stays deleted').to.deep.equal([[2, 'z', 'b'], [3, 'z', 'c']]);
+		});
+
+		it('renumbers a multi-column primary key AND a secondary index the insert lands ahead of both', async () => {
+			await db.exec(`CREATE TABLE pos_pk (k1 INTEGER, v TEXT, k2 INTEGER, PRIMARY KEY (k1, k2)) USING isolated`);
+			await db.exec(`CREATE INDEX pos_pk_v ON pos_pk (v)`);
+			await db.exec(`INSERT INTO pos_pk VALUES (1, 'p', 10)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_pk VALUES (2, 'q', 20)`);
+			isolatedModule.insertAt = 0;
+			await db.exec(`ALTER TABLE pos_pk ADD COLUMN w TEXT DEFAULT 'z'`);
+
+			expect(columnOrder('pos_pk')).to.deep.equal(['w', 'k1', 'v', 'k2']);
+			let byPk = await asyncIterableToArray(db.eval(`SELECT v FROM pos_pk WHERE k1 = 2 AND k2 = 20`));
+			let byIndex = await asyncIterableToArray(db.eval(`SELECT k1 FROM pos_pk WHERE v = 'q'`));
+			expect(byPk.map((r: any) => r.v), 'in-transaction PK seek').to.deep.equal(['q']);
+			expect(byIndex.map((r: any) => r.k1), 'in-transaction secondary index seek').to.deep.equal([2]);
+
+			await db.exec(`COMMIT`);
+			byPk = await asyncIterableToArray(db.eval(`SELECT v FROM pos_pk WHERE k1 = 2 AND k2 = 20`));
+			byIndex = await asyncIterableToArray(db.eval(`SELECT k1 FROM pos_pk WHERE v = 'q'`));
+			expect(byPk.map((r: any) => r.v), 'post-commit PK seek').to.deep.equal(['q']);
+			expect(byIndex.map((r: any) => r.k1), 'post-commit secondary index seek').to.deep.equal([2]);
+		});
+
+		it("a position equal to the base's column count is indistinguishable from a plain append", async () => {
+			await db.exec(`CREATE TABLE pos_end (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO pos_end VALUES (1, 'a')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_end VALUES (2, 'b')`);
+			isolatedModule.insertAt = 2; // the base's own append slot
+			await db.exec(`ALTER TABLE pos_end ADD COLUMN w TEXT DEFAULT 'z'`);
+
+			expect(columnOrder('pos_end')).to.deep.equal(['id', 'v', 'w']);
+			let rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_end ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w])).to.deep.equal([[1, 'a', 'z'], [2, 'b', 'z']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_end ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w])).to.deep.equal([[1, 'a', 'z'], [2, 'b', 'z']]);
+		});
+
+		it("a change with no position still appends — the harness can't mask the default arm", async () => {
+			await db.exec(`CREATE TABLE pos_default (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO pos_default VALUES (1, 'a')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_default VALUES (2, 'b')`);
+			isolatedModule.insertAt = undefined;
+			await db.exec(`ALTER TABLE pos_default ADD COLUMN w TEXT DEFAULT 'z'`);
+
+			expect(columnOrder('pos_default')).to.deep.equal(['id', 'v', 'w']);
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_default ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v, r.w])).to.deep.equal([[1, 'a', 'z'], [2, 'b', 'z']]);
+		});
+
+		it('rejects an out-of-range position clean, before anything irreversible', async () => {
+			await db.exec(`CREATE TABLE pos_oor (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO pos_oor VALUES (1, 'a')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_oor VALUES (2, 'b')`);
+			isolatedModule.insertAt = 99;
+
+			let error: unknown;
+			try {
+				await db.exec(`ALTER TABLE pos_oor ADD COLUMN w TEXT DEFAULT 'z'`);
+			} catch (e) { error = e; }
+			expect(error, 'out-of-range position should have been rejected').to.be.instanceOf(Error);
+			expect(String(error)).to.match(/Cannot add column 'w' at position 99/);
+			expect(String(error)).to.match(/expected an integer in \[0, 2\]/);
+
+			expect(columnOrder('pos_oor'), 'catalog untouched').to.deep.equal(['id', 'v']);
+
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_oor ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.v]), 'the open transaction still commits, rows unchanged').to.deep.equal([[1, 'a'], [2, 'b']]);
+		});
+
+		it('keeps pre-savepoint rows at the new layout after a rollback to savepoint', async () => {
+			await db.exec(`CREATE TABLE pos_sp (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_sp VALUES (1, 'a')`);
+			await db.exec(`SAVEPOINT s`);
+			await db.exec(`INSERT INTO pos_sp VALUES (2, 'b')`);
+			isolatedModule.insertAt = 0;
+			await db.exec(`ALTER TABLE pos_sp ADD COLUMN w TEXT DEFAULT 'z'`);
+			await db.exec(`INSERT INTO pos_sp VALUES ('x', 3, 'c')`); // new layout: w, id, v
+			await db.exec(`ROLLBACK TO SAVEPOINT s`);
+
+			expect(columnOrder('pos_sp')).to.deep.equal(['w', 'id', 'v']);
+			let rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_sp ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v]), 'only the pre-savepoint row survives, at the new layout').to.deep.equal([['z', 1, 'a']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_sp ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v])).to.deep.equal([['z', 1, 'a']]);
+		});
+
+		it('a caller-named position on a cross-connection foreign overlay backfills at that slot, not the end', async () => {
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			const dbA = new Database();
+			const dbB = new Database();
+			dbA.registerModule('isolated', iso);
+			await dbA.exec('create table pos_cross (id integer primary key, x integer null) using isolated');
+
+			const underlying = iso.getUnderlyingState('main', 'pos_cross')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlying.tableSchema!));
+			await overlay.update({ operation: 'insert', values: [10, 7, 0] });    // live staged row
+			await overlay.update({ operation: 'insert', values: [11, null, 1] }); // deletion marker
+			iso.setConnectionOverlay(dbB, 'main', 'pos_cross', { overlayTable: overlay, hasChanges: true, db: dbB });
+
+			const change: SchemaChangeInfo = {
+				type: 'addColumn',
+				columnDef: {
+					name: 'c',
+					dataType: 'INTEGER',
+					constraints: [{ type: 'default', expr: { type: 'literal', value: 42 } }],
+				},
+				insertAtIndex: 0,
+			};
+			const updated = await iso.alterTable(dbA, 'main', 'pos_cross', change);
+
+			expect(updated.columns.map(col => col.name), 'base gains c ahead of the existing columns').to.deep.equal(['c', 'id', 'x']);
+
+			const bState = iso.getConnectionOverlay(dbB, 'main', 'pos_cross')!;
+			expect(bState.poison, 'B must not be poisoned by a satisfiable caller-named position').to.be.undefined;
+			expect(bState.overlayTable.tableSchema!.columns.map(col => col.name), "B's overlay mirrors the base layout ahead of the tombstone flag")
+				.to.deep.equal(['c', 'id', 'x', '_tombstone']);
+
+			const bRows = await asyncIterableToArray(bState.overlayTable.query!(makeFullScanFilterInfo()));
+			expect(bRows, 'live row backfilled at slot 0; marker stays NULL there; flag stays last')
+				.to.deep.equal([[42, 10, 7, 0], [null, 11, null, 1]]);
+
+			await dbA.close();
+			await dbB.close();
 		});
 	});
 
