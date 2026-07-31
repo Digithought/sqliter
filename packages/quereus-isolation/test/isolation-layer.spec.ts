@@ -3128,6 +3128,76 @@ describe('IsolationModule', () => {
 			expect(rows.map((r: any) => [r.id, r.v]), 'the open transaction still commits, rows unchanged').to.deep.equal([[1, 'a'], [2, 'b']]);
 		});
 
+		it('an expression DEFAULT still evaluates against the pre-insert row layout', async () => {
+			// The evaluator arm, not a folded literal: `computeAddColumnValue` strips the
+			// tombstone flag off an OLD-layout overlay row before running `new.<col>`, while
+			// `insertAtIndex` describes the NEW layout. A caller-named slot must not shift
+			// what the evaluator reads.
+			await db.exec(`CREATE TABLE pos_expr (id INTEGER PRIMARY KEY, v INTEGER) USING isolated`);
+			await db.exec(`INSERT INTO pos_expr VALUES (1, 10)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_expr VALUES (2, 20)`);
+			isolatedModule.insertAt = 0;
+			await db.exec(`ALTER TABLE pos_expr ADD COLUMN w INTEGER DEFAULT (new.v * 2)`);
+
+			expect(columnOrder('pos_expr')).to.deep.equal(['w', 'id', 'v']);
+			let rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_expr ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v]), 'in-transaction read').to.deep.equal([[20, 1, 10], [40, 2, 20]]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_expr ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v]), 'post-commit read').to.deep.equal([[20, 1, 10], [40, 2, 20]]);
+		});
+
+		it('a NOT NULL expression DEFAULT at a position does not reject a staged deletion marker', async () => {
+			// A marker carries placeholder NULL at every non-key column, so it must be
+			// short-circuited (NULL, not evaluated, not NOT NULL-checked) even when the new
+			// column lands at slot 0 — the slot the marker's own key does NOT occupy.
+			await db.exec(`CREATE TABLE pos_nn (id INTEGER PRIMARY KEY, v INTEGER) USING isolated`);
+			await db.exec(`INSERT INTO pos_nn VALUES (1, 10), (2, 20)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM pos_nn WHERE id = 1`);
+			await db.exec(`INSERT INTO pos_nn VALUES (3, 30)`);
+			isolatedModule.insertAt = 0;
+			await db.exec(`ALTER TABLE pos_nn ADD COLUMN w INTEGER NOT NULL DEFAULT (new.v * 2)`);
+
+			expect(columnOrder('pos_nn')).to.deep.equal(['w', 'id', 'v']);
+			let rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_nn ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v]), 'in-transaction read').to.deep.equal([[40, 2, 20], [60, 3, 30]]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_nn ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.v]), 'post-commit read').to.deep.equal([[40, 2, 20], [60, 3, 30]]);
+		});
+
+		it('re-derives the overlay tombstone slot on each of three ALTERs in one transaction', async () => {
+			// The overlay's tombstone index is read off its own schema per ALTER, so a second
+			// (and third) reshape must see the reshaped overlay, not the connect-time snapshot.
+			await db.exec(`CREATE TABLE pos_twice (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await db.exec(`INSERT INTO pos_twice VALUES (1, 'a')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO pos_twice VALUES (2, 'b')`);
+			isolatedModule.insertAt = 0;
+			await db.exec(`ALTER TABLE pos_twice ADD COLUMN w TEXT DEFAULT 'z'`);
+			isolatedModule.insertAt = 2;
+			await db.exec(`ALTER TABLE pos_twice ADD COLUMN x TEXT DEFAULT 'y'`);
+			isolatedModule.insertAt = undefined; // appends, still ahead of the flag
+			await db.exec(`ALTER TABLE pos_twice ADD COLUMN u TEXT DEFAULT 'q'`);
+
+			expect(columnOrder('pos_twice')).to.deep.equal(['w', 'id', 'x', 'v', 'u']);
+			let rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_twice ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.x, r.v, r.u]), 'in-transaction read')
+				.to.deep.equal([['z', 1, 'y', 'a', 'q'], ['z', 2, 'y', 'b', 'q']]);
+
+			await db.exec(`COMMIT`);
+			rows = await asyncIterableToArray(db.eval(`SELECT * FROM pos_twice ORDER BY id`));
+			expect(rows.map((r: any) => [r.w, r.id, r.x, r.v, r.u]), 'post-commit read')
+				.to.deep.equal([['z', 1, 'y', 'a', 'q'], ['z', 2, 'y', 'b', 'q']]);
+		});
+
 		it('keeps pre-savepoint rows at the new layout after a rollback to savepoint', async () => {
 			await db.exec(`CREATE TABLE pos_sp (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
 
