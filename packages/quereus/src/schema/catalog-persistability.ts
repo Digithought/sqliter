@@ -147,6 +147,12 @@ function assertRenameDependentTablesPersistable(db: Database, rewriteTable: Tabl
  * clone — that arm of both table rewriters is already copy-on-write (it builds a new `fk`
  * record rather than assigning into the existing one).
  */
+// NOTE: a unique partial index and its derived UNIQUE constraint share ONE predicate node by
+// reference (see `appendIndexToTableSchema`), which is how the live propagation rewrites both
+// at once. Cloning the index's copy here breaks that sharing, so the probe's constraint keeps
+// the pre-rename predicate — invisible today, because a predicate can only name another table
+// through a subquery and no module accepts one. If index-predicate subqueries ever land, clone
+// the constraint's predicate to the SAME node as its index's.
 function cloneTableRewritableAsts(table: TableSchema): TableSchema {
 	return {
 		...table,

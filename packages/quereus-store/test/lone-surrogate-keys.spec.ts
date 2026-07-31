@@ -596,8 +596,9 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			expect(db.schemaManager.getTable('main', 's2')?.foreignKeys?.[0]?.referencedTable.toLowerCase(),
 				'the live FK must still target m').to.equal('m');
 			await storeModule.whenCatalogPersisted();
-			expect(await catalogDDL(provider, buildCatalogKey('main', 's2')),
-				'the persisted DDL must still name m').to.match(/\bm\b/);
+			const ddl = await catalogDDL(provider, buildCatalogKey('main', 's2'));
+			expect(ddl, 'the persisted DDL must still name m').to.match(/\bm\b/);
+			expect(ddl, 'no lone surrogate may have reached the catalog').to.not.include(LONE_HIGH);
 		});
 
 		it('refuses a column rename a store-backed dependent could not persist through its FOREIGN KEY', async () => {
@@ -613,8 +614,9 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			expect(db.schemaManager.getTable('main', 's2')?.foreignKeys?.[0]?.referencedColumnNames?.[0]?.toLowerCase(),
 				'the live FK must still name the id column').to.equal('id');
 			await storeModule.whenCatalogPersisted();
-			expect(await catalogDDL(provider, buildCatalogKey('main', 's2')),
-				'the persisted DDL must still name id').to.match(/\bid\b/);
+			const ddl = await catalogDDL(provider, buildCatalogKey('main', 's2'));
+			expect(ddl, 'the persisted DDL must still name id').to.match(/\bid\b/);
+			expect(ddl, 'no lone surrogate may have reached the catalog').to.not.include(LONE_HIGH);
 		});
 
 		it('refuses a table rename a store-backed dependent could not persist through its CHECK expression', async () => {
@@ -653,6 +655,61 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			expect(db.schemaManager.getTable('main', LONE_HIGH), 'the rename went through').to.not.be.undefined;
 			expect(db.schemaManager.getTable('main', 'mem2')?.foreignKeys?.[0]?.referencedTable,
 				'the memory dependent was rewritten as always').to.equal(LONE_HIGH);
+		});
+
+		it('refuses a rename an ISOLATION-WRAPPED store dependent could not persist, after a reopen', async () => {
+			// The ownership self-filter (`ownsTableCatalogEntry`) end-to-end, through the isolation
+			// wrapper and across a reopen — the deployment shape that has the most to lose, since
+			// the dependent's catalog entry is already on disk and the write path would re-persist
+			// it under the new name. Make the filter answer `false` and this test fails with the
+			// original bug verbatim: the rename succeeds and logs `[StoreModule] Failed to persist
+			// catalog DDL after schema change: …`.
+			//
+			// (Rehydration does put the table back in the store's `tables` map, so the first arm of
+			// the filter still claims it here; the `underlying === this` arm stays defensive, held
+			// for parity with `StoreModule.resolveOwnedTable`.)
+			// The renamed table must be MEMORY-backed, or the store's own `alterTable` /
+			// `renameTable` guard refuses first and the dependent scan proves nothing. A memory
+			// table does not survive a reopen, so it is re-created in phase 2 before rehydration,
+			// which is what lets the rehydrated store table's CHECK resolve against it again.
+			const isoProvider = createInMemoryProvider();
+			const memoryTable = `create table rm (id integer primary key)`;
+			const storeDependent =
+				`create table rc (id integer primary key, v integer check (v < (select count(*) from rm))) using store`;
+
+			// Phase 1 — persist the dependent.
+			const db1 = new Database();
+			const mod1 = createIsolatedStoreModule({ provider: isoProvider });
+			db1.registerModule('store', mod1);
+			await db1.exec(memoryTable);
+			await db1.exec(`insert into rm values (1)`);
+			await db1.exec(storeDependent);
+			await db1.exec(`insert into rc values (1, 0)`);
+			await (mod1.underlying as StoreModule).whenCatalogPersisted();
+			await db1.close();
+
+			// Phase 2 — fresh Database and wrapper over the SAME provider; nothing touches `rc`.
+			const db2 = new Database();
+			const mod2 = createIsolatedStoreModule({ provider: isoProvider });
+			db2.registerModule('store', mod2);
+			const inner = mod2.underlying as StoreModule;
+			try {
+				await db2.exec(memoryTable);
+				expect((await inner.rehydrateCatalog(db2)).errors, 'catalog rehydrates cleanly')
+					.to.have.lengthOf(0);
+
+				await rejects(db2, `alter table rm rename to "${LONE_HIGH}"`);
+
+				expect(db2.schemaManager.getTable('main', 'rm'), 'the table keeps its name').to.not.be.undefined;
+				expect(db2.schemaManager.getTable('main', LONE_HIGH)).to.be.undefined;
+				await inner.whenCatalogPersisted();
+				const ddl = await catalogDDL(isoProvider, buildCatalogKey('main', 'rc'));
+				expect(ddl, 'the persisted CHECK must still name rm').to.match(/\brm\b/);
+				expect(ddl, 'no lone surrogate may have reached the catalog').to.not.include(LONE_HIGH);
+			} finally {
+				await db2.close();
+				await isoProvider.closeAll();
+			}
 		});
 
 		// ── Regression pins: already-loud paths must STAY loud and stay clean no-ops ──

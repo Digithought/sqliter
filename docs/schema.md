@@ -418,7 +418,10 @@ read its catalog the way the table write path's absent-entry filter does. The st
 `StoreModule.resolveOwnedTable`: a table it already holds, or one whose `vtabModule` is the
 store (or a wrapper exposing it as `underlying`, which is what isolation-wrapping produces).
 Not owned ⇒ no entry ⇒ no check, which is what keeps a memory-backed dependent from being
-refused in a database that also has store tables.
+refused in a database that also has store tables. Ownership is a slightly coarser test than
+the write path's: a store-owned table whose catalog entry has not been written yet is refused
+here where the write path would have skipped it — the safe side, since that table's own later
+save would throw the same complaint with nowhere left to report it.
 
 Ordering note: for a **store-backed** table with a dependent view or dependent store table
 the pre-flight fires ahead of the store's physical store-name guard, so the reported message
