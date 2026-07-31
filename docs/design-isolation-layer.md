@@ -729,15 +729,20 @@ For each declared non-PK UNIQUE constraint:
 **When Phase 2 may seek (`canSeekForConstraint`).** Only when the constraint was
 synthesized from a `CREATE UNIQUE INDEX` (`derivedFromIndex` names a live entry in
 `tableSchema.indexes`) AND every key column's effective enforcement collation is
-BINARY. The BINARY gate is load-bearing, not an optimisation choice: the store's
-physical index key bytes come from a separate encoder registry that does **not**
-consult the database's collation registry
-(`backlog/debt-store-index-keys-use-column-collation`). Seeking a `NOCASE` index for
-`'B@X'` would physically miss a committed `'b@x'` that the full scan catches, turning
-a performance fix into a lost UNIQUE violation. A table-level `unique(a, b)` (no
-backing index) or any non-BINARY-collated index falls back to the full scan. Widen
-the gate to per-column enforcement collations generally only once that encoder defect
-is fixed.
+BINARY. A table-level `unique(a, b)` (no backing index) or any non-BINARY-collated
+index falls back to the full scan.
+
+The BINARY gate was load-bearing when the store's index key bytes ignored the
+database's collation registry and were encoded under the table key collation `K`:
+seeking a `NOCASE` index for `'B@X'` physically missed a committed `'b@x'` that the
+full scan catches, turning a performance fix into a lost UNIQUE violation. Both
+defects are fixed — index key bytes now resolve their normalizers through the
+connection's registry and encode under the index column's own effective collation
+(`docs/store.md` § Collation Support) — so the gate is now only conservative, costing
+the seek for a collated index. Widening it to per-column enforcement collations is
+tracked as an arm of `implement/store-index-collation-guard-collapse`; note that
+`backlog/debt-iso-store-unique-seek-rowcount` proposes a negative-control test that
+assumes today's gate.
 
 An INSERT that reuses a PK tombstoned earlier in the same transaction (reviving
 the tombstone into a live row) runs this same merged UNIQUE check before the

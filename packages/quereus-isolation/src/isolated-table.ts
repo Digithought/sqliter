@@ -943,9 +943,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * collation registered *after* a comparator was built is not picked up, the same
 	 * contract `Database.registerCollation` documents engine-wide.
 	 *
-	 * NOTE: this is the *comparison* collation only. The store's physical key bytes come
-	 * from a separate encoder registry that does not consult the database — see
-	 * `fix/bug-store-key-encoder-ignores-database-collations`.
+	 * NOTE: this is the *comparison* collation only. The store's physical key bytes are
+	 * produced by the key NORMALIZER of the same collation, resolved through the same
+	 * connection's registry (`bug-store-key-encoder-ignores-database-collations`, landed),
+	 * so the two agree on equality — but only on ORDER for a collation asserting
+	 * `orderPreserving` (see docs/store.md § Order preservation).
 	 */
 	private getPkCollations(): CollationFunction[] {
 		return this.getPkKeyShape().functions;

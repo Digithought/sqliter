@@ -894,9 +894,10 @@ or overridden with `db.registerCollation`.
 A collation registered with a comparator but **no** normalizer cannot key a persisted
 structure, and neither can an unregistered name. Both are rejected at `CREATE TABLE`
 (and at `CREATE INDEX` / `ALTER`), over exactly the collations the table's key encoding
-uses: each text-capable primary-key column, plus the table key collation `K` when the
-table has a secondary index over a text-capable column, or a primary-key column whose
-type can carry text without declaring a collation of its own.
+uses: each text-capable primary-key column's key collation (which for an undecorated
+`isTextual` member is `K`), plus each text-capable index column's key collation for every
+index — hidden `_uc_*` included. A table whose `K` cannot key but whose encoding never
+reaches `K` (integer PK, index columns keyed `BINARY`) stays openable.
 
 ### Built-in Collations
 
@@ -939,8 +940,9 @@ is unsound for ranges even with the built-ins — `'K'` (U+212A KELVIN SIGN) com
 greater than `'z'` under BINARY, yet keys as `'k'`, which sorts before `'z'`. So an index
 on a plain (BINARY) text column of a default-`K` (NOCASE) store table gets equality seeks
 but scans for ranges; declare the column `collate nocase` to keep the range seek.
-`backlog/debt-store-index-keys-use-column-collation` would restore it properly by encoding
-index-column bytes under `C`.
+Index-column bytes now *are* encoded under `C`, so the `C === K` demand is merely a
+conservative leftover; collapsing it to a plain order-preservation test on `C` (which
+restores the seek for the shape above) is `implement/store-index-collation-guard-collapse`.
 
 The built-ins hold their assertion for every **well-formed** string, including text outside
 the basic multilingual plane. They compare by Unicode code point (`compareCodePoints` in

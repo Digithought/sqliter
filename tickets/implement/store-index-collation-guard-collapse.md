@@ -7,7 +7,9 @@ files:
   - packages/quereus-store/src/common/pk-key-resolution.ts          # keyOrderMatchesCollation — doc comment, index-side caller
   - packages/quereus-store/test/collation-order-preserving.spec.ts  # the `shapes the gate must leave alone` block
   - packages/quereus-store/test/pushdown.spec.ts                    # plan-shape assertions
+  - packages/quereus-isolation/src/isolated-table.ts                # canSeekForConstraint — the BINARY-only gate (second arm)
   - docs/store.md                                                   # § Order preservation, Built-in Collations table + footnote
+  - docs/design-isolation-layer.md                                  # § When Phase 2 may seek
 difficulty: medium
 ---
 
@@ -55,6 +57,39 @@ exists. Concretely:
   (see the completed `store-range-seek-order-preserving-gate`). So the range arm keeps a
   check — but it becomes a single-collation question, `keyOrderMatchesCollation(db, col, C,
   C)`, with the `K` argument gone.
+
+## Second arm: the isolation layer's duplicate-check seek
+
+Added by the review of `store-index-key-column-collation` — same root cause, different
+file, so it belongs here rather than in a ticket of its own.
+
+`IsolatedTable.canSeekForConstraint` (packages/quereus-isolation/src/isolated-table.ts)
+decides whether a UNIQUE duplicate check may look its answer up through the backing index
+instead of reading the whole underlying table. It allows the seek only when **every**
+constrained column enforces under `BINARY`. That gate was written when the store's index
+key bytes were encoded under `K` and ignored the connection's collation registry: seeking
+a `NOCASE` index for `'B@X'` would physically miss a committed `'b@x'`, turning a
+performance win into a lost UNIQUE violation.
+
+Both premises are now gone. Index bytes encode under the index column's own effective
+collation, which for an index-derived UNIQUE is exactly the enforcement collation the
+merged check compares under — so the seek window is precisely the conflict set, and the
+`BINARY`-only gate is now pure conservatism (a collated UNIQUE full-scans the underlying
+on every insert).
+
+What to establish before widening it:
+
+- The seek is served the same way by **both** backends the isolation layer wraps (the
+  store's `analyzeIndexAccess` window, the memory table's index) for a collated index.
+- Only `derivedFromIndex` constraints are seekable — a plain `unique(email)` has no index
+  in the engine-facing schema (the store's `_uc_*` is enforcement-only), so it must keep
+  full-scanning.
+- A custom equality-only collation is fine for an equality seek (order is not involved),
+  but confirm the seek path is equality-only end to end.
+
+Interaction to honor: `backlog/debt-iso-store-unique-seek-rowcount` proposes a
+row-count test whose **negative control** is "a `collate nocase` index must full-scan".
+Widening this gate invalidates that control; whichever lands second must update the other.
 
 ## Why this matters
 
@@ -175,4 +210,7 @@ reason those tests could fail, so this is the pass that proves the remaining gat
 - Resolve the `costOnlyFallback` NOTE (keep or retire) and say which in the handoff.
 - `docs/store.md`: § *Order preservation* and the Built-in Collations table's range-support
   footnote both describe the `K`-vs-`C` regime; update them to the single-collation rule.
+- Second arm: widen `IsolatedTable.canSeekForConstraint` past BINARY-only (or record why
+  not), and update `docs/design-isolation-layer.md` § *When Phase 2 may seek*, which now
+  points here.
 - `yarn build`, `yarn lint`, `yarn test` green; run `yarn test:store` (stream with `tee`).

@@ -423,6 +423,16 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 *     encode through an order-preserving transform — see `storeSemanticKeyTransform`);
 	 *   - negated for a DESC column (its key bytes are bit-inverted).
 	 * Resolved against the MATERIALIZED schema so a hidden `_uc_*` name resolves too.
+	 *
+	 * NOTE: for a text column this states the COMPARATOR's order, which is the byte order
+	 * only while the collation's key normalizer preserves order (`_isCollationOrderPreserving`
+	 * — asserted by the built-ins, opt-in for a custom one; see keyOrderMatchesCollation).
+	 * Under an equality-only custom collation the emitted byte order and this comparator can
+	 * disagree, misplacing an overlay row within an index-key-equal group. Same exposure the
+	 * isolation layer's descriptor fallback carried before this method existed, so nothing
+	 * regressed; if a custom equality-only collation on an INDEX column ever ships, gate this
+	 * on the assertion (returning undefined declines to the fallback, which is no better —
+	 * the real fix is to make the store emit in comparator order or the merge tolerate it).
 	 */
 	getIndexComparator(indexName: string): CompareFn[] | undefined {
 		const schema = this.materializedSchema;

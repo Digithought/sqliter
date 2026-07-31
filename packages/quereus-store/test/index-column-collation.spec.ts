@@ -77,6 +77,14 @@ async function attempt(db: Database, sql: string): Promise<Error | null> {
 	}
 }
 
+/** A keyable custom collation (comparator + key normalizer) that ignores spaces. */
+const stripSpaces = (s: string): string => s.replace(/ /g, '');
+const noSpace = (a: string, b: string): number => {
+	const sa = stripSpaces(a);
+	const sb = stripSpaces(b);
+	return sa < sb ? -1 : sa > sb ? 1 : 0;
+};
+
 const SEEK = /INDEXSEEK|INDEX SEEK|IndexSeek/i;
 const UNIQUE_FAILED = /unique constraint failed/i;
 
@@ -308,6 +316,79 @@ describe('secondary-index key bytes encode under the index column collation, not
 			expect(err!.message).to.match(UNIQUE_FAILED);
 			// Sanity: the reopened table is still writable for a genuinely distinct value.
 			expect(await attempt(db, `insert into t values (3, 'Zed')`)).to.be.null;
+		});
+
+		it('a table whose index collation this connection cannot key is evicted alone; siblings still reconcile', async () => {
+			// `validateKeyCollations` now covers index key collations, so the rehydrate's
+			// post-import reconcile (`updateSchema`) can throw where it never could before.
+			// Unhandled that aborted the whole loop, leaving every LATER table live on its
+			// import-time index-less schema — accepting DML without maintaining indexes and
+			// without enforcing its derived UNIQUE.
+			db.registerCollation('NOSPACE', noSpace, stripSpaces);
+			await db.exec(`create table bad (id integer primary key, code text) using store`);
+			await db.exec(`create unique index ix_code on bad (code collate NOSPACE)`);
+			await db.exec(`create table good (id integer primary key, email text) using store`);
+			await db.exec(`create unique index ix_email on good (email collate nocase)`);
+			await db.exec(`insert into bad values (1, 'a b')`);
+			await db.exec(`insert into good values (1, 'A@x')`);
+			await db.close();
+
+			// Fresh connection: NOSPACE never registered, so `bad`'s index cannot key.
+			db = new Database();
+			const mod = new StoreModule(provider);
+			db.registerModule('store', mod);
+			const result = await mod.rehydrateCatalog(db);
+			expect(result.errors.map(e => e.error.message).join('; ')).to.match(/NOSPACE/i);
+			expect(result.errors, 'only the offending table fails').to.have.lengthOf(1);
+
+			// `good` reconciled its index despite `bad` failing first: the derived UNIQUE
+			// enforces under NOCASE, which an index-less half-schema could not do.
+			const goodErr = await attempt(db, `insert into good values (2, 'a@X')`);
+			expect(goodErr, "good's rehydrated UNIQUE must reject the case-variant").to.not.be.null;
+			expect(goodErr!.message).to.match(UNIQUE_FAILED);
+
+			// `bad` was evicted rather than left half-schema'd, so the next statement
+			// reconnects and raises at the point of use instead of silently skipping
+			// index maintenance.
+			const badErr = await attempt(db, `insert into bad values (2, 'zz')`);
+			expect(badErr, 'the evicted table must raise, not accept unmaintained DML').to.not.be.null;
+			expect(badErr!.message).to.match(/NOSPACE/i);
+		});
+	});
+
+	describe('getIndexComparator states the store\'s physical index-key order', () => {
+		it('honors the key collation, negates DESC, and resolves a hidden `_uc_*`', async () => {
+			// Its own module handle, so the connected StoreTable is reachable directly —
+			// the isolation merge consumes these comparators end-to-end (above), this
+			// pins the per-column output they are built from.
+			const localProvider = createPersistentProvider();
+			const localDb = new Database();
+			const module = new StoreModule(localProvider);
+			localDb.registerModule('store', module);
+			try {
+				await localDb.exec(`create table t (id integer primary key, name text collate nocase, score integer, email text, unique (email)) using store`);
+				await localDb.exec(`create index ix on t (name, score desc)`);
+
+				const table = module.getTable('main', 't');
+				expect(table, 'the connected StoreTable').to.not.be.undefined;
+
+				const comparators = table!.getIndexComparator('ix');
+				expect(comparators, 'one comparator per index column').to.have.lengthOf(2);
+				expect(comparators![0]('Ann', 'ann'), "the column's NOCASE key collation").to.equal(0);
+				expect(comparators![1](1, 2), 'DESC inverts the key bytes, so the comparator negates').to.be.greaterThan(0);
+
+				// Resolved against the MATERIALIZED schema, so the hidden index realizing the
+				// plain `unique (email)` is nameable — and its undecorated text column keys
+				// BINARY, not under the NOCASE table key collation.
+				const ucComparators = table!.getIndexComparator('_uc_email');
+				expect(ucComparators).to.have.lengthOf(1);
+				expect(ucComparators![0]('A@x', 'a@x')).to.not.equal(0);
+
+				expect(table!.getIndexComparator('no_such_index')).to.be.undefined;
+			} finally {
+				await localDb.close();
+				localProvider._hardClose();
+			}
 		});
 	});
 

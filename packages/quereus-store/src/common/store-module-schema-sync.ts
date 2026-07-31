@@ -288,7 +288,12 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 			} catch (e) {
 				recordError(`<index reconcile for ${current.schemaName}.${current.name}>`, e);
 				this.tables.delete(tableKey);
-				void table.dispose();
+				// Fire-and-forget: the eviction is complete without it (nothing reads the
+				// instance again), so a failing stats flush must not reject the rehydrate —
+				// but it must not become an unhandled rejection either.
+				void table.dispose().catch(disposeError => console.warn(
+					`[StoreModule] dispose of evicted ${current.schemaName}.${current.name} failed: ${String(disposeError)}`,
+				));
 			}
 		}
 
