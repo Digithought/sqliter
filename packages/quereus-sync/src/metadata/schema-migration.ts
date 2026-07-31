@@ -8,7 +8,7 @@
 import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc.js';
 import { buildSchemaMigrationKey, buildSchemaMigrationScanBounds } from './keys.js';
-import type { SchemaMigrationType } from '../sync/protocol.js';
+import type { SchemaMigrationType, SchemaObjectKind } from '../sync/protocol.js';
 
 /**
  * Stored schema migration record.
@@ -84,6 +84,11 @@ export function deserializeMigration(buffer: Uint8Array): StoredMigration {
 
 /**
  * Schema migration store operations.
+ *
+ * Every method is keyed by `(schemaName, kind, objectName)`: the object name
+ * alone is ambiguous, since an index migration names an INDEX while every other
+ * migration type names a TABLE. Callers derive `kind` from the migration type
+ * with {@link import('../sync/protocol.js').migrationObjectKind}.
  */
 export class SchemaMigrationStore {
   constructor(private readonly kv: KVStore) {}
@@ -93,10 +98,11 @@ export class SchemaMigrationStore {
    */
   async getMigration(
     schemaName: string,
-    tableName: string,
+    kind: SchemaObjectKind,
+    objectName: string,
     version: number
   ): Promise<StoredMigration | undefined> {
-    const key = buildSchemaMigrationKey(schemaName, tableName, version);
+    const key = buildSchemaMigrationKey(schemaName, kind, objectName, version);
     const data = await this.kv.get(key);
     if (!data) return undefined;
     return deserializeMigration(data);
@@ -107,10 +113,11 @@ export class SchemaMigrationStore {
    */
   async recordMigration(
     schemaName: string,
-    tableName: string,
+    kind: SchemaObjectKind,
+    objectName: string,
     migration: StoredMigration
   ): Promise<void> {
-    const key = buildSchemaMigrationKey(schemaName, tableName, migration.schemaVersion);
+    const key = buildSchemaMigrationKey(schemaName, kind, objectName, migration.schemaVersion);
     await this.kv.put(key, serializeMigration(migration));
   }
 
@@ -120,18 +127,23 @@ export class SchemaMigrationStore {
   recordMigrationBatch(
     batch: WriteBatch,
     schemaName: string,
-    tableName: string,
+    kind: SchemaObjectKind,
+    objectName: string,
     migration: StoredMigration
   ): void {
-    const key = buildSchemaMigrationKey(schemaName, tableName, migration.schemaVersion);
+    const key = buildSchemaMigrationKey(schemaName, kind, objectName, migration.schemaVersion);
     batch.put(key, serializeMigration(migration));
   }
 
   /**
-   * Get the current schema version for a table.
+   * Get the current schema version for one object (a table's, or an index's).
    */
-  async getCurrentVersion(schemaName: string, tableName: string): Promise<number> {
-    const bounds = buildSchemaMigrationScanBounds(schemaName, tableName);
+  async getCurrentVersion(
+    schemaName: string,
+    kind: SchemaObjectKind,
+    objectName: string
+  ): Promise<number> {
+    const bounds = buildSchemaMigrationScanBounds(schemaName, kind, objectName);
     let maxVersion = 0;
 
     for await (const entry of this.kv.iterate({ ...bounds, reverse: true, limit: 1 })) {
@@ -143,13 +155,14 @@ export class SchemaMigrationStore {
   }
 
   /**
-   * Get all migrations for a table.
+   * Get all migrations for one object.
    */
   async *getAllMigrations(
     schemaName: string,
-    tableName: string
+    kind: SchemaObjectKind,
+    objectName: string
   ): AsyncIterable<StoredMigration> {
-    const bounds = buildSchemaMigrationScanBounds(schemaName, tableName);
+    const bounds = buildSchemaMigrationScanBounds(schemaName, kind, objectName);
 
     for await (const entry of this.kv.iterate(bounds)) {
       yield deserializeMigration(entry.value);
@@ -162,11 +175,12 @@ export class SchemaMigrationStore {
    */
   async checkConflict(
     schemaName: string,
-    tableName: string,
+    kind: SchemaObjectKind,
+    objectName: string,
     version: number,
     incomingHLC: HLC
   ): Promise<StoredMigration | undefined> {
-    const existing = await this.getMigration(schemaName, tableName, version);
+    const existing = await this.getMigration(schemaName, kind, objectName, version);
     if (!existing) return undefined;
 
     // First-writer-wins: if existing has lower HLC, it wins

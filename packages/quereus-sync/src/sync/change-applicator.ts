@@ -23,6 +23,7 @@ import type {
 	SchemaChangeToApply,
 	SchemaMigration,
 } from './protocol.js';
+import { migrationObjectKind } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
 import { admitGroup } from './admission.js';
@@ -229,16 +230,18 @@ export async function applyChanges(
 	// below, which reads storage that no migration in this batch has written yet.
 	for (const migration of orderMigrationsByHLC(changes)) {
 		// NOTE: the `??` fallback reads storage no migration in this batch has written
-		// yet, so two same-table migrations that BOTH omit `schemaVersion` compute the
-		// SAME version and collapse onto one `sm:` key (the later, now max-HLC, wins).
+		// yet, so two migrations of ONE object that BOTH omit `schemaVersion` compute
+		// the SAME version and collapse onto one `sm:` key (the later, max-HLC, wins).
 		// Unreachable today — `SchemaMigration.schemaVersion` is required, and
 		// `collectSchemaMigrations` always carries the stored value; if a wire format
 		// ever makes it optional in practice, assign in-batch versions here instead.
+		const kind = migrationObjectKind(migration.type);
 		const schemaVersion = migration.schemaVersion ??
-			(await ctx.schemaMigrations.getCurrentVersion(migration.schema, migration.table)) + 1;
+			(await ctx.schemaMigrations.getCurrentVersion(migration.schema, kind, migration.table)) + 1;
 
 		const existingMigration = await ctx.schemaMigrations.getMigration(
 			migration.schema,
+			kind,
 			migration.table,
 			schemaVersion,
 		);
@@ -372,12 +375,17 @@ export async function applyChanges(
 
 			// Commit schema migration metadata
 			for (const { migration, schemaVersion } of pendingSchemaMigrations) {
-				await ctx.schemaMigrations.recordMigration(migration.schema, migration.table, {
-					type: migration.type,
-					ddl: migration.ddl,
-					hlc: migration.hlc,
-					schemaVersion,
-				});
+				await ctx.schemaMigrations.recordMigration(
+					migration.schema,
+					migrationObjectKind(migration.type),
+					migration.table,
+					{
+						type: migration.type,
+						ddl: migration.ddl,
+						hlc: migration.hlc,
+						schemaVersion,
+					},
+				);
 			}
 
 			// Hold diverted changes as part of the admission unit — durable BEFORE

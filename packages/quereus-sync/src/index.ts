@@ -60,6 +60,8 @@ export {
   type Change,
   // Schema types
   type SchemaMigrationType,
+  type SchemaObjectKind,
+  migrationObjectKind,
   type SchemaMigration,
   // Transaction types
   type ChangeSet,

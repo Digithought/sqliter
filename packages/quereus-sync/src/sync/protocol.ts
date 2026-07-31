@@ -80,6 +80,33 @@ export type SchemaMigrationType =
   | 'alter_column';
 
 /**
+ * The kind of schema object a migration names.
+ *
+ * A migration's object name means different things per type — for an index
+ * migration it is the INDEX name, for every other type it is the TABLE name — so
+ * the kind is what keeps a table and a same-named index in separate migration
+ * streams (see {@link migrationObjectKind} and the `sm:` key layout in
+ * `metadata/keys.ts`).
+ */
+export type SchemaObjectKind = 'table' | 'index';
+
+/**
+ * The object kind a migration type names. Derived, never carried on the wire:
+ * `SchemaMigration.type` already travels, so both ends compute the same kind and
+ * cannot disagree.
+ */
+export function migrationObjectKind(type: SchemaMigrationType): SchemaObjectKind {
+	switch (type) {
+		case 'add_index':
+		case 'drop_index':
+			return 'index';
+		// create/drop table and the three column-level types all name a TABLE.
+		default:
+			return 'table';
+	}
+}
+
+/**
  * A schema migration record.
  */
 export interface SchemaMigration {

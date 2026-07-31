@@ -943,7 +943,7 @@ describe('unknown-table disposition', () => {
       const h = await makeHarness({ columns: { [`main.${RETIRED}`]: ['note'] } });
       // Pre-record a DOMINATING migration (v1, HLC 3000) WITHOUT making the table
       // present (recordMigration touches only migration metadata, not the basis).
-      await h.manager.schemaMigrations.recordMigration('main', RETIRED, {
+      await h.manager.schemaMigrations.recordMigration('main', 'table', RETIRED, {
         type: 'create_table', ddl: `create table ${RETIRED} (id integer primary key, note text)`,
         hlc: createHLC(3000n, 1, h.remoteSite, 0), schemaVersion: 1,
       });

@@ -29,6 +29,7 @@ import {
 	type DataChangeToApply,
 	type SchemaChangeToApply,
 } from './protocol.js';
+import { migrationObjectKind } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError } from './sync-context.js';
 import {
@@ -283,9 +284,10 @@ export async function applySnapshot(
 
 			// Record schema migrations
 			for (const migration of snapshot.schemaMigrations) {
+				const kind = migrationObjectKind(migration.type);
 				const schemaVersion = migration.schemaVersion ??
-					(await ctx.schemaMigrations.getCurrentVersion(migration.schema, migration.table)) + 1;
-				await ctx.schemaMigrations.recordMigration(migration.schema, migration.table, {
+					(await ctx.schemaMigrations.getCurrentVersion(migration.schema, kind, migration.table)) + 1;
+				await ctx.schemaMigrations.recordMigration(migration.schema, kind, migration.table, {
 					type: migration.type,
 					ddl: migration.ddl,
 					hlc: migration.hlc,

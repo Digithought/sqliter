@@ -54,8 +54,10 @@ import {
 	parseColumnVersionKey,
 	parseTombstoneKey,
 	parseSchemaMigrationKey,
+	joinKeyParts,
 	type PkKeying,
 } from '../metadata/keys.js';
+import { migrationObjectKind } from './protocol.js';
 import { createPkKeyingResolver, type PkKeyingResolver } from '../metadata/pk-identity.js';
 import type { SyncManager, SnapshotCheckpoint } from './manager.js';
 import type {
@@ -247,9 +249,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 		const existingIdentity = await kv.get(siteIdKey);
 
-		// Sync-metadata format gate: per-row records are keyed by pk IDENTITY since
-		// format 2 (see SYNC_METADATA_FORMAT_VERSION); older metadata is unreadable
-		// under this layout, and writing new-format records beside it would corrupt
+		// Sync-metadata format gate: the key layout has changed across versions (see
+		// SYNC_METADATA_FORMAT_VERSION); older metadata is unreadable under the
+		// current layout, and writing new-format records beside it would corrupt
 		// both. A replica with existing identity but a missing/mismatched version
 		// must re-bootstrap from a peer snapshot (docs/sync.md § Metadata format
 		// version) — refuse loudly rather than silently mis-keying.
@@ -258,7 +260,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		if (storedFormat === undefined) {
 			if (existingIdentity) {
 				throw new QuereusError(
-					`Sync metadata predates format version ${SYNC_METADATA_FORMAT_VERSION} (pk-identity keys). `
+					`Sync metadata predates format version ${SYNC_METADATA_FORMAT_VERSION}. `
 						+ `Clear this replica's sync metadata and re-bootstrap from a peer snapshot (docs/sync.md § Metadata format version).`,
 					StatusCode.ERROR,
 				);
@@ -877,22 +879,25 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			);
 		}
 
-		// NOTE: for an index migration `objectName` is the INDEX name, so this key
-		// is `<schema>.<index name>` — index-vs-index it is unambiguous only because
-		// `SchemaManager.createIndex` enforces index names unique per schema. Two
-		// same-named indexes on different tables would otherwise share one version
-		// counter and suppress each other's migrations. (An index name colliding
-		// with a *table* name still shares a counter — the key carries no object
-		// kind; tracked separately as bug-sync-migration-version-key-ignores-object-kind.)
-		const counterKey = `${schemaName}.${objectName}`;
+		// NOTE: for an index migration `objectName` is the INDEX name, so the counter
+		// is per `(schema, kind, index name)` — index-vs-index it is unambiguous only
+		// because `SchemaManager.createIndex` enforces index names unique per schema
+		// (SCH-001, docs/invariants.md). Two same-named indexes on different tables
+		// would otherwise share one version counter and suppress each other's
+		// migrations.
+		const kind = migrationObjectKind(migrationType);
+		// Length-prefixed, like the stored key: a schema or object name may contain
+		// any character, so a bare-delimiter join could fold two distinct objects
+		// onto one in-transaction counter.
+		const counterKey = joinKeyParts(schemaName, kind, objectName);
 		let version = versionCounters.get(counterKey);
 		if (version === undefined) {
-			version = await this.schemaMigrations.getCurrentVersion(schemaName, objectName);
+			version = await this.schemaMigrations.getCurrentVersion(schemaName, kind, objectName);
 		}
 		version += 1;
 		versionCounters.set(counterKey, version);
 
-		this.schemaMigrations.recordMigrationBatch(batch, schemaName, objectName, {
+		this.schemaMigrations.recordMigrationBatch(batch, schemaName, kind, objectName, {
 			type: migrationType,
 			ddl: ddl || '',
 			hlc: nextHlc(),

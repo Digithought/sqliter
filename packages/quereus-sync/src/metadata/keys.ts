@@ -7,7 +7,7 @@
  *   tx: - Transaction records
  *   ps: - Peer sync state (received watermark: highest HLC pulled from a peer)
  *   pt: - Peer sent state (sent watermark: highest HLC pushed to a peer and acked)
- *   sm: - Schema migrations
+ *   sm: - Schema migrations (keyed by object KIND as well as name — see buildSchemaMigrationKey)
  *   si: - Site identity
  *   hc: - HLC clock state
  *   cl: - Change log (HLC-indexed for efficient delta queries)
@@ -21,6 +21,7 @@ import { serializeKeyNullGrouping } from '@quereus/quereus';
 import { assertNoUnpairedSurrogate } from '@quereus/store';
 import { type SiteId, siteIdToBase64, siteIdFromBase64 } from '../clock/site.js';
 import type { HLC } from '../clock/hlc.js';
+import type { SchemaObjectKind } from '../sync/protocol.js';
 
 const encoder = new TextEncoder();
 /** Shared: the parsers below run once per key across whole-prefix scans. */
@@ -45,21 +46,26 @@ export const SYNC_KEY_PREFIX = {
 /**
  * Current sync-metadata storage format version, persisted under the `fv:` key.
  *
+ * Version 4: schema migration keys (`sm:`) carry the object KIND (`table` /
+ * `index`) alongside the object name, so a table and a same-named index no
+ * longer share one version counter and suppress each other's migrations
+ * (version 3 keyed only `(schema, name)`).
+ *
  * Version 3: EVERY variable-length key component — schema, table, pk identity,
  * column — is length-prefixed via {@link joinKeyParts}, so no character is
  * reserved as a delimiter and a name containing `:` or `.` cannot shift the
  * split (version 2 packed schema/table as `{schema}.{table}:`, which mis-parsed
- * a table named `a:b` as table `a`).
+ * a table named `a:b` as table `a`) — retained in version 4.
  *
  * Version 2: per-row records (`cv:`/`tb:`/`cl:`) are keyed by the pk IDENTITY
  * (collation- and semantic-transform-normalized, via {@link encodePkIdentity})
- * and carry the raw pk in the record VALUE — retained in version 3.
+ * and carry the raw pk in the record VALUE — retained since.
  *
  * Older metadata is unreadable under this layout; a replica whose stored version
  * mismatches must re-bootstrap from a peer snapshot (see docs/sync.md
  * § Metadata format version).
  */
-export const SYNC_METADATA_FORMAT_VERSION = 3;
+export const SYNC_METADATA_FORMAT_VERSION = 4;
 
 /** Separator between a component's length and the component itself. */
 const SEPARATOR = ':';
@@ -249,20 +255,44 @@ export function parsePeerStateKey(key: Uint8Array): SiteId | null {
 }
 
 /**
+ * The key prefix shared by every migration of one schema object:
+ * `sm:{n}:{schema}{n}:{kind}{n}:{object}`.
+ *
+ * The kind sits BEFORE the object name so one object's migrations stay a single
+ * exact prefix (and stay contiguous by version within it). Kept separate from
+ * {@link buildTablePrefix}, which the two-component `cv:`/`tb:`/`qt:`/`bl:`
+ * families share.
+ */
+function buildSchemaMigrationPrefix(
+  schemaName: string,
+  kind: SchemaObjectKind,
+  objectName: string
+): string {
+  return `sm:${joinKeyParts(schemaName, kind, objectName)}`;
+}
+
+/**
  * Build a schema migration key.
- * Format: sm:{n}:{schema}{n}:{table}{version_padded_10}
+ * Format: sm:{n}:{schema}{n}:{kind}{n}:{object}{version_padded_10}
+ *
+ * `kind` distinguishes the two things `objectName` can be: for an index
+ * migration it is the INDEX name, for every other migration type the TABLE name.
+ * Without it a table `orders` and an index `orders` share one version counter,
+ * and a concurrent migration of one silently suppresses the other on the
+ * receiving replica.
  *
  * The version is fixed-width zero-padded (not length-prefixed) so migrations of
- * one table sort by version within the table's prefix.
+ * one object sort by version within that object's prefix.
  */
 export function buildSchemaMigrationKey(
   schemaName: string,
-  tableName: string,
+  kind: SchemaObjectKind,
+  objectName: string,
   version: number
 ): Uint8Array {
-  assertKeyableIdentifiers(schemaName, tableName);
+  assertKeyableIdentifiers(schemaName, objectName);
   const versionPart = version.toString().padStart(10, '0');
-  return encoder.encode(`sm:${joinKeyParts(schemaName, tableName)}${versionPart}`);
+  return encoder.encode(`${buildSchemaMigrationPrefix(schemaName, kind, objectName)}${versionPart}`);
 }
 
 /**
@@ -325,13 +355,15 @@ export function buildTombstoneScanBounds(
 }
 
 /**
- * Build scan bounds for all schema migrations of a table.
+ * Build scan bounds for all schema migrations of one object — a table's or an
+ * index's, per `kind`. A table and a same-named index have disjoint bounds.
  */
 export function buildSchemaMigrationScanBounds(
   schemaName: string,
-  tableName: string
+  kind: SchemaObjectKind,
+  objectName: string
 ): { gte: Uint8Array; lt: Uint8Array } {
-  return prefixBounds(buildTablePrefix('sm:', schemaName, tableName));
+  return prefixBounds(encoder.encode(buildSchemaMigrationPrefix(schemaName, kind, objectName)));
 }
 
 /**
@@ -429,21 +461,27 @@ export function parseTombstoneKey(key: Uint8Array): {
 
 /**
  * Parse a schema migration key to extract components.
- * Key format: sm:{n}:{schema}{n}:{table}{version_padded_10}
+ * Key format: sm:{n}:{schema}{n}:{kind}{n}:{object}{version_padded_10}
+ *
+ * `table` carries the object name whatever its kind — for an `index` key it is
+ * the index name, not the table the index is on (which the key never held).
  */
 export function parseSchemaMigrationKey(key: Uint8Array): {
   schema: string;
+  kind: SchemaObjectKind;
   table: string;
   version: number;
 } | null {
   const keyStr = decoder.decode(key);
   if (!keyStr.startsWith('sm:')) return null;
 
-  const split = splitKeyParts(keyStr.slice(3), 2);
+  const split = splitKeyParts(keyStr.slice(3), 3);
   if (!split || !/^\d+$/.test(split.remainder)) return null;
 
-  const [schema, table] = split.parts;
-  return { schema, table, version: parseInt(split.remainder, 10) };
+  const [schema, kind, table] = split.parts;
+  if (kind !== 'table' && kind !== 'index') return null;
+
+  return { schema, kind, table, version: parseInt(split.remainder, 10) };
 }
 
 /**

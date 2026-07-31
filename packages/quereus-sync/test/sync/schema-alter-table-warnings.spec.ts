@@ -56,7 +56,7 @@ describe('alter table sync warnings', () => {
 	});
 
 	it('warns on the origin when an ALTER TABLE commits, and still records the migration', async () => {
-		const versionBefore = await a.manager.schemaMigrations.getCurrentVersion('main', 'orders');
+		const versionBefore = await a.manager.schemaMigrations.getCurrentVersion('main', 'table', 'orders');
 
 		const warns = await captureWarnings(async () => {
 			await localWrite(a, 'alter table orders add column qty integer');
@@ -69,13 +69,13 @@ describe('alter table sync warnings', () => {
 		expect(orderWarns[0].toLowerCase()).to.include('alter_column');
 		expect(orderWarns[0].toLowerCase()).to.include('not reach other synced devices');
 
-		const versionAfter = await a.manager.schemaMigrations.getCurrentVersion('main', 'orders');
+		const versionAfter = await a.manager.schemaMigrations.getCurrentVersion('main', 'table', 'orders');
 		expect(versionAfter).to.equal(versionBefore + 1);
 	});
 
 	it('warns on the receiver when relaying that migration, without error, and still advances its schema version', async () => {
 		await localWrite(a, 'alter table orders add column qty integer');
-		const versionBefore = await b.manager.schemaMigrations.getCurrentVersion('main', 'orders');
+		const versionBefore = await b.manager.schemaMigrations.getCurrentVersion('main', 'table', 'orders');
 
 		const warns = await captureWarnings(async () => {
 			await relayAll(a, b);
@@ -88,7 +88,7 @@ describe('alter table sync warnings', () => {
 		expect(receiveWarns[0]).to.include('alter_column');
 		expect(receiveWarns[0]).to.include('no DDL');
 
-		const versionAfter = await b.manager.schemaMigrations.getCurrentVersion('main', 'orders');
+		const versionAfter = await b.manager.schemaMigrations.getCurrentVersion('main', 'table', 'orders');
 		expect(versionAfter).to.equal(versionBefore + 1);
 
 		// The blank-DDL migration ran nothing — b's table shape is unchanged.

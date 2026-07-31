@@ -296,14 +296,28 @@ describe('change-log key encoding', () => {
       }
     });
 
-    it('parseSchemaMigrationKey recovers schema, table and version', () => {
+    it('parseSchemaMigrationKey recovers schema, kind, object name and version', () => {
       for (const schema of NASTY) {
         for (const table of NASTY) {
-          const parsed = parseSchemaMigrationKey(buildSchemaMigrationKey(schema, table, 7));
-          expect(parsed, `sm ${schema}/${table}`).to.not.be.null;
-          expect(parsed!).to.deep.equal({ schema, table, version: 7 });
+          for (const kind of ['table', 'index'] as const) {
+            const parsed = parseSchemaMigrationKey(buildSchemaMigrationKey(schema, kind, table, 7));
+            expect(parsed, `sm ${schema}/${kind}/${table}`).to.not.be.null;
+            expect(parsed!).to.deep.equal({ schema, kind, table, version: 7 });
+          }
         }
       }
+    });
+
+    it('a table and a same-named index key to different sm: records', () => {
+      // The defect this layout removes: with the kind absent from the key, an
+      // index named `orders` shared table `orders`'s version counter, so one
+      // object's migration silently suppressed the other's on a peer.
+      const tableKey = buildSchemaMigrationKey('main', 'table', 'orders', 1);
+      const indexKey = buildSchemaMigrationKey('main', 'index', 'orders', 1);
+      expect(compareBytes(tableKey, indexKey), 'distinct keys').to.not.equal(0);
+
+      expect(parseSchemaMigrationKey(tableKey)!.kind).to.equal('table');
+      expect(parseSchemaMigrationKey(indexKey)!.kind).to.equal('index');
     });
 
     it('parseChangeLogKey recovers every component verbatim, column and delete alike', () => {
@@ -370,6 +384,11 @@ describe('change-log key encoding', () => {
       expect(parseColumnVersionKey(enc('cv:main.t:3:s:1:v'))).to.be.null;
       expect(parseTombstoneKey(enc('tb:main.t:s:1'))).to.be.null;
       expect(parseSchemaMigrationKey(enc('sm:main.t:0000000007'))).to.be.null;
+      // A version-3 sm: key (length-prefixed, but no object kind) must not read
+      // back as version 4 — its `t` would otherwise parse as the kind component.
+      expect(parseSchemaMigrationKey(enc('sm:4:main1:t0000000007'))).to.be.null;
+      // Nor may an unknown kind component parse.
+      expect(parseSchemaMigrationKey(enc('sm:4:main4:view1:t0000000007'))).to.be.null;
     });
   });
 
@@ -401,11 +420,23 @@ describe('change-log key encoding', () => {
       expect(within(tbAB, buildTombstoneScanBounds('main', 'a'))).to.be.false;
       expect(within(tbA, buildTombstoneScanBounds('main', 'a:b'))).to.be.false;
 
-      const smA = buildSchemaMigrationKey('main', 'a', 1);
-      const smAB = buildSchemaMigrationKey('main', 'a:b', 1);
-      expect(within(smA, buildSchemaMigrationScanBounds('main', 'a'))).to.be.true;
-      expect(within(smAB, buildSchemaMigrationScanBounds('main', 'a'))).to.be.false;
-      expect(within(smA, buildSchemaMigrationScanBounds('main', 'a:b'))).to.be.false;
+      const smA = buildSchemaMigrationKey('main', 'table', 'a', 1);
+      const smAB = buildSchemaMigrationKey('main', 'table', 'a:b', 1);
+      expect(within(smA, buildSchemaMigrationScanBounds('main', 'table', 'a'))).to.be.true;
+      expect(within(smAB, buildSchemaMigrationScanBounds('main', 'table', 'a'))).to.be.false;
+      expect(within(smA, buildSchemaMigrationScanBounds('main', 'table', 'a:b'))).to.be.false;
+    });
+
+    it('sm: bounds for a table and a same-named index are disjoint', () => {
+      const smTable = buildSchemaMigrationKey('main', 'table', 'orders', 1);
+      const smIndex = buildSchemaMigrationKey('main', 'index', 'orders', 1);
+      const tableBounds = buildSchemaMigrationScanBounds('main', 'table', 'orders');
+      const indexBounds = buildSchemaMigrationScanBounds('main', 'index', 'orders');
+
+      expect(within(smTable, tableBounds), 'table key in table bounds').to.be.true;
+      expect(within(smIndex, indexBounds), 'index key in index bounds').to.be.true;
+      expect(within(smIndex, tableBounds), 'index key must NOT scan as the table').to.be.false;
+      expect(within(smTable, indexBounds), 'table key must NOT scan as the index').to.be.false;
     });
 
     it('a row scan does not pick up a different row whose identity extends it', () => {
