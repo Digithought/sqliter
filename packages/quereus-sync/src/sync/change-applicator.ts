@@ -83,10 +83,10 @@ interface BatchTableFate {
 	/** The table exists after this batch's schema steps replay in timestamp order. */
 	present: boolean;
 	/**
-	 * A `drop_table` precedes the deciding `create_table`, so the post-batch table is a
-	 * NEW, EMPTY incarnation — its rows must not resolve against the dropped
-	 * incarnation's cell versions and tombstones (dropping a table does not purge its
-	 * sync metadata).
+	 * A `drop_table` precedes the deciding `create_table`, so the batch's DDL sequence
+	 * re-creates the table. Whether the LOCAL table is therefore a new, EMPTY
+	 * incarnation additionally requires that drop to be APPLIED here rather than
+	 * skipped as HLC-dominated — the read site ANDs this with `appliedDropKeys`.
 	 */
 	recreated: boolean;
 }
@@ -260,6 +260,19 @@ export async function applyChanges(
 		applied++;
 	}
 
+	// Tables whose `drop_table` this batch actually APPLIES (Phase 1a kept it; it was not
+	// skipped as HLC-dominated). Only an executed drop leaves whatever the batch
+	// re-creates a genuinely EMPTY table, so this is the second half of the
+	// `freshLocalTable` test below: a RE-DELIVERED drop/re-create batch has every schema
+	// step dominated, changes no local schema, and the local table is already the
+	// post-re-create incarnation — its metadata is that incarnation's and must still be
+	// consulted, or the batch's rows would clobber newer writes read-free.
+	const appliedDropKeys = new Set(
+		pendingSchemaMigrations
+			.filter(({ migration }) => migration.type === 'drop_table')
+			.map(({ migration }) => tableKey(migration.schema, migration.table)),
+	);
+
 	// PHASE 1b: Resolve all data changes (no writes yet). The clock watermark is merged
 	// once after a successful admission (see admitGroup below), not per changeset —
 	// resolution reads stored versions via compareHLC, never the live clock.
@@ -299,15 +312,18 @@ export async function applyChanges(
 			// Resolve it read-free rather than throwing from the keying resolver;
 			// Phase 3's metadata commit runs after the DDL, when the keying resolves.
 			//
-			// A table the batch DROPS AND RE-CREATES counts as fresh too, even when the
+			// A table this batch DROPS AND RE-CREATES counts as fresh too, even when the
 			// receiver already has it: post-batch it is a new, empty incarnation, and
 			// dropping a table does not purge its sync metadata — so resolving these rows
 			// against the dropped incarnation's cell versions and tombstones would let a
 			// stale tombstone silently discard them under the default
-			// `allowResurrection: false`. (The broader question of a re-created table
-			// INHERITING that bookkeeping — purge policy, relays, retention horizon — is
-			// tracked separately; this only stops the in-batch recreate consulting it.)
-			const freshLocalTable = !inBasis || (fate?.recreated ?? false);
+			// `allowResurrection: false`. Only when the drop is APPLIED here, though (see
+			// `appliedDropKeys`) — otherwise the re-create already happened and the
+			// surviving metadata is the CURRENT incarnation's. (The broader question of a
+			// re-created table INHERITING that bookkeeping — purge policy, relays,
+			// retention horizon — is tracked separately; this only stops the in-batch
+			// recreate consulting it.)
+			const freshLocalTable = !inBasis || (fate?.recreated === true && appliedDropKeys.has(key));
 
 			const resolved = await resolveChange(ctx, change, freshLocalTable);
 			if (freshLocalTable) resolved.freshLocalTable = true;
@@ -534,6 +550,11 @@ function emitRemoteChanges(
 		});
 	}
 }
+
+// NOTE: this file is 1144 lines (`wc -l`), second-largest in the package. The drain
+// block below (`drainHeldChanges` → `drainReappearedTables`) shares only `resolveChange`,
+// `reconcileInBatchDeletes`, `commitChangeMetadata`, and `admitGroup` with the wire-apply
+// half above, so it is the natural seam if the file keeps growing.
 
 /**
  * Replay held out-of-basis changes (`quarantine` + forwardable `store-and-forward`

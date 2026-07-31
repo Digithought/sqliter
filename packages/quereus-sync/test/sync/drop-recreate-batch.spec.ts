@@ -13,6 +13,11 @@
  * per-table verdict from the schema steps' HLCs (`computeBatchTableFates`) and reads it
  * at all three sites: the row-admission gate, `freshLocalTable`, and the reactive drain.
  *
+ * The `freshLocalTable` half of that verdict is deliberately narrow: read-free resolution
+ * skips the LWW comparison, so it is reserved for the batch whose `drop_table` this
+ * receiver actually applies. A re-delivered batch changes no local schema and must resolve
+ * normally.
+ *
  * Every spec here runs on real `Database` peers (`_peer-harness.ts`), so it asserts what
  * `select` returns, not what the metadata believes.
  */
@@ -191,6 +196,74 @@ describe('drop + re-create in one batch', () => {
 		}
 	});
 
+	// A primary key REUSED across the two incarnations. The receiver holds the dropped
+	// incarnation's row at that pk, so this pins both halves of "the rows land in the new
+	// incarnation": the drop reclaims the old row (no phantom survivor) and the new
+	// incarnation's write for the same pk lands, leaving the receiver equal to the origin.
+	it('lands a row whose primary key existed in the dropped incarnation', async () => {
+		const origin = await makePeer('origin');
+		const receiver = await makePeer('receiver');
+		try {
+			await localWrite(origin, WIDGETS_DDL);
+			await localWrite(origin, "insert into widgets (id, w) values (1, 'old')");
+			await relayAll(origin, receiver);
+			expect(await collect(receiver.db, 'select id, w from widgets'))
+				.to.deep.equal([{ id: 1, w: 'old' }]);
+
+			await localWrite(origin, 'drop table widgets');
+			await localWrite(origin, WIDGETS_DDL);
+			await localWrite(origin, "insert into widgets (id, w) values (1, 'new')");
+
+			const result = await receiver.manager.applyChanges(
+				await origin.manager.getChangesSince(receiver.manager.getSiteId()),
+			);
+
+			expect(result.unknownTable).to.be.undefined;
+			expect(await collect(receiver.db, 'select id, w from widgets'))
+				.to.deep.equal([{ id: 1, w: 'new' }]);
+			expect(await collect(receiver.db, 'select id, w from widgets'))
+				.to.deep.equal(await collect(origin.db, 'select id, w from widgets'));
+		} finally {
+			await closePeer(origin);
+			await closePeer(receiver);
+		}
+	});
+
+	// The other half of the `freshLocalTable` arm: read-free resolution skips the LWW
+	// comparison entirely, so it must be reserved for the batch that actually PERFORMS the
+	// re-create. A re-delivered batch's schema steps are all HLC-dominated and change no
+	// local schema — the local table is already the post-re-create incarnation and its
+	// metadata belongs to it, so the batch's rows have to lose to anything newer.
+	// Re-application is a live path, not a hypothetical (see
+	// `schema-replication-idempotency.spec.ts`: a peer re-applies the same batch on every
+	// sync until its watermark advances).
+	it('a re-delivered batch does not clobber a newer local write read-free', async () => {
+		const origin = await makePeer('origin');
+		const receiver = await makePeer('receiver');
+		try {
+			await localWrite(origin, WIDGETS_DDL);
+			await localWrite(origin, 'drop table widgets');
+			await localWrite(origin, WIDGETS_DDL);
+			await localWrite(origin, "insert into widgets (id, w) values (1, 'origin')");
+
+			const sets = await origin.manager.getChangesSince(receiver.manager.getSiteId());
+			await receiver.manager.applyChanges(sets);
+			expect(await collect(receiver.db, 'select id, w from widgets'))
+				.to.deep.equal([{ id: 1, w: 'origin' }]);
+
+			// A strictly newer local value for the same cell.
+			await localWrite(receiver, "update widgets set w = 'newer' where id = 1");
+
+			// The same batch again (a from-zero re-sync, or a duplicate relay hop).
+			await receiver.manager.applyChanges(sets);
+			expect(await collect(receiver.db, 'select id, w from widgets'))
+				.to.deep.equal([{ id: 1, w: 'newer' }]);
+		} finally {
+			await closePeer(origin);
+			await closePeer(receiver);
+		}
+	});
+
 	// The `freshLocalTable` arm. Dropping a table does NOT purge its sync metadata, so a
 	// receiver that already has `widgets` still holds the OLD incarnation's tombstone for
 	// pk 1. The re-created table is a new, empty incarnation, so its rows must resolve
@@ -199,8 +272,10 @@ describe('drop + re-create in one batch', () => {
 	//
 	// The tombstone is seeded by a LOCAL delete on the receiver, so the drop/re-create
 	// batch carries no delete of its own and the stored tombstone is the only blocker in
-	// play. (An in-batch delete from the dropped incarnation is a separate, still-open
-	// blocker — see the note in the review handoff.)
+	// play. An in-batch delete from the dropped incarnation is a separate, still-open
+	// blocker, as is a tombstone whose drop/re-create landed in an EARLIER batch (this
+	// arm is same-batch only) — both are
+	// `bug-sync-recreated-table-inherits-dropped-table-metadata`.
 	it('a stale tombstone from the dropped incarnation does not block the new one\'s row', async () => {
 		const origin = await makePeer('origin');
 		const receiver = await makePeer('receiver');

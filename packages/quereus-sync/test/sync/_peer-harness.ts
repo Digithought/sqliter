@@ -29,6 +29,19 @@ export function createInMemoryProvider(): { provider: KVStoreProvider; stores: M
 		async getCatalogStore() { return get('__catalog__'); },
 		async closeStore() {},
 		async closeIndexStore() {},
+		// A real provider reclaims a dropped table's physical storage. Without this the
+		// module falls back to `closeStore` (a no-op here) and `getStore` hands the
+		// re-created table the DROPPED incarnation's rows — so a drop/re-create spec
+		// would silently test a table that is not actually empty.
+		// Drop the map entry WITHOUT closing the handle (as
+		// `quereus-store/test/coordinator-callback-leak.spec.ts`'s provider does): the
+		// transaction coordinator keys buffered ops on the handle, and a drop in the same
+		// transaction as a write to that table still replays them at commit.
+		async deleteTableStores(s, t, indexNames) {
+			stores.delete(`${s}.${t}`);
+			stores.delete(`${s}.${t}.__stats__`);
+			for (const i of indexNames) stores.delete(`${s}.${t}_idx_${i}`);
+		},
 		async closeAll() {
 			for (const store of stores.values()) await store.close();
 			stores.clear();
