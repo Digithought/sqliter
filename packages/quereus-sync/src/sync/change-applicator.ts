@@ -78,27 +78,69 @@ function tableKey(schema: string, table: string): string {
 	return `${schema}.${table}`;
 }
 
+/** What this batch's schema steps leave behind for one `(schema, table)`. */
+interface BatchTableFate {
+	/** The table exists after this batch's schema steps replay in timestamp order. */
+	present: boolean;
+	/**
+	 * A `drop_table` precedes the deciding `create_table`, so the post-batch table is a
+	 * NEW, EMPTY incarnation — its rows must not resolve against the dropped
+	 * incarnation's cell versions and tombstones (dropping a table does not purge its
+	 * sync metadata).
+	 */
+	recreated: boolean;
+}
+
 /**
- * In-batch table delta from the batch's schema migrations: `create_table` adds a
- * table, `drop_table` removes one. Detection runs at Phase 1 (before any DDL
- * executes in Phase 2), so a referenced table is "known" if it is in the current
- * basis OR created by this batch, AND not dropped by this batch. Computed over the
- * WHOLE batch because admission applies all schema changes before all data.
+ * Per-table verdict on what this batch's schema migrations leave behind, keyed
+ * `schema.table`. Tables with no `create_table` / `drop_table` step in the batch are
+ * absent from the map (only those two kinds change whether a table exists — there is
+ * no rename in {@link SchemaMigrationType} — so the other kinds are ignored here).
+ *
+ * Detection runs at Phase 1, before any DDL executes in Phase 2, so the verdict has to
+ * be derived from the steps' HLCs rather than observed: `present` is decided by the
+ * table's LAST create/drop step in timestamp order — the same total order
+ * {@link orderMigrationsByHLC} replays them in — not by set membership, so a
+ * create → drop → create batch correctly reports the table present. Computed over the
+ * WHOLE batch because admission applies all schema changes before all data, including
+ * migrations Phase 1a later skips as HLC-dominated: a skipped migration means the
+ * receiver already reached that state, so the verdict is unchanged.
  */
-function computeBatchTableDelta(changes: ChangeSet[]): { created: Set<string>; dropped: Set<string> } {
-	const created = new Set<string>();
-	const dropped = new Set<string>();
+function computeBatchTableFates(changes: ChangeSet[]): Map<string, BatchTableFate> {
+	// Per table: the max-HLC create/drop step (which decides existence) and the max-HLC
+	// drop (which decides whether the surviving table is a new incarnation).
+	const lastStep = new Map<string, SchemaMigration>();
+	const lastDrop = new Map<string, SchemaMigration>();
 	for (const changeSet of changes) {
 		for (const migration of changeSet.schemaMigrations) {
+			if (migration.type !== 'create_table' && migration.type !== 'drop_table') continue;
 			const key = tableKey(migration.schema, migration.table);
-			if (migration.type === 'create_table') {
-				created.add(key);
-			} else if (migration.type === 'drop_table') {
-				dropped.add(key);
-			}
+			keepLatestStep(lastStep, key, migration);
+			if (migration.type === 'drop_table') keepLatestStep(lastDrop, key, migration);
 		}
 	}
-	return { created, dropped };
+
+	const fates = new Map<string, BatchTableFate>();
+	for (const [key, step] of lastStep) {
+		const present = step.type === 'create_table';
+		const drop = lastDrop.get(key);
+		fates.set(key, {
+			present,
+			recreated: present && drop !== undefined && compareHLC(drop.hlc, step.hlc) < 0,
+		});
+	}
+	return fates;
+}
+
+/**
+ * Keep the migration that replays LAST for a key. Ties keep the later-arriving one,
+ * matching {@link orderMigrationsByHLC}'s stable sort (equal HLCs stay in arrival
+ * order, so the last of them executes last) — unlike {@link keepMaxHLC}, which keeps
+ * the first of a tie because it collapses repeats of ONE fact.
+ */
+function keepLatestStep(latest: Map<string, SchemaMigration>, key: string, migration: SchemaMigration): void {
+	const prev = latest.get(key);
+	if (!prev || compareHLC(migration.hlc, prev.hlc) >= 0) latest.set(key, migration);
 }
 
 /**
@@ -124,9 +166,10 @@ function computeBatchTableDelta(changes: ChangeSet[]): { created: Set<string>; d
  * FIRST changeset that referenced the table as the straggler origin, so a reordered
  * batch can name a different relayer — telemetry only, never a stored fact.
  *
- * Unknown-table disposition: a change referencing a table outside the local basis
- * (a retired-table straggler delta — see `docs/migration.md` § 4 Contract) is
- * **diverted** during resolution — never resolved, applied, or recorded as CRDT
+ * Unknown-table disposition: a change referencing a table the batch leaves absent — not
+ * in the local basis and not created by this batch's schema steps (a retired-table
+ * straggler delta — see `docs/migration.md` § 4 Contract) — is **diverted** during
+ * resolution — never resolved, applied, or recorded as CRDT
  * metadata, so the change log stays clean (no survivor-HLC pollution). Diverted
  * changes are held (durably, idempotently — `quarantine`, or `store-and-forward`
  * which additionally marks them forwardable) or ignored per
@@ -155,7 +198,7 @@ export async function applyChanges(
 	// path, grouped per table for disposition + telemetry.
 	const unknownByTable = new Map<string, UnknownTableGroup>();
 
-	const { created: batchCreated, dropped: batchDropped } = computeBatchTableDelta(changes);
+	const batchFates = computeBatchTableFates(changes);
 
 	// Pre-commit drift validation: reject a batch whose maximum fact HLC is beyond the
 	// drift bound BEFORE any resolution, data write, or CRDT metadata commit — so a peer
@@ -230,13 +273,16 @@ export async function applyChanges(
 				continue;
 			}
 
-			// Structural unknown-table detection: in the current basis OR created by
-			// this batch, AND not dropped by this batch. Diverted changes never reach
+			// Structural unknown-table detection: a table this batch creates or drops is
+			// known iff the batch's schema steps leave it PRESENT (its last create/drop
+			// step in timestamp order is a create_table); one the batch does not touch
+			// falls back to the current basis. Diverted changes never reach
 			// resolveChange / dataChangesToApply / commitChangeMetadata, so no CRDT
 			// metadata is written for a table the receiver does not have.
 			const key = tableKey(change.schema, change.table);
 			const inBasis = ctx.isTableInBasis(change.schema, change.table);
-			const known = (inBasis || batchCreated.has(key)) && !batchDropped.has(key);
+			const fate = batchFates.get(key);
+			const known = fate ? fate.present : inBasis;
 			if (!known) {
 				let group = unknownByTable.get(key);
 				if (!group) {
@@ -252,7 +298,16 @@ export async function applyChanges(
 			// — and, being locally fresh, no local metadata to resolve against either.
 			// Resolve it read-free rather than throwing from the keying resolver;
 			// Phase 3's metadata commit runs after the DDL, when the keying resolves.
-			const freshLocalTable = !inBasis;
+			//
+			// A table the batch DROPS AND RE-CREATES counts as fresh too, even when the
+			// receiver already has it: post-batch it is a new, empty incarnation, and
+			// dropping a table does not purge its sync metadata — so resolving these rows
+			// against the dropped incarnation's cell versions and tombstones would let a
+			// stale tombstone silently discard them under the default
+			// `allowResurrection: false`. (The broader question of a re-created table
+			// INHERITING that bookkeeping — purge policy, relays, retention horizon — is
+			// tracked separately; this only stops the in-batch recreate consulting it.)
+			const freshLocalTable = !inBasis || (fate?.recreated ?? false);
 
 			const resolved = await resolveChange(ctx, change, freshLocalTable);
 			if (freshLocalTable) resolved.freshLocalTable = true;
@@ -350,15 +405,17 @@ export async function applyChanges(
 	// first, held changes LWW-resolve against it) — instead of waiting up to one
 	// periodic-sweep interval. Only applied migrations are in `pendingSchemaMigrations`
 	// (an HLC-dominated create_table `continue`s before being pushed), so a losing
-	// create never triggers a drain. A create+drop in the same batch leaves the table
-	// absent, so its key is skipped to avoid a wasted scoped `quarantine.list`.
+	// create never triggers a drain. A batch whose schema steps leave the table ABSENT
+	// (a trailing drop_table) has its key skipped to avoid a wasted scoped
+	// `quarantine.list` — a drop-then-create batch leaves it PRESENT and does drain.
 	// Advisory: `drainReappearedTables` logs + swallows any failure, so a drain throw
 	// never turns this successful apply into an error.
 	const reappeared = new Map<string, { schema: string; table: string }>();
 	for (const { migration } of pendingSchemaMigrations) {
 		if (migration.type !== 'create_table') continue;
 		const key = tableKey(migration.schema, migration.table);
-		if (batchDropped.has(key)) continue;
+		const fate = batchFates.get(key);
+		if (fate && !fate.present) continue;
 		if (!reappeared.has(key)) reappeared.set(key, { schema: migration.schema, table: migration.table });
 	}
 	await drainReappearedTables(ctx, [...reappeared.values()]);

@@ -109,7 +109,7 @@ describe('schema DDL replication', () => {
 
 		it('applies alongside row changes for the dropped table without resurrecting it', async () => {
 			// DDL runs before DML, so the batch's own drop makes `orders` unknown for
-			// the data phase (`computeBatchTableDelta`) and its rows divert instead of
+			// the data phase (`computeBatchTableFates`) and its rows divert instead of
 			// hitting a missing table. Previously unexercised: the drop was a no-op.
 			await localWrite(a, "insert into orders values (1, 'from A')");
 			await localWrite(a, 'drop table orders');
