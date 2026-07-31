@@ -10,6 +10,7 @@
 
 import type {
 	CompiledPredicate,
+	EffectiveRowSource,
 	KeyNormalizer,
 	KeyNormalizerResolver,
 	Row,
@@ -26,8 +27,9 @@ import {
 	resolvePkKeyTransforms,
 	storeSemanticKeyTransform,
 } from './pk-key-resolution.js';
-import { buildDataKey, buildIndexKey } from './key-builder.js';
+import { buildDataKey, buildFullScanBounds, buildIndexKey } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
+import type { StoreTable } from './store-table.js';
 // NOTE: this one constant is the only thing tying this file to the module chain (the graph
 // stays acyclic — the base layer is a leaf). If these helpers ever need to be usable without
 // loading the chain, move `DEFAULT_MAX_BATCH_BYTES` to a constants leaf and have the base
@@ -242,6 +244,20 @@ export async function* rowsFromEntries(entries: AsyncIterable<KVEntry>): AsyncIt
 	for await (const entry of entries) {
 		yield deserializeRow(entry.value);
 	}
+}
+
+/**
+ * The rows a DDL-issuing connection can SEE, as every pre-mutation probe in the ALTER
+ * path needs them: a wrapper module's `EffectiveRowSource` when the isolation layer
+ * holds this transaction's staged rows outside the store, else this table's own
+ * effective stream (committed rows merged with the module's buffered puts/deletes).
+ *
+ * One fresh stream per call — an async generator is single-shot, and an
+ * `EffectiveRowSource` is re-callable for exactly that reason, so a probe that needs
+ * two walks calls this twice.
+ */
+export function effectiveDdlRows(table: StoreTable, rows?: EffectiveRowSource): AsyncIterable<Row> {
+	return rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds()));
 }
 
 /**

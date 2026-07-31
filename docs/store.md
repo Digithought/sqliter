@@ -523,8 +523,20 @@ schema entry points:
   row stream) throws `CONSTRAINT` naming the key; a collision confined to committed rows the
   transaction has *deleted* — rows a `rollback` must restore, which a re-keyed store cannot
   hold — throws `BUSY` ("commit/rollback and retry"). Either refusal leaves the store, the
-  catalog, and the enclosing transaction untouched. A target equal to the column's current
+  catalog, and the enclosing transaction untouched. "Deleted" covers a delete staged in an
+  isolation wrapper's overlay *and* one buffered in this module's own coordinator, so the
+  bare module answers `BUSY` here too rather than flushing the delete and re-keying — which
+  would spend the transaction's rollback silently. A target equal to the column's current
   collation is a schema-only no-op (no re-key).
+
+  An ACCEPTED re-key is still not transactional: the new collation and the re-keyed
+  stores are durable the moment the statement returns, while the issuing transaction's
+  own row changes remain undoable. A `rollback` afterwards therefore restores rows the
+  probes judged deleted — including, where a UNIQUE index covers the altered column, rows
+  that violate it under the new collation. The data store and the index still describe the
+  same rows (index entry keys carry the PK suffix, so no row is displaced); the memory
+  backend leaves the same state for the same statement sequence, since its secondary
+  structures are multi-maps and its DDL is equally non-transactional.
 
 The store carries no on-disk format version stamp and no rebuild-on-open path: a store whose
 non-textual PK bytes were written under any collation but BINARY must be recreated.

@@ -879,6 +879,8 @@ The drops go through the overlay's ordinary write path, so its layer chain and s
 
 Some shapes remain unrepresentable and are refused as retryable `BUSY` — notably when a savepoint could restore both a marker and its replacement at one re-keyed key. That refusal comes from the overlay module's own representability check, is the same answer a plain (non-isolated) memory table gives for the equivalent statement sequence, and — thanks to the tier-2 pre-flight — arrives before the shared table mutates, leaving the transaction intact.
 
+The **underlying** can raise `BUSY` for the same statement too, and for the mirror-image reason: the transaction staged only a deletion marker, so the underlying still holds both committed rows a `rollback` must restore and cannot re-key them onto one key. The memory module answers from its layer chain and the store from its committed rows (`StoreTable.validateRekeyedPrimaryKey`; see [store.md](store.md) § `ALTER COLUMN … SET COLLATE` on a PK column). Both are pre-mutation, so this `BUSY` also leaves the transaction usable — it is the issuer-facing refusal referenced above as "a retryable `BUSY` … a condition the isolation layer's validation pass never claimed to judge".
+
 ##### ALTER PRIMARY KEY: the one change no overlay can follow
 
 An overlay's layer trees are keyed by the table's **old** primary key, and a staged deletion marker identifies the row it deletes *by that key* — under a new key its identity columns may be placeholder NULLs, i.e. garbage. So `alter primary key` cannot be forwarded to an overlay at all, and gets its own three-way handling:

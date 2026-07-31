@@ -30,9 +30,8 @@ import {
 import { StoreTable } from './store-table.js';
 import { storeSemanticKeyTransform } from './pk-key-resolution.js';
 import { withImplicitUniqueIndexes } from './implicit-unique-index.js';
-import { buildFullScanBounds } from './key-builder.js';
 import { StoreModuleIndex } from './store-module-index.js';
-import { rowsFromEntries, validateUniqueOverExistingRows } from './store-module-index-build.js';
+import { effectiveDdlRows, validateUniqueOverExistingRows } from './store-module-index-build.js';
 
 /**
  * Result of an {@link alterColumnChange} attribute sub-branch: the rewritten
@@ -169,9 +168,8 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 				.filter(uc => uc.columns.includes(colIndex));
 			for (const uc of coveringConstraints) {
-				// Fresh generator per constraint — an async generator is single-shot. An
-				// `EffectiveRowSource` is re-callable for exactly this reason.
-				const effectiveRows = rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds()));
+				// Fresh generator per constraint — an async generator is single-shot.
+				const effectiveRows = effectiveDdlRows(table, rows);
 				await validateUniqueOverExistingRows(
 					valueConvert ? convertRowsAtIndex(effectiveRows, colIndex, valueConvert) : effectiveRows,
 					updatedSchema,
@@ -205,7 +203,7 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			await table.validateRekeyedPrimaryKey(
 				oldSchema.primaryKeyDefinition,
 				updatedSchema.columns,
-				rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
+				effectiveDdlRows(table, rows),
 			);
 			// Physical re-key ahead — flush buffered writes (see
 			// `StoreModuleBase.ddlCommitPendingOps`). Every refusal this arm can make has

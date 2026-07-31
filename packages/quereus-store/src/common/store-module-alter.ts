@@ -37,9 +37,8 @@ import {
 } from '@quereus/quereus';
 import { StoreTable } from './store-table.js';
 import { withImplicitUniqueIndexes } from './implicit-unique-index.js';
-import { buildFullScanBounds } from './key-builder.js';
 import { StoreModuleAlterColumn } from './store-module-alter-column.js';
-import { rowsFromEntries, validateUniqueOverExistingRows } from './store-module-index-build.js';
+import { effectiveDdlRows, validateUniqueOverExistingRows } from './store-module-index-build.js';
 import { buildColumnRemap, renameColumnInSelfForeignKeys } from './store-module-schema-rewrite.js';
 
 export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
@@ -514,7 +513,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			// the transaction survives a CONSTRAINT rejection.
 			const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
 			await validateUniqueOverExistingRows(
-				rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
+				effectiveDdlRows(table, rows),
 				oldSchema,
 				uc,
 				db.getKeyNormalizerResolver(),

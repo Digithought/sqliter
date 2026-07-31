@@ -127,9 +127,9 @@ export class StoreTable extends StoreTableConstraints {
 	 * creating) a semantic-ordering member must collapse equal spellings, so
 	 * 'PT1H'/'PT60M' land on one key and are judged as the duplicate they are.
 	 */
-	rekeyedKeyComputer(
+	private rekeyedKeyComputer(
 		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
-		newColumns: ReadonlyArray<ColumnSchema> = this.tableSchema!.columns,
+		newColumns: ReadonlyArray<ColumnSchema>,
 	): (row: Row) => Uint8Array {
 		const newPkDirections = newPkDef.map(pk => !!pk.desc);
 		const newPkCollations = resolvePkKeyCollations(
@@ -161,13 +161,25 @@ export class StoreTable extends StoreTableConstraints {
 	 *     when the transaction has deleted one of them → `BUSY`, with the memory
 	 *     module's "commit/rollback and retry" posture.
 	 *
-	 * Probe order is what makes the statuses right: the committed probe fires only
-	 * when the effective probe passed, i.e. only when the committed rows are NOT a
-	 * subset of the effective ones — which happens exactly when a wrapper's
-	 * transaction deleted a committed row. Run without a wrapper, effective ⊇
-	 * committed, so a committed collision always reports `CONSTRAINT` via the first
-	 * probe. Both probes key through {@link rekeyedKeyComputer}, so they and the
-	 * re-key agree byte-for-byte.
+	 * Probe order is what makes the statuses right, with no backend sniffing: the
+	 * committed probe can only fire once the effective one passed, i.e. only when the
+	 * committed rows are NOT a subset of the effective ones — which happens exactly
+	 * when the transaction has DELETED a committed row (staged in a wrapper's overlay,
+	 * or buffered in this module's own coordinator). A collision among rows the
+	 * transaction can still see therefore always reports `CONSTRAINT`, never `BUSY`.
+	 *
+	 * The buffered-delete case makes the bare module stricter than it used to be: the
+	 * old post-flush pass committed the delete first and then re-keyed happily, quietly
+	 * spending the transaction's rollback. It now refuses with the same `BUSY` the
+	 * wrapped path gives, and `commit; <retry>` still lands the change.
+	 *
+	 * Both probes key through {@link rekeyedKeyComputer}, so they and the re-key agree
+	 * byte-for-byte.
+	 *
+	 * NOTE: these two probes put the SET COLLATE re-key at four full table scans (two
+	 * here, then {@link rekeyRows}' pass 1 backstop and pass 2), each holding one hex
+	 * key signature per row. Fine for a statement this rare; if a huge table ever makes
+	 * it slow, drop pass 1 for callers that pre-validated — it cannot fire for them.
 	 */
 	async validateRekeyedPrimaryKey(
 		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
