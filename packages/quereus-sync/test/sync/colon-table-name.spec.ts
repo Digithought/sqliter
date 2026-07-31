@@ -84,6 +84,47 @@ describe('colon table name (quoted identifier containing a colon)', () => {
 		}
 	});
 
+	it('two tables whose punctuation-joined grouping keys collide both converge', async () => {
+		// The in-batch collapse maps in `change-applicator.ts` used to key a row by
+		// `{schema}.{table}:{identity}`, which two DIFFERENT tables can spell alike:
+		// table `a` with pk 'b:s:1' encodes to `main.a:s:b:s:1`, and so does table
+		// `a:s:b` with pk '1' (the identity carries an `s:` type tag). Both rows change
+		// in ONE transaction, so both reach one collapse map. Only the max-HLC winner's
+		// metadata is written, so the loser's row landed in the receiver's store but
+		// acquired no `cv:`/`cl:` records — it would never relay onward and would be
+		// wiped by the next snapshot apply.
+		const p1 = await makePeer('p1');
+		const p2 = await makePeer('p2');
+		try {
+			for (const p of [p1, p2]) {
+				await p.db.exec('create table a (id text primary key, v text) using store');
+				await p.db.exec('create table "a:s:b" (id text primary key, v text) using store');
+			}
+
+			await localWrite(p1, `begin;
+				insert into a values ('b:s:1', 'from-a');
+				insert into "a:s:b" values ('1', 'from-colon');
+				commit;`);
+			await relay(p1, p2);
+
+			expect(await collect(p2.db, `select v from a`), 'table "a" converged').to.deep.equal([{ v: 'from-a' }]);
+			expect(await collect(p2.db, `select v from "a:s:b"`), 'table "a:s:b" converged')
+				.to.deep.equal([{ v: 'from-colon' }]);
+
+			// Both rows must also carry their own bookkeeping, or they are invisible to
+			// every downstream sync path.
+			const snapshot = await p2.manager.getSnapshot();
+			for (const table of ['a', 'a:s:b']) {
+				const entry = snapshot.tables.find(t => t.table === table);
+				void expect(entry, `${table} is in the receiver's snapshot`).to.exist;
+				expect(entry!.columnVersions.length, `${table} kept its column versions`).to.be.greaterThan(0);
+			}
+		} finally {
+			await closePeer(p1);
+			await closePeer(p2);
+		}
+	});
+
 	it('getSnapshot() and getSnapshotStream() carry the full colon name, tombstones included', async () => {
 		const p1 = await makePeer('p1');
 		try {

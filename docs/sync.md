@@ -379,7 +379,10 @@ repeats within one local transaction (§ Write side → *Local capture reads its
 writes*); and **in-batch collapse** on apply (`commitChangeMetadata`), where two versions
 of one key in a single `applyChanges` call resolve against the same pre-batch prior
 version, so only the max-HLC winner per key is written (e.g. concurrent deletes of the
-same pk relayed together).
+same pk relayed together). Those in-memory collapse keys are built with the same
+length-prefixed join as the stored keys (§ *Storage layout*) — punctuation-joining
+`(schema, table, identity)` would let rows of two differently-named tables collapse onto
+one winner and leave the loser in the store with no bookkeeping at all.
 
 **Entries die with their target.** The change log is a *derived index* over the live
 `cv:`/`tb:` records — `resolveLogEntry` returns `null` for an entry whose record is

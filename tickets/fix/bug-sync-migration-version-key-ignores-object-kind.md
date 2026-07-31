@@ -43,6 +43,14 @@ Two plausible directions, worth weighing before implementing:
   `drop table` ambiguity — but it is a user-visible restriction, and it does
   nothing for databases that already contain such a collision.
 
+Note on the key layout, if the "widen the key" direction is chosen: the migration
+key was reworked since this ticket was filed. Every variable-length component is
+now written as `{length}:{text}` (`joinKeyParts` in
+`packages/quereus-sync/src/metadata/keys.ts`), and the stored-format version
+(`SYNC_METADATA_FORMAT_VERSION`) was raised to **3** for it. An object-kind
+component should be added as one more length-prefixed part and the format version
+raised to **4** — not to 3, which is taken.
+
 Related but distinct: index-vs-index collisions on this same key are addressed by
 enforcing per-schema index-name uniqueness (`index-names-unique-per-schema`).
 This ticket is only about the cross-kind case that enforcement leaves open.

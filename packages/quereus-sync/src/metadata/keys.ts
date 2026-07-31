@@ -23,6 +23,8 @@ import { type SiteId, siteIdToBase64, siteIdFromBase64 } from '../clock/site.js'
 import type { HLC } from '../clock/hlc.js';
 
 const encoder = new TextEncoder();
+/** Shared: the parsers below run once per key across whole-prefix scans. */
+const decoder = new TextDecoder();
 
 /** Key prefix bytes for sync metadata. */
 export const SYNC_KEY_PREFIX = {
@@ -237,7 +239,7 @@ export function buildPeerSentStateKey(siteId: SiteId): Uint8Array {
  * Returns null for a key outside those prefixes or with a malformed suffix.
  */
 export function parsePeerStateKey(key: Uint8Array): SiteId | null {
-  const keyStr = new TextDecoder().decode(key);
+  const keyStr = decoder.decode(key);
   if (!keyStr.startsWith('ps:') && !keyStr.startsWith('pt:')) return null;
   try {
     return siteIdFromBase64(keyStr.slice(3));
@@ -393,7 +395,7 @@ export function parseColumnVersionKey(key: Uint8Array): {
   identity: string;
   column: string;
 } | null {
-  const keyStr = new TextDecoder().decode(key);
+  const keyStr = decoder.decode(key);
   if (!keyStr.startsWith('cv:')) return null;
 
   const split = splitKeyParts(keyStr.slice(3), 4);
@@ -415,7 +417,7 @@ export function parseTombstoneKey(key: Uint8Array): {
   table: string;
   identity: string;
 } | null {
-  const keyStr = new TextDecoder().decode(key);
+  const keyStr = decoder.decode(key);
   if (!keyStr.startsWith('tb:')) return null;
 
   const split = splitKeyParts(keyStr.slice(3), 3);
@@ -434,7 +436,7 @@ export function parseSchemaMigrationKey(key: Uint8Array): {
   table: string;
   version: number;
 } | null {
-  const keyStr = new TextDecoder().decode(key);
+  const keyStr = decoder.decode(key);
   if (!keyStr.startsWith('sm:')) return null;
 
   const split = splitKeyParts(keyStr.slice(3), 2);
@@ -574,7 +576,7 @@ export function parseChangeLogKey(key: Uint8Array): {
   // Minimum: cl: (3) + hlc (30) + type (1) + some suffix
   if (key.length < 35) return null;
 
-  const prefixStr = new TextDecoder().decode(key.slice(0, 3));
+  const prefixStr = decoder.decode(key.slice(0, 3));
   if (prefixStr !== 'cl:') return null;
 
   const hlcBytes = key.slice(3, 33);
@@ -583,7 +585,7 @@ export function parseChangeLogKey(key: Uint8Array): {
   const typeByte = key[33];
   const entryType: ChangeLogEntryType = typeByte === 0x01 ? 'column' : 'delete';
 
-  const suffixStr = new TextDecoder().decode(key.slice(34));
+  const suffixStr = decoder.decode(key.slice(34));
 
   // Parse suffix: {n}:{schema}{n}:{table}{n}:{identity}[{n}:{column}]
   const split = splitKeyParts(suffixStr, entryType === 'column' ? 4 : 3);

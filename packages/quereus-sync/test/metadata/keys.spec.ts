@@ -1,11 +1,14 @@
 /**
- * Tests for change-log key encoding.
+ * Tests for sync metadata key encoding.
  *
- * These assert the load-bearing invariant of the HLC-indexed change log:
- * the lexicographic byte order of the keys MUST equal `compareHLC`, so that a
- * range scan over the key space visits entries in HLC order. The opSeq bytes
- * sit after siteId (the last tiebreak), so they must round-trip and must order
- * facts of the same transaction.
+ * Two load-bearing invariants:
+ *  - the lexicographic byte order of `cl:` keys MUST equal `compareHLC`, so that a
+ *    range scan over the key space visits entries in HLC order. The opSeq bytes sit
+ *    after siteId (the last tiebreak), so they must round-trip and must order facts
+ *    of the same transaction;
+ *  - every variable-length component (schema, table, pk identity, column) is
+ *    length-prefixed, so a name containing `:` or `.` can neither shift a parse nor
+ *    let one table's scan bounds swallow another's keys.
  */
 
 import { expect } from 'chai';
@@ -326,6 +329,47 @@ describe('change-log key encoding', () => {
           expect(del!.column).to.be.undefined;
         }
       }
+    });
+  });
+
+  describe('empty components and malformed keys', () => {
+    it('a zero-length column still round-trips as a present component', () => {
+      // The builders test `column !== undefined`, not truthiness: an empty column
+      // must still emit its (empty) component, or a `column` entry would carry 3
+      // parts where the parser demands 4 and read back as unparseable.
+      const identity = encodeRawPkIdentity([1]);
+      const cv = parseColumnVersionKey(buildColumnVersionKey('main', 't', identity, ''));
+      expect(cv!.column).to.equal('');
+
+      const hlc = createHLC(1000n, 1, siteA, 0);
+      const cl = parseChangeLogKey(buildChangeLogKey(hlc, 'column', 'main', 't', identity, ''));
+      expect(cl, 'an empty column name is still a parseable column entry').to.not.be.null;
+      expect(cl!.column).to.equal('');
+      expect(cl!.identity).to.equal(identity);
+    });
+
+    it('empty schema, table and identity round-trip', () => {
+      const cv = parseColumnVersionKey(buildColumnVersionKey('', '', '', ''));
+      expect(cv!).to.deep.equal({ schema: '', table: '', identity: '', column: '' });
+      expect(parseTombstoneKey(buildTombstoneKey('', '', ''))!)
+        .to.deep.equal({ schema: '', table: '', identity: '' });
+    });
+
+    it('parsers reject a foreign prefix, a truncated key, and the old v2 layout', () => {
+      const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+      // Wrong family.
+      expect(parseColumnVersionKey(enc('tb:4:main1:t'))).to.be.null;
+      // Length runs past the end of the key.
+      expect(parseColumnVersionKey(enc('cv:99:main'))).to.be.null;
+      // Non-numeric length, and a leading separator.
+      expect(parseTombstoneKey(enc('tb:x:main'))).to.be.null;
+      expect(parseTombstoneKey(enc('tb::main'))).to.be.null;
+      // Trailing bytes beyond the declared components.
+      expect(parseTombstoneKey(enc('tb:1:a1:b1:c!'))).to.be.null;
+      // A version-2 key (bare `.`/`:` layout) must not read back as version 3.
+      expect(parseColumnVersionKey(enc('cv:main.t:3:s:1:v'))).to.be.null;
+      expect(parseTombstoneKey(enc('tb:main.t:s:1'))).to.be.null;
+      expect(parseSchemaMigrationKey(enc('sm:main.t:0000000007'))).to.be.null;
     });
   });
 

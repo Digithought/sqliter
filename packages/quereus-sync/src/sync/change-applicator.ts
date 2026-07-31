@@ -12,7 +12,7 @@ import { compareHLC, maxHLC, assertWithinDrift } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
-import { encodePkIdentity, RAW_PK_KEYING } from '../metadata/keys.js';
+import { encodePkIdentity, joinKeyParts, RAW_PK_KEYING } from '../metadata/keys.js';
 import type {
 	ChangeSet,
 	Change,
@@ -1010,10 +1010,15 @@ export async function commitChangeMetadata(
  * collapse runs post-DDL with the resolved keying; for a fresh table with
  * collation-variant pk spellings in ONE batch the two groupings can disagree, an
  * edge accepted here.)
+ *
+ * Components are length-prefixed ({@link joinKeyParts}), not punctuation-joined, for
+ * the same reason the on-disk keys are: a table name may contain `:` or `.` and a pk
+ * identity contains both, so a `{schema}.{table}:{identity}` join would let two rows
+ * of DIFFERENT tables collapse onto one winner and silently drop a change.
  */
 function rowIdentityKey(ctx: SyncContext, change: Change, freshLocalTable?: boolean): string {
 	const keying = freshLocalTable ? RAW_PK_KEYING : ctx.getPkKeying(change.schema, change.table);
-	return `${change.schema}.${change.table}:${encodePkIdentity(change.pk, keying)}`;
+	return joinKeyParts(change.schema, change.table, encodePkIdentity(change.pk, keying));
 }
 
 /** Stable per-pk key for collapsing repeated delete entries within one batch. */
@@ -1023,7 +1028,7 @@ function deleteKey(ctx: SyncContext, change: RowDeletion): string {
 
 /** Stable per-(pk, column) key for collapsing repeated column entries within one batch. */
 function columnKey(ctx: SyncContext, change: ColumnChange): string {
-	return `column:${rowIdentityKey(ctx, change)}:${change.column}`;
+	return `column:${rowIdentityKey(ctx, change)}${joinKeyParts(change.column)}`;
 }
 
 /** Keep the max-HLC resolved change per key, collapsing in-batch repeats to one winner. */
