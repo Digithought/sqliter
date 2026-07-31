@@ -204,14 +204,28 @@ describe('Store key bytes under a database-registered collation', () => {
 		expect(rows.map(r => r.id)).to.deep.equal([1, 2]);
 	});
 
-	it('rejects a secondary index over a text column when K cannot key', async () => {
-		// The mirror of the above: `v` can hold text, so its index bytes are encoded
-		// under K. An unusable K must be rejected rather than reached at write time.
+	it('an undecorated text index column keys BINARY — an unusable K no longer blocks it', async () => {
+		// Index-column bytes encode under the column's own effective collation (BINARY
+		// for an undecorated text column — see resolveIndexKeyCollations), so a
+		// comparator-only override of K = NOCASE is never consulted and must not make
+		// the index uncreatable.
 		db.registerCollation('NOCASE', noSpace);
 		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`insert into t values (1, 'x'), (2, 'y')`);
 
-		const err = await attempt(db, `create index ix_v on t (v)`);
-		expect(err, 'expected CREATE INDEX to reject the unusable key collation').to.not.be.null;
+		expect(await attempt(db, `create index ix_v on t (v)`)).to.be.null;
+		expect((await db.get(`select id from t where v = 'y'`))?.id).to.equal(2);
+	});
+
+	it('rejects a secondary index whose own column collation cannot key', async () => {
+		// The collation the index bytes DO encode under — the column's declared one —
+		// must carry a key normalizer, and is rejected at CREATE INDEX rather than
+		// reached at write time.
+		db.registerCollation('NOCASE', noSpace);
+		await db.exec(`create table t (id integer primary key, w text collate NOCASE) using store`);
+
+		const err = await attempt(db, `create index ix_w on t (w)`);
+		expect(err, 'expected CREATE INDEX to reject the comparator-only key collation').to.not.be.null;
 		expect(err!.message).to.match(/cannot key a persisted structure/i);
 	});
 

@@ -140,35 +140,44 @@ export function buildDataKey(
 }
 
 /**
+ * One half of a secondary-index key — the index-column prefix or the PK suffix.
+ * Each half carries its own per-column DESC `directions`, key `collations`
+ * (overriding `options.collation`; see {@link encodeCompositeKey}), and
+ * {@link KeyValueTransform}s, positionally aligned with `values`.
+ */
+export interface IndexKeyHalf {
+	values: SqlValue[];
+	directions?: ReadonlyArray<boolean>;
+	collations?: ReadonlyArray<string | undefined>;
+	transforms?: ReadonlyArray<KeyValueTransform | undefined>;
+}
+
+/**
  * Build a secondary index key.
  * Format: {encoded_index_cols}{encoded_pk}
  *
  * The index columns come first for range scans, followed by PK for uniqueness.
- * `indexDirections` and `pkDirections` independently control DESC bit-inversion
- * for each half so ordered index scans honor per-column direction.
+ * The two halves are symmetric {@link IndexKeyHalf}s:
  *
- * `pkCollations[i]`, when defined, encodes the PK-suffix column i under its own
- * key collation (overriding `options.collation`). The PK suffix MUST be encoded
- * with the same per-column collations as the data key (see `buildDataKey`), so
- * index maintenance (delete-then-insert on UPDATE/DELETE) addresses the same
- * bytes the data store keys by. Index columns keep `options.collation`.
- *
- * `indexTransforms` / `pkTransforms` canonicalize each half's values before
- * encoding (see {@link KeyValueTransform}); the PK-suffix transforms MUST match
- * the data key's for the same reason as the collations above.
+ * - `index.collations` encodes each index column under its own key collation
+ *   (`resolveIndexKeyCollations` — the index column's COLLATE, else the table
+ *   column's declared collation, else BINARY), so the stored bytes agree with the
+ *   collation everything that COMPARES those values uses (`matchesFilters`, the
+ *   planner's cover analysis, UNIQUE enforcement).
+ * - `pk.collations` MUST be the same per-column collations as the data key (see
+ *   `buildDataKey` / `resolvePkKeyCollations`), so index maintenance
+ *   (delete-then-insert on UPDATE/DELETE) addresses the same bytes the data store
+ *   keys by.
+ * - Each half's `transforms` canonicalize its values before encoding; the PK
+ *   suffix's MUST match the data key's for the same reason as its collations.
  */
 export function buildIndexKey(
-	indexValues: SqlValue[],
-	pkValues: SqlValue[],
+	index: IndexKeyHalf,
+	pk: IndexKeyHalf,
 	options?: EncodeOptions,
-	indexDirections?: ReadonlyArray<boolean>,
-	pkDirections?: ReadonlyArray<boolean>,
-	pkCollations?: ReadonlyArray<string | undefined>,
-	indexTransforms?: ReadonlyArray<KeyValueTransform | undefined>,
-	pkTransforms?: ReadonlyArray<KeyValueTransform | undefined>,
 ): Uint8Array {
-	const indexEncoded = encodeCompositeKey(indexValues, options, indexDirections, undefined, indexTransforms);
-	const pkEncoded = encodeCompositeKey(pkValues, options, pkDirections, pkCollations, pkTransforms);
+	const indexEncoded = encodeCompositeKey(index.values, options, index.directions, index.collations, index.transforms);
+	const pkEncoded = encodeCompositeKey(pk.values, options, pk.directions, pk.collations, pk.transforms);
 	return concatBytes(indexEncoded, pkEncoded);
 }
 
@@ -337,6 +346,12 @@ export function buildFullScanBounds(): { gte: Uint8Array } {
  * `directions[i] === true` flips bytes of prefix component i to match DESC
  * encoding in the stored index keys.
  *
+ * `collations[i]`, when defined, encodes prefix component i under its own key
+ * collation (overriding `options.collation`) — MUST be the same per-column index
+ * key collations `buildIndexKey`'s index half was written under
+ * (`resolveIndexKeyCollations`), or the bounds address different bytes than the
+ * stored entries. Same parameter order as {@link buildPkPrefixBounds}.
+ *
  * `lt` is omitted when the encoded prefix is all-0xff bytes (e.g. a single
  * leading DESC NULL, whose type byte inverts to 0xff) — no finite exclusive
  * upper bound exists, so the scan runs to the end of the store.
@@ -360,13 +375,14 @@ export function buildIndexPrefixBounds(
 	prefixValues: SqlValue[],
 	options?: EncodeOptions,
 	directions?: ReadonlyArray<boolean>,
+	collations?: ReadonlyArray<string | undefined>,
 	transforms?: ReadonlyArray<KeyValueTransform | undefined>,
 ): { gte: Uint8Array; lt?: Uint8Array } {
 	if (prefixValues.length === 0) {
 		return buildFullScanBounds();
 	}
 
-	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions, undefined, transforms);
+	const prefixEncoded = encodeCompositeKey(prefixValues, options, directions, collations, transforms);
 	return {
 		gte: prefixEncoded,
 		lt: incrementLastByte(prefixEncoded),

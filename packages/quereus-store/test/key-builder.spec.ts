@@ -150,7 +150,7 @@ describe('key-builder', () => {
 
 	describe('buildIndexKey', () => {
 		it('concatenates index key and pk key', () => {
-			const key = buildIndexKey(['alice'], [1]);
+			const key = buildIndexKey({ values: ['alice'] }, { values: [1] });
 			const indexOnly = buildDataKey(['alice']);
 			const pkOnly = buildDataKey([1]);
 			expect(key.length).to.equal(indexOnly.length + pkOnly.length);
@@ -158,12 +158,28 @@ describe('key-builder', () => {
 
 		it('applies DESC direction independently to index and pk halves', () => {
 			// Same index value, differing pk direction: the PK half should differ.
-			const noDir = buildIndexKey(['x'], [1], undefined, [false], [false]);
-			const pkDesc = buildIndexKey(['x'], [1], undefined, [false], [true]);
-			const idxDesc = buildIndexKey(['x'], [1], undefined, [true], [false]);
+			const noDir = buildIndexKey({ values: ['x'], directions: [false] }, { values: [1], directions: [false] });
+			const pkDesc = buildIndexKey({ values: ['x'], directions: [false] }, { values: [1], directions: [true] });
+			const idxDesc = buildIndexKey({ values: ['x'], directions: [true] }, { values: [1], directions: [false] });
 			expect(noDir).to.not.deep.equal(pkDesc);
 			expect(noDir).to.not.deep.equal(idxDesc);
 			expect(pkDesc).to.not.deep.equal(idxDesc);
+		});
+
+		it('applies per-column collations independently to index and pk halves', () => {
+			// Index half under NOCASE keys 'Alice' and 'alice' identically; under BINARY
+			// (explicit or defaulted) they differ. A never-text (integer) column ignores
+			// its collation entry outright.
+			const upper = buildIndexKey({ values: ['Alice'], collations: ['NOCASE'] }, { values: [1] });
+			const lower = buildIndexKey({ values: ['alice'], collations: ['NOCASE'] }, { values: [1] });
+			expect(upper).to.deep.equal(lower);
+
+			const upperBin = buildIndexKey({ values: ['Alice'], collations: ['BINARY'] }, { values: [1] });
+			expect(upperBin).to.not.deep.equal(lower);
+
+			const intPlain = buildIndexKey({ values: [42] }, { values: [1] });
+			const intCollated = buildIndexKey({ values: [42], collations: ['NOCASE'] }, { values: [1] });
+			expect(intPlain).to.deep.equal(intCollated);
 		});
 	});
 

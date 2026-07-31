@@ -18,6 +18,7 @@ import {
 	type DatabaseInternal,
 	type CollationResolver,
 	type TableSchema,
+	type TableIndexSchema,
 	type Row,
 	type SqlValue,
 	type ColumnStatistics,
@@ -44,7 +45,7 @@ import {
 	type TableStats,
 } from './serialization.js';
 import { type EncodeOptions, type KeyValueTransform } from './encoding.js';
-import { columnCanHoldText, resolvePkKeyCollations, resolvePkKeyTransforms, resolvePkSemanticEquality, storeSemanticKeyTransform } from './pk-key-resolution.js';
+import { resolveIndexKeyCollations, resolvePkKeyCollations, resolvePkKeyTransforms, resolvePkSemanticEquality, storeSemanticKeyTransform } from './pk-key-resolution.js';
 import { withImplicitUniqueIndexes } from './implicit-unique-index.js';
 
 /** Number of mutations before persisting statistics. */
@@ -228,8 +229,8 @@ export abstract class StoreTableBase extends VirtualTable {
 		);
 		this.pkKeyTransforms = resolvePkKeyTransforms(tableSchema.primaryKeyDefinition, tableSchema.columns);
 		this.pkSemanticEquality = resolvePkSemanticEquality(tableSchema.primaryKeyDefinition, tableSchema.columns);
-		// Validate the MATERIALIZED schema, so a `_uc_*` over a text column that needs the
-		// table key collation K is rejected up front just like an explicit index would be.
+		// Validate the MATERIALIZED schema, so a `_uc_*` whose key collations cannot key
+		// is rejected up front just like an explicit index would be.
 		this.validateKeyCollations(this.materializedSchema, this.pkKeyCollations);
 		this.validateSemanticKeyTransforms(this.materializedSchema);
 		this.ddlSaved = isConnected;
@@ -247,11 +248,17 @@ export abstract class StoreTableBase extends VirtualTable {
 	 *
 	 * Checked over exactly the collations the key encoding actually uses:
 	 *   - every defined `pkKeyCollations` entry (text-capable PK columns);
-	 *   - the table key collation K, but only when it is reachable — a secondary index
-	 *     encodes a TEXT-CAPABLE index column's bytes under K (`buildIndexKey`).
+	 *   - every defined index key collation of every index in the MATERIALIZED schema
+	 *     (`resolveIndexKeyCollations` — the index column's COLLATE, else the table
+	 *     column's declared collation, else BINARY; hidden `_uc_*` indexes included).
 	 *
-	 * So neither a table with an integer PK and no secondary index, nor one whose every
-	 * index column is type-natively keyed, is made unopenable by a K it never encodes with.
+	 * Two deliberate consequences of validating the actual index key collations rather
+	 * than blanket-requiring the table key collation K whenever any index column is
+	 * text-capable (the pre-per-column-index-collation behavior):
+	 *   - an index column declaring a comparator-only collation is rejected here instead
+	 *     of silently keying under K;
+	 *   - a table whose K has no normalizer but whose key encoding never uses K (all
+	 *     index columns BINARY/type-native, PK needing no K) is no longer unopenable.
 	 *
 	 * Blast radius: this also fires on catalog rehydration. Reopening a persisted database
 	 * from a connection that has not re-registered its custom collation now throws at
@@ -266,12 +273,19 @@ export abstract class StoreTableBase extends VirtualTable {
 		for (const collation of pkKeyCollations) {
 			if (collation !== undefined) names.add(collation);
 		}
-		const indexKeysText = (schema.indexes ?? []).some(index =>
-			index.columns.some(col => columnCanHoldText(schema.columns[col.index])));
-		if (indexKeysText) {
-			names.add((this.encodeOptions.collation ?? 'NOCASE').toUpperCase());
+		for (const index of schema.indexes ?? []) {
+			for (const collation of resolveIndexKeyCollations(index, schema.columns)) {
+				if (collation !== undefined) names.add(collation);
+			}
 		}
+		this.assertCollationsCanKey(names);
+	}
 
+	/**
+	 * Throw-only half of {@link validateKeyCollations}: raise unless every name in
+	 * `names` resolves to a registered key normalizer.
+	 */
+	private assertCollationsCanKey(names: Iterable<string>): void {
 		const dbInternal = this.db as DatabaseInternal;
 		for (const name of names) {
 			if (dbInternal._getCollationNormalizer(name)) continue;
@@ -284,6 +298,21 @@ export abstract class StoreTableBase extends VirtualTable {
 				StatusCode.ERROR,
 			);
 		}
+	}
+
+	/**
+	 * Throw-only pre-check for `StoreModuleIndex.createIndex`: reject a NEW index whose
+	 * key collations cannot key (comparator-only or unregistered), BEFORE the physical
+	 * index store is created — so a rejection leaves no store directory behind even for
+	 * an empty table (where the build itself would encode nothing and the later
+	 * `updateSchema` validation would fire only after the store exists).
+	 */
+	assertIndexKeyCollationsCanKey(indexSchema: TableIndexSchema): void {
+		const names = new Set<string>();
+		for (const collation of resolveIndexKeyCollations(indexSchema, this.tableSchema!.columns)) {
+			if (collation !== undefined) names.add(collation);
+		}
+		this.assertCollationsCanKey(names);
 	}
 
 	/**
@@ -356,8 +385,8 @@ export abstract class StoreTableBase extends VirtualTable {
 	 */
 	updateSchema(newSchema: TableSchema): void {
 		// `newSchema` is the engine-facing (non-materialized) schema; recompute the
-		// enforcement copy alongside it. Validate the MATERIALIZED copy so a `_uc_*` over a
-		// text column that needs the table key collation K is caught before adoption.
+		// enforcement copy alongside it. Validate the MATERIALIZED copy so a `_uc_*`
+		// whose key collations cannot key is caught before adoption.
 		const materialized = withImplicitUniqueIndexes(newSchema);
 		const pkKeyCollations = resolvePkKeyCollations(
 			newSchema.primaryKeyDefinition,

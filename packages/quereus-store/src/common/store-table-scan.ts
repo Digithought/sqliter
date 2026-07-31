@@ -20,6 +20,8 @@ import {
 	planKindFromCode,
 	type IdxStrSpec,
 	type CollationFunction,
+	type ColumnSchema,
+	type CompareFn,
 	type TableIndexSchema,
 	type Row,
 	type FilterInfo,
@@ -36,7 +38,7 @@ import {
 import {
 	deserializeRow,
 } from './serialization.js';
-import { keyOrderMatchesCollation, pkOrderPreservingPrefixLength, storeSemanticKeyTransform } from './pk-key-resolution.js';
+import { keyOrderMatchesCollation, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, storeSemanticKeyTransform } from './pk-key-resolution.js';
 
 import { StoreTableBase } from './store-table-base.js';
 
@@ -319,14 +321,13 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * index is unresolved. {@link matchesFilters} stays the authoritative row filter,
 	 * so the window need only be a SUPERSET.
 	 *
-	 * Index-column bytes are encoded under the table key collation K (NOT the index's
-	 * per-column declared collation — see `buildIndexKey`), while `matchesFilters` compares
-	 * under the index column's effective collation C. The EQ/prefix window is a superset
-	 * whenever K is coarser-or-equal to C, which `tryIndexAccessPlan` (store-module-access-plan.ts) checked
-	 * before it named this index. The RANGE window additionally needs byte order to BE
-	 * comparator order, so it is gated on {@link keyOrderMatchesCollation} (which demands
-	 * `C === K` plus K's `orderPreserving` assertion); when that fails we return null and
-	 * the caller full-scans.
+	 * Index-column bytes are encoded under each column's own key collation C
+	 * (`resolveIndexKeyCollations` — the index column's COLLATE, else the table column's
+	 * declared collation, else BINARY), which is also the collation `matchesFilters`
+	 * re-checks under — so the EQ/prefix window is EXACTLY the qualifying set. The RANGE
+	 * window additionally needs byte order to BE comparator order, so it is gated on
+	 * {@link indexRangeIsOrderSafe}; when that fails we return null and the caller
+	 * full-scans.
 	 */
 	protected analyzeIndexAccess(filterInfo: FilterInfo): IndexAccessPattern | null {
 		const index = this.resolveIndexFromIdxStr(filterInfo.idxStr);
@@ -334,6 +335,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 
 		const indexCols = index.columns.map(c => c.index);
 		const indexDirections = index.columns.map(c => !!c.desc);
+		const indexCollations = this.indexKeyCollations(index);
 
 		// Contiguous leading-prefix EQ → point/prefix window. A prefix member whose
 		// logical type carries semantic ordering stops the prefix: its byte-equality
@@ -355,6 +357,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 				eqValues,
 				this.encodeOptions,
 				indexDirections.slice(0, eqValues.length),
+				indexCollations.slice(0, eqValues.length),
 			);
 			return { index, type: 'point', bounds };
 		}
@@ -372,6 +375,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 					value: c.argvIndex > 0 ? filterInfo.args[c.argvIndex - 1] : undefined,
 				})),
 				indexDirections[0],
+				indexCollations[0],
 			);
 			return { index, type: 'range', bounds };
 		}
@@ -380,10 +384,72 @@ export abstract class StoreTableScan extends StoreTableBase {
 	}
 
 	/**
+	 * Lazy cache behind {@link indexKeyCollations}: one resolved array per index-schema
+	 * object, invalidated when the column array it was resolved against is replaced (an
+	 * ALTER can retype a column without minting new index objects, so the index identity
+	 * alone is not a safe key).
+	 */
+	private readonly indexKeyCollationsCache = new WeakMap<
+		TableIndexSchema,
+		{ columns: ReadonlyArray<ColumnSchema>; collations: (string | undefined)[] }
+	>();
+
+	/**
+	 * Per-column KEY collation for `index`'s own columns, memoized — see
+	 * {@link resolveIndexKeyCollations}. The one resolution every scan-side encode site
+	 * ({@link analyzeIndexAccess}, {@link buildIndexRangeBounds}, {@link scanMultiSeek})
+	 * threads into `buildIndexPrefixBounds`, so a scan window can never address
+	 * different bytes than the maintenance writes.
+	 */
+	protected indexKeyCollations(index: TableIndexSchema): (string | undefined)[] {
+		const columns = this.tableSchema!.columns;
+		const cached = this.indexKeyCollationsCache.get(index);
+		if (cached && cached.columns === columns) return cached.collations;
+		const collations = resolveIndexKeyCollations(index, columns);
+		this.indexKeyCollationsCache.set(index, { columns, collations });
+		return collations;
+	}
+
+	/**
+	 * Per-column comparators stating the store's actual index-key BYTE order for
+	 * `indexName` — the `VirtualTable.getIndexComparator` isolation hook, mirroring
+	 * `MemoryTable.getIndexComparator`. The isolation layer merges the overlay's pending
+	 * rows against this table's index scan by `(indexKey, PK)` sort key and prefers these
+	 * over its descriptor-derived fallback, so each column's comparator must reproduce
+	 * the order {@link scanIndex} emits in:
+	 *   - the column's KEY collation ({@link indexKeyCollations}: index COLLATE, else the
+	 *     table column's declared collation, else BINARY) for text;
+	 *   - the logical type's `compare` for a semantic-ordering column (its key bytes
+	 *     encode through an order-preserving transform — see `storeSemanticKeyTransform`);
+	 *   - negated for a DESC column (its key bytes are bit-inverted).
+	 * Resolved against the MATERIALIZED schema so a hidden `_uc_*` name resolves too.
+	 */
+	getIndexComparator(indexName: string): CompareFn[] | undefined {
+		const schema = this.materializedSchema;
+		const index = schema.indexes?.find(ix => ix.name.toLowerCase() === indexName.toLowerCase());
+		if (!index) return undefined;
+		const keyCollations = this.indexKeyCollations(index);
+		return index.columns.map((col, i) => {
+			const columnSchema = schema.columns[col.index];
+			const name = keyCollations[i];
+			const collationFunc = name ? this.collationResolver(name) : undefined;
+			const typedComparator = createTypedComparator(columnSchema.logicalType, collationFunc);
+			return col.desc
+				? (a: SqlValue, b: SqlValue): number => -typedComparator(a, b)
+				: typedComparator;
+		});
+	}
+
+	/**
 	 * True when a byte window over `leadingCol` of `index` reproduces the comparator's
-	 * order. Mirrors the range arm of `tryIndexAccessPlan` (store-module-access-plan.ts): the window's bytes
-	 * come from the table key collation K, the residual compares under the index column's
-	 * effective collation C, so both must be the same order-preserving collation.
+	 * order. Mirrors the range arm of `tryIndexAccessPlan` (store-module-access-plan.ts): both
+	 * demand the table key collation K equal the index column's effective collation C, plus
+	 * K's `orderPreserving` assertion. Index-column bytes now encode under C itself
+	 * (`resolveIndexKeyCollations`), so the K-vs-C comparison is CONSERVATIVE — it declines
+	 * `C ≠ K` windows that would in fact be sound — but it must stay in lockstep with the
+	 * planner's `rangeSafeToHandle` until the guard collapse lands
+	 * (tickets: store-index-collation-guard-collapse), or a plan the planner declined could
+	 * be answered here and vice versa.
 	 */
 	protected indexRangeIsOrderSafe(index: TableIndexSchema, leadingCol: number): boolean {
 		const schema = this.tableSchema!;
@@ -398,10 +464,9 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * Convert leading-index-column LT/LE/GT/GE constraints into one encoded-byte
 	 * `gte`/`lt` window — the secondary-index analogue of {@link buildPKRangeBounds}.
 	 *
-	 * Each bound value is encoded under {@link encodeOptions} (the table key collation K
-	 * and its normalizer resolver) and the leading index column's DESC `dir` — exactly as
-	 * {@link buildIndexKey} encodes
-	 * that column — via {@link buildIndexPrefixBounds}, giving the byte region
+	 * Each bound value is encoded under the leading index column's own key `collation`
+	 * ({@link indexKeyCollations}) and DESC `dir` — exactly as {@link buildIndexKey}
+	 * encodes that column — via {@link buildIndexPrefixBounds}, giving the byte region
 	 * `[lo, hi)` whose leading column equals that value. The op maps that region's
 	 * endpoints onto `gte`/`lt`, with the same DESC lower/upper SWAP as the PK path:
 	 *
@@ -420,6 +485,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 	protected buildIndexRangeBounds(
 		constraints: Array<{ op: IndexConstraintOp; value?: SqlValue }>,
 		dir: boolean,
+		collation: string | undefined,
 	): IterateOptions {
 		const full = buildFullScanBounds();
 		let gte: Uint8Array = full.gte;
@@ -427,7 +493,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 
 		for (const c of constraints) {
 			if (c.value === undefined || c.value === null) continue;
-			const { gte: lo, lt: hi } = buildIndexPrefixBounds([c.value], this.encodeOptions, [dir]);
+			const { gte: lo, lt: hi } = buildIndexPrefixBounds([c.value], this.encodeOptions, [dir], [collation]);
 			const lower = !dir
 				? (c.op === IndexConstraintOp.GE ? lo : c.op === IndexConstraintOp.GT ? hi : undefined)
 				: (c.op === IndexConstraintOp.LE ? lo : c.op === IndexConstraintOp.LT ? hi : undefined);
@@ -592,11 +658,9 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * index scan with its pending rows by (indexKey, PK) — an out-of-order underlying
 	 * stream misplaces overlay rows in the output. Two overlap hazards are folded
 	 * away before scanning:
-	 *   - Tuples whose K-encoded prefix byte-matches (duplicate bound parameters, or
-	 *     case variants under a NOCASE table key collation) share ONE window, each
-	 *     kept as a residual alternative — see {@link MultiSeekWindowContext} for why
-	 *     a single tuple's residual would drop rows when the comparison collation is
-	 *     finer than K.
+	 *   - Tuples whose encoded prefix byte-matches (duplicate bound parameters, or
+	 *     case variants under a NOCASE key collation C) share ONE window, each kept
+	 *     as a residual alternative — see {@link MultiSeekWindowContext}.
 	 *   - A window with no finite upper bound (all-0xff prefix — see
 	 *     buildIndexPrefixBounds) contains every later-sorting window outright (any
 	 *     key ≥ an all-0xff prefix necessarily starts with it), so those windows fold
@@ -623,7 +687,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 			this.multiSeekMalformed(filterInfo, `seekWidth ${seekWidth} exceeds ${index.name}'s ${indexCols.length} columns`);
 		}
 		const seekCols = indexCols.slice(0, seekWidth);
-		// The K-encoded byte windows below carry no residual able to resurrect a
+		// The encoded byte windows below carry no residual able to resurrect a
 		// skipped row, so a seek column whose byte equality under-fetches the type's
 		// equality (TIMESPAN, JSON — see pkHasSemanticOrderingMember) cannot be
 		// multi-seeked. `tryIndexAccessPlan` (store-module-access-plan.ts) declines such plans; one
@@ -632,12 +696,14 @@ export abstract class StoreTableScan extends StoreTableBase {
 			this.multiSeekMalformed(filterInfo, 'semantic-ordering seek column');
 		}
 
-		// One window per distinct K-encoded tuple prefix; K-equal tuples merge into
-		// one window, each kept as a residual alternative.
+		// One window per distinct encoded tuple prefix (each column under its own key
+		// collation C — see indexKeyCollations); C-equal tuples merge into one window,
+		// each kept as a residual alternative.
+		const seekCollations = this.indexKeyCollations(index).slice(0, seekWidth);
 		const windows = new Map<string, MultiSeekWindow>();
 		for (const tuple of tuples) {
 			const ordered = this.orderTupleValues(tuple, seekCols, filterInfo);
-			const bounds = buildIndexPrefixBounds(ordered, this.encodeOptions, indexDirections.slice(0, seekWidth));
+			const bounds = buildIndexPrefixBounds(ordered, this.encodeOptions, indexDirections.slice(0, seekWidth), seekCollations);
 			const hex = bytesToHex(bounds.gte);
 			const info: FilterInfo = { ...filterInfo, constraints: tuple.entries };
 			const existing = windows.get(hex);
@@ -919,13 +985,15 @@ interface MultiSeekWindow {
  * `collations` — the constraint collation map, resolved once per multi-seek (it is
  * identical for every window).
  *
- * `extraTuples` — additional seek tuples whose K-encoded window byte-equals this
- * window's (duplicate bound parameters, or case-variant values under a NOCASE table
- * key collation K). A row is yielded when it matches the primary FilterInfo OR any of
- * these: when the column's comparison collation C is strictly finer than K (K=NOCASE
- * over a BINARY column — the one coarser pairing the plan admits), the merged tuples
- * are C-distinct and each admits different rows, so a single tuple's residual would
- * silently drop the other tuples' rows.
+ * `extraTuples` — additional seek tuples whose encoded window byte-equals this
+ * window's (duplicate bound parameters, or case-variant values under a NOCASE key
+ * collation). A row is yielded when it matches the primary FilterInfo OR any of
+ * these. Index bytes now encode under the same collation C the residual compares
+ * under (`indexKeyCollations`), so byte-equal tuples are C-equal and each merged
+ * tuple's residual admits the same rows — the OR is redundancy, kept because it is
+ * what makes the fold safe by construction rather than by that argument, and it is
+ * what a custom equality-only normalizer (byte-equal ⇏ comparator-equal order but
+ * equal partition) still relies on.
  */
 interface MultiSeekWindowContext {
 	seen: Set<string>;

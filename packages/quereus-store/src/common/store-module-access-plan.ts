@@ -258,25 +258,24 @@ export function computeBestAccessPlan(
  * point), or a LT/LE/GT/GE range on the LEADING index column. These mirror the
  * two windows `StoreTable.analyzeIndexAccess` can build.
  *
- * **Collation-safety guard against under-fetch.** The store's index-column
- * window is encoded under the table key collation K, but `matchesFilters`
- * compares under the COLUMN's declared collation. Marking a filter handled drops
- * the residual Filter, so the K-window must be a guaranteed SUPERSET of the
- * qualifying rows. That holds only when K is coarser-or-equal to the column's
- * declared collation. To stay provably safe with minimal logic we mark the
- * covered filters handled — setting `indexName` + `seekColumns` — only when every
- * seek column is non-text, OR its declared collation equals K, OR (K = NOCASE
- * while the column is BINARY, i.e. K strictly coarser). Otherwise we return a
- * cost-only plan (cheaper cost, filters unhandled, residual retained — correct,
- * just not sped up). K itself always keys: `StoreTable`'s constructor rejects a
- * table whose key encoding would need a collation it cannot resolve to a normalizer.
+ * **Collation-safety guard against under-fetch.** The store's index-column window is
+ * now encoded under each column's own effective collation C (`resolveIndexKeyCollations`
+ * — the same collation `matchesFilters` re-checks under), so an EQ window is exactly the
+ * qualifying set and every admitted case below is trivially sound. The guard itself
+ * still reasons in pre-per-column terms — admit when every seek column is non-text, OR
+ * C equals the table key collation K, OR (K = NOCASE while C = BINARY) — which is now
+ * merely CONSERVATIVE: it declines `C ≠ K` cases (returning a cost-only plan — cheaper
+ * cost, filters unhandled, residual retained; correct, just not sped up) that the
+ * C-encoded window could in fact serve. Collapsing it is deferred to
+ * tickets: store-index-collation-guard-collapse, and until then it must stay in lockstep
+ * with `StoreTable.analyzeIndexAccess`'s gates so the "mark handled" and "build a
+ * window" decisions cannot disagree.
  *
- * NOTE: the coarser-K relaxation is sound for EQUALITY only. A RANGE window equates
- * memcmp of K-normalized bytes with C's comparator order, which a merely coarser K does
- * not give — under K = NOCASE and C = BINARY, 'K' (U+212A) is `> 'z'` yet keys as 'k',
- * before 'z'. So the range arm demands `C === K` *and* K's `orderPreserving` assertion,
- * via the shared {@link keyOrderMatchesCollation}; `StoreTable.analyzeIndexAccess`
- * declines the same windows, so the two decisions cannot disagree. The cost is that a
+ * NOTE: the RANGE arm additionally needs byte order to BE comparator order, which even
+ * an exact-collation window does not give for free (a registered normalizer promises an
+ * equality partition, not order preservation) — so it demands `C === K` *and* K's
+ * `orderPreserving` assertion, via the shared {@link keyOrderMatchesCollation};
+ * `StoreTable.indexRangeIsOrderSafe` declines the same windows. The cost is that a
  * default-K (NOCASE) table with an index on a plain BINARY text column loses its index
  * RANGE seek and falls back to the cost-only plan; EQ seeks are unchanged.
  */
@@ -361,10 +360,12 @@ function tryIndexAccessPlan(
 		return (indexCol?.collation ?? tableInfo.columns[colIdx]?.collation ?? 'BINARY').toUpperCase();
 	};
 
-	// EQUALITY: safe to mark handled iff K is coarser-or-equal to C. Exempt only columns
-	// that can NEVER hold text — their key bytes are type-native and collation-independent.
-	// A bare `isTextual` test wrongly exempts an `ANY` column (no marker, but it stores
-	// text as text), which would seek under K, drop the residual, and lose rows.
+	// EQUALITY: admitted iff K is coarser-or-equal to C (conservative — see the guard
+	// note in the doc comment above). Exempt only columns that can NEVER hold text —
+	// their key bytes are type-native and collation-independent. A bare `isTextual`
+	// test wrongly exempts an `ANY` column (no marker, but it stores text as text),
+	// which would skip the collation comparison entirely and mis-admit a plan the
+	// residual could no longer repair.
 	const eqSafeToHandle = (colIdx: number): boolean => {
 		const col = tableInfo.columns[colIdx];
 		if (!columnCanHoldText(col)) return true;

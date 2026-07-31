@@ -492,8 +492,14 @@ encoders). So **any** declared PK collation is honored natively (`x text collate
 primary key` keys under BINARY, `collate nocase` under NOCASE), at parity with the memory
 module. The table-level key collation K (`config.collation`, `BINARY` or `NOCASE`, default
 `NOCASE`) is only a **default** for an undecorated PK column whose logical type is
-`isTextual` (i.e. `text`), plus the collation used for secondary-index *column* values. The
-schema entry points:
+`isTextual` (i.e. `text`). Secondary-index *column* values are likewise keyed per-column,
+under the index column's own effective collation (`resolveIndexKeyCollations`: the index
+column's `COLLATE`, else the table column's declared collation, else `BINARY` — **not** K;
+an undecorated non-PK text column genuinely compares under BINARY, since the CREATE-time
+K-reconcile below applies only to PK members), with the same hard-`BINARY` rule for
+text-capable-but-not-`isTextual` columns as the PK bullet below. So the stored index bytes
+always agree with the collation the residual re-check, the planner's cover analysis, and
+UNIQUE enforcement compare under. The schema entry points:
 
 - **A PK column that can hold text but is not `isTextual`** — `any`, `json`, and the
   temporal types `date` / `time` / `datetime` / `timespan` — is keyed under **hard-coded
@@ -576,7 +582,11 @@ schema entry points:
   structures are multi-maps and its DDL is equally non-transactional.
 
 The store carries no on-disk format version stamp and no rebuild-on-open path: a store whose
-non-textual PK bytes were written under any collation but BINARY must be recreated.
+non-textual PK bytes were written under any collation but BINARY must be recreated. Likewise
+for secondary indexes: index-column bytes were formerly encoded under the table key collation
+K, so any previously-persisted database with a secondary index over a text column whose
+effective collation differs from K must be recreated or re-indexed (drop + recreate the
+index); the data-store bytes and the PK suffix inside each index key are unchanged.
 
 See [`docs/sql-alter.md` § ALTER COLUMN](sql-alter.md#27-alter-table-statement) for the
 full SET COLLATE contract, including the non-PK UNIQUE re-validation. Physical key bytes
@@ -609,8 +619,10 @@ store's by-name `uniqueEnforcementCollations`), where a by-column-set resolution
 both onto the first-listed index and under-enforce the coarser one
 (`memory-multi-index-unique-collation-resolution`). `ALTER COLUMN … SET
 COLLATE` on a column under such an index propagates the new collation into the index
-column (metadata-only — the store's index *key* bytes use the table-level collation K, so
-no entry re-encode is required), mirroring memory.
+column *and* rebuilds every index covering it — the store's index *key* bytes encode each
+index column under its own effective collation, so the persisted entries are stale until
+re-encoded under the new one — mirroring memory's schema propagation with the physical
+rebuild the store's byte encoding additionally requires.
 
 A non-derived (table-level / column) UNIQUE always enforces under the declared column
 collation, even when a *finer* same-column-set `CREATE UNIQUE INDEX` exists (either DDL

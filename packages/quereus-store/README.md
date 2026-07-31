@@ -468,6 +468,7 @@ console.log(hasIsolation(isolatedModule)); // true
 | `StoreTable` | Virtual table implementation (incl. `applyExternalRowChanges` / `readRowByPk` for externally-applied source writes) |
 | `ExternalRowOp` | One externally-applied row op (`upsert`/`delete`) for `StoreTable.applyExternalRowChanges` (type) |
 | `resolvePkKeyCollations` | Per-PK-column key collations (pass to `buildDataKey`/`buildIndexKey` to match `StoreTable`'s key bytes) |
+| `resolveIndexKeyCollations` | Per-index-column key collations (the index half of `buildIndexKey`: index COLLATE ?? column collation ?? BINARY) |
 | `StoreConnection` | Transaction connection |
 | `TransactionCoordinator` | Transaction management |
 | `StoreEventEmitter` | Event system for data/schema changes |

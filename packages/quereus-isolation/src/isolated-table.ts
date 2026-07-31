@@ -902,7 +902,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			return [...indexKey, ...pk];
 		};
 
-		// Prefer the underlying table's per-column index comparators; when it exposes
+		// Prefer the underlying table's per-column index comparators — both the memory
+		// and store backends supply them, each stating its own physical index order
+		// (the store's per-column key collations included). When the underlying exposes
 		// none for this index (always the case for a module-minted synthetic name),
 		// derive them from the descriptor's key columns so a DESC or collated key
 		// column still merges in the underlying's emission order rather than a
@@ -1009,9 +1011,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	/**
 	 * Per-column comparators derived from an index descriptor's key columns — the
 	 * fallback when the underlying exposes no `getIndexComparator` for the index
-	 * (always the case for a module-minted synthetic name). Honors each key column's
+	 * (always the case for a module-minted synthetic name; a store-backed index scan
+	 * now supplies its own comparators via `StoreTableScan.getIndexComparator`, so
+	 * this fallback no longer decides its merge order). Honors each key column's
 	 * declared direction and collation so the merge walks the underlying's emission
-	 * order.
+	 * order. NOTE: a key column with no descriptor collation falls back to BINARY,
+	 * not the table column's declared collation — widening that would also change
+	 * merge order for memory-backed tables, whose index BTrees genuinely order by
+	 * `specCol.collation ?? BINARY`.
 	 */
 	private buildDescriptorComparators(keyColumns: readonly IndexKeyColumn[]): ((a: SqlValue, b: SqlValue) => number)[] {
 		return keyColumns.map(kc => {

@@ -269,10 +269,27 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 		// instance — `importCatalog` deliberately skips module hooks to stay generic,
 		// so the store module reconciles here. Without this, DML on a rehydrated table
 		// would not maintain its indexes and the derived UNIQUE would not enforce.
-		for (const table of this.tables.values()) {
+		//
+		// Per-table isolation, matching the per-entry posture above: `updateSchema`
+		// validates the incoming schema's key collations, and an INDEX-appended schema
+		// can fail where the phase-1 table-only import passed (an index column naming a
+		// collation this connection never registered, or a comparator-only one). On a
+		// refusal, record the error and EVICT the instance rather than leaving it live
+		// on the import-time index-less schema — a half-schema'd table would accept DML
+		// without maintaining its indexes. The registered schema stays; the next
+		// statement to touch the table reconnects, and the StoreTable constructor
+		// re-raises the same error at the point of use.
+		for (const [tableKey, table] of [...this.tables.entries()]) {
 			const current = table.getSchema();
 			const fresh = db.schemaManager.getTable(current.schemaName, current.name);
-			if (fresh) table.updateSchema(fresh);
+			if (!fresh) continue;
+			try {
+				table.updateSchema(fresh);
+			} catch (e) {
+				recordError(`<index reconcile for ${current.schemaName}.${current.name}>`, e);
+				this.tables.delete(tableKey);
+				void table.dispose();
+			}
 		}
 
 		// Recompute the durable stale-MV set from the now-current flags and compare-write

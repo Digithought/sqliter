@@ -110,12 +110,12 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		// new collation. StoreTable.uniqueEnforcementCollations reads the index's
 		// per-column collation, so without this the index entry would stay stale
 		// and the derived UNIQUE would keep enforcing the OLD collation after the
-		// ALTER. Metadata-only: the store's index KEY bytes use the table-level key
-		// collation K (see buildIndexEntries / updateSecondaryIndexes), so no index
-		// entry re-encode is required for a non-PK column. An index column with an
-		// explicit COLLATE is re-collated too — matching memory, which clobbers it
-		// the same way (no surface preserves a differing index COLLATE across an
-		// ALTER COLUMN SET COLLATE on its column).
+		// ALTER. NOT metadata-only: the store keys each index column under its own
+		// effective collation (resolveIndexKeyCollations), so every index covering
+		// this column holds stale key bytes until the rebuild below re-encodes them.
+		// An index column with an explicit COLLATE is re-collated too — matching
+		// memory, which clobbers it the same way (no surface preserves a differing
+		// index COLLATE across an ALTER COLUMN SET COLLATE on its column).
 		const updatedIndexes = (collationChanged && oldSchema.indexes)
 			? oldSchema.indexes.map(idx => ({
 				...idx,
@@ -250,22 +250,30 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 
 		// The value rewrite above changed stored column values in place (same PK, new value) —
 		// and a key-identity transform change re-encodes the column's index-key bytes even with
-		// values untouched. Secondary index KEY bytes encode the indexed column VALUES, so any
-		// index covering this column still points at the OLD bytes until rebuilt — an
-		// index-backed lookup for the new value finds nothing (mirrors the memory module's
-		// `valueConvert` rebuild in MemoryTableManager.alterColumn). `rebuildSecondaryIndexes`
-		// reads committed-only, so flush buffered writes first — the value rewrite above
-		// already did, and the transform-only path (text → timespan: no value rewrite) must
+		// values untouched. Likewise a SET COLLATE on a non-PK column covered by any index
+		// (explicit or hidden `_uc_*`): index KEY bytes encode the indexed column values under
+		// the column's own effective collation (resolveIndexKeyCollations), so the persisted
+		// entries are keyed under the OLD collation until rebuilt — an index-backed lookup or
+		// UNIQUE enforcement seek after the ALTER would find nothing. In every case any index
+		// covering this column still points at the OLD bytes until rebuilt (mirrors the memory
+		// module's `valueConvert` rebuild in MemoryTableManager.alterColumn).
+		// `rebuildSecondaryIndexes` reads committed-only, so flush buffered writes first — the
+		// value rewrite above already did, and the transform-only / collation-only paths must
 		// too; a re-flush with nothing pending is a no-op. Skipped when the PK re-key above
 		// already rebuilt every index, so no double rebuild. Materialize so an implicit `_uc_*`
-		// over the rewritten column is rebuilt against the new value bytes too. The rebuild is
-		// NON-enforcing (`skipDuplicateCheck`): the UNIQUE re-validation above already judged
-		// the issuer's effective rows, and this module's committed rows may retain a row a
-		// wrapper's transaction has deleted whose converted value duplicates a survivor —
-		// enforcing here would spuriously reject what the probe correctly accepted.
-		if ((rewritesValues || keyTransformChanged) && !pkRekeyNeeded) {
+		// over the rewritten column is rebuilt against the new value bytes too (the covering
+		// check reads the materialized set for the same reason). The rebuild is NON-enforcing
+		// (`skipDuplicateCheck`): the UNIQUE re-validation above already judged the issuer's
+		// effective rows — it runs on `collationChanged` too, so the contract holds for the
+		// collation arm — and this module's committed rows may retain a row a wrapper's
+		// transaction has deleted whose converted value duplicates a survivor — enforcing here
+		// would spuriously reject what the probe correctly accepted.
+		const materializedUpdated = withImplicitUniqueIndexes(updatedSchema);
+		const indexCoversAlteredColumn = (materializedUpdated.indexes ?? [])
+			.some(ix => ix.columns.some(ic => ic.index === colIndex));
+		if ((rewritesValues || keyTransformChanged || (collationChanged && indexCoversAlteredColumn)) && !pkRekeyNeeded) {
 			await this.ddlCommitPendingOps();
-			await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver(), true);
+			await this.rebuildSecondaryIndexes(schemaName, tableName, table, materializedUpdated, db.getKeyNormalizerResolver(), true);
 		}
 
 		table.updateSchema(updatedSchema);

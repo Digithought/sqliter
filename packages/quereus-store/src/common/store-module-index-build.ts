@@ -22,6 +22,7 @@ import type {
 import { QuereusError, StatusCode, compilePredicate, logicalTypeCanHoldText, serializeKey } from '@quereus/quereus';
 import type { KVEntry, KVStore } from './kv-store.js';
 import {
+	resolveIndexKeyCollations,
 	resolveIndexKeyTransforms,
 	resolvePkKeyCollations,
 	resolvePkKeyTransforms,
@@ -70,12 +71,18 @@ export async function buildIndexEntries(
 	skipDuplicateCheck = false,
 	maxBatchBytes: number = DEFAULT_MAX_BATCH_BYTES,
 ): Promise<void> {
-	// Index COLUMN values use the table-level key collation K; the PK SUFFIX uses
-	// each PK column's own key collation, so the suffix bytes match the data-store
-	// keys (and `StoreTable.updateSecondaryIndexes`' maintenance writes) exactly.
+	// Both halves key per-column: each index COLUMN under its own key collation
+	// (`resolveIndexKeyCollations` — index COLLATE ?? table column collation ?? BINARY)
+	// and the PK SUFFIX under each PK column's own key collation, so the suffix bytes
+	// match the data-store keys — and both halves match
+	// `StoreTable.updateSecondaryIndexes`' maintenance writes exactly. Those two call
+	// sites are the pair whose drift silently corrupts an index; change one and the
+	// other must change with it. `keyCollation` (the table key collation K) remains
+	// only as the `EncodeOptions` fallback for entries the resolvers leave undefined.
 	const encodeOptions = { collation: keyCollation, normalizers };
 	const pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
 	const pkCollations = resolvePkKeyCollations(tableSchema.primaryKeyDefinition, tableSchema.columns, keyCollation);
+	const indexCollations = resolveIndexKeyCollations(indexSchema, tableSchema.columns);
 	// Key-identity transforms for both halves, mirroring `StoreTable`'s maintenance
 	// writes (`updateSecondaryIndexes` / `encodeDataKey`) — a rebuild that skipped them
 	// would re-encode a TIMESPAN member under different bytes than DML writes.
@@ -134,14 +141,9 @@ export async function buildIndexEntries(
 
 		// Build and store index key
 		const indexKey = buildIndexKey(
-			indexValues,
-			pkValues,
+			{ values: indexValues, directions: indexDirections, collations: indexCollations, transforms: indexTransforms },
+			{ values: pkValues, directions: pkDirections, collations: pkCollations, transforms: pkTransforms },
 			encodeOptions,
-			indexDirections,
-			pkDirections,
-			pkCollations,
-			indexTransforms,
-			pkTransforms,
 		);
 		// Index value = the row's encoded DATA key, so an index scan resolves each
 		// entry back to its base row via a direct data-store read (see

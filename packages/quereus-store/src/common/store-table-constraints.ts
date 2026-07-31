@@ -39,8 +39,8 @@ import {
 import {
 	deserializeRow,
 } from './serialization.js';
-import { columnCanHoldText, resolveIndexKeyTransforms, resolvePkSemanticEquality } from './pk-key-resolution.js';
-import { findReusableIndexForUnique, withImplicitUniqueIndexes } from './implicit-unique-index.js';
+import { columnCanHoldText, resolveIndexKeyCollations, resolveIndexKeyTransforms, resolvePkSemanticEquality } from './pk-key-resolution.js';
+import { findReusableIndexForUnique, implicitUniqueIndexName, withImplicitUniqueIndexes } from './implicit-unique-index.js';
 
 import { StoreTableScan } from './store-table-scan.js';
 
@@ -102,6 +102,11 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 			// Canonicalize semantic-ordering index members ('PT1H'/'PT60M' → one key) so a
 			// UNIQUE enforcement seek and delete-then-insert maintenance address one entry.
 			const indexTransforms = resolveIndexKeyTransforms(index, this.tableSchema!.columns);
+			// Each index column keys under its OWN collation (index COLLATE ?? table column
+			// collation ?? BINARY) — the same resolution `buildIndexEntries` uses for the
+			// build/rebuild path; the two MUST agree or a maintenance delete misses the
+			// entry the build wrote and the index silently rots.
+			const indexCollations = resolveIndexKeyCollations(index, this.tableSchema!.columns);
 
 			// Partial index: only rows the predicate unambiguously accepts are
 			// indexed (mirrors buildIndexEntries' build-time filtering). Guarding both
@@ -115,14 +120,9 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 			if (oldRow && (!predicate || predicate.evaluate(oldRow) === true)) {
 				const oldIndexValues = indexCols.map(i => oldRow[i]);
 				const oldIndexKey = buildIndexKey(
-					oldIndexValues,
-					oldPk,
+					{ values: oldIndexValues, directions: indexDirections, collations: indexCollations, transforms: indexTransforms },
+					{ values: oldPk, directions: this.pkDirections, collations: this.pkKeyCollations, transforms: this.pkKeyTransforms },
 					this.encodeOptions,
-					indexDirections,
-					this.pkDirections,
-					this.pkKeyCollations,
-					indexTransforms,
-					this.pkKeyTransforms,
 				);
 
 				if (inTransaction && this.coordinator) {
@@ -136,14 +136,9 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 			if (newRow && (!predicate || predicate.evaluate(newRow) === true)) {
 				const newIndexValues = indexCols.map(i => newRow[i]);
 				const newIndexKey = buildIndexKey(
-					newIndexValues,
-					newPk,
+					{ values: newIndexValues, directions: indexDirections, collations: indexCollations, transforms: indexTransforms },
+					{ values: newPk, directions: this.pkDirections, collations: this.pkKeyCollations, transforms: this.pkKeyTransforms },
 					this.encodeOptions,
-					indexDirections,
-					this.pkDirections,
-					this.pkKeyCollations,
-					indexTransforms,
-					this.pkKeyTransforms,
 				);
 				// Index value = the row's encoded DATA key. The index-entry key can
 				// locate a row's byte window, but its PK suffix is not losslessly
@@ -390,65 +385,66 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 		// INDEX yields fresh constraint objects, so such a cache invalidates itself.
 		// Reads the MATERIALIZED index set so the hidden `_uc_*` realizing a plain UNIQUE
 		// is visible (the engine-facing `tableSchema` carries only explicit/derived indexes).
-		//
-		// NOTE: `withImplicitUniqueIndexes` APPENDS `_uc_*` after the explicit indexes, so
-		// when both exist (a collation-mismatched index that `findReusableIndexForUnique`
-		// refused) the `find` below picks the EXPLICIT one and the `_uc_*` is maintained
-		// but never seeked. Harmless today — index keys are encoded under the table key
-		// collation for every index alike, so the two are byte-identical — but if index
-		// keys ever move to per-column collations
-		// (`plan/debt-store-index-keys-use-column-collation`), this seek would then
-		// under-fetch and silently accept a duplicate. Prefer the constraint's own
-		// `_uc_*` by name here as part of that change.
 		const indexes = this.materializedSchema.indexes;
 		if (!indexes || indexes.length === 0) return undefined;
 
-		const index = uc.derivedFromIndex
-			? indexes.find(ix => ix.name === uc.derivedFromIndex)
-			: indexes.find(ix => ix.predicate === uc.predicate
+		let index: TableIndexSchema | undefined;
+		if (uc.derivedFromIndex) {
+			index = indexes.find(ix => ix.name === uc.derivedFromIndex);
+		} else {
+			// Among the column-set matches, prefer the constraint's OWN index by name
+			// (`implicitUniqueIndexName` — the `_uc_*` the materializer minted for it).
+			// `withImplicitUniqueIndexes` APPENDS `_uc_*` after the explicit indexes, so a
+			// bare first-match would land on an explicit index that
+			// `findReusableIndexForUnique` REFUSED for a collation mismatch — whose key
+			// bytes now differ from the enforcement collation, so seeking it would
+			// under-fetch and silently accept a duplicate. When no `_uc_*` exists the
+			// remaining match is the reuse-approved index, whose collations
+			// `indexCollationsMatchDeclared` proved equal to the declared ones.
+			const candidates = indexes.filter(ix => ix.predicate === uc.predicate
 				&& ix.columns.length === uc.columns.length
 				&& ix.columns.every((c, i) => c.index === uc.columns[i]));
+			const ownName = implicitUniqueIndexName(this.materializedSchema, uc).toLowerCase();
+			index = candidates.find(ix => ix.name.toLowerCase() === ownName) ?? candidates[0];
+		}
 		if (!index) return undefined;
-		return this.indexSeekHonorsEnforcementCollation(uc) ? index : undefined;
+		return this.indexSeekHonorsEnforcementCollation(index, uc) ? index : undefined;
 	}
 
 	/**
-	 * True when a point seek into the index realizing `uc` returns a SUPERSET of
-	 * the constraint's true conflict set — the only condition under which the
-	 * seek may replace the full scan.
+	 * True when a point seek into `index` returns a SUPERSET of `uc`'s true conflict
+	 * set — the only condition under which the seek may replace the full scan.
 	 *
-	 * An index key's leading (index-column) bytes are encoded under the TABLE KEY
-	 * collation K (`buildIndexKey` passes `this.encodeOptions`), NOT the index's
-	 * declared per-column COLLATE and NOT the constraint's enforcement collation
-	 * C (`uniqueEnforcementCollations` — the index's per-column COLLATE for an
-	 * index-derived UC, else the declared column collation). A seek therefore
-	 * fetches exactly `{rows K-equal to newRow}` while the re-validation keeps
-	 * `{rows C-equal to newRow}`. Soundness needs
-	 * `{C-equal} ⊆ {K-equal}`, i.e. K must be COARSER-OR-EQUAL to C per column:
+	 * An index key's leading (index-column) bytes are encoded under the index's own
+	 * per-column key collations (`resolveIndexKeyCollations`), and the constraint
+	 * re-validates candidates under its enforcement collations
+	 * (`uniqueEnforcementCollations` — the index's per-column COLLATE for an
+	 * index-derived UC, else the declared column collation). For every index a
+	 * *designed* path can hand this method, the two resolve identically by
+	 * construction — the seek window is then exactly the C-equal set — so the check
+	 * is a plain per-column equality of the two resolutions (upper-cased; never-text
+	 * columns exempt, their bytes being type-native).
 	 *
-	 *  - non-text column → its bytes are type-native, collation-independent: safe.
-	 *  - C == K → the sets coincide: safe.
-	 *  - K = NOCASE, C = BINARY → K strictly coarser: safe superset.
-	 *  - otherwise (K = BINARY over C = NOCASE/RTRIM; K = NOCASE over C = RTRIM)
-	 *    the seek UNDER-fetches and a real duplicate would be silently accepted:
-	 *    reject, so the caller full-scans.
-	 *
-	 * Same direction and same admitted cases as the read-side guard in
-	 * `tryIndexAccessPlan` (store-module-access-plan.ts); conservative rather than exhaustive
-	 * (K = RTRIM over C = BINARY is provably safe but declined), which costs an
-	 * optimization, never correctness. The coarseness test is only sound for the
-	 * built-in names: a custom K equals a custom C only when the index column names
-	 * that same collation, and otherwise falls through to the full scan.
+	 * Kept rather than deleted because one undesigned path can still disagree:
+	 * `withImplicitUniqueIndexes` skips materializing a `_uc_*` whose NAME is already
+	 * taken (a user index literally named `_uc_email`, or a named UC colliding with an
+	 * index name), and the column-set fallback in
+	 * {@link findIndexForUniqueConstraint} can then hand this a same-columns index
+	 * whose key collations differ from the enforcement collations. A false `true`
+	 * there silently accepts a duplicate; a decline only costs the full scan.
 	 */
-	private indexSeekHonorsEnforcementCollation(uc: UniqueConstraintSchema): boolean {
+	private indexSeekHonorsEnforcementCollation(index: TableIndexSchema, uc: UniqueConstraintSchema): boolean {
 		const schema = this.tableSchema!;
-		const K = (this.encodeOptions.collation ?? 'NOCASE').toUpperCase();
-
-		const collations = uniqueEnforcementCollations(schema, uc);
+		const keyCollations = resolveIndexKeyCollations(index, schema.columns);
+		const enforcement = uniqueEnforcementCollations(schema, uc);
+		// Positions align: index.columns[i].index === uc.columns[i], guaranteed by the
+		// derived-UC construction (appendIndexToTableSchema) / the column-set match in
+		// findIndexForUniqueConstraint.
 		return uc.columns.every((colIdx, i) => {
 			if (!columnCanHoldText(schema.columns[colIdx])) return true;
-			const C = (collations[i] ?? 'BINARY').toUpperCase();
-			return C === K || (K === 'NOCASE' && C === 'BINARY');
+			const key = keyCollations[i];
+			const C = (enforcement[i] ?? 'BINARY').toUpperCase();
+			return key !== undefined && key === C;
 		});
 	}
 
@@ -490,12 +486,14 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 		// pure overhead.
 		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
 		const compares = this.uniqueColumnComparators(uc, collations);
-		// Same per-column transforms `updateSecondaryIndexes` wrote the entries under, so
-		// the probe for 'PT60M' lands on the window holding the 'PT1H' entry.
+		// Same per-column key collations and transforms `updateSecondaryIndexes` wrote
+		// the entries under, so the probe for 'A@x' lands on the window holding the
+		// NOCASE-keyed 'a@x' entry and the probe for 'PT60M' on the 'PT1H' one.
 		const bounds = buildIndexPrefixBounds(
 			uc.columns.map(c => newRow[c]),
 			this.encodeOptions,
 			index.columns.map(c => !!c.desc),
+			resolveIndexKeyCollations(index, this.tableSchema!.columns),
 			resolveIndexKeyTransforms(index, this.tableSchema!.columns),
 		);
 

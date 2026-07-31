@@ -102,6 +102,14 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		const tableSchema = table.getSchema();
 		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
 
+		// Reject an index whose key collations cannot key (comparator-only or
+		// unregistered names) BEFORE the physical store is created — the same DDL-time
+		// check `StoreTableBase.validateKeyCollations` applies to every index at
+		// CREATE TABLE / rehydrate, run here up front so a rejection leaves no
+		// index-store directory behind (the post-build `updateSchema` would only catch
+		// it after the store exists).
+		table.assertIndexKeyCollationsCanKey(indexSchema);
+
 		// Wrapper-supplied rows are the judged set. Validate BEFORE `getIndexStore` so a
 		// rejection leaves no index-store directory behind, and disable the in-pass dup
 		// check below (which would judge this module's committed rows instead).

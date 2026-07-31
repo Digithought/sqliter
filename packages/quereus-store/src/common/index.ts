@@ -51,6 +51,7 @@ export {
 	buildStatsKey,
 	buildDataKey,
 	buildIndexKey,
+	type IndexKeyHalf,
 	buildCatalogKey,
 	buildViewCatalogKey,
 	buildMaterializedViewCatalogKey,
@@ -110,6 +111,7 @@ export { type StoreTableConfig, type StoreTableModule } from './store-table-base
 export {
   resolvePkKeyCollations,
   resolvePkKeyTransforms,
+  resolveIndexKeyCollations,
   resolveIndexKeyTransforms,
   storeSemanticKeyTransform,
 } from './pk-key-resolution.js';

@@ -73,6 +73,47 @@ export function resolvePkKeyCollations(
 }
 
 /**
+ * Per-column KEY collation for a secondary index's OWN columns (the index half of
+ * `buildIndexKey`), positionally aligned with `index.columns` — the index twin of
+ * {@link resolvePkKeyCollations}. Same three-way branch, delegated to the engine's
+ * `pkKeyCollationName`:
+ *   - never-text column (`integer`, `real`, `blob`) → `undefined`: encoded
+ *     type-natively, collation is moot.
+ *   - text-capable but not `isTextual` (`any`, `json`, the temporal types) →
+ *     hard-coded `'BINARY'` — those types' `compare` ignores collation.
+ *   - `isTextual` (`text`) → the index column's own COLLATE, else the table
+ *     column's declared collation, else `'BINARY'`.
+ *
+ * The fallback is `BINARY`, NOT the table key collation K — deliberately asymmetric
+ * with {@link resolvePkKeyCollations}, whose fallback IS K. For a PK member the
+ * asymmetry is illusory: `reconcilePkCollations` (store-module-schema-rewrite.ts)
+ * rewrites an undecorated text PK column's declared collation to K at CREATE time, so
+ * for a PK member K *is* the declared collation. No such rewrite exists for non-PK
+ * columns — an undecorated `text` column genuinely compares under BINARY (in the
+ * engine's operators and in the store's `matchesFilters` residual alike), so BINARY is
+ * what its index bytes must encode under, or the stored order/equality disagrees with
+ * every comparison made against it.
+ */
+export function resolveIndexKeyCollations(
+	index: TableIndexSchema,
+	columns: ReadonlyArray<ColumnSchema>,
+): (string | undefined)[] {
+	return index.columns.map(col => {
+		const tableCol = columns[col.index];
+		// The collation handed to `pkKeyCollationName` is always defined, so an
+		// `undefined` answer means never-text (its textual branch returns the collation
+		// verbatim; passing a bare `col.collation ?? tableCol.collation` would conflate
+		// "undecorated text column" with "never-text" and silently fall back to K at
+		// encode time — the exact drift this resolver exists to remove).
+		const name = pkKeyCollationName(tableCol === undefined ? undefined : {
+			logicalType: tableCol.logicalType,
+			collation: col.collation ?? tableCol.collation ?? 'BINARY',
+		});
+		return name === undefined ? undefined : (name || 'BINARY').toUpperCase();
+	});
+}
+
+/**
  * The store's per-type key VALUE TRANSFORM for a semantic-ordering logical type, or
  * `undefined` when raw values already key faithfully.
  *

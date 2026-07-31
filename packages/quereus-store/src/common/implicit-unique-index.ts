@@ -33,16 +33,14 @@ export function implicitUniqueIndexName(schema: TableSchema, uc: UniqueConstrain
  * has `collation === undefined` and falls back to the declared column collation,
  * so the common `create index ix on t(email)` case stays reuse-eligible.
  *
- * Store index KEYS are today encoded under the table key collation K for every
- * index alike (`buildIndexKey` passes `this.encodeOptions`), so a same-column
- * index is byte-identical to the `_uc_*` it would replace REGARDLESS of the
- * declared per-column COLLATE — this gate is stricter than today's encoding
- * requires. It is deliberately kept strict: it mirrors
- * `MemoryTableManager.indexCollationsMatchDeclared` (so both backends reuse the
- * same set of indexes), and if store index keys ever move to per-column
- * collations, reusing a BINARY-collated index for a NOCASE-declared UNIQUE would
- * make the enforcement seek UNDER-fetch and silently accept a duplicate. The
- * cost of the strictness is one duplicate hidden index in a rare declaration.
+ * Load-bearing: store index KEYS are encoded under each column's own effective
+ * collation (`resolveIndexKeyCollations` — index COLLATE ?? table column collation
+ * ?? BINARY), so a collation-mismatched index holds DIFFERENT bytes than the
+ * `_uc_*` it would replace. Reusing a BINARY-collated index for a NOCASE-declared
+ * UNIQUE would make the enforcement seek UNDER-fetch and silently accept a
+ * duplicate. Also mirrors `MemoryTableManager.indexCollationsMatchDeclared`, so
+ * both backends reuse the same set of indexes. The cost of the strictness is one
+ * duplicate hidden index in a rare declaration.
  */
 function indexCollationsMatchDeclared(
 	schema: TableSchema,
