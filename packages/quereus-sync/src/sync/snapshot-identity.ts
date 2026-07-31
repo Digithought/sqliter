@@ -12,7 +12,7 @@
 
 import type { SqlValue } from '@quereus/quereus';
 import { compareHLC, type HLC } from '../clock/hlc.js';
-import { encodePkIdentity, type PkKeying } from '../metadata/keys.js';
+import { encodePkIdentity, joinKeyParts, type PkKeying } from '../metadata/keys.js';
 import type { ColumnVersionEntry } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError } from './sync-context.js';
@@ -31,15 +31,6 @@ export interface ReconciledRow {
 	pk: SqlValue[];
 	pkHlc: HLC;
 	cells: Map<string, { hlc: HLC; value: SqlValue }>;
-}
-
-/**
- * Length-prefixed join of components that may each contain any character (a
- * quoted SQL identifier, an arbitrary pk identity), so no separator choice can
- * let two distinct triples collide.
- */
-function joinKeyParts(...parts: string[]): string {
-	return parts.map(part => `${part.length}:${part}`).join('');
 }
 
 /**

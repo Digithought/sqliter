@@ -18,6 +18,16 @@ import {
   buildChangeLogScanBoundsAfter,
   buildColumnVersionKey,
   parseColumnVersionKey,
+  buildTombstoneKey,
+  parseTombstoneKey,
+  buildSchemaMigrationKey,
+  parseSchemaMigrationKey,
+  buildTableColumnVersionScanBounds,
+  buildColumnVersionScanBounds,
+  buildTombstoneScanBounds,
+  buildSchemaMigrationScanBounds,
+  buildQuarantineKey,
+  buildQuarantineScanBounds,
   encodeRawPkIdentity,
   encodePkIdentity,
   RAW_PK_KEYING,
@@ -245,6 +255,144 @@ describe('change-log key encoding', () => {
 
     it('still builds a key for a clean identifier', () => {
       expect(() => buildColumnVersionKey('main', 't', encodeRawPkIdentity([1]), 'c')).to.not.throw();
+    });
+  });
+
+  // Every metadata key component — schema, table, pk identity, column — is
+  // arbitrary user text: `create table "a:b" (...)` and `create table "a.b" (...)`
+  // are both legal SQL. Before every component was length-prefixed, the
+  // `{schema}.{table}:` prefix split at the first `.` and first `:`, so a table
+  // named `a:b` either failed to parse (cv/cl — the record was silently dropped
+  // from every sync path and deleted on the next snapshot apply) or parsed back
+  // CONFIDENTLY WRONG as table `a` (tb — a tombstone that could delete a row of a
+  // DIFFERENT table on the receiver). See bug-sync-metadata-key-delimiters-ambiguous.
+  describe('separator-bearing identifiers round-trip through every key family', () => {
+    const NASTY = ['a:b', 'a.b', 'x:y.z:', '.:', 'a'];
+
+    it('parseColumnVersionKey recovers every component verbatim', () => {
+      for (const schema of NASTY) {
+        for (const table of NASTY) {
+          const identity = encodeRawPkIdentity([`pk:${table}.`]);
+          for (const column of NASTY) {
+            const parsed = parseColumnVersionKey(buildColumnVersionKey(schema, table, identity, column));
+            expect(parsed, `cv ${schema}/${table}/${column}`).to.not.be.null;
+            expect(parsed!).to.deep.equal({ schema, table, identity, column });
+          }
+        }
+      }
+    });
+
+    it('parseTombstoneKey recovers every component verbatim (no cross-table misattribution)', () => {
+      for (const schema of NASTY) {
+        for (const table of NASTY) {
+          const identity = encodeRawPkIdentity([1]);
+          const parsed = parseTombstoneKey(buildTombstoneKey(schema, table, identity));
+          expect(parsed, `tb ${schema}/${table}`).to.not.be.null;
+          expect(parsed!).to.deep.equal({ schema, table, identity });
+        }
+      }
+    });
+
+    it('parseSchemaMigrationKey recovers schema, table and version', () => {
+      for (const schema of NASTY) {
+        for (const table of NASTY) {
+          const parsed = parseSchemaMigrationKey(buildSchemaMigrationKey(schema, table, 7));
+          expect(parsed, `sm ${schema}/${table}`).to.not.be.null;
+          expect(parsed!).to.deep.equal({ schema, table, version: 7 });
+        }
+      }
+    });
+
+    it('parseChangeLogKey recovers every component verbatim, column and delete alike', () => {
+      const hlc = createHLC(1000n, 1, siteA, 0);
+      for (const schema of NASTY) {
+        for (const table of NASTY) {
+          const identity = encodeRawPkIdentity(['a:b.c']);
+          for (const column of NASTY) {
+            const parsed = parseChangeLogKey(
+              buildChangeLogKey(hlc, 'column', schema, table, identity, column));
+            expect(parsed, `cl column ${schema}/${table}/${column}`).to.not.be.null;
+            expect(parsed!.schema).to.equal(schema);
+            expect(parsed!.table).to.equal(table);
+            expect(parsed!.identity).to.equal(identity);
+            expect(parsed!.column).to.equal(column);
+          }
+
+          const del = parseChangeLogKey(buildChangeLogKey(hlc, 'delete', schema, table, identity));
+          expect(del, `cl delete ${schema}/${table}`).to.not.be.null;
+          expect(del!.schema).to.equal(schema);
+          expect(del!.table).to.equal(table);
+          expect(del!.identity).to.equal(identity);
+          expect(del!.column).to.be.undefined;
+        }
+      }
+    });
+  });
+
+  describe('scan bounds stay exact under separator-bearing names', () => {
+    const within = (key: Uint8Array, bounds: { gte: Uint8Array; lt: Uint8Array }): boolean =>
+      compareBytes(key, bounds.gte) >= 0 && compareBytes(key, bounds.lt) < 0;
+
+    // Sibling names chosen so a bare-`.`/bare-`:` layout would overlap: `a`'s
+    // prefix `…a:` is a prefix of `a:b`'s `…a:b:` under the old encoding.
+    const identity = encodeRawPkIdentity([1]);
+
+    it('a table named "a" and one named "a:b" do not share cv: bounds', () => {
+      const keyA = buildColumnVersionKey('main', 'a', identity, 'v');
+      const keyAB = buildColumnVersionKey('main', 'a:b', identity, 'v');
+
+      const boundsA = buildTableColumnVersionScanBounds('main', 'a');
+      const boundsAB = buildTableColumnVersionScanBounds('main', 'a:b');
+
+      expect(within(keyA, boundsA), '"a" in its own bounds').to.be.true;
+      expect(within(keyAB, boundsAB), '"a:b" in its own bounds').to.be.true;
+      expect(within(keyAB, boundsA), '"a:b" must NOT scan under "a"').to.be.false;
+      expect(within(keyA, boundsAB), '"a" must NOT scan under "a:b"').to.be.false;
+    });
+
+    it('tb: and sm: bounds are likewise disjoint for "a" vs "a:b"', () => {
+      const tbA = buildTombstoneKey('main', 'a', identity);
+      const tbAB = buildTombstoneKey('main', 'a:b', identity);
+      expect(within(tbA, buildTombstoneScanBounds('main', 'a'))).to.be.true;
+      expect(within(tbAB, buildTombstoneScanBounds('main', 'a'))).to.be.false;
+      expect(within(tbA, buildTombstoneScanBounds('main', 'a:b'))).to.be.false;
+
+      const smA = buildSchemaMigrationKey('main', 'a', 1);
+      const smAB = buildSchemaMigrationKey('main', 'a:b', 1);
+      expect(within(smA, buildSchemaMigrationScanBounds('main', 'a'))).to.be.true;
+      expect(within(smAB, buildSchemaMigrationScanBounds('main', 'a'))).to.be.false;
+      expect(within(smA, buildSchemaMigrationScanBounds('main', 'a:b'))).to.be.false;
+    });
+
+    it('a row scan does not pick up a different row whose identity extends it', () => {
+      // encodeRawPkIdentity('a') vs 'ab': one identity is a prefix of the other.
+      const idA = encodeRawPkIdentity(['a']);
+      const idAB = encodeRawPkIdentity(['ab']);
+      const keyA = buildColumnVersionKey('main', 't', idA, 'v');
+      const keyAB = buildColumnVersionKey('main', 't', idAB, 'v');
+
+      expect(within(keyA, buildColumnVersionScanBounds('main', 't', idA))).to.be.true;
+      expect(within(keyAB, buildColumnVersionScanBounds('main', 't', idA))).to.be.false;
+      expect(within(keyA, buildColumnVersionScanBounds('main', 't', idAB))).to.be.false;
+    });
+
+    it('the schema-only quarantine prefix cannot match a different schema', () => {
+      const hlc = createHLC(1000n, 1, siteA, 0);
+      const inS = buildQuarantineKey('s', 't', hlc, 'column', [1], 'v');
+      const inSx = buildQuarantineKey('s:x', 't', hlc, 'column', [1], 'v');
+
+      expect(within(inS, buildQuarantineScanBounds('s')), '"s" entry under schema "s"').to.be.true;
+      expect(within(inSx, buildQuarantineScanBounds('s')), '"s:x" must NOT scan under "s"').to.be.false;
+      expect(within(inSx, buildQuarantineScanBounds('s:x'))).to.be.true;
+
+      // Per-table form: table "t" must not swallow table "t:u".
+      const inTU = buildQuarantineKey('s', 't:u', hlc, 'column', [1], 'v');
+      expect(within(inS, buildQuarantineScanBounds('s', 't'))).to.be.true;
+      expect(within(inTU, buildQuarantineScanBounds('s', 't'))).to.be.false;
+
+      // The no-argument (GC sweep) form still covers everything.
+      const all = buildQuarantineScanBounds();
+      expect(within(inS, all) && within(inSx, all) && within(inTU, all)).to.be.true;
     });
   });
 });

@@ -1351,7 +1351,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Each migration shares its transaction's base HLC, so the grouping step
 	 * rejoins it with that transaction's data facts (or forms a DDL-only ChangeSet).
 	 *
-	 * The `sm:` range is keyed by `{schema}.{table}:{version}`, not by HLC, so this
+	 * The `sm:` range is keyed by `(schema, table, version)`, not by HLC, so this
 	 * scan cannot early-exit the way {@link collectChangesSince} does — it is drained
 	 * in full even when the fact side stops early. That is acceptable because
 	 * migrations are few, and {@link buildTransactionChangeSets} drops any migration

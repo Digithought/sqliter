@@ -224,9 +224,11 @@ async function* streamSnapshotChunks(
 	// pass), batched by `(schema, table)` into `chunkSize` chunks. A row whose columns
 	// were all deleted has a tombstone but no live column-versions, so its table may be
 	// absent from `tableKeys`; the global pass carries it regardless. The scan is
-	// key-sorted, so all tombstones for one `(schema, table)` are contiguous (the
-	// `tb:{schema}.{table}:` prefix + `:` separator guarantee no interleaving) — a fresh
-	// chunk starts whenever the table changes or the batch fills.
+	// key-sorted, so all tombstones for one `(schema, table)` are contiguous: every
+	// `tb:` key opens with that pair LENGTH-PREFIXED (`tb:{n}:{schema}{n}:{table}…`),
+	// so one table's keys share an exact byte prefix that no other table's key can
+	// start with — no interleaving is possible, even between tables named `a` and
+	// `a:b`. A fresh chunk starts whenever the table changes or the batch fills.
 	// NOTE: on a RESUMED transfer this re-emits ALL tombstones regardless of the
 	// checkpoint's completed tables (tombstones are not tracked per-table there). The
 	// consumer re-writes them idempotently (same key, same bytes) — a deliberate

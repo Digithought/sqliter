@@ -8,7 +8,7 @@
 import type { SqlValue } from '@quereus/quereus';
 import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, type SerializedHLC, serializeHLC, deserializeHLC, compareHLC, hlcToJson, hlcFromJson } from '../clock/hlc.js';
-import { buildColumnVersionKey, buildColumnVersionRowPrefix, buildColumnVersionScanBounds, encodePkIdentity } from './keys.js';
+import { buildColumnVersionKey, buildColumnVersionScanBounds, encodePkIdentity, parseColumnVersionKey } from './keys.js';
 import type { PkKeyingResolver } from './pk-identity.js';
 
 /**
@@ -243,18 +243,16 @@ export class ColumnVersionStore {
   ): Promise<Map<string, ColumnVersion>> {
     const identity = this.identity(schemaName, tableName, pk);
     const bounds = buildColumnVersionScanBounds(schemaName, tableName, identity);
-    const prefix = buildColumnVersionRowPrefix(schemaName, tableName, identity);
-    const decoder = new TextDecoder();
     const versions = new Map<string, ColumnVersion>();
 
     for await (const entry of this.kv.iterate(bounds)) {
-      // The scan bounds are exactly [prefix, prefix+1), so every key here starts
-      // with `prefix` and everything after it is the column name verbatim —
-      // including a name containing `:`, which a last-colon split would truncate.
-      const keyStr = decoder.decode(entry.key);
-      const column = keyStr.slice(prefix.length);
+      // Every key component is length-prefixed, so the column name comes back
+      // verbatim even when it (or the table name, or the identity) contains
+      // `:` or `.` — see `metadata/keys.ts`.
+      const parsed = parseColumnVersionKey(entry.key);
+      if (!parsed) continue;
 
-      versions.set(column, deserializeColumnVersion(entry.value));
+      versions.set(parsed.column, deserializeColumnVersion(entry.value));
     }
 
     return versions;

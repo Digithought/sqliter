@@ -512,16 +512,28 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 
 | Prefix | Purpose | Format |
 |--------|---------|--------|
-| `cv:{schema}.{table}:{idLen}:{pkIdentity}:{col}` | Column version | `{hlc, value, pk}` |
-| `tb:{schema}.{table}:{pkIdentity}` | Tombstone | `{hlc, createdAt, pk, priorRow?}` |
-| `cl:{hlc}{type}{schema}.{table}:{idLen}:{pkIdentity}[:{col}]` | HLC-ordered change-log index over `cv:`/`tb:` | *(empty — all info in the key)* |
+| `cv:⟨schema⟩⟨table⟩⟨pkIdentity⟩⟨col⟩` | Column version | `{hlc, value, pk}` |
+| `tb:⟨schema⟩⟨table⟩⟨pkIdentity⟩` | Tombstone | `{hlc, createdAt, pk, priorRow?}` |
+| `cl:{hlc}{type}⟨schema⟩⟨table⟩⟨pkIdentity⟩[⟨col⟩]` | HLC-ordered change-log index over `cv:`/`tb:` | *(empty — all info in the key)* |
 | `tx:{txId}` | *Reserved — not persisted.* The transaction id is **derived** from the base HLC (see *Deterministic transaction id*), so no transaction record is written. The `tx:` prefix and `buildTransactionKey` remain reserved for a future durable txn log. | — |
 | `ps:{siteId}` | Peer sync state (received watermark) | `{lastSyncHlc}` |
 | `pt:{siteId}` | Peer sent state (sent watermark: highest HLC pushed to a peer and acked) | `{lastSyncHlc}` |
-| `sm:{schema}.{table}:{version}` | Schema migration | `{ddl, hlc}` |
+| `sm:⟨schema⟩⟨table⟩{version:010}` | Schema migration | `{ddl, hlc}` |
 | `si:` | Site identity | `{siteId, createdAt}` |
 | `hc:` | HLC state | `{wallTime, counter}` |
 | `fv:` | Sync-metadata format version | decimal string (see *Metadata format version*) |
+
+`⟨part⟩` above is a **length-prefixed component**: `{len}:{part}`, where `len` is the
+part's length in string code units (`joinKeyParts`, `metadata/keys.ts`). Schema names,
+table names, pk identities and column names are all arbitrary text — `create table "a:b"`
+and `create table "a.b"` are legal SQL, and a pk identity freely contains `:` (type tags)
+and `\0` (member separator) — so no character can be reserved as a delimiter. Carrying
+each part's length instead makes every split exact and every key prefix unambiguous: a
+scan over table `a` cannot pick up table `a:b`, and a tombstone for `a:b` can never read
+back as one for `a`. The tradeoff is that keys sort length-major-then-text rather than
+alphabetically; per-table and per-row *contiguity* — the only ordering the streaming
+snapshot relies on — is unaffected. Fixed-width components (the 30-byte HLC, the 1-byte
+change type, `sm:`'s zero-padded version) need no prefix and carry none.
 
 Co-location buys atomic data+metadata updates within a transaction, one storage backend for both LevelDB and IndexedDB, and no additional database connections.
 
@@ -543,9 +555,8 @@ Every per-row record splits the primary key into two roles:
   `Tombstone.pk`): a real, type-valid `SqlValue[]`. Any spelling from the row's
   equivalence class is acceptable; the receiver's store collapses spellings too.
 
-Because the identity freely contains `:` (type tags) and `\0` (member separator), the
-`cv:`/`cl:` key layouts **length-prefix** it (`{idLen}:` is the identity's length in
-string code units), making the identity/column split unambiguous. Keying is resolved per
+The identity is one of the length-prefixed key components described above, so it needs no
+separator to be absent from it. Keying is resolved per
 table from its schema (key collations + semantic transforms) via
 `metadata/pk-identity.ts`, a thin wrapper over the engine's `resolvePkIdentityKeying`
 (`@quereus/quereus`, `util/key-serializer.ts`) — one implementation, shared with the
@@ -569,8 +580,10 @@ so a table exists by the time its entries need keying.
 ### Metadata format version
 
 The `fv:` record stores the sync-metadata storage format version
-(`SYNC_METADATA_FORMAT_VERSION`, currently **2** — the pk-identity keying above, raw pk in
-record values). `SyncManagerImpl.create` writes it on a fresh replica and refuses to open
+(`SYNC_METADATA_FORMAT_VERSION`, currently **3** — the pk-identity keying above, raw pk in
+record values, and **every** variable-length key component length-prefixed. Version 2 was
+the same keying but packed schema and table as `{schema}.{table}:`, which mis-parsed a
+table whose name contains a colon). `SyncManagerImpl.create` writes it on a fresh replica and refuses to open
 one whose stored version is missing (pre-versioning) or different: old keys are unreadable
 under the new layout and mixing the two would corrupt both. Recovery is to clear the
 replica's sync metadata and re-bootstrap from a peer snapshot; there is no in-place

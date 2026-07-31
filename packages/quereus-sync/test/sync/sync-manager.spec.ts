@@ -17,6 +17,7 @@ import { InMemoryKVStore, type IterateOptions, type KVEntry } from '@quereus/sto
 import { generateSiteId, siteIdEquals } from '../../src/clock/site.js';
 import { type HLC, compareHLC } from '../../src/clock/hlc.js';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
+import { parseColumnVersionKey } from '../../src/metadata/keys.js';
 
 describe('SyncManager', () => {
   let kv: InMemoryKVStore;
@@ -1667,6 +1668,19 @@ describe('SyncManager', () => {
   });
 
   describe('error handling', () => {
+    /**
+     * Whether any `cv:` record was filed for `(schema, table)`. Parses each key
+     * rather than matching a literal prefix — every component of a metadata key
+     * is length-prefixed, so the literal spelling is an implementation detail.
+     */
+    const hasColumnVersionFor = async (schema: string, table: string): Promise<boolean> => {
+      for await (const entry of kv.iterate()) {
+        const parsed = parseColumnVersionKey(entry.key);
+        if (parsed?.schema === schema && parsed.table === table) return true;
+      }
+      return false;
+    };
+
     it('should warn when data change event has no primary key', async () => {
       const warnings: string[] = [];
       const origWarn = console.warn;
@@ -1918,11 +1932,7 @@ describe('SyncManager', () => {
 
         // No oracle ⇒ every table reports in-basis ⇒ nothing is skipped.
         expect(warnings.filter(w => w.includes('Skipped'))).to.have.lengthOf(0);
-        const keys: string[] = [];
-        for await (const entry of kv.iterate()) {
-          keys.push(new TextDecoder().decode(entry.key));
-        }
-        expect(keys.some(k => k.startsWith('cv:main.test'))).to.be.true;
+        expect(await hasColumnVersionFor('main', 'test')).to.be.true;
       } finally {
         console.warn = origWarn;
       }
@@ -1955,11 +1965,7 @@ describe('SyncManager', () => {
         expect(skips[0]).to.include('unresolvable');
 
         // Nothing recorded: no `cv:` column-version record for the skipped table.
-        const keys: string[] = [];
-        for await (const entry of kv.iterate()) {
-          keys.push(new TextDecoder().decode(entry.key));
-        }
-        expect(keys.some(k => k.startsWith('cv:main.test'))).to.be.false;
+        expect(await hasColumnVersionFor('main', 'test')).to.be.false;
       } finally {
         console.warn = origWarn;
       }

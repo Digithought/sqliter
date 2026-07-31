@@ -43,16 +43,23 @@ export const SYNC_KEY_PREFIX = {
 /**
  * Current sync-metadata storage format version, persisted under the `fv:` key.
  *
+ * Version 3: EVERY variable-length key component — schema, table, pk identity,
+ * column — is length-prefixed via {@link joinKeyParts}, so no character is
+ * reserved as a delimiter and a name containing `:` or `.` cannot shift the
+ * split (version 2 packed schema/table as `{schema}.{table}:`, which mis-parsed
+ * a table named `a:b` as table `a`).
+ *
  * Version 2: per-row records (`cv:`/`tb:`/`cl:`) are keyed by the pk IDENTITY
  * (collation- and semantic-transform-normalized, via {@link encodePkIdentity})
- * and carry the raw pk in the record VALUE. Version-1 metadata (raw
- * `JSON.stringify(pk)` keys, no pk in values) is unreadable under this layout;
- * a replica whose stored version mismatches must re-bootstrap from a peer
- * snapshot (see docs/sync.md § Metadata format version).
+ * and carry the raw pk in the record VALUE — retained in version 3.
+ *
+ * Older metadata is unreadable under this layout; a replica whose stored version
+ * mismatches must re-bootstrap from a peer snapshot (see docs/sync.md
+ * § Metadata format version).
  */
-export const SYNC_METADATA_FORMAT_VERSION = 2;
+export const SYNC_METADATA_FORMAT_VERSION = 3;
 
-/** Separator between key components. */
+/** Separator between a component's length and the component itself. */
 const SEPARATOR = ':';
 
 /**
@@ -69,6 +76,57 @@ function assertKeyableIdentifiers(...names: string[]): void {
   for (const name of names) {
     assertNoUnpairedSurrogate(name, `the identifier "${name}"`);
   }
+}
+
+/**
+ * Join variable-length key components, each prefixed with its own length in
+ * string code units: `{len}:{part}{len}:{part}…`.
+ *
+ * This is the ONLY encoding used for schema names, table names, pk identities
+ * and column names in metadata keys. Every one of those is arbitrary text — a
+ * quoted SQL identifier may contain `.` or `:`, and a pk identity freely
+ * contains `:` (type tags) and `\0` (member separator) — so no separator
+ * character can be reserved, and an explicit length is the only split that
+ * cannot shift. Two distinct component tuples can therefore never produce the
+ * same key.
+ *
+ * The length is in code units of the DECODED key string, which the byte
+ * encoding preserves: `TextEncoder` folds an unpaired surrogate to U+FFFD, one
+ * code unit for one code unit, and paired surrogates survive intact.
+ */
+export function joinKeyParts(...parts: string[]): string {
+  return parts.map(part => `${part.length}${SEPARATOR}${part}`).join('');
+}
+
+/**
+ * Split one length-prefixed component (`{len}:{part}`) off the front of `rest`.
+ * Returns null on a malformed length or an out-of-bounds slice.
+ */
+function splitKeyPart(rest: string): { part: string; remainder: string } | null {
+  const lenColon = rest.indexOf(SEPARATOR);
+  if (lenColon <= 0) return null;
+  const lenStr = rest.slice(0, lenColon);
+  if (!/^\d+$/.test(lenStr)) return null;
+  const len = parseInt(lenStr, 10);
+  const start = lenColon + 1;
+  if (start + len > rest.length) return null;
+  return { part: rest.slice(start, start + len), remainder: rest.slice(start + len) };
+}
+
+/**
+ * Split exactly `count` length-prefixed components off the front of `rest` — the
+ * inverse of {@link joinKeyParts}. Returns null if any component is malformed.
+ */
+function splitKeyParts(rest: string, count: number): { parts: string[]; remainder: string } | null {
+  const parts: string[] = [];
+  let remainder = rest;
+  for (let i = 0; i < count; i++) {
+    const split = splitKeyPart(remainder);
+    if (!split) return null;
+    parts.push(split.part);
+    remainder = split.remainder;
+  }
+  return { parts, remainder };
 }
 
 /**
@@ -121,12 +179,9 @@ export function encodeRawPkIdentity(pk: SqlValue[]): string {
 
 /**
  * Build a column version key.
- * Format: cv:{schema}.{table}:{identity_length}:{identity}:{column}
+ * Format: cv:{n}:{schema}{n}:{table}{n}:{identity}{n}:{column}
  *
- * The identity is LENGTH-PREFIXED (code units of the decoded key string) because
- * it freely contains `:` (type tags) and `\0` (member separator) — no separator
- * character is guaranteed absent, so an explicit length is the only unambiguous
- * split between identity and column.
+ * Every component is length-prefixed — see {@link joinKeyParts}.
  */
 export function buildColumnVersionKey(
   schemaName: string,
@@ -135,14 +190,12 @@ export function buildColumnVersionKey(
   column: string
 ): Uint8Array {
   assertKeyableIdentifiers(schemaName, tableName, column);
-  const key = `cv:${schemaName}.${tableName}${SEPARATOR}${identity.length}${SEPARATOR}${identity}${SEPARATOR}${column}`;
-  return encoder.encode(key);
+  return encoder.encode(`cv:${joinKeyParts(schemaName, tableName, identity, column)}`);
 }
 
 /**
  * Build a tombstone key.
- * Format: tb:{schema}.{table}:{identity}
- * (No length prefix — the identity is the final component.)
+ * Format: tb:{n}:{schema}{n}:{table}{n}:{identity}
  */
 export function buildTombstoneKey(
   schemaName: string,
@@ -150,8 +203,7 @@ export function buildTombstoneKey(
   identity: string
 ): Uint8Array {
   assertKeyableIdentifiers(schemaName, tableName);
-  const key = `tb:${schemaName}.${tableName}${SEPARATOR}${identity}`;
-  return encoder.encode(key);
+  return encoder.encode(`tb:${joinKeyParts(schemaName, tableName, identity)}`);
 }
 
 /**
@@ -196,7 +248,10 @@ export function parsePeerStateKey(key: Uint8Array): SiteId | null {
 
 /**
  * Build a schema migration key.
- * Format: sm:{schema}.{table}:{version}
+ * Format: sm:{n}:{schema}{n}:{table}{version_padded_10}
+ *
+ * The version is fixed-width zero-padded (not length-prefixed) so migrations of
+ * one table sort by version within the table's prefix.
  */
 export function buildSchemaMigrationKey(
   schemaName: string,
@@ -204,55 +259,57 @@ export function buildSchemaMigrationKey(
   version: number
 ): Uint8Array {
   assertKeyableIdentifiers(schemaName, tableName);
-  return encoder.encode(`sm:${schemaName}.${tableName}${SEPARATOR}${version.toString().padStart(10, '0')}`);
+  const versionPart = version.toString().padStart(10, '0');
+  return encoder.encode(`sm:${joinKeyParts(schemaName, tableName)}${versionPart}`);
+}
+
+/**
+ * Build a prefix over one `(schema, table)` under `prefix`. Exact: each
+ * component's length is carried by the component itself, so no other
+ * `(schema, table)` pair can share these bytes (see {@link joinKeyParts}).
+ */
+function buildTablePrefix(prefix: string, schemaName: string, tableName: string): Uint8Array {
+  return encoder.encode(`${prefix}${joinKeyParts(schemaName, tableName)}`);
+}
+
+/** Scan bounds over an exact byte prefix. */
+function prefixBounds(prefix: Uint8Array): { gte: Uint8Array; lt: Uint8Array } {
+  return { gte: prefix, lt: incrementLastByte(prefix) };
 }
 
 /**
  * Build scan bounds for all column versions of a table.
- * Returns keys to scan cv:{schema}.{table}:*
+ * Returns keys to scan cv:{n}:{schema}{n}:{table}*
  */
 export function buildTableColumnVersionScanBounds(
   schemaName: string,
   tableName: string,
 ): { gte: Uint8Array; lt: Uint8Array } {
-  const prefix = `cv:${schemaName}.${tableName}${SEPARATOR}`;
-  return {
-    gte: encoder.encode(prefix),
-    lt: incrementLastByte(encoder.encode(prefix)),
-  };
+  return prefixBounds(buildTablePrefix('cv:', schemaName, tableName));
 }
 
 /**
  * The key prefix shared by every column version of one row:
- * `cv:{schema}.{table}:{identity_length}:{identity}:`.
- *
- * Exported so a row scan can recover each entry's column name by stripping this
- * exact prefix, rather than splitting the key at its last `:` — the column name
- * is the only unbounded, separator-bearing component, so only the prefix is
- * unambiguous (see {@link parseColumnVersionKey}, which has no pk to anchor on).
+ * `cv:{n}:{schema}{n}:{table}{n}:{identity}`.
  */
-export function buildColumnVersionRowPrefix(
+function buildColumnVersionRowPrefix(
   schemaName: string,
   tableName: string,
   identity: string
 ): string {
-  return `cv:${schemaName}.${tableName}${SEPARATOR}${identity.length}${SEPARATOR}${identity}${SEPARATOR}`;
+  return `cv:${joinKeyParts(schemaName, tableName, identity)}`;
 }
 
 /**
  * Build scan bounds for all column versions of a row.
- * Returns keys to scan cv:{schema}.{table}:{identity_length}:{identity}:*
+ * Returns keys to scan cv:{n}:{schema}{n}:{table}{n}:{identity}*
  */
 export function buildColumnVersionScanBounds(
   schemaName: string,
   tableName: string,
   identity: string
 ): { gte: Uint8Array; lt: Uint8Array } {
-  const prefix = buildColumnVersionRowPrefix(schemaName, tableName, identity);
-  return {
-    gte: encoder.encode(prefix),
-    lt: incrementLastByte(encoder.encode(prefix)),
-  };
+  return prefixBounds(encoder.encode(buildColumnVersionRowPrefix(schemaName, tableName, identity)));
 }
 
 /**
@@ -262,11 +319,7 @@ export function buildTombstoneScanBounds(
   schemaName: string,
   tableName: string
 ): { gte: Uint8Array; lt: Uint8Array } {
-  const prefix = `tb:${schemaName}.${tableName}${SEPARATOR}`;
-  return {
-    gte: encoder.encode(prefix),
-    lt: incrementLastByte(encoder.encode(prefix)),
-  };
+  return prefixBounds(buildTablePrefix('tb:', schemaName, tableName));
 }
 
 /**
@@ -276,11 +329,7 @@ export function buildSchemaMigrationScanBounds(
   schemaName: string,
   tableName: string
 ): { gte: Uint8Array; lt: Uint8Array } {
-  const prefix = `sm:${schemaName}.${tableName}${SEPARATOR}`;
-  return {
-    gte: encoder.encode(prefix),
-    lt: incrementLastByte(encoder.encode(prefix)),
-  };
+  return prefixBounds(buildTablePrefix('sm:', schemaName, tableName));
 }
 
 /**
@@ -330,29 +379,13 @@ export function buildAllSchemaMigrationsScanBounds(): { gte: Uint8Array; lt: Uin
 }
 
 /**
- * Split a length-prefixed identity component off `rest` (the key text after the
- * table's separator): `{identity_length}:{identity}` followed by `remainder`.
- * Returns null on a malformed length or out-of-bounds slice.
- */
-function splitLengthPrefixedIdentity(rest: string): { identity: string; remainder: string } | null {
-  const lenColon = rest.indexOf(SEPARATOR);
-  if (lenColon <= 0) return null;
-  const lenStr = rest.slice(0, lenColon);
-  if (!/^\d+$/.test(lenStr)) return null;
-  const len = parseInt(lenStr, 10);
-  const start = lenColon + 1;
-  if (start + len > rest.length) return null;
-  return { identity: rest.slice(start, start + len), remainder: rest.slice(start + len) };
-}
-
-/**
  * Parse a column version key to extract components.
- * Key format: cv:{schema}.{table}:{identity_length}:{identity}:{column}
+ * Key format: cv:{n}:{schema}{n}:{table}{n}:{identity}{n}:{column}
  *
  * Returns the pk IDENTITY string — the identity is lossy and cannot be decoded
  * back to values; the raw pk lives in the record VALUE (`ColumnVersion.pk`).
- * The length prefix makes the identity/column split unambiguous regardless of
- * what characters either contains.
+ * The per-component length prefixes make every split unambiguous regardless of
+ * what characters any component contains.
  */
 export function parseColumnVersionKey(key: Uint8Array): {
   schema: string;
@@ -363,26 +396,16 @@ export function parseColumnVersionKey(key: Uint8Array): {
   const keyStr = new TextDecoder().decode(key);
   if (!keyStr.startsWith('cv:')) return null;
 
-  // cv:{schema}.{table}:{identity_length}:{identity}:{column}
-  const rest = keyStr.slice(3); // Remove 'cv:'
-  const firstDot = rest.indexOf('.');
-  if (firstDot === -1) return null;
-  const schema = rest.slice(0, firstDot);
+  const split = splitKeyParts(keyStr.slice(3), 4);
+  if (!split || split.remainder.length !== 0) return null;
 
-  const afterDot = rest.slice(firstDot + 1);
-  const firstColon = afterDot.indexOf(':');
-  if (firstColon === -1) return null;
-  const table = afterDot.slice(0, firstColon);
-
-  const split = splitLengthPrefixedIdentity(afterDot.slice(firstColon + 1));
-  if (!split || !split.remainder.startsWith(SEPARATOR)) return null;
-
-  return { schema, table, identity: split.identity, column: split.remainder.slice(1) };
+  const [schema, table, identity, column] = split.parts;
+  return { schema, table, identity, column };
 }
 
 /**
  * Parse a tombstone key to extract components.
- * Key format: tb:{schema}.{table}:{identity}
+ * Key format: tb:{n}:{schema}{n}:{table}{n}:{identity}
  *
  * Returns the pk IDENTITY string; the raw pk lives in the record VALUE
  * (`Tombstone.pk`).
@@ -395,23 +418,16 @@ export function parseTombstoneKey(key: Uint8Array): {
   const keyStr = new TextDecoder().decode(key);
   if (!keyStr.startsWith('tb:')) return null;
 
-  // tb:{schema}.{table}:{identity}
-  const rest = keyStr.slice(3); // Remove 'tb:'
-  const firstDot = rest.indexOf('.');
-  if (firstDot === -1) return null;
-  const schema = rest.slice(0, firstDot);
+  const split = splitKeyParts(keyStr.slice(3), 3);
+  if (!split || split.remainder.length !== 0) return null;
 
-  const afterDot = rest.slice(firstDot + 1);
-  const firstColon = afterDot.indexOf(':');
-  if (firstColon === -1) return null;
-  const table = afterDot.slice(0, firstColon);
-
-  return { schema, table, identity: afterDot.slice(firstColon + 1) };
+  const [schema, table, identity] = split.parts;
+  return { schema, table, identity };
 }
 
 /**
  * Parse a schema migration key to extract components.
- * Key format: sm:{schema}.{table}:{version}
+ * Key format: sm:{n}:{schema}{n}:{table}{version_padded_10}
  */
 export function parseSchemaMigrationKey(key: Uint8Array): {
   schema: string;
@@ -421,23 +437,11 @@ export function parseSchemaMigrationKey(key: Uint8Array): {
   const keyStr = new TextDecoder().decode(key);
   if (!keyStr.startsWith('sm:')) return null;
 
-  // sm:{schema}.{table}:{version}
-  const rest = keyStr.slice(3); // Remove 'sm:'
-  const firstDot = rest.indexOf('.');
-  if (firstDot === -1) return null;
-  const schema = rest.slice(0, firstDot);
+  const split = splitKeyParts(keyStr.slice(3), 2);
+  if (!split || !/^\d+$/.test(split.remainder)) return null;
 
-  const afterDot = rest.slice(firstDot + 1);
-  const firstColon = afterDot.indexOf(':');
-  if (firstColon === -1) return null;
-  const table = afterDot.slice(0, firstColon);
-
-  const versionStr = afterDot.slice(firstColon + 1);
-  const version = parseInt(versionStr, 10);
-
-  if (isNaN(version)) return null;
-
-  return { schema, table, version };
+  const [schema, table] = split.parts;
+  return { schema, table, version: parseInt(split.remainder, 10) };
 }
 
 /**
@@ -478,11 +482,11 @@ export function deserializeHLCFromKey(buffer: Uint8Array): HLC {
 
 /**
  * Build a change log key.
- * Format: cl:{hlc_bytes}{type_byte}{schema}.{table}:{identity_length}:{identity}[:{column}]
+ * Format: cl:{hlc_bytes}{type_byte}{n}:{schema}{n}:{table}{n}:{identity}[{n}:{column}]
  *
  * The HLC comes first to enable efficient range scans by time.
  * type_byte: 0x01 for column change, 0x02 for delete
- * The identity is length-prefixed for the same reason as {@link buildColumnVersionKey}.
+ * Every text component is length-prefixed — see {@link joinKeyParts}.
  */
 export function buildChangeLogKey(
   hlc: HLC,
@@ -495,10 +499,12 @@ export function buildChangeLogKey(
   assertKeyableIdentifiers(schemaName, tableName, ...(column !== undefined ? [column] : []));
   const hlcBytes = serializeHLCForKey(hlc);
   const typeByte = entryType === 'column' ? 0x01 : 0x02;
-  const pkPart = `${identity.length}${SEPARATOR}${identity}`;
-  const suffix = column
-    ? `${schemaName}.${tableName}${SEPARATOR}${pkPart}${SEPARATOR}${column}`
-    : `${schemaName}.${tableName}${SEPARATOR}${pkPart}`;
+  // `!== undefined`, not truthiness: a zero-length column name must still emit its
+  // (empty) component, or the builder would write 3 parts where `parseChangeLogKey`
+  // demands 4 for a `column` entry and the record would read back as unparseable.
+  const suffix = column !== undefined
+    ? joinKeyParts(schemaName, tableName, identity, column)
+    : joinKeyParts(schemaName, tableName, identity);
   const suffixBytes = encoder.encode(suffix);
 
   // cl: (3) + hlc (30) + type (1) + suffix
@@ -579,31 +585,21 @@ export function parseChangeLogKey(key: Uint8Array): {
 
   const suffixStr = new TextDecoder().decode(key.slice(34));
 
-  // Parse suffix: {schema}.{table}:{identity_length}:{identity}[:{column}]
-  const firstDot = suffixStr.indexOf('.');
-  if (firstDot === -1) return null;
-  const schema = suffixStr.slice(0, firstDot);
+  // Parse suffix: {n}:{schema}{n}:{table}{n}:{identity}[{n}:{column}]
+  const split = splitKeyParts(suffixStr, entryType === 'column' ? 4 : 3);
+  if (!split || split.remainder.length !== 0) return null;
 
-  const afterDot = suffixStr.slice(firstDot + 1);
-  const firstColon = afterDot.indexOf(':');
-  if (firstColon === -1) return null;
-  const table = afterDot.slice(0, firstColon);
-
-  const split = splitLengthPrefixedIdentity(afterDot.slice(firstColon + 1));
-  if (!split) return null;
-
+  const [schema, table, identity] = split.parts;
   if (entryType === 'column') {
-    if (!split.remainder.startsWith(SEPARATOR)) return null;
-    return { hlc, entryType, schema, table, identity: split.identity, column: split.remainder.slice(1) };
+    return { hlc, entryType, schema, table, identity, column: split.parts[3] };
   }
   // Delete entry - no column
-  if (split.remainder.length !== 0) return null;
-  return { hlc, entryType, schema, table, identity: split.identity };
+  return { hlc, entryType, schema, table, identity };
 }
 
 /**
  * Build a quarantine key for a held out-of-basis straggler change.
- * Format: qt:{schema}.{table}: + hlc_bytes(30) + type_byte(1) + :{raw_identity}[:{column}]
+ * Format: qt:{n}:{schema}{n}:{table} + hlc_bytes(30) + type_byte(1) + {n}:{raw_identity}[{n}:{column}]
  *
  * Unlike the change log (`cl:`), the table prefix comes BEFORE the HLC so the
  * range scans by `(schema, table)` for operator inspection. The HLC + type + pk
@@ -628,13 +624,13 @@ export function buildQuarantineKey(
   column?: string
 ): Uint8Array {
   assertKeyableIdentifiers(schemaName, tableName, ...(column !== undefined ? [column] : []));
-  const prefixBytes = encoder.encode(`qt:${schemaName}.${tableName}${SEPARATOR}`);
+  const prefixBytes = buildTablePrefix('qt:', schemaName, tableName);
   const hlcBytes = serializeHLCForKey(hlc);
   const typeByte = entryType === 'column' ? 0x01 : 0x02;
   const rawIdentity = encodeRawPkIdentity(pk);
-  const suffix = column
-    ? `${SEPARATOR}${rawIdentity}${SEPARATOR}${column}`
-    : `${SEPARATOR}${rawIdentity}`;
+  const suffix = column !== undefined
+    ? joinKeyParts(rawIdentity, column)
+    : joinKeyParts(rawIdentity);
   const suffixBytes = encoder.encode(suffix);
 
   const key = new Uint8Array(prefixBytes.length + 30 + 1 + suffixBytes.length);
@@ -649,7 +645,9 @@ export function buildQuarantineKey(
 /**
  * Build scan bounds over quarantine entries.
  * - both `schemaName` and `tableName`: a single table's held changes.
- * - `schemaName` only: all held changes in that schema.
+ * - `schemaName` only: all held changes in that schema — `qt:{n}:{schema}` is
+ *   exact, since the schema's own length prefix terminates it (a different
+ *   schema differs in either that length or its text).
  * - neither: every quarantine entry (the GC sweep).
  */
 export function buildQuarantineScanBounds(
@@ -657,12 +655,10 @@ export function buildQuarantineScanBounds(
   tableName?: string
 ): { gte: Uint8Array; lt: Uint8Array } {
   if (schemaName !== undefined && tableName !== undefined) {
-    const prefix = encoder.encode(`qt:${schemaName}.${tableName}${SEPARATOR}`);
-    return { gte: prefix, lt: incrementLastByte(prefix) };
+    return prefixBounds(buildTablePrefix('qt:', schemaName, tableName));
   }
   if (schemaName !== undefined) {
-    const prefix = encoder.encode(`qt:${schemaName}.`);
-    return { gte: prefix, lt: incrementLastByte(prefix) };
+    return prefixBounds(encoder.encode(`qt:${joinKeyParts(schemaName)}`));
   }
   return {
     gte: SYNC_KEY_PREFIX.QUARANTINE,
@@ -672,7 +668,7 @@ export function buildQuarantineScanBounds(
 
 /**
  * Build a basis-table lifecycle key.
- * Format: bl:{schema}.{table} (both lowercased — basis relations are keyed
+ * Format: bl:{n}:{schema}{n}:{table} (both lowercased — basis relations are keyed
  * lowercased throughout the lens deployment snapshot, so the lifecycle key
  * matches `relationBacking` / `derivation.sourceTables` keys exactly).
  *
@@ -682,7 +678,7 @@ export function buildQuarantineScanBounds(
  */
 export function buildBasisLifecycleKey(schemaName: string, tableName: string): Uint8Array {
   assertKeyableIdentifiers(schemaName, tableName);
-  return encoder.encode(`bl:${schemaName.toLowerCase()}.${tableName.toLowerCase()}`);
+  return buildTablePrefix('bl:', schemaName.toLowerCase(), tableName.toLowerCase());
 }
 
 /**
