@@ -159,36 +159,58 @@ describe('checkpoint invariant probe', () => {
 
 		const chunks = await chunksOf(sender);
 
-		// Count rows actually returned from `applyDataToStore` (durably applied),
-		// not merely handed to it.
-		let rowsApplied = 0;
+		// Count rows PER TABLE actually returned from `applyDataToStore` (durably
+		// applied), not merely handed to it. Per-table rather than a single total so
+		// the assertion below stays honest if the scenario ever grows a second
+		// row-bearing table — a total can be satisfied by the wrong table's rows.
+		const rowsApplied = new Map<string, number>();
 		const managerInternals = receiver.manager as unknown as { applyToStore?: ApplyToStoreCallback };
 		const originalApplyToStore = managerInternals.applyToStore;
 		managerInternals.applyToStore = async (dataChanges, schemaChanges, options) => {
 			const result = await originalApplyToStore!(dataChanges, schemaChanges, options);
-			rowsApplied += dataChanges.length;
+			for (const change of dataChanges) {
+				const key = `${change.schema}.${change.table}`;
+				rowsApplied.set(key, (rowsApplied.get(key) ?? 0) + 1);
+			}
 			return result;
 		};
 
-		// Snapshot `rowsApplied` at the moment of every `sc:` checkpoint write.
-		const checkpointSaves: Array<{ completedTables: string[]; rowsAppliedAtSave: number }> = [];
+		// Snapshot the per-table applied counts at the moment of every `sc:` checkpoint write.
+		const checkpointSaves: Array<{ completedTables: string[]; appliedAtSave: Map<string, number> }> = [];
 		const originalPut = receiver.manager.kv.put.bind(receiver.manager.kv);
 		receiver.manager.kv.put = async (key: Uint8Array, value: Uint8Array, options?: WriteOptions) => {
 			if (new TextDecoder().decode(key).startsWith('sc:')) {
 				const parsed = JSON.parse(new TextDecoder().decode(value)) as { completedTables: string[] };
-				checkpointSaves.push({ completedTables: [...parsed.completedTables], rowsAppliedAtSave: rowsApplied });
+				checkpointSaves.push({ completedTables: [...parsed.completedTables], appliedAtSave: new Map(rowsApplied) });
 			}
 			return originalPut(key, value, options);
 		};
 
 		await receiver.manager.applySnapshotStream(toStream(chunks));
 
-		expect(checkpointSaves.length, 'the ghost tombstone flush fired exactly one mid-stream checkpoint')
-			.to.equal(1);
+		// Non-vacuity: the probe only proves anything if this run actually saved a
+		// mid-stream checkpoint that named a table complete. Asserted separately from
+		// the invariant so a scenario that stops producing one fails loudly here
+		// rather than passing an empty loop. Not pinned to an exact count — the
+		// invariant loop below is generic over however many saves occur.
+		expect(checkpointSaves.length, 'the ghost tombstone flush fired a mid-stream checkpoint')
+			.to.be.at.least(1);
+		expect(
+			checkpointSaves.some((save) => save.completedTables.length > 0),
+			'at least one saved checkpoint names a completed table',
+		).to.equal(true);
+
+		// Full row count of every table this scenario streams rows for. A table named
+		// complete by a checkpoint must already have ALL of these durable.
+		const expectedRows = new Map<string, number>([['main.big', ROWS]]);
 		for (const save of checkpointSaves) {
-			if (save.completedTables.includes('main.big')) {
-				expect(save.rowsAppliedAtSave, 'big is claimed complete only once all its rows are durable')
-					.to.be.at.least(ROWS);
+			for (const table of save.completedTables) {
+				const expected = expectedRows.get(table);
+				// An untracked table here means the scenario drifted; failing beats
+				// silently asserting `at least 0` against it.
+				expect(expected, `this scenario knows ${table}'s full row count`).to.not.equal(undefined);
+				expect(save.appliedAtSave.get(table) ?? 0, `${table} is claimed complete only once all its rows are durable`)
+					.to.be.at.least(expected!);
 			}
 		}
 

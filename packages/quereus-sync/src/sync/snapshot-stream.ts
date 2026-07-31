@@ -430,6 +430,10 @@ export async function applySnapshotStream(
 				snapshotId,
 				siteId: ctx.getSiteId(),
 				hlc: snapshotHLC,
+				// NOTE: nothing reads these two — resume keys off `completedTables` alone.
+				// `tablesProcessed` counts `table-end`s, so it can exceed
+				// `completedTables.length` while tables are staged; if a resume path ever
+				// starts seeking by index, derive it from `completedTables`, not from here.
 				lastTableIndex: tablesProcessed,
 				lastEntryIndex: entriesProcessed,
 				completedTables: [...completedTables],

@@ -846,6 +846,14 @@ interface SnapshotProgress {
  * `JSON.stringify` throws on. Cross the wire via `serializeSnapshotCheckpoint` /
  * `deserializeSnapshotCheckpoint` (`sync/wire.ts`), which encode both as base64
  * into `SerializedSnapshotCheckpoint` — the shape `resume_snapshot` carries.
+ *
+ * INVARIANT on `completedTables`: a table appears here only after every one of its
+ * rows has returned from the store apply. A resumed sender SKIPS these tables and
+ * the receiver PRESERVES their metadata through the resume's up-front clear, so a
+ * table named prematurely would lose its trailing rows permanently — they are never
+ * re-sent, never reconciled, never reported. `applySnapshotStream` upholds this by
+ * staging a finished table and graduating it only inside its data flush; being late
+ * is safe (the table is merely re-streamed), being early is not.
  */
 interface SnapshotCheckpoint {
   snapshotId: string;
