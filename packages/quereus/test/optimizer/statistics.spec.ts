@@ -11,6 +11,7 @@ import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type { ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { FilterNode } from '../../src/planner/nodes/filter.js';
+import { TableReferenceNode } from '../../src/planner/nodes/reference.js';
 import type { SqlValue } from '../../src/common/types.js';
 
 // ── Histogram unit tests ───────────────────────────────────────────────────
@@ -663,8 +664,10 @@ describe('base-table cardinality from catalog statistics', () => {
 		return found;
 	}
 
-	function optimizedPlan(db: Database, sql: string): PlanNode {
-		return (db as unknown as { getPlan(s: string): PlanNode }).getPlan(sql);
+	function findTableRef(root: PlanNode): TableReferenceNode | undefined {
+		let found: TableReferenceNode | undefined;
+		walk(root, (n) => { if (!found && n instanceof TableReferenceNode) found = n; });
+		return found;
 	}
 
 	// ── catalogRowCount unit cases ──────────────────────────────────────────
@@ -694,6 +697,18 @@ describe('base-table cardinality from catalog statistics', () => {
 			const stats = { rowCount: 0, columnStats: new Map() } as TableStatistics;
 			expect(catalogRowCount(makeTableSchema(stats, 500))).to.equal(0);
 		});
+
+		// CatalogStatsProvider.tableRows is the other caller of the helper; it must agree
+		// with the node getter and still hand the fully-unknown case to NaiveStatsProvider.
+		it('CatalogStatsProvider.tableRows agrees with the helper, defaulting only when nothing is known', () => {
+			const provider = new CatalogStatsProvider();
+			const stats = { rowCount: 100, columnStats: new Map() } as TableStatistics;
+			expect(provider.tableRows(makeTableSchema(stats, 0))).to.equal(100);
+			expect(provider.tableRows(makeTableSchema(undefined, 0))).to.equal(0);
+			expect(provider.tableRows(makeTableSchema(undefined, 42))).to.equal(42);
+			// Neither source knows: NaiveStatsProvider's 1000 default, not 0 and not undefined.
+			expect(provider.tableRows(makeTableSchema(undefined, undefined))).to.equal(1000);
+		});
 	});
 
 	// ── End-to-end: scan cardinality after ANALYZE ──────────────────────────
@@ -702,23 +717,23 @@ describe('base-table cardinality from catalog statistics', () => {
 		let db: Database;
 		beforeEach(async () => {
 			db = new Database();
-			await db.exec('CREATE TABLE m (id INTEGER PRIMARY KEY, a INTEGER, s TEXT) USING memory');
+			await db.exec('create table m (id integer primary key, a integer, s text) using memory');
 		});
 		afterEach(async () => { await db.close(); });
 
 		async function seed(rows: number, startId: number = 1): Promise<void> {
 			for (let i = startId; i < startId + rows; i++) {
-				await db.exec(`INSERT INTO m VALUES (${i}, ${i % 4}, 's${i}')`);
+				await db.exec(`insert into m values (${i}, ${i % 4}, 's${i}')`);
 			}
 		}
 
 		it('an analyzed, populated table reports its real row count on the scan (not 0)', async () => {
 			await seed(100);
-			for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
+			for await (const _ of db.eval('analyze m')) { /* consume */ }
 			const ndv = db.schemaManager.findTable('m')?.statistics?.columnStats.get('a')?.distinctCount;
 			expect(ndv, 'ANALYZE should record a distinct count for a').to.be.a('number');
 
-			const plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			const plan = db.getPlan('select * from m where a = 1');
 			const scan = findScanNode(plan);
 			expect(scan, 'expected a physical access node').to.not.be.undefined;
 			expect(scan!.physical?.estimatedRows).to.equal(100);
@@ -727,24 +742,33 @@ describe('base-table cardinality from catalog statistics', () => {
 			expect(filter, 'expected a residual Filter').to.not.be.undefined;
 			expect(filter!.physical?.estimatedRows).to.equal(Math.max(1, Math.floor(100 / (ndv as number))));
 			expect(filter!.physical?.estimatedRows).to.not.equal(0);
+
+			// EXPLAIN reads getLogicalAttributes; it must print the number the cost model used.
+			const tableRef = findTableRef(plan);
+			expect(tableRef, 'expected a TableReference').to.not.be.undefined;
+			const estimates = tableRef!.getLogicalAttributes().estimates as { rows?: number };
+			expect(estimates.rows).to.equal(100);
 		});
 
 		it('a populated but never-analyzed table keeps the static (0) estimate — the change is inert without ANALYZE', async () => {
 			await seed(100);
 			// No ANALYZE.
-			const plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			const schema = db.schemaManager.findTable('m');
+			expect(schema?.statistics, 'no ANALYZE means no statistics').to.be.undefined;
+			expect(schema?.estimatedRows, 'SchemaManager stamps a static 0 at CREATE TABLE').to.equal(0);
+
+			const plan = db.getPlan('select * from m where a = 1');
 			const scan = findScanNode(plan);
 			expect(scan, 'expected a physical access node').to.not.be.undefined;
-			const staticEstimate = db.schemaManager.findTable('m')?.estimatedRows;
-			expect(scan!.physical?.estimatedRows).to.equal(staticEstimate);
+			expect(scan!.physical?.estimatedRows).to.equal(0);
 		});
 
 		it('ANALYZE on an empty table: scan and filter both report 0', async () => {
 			// No rows inserted.
-			for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
+			for await (const _ of db.eval('analyze m')) { /* consume */ }
 			expect(db.schemaManager.findTable('m')?.statistics?.rowCount).to.equal(0);
 
-			const plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			const plan = db.getPlan('select * from m where a = 1');
 			const scan = findScanNode(plan);
 			expect(scan!.physical?.estimatedRows).to.equal(0);
 
@@ -754,13 +778,13 @@ describe('base-table cardinality from catalog statistics', () => {
 
 		it('re-ANALYZE after further inserts: the scan estimate tracks the new count', async () => {
 			await seed(20);
-			for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
-			let plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			for await (const _ of db.eval('analyze m')) { /* consume */ }
+			let plan = db.getPlan('select * from m where a = 1');
 			expect(findScanNode(plan)!.physical?.estimatedRows).to.equal(20);
 
 			await seed(30, 21); // ids 21..50, 30 more rows
-			for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
-			plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			for await (const _ of db.eval('analyze m')) { /* consume */ }
+			plan = db.getPlan('select * from m where a = 1');
 			expect(findScanNode(plan)!.physical?.estimatedRows).to.equal(50);
 		});
 	});

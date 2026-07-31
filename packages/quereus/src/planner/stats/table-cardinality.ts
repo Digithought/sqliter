@@ -14,6 +14,14 @@
  *
  * NOTE: `rowCount` is a snapshot from the last `ANALYZE` — rows written
  * afterwards are invisible until the next one.
+ *
+ * NOTE: a real 0 (analyzed, empty table) is distinct from `undefined`, but the
+ * `estimatedRows || default` spellings in `rule-select-access-path`,
+ * `rule-grow-retrieve` and `IndexSeekNode.computePhysical` collapse the two and
+ * substitute their default — so an analyzed empty table reaches
+ * `getBestAccessPlan` as "unknown" (1000) while a SeqScan over it reports 0.
+ * Harmless today (any plan over 0 rows is cheap); switch those to `??` if an
+ * empty-table plan ever costs out wrong.
  */
 
 import type { TableSchema } from '../../schema/table.js';

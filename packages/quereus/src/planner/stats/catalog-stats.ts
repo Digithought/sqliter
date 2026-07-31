@@ -133,11 +133,10 @@ export class CatalogStatsProvider implements StatsProvider {
 	}
 
 	tableRows(table: TableSchema): number | undefined {
-		if (table.statistics) {
-			log('Table %s: catalog rowCount=%d', table.name, table.statistics.rowCount);
-			return table.statistics.rowCount;
-		}
-		return catalogRowCount(table) ?? this.fallback.tableRows(table);
+		const rows = catalogRowCount(table);
+		if (rows === undefined) return this.fallback.tableRows(table);
+		log('Table %s: rowCount=%d (source: %s)', table.name, rows, table.statistics ? 'catalog' : 'schema');
+		return rows;
 	}
 
 	selectivity(table: TableSchema, predicate: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined {
