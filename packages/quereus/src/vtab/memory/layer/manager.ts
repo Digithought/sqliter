@@ -3462,11 +3462,11 @@ export class MemoryTableManager {
 	 *     necessity, not because the data is invalid: the base must keep both rows for a
 	 *     rollback, and a base re-keyed under the new collation could not represent the pair
 	 *     at all → `BUSY` with the same "commit/rollback and retry" posture as
-	 *     {@link ensureSchemaChangeSafety}. The persistent store backend refuses the same
-	 *     shape for the same reason (its committed rows equally survive a rollback — see
-	 *     `backlog/bug-store-pk-collate-rejects-deleted-row-collision`); accepting it would
-	 *     take transaction-scoped DDL (`backlog/feat-transactional-ddl-native-backends`),
-	 *     which Quereus does not have.
+	 *     {@link ensureSchemaChangeSafety}. The persistent store backend asks the same two
+	 *     questions with the same statuses (`StoreTable.validateRekeyedPrimaryKey` in
+	 *     quereus-store — its committed rows equally survive a rollback); accepting the
+	 *     deleted-collider shape instead would take transaction-scoped DDL
+	 *     (`backlog/feat-transactional-ddl-native-backends`), which Quereus does not have.
 	 *
 	 * The passes judge different sets because a wrapper's effective stream and this manager's
 	 * layers genuinely diverge: staged inserts exist only in the stream, deleted committed

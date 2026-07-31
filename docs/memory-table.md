@@ -515,9 +515,10 @@ walk starts at the view's parent.
 A collision confined to committed rows the transaction has DELETED is therefore refused, on both
 legs, by physical necessity rather than because the data is invalid — the base must keep both
 rows for a rollback and a re-keyed base cannot represent the pair. The persistent store backend
-refuses the same shape for the same reason
-(`tickets/backlog/bug-store-pk-collate-rejects-deleted-row-collision.md`); accepting it needs
-transaction-scoped DDL (`tickets/backlog/feat-transactional-ddl-native-backends.md`).
+asks the same two questions with the same statuses before touching anything
+(`StoreTable.validateRekeyedPrimaryKey`; see [store.md](store.md) §"Per-column PK key collation",
+the `SET COLLATE` bullet); accepting the deleted-collider shape instead needs transaction-scoped DDL
+(tracked as `feat-transactional-ddl-native-backends`).
 
 The `BUSY` arm is deliberately conservative: a transaction that has held a colliding pair at
 *any* statement boundary is refused, even when its final view is clean and no savepoint can reach

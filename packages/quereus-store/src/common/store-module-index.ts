@@ -300,13 +300,16 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 * flush would rebuild an index missing its transaction's pending rows.
 	 *
 	 * `skipDuplicateCheck` suppresses {@link buildIndexEntries}' in-pass UNIQUE check.
-	 * The value-rewriting / key-transform ALTER COLUMN arm sets it: its pre-mutation
-	 * UNIQUE re-validation already judged the ISSUING connection's effective rows (a
-	 * wrapper's overlay included), and this rebuild sees only THIS module's committed
-	 * rows — a superset that may retain a row the wrapper's transaction has deleted, so
-	 * judging it here would spuriously reject a duplicate pair the probe correctly
-	 * accepted. Mirrors the memory module's deliberately non-enforcing base rebuild
-	 * (the probe is the only guard).
+	 * Both ALTER COLUMN rebuild callers set it — the value-rewriting / key-transform
+	 * arm and the PK re-key arm (`SET COLLATE` on a PK member): each runs a
+	 * pre-mutation UNIQUE re-validation that already judged the ISSUING connection's
+	 * effective rows (a wrapper's overlay included), and this rebuild sees only THIS
+	 * module's committed rows — a set that may retain a row the wrapper's transaction
+	 * has deleted, so judging it here would spuriously reject a duplicate pair the
+	 * probe correctly accepted (and, worse, reject AFTER the data store was already
+	 * re-keyed). Mirrors the memory module's deliberately non-enforcing base rebuild
+	 * (the probe is the only guard). `ALTER PRIMARY KEY`'s rebuild still enforces:
+	 * that arm has no effective-row UNIQUE probe of its own.
 	 */
 	protected async rebuildSecondaryIndexes(
 		schemaName: string,

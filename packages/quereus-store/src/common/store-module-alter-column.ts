@@ -183,32 +183,48 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 
 		// SET COLLATE on a PRIMARY KEY member (Option B physical re-key): re-encode
 		// every data-store key under the column's new key collation, then rebuild every
-		// secondary index (its keys embed the PK suffix). `rekeyRows` validates in a
-		// first pass and throws CONSTRAINT on a collision under the new collation WITHOUT
-		// mutating the store — so a coarser collation that collapses two distinct PKs
-		// (e.g. 'a'/'A' under BINARY→NOCASE) is rejected all-or-nothing, mirroring
-		// ALTER PRIMARY KEY. Runs AFTER the non-PK UNIQUE re-validation above so both
-		// throw-only checks precede the first store mutation. `updatedSchema.columns`
-		// carries the new collation, so the new key bytes follow it.
+		// secondary index (its keys embed the PK suffix). Runs AFTER the non-PK UNIQUE
+		// re-validation above so every throw-only check precedes the first store
+		// mutation. `updatedSchema.columns` carries the new collation, so the new key
+		// bytes follow it.
 		const pkRekeyNeeded = (collationChanged || keyTransformChanged)
 			&& oldSchema.primaryKeyDefinition.some(def => def.index === colIndex);
 		if (pkRekeyNeeded) {
+			// The two throw-only re-key questions — "is the change legal?" over the rows
+			// this transaction can SEE (CONSTRAINT), then "can the store carry it?" over
+			// the committed rows a rollback must restore (BUSY) — asked BEFORE the DDL
+			// flush below, so either refusal leaves the store, the catalog AND the
+			// enclosing transaction untouched. Mirrors the memory backend's
+			// `MemoryTableManager.validateRekeyedPrimaryKey`. The effective probe judges
+			// the wrapper-supplied `rows` when the isolation layer holds the
+			// transaction's staged rows outside this store — closing the
+			// staged-vs-committed hole the old post-flush pass fell through (a staged
+			// insert colliding with a committed row was caught by neither side) — else
+			// this module's own effective entries, which include its buffered ops, so a
+			// pending insert that is itself the duplicate is caught without flushing.
+			await table.validateRekeyedPrimaryKey(
+				oldSchema.primaryKeyDefinition,
+				updatedSchema.columns,
+				rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
+			);
 			// Physical re-key ahead — flush buffered writes (see
-			// `StoreModuleBase.ddlCommitPendingOps`). Deliberately AFTER the non-PK UNIQUE
-			// re-validation above: that check reads effectively and throws without
-			// needing the flush, so it must keep the transaction alive.
-			//
-			// NOTE: `rekeyRows` detects PK collisions among THIS module's rows only. When a
-			// wrapper module supplied `rows`, its staged rows are not in this store, so a
-			// pending row that collides with a committed one under the new collation is
-			// caught by neither side — the wrapper's overlay enforces the PK among its own
-			// rows, this store among its own. Closing it needs a PK-dedupe pass over `rows`
-			// under the new collation here, before the re-key.
+			// `StoreModuleBase.ddlCommitPendingOps`). Every refusal this arm can make has
+			// already run above, reading effectively and throwing without the flush, so a
+			// rejected ALTER keeps the transaction alive; `rekeyRows`' own pass 1 is now a
+			// backstop, not the gate.
 			await this.ddlCommitPendingOps();
 			await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
 			// Materialize so the implicit `_uc_*` PK suffix is re-encoded under the new
-			// key collation too (`updatedSchema` carries none on its own).
-			await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver());
+			// key collation too (`updatedSchema` carries none on its own). NON-enforcing
+			// (`skipDuplicateCheck`): this rebuild reads only committed rows, which may
+			// retain a row a wrapper's transaction has deleted whose indexed value
+			// collides with a survivor — the pre-mutation
+			// `validateUniqueOverExistingRows` walk above already judged every unique
+			// structure covering the altered column against the transaction's effective
+			// rows, and an index NOT covering it has unchanged values and collation, so
+			// it cannot newly collide (the PK-suffix change never affects index-column
+			// uniqueness). See `rebuildSecondaryIndexes`' skipDuplicateCheck contract.
+			await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver(), true);
 		}
 
 		// Deferred value rewrite (SET DATA TYPE physical conversion / SET NOT NULL DEFAULT

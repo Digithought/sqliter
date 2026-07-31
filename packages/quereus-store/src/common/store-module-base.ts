@@ -335,11 +335,14 @@ export abstract class StoreModuleBase {
 	 *   transaction — every table's pending ops, not just the altered/renamed
 	 *   table's — in one all-or-nothing batch. An ALTER cannot half-commit some
 	 *   sibling tables.
-	 * - Validation running AFTER this point (e.g. `rekeyRows`' duplicate-key pass,
-	 *   which must see pending rows because a pending insert can itself be the
-	 *   duplicate) throws with the enclosing transaction already flushed. The store
-	 *   stays unmutated — only the transaction is gone. Validation that does NOT
-	 *   need pending rows belongs before the call, so the transaction survives it.
+	 * - Validation running AFTER this point (e.g. `ALTER PRIMARY KEY`'s duplicate-key
+	 *   pass — `rekeyRows` pass 1, which must see the flushed rows because a pending
+	 *   insert can itself be the duplicate) throws with the enclosing transaction
+	 *   already flushed. The store stays unmutated — only the transaction is gone.
+	 *   Validation that can read effectively belongs before the call, so the
+	 *   transaction survives it — the SET COLLATE PK re-key does exactly that
+	 *   (`StoreTable.validateRekeyedPrimaryKey` reads the effective rows, pending
+	 *   ops included, before this flush; `rekeyRows` pass 1 is only its backstop).
 	 *
 	 * Subsequent `commit()` calls on the same coordinator are no-ops
 	 * (`inTransaction` is cleared), which keeps the enclosing transaction safe.

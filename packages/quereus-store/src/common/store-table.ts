@@ -20,6 +20,7 @@ import {
 	ConflictResolution,
 	QuereusError,
 	StatusCode,
+	formatKeyValue,
 	rowsValueIdentical,
 	type ColumnSchema,
 	type TableSchema,
@@ -113,13 +114,111 @@ export class StoreTable extends StoreTableConstraints {
 	}
 
 	/**
+	 * Closure computing a row's data key under a NEW primary-key definition and
+	 * column set — the exact bytes {@link rekeyRows} pass 2 writes. Shared by
+	 * `rekeyRows`' two passes and {@link validateRekeyedPrimaryKey}'s probes so a
+	 * collision judged by a probe is byte-identical to the key the re-key would
+	 * write. Deliberately NOT the `dedupeRowSignature` / `KeyNormalizerResolver`
+	 * path the UNIQUE validators use — the two disagree for at least an `any`-typed
+	 * PK member, whose key bytes pin BINARY regardless of its declared collation
+	 * (pinned by `any-json-pk-binary-key.spec.ts`).
+	 *
+	 * The transforms matter too: an ALTER PRIMARY KEY onto (or a SET DATA TYPE
+	 * creating) a semantic-ordering member must collapse equal spellings, so
+	 * 'PT1H'/'PT60M' land on one key and are judged as the duplicate they are.
+	 */
+	rekeyedKeyComputer(
+		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
+		newColumns: ReadonlyArray<ColumnSchema> = this.tableSchema!.columns,
+	): (row: Row) => Uint8Array {
+		const newPkDirections = newPkDef.map(pk => !!pk.desc);
+		const newPkCollations = resolvePkKeyCollations(
+			newPkDef,
+			newColumns,
+			this.encodeOptions.collation ?? 'NOCASE',
+		);
+		const newPkTransforms = resolvePkKeyTransforms(newPkDef, newColumns);
+		return (row: Row): Uint8Array =>
+			buildDataKey(newPkDef.map(pk => row[pk.index]), this.encodeOptions, newPkDirections, newPkCollations, newPkTransforms);
+	}
+
+	/**
+	 * The store's counterpart of the memory backend's
+	 * `MemoryTableManager.validateRekeyedPrimaryKey`: the two throw-only questions a
+	 * PK re-key must answer, over two DIFFERENT row sets, BEFORE anything is flushed
+	 * or mutated (see docs/memory-table.md §"A collation change on a PRIMARY KEY
+	 * column obeys a stricter rule"):
+	 *
+	 *  1. **Is the change legal?** — over `effectiveRows`, the rows the DDL-issuing
+	 *     transaction can SEE (a wrapper's `EffectiveRowSource` when the isolation
+	 *     layer holds the transaction's staged rows outside this store, else this
+	 *     table's own effective stream). Two rows on one new key here is a duplicate
+	 *     a `select` in this transaction would return, so the change is invalid →
+	 *     `CONSTRAINT`, naming the colliding key.
+	 *  2. **Can the store carry it?** — over this store's COMMITTED rows, the set a
+	 *     `rollback` must be able to restore. The data store holds one row per key,
+	 *     so a committed pair collapsing onto one new key cannot be represented even
+	 *     when the transaction has deleted one of them → `BUSY`, with the memory
+	 *     module's "commit/rollback and retry" posture.
+	 *
+	 * Probe order is what makes the statuses right: the committed probe fires only
+	 * when the effective probe passed, i.e. only when the committed rows are NOT a
+	 * subset of the effective ones — which happens exactly when a wrapper's
+	 * transaction deleted a committed row. Run without a wrapper, effective ⊇
+	 * committed, so a committed collision always reports `CONSTRAINT` via the first
+	 * probe. Both probes key through {@link rekeyedKeyComputer}, so they and the
+	 * re-key agree byte-for-byte.
+	 */
+	async validateRekeyedPrimaryKey(
+		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
+		newColumns: ReadonlyArray<ColumnSchema>,
+		effectiveRows: AsyncIterable<Row>,
+	): Promise<void> {
+		const computeNewKey = this.rekeyedKeyComputer(newPkDef, newColumns);
+
+		const seenEffective = new Set<string>();
+		for await (const row of effectiveRows) {
+			const hex = bytesToHex(computeNewKey(row));
+			if (seenEffective.has(hex)) {
+				// Mirror the memory module's diagnostic, naming the key from the second
+				// (colliding) row's PK values.
+				const parts = newPkDef.map(pk => formatKeyValue(row[pk.index]));
+				throw new QuereusError(
+					`UNIQUE constraint failed: ${this.tableName} primary key collides under the new key definition (key: ${parts.join(', ')})`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			seenEffective.add(hex);
+		}
+
+		const store = await this.ensureStore();
+		const seenCommitted = new Set<string>();
+		for await (const entry of store.iterate(buildFullScanBounds())) {
+			const hex = bytesToHex(computeNewKey(deserializeRow(entry.value)));
+			if (seenCommitted.has(hex)) {
+				throw new QuereusError(
+					`Cannot re-key the primary key of table ${this.tableName}: `
+					+ `rows this transaction has removed still collide under the new key definition and must survive a rollback. `
+					+ `Commit/rollback and retry.`,
+					StatusCode.BUSY,
+				);
+			}
+			seenCommitted.add(hex);
+		}
+	}
+
+	/**
 	 * Re-key every stored row under a new primary-key definition.
 	 *
 	 * Two-pass, signatures-only pass 1: the first pass computes each row's new data
 	 * key and retains only a `Set` of key SIGNATURES (hex of the key bytes) to detect
 	 * collisions — two distinct old keys collapsing to one new key under a coarser
 	 * collation or a narrower PK. On collision we throw `CONSTRAINT` without touching
-	 * the store. The second pass RE-SCANS the same committed store, recomputes each
+	 * the store. For `ALTER PRIMARY KEY` this pass is the gate; for `ALTER COLUMN …
+	 * SET COLLATE` on a PK member it is only a backstop — that arm has already run
+	 * {@link validateRekeyedPrimaryKey}'s two probes before the DDL flush, so a
+	 * refusal there leaves the enclosing transaction alive. The second pass RE-SCANS
+	 * the same committed store, recomputes each
 	 * new key, and batches deletes of displaced old keys + puts of new (key, row)
 	 * pairs into ONE atomic batch. Rows whose new key matches the old key are no-ops.
 	 *
@@ -157,20 +256,10 @@ export class StoreTable extends StoreTableConstraints {
 		const store = await this.ensureStore();
 		const bounds = buildFullScanBounds();
 
-		const newPkDirections = newPkDef.map(pk => !!pk.desc);
-		const newPkCollations = resolvePkKeyCollations(
-			newPkDef,
-			newColumns,
-			this.encodeOptions.collation ?? 'NOCASE',
-		);
-		// Post-ALTER key-identity transforms too: an ALTER PRIMARY KEY onto (or a SET
-		// DATA TYPE creating) a semantic-ordering member must collapse equal spellings
-		// — pass 1 then rejects 'PT1H'/'PT60M' as a duplicate PK, all-or-nothing.
-		const newPkTransforms = resolvePkKeyTransforms(newPkDef, newColumns);
-		// Both passes key rows through this one helper, so a collision judged in pass 1
-		// is byte-identical to the key pass 2 writes.
-		const computeNewKey = (row: Row): Uint8Array =>
-			buildDataKey(newPkDef.map(pk => row[pk.index]), this.encodeOptions, newPkDirections, newPkCollations, newPkTransforms);
+		// Both passes key rows through this one helper — shared with the SET COLLATE
+		// arm's pre-flush probes — so a collision judged anywhere is byte-identical to
+		// the key pass 2 writes.
+		const computeNewKey = this.rekeyedKeyComputer(newPkDef, newColumns);
 
 		// Pass 1 — collision detection only. Hold one hex signature per new key, never
 		// the row or old key. On a repeat, reject before any write; the store is
