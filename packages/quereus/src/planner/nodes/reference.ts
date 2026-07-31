@@ -11,6 +11,7 @@ import type { TableSchema } from '../../schema/table.js';
 import type { Scope } from '../scopes/scope.js';
 import type * as AST from '../../parser/ast.js';
 import { columnSchemaToScalarType, relationTypeFromTableSchema } from '../type-utils.js';
+import { catalogRowCount } from '../stats/table-cardinality.js';
 import { Cached } from '../../util/cached.js';
 import type { FunctionSchema } from '../../schema/function.js';
 import { isTableValuedFunctionSchema } from '../../schema/function.js';
@@ -88,7 +89,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 	}
 
 	get estimatedRows(): number | undefined {
-		return this.tableSchema.estimatedRows;
+		return catalogRowCount(this.tableSchema);
 	}
 
 	computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
@@ -273,7 +274,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			columns: this.tableSchema.columns.map(col => col.name),
 			...(this.readCommitted ? { readCommitted: true } : {}),
 			estimates: {
-				rows: this.tableSchema.estimatedRows
+				rows: this.estimatedRows
 			}
 		};
 	}

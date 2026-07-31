@@ -11,6 +11,7 @@ import type { TableSchema } from '../../schema/table.js';
 import type { ColumnStatsResolver, StatsProvider } from './index.js';
 import { NaiveStatsProvider } from './index.js';
 import { createLogger } from '../../common/logger.js';
+import { catalogRowCount } from './table-cardinality.js';
 import { selectivityFromHistogram } from './histogram.js';
 import { combineConjunctive, combineDisjunctive } from './selectivity-combine.js';
 import { splitConjuncts, splitDisjuncts } from '../analysis/predicate-conjuncts.js';
@@ -132,12 +133,11 @@ export class CatalogStatsProvider implements StatsProvider {
 	}
 
 	tableRows(table: TableSchema): number | undefined {
-		const stats = table.statistics;
-		if (stats) {
-			log('Table %s: catalog rowCount=%d', table.name, stats.rowCount);
-			return stats.rowCount;
+		if (table.statistics) {
+			log('Table %s: catalog rowCount=%d', table.name, table.statistics.rowCount);
+			return table.statistics.rowCount;
 		}
-		return this.fallback.tableRows(table);
+		return catalogRowCount(table) ?? this.fallback.tableRows(table);
 	}
 
 	selectivity(table: TableSchema, predicate: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined {

@@ -5,8 +5,12 @@ import { Database } from '../../src/core/database.js';
 import { buildHistogram, selectivityFromHistogram } from '../../src/planner/stats/histogram.js';
 import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
 import type { TableStatistics, ColumnStatistics, EquiHeightHistogram } from '../../src/planner/stats/catalog-stats.js';
+import { catalogRowCount } from '../../src/planner/stats/table-cardinality.js';
 import type { TableSchema } from '../../src/schema/table.js';
+import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type { ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
+import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
+import { FilterNode } from '../../src/planner/nodes/filter.js';
 import type { SqlValue } from '../../src/common/types.js';
 
 // ── Histogram unit tests ───────────────────────────────────────────────────
@@ -630,5 +634,134 @@ describe('VTab-supplied statistics', () => {
 			secondRows.push(r);
 		}
 		expect(secondRows[0].rows).to.equal(30);
+	});
+});
+
+// ── Base-table cardinality from catalog statistics ──────────────────────────
+// TableReferenceNode.estimatedRows (and every physical access node built on
+// top of it) must prefer ANALYZE-collected statistics over the static schema
+// estimate, which SchemaManager hardcodes to 0 at CREATE TABLE and never
+// updates. See docs/optimizer.md "Base-table row estimates".
+
+describe('base-table cardinality from catalog statistics', () => {
+	function walk(node: PlanNode, fn: (n: PlanNode) => void): void {
+		fn(node);
+		for (const child of node.getChildren()) walk(child as PlanNode, fn);
+	}
+
+	/** First physical table-access node (SeqScan / IndexScan / IndexSeek) in the plan. */
+	function findScanNode(root: PlanNode): PlanNode | undefined {
+		const accessTypes = new Set([PlanNodeType.SeqScan, PlanNodeType.IndexScan, PlanNodeType.IndexSeek]);
+		let found: PlanNode | undefined;
+		walk(root, (n) => { if (!found && accessTypes.has(n.nodeType)) found = n; });
+		return found;
+	}
+
+	function findFilter(root: PlanNode): FilterNode | undefined {
+		let found: FilterNode | undefined;
+		walk(root, (n) => { if (!found && n instanceof FilterNode) found = n; });
+		return found;
+	}
+
+	function optimizedPlan(db: Database, sql: string): PlanNode {
+		return (db as unknown as { getPlan(s: string): PlanNode }).getPlan(sql);
+	}
+
+	// ── catalogRowCount unit cases ──────────────────────────────────────────
+
+	describe('catalogRowCount', () => {
+		function makeTableSchema(stats?: TableStatistics, estimatedRows?: number): TableSchema {
+			return { name: 't', statistics: stats, estimatedRows, columns: [] } as unknown as TableSchema;
+		}
+
+		it('statistics present: returns rowCount, ignoring the static estimate', () => {
+			const stats = { rowCount: 100, columnStats: new Map() } as TableStatistics;
+			expect(catalogRowCount(makeTableSchema(stats, 0))).to.equal(100);
+		});
+
+		it('statistics absent, static estimatedRows present: returns the static estimate', () => {
+			expect(catalogRowCount(makeTableSchema(undefined, 0))).to.equal(0);
+			expect(catalogRowCount(makeTableSchema(undefined, 42))).to.equal(42);
+		});
+
+		it('both absent: returns undefined', () => {
+			expect(catalogRowCount(makeTableSchema(undefined, undefined))).to.be.undefined;
+		});
+
+		it('rowCount: 0 is honoured, not treated as "unknown" (?? vs ||)', () => {
+			// If this used `||` instead of `??`, a 0-row analyzed table would fall
+			// through to the static estimate below and silently misreport.
+			const stats = { rowCount: 0, columnStats: new Map() } as TableStatistics;
+			expect(catalogRowCount(makeTableSchema(stats, 500))).to.equal(0);
+		});
+	});
+
+	// ── End-to-end: scan cardinality after ANALYZE ──────────────────────────
+
+	describe('end-to-end scan and filter estimates', () => {
+		let db: Database;
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('CREATE TABLE m (id INTEGER PRIMARY KEY, a INTEGER, s TEXT) USING memory');
+		});
+		afterEach(async () => { await db.close(); });
+
+		async function seed(rows: number, startId: number = 1): Promise<void> {
+			for (let i = startId; i < startId + rows; i++) {
+				await db.exec(`INSERT INTO m VALUES (${i}, ${i % 4}, 's${i}')`);
+			}
+		}
+
+		it('an analyzed, populated table reports its real row count on the scan (not 0)', async () => {
+			await seed(100);
+			for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
+			const ndv = db.schemaManager.findTable('m')?.statistics?.columnStats.get('a')?.distinctCount;
+			expect(ndv, 'ANALYZE should record a distinct count for a').to.be.a('number');
+
+			const plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			const scan = findScanNode(plan);
+			expect(scan, 'expected a physical access node').to.not.be.undefined;
+			expect(scan!.physical?.estimatedRows).to.equal(100);
+
+			const filter = findFilter(plan);
+			expect(filter, 'expected a residual Filter').to.not.be.undefined;
+			expect(filter!.physical?.estimatedRows).to.equal(Math.max(1, Math.floor(100 / (ndv as number))));
+			expect(filter!.physical?.estimatedRows).to.not.equal(0);
+		});
+
+		it('a populated but never-analyzed table keeps the static (0) estimate — the change is inert without ANALYZE', async () => {
+			await seed(100);
+			// No ANALYZE.
+			const plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			const scan = findScanNode(plan);
+			expect(scan, 'expected a physical access node').to.not.be.undefined;
+			const staticEstimate = db.schemaManager.findTable('m')?.estimatedRows;
+			expect(scan!.physical?.estimatedRows).to.equal(staticEstimate);
+		});
+
+		it('ANALYZE on an empty table: scan and filter both report 0', async () => {
+			// No rows inserted.
+			for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
+			expect(db.schemaManager.findTable('m')?.statistics?.rowCount).to.equal(0);
+
+			const plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			const scan = findScanNode(plan);
+			expect(scan!.physical?.estimatedRows).to.equal(0);
+
+			const filter = findFilter(plan);
+			expect(filter!.physical?.estimatedRows).to.equal(0);
+		});
+
+		it('re-ANALYZE after further inserts: the scan estimate tracks the new count', async () => {
+			await seed(20);
+			for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
+			let plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			expect(findScanNode(plan)!.physical?.estimatedRows).to.equal(20);
+
+			await seed(30, 21); // ids 21..50, 30 more rows
+			for await (const _ of db.eval('ANALYZE m')) { /* consume */ }
+			plan = optimizedPlan(db, 'SELECT * FROM m WHERE a = 1');
+			expect(findScanNode(plan)!.physical?.estimatedRows).to.equal(50);
+		});
 	});
 });

@@ -406,6 +406,11 @@ export class IndexSeekNode extends TableAccessNode {
 		}
 		const base = {
 			ordering: this.providesOrdering,
+			// NOTE: capped by a real catalog table count now (catalogRowCount), not
+			// just the static schema estimate — for an analyzed table under 100 rows
+			// this reports the whole table rather than a flat 100. If seek cardinality
+			// ever drives a bad plan, derive it from the seek key's own selectivity
+			// instead of min(tableRows, 100).
 			estimatedRows: Math.min(this.source.estimatedRows || 1000, 100),
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
