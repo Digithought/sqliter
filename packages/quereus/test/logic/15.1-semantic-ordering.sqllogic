@@ -347,6 +347,82 @@ select id, d, e from paired where e = 'PT60M';
 
 drop table fsc;
 
+-- === CHECK-derived cross-column equality facts ===
+--
+-- A declared `check (d = s)` used to mint the same mirror FDs and equivalence
+-- class ungated, onto the TABLE REFERENCE — where `rule-predicate-inference-
+-- equivalence` reads it directly, with nothing to make it dormant. The claim is
+-- false for a mixed pair: the CHECK compares `d` and `s` by elapsed time, so a
+-- row may legally store 'PT1H' in one column and 'PT60M' in the other.
+-- Regression for `check-derived-equivalence-ignores-semantic-ordering`.
+--
+-- Every query below returned NO rows before the gate landed, except the
+-- same-type control (which was and stays correct).
+
+create table ckm (id integer primary key, d timespan, s text, check (d = s));
+insert into ckm values (1, 'PT1H', 'PT60M');
+
+-- The CHECK accepts the row: 'PT1H' and 'PT60M' are one elapsed time.
+select id, d, s from ckm;
+→ [{"id":1,"d":"PT1H","s":"PT60M"}]
+
+select id from ckm where d = 'PT1H';
+→ [{"id":1}]
+
+drop table ckm;
+
+-- Operand order reversed in the CHECK — the gate must be symmetric.
+create table ckr (id integer primary key, d timespan, s text, check (s = d));
+insert into ckr values (1, 'PT1H', 'PT60M');
+
+select id from ckr where d = 'PT1H';
+→ [{"id":1}]
+
+drop table ckr;
+
+-- JSON against TEXT: '{"x":1}' and '{ "x" : 1 }' are one structure, two strings.
+create table ckj (id integer primary key, a json, b text, check (a = b));
+insert into ckj values (1, '{"x":1}', '{ "x" : 1 }');
+
+select id from ckj where a = '{"x":1}';
+→ [{"id":1}]
+
+drop table ckj;
+
+-- Same-type control: `check (d = e)` over two TIMESPAN columns keeps its mirror
+-- FDs and equivalence class (the gate must not over-decline), and the row comes
+-- back carrying its own stored spellings — a canonicalizing "fix" would have
+-- rewritten them.
+create table ckt (id integer primary key, d timespan, e timespan, check (d = e));
+insert into ckt values (1, 'PT1H', 'PT60M');
+
+select id, d, e from ckt where d = 'PT1H';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+select id, d, e from ckt where e = 'PT60M';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+drop table ckt;
+
+-- A partial UNIQUE index in play. Row 2 is outside the index's `where` scope, so
+-- both rows may carry v = 7. The false {d, s} class dropped row 2 by inferring
+-- `s = 'PT60M'` from the pin on `d`. (It also fed the guard-discharge route,
+-- where an equivalence peer pinned to a literal discharges the partial index's
+-- `where` clause and activates a uniqueness FD that does not hold; the two could
+-- not be isolated from each other and close together.)
+create table ckp (id integer primary key, d timespan, s text, v integer, check (d = s));
+create unique index ckp_v on ckp (v) where s = 'PT60M';
+insert into ckp values (1, 'PT60M', 'PT60M', 7);
+insert into ckp values (2, 'PT1H', 'PT1H', 7);
+
+-- No `order by` here on purpose: adding one changes the plan enough to hide the
+-- defect (it returned both rows even ungated), so the bare form is the case that
+-- discriminates.
+select id from ckp where d = 'PT60M' and v = 7;
+→ [{"id":1},{"id":2}]
+
+drop table ckp;
+
 -- USING over a mixed pair: `using (d)` means `l.d = r.d`, so the generic join's
 -- USING comparison routes through the same comparator the operator does.
 create table uma (id integer primary key, d timespan);

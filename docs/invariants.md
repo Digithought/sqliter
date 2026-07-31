@@ -441,19 +441,17 @@ resolved at plan time exactly as the runtime resolves it, through the shared hel
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `extractEqualityFds`
 - code: `packages/quereus/src/planner/nodes/join-node.ts` — `extractEquiPairsFromCondition`
 - code: `packages/quereus/src/planner/rules/join/equi-pair-extractor.ts` — `extractEquiPairs`
+- code: `packages/quereus/src/planner/analysis/check-extraction.ts` — `columnPairSemanticsAgree`
 - guard: `packages/quereus/test/planner/collation-soundness.spec.ts` — `semantic-ordering gate`
 - doc: [Functional Dependencies § Semantic-ordering gate on cross-column facts](optimizer-fd.md#semantic-ordering-gate-on-cross-column-facts)
 
 TIMESPAN and JSON compare by meaning, not stored text (`'PT1H'` = `'PT60M'`). A `col1 = col2`
-fact — mirror FDs, an equivalence class, a join equi-pair — is false when the two sides
-disagree on semantic ordering: rows can agree on the semantic column while holding different
-strings in the plain one. Each of the three extractors above requires `semanticOrderingsAgree`
-on both declared logical types. Cross-**column** facts only: a constant pin stays ungated —
-it claims the column *compares equal to* that value under its own comparison, which is true.
-
-Known hole: CHECK / assertion extraction (`planner/analysis/check-extraction.ts`) lifts the
-same fact ungated and returns wrong rows today — ticket
-`check-derived-equivalence-ignores-semantic-ordering`.
+fact — mirror FDs, an equivalence class, a join equi-pair, a one-way `col = expr`
+determination — is false when the two sides disagree on semantic ordering: rows can agree on
+the semantic column while holding different strings in the plain one. Each of the four
+extractors above requires `semanticOrderingsAgree` on both declared logical types.
+Cross-**column** facts only: a constant pin stays ungated — it claims the column *compares
+equal to* that value under its own comparison, which is true.
 
 ### OPT-052 — Provenance is informational
 

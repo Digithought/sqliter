@@ -9,6 +9,8 @@ import { DEFAULT_ROWOP_MASK, RowOpFlag } from '../../src/schema/table.js';
 import type * as AST from '../../src/parser/ast.js';
 import type { DeclaredColumnInfo } from '../../src/planner/analysis/comparison-collation.js';
 import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
+import { TIMESPAN_TYPE } from '../../src/types/temporal-types.js';
+import { JSON_TYPE } from '../../src/types/json-type.js';
 
 // ---------------------------------------------------------------------------
 // AST builders for unit tests
@@ -511,6 +513,145 @@ describe('extractCheckConstraints collation gate', () => {
 			colMap, allDeterministic, colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Semantic-ordering gate on cross-column facts — invariant OPT-051, ticket
+// check-derived-equivalence-ignores-semantic-ordering. TIMESPAN and JSON
+// compare by meaning, not stored text ('PT1H' = 'PT60M'), so a mixed pair such
+// as `d timespan` / `s text` shares no notion of "same value" and may mint no
+// cross-column fact. Constant pins stay ungated (a pin claims only that the
+// column compares equal to the literal under its own comparison).
+// ---------------------------------------------------------------------------
+
+describe('extractCheckConstraints semantic-ordering gate', () => {
+	function metaWith(overrides: Record<number, DeclaredColumnInfo>): DeclaredColumnInfo[] {
+		const m = colMeta.slice();
+		for (const [idx, info] of Object.entries(overrides)) m[Number(idx)] = info;
+		return m;
+	}
+
+	const TS: DeclaredColumnInfo = { collation: 'BINARY', logicalType: TIMESPAN_TYPE };
+	const JSONC: DeclaredColumnInfo = { collation: 'BINARY', logicalType: JSON_TYPE };
+
+	// `a` (0) semantic, `b` (1) plain text — the headline mixed pair.
+	const mixed = metaWith({ 0: TS });
+	// Both semantic and the SAME type — the over-declining control.
+	const sameType = metaWith({ 0: TS, 1: TS });
+
+	function expectNoCrossColumnFacts(
+		result: ReturnType<typeof extractCheckConstraints>,
+		why: string,
+	): void {
+		expect(result.fds, `${why}: FDs`).to.have.length(0);
+		expect(result.equivPairs, `${why}: EC pair`).to.have.length(0);
+	}
+
+	it('check (timespan_col = text_col) mints no mirror FDs and no EC pair, in both operand orders', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints([check(bin('=', col('a'), col('b')))], colMap, allDeterministic, mixed),
+			'timespan = text');
+		expectNoCrossColumnFacts(
+			extractCheckConstraints([check(bin('=', col('b'), col('a')))], colMap, allDeterministic, mixed),
+			'text = timespan');
+	});
+
+	it('check (timespan_col = json_col) — two DIFFERENT semantic types are declined too', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(bin('=', col('a'), col('b')))], colMap, allDeterministic, metaWith({ 0: TS, 1: JSONC })),
+			'timespan = json');
+	});
+
+	it('check (json_col = text_col) mints no cross-column facts', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(bin('=', col('a'), col('b')))], colMap, allDeterministic, metaWith({ 0: JSONC })),
+			'json = text');
+	});
+
+	it('check (timespan_col = timespan_col) still mints both mirror FDs and the EC pair', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('a'), col('b')))], colMap, allDeterministic, sameType);
+		expect(result.fds).to.have.length(2);
+		expect(result.fds.some(fd => fd.determinants.includes(0) && fd.dependents.includes(1))).to.equal(true);
+		expect(result.fds.some(fd => fd.determinants.includes(1) && fd.dependents.includes(0))).to.equal(true);
+		expect(result.equivPairs).to.deep.equal([[0, 1]]);
+	});
+
+	it("check (timespan_col = 'PT1H') keeps its ∅ → col pin and binding — pins are ungated", () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('a'), lit('PT1H')))], colMap, allDeterministic, mixed);
+		expect(result.fds).to.have.length(1);
+		expect(result.fds[0].determinants).to.deep.equal([]);
+		expect(result.fds[0].dependents).to.deep.equal([0]);
+		expect(result.constantBindings).to.have.length(1);
+		expect(result.constantBindings[0].attrs).to.deep.equal([0]);
+		expect(result.constantBindings[0].value).to.deep.equal({ kind: 'literal', value: 'PT1H' });
+	});
+
+	// --- Arm 3: the one-way `col = expr` determination. -----------------------
+
+	it('check (text_col = trim(timespan_col)) mints no one-way FD across a mixed pair', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(bin('=', col('b'), fn('trim', col('a'))))], colMap, allDeterministic, mixed),
+			'text = trim(timespan)');
+		// Operand order reversed: the expression on the left.
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(bin('=', fn('trim', col('a')), col('b')))], colMap, allDeterministic, mixed),
+			'trim(timespan) = text');
+	});
+
+	it('check (timespan_col = trim(timespan_col)) keeps the one-way FD for a same-type pair', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('b'), fn('trim', col('a'))))], colMap, allDeterministic, sameType);
+		expect(result.fds).to.have.length(1);
+		expect(result.fds[0].determinants).to.deep.equal([0]);
+		expect(result.fds[0].dependents).to.deep.equal([1]);
+	});
+
+	// --- Arm 2: the implication form `g <> lit or d = s`. ---------------------
+	// No query shape has been found where a guarded mixed pair returns a wrong
+	// row (guard activation writes the class onto the Filter itself, which
+	// `rule-predicate-inference-equivalence` does not read), so the extractor
+	// output IS the assertion here — see the ticket's arm-2 note.
+
+	it('implication-form check (status <> 1 or timespan_col = text_col) mints no guarded mirror pair', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(or(bin('<>', col('status'), lit(1)), bin('=', col('a'), col('b'))))],
+				colMap, allDeterministic, mixed),
+			'guarded timespan = text');
+	});
+
+	it('implication-form check over a same-type pair keeps its guarded mirror FDs and the valueEquality tag', () => {
+		const result = extractCheckConstraints(
+			[check(or(bin('<>', col('status'), lit(1)), bin('=', col('a'), col('b'))))],
+			colMap, allDeterministic, sameType);
+		expect(result.fds).to.have.length(2);
+		expect(result.fds.every(fd => fd.valueEquality === true), 'valueEquality tag survives').to.equal(true);
+		expect(result.fds.every(fd => fd.guard !== undefined), 'guard survives').to.equal(true);
+		// Equivalences/bindings are unconditional facts — never lifted from a guarded body.
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+	});
+
+	it('implication-form one-way body (status <> 1 or text_col = trim(timespan_col)) is declined', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(or(bin('<>', col('status'), lit(1)), bin('=', col('b'), fn('trim', col('a')))))],
+				colMap, allDeterministic, mixed),
+			'guarded text = trim(timespan)');
+		// Same-type control keeps it.
+		const kept = extractCheckConstraints(
+			[check(or(bin('<>', col('status'), lit(1)), bin('=', col('b'), fn('trim', col('a')))))],
+			colMap, allDeterministic, sameType);
+		expect(kept.fds).to.have.length(1);
+		expect(kept.fds[0].determinants).to.deep.equal([0]);
+		expect(kept.fds[0].dependents).to.deep.equal([1]);
 	});
 });
 

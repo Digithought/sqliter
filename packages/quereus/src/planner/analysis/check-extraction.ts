@@ -18,6 +18,7 @@ import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
 import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison, walkAstNodes } from './predicate-shape.js';
 import { isValueDiscriminatingAstComparison, type DeclaredColumnInfo } from './comparison-collation.js';
+import { semanticOrderingsAgree } from '../../util/comparison.js';
 
 export interface CheckExtraction {
 	readonly fds: ReadonlyArray<FunctionalDependency>;
@@ -289,6 +290,28 @@ function recognize(
 	}
 }
 
+/**
+ * Semantic-ordering gate for a **cross-column** CHECK-derived fact (invariant
+ * OPT-051): a mixed pair such as `d timespan` / `s text` shares no notion of
+ * "same value" — `check (d = s)` accepts a row holding 'PT1H' and 'PT60M', so
+ * mirror FDs, an equivalence pair, or a one-way determination between them are
+ * all false. Admits only "neither side semantic" or "both the SAME semantic
+ * type". An absent `logicalType` counts as non-semantic. Reasoning:
+ * `docs/optimizer-fd.md` § "Semantic-ordering gate on cross-column facts".
+ *
+ * Deliberately local rather than shared with the three plan-node call sites of
+ * {@link semanticOrderingsAgree} — those work on `ScalarPlanNode`, this one on
+ * declared column metadata, the same split the collation gate carries
+ * (`isValueDiscriminatingEquality` / `isValueDiscriminatingAstComparison`).
+ */
+function columnPairSemanticsAgree(
+	a: number,
+	b: number,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
+): boolean {
+	return semanticOrderingsAgree(columns[a]?.logicalType, columns[b]?.logicalType);
+}
+
 function handleEquality(
 	left: AST.Expression,
 	right: AST.Expression,
@@ -310,6 +333,8 @@ function handleEquality(
 	// values, never row counts, so it can never witness row-uniqueness.
 	if (lIdx !== undefined && rIdx !== undefined) {
 		if (lIdx === rIdx) return;
+		// Cross-column fact — gated on semantic ordering (OPT-051).
+		if (!columnPairSemanticsAgree(lIdx, rIdx, columns)) return;
 		fds.push({ determinants: [lIdx], dependents: [rIdx], kind: 'determination' });
 		fds.push({ determinants: [rIdx], dependents: [lIdx], kind: 'determination' });
 		equivPairs.push([lIdx, rIdx]);
@@ -319,6 +344,8 @@ function handleEquality(
 	if (lIdx !== undefined) {
 		const lit = literalValue(right);
 		if (lit !== undefined) {
+			// Constant pin — deliberately UNGATED: it claims only that the column
+			// compares equal to the literal under its own comparison (OPT-051).
 			fds.push({ determinants: [], dependents: [lIdx], kind: 'determination' });
 			constantBindings.push({ attrs: [lIdx], value: { kind: 'literal', value: lit } });
 			return;
@@ -326,7 +353,8 @@ function handleEquality(
 		const cols = collectColumnNames(right, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
-			if (singleCol !== lIdx) {
+			// Cross-column determination — same gate (OPT-051).
+			if (singleCol !== lIdx && columnPairSemanticsAgree(singleCol, lIdx, columns)) {
 				fds.push({ determinants: [singleCol], dependents: [lIdx], kind: 'determination' });
 			}
 		}
@@ -343,7 +371,7 @@ function handleEquality(
 		const cols = collectColumnNames(left, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
-			if (singleCol !== rIdx) {
+			if (singleCol !== rIdx && columnPairSemanticsAgree(singleCol, rIdx, columns)) {
 				fds.push({ determinants: [singleCol], dependents: [rIdx], kind: 'determination' });
 			}
 		}
@@ -560,6 +588,12 @@ function recognizeGuardedBody(
 	// only, never row counts.
 	if (lIdx !== undefined && rIdx !== undefined) {
 		if (lIdx === rIdx) return;
+		// Cross-column fact — gated on semantic ordering (OPT-051). Load-bearing
+		// for the `valueEquality` tag below: `FilterNode.computePhysical` lifts a
+		// tagged mirror pair into an equivalence class once the guard discharges,
+		// and re-closes constant bindings over it, so a mixed pair would pin the
+		// text column to a spelling no row stores.
+		if (!columnPairSemanticsAgree(lIdx, rIdx, columns)) return;
 		// Tag the mirror pair as a genuine column value-equality so a downstream
 		// guard-activation (FilterNode) can soundly lift it as an EC — a one-way
 		// `col = expr` body (below) or an index-derived guarded mirror is NOT
@@ -572,13 +606,15 @@ function recognizeGuardedBody(
 	if (lIdx !== undefined) {
 		const lit = literalValue(b.right);
 		if (lit !== undefined) {
+			// Guarded constant pin — ungated, same reason as its unconditional twin.
 			fds.push({ determinants: [], dependents: [lIdx], guard, kind: 'determination' });
 			return;
 		}
 		const cols = collectColumnNames(b.right, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
-			if (singleCol !== lIdx) {
+			// Cross-column determination — same gate (OPT-051).
+			if (singleCol !== lIdx && columnPairSemanticsAgree(singleCol, lIdx, columns)) {
 				fds.push({ determinants: [singleCol], dependents: [lIdx], guard, kind: 'determination' });
 			}
 		}
@@ -594,7 +630,7 @@ function recognizeGuardedBody(
 		const cols = collectColumnNames(b.left, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
-			if (singleCol !== rIdx) {
+			if (singleCol !== rIdx && columnPairSemanticsAgree(singleCol, rIdx, columns)) {
 				fds.push({ determinants: [singleCol], dependents: [rIdx], guard, kind: 'determination' });
 			}
 		}

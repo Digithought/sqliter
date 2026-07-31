@@ -224,9 +224,9 @@ export type ConstantValue =
  *    attribute, so the comparison it emits is the target column's own. Sound
  *    only while the equivalence class it transfers along is itself
  *    semantic-ordering-gated at extraction (invariant OPT-051), so the target
- *    shares the source's type. The predicate/join extractors are; CHECK
- *    extraction is NOT yet, and its ungated EC makes this transfer drop rows —
- *    ticket `check-derived-equivalence-ignores-semantic-ordering`.
+ *    shares the source's type. Every extractor that mints one — the predicate,
+ *    join, and CHECK/assertion sites — is gated; a new ungated minter would
+ *    break this transfer.
  *  - `analysis/update-lineage.ts` (`deriveFilterAttributeDefaults`) uses the
  *    binding as the omitted-column default when inserting through a filtered
  *    view; it needs a value that SATISFIES the view predicate, which is exactly
