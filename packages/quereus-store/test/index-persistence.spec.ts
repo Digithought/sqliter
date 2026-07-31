@@ -927,4 +927,81 @@ describe('StoreModule secondary-index persistence', () => {
 		await db2.exec(`insert into t values (3, 'x', 'z')`);
 		expect(await rows(db2, `select count(*) as c from t where a = 'x'`)).to.deep.equal([{ c: 2 }]);
 	});
+
+	// An UNNAMED UNIQUE's backing structure is named `_uc_<covered column names>`,
+	// derived from the columns' CURRENT names and recorded nowhere — so RENAME COLUMN
+	// moves that name. Renaming onto a name an index on the same table already holds is
+	// the same durable loss as the declaration case above, reached through a rename: the
+	// rewritten bundle drops the user's `CREATE INDEX` line and the constraint's entries
+	// are then built into that index's store (physical store name is a pure function of
+	// schema + table + index name), so after reopen the index is gone and the constraint
+	// checks uniqueness against entries keyed on the WRONG column. Refused up front now.
+	it('a column rename colliding with an index name is refused and the index survives reopen intact', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, a text, b text, unique (a)) using store`);
+		await db.exec(`create index _uc_z on t (b)`);
+		await db.exec(`insert into t values (1, 'x', 'p'), (2, 'y', 'q')`);
+		expect(indexStoreSize('t', '_uc_z'), 'index backed by one entry per row').to.equal(2);
+
+		const writes = await traceCatalogWrites();
+
+		let err: Error | undefined;
+		try { await db.exec(`alter table t rename column a to z`); } catch (e) { err = e as Error; }
+		expect(err, 'expected rejection').to.not.be.undefined;
+		expect(err!.message).to.match(/would collide with existing index '_uc_z'/i);
+
+		// The refusal precedes module.alterTable, so no bundle was rewritten at all; any
+		// write that DID happen still carries the index DDL.
+		for (const w of writes) {
+			expect(w, 'no catalog write drops the CREATE INDEX line').to.match(/CREATE INDEX/i);
+		}
+		const entry = (await catalogEntry('t'))!;
+		expect(entry, 'bundle still declares the index').to.match(/CREATE INDEX "_uc_z"/i);
+		expect(entry, 'bundle still declares the un-renamed column').to.match(/"a"\s+TEXT/i);
+		expect(indexStoreSize('t', '_uc_z'), 'backing store untouched').to.equal(2);
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen();
+
+		const info = await indexInfo(db2, 't');
+		expect(info.map(r => r.index_name), 'index survives reopen').to.include('_uc_z');
+		expect(indexStoreSize('t', '_uc_z'), 'backing entries survive reopen').to.equal(2);
+		expect(await rows(db2, `select id from t where b = 'q'`)).to.deep.equal([{ id: 2 }]);
+
+		// The constraint kept its old column and still rejects duplicates on it.
+		let rejected = false;
+		try { await db2.exec(`insert into t values (3, 'x', 'r')`); } catch { rejected = true; }
+		expect(rejected, 'UNIQUE still enforces over the un-renamed column after reopen').to.be.true;
+	});
+
+	it('a column rename relocates an unnamed UNIQUE backing store and keeps it hidden + enforcing across reopen', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, a text, b text, unique (a)) using store`);
+		await db.exec(`insert into t values (1, 'x', 'p'), (2, 'y', 'q')`);
+		expect(indexStoreSize('t', '_uc_a'), 'backing store built under the derived name').to.equal(2);
+
+		await db.exec(`alter table t rename column a to z`);
+
+		// The derived name moved with the column: the old physical store is torn down and
+		// the entries are rebuilt under the new one.
+		expect(indexStoreSize('t', '_uc_a'), 'old backing store torn down').to.equal(0);
+		expect(indexStoreSize('t', '_uc_z'), 'entries rebuilt under the new derived name').to.equal(2);
+
+		// Still a hidden backing structure, not a user index.
+		expect(await indexInfo(db, 't'), 'structure stays hidden after the rename').to.have.lengthOf(0);
+		expect((await catalogEntry('t'))!, 'no CREATE INDEX line for the structure').to.not.match(/CREATE INDEX/i);
+
+		let rejected = false;
+		try { await db.exec(`insert into t values (3, 'x', 'r')`); } catch { rejected = true; }
+		expect(rejected, 'UNIQUE enforces after the rename').to.be.true;
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen();
+
+		expect(await indexInfo(db2, 't'), 'structure still hidden after reopen').to.have.lengthOf(0);
+		expect(indexStoreSize('t', '_uc_z'), 'relocated entries survive reopen').to.equal(2);
+		let rejectedAfterReopen = false;
+		try { await db2.exec(`insert into t values (4, 'x', 's')`); } catch { rejectedAfterReopen = true; }
+		expect(rejectedAfterReopen, 'UNIQUE still enforces after reopen').to.be.true;
+	});
 });

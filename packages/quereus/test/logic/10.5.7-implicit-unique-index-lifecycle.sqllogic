@@ -431,6 +431,144 @@ select count(*) as c from schema() where type = 'index' and name = 'ui_a';
 insert into iul_ui values (2, 'k');
 -- error: unique
 
+-- 9f. ALTER TABLE RENAME COLUMN — the `_uc_<cols>` name MOVES with the column
+-- The auto-name is derived from the covered columns' CURRENT names and recorded
+-- nowhere, so renaming a covered column renames the backing structure. Two halves:
+-- the structure must follow (or it is orphaned under the old name — surfacing as a
+-- user index, droppable, and no longer recognized as the constraint's), and the
+-- statement must be refused when the post-rename name is already an index here.
+-- Column names are file-unique so a `drop index` below cannot resolve to some other
+-- table's index of the same name (see section 6).
+create table iul_rk (id integer primary key, rka text, rkb text, unique (rka));
+insert into iul_rk values (1, 'x', 'p'), (2, 'y', 'q');
+-- run
+
+alter table iul_rk rename column rka to rkz;
+-- run
+
+-- The structure followed the column: nothing surfaces under either name.
+select count(*) as c from schema() where type = 'index' and tbl_name = 'iul_rk';
+→ [{"c":0}]
+
+select count(*) as c from index_info('iul_rk');
+→ [{"c":0}]
+
+drop index _uc_rka;
+-- error: no such index
+
+drop index _uc_rkz;
+-- error: no such index
+
+-- ...and the constraint still enforces, now over the new column name.
+insert into iul_rk values (3, 'x', 'r');
+-- error: unique
+
+-- Multi-column: the auto-name joins the NEW column names.
+create table iul_rm (id integer primary key, rma text, rmb text, unique (rma, rmb));
+insert into iul_rm values (1, 'x', 'p');
+-- run
+
+alter table iul_rm rename column rma to rmz;
+-- run
+
+select count(*) as c from index_info('iul_rm');
+→ [{"c":0}]
+
+drop index _uc_rmz_rmb;
+-- error: no such index
+
+insert into iul_rm values (2, 'x', 'p');
+-- error: unique
+
+-- Collision: the post-rename name is already an index on this table.
+create table iul_rx (id integer primary key, rxa text, rxb text, unique (rxa));
+create index _uc_rxz on iul_rx (rxb);
+insert into iul_rx values (1, 'x', 'p'), (2, 'y', 'q');
+-- run
+
+alter table iul_rx rename column rxa to rxz;
+-- error: would collide with existing index '_uc_rxz'
+
+-- Nothing moved: the column keeps its old name...
+select count(*) as c from table_info('iul_rx') where name = 'rxa';
+→ [{"c":1}]
+
+select count(*) as c from table_info('iul_rx') where name = 'rxz';
+→ [{"c":0}]
+
+-- ...the user's index is still listed and still resolves rows...
+select count(*) as c from schema() where type = 'index' and name = '_uc_rxz';
+→ [{"c":1}]
+
+select id from iul_rx where rxb = 'q';
+→ [{"id":2}]
+
+-- ...the constraint still enforces over the old column name...
+insert into iul_rx values (3, 'x', 'r');
+-- error: unique
+
+-- ...and the index is still the user's to drop.
+drop index _uc_rxz;
+-- run
+
+-- A case-only rename derives a case-equal name, which must not be read as a
+-- collision with the constraint's OWN structure.
+create table iul_rf (id integer primary key, rfa text, unique (rfa));
+insert into iul_rf values (1, 'x');
+-- run
+
+alter table iul_rf rename column rfa to RFA;
+-- run
+
+select count(*) as c from index_info('iul_rf');
+→ [{"c":0}]
+
+insert into iul_rf values (2, 'x');
+-- error: unique
+
+-- An EXPOSED implicit structure follows the rename too — it stays visible, under the
+-- NEW derived name (exposure changes visibility, not who owns the name).
+create table iul_rp (id integer primary key, rpa text,
+    unique (rpa) with tags ("quereus.expose_implicit_index" = true));
+insert into iul_rp values (1, 'x');
+-- run
+
+alter table iul_rp rename column rpa to rpz;
+-- run
+
+select index_name from index_info('iul_rp');
+→ [{"index_name":"_uc_rpz"}]
+
+insert into iul_rp values (2, 'x');
+-- error: unique
+
+-- A NAMED UNIQUE's structure takes the CONSTRAINT's name, which no column rename
+-- moves — so neither arm applies to it.
+create table iul_rn (id integer primary key, rna text, rnb text, constraint rn_uq unique (rna));
+create index _uc_rnz on iul_rn (rnb);
+insert into iul_rn values (1, 'x', 'p');
+-- run
+
+alter table iul_rn rename column rna to rnz;
+-- run
+
+-- The index the unnamed case would have collided with is untouched...
+select count(*) as c from schema() where type = 'index' and name = '_uc_rnz' and tbl_name = 'iul_rn';
+→ [{"c":1}]
+
+-- ...and the constraint's own structure is still hidden and still enforcing.
+select count(*) as c from index_info('iul_rn') where index_name = 'rn_uq';
+→ [{"c":0}]
+
+insert into iul_rn values (2, 'x', 'q');
+-- error: unique
+
+drop table iul_rn;
+drop table iul_rp;
+drop table iul_rf;
+drop table iul_rx;
+drop table iul_rm;
+drop table iul_rk;
 drop table iul_ui;
 drop table iul_cm;
 drop table iul_cc;

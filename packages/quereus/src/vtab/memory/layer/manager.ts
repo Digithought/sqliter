@@ -37,6 +37,21 @@ let tableManagerCounter = 0;
 const logger = createMemoryTableLoggers('layer:manager');
 
 /**
+ * The `_uc_<cols>` auto-name of the implicit covering structure realizing an UNNAMED
+ * UNIQUE constraint, resolved over an EXPLICIT column list rather than the manager's
+ * live one — `renameColumn` needs the name under the POST-rename columns, which
+ * `this.tableSchema` does not carry yet.
+ *
+ * The name is derived, never recorded, so it MOVES when a covered column is renamed.
+ * Every consumer re-derives it (see the catalog's `implicitIndexNameForColumns`, which
+ * this mirrors and must stay equal to, and `quereus-store`'s `implicitUniqueIndexName`);
+ * keep this the only spelling of the rule inside this file.
+ */
+function implicitIndexNameOver(uc: UniqueConstraintSchema, columns: ReadonlyArray<ColumnSchema>): string {
+	return `_uc_${uc.columns.map(i => columns[i]?.name ?? String(i)).join('_')}`;
+}
+
+/**
  * Unified surface for the structure that enforces a UNIQUE constraint. A
  * constraint is logical; its backing structure is optional and may take one of
  * several physical shapes:
@@ -267,8 +282,7 @@ export class MemoryTableManager {
 			if (matchingIndex) {
 				indexName = matchingIndex.name;
 			} else {
-				const colNames = uc.columns.map(i => this.tableSchema.columns[i]?.name ?? String(i));
-				indexName = uc.name ?? `_uc_${colNames.join('_')}`;
+				indexName = uc.name ?? this.implicitIndexNameFor(uc);
 				newIndexes.push({
 					name: indexName,
 					// Carry each column's declared collation so the auto-index — and the
@@ -308,10 +322,70 @@ export class MemoryTableManager {
 		return this.implicitCoveringStructures.get(indexName);
 	}
 
-	/** Conventional auto-index name for an unnamed UNIQUE constraint (mirrors {@link ensureUniqueConstraintIndexes}). */
+	/** Conventional auto-index name for an unnamed UNIQUE constraint, over the LIVE columns. */
 	private implicitIndexNameFor(uc: UniqueConstraintSchema): string {
-		const colNames = uc.columns.map(i => this.tableSchema.columns[i]?.name ?? String(i));
-		return `_uc_${colNames.join('_')}`;
+		return implicitIndexNameOver(uc, this.tableSchema.columns);
+	}
+
+	/**
+	 * The materialized covering-index renames a column rename forces: one per UNNAMED
+	 * UNIQUE constraint covering the renamed column, from its `_uc_<old cols>` name to
+	 * its `_uc_<new cols>` one.
+	 *
+	 * The auto-name is derived from the live column names and recomputed by every
+	 * consumer ({@link implicitIndexNameFor} here, the catalog's exposure map behind
+	 * `schema()` / `index_info()`), so leaving the entry under its pre-rename name
+	 * severs the constraint↔structure link: the structure stops being recognized as
+	 * hidden (it surfaces as a user index and becomes droppable, taking the
+	 * constraint's enforcement structure with it) and
+	 * {@link getImplicitCoveringStructure} falls through to its column-set fallback.
+	 *
+	 * Skipped for constraints that do not move: a NAMED one's structure takes the
+	 * constraint's name, a `derivedFromIndex` one IS the user's index, and one realized
+	 * by a REUSED user index has no `_uc_*` entry to rename (that index keeps its own
+	 * name).
+	 *
+	 * A case-only column rename DOES produce a rename here, even though every name
+	 * comparison folds case: the covering-structure map is keyed by the exact derived
+	 * string, so leaving `_uc_a` in place while consumers derive `_uc_A` would break
+	 * {@link getImplicitCoveringStructure} the same way. It cannot collide — an index
+	 * named `_uc_A` could never have been created alongside `_uc_a` in the first place.
+	 *
+	 * Pure — the caller applies the result to the new index list and, once the schema
+	 * swap has succeeded, to {@link implicitCoveringStructures}.
+	 */
+	private planImplicitCoveringIndexRenames(
+		updatedCols: ReadonlyArray<ColumnSchema>,
+		renamedColIndex: number,
+	): Array<{ oldName: string; newName: string }> {
+		const renames: Array<{ oldName: string; newName: string }> = [];
+		const indexes = this.tableSchema.indexes ?? [];
+		for (const uc of this.tableSchema.uniqueConstraints ?? []) {
+			if (uc.name !== undefined || uc.derivedFromIndex !== undefined) continue;
+			if (!uc.columns.includes(renamedColIndex)) continue;
+			const oldName = implicitIndexNameOver(uc, this.tableSchema.columns);
+			const newName = implicitIndexNameOver(uc, updatedCols);
+			if (oldName === newName) continue;
+			if (!indexes.some(idx => idx.name.toLowerCase() === oldName.toLowerCase())) continue;
+			renames.push({ oldName, newName });
+		}
+		return renames;
+	}
+
+	/**
+	 * Re-keys {@link implicitCoveringStructures} for the renames
+	 * {@link planImplicitCoveringIndexRenames} produced — the map is keyed by
+	 * constraint identity, which for an unnamed constraint IS the derived index name.
+	 * Runs only after the schema swap succeeded, so a failed rename leaves the map
+	 * agreeing with the restored schema.
+	 */
+	private applyImplicitCoveringStructureRenames(renames: ReadonlyArray<{ oldName: string; newName: string }>): void {
+		for (const { oldName, newName } of renames) {
+			const rec = this.implicitCoveringStructures.get(oldName);
+			if (!rec) continue;
+			this.implicitCoveringStructures.delete(oldName);
+			this.implicitCoveringStructures.set(newName, { ...rec, indexName: newName });
+		}
 	}
 
 	/**
@@ -2139,8 +2213,18 @@ export class MemoryTableManager {
 
 			const newColumnSchemaAtIndex = columnDefToSchema(newColumnDefAst, defaultNotNull, 'BINARY', (n) => this.db.isCollationRegistered(n));
 			const updatedCols = this.tableSchema.columns.map((c, i) => i === colIndex ? newColumnSchemaAtIndex : c);
+
+			// An unnamed UNIQUE's covering index is named `_uc_<column names>`, so renaming a
+			// covered column moves that name — rewrite the materialized ENTRY, not just its
+			// column references, or the structure is orphaned under the old name (see
+			// {@link planImplicitCoveringIndexRenames}). The engine refuses the statement up
+			// front when the post-rename name is already an index here, so no rename below can
+			// collide with a sibling entry.
+			const coveringRenames = this.planImplicitCoveringIndexRenames(updatedCols, colIndex);
+			const renamedTo = new Map(coveringRenames.map(r => [r.oldName.toLowerCase(), r.newName]));
 			const updatedIndexes = (this.tableSchema.indexes || []).map(idx => ({
 				...idx,
+				name: renamedTo.get(idx.name.toLowerCase()) ?? idx.name,
 				columns: idx.columns.map(ic =>
 					ic.index === colIndex ? { ...ic, name: newColumnName } : ic
 				)
@@ -2180,8 +2264,13 @@ export class MemoryTableManager {
 				this.schemaName, resolveColumnInSource);
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
+			// Rebuilds every secondary index from the new schema, so a renamed covering index
+			// lands under its new key in the base's index map with no extra rebuild here.
 			await this.baseLayer.handleColumnRename();
 			this.tableSchema = finalNewTableSchema;
+			// Only now that the swap has succeeded — the catch below restores the old schema
+			// and the map must keep agreeing with it.
+			this.applyImplicitCoveringStructureRenames(coveringRenames);
 			this.initializePrimaryKeyFunctions();
 			// The DDL transaction's own layers froze their schema at creation; hand them the
 			// renamed one, mirroring `handleColumnRename`'s base-side secondary rebuild —

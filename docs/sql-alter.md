@@ -30,6 +30,8 @@ Renames a column. Data is preserved. Fails if the new name conflicts with an exi
 
 A partial index on the renamed table survives as a **live structure**, not just a catalog entry: the module rewrites the predicate as part of the rename, before rebuilding its index structures against the new column list. If the rewrite or the rebuild fails, the whole `RENAME COLUMN` fails and both the table and the stored predicate are left untouched — a rename never silently loses an index the catalog still advertises.
 
+An **unnamed** `UNIQUE` constraint covering the renamed column has its covering structure renamed too. That structure's name is `_uc_<covered column names>`, derived from the columns' current names and recorded nowhere, so `rename column a to z` moves it from `_uc_a` to `_uc_z`; the structure stays hidden from `schema()` / `index_info()` under the new name and keeps enforcing, on both backends. The one visible consequence: the statement is **refused** with a `CONSTRAINT` error when the post-rename name is already an index on that table, since accepting it would silently reclassify the user's index as a hidden backing structure (see [SQL DDL § 6.3](sql-ddl.md#63-indexes-on-virtual-tables)). The refusal happens before the module is called, so the column keeps its old name and the index is untouched — rename or drop that index first. A **named** `UNIQUE` is unaffected: its structure takes the constraint's name.
+
 **ADD COLUMN**
 
 ```sql

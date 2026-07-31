@@ -358,6 +358,8 @@ async function runRenameColumn(
 		t => rewriteTableForColumnRename(
 			t, tableSchema.schemaName.toLowerCase(), tableSchema.name, oldName, newName, resolveColumnInSource));
 
+	assertRenamedColumnBackingNamesFree(tableSchema, colIndex, oldName, newName);
+
 	const existingCol = tableSchema.columns[colIndex];
 
 	// Build a ColumnDef AST for the renamed column (preserving type info)
@@ -431,6 +433,63 @@ async function runRenameColumn(
 
 	log('Renamed column %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
 	return null;
+}
+
+/**
+ * Refuses a RENAME COLUMN that would move an unnamed UNIQUE constraint's backing
+ * structure onto a name an index on the same table already holds.
+ *
+ * An unnamed UNIQUE is enforced by a structure named `_uc_<covered column names>`,
+ * derived from the LIVE column names and never recorded — so renaming a covered
+ * column moves that name. This is the same collision the four declaration paths
+ * already refuse (ADD CONSTRAINT, ADD COLUMN … unique, RENAME CONSTRAINT, and
+ * `SchemaManager.createIndex` from the index side), reached through a rename instead
+ * of a declaration. Left unguarded the user's index is silently reclassified as a
+ * hidden backing structure: it vanishes from `schema()` / `index_info()`, `DROP INDEX`
+ * answers `no such index`, and store-backed its `CREATE INDEX` line is dropped from
+ * the persisted catalog entry — after which the constraint's entries are built into
+ * that index's store and, on reopen, it stops rejecting duplicates.
+ *
+ * Placed before `module.alterTable` for the same reason those paths are: the store's
+ * `alterTable` persists, so a later throw would leave the damage on disk.
+ *
+ * Skips a case-only rename entirely: the derived name folds to the constraint's OWN
+ * pre-rename structure, which the memory backend materializes as a real index entry
+ * and the name-only guard would otherwise read as a collision (the same reason
+ * `runRenameConstraint` gates its check on `oldLower !== newLower`).
+ *
+ * Named and `derivedFromIndex` constraints are unaffected — neither takes a derived
+ * name. Two DIFFERENT unnamed constraints deriving one post-rename name is only
+ * reachable through duplicate unnamed UNIQUEs and is not this guard's problem.
+ *
+ * NOTE: name-only, like the declaration guards, so it also refuses the rename when the
+ * constraint is realized by a REUSED same-column-set index and therefore has no
+ * `_uc_*` structure to move — a legal rename turned away over a name nothing would
+ * have claimed. Deliberate: both backends decide reuse internally and at different
+ * times, so a reuse-aware check would make them disagree on which renames are legal.
+ * The refusal names both objects and is escapable by renaming the index first. If the
+ * false refusal ever bites, gate the check on the constraint actually holding a
+ * `_uc_*` structure — which means asking the module, not just `tableSchema.indexes`.
+ */
+function assertRenamedColumnBackingNamesFree(
+	tableSchema: TableSchema,
+	colIndex: number,
+	oldName: string,
+	newName: string,
+): void {
+	if (oldName.toLowerCase() === newName.toLowerCase()) return;
+	for (const uc of tableSchema.uniqueConstraints ?? []) {
+		if (uc.name !== undefined || uc.derivedFromIndex !== undefined) continue;
+		if (!uc.columns.includes(colIndex)) continue;
+		const postRenameColumns = uc.columns.map(i =>
+			i === colIndex ? newName : (tableSchema.columns[i]?.name ?? String(i)));
+		assertUniqueConstraintIndexNameFree(
+			tableSchema,
+			undefined,
+			postRenameColumns,
+			`rename column '${oldName}' to '${newName}' on table '${tableSchema.name}'`,
+		);
+	}
 }
 
 /**

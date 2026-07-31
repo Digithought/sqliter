@@ -1,13 +1,17 @@
 /**
- * Memory-module-specific behaviour of `ALTER TABLE DROP/RENAME CONSTRAINT`.
+ * Memory-module-specific behaviour of `ALTER TABLE DROP/RENAME CONSTRAINT` and of
+ * `ALTER TABLE RENAME COLUMN`'s effect on a UNIQUE's covering index.
  *
  * The cross-module behavioural surface (enforcement on/off, introspection names,
- * error cases) lives in `test/logic/41.6-alter-drop-rename-constraint.sqllogic`,
- * which runs under both memory and store. This file pins the bits that are
- * MemoryTable-specific and have no store analogue: the implicit covering index a
- * named inline UNIQUE auto-builds (named after the constraint) is torn down on
- * DROP CONSTRAINT and renamed in lock-step on RENAME CONSTRAINT — so neither
- * leaves an orphan index in `tableSchema.indexes` (the in-memory materialization).
+ * error cases) lives in `test/logic/41.6-alter-drop-rename-constraint.sqllogic` and
+ * `test/logic/10.5.7-implicit-unique-index-lifecycle.sqllogic`, which run under both
+ * memory and store. This file pins the bits that are MemoryTable-specific and have no
+ * store analogue: the implicit covering index a UNIQUE auto-builds (named after the
+ * constraint, or `_uc_<covered columns>` when it has no name) is torn down on DROP
+ * CONSTRAINT, renamed in lock-step on RENAME CONSTRAINT, and — for the unnamed case,
+ * whose name is derived from the columns — re-derived on RENAME COLUMN, so none of
+ * the three leaves an orphan index in `tableSchema.indexes` (the in-memory
+ * materialization).
  *
  * `index_info()` hides this structure while the constraint is hidden-implicit
  * (see `isHiddenImplicitIndex`), so it can't be used to observe the covering
@@ -133,6 +137,42 @@ describe('ALTER TABLE DROP/RENAME CONSTRAINT (memory covering-index behaviour)',
 		expect(err!.message).to.match(/would collide with existing index 'taken'/i);
 
 		expect(indexNames(db, 't'), 'neither index moved').to.deep.equal(['taken', 'uq_a']);
+	});
+
+	it("RENAME COLUMN re-derives an unnamed UNIQUE's covering index name", async () => {
+		// `_uc_<cols>` is computed from the columns' CURRENT names every time it is needed
+		// and recorded nowhere, so a rename moves it. Left behind under the old name the
+		// entry stops being recognized as the constraint's structure: it surfaces in
+		// `schema()` / `index_info()` as a user index and `DROP INDEX` deletes it.
+		await db.exec('create table t (id integer primary key, a text, b text, unique (a))');
+		expect(indexNames(db, 't')).to.deep.equal(['_uc_a']);
+
+		await db.exec('alter table t rename column a to z');
+
+		expect(indexNames(db, 't'), 'covering index follows the column').to.deep.equal(['_uc_z']);
+		const covering = db._findTable('t')!.indexes!.find(idx => idx.name === '_uc_z')!;
+		expect(covering.columns.map(c => c.index), 'still keyed on the renamed column').to.deep.equal([1]);
+
+		// Enforcement survives the rename, under the new column name.
+		await db.exec("insert into t values (1, 'x', 'p')");
+		let rejected = false;
+		try { await db.exec("insert into t values (2, 'x', 'q')"); } catch { rejected = true; }
+		expect(rejected, 'renamed UNIQUE still enforces').to.be.true;
+	});
+
+	it('a refused RENAME COLUMN leaves the column name and both index entries in place', async () => {
+		await db.exec('create table t (id integer primary key, a text, b text, unique (a))');
+		await db.exec('create index _uc_z on t (b)');
+		expect(indexNames(db, 't')).to.deep.equal(['_uc_a', '_uc_z']);
+
+		let err: Error | undefined;
+		try { await db.exec('alter table t rename column a to z'); } catch (e) { err = e as Error; }
+		expect(err, 'expected rejection').to.not.be.undefined;
+		expect(err!.message).to.match(/would collide with existing index '_uc_z'/i);
+
+		expect(indexNames(db, 't'), 'neither index moved').to.deep.equal(['_uc_a', '_uc_z']);
+		expect(db._findTable('t')!.columns.map(c => c.name), 'column keeps its old name')
+			.to.deep.equal(['id', 'a', 'b']);
 	});
 
 	it('a CREATE UNIQUE INDEX-derived constraint cannot be dropped via DROP CONSTRAINT', async () => {
