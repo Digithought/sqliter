@@ -207,21 +207,34 @@ export function computeBestAccessPlan(
 	// when no index yields a collation-safe seek, preserving the prior "cheaper
 	// cost, filters unhandled, residual retained" behavior.
 	const indexes = tableInfo.indexes || [];
+	let bestSeekPlan: BestAccessPlanResult | null = null;
 	let costOnlyFallback: BestAccessPlanResult | null = null;
 	for (const index of indexes) {
 		if (index.columns.length === 0) continue;
 		const plan = tryIndexAccessPlan(db, tableKeyCollation, tableInfo, request, index, estimatedRows);
 		if (!plan) continue;
-		// A fully-handled seek (indexName + seekColumns set) wins immediately.
-		if (plan.seekColumnIndexes && plan.seekColumnIndexes.length > 0) return plan;
+		// A fully-handled seek (indexName + seekColumns set) is a candidate: keep the
+		// cheapest one seen so far rather than the first, so declaration order of the
+		// indexes doesn't decide the plan. Strict '<' so ties keep the first candidate,
+		// matching MemoryTableModule.findBestAccessPlan's `indexPlan.cost < bestPlan.cost`.
+		if (plan.seekColumnIndexes && plan.seekColumnIndexes.length > 0) {
+			if (!bestSeekPlan || plan.cost < bestSeekPlan.cost) bestSeekPlan = plan;
+			continue;
+		}
 		// Otherwise remember the first cost-only advertisement as a fallback.
 		if (!costOnlyFallback) costOnlyFallback = plan;
 	}
+	if (bestSeekPlan) return bestSeekPlan;
 	// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
 	// iterates in PK key order for it (`StoreTable.query` full-scans). The range gate makes
 	// this arm fire more often — an index range on a BINARY text column of a default-K table
 	// now lands here — so `... where v > 'x' order by <pk>` picks up a Sort it did not need.
 	// If that shows up as slow, merge `buildPkOrderingAdvertisement(...)` into this return.
+	//
+	// NOTE: cost-only fallback deliberately stays first-wins, not min-cost. These plans
+	// handle no filters — the scan full-scans regardless of which index "wins" — so
+	// "cheapest" among them isn't a meaningful ranking; picking a lower-cost one here would
+	// just under-state the plan's advertised cost to the optimizer without changing the work.
 	if (costOnlyFallback) return costOnlyFallback;
 
 	// Fallback to full scan. The store iterates rows in PK key order

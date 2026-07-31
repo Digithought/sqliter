@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-30T23:31:45.376Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\bug-store-index-choice-ignores-cost.implement.2026-07-30T23-31-45-376Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ---
 description: When a table has several indexes that could answer a query, the persistent storage backend uses whichever one it happens to look at first instead of the cheapest, so a query can end up doing hundreds of index lookups where one would have done.
 files:
