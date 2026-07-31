@@ -765,18 +765,22 @@ create unique index dup_pt_neg on dup_pt (c) where s = 'neg';
 select count(distinct id) as c from unique_constraint_info('dup_pt') where partial = 1;
 → [{"c":2}]
 
--- A full UNIQUE over the same column is still accepted beside them.
--- NOTE: acceptance only — this section deliberately does NOT assert that the full
--- UNIQUE then ENFORCES. On the memory backend it does not: `ensureUniqueConstraintIndexes`
--- reuses a same-column PARTIAL index as a full constraint's backing structure, so
--- enforcement silently narrows to the predicate's scope. That is a separate pre-existing
--- defect in the reuse rule (see tickets/fix/bug-memory-unique-reuses-partial-index), not
--- in the duplicate test this section covers.
+-- A full UNIQUE over the same column is still accepted beside them, and builds its
+-- OWN backing structure rather than adopting either partial index — a partial index
+-- only covers rows inside its predicate, so it cannot back a rule that covers every row.
 alter table dup_pt add unique (c);
 -- run
 
 select count(distinct id) as c from unique_constraint_info('dup_pt');
 → [{"c":3}]
+
+-- ...and it enforces across the WHOLE table, not just the rows either partial
+-- index's predicate admits.
+insert into dup_pt values (1, 5, 'a');
+-- run
+
+insert into dup_pt values (2, 5, 'b');
+-- error: unique
 
 -- ...and now it is the full one that refuses the repeat.
 alter table dup_pt add unique (c);

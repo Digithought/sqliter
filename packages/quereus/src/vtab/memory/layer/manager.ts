@@ -272,7 +272,12 @@ export class MemoryTableManager {
 			// it would enforce this non-derived UC under the index's collation rather
 			// than the declared one. A collation-mismatched index falls through to a
 			// distinct `_uc_*` covering index and coexists as its own constraint.
-			const matchingIndex = existingIndexes.find(idx =>
+			// A filtered (partial) index only covers rows matching its own predicate, so
+			// it's never valid backing for an unfiltered UNIQUE — and a filtered UNIQUE
+			// already owns its index, so it isn't part of this search either (mirrors
+			// `findReusableIndexForUnique` in quereus-store's implicit-unique-index.ts).
+			const matchingIndex = uc.predicate ? undefined : existingIndexes.find(idx =>
+				!idx.predicate &&
 				idx.columns.length === uc.columns.length &&
 				idx.columns.every((col, i) => col.index === uc.columns[i]) &&
 				this.indexCollationsMatchDeclared(idx, uc)
@@ -3143,8 +3148,12 @@ export class MemoryTableManager {
 		// would under-enforce this non-derived UNIQUE. A collation mismatch falls
 		// through to build the distinct `_uc_*` covering index; the user index keeps
 		// enforcing its own (stricter) uniqueness independently (matches SQLite).
-		const matchingUniqueIndex = existingIndexes.find(idx =>
+		// A FILTERED (partial) unique index only guarantees uniqueness among the rows
+		// its own predicate admits, so it can't back a full (unfiltered) UNIQUE either —
+		// same reasoning as `ensureUniqueConstraintIndexes` above.
+		const matchingUniqueIndex = uc.predicate ? undefined : existingIndexes.find(idx =>
 			idx.unique &&
+			!idx.predicate &&
 			idx.columns.length === uc.columns.length &&
 			idx.columns.every((col, i) => col.index === uc.columns[i]) &&
 			this.indexCollationsMatchDeclared(idx, uc),
