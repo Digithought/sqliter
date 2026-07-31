@@ -389,6 +389,13 @@ function selectPhysicalNode(
 ): RelationalPlanNode {
 
 	// Empty result optimization (e.g., IS NULL on NOT NULL column)
+	// NOTE: `handledFilters.every(...)` is vacuously true for a plan with NO filters, so a
+	// module that reports `rows: 0` on a full scan — a plausible reading of a field the
+	// interface calls a "cardinality estimate", for a table that is empty right now — has
+	// its whole table access folded away, and a statement that writes rows into that table
+	// before reading them returns nothing. Dormant: no shipped module reports a live 0 (see
+	// docs/module-authoring.md § Index-Based Access). Hardening tracked in
+	// backlog/debt-empty-access-plan-fold-trusts-estimate.
 	if (accessPlan.rows === 0 && accessPlan.handledFilters.every(h => h)) {
 		log('Using empty result (impossible predicate detected)');
 		return createEmptyResultNode(tableRef);

@@ -580,8 +580,42 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		// `config.collation` reads as the default here exactly as it does in
 		// `StoreTable.encodeOptions` — the two must agree or `analyzePKAccess` would decline a
 		// window `computeBestAccessPlan` already marked handled.
-		const tableKeyCollation = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation || 'NOCASE').toUpperCase();
-		return { ...computeBestAccessPlan(db, tableInfo, request, tableKeyCollation), honorsCollatedRangeBounds: true };
+		const table = this.getTable(tableInfo.schemaName, tableInfo.name);
+		const tableKeyCollation = (table?.getConfig().collation || 'NOCASE').toUpperCase();
+
+		// Fill in the table's real size when the planner has none to give.
+		// `request.estimatedRows` is the engine's hint, and it is only populated from
+		// statistics `ANALYZE` collected — a never-analyzed table arrives here as
+		// `undefined` and every cost below would otherwise be computed against
+		// `computeBestAccessPlan`'s fixed 1000-row placeholder, whatever the table
+		// actually holds. This module maintains a running row count as it writes
+		// (`StoreTable.getKnownRowCount`), so it can answer for itself.
+		//
+		// The engine's hint WINS when it has one: it is the number the rest of the plan
+		// was costed with (join ordering, cache thresholds, sort costs all read the same
+		// catalog statistics), and a module quietly pricing against a different figure
+		// would make the access path disagree with the plan around it. That also means a
+		// stale post-`ANALYZE` count stays stale here — the engine-wide snapshot
+		// semantics, not a separate rule.
+		//
+		// Floored at 1, and that floor is load-bearing rather than cosmetic. `rows: 0` is
+		// not "this table is empty" in the access-plan protocol — it is a module PROVING
+		// its predicate is unsatisfiable, and `rule-select-access-path` acts on it by
+		// replacing the whole table access with a static empty relation. (The memory
+		// module only ever emits it for `IS NULL` on a NOT NULL column, and otherwise
+		// reads an incoming 0 as "unknown".) A live count is a snapshot taken at PLAN
+		// time, so an empty table can still be read after rows are written into it by
+		// the very same statement — a view update that materializes its missing
+		// non-preserved-side row does exactly that. Reporting the honest 0 there folded
+		// the read away and the statement returned nulls for rows it had just written.
+		const liveRows = request.estimatedRows === undefined ? table?.getKnownRowCount() : undefined;
+		const knownRows = liveRows === undefined ? undefined : Math.max(1, liveRows);
+		const sizedRequest = knownRows === undefined ? request : { ...request, estimatedRows: knownRows };
+
+		return {
+			...computeBestAccessPlan(db, tableInfo, sizedRequest, tableKeyCollation),
+			honorsCollatedRangeBounds: true,
+		};
 	}
 
 	/**

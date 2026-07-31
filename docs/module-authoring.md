@@ -165,6 +165,10 @@ interface BestAccessPlanResult {
 - `supportsOrdinalSeek` enables the `monotonic-limit-pushdown` rule: when advertised, the runtime may stamp `FilterInfo.offset`/`FilterInfo.limit` and the module must seek directly to the kth monotonic row (see `query()` contract above). Modules that advertise `supportsOrdinalSeek` but ignore the directives at runtime degrade to a streaming `LIMIT` (the rule's slice operator enforces the cap above the leaf).
 - `supportsAsofRight` enables the `lateral-top1-asof` rule: forward-only repositioning per left row.
 
+**Row counts — one of the two is a claim, not an estimate**:
+
+`request.estimatedRows` is the planner's hint, populated only from `ANALYZE`-collected statistics; `undefined` means unknown, and a module that can size itself may substitute its own count there — but must defer to a supplied hint, or the access path is costed against a different figure than the plan around it. `rows` in the result is an estimate, with one exception: **`rows: 0` claims the predicate is unsatisfiable**, and `rule-select-access-path` replaces the entire table access with a static empty relation on it. Never report 0 merely because the table is empty right now — planning precedes execution, and a statement can write rows into a table before reading it. Report at least 1.
+
 **Claiming `handledFilters` — the positional contract**:
 
 A module may set `handledFilters[i] = true` only for a filter it will actually apply.
@@ -1025,7 +1029,9 @@ class MyTable extends VirtualTable {
 }
 ```
 
-When `getStatistics()` is implemented, the `ANALYZE` command calls it directly. Otherwise, ANALYZE performs a full scan to collect statistics. Statistics are cached on `TableSchema.statistics` and consumed by `CatalogStatsProvider` for selectivity estimation.
+The `ANALYZE` command calls `getStatistics()` when it is implemented, and otherwise collects statistics by scanning the table. Statistics are cached on `TableSchema.statistics` and consumed by `CatalogStatsProvider` for selectivity estimation.
+
+A row count with an **empty** `columnStats` is a supported partial answer, for a module that can size itself cheaply but keeps no value distribution: `ANALYZE` reads it as *"size answered, collect the rest yourself"*, still scans for the per-column numbers, and prefers the scan's row count (it counted every live row; a maintained count can drift). Nothing consults `getStatistics()` during *planning* — to get a live size into cost decisions between `ANALYZE`s, fill in `request.estimatedRows` from `getBestAccessPlan` (see [Index-Based Access](#2-index-based-access-standard)).
 
 ## Update results and REPLACE displacement
 

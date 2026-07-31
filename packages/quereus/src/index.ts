@@ -322,6 +322,11 @@ export type { PluginFunction } from './util/plugin-helper.js';
 // Initialize runtime emitters (this ensures they are registered)
 import './runtime/register.js';
 
+// Catalog statistics — the shape `VirtualTable.getStatistics` returns and `ANALYZE`
+// caches on the table's schema entry. Exported so out-of-package modules (the store
+// backends) can implement that method with the engine's own types.
+export type { TableStatistics, ColumnStatistics, EquiHeightHistogram, HistogramBucket } from './planner/stats/catalog-stats.js';
+
 // Re-export virtual table framework
 export type { VirtualTableModule } from './vtab/module.js';
 export type { ModuleCapabilities, IsolationCapableTable } from './vtab/capabilities.js';

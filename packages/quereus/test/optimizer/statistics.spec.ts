@@ -2,6 +2,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { buildHistogram, selectivityFromHistogram } from '../../src/planner/stats/histogram.js';
 import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
 import type { TableStatistics, ColumnStatistics, EquiHeightHistogram } from '../../src/planner/stats/catalog-stats.js';
@@ -635,6 +636,85 @@ describe('VTab-supplied statistics', () => {
 			secondRows.push(r);
 		}
 		expect(secondRows[0].rows).to.equal(30);
+	});
+});
+
+// ── A module that can only report its SIZE ──────────────────────────────────
+// Not every backend can answer the whole statistics question cheaply. A
+// key-value backend maintains a running row count and keeps no value
+// distribution at all, so its getStatistics() reports a row count with an empty
+// columnStats. ANALYZE must read that as "I answered the size, collect the rest
+// yourself" and still scan — otherwise implementing getStatistics() would make
+// ANALYZE collect strictly LESS than it did before.
+
+/** A memory module whose tables report a row count and no column statistics. */
+class SizeOnlyStatsModule extends MemoryTableModule {
+	/** Row count the last size-only report handed back, so a test can tell them apart. */
+	public reportedRowCount: number | undefined;
+
+	override async connect(
+		db: Database, pAux: unknown, moduleName: string, schemaName: string, tableName: string,
+		options: any, tableSchema?: TableSchema,
+	): Promise<any> {
+		const table = await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema);
+		const rich = table.getStatistics();
+		this.reportedRowCount = rich.rowCount;
+		table.getStatistics = (): TableStatistics => ({
+			rowCount: rich.rowCount,
+			columnStats: new Map<string, ColumnStatistics>(),
+		});
+		return table;
+	}
+}
+
+describe('ANALYZE over a size-only getStatistics()', () => {
+	let db: Database;
+	let module: SizeOnlyStatsModule;
+
+	beforeEach(() => {
+		db = new Database();
+		module = new SizeOnlyStatsModule();
+		db.registerModule('size_only', module);
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	const seed = async (): Promise<void> => {
+		await db.exec(`create table so (id integer primary key, cat text) using size_only`);
+		for (let i = 1; i <= 24; i++) {
+			await db.exec(`insert into so values (${i}, 'c${i % 4}')`);
+		}
+	};
+
+	it('still collects per-column statistics from the scan', async () => {
+		await seed();
+		for await (const _ of db.eval('analyze so')) { /* consume */ }
+
+		const stats = db.schemaManager.findTable('so')?.statistics;
+		expect(module.reportedRowCount, 'the module did report a size').to.equal(24);
+		expect(stats, 'statistics cached on the schema entry').to.not.be.undefined;
+		expect(stats!.rowCount).to.equal(24);
+		expect([...stats!.columnStats.keys()].sort()).to.deep.equal(['cat', 'id']);
+		expect(stats!.columnStats.get('cat')!.distinctCount).to.equal(4);
+	});
+
+	it('prefers the scan count when the reported size has drifted', async () => {
+		await seed();
+		// A delta-tracked count that lost sight of reality; the scan is the reconciliation.
+		const inflate = (): TableStatistics => ({ rowCount: 9999, columnStats: new Map() });
+		const originalConnect = module.connect.bind(module);
+		module.connect = async (...args: Parameters<typeof originalConnect>) => {
+			const table = await originalConnect(...args);
+			table.getStatistics = inflate;
+			return table;
+		};
+
+		const yielded: any[] = [];
+		for await (const r of db.eval('analyze so')) yielded.push(r);
+		expect(yielded[0].rows).to.equal(24);
+		expect(db.schemaManager.findTable('so')!.statistics!.rowCount).to.equal(24);
 	});
 });
 

@@ -809,6 +809,7 @@ Row counts are maintained lazily for efficient query planning:
 - **Tracking**: Each insert increments count (+1), each delete decrements (-1)
 - **Persistence**: After ~100 mutations, stats are flushed to storage in a microtask
 - **Flush on close**: Stats are persisted when a table is disconnected
+- **Load on open**: The persisted count is read back the first time a table's storage is opened, before any mutation can be tracked against it — otherwise the first write after a reopen would restart the count from zero
 - **No database upgrades**: The `__stats__` store is created at database initialization, so stats persistence never triggers schema upgrades
 
 ```typescript
@@ -817,7 +818,15 @@ const table = module.getTable('main', 'users');
 const rowCount = await table.getEstimatedRowCount();
 ```
 
-The `getBestAccessPlan()` method uses these statistics for cost estimation when choosing between full scans and index lookups.
+### How the count reaches the planner
+
+Two routes, answering two different questions.
+
+`StoreTable.getStatistics()` is the engine's `VirtualTable` contract: `ANALYZE` calls it, and it answers the table's **size** in O(1) from the maintained count, with no per-column statistics (the store keeps no value distribution — a distinct count or histogram would cost a full scan). `ANALYZE` treats that empty `columnStats` as "size answered, collect the rest yourself" and still scans for the per-column numbers, preferring the scan's row count because it counted every live row while the maintained one is a delta-tracked estimate that can drift. `ANALYZE` is therefore also the reconciliation for a drifted count. What it collects is cached on `TableSchema.statistics` and is what the engine's own cost model (join ordering, cache thresholds, sort costs) reads.
+
+`StoreModule.getBestAccessPlan()` covers the between-`ANALYZE`s case, which is every store table until someone runs one. The planner's `request.estimatedRows` hint is populated only from `ANALYZE`-collected statistics, so a never-analyzed table arrives as `undefined` and every cost below would otherwise be computed against the module's fixed 1000-row placeholder. The module fills the hint in from `StoreTable.getKnownRowCount()` — the count already in memory, including the open transaction's buffered delta — whenever the planner supplied none. A planner-supplied hint always wins, so the access path is costed with the same number as the plan around it.
+
+The substituted count is floored at 1. `rows: 0` is the access-plan protocol's *"this predicate is unsatisfiable"* — `rule-select-access-path` replaces the whole table access with a static empty relation on it — and a table that is empty when the plan is built can still be read after the same statement writes into it. Consequence: a genuinely empty store table is still costed as though it held one row, not zero.
 
 ## Configuration
 

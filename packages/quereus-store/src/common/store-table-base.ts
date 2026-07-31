@@ -20,6 +20,8 @@ import {
 	type TableSchema,
 	type Row,
 	type SqlValue,
+	type ColumnStatistics,
+	type TableStatistics,
 	type VirtualTableConnection,
 	type VirtualTableModule,
 } from '@quereus/quereus';
@@ -483,6 +485,8 @@ export abstract class StoreTableBase extends VirtualTable {
 				this.ddlSaved = true;
 			}
 
+			await this.primeStats();
+
 			return this.store;
 		} catch (error) {
 			this.storeInitPromise = null;
@@ -500,6 +504,37 @@ export abstract class StoreTableBase extends VirtualTable {
 			this.indexStores.set(indexName, indexStore);
 		}
 		return indexStore;
+	}
+
+	/**
+	 * Read the persisted row count into {@link cachedStats} once per table instance,
+	 * before any mutation can be tracked against it.
+	 *
+	 * `trackMutation` / `applyPendingStats` both seed a missing `cachedStats` with
+	 * `rowCount: 0` and add their delta to it, so WITHOUT this priming the first write
+	 * after a reopen silently restarted the count from zero: a table reopened with 500
+	 * persisted rows reported 1 after a single insert, and the next
+	 * {@link flushStats} made that durable. Nothing read the count for planning before,
+	 * so the loss was invisible; it is not once {@link getKnownRowCount} prices access
+	 * plans with it.
+	 *
+	 * Called from {@link initializeStore}, which every read and write path awaits
+	 * before touching storage — so priming precedes the first `trackMutation` without
+	 * any caller having to remember it. Costs one extra KV `get` per table per session.
+	 *
+	 * Statistics are advisory (same posture as `StoreModuleRename`'s stats re-key): a
+	 * failure to open or read the stats store warns and leaves the count unknown rather
+	 * than failing the storage open that carries the caller's actual query.
+	 */
+	private async primeStats(): Promise<void> {
+		if (this.cachedStats) return;
+		try {
+			const statsStore = await this.ensureStatsStore();
+			const statsData = await statsStore.get(buildStatsKey(this.schemaName, this.tableName));
+			if (statsData) this.cachedStats = deserializeStats(statsData);
+		} catch (e) {
+			console.warn(`[StoreModule] Failed to read persisted statistics for '${this.schemaName}.${this.tableName}': ${e instanceof Error ? e.message : String(e)}`);
+		}
 	}
 
 	/**
@@ -886,21 +921,52 @@ export abstract class StoreTableBase extends VirtualTable {
 
 	/** Get the current estimated row count. */
 	async getEstimatedRowCount(): Promise<number> {
-		if (this.cachedStats) {
-			return this.cachedStats.rowCount;
+		if (!this.cachedStats) {
+			await this.primeStats();
 		}
+		// Still nothing on disk ⇒ this table has never been counted; report 0.
+		return this.cachedStats?.rowCount ?? 0;
+	}
 
-		const statsStore = await this.ensureStatsStore();
-		const statsKey = buildStatsKey(this.schemaName, this.tableName);
-		const statsData = await statsStore.get(statsKey);
+	/**
+	 * The row count this instance can answer WITHOUT any I/O — `undefined` when no
+	 * count has been read or maintained yet (a table nothing has touched this session,
+	 * or one that has never been counted at all).
+	 *
+	 * Synchronous by design: `StoreModule.getBestAccessPlan` is a synchronous engine
+	 * callback, so the only count it can price a plan with is one already in memory.
+	 * {@link primeStats} is what makes that the common case rather than the rare one —
+	 * it loads the persisted count when storage is first opened, which every read and
+	 * write path does before it can reach the planner a second time.
+	 *
+	 * Includes the open transaction's buffered delta, so a statement that reads what
+	 * its own transaction just wrote is costed against the size it will actually see.
+	 */
+	getKnownRowCount(): number | undefined {
+		if (!this.cachedStats) return undefined;
+		return Math.max(0, this.cachedStats.rowCount + this.pendingStatsDelta);
+	}
 
-		if (statsData) {
-			this.cachedStats = deserializeStats(statsData);
-			return this.cachedStats.rowCount;
-		}
-
-		// No stats yet, return 0
-		return 0;
+	/**
+	 * The `VirtualTable.getStatistics` contract: this table's SIZE, reported from the
+	 * running count the write paths already maintain and persist, in O(1) — no scan.
+	 *
+	 * Column statistics are deliberately absent. The store keeps no value distribution
+	 * (a distinct count or histogram would cost a full scan of the table or of an index),
+	 * and `ANALYZE` reads an empty `columnStats` as "this module reported its size
+	 * cheaply, collect the rest by scanning" (see `runtime/emit/analyze.ts`) — so
+	 * implementing this method makes the count reachable without giving up the
+	 * per-column statistics ANALYZE collects today.
+	 *
+	 * `rowCount` is delta-tracked rather than counted, so it can drift from the true
+	 * count if a write path ever mis-accounts; `ANALYZE`'s scan is the reconciliation.
+	 */
+	async getStatistics(): Promise<TableStatistics> {
+		return {
+			rowCount: await this.getEstimatedRowCount(),
+			columnStats: new Map<string, ColumnStatistics>(),
+			lastAnalyzed: this.cachedStats?.updatedAt,
+		};
 	}
 
 	/** Track a mutation and schedule lazy stats persistence. */
