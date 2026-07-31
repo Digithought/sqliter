@@ -34,7 +34,7 @@ import { MergeJoinNode } from '../../nodes/merge-join-node.js';
 import type { EquiJoinPair } from '../../nodes/join-utils.js';
 import { nestedLoopJoinCost, hashJoinCost, mergeJoinCost } from '../../cost/index.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
-import { extractEquiPairs, extractEquiPairsFromUsing, combineResidual, isMergeReadyOnAllPairs } from './equi-pair-extractor.js';
+import { extractEquiPairs, combineResidual, isMergeReadyOnAllPairs } from './equi-pair-extractor.js';
 
 const log = createLogger('optimizer:rule:monotonic-merge-join');
 
@@ -53,9 +53,9 @@ export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): Pl
 	const leftAttrIds = new Set(leftAttrs.map(a => a.id));
 	const rightAttrIds = new Set(rightAttrs.map(a => a.id));
 
-	const extracted = node.condition
-		? extractEquiPairs(node.condition, leftAttrIds, rightAttrIds)
-		: extractEquiPairsFromUsing(node.usingColumns, leftAttrs, rightAttrs);
+	// A USING join carries a desugared condition (see `buildUsingCondition`), so the
+	// one extractor covers both spellings.
+	const extracted = extractEquiPairs(node.condition, leftAttrIds, rightAttrIds);
 	if (!extracted || extracted.equiPairs.length === 0) return null;
 
 	// Defer to `rule-join-physical-selection` whenever both sides' physical

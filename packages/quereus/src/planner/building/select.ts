@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import { PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
+import { PlanNode, type Attribute, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { PlanningContext } from '../planning-context.js';
@@ -20,9 +20,10 @@ import { CTEReferenceNode } from '../nodes/cte-reference-node.js';
 import { InternalRecursiveCTERefNode as _InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import type { CTEScopeNode, CTEPlanNode } from '../nodes/cte-node.js';
 import { JoinNode, type ExistenceColumnSpec } from '../nodes/join-node.js';
-import { resolveComparisonCollation, collationConflictError } from '../analysis/comparison-collation.js';
 import { EXISTENCE_FLAG_TYPE } from '../nodes/join-utils.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
+import { BinaryOpNode } from '../nodes/scalar.js';
+import { insertCrossTypeCoercion } from './coercion.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
 import { ValuesNode } from '../nodes/values-node.js';
 import { createLogger } from '../../common/logger.js';
@@ -701,13 +702,11 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 		condition = buildExpression(joinContext, joinClause.condition);
 	}
 
-	// Handle USING columns
+	// Handle USING columns — desugared to the equivalent ON condition
 	if (joinClause.columns) {
 		usingColumns = joinClause.columns;
-		// Convert USING to ON condition: table1.col1 = table2.col1 AND table1.col2 = table2.col2 ...
-		// For now, store the column names and let the emitter handle the condition
-		// TODO: This could be improved by synthesizing the equality conditions here
-		validateUsingCollations(usingColumns, leftNode, rightNode);
+		condition = buildUsingCondition(
+			usingColumns, leftNode.getAttributes(), rightNode.getAttributes(), joinContext.scope);
 	}
 
 	// Existence (`exists … as`) flags: mint a stable attribute id per clause (once,
@@ -749,32 +748,80 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 }
 
 /**
- * Plan-time USING (and, when supported, NATURAL) collation-conflict check. USING
- * column pairs never materialize as a `BinaryOpNode`, so `BinaryOpNode.generateType`'s
- * lattice validation — which covers spelled-out ON-clause equi-joins — never sees
- * them, yet every USING comparator (the nested-loop join's, and the merge/bloom
- * key collations once `equi-pair-extractor` admits the pair) resolves each pair
- * through the SAME provenance lattice. Run the resolver here so a `using (c)` over
- * columns with conflicting explicit/declared collations raises the identical
- * ambiguous-collation error as the equivalent `l.c = r.c`, at plan time rather
- * than only as the emitter's loud backstop. A NATURAL join (not yet parsed)
- * desugars to USING pairs and inherits this check for free.
+ * Desugar `using (c1, c2, …)` into the `on l.c1 = r.c1 and l.c2 = r.c2 …` condition
+ * it is defined to mean, so a USING join is *the same plan* an equivalent ON join
+ * builds. Everything that hangs off building a real `=` node then applies to USING
+ * for free and cannot drift from the ON spelling:
+ *
+ * - `insertCrossTypeCoercion` — a JSON column paired with a TEXT one compares
+ *   structurally, an INTEGER paired with a TEXT one numerically (ticket
+ *   `bug-using-join-skips-cross-type-coercion`; before the desugar USING compared
+ *   raw storage classes and matched nothing).
+ * - `BinaryOpNode.generateType`'s collation-lattice validation — a `using (c)` over
+ *   columns with conflicting explicit/declared collations raises the identical
+ *   ambiguous-collation error as `l.c = r.c`. Both spellings resolve each pair
+ *   through the SAME symmetric provenance lattice; forcing `getType()` here (the
+ *   type is lazily cached) surfaces the conflict at plan time rather than only as
+ *   the emitter's backstop.
+ * - `extractEquiPairs` — hash/merge key selection, collation tagging and the
+ *   semantic-ordering gate, all off the one extractor.
+ *
+ * A NATURAL join (not yet parsed) desugars to USING pairs and inherits all of this.
+ *
+ * Column references are built **from attributes**, not by resolving a synthesized
+ * qualified `AST.ColumnExpr` through the join scope: a USING column can be ambiguous
+ * by name within one side (`a join b using (k) join c using (k)` — the left side of
+ * the second join has two `k` columns). First-match-per-side by name is the pairing
+ * rule USING has always used here.
+ *
+ * NOTE: the nested-loop USING path used to resolve one comparator per column at emit
+ * time; it now evaluates a condition sub-program per row pair, like every ON join.
+ * Only USING joins that fall back to nested loop (cross-type pairs, existence-flag
+ * joins) pay this, and it is not measured. If a USING-heavy workload ever profiles
+ * slower, the fix belongs in the shared ON-condition evaluation path — not in a
+ * restored USING special case.
  */
-function validateUsingCollations(
+export function buildUsingCondition(
 	usingColumns: readonly string[],
-	leftNode: RelationalPlanNode,
-	rightNode: RelationalPlanNode,
-): void {
-	const leftAttrs = leftNode.getAttributes();
-	const rightAttrs = rightNode.getAttributes();
-	for (const colName of usingColumns) {
-		const lower = colName.toLowerCase();
-		const leftAttr = leftAttrs.find(a => a.name.toLowerCase() === lower);
-		const rightAttr = rightAttrs.find(a => a.name.toLowerCase() === lower);
-		// A USING column missing from a side is a name-resolution error surfaced
-		// elsewhere (the join's column scope); skip rather than mask it here.
-		if (!leftAttr || !rightAttr) continue;
-		const resolution = resolveComparisonCollation(leftAttr.type, rightAttr.type);
-		if (resolution.kind === 'conflict') throw collationConflictError(resolution);
+	leftAttrs: readonly Attribute[],
+	rightAttrs: readonly Attribute[],
+	scope: Scope,
+): ScalarPlanNode {
+	if (usingColumns.length === 0) {
+		throw new QuereusError('USING clause requires at least one column', StatusCode.ERROR);
 	}
+
+	const conjuncts = usingColumns.map(colName => {
+		const lower = colName.toLowerCase();
+		const leftIndex = leftAttrs.findIndex(a => a.name.toLowerCase() === lower);
+		const rightIndex = rightAttrs.findIndex(a => a.name.toLowerCase() === lower);
+		if (leftIndex === -1 || rightIndex === -1) {
+			const missing = leftIndex === -1 ? 'left' : 'right';
+			throw new QuereusError(
+				`USING column not found on ${missing} side of join: ${colName}`,
+				StatusCode.ERROR);
+		}
+		const expr: AST.ColumnExpr = { type: 'column', name: colName };
+		const [left, right] = insertCrossTypeCoercion(
+			scope,
+			new ColumnReferenceNode(scope, expr, leftAttrs[leftIndex].type, leftAttrs[leftIndex].id, leftIndex),
+			new ColumnReferenceNode(scope, expr, rightAttrs[rightIndex].type, rightAttrs[rightIndex].id, rightIndex),
+		);
+		const conjunct = new BinaryOpNode(
+			scope,
+			{ type: 'binary', operator: '=', left: left.expression, right: right.expression },
+			left,
+			right,
+		);
+		// Force the lazily-cached collation-lattice validation (see above).
+		conjunct.getType();
+		return conjunct;
+	});
+
+	return conjuncts.reduce((acc, cur) => new BinaryOpNode(
+		acc.scope,
+		{ type: 'binary', operator: 'AND', left: acc.expression, right: cur.expression },
+		acc,
+		cur,
+	));
 }

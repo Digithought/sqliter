@@ -117,9 +117,9 @@ drop table um_r;
 -- run
 
 -- Conflicting DECLARED collations on a USING pair → plan-time ambiguous-collation
--- error, raised at build (USING pairs never become BinaryOpNodes, so the new
--- join-build validation must catch them). The spelled-out ON form must error
--- IDENTICALLY (uniformity between USING and ON).
+-- error, raised at build: `using (name)` desugars to the `l.name = r.name`
+-- BinaryOpNode, whose type generation reports the conflict. The spelled-out ON
+-- form must error IDENTICALLY (uniformity between USING and ON).
 create table cf_a (id integer primary key, name text collate nocase);
 create table cf_b (id integer primary key, name text collate rtrim);
 insert into cf_a values (1, 'bob');
@@ -167,3 +167,74 @@ select nu_l.id as lid, nu_r.id as rid from nu_l left join nu_r using (k) order b
 
 drop table nu_l;
 drop table nu_r;
+-- run
+
+-- ===== Cross-type USING pairs coerce exactly as the ON form does =====
+-- (ticket bug-using-join-skips-cross-type-coercion) `using (k)` desugars to
+-- `l.k = r.k`, so `insertCrossTypeCoercion` reconciles the pair: a JSON column
+-- against a TEXT one compares structurally (key order irrelevant), and an INTEGER
+-- against a TEXT one compares numerically. Before the desugar USING compared raw
+-- storage classes and returned 0 rows where the ON spelling returned the row.
+create table xj_l (id integer primary key, k json);
+create table xj_r (id integer primary key, k text);
+insert into xj_l values (1, '{"a":1,"b":2}');
+insert into xj_r values (10, '{"b":2,"a":1}');
+
+select xj_l.id as lid, xj_r.id as rid from xj_l join xj_r using (k);
+→ [{"lid":1,"rid":10}]
+
+select xj_l.id as lid, xj_r.id as rid from xj_l join xj_r on xj_l.k = xj_r.k;
+→ [{"lid":1,"rid":10}]
+
+create table xn_l (id integer primary key, k integer);
+create table xn_r (id integer primary key, k text);
+insert into xn_l values (1, 5), (2, 6);
+insert into xn_r values (10, '5'), (20, 'six');
+
+select xn_l.id as lid, xn_r.id as rid from xn_l join xn_r using (k);
+→ [{"lid":1,"rid":10}]
+
+select xn_l.id as lid, xn_r.id as rid from xn_l join xn_r on xn_l.k = xn_r.k;
+→ [{"lid":1,"rid":10}]
+
+drop table xj_l;
+drop table xj_r;
+drop table xn_l;
+drop table xn_r;
+-- run
+
+-- ===== A USING column absent from a side is an error, not a silent empty result =====
+-- Formerly the emitter's USING comparator returned false for an unresolved column
+-- index, so the join produced zero rows and raised nothing.
+create table mi_l (id integer primary key, k integer);
+create table mi_r (id integer primary key, k integer);
+insert into mi_l values (1, 10);
+insert into mi_r values (10, 10);
+-- run
+
+select mi_l.id from mi_l join mi_r using (zzz);
+-- error: USING column not found on left side of join: zzz
+
+drop table mi_l;
+drop table mi_r;
+-- run
+
+-- ===== Three-way USING: first-match-per-side pairing =====
+-- The second join's left side (the a-b join) carries TWO `k` attributes. The pair
+-- is formed from the FIRST match on each side, i.e. `t3a.k = t3c.k` — pinned by
+-- making the first join a LEFT join so a null-extended row has `t3b.k` NULL while
+-- `t3a.k` still holds 20. Pairing on `t3b.k` would drop that row.
+create table t3a (id integer primary key, k integer);
+create table t3b (id integer primary key, k integer);
+create table t3c (id integer primary key, k integer);
+insert into t3a values (1, 10), (2, 20);
+insert into t3b values (11, 10);
+insert into t3c values (111, 10), (222, 20);
+
+select t3a.id as aid, t3b.id as bid, t3c.id as cid
+  from t3a left join t3b using (k) join t3c using (k) order by t3a.id;
+→ [{"aid":1,"bid":11,"cid":111},{"aid":2,"bid":null,"cid":222}]
+
+drop table t3a;
+drop table t3b;
+drop table t3c;

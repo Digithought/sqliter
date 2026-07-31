@@ -401,14 +401,14 @@ describe('ruleAsyncGatherZipByKey', () => {
 		]);
 	});
 
-	it('does NOT fold a USING(k) full join (no synthesized ON condition; out of scope)', async () => {
-		// USING / NATURAL full joins carry no explicit `ON` condition, so the chain
-		// walk declines the gather fold. The binary FULL JOIN then executes via the
-		// nested-loop emitter — only the gather fold is out of scope, not execution.
+	it('folds a USING(k) full join — the desugared ON condition is what the chain walk reads', async () => {
+		// `buildUsingCondition` desugars `using (k)` into `a.k = b.k` at build time,
+		// so a USING / NATURAL full join is indistinguishable from the spelled-out ON
+		// form here and takes the same zip-by-key gather fold.
 		await setup();
 		const sql = 'select coalesce(a.k, b.k) as k, a.av, b.bv from a full outer join b using (k)';
 		const plan = await planRows(db, sql);
-		expect(hasAsyncGather(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
+		expect(hasAsyncGather(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
 		expect(sortByK(await results(db, sql))).to.deep.equal([
 			{ k: 1, av: 'a1', bv: null },
 			{ k: 2, av: 'a2', bv: 'b2' },

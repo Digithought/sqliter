@@ -215,7 +215,8 @@ describe('Collation soundness of plan-time equality facts', () => {
 			await db.exec('create table j8 (k text primary key, z integer) using memory');
 			await db.exec("insert into j7 values (1,'BOB')");
 			await db.exec("insert into j8 values ('Bob',1), ('bob',2)");
-			// extractEquiPairsFromUsing now ADMITS the mismatched pair (tagged
+			// USING desugars to `j7.k = j8.k`, and extractEquiPairs ADMITS the
+			// mismatched pair (tagged
 			// collationsMatch=false / valueDiscriminating=false), so a hash join may
 			// fire — but whichever algorithm runs, the pair mints no key coverage,
 			// and the comparison resolves through the provenance lattice (declared

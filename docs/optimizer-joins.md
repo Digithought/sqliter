@@ -73,7 +73,7 @@ earns from `computePhysical`.
 
 After join ordering (QuickPick), the optimizer selects a physical join algorithm for each join node. This runs in the PostOptimization pass (after QuickPick in the Physical pass) so the full logical join tree is visible to QuickPick before any physical conversion.
 
-The selection rule (`ruleJoinPhysicalSelection`) extracts equi-join pairs from AND-of-equalities in the ON condition (or USING columns), performs a three-way cost comparison (nested-loop vs hash vs merge), and selects the cheapest physical algorithm.
+The selection rule (`ruleJoinPhysicalSelection`) extracts equi-join pairs from AND-of-equalities in the ON condition, performs a three-way cost comparison (nested-loop vs hash vs merge), and selects the cheapest physical algorithm.
 
 **Admissibility and tagging in `rules/join/equi-pair-extractor.ts`** decide whether a candidate pair may become a physical key, and with which properties. A physical key compares with no type context, so it must reproduce what the `=` operator says:
 
@@ -83,7 +83,7 @@ The selection rule (`ruleJoinPhysicalSelection`) extracts equi-join pairs from A
   - `valueDiscriminating` — the comparison passes only value-equal rows (`isValueDiscriminatingEquality`). The physical join nodes feed **only** these pairs into key coverage, FD/EC, and monotonicity propagation — a NOCASE pair matches `'Bob'` to `'bob'`, so minting a value-equality fact from it would over-claim. Non-discriminating pairs still key the join at runtime.
   - The one collation shape still declined is a same-rank explicit/declared *conflict* (declared NOCASE vs declared RTRIM): extraction leaves it in the residual so the plan-time error surfaces at its own site (`BinaryOpNode.generateType`) rather than from a join rule.
 
-A pair failing the semantic-ordering gate (or carrying a collation conflict) demotes to the join's residual predicate — or, for `USING` (which has no residual), sinks the whole extraction — so the generic nested-loop join evaluates it with the `=` operator's own semantics.
+A pair failing the semantic-ordering gate (or carrying a collation conflict) demotes to the join's residual predicate, so the generic nested-loop join evaluates it with the `=` operator's own semantics. This covers `USING` too: `using (c)` is desugared at build time into the `l.c = r.c` condition it means (`buildUsingCondition` in `planner/building/select.ts`), so it reaches this rule as an ordinary ON condition and has a residual like any other join.
 
 ### Bloom (Hash) Join
 

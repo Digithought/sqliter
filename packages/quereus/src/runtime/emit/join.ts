@@ -5,11 +5,7 @@ import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
 import type { Row, SubProgram, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
-import { BINARY_COLLATION } from '../../util/comparison.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
-import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
-import { makeOperandComparator, type OperandComparator } from './operand-comparator.js';
-import { ANY_TYPE } from '../../types/builtin-types.js';
 
 import { createRowSlot } from '../context-helpers.js';
 import { joinOutputRow } from './join-output.js';
@@ -40,28 +36,9 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 	const rightAttributes = plan.right.getAttributes();
 	const rightRowDescriptor = buildRowDescriptor(rightAttributes);
 
-	// Pre-resolve USING column indices and per-column comparators at emit time.
-	// USING compares the two sides' same-named columns, so each pair resolves its
-	// collation through the shared provenance lattice — `using (k)` agrees with the
-	// spelled-out `l.k = r.k` regardless of side order — and its comparator through
-	// `makeOperandComparator`, the one copy of the routing rule `emitComparisonOp`
-	// uses, so the two also agree on declared-type semantics (see
-	// {@link evaluateUsingCondition}).
-	const usingResolved = plan.usingColumns?.map(columnName => {
-		const lowerName = columnName.toLowerCase();
-		const leftIndex = leftAttributes.findIndex(attr => attr.name.toLowerCase() === lowerName);
-		const rightIndex = rightAttributes.findIndex(attr => attr.name.toLowerCase() === lowerName);
-		const leftType = leftAttributes[leftIndex]?.type;
-		const rightType = rightAttributes[rightIndex]?.type;
-		const collationFunc = leftType && rightType
-			? ctx.resolveCollation(effectiveCollationOfTypes(leftType, rightType))
-			: BINARY_COLLATION;
-		const compare = makeOperandComparator(
-			leftType?.logicalType ?? ANY_TYPE,
-			rightType?.logicalType ?? ANY_TYPE,
-			collationFunc);
-		return { leftIndex, rightIndex, compare };
-	});
+	// USING needs no handling here: `buildUsingCondition` desugars `using (k)` into
+	// the equivalent `l.k = r.k` ON condition at build time, so a USING join reaches
+	// this emitter with `plan.condition` set like any other predicated join.
 
 	// Existence (`exists … as`) flags appended after both sides. The flag is the
 	// ACTUAL match bit the outer-join null-extension already computes (NOT a
@@ -112,17 +89,14 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 
 		// The condition-met decision, shared by both loop shapes. Evaluated against
 		// the runtime context after BOTH slots are set, so it is agnostic to which
-		// side drives the iteration: callback (ON) / USING / unconditional (cross or
-		// a bare join with no predicate).
+		// side drives the iteration: callback (ON, including a desugared USING) or
+		// unconditional (cross, or a bare join with no predicate).
 		// Returns `MaybePromise<boolean>` (not always a promise): the ON sub-program
 		// almost always completes synchronously, so callers branch on the result and
 		// only `await` on the rare async path. See resolveMaybe in runtime/async-util.ts.
-		const conditionMet = (leftRow: Row, rightRow: Row): MaybePromise<boolean> => {
+		const conditionMet = (): MaybePromise<boolean> => {
 			if (conditionCallback) {
 				return resolveMaybe(conditionCallback(rctx), (v) => !!v);
-			}
-			if (usingResolved) {
-				return evaluateUsingCondition(leftRow, rightRow, usingResolved);
 			}
 			return true;
 		};
@@ -136,7 +110,7 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 
 				for await (const rightRow of rightCallback(rctx)) {
 					rightSlot.set(rightRow);
-					const leftMet = conditionMet(leftRow, rightRow);
+					const leftMet = conditionMet();
 					if (leftMet instanceof Promise ? await leftMet : leftMet) {
 						matched = true;
 						if (isSemiOrAnti) {
@@ -183,7 +157,7 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 				for (let i = 0; i < leftRows.length; i++) {
 					const leftRow = leftRows[i];
 					leftSlot.set(leftRow);
-					const rightMet = conditionMet(leftRow, rightRow);
+					const rightMet = conditionMet();
 					if (rightMet instanceof Promise ? await rightMet : rightMet) {
 						rightMatched = true;
 						if (leftMatched) leftMatched[i] = true;
@@ -241,51 +215,4 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 		run: asRun(run),
 		note: `${plan.joinType} join (nested loop)`
 	};
-}
-
-type ResolvedUsingColumn = {
-	leftIndex: number;
-	rightIndex: number;
-	compare: OperandComparator;
-};
-
-/**
- * Evaluates a USING condition from pre-resolved column indices and comparators.
- * All index lookups, collation resolution and comparator routing happen at emit time.
- *
- * `using (k)` means exactly `l.k = r.k`, so each column compares through
- * {@link makeOperandComparator} — the one copy of the routing rule
- * `emitComparisonOp` uses. A USING column pairing a semantic-ordering type with a
- * plain one (TIMESPAN `d` against TEXT `d`) therefore takes the same runtime
- * duration check `=` takes and reports 'PT1H' ≡ 'PT60M'; a same-type pair takes the
- * type's own compare. A NULL on either side fails the column outright, mirroring
- * `emitComparisonOp`'s `v1 === null || v2 === null ⇒ null` guard: `l.k = r.k` is
- * UNKNOWN, not true, when both are NULL. The comparators themselves rank NULL/NULL as
- * equal (they are ordering functions, where NULL is a value), so the guard belongs
- * here — without it a nested-loop USING join emits rows the hash-keyed path and the
- * spelled-out ON form both drop.
- *
- * NOTE: USING skips the plan-time cross-type coercion `=` gets, so a JSON column
- * paired with a TEXT one still compares as OBJECT-vs-TEXT storage classes and never
- * matches. Tracked as `bug-using-join-skips-cross-type-coercion`.
- */
-function evaluateUsingCondition(
-	leftRow: Row,
-	rightRow: Row,
-	resolved: readonly ResolvedUsingColumn[]
-): boolean {
-	for (const { leftIndex, rightIndex, compare } of resolved) {
-		if (leftIndex === -1 || rightIndex === -1) {
-			return false;
-		}
-		const leftValue = leftRow[leftIndex];
-		const rightValue = rightRow[rightIndex];
-		if (leftValue === null || rightValue === null) {
-			return false;
-		}
-		if (compare(leftValue, rightValue) !== 0) {
-			return false;
-		}
-	}
-	return true;
 }

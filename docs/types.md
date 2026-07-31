@@ -325,8 +325,7 @@ the SAME one. A **mixed** pair, `timespan_col = text_col`, is inadmissible: `=` 
 its generic path's runtime duration check and matches 'PT1H' against 'PT60M', which a
 raw-text hash key or merge co-walk does not. The equi-pair extractor
 (`planner/rules/join/equi-pair-extractor.ts`) declines such a pair, demoting it to the
-join's residual predicate — or, for `using (…)`, sinking the whole extraction to the
-generic nested-loop join — so the `=` operator's own semantics decide the match. The
+join's residual predicate, so the `=` operator's own semantics decide the match. The
 cost is that a rare shape drops to nested-loop; losing rows is worse.
 
 Declining rather than canonicalizing the key is deliberate. Merge join needs both
@@ -336,17 +335,12 @@ two orders, so canonicalizing would fix hash join and leave merge join unsound.
 Canonicalizing also introduces a false-positive hazard: TIMESPAN's `groupKey` returns a
 *number*, so a `timespan` ↔ `integer` pair would hash-match values `=` reports unequal.
 
-`using (k)` is the same equality, so the generic join's USING comparison routes through
-`makeOperandComparator` — the one copy of the comparison routing rule `=` uses — and a
-mixed USING pair matches exactly what `=` matches. One gap remains: USING skips the
-plan-time cross-type coercion `=` gets, so a JSON column joined `using` a TEXT column
-still compares OBJECT against TEXT and never matches. Tracked as
-`tickets/backlog/bug-using-join-skips-cross-type-coercion`.
-
-`using (k)` also fails a NULL key on either side, matching `=` (`null = null` is
-UNKNOWN) and the hash path (which never inserts NULL keys). The nested-loop emitter
-needs its own guard for that: the comparators it routes through are *ordering*
-functions, and ordering ranks NULL/NULL as equal.
+`using (k)` has no comparison machinery of its own: `buildUsingCondition`
+(`planner/building/select.ts`) desugars it at build time into the `l.k = r.k` node an ON
+join builds, so it inherits everything hanging off that node — plan-time cross-type
+coercion (a JSON column joined `using` a TEXT column compares structurally), the
+collation lattice, the mixed-pair rule above, and NULL handling (`null = null` is
+UNKNOWN, so a NULL key never matches on either physical path).
 
 Two surfaces still do **not** follow the rule — one observable, one latent.
 
@@ -933,9 +927,9 @@ Related forms:
   `text` column holding duration-shaped text stays text-compared. A *searched*
   `CASE` (`case when <predicate>`) does no comparison of its own — its WHEN is an
   ordinary boolean expression that already resolved through the lattice.
-- **USING joins** — each same-named column pair resolves through the lattice,
-  so `using (k)` agrees with the spelled-out `l.k = r.k`. The four pairwise
-  join-key surfaces (USING comparator, merge / bloom / asof) all resolve their
+- **USING joins** — `using (k)` desugars to the `l.k = r.k` comparison node, so
+  it resolves through the lattice by construction, identically to the spelled-out
+  form. The pairwise join-key surfaces (merge / bloom / asof) all resolve their
   key collation through the same lattice — the sibling of set operations below.
 - **Set operations** (`UNION` / `INTERSECT` / `EXCEPT` / `DIFF`, and `UNION
   ALL`) — each OUTPUT column resolves its dedup/compare collation **symmetrically

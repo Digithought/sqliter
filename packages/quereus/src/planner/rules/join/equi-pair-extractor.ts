@@ -13,22 +13,20 @@ import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import {
 	operandCollation,
 	isValueDiscriminatingEquality,
-	isValueDiscriminatingTypePair,
 	resolveComparisonCollation,
-	type TypeSlice,
 } from '../../analysis/comparison-collation.js';
-import { normalizeCollationName, semanticOrderingsAgree } from '../../../util/comparison.js';
+import { semanticOrderingsAgree } from '../../../util/comparison.js';
 
 export interface EquiPairExtraction {
 	equiPairs: EquiJoinPair[];
 	residual: ScalarPlanNode | undefined;
 	/**
 	 * For each entry in `equiPairs`, the original `=` ScalarPlanNode it was
-	 * extracted from (or `undefined` for USING-derived pairs that have no
-	 * source node). Same length and order as `equiPairs`. Useful when a rule
+	 * extracted from. Same length and order as `equiPairs`. Useful when a rule
 	 * wants to demote a subset of equi-pairs back into the residual (e.g., the
 	 * monotonic-merge rule keeps only the monotonic-driving pair as the merge
-	 * key and pushes the rest into the residual).
+	 * key and pushes the rest into the residual). Typed optional for that
+	 * demotion path's convenience; extraction always fills every slot.
 	 */
 	equiPairNodes: Array<ScalarPlanNode | undefined>;
 }
@@ -178,8 +176,8 @@ export function combineResidual(
  * physically sorted in its comparator's order and a `timespan` side is sorted by
  * elapsed time while a `text` side is sorted by text — no single comparator merges
  * those two orders, so canonicalizing would fix hash join and leave merge join
- * unsound. Declined pairs demote to the residual (or, for USING, sink the whole
- * extraction) and the `=` operator's own semantics apply. See `docs/types.md`
+ * unsound. Declined pairs demote to the residual and the `=` operator's own
+ * semantics apply. See `docs/types.md`
  * § "Semantic ordering"; ticket
  * `mixed-type-equi-join-key-drops-semantic-matches`.
  */
@@ -235,56 +233,4 @@ export function extractEquiPairs(
 	const residual = combineResidual(undefined, residuals);
 
 	return { equiPairs, residual, equiPairNodes };
-}
-
-/**
- * The slice of an {@link import('../../nodes/plan-node.js').Attribute} the USING
- * extractor reads. Structural rather than the full `Attribute` so tests can pass a
- * literal; both production call sites pass real attributes.
- */
-type UsingAttr = {
-	id: number;
-	name: string;
-	type?: TypeSlice;
-};
-
-/**
- * Convert USING-column names into equi-pairs given the left/right attributes.
- * Returns null if no pairs could be matched.
- *
- * Collation is handled as in {@link extractEquiPairs}: a pair over columns with
- * differing declared collations IS extracted, tagged `collationsMatch: false`
- * (hash/bloom join it; merge declines) and with `valueDiscriminating` per the
- * value-discrimination gate. Two shapes still sink the whole extraction to
- * `null` (USING has no residual to demote into — the generic join evaluates
- * the condition instead): a same-rank explicit/declared collation *conflict*,
- * and disagreeing semantic ordering (one side `timespan`, the other plain
- * `text` — see the semantic-ordering gate on {@link extractEquiPairs}).
- */
-export function extractEquiPairsFromUsing(
-	usingColumns: readonly string[] | undefined,
-	leftAttrs: ReadonlyArray<UsingAttr>,
-	rightAttrs: ReadonlyArray<UsingAttr>,
-): EquiPairExtraction | null {
-	if (!usingColumns || usingColumns.length === 0) return null;
-	const equiPairs: EquiJoinPair[] = [];
-	for (const colName of usingColumns) {
-		const lower = colName.toLowerCase();
-		const leftAttr = leftAttrs.find(a => a.name.toLowerCase() === lower);
-		const rightAttr = rightAttrs.find(a => a.name.toLowerCase() === lower);
-		if (leftAttr && rightAttr) {
-			if (resolveComparisonCollation(leftAttr.type ?? {}, rightAttr.type ?? {}).kind === 'conflict') return null;
-			if (!semanticOrderingsAgree(leftAttr.type?.logicalType, rightAttr.type?.logicalType)) return null;
-			const lColl = normalizeCollationName(leftAttr.type?.collationName ?? 'BINARY');
-			const rColl = normalizeCollationName(rightAttr.type?.collationName ?? 'BINARY');
-			equiPairs.push({
-				leftAttrId: leftAttr.id,
-				rightAttrId: rightAttr.id,
-				collationsMatch: lColl === rColl,
-				valueDiscriminating: isValueDiscriminatingTypePair(leftAttr.type, rightAttr.type),
-			});
-		}
-	}
-	if (equiPairs.length === 0) return null;
-	return { equiPairs, residual: undefined, equiPairNodes: equiPairs.map(() => undefined) };
 }

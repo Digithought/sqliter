@@ -121,6 +121,15 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 		public readonly right: RelationalPlanNode,
 		public readonly joinType: JoinType,
 		public readonly condition?: ScalarPlanNode,
+		/**
+		 * The column names a `using (…)` join was written with. **Presentational
+		 * only — `condition` is authoritative.** `buildUsingCondition`
+		 * (planner/building/select.ts) desugars USING into the equivalent
+		 * `l.c = r.c and …` and stores it in `condition`, so every consumer
+		 * (physical selection, equi-pair extraction, the nested-loop emitter)
+		 * reads the condition and none re-derives the comparison from these names.
+		 * They survive so EXPLAIN can print how the join was actually written.
+		 */
 		public readonly usingColumns?: readonly string[],
 		public readonly existence?: readonly ExistenceColumnSpec[],
 	) {
@@ -306,10 +315,12 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 
 	override toString(): string {
 		const joinTypeDisplay = this.joinType.toUpperCase();
-		if (this.condition) {
-			return `${joinTypeDisplay} JOIN ON condition`;
-		} else if (this.usingColumns) {
+		// USING first: a USING join always carries a desugared condition too (see the
+		// `usingColumns` field), and the USING spelling is the faithful one for EXPLAIN.
+		if (this.usingColumns) {
 			return `${joinTypeDisplay} JOIN USING(${this.usingColumns.join(', ')})`;
+		} else if (this.condition) {
+			return `${joinTypeDisplay} JOIN ON condition`;
 		} else {
 			return `${joinTypeDisplay} JOIN`;
 		}

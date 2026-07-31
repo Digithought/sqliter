@@ -22,7 +22,6 @@ import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { nestedLoopJoinCost, hashJoinCost, mergeJoinCost } from '../../cost/index.js';
 import {
 	extractEquiPairs,
-	extractEquiPairsFromUsing,
 	isOrderedOnEquiPairs,
 	reorderEquiPairsForMerge,
 } from './equi-pair-extractor.js';
@@ -83,14 +82,10 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 	const leftAttrIds = new Set(leftAttrs.map(a => a.id));
 	const rightAttrIds = new Set(rightAttrs.map(a => a.id));
 
-	// Try to extract equi-join pairs from condition (or USING)
-	let extracted: { equiPairs: EquiJoinPair[]; residual: ScalarPlanNode | undefined } | null = null;
-
-	if (node.condition) {
-		extracted = extractEquiPairs(node.condition, leftAttrIds, rightAttrIds);
-	} else if (node.usingColumns) {
-		extracted = extractEquiPairsFromUsing(node.usingColumns, leftAttrs, rightAttrs);
-	}
+	// Try to extract equi-join pairs from the condition. A USING join has one too —
+	// `buildUsingCondition` desugars it at build time — so there is no separate path.
+	const extracted: { equiPairs: EquiJoinPair[]; residual: ScalarPlanNode | undefined } | null =
+		extractEquiPairs(node.condition, leftAttrIds, rightAttrIds);
 
 	if (!extracted || extracted.equiPairs.length === 0) return null;
 
