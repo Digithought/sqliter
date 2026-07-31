@@ -193,6 +193,25 @@ await db.exec("alter table users rename column created_at to registration_date")
 *   **Inheritance Propagation:** Index changes automatically propagate through layer inheritance
 *   **Schema Consistency:** Index definitions are maintained consistently across layer transitions
 
+### **Which structure enforces a declared UNIQUE:**
+A declared `UNIQUE` constraint is enforced through a secondary BTree. Rather than always
+building one, `MemoryTableManager` may adopt an existing same-column index. Adoption is
+admissible only when that index covers *exactly* the same rows and orders them the same way:
+
+*   **Not filtered.** A partial index (`create index ... where ...`) physically holds only the
+    rows its predicate admits, and the write path skips the uniqueness check outright for a row
+    outside the covering index's predicate. Adopting one for an unfiltered `UNIQUE` therefore
+    narrows enforcement to the predicate's scope — duplicates outside it are accepted silently.
+*   **Collation-equivalent** per column to the constraint's *declared* collations, or the
+    constraint is enforced under the index's comparator rather than its own.
+
+The rule binds at all three places that pick a structure: the two creation-time reuse searches
+(`ensureUniqueConstraintIndexes` for `CREATE TABLE`-declared `UNIQUE`,
+`addUniqueConstraint` for `ALTER TABLE ... ADD UNIQUE`) and the column-set scan in
+`findIndexForConstraint`, which resolves the enforcing structure on every write when the
+by-name lookup misses. Finding no admissible structure is always safe: enforcement falls back to
+a full scan that applies the constraint's own predicate and collations — slower, but exact.
+
 ### **Memory Management:**
 *   **Copy-on-Write Pages:** Only modified pages are copied, sharing immutable pages across layers
 *   **Automatic Cleanup:** Unused layers are automatically garbage collected when no longer referenced

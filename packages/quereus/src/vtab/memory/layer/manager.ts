@@ -1357,8 +1357,8 @@ export class MemoryTableManager {
 		//    finer index (e.g. BINARY over a NOCASE column) no longer collapses onto
 		//    the constraint; resolving by name is robust to `schema.indexes` order
 		//    (the finer index may be listed earlier, having been created first).
-		// Both fall through to the column-set scan only when the name does not
-		// resolve (defensive).
+		// Both fall through to the column-set scan below when the name does not
+		// resolve — see there for when that actually happens.
 		if (uc.derivedFromIndex) {
 			const index = targetLayer.getSecondaryIndex?.(uc.derivedFromIndex);
 			if (index) return { kind: 'memory-index', index };
@@ -1370,14 +1370,34 @@ export class MemoryTableManager {
 			}
 		}
 
-		// Defensive fallback: match the auto-built `_uc_*` covering index by
-		// column-set when the by-name resolution above did not land.
+		// Fallback: match the covering index by column-set when the by-name
+		// resolution above did not land. Reached more often than "defensive"
+		// suggests — the reuse arms of `ensureUniqueConstraintIndexes` /
+		// `addUniqueConstraint` register an UNNAMED constraint's structure under the
+		// REUSED index's name, which `getImplicitCoveringStructure` (keyed
+		// `_uc_<cols>`) then cannot find; and a reused index that is later dropped
+		// leaves the recorded name unresolvable.
+		//
+		// So this scan must apply the SAME admissibility rule as those two reuse
+		// searches, or it re-opens the hole they close: a FILTERED index holds only
+		// the rows its predicate admits, and `checkSingleUniqueConstraint` skips the
+		// check outright for a row outside the covering index's predicate — adopting
+		// one for an unfiltered UNIQUE silently narrows enforcement to the
+		// predicate's scope. A collation-mismatched index enforces under ITS
+		// collation rather than the declared one, the same way.
+		//
+		// Returning undefined is always SAFE: the caller falls back to the
+		// predicate- and collation-aware full scan, which is slower but exact. So a
+		// filtered constraint does not guess here at all — its own structure is
+		// resolved by name above.
+		if (uc.predicate) return undefined;
 		for (const idx of schema.indexes) {
-			if (idx.columns.length === uc.columns.length &&
-				idx.columns.every((col, i) => col.index === uc.columns[i])) {
-				const index = targetLayer.getSecondaryIndex?.(idx.name);
-				return index ? { kind: 'memory-index', index } : undefined;
-			}
+			if (idx.predicate) continue;
+			if (idx.columns.length !== uc.columns.length) continue;
+			if (!idx.columns.every((col, i) => col.index === uc.columns[i])) continue;
+			if (!this.indexCollationsMatchDeclared(idx, uc)) continue;
+			const index = targetLayer.getSecondaryIndex?.(idx.name);
+			if (index) return { kind: 'memory-index', index };
 		}
 		return undefined;
 	}
@@ -1935,7 +1955,7 @@ export class MemoryTableManager {
 					const colNames = uc.columns.map(i => schema.columns[i]?.name ?? String(i));
 					throw maintainedTableUniqueViolationError(
 						this.schemaName, this._tableName,
-						uc.name ?? `_uc_${colNames.join('_')}`,
+						uc.name ?? implicitIndexNameOver(uc, schema.columns),
 						colNames,
 						uc.columns.map(i => change.newRow[i]),
 					);
@@ -3179,8 +3199,7 @@ export class MemoryTableManager {
 			return;
 		}
 
-		const colNames = uc.columns.map(i => columns[i]?.name ?? String(i));
-		const indexName = uc.name ?? `_uc_${colNames.join('_')}`;
+		const indexName = uc.name ?? implicitIndexNameOver(uc, columns);
 		const indexSchema: IndexSchema = {
 			name: indexName,
 			// Carry per-column collation so enforcement honors e.g. NOCASE (mirrors

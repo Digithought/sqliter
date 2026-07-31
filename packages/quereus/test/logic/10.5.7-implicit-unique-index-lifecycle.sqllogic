@@ -786,6 +786,36 @@ insert into dup_pt values (2, 5, 'b');
 alter table dup_pt add unique (c);
 -- error: an equivalent UNIQUE constraint on (c) already exists
 
+-- 10e-bis. The full UNIQUE keeps enforcing after the index it ADOPTED is dropped,
+-- and still refuses to fall back onto a same-column PARTIAL index.
+-- `add unique (c)` reuses `reuse_full` (unique, unfiltered, same collation) instead of
+-- building its own structure. Dropping that index leaves the constraint with no named
+-- structure, so enforcement resolves the covering index by column set — where a partial
+-- index over (c) is the only remaining candidate. It must be refused: with it adopted,
+-- both rows below sit outside `s = 'pos'` and the duplicate `c = 7` goes unnoticed.
+create table reuse_pt (id integer primary key, c integer, s text);
+create unique index reuse_part on reuse_pt (c) where s = 'pos';
+create unique index reuse_full on reuse_pt (c);
+alter table reuse_pt add unique (c);
+drop index reuse_full;
+-- run
+
+insert into reuse_pt values (1, 7, 'a');
+-- run
+
+insert into reuse_pt values (2, 7, 'b');
+-- error: unique
+
+select count(*) as c from reuse_pt;
+→ [{"c":1}]
+
+-- The partial index still enforces its own narrower rule alongside.
+insert into reuse_pt values (3, 8, 'pos');
+-- run
+
+insert into reuse_pt values (4, 8, 'pos');
+-- error: unique
+
 -- 10f. A column name is compared as a whole name, never as text spliced together
 -- A quoted identifier may contain anything, including whatever character the guard
 -- uses to concatenate a column set. `unique ("a,b")` covers ONE column and must not
