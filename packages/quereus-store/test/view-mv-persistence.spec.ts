@@ -571,4 +571,85 @@ describe('StoreModule view / materialized-view persistence', () => {
 		// The rest of the database is untouched by the refusal.
 		expect(await rows(db2, 'select id, v from base')).to.deep.equal([{ id: 1, v: 10 }]);
 	});
+
+	// ── Tables and views persisted regardless of access / statement order ──
+	//
+	// `bug-store-untouched-table-and-early-view-never-persisted`: a table's catalog entry
+	// used to be written lazily, the first time its storage was opened, so a table nobody
+	// read or wrote vanished on reopen; and the module only learned its `Database` from
+	// its first TABLE hook, so a view created before the first store table was never
+	// persisted — nor even vetoed. Now the entry rides `table_added` and the subscription
+	// is established at `registerModule`.
+
+	it('an empty, never-touched store table survives reopen and is queryable', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table lonely (id integer primary key, v text) using store`);
+		// Deliberately no read and no write — nothing ever opens the table's storage.
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.tables, 'the untouched table rehydrated').to.deep.equal(['main.lonely']);
+		expect(await rows(db2, 'select count(*) as n from lonely')).to.deep.equal([{ n: 0 }]);
+		// And it is usable, not just registered.
+		await db2.exec(`insert into lonely values (1, 'a')`);
+		expect(await rows(db2, `select id, v from lonely`)).to.deep.equal([{ id: 1, v: 'a' }]);
+	});
+
+	it('an empty store table with a secondary index survives reopen with the index intact', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table idxed (id integer primary key, v integer) using store`);
+		await db.exec(`create index idx_v on idxed(v)`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.tables).to.deep.equal(['main.idxed']);
+		expect(result.indexes, 'the index rehydrated with the table').to.deep.equal(['main.idxed.idx_v']);
+		expect(await rows(db2, 'select count(*) as n from idxed')).to.deep.equal([{ n: 0 }]);
+	});
+
+	it('a store table created then dropped leaves no phantom catalog entry', async () => {
+		// Guards the drop path against the `table_added` write landing after the drop's
+		// own catalog delete (both are catalog writes, one queued and one direct).
+		const { db, mod } = open();
+		await db.exec(`create table doomed (id integer primary key) using store`);
+		await db.exec(`drop table doomed`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.tables, 'no resurrected table').to.deep.equal([]);
+		expect(db2.schemaManager.getTable('main', 'doomed'), 'table not registered').to.be.undefined;
+	});
+
+	it('a view created as the FIRST statement of a brand-new database survives reopen', async () => {
+		// No rehydrate, no prior store table — the module learns its Database from
+		// `registerModule` alone.
+		const { db, mod } = open();
+		await db.exec(`create view early as select 1 as x`);
+		await db.exec(`create table later (id integer primary key) using store`);
+		await db.exec(`insert into later values (1)`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.views, 'the early view persisted').to.deep.equal(['main.early']);
+		expect(result.tables).to.deep.equal(['main.later']);
+		expect(await rows(db2, 'select x from early')).to.deep.equal([{ x: 1 }]);
+	});
+
+	it('an unpersistable view name is REFUSED even as the first statement of a fresh database', async () => {
+		// Previously the veto self-gated on `subscribedDb === db`, so before the first
+		// store-table hook it declined to answer and the create slipped through — silently
+		// dropped on reopen. The registration-time subscription closes that window.
+		const { db, mod } = open();
+		await expectRejected(db, `create view "\uD800" as select 1 as x`);
+		await mod.closeAll();
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.views, 'nothing persisted').to.deep.equal([]);
+		expect(db2.schemaManager.getView('main', '\uD800'), 'view not registered').to.be.undefined;
+	});
 });

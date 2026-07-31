@@ -201,6 +201,24 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 	}
 
 	/**
+	 * Engine `onRegister` hook: subscribe to the database's schema-change notifier the
+	 * moment this module is registered, before any statement can run.
+	 *
+	 * Views and materialized views never route through a module table hook, so without
+	 * this the module would only learn its `Database` from the first
+	 * `create`/`connect`/`alterTable`/`rehydrateCatalog` — and a `create view` issued
+	 * before that (the first statement of a brand-new database, say) would fire
+	 * `view_added` at a module that is not listening yet and silently never persist.
+	 *
+	 * Idempotent with the lazy call sites; a second `Database` logs
+	 * `ensureSchemaSubscription`'s "different Database" warning here rather than at first
+	 * table use (a warning, not a throw — one module instance still serves one Database).
+	 */
+	onRegister(db: Database, _moduleName: string): void {
+		this.ensureSchemaSubscription(db);
+	}
+
+	/**
 	 * Engine `notifyLensDeployment` hook: a logical `apply schema X` fires this on
 	 * every registered module once the lens catalog mutation + snapshot rotation
 	 * complete (see `VirtualTableModule.notifyLensDeployment`). The store module —
@@ -502,7 +520,14 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 			await this.provider.closeStore(schemaName, tableName);
 		}
 
-		// Remove DDL from catalog
+		// Remove DDL from catalog. Drain the persist queue first: the `table_added`
+		// listener writes a freshly created table's entry asynchronously, so a
+		// create-then-drop in the same session could otherwise land that queued write
+		// AFTER this delete and resurrect the entry as a phantom table on reopen. Every
+		// other direct catalog write in the module is followed by a queued
+		// `table_modified` (or, for RENAME, a queued `removeTableDDL`) that re-establishes
+		// the truth; a drop has no such follow-up, so it drains explicitly.
+		await this.whenCatalogPersisted();
 		await this.removeTableDDL(schemaName, tableName);
 	}
 

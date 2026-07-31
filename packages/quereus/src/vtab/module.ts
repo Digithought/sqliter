@@ -536,6 +536,21 @@ export interface VirtualTableModule<
 	): void | Promise<void>;
 
 	/**
+	 * Optional. Called once by {@link Database.registerModule} when this module is
+	 * registered on a database, before any table hook (`create`/`connect`/`alterTable`/…)
+	 * can fire. A module that must observe the database from the very first statement —
+	 * e.g. a persistent-storage module that persists views, which never route through a
+	 * table hook — subscribes to `db.schemaManager.getChangeNotifier()` here rather than
+	 * waiting for its first table hook to hand it a `db`.
+	 *
+	 * Synchronous and side-effect-light by contract: it runs inside `registerModule`, and
+	 * throwing fails the registration. Registering the SAME module instance on a second
+	 * `Database` therefore surfaces whatever a module does about that at registration time
+	 * rather than at first table use. Omit ⇒ never called (today's behavior).
+	 */
+	onRegister?(db: Database, moduleName: string): void;
+
+	/**
 	 * Optional pre-flight veto: throw when this module would be UNABLE to durably
 	 * persist the catalog entry for `object`. Consulted over every registered module
 	 * by the CREATE VIEW / CREATE MATERIALIZED VIEW / ALTER … SET TAGS paths BEFORE

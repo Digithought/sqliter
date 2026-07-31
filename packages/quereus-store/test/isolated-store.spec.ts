@@ -10,7 +10,8 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, asyncIterableToArray, type DatabaseInternal, type VirtualTableConnection } from '@quereus/quereus';
+import { Database, MemoryTableModule, asyncIterableToArray, type DatabaseInternal, type VirtualTableConnection } from '@quereus/quereus';
+import { IsolationModule } from '@quereus/isolation';
 import {
 	createIsolatedStoreModule,
 	hasIsolation,
@@ -1593,5 +1594,91 @@ describe('Isolated Store Module', () => {
 
 			await db.exec('COMMIT');
 		});
+	});
+});
+
+/**
+ * Catalog persistence THROUGH the isolation wrapper.
+ *
+ * `Database.registerModule` and the engine's schema-change notifier both see the
+ * REGISTERED module — the `IsolationModule` — so anything the store needs from the
+ * engine has to be forwarded. Two forwards are pinned here: `onRegister` (the store
+ * subscribes to the notifier at registration) and the ownership test the `table_added`
+ * catalog write self-filters on, which must recognize a table whose `vtabModule` is the
+ * wrapper exposing the store as `underlying`.
+ */
+describe('Isolated Store Module — catalog persistence across reopen', () => {
+	/**
+	 * A provider whose `closeAll` is a NO-OP, so a logical `StoreModule.closeAll()`
+	 * (which drains the catalog persist queue) survives and a fresh module can reopen
+	 * the same storage — the only way to express close → reopen against memory.
+	 */
+	function createPersistentProvider(): KVStoreProvider & { _hardClose: () => void } {
+		const stores = new Map<string, InMemoryKVStore>();
+		const getOrCreate = (key: string): InMemoryKVStore => {
+			let s = stores.get(key);
+			if (!s) {
+				s = new InMemoryKVStore();
+				stores.set(key, s);
+			}
+			return s;
+		};
+		return {
+			async getStore(schemaName: string, tableName: string) { return getOrCreate(`${schemaName}.${tableName}`); },
+			async getIndexStore(schemaName: string, tableName: string, indexName: string) {
+				return getOrCreate(`${schemaName}.${tableName}_idx_${indexName}`);
+			},
+			async getStatsStore(schemaName: string, tableName: string) { return getOrCreate(`${schemaName}.${tableName}.__stats__`); },
+			async getCatalogStore() { return getOrCreate('__catalog__'); },
+			async closeStore() { /* no-op: durable storage survives a logical close */ },
+			async closeIndexStore() { /* no-op */ },
+			async closeAll() { /* no-op: data survives module close, mirroring real disk */ },
+			_hardClose() {
+				for (const s of stores.values()) void s.close();
+				stores.clear();
+			},
+		};
+	}
+
+	let provider: ReturnType<typeof createPersistentProvider>;
+
+	beforeEach(() => { provider = createPersistentProvider(); });
+	afterEach(() => { provider._hardClose(); });
+
+	/** A fresh db whose `store` module is a StoreModule behind the isolation wrapper. */
+	function open(): { db: Database; store: StoreModule } {
+		const db = new Database();
+		const store = new StoreModule(provider);
+		db.registerModule('store', new IsolationModule({ underlying: store, overlay: new MemoryTableModule() }));
+		return { db, store };
+	}
+
+	it('an empty, never-touched store table behind the isolation wrapper survives reopen', async () => {
+		const { db, store } = open();
+		await db.exec(`CREATE TABLE lonely (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+		// No read, no write — the table's storage is never opened.
+		await store.closeAll();
+
+		const { db: db2, store: store2 } = open();
+		const result = await store2.rehydrateCatalog(db2);
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.tables, 'the untouched wrapped table rehydrated').to.deep.equal(['main.lonely']);
+
+		const counted = await asyncIterableToArray(db2.eval('SELECT count(*) AS n FROM lonely'));
+		expect(counted[0].n).to.equal(0);
+	});
+
+	it('a view created as the FIRST statement behind the isolation wrapper survives reopen', async () => {
+		const { db, store } = open();
+		await db.exec(`CREATE VIEW early AS SELECT 1 AS x`);
+		await store.closeAll();
+
+		const { db: db2, store: store2 } = open();
+		const result = await store2.rehydrateCatalog(db2);
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.views, 'the early view persisted through the wrapper').to.deep.equal(['main.early']);
+
+		const got = await asyncIterableToArray(db2.eval('SELECT x FROM early'));
+		expect(got).to.deep.equal([{ x: 1 }]);
 	});
 });

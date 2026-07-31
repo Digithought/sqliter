@@ -344,10 +344,12 @@ or refill. A **memory-hosted** maintained table's `table_*` events stay ignored
 the MV form — persists, and it always refills on reopen. All writes ride the same
 serialized `persistQueue` drained by `closeAll`/`whenCatalogPersisted`.
 
-**Subscription is established in `rehydrateCatalog`** (not lazily off the first table
-hook), so a reopened DB persists subsequent view/MV DDL even when its first
-post-reopen statement is a view. Gap: a brand-new DB never rehydrated, whose first
-DDL is a view, still relies on a prior store-table create/connect to subscribe.
+**Subscription is established at `Database.registerModule`**, through the optional
+`VirtualTableModule.onRegister` hook (the isolation wrapper forwards it). The store
+subscribes there, before any statement can run, so view/MV DDL persists regardless of
+where it falls in statement order — including as the very first statement of a brand-new
+database that was never rehydrated. `rehydrateCatalog` still subscribes as well
+(idempotent), since it is reachable with a `Database` the module was never registered on.
 
 **Persistence is advisory — except for one pre-flight veto.** These writes are
 fire-and-forget in both layers: `SchemaChangeNotifier.notifyChange` wraps every
@@ -432,9 +434,12 @@ Two things stay uncovered. A `select *` materialized view's persisted backing **
 list** shifts under a column rename with no AST change, so the scan cannot see it (and no
 persist event fires) — harmless today because reopen re-derives an implicit MV's shape from
 its body; see the `NOTE:` on `restoreUnaffectedMaterializedViews` in
-`runtime/emit/materialized-view-helpers.ts`. And a store module that has not
-yet subscribed to a database never vetoes at all —
-`bug-store-untouched-table-and-early-view-never-persisted`.
+`runtime/emit/materialized-view-helpers.ts`. And a `create table` is not gated here at
+all — it goes through `module.create`, whose failure already reaches the statement, but
+that hook does not check DDL-text encodability; for a store table an unencodable
+definition (a lone surrogate in a quoted column name, a `DEFAULT` string literal, a
+`CHECK` constant) is instead raised by the catalog backstop the first time the table's
+storage is opened, so a table nobody ever reads or writes never surfaces it.
 
 **Rehydrate phasing.** `rehydrateCatalog` first consumes the clean-shutdown marker
 (the reserved `\x00meta\x00clean_shutdown` entry `closeAll` writes after every batch

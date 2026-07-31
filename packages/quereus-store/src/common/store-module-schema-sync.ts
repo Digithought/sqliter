@@ -128,11 +128,10 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 	 * USING clause).
 	 */
 	async rehydrateCatalog(db: Database): Promise<RehydrationResult> {
-		// Subscribe up front: a reopened DB whose first post-reopen DDL is a view/MV
-		// would otherwise miss the event (the lazy `ensureSchemaSubscription` points are
-		// all table hooks). Done even for an empty catalog. (Documented gap: a brand-new
-		// DB — never rehydrated — whose very first DDL is a view still relies on a prior
-		// store-table create/connect to establish the subscription.)
+		// Idempotent: `StoreModule.onRegister` already subscribed at `db.registerModule`.
+		// Kept because `rehydrateCatalog` is also reachable with a `db` this module was
+		// never registered on (tests, embedders driving rehydration directly), and because
+		// the subscription must exist before phase 3 can observe MV staleness.
 		this.ensureSchemaSubscription(db);
 
 		// Capability gate (method presence — matching the coordinator's own gate): an
@@ -290,11 +289,16 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 	}
 
 	/**
-	 * Subscribe (once) to the engine's `SchemaChangeNotifier` so catalog-only
-	 * mutations that bypass `module.alterTable` — notably `ALTER … SET TAGS` and the
-	 * programmatic `setTableTags`/`setColumnTags`/`setConstraintTags` — still re-persist
-	 * the table's catalog DDL. Called lazily from the first `create`/`connect`/
-	 * `alterTable` hook that hands us a `db`.
+	 * Subscribe (once) to the engine's `SchemaChangeNotifier`, the channel every
+	 * event-driven catalog write rides: `table_added` (a new store table's entry),
+	 * catalog-only mutations that bypass `module.alterTable` — notably `ALTER … SET TAGS`
+	 * and the programmatic `setTableTags`/`setColumnTags`/`setConstraintTags` — and the
+	 * whole view / materialized-view lifecycle.
+	 *
+	 * Normally called from `StoreModule.onRegister` at `Database.registerModule`, before
+	 * any statement runs; also called from `rehydrateCatalog` and the `create`/`connect`/
+	 * `alterTable` hooks, which are reachable with a `db` this module was not registered
+	 * on. Idempotent.
 	 *
 	 * One `StoreModule` instance is assumed to serve one `Database`. A later hook
 	 * carrying a *different* `db` keeps the existing subscription (multi-database
@@ -322,6 +326,9 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 	 * Engine schema-change listener. Persists the catalog incrementally for the events
 	 * that bypass `module.alterTable` / `module.destroy`:
 	 *
+	 * - `table_added` — a table the engine has just fully validated and registered. This is
+	 *   what persists a store table nobody ever reads or writes (the lazy
+	 *   first-storage-access save never runs for one).
 	 * - `table_modified` — every catalog-only tag swap (and the redundant follow-up a
 	 *   structural ALTER fires). Keeps a connected `StoreTable`'s cached schema consistent
 	 *   (SET TAGS does not call `updateSchema`) then read-compare-writes the table bundle.
@@ -336,10 +343,11 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 	 * add/remove: one `StoreModule` instance serves one `Database`, so that database's
 	 * views/MVs belong in its catalog unconditionally. A MEMORY-hosted maintained table
 	 * fires `table_added`/`table_removed`/`table_modified` like any table; those stay
-	 * ignored (`table_added`/`table_removed` fall through; its `table_modified` is
-	 * catalog-absent → skipped), so only the MV entry persists for it. A STORE-hosted
-	 * maintained table additionally persists its own table bundle through the ordinary
-	 * store-table machinery (which phase-1 rehydrate connects for the adopt fast path).
+	 * ignored (`table_added` fails the ownership filter, `table_removed` falls through,
+	 * its `table_modified` is catalog-absent → skipped), so only the MV entry persists for
+	 * it. A STORE-hosted maintained table additionally persists its own table bundle
+	 * through the ordinary store-table machinery (which phase-1 rehydrate connects for the
+	 * adopt fast path).
 	 *
 	 * Synchronous by contract (`notifyChange` does not await listeners); every async write
 	 * rides `persistQueue`, drained by `closeAll`/`whenCatalogPersisted`.
@@ -362,9 +370,55 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 		this.persistStaleMvSetIfChanged();
 	};
 
-	/** Dispatch a single engine schema-change event to its catalog-persistence arm. */
+	/**
+	 * Dispatch a single engine schema-change event to its catalog-persistence arm.
+	 *
+	 * The `table_added` arm is where a store table's catalog entry is written. It fires
+	 * from `SchemaManager.createTable` only AFTER the engine has fully validated the table
+	 * (notably `validateForeignKeyCollations`, which runs after `module.create` returns and
+	 * throws WITHOUT calling `destroy`) and registered it — so, unlike an eager write
+	 * inside `StoreModule.create`, it can never leave an entry behind for a table the user
+	 * never got, which would reopen as a phantom table.
+	 *
+	 * Two things distinguish this arm from the view/MV arms above it:
+	 *
+	 * - **It self-filters on ownership.** Every table the engine registers is announced,
+	 *   including memory tables and other modules'. `ownsTableCatalogEntry` is the test for
+	 *   "would this module write that table's entry" (and already handles the isolation
+	 *   wrapper, whose `vtabModule` is the wrapper exposing us as `underlying`). The
+	 *   view/MV arms need no such filter — views and MVs are not owned by a module.
+	 * - **It compare-writes rather than blind-puts.** `table_added` is re-delivered during
+	 *   rehydration for a store-hosted materialized-view backing
+	 *   (`SchemaManager.createBackingTable`), where the entry phase 1 already wrote is
+	 *   current; comparing keeps that a no-op so a second consecutive reopen still yields
+	 *   identical catalog bytes. (Plain table import during rehydration is silent — no
+	 *   `table_added` fires at all.)
+	 *
+	 * A failure on this path is logged and swallowed by `enqueuePersist`, not raised on the
+	 * statement — identical to how `create view` / `create materialized view` already
+	 * persist. That is why `StoreTableBase.initializeStore` keeps its first-storage-access
+	 * catalog write as a compare-write BACKSTOP: it is the only site where a table whose
+	 * DDL text cannot be encoded at all (a lone surrogate in a quoted column name, a
+	 * DEFAULT string literal, a CHECK constant) still raises on a statement.
+	 */
 	private dispatchSchemaChange(event: EngineSchemaChangeEvent): void {
 		switch (event.type) {
+			// NOTE: the compare-write costs one catalog READ per CREATE TABLE, and the
+			// first-storage-access backstop costs a second one. DDL is rare, so neither is
+			// worth avoiding today; if a schema-heavy `apply schema` creating many tables at
+			// once ever shows up hot here, have the arm hand the freshly written bundle to
+			// the StoreTable (as `createIndex` does with `markDdlSaved`) so the backstop can
+			// be skipped outright.
+			case 'table_added': {
+				const table = event.newObject;
+				if (!this.ownsTableCatalogEntry(table)) return;
+				// `newObject` is the post-`finalizeCreatedTableSchema` schema, so it already
+				// carries the store's reconciled PK collations — byte-identical to what the
+				// first-storage-access backstop in `StoreTableBase.initializeStore` writes,
+				// which is what makes that backstop a compare-skip rather than a second put.
+				this.enqueuePersist(() => this.persistTableCatalogEntryIfChanged(table));
+				return;
+			}
 			case 'table_modified': {
 				// SET TAGS does not call `table.updateSchema`, so a connected instance's cached
 				// schema would otherwise go stale (and a later lazy `saveTableDDL` could re-write

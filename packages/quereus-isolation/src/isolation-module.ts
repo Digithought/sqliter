@@ -682,6 +682,22 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Forwards module registration to the underlying module.
+	 *
+	 * `Database.registerModule` calls `onRegister` on the REGISTERED module, which is this
+	 * wrapper when a store is isolated. The underlying module uses it to subscribe to the
+	 * database's schema-change notifier before any statement runs; without this forward an
+	 * isolation-wrapped store would fall back to subscribing lazily at its first table
+	 * hook and would silently drop a view created ahead of that.
+	 *
+	 * Which `Database` the module serves is isolation-transparent, so a straight delegate
+	 * is correct; a throw must propagate (it fails the registration by contract).
+	 */
+	onRegister(db: Database, moduleName: string): void {
+		this.underlying.onRegister?.(db, moduleName);
+	}
+
+	/**
 	 * Forwards the view / materialized-view catalog-persistability veto to the underlying
 	 * module.
 	 *

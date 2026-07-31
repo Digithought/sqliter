@@ -91,8 +91,10 @@ export interface StoreTableModule {
 	 * coordinator never requires opening storage.
 	 */
 	getCoordinator(): TransactionCoordinator;
-	/** Save table DDL to persistent storage. */
+	/** Save table DDL to persistent storage (unconditional put). */
 	saveTableDDL(tableSchema: TableSchema): Promise<void>;
+	/** Write table DDL only when the persisted entry is absent or differs. */
+	persistTableCatalogEntryIfChanged(tableSchema: TableSchema): Promise<void>;
 }
 
 /**
@@ -465,9 +467,19 @@ export abstract class StoreTableBase extends VirtualTable {
 				throw new Error(`getStore returned null/undefined for ${tableKey}`);
 			}
 
-			// Save DDL on first access (only for newly created tables)
+			// Catalog backstop on first storage access. The authoritative write happens
+			// earlier, off the engine's `table_added` event; this is a COMPARE-write, so for
+			// an already-persisted table it reads and skips rather than re-putting identical
+			// bytes.
+			//
+			// It is retained (rather than dropped as redundant) because it is the only place a
+			// table whose persisted DDL text is UNENCODABLE — a lone surrogate in a quoted
+			// column name, a DEFAULT string literal, a CHECK constant — can raise on the
+			// statement: the `table_added` write rides the persist queue, which logs and
+			// swallows. The entry is absent there (that write threw), so the compare-write
+			// attempts it and the encoding guard throws into the DML that opened the storage.
 			if (!this.ddlSaved && this.tableSchema) {
-				await this.storeModule.saveTableDDL(this.tableSchema);
+				await this.storeModule.persistTableCatalogEntryIfChanged(this.tableSchema);
 				this.ddlSaved = true;
 			}
 

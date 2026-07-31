@@ -829,6 +829,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		// Check if the module has a getEventEmitter method and hook it up
 		this.hookModuleEvents(name, module);
+
+		// Hand the module this Database before any table hook can fire, so a module that
+		// must observe schema changes from the very first statement (a persistent-storage
+		// module persisting views, which never route through a table hook) can subscribe
+		// now. Throwing fails the registration — see `VirtualTableModule.onRegister`.
+		module.onRegister?.(this, name);
 	}
 
 	/**

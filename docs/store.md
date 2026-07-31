@@ -376,13 +376,38 @@ silently (no change event, no import-result entry) against the just-imported
 table, whose `CREATE TABLE` earlier in the bundle carries the constraint and its
 exposure flag.
 
+**When a table's entry is written.** The authoritative write happens when the engine
+REGISTERS the table — the store's schema-change listener handles `table_added` and
+compare-writes the bundle. Registration is the right moment because it is the first
+point at which the table definitively exists: `SchemaManager.createTable` runs
+`validateForeignKeyCollations` *after* `module.create` returns and throws there without
+calling `destroy`, so a write inside `create` could leave an entry for a table the user
+never got, which would reopen as a phantom.
+
+The listener self-filters on ownership (`ownsTableCatalogEntry` — memory tables and other
+modules' tables are left alone, and a store table behind the isolation wrapper is still
+recognized) and compare-writes rather than blind-puts, because `table_added` is also
+delivered during rehydration for a store-hosted materialized-view backing whose entry is
+already current.
+
+`StoreTableBase.initializeStore` still compare-writes the entry the first time a table's
+storage is opened, now purely as a **backstop**: for an already-persisted table it reads
+and skips. It is retained because the `table_added` write rides the async persist queue,
+which logs and swallows — so the backstop is the only site where a table whose DDL text
+cannot be encoded at all (a lone surrogate in a quoted column name, a `DEFAULT` string
+literal, a `CHECK` constant) raises on a statement rather than vanishing quietly. Before
+this arrangement the write was *only* lazy, so a table nobody ever read or wrote was never
+persisted at all and disappeared on reopen.
+
 **Why bundle rather than a per-index key:** every existing re-persist path carries
 the indexes for free —
 
 - `CREATE INDEX` / `DROP INDEX` rewrite the bundle (`StoreModule.createIndex` /
   `dropIndex` call `saveTableDDL` after updating the connected table's schema).
 - `DROP TABLE` deletes the single key, so the indexes vanish with it (no orphan
-  catalog entries).
+  catalog entries). The teardown drains the persist queue first, so a create-then-drop
+  in one session cannot have its queued `table_added` write land *after* the delete and
+  resurrect a phantom entry.
 - `RENAME TABLE` regenerates the bundle under the new name (index DDL references
   the renamed table automatically).
 - `ALTER INDEX … SET/ADD/DROP TAGS` fires `table_modified` on the *owning* table;

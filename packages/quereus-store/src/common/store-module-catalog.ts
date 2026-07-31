@@ -160,11 +160,42 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 
 	/**
 	 * Save table DDL (bundled with its secondary index DDL) to the catalog store.
+	 * Unconditional put — every caller has just produced the authoritative bundle
+	 * (create-index / drop-index / an `alterTable` arm / `renameTable`). For the
+	 * event-driven `table_added` path, which may be re-delivered over an entry that
+	 * is already current, use {@link persistTableCatalogEntryIfChanged}.
 	 */
 	async saveTableDDL(tableSchema: TableSchema): Promise<void> {
 		const { key, ddl } = this.tableCatalogEntry(tableSchema);
 		const catalogStore = await this.provider.getCatalogStore();
 		await catalogStore.put(key, this.encodeCatalogDDL(ddl));
+	}
+
+	/**
+	 * Compare-write a TABLE's catalog entry: write when the entry is absent or its
+	 * bundle differs, skip when identical.
+	 *
+	 * Two callers, both needing exactly this shape:
+	 * - the `table_added` arm of `StoreModuleSchemaSync.dispatchSchemaChange` — the
+	 *   authoritative write for a freshly registered store table, including one nobody
+	 *   ever reads or writes;
+	 * - `StoreTableBase.initializeStore`'s first-storage-access backstop, which the
+	 *   `table_added` write normally renders a no-op.
+	 *
+	 * Distinct from both neighbours on purpose:
+	 * - not {@link persistCatalogIfChanged}, whose absent → skip self-filter is exactly
+	 *   the case this path exists to cover (a brand-new table has no entry yet);
+	 * - not bare {@link saveTableDDL}, which always puts — `table_added` is also
+	 *   delivered during rehydration for a store-hosted materialized-view backing, where
+	 *   the entry is already current and a blind put would dirty otherwise-identical
+	 *   catalog bytes.
+	 *
+	 * Shares {@link tableCatalogEntry} with the write and veto paths so all three agree
+	 * on what a table's entry is.
+	 */
+	async persistTableCatalogEntryIfChanged(tableSchema: TableSchema): Promise<void> {
+		const { key, ddl } = this.tableCatalogEntry(tableSchema);
+		await this.persistObjectCatalogEntryIfChanged(key, ddl);
 	}
 
 	/**
@@ -231,11 +262,12 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	 * memory-backed dependent from being refused on our behalf.
 	 *
 	 * Gated on `subscribedDb === db`: this module persists a view/MV only while subscribed
-	 * to that `Database`'s change notifier (`StoreModuleSchemaSync.ensureSchemaSubscription`, driven by the
-	 * first `create`/`connect`/`alterTable`/`rehydrateCatalog`). A module registered but
-	 * never handed a `db` writes nothing, so vetoing there would reject a definition that
-	 * loses nothing. The gate becomes removable if persistence is ever made unconditional
-	 * (`bug-store-untouched-table-and-early-view-never-persisted`).
+	 * to that `Database`'s change notifier. Since `StoreModule.onRegister` subscribes at
+	 * `Database.registerModule` — before any statement can run — the gate no longer
+	 * shields an unsubscribed module from vetoing; it now only declines to answer on
+	 * behalf of a *different* `Database` than the one this module serves (the
+	 * one-instance-one-database posture `ensureSchemaSubscription` documents). That case
+	 * writes nothing, so vetoing there would reject a definition that loses nothing.
 	 */
 	// NOTE: regenerates the object's full DDL text on every CREATE VIEW / CREATE MATERIALIZED
 	// VIEW / view-or-MV SET TAGS, and the persist that follows regenerates it again. DDL is
@@ -273,6 +305,10 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	 * {@link persistCatalogIfChanged}), which reads the catalog store and so is unavailable
 	 * to a hook that is synchronous and IO-free by contract.
 	 *
+	 * Also the self-filter for the `table_added` catalog write in
+	 * `StoreModuleSchemaSync.dispatchSchemaChange`, which is likewise handed every table the
+	 * engine registers regardless of who owns it.
+	 *
 	 * Ownership is tested exactly as `StoreModule.resolveOwnedTable` tests it: a table this
 	 * session already touched (it is in `tables`), or one whose `vtabModule` is this module
 	 * — or a WRAPPER exposing this module as `underlying`, which is what a store table looks
@@ -285,7 +321,7 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	 * safe side: that table's eventual lazy `saveTableDDL` would throw on the diverged text
 	 * anyway, on the same swallowing path with nothing left to tell the user.
 	 */
-	private ownsTableCatalogEntry(table: TableSchema): boolean {
+	protected ownsTableCatalogEntry(table: TableSchema): boolean {
 		const tableKey = `${table.schemaName}.${table.name}`.toLowerCase();
 		if (this.tables.has(tableKey)) return true;
 		const owner = table.vtabModule as unknown as { underlying?: unknown } | undefined;
@@ -293,14 +329,17 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	}
 
 	/**
-	 * Compare-write a view/MV catalog entry: write only when the entry is absent or its
-	 * DDL differs from `newDDL` (skip identical). Unlike the table path's
-	 * {@link persistCatalogIfChanged} there is **no** absent→skip self-filter — a view/MV
-	 * belongs to this db's catalog unconditionally (one module instance serves one
-	 * Database). Skipping identical writes makes any event whose regenerated DDL is
-	 * unchanged (e.g. a `materialized_view_refreshed`) a no-op, so a second consecutive
-	 * reopen yields identical catalog bytes. (Rehydration itself fires no view/MV events
-	 * at all — `importCatalog` is silent.)
+	 * Compare-write a catalog entry: write only when the entry is absent or its DDL
+	 * differs from `newDDL` (skip identical). Unlike {@link persistCatalogIfChanged}
+	 * there is **no** absent→skip self-filter — the callers have already established
+	 * that the object belongs in this db's catalog (a view/MV unconditionally, since
+	 * one module instance serves one Database; a table via
+	 * {@link persistTableCatalogEntryIfChanged}'s ownership filter). Skipping identical
+	 * writes makes any event whose regenerated DDL is unchanged (e.g. a
+	 * `materialized_view_refreshed`, or a `table_added` re-delivered for an
+	 * already-persisted materialized-view backing during rehydration) a no-op, so a
+	 * second consecutive reopen yields identical catalog bytes. (View/MV rehydration
+	 * itself fires no view/MV events at all — `importCatalog` is silent.)
 	 */
 	private async persistObjectCatalogEntryIfChanged(key: Uint8Array, newDDL: string): Promise<void> {
 		const catalogStore = await this.provider.getCatalogStore();
