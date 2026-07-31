@@ -207,6 +207,37 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 		}
 	});
 
+	it('an index whose name a UNIQUE constraint on the same table holds imports (warn-and-proceed) into a degraded table', async () => {
+		// Both write paths refuse this collision now, so only a catalog written before
+		// those guards — or a hand-built bundle like this one — can carry it. `importIndex`
+		// deliberately warns and proceeds rather than bricking the open; this pins what
+		// "proceeds" actually costs, which is more than the shadowing the warning used to
+		// describe: two index entries under one name, neither reported by `index_info()`,
+		// `DROP INDEX` refusing, and a predicate over the imported index's column no longer
+		// filtering. Asserted so a future decision to reject or rename here visibly flips it.
+		const dst = new Database();
+		try {
+			await dst.exec('create table t (id integer primary key, a text, b text, constraint foo unique (a))');
+			await dst.exec("insert into t values (1, 'x', 'p'), (2, 'y', 'q')");
+			const result = await dst.schemaManager.importCatalog(['CREATE INDEX foo ON t (b)']);
+			expect(result.indexes, 'import proceeds').to.have.length(1);
+
+			const named = dst._findTable('t')!.indexes!.filter(idx => idx.name.toLowerCase() === 'foo');
+			expect(named, 'two structures now answer to one name').to.have.length(2);
+			expect(await rows(dst, "select index_name from index_info('t')"), 'neither is reported').to.deep.equal([]);
+
+			let dropErr: Error | undefined;
+			try { await dst.exec('drop index foo'); } catch (e) { dropErr = e as Error; }
+			expect(dropErr?.message, 'the imported index is not droppable').to.match(/no such index/i);
+
+			// The constraint still enforces, but the imported index no longer filters.
+			const filtered = await rows(dst, "select id from t where b = 'q'");
+			expect(filtered, 'predicate over the shadowed index stops filtering (known damage)').to.have.length(2);
+		} finally {
+			await dst.close();
+		}
+	});
+
 	it('a genuine expression index is still rejected on import', async () => {
 		const dst = new Database();
 		try {

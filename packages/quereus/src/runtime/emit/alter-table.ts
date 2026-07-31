@@ -1145,11 +1145,12 @@ async function runRenameConstraint(
 	// memory backend the constraint's OWN backing structure is a materialized index under
 	// the old name, which a case-only rename would otherwise match.
 	if (constraintClass === 'unique' && oldLower !== newLower) {
-		const uc = (tableSchema.uniqueConstraints ?? []).find(c => c.name?.toLowerCase() === oldLower);
+		// No columns to pass: the renamed-to name is always a name, so the `_uc_<cols>`
+		// auto-name branch is unreachable from here.
 		assertUniqueConstraintIndexNameFree(
 			tableSchema,
 			newName,
-			(uc?.columns ?? []).map(i => tableSchema.columns[i]?.name ?? String(i)),
+			[],
 			`rename constraint '${oldName}' to '${newName}' on table '${tableSchema.name}'`,
 		);
 	}

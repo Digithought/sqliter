@@ -3382,11 +3382,21 @@ export class SchemaManager {
 		// carrying it was written before those guards existed. `importDDL` imports the
 		// CREATE TABLE (constraints included) ahead of every CREATE INDEX, so the
 		// constraint is always the one already present when the collision is seen.
+		//
+		// NOTE: the resulting state is worse than "shadowed and undroppable". Measured on
+		// the memory backend (test/index-ddl-roundtrip.spec.ts), the table ends up with two
+		// index entries under the one name, `index_info()` reports NEITHER, `DROP INDEX`
+		// answers `no such index`, and a predicate over the imported index's column stops
+		// filtering — `where b = 'q'` returns every row. No write path can produce such a
+		// catalog any more, so this is only reachable by opening a database written before
+		// the guards (backwards compatibility is waived project-wide) or by handing
+		// `importCatalog` a collided bundle directly. If either becomes real, reject or
+		// rename the shadowing index HERE rather than loosening the write-path guards.
 		if (isImplicitCoveringIndex(tableSchema, indexName)) {
 			warnLog(
 				`Imported index '%s' on table '%s' collides with the implicit backing index of a UNIQUE constraint of the same name `
-					+ `on that table; the index shadows the constraint's structure and DROP INDEX will refuse to drop it — `
-					+ `rename either the index or the constraint`,
+					+ `on that table; the index shadows the constraint's structure, DROP INDEX will refuse to drop it, and predicates `
+					+ `over its columns stop filtering — rename either the index or the constraint`,
 				indexName, tableSchema.name,
 			);
 		}

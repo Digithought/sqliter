@@ -427,8 +427,11 @@ function implicitIndexNameForColumns(constraintName: string | undefined, columnN
  * engine. Deliberately name-only: the legitimate "reuse an existing index to back
  * a constraint" case matches on *columns*, not names, and is unaffected. Matching
  * columns do NOT make the collision benign — see the callers.
+ *
+ * `columnNames` is consulted only when `constraintName` is undefined (the
+ * `_uc_<cols>` auto-name); a named constraint ignores it.
  */
-export function findIndexShadowedByUniqueConstraint(
+function findIndexShadowedByUniqueConstraint(
 	tableSchema: TableSchema,
 	constraintName: string | undefined,
 	columnNames: ReadonlyArray<string>,

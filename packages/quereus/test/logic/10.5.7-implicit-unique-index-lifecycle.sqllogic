@@ -334,6 +334,25 @@ alter table iul_au add unique (a);
 select count(*) as c from schema() where type = 'index' and name = '_uc_a';
 → [{"c":1}]
 
+-- Multi-column: the auto-name joins the declared column names with `_`.
+create table iul_am (id integer primary key, a text, b text, c text);
+create index _uc_a_b on iul_am (c);
+-- run
+
+alter table iul_am add unique (a, b);
+-- error: would collide with existing index '_uc_a_b'
+
+select count(*) as c from schema() where type = 'index' and name = '_uc_a_b';
+→ [{"c":1}]
+
+-- A free multi-column auto-name still installs and enforces.
+alter table iul_am add unique (b, c);
+insert into iul_am values (1, 'p', 'q', 'r');
+-- run
+
+insert into iul_am values (2, 'z', 'q', 'r');
+-- error: unique
+
 -- 9c. ALTER TABLE RENAME CONSTRAINT
 create table iul_rc (id integer primary key, a text, b text);
 create index rc_taken on iul_rc (b);
@@ -387,6 +406,18 @@ insert into iul_cc values (1, 'p', 'q');
 insert into iul_cc values (2, 'p2', 'q');
 -- error: unique
 
+-- A column declaring several inline `unique` constraints is checked per constraint,
+-- so the colliding one is refused whichever position it holds.
+create table iul_cm (id integer primary key, a text);
+create index _uc_m on iul_cm (a);
+-- run
+
+alter table iul_cm add column m text constraint cm_free unique unique;
+-- error: would collide with existing index '_uc_m'
+
+select count(*) as c from table_info('iul_cm') where name = 'm';
+→ [{"c":0}]
+
 -- 9e. `create unique index` still synthesizes its constraint beside its index
 -- (`derivedFromIndex`), which the guard must not mistake for a collision.
 create table iul_ui (id integer primary key, a text);
@@ -401,8 +432,10 @@ insert into iul_ui values (2, 'k');
 -- error: unique
 
 drop table iul_ui;
+drop table iul_cm;
 drop table iul_cc;
 drop table iul_rc;
+drop table iul_am;
 drop table iul_au;
 drop table iul_ac;
 -- run
