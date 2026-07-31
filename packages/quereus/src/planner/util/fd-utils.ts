@@ -11,7 +11,7 @@ import { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.
 import { BetweenNode, BinaryOpNode, CastNode, CollateNode, LiteralNode, UnaryOpNode } from '../nodes/scalar.js';
 import { InNode } from '../nodes/subquery.js';
 import type { SqlValue } from '../../common/types.js';
-import { compareSqlValues, normalizeCollationName } from '../../util/comparison.js';
+import { compareSqlValues, normalizeCollationName, semanticOrderingsAgree } from '../../util/comparison.js';
 import { flipComparison } from '../analysis/predicate-shape.js';
 import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, isValueDiscriminatingEquality, operandCollation } from '../analysis/comparison-collation.js';
 
@@ -984,18 +984,42 @@ export interface EqualityFds {
  *
  * Non-equality conjuncts contribute nothing.
  *
- * **Collation gate.** Every extracted fact is a VALUE-level claim (a pinned
- * column has one value across rows; `col1 = col2` rows are value-equal), so a
- * conjunct only contributes when its comparison is value-discriminating
- * (`isValueDiscriminatingEquality`): for textual operands the effective
- * comparison collation must be BINARY. A NOCASE/RTRIM comparison — via a
- * `COLLATE` wrapper on either side or a non-BINARY declared column collation —
- * passes value-DIFFERENT rows ('Bob' = 'bob' NOCASE), so its facts would
- * over-claim (false ≤1-row keys, false EC-driven inferences, wrong insert
+ * **Collation gate (all shapes).** Every extracted fact is a VALUE-level claim
+ * (a pinned column has one value across rows; `col1 = col2` rows are
+ * value-equal), so a conjunct only contributes when its comparison is
+ * value-discriminating (`isValueDiscriminatingEquality`): for textual operands
+ * the effective comparison collation must be BINARY. A NOCASE/RTRIM comparison —
+ * via a `COLLATE` wrapper on either side or a non-BINARY declared column
+ * collation — passes value-DIFFERENT rows ('Bob' = 'bob' NOCASE), so its facts
+ * would over-claim (false ≤1-row keys, false EC-driven inferences, wrong insert
  * defaults — ticket `collation-blind-equality-fact-extraction`). Declared-
  * collation covered-key ≤1-row detection is NOT lost: it flows through the
  * independent (and collation-sound) `extractConstraints` path in
  * `FilterNode.computePhysical`.
+ *
+ * **Semantic-ordering gate (`col1 = col2` ONLY).** A few logical types compare
+ * by meaning rather than by stored text (`timespan`: 'PT1H' = 'PT60M'; `json`:
+ * '{"a":1}' = '{ "a" : 1 }'). For a MIXED pair — `d timespan = s text` — the
+ * mirror FDs and the equivalence class are both FALSE: two surviving rows can
+ * agree on `d` (same elapsed time) while disagreeing on `s` (distinct strings),
+ * because the two columns have no common notion of "same value". So the col=col
+ * arm additionally requires `semanticOrderingsAgree` on the two declared logical
+ * types, mirroring the two join-side extractors that mint the same kind of fact
+ * (`extractEquiPairsFromCondition` in `nodes/join-node.ts`, `extractEquiPairs`
+ * in `rules/join/equi-pair-extractor.ts`). Same-type pairs (`timespan =
+ * timespan`) stay admitted — under the type's own identity both facts hold.
+ * Invariant OPT-051; ticket `debt-filter-equality-facts-ignore-semantic-ordering`.
+ *
+ * **The constant-pin arms are deliberately NOT semantic-ordering-gated.** This is
+ * intentional, not an oversight. `where d = 'PT60M'` keeps every row whose `d` is
+ * one hour whatever text it stores, and under the engine's identity for a
+ * `timespan` column — the same identity `distinct`/`group by`/`unique` use —
+ * those rows all hold *the same value*, so `∅ → d` is true. The
+ * `ConstantBinding` claim is likewise true as defined (see its declaration in
+ * `nodes/plan-node.ts`): the column *compares equal to* the bound value under its
+ * own comparison. Gating this arm would decline EVERY constant pin on a
+ * `timespan`/`json` column (a literal never declares a semantic-ordering type),
+ * losing real optimizations to "fix" a claim that is not wrong.
  */
 export function extractEqualityFds(
 	predicate: ScalarPlanNode,
@@ -1024,6 +1048,10 @@ export function extractEqualityFds(
 		const rConst = constantValueOf(n.right);
 
 		if (lIsCol && rIsCol) {
+			// Semantic-ordering gate — cross-COLUMN facts only (see doc). A mixed
+			// pair has no shared notion of "same value", so neither the mirror FDs
+			// nor the equivalence class hold. Symmetric, so operand order is moot.
+			if (!semanticOrderingsAgree(n.left.getType().logicalType, n.right.getType().logicalType)) continue;
 			const lIdx = attrIdToIndex.get((n.left as ColumnReferenceNode).attributeId);
 			const rIdx = attrIdToIndex.get((n.right as ColumnReferenceNode).attributeId);
 			if (lIdx !== undefined && rIdx !== undefined && lIdx !== rIdx) {
@@ -1254,6 +1282,14 @@ function buildPredicateFacts(
 				if (lIdx !== undefined && rIdx !== undefined) {
 					// Both sides are bare column refs; require their contributed
 					// collations to agree so any resolution order matches the guard's.
+					// NOTE: deliberately NOT semantic-ordering-gated, unlike the
+					// cross-column arm of `extractEqualityFds` (invariant OPT-051).
+					// A `columnEqs` fact only ever discharges an `eq-column` guard
+					// clause, which is the SAME comparison re-evaluated under the same
+					// declared types at enforcement time — so filter-rows and
+					// guard-scope-rows coincide whether or not semantic ordering is in
+					// play. Adding the gate here for symmetry would be a pure
+					// completeness loss. Do not "fix".
 					if (operandCollation(n.left) === operandCollation(n.right)) {
 						addColumnEq(lIdx, rIdx);
 					}

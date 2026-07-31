@@ -289,6 +289,64 @@ select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s where mxb.s =
 drop table mxb;
 drop table mxa;
 
+-- === Filter-level cross-column equality facts ===
+--
+-- The join extractors above are gated on semantic ordering; `extractEqualityFds`
+-- (the FILTER-side extractor) was not, so `where d = s` over a single table minted
+-- mirror FDs and an equivalence class claiming the timespan column and the text
+-- column always hold the same value. They do not: 'PT1H' and 'PT60M' are one
+-- elapsed time but two distinct strings. The one rule that acts on such a class,
+-- predicate inference through equivalences, reads them off the Filter's SOURCE, and
+-- adjacent filters merge into one Filter before it runs — so no spelling below
+-- returned a wrong row even before the gate. These cases exist so the path stays
+-- closed if filter merging or CTE property propagation changes.
+-- Regression for `debt-filter-equality-facts-ignore-semantic-ordering`.
+
+create table fso (id integer primary key, d timespan, s text);
+insert into fso values (1, 'PT1H', 'PT60M'), (2, 'PT30M', 'PT45M');
+
+-- Baseline: one Filter, both conjuncts together.
+select id from fso where d = s and d = 'PT1H';
+→ [{"id":1}]
+
+-- Nested sub-select: the inner filter carries the cross-column conjunct, the outer
+-- one the constant pin, so they are two separate Filters.
+select id from (select id, d, s from fso where d = s) where d = 'PT1H';
+→ [{"id":1}]
+
+-- Same shape via a CTE.
+with paired as (select id, d, s from fso where d = s)
+select id from paired where d = 'PT1H';
+→ [{"id":1}]
+
+-- Pinning the TEXT side instead: the pin is compared as text, so only the stored
+-- spelling matches. Same intended asymmetry as the join cases above.
+select id from (select id, d, s from fso where d = s) where s = 'PT1H';
+→ []
+
+select id from (select id, d, s from fso where d = s) where s = 'PT60M';
+→ [{"id":1}]
+
+drop table fso;
+
+-- Same-type control: `timespan = timespan` keeps its mirror FDs and equivalence
+-- class (the gate must not over-decline), and the row still comes back carrying its
+-- own stored spelling — a canonicalizing "fix" would have rewritten these.
+create table fsc (id integer primary key, d timespan, e timespan);
+insert into fsc values (1, 'PT1H', 'PT60M'), (2, 'PT30M', 'PT45M');
+
+select id, d, e from fsc where d = e and d = 'PT1H';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+select id, d, e from (select id, d, e from fsc where d = e) where d = 'PT1H';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+with paired as (select id, d, e from fsc where d = e)
+select id, d, e from paired where e = 'PT60M';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+drop table fsc;
+
 -- USING over a mixed pair: `using (d)` means `l.d = r.d`, so the generic join's
 -- USING comparison routes through the same comparator the operator does.
 create table uma (id integer primary key, d timespan);

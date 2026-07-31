@@ -426,7 +426,7 @@ never remapped by projection or join shift.
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `extractEqualityFds`
 - code: `packages/quereus/src/planner/analysis/comparison-collation.ts`
 - guard: `packages/quereus/test/planner/collation-soundness.spec.ts` — `Collation soundness of plan-time equality facts`
-- doc: [Functional Dependencies § Collation gate on equality facts](optimizer-fd.md#collation-gate-on-equality-facts)
+- doc: [Functional Dependencies § Soundness gates on equality facts](optimizer-fd.md#soundness-gates-on-equality-facts)
 
 An equality-derived fact — a `∅ → col` constant pin, a `col1 = col2` mirror FD, an
 equivalence class, a constant binding, a domain constraint — is a **value** claim, and a SQL
@@ -435,6 +435,22 @@ values. `'Bob' = 'bob'` holds under NOCASE. So each conjunct is gated: extractio
 when every contributed collation on a textual operand is BINARY. Effective collation is
 resolved at plan time exactly as the runtime resolves it, through the shared helpers in
 `comparison-collation.ts`, so plan-time facts and runtime behaviour cannot drift.
+
+### OPT-051 — Cross-column equality facts require agreeing semantic ordering
+
+- code: `packages/quereus/src/planner/util/fd-utils.ts` — `extractEqualityFds`
+- code: `packages/quereus/src/planner/nodes/join-node.ts` — `extractEquiPairsFromCondition`
+- code: `packages/quereus/src/planner/rules/join/equi-pair-extractor.ts` — `extractEquiPairs`
+- guard: `packages/quereus/test/planner/collation-soundness.spec.ts` — `semantic-ordering gate`
+- doc: [Functional Dependencies § Semantic-ordering gate on cross-column facts](optimizer-fd.md#semantic-ordering-gate-on-cross-column-facts)
+
+TIMESPAN and JSON compare by meaning, not stored text (`'PT1H'` = `'PT60M'`). A `col1 = col2`
+fact — mirror FDs, an equivalence class, a join equi-pair — is false when the two sides
+disagree on semantic ordering: rows can agree on the semantic column while holding different
+strings in the plain one. Every extractor minting such a fact requires `semanticOrderingsAgree`
+on both declared logical types. The gate is on cross-**column** facts only: a constant pin
+(`d = 'PT60M'` ⇒ `∅ → d` plus a binding) stays ungated, because it claims the column *compares
+equal to* that value under its own comparison — which is true.
 
 ### OPT-052 — Provenance is informational
 

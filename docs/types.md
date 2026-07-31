@@ -344,24 +344,25 @@ column compares structurally), the
 collation lattice, the mixed-pair rule above, and NULL handling (`null = null` is
 UNKNOWN, so a NULL key never matches on either physical path).
 
-Two surfaces still do **not** follow the rule — one observable, one latent.
+One surface still does **not** follow the rule.
 
 **AS OF** match/partition columns compare by storage class + collation. Correct for the canonical AS OF column
 types (DATE/DATETIME, whose ISO text order is their semantic order), wrong for a TIMESPAN
 or JSON match column. AS OF has no residual to demote into, so the join gate does not
 apply. Tracked as `tickets/backlog/bug-asof-match-column-ignores-semantic-ordering`.
 
-**Filter-level equality facts.** `extractEqualityFds`
-(`planner/util/fd-utils.ts`) mints the same value-level claims from `where`
-equalities — mirror FDs and an EC pair from `col1 = col2`, an `∅ → col` FD plus a
-constant binding from `col = literal` — and gates on collation only. Both claims are
-false for a semantic-ordering operand: `where d = 'PT60M'` also matches rows storing
-`'PT1H'`, so `d` is not pinned to one value. No consumer turns those facts into a
-wrong answer today (probed across constant substitution, `distinct`, `group by`,
-`order by` transfer, IN/EXISTS and transitive two-conjunct pins), which is why the
-gate has not been added: declining every pin on a TIMESPAN/JSON column would cost
-real optimizations for no present correctness gain. Tracked as
-`tickets/backlog/debt-filter-equality-facts-ignore-semantic-ordering`.
+**Filter-level equality facts** follow it, with one deliberate asymmetry.
+`extractEqualityFds` (`planner/util/fd-utils.ts`) mints value-level claims from `where`
+equalities, and the **cross-column** arm carries the same `semanticOrderingsAgree` gate the
+join extractors do (invariant OPT-051): `where d = s` over a TIMESPAN `d` and a TEXT `s`
+mints no mirror FDs and no equivalence class, because two surviving rows can agree on `d`
+(same elapsed time) while disagreeing on `s` (distinct strings) — the two columns have no
+common notion of "same value". A **constant pin** (`where d = 'PT60M'` ⇒ `∅ → d` plus a
+constant binding) is deliberately *not* gated: under the engine's identity for a TIMESPAN
+column — the same identity `distinct` / `group by` / `unique` use — every surviving row
+holds the same value, so the FD is true, and a `ConstantBinding` claims only that the
+column *compares equal to* the bound value under its own comparison, not that it stores
+that spelling. A consumer needing raw-value identity must not read a binding.
 
 Hash-keyed identity (GROUP BY, window PARTITION BY, hash-join build/probe) cannot
 call `compare` pairwise, so a semantic-ordering type whose stored form is not

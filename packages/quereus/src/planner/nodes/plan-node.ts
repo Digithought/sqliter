@@ -207,6 +207,27 @@ export type ConstantValue =
  * while a `ConstantBinding` additionally records *what value* it is pinned
  * to. Downstream rules (predicate inference through ECs, ordering pruning)
  * consume bindings directly instead of re-walking predicate ASTs.
+ *
+ * **The claim is "compares equal to", not "is stored as".** Every producer mints
+ * a binding from an `=` conjunct or a declared CHECK, so what it records is:
+ * *every surviving row satisfies `col = value` under `col`'s own declared
+ * comparison*. For a column whose logical type compares by meaning rather than by
+ * stored text (`timespan`: 'PT1H' = 'PT60M'; `json`: '{"a":1}' = '{ "a" : 1 }' —
+ * see `docs/types.md` § "Semantic ordering") the rows may hold a DIFFERENT
+ * spelling than `value`. A consumer that needs raw-value identity — byte
+ * equality, a hash/serialization key, anything comparing the bound value outside
+ * the column's own comparator — must NOT read a binding.
+ *
+ * Both current consumers need only the "compares equal to" reading:
+ *  - `rules/predicate/rule-predicate-inference-equivalence.ts` re-synthesizes
+ *    `otherCol = <value>` and types the synthesized literal from the TARGET
+ *    attribute, so the comparison it emits is the target column's own. Sound
+ *    because equivalence-class transfers are semantic-ordering-gated at
+ *    extraction (invariant OPT-051), so the target shares the source's type.
+ *  - `analysis/update-lineage.ts` (`deriveFilterAttributeDefaults`) uses the
+ *    binding as the omitted-column default when inserting through a filtered
+ *    view; it needs a value that SATISFIES the view predicate, which is exactly
+ *    what the binding guarantees.
  */
 export interface ConstantBinding {
   /** Output column indices pinned to `value`. */

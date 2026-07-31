@@ -18,10 +18,12 @@ import { keysOf, isAtMostOneRow, extractEqualityFds } from '../../src/planner/ut
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { EmptyScope } from '../../src/planner/scopes/empty.js';
-import { BinaryOpNode, CollateNode, LiteralNode } from '../../src/planner/nodes/scalar.js';
-import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
-import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
+import { BinaryOpNode, CastNode, CollateNode, LiteralNode } from '../../src/planner/nodes/scalar.js';
+import { ColumnReferenceNode, ParameterReferenceNode } from '../../src/planner/nodes/reference.js';
+import { ANY_TYPE, INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
 import { JSON_TYPE } from '../../src/types/json-type.js';
+import { TIMESPAN_TYPE } from '../../src/types/temporal-types.js';
+import type { LogicalType } from '../../src/types/logical-type.js';
 import { isValueDiscriminatingAstComparison } from '../../src/planner/analysis/comparison-collation.js';
 import type * as AST from '../../src/parser/ast.js';
 
@@ -449,11 +451,15 @@ describe('Collation soundness of plan-time equality facts', () => {
 	});
 
 	describe('extractEqualityFds collation gate (unit)', () => {
-		function colRef(attrId: number, index: number, opts: { textual?: boolean; collation?: string } = {}): ColumnReferenceNode {
+		function colRef(
+			attrId: number,
+			index: number,
+			opts: { textual?: boolean; collation?: string; logicalType?: LogicalType } = {},
+		): ColumnReferenceNode {
 			const expr: AST.ColumnExpr = { type: 'column', name: `c${attrId}` } as AST.ColumnExpr;
 			const type = {
 				typeClass: 'scalar' as const,
-				logicalType: opts.textual === false ? INTEGER_TYPE : TEXT_TYPE,
+				logicalType: opts.logicalType ?? (opts.textual === false ? INTEGER_TYPE : TEXT_TYPE),
 				collationName: opts.collation,
 				nullable: false,
 				isReadOnly: false,
@@ -515,6 +521,183 @@ describe('Collation soundness of plan-time equality facts', () => {
 				eq(colRef(1, 0, { collation: 'BINARY' }), colRef(2, 1, { collation: 'BINARY' })), attrMap);
 			expect(both.fds.length).to.equal(2);
 			expect(both.equivPairs.length).to.equal(1);
+		});
+
+		/**
+		 * Ticket `debt-filter-equality-facts-ignore-semantic-ordering` / invariant
+		 * OPT-051. `timespan` and `json` compare by meaning, not by stored text
+		 * ('PT1H' = 'PT60M'), so a MIXED cross-column pair has no shared notion of
+		 * "same value" and its mirror FDs / equivalence class are false. The
+		 * constant-pin arms are deliberately NOT gated — see the arm-2 controls at
+		 * the end of this block, and `extractEqualityFds`' doc comment.
+		 */
+		describe('semantic-ordering gate', () => {
+			function param(nameOrIndex: string | number, logicalType: LogicalType): ParameterReferenceNode {
+				const expr = { type: 'parameter', name: String(nameOrIndex) } as unknown as AST.ParameterExpr;
+				return new ParameterReferenceNode(scope, expr, nameOrIndex, {
+					typeClass: 'scalar', logicalType, nullable: true, isReadOnly: true,
+				});
+			}
+
+			function cast(operand: ScalarPlanNode, targetType: string): CastNode {
+				const ast: AST.CastExpr = {
+					type: 'cast', targetType,
+					expr: (operand as unknown as { expression: AST.Expression }).expression,
+				} as AST.CastExpr;
+				return new CastNode(scope, ast, operand);
+			}
+
+			const ts = (attrId: number, index: number) =>
+				colRef(attrId, index, { collation: 'BINARY', logicalType: TIMESPAN_TYPE });
+			const json = (attrId: number, index: number) =>
+				colRef(attrId, index, { collation: 'BINARY', logicalType: JSON_TYPE });
+			const text = (attrId: number, index: number) =>
+				colRef(attrId, index, { collation: 'BINARY', logicalType: TEXT_TYPE });
+			const anyCol = (attrId: number, index: number) =>
+				colRef(attrId, index, { collation: 'BINARY', logicalType: ANY_TYPE });
+
+			const expectDeclined = (res: ReturnType<typeof extractEqualityFds>, why: string) => {
+				expect(res.fds.length, `${why}: mirror FDs`).to.equal(0);
+				expect(res.equivPairs.length, `${why}: EC pair`).to.equal(0);
+				expect(res.constantBindings.length, `${why}: bindings`).to.equal(0);
+			};
+
+			const expectMirrorPair = (res: ReturnType<typeof extractEqualityFds>, why: string) => {
+				expect(res.fds.length, `${why}: mirror FDs`).to.equal(2);
+				expect(res.equivPairs.length, `${why}: EC pair`).to.equal(1);
+			};
+
+			it('declines timespan = text in both operand orders', () => {
+				expectDeclined(extractEqualityFds(eq(ts(1, 0), text(2, 1)), attrMap), 'timespan = text');
+				expectDeclined(extractEqualityFds(eq(text(1, 0), ts(2, 1)), attrMap), 'text = timespan');
+			});
+
+			it('declines json = text in both operand orders', () => {
+				expectDeclined(extractEqualityFds(eq(json(1, 0), text(2, 1)), attrMap), 'json = text');
+				expectDeclined(extractEqualityFds(eq(text(1, 0), json(2, 1)), attrMap), 'text = json');
+			});
+
+			it('declines two DIFFERENT semantic-ordering types (timespan = json)', () => {
+				expectDeclined(extractEqualityFds(eq(ts(1, 0), json(2, 1)), attrMap), 'timespan = json');
+			});
+
+			it('still admits a same-type pair — the over-declining control', () => {
+				expectMirrorPair(extractEqualityFds(eq(ts(1, 0), ts(2, 1)), attrMap), 'timespan = timespan');
+				expectMirrorPair(extractEqualityFds(eq(json(1, 0), json(2, 1)), attrMap), 'json = json');
+			});
+
+			it('treats ANY as non-semantic: any = text admitted, any = timespan declined', () => {
+				expectMirrorPair(extractEqualityFds(eq(anyCol(1, 0), text(2, 1)), attrMap), 'any = text');
+				expectDeclined(extractEqualityFds(eq(anyCol(1, 0), ts(2, 1)), attrMap), 'any = timespan');
+			});
+
+			// --- Arm 2: constant pins stay UNGATED. -----------------------------
+			// The pin's claim is "this column compares equal to the value under its
+			// own comparison", which is true for a semantic-ordering column. Gating
+			// here would decline every pin on a timespan/json column (a literal never
+			// declares a semantic-ordering type) for no soundness gain.
+
+			it('a timespan = literal pin still extracts (arm-2 control)', () => {
+				const res = extractEqualityFds(eq(ts(1, 0), lit('PT60M')), attrMap);
+				expect(res.fds.length).to.equal(1);
+				expect(res.fds[0].determinants).to.deep.equal([]);
+				expect(res.fds[0].dependents).to.deep.equal([0]);
+				expect(res.constantBindings.length).to.equal(1);
+				expect(res.constantBindings[0].value).to.deep.equal({ kind: 'literal', value: 'PT60M' });
+			});
+
+			it('a json = literal pin still extracts (arm-2 control)', () => {
+				const res = extractEqualityFds(eq(json(1, 0), lit('{"a":1}')), attrMap);
+				expect(res.fds.length).to.equal(1);
+				expect(res.constantBindings.length).to.equal(1);
+				expect(res.constantBindings[0].value).to.deep.equal({ kind: 'literal', value: '{"a":1}' });
+			});
+
+			it('a timespan = parameter pin still extracts (arm-2 control)', () => {
+				const res = extractEqualityFds(eq(ts(1, 0), param(1, TEXT_TYPE)), attrMap);
+				expect(res.fds.length).to.equal(1);
+				expect(res.constantBindings.length).to.equal(1);
+				expect(res.constantBindings[0].value).to.deep.equal({ kind: 'parameter', paramRef: 1 });
+			});
+
+			it('a cast-wrapped literal pin is unaffected — the gate never sees that path', () => {
+				// Not a bare ColumnReferenceNode on the right, so it falls to
+				// `constantValueOf`, which peels the CastNode and reports the inner value.
+				const res = extractEqualityFds(eq(ts(1, 0), cast(lit('PT60M'), 'timespan')), attrMap);
+				expect(res.fds.length).to.equal(1);
+				expect(res.constantBindings.length).to.equal(1);
+				expect(res.constantBindings[0].value).to.deep.equal({ kind: 'literal', value: 'PT60M' });
+			});
+
+			it('a cast-wrapped COLUMN reaches neither arm (unchanged by the gate)', () => {
+				// `cast(d as text) = s`: left is a CastNode (not a column, not constant),
+				// so no fact was or is extracted.
+				expectDeclined(
+					extractEqualityFds(eq(cast(ts(1, 0), 'text'), text(2, 1)), attrMap),
+					'cast(timespan as text) = text');
+			});
+
+			it('the collation gate still rejects first for a collated same-type pair', () => {
+				// Both gates are pure predicates; adding the semantic one must not let a
+				// NOCASE-declared timespan pair through.
+				expectDeclined(
+					extractEqualityFds(
+						eq(colRef(1, 0, { collation: 'NOCASE', logicalType: TIMESPAN_TYPE }), ts(2, 1)),
+						attrMap),
+					'timespan collate nocase = timespan');
+			});
+		});
+	});
+
+	/**
+	 * Plan-level sibling of the collation guard above: the false facts really were
+	 * materialized on the Filter's physical properties before the gate landed
+	 * (`equivClasses: [[1,2]]`, `constantBindings: [{attrs:[1,2], value:'PT1H'}]`),
+	 * so this pins that they are gone — and that the same-type control keeps them.
+	 */
+	describe('semantic-ordering gate on filter equality facts (plan level)', () => {
+		interface PhysicalSnapshot {
+			equivClasses?: number[][];
+			constantBindings?: { attrs: number[] }[];
+		}
+
+		async function filterPhysical(sql: string): Promise<PhysicalSnapshot[]> {
+			const out: PhysicalSnapshot[] = [];
+			for await (const r of db.eval('select op, physical from query_plan(?)', [sql])) {
+				const row = r as unknown as { op: string; physical: string | null };
+				if (row.op !== 'FILTER' || !row.physical) continue;
+				out.push(JSON.parse(row.physical) as PhysicalSnapshot);
+			}
+			return out;
+		}
+
+		const spansBoth = (attrs: readonly number[]) => attrs.includes(1) && attrs.includes(2);
+
+		it('a mixed timespan/text filter mints no cross-column class or spanning binding', async () => {
+			await db.exec('create table tso_mixed (id integer primary key, d timespan, s text) using memory');
+			const physicals = await filterPhysical("select id from tso_mixed where d = s and d = 'PT1H'");
+			expect(physicals.length, 'no Filter in the plan').to.be.greaterThan(0);
+			for (const p of physicals) {
+				expect((p.equivClasses ?? []).some(spansBoth), 'false {d,s} equivalence class').to.equal(false);
+				expect((p.constantBindings ?? []).some(b => spansBoth(b.attrs)),
+					'binding claiming the text column holds the timespan literal').to.equal(false);
+			}
+		});
+
+		it('the same-type control keeps both facts', async () => {
+			await db.exec('create table tso_same (id integer primary key, d timespan, s timespan) using memory');
+			const physicals = await filterPhysical("select id from tso_same where d = s and d = 'PT1H'");
+			expect(physicals.some(p => (p.equivClasses ?? []).some(spansBoth)),
+				'same-type equivalence class over-declined').to.equal(true);
+			expect(physicals.some(p => (p.constantBindings ?? []).some(b => spansBoth(b.attrs))),
+				'same-type spanning binding over-declined').to.equal(true);
+		});
+
+		it('a mixed filter still returns the semantically-matching row', async () => {
+			await db.exec('create table tso_rows (id integer primary key, d timespan, s text) using memory');
+			await db.exec("insert into tso_rows values (1, 'PT1H', 'PT60M')");
+			const rows = await collect(db, "select id from tso_rows where d = s and d = 'PT1H'");
+			expect(rows.map(r => r.id)).to.deep.equal([1]);
 		});
 	});
 });
