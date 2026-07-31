@@ -1056,9 +1056,36 @@ clash could only half-apply then fail mid-migration), while `index` (SCH-001) an
 each have their own. Seed blocks are keyed by target table and guarded at declare time — the
 differ never sees them.
 
+### SCH-004 — A module never silently no-ops an `alterTable` arm
+
+- code: `packages/quereus/src/runtime/emit/alter-table.ts` — `runAlterColumn`
+- code: `packages/quereus/src/vtab/module.ts` — `alterTable`
+- guard: `packages/quereus/test/alter-table-conformance.spec.ts` — `ALTER conformance matrix — module without alterTable (sited UNSUPPORTED)`
+- doc: [Module Capability Negotiation § `alterTable` sub-arms](module-capabilities.md#altertable-sub-arms--the-fine-grained-mandate-layer)
+
+`alterTable` presence is one bit covering every `SchemaChangeInfo` arm, so per-arm support is
+negotiated behaviorally. A module handed an arm it cannot honor MUST throw
+`QuereusError(StatusCode.UNSUPPORTED)` with a sited message; it must never accept the call and
+leave the physical state unchanged. The engine relies on that throw to substitute a defined
+fallback — generic rebuild, schema-only rename, engine-side logical enforcement — or to surface
+a clean user error. A silent no-op leaves the catalog and the physical state diverged with the
+engine none the wiser, and stays invisible until a later read returns wrong rows.
+
 ## SYNC — Sync
 
-Reserved.
+### SYNC-001 — All DDL in a sync batch applies before any DML
+
+- code: `packages/quereus-sync/src/sync/change-applicator.ts` — `orderMigrationsByHLC`
+- code: `packages/quereus-sync/src/sync/store-adapter.ts` — `applyToStore`
+- guard: `packages/quereus-sync/test/sync/apply-order-independence.spec.ts` — `creates the table and lands its rows`
+- doc: [Sync: Schema Replication § DDL Application Order](sync-schema.md#ddl-application-order)
+
+Within one admission unit every schema migration is applied before any row change, so an
+INSERT / UPDATE / DELETE always lands on the schema its origin wrote it under. Arrival order
+decides nothing: migrations are flattened across changesets and replayed in HLC (causal) order,
+so a `create index` never precedes its table's `create table`. The guarantee is per batch only
+— a streamed snapshot is many batches, so its producer emits every schema-migration chunk ahead
+of all table data rather than relying on this.
 
 ## LENS — Lens
 

@@ -350,6 +350,11 @@ Internally, `rehydrateCatalog()` delegates to `loadAllDDL()` (scan the catalog s
 
 ### Catalog persistence (bundled index DDL)
 
+This section covers **table** entries. Views and materialized views are engine-level
+objects that never reach a module hook; the store persists them under reserved-prefix
+keys through a schema-change subscription — see
+[view-persistence.md](view-persistence.md).
+
 `@quereus/store` persists each table's secondary indexes **inside the same
 catalog entry as the table**, keyed `{schema}.{table}` (no per-index key
 namespace). The entry is a newline-joined bundle: the `CREATE TABLE` statement
@@ -702,7 +707,7 @@ Savepoints opened before such a statement go away with the transaction. A later 
 
 DDL that writes no rows does **not** commit: `ADD CONSTRAINT`, `RENAME COLUMN`, `SET DEFAULT`, `SET COLLATE` on a non-PK column, `SET DATA TYPE` between aliases of one logical type (`TEXT` → `VARCHAR(50)`), `DROP NOT NULL`, and `CREATE INDEX` (which builds from the buffered-plus-committed view) all stay inside the open transaction.
 
-**Declared contract: `ddlTransactionality: 'auto-commit'`.** The store module declares this tier in `getCapabilities()` (see [module-authoring.md § DDL transactionality tiers](module-authoring.md#ddl-transactionality-tiers)). The flag is a single **worst-case summary**: because the committing statements above force-commit the buffered transaction (schema change *and* every pending write), the store declares `auto-commit` even though the no-row DDL in the previous paragraph is merely `non-transactional`. A caller that wants a hard guarantee against either surprise can set `ddl_transaction_policy = 'strict'`, which refuses module-dispatching DDL inside an explicit transaction on any non-`transactional` module (the store is not `transactional`). The default `'permissive'` policy leaves the behavior above unchanged.
+**Declared contract: `ddlTransactionality: 'auto-commit'`.** The store module declares this tier in `getCapabilities()` (see [module-capabilities.md § DDL transactionality tiers](module-capabilities.md#ddl-transactionality-tiers)). The flag is a single **worst-case summary**: because the committing statements above force-commit the buffered transaction (schema change *and* every pending write), the store declares `auto-commit` even though the no-row DDL in the previous paragraph is merely `non-transactional`. A caller that wants a hard guarantee against either surprise can set `ddl_transaction_policy = 'strict'`, which refuses module-dispatching DDL inside an explicit transaction on any non-`transactional` module (the store is not `transactional`). The default `'permissive'` policy leaves the behavior above unchanged.
 
 ### Multi-Table Atomicity
 

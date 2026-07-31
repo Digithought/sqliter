@@ -3,7 +3,7 @@ files:
   - packages/quereus-store/src/common/store-module.ts:695 (the create-table schema event)
   - packages/quereus/src/schema/ddl-generator.ts (generateTableDDL vs generateMaintainedTableDDL)
   - packages/quereus-sync/src/sync/sync-manager-impl.ts (recordSchemaMigration)
-  - docs/sync.md (§ What replicates)
+  - docs/sync-schema.md (§ What replicates)
 difficulty: medium
 ----
 
@@ -54,5 +54,5 @@ ordinary but is permanently stale:
 - If maintained tables replicate: the wire text must be the maintained form, so
   the receiver reconstructs the derivation and maintains the table itself.
 - If they do not: the create event for a maintained table should not be recorded
-  as a replicable migration at all, and `docs/sync.md` § What replicates should
+  as a replicable migration at all, and `docs/sync-schema.md` § What replicates should
   say so.

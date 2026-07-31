@@ -127,10 +127,13 @@ This repository contains multiple packages:
 - **[SQL Reference](docs/sql.md)** — Comprehensive SQL dialect guide
 - **[Built-in Functions](docs/functions.md)** — Complete function reference
 - **[Virtual Tables](docs/memory-table.md)** — Virtual table system and memory tables
+- **[Module Capability Negotiation](docs/module-capabilities.md)** — Every capability surface a virtual table module can implement, and what the engine does when it doesn't
 - **[Runtime Architecture](docs/runtime.md)** — Execution engine internals
 
 ### Storage & Sync
 - **[Persistent Store](docs/store.md)** — LevelDB/IndexedDB storage architecture
+- **[View Persistence](docs/view-persistence.md)** — How the store keeps view and materialized-view definitions across reopen
+- **[Schema Replication](docs/sync-schema.md)** — Replicating the catalog between peers, and shipping an app's initial schema as a seed
 - **[Store Plugin base README](packages/quereus-store/README.md)** — Quick start and API reference
 
 ### Advanced Topics

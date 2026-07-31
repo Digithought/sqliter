@@ -318,7 +318,7 @@ that removal is not undone by `ROLLBACK` / `ROLLBACK TO SAVEPOINT` — after `ro
 the dropped index stays dropped.
 
 **Declared contract: `ddlTransactionality: 'non-transactional'`.** The memory module declares this
-tier in `getCapabilities()` (see [module-authoring.md § DDL transactionality tiers](module-authoring.md#ddl-transactionality-tiers)):
+tier in `getCapabilities()` (see [module-capabilities.md § DDL transactionality tiers](module-capabilities.md#ddl-transactionality-tiers)):
 a schema change escapes the enclosing transaction (it survives `rollback`), but buffered DML still
 rolls back normally. Callers that want a hard guarantee against this can set the
 `ddl_transaction_policy = 'strict'` pragma, which refuses module-dispatching DDL inside an explicit

@@ -703,7 +703,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * every fact of the transaction shares that base `(wallTime, counter, siteId)`
 	 * and differs only in `opSeq` (a contiguous, 0-based sub-order). DDL is recorded
 	 * before DML so migrations sort below the same transaction's data facts
-	 * (docs/sync.md § DDL Application Order). All metadata for the transaction —
+	 * (docs/sync-schema.md § DDL Application Order). All metadata for the transaction —
 	 * schema migrations, column versions, tombstones, change-log entries, and the
 	 * HLC clock state — lands in a single KV batch.
 	 */

@@ -170,7 +170,7 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 * [Stability Tiers](../../docs/stability.md) — what each tier promises, and which feature areas are Stable, Beta, Experimental, or Internal
 * [Usage Guide](../../docs/usage.md) — complete API reference (type mappings, parameter binding, logging, tracing, transactions)
 * [SQL Reference Guide](../../docs/sql.md) — SQL syntax (includes Declarative Schema)
-* [Schema Management](../../docs/schema.md) — SchemaManager API, change events, key types, DDL generation
+* [Schema Management](../../docs/schema.md) — SchemaManager API, change events, key types, DDL generation. Deep dive: [view and materialized-view persistence](../../docs/view-persistence.md)
 * [View Updateability](../../docs/view-updateability.md) — write-through for views, CTEs, and subqueries-in-FROM; per-operator semantics and override tags
 * [Materialized Views](../../docs/materialized-views.md) — keyed derived relations, DDL, query resolution, write-through, declarative-schema round-trip. Deep dives: [maintenance](../../docs/mv-maintenance.md), [derived-row constraints and covering structures](../../docs/mv-constraints.md), [external row-change ingestion](../../docs/mv-ingestion.md), [schema-change staleness](../../docs/mv-schema-change.md), [the backing-host capability](../../docs/mv-backing-host.md)
 * [Lenses and Layered Schemas](../../docs/lens.md) — logical/basis separation and bidirectional per-table lenses
@@ -178,7 +178,7 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 * [Type System](../../docs/types.md) — logical/physical types, temporal types, JSON, custom types
 * [Functions](../../docs/functions.md) — built-in scalar, aggregate, window, and JSON functions
 * [Memory Tables](../../docs/memory-table.md) — built-in MemoryTable module
-* [Module Authoring](../../docs/module-authoring.md) — virtual table module development
+* [Module Authoring](../../docs/module-authoring.md) — virtual table module development. Deep dive: [capability negotiation](../../docs/module-capabilities.md) — every negotiation surface, DDL transactionality tiers, per-arm `alterTable` mandates
 * [Database-Level Event System](../../docs/module-events.md) — data and schema change events
 * [Date/Time Handling](../../docs/datetime.md) — temporal parsing, functions, and ISO 8601 formats
 * [Runtime](../../docs/runtime.md) — instruction-based execution and opcodes
