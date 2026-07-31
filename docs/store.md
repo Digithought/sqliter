@@ -956,7 +956,7 @@ a lone surrogate in a quoted column name or a `default`/`check` string literal i
 when the table's own name is clean.
 
 For a **view or materialized view** that guard alone is not enough, because the catalog write
-is fire-and-forget (see [schema.md](schema.md) § View and materialized-view persistence): the
+is fire-and-forget (see [view-persistence.md](view-persistence.md)): the
 throw lands inside the persist queue, where it can only be logged, so the definition would
 create "successfully" and be gone after reopen. `StoreModule.assertCatalogObjectPersistable`
 closes that on the CREATE VIEW / CREATE MATERIALIZED VIEW / `ALTER … SET TAGS` paths — it runs

@@ -1076,7 +1076,7 @@ engine none the wiser, and stays invisible until a later read returns wrong rows
 ### SYNC-001 — All DDL in a sync batch applies before any DML
 
 - code: `packages/quereus-sync/src/sync/change-applicator.ts` — `orderMigrationsByHLC`
-- code: `packages/quereus-sync/src/sync/store-adapter.ts` — `applyToStore`
+- code: `packages/quereus-sync/src/sync/store-adapter.ts` — `createStoreAdapter`
 - guard: `packages/quereus-sync/test/sync/apply-order-independence.spec.ts` — `creates the table and lands its rows`
 - doc: [Sync: Schema Replication § DDL Application Order](sync-schema.md#ddl-application-order)
 

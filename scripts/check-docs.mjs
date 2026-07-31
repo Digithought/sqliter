@@ -273,10 +273,11 @@ function markdownLinks(content) {
  * A trailing prose section marker (`See docs/optimizer.md § Audit discipline`) is not an
  * anchor and is ignored — the regex simply stops at `.md`.
  *
- * NOTE: that makes a `§` marker rot silently when a doc split moves the section it names —
- * the file half still resolves, so nothing fails. Every split so far has fixed them by hand
- * (grep `§` across the package sources). If a split ever ships a stale one, validate the marker
- * against the target's heading text rather than dropping the form.
+ * That makes a `§` marker rot silently when a doc split moves the section it names — the file
+ * half still resolves, so nothing fails. Fixing them by hand has already leaked: the
+ * module-capabilities / sync-schema / view-persistence split left four stale markers, two of
+ * them repointed by that split's own edits. Closing the hole (match the marker against the
+ * target document's heading text) is `debt-check-docs-validate-section-markers`.
  */
 function bareDocRefs(content) {
 	const refs = [];

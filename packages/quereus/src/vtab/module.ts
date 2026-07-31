@@ -566,7 +566,7 @@ export interface VirtualTableModule<
 	 * module chains the actual write onto an async queue. Neither layer can surface a
 	 * failure to the statement, so an unpersistable definition would otherwise appear
 	 * to succeed and then vanish on reopen. This hook is the ONE synchronous point where
-	 * a module can refuse. See `docs/schema.md` § View and materialized-view persistence.
+	 * a module can refuse. See `docs/view-persistence.md`.
 	 *
 	 * Every registered module gets the veto, and one that would not persist `object` must
 	 * no-op: views and materialized views are not owned by any one module the way a table

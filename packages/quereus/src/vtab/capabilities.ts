@@ -25,7 +25,7 @@ import type { SqlValue, Row, CompareFn } from '../common/types.js';
  * Consumed by the `ddl_transaction_policy = 'strict'` gate, which refuses a
  * module-dispatching DDL statement inside an explicit transaction on any module
  * whose tier is not `'transactional'`. See `runtime/emit/ddl-transaction-policy.ts`
- * and docs/module-capabilities.md § "Capability negotiation surface".
+ * and docs/module-capabilities.md § "DDL transactionality tiers".
  */
 export type DdlTransactionality = 'transactional' | 'non-transactional' | 'auto-commit';
 
@@ -41,7 +41,7 @@ export interface ModuleCapabilities {
 	// `isolation` / `savepoints` for its own bookkeeping — nothing reads them as a
 	// gate. Toggling one changes no engine behavior. Only `delegatesNotNullBackfill`,
 	// `permitsGrandfatheredCheckViolators`, and `ddlTransactionality` (below) are
-	// live capability gates. See docs/module-capabilities.md § "Capability negotiation surface".
+	// live capability gates. See docs/module-capabilities.md § "Surface inventory".
 
 	/** Advisory: module provides transaction isolation (read-your-own-writes, snapshot reads). Not engine-consulted. */
 	isolation?: boolean;
