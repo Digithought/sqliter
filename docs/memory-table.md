@@ -428,7 +428,11 @@ call; see `docs/module-authoring.md`.)
 column set nor the key bytes, so it needs `adoptSchema` rather than the reshape pair — but it needs
 it just as much. `renameColumn` rebuilds every `IndexSchema` object (each carries the column's
 name), which is exactly the identity signal `adoptSchema` rebuilds a layer's `MemoryIndex` on,
-mirroring the base-side `handleColumnRename` rebuild. Skipping the adopt leaves an eager savepoint
+mirroring the base-side `handleColumnRename` rebuild. An *unnamed* UNIQUE's covering index is
+additionally re-**named**: its `_uc_<covered column names>` auto-name is derived from the live
+column names and recorded nowhere, so the entry, the `implicitCoveringStructures` key, and each
+layer's `MemoryIndex` key all move with the column (`adoptSchema`'s add-then-drop-by-name pass
+handles the layer side unchanged). Skipping the adopt leaves an eager savepoint
 snapshot on its frozen pre-rename schema, which fails the commit-time snapshot wrap's
 `readLayer.getSchema() === tableSchema` check — and the transaction's staged rows are dropped at
 `COMMIT` even without any rollback.

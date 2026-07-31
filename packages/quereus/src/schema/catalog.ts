@@ -430,6 +430,17 @@ function implicitIndexNameForColumns(constraintName: string | undefined, columnN
  *
  * `columnNames` is consulted only when `constraintName` is undefined (the
  * `_uc_<cols>` auto-name); a named constraint ignores it.
+ *
+ * NOTE: the *input* is backend-dependent even though the check itself is not. A user
+ * index is in `tableSchema.indexes` on every backend, so the collision this exists to
+ * catch is refused identically everywhere. Another constraint's backing structure is
+ * NOT — the memory module materializes one into `.indexes`, the store module does not
+ * — so a constraint whose structure is named like another's (only reachable when the
+ * user writes the engine's reserved `_uc_` prefix into a constraint name, e.g.
+ * `constraint _uc_z unique (b)` beside `unique (z)`) is refused under memory and
+ * accepted under store. If a caller ever needs the two to agree there, compare against
+ * the derived names of the table's other UNIQUE constraints as well, not just
+ * `.indexes`.
  */
 function findIndexShadowedByUniqueConstraint(
 	tableSchema: TableSchema,

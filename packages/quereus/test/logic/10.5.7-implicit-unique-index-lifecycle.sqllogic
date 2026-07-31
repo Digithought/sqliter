@@ -563,6 +563,64 @@ select count(*) as c from index_info('iul_rn') where index_name = 'rn_uq';
 insert into iul_rn values (2, 'x', 'q');
 -- error: unique
 
+-- The re-derived name is also the key DROP COLUMN tears the structure down by, so a
+-- rename followed by dropping a covered column must leave no orphan behind. Multi-column
+-- on purpose: a single-column structure collapses to zero key columns and is dropped by
+-- the shift helper regardless, so only this shape proves the key was re-derived.
+create table iul_rd (id integer primary key, rda text, rdb text, unique (rda, rdb));
+insert into iul_rd values (1, 'x', 'p');
+-- run
+
+alter table iul_rd rename column rda to rdz;
+-- run
+
+alter table iul_rd drop column rdz;
+-- run
+
+select count(*) as c from index_info('iul_rd');
+→ [{"c":0}]
+
+select count(*) as c from schema() where type = 'index' and tbl_name = 'iul_rd';
+→ [{"c":0}]
+
+-- The constraint covered the dropped column, so it went with it — the survivor is free.
+insert into iul_rd values (2, 'p');
+-- run
+
+select count(*) as c from iul_rd;
+→ [{"c":2}]
+
+-- Renaming INSIDE an open transaction that has already staged a row: the structure moves
+-- to its new name under the transaction's own layer too, so the staged row stays visible
+-- to it, enforcement never lapses, and the commit does not drop the staged write.
+create table iul_rs (id integer primary key, rsa text, unique (rsa));
+insert into iul_rs values (1, 'x');
+-- run
+
+begin;
+-- run
+insert into iul_rs values (2, 'y');
+-- run
+alter table iul_rs rename column rsa to rsz;
+-- run
+
+insert into iul_rs values (3, 'y');
+-- error: unique
+
+commit;
+-- run
+
+select id, rsz from iul_rs order by id;
+→ [{"id":1,"rsz":"x"},{"id":2,"rsz":"y"}]
+
+select count(*) as c from index_info('iul_rs');
+→ [{"c":0}]
+
+insert into iul_rs values (4, 'x');
+-- error: unique
+
+drop table iul_rs;
+drop table iul_rd;
 drop table iul_rn;
 drop table iul_rp;
 drop table iul_rf;
