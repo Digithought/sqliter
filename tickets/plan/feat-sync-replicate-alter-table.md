@@ -8,6 +8,8 @@ files:
   - packages/quereus-store/src/common/store-module.ts (the alter arms that emit the event)
   - packages/quereus-store/src/common/events.ts (StoreEventEmitter — remote-event expectations)
   - packages/quereus-sync/src/sync/store-adapter.ts (applySchemaChange)
+  - packages/quereus-sync/test/sync/_peer-harness.ts (relayAll — the two-real-peer relay used to verify the gap)
+  - packages/quereus-sync/test/sync/schema-ddl-replication.spec.ts (the create/drop/index forms that DO replicate)
   - docs/sync.md (§ Schema Synchronization)
 difficulty: hard
 ----
@@ -78,3 +80,36 @@ concurrently in incompatible ways. Creates already have no automatic convergence
 path for a divergent same-name definition — that batch errors and retries until
 an operator intervenes. Alterations should decide whether they inherit that
 behavior or need something better.
+
+## Verified state of the gap (2026-07-31)
+
+A separate bug report (`bug-sync-schema-migrations-replicate-empty-ddl`, now
+folded into this ticket) claimed that dropping a table and creating or dropping
+an index also fail to replicate. That is no longer true — `sync-replicate-drop-and-index-ddl`
+closed those, and `packages/quereus-sync/test/sync/schema-ddl-replication.spec.ts`
+covers them end to end. **Alterations and renames are the only remaining hole**,
+exactly as this ticket describes.
+
+Re-confirmed by running two real store-backed peers through `relayAll`
+(`packages/quereus-sync/test/sync/_peer-harness.ts`) at HEAD:
+
+| Statement on peer A | Peer B afterwards |
+| --- | --- |
+| `drop table orders` | table gone — replicates |
+| `alter table orders add column sku text` | still `[id, note]` — diverged |
+| `alter table orders drop column note` | still `[id, note]` — diverged |
+| `alter table orders rename to orders2` | still has `orders`, no `orders2` |
+
+**A rename is the worst of the four, because it also silently stops the data
+from replicating.** Once A's table is `orders2` and B's is still `orders`, every
+subsequent row change A makes is recorded against a table name B has never heard
+of. Measured on the relay above: inserting one row into `orders2` after the
+rename produced an `ApplyResult` of `{ applied: 1, skipped: 1, conflicts: 2,
+unknownTable: 2 }` on B, and B's `orders` kept only its pre-rename row. So the
+divergence is not merely cosmetic drift in table shape — it is a permanent,
+unannounced halt of row replication for that table. Whatever design lands here
+should treat rename as the priority case, and the acceptance test should assert
+that *data* keeps flowing across a rename, not only that the name changed.
+
+Nothing else needs re-verifying: `docs/sync.md` § "What replicates" already
+describes the current state accurately.

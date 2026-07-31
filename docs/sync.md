@@ -1329,44 +1329,43 @@ machinery.
 
 ### What replicates
 
-Four object-lifecycle migrations reach a peer with a real DDL string and are
-re-executed there: `create_table`, `drop_table`, `add_index` and `drop_index`.
-The store module attaches the canonical text at each emit site — `create table`
-and `create index` via `generateTableDDL` / `generateIndexDDL`, the two drops via
-`generateDropTableDDL` / `generateDropIndexDDL` (all in
-`packages/quereus/src/schema/ddl-generator.ts`). The memory virtual-table module
-attaches the same four, so a host that wires it an event emitter sees the same
-DDL; there is no end-to-end sync path for memory-backed tables today.
+Four object-lifecycle migrations reach a peer with a real DDL string and are re-executed
+there: `create_table`, `drop_table`, `add_index` and `drop_index`. The store module
+attaches the canonical text at each emit site — the two creates via `generateTableDDL` /
+`generateIndexDDL`, the two drops via `generateDropTableDDL` / `generateDropIndexDDL` (all
+in `packages/quereus/src/schema/ddl-generator.ts`). The memory virtual-table module
+attaches the same four, though there is no end-to-end sync path for memory-backed tables
+today.
 
 ALTER TABLE does **not** replicate. A column add / drop / alter records an
-`alter_column` migration whose DDL is blank, so it crosses the wire as an empty
-statement and changes nothing on the receiver — a peer that alters a table stays
-silently diverged in shape. This is a known gap, not a bug to work around: a table
-alteration's event (`alter` / `table` plus the table name) does not describe *what* was
-altered, a rename reports only the new name, and a declarative `apply schema` applies its
-diff as several separate alterations in one transaction, each its own event — so
-attaching the originating DDL to the event is real design work, tracked in
-`feat-sync-replicate-alter-table`.
+`alter_column` migration whose DDL is blank, so it crosses the wire as an empty statement
+and changes nothing on the receiver — a peer that alters a table stays silently diverged
+in shape. A known gap, not a bug to work around: the event (`alter` / `table` plus the
+table name) does not describe *what* was altered, a rename reports only the new name, and
+a declarative `apply schema` emits one event per alteration in its diff — so attaching the
+originating DDL is real design work, tracked in `feat-sync-replicate-alter-table`.
 
-Both ends log the gap. The origin warns in `recordSchemaMigration` when it records a
-DDL-less `alter_column` migration, naming the schema and table and stating that the
-alteration will not reach other devices — one warning per altering event, so a
-multi-alteration `apply schema` names each one. The receiver warns in
-`applySchemaChange`, in the blank-DDL early return, naming the migration type, schema
-and table; that one is deliberately **not** scoped to `alter_column`, so a blank
-drop/index migration from a peer on an older build is reported too. Neither warning
-changes behavior: the migration is still recorded (and still advances the table's schema
-version, which the destructiveness comparison depends on) and still skipped.
+`RENAME TO` is the sharpest form: it also stops the table's **data** from replicating. The
+origin writes under the new name while the peer still holds the old, so every later row
+change names a table the peer lacks and takes the unknown-table disposition.
+
+Both ends log the gap. The origin warns in `recordSchemaMigration` on a DDL-less
+`alter_column` migration, naming the schema and table and stating the alteration will not
+reach other devices — one warning per altering event, so a multi-alteration `apply schema`
+names each one. The receiver warns in `applySchemaChange`'s blank-DDL early return, naming
+migration type, schema and table; that one is deliberately **not** scoped to
+`alter_column`, so a blank drop/index migration from an older-build peer is reported too.
+Neither changes behavior: the migration is still recorded (still advancing the table's
+schema version, which the destructiveness comparison depends on) and still skipped.
 
 A blank-DDL migration is skipped outright — counted applied, but neither executed nor
 given a pending remote-event expectation. That last part matters: expectations are
 refcounted and never expire, so one registered for a statement that emits no event would
-linger and consume the next genuine *local* DDL of the same signature, marking it remote
-— and remote events are filtered out of local-fact capture, so that local change would
-never replicate. The same one-expectation-per-migration accounting is why each executed
-form must emit exactly one module event: `drop table` over an indexed table emits one
-`drop`/`table` event and no per-index drop, so its single expectation is matched exactly
-once.
+linger and consume the next genuine *local* DDL of the same signature, marking it remote —
+and remote events are filtered out of local-fact capture, so that local change would never
+replicate. The same accounting is why each executed form must emit exactly one module
+event: `drop table` over an indexed table emits one `drop`/`table` event and no per-index
+drop, so its single expectation matches exactly once.
 
 ## Configuration
 
