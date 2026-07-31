@@ -273,6 +273,11 @@ export function keyOrderMatchesCollation(
  * else BINARY (see `indexColumnCollations`). The same resolution the planner used when it
  * decided the residual Filter could be dropped, so it is the order/equality a byte window
  * over that position has to reproduce.
+ *
+ * NOTE: this duplicates {@link resolveIndexKeyCollations}' textual branch — same three-step
+ * fallback, same BINARY default — which is why both gates below admit every `text` column.
+ * Change either fallback without the other and the gates start declining (or, worse,
+ * admitting) shapes nobody intended; keep the two in step.
  */
 function indexResidualCollation(
 	columns: ReadonlyArray<ColumnSchema>,

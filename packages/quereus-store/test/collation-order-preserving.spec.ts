@@ -357,7 +357,7 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			// answer before the index exists: creating an index must not change a query's
 			// result. (The memory backend is NOT the oracle for this shape — it answers
 			// `v = 'BOB'` as `[1]` unindexed and `[]` indexed, i.e. its own index seek
-			// changes the answer. Tracked as backlog/bug-memory-any-collate-index-under-fetch.)
+			// changes the answer. Tracked as fix/any-collate-index-changes-query-answer.)
 			const eq = `select id from t where v = 'BOB' order by id`;
 			const gt = `select id from t where v > 'a' order by id`;
 			await db.exec(`create table t (id integer primary key, v any collate nocase) using store`);

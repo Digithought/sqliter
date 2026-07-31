@@ -38,7 +38,7 @@ import {
 import {
 	deserializeRow,
 } from './serialization.js';
-import { indexLeadingRangeIsOrderSafe, indexPrefixSeekIsCollationExact, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, storeSemanticKeyTransform } from './pk-key-resolution.js';
+import { indexLeadingRangeIsOrderSafe, indexPrefixSeekIsCollationExact, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, storeSemanticKeyTransform } from './pk-key-resolution.js';
 
 import { StoreTableBase } from './store-table-base.js';
 
@@ -706,11 +706,21 @@ export abstract class StoreTableScan extends StoreTableBase {
 		if (seekCols.some(colIdx => hasSemanticOrdering(this.tableSchema!.columns[colIdx]?.logicalType))) {
 			this.multiSeekMalformed(filterInfo, 'semantic-ordering seek column');
 		}
+		// Same rationale for the collation gate: the merged windows drop any tuple the
+		// bytes exclude, so a prefix whose key collation differs from the one the residual
+		// re-compares under would under-fetch with nothing left to repair it.
+		// `tryIndexAccessPlan` declines such plans through this same predicate; one
+		// arriving anyway is malformed. {@link analyzeIndexAccess} makes the point-window
+		// twin of this check.
+		const indexKeyCollations = this.indexKeyCollations(index);
+		if (!indexPrefixSeekIsCollationExact(this.tableSchema!.columns, index, indexKeyCollations, seekWidth)) {
+			this.multiSeekMalformed(filterInfo, 'index key collation differs from the comparison collation');
+		}
 
 		// One window per distinct encoded tuple prefix (each column under its own key
 		// collation C — see indexKeyCollations); C-equal tuples merge into one window,
 		// each kept as a residual alternative.
-		const seekCollations = this.indexKeyCollations(index).slice(0, seekWidth);
+		const seekCollations = indexKeyCollations.slice(0, seekWidth);
 		const windows = new Map<string, MultiSeekWindow>();
 		for (const tuple of tuples) {
 			const ordered = this.orderTupleValues(tuple, seekCols, filterInfo);

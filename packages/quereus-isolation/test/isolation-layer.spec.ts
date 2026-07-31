@@ -6110,6 +6110,24 @@ describe('IsolationModule — two-phase merged UNIQUE check (index seek)', () =>
 		await db.exec('rollback');
 	});
 
+	it('an index INHERITING the column collation seeks under it, and still catches the collision', async () => {
+		// The gate reads the ENFORCEMENT collation, which for an index with no explicit
+		// COLLATE is the table column's declared one — so it admits the seek here exactly
+		// as it does for `ux(email collate nocase)` above. That is only sound if the
+		// backing index is really keyed NOCASE. It is, by construction and not by luck:
+		// `buildIndexSchema` / `importIndex` resolve every IndexColumnSchema.collation to
+		// the effective value at create time (explicit COLLATE → column collation →
+		// BINARY), so `MemoryIndex`'s `specCol.collation ? resolver(…) : undefined`
+		// never sees the unset case for a real index. Pin it: a BINARY-keyed `ux` would
+		// miss the committed 'b@x' and admit the duplicate.
+		await db.exec(`create table t (id integer primary key, email text collate nocase) using isolated`);
+		await db.exec(`create unique index ux on t(email)`);
+		await db.exec(`insert into t values (1, 'b@x')`);   // committed
+		await db.exec('begin');
+		await expectConstraint(`insert into t values (2, 'B@X')`);
+		await db.exec('rollback');
+	});
+
 	it('an `any` column with a declared COLLATE still declines the seek, and still catches the collision', async () => {
 		// The shape the widened gate must keep out: `any` keys hard-BINARY (the collation
 		// `ANY_TYPE.compare` uses) while the merged check enforces under the declared

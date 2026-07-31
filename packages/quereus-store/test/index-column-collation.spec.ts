@@ -288,8 +288,9 @@ describe('secondary-index key bytes encode under the index column collation, not
 			await db.exec(`insert into t values ('Ann', 1)`);
 
 			await db.exec(`alter table t alter column name set collate binary`);
-			// C = BINARY under K = NOCASE: the planner still seeks (K coarser), the window
-			// is BINARY-exact — a stale NOCASE-keyed entry ('ann') would miss it.
+			// The column is now BINARY, so the index bytes and the scan residual both use
+			// BINARY and the planner seeks a BINARY-exact window (the table key collation K
+			// is not consulted) — a stale NOCASE-keyed entry ('ann') would miss it.
 			expect(await column(db, `select v from t where name = 'Ann'`, 'v')).to.deep.equal([1]);
 			expect(await column(db, `select v from t where name = 'ANN'`, 'v')).to.deep.equal([]);
 		});

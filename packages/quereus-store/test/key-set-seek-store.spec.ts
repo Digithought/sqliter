@@ -464,12 +464,13 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				expect(mod.seen('cnk')[0], 'served as a multi-seek').to.match(/plan=5/);
 			});
 
-			it('the default table key collation COARSER than the column still seeks; the probe trims the over-fetch', async () => {
-				// The store's default K is NOCASE, so a plain BINARY text column keys
-				// case-insensitively: 'a' and 'A' share ONE window. That over-fetches
-				// relative to the BINARY join comparison, and the semi join's probe — which
-				// runs on every emitted row — drops the extra. Over-fetching is always safe;
-				// only under-fetching is not.
+			it('a plain BINARY column of a NOCASE-keyed store seeks and returns only the BINARY match', async () => {
+				// The store's default K is NOCASE, but an undecorated `text` column keys
+				// BINARY — K is not part of the index seek decision. So 'alpha' and 'ALPHA'
+				// occupy DISTINCT windows and the seek for 'alpha' never fetches row 2 in the
+				// first place. (It used to share one K-encoded window and rely on the semi
+				// join's probe to trim the over-fetch; the probe still runs, it just has
+				// nothing to trim here.)
 				await db.exec(`create table cb (pk integer primary key, s text) using store`);
 				await db.exec(`create index ix_cb on cb (s)`);
 				await db.exec(`create table cbsrc (id integer primary key, s text) using store`);
@@ -477,7 +478,7 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				await db.exec(`insert into cbsrc values (1, 'alpha')`);
 				mod.reset();
 				expect(await pks(`select pk from cb where s in (select s from cbsrc)`),
-					'the case variant the K-window over-fetched is trimmed').to.deep.equal([1]);
+					'the BINARY-distinct case variant is not a match').to.deep.equal([1]);
 				expect(mod.seen('cb')[0], 'the seek did happen').to.match(multiSeekRe('ix_cb'));
 			});
 		});

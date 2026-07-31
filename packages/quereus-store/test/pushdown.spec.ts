@@ -977,11 +977,14 @@ describe('StoreModule predicate pushdown', () => {
 				expect((await asyncIterableToArray(db.eval(q))).map(r => r.id)).to.deep.equal([1, 2, 3]);
 			});
 
-			it('BINARY column under the NOCASE key collation: case-variant values each find their row', async () => {
-				// K = NOCASE (store default) is strictly coarser than the column's BINARY
-				// comparison collation, so 'a' and 'A' share ONE K-encoded window; the scan
-				// must apply BOTH tuples' residuals to that window — a single tuple's
-				// residual would silently drop the other value's row.
+			it('BINARY column of a NOCASE-keyed table: case-variant IN values each find their row', async () => {
+				// An undecorated `text` column keys BINARY whatever the table key collation is
+				// (store-index-key-column-collation), so 'a' and 'A' get two DISTINCT windows
+				// and the multi-seek must visit both. Note this no longer exercises the
+				// merged-window case it was written for: with key collation and residual
+				// collation always equal for a text column, two IN values can only share a
+				// window when they are also residual-equal, so a per-tuple residual can no
+				// longer drop a row.
 				await db.exec(`create table b (id integer primary key, v text) using store`);
 				await db.exec(`create index ix_v on b (v)`);
 				await db.exec(`insert into b values (1, 'a'), (2, 'A'), (3, 'b')`);

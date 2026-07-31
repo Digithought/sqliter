@@ -801,24 +801,32 @@ describe('StoreTable UNIQUE constraints', () => {
 			expect(await collect(db, `SELECT count(*) AS n FROM ixq`)).to.deep.equal([{ n: 1 }]);
 		});
 
-		// Collation guard: index-column bytes are encoded under the TABLE KEY collation K,
-		// not the constraint's enforcement collation C. A seek is a sound superset only
-		// when K is coarser-or-equal to C. With K = BINARY and C = NOCASE it UNDER-fetches,
-		// so the constraint must fall back to the full scan or a real duplicate is admitted.
+		// Collation guard: index-column bytes are encoded under the index column's OWN key
+		// collation and the constraint re-validates under its enforcement collation C. The
+		// guard admits the seek only when the two agree; where they cannot (an `any` / `json`
+		// column keys hard-BINARY while C is its declared COLLATE) a seek would UNDER-fetch,
+		// so the constraint falls back to the full scan or a real duplicate is admitted.
+		// The table key collation K is not part of this decision — the `collation = 'BINARY'`
+		// module option below is now incidental to each case, kept so the shapes still differ.
+		//
+		// Every case asserts the OUTCOME (the dup is rejected, the non-dup admitted), which
+		// is what must hold on either arm; the titles name the arm now taken.
 		describe('collation guard', () => {
-			it('K = BINARY over C = NOCASE falls back to the full scan (still rejects the dup)', async () => {
+			it('C = NOCASE seeks the index (key bytes are NOCASE too) and rejects the dup', async () => {
 				await db.exec(`CREATE TABLE gb (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX gb_b ON gb (b)`);
 				await db.exec(`INSERT INTO gb VALUES (1, 'Bob')`);
-				// 'BOB' is NOCASE-equal to 'Bob' but BINARY-distinct: its index bytes land in
-				// a DIFFERENT seek window, so an unguarded seek would find nothing.
+				// 'BOB' is NOCASE-equal to 'Bob'. Both key under the column's NOCASE, so the
+				// seek window for 'BOB' holds 'Bob''s entry and the check finds it. Keying
+				// under the table's BINARY instead (the pre-store-index-key-column-collation
+				// behaviour) would land them in different windows and find nothing.
 				await rejects(`INSERT INTO gb VALUES (2, 'BOB')`);
 				expect(await collect(db, `SELECT count(*) AS n FROM gb`)).to.deep.equal([{ n: 1 }]);
 				await db.exec(`INSERT INTO gb VALUES (3, 'Carol')`);
 				expect(await collect(db, `SELECT count(*) AS n FROM gb`)).to.deep.equal([{ n: 2 }]);
 			});
 
-			it('K = BINARY over C = RTRIM falls back to the full scan', async () => {
+			it('C = RTRIM seeks the index (key bytes are RTRIM too) and rejects the dup', async () => {
 				await db.exec(`CREATE TABLE gr (id INTEGER PRIMARY KEY, b TEXT COLLATE RTRIM) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX gr_b ON gr (b)`);
 				await db.exec(`INSERT INTO gr VALUES (1, 'abc')`);
@@ -826,9 +834,10 @@ describe('StoreTable UNIQUE constraints', () => {
 				expect(await collect(db, `SELECT count(*) AS n FROM gr`)).to.deep.equal([{ n: 1 }]);
 			});
 
-			it('K = NOCASE over C = RTRIM falls back to the full scan', async () => {
-				// NOCASE is not coarser than RTRIM: 'abc' and 'abc   ' are RTRIM-equal but
-				// encode to different NOCASE bytes.
+			it('C = RTRIM under a NOCASE-keyed table still seeks (K is not consulted)', async () => {
+				// 'abc' and 'abc   ' are RTRIM-equal and both key under the column's RTRIM,
+				// so they share one window. Keying under the table's NOCASE instead would
+				// give them different bytes and lose the conflict.
 				await db.exec(`CREATE TABLE gn (id INTEGER PRIMARY KEY, b TEXT COLLATE RTRIM) USING store`);
 				await db.exec(`CREATE UNIQUE INDEX gn_b ON gn (b)`);
 				await db.exec(`INSERT INTO gn VALUES (1, 'abc')`);
@@ -836,10 +845,12 @@ describe('StoreTable UNIQUE constraints', () => {
 				expect(await collect(db, `SELECT count(*) AS n FROM gn`)).to.deep.equal([{ n: 1 }]);
 			});
 
-			it('an ANY column is treated as potentially textual (K = BINARY over C = NOCASE)', async () => {
+			it('an ANY column with a declared COLLATE falls back to the full scan', async () => {
 				// ANY carries no `isTextual` marker and a NULL physicalType, but its `parse`
-				// is the identity — it stores text as text and keys it through the collation
-				// encoder. Exempting it as "non-text" would skip the guard and admit the dup.
+				// is the identity — it stores text as text. Exempting it as "non-text" would
+				// skip the guard and admit the dup. Its key bytes are hard-BINARY (what
+				// `ANY_TYPE.compare` uses) while C is the declared NOCASE, so the two cannot
+				// agree and this is the shape that still declines.
 				await db.exec(`CREATE TABLE ga (id INTEGER PRIMARY KEY, x ANY COLLATE NOCASE) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX ga_x ON ga (x)`);
 				await db.exec(`INSERT INTO ga VALUES (1, 'Bob')`);
@@ -847,10 +858,11 @@ describe('StoreTable UNIQUE constraints', () => {
 				expect(await collect(db, `SELECT count(*) AS n FROM ga`)).to.deep.equal([{ n: 1 }]);
 			});
 
-			it('a JSON column is treated as potentially textual (K = BINARY over C = NOCASE)', async () => {
+			it('a JSON column with an index COLLATE falls back to the full scan', async () => {
 				// JSON's physicalType is OBJECT, but its `parse` passes a JSON scalar string
-				// straight through, so the column holds text and keys it through the
-				// collation encoder — exactly like ANY. `'"Bob"'` stores the string `Bob`.
+				// straight through, so the column holds text — exactly like ANY, and it keys
+				// hard-BINARY for the same reason while C is the index's NOCASE.
+				// `'"Bob"'` stores the string `Bob`.
 				await db.exec(`CREATE TABLE gj (id INTEGER PRIMARY KEY, j JSON) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX gj_j ON gj (j COLLATE NOCASE)`);
 				await db.exec(`INSERT INTO gj VALUES (1, '"Bob"')`);
@@ -858,7 +870,7 @@ describe('StoreTable UNIQUE constraints', () => {
 				expect(await collect(db, `SELECT count(*) AS n FROM gj`)).to.deep.equal([{ n: 1 }]);
 			});
 
-			it('K = BINARY over C = BINARY seeks the index (equal collations)', async () => {
+			it('C = BINARY seeks the index (equal collations)', async () => {
 				await db.exec(`CREATE TABLE gq (id INTEGER PRIMARY KEY, b TEXT) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX gq_b ON gq (b)`);
 				await db.exec(`INSERT INTO gq VALUES (1, 'Bob')`);
@@ -867,9 +879,10 @@ describe('StoreTable UNIQUE constraints', () => {
 				expect(await collect(db, `SELECT count(*) AS n FROM gq`)).to.deep.equal([{ n: 2 }]);
 			});
 
-			it('K = NOCASE over C = BINARY seeks the index and re-validates under BINARY', async () => {
-				// K strictly coarser: the seek for 'bob' also returns 'Bob''s entry, which
-				// the BINARY re-validation discards.
+			it('an index COLLATE BINARY over a NOCASE column seeks and enforces BINARY', async () => {
+				// The index's own COLLATE wins on both sides — key bytes AND enforcement are
+				// BINARY — so 'Bob' and 'bob' are distinct rows and only the exact repeat of
+				// 'bob' conflicts. The column's declared NOCASE never enters the seek.
 				await db.exec(`CREATE TABLE gc (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store`);
 				await db.exec(`CREATE UNIQUE INDEX gc_b ON gc (b COLLATE BINARY)`);
 				await db.exec(`INSERT INTO gc VALUES (1, 'Bob')`);
