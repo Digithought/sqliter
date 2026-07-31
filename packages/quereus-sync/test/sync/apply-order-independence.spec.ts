@@ -18,7 +18,7 @@
  */
 
 import { expect } from 'chai';
-import { type ChangeSet, type SyncConfig } from '../../src/sync/protocol.js';
+import { type Change, type ChangeSet, type SyncConfig } from '../../src/sync/protocol.js';
 import { compareHLC } from '../../src/clock/hlc.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import {
@@ -201,6 +201,74 @@ describe('applyChanges order independence', () => {
 			} finally {
 				await closePeer(origin);
 				await closePeer(inOrder);
+				await closePeer(reordered);
+			}
+		});
+	});
+
+	// A batch that carries a table's create_table AND its rows: the DDL sort and the
+	// data sort have to land in the right relation to each other, not just each on its
+	// own — the rows resolve as a `freshLocalTable` (no local schema until the DDL runs)
+	// whichever end of the array they arrive at.
+	//
+	// A PIN, not a repro: it passes with either sort removed. One sender's change log
+	// keeps at most one entry per (pk, column), so reversing its changesets cannot
+	// invert two writes to one cell, and one create_table has nothing to be ordered
+	// against. It fixes the DDL-before-DML relation across a reordered array.
+	describe('reversed batch carrying DDL and data for one table', () => {
+		it('creates the table and lands its rows', async () => {
+			const origin = await makePeer('origin');
+			const inOrder = await makePeer('in-order');
+			const reordered = await makePeer('reordered');
+			try {
+				await localWrite(origin, 'create table widgets (id integer primary key, w text) using store');
+				await localWrite(origin, "insert into widgets (id, w) values (1, 'p')");
+				await localWrite(origin, "update widgets set w = 'q' where id = 1");
+
+				await inOrder.manager.applyChanges(
+					await origin.manager.getChangesSince(inOrder.manager.getSiteId()),
+				);
+				const reversed = [...(await origin.manager.getChangesSince(reordered.manager.getSiteId()))].reverse();
+				expectNotHLCOrdered(reversed);
+				await reordered.manager.applyChanges(reversed);
+
+				expect(await collect(reordered.db, 'select id, w from widgets'))
+					.to.deep.equal([{ id: 1, w: 'q' }]);
+				expect(await collect(reordered.db, 'select id, w from widgets'))
+					.to.deep.equal(await collect(inOrder.db, 'select id, w from widgets'));
+			} finally {
+				await closePeer(origin);
+				await closePeer(inOrder);
+				await closePeer(reordered);
+			}
+		});
+	});
+
+	// `emitRemoteChanges` sorts its payload too: it is built from the same reconciled
+	// list as the store ops, so an unordered payload would hand a listener the batch's
+	// facts in an order contradicting the state just committed.
+	describe('onRemoteChange payload', () => {
+		it('is HLC-ordered even when the batch was not', async () => {
+			const origin = await makeOriginWithRecreatedRow();
+			const reordered = await makePeer('reordered', { createOrders: true, config: RESURRECT });
+			try {
+				const payloads: Change[][] = [];
+				reordered.manager.syncEvents.onRemoteChange(event => payloads.push([...event.changes]));
+
+				const reversed = [...(await pull(origin, reordered))].reverse();
+				expectNotHLCOrdered(reversed);
+				await reordered.manager.applyChanges(reversed);
+
+				// One relaying site ⇒ one event carrying every applied change: the delete
+				// first, then the re-creation's columns — the reverse of arrival order.
+				expect(payloads).to.have.lengthOf(1);
+				const emitted = payloads[0];
+				expect(emitted.length).to.be.greaterThan(1);
+				expect(emitted[0].type).to.equal('delete');
+				expect(emitted.every((change, i) => i === 0 || compareHLC(emitted[i - 1].hlc, change.hlc) <= 0))
+					.to.equal(true);
+			} finally {
+				await closePeer(origin);
 				await closePeer(reordered);
 			}
 		});

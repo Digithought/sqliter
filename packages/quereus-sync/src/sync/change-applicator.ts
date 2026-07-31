@@ -118,7 +118,11 @@ function computeBatchTableDelta(changes: ChangeSet[]): { created: Set<string>; d
  * {@link reconcileInBatchDeletes} already compare HLCs, the store apply list is sorted
  * by {@link orderDataChangesByHLC}, the DDL list by {@link orderMigrationsByHLC}, and
  * the emitted payload by {@link emitRemoteChanges}. Everything else (the counters, the
- * quarantine holds, the watermark max) is order-insensitive by construction.
+ * quarantine holds, the watermark max) is order-insensitive by construction. The
+ * guarantee covers committed STATE, not the event stream: `onConflictResolved` fires
+ * from the resolve loop in arrival order, and an `onUnknownTable` event reports the
+ * FIRST changeset that referenced the table as the straggler origin, so a reordered
+ * batch can name a different relayer — telemetry only, never a stored fact.
  *
  * Unknown-table disposition: a change referencing a table outside the local basis
  * (a retired-table straggler delta — see `docs/migration.md` § 4 Contract) is
