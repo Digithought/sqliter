@@ -8,6 +8,7 @@ import { StatusCode } from '../../common/types.js';
 import type { LimitCapable } from '../framework/characteristics.js';
 import { CastNode, CollateNode, LiteralNode } from './scalar.js';
 import { addSingletonFd } from '../util/fd-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Represents a LIMIT/OFFSET operation.
@@ -87,7 +88,15 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 	}
 
 	get estimatedRows(): number | undefined {
-		const sourceRows = this.source.estimatedRows;
+		return this.rowsFrom(this.source.estimatedRows);
+	}
+
+	/**
+	 * The LIMIT/OFFSET row estimate as a pure function of the source cardinality,
+	 * shared by the logical getter and `computePhysical` (which feeds it the
+	 * PHYSICAL source count) so the two cannot drift apart.
+	 */
+	private rowsFrom(sourceRows: number | undefined): number | undefined {
 		if (sourceRows === undefined) return undefined;
 
 		const limit = this.constantLimit();
@@ -118,7 +127,7 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 		}
 
 		return {
-			estimatedRows: this.estimatedRows,
+			estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
 			ordering: sourcePhysical?.ordering,
 			// LIMIT/OFFSET preserves FDs/ECs/bindings — slicing rows doesn't break
 			// per-row determinations.

@@ -11,6 +11,7 @@ import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
 import { aggregateCost } from '../cost/index.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 export interface AggregateExpression {
   expression: ScalarPlanNode;
@@ -267,7 +268,15 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
   }
 
   get estimatedRows(): number | undefined {
-    const sourceRows = this.source.estimatedRows;
+    return this.rowsFrom(this.source.estimatedRows);
+  }
+
+  /**
+   * The aggregate's row estimate as a pure function of the source cardinality,
+   * shared by the logical getter and `computePhysical` (which feeds it the
+   * PHYSICAL source count) so the two cannot drift apart.
+   */
+  private rowsFrom(sourceRows: number | undefined): number | undefined {
     if (sourceRows === undefined) return undefined;
 
     // If we have GROUP BY, the output rows depend on the number of distinct groups
@@ -291,7 +300,7 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
     );
 
     return {
-      estimatedRows: this.estimatedRows,
+      estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
       ordering: sourcePhysical?.ordering,
       fds,
       equivClasses,

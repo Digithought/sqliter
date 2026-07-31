@@ -9,6 +9,7 @@ import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
 import { COST_CONSTANTS } from '../cost/index.js';
 import { propagateAggregateFds } from './aggregate-node.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
 
 /**
@@ -156,7 +157,15 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode, 
 	}
 
 	get estimatedRows(): number | undefined {
-		const sourceRows = this.source.estimatedRows;
+		return this.rowsFrom(this.source.estimatedRows);
+	}
+
+	/**
+	 * The aggregate's row estimate as a pure function of the source cardinality —
+	 * `computePhysical` feeds it the PHYSICAL source count, this getter the logical
+	 * one, and neither can drift from the other.
+	 */
+	private rowsFrom(sourceRows: number | undefined): number | undefined {
 		if (sourceRows === undefined) return undefined;
 
 		if (this.groupBy.length > 0) {
@@ -176,7 +185,7 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode, 
 		);
 
 		return {
-			estimatedRows: this.estimatedRows,
+			estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
 			// Hash aggregate does NOT preserve input ordering
 			ordering: undefined,
 			// Aggregation boundary: drop monotonicOn (the grouped relation is a set).

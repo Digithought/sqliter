@@ -108,11 +108,15 @@ function stripNodeIds(detail: string): string {
 
 /**
  * Build the plain-object snapshot for a single node. Deliberately captures only
- * shape + logical + physical — never `estimatedCost` / `getTotalCost()` /
- * `estimatedRows` / the node `id`, all of which churn on unrelated optimizer or
- * statistics changes. This mirrors the EXPLAIN / `query_plan()` surface
- * (node_type / op / detail / properties / physical) rather than the cost-laden
- * `serializePlanTree` debug view.
+ * shape + logical + physical — never `estimatedCost` / `getTotalCost()` / the
+ * node's logical `estimatedRows` getter / the node `id`, all of which churn on
+ * unrelated optimizer or statistics changes. This mirrors the EXPLAIN /
+ * `query_plan()` surface (node_type / op / detail / properties / physical) rather
+ * than the cost-laden `serializePlanTree` debug view.
+ *
+ * `physical.estimatedRows` IS captured — it is part of the physical-properties
+ * surface EXPLAIN exposes, so a change in cardinality propagation shows up here.
+ * The golden corpus never runs `ANALYZE`, so those numbers stay stable.
  */
 function buildSerializedNode(node: PlanNode): SerializedPlanNode {
 	return {

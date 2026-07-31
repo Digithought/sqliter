@@ -372,6 +372,10 @@ Per conjunct:
 
 **Statistics gate (multi-relation path only).** `context.stats.selectivity` always returns a number for a stats-less table, because `CatalogStatsProvider` falls through to `NaiveStatsProvider`. Stamping that would replace 0.5 with 0.1 on essentially every filter-over-join, including in the many tests that never run `ANALYZE`, churning plan shapes with no information behind the change. So the multi-relation path counts a conjunct as known only when real statistics answer it: a single-relation conjunct goes through `statsOnlySelectivity`, and a cross-relation conjunct requires `columnStats` for *both* compared columns before `joinSelectivity` is consulted (table-level `statistics` alone is not enough — `joinSelectivity` has its own naive fallback for a missing distinct count). The one deliberate exception is a cross-relation `!=` / `<>`: the catalog models only `=`, so the complement rides on the naive join estimate, which is capped at 0.5 — bounding the result to `[0.5, 1]`, where it can only relax the estimate, never claim an unsupported reduction. The single-table path is deliberately *not* gated — it keeps its existing behaviour of stamping a naive number when that is all there is.
 
+**The number the selectivity multiplies.** A selectivity is only useful if the cardinality underneath it is a real number. Every relational node carries two row counts — the **logical** `estimatedRows` getter (available before optimization, derived from the *logical* children) and the **physical** `physical.estimatedRows` (folded bottom-up during the Physical pass). They diverge the moment a `Retrieve` subtree becomes a physical access node: `SeqScanNode` / `IndexScanNode` / `IndexSeekNode` declare no `estimatedRows` getter, so any logical read through one yields `undefined` while its physical property holds the catalog-derived count. A `computePhysical` that estimates from `this.source.estimatedRows` therefore drops the count for the whole plan above it. `physicalSourceRows` (`planner/util/row-estimates.ts`) is the one-line reader every `computePhysical` uses instead: physical count first, logical getter as fallback. Nodes whose estimate is a *formula* over the source count (aggregate, distinct, limit, ordinal slice) keep that formula in a single private `rowsFrom(sourceRows)` shared by the getter and `computePhysical`, so the logical and physical readings cannot drift apart.
+
+For a join the same rule applies to both sides, and there is a second gap to fill: `analyzeJoinKeyCoverage` only returns a number when it can *prove* a cap (an equi-predicate covering a unique key bounds the output at the other side's row count). Everywhere else — no key coverage, full outer, semi/anti — `joinPhysicalRows` (`planner/nodes/join-utils.ts`) falls back to the `estimateJoinRows` heuristic over the same physical inputs, floored to whole rows. A proven cap of `0` is kept as an answer, not treated as unknown. All three join shapes (the logical `JoinNode` that also serves as the nested-loop physical join, `BloomJoinNode` = hash join, `MergeJoinNode`) go through it.
+
 **Simplifications.** Join type is ignored: a `left`/`right`/`full` join emits NULL-extended rows, which makes a predicate on the non-preserved side more selective than the base-table fraction suggests and one on the preserved side less so, but the base fraction is applied either way. An `aggregate` between the Filter and the join forwards group-key attribute ids unchanged, so a predicate on a group key is attributed to its base table and its base-table fraction is applied to post-aggregate cardinality — imprecise, not unsound. Multi-column correlation within one table remains out of scope (backlog `feat-multi-column-correlation-stats`).
 
 ### Physical Properties System
@@ -423,10 +427,12 @@ get physical(): PhysicalProperties {
 **Property Computation Example**
 ```typescript
 // SortNode only overrides specific properties
-computePhysical(): Partial<PhysicalProperties> {
+computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
   return {
     ordering: extractOrderingFromSortKeys(this.sortKeys),
-    estimatedRows: this.source.physical.estimatedRows,
+    // Read the CHILD's already-computed physical properties, never `.physical`
+    // on the child node itself — the bottom-up walk hands them in.
+    estimatedRows: physicalSourceRows(childrenPhysical[0], this.source),
     // deterministic and readonly are inherited from source
   };
 }
@@ -820,9 +826,11 @@ above the `Retrieve` boundary. See
 
 ### Property Propagation
 ```typescript
-computePhysical(_children: PhysicalProperties[]): Partial<PhysicalProperties> {
+computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
   return {
-    estimatedRows: this.source.estimatedRows,
+    // Physical count first, logical getter only as fallback — see
+    // "The number the selectivity multiplies" above.
+    estimatedRows: physicalSourceRows(childrenPhysical[0], this.source),
     // Keys propagate as FDs in `fds`. TableReferenceNode emits `{pk} → other-cols`
     // FDs; physical access nodes pass them through unchanged.
     fds: childrenPhysical[0]?.fds,

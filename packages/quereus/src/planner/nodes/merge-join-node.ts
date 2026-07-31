@@ -8,7 +8,8 @@ import { quereusError } from '../../common/errors.js';
 import type { JoinCapable, PredicateSourceCapable } from '../framework/characteristics.js';
 import { mergeJoinCost } from '../cost/index.js';
 import type { JoinType } from './join-node.js';
-import { buildJoinAttributes, buildJoinRelationType, describeEquiPairs, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds, valueFactPairs, type EquiJoinPair } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, describeEquiPairs, estimateJoinRows, joinPhysicalRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds, valueFactPairs, type EquiJoinPair } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
 
 /**
@@ -97,10 +98,15 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 			right: rightIndex.get(p.rightAttrId) ?? -1,
 		}));
 
+		// PHYSICAL child cardinalities — the logical getters read `undefined`
+		// through a physical access node (see `physicalSourceRows`).
+		const leftRows = physicalSourceRows(leftPhys, this.left);
+		const rightRows = physicalSourceRows(rightPhys, this.right);
+
 		const result = analyzeJoinKeyCoverage(
 			this.joinType, leftPhys, rightPhys,
 			this.left.getType(), this.right.getType(),
-			indexPairs, this.left.estimatedRows, this.right.estimatedRows,
+			indexPairs, leftRows, rightRows,
 			leftAttrs.length,
 		);
 
@@ -117,7 +123,7 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 
 		return {
 			ordering,
-			estimatedRows: result.estimatedRows,
+			estimatedRows: joinPhysicalRows(this.joinType, result.estimatedRows, leftRows, rightRows),
 			// MergeJoin physically guarantees monotonicOn on equi-pair attrIds when both
 			// inputs were monotonic on their respective X (the merge join's whole point).
 			// Value-discriminating pairs only: a NOCASE run collapses value-distinct

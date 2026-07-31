@@ -356,8 +356,12 @@ export interface JoinKeyCoverageResult {
  * @param leftType       Logical type of the left child (for logical keys + colCount)
  * @param rightType      Logical type of the right child (for logical keys + colCount)
  * @param equiPairs      Equi-join column index pairs (left index, right index)
- * @param leftRows       Estimated rows from left child
- * @param rightRows      Estimated rows from right child
+ * @param leftRows       Estimated rows from the left child — pass the PHYSICAL
+ *                       count (`physicalSourceRows`), not the logical getter: a
+ *                       physical access node declares no `estimatedRows` getter,
+ *                       so the logical read is `undefined` by the time a join's
+ *                       `computePhysical` runs.
+ * @param rightRows      Estimated rows from the right child (same rule)
  * @param leftColumnCount Number of columns on the left side (for shifting right key indices)
  */
 export function analyzeJoinKeyCoverage(

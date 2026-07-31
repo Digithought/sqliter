@@ -475,6 +475,37 @@ export function propagateJoinInds(
 }
 
 /**
+ * The physical row count a join node should stamp in `computePhysical`.
+ *
+ * `analyzeJoinKeyCoverage` only produces a number in the cases where it can
+ * *prove* a cap — an equi-predicate covering a unique key on one side bounds the
+ * output at the other side's row count. Everywhere else (no key coverage, full
+ * outer, semi/anti) it returns `undefined`, which used to leave the join — and
+ * therefore every node above it — with no cardinality at all. Fall back to the
+ * same heuristic the logical `estimatedRows` getter uses, applied to the
+ * cardinalities actually arriving at this node.
+ *
+ * `leftRows` / `rightRows` must be the PHYSICAL child counts (see
+ * `physicalSourceRows`): after the Retrieve→access-node conversion the logical
+ * getters read `undefined` through a `SeqScan` / `IndexScan`.
+ *
+ * The result is floored so EXPLAIN reports whole rows — the inner-join heuristic
+ * multiplies by 0.1 and would otherwise print values like `12.100000000000001`.
+ * `estimateJoinRows` itself is left unrounded: it also backs the logical getters,
+ * which feed cost comparisons this change has no business perturbing.
+ */
+export function joinPhysicalRows(
+	joinType: JoinType,
+	coverageRows: number | undefined,
+	leftRows: number | undefined,
+	rightRows: number | undefined,
+): number | undefined {
+	if (coverageRows !== undefined) return coverageRows;
+	const estimate = estimateJoinRows(leftRows, rightRows, joinType);
+	return estimate === undefined ? undefined : Math.floor(estimate);
+}
+
+/**
  * Estimate the number of output rows for a join given the input cardinalities.
  */
 export function estimateJoinRows(

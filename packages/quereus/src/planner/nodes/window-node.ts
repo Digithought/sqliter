@@ -9,6 +9,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { ColumnReferenceNode } from './reference.js';
 import { isUniqueDeterminant } from '../util/fd-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 export interface WindowSpec {
 	partitionBy: AST.Expression[];
@@ -270,7 +271,8 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 		}
 
 		return {
-			estimatedRows: this.estimatedRows,
+			// Window functions don't change the row count — relay the PHYSICAL one.
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering: sourcePhysical?.ordering,
 			monotonicOn,
 			// Window functions append columns but don't change the source row stream;

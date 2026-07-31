@@ -12,7 +12,8 @@ import { normalizePredicate } from '../analysis/predicate-normalizer.js';
 import { combineJoinKeys, analyzeJoinKeyCoverage } from '../util/key-utils.js';
 import { BinaryOpNode } from './scalar.js';
 import { ColumnReferenceNode } from './reference.js';
-import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, joinPhysicalRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import { isValueDiscriminatingEquality } from '../analysis/comparison-collation.js';
 import { deriveJoinUpdateLineage, type JoinExistenceSite } from '../analysis/update-lineage.js';
 import { semanticOrderingsAgree } from '../../util/comparison.js';
@@ -156,9 +157,15 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			this.condition, leftAttrs, rightAttrs
 		);
 
+		// PHYSICAL child cardinalities, not the logical getters: by the time this
+		// runs both sides are usually physical access nodes (or wrappers over them),
+		// which declare no `estimatedRows` getter — see `physicalSourceRows`.
+		const leftRows = physicalSourceRows(leftPhys, this.left);
+		const rightRows = physicalSourceRows(rightPhys, this.right);
+
 		const result = analyzeJoinKeyCoverage(
 			this.joinType, leftPhys, rightPhys, leftType, rightType,
-			pairs, this.left.estimatedRows, this.right.estimatedRows,
+			pairs, leftRows, rightRows,
 			leftType.columns.length,
 		);
 
@@ -190,7 +197,7 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 		);
 
 		return {
-			estimatedRows: result.estimatedRows,
+			estimatedRows: joinPhysicalRows(this.joinType, result.estimatedRows, leftRows, rightRows),
 			monotonicOn: propagateJoinMonotonicOn(this.joinType, leftPhys, rightPhys, attrIdPairs),
 			// `fdResult.fds` already covers `key → flag` for each preserved key: the
 			// forward walk's `withKeyFds` builds `key → all_other_cols` over the FULL

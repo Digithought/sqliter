@@ -14,6 +14,7 @@ import type { ProjectionCapable } from '../framework/characteristics.js';
 import type { PhysicalProperties, FunctionalDependency, AuthoredInverseMeta } from './plan-node.js';
 import { projectMonotonicOnByAttrId, projectOrdering } from '../framework/physical-utils.js';
 import { deriveProjectUpdateLineage } from '../analysis/update-lineage.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 export interface Projection {
 	node: ScalarPlanNode;
@@ -342,7 +343,7 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 		);
 
 		return {
-			estimatedRows: this.source.estimatedRows,
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering: projectOrdering(sourcePhysical?.ordering, map),
 			monotonicOn: projectMonotonicOnByAttrId(sourcePhysical?.monotonicOn, preservedAttrIds),
 			fds: fds.length > 0 ? fds : undefined,

@@ -10,6 +10,7 @@ import type { SortCapable } from '../framework/characteristics.js';
 import { ColumnReferenceNode } from './reference.js';
 import { isUniqueDeterminant } from '../util/fd-utils.js';
 import { sortCost } from '../cost/index.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Represents a sort key for ordering results
@@ -102,7 +103,8 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		}
 
 		return {
-			estimatedRows: this.estimatedRows,
+			// Sort doesn't change the row count — relay the source's PHYSICAL count.
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering,
 			// Sort doesn't change which rows are in the relation — FDs/ECs/bindings/
 			// INDs propagate unchanged.

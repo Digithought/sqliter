@@ -4,6 +4,7 @@ import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Represents a DISTINCT operation that eliminates duplicate rows.
@@ -47,9 +48,17 @@ export class DistinctNode extends PlanNode implements UnaryRelationalNode {
   }
 
   get estimatedRows(): number | undefined {
+    return this.rowsFrom(this.source.estimatedRows);
+  }
+
+  /**
+   * DISTINCT's row estimate as a pure function of the source cardinality, so the
+   * logical getter and `computePhysical` (which feeds it the PHYSICAL source
+   * count) cannot drift apart.
+   */
+  private rowsFrom(sourceRows: number | undefined): number | undefined {
     // DISTINCT reduces the number of rows by eliminating duplicates
     // This is a rough estimate - in reality it depends on data distribution
-    const sourceRows = this.source.estimatedRows;
     if (sourceRows === undefined) return undefined;
     if (sourceRows <= 1) return sourceRows;
 
@@ -84,7 +93,7 @@ export class DistinctNode extends PlanNode implements UnaryRelationalNode {
     // `RelationType.isSet` (set in getType()). FDs that the source proved on
     // proper subsets of the output (e.g., a PK FD) carry through unchanged.
     return {
-      estimatedRows: this.estimatedRows,
+      estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
       ordering: sourcePhysical?.ordering,
       monotonicOn,
       fds: sourcePhysical?.fds,

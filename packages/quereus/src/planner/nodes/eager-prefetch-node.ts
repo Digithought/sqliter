@@ -4,6 +4,7 @@ import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Physical pass-through that forks the runtime context and pumps its child
@@ -89,7 +90,7 @@ export class EagerPrefetchNode extends PlanNode implements UnaryRelationalNode {
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const sourcePhysical = childrenPhysical[0];
 		return {
-			estimatedRows: this.estimatedRows,
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			// FIFO ring buffer: rows, order, and attribute IDs are identical at
 			// runtime, so every relational claim passes through verbatim.
 			ordering: sourcePhysical?.ordering,

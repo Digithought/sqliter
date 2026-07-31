@@ -3,6 +3,7 @@ import type { RelationType } from '../../common/datatype.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Plan node that wraps a relational node and updates the relationName on its attributes.
@@ -65,7 +66,7 @@ export class AliasNode extends PlanNode implements UnaryRelationalNode {
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const sourcePhysical = childrenPhysical[0];
 		return {
-			estimatedRows: this.source.estimatedRows,
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering: sourcePhysical?.ordering,
 			// Alias preserves attribute IDs unchanged — pass monotonicOn through.
 			monotonicOn: sourcePhysical?.monotonicOn,

@@ -193,6 +193,7 @@
                   "physical": {
                     "concurrencySafe": true,
                     "deterministic": true,
+                    "estimatedRows": 0,
                     "expectedLatencyMs": 0,
                     "fds": [
                       {
@@ -429,6 +430,7 @@
                   "physical": {
                     "concurrencySafe": true,
                     "deterministic": true,
+                    "estimatedRows": 0,
                     "expectedLatencyMs": 0,
                     "fds": [
                       {
@@ -512,6 +514,7 @@
                     4
                   ]
                 ],
+                "estimatedRows": 0,
                 "expectedLatencyMs": 0,
                 "fds": [
                   {
@@ -630,6 +633,7 @@
                 4
               ]
             ],
+            "estimatedRows": 0,
             "expectedLatencyMs": 0,
             "fds": [
               {
@@ -733,6 +737,7 @@
       "physical": {
         "concurrencySafe": true,
         "deterministic": true,
+        "estimatedRows": 0,
         "expectedLatencyMs": 0,
         "idempotent": true,
         "readonly": true,

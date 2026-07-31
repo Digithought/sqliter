@@ -33,9 +33,12 @@ cost-laden `serializePlanTree` debug view:
   the bounded `{ $map: [[k, v], …], size }` summary (capped at
   `MAP_SUMMARY_ENTRY_CAP`), so the golden corpus tracks the real
   physical-properties surface instead of `[COMPLEX_OBJECT]`.
-- Cost / `estimatedRows` / node `id` are intentionally **omitted** — they churn on
-  unrelated optimizer or statistics changes. Object keys are sorted and any
-  residual `id`/`timestamp` keys stripped for deterministic diffs.
+- Cost, the node's logical `estimatedRows` getter, and the node `id` are
+  intentionally **omitted** — they churn on unrelated optimizer or statistics
+  changes. `physical.estimatedRows` is part of the `physical` blob and therefore
+  *is* captured; the corpus never runs `ANALYZE`, so it stays stable. Object keys
+  are sorted and any residual `id`/`timestamp` keys stripped for deterministic
+  diffs.
 
 The serializer lives in `_helpers.ts` (`serializePlanForGolden`) so plan-shape
 specs can share it.

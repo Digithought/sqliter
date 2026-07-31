@@ -5,6 +5,7 @@ import type { Scope } from '../scopes/scope.js';
 import type { TableReferenceNode } from './reference.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { Cached } from '../../util/cached.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * RetrieveNode represents the boundary between virtual table module execution and Quereus execution.
@@ -70,7 +71,7 @@ export class RetrieveNode extends PlanNode implements UnaryRelationalNode {
 		const src = childrenPhysical[0];
 		if (!src) return {};
 		return {
-			estimatedRows: this.source.estimatedRows,
+			estimatedRows: physicalSourceRows(src, this.source),
 			ordering: src.ordering,
 			monotonicOn: src.monotonicOn,
 			fds: src.fds,

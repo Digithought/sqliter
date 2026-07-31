@@ -368,6 +368,7 @@
       "physical": {
         "concurrencySafe": true,
         "deterministic": true,
+        "estimatedRows": 0,
         "expectedLatencyMs": 0,
         "fds": [
           {

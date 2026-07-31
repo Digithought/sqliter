@@ -6,6 +6,7 @@ import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import { hashJoinCost } from '../cost/index.js';
 import { estimateJoinRows } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import { SeqScanNode, IndexScanNode } from './table-access-nodes.js';
 import type { AccessPath } from '../../vtab/index-descriptor.js';
 
@@ -110,6 +111,15 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		return estimateJoinRows(this.left.estimatedRows, this.keySource.estimatedRows, 'semi');
 	}
 
+	/**
+	 * `estimatedRows` over explicitly-supplied cardinalities, so `computePhysical`
+	 * can feed it the PHYSICAL child counts (the logical getters read `undefined`
+	 * through the physical access node this semi-join targets).
+	 */
+	private rowsFrom(targetRows: number | undefined, keyRows: number | undefined): number | undefined {
+		return estimateJoinRows(targetRows, keyRows, 'semi');
+	}
+
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const targetPhysical = childrenPhysical[0];
 		// The output is a row-subset of the target with identical attributes, so
@@ -127,7 +137,10 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		// join this node replaces could have been built on the leaf's order —
 		// losing those properties is the status quo, not a regression.
 		return {
-			estimatedRows: this.estimatedRows,
+			estimatedRows: this.rowsFrom(
+				physicalSourceRows(targetPhysical, this.left),
+				physicalSourceRows(childrenPhysical[1], this.keySource),
+			),
 			fds: targetPhysical?.fds,
 			equivClasses: targetPhysical?.equivClasses,
 			constantBindings: targetPhysical?.constantBindings,

@@ -9,7 +9,8 @@ import type { JoinCapable, PredicateSourceCapable } from '../framework/character
 import { hashJoinCost } from '../cost/index.js';
 import type { JoinType } from './join-node.js';
 import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
-import { buildJoinAttributes, buildJoinRelationType, describeEquiPairs, estimateJoinRows, propagateJoinFds, propagateJoinInds, valueFactPairs, type EquiJoinPair } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, describeEquiPairs, estimateJoinRows, joinPhysicalRows, propagateJoinFds, propagateJoinInds, valueFactPairs, type EquiJoinPair } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 export type { EquiJoinPair } from './join-utils.js';
 
@@ -95,10 +96,15 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 			right: rightIndex.get(p.rightAttrId) ?? -1,
 		}));
 
+		// PHYSICAL child cardinalities — the logical getters read `undefined`
+		// through a physical access node (see `physicalSourceRows`).
+		const leftRows = physicalSourceRows(leftPhys, this.left);
+		const rightRows = physicalSourceRows(rightPhys, this.right);
+
 		const result = analyzeJoinKeyCoverage(
 			this.joinType, leftPhys, rightPhys,
 			this.left.getType(), this.right.getType(),
-			indexPairs, this.left.estimatedRows, this.right.estimatedRows,
+			indexPairs, leftRows, rightRows,
 			leftAttrs.length,
 		);
 
@@ -109,7 +115,7 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		);
 
 		return {
-			estimatedRows: result.estimatedRows,
+			estimatedRows: joinPhysicalRows(this.joinType, result.estimatedRows, leftRows, rightRows),
 			fds: fdResult.fds,
 			equivClasses: fdResult.equivClasses,
 			constantBindings: fdResult.constantBindings,

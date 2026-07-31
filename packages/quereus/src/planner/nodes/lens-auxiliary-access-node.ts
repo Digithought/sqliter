@@ -3,6 +3,7 @@ import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import type { AccessForm, MappingAdvertisement } from '../../vtab/mapping-advertisement.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * One side of the logical-PK join-back (D4): the marker source's output
@@ -114,7 +115,7 @@ export class LensAuxiliaryAccessNode extends PlanNode implements UnaryRelational
 		// Pure pass-through of every physical property (attribute IDs preserved),
 		// exactly like AssertedKeysNode / AliasNode — the marker carries no rows.
 		return {
-			estimatedRows: this.source.estimatedRows,
+			estimatedRows: physicalSourceRows(src, this.source),
 			ordering: src.ordering,
 			monotonicOn: src.monotonicOn,
 			fds: src.fds,

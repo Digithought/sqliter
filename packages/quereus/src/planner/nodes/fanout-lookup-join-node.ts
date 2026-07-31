@@ -16,6 +16,7 @@ import { Cached } from '../../util/cached.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import { propagateJoinFds, propagateJoinInds } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * The mode a FanOutLookupJoin branch contributes for one outer row:
@@ -316,7 +317,7 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 			constantBindings: bindings.length > 0 ? bindings : undefined,
 			domainConstraints: domains.length > 0 ? domains : undefined,
 			inds: inds.length > 0 ? inds : undefined,
-			estimatedRows: this.computeEstimatedRows(),
+			estimatedRows: this.computeEstimatedRows(childrenPhysical),
 		};
 	}
 
@@ -328,17 +329,25 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 	 * branch preserves the outer row when empty, so its true factor is at least 1;
 	 * the child-estimate product is an upper-leaning approximation either way.)
 	 * Returns `undefined` only when the outer side itself has no estimate.
+	 *
+	 * `childrenPhysical` is supplied by `computePhysical` so the fan-out reads each
+	 * child's PHYSICAL cardinality (`getChildren()` order: outer, then one entry per
+	 * branch); the logical getter reads `undefined` through a physical access node.
+	 * Omitted by the `estimatedRows` getter, which is the pre-optimization view.
 	 */
-	private computeEstimatedRows(): number | undefined {
-		const outerEst = this.outer.estimatedRows;
+	private computeEstimatedRows(childrenPhysical?: readonly PhysicalProperties[]): number | undefined {
+		const rowsOf = (node: RelationalPlanNode, childIndex: number): number | undefined =>
+			childrenPhysical ? physicalSourceRows(childrenPhysical[childIndex], node) : node.estimatedRows;
+
+		const outerEst = rowsOf(this.outer, 0);
 		if (outerEst === undefined) return undefined;
 		let est = outerEst;
-		for (const b of this.branches) {
+		this.branches.forEach((b, i) => {
 			if (isCrossBranchMode(b.mode)) {
-				const childEst = b.child.estimatedRows;
+				const childEst = rowsOf(b.child, i + 1);
 				if (childEst !== undefined) est *= childEst;
 			}
-		}
+		});
 		return est;
 	}
 

@@ -469,6 +469,7 @@
           }
         ],
         "deterministic": true,
+        "estimatedRows": 1,
         "expectedLatencyMs": 0,
         "fds": [
           {

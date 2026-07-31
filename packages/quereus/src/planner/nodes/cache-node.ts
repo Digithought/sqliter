@@ -5,6 +5,7 @@ import type { Scope } from '../scopes/scope.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import type { CacheCapable } from '../framework/characteristics.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 export type CacheStrategy = 'memory' | 'spill'; // Future: spill-to-disk
 
@@ -76,7 +77,7 @@ export class CacheNode extends PlanNode implements UnaryRelationalNode, CacheCap
 		// the cache's replay iterator is not that leaf — matching the pass-through
 		// contract documented on those fields.
 		return {
-			estimatedRows: this.source.estimatedRows,
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering: sourcePhysical?.ordering,
 			monotonicOn: sourcePhysical?.monotonicOn,
 			fds: sourcePhysical?.fds,

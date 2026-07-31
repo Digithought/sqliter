@@ -3,6 +3,7 @@ import type { RelationType } from '../../common/datatype.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import { addFd } from '../util/fd-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * A unary pass-through that contributes a set of **asserted** functional
@@ -74,7 +75,7 @@ export class AssertedKeysNode extends PlanNode implements UnaryRelationalNode {
 		}
 
 		return {
-			estimatedRows: this.source.estimatedRows,
+			estimatedRows: physicalSourceRows(src, this.source),
 			ordering: src.ordering,
 			monotonicOn: src.monotonicOn,
 			fds,

@@ -5,6 +5,7 @@ import type { Scope } from '../scopes/scope.js';
 import { formatExpression } from '../../util/plan-formatter.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Physical node representing a monotonic LIMIT/OFFSET pushdown over an
@@ -62,7 +63,14 @@ export class OrdinalSliceNode extends PlanNode implements UnaryRelationalNode {
 	}
 
 	get estimatedRows(): number | undefined {
-		const sourceRows = this.source.estimatedRows;
+		return this.rowsFrom(this.source.estimatedRows);
+	}
+
+	/**
+	 * The slice's row estimate as a pure function of the source cardinality —
+	 * shared with `computePhysical`, which feeds it the PHYSICAL source count.
+	 */
+	private rowsFrom(sourceRows: number | undefined): number | undefined {
 		if (sourceRows === undefined) return undefined;
 		// We don't know the literal value of limitExpr here; use a conservative cap.
 		return this.limitExpr ? Math.min(sourceRows, 100) : sourceRows;
@@ -74,7 +82,7 @@ export class OrdinalSliceNode extends PlanNode implements UnaryRelationalNode {
 		// accessCapabilities are NOT propagated past the slice — the slice consumed
 		// the ordinal-seek capability.
 		return {
-			estimatedRows: this.estimatedRows,
+			estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
 			ordering: sourcePhysical?.ordering,
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
