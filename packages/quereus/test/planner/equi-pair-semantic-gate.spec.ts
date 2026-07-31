@@ -18,6 +18,7 @@ import { DATE_TYPE, DATETIME_TYPE, TIMESPAN_TYPE } from '../../src/types/tempora
 import { JSON_TYPE } from '../../src/types/json-type.js';
 import type { LogicalType } from '../../src/types/logical-type.js';
 import { EmptyScope } from '../../src/planner/scopes/empty.js';
+import type { Scope } from '../../src/planner/scopes/scope.js';
 import { BinaryOpNode } from '../../src/planner/nodes/scalar.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
 import type { Attribute, ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
@@ -76,8 +77,7 @@ describe('semantic-ordering gate on equi-join keys', () => {
 	// that desugar, so USING and ON cannot drift apart again (ticket
 	// `bug-using-join-skips-cross-type-coercion`).
 	describe('USING, desugared to an ON condition', () => {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const scope = EmptyScope.instance as unknown as any;
+		const scope: Scope = EmptyScope.instance;
 
 		const attr = (id: number, name: string, logicalType: LogicalType, collationName = 'BINARY',
 			collationSource?: CollationSource): Attribute =>
@@ -194,11 +194,29 @@ describe('semantic-ordering gate on equi-join keys', () => {
 				[attr(1, 'k', JSON_TYPE)],
 				[attr(2, 'k', TEXT_TYPE)])).to.equal(null);
 		});
+
+		it('rejects an empty column list', () => {
+			// The parser cannot produce `using ()`, so this is a guard on the exported
+			// entry point rather than a reachable SQL path — an empty conjunct list would
+			// otherwise reduce to `undefined` and silently turn the join into a cross join.
+			expect(() => buildUsingCondition(
+				[], [attr(1, 'k', TEXT_TYPE)], [attr(2, 'k', TEXT_TYPE)], scope))
+				.to.throw(/USING clause requires at least one column/);
+		});
+
+		it('AND-combines multi-column USING into both pairs', () => {
+			expect(extractUsing(
+				['a', 'b'],
+				[attr(1, 'a', TEXT_TYPE), attr(3, 'b', INTEGER_TYPE)],
+				[attr(2, 'a', TEXT_TYPE), attr(4, 'b', INTEGER_TYPE)])?.equiPairs).to.have.deep.members([
+				{ leftAttrId: 1, rightAttrId: 2, collationsMatch: true, valueDiscriminating: true },
+				{ leftAttrId: 3, rightAttrId: 4, collationsMatch: true, valueDiscriminating: true },
+			]);
+		});
 	});
 
 	describe('extractEquiPairs (ON condition)', () => {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const scope = EmptyScope.instance as unknown as any;
+		const scope: Scope = EmptyScope.instance;
 
 		function colRef(
 			attrId: number, index: number,

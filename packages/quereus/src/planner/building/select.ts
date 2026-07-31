@@ -13,7 +13,7 @@ import { MultiScope } from '../scopes/multi.js';
 import { ShadowScope } from '../scopes/shadow.js';
 import { EmptyScope } from '../scopes/empty.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
-import { buildExpression } from './expression.js';
+import { buildComparison, buildExpression } from './expression.js';
 import { FilterNode } from '../nodes/filter.js';
 import { buildTableFunctionCall } from './table-function.js';
 import { CTEReferenceNode } from '../nodes/cte-reference-node.js';
@@ -23,7 +23,6 @@ import { JoinNode, type ExistenceColumnSpec } from '../nodes/join-node.js';
 import { EXISTENCE_FLAG_TYPE } from '../nodes/join-utils.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
-import { insertCrossTypeCoercion } from './coercion.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
 import { ValuesNode } from '../nodes/values-node.js';
 import { createLogger } from '../../common/logger.js';
@@ -697,13 +696,11 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 	let condition: ScalarPlanNode | undefined;
 	let usingColumns: string[] | undefined;
 
-	// Handle ON condition
+	// ON and USING are mutually exclusive spellings of the same predicate (the parser
+	// accepts one or the other), and USING desugars into the ON condition it means.
 	if (joinClause.condition) {
 		condition = buildExpression(joinContext, joinClause.condition);
-	}
-
-	// Handle USING columns — desugared to the equivalent ON condition
-	if (joinClause.columns) {
+	} else if (joinClause.columns) {
 		usingColumns = joinClause.columns;
 		condition = buildUsingCondition(
 			usingColumns, leftNode.getAttributes(), rightNode.getAttributes(), joinContext.scope);
@@ -750,19 +747,19 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 /**
  * Desugar `using (c1, c2, …)` into the `on l.c1 = r.c1 and l.c2 = r.c2 …` condition
  * it is defined to mean, so a USING join is *the same plan* an equivalent ON join
- * builds. Everything that hangs off building a real `=` node then applies to USING
- * for free and cannot drift from the ON spelling:
+ * builds. Each pair goes through `buildComparison` — the same helper `buildExpression`
+ * uses for a spelled-out `=` — so everything hanging off a real comparison node
+ * applies to USING for free and cannot drift from the ON spelling:
  *
- * - `insertCrossTypeCoercion` — a JSON column paired with a TEXT one compares
- *   structurally, an INTEGER paired with a TEXT one numerically (ticket
+ * - cross-type coercion — a JSON column paired with a TEXT one compares structurally,
+ *   an INTEGER paired with a TEXT one numerically (ticket
  *   `bug-using-join-skips-cross-type-coercion`; before the desugar USING compared
  *   raw storage classes and matched nothing).
  * - `BinaryOpNode.generateType`'s collation-lattice validation — a `using (c)` over
  *   columns with conflicting explicit/declared collations raises the identical
- *   ambiguous-collation error as `l.c = r.c`. Both spellings resolve each pair
- *   through the SAME symmetric provenance lattice; forcing `getType()` here (the
- *   type is lazily cached) surfaces the conflict at plan time rather than only as
- *   the emitter's backstop.
+ *   ambiguous-collation error as `l.c = r.c`, at plan time rather than only as the
+ *   emitter's backstop. Both spellings resolve each pair through the SAME symmetric
+ *   provenance lattice.
  * - `extractEquiPairs` — hash/merge key selection, collation tagging and the
  *   semantic-ordering gate, all off the one extractor.
  *
@@ -791,32 +788,8 @@ export function buildUsingCondition(
 		throw new QuereusError('USING clause requires at least one column', StatusCode.ERROR);
 	}
 
-	const conjuncts = usingColumns.map(colName => {
-		const lower = colName.toLowerCase();
-		const leftIndex = leftAttrs.findIndex(a => a.name.toLowerCase() === lower);
-		const rightIndex = rightAttrs.findIndex(a => a.name.toLowerCase() === lower);
-		if (leftIndex === -1 || rightIndex === -1) {
-			const missing = leftIndex === -1 ? 'left' : 'right';
-			throw new QuereusError(
-				`USING column not found on ${missing} side of join: ${colName}`,
-				StatusCode.ERROR);
-		}
-		const expr: AST.ColumnExpr = { type: 'column', name: colName };
-		const [left, right] = insertCrossTypeCoercion(
-			scope,
-			new ColumnReferenceNode(scope, expr, leftAttrs[leftIndex].type, leftAttrs[leftIndex].id, leftIndex),
-			new ColumnReferenceNode(scope, expr, rightAttrs[rightIndex].type, rightAttrs[rightIndex].id, rightIndex),
-		);
-		const conjunct = new BinaryOpNode(
-			scope,
-			{ type: 'binary', operator: '=', left: left.expression, right: right.expression },
-			left,
-			right,
-		);
-		// Force the lazily-cached collation-lattice validation (see above).
-		conjunct.getType();
-		return conjunct;
-	});
+	const conjuncts = usingColumns.map(colName =>
+		buildUsingColumnEquality(colName, leftAttrs, rightAttrs, scope));
 
 	return conjuncts.reduce((acc, cur) => new BinaryOpNode(
 		acc.scope,
@@ -824,4 +797,45 @@ export function buildUsingCondition(
 		acc,
 		cur,
 	));
+}
+
+/** One USING column's `l.c = r.c` conjunct, built exactly as the ON spelling builds it. */
+function buildUsingColumnEquality(
+	colName: string,
+	leftAttrs: readonly Attribute[],
+	rightAttrs: readonly Attribute[],
+	scope: Scope,
+): BinaryOpNode {
+	const left = buildUsingOperand(colName, leftAttrs, 'left', scope);
+	const right = buildUsingOperand(colName, rightAttrs, 'right', scope);
+	return buildComparison(
+		scope,
+		{ type: 'binary', operator: '=', left: left.expression, right: right.expression },
+		left,
+		right,
+	);
+}
+
+/**
+ * One side's operand for a USING column: a reference to the FIRST attribute of that
+ * name on that side (see the pairing rule on {@link buildUsingCondition}), qualified
+ * by its relation so the synthesized AST reads like the ON spelling.
+ */
+function buildUsingOperand(
+	colName: string,
+	attrs: readonly Attribute[],
+	side: 'left' | 'right',
+	scope: Scope,
+): ColumnReferenceNode {
+	const lower = colName.toLowerCase();
+	const index = attrs.findIndex(a => a.name.toLowerCase() === lower);
+	if (index === -1) {
+		throw new QuereusError(
+			`USING column not found on ${side} side of join: ${colName}`, StatusCode.ERROR);
+	}
+	const attr = attrs[index];
+	const expr: AST.ColumnExpr = attr.relationName
+		? { type: 'column', name: attr.name, table: attr.relationName }
+		: { type: 'column', name: attr.name };
+	return new ColumnReferenceNode(scope, expr, attr.type, attr.id, index);
 }

@@ -9,7 +9,7 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { RelationType } from '../../common/datatype.js';
 import { resolveColumn, resolveParameter } from '../resolve.js';
-import { Ambiguous } from '../scopes/scope.js';
+import { Ambiguous, type Scope } from '../scopes/scope.js';
 import { buildSelectStmt, buildValuesStmt } from './select.js';
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
@@ -52,6 +52,32 @@ const logger = createLogger('planner:expression');
 
 /** Comparison operators that should trigger cross-category coercion insertion */
 const COMPARISON_OPS = new Set(['=', '==', '!=', '<>', '<', '<=', '>', '>=']);
+
+/**
+ * Build a comparison `BinaryOpNode` the ONE way every comparison site must: insert
+ * the cross-type coercion casts (so a numeric side and a textual side compare
+ * numerically, an object side and a textual side structurally), then force
+ * `generateType`'s lazily-cached collation-lattice validation so an ambiguous
+ * collation errors at prepare time rather than as the emitter's backstop.
+ *
+ * `expression` is the source spelling and is deliberately NOT rewritten to match a
+ * coerced operand — EXPLAIN keeps showing what the user wrote.
+ *
+ * Callers: the `binary` case below, and `buildUsingCondition` (`./select.ts`), which
+ * desugars `using (c)` into this node — that shared construction is what keeps a
+ * USING pair from drifting away from the spelled-out `l.c = r.c`.
+ */
+export function buildComparison(
+	scope: Scope,
+	expression: AST.BinaryExpr,
+	left: ScalarPlanNode,
+	right: ScalarPlanNode,
+): BinaryOpNode {
+	const [coercedLeft, coercedRight] = insertCrossTypeCoercion(scope, left, right);
+	const node = new BinaryOpNode(scope, expression, coercedLeft, coercedRight);
+	node.getType();
+	return node;
+}
 
 /**
  * Builds an expression plan node from an AST expression.
@@ -105,20 +131,11 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
 		}
 
 		case 'binary': {
-      let left = buildExpression(ctx, expr.left, allowAggregates);
-      let right = buildExpression(ctx, expr.right, allowAggregates);
-      // For comparison operators, insert explicit casts when one side is
-      // numeric and the other textual so the runtime can use the fast path.
-      if (COMPARISON_OPS.has(expr.operator)) {
-        [left, right] = insertCrossTypeCoercion(ctx.scope, left, right);
-      }
-      const binaryNode = new BinaryOpNode(ctx.scope, expr, left, right);
-      // Comparisons validate their collation lattice in generateType, which is
-      // lazily cached — force it so a conflict errors at prepare time.
-      if (COMPARISON_OPS.has(expr.operator)) {
-        binaryNode.getType();
-      }
-      return binaryNode;
+      const left = buildExpression(ctx, expr.left, allowAggregates);
+      const right = buildExpression(ctx, expr.right, allowAggregates);
+      return COMPARISON_OPS.has(expr.operator)
+        ? buildComparison(ctx.scope, expr, left, right)
+        : new BinaryOpNode(ctx.scope, expr, left, right);
 		}
 
     case 'case': {

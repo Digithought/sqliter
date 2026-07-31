@@ -197,10 +197,37 @@ select xn_l.id as lid, xn_r.id as rid from xn_l join xn_r using (k);
 select xn_l.id as lid, xn_r.id as rid from xn_l join xn_r on xn_l.k = xn_r.k;
 → [{"lid":1,"rid":10}]
 
+-- A cross-type USING pair runs as nested loop (the coerced operand is a CastNode, so
+-- no equi-pair is extracted), which is the path an outer join's null-extension takes.
+-- The unmatched left row must still survive, and the ON form must agree.
+select xn_l.id as lid, xn_r.id as rid from xn_l left join xn_r using (k) order by xn_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":null}]
+
+select xn_l.id as lid, xn_r.id as rid from xn_l left join xn_r on xn_l.k = xn_r.k order by xn_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":null}]
+
 drop table xj_l;
 drop table xj_r;
 drop table xn_l;
 drop table xn_r;
+-- run
+
+-- Multi-column USING where only ONE column is cross-type: the same-type column still
+-- keys the join and the coerced one is evaluated as a residual predicate. Both must
+-- apply — row (2,'7') differs on the coerced column and must not join.
+create table xm_l (id integer primary key, a integer, b integer);
+create table xm_r (id integer primary key, a integer, b text);
+insert into xm_l values (1, 100, 5), (2, 200, 6);
+insert into xm_r values (10, 100, '5'), (20, 200, '7');
+
+select xm_l.id as lid, xm_r.id as rid from xm_l join xm_r using (a, b) order by xm_l.id;
+→ [{"lid":1,"rid":10}]
+
+select xm_l.id as lid, xm_r.id as rid from xm_l join xm_r on xm_l.a = xm_r.a and xm_l.b = xm_r.b order by xm_l.id;
+→ [{"lid":1,"rid":10}]
+
+drop table xm_l;
+drop table xm_r;
 -- run
 
 -- ===== A USING column absent from a side is an error, not a silent empty result =====

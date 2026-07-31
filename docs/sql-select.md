@@ -431,7 +431,12 @@ This allows for powerful compositions where the results of data modifications ca
 
 **Join Specifications:**
 - `on condition`: Join condition
-- `using (column[,...])`: Join on equal named columns
+- `using (column[,...])`: Join on equal named columns. Shorthand for the `on
+  left.col = right.col and …` predicate, and identical to it in every respect
+  (type coercion, collation resolution, NULL handling, plan shape). Unlike SQLite,
+  the shared column is **not** merged into one output column — both sides' columns
+  remain selectable, so an unqualified reference to the shared name is ambiguous.
+  A named column absent from either side is an error.
 
 #### Existence columns on outer joins
 

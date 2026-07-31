@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { planOps, allRows } from './_helpers.js';
+import { planOps, planRows, allRows } from './_helpers.js';
 
 describe('Plan shape: join algorithm selection', () => {
 	let db: Database;
@@ -179,6 +179,30 @@ describe('Plan shape: join algorithm selection', () => {
 			const q = "SELECT t1.val AS a, t2.val AS b FROM t1 CROSS JOIN t2";
 			const results = await allRows<{ a: number; b: number }>(db, q);
 			expect(results).to.have.lengthOf(4);
+		});
+	});
+
+	// `using (k)` desugars to the `l.k = r.k` condition an ON join builds, so the two
+	// are one plan — but EXPLAIN must still report which way the query was written.
+	// A cross-type pair yields no extractable equi-pair, so both spellings keep the
+	// generic JoinNode and the only difference left is the label.
+	describe('EXPLAIN keeps the USING spelling', () => {
+		beforeEach(async () => {
+			await db.exec('create table ej_l (id integer primary key, k json) using memory');
+			await db.exec('create table ej_r (id integer primary key, k text) using memory');
+		});
+
+		const joinDetail = async (q: string) =>
+			(await planRows(db, q)).find(r => r.op === 'JOIN')?.detail;
+
+		it('labels a USING join USING(...)', async () => {
+			expect(await joinDetail('select ej_l.id from ej_l join ej_r using (k)'))
+				.to.equal('INNER JOIN USING(k)');
+		});
+
+		it('labels the equivalent ON join as an ON condition', async () => {
+			expect(await joinDetail('select ej_l.id from ej_l join ej_r on ej_l.k = ej_r.k'))
+				.to.equal('INNER JOIN ON condition');
 		});
 	});
 });

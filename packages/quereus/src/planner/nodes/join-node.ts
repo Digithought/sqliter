@@ -298,13 +298,16 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 		// Create new instance - JoinNode creates new attributes by combining left and
 		// right. The existence specs carry pre-minted stable attribute ids, so they
 		// are threaded verbatim (the appended flag columns survive the rebuild).
+		// `usingColumns` is dropped when the condition is rewritten: it only labels the
+		// predicate the desugar produced, so keeping it over a different condition would
+		// make `toString` print `USING(...)` for a predicate that is no longer that.
 		return new JoinNode(
 			this.scope,
 			newLeft as RelationalPlanNode,
 			newRight as RelationalPlanNode,
 			this.joinType,
 			newCondition as ScalarPlanNode | undefined,
-			this.usingColumns,
+			conditionChanged ? undefined : this.usingColumns,
 			this.existence,
 		);
 	}
