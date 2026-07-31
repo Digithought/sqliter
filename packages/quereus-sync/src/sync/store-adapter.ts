@@ -17,10 +17,11 @@
  *      receiver failing "already exists" on every sync (see
  *      {@link decideSchemaChange}).
  *   2. Data changes are grouped per table, then per row; each row group
- *      collapses to ONE `ExternalRowOp` — the group's NET effect in arrival
- *      order (a delete resets the row to absent and later column updates
- *      rebuild it from PK+nulls; updates with no later delete merge onto the
- *      pre-read existing row — UPSERT semantics; see {@link buildRowOp}).
+ *      collapses to ONE `ExternalRowOp` — the group's NET effect in list
+ *      order, which the caller delivers HLC-ordered (a delete resets the row to
+ *      absent and later column updates rebuild it from PK+nulls; updates with no
+ *      later delete merge onto the pre-read existing row — UPSERT semantics; see
+ *      {@link buildRowOp}).
  *   3. `StoreTable.applyExternalRowChanges(ops)` applies the table's ops to
  *      committed storage and returns the EFFECTIVE changes (no-ops — absent
  *      delete, value-identical upsert — are suppressed: no storage write, no
@@ -584,22 +585,21 @@ async function applySchemaChange(
 
 /**
  * Collapse one row group's changes into a single ExternalRowOp — the group's NET
- * effect in arrival (batch) order. A delete resets the row to absent: column
- * updates BEFORE it are discarded (the delete already erased their effect) and
- * updates AFTER it rebuild the row from a PK+nulls base — the same state the
- * changes would leave applied one at a time (a re-creation after a same-batch
- * delete must not resurrect the pre-delete image of columns it does not set).
- * A group whose net effect is the delete collapses to a delete op; updates with
- * no later delete merge onto the pre-read existing row (UPSERT semantics).
+ * effect in list order. A delete resets the row to absent: column updates BEFORE
+ * it are discarded (the delete already erased their effect) and updates AFTER it
+ * rebuild the row from a PK+nulls base — the same state the changes would leave
+ * applied one at a time (a re-creation after a same-batch delete must not
+ * resurrect the pre-delete image of columns it does not set). A group whose net
+ * effect is the delete collapses to a delete op; updates with no later delete
+ * merge onto the pre-read existing row (UPSERT semantics).
  *
- * NOTE: "net effect in order" assumes the batch arrives in HLC order, which
- * `getChangesSince` guarantees (`DataChangeToApply` carries no HLC to re-sort
- * by). The change-applicator's in-batch delete reconciliation decides the SAME
- * question by HLC instead, so on a batch whose changesets were reordered the two
- * disagree: under `allowResurrection` a resurrected row keeps its cell records
- * and change-log entries while this collapse deletes it from the table, leaving
- * the replica relaying a row it does not have. Tracked as
- * `bug-sync-apply-order-splits-data-from-metadata`.
+ * "Net effect in order" is only correct on an HLC-ORDERED list, and
+ * `DataChangeToApply` carries no HLC for this function to re-sort by. The CALLER
+ * establishes that order: `change-applicator.ts`'s `orderDataChangesByHLC` sorts the
+ * reconciled batch by HLC — in the one place that still holds the HLCs — before
+ * handing it to `applyToStore`, so this collapse decides the same question by the
+ * same rule as resolution and the in-batch delete reconciliation, whatever order the
+ * batch arrived in. Anything else driving this callback owes it the same ordering.
  */
 async function buildRowOp(
   table: StoreTable,

@@ -45,7 +45,13 @@ export interface SyncManager {
    * Changes are applied atomically per transaction.
    * Conflicts are resolved using column-level LWW.
    *
-   * @param changes - Change sets received from a peer
+   * **Order-independent**: `changes` may be in any order and produces the same
+   * committed state as the HLC-ordered array — every ordering decision (which write
+   * survives, which DDL runs first, what the table row becomes) is made from the
+   * facts' HLCs, not from their position in the array. Callers assembling a batch
+   * from several senders, or passing one through an approval hook, need not sort it.
+   *
+   * @param changes - Change sets received from a peer, in any order
    * @returns Statistics about what was applied
    */
   applyChanges(changes: ChangeSet[]): Promise<ApplyResult>;

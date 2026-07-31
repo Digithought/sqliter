@@ -109,6 +109,17 @@ function computeBatchTableDelta(changes: ChangeSet[]): { created: Set<string>; d
  *   2. Apply data to store via callback
  *   3. Commit CRDT metadata (+ durable quarantine of diverted changes)
  *
+ * ORDER-INDEPENDENT: `changes` may arrive in any order and produces the same
+ * committed state as the HLC-ordered array. Callers need not (and do not) preserve
+ * timestamp order — the coordinator's `onBeforeApplyChanges` approval hook returns a
+ * caller-supplied array, and the REST/WebSocket ingress accepts an arbitrary array
+ * from any client. Everything whose outcome depends on order is re-derived from the
+ * HLCs here rather than from arrival position: resolution and
+ * {@link reconcileInBatchDeletes} already compare HLCs, the store apply list is sorted
+ * by {@link orderDataChangesByHLC}, the DDL list by {@link orderMigrationsByHLC}, and
+ * the emitted payload by {@link emitRemoteChanges}. Everything else (the counters, the
+ * quarantine holds, the watermark max) is order-insensitive by construction.
+ *
  * Unknown-table disposition: a change referencing a table outside the local basis
  * (a retired-table straggler delta — see `docs/migration.md` § 4 Contract) is
  * **diverted** during resolution — never resolved, applied, or recorded as CRDT
@@ -125,7 +136,6 @@ export async function applyChanges(
 	let skipped = 0;
 	let conflicts = 0;
 
-	const dataChangesToApply: DataChangeToApply[] = [];
 	const schemaChangesToApply: SchemaChangeToApply[] = [];
 	const appliedChanges: Array<{ change: Change; siteId: SiteId }> = [];
 	const resolvedDataChanges: ResolvedChange[] = [];
@@ -161,39 +171,52 @@ export async function applyChanges(
 		}
 	}
 
-	// PHASE 1: Resolve all changes (no writes yet). The clock watermark is merged
+	// PHASE 1a: Schema migrations, batch-wide and HLC-ordered (DDL before DML — the
+	// whole batch's schema changes run before any of its data, see admitGroup). Two
+	// migrations for ONE table are order-dependent (a `drop_table` replayed after the
+	// `create_table` that should follow it leaves the table absent), and `applyChanges`
+	// does not trust arrival order, so sort by HLC rather than walking the changesets in
+	// receipt order. For a well-ordered batch the sort is a no-op: per-table HLC order
+	// IS schemaVersion order (the origin assigns versions monotonically as it ticks).
+	// It also pins the `migration.schemaVersion ?? getCurrentVersion() + 1` fallback
+	// below, which reads storage that no migration in this batch has written yet.
+	for (const migration of orderMigrationsByHLC(changes)) {
+		// NOTE: the `??` fallback reads storage no migration in this batch has written
+		// yet, so two same-table migrations that BOTH omit `schemaVersion` compute the
+		// SAME version and collapse onto one `sm:` key (the later, now max-HLC, wins).
+		// Unreachable today — `SchemaMigration.schemaVersion` is required, and
+		// `collectSchemaMigrations` always carries the stored value; if a wire format
+		// ever makes it optional in practice, assign in-batch versions here instead.
+		const schemaVersion = migration.schemaVersion ??
+			(await ctx.schemaMigrations.getCurrentVersion(migration.schema, migration.table)) + 1;
+
+		const existingMigration = await ctx.schemaMigrations.getMigration(
+			migration.schema,
+			migration.table,
+			schemaVersion,
+		);
+
+		if (existingMigration) {
+			if (compareHLC(migration.hlc, existingMigration.hlc) <= 0) {
+				skipped++;
+				continue;
+			}
+		}
+
+		schemaChangesToApply.push({
+			type: migration.type,
+			schema: migration.schema,
+			table: migration.table,
+			ddl: migration.ddl,
+		});
+		pendingSchemaMigrations.push({ migration, schemaVersion });
+		applied++;
+	}
+
+	// PHASE 1b: Resolve all data changes (no writes yet). The clock watermark is merged
 	// once after a successful admission (see admitGroup below), not per changeset —
 	// resolution reads stored versions via compareHLC, never the live clock.
 	for (const changeSet of changes) {
-		// Process schema migrations first (DDL before DML)
-		for (const migration of changeSet.schemaMigrations) {
-			const schemaVersion = migration.schemaVersion ??
-				(await ctx.schemaMigrations.getCurrentVersion(migration.schema, migration.table)) + 1;
-
-			const existingMigration = await ctx.schemaMigrations.getMigration(
-				migration.schema,
-				migration.table,
-				schemaVersion,
-			);
-
-			if (existingMigration) {
-				if (compareHLC(migration.hlc, existingMigration.hlc) <= 0) {
-					skipped++;
-					continue;
-				}
-			}
-
-			schemaChangesToApply.push({
-				type: migration.type,
-				schema: migration.schema,
-				table: migration.table,
-				ddl: migration.ddl,
-			});
-			pendingSchemaMigrations.push({ migration, schemaVersion });
-			applied++;
-		}
-
-		// Resolve data changes
 		for (const change of changeSet.changes) {
 			// Self-origin echo skip BEFORE unknown-table detection, so a self-change
 			// to a retired table is skipped (counted), never quarantined. resolveChange
@@ -247,15 +270,14 @@ export async function applyChanges(
 			applied++;
 			appliedChanges.push({ change: resolved.change, siteId: dataResolutions[i].siteId });
 			resolvedDataChanges.push(resolved);
-			if (resolved.dataChange) {
-				dataChangesToApply.push(resolved.dataChange);
-			}
 		} else if (resolved.outcome === 'skipped') {
 			skipped++;
 		} else {
 			conflicts++;
 		}
 	}
+
+	const dataChangesToApply = orderDataChangesByHLC(resolvedDataChanges);
 
 	const disposition = ctx.config.unknownTableDisposition;
 	// Single receive timestamp for every quarantine entry this apply (GC horizon).
@@ -364,11 +386,63 @@ export async function applyChanges(
 }
 
 /**
+ * Order one reconciled batch's store operations by HLC.
+ *
+ * {@link DataChangeToApply} carries no timestamp, so the store adapter replays each
+ * row group in ARRIVAL order (`buildRowOp` in store-adapter.ts) while resolution and
+ * {@link reconcileInBatchDeletes} decide by HLC. `applyChanges` takes whatever
+ * transaction array its caller hands it — the coordinator's approval hook and the
+ * REST/WebSocket ingress neither preserve nor produce timestamp order — so arrival
+ * order is not trustworthy. Sorting here, in the one place that still holds the HLCs,
+ * makes the table contents follow the same rule as the metadata whatever order the
+ * batch arrived in, without threading an HLC through the whole store seam.
+ *
+ * A GLOBAL sort suffices: the adapter groups by table, then by row, so only the
+ * relative order WITHIN one row group is load-bearing. `compareHLC` is a total order
+ * over `(wallTime, counter, siteId, opSeq)` and `Array.prototype.sort` is stable, so
+ * equal HLCs — the same fact — keep arrival order.
+ *
+ * It also lands the resurrection case right: {@link reconcileInBatchDeletes} already
+ * skipped every column change at or below the winning delete's HLC, so the only column
+ * ops left for that row are strictly later than the delete — the sort puts the delete
+ * first and `buildRowOp` rebuilds the row from primary key + nulls, which is what the
+ * metadata says happened.
+ */
+function orderDataChangesByHLC(applied: readonly ResolvedChange[]): DataChangeToApply[] {
+	const withOps = applied.filter(
+		(resolved): resolved is ResolvedChange & { dataChange: DataChangeToApply } =>
+			resolved.dataChange !== undefined,
+	);
+	withOps.sort((a, b) => compareHLC(a.change.hlc, b.change.hlc));
+	return withOps.map(resolved => resolved.dataChange);
+}
+
+/**
+ * Flatten a batch's schema migrations into one HLC-ordered list.
+ *
+ * Same reason as {@link orderDataChangesByHLC}: the DDL list reaches the store adapter
+ * as a plain array replayed in order, and two migrations for ONE table are
+ * order-dependent, so arrival order across changesets must not decide which runs first.
+ * Stable, so migrations that cannot be distinguished by HLC keep arrival order.
+ */
+function orderMigrationsByHLC(changes: readonly ChangeSet[]): SchemaMigration[] {
+	const migrations = changes.flatMap(changeSet => [...changeSet.schemaMigrations]);
+	migrations.sort((a, b) => compareHLC(a.hlc, b.hlc));
+	return migrations;
+}
+
+/**
  * Emit `onRemoteChange` for applied changes, grouped by a per-change origin site
  * id. Shared by the wire apply (grouping by the relaying changeset's `siteId`) and
  * the drain path (grouping by each held change's original origin `hlc.siteId`), so
  * downstream reactivity — MV maintenance, `Database.watch`, UI — fires identically
  * on a revival as on a fresh remote apply. No-op for an empty set.
+ *
+ * The payload is HLC-ordered for the same reason the store apply list is
+ * ({@link orderDataChangesByHLC}): it is built from the same reconciled list, so a
+ * reordered batch would otherwise hand a listener the batch's facts in an order that
+ * contradicts the state just committed. Ordering is per emitted event, and the sort is
+ * a total order, so each site's slice stays HLC-ordered too.
  */
 function emitRemoteChanges(
 	ctx: SyncContext,
@@ -376,8 +450,9 @@ function emitRemoteChanges(
 ): void {
 	if (entries.length === 0) return;
 
+	const ordered = [...entries].sort((a, b) => compareHLC(a.change.hlc, b.change.hlc));
 	const changesBySite = new Map<string, Change[]>();
-	for (const { change, siteId } of entries) {
+	for (const { change, siteId } of ordered) {
 		const siteKey = Array.from(siteId).join(',');
 		const siteChanges = changesBySite.get(siteKey);
 		if (siteChanges) {
@@ -467,7 +542,6 @@ async function drainTableGroup(
 	if (columns === undefined) return 0;
 	const columnSet = new Set(columns);
 
-	const dataChangesToApply: DataChangeToApply[] = [];
 	const resolvedDataChanges: ResolvedChange[] = [];
 	const appliedEntries: Array<{ change: Change; siteId: SiteId }> = [];
 	let applied = 0;
@@ -497,7 +571,6 @@ async function drainTableGroup(
 		if (resolved.outcome === 'applied') {
 			applied++;
 			resolvedDataChanges.push(resolved);
-			if (resolved.dataChange) dataChangesToApply.push(resolved.dataChange);
 			// Group revival events by the held change's ORIGINAL origin (its HLC
 			// siteId) — a held change carries no relaying changeset.
 			appliedEntries.push({ change: resolved.change, siteId: resolved.change.hlc.siteId });
@@ -505,6 +578,11 @@ async function drainTableGroup(
 			skipped++;
 		}
 	}
+
+	// Held entries already come back HLC-ordered (`buildQuarantineKey` puts the HLC
+	// bytes first), so this is order-preserving today — it pins the same contract
+	// applyChanges states rather than fixing a live inversion here.
+	const dataChangesToApply = orderDataChangesByHLC(resolvedDataChanges);
 
 	// One admission unit: data first → CRDT metadata + held-entry deletes second.
 	// No watermarkHLC — these HLCs were already merged into the local clock at the
