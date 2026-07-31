@@ -381,6 +381,13 @@ export async function applySnapshotStream(
 	let currentTable: string | undefined;
 	const completedTables: string[] = [];
 
+	// Tables whose `table-end` arrived but whose trailing rows may still sit in
+	// `pendingDataChanges`. They graduate into `completedTables` only once
+	// `applyDataToStore` has returned — a checkpoint naming a table whose last rows
+	// are still in memory tells the sender to skip that table on resume, and those
+	// rows are then never sent, never reconciled, and never reported.
+	let stagedCompletedTables: string[] = [];
+
 	// Pending data to apply to store (batched for efficiency)
 	let pendingDataChanges: DataChangeToApply[] = [];
 	// Held as full migrations, not `SchemaChangeToApply`, so the flush can re-order
@@ -401,6 +408,8 @@ export async function applySnapshotStream(
 		await applyDataToStore(ctx, pendingDataChanges, schemaChanges, { remote: true, bootstrap: true });
 		pendingDataChanges = [];
 		pendingSchemaMigrations = [];
+		completedTables.push(...stagedCompletedTables);
+		stagedCompletedTables = [];
 	};
 
 	// Process chunks
@@ -651,7 +660,7 @@ export async function applySnapshotStream(
 
 				tablesProcessed++;
 				if (currentTable) {
-					completedTables.push(currentTable);
+					stagedCompletedTables.push(currentTable);
 				}
 				break;
 
