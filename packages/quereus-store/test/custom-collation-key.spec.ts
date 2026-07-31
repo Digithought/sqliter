@@ -302,9 +302,10 @@ describe('Store key bytes under a database-registered collation', () => {
 	});
 
 	it('leaves an ANY-typed PK column unaffected by a table key collation K that cannot key', async () => {
-		// `resolvePkKeyCollations` keys an ANY/JSON member under hard-coded BINARY, never K,
-		// because `ANY_TYPE.compare` ignores whatever collation it is handed. So a
-		// comparator-only K is never encoded with, and the two BINARY-distinct rows both land.
+		// `resolvePkKeyCollations` keys an undecorated ANY member under its declared BINARY
+		// (the session default never applies a non-BINARY collation to ANY, and the store's
+		// K-reconcile skips non-text columns), never K. So a comparator-only K is never
+		// encoded with, and the two BINARY-distinct rows both land.
 		db.registerCollation('NOCASE', noSpace);
 		expect(await attempt(db, `create table t (k any primary key, v text) using store`)).to.be.null;
 		await db.exec(`insert into t values ('A', 'upper'), ('a', 'lower')`);

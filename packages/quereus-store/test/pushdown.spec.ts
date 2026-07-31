@@ -786,14 +786,14 @@ describe('StoreModule predicate pushdown', () => {
 			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 1 }, { id: 2 }]);
 		});
 
-		// The guard that DOES survive the collapse, over an `ANY`-typed column. ANY carries
-		// no `isTextual` marker and a NULL physicalType, yet its `parse` is the identity — so
-		// it stores text as text. Its index key bytes are hard-BINARY (the collation
-		// `ANY_TYPE.compare` uses) while the scan residual compares under the declared
-		// NOCASE, so a byte-equality window under-fetches: `where x = 'BOB'` would return
-		// NOTHING, while the SAME query over the SAME rows without an index returns the row.
-		// Creating an index must never change a query's results.
-		it('collation-unsafe index over an ANY column declines the seek but stays correct', async () => {
+		// ANY carries no `isTextual` marker and a NULL physicalType, yet its `parse` is the
+		// identity — so it stores text as text. Since `ANY_TYPE.compare` honors the
+		// collation it is handed (any-type-compare-honors-collation), the index key bytes
+		// encode under the declared NOCASE — the same collation the scan residual compares
+		// under — so the byte-equality window IS the qualifying set and the seek is
+		// admitted. The invariant stays what it always was: creating an index must never
+		// change a query's results.
+		it('index over an ANY column with a declared COLLATE seeks and stays correct', async () => {
 			await db.exec(`create table t (id integer primary key, x ANY collate nocase) using store (collation = binary)`);
 			await db.exec(`insert into t values (1, 'Bob')`);
 
@@ -803,8 +803,8 @@ describe('StoreModule predicate pushdown', () => {
 
 			await db.exec(`create index ix_x on t (x)`);
 			expect(await asyncIterableToArray(db.eval(q)), 'and still matches once an index exists').to.deep.equal([{ id: 1 }]);
-			expect(await planOps(q), 'the ANY key-collation guard still declines the seek')
-				.to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await planOps(q), 'key and residual collation agree — the seek is claimed')
+				.to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
 		});
 
 		// Regression: `tryIndexAccessPlan` must mark handled ONLY the constraints

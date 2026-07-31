@@ -34,10 +34,11 @@ export type PkKeyingResolver = (schemaName: string, tableName: string) => PkKeyi
 /**
  * Resolve a table's {@link PkKeying} from its schema. Delegates entirely to
  * `@quereus/quereus`'s {@link resolvePkIdentityKeying} (per pk column: key collation
- * via `pkKeyCollationName` — its own declared collation for a textual column, since
- * the store reconciles an undecorated text pk to the table key collation at CREATE,
- * so the registered schema always carries it; BINARY for text-capable-but-not-textual
- * columns; identity for never-text columns — plus the engine's `semanticKeyTransform`,
+ * via `pkKeyCollationName` — its own declared collation for a collation-aware column
+ * (`text`, `any`; for text the store reconciles an undecorated pk to the table key
+ * collation at CREATE, so the registered schema always carries it); BINARY for
+ * collation-blind text-capable columns (`json`, the temporal types); identity for
+ * never-text columns — plus the engine's `semanticKeyTransform`,
  * the logical type's `groupKey`, today TIMESPAN → total seconds. Deliberately the
  * ENGINE transform, not the store's byte-order variant: identity strings need
  * equality, not memcmp order, so JSON's canonical text is already faithful), whose

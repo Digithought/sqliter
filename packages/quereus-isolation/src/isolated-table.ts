@@ -502,10 +502,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// string values, so the collation cannot affect how such a key buckets. Asking
 		// the resolver for it would reject `n integer collate mycoll` under a
 		// comparator-only collation, which the engine's own hash sites accept (they gate
-		// through `hashKeyCollationName`, the same predicate). A text-capable-but-not-
-		// `isTextual` column (`any`, `json`, the temporal types) is keyed under `'BINARY'`
-		// regardless of its declared collation, since PK equality compares those types
-		// through `logicalType.compare`, which ignores collation entirely.
+		// through `hashKeyCollationName`, the same predicate). A collation-aware column
+		// (`text`, `any` — types whose `compare` honors the collation it is handed) keys
+		// under its own declared collation; a collation-blind text-capable column
+		// (`json`, the temporal types) is keyed under `'BINARY'` regardless, since PK
+		// equality compares those types through `logicalType.compare`, which ignores
+		// the collation argument.
 		const pkNormalizers = pkIndices.map(i => {
 			const column = this.tableSchema!.columns[i];
 			return this.keyNormalizerResolver(pkKeyCollationName(column));
@@ -1779,11 +1781,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 *  - enforcement collation BINARY → seekable; BINARY equality is byte identity, which
 	 *    every backend's index key preserves.
 	 *  - otherwise seekable only when a key-encoding backend keys the column under that
-	 *    same collation, which is exactly what `pkKeyCollationName` answers: a `text`
-	 *    column keys under its own collation (seekable), while a text-capable-but-not
-	 *    -`isTextual` column — `any`, `json`, the temporal types — keys hard-`BINARY`
-	 *    while this check still compares under the declared name (NOT seekable; a probe
-	 *    for `'B@X'` would byte-miss the committed `'b@x'`).
+	 *    same collation, which is exactly what `pkKeyCollationName` answers: a
+	 *    collation-aware column (`text`, `any` — `compare` honors the handed collation)
+	 *    keys under its own collation (seekable), while a collation-blind text-capable
+	 *    column — `json`, the temporal types — keys hard-`BINARY` while this check still
+	 *    compares under the declared name (NOT seekable; a probe for `'B@X'` would
+	 *    byte-miss the committed `'b@x'`).
 	 *
 	 * Equality is all the seek needs — order preservation is a RANGE concern and no range
 	 * is built here (`makeSecondaryIndexEqSeekFilter` emits one EQ per key column and

@@ -497,36 +497,44 @@ under the index column's own effective collation (`resolveIndexKeyCollations`: t
 column's `COLLATE`, else the table column's declared collation, else `BINARY` — **not** K;
 an undecorated non-PK text column genuinely compares under BINARY, since the CREATE-time
 K-reconcile below applies only to PK members), with the same hard-`BINARY` rule for
-text-capable-but-not-`isTextual` columns as the PK bullet below. So the stored index bytes
-always agree with the collation the residual re-check, the planner's cover analysis, and
-UNIQUE enforcement compare under. The schema entry points:
+collation-blind columns (`json`, the temporal types) as the PK bullet below. So the stored
+index bytes always agree with the collation the residual re-check, the planner's cover
+analysis, and UNIQUE enforcement compare under. The schema entry points:
 
-- **A PK column that can hold text but is not `isTextual`** — `any`, `json`, and the
-  temporal types `date` / `time` / `datetime` / `timespan` — is keyed under **hard-coded
-  `BINARY`**, never under its declared collation and never under K. Each of these types
-  supplies its own `compare`, and none lets the collation argument `createTypedComparator`
-  hands it influence the result (`TEXT_TYPE.compare` is the only one that applies it). Keying
-  such a column under anything but BINARY would enforce uniqueness under one collation and
-  compare under another — `'A'` and `'a'` are distinct BINARY values that would collide at one
-  NOCASE key, so a second `insert` would be spuriously rejected and an `insert or replace`
-  would silently destroy the first row.
-  `create table t (k any collate nocase primary key)` is *accepted* (`NOCASE` is a registered
-  built-in, so it passes the registry-aware column-DDL gate on `ANY_TYPE`, which declares no
-  supported-collation list; an *unregistered* name is rejected there), but the
-  `nocase` is inert — honored neither in the key bytes nor in the comparison. Its one cost:
-  `pkOrderPreservingPrefixLength` finds the BINARY key collation unequal to the declared
-  NOCASE and conservatively declines the range seek — an optimization lost, never a row.
+- **A collation-aware PK column** — one whose type's `compare` applies the collation it
+  is handed (`LogicalType.collationAware`: `text` and `any`) — is keyed under its
+  **declared collation**. `create table t (k any collate nocase primary key)` is accepted
+  (`NOCASE` is a registered built-in, so it passes the registry-aware column-DDL gate on
+  `ANY_TYPE`, which declares no supported-collation list; an *unregistered* name is
+  rejected there) and the `nocase` is *honored*: key bytes, PK/UNIQUE enforcement, and
+  every comparison agree that `'A'` and `'a'` are one key, and
+  `pkOrderPreservingPrefixLength` finds key and comparison collation equal, so the range
+  seek and PK-order advertisement stay open. An **undecorated** `any` PK column keys (and
+  compares) BINARY — `resolveDefaultCollation` never applies a non-BINARY session default
+  to ANY, and the CREATE-time K-reconcile below deliberately skips it — so only an
+  explicit non-BINARY `COLLATE` moves its key bytes.
+
+- **A PK column that can hold text but is collation-blind** — `json` and the temporal
+  types `date` / `time` / `datetime` / `timespan` — is keyed under **hard-coded
+  `BINARY`**, never under a declared collation and never under K. Those types' `compare`
+  ignores the collation argument `createTypedComparator` hands it, so keying such a
+  column under anything but BINARY would enforce uniqueness under one collation and
+  compare under another — `'A'` and `'a'` are distinct to the comparator but would
+  collide at one NOCASE key, so a second `insert` would be spuriously rejected and an
+  `insert or replace` would silently destroy the first row. (Their empty
+  `supportedCollations` list already keeps a non-BINARY column COLLATE out at DDL time;
+  the hard-coding is the backstop.)
 
 - **What the PK-order advertisement is measured against.** A range seek and a
   `providesOrdering` advertisement claim that memcmp over the key bytes reproduces the order
-  the planner's `Sort` would have produced. `Sort`, like every scalar comparison in the engine,
-  orders under the operand's *collation* (`compareSqlValuesFast`), never through
-  `logicalType.compare`. So BINARY key bytes are order-faithful for these columns even where
-  the type's own `compare` disagrees (`TIMESPAN.compare` ranks by `Temporal.Duration` total,
-  `JSON_TYPE.compare` structurally — neither runs under `order by` or `where`). `MemoryTable`
-  is the exception: its primary-key BTree *is* keyed by `createTypedComparator`, so it
-  advertises an order its own `Sort` disagrees with — a memory-module defect, not a contract
-  the store must match.
+  the planner's `Sort` would have produced. For a collation-aware column `Sort` orders under
+  the operand's *collation*, which is exactly what the key bytes encode under, so the
+  advertisement holds (subject to the collation's `orderPreserving` assertion). For a
+  semantic-ordering type (TIMESPAN, JSON) `Sort` ranks through `logicalType.compare`, which
+  no collation byte encoding reproduces — `keyOrderMatchesCollation` closes the gate for
+  those members outright and the store declines rather than advertising a divergent byte
+  order. The memory backend's declared-key BTrees (`createTypedComparator`) agree with
+  `Sort` on both kinds, so the two backends advertise the same orders.
 
 - **CREATE.** `module.create` applies the store default K to an *implicit*-default text PK
   column (the engine's BINARY column default becomes NOCASE under K = NOCASE), so an
@@ -942,18 +950,21 @@ bytes are encoded under the index column's own key collation, and the post-fetch
 re-compares under the index column's `COLLATE` (else the table column's declared
 collation). Both index arms ask only whether those two agree:
 
-- **Equality** — agreement makes the byte window exactly the qualifying set. A `text`
-  column always agrees, so an index on a plain (BINARY) text column of a default-`K`
-  (NOCASE) table seeks, and so does an index on a `collate nocase` column of a
-  `collation = binary` table.
+- **Equality** — agreement makes the byte window exactly the qualifying set. A `text` or
+  `any` column always agrees (both types' `compare` honors the collation it is handed —
+  `LogicalType.collationAware` — so key bytes and filter resolve the same name), so an
+  index on a plain (BINARY) text column of a default-`K` (NOCASE) table seeks, and so do
+  an index on a `collate nocase` column of a `collation = binary` table and an index over
+  an `any collate nocase` column.
 - **Range** — the same agreement *plus* the collation's `orderPreserving` assertion,
   since a byte window also equates memcmp of the key bytes with the comparator's order.
 
-The one shape where the two do **not** agree is a column that can hold text but is not
-declared `text` — `any`, `json`, and the temporal types — carrying a declared `COLLATE`.
-Those key hard-`BINARY` (the collation their `compare` actually uses) while the filter
-still compares under the declared name, so both arms decline and the query full-scans.
-Declining costs the seek, never a row.
+The one shape where the two do **not** agree is a collation-blind column (`json`, the
+temporal types — their `compare` ignores the collation argument) under an index column
+carrying an explicit non-`BINARY` `COLLATE` (index DDL does not type-gate the way column
+DDL does). Those key hard-`BINARY` while the filter still compares under the declared
+name, so both arms decline and the query full-scans. Declining costs the seek, never a
+row.
 
 The built-ins hold their assertion for every **well-formed** string, including text outside
 the basic multilingual plane. They compare by Unicode code point (`compareCodePoints` in
@@ -1038,10 +1049,12 @@ whose own **name** carries a lone surrogate is refused at `CREATE`/`ALTER … RE
 lone surrogate that only appears in the persisted DDL **text** (a column name, a `default`
 literal) still surfaces lazily on first data access, since the table's own name is clean.
 
-Note also that a text-capable but non-textual primary-key column (`any`, `json`, a date/time
-type) is keyed under `BINARY`, not under the table key collation `K` — matching the `BINARY`
-the engine compares it under, so its range seeks and PK-order advertisement stand and its
-uniqueness is enforced bytewise. See "Per-column PK key collation" in [schema.md](schema.md).
+Note also that a collation-blind primary-key column (`json`, a date/time type) is keyed
+under `BINARY`, not under the table key collation `K` — matching the `BINARY` the engine
+compares it under, so its range seeks and PK-order advertisement stand and its uniqueness
+is enforced bytewise. An `any` PK member keys under its declared collation (BINARY unless
+an explicit non-BINARY `COLLATE` is declared — the K-reconcile skips non-text columns).
+See "Per-column PK key collation" in [schema.md](schema.md).
 (A declared-`json` member takes no collation at all: its transform hands `encodeValue` a
 `Uint8Array`, which the BLOB path encodes verbatim — no normalizer runs.)
 

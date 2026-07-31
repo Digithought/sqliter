@@ -1,14 +1,19 @@
 /**
- * A store PK column whose declared type can hold text but is not `isTextual` — `any`, `json`,
- * and the temporal types — is keyed under hard-coded BINARY.
+ * A store PK column keys under the collation the engine actually compares it under.
+ * For a collation-blind type (`json`, the temporal types — their `compare` ignores the
+ * collation argument) that is hard-coded BINARY; for an UNDECORATED `any` PK it is BINARY
+ * too (`resolveDefaultCollation` never applies a non-BINARY default to ANY, and the
+ * store's K-reconcile skips non-text columns). The store used to leave such a member's
+ * key collation `undefined`, which `encodeValue` reads as "fall back to the table key
+ * collation K" (default NOCASE) — enforcing PK uniqueness under NOCASE while the engine
+ * compared under BINARY. `'A'` and `'a'` are distinct BINARY values that collided at one
+ * NOCASE key, so the second `insert` was rejected and an `insert or replace` silently
+ * destroyed the first row.
  *
- * These types supply their own `logicalType.compare`, and none of them lets the collation
- * argument `createTypedComparator` hands it influence the result — `TEXT_TYPE.compare` is the
- * only one that applies it. The store used to leave such a member's key collation `undefined`,
- * which `encodeValue` reads as "fall back to the table key collation K" (default NOCASE) —
- * enforcing PK uniqueness under NOCASE while the engine compared under BINARY. `'A'` and `'a'`
- * are distinct BINARY values that collided at one NOCASE key, so the second `insert` was
- * rejected and an `insert or replace` silently destroyed the first row.
+ * An `any` PK carrying an EXPLICIT non-BINARY COLLATE is different since
+ * any-type-compare-honors-collation: `ANY_TYPE.compare` honors the collation it is
+ * handed, so such a member keys — and enforces — under the declared name (see the ALTER
+ * case below and 06.4.5-any-collate-declared-keys.sqllogic).
  *
  * A memory table is the oracle for UNIQUENESS throughout. Since the semantic-ordering ruling
  * (docs/types.md "Semantic ordering"), it is the ordering oracle too: `Sort` ranks a TIMESPAN
@@ -142,18 +147,27 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			expect((await db.get(`select v from t where k = 'A'`))?.v).to.equal('upper');
 		});
 
-		it('re-keys an `any` PK to the same BINARY bytes across `alter column … set collate`', async () => {
-			// `rekeyRows` resolves the key collation through `resolvePkKeyCollations` on both
-			// sides of the ALTER, and an ANY member pins BINARY regardless of what it declares.
-			// So the re-key is a no-op: both case-distinct rows must survive, and neither may
-			// collide at a NOCASE key on the way through.
+		it('`alter column … set collate nocase` on an `any` PK is a real re-key: collisions refuse, survivors re-key', async () => {
+			// `ANY_TYPE.compare` honors the handed collation, so `resolvePkKeyCollations`
+			// resolves the ANY member to NOCASE after the ALTER and `rekeyRows` genuinely
+			// re-encodes. Case-distinct rows collide under the new collation, so the
+			// pre-mutation validation refuses — same stricter rule as a text PK.
 			await db.exec(`create table t (k any primary key, v text) using store`);
 			await db.exec(`insert into t values ('A', 'upper'), ('a', 'lower')`);
 
-			expect(await attempt(db, `alter table t alter column k set collate nocase`)).to.be.null;
-			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(2);
-			expect((await db.get(`select v from t where k = 'A'`))?.v).to.equal('upper');
+			const err = await attempt(db, `alter table t alter column k set collate nocase`);
+			expect(err, "'A' and 'a' collide under NOCASE — the re-key must refuse").to.not.be.null;
+			expect((await db.get(`select count(*) as cnt from t`))?.cnt, 'refusal leaves the table untouched').to.equal(2);
 			expect((await db.get(`select v from t where k = 'a'`))?.v).to.equal('lower');
+
+			// Collision-free rows re-key, and the new collation then enforces.
+			await db.exec(`create table t2 (k any primary key, v text) using store`);
+			await db.exec(`insert into t2 values ('A', 'upper'), ('b', 'other')`);
+			expect(await attempt(db, `alter table t2 alter column k set collate nocase`)).to.be.null;
+			expect(await attempt(db, `insert into t2 values ('a', 'dup')`), 'the re-keyed PK enforces NOCASE')
+				.to.not.be.null;
+			expect((await db.get(`select v from t2 where k = 'a'`))?.v, 'NOCASE point lookup finds the case variant')
+				.to.equal('upper');
 		});
 	});
 

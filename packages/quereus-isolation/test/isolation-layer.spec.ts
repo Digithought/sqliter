@@ -524,26 +524,26 @@ describe('IsolationModule', () => {
 			await db.exec('ROLLBACK');
 		});
 
-		it('keeps case-distinct `any`-typed PK rows separate under a declared (inert) NOCASE', async () => {
+		it('keeps case-distinct rows of an undecorated `any` PK separate (BINARY identity)', async () => {
+			// An `any` PK with no COLLATE compares — and keys — under BINARY (the session
+			// default never applies a non-BINARY collation to ANY), so 'A' and 'a' are
+			// genuinely distinct rows and the modified-PK normalizer must not merge them.
 			await db.exec(`
 				CREATE TABLE t (
-					k ANY COLLATE NOCASE PRIMARY KEY,
+					k ANY PRIMARY KEY,
 					v TEXT
 				) USING isolated
 			`);
 			await db.exec(`CREATE INDEX idx_v ON t(v)`);
 
-			// Two committed rows whose PKs differ only in case — genuinely distinct under
-			// ANY_TYPE.compare, which always compares BINARY regardless of the declared
-			// (and inert) NOCASE collation.
 			await db.exec(`INSERT INTO t VALUES ('A', 'upper')`);
 			await db.exec(`INSERT INTO t VALUES ('a', 'lower')`);
 
 			await db.exec('BEGIN');
 			// Modify one of the pair via a secondary-index-driven scan (idx_v), which builds
-			// its modified-PK set through the collation-aware key normalizer. Pre-fix, that
-			// normalizer keys 'A' and 'a' under NOCASE and treats them as the same PK, so
-			// the untouched 'a' row is wrongly excluded from the merge.
+			// its modified-PK set through the collation-aware key normalizer. A normalizer
+			// that wrongly keyed this shape NOCASE would treat 'A' and 'a' as the same PK
+			// and exclude the untouched 'a' row from the merge.
 			await db.exec(`UPDATE t SET v = 'changed' WHERE k = 'A'`);
 
 			const changed = await asyncIterableToArray(db.eval(`SELECT k, v FROM t WHERE v = 'changed'`));
@@ -554,6 +554,36 @@ describe('IsolationModule', () => {
 			expect(untouched.length).to.equal(1);
 			expect(untouched[0].k).to.equal('a');
 
+			await db.exec('ROLLBACK');
+		});
+
+		it('collapses case variants of an `any collate nocase` PK — one logical key, shadowed across case', async () => {
+			// ANY_TYPE.compare honors the collation it is handed
+			// (any-type-compare-honors-collation), so a declared NOCASE on an `any` PK is
+			// a real identity: the case variant is a PK violation, and an in-transaction
+			// case-only rewrite must shadow the underlying spelling — mirroring the TEXT
+			// COLLATE NOCASE PK case above.
+			await db.exec(`
+				CREATE TABLE t (
+					k ANY COLLATE NOCASE PRIMARY KEY,
+					v TEXT
+				) USING isolated
+			`);
+			await db.exec(`CREATE INDEX idx_v ON t(v)`);
+
+			await db.exec(`INSERT INTO t VALUES ('abc', 'shared')`);
+			let err: Error | null = null;
+			try { await db.exec(`INSERT INTO t VALUES ('ABC', 'dup')`); } catch (e) { err = e as Error; }
+			expect(err?.message ?? '', 'the case variant is the same NOCASE key').to.match(/constraint/i);
+
+			await db.exec('BEGIN');
+			// Case-only PK rewrite: the overlay row must shadow the underlying 'abc' —
+			// a modified-PK normalizer keyed BINARY would miss it and the scan would
+			// surface both spellings.
+			await db.exec(`UPDATE t SET k = 'ABC' WHERE k = 'abc'`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT k FROM t WHERE v = 'shared'`));
+			expect(rows.length).to.equal(1);
+			expect(rows[0].k).to.equal('ABC');
 			await db.exec('ROLLBACK');
 		});
 
@@ -6128,11 +6158,11 @@ describe('IsolationModule — two-phase merged UNIQUE check (index seek)', () =>
 		await db.exec('rollback');
 	});
 
-	it('an `any` column with a declared COLLATE still declines the seek, and still catches the collision', async () => {
-		// The shape the widened gate must keep out: `any` keys hard-BINARY (the collation
-		// `ANY_TYPE.compare` uses) while the merged check enforces under the declared
-		// NOCASE, so a byte-equality seek for 'B@X' would physically miss the committed
-		// 'b@x'. `canSeekForConstraint` declines and Phase 2 full-scans.
+	it('an `any` column with a declared COLLATE seeks, and still catches the collision', async () => {
+		// `any` keys under its declared NOCASE now (any-type-compare-honors-collation
+		// made ANY_TYPE.compare honor the handed collation), which is also the collation
+		// the merged check enforces under — so `canSeekForConstraint` admits the seek,
+		// and the NOCASE seek window for 'B@X' must hold the committed 'b@x'.
 		await db.exec(`create table t (id integer primary key, email any collate nocase) using isolated`);
 		await db.exec(`create unique index ux on t(email)`);
 		await db.exec(`insert into t values (1, 'b@x')`);   // committed

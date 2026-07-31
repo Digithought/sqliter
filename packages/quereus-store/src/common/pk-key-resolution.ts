@@ -34,10 +34,14 @@ import { jsonStructuralKey } from './json-key.js';
  * The store encodes PRIMARY KEY uniqueness/ordering PHYSICALLY in the key bytes, so each
  * text-capable PK column's key must be encoded under the collation the engine actually
  * COMPARES that column under. Returns one entry per PK member, in `pkDef` order:
- *   - `isTextual` member (`text`) → its declared `collation` (normalized upper-case), or
- *     `fallback` (the table key collation K) when the column carries none.
- *   - text-capable but not `isTextual` member — `any`, `json`, and the temporal types
- *     (`date` / `time` / `datetime` / `timespan`) → hard-coded `'BINARY'`, see below.
+ *   - collation-aware member (`text`, `any` — the types whose `compare` applies the
+ *     collation it is handed, `LogicalType.collationAware`) → its declared `collation`
+ *     (normalized upper-case), or `fallback` (the table key collation K) when the
+ *     column carries none.
+ *   - text-capable but collation-blind member — `json` and the temporal types
+ *     (`date` / `time` / `datetime` / `timespan`) → hard-coded `'BINARY'`: those
+ *     types' `compare` ignores the collation argument (and their empty
+ *     `supportedCollations` list keeps a non-BINARY column COLLATE out at DDL time).
  *   - never-text member → `undefined`: collation is meaningless for
  *     integer/real/blob keys (they encode type-natively), so the encoder ignores
  *     it and the data/index key bytes are identical regardless.
@@ -63,7 +67,7 @@ export function resolvePkKeyCollations(
 ): (string | undefined)[] {
 	return pkDef.map(def => {
 		const col = columns[def.index];
-		// Delegates the isTextual/text-capable/never-text branch to the engine's
+		// Delegates the collation-aware/collation-blind/never-text branch to the engine's
 		// `pkKeyCollationName` — the same decision `quereus-isolation`'s modified-PK set
 		// makes for its own key normalizers, so the two can never drift apart again. Only
 		// the fallback-to-K and uppercase-normalization are store-specific.
@@ -79,10 +83,10 @@ export function resolvePkKeyCollations(
  * `pkKeyCollationName`:
  *   - never-text column (`integer`, `real`, `blob`) → `undefined`: encoded
  *     type-natively, collation is moot.
- *   - text-capable but not `isTextual` (`any`, `json`, the temporal types) →
- *     hard-coded `'BINARY'` — those types' `compare` ignores collation.
- *   - `isTextual` (`text`) → the index column's own COLLATE, else the table
- *     column's declared collation, else `'BINARY'`.
+ *   - text-capable but collation-blind (`json`, the temporal types) → hard-coded
+ *     `'BINARY'` — those types' `compare` ignores collation.
+ *   - collation-aware (`text`, `any`) → the index column's own COLLATE, else the
+ *     table column's declared collation, else `'BINARY'`.
  *
  * The fallback is `BINARY`, NOT the table key collation K — deliberately asymmetric
  * with {@link resolvePkKeyCollations}, whose fallback IS K. For a PK member the
@@ -240,10 +244,11 @@ export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
  * collation K for an undecorated text PK member. The secondary-index caller
  * ({@link indexLeadingRangeIsOrderSafe}) usually passes the same name on both sides — index
  * key bytes encode under the index column's own effective collation, which is what the scan
- * residual re-compares under — so for a plain `text` column it reduces to the
+ * residual re-compares under — so for a `text` or `any` column it reduces to the
  * `orderPreserving` assertion alone. The one index shape where the two sides still differ is
- * a text-capable-but-not-`isTextual` column (`any`) carrying a declared COLLATE: its key
- * bytes are hard-`BINARY` while its residual compares under the declared name, and this
+ * a collation-blind column (`json`, the temporal types) under an index column carrying an
+ * explicit non-BINARY COLLATE (index DDL does not type-gate the way column DDL does): its
+ * key bytes are hard-`BINARY` while its residual compares under the declared name, and this
  * predicate correctly declines it.
  */
 export function keyOrderMatchesCollation(
@@ -274,10 +279,10 @@ export function keyOrderMatchesCollation(
  * decided the residual Filter could be dropped, so it is the order/equality a byte window
  * over that position has to reproduce.
  *
- * NOTE: this duplicates {@link resolveIndexKeyCollations}' textual branch — same three-step
- * fallback, same BINARY default — which is why both gates below admit every `text` column.
- * Change either fallback without the other and the gates start declining (or, worse,
- * admitting) shapes nobody intended; keep the two in step.
+ * NOTE: this duplicates {@link resolveIndexKeyCollations}' collation-aware branch — same
+ * three-step fallback, same BINARY default — which is why both gates below admit every
+ * `text` and `any` column. Change either fallback without the other and the gates start
+ * declining (or, worse, admitting) shapes nobody intended; keep the two in step.
  */
 function indexResidualCollation(
 	columns: ReadonlyArray<ColumnSchema>,
@@ -298,14 +303,16 @@ function indexResidualCollation(
  * position's key bytes are ACTUALLY encoded under. The window equals the qualifying set iff
  * that agrees, per position, with {@link indexResidualCollation}.
  *
- * For a `text` column the two agree by construction — both resolve to the index `COLLATE`
- * else the declared collation else BINARY — so the common case admits, including the
- * `text` column of a table whose key collation K is something else entirely. The shape that
- * does NOT agree is a text-capable-but-not-`isTextual` column (`any`, `json`, the temporal
- * types) carrying a declared COLLATE: `pkKeyCollationName` keys those hard-`BINARY` while
- * the residual still compares under the declared name, so a `where x = 'BOB'` window over an
- * `x any collate nocase` index would be byte-equal only and miss the committed `'Bob'` the
- * residual admits. Never-text columns are exempt — their key bytes are type-native.
+ * For a `text` or `any` column the two agree by construction — both resolve to the index
+ * `COLLATE` else the declared collation else BINARY — so those admit, including the
+ * `text` column of a table whose key collation K is something else entirely, and an
+ * `x any collate nocase` index column (whose window is now genuinely the NOCASE-equal
+ * set — ANY's `compare` honors the collation, so key bytes, residual, and enforcement
+ * all agree). The shape that does NOT agree is a collation-blind column (`json`, the
+ * temporal types) under an index column carrying an explicit non-BINARY COLLATE:
+ * `pkKeyCollationName` keys those hard-`BINARY` while the residual still compares under
+ * the declared name, so the window would be byte-equal only and miss rows the residual
+ * admits — declined. Never-text columns are exempt — their key bytes are type-native.
  */
 export function indexPrefixSeekIsCollationExact(
 	columns: ReadonlyArray<ColumnSchema>,
@@ -385,13 +392,6 @@ export function pkOrderPreservingPrefixLength(
 	while (n < pk.length) {
 		const col = schema.columns[pk[n].index];
 		const keyCollation = pkKeyCollations[n] ?? tableKeyCollation;
-		// NOTE: an explicit `k any collate nocase` PK declines its seek here — the key
-		// collation is BINARY (what ANY_TYPE.compare actually uses) while `col.collation` is
-		// the declared-but-ignored NOCASE, so the two sides differ and the gate closes. Both
-		// sides genuinely compare under BINARY, so the decline is conservative: it costs the
-		// seek, never a row. If that declaration ever shows up in practice, resolve the
-		// comparison collation the way `resolvePkKeyCollations` resolves the key collation
-		// rather than widening the gate.
 		if (!keyOrderMatchesCollation(db, col, keyCollation, col?.collation ?? 'BINARY')) break;
 		n++;
 	}

@@ -981,9 +981,11 @@ describe('Isolated Store Module', () => {
 			expect(rows.map(r => r.id)).to.deep.equal([1, 3]);
 		});
 
-		it('an ANY column with a declared COLLATE declines the seek and still catches the collision', async () => {
-			// `any` keys hard-BINARY while the merged check enforces under the declared
-			// NOCASE, so `canSeekForConstraint` must keep full-scanning this shape.
+		it('an ANY column with a declared COLLATE seeks and still catches the collision', async () => {
+			// `any` keys under its declared NOCASE now (any-type-compare-honors-collation
+			// made ANY_TYPE.compare honor the handed collation), which is also the
+			// collation the merged check enforces under — so `canSeekForConstraint`
+			// admits the seek, and the seek window must still hold the case variant.
 			await db.exec(`CREATE TABLE au (id INTEGER PRIMARY KEY, email ANY COLLATE NOCASE NOT NULL) USING store`);
 			await db.exec(`CREATE UNIQUE INDEX au_email ON au (email)`);
 			await db.exec(`INSERT INTO au VALUES (1, 'b@x')`);
@@ -992,7 +994,7 @@ describe('Isolated Store Module', () => {
 			let err: Error | null = null;
 			try { await db.exec(`INSERT INTO au VALUES (2, 'B@X')`); } catch (e) { err = e as Error; }
 			await db.exec('ROLLBACK');
-			expect(err?.message ?? '', 'the full-scan fallback must find the committed case variant')
+			expect(err?.message ?? '', 'the seek must find the committed case variant')
 				.to.match(/UNIQUE constraint failed/i);
 		});
 

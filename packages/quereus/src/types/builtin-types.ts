@@ -128,6 +128,7 @@ export const TEXT_TYPE: LogicalType = {
 	name: 'TEXT',
 	physicalType: PhysicalType.TEXT,
 	isTextual: true,
+	collationAware: true,
 	supportedCollations: ['BINARY', 'NOCASE', 'RTRIM'],
 
 	validate: (v) => {
@@ -320,12 +321,17 @@ export const NUMERIC_TYPE: LogicalType = {
 export const ANY_TYPE: LogicalType = {
 	name: 'ANY',
 	physicalType: PhysicalType.NULL,
+	collationAware: true,
 
 	validate: () => true, // Accept any value
 
 	parse: (v) => v, // No conversion, store as-is
 
-	compare: (a, b) => compareSqlValuesFast(a, b, BINARY_COLLATION),
+	// `compareSqlValuesFast` consults the collation only for a TEXT/TEXT pair and
+	// ranks mixed storage classes by class, so honoring the handed collation is
+	// total over ANY's whole value space — declared-key BTrees (memory PK/index)
+	// agree with the generic operator path on a `v any collate nocase` column.
+	compare: (a, b, collation) => compareSqlValuesFast(a, b, collation ?? BINARY_COLLATION),
 };
 
 /**

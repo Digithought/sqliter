@@ -746,10 +746,10 @@ now asks, per constrained column:
 - never-text (`integer`, `real`, `blob`) → seekable; key bytes are type-native.
 - enforcement collation BINARY → seekable; BINARY equality is byte identity.
 - otherwise seekable only when a key-encoding backend keys the column under that same
-  collation — `pkKeyCollationName`'s answer. A `text` column does (seekable); a
-  text-capable-but-not-`text` column (`any`, `json`, the temporal types) keys
-  hard-`BINARY` while the check still compares under the declared name, so it is **not**
-  seekable and keeps full-scanning.
+  collation — `pkKeyCollationName`'s answer. A collation-aware column (`text`, `any` —
+  `compare` honors the handed collation) does (seekable); a collation-blind text-capable
+  column (`json`, the temporal types) keys hard-`BINARY` while the check still compares
+  under the declared name, so it is **not** seekable and keeps full-scanning.
 
 Equality is all the seek needs — order preservation is a range concern and no range is
 built here (`makeSecondaryIndexEqSeekFilter` emits one EQ per key column), so a custom
@@ -773,9 +773,9 @@ PK that has a tombstone in the overlay.
 
 - Non-PK UNIQUE checks over an index-derived constraint seek the backing index
   (O(log n) + overlay scan) rather than scanning the underlying, collated or not; a
-  table-level `unique(...)` with no backing index, or one over an `any` / `json` /
-  temporal column carrying a declared `COLLATE`, still does the O(n) full scan (see
-  `canSeekForConstraint`). The overlay's own
+  table-level `unique(...)` with no backing index, or one over a collation-blind
+  (`json` / temporal) column enforced under a non-BINARY collation, still does the
+  O(n) full scan (see `canSeekForConstraint`). The overlay's own
   UNIQUE enforcement covers overlay-only conflicts; the merged-view search fills the
   underlying-only gap. Phase 1 always scans the (small) overlay in full.
 - Same-PK REPLACE returns null instead of carrying the replaced row back to

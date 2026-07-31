@@ -227,7 +227,9 @@ describe('Astral text keys order identically in the store and in memory', () => 
 	describe('an `any` primary key holding JSON', () => {
 		// `encodeObject` writes the canonical JSON string as UTF-8, and `compareSameType`'s
 		// OBJECT-class branch compares that same string — by code point, so the two agree.
-		// An `any` member keys under hard-coded BINARY (see `any-json-pk-binary-key.spec.ts`).
+		// An undecorated `any` member keys under BINARY (see `any-json-pk-binary-key.spec.ts`);
+		// collation would not touch OBJECT-class values regardless — only TEXT/TEXT pairs
+		// consult it.
 		const ddl = (name: string, using: string) =>
 			`create table ${name} (k any primary key) ${using}`;
 

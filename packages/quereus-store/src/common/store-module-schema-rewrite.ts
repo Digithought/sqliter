@@ -48,6 +48,14 @@ export function reconcilePkCollations(
 		if (!pkIndices.has(idx)) return col;
 		// Collation governs key bytes only for text; non-text PK columns (integer,
 		// real, blob, …) are encoded type-natively and keep their declared collation.
+		// Deliberately `isTextual`, NOT `collationAware`: `any` now keys (and
+		// compares) under its declared collation, but an undecorated `any` PK's
+		// declared collation is always BINARY — `resolveDefaultCollation` never
+		// applies a non-BINARY default to ANY, which declares no supported-collation
+		// list — and rewriting it to K here would silently flip that shape's
+		// comparison semantics store-side only, diverging from the memory backend
+		// for no compatibility gain (the historical K-default covers text PKs, not
+		// `any`). Only `text` takes the rewrite.
 		if (!col.logicalType.isTextual) return col;
 		// An EXPLICIT collation is honored as-declared — the per-column key encoding
 		// keys the column under it (Option B physical re-key parity with memory).

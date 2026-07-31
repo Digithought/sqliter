@@ -36,7 +36,7 @@ import type { InNode } from '../nodes/subquery.js';
 import type * as AST from '../../parser/ast.js';
 import type { ScalarType, CollationSource } from '../../common/datatype.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { normalizeCollationName } from '../../util/comparison.js';
+import { isCollationAware, normalizeCollationName } from '../../util/comparison.js';
 import { PhysicalType } from '../../types/logical-type.js';
 import { collectCollateNames, collectColumnNames, columnIndexFromExpr } from './predicate-shape.js';
 import { QuereusError } from '../../common/errors.js';
@@ -372,17 +372,19 @@ export function logicalTypeCanHoldText(logicalType: LogicalType | undefined): bo
  * column, or `undefined` when the column can never hold text (a key normalizer only
  * ever touches string values, so collation is moot there).
  *
- * A text-capable-but-not-`isTextual` column — `any`, `json`, the temporal types — gets
- * hard-coded `'BINARY'` regardless of its declared collation: PK equality compares
- * through `logicalType.compare` (`createTypedComparator`), which ignores the collation
- * it is handed for every one of those types (ANY and the temporals compare under
- * BINARY_COLLATION; JSON structurally). Keying such a column under its declared
- * collation — say `k any collate nocase` — would bucket `'A'` and `'a'` together even
- * though the comparator that actually orders/equates primary keys treats them as
- * distinct, silently merging two rows into one.
+ * A collation-aware column (`text`, `any` — the types whose `compare` applies the
+ * collation it is handed, see `LogicalType.collationAware`) keys under its own
+ * declared collation: that is the collation `createTypedComparator` orders/equates
+ * primary keys under, so the key bytes and the comparator agree.
  *
- * Only `isTextual` columns (`text`) apply their own declared collation, since
- * `TEXT_TYPE.compare` is the one comparator that honors it.
+ * A text-capable-but-collation-blind column — `json`, the temporal types — gets
+ * hard-coded `'BINARY'` regardless of any declared collation: those types' `compare`
+ * ignores the collation argument (the temporals compare under BINARY_COLLATION; JSON
+ * structurally), so keying such a column under a non-BINARY collation would bucket
+ * `'A'` and `'a'` together even though the comparator that actually orders/equates
+ * primary keys treats them as distinct, silently merging two rows into one. (Those
+ * types also declare `supportedCollations: []`, so DDL rejects a non-BINARY COLLATE
+ * on them anyway — the hard-coding is a backstop, not the primary gate.)
  *
  * Mirrors {@link resolvePkKeyCollations} in `quereus-store`, which makes the identical
  * decision for the store's on-disk PK key encoding; the isolation overlay's modified-PK
@@ -392,7 +394,14 @@ export function pkKeyCollationName(
 	column: { logicalType: LogicalType; collation?: string } | undefined
 ): string | undefined {
 	if (!column || !logicalTypeCanHoldText(column.logicalType)) return undefined;
-	return column.logicalType.isTextual ? column.collation : 'BINARY';
+	// NOTE: a collation-aware column with `collation` UNSET returns undefined here,
+	// which the store's resolvePkKeyCollations reads as "fall back to the table key
+	// collation K" — correct for `text` (the K-reconcile makes K the declared
+	// collation for text PK members) but wrong for `any`, which compares BINARY when
+	// undeclared. Unreachable from a real ColumnSchema (columnDefToSchema always
+	// resolves a collation, BINARY floor); if a schema-stub caller ever hands an
+	// `any` column without one, default it to 'BINARY' here.
+	return isCollationAware(column.logicalType) ? column.collation : 'BINARY';
 }
 
 /** True when a value of this type could be a text string at runtime. Absent type ⇒ unknown ⇒ yes. */

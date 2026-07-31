@@ -266,8 +266,19 @@ Today the flag is set on **TIMESPAN** (elapsed-time order) and **JSON** (structu
 order). DATE/TIME/DATETIME need no flag: their canonical ISO text order *is* their
 semantic order, so the cheaper storage-class compare is already correct. ANY and
 untyped expressions have no semantic-ordering type and keep storage-class +
-collation ordering (their declared `compare` is a BINARY fallback that ignores
-collation, which is why the flag — not mere presence of `compare` — gates routing).
+collation ordering (their declared `compare` reproduces exactly that ordering, which
+is why the flag — not mere presence of `compare` — gates routing).
+
+A sibling flag, `collationAware: true`, marks the types whose `compare` **applies the
+collation function it is handed** — TEXT and ANY. It drives the opposite decision
+from `semanticOrdering`: not "route comparisons through `compare`" but "key declared
+structures under the column's collation". A key structure built over a column
+(memory PK/index BTrees via `createTypedComparator`, the persistent store's key
+bytes, the isolation overlay's shadow keys — resolved through `pkKeyCollationName`)
+keys a collation-aware column under its declared COLLATE, so `k any collate nocase`
+enforces and orders case-insensitively everywhere; a collation-blind type (JSON, the
+temporals — their `compare` ignores the argument) keys hard-BINARY regardless.
+Creating an index therefore never changes a query's answer for either kind.
 
 The flag keys on the **declared** logical type of the column/expression, not the
 runtime value: an ANY column holding a duration-shaped string still orders as text.
@@ -392,8 +403,9 @@ there and is not.
 UNIQUE enforcement collapses the same identity on **every** backend. A constrained
 column whose declared type carries semantic ordering is compared through that type's
 `compare`; every other column keeps the storage-class + collation comparison (a
-TEXT/ANY column's declared `compare` is not collation-aware, so consulting it would
-break NOCASE/RTRIM enforcement — the `hasSemanticOrdering` flag is the gate). The
+TEXT/ANY column's declared `compare` honors the collation it is handed —
+`collationAware` — and is equivalent to the generic path, so the cheaper generic
+comparator is used; the `hasSemanticOrdering` flag is the gate). The
 per-column comparators are built once per constraint check by the shared
 `uniqueEnforcementComparators` (`schema/unique-enforcement.ts`), which the memory
 backend's three re-validators, the persistent store's finders, the isolation

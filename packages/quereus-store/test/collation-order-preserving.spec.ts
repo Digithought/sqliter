@@ -229,12 +229,13 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			expect(await planOps(db, q)).to.match(SEEK);
 		});
 
-		it('keeps the PK RANGE seek on an `any` PK, whose bytes now key under BINARY', async () => {
-			// `resolvePkKeyCollations` keys an ANY member under hard-coded BINARY — the collation
-			// `ANY_TYPE.compare` actually uses — rather than falling back to K = NOCASE. Key
-			// bytes and comparison agree, so the byte window is sound: 'B' (0x42) < 'aa' (0x61…)
-			// both ways. The encoder's type tags also order NULL < NUMERIC < TEXT < BLOB < OBJECT,
-			// matching the engine's storage-class order.
+		it('keeps the PK RANGE seek on an undecorated `any` PK, whose bytes key under BINARY', async () => {
+			// `resolvePkKeyCollations` keys an undecorated ANY member under its declared
+			// BINARY (the session default never applies a non-BINARY collation to ANY) —
+			// rather than falling back to K = NOCASE. Key bytes and comparison agree, so
+			// the byte window is sound: 'B' (0x42) < 'aa' (0x61…) both ways. The encoder's
+			// type tags also order NULL < NUMERIC < TEXT < BLOB < OBJECT, matching the
+			// engine's storage-class order.
 			await db.exec(`create table t (k any primary key, v text) using store`);
 			await db.exec(`insert into t values ('aa', 'one'), ('B', 'two')`);
 
@@ -350,14 +351,14 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			expect(await planOps(db, `select id from t where v > 'ab'`), 'assertion ⇒ seek').to.match(SEEK);
 		});
 
-		it('declines BOTH arms on an `any` column carrying a declared COLLATE', async () => {
-			// `any` keys hard-BINARY (the collation `ANY_TYPE.compare` uses) while the scan
-			// residual re-compares under the declared NOCASE, so neither a byte-equality nor
-			// a byte-range window is the qualifying set. The oracle here is the store's OWN
-			// answer before the index exists: creating an index must not change a query's
-			// result. (The memory backend is NOT the oracle for this shape — it answers
-			// `v = 'BOB'` as `[1]` unindexed and `[]` indexed, i.e. its own index seek
-			// changes the answer. Tracked as fix/any-collate-index-changes-query-answer.)
+		it('admits BOTH arms on an `any` column carrying a declared COLLATE', async () => {
+			// `ANY_TYPE.compare` honors the collation it is handed
+			// (any-type-compare-honors-collation), so an `any collate nocase` column keys
+			// under NOCASE — the same collation the scan residual re-compares under — and
+			// both the byte-equality and the byte-range window are exactly the qualifying
+			// set. The oracle is still the store's OWN answer before the index exists:
+			// creating an index must not change a query's result (and the memory backend
+			// now agrees on this shape too).
 			const eq = `select id from t where v = 'BOB' order by id`;
 			const gt = `select id from t where v > 'a' order by id`;
 			await db.exec(`create table t (id integer primary key, v any collate nocase) using store`);
@@ -369,8 +370,8 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			await db.exec(`create index ix_t on t (v)`);
 			expect(await column(db, eq, 'id'), 'the index must not change the answer').to.deep.equal(eqUnindexed);
 			expect(await column(db, gt, 'id'), 'the index must not change the answer').to.deep.equal(gtUnindexed);
-			expect(await planOps(db, eq), 'EQ declined').to.not.match(SEEK);
-			expect(await planOps(db, gt), 'range declined').to.not.match(SEEK);
+			expect(await planOps(db, eq), 'EQ seeks — key and residual collation agree').to.match(SEEK);
+			expect(await planOps(db, gt), 'range seeks — NOCASE is order-preserving').to.match(SEEK);
 		});
 
 		it('leaves a TIMESPAN index column alone — still no range seek, still correct', async () => {

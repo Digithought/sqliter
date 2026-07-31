@@ -70,6 +70,13 @@ export interface LogicalType {
 	/** Type-specific comparison function */
 	compare?(a: SqlValue, b: SqlValue, collation?: CollationFunction): number;
 	/**
+	 * True when {@link compare} actually applies the collation function it is handed
+	 * (TEXT, ANY). When unset, the type's compare is collation-blind, so a key
+	 * structure over such a column must be keyed under BINARY regardless of the
+	 * column's declared COLLATE — see `pkKeyCollationName`.
+	 */
+	collationAware?: boolean;
+	/**
 	 * True when {@link compare} defines an order that OBSERVABLY differs from
 	 * storage-class + collation ordering of the stored representation (e.g. TIMESPAN
 	 * orders by elapsed time, JSON by structural deep-compare — not by their text).

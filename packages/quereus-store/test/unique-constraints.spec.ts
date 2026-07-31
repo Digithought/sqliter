@@ -803,9 +803,12 @@ describe('StoreTable UNIQUE constraints', () => {
 
 		// Collation guard: index-column bytes are encoded under the index column's OWN key
 		// collation and the constraint re-validates under its enforcement collation C. The
-		// guard admits the seek only when the two agree; where they cannot (an `any` / `json`
-		// column keys hard-BINARY while C is its declared COLLATE) a seek would UNDER-fetch,
-		// so the constraint falls back to the full scan or a real duplicate is admitted.
+		// guard admits the seek only when the two agree — which since
+		// any-type-compare-honors-collation includes `any` (its `compare` honors the handed
+		// collation, so it keys under its declared COLLATE like `text`). Where they cannot
+		// agree (a collation-blind `json` / temporal column keys hard-BINARY while C is a
+		// declared non-BINARY name) a seek would UNDER-fetch, so the constraint falls back
+		// to the full scan or a real duplicate is admitted.
 		// The table key collation K is not part of this decision — the `collation = 'BINARY'`
 		// module option below is now incidental to each case, kept so the shapes still differ.
 		//
@@ -845,12 +848,12 @@ describe('StoreTable UNIQUE constraints', () => {
 				expect(await collect(db, `SELECT count(*) AS n FROM gn`)).to.deep.equal([{ n: 1 }]);
 			});
 
-			it('an ANY column with a declared COLLATE falls back to the full scan', async () => {
+			it('an ANY column with a declared COLLATE seeks (key bytes are NOCASE too) and rejects the dup', async () => {
 				// ANY carries no `isTextual` marker and a NULL physicalType, but its `parse`
-				// is the identity — it stores text as text. Exempting it as "non-text" would
-				// skip the guard and admit the dup. Its key bytes are hard-BINARY (what
-				// `ANY_TYPE.compare` uses) while C is the declared NOCASE, so the two cannot
-				// agree and this is the shape that still declines.
+				// is the identity — it stores text as text. `ANY_TYPE.compare` honors the
+				// collation it is handed (any-type-compare-honors-collation), so the index
+				// key bytes encode under the declared NOCASE — the same collation C the
+				// check enforces under — and 'Bob'/'BOB' share one seek window.
 				await db.exec(`CREATE TABLE ga (id INTEGER PRIMARY KEY, x ANY COLLATE NOCASE) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX ga_x ON ga (x)`);
 				await db.exec(`INSERT INTO ga VALUES (1, 'Bob')`);

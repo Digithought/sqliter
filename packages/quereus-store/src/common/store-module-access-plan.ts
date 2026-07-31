@@ -274,8 +274,10 @@ export function computeBestAccessPlan(
  * collation K at all, which is why this function never sees it:
  *
  *  - EQUALITY — {@link indexPrefixSeekIsCollationExact}: agreement makes the window
- *    EXACTLY the qualifying set. A plain `text` column always agrees; an `any` column
- *    carrying a declared COLLATE does not (its key bytes are hard-BINARY) and declines.
+ *    EXACTLY the qualifying set. A `text` or `any` column always agrees (both key under
+ *    the same resolution the residual uses); a collation-blind column (`json`, the
+ *    temporal types) under an index column with an explicit non-BINARY COLLATE does not
+ *    (its key bytes are hard-BINARY) and declines.
  *  - RANGE — {@link indexLeadingRangeIsOrderSafe}: the same agreement PLUS the collation's
  *    `orderPreserving` assertion, because a byte window also equates memcmp of the key
  *    bytes with the residual comparator's order.

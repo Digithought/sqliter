@@ -125,11 +125,12 @@ describe('secondary-index key bytes encode under the index column collation, not
 				.to.deep.equal(['BINARY']);
 		});
 
-		it('a never-text column resolves undefined; a text-capable non-textual one pins BINARY', () => {
-			// `v any collate nocase`: the declared NOCASE is inert — ANY compares through
-			// its own `compare`, which ignores collation, so the key must be BINARY.
+		it('a never-text column resolves undefined; an `any` column keys under its declared collation', () => {
+			// `v any collate nocase`: ANY_TYPE.compare honors the collation it is handed
+			// (any-type-compare-honors-collation), so the key encodes under the declared
+			// NOCASE — the same collation the residual and UNIQUE enforcement compare under.
 			expect(resolveIndexKeyCollations(index([{ index: 2 }, { index: 3 }]), columns))
-				.to.deep.equal([undefined, 'BINARY']);
+				.to.deep.equal([undefined, 'NOCASE']);
 		});
 	});
 

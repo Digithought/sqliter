@@ -424,16 +424,12 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 					.to.not.match(/plan=5/);
 			});
 
-			it('an `any` column with a declared COLLATE declines (key bytes are hard-BINARY)', async () => {
-				// The one index shape whose key bytes and residual comparison still disagree:
-				// `any` keys under BINARY (what `ANY_TYPE.compare` uses) while the residual
-				// compares under the declared NOCASE, so a byte-equality window would DROP
-				// rows the probe could never resurrect. Cost-only ⇒ no index claimed ⇒ the
-				// rule declines and the hash semi join returns the right answer.
-				//
-				// (A `text collate nocase` column here does NOT decline any more: since
-				// store-index-collation-guard-collapse its index bytes encode under NOCASE
-				// whatever the table key collation is, so the window is exact.)
+			it('an `any` column with a declared COLLATE multi-seeks, and the answer is unchanged', async () => {
+				// `ANY_TYPE.compare` honors the collation it is handed
+				// (any-type-compare-honors-collation), so an `any collate nocase` index keys
+				// under NOCASE — the same collation the residual and the join probe compare
+				// under — and the multi-seek window is exactly the qualifying set, like the
+				// `text collate nocase` arm below.
 				await db.exec(`create table cif (pk integer primary key, s any collate nocase) using store`);
 				await db.exec(`create index ix_cif on cif (s)`);
 				await db.exec(`create table cifsrc (id integer primary key, s any collate nocase) using store`);
@@ -441,10 +437,10 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				await db.exec(`insert into cifsrc values (1, 'alpha'), (2, 'gamma')`);
 
 				const q = `select pk from cif where s in (select s from cifsrc)`;
-				expect(await planOps(q), 'the rule declined').to.not.match(/KEYSETSEMIJOIN/);
+				expect(await planOps(q), 'the rule fires').to.match(/KEYSETSEMIJOIN/);
 				mod.reset();
 				expect(await pks(q), 'NOCASE equality still matches both rows').to.deep.equal([1, 3]);
-				expect(mod.seen('cif')[0] ?? '').to.not.match(/plan=5/);
+				expect(mod.seen('cif')[0], 'served as a multi-seek').to.match(/plan=5/);
 			});
 
 			it('a NOCASE column of a K=BINARY store now SEEKS, and the answer is unchanged', async () => {

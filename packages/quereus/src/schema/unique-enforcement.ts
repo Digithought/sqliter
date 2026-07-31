@@ -127,8 +127,10 @@ export function resolveUniqueEnforcementCollations(
  * PK member still names the same row.
  *
  * Only semantic-ordering types are routed through `compare` ({@link hasSemanticOrdering}
- * is the gate): a TEXT/ANY column's declared `compare` is not collation-aware, so
- * consulting it would break NOCASE/RTRIM enforcement.
+ * is the gate): a TEXT/ANY column's declared `compare` honors the collation it is
+ * handed and is equivalent to the generic storage-class + collation path, so the
+ * cheaper generic comparator is used for them — only types whose order genuinely
+ * diverges from that path need their own `compare` consulted.
  *
  * Takes PRE-RESOLVED collations rather than `(schema, uc, resolver)` because the call
  * sites do not share one collation resolution. Memory's `checkUniqueViaIndex`

@@ -14,6 +14,7 @@ import {
 	ANY_TYPE,
 	BUILTIN_NORMALIZERS,
 	INTEGER_TYPE,
+	JSON_TYPE,
 	TEXT_TYPE,
 	TIMESPAN_TYPE,
 	makePkIdentitySerializer,
@@ -52,9 +53,15 @@ describe('pk row identity (resolvePkIdentityKeying / makePkIdentitySerializer)',
 			expect(asked).to.deep.equal(['NOCASE']);
 		});
 
-		it('uses BINARY for a text-capable but non-textual column', () => {
+		it("uses an `any` column's own declared collation (its compare honors it)", () => {
 			const { resolve, asked } = recordingResolver();
 			resolvePkIdentityKeying(singlePkTable({ logicalType: ANY_TYPE, collation: 'NOCASE' }), resolve);
+			expect(asked).to.deep.equal(['NOCASE']);
+		});
+
+		it('uses BINARY for a collation-blind text-capable column (JSON)', () => {
+			const { resolve, asked } = recordingResolver();
+			resolvePkIdentityKeying(singlePkTable({ logicalType: JSON_TYPE, collation: 'NOCASE' }), resolve);
 			expect(asked).to.deep.equal(['BINARY']);
 		});
 

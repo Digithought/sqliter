@@ -288,8 +288,9 @@ function compareSameType(a: SqlValue, b: SqlValue, storageClass: StorageClass, c
 		case StorageClass.OBJECT: {
 			// Compare JSON objects by their canonical stringified representation, by code
 			// point — the store's `encodeObject` writes that same canonical string as UTF-8,
-			// so this must be the memcmp order of those bytes (an `any` primary key keys
-			// under BINARY and advertises byte order).
+			// so this must be the memcmp order of those bytes. Collation never applies to
+			// OBJECT-class values (only the TEXT/TEXT branch consults it), so an `any`
+			// primary key's object-valued members order identically under any collation.
 			const strA = objectCanonicalString(a as object);
 			const strB = objectCanonicalString(b as object);
 			return compareCodePoints(strA, strB);
@@ -502,6 +503,18 @@ export function hasSemanticOrdering(type: LogicalType | undefined): type is Logi
 }
 
 /**
+ * True when a logical type's `compare` applies the collation function it is handed
+ * (see {@link LogicalType.collationAware} — TEXT and ANY). A declared-key structure
+ * (memory PK/index BTree, the store's key encoding, the isolation overlay's shadow
+ * keys) over a column of such a type must key under the column's declared collation;
+ * over a collation-blind type it must key under BINARY, or the key order/identity
+ * diverges from the comparator that actually orders the structure.
+ */
+export function isCollationAware(type: LogicalType | undefined): boolean {
+	return type?.collationAware === true;
+}
+
+/**
  * True when two logical types order values differently — i.e. the comparators
  * {@link createTypedComparator} builds for them are not interchangeable, so any structure
  * keyed by one has to be re-sorted (and its uniqueness re-judged) to move to the other.
@@ -525,7 +538,9 @@ export function hasSemanticOrdering(type: LogicalType | undefined): type is Logi
  * NOTE: deliberately conservative — it answers "may the order move", not "does it". The
  * DATE / TIME / DATETIME family compares exactly as BINARY text does, so under the only
  * collation those types legally accept (BINARY — `supportedCollations: []`) a `text → date`
- * retype re-sorts every structure into the order it was already in. Harmless but O(rows);
+ * retype re-sorts every structure into the order it was already in. `text ↔ any` is
+ * over-reported the same way: both types' `compare` honor the handed collation, so over
+ * all-text data a retype between them re-sorts into the same order. Harmless but O(rows);
  * if a retype on a large table ever shows up as slow, narrow the predicate to a probe of the
  * two comparators over a representative value set, or special-case the BINARY-equivalent
  * comparators by identity.
@@ -651,8 +666,10 @@ export function createSemanticValueComparator(
  * keep the storage-class + collation comparison of
  * {@link createCollationRowComparator}. This makes row identity agree with `=`
  * (e.g. TIMESPAN 'PT1H' ≡ 'PT60M' collapses) without perturbing collation-aware
- * text identity on ANY/TEXT columns, whose declared `compare` is not
- * collation-aware and must not be consulted here.
+ * text identity on ANY/TEXT columns: those types' `compare` now honors the handed
+ * collation (see {@link isCollationAware}) and is equivalent to the generic
+ * storage-class + collation path, so routing them through the cheaper generic
+ * comparator changes nothing.
  *
  * Per-column routing is {@link createSemanticValueComparator}.
  */

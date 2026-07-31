@@ -248,18 +248,18 @@ describe('StoreModule runtime-valued IN sets (feat-runtime-key-set-protocol)', (
 			expect(result.explains).to.match(/semantic-ordering seek column cannot multi-seek/);
 		});
 
-		it('declines an `any` column with a declared COLLATE (key bytes are hard-BINARY)', async () => {
-			// `any` keys under BINARY — the collation `ANY_TYPE.compare` uses — while the
-			// scan residual compares under the declared NOCASE, so a byte-equality window is
-			// not the qualifying set and claiming the filter would drop rows. The one
-			// key-vs-comparison collation disagreement that survives
-			// store-index-collation-guard-collapse.
+		it('claims an `any` column with a declared COLLATE (key bytes encode under it)', async () => {
+			// `ANY_TYPE.compare` honors the collation it is handed
+			// (any-type-compare-honors-collation), so an `any collate nocase` index keys
+			// under NOCASE — the same collation the scan residual compares under — and the
+			// byte-equality window is exactly the qualifying set, like the `text collate
+			// nocase` arm below.
 			await db.exec('create table ct2 (id integer primary key, v any collate nocase) using store');
 			await db.exec('create index ix_v2 on ct2 (v)');
 			const result = plan('ct2', [runtimeSetFilter(1, 4)]);
-			expect(result.handledFilters).to.deep.equal([false]);
-			expect(result.seekColumnIndexes).to.be.undefined;
-			expect(result.explains).to.match(/index key collation differs from the comparison collation/);
+			expect(result.handledFilters).to.deep.equal([true]);
+			expect(result.seekColumnIndexes).to.deep.equal([1]);
+			expect(result.explains).to.match(/multi-seek\(4\)/);
 		});
 
 		it('no longer declines a NOCASE column just because the table key collation is BINARY', async () => {
