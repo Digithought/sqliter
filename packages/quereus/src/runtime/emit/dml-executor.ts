@@ -836,7 +836,10 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	 * `semanticOrdering` — DATE/TIME/DATETIME, whose `compare` is hard-wired to BINARY — if such
 	 * a column ever became able to declare a non-BINARY collation, which the DDL currently
 	 * refuses. If that changes, share one comparator factory instead: a disagreement here emits
-	 * one `update` for a row the substrate actually moved.
+	 * one `update` for a row the substrate actually moved. The same tripwire covers the STORE
+	 * substrate, which reaches this path whenever a store table is registered WITHOUT its own
+	 * emitter: it decides relocation from its encoded data key (`resolvePkKeyCollations`), a
+	 * third construction that folds the same per-column collation.
 	 */
 	function primaryKeyRelocated(oldRow: Row, newRow: Row): boolean {
 		return pkColumnIndicesInSchema.some(

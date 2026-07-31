@@ -591,6 +591,15 @@ export class TransactionManager {
 	 * Record an UPDATE operation. When the PK changes value, this is recorded
 	 * as a DELETE of the old PK followed by an INSERT of the new PK. Otherwise
 	 * it is recorded as a single UPDATE with both projections.
+	 *
+	 * NOTE: "changes value" here is `encodeKeyTuple` identity, which is value-based and
+	 * collation-BLIND — deliberately coarser than the data-event contract's relocation test
+	 * (`primaryKeyRelocated` in runtime/emit/dml-executor.ts), which asks the primary key's
+	 * own comparator. So a case-only rewrite under a `NOCASE` key splits here while the
+	 * `onDataChange` channel keeps it one in-place update. Harmless for this log's purpose —
+	 * it drives re-evaluation, and naming both key spellings is over-broad, never wrong. If a
+	 * consumer ever treats a change-log split as an assertion that the row MOVED, share the
+	 * comparator instead of the encoder.
 	 */
 	recordUpdate(baseTable: string, oldRow: Row, newRow: Row, pkIndices: readonly number[]): void {
 		const lower = baseTable.toLowerCase();

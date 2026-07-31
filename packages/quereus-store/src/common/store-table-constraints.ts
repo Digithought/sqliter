@@ -702,17 +702,12 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 		this.trackMutation(-1, inTransaction);
 
 		const schema = this.tableSchema!;
-		const deleteEvent = {
-			type: 'delete' as const,
+		this.emitOrQueueDataChange(inTransaction, {
+			type: 'delete',
 			schemaName: schema.schemaName,
 			tableName: schema.name,
 			key: pk,
 			oldRow,
-		};
-		if (inTransaction && this.coordinator) {
-			this.coordinator.queueEvent(deleteEvent);
-		} else {
-			this.eventEmitter?.emitDataChange(deleteEvent);
-		}
+		});
 	}
 }

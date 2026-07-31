@@ -180,5 +180,56 @@ for (const producer of producers) {
 				{ type: 'insert', key: [2], oldRow: undefined, newRow: [2, 5, 'x'] },
 			]);
 		});
+
+		it('a delete keys by its own oldRow', async () => {
+			// Clause 1's delete arm, on its own rather than as half of a split.
+			await db.exec('create table t (a integer not null, v text, primary key (a))');
+			await db.exec("insert into t values (1, 'x')");
+			events.length = 0;
+
+			await db.exec('delete from t where a = 1');
+
+			assert.deepEqual(events.map(shape), [
+				{ type: 'delete', key: [1], oldRow: [1, 'x'], newRow: undefined },
+			]);
+		});
+
+		it('a multi-row relocating update splits each row separately, in row order', async () => {
+			await db.exec('create table t (a integer not null, v text, primary key (a))');
+			await db.exec("insert into t values (1, 'x')");
+			await db.exec("insert into t values (2, 'y')");
+			events.length = 0;
+
+			await db.exec('update t set a = a + 10');
+
+			assert.deepEqual(events.map(shape), [
+				{ type: 'delete', key: [1], oldRow: [1, 'x'], newRow: undefined },
+				{ type: 'insert', key: [11], oldRow: undefined, newRow: [11, 'x'] },
+				{ type: 'delete', key: [2], oldRow: [2, 'y'], newRow: undefined },
+				{ type: 'insert', key: [12], oldRow: undefined, newRow: [12, 'y'] },
+			]);
+		});
+
+		it('an explicit transaction delivers every split in write order, uncoalesced', async () => {
+			// The contract promises ordering across the whole committed batch, not adjacency.
+			// Two relocations of the SAME row in one transaction are the sharpest form of that:
+			// the batch must not collapse `delete [2]` against the `insert [2]` before it, or a
+			// listener replaying it lands the row at the wrong key (or loses it entirely).
+			await db.exec('create table t (a integer not null, v text, primary key (a))');
+			await db.exec("insert into t values (1, 'x')");
+			events.length = 0;
+
+			await db.exec('begin');
+			await db.exec('update t set a = 2 where a = 1');
+			await db.exec('update t set a = 3 where a = 2');
+			await db.exec('commit');
+
+			assert.deepEqual(events.map(shape), [
+				{ type: 'delete', key: [1], oldRow: [1, 'x'], newRow: undefined },
+				{ type: 'insert', key: [2], oldRow: undefined, newRow: [2, 'x'] },
+				{ type: 'delete', key: [2], oldRow: [2, 'x'], newRow: undefined },
+				{ type: 'insert', key: [3], oldRow: undefined, newRow: [3, 'x'] },
+			]);
+		});
 	});
 }

@@ -397,6 +397,21 @@ non-transactional — see the declared-contract paragraph above); what the resha
 that the transaction's DML — including rows inserted before a savepoint — survives at the new
 arity.
 
+**A `PendingChange` records only row images — never a key.** The delivered `key` is projected
+out of the change's own image at commit (`newRow` for an insert or an update, `oldRow` for a
+delete) through the primary key of the schema current *at delivery* — `eventKeyFromImage` in
+`MemoryTableManager.commitTransaction`. That is the engine-wide event contract
+([usage § Subscribing to Data Changes](usage.md#subscribing-to-data-changes)) read as an
+implementation: keying at delivery rather than replaying each write's recorded key is what makes
+an in-place rewrite that changes a key column's *value* but not the row's identity (a `NOCASE`
+`'apple'` → `'APPLE'`, which `recordUpsert` files under the pre-image key) hand listeners the
+post-image the table actually holds. It also re-keys the log across a mid-transaction ALTER
+PRIMARY KEY for free — the images are already reshaped to the delivered schema, so projecting
+them through *that* schema's key IS the re-key, and `prepareRekeyedPrimaryKeyColumns` needs no
+event-log arm at all. Projection is best-effort like the image reshape below: an image the
+reshape had to leave at the retired arity ships the event with no `key`, and logs, rather than
+emitting an `undefined` key slot a listener would file a row under.
+
 **The pending-change *event log* is rewritten alongside the rows.** When change tracking is on
 (the module was given an emitter and a listener exists), each open layer also holds the
 `PendingChange` log its commit will emit; a mid-transaction column-set or value change must
@@ -424,8 +439,8 @@ for the pre-image was rejected — it makes `oldRow[new] === newRow[new]` always
 consumer (e.g. the sync engine's per-column versioning) would never record the added column —
 as was suppressing the pre-image, which silently turns updates into upserts.
 `rekeyPrimaryKey` (`SET COLLATE` on a PK column) deliberately leaves the log alone: a collation
-change moves only the comparator, never a stored value or key value, so the recorded images are
-still accurate. `RENAME COLUMN` needs nothing either — the log stores no column names, and
+change moves only the comparator, never a stored value, so the recorded images are still
+accurate — and the log records nothing but images. `RENAME COLUMN` needs nothing either — the log stores no column names, and
 `changedColumns` is derived from the images against `this.tableSchema` at *emit* time, so it
 already reads the post-rename name. Consolidation (`consolidateToBaseLayer`) clears the drained committed layers'
 logs — their events were delivered when those layers committed, and leaving them in place would

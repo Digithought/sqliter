@@ -452,36 +452,13 @@ export class StoreTable extends StoreTableConstraints {
 					this.trackMutation(+1, inTransaction);
 				}
 
-				// Queue or emit event
-				if (oldRow) {
-					// REPLACE — emit as update
-					const updateEvent = {
-						type: 'update' as const,
-						schemaName: schema.schemaName,
-						tableName: schema.name,
-						key: pk,
-						oldRow,
-						newRow: coerced,
-					};
-					if (inTransaction) {
-						coordinator.queueEvent(updateEvent);
-					} else {
-						this.eventEmitter?.emitDataChange(updateEvent);
-					}
-				} else {
-					const insertEvent = {
-						type: 'insert' as const,
-						schemaName: schema.schemaName,
-						tableName: schema.name,
-						key: pk,
-						newRow: coerced,
-					};
-					if (inTransaction) {
-						coordinator.queueEvent(insertEvent);
-					} else {
-						this.eventEmitter?.emitDataChange(insertEvent);
-					}
-				}
+				// Queue or emit event. A REPLACE at the SAME key is an in-place update, so
+				// it keeps the single `update` shape — the contract's split rule applies to
+				// a key change that MOVES the row, which this arm cannot produce.
+				const insertEventBase = { schemaName: schema.schemaName, tableName: schema.name, key: pk };
+				this.emitOrQueueDataChange(inTransaction, oldRow
+					? { ...insertEventBase, type: 'update', oldRow, newRow: coerced }
+					: { ...insertEventBase, type: 'insert', newRow: coerced });
 
 				return { status: 'ok', row: coerced, replacedRow: oldRow ?? undefined, evictedRows: evicted.length > 0 ? evicted : undefined };
 			}
@@ -609,19 +586,12 @@ export class StoreTable extends StoreTableConstraints {
 				// non-relocating update — by the POST-image `newPk`. Any `replacedAtNewPk`
 				// eviction already emitted its own delete above (deleteRowAt), so the delivered
 				// order is evict-delete, move-delete, move-insert.
-				const emitOrQueue = (event: DataChangeEvent): void => {
-					if (inTransaction) {
-						coordinator.queueEvent(event);
-					} else {
-						this.eventEmitter?.emitDataChange(event);
-					}
-				};
 				const eventBase = { schemaName: schema.schemaName, tableName: schema.name };
 				if (pkChanged) {
-					emitOrQueue({ ...eventBase, type: 'delete', key: oldPk, oldRow: oldRow || undefined });
-					emitOrQueue({ ...eventBase, type: 'insert', key: newPk, newRow: coerced });
+					this.emitOrQueueDataChange(inTransaction, { ...eventBase, type: 'delete', key: oldPk, oldRow: oldRow || undefined });
+					this.emitOrQueueDataChange(inTransaction, { ...eventBase, type: 'insert', key: newPk, newRow: coerced });
 				} else {
-					emitOrQueue({ ...eventBase, type: 'update', key: newPk, oldRow: oldRow || undefined, newRow: coerced });
+					this.emitOrQueueDataChange(inTransaction, { ...eventBase, type: 'update', key: newPk, oldRow: oldRow || undefined, newRow: coerced });
 				}
 
 				return { status: 'ok', row: coerced, replacedRow: replacedAtNewPk ?? undefined, evictedRows: evicted.length > 0 ? evicted : undefined };
@@ -655,18 +625,13 @@ export class StoreTable extends StoreTableConstraints {
 				}
 
 				// Queue or emit event
-				const deleteEvent = {
-					type: 'delete' as const,
+				this.emitOrQueueDataChange(inTransaction, {
+					type: 'delete',
 					schemaName: schema.schemaName,
 					tableName: schema.name,
 					key: pk,
 					oldRow: oldRow || undefined,
-				};
-				if (inTransaction) {
-					coordinator.queueEvent(deleteEvent);
-				} else {
-					this.eventEmitter?.emitDataChange(deleteEvent);
-				}
+				});
 
 				return { status: 'ok', row: oldRow || undefined };
 			}

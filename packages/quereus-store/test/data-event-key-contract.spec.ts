@@ -167,4 +167,108 @@ describe('data-change event key contract — store module', () => {
 			{ type: 'insert', key: [2], oldRow: undefined, newRow: [2, 5, 'x'] },
 		]);
 	});
+
+	it('a delete keys by its own oldRow', async () => {
+		await db.exec('create table t (a integer not null, v text, primary key (a)) using store');
+		await db.exec("insert into t values (1, 'x')");
+		events.length = 0;
+
+		await db.exec('delete from t where a = 1');
+
+		assert.deepEqual(events.map(shape), [
+			{ type: 'delete', key: [1], oldRow: [1, 'x'], newRow: undefined },
+		]);
+	});
+
+	it('a multi-row relocating update splits each row separately, in row order', async () => {
+		await db.exec('create table t (a integer not null, v text, primary key (a)) using store');
+		await db.exec("insert into t values (1, 'x')");
+		await db.exec("insert into t values (2, 'y')");
+		events.length = 0;
+
+		await db.exec('update t set a = a + 10');
+
+		assert.deepEqual(events.map(shape), [
+			{ type: 'delete', key: [1], oldRow: [1, 'x'], newRow: undefined },
+			{ type: 'insert', key: [11], oldRow: undefined, newRow: [11, 'x'] },
+			{ type: 'delete', key: [2], oldRow: [2, 'y'], newRow: undefined },
+			{ type: 'insert', key: [12], oldRow: undefined, newRow: [12, 'y'] },
+		]);
+	});
+
+	it('an explicit transaction delivers every split in write order, uncoalesced', async () => {
+		// The store queues events into the coordinator and flushes them at commit, so two
+		// relocations of the SAME row in one transaction are the sharpest check that the
+		// queue preserves order and never collapses `delete [2]` against the `insert [2]`
+		// that preceded it.
+		await db.exec('create table t (a integer not null, v text, primary key (a)) using store');
+		await db.exec("insert into t values (1, 'x')");
+		events.length = 0;
+
+		await db.exec('begin');
+		await db.exec('update t set a = 2 where a = 1');
+		await db.exec('update t set a = 3 where a = 2');
+		await db.exec('commit');
+
+		assert.deepEqual(events.map(shape), [
+			{ type: 'delete', key: [1], oldRow: [1, 'x'], newRow: undefined },
+			{ type: 'insert', key: [2], oldRow: undefined, newRow: [2, 'x'] },
+			{ type: 'delete', key: [2], oldRow: [2, 'x'], newRow: undefined },
+			{ type: 'insert', key: [3], oldRow: undefined, newRow: [3, 'x'] },
+		]);
+	});
+});
+
+/**
+ * A store table registered WITHOUT an event emitter has no native event path, so the ENGINE's
+ * auto-event path produces its events instead — while the store still decides which writes
+ * physically move a row from its own encoded data key. The two therefore have to agree about
+ * what "relocated" means, from two independent constructions (the engine's per-column primary-key
+ * comparators vs. the store's key encoding). These pin that agreement in both directions; a drift
+ * would emit one `update` for a row the store moved, or split one it left in place.
+ */
+describe('data-change event key contract — store module with no emitter (engine auto path)', () => {
+	let db: Database;
+	let provider: KVStoreProvider;
+	let events: DatabaseDataChangeEvent[];
+	let unsub: () => void;
+
+	beforeEach(() => {
+		provider = createInMemoryProvider();
+		db = new Database();
+		db.registerModule('store', new StoreModule(provider));
+		events = [];
+		unsub = db.onDataChange(e => { if (e.tableName === 't') events.push(e); });
+	});
+
+	afterEach(async () => {
+		unsub();
+		await db.close();
+		await provider.closeAll();
+	});
+
+	it('splits a relocating update exactly once', async () => {
+		await db.exec('create table t (a integer not null, v text, primary key (a)) using store');
+		await db.exec("insert into t values (1, 'x')");
+		events.length = 0;
+
+		await db.exec('update t set a = 2 where a = 1');
+
+		assert.deepEqual(events.map(shape), [
+			{ type: 'delete', key: [1], oldRow: [1, 'x'], newRow: undefined },
+			{ type: 'insert', key: [2], oldRow: undefined, newRow: [2, 'x'] },
+		]);
+	});
+
+	it('agrees with the store that a NOCASE case-only rewrite moves nothing', async () => {
+		await db.exec('create table t (k text not null collate nocase, v text, primary key (k)) using store');
+		await db.exec("insert into t values ('apple', 'x')");
+		events.length = 0;
+
+		await db.exec("update t set k = 'APPLE' where k = 'apple'");
+
+		assert.deepEqual(events.map(shape), [
+			{ type: 'update', key: ['APPLE'], oldRow: ['apple', 'x'], newRow: ['APPLE', 'x'] },
+		]);
+	});
 });

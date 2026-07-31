@@ -26,7 +26,7 @@ import {
 
 import type { IterateOptions, KVEntry, KVStore } from './kv-store.js';
 import { bytesToHex, compareBytes } from './bytes.js';
-import type { StoreEventEmitter } from './events.js';
+import type { DataChangeEvent, StoreEventEmitter } from './events.js';
 import type { TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import {
@@ -558,6 +558,23 @@ export abstract class StoreTableBase extends VirtualTable {
 		}
 
 		return coordinator;
+	}
+
+	/**
+	 * Deliver one data-change event: buffered on the coordinator inside a transaction
+	 * (fires on commit, discarded on rollback), emitted straight through otherwise.
+	 * Every write path routes its event here so the two arms can never drift apart.
+	 *
+	 * Ordering within a transaction is the coordinator's queue order, which is the order
+	 * these calls are made — the event contract's delete-before-insert promise for a
+	 * relocating key change rides on that (docs/usage.md § Subscribing to Data Changes).
+	 */
+	protected emitOrQueueDataChange(inTransaction: boolean, event: DataChangeEvent): void {
+		if (inTransaction && this.coordinator) {
+			this.coordinator.queueEvent(event);
+		} else {
+			this.eventEmitter?.emitDataChange(event);
+		}
 	}
 
 	/** Apply pending stats on commit. */
