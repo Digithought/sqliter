@@ -72,6 +72,16 @@ describe('schema migration version keys carry the object kind', () => {
 		).to.equal(1);
 	});
 
+	it('dropping the colliding index also stays in the index stream', async () => {
+		await localWrite(x, COLLIDING_INDEX);
+		await localWrite(x, 'drop index orders');
+
+		expect(indexOwner(x, 'orders'), 'the index is gone').to.be.undefined;
+		expect(await version(x, 'index', 'orders'), 'create + drop are versions 1 and 2').to.equal(2);
+		expect(await version(x, 'table', 'orders'), 'neither touched the table stream').to.equal(1);
+		expect(x.db.schemaManager.getTable('main', 'orders'), 'the table survives').to.not.be.undefined;
+	});
+
 	it('a concurrent table migration does not suppress the colliding index migration', async () => {
 		// x: index `orders` — table-version 2 under the old, kind-less key.
 		await localWrite(x, COLLIDING_INDEX);

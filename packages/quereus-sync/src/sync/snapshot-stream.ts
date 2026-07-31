@@ -11,15 +11,12 @@ import { assertWithinDrift } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import { deserializeColumnVersion } from '../metadata/column-version.js';
 import { deserializeTombstone } from '../metadata/tombstones.js';
-import { deserializeMigration } from '../metadata/schema-migration.js';
 import {
 	buildAllColumnVersionsScanBounds,
 	buildAllTombstonesScanBounds,
-	buildAllSchemaMigrationsScanBounds,
 	buildAllChangeLogScanBounds,
 	buildTableColumnVersionScanBounds,
 	parseColumnVersionKey,
-	parseSchemaMigrationKey,
 	parseTombstoneKey,
 	parseChangeLogKey,
 	encodePkIdentity,
@@ -38,9 +35,11 @@ import {
 	type SnapshotFooterChunk,
 	type ColumnVersionEntry,
 	type DataChangeToApply,
-	type SchemaChangeToApply,
+	type SchemaMigration,
+	migrationObjectKind,
+	sortMigrationsByHLC,
+	toSchemaChange,
 } from './protocol.js';
-import { migrationObjectKind } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCState, toError } from './sync-context.js';
 import {
@@ -113,11 +112,14 @@ async function* streamSnapshotChunks(
 		if (parsed) tableKeys.set(`${parsed.schema}.${parsed.table}`, { schema: parsed.schema, table: parsed.table });
 	}
 
-	let migrationCount = 0;
-	const smBounds = buildAllSchemaMigrationsScanBounds();
-	for await (const _entry of ctx.kv.iterate(smBounds)) {
-		migrationCount++;
-	}
+	// Collect migrations up front — the header needs their count anyway, and they must
+	// be emitted in causal order rather than `sm:` scan order (see `listAllMigrations`).
+	// NOTE: this holds the whole migration set in memory; one record per DDL statement
+	// ever run, so it is small next to the row data this same generator streams. If a
+	// replica's DDL history ever grows enough to matter, keep an HLC-ordered index over
+	// `sm:` and stream from that instead.
+	const migrations = await ctx.schemaMigrations.listAllMigrations();
+	const migrationCount = migrations.length;
 
 	// Yield header
 	const header: SnapshotHeaderChunk = {
@@ -137,22 +139,8 @@ async function* streamSnapshotChunks(
 	// a receiver that does not already have the table, every row in that early flush
 	// fails. DDL-first makes the streaming bootstrap work for tables of any size;
 	// `applySnapshotStream` depends on this order.
-	for await (const entry of ctx.kv.iterate(smBounds)) {
-		const parsed = parseSchemaMigrationKey(entry.key);
-		if (!parsed) continue;
-
-		const migration = deserializeMigration(entry.value);
-		const migrationChunk: SnapshotSchemaMigrationChunk = {
-			type: 'schema-migration',
-			migration: {
-				type: migration.type,
-				schema: parsed.schema,
-				table: parsed.table,
-				ddl: migration.ddl,
-				hlc: migration.hlc,
-				schemaVersion: migration.schemaVersion,
-			},
-		};
+	for (const migration of migrations) {
+		const migrationChunk: SnapshotSchemaMigrationChunk = { type: 'schema-migration', migration };
 		yield migrationChunk;
 	}
 
@@ -395,7 +383,10 @@ export async function applySnapshotStream(
 
 	// Pending data to apply to store (batched for efficiency)
 	let pendingDataChanges: DataChangeToApply[] = [];
-	let pendingSchemaChanges: SchemaChangeToApply[] = [];
+	// Held as full migrations, not `SchemaChangeToApply`, so the flush can re-order
+	// them causally instead of trusting the sender's chunk order — DDL replays in
+	// list order and `create index` needs its table's `create table` to have run.
+	let pendingSchemaMigrations: SchemaMigration[] = [];
 
 	const flushDataToStore = async (): Promise<void> => {
 		// A streamed snapshot is a known-complete wholesale load: each flush is a
@@ -406,9 +397,10 @@ export async function applySnapshotStream(
 		// storage failure emits `status:'error'` and aborts the stream mid-flight,
 		// before the footer emits `status:'synced'` / clears the checkpoint — so the
 		// checkpoint stays in place and the transfer resumes/retries.
-		await applyDataToStore(ctx, pendingDataChanges, pendingSchemaChanges, { remote: true, bootstrap: true });
+		const schemaChanges = sortMigrationsByHLC(pendingSchemaMigrations).map(toSchemaChange);
+		await applyDataToStore(ctx, pendingDataChanges, schemaChanges, { remote: true, bootstrap: true });
 		pendingDataChanges = [];
-		pendingSchemaChanges = [];
+		pendingSchemaMigrations = [];
 	};
 
 	// Process chunks
@@ -665,12 +657,7 @@ export async function applySnapshotStream(
 
 			case 'schema-migration': {
 				const migration = chunk.migration;
-				pendingSchemaChanges.push({
-					type: migration.type,
-					schema: migration.schema,
-					table: migration.table,
-					ddl: migration.ddl,
-				});
+				pendingSchemaMigrations.push(migration);
 
 				const kind = migrationObjectKind(migration.type);
 				const schemaVersion = migration.schemaVersion ??

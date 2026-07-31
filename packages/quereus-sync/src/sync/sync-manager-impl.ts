@@ -30,7 +30,7 @@ import {
 import { ColumnVersionStore, type ColumnVersionData, deserializeColumnVersion } from '../metadata/column-version.js';
 import { TombstoneStore, deserializeTombstone } from '../metadata/tombstones.js';
 import { PeerStateStore } from '../metadata/peer-state.js';
-import { SchemaMigrationStore, deserializeMigration } from '../metadata/schema-migration.js';
+import { SchemaMigrationStore } from '../metadata/schema-migration.js';
 import { ChangeLogStore, type ChangeLogEntry } from '../metadata/change-log.js';
 import { QuarantineStore } from '../metadata/quarantine.js';
 import {
@@ -50,10 +50,8 @@ import {
 	SYNC_METADATA_FORMAT_VERSION,
 	buildAllColumnVersionsScanBounds,
 	buildAllTombstonesScanBounds,
-	buildAllSchemaMigrationsScanBounds,
 	parseColumnVersionKey,
 	parseTombstoneKey,
-	parseSchemaMigrationKey,
 	joinKeyParts,
 	type PkKeying,
 } from '../metadata/keys.js';
@@ -1356,9 +1354,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Each migration shares its transaction's base HLC, so the grouping step
 	 * rejoins it with that transaction's data facts (or forms a DDL-only ChangeSet).
 	 *
-	 * The `sm:` range is keyed by `(schema, table, version)`, not by HLC, so this
-	 * scan cannot early-exit the way {@link collectChangesSince} does — it is drained
-	 * in full even when the fact side stops early. That is acceptable because
+	 * The `sm:` range is keyed by `(schema, kind, object, version)`, not by HLC, so
+	 * this read cannot early-exit the way {@link collectChangesSince} does — the whole
+	 * range is drained even when the fact side stops early. That is acceptable because
 	 * migrations are few, and {@link buildTransactionChangeSets} drops any migration
 	 * that sorts past the bounded fact watermark (its DDL-only group falls beyond the
 	 * `batchSize` cut), so over-scanning here costs work but never correctness. A
@@ -1369,27 +1367,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		peerSiteId: SiteId,
 		sinceHLC?: HLC,
 	): Promise<SchemaMigration[]> {
-		const schemaMigrations: SchemaMigration[] = [];
-		const smBounds = buildAllSchemaMigrationsScanBounds();
-		for await (const entry of this.kv.iterate(smBounds)) {
-			const parsed = parseSchemaMigrationKey(entry.key);
-			if (!parsed) continue;
-
-			const migration = deserializeMigration(entry.value);
-
-			if (sinceHLC && compareHLC(migration.hlc, sinceHLC) <= 0) continue;
-			if (siteIdEquals(migration.hlc.siteId, peerSiteId)) continue;
-
-			schemaMigrations.push({
-				type: migration.type,
-				schema: parsed.schema,
-				table: parsed.table,
-				ddl: migration.ddl,
-				hlc: migration.hlc,
-				schemaVersion: migration.schemaVersion,
-			});
-		}
-		return schemaMigrations;
+		const all = await this.schemaMigrations.listAllMigrations();
+		return all.filter(migration => {
+			if (sinceHLC && compareHLC(migration.hlc, sinceHLC) <= 0) return false;
+			return !siteIdEquals(migration.hlc.siteId, peerSiteId);  // echo filter
+		});
 	}
 
 	// ============================================================================

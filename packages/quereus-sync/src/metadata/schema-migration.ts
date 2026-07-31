@@ -7,8 +7,18 @@
 
 import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc.js';
-import { buildSchemaMigrationKey, buildSchemaMigrationScanBounds } from './keys.js';
-import type { SchemaMigrationType, SchemaObjectKind } from '../sync/protocol.js';
+import {
+  buildAllSchemaMigrationsScanBounds,
+  buildSchemaMigrationKey,
+  buildSchemaMigrationScanBounds,
+  parseSchemaMigrationKey,
+} from './keys.js';
+import {
+  sortMigrationsByHLC,
+  type SchemaMigration,
+  type SchemaMigrationType,
+  type SchemaObjectKind,
+} from '../sync/protocol.js';
 
 /**
  * Stored schema migration record.
@@ -167,6 +177,37 @@ export class SchemaMigrationStore {
     for await (const entry of this.kv.iterate(bounds)) {
       yield deserializeMigration(entry.value);
     }
+  }
+
+  /**
+   * Every migration on this replica as a wire record, in causal (HLC) order.
+   *
+   * The producers that ship DDL — both snapshot paths and the delta collector —
+   * all need the whole set, and all need it causally ordered: DDL replays in list
+   * order, so a `create index` ahead of its table's `create table` fails outright.
+   * `sm:` key order is (schema, object kind, object name), which puts every index
+   * migration ahead of every table migration in a schema, so the scan order can
+   * never be used directly.
+   */
+  async listAllMigrations(): Promise<SchemaMigration[]> {
+    const migrations: SchemaMigration[] = [];
+
+    for await (const entry of this.kv.iterate(buildAllSchemaMigrationsScanBounds())) {
+      const parsed = parseSchemaMigrationKey(entry.key);
+      if (!parsed) continue;
+
+      const stored = deserializeMigration(entry.value);
+      migrations.push({
+        type: stored.type,
+        schema: parsed.schema,
+        table: parsed.table,
+        ddl: stored.ddl,
+        hlc: stored.hlc,
+        schemaVersion: stored.schemaVersion,
+      });
+    }
+
+    return sortMigrationsByHLC(migrations);
   }
 
   /**

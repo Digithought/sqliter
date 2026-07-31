@@ -23,7 +23,7 @@ import type {
 	SchemaChangeToApply,
 	SchemaMigration,
 } from './protocol.js';
-import { migrationObjectKind } from './protocol.js';
+import { migrationObjectKind, sortMigrationsByHLC, toSchemaChange } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
 import { admitGroup } from './admission.js';
@@ -253,12 +253,7 @@ export async function applyChanges(
 			}
 		}
 
-		schemaChangesToApply.push({
-			type: migration.type,
-			schema: migration.schema,
-			table: migration.table,
-			ddl: migration.ddl,
-		});
+		schemaChangesToApply.push(toSchemaChange(migration));
 		pendingSchemaMigrations.push({ migration, schemaVersion });
 		applied++;
 	}
@@ -506,14 +501,11 @@ function orderDataChangesByHLC(applied: readonly ResolvedChange[]): DataChangeTo
  * Flatten a batch's schema migrations into one HLC-ordered list.
  *
  * Same reason as {@link orderDataChangesByHLC}: the DDL list reaches the store adapter
- * as a plain array replayed in order, and two migrations for ONE table are
- * order-dependent, so arrival order across changesets must not decide which runs first.
- * Stable, so migrations that cannot be distinguished by HLC keep arrival order.
+ * as a plain array replayed in order, so arrival order across changesets must not
+ * decide which runs first. Ordering itself is {@link sortMigrationsByHLC}.
  */
 function orderMigrationsByHLC(changes: readonly ChangeSet[]): SchemaMigration[] {
-	const migrations = changes.flatMap(changeSet => [...changeSet.schemaMigrations]);
-	migrations.sort((a, b) => compareHLC(a.hlc, b.hlc));
-	return migrations;
+	return sortMigrationsByHLC(changes.flatMap(changeSet => [...changeSet.schemaMigrations]));
 }
 
 /**

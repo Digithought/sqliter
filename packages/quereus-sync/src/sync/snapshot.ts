@@ -7,29 +7,27 @@
 
 import { assertWithinDrift, compareHLC } from '../clock/hlc.js';
 import { deserializeColumnVersion, type ColumnVersion } from '../metadata/column-version.js';
-import { deserializeMigration } from '../metadata/schema-migration.js';
 import { deserializeTombstone } from '../metadata/tombstones.js';
 import {
 	buildAllColumnVersionsScanBounds,
 	buildAllTombstonesScanBounds,
-	buildAllSchemaMigrationsScanBounds,
 	buildAllChangeLogScanBounds,
 	parseColumnVersionKey,
 	parseTombstoneKey,
-	parseSchemaMigrationKey,
 	encodePkIdentity,
 } from '../metadata/keys.js';
 import {
 	SNAPSHOT_WIRE_FORMAT_VERSION,
 	type Snapshot,
 	type SnapshotTombstone,
-	type SchemaMigration,
 	type TableSnapshot,
 	type ColumnVersionEntry,
 	type DataChangeToApply,
 	type SchemaChangeToApply,
+	migrationObjectKind,
+	sortMigrationsByHLC,
+	toSchemaChange,
 } from './protocol.js';
-import { migrationObjectKind } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError } from './sync-context.js';
 import {
@@ -91,23 +89,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 		tables.push({ schema, table, columnVersions });
 	}
 
-	// Collect all schema migrations
-	const schemaMigrations: SchemaMigration[] = [];
-	const smBounds = buildAllSchemaMigrationsScanBounds();
-	for await (const entry of ctx.kv.iterate(smBounds)) {
-		const parsed = parseSchemaMigrationKey(entry.key);
-		if (!parsed) continue;
-
-		const migration = deserializeMigration(entry.value);
-		schemaMigrations.push({
-			type: migration.type,
-			schema: parsed.schema,
-			table: parsed.table,
-			ddl: migration.ddl,
-			hlc: migration.hlc,
-			schemaVersion: migration.schemaVersion,
-		});
-	}
+	const schemaMigrations = await ctx.schemaMigrations.listAllMigrations();
 
 	// Collect all tombstones — a GLOBAL pass (not keyed off `tables`), mirroring the
 	// streaming producer: a fully-deleted row has a tombstone but no live
@@ -174,13 +156,12 @@ export async function applySnapshot(
 	const dataChangesToApply: DataChangeToApply[] = [];
 	const schemaChangesToApply: SchemaChangeToApply[] = [];
 
-	for (const migration of snapshot.schemaMigrations) {
-		schemaChangesToApply.push({
-			type: migration.type,
-			schema: migration.schema,
-			table: migration.table,
-			ddl: migration.ddl,
-		});
+	// Re-order rather than trust the sender's list order: DDL replays in list order
+	// and `create index` needs its table's `create table` to have run first.
+	const orderedMigrations = sortMigrationsByHLC(snapshot.schemaMigrations);
+
+	for (const migration of orderedMigrations) {
+		schemaChangesToApply.push(toSchemaChange(migration));
 	}
 
 	for (const tableSnapshot of snapshot.tables) {
@@ -283,7 +264,7 @@ export async function applySnapshot(
 			}
 
 			// Record schema migrations
-			for (const migration of snapshot.schemaMigrations) {
+			for (const migration of orderedMigrations) {
 				const kind = migrationObjectKind(migration.type);
 				const schemaVersion = migration.schemaVersion ??
 					(await ctx.schemaMigrations.getCurrentVersion(migration.schema, kind, migration.table)) + 1;

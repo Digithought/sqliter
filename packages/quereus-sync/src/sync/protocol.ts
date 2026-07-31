@@ -7,7 +7,7 @@
  */
 
 import type { AssertionViolation, Row, SqlValue } from '@quereus/quereus';
-import type { HLC } from '../clock/hlc.js';
+import { type HLC, compareHLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 
 // ============================================================================
@@ -115,7 +115,21 @@ export interface SchemaMigration {
   readonly table: string;
   readonly ddl: string;           // The DDL statement
   readonly hlc: HLC;              // When migration occurred
-  readonly schemaVersion: number; // Monotonic per-table version
+  readonly schemaVersion: number; // Monotonic per (object kind, object name)
+}
+
+/**
+ * Order migrations causally — ascending HLC, stable, so migrations that cannot be
+ * distinguished by HLC keep arrival order.
+ *
+ * Every consumer replays DDL as a plain array in list order, and migrations are
+ * order-dependent across objects as well as within one: `create index` fails
+ * outright if its table's `create table` has not run. Neither the `sm:` key order
+ * (schema, then object kind, then name — every index before every table) nor
+ * changeset arrival order is causal, so both snapshot and delta paths sort here.
+ */
+export function sortMigrationsByHLC(migrations: readonly SchemaMigration[]): SchemaMigration[] {
+	return [...migrations].sort((a, b) => compareHLC(a.hlc, b.hlc));
 }
 
 // ============================================================================
@@ -464,6 +478,16 @@ export interface SchemaChangeToApply {
   readonly table: string;
   /** The DDL statement to execute. */
   readonly ddl: string;
+}
+
+/** Narrow a migration to the fields the store adapter replays. */
+export function toSchemaChange(migration: SchemaMigration): SchemaChangeToApply {
+	return {
+		type: migration.type,
+		schema: migration.schema,
+		table: migration.table,
+		ddl: migration.ddl,
+	};
 }
 
 /**

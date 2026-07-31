@@ -813,14 +813,12 @@ interface SyncManager {
  *   header → schema-migration* → [table-start, column-versions…, table-end]*
  *          → tombstone* → footer
  *
- * The receiver cannot buffer a whole snapshot: `applySnapshotStream` flushes
- * accumulated rows to the store every 100 pending row changes, and the store
- * adapter applies DDL before DML only WITHIN one flush. A `create table` emitted
- * after its rows would therefore arrive too late for every flush the table's rows
- * already triggered, and on a receiver that does not yet have the table each of
- * those rows fails with "Table not found for external write". The receiver
- * correspondingly flushes its pending schema changes when it reaches the first
- * `table-start` (which marks the end of the migration section).
+ * The receiver cannot buffer a whole snapshot: `applySnapshotStream` flushes rows to
+ * the store every 100 pending changes, and the adapter applies DDL before DML only
+ * WITHIN one flush. A `create table` emitted after its rows arrives too late for every
+ * flush they already triggered, and on a receiver that lacks the table each of those
+ * rows fails with "Table not found for external write". The receiver correspondingly
+ * flushes its pending DDL — re-sorted causally — at the first `table-start`.
  */
 type SnapshotChunk =
   | SnapshotHeaderChunk      // First; snapshotFormat gated + HLC drift-validated here
@@ -1218,15 +1216,16 @@ B: ADD COLUMN bar TEXT     @ HLC(2000, 1, B)
 
 ### DDL Application Order
 
-Within a sync batch, **all DDL is applied before any DML**, destructive operations first
-(DROP TABLE, then DROP COLUMN, then ALTER/ADD), and INSERT/UPDATE/DELETE then land on the
-now-correct schema — so structures always exist before data referencing them arrives.
+Within a sync batch, **all DDL is applied before any DML**, so INSERT/UPDATE/DELETE land
+on the now-correct schema. The DDL itself replays in **HLC (causal) order** — a
+`create index` never runs ahead of its table's `create table`. Neither `sm:` key order
+(schema, kind, name — index migrations ahead of table ones) nor arrival order
+is causal, so producers and consumers on both paths sort (`sortMigrationsByHLC`).
 
 "Within a batch" is the whole guarantee: a streamed snapshot is many batches (the
-receiver flushes every 100 pending row changes), so DDL that reaches the receiver
-*after* a flush cannot help that flush. The streaming snapshot protocol therefore
-puts every `schema-migration` chunk ahead of all table data — see § Streaming
-Snapshot API for the chunk order.
+receiver flushes every 100 pending row changes), so DDL arriving *after* a flush cannot
+help it. The streaming protocol therefore puts every `schema-migration` chunk ahead of
+all table data — see § Streaming Snapshot API.
 
 ### Schema Change Types
 
