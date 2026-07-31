@@ -550,10 +550,13 @@ export interface VirtualTableModule<
 	 * to succeed and then vanish on reopen. This hook is the ONE synchronous point where
 	 * a module can refuse. See `docs/schema.md` § View and materialized-view persistence.
 	 *
-	 * Views and materialized views are not owned by any one module the way a table is,
-	 * so every module gets the veto; a module that would not persist the object must
-	 * no-op. Synchronous by contract: the check must be a pure function of the schema
-	 * (no IO). Omit ⇒ never consulted (today's behavior).
+	 * Every registered module gets the veto, and one that would not persist `object` must
+	 * no-op: views and materialized views are not owned by any one module the way a table
+	 * is, and the `'table'` kind is likewise offered to every module regardless of who owns
+	 * the table. Synchronous by contract: the check must be a pure function of the schema
+	 * (no IO) — so a module answering for `'table'` must decide ownership from what it
+	 * already holds in memory, not by reading its catalog. Omit ⇒ never consulted (today's
+	 * behavior).
 	 *
 	 * Call sites, each ahead of its statement's first side effect: `emitCreateView`
 	 * (before `schema.addView`); `materializeView` (inside its existing rollback arm — an
@@ -561,16 +564,17 @@ export interface VirtualTableModule<
 	 * TAGS paths in `SchemaManager` (tags ride the persisted DDL); and both ALTER RENAME
 	 * arms in `runtime/emit/alter-table.ts`, which reach this through
 	 * `assertRenameDependentsPersistable` — the pre-flight scan that offers the
-	 * PROSPECTIVE (rewritten-on-a-clone) body of every dependent view / materialized view,
-	 * plus, for a renamed materialized view, its own prospective record under the new name.
+	 * PROSPECTIVE (rewritten-on-a-clone) body of every dependent view / materialized view
+	 * and the prospective record of every dependent TABLE (the FK / CHECK / partial-index
+	 * rewrites a rename propagates into other tables), plus, for a renamed materialized
+	 * view, its own prospective record under the new name.
+	 *
+	 * `'table'` is a RENAME-propagation kind only: `create table` is not gated here, since
+	 * it goes through `module.create`, whose failure already reaches the statement.
 	 *
 	 * Not covered: a `select *` materialized view's persisted backing COLUMN LIST shifts
 	 * under a column rename with no AST change and no persist event, so nothing asks here
-	 * (see the `NOTE:` on `restoreUnaffectedMaterializedViews`); and dependent TABLE
-	 * entries — the FK / CHECK / partial-index rewrites a rename propagates into other
-	 * tables — re-persist through the same swallowing path with no veto at all, since
-	 * {@link CatalogObjectKind} has no `'table'` case
-	 * (`bug-store-rename-diverges-dependent-table-catalog-entry`).
+	 * (see the `NOTE:` on `restoreUnaffectedMaterializedViews`).
 	 */
 	assertCatalogObjectPersistable?(
 		db: Database,
@@ -582,9 +586,13 @@ export interface VirtualTableModule<
 /**
  * The catalog object classes {@link VirtualTableModule.assertCatalogObjectPersistable}
  * arbitrates. `'view'` carries a {@link ViewSchema}; `'materializedView'` carries the
- * maintained {@link TableSchema} (the unified MV record).
+ * maintained {@link TableSchema} (the unified MV record); `'table'` carries an ordinary
+ * {@link TableSchema} — a table whose own catalog entry a RENAME propagation would
+ * rewrite (its FKs, CHECK expressions or partial-index predicates name the renamed
+ * object). A maintained table is offered under BOTH kinds: a store-hosted materialized
+ * view persists an ordinary table bundle alongside its MV entry.
  */
-export type CatalogObjectKind = 'view' | 'materializedView';
+export type CatalogObjectKind = 'view' | 'materializedView' | 'table';
 
 /**
  * Defines the structure for schema change information passed to xAlterSchema

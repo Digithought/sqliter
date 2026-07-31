@@ -28,6 +28,7 @@ import {
 	StoreModule,
 	InMemoryKVStore,
 	createIsolatedStoreModule,
+	buildCatalogKey,
 	buildMaterializedViewCatalogKey,
 	type KVStoreProvider,
 } from '../src/index.js';
@@ -449,11 +450,13 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 		});
 	});
 
-	describe('a RENAME that would make a persisted view or materialized view unwritable', () => {
+	describe('a RENAME that would make a persisted view, materialized view or table unwritable', () => {
 		// The CREATE-side veto left the RENAME paths uncovered. `alter table … rename to` and
 		// `alter table … rename column` rewrite the new name into every dependent view / MV
-		// body and re-persist them; renaming a materialized view additionally MOVES its own
-		// catalog entry. All of that rides `SchemaChangeNotifier` (try/catch per listener,
+		// body and into every dependent TABLE's foreign keys, CHECK expressions and
+		// partial-index predicates, then re-persist them; renaming a materialized view
+		// additionally MOVES its own catalog entry. All of that rides
+		// `SchemaChangeNotifier` (try/catch per listener,
 		// log only) and then the store's async persist queue (`.catch`-log), so nothing there
 		// can fail the statement. Before the fix each of these renames REPORTED SUCCESS and:
 		//   - deleted the MV's catalog entry outright (the MV answered queries all session and
@@ -568,6 +571,90 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			expect(isStale(db, 'mvs'), 'the MV must not be left stale').to.be.false;
 		});
 
+		// ── Dependent TABLES: the FK / CHECK / partial-index rewrites the propagation
+		//    pushes into OTHER tables, whose store-backed catalog entries must re-persist ──
+		//
+		// Before the fix each of these reported success, rewrote the live definition, and
+		// left the on-disk one holding the old name — reported only as a `[StoreModule]
+		// Failed to persist catalog DDL after schema change: …` console line.
+		//
+		// Every case inserts a row into the dependent store table first: a store table that
+		// was created but never written to has NO catalog entry yet (that lazy-persist gap is
+		// `bug-store-untouched-table-and-early-view-never-persisted`), so without the insert
+		// there is no persisted DDL to diverge and the test would assert nothing.
+
+		it('refuses a table rename a store-backed dependent could not persist through its FOREIGN KEY', async () => {
+			await db.exec(`create table s2 (id integer primary key, mid integer references m(id)) using store`);
+			await db.exec(`insert into s2 values (1, 1)`);
+			await storeModule.whenCatalogPersisted();
+
+			await rejects(db, `alter table m rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm'), 'the table keeps its name').to.not.be.undefined;
+			expect(db.schemaManager.getTable('main', LONE_HIGH)).to.be.undefined;
+			// The LIVE catalog must be untouched too — the probe rewrites a clone.
+			expect(db.schemaManager.getTable('main', 's2')?.foreignKeys?.[0]?.referencedTable.toLowerCase(),
+				'the live FK must still target m').to.equal('m');
+			await storeModule.whenCatalogPersisted();
+			expect(await catalogDDL(provider, buildCatalogKey('main', 's2')),
+				'the persisted DDL must still name m').to.match(/\bm\b/);
+		});
+
+		it('refuses a column rename a store-backed dependent could not persist through its FOREIGN KEY', async () => {
+			// The referenced-COLUMN list is the rewrite here (`references m(id)` → `m("\uD800")`).
+			await db.exec(`create table s2 (id integer primary key, mid integer references m(id)) using store`);
+			await db.exec(`insert into s2 values (1, 1)`);
+			await storeModule.whenCatalogPersisted();
+
+			await rejects(db, `alter table m rename column id to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm')?.columnIndexMap.has('id'),
+				'the column keeps its name').to.be.true;
+			expect(db.schemaManager.getTable('main', 's2')?.foreignKeys?.[0]?.referencedColumnNames?.[0]?.toLowerCase(),
+				'the live FK must still name the id column').to.equal('id');
+			await storeModule.whenCatalogPersisted();
+			expect(await catalogDDL(provider, buildCatalogKey('main', 's2')),
+				'the persisted DDL must still name id').to.match(/\bid\b/);
+		});
+
+		it('refuses a table rename a store-backed dependent could not persist through its CHECK expression', async () => {
+			await db.exec(`create table s3 (id integer primary key, v integer check (v < (select count(*) from m))) using store`);
+			await db.exec(`insert into s3 values (1, 0)`);
+			await storeModule.whenCatalogPersisted();
+
+			await rejects(db, `alter table m rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm'), 'the table keeps its name').to.not.be.undefined;
+			await storeModule.whenCatalogPersisted();
+			const ddl = await catalogDDL(provider, buildCatalogKey('main', 's3'));
+			expect(ddl, 'the persisted CHECK must still name m').to.match(/\bfrom\s+(main\.)?"?m"?/i);
+			expect(ddl, 'no lone surrogate may have reached the catalog').to.not.include(LONE_HIGH);
+			// The live CHECK still resolves against m — proof the probe rewrote a clone.
+			await db.exec(`insert into s3 values (2, 0)`);
+		});
+
+		// The third rewrite arm — a partial-index PREDICATE naming another table — has no test
+		// because it has no reachable shape today: a predicate can only name another table
+		// through a subquery, and the store's index-build predicate compiler refuses one
+		// (`Unsupported expression in partial-index predicate: subquery`, raised from
+		// `store-module-index-build.ts`). The scan covers the arm anyway, since
+		// `rewriteTableForTableRename` / `rewriteTableForColumnRename` walk predicates; if
+		// subqueries in index predicates ever land, add the case here.
+
+		it('still permits the rename when the only dependent table is memory-backed', async () => {
+			// The false positive the ownership self-filter exists to prevent: a store module is
+			// registered and live (`st` above), but `mem2` has no catalog entry of ours to lose,
+			// so nothing may refuse on our behalf.
+			await db.exec(`create table mem2 (id integer primary key, mid integer references m(id))`);
+			await db.exec(`insert into mem2 values (1, 1)`);
+
+			await db.exec(`alter table m rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', LONE_HIGH), 'the rename went through').to.not.be.undefined;
+			expect(db.schemaManager.getTable('main', 'mem2')?.foreignKeys?.[0]?.referencedTable,
+				'the memory dependent was rewritten as always').to.equal(LONE_HIGH);
+		});
+
 		// ── Regression pins: already-loud paths must STAY loud and stay clean no-ops ──
 		//
 		// The store's physical store-name / DDL-text guard already refused these. The
@@ -603,14 +690,22 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 
 		it('still accepts a well-formed astral rename of a table and a column', async () => {
 			// The guard must not over-reject: an astral character is a PAIRED surrogate and
-			// encodes fine. Both dependent kinds are present so the pre-flight actually renders
-			// a prospective view AND a prospective MV before letting the rename through.
+			// encodes fine. All three dependent kinds are present so the pre-flight actually
+			// renders a prospective view, a prospective MV and a prospective TABLE before
+			// letting the rename through — and the dependent table must then RE-PERSIST under
+			// the new name rather than merely be allowed.
 			await db.exec(`create view vm as select id, x from m`);
 			await db.exec(`create materialized view mvm as select id, x from m`);
+			await db.exec(`create table s2 (id integer primary key, mid integer references m(id)) using store`);
+			await db.exec(`insert into s2 values (1, 1)`);
+			await storeModule.whenCatalogPersisted();
 
 			await db.exec(`alter table m rename to "${ASTRAL}"`);
 			expect(await column(db, `select x from vm`, 'x')).to.deep.equal([100]);
 			expect(await column(db, `select x from mvm`, 'x')).to.deep.equal([100]);
+			await storeModule.whenCatalogPersisted();
+			expect(await catalogDDL(provider, buildCatalogKey('main', 's2')),
+				'the dependent FK re-persisted under the new name').to.include(ASTRAL);
 
 			await db.exec(`alter table "${ASTRAL}" rename column x to "${ASTRAL}"`);
 			expect(await column(db, `select "${ASTRAL}" from vm`, ASTRAL)).to.deep.equal([100]);

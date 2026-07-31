@@ -468,7 +468,7 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `finalizeRename` | presence | engine-side fallback (no-op — `renameTable` did all the work) | n/a | ✓ deletes old catalog entry after dependents persist (two-phase, see [schema.md](schema.md)) | forwards | via store |
 | `beginSchemaBatch` / `endSchemaBatch` | presence | engine-side fallback (per-DDL commits) | n/a | ✓ | forwards | via store |
 | `notifyLensDeployment` | presence | engine-side fallback (no-op) | n/a | n/a | forwards | n/a |
-| `assertCatalogObjectPersistable` | presence | engine-side fallback (no-op — the object is registered and its catalog write, if any, stays fire-and-forget) | n/a | ✓ refuses a view/MV whose key or generated DDL it could not encode | forwards | via store |
+| `assertCatalogObjectPersistable` | presence | engine-side fallback (no-op — the object is registered and its catalog write, if any, stays fire-and-forget) | n/a | ✓ refuses a view / MV / rename-rewritten table whose key or generated DDL it could not encode (tables self-filtered on ownership) | forwards | via store |
 | `concurrencyMode` | static field | engine-side fallback (`'serial'`) | `reentrant-reads` | `serial` (default) | computed: `weaker(underlying, overlay)`, capped at `reentrant-reads` | via store |
 | `expectedLatencyMs` | static field | engine-side fallback (`0`) | 0 | 0 | forwards underlying | via store |
 | `getCapabilities().delegatesNotNullBackfill` | flag (live) | engine-side gate (ADD COLUMN skips `validateNotNullBackfill`) | off | off | inherits underlying | off |

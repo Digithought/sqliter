@@ -374,8 +374,10 @@ layer) must forward the hook or the wrapped module never gets its veto.
 
 **The RENAME arms get the same veto, through a pre-flight dependent scan.**
 `alter table … rename to` / `rename column` rewrites the new name into every dependent
-view and materialized-view body and fires `view_modified` / `materialized_view_modified`,
-and renaming a materialized view additionally moves its own catalog entry
+view and materialized-view body and fires `view_modified` / `materialized_view_modified`;
+it also rewrites every dependent **table** (an FK's `referencedTable` / referenced-column
+list, a CHECK expression, a partial-index predicate) and fires `table_modified`; and
+renaming a materialized view additionally moves its own catalog entry
 (`materialized_view_removed` old → `materialized_view_added` new). Those re-persists are
 fire-and-forget like the rest, so both arms run `assertRenameDependentsPersistable`
 (same file) BEFORE their first side effect — `module.renameTable` for the table arm,
@@ -389,8 +391,18 @@ fire-and-forget like the rest, so both arms run `assertRenameDependentsPersistab
   renamed; `structuredClone` is not an option, because `LiteralExpr.value` may hold a
   Promise. A body the rewrite does not touch renders identically to what is persisted, so
   it is skipped.
+- Every table in **every** schema is probed under kind `'table'`, because the propagation's
+  table loop is not schema-scoped (`propagateTableRename` walks `_getAllSchemas()`, so a
+  cross-schema FK reference is rewritten). Its rewritable state is spread over three fields
+  and only the FK arm is copy-on-write, so the probe runs against a copy whose CHECK
+  expressions and index predicates are spine clones (`cloneTableRewritableAsts`). The
+  rewriters return the SAME reference when nothing changed, which is the skip test.
 - Both DDL generators read the AST rather than a cached string, so the prospective object
   is just the record with the clone swapped in.
+- The renamed table itself is left in the table scan rather than special-cased: it is probed
+  under its OLD name with only new-name-carrying text rewritten in, so a veto there is
+  always true, and its own catalog entry stays covered by the module's `renameTable` /
+  `alterTable` guards.
 - Renaming a maintained table additionally vets the prospective record
   `{ …, name: newName }` directly — checking the new catalog **key** as well as the new DDL
   text, long before the `materialized_view_removed` that would otherwise delete the old
@@ -400,21 +412,24 @@ fire-and-forget like the rest, so both arms run `assertRenameDependentsPersistab
   resolver is only ever asked about sources *other* than the renamed table, whose column
   sets the rename does not touch.
 
-Ordering note: for a **store-backed** table with a dependent view the pre-flight fires
-ahead of the store's physical store-name guard, so the reported message is
-`cannot store persisted schema text …` rather than `cannot store the identifier …`. Both
+Because the `'table'` kind is offered over tables the asked module may not own, a module
+answering it must **self-filter synchronously** — the hook is pure by contract, so it cannot
+read its catalog the way the table write path's absent-entry filter does. The store mirrors
+`StoreModule.resolveOwnedTable`: a table it already holds, or one whose `vtabModule` is the
+store (or a wrapper exposing it as `underlying`, which is what isolation-wrapping produces).
+Not owned ⇒ no entry ⇒ no check, which is what keeps a memory-backed dependent from being
+refused in a database that also has store tables.
+
+Ordering note: for a **store-backed** table with a dependent view or dependent store table
+the pre-flight fires ahead of the store's physical store-name guard, so the reported message
+is `cannot store persisted schema text …` rather than `cannot store the identifier …`. Both
 name the unpaired surrogate and both leave a clean no-op.
 
-Three things stay uncovered. A `select *` materialized view's persisted backing **column
+Two things stay uncovered. A `select *` materialized view's persisted backing **column
 list** shifts under a column rename with no AST change, so the scan cannot see it (and no
 persist event fires) — harmless today because reopen re-derives an implicit MV's shape from
 its body; see the `NOTE:` on `restoreUnaffectedMaterializedViews` in
-`runtime/emit/materialized-view-helpers.ts`. Dependent **tables** — the FK
-`referencedTable`, CHECK-expression and partial-index-predicate rewrites
-`rewriteTableForTableRename` / `rewriteTableForColumnRename` perform — re-persist through
-the same swallowing path with nothing vetting them, because `CatalogObjectKind` has no
-`'table'` case; tracked as
-`bug-store-rename-diverges-dependent-table-catalog-entry`. And a store module that has not
+`runtime/emit/materialized-view-helpers.ts`. And a store module that has not
 yet subscribed to a database never vetoes at all —
 `bug-store-untouched-table-and-early-view-never-persisted`.
 

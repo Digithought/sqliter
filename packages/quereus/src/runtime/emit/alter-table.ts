@@ -210,7 +210,8 @@ async function runRenameTable(
 		assertCatalogObjectPersistable(rctx.db, 'materializedView', { ...tableSchema, name: newName });
 	}
 	assertRenameDependentsPersistable(rctx.db, schema,
-		ast => renameTableInAst(ast, oldName, newName, tableSchema.schemaName));
+		ast => renameTableInAst(ast, oldName, newName, tableSchema.schemaName),
+		t => rewriteTableForTableRename(t, tableSchema.schemaName.toLowerCase(), oldName, newName));
 
 	// Clone schema with new name
 	const updatedTableSchema: TableSchema = {
@@ -340,7 +341,9 @@ async function runRenameColumn(
 	}
 
 	// Pre-flight, BEFORE the first side effect (`module.alterTable`): the rewritten
-	// body of every dependent view / materialized view must still be persistable —
+	// body of every dependent view / materialized view — and the rewritten record of
+	// every dependent table (its CHECK expressions, the referenced-column list of an FK
+	// pointing here, its partial-index predicates) — must still be persistable, on the
 	// same unfailable-propagation reasoning as the table-rename arm above. Shares one
 	// resolver with `propagateColumnRename` so the two passes cannot drift apart in
 	// code; what makes them agree at RUNTIME (the resolver reads the LIVE catalog, and
@@ -348,8 +351,11 @@ async function runRenameColumn(
 	// `isTableInUnaliasedScope` skips the renamed table itself and probes only OTHER
 	// sources, whose column sets this rename does not touch.
 	const resolveColumnInSource = buildColumnSourceResolver(rctx.db);
-	assertRenameDependentsPersistable(rctx.db, schema, ast => renameColumnInAst(
-		ast, tableSchema.name, oldName, newName, tableSchema.schemaName, resolveColumnInSource));
+	assertRenameDependentsPersistable(rctx.db, schema,
+		ast => renameColumnInAst(
+			ast, tableSchema.name, oldName, newName, tableSchema.schemaName, resolveColumnInSource),
+		t => rewriteTableForColumnRename(
+			t, tableSchema.schemaName.toLowerCase(), tableSchema.name, oldName, newName, resolveColumnInSource));
 
 	const existingCol = tableSchema.columns[colIndex];
 

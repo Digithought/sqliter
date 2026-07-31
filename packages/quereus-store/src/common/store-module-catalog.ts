@@ -144,15 +144,27 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	}
 
 	/**
+	 * The catalog entry a plain table would be persisted as: its `{schema}.{table}` key
+	 * (which {@link buildCatalogKey} refuses for an unencodable identifier) plus the DDL
+	 * bundle {@link buildCatalogEntry} produces. Counterpart of {@link viewCatalogEntry} /
+	 * {@link maintainedViewCatalogEntry}, and shared the same way — by the write path
+	 * ({@link saveTableDDL}) and by the pre-flight veto
+	 * ({@link assertCatalogObjectPersistable}) — so the two cannot drift.
+	 */
+	private tableCatalogEntry(tableSchema: TableSchema): CatalogEntry {
+		return {
+			key: buildCatalogKey(tableSchema.schemaName, tableSchema.name),
+			ddl: this.buildCatalogEntry(tableSchema),
+		};
+	}
+
+	/**
 	 * Save table DDL (bundled with its secondary index DDL) to the catalog store.
 	 */
 	async saveTableDDL(tableSchema: TableSchema): Promise<void> {
-		const ddl = this.buildCatalogEntry(tableSchema);
-		const catalogKey = buildCatalogKey(tableSchema.schemaName, tableSchema.name);
-		const encodedDDL = this.encodeCatalogDDL(ddl);
-
+		const { key, ddl } = this.tableCatalogEntry(tableSchema);
 		const catalogStore = await this.provider.getCatalogStore();
-		await catalogStore.put(catalogKey, encodedDDL);
+		await catalogStore.put(key, this.encodeCatalogDDL(ddl));
 	}
 
 	/**
@@ -202,14 +214,21 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 
 	/**
 	 * Pre-flight veto (see `VirtualTableModule.assertCatalogObjectPersistable`): refuse a
-	 * view / materialized view whose catalog entry this module could not durably write.
+	 * view / materialized view / table whose catalog entry this module could not durably
+	 * write.
 	 *
 	 * It runs exactly the derivation the write path runs — {@link viewCatalogEntry} /
-	 * {@link maintainedViewCatalogEntry} build the key (rejecting an unencodable
-	 * identifier) and {@link assertPersistableDdlText} checks the generated DDL text —
-	 * so the veto and the write cannot disagree about what is persistable. It is the only
-	 * synchronous path a rejection can travel: the actual save is chained onto
-	 * `persistQueue` behind a `SchemaChangeNotifier` listener, and both layers swallow.
+	 * {@link maintainedViewCatalogEntry} / {@link tableCatalogEntry} build the key
+	 * (rejecting an unencodable identifier) and {@link assertPersistableDdlText} checks the
+	 * generated DDL text — so the veto and the write cannot disagree about what is
+	 * persistable. It is the only synchronous path a rejection can travel: the actual save
+	 * is chained onto `persistQueue` behind a `SchemaChangeNotifier` listener, and both
+	 * layers swallow.
+	 *
+	 * The `'table'` kind arrives only from the RENAME pre-flight scan, which offers EVERY
+	 * table in every schema whose record the propagation would rewrite — most of them not
+	 * ours. {@link ownsTableCatalogEntry} is the synchronous self-filter that keeps a
+	 * memory-backed dependent from being refused on our behalf.
 	 *
 	 * Gated on `subscribedDb === db`: this module persists a view/MV only while subscribed
 	 * to that `Database`'s change notifier (`StoreModuleSchemaSync.ensureSchemaSubscription`, driven by the
@@ -225,10 +244,52 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	// here, thread the already-built CatalogEntry from the veto through to the write.
 	assertCatalogObjectPersistable(db: Database, kind: CatalogObjectKind, object: ViewSchema | TableSchema): void {
 		if (this.subscribedDb !== db) return;
-		const entry = kind === 'view'
-			? viewCatalogEntry(object as ViewSchema)
-			: maintainedViewCatalogEntry(object as TableSchema);
+		const entry = this.prospectiveCatalogEntry(kind, object);
 		if (entry) assertPersistableDdlText(entry.ddl);
+	}
+
+	/**
+	 * The entry {@link assertCatalogObjectPersistable} is being asked about, or `undefined`
+	 * when this module would write none for it (a non-maintained table offered as
+	 * `'materializedView'`, or a table we do not own).
+	 */
+	private prospectiveCatalogEntry(
+		kind: CatalogObjectKind,
+		object: ViewSchema | TableSchema,
+	): CatalogEntry | undefined {
+		switch (kind) {
+			case 'view': return viewCatalogEntry(object as ViewSchema);
+			case 'materializedView': return maintainedViewCatalogEntry(object as TableSchema);
+			case 'table': {
+				const table = object as TableSchema;
+				return this.ownsTableCatalogEntry(table) ? this.tableCatalogEntry(table) : undefined;
+			}
+		}
+	}
+
+	/**
+	 * Whether this module would be the one to write `table`'s catalog entry — the
+	 * synchronous stand-in for the write path's absent-entry self-filter (see
+	 * {@link persistCatalogIfChanged}), which reads the catalog store and so is unavailable
+	 * to a hook that is synchronous and IO-free by contract.
+	 *
+	 * Ownership is tested exactly as `StoreModule.resolveOwnedTable` tests it: a table this
+	 * session already touched (it is in `tables`), or one whose `vtabModule` is this module
+	 * — or a WRAPPER exposing this module as `underlying`, which is what a store table looks
+	 * like under `@quereus/quereus-isolation` (its `vtabModule` is the `IsolationModule`).
+	 * Not ours ⇒ no entry ⇒ no check, which is what keeps a memory-backed dependent table in
+	 * a database that also has store tables from being refused.
+	 *
+	 * Where this is STRICTER than the write path — a store-owned table whose catalog entry
+	 * has not been written yet, which `persistCatalogIfChanged` would skip — refusing is the
+	 * safe side: that table's eventual lazy `saveTableDDL` would throw on the diverged text
+	 * anyway, on the same swallowing path with nothing left to tell the user.
+	 */
+	private ownsTableCatalogEntry(table: TableSchema): boolean {
+		const tableKey = `${table.schemaName}.${table.name}`.toLowerCase();
+		if (this.tables.has(tableKey)) return true;
+		const owner = table.vtabModule as unknown as { underlying?: unknown } | undefined;
+		return owner === this || owner?.underlying === this;
 	}
 
 	/**
