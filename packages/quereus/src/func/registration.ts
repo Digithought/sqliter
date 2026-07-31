@@ -1,11 +1,11 @@
 import type { AggregateFinalizer, AggregateReducer, IntegratedTableValuedFunc, ScalarFunc, TableValuedFunc, ScalarFunctionSchema,
 	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, AggregateArgBinding, TVFAdvertisement, FunctionSchema } from '../schema/function.js';
 import { FunctionFlags } from '../common/constants.js';
-import type { ScalarType, RelationType, BaseType, ColumnDef } from '../common/datatype.js';
-import { ANY_TYPE } from '../types/builtin-types.js';
+import type { ScalarType, RelationType, BaseType, ColumnDef, ColRef } from '../common/datatype.js';
 import type { LogicalType } from '../types/logical-type.js';
 import type { DeepReadonly } from '../common/types.js';
 import { MisuseError } from '../common/errors.js';
+import { ANY_RETURN } from './builtins/return-types.js';
 
 /**
  * Configuration options for scalar functions
@@ -148,13 +148,11 @@ interface AggregateFuncOptions {
  * isTextual, so coercion leaves both operands alone and the generic runtime
  * comparison decides. Declare `returnType` when you know it: ANY is safe but
  * forfeits plan-time typing and comparison specialization.
+ *
+ * Same declaration a built-in spells `ANY_RETURN` — named separately here because
+ * this one is the default nobody asked for, not a deliberate "unknown on purpose".
  */
-const UNKNOWN_SCALAR_RETURN: ScalarType = {
-	typeClass: 'scalar',
-	logicalType: ANY_TYPE,
-	nullable: true,
-	isReadOnly: true
-};
+const UNKNOWN_SCALAR_RETURN: ScalarType = ANY_RETURN;
 
 /**
  * The relation a table-valued function that declares no columns gets. Its empty
@@ -181,15 +179,88 @@ function isLogicalTypeObject(value: unknown): boolean {
 	return typeof candidate.name === 'string' && typeof candidate.physicalType === 'number';
 }
 
-/** Structural test for a scalar type object (`{ typeClass: 'scalar', logicalType, … }`). */
-function isScalarTypeObject(value: unknown): boolean {
-	if (typeof value !== 'object' || value === null) return false;
+/**
+ * Check a scalar type object (`{ typeClass: 'scalar', logicalType, … }`) and fill
+ * in its one omittable field. `nullable` is required by {@link ScalarType} but is
+ * easy to leave off a hand-built declaration, and it has one safe answer —
+ * nullable — so an absent one is filled rather than rejected. Everything that
+ * reads it today treats `undefined` as nullable already; filling it keeps the
+ * stored type honest to its own declared shape.
+ *
+ * Returns the input unchanged when nothing needed filling, or `null` when the
+ * value is not a scalar type object at all.
+ */
+function normalizeScalarType(value: unknown): ScalarType | null {
+	if (typeof value !== 'object' || value === null) return null;
 	const candidate = value as Partial<ScalarType>;
-	return candidate.typeClass === 'scalar' && isLogicalTypeObject(candidate.logicalType);
+	if (candidate.typeClass !== 'scalar' || !isLogicalTypeObject(candidate.logicalType)) return null;
+	if (typeof candidate.nullable === 'boolean') return candidate as ScalarType;
+	return { ...candidate, nullable: true } as ScalarType;
 }
 
 function malformedReturnType(schema: FunctionSchema, problem: string): never {
 	throw new MisuseError(`Function '${schema.name}/${schema.numArgs}': ${problem}`);
+}
+
+/**
+ * Check a relation's declared columns and fill in each one's omittable fields.
+ * Returns the input array unchanged when nothing needed filling.
+ */
+function normalizeRelationColumns(schema: FunctionSchema, columns: unknown): ReadonlyArray<ColumnDef> {
+	if (!Array.isArray(columns)) {
+		malformedReturnType(schema, 'returnType.columns must be an array of column definitions');
+	}
+	let changed = false;
+	const normalized = (columns as ReadonlyArray<Partial<ColumnDef> | null | undefined>).map((column, index) => {
+		if (typeof column?.name !== 'string' || column.name === '') {
+			malformedReturnType(schema, `returnType.columns[${index}].name must be a non-empty string`);
+		}
+		const type = normalizeScalarType(column.type);
+		if (!type) {
+			malformedReturnType(schema, `returnType.columns[${index}] ('${column.name}') must carry a scalar type object such as `
+				+ `{ typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true }, not a type-name string`);
+		}
+		if (type === column.type) return column as ColumnDef;
+		changed = true;
+		return { ...column, type } as ColumnDef;
+	});
+	return changed ? normalized : (columns as ReadonlyArray<ColumnDef>);
+}
+
+/**
+ * Check a relation's declared unique keys. Each key is an array of `{ index }`
+ * references into the declared columns — `[]` is the empty key (the relation has
+ * at most one row), and `keys: []` declares no key at all.
+ *
+ * The indices are checked because a bad one is not inert: `keysOf`
+ * (`planner/util/fd-utils.ts`) reads `ref.index` straight through into the plan's
+ * key set, so `keys: [['v']]` — column names where references belong — mints a key
+ * over column `undefined`, and an out-of-range index mints one over a column that
+ * does not exist. Both survive registration and then drive DISTINCT elimination
+ * and join-cardinality reasoning off a key nothing enforces.
+ *
+ * NOTE: `TVFAdvertisement.keys` (`relationalAdvertisement`, see
+ * docs/optimizer-retrieve.md) is the same shape feeding the same consumer, and is
+ * still unchecked. Nothing in-tree declares a bad one; if a plugin's advertisement
+ * ever produces a phantom key, validate it the same way here.
+ */
+function validateRelationKeys(schema: FunctionSchema, keys: unknown, columnCount: number): void {
+	if (!Array.isArray(keys)) {
+		malformedReturnType(schema, 'returnType.keys must be an array of key column references');
+	}
+	keys.forEach((key: unknown, keyIndex: number) => {
+		if (!Array.isArray(key)) {
+			malformedReturnType(schema, `returnType.keys[${keyIndex}] must be an array of { index } column references `
+				+ '(an empty array declares the empty key)');
+		}
+		key.forEach((ref: unknown, refIndex: number) => {
+			const index = (ref as Partial<ColRef> | null | undefined)?.index;
+			if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= columnCount) {
+				malformedReturnType(schema, `returnType.keys[${keyIndex}][${refIndex}].index must be an integer index into the `
+					+ `${columnCount} declared column(s), as { index: 0 }`);
+			}
+		});
+	});
 }
 
 /**
@@ -201,41 +272,30 @@ function malformedReturnType(schema: FunctionSchema, problem: string): never {
  * obvious answer for a function that says nothing about them, so an absent one
  * is filled with the same value `createTableValuedFunction` uses rather than
  * being demanded of the author — an absent `keys` otherwise registers fine and
- * then fails at planning with `type.keys is not iterable`. Present-but-not-an-array
- * is still a typo, and is rejected.
+ * then fails at planning with `type.keys is not iterable`. Present-but-malformed
+ * is still a typo, and is rejected (see {@link validateRelationKeys}).
  *
  * Returns the input unchanged when nothing needed filling.
  */
 function normalizeRelationReturnType(schema: FunctionSchema, returnType: RelationType): RelationType {
-	const columns: unknown = returnType.columns;
-	if (!Array.isArray(columns)) {
-		malformedReturnType(schema, 'returnType.columns must be an array of column definitions');
-	}
-	(columns as ReadonlyArray<Partial<ColumnDef> | null | undefined>).forEach((column, index) => {
-		if (typeof column?.name !== 'string' || column.name === '') {
-			malformedReturnType(schema, `returnType.columns[${index}].name must be a non-empty string`);
-		}
-		if (!isScalarTypeObject(column.type)) {
-			malformedReturnType(schema, `returnType.columns[${index}] ('${column.name}') must carry a scalar type object such as `
-				+ `{ typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true }, not a type-name string`);
-		}
-	});
+	const columns = normalizeRelationColumns(schema, returnType.columns);
 
 	const keys: unknown = returnType.keys;
-	if (keys !== undefined && !Array.isArray(keys)) {
-		malformedReturnType(schema, 'returnType.keys must be an array of key column references');
-	}
+	if (keys !== undefined) validateRelationKeys(schema, keys, columns.length);
+
 	const rowConstraints: unknown = returnType.rowConstraints;
 	if (rowConstraints !== undefined && !Array.isArray(rowConstraints)) {
 		malformedReturnType(schema, 'returnType.rowConstraints must be an array');
 	}
 
-	const needsDefaults = returnType.isReadOnly === undefined || returnType.isSet === undefined
+	const needsDefaults = columns !== returnType.columns
+		|| returnType.isReadOnly === undefined || returnType.isSet === undefined
 		|| keys === undefined || rowConstraints === undefined;
 	if (!needsDefaults) return returnType;
 
 	return {
 		...returnType,
+		columns,
 		isReadOnly: returnType.isReadOnly ?? UNDECLARED_RELATION_RETURN.isReadOnly,
 		isSet: returnType.isSet ?? UNDECLARED_RELATION_RETURN.isSet,
 		keys: (keys as RelationType['keys']) ?? UNDECLARED_RELATION_RETURN.keys,
@@ -257,7 +317,9 @@ function normalizeRelationReturnType(schema: FunctionSchema, returnType: Relatio
  *   half-worked for so long — it registered and evaluated, then failed with an
  *   internal `undefined` read the first time anything compared against its type.
  * - **Present and well-formed but incomplete** is filled in, for the fields that
- *   have one obvious answer: see {@link normalizeRelationReturnType}.
+ *   have one obvious answer: a scalar's `nullable` (see {@link normalizeScalarType})
+ *   and a relation's `isReadOnly` / `isSet` / `keys` / `rowConstraints` (see
+ *   {@link normalizeRelationReturnType}).
  *
  * Both registration paths route through here: `Database.registerFunction` for a
  * hand-built schema (the path every plugin takes via `registerPlugin`) and the
@@ -280,11 +342,12 @@ export function normalizeFunctionSchema<T extends FunctionSchema>(schema: T): T 
 	}
 	switch (returnType.typeClass) {
 		case 'scalar': {
-			if (!isScalarTypeObject(returnType)) {
+			const scalar = normalizeScalarType(returnType);
+			if (!scalar) {
 				malformedReturnType(schema, 'returnType.logicalType must be a type object such as TEXT_TYPE — '
 					+ 'build the declaration with scalarReturn(TEXT_TYPE) or use the TEXT_RETURN / INTEGER_RETURN / … constants');
 			}
-			break;
+			return scalar === returnType ? schema : { ...schema, returnType: scalar } as unknown as T;
 		}
 		case 'relation': {
 			const relation = normalizeRelationReturnType(schema, returnType as RelationType);
@@ -293,7 +356,6 @@ export function normalizeFunctionSchema<T extends FunctionSchema>(schema: T): T 
 		default:
 			malformedReturnType(schema, `returnType.typeClass must be 'scalar' or 'relation' (got ${String(returnType.typeClass)})`);
 	}
-	return schema;
 }
 
 /**

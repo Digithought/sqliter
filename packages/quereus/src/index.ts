@@ -265,6 +265,11 @@ export {
 	ANY_RETURN
 } from './func/builtins/return-types.js';
 
+// The shapes a `returnType` is made of. `scalarReturn` returns a `ScalarType`, and a
+// table-valued function's relation is spelled out column by column, so a plugin
+// outside this repo needs to be able to name these.
+export type { ScalarType, RelationType, ColumnDef, ColRef } from './common/datatype.js';
+
 export type {
 	ScalarFunc,
 	TableValuedFunc,

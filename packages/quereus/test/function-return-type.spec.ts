@@ -23,7 +23,7 @@ import {
 	createTableValuedFunction,
 	TEXT_RETURN,
 } from '../src/index.js';
-import type { SqlValue, Row } from '../src/index.js';
+import type { SqlValue, Row, ScalarType, RelationType } from '../src/index.js';
 
 const FLAGS = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
 
@@ -199,6 +199,60 @@ describe('Registered function return-type contract', () => {
 			);
 		});
 
+		it('rejects a relation whose keys are not arrays of column references', () => {
+			// `keys: [{ index: 0 }]` — a reference where a whole key belongs.
+			expectRejected(
+				{
+					name: 'bad_keyshape',
+					numArgs: 1,
+					flags: FLAGS,
+					implementation: async function* (): AsyncIterable<Row> { yield [1]; },
+					returnType: {
+						typeClass: 'relation',
+						columns: [{ name: 'v', type: scalarReturn(INTEGER_TYPE) }],
+						keys: [{ index: 0 }],
+					},
+				},
+				/bad_keyshape\/1.*keys\[0\] must be an array of \{ index \} column references/s,
+			);
+		});
+
+		it('rejects a key naming its columns by name instead of index', () => {
+			// `ref.index` reads back undefined, minting a key over a column that does
+			// not exist — accepted before, and never noticed until a plan used it.
+			expectRejected(
+				{
+					name: 'bad_keynames',
+					numArgs: 1,
+					flags: FLAGS,
+					implementation: async function* (): AsyncIterable<Row> { yield [1]; },
+					returnType: {
+						typeClass: 'relation',
+						columns: [{ name: 'v', type: scalarReturn(INTEGER_TYPE) }],
+						keys: [['v']],
+					},
+				},
+				/bad_keynames\/1.*keys\[0\]\[0\]\.index must be an integer index into the 1 declared column/s,
+			);
+		});
+
+		it('rejects a key referencing a column index the relation does not have', () => {
+			expectRejected(
+				{
+					name: 'bad_keyrange',
+					numArgs: 1,
+					flags: FLAGS,
+					implementation: async function* (): AsyncIterable<Row> { yield [1]; },
+					returnType: {
+						typeClass: 'relation',
+						columns: [{ name: 'v', type: scalarReturn(INTEGER_TYPE) }],
+						keys: [[{ index: 0 }, { index: 1 }]],
+					},
+				},
+				/bad_keyrange\/1.*keys\[0\]\[1\]\.index must be an integer index into the 1 declared column/s,
+			);
+		});
+
 		it('rejects a relation column with no name', () => {
 			expectRejected(
 				{
@@ -307,6 +361,102 @@ describe('Registered function return-type contract', () => {
 			} as any);
 
 			expect(await collect(db, `select v from partial_tvf(3) where v = 1 order by v`)).to.deep.equal([{ v: 1 }]);
+		});
+
+		it('fills in an omitted scalar nullable', () => {
+			// `nullable` is required by ScalarType but easy to leave off a hand-built
+			// declaration; absent means nullable, which is the safe reading.
+			db.registerFunction({
+				name: 'partial_scalar',
+				numArgs: 1,
+				flags: FLAGS,
+				returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE },
+				implementation: (x: SqlValue) => String(x),
+			} as any);
+
+			const stored = db.schemaManager.getMainSchema().getFunction('partial_scalar', 1)!;
+			expect((stored.returnType as ScalarType).nullable).to.equal(true);
+		});
+
+		it('fills in an omitted nullable on a relation column', async () => {
+			db.registerFunction({
+				name: 'partial_colnull',
+				numArgs: 1,
+				flags: FLAGS,
+				returnType: {
+					typeClass: 'relation',
+					columns: [{ name: 'v', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE } }],
+				},
+				implementation: async function* (n: SqlValue): AsyncIterable<Row> {
+					for (let i = 0; i < Number(n); i++) yield [i];
+				},
+			} as any);
+
+			const stored = db.schemaManager.getMainSchema().getFunction('partial_colnull', 1)!;
+			expect((stored.returnType as RelationType).columns[0].type.nullable).to.equal(true);
+			expect(await collect(db, `select v from partial_colnull(2)`)).to.deep.equal([{ v: 0 }, { v: 1 }]);
+		});
+
+		it('accepts declared keys, including the empty key', async () => {
+			db.registerFunction(createTableValuedFunction(
+				{
+					name: 'keyed_tvf',
+					numArgs: 1,
+					flags: FLAGS,
+					returnType: {
+						typeClass: 'relation',
+						isReadOnly: true,
+						isSet: true,
+						columns: [{ name: 'v', type: scalarReturn(INTEGER_TYPE, false) }],
+						keys: [[{ index: 0 }]],
+						rowConstraints: [],
+					},
+				},
+				async function* (n: SqlValue): AsyncIterable<Row> {
+					for (let i = 0; i < Number(n); i++) yield [i];
+				},
+			));
+			expect(await collect(db, `select distinct v from keyed_tvf(2) order by v`)).to.deep.equal([{ v: 0 }, { v: 1 }]);
+
+			// `[]` inside keys is the empty key: at most one row.
+			db.registerFunction({
+				name: 'singleton_tvf',
+				numArgs: 0,
+				flags: FLAGS,
+				returnType: {
+					typeClass: 'relation',
+					columns: [{ name: 'v', type: scalarReturn(INTEGER_TYPE, false) }],
+					keys: [[]],
+				},
+				implementation: async function* (): AsyncIterable<Row> { yield [7]; },
+			} as any);
+			expect(await collect(db, `select v from singleton_tvf()`)).to.deep.equal([{ v: 7 }]);
+		});
+
+		it('leaves the caller\'s schema object untouched when it fills fields in', () => {
+			const declared = {
+				name: 'nomutate',
+				numArgs: 1,
+				flags: FLAGS,
+				returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE },
+				implementation: (x: SqlValue) => String(x),
+			};
+			db.registerFunction(declared as any);
+
+			expect(declared.returnType).to.not.have.property('nullable');
+		});
+
+		it('treats an explicitly null returnType as absent', async () => {
+			db.registerFunction({
+				name: 'nullret',
+				numArgs: 1,
+				flags: FLAGS,
+				returnType: null,
+				implementation: (x: SqlValue) => `n:${String(x)}`,
+			} as any);
+
+			expect(await collect(db, `select nullret(1) = 'n:1' as v`))
+				.to.satisfy((rows: Record<string, SqlValue>[]) => rows[0].v === 1 || rows[0].v === true);
 		});
 
 		it('accepts an aggregate with an explicit returnType', async () => {

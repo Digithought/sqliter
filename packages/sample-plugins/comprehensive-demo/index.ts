@@ -12,9 +12,11 @@ import {
 	FunctionFlags,
 	createScalarFunction,
 	createTableValuedFunction,
+	scalarReturn,
+	TEXT_RETURN,
+	INTEGER_RETURN,
+	REAL_RETURN,
 	TEXT_TYPE,
-	INTEGER_TYPE,
-	REAL_TYPE,
 } from '@quereus/quereus';
 import type {
 	Database,
@@ -127,27 +129,6 @@ const keyValueModule: VirtualTableModule<KeyValueTable> = {
 
 const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
 
-const REAL_SCALAR = {
-	typeClass: 'scalar' as const,
-	logicalType: REAL_TYPE,
-	nullable: true,
-	isReadOnly: true,
-};
-
-const INTEGER_SCALAR = {
-	typeClass: 'scalar' as const,
-	logicalType: INTEGER_TYPE,
-	nullable: true,
-	isReadOnly: true,
-};
-
-const TEXT_SCALAR = {
-	typeClass: 'scalar' as const,
-	logicalType: TEXT_TYPE,
-	nullable: true,
-	isReadOnly: true,
-};
-
 function mathRoundTo(value: SqlValue, precision: SqlValue): SqlValue {
 	if (value === null || value === undefined) return null;
 	if (precision === null || precision === undefined) return null;
@@ -229,19 +210,19 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 		functions: [
 			{
 				schema: createScalarFunction(
-					{ name: 'math_round_to', numArgs: 2, flags: DETERMINISTIC_UTF8, returnType: REAL_SCALAR },
+					{ name: 'math_round_to', numArgs: 2, flags: DETERMINISTIC_UTF8, returnType: REAL_RETURN },
 					mathRoundTo,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'hex_to_int', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: INTEGER_SCALAR },
+					{ name: 'hex_to_int', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: INTEGER_RETURN },
 					hexToInt,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'int_to_hex', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_SCALAR },
+					{ name: 'int_to_hex', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
 					intToHex,
 				),
 			},
@@ -256,8 +237,8 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 							isReadOnly: true,
 							isSet: false,
 							columns: [
-								{ name: 'property', type: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false, isReadOnly: true } },
-								{ name: 'value', type: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: true, isReadOnly: true } },
+								{ name: 'property', type: scalarReturn(TEXT_TYPE, false) },
+								{ name: 'value', type: scalarReturn(TEXT_TYPE) },
 							],
 							keys: [],
 							rowConstraints: [],
