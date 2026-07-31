@@ -1,10 +1,11 @@
 import type { AggregateFinalizer, AggregateReducer, IntegratedTableValuedFunc, ScalarFunc, TableValuedFunc, ScalarFunctionSchema,
-	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, AggregateArgBinding, TVFAdvertisement } from '../schema/function.js';
+	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, AggregateArgBinding, TVFAdvertisement, FunctionSchema } from '../schema/function.js';
 import { FunctionFlags } from '../common/constants.js';
-import type { ScalarType, RelationType } from '../common/datatype.js';
+import type { ScalarType, RelationType, BaseType, ColumnDef } from '../common/datatype.js';
 import { ANY_TYPE } from '../types/builtin-types.js';
 import type { LogicalType } from '../types/logical-type.js';
 import type { DeepReadonly } from '../common/types.js';
+import { MisuseError } from '../common/errors.js';
 
 /**
  * Configuration options for scalar functions
@@ -137,6 +138,165 @@ interface AggregateFuncOptions {
 }
 
 /**
+ * The return type a function that declares none is taken to have.
+ *
+ * An undeclared return type is genuinely unknown, so it defaults to ANY rather
+ * than guessing. A concrete guess is worse than no answer: while this defaulted to
+ * REAL, the planner believed every undeclared function returned a number and
+ * `insertCrossTypeCoercion` cast the *other* side of a comparison to REAL —
+ * `my_text_udf(x) = 'abc'` silently became `… = 0`. ANY sets neither isNumeric nor
+ * isTextual, so coercion leaves both operands alone and the generic runtime
+ * comparison decides. Declare `returnType` when you know it: ANY is safe but
+ * forfeits plan-time typing and comparison specialization.
+ */
+const UNKNOWN_SCALAR_RETURN: ScalarType = {
+	typeClass: 'scalar',
+	logicalType: ANY_TYPE,
+	nullable: true,
+	isReadOnly: true
+};
+
+/**
+ * The relation a table-valued function that declares no columns gets. Its empty
+ * `columns` is load-bearing: it is how such a function opts out of row-width
+ * normalization (see {@link createTableValuedFunction}).
+ *
+ * NOTE: as with the shared constants in `func/builtins/return-types.ts`, one
+ * object is shared by every function that defaults to it, so a `returnType` is
+ * only ever read, never mutated.
+ */
+const UNDECLARED_RELATION_RETURN: RelationType = {
+	typeClass: 'relation',
+	isReadOnly: true,
+	isSet: false, // Table functions can return duplicates by default
+	columns: [],
+	keys: [],
+	rowConstraints: []
+};
+
+/** Structural test for a logical type object — every one carries these two fields. */
+function isLogicalTypeObject(value: unknown): boolean {
+	if (typeof value !== 'object' || value === null) return false;
+	const candidate = value as Partial<LogicalType>;
+	return typeof candidate.name === 'string' && typeof candidate.physicalType === 'number';
+}
+
+/** Structural test for a scalar type object (`{ typeClass: 'scalar', logicalType, … }`). */
+function isScalarTypeObject(value: unknown): boolean {
+	if (typeof value !== 'object' || value === null) return false;
+	const candidate = value as Partial<ScalarType>;
+	return candidate.typeClass === 'scalar' && isLogicalTypeObject(candidate.logicalType);
+}
+
+function malformedReturnType(schema: FunctionSchema, problem: string): never {
+	throw new MisuseError(`Function '${schema.name}/${schema.numArgs}': ${problem}`);
+}
+
+/**
+ * Check a relation return type and fill in its omittable fields.
+ *
+ * `columns` is the field that carries meaning, so it is validated: a non-array,
+ * an unnamed column, or a column typed with anything but a scalar type object is
+ * rejected. `isReadOnly` / `isSet` / `keys` / `rowConstraints` all have one
+ * obvious answer for a function that says nothing about them, so an absent one
+ * is filled with the same value `createTableValuedFunction` uses rather than
+ * being demanded of the author — an absent `keys` otherwise registers fine and
+ * then fails at planning with `type.keys is not iterable`. Present-but-not-an-array
+ * is still a typo, and is rejected.
+ *
+ * Returns the input unchanged when nothing needed filling.
+ */
+function normalizeRelationReturnType(schema: FunctionSchema, returnType: RelationType): RelationType {
+	const columns: unknown = returnType.columns;
+	if (!Array.isArray(columns)) {
+		malformedReturnType(schema, 'returnType.columns must be an array of column definitions');
+	}
+	(columns as ReadonlyArray<Partial<ColumnDef> | null | undefined>).forEach((column, index) => {
+		if (typeof column?.name !== 'string' || column.name === '') {
+			malformedReturnType(schema, `returnType.columns[${index}].name must be a non-empty string`);
+		}
+		if (!isScalarTypeObject(column.type)) {
+			malformedReturnType(schema, `returnType.columns[${index}] ('${column.name}') must carry a scalar type object such as `
+				+ `{ typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true }, not a type-name string`);
+		}
+	});
+
+	const keys: unknown = returnType.keys;
+	if (keys !== undefined && !Array.isArray(keys)) {
+		malformedReturnType(schema, 'returnType.keys must be an array of key column references');
+	}
+	const rowConstraints: unknown = returnType.rowConstraints;
+	if (rowConstraints !== undefined && !Array.isArray(rowConstraints)) {
+		malformedReturnType(schema, 'returnType.rowConstraints must be an array');
+	}
+
+	const needsDefaults = returnType.isReadOnly === undefined || returnType.isSet === undefined
+		|| keys === undefined || rowConstraints === undefined;
+	if (!needsDefaults) return returnType;
+
+	return {
+		...returnType,
+		isReadOnly: returnType.isReadOnly ?? UNDECLARED_RELATION_RETURN.isReadOnly,
+		isSet: returnType.isSet ?? UNDECLARED_RELATION_RETURN.isSet,
+		keys: (keys as RelationType['keys']) ?? UNDECLARED_RELATION_RETURN.keys,
+		rowConstraints: (rowConstraints as RelationType['rowConstraints']) ?? UNDECLARED_RELATION_RETURN.rowConstraints,
+	};
+}
+
+/**
+ * The one stated contract for a registered function's `returnType`.
+ *
+ * - **Absent** means "unknown" and normalizes to a nullable scalar of ANY. A
+ *   schema carrying an implementation and no declared return type is therefore
+ *   taken to be SCALAR — nothing else distinguishes it from a table-valued
+ *   function, and a TVF with no declared columns is useless anyway. TVF authors
+ *   declare `returnType` or use {@link createTableValuedFunction}.
+ * - **Present but malformed** throws {@link MisuseError} naming the function and
+ *   the offending field. A typo is never silently downgraded to "unknown": that
+ *   is how the long-documented `{ typeClass: 'scalar', sqlType: 'TEXT' }` shape
+ *   half-worked for so long — it registered and evaluated, then failed with an
+ *   internal `undefined` read the first time anything compared against its type.
+ * - **Present and well-formed but incomplete** is filled in, for the fields that
+ *   have one obvious answer: see {@link normalizeRelationReturnType}.
+ *
+ * Both registration paths route through here: `Database.registerFunction` for a
+ * hand-built schema (the path every plugin takes via `registerPlugin`) and the
+ * `create*` helpers below.
+ *
+ * NOTE: `Schema.addFunction` (schema/schema.ts) is where all roads actually meet,
+ * including the built-ins registered at startup, but it is a plain map insert and
+ * deliberately stays one — gating there would revalidate every builtin on every
+ * database open for the same benefit. Anything that inserts into a Schema directly
+ * therefore bypasses this contract; the type guards in schema/function.ts are the
+ * backstop for that case.
+ */
+export function normalizeFunctionSchema<T extends FunctionSchema>(schema: T): T {
+	const returnType = schema.returnType as BaseType | undefined | null;
+	if (returnType === undefined || returnType === null) {
+		return { ...schema, returnType: UNKNOWN_SCALAR_RETURN } as unknown as T;
+	}
+	if (typeof returnType !== 'object') {
+		malformedReturnType(schema, 'returnType must be an object');
+	}
+	switch (returnType.typeClass) {
+		case 'scalar': {
+			if (!isScalarTypeObject(returnType)) {
+				malformedReturnType(schema, 'returnType.logicalType must be a type object such as TEXT_TYPE — '
+					+ 'build the declaration with scalarReturn(TEXT_TYPE) or use the TEXT_RETURN / INTEGER_RETURN / … constants');
+			}
+			break;
+		}
+		case 'relation': {
+			const relation = normalizeRelationReturnType(schema, returnType as RelationType);
+			return relation === returnType ? schema : { ...schema, returnType: relation } as unknown as T;
+		}
+		default:
+			malformedReturnType(schema, `returnType.typeClass must be 'scalar' or 'relation' (got ${String(returnType.typeClass)})`);
+	}
+	return schema;
+}
+
+/**
  * Creates a function schema for a scalar SQL function.
  * This is the primary way to register scalar functions in Quereus.
  *
@@ -145,26 +305,13 @@ interface AggregateFuncOptions {
  * @returns A FunctionSchema ready for registration
  */
 export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarFunc): ScalarFunctionSchema {
-	// An undeclared return type is genuinely unknown, so it defaults to ANY rather
-	// than guessing. A concrete guess is worse than no answer: while this defaulted to
-	// REAL, the planner believed every undeclared function returned a number and
-	// `insertCrossTypeCoercion` cast the *other* side of a comparison to REAL —
-	// `my_text_udf(x) = 'abc'` silently became `… = 0`. ANY sets neither isNumeric nor
-	// isTextual, so coercion leaves both operands alone and the generic runtime
-	// comparison decides. Declare `returnType` when you know it: ANY is safe but
-	// forfeits plan-time typing and comparison specialization.
-	const returnType: ScalarType = options.returnType ?? {
-		typeClass: 'scalar',
-		logicalType: ANY_TYPE,
-		nullable: true,
-		isReadOnly: true
-	};
-
-	return {
+	// Defaulting and validation both live in normalizeFunctionSchema — see the
+	// contract there for what an absent return type means.
+	return normalizeFunctionSchema({
 		name: options.name,
 		numArgs: options.numArgs,
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
-		returnType,
+		returnType: options.returnType ?? UNKNOWN_SCALAR_RETURN,
 		implementation: jsFunc,
 		replicable: options.replicable,
 		inferReturnType: options.inferReturnType,
@@ -175,7 +322,7 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 		hidden: options.hidden,
 		comparesArgs: options.comparesArgs,
 		returnsArg: options.returnsArg,
-	};
+	});
 }
 
 /**
@@ -194,24 +341,15 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
  * @returns A FunctionSchema ready for registration
  */
 export function createTableValuedFunction(options: TableValuedFuncOptions, jsFunc: TableValuedFunc): TableValuedFunctionSchema {
-	const returnType: RelationType = options.returnType ?? {
-		typeClass: 'relation',
-		isReadOnly: true,
-		isSet: false, // Table functions can return duplicates by default
-		columns: [],
-		keys: [],
-		rowConstraints: []
-	};
-
-	return {
+	return normalizeFunctionSchema({
 		name: options.name,
 		numArgs: options.numArgs,
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
-		returnType,
+		returnType: options.returnType ?? UNDECLARED_RELATION_RETURN,
 		implementation: jsFunc,
 		replicable: options.replicable,
 		relationalAdvertisement: options.relationalAdvertisement
-	};
+	});
 }
 
 /**
@@ -223,25 +361,16 @@ export function createTableValuedFunction(options: TableValuedFuncOptions, jsFun
  * @returns A FunctionSchema ready for registration
  */
 export function createIntegratedTableValuedFunction(options: TableValuedFuncOptions, jsFunc: IntegratedTableValuedFunc): TableValuedFunctionSchema {
-	const returnType: RelationType = options.returnType ?? {
-		typeClass: 'relation',
-		isReadOnly: true,
-		isSet: false, // Table functions can return duplicates by default
-		columns: [],
-		keys: [],
-		rowConstraints: []
-	};
-
-	return {
+	return normalizeFunctionSchema({
 		name: options.name,
 		numArgs: options.numArgs,
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
-		returnType,
+		returnType: options.returnType ?? UNDECLARED_RELATION_RETURN,
 		implementation: jsFunc,
 		replicable: options.replicable,
 		isIntegrated: true,
 		relationalAdvertisement: options.relationalAdvertisement
-	};
+	});
 }
 
 /**
@@ -258,22 +387,14 @@ export function createAggregateFunction(
 	stepFunc: AggregateReducer,
 	finalizeFunc: AggregateFinalizer
 ): AggregateFunctionSchema {
-	// Unknown rather than guessed — see the note in createScalarFunction. No built-in
-	// aggregate rides this default (every one declares a type or supplies
-	// inferReturnType); it guards user-defined aggregates registered through
-	// Database.createAggregateFunction.
-	const returnType: ScalarType = options.returnType ?? {
-		typeClass: 'scalar',
-		logicalType: ANY_TYPE,
-		nullable: true,
-		isReadOnly: true
-	};
-
-	return {
+	// Unknown rather than guessed — see UNKNOWN_SCALAR_RETURN. No built-in aggregate
+	// rides this default (every one declares a type or supplies inferReturnType); it
+	// guards user-defined aggregates registered through Database.createAggregateFunction.
+	return normalizeFunctionSchema({
 		name: options.name,
 		numArgs: options.numArgs,
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
-		returnType,
+		returnType: options.returnType ?? UNKNOWN_SCALAR_RETURN,
 		stepFunction: stepFunc,
 		finalizeFunction: finalizeFunc,
 		initialValue: options.initialValue,
@@ -282,7 +403,7 @@ export function createAggregateFunction(
 		replicable: options.replicable,
 		inferReturnType: options.inferReturnType,
 		validateArgTypes: options.validateArgTypes
-	};
+	});
 }
 
 /**

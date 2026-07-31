@@ -418,13 +418,21 @@ export type FunctionSchema =
 
 /**
  * Type guards for function schema types.
+ *
+ * `returnType` is declared non-optional and `Database.registerFunction` normalizes
+ * it (see `normalizeFunctionSchema` in func/registration.ts), so an absent one
+ * should be unreachable. These guards answer `false` rather than throwing anyway:
+ * a schema that reaches the planner some other way (e.g. inserted straight into a
+ * Schema) then produces "Function f is not a scalar function" instead of an
+ * internal `undefined` read, and the `function_info()` catalog keeps listing
+ * instead of truncating at the first bad entry.
  */
 export function isScalarFunctionSchema(schema: FunctionSchema): schema is ScalarFunctionSchema {
-	return schema.returnType.typeClass === 'scalar' && 'implementation' in schema && typeof schema.implementation === 'function';
+	return schema.returnType?.typeClass === 'scalar' && 'implementation' in schema && typeof schema.implementation === 'function';
 }
 
 export function isTableValuedFunctionSchema(schema: FunctionSchema): schema is TableValuedFunctionSchema {
-	return schema.returnType.typeClass === 'relation';
+	return schema.returnType?.typeClass === 'relation';
 }
 
 export function isAggregateFunctionSchema(schema: FunctionSchema): schema is AggregateFunctionSchema {

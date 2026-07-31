@@ -243,8 +243,27 @@ export type { InstructionTracer, InstructionTraceEvent } from './runtime/types.j
 export {
 	createScalarFunction,
 	createTableValuedFunction,
-	createAggregateFunction
+	createAggregateFunction,
+	normalizeFunctionSchema
 } from './func/registration.js';
+
+// Return-type declarations for registered functions. `scalarReturn(TEXT_TYPE)` and
+// the `*_RETURN` constants make declaring a function's return type a one-token edit
+// instead of a repeated four-field object literal.
+export {
+	scalarReturn,
+	TEXT_RETURN,
+	TEXT_RETURN_NOT_NULL,
+	INTEGER_RETURN,
+	INTEGER_RETURN_NOT_NULL,
+	REAL_RETURN,
+	REAL_RETURN_NOT_NULL,
+	BOOLEAN_RETURN,
+	BOOLEAN_RETURN_NOT_NULL,
+	BLOB_RETURN,
+	JSON_RETURN,
+	ANY_RETURN
+} from './func/builtins/return-types.js';
 
 export type {
 	ScalarFunc,

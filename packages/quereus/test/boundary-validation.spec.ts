@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { expect } from 'chai';
-import { Database, MisuseError, PhysicalType } from '../src/index.js';
+import { Database, MisuseError, PhysicalType, TEXT_TYPE } from '../src/index.js';
 
 describe('Boundary Validation', () => {
 	let db: Database;
@@ -61,36 +61,41 @@ describe('Boundary Validation', () => {
 	// ========================================================================
 
 	describe('registerFunction()', () => {
+		// A valid scalar return type. Each case below is malformed in exactly the field
+		// its name calls out, so the assertion cannot pass on some other check's error;
+		// registerFunction validates returnType last, after all of these.
+		const TEXT_RETURN_TYPE = { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true };
+
 		it('should reject null schema', () => {
 			expect(() => db.registerFunction(null as any)).to.throw(MisuseError, /schema must be an object/);
 		});
 
 		it('should reject schema with empty name', () => {
-			expect(() => db.registerFunction({ name: '', numArgs: 0, flags: 0, returnType: { typeClass: 'scalar', affinity: 3 }, implementation: () => null } as any)).to.throw(MisuseError, /schema\.name must be a non-empty string/);
+			expect(() => db.registerFunction({ name: '', numArgs: 0, flags: 0, returnType: TEXT_RETURN_TYPE, implementation: () => null } as any)).to.throw(MisuseError, /schema\.name must be a non-empty string/);
 		});
 
 		it('should reject schema with non-integer numArgs', () => {
-			expect(() => db.registerFunction({ name: 'f', numArgs: 1.5, flags: 0, returnType: { typeClass: 'scalar', affinity: 3 }, implementation: () => null } as any)).to.throw(MisuseError, /schema\.numArgs must be an integer/);
+			expect(() => db.registerFunction({ name: 'f', numArgs: 1.5, flags: 0, returnType: TEXT_RETURN_TYPE, implementation: () => null } as any)).to.throw(MisuseError, /schema\.numArgs must be an integer/);
 		});
 
 		it('should reject schema with numArgs < -1', () => {
-			expect(() => db.registerFunction({ name: 'f', numArgs: -2, flags: 0, returnType: { typeClass: 'scalar', affinity: 3 }, implementation: () => null } as any)).to.throw(MisuseError, /schema\.numArgs must be an integer/);
+			expect(() => db.registerFunction({ name: 'f', numArgs: -2, flags: 0, returnType: TEXT_RETURN_TYPE, implementation: () => null } as any)).to.throw(MisuseError, /schema\.numArgs must be an integer/);
 		});
 
 		it('should reject schema without implementation or stepFunction', () => {
-			expect(() => db.registerFunction({ name: 'f', numArgs: 0, flags: 0, returnType: { typeClass: 'scalar', affinity: 3 } } as any)).to.throw(MisuseError, /must have implementation/);
+			expect(() => db.registerFunction({ name: 'f', numArgs: 0, flags: 0, returnType: TEXT_RETURN_TYPE } as any)).to.throw(MisuseError, /must have implementation/);
 		});
 
 		it('should reject aggregate schema with non-function stepFunction', () => {
-			expect(() => db.registerFunction({ name: 'f', numArgs: 0, flags: 0, returnType: { typeClass: 'scalar', affinity: 3 }, stepFunction: 'not a func', finalizeFunction: () => null } as any)).to.throw(MisuseError, /stepFunction must be a function/);
+			expect(() => db.registerFunction({ name: 'f', numArgs: 0, flags: 0, returnType: TEXT_RETURN_TYPE, stepFunction: 'not a func', finalizeFunction: () => null } as any)).to.throw(MisuseError, /stepFunction must be a function/);
 		});
 
 		it('should reject aggregate schema with non-function finalizeFunction', () => {
-			expect(() => db.registerFunction({ name: 'f', numArgs: 0, flags: 0, returnType: { typeClass: 'scalar', affinity: 3 }, stepFunction: () => null, finalizeFunction: 'not a func' } as any)).to.throw(MisuseError, /finalizeFunction must be a function/);
+			expect(() => db.registerFunction({ name: 'f', numArgs: 0, flags: 0, returnType: TEXT_RETURN_TYPE, stepFunction: () => null, finalizeFunction: 'not a func' } as any)).to.throw(MisuseError, /finalizeFunction must be a function/);
 		});
 
 		it('should reject schema with non-function implementation', () => {
-			expect(() => db.registerFunction({ name: 'f', numArgs: 0, flags: 0, returnType: { typeClass: 'scalar', affinity: 3 }, implementation: 'not a func' } as any)).to.throw(MisuseError, /schema\.implementation must be a function/);
+			expect(() => db.registerFunction({ name: 'f', numArgs: 0, flags: 0, returnType: TEXT_RETURN_TYPE, implementation: 'not a func' } as any)).to.throw(MisuseError, /schema\.implementation must be a function/);
 		});
 	});
 

@@ -331,29 +331,31 @@ Notes:
 
 Functions extend SQL with custom computational logic. For the complete list of built-in functions (scalar, aggregate, window, JSON, date/time), see the [Built-in Functions Reference](functions.md).
 
+Build every function schema with one of the `create*` helpers (`createScalarFunction`, `createTableValuedFunction`, `createAggregateFunction`). They fill in the defaults and are type-checked against the schema the engine actually expects — see [Declaring return types](#declaring-return-types) for what a `returnType` must look like and what happens if it is wrong.
+
 ### Scalar Functions
 
 Return a single value:
 
 ```typescript
-import { Database, FunctionFlags, SqlValue } from 'quereus';
+import { createScalarFunction, FunctionFlags, TEXT_RETURN } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
+
+const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
 
 function reverse(text: SqlValue): SqlValue {
   if (text === null || text === undefined) return null;
   return String(text).split('').reverse().join('');
 }
 
-export default function register(db: Database, config: any) {
+export default function register(db: Database, config: Record<string, SqlValue> = {}) {
   return {
     functions: [
       {
-        schema: {
-          name: 'reverse',
-          numArgs: 1,
-          flags: FunctionFlags.UTF8,
-          returnType: { typeClass: 'scalar', sqlType: 'TEXT' },
-          implementation: reverse
-        }
+        schema: createScalarFunction(
+          { name: 'reverse', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
+          reverse
+        )
       }
     ]
   };
@@ -362,76 +364,111 @@ export default function register(db: Database, config: any) {
 
 ### Table-Valued Functions
 
-Return multiple rows:
+Return multiple rows. The implementation is an **async generator** (its declared type is `(...args) => MaybePromise<AsyncIterable<Row>>`), and each row it yields is an **array of values in declared column order** — not an object keyed by column name:
 
-```javascript
-function* split_string(text, delimiter) {
+```typescript
+import { createTableValuedFunction, FunctionFlags, scalarReturn, INTEGER_TYPE, TEXT_TYPE } from '@quereus/quereus';
+import type { Database, Row, SqlValue } from '@quereus/quereus';
+
+const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
+
+async function* splitString(text: SqlValue, delimiter: SqlValue): AsyncIterable<Row> {
   if (text === null || text === undefined) return;
-  
-  const parts = String(text).split(String(delimiter || ','));
+
+  const parts = String(text).split(String(delimiter ?? ','));
   for (let i = 0; i < parts.length; i++) {
-    yield { 
-      index: i + 1, 
-      value: parts[i].trim() 
-    };
+    yield [i + 1, parts[i].trim()];
   }
 }
 
-export default function register(db, config) {
+export default function register(db: Database, config: Record<string, SqlValue> = {}) {
   return {
     functions: [
       {
-        schema: {
-          name: 'split_string',
-          numArgs: 2,
-          flags: 1,
-          returnType: { 
-            typeClass: 'relation',
-            columns: [
-              { name: 'index', type: 'INTEGER' },
-              { name: 'value', type: 'TEXT' }
-            ]
+        schema: createTableValuedFunction(
+          {
+            name: 'split_string',
+            numArgs: 2,
+            flags: DETERMINISTIC_UTF8,
+            returnType: {
+              typeClass: 'relation',
+              isReadOnly: true,
+              isSet: false,
+              columns: [
+                { name: 'ordinal', type: scalarReturn(INTEGER_TYPE, false) },
+                { name: 'value', type: scalarReturn(TEXT_TYPE, false) }
+              ],
+              keys: [],
+              rowConstraints: []
+            }
           },
-          implementation: split_string
-        }
+          splitString
+        )
       }
     ]
   };
 }
 ```
+
+Declared columns are what makes `select ordinal, value from split_string(...)` and `... where value = 'b'` resolve; a table-valued function that declares none has no referenceable column names.
 
 ### Aggregate Functions
 
 Accumulate values across rows:
 
-```javascript
-function concatenateStep(accumulator, value) {
+```typescript
+import { createAggregateFunction, FunctionFlags, TEXT_RETURN } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
+
+const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
+
+function concatenateStep(accumulator: string, value: SqlValue): string {
   if (value === null || value === undefined) return accumulator;
   return accumulator + String(value);
 }
 
-function concatenateFinal(accumulator) {
+function concatenateFinal(accumulator: string): SqlValue {
   return accumulator;
 }
 
-export default function register(db, config) {
+export default function register(db: Database, config: Record<string, SqlValue> = {}) {
   return {
     functions: [
       {
-        schema: {
-          name: 'str_concat',
-          numArgs: 1,
-          flags: 1,
-          returnType: { typeClass: 'scalar', sqlType: 'TEXT' },
-          stepFunction: concatenateStep,
-          finalizeFunction: concatenateFinal,
-          initialValue: ''
-        }
+        schema: createAggregateFunction(
+          { name: 'str_concat', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN, initialValue: '' },
+          concatenateStep,
+          concatenateFinal
+        )
       }
     ]
   };
 }
 ```
+
+### Declaring return types
+
+Every function schema carries a `returnType`, and there is exactly one contract for it — the same one whether you build the schema by hand or through a `create*` helper.
+
+A **scalar** return type names a *logical type object*, not a type-name string:
+
+```typescript
+import { scalarReturn, TEXT_TYPE } from '@quereus/quereus';
+
+scalarReturn(TEXT_TYPE)         // { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }
+scalarReturn(TEXT_TYPE, false)  // ...the same, declared NOT NULL
+```
+
+Ready-made constants cover the common cases: `TEXT_RETURN`, `INTEGER_RETURN`, `REAL_RETURN`, `BOOLEAN_RETURN`, `BLOB_RETURN`, `JSON_RETURN`, `ANY_RETURN`, plus `*_RETURN_NOT_NULL` variants for the ones that can never return NULL. A **relation** return type (table-valued functions) gives each column a `name` and a scalar type object as its `type` — again, not a type-name string.
+
+Rules:
+
+- **Omitting `returnType` is allowed** and means "unknown": it becomes a nullable scalar of type ANY. That is safe, but it forfeits plan-time typing, comparison specialization and cross-type coercion — declare the truth when you know it.
+- **A schema with an `implementation` and no `returnType` is taken to be scalar.** Nothing else distinguishes a scalar from a table-valued function, and a table-valued function with no declared columns is useless anyway. A table-valued function must therefore declare its columns, or be built with `createTableValuedFunction`.
+- **A relation's `isReadOnly`, `isSet`, `keys` and `rowConstraints` may be omitted** — each has one obvious answer for a function that says nothing about it, and registration fills it in. Only `columns` carries meaning you have to supply.
+- **A malformed `returnType` is rejected at registration** with a `MisuseError` naming the function and the offending field. Registration does not quietly downgrade a typo to "unknown" — a wrong-shaped declaration that registers successfully only fails much later, at query planning time, with an error that names neither the function nor the problem. Malformed means: a `typeClass` that is missing or is neither `'scalar'` nor `'relation'`; a scalar whose `logicalType` is missing or is not a type object; a relation whose `columns` is not an array, or whose columns lack a `name` or carry a `type` that is not a scalar type object; a relation whose `keys` or `rowConstraints` is present but is not an array.
+
+Older documentation showed `returnType: { typeClass: 'scalar', sqlType: 'TEXT' }` and relation columns typed `{ name: 'v', type: 'INTEGER' }`. Neither shape has ever been read by the engine; both are now rejected at registration.
 
 ### Variable Arguments
 
@@ -644,6 +681,7 @@ Here's a comprehensive plugin that demonstrates all three types. Note that metad
 
 **index.ts:**
 ```typescript
+import { createScalarFunction, FunctionFlags, TEXT_RETURN } from '@quereus/quereus';
 import type { Database, SqlValue, CollationFunction } from '@quereus/quereus';
 
 // Virtual table: simple key-value store
@@ -732,13 +770,10 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 
     functions: [
       {
-        schema: {
-          name: 'upper_reverse',
-          numArgs: 1,
-          flags: 1,
-          returnType: { typeClass: 'scalar', sqlType: 'TEXT' },
-          implementation: upperReverse
-        }
+        schema: createScalarFunction(
+          { name: 'upper_reverse', numArgs: 1, flags: FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC, returnType: TEXT_RETURN },
+          upperReverse
+        )
       }
     ],
 
@@ -759,6 +794,7 @@ Plugins are now best developed in TypeScript for full type safety and IDE suppor
 ### Full Type Safety
 
 ```typescript
+import { createScalarFunction, FunctionFlags, TEXT_RETURN } from '@quereus/quereus';
 import type { Database, SqlValue, CollationFunction } from '@quereus/quereus';
 
 // Compile-time checking of function implementations
@@ -777,13 +813,12 @@ const myCollation: CollationFunction = (a: string, b: string): number => {
 export default function register(db: Database, config: Record<string, SqlValue> = {}) {
   return {
     functions: [{
-      schema: {
-        name: 'my_function',
-        numArgs: 1,
-        flags: 1,
-        returnType: { typeClass: 'scalar', sqlType: 'TEXT' },
-        implementation: myFunction  // Type-checked at compile time
-      }
+      // createScalarFunction type-checks the whole schema — including the
+      // returnType shape — at compile time
+      schema: createScalarFunction(
+        { name: 'my_function', numArgs: 1, flags: FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC, returnType: TEXT_RETURN },
+        myFunction
+      )
     }],
     collations: [{
       name: 'MY_COLLATION',

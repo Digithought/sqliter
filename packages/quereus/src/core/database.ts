@@ -9,7 +9,7 @@ import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { FunctionSchema } from '../schema/function.js';
 import { BUILTIN_FUNCTIONS } from '../func/builtins/index.js';
-import { createScalarFunction, createAggregateFunction } from '../func/registration.js';
+import { createScalarFunction, createAggregateFunction, normalizeFunctionSchema } from '../func/registration.js';
 import { FunctionFlags } from '../common/constants.js';
 import { MemoryTableModule } from '../vtab/memory/module.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
@@ -1223,7 +1223,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/**
 	 * Registers a function using a pre-defined FunctionSchema.
-	 * This is the lower-level registration method.
+	 * This is the lower-level registration method, and the path every plugin takes
+	 * (`registerPlugin` hands each entry's schema straight here).
+	 *
+	 * The schema's `returnType` is checked and normalized by
+	 * {@link normalizeFunctionSchema} — an absent one means "unknown" and becomes a
+	 * nullable scalar of ANY; a malformed one is rejected with a MisuseError rather
+	 * than surfacing later as an internal error at planning time.
 	 *
 	 * @param schema The FunctionSchema object describing the function.
 	 */
@@ -1253,8 +1259,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		} else {
 			throw new MisuseError('registerFunction: schema must have implementation (scalar/TVF) or stepFunction+finalizeFunction (aggregate)');
 		}
-		this.registerFunctionWithErrorHandling('user', schema.name, schema.numArgs, () => {
-			this.schemaManager.getMainSchema().addFunction(schema);
+		// Return-type contract last, so the checks above keep firing on the field they name.
+		const normalized = normalizeFunctionSchema(schema);
+		this.registerFunctionWithErrorHandling('user', normalized.name, normalized.numArgs, () => {
+			this.schemaManager.getMainSchema().addFunction(normalized);
 		});
 	}
 

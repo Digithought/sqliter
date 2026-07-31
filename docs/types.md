@@ -1093,7 +1093,14 @@ Declaring neither `returnType` nor `inferReturnType` yields `ANY_TYPE` — the e
   returned a number and cast the *other* side of a comparison to REAL, so
   `my_text_func(x) = 'abc'` silently became `… = 0` and was always false.
 - `Database.createScalarFunction` / `createAggregateFunction` never pass a `returnType`, so
-  every user- and plugin-registered function lands on this default.
+  every function registered through *those* two lands on this default. A plugin that builds
+  its own schema and registers it through `Database.registerFunction` declares its own.
+- Omitting the return type is the only accepted way to say "unknown". A `returnType` that is
+  *present but malformed* is rejected at registration with a `MisuseError` naming the
+  function and the offending field — it is never quietly downgraded to `ANY_TYPE`. The one
+  contract, shared by `Database.registerFunction` and all the `create*` helpers, lives in
+  `normalizeFunctionSchema` (`func/registration.ts`); `docs/plugins.md`
+  § Declaring return types states it for plugin authors.
 - Every **built-in** scalar function now declares a `returnType` or an `inferReturnType`,
   with one deliberate exception: `json_extract`, whose result shape depends on the data
   rather than on the argument types, declares `ANY_TYPE` explicitly. The shared shape
@@ -1101,7 +1108,8 @@ Declaring neither `returnType` nor `inferReturnType` yields `ANY_TYPE` — the e
   `REAL_RETURN`, `BOOLEAN_RETURN`, `BLOB_RETURN`, `JSON_RETURN`, `ANY_RETURN`, plus
   `_NOT_NULL` variants and the `scalarReturn(type, nullable)` builder for the types with
   no constant). Every built-in scalar, aggregate and window function declares through
-  them — use them rather than re-spelling the four-field literal.
+  them — use them rather than re-spelling the four-field literal. They are re-exported from
+  the package index, so plugins outside this repo can use them too.
 - A function whose result is not closed over its argument's type must declare the wider
   type rather than infer the argument's. `sqrt`, `pow` and `power` all declare REAL for
   this reason: `sqrt(int_col)` claiming INTEGER would make the write path skip conversion
