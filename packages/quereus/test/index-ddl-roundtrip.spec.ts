@@ -238,6 +238,44 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 		}
 	});
 
+	it('two UNIQUE constraints deriving one structure name leave ONE index entry, not two', async () => {
+		// The sibling test above pins what two entries under one name cost. This pins the
+		// other producer of that shape and the guard that now closes it: a UNIQUE whose
+		// backing structure name is the `_uc_<cols>` another UNIQUE on the same table
+		// derives. The ALTER paths refuse it (`assertUniqueConstraintIndexNameFree` sees
+		// the materialized structure in `tableSchema.indexes`), but CREATE TABLE runs no
+		// such check, so the declaration below reaches `ensureUniqueConstraintIndexes` with
+		// two constraints wanting one name. It now ADOPTS the held name instead of pushing
+		// a second entry under it. Only reachable by typing the engine-reserved `_uc_`
+		// prefix into a constraint name — see the NOTE on `findIndexShadowedByUniqueConstraint`.
+		//
+		// NOTE: adoption is damage LIMITATION, not a fix. The adopting constraint is left
+		// enforced by a structure keyed on the OTHER constraint's column, so `unique (c)`
+		// below silently stops rejecting duplicate `c`. That gap predates this guard (with
+		// two entries, both constraints resolved the name to the same first-match entry) and
+		// is filed as `backlog/bug-create-table-unique-derived-name-collision`; asserted
+		// here only as the array shape, so a future fix visibly flips it.
+		const dst = new Database();
+		try {
+			await dst.exec('create table t (id integer primary key, c integer, b integer, constraint _uc_c unique (b), unique (c))');
+
+			const t = dst._findTable('t')!;
+			expect(t.uniqueConstraints, 'both constraints registered').to.have.length(2);
+			expect((t.indexes ?? []).map(idx => idx.name), 'one entry under the shared name').to.deep.equal(['_uc_c']);
+
+			// Both are backing structures, so neither surfaces as a user index.
+			expect(await rows(dst, "select index_name from index_info('t')")).to.deep.equal([]);
+
+			// The constraint that OWNS the structure still enforces normally.
+			await dst.exec('insert into t values (1, 5, 7)');
+			let err: Error | undefined;
+			try { await dst.exec('insert into t values (2, 6, 7)'); } catch (e) { err = e as Error; }
+			expect(err?.message, 'the owning UNIQUE still enforces').to.match(/UNIQUE constraint failed/i);
+		} finally {
+			await dst.close();
+		}
+	});
+
 	it('a genuine expression index is still rejected on import', async () => {
 		const dst = new Database();
 		try {

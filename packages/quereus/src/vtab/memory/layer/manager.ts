@@ -278,11 +278,27 @@ export class MemoryTableManager {
 				this.indexCollationsMatchDeclared(idx, uc)
 			);
 
+			// The name this constraint's own structure would take, and whoever already holds
+			// it in `newIndexes` — a pre-existing index, or the structure an EARLIER
+			// constraint in this same loop just pushed. A held name is ADOPTED, never pushed
+			// a second time: two entries under one name is the state `importDDL` warns about
+			// (see `SchemaManager.importCatalog`) — `index_info()` then reports neither,
+			// `DROP INDEX` answers `no such index`, and a predicate over the covered column
+			// stops filtering. No write path can produce a duplicate unnamed UNIQUE any more
+			// (`assertNoDuplicateUniqueConstraints` / `assertUniqueConstraintNotDuplicated`
+			// refuse it at every declaration site), so this arm is defence in depth for a
+			// catalog written before those guards: it degrades to one shared structure and
+			// double enforcement rather than to a corrupt index list.
+			const wantedName = uc.name ?? this.implicitIndexNameFor(uc);
+			const claimedIndex = newIndexes.find(idx => idx.name.toLowerCase() === wantedName.toLowerCase());
+
 			let indexName: string;
 			if (matchingIndex) {
 				indexName = matchingIndex.name;
+			} else if (claimedIndex) {
+				indexName = claimedIndex.name;
 			} else {
-				indexName = uc.name ?? this.implicitIndexNameFor(uc);
+				indexName = wantedName;
 				newIndexes.push({
 					name: indexName,
 					// Carry each column's declared collation so the auto-index — and the

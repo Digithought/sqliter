@@ -637,7 +637,160 @@ drop table iul_ac;
 -- run
 
 -- ============================================================
--- 10. `apply schema` reaches the same guard
+-- 10. Duplicate UNIQUE constraints — one rule, every declaration site
+-- ============================================================
+-- An unnamed UNIQUE has no name to compare, so before this guard the only thing that
+-- ever noticed a repeat was the backing-structure name — which the memory backend
+-- materializes and the store backend does not, so one statement got three different
+-- answers. The test is the constraint's COLUMN SET, which both backends carry, and it
+-- runs ahead of the index-name check so the message names the constraint rather than
+-- an index the user never created.
+
+-- 10a. ALTER TABLE ADD CONSTRAINT
+create table dup_ac (id integer primary key, c integer, d integer);
+alter table dup_ac add unique (c);
+-- run
+
+alter table dup_ac add unique (c);
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+-- Case folds, like every other column-name compare.
+alter table dup_ac add unique (C);
+-- error: an equivalent UNIQUE constraint on (C) already exists
+
+-- Exactly one constraint survives the refusals, and it still enforces.
+select count(*) as c from unique_constraint_info('dup_ac');
+→ [{"c":1}]
+
+insert into dup_ac values (1, 5, 7);
+-- run
+
+insert into dup_ac values (2, 5, 8);
+-- error: unique
+
+-- Column ORDER is not identity: `unique (c, d)` and `unique (d, c)` are one rule, even
+-- though their derived structure names (`_uc_c_d` / `_uc_d_c`) differ.
+alter table dup_ac add unique (c, d);
+-- run
+
+alter table dup_ac add unique (d, c);
+-- error: an equivalent UNIQUE constraint on (d, c) already exists
+
+select count(distinct id) as c from unique_constraint_info('dup_ac');
+→ [{"c":2}]
+
+-- 10b. ALTER TABLE ADD COLUMN … unique, repeated within ONE statement
+create table dup_cc (id integer primary key, a text);
+-- run
+
+alter table dup_cc add column m text unique unique;
+-- error: an equivalent UNIQUE constraint on (m) already exists
+
+-- The refusal left the table exactly as it was — the column was never added.
+select count(*) as c from table_info('dup_cc') where name = 'm';
+→ [{"c":0}]
+
+-- A single inline `unique` still adds the column and enforces.
+alter table dup_cc add column n text unique;
+insert into dup_cc values (1, 'p', 'q');
+-- run
+
+insert into dup_cc values (2, 'p2', 'q');
+-- error: unique
+
+-- 10c. CREATE TABLE — refused before any storage is created
+create table dup_ct (id integer primary key, c integer, unique (c), unique (c));
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+select count(*) as c from schema() where type = 'table' and name = 'dup_ct';
+→ [{"c":0}]
+
+-- Column-level and table-level spellings of the same rule collide too.
+create table dup_ct (id integer primary key, c integer unique, unique (c));
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+-- ...as do two column-level ones on one column.
+create table dup_ct (id integer primary key, c integer unique unique);
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+-- Multi-column, declared in opposite orders — still one rule.
+create table dup_ct (id integer primary key, c integer, d integer, unique (c, d), unique (d, c));
+-- error: an equivalent UNIQUE constraint on (d, c) already exists
+
+-- The name is free the whole time: a single declaration creates normally.
+create table dup_ct (id integer primary key, c integer, d integer, unique (c), unique (d));
+insert into dup_ct values (1, 1, 1);
+-- run
+
+insert into dup_ct values (2, 1, 2);
+-- error: unique
+
+-- 10d. CARVE-OUT — a named UNIQUE beside an unnamed one over the same columns is legal
+-- Both are addressable and droppable by name, so the state is redundant, not broken.
+create table dup_nm (id integer primary key, c integer, unique (c));
+alter table dup_nm add constraint nm_u1 unique (c);
+-- run
+
+select count(distinct id) as c from unique_constraint_info('dup_nm');
+→ [{"c":2}]
+
+-- A SECOND named one is legal as well — a distinct name is a distinct identity.
+alter table dup_nm add constraint nm_u2 unique (c);
+-- run
+
+-- ...but a repeated NAME is still refused, by the name guard rather than this one.
+alter table dup_nm add constraint nm_u2 unique (c);
+-- error: a constraint with that name already exists
+
+-- The named ones drop by name, leaving the unnamed one enforcing.
+alter table dup_nm drop constraint nm_u1;
+alter table dup_nm drop constraint nm_u2;
+insert into dup_nm values (1, 3);
+-- run
+
+insert into dup_nm values (2, 3);
+-- error: unique
+
+select count(distinct id) as c from unique_constraint_info('dup_nm');
+→ [{"c":1}]
+
+-- 10e. CARVE-OUT — partial UNIQUEs over the same columns are different rules
+-- A partial UNIQUE only governs rows inside its predicate, so two with different
+-- predicates are genuinely different constraints, and neither duplicates a full one.
+create table dup_pt (id integer primary key, c integer, s text);
+create unique index dup_pt_pos on dup_pt (c) where s = 'pos';
+create unique index dup_pt_neg on dup_pt (c) where s = 'neg';
+-- run
+
+select count(distinct id) as c from unique_constraint_info('dup_pt') where partial = 1;
+→ [{"c":2}]
+
+-- A full UNIQUE over the same column is still accepted beside them.
+-- NOTE: acceptance only — this section deliberately does NOT assert that the full
+-- UNIQUE then ENFORCES. On the memory backend it does not: `ensureUniqueConstraintIndexes`
+-- reuses a same-column PARTIAL index as a full constraint's backing structure, so
+-- enforcement silently narrows to the predicate's scope. That is a separate pre-existing
+-- defect in the reuse rule (see tickets/fix/bug-memory-unique-reuses-partial-index), not
+-- in the duplicate test this section covers.
+alter table dup_pt add unique (c);
+-- run
+
+select count(distinct id) as c from unique_constraint_info('dup_pt');
+→ [{"c":3}]
+
+-- ...and now it is the full one that refuses the repeat.
+alter table dup_pt add unique (c);
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+drop table dup_pt;
+drop table dup_nm;
+drop table dup_ct;
+drop table dup_cc;
+drop table dup_ac;
+-- run
+
+-- ============================================================
+-- 11. `apply schema` reaches the same guard
 -- ============================================================
 -- The differ emits `ALTER TABLE … ADD <constraint>` through the normal statement
 -- pipeline, so it inherits the ADD CONSTRAINT arm above rather than needing its

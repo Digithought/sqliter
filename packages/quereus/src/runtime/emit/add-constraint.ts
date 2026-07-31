@@ -8,7 +8,7 @@ import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import { assertConstraintNameFree, opsToMask, requireVtabModule } from '../../schema/table.js';
 import { buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
-import { assertUniqueConstraintIndexNameFree } from '../../schema/catalog.js';
+import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import { emitAlterSchemaEvent } from './alter-schema-event.js';
 
@@ -160,18 +160,20 @@ async function runAddConstraintViaModule(
 		validateForeignKeyCollations(rctx.db, tableSchema, fk);
 	}
 
-	// Reject a UNIQUE whose implicit backing structure would claim a name already held
-	// by an index on this table — the mirror of the refusal `SchemaManager.createIndex`
-	// applies when the index is declared second. Pre-dispatch for the same reason the FK
-	// check above is: the store's `alterTable` persists, so a later throw would leave the
-	// damage (a dropped `CREATE INDEX` line in the catalog entry) on disk.
+	// Two UNIQUE guards, both pre-dispatch for the same reason the FK check above is: the
+	// store's `alterTable` persists, so a later throw would leave the damage on disk (for
+	// the name collision, a dropped `CREATE INDEX` line in the catalog entry).
+	//
+	// Order is load-bearing. The duplicate-constraint test runs FIRST because it compares
+	// the constraint itself (its column set), which both backends carry, while the
+	// index-name test compares a backing structure only the memory backend materializes —
+	// letting the latter rule first made the two backends disagree on a plain duplicate
+	// and reported it as a collision with an index the user never created.
 	if (constraint.type === 'unique') {
-		assertUniqueConstraintIndexNameFree(
-			tableSchema,
-			constraint.name,
-			(constraint.columns ?? []).map(c => c.name),
-			`add ${constraint.name ? `constraint '${constraint.name}'` : 'UNIQUE constraint'} to table '${tableSchema.name}'`,
-		);
+		const columnNames = (constraint.columns ?? []).map(c => c.name);
+		const operation = `add ${constraint.name ? `constraint '${constraint.name}'` : 'UNIQUE constraint'} to table '${tableSchema.name}'`;
+		assertUniqueConstraintNotDuplicated(tableSchema, constraint.name, columnNames, operation);
+		assertUniqueConstraintIndexNameFree(tableSchema, constraint.name, columnNames, operation);
 	}
 
 	const updatedTableSchema = await module.alterTable(

@@ -14,7 +14,7 @@ import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateF
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
-import { isHiddenImplicitIndex, isImplicitCoveringIndex, findExposedImplicitConstraintIndex } from './catalog.js';
+import { isHiddenImplicitIndex, isImplicitCoveringIndex, findExposedImplicitConstraintIndex, assertNoDuplicateUniqueConstraints } from './catalog.js';
 import { assertCatalogObjectPersistable } from './catalog-persistability.js';
 import { buildLensBasisFkGate } from './lens-fk-discovery.js';
 import { createLogger } from '../common/logger.js';
@@ -2763,6 +2763,19 @@ export class SchemaManager {
 		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
 		this.validateDefaultDeterminism(baseTableSchema.columns, tableName, hasMutationContext, allowNonDet);
 		this.validateCheckConstraintDeterminism(baseTableSchema.checkConstraints, tableName, allowNonDet);
+
+		// Refuse a CREATE TABLE that declares the same plain UNIQUE twice — the same rule
+		// `ALTER TABLE ADD CONSTRAINT` / `ADD COLUMN … unique` apply, so a duplicate is
+		// refused identically wherever it is written. Before `module.create`, so the
+		// statement leaves no storage behind. Deliberately here rather than in
+		// `buildTableSchemaFromAST`: the import/rehydrate path shares that builder and must
+		// still open a catalog written before this guard existed (same placement rationale
+		// as the FK-collation check below).
+		assertNoDuplicateUniqueConstraints(
+			baseTableSchema.uniqueConstraints ?? [],
+			baseTableSchema.columns,
+			`create table '${tableName}'`,
+		);
 
 		let tableInstance: VirtualTable;
 		try {

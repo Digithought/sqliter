@@ -49,6 +49,16 @@ answers the same either way. The cost is doubled index maintenance per write, pl
 memory the duplicate occupies. Also worth aligning because the two backends' reuse rules
 are now documented as mirroring each other, and they no longer do.
 
+## Related
+
+`fix/bug-memory-unique-reuses-partial-index` changes the same function's reuse search
+for a different reason: the condition currently admits a *filtered* index, so an
+unfiltered UNIQUE adopts it and stops rejecting duplicates outside the filter. That is
+a correctness fix to *which shapes qualify*; this ticket is about *when the decision is
+re-taken*. Whichever lands second should re-read the other — the two edits are
+adjacent, and the fix already realizes the "a partial index must keep building its own
+structure" bullet listed above.
+
 The store implementation is the reference for the reuse predicate (which shapes qualify)
 and for the create/drop transition; the memory-side work is finding the equivalent of the
 store's "reconcile on schema change" hook, since memory's index set lives in the layer

@@ -928,6 +928,54 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(await rows(db2, `select count(*) as c from t where a = 'x'`)).to.deep.equal([{ c: 2 }]);
 	});
 
+	// A plain unnamed UNIQUE has no name, so nothing ever compared a repeat against the
+	// constraints already on the table — the only check was the backing-structure name, and
+	// the store never materializes one into `tableSchema.indexes`, so the store ACCEPTED the
+	// duplicate. Both copies then persisted into the catalog entry (`… unique (c), unique (c)`),
+	// where neither could be dropped (a null-named constraint is not addressable by
+	// `DROP CONSTRAINT`) and every write paid the same check twice, forever, across reopen.
+	// The declaration is refused up front now; this pins that the refusal precedes the
+	// persistence side effects rather than being undone after them.
+	it('a duplicate unnamed UNIQUE is refused before any catalog write and does not persist', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, c integer) using store`);
+		await db.exec(`insert into t values (1, 5), (2, 6)`);
+
+		const writes = await traceCatalogWrites();
+		await db.exec(`alter table t add unique (c)`);
+		expect(writes.length, 'the accepted ADD UNIQUE rewrote the bundle').to.be.greaterThan(0);
+
+		const beforeCount = writes.length;
+		let err: Error | undefined;
+		try { await db.exec(`alter table t add unique (c)`); } catch (e) { err = e as Error; }
+		expect(err, 'expected rejection').to.not.be.undefined;
+		expect(err!.message).to.match(/an equivalent UNIQUE constraint on \(c\) already exists/i);
+
+		// Pre-dispatch refusal: module.alterTable never ran, so the bundle was not rewritten
+		// at all — not even to an identical value.
+		expect(writes.length, 'the refused ADD UNIQUE wrote nothing').to.equal(beforeCount);
+
+		const entry = (await catalogEntry('t'))!;
+		expect(entry.match(/unique/gi)?.length, 'exactly one UNIQUE in the bundle').to.equal(1);
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen();
+
+		// One constraint rehydrates, and it enforces.
+		const ucs = await rows(db2, `select count(distinct id) as c from unique_constraint_info('t')`);
+		expect(ucs).to.deep.equal([{ c: 1 }]);
+		let rejected = false;
+		try { await db2.exec(`insert into t values (3, 5)`); } catch { rejected = true; }
+		expect(rejected, 'the surviving UNIQUE still enforces after reopen').to.be.true;
+
+		// Still refused after reopen — the guard reads the rehydrated constraint, not
+		// anything remembered from the session that declared it.
+		let err2: Error | undefined;
+		try { await db2.exec(`alter table t add unique (c)`); } catch (e) { err2 = e as Error; }
+		expect(err2, 'expected rejection after reopen').to.not.be.undefined;
+		expect(err2!.message).to.match(/an equivalent UNIQUE constraint on \(c\) already exists/i);
+	});
+
 	// An UNNAMED UNIQUE's backing structure is named `_uc_<covered column names>`,
 	// derived from the columns' CURRENT names and recorded nowhere — so RENAME COLUMN
 	// moves that name. Renaming onto a name an index on the same table already holds is

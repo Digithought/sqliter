@@ -390,8 +390,20 @@ function implicitCoveringIndexExposure(tableSchema: TableSchema): Map<string, bo
  * materializes the identical name).
  */
 function implicitIndexName(tableSchema: TableSchema, uc: UniqueConstraintSchema): string {
-	const colNames = uc.columns.map(i => tableSchema.columns[i]?.name ?? String(i));
-	return implicitIndexNameForColumns(uc.name, colNames);
+	return implicitIndexNameForColumns(uc.name, uniqueConstraintColumnNames(tableSchema.columns, uc));
+}
+
+/**
+ * The names of the columns `uc` covers, in declaration order, resolved against
+ * `columns`. An index with no column falls back to its own number — the same
+ * degenerate-input handling every other resolver here uses; it cannot arise from a
+ * built schema, whose constraint columns are resolved through `columnIndexMap`.
+ */
+function uniqueConstraintColumnNames(
+	columns: ReadonlyArray<{ name: string }>,
+	uc: UniqueConstraintSchema,
+): string[] {
+	return uc.columns.map(i => columns[i]?.name ?? String(i));
 }
 
 /**
@@ -478,6 +490,121 @@ export function assertUniqueConstraintIndexNameFree(
 			+ `on the same table. Rename the constraint or the index.`,
 		StatusCode.CONSTRAINT,
 	);
+}
+
+/* ─────────────── duplicate UNIQUE constraints ───────────────
+ * An unnamed UNIQUE has no name to compare, so nothing but the derived structure
+ * name ever noticed a repeat — and that name is only materialized by SOME backends,
+ * so the same statement got different answers on memory and store. The two helpers
+ * below compare what actually makes two UNIQUEs the same (their column set), which
+ * is backend-independent, and every declaration site runs them BEFORE
+ * `assertUniqueConstraintIndexNameFree` so the user sees a constraint-worded message
+ * rather than one naming an index they never created. Same ordering rationale
+ * `assertConstraintNameFree` documents in schema/table.ts. */
+
+/**
+ * Order- and repetition-insensitive key for the column set a UNIQUE constraint
+ * covers. `unique (a, b)` and `unique (b, a)` enforce the identical rule, so they
+ * share a key — while their derived structure names (`_uc_a_b` / `_uc_b_a`) do not,
+ * which is exactly why the duplicate test cannot go through those names.
+ * Case-folded like every other column-name comparison in the engine.
+ */
+export function uniqueConstraintColumnSetKey(columnNames: ReadonlyArray<string>): string {
+	return [...new Set(columnNames.map(n => n.toLowerCase()))].sort().join(',');
+}
+
+/**
+ * True when `uc` carries no identity of its own beyond the columns it covers:
+ * unnamed, not synthesized from a `CREATE UNIQUE INDEX` (`derivedFromIndex`), and
+ * not partial (`predicate`). Two of these over one column set are wholly
+ * indistinguishable — neither can be named in `DROP CONSTRAINT`, so neither can be
+ * removed short of recreating the table, while every write pays the same check twice.
+ *
+ * The three exclusions each carve out a genuinely different constraint:
+ * - `derivedFromIndex` — owned by its `CREATE UNIQUE INDEX`, addressable and
+ *   droppable through it.
+ * - `predicate` — a partial UNIQUE only governs rows inside its scope, so two with
+ *   different predicates are different rules. (Only a `CREATE UNIQUE INDEX … WHERE`
+ *   produces one today: `AST.TableConstraint` has no predicate field, so a declared
+ *   UNIQUE is never partial. Tested for anyway, so the rule stays right if it gains
+ *   one.)
+ * - a name — see the NOTE on {@link assertUniqueConstraintNotDuplicated}.
+ */
+function isAnonymousUniqueConstraint(uc: UniqueConstraintSchema): boolean {
+	return uc.name === undefined && uc.derivedFromIndex === undefined && uc.predicate === undefined;
+}
+
+function duplicateUniqueConstraintError(operation: string, columnNames: ReadonlyArray<string>): QuereusError {
+	return new QuereusError(
+		`Cannot ${operation}: an equivalent UNIQUE constraint on (${columnNames.join(', ')}) already exists.`,
+		StatusCode.CONSTRAINT,
+	);
+}
+
+/**
+ * Rejects a UNIQUE declaration that would duplicate one the table already carries —
+ * see {@link isAnonymousUniqueConstraint} for what counts as "the same constraint".
+ *
+ * Takes prospective column *names* (like {@link assertUniqueConstraintIndexNameFree})
+ * so the `ALTER TABLE ADD COLUMN … unique` caller, whose column does not exist on
+ * `tableSchema` yet, can use it. A name absent from the table simply matches no
+ * existing constraint, which is the correct answer for a brand-new column.
+ *
+ * `alsoDeclared` holds column-set keys ({@link uniqueConstraintColumnSetKey}) claimed
+ * earlier in the SAME statement, none of which is on `tableSchema` yet — one
+ * `ADD COLUMN` can declare several inline `unique` constraints over its new column.
+ *
+ * NOTE: deliberately silent when the NEW constraint is named, and skips named
+ * existing ones. A named UNIQUE beside an unnamed one over the same columns
+ * (`create table t (…, unique (c))` then `alter table t add constraint u1 unique (c)`)
+ * stays legal: both are addressable and droppable by name, so the state is merely
+ * redundant rather than broken, and refusing it would change more surface than the
+ * defect this guard exists for. Two DIFFERENTLY-named UNIQUEs over one column set are
+ * legal for the same reason; two with the SAME name are already refused by
+ * `assertConstraintNameFree`.
+ */
+export function assertUniqueConstraintNotDuplicated(
+	tableSchema: TableSchema,
+	constraintName: string | undefined,
+	columnNames: ReadonlyArray<string>,
+	operation: string,
+	alsoDeclared?: ReadonlySet<string>,
+): void {
+	if (constraintName !== undefined) return;
+	const key = uniqueConstraintColumnSetKey(columnNames);
+	const duplicated = alsoDeclared?.has(key)
+		|| (tableSchema.uniqueConstraints ?? []).some(uc =>
+			isAnonymousUniqueConstraint(uc)
+			&& uniqueConstraintColumnSetKey(uniqueConstraintColumnNames(tableSchema.columns, uc)) === key);
+	if (!duplicated) return;
+	throw duplicateUniqueConstraintError(operation, columnNames);
+}
+
+/**
+ * The `CREATE TABLE` form of {@link assertUniqueConstraintNotDuplicated}: rejects a
+ * constraint list that already contains two equivalent UNIQUEs, whether they were
+ * declared inline on a column or at table level. Runs over the BUILT constraints
+ * (column indices already resolved), so both declaration shapes are compared in one
+ * place and neither can slip past.
+ *
+ * Called from `SchemaManager.createTable` only — never from the import / rehydrate
+ * path, so a catalog written before this guard existed still opens (`importDDL`
+ * warns and proceeds; `MemoryTableManager.ensureUniqueConstraintIndexes` refuses to
+ * build the duplicate structure such a catalog asks for).
+ */
+export function assertNoDuplicateUniqueConstraints(
+	constraints: ReadonlyArray<UniqueConstraintSchema>,
+	columns: ReadonlyArray<{ name: string }>,
+	operation: string,
+): void {
+	const seen = new Set<string>();
+	for (const uc of constraints) {
+		if (!isAnonymousUniqueConstraint(uc)) continue;
+		const names = uniqueConstraintColumnNames(columns, uc);
+		const key = uniqueConstraintColumnSetKey(names);
+		if (seen.has(key)) throw duplicateUniqueConstraintError(operation, names);
+		seen.add(key);
+	}
 }
 
 /**
