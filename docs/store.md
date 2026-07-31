@@ -826,7 +826,7 @@ Two routes, answering two different questions.
 
 `StoreModule.getBestAccessPlan()` covers the between-`ANALYZE`s case, which is every store table until someone runs one. The planner's `request.estimatedRows` hint is populated only from `ANALYZE`-collected statistics, so a never-analyzed table arrives as `undefined` and every cost below would otherwise be computed against the module's fixed 1000-row placeholder. The module fills the hint in from `StoreTable.getKnownRowCount()` — the count already in memory, including the open transaction's buffered delta — whenever the planner supplied none. A planner-supplied hint always wins, so the access path is costed with the same number as the plan around it.
 
-The substituted count is floored at 1. `rows: 0` is the access-plan protocol's *"this predicate is unsatisfiable"* — `rule-select-access-path` replaces the whole table access with a static empty relation on it — and a table that is empty when the plan is built can still be read after the same statement writes into it. Consequence: a genuinely empty store table is still costed as though it held one row, not zero.
+The substituted count is floored at 1. `rows: 0` is the access-plan protocol's *"this predicate is unsatisfiable"* — `rule-select-access-path` replaces the whole table access with a static empty relation on it — and a table that is empty when the plan is built can still be read after the same statement writes into it. The rule now also requires the plan to have claimed at least one filter before folding, so the floor is belt-and-braces for the no-filter case and the real guard for a filtered one. Consequence: a genuinely empty store table is still costed as though it held one row, not zero.
 
 ## Configuration
 

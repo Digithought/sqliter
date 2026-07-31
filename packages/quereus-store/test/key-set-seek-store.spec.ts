@@ -461,17 +461,20 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 		});
 
 		describe('the engine ceiling on seek keys', () => {
-			// OBSERVED BREAK-EVEN, recorded per the ticket: on an ordinary store table the
-			// interpolated `breakEvenKeys` clamps at the engine's 1000-key ceiling — i.e. the
-			// runtime seeks for every set size it is allowed to. That is the store's own cost
-			// model being consistent, not this rule misreading it: the planner never learns a
-			// store table's real row count (`TableSchema.estimatedRows` stays 0 and
-			// `statistics` stays undefined, because `StoreTable` implements no
-			// `getStatistics()` for ANALYZE to collect — backlog/debt-store-analyze-row-count,
-			// and backlog/debt-access-node-catalog-cardinality for the engine half). So the
-			// store prices every table against its own 1000-row default, where a 1000-key seek
-			// (cost 800) still beats a full scan (cost 1000). Over-seeking costs performance
-			// only — the semi join's probe re-checks every emitted row.
+			// OBSERVED BREAK-EVEN, recorded per the ticket: on this table the interpolated
+			// `breakEvenKeys` clamps at the engine's 1000-key ceiling — i.e. the runtime seeks
+			// for every set size it is allowed to. That is the store's own cost model being
+			// consistent, not this rule misreading it: `cap` holds exactly 1000 rows, and a
+			// 1000-key seek (cost 800) still beats a full scan of 1000 rows (cost 1000).
+			// Over-seeking costs performance only — the semi join's probe re-checks every
+			// emitted row.
+			//
+			// The 1000 is now the table's REAL size rather than a placeholder that happened to
+			// match: since debt-store-analyze-row-count, `StoreModule.getBestAccessPlan` fills
+			// `request.estimatedRows` in from the row count the store maintains whenever the
+			// planner has no ANALYZE snapshot to hand it. The numbers below are unchanged
+			// because the two coincide at this table's size; seed a different row count and the
+			// break-even moves with it.
 			//
 			// The interpolation arm itself is pinned cheaply in
 			// "break-even interpolated from doctored store costs" below.

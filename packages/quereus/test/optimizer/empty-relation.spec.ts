@@ -1,6 +1,10 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { SqlValue } from '../../src/common/types.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { AccessPlanBuilder } from '../../src/vtab/best-access-plan.js';
+import type { BestAccessPlanRequest, BestAccessPlanResult } from '../../src/vtab/best-access-plan.js';
+import type { TableSchema } from '../../src/schema/table.js';
 
 type ResultRow = Record<string, SqlValue>;
 
@@ -257,5 +261,69 @@ describe('Empty-relation folding', () => {
 			const out = await results(db, q);
 			expect(out.map(r => r.id)).to.deep.equal([1, 2, 3]);
 		});
+	});
+});
+
+// ── `rows: 0` from a module is only a proof when it claimed a filter ─────────
+// `selectPhysicalNode` replaces a table access with an EmptyRelation on
+// `accessPlan.rows === 0`. That is sound only for the case it was written for: the
+// module was handed a filter it can prove nothing matches. The guard that is meant to
+// say so, `handledFilters.every(...)`, is vacuously true when there are NO filters, so
+// a module reporting a live count of zero on a plain full scan would have its read
+// deleted — and planning precedes execution, so "empty now" is not "empty when this
+// runs". Requiring at least one claimed filter keeps the fold to the proof case.
+
+/** A module that reports its live size on a no-filter scan, honestly — zero included. */
+class LiveCountModule extends MemoryTableModule {
+	override getBestAccessPlan(
+		db: Database,
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+	): BestAccessPlanResult {
+		if (request.filters.length === 0) {
+			return AccessPlanBuilder
+				.fullScan(0)
+				.setHandledFilters([])
+				.setExplanation('Live count says the table is empty right now')
+				.build();
+		}
+		return super.getBestAccessPlan(db, tableInfo, request);
+	}
+}
+
+describe('A no-filter `rows: 0` is an estimate, not a proof', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+		db.registerModule('live_count', new LiveCountModule());
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('keeps the table read instead of folding it away', async () => {
+		await db.exec('create table lc (id integer primary key, v text) using live_count');
+		await db.exec("insert into lc values (1, 'a'), (2, 'b')");
+
+		const q = 'select id from lc order by id';
+		const plan = await planRows(db, q);
+		// `createEmptyResultNode` emits EMPTYRESULT (the access-fold node), distinct from
+		// the EMPTYRELATION the `where false` rules above produce.
+		expect(hasOp(plan, 'EMPTYRESULT'), `plan ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
+		expect(await results(db, q)).to.deep.equal([{ id: 1 }, { id: 2 }]);
+	});
+
+	it('still folds when the module claimed the filter it was given', async () => {
+		// The memory module's own impossible-predicate arm: IS NULL on a NOT NULL column,
+		// reported as rows: 0 with that one filter claimed handled. Unaffected by the guard.
+		await db.exec('create table nn (id integer primary key, v text not null) using live_count');
+		await db.exec("insert into nn values (1, 'a')");
+
+		const q = 'select id from nn where v is null';
+		const plan = await planRows(db, q);
+		expect(hasOp(plan, 'EMPTYRESULT'), `plan ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
+		expect(await results(db, q)).to.have.lengthOf(0);
 	});
 });

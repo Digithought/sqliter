@@ -525,6 +525,13 @@ export abstract class StoreTableBase extends VirtualTable {
 	 * Statistics are advisory (same posture as `StoreModuleRename`'s stats re-key): a
 	 * failure to open or read the stats store warns and leaves the count unknown rather
 	 * than failing the storage open that carries the caller's actual query.
+	 *
+	 * NOTE: on that failure path the pre-fix behaviour returns for this table — the next
+	 * `trackMutation` seeds `cachedStats` at 0 and a later {@link flushStats} makes the
+	 * restarted count durable, silently discarding the persisted one. Tolerated because a
+	 * stats-store read failure is already a storage-level fault and the count is advisory.
+	 * If it ever needs to be safe, gate {@link flushStats} on a "primed or genuinely
+	 * absent" flag rather than on `cachedStats` being non-null.
 	 */
 	private async primeStats(): Promise<void> {
 		if (this.cachedStats) return;
@@ -960,12 +967,15 @@ export abstract class StoreTableBase extends VirtualTable {
 	 *
 	 * `rowCount` is delta-tracked rather than counted, so it can drift from the true
 	 * count if a write path ever mis-accounts; `ANALYZE`'s scan is the reconciliation.
+	 *
+	 * `lastAnalyzed` is deliberately left unset: the only timestamp this table holds is
+	 * `TableStats.updatedAt`, the moment the count last MOVED, which is a different fact
+	 * — reporting it here would tell a staleness check the table had been analyzed.
 	 */
 	async getStatistics(): Promise<TableStatistics> {
 		return {
 			rowCount: await this.getEstimatedRowCount(),
 			columnStats: new Map<string, ColumnStatistics>(),
-			lastAnalyzed: this.cachedStats?.updatedAt,
 		};
 	}
 

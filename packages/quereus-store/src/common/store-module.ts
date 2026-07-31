@@ -66,6 +66,45 @@ import { computeBestAccessPlan } from './store-module-access-plan.js';
 import { reconcilePkCollations } from './store-module-schema-rewrite.js';
 
 /**
+ * `request` with the table's own size filled into `estimatedRows` when the planner
+ * supplied none — otherwise `request` unchanged.
+ *
+ * The planner's hint comes only from `ANALYZE`-collected statistics, so a
+ * never-analyzed table arrives as `undefined` and every cost in
+ * `computeBestAccessPlan` would be computed against its fixed 1000-row placeholder,
+ * whatever the table actually holds. This module maintains a running row count as it
+ * writes ({@link StoreTable.getKnownRowCount}), so it can answer for itself.
+ *
+ * A supplied hint WINS: it is the number the rest of the plan was costed with (join
+ * ordering, cache thresholds and sort costs all read the same catalog statistics), and
+ * a module quietly pricing against a different figure would make the access path
+ * disagree with the plan around it. A stale post-`ANALYZE` count therefore stays stale
+ * here — engine-wide snapshot semantics, not a separate rule.
+ *
+ * Floored at 1: `rows: 0` is not "this table is empty" in the access-plan protocol, it
+ * is a module PROVING its predicate unsatisfiable, and `rule-select-access-path` acts
+ * on it by replacing the whole table access with a static empty relation. A live count
+ * is a snapshot taken at PLAN time, so an empty table can still be read after rows are
+ * written into it by the very same statement — a view update materializing its missing
+ * non-preserved-side row does exactly that.
+ *
+ * NOTE: a prepared `Statement` holds its compiled plan and recompiles only on a schema
+ * change, so a long-lived prepared statement keeps the costs derived from the size the
+ * table had at first compile. Harmless while this only moves costs, not plan shape; if a
+ * prepared statement is ever seen picking a plan wrong for the table's current size, the
+ * fix belongs at the statement's recompile trigger, not here.
+ */
+function sizeRequestFromLiveCount(
+	request: BestAccessPlanRequest,
+	table: StoreTable | undefined,
+): BestAccessPlanRequest {
+	if (request.estimatedRows !== undefined) return request;
+	const liveRows = table?.getKnownRowCount();
+	if (liveRows === undefined) return request;
+	return { ...request, estimatedRows: Math.max(1, liveRows) };
+}
+
+/**
  * Generic store module that works with any KVStoreProvider.
  *
  * Usage:
@@ -561,6 +600,9 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 	 * ORDER-PRESERVING — byte order and comparator order must coincide, or the seek would
 	 * under-fetch and the ordering advertisement would elide a Sort it must not. That gate
 	 * needs the connection's collation registry, hence `db` is threaded down.
+	 *
+	 * The request is sized from the table's own maintained row count when the planner
+	 * supplied no estimate — see {@link sizeRequestFromLiveCount}.
 	 */
 	getBestAccessPlan(
 		db: Database,
@@ -583,37 +625,8 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		const table = this.getTable(tableInfo.schemaName, tableInfo.name);
 		const tableKeyCollation = (table?.getConfig().collation || 'NOCASE').toUpperCase();
 
-		// Fill in the table's real size when the planner has none to give.
-		// `request.estimatedRows` is the engine's hint, and it is only populated from
-		// statistics `ANALYZE` collected — a never-analyzed table arrives here as
-		// `undefined` and every cost below would otherwise be computed against
-		// `computeBestAccessPlan`'s fixed 1000-row placeholder, whatever the table
-		// actually holds. This module maintains a running row count as it writes
-		// (`StoreTable.getKnownRowCount`), so it can answer for itself.
-		//
-		// The engine's hint WINS when it has one: it is the number the rest of the plan
-		// was costed with (join ordering, cache thresholds, sort costs all read the same
-		// catalog statistics), and a module quietly pricing against a different figure
-		// would make the access path disagree with the plan around it. That also means a
-		// stale post-`ANALYZE` count stays stale here — the engine-wide snapshot
-		// semantics, not a separate rule.
-		//
-		// Floored at 1, and that floor is load-bearing rather than cosmetic. `rows: 0` is
-		// not "this table is empty" in the access-plan protocol — it is a module PROVING
-		// its predicate is unsatisfiable, and `rule-select-access-path` acts on it by
-		// replacing the whole table access with a static empty relation. (The memory
-		// module only ever emits it for `IS NULL` on a NOT NULL column, and otherwise
-		// reads an incoming 0 as "unknown".) A live count is a snapshot taken at PLAN
-		// time, so an empty table can still be read after rows are written into it by
-		// the very same statement — a view update that materializes its missing
-		// non-preserved-side row does exactly that. Reporting the honest 0 there folded
-		// the read away and the statement returned nulls for rows it had just written.
-		const liveRows = request.estimatedRows === undefined ? table?.getKnownRowCount() : undefined;
-		const knownRows = liveRows === undefined ? undefined : Math.max(1, liveRows);
-		const sizedRequest = knownRows === undefined ? request : { ...request, estimatedRows: knownRows };
-
 		return {
-			...computeBestAccessPlan(db, tableInfo, sizedRequest, tableKeyCollation),
+			...computeBestAccessPlan(db, tableInfo, sizeRequestFromLiveCount(request, table), tableKeyCollation),
 			honorsCollatedRangeBounds: true,
 		};
 	}

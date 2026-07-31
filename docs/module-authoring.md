@@ -167,7 +167,7 @@ interface BestAccessPlanResult {
 
 **Row counts — one of the two is a claim, not an estimate**:
 
-`request.estimatedRows` is the planner's hint, populated only from `ANALYZE`-collected statistics; `undefined` means unknown, and a module that can size itself may substitute its own count there — but must defer to a supplied hint, or the access path is costed against a different figure than the plan around it. `rows` in the result is an estimate, with one exception: **`rows: 0` claims the predicate is unsatisfiable**, and `rule-select-access-path` replaces the entire table access with a static empty relation on it. Never report 0 merely because the table is empty right now — planning precedes execution, and a statement can write rows into a table before reading it. Report at least 1.
+`request.estimatedRows` is the planner's hint, populated only from `ANALYZE`-collected statistics; `undefined` means unknown, and a module that can size itself may substitute its own count there — but must defer to a supplied hint, or the access path is costed against a different figure than the plan around it. `rows` in the result is an estimate, with one exception: **`rows: 0` on a plan claiming at least one filter handled asserts the predicate is unsatisfiable**, and `rule-select-access-path` replaces the entire table access with a static empty relation. Never report 0 as an estimate there, nor merely because the table is empty right now — planning precedes execution, and a statement can write rows into a table before reading it. Report at least 1.
 
 **Claiming `handledFilters` — the positional contract**:
 

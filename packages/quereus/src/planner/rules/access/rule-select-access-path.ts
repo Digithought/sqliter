@@ -388,15 +388,22 @@ function selectPhysicalNode(
 	orderingLoadBearing = false,
 ): RelationalPlanNode {
 
-	// Empty result optimization (e.g., IS NULL on NOT NULL column)
-	// NOTE: `handledFilters.every(...)` is vacuously true for a plan with NO filters, so a
-	// module that reports `rows: 0` on a full scan — a plausible reading of a field the
-	// interface calls a "cardinality estimate", for a table that is empty right now — has
-	// its whole table access folded away, and a statement that writes rows into that table
-	// before reading them returns nothing. Dormant: no shipped module reports a live 0 (see
-	// docs/module-authoring.md § Index-Based Access). Hardening tracked in
+	// Empty result optimization (e.g., IS NULL on NOT NULL column).
+	//
+	// `rows === 0` folds the whole table access away, so it is only sound when the module
+	// was PROVING a predicate unsatisfiable. `handledFilters.every(...)` alone does not say
+	// that — it is vacuously true for a plan with no filters at all, so a module reporting
+	// `rows: 0` on a plain full scan (a plausible reading of a field the interface calls a
+	// "cardinality estimate", for a table that is empty at plan time) would have its read
+	// deleted, and a statement that writes rows into that table before reading them back
+	// would return nothing. Requiring at least one claimed filter keeps the fold to the case
+	// it was written for. It cannot fire vacuously today — the memory module emits `rows: 0`
+	// only for `IS NULL` on a NOT NULL column, which always carries that filter.
+	//
+	// NOTE: with filters present the fold still trusts a number the interface documents as an
+	// estimate; an explicit "predicate is unsatisfiable" signal is tracked in
 	// backlog/debt-empty-access-plan-fold-trusts-estimate.
-	if (accessPlan.rows === 0 && accessPlan.handledFilters.every(h => h)) {
+	if (accessPlan.rows === 0 && accessPlan.handledFilters.length > 0 && accessPlan.handledFilters.every(h => h)) {
 		log('Using empty result (impossible predicate detected)');
 		return createEmptyResultNode(tableRef);
 	}
