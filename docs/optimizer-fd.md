@@ -121,7 +121,7 @@ A few logical types compare by **meaning** rather than by stored text — TIMESP
 - `extractEquiPairs` (`planner/rules/join/equi-pair-extractor.ts`) — physical hash/merge/bloom key selection.
 - **CHECK / assertion extraction** (`planner/analysis/check-extraction.ts`, via the local `columnPairSemanticsAgree`) — `handleEquality`'s col=col arm, `recognizeGuardedBody`'s `valueEquality` mirror pair, and both functions' one-way `col = expr` determinations. Guarded by `packages/quereus/test/optimizer/check-derived-fds.spec.ts` § `extractCheckConstraints semantic-ordering gate` plus the end-to-end block in `test/logic/15.1-semantic-ordering.sqllogic`. This site is the one whose fact lands on the **TableReferenceNode**, where `rule-predicate-inference-equivalence` reads it straight off a Filter's source with nothing to make it dormant — ungated, `create table ck (d timespan, s text, check (d = s))` gave `where d = 'PT1H'` an inferred `s = 'PT1H'` that dropped a row storing `'PT60M'` (ticket `check-derived-equivalence-ignores-semantic-ordering`).
 
-`semanticOrderingsAgree` compares `LogicalType` by object identity, so two distinct instances of a same-named type over-decline. That is the safe direction and is shared by all three gated sites.
+`semanticOrderingsAgree` compares `LogicalType` by object identity, so two distinct instances of a same-named type over-decline. That is the safe direction and is shared by all four gated sites.
 
 Two neighbouring surfaces are deliberately **ungated**, and both are load-bearing:
 

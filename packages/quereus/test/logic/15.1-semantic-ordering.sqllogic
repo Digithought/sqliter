@@ -423,6 +423,20 @@ select id from ckp where d = 'PT60M' and v = 7;
 
 drop table ckp;
 
+-- The hoisted-assertion route reaches the same extractor: a per-table assertion
+-- `not exists (select 1 from t where d <> s)` is negated into a synthetic per-row
+-- `d = s` check, and its facts merge onto the same TableReferenceNode. Same gate,
+-- same outcome.
+create table cka (id integer primary key, d timespan, s text);
+create assertion cka_eq check (not exists (select 1 from cka where d <> s));
+insert into cka values (1, 'PT1H', 'PT60M');
+
+select id from cka where d = 'PT1H';
+→ [{"id":1}]
+
+drop assertion cka_eq;
+drop table cka;
+
 -- USING over a mixed pair: `using (d)` means `l.d = r.d`, so the generic join's
 -- USING comparison routes through the same comparator the operator does.
 create table uma (id integer primary key, d timespan);
