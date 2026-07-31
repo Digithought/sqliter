@@ -8,6 +8,7 @@ import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import { opsToMask, requireVtabModule } from '../../schema/table.js';
 import { buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
+import { assertUniqueConstraintIndexNameFree } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import { emitAlterSchemaEvent } from './alter-schema-event.js';
 
@@ -146,6 +147,20 @@ async function runAddConstraintViaModule(
 			tableSchema.schemaName,
 		);
 		validateForeignKeyCollations(rctx.db, tableSchema, fk);
+	}
+
+	// Reject a UNIQUE whose implicit backing structure would claim a name already held
+	// by an index on this table — the mirror of the refusal `SchemaManager.createIndex`
+	// applies when the index is declared second. Pre-dispatch for the same reason the FK
+	// check above is: the store's `alterTable` persists, so a later throw would leave the
+	// damage (a dropped `CREATE INDEX` line in the catalog entry) on disk.
+	if (constraint.type === 'unique') {
+		assertUniqueConstraintIndexNameFree(
+			tableSchema,
+			constraint.name,
+			(constraint.columns ?? []).map(c => c.name),
+			`add ${constraint.name ? `constraint '${constraint.name}'` : 'UNIQUE constraint'} to table '${tableSchema.name}'`,
+		);
 	}
 
 	const updatedTableSchema = await module.alterTable(

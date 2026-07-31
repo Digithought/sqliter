@@ -92,6 +92,49 @@ describe('ALTER TABLE DROP/RENAME CONSTRAINT (memory covering-index behaviour)',
 		expect(rejected, 'surviving UNIQUE still enforces').to.be.true;
 	});
 
+	it('a refused UNIQUE declaration never leaves two indexes sharing a name', async () => {
+		// `ensureUniqueConstraintIndexes` looks for a reusable covering index by COLUMNS,
+		// so a constraint whose name is already an index over a DIFFERENT column used to
+		// append a second entry under the same name. Reads then resolved by first match
+		// and landed on the wrong structure (rows vanishing from one predicate,
+		// multiplying on the other) while `schema()` showed neither. The declaration is
+		// refused up front now; this pins the array shape the refusal preserves.
+		await db.exec('create table t (id integer primary key, a text, b text)');
+		await db.exec('create index foo on t (b)');
+		await db.exec("insert into t values (1, 'x', 'p'), (2, 'y', 'q')");
+
+		let err: Error | undefined;
+		try { await db.exec('alter table t add constraint foo unique (a)'); } catch (e) { err = e as Error; }
+		expect(err, 'expected rejection').to.not.be.undefined;
+		expect(err!.message).to.match(/would collide with existing index 'foo'/i);
+
+		// Exactly one `foo`, still the user's index on `b`.
+		expect(indexNames(db, 't')).to.deep.equal(['foo']);
+		const foo = db._findTable('t')!.indexes!.find(idx => idx.name === 'foo')!;
+		expect(foo.columns.map(c => c.index), "index still keyed on 'b'").to.deep.equal([2]);
+
+		// ...and it still resolves rows by that column.
+		expect(await collect(db, "select id from t where b = 'q'")).to.deep.equal([{ id: 2 }]);
+		expect(await collect(db, "select id from t where b = 'p'")).to.deep.equal([{ id: 1 }]);
+
+		// No constraint was installed, so duplicates on `a` stay legal.
+		await db.exec("insert into t values (3, 'x', 'r')");
+		expect(await collect(db, "select count(*) as c from t where a = 'x'")).to.deep.equal([{ c: 2 }]);
+	});
+
+	it('a refused RENAME CONSTRAINT leaves both the constraint and the index in place', async () => {
+		await db.exec('create table t (id integer primary key, a text, b text, constraint uq_a unique (a))');
+		await db.exec('create index taken on t (b)');
+		expect(indexNames(db, 't')).to.deep.equal(['taken', 'uq_a']);
+
+		let err: Error | undefined;
+		try { await db.exec('alter table t rename constraint uq_a to taken'); } catch (e) { err = e as Error; }
+		expect(err, 'expected rejection').to.not.be.undefined;
+		expect(err!.message).to.match(/would collide with existing index 'taken'/i);
+
+		expect(indexNames(db, 't'), 'neither index moved').to.deep.equal(['taken', 'uq_a']);
+	});
+
 	it('a CREATE UNIQUE INDEX-derived constraint cannot be dropped via DROP CONSTRAINT', async () => {
 		await db.exec('create table t (id integer primary key, a integer)');
 		await db.exec('create unique index uq_a on t (a)');

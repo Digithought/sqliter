@@ -272,3 +272,169 @@ drop table iul_e;
 drop table iul_u;
 drop table iul_a;
 -- run
+
+-- ============================================================
+-- 9. The same rule from the CONSTRAINT side — declaring second is refused too
+-- ============================================================
+-- Sections 2/3/5 cover `CREATE INDEX` onto a name a UNIQUE constraint already
+-- holds. The mirror image — declaring a UNIQUE constraint onto a name an index on
+-- the SAME table already holds — is refused identically, on every authoring path.
+-- Left unguarded it silently reclassifies the user's index as a hidden backing
+-- structure: it disappears from schema() / index_info(), stops being droppable,
+-- and (store-backed) its CREATE INDEX line is dropped from the persisted catalog.
+
+create table iul_ac (id integer primary key, a text, b text);
+create index cs_named on iul_ac (b);
+insert into iul_ac values (1, 'x', 'p'), (2, 'y', 'q');
+-- run
+
+-- 9a. ALTER TABLE ADD CONSTRAINT
+alter table iul_ac add constraint cs_named unique (a);
+-- error: would collide with existing index 'cs_named'
+
+-- The index is untouched by the refusal: still visible, still resolving rows.
+select count(*) as c from schema() where type = 'index' and name = 'cs_named';
+→ [{"c":1}]
+
+select id from iul_ac where b = 'q';
+→ [{"id":2}]
+
+-- No duplicate index entry was left behind either.
+select count(*) as c from index_info('iul_ac') where index_name = 'cs_named';
+→ [{"c":1}]
+
+-- Case folds, like every other index-name compare.
+alter table iul_ac add constraint CS_Named unique (a);
+-- error: would collide with existing index 'cs_named'
+
+-- Rejected even when the index is over the SAME column, where the two structures
+-- would physically coincide: accepting it would silently hide the user's index.
+create index cs_same on iul_ac (a);
+-- run
+
+alter table iul_ac add constraint cs_same unique (a);
+-- error: would collide with existing index 'cs_same'
+
+-- A DIFFERENTLY-named constraint over an already-indexed column stays legal —
+-- reuse matches on columns, not on names.
+alter table iul_ac add constraint cs_other unique (a);
+-- run
+
+insert into iul_ac values (3, 'x', 'r');
+-- error: unique
+
+-- 9b. Unnamed UNIQUE — the auto-name `_uc_<cols>` is guarded the same way
+create table iul_au (id integer primary key, a text);
+create index _uc_a on iul_au (a);
+-- run
+
+alter table iul_au add unique (a);
+-- error: would collide with existing index '_uc_a'
+
+select count(*) as c from schema() where type = 'index' and name = '_uc_a';
+→ [{"c":1}]
+
+-- 9c. ALTER TABLE RENAME CONSTRAINT
+create table iul_rc (id integer primary key, a text, b text);
+create index rc_taken on iul_rc (b);
+alter table iul_rc add constraint rc_uq unique (a);
+-- run
+
+alter table iul_rc rename constraint rc_uq to rc_taken;
+-- error: would collide with existing index 'rc_taken'
+
+-- Neither object moved: the constraint keeps its name and the index keeps its own.
+select count(*) as c from unique_constraint_info('iul_rc') where name = 'rc_uq';
+→ [{"c":1}]
+
+select count(*) as c from schema() where type = 'index' and name = 'rc_taken';
+→ [{"c":1}]
+
+-- A free name still renames, and a case-only rename is still a no-op (it must not
+-- trip over the constraint's OWN backing structure).
+alter table iul_rc rename constraint rc_uq to rc_moved;
+-- run
+
+alter table iul_rc rename constraint rc_moved to RC_Moved;
+-- run
+
+select count(*) as c from unique_constraint_info('iul_rc') where lower(name) = 'rc_moved';
+→ [{"c":1}]
+
+-- 9d. ALTER TABLE ADD COLUMN … unique
+create table iul_cc (id integer primary key, a text);
+create index _uc_c on iul_cc (a);
+create index cc_named on iul_cc (a);
+-- run
+
+-- Unnamed inline unique: auto-name comes from the not-yet-existing column's name.
+alter table iul_cc add column c text unique;
+-- error: would collide with existing index '_uc_c'
+
+-- Named inline unique.
+alter table iul_cc add column d text constraint cc_named unique;
+-- error: would collide with existing index 'cc_named'
+
+-- The refusals left the table exactly as it was — neither column was added.
+select count(*) as c from table_info('iul_cc') where name in ('c', 'd');
+→ [{"c":0}]
+
+-- A free name adds the column and its constraint normally.
+alter table iul_cc add column e text unique;
+insert into iul_cc values (1, 'p', 'q');
+-- run
+
+insert into iul_cc values (2, 'p2', 'q');
+-- error: unique
+
+-- 9e. `create unique index` still synthesizes its constraint beside its index
+-- (`derivedFromIndex`), which the guard must not mistake for a collision.
+create table iul_ui (id integer primary key, a text);
+create unique index ui_a on iul_ui (a);
+insert into iul_ui values (1, 'k');
+-- run
+
+select count(*) as c from schema() where type = 'index' and name = 'ui_a';
+→ [{"c":1}]
+
+insert into iul_ui values (2, 'k');
+-- error: unique
+
+drop table iul_ui;
+drop table iul_cc;
+drop table iul_rc;
+drop table iul_au;
+drop table iul_ac;
+-- run
+
+-- ============================================================
+-- 10. `apply schema` reaches the same guard
+-- ============================================================
+-- The differ emits `ALTER TABLE … ADD <constraint>` through the normal statement
+-- pipeline, so it inherits the ADD CONSTRAINT arm above rather than needing its
+-- own check. Runs last, against an otherwise-empty main schema, so the
+-- declaration below is the whole of main and the diff generates no drops.
+
+create table as_t (id integer primary key, a text, b text);
+create index as_foo on as_t (b);
+insert into as_t values (1, 'x', 'p'), (2, 'y', 'q');
+-- run
+
+declare schema main {
+	table as_t (id integer primary key, a text, b text, constraint as_foo unique (a))
+	index as_foo on as_t (b)
+}
+-- run
+
+apply schema main;
+-- error: would collide with existing index 'as_foo'
+
+-- The migration stopped at the offending statement; the index is intact.
+select count(*) as c from schema() where type = 'index' and name = 'as_foo';
+→ [{"c":1}]
+
+select id from as_t where b = 'q';
+→ [{"id":2}]
+
+drop table as_t;
+-- run

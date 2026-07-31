@@ -3360,17 +3360,34 @@ export class SchemaManager {
 		// one name→owner map for the whole import instead of re-scanning per index.
 		//
 		// NOTE: this path deliberately does NOT consult `isImplicitCoveringIndex`, so a
-		// catalog written before `createIndex` refused a name held by that table's own
+		// catalog written before the write paths refused a name held by that table's own
 		// UNIQUE constraint still imports its shadowing index — after which the name
 		// resolves to a real index that `dropIndex` then refuses to drop. Only reachable
-		// by opening such a pre-existing database; if that ever needs handling, reject or
-		// rename the shadowing index here rather than loosening the write-path guards.
+		// by opening such a pre-existing database; it warns (below) and proceeds rather
+		// than bricking the open. If that ever needs stronger handling, reject or rename
+		// the shadowing index here rather than loosening the write-path guards.
 		const collidingOwner = this.findIndexNameOwnerElsewhere(targetSchemaName, tableSchema.name, indexName);
 		if (collidingOwner) {
 			warnLog(
 				`Imported index '%s' on table '%s' collides with an existing index of the same name on table '%s' in schema '%s'; `
 					+ `index names are expected to be unique per schema — DROP/ALTER INDEX by this name resolves to whichever table registered first`,
 				indexName, tableSchema.name, collidingOwner.name, targetSchemaName,
+			);
+		}
+
+		// Same warn-and-proceed treatment for the same-table variant: the name is already
+		// the implicit backing structure of one of this table's own UNIQUE constraints.
+		// Both write paths now refuse this (`createIndex` from the index side,
+		// `assertUniqueConstraintIndexNameFree` from the constraint side), so a catalog
+		// carrying it was written before those guards existed. `importDDL` imports the
+		// CREATE TABLE (constraints included) ahead of every CREATE INDEX, so the
+		// constraint is always the one already present when the collision is seen.
+		if (isImplicitCoveringIndex(tableSchema, indexName)) {
+			warnLog(
+				`Imported index '%s' on table '%s' collides with the implicit backing index of a UNIQUE constraint of the same name `
+					+ `on that table; the index shadows the constraint's structure and DROP INDEX will refuse to drop it — `
+					+ `rename either the index or the constraint`,
+				indexName, tableSchema.name,
 			);
 		}
 

@@ -16,6 +16,7 @@ import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast
 import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
+import { assertUniqueConstraintIndexNameFree } from '../../schema/catalog.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
@@ -530,6 +531,23 @@ async function runAddColumn(
 		...inlineChecks,
 		...extractColumnLevelForeignKeys(columnDef),
 	];
+
+	// An inline `unique` builds an implicit backing structure named after the constraint
+	// — or `_uc_<column>` when unnamed — so reject before the column is materialized when
+	// that name is already an index on this table. The column does not exist yet, so the
+	// auto-name is computed from the column definition's own name (which is exactly what
+	// `extractColumnLevelUniqueConstraints` put in `columns`). Placed here, ahead of
+	// `module.alterTable`, so a refused statement leaves the table completely untouched
+	// rather than relying on the revert path.
+	for (const constraint of inlineConstraints) {
+		if (constraint.type !== 'unique') continue;
+		assertUniqueConstraintIndexNameFree(
+			tableSchema,
+			constraint.name,
+			(constraint.columns ?? []).map(c => c.name),
+			`add ${constraint.name ? `constraint '${constraint.name}'` : 'UNIQUE'} column '${columnDef.name}' to table '${tableSchema.name}'`,
+		);
+	}
 
 	// A per-row backfill derives each existing row's value from that row. Install a row slot
 	// over the backfill's row descriptor; the evaluator the module calls per existing row
@@ -1117,6 +1135,22 @@ async function runRenameConstraint(
 		throw new QuereusError(
 			`Cannot rename constraint to '${newName}': a constraint with that name already exists in table '${tableSchema.name}'`,
 			StatusCode.CONSTRAINT,
+		);
+	}
+
+	// A UNIQUE constraint's implicit backing structure is named after the constraint, so
+	// the rename renames that structure too — reject when the new name is already an
+	// index on this table (the mirror of `SchemaManager.createIndex`'s refusal). Gated on
+	// `oldLower !== newLower` for the same reason the collision check above is: on the
+	// memory backend the constraint's OWN backing structure is a materialized index under
+	// the old name, which a case-only rename would otherwise match.
+	if (constraintClass === 'unique' && oldLower !== newLower) {
+		const uc = (tableSchema.uniqueConstraints ?? []).find(c => c.name?.toLowerCase() === oldLower);
+		assertUniqueConstraintIndexNameFree(
+			tableSchema,
+			newName,
+			(uc?.columns ?? []).map(i => tableSchema.columns[i]?.name ?? String(i)),
+			`rename constraint '${oldName}' to '${newName}' on table '${tableSchema.name}'`,
 		);
 	}
 

@@ -6,7 +6,8 @@ import { isMaintainedTable, type MaintainedTableSchema } from './derivation.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString, viewDefinitionToCanonicalString } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
-import type { SqlValue } from '../common/types.js';
+import { type SqlValue, StatusCode } from '../common/types.js';
+import { QuereusError } from '../common/errors.js';
 import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
 import { ENGINE_MANAGED_TABLE_TAG } from './reserved-tags.js';
 
@@ -390,7 +391,79 @@ function implicitCoveringIndexExposure(tableSchema: TableSchema): Map<string, bo
  */
 function implicitIndexName(tableSchema: TableSchema, uc: UniqueConstraintSchema): string {
 	const colNames = uc.columns.map(i => tableSchema.columns[i]?.name ?? String(i));
-	return uc.name ?? `_uc_${colNames.join('_')}`;
+	return implicitIndexNameForColumns(uc.name, colNames);
+}
+
+/**
+ * The same name rule as {@link implicitIndexName}, expressed over column *names*
+ * rather than a resolved {@link UniqueConstraintSchema}. Declaration-time callers
+ * (`ALTER TABLE … ADD CONSTRAINT`, `ADD COLUMN … unique`) hold only the statement's
+ * column names — an `ADD COLUMN`'s column does not even exist on the table yet — so
+ * they cannot go through the schema-resolved form.
+ *
+ * Keep this the ONLY spelling of the `_uc_<cols>` rule in this package.
+ * `quereus-store`'s `implicitUniqueIndexName` and
+ * `MemoryTableManager.implicitIndexNameFor` mirror it for their own backends and
+ * must stay equal to it.
+ */
+function implicitIndexNameForColumns(constraintName: string | undefined, columnNames: ReadonlyArray<string>): string {
+	return constraintName ?? `_uc_${columnNames.join('_')}`;
+}
+
+/**
+ * The existing index on `tableSchema` whose name would be claimed by the backing
+ * structure of a UNIQUE constraint declared as `constraintName` over
+ * `columnNames` — or undefined when the name is free.
+ *
+ * The mirror image of the guard {@link SchemaManager.createIndex} applies from the
+ * index side via {@link isImplicitCoveringIndex}: one name, one table, two objects
+ * that both want it. Left unguarded, the constraint's backing structure adopts the
+ * index's name and the user's index stops being addressable — it vanishes from
+ * `schema()` / `index_info()`, `DROP INDEX` reports `no such index`, and on the
+ * store backend the persisted `CREATE INDEX` line is dropped from the catalog
+ * entry (`buildCatalogEntry` skips whatever `isHiddenImplicitIndex` reports).
+ *
+ * Matched case-insensitively, like every other index-name comparison in the
+ * engine. Deliberately name-only: the legitimate "reuse an existing index to back
+ * a constraint" case matches on *columns*, not names, and is unaffected. Matching
+ * columns do NOT make the collision benign — see the callers.
+ */
+export function findIndexShadowedByUniqueConstraint(
+	tableSchema: TableSchema,
+	constraintName: string | undefined,
+	columnNames: ReadonlyArray<string>,
+): IndexSchema | undefined {
+	const wanted = implicitIndexNameForColumns(constraintName, columnNames).toLowerCase();
+	return (tableSchema.indexes ?? []).find(idx => idx.name.toLowerCase() === wanted);
+}
+
+/**
+ * Rejects a UNIQUE constraint declaration whose implicit backing structure would
+ * claim a name already held by an index on the same table (see
+ * {@link findIndexShadowedByUniqueConstraint}). No-op for any other constraint
+ * kind — CHECK and FOREIGN KEY build no backing index, so they cannot collide.
+ *
+ * Called from the engine side BEFORE `module.alterTable`, which is what makes one
+ * guard cover both backends and keeps a rejected statement from reaching the
+ * store's persistence side effects.
+ *
+ * `operation` describes what the statement was doing, e.g.
+ * `add constraint 'foo' to table 't'`.
+ */
+export function assertUniqueConstraintIndexNameFree(
+	tableSchema: TableSchema,
+	constraintName: string | undefined,
+	columnNames: ReadonlyArray<string>,
+	operation: string,
+): void {
+	const shadowed = findIndexShadowedByUniqueConstraint(tableSchema, constraintName, columnNames);
+	if (!shadowed) return;
+	const backingName = implicitIndexNameForColumns(constraintName, columnNames);
+	throw new QuereusError(
+		`Cannot ${operation}: its backing index '${backingName}' would collide with existing index '${shadowed.name}' `
+			+ `on the same table. Rename the constraint or the index.`,
+		StatusCode.CONSTRAINT,
+	);
 }
 
 /**

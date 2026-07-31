@@ -876,4 +876,55 @@ describe('StoreModule secondary-index persistence', () => {
 		const { db: db2 } = await reopen();
 		expect(db2.schemaManager.findTable('t'), 'table does not resurrect').to.be.undefined;
 	});
+
+	// A UNIQUE constraint's backing structure is named after the constraint, so a
+	// constraint declared onto a name an index on the same table already holds used to
+	// take that name over. `buildCatalogEntry` skips whatever `isHiddenImplicitIndex`
+	// reports, so the rewritten bundle silently LOST the user's `CREATE INDEX` line —
+	// durable schema loss with no error. Worse, on reopen the constraint's structure
+	// bound to the orphaned index store the lost index left behind (the physical store
+	// name is a pure function of schema + table + index name), so uniqueness was checked
+	// against entries keyed on the WRONG column and every pre-existing row was invisible
+	// to it. The declaration is refused up front now; this pins what the refusal
+	// preserves across close → reopen.
+	it('a UNIQUE constraint colliding with an index name is refused and the index survives reopen intact', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, a text, b text) using store`);
+		await db.exec(`create index foo on t (b)`);
+		await db.exec(`insert into t values (1, 'x', 'p'), (2, 'y', 'q')`);
+		expect(indexStoreSize('t', 'foo'), 'index backed by one entry per row').to.equal(2);
+
+		// Every catalog write from here on must keep carrying the index DDL — a bundle
+		// written without it is durable loss even if a later write puts it back.
+		const writes = await traceCatalogWrites();
+
+		let err: Error | undefined;
+		try { await db.exec(`alter table t add constraint foo unique (a)`); } catch (e) { err = e as Error; }
+		expect(err, 'expected rejection').to.not.be.undefined;
+		expect(err!.message).to.match(/would collide with existing index 'foo'/i);
+
+		// The refusal happens before module.alterTable, so nothing was re-persisted at
+		// all; any write that DID happen still carries the index.
+		for (const w of writes) {
+			expect(w, 'no catalog write drops the CREATE INDEX line').to.match(/CREATE INDEX/i);
+		}
+		const entry = (await catalogEntry('t'))!;
+		expect(entry, 'bundle still declares the index').to.match(/CREATE INDEX "foo"/i);
+		expect(entry, 'bundle carries no UNIQUE constraint').to.not.match(/unique/i);
+		expect(indexStoreSize('t', 'foo'), 'backing store untouched').to.equal(2);
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen();
+
+		// The index rehydrates as a real, listed index over `b` with its entries intact.
+		const info = await indexInfo(db2, 't');
+		expect(info.map(r => r.index_name), 'index survives reopen').to.include('foo');
+		expect(indexStoreSize('t', 'foo'), 'backing entries survive reopen').to.equal(2);
+		expect(await rows(db2, `select id from t where b = 'q'`)).to.deep.equal([{ id: 2 }]);
+
+		// No constraint was installed, so a duplicate `a` is accepted (rather than the
+		// old failure mode: a UNIQUE that silently enforced nothing over the old rows).
+		await db2.exec(`insert into t values (3, 'x', 'z')`);
+		expect(await rows(db2, `select count(*) as c from t where a = 'x'`)).to.deep.equal([{ c: 2 }]);
+	});
 });
