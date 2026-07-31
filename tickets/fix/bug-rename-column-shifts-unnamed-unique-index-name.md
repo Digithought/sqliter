@@ -1,5 +1,5 @@
 ---
-description: Renaming a column covered by an unnamed UNIQUE constraint can silently swallow an unrelated index on the same table — the index stops appearing in schema listings, can no longer be dropped, and on the persistent backend is permanently erased from the saved schema on the next reopen.
+description: Renaming a column covered by an unnamed UNIQUE constraint can silently swallow an unrelated index on the same table — the index stops appearing in schema listings, can no longer be dropped, and on the persistent backend is permanently erased from the saved schema on the next reopen. A second defect in the same code is folded in: declaring the same unnamed UNIQUE twice is rejected outright on one storage backend and silently duplicated on the other.
 prereq:
 files:
   - packages/quereus/src/runtime/emit/alter-table.ts            # runRenameColumn ~300-433 — the unguarded site
@@ -145,3 +145,40 @@ has the persistent-provider + `open()` / `reopen()` helpers plus `catalogEntry()
 readings that show the dropped `CREATE INDEX` line and the orphaned store. Its
 last test, `a UNIQUE constraint colliding with an index name is refused and the
 index survives reopen intact`, is the closest existing shape to copy.
+
+## Second arm: two unnamed UNIQUE constraints over one column, backend-dependent
+
+Found while reviewing `bug-add-constraint-allows-duplicate-constraint-name` (which
+closed the *named* case on both backends). Same root site — the derived
+`_uc_<columns>` name and `assertUniqueConstraintIndexNameFree` — so it belongs here
+rather than in its own ticket.
+
+An unnamed UNIQUE has no user-written name, so nothing compares it against the
+constraints already on the table. The only thing that catches a repeat is the
+backing-structure name check, and that check can only see a structure the backend
+actually materialized. Measured on the current tree (`repro: verified`, both legs
+run directly against the two modules):
+
+```sql
+create table t (id integer primary key, c integer);
+alter table t add unique (c);
+alter table t add unique (c);   -- same constraint, declared twice
+```
+
+| backend | second statement | resulting table |
+| --- | --- | --- |
+| memory | refused: `its backing index '_uc_c' would collide with existing index '_uc_c' on the same table. Rename the constraint or the index.` | one UNIQUE |
+| store | **accepted** | two identical unnamed UNIQUE constraints |
+
+`alter table t add column c integer null unique` followed by
+`alter table t add unique (c)` behaves the same way. On the store leg the pair is
+then unaddressable: `alter table t drop constraint _uc_c` answers
+`Named constraint '_uc_c' not found in table 't'` (the constraints carry a null
+`name`; `_uc_c` is only ever computed), so neither copy can be removed except by
+recreating the table, and every write pays duplicate enforcement.
+
+Neither outcome is right. The memory message names an index the user never created
+for a statement whose real fault is a duplicate constraint; the store silently keeps
+both. Whichever shape this ticket picks, the outcome to pin on both backends for a
+re-declared unnamed UNIQUE is one behavior, stated in terms of the constraint rather
+than its hidden structure.

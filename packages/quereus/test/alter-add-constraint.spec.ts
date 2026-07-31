@@ -295,6 +295,51 @@ describe('ALTER TABLE ADD CONSTRAINT', () => {
 			expect(t.uniqueConstraints ?? []).to.deep.equal([]);
 		});
 
+		it('refuses two inline constraints on one ADD COLUMN whose names differ only in case', async () => {
+			await db.exec('create table t (id integer primary key, a integer)');
+			await expectDuplicate(
+				'alter table t add column b integer null constraint x check (b > 0) constraint X unique',
+				'X',
+				't',
+			);
+			expect(db.schemaManager.getTable('main', 't')!.columns.map(c => c.name)).to.deep.equal(['id', 'a']);
+		});
+
+		it('refuses an inline named FOREIGN KEY on ADD COLUMN, matching case-insensitively', async () => {
+			// The third class that occupies a named-constraint array; the inline arm reads the
+			// raw declaration, so each class needs its own coverage that the name is seen there.
+			await db.exec('create table parent (pid integer primary key)');
+			await db.exec('create table child (id integer primary key, a integer, constraint fk_p check (a > 0))');
+			await expectDuplicate(
+				'alter table child add column pa integer null constraint FK_P references parent(pid)',
+				'FK_P',
+				'child',
+			);
+			const t = db.schemaManager.getTable('main', 'child')!;
+			expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'a']);
+			expect(t.foreignKeys ?? []).to.deep.equal([]);
+		});
+
+		it('leaves two unnamed inline CHECKs on one new column alone', async () => {
+			// Both auto-name `_check_b`. The guard reads user-written names off the raw
+			// declaration precisely so a synthesized name never refuses a legal statement.
+			await db.exec('create table t (id integer primary key, a integer)');
+			await db.exec('alter table t add column b integer null check (b > 0) check (b < 10)');
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'a', 'b']);
+			expect(t.checkConstraints.map(c => c.name)).to.deep.equal(['_check_b', '_check_b']);
+		});
+
+		it('ignores a name on an inline constraint class that stores none', async () => {
+			// `constraint ck not null` records no name anywhere, so it cannot collide with
+			// the CHECK named `ck` — refusing it would reject a legal statement.
+			await db.exec('create table t (id integer primary key, a integer, constraint ck check (a > 0))');
+			await db.exec('alter table t add column b integer constraint ck not null default 1');
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'a', 'b']);
+			expect(t.checkConstraints.map(c => c.name)).to.deep.equal(['ck']);
+		});
+
 		it('still allows a non-colliding inline named constraint on ADD COLUMN', async () => {
 			await db.exec('create table t (id integer primary key, a integer, constraint ck check (a > 0))');
 			await db.exec('alter table t add column b integer null constraint ck_b check (b > 0)');

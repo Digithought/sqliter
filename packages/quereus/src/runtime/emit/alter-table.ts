@@ -8,7 +8,7 @@ import { QuereusError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition } from '../../schema/table.js';
-import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, validateCollationForType, columnDefToSchema } from '../../schema/table.js';
+import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
@@ -433,6 +433,28 @@ async function runRenameColumn(
 	return null;
 }
 
+/**
+ * Refuses an inline constraint on a new column whose *user-written* name is already taken —
+ * by a constraint on the table, or by an earlier inline constraint in the same ADD COLUMN
+ * (neither is on `tableSchema` yet). Same within-table rule ADD CONSTRAINT and RENAME
+ * CONSTRAINT enforce; see {@link assertConstraintNameFree} for the ordering constraints.
+ *
+ * Reads the RAW declaration rather than the extracted table constraints: the extractors
+ * auto-name an unnamed CHECK `_check_<column>`, and that synthesized name is not user
+ * identity — comparing it would refuse two unnamed CHECKs on one new column, which is
+ * legal. Only the three classes that occupy a named-constraint array are compared (a name
+ * on an inline NOT NULL / DEFAULT / PRIMARY KEY is not stored, so it cannot collide).
+ */
+function assertInlineConstraintNamesFree(tableSchema: TableSchema, columnDef: ColumnDef): void {
+	const seen = new Set<string>();
+	for (const declared of columnDef.constraints) {
+		if (!declared.name) continue;
+		if (declared.type !== 'check' && declared.type !== 'unique' && declared.type !== 'foreignKey') continue;
+		assertConstraintNameFree(tableSchema, declared.name, seen);
+		seen.add(declared.name.toLowerCase());
+	}
+}
+
 async function runAddColumn(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
@@ -532,40 +554,9 @@ async function runAddColumn(
 		...extractColumnLevelForeignKeys(columnDef),
 	];
 
-	// Constraint names are unique within a table — the same rule ADD CONSTRAINT and RENAME
-	// CONSTRAINT enforce, applied to a constraint arriving inline on a new column. Read off
-	// `columnDef.constraints` (the RAW declaration) rather than `inlineConstraints`: the
-	// extractors above auto-name an unnamed CHECK `_check_<column>`, and that synthesized name
-	// is not user identity — comparing it would refuse two unnamed CHECKs on one new column,
-	// which is legal. Only a `constraint <name>` the user actually wrote is compared, and only
-	// for the three classes that occupy a named-constraint array.
-	//
-	// Names seen within THIS statement are accumulated too: two inline constraints on one
-	// ADD COLUMN can collide with each other, and neither is on `tableSchema` yet.
-	//
-	// Placed here, ahead of `module.alterTable`, so a refused statement leaves the table
-	// completely untouched (no column added, nothing persisted) rather than relying on the
-	// revert path. Ahead of the index-name check below for the same reason it precedes that
-	// check on ADD CONSTRAINT: on the memory backend an existing UNIQUE constraint's own
-	// hidden backing index is materialized into the table's index list, so the index-name
-	// check would otherwise fire on it and name an index the user never created — while the
-	// store backend, which keeps that structure internal, would see nothing and accept the
-	// duplicate. Name check first ⇒ both backends refuse identically, and the index check
-	// keeps owning the case it was written for (a name held by a real user index and by no
-	// constraint).
-	const inlineNamesSeen = new Set<string>();
-	for (const declared of columnDef.constraints ?? []) {
-		if (!declared.name) continue;
-		if (declared.type !== 'check' && declared.type !== 'unique' && declared.type !== 'foreignKey') continue;
-		const lower = declared.name.toLowerCase();
-		if (inlineNamesSeen.has(lower) || namedConstraintExists(tableSchema, declared.name)) {
-			throw new QuereusError(
-				`Cannot add constraint '${declared.name}' to table '${tableSchema.name}': a constraint with that name already exists`,
-				StatusCode.CONSTRAINT,
-			);
-		}
-		inlineNamesSeen.add(lower);
-	}
+	// Refused before the column is materialized, so a duplicate name leaves the table
+	// completely untouched rather than relying on the revert path.
+	assertInlineConstraintNamesFree(tableSchema, columnDef);
 
 	// An inline `unique` builds an implicit backing structure named after the constraint
 	// — or `_uc_<column>` when unnamed — so reject before the column is materialized when

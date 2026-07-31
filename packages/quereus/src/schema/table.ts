@@ -179,6 +179,38 @@ export function namedConstraintExists(tableSchema: TableSchema, name: string): b
 }
 
 /**
+ * Refuses a *user-written* constraint name that is already taken — the within-table
+ * name-uniqueness rule shared by every ALTER path that adds a named constraint
+ * (`ADD CONSTRAINT`, and an inline named constraint on `ADD COLUMN`). Without it a
+ * table can hold two constraints under one name, after which DROP / RENAME CONSTRAINT
+ * hits every match (same class) or fails permanently as ambiguous (across classes).
+ *
+ * `alsoTaken` holds lowercased names claimed earlier in the SAME statement, none of
+ * which is on `tableSchema` yet — one `ADD COLUMN` can declare several inline
+ * constraints that collide with each other.
+ *
+ * Callers place this ahead of any module dispatch (a store-backed `alterTable`
+ * persists, so a later throw would leave the duplicate on disk to rehydrate on
+ * reopen) and ahead of `assertUniqueConstraintIndexNameFree`: the memory backend
+ * materializes an existing UNIQUE's hidden backing index into the table's index list
+ * and the store backend does not, so letting the index guard rule on a duplicate name
+ * first makes the two backends disagree — and names an index the user never created.
+ *
+ * Engine-synthesized names (`_uc_*` / `_check_*` / `_fk_*`) are not user identity and
+ * are never passed here; a name a user typed in that shape forfeits the guard, the
+ * same corner `isAutoConstraintName` already documents for declarative lifecycle.
+ *
+ * @throws QuereusError(CONSTRAINT) when the name is taken.
+ */
+export function assertConstraintNameFree(tableSchema: TableSchema, name: string, alsoTaken?: ReadonlySet<string>): void {
+	if (!alsoTaken?.has(name.toLowerCase()) && !namedConstraintExists(tableSchema, name)) return;
+	throw new QuereusError(
+		`Cannot add constraint '${name}' to table '${tableSchema.name}': a constraint with that name already exists`,
+		StatusCode.CONSTRAINT,
+	);
+}
+
+/**
  * Builds a map from column names to their indices in the columns array
  *
  * @param columns Array of column schemas
