@@ -439,20 +439,19 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			assert.deepEqual(await tRows(), [{ a: 1, b: 9, v: 'y' }]);
 		});
 
-		it('an update that MOVES the primary key keeps whichever image the producer keyed it by', async () => {
-			// The three producers disagree about whether a PK-moving update's `key` holds the
-			// pre- or the post-update key (fix/bug-update-event-key-disagrees-across-producers);
-			// this path records the PRE-update one, the store module the post-update one. The
-			// re-key must be neutral to that, re-projecting the SAME image the producer used —
-			// so learn the choice from a run with no ALTER, then require the re-keyed run to
-			// deliver exactly that key with `b` appended.
+		it('an update that MOVES the primary key re-keys its delete and its insert independently', async () => {
+			// A PK-moving update is never one `update` event: the contract splits it into a
+			// `delete` at the old key and an `insert` at the new one (usage.md § Subscribing to
+			// Data Changes). Each carries a single meaningful image, so the re-key re-projects
+			// each through its own — [1, 9] for the delete's oldRow, [2, 9] for the insert's
+			// newRow — and the two land at DIFFERENT keys, which a shared re-key could not do.
 			await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a))');
 			await db.exec("insert into t values (1, 9, 'x')");
 			events.length = 0;
 			await db.exec('update t set a = 2 where a = 1');
-			assert.equal(events.length, 1);
-			assert.equal(events[0].key?.length, 1);
-			const producerKeyedBy = events[0].key![0];
+			assert.deepEqual(events.map(e => e.type), ['delete', 'insert']);
+			assert.deepEqual(events[0].key, [1]);
+			assert.deepEqual(events[1].key, [2]);
 
 			await db.exec('create table u (a integer not null, b integer not null, v text, primary key (a))');
 			await db.exec("insert into u values (1, 9, 'x')");
@@ -462,9 +461,9 @@ describe('ALTER TABLE mid-transaction: batched data events keep the delivered sc
 			await db.exec('alter table u alter primary key (a, b)');
 			await db.exec('commit');
 
-			assert.equal(events.length, 1);
-			assert.equal(events[0].type, 'update');
-			assert.deepEqual(events[0].key, [producerKeyedBy, 9]);
+			assert.deepEqual(events.map(e => e.type), ['delete', 'insert']);
+			assert.deepEqual(events[0].key, [1, 9]);
+			assert.deepEqual(events[1].key, [2, 9]);
 		});
 
 		it('a delete crossing an ALTER PRIMARY KEY is re-keyed from oldRow', async () => {

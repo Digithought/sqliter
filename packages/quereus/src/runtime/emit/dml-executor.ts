@@ -333,6 +333,20 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	// Pre-calculate primary key column indices from schema (needed for update/delete)
 	const pkColumnIndicesInSchema = tableSchema.primaryKeyDefinition.map(pkColDef => pkColDef.index);
 
+	// Per-PK-column comparators for the data-event contract's relocation test: an UPDATE
+	// whose key values differ under the PRIMARY KEY's own comparator MOVES the row, and the
+	// contract delivers that as delete-at-old-key + insert-at-new-key rather than one `update`
+	// (docs/usage.md § Subscribing to Data Changes). Built through the shared UNIQUE-enforcement
+	// rule so the test is collation- and type-aware — never raw value equality, which would
+	// mis-classify a NOCASE case-only rewrite ('apple' → 'APPLE') as a move when the row never
+	// left its slot. Resolved once here (the resolver throws on an unregistered name and
+	// records the collation dependency so a redefined collation re-emits).
+	const pkEventComparators = uniqueEnforcementComparators(
+		tableSchema.columns,
+		pkColumnIndicesInSchema,
+		tableSchema.primaryKeyDefinition.map(pkColDef => ctx.resolveCollation(pkColDef.collation ?? 'BINARY')),
+	);
+
 	// Emit mutation context evaluators if present
 	const contextEvaluatorInstructions: Instruction[] = [];
 	if (plan.mutationContextValues && plan.contextAttributes) {
@@ -809,6 +823,55 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	}
 
 	/**
+	 * True when `oldRow` and `newRow` sit at DIFFERENT primary keys — the row relocated.
+	 * Compares under {@link pkEventComparators} (per-column collation- and type-aware), so a
+	 * key rewrite that leaves the row in its existing slot (a NOCASE 'apple' → 'APPLE') is
+	 * NOT a relocation.
+	 *
+	 * NOTE: this verdict must match the SUBSTRATE's — the memory module decides the same
+	 * question with `createPrimaryKeyFunctions`' comparators, a different construction. The two
+	 * agree on every type in tree today (both fall through to `compareSqlValuesFast` under the
+	 * column collation for TEXT, and to the declared type's `compare` for a semantic-ordering
+	 * type). They could part company on a type that carries a `compare` WITHOUT
+	 * `semanticOrdering` — DATE/TIME/DATETIME, whose `compare` is hard-wired to BINARY — if such
+	 * a column ever became able to declare a non-BINARY collation, which the DDL currently
+	 * refuses. If that changes, share one comparator factory instead: a disagreement here emits
+	 * one `update` for a row the substrate actually moved.
+	 */
+	function primaryKeyRelocated(oldRow: Row, newRow: Row): boolean {
+		return pkColumnIndicesInSchema.some(
+			(colIdx, i) => pkEventComparators[i](oldRow[colIdx], newRow[colIdx]) !== 0);
+	}
+
+	/**
+	 * Emit the auto data event(s) for one row-level UPDATE under the event contract's split
+	 * rule (docs/usage.md § Subscribing to Data Changes): a relocating key change is delivered
+	 * as a `delete` at the old key then an `insert` at the new key — so a listener retires the
+	 * old identity without having to know which columns form the key — and anything else is a
+	 * single `update` keyed by the POST-image, which is the row the table now holds.
+	 *
+	 * The split loses `changedColumns` and the "same row" link between the two events; that
+	 * cost is the documented contract, not an oversight.
+	 */
+	function emitAutoUpdateEvents(ctx: RuntimeContext, oldRow: Row, newRow: Row): void {
+		const newKeyValues = pkColumnIndicesInSchema.map(idx => newRow[idx]);
+		if (primaryKeyRelocated(oldRow, newRow)) {
+			const oldKeyValues = pkColumnIndicesInSchema.map(idx => oldRow[idx]);
+			emitAutoDataEvent(ctx, tableSchema, 'delete', oldKeyValues, [...oldRow]);
+			emitAutoDataEvent(ctx, tableSchema, 'insert', newKeyValues, undefined, [...newRow]);
+			return;
+		}
+
+		const changedColumns: string[] = [];
+		for (let i = 0; i < tableSchema.columns.length; i++) {
+			if (!sqlValueIdentical(oldRow[i], newRow[i])) {
+				changedColumns.push(tableSchema.columns[i].name);
+			}
+		}
+		emitAutoDataEvent(ctx, tableSchema, 'update', newKeyValues, [...oldRow], [...newRow], changedColumns);
+	}
+
+	/**
 	 * Performs a single row's INSERT side-effects (vtab.update + bookkeeping +
 	 * UPSERT handling + REPLACE handling). Returns the row to yield downstream,
 	 * or undefined if the row should be skipped (IGNORE / DO NOTHING).
@@ -864,7 +927,6 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					);
 					if (!updateResult) return undefined;
 
-					const existingKeyValues = pkColumnIndicesInSchema.map(idx => result.existingRow![idx]);
 					ctx.db._recordUpdate(
 						tableKey,
 						result.existingRow!,
@@ -876,18 +938,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', result.existingRow!, updateResult.updatedRow, plan.lensRouted);
 
 					if (needsAutoEvents) {
-						const changedColumns: string[] = [];
-						for (let i = 0; i < tableSchema.columns.length; i++) {
-							if (!sqlValueIdentical(result.existingRow![i], updateResult.updatedRow[i])) {
-								changedColumns.push(tableSchema.columns[i].name);
-							}
-						}
-						emitAutoDataEvent(
-							ctx, tableSchema, 'update',
-							existingKeyValues,
-							[...result.existingRow!], [...updateResult.updatedRow],
-							changedColumns,
-						);
+						emitAutoUpdateEvents(ctx, result.existingRow!, updateResult.updatedRow);
 					}
 					return updateResult.flatRow;
 				}
@@ -916,19 +967,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const replacedRow = result.replacedRow;
 
 		if (replacedRow) {
-			const newKeyValues = pkColumnIndicesInSchema.map(idx => storedRow[idx]);
 			ctx.db._recordUpdate(tableKey, replacedRow, storedRow, pkColumnIndicesInSchema);
 			await maintainRowTimeStructures(ctx, tableKey, { op: 'update', oldRow: replacedRow, newRow: storedRow }, backingConnCache, deferredRebuilds, residualBatch);
 			await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'delete', replacedRow, undefined, plan.lensRouted);
 
 			if (needsAutoEvents) {
-				const changedColumns: string[] = [];
-				for (let i = 0; i < numCols; i++) {
-					if (!sqlValueIdentical(replacedRow[i], storedRow[i])) {
-						changedColumns.push(tableSchema.columns[i].name);
-					}
-				}
-				emitAutoDataEvent(ctx, tableSchema, 'update', newKeyValues, [...replacedRow], [...storedRow], changedColumns);
+				emitAutoUpdateEvents(ctx, replacedRow, storedRow);
 			}
 		} else {
 			const pkValues = pkColumnIndicesInSchema.map(idx => storedRow[idx]);
@@ -1165,18 +1209,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// Execute FK cascading actions (CASCADE, SET NULL, SET DEFAULT)
 		await executeForeignKeyActionsAndLens(ctx.db, tableSchema, 'update', oldRow, storedRow, plan.lensRouted);
 
-		// Emit auto event for modules without native event support
+		// Emit auto event(s) for modules without native event support. NOT keyed by
+		// `keyValues` — that is the vtab's `oldKeyValues` and stays pointed at the OLD row;
+		// the event contract keys an update by its post-image and splits a relocating key
+		// change into delete + insert. See emitAutoUpdateEvents.
 		if (needsAutoEvents) {
-			// Compute changed columns
-			const changedColumns: string[] = [];
-			for (let i = 0; i < numCols; i++) {
-				const oldVal = oldRow[i];
-				const newVal = storedRow[i];
-				if (!sqlValueIdentical(oldVal, newVal)) {
-					changedColumns.push(tableSchema.columns[i].name);
-				}
-			}
-			emitAutoDataEvent(ctx, tableSchema, 'update', keyValues, [...oldRow], [...storedRow], changedColumns);
+			emitAutoUpdateEvents(ctx, oldRow, storedRow);
 		}
 
 		return withStoredNewSection(flatRow, storedRow, newRow, numCols);

@@ -5,7 +5,7 @@ import { BTree } from 'inheritree';
 import { createValueSet } from '../../../util/value-set.js';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer, iteratePrimaryRows, populateIndexFromRows, populateIndexFromRowsAsync } from './base.js';
-import { TransactionLayer, type OwnWrite, type PreparedColumnReshape, type PreparedPrimaryKeyRekey } from './transaction.js';
+import { TransactionLayer, type OwnWrite, type PendingChange, type PreparedColumnReshape, type PreparedPrimaryKeyRekey } from './transaction.js';
 import type { Layer } from './interface.js';
 import { MemoryTableConnection } from './connection.js';
 import { MemoryVirtualTableConnection } from '../connection.js';
@@ -705,21 +705,23 @@ export class MemoryTableManager {
 
 			// Emit data change events after successful commit
 			if (changes.length > 0 && this.eventEmitter?.emitDataChange) {
-				// The event contract carries the PK as a component array. Derive the stored
-				// key's shape from the PK arity, never from `Array.isArray` — a JSON PK whose
-				// value is a document like `[1]` is a SCALAR key that happens to be a JS
-				// array, and sniffing it would emit `[1]` where the contract wants `[[1]]`.
-				// NOTE: on the tuple path this hands listeners the STORED key array itself
-				// (`VTableDataChangeEvent.key` is mutable `SqlValue[]`, as it always was).
-				// If a listener is ever seen mutating `event.key`, copy here — an in-place
-				// edit would re-order the primary tree under the comparator.
-				const eventKeyIsTuple = primaryKeyArity(this.tableSchema) !== 1;
+				// The contract's `key` is the primary key projected out of the event's OWN row
+				// image — `newRow` for an insert or an update, `oldRow` for a delete — under the
+				// schema current at DELIVERY (docs/usage.md § Subscribing to Data Changes).
+				// Projecting here rather than replaying the key each write recorded is what
+				// makes an in-place rewrite that changes the key's VALUE but not the row's
+				// identity (a NOCASE 'apple' → 'APPLE', which `recordUpsert` files under the
+				// pre-image key) hand listeners the post-image the table actually holds. It also
+				// re-derives the key across a mid-transaction ALTER PRIMARY KEY for free: the
+				// pending-change images are already reshaped to the delivered schema, so
+				// projecting them through THAT schema's key is the re-key.
+				const pkIndices = this.tableSchema.primaryKeyDefinition.map(def => def.index);
 				for (const change of changes) {
 					const event: import('../../events.js').VTableDataChangeEvent = {
 						type: change.type,
 						schemaName: this.schemaName,
 						tableName: this._tableName,
-						key: keyParts(change.pk, eventKeyIsTuple) as SqlValue[],
+						key: this.eventKeyFromImage(change, pkIndices),
 						oldRow: change.oldRow,
 						newRow: change.newRow,
 					};
@@ -736,6 +738,27 @@ export class MemoryTableManager {
 			release();
 			logger.debugLog(`[Commit ${connection.connectionId}] Released lock for ${this._tableName}`);
 		}
+	}
+
+	/**
+	 * The delivered `key` of one pending change: the primary key projected out of the change's
+	 * own row image (`newRow` for an insert or an update, `oldRow` for a delete) through
+	 * `pkIndices`, the key columns of the schema current at delivery.
+	 *
+	 * Best-effort, exactly like the pending-change image reshape it consumes: an image the
+	 * reshape had to leave at the retired arity cannot be projected, so the event ships with no
+	 * key and logs rather than emitting an `undefined` key slot a listener would file a row
+	 * under. (A `PendingChange` always carries at least one image — `recordUpsert` sets
+	 * `newRow`, `recordDelete` sets `oldRow` — so a missing image means only that.)
+	 */
+	private eventKeyFromImage(change: PendingChange, pkIndices: readonly number[]): SqlValue[] | undefined {
+		const image = change.newRow ?? change.oldRow;
+		if (image && pkIndices.every(i => i >= 0 && i < image.length)) {
+			return pkIndices.map(i => image[i]);
+		}
+		logger.warn('Commit Transaction', this._tableName,
+			`${change.type} event has no image the delivered primary key can be projected from; delivering it with no key`);
+		return undefined;
 	}
 
 	/** All layers in `layer`'s parent chain, including `layer` itself. */

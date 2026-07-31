@@ -1189,6 +1189,25 @@ The database-level event system a module feeds — `getEventEmitter()`, the auto
 transaction batching, and the row-shape / table-name / row-key contract across mid-transaction
 ALTER — is documented separately in [Database-Level Event System](module-events.md).
 
+**A module that raises its own data-change events owes two more guarantees**, on top of the
+as-of-delivery ones above. A module without an emitter owes nothing here: the engine's
+auto-event path produces both for it.
+
+- **`key` is the primary key projected out of the event's own row image** — out of `newRow` for
+  an `insert` and an `update`, out of `oldRow` for a `delete`. Never the pre-image key of an
+  update, and never a key your storage layer normalized away from the values the row holds.
+- **An `update` event never moves a row.** If a write relocates a row — its key values differ
+  under the primary key's own comparator, which is per-column collation- and type-aware, not
+  byte identity — emit a `delete` at the old key followed by an `insert` at the new key, in
+  that order, instead of one `update`. Test relocation with the same comparator (or the same
+  encoded key) your storage uses to address rows, never raw value equality: under a `NOCASE`
+  key, rewriting `'apple'` to `'APPLE'` moves nothing and stays a single `update`, keyed by
+  the post-image. Consumers are promised the ordering but **not** adjacency, so you may
+  interleave other events between the pair.
+
+Both are what lets a listener retire a row's old identity without knowing which columns form
+the key — see [usage § Subscribing to Data Changes](usage.md#subscribing-to-data-changes).
+
 ## See Also
 
 - [Database-Level Event System](module-events.md) - Data and schema change events

@@ -21,7 +21,6 @@ let transactionLayerCounter = 1000;
  */
 export interface PendingChange {
 	type: 'insert' | 'update' | 'delete';
-	pk: BTreeKeyForPrimary;
 	oldRow?: Row;
 	newRow?: Row;
 }
@@ -60,16 +59,6 @@ export interface PreparedPrimaryKeyRekey {
 	deletions: Array<{ newKey: BTreeKeyForPrimary; oldKey: BTreeKeyForPrimary }>;
 	/** The layer's net effective rows. A key-column change moves no stored value, so rows pass verbatim. */
 	upserts: Row[];
-	/**
-	 * The layer's {@link PendingChange} event log with every recorded `pk` re-derived from
-	 * the event's own row image, or null when change tracking is disabled. The commit-time
-	 * delivery shapes each event's key by the arity of the schema AT DELIVERY
-	 * (`MemoryTableManager.commitTransaction`), so a key recorded at the retired arity
-	 * would be mis-shaped — unlike a collation-only re-key, where the recorded keys stay
-	 * accurate (see {@link TransactionLayer.rekeyPrimaryKey}). Not deduplicated — every
-	 * recorded write stays a separate event, the delivered contract.
-	 */
-	rekeyedPendingChanges: PendingChange[] | null;
 }
 
 /**
@@ -331,8 +320,8 @@ export class TransactionLayer implements Layer {
 	 */
 	public rekeyPrimaryKey(newSchema: TableSchema): void {
 		// The pending-change EVENT log is deliberately NOT rewritten here: a collation
-		// change moves only the comparator — every stored value and every key value is
-		// untouched — so the recorded `pk`/`oldRow`/`newRow` images stay accurate as-is.
+		// change moves only the comparator — every stored value is untouched — so the
+		// recorded `oldRow`/`newRow` images stay accurate as-is.
 		// (Contrast convertColumn / installReshapedColumns, which do rewrite the log.)
 		const preRekeyTree = this.primaryModifications;
 		const preRekeyFunctions = this.pkFunctions;
@@ -404,54 +393,21 @@ export class TransactionLayer implements Layer {
 			deletions.push({ newKey: newPkFunctions.extractFromRow(parentRow), oldKey: write.primaryKey });
 		}
 
-		// Re-derive each recorded event's `pk` from the event's own row image. An update
-		// carries two images and the producers disagree about which one's key it recorded
-		// when the update itself moved the key (`fix/bug-update-event-key-disagrees-across-
-		// producers`) — so, exactly like the engine emitter's `rekeyBatchedDataEvents`
-		// tie-break, test both against the recorded key under the OLD functions and re-key
-		// from whichever matches. One entry per recorded write is kept — no dedup — because
-		// every recorded write is a separately delivered event.
-		let rekeyedPendingChanges: PendingChange[] | null = null;
-		if (this.pendingChanges) {
-			rekeyedPendingChanges = this.pendingChanges.map(change => {
-				const image = this.selectEventKeySourceImage(change, oldFunctions);
-				if (image === undefined) {
-					warnLog('Primary-key re-key: %s event on %s has no usable row image; leaving its key at the retired shape',
-						change.type, this.tableSchemaAtCreation.name);
-					return { ...change };
-				}
-				return { ...change, pk: newPkFunctions.extractFromRow(image) };
-			});
-		}
-
-		return { deletions, upserts, rekeyedPendingChanges };
-	}
-
-	/**
-	 * The row image a {@link PendingChange}'s recorded `pk` was derived from — the image a
-	 * primary-key re-key must re-project so the rewritten key still addresses the row the
-	 * producer meant. Insert and delete carry one meaningful image each; an update's two can
-	 * disagree when the update moved the key, so the recorded key picks between them.
-	 */
-	private selectEventKeySourceImage(change: PendingChange, oldFunctions: PrimaryKeyFunctions): Row | undefined {
-		if (change.type === 'insert') return change.newRow;
-		if (change.type === 'delete') return change.oldRow;
-
-		const matches = (row: Row | undefined): boolean =>
-			row !== undefined && oldFunctions.compare(change.pk, oldFunctions.extractFromRow(row)) === 0;
-		const oldMatches = matches(change.oldRow);
-		const newMatches = matches(change.newRow);
-		if (oldMatches && !newMatches) return change.oldRow;
-		if (newMatches && !oldMatches) return change.newRow;
-		return change.newRow ?? change.oldRow;
+		// The pending-change EVENT log needs nothing here: a change records only its row
+		// images, and `MemoryTableManager.commitTransaction` projects the delivered `key` out
+		// of them through the primary key of the schema current AT DELIVERY. So the re-key of
+		// the events is the projection itself, and the images this rewrite leaves untouched
+		// (a key-column change moves no stored value) are already the right ones.
+		return { deletions, upserts };
 	}
 
 	/**
 	 * Phase 2 of adopting `alter table … alter primary key`: installs what
 	 * {@link prepareRekeyedPrimaryKeyColumns} computed. Swaps in the new schema, rebuilds
 	 * {@link pkFunctions}, replays the net own-writes into a tree over the parent's
-	 * already-rebuilt one, rebuilds every secondary index (each embeds the primary key in its
-	 * entries), and installs the re-keyed event log. Synchronous and mutation-only.
+	 * already-rebuilt one, and rebuilds every secondary index (each embeds the primary key in
+	 * its entries). Synchronous and mutation-only. The pending-change event log is untouched —
+	 * it stores only row images, and the delivered key is projected from them at commit.
 	 *
 	 * Like every whole-layer rebuild, the caller MUST apply this oldest-first with the base
 	 * already re-keyed: the rebuilt tree inherits copy-on-write from the parent's NEW one.
@@ -483,13 +439,6 @@ export class TransactionLayer implements Layer {
 					&& oldFunctions.compare(oldKey, oldFunctions.extractFromRow(foundRow)) === 0;
 			},
 		);
-
-		// Install the re-keyed event log the prepare phase computed (null ⇔ tracking
-		// disabled), so the keys delivered at this table's commit have the arity the
-		// delivery-time schema expects.
-		if (prepared.rekeyedPendingChanges !== null) {
-			this.pendingChanges = prepared.rekeyedPendingChanges;
-		}
 	}
 
 	/**
@@ -915,7 +864,6 @@ export class TransactionLayer implements Layer {
 		if (this.pendingChanges) {
 			this.pendingChanges.push({
 				type: oldRowDataIfUpdate ? 'update' : 'insert',
-				pk: primaryKey,
 				oldRow: oldRowDataIfUpdate ?? undefined,
 				newRow: newRowData,
 			});
@@ -990,7 +938,6 @@ export class TransactionLayer implements Layer {
 		if (this.pendingChanges) {
 			this.pendingChanges.push({
 				type: 'delete',
-				pk: primaryKey,
 				oldRow: oldRowDataForIndexes,
 			});
 		}

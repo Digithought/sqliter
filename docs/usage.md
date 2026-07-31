@@ -341,7 +341,7 @@ The `DatabaseDataChangeEvent` interface:
 | `moduleName` | `string` | The virtual table module that raised the event |
 | `schemaName` | `string` | Schema containing the table |
 | `tableName` | `string` | Table name |
-| `key` | `SqlValue[]` | Primary key values of the row (if available), under the primary key the table has at delivery |
+| `key` | `SqlValue[]` | Primary key values projected out of the event's **own** row image (`newRow` for insert/update, `oldRow` for delete), under the primary key the table has at delivery |
 | `oldRow` | `Row` | Previous row data (for update/delete) |
 | `newRow` | `Row` | New row data (for insert/update) |
 | `changedColumns` | `string[]` | Column names that changed (for updates) |
@@ -362,6 +362,29 @@ compose within a transaction (`t` → `t2` → `t3` delivers `t3`), and a rename
 *between* transactions changes nothing about events already delivered, which correctly carry
 the name the table had when they were delivered. `key` and `oldRow`/`newRow` are untouched by
 a rename, which moves no value.
+
+`key` addresses exactly one row, and an `update` never moves it. Every producer follows the
+same two clauses, so a listener can treat `key` as the row's identity without knowing anything
+about the table's schema:
+
+1. **`key` is the primary key projected out of the event's own row image** — out of `newRow`
+   for an `insert` and an `update`, out of `oldRow` for a `delete`. An update therefore keys by
+   the row's *post*-image, which is the row the table now holds.
+2. **An `update` never moves a row.** When a statement changes a primary key such that the row
+   *relocates* — its key values differ under the primary key's own comparator, which is
+   per-column collation- and type-aware, not byte identity — the producer delivers a `delete`
+   at the old key followed by an `insert` at the new key, **in that order**, instead of one
+   `update`. A rewrite that leaves the row where it was stays a single `update`: under a
+   `NOCASE` primary key, `update t set k = 'APPLE' where k = 'apple'` moves nothing, so it is
+   one `update` whose `key` is the post-image `['APPLE']` the table now stores.
+
+The split is what lets a plain listener retire the old identity. `update t set a = 2 where a =
+1` on a table keyed by `a` delivers `delete key: [1]` then `insert key: [2]`, so a cache or a
+change log keyed by `key` drops row `1` and adds row `2` without having to know which columns
+form the key — which the event does not carry. The cost is deliberate: a relocating update
+carries no `changedColumns` and no "these two events are the same row" link. **Ordering is
+guaranteed; adjacency is not** — other events may be delivered between the `delete` and the
+`insert`, so do not pair them positionally.
 
 `key` is as-of-delivery too: it holds the values of the primary key the table has **at
 delivery**, so a consumer that addresses rows by `key` (an incremental cache, a sync change

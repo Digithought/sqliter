@@ -19,12 +19,16 @@ export interface SchemaChangeEvent {
 
 /**
  * Data change event types.
+ *
+ * Producers owe the engine's key contract (`docs/usage.md` § Subscribing to Data Changes):
+ * `key` is projected from the event's own row image, and an `update` never moves a row — a
+ * relocating primary-key change is a `delete` at the old key then an `insert` at the new one.
  */
 export interface DataChangeEvent {
   type: 'insert' | 'update' | 'delete';
   schemaName: string;
   tableName: string;
-  /** Primary key values. Alias: pk */
+  /** Primary key projected from this event's own image: `newRow` for insert/update, `oldRow` for delete. Alias: pk */
   key?: SqlValue[];
   /** Primary key values. Alias: key */
   pk?: SqlValue[];

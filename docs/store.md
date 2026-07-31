@@ -43,7 +43,7 @@ interface DataChangeEvent {
   type: 'insert' | 'update' | 'delete';
   schemaName: string;
   tableName: string;
-  key: SqlValue[];      // Primary key values
+  key: SqlValue[];      // Primary key projected from this event's own row image
   oldRow?: Row;         // For update/delete
   newRow?: Row;         // For insert/update
 }
@@ -52,6 +52,13 @@ store.onDataChange((event: DataChangeEvent) => {
   // Invalidate cache, update UI, replicate, etc.
 });
 ```
+
+`key` follows the engine-wide contract in [usage § Subscribing to Data Changes](usage.md#subscribing-to-data-changes):
+it is the primary key projected out of the event's own row image (`newRow` for an insert or an
+update, `oldRow` for a delete), and an `update` never moves a row — a key change that relocates
+the row arrives as a `delete` at the old key followed by an `insert` at the new one. The store
+tests relocation by its ENCODED data key, so a case-only rewrite under a `NOCASE` key stays a
+single in-place `update`.
 
 ### Use Cases
 

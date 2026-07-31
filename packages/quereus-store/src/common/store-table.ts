@@ -41,6 +41,7 @@ import {
 	deserializeRow,
 } from './serialization.js';
 import { resolvePkKeyCollations, resolvePkKeyTransforms } from './pk-key-resolution.js';
+import type { DataChangeEvent } from './events.js';
 
 import { StoreTableConstraints } from './store-table-constraints.js';
 
@@ -598,19 +599,29 @@ export class StoreTable extends StoreTableConstraints {
 				// both halves use the same key.
 				await this.updateSecondaryIndexes(inTransaction, oldRow, coerced, oldPk, newPk);
 
-				// Queue or emit event
-				const updateEvent = {
-					type: 'update' as const,
-					schemaName: schema.schemaName,
-					tableName: schema.name,
-					key: newPk,
-					oldRow: oldRow || undefined,
-					newRow: coerced,
+				// Queue or emit the event(s). An update that RELOCATED the row is delivered
+				// as a `delete` at the old key then an `insert` at the new one, never a single
+				// `update` — the event contract's split rule, which lets a listener retire the
+				// old identity without knowing which columns form the key (docs/usage.md
+				// § Subscribing to Data Changes). `pkChanged` is exactly the relocation test the
+				// contract names: encoded data keys fold each PK column's collation, so a NOCASE
+				// case-only rewrite stays one in-place `update`, keyed — like every
+				// non-relocating update — by the POST-image `newPk`. Any `replacedAtNewPk`
+				// eviction already emitted its own delete above (deleteRowAt), so the delivered
+				// order is evict-delete, move-delete, move-insert.
+				const emitOrQueue = (event: DataChangeEvent): void => {
+					if (inTransaction) {
+						coordinator.queueEvent(event);
+					} else {
+						this.eventEmitter?.emitDataChange(event);
+					}
 				};
-				if (inTransaction) {
-					coordinator.queueEvent(updateEvent);
+				const eventBase = { schemaName: schema.schemaName, tableName: schema.name };
+				if (pkChanged) {
+					emitOrQueue({ ...eventBase, type: 'delete', key: oldPk, oldRow: oldRow || undefined });
+					emitOrQueue({ ...eventBase, type: 'insert', key: newPk, newRow: coerced });
 				} else {
-					this.eventEmitter?.emitDataChange(updateEvent);
+					emitOrQueue({ ...eventBase, type: 'update', key: newPk, oldRow: oldRow || undefined, newRow: coerced });
 				}
 
 				return { status: 'ok', row: coerced, replacedRow: replacedAtNewPk ?? undefined, evictedRows: evicted.length > 0 ? evicted : undefined };

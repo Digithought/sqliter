@@ -209,20 +209,20 @@ describe('Store-backed ALTER TABLE mid-transaction: events keep the delivered sc
 		await assertRows(db, 'select * from t', [{ a: 1, b: 9, v: 'y' }]);
 	});
 
-	it('an update that MOVES the primary key keeps whichever image the producer keyed it by', async () => {
-		// The three event producers disagree about whether a PK-moving update's `key` holds
-		// the pre- or the post-update key (fix/bug-update-event-key-disagrees-across-producers).
-		// The re-key must be neutral to that: it re-projects the SAME image the producer used.
-		// So learn the producer's choice from a run with no ALTER at all, then assert the
-		// re-keyed run delivers exactly that key with `b` appended — never the other image's.
+	it('an update that MOVES the primary key re-keys its delete and its insert independently', async () => {
+		// A PK-moving update is never one `update` event: the contract splits it into a
+		// `delete` at the old key and an `insert` at the new one (usage.md § Subscribing to
+		// Data Changes). Each carries a single meaningful image, so the re-key re-projects each
+		// through its own — [1, 9] for the delete's oldRow, [2, 9] for the insert's newRow —
+		// and the two land at DIFFERENT keys, which a shared re-key could not do.
 		await db.exec('create table t (a integer not null, b integer not null, v text, primary key (a)) using store');
 		await db.exec("insert into t values (1, 9, 'x')");
 		events.length = 0;
 		await db.exec('update t set a = 2 where a = 1');
 		const baseline = events.filter(e => e.tableName === 't');
-		assert.equal(baseline.length, 1);
-		assert.equal(baseline[0].key?.length, 1);
-		const producerKeyedBy = baseline[0].key![0];
+		assert.deepEqual(baseline.map(e => e.type), ['delete', 'insert']);
+		assert.deepEqual(baseline[0].key, [1]);
+		assert.deepEqual(baseline[1].key, [2]);
 
 		await db.exec('create table u (a integer not null, b integer not null, v text, primary key (a)) using store');
 		await db.exec("insert into u values (1, 9, 'x')");
@@ -233,9 +233,9 @@ describe('Store-backed ALTER TABLE mid-transaction: events keep the delivered sc
 		await db.exec('commit');
 
 		const dml = events.filter(e => e.tableName === 'u');
-		assert.equal(dml.length, 1);
-		assert.equal(dml[0].type, 'update');
-		assert.deepEqual(dml[0].key, [producerKeyedBy, 9]);
+		assert.deepEqual(dml.map(e => e.type), ['delete', 'insert']);
+		assert.deepEqual(dml[0].key, [1, 9]);
+		assert.deepEqual(dml[1].key, [2, 9]);
 		await assertRows(db, 'select * from u', [{ a: 2, b: 9, v: 'x' }]);
 	});
 

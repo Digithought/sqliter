@@ -60,9 +60,9 @@ value list, not an index list. Same split:
 
 - Both arms of `runAlterPrimaryKey` call `DatabaseEventEmitter.rekeyBatchedDataEvents` after
   the module's `alterTable` (or the rebuild fallback) returns, walking the base batch and every
-  open savepoint layer. Each new key is projected from that event's **own** image: `newRow` for
-  an insert, `oldRow` for a delete, and for an update whichever image reproduces the recorded
-  key under the retired key's columns. Best-effort like the image remap — no key, no usable
+  open savepoint layer. Each new key is projected from that event's **own** image — the same
+  rule the producers follow when they record the key in the first place: `newRow` for an insert
+  or an update, `oldRow` for a delete. Best-effort like the image remap — no key, no usable
   image, or an image too short for the new key columns keeps the key as-is and logs.
 - A module holding its own queue across the ALTER re-derives `key` itself, by the same rule.
 
@@ -80,7 +80,10 @@ interface DatabaseDataChangeEvent {
   moduleName: string;       // Which module raised this event
   schemaName: string;
   tableName: string;
-  key?: SqlValue[];         // Primary key values, under the key the table has at delivery
+  key?: SqlValue[];         // Primary key projected from this event's OWN row image (newRow for
+                            // insert/update, oldRow for delete), under the key the table has at
+                            // delivery. An update never moves a row — a relocating PK change is
+                            // delivered as delete-then-insert. See usage.md § Subscribing to Data Changes.
   oldRow?: Row;             // Previous values (update/delete)
   newRow?: Row;             // New values (insert/update)
   changedColumns?: string[]; // Column names that changed (update only)

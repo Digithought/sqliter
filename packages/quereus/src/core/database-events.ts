@@ -22,6 +22,11 @@ const errorLog = log.extend('error');
 /**
  * Data change event emitted at the database level.
  * Extends VTableDataChangeEvent with module identification.
+ *
+ * See `docs/usage.md` § Subscribing to Data Changes for the key contract every producer
+ * follows: `key` is projected from the event's own row image, and an `update` never moves a
+ * row (a relocating primary-key change is a `delete` at the old key then an `insert` at the new
+ * one, in that order — ordering guaranteed, adjacency not).
  */
 export interface DatabaseDataChangeEvent {
 	/** The type of mutation operation */
@@ -32,7 +37,7 @@ export interface DatabaseDataChangeEvent {
 	schemaName: string;
 	/** Table name */
 	tableName: string;
-	/** Primary key values */
+	/** Primary key projected from this event's own image: `newRow` for insert/update, `oldRow` for delete */
 	key?: SqlValue[];
 	/** Previous row data (for update/delete) */
 	oldRow?: Row;
@@ -228,36 +233,29 @@ function keyMatchesImage(row: Row, indices: readonly number[], key: readonly Sql
  * re-project through the new key so the re-key preserves whichever row the producer
  * was addressing.
  *
- * `insert` and `delete` carry one meaningful image each. `update` carries two, and the
- * three producers disagree about which one's PK an update's `key` holds when the update
- * itself changes a PK column (`fix/bug-update-event-key-disagrees-across-producers`); so
- * rather than pick, test both against the recorded `key` and keep the one that matches.
- * Both match (the ordinary case — the update touched no PK column) ⇒ either will do, so
- * `newRow`, falling back to `oldRow`.
+ * This is just the producers' own key rule (docs/usage.md § Subscribing to Data Changes)
+ * read backwards: `key` is projected from `newRow` for an insert or an update, from
+ * `oldRow` for a delete. An update's two images can still differ in a key column — a
+ * NOCASE 'apple' → 'APPLE' rewrite leaves the row in place, and the contract keys it by the
+ * post-image — which is why `newRow` is not merely a convenience here.
  *
- * NEITHER matching means the recorded `key` was not projected from either image under the
- * retired key — a producer that normalizes key values, or a key of an arity the retired key
- * never had. The re-key is then guessing which row the event addresses, so it says so.
+ * A recorded `key` that the chosen image does not reproduce under the retired key means the
+ * producer broke that rule (a module with its own emitter that normalizes key values, or one
+ * still keying an update by its pre-image). The re-key then addresses a different row than
+ * the producer meant, so it says so and proceeds by the contract.
  */
 function selectKeySourceImage(
 	event: VTableDataChangeEvent,
 	oldPkIndices: readonly number[],
 ): Row | undefined {
-	if (event.type === 'insert') return event.newRow;
 	if (event.type === 'delete') return event.oldRow;
 
-	const key = event.key;
-	if (key) {
-		const oldMatches = event.oldRow !== undefined && keyMatchesImage(event.oldRow, oldPkIndices, key);
-		const newMatches = event.newRow !== undefined && keyMatchesImage(event.newRow, oldPkIndices, key);
-		if (oldMatches && !newMatches) return event.oldRow;
-		if (newMatches && !oldMatches) return event.newRow;
-		if (!oldMatches && !newMatches && (event.oldRow !== undefined || event.newRow !== undefined)) {
-			warnLog('rekeyBatchedDataEvents: neither image of the update on %s.%s reproduces its recorded key %O under the retired key columns %O; re-keying from newRow',
-				event.schemaName, event.tableName, key, oldPkIndices);
-		}
+	const image = event.newRow ?? event.oldRow;
+	if (event.key && image !== undefined && !keyMatchesImage(image, oldPkIndices, event.key)) {
+		warnLog('rekeyBatchedDataEvents: the %s event on %s.%s carries key %O, which its row image does not reproduce under the retired key columns %O — the producer is not keying events from the row image; re-keying from that image anyway',
+			event.type, event.schemaName, event.tableName, event.key, oldPkIndices);
 	}
-	return event.newRow ?? event.oldRow;
+	return image;
 }
 
 /**
