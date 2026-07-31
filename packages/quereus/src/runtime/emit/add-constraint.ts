@@ -6,7 +6,7 @@ import { QuereusError } from '../../common/errors.js';
 import { SqlValue, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
-import { opsToMask, requireVtabModule } from '../../schema/table.js';
+import { namedConstraintExists, opsToMask, requireVtabModule } from '../../schema/table.js';
 import { buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertUniqueConstraintIndexNameFree } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
@@ -32,6 +32,31 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 		const constraint = plan.constraint;
 		const schemaManager = rctx.db.schemaManager;
 		const schema = schemaManager.getSchemaOrFail(tableSchema.schemaName);
+
+		// Constraint names are unique within a table — the same rule RENAME CONSTRAINT
+		// already enforces, applied to the addition side. Placed here, ABOVE the
+		// engine-side / module-routed branch below, so one guard covers both arms; and
+		// above the module dispatch inside each, so a refused statement persists nothing
+		// (the store's `alterTable` writes the saved schema, and a post-call throw would
+		// leave the duplicate on disk to rehydrate on reopen). It also runs ahead of
+		// `assertUniqueConstraintIndexNameFree`: on the memory backend an existing UNIQUE's
+		// own hidden backing index is materialized into the index list, so the index guard
+		// would otherwise fire on it and name an index the user never created, while the
+		// store backend saw nothing at all — same statement, two outcomes.
+		//
+		// An unnamed constraint has no user-supplied identity to collide, so it is skipped;
+		// the engine-synthesized `_uc_*` / `_check_*` / `_fk_*` names are not compared.
+		//
+		// NOTE: when the same-named existing constraint is a UNIQUE synthesized from
+		// `CREATE UNIQUE INDEX` (`derivedFromIndex` set), this says a constraint with that
+		// name exists rather than naming the index. That is still true, and it is what the
+		// rename path already reports for the same shape.
+		if (constraint.name && namedConstraintExists(tableSchema, constraint.name)) {
+			throw new QuereusError(
+				`Cannot add constraint '${constraint.name}' to table '${tableSchema.name}': a constraint with that name already exists`,
+				StatusCode.CONSTRAINT,
+			);
+		}
 
 		// A CHECK on a module without an `alterTable` hook stays engine-side (catalog
 		// only — DROP/RENAME CONSTRAINT are unsupported on such a module anyway, so

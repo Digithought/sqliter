@@ -156,6 +156,29 @@ export function resolveNamedConstraintClass(tableSchema: TableSchema, constraint
 }
 
 /**
+ * True when `name` addresses any named CHECK / UNIQUE / FOREIGN KEY constraint on
+ * the table. The existence-only sibling of {@link resolveNamedConstraintClass}
+ * (which resolves the class and throws on absent/ambiguous), matching names the
+ * same case-insensitive way.
+ *
+ * Lives here — not beside either caller — because two copies of a name-matching
+ * rule drift. Used by the ALTER write paths that must refuse a duplicate constraint
+ * name: `ADD CONSTRAINT`, an inline named constraint on `ADD COLUMN`, and
+ * `RENAME CONSTRAINT`'s collision check.
+ *
+ * Engine-synthesized names (`_uc_*` / `_check_*` / `_fk_*`) are not user identity,
+ * but they are stored in the same `name` fields, so a caller comparing a
+ * user-supplied name against them is comparing against a name the user cannot have
+ * typed — harmless, and not special-cased here.
+ */
+export function namedConstraintExists(tableSchema: TableSchema, name: string): boolean {
+	const lower = name.toLowerCase();
+	return (tableSchema.checkConstraints ?? []).some(c => c.name?.toLowerCase() === lower)
+		|| (tableSchema.uniqueConstraints ?? []).some(c => c.name?.toLowerCase() === lower)
+		|| (tableSchema.foreignKeys ?? []).some(c => c.name?.toLowerCase() === lower);
+}
+
+/**
  * Builds a map from column names to their indices in the columns array
  *
  * @param columns Array of column schemas

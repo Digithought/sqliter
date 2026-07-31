@@ -223,4 +223,84 @@ describe('ALTER TABLE ADD CONSTRAINT', () => {
 			await db.exec('alter table child add constraint fk_pa foreign key (pa) references parent(pid)');
 		});
 	});
+
+	// Constraint names are unique within a table. RENAME CONSTRAINT already enforced
+	// that; ADD CONSTRAINT did not, so a duplicate arriving by addition was accepted and
+	// left a name that DROP/RENAME then removed twice (same class) or could never address
+	// again (across classes — the ambiguity error). The behavioral/cross-backend coverage
+	// lives in test/logic/41.6-alter-drop-rename-constraint.sqllogic § 7b; these pin the
+	// message text and status code.
+	describe('duplicate constraint name', () => {
+		const expectDuplicate = async (sql: string, name: string, table: string): Promise<void> => {
+			const err = await expectThrows(() => db.exec(sql));
+			expect(err.code).to.equal(StatusCode.CONSTRAINT);
+			expect(err.message).to.contain(
+				`Cannot add constraint '${name}' to table '${table}': a constraint with that name already exists`,
+			);
+		};
+
+		it('refuses a CHECK whose name another CHECK already uses', async () => {
+			await db.exec('create table t (id integer primary key, a integer, b integer, constraint ck check (a > 0))');
+			await expectDuplicate('alter table t add constraint ck check (b > 0)', 'ck', 't');
+			expect(db.schemaManager.getTable('main', 't')!.checkConstraints.map(c => c.name)).to.deep.equal(['ck']);
+		});
+
+		it('refuses a UNIQUE whose name a CHECK already uses (cross-class)', async () => {
+			await db.exec('create table t (id integer primary key, a integer, b integer, constraint dup check (a > 0))');
+			await expectDuplicate('alter table t add constraint dup unique (b)', 'dup', 't');
+			expect(db.schemaManager.getTable('main', 't')!.uniqueConstraints ?? []).to.deep.equal([]);
+			// The name still resolves to exactly one constraint, so DROP keeps working —
+			// which is exactly what a landed duplicate would have made impossible.
+			await db.exec('alter table t drop constraint dup');
+			expect(db.schemaManager.getTable('main', 't')!.checkConstraints.map(c => c.name)).to.deep.equal([]);
+		});
+
+		it('matches the existing name case-insensitively', async () => {
+			await db.exec('create table t (id integer primary key, a integer, b integer, constraint ck check (a > 0))');
+			await expectDuplicate('alter table t add constraint CK check (b > 0)', 'CK', 't');
+		});
+
+		it('does not fire for an unnamed constraint', async () => {
+			await db.exec('create table t (id integer primary key, a integer, b integer, constraint uq unique (a))');
+			await db.exec('alter table t add unique (b)');
+			expect((db.schemaManager.getTable('main', 't')!.uniqueConstraints ?? []).length).to.equal(2);
+		});
+
+		it('refuses an inline named constraint on ADD COLUMN, leaving the table unchanged', async () => {
+			await db.exec('create table t (id integer primary key, a integer, constraint ck check (a > 0))');
+			await db.exec('insert into t values (1, 5)');
+			await expectDuplicate('alter table t add column b integer null constraint ck check (b > 0)', 'ck', 't');
+
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.columns.map(c => c.name), 'no column added').to.deep.equal(['id', 'a']);
+			expect(t.checkConstraints.map(c => c.name), 'no constraint installed').to.deep.equal(['ck']);
+			// Data is intact and still readable through the unchanged column set.
+			const rows: Record<string, unknown>[] = [];
+			for await (const r of db.eval('select id, a from t')) rows.push(r as Record<string, unknown>);
+			expect(rows).to.deep.equal([{ id: 1, a: 5 }]);
+		});
+
+		it('refuses two inline constraints on one ADD COLUMN that collide with each other', async () => {
+			// Neither name is on the table yet, so only the within-statement accumulation
+			// catches this one.
+			await db.exec('create table t (id integer primary key, a integer)');
+			await expectDuplicate(
+				'alter table t add column b integer null constraint x check (b > 0) constraint x unique',
+				'x',
+				't',
+			);
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'a']);
+			expect(t.checkConstraints.map(c => c.name)).to.deep.equal([]);
+			expect(t.uniqueConstraints ?? []).to.deep.equal([]);
+		});
+
+		it('still allows a non-colliding inline named constraint on ADD COLUMN', async () => {
+			await db.exec('create table t (id integer primary key, a integer, constraint ck check (a > 0))');
+			await db.exec('alter table t add column b integer null constraint ck_b check (b > 0)');
+			const t = db.schemaManager.getTable('main', 't')!;
+			expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'a', 'b']);
+			expect(t.checkConstraints.map(c => c.name)).to.have.members(['ck', 'ck_b']);
+		});
+	});
 });

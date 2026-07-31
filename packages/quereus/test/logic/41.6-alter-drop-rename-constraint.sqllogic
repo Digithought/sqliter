@@ -204,6 +204,128 @@ drop table e_coll;
 -- The negative control for a UNIQUE derived from CREATE UNIQUE INDEX (DROP CONSTRAINT
 -- cannot target it) lives in 41.6.1-alter-drop-constraint-index-derived.
 
+-- ------------------------------------------------------------
+-- 7b. ADD CONSTRAINT refuses a name another constraint already uses.
+-- Same rule RENAME CONSTRAINT enforces, applied to the addition side. The refusal
+-- happens before the statement reaches the storage module, so memory and store agree
+-- and nothing is persisted — which is why these live here rather than in a spec.
+-- ------------------------------------------------------------
+
+-- CHECK onto CHECK
+create table a_chk (id integer primary key, a integer, b integer, constraint ck check (a > 0));
+-- run
+
+alter table a_chk add constraint ck check (b > 0);
+-- error: already exists
+
+-- refused ⇒ table untouched: still exactly one CHECK named ck
+select count(*) as c from check_constraint_info('a_chk') where name = 'ck';
+→ [{"c":1}]
+
+-- a different name is still accepted
+alter table a_chk add constraint ck2 check (b > 0);
+-- run
+
+select count(*) as c from check_constraint_info('a_chk') where name = 'ck2';
+→ [{"c":1}]
+
+-- case-insensitive, like every other constraint-name comparison
+alter table a_chk add constraint CK check (b > 1);
+-- error: already exists
+
+drop table a_chk;
+-- run
+
+-- UNIQUE onto UNIQUE
+create table a_unq (id integer primary key, a integer, b integer, constraint uq unique (a));
+-- run
+
+alter table a_unq add constraint uq unique (b);
+-- error: already exists
+
+select count(*) as c from unique_constraint_info('a_unq') where name = 'uq';
+→ [{"c":1}]
+
+-- negative control: an UNNAMED add has no user-supplied name to collide, so it succeeds
+alter table a_unq add unique (b);
+-- run
+
+insert into a_unq values (1, 1, 1);
+insert into a_unq values (2, 2, 1);
+-- error: unique
+
+drop table a_unq;
+-- run
+
+-- FOREIGN KEY onto FOREIGN KEY
+create table a_fk_parent (pid integer primary key);
+create table a_fk_child (id integer primary key, x integer, y integer, constraint fk foreign key (x) references a_fk_parent(pid));
+-- run
+
+alter table a_fk_child add constraint fk foreign key (y) references a_fk_parent(pid);
+-- error: already exists
+
+select count(*) as c from foreign_key_info('a_fk_child') where name = 'fk';
+→ [{"c":1}]
+
+drop table a_fk_child;
+drop table a_fk_parent;
+-- run
+
+-- Cross-class: a CHECK's name blocks a UNIQUE of the same name (and vice versa).
+-- Without this, the table ends up with a name no DROP/RENAME can ever address —
+-- both fail permanently with the ambiguity error from § 7 above.
+create table a_cross (id integer primary key, a integer, b integer, constraint dup check (a > 0));
+-- run
+
+alter table a_cross add constraint dup unique (b);
+-- error: already exists
+
+select count(*) as c from unique_constraint_info('a_cross') where name = 'dup';
+→ [{"c":0}]
+
+-- the name still resolves to exactly one constraint, so DROP works
+alter table a_cross drop constraint dup;
+-- run
+
+select count(*) as c from check_constraint_info('a_cross') where name = 'dup';
+→ [{"c":0}]
+
+drop table a_cross;
+-- run
+
+-- ADD COLUMN carrying an inline NAMED constraint is refused the same way
+create table a_col (id integer primary key, a integer, constraint ck check (a > 0));
+-- run
+
+alter table a_col add column b integer null constraint ck check (b > 0);
+-- error: already exists
+
+-- refused ⇒ no column added and no constraint installed
+select count(*) as c from table_info('a_col') where name = 'b';
+→ [{"c":0}]
+
+select count(*) as c from check_constraint_info('a_col') where name = 'ck';
+→ [{"c":1}]
+
+-- two inline constraints colliding with EACH OTHER on one ADD COLUMN (neither exists
+-- on the table yet, so only the within-statement accumulation catches it)
+alter table a_col add column c integer null constraint x check (c > 0) constraint x unique;
+-- error: already exists
+
+select count(*) as c from table_info('a_col') where name = 'c';
+→ [{"c":0}]
+
+-- a non-colliding inline name still works
+alter table a_col add column d integer null constraint ck_d check (d > 0);
+-- run
+
+select count(*) as c from check_constraint_info('a_col') where name = 'ck_d';
+→ [{"c":1}]
+
+drop table a_col;
+-- run
+
 -- ============================================================
 -- 8. DROP CONSTRAINT (CHECK) invalidates optimizer folding
 -- ============================================================
