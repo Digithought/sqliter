@@ -248,15 +248,29 @@ describe('StoreModule runtime-valued IN sets (feat-runtime-key-set-protocol)', (
 			expect(result.explains).to.match(/semantic-ordering seek column cannot multi-seek/);
 		});
 
-		it('declines when the key collation may under-fetch (K = BINARY over a NOCASE column)', async () => {
-			// The K-encoded window is not a superset of the NOCASE-qualifying rows, so
-			// claiming the filter would drop rows. `eqSafeToHandle` rejects it.
-			await db.exec('create table ct2 (id integer primary key, v text collate nocase) using store (collation = binary)');
+		it('declines an `any` column with a declared COLLATE (key bytes are hard-BINARY)', async () => {
+			// `any` keys under BINARY — the collation `ANY_TYPE.compare` uses — while the
+			// scan residual compares under the declared NOCASE, so a byte-equality window is
+			// not the qualifying set and claiming the filter would drop rows. The one
+			// key-vs-comparison collation disagreement that survives
+			// store-index-collation-guard-collapse.
+			await db.exec('create table ct2 (id integer primary key, v any collate nocase) using store');
 			await db.exec('create index ix_v2 on ct2 (v)');
 			const result = plan('ct2', [runtimeSetFilter(1, 4)]);
 			expect(result.handledFilters).to.deep.equal([false]);
 			expect(result.seekColumnIndexes).to.be.undefined;
-			expect(result.explains).to.match(/key collation may under-fetch/);
+			expect(result.explains).to.match(/index key collation differs from the comparison collation/);
+		});
+
+		it('no longer declines a NOCASE column just because the table key collation is BINARY', async () => {
+			// Index bytes encode under the column's own NOCASE whatever the table key
+			// collation is, so window and residual agree and the multi-seek is claimed.
+			await db.exec('create table ct3 (id integer primary key, v text collate nocase) using store (collation = binary)');
+			await db.exec('create index ix_v3 on ct3 (v)');
+			const result = plan('ct3', [runtimeSetFilter(1, 4)]);
+			expect(result.handledFilters).to.deep.equal([true]);
+			expect(result.seekColumnIndexes).to.deep.equal([1]);
+			expect(result.explains).to.match(/multi-seek\(4\)/);
 		});
 
 		it('never seeks a partial index', async () => {

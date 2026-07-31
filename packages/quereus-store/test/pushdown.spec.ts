@@ -770,28 +770,29 @@ describe('StoreModule predicate pushdown', () => {
 			expect(await asyncIterableToArray(db.eval(outScope))).to.deep.equal([{ id: 3 }]);
 		});
 
-		// Collation-safety guard against under-fetch: a BINARY-config store (K = BINARY)
-		// with an index on a NOCASE-declared column would MISS a case-variant row if the
-		// BINARY window were trusted, so the plan must NOT mark the filter handled — no
-		// index seek, residual retained, and the result stays NOCASE-correct.
-		it('collation-unsafe index (K=BINARY over a NOCASE column) declines the seek but stays correct', async () => {
+		// The table key collation K is no longer part of the index seek decision
+		// (store-index-collation-guard-collapse): index bytes encode under the index
+		// column's own collation, which for a NOCASE-declared column is NOCASE whatever K
+		// is. Window and residual agree, so the seek is admitted and the answer stays
+		// NOCASE-correct — this shape used to decline purely because K = BINARY.
+		it('index over a NOCASE column of a K=BINARY store seeks, and stays NOCASE-correct', async () => {
 			await db.exec(`create table t (id integer primary key, v text collate nocase) using store (collation = binary)`);
 			await db.exec(`create index ix_v on t (v)`);
 			await db.exec(`insert into t values (1, 'Apple'), (2, 'apple'), (3, 'Banana')`);
 
 			const q = `select id from t where v = 'apple' order by id`;
-			expect(await planOps(q), 'guard leaves the filter unhandled — no index seek').to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await planOps(q), 'window and residual agree — the seek is claimed').to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
 			// NOCASE-correct: both 'Apple' and 'apple' match.
 			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 1 }, { id: 2 }]);
 		});
 
-		// Same guard, over an `ANY`-typed column. ANY carries no `isTextual` marker and a
-		// NULL physicalType, yet its `parse` is the identity — so it stores text as text
-		// and keys it through the collation encoder. The bare `!isTextual` exemption
-		// classified it as never-text, skipped the K-vs-C check, seeked under K = BINARY
-		// and dropped the residual: `where x = 'BOB'` returned NOTHING, while the SAME
-		// query over the SAME rows without an index returned the row. Creating an index
-		// must never change a query's results.
+		// The guard that DOES survive the collapse, over an `ANY`-typed column. ANY carries
+		// no `isTextual` marker and a NULL physicalType, yet its `parse` is the identity — so
+		// it stores text as text. Its index key bytes are hard-BINARY (the collation
+		// `ANY_TYPE.compare` uses) while the scan residual compares under the declared
+		// NOCASE, so a byte-equality window under-fetches: `where x = 'BOB'` would return
+		// NOTHING, while the SAME query over the SAME rows without an index returns the row.
+		// Creating an index must never change a query's results.
 		it('collation-unsafe index over an ANY column declines the seek but stays correct', async () => {
 			await db.exec(`create table t (id integer primary key, x ANY collate nocase) using store (collation = binary)`);
 			await db.exec(`insert into t values (1, 'Bob')`);
@@ -802,6 +803,8 @@ describe('StoreModule predicate pushdown', () => {
 
 			await db.exec(`create index ix_x on t (x)`);
 			expect(await asyncIterableToArray(db.eval(q)), 'and still matches once an index exists').to.deep.equal([{ id: 1 }]);
+			expect(await planOps(q), 'the ANY key-collation guard still declines the seek')
+				.to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
 		});
 
 		// Regression: `tryIndexAccessPlan` must mark handled ONLY the constraints

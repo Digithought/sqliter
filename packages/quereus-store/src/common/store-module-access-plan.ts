@@ -5,11 +5,13 @@
  * claims as handled, and what ordering the chosen path provides.
  *
  * The mirror of `store-table-scan.ts`: the planner here decides which access path to
- * advertise, and the scan layer there executes it. Several soundness predicates — the
- * collation-cover guards, the partial-index and semantic-ordering declines — are
- * deliberately duplicated across the two, because a plan that claims a filter the scan
- * cannot honor drops the residual Filter and returns wrong rows. Change one and the
- * other must change with it.
+ * advertise, and the scan layer there executes it. A plan that claims a filter the scan
+ * cannot honor drops the residual Filter and returns wrong rows, so every soundness
+ * predicate the two share lives in `pk-key-resolution.ts` (`keyOrderMatchesCollation`,
+ * `indexLeadingRangeIsOrderSafe`, `pkOrderPreservingPrefixLength`) rather than being
+ * restated here. The declines that are NOT shared — partial indexes, semantic-ordering
+ * columns, the multi-seek cap — are stated in both files, and changing one means changing
+ * the other.
  *
  * Free functions rather than a layer of the store-module chain — access planning reads
  * no module state beyond the table's configured key collation, which the caller passes in.
@@ -26,9 +28,10 @@ import type {
 } from '@quereus/quereus';
 import { AccessPlanBuilder, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality } from '@quereus/quereus';
 import {
-	columnCanHoldText,
-	keyOrderMatchesCollation,
+	indexLeadingRangeIsOrderSafe,
+	indexPrefixSeekIsCollationExact,
 	pkOrderPreservingPrefixLength,
+	resolveIndexKeyCollations,
 	resolvePkKeyCollations,
 } from './pk-key-resolution.js';
 
@@ -127,8 +130,11 @@ function equalityRoles(colIdxs: readonly number[], ops: readonly string[]): Seek
  * module-wide `honorsCollatedRangeBounds` flag onto it.
  *
  * `tableKeyCollation` is the table's resolved key collation K, passed in rather than
- * looked up: the caller (`StoreModule.getBestAccessPlan`) owns the module's table map,
- * and every gate below judges the pushed filters against K.
+ * looked up: the caller (`StoreModule.getBestAccessPlan`) owns the module's table map.
+ * It is the PRIMARY-KEY arms' concern only — `resolvePkKeyCollations` still falls back to
+ * K for an undecorated text PK member. The secondary-index arm never sees it: index key
+ * bytes encode under each index column's own collation, so {@link tryIndexAccessPlan}
+ * judges its filters against that instead.
  */
 export function computeBestAccessPlan(
 	db: Database,
@@ -202,16 +208,16 @@ export function computeBestAccessPlan(
 	// Check for secondary index usage. `StoreTable.query` now implements the
 	// secondary-index scan arm (leading-prefix EQ point / leading-column range),
 	// so we advertise the index with `indexName` + `seekColumns` and mark the
-	// covered filters handled — subject to the collation-safety guard in
+	// covered filters handled — subject to the range arm's order-safety gate in
 	// {@link tryIndexAccessPlan}. A cost-only plan (no seek) is kept as a fallback
-	// when no index yields a collation-safe seek, preserving the prior "cheaper
-	// cost, filters unhandled, residual retained" behavior.
+	// when no index yields a sound seek, preserving the prior "cheaper cost, filters
+	// unhandled, residual retained" behavior.
 	const indexes = tableInfo.indexes || [];
 	let bestSeekPlan: BestAccessPlanResult | null = null;
 	let costOnlyFallback: BestAccessPlanResult | null = null;
 	for (const index of indexes) {
 		if (index.columns.length === 0) continue;
-		const plan = tryIndexAccessPlan(db, tableKeyCollation, tableInfo, request, index, estimatedRows);
+		const plan = tryIndexAccessPlan(db, tableInfo, request, index, estimatedRows);
 		if (!plan) continue;
 		// A fully-handled seek (indexName + seekColumns set) is a candidate: keep the
 		// cheapest one seen so far rather than the first, so declaration order of the
@@ -226,10 +232,13 @@ export function computeBestAccessPlan(
 	}
 	if (bestSeekPlan) return bestSeekPlan;
 	// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
-	// iterates in PK key order for it (`StoreTable.query` full-scans). The range gate makes
-	// this arm fire more often — an index range on a BINARY text column of a default-K table
-	// now lands here — so `... where v > 'x' order by <pk>` picks up a Sort it did not need.
-	// If that shows up as slow, merge `buildPkOrderingAdvertisement(...)` into this return.
+	// iterates in PK key order for it (`StoreTable.query` full-scans), so `... where v > 'x'
+	// order by <pk>` picks up a Sort it did not need. Still true, just rarer than it was: an
+	// index range on a plain BINARY text column of a default-K (NOCASE) table now gets its
+	// seek and no longer lands here — what remains is a range under a collation without the
+	// `orderPreserving` assertion, an `any` column with a declared COLLATE, a semantic-ordering
+	// column, and the multi-seek declines. If it shows up as slow, merge
+	// `buildPkOrderingAdvertisement(...)` into this return.
 	//
 	// NOTE: cost-only fallback deliberately stays first-wins, not min-cost. These plans
 	// handle no filters — the scan full-scans regardless of which index "wins" — so
@@ -258,30 +267,25 @@ export function computeBestAccessPlan(
  * point), or a LT/LE/GT/GE range on the LEADING index column. These mirror the
  * two windows `StoreTable.analyzeIndexAccess` can build.
  *
- * **Collation-safety guard against under-fetch.** The store's index-column window is
- * now encoded under each column's own effective collation C (`resolveIndexKeyCollations`
- * — the same collation `matchesFilters` re-checks under), so an EQ window is exactly the
- * qualifying set and every admitted case below is trivially sound. The guard itself
- * still reasons in pre-per-column terms — admit when every seek column is non-text, OR
- * C equals the table key collation K, OR (K = NOCASE while C = BINARY) — which is now
- * merely CONSERVATIVE: it declines `C ≠ K` cases (returning a cost-only plan — cheaper
- * cost, filters unhandled, residual retained; correct, just not sped up) that the
- * C-encoded window could in fact serve. Collapsing it is deferred to
- * tickets: store-index-collation-guard-collapse, and until then it must stay in lockstep
- * with `StoreTable.analyzeIndexAccess`'s gates so the "mark handled" and "build a
- * window" decisions cannot disagree.
+ * **Collation safety.** Index-column key bytes are encoded under each column's own key
+ * collation (`resolveIndexKeyCollations`); `StoreTable.matchesFilters` re-checks a fetched
+ * row under the index column's `COLLATE` else the table column's declared collation. Both
+ * arms below ask whether those two agree — the question is no longer about the table key
+ * collation K at all, which is why this function never sees it:
  *
- * NOTE: the RANGE arm additionally needs byte order to BE comparator order, which even
- * an exact-collation window does not give for free (a registered normalizer promises an
- * equality partition, not order preservation) — so it demands `C === K` *and* K's
- * `orderPreserving` assertion, via the shared {@link keyOrderMatchesCollation};
- * `StoreTable.indexRangeIsOrderSafe` declines the same windows. The cost is that a
- * default-K (NOCASE) table with an index on a plain BINARY text column loses its index
- * RANGE seek and falls back to the cost-only plan; EQ seeks are unchanged.
+ *  - EQUALITY — {@link indexPrefixSeekIsCollationExact}: agreement makes the window
+ *    EXACTLY the qualifying set. A plain `text` column always agrees; an `any` column
+ *    carrying a declared COLLATE does not (its key bytes are hard-BINARY) and declines.
+ *  - RANGE — {@link indexLeadingRangeIsOrderSafe}: the same agreement PLUS the collation's
+ *    `orderPreserving` assertion, because a byte window also equates memcmp of the key
+ *    bytes with the residual comparator's order.
+ *
+ * `StoreTable.analyzeIndexAccess` gates its windows on the same two helpers, so the "mark
+ * handled" and "build a window" decisions cannot disagree. A decline returns a cost-only
+ * plan: cheaper cost, filters unhandled, residual retained; correct, just not sped up.
  */
 function tryIndexAccessPlan(
 	db: Database,
-	tableKeyCollation: string,
 	tableInfo: TableSchema,
 	request: BestAccessPlanRequest,
 	index: TableIndexSchema,
@@ -349,38 +353,15 @@ function tryIndexAccessPlan(
 			.setExplanation(`Store index scan on ${index.name} (${why})`)
 			.build();
 
-	// The INDEX column's effective comparison collation C — the index column's own
-	// COLLATE, else the table column's declared collation. C, not the table column's
-	// declared collation, is what matchesFilters compares an index-scan row under and
-	// what the planner matched to drop the residual, so the K-window must be a superset
-	// relative to C.
-	const K = tableKeyCollation;
-	const effectiveCollation = (colIdx: number): string => {
-		const indexCol = index.columns.find(c => c.index === colIdx);
-		return (indexCol?.collation ?? tableInfo.columns[colIdx]?.collation ?? 'BINARY').toUpperCase();
-	};
-
-	// EQUALITY: admitted iff K is coarser-or-equal to C (conservative — see the guard
-	// note in the doc comment above). Exempt only columns that can NEVER hold text —
-	// their key bytes are type-native and collation-independent. A bare `isTextual`
-	// test wrongly exempts an `ANY` column (no marker, but it stores text as text),
-	// which would skip the collation comparison entirely and mis-admit a plan the
-	// residual could no longer repair.
-	const eqSafeToHandle = (colIdx: number): boolean => {
-		const col = tableInfo.columns[colIdx];
-		if (!columnCanHoldText(col)) return true;
-		const C = effectiveCollation(colIdx);
-		if (C === K) return true;                               // equal
-		if (K === 'NOCASE' && C === 'BINARY') return true;      // K strictly coarser
-		return false;
-	};
-
-	// RANGE: coarser is not enough — byte order must BE comparator order. See the doc above.
-	const rangeSafeToHandle = (colIdx: number): boolean =>
-		keyOrderMatchesCollation(db, tableInfo.columns[colIdx], K, effectiveCollation(colIdx));
-
-	if (!seekCols.every(isRange ? rangeSafeToHandle : eqSafeToHandle)) {
-		return costOnly('cost-only; key collation may under-fetch');
+	// Collation gates — see the doc comment above. `StoreTable.analyzeIndexAccess` declines
+	// exactly the same windows through the same two helpers.
+	const indexKeyCollations = resolveIndexKeyCollations(index, tableInfo.columns);
+	if (isRange) {
+		if (!indexLeadingRangeIsOrderSafe(db, tableInfo.columns, index, indexKeyCollations)) {
+			return costOnly('cost-only; index range needs an order-preserving key collation');
+		}
+	} else if (!indexPrefixSeekIsCollationExact(tableInfo.columns, index, indexKeyCollations, seekCols.length)) {
+		return costOnly('cost-only; index key collation differs from the comparison collation');
 	}
 
 	// Multi-seek declines. Cost-only keeps the residual, so the answer stays right

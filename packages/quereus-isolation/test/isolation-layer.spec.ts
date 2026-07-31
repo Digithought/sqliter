@@ -6096,14 +6096,29 @@ describe('IsolationModule — two-phase merged UNIQUE check (index seek)', () =>
 		});
 	}
 
-	it('collate nocase declines the seek and still catches a case-only committed collision', async () => {
+	it('collate nocase SEEKS and still catches a case-only committed collision', async () => {
 		await db.exec(`create table t (id integer primary key, email text) using isolated`);
 		await db.exec(`create unique index ux on t(email collate nocase)`);
 		await db.exec(`insert into t values (1, 'b@x')`);   // committed
 		await db.exec('begin');
-		// 'B@X' == 'b@x' under NOCASE. The BINARY-only seek gate declines to seek `ux`
-		// (its enforcement collation is NOCASE), so Phase 2 full-scans and the NOCASE
-		// comparator catches the committed 'b@x'. A NOCASE seek would physically miss it.
+		// 'B@X' == 'b@x' under NOCASE. The seek gate used to demand BINARY and full-scan
+		// here, because the store's index bytes were keyed under a table-wide collation
+		// that ignored the column's. Both backends now key `ux` under its own NOCASE, so
+		// the seek window for 'B@X' contains the committed 'b@x' and the enforcement
+		// comparator confirms it. Seeking is what must NOT lose the violation.
+		await expectConstraint(`insert into t values (2, 'B@X')`);
+		await db.exec('rollback');
+	});
+
+	it('an `any` column with a declared COLLATE still declines the seek, and still catches the collision', async () => {
+		// The shape the widened gate must keep out: `any` keys hard-BINARY (the collation
+		// `ANY_TYPE.compare` uses) while the merged check enforces under the declared
+		// NOCASE, so a byte-equality seek for 'B@X' would physically miss the committed
+		// 'b@x'. `canSeekForConstraint` declines and Phase 2 full-scans.
+		await db.exec(`create table t (id integer primary key, email any collate nocase) using isolated`);
+		await db.exec(`create unique index ux on t(email)`);
+		await db.exec(`insert into t values (1, 'b@x')`);   // committed
+		await db.exec('begin');
 		await expectConstraint(`insert into t values (2, 'B@X')`);
 		await db.exec('rollback');
 	});
@@ -6176,7 +6191,7 @@ describe('IsolationModule — two-phase merged UNIQUE check (index seek)', () =>
 		expect(ev.map(r => [...r])).to.deep.equal([[1, 5, 5]]);
 	});
 
-	it('the binary index seek visits O(matches) underlying rows; the nocase fallback scans the whole table', async () => {
+	it('an index-derived UNIQUE seeks O(matches) underlying rows — collated or not; a table-level unique scans', async () => {
 		type UnderlyingTable = Awaited<ReturnType<MemoryTableModule['create']>>;
 		// Counts every row the underlying yields from query(). The overlay is served by a
 		// SEPARATE (default) MemoryTableModule, so Phase 1's overlay scan is not counted —
@@ -6224,16 +6239,31 @@ describe('IsolationModule — two-phase merged UNIQUE check (index seek)', () =>
 			const seekCount = counting.rowsYielded;
 			expect(seekCount, `binary index seek must not walk the whole table (yielded ${seekCount} of 100)`).to.be.at.most(5);
 
-			// --- Scan arm: identical shape but the index is NOCASE, so the seek is declined. ---
-			await cdb.exec(`create table scan_t (id integer primary key, email text) using isolated`);
-			await cdb.exec(`create unique index ux2 on scan_t(email collate nocase)`);
-			for (let i = 0; i < 100; i++) await cdb.exec(`insert into scan_t values (${i}, 'f${i}@x')`);
+			// --- Seek arm 2: a NOCASE index-derived UNIQUE seeks too. Index bytes key under
+			// the index column's own collation, which for an index-derived UNIQUE IS the
+			// enforcement collation, so the window is exactly the conflict set. Before
+			// store-index-collation-guard-collapse this arm was the negative control.
+			await cdb.exec(`create table nocase_t (id integer primary key, email text) using isolated`);
+			await cdb.exec(`create unique index ux2 on nocase_t(email collate nocase)`);
+			for (let i = 0; i < 100; i++) await cdb.exec(`insert into nocase_t values (${i}, 'f${i}@x')`);
+
+			const tn = await ciso.connect(cdb, undefined, 'isolated', 'main', 'nocase_t', {} as BaseModuleConfig) as IsolatedTable;
+			counting.rowsYielded = 0;
+			await tn.update({ operation: 'insert', values: [1000, 'fresh2@x'] });   // no collision
+			const nocaseCount = counting.rowsYielded;
+			expect(nocaseCount, `a collated index-derived UNIQUE must seek too (yielded ${nocaseCount} of 100)`).to.be.at.most(5);
+
+			// --- Scan arm: a table-level `unique(email)` has no index in the engine-facing
+			// schema at all, so there is nothing to name in a seek and Phase 2 full-scans.
+			// This is the negative control that proves the seek arm is what bounds the count.
+			await cdb.exec(`create table scan_t (id integer primary key, email text, unique(email)) using isolated`);
+			for (let i = 0; i < 100; i++) await cdb.exec(`insert into scan_t values (${i}, 'g${i}@x')`);
 
 			const tc = await ciso.connect(cdb, undefined, 'isolated', 'main', 'scan_t', {} as BaseModuleConfig) as IsolatedTable;
 			counting.rowsYielded = 0;
-			await tc.update({ operation: 'insert', values: [1000, 'fresh2@x'] });   // no collision
+			await tc.update({ operation: 'insert', values: [1000, 'fresh3@x'] });   // no collision
 			const scanCount = counting.rowsYielded;
-			expect(scanCount, `nocase constraint must decline the seek and full-scan (yielded ${scanCount})`).to.be.at.least(100);
+			expect(scanCount, `a non-index-derived UNIQUE must decline the seek and full-scan (yielded ${scanCount})`).to.be.at.least(100);
 		} finally {
 			await cdb.close();
 		}

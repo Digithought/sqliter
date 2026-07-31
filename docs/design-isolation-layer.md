@@ -728,21 +728,32 @@ For each declared non-PK UNIQUE constraint:
 
 **When Phase 2 may seek (`canSeekForConstraint`).** Only when the constraint was
 synthesized from a `CREATE UNIQUE INDEX` (`derivedFromIndex` names a live entry in
-`tableSchema.indexes`) AND every key column's effective enforcement collation is
-BINARY. A table-level `unique(a, b)` (no backing index) or any non-BINARY-collated
-index falls back to the full scan.
+`tableSchema.indexes`) AND every key column's index bytes are keyed under the collation
+this check *enforces* under. A table-level `unique(a, b)` falls back to the full scan
+because it has no index in the engine-facing schema at all — the store's `_uc_*` is
+enforcement-only and invisible here, so there is nothing to name in a seek.
 
-The BINARY gate was load-bearing when the store's index key bytes ignored the
-database's collation registry and were encoded under the table key collation `K`:
-seeking a `NOCASE` index for `'B@X'` physically missed a committed `'b@x'` that the
-full scan catches, turning a performance fix into a lost UNIQUE violation. Both
-defects are fixed — index key bytes now resolve their normalizers through the
-connection's registry and encode under the index column's own effective collation
-(`docs/store.md` § Collation Support) — so the gate is now only conservative, costing
-the seek for a collated index. Widening it to per-column enforcement collations is
-tracked as an arm of `implement/store-index-collation-guard-collapse`; note that
-`backlog/debt-iso-store-unique-seek-rowcount` proposes a negative-control test that
-assumes today's gate.
+The collation half is what makes the seek sound rather than merely fast: the seek
+*replaces* the full scan, so a window narrower than the enforcement-equal set silently
+loses a UNIQUE violation. It demanded BINARY outright while the store keyed every index
+column under the table-wide key collation `K` and ignored the connection's collation
+registry — seeking a `NOCASE` index for `'B@X'` physically missed a committed `'b@x'`.
+Index key bytes now resolve their normalizers through the connection's registry and
+encode under the index column's own effective collation (`docs/store.md` § Collation
+Support), which for an index-derived UNIQUE *is* the enforcement collation. So the gate
+now asks, per constrained column:
+
+- never-text (`integer`, `real`, `blob`) → seekable; key bytes are type-native.
+- enforcement collation BINARY → seekable; BINARY equality is byte identity.
+- otherwise seekable only when a key-encoding backend keys the column under that same
+  collation — `pkKeyCollationName`'s answer. A `text` column does (seekable); a
+  text-capable-but-not-`text` column (`any`, `json`, the temporal types) keys
+  hard-`BINARY` while the check still compares under the declared name, so it is **not**
+  seekable and keeps full-scanning.
+
+Equality is all the seek needs — order preservation is a range concern and no range is
+built here (`makeSecondaryIndexEqSeekFilter` emits one EQ per key column), so a custom
+equality-only collation is fine.
 
 An INSERT that reuses a PK tombstoned earlier in the same transaction (reviving
 the tombstone into a live row) runs this same merged UNIQUE check before the
@@ -760,10 +771,11 @@ PK that has a tombstone in the overlay.
 
 ### Trade-offs
 
-- Non-PK UNIQUE checks over an index-derived, BINARY-collated constraint seek the
-  backing index (O(log n) + overlay scan) rather than scanning the underlying; a
-  table-level `unique(...)` with no backing index, or a non-BINARY-collated one,
-  still does the O(n) full scan (see `canSeekForConstraint`). The overlay's own
+- Non-PK UNIQUE checks over an index-derived constraint seek the backing index
+  (O(log n) + overlay scan) rather than scanning the underlying, collated or not; a
+  table-level `unique(...)` with no backing index, or one over an `any` / `json` /
+  temporal column carrying a declared `COLLATE`, still does the O(n) full scan (see
+  `canSeekForConstraint`). The overlay's own
   UNIQUE enforcement covers overlay-only conflicts; the merged-view search fills the
   underlying-only gap. Phase 1 always scans the (small) overlay in full.
 - Same-PK REPLACE returns null instead of carrying the replaced row back to

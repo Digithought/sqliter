@@ -958,6 +958,44 @@ describe('Isolated Store Module', () => {
 			expect(rows.map(r => [r.id, r.email])).to.deep.equal([[1, 'b'], [2, 'a']]);
 		});
 
+		// store-index-collation-guard-collapse widened `IsolatedTable.canSeekForConstraint`
+		// past BINARY-only, so Phase 2 now answers a COLLATED index-derived UNIQUE through
+		// an index seek instead of a full underlying scan. The seek REPLACES the scan, so a
+		// window narrower than the enforcement-equal set silently loses a violation — these
+		// pin that the store's index bytes and the merged check agree on the collation.
+		it('a NOCASE index-derived UNIQUE catches a case-only committed collision through the seek', async () => {
+			await db.exec(`CREATE TABLE cu (id INTEGER PRIMARY KEY, email TEXT NOT NULL) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX cu_email ON cu (email COLLATE NOCASE)`);
+			await db.exec(`INSERT INTO cu VALUES (1, 'b@x')`);
+
+			await db.exec('BEGIN');
+			let err: Error | null = null;
+			try { await db.exec(`INSERT INTO cu VALUES (2, 'B@X')`); } catch (e) { err = e as Error; }
+			await db.exec('ROLLBACK');
+			expect(err?.message ?? '', 'the NOCASE seek must find the committed case variant')
+				.to.match(/UNIQUE constraint failed/i);
+
+			// A genuinely distinct value still inserts — the seek is not just refusing everything.
+			await db.exec(`INSERT INTO cu VALUES (3, 'c@x')`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT id FROM cu ORDER BY id`));
+			expect(rows.map(r => r.id)).to.deep.equal([1, 3]);
+		});
+
+		it('an ANY column with a declared COLLATE declines the seek and still catches the collision', async () => {
+			// `any` keys hard-BINARY while the merged check enforces under the declared
+			// NOCASE, so `canSeekForConstraint` must keep full-scanning this shape.
+			await db.exec(`CREATE TABLE au (id INTEGER PRIMARY KEY, email ANY COLLATE NOCASE NOT NULL) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX au_email ON au (email)`);
+			await db.exec(`INSERT INTO au VALUES (1, 'b@x')`);
+
+			await db.exec('BEGIN');
+			let err: Error | null = null;
+			try { await db.exec(`INSERT INTO au VALUES (2, 'B@X')`); } catch (e) { err = e as Error; }
+			await db.exec('ROLLBACK');
+			expect(err?.message ?? '', 'the full-scan fallback must find the committed case variant')
+				.to.match(/UNIQUE constraint failed/i);
+		});
+
 		it('partial-UNIQUE value swap (both rows in predicate scope) commits within one txn', async () => {
 			// Exercises the merged-row predicate evaluation in findMergedUniqueConflict
 			// (isolation-merged-unique-stale-underlying-false-positive): the partial predicate

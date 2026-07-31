@@ -201,9 +201,9 @@ export function resolvePkSemanticEquality(
  * encoding. The `ColumnSchema`-shaped wrapper over the engine's
  * {@link logicalTypeCanHoldText}; both collation-safety guards over the store's
  * secondary indexes — the write-side `StoreTableConstraints.indexSeekHonorsEnforcementCollation`
- * and the read-side `tryIndexAccessPlan` (store-module-access-plan.ts) — exempt a never-text column
- * from their K-vs-C comparison, so a false "non-text" answer is a silent
- * wrong-result (a seek under the wrong collation, with the residual dropped).
+ * and the read-side {@link keyOrderMatchesCollation} — exempt a never-text column from their
+ * key-vs-comparison collation test, so a false "non-text" answer is a silent wrong-result
+ * (a seek under the wrong collation, with the residual dropped).
  */
 export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
 	return logicalTypeCanHoldText(col?.logicalType);
@@ -218,10 +218,9 @@ export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
  * `compareCollation`'s comparator defines. Two things must hold for that equation:
  *
  *  - **Same collation on both sides** (`compareCollation === keyCollation`). A `keyCollation`
- *    merely COARSER than `compareCollation` — the relaxation the EQUALITY seek is allowed to
- *    make, see `tryIndexAccessPlan` (store-module-access-plan.ts) — is not enough here: it would need the key
- *    normalizer to be monotone with respect to the OTHER collation's order. It generally is
- *    not, even for built-ins: with `keyCollation = NOCASE` and `compareCollation = BINARY`,
+ *    merely COARSER than `compareCollation` is not enough: it would need the key normalizer
+ *    to be monotone with respect to the OTHER collation's order. It generally is not, even
+ *    for built-ins: with `keyCollation = NOCASE` and `compareCollation = BINARY`,
  *    'K' (U+212A KELVIN SIGN) is `> 'z'` under BINARY, yet its key bytes are
  *    `toLowerCase('K') = 'k'`, which sorts BEFORE 'z' — the row falls outside a `> 'z'`
  *    window and is silently dropped.
@@ -235,6 +234,17 @@ export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
  * collation-aware `matchesFilters` residual decide); returning `true` wrongly is a silent
  * wrong-result. Shared by `StoreTable`'s read arms and `StoreModule`'s access planner so the
  * "mark handled" and "build a window" decisions can never disagree.
+ *
+ * The PK caller ({@link pkOrderPreservingPrefixLength}) can genuinely pass two DIFFERENT
+ * collations, because {@link resolvePkKeyCollations} still falls back to the table key
+ * collation K for an undecorated text PK member. The secondary-index caller
+ * ({@link indexLeadingRangeIsOrderSafe}) usually passes the same name on both sides — index
+ * key bytes encode under the index column's own effective collation, which is what the scan
+ * residual re-compares under — so for a plain `text` column it reduces to the
+ * `orderPreserving` assertion alone. The one index shape where the two sides still differ is
+ * a text-capable-but-not-`isTextual` column (`any`) carrying a declared COLLATE: its key
+ * bytes are hard-`BINARY` while its residual compares under the declared name, and this
+ * predicate correctly declines it.
  */
 export function keyOrderMatchesCollation(
 	db: Database,
@@ -255,6 +265,87 @@ export function keyOrderMatchesCollation(
 	if (!columnCanHoldText(column)) return true;
 	if (compareCollation.toUpperCase() !== keyCollation.toUpperCase()) return false;
 	return (db as DatabaseInternal)._isCollationOrderPreserving(keyCollation);
+}
+
+/**
+ * The collation `StoreTableScan.matchesFilters` re-compares index position `position`
+ * under — the index column's own `COLLATE`, else the table column's declared collation,
+ * else BINARY (see `indexColumnCollations`). The same resolution the planner used when it
+ * decided the residual Filter could be dropped, so it is the order/equality a byte window
+ * over that position has to reproduce.
+ */
+function indexResidualCollation(
+	columns: ReadonlyArray<ColumnSchema>,
+	index: TableIndexSchema,
+	position: number,
+): string {
+	const spec = index.columns[position];
+	return (spec?.collation ?? columns[spec?.index ?? -1]?.collation ?? 'BINARY').toUpperCase();
+}
+
+/**
+ * True when an EQUALITY/prefix byte window over the leading `prefixLength` columns of
+ * secondary `index` is EXACTLY the qualifying set — the condition under which the access
+ * planner may claim the equality filters handled and drop the residual Filter.
+ *
+ * `keyCollations` is {@link resolveIndexKeyCollations}' output for `index` (the scan passes
+ * its memoized copy, the access planner resolves one on the spot): the collation each
+ * position's key bytes are ACTUALLY encoded under. The window equals the qualifying set iff
+ * that agrees, per position, with {@link indexResidualCollation}.
+ *
+ * For a `text` column the two agree by construction — both resolve to the index `COLLATE`
+ * else the declared collation else BINARY — so the common case admits, including the
+ * `text` column of a table whose key collation K is something else entirely. The shape that
+ * does NOT agree is a text-capable-but-not-`isTextual` column (`any`, `json`, the temporal
+ * types) carrying a declared COLLATE: `pkKeyCollationName` keys those hard-`BINARY` while
+ * the residual still compares under the declared name, so a `where x = 'BOB'` window over an
+ * `x any collate nocase` index would be byte-equal only and miss the committed `'Bob'` the
+ * residual admits. Never-text columns are exempt — their key bytes are type-native.
+ */
+export function indexPrefixSeekIsCollationExact(
+	columns: ReadonlyArray<ColumnSchema>,
+	index: TableIndexSchema,
+	keyCollations: ReadonlyArray<string | undefined>,
+	prefixLength: number,
+): boolean {
+	for (let i = 0; i < prefixLength; i++) {
+		const spec = index.columns[i];
+		if (!spec) return false;
+		if (!columnCanHoldText(columns[spec.index])) continue;
+		if ((keyCollations[i] ?? 'BINARY').toUpperCase() !== indexResidualCollation(columns, index, i)) return false;
+	}
+	return true;
+}
+
+/**
+ * True when a byte RANGE window over the LEADING column of secondary `index` is SOUND.
+ *
+ * Strictly stronger than {@link indexPrefixSeekIsCollationExact} at position 0: the same
+ * key-vs-residual collation agreement, PLUS the collation's `orderPreserving` assertion,
+ * because a range window also equates memcmp of the key bytes with the residual
+ * comparator's ORDER. Both halves are {@link keyOrderMatchesCollation}, which also declines
+ * a semantic-ordering column outright.
+ *
+ * THE shared predicate for the two decision sites: `tryIndexAccessPlan`
+ * (store-module-access-plan.ts) marks the range filters handled only when it holds, and
+ * `StoreTableScan.analyzeIndexAccess` builds a window only when it holds. They must agree —
+ * a plan that claims a filter the scan then declines to window loses the residual Filter and
+ * returns the whole table — so they call this rather than each restating it.
+ */
+export function indexLeadingRangeIsOrderSafe(
+	db: Database,
+	columns: ReadonlyArray<ColumnSchema>,
+	index: TableIndexSchema,
+	keyCollations: ReadonlyArray<string | undefined>,
+): boolean {
+	const leading = index.columns[0];
+	if (!leading) return false;
+	return keyOrderMatchesCollation(
+		db,
+		columns[leading.index],
+		keyCollations[0] ?? 'BINARY',
+		indexResidualCollation(columns, index, 0),
+	);
 }
 
 /**

@@ -1761,16 +1761,33 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 *
 	 * Seek only when the constraint was synthesized from a `CREATE UNIQUE INDEX`
 	 * (`derivedFromIndex` names a live entry in `tableSchema.indexes`) AND every key
-	 * column's effective enforcement collation is BINARY.
+	 * column's index bytes are keyed under the collation this check ENFORCES under. A
+	 * table-level `unique(a, b)` still falls back to the full scan: it has no index in the
+	 * engine-facing schema at all (the store's `_uc_*` is enforcement-only and invisible
+	 * here), so there is nothing to name in the seek.
 	 *
-	 * NOTE: the BINARY gate is load-bearing, not an optimisation choice. The store's
-	 * physical index key bytes come from a separate encoder registry that does NOT
-	 * consult the database's collation registry
-	 * (backlog/debt-store-index-keys-use-column-collation, see the comment at
-	 * getPkKeyShape above). Seeking a NOCASE index for 'B@X' would miss the committed
-	 * 'b@x' that the full scan catches, turning this perf fix into a LOST UNIQUE
-	 * violation. Widen this gate (to per-column enforcement collations generally) only
-	 * once that encoder defect is fixed.
+	 * The collation half of the gate is what makes the seek sound rather than merely fast:
+	 * the seek REPLACES the full scan, so a window narrower than the enforcement-equal set
+	 * silently loses a UNIQUE violation. It used to demand BINARY outright, because the
+	 * store keyed every index column under the table-wide key collation and ignored the
+	 * connection's collation registry. Index bytes now encode under the index column's own
+	 * effective collation, which for an index-derived UNIQUE IS the enforcement collation
+	 * — so a collated index is seekable, and this asks per column:
+	 *
+	 *  - never-text column (`integer`, `real`, `blob`) → seekable; its key bytes are
+	 *    type-native and no collation is involved.
+	 *  - enforcement collation BINARY → seekable; BINARY equality is byte identity, which
+	 *    every backend's index key preserves.
+	 *  - otherwise seekable only when a key-encoding backend keys the column under that
+	 *    same collation, which is exactly what `pkKeyCollationName` answers: a `text`
+	 *    column keys under its own collation (seekable), while a text-capable-but-not
+	 *    -`isTextual` column — `any`, `json`, the temporal types — keys hard-`BINARY`
+	 *    while this check still compares under the declared name (NOT seekable; a probe
+	 *    for `'B@X'` would byte-miss the committed `'b@x'`).
+	 *
+	 * Equality is all the seek needs — order preservation is a RANGE concern and no range
+	 * is built here (`makeSecondaryIndexEqSeekFilter` emits one EQ per key column and
+	 * nothing else), so a custom equality-only collation is fine.
 	 */
 	private canSeekForConstraint(uc: UniqueConstraintSchema): IndexSchema | null {
 		if (!uc.derivedFromIndex) return null;
@@ -1779,8 +1796,18 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// Enforcement collation per constrained column, positionally aligned with the
 		// index key columns (appendIndexToTableSchema guarantees the alignment).
 		const enforcement = uniqueEnforcementCollations(this.tableSchema!, uc);
-		const allBinary = enforcement.every(c => normalizeCollationName(c ?? 'BINARY') === 'BINARY');
-		return allBinary ? index : null;
+		const seekable = uc.columns.every((colIdx, i) => {
+			const column = this.tableSchema!.columns[colIdx];
+			const name = normalizeCollationName(enforcement[i] ?? 'BINARY');
+			if (name === 'BINARY') return true;
+			const keyed = pkKeyCollationName(column === undefined ? undefined : {
+				logicalType: column.logicalType,
+				collation: name,
+			});
+			if (keyed === undefined) return true; // never-text: key bytes are type-native
+			return normalizeCollationName(keyed || 'BINARY') === name;
+		});
+		return seekable ? index : null;
 	}
 
 	/**

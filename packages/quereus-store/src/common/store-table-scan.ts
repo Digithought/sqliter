@@ -38,7 +38,7 @@ import {
 import {
 	deserializeRow,
 } from './serialization.js';
-import { keyOrderMatchesCollation, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, storeSemanticKeyTransform } from './pk-key-resolution.js';
+import { indexLeadingRangeIsOrderSafe, indexPrefixSeekIsCollationExact, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, storeSemanticKeyTransform } from './pk-key-resolution.js';
 
 import { StoreTableBase } from './store-table-base.js';
 
@@ -321,13 +321,16 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * index is unresolved. {@link matchesFilters} stays the authoritative row filter,
 	 * so the window need only be a SUPERSET.
 	 *
-	 * Index-column bytes are encoded under each column's own key collation C
-	 * (`resolveIndexKeyCollations` — the index column's COLLATE, else the table column's
-	 * declared collation, else BINARY), which is also the collation `matchesFilters`
-	 * re-checks under — so the EQ/prefix window is EXACTLY the qualifying set. The RANGE
-	 * window additionally needs byte order to BE comparator order, so it is gated on
-	 * {@link indexRangeIsOrderSafe}; when that fails we return null and the caller
-	 * full-scans.
+	 * Index-column bytes are encoded under each column's own key collation
+	 * ({@link indexKeyCollations}); {@link matchesFilters} re-checks a fetched row under the
+	 * index column's `COLLATE` else the table column's declared collation. The EQ/prefix
+	 * window is EXACTLY the qualifying set when those two agree, which
+	 * {@link indexPrefixSeekIsCollationExact} decides; the RANGE window additionally equates
+	 * memcmp of the key bytes with the residual's comparison ORDER, which
+	 * {@link indexRangeIsOrderSafe} decides. `tryIndexAccessPlan`
+	 * (store-module-access-plan.ts) consults the SAME two predicates before claiming the
+	 * filters handled, so the two decisions cannot disagree. Either failing returns null and
+	 * the caller full-scans, where the residual is authoritative.
 	 */
 	protected analyzeIndexAccess(filterInfo: FilterInfo): IndexAccessPattern | null {
 		const index = this.resolveIndexFromIdxStr(filterInfo.idxStr);
@@ -353,6 +356,12 @@ export abstract class StoreTableScan extends StoreTableBase {
 			eqValues.push(filterInfo.args[eq.argvIndex - 1]);
 		}
 		if (eqValues.length > 0) {
+			// Decline rather than fall through to the range arm: an EQ prefix whose key
+			// collation differs from the residual's comparison collation would under-fetch,
+			// and the planner declined the same shape, so the residual Filter is still there.
+			if (!indexPrefixSeekIsCollationExact(this.tableSchema!.columns, index, indexCollations, eqValues.length)) {
+				return null;
+			}
 			const bounds = buildIndexPrefixBounds(
 				eqValues,
 				this.encodeOptions,
@@ -368,7 +377,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 		const rangeConstraints = (filterInfo.constraints ?? []).filter(
 			c => c.constraint.iColumn === leadingCol && rangeOps.includes(c.constraint.op),
 		);
-		if (rangeConstraints.length > 0 && this.indexRangeIsOrderSafe(index, leadingCol)) {
+		if (rangeConstraints.length > 0 && this.indexRangeIsOrderSafe(index)) {
 			const bounds = this.buildIndexRangeBounds(
 				rangeConstraints.map(c => ({
 					op: c.constraint.op,
@@ -451,23 +460,15 @@ export abstract class StoreTableScan extends StoreTableBase {
 	}
 
 	/**
-	 * True when a byte window over `leadingCol` of `index` reproduces the comparator's
-	 * order. Mirrors the range arm of `tryIndexAccessPlan` (store-module-access-plan.ts): both
-	 * demand the table key collation K equal the index column's effective collation C, plus
-	 * K's `orderPreserving` assertion. Index-column bytes now encode under C itself
-	 * (`resolveIndexKeyCollations`), so the K-vs-C comparison is CONSERVATIVE — it declines
-	 * `C ≠ K` windows that would in fact be sound — but it must stay in lockstep with the
-	 * planner's `rangeSafeToHandle` until the guard collapse lands
-	 * (tickets: store-index-collation-guard-collapse), or a plan the planner declined could
-	 * be answered here and vice versa.
+	 * True when a byte window over the LEADING column of `index` reproduces the order the
+	 * residual comparison uses. Delegates to {@link indexLeadingRangeIsOrderSafe} — the SAME
+	 * call the range arm of `tryIndexAccessPlan` (store-module-access-plan.ts) makes before
+	 * it marks the range filters handled, so the "build a window" and "mark handled"
+	 * decisions cannot disagree. The memoized {@link indexKeyCollations} is passed as the
+	 * key side, so the predicate judges the bytes this scan actually addresses.
 	 */
-	protected indexRangeIsOrderSafe(index: TableIndexSchema, leadingCol: number): boolean {
-		const schema = this.tableSchema!;
-		const K = this.encodeOptions.collation ?? 'NOCASE';
-		const col = schema.columns[leadingCol];
-		const indexCol = index.columns.find(c => c.index === leadingCol);
-		const C = indexCol?.collation ?? col?.collation ?? 'BINARY';
-		return keyOrderMatchesCollation(this.db, col, K, C);
+	protected indexRangeIsOrderSafe(index: TableIndexSchema): boolean {
+		return indexLeadingRangeIsOrderSafe(this.db, this.tableSchema!.columns, index, this.indexKeyCollations(index));
 	}
 
 	/**

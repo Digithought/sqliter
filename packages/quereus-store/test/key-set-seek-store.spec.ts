@@ -424,14 +424,19 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 					.to.not.match(/plan=5/);
 			});
 
-			it('a table key collation FINER than the column declines (K = BINARY over a NOCASE column)', async () => {
-				// `eqSafeToHandle` refuses to claim the seek: the K-encoded window is not a
-				// superset of the NOCASE-qualifying rows, so seeking could DROP rows the
-				// probe could never resurrect. Cost-only ⇒ no index claimed ⇒ the rule
-				// declines and the hash semi join returns the right answer.
-				await db.exec(`create table cif (pk integer primary key, s text collate nocase) using store (collation = binary)`);
+			it('an `any` column with a declared COLLATE declines (key bytes are hard-BINARY)', async () => {
+				// The one index shape whose key bytes and residual comparison still disagree:
+				// `any` keys under BINARY (what `ANY_TYPE.compare` uses) while the residual
+				// compares under the declared NOCASE, so a byte-equality window would DROP
+				// rows the probe could never resurrect. Cost-only ⇒ no index claimed ⇒ the
+				// rule declines and the hash semi join returns the right answer.
+				//
+				// (A `text collate nocase` column here does NOT decline any more: since
+				// store-index-collation-guard-collapse its index bytes encode under NOCASE
+				// whatever the table key collation is, so the window is exact.)
+				await db.exec(`create table cif (pk integer primary key, s any collate nocase) using store`);
 				await db.exec(`create index ix_cif on cif (s)`);
-				await db.exec(`create table cifsrc (id integer primary key, s text collate nocase) using store (collation = binary)`);
+				await db.exec(`create table cifsrc (id integer primary key, s any collate nocase) using store`);
 				await db.exec(`insert into cif values (1, 'Alpha'), (2, 'beta'), (3, 'GAMMA')`);
 				await db.exec(`insert into cifsrc values (1, 'alpha'), (2, 'gamma')`);
 
@@ -440,6 +445,23 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				mod.reset();
 				expect(await pks(q), 'NOCASE equality still matches both rows').to.deep.equal([1, 3]);
 				expect(mod.seen('cif')[0] ?? '').to.not.match(/plan=5/);
+			});
+
+			it('a NOCASE column of a K=BINARY store now SEEKS, and the answer is unchanged', async () => {
+				// The arm the guard collapse restored: index bytes encode under the column's
+				// own NOCASE, which is also what the residual and the join probe compare
+				// under, so the multi-seek window is exactly the qualifying set.
+				await db.exec(`create table cnk (pk integer primary key, s text collate nocase) using store (collation = binary)`);
+				await db.exec(`create index ix_cnk on cnk (s)`);
+				await db.exec(`create table cnksrc (id integer primary key, s text collate nocase) using store (collation = binary)`);
+				await db.exec(`insert into cnk values (1, 'Alpha'), (2, 'beta'), (3, 'GAMMA')`);
+				await db.exec(`insert into cnksrc values (1, 'alpha'), (2, 'gamma')`);
+
+				const q = `select pk from cnk where s in (select s from cnksrc)`;
+				expect(await planOps(q), 'the rule fires').to.match(/KEYSETSEMIJOIN/);
+				mod.reset();
+				expect(await pks(q), 'NOCASE equality still matches both rows').to.deep.equal([1, 3]);
+				expect(mod.seen('cnk')[0], 'served as a multi-seek').to.match(/plan=5/);
 			});
 
 			it('the default table key collation COARSER than the column still seeks; the probe trims the over-fetch', async () => {

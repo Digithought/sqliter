@@ -13,7 +13,8 @@ difficulty: medium
 The isolation layer's non-primary-key UNIQUE check was changed (ticket
 `iso-unique-check-index-seek`) to look a duplicate up through the backing index — an
 O(log n) seek — instead of scanning the whole underlying table, whenever the constraint
-is index-derived and its enforcement collation is BINARY.
+is index-derived and the backing index keys its columns under the collation the check
+enforces under.
 
 That optimisation is what the ticket exists for, and the arm it most cares about is the
 **persistent store** (LevelDB-backed), not the in-memory backend. But the only test that
@@ -30,12 +31,17 @@ unnoticed. For a ticket whose entire purpose is that win, that is a real blind s
 
 ## What to build
 
-A store-mode analogue of the memory row-count proof: against a store-backed table with a
-BINARY index-derived UNIQUE over a large committed row set, drive a constrained insert
-through the isolation layer and assert the number of underlying rows read is bounded
-(seek), not linear in the table size (scan). Then the negative control — a `collate nocase`
-index over the same shape — must read the whole table, confirming the BINARY gate in
-`canSeekForConstraint` is what selects the arm.
+A store-mode analogue of the memory row-count proof: against a store-backed table with an
+index-derived UNIQUE over a large committed row set, drive a constrained insert through
+the isolation layer and assert the number of underlying rows read is bounded (seek), not
+linear in the table size (scan). Run it for both a BINARY index and a `collate nocase`
+one — since `store-index-collation-guard-collapse` both seek.
+
+**The negative control changed.** A `collate nocase` index used to full-scan and was the
+obvious control; it now seeks. Use a table-level `unique(email)` instead (no index in the
+engine-facing schema at all, so nothing to name in a seek), which is what the memory-side
+row-count test in `isolation-layer.spec.ts` switched to. An `any collate nocase` column
+also still declines, but it exercises a narrower branch.
 
 The counting hook differs from memory: the store yields rows through its own KVStore
 iteration, not a `query()` generator you can Proxy at the module boundary the same way, so

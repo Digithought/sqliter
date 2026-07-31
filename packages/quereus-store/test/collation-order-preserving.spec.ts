@@ -214,9 +214,12 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			expect(await planOps(db, q)).to.match(SEEK);
 		});
 
-		it('keeps the equality index seek even when K is coarser than the column collation', async () => {
-			// K = NOCASE (the store default), C = BINARY. Sound for EQUALITY — every
-			// C-equal row normalizes into the window — and untouched by the range gate.
+		it('keeps the equality index seek on a BINARY column of a NOCASE-keyed table', async () => {
+			// The table key collation K = NOCASE is not part of this decision at all: an
+			// index over an undecorated `text` column keys its bytes under BINARY, and the
+			// scan residual re-compares under BINARY, so the window is exactly the
+			// qualifying set. (Before the guard collapse this seek survived for a different,
+			// now-retired reason — "K is coarser than C, so its window is a superset".)
 			await db.exec(`create table t (id integer primary key, v text) using store`);
 			await db.exec(`create index ix_v on t (v)`);
 			await db.exec(`insert into t values (1, 'x'), (2, 'y')`);
@@ -271,17 +274,130 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			expect(await column(db, q, 'w')).to.deep.equal(['x']);
 		});
 
-		it('declines the index RANGE seek when K is merely coarser, and still returns every row', async () => {
-			// K = NOCASE, C = BINARY. 'K' (U+212A KELVIN SIGN) is > 'z' under BINARY, but its
-			// index bytes are `toLowerCase('K') = 'k'`, which sorts BEFORE 'z' — a K-window at
-			// `> 'z'` would drop it. The gate declines the seek; the residual finds the row.
+		it('keeps the index RANGE seek on a BINARY column of a NOCASE-keyed table', async () => {
+			// The shape the guard collapse restores. U+212A KELVIN SIGN is > 'z' under BINARY.
+			// While index bytes were encoded under the TABLE key collation K = NOCASE they
+			// were `toLowerCase(…) = 'k'`, which sorts BEFORE 'z', so a window at `> 'z'`
+			// dropped the row and the gate had to decline. Index bytes are now BINARY — the
+			// same collation the residual compares under, and one that carries the
+			// `orderPreserving` assertion — so the window is exact and the seek is back.
 			await db.exec(`create table t (id integer primary key, v text) using store`);
 			await db.exec(`create index ix_v on t (v)`);
 			await db.exec(`insert into t values (1, 'K'), (2, 'a')`);
 
+			// Memory is the oracle: a plan change must not move a row.
+			await db.exec(`create table m (id integer primary key, v text)`);
+			await db.exec(`create index ix_mv on m (v)`);
+			await db.exec(`insert into m select id, v from t`);
+
 			const q = `select id from t where v > 'z'`;
 			expect(await column(db, q, 'id')).to.deep.equal([1]);
-			expect(await planOps(db, q), 'the index range seek must be declined').to.not.match(SEEK);
+			expect(await column(db, `select id from m where v > 'z'`, 'id')).to.deep.equal([1]);
+			expect(await planOps(db, q), 'the index range seek is restored').to.match(SEEK);
+		});
+	});
+
+	// The guard collapse (store-index-collation-guard-collapse): with index bytes encoded
+	// under the index column's own collation, the read guards no longer ask about the table
+	// key collation K at all. EQUALITY asks only whether the key collation equals the one
+	// the residual re-compares under; RANGE asks that plus the `orderPreserving` assertion.
+	describe('after the guard collapse: the range arm asks only about order preservation', () => {
+		/** A store table + index over `v`, alongside a memory twin used as the oracle. */
+		async function twinTables(decl: string, rows: string): Promise<void> {
+			await db.exec(`create table t (id integer primary key, ${decl}) using store`);
+			await db.exec(`create index ix_t on t (v)`);
+			await db.exec(`create table m (id integer primary key, ${decl})`);
+			await db.exec(`create index ix_m on m (v)`);
+			await db.exec(`insert into t values ${rows}`);
+			await db.exec(`insert into m values ${rows}`);
+		}
+
+		/** Assert the store answers `where` exactly as the memory twin does. */
+		async function agreesWithMemory(where: string): Promise<SqlValue[]> {
+			const ids = await column(db, `select id from t where ${where} order by id`, 'id');
+			expect(ids).to.deep.equal(await column(db, `select id from m where ${where} order by id`, 'id'));
+			return ids;
+		}
+
+		it('restores the range seek on a plain text column of a default-K (NOCASE) table', async () => {
+			// The headline shape from `store-range-seek-order-preserving-gate`: the column is
+			// BINARY, the table's K is NOCASE, and the old `C === K` demand cost this seek.
+			await twinTables(`v text`, `(1, 'alpha'), (2, 'mike'), (3, 'zulu')`);
+
+			expect(await agreesWithMemory(`v > 'm'`)).to.deep.equal([2, 3]);
+			expect(await planOps(db, `select id from t where v > 'm' order by id`), 'the range seek is back')
+				.to.match(SEEK);
+		});
+
+		it('declines the range but keeps the EQ seek under a non-order-preserving collation', async () => {
+			db.registerCollation('NOCASE', lengthFirst, { normalizer: lower });
+			await twinTables(`v text collate nocase`, `(1, 'aa'), (2, 'b')`);
+
+			// Range: the normalizer preserves equality, not order — no seek, right rows.
+			expect(await agreesWithMemory(`v > 'b'`)).to.deep.equal([1]);
+			expect(await planOps(db, `select id from t where v > 'b'`), 'range declined').to.not.match(SEEK);
+
+			// Equality never depended on order, so it still seeks.
+			expect(await agreesWithMemory(`v = 'AA'`)).to.deep.equal([1]);
+			expect(await planOps(db, `select id from t where v = 'AA'`), 'EQ still seeks').to.match(SEEK);
+		});
+
+		it('gives the range seek back once the same pair asserts orderPreserving', async () => {
+			db.registerCollation('NOCASE', noSpace, { normalizer: stripSpaces, orderPreserving: true });
+			await twinTables(`v text collate nocase`, `(1, 'a b'), (2, 'c d'), (3, 'e')`);
+
+			expect(await agreesWithMemory(`v > 'ab'`)).to.deep.equal([2, 3]);
+			expect(await planOps(db, `select id from t where v > 'ab'`), 'assertion ⇒ seek').to.match(SEEK);
+		});
+
+		it('declines BOTH arms on an `any` column carrying a declared COLLATE', async () => {
+			// `any` keys hard-BINARY (the collation `ANY_TYPE.compare` uses) while the scan
+			// residual re-compares under the declared NOCASE, so neither a byte-equality nor
+			// a byte-range window is the qualifying set. The oracle here is the store's OWN
+			// answer before the index exists: creating an index must not change a query's
+			// result. (The memory backend is NOT the oracle for this shape — it answers
+			// `v = 'BOB'` as `[1]` unindexed and `[]` indexed, i.e. its own index seek
+			// changes the answer. Tracked as backlog/bug-memory-any-collate-index-under-fetch.)
+			const eq = `select id from t where v = 'BOB' order by id`;
+			const gt = `select id from t where v > 'a' order by id`;
+			await db.exec(`create table t (id integer primary key, v any collate nocase) using store`);
+			await db.exec(`insert into t values (1, 'Bob'), (2, 'zed')`);
+			const eqUnindexed = await column(db, eq, 'id');
+			const gtUnindexed = await column(db, gt, 'id');
+			expect(eqUnindexed, 'NOCASE-equal row matches with no index').to.deep.equal([1]);
+
+			await db.exec(`create index ix_t on t (v)`);
+			expect(await column(db, eq, 'id'), 'the index must not change the answer').to.deep.equal(eqUnindexed);
+			expect(await column(db, gt, 'id'), 'the index must not change the answer').to.deep.equal(gtUnindexed);
+			expect(await planOps(db, eq), 'EQ declined').to.not.match(SEEK);
+			expect(await planOps(db, gt), 'range declined').to.not.match(SEEK);
+		});
+
+		it('leaves a TIMESPAN index column alone — still no range seek, still correct', async () => {
+			await twinTables(`v timespan`, `(1, 'PT30M'), (2, 'PT2H')`);
+
+			expect(await agreesWithMemory(`v > 'PT1H'`)).to.deep.equal([2]);
+			expect(await planOps(db, `select id from t where v > 'PT1H'`), 'semantic ordering declines outright')
+				.to.not.match(SEEK);
+		});
+
+		it('leaves DESC and partial index shapes alone', async () => {
+			await db.exec(`create table t (id integer primary key, v text) using store`);
+			await db.exec(`create index ix_desc on t (v desc)`);
+			await db.exec(`create table m (id integer primary key, v text)`);
+			await db.exec(`create index ix_mdesc on m (v desc)`);
+			await db.exec(`insert into t values (1, 'a'), (2, 'm'), (3, 'z')`);
+			await db.exec(`insert into m values (1, 'a'), (2, 'm'), (3, 'z')`);
+			expect(await agreesWithMemory(`v > 'b'`)).to.deep.equal([2, 3]);
+			expect(await planOps(db, `select id from t where v > 'b' order by id`), 'DESC index still seeks')
+				.to.match(SEEK);
+
+			await db.exec(`create table p (id integer primary key, v text) using store`);
+			await db.exec(`create index ix_part on p (v) where id > 1`);
+			await db.exec(`insert into p values (1, 'a'), (2, 'm'), (3, 'z')`);
+			const pq = `select id from p where v > 'b' order by id`;
+			expect(await planOps(db, pq), 'a partial index is still never seeked').to.not.match(SEEK);
+			expect(await column(db, pq, 'id')).to.deep.equal([2, 3]);
 		});
 	});
 });

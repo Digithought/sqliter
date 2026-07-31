@@ -908,6 +908,10 @@ reaches `K` (integer PK, index columns keyed `BINARY`) stays openable.
 | **RTRIM** | strips trailing ASCII space (`0x20`) only | Full |
 | **Custom** | whatever `registerCollation` supplied | Point/equality always; range and PK order only with `{ orderPreserving: true }` |
 
+"Ordering Support" is about the **range window and the PK-order advertisement**, which need
+the normalizer to preserve order. Point/equality seeks never do — see § *Order preservation*
+below for what each index arm actually asks.
+
 The default collation is **NOCASE**, matching Quereus's case-insensitive comparison semantics.
 
 `RTRIM` strips only ASCII `0x20`, matching `RTRIM_COLLATION`. (The retired store-local
@@ -933,16 +937,23 @@ window degrades to a full scan and the Sort is retained, with the collation-awar
 post-fetch filter still deciding every row. Point/equality seeks never need the assertion
 — they rely only on the equality guarantee — and are unaffected.
 
-A secondary-index **range** seek carries a second requirement: the index column's
-effective collation `C` must EQUAL the table key collation `K`, not merely be finer than
-it. The relaxation the equality seek is allowed to make (`K = NOCASE` over `C = BINARY`)
-is unsound for ranges even with the built-ins — `'K'` (U+212A KELVIN SIGN) compares
-greater than `'z'` under BINARY, yet keys as `'k'`, which sorts before `'z'`. So an index
-on a plain (BINARY) text column of a default-`K` (NOCASE) store table gets equality seeks
-but scans for ranges; declare the column `collate nocase` to keep the range seek.
-Index-column bytes now *are* encoded under `C`, so the `C === K` demand is merely a
-conservative leftover; collapsing it to a plain order-preservation test on `C` (which
-restores the seek for the shape above) is `implement/store-index-collation-guard-collapse`.
+The table key collation `K` is **not** part of a secondary-index seek decision. Index
+bytes are encoded under the index column's own key collation, and the post-fetch filter
+re-compares under the index column's `COLLATE` (else the table column's declared
+collation). Both index arms ask only whether those two agree:
+
+- **Equality** — agreement makes the byte window exactly the qualifying set. A `text`
+  column always agrees, so an index on a plain (BINARY) text column of a default-`K`
+  (NOCASE) table seeks, and so does an index on a `collate nocase` column of a
+  `collation = binary` table.
+- **Range** — the same agreement *plus* the collation's `orderPreserving` assertion,
+  since a byte window also equates memcmp of the key bytes with the comparator's order.
+
+The one shape where the two do **not** agree is a column that can hold text but is not
+declared `text` — `any`, `json`, and the temporal types — carrying a declared `COLLATE`.
+Those key hard-`BINARY` (the collation their `compare` actually uses) while the filter
+still compares under the declared name, so both arms decline and the query full-scans.
+Declining costs the seek, never a row.
 
 The built-ins hold their assertion for every **well-formed** string, including text outside
 the basic multilingual plane. They compare by Unicode code point (`compareCodePoints` in
