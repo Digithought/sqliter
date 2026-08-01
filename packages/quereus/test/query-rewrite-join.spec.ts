@@ -30,6 +30,7 @@ const ALL_DETERMINISTIC: DeterminismProbe = () => true;
 const JOIN_SHAPE_RULES = new Set<string>([
 	'materialized-view-rewrite',
 	'predicate-pushdown',
+	'join-predicate-pushdown',
 	'aggregate-predicate-pushdown',
 	'filter-merge',
 	'sargable-range-rewrite',

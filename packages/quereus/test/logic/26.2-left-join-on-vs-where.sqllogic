@@ -39,5 +39,29 @@ select ow_l.id as lid, ow_r.id as rid from ow_l left join ow_r on ow_l.id = ow_r
 select ow_l.id as lid, count(ow_r.id) as cnt from ow_l left join ow_r on ow_l.id = ow_r.l_id group by ow_l.id having count(ow_r.id) > 0 order by ow_l.id;
 → [{"lid":1,"cnt":1},{"lid":2,"cnt":1}]
 
+-- Pushdown asymmetry (rule-join-predicate-pushdown), pinned end-to-end.
+-- A WHERE on the PRESERVED side may be evaluated before the join: an ow_l row it
+-- rejects would have produced only rows the WHERE rejects anyway.
+select ow_l.id as lid, ow_r.id as rid from ow_l left join ow_r on ow_l.id = ow_r.l_id where ow_l.grp >= 20 order by lid;
+→ [{"lid":2,"rid":101},{"lid":3,"rid":null}]
+
+-- A WHERE on the NULL-EXTENDED side may NOT: evaluating `ow_r.val = 'r1'` before the
+-- join turns it into the ON-clause case above, which KEEPS lid 2 and 3 NULL-padded.
+select ow_l.id as lid, ow_r.id as rid from ow_l left join ow_r on ow_l.id = ow_r.l_id where ow_r.val = 'r1' order by lid;
+→ [{"lid":1,"rid":100}]
+
+-- Both at once: the preserved-side conjunct is pushable, the null-extended one is not,
+-- and the pair must still compose to the post-join semantics.
+select ow_l.id as lid, ow_r.id as rid from ow_l left join ow_r on ow_l.id = ow_r.l_id where ow_l.grp >= 20 and ow_r.val = 'r2' order by lid;
+→ [{"lid":2,"rid":101}]
+
+-- Mirror on a RIGHT join: ow_l is the null-extended side there, so its WHERE stays above
+-- while the preserved (ow_r) side's is pushable.
+select ow_l.id as lid, ow_r.id as rid from ow_l right join ow_r on ow_l.id = ow_r.l_id where ow_l.grp = 10 order by rid;
+→ [{"lid":1,"rid":100}]
+
+select ow_l.id as lid, ow_r.id as rid from ow_l right join ow_r on ow_l.id = ow_r.l_id where ow_r.val = 'r2' order by rid;
+→ [{"lid":2,"rid":101}]
+
 drop table ow_l;
 drop table ow_r;

@@ -170,6 +170,17 @@ describe('rule-filter-selectivity (end-to-end through the optimizer)', () => {
 	});
 });
 
+/**
+ * A note on the `full join`s below. `rule-join-predicate-pushdown` moves any conjunct
+ * whose columns all sit on ONE never-null-extended side of a join onto that branch, so a
+ * plain `o join r … where o.cat = 'a' and r.cat = 'x'` no longer leaves a Filter over the
+ * join at all — each side gets its own single-table Filter. The multi-relation path is
+ * still very much live (cross-side conjuncts, subquery conjuncts, and conjuncts over an
+ * outer join's null-extended side all stay above), and `full join` is the shape that
+ * keeps EVERY conjunct above with the fewest other moving parts: both sides are
+ * null-extended, so the pushdown rule declines outright. Join type does not enter the
+ * selectivity estimate, so switching to `full` changes only which node holds the Filter.
+ */
 describe('multi-relation filter selectivity (filter over a join)', () => {
 	let db: Database;
 	/** Distinct counts recorded by ANALYZE, keyed by `table.column`. */
@@ -208,8 +219,8 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 	afterEach(async () => { await db.close(); });
 
 	it('attributes each conjunct to its own table and combines the per-table estimates', () => {
-		// Neither conjunct can push below the join, so both live in one Filter above it.
-		const f = optimizedFilter(db, "SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.cat = 'a' AND r.cat = 'x'");
+		// Neither conjunct can push below a full join, so both live in one Filter above it.
+		const f = optimizedFilter(db, "SELECT * FROM o FULL JOIN r ON o.rid = r.id WHERE o.cat = 'a' AND r.cat = 'x'");
 		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 
 		const expected = combineConjunctive([1 / ndv['o.cat'], 1 / ndv['r.cat']]);
@@ -242,7 +253,7 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		// the resolver keyed on reference identity must still accept `a.cat` rather than
 		// rejecting it because `b` also owns a column of that name.
 		const f = optimizedFilter(db,
-			"SELECT * FROM o a JOIN o b ON a.id = b.id WHERE a.cat = 'a' AND a.qty > b.qty");
+			"SELECT * FROM o a FULL JOIN o b ON a.id = b.id WHERE a.cat = 'a' AND a.qty > b.qty");
 		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 
 		const expected = combineConjunctive([1 / ndv['o.cat'], CROSS_RELATION_INEQUALITY_SELECTIVITY]);
@@ -299,13 +310,17 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 
 			// `hasP` is an existence flag minted by the join, not a base column. Selecting
 			// it keeps it demanded so the probe is not recovered into a semi-join.
+			// `exists … as` is only legal on an outer join, so the companion conjunct is
+			// put on the NULL-extended (`p`) side — the one side of a `left join` that
+			// `rule-join-predicate-pushdown` must never push to, which is what keeps both
+			// conjuncts in one Filter above the join.
 			const f = optimizedFilter(db2,
-				'SELECT c.cc, hasP FROM ec c LEFT JOIN ep p ON p.pp = c.pr EXISTS RIGHT AS hasP WHERE hasP AND c.cv > 100');
+				'SELECT c.cc, hasP FROM ec c LEFT JOIN ep p ON p.pp = c.pr EXISTS RIGHT AS hasP WHERE hasP AND p.pv > 10');
 			expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 
-			// Only `c.cv > 100` was estimable; combineConjunctive of one value is that
+			// Only `p.pv > 10` was estimable; combineConjunctive of one value is that
 			// value, so the stamp must equal the single-table estimate for that conjunct.
-			const solo = optimizedFilter(db2, 'SELECT * FROM ec WHERE cv > 100 AND cc > 0');
+			const solo = optimizedFilter(db2, 'SELECT * FROM ep WHERE pv > 10 AND pp > 0');
 			expect(solo?.selectivity, 'baseline single-table estimate').to.be.a('number');
 			expect(f!.selectivity).to.be.closeTo(solo!.selectivity as number, 1e-12);
 		} finally {
@@ -324,7 +339,7 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 
 	it('re-stamps a filter-over-join whose predicate was re-minted by scalar-subquery-cache', () => {
 		const f = optimizedFilter(db,
-			"SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.qty = (SELECT max(qty) FROM r r2) AND o.cat = 'a'");
+			"SELECT * FROM o FULL JOIN r ON o.rid = r.id WHERE o.qty = (SELECT max(qty) FROM r r2) AND o.cat = 'a'");
 		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 		expect(hasScalarSubquery(f!.predicate), 'the Filter must be the re-minted one').to.be.true;
 
@@ -343,7 +358,7 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 			disabledRules: new Set([...(prev.disabledRules ?? []), 'filter-selectivity-restamp']),
 		});
 		const f = optimizedFilter(db,
-			"SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.qty = (SELECT max(qty) FROM r r2) AND o.cat = 'a'");
+			"SELECT * FROM o FULL JOIN r ON o.rid = r.id WHERE o.qty = (SELECT max(qty) FROM r r2) AND o.cat = 'a'");
 		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 		expect(f!.selectivity, 'the Physical-pass stamp is dropped by the predicate re-mint')
 			.to.be.undefined;
@@ -405,7 +420,7 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		// `CatalogStatsProvider` reads the column off a DIRECT child of the comparison,
 		// so `lower(o.cat)` puts the conjunct out of reach of the stats that exist and
 		// the fabricated naive number must not be stamped in their place.
-		const f = optimizedFilter(db, "SELECT * FROM o JOIN r ON o.rid = r.id WHERE lower(o.cat) = 'a'");
+		const f = optimizedFilter(db, "SELECT * FROM o FULL JOIN r ON o.rid = r.id WHERE lower(o.cat) = 'a'");
 		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 		expect(f!.selectivity, 'wrapped column has no reachable statistics').to.be.undefined;
 	});
@@ -416,7 +431,7 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		// "real statistics answered THE PREDICATE". A floor is not an answer, so the
 		// conjunct contributes nothing and the Filter stays unstamped.
 		const f = optimizedFilter(db,
-			"SELECT * FROM o JOIN r ON o.rid = r.id WHERE o.cat = 'a' OR lower(o.cat) = 'x'");
+			"SELECT * FROM o FULL JOIN r ON o.rid = r.id WHERE o.cat = 'a' OR lower(o.cat) = 'x'");
 		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 		expect(f!.selectivity, 'a floor must not pass the statistics gate').to.be.undefined;
 	});
@@ -458,7 +473,7 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 
 	it('still estimates a single-relation conjunct over one arm of a CTE self-join', () => {
 		const f = optimizedFilter(db,
-			"WITH c AS (SELECT * FROM o) SELECT * FROM c a JOIN c b ON a.id = b.id "
+			"WITH c AS (SELECT * FROM o) SELECT * FROM c a FULL JOIN c b ON a.id = b.id "
 			+ "WHERE a.cat = 'a' AND a.qty > b.qty");
 		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 
@@ -487,7 +502,7 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 
 	it('estimates a CTE joined to a real table', () => {
 		const f = optimizedFilter(db,
-			'WITH c AS (SELECT cat, qty, rid FROM o) SELECT * FROM c JOIN r ON c.rid = r.id '
+			'WITH c AS (SELECT cat, qty, rid FROM o) SELECT * FROM c FULL JOIN r ON c.rid = r.id '
 			+ "WHERE c.cat = 'a' AND r.cat = 'x'");
 		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
 		expect(f!.selectivity).to.be.closeTo(combineConjunctive([1 / ndv['o.cat'], 1 / ndv['r.cat']]), 1e-12);

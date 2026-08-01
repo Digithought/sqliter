@@ -96,7 +96,10 @@ describe('collectColumnOrigins', () => {
 	});
 
 	it('reaches base tables through the physical access nodes of an optimized plan', () => {
-		const plan = optimized(db, "select * from o join r on o.rid = r.id where o.cat = 'a'");
+		// A CROSS-side predicate, so `rule-join-predicate-pushdown` cannot move it and a
+		// residual Filter genuinely survives over the join (a single-side `o.cat = 'a'`
+		// now lands on the `o` branch instead — see the next case).
+		const plan = optimized(db, 'select * from o join r on o.rid = r.id where o.qty > r.qty');
 		const filter = findFirst(plan, FilterNode);
 		expect(filter, 'expected a residual Filter over the join').to.not.be.undefined;
 
@@ -105,6 +108,19 @@ describe('collectColumnOrigins', () => {
 		const origins = collectColumnOrigins(filter!.source);
 		expect(origins.size).to.equal(7);
 		expect(distinctRefs(origins).size).to.equal(2);
+	});
+
+	it('sees only one side under a Filter that join-predicate-pushdown moved onto a branch', () => {
+		const plan = optimized(db, "select * from o join r on o.rid = r.id where o.cat = 'a'");
+		const filter = findFirst(plan, FilterNode);
+		expect(filter, "expected the pushed `o.cat = 'a'` Filter on the `o` branch").to.not.be.undefined;
+
+		// Single-relation source now, so `rule-filter-selectivity` takes its
+		// single-table path here rather than the multi-relation one.
+		const origins = collectColumnOrigins(filter!.source);
+		expect(origins.size, "only `o`'s four columns are below the branch Filter").to.equal(4);
+		expect(distinctRefs(origins).size).to.equal(1);
+		expect([...origins.values()].every(o => o.table.name === 'o')).to.equal(true);
 	});
 
 	it('gives a self-join two distinct refs sharing one TableSchema', () => {

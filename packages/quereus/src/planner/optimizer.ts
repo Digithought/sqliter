@@ -27,6 +27,7 @@ import { ruleAsofStrategySelect } from './rules/access/rule-asof-strategy-select
 import { ruleGrowRetrieve } from './rules/retrieve/rule-grow-retrieve.js';
 import { rulePredicatePushdown } from './rules/predicate/rule-predicate-pushdown.js';
 import { ruleAggregatePredicatePushdown } from './rules/predicate/rule-aggregate-predicate-pushdown.js';
+import { ruleJoinPredicatePushdown } from './rules/predicate/rule-join-predicate-pushdown.js';
 import { ruleFilterMerge } from './rules/predicate/rule-filter-merge.js';
 import { rulePredicateInferenceEquivalence } from './rules/predicate/rule-predicate-inference-equivalence.js';
 import { ruleSargableRangeRewrite } from './rules/predicate/rule-sargable-range-rewrite.js';
@@ -350,10 +351,39 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		nodeType: PlanNodeType.Filter,
 		phase: 'rewrite',
 		fn: rulePredicateInferenceEquivalence,
-		// Materializes inferred equality conjuncts and optionally injects
-		// branch filters above an inner/cross join's children — would change
-		// which rows reach a side-effect-bearing branch. Refuses branch
-		// injection when the target branch has side effects.
+		// ANDs inferred equality conjuncts into the Filter's own predicate and
+		// nothing else — the source subtree is untouched and no subtree is
+		// moved, dropped, or duplicated (same rationale as `filter-merge`).
+		// It used to also inject branch Filters below the join, which is why it
+		// was 'aware'; `join-predicate-pushdown` owns that move now and carries
+		// the per-branch side-effect refusal with it.
+		sideEffectMode: 'safe',
+	},
+
+	// Join-aware predicate pushdown: splits a Filter above a join so each
+	// single-side conjunct lands on that side's branch.
+	//
+	// Registered AFTER `predicate-inference-equivalence`, not next to the other
+	// pushdown rules, and the order is load-bearing: inference fires on a Filter
+	// over a join and materializes `t.id = 'x'` from `t.id = e.txn_id and
+	// e.txn_id = 'x'`. Running this rule first would move `e.txn_id = 'x'` onto
+	// the `e` branch, leaving no Filter over the join for inference to read — the
+	// cross-side fact would never be derived and the `t` branch would lose its
+	// seek. Running it second, both sides end up filtered.
+	//
+	// Within one `applyPassRules` sweep the rule list is scanned in array order,
+	// so this fires on inference's own output in the same visit; the branch
+	// Filters it mints are then walked (a top-down pass descends into the
+	// post-rule node's children) and `predicate-pushdown` carries each across its
+	// branch's Alias and into its Retrieve.
+	{
+		pass: PassId.Structural,
+		id: 'join-predicate-pushdown',
+		nodeType: PlanNodeType.Filter,
+		phase: 'rewrite',
+		fn: ruleJoinPredicatePushdown,
+		// Moves Filter conjuncts below a Join, changing which rows reach each
+		// branch. Refuses per-branch when that branch's subtree carries a write.
 		sideEffectMode: 'aware',
 	},
 
@@ -1334,11 +1364,20 @@ export class Optimizer {
 	/**
 	 * Run only non-physical passes to obtain a structurally rewritten logical plan
 	 * suitable for pre-physical analysis (e.g., row-specific classification).
+	 *
+	 * `opts.disabledRules` additionally suppresses the named rules for THIS call
+	 * only (unioned with any tuning-level disables). A caller that classifies a
+	 * body by its plan *shape* uses this to hold the shape canonical — see the
+	 * materialized-view maintenance analyzer, which needs the body's WHERE to stay
+	 * visible above the join.
 	 */
-	optimizeForAnalysis(plan: PlanNode, db: Database): PlanNode {
+	optimizeForAnalysis(plan: PlanNode, db: Database, opts?: { readonly disabledRules?: readonly string[] }): PlanNode {
 		log('Starting pre-physical analysis optimization of plan', plan.nodeType);
 
-		const context = createOptContext(this, this.stats, this.tuning, db);
+		const tuning = opts?.disabledRules?.length
+			? { ...this.tuning, disabledRules: new Set([...(this.tuning.disabledRules ?? []), ...opts.disabledRules]) }
+			: this.tuning;
+		const context = createOptContext(this, this.stats, tuning, db);
 		tracePhaseStart('pre-physical-analysis');
 		try {
 			// Execute constant folding + structural passes (PassManager runs constant folding as its first pass)

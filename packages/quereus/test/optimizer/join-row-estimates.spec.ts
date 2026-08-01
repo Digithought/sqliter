@@ -135,9 +135,21 @@ describe('join row estimates survive the physical pass', () => {
 
 	afterEach(async () => { await db.close(); });
 
-	/** The ticket's own example query, with both sides aliased. */
+	/**
+	 * The ticket's own example query, with both sides aliased.
+	 *
+	 * `rule-join-predicate-pushdown` now moves each single-side WHERE conjunct onto its
+	 * own branch, so the shape is `Project(Join(Alias(Filter(scan orders)),
+	 * Alias(Filter(scan regions))))` with NO Filter above the join. The numbers below
+	 * follow from that: `status` has 3 distinct values, so the orders branch estimates
+	 * `floor(100/3)` = 33, and `name` likewise takes regions to `floor(10/3)` = 3. The
+	 * equi-pair still covers `regions.id` (its PK), so the join's proven cap is still the
+	 * orders side — now 33 rather than 100.
+	 */
 	const JOIN_SQL =
 		"select * from orders o join regions r on o.region_id = r.id where o.status = 'shipped' and r.name = 'EU'";
+	/** Rows the orders branch estimates after its pushed `o.status = 'shipped'` Filter. */
+	const ORDERS_BRANCH_ROWS = 33;
 
 	it('gives the join a row count derived from its physical inputs', () => {
 		const plan = db.getPlan(JOIN_SQL);
@@ -146,24 +158,25 @@ describe('join row estimates survive the physical pass', () => {
 
 		const joinRows = join!.physical?.estimatedRows;
 		expect(joinRows, 'join physical estimatedRows').to.be.a('number');
-		// 100 orders each matching exactly one region (r.id is the PK covered by the
+		// Each surviving order matches exactly one region (r.id is the PK covered by the
 		// equi-pair), so the cap is the orders side — not a cross product, not blank.
-		expect(joinRows).to.equal(100);
+		expect(joinRows).to.equal(ORDERS_BRANCH_ROWS);
 	});
 
-	it('multiplies the stamped filter selectivity by the join row count', () => {
+	it('multiplies the stamped filter selectivity by the scanned row count', () => {
 		const plan = db.getPlan(JOIN_SQL);
-		const join = findJoin(plan);
+		// Pre-order walk: the `o` branch's pushed Filter is the first one in the plan.
 		const filter = findFilter(plan);
-		expect(filter, 'expected a residual Filter over the join').to.not.be.undefined;
+		expect(filter, 'expected the pushed Filter on the orders branch').to.not.be.undefined;
 		expect(filter!.selectivity, 'filter selectivity should be stamped').to.be.a('number');
 
-		const joinRows = join!.physical?.estimatedRows as number;
-		const expected = Math.max(1, Math.floor(joinRows * (filter!.selectivity as number)));
+		const sourceRows = filter!.source.physical?.estimatedRows as number;
+		expect(sourceRows, 'the filtered scan must report a real cardinality').to.equal(100);
+		const expected = Math.max(1, Math.floor(sourceRows * (filter!.selectivity as number)));
 		expect(filter!.physical?.estimatedRows).to.equal(expected);
-		// The whole point of the ticket: the filter's estimate is a real reduction of
-		// a real number, not a multiplication against nothing.
-		expect(filter!.physical?.estimatedRows).to.be.lessThan(joinRows);
+		// The whole point of the row-estimate ticket: the filter's estimate is a real
+		// reduction of a real number, not a multiplication against nothing.
+		expect(filter!.physical?.estimatedRows).to.be.lessThan(sourceRows);
 	});
 
 	it('relays the estimate through the alias and projection above the join', () => {
@@ -172,8 +185,9 @@ describe('join row estimates survive the physical pass', () => {
 		// relay the join sees `undefined` on both sides no matter what it reads.
 		const alias = findNodeOfType(plan, PlanNodeType.Alias);
 		expect(alias, 'expected an Alias between each access node and the join').to.not.be.undefined;
-		// The `o` alias is found first (pre-order walk) — it relays the orders scan.
-		expect(alias!.physical?.estimatedRows, 'alias physical estimatedRows').to.equal(100);
+		// The `o` alias is found first (pre-order walk) — it relays the orders scan
+		// through the Filter that `predicate-pushdown` slid underneath it.
+		expect(alias!.physical?.estimatedRows, 'alias physical estimatedRows').to.equal(ORDERS_BRANCH_ROWS);
 
 		const project = findNodeOfType(plan, PlanNodeType.Project);
 		expect(project, 'expected a Project at the top of the select').to.not.be.undefined;
@@ -193,11 +207,13 @@ describe('join row estimates survive the physical pass', () => {
 	it('carries the estimate through an ORDER BY above the join', () => {
 		const plan = db.getPlan(`${JOIN_SQL} order by o.id`);
 		const sort = findNodeOfType(plan, PlanNodeType.Sort);
-		const filter = findFilter(plan);
-		expect(filter, 'expected a residual Filter over the join').to.not.be.undefined;
+		const join = findJoin(plan);
+		expect(join, 'expected a join in the optimized plan').to.not.be.undefined;
 		if (sort) {
-			// Sort doesn't change the row count — it must report what the filter did.
-			expect(sort.physical?.estimatedRows).to.equal(filter!.physical?.estimatedRows);
+			// Sort doesn't change the row count — it must report what the join did.
+			// (Both WHERE conjuncts are now pushed onto their branches, so the join is
+			// the topmost row-reducing node under the Sort.)
+			expect(sort.physical?.estimatedRows).to.equal(join!.physical?.estimatedRows);
 		}
 	});
 

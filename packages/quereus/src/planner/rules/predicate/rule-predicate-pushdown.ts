@@ -16,7 +16,13 @@
  *
  * Non-moves (for now):
  * - Across Limit/Offset (changes semantics)
- * - Across Aggregate/Window/Join (requires deeper analysis)
+ * - Across Aggregate/Window (requires deeper analysis)
+ *
+ * Join is handled by a SEPARATE rule — `rule-join-predicate-pushdown` — because
+ * the join case is "split a predicate and distribute the parts per side", not
+ * "slide one Filter past one commuting node". It registers just ahead of this
+ * rule, so a conjunct it drops onto a join branch is picked up here and carried
+ * across that branch's Alias / into its Retrieve.
  */
 
 import { createLogger } from '../../../common/logger.js';

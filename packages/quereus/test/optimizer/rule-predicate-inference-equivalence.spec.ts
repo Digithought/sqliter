@@ -59,7 +59,7 @@ describe('rulePredicateInferenceEquivalence', () => {
 		expect(hasInferredOnU, `expected an inferred filter on u.k=5; got filters: ${JSON.stringify(filters)}`).to.equal(true);
 	});
 
-	it('LEFT JOIN: right-branch injection is suppressed (no inferred filter on u side)', async () => {
+	it('LEFT JOIN: no inference reaches the null-extended (u) side', async () => {
 		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER) USING memory');
 		await db.exec('CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER) USING memory');
 		const sql = 'SELECT t.k, u.k FROM t LEFT JOIN u ON t.k = u.k WHERE t.k = 5';
@@ -69,7 +69,8 @@ describe('rulePredicateInferenceEquivalence', () => {
 
 		// LEFT JOIN drops right-side bindings/ECs in propagateJoinFds, so the
 		// outer Filter's source has no EC visible from the right side. The rule
-		// must NOT emit `u.k = 5` on the right branch.
+		// must NOT emit `u.k = 5` at all — and `join-predicate-pushdown` would
+		// refuse to carry it to the null-extended branch even if it did.
 		const hasUk5 = filters.some(d => /u\.k\s*=\s*5/.test(d));
 		expect(hasUk5, 'right-branch inference must be suppressed for LEFT JOIN').to.equal(false);
 	});
@@ -122,12 +123,11 @@ describe('rulePredicateInferenceEquivalence', () => {
 		const rows = await planRows(db, sql);
 		const filters = filtersByDetail(rows);
 
-		// By design the rule materialises `u.k = 5` twice — once in the outer
-		// Filter (alongside the original predicate) and once on the right
-		// branch as a separate FilterNode. Both are correct; the harmless outer
-		// copy is later available for filter merging. What MUST NOT happen is a
-		// third occurrence (which would indicate the rule re-fired on its own
-		// output, breaking the fixpoint guarantee).
+		// The rule materialises `u.k = 5` once, into the Filter above the join;
+		// `join-predicate-pushdown` then MOVES it onto the u branch, so it is
+		// still visible exactly once. What MUST NOT happen is a repeat occurrence
+		// (which would indicate the rule re-fired on its own output, breaking the
+		// fixpoint guarantee).
 		const occurrences = filters.reduce((acc, d) => acc + (d.match(/u\.k\s*=\s*5/g) ?? []).length, 0);
 		expect(occurrences, `u.k = 5 must appear at most twice; saw ${occurrences} across ${JSON.stringify(filters)}`)
 			.to.be.at.most(2);
@@ -144,8 +144,9 @@ describe('rulePredicateInferenceEquivalence', () => {
 		const filters = filtersByDetail(rows);
 
 		// The branch-specific filter is the one that mentions u.k = 5 but does NOT
-		// mention t.x or t.k. (The outer filter retains both; branch injection
-		// splits the conjuncts by side and only u-side ones land on the branch.)
+		// mention t.x or t.k: inference augments the predicate above the join, and
+		// `join-predicate-pushdown` then splits it by side, so only u-side conjuncts
+		// land on the u branch.
 		const branchFilter = filters.find(d => /u\.k\s*=\s*5/.test(d) && !/t\.x/.test(d) && !/t\.k/.test(d));
 		expect(branchFilter, `expected a u-branch filter scoped to u columns only; got: ${JSON.stringify(filters)}`).to.not.equal(undefined);
 	});
@@ -198,11 +199,10 @@ describe('rulePredicateInferenceEquivalence', () => {
 
 	it('Inferred predicate is pushed to the vtab access leaf when supported', async () => {
 		// PK on the joined column means inference produces an equality on a PK,
-		// which the memory module exposes as an INDEXSEEK. The rule only
-		// materialises the *inferred* `u.k = 5` on the u-branch; the original
-		// `t.k = 5` stays on the outer Filter (cross-join predicate pushdown is
-		// a separate concern), so we only assert that at least one INDEXSEEK
-		// fires — the one that wouldn't exist without inference.
+		// which the memory module exposes as an INDEXSEEK. With the rule disabled
+		// only the original `t.k = 5` reaches a branch (via join-predicate-pushdown),
+		// so exactly one seek fires; with it enabled the inferred `u.k = 5` adds the
+		// second. Asserting the delta keeps this pinned to inference alone.
 		await db.exec('CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER) USING memory');
 		await db.exec('CREATE TABLE u (k INTEGER PRIMARY KEY, v INTEGER) USING memory');
 		const sqlWith = 'SELECT t.v, u.v FROM t JOIN u ON t.k = u.k WHERE t.k = 5';

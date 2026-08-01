@@ -15,14 +15,17 @@
  *     `col = value` conjunct.
  *   - AND the new conjuncts into the filter predicate.
  *
- * Powerful form (additional when source is an inner/cross JoinNode):
- *   - Split the newly-inferred conjuncts by which side of the join their
- *     columns reference. For each single-side conjunct, inject a FilterNode
- *     wrapping that side of the join, re-keyed onto the branch's local
- *     column indices.
- *   - The outer FilterNode still carries the augmented predicate; the
- *     branch filter is what subsequent predicate-pushdown can carry into
- *     the leaf's Retrieve pipeline.
+ * Getting the inferred conjunct onto the branch is NOT this rule's job.
+ * `rule-join-predicate-pushdown` (registered immediately after this one, so it
+ * fires on this rule's own output within the same node visit) moves every
+ * single-side conjunct of the augmented predicate — original and inferred alike —
+ * onto the branch it constrains, and `rule-predicate-pushdown` then carries it
+ * across that branch's Alias into its Retrieve. This rule used to inject those
+ * branch Filters itself, back when no rule could cross a join; doing both now
+ * materializes the same conjunct twice on one branch (`u.k = 5 AND u.k = 5`), so
+ * the injection was removed rather than duplicated. Disabling
+ * `join-predicate-pushdown` therefore also stops inferred conjuncts from reaching
+ * a branch — they still land in the Filter above the join.
  *
  * Fixpoint guard: the rule's emission set is `{otherIdx ∈ EC | otherIdx
  * is not already in predBoundIdx}`. On a second invocation the
@@ -33,23 +36,21 @@
  * Safety:
  *   - LEFT/RIGHT/FULL joins: per `propagateJoinFds`, NULL-padded sides drop
  *     their bindings/ECs, so the EC visible at the filter's source is
- *     restricted to the preserved side. The rule additionally refuses
- *     branch injection on these join types (outer filter only).
+ *     restricted to the preserved side — no conjunct over a null-extended
+ *     side can be inferred here in the first place.
  *   - SEMI/ANTI: only the left side is in the output; no right inference
- *     can arise here. Treat as LEFT for branch injection.
+ *     can arise here.
  *
  * See ticket `3-rule-predicate-inference-equivalence` for the full design.
  */
 
 import { createLogger } from '../../../common/logger.js';
 import type { OptContext as _OptContext } from '../../framework/context.js';
-import type { Attribute, ConstantValue, RelationalPlanNode, ScalarPlanNode } from '../../nodes/plan-node.js';
+import type { Attribute, ConstantValue, ScalarPlanNode } from '../../nodes/plan-node.js';
 import { FilterNode } from '../../nodes/filter.js';
-import { JoinNode } from '../../nodes/join-node.js';
 import { BinaryOpNode, LiteralNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode, ParameterReferenceNode } from '../../nodes/reference.js';
 import { extractEqualityFds } from '../../util/fd-utils.js';
-import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import type { Scope } from '../../scopes/scope.js';
 import type * as AST from '../../../parser/ast.js';
 
@@ -109,86 +110,14 @@ export function rulePredicateInferenceEquivalence(node: import('../../nodes/plan
 
 	log('Inferring %d new equality conjunct(s) on Filter from EC × bindings', inferred.length);
 
-	// AND every inferred conjunct into the predicate.
+	// AND every inferred conjunct into the predicate. `join-predicate-pushdown`
+	// distributes the single-side ones onto their branches from here.
 	let combinedPredicate = filter.predicate;
 	for (const inf of inferred) {
 		combinedPredicate = andTogether(filter.scope, combinedPredicate, inf.conjunct);
 	}
 
-	// Powerful form: branch injection below inner/cross joins.
-	let newSource: RelationalPlanNode = source;
-	if (source instanceof JoinNode) {
-		newSource = tryBranchInjection(source, inferred) ?? source;
-	}
-
-	return new FilterNode(filter.scope, newSource, combinedPredicate);
-}
-
-/**
- * For an inner or cross JoinNode whose output bears `inferred` conjuncts,
- * inject single-side conjuncts as FilterNode wrappers on the corresponding
- * branch. Returns the rebuilt join, or null if no inferred conjunct lands
- * on either branch.
- */
-function tryBranchInjection(join: JoinNode, inferred: readonly InferredConjunct[]): RelationalPlanNode | null {
-	// Only inner / cross are safe — see file-level "Safety" notes.
-	if (join.joinType !== 'inner' && join.joinType !== 'cross') return null;
-
-	const leftAttrs = join.left.getAttributes();
-	const rightAttrs = join.right.getAttributes();
-	const leftCount = leftAttrs.length;
-
-	const leftBranchConjuncts: ScalarPlanNode[] = [];
-	const rightBranchConjuncts: ScalarPlanNode[] = [];
-
-	for (const inf of inferred) {
-		if (inf.sourceColIdx < leftCount) {
-			// Left-branch: attribute id is stable, so re-synthesize against the
-			// branch's local column index (which is `sourceColIdx` itself).
-			const attr = leftAttrs[inf.sourceColIdx];
-			if (!attr) continue;
-			leftBranchConjuncts.push(synthesizeEquality(join.scope, attr, inf.sourceColIdx, inf.value));
-		} else {
-			const rightIdx = inf.sourceColIdx - leftCount;
-			const attr = rightAttrs[rightIdx];
-			if (!attr) continue;
-			rightBranchConjuncts.push(synthesizeEquality(join.scope, attr, rightIdx, inf.value));
-		}
-	}
-
-	if (leftBranchConjuncts.length === 0 && rightBranchConjuncts.length === 0) return null;
-
-	let newLeft: RelationalPlanNode = join.left;
-	let newRight: RelationalPlanNode = join.right;
-
-	if (leftBranchConjuncts.length > 0) {
-		// Refuse to inject a Filter above a side-effect-bearing branch — the
-		// added predicate would change which rows reach the write.
-		if (PlanNodeCharacteristics.subtreeHasSideEffects(join.left)) {
-			return null;
-		}
-		const leftPred = combineAnds(join.scope, leftBranchConjuncts);
-		newLeft = new FilterNode(join.left.scope, join.left, leftPred);
-	}
-	if (rightBranchConjuncts.length > 0) {
-		if (PlanNodeCharacteristics.subtreeHasSideEffects(join.right)) {
-			return null;
-		}
-		const rightPred = combineAnds(join.scope, rightBranchConjuncts);
-		newRight = new FilterNode(join.right.scope, join.right, rightPred);
-	}
-
-	log('Injecting %d left + %d right branch filter(s) below %s join',
-		leftBranchConjuncts.length, rightBranchConjuncts.length, join.joinType);
-
-	return new JoinNode(
-		join.scope,
-		newLeft,
-		newRight,
-		join.joinType,
-		join.condition,
-		join.usingColumns,
-	);
+	return new FilterNode(filter.scope, source, combinedPredicate);
 }
 
 function synthesizeEquality(scope: Scope, attr: Attribute, columnIndex: number, value: ConstantValue): ScalarPlanNode {
@@ -232,14 +161,6 @@ function andTogether(scope: Scope, left: ScalarPlanNode, right: ScalarPlanNode):
 		right: right.expression,
 	};
 	return new BinaryOpNode(scope, ast, left, right);
-}
-
-function combineAnds(scope: Scope, conjuncts: readonly ScalarPlanNode[]): ScalarPlanNode {
-	let acc = conjuncts[0];
-	for (let i = 1; i < conjuncts.length; i++) {
-		acc = andTogether(scope, acc, conjuncts[i]);
-	}
-	return acc;
 }
 
 function valueSignature(value: ConstantValue): string {
