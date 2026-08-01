@@ -1498,6 +1498,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * scan, same shape as {@link pruneTombstones} — a replica with no pre-fix
 	 * orphans (or one already repaired) resolves every entry and deletes nothing,
 	 * so a caught-up replica pays only the scan.
+	 *
+	 * NOTE: the scan is one KV point-read per change-log entry, and the log holds
+	 * roughly one entry per live cell, so a caught-up replica still pays O(live
+	 * cells) reads on every maintenance tick for a repair that can only ever find
+	 * something once. If that cost shows up (large replica, 5-minute quoomb-web
+	 * cadence), stop re-scanning after a clean pass — see
+	 * `debt-sync-repair-changelog-rescans-every-tick`.
+	 *
+	 * NOTE: entries whose key `parseChangeLogKey` cannot decode are skipped by
+	 * `getAllChanges`, so this sweep cannot reach them either. Only reachable via
+	 * key-format drift or corruption; if that ever happens, repair needs to iterate
+	 * raw `cl:` keys rather than parsed entries.
 	 */
 	async repairChangeLog(): Promise<number> {
 		const batch = this.kv.batch();

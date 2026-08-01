@@ -794,6 +794,21 @@ describe('change log orphan cleanup', () => {
       expect(after).to.deep.equal(before);
     });
 
+    it('keeps a delete entry whose tombstone is still live', async () => {
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['x', 'y', 'z'] });
+      await settle();
+      source.commitData({ type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['x', 'y', 'z'] });
+      await settle();
+      // The delete took the row's column entries with it, leaving one live delete entry.
+      expect(await countChangeLog(manager)).to.equal(1);
+      expect(await countTombstones(manager)).to.equal(1);
+
+      // The delete arm of resolveLogEntry must be exercised too — a sweep that only
+      // kept column entries alive would pass every other case in this block.
+      expect(await manager.repairChangeLog()).to.equal(0);
+      expect(await countChangeLog(manager)).to.equal(1);
+    });
+
     it('is idempotent: a second pass over an already-repaired log finds nothing', async () => {
       await manager.changeLog.recordDeletion(manager.getCurrentHLC(), 'main', 'users', [999]);
       await manager.changeLog.recordColumnChange(manager.getCurrentHLC(), 'main', 'users', [998], 'col_0');

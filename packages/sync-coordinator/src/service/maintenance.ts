@@ -25,9 +25,11 @@ import { serviceLog } from '../common/logger.js';
  * and that one is inert on a relay — no `getTableSchema` oracle to tell it which
  * held tables are back, so it returns 0. `evictExpiredBasisTables` is likewise
  * inert without a `dropLocalTable` callback. What actually reclaims here is
- * `pruneTombstones` / `pruneQuarantine`, both at horizon granularity (default 30
- * days), so hourly expires records well inside the horizon while costing nothing
- * when there is nothing to reclaim (every sweep is zero-cost on an empty scan).
+ * `pruneTombstones` / `pruneQuarantine` — both at horizon granularity (default 30
+ * days) — plus `repairChangeLog`, which needs neither oracle nor callback and so
+ * does real work on a relay too. Hourly expires records well inside the horizon
+ * while costing nothing when there is nothing to reclaim (every sweep is
+ * zero-cost on an empty scan).
  * A documented constant rather than a `CoordinatorConfig` knob,
  * matching the other internal timings in this package (store idle timeout,
  * cleanup interval); promote it to config only if a deployment needs to tune it.
