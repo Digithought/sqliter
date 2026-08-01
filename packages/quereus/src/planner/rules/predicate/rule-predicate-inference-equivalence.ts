@@ -56,14 +56,6 @@ import type * as AST from '../../../parser/ast.js';
 
 const log = createLogger('optimizer:rule:predicate-inference-equivalence');
 
-interface InferredConjunct {
-	/** Column index in the FilterNode's source attribute list. */
-	readonly sourceColIdx: number;
-	readonly value: ConstantValue;
-	/** Synthesized `col = value` expression. */
-	readonly conjunct: ScalarPlanNode;
-}
-
 export function rulePredicateInferenceEquivalence(node: import('../../nodes/plan-node.js').PlanNode, _context: _OptContext): import('../../nodes/plan-node.js').PlanNode | null {
 	if (!(node instanceof FilterNode)) return null;
 	const filter = node as FilterNode;
@@ -85,7 +77,9 @@ export function rulePredicateInferenceEquivalence(node: import('../../nodes/plan
 	const predBoundIdx = new Set<number>();
 	for (const b of predBindings) for (const c of b.attrs) predBoundIdx.add(c);
 
-	const inferred: InferredConjunct[] = [];
+	// Only the synthesized expressions are needed now that branch injection is gone —
+	// the rule's whole output is the augmented predicate.
+	const inferred: ScalarPlanNode[] = [];
 	const seen = new Set<string>();
 	for (const binding of predBindings) {
 		for (const predIdx of binding.attrs) {
@@ -99,8 +93,7 @@ export function rulePredicateInferenceEquivalence(node: import('../../nodes/plan
 					seen.add(key);
 					const attr = sourceAttrs[otherIdx];
 					if (!attr) continue;
-					const conjunct = synthesizeEquality(filter.scope, attr, otherIdx, binding.value);
-					inferred.push({ sourceColIdx: otherIdx, value: binding.value, conjunct });
+					inferred.push(synthesizeEquality(filter.scope, attr, otherIdx, binding.value));
 				}
 			}
 		}
@@ -114,7 +107,7 @@ export function rulePredicateInferenceEquivalence(node: import('../../nodes/plan
 	// distributes the single-side ones onto their branches from here.
 	let combinedPredicate = filter.predicate;
 	for (const inf of inferred) {
-		combinedPredicate = andTogether(filter.scope, combinedPredicate, inf.conjunct);
+		combinedPredicate = andTogether(filter.scope, combinedPredicate, inf);
 	}
 
 	return new FilterNode(filter.scope, source, combinedPredicate);

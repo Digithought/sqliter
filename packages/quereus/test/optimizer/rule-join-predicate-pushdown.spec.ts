@@ -12,6 +12,10 @@ import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { FilterNode } from '../../src/planner/nodes/filter.js';
+import { JoinNode } from '../../src/planner/nodes/join-node.js';
+import { ruleJoinPredicatePushdown } from '../../src/planner/rules/predicate/rule-join-predicate-pushdown.js';
+import type { OptContext } from '../../src/planner/framework/context.js';
 import { Parser } from '../../src/parser/parser.js';
 import type * as AST from '../../src/parser/ast.js';
 
@@ -176,6 +180,87 @@ describe('rule-join-predicate-pushdown', () => {
 		expect(filtersAboveJoin(await planOps(q)), 'both conjuncts push across a cross join').to.equal(0);
 	});
 
+	it('pushes the left conjunct of a SEMI join (decorrelated IN)', async () => {
+		// `subquery-decorrelation` turns the IN into a semi join, so the `semi` row of the
+		// header table IS reachable from SQL — the left branch takes its conjunct.
+		const q = "select e.id as eid from entry e where e.txn_id in (select t.id from txn t) "
+			+ "and e.account_id = 'a3' order by e.id";
+		expect(await rows(q)).to.deep.equal([{ eid: 1 }, { eid: 3 }]);
+
+		const details = await planDetails(q);
+		expect(details.some(d => /SEMI/.test(d.detail)), 'expected a semi join').to.equal(true);
+		expect(filtersAboveJoin(details.map(d => d.op)), 'the left conjunct moved below the semi join').to.equal(0);
+	});
+
+	it('pushes the left conjunct of an ANTI join (decorrelated NOT EXISTS)', async () => {
+		await db.exec("insert into entry values (6,99,'a3',60)");
+		const q = 'select e.id as eid from entry e where not exists (select 1 from txn t where t.id = e.txn_id) '
+			+ "and e.account_id = 'a3' order by e.id";
+		expect(await rows(q)).to.deep.equal([{ eid: 6 }]);
+
+		const details = await planDetails(q);
+		expect(details.some(d => /ANTI/.test(d.detail)), 'expected an anti join').to.equal(true);
+		expect(filtersAboveJoin(details.map(d => d.op)), 'the left conjunct moved below the anti join').to.equal(0);
+	});
+
+	it('pushes through a 3-way join to the innermost branch', async () => {
+		await db.exec('create table tag (id integer primary key, entry_id integer, label text) using memory');
+		await db.exec("insert into tag values (10,1,'x'),(11,3,'y')");
+		const q = "select e.id as eid, g.label as label from entry e join txn t on t.id = e.txn_id "
+			+ "join tag g on g.entry_id = e.id where e.account_id = 'a3' and g.label = 'y' order by e.id";
+		expect(await rows(q)).to.deep.equal([{ eid: 3, label: 'y' }]);
+		expect(filtersAboveJoin(await planOps(q)), 'both conjuncts reach their own branch').to.equal(0);
+	});
+
+	it('relocates — never mis-pushes — a conjunct over a LEFT sub-join\'s null-extended side', async () => {
+		// `(entry ⟕ tag) ⋈ txn where g.label is null`. The conjunct is a LEFT-branch
+		// conjunct of the INNER join, so it may move onto that branch; it must then be
+		// refused by the rule's second firing on the LEFT sub-join underneath.
+		await db.exec('create table tag (id integer primary key, entry_id integer, label text) using memory');
+		await db.exec("insert into tag values (10,1,'x'),(11,3,'y')");
+		const q = 'select e.id as eid from entry e left join tag g on g.entry_id = e.id '
+			+ 'join txn t on t.id = e.txn_id where g.label is null order by e.id';
+		expect(await rows(q)).to.deep.equal([{ eid: 2 }, { eid: 4 }]);
+	});
+
+	it('pushes a single-side OR and keeps a cross-side OR above', async () => {
+		// `splitConjuncts` yields ONE conjunct for an OR, so side attribution is over the
+		// whole disjunction — all-one-side pushes, mixed does not.
+		const oneSide = "select e.id as eid from entry e join txn t on t.id = e.txn_id "
+			+ "where (e.account_id = 'a5' or e.amount < 15) order by e.id";
+		expect(await rows(oneSide)).to.deep.equal([{ eid: 1 }, { eid: 4 }]);
+		expect(filtersAboveJoin(await planOps(oneSide)), 'a wholly-left OR pushes').to.equal(0);
+
+		const crossSide = "select e.id as eid from entry e join txn t on t.id = e.txn_id "
+			+ "where (e.account_id = 'a5' or t.date = '2024-02-01') order by e.id";
+		expect(await rows(crossSide)).to.deep.equal([{ eid: 3 }, { eid: 4 }]);
+		expect(filtersAboveJoin(await planOps(crossSide)), 'a cross-side OR stays above').to.equal(1);
+	});
+
+	it('preserves three-valued logic for a pushed conjunct over a nullable column', async () => {
+		await db.exec('create table nn (id integer primary key, v text null) using memory');
+		await db.exec("insert into nn values (1,'a'),(2,null),(3,'c')");
+		// `n.v <> 'a'` is NULL (not false) for the NULL row: it must be dropped whether the
+		// conjunct is evaluated above the join or on the branch.
+		const q = "select n.id as nid from nn n join txn t on t.id = n.id where n.v <> 'a' order by n.id";
+		expect(await rows(q)).to.deep.equal([{ nid: 3 }]);
+		expect(filtersAboveJoin(await planOps(q)), 'the conjunct is pushed').to.equal(0);
+		expect(await rows("select n.id as nid from nn n join txn t on t.id = n.id where n.v is null order by n.id"))
+			.to.deep.equal([{ nid: 2 }]);
+	});
+
+	it('filters only the aliased side a self-join conjunct names', async () => {
+		// Both branches are the same table; distinct per-instance attribute ids are what
+		// keeps `attributeSide` from calling the conjunct ambiguous.
+		const q = "select a.id as aid, b.account_id as bacct from entry a join entry b on b.id = a.txn_id "
+			+ "where a.account_id = 'a3' order by a.id";
+		expect(await rows(q)).to.deep.equal([
+			{ aid: 1, bacct: 'a3' },
+			{ aid: 3, bacct: 'a4' },
+		]);
+		expect(filtersAboveJoin(await planOps(q)), 'only the `a` branch is filtered').to.equal(0);
+	});
+
 	it('pushes a right-side conjunct of a LATERAL join', async () => {
 		// The right side is correlated to the left, but a conjunct over the right
 		// side's OUTPUT attributes is still safe to evaluate before the combination.
@@ -323,7 +408,36 @@ describe('rule-join-predicate-pushdown', () => {
 		const twice = db.optimizer.optimizeForAnalysis(once, db);
 		expect(shapeOf(twice)).to.equal(shapeOf(once));
 	});
+
+	it('returns null when re-offered its own residual Filter', () => {
+		// The pass-level fixed point above cannot distinguish "the rule declined" from
+		// "the rule fired and something else undid it". This calls the rule function
+		// directly on the residual it produced: the conjunct it moved is gone from the
+		// Filter, so the second visit finds nothing pushable. The rule ignores its
+		// context argument, so a null stands in for one.
+		const sql = "select e.id, t.date from entry e join txn t on t.id = e.txn_id "
+			+ "where e.account_id = 'a3' and e.amount > t.id";
+		const ast = new Parser().parse(sql) as AST.Statement;
+		const raw = (db as unknown as { _buildPlan(a: AST.Statement[]): { plan: PlanNode } })._buildPlan([ast]).plan;
+		const noContext = null as unknown as OptContext;
+
+		const residual = findFilterOverJoin(db.optimizer.optimizeForAnalysis(raw, db));
+		expect(residual, 'expected the cross-side conjunct to leave a residual Filter over the join')
+			.to.not.be.undefined;
+		expect(ruleJoinPredicatePushdown(residual!, noContext), 'a second visit must decline').to.equal(null);
+	});
 });
+
+/** The first `FilterNode` in `root` whose immediate source is a `JoinNode`. */
+function findFilterOverJoin(root: PlanNode): FilterNode | undefined {
+	const stack: PlanNode[] = [root];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node instanceof FilterNode && node.source instanceof JoinNode) return node;
+		for (const child of node.getChildren()) stack.push(child as PlanNode);
+	}
+	return undefined;
+}
 
 /** Pre-order `nodeType|toString()` signature of a plan — stable across re-mints. */
 function shapeOf(root: PlanNode): string {

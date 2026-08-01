@@ -44,6 +44,14 @@
  *   own ids — which belong to neither side — and the conjunct is declined. That
  *   descent is load-bearing: a scalar-only walk would see only `e.id` and push a
  *   conjunct onto the left branch where `t.id` does not resolve.
+ * - Symmetrically, a conjunct naming a column from OUTSIDE the join — an outer
+ *   reference, when this `Filter(Join)` is itself the body of a correlated
+ *   subquery — sees an id in neither side's set and is declined.
+ *   NOTE: sound but pessimistic — `x.a = <outer>.b` would be safe on the `x`
+ *   branch. Ignoring "in neither side" ids instead of refusing on them would
+ *   recover that, but only after separating a genuinely-outer id from a
+ *   subquery-internal one, which this walk does not currently distinguish.
+ *   Left alone until a real correlated body is measured losing a seek to it.
  * - A conjunct with NO column references (`where 1 = 1`, `where :p > 0`) stays
  *   above; pushing it buys nothing and would make the rule fire on plans it
  *   should leave alone.

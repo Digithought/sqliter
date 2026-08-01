@@ -460,7 +460,7 @@ The companion **independent-channel singleton law** (same harness) closes the pr
 
 `ruleAggregatePredicatePushdown` ([Rules § Optimization Rules](optimizer-rules.md#optimization-rules)) consumes `physical.fds`: it uses `computeClosure` over the aggregate's output FDs to widen the set of pushable conjuncts on composite GROUP BYs.
 
-`rulePredicateInferenceEquivalence` consumes `physical.constantBindings` × `physical.equivClasses`: for `SELECT ... FROM t JOIN u ON t.k = u.k WHERE t.k = 5`, the join contributes an EC `{t.k, u.k}` and the filter contributes a binding `{t.k → 5}`. The rule crosses them and emits a `u.k = 5` conjunct on the u-branch, which subsequent `predicate-pushdown` iterations carry into the leaf so the vtab can pick a seek over a scan. The same shape works for parameter bindings (`t.k = ?`) and chains transitively across multiple equi-joins.
+`rulePredicateInferenceEquivalence` consumes `physical.constantBindings` × `physical.equivClasses`: for `SELECT ... FROM t JOIN u ON t.k = u.k WHERE t.k = 5`, the join contributes an EC `{t.k, u.k}` and the filter contributes a binding `{t.k → 5}`. The rule crosses them and ANDs a `u.k = 5` conjunct into the Filter above the join; `join-predicate-pushdown` then moves it onto the u branch and `predicate-pushdown` carries it into the leaf, so the vtab can pick a seek over a scan. The same shape works for parameter bindings (`t.k = ?`) and chains transitively across multiple equi-joins.
 
 ## Rejected alternatives
 

@@ -119,6 +119,34 @@ function resolveBackingPkColumns(backing: TableSchema, resolver: CollationResolv
 }
 
 /**
+ * Rules suppressed while producing the `analyzed` body every arm classifies by plan
+ * SHAPE. Only `join-predicate-pushdown` is on the list: it moves a single-side WHERE
+ * conjunct into the join branch it constrains, which breaks two shape reads the
+ * join-residual arm depends on — `bodyWhereReferencesLookup` (which finds the body
+ * WHERE as `FilterNode`s at/above the join, and cannot see one absorbed into a branch's
+ * `Retrieve` pipeline) and the coverage prover's inner-join no-row-loss precondition
+ * (`resolveFullScanTableRef`, which requires the LOOKUP branch to expose `P`'s full row
+ * set — a pushed `P`-side conjunct disqualifies it). Without this every WHERE-bearing
+ * 1:1 join MV silently drops from the bounded-delta arm to the full-rebuild floor:
+ * still correct, but a whole-source rescan per write.
+ *
+ * This constrains only the CLASSIFICATION input. Every residual the arms compile goes
+ * back through the full `optimize()` pipeline (`compileResidual` /
+ * `compileWholeBodyScheduler`), so the maintenance plans that actually run still get the
+ * pushdown.
+ *
+ * NOTE: this list is a shape coupling, not a general escape hatch. Any FUTURE Structural
+ * rule that relocates the body's WHERE relative to its join will break the same two shape
+ * reads and belongs here too — the symptom is silent (bounded-delta arms degrade to the
+ * full-rebuild floor, results stay correct), so the guard is
+ * `test/incremental/maintenance-equivalence.spec.ts` § "join-residual partial-WHERE plan
+ * selection", which asserts `plan.kind === 'join-residual'` directly. Making the two shape
+ * reads see THROUGH a pushed predicate — so this list can go away — is
+ * `backlog/debt-mv-shape-analysis-blind-to-pushed-predicates`.
+ */
+const ANALYSIS_DISABLED_RULES = { disabledRules: ['join-predicate-pushdown'] } as const;
+
+/**
  * Build the row-time maintenance plan for an MV — **cost-gated, with a floor, never a
  * shape allowlist**. The builder tries to match a bounded-delta arm by shape
  * ({@link tryBuildBoundedDeltaArm}); a body that matches **none** falls through to the
@@ -147,32 +175,6 @@ function resolveBackingPkColumns(backing: TableSchema, resolver: CollationResolv
  * cost gate, and full-rebuild is selected exactly when no bounded-delta arm is sound (an
  * empty sound set resolves to the floor) — so an existing eligible shape is unaffected.
  */
-/**
- * Rules suppressed while producing the `analyzed` body every arm classifies by plan
- * SHAPE. Only `join-predicate-pushdown` is on the list: it moves a single-side WHERE
- * conjunct into the join branch it constrains, which breaks two shape reads the
- * join-residual arm depends on — `bodyWhereReferencesLookup` (which finds the body
- * WHERE as `FilterNode`s at/above the join, and cannot see one absorbed into a branch's
- * `Retrieve` pipeline) and the coverage prover's inner-join no-row-loss precondition
- * (`resolveFullScanTableRef`, which requires the LOOKUP branch to expose `P`'s full row
- * set — a pushed `P`-side conjunct disqualifies it). Without this every WHERE-bearing
- * 1:1 join MV silently drops from the bounded-delta arm to the full-rebuild floor:
- * still correct, but a whole-source rescan per write.
- *
- * This constrains only the CLASSIFICATION input. Every residual the arms compile goes
- * back through the full `optimize()` pipeline (`compileResidual` /
- * `compileWholeBodyScheduler`), so the maintenance plans that actually run still get the
- * pushdown.
- *
- * NOTE: this list is a shape coupling, not a general escape hatch. Any FUTURE Structural
- * rule that relocates the body's WHERE relative to its join will break the same two shape
- * reads and belongs here too — the symptom is silent (bounded-delta arms degrade to the
- * full-rebuild floor, results stay correct), so the guard is
- * `test/incremental/maintenance-equivalence.spec.ts` § "join-residual partial-WHERE plan
- * selection", which asserts `plan.kind === 'join-residual'` directly.
- */
-const ANALYSIS_DISABLED_RULES = { disabledRules: ['join-predicate-pushdown'] } as const;
-
 export function buildMaintenancePlan(ctx: MaterializedViewManagerContext, mv: MaintainedTableSchema): MaintenancePlan {
 	const db = ctx as unknown as Database;
 	// Analyze the MV's own body to compile maintenance; suppress the read-side
