@@ -8,7 +8,12 @@ import { FilterNode } from '../src/planner/nodes/filter.js';
 import type { OptContext } from '../src/planner/framework/context.js';
 import { splitConjuncts } from '../src/planner/analysis/predicate-conjuncts.js';
 import { ruleFilterConjunctOrdering } from '../src/planner/rules/predicate/rule-filter-conjunct-ordering.js';
-import { classifyConjunctCost, compareConjunctCost, ConjunctCostTier } from '../src/planner/cost/conjunct-cost.js';
+import {
+	classifyConjunctCost, compareConjunctCost, compareConjunctRank, ConjunctCostTier,
+	UNKNOWN_CONJUNCT_SELECTIVITY, type ConjunctRank,
+} from '../src/planner/cost/conjunct-cost.js';
+import { createOptContext } from '../src/planner/framework/context.js';
+import { CatalogStatsProvider } from '../src/planner/stats/catalog-stats.js';
 
 /**
  * Filter conjunct cost ordering (`rule-filter-conjunct-ordering`,
@@ -17,9 +22,11 @@ import { classifyConjunctCost, compareConjunctCost, ConjunctCostTier } from '../
  * With conjunct early exit landed (filter-conjunct-early-exit.spec.ts), conjunct
  * ORDER is load-bearing: the emitter runs a Filter's conjuncts in predicate
  * order and stops at the first non-true one. This rule sorts the top-level AND
- * conjuncts cheapest-first on a (tier, subtreeCost) key — Pure < Volatile <
- * Subquery, subtree cost as within-tier tiebreak — so the same query written in
- * either order converges on the same low evaluation count.
+ * conjuncts on a (tier, benefit/cost, subtreeCost) key — Pure < Volatile <
+ * Subquery first; within a tier, statistics-estimated filtering bought per unit
+ * work descending, falling back to plain subtree cost when no conjunct has a
+ * real estimate — so the same query written in either order converges on the
+ * same low evaluation count.
  */
 
 async function collect(db: Database, sql: string): Promise<Array<Record<string, SqlValue>>> {
@@ -41,16 +48,17 @@ function findFilters(root: PlanNode): FilterNode[] {
 	return found;
 }
 
-// The rule never reads its context (it works off the node alone); a dummy is
-// fine for direct invocation.
-const DUMMY_CONTEXT = undefined as unknown as OptContext;
-
 describe('WHERE conjunct cost ordering', () => {
 	let db: Database;
 	let calls: number;
+	// The rule reads `context.stats` for its selectivity gate, so direct
+	// invocation needs a real context — built the way the optimizer builds its
+	// own (CatalogStatsProvider is the production default).
+	let context: OptContext;
 
 	beforeEach(async () => {
 		db = new Database();
+		context = createOptContext(db.optimizer, new CatalogStatsProvider(), db.optimizer.tuning, db);
 		calls = 0;
 		// Non-deterministic by default, so the engine cannot hoist, cache, or
 		// constant-fold it: `calls` is a faithful per-evaluation counter.
@@ -83,6 +91,21 @@ describe('WHERE conjunct cost ordering', () => {
 	function optimizedFilters(sql: string): FilterNode[] {
 		const plan = (db as unknown as { getPlan(s: string): PlanNode }).getPlan(sql);
 		return findFilters(plan);
+	}
+
+	/**
+	 * A 100-row table with knowably different column selectivities: `weak` has 2
+	 * distinct values (equality keeps 0.5), `strong` has 50 (`strong in (2, 3)`
+	 * estimates 2/50 = 0.04). Optionally ANALYZEd so CatalogStatsProvider has
+	 * real statistics to answer from.
+	 */
+	async function createSelectivityTable(name: string, analyze: boolean): Promise<void> {
+		await db.exec(`create table ${name} (id integer primary key, weak integer, strong integer)`);
+		const rows = Array.from({ length: 100 }, (_, i) => `(${i + 1}, ${(i + 1) % 2}, ${(i + 1) % 50})`).join(', ');
+		await db.exec(`insert into ${name} values ${rows}`);
+		if (analyze) {
+			for await (const _ of db.eval(`analyze ${name}`)) { /* consume */ }
+		}
 	}
 
 	describe('evaluation counts (both written orders converge)', () => {
@@ -218,37 +241,115 @@ describe('WHERE conjunct cost ordering', () => {
 		});
 	});
 
+	describe('conjunct rank comparison (compareConjunctRank)', () => {
+		const rank = (tier: ConjunctCostTier, subtreeCost: number, selectivity: number): ConjunctRank =>
+			({ tier, subtreeCost, selectivity });
+
+		it('strong-but-pricier beats weak-but-cheaper within a tier', () => {
+			const weakCheap = rank(ConjunctCostTier.Pure, 2, 0.5);
+			const strongPricey = rank(ConjunctCostTier.Pure, 3, 0.04);
+			expect(compareConjunctRank(strongPricey, weakCheap)).to.be.lessThan(0);
+			expect(compareConjunctRank(weakCheap, strongPricey)).to.be.greaterThan(0);
+		});
+
+		it('uniform unknowns reproduce the cost-only order', () => {
+			// With the benefit term constant across a group, descending benefit/cost
+			// degenerates to ascending cost — so unknowns keep their cost order among
+			// themselves in the mixed case. (The ALL-unknown case never reaches this
+			// comparator at all: the rule branches to compareConjunctCost verbatim.)
+			const cheap = rank(ConjunctCostTier.Pure, 1, UNKNOWN_CONJUNCT_SELECTIVITY);
+			const pricey = rank(ConjunctCostTier.Pure, 2, UNKNOWN_CONJUNCT_SELECTIVITY);
+			expect(Math.sign(compareConjunctRank(cheap, pricey)))
+				.to.equal(Math.sign(compareConjunctCost(cheap, pricey)));
+			expect(compareConjunctRank(cheap, pricey)).to.be.lessThan(0);
+		});
+
+		it('cross-tier immunity: a maximally selective Subquery conjunct never outranks a useless Pure one', () => {
+			// The decision most likely to be "improved" away later: the tier stays
+			// the PRIMARY key because raw cost — the ratio's denominator — is not
+			// comparable across tiers. A measured selectivity must not bet against
+			// an unmeasured per-row sub-program cost.
+			const strongSubquery = rank(ConjunctCostTier.Subquery, 0.05, 0);
+			const uselessPure = rank(ConjunctCostTier.Pure, 100, 1);
+			expect(compareConjunctRank(strongSubquery, uselessPure)).to.be.greaterThan(0);
+			expect(compareConjunctRank(uselessPure, strongSubquery)).to.be.lessThan(0);
+		});
+
+		it('selectivity exactly 1.0 → zero benefit → last within its tier', () => {
+			// Correct: it rejects nothing, so running it early buys nothing.
+			const rejectsNothing = rank(ConjunctCostTier.Pure, 1, 1);
+			const nearlyUseless = rank(ConjunctCostTier.Pure, 50, 0.99);
+			expect(compareConjunctRank(nearlyUseless, rejectsNothing)).to.be.lessThan(0);
+		});
+
+		it('selectivity exactly 0.0 → maximal benefit for its cost', () => {
+			const rejectsAll = rank(ConjunctCostTier.Pure, 2, 0);
+			const nearlyAll = rank(ConjunctCostTier.Pure, 2, 0.01);
+			expect(compareConjunctRank(rejectsAll, nearlyAll)).to.be.lessThan(0);
+		});
+
+		it('out-of-range provider values clamp to the [0, 1] boundaries', () => {
+			// A below-0 value behaves exactly like 0 and an above-1 like 1, so a
+			// misbehaving provider cannot produce a negative benefit.
+			expect(compareConjunctRank(rank(ConjunctCostTier.Pure, 1, -3), rank(ConjunctCostTier.Pure, 1, 0))).to.equal(0);
+			expect(compareConjunctRank(rank(ConjunctCostTier.Pure, 1, 4), rank(ConjunctCostTier.Pure, 1, 1))).to.equal(0);
+		});
+
+		it('zero subtree cost is floored — finite, comparable, never NaN', () => {
+			const freebie = rank(ConjunctCostTier.Pure, 0, 0.5);
+			const normal = rank(ConjunctCostTier.Pure, 1, 0.5);
+			expect(compareConjunctRank(freebie, normal), 'the floored ratio is enormous but finite').to.be.lessThan(0);
+			expect(Number.isNaN(compareConjunctRank(freebie, freebie))).to.be.false;
+			expect(compareConjunctRank(freebie, freebie)).to.equal(0);
+		});
+
+		it('equal ratios fall through to the cheaper conjunct', () => {
+			// (1 - 0.5) / 1 and (1 - 0) / 2 are both exactly 0.5: the tertiary key
+			// (plain cost) breaks the tie rather than a raw ratio difference.
+			const cheapHalf = rank(ConjunctCostTier.Pure, 1, 0.5);
+			const priceyFull = rank(ConjunctCostTier.Pure, 2, 0);
+			expect(compareConjunctRank(cheapHalf, priceyFull)).to.be.lessThan(0);
+		});
+
+		it('identical (tier, ratio, cost) keys compare equal (the stable-sort tie)', () => {
+			expect(compareConjunctRank(
+				rank(ConjunctCostTier.Volatile, 3, 0.25),
+				rank(ConjunctCostTier.Volatile, 3, 0.25),
+			)).to.equal(0);
+		});
+	});
+
 	describe('rule mechanics (direct invocation)', () => {
 		it('reorders a raw expensive-first filter, then reaches a fixed point', () => {
 			const filter = rawFilter('select id from t where sidefx() = 1 and v % 5 = 2');
-			const reordered = ruleFilterConjunctOrdering(filter, DUMMY_CONTEXT);
+			const reordered = ruleFilterConjunctOrdering(filter, context);
 			expect(reordered, 'expensive-first predicate must be rewritten').to.be.instanceOf(FilterNode);
 			const detail = (reordered as FilterNode).toString();
 			expect(detail.indexOf('v % 5'), detail).to.be.lessThan(detail.indexOf('sidefx'));
 			// Idempotence: running the rule on its own output must return null —
 			// this is what stops the optimizer's fixed-point loop.
-			expect(ruleFilterConjunctOrdering(reordered as FilterNode, DUMMY_CONTEXT)).to.be.null;
+			expect(ruleFilterConjunctOrdering(reordered as FilterNode, context)).to.be.null;
 		});
 
 		it('returns null on an already-ordered predicate (no gratuitous re-mint)', () => {
 			const filter = rawFilter('select id from t where v % 5 = 2 and sidefx() = 1');
-			expect(ruleFilterConjunctOrdering(filter, DUMMY_CONTEXT)).to.be.null;
+			expect(ruleFilterConjunctOrdering(filter, context)).to.be.null;
 		});
 
 		it('returns null on a single-conjunct filter', () => {
 			const filter = rawFilter('select id from t where v % 5 = 2');
-			expect(ruleFilterConjunctOrdering(filter, DUMMY_CONTEXT)).to.be.null;
+			expect(ruleFilterConjunctOrdering(filter, context)).to.be.null;
 		});
 
 		it('returns null on a non-AND (OR) predicate', () => {
 			const filter = rawFilter('select id from t where sidefx() = 1 or v % 5 = 2');
-			expect(ruleFilterConjunctOrdering(filter, DUMMY_CONTEXT)).to.be.null;
+			expect(ruleFilterConjunctOrdering(filter, context)).to.be.null;
 		});
 
 		it('preserves a stamped selectivity through the reorder', () => {
 			const filter = rawFilter('select id from t where sidefx() = 1 and v % 5 = 2');
 			const stamped = new FilterNode(filter.scope, filter.source, filter.predicate, undefined, 0.25);
-			const reordered = ruleFilterConjunctOrdering(stamped, DUMMY_CONTEXT) as FilterNode;
+			const reordered = ruleFilterConjunctOrdering(stamped, context) as FilterNode;
 			expect(reordered, 'stamped filter must still be rewritten').to.be.instanceOf(FilterNode);
 			expect(reordered.selectivity, 'the conjunct set is unchanged, so the estimate stays valid').to.equal(0.25);
 		});
@@ -264,7 +365,111 @@ describe('WHERE conjunct cost ordering', () => {
 			Object.defineProperty(conjuncts[0], 'physical', {
 				value: { readonly: false },
 			});
-			expect(ruleFilterConjunctOrdering(filter, DUMMY_CONTEXT)).to.be.null;
+			expect(ruleFilterConjunctOrdering(filter, context)).to.be.null;
+		});
+
+		it('fires on a mixed known/unknown predicate, then reaches a fixed point', async () => {
+			await createSelectivityTable('wa', true);
+			// `weak + 0 = 1` puts the column out of the catalog's reach (not a bare
+			// column child of the comparison) → unknown, assigned the neutral 0.5.
+			// `strong in (2, 3)` estimates 2/50 = 0.04 — stronger than neutral, so
+			// it moves ahead of the unknown despite being the pricier subtree.
+			const filter = rawFilter('select id from wa where weak + 0 = 1 and strong in (2, 3)');
+			const reordered = ruleFilterConjunctOrdering(filter, context);
+			expect(reordered, 'the estimated-strong conjunct must move ahead of the unknown one').to.be.instanceOf(FilterNode);
+			const detail = (reordered as FilterNode).toString();
+			expect(detail.indexOf('strong'), detail).to.be.greaterThan(-1);
+			expect(detail.indexOf('strong'), detail).to.be.lessThan(detail.indexOf('weak'));
+			// The key depends only on the node and context.stats (stable within one
+			// optimize()), so the rule's own output must be its fixed point.
+			expect(ruleFilterConjunctOrdering(reordered as FilterNode, context), 'fixed point in the mixed case').to.be.null;
+		});
+
+		it('keeps a statistics-strong Subquery-tier conjunct behind a weak Pure one', async () => {
+			await createSelectivityTable('wa', true);
+			// `strong = (select wa.strong)` references ONLY outer attributes, so the
+			// shared estimator resolves them and answers 1/ndv(strong) = 0.02 — a
+			// number describing the OUTER column, not the subquery's result (the
+			// known, bounded imprecision noted in stats/conjunct-selectivity.ts).
+			// Containment: the conjunct is Subquery tier, so even that strong-looking
+			// estimate cannot lift it past the Pure `weak = 1` (selectivity 0.5).
+			const filter = rawFilter('select id from wa where strong = (select wa.strong) and weak = 1');
+			const [subq] = splitConjuncts(filter.predicate);
+			expect(classifyConjunctCost(subq).tier, 'precondition: the conjunct really is Subquery tier')
+				.to.equal(ConjunctCostTier.Subquery);
+			const reordered = ruleFilterConjunctOrdering(filter, context);
+			expect(reordered, 'the Pure conjunct must still move ahead of the subquery').to.be.instanceOf(FilterNode);
+			const detail = (reordered as FilterNode).toString();
+			expect(detail.indexOf('weak'), detail).to.be.greaterThan(-1);
+			expect(detail.indexOf('weak'), detail).to.be.lessThan(detail.indexOf('select'));
+		});
+	});
+
+	describe('selectivity-driven ordering (ANALYZEd table, end to end)', () => {
+		// What is observable here: the reordered predicate's detail string plus
+		// row-set parity for both written orders. The counting-UDF technique used
+		// above cannot demonstrate the win — a UDF conjunct is Volatile tier and
+		// has no column statistics — so this block proves the ORDER the statistics
+		// chose, not a measured speedup.
+		beforeEach(async () => {
+			await createSelectivityTable('wa', true);
+			// Identical data, never ANALYZEd — the negative control.
+			await createSelectivityTable('wu', false);
+		});
+
+		/** The optimized plan's Filter whose predicate mentions `needle`. */
+		function filterDetailContaining(sql: string, needle: string): string {
+			const filter = optimizedFilters(sql).find(f => f.toString().includes(needle));
+			if (!filter) throw new Error(`no Filter mentioning '${needle}' in optimized plan for: ${sql}`);
+			return filter.toString();
+		}
+
+		// `weak = 1` (selectivity 0.5) is the CHEAPER subtree; `strong in (2, 3)`
+		// (selectivity 0.04) carries an extra literal child, so plain cost ordering
+		// runs `weak` first. Cost-only and cost+selectivity genuinely disagree here.
+		const WRITTEN_ORDERS = (table: string) => [
+			`select id from ${table} where weak = 1 and strong in (2, 3)`,
+			`select id from ${table} where strong in (2, 3) and weak = 1`,
+		];
+
+		it('both written orders converge on the stronger-conjunct-first plan', () => {
+			for (const sql of WRITTEN_ORDERS('wa')) {
+				const detail = filterDetailContaining(sql, 'strong');
+				expect(detail.indexOf('weak'), detail).to.be.greaterThan(-1);
+				expect(detail.indexOf('strong'), `stronger conjunct must come first in: ${detail}`)
+					.to.be.lessThan(detail.indexOf('weak'));
+			}
+		});
+
+		it('row-set parity: both written orders return the same rows', async () => {
+			// weak = id % 2, strong = id % 50 → weak = 1 keeps odd ids and
+			// strong in (2, 3) keeps {2, 3, 52, 53}; the conjunction keeps {3, 53}.
+			const results = [];
+			for (const sql of WRITTEN_ORDERS('wa')) {
+				results.push(await collect(db, `${sql} order by id`));
+			}
+			expect(results[0]).to.deep.equal(results[1]);
+			expect(results[0].map(r => r.id)).to.deep.equal([3, 53]);
+		});
+
+		it('negative control: the un-ANALYZEd table keeps the cost-only order', () => {
+			// No statistics → every conjunct unknown → the explicit all-unknown
+			// branch sorts with compareConjunctCost verbatim: cheap `weak` first.
+			for (const sql of WRITTEN_ORDERS('wu')) {
+				const detail = filterDetailContaining(sql, 'strong');
+				expect(detail.indexOf('weak'), detail).to.be.greaterThan(-1);
+				expect(detail.indexOf('weak'), `cheaper conjunct must come first in: ${detail}`)
+					.to.be.lessThan(detail.indexOf('strong'));
+			}
+		});
+
+		it('row-set parity on the un-ANALYZEd table too', async () => {
+			const results = [];
+			for (const sql of WRITTEN_ORDERS('wu')) {
+				results.push(await collect(db, `${sql} order by id`));
+			}
+			expect(results[0]).to.deep.equal(results[1]);
+			expect(results[0].map(r => r.id)).to.deep.equal([3, 53]);
 		});
 	});
 });

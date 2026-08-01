@@ -254,24 +254,56 @@ Cost estimation is centralized in `src/planner/cost/index.ts`:
 #### Conjunct cost tiers
 
 `cost/conjunct-cost.ts` ranks WHERE/HAVING conjuncts for
-`rule-filter-conjunct-ordering` on a two-part key: a coarse `ConjunctCostTier`
-(`Pure` < `Volatile` < `Subquery`) first, `getTotalCost()` only as the
-within-tier tiebreak. Raw subtree cost alone misorders: node-count-derived cost
+`rule-filter-conjunct-ordering` on a three-part key
+(`compareConjunctRank`): a coarse `ConjunctCostTier`
+(`Pure` < `Volatile` < `Subquery`) first; within a tier, estimated filtering
+bought per unit work — `(1 - selectivity) / max(subtreeCost, 1e-9)`,
+descending — with plain `getTotalCost()` breaking ratio ties. Raw subtree cost
+alone misorders across tiers: node-count-derived cost
 does not model "opens a whole sub-program per row", so a tableless scalar
 subquery (`(select f())`, ≈0.051) costs *less* than a three-term arithmetic
 expression (≈0.053) and barely more than a modulo — pure cost would run the
 subquery before the arithmetic. The tier is the structural signal instead: any
 relational descendant ⇒ `Subquery`, else any non-deterministic node ⇒
-`Volatile`, else `Pure`. The module is deliberately **not** re-exported from
+`Volatile`, else `Pure`.
+
+**Why the tier stays the primary key.** The textbook rank is
+`(fraction rejected) / (cost to run)` applied globally, but that needs a cost
+denominator comparable across every conjunct — which is exactly what the tier
+exists to say quereus does *not* have. Promoting a `Subquery`-tier conjunct
+ahead of a `Pure` one because statistics say it rejects 95% would bet a
+*measured* selectivity against an *unmeasured* per-row sub-program cost. Within
+a tier the conjuncts are the same structural class, so cost is comparable there
+and the ratio is meaningful.
+
+Per-conjunct selectivities come from the shared estimator in
+`planner/stats/conjunct-selectivity.ts`, gated on `statsOnlySelectivity` — real
+statistics only. When **no** conjunct in a filter gets a real estimate the rule
+sorts with the cost-only `compareConjunctCost` verbatim (an explicit branch,
+not a limit argument), so a query with no `ANALYZE`d statistics orders
+bit-identically to the pre-selectivity rule. In the mixed case an unknown
+conjunct is assigned `UNKNOWN_CONJUNCT_SELECTIVITY` — which *is*
+`DEFAULT_FILTER_SELECTIVITY` (0.5), the engine's one "nobody knows" fraction —
+so "no information" is the neutral position: a measured-stronger conjunct
+(s < 0.5) sorts ahead of unknowns, a measured-weaker one behind, and unknowns
+keep their cost order among themselves (constant benefit ⇒ descending
+benefit/cost degenerates to ascending cost). Selectivities are clamped to
+[0, 1] before the benefit is computed, and the 1e-9 cost floor is a
+divide-by-zero guard only — no real conjunct has zero subtree cost.
+
+The module is deliberately **not** re-exported from
 `cost/index.ts` — `nodes/filter.ts` imports `cost/index.ts`, and conjunct-cost
-imports plan-node + characteristics, so a re-export would create an import
-cycle.
+imports plan-node + characteristics (and now `DEFAULT_FILTER_SELECTIVITY` from
+`nodes/filter.ts` itself), so a re-export would create an import cycle.
 
 Reordering preserves the row set (AND commutes under three-valued logic, and a
 Filter rejects `false` and `NULL` alike) but it does **not** preserve which
 conjuncts get evaluated, so a guard idiom (`v <> 0 and 10 / v > 1`) is only
 safe while no scalar expression raises. Every arithmetic edge quereus defines
-returns NULL rather than throwing, so this is inert today; if a scalar function
+returns NULL rather than throwing, so this is inert today; note that
+selectivity adds a second route past a guard — a statistics-strong conjunct
+can sort ahead of a cheaper same-tier guard even where cost alone would have
+kept the guard first. If a scalar function
 that throws on bad input ever ships, gate the reorder on a per-function
 "may raise" trait, or require CASE for guarding as PostgreSQL does.
 
@@ -357,6 +389,8 @@ s₁ · s₂^(1/2) · s₃^(1/4) · s₄^(1/8)
 Plain independence collapses too fast for real workloads (five conditions at 0.1 each give 1e-5) because predicates are correlated far more often than not; backoff needs no correlation statistics and reduces to plain independence for a single conjunct. Once two or more selectivities are actually combined the result floors at `1 / rowCount` — never fewer than one surviving row. Conjuncts on the *same* column (`a > 1 and a < 10`) are still not paired into a single range, so that case remains over-selective, just less so.
 
 **Filters over a join.** `rule-filter-selectivity` has a second path for a Filter whose source spans several base tables — the common shape, since `rule-predicate-pushdown` does not push across a join, so every `where` conjunct of `... o join r on … where o.status = 'shipped' and r.name = 'EU'` stays in one Filter above it. That path splits the predicate with `splitConjuncts`, attributes each conjunct to the relation(s) its columns come from, estimates each independently, and folds the results with the same exponential backoff.
+
+The per-conjunct estimation machinery lives in `planner/stats/conjunct-selectivity.ts` (`estimateConjunctSelectivity` / `makeColumnStatsResolver`), shared with `rule-filter-conjunct-ordering` so the two cannot drift. The estimator works off `collectColumnOrigins`, which populates for a one-table source exactly as for a join, so the ordering rule calls it regardless of how many tables sit under the Filter and gates on `statsOnlySelectivity` on **both** single-table and multi-relation sources. The single-table *stamping* path here deliberately still does not — it hands the whole predicate to `selectivity` (naive fallback allowed), as it always has, because its output feeds `estimatedRows` and every physical cost reader.
 
 Attribution uses `collectColumnOrigins` (`planner/util/column-origins.ts`), which maps each attribute id reachable under the Filter's source back to the base-table column that minted it. Origins are keyed on a **relation instance** (`ColumnOrigin.relation`, an opaque token compared by reference and never dereferenced), not on the `TableSchema`: a self-join produces two relation instances sharing one schema object, and collapsing them would mis-read `a.age > b.age` as a single-table predicate. A `TableReferenceNode` is its own instance. Attributes minted *above* a base table — computed projections, aggregate outputs, `values` rows, join existence flags — are deliberately absent from the map, so a conjunct over one of them is skipped rather than mis-attributed by column name.
 

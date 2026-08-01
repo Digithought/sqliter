@@ -15,6 +15,7 @@
 
 import { PlanNode, isRelationalNode, type ScalarPlanNode } from '../nodes/plan-node.js';
 import { PlanNodeCharacteristics } from '../framework/characteristics.js';
+import { DEFAULT_FILTER_SELECTIVITY } from '../nodes/filter.js';
 
 /** How expensive a WHERE conjunct is to evaluate once, coarsest signal first. */
 export enum ConjunctCostTier {
@@ -65,5 +66,60 @@ export function classifyConjunctCost(node: ScalarPlanNode): ConjunctCost {
  */
 export function compareConjunctCost(a: ConjunctCost, b: ConjunctCost): number {
 	if (a.tier !== b.tier) return a.tier - b.tier;
+	return a.subtreeCost - b.subtreeCost;
+}
+
+/**
+ * Selectivity assigned to a conjunct the statistics could not estimate, when at
+ * least one sibling conjunct WAS estimated. This is `DEFAULT_FILTER_SELECTIVITY`
+ * (0.5) — the engine's one "nobody knows" fraction, the same one
+ * `FilterNode.estimatedRows` falls back to — so "no information" is the neutral
+ * position: a measured-stronger conjunct (s < 0.5) sorts ahead of unknowns, a
+ * measured-weaker one (s > 0.5) behind. With the benefit term constant across a
+ * group of unknowns, descending benefit/cost degenerates to ascending cost, so
+ * unknowns keep their cost order among themselves.
+ */
+export const UNKNOWN_CONJUNCT_SELECTIVITY = DEFAULT_FILTER_SELECTIVITY;
+
+/**
+ * Divide-by-zero guard only. `PlanNode.estimatedCost` defaults to 0.01 and the
+ * leaf scalar nodes cost 1, so no real conjunct has zero subtree cost; the floor
+ * just guarantees the ratio can never be Infinity or NaN.
+ */
+export const MIN_CONJUNCT_COST = 1e-9;
+
+export interface ConjunctRank extends ConjunctCost {
+	/**
+	 * Estimated fraction of rows the conjunct keeps, from the stats provider's
+	 * `statsOnlySelectivity` family; {@link UNKNOWN_CONJUNCT_SELECTIVITY} when
+	 * unknown. Clamped to [0, 1] at comparison time, so an out-of-range provider
+	 * value cannot produce a negative benefit.
+	 */
+	selectivity: number;
+}
+
+/** Filtering bought per unit of evaluation work: `(1 - selectivity) / cost`. */
+function filteringRatio(rank: ConjunctRank): number {
+	const sel = Math.min(1, Math.max(0, rank.selectivity));
+	return (1 - sel) / Math.max(rank.subtreeCost, MIN_CONJUNCT_COST);
+}
+
+/**
+ * (tier asc, benefit/cost desc, subtreeCost asc) lexicographic.
+ *
+ * The tier stays the primary key: raw cost is not comparable ACROSS tiers (see
+ * the module doc-comment), so a measured selectivity must never bet against an
+ * unmeasured per-row sub-program cost — a strongly-selective `Subquery`-tier
+ * conjunct cannot jump ahead of a weakly-selective `Pure` one. Within a tier the
+ * conjuncts are the same structural class, cost is comparable, and the ratio is
+ * the textbook rank. Ratio ties fall through to plain cost (never a raw ratio
+ * difference — a sub-ULP difference must not collapse two distinct keys into a
+ * tie); full ties resolve to 0 and callers keep source order via a stable sort.
+ */
+export function compareConjunctRank(a: ConjunctRank, b: ConjunctRank): number {
+	if (a.tier !== b.tier) return a.tier - b.tier;
+	const ra = filteringRatio(a);
+	const rb = filteringRatio(b);
+	if (ra !== rb) return rb - ra;
 	return a.subtreeCost - b.subtreeCost;
 }
