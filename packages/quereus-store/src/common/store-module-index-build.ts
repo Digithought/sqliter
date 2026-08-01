@@ -23,10 +23,10 @@ import { QuereusError, StatusCode, compilePredicate, logicalTypeCanHoldText, ser
 import type { KVEntry, KVStore } from './kv-store.js';
 import {
 	resolveIndexKeyCollations,
+	resolveDedupeKeyTransforms,
 	resolveIndexKeyTransforms,
 	resolvePkKeyCollations,
 	resolvePkKeyTransforms,
-	storeDedupeKeyTransform,
 } from './pk-key-resolution.js';
 import { buildDataKey, buildFullScanBounds, buildIndexKey } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
@@ -88,12 +88,6 @@ export async function buildIndexEntries(
 	// would re-encode a TIMESPAN member under different bytes than DML writes.
 	const pkTransforms = resolvePkKeyTransforms(tableSchema.primaryKeyDefinition, tableSchema.columns);
 	const indexTransforms = resolveIndexKeyTransforms(indexSchema, tableSchema.columns);
-	// Dedupe-SIGNATURE transform, separate from `indexTransforms` above: the signature
-	// must reproduce `JSON_TYPE.compare`'s collation-honoring string-scalar case (which
-	// `serializeKey`'s normalizer applies), while `indexTransforms` must stay the
-	// hard-structural physical key bytes `buildIndexKey` persists. See
-	// `storeDedupeKeyTransform`'s docstring.
-	const dedupeTransforms = indexSchema.columns.map(col => storeDedupeKeyTransform(tableSchema.columns[col.index]?.logicalType));
 	const indexDirections = indexSchema.columns.map(col => !!col.desc);
 
 	const predicate: CompiledPredicate | undefined = indexSchema.predicate
@@ -108,6 +102,13 @@ export async function buildIndexEntries(
 	const indexColIndices = indexSchema.columns.map(col => col.index);
 	const indexNormalizers = seen
 		? indexDedupeNormalizers(tableSchema, indexSchema, normalizers)
+		: undefined;
+	// Deliberately NOT `indexTransforms`: the dedupe signature must reproduce
+	// `JSON_TYPE.compare`'s collation-honoring string-scalar case (which `serializeKey`'s
+	// normalizer applies), while `indexTransforms` stays the hard-structural physical key
+	// bytes `buildIndexKey` persists. See `storeDedupeKeyTransform`'s docstring.
+	const dedupeTransforms = seen
+		? resolveDedupeKeyTransforms(indexColIndices, tableSchema.columns)
 		: undefined;
 
 	let batch = indexStore.batch();
@@ -130,7 +131,7 @@ export async function buildIndexEntries(
 		if (seen) {
 			// The signature returns null when any indexed column is NULL —
 			// SQL UNIQUE allows multiple NULLs, so those rows never collide.
-			const keySig = dedupeRowSignature(row, indexColIndices, indexNormalizers!, dedupeTransforms);
+			const keySig = dedupeRowSignature(row, indexColIndices, indexNormalizers!, dedupeTransforms!);
 			if (keySig !== null) {
 				if (seen.has(keySig)) {
 					const colNames = indexSchema.columns
@@ -352,7 +353,7 @@ async function assertNoDuplicateRows(
 	normalizers: readonly KeyNormalizer[],
 	predicate: CompiledPredicate | undefined,
 ): Promise<void> {
-	const transforms = columnIndices.map(i => storeDedupeKeyTransform(tableSchema.columns[i]?.logicalType));
+	const transforms = resolveDedupeKeyTransforms(columnIndices, tableSchema.columns);
 	const seen = new Set<string>();
 	for await (const row of rows) {
 		if (predicate && predicate.evaluate(row) !== true) continue;

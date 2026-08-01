@@ -898,6 +898,29 @@ describe('StoreTable UNIQUE constraints', () => {
 				await rejects(`CREATE UNIQUE INDEX gjbm_d ON gjbm (d COLLATE NOCASE)`);
 			});
 
+			// The other half of the same fix: the dedupe signature's branch boundary. Only a
+			// TOP-LEVEL string scalar is left for the collation normalizer, because only that
+			// shape is what `JSON_TYPE.compare` routes through the collation it is handed —
+			// `deepCompareJson` (every other node) takes none. A signature that folded more
+			// than that would REJECT builds the write path admits, the mirror-image defect.
+			it('a JSON index COLLATE folds only top-level string scalars, so distinct nodes still build', async () => {
+				for (const using of ['USING store', '']) {
+					const t = using ? 'gjd' : 'gjdm';
+					await db.exec(`CREATE TABLE ${t} (id INTEGER PRIMARY KEY, d JSON) ${using}`);
+					// The JSON string "9" vs the JSON number 9 (the type ranks number < string),
+					// and a NESTED case-variant string leaf, which no collation reaches.
+					await db.exec(`INSERT INTO ${t} VALUES (1, '"9"'), (2, '9'), (3, '["a"]'), (4, '["A"]'), (5, '"b"')`);
+					await db.exec(`CREATE UNIQUE INDEX ${t}_d ON ${t} (d COLLATE NOCASE)`);
+					expect(await collect(db, `SELECT count(*) AS n FROM ${t}`), t).to.deep.equal([{ n: 5 }]);
+					// Write-time still folds the top-level scalar under the index's NOCASE, which
+					// is exactly what the build above had to agree with.
+					await rejects(`INSERT INTO ${t} VALUES (6, '"B"')`);
+					// ...and still does not fold the nested leaf.
+					await db.exec(`INSERT INTO ${t} VALUES (7, '["B"]')`);
+					expect(await collect(db, `SELECT count(*) AS n FROM ${t}`), t).to.deep.equal([{ n: 6 }]);
+				}
+			});
+
 			it('C = BINARY seeks the index (equal collations)', async () => {
 				await db.exec(`CREATE TABLE gq (id INTEGER PRIMARY KEY, b TEXT) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX gq_b ON gq (b)`);

@@ -183,10 +183,19 @@ export function storeSemanticKeyTransform(type: LogicalType | undefined): KeyVal
  * this resolver defers to {@link storeSemanticKeyTransform} unchanged.
  */
 export function storeDedupeKeyTransform(type: LogicalType | undefined): KeyValueTransform | undefined {
-	if (hasSemanticOrdering(type) && type.name === JSON_TYPE.name) {
-		return (v: SqlValue) => (typeof v === 'string' ? v : jsonStructuralKey(v));
-	}
+	if (hasSemanticOrdering(type) && type.name === JSON_TYPE.name) return jsonDedupeKey;
 	return storeSemanticKeyTransform(type);
+}
+
+/**
+ * A declared-JSON value as the UNIQUE dedupe signature must see it: a top-level string
+ * scalar verbatim (so `serializeKey` runs the column's collation normalizer over it,
+ * mirroring `JSON_TYPE.compare`'s collation-honoring string/string branch), every other
+ * node as {@link jsonStructuralKey}'s bytes (mirroring `deepCompareJson`, which takes no
+ * collation — a NESTED string leaf is code-point-compared even under an index COLLATE).
+ */
+function jsonDedupeKey(value: SqlValue): SqlValue {
+	return typeof value === 'string' ? value : jsonStructuralKey(value);
 }
 
 /**
@@ -216,6 +225,20 @@ export function resolveIndexKeyTransforms(
 	columns: ReadonlyArray<ColumnSchema>,
 ): (KeyValueTransform | undefined)[] {
 	return index.columns.map(col => storeSemanticKeyTransform(columns[col.index]?.logicalType));
+}
+
+/**
+ * Per-column {@link storeDedupeKeyTransform} for an arbitrary column-index list —
+ * the UNIQUE dedupe-signature counterpart of {@link resolveIndexKeyTransforms},
+ * shared by both build/validate-time dedupe sites (`buildIndexEntries`' in-pass
+ * `seen` check over an index's columns, `assertNoDuplicateRows` over a constraint's)
+ * so the two cannot drift onto different transforms.
+ */
+export function resolveDedupeKeyTransforms(
+	colIndices: ReadonlyArray<number>,
+	columns: ReadonlyArray<ColumnSchema>,
+): (KeyValueTransform | undefined)[] {
+	return colIndices.map(i => storeDedupeKeyTransform(columns[i]?.logicalType));
 }
 
 /**

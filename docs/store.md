@@ -604,18 +604,39 @@ and existing-row dedup both resolve the collation's key normalizer against the c
 registry, so a custom or overridden collation is honored; a comparator-only collation
 (no `normalizer`) is rejected rather than silently keyed under someone else's bytes.
 
-**JSON (OBJECT-class) PK / index key encoding.** A JSON value keyed as a PK or index
-column encodes through a **canonical JSON string** (`canonicalJsonString` from
-`@quereus/quereus` — recursive object-key sort, array order preserved), not a bare
-`JSON.stringify`. So reorder-equal objects encode to identical key bytes and collide as one
-row (matching `deepCompareJson` and the memory module), while array order stays
-significant. The canonical form governs only the *key* bytes — the stored/displayed row
-value keeps its insertion order (rows round-trip through `serializeRow`/`deserializeRow`,
-independent of the key). **No collation applies** — the canonical string is encoded
-verbatim, mirroring the engine, whose OBJECT-class comparison (`compareSameType`) and key
-serializer (`util/key-serializer.ts`) both ignore the collation for object values. So the
-object-valued members of an `any collate nocase` key stay case-distinct and keep the
-comparator's code-point order, while that column's *text* values still fold under NOCASE.
+**OBJECT-class PK / index key encoding.** An object-valued key member encodes through a
+**canonical JSON string** (`canonicalJsonString` from `@quereus/quereus` — recursive
+object-key sort, array order preserved), not a bare `JSON.stringify`. So reorder-equal
+objects encode to identical key bytes and collide as one row (matching `deepCompareJson`
+and the memory module), while array order stays significant. The canonical form governs
+only the *key* bytes — the stored/displayed row value keeps its insertion order (rows
+round-trip through `serializeRow`/`deserializeRow`, independent of the key). **No collation
+applies** — the canonical string is encoded verbatim, mirroring the engine, whose
+OBJECT-class comparison (`compareSameType`) and key serializer (`util/key-serializer.ts`)
+both ignore the collation for object values. So the object-valued members of an
+`any collate nocase` key stay case-distinct and keep the comparator's code-point order,
+while that column's *text* values still fold under NOCASE.
+
+This canonical-text path serves members with **no declared `json` type** (an `any` column
+holding an object). A member on a column DECLARED `json` takes the store-local
+**structural byte form** instead (`jsonStructuralKey`, `json-key.ts` — see § Order
+preservation and `docs/types.md` § Semantic ordering): same reorder-equal identity, but a
+memcmp order that reproduces `JSON_TYPE.compare` rather than JSON punctuation order. Its
+key bytes are likewise collation-free (a declared-`json` index column keys hard-`BINARY`).
+
+**Where a declared-`json` index column's `COLLATE` *does* bite.** `CREATE UNIQUE INDEX …
+(j COLLATE NOCASE)` over a `json` column is accepted (index DDL applies no type gate), and
+although the key bytes ignore that name, both uniqueness checks honor it on the one shape
+`JSON_TYPE.compare` treats as text — a **top-level string scalar**. Write-time enforcement
+compares through the index's collation; build-time enforcement (`buildIndexEntries`'
+in-pass `seen` check and `validateUniqueIndexOverRows`) signs each value through
+`storeDedupeKeyTransform`, which leaves a top-level string scalar AS a string so
+`serializeKey` runs the collation normalizer over it, and falls back to the structural
+bytes for every other node. Signing a string through the structural bytes instead dropped
+the collation and let `CREATE UNIQUE INDEX` admit rows a later insert then rejected
+(`bug-store-index-build-dedupe-skips-collation`). A **nested** string leaf is unaffected:
+`deepCompareJson` takes no collation, so `["a"]` and `["A"]` stay distinct under any index
+`COLLATE`.
 
 **Index-derived UNIQUE enforcement collation.** A `CREATE UNIQUE INDEX … (col COLLATE x)`
 synthesizes a `derivedFromIndex` UNIQUE constraint whose DML enforcement resolves each
