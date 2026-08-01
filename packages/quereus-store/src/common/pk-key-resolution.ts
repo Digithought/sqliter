@@ -143,6 +143,12 @@ export function resolveIndexKeyCollations(
  * store-local seam. A semantic-ordering type with NEITHER a `groupKey` nor an entry
  * here cannot key a persisted structure soundly; `StoreTable` rejects it at DDL time
  * (see `validateSemanticKeyTransforms`).
+ *
+ * This is the PHYSICAL KEY BYTES resolver — it feeds `buildIndexKey` / `buildDataKey`
+ * and its output is memcmp-ordered and persisted. {@link storeDedupeKeyTransform} is
+ * its build/validate-time twin: same job, but for the transient UNIQUE dedupe
+ * signature, which is free to leave a comparable value for `serializeKey`'s collation
+ * normalizer instead of committing to structural bytes.
  */
 export function storeSemanticKeyTransform(type: LogicalType | undefined): KeyValueTransform | undefined {
 	// Matched by NAME, not object identity (`type === JSON_TYPE`): the engine and this
@@ -152,6 +158,35 @@ export function storeSemanticKeyTransform(type: LogicalType | undefined): KeyVal
 	// gate keeps a hypothetical plain custom type named 'JSON' out of this branch.
 	if (hasSemanticOrdering(type) && type.name === JSON_TYPE.name) return jsonStructuralKey;
 	return semanticKeyTransform(type);
+}
+
+/**
+ * The build/validate-time twin of {@link storeSemanticKeyTransform}, for the UNIQUE
+ * dedupe SIGNATURE rather than physical key bytes (`buildIndexEntries`'s in-pass
+ * `seen` check and `assertNoDuplicateRows`, both in store-module-index-build.ts).
+ *
+ * The signature is a `serializeKey` call over the (possibly transformed) values, and
+ * `serializeKey` applies a column's collation NORMALIZER only to a raw `string` value
+ * — a transform that returns a `Uint8Array` (as {@link storeSemanticKeyTransform} does
+ * for JSON, via {@link jsonStructuralKey}) is tagged as an opaque byte array instead,
+ * and the normalizer never runs. For JSON that would silently drop the index
+ * COLLATE on exactly the case `JSON_TYPE.compare` treats as text (a string-scalar
+ * pair) and let a build-time UNIQUE index admit rows a write-time insert would then
+ * reject (bug-store-index-build-dedupe-skips-collation) — so this resolver special-
+ * cases JSON: a string scalar is left AS a string, so `serializeKey`'s normalizer
+ * still runs; every other JSON value (object, array, number, boolean, or null) falls
+ * back to the structural bytes, matching `JSON_TYPE.compare`'s non-text ranking.
+ *
+ * Every other semantic-ordering type (TIMESPAN today) is unaffected: its `compare`
+ * ignores the collation it is handed, and its `groupKey` transform already collides
+ * every equal-identity spelling onto one value on both the build and write paths, so
+ * this resolver defers to {@link storeSemanticKeyTransform} unchanged.
+ */
+export function storeDedupeKeyTransform(type: LogicalType | undefined): KeyValueTransform | undefined {
+	if (hasSemanticOrdering(type) && type.name === JSON_TYPE.name) {
+		return (v: SqlValue) => (typeof v === 'string' ? v : jsonStructuralKey(v));
+	}
+	return storeSemanticKeyTransform(type);
 }
 
 /**

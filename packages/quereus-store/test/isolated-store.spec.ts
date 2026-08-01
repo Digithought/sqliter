@@ -906,6 +906,27 @@ describe('Isolated Store Module', () => {
 			await db.exec('ROLLBACK');
 		});
 
+		it('CREATE UNIQUE INDEX … COLLATE NOCASE over a JSON column is rejected for pending NOCASE-equal rows (wrapper dedupe)', async () => {
+			// bug-store-index-build-dedupe-skips-collation, wrapper-path arm: mid-transaction
+			// DDL routes the build through `validateUniqueIndexOverRows` (this module's
+			// `rows()` callback) instead of `buildIndexEntries`' own in-pass check, so the
+			// dedupe-signature fix must cover that call site too, not just the committed-row
+			// path pinned in unique-constraints.spec.ts.
+			await db.exec(`CREATE TABLE ddl_tx_j (id INTEGER PRIMARY KEY, d JSON) USING store`);
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO ddl_tx_j VALUES (1, '"a"')`);
+			await db.exec(`INSERT INTO ddl_tx_j VALUES (2, '"A"')`);
+
+			await expectUniqueRejection(`CREATE UNIQUE INDEX ddl_tx_j_ix ON ddl_tx_j (d COLLATE NOCASE)`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, d FROM ddl_tx_j ORDER BY id`));
+			expect(rows, 'both staged rows survive the rejected CREATE INDEX').to.deep.equal([
+				{ id: 1, d: 'a' },
+				{ id: 2, d: 'A' },
+			]);
+			await db.exec('ROLLBACK');
+		});
+
 		it('accepted CREATE UNIQUE INDEX rebuilds the overlay and preserves its rows and tombstones', async () => {
 			await db.exec(`INSERT INTO ddl_tx VALUES (1, 'a')`);
 			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'a')`);

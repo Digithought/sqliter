@@ -26,7 +26,7 @@ import {
 	resolveIndexKeyTransforms,
 	resolvePkKeyCollations,
 	resolvePkKeyTransforms,
-	storeSemanticKeyTransform,
+	storeDedupeKeyTransform,
 } from './pk-key-resolution.js';
 import { buildDataKey, buildFullScanBounds, buildIndexKey } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
@@ -88,6 +88,12 @@ export async function buildIndexEntries(
 	// would re-encode a TIMESPAN member under different bytes than DML writes.
 	const pkTransforms = resolvePkKeyTransforms(tableSchema.primaryKeyDefinition, tableSchema.columns);
 	const indexTransforms = resolveIndexKeyTransforms(indexSchema, tableSchema.columns);
+	// Dedupe-SIGNATURE transform, separate from `indexTransforms` above: the signature
+	// must reproduce `JSON_TYPE.compare`'s collation-honoring string-scalar case (which
+	// `serializeKey`'s normalizer applies), while `indexTransforms` must stay the
+	// hard-structural physical key bytes `buildIndexKey` persists. See
+	// `storeDedupeKeyTransform`'s docstring.
+	const dedupeTransforms = indexSchema.columns.map(col => storeDedupeKeyTransform(tableSchema.columns[col.index]?.logicalType));
 	const indexDirections = indexSchema.columns.map(col => !!col.desc);
 
 	const predicate: CompiledPredicate | undefined = indexSchema.predicate
@@ -124,7 +130,7 @@ export async function buildIndexEntries(
 		if (seen) {
 			// The signature returns null when any indexed column is NULL —
 			// SQL UNIQUE allows multiple NULLs, so those rows never collide.
-			const keySig = dedupeRowSignature(row, indexColIndices, indexNormalizers!, indexTransforms);
+			const keySig = dedupeRowSignature(row, indexColIndices, indexNormalizers!, dedupeTransforms);
 			if (keySig !== null) {
 				if (seen.has(keySig)) {
 					const colNames = indexSchema.columns
@@ -272,6 +278,19 @@ export function effectiveDdlRows(table: StoreTable, rows?: EffectiveRowSource): 
  * of its collation (the signature serializer normalizes only string values), so a comparator-only
  * collation named on an integer column is not rejected here when the engine's own hash sites
  * would accept it.
+ *
+ * NOTE: a JSON (or other collation-blind-but-text-capable) index column with a
+ * comparator-only custom collation (registered with no key normalizer) passes DDL —
+ * `assertIndexKeyCollationsCanKey` checks `resolveIndexKeyCollations`, which keys such a
+ * column hard-`BINARY` regardless of the declared name, and `BINARY` always has a
+ * normalizer — but THIS resolver looks up the column's own declared name (JSON can hold
+ * text, so it takes the textual branch above), and `keyNormalizers` throws for a name with
+ * no registered normalizer. The DDL-time check and this one are asking two different
+ * questions (can the physical key encode vs. can the dedupe signature encode) and can
+ * disagree. Confirmed by inspection, not exercised by a test: this surfaces as a thrown
+ * error at `CREATE UNIQUE INDEX` — confusing, since the same statement's key-collation gate
+ * just passed — but not a correctness hole (no bad state is built). If this needs a
+ * friendlier message, that is a follow-up, not implied by this ticket.
  */
 function indexDedupeNormalizers(
 	tableSchema: TableSchema,
@@ -288,12 +307,21 @@ function indexDedupeNormalizers(
 
 /**
  * Collation- and identity-aware dedupe signature of `row` over `colIndices`: each value
- * runs through its column's key transform (`storeSemanticKeyTransform` — TIMESPAN's
+ * runs through its column's key transform (`storeDedupeKeyTransform` — TIMESPAN's
  * total-seconds `groupKey`, so 'PT1H' and 'PT60M' sign identically; JSON's structural
- * bytes, so reorder-equal objects sign identically) before `serializeKey` applies the
- * per-column normalizer. Returns null when any covered value
+ * bytes for everything but a string scalar, so reorder-equal objects sign identically
+ * while a string scalar is left for `serializeKey`'s normalizer) before `serializeKey`
+ * applies the per-column normalizer. Returns null when any covered value
  * is NULL (SQL UNIQUE allows multiple NULLs). The build/validate-time twin of the
  * write-time typed compare in `StoreTable.uniqueColumnComparators`.
+ *
+ * NOTE: `transforms` normalizes STRING values only through `serializeKey`'s collation
+ * normalizer — a transform whose output is a `Uint8Array` (as `storeSemanticKeyTransform`
+ * would produce) bypasses that normalizer entirely (`serializeKey` tags a byte array
+ * `x:` and never consults it). So any future semantic-ordering logical type that BOTH
+ * carries a key transform AND honors a collation in its `compare` (like JSON_TYPE) needs
+ * its own `storeDedupeKeyTransform` branch, or its build-time UNIQUE check silently
+ * degrades to BINARY while the write-time check honors the collation.
  */
 function dedupeRowSignature(
 	row: Row,
@@ -324,7 +352,7 @@ async function assertNoDuplicateRows(
 	normalizers: readonly KeyNormalizer[],
 	predicate: CompiledPredicate | undefined,
 ): Promise<void> {
-	const transforms = columnIndices.map(i => storeSemanticKeyTransform(tableSchema.columns[i]?.logicalType));
+	const transforms = columnIndices.map(i => storeDedupeKeyTransform(tableSchema.columns[i]?.logicalType));
 	const seen = new Set<string>();
 	for await (const row of rows) {
 		if (predicate && predicate.evaluate(row) !== true) continue;

@@ -385,8 +385,14 @@ export function logicalTypeCanHoldText(logicalType: LogicalType | undefined): bo
  * non-BINARY collation would bucket
  * `'A'` and `'a'` together even though the comparator that actually orders/equates
  * primary keys treats them as distinct, silently merging two rows into one. (Those
- * types also declare `supportedCollations: []`, so DDL rejects a non-BINARY COLLATE
- * on them anyway — the hard-coding is a backstop, not the primary gate.)
+ * types also declare `supportedCollations: []`, so COLUMN DDL rejects a non-BINARY
+ * COLLATE on them — but that gate is `validateCollationForType`, which only a column's
+ * OWN declared collation goes through. An INDEX column's collation is resolved by
+ * `SchemaManager.buildIndexSchema` — and its rehydrate twin `importIndex` — with a bare
+ * `normalizeCollationName(collation || tableColSchema.collation || 'BINARY')` and no
+ * type gate at all, so a non-BINARY index COLLATE on one of these types reaches here
+ * uncaught. For an index column this hard-coding is therefore the ONLY gate, not a
+ * backstop.)
  *
  * Mirrors {@link resolvePkKeyCollations} in `quereus-store`, which makes the identical
  * decision for the store's on-disk PK key encoding; the isolation overlay's modified-PK

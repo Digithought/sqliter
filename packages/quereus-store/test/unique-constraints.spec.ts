@@ -873,6 +873,31 @@ describe('StoreTable UNIQUE constraints', () => {
 				expect(await collect(db, `SELECT count(*) AS n FROM gj`)).to.deep.equal([{ n: 1 }]);
 			});
 
+			// bug-store-index-build-dedupe-skips-collation: the BUILD-time dedupe used to
+			// sign JSON values through the structural-bytes key transform, which
+			// `serializeKey` tags as an opaque byte array and never runs the NOCASE
+			// normalizer over — so `CREATE UNIQUE INDEX` admitted 'a'/'A' that a later
+			// WRITE-time insert (routed through `JSON_TYPE.compare`, which honors the
+			// collation for a string-scalar pair, matching the test above) would then
+			// reject. Memory is the oracle: both backends must reject the build too.
+			//
+			// TIMESPAN and plain TEXT are already pinned as build/write-agreement controls
+			// elsewhere in this suite — TIMESPAN in
+			// timespan-semantic-key-identity.spec.ts ("rejects `create unique index` over
+			// existing equal-elapsed spellings"), TEXT just above in
+			// "build-time dedup and DML enforcement agree on the index collation" — so
+			// they are not repeated here.
+			it('a JSON column with pre-existing NOCASE-equal rows rejects CREATE UNIQUE INDEX … COLLATE NOCASE', async () => {
+				await db.exec(`CREATE TABLE gjb (id INTEGER PRIMARY KEY, d JSON) USING store(collation = 'BINARY')`);
+				await db.exec(`INSERT INTO gjb VALUES (1, '"a"'), (2, '"A"')`);
+				await rejects(`CREATE UNIQUE INDEX gjb_d ON gjb (d COLLATE NOCASE)`);
+				expect(await collect(db, `SELECT count(*) AS n FROM gjb`)).to.deep.equal([{ n: 2 }]);
+
+				await db.exec(`CREATE TABLE gjbm (id INTEGER PRIMARY KEY, d JSON)`);
+				await db.exec(`INSERT INTO gjbm VALUES (1, '"a"'), (2, '"A"')`);
+				await rejects(`CREATE UNIQUE INDEX gjbm_d ON gjbm (d COLLATE NOCASE)`);
+			});
+
 			it('C = BINARY seeks the index (equal collations)', async () => {
 				await db.exec(`CREATE TABLE gq (id INTEGER PRIMARY KEY, b TEXT) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX gq_b ON gq (b)`);
