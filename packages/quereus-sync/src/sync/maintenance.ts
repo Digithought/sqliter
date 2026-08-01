@@ -25,7 +25,7 @@
 export const SYNC_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
- * Minimal structural view of the four host-driven sweeps the loop calls. Avoids
+ * Minimal structural view of the five host-driven sweeps the loop calls. Avoids
  * depending on the full `SyncManager` surface and keeps test fakes tiny — a
  * `SyncManager` is structurally assignable to this.
  */
