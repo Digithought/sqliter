@@ -40,8 +40,9 @@ import { jsonStructuralKey } from './json-key.js';
  *     column carries none.
  *   - text-capable but collation-blind member — `json` and the temporal types
  *     (`date` / `time` / `datetime` / `timespan`) → hard-coded `'BINARY'`: those
- *     types' `compare` ignores the collation argument (and their empty
- *     `supportedCollations` list keeps a non-BINARY column COLLATE out at DDL time).
+ *     types' `compare` is not the generic storage-class + collation comparison (the
+ *     temporals ignore the argument; JSON ranks structurally), and their empty
+ *     `supportedCollations` list keeps a non-BINARY column COLLATE out at DDL time.
  *   - never-text member → `undefined`: collation is meaningless for
  *     integer/real/blob keys (they encode type-natively), so the encoder ignores
  *     it and the data/index key bytes are identical regardless.
@@ -84,7 +85,7 @@ export function resolvePkKeyCollations(
  *   - never-text column (`integer`, `real`, `blob`) → `undefined`: encoded
  *     type-natively, collation is moot.
  *   - text-capable but collation-blind (`json`, the temporal types) → hard-coded
- *     `'BINARY'` — those types' `compare` ignores collation.
+ *     `'BINARY'` — those types' `compare` is not the generic collation comparison.
  *   - collation-aware (`text`, `any`) → the index column's own COLLATE, else the
  *     table column's declared collation, else `'BINARY'`.
  *

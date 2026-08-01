@@ -379,8 +379,10 @@ export function logicalTypeCanHoldText(logicalType: LogicalType | undefined): bo
  *
  * A text-capable-but-collation-blind column — `json`, the temporal types — gets
  * hard-coded `'BINARY'` regardless of any declared collation: those types' `compare`
- * ignores the collation argument (the temporals compare under BINARY_COLLATION; JSON
- * structurally), so keying such a column under a non-BINARY collation would bucket
+ * is not the generic storage-class + collation comparison (the temporals ignore the
+ * argument and compare under BINARY_COLLATION; JSON ranks structurally, applying the
+ * collation only to a string-scalar pair), so keying such a column under a
+ * non-BINARY collation would bucket
  * `'A'` and `'a'` together even though the comparator that actually orders/equates
  * primary keys treats them as distinct, silently merging two rows into one. (Those
  * types also declare `supportedCollations: []`, so DDL rejects a non-BINARY COLLATE

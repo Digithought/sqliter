@@ -145,7 +145,7 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
   // JSON string so reorder-equal values ({a:1,b:2} vs {b:2,a:1}) encode to the
   // same bytes, matching the in-memory JSON comparator. Arrays stay positional.
   if (typeof value === 'object') {
-    return encodeObject(canonicalJsonString(value as JsonSqlValue), collation, normalizers);
+    return encodeObject(canonicalJsonString(value as JsonSqlValue));
   }
 
   throw new Error(`Cannot encode value of type ${typeof value}`);
@@ -164,8 +164,9 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
  * composite primary key can carry a *per-column* key collation (e.g. a BINARY
  * member alongside a NOCASE member) rather than one collation for the whole key.
  * A `undefined` entry (or no array) falls back to `options.collation`. Collation
- * only affects TEXT/OBJECT encoding; non-text components ignore it, so a
- * per-column override on an integer/real/blob member is a harmless no-op.
+ * only affects TEXT encoding; every other storage class — including OBJECT, see
+ * {@link encodeObject} — ignores it, so a per-column override on an
+ * integer/real/blob/object member is a harmless no-op.
  *
  * When `transforms` is provided, each position with a defined entry maps its value
  * through that {@link KeyValueTransform} BEFORE encoding (and before DESC inversion),
@@ -426,13 +427,17 @@ function encodeBlob(value: Uint8Array): Uint8Array {
  * resolved by `storeSemanticKeyTransform`) maps the value to a `Uint8Array` first, so
  * it encodes through the BLOB path in structural `compare` order instead.
  *
- * NOTE: the collation normalizer runs over the CANONICAL JSON STRING, not over the
- * object's text leaves — under the default NOCASE that already lowercases object keys
- * and string values inside the key bytes, and a normalizer that reorders or deletes
- * characters can leave a string `decodeObject` cannot `JSON.parse`. Latent today:
- * nothing in the row path decodes an object key (rows are serialized separately, and
- * `decodeCompositeKey` has no `src/` caller). If an object-valued key ever has to be
- * decoded, normalize the leaves before canonicalization rather than the string after.
+ * Deliberately takes NO collation: the canonical string is encoded verbatim. Collation
+ * never reaches an OBJECT-class value in the engine — `compareSameType` consults the
+ * collation function only on the TEXT/TEXT branch, and the engine's own key serializer
+ * (`util/key-serializer.ts`) normalizes only string values — so folding the canonical
+ * string here would make key identity/order disagree with the comparator that governs
+ * the structure. That mattered the moment `any collate nocase` became a real key
+ * collation (ticket `any-type-compare-honors-collation`): an object-valued member of
+ * such a PK collided at one lowercased key (`{"A":1}` vs `{"a":1}`) while the memory
+ * backend kept them distinct, and `order by` over the folded bytes inverted the
+ * comparator's code-point order. Encoding verbatim also keeps the bytes `JSON.parse`-able,
+ * which a character-deleting normalizer (RTRIM) would not.
  *
  * NOTE: no unpaired-surrogate guard here, unlike `encodeText`. `canonicalJsonString` ends
  * in `JSON.stringify`, which is well-formed (ES2019): it escapes every lone surrogate to
@@ -441,9 +446,8 @@ function encodeBlob(value: Uint8Array): Uint8Array {
  * `JSON.stringify` (or gains a `rawJSON` passthrough), that escaping is lost and this must
  * call `assertNoUnpairedSurrogate` too.
  */
-function encodeObject(jsonString: string, collation: string, normalizers: KeyNormalizerResolver): Uint8Array {
-  const sortValue = normalizers(collation)(jsonString);
-  const utf8 = new TextEncoder().encode(sortValue);
+function encodeObject(jsonString: string): Uint8Array {
+  const utf8 = new TextEncoder().encode(jsonString);
   return writeEscapedWithTerminator(TYPE_OBJECT, utf8);
 }
 

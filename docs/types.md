@@ -277,7 +277,9 @@ structures under the column's collation". A key structure built over a column
 bytes, the isolation overlay's shadow keys — resolved through `pkKeyCollationName`)
 keys a collation-aware column under its declared COLLATE, so `k any collate nocase`
 enforces and orders case-insensitively everywhere; a collation-blind type (JSON, the
-temporals — their `compare` ignores the argument) keys hard-BINARY regardless.
+temporals — whose `compare` is not the generic storage-class + collation comparison:
+the temporals ignore the argument, JSON ranks structurally and applies the collation
+only to a string-scalar pair) keys hard-BINARY regardless.
 Creating an index therefore never changes a query's answer for either kind.
 
 The flag keys on the **declared** logical type of the column/expression, not the

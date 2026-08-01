@@ -169,6 +169,39 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			expect((await db.get(`select v from t2 where k = 'a'`))?.v, 'NOCASE point lookup finds the case variant')
 				.to.equal('upper');
 		});
+
+		it('keeps OBJECT-class members of an `any collate nocase` PK collation-blind', async () => {
+			// The declared COLLATE governs the column's TEXT values only. `compareSameType`
+			// consults the collation function on the TEXT/TEXT branch alone, so two object
+			// values differing in the case of an object key are DISTINCT to every engine
+			// comparator — `encodeObject` must therefore encode the canonical string
+			// verbatim, not through the collation's key normalizer.
+			await db.exec(`create table t (k any collate nocase primary key, v text) using store`);
+			await db.exec(`create table m (k any collate nocase primary key, v text)`);
+
+			for (const t of ['t', 'm']) {
+				await db.exec(`insert into ${t} values (json('{"A":1}'), 'upper')`);
+				expect(await attempt(db, `insert into ${t} values (json('{"a":1}'), 'lower')`), `${t} must accept both`)
+					.to.be.null;
+				expect((await db.get(`select count(*) as cnt from ${t}`))?.cnt).to.equal(2);
+			}
+
+			// …and their order is the comparator's code-point order over the canonical
+			// strings, which lowercased key bytes would invert ('B' < 'a', but 'b' > 'a').
+			await db.exec(`create table t3 (k any collate nocase primary key) using store`);
+			await db.exec(`create table m3 (k any collate nocase primary key)`);
+			for (const t of ['t3', 'm3']) {
+				await db.exec(`insert into ${t} values (json('{"B":1}')), (json('{"a":2}'))`);
+			}
+			expect(await column(db, `select k from t3 order by k`, 'k'))
+				.to.deep.equal(await column(db, `select k from m3 order by k`, 'k'));
+
+			// A TEXT value in the same column still folds — the collation is not inert.
+			await db.exec(`create table t4 (k any collate nocase primary key) using store`);
+			await db.exec(`insert into t4 values ('Bob')`);
+			expect(await attempt(db, `insert into t4 values ('BOB')`), 'text members still enforce NOCASE')
+				.to.not.be.null;
+		});
 	});
 
 	describe('the read-side gate that BINARY keying un-declines', () => {

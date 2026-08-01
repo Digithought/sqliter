@@ -70,3 +70,23 @@ insert into u4 values (3, 'zed');
 select count(distinct v) as dv from u4;
 → [{"dv":2}]
 drop table u4;
+
+-- Case 5: the identity paths — row DISTINCT, GROUP BY, aggregate DISTINCT, min/max
+-- — all collapse case variants of an `any collate nocase` column, and an index does
+-- not move any of those answers either.
+create table t5 (id integer primary key, v any collate nocase);
+insert into t5 values (1, 'Bob'), (2, 'BOB'), (3, 'zed');
+select distinct v from t5 order by v;
+→ [{"v":"Bob"},{"v":"zed"}]
+select v, count(*) as n from t5 group by v order by v;
+→ [{"v":"Bob","n":2},{"v":"zed","n":1}]
+select count(distinct v) as dv, min(v) as lo, max(v) as hi from t5;
+→ [{"dv":2,"lo":"Bob","hi":"zed"}]
+create index ix5 on t5 (v);
+select distinct v from t5 order by v;
+→ [{"v":"Bob"},{"v":"zed"}]
+select v, count(*) as n from t5 group by v order by v;
+→ [{"v":"Bob","n":2},{"v":"zed","n":1}]
+select count(distinct v) as dv, min(v) as lo, max(v) as hi from t5;
+→ [{"dv":2,"lo":"Bob","hi":"zed"}]
+drop table t5;

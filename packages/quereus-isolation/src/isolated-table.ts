@@ -506,8 +506,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// (`text`, `any` — types whose `compare` honors the collation it is handed) keys
 		// under its own declared collation; a collation-blind text-capable column
 		// (`json`, the temporal types) is keyed under `'BINARY'` regardless, since PK
-		// equality compares those types through `logicalType.compare`, which ignores
-		// the collation argument.
+		// equality compares those types through `logicalType.compare`, which is not the
+		// generic collation comparison (the temporals ignore the argument; JSON ranks
+		// structurally).
 		const pkNormalizers = pkIndices.map(i => {
 			const column = this.tableSchema!.columns[i];
 			return this.keyNormalizerResolver(pkKeyCollationName(column));

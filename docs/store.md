@@ -517,7 +517,9 @@ analysis, and UNIQUE enforcement compare under. The schema entry points:
 - **A PK column that can hold text but is collation-blind** — `json` and the temporal
   types `date` / `time` / `datetime` / `timespan` — is keyed under **hard-coded
   `BINARY`**, never under a declared collation and never under K. Those types' `compare`
-  ignores the collation argument `createTypedComparator` hands it, so keying such a
+  is not the generic storage-class + collation comparison — the temporals ignore the
+  argument `createTypedComparator` hands them, and JSON ranks structurally, applying the
+  collation only to a string-scalar pair — so keying such a
   column under anything but BINARY would enforce uniqueness under one collation and
   compare under another — `'A'` and `'a'` are distinct to the comparator but would
   collide at one NOCASE key, so a second `insert` would be spuriously rejected and an
@@ -609,7 +611,11 @@ column encodes through a **canonical JSON string** (`canonicalJsonString` from
 row (matching `deepCompareJson` and the memory module), while array order stays
 significant. The canonical form governs only the *key* bytes — the stored/displayed row
 value keeps its insertion order (rows round-trip through `serializeRow`/`deserializeRow`,
-independent of the key). Collation still applies to the canonical string as for text.
+independent of the key). **No collation applies** — the canonical string is encoded
+verbatim, mirroring the engine, whose OBJECT-class comparison (`compareSameType`) and key
+serializer (`util/key-serializer.ts`) both ignore the collation for object values. So the
+object-valued members of an `any collate nocase` key stay case-distinct and keep the
+comparator's code-point order, while that column's *text* values still fold under NOCASE.
 
 **Index-derived UNIQUE enforcement collation.** A `CREATE UNIQUE INDEX … (col COLLATE x)`
 synthesizes a `derivedFromIndex` UNIQUE constraint whose DML enforcement resolves each
@@ -960,7 +966,7 @@ collation). Both index arms ask only whether those two agree:
   since a byte window also equates memcmp of the key bytes with the comparator's order.
 
 The one shape where the two do **not** agree is a collation-blind column (`json`, the
-temporal types — their `compare` ignores the collation argument) under an index column
+temporal types — whose `compare` is not the generic collation comparison) under an index column
 carrying an explicit non-`BINARY` `COLLATE` (index DDL does not type-gate the way column
 DDL does). Those key hard-`BINARY` while the filter still compares under the declared
 name, so both arms decline and the query full-scans. Declining costs the seek, never a

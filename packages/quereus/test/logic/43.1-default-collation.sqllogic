@@ -64,6 +64,20 @@ select name, collation from table_info('t_json') order by cid;
 
 drop table t_json;
 
+-- `any` declares no supported-collation list either, so it stays BINARY too.
+-- This matters since `ANY_TYPE.compare` began honoring its collation argument
+-- (ticket any-type-compare-honors-collation): an undecorated `any` column must
+-- keep comparing — and keying — BINARY, so only an explicit COLLATE moves it.
+create table t_any (id integer primary key, v any);
+select name, collation from table_info('t_any') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"v","collation":"BINARY"}]
+
+insert into t_any values (1, 'a');
+select count(*) as n from t_any where v = 'A';
+→ [{"n":0}]
+
+drop table t_any;
+
 -- ===================================
 -- 4. Explicit COLLATE always wins over the default.
 -- ===================================
