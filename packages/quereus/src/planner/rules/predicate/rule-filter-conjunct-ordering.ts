@@ -108,7 +108,15 @@ export function ruleFilterConjunctOrdering(node: PlanNode, context: OptContext):
  * `statsOnlySelectivity`, the source exposes no base-column origins (HAVING over
  * an aggregate, a set operation, a `values` clause, …), or no conjunct could be
  * estimated. The provider check comes first so the origins walk — a full pass
- * over the source subtree — is only paid when an estimate is possible.
+ * over the source subtree — is skipped outright for a provider that omits the
+ * method.
+ *
+ * NOTE (tripwire): that short-circuit does NOT help the production
+ * `CatalogStatsProvider`, which always implements `statsOnlySelectivity`. A
+ * database with nothing ANALYZEd therefore still pays one origins walk per
+ * multi-conjunct Filter here, on top of the one `rule-filter-selectivity`
+ * already pays. Unmeasured; if it ever profiles hot, memoize the map per pass on
+ * OptContext keyed by the source node — the fix noted at that rule.
  */
 function estimateSelectivities(
 	filter: FilterNode,

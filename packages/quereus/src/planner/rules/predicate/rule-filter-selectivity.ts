@@ -64,14 +64,9 @@ import { extractRowSourceTableSchema } from '../../util/key-utils.js';
 import { collectColumnOrigins, type ColumnOrigin, type RelationInstance } from '../../util/column-origins.js';
 import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { combineConjunctive } from '../../stats/selectivity-combine.js';
-import { estimateConjunctSelectivity, makeColumnStatsResolver, CROSS_RELATION_INEQUALITY_SELECTIVITY } from '../../stats/conjunct-selectivity.js';
+import { estimateConjunctSelectivity, makeColumnStatsResolver } from '../../stats/conjunct-selectivity.js';
 
 const log = createLogger('optimizer:rule:filter-selectivity');
-
-// Re-exported from its original home so existing importers (including
-// test/optimizer/filter-selectivity.spec.ts) keep working; the definition now
-// lives with the shared per-conjunct estimator.
-export { CROSS_RELATION_INEQUALITY_SELECTIVITY };
 
 export function ruleFilterSelectivity(node: PlanNode, context: OptContext): PlanNode | null {
 	const filter = node as FilterNode;

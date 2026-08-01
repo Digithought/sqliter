@@ -84,7 +84,8 @@ export const UNKNOWN_CONJUNCT_SELECTIVITY = DEFAULT_FILTER_SELECTIVITY;
 /**
  * Divide-by-zero guard only. `PlanNode.estimatedCost` defaults to 0.01 and the
  * leaf scalar nodes cost 1, so no real conjunct has zero subtree cost; the floor
- * just guarantees the ratio can never be Infinity or NaN.
+ * keeps a zero from turning the ratio into Infinity. It cannot repair a NaN
+ * cost — but `getTotalCost()` sums finite per-node costs, so none arises.
  */
 export const MIN_CONJUNCT_COST = 1e-9;
 

@@ -78,13 +78,17 @@ describe('WHERE conjunct cost ordering', () => {
 		await db.close();
 	});
 
-	/** The FULL (unoptimized) predicate's Filter, for direct rule invocation. */
-	function rawFilter(sql: string): FilterNode {
+	/**
+	 * The FULL (unoptimized) predicate's Filter, for direct rule invocation.
+	 * `needle` selects among several — a join plan has one Filter per `on`
+	 * clause as well as the `where` one; the default picks the first.
+	 */
+	function rawFilter(sql: string, needle = ''): FilterNode {
 		const ast = new Parser().parse(sql) as unknown as AST.Statement;
 		const { plan } = db._buildPlan([ast]);
-		const filters = findFilters(plan);
-		if (filters.length === 0) throw new Error(`no FilterNode in raw plan for: ${sql}`);
-		return filters[0];
+		const filter = findFilters(plan).find(f => f.toString().includes(needle));
+		if (!filter) throw new Error(`no Filter mentioning '${needle}' in raw plan for: ${sql}`);
+		return filter;
 	}
 
 	/** All FilterNodes in the OPTIMIZED plan for `sql`. */
@@ -383,6 +387,41 @@ describe('WHERE conjunct cost ordering', () => {
 			// The key depends only on the node and context.stats (stable within one
 			// optimize()), so the rule's own output must be its fixed point.
 			expect(ruleFilterConjunctOrdering(reordered as FilterNode, context), 'fixed point in the mixed case').to.be.null;
+		});
+
+		it('sinks a measured-WEAK conjunct behind an unknown one (the neutral cuts both ways)', async () => {
+			await createSelectivityTable('wa', true);
+			// The mirror of the test above, and the arm cost alone cannot express:
+			// `strong <> 3` estimates 1 - 1/50 = 0.98 — measurably WEAKER than the
+			// 0.5 neutral — and is also the CHEAPER subtree, so the cost-only rule
+			// leaves it first and returns null. `weak + 0 = 1` is out of the
+			// catalog's reach (the column is not a bare child of the comparison) →
+			// unknown → neutral 0.5, whose higher benefit now wins.
+			const filter = rawFilter('select id from wa where strong <> 3 and weak + 0 = 1');
+			const reordered = ruleFilterConjunctOrdering(filter, context);
+			expect(reordered, 'the measured-weak conjunct must move behind the unknown').to.be.instanceOf(FilterNode);
+			const detail = (reordered as FilterNode).toString();
+			expect(detail.indexOf('strong'), detail).to.be.greaterThan(-1);
+			expect(detail.indexOf('weak'), detail).to.be.lessThan(detail.indexOf('strong'));
+		});
+
+		it('ranks conjuncts over a JOIN source, attributing each to its own relation', async () => {
+			await createSelectivityTable('wa', true);
+			await createSelectivityTable('wb', true);
+			// The same reversal, but reached through a MULTI-relation origins map:
+			// `a.strong <> 3` is attributed to wa (0.98) and `b.weak + 0 = 1` to wb
+			// (unestimable → neutral). Covers the ordering rule's use of the shared
+			// estimator on a source spanning several base tables, which is the shape
+			// `rule-predicate-pushdown` leaves behind for every filter over a join.
+			const filter = rawFilter(
+				'select a.id from wa a join wb b on a.id = b.id where a.strong <> 3 and b.weak + 0 = 1',
+				'strong',
+			);
+			const reordered = ruleFilterConjunctOrdering(filter, context);
+			expect(reordered, 'statistics must reach conjuncts over a join source too').to.be.instanceOf(FilterNode);
+			const detail = (reordered as FilterNode).toString();
+			expect(detail.indexOf('strong'), detail).to.be.greaterThan(-1);
+			expect(detail.indexOf('weak'), detail).to.be.lessThan(detail.indexOf('strong'));
 		});
 
 		it('keeps a statistics-strong Subquery-tier conjunct behind a weak Pure one', async () => {

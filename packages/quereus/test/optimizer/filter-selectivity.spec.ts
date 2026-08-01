@@ -16,7 +16,7 @@ import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { FilterNode, DEFAULT_FILTER_SELECTIVITY } from '../../src/planner/nodes/filter.js';
 import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
 import { combineConjunctive, combineDisjunctive } from '../../src/planner/stats/selectivity-combine.js';
-import { CROSS_RELATION_INEQUALITY_SELECTIVITY } from '../../src/planner/rules/predicate/rule-filter-selectivity.js';
+import { CROSS_RELATION_INEQUALITY_SELECTIVITY } from '../../src/planner/stats/conjunct-selectivity.js';
 import { extractTableSchema, extractRowSourceTableSchema } from '../../src/planner/util/key-utils.js';
 import type { RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { Parser } from '../../src/parser/parser.js';
