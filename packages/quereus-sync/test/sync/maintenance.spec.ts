@@ -32,6 +32,7 @@ const ALL_SWEEPS: SweepName[] = [
   'drainHeldChanges',
   'pruneQuarantine',
   'pruneTombstones',
+  'repairChangeLog',
   'evictExpiredBasisTables',
 ];
 
@@ -61,13 +62,14 @@ function makeFakeTarget(
       drainHeldChanges: sweep('drainHeldChanges'),
       pruneQuarantine: sweep('pruneQuarantine'),
       pruneTombstones: sweep('pruneTombstones'),
+      repairChangeLog: sweep('repairChangeLog'),
       evictExpiredBasisTables: sweep('evictExpiredBasisTables'),
     },
   };
 }
 
 describe('runSyncMaintenancePass', () => {
-  it('runs all four sweeps once, in order (drain → pruneQuarantine → pruneTombstones → evict)', async () => {
+  it('runs all five sweeps once, in order (drain → pruneQuarantine → pruneTombstones → repairChangeLog → evict)', async () => {
     const { target, calls } = makeFakeTarget();
     const { log, entries } = makeLogger();
 
@@ -77,7 +79,7 @@ describe('runSyncMaintenancePass', () => {
     expect(entries).to.deep.equal([]);
   });
 
-  it('isolates a failing sweep: the other three still run, the pass resolves, the failure is logged once', async () => {
+  it('isolates a failing sweep: the other four still run, the pass resolves, the failure is logged once', async () => {
     const boom = new Error('quarantine boom');
     const { target, calls } = makeFakeTarget({
       pruneQuarantine: () => Promise.reject(boom),
@@ -86,7 +88,7 @@ describe('runSyncMaintenancePass', () => {
 
     expect(await runSyncMaintenancePass(target, log)).to.be.undefined;
 
-    // All four were still invoked despite the second one rejecting.
+    // All five were still invoked despite the second one rejecting.
     expect(calls).to.deep.equal(ALL_SWEEPS);
     expect(entries).to.deep.equal([['pruneQuarantine', boom]]);
   });
@@ -132,7 +134,7 @@ describe('createSyncMaintenanceTicker', () => {
     gate.resolve(0); // release the first pass
     await first;
 
-    // The first pass completed all four sweeps exactly once.
+    // The first pass completed all five sweeps exactly once.
     expect(calls).to.deep.equal(ALL_SWEEPS);
 
     // Once settled, the guard re-arms: a fresh tick runs a full pass again.

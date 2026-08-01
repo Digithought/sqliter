@@ -1481,6 +1481,48 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return this.quarantine.pruneOlderThan(cutoff);
 	}
 
+	/**
+	 * One-shot repair pass over the whole change log: delete every entry whose
+	 * target ({@link resolveLogEntry}) is already gone.
+	 *
+	 * {@link pruneTombstones} / `deleteRowVersionsAndLogEntries` (`sync-context.ts`)
+	 * only stop *new* orphans — each deletes a `cl:` entry *via* the record it
+	 * points at, so an entry whose record died before that forward fix landed can
+	 * never be reached that way and is orphaned forever. This sweep reaches those
+	 * by scanning the change log itself instead of a record's deletion path.
+	 *
+	 * Safe to run at any time, on any replica, with no peer coordination: an
+	 * entry that resolves to `null` already produced no output for
+	 * {@link collectChangesSince} (`resolveLogEntry` returning `null` is exactly
+	 * what makes it an orphan), so deleting it changes nothing observable. Full
+	 * scan, same shape as {@link pruneTombstones} — a replica with no pre-fix
+	 * orphans (or one already repaired) resolves every entry and deletes nothing,
+	 * so a caught-up replica pays only the scan.
+	 */
+	async repairChangeLog(): Promise<number> {
+		const batch = this.kv.batch();
+		let count = 0;
+
+		for await (const logEntry of this.changeLog.getAllChanges()) {
+			const resolved = await this.resolveLogEntry(logEntry);
+			if (resolved) continue;
+
+			this.changeLog.deleteEntryByIdentityBatch(
+				batch,
+				logEntry.hlc,
+				logEntry.entryType,
+				logEntry.schema,
+				logEntry.table,
+				logEntry.identity,
+				logEntry.column,
+			);
+			count++;
+		}
+
+		await batch.write();
+		return count;
+	}
+
 	getEventEmitter(): SyncEventEmitterImpl {
 		return this.syncEvents;
 	}

@@ -27,6 +27,7 @@ const ALL_SWEEPS: SweepName[] = [
   'drainHeldChanges',
   'pruneQuarantine',
   'pruneTombstones',
+  'repairChangeLog',
   'evictExpiredBasisTables',
 ];
 
@@ -82,6 +83,7 @@ class FakeStoreSource implements MaintenanceStoreSource {
       drainHeldChanges: sweep('drainHeldChanges'),
       pruneQuarantine: sweep('pruneQuarantine'),
       pruneTombstones: sweep('pruneTombstones'),
+      repairChangeLog: sweep('repairChangeLog'),
       evictExpiredBasisTables: sweep('evictExpiredBasisTables'),
     };
   }

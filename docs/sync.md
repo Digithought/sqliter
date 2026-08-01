@@ -187,11 +187,11 @@ A retired table can come **back** — re-created app-side, a `create_table` arri
 
 **Who drives the sweep.** The library schedules nothing; the host owns cadence. It does ship the *shape* of one pass — sweep order, per-sweep error isolation, the single-flight guard — as `runSyncMaintenancePass` / `createSyncMaintenanceTicker` (`src/sync/maintenance.ts`), so every host runs the same semantics instead of re-deriving them; arming a timer around that is still the host's job.
 
-The **quoomb-web worker** runs all four sweeps on one periodic loop (5-minute default cadence, plus an immediate pass at sync-module init), owned by the sync module: started on init, stopped on `close()`, surviving `disconnectSync()` so held changes drain even while offline. It also subscribes `db.onSchemaChange` and fires an **immediate** scoped `drainHeldChanges(schema, table)` when the app **locally** re-creates a table — a `{type:'create', objectType:'table', remote:false}` event, emitted post-commit so the table is durable when the listener runs. That listener is fire-and-forget (a throw is logged, never re-thrown into the user's `create table`) and **not** gated by `drainOnReappear`, which governs only the two library-internal paths. Remote `create_table` is excluded (already drained reactively); `alter`/`drop` and `index`/`column` events never revive a held table and are filtered out.
+The **quoomb-web worker** runs all five sweeps on one periodic loop (5-minute default cadence, plus an immediate pass at sync-module init), owned by the sync module: started on init, stopped on `close()`, surviving `disconnectSync()` so held changes drain even while offline. It also subscribes `db.onSchemaChange` and fires an **immediate** scoped `drainHeldChanges(schema, table)` when the app **locally** re-creates a table — a `{type:'create', objectType:'table', remote:false}` event, emitted post-commit so the table is durable when the listener runs. That listener is fire-and-forget (a throw is logged, never re-thrown into the user's `create table`) and **not** gated by `drainOnReappear`, which governs only the two library-internal paths. Remote `create_table` is excluded (already drained reactively); `alter`/`drop` and `index`/`column` events never revive a held table and are filtered out.
 
 The relay-only **`sync-coordinator`** runs the same pass on its own loop (`src/service/maintenance.ts`), started in `CoordinatorService.initialize()` and stopped in `shutdown()`, differing in three ways because it is a multi-tenant relay:
 
-- **Cadence is hourly, not 5-minutely**, because two sweeps are inert on a relay and return 0 — `drainHeldChanges` (no `getTableSchema` oracle) and `evictExpiredBasisTables` (no `dropLocalTable` reclaim callback) — and the drain is the only latency-sensitive one. `pruneTombstones` and `pruneQuarantine`, the two that do real work here, act at horizon granularity (`retentionHorizonMs`, default 30 days). The inert two are still called, for symmetry and because they cost nothing.
+- **Cadence is hourly, not 5-minutely**, because two sweeps are inert on a relay and return 0 — `drainHeldChanges` (no `getTableSchema` oracle) and `evictExpiredBasisTables` (no `dropLocalTable` reclaim callback) — and the drain is the only latency-sensitive one. `pruneTombstones`, `pruneQuarantine` and `repairChangeLog` all do real work here (none of the three depends on a basis oracle or a reclaim callback) and act at horizon granularity or on the whole change log, so hourly is ample. The inert two are still called, for symmetry and because they cost nothing.
 - **One pass sweeps every open database**, iterating the `StoreManager`'s open set and pinning each store by refcount for its sweep so a concurrent idle-close cannot pull the LevelDB handle out from under a scan. A store closed between the pass snapshotting the open set and reaching it is skipped. Failures are isolated per sweep *and* per store, so one bad tenant cannot starve the rest.
 - **Only already-open databases are swept**; one closed on disk waits until a client next opens it. An eager scan of every database directory was rejected: it would open — and, where disk eviction is enabled, re-download from S3 — databases nobody is using, turning a cheap housekeeping tick into an unbounded I/O storm.
 
@@ -408,6 +408,16 @@ Pruning entries by a *time* horizon (`ChangeLogStore.pruneEntriesBefore`) is a d
 deliberately **unwired** operation: it drops entries for still-live cells, safe only once
 the server refuses delta sync for a too-old `sinceHLC` (`SyncManager.canDeltaSync`,
 likewise not yet called by the coordinator).
+
+**Repairing pre-existing orphans.** The forward cleanup above only stops *new* orphans —
+each deletes a `cl:` entry *via* the record it points at, so an entry whose record died
+before the cleanup existed can never be reached that way. `SyncManager.repairChangeLog()`
+reaches those instead: a full scan of the change log that deletes every entry
+`resolveLogEntry` resolves to `null`. It is a sibling of `pruneTombstones` in the host
+maintenance pass (`SyncMaintenanceTarget`, `src/sync/maintenance.ts`) — safe to run at any
+time, on any replica, with no peer coordination, since a `null`-resolving entry already
+produced no output. Cheap once caught up: a replica with nothing to repair resolves every
+entry and deletes none, paying only the scan.
 
 **Oversized transaction.** A transaction whose fact count exceeds `batchSize` is returned
 **whole** as one ChangeSet and telemetered (a `console.warn`), never silently chunked —

@@ -139,6 +139,23 @@ export interface SyncManager {
   pruneQuarantine(): Promise<number>;
 
   /**
+   * Repair pass over the change log: delete every entry whose target record is
+   * already gone. Forward cleanup (`deleteRowVersionsAndLogEntries` / the change-log
+   * deletion in {@link pruneTombstones}) only stops *new* orphans — an entry whose
+   * record died before that cleanup existed is orphaned forever unless something
+   * scans the log itself. Nothing is incorrect while orphans remain (a resolved-to-
+   * `null` entry already produces no output), so this is a storage/scan-cost cleanup,
+   * safe to run at any time with no peer coordination.
+   *
+   * Host-driven — call from the same periodic maintenance path as
+   * {@link pruneTombstones} / {@link pruneQuarantine} / {@link evictExpiredBasisTables};
+   * the library adds no timer. Idempotent and cheap on a replica with nothing to
+   * repair: every entry resolves and none are deleted. Returns the number of
+   * entries removed.
+   */
+  repairChangeLog(): Promise<number>;
+
+  /**
    * Replay held out-of-basis changes (`quarantine` + forwardable `store-and-forward`
    * entries) into tables that have since reappeared in the local basis — the revival
    * path of the unknown-table contract (`docs/migration.md` § 4 Contract). Each held

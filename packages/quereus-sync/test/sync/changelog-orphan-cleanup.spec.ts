@@ -741,4 +741,66 @@ describe('change log orphan cleanup', () => {
       });
     });
   });
+
+  // repairChangeLog reaches orphans the forward-only cleanup above cannot: an entry
+  // whose target died BEFORE the forward fix existed (or, in these tests, an entry
+  // manually recorded for a pk/column that was never live at all — same shape, no
+  // production write path needed to construct it).
+  describe('repair sweep (repairChangeLog)', () => {
+    let source: FakeTransactionSource;
+    let manager: SyncManagerImpl;
+
+    beforeEach(async () => {
+      source = new FakeTransactionSource();
+      manager = await SyncManagerImpl.create(
+        new InMemoryKVStore(),
+        source,
+        { ...DEFAULT_SYNC_CONFIG, ...EXPIRE_IMMEDIATELY },
+        new SyncEventEmitterImpl(),
+      );
+    });
+
+    it('deletes a delete-entry orphan whose tombstone was never written', async () => {
+      await manager.changeLog.recordDeletion(manager.getCurrentHLC(), 'main', 'users', [999]);
+      expect(await countChangeLog(manager)).to.equal(1);
+
+      expect(await manager.repairChangeLog()).to.equal(1);
+      expect(await countChangeLog(manager)).to.equal(0);
+    });
+
+    it('deletes a column-entry orphan whose column version was never written', async () => {
+      await manager.changeLog.recordColumnChange(manager.getCurrentHLC(), 'main', 'users', [999], 'col_0');
+      expect(await countChangeLog(manager)).to.equal(1);
+
+      expect(await manager.repairChangeLog()).to.equal(1);
+      expect(await countChangeLog(manager)).to.equal(0);
+    });
+
+    it('leaves live entries untouched, removing only the orphan in the same pass', async () => {
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['x', 'y', 'z'] });
+      await settle();
+      expect(await countChangeLog(manager)).to.equal(3);   // 3 live column entries
+
+      await manager.changeLog.recordDeletion(manager.getCurrentHLC(), 'main', 'users', [999]);
+      expect(await countChangeLog(manager)).to.equal(4);
+
+      const peer = generateSiteId();
+      const before = await manager.getChangesSince(peer, BEGINNING_OF_TIME);
+
+      expect(await manager.repairChangeLog()).to.equal(1);
+      expect(await countChangeLog(manager)).to.equal(3);
+
+      const after = await manager.getChangesSince(peer, BEGINNING_OF_TIME);
+      expect(after).to.deep.equal(before);
+    });
+
+    it('is idempotent: a second pass over an already-repaired log finds nothing', async () => {
+      await manager.changeLog.recordDeletion(manager.getCurrentHLC(), 'main', 'users', [999]);
+      await manager.changeLog.recordColumnChange(manager.getCurrentHLC(), 'main', 'users', [998], 'col_0');
+
+      expect(await manager.repairChangeLog()).to.equal(2);
+      expect(await manager.repairChangeLog()).to.equal(0);
+      expect(await countChangeLog(manager)).to.equal(0);
+    });
+  });
 });

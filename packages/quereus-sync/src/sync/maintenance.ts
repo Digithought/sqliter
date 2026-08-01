@@ -1,9 +1,9 @@
 /**
  * Host-agnostic tick body for the periodic sync-maintenance loop.
  *
- * `@quereus/sync` is deliberately timer-free: it exposes the four host-driven
+ * `@quereus/sync` is deliberately timer-free: it exposes the five host-driven
  * sweeps (`drainHeldChanges` / `pruneQuarantine` / `pruneTombstones` /
- * `evictExpiredBasisTables`) but never schedules them — the host owns cadence
+ * `repairChangeLog` / `evictExpiredBasisTables`) but never schedules them — the host owns cadence
  * (`docs/sync.md` § Who drives the sweep, `docs/migration.md` § 4 Contract).
  * What lives here is only the *shape* of one pass — ordering, error isolation,
  * single-flight — with no timer and no `SyncManager` import, so every host
@@ -33,6 +33,7 @@ export interface SyncMaintenanceTarget {
   drainHeldChanges(): Promise<number>;
   pruneQuarantine(): Promise<number>;
   pruneTombstones(): Promise<number>;
+  repairChangeLog(): Promise<number>;
   evictExpiredBasisTables(): Promise<number>;
 }
 
@@ -61,9 +62,11 @@ async function runStep(
  *
  * Order: `drainHeldChanges` first — it replays held out-of-basis changes into
  * tables that have reappeared in the local basis — THEN `pruneQuarantine` GCs
- * the truly-expired remainder, then `pruneTombstones`, then
- * `evictExpiredBasisTables`. Draining before pruning means a held change for a
+ * the truly-expired remainder, then `pruneTombstones`, then `repairChangeLog`,
+ * then `evictExpiredBasisTables`. Draining before pruning means a held change for a
  * table that has come back is replayed rather than GC'd out from under it.
+ * `repairChangeLog` has no ordering dependency on any other sweep — it is placed
+ * next to `pruneTombstones` because both act on the change log.
  */
 export async function runSyncMaintenancePass(
   target: SyncMaintenanceTarget,
@@ -72,6 +75,7 @@ export async function runSyncMaintenancePass(
   await runStep('drainHeldChanges', () => target.drainHeldChanges(), log);
   await runStep('pruneQuarantine', () => target.pruneQuarantine(), log);
   await runStep('pruneTombstones', () => target.pruneTombstones(), log);
+  await runStep('repairChangeLog', () => target.repairChangeLog(), log);
   await runStep('evictExpiredBasisTables', () => target.evictExpiredBasisTables(), log);
 }
 

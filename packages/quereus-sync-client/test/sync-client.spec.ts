@@ -199,6 +199,10 @@ class MockSyncManager implements SyncManager {
     return 0;
   }
 
+  async repairChangeLog(): Promise<number> {
+    return 0;
+  }
+
   async drainHeldChanges(_schema?: string, _table?: string): Promise<number> {
     return 0;
   }
