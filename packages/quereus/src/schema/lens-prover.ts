@@ -309,7 +309,7 @@ function buildProveContext(slot: LensSlot, db: Database): ProveContext {
 		outputColumns,
 		outputIndex,
 		root: planBody(db, slot.compiledBody),
-		basisSource: resolveSingleBasisSource(db.schemaManager, slot.compiledBody, basisSchemaName),
+		basisSource: resolveSingleBasisSource(db.schemaManager, slot.compiledBody),
 		basisSchemaName,
 	};
 }
@@ -347,26 +347,34 @@ function planBody(db: Database, body: AST.SelectStmt): RelationalPlanNode | unde
 	}
 }
 
-/** The single basis `table` source of a body, or undefined for a multi-source / opaque FROM. */
-function resolveSingleBasisSource(schemaManager: SchemaManager, body: AST.SelectStmt, basisSchemaName: string): TableSchema | undefined {
+/**
+ * The single basis `table` source of a **compiled** body, or undefined for a
+ * multi-source / opaque FROM.
+ *
+ * Reads the schema qualifier the body carries rather than defaulting a bare name
+ * to the basis: every compiled body is fully basis-qualified by construction
+ * (`lens-compiler.ts` § `qualifyBasisSources`; the synthesized default and
+ * decomposition bodies emit qualified sources directly), so a bare name surviving
+ * in one is a CTE reference shadowing a same-named basis relation — resolving it
+ * as that relation would attribute the CTE's rows to a table the body never reads.
+ */
+function resolveSingleBasisSource(schemaManager: SchemaManager, body: AST.SelectStmt): TableSchema | undefined {
 	const from = body.from;
 	if (!from || from.length !== 1) return undefined;
 	const node = from[0];
-	if (node.type !== 'table') return undefined;
-	const schemaName = node.table.schema ?? basisSchemaName;
-	return schemaManager.getSchema(schemaName)?.getTable(node.table.name);
+	if (node.type !== 'table' || node.table.schema === undefined) return undefined;
+	return schemaManager.getSchema(node.table.schema)?.getTable(node.table.name);
 }
 
 /**
  * The single basis `table` source of a lens slot's compiled body, or undefined for
  * a multi-source / opaque FROM — the exported slot-level entry point. Reused by the
  * lens FK-redundancy detector (`planner/mutation/lens-enforcement.ts`) so it walks
- * the same single-source `from` the prover does, resolving a bare table name against
- * the slot's own default basis schema. Reads only the catalog, so it is safe over a
- * lightweight (un-planned) caller.
+ * the same single-source `from` the prover does. Reads only the catalog, so it is
+ * safe over a lightweight (un-planned) caller.
  */
 export function resolveSlotBasisSource(slot: LensSlot, schemaManager: SchemaManager): TableSchema | undefined {
-	return resolveSingleBasisSource(schemaManager, slot.compiledBody, slot.defaultBasis.schemaName);
+	return resolveSingleBasisSource(schemaManager, slot.compiledBody);
 }
 
 // ---------------------------------------------------------------------------
@@ -2270,7 +2278,7 @@ function buildLiteProveContext(slot: LensSlot, db: Database): ProveContext {
 		outputColumns,
 		outputIndex,
 		root: undefined,
-		basisSource: resolveSingleBasisSource(db.schemaManager, slot.compiledBody, basisSchemaName),
+		basisSource: resolveSingleBasisSource(db.schemaManager, slot.compiledBody),
 		basisSchemaName,
 	};
 }

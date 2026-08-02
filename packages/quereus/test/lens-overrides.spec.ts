@@ -592,6 +592,79 @@ describe('lens overrides: unqualified basis sources', () => {
 			await db.close();
 		}
 	});
+
+	// A basis *view* is a legitimate override source. It is not introspectable (no
+	// column list for `*` expansion / gap-fill), but it is still a basis relation
+	// and must carry the qualifier, or the read falls off the basis exactly as a
+	// bare table did.
+	it('qualifies a bare basis view source', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } view CarV as select id, speed from y.CarCore }');
+			await db.exec('apply schema y');
+			await db.exec('insert into y.CarCore values (1, 120)');
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from CarV }');
+			await db.exec('apply schema x');
+
+			const sqlRows = await rows(db, "select distinct effective_sql from quereus_effective_lens('x', 'Car')");
+			expect(String(sqlRows[0].effective_sql).toLowerCase()).to.contain('from y.carv');
+			expect(await rows(db, 'select * from x.Car')).to.deep.equal([{ id: 1, speed: 120 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// A bare name the basis does not have cannot be pinned, so it would fall
+	// through to the *default* schema path at read time — binding `main`'s
+	// same-named relation, the same silent cross-basis re-anchor the qualified
+	// spelling (`main.Gadget`) is rejected for. Reject it at deploy instead.
+	it('rejects a bare source the basis does not have, even when main does', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('create table Gadget (id integer primary key, speed integer)');
+			await db.exec("insert into main.Gadget values (42, 7)");
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from Gadget }');
+			await expectThrows(() => db.exec('apply schema x'), /'Gadget'.*declared basis 'y' does not have/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rejects a bare source that exists nowhere, at deploy rather than at read', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, maxSpeed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed as maxSpeed from NoSuchTable }');
+			await expectThrows(() => db.exec('apply schema x'), /'NoSuchTable'.*declared basis 'y' does not have/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// The reject walks the whole body, matching the cross-basis check.
+	it('rejects a non-basis bare source nested in an in-subquery', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('create table Sneaky (id integer primary key)');
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from CarCore c where c.id in (select id from Sneaky) }');
+			await expectThrows(() => db.exec('apply schema x'), /'Sneaky'.*declared basis 'y' does not have/);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens overrides: quereus_effective_lens', () => {

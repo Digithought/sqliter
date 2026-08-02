@@ -487,3 +487,80 @@ declare lens for ctgapp over cbasis {
 
 apply schema ctgapp;
 -- error: color
+
+-- ===================================
+-- 12. A bare source the basis does not have is rejected at DEPLOY. It cannot be
+--     pinned to the basis, so it would otherwise fall through to the default
+--     schema path and bind main's same-named relation — the same cross-basis
+--     re-anchor the qualified spelling (`main.Gadget`) is already rejected for.
+-- ===================================
+
+create table Gadget (
+	id integer primary key,
+	speed integer
+);
+
+-- run
+
+declare logical schema gapp {
+	table Car {
+		id integer primary key,
+		speed integer
+	}
+}
+
+-- run
+
+declare lens for gapp over ubasis {
+	view Car as select id, speed from Gadget
+}
+
+-- run
+
+apply schema gapp;
+-- error: Gadget
+
+-- ===================================
+-- 13. A basis VIEW is a legitimate bare source: not introspectable (no column
+--     list for `*` expansion), but still a basis relation, so it is qualified.
+-- ===================================
+
+declare schema vbasis {
+	table CarCore {
+		id integer primary key,
+		speed integer
+	}
+	view CarV as select id, speed from vbasis.CarCore
+}
+
+-- run
+
+apply schema vbasis;
+
+-- run
+
+insert into vbasis.CarCore values (1, 120);
+
+-- run
+
+declare logical schema vapp {
+	table Car {
+		id integer primary key,
+		speed integer
+	}
+}
+
+-- run
+
+declare lens for vapp over vbasis {
+	view Car as select id, speed from CarV
+}
+
+-- run
+
+apply schema vapp;
+
+-- run
+
+select * from vapp.Car;
+→ [{"id": 1, "speed": 120}]

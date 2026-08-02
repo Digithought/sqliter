@@ -1206,20 +1206,20 @@ function compileOverrideBody(
 	const select = override.select;
 	const logicalName = logicalTable.name;
 
-	// Every FROM source the override names must live in the declared basis — an
-	// override referencing a *different* existing schema (e.g. `Z.Foo` while the
-	// lens is `over Y`) would silently re-anchor the body to Z (docs/lens.md § D4).
-	validateOverrideBasisSources(select, basisSchemaName, logicalSchemaName, logicalName);
-
 	// Names a CTE declares anywhere in the body shadow same-named basis relations:
 	// they are neither collectable as basis sources (their columns are the CTE's,
 	// not the basis table's, so `*` expansion and gap-fill must not use them) nor
 	// qualifiable with the basis schema.
 	const cteNames = collectCteNames(select);
 
+	// Every FROM source the override names must live in the declared basis — an
+	// override referencing a *different* existing schema (e.g. `Z.Foo` while the
+	// lens is `over Y`) would silently re-anchor the body to Z (docs/lens.md § D4).
+	validateOverrideBasisSources(select, basisSchemaName, schemaManager, cteNames, logicalSchemaName, logicalName);
+
 	// Resolve FROM-source basis tables once — used for both `*` expansion and
-	// gap-fill. Opaque sources (subquery / function / CTE / unresolvable table) are
-	// tracked so a gap that actually needs them errors precisely.
+	// gap-fill. Opaque sources (subquery / function / CTE / basis view — anything
+	// exposing no column list) are tracked so a gap that needs one errors precisely.
 	const { sources, hasOpaqueSource } = collectOverrideSources(select.from, basisSchemaName, schemaManager, cteNames);
 	const qualify = sources.length > 1;
 
@@ -1403,8 +1403,8 @@ function collectCteNames(select: AST.SelectStmt): Set<string> {
  * `compileDecompositionBody`, which already emit fully-qualified references.
  *
  * A bare name is left exactly as authored when a CTE shadows it (see
- * {@link collectCteNames}) or when the basis has no such table — an
- * unresolvable name stays opaque and surfaces the same error it does today.
+ * {@link collectCteNames}); one the basis does not have never reaches this pass,
+ * having already been rejected by {@link validateOverrideBasisSources}.
  *
  * The input AST is never mutated: `select` here is the authored
  * `override.select`, which is also stored as the slot's override *and* lives in
@@ -1427,11 +1427,17 @@ function qualifyBasisSources(
 		const src = node as unknown as AST.TableSource;
 		if (src.table.schema !== undefined) return false;
 		if (cteNames.has(src.table.name.toLowerCase())) return false;
-		return basis.getTable(src.table.name) !== undefined;
+		return basisHasRelation(basis, src.table.name);
 	};
 
 	let found = false;
 	forEachAstNode(select, node => { if (needsQualifier(node)) found = true; });
+	// NOTE: this early return leaves the compiled body sharing FROM/where subtrees
+	// with the authored declaration AST (as it always did), while the rewrite path
+	// below hands back a fully detached clone — so body↔declaration aliasing is
+	// asymmetric. Harmless while nothing mutates a compiled body in place; if an
+	// in-place AST rewriter (`schema/rename-rewriter.ts`) is ever pointed at one,
+	// clone unconditionally here instead of chasing the difference.
 	if (!found) return select;
 
 	const clone = spineCloneAst(select);
@@ -1445,7 +1451,9 @@ function qualifyBasisSources(
  * Resolves one FROM `table` node to its basis table, or undefined when it is not
  * an introspectable basis relation. A bare name a CTE declares is *not* a basis
  * table — resolving it as one would attribute the CTE's rows (and columns) to a
- * basis relation the body never reads.
+ * basis relation the body never reads. Narrower than {@link basisHasRelation}: a
+ * basis *view* is a legal source but exposes no column list, so it resolves to
+ * undefined here and the caller treats it as opaque.
  */
 function resolveBasisTableSource(
 	node: AST.TableSource,
@@ -1494,25 +1502,29 @@ function collectOverrideSources(
 
 /**
  * Validates that every `table` source reachable from an override's body resolves
- * to the declared basis schema. A table qualified with a *different* existing
- * schema would otherwise bind there silently (re-anchoring the lens off its
- * `over Y` basis); reject it at deploy time. Unqualified tables default to the
- * basis and are fine; tables qualified with the basis name are fine.
+ * to the declared basis schema — in both directions an override could escape it:
+ *
+ * 1. **Qualified with another schema** (`Z.Foo` while the lens is `over Y`) would
+ *    bind there silently, re-anchoring the lens off its basis.
+ * 2. **Bare and absent from the basis.** A bare name is the basis or a CTE and
+ *    nothing else (docs/lens.md § Body-shape restrictions). One that is neither
+ *    has no basis qualifier to pin ({@link qualifyBasisSources} leaves it alone),
+ *    so it falls through to the *default* schema path at read time — binding a
+ *    same-named `main` relation, which is the same silent re-anchor as (1) minus
+ *    the qualifier that would have made it visible. Rejecting it here reports the
+ *    escape at deploy, naming the relation, instead of at read (or not at all).
+ *
+ * A basis *view* counts as a basis relation for this check and for qualification,
+ * though not as an introspectable source: `*` expansion and gap-fill still treat
+ * it as opaque (see {@link resolveBasisTableSource}).
  *
  * The walk ({@link forEachAstNode}) is reflective over the entire override
  * `select` AST, so it descends into subquery-source FROM trees, function-source
  * argument subqueries, `with` CTE bodies, compound (`union`/`intersect`/…) legs,
- * and scalar/`where`/`in`/`exists` subqueries — a cross-basis `z.Foo` in any of
+ * and scalar/`where`/`in`/`exists` subqueries — an escaping source in any of
  * those nested positions is flagged too, not only top-level `table`/`join`
- * sources.
- *
- * No CTE-name / alias scope tracking is needed. The check fires only on a `table`
- * node carrying an explicit, non-basis *schema qualifier*; CTE references and
- * FROM aliases are always bare (SQL has no `schema.cte` form) and the compiler
- * resolves a bare FROM table to the basis (see `collectOverrideSources`), so a
- * bare name is always either the basis or a CTE — never a cross-basis relation.
- * Only a schema-qualified table can be cross-basis, and that can never name a
- * CTE/alias, so the walk needs no in-scope-name set to avoid false positives.
+ * sources. Function (TVF) sources are not `table` nodes and resolve through the
+ * function registry rather than the schema path, so they are out of scope here.
  *
  * Runs on the **authored** select, before {@link qualifyBasisSources} rewrites
  * bare basis names — the qualifier that pass adds is the basis one, so ordering
@@ -1521,21 +1533,44 @@ function collectOverrideSources(
 function validateOverrideBasisSources(
 	select: AST.SelectStmt,
 	basisSchemaName: string,
+	schemaManager: SchemaManager,
+	cteNames: ReadonlySet<string>,
 	logicalSchemaName: string,
 	logicalName: string,
 ): void {
 	const lowerBasis = basisSchemaName.toLowerCase();
+	const basis = schemaManager.getSchema(basisSchemaName);
+	const fail = (message: string): never => {
+		throw new QuereusError(
+			`lens: override for logical table '${logicalSchemaName}.${logicalName}' ${message} (the lens is declared 'over ${basisSchemaName}'); an override's FROM may only reference the declared basis`,
+			StatusCode.ERROR,
+		);
+	};
+
 	forEachAstNode(select, node => {
 		if (node.type !== 'table') return;
-		const source = node as unknown as AST.TableSource;
-		const schema = source.table.schema;
-		if (schema && schema.toLowerCase() !== lowerBasis) {
-			throw new QuereusError(
-				`lens: override for logical table '${logicalSchemaName}.${logicalName}' references basis relation '${schema}.${source.table.name}' outside the declared basis '${basisSchemaName}' (the lens is declared 'over ${basisSchemaName}'); an override's FROM may only reference the declared basis`,
-				StatusCode.ERROR,
-			);
+		const { table } = node as unknown as AST.TableSource;
+		if (table.schema !== undefined) {
+			if (table.schema.toLowerCase() !== lowerBasis) {
+				fail(`references basis relation '${table.schema}.${table.name}' outside the declared basis '${basisSchemaName}'`);
+			}
+			return;
+		}
+		if (cteNames.has(table.name.toLowerCase())) return;
+		if (basis && !basisHasRelation(basis, table.name)) {
+			fail(`references relation '${table.name}', which the declared basis '${basisSchemaName}' does not have — an unqualified FROM source names a basis table or view, or a CTE of the same body`);
 		}
 	});
+}
+
+/**
+ * Whether the basis schema holds a relation of this name. Broader than
+ * {@link resolveBasisTableSource}: a *view* is a legitimate basis source to
+ * reference (and to qualify) even though it exposes no {@link TableSchema} for
+ * `*` expansion / gap-fill to read columns from.
+ */
+function basisHasRelation(basis: Schema, name: string): boolean {
+	return basis.getTable(name) !== undefined || basis.getView(name) !== undefined;
 }
 
 /** Output name a result column contributes: its alias, or the bare column name. */

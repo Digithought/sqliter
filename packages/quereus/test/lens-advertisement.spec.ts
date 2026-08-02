@@ -720,6 +720,45 @@ describe('lens advertisement: get synthesis (n-way decomposition)', () => {
 		}
 	});
 
+	// Same body as above, written with a BARE FROM source. Basis-source resolution
+	// runs on the authored select, before the compiler pins bare names to the basis
+	// (`lens-compiler.ts` § qualifyBasisSources), so `overrideSourceByRel` must key
+	// the advertised member the same either way — i.e. gap-fill still finds `cap`.
+	it('advertisement-driven gap-fill: an unqualified override FROM resolves the same advertised member', async () => {
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [{
+				id: 'Item_core',
+				logicalTable: 'Item',
+				role: 'primary-storage',
+				storage: {
+					anchorRelationId: 'Item_core',
+					members: [
+						{ relationId: 'Item_core', relation: { schema: 'main', table: 'Item_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('name', 'name'), colMap('caption', 'cap')] },
+					],
+					sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['Item_core', ['id']]) },
+				},
+			}];
+			db.registerModule('admod', mod);
+			await db.exec('create table Item_core (id integer primary key, name text, cap text) using admod');
+			await db.exec("insert into Item_core values (1, 'widget', 'Hello')");
+
+			await db.exec('declare logical schema x { table Item { id integer primary key, name text, caption text } }');
+			await db.exec("declare lens for x over main { view Item as select id, name from Item_core }");
+			await db.exec('apply schema x');
+
+			expect(await rows(db, "select logical_column, source from quereus_effective_lens('x', 'Item') order by logical_column")).to.deep.equal([
+				{ logical_column: 'caption', source: 'default' },
+				{ logical_column: 'id', source: 'override' },
+				{ logical_column: 'name', source: 'override' },
+			]);
+			expect(await rows(db, 'select * from x.Item')).to.deep.equal([{ id: 1, name: 'widget', caption: 'Hello' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('advertisement-driven gap-fill: errors precisely when an uncovered column needs a member absent from the override FROM', async () => {
 		const db = new Database();
 		try {
