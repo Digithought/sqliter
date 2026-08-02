@@ -118,7 +118,7 @@ be built before the node it references; it explicitly invalidates the caches it 
 
 - code: `packages/quereus/src/planner/framework/pass.ts` — `inheritVisitedRules`
 - guard: `packages/quereus/test/planner/framework.spec.ts` — `Visited-rule tracking`
-- doc: [Optimizer § Rule Application Control](optimizer.md#rule-application-control)
+- doc: [Optimizer Visited Tracking § Rule Application Control](optimizer-visited-tracking.md#rule-application-control)
 
 When a rule transforms a node, `PassManager` copies the original node's applied-rule set onto
 the freshly-minted node, so an applied rule is never re-offered its own output — that is what
