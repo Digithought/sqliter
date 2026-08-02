@@ -50,6 +50,12 @@ export interface CoveringFKMatch {
  * Returns the matched FK plus a nullability bit (true iff any FK child column
  * is nullable).
  *
+ * **`childEquiCols` / `parentEquiCols` must be BASE-TABLE column indices** —
+ * same contract as `checkFkPkAlignment`. Translate a subtree's output column
+ * positions through {@link resolveTableColumnMapping} / {@link mapColumnsToTable}
+ * first; an output index compared against an FK declaration silently names a
+ * different column whenever a projection sits between the table and the join.
+ *
  * Alignment is *positional*: for each `i`, the equi-pair partner of
  * `fk.columns[i]` must equal `fk.referencedColumns[i]`. A composite FK
  * `(fa, fb) REFERENCES p(a, b)` guarantees `fa → a` and `fb → b` in that
@@ -283,40 +289,35 @@ export function mapColumnsToTable(
  *
  * Allowed wrappers: TableReferenceNode (base), RetrieveNode whose pipeline is
  * the bare TableReferenceNode (no pushed-down pipeline filter), AliasNode,
- * SortNode — all preserve row count *and* attribute-id mapping of their
- * source. Anything else (Filter, LimitOffset, Distinct, Join, Aggregate,
- * Window, CTE, SetOperation, …) disqualifies.
+ * SortNode, ProjectNode — none of them can remove a row. Anything else (Filter,
+ * LimitOffset, Distinct, Join, Aggregate, Window, CTE, SetOperation, …)
+ * disqualifies.
  *
- * `ProjectNode` is excluded by default even though a projection never removes
- * rows: it may rename, reorder, or drop columns, which breaks the
- * table-column-index ≡ output-index assumption callers who pass raw output
- * indices to the FK→PK alignment check rely on. Callers that translate their
- * column indices through {@link resolveTableColumnMapping} first are immune to
- * that and pass `throughProject: true` to peel projections as well.
+ * This predicate answers *rows only*. A `ProjectNode` may rename, reorder, or
+ * drop **columns**, so a caller that also pairs column indices against the base
+ * table's schema (FK→PK alignment) must translate those indices through
+ * {@link resolveTableColumnMapping} / {@link mapColumnsToTable} first — this
+ * function makes no claim that output index ≡ table column index. Every current
+ * caller does exactly that.
  *
  * Used by: INNER join elimination (PK side must be unfiltered), aggregate
  * elimination over FK-covered joins (same reason — a row-reducing wrapper on
  * the eliminable side would have dropped rows the FK→PK guarantee assumes are
- * present), and the semi/anti-join FK folds (which opt into `throughProject`,
- * since the uncorrelated `IN` arm hands the join a bare `Project` over the
- * parent table).
+ * present), the fan-out lookup join's `atMostOne-inner` branch, and the
+ * semi/anti-join FK folds (whose uncorrelated `IN` arm hands the join a bare
+ * `Project` over the parent table).
  */
-export function isRowPreservingPathToTable(
-	node: RelationalPlanNode,
-	options: { throughProject?: boolean } = {},
-): boolean {
+export function isRowPreservingPathToTable(node: RelationalPlanNode): boolean {
 	if (node instanceof TableReferenceNode) return true;
 	if (node instanceof RetrieveNode) {
-		// NOTE: `throughProject` deliberately stops at the Retrieve boundary — a
-		// pushed-down pipeline is only accepted when it is the bare table. If a
-		// module ever accepts projection pushdown on a semi/anti-join parent side,
-		// this declines a fold it could take; recurse with `options` then.
+		// NOTE: the walk deliberately stops at the Retrieve boundary — a pushed-down
+		// pipeline is only accepted when it is the bare table. If a module ever
+		// accepts projection pushdown on a semi/anti-join parent side, this declines
+		// a fold it could take; recurse into the pipeline then.
 		return node.source instanceof TableReferenceNode;
 	}
-	if (node instanceof AliasNode) return isRowPreservingPathToTable(node.source, options);
-	if (node instanceof SortNode) return isRowPreservingPathToTable(node.source, options);
-	if (options.throughProject && node instanceof ProjectNode) {
-		return isRowPreservingPathToTable(node.source, options);
-	}
+	if (node instanceof AliasNode) return isRowPreservingPathToTable(node.source);
+	if (node instanceof SortNode) return isRowPreservingPathToTable(node.source);
+	if (node instanceof ProjectNode) return isRowPreservingPathToTable(node.source);
 	return false;
 }

@@ -80,7 +80,7 @@ export function ruleAntiJoinFkEmpty(node: PlanNode, _context: OptContext): PlanN
 	// IND `L.fk ⊆ R.pk` doesn't guarantee a match in the filtered relation. A
 	// projection is peeled (it never drops rows); its column renaming is already
 	// accounted for by the mapping above.
-	if (!isRowPreservingPathToTable(node.right, { throughProject: true })) return null;
+	if (!isRowPreservingPathToTable(node.right)) return null;
 
 	// Refuse to fold to Empty when either participating subtree carries a write —
 	// the anti-join collapses to EmptyRelation(L's attrs), dropping both sides.

@@ -59,6 +59,14 @@ function joinCount(rows: readonly PlanRow[]): number {
 	return rows.filter(r => JOIN_OPS.has(r.op)).length;
 }
 
+/** Branch modes parsed from the fan-out node's logical properties. */
+function fanOutBranchModes(rows: readonly PlanRow[]): string[] {
+	const fo = rows.find(r => r.op === 'FANOUTLOOKUPJOIN' || r.node_type === 'FanOutLookupJoin');
+	if (!fo || !fo.properties) return [];
+	const props = JSON.parse(fo.properties) as { branches?: { mode: string }[] };
+	return (props.branches ?? []).map(b => b.mode);
+}
+
 // Tests that *execute* a fan-out plan with an ORDER BY hit a known strict-fork
 // harness interaction: the Sort/Project above the fan-out join calls
 // `createRowSlot` on the parent rctx while the join's forks are still counted
@@ -316,6 +324,118 @@ describe('ruleFanOutLookupJoin', () => {
 	});
 
 	// ----------------------------------------------------------------------
+	// FK→PK alignment compares base-table column positions. A sub-select on a
+	// lookup branch renumbers columns, so an untranslated comparison can accept
+	// the wrong column as the PK column and classify a genuinely 1:n branch as
+	// `atMostOne-left` — which `assertAtMostOne` then rejects at runtime.
+	// ----------------------------------------------------------------------
+	describe('derived-table lookup branches', () => {
+		/**
+		 * Three lookup tables whose `other` column is NOT the PK and NOT the FK
+		 * target: every row carries `other = 1`, so a join on `other` matches two
+		 * rows per outer row (a genuine 1:n branch).
+		 */
+		async function setupDerivedBranches(): Promise<void> {
+			for (const t of ['cust', 'prod', 'region']) {
+				await db.exec(
+					`create table ${t} (id integer primary key, other integer, label text) using hi_lat_memory`,
+				);
+				await db.exec(`insert into ${t} values (1, 1, '${t}-a'), (2, 1, '${t}-b')`);
+			}
+			await db.exec(`create table orders (
+				order_id integer primary key,
+				customer_id integer not null references cust(id),
+				product_id integer not null references prod(id),
+				region_id integer not null references region(id)
+			) using memory`);
+			// order 1 joins on value 1 (matches both lookup rows per branch);
+			// order 2 joins on value 2 (matches none — exercises the NULL pad).
+			await db.exec('insert into orders values (1, 1, 1, 1), (2, 2, 2, 2)');
+		}
+
+		// `c.other` is output position 0 of the sub-select but column 1 of `cust`;
+		// position 0 is `cust.id`, the column the FK references.
+		const derivedNonFkSQL = `select o.order_id from orders o
+			left join (select other from cust) c on o.customer_id = c.other
+			left join (select other from prod) p on o.product_id = p.other
+			left join (select other from region) r on o.region_id = r.other`;
+
+		// The mirror image: a reordering sub-select that IS FK-covered.
+		const derivedFkSQL = `select o.order_id, c.label from orders o
+			left join (select other, id, label from cust) c on o.customer_id = c.id
+			left join (select other, id from prod) p on o.product_id = p.id
+			left join (select other, id from region) r on o.region_id = r.id`;
+
+		it('does NOT classify a non-FK sub-select branch as at-most-one', async () => {
+			await setupDerivedBranches();
+			const plan = await planRows(db, derivedNonFkSQL);
+			// The branches are still clusterable — a `cross` / `cross-left` branch is
+			// always sound (data-driven 1:n, gated by the row/product guards), so
+			// failing to *prove* at-most-one degrades the branch rather than killing
+			// the whole cluster. What must never happen is an at-most-one claim.
+			expect(fanOutBranchModes(plan)).to.deep.equal(['cross-left', 'cross-left', 'cross-left']);
+		});
+
+		forkExecTest('non-FK sub-select branches return the nested-loop row multiset', async () => {
+			await setupDerivedBranches();
+			const plan = await planRows(db, derivedNonFkSQL);
+			expect(hasFanOut(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
+			const out = await results(db, derivedNonFkSQL + ' order by o.order_id');
+
+			const before = db.optimizer.tuning;
+			db.optimizer.updateTuning({
+				...before,
+				disabledRules: new Set(['fanout-lookup-join']),
+			});
+			let baseline: Record<string, SqlValue>[];
+			try {
+				baseline = await results(db, derivedNonFkSQL + ' order by o.order_id');
+			} finally {
+				db.optimizer.updateTuning(before);
+			}
+
+			expect(out).to.deep.equal(baseline);
+			// order 1 matches 2 rows on each of 3 branches (2³ = 8); order 2 matches
+			// nothing and survives once via the LEFT null-pad.
+			expect(out.map(r => r.order_id)).to.deep.equal([1, 1, 1, 1, 1, 1, 1, 1, 2]);
+		});
+
+		it('still recognizes at-most-one when a reordering sub-select IS FK-covered', async () => {
+			await setupDerivedBranches();
+			const plan = await planRows(db, derivedFkSQL);
+			// `c.id` is output position 1 but table column 0 — the FK's referenced
+			// column. Translating (rather than refusing sub-selects) keeps the
+			// at-most-one classification available.
+			expect(fanOutBranchModes(plan)).to.deep.equal([
+				'atMostOne-left', 'atMostOne-left', 'atMostOne-left',
+			]);
+		});
+
+		forkExecTest('FK-covered sub-select branches return the nested-loop rows', async () => {
+			await setupDerivedBranches();
+			const plan = await planRows(db, derivedFkSQL);
+			expect(hasFanOut(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
+			const out = await results(db, derivedFkSQL + ' order by o.order_id');
+
+			const before = db.optimizer.tuning;
+			db.optimizer.updateTuning({
+				...before,
+				disabledRules: new Set(['fanout-lookup-join']),
+			});
+			let baseline: Record<string, SqlValue>[];
+			try {
+				baseline = await results(db, derivedFkSQL + ' order by o.order_id');
+			} finally {
+				db.optimizer.updateTuning(before);
+			}
+
+			expect(out).to.deep.equal(baseline);
+			expect(out.map(r => r.order_id)).to.deep.equal([1, 2]);
+			expect(out.map(r => r.label)).to.deep.equal(['cust-a', 'cust-b']);
+		});
+	});
+
+	// ----------------------------------------------------------------------
 	// Subquery-branch recognition: correlated scalar aggregates in the SELECT
 	// projection list cluster as `atMostOne-left` fan-out branches.
 	// ----------------------------------------------------------------------
@@ -352,14 +472,6 @@ describe('ruleFanOutLookupJoin', () => {
 				(select json_group_array(a.v) from a where a.fk = o.k) as xs,
 				(select count(*) from b where b.fk = o.k) as nb
 			 from outer_t o`;
-
-		/** Branch modes parsed from the fan-out node's logical properties. */
-		function fanOutBranchModes(rows: readonly PlanRow[]): string[] {
-			const fo = rows.find(r => r.op === 'FANOUTLOOKUPJOIN' || r.node_type === 'FanOutLookupJoin');
-			if (!fo || !fo.properties) return [];
-			const props = JSON.parse(fo.properties) as { branches?: { mode: string }[] };
-			return (props.branches ?? []).map(b => b.mode);
-		}
 
 		it('pure subquery cluster fires with 2 atMostOne-left branches', async () => {
 			await setupSubqueryTables('hi_lat_memory');

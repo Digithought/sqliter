@@ -274,6 +274,104 @@ describe('ruleJoinElimination', () => {
 		await db.exec('DROP VIEW order_view');
 	});
 
+	// FK→PK alignment compares base-table column positions. A sub-select renames,
+	// reorders and drops columns, so the join condition's *output* positions are
+	// translated through `resolveTableColumnMapping` first. Without the
+	// translation an output index collides with an unrelated table column and the
+	// wrong column is accepted as the FK/PK column.
+	describe('derived-table column indices', () => {
+		async function setupDerived(): Promise<void> {
+			await db.exec('create table p (id integer primary key, other integer) using memory');
+			await db.exec(
+				'create table c (id integer primary key, p_id integer not null references p(id)) using memory',
+			);
+			await db.exec('insert into p values (7, 7), (2, 7)');
+			await db.exec('insert into c values (10, 7)');
+		}
+
+		it('keeps the LEFT join when the sub-select exposes a NON-FK-referenced column', async () => {
+			await setupDerived();
+			// `q.other` is output position 0 of the sub-select but column 1 of `p`.
+			// Position 0 of `p` is `id` — the column the FK references — so an
+			// untranslated comparison reports alignment and drops the join, losing a
+			// row (two `p` rows have other = 7).
+			const q = 'select c.id from c left join (select other from p) q on c.p_id = q.other';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			const out = await results(db, q);
+			expect(out.map(r => r.id)).to.deep.equal([10, 10]);
+		});
+
+		it('keeps the INNER join when the sub-select exposes a NON-FK column on the preserved side', async () => {
+			// The untranslated comparison also mis-fires on the FK (preserved) side,
+			// where an INNER join emits a row that has no parent at all.
+			await db.exec('create table p (id integer primary key) using memory');
+			await db.exec(
+				`create table c3 (
+					id integer primary key,
+					x integer,
+					p_id integer not null references p(id),
+					y integer
+				) using memory`,
+			);
+			await db.exec('insert into p values (1), (2)');
+			// y = 99 has NO parent row; p_id = 1 does.
+			await db.exec('insert into c3 values (10, 0, 1, 99)');
+
+			// `q.y` is output position 2, colliding with `c3.p_id` (table column 2),
+			// the real FK column.
+			const q = 'select q.id from (select id, x, y from c3) q join p on q.y = p.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			const out = await results(db, q);
+			expect(out).to.have.lengthOf(0);
+		});
+
+		it('still eliminates a LEFT join when a reordering sub-select IS FK-covered', async () => {
+			await setupDerived();
+			// `q.id` is output position 1 but table column 0 — the FK's referenced
+			// column. Translating (rather than refusing sub-selects outright) keeps
+			// this rewrite available.
+			const q = 'select c.id from c left join (select other, id from p) q on c.p_id = q.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out.map(r => r.id)).to.deep.equal([10]);
+		});
+
+		it('still eliminates an INNER join when a reordering sub-select IS FK-covered', async () => {
+			await setupDerived();
+			// INNER additionally needs a row-preserving path to the PK table; a
+			// projection never drops rows, so it is peeled.
+			const q = 'select c.id from c join (select other, id from p) q on c.p_id = q.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out.map(r => r.id)).to.deep.equal([10]);
+		});
+
+		it('declines when the join column is computed and has no base-table origin', async () => {
+			await setupDerived();
+			// `q.k` is an expression — `mapColumnsToTable` returns undefined, so the
+			// rewrite must decline rather than pair an unrelated index against `p`.
+			const q = 'select c.id from c left join (select id + 0 as k from p) q on c.p_id = q.k';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			const out = await results(db, q);
+			expect(out.map(r => r.id)).to.deep.equal([10]);
+		});
+	});
+
 	// `ruleJoinEliminationUnderAggregate` (id `join-elimination-aggregate`): the
 	// Aggregate-anchored sibling of the Project entrypoint. A cardinality-only
 	// aggregate (`count(*)`) over an FK→PK LEFT/RIGHT/INNER join whose

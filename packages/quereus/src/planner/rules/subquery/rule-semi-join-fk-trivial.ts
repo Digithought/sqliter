@@ -77,7 +77,7 @@ export function ruleSemiJoinFkTrivial(node: PlanNode, _context: OptContext): Pla
 	// subquery verbatim, so R is a `Project` over the parent table, and a
 	// projection never drops rows. Its column renaming is already accounted for
 	// by the mapping above.
-	if (!isRowPreservingPathToTable(node.right, { throughProject: true })) return null;
+	if (!isRowPreservingPathToTable(node.right)) return null;
 
 	// Refuse to drop the R side when it carries a write — the rewrite replaces
 	// the semi-join with L (or Filter(L)) and the R subtree is dropped entirely.

@@ -555,6 +555,15 @@ function walkToTableSchema(node: RelationalPlanNode, strict: boolean): TableSche
 /**
  * Check if an FK→PK relationship aligns with equi-join pairs.
  *
+ * **`fkTableCols` / `pkTableCols` must be BASE-TABLE column indices**, not the
+ * output column positions of whatever relational subtree the join sees. FK and
+ * PK declarations are stored in each table's own column order, and a sub-select
+ * (or any projection) between the table and the join renames, reorders, and
+ * drops columns — so an output index compared against a declaration silently
+ * names a different column. Translate first via `ind-utils.ts`'s
+ * `resolveTableColumnMapping` + `mapColumnsToTable`, and decline when a join
+ * column has no base-table origin.
+ *
  * Alignment is *positional*: for each declared FK column at index `i`, the
  * equi-pair partner must equal the FK's declared `referencedColumns[i]`. A
  * composite FK `(fa, fb) REFERENCES p(a, b)` only covers the pairing
@@ -567,8 +576,8 @@ function walkToTableSchema(node: RelationalPlanNode, strict: boolean): TableSche
 export function checkFkPkAlignment(
 	fkTable: TableSchema,
 	pkTable: TableSchema,
-	fkEquiIndices: ReadonlyArray<number>,
-	pkEquiIndices: ReadonlyArray<number>,
+	fkTableCols: ReadonlyArray<number>,
+	pkTableCols: ReadonlyArray<number>,
 ): boolean {
 	if (!fkTable.foreignKeys) return false;
 
@@ -588,10 +597,11 @@ export function checkFkPkAlignment(
 		}
 		if (refCols.length !== fk.columns.length) continue;
 
-		// Build mapping: for each equi-pair, fk column index -> pk column index
+		// Build mapping: for each equi-pair, fk table column index -> pk table
+		// column index
 		const equiMap = new Map<number, number>();
-		for (let i = 0; i < fkEquiIndices.length; i++) {
-			equiMap.set(fkEquiIndices[i], pkEquiIndices[i]);
+		for (let i = 0; i < fkTableCols.length; i++) {
+			equiMap.set(fkTableCols[i], pkTableCols[i]);
 		}
 
 		const pkColSet = new Set(pkDef.map(pk => pk.index));

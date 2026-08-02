@@ -20,6 +20,12 @@
  *
  * Non-equi residual conjuncts in the ON-clause disqualify the rewrite (they
  * may alter cardinality beyond the FK→PK guarantee).
+ *
+ * The FK→PK alignment step speaks *base-table* column indices. The equi-pairs
+ * arrive as each side's output column positions, which a sub-select in the FROM
+ * list renames, reorders, and drops freely — so both sides are translated
+ * through `resolveTableColumnMapping` / `mapColumnsToTable` first. A join column
+ * with no base-table origin (a computed expression) declines the rewrite.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -37,8 +43,8 @@ import { JoinNode, extractEquiPairsFromCondition } from '../../nodes/join-node.j
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { BinaryOpNode } from '../../nodes/scalar.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
-import { checkFkPkAlignment, extractTableSchema } from '../../util/key-utils.js';
-import { lookupCoveringFK, isRowPreservingPathToTable } from '../../util/ind-utils.js';
+import { checkFkPkAlignment } from '../../util/key-utils.js';
+import { lookupCoveringFK, isRowPreservingPathToTable, mapColumnsToTable, resolveTableColumnMapping } from '../../util/ind-utils.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
 const log = createLogger('optimizer:rule:join-elimination');
@@ -219,15 +225,22 @@ function tryEliminate(
 		return null;
 	}
 
-	const leftSchema = extractTableSchema(join.left as RelationalPlanNode);
-	const rightSchema = extractTableSchema(join.right as RelationalPlanNode);
-	if (!leftSchema || !rightSchema) return null;
+	// Equi-pairs index each side's OUTPUT columns; the FK/PK declarations speak
+	// base-table column indices. Translate before comparing — an intervening
+	// projection (a sub-select in the FROM list) can rename, reorder, or drop
+	// columns, and a derived column has no table origin at all.
+	const leftMap = resolveTableColumnMapping(join.left as RelationalPlanNode);
+	const rightMap = resolveTableColumnMapping(join.right as RelationalPlanNode);
+	if (!leftMap || !rightMap) return null;
 
 	// FK side is the preserved side; PK side is the side being removed.
-	const fkSchema = sideToRemove === 'right' ? leftSchema : rightSchema;
-	const pkSchema = sideToRemove === 'right' ? rightSchema : leftSchema;
-	const fkEquiCols = pairs.map(p => sideToRemove === 'right' ? p.left : p.right);
-	const pkEquiCols = pairs.map(p => sideToRemove === 'right' ? p.right : p.left);
+	const fkMap = sideToRemove === 'right' ? leftMap : rightMap;
+	const pkMap = sideToRemove === 'right' ? rightMap : leftMap;
+	const fkSchema = fkMap.schema;
+	const pkSchema = pkMap.schema;
+	const fkEquiCols = mapColumnsToTable(pairs.map(p => sideToRemove === 'right' ? p.left : p.right), fkMap);
+	const pkEquiCols = mapColumnsToTable(pairs.map(p => sideToRemove === 'right' ? p.right : p.left), pkMap);
+	if (!fkEquiCols || !pkEquiCols) return null;
 
 	if (!checkFkPkAlignment(fkSchema, pkSchema, fkEquiCols, pkEquiCols)) return null;
 
@@ -239,6 +252,8 @@ function tryEliminate(
 	//     RetrieveNode with a non-trivial pipeline) between the join and the
 	//     base table would have dropped rows that the FK→PK guarantee assumes
 	//     are present, so eliminating would silently survive orphaned FK rows.
+	//     A Project is peeled (it never drops rows); its column renaming is
+	//     already accounted for by the mapping translation above.
 	if (join.joinType === 'inner') {
 		const match = lookupCoveringFK(fkSchema, pkSchema, fkEquiCols, pkEquiCols);
 		if (!match) return null;
