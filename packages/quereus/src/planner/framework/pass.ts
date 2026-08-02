@@ -210,9 +210,11 @@ export const STANDARD_PASSES: OptimizationPass[] = [
 	// because Materialization rewrote something inside the predicate is the case
 	// that motivated this pass. Rules registered here re-derive such an estimate
 	// against the FINAL node, so an estimate's survival no longer depends on which
-	// pass happens to touch its node last. Nothing may be registered after this
-	// pass except read-only checks; `test/optimizer/rule-manifest.spec.ts` asserts
-	// that statically.
+	// pass happens to touch its node last. Nothing that rewrites the plan may run
+	// behind this pass — neither a manifest rule nor a custom-`execute` pass;
+	// `test/optimizer/rule-manifest.spec.ts` asserts both statically. That check is
+	// deliberately blunt: a genuinely read-only rule registered behind here trips it
+	// too, so adding one is a deliberate edit to that test rather than a silent one.
 	createPass(
 		PassId.FinalEstimates,
 		'Final Estimates',

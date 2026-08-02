@@ -368,7 +368,7 @@ This distinction is important: a query joining a local `MemoryTable` with a DHT-
   Cons:
   - NaiveStatsProvider's defaults may not produce the "robust worst-case" behavior in all scenarios. Example: defaultSelectivity: 0.3 combined with a 1000-row default means an equality predicate estimates 300 rows — might not trigger index seek if the cost model sees it
    as marginal
-  - The full optimizer runs all 5 passes, including QuickPick join enumeration, CSE, CTE optimization — overkill for a "quick startup" tier
+  - The full optimizer runs every pass, including QuickPick join enumeration, CSE, CTE optimization — overkill for a "quick startup" tier
   - The cost model can make actively bad choices with heuristic inputs. NaiveStatsProvider treats all BinaryOps as 0.1 selectivity regardless of operator — a > comparison gets the same selectivity as =
   - "Tier 0 = existing optimizer with worse stats" means Tier 0 is not actually faster than Tier 1 — just less accurate. The "quick startup" goal isn't served
 

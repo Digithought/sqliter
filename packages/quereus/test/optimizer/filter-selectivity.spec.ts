@@ -415,6 +415,13 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		'WITH c AS (SELECT cat, qty FROM o) '
 		+ 'SELECT * FROM o WHERE o.qty = (SELECT max(qty) FROM c) '
 		+ "AND o.rid = (SELECT min(qty) FROM c) AND o.cat = 'a'";
+	// Same re-mint, but over a join — the multi-relation estimator path, which reaches
+	// the source subtree through `collectColumnOrigins` rather than the single-table
+	// walk. FULL JOIN keeps both base-table conjuncts in one Filter above the join.
+	const JOINED_MATERIALIZED_CTE_SQL =
+		'WITH c AS MATERIALIZED (SELECT cat, qty FROM o) '
+		+ 'SELECT * FROM o FULL JOIN r ON o.rid = r.id '
+		+ "WHERE o.qty = (SELECT max(qty) FROM c) AND o.cat = 'a' AND r.cat = 'x'";
 
 	/**
 	 * The upper Filter of `sql`'s optimized plan — identified by carrying the
@@ -449,6 +456,17 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 			.to.be.lessThan(1 / ndv['o.qty']);
 	});
 
+	it('re-stamps a filter over a JOIN whose predicate the materialization pass re-minted', () => {
+		// The multi-relation path, post-materialization: the estimate is rebuilt from
+		// per-conjunct origins over a join source that now carries the advisory's
+		// rewrites. The subquery conjunct compares against an attribute minted inside
+		// the subquery, so `collectColumnOrigins` cannot attribute it and it
+		// contributes nothing — the two base-table conjuncts are the estimate.
+		const f = subqueryFilterOf(JOINED_MATERIALIZED_CTE_SQL);
+		expect(f.selectivity)
+			.to.be.closeTo(combineConjunctive([1 / ndv['o.cat'], 1 / ndv['r.cat']]), 1e-12);
+	});
+
 	it('leaves the materialization-marked spellings unstamped when only the final re-stamp is disabled', () => {
 		// Negative control for the new registration alone: the PostOptimization
 		// re-stamp still runs and still recovers the plain spelling. Only the
@@ -469,6 +487,9 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 			.to.be.undefined;
 		expect(subqueryFilterOf(TWICE_REFERENCED_CTE_SQL).selectivity,
 			'a twice-referenced CTE trips the same mark with no hint written')
+			.to.be.undefined;
+		expect(subqueryFilterOf(JOINED_MATERIALIZED_CTE_SQL).selectivity,
+			'the multi-relation path loses the stamp to the same re-mint')
 			.to.be.undefined;
 	});
 

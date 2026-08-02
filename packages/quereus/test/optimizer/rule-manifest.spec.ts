@@ -110,40 +110,58 @@ describe('registerManifest', () => {
  * `bug-filter-row-estimate-lost-in-materialization-pass`.
  *
  * That guarantee holds only while nothing which mutates the plan runs BEHIND that pass.
- * Pass order lives in `STANDARD_PASSES` and rule placement lives in `RULE_MANIFEST`, so
- * nothing but this check connects the two: a rule added to a later-ordered pass would
- * silently re-open the hole. Today only `PassId.Validation` (order 40) sits behind it,
- * and it carries no manifest entries.
+ * A plan mutation gets behind it in one of two ways — a rule registered into a
+ * later-ordered pass (`RULE_MANIFEST`), or a later-ordered pass with a custom `execute`
+ * and no rule slots at all (`STANDARD_PASSES`, as `PassId.Materialization` itself is).
+ * Both live apart from the pass order, so nothing but the checks below connects them.
+ * Today only `PassId.Validation` (order 40) sits behind the re-derivation point; it
+ * carries no manifest entries and no `execute`.
  */
-describe('RULE_MANIFEST: no rules run behind the final-estimates pass', () => {
-	// NOTE: this reads the manifest, so it is blind to a custom-`execute` pass — one
-	// with no rule slots at all, like `PassId.Materialization` itself. If a
-	// plan-mutating custom-execute pass is ever ordered after 37, this test still
-	// passes while the hole re-opens; extend it to assert on `STANDARD_PASSES`
-	// entries carrying an `execute` too.
+describe('nothing plan-mutating runs behind the final-estimates pass', () => {
 	const orderOf = new Map(STANDARD_PASSES.map(p => [p.id, p.order]));
+	/** Unknown pass → treated as behind, so the sibling case below names it loudly. */
+	const orderOrBehind = (passId: string): number => orderOf.get(passId) ?? Number.POSITIVE_INFINITY;
+	const finalOrder = orderOrBehind(PassId.FinalEstimates);
+
+	const REMEDY =
+		'Either move it ahead of PassId.FinalEstimates, or (if it genuinely must run last) add a '
+		+ 're-derivation point behind it and update this test deliberately.';
+
+	it('PassId.FinalEstimates is one of the standard passes', () => {
+		// Everything below compares against its order, so a missing pass would silently
+		// classify every entry as "not behind".
+		expect(orderOf.has(PassId.FinalEstimates), 'PassId.FinalEstimates missing from STANDARD_PASSES')
+			.to.be.true;
+	});
 
 	it('every manifest entry targets a standard pass', () => {
-		// Guards the assertion below: an entry whose pass is missing from the order map
-		// could not be classified as before-or-behind at all.
 		const unknown = RULE_MANIFEST.filter(e => !orderOf.has(e.pass)).map(e => `${e.id} → ${e.pass}`);
 		expect(unknown, 'manifest entries targeting a pass not in STANDARD_PASSES').to.deep.equal([]);
 	});
 
 	it('no manifest entry targets a pass ordered after PassId.FinalEstimates', () => {
-		const finalOrder = orderOf.get(PassId.FinalEstimates);
-		expect(finalOrder, 'PassId.FinalEstimates must be one of the standard passes').to.be.a('number');
-
 		const behind = RULE_MANIFEST
-			.filter(e => (orderOf.get(e.pass) as number) > (finalOrder as number))
+			.filter(e => orderOrBehind(e.pass) > finalOrder)
 			.map(e => `${e.id} → ${e.pass}`);
 
 		expect(behind,
 			'A rule registered after PassId.FinalEstimates can rewrite a node whose plan estimate '
 			+ 'was re-derived there, and nothing runs after it to derive the estimate again — the '
-			+ 'exact hole bug-filter-row-estimate-lost-in-materialization-pass closed. Either move '
-			+ 'the rule ahead of that pass, or (if it genuinely must run last) add a re-derivation '
-			+ 'point behind it and update this test deliberately.')
+			+ `exact hole bug-filter-row-estimate-lost-in-materialization-pass closed. ${REMEDY}`)
+			.to.deep.equal([]);
+	});
+
+	it('no custom-execute pass is ordered after PassId.FinalEstimates', () => {
+		// A custom-`execute` pass has no rule slots, so the manifest check above cannot
+		// see it — `PassId.Materialization`, the pass that opened the hole in the first
+		// place, is exactly that shape.
+		const behind = STANDARD_PASSES
+			.filter(p => p.execute !== undefined && p.order > finalOrder)
+			.map(p => `${p.id} (order ${p.order})`);
+
+		expect(behind,
+			'A custom-execute pass ordered after PassId.FinalEstimates rewrites the plan with no '
+			+ `re-derivation point behind it — the shape of the original bug. ${REMEDY}`)
 			.to.deep.equal([]);
 	});
 });
