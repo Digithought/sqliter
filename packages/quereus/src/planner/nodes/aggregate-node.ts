@@ -11,7 +11,7 @@ import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
 import { aggregateCost } from '../cost/index.js';
-import { physicalSourceRows } from '../util/row-estimates.js';
+import { aggregateRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
 
 export interface AggregateExpression {
   expression: ScalarPlanNode;
@@ -271,23 +271,10 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
     return this.rowsFrom(this.source.estimatedRows);
   }
 
-  /**
-   * The aggregate's row estimate as a pure function of the source cardinality,
-   * shared by the logical getter and `computePhysical` (which feeds it the
-   * PHYSICAL source count) so the two cannot drift apart.
-   */
   private rowsFrom(sourceRows: number | undefined): number | undefined {
-    if (sourceRows === undefined) return undefined;
-
-    // If we have GROUP BY, the output rows depend on the number of distinct groups
-    // For now, we'll use a conservative estimate
-    if (this.groupBy.length > 0) {
-      // Estimate that we'll have at most sourceRows/2 groups, but at least 1
-      return Math.max(1, Math.floor(sourceRows / 2));
-    } else {
-      // No GROUP BY means we're aggregating the entire table into a single row
-      return 1;
-    }
+    // The logical node is deliberately more conservative than its physical
+    // counterparts about how much a GROUP BY collapses: 2 rows per group, not 10.
+    return aggregateRowsFrom(sourceRows, this.groupBy.length > 0, 2);
   }
 
   computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {

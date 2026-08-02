@@ -9,7 +9,7 @@ import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
 import { COST_CONSTANTS } from '../cost/index.js';
 import { propagateAggregateFds } from './aggregate-node.js';
-import { physicalSourceRows } from '../util/row-estimates.js';
+import { aggregateRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
 
 /**
@@ -160,19 +160,8 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode, 
 		return this.rowsFrom(this.source.estimatedRows);
 	}
 
-	/**
-	 * The aggregate's row estimate as a pure function of the source cardinality —
-	 * `computePhysical` feeds it the PHYSICAL source count, this getter the logical
-	 * one, and neither can drift from the other.
-	 */
 	private rowsFrom(sourceRows: number | undefined): number | undefined {
-		if (sourceRows === undefined) return undefined;
-
-		if (this.groupBy.length > 0) {
-			return Math.max(1, Math.floor(sourceRows / 10));
-		} else {
-			return 1;
-		}
+		return aggregateRowsFrom(sourceRows, this.groupBy.length > 0, 10);
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {

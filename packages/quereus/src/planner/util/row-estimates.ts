@@ -43,3 +43,36 @@ export function physicalSourceRows(
 ): number | undefined {
 	return childPhysical?.estimatedRows ?? source.estimatedRows;
 }
+
+/**
+ * An aggregate's output cardinality as a pure function of its source's — shared
+ * by every aggregate node's logical `estimatedRows` getter and its
+ * `computePhysical` (which feeds it the PHYSICAL source count) so the two cannot
+ * drift, and by all three aggregate flavours so their only difference is the
+ * `groupDivisor` each believes its grouping produces.
+ *
+ * @param grouped whether the aggregate has a GROUP BY (ungrouped always emits one row)
+ * @param groupDivisor rows-per-group assumption for the grouped estimate
+ */
+export function aggregateRowsFrom(
+	sourceRows: number | undefined,
+	grouped: boolean,
+	groupDivisor: number,
+): number | undefined {
+	if (sourceRows === undefined) return undefined;
+
+	// No GROUP BY: the whole input folds into exactly one row, whatever comes in
+	// (including the unknown sentinel — the count is not a function of the source).
+	if (!grouped) return 1;
+
+	// 0 must pass through unchanged. It is both the genuinely-empty count (0 rows
+	// in ⇒ 0 groups out) and the never-analyzed "unknown" sentinel (see the NOTE
+	// on `physicalSourceRows`), and flooring it to 1 conflates them: unknown would
+	// leave here as a confident single row, which reads as a real magnitude and
+	// silently defeats every downstream `|| default` unknown-guard —
+	// `rule-join-physical-selection` costed a 1x1 join and kept the nested loop
+	// where both sides were un-analyzed grouped aggregates.
+	if (sourceRows === 0) return 0;
+
+	return Math.max(1, Math.floor(sourceRows / groupDivisor));
+}

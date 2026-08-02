@@ -8,7 +8,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
 import { propagateAggregateFds } from './aggregate-node.js';
-import { physicalSourceRows } from '../util/row-estimates.js';
+import { aggregateRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
 
 /**
@@ -170,22 +170,8 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
     return this.rowsFrom(this.source.estimatedRows);
   }
 
-  /**
-   * The aggregate's row estimate as a pure function of the source cardinality —
-   * `computePhysical` feeds it the PHYSICAL source count, this getter the logical
-   * one, and neither can drift from the other.
-   */
   private rowsFrom(sourceRows: number | undefined): number | undefined {
-    if (sourceRows === undefined) return undefined;
-
-    if (this.groupBy.length > 0) {
-      // For streaming aggregate, we assume groups are somewhat clustered
-      // so we estimate fewer groups than hash aggregate would
-      return Math.max(1, Math.floor(sourceRows / 10));
-    } else {
-      // No GROUP BY means single output row
-      return 1;
-    }
+    return aggregateRowsFrom(sourceRows, this.groupBy.length > 0, 10);
   }
 
   computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
