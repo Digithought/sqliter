@@ -433,6 +433,167 @@ describe('lens overrides: body-shape validation', () => {
 	});
 });
 
+describe('lens overrides: unqualified basis sources', () => {
+	// An override may name its basis tables bare; the compiler pins them to the
+	// basis schema so the *stored* body says which schema it meant. Before that,
+	// every consumer re-resolved the bare name its own way and none knew the
+	// basis: the read path plans under the logical schema's home path, and the
+	// prover / `explain` round-trip the body through SQL text with no path at all.
+	it('carries the basis qualifier into effective_sql and proves the same inverses as the qualified form', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer, color text } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.CarCore values (1, 120, 'red')");
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, maxSpeed integer, color text } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed as maxSpeed from CarCore }');
+			await db.exec('apply schema x');
+
+			const sqlRows = await rows(db, "select distinct effective_sql from quereus_effective_lens('x', 'Car')");
+			expect(sqlRows.length).to.equal(1);
+			expect(String(sqlRows[0].effective_sql).toLowerCase()).to.contain('from y.carcore');
+
+			// The prover plans the stored body by round-tripping it through SQL text
+			// with no schema path, so an unqualified body used to fail to plan and
+			// every column degraded to inverse 'none'. Match the qualified form.
+			expect(await rows(db, "select logical_column, source, inverse from quereus_effective_lens('x', 'Car') order by logical_column"))
+				.to.deep.equal([
+					{ logical_column: 'color', source: 'default', inverse: 'inferred' },
+					{ logical_column: 'id', source: 'override', inverse: 'inferred' },
+					{ logical_column: 'maxSpeed', source: 'override', inverse: 'inferred' },
+				]);
+
+			expect(await rows(db, 'select * from x.Car')).to.deep.equal([{ id: 1, maxSpeed: 120, color: 'red' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// The sharp edge: a same-named table on the default schema path used to win,
+	// so the compiler validated coverage against the basis relation while the read
+	// bound `main`'s — different tables, no error.
+	it('binds the basis relation, not a same-named table in main', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Widget { id integer primary key, label text } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.Widget values (1, 'from-basis')");
+			await db.exec('create table Widget (id integer primary key, label text)');
+			await db.exec("insert into main.Widget values (2, 'from-main')");
+
+			await db.exec('declare logical schema x { table Widget { id integer primary key, label text } }');
+			await db.exec('declare lens for x over y { view Widget as select id, label from Widget }');
+			await db.exec('apply schema x');
+
+			expect(await rows(db, 'select * from x.Widget')).to.deep.equal([{ id: 1, label: 'from-basis' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// The qualification must not touch a bare name a CTE declares — that name is
+	// the CTE, and pinning it to the basis would silently swap the relation.
+	it('leaves a CTE that shadows a basis table name binding the CTE', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('insert into y.CarCore values (1, 120)');
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, maxSpeed integer } }');
+			await db.exec('declare lens for x over y { view Car as with CarCore as (select 9 as id, 1 as speed) select id, speed as maxSpeed from CarCore }');
+			await db.exec('apply schema x');
+
+			expect(await rows(db, 'select * from x.Car')).to.deep.equal([{ id: 9, maxSpeed: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// A CTE shadow is not an introspectable basis source, so gap-fill may not draw
+	// on the shadowed basis table. Previously it did: `color` was gap-filled from
+	// y.CarCore, which the CTE does not expose, and the body deployed only to fail
+	// at read with `Column not found: color`.
+	it('errors at deploy when a CTE shadow leaves an uncovered column unreachable', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer, color text } }');
+			await db.exec('apply schema y');
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, maxSpeed integer, color text } }');
+			await db.exec('declare lens for x over y { view Car as with CarCore as (select 9 as id, 1 as speed) select id, speed as maxSpeed from CarCore }');
+			await expectThrows(
+				() => db.exec('apply schema x'),
+				/not reachable.*'color'|'color'.*not reachable|column 'color'/i,
+			);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Qualification descends the whole body, not just top-level FROM sources.
+	it('qualifies a bare basis table inside a subquery source', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('insert into y.CarCore values (1, 120)');
+
+			await db.exec('declare logical schema x { table Car { id integer primary key, speed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed from (select * from CarCore) s }');
+			await db.exec('apply schema x');
+
+			expect(await rows(db, 'select * from x.Car')).to.deep.equal([{ id: 1, speed: 120 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('qualifies both legs of a bare two-table basis join', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Core { id integer primary key, name text } table Contact { id integer primary key, email text } }');
+			await db.exec('apply schema y');
+			await db.exec("insert into y.Core values (1, 'Ada')");
+			await db.exec("insert into y.Contact values (1, 'ada@x.io')");
+
+			await db.exec('declare logical schema x { table Person { id integer primary key, name text, email text } }');
+			await db.exec('declare lens for x over y { view Person as select c.id, c.name, k.email from Core c join Contact k using (id) }');
+			await db.exec('apply schema x');
+
+			expect(await rows(db, 'select * from x.Person')).to.deep.equal([{ id: 1, name: 'Ada', email: 'ada@x.io' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// Qualification rewrites a copy: the authored `declare lens` AST the catalog
+	// holds must still stringify exactly as written, or DDL round-trip and
+	// declarative-equivalence output would drift.
+	it('does not rewrite the authored declaration AST', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table CarCore { id integer primary key, speed integer } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Car { id integer primary key, maxSpeed integer } }');
+			await db.exec('declare lens for x over y { view Car as select id, speed as maxSpeed from CarCore }');
+			await db.exec('apply schema x');
+
+			const declared = db.declaredSchemaManager.getLensDeclaration('x');
+			expect(declared, 'declared lens should be retained').to.not.be.undefined;
+			const authored = astToString(declared!.overrides[0].select).toLowerCase();
+			expect(authored).to.contain('from carcore');
+			expect(authored).to.not.contain('y.carcore');
+
+			// …while the compiled body the engine reads *is* qualified.
+			expect(astToString(db.schemaManager.getView('x', 'Car')!.selectAst).toLowerCase()).to.contain('from y.carcore');
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens overrides: quereus_effective_lens', () => {
 	it('returns composed SQL + per-attribute source for a logical table', async () => {
 		const db = new Database();

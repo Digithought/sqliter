@@ -218,3 +218,272 @@ declare lens for tapp over tb {
 
 apply schema tapp;
 -- error: name
+
+-- ===================================
+-- 6. Unqualified basis sources — an override may name its basis tables bare.
+--    The compiler pins them to the basis schema, so the stored body reads the
+--    same as § 1's qualified form even though the basis is not on the default
+--    schema path.
+-- ===================================
+
+declare schema ubasis {
+	table CarCore {
+		id integer primary key,
+		speed integer,
+		color text
+	}
+}
+
+-- run
+
+apply schema ubasis;
+
+-- run
+
+insert into ubasis.CarCore values (1, 120, 'red'), (2, 90, 'blue');
+
+-- run
+
+declare logical schema uqapp {
+	table Car {
+		id integer primary key,
+		maxSpeed integer,
+		color text
+	}
+}
+
+-- run
+
+-- `CarCore` unqualified — resolves to ubasis.CarCore, not the default path.
+declare lens for uqapp over ubasis {
+	view Car as select id, speed as maxSpeed from CarCore
+}
+
+-- run
+
+apply schema uqapp;
+
+-- run
+
+select * from uqapp.Car order by id;
+→ [{"id": 1, "maxSpeed": 120, "color": "red"}, {"id": 2, "maxSpeed": 90, "color": "blue"}]
+
+select color from uqapp.Car where id = 2;
+→ [{"color": "blue"}]
+
+-- ===================================
+-- 7. Two-table basis join, both sources unqualified
+-- ===================================
+
+declare schema jbasis {
+	table PersonCore {
+		id integer primary key,
+		name text
+	}
+	table PersonContact {
+		id integer primary key,
+		email text
+	}
+}
+
+-- run
+
+apply schema jbasis;
+
+-- run
+
+insert into jbasis.PersonCore values (1, 'Ada');
+
+-- run
+
+insert into jbasis.PersonContact values (1, 'ada@x.io');
+
+-- run
+
+declare logical schema japp {
+	table Person {
+		id integer primary key,
+		name text,
+		email text
+	}
+}
+
+-- run
+
+declare lens for japp over jbasis {
+	view Person as select c.id, c.name, k.email from PersonCore c join PersonContact k using (id)
+}
+
+-- run
+
+apply schema japp;
+
+-- run
+
+select * from japp.Person;
+→ [{"id": 1, "name": "Ada", "email": "ada@x.io"}]
+
+-- ===================================
+-- 8. Basis is `main` — unqualified sources keep working (no regression; `main`
+--    was already on the default schema path)
+-- ===================================
+
+create table MainCore (
+	id integer primary key,
+	speed integer
+);
+
+-- run
+
+insert into MainCore values (7, 55);
+
+-- run
+
+declare logical schema mapp {
+	table Car {
+		id integer primary key,
+		maxSpeed integer
+	}
+}
+
+-- run
+
+declare lens for mapp over main {
+	view Car as select id, speed as maxSpeed from MainCore
+}
+
+-- run
+
+apply schema mapp;
+
+-- run
+
+select * from mapp.Car;
+→ [{"id": 7, "maxSpeed": 55}]
+
+-- ===================================
+-- 9. A same-named table in `main` shadows nothing — an unqualified override
+--    source binds the BASIS relation, not the default-path one
+-- ===================================
+
+declare schema sbasis {
+	table Widget {
+		id integer primary key,
+		label text
+	}
+}
+
+-- run
+
+apply schema sbasis;
+
+-- run
+
+insert into sbasis.Widget values (1, 'from-basis');
+
+-- run
+
+create table Widget (
+	id integer primary key,
+	label text
+);
+
+-- run
+
+insert into main.Widget values (2, 'from-main');
+
+-- run
+
+declare logical schema sapp {
+	table Widget {
+		id integer primary key,
+		label text
+	}
+}
+
+-- run
+
+declare lens for sapp over sbasis {
+	view Widget as select id, label from Widget
+}
+
+-- run
+
+apply schema sapp;
+
+-- run
+
+select * from sapp.Widget;
+→ [{"id": 1, "label": "from-basis"}]
+
+-- ===================================
+-- 10. A CTE shadowing a basis table name still binds the CTE
+-- ===================================
+
+declare schema cbasis {
+	table CarCore {
+		id integer primary key,
+		speed integer,
+		color text
+	}
+}
+
+-- run
+
+apply schema cbasis;
+
+-- run
+
+insert into cbasis.CarCore values (1, 120, 'red');
+
+-- run
+
+declare logical schema ctapp {
+	table Car {
+		id integer primary key,
+		maxSpeed integer
+	}
+}
+
+-- run
+
+-- `CarCore` here is the CTE, not cbasis.CarCore — its rows are what reads.
+declare lens for ctapp over cbasis {
+	view Car as with CarCore as (select 9 as id, 1 as speed) select id, speed as maxSpeed from CarCore
+}
+
+-- run
+
+apply schema ctapp;
+
+-- run
+
+select * from ctapp.Car;
+→ [{"id": 9, "maxSpeed": 1}]
+
+-- ===================================
+-- 11. A CTE shadow is not a basis source, so a column it does not expose is
+--     an uncovered-column error at DEPLOY (not a read-time surprise)
+-- ===================================
+
+declare logical schema ctgapp {
+	table Car {
+		id integer primary key,
+		maxSpeed integer,
+		color text
+	}
+}
+
+-- run
+
+-- `color` is uncovered; the CTE cannot back it and cbasis.CarCore is not a
+-- source of this body, so the deploy rejects rather than composing an
+-- unreadable body.
+declare lens for ctgapp over cbasis {
+	view Car as with CarCore as (select 9 as id, 1 as speed) select id, speed as maxSpeed from CarCore
+}
+
+-- run
+
+apply schema ctgapp;
+-- error: color

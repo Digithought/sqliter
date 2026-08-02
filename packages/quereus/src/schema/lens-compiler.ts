@@ -19,6 +19,7 @@ import type { MappingAdvertisement, DecompositionMember, StorageShape } from '..
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import type { InclusionDependency } from '../planner/nodes/plan-node.js';
 import { addInd, MAX_INDS_PER_NODE } from '../planner/util/fd-utils.js';
+import { spineCloneAst } from '../util/ast-spine-clone.js';
 
 const log = createLogger('schema:lens-compiler');
 
@@ -367,7 +368,11 @@ function deriveRelationBacking(
 	basis: { schema: Schema; schemaName: string },
 	schemaManager: SchemaManager,
 ): Map<string, LensRelationBacking> {
-	const { sources } = collectOverrideSources(body.from, basis.schemaName, schemaManager);
+	// The compiled body is fully qualified (see `qualifyBasisSources`), so a bare
+	// name surviving in it is a CTE reference or unresolvable — never a basis
+	// table. Carry the shadow set so neither pass claims a CTE as basis backing.
+	const cteNames = collectCteNames(body);
+	const { sources } = collectOverrideSources(body.from, basis.schemaName, schemaManager, cteNames);
 	const byRef = new Map<string, OverrideSource>();
 	for (const s of sources) byRef.set(s.refName.toLowerCase(), s);
 	const single = sources.length === 1 ? sources[0] : undefined;
@@ -406,7 +411,7 @@ function deriveRelationBacking(
 	}
 
 	// 2. Shared join keys — thread each equated key column to a projected logical column.
-	for (const cls of collectJoinKeyEquivalences(body.from, basis.schemaName, schemaManager)) {
+	for (const cls of collectJoinKeyEquivalences(body.from, basis.schemaName, schemaManager, cteNames)) {
 		let logical: string | undefined;
 		for (const m of cls) {
 			const proj = projected.find(p => sourceRelKey(p.src) === sourceRelKey(m.src)
@@ -437,6 +442,7 @@ function collectJoinKeyEquivalences(
 	from: ReadonlyArray<AST.FromClause> | undefined,
 	basisSchemaName: string,
 	schemaManager: SchemaManager,
+	cteNames: ReadonlySet<string>,
 ): KeyMember[][] {
 	const classes: KeyMember[][] = [];
 	if (!from) return classes;
@@ -445,8 +451,7 @@ function collectJoinKeyEquivalences(
 		const out: OverrideSource[] = [];
 		const walk = (n: AST.FromClause): void => {
 			if (n.type === 'table') {
-				const schemaName = n.table.schema ?? basisSchemaName;
-				const tbl = schemaManager.getSchema(schemaName)?.getTable(n.table.name);
+				const tbl = resolveBasisTableSource(n, basisSchemaName, schemaManager, cteNames);
 				if (tbl) out.push({ table: tbl, refName: n.alias ?? tbl.name });
 			} else if (n.type === 'join') {
 				walk(n.left);
@@ -1206,10 +1211,16 @@ function compileOverrideBody(
 	// lens is `over Y`) would silently re-anchor the body to Z (docs/lens.md § D4).
 	validateOverrideBasisSources(select, basisSchemaName, logicalSchemaName, logicalName);
 
+	// Names a CTE declares anywhere in the body shadow same-named basis relations:
+	// they are neither collectable as basis sources (their columns are the CTE's,
+	// not the basis table's, so `*` expansion and gap-fill must not use them) nor
+	// qualifiable with the basis schema.
+	const cteNames = collectCteNames(select);
+
 	// Resolve FROM-source basis tables once — used for both `*` expansion and
-	// gap-fill. Opaque sources (subquery / function / unresolvable table) are
+	// gap-fill. Opaque sources (subquery / function / CTE / unresolvable table) are
 	// tracked so a gap that actually needs them errors precisely.
-	const { sources, hasOpaqueSource } = collectOverrideSources(select.from, basisSchemaName, schemaManager);
+	const { sources, hasOpaqueSource } = collectOverrideSources(select.from, basisSchemaName, schemaManager, cteNames);
 	const qualify = sources.length > 1;
 
 	// Advertisement-driven gap-fill needs to map an advertised member relationId to
@@ -1315,9 +1326,136 @@ function compileOverrideBody(
 
 	// Preserve every non-projection clause of the override (where/group/having/
 	// order/limit/distinct/with — the filter shape, etc.); replace only the
-	// projection with the composed logical-column list.
-	const body: AST.SelectStmt = { ...select, columns: composed };
+	// projection with the composed logical-column list, then pin each bare basis
+	// source to the basis schema so the stored body resolves the same way for
+	// every consumer (read / prover / explain), not just for this compiler.
+	const body = qualifyBasisSources(
+		{ ...select, columns: composed }, basisSchemaName, schemaManager, cteNames,
+	);
 	return { body, provenance, effectiveColumns };
+}
+
+/**
+ * Reflectively visits every plain-object node reachable from `root`, in no
+ * particular order. Descent is *not* gated on a `type` discriminant: some
+ * containers that hold nested SELECTs are plain wrappers without one — notably
+ * `compound` (`{ op, select }`) and `orderBy` clauses — so a type-gated walk
+ * would skip everything nested under them. Arrays are transparent (their
+ * elements are visited, the array itself is not).
+ *
+ * Anything with a non-plain prototype (`Uint8Array`, a Promise
+ * {@link AST.LiteralExpr} value, any class instance) is a leaf and is neither
+ * visited nor descended into — the same boundary {@link spineCloneAst} draws.
+ */
+function forEachAstNode(root: unknown, visit: (node: Record<string, unknown>) => void): void {
+	const stack: unknown[] = [root];
+	while (stack.length > 0) {
+		const node = stack.pop();
+		if (!node || typeof node !== 'object') continue;
+		if (!Array.isArray(node)) {
+			const proto = Object.getPrototypeOf(node);
+			if (proto !== Object.prototype && proto !== null) continue;
+			visit(node as Record<string, unknown>);
+		}
+		for (const value of Object.values(node as Record<string, unknown>)) {
+			if (value && typeof value === 'object') stack.push(value);
+		}
+	}
+}
+
+/**
+ * Every CTE name declared anywhere in an override body, lowercased — the set of
+ * bare FROM names that must NOT be read as basis tables (a CTE shadows a
+ * same-named basis relation, per SQL scoping).
+ *
+ * NOTE: this is one flat set over the whole body, not per-scope frames as
+ * `schema/rename-rewriter.ts` maintains. A name declared as a CTE in *any*
+ * nested scope therefore disables basis-qualification and basis-source
+ * collection for that name in *all* scopes, including scopes where it really is
+ * the basis table. That direction is safe — such a reference keeps today's
+ * behavior (unqualified, hence unresolved at read time, hence a loud error)
+ * rather than risking a silently wrong bind. If a real body ever needs the same
+ * name to mean a CTE in one scope and the basis table in another, replace this
+ * with the per-scope frames `rename-rewriter.ts` already models.
+ */
+function collectCteNames(select: AST.SelectStmt): Set<string> {
+	const names = new Set<string>();
+	forEachAstNode(select, node => {
+		if (node.type === 'commonTableExpr') names.add((node as unknown as AST.CommonTableExpr).name.toLowerCase());
+	});
+	return names;
+}
+
+/**
+ * Rewrites every bare FROM `table` reference that resolves in the declared basis
+ * so it carries the basis schema qualifier explicitly.
+ *
+ * The compiler resolves an unqualified override source against the basis
+ * (docs/lens.md § Body-shape restrictions), but the *stored* body used to keep
+ * the authored FROM verbatim — so nothing recorded which schema the bare name
+ * meant, and each downstream consumer re-resolved it its own way: the read path
+ * plans the body under the **logical** schema's home path, while the prover and
+ * `explain` round-trip it through SQL text with no path context at all. None of
+ * those knows the basis, so an unqualified source either failed to resolve or
+ * (with a same-named `main` table in the way) silently bound the wrong relation.
+ * Qualifying here makes the stored body self-describing, so every consumer
+ * agrees by construction — and matches `compileDefaultBody` /
+ * `compileDecompositionBody`, which already emit fully-qualified references.
+ *
+ * A bare name is left exactly as authored when a CTE shadows it (see
+ * {@link collectCteNames}) or when the basis has no such table — an
+ * unresolvable name stays opaque and surfaces the same error it does today.
+ *
+ * The input AST is never mutated: `select` here is the authored
+ * `override.select`, which is also stored as the slot's override *and* lives in
+ * the declared-lens AST held by the catalog, so an in-place edit would rewrite
+ * the user's own declaration (and perturb DDL round-trip / declarative
+ * equivalence). A rewrite therefore works on a spine clone; when there is
+ * nothing to rewrite the input is returned untouched.
+ */
+function qualifyBasisSources(
+	select: AST.SelectStmt,
+	basisSchemaName: string,
+	schemaManager: SchemaManager,
+	cteNames: ReadonlySet<string>,
+): AST.SelectStmt {
+	const basis = schemaManager.getSchema(basisSchemaName);
+	if (!basis) return select;
+
+	const needsQualifier = (node: Record<string, unknown>): boolean => {
+		if (node.type !== 'table') return false;
+		const src = node as unknown as AST.TableSource;
+		if (src.table.schema !== undefined) return false;
+		if (cteNames.has(src.table.name.toLowerCase())) return false;
+		return basis.getTable(src.table.name) !== undefined;
+	};
+
+	let found = false;
+	forEachAstNode(select, node => { if (needsQualifier(node)) found = true; });
+	if (!found) return select;
+
+	const clone = spineCloneAst(select);
+	forEachAstNode(clone, node => {
+		if (needsQualifier(node)) (node as unknown as AST.TableSource).table.schema = basisSchemaName;
+	});
+	return clone;
+}
+
+/**
+ * Resolves one FROM `table` node to its basis table, or undefined when it is not
+ * an introspectable basis relation. A bare name a CTE declares is *not* a basis
+ * table — resolving it as one would attribute the CTE's rows (and columns) to a
+ * basis relation the body never reads.
+ */
+function resolveBasisTableSource(
+	node: AST.TableSource,
+	basisSchemaName: string,
+	schemaManager: SchemaManager,
+	cteNames: ReadonlySet<string>,
+): TableSchema | undefined {
+	if (node.table.schema === undefined && cteNames.has(node.table.name.toLowerCase())) return undefined;
+	const schemaName = node.table.schema ?? basisSchemaName;
+	return schemaManager.getSchema(schemaName)?.getTable(node.table.name);
 }
 
 /** Walks an override's FROM tree, collecting introspectable basis-table sources. */
@@ -1325,6 +1463,7 @@ function collectOverrideSources(
 	from: ReadonlyArray<AST.FromClause> | undefined,
 	basisSchemaName: string,
 	schemaManager: SchemaManager,
+	cteNames: ReadonlySet<string>,
 ): { sources: OverrideSource[]; hasOpaqueSource: boolean } {
 	const sources: OverrideSource[] = [];
 	let hasOpaqueSource = false;
@@ -1332,8 +1471,7 @@ function collectOverrideSources(
 	const walk = (node: AST.FromClause): void => {
 		switch (node.type) {
 			case 'table': {
-				const schemaName = node.table.schema ?? basisSchemaName;
-				const tbl = schemaManager.getSchema(schemaName)?.getTable(node.table.name);
+				const tbl = resolveBasisTableSource(node, basisSchemaName, schemaManager, cteNames);
 				if (!tbl) { hasOpaqueSource = true; return; }
 				sources.push({ table: tbl, refName: node.alias ?? tbl.name });
 				break;
@@ -1361,14 +1499,12 @@ function collectOverrideSources(
  * `over Y` basis); reject it at deploy time. Unqualified tables default to the
  * basis and are fine; tables qualified with the basis name are fine.
  *
- * The walk is reflective over the entire override `select` AST, so it descends
- * into subquery-source FROM trees, function-source argument subqueries, `with`
- * CTE bodies, compound (`union`/`intersect`/…) legs, and scalar/`where`/`in`/
- * `exists` subqueries — a cross-basis `z.Foo` in any of those nested positions is
- * flagged too, not only top-level `table`/`join` sources. Descent is *not* gated
- * on a `type` discriminant: some containers that hold nested SELECTs are plain
- * wrappers without one — notably `compound` (`{ op, select }`) and `orderBy`
- * clauses — so a type-gated walk would skip the tables nested under them.
+ * The walk ({@link forEachAstNode}) is reflective over the entire override
+ * `select` AST, so it descends into subquery-source FROM trees, function-source
+ * argument subqueries, `with` CTE bodies, compound (`union`/`intersect`/…) legs,
+ * and scalar/`where`/`in`/`exists` subqueries — a cross-basis `z.Foo` in any of
+ * those nested positions is flagged too, not only top-level `table`/`join`
+ * sources.
  *
  * No CTE-name / alias scope tracking is needed. The check fires only on a `table`
  * node carrying an explicit, non-basis *schema qualifier*; CTE references and
@@ -1377,6 +1513,10 @@ function collectOverrideSources(
  * bare name is always either the basis or a CTE — never a cross-basis relation.
  * Only a schema-qualified table can be cross-basis, and that can never name a
  * CTE/alias, so the walk needs no in-scope-name set to avoid false positives.
+ *
+ * Runs on the **authored** select, before {@link qualifyBasisSources} rewrites
+ * bare basis names — the qualifier that pass adds is the basis one, so ordering
+ * does not change the verdict either way.
  */
 function validateOverrideBasisSources(
 	select: AST.SelectStmt,
@@ -1385,26 +1525,17 @@ function validateOverrideBasisSources(
 	logicalName: string,
 ): void {
 	const lowerBasis = basisSchemaName.toLowerCase();
-	const stack: unknown[] = [select];
-	while (stack.length > 0) {
-		const node = stack.pop();
-		if (!node || typeof node !== 'object') continue;
-		if ((node as AST.AstNode).type === 'table') {
-			const source = node as AST.TableSource;
-			const schema = source.table.schema;
-			if (schema && schema.toLowerCase() !== lowerBasis) {
-				throw new QuereusError(
-					`lens: override for logical table '${logicalSchemaName}.${logicalName}' references basis relation '${schema}.${source.table.name}' outside the declared basis '${basisSchemaName}' (the lens is declared 'over ${basisSchemaName}'); an override's FROM may only reference the declared basis`,
-					StatusCode.ERROR,
-				);
-			}
+	forEachAstNode(select, node => {
+		if (node.type !== 'table') return;
+		const source = node as unknown as AST.TableSource;
+		const schema = source.table.schema;
+		if (schema && schema.toLowerCase() !== lowerBasis) {
+			throw new QuereusError(
+				`lens: override for logical table '${logicalSchemaName}.${logicalName}' references basis relation '${schema}.${source.table.name}' outside the declared basis '${basisSchemaName}' (the lens is declared 'over ${basisSchemaName}'); an override's FROM may only reference the declared basis`,
+				StatusCode.ERROR,
+			);
 		}
-		// Reflective descent: push every nested object/array element. Arrays are
-		// transparent here — Object.values yields their elements.
-		for (const value of Object.values(node as Record<string, unknown>)) {
-			if (value && typeof value === 'object') stack.push(value);
-		}
-	}
+	});
 }
 
 /** Output name a result column contributes: its alias, or the bare column name. */
@@ -1831,7 +1962,9 @@ function validateOverrideAdvertisementConflict(
 	const memberRelations = new Set(
 		storage.members.map(m => `${(m.relation.schema || basisSchemaName).toLowerCase()}.${m.relation.table.toLowerCase()}`),
 	);
-	const { sources } = collectOverrideSources(override.select.from, basisSchemaName, schemaManager);
+	const { sources } = collectOverrideSources(
+		override.select.from, basisSchemaName, schemaManager, collectCteNames(override.select),
+	);
 	for (const src of sources) {
 		const key = `${src.table.schemaName.toLowerCase()}.${src.table.name.toLowerCase()}`;
 		if (!memberRelations.has(key)) {
