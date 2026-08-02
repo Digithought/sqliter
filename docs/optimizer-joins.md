@@ -73,7 +73,7 @@ earns from `computePhysical`.
 
 After join ordering (QuickPick), the optimizer selects a physical join algorithm for each join node. This runs in the PostOptimization pass (after QuickPick in the Physical pass) so the full logical join tree is visible to QuickPick before any physical conversion.
 
-The selection rule (`ruleJoinPhysicalSelection`) extracts equi-join pairs from AND-of-equalities in the ON condition, performs a three-way cost comparison (nested-loop vs hash vs merge), and selects the cheapest physical algorithm.
+The selection rule (`ruleJoinPhysicalSelection`) extracts equi-join pairs from AND-of-equalities in the ON condition, performs a four-way cost comparison (nested-loop vs hash vs merge vs index-nested-loop), and selects the cheapest physical algorithm. The rule declines outright when either input is correlated: hash and merge drain a side once, outside any outer row's scope, so a correlated side — e.g. a `JOIN LATERAL` subtree reading outer columns — must keep the nested-loop driver. (That guard is also what makes the index-nested-loop rewrite below idempotent: its own output has a correlated right side.)
 
 **Admissibility and tagging in `rules/join/equi-pair-extractor.ts`** decide whether a candidate pair may become a physical key, and with which properties. A physical key compares with no type context, so it must reproduce what the `=` operator says:
 
@@ -111,10 +111,25 @@ Selected when both inputs are already sorted on the equi-join columns (or when s
 - **Null handling**: NULL keys never match (consistent with SQL null != null semantics)
 - **Collation awareness**: Each equi-pair's key comparator is resolved through the same shared lattice as bloom/nested-loop. Because the physical ordering property (`PhysicalProperties.ordering`) is collation-blind, merge correctness depends on both inputs being sorted under the resolved collation — so the selection rules (`rule-join-physical-selection` and `rule-monotonic-merge-join`) consider merge **only when every equi-pair has `collationsMatch`** (both sides declare the same collation, making the resolved key collation equal each input's declared sort collation). Any mismatched pair removes merge from the candidate set and hash vs nested-loop compete; merging on just the matched subset of a multi-key join is deliberately not attempted (rare shape, and losing it costs an optimization, never a row).
 
+### Index-Nested-Loop Join
+
+Selected when the join's inner (right) side bottoms out in an unconstrained every-row walk over a table whose module can answer an equality seek on the join key. `rules/join/index-nested-loop.ts` builds the candidate; the four-way comparison in `rule-join-physical-selection` adopts it. The logical `JoinNode` — and therefore the nested-loop emitter — survives; only the right access leaf is replaced with an `IndexSeekNode` whose seek keys are column references into the **outer** row. For each outer row the emitter installs the left row slot and re-opens the inner pipeline, so the seek keys re-resolve per row through the runtime context by attribute id — the same machinery correlated subqueries already exercise.
+
+- **Complexity**: O(n · seek) — one seek per outer row — vs O(n + m) for hash/merge. Wins when the outer side is small and the inner is large with a selective index. Selectivity authority stays with the module: `getBestAccessPlan` is probed twice (with the synthesized join constraints, and with none), and the seek must beat the module's own scan on **both** cost and rows — module currency compared to module currency, the same discipline as `rule-key-set-seek`'s break-even.
+- **Supports**: INNER, LEFT, SEMI, and ANTI — the types the emitter drives from the left. SEMI/ANTI benefit most: the emitter breaks on the first inner row, so a one-row seek ends the inner loop immediately. RIGHT/FULL drive from the right with no left slot installed and never take this path. `exists … as` existence joins **can** take it (the flag bit is derived by the surviving nested-loop emitter) — the one physical join algorithm available to them, since hash/merge drop the appended flag column.
+- **ON condition retained** on the join: redundant when the seek is exact, but the safety net when the seek over-fetches (a `COARSER_SAFE` collation cover, a module returning a superset). Costs one predicate evaluation per emitted row, not per scanned row.
+- **NULL outer key**: the seek key is NULL, the scan layer's NULL-seek guard returns no rows, and the outer row is unmatched — INNER/SEMI drop it, LEFT null-pads it, ANTI keeps it. `NULL = x` is UNKNOWN, so this is the correct answer, not an accident.
+- **Declines** (leaving nested-loop / hash / merge to compete): a right side that does not peel through Alias / trivial Project / Filter (`rules/shared/access-leaf.ts`, shared with `rule-key-set-seek`) to an unconstrained leaf — pushed constraints, a pushed limit/offset, or a load-bearing walk order all disqualify; side effects on the right; cross-logical-type or semantic-ordering join keys (a raw-value seek can miss rows `=` considers equal, and the retained ON cannot resurrect a row never returned); a `MISMATCH_UNSAFE` collation cover; the module declining the seek, attaching a `residualFilter`, or costing the seek at or above its own scan. Collation, composite seeks, NULL handling, and residual reattachment are all delegated to the exported `selectPhysicalNode` from `rule-select-access-path` — anything but an `IndexSeekNode` coming back (a scan on a collation decline, an `EmptyResultNode` on an "impossible" predicate) declines the candidate.
+- **Determinism is deliberately not gated**: the nested loop already re-executes the inner side per outer row, so replacing a scan with a seek does not change how often a non-deterministic inner runs.
+- **Caching**: `rule-nested-loop-right-cache` declines correlated right sides, so the per-outer-row seek is never frozen behind a `CacheNode` (which would replay the first outer row's matches for every row).
+
 **Cost model** (from `src/planner/cost/index.ts`):
 - Merge join: `(leftRows + rightRows) × 0.3` + sort costs if needed
 - Hash join: `buildRows × 0.8 + probeRows × 0.4`
 - Nested loop: `outerRows × 1.0 + outerRows × innerRows × 0.1`
+- Index-nested-loop: `outerRows × (1.0 + 0.5 + rowsPerSeek × 0.3 + perSeekLatencyMs)` — `rowsPerSeek` is the module's estimate for the equality access plan
+
+Inner-side first-row latency (`physical.expectedLatencyMs`) is charged once to the hash and merge candidates (each drains the inner side once) and per outer row to index-nested-loop — locally inside the selection rule's comparison, not in the shared cost functions. Plain nested-loop's formula is left alone: it is the no-change fallback.
 
 For a 50×1000 self-join, hash join cost = 1000×0.8 + 50×0.4 = 820 vs nested loop = 50×1.0 + 50×1000×0.1 = 5050.
 

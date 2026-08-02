@@ -1,0 +1,263 @@
+/**
+ * Plan-shape and cost assertions for the index-nested-loop join: the fourth
+ * physical join algorithm chosen inside `rule-join-physical-selection`, whose
+ * candidate is built by `rules/join/index-nested-loop.ts`.
+ *
+ * On a win the logical JoinNode SURVIVES (the nested-loop emitter drives it);
+ * only its right access leaf is replaced by an `IndexSeekNode` whose seek keys
+ * are column references into the outer (left) row. So the plan signature is
+ * "a JoinNode whose right subtree contains an IndexSeek seeking on a left
+ * attribute" — see `correlatedSeekJoins`. Every decline path must leave that
+ * signature absent (the nested-loop / hash / merge competition is unchanged).
+ *
+ * Row-level correctness (INNER / LEFT / SEMI / ANTI, NULL keys, composite,
+ * self-join, three-way spine, collation) lives in
+ * `test/logic/11.3-index-nested-loop-join.sqllogic`.
+ */
+
+import { expect } from 'chai';
+import { Database } from '../../src/core/database.js';
+import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { JoinNode } from '../../src/planner/nodes/join-node.js';
+import { BloomJoinNode } from '../../src/planner/nodes/bloom-join-node.js';
+import { MergeJoinNode } from '../../src/planner/nodes/merge-join-node.js';
+import { IndexSeekNode } from '../../src/planner/nodes/table-access-nodes.js';
+import { CacheNode } from '../../src/planner/nodes/cache-node.js';
+import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
+import { ruleJoinPhysicalSelection } from '../../src/planner/rules/join/rule-join-physical-selection.js';
+import type { OptContext } from '../../src/planner/framework/context.js';
+import { indexNestedLoopJoinCost, hashJoinCost, nestedLoopJoinCost } from '../../src/planner/cost/index.js';
+
+function collectNodes<T extends PlanNode>(
+	root: PlanNode,
+	predicate: (n: PlanNode) => n is T,
+): T[] {
+	const found: T[] = [];
+	const walk = (n: PlanNode): void => {
+		if (predicate(n)) found.push(n);
+		for (const c of n.getChildren()) walk(c as PlanNode);
+	};
+	walk(root);
+	return found;
+}
+
+const isJoin = (n: PlanNode): n is JoinNode => n instanceof JoinNode;
+const isHashJoin = (n: PlanNode): n is BloomJoinNode => n instanceof BloomJoinNode;
+const isMergeJoin = (n: PlanNode): n is MergeJoinNode => n instanceof MergeJoinNode;
+const isIndexSeek = (n: PlanNode): n is IndexSeekNode => n instanceof IndexSeekNode;
+const isCache = (n: PlanNode): n is CacheNode => n instanceof CacheNode;
+const isColumnRef = (n: PlanNode): n is ColumnReferenceNode => n instanceof ColumnReferenceNode;
+
+/** Does this seek key expression reference any of the given attribute ids? */
+function keyReferences(key: PlanNode, attrIds: ReadonlySet<number>): boolean {
+	return collectNodes(key, isColumnRef).some(ref => attrIds.has(ref.attributeId));
+}
+
+/**
+ * The feature's plan signature: logical JoinNodes whose right subtree contains
+ * an IndexSeek with at least one seek key referencing a LEFT-side attribute.
+ * (A literal or pushed-range IndexSeek on the right does NOT match — its keys
+ * reference nothing on the left — so decline paths that legitimately keep a
+ * non-correlated seek in the right subtree still assert to zero.)
+ */
+function correlatedSeekJoins(root: PlanNode): JoinNode[] {
+	return collectNodes(root, isJoin).filter(join => {
+		const leftAttrIds = new Set(join.left.getAttributes().map(a => a.id));
+		return collectNodes(join.right, isIndexSeek).some(seek =>
+			seek.seekKeys.some(key => keyReferences(key, leftAttrIds)));
+	});
+}
+
+async function drain(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
+	const rows: Array<Record<string, unknown>> = [];
+	for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
+	return rows;
+}
+
+describe('index-nested-loop join plan shape', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		// Small outer: 4 rows, one NULL join key.
+		await db.exec('create table s (id integer primary key, k integer null)');
+		await db.exec('insert into s values (1, 5), (2, 7), (3, 9), (4, null)');
+		// Large inner: 200 rows; `v` secondary-indexed, `w` unindexed.
+		await db.exec('create table big (id integer primary key, v integer, w integer)');
+		await db.exec('create index idx_v on big(v)');
+		const rows: string[] = [];
+		for (let i = 1; i <= 200; i++) rows.push(`(${i}, ${i}, ${i % 10})`);
+		await db.exec(`insert into big values ${rows.join(', ')}`);
+		// ANALYZE feeds both the outer-rows estimate (left side) and the module's
+		// seek-vs-scan row answers the candidate's admission gate compares.
+		for await (const _ of db.eval('analyze')) { /* consume */ }
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('fires on a small outer joined to a large inner via a secondary index', () => {
+		const plan = db.getPlan('select s.id, big.id as bid from s join big on big.v = s.k');
+		const fired = correlatedSeekJoins(plan);
+		expect(fired, 'one JoinNode with a correlated IndexSeek right').to.have.lengthOf(1);
+		expect(fired[0].joinType).to.equal('inner');
+		expect(fired[0].condition, 'the ON condition is retained as the over-fetch safety net').to.not.be.undefined;
+		expect(collectNodes(plan, isHashJoin), 'no hash join').to.have.lengthOf(0);
+		expect(collectNodes(plan, isMergeJoin), 'no merge join').to.have.lengthOf(0);
+	});
+
+	it('fires on a primary-key join too', () => {
+		const plan = db.getPlan('select s.id, big.w from s join big on big.id = s.k');
+		expect(correlatedSeekJoins(plan)).to.have.lengthOf(1);
+	});
+
+	it('fires for LEFT joins (null-padding stays with the nested-loop driver)', () => {
+		const plan = db.getPlan('select s.id, big.id as bid from s left join big on big.v = s.k');
+		const fired = correlatedSeekJoins(plan);
+		expect(fired).to.have.lengthOf(1);
+		expect(fired[0].joinType).to.equal('left');
+	});
+
+	it('fires for the SEMI and ANTI joins EXISTS / NOT EXISTS decorrelate into', () => {
+		const semi = db.getPlan('select s.id from s where exists (select 1 from big where big.v = s.k)');
+		const semiFired = correlatedSeekJoins(semi);
+		expect(semiFired, 'EXISTS → semi join with a correlated seek').to.have.lengthOf(1);
+		expect(semiFired[0].joinType).to.equal('semi');
+
+		const anti = db.getPlan('select s.id from s where not exists (select 1 from big where big.v = s.k)');
+		const antiFired = correlatedSeekJoins(anti);
+		expect(antiFired, 'NOT EXISTS → anti join with a correlated seek').to.have.lengthOf(1);
+		expect(antiFired[0].joinType).to.equal('anti');
+	});
+
+	it('keeps `exists … as` flag columns (a capability hash/merge cannot offer)', async () => {
+		const sql = 'select s.id, b_ex from s left join big b on b.id = s.k exists right as b_ex order by s.id';
+		const plan = db.getPlan(sql);
+		const fired = correlatedSeekJoins(plan);
+		expect(fired, 'the existence join takes the index-NL path').to.have.lengthOf(1);
+		// The flag bit must survive the rewrite: k=5,7,9 match ids 5,7,9; k=null matches nothing.
+		expect(await drain(db, sql)).to.deep.equal([
+			{ id: 1, b_ex: true }, { id: 2, b_ex: true }, { id: 3, b_ex: true }, { id: 4, b_ex: false },
+		]);
+	});
+
+	it('never caches the correlated right side (a frozen first-row seek would be wrong)', () => {
+		const plan = db.getPlan('select s.id, big.id as bid from s join big on big.v = s.k');
+		const fired = correlatedSeekJoins(plan);
+		expect(fired).to.have.lengthOf(1);
+		expect(collectNodes(fired[0].right, isCache), 'no CacheNode above the seek').to.have.lengthOf(0);
+	});
+
+	it('is idempotent: the rule declines its own output via the correlated-side guard', () => {
+		const plan = db.getPlan('select s.id, big.id as bid from s join big on big.v = s.k');
+		const fired = correlatedSeekJoins(plan);
+		expect(fired).to.have.lengthOf(1);
+		// The correlated-right guard fires before the context is touched, so a
+		// stub context proves the decline is unconditional — "fixed point of the
+		// pass" would not distinguish "declined" from "fired and was undone".
+		const noContext = null as unknown as OptContext;
+		expect(ruleJoinPhysicalSelection(fired[0], noContext)).to.equal(null);
+	});
+
+	describe('declines', () => {
+		it('when the join column has no index (module declines the seek)', () => {
+			const plan = db.getPlan('select s.id from s join big on big.w = s.k');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
+		});
+
+		it('when the leaf already carries a pushed constraint', () => {
+			// `big.id > 5` pushes into the leaf as a range seek; replacing that
+			// leaf's FilterInfo would drop the module-enforced range. The range
+			// seek's literal bound must not read as a correlated key.
+			const plan = db.getPlan('select s.id from s join big on big.v = s.k where big.id > 5');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
+		});
+
+		it('when an ordered derived table carries a LIMIT (non-peelable directive)', () => {
+			// The LimitOffset between the join and the leaf blocks the peel — the
+			// limited-and-ordered prefix is not an every-row walk.
+			const plan = db.getPlan(
+				'select s.id, z.v from s join (select * from big order by v limit 50) z on z.id = s.k');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
+		});
+
+		it('a bare derived-table ORDER BY is pruned upstream, so the seek fires soundly', () => {
+			// With no LIMIT the derived table's ORDER BY guarantees nothing through
+			// the join and the optimizer drops it before physical selection — the
+			// leaf arrives as a plain walk, never as a load-bearing ordered scan.
+			// (admitLeaf's orderingLoadBearing gate stays as defense in depth; no
+			// SQL shape reaches a join right side with that flag set today.)
+			const plan = db.getPlan(
+				'select s.id, z.v from s join (select * from big order by v) z on z.id = s.k');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(1);
+		});
+
+		it('on cross-type join keys (INTEGER column vs REAL key)', async () => {
+			await db.exec('create table sr (id integer primary key, k real)');
+			await db.exec('insert into sr values (1, 5.0), (2, 7.5)');
+			for await (const _ of db.eval('analyze sr')) { /* consume */ }
+			const plan = db.getPlan('select sr.id from sr join big on big.v = sr.k');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
+		});
+
+		it('when a NOCASE join would seek a BINARY index (MISMATCH_UNSAFE under-fetch)', async () => {
+			// Outer key declared NOCASE resolves the join collation to NOCASE; the
+			// inner index is BINARY (finer) — a seek would miss case variants, and
+			// the retained ON condition cannot resurrect rows never returned.
+			await db.exec('create table co (id integer primary key, name text collate nocase)');
+			await db.exec("insert into co values (1, 'a'), (2, 'b'), (3, 'c')");
+			await db.exec('create table ci (pk integer primary key, name text)');
+			await db.exec('create index idx_ci_name on ci(name)');
+			const rows: string[] = [];
+			for (let i = 1; i <= 100; i++) rows.push(`(${i}, 'n${i}')`);
+			await db.exec(`insert into ci values ${rows.join(', ')}`);
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+			const plan = db.getPlan('select co.id from co join ci on ci.name = co.name');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
+		});
+
+		it('but fires when the index collation matches the resolved join collation (NOCASE = NOCASE)', async () => {
+			// Inner column declared NOCASE: its index inherits NOCASE, and declared
+			// NOCASE beats the outer's defaulted BINARY in the lattice — exact cover.
+			await db.exec('create table cb (id integer primary key, name text)');
+			await db.exec("insert into cb values (1, 'a'), (2, 'b'), (3, 'c')");
+			await db.exec('create table cn (pk integer primary key, name text collate nocase)');
+			await db.exec('create index idx_cn_name on cn(name)');
+			const rows: string[] = [];
+			for (let i = 1; i <= 100; i++) rows.push(`(${i}, 'n${i}')`);
+			await db.exec(`insert into cn values ${rows.join(', ')}`);
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+			const plan = db.getPlan('select cb.id from cb join cn on cn.name = cb.name');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(1);
+		});
+
+		it('for RIGHT and FULL joins (the driver installs no left row slot)', () => {
+			const right = db.getPlan('select s.id from s right join big on big.v = s.k');
+			expect(correlatedSeekJoins(right)).to.have.lengthOf(0);
+			const full = db.getPlan('select s.id from s full join big on big.v = s.k');
+			expect(correlatedSeekJoins(full)).to.have.lengthOf(0);
+		});
+	});
+
+	describe('cost crossover (the decision is reviewable, not folkloric)', () => {
+		// Mirror the caller's comparison: index-NL vs hash (build = smaller side)
+		// vs plain nested loop, zero latency throughout.
+		const hash = (outer: number, inner: number): number =>
+			hashJoinCost(Math.min(outer, inner), Math.max(outer, inner));
+
+		it('small outer × huge indexed inner → index-NL wins', () => {
+			const inl = indexNestedLoopJoinCost(10, 1);
+			expect(inl).to.be.lessThan(hash(10, 100_000));
+			expect(inl).to.be.lessThan(nestedLoopJoinCost(10, 100_000));
+		});
+
+		it('huge outer × tiny inner → hash wins (per-row seeks lose to one build)', () => {
+			expect(hash(100_000, 5)).to.be.lessThan(indexNestedLoopJoinCost(100_000, 1));
+		});
+
+		it('an unselective index (100 rows per seek) loses at equal cardinalities', () => {
+			expect(indexNestedLoopJoinCost(100, 100)).to.be.greaterThan(hash(100, 100));
+		});
+	});
+});
