@@ -7,10 +7,10 @@ import { expect } from 'chai';
 import { generateMigrationDDL, computeSchemaDiff } from '../src/schema/schema-differ.js';
 import type { SchemaDiff } from '../src/schema/schema-differ.js';
 import type * as AST from '../src/parser/ast.js';
-import type { SchemaCatalog, CatalogTable, CatalogView } from '../src/schema/catalog.js';
+import type { SchemaCatalog, CatalogTable, CatalogView, CatalogAssertion } from '../src/schema/catalog.js';
 import { QuereusError } from '../src/common/errors.js';
 import { Parser } from '../src/parser/parser.js';
-import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
+import { viewDefinitionToCanonicalString, expressionToString } from '../src/emit/ast-stringify.js';
 import { computeBodyHash } from '../src/schema/view.js';
 
 function parseDeclaredSchema(sql: string): AST.DeclareSchemaStmt {
@@ -19,8 +19,8 @@ function parseDeclaredSchema(sql: string): AST.DeclareSchemaStmt {
 	return stmt;
 }
 
-function makeCatalog(tables: CatalogTable[] = [], views: CatalogView[] = []): SchemaCatalog {
-	return { schemaName: 'main', tables, views, indexes: [], assertions: [] };
+function makeCatalog(tables: CatalogTable[] = [], views: CatalogView[] = [], assertions: CatalogAssertion[] = []): SchemaCatalog {
+	return { schemaName: 'main', tables, views, indexes: [], assertions };
 }
 
 function catalogTable(name: string, pkColumn: string): CatalogTable {
@@ -64,6 +64,20 @@ function catalogView(sql: string): CatalogView {
 		ddl: sql,
 		definition: viewDefinitionToCanonicalString(view.columns, view.select),
 		tags: view.tags,
+	};
+}
+
+/** Builds a CatalogAssertion from CREATE ASSERTION DDL the way `assertionSchemaToCatalog`
+ *  does (same canonical renderer — `expressionToString` over the CHECK expression —
+ *  feeding both `ddl` and `definition`). */
+function catalogAssertion(sql: string): CatalogAssertion {
+	const stmt = new Parser().parse(sql);
+	if (stmt.type !== 'createAssertion') throw new Error(`Expected createAssertion, got ${stmt.type}`);
+	const assertion = stmt as AST.CreateAssertionStmt;
+	return {
+		name: assertion.name.name,
+		ddl: sql,
+		definition: expressionToString(assertion.check),
 	};
 }
 
@@ -885,6 +899,64 @@ describe('Schema Differ', () => {
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal(['v']);
 			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id, newc from t where id > 0']);
+		});
+	});
+
+	describe('assertion body drift (bug-assertion-body-drift-invisible-to-diff)', () => {
+		it('unchanged CHECK body → no assertion buckets populated', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, x integer }
+					assertion a1 check (not exists (select 1 from t where x < 0))
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[],
+				[catalogAssertion('create assertion a1 check (not exists (select 1 from t where x < 0))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.assertionsToDrop).to.deep.equal([]);
+			expect(diff.assertionsToCreate).to.deep.equal([]);
+		});
+
+		it('changed CHECK body on a name-matched assertion → one drop + one create', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, x integer }
+					assertion a1 check (not exists (select 1 from t where x < 100))
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[],
+				[catalogAssertion('create assertion a1 check (not exists (select 1 from t where x < 0))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.assertionsToDrop).to.deep.equal(['a1']);
+			expect(diff.assertionsToCreate).to.deep.equal(['create assertion a1 check (not exists (select 1 from t where x < 100))']);
+		});
+
+		it('whitespace/formatting-only difference in the declared source → no diff', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, x integer }
+					assertion a1 check (
+						not exists (
+							select 1 from t
+							where   x   <   0
+						)
+					)
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[],
+				[catalogAssertion('create assertion a1 check (not exists (select 1 from t where x < 0))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.assertionsToDrop).to.deep.equal([]);
+			expect(diff.assertionsToCreate).to.deep.equal([]);
 		});
 	});
 });

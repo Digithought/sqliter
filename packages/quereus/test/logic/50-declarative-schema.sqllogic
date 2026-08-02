@@ -774,6 +774,73 @@ select * from assert_items;
 → [{"id": 1, "qty": 5, "price": 10}]
 
 -- ===================================================================
+-- Redeclaring an assertion's CHECK body must be visible to `diff` / `apply` —
+-- regression for bug-assertion-body-drift-invisible-to-diff. Uses its own
+-- schema so it does not disturb the assert_accounts / assert_items row
+-- counts asserted above.
+-- ===================================================================
+
+declare schema assert_drift {
+	table t (
+		x INTEGER PRIMARY KEY
+	)
+
+	assertion range_check check (not exists (select 1 from t where x < 0))
+}
+
+-- run
+
+apply schema assert_drift;
+
+-- run
+
+diff schema assert_drift;
+→ []
+
+-- Redeclare with a changed CHECK body (forbid x < 0 → forbid x < -100). The
+-- diff must show a drop+recreate pair for the drifted assertion, not [].
+declare schema assert_drift {
+	table t (
+		x INTEGER PRIMARY KEY
+	)
+
+	assertion range_check check (not exists (select 1 from t where x < -100))
+}
+
+-- run
+
+diff schema assert_drift;
+→ [{"ddl": "DROP ASSERTION IF EXISTS assert_drift.range_check"}, {"ddl": "create assertion assert_drift.range_check check (not exists (select 1 from t where x < -100))"}]
+
+apply schema assert_drift;
+
+-- run
+
+-- Idempotent: re-diff is empty.
+diff schema assert_drift;
+→ []
+
+-- A row illegal under the OLD rule (x < 0) but legal under the NEW rule
+-- (only x < -100 is forbidden) commits — the new rule is the one enforced.
+begin;
+insert into assert_drift.t values (-50);
+commit;
+
+-- run
+
+select * from assert_drift.t;
+→ [{"x": -50}]
+
+-- A row illegal under the NEW rule fails at commit.
+begin;
+insert into assert_drift.t values (-150);
+commit;
+-- error: Integrity assertion failed: assert_drift.range_check
+
+select count(*) as cnt from assert_drift.t;
+→ [{"cnt": 1}]
+
+-- ===================================================================
 -- Declarative `unique index` — parser admits the UNIQUE qualifier and
 -- the diff stringifies it back as `create unique index` so that the
 -- apply path enforces uniqueness the same way a top-level

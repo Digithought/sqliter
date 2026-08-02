@@ -122,6 +122,12 @@ export interface CatalogIndex {
 export interface CatalogAssertion {
 	name: string;
 	ddl: string;
+	/**
+	 * Canonical CHECK-expression rendering (name / schema excluded), so the
+	 * differ compares bodies without name-qualification noise, mirroring
+	 * `CatalogView.definition` / `CatalogIndex.definition`.
+	 */
+	definition: string;
 }
 
 /**
@@ -763,7 +769,8 @@ function assertionSchemaToCatalog(assertionSchema: IntegrityAssertionSchema): Ca
 		: quoteIdentifier(assertionSchema.name);
 	return {
 		name: assertionSchema.name,
-		ddl: `CREATE ASSERTION ${qualifiedName} CHECK (${checkSql})`
+		ddl: `CREATE ASSERTION ${qualifiedName} CHECK (${checkSql})`,
+		definition: checkSql
 	};
 }
 

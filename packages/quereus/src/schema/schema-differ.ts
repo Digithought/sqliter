@@ -839,10 +839,27 @@ export function computeSchemaDiff(
 	}
 
 	// Assertions (no rename support — names are explicitly part of the contract).
+	// A name-matched assertion whose CHECK body drifted drops+recreates — an
+	// assertion has no in-place "redefine" primitive, same shape as index/view
+	// body drift above. Bodies are compared via the canonical (name/schema-free)
+	// `definition` field so both sides run the same `expressionToString` over
+	// ASTs from the same parser: an unchanged body renders byte-identical.
+	// NOTE: no rename reconciliation here (unlike the view/index loops above) —
+	// an assertion's stored CHECK expression is captured verbatim at CREATE and
+	// never rewritten by `alter table … rename`, so a table/column renamed in
+	// this same diff makes an otherwise-unchanged assertion body look drifted
+	// and churns a spurious-but-correct drop+recreate (assertion creates run
+	// after table renames, so the DDL still applies cleanly).
 	const actualAssertions = new Map(actualCatalog.assertions.map(a => [a.name.toLowerCase(), a]));
 
 	for (const [name, declaredAssertion] of declaredAssertions) {
-		if (!actualAssertions.has(name)) {
+		const matchedActual = actualAssertions.get(name);
+		const declaredBody = expressionToString(declaredAssertion.assertionStmt.check);
+		if (!matchedActual) {
+			diff.assertionsToCreate.push(createAssertionToString(
+				applyAssertionSchemaDefault(declaredAssertion.assertionStmt, targetSchemaName)));
+		} else if (declaredBody !== matchedActual.definition) {
+			diff.assertionsToDrop.push(matchedActual.name);
 			diff.assertionsToCreate.push(createAssertionToString(
 				applyAssertionSchemaDefault(declaredAssertion.assertionStmt, targetSchemaName)));
 		}
