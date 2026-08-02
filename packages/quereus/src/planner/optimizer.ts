@@ -908,12 +908,17 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// (which copies the stamp forward into its reordered Filter) rather than relying
 	// on `applyPassRules`' fixpoint loop to get there.
 	//
-	// NOTE: any pass that runs AFTER PostOptimization and re-mints a Filter's
-	// predicate loses the stamp again — `PassId.Materialization` (order 35) walks
-	// scalar children and can wrap a relational node inside a predicate. No query
-	// exhibiting this was found (the obvious CTE-shared-between-two-scalar-subqueries
-	// shape has nothing estimable to stamp in the first place). If one turns up, the
-	// fix is to move this re-stamp behind the materialization pass.
+	// KNOWN GAP: this does NOT cover `PassId.Materialization` (order 35), which runs
+	// after PostOptimization and re-mints a Filter's predicate whenever it marks or
+	// wraps a relational node inside it. Verified repro — a MATERIALIZED-hinted (or
+	// multiply-referenced) CTE read from a scalar subquery in the `where`:
+	//   with c as materialized (select cat, qty from o)
+	//   select * from o where o.qty = (select max(qty) from c) and o.cat = 'a'
+	// stamps that Filter without the hint and leaves it unstamped with it. Tracked as
+	// `bug-filter-row-estimate-lost-in-materialization-pass`; the fix is a final
+	// re-stamp point behind the materialization pass (Materialization is a
+	// custom-execute pass with no rule slots, so it needs more than a third manifest
+	// entry here).
 	{
 		pass: PassId.PostOptimization,
 		id: 'filter-selectivity-restamp',

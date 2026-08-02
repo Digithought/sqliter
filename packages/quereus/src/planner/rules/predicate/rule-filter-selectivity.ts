@@ -91,7 +91,11 @@ export function ruleFilterSelectivity(node: PlanNode, context: OptContext): Plan
 	// FilterNode, so a stack of N filters over one large subtree costs O(N·subtree) —
 	// and unlike before, it now runs for EVERY Filter, not only filters over joins.
 	// `rule-filter-conjunct-ordering` (PostOptimization) runs the SAME walk again on
-	// each Filter it ranks, so the walk now happens twice per Filter. The walk is
+	// each Filter it ranks, so the walk now happens twice per Filter. A Filter that is
+	// permanently unstampable (computed projection, set-operation output, un-analyzed
+	// table) also pays it a third time, because the `filter-selectivity-restamp`
+	// registration cannot short-circuit on a stamp that will never exist — measured
+	// only as "one extra walk", not profiled. The walk is
 	// cheap per node and filter stacks are shallow; if it ever shows up in an
 	// optimizer profile, memoize the map per pass on OptContext keyed by the source
 	// node (or — for the single-table path only — build the resolver from the one
