@@ -130,6 +130,11 @@ export function getAssertionHoistedConstraints(
 			expr: negateAst(candidate.innerPredicate),
 			operations: DEFAULT_ROWOP_MASK,
 		});
+		// NOTE: provenance carries the BARE assertion name, which is only unique
+		// per schema — two same-named assertions in different schemas hoisting
+		// onto the same table are indistinguishable here. Harmless today because
+		// provenance is informational (invariant OPT-052: no rule branches on it);
+		// if a rule ever reads it, key on `schemaName.name` instead.
 		provenanceByCheckIdx.push({ kind: 'assertion', name: candidate.assertionName });
 		log('Hoisted assertion %s onto %s', candidate.assertionName, targetName);
 	}

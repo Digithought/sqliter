@@ -385,7 +385,7 @@ drop assertion [if exists] [schema_name.]assertion_name;
 Behavior:
 - An assertion belongs to a schema. An unqualified name means the current schema, matching every other DDL statement; names are unique per schema, so two schemas may each hold an assertion of the same name and both enforce independently.
 - The stored CHECK body resolves its unqualified table names against the assertion's **own** schema first, independent of the session's search path — the same home-schema rule stored view and materialized-view bodies follow (see `sql-select.md` § 2.1.1).
-- Assertions are enforced at COMMIT. Any row produced by the stored violation query indicates a violation and the COMMIT fails with a constraint error (transaction rolled back).
+- Assertions are enforced at COMMIT. Any row produced by the stored violation query indicates a violation and the COMMIT fails with a constraint error (transaction rolled back). The error names the assertion, schema-qualified outside `main` (`Integrity assertion failed: sales.a1`).
 - The `check (expr)` is stored as a violation SQL: `select 1 where not (expr)`.
 - Efficiency: The optimizer classifies each table reference instance in the violation query as row-specific (unique key fully covered) or global. If any changed base is global, run the violation SQL once. Otherwise, for row-specific references, the engine executes per changed primary key using prepared parameters (`pk0`, `pk1`, ... for composite keys), early-exiting on the first violation.
 

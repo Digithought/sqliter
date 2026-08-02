@@ -113,6 +113,32 @@ describe('classifyAssertionForHoisting (unit)', () => {
 		expect(c).to.equal(undefined);
 	});
 
+	it('resolves an unqualified base against the assertion home schema first', async () => {
+		// Same table name in two schemas: the hoist must bind the one next to the
+		// assertion, matching how the evaluator plans the stored body. Binding
+		// main.orders here would fold a temp assertion's predicate onto main's plan.
+		await db.exec('create table temp.orders (id integer primary key, qty integer) using memory');
+		const a: IntegrityAssertionSchema = {
+			...assertion('temp_no_neg', notExistsOnTable('orders', bin('<', col('qty'), lit(0)))),
+			schemaName: 'temp',
+		};
+		const c = classifyAssertionForHoisting(a, db.schemaManager);
+		expect(c, 'expected hoist candidate').to.not.equal(undefined);
+		expect(c!.baseTableQualifiedName).to.equal('temp.orders');
+	});
+
+	it('falls back past an empty home schema to the default path', () => {
+		// `orders` exists only in main; an assertion homed elsewhere still binds it.
+		db.schemaManager.addSchema('other_home');
+		const a: IntegrityAssertionSchema = {
+			...assertion('elsewhere', notExistsOnTable('orders', bin('<', col('qty'), lit(0)))),
+			schemaName: 'other_home',
+		};
+		const c = classifyAssertionForHoisting(a, db.schemaManager);
+		expect(c, 'expected hoist candidate').to.not.equal(undefined);
+		expect(c!.baseTableQualifiedName).to.equal('main.orders');
+	});
+
 	it('exists(...) — non-negated existential is rejected', () => {
 		const a: IntegrityAssertionSchema = {
 			...assertion('exists_form', existsOnTable('orders', bin('<', col('qty'), lit(0)))),

@@ -50,6 +50,16 @@ function assertionCacheKey(assertion: { name: string; schemaName: string }): str
 	return `${assertion.schemaName.toLowerCase()}.${assertion.name.toLowerCase()}`;
 }
 
+/** How an assertion names itself in a violation error / report-mode record.
+ *  Qualified outside `main`, where a bare name is ambiguous (names are only
+ *  unique per schema); bare in `main`, matching the rest of the DDL surface
+ *  (see `applyAssertionSchemaDefault`, `assertionSchemaToCatalog`). */
+function assertionDisplayName(assertion: { name: string; schemaName: string }): string {
+	return assertion.schemaName.toLowerCase() === 'main'
+		? assertion.name
+		: `${assertion.schemaName}.${assertion.name}`;
+}
+
 /**
  * A single commit-time global-assertion violation, collected (rather than
  * thrown) when {@link AssertionEvaluator.runGlobalAssertions} is driven in
@@ -415,7 +425,7 @@ export class AssertionEvaluator {
 					await this.executeViolationOnce(assertion);
 					return;
 				}
-				await this.executeResidualPerTuple(assertion.name, residual, tuples);
+				await this.executeResidualPerTuple(assertionDisplayName(assertion), residual, tuples);
 			}
 
 			// Global re-evaluation: run once if any relation needs it. (Multiple
@@ -437,7 +447,7 @@ export class AssertionEvaluator {
 	}
 
 	private async executeViolationOnce(assertion: AssertionIdentity): Promise<void> {
-		const assertionName = assertion.name;
+		const assertionName = assertionDisplayName(assertion);
 		// `prepare()` defers planning; force compile under hoist-suppression so
 		// the optimizer can't fold this assertion's own violation query to
 		// empty. See `getOrCompilePlan`. The home-schema path override makes the

@@ -45,9 +45,13 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 
 		// Discover dependent base tables (best-effort; conservative if any failure).
 		// Plan under the assertion's home-schema path so unqualified table names in
-		// the body resolve against the assertion's own schema first.
+		// the body resolve against the assertion's own schema first, and under
+		// hoist suppression so another assertion's hoisted premises can't fold a
+		// base reference out of the plan — the commit-time evaluator derives its
+		// own base set the same way (see AssertionEvaluator.getOrCompilePlan).
 		try {
-			const planNode = rctx.db.getPlan(violationSql, rctx.db._homeSchemaPath(plan.schemaName));
+			const planNode = rctx.db.schemaManager.withSuppressedAssertionHoist(
+				() => rctx.db.getPlan(violationSql, rctx.db._homeSchemaPath(plan.schemaName)));
 			const deps = new Map<string, AssertionDependentTable>();
 			(function collect(node: unknown) {
 				const candidate = node as {
@@ -67,11 +71,12 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 			assertionSchema.dependentTables = Array.from(deps.values());
 			log('Assertion %s dependencies discovered: %o', plan.name, assertionSchema.dependentTables);
 		} catch (depErr) {
-			// A total discovery failure leaves dependent_tables empty; enforcement
-			// then falls back to running the full violation query on every commit.
-			// Surface that degradation — a silent debug line made it invisible.
+			// Enforcement does NOT read `dependentTables` — the evaluator recomputes
+			// its base set when it compiles the body. A failure here only blanks the
+			// `dependent_tables` column of `assertion_info()`, and usually means the
+			// body will fail to plan at commit time too. Warn rather than swallow.
 			warnLog(
-				'Dependency discovery failed for assertion %s.%s; enforcement falls back to the full violation query: %O',
+				'Dependency discovery failed for assertion %s.%s; assertion_info().dependent_tables will be empty: %O',
 				plan.schemaName, plan.name, depErr
 			);
 		}

@@ -1758,7 +1758,7 @@ select id, x from nm_assert_pol.at_t order by id;
 begin;
 insert into nm_assert_pol.at_t values (2, -5);
 commit;
--- error: Integrity assertion failed: a1
+-- error: Integrity assertion failed: nm_assert_pol.a1
 
 select count(*) as cnt from nm_assert_pol.at_t;
 → [{"cnt": 1}]
