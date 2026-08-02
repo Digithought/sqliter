@@ -1135,32 +1135,56 @@ describe('StoreModule predicate pushdown', () => {
 			describe('cost-based index choice (declaration order must not decide)', () => {
 				const manyValues = Array.from({ length: 300 }, (_, i) => i).join(', ');
 
-				it('cheaper index declared second still wins', async () => {
+				/** `two(id, a, b)` with identical rows, indexes created in the given order. */
+				const seedTwo = async (...declarationOrder: Array<'a' | 'b'>) => {
 					await db.exec(`create table two (id integer primary key, a integer, b integer) using store`);
-					await db.exec(`create index ix_b on two (b)`);
-					await db.exec(`create index ix_a on two (a)`);
+					for (const col of declarationOrder) await db.exec(`create index ix_${col} on two (${col})`);
 					await db.exec(`insert into two values (1, 7, 5), (2, 7, 999), (3, 3, 5)`);
+				};
+
+				it('cheaper index declared second still wins', async () => {
+					await seedTwo('b', 'a');
 					const q = `select id from two where a = 7 and b in (${manyValues}) order by id`;
 					expect(await planDetails(q)).to.match(/USING ix_a\b/);
 					expect(await ids(q)).to.deep.equal([1]);
 				});
 
 				it('same declaration order, same predicate: cheaper index still wins', async () => {
-					await db.exec(`create table two (id integer primary key, a integer, b integer) using store`);
-					await db.exec(`create index ix_a on two (a)`);
-					await db.exec(`create index ix_b on two (b)`);
-					await db.exec(`insert into two values (1, 7, 5), (2, 7, 999), (3, 3, 5)`);
+					await seedTwo('a', 'b');
 					const q = `select id from two where a = 7 and b in (${manyValues}) order by id`;
 					expect(await planDetails(q)).to.match(/USING ix_a\b/);
 					expect(await ids(q)).to.deep.equal([1]);
 				});
 
 				it('reversed predicate, fixed declaration order: the cheaper index still wins (proves cost, not order)', async () => {
-					await db.exec(`create table two (id integer primary key, a integer, b integer) using store`);
-					await db.exec(`create index ix_a on two (a)`);
-					await db.exec(`create index ix_b on two (b)`);
-					await db.exec(`insert into two values (1, 7, 5), (2, 7, 999), (3, 3, 5)`);
+					await seedTwo('a', 'b');
 					const q = `select id from two where a in (${manyValues}) and b = 5 order by id`;
+					expect(await planDetails(q)).to.match(/USING ix_b\b/);
+					expect(await ids(q)).to.deep.equal([1, 3]);
+				});
+
+				// Two plain EQ seeks on single-column indexes price identically, so the strict
+				// '<' comparison never displaces the incumbent: the FIRST-declared index wins.
+				// Not an arbitrary outcome to be preserved for its own sake — it pins that the
+				// choice stays stable across runs rather than flipping on an equal-cost tie.
+				for (const [first, second] of [['a', 'b'], ['b', 'a']] as const) {
+					it(`equal-cost tie is broken deterministically by declaration order (${first} then ${second})`, async () => {
+						await seedTwo(first, second);
+						const q = `select id from two where a = 7 and b = 5 order by id`;
+						expect(await planDetails(q)).to.match(new RegExp(`USING ix_${first}\\b`));
+						expect(await ids(q)).to.deep.equal([1]);
+					});
+				}
+
+				it('three competing indexes: the cheapest wins even declared in the middle', async () => {
+					await db.exec(`create table three (id integer primary key, a integer, b integer, c integer) using store`);
+					await db.exec(`create index ix_a on three (a)`);
+					await db.exec(`create index ix_b on three (b)`);
+					await db.exec(`create index ix_c on three (c)`);
+					await db.exec(`insert into three values (1, 7, 5, 9), (2, 7, 999, 9), (3, 3, 5, 9)`);
+					// Cheap EQ on `b`, expensive 300-key multi-seeks on `a` and `c` — so neither
+					// "first candidate" nor "last candidate" can be mistaken for the winner.
+					const q = `select id from three where a in (${manyValues}) and b = 5 and c in (${manyValues}) order by id`;
 					expect(await planDetails(q)).to.match(/USING ix_b\b/);
 					expect(await ids(q)).to.deep.equal([1, 3]);
 				});

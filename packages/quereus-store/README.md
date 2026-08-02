@@ -65,8 +65,10 @@ yield their rows once, and a composite index serves the cross-product of per-col
 (`a in (1,2) and b in (10,20)` is four seeks). Very large lists (over 1000 seek keys) and
 lists on semantically-ordered column types (TIMESPAN, JSON) fall back to the scan path —
 still correct, just not accelerated. `IN` on the primary key currently scans (see backlog
-`feat-store-pk-in-list-multiseek`). Index choice among several usable indexes is
-first-match, not cheapest — see backlog `bug-store-index-choice-ignores-cost`.
+`feat-store-pk-in-list-multiseek`). When several secondary indexes can serve the same
+predicate, the lowest-cost seek wins (equal costs keep the first-declared index), so
+declaration order no longer decides whether a query does one seek or hundreds. The primary-key
+arms still take precedence over any secondary index whenever they apply.
 
 The same multi-seek path also serves an `IN` whose values only exist once the query runs
 — `where v in (select … )`, which the engine may materialize into a set and hand down as
