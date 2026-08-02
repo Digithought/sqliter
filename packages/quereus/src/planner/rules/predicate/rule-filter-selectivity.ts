@@ -4,25 +4,39 @@
  * Stamps a stats-derived selectivity onto a FilterNode so its `estimatedRows`
  * reflects real column statistics instead of the flat DEFAULT_FILTER_SELECTIVITY.
  *
- * Registered TWICE, both bottom-up:
+ * Registered THREE times, all bottom-up. Only the first derives an estimate the plan
+ * did not have; the other two recover one that a later pass dropped, because
+ * `FilterNode.withChildren` carries `selectivity` forward only when the predicate
+ * child is the same object, and several passes rewrite inside a predicate:
  *
- *   - `filter-selectivity` (Physical pass), which fires AFTER the Structural pass —
- *     predicate-pushdown / grow-retrieve have already put the Filter in its final
- *     position over its final source, so the source subtree is settled (and may carry
- *     physical access nodes between the join and its table references). This stamp is
- *     what the physical and PostOptimization cost readers consult.
- *   - `filter-selectivity-restamp` (PostOptimization pass, registered first in that
- *     pass), which recovers the estimate for a Filter whose stamp was dropped by
- *     `FilterNode.withChildren` because PostOptimization rewrote something inside its
- *     predicate — `scalar-subquery-cache` wrapping an uncorrelated scalar subquery's
- *     inner re-mints every scalar ancestor up to the predicate. Without it, any query
- *     with a subquery in its `where` plans on the flat DEFAULT_FILTER_SELECTIVITY.
+ *   - `filter-selectivity` (Physical pass), the primary stamp. Fires AFTER the
+ *     Structural pass — predicate-pushdown / grow-retrieve have already put the Filter
+ *     in its final position over its final source, so the source subtree is settled
+ *     (and may carry physical access nodes between the join and its table references).
+ *     This stamp is what the physical and PostOptimization cost readers consult.
+ *   - `filter-selectivity-restamp` (PostOptimization pass, registered FIRST in that
+ *     pass so it precedes `filter-conjunct-ordering`, which copies the stamp forward).
+ *     Recovers the estimate for a Filter whose predicate PostOptimization itself
+ *     rewrote — `scalar-subquery-cache` wrapping an uncorrelated scalar subquery's
+ *     inner re-mints every scalar ancestor up to the predicate. It has to run inside
+ *     that pass, not merely after it, because the cost readers later in the pass
+ *     (join-physical-selection, key-set-seek, the materialization advisory) consult
+ *     the stamp.
+ *   - `filter-selectivity-final` (FinalEstimates pass, order 37), the backstop behind
+ *     every plan-mutating pass. Recovers the estimate for a Filter re-minted by the
+ *     Materialization advisory (order 35) — which rebuilds every path on which it
+ *     marks a `with` clause for shared materialization or injects a `CacheNode` — and
+ *     for any future pass ordered before it. Its stamp is read only at emission, so
+ *     it cannot substitute for the PostOptimization registration.
  *
- * The `selectivity !== undefined` guard below makes the second registration a no-op on
- * every Filter whose stamp survived, so it only ever fills in, never overwrites. Both
- * firings read a physical source subtree (`select-access-path` has already replaced
- * Retrieve with an access node by the Physical pass's own bottom-up order);
- * PostOptimization sources are the same shape or further lowered.
+ * The `selectivity !== undefined` guard below makes the second and third registrations
+ * a no-op on every Filter whose stamp survived, so they only ever fill in, never
+ * overwrite. All three firings read a physical source subtree (`select-access-path` has
+ * already replaced Retrieve with an access node by the Physical pass's own bottom-up
+ * order); later sources are the same shape or further lowered — a `CacheNode` the
+ * advisory newly slid under the Filter is a generic single-relation wrapper that both
+ * `extractRowSourceTableSchema` and `collectColumnOrigins` descend, so the re-derived
+ * number matches what the Physical pass produced.
  *
  * Node-level accessors (`estimatedRows` / `computePhysical`) carry no OptContext,
  * so a Filter cannot consult `context.stats` from inside itself. This rule holds
@@ -93,9 +107,10 @@ export function ruleFilterSelectivity(node: PlanNode, context: OptContext): Plan
 	// `rule-filter-conjunct-ordering` (PostOptimization) runs the SAME walk again on
 	// each Filter it ranks, so the walk now happens twice per Filter. A Filter that is
 	// permanently unstampable (computed projection, set-operation output, un-analyzed
-	// table) also pays it a third time, because the `filter-selectivity-restamp`
-	// registration cannot short-circuit on a stamp that will never exist — measured
-	// only as "one extra walk", not profiled. The walk is
+	// table) also pays it a third and fourth time, because neither the
+	// `filter-selectivity-restamp` nor the `filter-selectivity-final` registration can
+	// short-circuit on a stamp that will never exist — measured only as "extra walks",
+	// not profiled. The walk is
 	// cheap per node and filter stacks are shallow; if it ever shows up in an
 	// optimizer profile, memoize the map per pass on OptContext keyed by the source
 	// node (or — for the single-table path only — build the resolver from the one

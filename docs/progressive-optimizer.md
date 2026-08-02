@@ -41,7 +41,7 @@ Implementation: the PassManager runs passes 0–1 (constant folding, structural 
 
 ### Tier 1: Cost-Based Plan
 
-The full multi-pass optimization pipeline, corresponding to the current optimizer described in `docs/optimizer.md`. This tier runs when cached statistics are available — either from vtab-supplied metadata or from the runtime stats overlay. All five passes execute: constant folding, structural transformations, physical selection, post-optimization, and validation.
+The full multi-pass optimization pipeline, corresponding to the current optimizer described in `docs/optimizer.md`. This tier runs when cached statistics are available — either from vtab-supplied metadata or from the runtime stats overlay. Every pass executes: constant folding, structural transformations, physical selection, post-optimization, the materialization advisory, final estimates, and validation.
 
 Key constraint: Tier 1 **never blocks waiting for statistics**. It uses whatever is cached at the time of optimization. When stats are missing for a particular table or predicate, the cost model falls back to heuristic defaults for that specific decision, while using available stats everywhere else. This produces a plan that is partially cost-optimized and partially heuristic — strictly better than Tier 0.
 

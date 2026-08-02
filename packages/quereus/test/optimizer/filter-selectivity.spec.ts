@@ -349,13 +349,21 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 		expect(f!.selectivity).to.be.closeTo(combineConjunctive([1 / ndv['o.cat']]), 1e-12);
 	});
 
-	it('leaves that same Filter unstamped when the re-stamp registration is disabled', () => {
-		// Negative control: pins the assertion above to the new PostOptimization
+	it('leaves that same Filter unstamped when the re-stamp registrations are disabled', () => {
+		// Negative control: pins the assertion above to the PostOptimization
 		// registration rather than to some other path happening to stamp the node.
+		// BOTH re-stamp registrations have to be disabled — `filter-selectivity-final`
+		// (FinalEstimates, order 37) is a backstop behind every plan-mutating pass, so
+		// on its own it would fill this stamp back in and the control would prove
+		// nothing about the PostOptimization one.
 		const prev = db.optimizer.tuning;
 		db.optimizer.updateTuning({
 			...prev,
-			disabledRules: new Set([...(prev.disabledRules ?? []), 'filter-selectivity-restamp']),
+			disabledRules: new Set([
+				...(prev.disabledRules ?? []),
+				'filter-selectivity-restamp',
+				'filter-selectivity-final',
+			]),
 		});
 		const f = optimizedFilter(db,
 			"SELECT * FROM o FULL JOIN r ON o.rid = r.id WHERE o.qty = (SELECT max(qty) FROM r r2) AND o.cat = 'a'");
@@ -383,6 +391,85 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 			.to.be.closeTo(1 / ndv['o.qty'], 1e-12);
 		expect(withoutSubquery[0].selectivity, 'lower Filter keeps its Physical-pass stamp')
 			.to.be.closeTo(1 / ndv['o.cat'], 1e-12);
+	});
+
+	// ── Re-stamping after the Materialization pass ────────────────────────────
+	//
+	// The materialization advisory (`PassId.Materialization`, order 35) runs AFTER the
+	// PostOptimization re-stamp and rebuilds every path on which it marks a `with`
+	// clause for shared materialization or injects a `CacheNode`. When such a path runs
+	// through a Filter's predicate — a scalar subquery in the `where` reading the CTE —
+	// `FilterNode.withChildren` drops the stamp with nothing left in that pass to
+	// restore it. `filter-selectivity-final` (`PassId.FinalEstimates`, order 37) is what
+	// recovers it, behind every plan-mutating pass.
+
+	/** The CTE spellings below differ only in what trips the shared-materialization mark. */
+	const PLAIN_CTE_SQL =
+		'WITH c AS (SELECT cat, qty FROM o) '
+		+ "SELECT * FROM o WHERE o.qty = (SELECT max(qty) FROM c) AND o.cat = 'a'";
+	const MATERIALIZED_CTE_SQL =
+		'WITH c AS MATERIALIZED (SELECT cat, qty FROM o) '
+		+ "SELECT * FROM o WHERE o.qty = (SELECT max(qty) FROM c) AND o.cat = 'a'";
+	// Two references to one `with` clause trip the same mark with no hint written.
+	const TWICE_REFERENCED_CTE_SQL =
+		'WITH c AS (SELECT cat, qty FROM o) '
+		+ 'SELECT * FROM o WHERE o.qty = (SELECT max(qty) FROM c) '
+		+ "AND o.rid = (SELECT min(qty) FROM c) AND o.cat = 'a'";
+
+	/**
+	 * The upper Filter of `sql`'s optimized plan — identified by carrying the
+	 * subquery conjunct(s), since `o.cat = 'a'` is left in a separate Filter below.
+	 */
+	function subqueryFilterOf(sql: string): FilterNode {
+		const plan = (db as unknown as { getPlan(s: string): PlanNode }).getPlan(sql);
+		const withSubquery = findFilters(plan).filter(f => hasScalarSubquery(f.predicate));
+		expect(withSubquery.length, `expected exactly one Filter carrying a subquery conjunct: ${sql}`)
+			.to.equal(1);
+		return withSubquery[0];
+	}
+
+	it('stamps the same estimate whether or not the CTE is MATERIALIZED', () => {
+		const plain = subqueryFilterOf(PLAIN_CTE_SQL);
+		const materialized = subqueryFilterOf(MATERIALIZED_CTE_SQL);
+
+		// Single-table path over `o`: the provider reads `o.qty` off a direct child of
+		// the comparison and answers 1/ndv regardless of what the other side is.
+		expect(plain.selectivity, 'plain spelling').to.be.closeTo(1 / ndv['o.qty'], 1e-12);
+		// The durable half: the hint changes how the CTE executes, never the estimate.
+		expect(materialized.selectivity, 'the MATERIALIZED spelling must agree exactly')
+			.to.equal(plain.selectivity);
+	});
+
+	it('stamps the upper Filter over a CTE referenced twice', () => {
+		const f = subqueryFilterOf(TWICE_REFERENCED_CTE_SQL);
+		// Two estimable conjuncts — `o.qty` (3 distinct) and `o.rid` (20) each compared
+		// to a scalar subquery — folded with the usual backoff.
+		expect(f.selectivity).to.be.closeTo(combineConjunctive([1 / ndv['o.qty'], 1 / ndv['o.rid']]), 1e-12);
+		expect(f.selectivity, 'both conjuncts must contribute, not just o.qty')
+			.to.be.lessThan(1 / ndv['o.qty']);
+	});
+
+	it('leaves the materialization-marked spellings unstamped when only the final re-stamp is disabled', () => {
+		// Negative control for the new registration alone: the PostOptimization
+		// re-stamp still runs and still recovers the plain spelling. Only the
+		// materialization pass's own re-mint, which happens behind it, needs
+		// `filter-selectivity-final` — so this pins the behaviour above to that
+		// mechanism rather than to the PostOptimization one.
+		const prev = db.optimizer.tuning;
+		db.optimizer.updateTuning({
+			...prev,
+			disabledRules: new Set([...(prev.disabledRules ?? []), 'filter-selectivity-final']),
+		});
+
+		expect(subqueryFilterOf(PLAIN_CTE_SQL).selectivity,
+			'no materialization mark here, so the PostOptimization re-stamp is enough')
+			.to.be.closeTo(1 / ndv['o.qty'], 1e-12);
+		expect(subqueryFilterOf(MATERIALIZED_CTE_SQL).selectivity,
+			'the materialization pass re-minted this predicate after the PostOptimization re-stamp')
+			.to.be.undefined;
+		expect(subqueryFilterOf(TWICE_REFERENCED_CTE_SQL).selectivity,
+			'a twice-referenced CTE trips the same mark with no hint written')
+			.to.be.undefined;
 	});
 
 	it('is idempotent: re-optimizing an already-stamped plan changes nothing', () => {

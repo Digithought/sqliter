@@ -77,6 +77,9 @@ export enum PassId {
 	/** Cache materialization advisory — one whole-tree pass */
 	Materialization = 'materialization',
 
+	/** Re-derive plan estimates that a later-than-Physical pass invalidated */
+	FinalEstimates = 'final-estimates',
+
 	/** Final validation */
 	Validation = 'validation',
 }
@@ -199,6 +202,24 @@ export const STANDARD_PASSES: OptimizationPass[] = [
 	),
 
 	createMaterializationPass(),
+
+	// Last plan-mutating pass. A node estimate is derived by a rule that holds an
+	// OptContext (node accessors carry none), so any later pass that re-mints the
+	// node it was stamped on drops the estimate with nothing behind it to restore
+	// the number — `FilterNode.withChildren` dropping a stamped `selectivity`
+	// because Materialization rewrote something inside the predicate is the case
+	// that motivated this pass. Rules registered here re-derive such an estimate
+	// against the FINAL node, so an estimate's survival no longer depends on which
+	// pass happens to touch its node last. Nothing may be registered after this
+	// pass except read-only checks; `test/optimizer/rule-manifest.spec.ts` asserts
+	// that statically.
+	createPass(
+		PassId.FinalEstimates,
+		'Final Estimates',
+		'Re-derive plan estimates invalidated by a later pass rewriting inside a node',
+		37,
+		TraversalOrder.BottomUp
+	),
 
 	createPass(
 		PassId.Validation,

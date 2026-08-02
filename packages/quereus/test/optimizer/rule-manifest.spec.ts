@@ -13,8 +13,8 @@
  */
 
 import { expect } from 'chai';
-import { registerManifest, type RuleManifestEntry } from '../../src/planner/optimizer.js';
-import { PassManager, PassId, createPass, TraversalOrder } from '../../src/planner/framework/pass.js';
+import { registerManifest, RULE_MANIFEST, type RuleManifestEntry } from '../../src/planner/optimizer.js';
+import { PassManager, PassId, createPass, TraversalOrder, STANDARD_PASSES } from '../../src/planner/framework/pass.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
 
@@ -99,5 +99,51 @@ describe('registerManifest', () => {
 		], pm)).to.not.throw();
 		expect(idsInPass(pm, PassId.Structural)).to.include('shared');
 		expect(idsInPass(pm, PassId.PostOptimization)).to.include('shared');
+	});
+});
+
+/**
+ * `PassId.FinalEstimates` (order 37) is the re-derivation point of last resort: a plan
+ * estimate that a rule stamped onto a node, and that a later pass then dropped by
+ * rewriting inside that node, is re-derived there before emission. `FilterNode`'s
+ * `selectivity` is the case that motivated it — see
+ * `bug-filter-row-estimate-lost-in-materialization-pass`.
+ *
+ * That guarantee holds only while nothing which mutates the plan runs BEHIND that pass.
+ * Pass order lives in `STANDARD_PASSES` and rule placement lives in `RULE_MANIFEST`, so
+ * nothing but this check connects the two: a rule added to a later-ordered pass would
+ * silently re-open the hole. Today only `PassId.Validation` (order 40) sits behind it,
+ * and it carries no manifest entries.
+ */
+describe('RULE_MANIFEST: no rules run behind the final-estimates pass', () => {
+	// NOTE: this reads the manifest, so it is blind to a custom-`execute` pass — one
+	// with no rule slots at all, like `PassId.Materialization` itself. If a
+	// plan-mutating custom-execute pass is ever ordered after 37, this test still
+	// passes while the hole re-opens; extend it to assert on `STANDARD_PASSES`
+	// entries carrying an `execute` too.
+	const orderOf = new Map(STANDARD_PASSES.map(p => [p.id, p.order]));
+
+	it('every manifest entry targets a standard pass', () => {
+		// Guards the assertion below: an entry whose pass is missing from the order map
+		// could not be classified as before-or-behind at all.
+		const unknown = RULE_MANIFEST.filter(e => !orderOf.has(e.pass)).map(e => `${e.id} → ${e.pass}`);
+		expect(unknown, 'manifest entries targeting a pass not in STANDARD_PASSES').to.deep.equal([]);
+	});
+
+	it('no manifest entry targets a pass ordered after PassId.FinalEstimates', () => {
+		const finalOrder = orderOf.get(PassId.FinalEstimates);
+		expect(finalOrder, 'PassId.FinalEstimates must be one of the standard passes').to.be.a('number');
+
+		const behind = RULE_MANIFEST
+			.filter(e => (orderOf.get(e.pass) as number) > (finalOrder as number))
+			.map(e => `${e.id} → ${e.pass}`);
+
+		expect(behind,
+			'A rule registered after PassId.FinalEstimates can rewrite a node whose plan estimate '
+			+ 'was re-derived there, and nothing runs after it to derive the estimate again — the '
+			+ 'exact hole bug-filter-row-estimate-lost-in-materialization-pass closed. Either move '
+			+ 'the rule ahead of that pass, or (if it genuinely must run last) add a re-derivation '
+			+ 'point behind it and update this test deliberately.')
+			.to.deep.equal([]);
 	});
 });

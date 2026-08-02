@@ -250,12 +250,18 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		// the predicate is unchanged; drop it (undefined → recompute default until
 		// re-stamped) when the predicate changes.
 		//
-		// Dropping it here is routine, not exceptional: PostOptimization re-mints
-		// stamped Filters whenever it rewrites something inside their predicate
-		// (`scalar-subquery-cache` wrapping a scalar subquery's inner is the common
-		// case). The `filter-selectivity-restamp` PostOptimization registration of
-		// `rule-filter-selectivity` is what recovers the estimate — it re-derives a
-		// number against the NEW predicate rather than carrying the old one forward.
+		// Dropping it here is routine, not exceptional: several passes re-mint stamped
+		// Filters whenever they rewrite something inside a predicate
+		// (`scalar-subquery-cache` wrapping a scalar subquery's inner in
+		// PostOptimization; the materialization advisory marking or wrapping a
+		// relational node inside a predicate's subquery). What makes the drop safe
+		// regardless of WHICH pass re-mints is the `filter-selectivity-final`
+		// registration of `rule-filter-selectivity` in `PassId.FinalEstimates` (order
+		// 37) — it sits behind every plan-mutating pass and re-derives a number against
+		// the NEW predicate rather than carrying the old one forward. (The
+		// `filter-selectivity-restamp` PostOptimization registration is not redundant
+		// with it: cost readers later in that same pass need the stamp back before
+		// emission.)
 		//
 		// NOTE (tripwire): a carried selectivity was computed against THIS source's
 		// table. If a pass ever re-sources a stamped Filter (same predicate object,

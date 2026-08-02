@@ -140,8 +140,12 @@ const RANGE_ACCESS_LEAF_TYPES = [
  * particular `lateral-top1-asof` (Structural) sits AFTER the three Physical entries
  * here because that was its historical registration position, making it the last
  * rule in the Structural pass.
+ *
+ * Exported for static auditing only (see `test/optimizer/rule-manifest.spec.ts`,
+ * which asserts nothing registers behind `PassId.FinalEstimates`); the optimizer
+ * itself is the only production consumer.
  */
-const RULE_MANIFEST: readonly RuleManifestEntry[] = [
+export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// ── Structural pass (top-down) ──────────────────────────────────────────
 
 	// Materialized-view query rewrite (read side). Registered FIRST in the
@@ -908,17 +912,11 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// (which copies the stamp forward into its reordered Filter) rather than relying
 	// on `applyPassRules`' fixpoint loop to get there.
 	//
-	// KNOWN GAP: this does NOT cover `PassId.Materialization` (order 35), which runs
-	// after PostOptimization and re-mints a Filter's predicate whenever it marks or
-	// wraps a relational node inside it. Verified repro — a MATERIALIZED-hinted (or
-	// multiply-referenced) CTE read from a scalar subquery in the `where`:
-	//   with c as materialized (select cat, qty from o)
-	//   select * from o where o.qty = (select max(qty) from c) and o.cat = 'a'
-	// stamps that Filter without the hint and leaves it unstamped with it. Tracked as
-	// `bug-filter-row-estimate-lost-in-materialization-pass`; the fix is a final
-	// re-stamp point behind the materialization pass (Materialization is a
-	// custom-execute pass with no rule slots, so it needs more than a third manifest
-	// entry here).
+	// This entry does not cover `PassId.Materialization` (order 35), which runs after
+	// PostOptimization and re-mints a Filter's predicate whenever it marks or wraps a
+	// relational node inside it. `filter-selectivity-final` (PassId.FinalEstimates,
+	// order 37 — the last entry in this manifest) is what covers that, and every
+	// future pass ordered before it.
 	{
 		pass: PassId.PostOptimization,
 		id: 'filter-selectivity-restamp',
@@ -1230,6 +1228,33 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// the CacheNodes injected by `cte-optimization`). See
 	// `createMaterializationPass` in framework/pass.ts for the single-walk rationale
 	// and the side-effect-soundness argument.
+
+	// ── Final-estimates pass (bottom-up, order 37) ──────────────────────────
+
+	// Third and LAST selectivity stamp point. The two registrations above recover a
+	// dropped stamp only for rewrites that happen in or before their own pass, so a
+	// Filter re-minted by the Materialization advisory (order 35 — it re-mints every
+	// path on which it marks a `with` clause for shared materialization or injects a
+	// CacheNode) reached emission on the flat DEFAULT_FILTER_SELECTIVITY. Verified
+	// repro: a MATERIALIZED-hinted (or multiply-referenced) CTE read from a scalar
+	// subquery in the `where`
+	//   with c as materialized (select cat, qty from o)
+	//   select * from o where o.qty = (select max(qty) from c) and o.cat = 'a'
+	// stamped 1/ndv(o.qty) without the hint and nothing with it — two spellings of one
+	// query disagreeing. This entry runs behind every plan-mutating pass, so the
+	// estimate no longer depends on which pass touched the predicate last; it declines
+	// in O(1) on any Filter whose stamp survived.
+	{
+		pass: PassId.FinalEstimates,
+		id: 'filter-selectivity-final',
+		nodeType: PlanNodeType.Filter,
+		phase: 'impl',
+		fn: ruleFilterSelectivity,
+		// Same justification as the Physical and PostOptimization entries: rebuilds
+		// the identical Filter (same scope, source, predicate, same output attribute
+		// ids) with only an added row estimate.
+		sideEffectMode: 'safe',
+	},
 ];
 
 /**
