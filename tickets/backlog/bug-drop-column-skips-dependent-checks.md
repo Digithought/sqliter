@@ -7,9 +7,12 @@ files:
   - packages/quereus/src/planner/building/foreign-key-builder.ts      # buildChildSideFKChecks — the caller that raises
   - packages/quereus/test/logic/41.4-alter-add-column-constraints.sqllogic   # §7a covers a CHECK surviving an UNRELATED drop only
   - packages/quereus/test/logic/41.10-alter-drop-column-foreign-key.sqllogic # child-side coverage; parent side has none
+  - packages/quereus/src/core/database-assertions.ts                  # Arm C — where the unresolvable assertion body finally raises, at commit, for the whole database
+  - packages/quereus/test/logic/95-assertions.sqllogic                # Arm C — assertion end-to-end coverage
   - docs/sql-alter.md                                                 # DROP COLUMN restrictions — line 71 is factually wrong (see below)
   - docs/sql-ddl.md                                                   # DROP COLUMN section — the rule chosen here belongs here too
 difficulty: medium
+repro: verified
 ---
 
 # DROP COLUMN validates only some dependents, leaving tables unwritable
@@ -97,6 +100,33 @@ references to the table being altered, which is why this arm is the harder half.
 table's own foreign key constrains — was fixed under
 `bug-drop-column-leaves-fk-child-index-dangling`. Arm B is the mirror case and lives in the
 engine's `runDropColumn` validation, not in either virtual-table module.
+
+## Arm C — an assertion whose body names the dropped column
+
+```sql
+create table f (id integer primary key, x integer);
+create assertion ff check (not exists (select 1 from f where x < 0));
+
+alter table f drop column x;   -- accepted, no error
+insert into f values (1);      -- error: Column not found: x
+```
+
+Verified in-process at commit `d35d0b7e`. Same shape as Arm A, but the dependent is a
+database-wide integrity rule rather than a table-local CHECK — so the blast radius is
+larger: the assertion evaluator compiles **every** live assertion on any commit that
+touched any table, so one unresolvable assertion body blocks writes to the whole
+database, not only to the altered table. The error names the column the user just
+deliberately removed and never mentions the assertion.
+
+Same root site as the other arms — the fixed dependent list in `runDropColumn`. Whichever
+rule Arms A and B settle on (refuse vs. drop the dependent) should extend here, with the
+caveat that silently dropping a user's integrity rule is harder to justify than dropping a
+narrowed constraint.
+
+`fix/bug-assertion-body-can-name-missing-table` covers the *table* verb of the same family
+(`DROP TABLE` with a referring assertion, and `CREATE ASSERTION` over a missing table); it
+explicitly notes assertions are unguarded on both verbs but scopes itself to `DROP TABLE`.
+This arm is the column verb.
 
 ## Documentation is currently wrong — fixing it is in scope
 

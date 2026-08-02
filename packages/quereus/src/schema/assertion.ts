@@ -44,4 +44,3 @@ export function buildAssertionViolationSql(check: AST.Expression): string {
 	return `select 1 where not (${expressionToString(check)})`;
 }
 
-

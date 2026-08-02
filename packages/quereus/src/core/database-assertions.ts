@@ -180,6 +180,15 @@ export class AssertionEvaluator {
 		this.subscribeToSchemaChanges();
 	}
 
+	// NOTE: `assertion_modified` deliberately does NOT bump the generation — the only
+	// producer today is the `ALTER TABLE … RENAME` body rewrite
+	// (`runtime/emit/assertion-rename-helpers.ts`), and that statement already fires
+	// `table_modified` for the renamed table before it rewrites any body, so the
+	// cached plan is invalidated either way. `CREATE ASSERTION` over an existing name
+	// is refused, so no in-place redefine reaches here. If a redefine path is ever
+	// added (`create or replace assertion`, a catalog-import reconstruction), add
+	// `assertion_modified` to this gate — without it the evaluator keeps serving a
+	// plan compiled from the previous `violationSql`.
 	private subscribeToSchemaChanges(): void {
 		const notifier = this.ctx.schemaManager.getChangeNotifier();
 		this.unsubscribeSchemaChanges = notifier.addListener((event: SchemaChangeEvent) => {

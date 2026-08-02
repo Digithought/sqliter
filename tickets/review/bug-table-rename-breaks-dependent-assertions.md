@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-02T19:22:16.619Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\bug-table-rename-breaks-dependent-assertions.review.2026-08-02T19-22-16-619Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ---
 description: Renaming a table or column used to silently break every integrity-check rule that mentioned it, so all later writes failed with a confusing "table not found" error; renames now rewrite those rules the same way they already rewrite views.
 files:

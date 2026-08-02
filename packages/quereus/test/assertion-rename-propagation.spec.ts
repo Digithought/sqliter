@@ -24,6 +24,8 @@ import { Database } from '../src/core/database.js';
 import type { SchemaChangeEvent } from '../src/schema/change-events.js';
 import type { IntegrityAssertionSchema } from '../src/schema/assertion.js';
 import { expressionToString } from '../src/emit/ast-stringify.js';
+import { computeSchemaDiff } from '../src/schema/schema-differ.js';
+import { collectSchemaCatalog } from '../src/schema/catalog.js';
 
 /** Collect every schema-change event a database fires while `fn` runs. */
 async function captureEvents(db: Database, fn: () => Promise<void>): Promise<SchemaChangeEvent[]> {
@@ -191,6 +193,193 @@ describe('assertion rename propagation: stored body, derived SQL, and events', (
 			await expectThrows(
 				() => db.exec('insert into temp.qt values (1, -5)'),
 				'Integrity assertion failed: temp.qa');
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
+ * Body shapes the rename walkers are shared with the view-body path for — a join,
+ * an alias, a CTE, a correlated subquery. The shared code makes them likely to work;
+ * these pin that they do, since an assertion body (unlike a view body) is walked
+ * unseeded and a false capture there silently breaks every later write.
+ */
+describe('assertion rename propagation: body shapes', () => {
+	it('rewrites only the renamed side of a two-table join', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table ja (id integer primary key, k integer)');
+			await db.exec('create table jb (id integer primary key, k integer)');
+			await db.exec('create assertion j1 check (not exists (select 1 from ja join jb on ja.k = jb.k where ja.k < 0))');
+
+			await db.exec('alter table ja rename to ja2');
+
+			const sql = getAssertion(db, 'main', 'j1').violationSql;
+			expect(sql, 'renamed side follows, in FROM and in both qualified refs')
+				.to.contain('from ja2 inner join jb on ja2.k = jb.k where ja2.k < 0');
+			expect(sql, 'the untouched side keeps its name').to.contain('jb');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('follows an alias for both rename kinds', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table al (id integer primary key, x integer)');
+			await db.exec('create assertion a_al check (not exists (select 1 from al as aa where aa.x < 0))');
+
+			await db.exec('alter table al rename column x to y');
+			expect(getAssertion(db, 'main', 'a_al').violationSql, 'the alias-qualified column follows')
+				.to.contain('from al as aa where aa.y < 0');
+
+			await db.exec('alter table al rename to al2');
+			expect(getAssertion(db, 'main', 'a_al').violationSql, 'the aliased source follows; the alias itself does not')
+				.to.contain('from al2 as aa where aa.y < 0');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('descends a CTE in the body for both rename kinds', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table ce (id integer primary key, x integer)');
+			await db.exec('create assertion a_ce check (not exists (with q as (select x from ce) select 1 from q where x < 0))');
+
+			await db.exec('alter table ce rename to ce2');
+			expect(getAssertion(db, 'main', 'a_ce').violationSql, 'the CTE body follows the table rename')
+				.to.contain('with q as (select x from ce2)');
+
+			await db.exec('alter table ce2 rename column x to y');
+			// The CTE re-exposes `x` with no explicit column list, so the outer
+			// reference follows too — the same rule the view-body path documents.
+			expect(getAssertion(db, 'main', 'a_ce').violationSql, 'both the CTE projection and the outer ref follow')
+				.to.contain('with q as (select y from ce2) select 1 from q where y < 0');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('rewrites through a correlated subquery without disturbing the inner source', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table par (id integer primary key, x integer)');
+			await db.exec('create table chi (id integer primary key, pid integer)');
+			await db.exec(`create assertion a_co check (not exists (
+				select 1 from par where x < 0 and exists (select 1 from chi where chi.pid = par.id)))`);
+
+			await db.exec('alter table par rename column x to z');
+			expect(getAssertion(db, 'main', 'a_co').violationSql, 'the outer column follows')
+				.to.contain('where z < 0');
+
+			await db.exec('alter table par rename to par2');
+			const sql = getAssertion(db, 'main', 'a_co').violationSql;
+			expect(sql, 'the correlated qualifier follows').to.contain('chi.pid = par2.id');
+			expect(sql, 'the inner (unrenamed) source is untouched').to.contain('from chi where');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('enforces against the new name when the rename and the writes share one transaction', async () => {
+		const db = new Database();
+		try {
+			await db.exec('create table tx (x integer primary key)');
+			await db.exec('create assertion a_tx check (not exists (select 1 from tx where x < 0))');
+			await db.exec('insert into tx values (1)');
+
+			// The first commit compiled and cached the assertion plan against the OLD
+			// body; the rename must invalidate it before this transaction's own COMMIT
+			// evaluates the assertion.
+			await db.exec('begin');
+			await db.exec('alter table tx rename to tx2');
+			await db.exec('insert into tx2 values (5)');
+			await db.exec('commit');
+			expect(await rowCount(db, 'tx2')).to.equal(2);
+
+			await db.exec('begin');
+			await db.exec('insert into tx2 values (-9)');
+			await expectThrows(() => db.exec('commit'), 'Integrity assertion failed: a_tx');
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/**
+ * The declarative half: `apply schema` renames a table via a `quereus.previous_name`
+ * hint while the declared assertion body already names the new table. The rename
+ * propagation is what makes the follow-up diff converge — it rewrites the live body
+ * to the new name, so both sides render identically. See the NOTE on the assertion
+ * loop in `schema/schema-differ.ts`.
+ */
+describe('assertion rename propagation: declarative round trip', () => {
+	it('converges after a table rename hint and keeps enforcing', async () => {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table orders { id INTEGER PRIMARY KEY, qty INTEGER }
+				assertion qty_nonneg check (not exists (select 1 from orders where qty < 0))
+			}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {
+				table sales { id INTEGER PRIMARY KEY, qty INTEGER } with tags ("quereus.previous_name" = 'orders')
+				assertion qty_nonneg check (not exists (select 1 from sales where qty < 0))
+			}`);
+			await db.exec('apply schema main');
+
+			expect(getAssertion(db, 'main', 'qty_nonneg').violationSql, 'live body follows the applied rename')
+				.to.equal('select 1 where not (not exists (select 1 from sales where qty < 0))');
+
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.renames, 'no further rename').to.deep.equal([]);
+			expect(diff.assertionsToCreate, 'no assertion churn on the re-diff').to.deep.equal([]);
+			expect(diff.assertionsToDrop, 'no assertion churn on the re-diff').to.deep.equal([]);
+
+			await db.exec('insert into sales values (1, 4)');
+			await expectThrows(
+				() => db.exec('insert into sales values (2, -4)'),
+				'Integrity assertion failed: qty_nonneg');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('converges after a column rename hint and keeps enforcing', async () => {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table inv { id INTEGER PRIMARY KEY, qty INTEGER }
+				assertion inv_nonneg check (not exists (select 1 from inv where qty < 0))
+			}`);
+			await db.exec('apply schema main');
+
+			await db.exec(`declare schema main {
+				table inv { id INTEGER PRIMARY KEY, amount INTEGER with tags ("quereus.previous_name" = 'qty') }
+				assertion inv_nonneg check (not exists (select 1 from inv where amount < 0))
+			}`);
+			await db.exec('apply schema main');
+
+			expect(getAssertion(db, 'main', 'inv_nonneg').violationSql, 'live body follows the applied column rename')
+				.to.equal('select 1 where not (not exists (select 1 from inv where amount < 0))');
+
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.assertionsToCreate, 'no assertion churn on the re-diff').to.deep.equal([]);
+			expect(diff.assertionsToDrop, 'no assertion churn on the re-diff').to.deep.equal([]);
+			expect(diff.tablesToAlter, 'no table churn on the re-diff').to.deep.equal([]);
+
+			await expectThrows(
+				() => db.exec('insert into inv values (2, -4)'),
+				'Integrity assertion failed: inv_nonneg');
 		} finally {
 			await db.close();
 		}
