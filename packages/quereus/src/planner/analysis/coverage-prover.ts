@@ -638,12 +638,20 @@ function findConstrainedTableRef(node: RelationalPlanNode, baseTable: TableSchem
  *
  * This is the optimized-plan analogue of `ind-utils.ts`'s
  * `isRowPreservingPathToTable` (which recognizes the *logical*-plan shape:
- * bare TableReference / Retrieve-of-bare-table / Alias / Sort). After physical
- * access selection a full scan is a `SeqScan`/`IndexScan` over the table — so we
- * additionally admit those, but only when **not range-bounded** (`rangeBoundedOn`
- * unset; a bounded scan drops rows). `IndexSeek`/`TableSeek` (row-reducing
- * seeks), `Filter`, `LimitOffset`, `Distinct`, `Project`, joins, aggregates, …
+ * bare TableReference / Retrieve-of-bare-table / Alias / Sort / Project). After
+ * physical access selection a full scan is a `SeqScan`/`IndexScan` over the
+ * table — so we additionally admit those, but only when **not range-bounded**
+ * (`rangeBoundedOn` unset; a bounded scan drops rows). `IndexSeek`/`TableSeek`
+ * (row-reducing seeks), `Filter`, `LimitOffset`, `Distinct`, joins, aggregates, …
  * all disqualify by falling through to `undefined`.
+ *
+ * NOTE: `Project` is the one shape where the two now differ — the logical
+ * predicate peels it (a projection drops no rows; see `ind-utils.ts`), this walk
+ * stops at it. Under-claim-safe: a `Project` surviving above the parent scan
+ * costs a cover, not correctness. Peel it here too if that shape ever shows up
+ * as a lost optimization; the pairing below resolves attribute ids against
+ * `lookupRef`'s own attributes, so an intervening projection would not disturb
+ * it.
  *
  * Required for the inner-join FK admit path: the lookup (parent) side must
  * produce the parent's full row set, else a `T` row whose parent was filtered

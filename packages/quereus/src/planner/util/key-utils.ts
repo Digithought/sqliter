@@ -498,9 +498,15 @@ export function analyzeJoinKeyCoverage(
  *
  * Permissive: answers "which table does this subtree ultimately read?", walking
  * through ANY single-relation operator including aggregates and recursive CTEs.
- * That is what FK/PK and key analysis want. When the question is instead "whose
- * statistics describe the rows arriving here", use
- * {@link extractRowSourceTableSchema}.
+ * When the question is instead "whose statistics describe the rows arriving
+ * here", use {@link extractRowSourceTableSchema}.
+ *
+ * **Not for FK/PK alignment**, and no production caller uses it for that any
+ * more: a schema alone cannot say which base-table column an output position
+ * came from, which is the defect `resolveTableColumnMapping` (`ind-utils.ts`)
+ * exists to prevent. It survives as the permissive half of the pair the
+ * selectivity rule's strict walk is defined against — its own unit tests pin
+ * that contrast.
  */
 export function extractTableSchema(node: RelationalPlanNode): TableSchema | undefined {
 	return walkToTableSchema(node, false);

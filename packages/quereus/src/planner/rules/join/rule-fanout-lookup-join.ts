@@ -513,6 +513,12 @@ function recognizeBranch(
 		rightCols.push(p.right);
 	}
 
+	// NOTE: a lookup side that reads zero or several tables (a join, a union, a
+	// values list) bails the whole cluster, where an untranslatable *column*
+	// merely degrades the branch to `cross` below. The stricter treatment is
+	// sound but costs clusters; if multi-table lookup branches show up as a
+	// missed optimization, fall through to the cross path here too — `cross` never
+	// needed the schema.
 	const rightMapping = resolveTableColumnMapping(join.right);
 	if (!rightMapping) return null;
 

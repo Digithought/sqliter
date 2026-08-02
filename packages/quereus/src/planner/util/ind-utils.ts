@@ -13,11 +13,15 @@
  *     underlying base table (no row-reducing wrapper between the join and the
  *     table).
  *
- * `extractTableSchema` and `checkFkPkAlignment` live in `key-utils.ts` because
- * they also serve non-IND callers (key coverage, FD propagation). This file
- * adds the IND-specific extensions: a covering-FK lookup that *returns* the
- * matched FK (so callers can inspect nullability), the output-column →
- * table-column mapping, and the row-preserving path walker.
+ * `checkFkPkAlignment` lives in `key-utils.ts` because it also serves non-IND
+ * callers (key coverage, FD propagation). This file adds the IND-specific
+ * extensions: a covering-FK lookup that *returns* the matched FK (so callers can
+ * inspect nullability), the output-column → table-column mapping, and the
+ * row-preserving path walker.
+ *
+ * FK-alignment callers resolve a subtree with `resolveTableColumnMapping` here,
+ * never with `key-utils.ts`'s `extractTableSchema` — a bare schema loses the
+ * output-column → table-column map the alignment check needs.
  */
 
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';

@@ -370,6 +370,53 @@ describe('ruleJoinElimination', () => {
 			const out = await results(db, q);
 			expect(out.map(r => r.id)).to.deep.equal([10]);
 		});
+
+		/**
+		 * Composite FK through a sub-select that swaps the parent's two PK columns.
+		 * Positional pairing is what makes a composite FK safe, and the swap makes
+		 * the two numbering schemes disagree in *both* directions: the pairing that
+		 * looks aligned by output position is the misaligned one, and vice versa.
+		 */
+		async function setupComposite(): Promise<void> {
+			await db.exec(
+				'create table pcomp (a integer not null, b integer not null, primary key (a, b)) using memory',
+			);
+			await db.exec(`create table ccomp (
+				id integer primary key,
+				fa integer not null,
+				fb integer not null,
+				foreign key (fa, fb) references pcomp(a, b)
+			) using memory`);
+			await db.exec('insert into pcomp values (1, 10), (2, 20)');
+			await db.exec('insert into ccomp values (100, 1, 10), (101, 2, 20)');
+		}
+
+		it('keeps the INNER join when a swapping sub-select permutes a composite FK', async () => {
+			await setupComposite();
+			// `(select b, a …)` puts `b` at output 0 and `a` at output 1, so pairing
+			// fa with q.b and fb with q.a reads as the FK's declared (a, b) order by
+			// output position while actually being the permuted pairing the FK does
+			// NOT cover. Eliminating would return ccomp's 2 rows; the truth is none.
+			const q = 'select c.id from ccomp c join (select b, a from pcomp) q on c.fa = q.b and c.fb = q.a';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			expect(await results(db, q)).to.have.lengthOf(0);
+		});
+
+		it('still eliminates the INNER join when a swapping sub-select keeps the composite FK pairing', async () => {
+			await setupComposite();
+			// The mirror: fa↔a and fb↔b is the FK's declared pairing, even though the
+			// sub-select hands them over in the opposite output order.
+			const q = 'select c.id from ccomp c join (select b, a from pcomp) q on c.fa = q.a and c.fb = q.b';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q + ' order by c.id');
+			expect(out.map(r => r.id)).to.deep.equal([100, 101]);
+		});
 	});
 
 	// `ruleJoinEliminationUnderAggregate` (id `join-elimination-aggregate`): the
@@ -539,6 +586,30 @@ describe('ruleJoinElimination', () => {
 			const rows = await planRows(db, q);
 			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
 
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 2 }]);
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
+
+		it('keeps the LEFT join under count(*) when the sub-select exposes a NON-FK-referenced column', async () => {
+			// The aggregate anchor shares `tryEliminate` with the Project anchor, so
+			// the base-table translation covers it too — pinned here because the LEFT
+			// aggregate path skips both guards the INNER path relies on, leaving the
+			// alignment check as the only thing standing between a 1:n join and a
+			// wrong row count. `q.other` is output position 0 but column 1 of `p`.
+			await db.exec('create table p (id integer primary key, other integer) using memory');
+			await db.exec(
+				'create table c (id integer primary key, p_id integer not null references p(id)) using memory',
+			);
+			await db.exec('insert into p values (7, 7), (2, 7)');
+			await db.exec('insert into c values (10, 7)');
+
+			const q = 'select count(*) as n from c left join (select other from p) q on c.p_id = q.other';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			// Both `p` rows carry other = 7, so the single `c` row matches twice.
 			const out = await results(db, q);
 			expect(out).to.deep.equal([{ n: 2 }]);
 			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
