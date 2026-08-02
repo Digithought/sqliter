@@ -1,7 +1,7 @@
 <!-- resume-note -->
 RESUME: A prior agent run on this ticket did not complete.
-  Prior run: 2026-08-02T07:05:57.037Z (agent: claude)
-  Log file: C:\projects\quereus\tickets\.logs\bug-declared-materialized-view-non-main-schema.fix.2026-08-02T07-05-57-037Z.log
+  Prior run: 2026-08-02T14:21:52.243Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\bug-declared-materialized-view-non-main-schema.fix.2026-08-02T14-21-52-238Z.log
 Read the log to see what was done. Resume where it left off.
 If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
 <!-- /resume-note -->
