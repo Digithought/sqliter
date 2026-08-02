@@ -6,6 +6,8 @@
  * - Both inputs advertise `MonotonicOn` on (at least) one of the equi-pair
  *   attributes, with matching direction (ASC for v1, since the merge-join
  *   emitter assumes ASC ordering).
+ * - Neither input reads the other's columns (a merge join drains each side
+ *   independently, so such a side must keep the nested-loop driver).
  *
  * Why this rule exists alongside `rule-join-physical-selection`:
  * The existing rule chooses merge-join when both sources' `physical.ordering`
@@ -35,6 +37,7 @@ import type { EquiJoinPair } from '../../nodes/join-utils.js';
 import { nestedLoopJoinCost, hashJoinCost, mergeJoinCost } from '../../cost/index.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { extractEquiPairs, combineResidual, isMergeReadyOnAllPairs } from './equi-pair-extractor.js';
+import { readsColumnsOf } from '../../cache/correlation-detector.js';
 
 const log = createLogger('optimizer:rule:monotonic-merge-join');
 
@@ -57,6 +60,18 @@ export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): Pl
 	// one extractor covers both spellings.
 	const extracted = extractEquiPairs(node.condition, leftAttrIds, rightAttrIds);
 	if (!extracted || extracted.equiPairs.length === 0) return null;
+
+	// Same hazard `rule-join-physical-selection` guards: a merge join drains each
+	// side independently, so a side reading its SIBLING's columns (a `JOIN
+	// LATERAL` subtree, an index-nested-loop's correlated seek) would resolve
+	// against no row. Defensive here — no SQL shape was found that both reads a
+	// sibling's columns and advertises `monotonicOn` on the join key, so this
+	// gate is untested — but the emitter contract is identical, so declining
+	// costs at most one unreachable optimization.
+	if (readsColumnsOf(node.right, node.left) || readsColumnsOf(node.left, node.right)) {
+		log('Declining: a join side reads its sibling\'s columns; nested-loop driver required');
+		return null;
+	}
 
 	// Defer to `rule-join-physical-selection` whenever both sides' physical
 	// ordering already covers ALL equi-pairs in merge-ready order. The

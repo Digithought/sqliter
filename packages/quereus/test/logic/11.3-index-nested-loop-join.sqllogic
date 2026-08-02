@@ -89,11 +89,11 @@ SELECT s2.id, c.val FROM inl_s2 s2 JOIN inl_c c ON c.a = s2.x AND c.b = s2.y ORD
 SELECT s2.id, c.b AS cb FROM inl_s2 s2 JOIN inl_c c ON c.a = s2.x AND c.val = s2.name ORDER BY s2.id;
 → [{"id":1,"cb":3},{"id":2,"cb":12}]
 
--- ===== LATERAL with an ON equality (the correlated-side guard) =====
--- Before the guard in rule-join-physical-selection, a correlated LATERAL right
--- side with an equality ON was converted to a hash join, which drains the right
--- side outside any outer row's scope — "No row context found" at runtime. The
--- guard keeps the nested-loop driver.
+-- ===== LATERAL with an ON equality (the sibling-reference guard) =====
+-- Before the guard in rule-join-physical-selection, a LATERAL right side reading
+-- the left side's columns with an equality ON was converted to a hash join,
+-- which drains the right side before any left row exists — "No row context
+-- found" at runtime. The guard keeps the nested-loop driver.
 
 CREATE TABLE inl_lt (k INTEGER PRIMARY KEY, v INTEGER);
 CREATE TABLE inl_lu (k INTEGER PRIMARY KEY, v INTEGER);

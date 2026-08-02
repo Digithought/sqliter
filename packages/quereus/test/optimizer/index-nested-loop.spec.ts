@@ -149,13 +149,14 @@ describe('index-nested-loop join plan shape', () => {
 		expect(collectNodes(fired[0].right, isCache), 'no CacheNode above the seek').to.have.lengthOf(0);
 	});
 
-	it('is idempotent: the rule declines its own output via the correlated-side guard', () => {
+	it('is idempotent: the rule declines its own output via the sibling-reference guard', () => {
 		const plan = db.getPlan('select s.id, big.id as bid from s join big on big.v = s.k');
 		const fired = correlatedSeekJoins(plan);
 		expect(fired).to.have.lengthOf(1);
-		// The correlated-right guard fires before the context is touched, so a
-		// stub context proves the decline is unconditional — "fixed point of the
-		// pass" would not distinguish "declined" from "fired and was undone".
+		// The right side now seeks on left-side column references, so the guard
+		// fires before the context is touched — a stub context proves the decline
+		// is unconditional; "fixed point of the pass" would not distinguish
+		// "declined" from "fired and was undone".
 		const noContext = null as unknown as OptContext;
 		expect(ruleJoinPhysicalSelection(fired[0], noContext)).to.equal(null);
 	});
@@ -237,6 +238,35 @@ describe('index-nested-loop join plan shape', () => {
 			expect(correlatedSeekJoins(right)).to.have.lengthOf(0);
 			const full = db.getPlan('select s.id from s full join big on big.v = s.k');
 			expect(correlatedSeekJoins(full)).to.have.lengthOf(0);
+		});
+	});
+
+	describe('the sibling-reference guard', () => {
+		it('keeps a LATERAL right side on the nested-loop driver', async () => {
+			// The right side reads `t.k` from the left, so hash/merge — which drain
+			// one side before the other's rows exist — would raise "No row context
+			// found". Row-level proof lives in 11.3-index-nested-loop-join.sqllogic.
+			await db.exec('create table lt (k integer primary key, v integer)');
+			await db.exec('create table lu (k integer primary key, v integer)');
+			await db.exec('insert into lt values (1, 10), (2, 20)');
+			await db.exec('insert into lu values (1, 10), (2, 99)');
+			const plan = db.getPlan(
+				'select t.k from lt t join lateral (select * from lu u where u.k = t.k) x on x.v = t.v');
+			expect(collectNodes(plan, isHashJoin), 'no hash join').to.have.lengthOf(0);
+			expect(collectNodes(plan, isMergeJoin), 'no merge join').to.have.lengthOf(0);
+			expect(collectNodes(plan, isJoin), 'the logical JoinNode survives').to.have.lengthOf(1);
+		});
+
+		it('does NOT decline a join whose side reads a scope outside the join', () => {
+			// `b1`'s projection reads `s.k` — correlated, but to the ENCLOSING
+			// lateral, not to its sibling `b2`. The enclosing driver installs that
+			// row slot before the inner join opens, so a once-per-open hash build
+			// sees it. Declining here would cost a 200x200 nested loop for nothing.
+			const plan = db.getPlan(`select s.id, x.id from s join lateral (
+				select b1.id from (select id, w, v + s.k as vk from big) b1
+				join big b2 on b2.w = b1.w) x on true`);
+			expect(collectNodes(plan, isHashJoin), 'the inner join is still a hash join')
+				.to.have.lengthOf(1);
 		});
 	});
 

@@ -4,8 +4,8 @@
  * Required Characteristics:
  * - Node must be a logical JoinNode (not already a physical join)
  * - Node must have an equi-join predicate for hash/merge/index-NL consideration
- * - Neither side may be correlated (a correlated side must keep the
- *   nested-loop driver — hash/merge drain a side outside any outer row's scope)
+ * - Neither side may read the other's columns (such a side must keep the
+ *   nested-loop driver — hash/merge drain one side before the other's rows exist)
  *
  * Applied When:
  * - Logical JoinNode with equi-join predicates where hash join, merge join, or
@@ -32,7 +32,7 @@ import {
 	reorderEquiPairsForMerge,
 } from './equi-pair-extractor.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
-import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
+import { readsColumnsOf } from '../../cache/correlation-detector.js';
 import { physicalSourceRows } from '../../util/row-estimates.js';
 import { tryIndexNestedLoop } from './index-nested-loop.js';
 
@@ -74,15 +74,6 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// Guard: only apply to logical JoinNode, not already-physical nodes
 	if (!(node instanceof JoinNode)) return null;
 
-	// A correlated side must keep the nested-loop driver: hash and merge both
-	// drain a side once, outside any outer row's scope, so a subtree reading
-	// outer columns would resolve against no row (LATERAL is a parsed, supported
-	// join form, so `join lateral (…) on <equality>` reaches this rule with a
-	// correlated right side — converting it to a hash join raised "No row
-	// context found" at runtime). This is also what makes the index-nested-loop
-	// rewrite below idempotent: its own output has a correlated right side.
-	if (isCorrelatedSubquery(node.left) || isCorrelatedSubquery(node.right)) return null;
-
 	const joinType = node.joinType;
 
 	// Support INNER, LEFT, SEMI, and ANTI joins
@@ -100,6 +91,17 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		extractEquiPairs(node.condition, leftAttrIds, rightAttrIds);
 
 	if (!extracted || extracted.equiPairs.length === 0) return null;
+
+	// A side that reads its sibling's columns must keep the nested-loop driver.
+	// LATERAL is a parsed, supported join form, so `join lateral (…) on
+	// <equality>` reaches this rule with a right side reading left columns —
+	// converting it to a hash join raised "No row context found" at runtime.
+	// This is also what makes the index-nested-loop rewrite below idempotent:
+	// its own output seeks on left-side column references.
+	if (readsColumnsOf(node.right, node.left) || readsColumnsOf(node.left, node.right)) {
+		log('Declining: a join side reads its sibling\'s columns; nested-loop driver required');
+		return null;
+	}
 
 	// Cost comparison: nested loop vs hash join vs merge join vs index-nested-loop.
 	// Physical relay first: by PostOptimization both sides are physical access
@@ -129,9 +131,8 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// row, not per scanned row.
 	const rebuildWithIndexNL = (): PlanNode => {
 		log('Selecting index-nested-loop join (cost=%.2f) for %d outer rows', indexNL!.cost, leftRows);
-		return node.withChildren(node.condition
-			? [node.left, indexNL!.newRight, node.condition]
-			: [node.left, indexNL!.newRight]);
+		// `condition` is defined — equi pairs were extracted from it above.
+		return node.withChildren([node.left, indexNL!.newRight, node.condition!]);
 	};
 
 	// A join exposing `exists … as` match flags stays the nested-loop JoinNode (the
@@ -182,6 +183,13 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// formula charges it per outer row (per seek). Plain nested-loop's formula
 	// is deliberately left alone: it is the no-change fallback, and if it wins
 	// nothing is rewritten.
+	//
+	// NOTE: that last exemption biases against index-NL once a module reports a
+	// nonzero `expectedLatencyMs` — plain NL re-opens the right side per outer
+	// row too, so it pays the same per-seek latency but is charged none, and can
+	// win a comparison against the strictly cheaper index-NL. Harmless today
+	// (both shipped modules report 0). If a high-latency module appears, charge
+	// plain NL `outerRows * latency` here rather than dropping it from index-NL.
 	const rightLatencyMs = node.right.physical.expectedLatencyMs ?? 0;
 
 	// Pick the cheapest physical join algorithm
