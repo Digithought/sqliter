@@ -149,6 +149,15 @@ describe('StoreModule predicate pushdown', () => {
 		return rows[0].ops as string;
 	}
 
+	/** The `query_plan()` `detail` strings for `query`, as a JSON array string. */
+	async function planDetails(query: string): Promise<string> {
+		const rows = await asyncIterableToArray(
+			db.eval(`select json_group_array(detail) as details from query_plan(?)`, [query]),
+		);
+		expect(rows).to.have.lengthOf(1);
+		return rows[0].details as string;
+	}
+
 	describe('explicit PRIMARY KEY (id)', () => {
 		beforeEach(async () => {
 			await db.exec(`
@@ -1114,6 +1123,47 @@ describe('StoreModule predicate pushdown', () => {
 				const q = `select id from cap where v in (${list}) order by id`;
 				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
 				expect(await ids(q)).to.deep.equal([1, 2]);
+			});
+
+			// bug-store-index-choice-ignores-cost: computeBestAccessPlan used to return the
+			// FIRST secondary index whose plan claimed a seek, rather than the cheapest one.
+			// A cheap single-key EQ seek on `a` and an expensive 300-key IN multi-seek on `b`
+			// both claim a seek here; only the declared cost tells them apart (a plain EQ
+			// estimates 100 matched rows at cost ~30, a 300-value IN estimates ~450 — see the
+			// ticket for the arithmetic). These three cases isolate declaration order from
+			// predicate order so only the cost comparison can be making the choice.
+			describe('cost-based index choice (declaration order must not decide)', () => {
+				const manyValues = Array.from({ length: 300 }, (_, i) => i).join(', ');
+
+				it('cheaper index declared second still wins', async () => {
+					await db.exec(`create table two (id integer primary key, a integer, b integer) using store`);
+					await db.exec(`create index ix_b on two (b)`);
+					await db.exec(`create index ix_a on two (a)`);
+					await db.exec(`insert into two values (1, 7, 5), (2, 7, 999), (3, 3, 5)`);
+					const q = `select id from two where a = 7 and b in (${manyValues}) order by id`;
+					expect(await planDetails(q)).to.match(/USING ix_a\b/);
+					expect(await ids(q)).to.deep.equal([1]);
+				});
+
+				it('same declaration order, same predicate: cheaper index still wins', async () => {
+					await db.exec(`create table two (id integer primary key, a integer, b integer) using store`);
+					await db.exec(`create index ix_a on two (a)`);
+					await db.exec(`create index ix_b on two (b)`);
+					await db.exec(`insert into two values (1, 7, 5), (2, 7, 999), (3, 3, 5)`);
+					const q = `select id from two where a = 7 and b in (${manyValues}) order by id`;
+					expect(await planDetails(q)).to.match(/USING ix_a\b/);
+					expect(await ids(q)).to.deep.equal([1]);
+				});
+
+				it('reversed predicate, fixed declaration order: the cheaper index still wins (proves cost, not order)', async () => {
+					await db.exec(`create table two (id integer primary key, a integer, b integer) using store`);
+					await db.exec(`create index ix_a on two (a)`);
+					await db.exec(`create index ix_b on two (b)`);
+					await db.exec(`insert into two values (1, 7, 5), (2, 7, 999), (3, 3, 5)`);
+					const q = `select id from two where a in (${manyValues}) and b = 5 order by id`;
+					expect(await planDetails(q)).to.match(/USING ix_b\b/);
+					expect(await ids(q)).to.deep.equal([1, 3]);
+				});
 			});
 		});
 
