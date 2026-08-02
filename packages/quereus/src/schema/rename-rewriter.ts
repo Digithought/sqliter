@@ -67,6 +67,16 @@ const schemaMatches = (
 // Table rename
 // ──────────────────────────────────────────────────────────────────────
 
+/**
+ * Traversal state for {@link visitTableRename}. `dryRun` turns the walk into a
+ * pure predicate: matches still set `changed`, but nothing is assigned — see
+ * {@link tableReferencedInAst}.
+ */
+interface TableRenameCtx {
+	changed: boolean;
+	dryRun?: boolean;
+}
+
 export function renameTableInAst(
 	node: AST.AstNode | undefined,
 	oldName: string,
@@ -74,8 +84,33 @@ export function renameTableInAst(
 	defaultSchemaName: string,
 ): boolean {
 	if (!node) return false;
-	const ctx = { changed: false };
+	const ctx: TableRenameCtx = { changed: false };
 	visitTableRename(node, oldName, newName, defaultSchemaName, ctx);
+	return ctx.changed;
+}
+
+/**
+ * Whether `node` refers to the table/view `name` in schema `defaultSchemaName` —
+ * read-only, nothing is mutated.
+ *
+ * Deliberately the SAME traversal {@link renameTableInAst} uses, run with
+ * `dryRun`, so "refers to" can never drift from "would have been rewritten by a
+ * rename". That equivalence is the whole point: the DROP guard refuses exactly
+ * the cases `ALTER TABLE … RENAME` would have followed. A second traversal — or
+ * a `renameTableInAst(clone, name, name, …)` trick, which would silently
+ * re-case identifiers — would both break it.
+ *
+ * `name` is passed as both old and new name; under `dryRun` the new name is
+ * never read.
+ */
+export function tableReferencedInAst(
+	node: AST.AstNode | undefined,
+	name: string,
+	defaultSchemaName: string,
+): boolean {
+	if (!node) return false;
+	const ctx: TableRenameCtx = { changed: false, dryRun: true };
+	visitTableRename(node, name, name, defaultSchemaName, ctx);
 	return ctx.changed;
 }
 
@@ -84,9 +119,11 @@ function visitTableRename(
 	oldName: string,
 	newName: string,
 	defaultSchemaName: string,
-	ctx: { changed: boolean },
+	ctx: TableRenameCtx,
 ): void {
 	if (!node) return;
+	// A dry run only answers yes/no — stop as soon as the answer is known.
+	if (ctx.dryRun && ctx.changed) return;
 
 	switch (node.type) {
 		case 'select': {
@@ -162,7 +199,7 @@ function visitTableRename(
 		case 'table': {
 			const ts = node as AST.TableSource;
 			if (eq(ts.table.name, oldName) && schemaMatches(ts.table.schema, defaultSchemaName)) {
-				ts.table.name = newName;
+				if (!ctx.dryRun) ts.table.name = newName;
 				ctx.changed = true;
 			}
 			break;
@@ -247,7 +284,7 @@ function visitTableRename(
 		case 'column': {
 			const col = node as AST.ColumnExpr;
 			if (col.table && eq(col.table, oldName) && schemaMatches(col.schema, defaultSchemaName)) {
-				col.table = newName;
+				if (!ctx.dryRun) col.table = newName;
 				ctx.changed = true;
 			}
 			break;
@@ -323,11 +360,11 @@ function rewriteIdentifierIfTable(
 	oldName: string,
 	newName: string,
 	defaultSchemaName: string,
-	ctx: { changed: boolean },
+	ctx: TableRenameCtx,
 ): void {
 	if (!id) return;
 	if (eq(id.name, oldName) && schemaMatches(id.schema, defaultSchemaName)) {
-		id.name = newName;
+		if (!ctx.dryRun) id.name = newName;
 		ctx.changed = true;
 	}
 }

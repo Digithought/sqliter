@@ -245,5 +245,8 @@ DROP TABLE wf_data;
 -- ===================================
 
 DROP TABLE app1.customers;
+-- The assertion still names validated.accounts, so the table drop is refused
+-- until the rule goes first.
+DROP ASSERTION validated.positive_balance;
 DROP TABLE validated.accounts;
 DROP TABLE main_data;

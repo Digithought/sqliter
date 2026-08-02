@@ -48,6 +48,10 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 		// hoist suppression so another assertion's hoisted premises can't fold a
 		// base reference out of the plan — the commit-time evaluator derives its
 		// own base set the same way (see AssertionEvaluator.getOrCompilePlan).
+		// The builder (`planAssertionBody`) already proved this same violation SQL
+		// builds against the live catalog, so a failure below is a discovery-only
+		// failure (optimizer-stage, or the plan-shape walk) — never "the body names
+		// something that doesn't exist".
 		try {
 			const planNode = rctx.db.schemaManager.withSuppressedAssertionHoist(
 				() => rctx.db.getPlan(violationSql, rctx.db._homeSchemaPath(plan.schemaName)));

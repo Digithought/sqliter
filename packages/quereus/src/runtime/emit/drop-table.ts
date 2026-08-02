@@ -7,6 +7,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { dropMaintainedTable } from './materialized-view.js';
 import { requireVtabModule } from '../../schema/table.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
+import { assertNoAssertionDependsOn } from './assertion-drop-guard.js';
 
 export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instruction {
 	const schemaManager = ctx.db.schemaManager;
@@ -31,6 +32,11 @@ export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instru
 				rctx.db, requireVtabModule(target), target.vtabModuleName,
 				`DROP TABLE ${objectName}`,
 			);
+			// Before the maintained-table branch below, so DROP TABLE on a
+			// materialized view is guarded too. Gated on the table existing: an
+			// `IF EXISTS` drop of an absent name is a no-op with nothing to protect
+			// (and any assertion naming that name is already broken).
+			assertNoAssertionDependsOn(rctx.db, targetSchemaName, objectName, 'table');
 		}
 
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)

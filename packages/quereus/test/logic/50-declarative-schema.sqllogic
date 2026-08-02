@@ -841,11 +841,11 @@ select count(*) as cnt from assert_drift.t;
 → [{"cnt": 1}]
 
 -- ===================================================================
--- Drift interacting with a same-apply ADD COLUMN: the recreated assertion
--- names a column that does not exist yet when its `create assertion` runs
--- (creates are emitted before the table-alter block). An assertion body binds
--- at enforcement time, not at create time, so this applies cleanly — unlike
--- the view path, which plans its body at create and cannot survive it.
+-- Drift interacting with a same-apply ADD COLUMN: the recreated assertion names
+-- a column the same migration adds. `create assertion` plans its body at create
+-- time (same strictness as a view body), so the create MUST run after the
+-- table-alter block — assertion creates are emitted last, after every ADD COLUMN
+-- and maintained re-attach. Assertion DROPs still lead the whole migration.
 -- ===================================================================
 
 declare schema assert_addcol {
@@ -874,7 +874,7 @@ declare schema assert_addcol {
 -- run
 
 diff schema assert_addcol;
-→ [{"ddl": "DROP ASSERTION IF EXISTS assert_addcol.range_check"}, {"ddl": "create assertion assert_addcol.range_check check (not exists (select 1 from t where y < 0))"}, {"ddl": "ALTER TABLE assert_addcol.t ADD COLUMN y INTEGER"}]
+→ [{"ddl": "DROP ASSERTION IF EXISTS assert_addcol.range_check"}, {"ddl": "ALTER TABLE assert_addcol.t ADD COLUMN y INTEGER"}, {"ddl": "create assertion assert_addcol.range_check check (not exists (select 1 from t where y < 0))"}]
 
 apply schema assert_addcol;
 

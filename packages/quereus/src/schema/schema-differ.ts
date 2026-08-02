@@ -8,7 +8,7 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst } from './rename-rewriter.js';
+import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst } from './rename-rewriter.js';
 import type { ResolveColumnInSource } from './rename-rewriter.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
@@ -855,15 +855,29 @@ export function computeSchemaDiff(
 	// the same round still makes an otherwise-unchanged assertion body look drifted
 	// and churns a spurious-but-correct drop+recreate (the DDL applies cleanly). The
 	// converse — renaming a table while LEAVING the declared body on the old name —
-	// converges the diff while recreating the assertion against a table that no
-	// longer exists; that is a separate defect (`create assertion` accepts a body
-	// naming a missing table), tracked by `bug-assertion-body-can-name-missing-table`.
+	// converges the diff, and the recreate then FAILS loudly at apply with
+	// `Cannot create assertion '<name>': Table '<old>' not found`, because
+	// `CREATE ASSERTION` now plans its body at build time. That is the intended
+	// outcome: the migration stops instead of leaving the database unwritable.
 	const actualAssertions = new Map(actualCatalog.assertions.map(a => [a.name.toLowerCase(), a]));
+
+	// An unchanged assertion naming an object this same migration DROPS must still
+	// be dropped and recreated around it — otherwise the DROP is refused by the
+	// runtime guard (`assertNoAssertionDependsOn`) and the migration dies. The live
+	// case is a maintained table whose backing module changed: it emits
+	// `DROP TABLE IF EXISTS x` plus a recreate of `x`, so the assertion's target
+	// comes back and the recreate (emitted last) succeeds. When the object is
+	// genuinely gone, the recreate fails loudly with the build-time error above
+	// rather than silently bricking every write.
+	const droppedInThisDiff = [...diff.tablesToDrop, ...diff.viewsToDrop];
+	const namesDroppedObject = (check: AST.Expression): boolean =>
+		droppedInThisDiff.some(dropped => tableReferencedInAst(check, dropped, targetSchemaName));
 
 	for (const [name, declaredAssertion] of declaredAssertions) {
 		const matchedActual = actualAssertions.get(name);
 		const declaredBody = expressionToString(declaredAssertion.assertionStmt.check);
-		if (matchedActual && declaredBody === matchedActual.definition) continue;
+		if (matchedActual && declaredBody === matchedActual.definition
+			&& !namesDroppedObject(declaredAssertion.assertionStmt.check)) continue;
 		// Drift on a name match: drop the old one first (creates run later, see
 		// `generateMigrationDDL`), then recreate from the declaration.
 		if (matchedActual) diff.assertionsToDrop.push(matchedActual.name);
@@ -2594,7 +2608,8 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	statements.push(...diff.tablesToCreate);
 	statements.push(...diff.viewsToCreate);
 	statements.push(...diff.indexesToCreate);
-	statements.push(...diff.assertionsToCreate);
+	// Assertion creates do NOT go here — they run last, after the table alters and
+	// the maintained re-attaches. See the push at the end of this function.
 
 	// Alter existing tables.
 	// Phase order within one table:
@@ -2706,6 +2721,15 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		};
 		statements.push(astToString(stmt));
 	}
+
+	// Assertion creates LAST — after every table alter and maintained re-attach, so
+	// a body sees the final shape of every object. `CREATE ASSERTION` plans its
+	// body at build time (see `planAssertionBody`), so a declaration that adds a
+	// column and an assertion over that column in the same round would fail if the
+	// create ran in the create block, before `ADD COLUMN`. Nothing in a migration
+	// depends on an assertion existing, so last is strictly safer. Assertion DROPs
+	// stay first (see the top of this function).
+	statements.push(...diff.assertionsToCreate);
 
 	// In-place tag changes on views / indexes. These are leaf metadata writes (no
 	// dependency ordering vs the table-alter block). The `?? []` keeps

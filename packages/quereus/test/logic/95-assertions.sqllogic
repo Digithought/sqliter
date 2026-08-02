@@ -670,3 +670,129 @@ SELECT COUNT(*) FROM ren_u;
 DROP ASSERTION ren_u_nonneg;
 DROP TABLE ren_u;
 -- run
+
+-- ===================================
+-- Body validation at CREATE (arm 1)
+-- ===================================
+-- The body is planned when the assertion is created, at the same strictness a
+-- view body is planned: missing table / missing column / unknown function all
+-- fail the CREATE. Before this, each was accepted and then made every later
+-- COMMIT in the whole database fail, naming the missing object but never the
+-- assertion.
+
+CREATE TABLE bv_t (x INTEGER PRIMARY KEY);
+CREATE TABLE bv_other (i INTEGER PRIMARY KEY);
+-- run
+
+CREATE ASSERTION bv_missing_table CHECK (NOT EXISTS (SELECT 1 FROM bv_nope WHERE q < 0));
+-- error: Cannot create assertion 'bv_missing_table': Table 'bv_nope' not found
+
+CREATE ASSERTION bv_missing_column CHECK (NOT EXISTS (SELECT 1 FROM bv_t WHERE zzz < 0));
+-- error: Cannot create assertion 'bv_missing_column': Column not found: zzz
+
+CREATE ASSERTION bv_missing_fn CHECK (bv_nosuchfn(1) > 0);
+-- error: Cannot create assertion 'bv_missing_fn': Function not found: bv_nosuchfn/1
+
+-- None of the three were registered.
+SELECT COUNT(*) AS n FROM assertion_info() WHERE name LIKE 'bv_%';
+→ [{ "n": 0 }]
+
+-- The database was never poisoned: an unrelated write still commits.
+INSERT INTO bv_other VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM bv_other;
+→ [{ "n": 1 }]
+
+DROP TABLE bv_t;
+DROP TABLE bv_other;
+-- run
+
+-- ===================================
+-- DROP refused while an assertion refers to the object (arm 2)
+-- ===================================
+
+-- --- DROP TABLE ---
+
+CREATE TABLE dg_t (x INTEGER PRIMARY KEY);
+CREATE TABLE dg_other (i INTEGER PRIMARY KEY);
+CREATE ASSERTION dg_t_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_t WHERE x < 0));
+-- run
+
+DROP TABLE dg_t;
+-- error: cannot drop table 'main.dg_t': assertion 'dg_t_nonneg' still refers to it
+
+-- IF EXISTS governs absence, not dependency — it does not weaken the guard.
+DROP TABLE IF EXISTS dg_t;
+-- error: cannot drop table 'main.dg_t': assertion 'dg_t_nonneg' still refers to it
+
+-- The refusal is a clean no-op: the table is still there and still enforced.
+INSERT INTO dg_t VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM dg_t;
+→ [{ "n": 1 }]
+
+-- Dropping the rule first is the documented way out.
+DROP ASSERTION dg_t_nonneg;
+DROP TABLE dg_t;
+INSERT INTO dg_other VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM dg_other;
+→ [{ "n": 1 }]
+
+DROP TABLE dg_other;
+-- run
+
+-- --- DROP VIEW ---
+
+CREATE TABLE dg_u (x INTEGER PRIMARY KEY);
+CREATE VIEW dg_v AS SELECT * FROM dg_u;
+CREATE ASSERTION dg_v_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_v WHERE x < 0));
+-- run
+
+DROP VIEW dg_v;
+-- error: cannot drop view 'main.dg_v': assertion 'dg_v_nonneg' still refers to it
+
+DROP ASSERTION dg_v_nonneg;
+DROP VIEW dg_v;
+DROP TABLE dg_u;
+-- run
+
+-- --- DROP MATERIALIZED VIEW (and DROP TABLE on the same maintained table) ---
+
+CREATE TABLE dg_w (x INTEGER PRIMARY KEY);
+CREATE MATERIALIZED VIEW dg_mv AS SELECT x FROM dg_w;
+CREATE ASSERTION dg_mv_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_mv WHERE x < 0));
+-- run
+
+DROP MATERIALIZED VIEW dg_mv;
+-- error: cannot drop materialized view 'main.dg_mv': assertion 'dg_mv_nonneg' still refers to it
+
+-- DROP TABLE on a maintained table is guarded on the same seam.
+DROP TABLE dg_mv;
+-- error: cannot drop table 'main.dg_mv': assertion 'dg_mv_nonneg' still refers to it
+
+DROP ASSERTION dg_mv_nonneg;
+DROP MATERIALIZED VIEW dg_mv;
+DROP TABLE dg_w;
+-- run
+
+-- --- Same-schema scoping ---
+-- An assertion's unqualified table names resolve against its OWN schema first,
+-- so an assertion living in `temp` must not be tripped by dropping a like-named
+-- table in `main`.
+
+CREATE TABLE main.dg_s (x INTEGER PRIMARY KEY);
+CREATE TABLE temp.dg_s (x INTEGER PRIMARY KEY);
+CREATE ASSERTION temp.dg_s_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_s WHERE x < 0));
+-- run
+
+-- main.dg_s is not what the temp assertion names.
+DROP TABLE main.dg_s;
+-- run
+
+DROP TABLE temp.dg_s;
+-- error: cannot drop table 'temp.dg_s': assertion 'dg_s_nonneg' still refers to it
+
+DROP ASSERTION temp.dg_s_nonneg;
+DROP TABLE temp.dg_s;
+-- run

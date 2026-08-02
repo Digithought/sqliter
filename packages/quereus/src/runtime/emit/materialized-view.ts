@@ -13,6 +13,7 @@ import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import { requireVtabModule } from '../../schema/table.js';
 import { normalizeBackingModuleName } from '../../schema/view.js';
 import { assertDdlTransactionPolicy, isDdlPolicyStrict } from './ddl-transaction-policy.js';
+import { assertNoAssertionDependsOn } from './assertion-drop-guard.js';
 import {
 	materializeView,
 	deriveBackingShape,
@@ -291,6 +292,11 @@ export function emitDropMaterializedView(plan: DropMaterializedViewNode, _ctx: E
 			}
 			throw new QuereusError(`no such materialized view: ${plan.viewName}`, StatusCode.ERROR);
 		}
+
+		// Same guard DROP TABLE applies — a maintained table is a table to an
+		// assertion body. `dropMaintainedTable` itself stays unguarded: internal
+		// rollback / catalog-cleanup paths call it and must not be vetoed.
+		assertNoAssertionDependsOn(db, plan.schemaName, plan.viewName, 'materialized view');
 
 		await dropMaintainedTable(db, mv);
 		return null;

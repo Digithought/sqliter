@@ -3,6 +3,7 @@ import type { Instruction, RuntimeContext } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
+import { assertNoAssertionDependsOn } from './assertion-drop-guard.js';
 
 export function emitDropView(plan: DropViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -31,6 +32,10 @@ export function emitDropView(plan: DropViewNode, _ctx: EmissionContext): Instruc
 			// View doesn't exist but IF EXISTS was specified, so this is a no-op
 			return null;
 		}
+
+		// An assertion body may name a view exactly as it names a base table, and
+		// dropping it out from under one breaks every write to the database.
+		assertNoAssertionDependsOn(rctx.db, plan.schemaName, plan.viewName, 'view');
 
 		// Remove the view from the schema manager
 		const schema = rctx.db.schemaManager.getSchema(plan.schemaName);
