@@ -847,16 +847,17 @@ export function computeSchemaDiff(
 	// Identifiers are NOT case-folded (same policy as the view/MV bodies above):
 	// a case-only edit churns a drop+recreate, which is cheap here — an assertion
 	// recreate re-plans a query, it does not rebuild a structure or rescan rows.
-	// NOTE: no rename reconciliation here (unlike the view/index loops above) —
-	// an assertion's stored CHECK expression is captured verbatim at CREATE and
-	// never rewritten by `alter table … rename`, so a table/column renamed in
-	// this same diff makes an otherwise-unchanged assertion body look drifted
-	// and churns a spurious-but-correct drop+recreate (assertion creates run
-	// after table renames, so the DDL still applies cleanly). The converse —
-	// renaming a table while LEAVING the declared body on the old name — is a
-	// separate, pre-existing defect the diff cannot see (both sides render the
-	// old name, so it converges while the live assertion is broken); tracked by
-	// ticket `bug-table-rename-breaks-dependent-assertions`.
+	// NOTE: no rename reconciliation here (unlike the view/index loops above), and
+	// none is needed for the well-formed case: `alter table … rename` DOES rewrite
+	// an assertion's stored CHECK expression (see `assertion-rename-helpers.ts`), and
+	// `apply schema` runs renames before assertion creates, so the re-diff compares
+	// new-name against new-name and converges. On the FIRST diff a table renamed in
+	// the same round still makes an otherwise-unchanged assertion body look drifted
+	// and churns a spurious-but-correct drop+recreate (the DDL applies cleanly). The
+	// converse — renaming a table while LEAVING the declared body on the old name —
+	// converges the diff while recreating the assertion against a table that no
+	// longer exists; that is a separate defect (`create assertion` accepts a body
+	// naming a missing table), tracked by `bug-assertion-body-can-name-missing-table`.
 	const actualAssertions = new Map(actualCatalog.assertions.map(a => [a.name.toLowerCase(), a]));
 
 	for (const [name, declaredAssertion] of declaredAssertions) {

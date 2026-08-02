@@ -1,4 +1,5 @@
 import type * as AST from '../parser/ast.js';
+import { expressionToString } from '../emit/ast-stringify.js';
 
 export interface AssertionDependentTable {
   /** Instance-unique table reference key, e.g. schema.table#nodeId */
@@ -27,6 +28,20 @@ export interface IntegrityAssertionSchema {
    * — assertions without it fall through to commit-time enforcement only.
    */
   checkExpression?: AST.Expression;
+}
+
+/**
+ * Renders the violation-producing query an assertion's CHECK expression implies:
+ * `check (<expr>)` holds exactly when `select 1 where not (<expr>)` returns no
+ * row, so any row it returns is a violation. The commit-time evaluator re-parses
+ * and re-plans this text (see `AssertionEvaluator.getOrCompilePlan`).
+ *
+ * Shared by `CREATE ASSERTION` and the `ALTER TABLE … RENAME` propagation, so a
+ * body rewritten by a rename regenerates byte-identically to what a fresh create
+ * would have produced for the same expression.
+ */
+export function buildAssertionViolationSql(check: AST.Expression): string {
+	return `select 1 where not (${expressionToString(check)})`;
 }
 
 

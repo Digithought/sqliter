@@ -593,3 +593,80 @@ SELECT balance FROM accounts WHERE id = 1;
 DROP ASSERTION rnn_balance;
 DROP TABLE accounts;
 -- run
+
+-- ===================================
+-- ALTER TABLE ... RENAME propagates into assertion bodies
+-- ===================================
+-- A rename rewrites the stored CHECK expression (and the derived violation SQL
+-- the commit-time evaluator re-parses) the same way it rewrites a view body.
+-- Before this propagation existed, every write to the renamed table failed with
+-- "Table 't' not found" / "Column not found: x". Catalog-level invariants
+-- (event fired, dependentTables re-keyed, home-schema scoping) are covered in
+-- test/assertion-rename-propagation.spec.ts.
+
+-- --- TABLE rename, with a table-qualified self-reference in the body ---
+
+CREATE TABLE ren_t (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_t_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM ren_t WHERE ren_t.x < 0
+));
+INSERT INTO ren_t VALUES (1);
+COMMIT;
+ALTER TABLE ren_t RENAME TO ren_t2;
+-- run
+
+-- The stored violation SQL names the new table in both the FROM and the
+-- qualified column reference.
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_t_nonneg';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_t2 where ren_t2.x < 0))" }]
+
+-- A benign write commits (pre-fix this failed with "Table 'ren_t' not found").
+INSERT INTO ren_t2 VALUES (7);
+COMMIT;
+SELECT COUNT(*) FROM ren_t2;
+→ [{ "count(*)": 2 }]
+
+-- And the rule still enforces against the renamed table.
+BEGIN;
+INSERT INTO ren_t2 VALUES (-1);
+COMMIT;
+-- error: Integrity assertion failed: ren_t_nonneg
+
+SELECT COUNT(*) FROM ren_t2;
+→ [{ "count(*)": 2 }]
+
+DROP ASSERTION ren_t_nonneg;
+DROP TABLE ren_t2;
+-- run
+
+-- --- COLUMN rename ---
+
+CREATE TABLE ren_u (id INTEGER PRIMARY KEY, x INTEGER);
+CREATE ASSERTION ren_u_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM ren_u WHERE x < 0
+));
+INSERT INTO ren_u VALUES (1, 10);
+COMMIT;
+ALTER TABLE ren_u RENAME COLUMN x TO y;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_u_nonneg';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_u where y < 0))" }]
+
+-- Benign write commits (pre-fix: "Column not found: x").
+INSERT INTO ren_u VALUES (2, 20);
+COMMIT;
+SELECT COUNT(*) FROM ren_u;
+→ [{ "count(*)": 2 }]
+
+BEGIN;
+INSERT INTO ren_u VALUES (3, -3);
+COMMIT;
+-- error: Integrity assertion failed: ren_u_nonneg
+
+SELECT COUNT(*) FROM ren_u;
+→ [{ "count(*)": 2 }]
+
+DROP ASSERTION ren_u_nonneg;
+DROP TABLE ren_u;
+-- run

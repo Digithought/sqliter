@@ -6,7 +6,7 @@ import { QuereusError } from '../../common/errors.js';
 import { SqlValue, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { IntegrityAssertionSchema, AssertionDependentTable } from '../../schema/assertion.js';
-import { expressionToString } from '../../emit/ast-stringify.js';
+import { buildAssertionViolationSql } from '../../schema/assertion.js';
 
 const log = createLogger('runtime:emit:create-assertion');
 const warnLog = log.extend('warn');
@@ -17,13 +17,12 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
-		// Convert the CHECK expression to SQL text for storage
-		// The CHECK expression should be negated to become a violation query:
-		// check (condition) becomes "select 1 where not (condition)"
+		// Convert the CHECK expression to SQL text for storage. Shared with the
+		// `ALTER TABLE … RENAME` propagation, which regenerates this same text from
+		// the rewritten expression (see `buildAssertionViolationSql`).
 		let violationSql: string;
 		try {
-			const exprSql = expressionToString(plan.checkExpression);
-			violationSql = `select 1 where not (${exprSql})`;
+			violationSql = buildAssertionViolationSql(plan.checkExpression);
 		} catch (e) {
 			throw new QuereusError(
 				`Cannot create assertion '${plan.name}': failed to convert check expression to SQL`,

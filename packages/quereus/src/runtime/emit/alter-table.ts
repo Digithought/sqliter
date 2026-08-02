@@ -31,6 +31,10 @@ import {
 	attachMaintainedDerivation,
 	detachMaintainedDerivation,
 } from './materialized-view-helpers.js';
+import {
+	propagateTableRenameToAssertions,
+	propagateColumnRenameToAssertions,
+} from './assertion-rename-helpers.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { inferType } from '../../types/registry.js';
 
@@ -2087,6 +2091,12 @@ async function propagateTableRenameInSchema(
 			}
 		}
 
+		// Assertions: same in-place body rewrite as plain views, plus a regenerated
+		// `violationSql` (the text the commit-time evaluator re-parses). Assertions
+		// feed no materialized view, so order against the MV pass is free; sitting
+		// next to the view loop keeps the plain schema-level objects together.
+		propagateTableRenameToAssertions(db, schema, renamedSchemaName, oldName, newName);
+
 		// Materialized views: same in-place body rewrite as plain views ("MV ≡
 		// faster view"), plus the derived-field re-key, row-time re-registration,
 		// and staleness discipline the MV record needs. Runs AFTER the view loop
@@ -2230,6 +2240,11 @@ async function propagateColumnRenameInSchema(
 				});
 			}
 		}
+
+		// Assertions: same in-place body rewrite as plain views (unseeded walker —
+		// an assertion body owns its own FROM scopes), plus a regenerated
+		// `violationSql`.
+		propagateColumnRenameToAssertions(db, schema, renamedSchemaName, tableName, oldCol, newCol, resolveColumnInSource);
 
 		// Materialized views: same in-place body rewrite as plain views, then the
 		// MV-specific tail — backing-column rename for a shifted output name,
