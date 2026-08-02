@@ -561,6 +561,8 @@ One row per (index, indexed-column) pair, ordered by column position within the 
 | `partial` | INTEGER | 1 if the index has a `WHERE` predicate |
 | `tags` | TEXT? | Index tags as JSON object (repeated per row) |
 
+The implicit covering structure backing a plain `UNIQUE` constraint is not a user-addressable index, so neither `index_info()` nor `schema()` lists it — on any backend — unless the constraint opts in via `quereus.expose_implicit_index`. See [sql-ddl.md §6.3](sql-ddl.md#63-indexes-on-virtual-tables).
+
 ### `check_constraint_info(table_name)` columns
 
 | Column | Type | Description |

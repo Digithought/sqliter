@@ -153,6 +153,26 @@ export function nestedLoopJoinCost(outerRows: number, innerRows: number): number
 }
 
 /**
+ * Cost for an index-nested-loop join: one index seek into the inner side per
+ * outer row. `rowsPerSeek` is the MODULE's estimate for the equality access
+ * plan — selectivity authority stays with the module that owns the index rather
+ * than being re-derived from engine-side statistics (same discipline as
+ * rule-key-set-seek's break-even). `perSeekLatencyMs` is the inner subtree's
+ * `physical.expectedLatencyMs` (0 for every in-process vtab), treated as
+ * ms-equivalent cost — the same convention as `tuning.parallel.branchSetupCost`.
+ */
+export function indexNestedLoopJoinCost(
+	outerRows: number, rowsPerSeek: number, perSeekLatencyMs = 0,
+): number {
+	return outerRows * (
+		COST_CONSTANTS.NL_JOIN_PER_OUTER_ROW
+		+ COST_CONSTANTS.INDEX_SEEK_BASE
+		+ rowsPerSeek * COST_CONSTANTS.INDEX_SEEK_PER_ROW
+		+ perSeekLatencyMs
+	);
+}
+
+/**
  * Calculate cost for merge join
  * Includes optional sort costs for each side
  */

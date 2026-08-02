@@ -549,12 +549,18 @@ describe('multi-relation filter selectivity (filter over a join)', () => {
 	});
 
 	it('still estimates the base-table side of a join whose other side is a set operation', () => {
-		const f = optimizedFilter(db,
+		const plan = (db as unknown as { getPlan(s: string): PlanNode }).getPlan(
 			"SELECT * FROM o JOIN (SELECT id, cat FROM r UNION ALL SELECT id, cat FROM r) z ON z.id = o.id "
 			+ "WHERE o.cat = 'a' AND z.cat = 'x'");
-		expect(f, 'expected a residual Filter over the join').to.not.be.undefined;
-		// Only `o.cat` is attributable; `z.cat` is skipped, so the fold is that one value.
-		expect(f!.selectivity).to.be.closeTo(1 / ndv['o.cat'], 1e-12);
+		// Pushdown splits the conjuncts onto their branches, and the hash join may
+		// swap build/probe on cardinality — so identify the filters by stamp, not
+		// by walk order: only the `o.cat` conjunct is attributable; the filter over
+		// the set-operation branch is deliberately unstampable.
+		const filters = findFilters(plan);
+		const stamped = filters.filter(f => f.selectivity !== undefined);
+		expect(filters.length - stamped.length, 'the set-operation-side Filter stays unstamped').to.be.at.least(1);
+		expect(stamped, 'exactly one attributable Filter (the o side)').to.have.lengthOf(1);
+		expect(stamped[0].selectivity).to.be.closeTo(1 / ndv['o.cat'], 1e-12);
 	});
 });
 

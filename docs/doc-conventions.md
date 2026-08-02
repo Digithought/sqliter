@@ -161,13 +161,24 @@ banners. Edit all three.
 ## The size ratchet
 
 `docs/.doc-budget.json` records each large doc's current word count. A doc may shrink; it
-may never grow past its recorded size. A doc with no entry must come in under `maxWords`
-(12,000 — roughly the largest doc still readable end-to-end in one sitting).
+may grow only within the `slackWords` grace band above its recorded size (500 words). A doc
+with no entry must come in under `maxWords` (12,000 — roughly the largest doc still readable
+end-to-end in one sitting), which carries no grace band: at the cap the answer is a split,
+not another 500 words.
 
 Word count is whitespace-separated tokens over the whole file, fenced code included. A doc
 whose bulk is code samples is just as unreviewable as one whose bulk is prose.
 
-After a doc shrinks, lower its entry — this is expected routine, not an event:
+**The grace band is for the 40-word clarification.** Without it, adding a sentence to a
+ratcheted doc fails the build, and a gate that fails on every honest edit trains everyone to
+reach for `--force`. Drift inside the band never re-baselines the entry, so it is not a
+slow leak: `--update-ratchet` still refuses to raise, which bounds total unforced growth at
+500 words for the life of an entry. Every run prints the drift and the headroom left
+(`docs/sync.md: 12,670 words, 132 over its ratchet of 12,538 — inside the 500-word grace
+band (368 left)`), so the doc that is about to run out gets several runs of warning first.
+
+After a doc shrinks, lower its entry — this is expected routine, not an event, and it is
+what buys the band back:
 
 ```bash
 node scripts/check-docs.mjs --update-ratchet

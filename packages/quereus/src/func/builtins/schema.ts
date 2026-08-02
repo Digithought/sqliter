@@ -146,7 +146,13 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 						tagsToJson(tableSchema.tags)
 					] as Row;
 
-					// Process Indexes for this table
+					// Process Indexes for this table. A hidden implicit covering structure
+					// (a plain UNIQUE's auto-built index) is a backing detail, not a
+					// user-addressable index — same rule `collectSchemaCatalog` applies.
+					// NOTE: `isHiddenImplicitIndex` rebuilds the table's exposure map per
+					// call, so this is O(indexes × unique constraints) per table; if a
+					// table ever carries enough of both to matter, hoist the map the way
+					// `collectSchemaCatalog` does.
 					if (tableSchema.indexes) {
 						for (const indexSchema of tableSchema.indexes) {
 							if (isHiddenImplicitIndex(tableSchema, indexSchema.name)) continue;

@@ -380,8 +380,15 @@ function reattachUnconsumedConstraints(
  * `orderingLoadBearing` records that a SortNode was dropped on the strength of
  * this plan's `providesOrdering` (sort absorption) — lifted onto the
  * ordering-only IndexScan leaf so emission-order-changing rewrites decline.
+ *
+ * Exported for `rules/join/index-nested-loop.ts`, which feeds it synthesized
+ * correlated equality constraints so a per-outer-row seek gets the same
+ * collation-cover / composite-seek / NULL-handling / reattach treatment as a
+ * pushed user predicate. Callers must inspect the result: this function
+ * degrades to a SeqScan + residual on a collation decline and to an
+ * EmptyResultNode on an impossible predicate.
  */
-function selectPhysicalNode(
+export function selectPhysicalNode(
 	tableRef: TableReferenceNode,
 	accessPlan: BestAccessPlanResult,
 	constraints: PlannerPredicateConstraint[],

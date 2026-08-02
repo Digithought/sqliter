@@ -65,86 +65,25 @@
 
 import { createLogger } from '../../../common/logger.js';
 import type { PlanNode, RelationalPlanNode } from '../../nodes/plan-node.js';
-import { isRelationalNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
 import { BloomJoinNode } from '../../nodes/bloom-join-node.js';
 import { KeySetSemiJoinNode, RUNTIME_SET_MAX_KEYS, type KeySetPushdown, type KeySetTargetNode } from '../../nodes/key-set-semi-join-node.js';
-import { SeqScanNode, IndexScanNode } from '../../nodes/table-access-nodes.js';
-import { AliasNode } from '../../nodes/alias-node.js';
-import { ProjectNode } from '../../nodes/project-node.js';
-import { FilterNode } from '../../nodes/filter.js';
-import { ColumnReferenceNode } from '../../nodes/reference.js';
+import { IndexScanNode } from '../../nodes/table-access-nodes.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
 import { hasSemanticOrdering, normalizeCollationName } from '../../../util/comparison.js';
 import { effectiveCollationOfTypes } from '../../analysis/comparison-collation.js';
 import { classifyConstraintCover } from './rule-select-access-path.js';
+import { peelToAccessLeaf, rebuildChain, buildProbeRequest } from '../shared/access-leaf.js';
 import { resolveIndexDescriptor } from '../../../vtab/index-descriptor.js';
 import {
 	validateAccessPlan,
-	type BestAccessPlanRequest,
 	type BestAccessPlanResult,
-	type ColumnMeta,
 	type PredicateConstraint,
 } from '../../../vtab/best-access-plan.js';
 import type { ScalarType } from '../../../common/datatype.js';
-import type { TableSchema } from '../../../schema/table.js';
 
 const log = createLogger('optimizer:rule:key-set-seek');
-
-/**
- * A Project is "trivial" iff every projection is a bare ColumnReferenceNode —
- * it preserves row count, order, and attribute ids, so the semi join commutes
- * below it. Same predicate as `rule-monotonic-limit-pushdown`.
- */
-function isTrivialProject(project: ProjectNode): boolean {
-	return project.projections.every(p => p.node instanceof ColumnReferenceNode);
-}
-
-/**
- * Walk down from `chainRoot` toward the access leaf, descending only through
- * Alias / trivial Project / Filter wrappers (each commutes with a semi join).
- * Returns null when anything else appears before an admissible leaf.
- */
-function peelToLeaf(chainRoot: RelationalPlanNode): KeySetTargetNode | null {
-	let cursor: RelationalPlanNode = chainRoot;
-	let safety = 16;
-	while (safety-- > 0) {
-		if (cursor instanceof SeqScanNode || cursor instanceof IndexScanNode) return cursor;
-		if (cursor instanceof AliasNode) {
-			cursor = cursor.source;
-			continue;
-		}
-		if (cursor instanceof ProjectNode && isTrivialProject(cursor)) {
-			cursor = cursor.source;
-			continue;
-		}
-		if (cursor instanceof FilterNode) {
-			cursor = cursor.source;
-			continue;
-		}
-		return null;
-	}
-	return null;
-}
-
-/**
- * Rebuild the chain `chainRoot → … → oldLeaf` with `oldLeaf` replaced by
- * `newLeaf`, reconstructing each intermediate node via `withChildren` (same
- * shape as `rule-monotonic-limit-pushdown`'s rebuildChain).
- */
-function rebuildChain(
-	chainRoot: RelationalPlanNode,
-	oldLeaf: KeySetTargetNode,
-	newLeaf: RelationalPlanNode,
-): RelationalPlanNode {
-	if (chainRoot === (oldLeaf as unknown as RelationalPlanNode)) {
-		return newLeaf;
-	}
-	const newChildren: PlanNode[] = chainRoot.getChildren().map(child =>
-		isRelationalNode(child) ? rebuildChain(child, oldLeaf, newLeaf) : child);
-	return chainRoot.withChildren(newChildren) as RelationalPlanNode;
-}
 
 /**
  * Structural + purity admission of the join itself: a single-pair, residual-free
@@ -195,7 +134,7 @@ function admitJoin(node: BloomJoinNode): boolean {
  * is likewise a directive the multi-seek would not honor.
  */
 function admitLeaf(left: RelationalPlanNode): KeySetTargetNode | null {
-	const leaf = peelToLeaf(left);
+	const leaf = peelToAccessLeaf(left);
 	if (!leaf) {
 		log('decline: left does not peel to an access leaf through Alias/Project/Filter');
 		return null;
@@ -271,25 +210,6 @@ function resolveSeekColumns(
 		return null;
 	}
 	return { seekCol, targetType, keyType };
-}
-
-/** Build the probe request `createIndexBasedAccess` would (identical `columns` mapping). */
-function buildProbeRequest(
-	tableSchema: TableSchema,
-	tableRows: number | undefined,
-	filters: readonly PredicateConstraint[],
-): BestAccessPlanRequest {
-	return {
-		columns: tableSchema.columns.map((col, index) => ({
-			index,
-			name: col.name,
-			type: col.logicalType,
-			isPrimaryKey: col.primaryKey || false,
-			isUnique: col.primaryKey || false,
-		} as ColumnMeta)),
-		filters,
-		estimatedRows: tableRows,
-	};
 }
 
 /** A seek probe's claim, when the module accepted the runtime-set filter cleanly. */
