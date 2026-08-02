@@ -181,7 +181,9 @@ export function buildMaintenancePlan(ctx: MaterializedViewManagerContext, mv: Ma
 	// rewrite so the body stays over its SOURCE table, not re-pointed at this
 	// MV's backing (which the maintenance plan is what keeps consistent).
 	const analyzed = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
-		const { plan } = ctx._buildPlan([mv.derivation.selectAst as AST.Statement]);
+		// Home-schema path: the body's unqualified names resolve next to the MV,
+		// independent of the session's schema path at (re)registration time.
+		const { plan } = ctx._buildPlan([mv.derivation.selectAst as AST.Statement], undefined, db._homeSchemaPath(mv.schemaName));
 		return ctx.optimizer.optimizeForAnalysis(plan, db, ANALYSIS_DISABLED_RULES) as BlockNode;
 	});
 
@@ -1201,7 +1203,7 @@ export function compileLookupMembershipResidual(
 	const db = ctx as unknown as Database;
 	const strippedAst = { ...(mv.derivation.selectAst as AST.SelectStmt), where: undefined };
 	const stripped = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
-		const { plan } = ctx._buildPlan([strippedAst as AST.Statement]);
+		const { plan } = ctx._buildPlan([strippedAst as AST.Statement], undefined, db._homeSchemaPath(mv.schemaName));
 		return ctx.optimizer.optimizeForAnalysis(plan, db, ANALYSIS_DISABLED_RULES) as BlockNode;
 	});
 	// Re-locate `P` in the WHERE-stripped plan by base name (fresh node ids) to build the

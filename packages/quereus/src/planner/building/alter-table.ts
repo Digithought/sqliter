@@ -183,7 +183,9 @@ export function buildAlterTableStmt(
       // reshape-on-attach (attachMaintainedDerivation), so a build-time arity
       // gate would block legitimate reshapes.
       const tableSchema = tableReference.tableSchema;
-      planViewBody(ctx, tableSchema.name, stmt.action.select);
+      // Home-schema body path: the derivation's unqualified source names must
+      // resolve next to the table the derivation attaches to.
+      planViewBody(ctx, tableSchema.name, stmt.action.select, tableSchema.schemaName);
       // Mirror the create-form gate: a generated column would silently diverge
       // from its expression once the body supplies every column's value.
       const generated = tableSchema.columns.find(c => c.generated);

@@ -1880,7 +1880,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		}
 	}
 
-	getPlan(sqlOrAst: string | AST.AstNode): PlanNode {
+	/**
+	 * Builds and optimizes the plan for a statement.
+	 *
+	 * `schemaPath` (internal) overrides the session default search path for
+	 * unqualified-name resolution — used by the stored-body seams (view /
+	 * materialized-view bodies) to resolve against the owning object's home
+	 * schema instead of the caller's path. See {@link _homeSchemaPath}.
+	 */
+	getPlan(sqlOrAst: string | AST.AstNode, schemaPath?: string[]): PlanNode {
 		this.checkOpen();
 
 		let ast: AST.AstNode;
@@ -1900,7 +1908,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			ast = sqlOrAst;
 		}
 
-		const { plan } = this._buildPlan([ast as AST.Statement]);
+		const { plan } = this._buildPlan([ast as AST.Statement], undefined, schemaPath);
 
 		if (plan.statements.length === 0) return plan; // No-op for this AST
 
@@ -2013,7 +2021,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * probe — whose `schemaDependencies` are discarded (the read TVF already discards the body
 	 * plan's), so a fresh tracker per call is correct.
 	 */
-	_buildProbeContext(paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>): PlanningContext {
+	_buildProbeContext(paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[]): PlanningContext {
 		const globalScope = new GlobalScope(this.schemaManager);
 
 		// If we received parameter values, infer their types
@@ -2025,8 +2033,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// This ParameterScope is for the entire batch. It has globalScope as its parent.
 		const parameterScope = new ParameterScope(globalScope, parameterTypes);
 
-		// Get default schema path from options
-		const schemaPath = parseSchemaPath(this.options.getStringOption('schema_path'));
+		// The caller's override (a stored body's home-schema path), else the
+		// session default from options
+		const schemaPath = schemaPathOverride ?? parseSchemaPath(this.options.getStringOption('schema_path'));
 
 		return {
 			db: this,
@@ -2042,11 +2051,29 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		};
 	}
 
-	/** @internal */
-	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>): BuildPlanResult {
-		const ctx = this._buildProbeContext(paramsOrTypes);
+	/** @internal `schemaPathOverride` — see {@link getPlan} / {@link _homeSchemaPath}. */
+	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[]): BuildPlanResult {
+		const ctx = this._buildProbeContext(paramsOrTypes, schemaPathOverride);
 		const plan = buildBlock(ctx, statements);
 		return { plan, schemaDependencies: ctx.schemaDependencies };
+	}
+
+	/**
+	 * @internal Compose the schema path a stored object's body resolves under:
+	 * the owning object's schema first, then the session default path (deduped).
+	 * A view / materialized-view body written next to its tables must find them
+	 * regardless of the *reader's* path — the body is planned against this path
+	 * at create time, at reference/refresh/maintenance re-plan time, and by the
+	 * static updateability probes. The default path (not the calling statement's
+	 * `with schema` path) is the base so a caller's per-statement path never
+	 * leaks into a stored object's resolution.
+	 */
+	_homeSchemaPath(homeSchemaName: string): string[] {
+		// NOTE: re-parses the schema_path option on every body plan; if body
+		// re-plans ever show up hot, memoize on the option's change hook.
+		const defaultPath = parseSchemaPath(this.options.getStringOption('schema_path')) ?? ['main', 'temp'];
+		const lowerHome = homeSchemaName.toLowerCase();
+		return [homeSchemaName, ...defaultPath.filter(s => s.toLowerCase() !== lowerHome)];
 	}
 
 	/**

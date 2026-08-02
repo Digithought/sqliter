@@ -3151,7 +3151,7 @@ export class SchemaManager {
 		// deliberately BEFORE any drop, so a not-yet-resolvable body (the store's
 		// MV-over-MV fixpoint: a dependent fails until its upstream's round lands)
 		// errors per-entry with any pre-existing backing preserved — data-safe.
-		const shape: BackingShape = deriveBackingShape(this.db, def.bodySql, def.columns);
+		const shape: BackingShape = deriveBackingShape(this.db, def.schemaName, def.bodySql, def.columns);
 		// Declared-column arity mismatch: the entry can NEVER materialize, so throw
 		// with the backing preserved rather than dropping durable rows for nothing.
 		assertDeclaredColumnArity(def, shape);

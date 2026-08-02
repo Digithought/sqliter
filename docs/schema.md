@@ -332,6 +332,8 @@ const path = db.getSchemaPath(); // ['main', 'extensions', 'plugins']
 
 Note the deliberate asymmetry with DDL: unqualified DDL lands objects in the **current schema** (`schemaManager.setCurrentSchema(name)`, API-only), but unqualified read resolution consults only the schema path (default `main`, then `temp`) — never the current schema. An embedder setting a non-`main` current schema should set the schema path to match, or qualify references; see [SQL Reference § Schema Search Path](sql-select.md#211-schema-search-path-with-schema).
 
+**Stored bodies resolve against their home schema.** A view or materialized-view body resolves its unqualified names against the *owning object's* schema first, then the database default path — independent of the reading statement's path (a statement-level `with schema` never leaks into a stored body). So a view declared next to its tables in a non-`main` schema works under any session path, and `refresh materialized view` does not depend on the path at refresh time. CHECK-constraint and foreign-key bodies follow the same owner-first rule.
+
 See the [Usage Guide](usage.md) for the consumer-facing declarative schema workflow, schema path resolution order, and `PRAGMA schema_path` syntax.
 
 ## Database Options Affecting Schema

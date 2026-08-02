@@ -64,6 +64,14 @@ export class Statement {
 	private scalarRequiredParams: Set<string | number> = new Set();
 	/** Debug options set via Database.prepareDebug(). @internal */
 	_debugOptions?: import('../planner/planning-context.js').DebugOptions;
+	/**
+	 * @internal Schema-path override applied when this statement plans (compile is
+	 * deferred, so setting this right after `db.prepare(...)` is race-free). Used by
+	 * the stored-body seams (materialized-view body re-plans) so an unqualified name
+	 * in the body resolves against the owning object's home schema, not the session
+	 * path — see {@link Database._homeSchemaPath}.
+	 */
+	_schemaPathOverride?: string[];
 
 	/**
 	 * @internal - Use db.prepare().
@@ -163,7 +171,7 @@ export class Statement {
 			}
 
 			// Pass parameter types directly to planning
-			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], this.parameterTypes);
+			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], this.parameterTypes, this._schemaPathOverride);
 			// Collect array-valued-scalar-param guard targets from the LOGICAL plan,
 			// before the access-path optimizer folds `col = ?` comparisons into index
 			// seeks (which erases the comparison node). See validateParameterTypes.
@@ -811,7 +819,7 @@ export class Statement {
 		if (this.parameterTypes === undefined) {
 			this.parameterTypes = getParameterTypes(this.boundArgs);
 		}
-		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.parameterTypes);
+		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.parameterTypes, this._schemaPathOverride);
 		return this.db.optimizer.optimizeForAnalysis(rawPlan, this.db) as BlockNode;
 	}
 

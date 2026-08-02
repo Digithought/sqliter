@@ -1657,3 +1657,59 @@ select id, d from decl_collate_retype.t order by id;
 → [{"id": 1, "d": "2024-01-01"}, {"id": 2, "d": "2024-02-01"}]
 
 drop table decl_collate_retype.t;
+
+-- run
+
+-- ---------------------------------------------------------------------------
+-- Views and materialized views in a NON-main declared schema. The apply must
+-- land both in the declared schema, their bodies must resolve their unqualified
+-- source names against that schema (independent of the session's schema path),
+-- and a re-diff immediately after apply must be empty.
+-- Ticket `bug-declared-materialized-view-non-main-schema`.
+declare schema nm_view_pol using (default_vtab_module = 'memory') {
+	table nt {
+		id INTEGER PRIMARY KEY,
+		x INTEGER
+	}
+
+	view nv as select id, x from nt
+
+	materialized view nmv as select id, x from nt
+}
+
+-- run
+
+apply schema nm_view_pol;
+
+-- run
+
+-- Converged immediately: the stored (unqualified) bodies match the declared ones.
+diff schema nm_view_pol;
+→ []
+
+insert into nm_view_pol.nt values (1, 10), (2, 20);
+
+-- The view body resolves `nt` in its home schema even though the session path is
+-- the default (`main, temp`).
+select * from nm_view_pol.nv order by id;
+→ [{"id": 1, "x": 10}, {"id": 2, "x": 20}]
+
+-- The MV was filled at apply and row-time maintained through the insert above.
+select * from nm_view_pol.nmv order by id;
+→ [{"id": 1, "x": 10}, {"id": 2, "x": 20}]
+
+-- run
+
+-- Refresh re-plans the body — still against the MV's home schema.
+refresh materialized view nm_view_pol.nmv;
+
+select * from nm_view_pol.nmv order by id;
+→ [{"id": 1, "x": 10}, {"id": 2, "x": 20}]
+
+-- Still converged after use.
+diff schema nm_view_pol;
+→ []
+
+drop materialized view nm_view_pol.nmv;
+drop view nm_view_pol.nv;
+drop table nm_view_pol.nt;

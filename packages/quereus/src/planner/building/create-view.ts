@@ -13,8 +13,16 @@ import { StatusCode } from '../../common/types.js';
  * permanently — a view body re-evaluates on every reference, so a DML body
  * would re-drive writes on every read, which is incoherent with view
  * semantics. Mutations must be expressed in the query that *uses* the view.
+ *
+ * `homeSchemaName` — the schema the view/maintained table lands in. When given,
+ * the body plans under that schema's home path ({@link Database._homeSchemaPath})
+ * so unqualified names in the body resolve next to the object that owns them,
+ * not against the creating statement's search path.
  */
-export function planViewBody(ctx: PlanningContext, viewName: string, body: AST.QueryExpr): RelationalPlanNode {
+export function planViewBody(ctx: PlanningContext, viewName: string, body: AST.QueryExpr, homeSchemaName?: string): RelationalPlanNode {
+	if (homeSchemaName) {
+		ctx = { ...ctx, schemaPath: ctx.db._homeSchemaPath(homeSchemaName) };
+	}
 	switch (body.type) {
 		case 'select': {
 			const planned = buildSelectStmt(ctx, body);
@@ -55,7 +63,7 @@ export function buildCreateViewStmt(ctx: PlanningContext, stmt: AST.CreateViewSt
 	// If an explicit column list was provided, validate that its arity matches the body's projection.
 	// Plan the body (read-only) so star-expansion and CTEs are resolved.
 	if (stmt.columns && stmt.columns.length > 0) {
-		const planned = planViewBody(ctx, viewName, stmt.select);
+		const planned = planViewBody(ctx, viewName, stmt.select, schemaName);
 		const bodyArity = planned.getAttributes().length;
 		if (stmt.columns.length !== bodyArity) {
 			throw new QuereusError(
@@ -66,7 +74,7 @@ export function buildCreateViewStmt(ctx: PlanningContext, stmt: AST.CreateViewSt
 	} else {
 		// No explicit column list — still run the gate so a DML body is
 		// rejected at plan time rather than waiting until first reference.
-		planViewBody(ctx, viewName, stmt.select);
+		planViewBody(ctx, viewName, stmt.select, schemaName);
 	}
 
 	// The original SQL text is needed for the view definition

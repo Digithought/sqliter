@@ -38,7 +38,12 @@ export function buildCreateTableStmt(
  */
 function raiseCreateMaintainedDiagnostics(context: PlanningContext, stmt: AST.CreateTableStmt): void {
 	const tableName = stmt.table.name;
-	const planned = planViewBody(context, tableName, stmt.maintained!.select);
+	// The body plans under the table's home-schema path (same landing rule as the
+	// CREATE TABLE emitter: explicit qualifier, else the current schema) so its
+	// unqualified source names resolve next to the maintained table.
+	const sm = context.db.schemaManager;
+	const homeSchemaName = stmt.table.schema ? sm.canonicalSchemaName(stmt.table.schema) : sm.getCurrentSchemaName();
+	const planned = planViewBody(context, tableName, stmt.maintained!.select, homeSchemaName);
 	const bodyArity = planned.getAttributes().length;
 	if (bodyArity !== stmt.columns.length) {
 		throw new QuereusError(
@@ -67,7 +72,6 @@ function raiseCreateMaintainedDiagnostics(context: PlanningContext, stmt: AST.Cr
 	}
 	// Resolve the hosting module exactly as CREATE TABLE will (the `using`
 	// clause, else the session default) and require the backing-host capability.
-	const sm = context.db.schemaManager;
 	const moduleName = stmt.moduleName ?? sm.getDefaultVTabModuleName();
 	const moduleInfo = sm.getModule(moduleName);
 	if (!moduleInfo?.module) {

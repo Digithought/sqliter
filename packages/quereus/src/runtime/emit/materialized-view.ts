@@ -168,7 +168,7 @@ export async function refreshMaintainedTable(db: Database, mv: MaintainedTableSc
 
 	// A stale MV re-validates its body against current source schemas first.
 	if (d.stale) {
-		revalidateBody(db, mv.name, bodySql);
+		revalidateBody(db, mv.schemaName, mv.name, bodySql);
 	}
 
 	// Re-derive the canonical backing shape from the (re-planned) body. A source
@@ -179,7 +179,7 @@ export async function refreshMaintainedTable(db: Database, mv: MaintainedTableSc
 	// column labels (a latent direct-read corruption) and break the positional
 	// backing↔body alignment the join read-rewrite relies on. So compare the derived
 	// shape to the live table and rebuild it when the shape shifted.
-	const shape = deriveBackingShape(db, bodySql, d.columns);
+	const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns);
 
 	// An explicit column list is a declared interface. A body whose output count
 	// shifted under it (a source column add behind `mv(a, b, c)`) would silently

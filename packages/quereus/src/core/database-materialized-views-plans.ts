@@ -26,7 +26,6 @@ import type { VirtualTableConnection } from '../vtab/connection.js';
 import type { CompiledPredicate } from '../vtab/memory/utils/predicate.js';
 import type { Database } from './database.js';
 import type { DatabaseEventEmitter } from './database-events.js';
-import type * as AST from '../parser/ast.js';
 
 /**
  * Database internals the materialized-view manager needs. Mirrors
@@ -50,7 +49,9 @@ export interface MaterializedViewManagerContext {
 	 *  degrading to byte comparison. */
 	getCollationResolver(): CollationResolver;
 
-	_buildPlan(statements: AST.Statement[]): import('./database.js').BuildPlanResult;
+	/** Mirrors {@link Database._buildPlan} — the manager passes an MV body's
+	 *  home-schema path as the third argument (see {@link Database._homeSchemaPath}). */
+	_buildPlan: Database['_buildPlan'];
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
 	/** Backing-connection resolution for row-time write-through (see {@link MaterializedViewManager.getBackingConnection}). */
 	getConnectionsForTable(tableName: string): VirtualTableConnection[];

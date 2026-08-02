@@ -766,7 +766,8 @@ function addDefaultable(map: Map<number, Set<string>>, table: number, baseColumn
  * caching is a later optimization.
  */
 function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
-	const { plan } = db._buildPlan([view.selectAst as AST.Statement]);
+	// Home-schema path: the body's unqualified names resolve next to the view.
+	const { plan } = db._buildPlan([view.selectAst as AST.Statement], undefined, db._homeSchemaPath(view.schemaName));
 	const root = plan.getRelations()[0];
 	if (!root) return CONSERVATIVE_VIEW_INFO;
 
@@ -802,7 +803,7 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		// operand is a subtree: inserting into a multi-leaf subtree has no single deterministic
 		// target leaf (product-coordinate addressing — `set-op-membership-nested`).
 		const isInsertableInto = !setOpHasSubtreeOperand(view.selectAst)
-			&& setOpJoinLegsInsertable(db._buildProbeContext(), viewAsMutable);
+			&& setOpJoinLegsInsertable(db._buildProbeContext(undefined, db._homeSchemaPath(view.schemaName)), viewAsMutable);
 		return { isInsertableInto, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
 
@@ -821,7 +822,7 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		// a body whose join legs are ALL insertable — re-derived dynamically by
 		// `setOpJoinLegsInsertable` (NO for a composite-key / no-default / non-equi join leg) —
 		// matching the dynamic `buildFlaglessInsert`; UPDATE / DELETE through the join leg stay YES.
-		const isInsertableInto = setOpJoinLegsInsertable(db._buildProbeContext(), viewAsMutable);
+		const isInsertableInto = setOpJoinLegsInsertable(db._buildProbeContext(undefined, db._homeSchemaPath(view.schemaName)), viewAsMutable);
 		return { isInsertableInto, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
 
@@ -1211,7 +1212,8 @@ function deriveBodyColumnRows(
 	selectAst: AST.QueryExpr,
 	columnNames?: ReadonlyArray<string>,
 ): ColumnInfoRow[] {
-	const { plan } = db._buildPlan([selectAst as AST.Statement]);
+	// Home-schema path: the body's unqualified names resolve next to the owner.
+	const { plan } = db._buildPlan([selectAst as AST.Statement], undefined, db._homeSchemaPath(schemaName));
 	const root = plan.getRelations()[0];
 	if (!root) return [];
 

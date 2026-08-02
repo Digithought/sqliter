@@ -128,22 +128,26 @@ export interface BackingShape {
  */
 export function deriveBackingShape(
 	db: Database,
+	schemaName: string,
 	bodySql: string,
 	explicitColumns: ReadonlyArray<string> | undefined,
 ): BackingShape {
 	// Suppress the read-side rewrite: we are computing the MV body to derive/populate
 	// its OWN backing, so it must not be rewritten to read that backing.
 	return db.schemaManager.withSuppressedMaterializedViewRewrite(
-		() => deriveBackingShapeUnguarded(db, bodySql, explicitColumns),
+		() => deriveBackingShapeUnguarded(db, schemaName, bodySql, explicitColumns),
 	);
 }
 
 function deriveBackingShapeUnguarded(
 	db: Database,
+	schemaName: string,
 	bodySql: string,
 	explicitColumns: ReadonlyArray<string> | undefined,
 ): BackingShape {
-	const plan = db.getPlan(bodySql);
+	// Home-schema path: the body's unqualified source names resolve next to the
+	// MV, independent of the session's schema path at re-plan time.
+	const plan = db.getPlan(bodySql, db._homeSchemaPath(schemaName));
 	const root = plan.getRelations()[0];
 	if (!root) {
 		throw new QuereusError('materialized view body produced no relation', StatusCode.INTERNAL);
@@ -348,12 +352,14 @@ export function buildBackingTableSchema(
 
 /** Runs the body to completion and returns its rows (raw `Row` arrays). Uses the
  *  no-transaction-management primitive — the caller is already inside DDL execution. */
-export async function collectBodyRows(db: Database, bodySql: string): Promise<Row[]> {
+export async function collectBodyRows(db: Database, schemaName: string, bodySql: string): Promise<Row[]> {
 	// Suppress the read-side rewrite for the whole prepare+iterate: this body is run
 	// to (re)compute the MV's OWN backing (create fill / refresh rebuild), so it must
 	// recompute from the source, never read the backing it is populating.
 	return db.schemaManager.withSuppressedMaterializedViewRewriteAsync(async () => {
 		const stmt = db.prepare(bodySql);
+		// Compile is deferred, so the override lands before any planning happens.
+		stmt._schemaPathOverride = db._homeSchemaPath(schemaName);
 		try {
 			const rows: Row[] = [];
 			for await (const row of stmt._iterateRowsRaw()) {
@@ -499,7 +505,7 @@ function warnKeyCoarsening(schemaName: string, viewName: string, info: Coarsened
 export async function materializeView(db: Database, def: MaterializeViewDefinition, preDerivedShape?: BackingShape): Promise<MaintainedTableSchema> {
 	const sm = db.schemaManager;
 
-	const shape = preDerivedShape ?? deriveBackingShape(db, def.bodySql, def.columns);
+	const shape = preDerivedShape ?? deriveBackingShape(db, def.schemaName, def.bodySql, def.columns);
 	// Lives here — not in deriveBackingShape — because the refresh path reaches a
 	// legitimate mismatch after a source ALTER (see the assert's docstring).
 	assertDeclaredColumnArity(def, shape);
@@ -511,7 +517,7 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 	const completeBacking = await sm.createBackingTable(backingSchema);
 
 	try {
-		const rows: Row[] = await collectBodyRows(db, def.bodySql);
+		const rows: Row[] = await collectBodyRows(db, def.schemaName, def.bodySql);
 		const host = resolveBackingHost(db, completeBacking);
 		// `replaceContents` runs NO derived-row constraint validation: this caller's
 		// backing is the MV-sugar shape (`buildBackingTableSchema` hard-codes empty
@@ -1059,7 +1065,7 @@ export async function attachMaintainedDerivation(
 	// renamed positionally to it and the name check skipped; otherwise natural output
 	// names with the strict declared-shape check (the body must already be aliased to
 	// the declared names — the attach verb / implicit-create posture).
-	const shape = deriveBackingShape(db, bodySql, positionalRename ? recordedColumns : undefined);
+	const shape = deriveBackingShape(db, schemaName, bodySql, positionalRename ? recordedColumns : undefined);
 
 	// Explicit rename-list arity guard. `deriveBackingShape` sizes the shape to the
 	// BODY's arity (a surplus rename name is dropped, a missing one padded), so a
@@ -1113,7 +1119,7 @@ export async function attachMaintainedDerivation(
 	}
 	assertNoDerivationCycle(db, schemaName, name, shape.sourceTables);
 
-	const rows: Row[] = await collectBodyRows(db, bodySql);
+	const rows: Row[] = await collectBodyRows(db, schemaName, bodySql);
 	// Shape-derived physical key (see assertDerivedRowsAreSet): under a reshape the
 	// table's own PK definition may carry pre-reshape indices; equivalent otherwise.
 	const shapePk = computeBackingPrimaryKey(shape)
@@ -1451,7 +1457,7 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 	const declared = sm.buildDeclaredTableSchema(stmt);
 	const recordedColumns = explicit ? declared.columns.map(c => c.name) : undefined;
 	const bodySql = astToString(stmt.maintained!.select);
-	const shape = deriveBackingShape(db, bodySql, explicit ? recordedColumns : undefined);
+	const shape = deriveBackingShape(db, schemaName, bodySql, explicit ? recordedColumns : undefined);
 	const mismatch = describeAttachShapeMismatch(declared, shape, explicit);
 	if (mismatch) {
 		throw new QuereusError(
@@ -1530,7 +1536,7 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
  */
 export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): Promise<void> {
 	const bodySql = astToString(mv.derivation.selectAst);
-	const rows: Row[] = await collectBodyRows(db, bodySql);
+	const rows: Row[] = await collectBodyRows(db, mv.schemaName, bodySql);
 
 	const backing = db.schemaManager.getTable(mv.schemaName, mv.name);
 	if (!backing) {
@@ -1905,11 +1911,11 @@ function valueSemanticsChangedColumns(oldObject: TableSchema, newObject: TableSc
  * which treats a failed analysis as "could not prove disjoint" ⇒ stale (the safe
  * default) — it must never be swallowed into a false "disjoint" conclusion.
  */
-export function referencedSourceColumns(db: Database, bodySql: string, qualifiedSource: string): Set<number> {
+export function referencedSourceColumns(db: Database, schemaName: string, bodySql: string, qualifiedSource: string): Set<number> {
 	const targetName = qualifiedSource.toLowerCase();
 	return db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
 		const ast = new Parser().parse(bodySql);
-		const { plan } = db._buildPlan([ast as AST.Statement]);
+		const { plan } = db._buildPlan([ast as AST.Statement], undefined, db._homeSchemaPath(schemaName));
 
 		const referencedAttrIds = new Set<number>();
 		const sourceRefs: TableReferenceNode[] = [];
@@ -2037,7 +2043,7 @@ export function tryRecompileMaterializedViewLive(
 	try {
 		const d = mv.derivation;
 		const bodySql = astToString(d.selectAst);
-		const shape = deriveBackingShape(db, bodySql, d.columns);
+		const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns);
 		if (!sameSourceTables(d.sourceTables, shape.sourceTables)) {
 			log('Marking materialized view %s.%s stale instead of recompiling: re-planned source tables (%s) disagree with the recorded set (%s) — REFRESH re-derives',
 				mv.schemaName, mv.name, shape.sourceTables.join(', '), d.sourceTables.join(', '));
@@ -2083,7 +2089,7 @@ export function tryRecompileMaterializedViewLive(
 		const valueChanged = valueSemanticsChangedColumns(oldObject, newObject);
 		if (valueChanged.size > 0) {
 			const source = `${newObject.schemaName}.${newObject.name}`.toLowerCase();
-			const read = referencedSourceColumns(db, bodySql, source);
+			const read = referencedSourceColumns(db, mv.schemaName, bodySql, source);
 			const collidingName = [...valueChanged].find(name => {
 				const idx = newObject.columnIndexMap.get(name);
 				return idx !== undefined && read.has(idx);
@@ -2604,8 +2610,9 @@ export function tryResolveBackingHost(db: Database, backingSchema: TableSchema):
 export function linkCoveredUniqueConstraints(db: Database, mv: MaintainedTableSchema, bodySql: string): void {
 	// The coverage prover reasons over the body's SOURCE table; suppress the
 	// read-side rewrite so the body is not re-pointed at this MV's own backing.
+	// Home-schema path: the body's unqualified names resolve next to the MV.
 	const root = db.schemaManager.withSuppressedMaterializedViewRewrite(
-		() => db.getPlan(bodySql).getRelations()[0],
+		() => db.getPlan(bodySql, db._homeSchemaPath(mv.schemaName)).getRelations()[0],
 	);
 	if (!root) return;
 	const sm = db.schemaManager;
@@ -2645,13 +2652,14 @@ export function unlinkCoveredUniqueConstraints(db: Database, mv: MaintainedTable
 /** Re-validates a stale MV's body against the current source schemas. Throws the
  *  staleness diagnostic when the body no longer plans. Returns the optimized
  *  relational root on success. */
-export function revalidateBody(db: Database, mvName: string, bodySql: string): RelationalPlanNode {
+export function revalidateBody(db: Database, schemaName: string, mvName: string, bodySql: string): RelationalPlanNode {
 	let root: RelationalPlanNode | undefined;
 	try {
 		// Re-validate the body against the SOURCE schemas; suppress the read-side
-		// rewrite so it is not re-pointed at this MV's own backing.
+		// rewrite so it is not re-pointed at this MV's own backing. Home-schema
+		// path: unqualified names resolve next to the MV, not the session path.
 		root = db.schemaManager.withSuppressedMaterializedViewRewrite(
-			() => db.getPlan(bodySql).getRelations()[0],
+			() => db.getPlan(bodySql, db._homeSchemaPath(schemaName)).getRelations()[0],
 		);
 	} catch (e) {
 		const message = e instanceof Error ? e.message : String(e);
@@ -2945,7 +2953,7 @@ export async function restoreUnaffectedMaterializedViews(
 			// Throws when the body no longer plans against the renamed catalog
 			// (e.g. a chained MV referencing a renamed-away output name) → catch
 			// below leaves it stale.
-			const shape = deriveBackingShape(db, bodySql, d.columns);
+			const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns);
 			// The retry of a failure-marked MV must not revive an inconsistent record: a
 			// rewrite that threw between the in-place AST mutation and the derived-field
 			// re-key leaves the OLD derivation (un-re-keyed `sourceTables`) holding the
@@ -3010,7 +3018,7 @@ async function renameShiftedBackingColumns(
 	bodySql: string,
 	preDerivedShape?: BackingShape,
 ): Promise<void> {
-	const shape = preDerivedShape ?? deriveBackingShape(db, bodySql, mv.derivation.columns);
+	const shape = preDerivedShape ?? deriveBackingShape(db, mv.schemaName, bodySql, mv.derivation.columns);
 	const backing = schema.getTable(mv.name);
 	if (!backing) {
 		throw new QuereusError(

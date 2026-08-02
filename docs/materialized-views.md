@@ -107,6 +107,8 @@ A maintained table has two equivalent authoring surfaces — the declared-shape 
 
 Every statement below creates, drops, or rewrites a real module-backed table, so all of them — including `REFRESH` — are refused inside an explicit `begin … commit` under the opt-in `ddl_transaction_policy = 'strict'` setting, on any backing module that does not declare `ddlTransactionality: 'transactional'` (no built-in module does). The module consulted is the backing host (`using <module>(…)`, else `memory`). Under the default `permissive` policy nothing is refused. See [module-capabilities.md § DDL transactionality tiers](module-capabilities.md#ddl-transactionality-tiers).
 
+**Home-schema body resolution.** The stored body's unqualified names resolve against the maintained table's **own schema first**, then the session default path — never the calling statement's `with schema` path. The same rule applies at every seam that re-plans the body: create-time validation, refresh, staleness re-validation, backing-shape derivation, and row-time maintenance compilation. So `create materialized view temp.mv as select … from t` finds `temp.t`, and `refresh materialized view` succeeds regardless of the session's `schema_path` at refresh time. See [schema.md § Schema Path](schema.md#schema-path).
+
 ### `CREATE TABLE … MAINTAINED AS` (declared-shape form)
 
 ```sql

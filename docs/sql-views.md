@@ -18,6 +18,7 @@ drop view [if exists] view_name;
 ```
 
 - `query_expr` is any relation-producing expression — a `select`, a `values (...)`, or a `with … select`. A **DML body** (`insert`/`update`/`delete … returning`) is **rejected at create time**: a view re-evaluates per reference, so a write-per-read body is incoherent.
+- **Home-schema resolution:** the body's unqualified names resolve against the *view's own schema* first, then the session default path — independent of the reader's schema path (a statement-level `with schema` never leaks into the body). A view in a non-`main` schema that reads its sibling tables unqualified works under any session path.
 - An optional column list renames the body's output columns (arity must match).
 - `with defaults (col = expr, ...)` is a trailing clause of the **core select** (it binds to the whole query expression after `limit`/`offset`, before `with tags`): it declares per-column **omitted-insert defaults** for write-through — typically for a base column the view projects away (see [§2.9](#29-updatable-views)). Column names must be distinct; each `expr` must be self-contained (it cannot reference the inserted row's columns); the target is resolved (and a typo rejected) at write time, not at create — the base-column lineage it resolves against is only assembled when the view is an actual write target.
 - `with tags (...)` attaches metadata (informational only — reserved `quereus.*` keys are validated, but none carries view behavior; see [§2.9](#29-updatable-views)).

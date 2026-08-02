@@ -445,11 +445,15 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				// Build the view's body. The body is a QueryExpr — today only
 				// SELECT and VALUES bodies plan; DML bodies are rejected at
 				// CREATE VIEW plan time so we never get here with one.
+				// The body plans under the VIEW's home-schema path (not the
+				// caller's) so its unqualified source names resolve next to the
+				// view — independent of the reading statement's search path.
+				const viewBodyContext = { ...parentContext, schemaPath: parentContext.db._homeSchemaPath(viewSchema.schemaName) };
 				let viewSelectNode: RelationalPlanNode;
 				if (viewSchema.selectAst.type === 'select') {
-					viewSelectNode = buildSelectStmt(parentContext, viewSchema.selectAst, cteNodes) as RelationalPlanNode;
+					viewSelectNode = buildSelectStmt(viewBodyContext, viewSchema.selectAst, cteNodes) as RelationalPlanNode;
 				} else if (viewSchema.selectAst.type === 'values') {
-					viewSelectNode = buildValuesStmt(parentContext, viewSchema.selectAst);
+					viewSelectNode = buildValuesStmt(viewBodyContext, viewSchema.selectAst);
 				} else {
 					throw new QuereusError(
 						`View '${viewSchema.name}' has a ${viewSchema.selectAst.type.toUpperCase()} body, which is not yet supported.`,

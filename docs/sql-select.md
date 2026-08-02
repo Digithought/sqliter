@@ -312,6 +312,8 @@ Quereus supports flexible schema resolution through search paths. Unqualified ta
 3. **PRAGMA schema_path** - Session-level default search path
 4. **Default search order** - `main`, then `temp`
 
+**Stored bodies are the exception:** a view / materialized-view body (like a CHECK-constraint or foreign-key body) resolves its unqualified names against the **owning object's schema first**, then the session default path — never the calling statement's `WITH SCHEMA` path. A view declared next to its tables in a non-`main` schema therefore reads correctly under any session path, and `refresh materialized view` is path-independent.
+
 **DDL landing vs. read resolution (deliberate asymmetry):** unqualified DDL (`create table` / `create view` / `create index` / `drop …` / `alter … tags`) lands objects in the **current schema** (`SchemaManager.setCurrentSchema`, an embedder API — there is no SQL surface for it), while unqualified *reads* resolve only via the search path above, which does **not** consult the current schema. An embedder that sets a non-`main` current schema must also set `schema_path` (or qualify references); otherwise objects it creates are invisible to unqualified reads. Pure-SQL users are unaffected — the current schema is always `main` unless an embedder changes it.
 
 **WITH SCHEMA Syntax:**

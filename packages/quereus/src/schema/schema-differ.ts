@@ -708,7 +708,7 @@ export function computeSchemaDiff(
 	for (const [name, declaredView] of declaredViews) {
 		const matchedActual = viewRenames.pairs.get(name);
 		if (!matchedActual) {
-			diff.viewsToCreate.push(createViewToString(declaredView.viewStmt));
+			diff.viewsToCreate.push(createViewToString(applyViewSchemaDefault(declaredView.viewStmt, targetSchemaName)));
 			continue;
 		}
 		const stmt = declaredView.viewStmt;
@@ -720,7 +720,7 @@ export function computeSchemaDiff(
 		}
 		if (definitionDrifted) {
 			diff.viewsToDrop.push(matchedActual.name);
-			diff.viewsToCreate.push(createViewToString(stmt));
+			diff.viewsToCreate.push(createViewToString(applyViewSchemaDefault(stmt, targetSchemaName)));
 			viewRecreates++;
 			continue;
 		}
@@ -728,7 +728,7 @@ export function computeSchemaDiff(
 			// Hinted rename, definition unchanged → drop(old) + recreate(declared),
 			// rendered with in-diff column renames inverse-applied (NEW→OLD).
 			diff.viewsToDrop.push(matchedActual.name);
-			diff.viewsToCreate.push(createViewToString(columnReconciledViewStmt(stmt, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn)));
+			diff.viewsToCreate.push(createViewToString(applyViewSchemaDefault(columnReconciledViewStmt(stmt, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn), targetSchemaName)));
 			viewRecreates++;
 			continue;
 		}
@@ -1056,10 +1056,31 @@ function renderFreshTableCreate(
 ): string {
 	const declaredMv = declaredMaterializedViews.get(name);
 	if (declaredMv) {
-		return createMaterializedViewToString(declaredMv.viewStmt);
+		return createMaterializedViewToString(applyViewSchemaDefault(declaredMv.viewStmt, targetSchemaName));
 	}
 	const effectiveStmt = applyTableDefaults(tableStmt, targetSchemaName, defaultVtabModule, defaultVtabArgs);
 	return createTableToString(effectiveStmt);
+}
+
+/**
+ * Qualifies a view / materialized-view create statement's own name with the
+ * target schema (when not `main` and not already qualified), so the rendered
+ * DDL lands the object in the declared schema rather than whatever schema is
+ * current at apply time. The table analogue is {@link applyTableDefaults};
+ * `catalog.ts`'s baseline emission applies the identical qualification.
+ */
+function applyViewSchemaDefault<T extends AST.CreateViewStmt | AST.CreateMaterializedViewStmt>(
+	stmt: T,
+	targetSchemaName: string,
+): T {
+	if (!targetSchemaName || targetSchemaName === 'main' || stmt.view.schema) return stmt;
+	return {
+		...stmt,
+		view: {
+			...stmt.view,
+			schema: targetSchemaName,
+		},
+	};
 }
 
 /**
