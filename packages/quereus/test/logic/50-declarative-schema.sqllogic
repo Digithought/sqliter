@@ -841,6 +841,112 @@ select count(*) as cnt from assert_drift.t;
 → [{"cnt": 1}]
 
 -- ===================================================================
+-- Drift interacting with a same-apply ADD COLUMN: the recreated assertion
+-- names a column that does not exist yet when its `create assertion` runs
+-- (creates are emitted before the table-alter block). An assertion body binds
+-- at enforcement time, not at create time, so this applies cleanly — unlike
+-- the view path, which plans its body at create and cannot survive it.
+-- ===================================================================
+
+declare schema assert_addcol {
+	table t (
+		x INTEGER PRIMARY KEY
+	)
+
+	assertion range_check check (not exists (select 1 from t where x < 0))
+}
+
+-- run
+
+apply schema assert_addcol;
+
+-- run
+
+declare schema assert_addcol {
+	table t (
+		x INTEGER PRIMARY KEY,
+		y INTEGER
+	)
+
+	assertion range_check check (not exists (select 1 from t where y < 0))
+}
+
+-- run
+
+diff schema assert_addcol;
+→ [{"ddl": "DROP ASSERTION IF EXISTS assert_addcol.range_check"}, {"ddl": "create assertion assert_addcol.range_check check (not exists (select 1 from t where y < 0))"}, {"ddl": "ALTER TABLE assert_addcol.t ADD COLUMN y INTEGER"}]
+
+apply schema assert_addcol;
+
+-- run
+
+diff schema assert_addcol;
+→ []
+
+-- The recreated rule enforces against the freshly added column.
+begin;
+insert into assert_addcol.t values (1, -5);
+commit;
+-- error: Integrity assertion failed: assert_addcol.range_check
+
+begin;
+insert into assert_addcol.t values (2, 5);
+commit;
+
+-- run
+
+select * from assert_addcol.t;
+→ [{"x": 2, "y": 5}]
+
+-- ===================================================================
+-- Table rename in the same apply as an assertion whose body follows the new
+-- name. Assertion CHECK bodies are never rename-reconciled by the differ, so
+-- the unchanged-in-spirit assertion reads as drifted and churns a
+-- drop+recreate. That is correct-but-avoidable, and it must still APPLY
+-- cleanly: renames are emitted before assertion drops/creates.
+-- ===================================================================
+
+declare schema assert_rename {
+	table t (
+		x INTEGER PRIMARY KEY
+	)
+
+	assertion range_check check (not exists (select 1 from t where x < 0))
+}
+
+-- run
+
+apply schema assert_rename;
+
+-- run
+
+declare schema assert_rename {
+	table t2 (
+		x INTEGER PRIMARY KEY
+	) with tags ("quereus.previous_name" = 't')
+
+	assertion range_check check (not exists (select 1 from t2 where x < 0))
+}
+
+-- run
+
+diff schema assert_rename;
+→ [{"ddl": "ALTER TABLE assert_rename.t RENAME TO t2"}, {"ddl": "DROP ASSERTION IF EXISTS assert_rename.range_check"}, {"ddl": "create assertion assert_rename.range_check check (not exists (select 1 from t2 where x < 0))"}]
+
+apply schema assert_rename;
+
+-- run
+
+diff schema assert_rename;
+→ []
+
+-- The rebound assertion enforces against the renamed table.
+begin;
+insert into assert_rename.t2 values (-1);
+commit;
+-- error: Integrity assertion failed: assert_rename.range_check
+
+-- ===================================================================
 -- Declarative `unique index` — parser admits the UNIQUE qualifier and
 -- the diff stringifies it back as `create unique index` so that the
 -- apply path enforces uniqueness the same way a top-level

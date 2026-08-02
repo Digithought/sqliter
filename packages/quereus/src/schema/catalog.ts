@@ -758,6 +758,12 @@ function assertionSchemaToCatalog(assertionSchema: IntegrityAssertionSchema): Ca
 	// throws on assertion DDL), so the primary branch always fires. The fallback
 	// keeps a descriptive (non-reparseable) string for that hypothetical case
 	// rather than throwing. See assertion.ts:21-27.
+	// NOTE: the fallback also feeds `definition`, and a `select 1 where not (…)`
+	// query never equals a declared CHECK body — so if assertion reconstruction
+	// from `violationSql` is ever implemented, every such assertion reads as
+	// permanently drifted and `apply schema` re-drops/recreates it on each run.
+	// Whoever lights that path up must re-parse the CHECK body (or persist it)
+	// rather than reuse `violationSql` here.
 	const checkSql = assertionSchema.checkExpression
 		? expressionToString(assertionSchema.checkExpression)
 		: assertionSchema.violationSql;

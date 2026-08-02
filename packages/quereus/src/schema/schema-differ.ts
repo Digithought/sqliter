@@ -844,25 +844,30 @@ export function computeSchemaDiff(
 	// body drift above. Bodies are compared via the canonical (name/schema-free)
 	// `definition` field so both sides run the same `expressionToString` over
 	// ASTs from the same parser: an unchanged body renders byte-identical.
+	// Identifiers are NOT case-folded (same policy as the view/MV bodies above):
+	// a case-only edit churns a drop+recreate, which is cheap here — an assertion
+	// recreate re-plans a query, it does not rebuild a structure or rescan rows.
 	// NOTE: no rename reconciliation here (unlike the view/index loops above) —
 	// an assertion's stored CHECK expression is captured verbatim at CREATE and
 	// never rewritten by `alter table … rename`, so a table/column renamed in
 	// this same diff makes an otherwise-unchanged assertion body look drifted
 	// and churns a spurious-but-correct drop+recreate (assertion creates run
-	// after table renames, so the DDL still applies cleanly).
+	// after table renames, so the DDL still applies cleanly). The converse —
+	// renaming a table while LEAVING the declared body on the old name — is a
+	// separate, pre-existing defect the diff cannot see (both sides render the
+	// old name, so it converges while the live assertion is broken); tracked by
+	// ticket `bug-table-rename-breaks-dependent-assertions`.
 	const actualAssertions = new Map(actualCatalog.assertions.map(a => [a.name.toLowerCase(), a]));
 
 	for (const [name, declaredAssertion] of declaredAssertions) {
 		const matchedActual = actualAssertions.get(name);
 		const declaredBody = expressionToString(declaredAssertion.assertionStmt.check);
-		if (!matchedActual) {
-			diff.assertionsToCreate.push(createAssertionToString(
-				applyAssertionSchemaDefault(declaredAssertion.assertionStmt, targetSchemaName)));
-		} else if (declaredBody !== matchedActual.definition) {
-			diff.assertionsToDrop.push(matchedActual.name);
-			diff.assertionsToCreate.push(createAssertionToString(
-				applyAssertionSchemaDefault(declaredAssertion.assertionStmt, targetSchemaName)));
-		}
+		if (matchedActual && declaredBody === matchedActual.definition) continue;
+		// Drift on a name match: drop the old one first (creates run later, see
+		// `generateMigrationDDL`), then recreate from the declaration.
+		if (matchedActual) diff.assertionsToDrop.push(matchedActual.name);
+		diff.assertionsToCreate.push(createAssertionToString(
+			applyAssertionSchemaDefault(declaredAssertion.assertionStmt, targetSchemaName)));
 	}
 
 	for (const [name] of actualAssertions) {

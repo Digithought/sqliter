@@ -937,6 +937,43 @@ describe('Schema Differ', () => {
 			expect(diff.assertionsToCreate).to.deep.equal(['create assertion a1 check (not exists (select 1 from t where x < 100))']);
 		});
 
+		it('only the drifted one of several name-matched assertions churns', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, x integer }
+					assertion stable check (not exists (select 1 from t where x is null))
+					assertion moved check (not exists (select 1 from t where x < 100))
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[],
+				[
+					catalogAssertion('create assertion stable check (not exists (select 1 from t where x is null))'),
+					catalogAssertion('create assertion moved check (not exists (select 1 from t where x < 0))'),
+				],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.assertionsToDrop).to.deep.equal(['moved']);
+			expect(diff.assertionsToCreate).to.deep.equal(['create assertion moved check (not exists (select 1 from t where x < 100))']);
+		});
+
+		it('undeclared assertion → drop only, no create', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t { id integer primary key, x integer }
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[],
+				[catalogAssertion('create assertion a1 check (not exists (select 1 from t where x < 0))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.assertionsToDrop).to.deep.equal(['a1']);
+			expect(diff.assertionsToCreate).to.deep.equal([]);
+		});
+
 		it('whitespace/formatting-only difference in the declared source → no diff', () => {
 			const declared = parseDeclaredSchema(
 				`declare schema main {
