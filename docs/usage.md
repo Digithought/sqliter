@@ -1001,6 +1001,8 @@ for await (const row of db.eval(`
 3. `PRAGMA schema_path` / `db.setSchemaPath()` - Session default
 4. Default schema (`main`) - Final fallback
 
+A **stored body** (a view or materialized-view definition) is the exception: it resolves its unqualified names against the owning object's own schema first, then the session default path — never the reading statement's `WITH SCHEMA` path. So a view declared next to its tables in a non-`main` schema reads correctly under any session path.
+
 ## Views, Updatable Views, and Materialized Views
 
 For the SQL syntax and semantics see the [SQL Reference §2.8–2.11](sql-views.md#28-create-view-statement). This section covers the operational/API-level behavior.

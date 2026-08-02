@@ -9,6 +9,7 @@ import type * as AST from '../parser/ast.js';
 import { type SqlValue, StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
+import { applyViewSchemaDefault } from './schema-differ.js';
 import { ENGINE_MANAGED_TABLE_TAG } from './reserved-tags.js';
 
 /**
@@ -802,40 +803,12 @@ export function generateDeclaredDDL(declaredSchema: AST.DeclareSchemaStmt, targe
 				}
 				break;
 			}
-			case 'declaredView': {
-				// Qualify view name with schema if specified
-				const viewStmt = item.viewStmt;
-				if (targetSchema && targetSchema !== 'main' && !viewStmt.view.schema) {
-					const qualifiedStmt: AST.CreateViewStmt = {
-						...viewStmt,
-						view: {
-							...viewStmt.view,
-							schema: targetSchema
-						}
-					};
-					ddlStatements.push(createViewToString(qualifiedStmt));
-				} else {
-					ddlStatements.push(createViewToString(viewStmt));
-				}
+			case 'declaredView':
+				ddlStatements.push(createViewToString(applyViewSchemaDefault(item.viewStmt, targetSchema)));
 				break;
-			}
-			case 'declaredMaterializedView': {
-				// Qualify MV name with schema if specified
-				const mvStmt = item.viewStmt;
-				if (targetSchema && targetSchema !== 'main' && !mvStmt.view.schema) {
-					const qualifiedStmt: AST.CreateMaterializedViewStmt = {
-						...mvStmt,
-						view: {
-							...mvStmt.view,
-							schema: targetSchema
-						}
-					};
-					ddlStatements.push(createMaterializedViewToString(qualifiedStmt));
-				} else {
-					ddlStatements.push(createMaterializedViewToString(mvStmt));
-				}
+			case 'declaredMaterializedView':
+				ddlStatements.push(createMaterializedViewToString(applyViewSchemaDefault(item.viewStmt, targetSchema)));
 				break;
-			}
 		}
 	}
 

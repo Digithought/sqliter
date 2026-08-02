@@ -10,6 +10,7 @@
 
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
+import { serializePlanTree } from '../src/planner/debug.js';
 
 async function all(db: Database, sql: string): Promise<Record<string, unknown>[]> {
 	const out: Record<string, unknown>[] = [];
@@ -84,5 +85,34 @@ describe('home-schema body resolution (non-main views and MVs)', () => {
 		await db.exec('insert into mt values (1)');
 		await db.exec('create view mv_plain as select id from mt');
 		expect(await all(db, 'select * from mv_plain')).to.deep.equal([{ id: 1 }]);
+	});
+
+	it('keeps a STALE non-main materialized view readable', async () => {
+		await db.exec('create table temp.par (id integer primary key, x integer not null)');
+		await db.exec('insert into temp.par values (1, 5)');
+		await db.exec('create materialized view temp.par_ix as select id, x from par where x > 0');
+		// A source ALTER marks the MV stale; the read then RE-VALIDATES the stored
+		// body. Under the reader's path that re-plan cannot see `temp.par`, and the
+		// failure would surface as a (false) "source changed incompatibly" staleness
+		// error instead of the materialized rows.
+		await db.exec('alter table temp.par alter column x drop not null');
+		expect(await all(db, 'select id, x from temp.par_ix order by id')).to.deep.equal([{ id: 1, x: 5 }]);
+	});
+
+	it('lets the join-subsumption rewrite fire for a non-main materialized view', async () => {
+		await db.exec('create table temp.customers (id integer primary key, name text null)');
+		await db.exec('create table temp.orders (id integer primary key, customer_id integer not null, amt integer not null, '
+			+ 'foreign key (customer_id) references customers(id))');
+		await db.exec('create materialized view temp.enriched as select o.id, o.customer_id, o.amt, c.name '
+			+ 'from orders o join customers c on o.customer_id = c.id');
+		await db.exec("insert into temp.customers values (1, 'ann')");
+		await db.exec('insert into temp.orders values (101, 1, 5)');
+		// The rewrite rule re-plans the MV body to prove the join is 1:1. Without the
+		// home path that re-plan throws and the candidate is silently dropped, so the
+		// join survives and the MV is never used.
+		const plan = serializePlanTree(db.getPlan(
+			'select o.id, o.amt, c.name from temp.orders o join temp.customers c on o.customer_id = c.id where o.amt > 0 order by o.id'));
+		expect(plan, 'rewrote to the MV table').to.contain('"name": "enriched"');
+		expect(plan, 'no join survives').to.not.match(/"nodeType": "\w*Join"/);
 	});
 });

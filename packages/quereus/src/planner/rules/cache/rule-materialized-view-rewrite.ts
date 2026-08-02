@@ -335,11 +335,19 @@ function plannedMvBodyRoot(db: OptContext['db'], mv: MaintainedTableSchema): Rel
 	let root: RelationalPlanNode | null = null;
 	try {
 		root = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
-			const plan = db.getPlan(d.selectAst as AST.AstNode);
+			// Home-schema path: the body's unqualified names resolve next to the MV.
+			// With the session path a non-`main` MV's body throws here, and the catch
+			// below drops it as a rewrite candidate.
+			const plan = db.getPlan(d.selectAst as AST.AstNode, db._homeSchemaPath(mv.schemaName));
 			return (plan.getRelations()[0] as RelationalPlanNode | undefined) ?? null;
 		});
-	} catch {
-		root = null; // a body that no longer plans is simply not a candidate
+	} catch (e) {
+		// A body that no longer plans is simply not a candidate — but log it: a
+		// silent drop here is indistinguishable from "the shape didn't match", so
+		// a resolution regression would otherwise show up only as a lost rewrite.
+		log('MV %s.%s body failed to plan; not a rewrite candidate: %s', mv.schemaName, mv.name,
+			e instanceof Error ? e.message : String(e));
+		root = null;
 	}
 	if (root !== null) MV_BODY_ROOT_CACHE.set(d, root); else MV_BODY_ROOT_CACHE.delete(d);
 	return root;

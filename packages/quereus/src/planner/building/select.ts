@@ -533,12 +533,17 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				if (maintainedTable.derivation.stale) {
 					// Re-validate the body against current source schemas. An
 					// incompatible change (dropped source, dropped column, …) makes
-					// the body fail to plan — surface the staleness diagnostic.
+					// the body fail to plan — surface the staleness diagnostic. Under the
+					// MV's home-schema path, like every other body re-plan: the caller's
+					// path would make a perfectly resolvable non-`main` body look
+					// incompatibly changed, hiding the materialized rows behind a false
+					// staleness error.
+					const bodyContext = { ...parentContext, schemaPath: parentContext.db._homeSchemaPath(maintainedTable.schemaName) };
 					try {
 						if (maintainedTable.derivation.selectAst.type === 'select') {
-							buildSelectStmt(parentContext, maintainedTable.derivation.selectAst, cteNodes);
+							buildSelectStmt(bodyContext, maintainedTable.derivation.selectAst, cteNodes);
 						} else if (maintainedTable.derivation.selectAst.type === 'values') {
-							buildValuesStmt(parentContext, maintainedTable.derivation.selectAst);
+							buildValuesStmt(bodyContext, maintainedTable.derivation.selectAst);
 						}
 					} catch (e) {
 						const message = e instanceof Error ? e.message : String(e);

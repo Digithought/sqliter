@@ -335,6 +335,8 @@ When resolving unqualified table names:
 3. `PRAGMA schema_path` setting (session default)
 4. Default schema (`main`)
 
+A **stored body** (a view or materialized-view definition) is the exception: it resolves its unqualified names against the owning object's own schema first, then the session default path — never the reading statement's `WITH SCHEMA` path. See [SQL Reference § Schema Search Path](sql-select.md#211-schema-search-path-with-schema).
+
 **Examples:**
 
 ```sql

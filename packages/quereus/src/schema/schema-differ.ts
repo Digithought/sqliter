@@ -1066,12 +1066,12 @@ function renderFreshTableCreate(
  * Qualifies a view / materialized-view create statement's own name with the
  * target schema (when not `main` and not already qualified), so the rendered
  * DDL lands the object in the declared schema rather than whatever schema is
- * current at apply time. The table analogue is {@link applyTableDefaults};
- * `catalog.ts`'s baseline emission applies the identical qualification.
+ * current at apply time. The table analogue is {@link applyTableDefaults}.
+ * Shared with `catalog.ts`'s baseline DDL emission, which needs the same rule.
  */
-function applyViewSchemaDefault<T extends AST.CreateViewStmt | AST.CreateMaterializedViewStmt>(
+export function applyViewSchemaDefault<T extends AST.CreateViewStmt | AST.CreateMaterializedViewStmt>(
 	stmt: T,
-	targetSchemaName: string,
+	targetSchemaName: string | undefined,
 ): T {
 	if (!targetSchemaName || targetSchemaName === 'main' || stmt.view.schema) return stmt;
 	return {
