@@ -4,12 +4,12 @@ import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema } from './derivation.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString, viewDefinitionToCanonicalString } from '../emit/ast-stringify.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, quoteIdentifier, expressionToString, viewDefinitionToCanonicalString } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
 import { type SqlValue, StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
-import { applyViewSchemaDefault } from './schema-differ.js';
+import { applyViewSchemaDefault, applyAssertionSchemaDefault } from './schema-differ.js';
 import { ENGINE_MANAGED_TABLE_TAG } from './reserved-tags.js';
 
 /**
@@ -755,9 +755,15 @@ function assertionSchemaToCatalog(assertionSchema: IntegrityAssertionSchema): Ca
 	const checkSql = assertionSchema.checkExpression
 		? expressionToString(assertionSchema.checkExpression)
 		: assertionSchema.violationSql;
+	// Qualify a non-main assertion's name so the rendered DDL is faithful to
+	// where the assertion actually lives. `name` stays bare — the catalog is
+	// per-schema and the differ keys assertions by bare name within it.
+	const qualifiedName = assertionSchema.schemaName.toLowerCase() !== 'main'
+		? `${quoteIdentifier(assertionSchema.schemaName)}.${quoteIdentifier(assertionSchema.name)}`
+		: quoteIdentifier(assertionSchema.name);
 	return {
 		name: assertionSchema.name,
-		ddl: `CREATE ASSERTION ${quoteIdentifier(assertionSchema.name)} CHECK (${checkSql})`
+		ddl: `CREATE ASSERTION ${qualifiedName} CHECK (${checkSql})`
 	};
 }
 
@@ -808,6 +814,12 @@ export function generateDeclaredDDL(declaredSchema: AST.DeclareSchemaStmt, targe
 				break;
 			case 'declaredMaterializedView':
 				ddlStatements.push(createMaterializedViewToString(applyViewSchemaDefault(item.viewStmt, targetSchema)));
+				break;
+			case 'declaredAssertion':
+				// Assertions participate in the declared DDL (and hence the schema
+				// hash — a changed assertion body must change the schema version).
+				// `declaredSeed` stays absent deliberately: a seed is data, not shape.
+				ddlStatements.push(createAssertionToString(applyAssertionSchemaDefault(item.assertionStmt, targetSchema)));
 				break;
 		}
 	}

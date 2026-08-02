@@ -294,7 +294,7 @@ function findDuplicateDeclaredName(items: readonly AST.DeclareItem[]): Duplicate
 				duplicate = record(indexes, item.indexStmt.index.name, { kind: 'index', table: item.indexStmt.table.name });
 				break;
 			case 'declaredAssertion':
-				duplicate = record(assertions, item.assertionStmt.name, { kind: 'assertion' });
+				duplicate = record(assertions, item.assertionStmt.name.name, { kind: 'assertion' });
 				break;
 			// NOTE: `declareIgnored` (domain / collation / import) is skipped — the parser
 			// keeps it as an opaque snippet with no parsed name, so there is nothing to key
@@ -464,7 +464,7 @@ export function computeSchemaDiff(
 				tagDiagnostics.push(...validateReservedTags(item.indexStmt.tags, 'physical-index'));
 				break;
 			case 'declaredAssertion':
-				declaredAssertions.set(item.assertionStmt.name.toLowerCase(), item);
+				declaredAssertions.set(item.assertionStmt.name.name.toLowerCase(), item);
 				break;
 		}
 	}
@@ -843,7 +843,8 @@ export function computeSchemaDiff(
 
 	for (const [name, declaredAssertion] of declaredAssertions) {
 		if (!actualAssertions.has(name)) {
-			diff.assertionsToCreate.push(createAssertionToString(declaredAssertion.assertionStmt));
+			diff.assertionsToCreate.push(createAssertionToString(
+				applyAssertionSchemaDefault(declaredAssertion.assertionStmt, targetSchemaName)));
 		}
 	}
 
@@ -1078,6 +1079,27 @@ export function applyViewSchemaDefault<T extends AST.CreateViewStmt | AST.Create
 		...stmt,
 		view: {
 			...stmt.view,
+			schema: targetSchemaName,
+		},
+	};
+}
+
+/**
+ * The assertion analogue of {@link applyViewSchemaDefault}: qualifies a
+ * `create assertion` statement's name with the target schema (when not `main`
+ * and not already qualified), so the rendered DDL lands the assertion in the
+ * declared schema rather than whatever schema is current at apply time.
+ * Shared with `catalog.ts`'s declared-DDL emission.
+ */
+export function applyAssertionSchemaDefault(
+	stmt: AST.CreateAssertionStmt,
+	targetSchemaName: string | undefined,
+): AST.CreateAssertionStmt {
+	if (!targetSchemaName || targetSchemaName === 'main' || stmt.name.schema) return stmt;
+	return {
+		...stmt,
+		name: {
+			...stmt.name,
 			schema: targetSchemaName,
 		},
 	};

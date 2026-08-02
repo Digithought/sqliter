@@ -1227,7 +1227,7 @@ export function refreshMaterializedViewToString(stmt: AST.RefreshMaterializedVie
 }
 
 export function createAssertionToString(stmt: AST.CreateAssertionStmt): string {
-	return `create assertion ${quoteIdentifier(stmt.name)} check (${expressionToString(stmt.check)})`;
+	return `create assertion ${expressionToString(stmt.name)} check (${expressionToString(stmt.check)})`;
 }
 
 function alterTableToString(stmt: AST.AlterTableStmt): string {
@@ -1508,7 +1508,7 @@ function declaredSeedToString(it: AST.DeclaredSeed): string {
 }
 
 function declaredAssertionToString(it: AST.DeclaredAssertion): string {
-	return `assertion ${quoteIdentifier(it.assertionStmt.name)} check (${expressionToString(it.assertionStmt.check)})`;
+	return `assertion ${expressionToString(it.assertionStmt.name)} check (${expressionToString(it.assertionStmt.check)})`;
 }
 
 /** Renders an SqlValue as a SQL literal that re-parses to the same value. */

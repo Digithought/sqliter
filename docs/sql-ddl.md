@@ -378,17 +378,20 @@ Quereus supports database-wide integrity assertions evaluated at COMMIT time.
 
 Syntax:
 ```sql
-create assertion assertion_name check (condition_expression);
-drop assertion assertion_name;
+create assertion [schema_name.]assertion_name check (condition_expression);
+drop assertion [if exists] [schema_name.]assertion_name;
 ```
 
 Behavior:
+- An assertion belongs to a schema. An unqualified name means the current schema, matching every other DDL statement; names are unique per schema, so two schemas may each hold an assertion of the same name and both enforce independently.
+- The stored CHECK body resolves its unqualified table names against the assertion's **own** schema first, independent of the session's search path — the same home-schema rule stored view and materialized-view bodies follow (see `sql-select.md` § 2.1.1).
 - Assertions are enforced at COMMIT. Any row produced by the stored violation query indicates a violation and the COMMIT fails with a constraint error (transaction rolled back).
 - The `check (expr)` is stored as a violation SQL: `select 1 where not (expr)`.
 - Efficiency: The optimizer classifies each table reference instance in the violation query as row-specific (unique key fully covered) or global. If any changed base is global, run the violation SQL once. Otherwise, for row-specific references, the engine executes per changed primary key using prepared parameters (`pk0`, `pk1`, ... for composite keys), early-exiting on the first violation.
 
 Diagnostics:
-- Use `explain_assertion(name)` to introspect classification and prepared parameterization.
+- Use `explain_assertion(name)` to introspect classification and prepared parameterization. The argument may be `'schema.name'` (schema-scoped) or a bare name (first match across schemas).
+- `assertion_info()` lists all assertions with their `schema_name`.
 
 Examples:
 ```sql

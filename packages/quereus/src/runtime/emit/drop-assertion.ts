@@ -15,21 +15,21 @@ export function emitDropAssertion(plan: DropAssertionNode, _ctx: EmissionContext
 		await rctx.db._ensureTransaction();
 
 		const schemaManager = rctx.db.schemaManager;
-		const schema = schemaManager.getMainSchema(); // Look in main schema for now
+		const schema = schemaManager.getSchema(plan.schemaName);
 
-		const existing = schema.getAssertion(plan.name);
+		const existing = schema?.getAssertion(plan.name);
 		if (!existing) {
 			if (plan.ifExists) {
-				log('Assertion %s not found, but IF EXISTS specified', plan.name);
+				log('Assertion %s.%s not found, but IF EXISTS specified', plan.schemaName, plan.name);
 				return null;
 			}
 			throw new QuereusError(
-				`Assertion ${plan.name} not found`,
+				`Assertion ${plan.name} not found in schema ${plan.schemaName}`,
 				StatusCode.NOTFOUND
 			);
 		}
 
-		const removed = schemaManager.removeAssertion(schema.name, plan.name);
+		const removed = schemaManager.removeAssertion(plan.schemaName, plan.name);
 		if (!removed && !plan.ifExists) {
 			throw new QuereusError(
 				`Failed to remove assertion ${plan.name}`,
@@ -38,15 +38,15 @@ export function emitDropAssertion(plan: DropAssertionNode, _ctx: EmissionContext
 		}
 
 		// Invalidate cached plan for this assertion
-		rctx.db.invalidateAssertionCache(plan.name);
+		rctx.db.invalidateAssertionCache(plan.schemaName, plan.name);
 
-		log('Dropped assertion %s', plan.name);
+		log('Dropped assertion %s.%s', plan.schemaName, plan.name);
 		return null;
 	}
 
 	return {
 		params: [],
 		run: asRun(run),
-		note: `dropAssertion(${plan.name})`
+		note: `dropAssertion(${plan.schemaName}.${plan.name})`
 	};
 }

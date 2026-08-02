@@ -2558,8 +2558,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/** @internal Invalidate cached assertion plan (called on DROP ASSERTION) */
-	public invalidateAssertionCache(name: string): void {
-		this.assertionEvaluator.invalidateAssertion(name);
+	public invalidateAssertionCache(schemaName: string, name: string): void {
+		this.assertionEvaluator.invalidateAssertion(schemaName, name);
 	}
 }
 

@@ -670,10 +670,11 @@ const createIndexArb: fc.Arbitrary<AST.CreateIndexStmt> = fc.record({
 
 const createAssertionArb: fc.Arbitrary<AST.CreateAssertionStmt> = fc.record({
 	name: identArb,
+	schema: fc.option(identArb, { nil: undefined }),
 	check: checkExprArb,
-}).map(({ name, check }): AST.CreateAssertionStmt => ({
+}).map(({ name, schema, check }): AST.CreateAssertionStmt => ({
 	type: 'createAssertion',
-	name,
+	name: { type: 'identifier', name, schema },
 	check,
 }));
 
@@ -768,7 +769,7 @@ const declaredAssertionItemArb: fc.Arbitrary<AST.DeclaredAssertion> = fc.record(
 	check: checkExprArb,
 }).map(({ name, check }): AST.DeclaredAssertion => ({
 	type: 'declaredAssertion',
-	assertionStmt: { type: 'createAssertion', name, check },
+	assertionStmt: { type: 'createAssertion', name: { type: 'identifier', name }, check },
 }));
 
 const declareItemArb: fc.Arbitrary<AST.DeclareItem> = fc.oneof(

@@ -9,6 +9,7 @@ import type { IntegrityAssertionSchema, AssertionDependentTable } from '../../sc
 import { expressionToString } from '../../emit/ast-stringify.js';
 
 const log = createLogger('runtime:emit:create-assertion');
+const warnLog = log.extend('warn');
 
 export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionContext): Instruction {
 
@@ -34,6 +35,7 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 		// Create the assertion schema object
 		const assertionSchema: IntegrityAssertionSchema = {
 			name: plan.name,
+			schemaName: plan.schemaName,
 			violationSql,
 			deferrable: true, // Auto-deferred for multi-table constraints
 			initiallyDeferred: true,
@@ -41,9 +43,11 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 			checkExpression: plan.checkExpression,
 		};
 
-		// Discover dependent base tables (best-effort; conservative if any failure)
+		// Discover dependent base tables (best-effort; conservative if any failure).
+		// Plan under the assertion's home-schema path so unqualified table names in
+		// the body resolve against the assertion's own schema first.
 		try {
-			const planNode = rctx.db.getPlan(violationSql);
+			const planNode = rctx.db.getPlan(violationSql, rctx.db._homeSchemaPath(plan.schemaName));
 			const deps = new Map<string, AssertionDependentTable>();
 			(function collect(node: unknown) {
 				const candidate = node as {
@@ -63,14 +67,23 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 			assertionSchema.dependentTables = Array.from(deps.values());
 			log('Assertion %s dependencies discovered: %o', plan.name, assertionSchema.dependentTables);
 		} catch (depErr) {
-			log('Dependency discovery failed for assertion %s: %O', plan.name, depErr);
+			// A total discovery failure leaves dependent_tables empty; enforcement
+			// then falls back to running the full violation query on every commit.
+			// Surface that degradation — a silent debug line made it invisible.
+			warnLog(
+				'Dependency discovery failed for assertion %s.%s; enforcement falls back to the full violation query: %O',
+				plan.schemaName, plan.name, depErr
+			);
 		}
 
-		// Add to schema
+		// Add to the assertion's home schema
 		const schemaManager = rctx.db.schemaManager;
-		const schema = schemaManager.getMainSchema(); // Store in main schema for now
+		const schema = schemaManager.getSchema(plan.schemaName);
+		if (!schema) {
+			throw new QuereusError(`Schema not found: ${plan.schemaName}`, StatusCode.ERROR);
+		}
 
-		// Check for existing assertion
+		// Check for existing assertion (names are unique per schema)
 		const existing = schema.getAssertion(plan.name);
 		if (existing) {
 			throw new QuereusError(
@@ -81,13 +94,13 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 
 		schemaManager.addAssertion(schema.name, assertionSchema);
 
-		log('Created assertion %s with violationSql: %s', plan.name, violationSql);
+		log('Created assertion %s.%s with violationSql: %s', plan.schemaName, plan.name, violationSql);
 		return null;
 	}
 
 	return {
 		params: [],
 		run: asRun(run),
-		note: `createAssertion(${plan.name})`
+		note: `createAssertion(${plan.schemaName}.${plan.name})`
 	};
 }

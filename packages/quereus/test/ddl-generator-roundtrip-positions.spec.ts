@@ -511,7 +511,7 @@ describe('Generator: CREATE ASSERTION name (collectSchemaCatalog)', () => {
 		const stmt = parse(a!.ddl);
 		expect(stmt.type, `ddl re-parsed to wrong statement: ${a!.ddl}`).to.equal('createAssertion');
 		if (stmt.type === 'createAssertion') {
-			expect(stmt.name.toLowerCase()).to.equal('my_assert');
+			expect(stmt.name.name.toLowerCase()).to.equal('my_assert');
 		}
 	});
 
@@ -528,7 +528,7 @@ describe('Generator: CREATE ASSERTION name (collectSchemaCatalog)', () => {
 		const stmt = parse(a!.ddl);
 		expect(stmt.type, `ddl re-parsed to wrong statement: ${a!.ddl}`).to.equal('createAssertion');
 		if (stmt.type === 'createAssertion') {
-			expect(stmt.name.toLowerCase()).to.equal('a2');
+			expect(stmt.name.name.toLowerCase()).to.equal('a2');
 			// Faithfulness, not just shape: the re-parsed CHECK predicate must
 			// canonicalise to the same expression as the original. A structure-only
 			// check would miss a precedence/paren-drop bug in `expressionToString`

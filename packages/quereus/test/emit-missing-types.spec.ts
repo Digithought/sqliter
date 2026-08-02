@@ -186,7 +186,7 @@ describe('Emit: missing statement types', () => {
 		it('should stringify create assertion', () => {
 			const node: CreateAssertionStmt = {
 				type: 'createAssertion',
-				name: 'positive_balance',
+				name: { type: 'identifier', name: 'positive_balance' },
 				check: {
 					type: 'binary',
 					operator: '>',

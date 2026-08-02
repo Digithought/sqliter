@@ -986,9 +986,15 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			throw new QuereusError('explain_assertion(name) requires an assertion name', StatusCode.ERROR);
 		}
 
-		// Find assertion across all schemas
+		// Accept `schema.name` (schema-scoped lookup) or a bare name (find-first
+		// across all schemas — assertion names are only unique per schema).
 		const all = db.schemaManager.getAllAssertions();
-		const assertion = all.find(a => a.name.toLowerCase() === assertionName.toLowerCase());
+		const dot = assertionName.indexOf('.');
+		const wantedSchema = dot >= 0 ? assertionName.slice(0, dot).toLowerCase() : undefined;
+		const wantedName = (dot >= 0 ? assertionName.slice(dot + 1) : assertionName).toLowerCase();
+		const assertion = all.find(a =>
+			a.name.toLowerCase() === wantedName
+			&& (wantedSchema === undefined || a.schemaName.toLowerCase() === wantedSchema));
 		if (!assertion) {
 			throw new QuereusError(`Assertion not found: ${assertionName}`, StatusCode.NOTFOUND);
 		}
@@ -1015,11 +1021,20 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
-			outputScopes: new Map()
+			outputScopes: new Map(),
+			// The stored body resolves unqualified names against the assertion's
+			// home schema, same as commit-time enforcement.
+			schemaPath: db._homeSchemaPath(assertion.schemaName)
 		};
 
-		const plan = buildBlock(ctx, [ast]);
-		const analyzed = db.optimizer.optimizeForAnalysis(plan, db) as unknown as RelationalPlanNode;
+		// Suppress assertion-hoisting while planning, exactly as the commit-time
+		// evaluator does: otherwise a canonical-shaped assertion's own hoisted
+		// facts fold its violation query to empty and the explain shows no
+		// classifications at all.
+		const analyzed = db.schemaManager.withSuppressedAssertionHoist(() => {
+			const plan = buildBlock(ctx, [ast]);
+			return db.optimizer.optimizeForAnalysis(plan, db) as unknown as RelationalPlanNode;
+		});
 
 		// Classify each table reference as row/group/global.
 		const { classifications, groupKeys } = analyzeRowSpecific(analyzed);

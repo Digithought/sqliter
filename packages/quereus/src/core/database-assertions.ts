@@ -37,6 +37,19 @@ const log = createLogger('core:assertions');
 /** Maximum number of violating rows to include in error messages */
 const MAX_VIOLATION_SAMPLES = 5;
 
+/** The identity slice of {@link IntegrityAssertionSchema} the evaluator needs. */
+interface AssertionIdentity {
+	name: string;
+	schemaName: string;
+	violationSql: string;
+}
+
+/** Cache key for an assertion: schema-qualified so two same-named assertions
+ *  in different schemas never evict each other's compiled plan. */
+function assertionCacheKey(assertion: { name: string; schemaName: string }): string {
+	return `${assertion.schemaName.toLowerCase()}.${assertion.name.toLowerCase()}`;
+}
+
 /**
  * A single commit-time global-assertion violation, collected (rather than
  * thrown) when {@link AssertionEvaluator.runGlobalAssertions} is driven in
@@ -63,8 +76,9 @@ export interface AssertionEvaluatorContext {
 	readonly optimizer: Database['optimizer'];
 	readonly options: Database['options'];
 
-	_buildPlan(statements: AST.Statement[]): import('./database.js').BuildPlanResult;
+	_buildPlan(statements: AST.Statement[], paramsOrTypes?: undefined, schemaPathOverride?: string[]): import('./database.js').BuildPlanResult;
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
+	_homeSchemaPath(schemaName: string): string[];
 	prepare(sql: string): ReturnType<Database['prepare']>;
 	getInstructionTracer(): ReturnType<Database['getInstructionTracer']>;
 
@@ -127,7 +141,7 @@ interface CachedAssertionPlan {
  * changes to avoid re-parsing/re-planning on every commit.
  */
 export class AssertionEvaluator {
-	/** Cached compiled plans keyed by assertion name (lowercase) */
+	/** Cached compiled plans keyed by lowercase `schema.name` (see {@link assertionCacheKey}) */
 	private cache = new Map<string, CachedAssertionPlan>();
 	/** Monotonic generation counter; incremented on schema changes that may affect assertions */
 	private schemaGeneration = 0;
@@ -167,8 +181,8 @@ export class AssertionEvaluator {
 	}
 
 	/** Remove an assertion from the plan cache (called on DROP ASSERTION) */
-	invalidateAssertion(name: string): void {
-		const key = name.toLowerCase();
+	invalidateAssertion(schemaName: string, name: string): void {
+		const key = assertionCacheKey({ name, schemaName });
 		const cached = this.cache.get(key);
 		if (cached) {
 			this.releaseCached(cached);
@@ -236,9 +250,9 @@ export class AssertionEvaluator {
 			// it dispatches on dependency overlap. Handle them directly here. In
 			// report mode these collect (do not throw), so all are evaluated.
 			for (const assertion of assertions) {
-				const cached = this.cache.get(assertion.name.toLowerCase());
+				const cached = this.cache.get(assertionCacheKey(assertion));
 				if (cached && cached.baseTablesInPlan.size === 0) {
-					await this.executeViolationOnce(assertion.name, assertion.violationSql);
+					await this.executeViolationOnce(assertion);
 				}
 			}
 
@@ -251,8 +265,8 @@ export class AssertionEvaluator {
 		}
 	}
 
-	private getOrCompilePlan(assertion: { name: string; violationSql: string }): CachedAssertionPlan {
-		const key = assertion.name.toLowerCase();
+	private getOrCompilePlan(assertion: AssertionIdentity): CachedAssertionPlan {
+		const key = assertionCacheKey(assertion);
 		const existing = this.cache.get(key);
 		if (existing && existing.schemaGeneration === this.schemaGeneration) {
 			return existing;
@@ -285,11 +299,14 @@ export class AssertionEvaluator {
 	}
 
 	private compileUnderSuppression(
-		assertion: { name: string; violationSql: string },
+		assertion: AssertionIdentity,
 		ast: AST.Statement,
 		key: string,
 	): CachedAssertionPlan {
-		const { plan } = this.ctx._buildPlan([ast]);
+		// Plan under the assertion's home-schema path so unqualified table names in
+		// the stored body resolve against the assertion's own schema first,
+		// independent of the session's search path (see Database._homeSchemaPath).
+		const { plan } = this.ctx._buildPlan([ast], undefined, this.ctx._homeSchemaPath(assertion.schemaName));
 		const analyzed = this.ctx.optimizer.optimizeForAnalysis(plan, this.ctx as unknown as Database) as BlockNode;
 
 		const bindings = extractBindings(analyzed);
@@ -380,10 +397,10 @@ export class AssertionEvaluator {
 	}
 
 	private buildSubscription(
-		assertion: { name: string; violationSql: string },
+		assertion: AssertionIdentity,
 		cached: CachedAssertionPlan,
 	): DeltaSubscription {
-		const id = `assertion:${assertion.name}`;
+		const id = `assertion:${assertionCacheKey(assertion)}`;
 		const bindingsForExecutor = new Map<string, BindingMode>(cached.bindings.perRelation);
 		const relationToBase = new Map<string, string>(cached.bindings.relationToBase);
 		const pkIndicesByBase = new Map<string, readonly number[]>(cached.pkIndicesByBase);
@@ -395,7 +412,7 @@ export class AssertionEvaluator {
 				if (!residual) {
 					// Defensive: no residual compiled — run the full violation
 					// query once to maintain correctness.
-					await this.executeViolationOnce(assertion.name, assertion.violationSql);
+					await this.executeViolationOnce(assertion);
 					return;
 				}
 				await this.executeResidualPerTuple(assertion.name, residual, tuples);
@@ -404,7 +421,7 @@ export class AssertionEvaluator {
 			// Global re-evaluation: run once if any relation needs it. (Multiple
 			// 'global' relations for one assertion still only need one run.)
 			if (input.globalRelations.size > 0) {
-				await this.executeViolationOnce(assertion.name, assertion.violationSql);
+				await this.executeViolationOnce(assertion);
 			}
 		};
 
@@ -419,11 +436,15 @@ export class AssertionEvaluator {
 		};
 	}
 
-	private async executeViolationOnce(assertionName: string, sql: string): Promise<void> {
+	private async executeViolationOnce(assertion: AssertionIdentity): Promise<void> {
+		const assertionName = assertion.name;
 		// `prepare()` defers planning; force compile under hoist-suppression so
 		// the optimizer can't fold this assertion's own violation query to
-		// empty. See `getOrCompilePlan`.
-		const stmt = this.ctx.prepare(sql);
+		// empty. See `getOrCompilePlan`. The home-schema path override makes the
+		// stored body resolve unqualified names against the assertion's own
+		// schema (compile is deferred, so setting it here is race-free).
+		const stmt = this.ctx.prepare(assertion.violationSql);
+		stmt._schemaPathOverride = this.ctx._homeSchemaPath(assertion.schemaName);
 		this.ctx.schemaManager.withSuppressedAssertionHoist(() => { stmt.compile(); });
 		try {
 			const violatingRows: SqlValue[][] = [];

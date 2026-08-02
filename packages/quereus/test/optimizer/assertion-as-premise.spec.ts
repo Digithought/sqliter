@@ -60,6 +60,7 @@ function existsOnJoined(leftTable: string, rightTable: string): AST.ExistsExpr {
 function assertion(name: string, expr: AST.Expression): IntegrityAssertionSchema {
 	return {
 		name,
+		schemaName: 'main',
 		violationSql: 'select 1 where 0', // unused by classifier
 		deferrable: true,
 		initiallyDeferred: true,

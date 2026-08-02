@@ -592,7 +592,8 @@ One row per (UNIQUE constraint, column) pair. The primary key is excluded — qu
 
 | Column | Type | Description |
 |---|---|---|
-| `name` | TEXT | Assertion name |
+| `schema_name` | TEXT | Schema the assertion lives in |
+| `name` | TEXT | Assertion name (unique per schema) |
 | `violation_sql` | TEXT | The query that should return zero rows when the assertion holds |
 | `deferrable` | INTEGER | 0/1 |
 | `initially_deferred` | INTEGER | 0/1 |
@@ -625,7 +626,7 @@ These table-valued functions provide query introspection and execution tracing. 
 | `stack_trace(sql)` | 1 | Execution stack trace |
 | `execution_trace(sql)` | 1 | Instruction-level trace with timing. Non-deterministic |
 | `row_trace(sql)` | 1 | Row-level data flow trace. Non-deterministic |
-| `explain_assertion(name)` | 1 | Assertion analysis: classification, prepared PK params, violation SQL |
+| `explain_assertion(name)` | 1 | Assertion analysis: classification, prepared PK params, violation SQL. `name` may be `'schema.name'` or bare (first match across schemas) |
 
 ```sql
 select id, op, detail from query_plan('select * from users where age > 25');

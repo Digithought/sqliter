@@ -1713,3 +1713,89 @@ diff schema nm_view_pol;
 drop materialized view nm_view_pol.nmv;
 drop view nm_view_pol.nv;
 drop table nm_view_pol.nt;
+
+-- run
+
+-- ---------------------------------------------------------------------------
+-- Assertion in a NON-main declared schema. The apply must land the assertion in
+-- the declared schema (not main), its body must resolve the unqualified table
+-- name against that schema, a re-diff immediately after apply must be empty,
+-- and a write to an unrelated main-schema table must still commit.
+-- Ticket `bug-declared-assertion-ignores-target-schema`.
+declare schema nm_assert_pol using (default_vtab_module = 'memory') {
+	table at_t {
+		id INTEGER PRIMARY KEY,
+		x INTEGER NOT NULL
+	}
+
+	assertion a1 check (not exists (select 1 from at_t where x < 0))
+}
+
+-- run
+
+apply schema nm_assert_pol;
+
+-- run
+
+-- Converged immediately: the assertion landed in its declared schema.
+diff schema nm_assert_pol;
+→ []
+
+-- The assertion lives in the declared schema, not main.
+select schema_name, name from assertion_info() where name = 'a1';
+→ [{"schema_name": "nm_assert_pol", "name": "a1"}]
+
+-- A conforming row commits (the body's unqualified `at_t` resolves in the
+-- assertion's home schema even though the session path is `main, temp`).
+insert into nm_assert_pol.at_t values (1, 10);
+
+select id, x from nm_assert_pol.at_t order by id;
+→ [{"id": 1, "x": 10}]
+
+-- run
+
+-- A violating row fails at commit.
+begin;
+insert into nm_assert_pol.at_t values (2, -5);
+commit;
+-- error: Integrity assertion failed: a1
+
+select count(*) as cnt from nm_assert_pol.at_t;
+→ [{"cnt": 1}]
+
+-- An unrelated main-schema write still commits: compiling the non-main
+-- assertion at commit time no longer fails against the session path.
+create table nm_unrelated (id integer primary key);
+insert into nm_unrelated values (1);
+
+select id from nm_unrelated;
+→ [{"id": 1}]
+
+-- run
+
+-- Redeclare the schema WITHOUT the assertion: the diff emits a schema-qualified
+-- drop, and applying it removes the assertion from its home schema.
+declare schema nm_assert_pol using (default_vtab_module = 'memory') {
+	table at_t {
+		id INTEGER PRIMARY KEY,
+		x INTEGER NOT NULL
+	}
+}
+
+-- run
+
+diff schema nm_assert_pol;
+→ [{"ddl": "DROP ASSERTION IF EXISTS nm_assert_pol.a1"}]
+
+apply schema nm_assert_pol;
+
+-- run
+
+select count(*) as cnt from assertion_info() where name = 'a1';
+→ [{"cnt": 0}]
+
+diff schema nm_assert_pol;
+→ []
+
+drop table nm_unrelated;
+drop table nm_assert_pol.at_t;

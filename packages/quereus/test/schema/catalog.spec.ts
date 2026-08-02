@@ -613,6 +613,28 @@ describe('Schema Catalog', () => {
 			const ddl = generateDeclaredDDL(schema);
 			expect(ddl).to.have.length(2);
 		});
+
+		it('should include declared assertions, qualified with a non-main target schema', () => {
+			const schema = parse(
+				'declare schema pol { table t (id integer, primary key (id)); assertion a1 check (not exists (select 1 from t where id < 0)) }'
+			) as AST.DeclareSchemaStmt;
+
+			const ddl = generateDeclaredDDL(schema, 'pol');
+			expect(ddl).to.have.length(2);
+			expect(ddl[1].toLowerCase()).to.include('create assertion');
+			expect(ddl[1]).to.include('pol.a1');
+		});
+
+		it('should not qualify a declared assertion for main', () => {
+			const schema = parse(
+				'declare schema main { assertion a1 check (1 = 1) }'
+			) as AST.DeclareSchemaStmt;
+
+			const ddl = generateDeclaredDDL(schema, 'main');
+			expect(ddl).to.have.length(1);
+			expect(ddl[0]).to.include('a1');
+			expect(ddl[0]).to.not.include('main.');
+		});
 	});
 });
 
@@ -696,6 +718,24 @@ describe('Schema Hasher', () => {
 		};
 
 		expect(computeSchemaHash(schema1)).to.not.equal(computeSchemaHash(schema2));
+	});
+
+	it('should change the hash when a declared assertion is added or its body changes', () => {
+		// Regression for ticket bug-declared-assertion-ignores-target-schema:
+		// generateDeclaredDDL had no assertion case, so these three all hashed alike.
+		const declare = (assertion: string | undefined): AST.DeclareSchemaStmt => parse(
+			'declare schema p { table t (x integer, primary key (x))'
+			+ (assertion ? `; assertion a1 check (${assertion})` : '')
+			+ ' }'
+		) as AST.DeclareSchemaStmt;
+
+		const without = computeSchemaHash(declare(undefined));
+		const bodyA = computeSchemaHash(declare('not exists (select 1 from t where x < 0)'));
+		const bodyB = computeSchemaHash(declare('not exists (select 1 from t where x < 100)'));
+
+		expect(bodyA).to.not.equal(without);
+		expect(bodyA).to.not.equal(bodyB);
+		expect(bodyB).to.not.equal(without);
 	});
 
 	it('should strip tags before hashing (tags do not affect hash)', () => {

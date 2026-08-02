@@ -337,7 +337,7 @@ estimatedRows: (operands) => {
 | `foreign_key_info(table)` | `isSet`, `keys=[[id, seq]]`. |
 | `unique_constraint_info(table)` | `isSet`, `keys=[[id, seq]]`. |
 | `check_constraint_info(table)` | `isSet`, `keys=[[id]]`. |
-| `assertion_info()` | `isSet`, `keys=[[name]]`. |
+| `assertion_info()` | `isSet`, `keys=[[schema_name, name]]`. |
 | `function_info()` | `isSet`, `keys=[[name, num_args]]`. |
 
 Non-deterministic or trace-only TVFs (`execution_trace`, `row_trace`, `stack_trace`, `scheduler_program`, `schema_size`, `explain_assertion`, `schema`) skip advertisement.

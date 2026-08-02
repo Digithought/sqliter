@@ -315,7 +315,7 @@ describe('Emit: ast-stringify AST round-trip', () => {
 			const reparsed = parse(astToString(original)) as DeclareSchemaStmt;
 			const a = reparsed.items.find(i => i.type === 'declaredAssertion') as DeclaredAssertion;
 			expect(a).to.exist;
-			expect(a.assertionStmt.name.toLowerCase()).to.equal('a');
+			expect(a.assertionStmt.name.name.toLowerCase()).to.equal('a');
 			expect(a.assertionStmt.check.type).to.equal('binary');
 		});
 

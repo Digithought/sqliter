@@ -3,5 +3,9 @@ import type * as AST from '../../parser/ast.js';
 import { CreateAssertionNode } from '../nodes/create-assertion-node.js';
 
 export function buildCreateAssertionStmt(ctx: PlanningContext, stmt: AST.CreateAssertionStmt): CreateAssertionNode {
-	return new CreateAssertionNode(ctx.scope, stmt.name, stmt.check);
+	const sm = ctx.schemaManager;
+	// Canonical schemaName (see SchemaManager.canonicalSchemaName) — it becomes
+	// the assertion's stored home schema.
+	const schemaName = stmt.name.schema ? sm.canonicalSchemaName(stmt.name.schema) : sm.getCurrentSchemaName();
+	return new CreateAssertionNode(ctx.scope, schemaName, stmt.name.name, stmt.check);
 }

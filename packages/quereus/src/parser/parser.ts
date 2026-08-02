@@ -3107,7 +3107,7 @@ export class Parser {
 	 * @returns AST for CREATE ASSERTION
 	 */
 	private createAssertionStatement(startToken: Token, _withClause?: AST.WithClause): AST.CreateAssertionStmt {
-		const name = this.consumeIdentifier("Expected assertion name.");
+		const name = this.tableIdentifier();
 
 		this.consumeKeyword('CHECK', "Expected 'CHECK' after assertion name.");
 		this.consume(TokenType.LPAREN, "Expected '(' after CHECK.");

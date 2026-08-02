@@ -8,8 +8,10 @@ export interface AssertionDependentTable {
 }
 
 export interface IntegrityAssertionSchema {
-  /** Unique assertion name */
+  /** Assertion name, unique within its schema */
   name: string;
+  /** Canonical name of the schema the assertion lives in (see SchemaManager.canonicalSchemaName) */
+  schemaName: string;
   /** SQL text of the violation-producing query. Any returned row indicates a violation. */
   violationSql: string;
   /** Whether the assertion is deferrable. Currently always enforced at COMMIT. */

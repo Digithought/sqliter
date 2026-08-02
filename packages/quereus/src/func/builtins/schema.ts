@@ -564,6 +564,7 @@ export const assertionInfoFunc = createIntegratedTableValuedFunction(
 			isReadOnly: true,
 			isSet: false,
 			columns: [
+				{ name: 'schema_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'violation_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'deferrable', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
@@ -575,13 +576,16 @@ export const assertionInfoFunc = createIntegratedTableValuedFunction(
 		},
 		relationalAdvertisement: {
 			isSet: true,
-			keys: [[{ index: 0 }]],
+			// Assertion names are unique per schema, not globally — the honest key
+			// is the (schema_name, name) pair.
+			keys: [[{ index: 0 }, { index: 1 }]],
 		},
 	},
 	async function* (db: Database): AsyncIterable<Row> {
 		for (const assertion of db.schemaManager.getAllAssertions()) {
 			const deps = assertion.dependentTables ?? [];
 			yield [
+				assertion.schemaName,
 				assertion.name,
 				assertion.violationSql,
 				assertion.deferrable ? 1 : 0,

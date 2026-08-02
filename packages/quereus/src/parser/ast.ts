@@ -384,7 +384,7 @@ export interface CreateIndexStmt extends AstNode {
 // CREATE ASSERTION statement
 export interface CreateAssertionStmt extends AstNode {
 	type: 'createAssertion';
-	name: string;
+	name: IdentifierExpr; // Possibly schema-qualified assertion name
 	check: Expression; // The CHECK (<violation-query>) expression
 }
 
