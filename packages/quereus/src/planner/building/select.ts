@@ -82,6 +82,12 @@ export function buildSelectStmt(
 	// plans it under `bodyPlanningContext` → `storedBodyContext`, which already IS that home
 	// environment (and stamps `storedBodyOf`). Re-swapping there would re-clear `cteNodes`
 	// inside the body's own plan and break a body whose sub-select reads the body's `with`.
+	//
+	// NOTE: the guard compares SCHEMA NAMES, not body identity, so a fragment stamped for
+	// view A would also be treated as at-home inside a *different* body of the same schema.
+	// Exact today because that needs a nested write-through (a view over a view), which
+	// `analyzeView` rejects outright. If view-over-view write-through is ever allowed, key
+	// `storedBodyOf` on the body object rather than its schema name.
 	const storedSwap = storedHome !== undefined && ctx.storedBodyOf !== storedHome;
 	const storedCtx = storedSwap ? storedBodyContext(ctx, storedHome) : ctx;
 	// Clearing `ctx.cteNodes` (which `storedBodyContext` does) is NOT sufficient on its own:

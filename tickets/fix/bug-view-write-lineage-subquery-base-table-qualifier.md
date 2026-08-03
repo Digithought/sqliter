@@ -81,3 +81,8 @@ wins, as elsewhere in this substrate.
 - Worth probing whether DELETE and RETURNING through such a view fail the same
   way, and whether an `insert` that evaluates the lineage (authored inverse
   puts) is affected.
+- `bug-view-write-subquery-shadow-analysis-wrong-schema` is a separate defect in
+  the *same* descent: the shadow set that decides whether a reference is local
+  looks its `from` sources up in one fixed schema. Different site (the lookup,
+  not the qualifier rule) but it changes which references this ticket's rewrite
+  sees as unshadowed — read it before settling on where the rewrite belongs.

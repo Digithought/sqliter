@@ -485,6 +485,25 @@ describe('home-schema resolution for sub-selects copied out of a view body', () 
 		expect(await all(db, 'select id, x from temp.a order by id')).to.deep.equal([{ id: 2, x: 20 }]);
 	});
 
+	it('updates through a temp materialized view whose body predicate holds a sub-select', async () => {
+		// An MV reaches the same funnel through a DIFFERENT adapter object
+		// (`maintainedTableViewLike`, `schema/derivation.ts`) than a plain `ViewSchema`, and
+		// the marker is applied to a spread copy of whichever one arrives — so pin the MV
+		// side too, not only the view side.
+		await db.exec('create table temp.mt (id integer primary key, x integer)');
+		await db.exec('create table temp.mk (id integer primary key)');
+		await db.exec('insert into temp.mt values (1, 10), (2, 20)');
+		await db.exec('insert into temp.mk values (1)');
+		await db.exec('create materialized view temp.mmv as select id, x from mt where id in (select id from mk)');
+
+		expect(await all(db, 'select id, x from temp.mmv'), 'the read already worked')
+			.to.deep.equal([{ id: 1, x: 10 }]);
+
+		await db.exec('update temp.mmv set x = 99 where id = 1');
+		expect(await all(db, 'select id, x from temp.mt order by id'))
+			.to.deep.equal([{ id: 1, x: 99 }, { id: 2, x: 20 }]);
+	});
+
 	it('binds a body sub-select in the home schema when a same-named table exists in main', async () => {
 		// `b2` in BOTH schemas with different contents. Under the default path the caller
 		// reaches main.b2 (which would select row 2); the body must bind temp.b2 (row 1) —
