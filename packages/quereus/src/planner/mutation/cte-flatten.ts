@@ -426,7 +426,7 @@ function cloneInverse(
  * flattened body is planned on this same context, so a fixed-schema lookup would report
  * an off-current-schema base table as unresolvable and reject a rename-over-`select *`
  * chain the plan resolves fine — the same defect fixed in `scope-transform.ts`'s
- * {@link import('./scope-transform.js').collectFromColumnNames}.
+ * `tableSourceColumnNames` (the FROM-source lookup behind `collectFromColumnNames`).
  *
  * Unlike that one this needs no home-schema swap. A CTE write target is EPHEMERAL — its
  * body comes from the caller's own statement, never from a stored view definition — so

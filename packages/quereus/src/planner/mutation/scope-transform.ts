@@ -471,22 +471,18 @@ function fromSourceColumnNames(ctx: PlanningContext, fc: AST.FromClause): Set<st
  * its registered columns ARE the authoritative output names.
  *
  * The lookup MUST be the path-aware {@link import('../../schema/manager.js').SchemaManager.findSchemaItem},
- * because this static analysis and the plan that actually executes have to agree on
- * WHICH object a FROM name denotes. `buildSelectStmt`'s FROM branch (`building/select.ts`
- * → `buildFrom` → `buildTableReference`) resolves the same name through `findSchemaItem` /
- * `findTable` against `ctx.schemaPath`; a fixed-schema `getTable` / `getView` here (both
- * of which default an unqualified name to the connection's CURRENT schema and consult no
- * search path) would read a DIFFERENT table's column list — or none — whenever the real
- * source is reached through the path rather than sitting in the current schema. That
- * disagreement is not conservative: the shadow set it produces makes the descent decide
- * the opposite of the truth about which references are outward correlations, so the
- * lowered statement is either rejected or silently rewritten to mean something else.
- * `ctx` must therefore already BE the environment the fragment resolves on — see
- * {@link fromResolutionContext}.
+ * because this analysis and the plan that executes have to agree on WHICH object a FROM
+ * name denotes: `buildSelectStmt`'s FROM branch resolves it through `findSchemaItem` /
+ * `findTable` against `ctx.schemaPath`. A fixed-schema `getTable` / `getView` would read a
+ * different table's column list — or none — for any source reached through the path, and
+ * that disagreement is not conservative (docs/view-updateability.md § Schema resolution
+ * during write-through). `ctx` must therefore already BE the environment the fragment
+ * resolves on — see {@link fromResolutionContext}.
  *
  * `findSchemaItem` walks one path entry at a time, checking that schema's tables AND
- * views together. Tables and views share one namespace per schema, so at most one can
- * match per entry and the old table-then-view preference is preserved by construction.
+ * views together. Tables and views share one namespace per schema (CREATE rejects a
+ * cross-kind name collision), so at most one can match per entry and the old
+ * table-then-view preference is preserved by construction.
  *
  * NOTE: the `committed.` pseudo-schema (`from committed.t`, the pre-statement snapshot
  * of `t`) is not intercepted here the way `resolveTableSchema` intercepts it at plan
@@ -543,15 +539,13 @@ function projectionOutputNames(query: AST.QueryExpr): Set<string> | null {
  * The context a select's OWN FROM names resolve on — the analysis-time twin of the
  * environment entry `buildSelectStmt` performs before it plans a FROM clause.
  *
- * Both callers of the scope-aware descent (`makeBaseQualifier` /
- * `makeViewColumnDescend` in `mutation/single-source.ts`) hand it the CALLER's
- * planning context, which is right for the user's own clauses but wrong for a
- * fragment copied out of the view's definition: that fragment's `from` names must
- * resolve on the VIEW's environment, not the writing statement's. `buildViewMutation`
- * (`building/view-mutation-builder.ts`) stamps every nested sub-select of the stored
- * body with {@link AST.StoredBodyEnv} before this analysis runs, so the environment is
- * already on the node — this only has to re-enter it, in the same order and with the
- * same precedence `buildSelectStmt` uses at plan time:
+ * The descent is entered on the CALLER's planning context, which is right for the user's
+ * own clauses but wrong for a fragment copied out of the view's definition: that
+ * fragment's `from` names must resolve on the VIEW's environment. `buildViewMutation`
+ * (`building/view-mutation-builder.ts`) stamps every nested sub-select of the stored body
+ * with {@link AST.StoredBodyEnv} before this analysis runs, so the environment is already
+ * on the node — this only re-enters it, in the same order and with the same precedence
+ * `buildSelectStmt` uses at plan time:
  *
  *   1. {@link storedBodyContext} on the view's home schema (its home schema path);
  *   2. the body's DECLARED `with schema` path, when it has one, overriding 1;
@@ -568,9 +562,12 @@ function projectionOutputNames(query: AST.QueryExpr): Set<string> | null {
  * for the same reason: it keeps the marker inert while the body ITSELF is being
  * analysed under a context that already IS the home environment.
  *
- * Applied per select rather than threaded down the descent because `mapNestedSelects`
- * stamps EVERY nested sub-select of the body — including FROM `subquerySource` members
- * — so each select re-derives its own environment from its own node.
+ * Re-derived per select — `mapNestedSelects` stamps EVERY nested sub-select of the body,
+ * including FROM `subquerySource` members — but derived FROM the enclosing select's
+ * environment rather than the descent's entry context, so an enclosing `with schema`
+ * clause is inherited the way `buildSelectStmt` passes its context down. The at-home
+ * guard makes the inherited stamp a no-op once the swap has happened, exactly as
+ * `enterStoredBodyEnv` goes inert inside an already-swapped fragment.
  *
  * NOTE: `storedBodyContext` clears `cteNodes`, so a stamped fragment naming a
  * BODY-LOCAL CTE resolves to nothing and taints its scope. Not a regression (before,
@@ -693,9 +690,13 @@ export function transformScopedQuery(
 	const sel = query;
 	// This select's own FROM names resolve on THIS select's environment — the caller's
 	// for a user clause, the view's home environment for a fragment copied out of the
-	// stored body (see {@link fromResolutionContext}). Only the FROM lookup takes it;
-	// everything else below is scope bookkeeping over names already resolved.
-	const local = collectFromColumnNames(fromResolutionContext(ctx, sel), sel.from);
+	// stored body (see {@link fromResolutionContext}). That environment is threaded into
+	// the nested / leg descents too, exactly as `buildSelectStmt` passes its own
+	// `contextWithSchemaPath` down: a sub-select nested inside a `select … with schema`
+	// inherits the enclosing clause's path. Only the FROM lookup consumes it; everything
+	// else below is scope bookkeeping over names already resolved.
+	const fromCtx = fromResolutionContext(ctx, sel);
+	const local = collectFromColumnNames(fromCtx, sel.from);
 	let innerShadow: ReadonlySet<string>;
 	let scopeTainted: boolean;
 	if (local === null) {
@@ -719,11 +720,13 @@ export function transformScopedQuery(
 	const substitute = scope.makeSubstitute(innerShadow, scopeTainted, innerAliasShadow);
 	// A subquery nested inside this select's clauses / FROM sees this select's FROM,
 	// so it inherits `innerShadow` / `scopeTainted` / `innerAliasShadow`.
-	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, innerShadow, scopeTainted, innerAliasShadow);
+	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(fromCtx, scope, q, innerShadow, scopeTainted, innerAliasShadow);
 	// A compound / union leg is a SIBLING select correlating to the SAME outer scope
 	// as this one — it does NOT see this select's FROM, so it keeps the incoming
-	// `shadowed` / `tainted` / `aliasShadowed`.
-	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, shadowed, tainted, aliasShadowed);
+	// `shadowed` / `tainted` / `aliasShadowed`. It does share this select's naming
+	// ENVIRONMENT though (`buildCompoundSelect` builds every leg on the enclosing
+	// select's context, and the parser suppresses a leg's own `with schema` clause).
+	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(fromCtx, scope, q, shadowed, tainted, aliasShadowed);
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, onNested);
 	return rebuildSelect(sel, onExpr, onNested, onLeg);
 }

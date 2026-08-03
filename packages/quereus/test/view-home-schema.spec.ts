@@ -1151,6 +1151,85 @@ describe('write-through sub-query shadow analysis resolves sources like the plan
 			.to.deep.equal([{ id: 1, x: 55 }, { id: 2, x: 55 }]);
 	});
 
+	it("resolves a body sub-query's source in a schema ONLY the declared path reaches", async () => {
+		// The same step as the case above, isolated harder: `adk` lives in a third schema
+		// that the view's plain home path (`main`, then `temp`) never reaches, so getting
+		// step 2 wrong is not a mis-sizing here but a total miss — the source resolves to
+		// nothing, taints its scope and the write is rejected outright.
+		await db.exec('declare schema aux { table adk { id INTEGER PRIMARY KEY, lbl TEXT } }');
+		await db.exec('apply schema aux');
+		await db.exec('create table main.adt (id integer primary key, x integer)');
+		await db.exec('create table main.asel (tag text primary key)');
+		await db.exec("insert into aux.adk values (1, 'one'), (2, 'two')");
+		await db.exec('insert into main.adt values (1, 10), (2, 20)');
+		await db.exec("insert into main.asel values ('one')");
+		await db.exec('create view main.avd as select id, x, '
+			+ '(select lbl from adk where id = 1) as n from adt with schema aux, main');
+
+		expect(await all(db, 'select id, x, n from main.avd order by id'), 'the read binds aux.adk')
+			.to.deep.equal([{ id: 1, x: 10, n: 'one' }, { id: 2, x: 20, n: 'one' }]);
+
+		const written = await all(db, 'update main.avd set x = 55 '
+			+ 'where exists (select 1 from asel where asel.tag = n) returning id');
+		expect([...written].sort((a, b) => Number(a.id) - Number(b.id)), 'the write touched both rows')
+			.to.deep.equal([{ id: 1 }, { id: 2 }]);
+		expect(await all(db, 'select id, x from main.adt order by id'))
+			.to.deep.equal([{ id: 1, x: 55 }, { id: 2, x: 55 }]);
+	});
+
+	it("inherits an enclosing sub-query's own `with schema` clause into a sub-query nested in it", async () => {
+		// A `with schema` clause on a sub-select governs everything built under it, so the
+		// analysis has to thread that environment down the descent, not re-derive each
+		// nested select from the statement's own context. `q` exists in both schemas and
+		// only `temp.q` has an `id`: resolved on the caller's main-first path the analysis
+		// calls the inner bare `id` an outward correlation and re-points it at the row being
+		// updated, narrowing the write to row 1 while the read still matches both rows.
+		await db.exec("pragma schema_path = 'main,temp'");
+		await db.exec('create table temp.zt (id integer primary key, x integer)');
+		await db.exec('create table main.q (k integer primary key)');
+		await db.exec('create table temp.q (id integer primary key)');
+		await db.exec('create table main.anchor (a integer primary key)');
+		await db.exec('insert into temp.zt values (1, 10), (2, 20)');
+		await db.exec('insert into temp.q values (1)');
+		await db.exec('insert into main.anchor values (1)');
+		await db.exec('create view temp.zv as select id, x from temp.zt');
+
+		const pred = 'exists (select 1 from anchor where exists '
+			+ '(select 1 from q where id = 1) with schema "temp", main)';
+		expect(await all(db, `select id from temp.zv where ${pred} order by id`), 'the matching read')
+			.to.deep.equal([{ id: 1 }, { id: 2 }]);
+
+		await db.exec(`update temp.zv set x = 99 where ${pred}`);
+		expect(await all(db, 'select id, x from temp.zt order by id'), 'the write touched the same rows')
+			.to.deep.equal([{ id: 1, x: 99 }, { id: 2, x: 99 }]);
+	});
+
+	it('analyses a user sub-query over a JOIN-bodied view whose source needs the session path', async () => {
+		// The multi-source (join) spine reaches the same descent through its own
+		// `transformScopedExpr` side-qualifier (`mutation/multi-source.ts`), with no second
+		// lookup of its own — pinned here so a future divergence between the two spines
+		// trips a test. `jside` has no `cid`, so the bare `cid` is an outward correlation
+		// to the view row and the analysis must size `temp.jside` up to know that.
+		await db.exec("pragma schema_path = 'temp,main'");
+		await db.exec('create table temp.jp (pid integer primary key, label text)');
+		await db.exec('create table temp.jc (cid integer primary key, pref integer, note text, '
+			+ 'foreign key (pref) references jp(pid))');
+		await db.exec('create table temp.jside (tag integer primary key)');
+		await db.exec("insert into temp.jp values (10, 'P10'), (20, 'P20')");
+		await db.exec("insert into temp.jc values (1, 10, 'a'), (2, 20, 'b')");
+		await db.exec('insert into temp.jside values (2)');
+		await db.exec('create view temp.jv as select c.cid as cid, c.note as note, p.label as label '
+			+ 'from jc c join jp p on p.pid = c.pref');
+
+		const pred = 'exists (select 1 from jside where jside.tag = cid)';
+		expect(await all(db, `select cid from temp.jv where ${pred} order by cid`), 'the matching read')
+			.to.deep.equal([{ cid: 2 }]);
+
+		await db.exec(`update temp.jv set note = 'X' where ${pred}`);
+		expect(await all(db, 'select cid, note from temp.jc order by cid'), 'the write touched the same row')
+			.to.deep.equal([{ cid: 1, note: 'a' }, { cid: 2, note: 'X' }]);
+	});
+
 	// --- the conservative path must stay conservative ---
 
 	it('still rejects a user sub-query over a `select *` source under a session path', async () => {
