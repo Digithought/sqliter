@@ -85,6 +85,8 @@ import {
 	getSnapshotStream as getSnapshotStreamImpl,
 	applySnapshotStream as applySnapshotStreamImpl,
 	getSnapshotCheckpoint as getSnapshotCheckpointImpl,
+	listSnapshotCheckpoints as listSnapshotCheckpointsImpl,
+	clearSnapshotCheckpoint as clearSnapshotCheckpointImpl,
 	resumeSnapshotStream as resumeSnapshotStreamImpl,
 } from './snapshot-stream.js';
 
@@ -1556,6 +1558,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	async getSnapshotCheckpoint(snapshotId: string): Promise<SnapshotCheckpoint | undefined> {
 		return getSnapshotCheckpointImpl(this, snapshotId);
+	}
+
+	async listSnapshotCheckpoints(): Promise<SnapshotCheckpoint[]> {
+		return listSnapshotCheckpointsImpl(this);
+	}
+
+	async clearSnapshotCheckpoint(snapshotId: string): Promise<void> {
+		return clearSnapshotCheckpointImpl(this, snapshotId);
 	}
 
 	async *resumeSnapshotStream(checkpoint: SnapshotCheckpoint): AsyncIterable<SnapshotChunk> {

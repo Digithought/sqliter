@@ -15,6 +15,8 @@ import {
 	buildAllColumnVersionsScanBounds,
 	buildAllTombstonesScanBounds,
 	buildAllChangeLogScanBounds,
+	buildAllSnapshotCheckpointScanBounds,
+	buildSnapshotCheckpointKey,
 	buildTableColumnVersionScanBounds,
 	parseColumnVersionKey,
 	parseTombstoneKey,
@@ -52,9 +54,6 @@ import { applyDataToStore } from './admission.js';
 
 /** Default chunk size for streaming snapshots. */
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 1000;
-
-/** Key prefix for snapshot checkpoints. */
-const CHECKPOINT_PREFIX = 'sc:';
 
 /**
  * Row changes `applySnapshotStream` accumulates before pushing them to the store.
@@ -420,26 +419,31 @@ export async function applySnapshotStream(
 	// Flush the accumulated metadata batch and (on a live transfer) save a resume
 	// checkpoint. Shared by the column-version and tombstone chunk handlers so both
 	// honor the same BATCH_FLUSH_SIZE bound and checkpoint cadence.
+	// The checkpoint record for the apply's CURRENT position. Both save sites — the
+	// header-time save that opens the resumable window, and every metadata-batch
+	// flush below — build it here so the two cannot drift.
+	const buildCheckpointRecord = (id: string, hlc: HLC): SnapshotCheckpoint => ({
+		snapshotId: id,
+		siteId: ctx.getSiteId(),
+		hlc,
+		// NOTE: nothing reads these two — resume keys off `completedTables` alone.
+		// `tablesProcessed` counts `table-end`s, so it can exceed
+		// `completedTables.length` while tables are staged; if a resume path ever
+		// starts seeking by index, derive it from `completedTables`, not from here.
+		lastTableIndex: tablesProcessed,
+		lastEntryIndex: entriesProcessed,
+		completedTables: [...completedTables],
+		entriesProcessed,
+		createdAt: Date.now(),
+	});
+
 	const flushMetadataBatch = async (): Promise<void> => {
 		await batch.write();
 		batch = ctx.kv.batch();
 		batchSize = 0;
 
 		if (snapshotId && snapshotHLC) {
-			await saveSnapshotCheckpoint(ctx, {
-				snapshotId,
-				siteId: ctx.getSiteId(),
-				hlc: snapshotHLC,
-				// NOTE: nothing reads these two — resume keys off `completedTables` alone.
-				// `tablesProcessed` counts `table-end`s, so it can exceed
-				// `completedTables.length` while tables are staged; if a resume path ever
-				// starts seeking by index, derive it from `completedTables`, not from here.
-				lastTableIndex: tablesProcessed,
-				lastEntryIndex: entriesProcessed,
-				completedTables: [...completedTables],
-				entriesProcessed,
-				createdAt: Date.now(),
-			});
+			await saveSnapshotCheckpoint(ctx, buildCheckpointRecord(snapshotId, snapshotHLC));
 		}
 	};
 
@@ -532,6 +536,16 @@ export async function applySnapshotStream(
 					entriesProcessed = checkpoint.entriesProcessed;
 				}
 				await clearExistingMetadata(ctx, new Set(completedTables));
+
+				// Open the resumable window the instant local metadata is gone. Both gates
+				// above reject WITHOUT touching local state, so a refused snapshot leaves no
+				// checkpoint behind; from here on the replica's data is partial until the
+				// footer clears this record, and `listSnapshotCheckpoints` is what says so.
+				// Without this save, an interruption before the first `flushMetadataBatch`
+				// (every 1000 metadata entries) would leave a cleared, half-written replica
+				// with nothing recording that a transfer was underway. On a resumed apply
+				// this re-saves substantively the same record — harmless.
+				await saveSnapshotCheckpoint(ctx, buildCheckpointRecord(chunk.snapshotId, chunk.hlc));
 				break;
 			}
 
@@ -744,19 +758,9 @@ export async function applySnapshotStream(
 // have to be read under both shapes. If checkpoint storage is ever reworked for
 // another reason, fold it onto the wire codec then.
 
-/**
- * Retrieve a saved checkpoint for an in-progress snapshot.
- */
-export async function getSnapshotCheckpoint(
-	ctx: SyncContext,
-	snapshotId: string,
-): Promise<SnapshotCheckpoint | undefined> {
-	const key = new TextEncoder().encode(`${CHECKPOINT_PREFIX}${snapshotId}`);
-	const data = await ctx.kv.get(key);
-	if (!data) return undefined;
-
-	const json = new TextDecoder().decode(data);
-	const obj = JSON.parse(json);
+/** Decode one checkpoint record's at-rest bytes. */
+function decodeCheckpoint(bytes: Uint8Array): SnapshotCheckpoint {
+	const obj = JSON.parse(new TextDecoder().decode(bytes));
 
 	return {
 		...obj,
@@ -771,13 +775,37 @@ export async function getSnapshotCheckpoint(
 }
 
 /**
+ * Retrieve a saved checkpoint for an in-progress snapshot.
+ */
+export async function getSnapshotCheckpoint(
+	ctx: SyncContext,
+	snapshotId: string,
+): Promise<SnapshotCheckpoint | undefined> {
+	const data = await ctx.kv.get(buildSnapshotCheckpointKey(snapshotId));
+	if (!data) return undefined;
+	return decodeCheckpoint(data);
+}
+
+/**
+ * List every saved snapshot checkpoint — the discovery path for a caller that
+ * has forgotten (or never held) the `snapshotId` of an interrupted transfer.
+ * See {@link import('./manager.js').SyncManager.listSnapshotCheckpoints}.
+ */
+export async function listSnapshotCheckpoints(ctx: SyncContext): Promise<SnapshotCheckpoint[]> {
+	const checkpoints: SnapshotCheckpoint[] = [];
+	for await (const entry of ctx.kv.iterate(buildAllSnapshotCheckpointScanBounds())) {
+		checkpoints.push(decodeCheckpoint(entry.value));
+	}
+	return checkpoints;
+}
+
+/**
  * Save a checkpoint during a streaming snapshot apply.
  */
 async function saveSnapshotCheckpoint(
 	ctx: SyncContext,
 	checkpoint: SnapshotCheckpoint,
 ): Promise<void> {
-	const key = new TextEncoder().encode(`${CHECKPOINT_PREFIX}${checkpoint.snapshotId}`);
 	const json = JSON.stringify({
 		...checkpoint,
 		hlc: {
@@ -788,16 +816,16 @@ async function saveSnapshotCheckpoint(
 		},
 		siteId: Array.from(checkpoint.siteId),
 	});
-	await ctx.kv.put(key, new TextEncoder().encode(json));
+	await ctx.kv.put(buildSnapshotCheckpointKey(checkpoint.snapshotId), new TextEncoder().encode(json));
 }
 
 /**
- * Clear checkpoint after a snapshot completes successfully.
+ * Clear a checkpoint — after its snapshot completes successfully, or when a
+ * caller abandons a transfer it will not resume.
  */
-async function clearSnapshotCheckpoint(
+export async function clearSnapshotCheckpoint(
 	ctx: SyncContext,
 	snapshotId: string,
 ): Promise<void> {
-	const key = new TextEncoder().encode(`${CHECKPOINT_PREFIX}${snapshotId}`);
-	await ctx.kv.delete(key);
+	await ctx.kv.delete(buildSnapshotCheckpointKey(snapshotId));
 }

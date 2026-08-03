@@ -14,6 +14,7 @@
  *   qt: - Quarantine (held out-of-basis straggler changes)
  *   bl: - Basis-table lifecycle (mapped/derivation-source/unreferenced/detached bookkeeping)
  *   fv: - Sync-metadata format version (single record; see SYNC_METADATA_FORMAT_VERSION)
+ *   sc: - Snapshot checkpoints (resume position of an interrupted streaming snapshot apply)
  */
 
 import type { SqlValue } from '@quereus/quereus';
@@ -41,6 +42,7 @@ export const SYNC_KEY_PREFIX = {
   QUARANTINE: encoder.encode('qt:'),
   BASIS_LIFECYCLE: encoder.encode('bl:'),
   FORMAT_VERSION: encoder.encode('fv:'),
+  SNAPSHOT_CHECKPOINT: encoder.encode('sc:'),
 } as const;
 
 /**
@@ -730,5 +732,31 @@ export function buildAllBasisLifecycleScanBounds(): { gte: Uint8Array; lt: Uint8
   return {
     gte: SYNC_KEY_PREFIX.BASIS_LIFECYCLE,
     lt: incrementLastByte(SYNC_KEY_PREFIX.BASIS_LIFECYCLE),
+  };
+}
+
+/**
+ * Build a snapshot checkpoint key — the resume position of one streaming
+ * snapshot apply.
+ * Format: sc:{snapshotId}
+ *
+ * Unlike `cv:` / `tb:` / `cl:`, this suffix is NOT length-prefixed and has no
+ * `parse…Key` counterpart: it is a single UUID, which cannot contain the `:`
+ * separator, so nothing can shift the split. Callers that need the id back read
+ * the `snapshotId` field of the record VALUE (see `snapshot-stream.ts`).
+ */
+export function buildSnapshotCheckpointKey(snapshotId: string): Uint8Array {
+  return encoder.encode(`sc:${snapshotId}`);
+}
+
+/**
+ * Build scan bounds over every saved snapshot checkpoint. A non-empty scan means
+ * a streaming snapshot apply cleared local metadata and never reached its footer,
+ * so this replica's data is partial (see `listSnapshotCheckpoints`).
+ */
+export function buildAllSnapshotCheckpointScanBounds(): { gte: Uint8Array; lt: Uint8Array } {
+  return {
+    gte: SYNC_KEY_PREFIX.SNAPSHOT_CHECKPOINT,
+    lt: incrementLastByte(SYNC_KEY_PREFIX.SNAPSHOT_CHECKPOINT),
   };
 }

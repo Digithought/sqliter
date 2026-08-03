@@ -119,8 +119,14 @@ await syncManager.applySnapshot(snapshot);
 Streaming snapshots support checkpoint-based resumption:
 
 ```typescript
-// Save checkpoint during long snapshot transfers
-const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
+// After a restart the snapshotId is gone (it only ever arrived in the header
+// chunk), so discover any interrupted transfer instead. A non-empty list means
+// this replica's data is PARTIAL — an apply cleared local metadata and never
+// reached its footer.
+const [checkpoint] = await syncManager.listSnapshotCheckpoints();
+
+// Or look one up directly, when the id is still in hand
+// const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
 
 // Resume from where we left off
 if (checkpoint) {
@@ -128,6 +134,9 @@ if (checkpoint) {
     sendToPeer(chunk);
   }
 }
+
+// Or abandon a transfer that will not be resumed
+await syncManager.clearSnapshotCheckpoint(checkpoint.snapshotId);
 ```
 
 A `SnapshotCheckpoint` holds a `Uint8Array` site id and a `bigint` HLC wall time,

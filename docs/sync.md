@@ -811,14 +811,35 @@ interface SyncManager {
    *
    * The header HLC is drift-validated before the clear (see the HLC section): a
    * far-future snapshot is rejected before any local metadata is touched.
+   *
+   * A checkpoint exists for the WHOLE duration of an apply: one is saved at header
+   * time, immediately after the clear, and the footer clears it on success. So
+   * "a checkpoint is present" is the durable answer to "is this replica's data
+   * partial?" — see § Checkpoint presence means partial data below.
    */
   applySnapshotStream(
     chunks: AsyncIterable<SnapshotChunk>,
     onProgress?: (progress: SnapshotProgress) => void
   ): Promise<void>;
 
-  /** A resumable checkpoint for an in-progress snapshot. */
+  /** A resumable checkpoint for an in-progress snapshot, by id. */
   getSnapshotCheckpoint(snapshotId: string): Promise<SnapshotCheckpoint | undefined>;
+
+  /**
+   * Every saved checkpoint — the discovery path for a caller that does not hold a
+   * snapshotId (it only ever arrived in the header chunk, so a restarted client
+   * has forgotten it). Ordering is unspecified; pick by `createdAt` when more than
+   * one is present. Returns `[]` on a replica that never applied a snapshot.
+   */
+  listSnapshotCheckpoints(): Promise<SnapshotCheckpoint[]>;
+
+  /**
+   * Discard a checkpoint without applying anything — for a transfer the caller
+   * will not resume (e.g. superseded checkpoints when several are present).
+   * A successful apply already clears its own. Not guarded against an in-flight
+   * apply: that apply simply re-saves the record at its next flush.
+   */
+  clearSnapshotCheckpoint(snapshotId: string): Promise<void>;
 
   /** Resume a snapshot transfer from a checkpoint. */
   resumeSnapshotStream(checkpoint: SnapshotCheckpoint): AsyncIterable<SnapshotChunk>;
@@ -885,6 +906,31 @@ interface SnapshotCheckpoint {
   createdAt: number;
 }
 ```
+
+#### Checkpoint presence means partial data
+
+Checkpoints live under `sc:{snapshotId}` (`SYNC_KEY_PREFIX.SNAPSHOT_CHECKPOINT`).
+A checkpoint is present for the *entire* duration of a streaming apply:
+
+- **Saved at the header**, immediately after `clearExistingMetadata`. Both header
+  gates — wire format and clock drift — reject *before* that clear and touch no
+  local state, so a refused snapshot leaves no checkpoint behind. Everything after
+  the clear is covered, including the window before the first metadata-batch flush
+  (every 1000 entries) that used to be the earliest save.
+- **Re-saved at every metadata flush**, advancing `completedTables`.
+- **Cleared by the footer**, after `bootstrapFinalize` — deliberately in that order,
+  so a failed finalize leaves the checkpoint in place and the transfer retries.
+
+So on a replica whose data may be mid-bootstrap, `listSnapshotCheckpoints()` is the
+single durable answer to "is this data partial?" — no `snapshotId` needed, which
+matters because the id only ever arrives in the header chunk and a restarted client
+has forgotten it. Feed the discovered checkpoint back to a peer's
+`resumeSnapshotStream(checkpoint)` to finish the transfer, or
+`clearSnapshotCheckpoint(id)` to abandon it.
+
+`clearExistingMetadata` sweeps `cv:` / `tb:` / `cl:` only — it must never grow to
+include `sc:`, or a resumed apply would delete the very resume position it is
+running from.
 
 ### Sync Flow (Master to Many-Masters)
 

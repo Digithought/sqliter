@@ -124,6 +124,13 @@ class MockSyncManager implements SyncManager {
   updatePeerSyncStateCalls: { peerSiteId: SiteId; hlc: HLC }[] = [];
   updatePeerSentStateCalls: { peerSiteId: SiteId; hlc: HLC }[] = [];
   getChangesSinceCalls: { peerSiteId: SiteId; sinceHLC?: HLC }[] = [];
+  /**
+   * Stands in for the durable `sc:` records. A real map rather than a fixed
+   * `[]` / `undefined`: a test can seed a checkpoint here to make this mock look
+   * like a replica interrupted mid-bootstrap, and the get/list/clear methods
+   * below then agree with each other the way the real manager's do.
+   */
+  checkpoints = new Map<string, SnapshotCheckpoint>();
 
   getSiteId(): SiteId {
     return this.siteId;
@@ -187,8 +194,16 @@ class MockSyncManager implements SyncManager {
     _onProgress?: (progress: SnapshotProgress) => void
   ): Promise<void> {}
 
-  async getSnapshotCheckpoint(_snapshotId: string): Promise<SnapshotCheckpoint | undefined> {
-    return undefined;
+  async getSnapshotCheckpoint(snapshotId: string): Promise<SnapshotCheckpoint | undefined> {
+    return this.checkpoints.get(snapshotId);
+  }
+
+  async listSnapshotCheckpoints(): Promise<SnapshotCheckpoint[]> {
+    return [...this.checkpoints.values()];
+  }
+
+  async clearSnapshotCheckpoint(snapshotId: string): Promise<void> {
+    this.checkpoints.delete(snapshotId);
   }
 
   async pruneTombstones(): Promise<number> {

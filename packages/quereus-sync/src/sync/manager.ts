@@ -284,6 +284,31 @@ export interface SyncManager {
   getSnapshotCheckpoint(snapshotId: string): Promise<SnapshotCheckpoint | undefined>;
 
   /**
+   * List every saved checkpoint for an interrupted snapshot apply.
+   *
+   * A non-empty result means this replica's data is PARTIAL: a snapshot apply
+   * cleared existing sync metadata and did not reach its footer. Callers use
+   * this to discover a resumable transfer whose `snapshotId` they no longer
+   * hold (it only ever arrived in the snapshot's header chunk).
+   *
+   * Ordering is unspecified; pick by `createdAt` when more than one exists.
+   */
+  listSnapshotCheckpoints(): Promise<SnapshotCheckpoint[]>;
+
+  /**
+   * Discard a saved checkpoint without applying anything.
+   *
+   * `applySnapshotStream` already clears its own checkpoint on success; this is
+   * for callers abandoning a transfer they will not resume (e.g. discarding
+   * superseded checkpoints when several are present).
+   *
+   * Calling this for an IN-FLIGHT apply's snapshotId is not guarded: the apply
+   * simply re-saves the record at its next flush, so nothing corrupts — the
+   * transfer only loses one resume position in the interim.
+   */
+  clearSnapshotCheckpoint(snapshotId: string): Promise<void>;
+
+  /**
    * Resume a snapshot transfer from a checkpoint.
    *
    * @param checkpoint - Previously saved checkpoint
