@@ -77,7 +77,10 @@ export function ruleCteOptimization(node: PlanNode, context: OptContext): PlanNo
 			cacheThreshold
 		);
 
-		// Create new CTE with cached source (specific to CTENode implementation)
+		// Create new CTE with cached source (specific to CTENode implementation).
+		// The original's `tableDescriptor` is carried over: emitCTE keys its shared
+		// per-execution buffer on that identity, so a replacement that minted a
+		// fresh one would give this copy its own buffer and re-drive the source.
 		const result = new CTENode(
 			node.scope,
 			cteNode.cteName,
@@ -85,7 +88,8 @@ export function ruleCteOptimization(node: PlanNode, context: OptContext): PlanNo
 			cachedSource,
 			cteNode.materializationHint,
 			cteNode.isRecursive,
-			node instanceof CTENode ? node.materialize : false
+			node instanceof CTENode ? node.materialize : false,
+			cteNode.tableDescriptor
 		);
 
 		log('Created CTE with caching');

@@ -173,10 +173,9 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 		// SAME `tableDescriptor`. Earlier optimizer passes duplicate a multi-
 		// referenced recursive CTE into distinct RecursiveCTENode instances (distinct
 		// plan ids), but every copy preserves the one tableDescriptor identity, so it
-		// — not plan.id — is what the references agree on. Mirrors emitCTE's
-		// shared-materialization idiom (which keys by plan id, since its references
-		// DO share one CTENode instance).
-		const buffers = (rctx.cteMaterializations ??= new Map<string | typeof tableDescriptor, Promise<Row[]>>());
+		// — not plan.id — is what the references agree on. emitCTE keys the same map
+		// the same way, for the same reason.
+		const buffers = (rctx.cteMaterializations ??= new Map<typeof tableDescriptor, Promise<Row[]>>());
 		let bufferPromise = buffers.get(tableDescriptor);
 		if (!bufferPromise) {
 			// First reference to run owns the single drive. Create and store the

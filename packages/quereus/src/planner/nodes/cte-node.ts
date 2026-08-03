@@ -39,7 +39,15 @@ export interface CTEPlanNode extends UnaryRelationalNode {
 export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTECapable {
 	readonly nodeType = PlanNodeType.CTE;
 	readonly isCTECapable = true as const;
-	readonly tableDescriptor: TableDescriptor = {}; // Identity object for table context lookup
+	/**
+	 * Stable identity object for this CTE, minted once when the CTE is built and
+	 * threaded through every optimizer rebuild. Two `CTENode` instances that
+	 * describe the SAME source CTE share one descriptor, which is what lets
+	 * emitCTE's per-execution buffer be shared across them (plan ids are not:
+	 * a node reachable from two parents can be rebuilt once per parent path).
+	 * Mirrors `RecursiveCTENode.tableDescriptor`.
+	 */
+	readonly tableDescriptor: TableDescriptor;
 
 	private attributesCache: Cached<Attribute[]>;
 	private typeCache: Cached<RelationType>;
@@ -57,11 +65,13 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 		 * rows once per statement execution and every reference reads that one
 		 * shared buffer (multi-referenced or MATERIALIZED-hinted CTEs).
 		 */
-		public readonly materialize: boolean = false
+		public readonly materialize: boolean = false,
+		tableDescriptor?: TableDescriptor
 	) {
 		// Self-cost only: the source flows in via getChildren(). Self is the CTE
 		// materialization overhead.
 		super(scope, 10);
+		this.tableDescriptor = tableDescriptor ?? {}; // Identity object for table context lookup
 		this.attributesCache = new Cached(() => this.buildAttributes());
 		this.typeCache = new Cached(() => this.buildType());
 	}
@@ -126,7 +136,9 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 			return this;
 		}
 
-		// Create new instance with updated source
+		// Create new instance with updated source. `tableDescriptor` is threaded
+		// through so a rebuilt copy still shares the original's identity — see the
+		// field's doc comment.
 		return new CTENode(
 			this.scope,
 			this.cteName,
@@ -134,7 +146,8 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 			newSource as RelationalPlanNode,
 			this.materializationHint,
 			this.isRecursive,
-			this.materialize
+			this.materialize,
+			this.tableDescriptor
 		);
 	}
 
@@ -146,7 +159,11 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 		const recursiveText = this.isRecursive ? 'RECURSIVE ' : '';
 		const columnsText = this.columns ? `(${this.columns.join(', ')})` : '';
 		const materializationText = this.materializationHint ? ` ${this.materializationHint.toUpperCase()}` : '';
-		return `${recursiveText}CTE ${this.cteName}${columnsText}${materializationText}`;
+		// The resolved decision, which is NOT the hint: a data-modifying body is
+		// always buffered and a multi-referenced one usually is, hint or none.
+		// Matches RecursiveCTENode.toString().
+		const bufferedText = this.materialize ? ' [buffered]' : '';
+		return `${recursiveText}CTE ${this.cteName}${columnsText}${materializationText}${bufferedText}`;
 	}
 
 	override getLogicalAttributes(): Record<string, unknown> {

@@ -317,6 +317,8 @@ export interface CTECapable extends RelationalPlanNode {
 	readonly columns: string[] | undefined;
 	readonly materializationHint: 'materialized' | 'not_materialized' | undefined;
 	readonly isRecursive: boolean;
+	/** Stable identity for this CTE, preserved across optimizer rebuilds. */
+	readonly tableDescriptor: TableDescriptor;
 	getCTESource(): RelationalPlanNode;
 }
 

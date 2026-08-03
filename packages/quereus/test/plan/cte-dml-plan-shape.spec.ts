@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
+import { CTENode } from '../../src/planner/nodes/cte-node.js';
 import { serializePlanForGolden } from './_helpers.js';
 
 /**
@@ -180,5 +181,100 @@ describe('CTE / inline-subquery DML write target: plan-shape parity', () => {
 		const baseline = subtree(db, UPDATE_FORMS.named);
 		const divergent = subtree(db, "update t set color = 'x' where id = 2");
 		expect(divergent, 'a different seek-key literal must survive canonicalization').to.not.equal(baseline);
+	});
+});
+
+/** Every `CTENode` instance reachable from `root`, in discovery order. */
+function cteNodes(root: PlanNode): CTENode[] {
+	const found: CTENode[] = [];
+	const stack: PlanNode[] = [root];
+	const seen = new Set<PlanNode>();
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (seen.has(node)) continue;
+		seen.add(node);
+		if (node instanceof CTENode) found.push(node);
+		for (const child of node.getChildren()) stack.push(child);
+	}
+	return found;
+}
+
+/**
+ * A CTE whose body writes rows must run that write exactly once per statement
+ * execution, however many times the query names it. Two plan-level properties carry
+ * that guarantee, and each was independently broken before
+ * (`bug-dml-cte-executes-once-per-reference`):
+ *
+ *  1. **every** `CTENode` instance in the optimized plan carries `materialize = true`
+ *     — set at build time in planner/building/with.ts rather than left to the
+ *     reference-count gate in planner/cache/materialization-advisory.ts, which
+ *     undercounts (two mentions sharing an alias collapse to one
+ *     `CTEReferenceNode`, so the `CTENode` shows a single parent), and
+ *  2. all those instances share **one** `tableDescriptor` object — the key
+ *     `emitCTE` uses for its per-execution buffer. The optimizer does not promise a
+ *     single instance: the constant-folding pass (planner/analysis/const-pass.ts)
+ *     rebuilds a two-parent node once per parent path, so a `values`-bodied INSERT
+ *     really does end up as two `CTENode`s. Two descriptors would mean two buffers,
+ *     i.e. two writes.
+ *
+ * `test/logic/13.6-cte-dml-runs-once.sqllogic` pins the observable row-set and
+ * base-table state; this spec pins the plan-level invariants that produce them, so a
+ * regression names its own cause instead of surfacing as a mystery duplicate-key error.
+ */
+describe('data-modifying CTE: plan-shape invariants', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table w (k integer primary key, v integer)');
+		await db.exec('create table u (k integer primary key)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	// Both body shapes matter: a `values` body constant-folds (and so gets split into
+	// several CTENode instances), a `select … from u` body does not.
+	const DML_BODIES = {
+		'insert … values': "with c as (insert into w (k) values (1) returning k) select (select count(*) from c) a, (select count(*) from c) b",
+		'insert … select': "with c as (insert into w (k) select k from u returning k) select (select count(*) from c) a, (select count(*) from c) b",
+		update: 'with c as (update w set v = v + 1 returning k, v) select (select count(*) from c) a, (select count(*) from c) b',
+		delete: 'with c as (delete from w where k = 1 returning k) select (select count(*) from c) a, (select count(*) from c) b',
+		'insert, joined twice': 'with c as (insert into w (k) values (1) returning k) select count(*) n from c c1 join c c2 on c1.k = c2.k',
+		'insert, MATERIALIZED hint': 'with c as materialized (insert into w (k) values (1) returning k) select (select count(*) from c) a, (select count(*) from c) b',
+		// The hint is deliberately overridden: honoring it would license a second write.
+		'insert, NOT MATERIALIZED hint': 'with c as not materialized (insert into w (k) values (1) returning k) select (select count(*) from c) a, (select count(*) from c) b',
+		'insert, referenced once': 'with c as (insert into w (k) values (1) returning k) select k from c',
+	} as const;
+
+	for (const [label, sql] of Object.entries(DML_BODIES)) {
+		it(`${label}: every CTENode is materialized and all share one tableDescriptor`, () => {
+			const nodes = cteNodes(db.getPlan(sql));
+
+			expect(nodes.length, 'the DML-bodied CTE must survive into the optimized plan').to.be.greaterThan(0);
+			for (const node of nodes) {
+				expect(node.materialize, `CTENode ${node.cteName} (id ${node.id}) is not materialized`).to.equal(true);
+			}
+			const descriptors = new Set(nodes.map(n => n.tableDescriptor));
+			expect(descriptors.size, `${nodes.length} CTENode instance(s) carry ${descriptors.size} distinct descriptors`).to.equal(1);
+		});
+	}
+
+	// Anti-vacuity for the descriptor assert: prove the split this fix survives is real,
+	// i.e. that at least one covered shape genuinely yields two CTENode instances. If the
+	// optimizer ever stops splitting, this fails loudly rather than letting the
+	// single-descriptor assert quietly become a tautology for every case.
+	it('a constant-foldable DML body really is split into 2+ CTENode instances', () => {
+		const nodes = cteNodes(db.getPlan(DML_BODIES['insert … values']));
+		expect(nodes.length, 'expected the constant-folding pass to rebuild the shared CTENode per parent path')
+			.to.be.greaterThan(1);
+	});
+
+	// Guard the other direction: the build-time mark is scoped to writing bodies only.
+	// A read-only CTE keeps flowing through the advisory pass, which leaves a
+	// single-reference one unmaterialized (streaming, so an outer LIMIT can cut it off).
+	it('a SELECT-bodied CTE referenced once is NOT force-materialized', () => {
+		const nodes = cteNodes(db.getPlan('with c as (select k from u) select k from c'));
+		expect(nodes.length, 'the CTE must survive into the optimized plan').to.be.greaterThan(0);
+		for (const node of nodes) {
+			expect(node.materialize, `read-only CTENode ${node.cteName} was force-materialized`).to.equal(false);
+		}
 	});
 });

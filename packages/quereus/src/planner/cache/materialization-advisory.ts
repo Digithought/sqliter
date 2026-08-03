@@ -68,9 +68,11 @@ export class MaterializationAdvisory {
 		// Mark multi-referenced / MATERIALIZED-hinted CTEs for shared
 		// materialization at emission. Memoized by node identity so a CTENode
 		// shared by several CTEReferenceNode parents is rewritten ONCE and the
-		// parents keep pointing at the same marked instance — emitCTE keys its
-		// per-execution buffer on that shared node's plan id. (Recursive CTEs use
+		// parents keep pointing at the same marked instance. (Recursive CTEs use
 		// the descriptor count above instead — see markCTEMaterialization.)
+		// A data-modifying CTE is already marked at build time (planner/building/
+		// with.ts) and skips this gate entirely — its write must run once per
+		// execution regardless of reference count or hint.
 		const markMemo = new Map<PlanNode, PlanNode>();
 		const markedRoot = this.markCTEMaterialization(root, refGraph, recursiveRefsByDescriptor, markMemo);
 
@@ -136,6 +138,13 @@ export class MaterializationAdvisory {
 	 * opted into re-execution per reference); otherwise an explicit MATERIALIZED
 	 * hint or two-plus references trips the mark.
 	 *
+	 * A CTE with a data-modifying body never reaches here: it is built with
+	 * `materialize` already true, and the caller's `!node.materialize` guard short-
+	 * circuits. That is deliberate — this gate would get it wrong, because it reads a
+	 * reference count that undercounts (two mentions sharing an alias share one
+	 * CTEReferenceNode) and honors a NOT MATERIALIZED hint that would license a
+	 * second write.
+	 *
 	 * Recursive CTEs ({@link RecursiveCTENode}) do NOT flow through here — they run
 	 * through the working-table machinery (emitRecursiveCTE), not emitCTE, and are
 	 * marked by a dedicated branch in {@link markCTEMaterialization} that gates
@@ -187,7 +196,8 @@ export class MaterializationAdvisory {
 				newSource,
 				node.materializationHint,
 				node.isRecursive,
-				true
+				true,
+				node.tableDescriptor
 			);
 			log('Marked CTE %s for shared materialization', node.cteName);
 		} else if (node instanceof RecursiveCTENode && !node.materialize && (recursiveRefsByDescriptor.get(node.tableDescriptor) ?? 0) >= 2) {

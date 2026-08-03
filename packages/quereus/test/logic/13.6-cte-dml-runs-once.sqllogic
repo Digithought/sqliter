@@ -1,0 +1,186 @@
+-- 13.6-cte-dml-runs-once.sqllogic - a data-modifying CTE runs ONCE per statement
+--
+-- `with c as (insert/update/delete ... returning ...) select ...` must execute its
+-- write exactly once per statement execution, no matter how many times the rest of
+-- the query names `c`. Every mention then replays one buffer of RETURNING rows.
+--
+-- This held only accidentally before: buffering was gated on the CTE's parent count
+-- (two mentions sharing an alias collapse to ONE reference node, so the gate read
+-- "referenced once") and the buffer was keyed on the plan node's id (which the
+-- constant-folding pass can split into several ids for one CTE). A `values`-bodied
+-- INSERT folds to a table literal and hit both; a `select`-bodied one hit only the
+-- first. Both body shapes are covered below.
+
+-- ===== INSERT body, referenced twice via scalar subqueries =====
+
+create table t1 (k integer primary key, v integer default 0);
+-- run
+
+with c as (insert into t1 (k) values (1) returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+-- One row inserted, not two — the second mention replayed the buffer.
+select k, v from t1 order by k;
+→ [{"k":1,"v":0}]
+
+-- ===== INSERT body, referenced twice via a self-join =====
+
+create table t2 (k integer primary key);
+-- run
+
+with c as (insert into t2 (k) values (1) returning k)
+select count(*) as n from c c1 join c c2 on c1.k = c2.k;
+→ [{"n":1}]
+
+select k from t2 order by k;
+→ [{"k":1}]
+
+-- ===== INSERT body reading a real table (not constant-foldable) =====
+
+create table src (k integer primary key);
+insert into src values (7), (8);
+create table t3 (k integer primary key);
+-- run
+
+with c as (insert into t3 (k) select k from src returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":2,"b":2}]
+
+select k from t3 order by k;
+→ [{"k":7},{"k":8}]
+
+-- ===== UPDATE body, referenced twice =====
+-- The silent-corruption case: no error, plausible output, doubled increment.
+
+create table t4 (k integer primary key, v integer);
+insert into t4 values (1, 0), (2, 0);
+-- run
+
+with c as (update t4 set v = v + 1 returning k, v)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":2,"b":2}]
+
+-- v incremented once, not twice.
+select k, v from t4 order by k;
+→ [{"k":1,"v":1},{"k":2,"v":1}]
+
+-- ===== DELETE body, referenced twice =====
+-- Second mention must see the SAME returned rows, not an empty re-run.
+
+create table t5 (k integer primary key);
+insert into t5 values (1), (2), (3);
+-- run
+
+with c as (delete from t5 where k = 1 returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+select k from t5 order by k;
+→ [{"k":2},{"k":3}]
+
+-- ===== Explicit MATERIALIZED hint changes nothing =====
+
+create table t6 (k integer primary key);
+-- run
+
+with c as materialized (insert into t6 (k) values (1) returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+select k from t6 order by k;
+→ [{"k":1}]
+
+-- ===== Explicit NOT MATERIALIZED does NOT license a second write =====
+-- Correctness beats the hint: re-executing the body would mean writing twice.
+-- (Same call the recursive-CTE branch already makes.)
+
+create table t7 (k integer primary key);
+-- run
+
+with c as not materialized (insert into t7 (k) values (1) returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+select k from t7 order by k;
+→ [{"k":1}]
+
+-- ===== NOT MATERIALIZED on an UPDATE body =====
+
+create table t8 (k integer primary key, v integer);
+insert into t8 values (1, 0);
+-- run
+
+with c as not materialized (update t8 set v = v + 1 returning k, v)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+select k, v from t8 order by k;
+→ [{"k":1,"v":1}]
+
+-- ===== Three mentions =====
+
+create table t9 (k integer primary key, v integer);
+insert into t9 values (1, 0);
+-- run
+
+with c as (update t9 set v = v + 5 returning k, v)
+select (select count(*) from c) as a, (select sum(v) from c) as b, (select max(k) from c) as d;
+→ [{"a":1,"b":5,"d":1}]
+
+select k, v from t9 order by k;
+→ [{"k":1,"v":5}]
+
+-- ===== Control: referenced ONCE still works =====
+
+create table t10 (k integer primary key);
+-- run
+
+with c as (insert into t10 (k) values (1) returning k) select k from c;
+→ [{"k":1}]
+
+select k from t10 order by k;
+→ [{"k":1}]
+
+-- ===== Control: referenced ZERO times =====
+-- Out of scope here: the planner drops an unreferenced CTE entirely, so the write
+-- never happens (a known deviation from SQLite/PostgreSQL, tracked separately in
+-- backlog `bug-unreferenced-dml-cte-never-runs`). Pinned so this fix does not
+-- accidentally change it in either direction without a deliberate decision.
+
+create table t11 (k integer primary key);
+-- run
+
+with c as (insert into t11 (k) values (1) returning k) select 42 as x;
+→ [{"x":42}]
+
+select count(*) as cnt from t11;
+→ [{"cnt":0}]
+
+-- ===== Control: a plain SELECT-bodied CTE is untouched =====
+-- Re-evaluating a read-only body is a performance question, not a correctness one;
+-- the row-set answer is identical either way. Pinned so the DML rule did not leak.
+
+create table t12 (k integer primary key);
+insert into t12 values (1), (2);
+-- run
+
+with c as (select k from t12)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":2,"b":2}]
+
+-- Cleanup
+drop table t1;
+drop table t2;
+drop table src;
+drop table t3;
+drop table t4;
+drop table t5;
+drop table t6;
+drop table t7;
+drop table t8;
+drop table t9;
+drop table t10;
+drop table t11;
+drop table t12;
+-- run

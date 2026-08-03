@@ -118,18 +118,20 @@ pair).
 
 A non-recursive CTE referenced more than once (or hinted `MATERIALIZED`) is
 marked `materialize` by the optimizer's materialization-advisory pass (see
-`docs/optimizer.md` § Materialization Advisory). `emitCTE`
+`docs/optimizer.md` § Materialization Advisory); a CTE with a **data-modifying
+body** is marked at build time instead (see below). `emitCTE`
 (`src/runtime/emit/cte.ts`) then evaluates the CTE **exactly once per statement
 execution**, matching standard SQL `MATERIALIZED` semantics:
 
 - Every `CTEReferenceNode` emits its own copy of the CTE's source subtree
-  (`emitPlanNode` has no memoization), but all references share one `CTENode`
-  instance — so each reference's `emitCTE` closure agrees on the buffer key,
-  the CTENode's plan id.
+  (`emitPlanNode` has no memoization). References usually share one `CTENode`
+  instance, but that is not guaranteed — the constant-folding pass rebuilds a
+  node reachable from two parents once per parent path — so the buffer key is
+  the CTE's `tableDescriptor`, an identity object minted when the CTE is built
+  and threaded through every rebuild. All copies therefore agree on the key.
 - The buffer lives on the per-execution `RuntimeContext`
-  (`ctx.cteMaterializations`, a `Map<string | TableDescriptor, Promise<Row[]>>` —
-  non-recursive CTEs key by plan-id string, recursive CTEs by descriptor object;
-  the two key spaces never collide). The first
+  (`ctx.cteMaterializations`, a `Map<TableDescriptor, Promise<Row[]>>`; recursive
+  CTEs key the same map by their working-table descriptor). The first
   reference to run stores the buffer *promise* synchronously (before any
   `await`), then drives its source to completion; a second reference that
   interleaves — e.g. the two sides of a nested-loop self-join — finds the
@@ -144,6 +146,19 @@ execution**, matching standard SQL `MATERIALIZED` semantics:
 Un-marked CTEs (single reference without a `MATERIALIZED` hint, or an explicit
 `NOT MATERIALIZED`) keep the pure streaming path — early exit such as `LIMIT`
 never drains the source.
+
+**Data-modifying CTEs are always buffered.** A CTE whose body is an `INSERT` /
+`UPDATE` / `DELETE` (`with c as (insert into t … returning …) select …`) is
+constructed with `materialize` already true (`planner/building/with.ts`), so it
+never reaches the reference-count gate. Its write must happen exactly once per
+statement execution however many times the query names `c`, and every mention
+replays the one buffer of `RETURNING` rows. The hint is overridden here: `NOT
+MATERIALIZED` on a writing body would license a second write, so correctness
+wins — the same call the recursive branch below makes. (Streaming a write body
+per reference is what produced `UNIQUE constraint failed` on a doubly-referenced
+`INSERT` and a silent double-increment on an `UPDATE`.) An **unreferenced**
+data-modifying CTE is a separate, still-open gap: the planner drops it entirely,
+so the write never runs — SQLite and PostgreSQL both run it.
 
 **Recursive CTEs** run through the working-table machinery (`emitRecursiveCTE`),
 not `emitCTE`, but follow the same buffer-once-replay pattern when referenced

@@ -135,13 +135,35 @@ export function buildCommonTableExpr(
 	// `undefined` so the materialization-advisory pass may still decide to
 	// materialize it when it is referenced more than once; a synthesized
 	// 'not_materialized' default would read as an explicit user opt-out there.
+	//
+	// A data-modifying body is a different matter: its write must happen exactly
+	// ONCE per statement execution no matter how many times the CTE is named, so
+	// `materialize` is forced on here rather than left to the advisory pass. The
+	// advisory's reference count cannot carry that decision — two mentions with the
+	// same alias share one CTEReferenceNode, so the CTENode sees a single parent and
+	// the gate reads "referenced once" while both mentions still emit and run the
+	// body. The hint is deliberately overridden too: NOT MATERIALIZED on a writing
+	// body would license re-execution, i.e. a second write. Correctness beats the
+	// hint, the same call the recursive-CTE branch makes (see the comment in
+	// MaterializationAdvisory.markCTEMaterialization). Every mention then replays the
+	// one buffer of RETURNING rows.
+	//
+	// NOTE: this also takes a data-modifying CTE off the streaming path, so its whole
+	// RETURNING set is held in memory for the statement even when referenced once and
+	// consumed under a LIMIT. Unavoidable for the multi-reference case, and today's
+	// RETURNING sets are small; if a bulk write's RETURNING ever needs to stream,
+	// buffering would have to become conditional on the reference count — which means
+	// first fixing the undercount described above, not relaxing this flag.
+	const isDataModifying = cte.query.type === 'insert' || cte.query.type === 'update' || cte.query.type === 'delete';
+
 	return new CTENode(
 		ctx.scope,
 		cte.name,
 		cte.columns,
 		query,
 		cte.materializationHint,
-		isRecursive
+		isRecursive,
+		isDataModifying
 	);
 }
 

@@ -105,18 +105,15 @@ export type RuntimeContext = {
 	 * source subtree. A fresh RuntimeContext per execution resets the map between
 	 * prepared-statement runs (no stale replay). Mirrors {@link cacheStates}.
 	 *
-	 * Two key kinds coexist here (their key spaces never collide — string vs
-	 * object):
-	 * - {@link emitCTE} keys by the shared CTENode's plan id (a string); all
-	 *   non-recursive references share one CTENode instance, so their closures
-	 *   agree on the key.
-	 * - {@link emitRecursiveCTE} keys by the shared `TableDescriptor` object. A
-	 *   multi-referenced recursive CTE is DUPLICATED into distinct RecursiveCTENode
-	 *   instances by earlier optimizer passes (distinct plan ids), but every copy
-	 *   preserves the one `tableDescriptor` identity through `withChildren`, so the
-	 *   descriptor — not the plan id — is what the copies agree on.
+	 * Both {@link emitCTE} and {@link emitRecursiveCTE} key by the CTE's
+	 * `TableDescriptor` — the identity object minted when the CTE is built and
+	 * threaded through every optimizer rebuild. The plan id would NOT do: the
+	 * optimizer may split one CTE node into several instances (a multi-referenced
+	 * recursive CTE is duplicated outright; a node reachable from two parents is
+	 * rebuilt once per path by the constant-folding pass), and per-id keying would
+	 * give each copy a private buffer and re-drive the source.
 	 */
-	cteMaterializations?: Map<string | TableDescriptor, Promise<Row[]>>;
+	cteMaterializations?: Map<TableDescriptor, Promise<Row[]>>;
 	/**
 	 * Per-execution materialized lookup sets for uncorrelated, functional
 	 * `x IN (subquery)` probes ({@link import('./emit/subquery.js').emitIn}), keyed

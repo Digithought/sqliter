@@ -19,12 +19,17 @@ export function emitCTE(plan: CTENode, ctx: EmissionContext): Instruction {
 		}
 
 		// Shared materialization: every reference to this CTE shares one
-		// per-execution buffer keyed by the CTENode's plan id (all references
-		// point at the same CTENode instance, so each reference's separately
-		// emitted closure agrees on the key). Each reference emits its own copy
-		// of the source subtree; only the buffer owner ever iterates one.
-		const buffers = (rctx.cteMaterializations ??= new Map<string, Promise<Row[]>>());
-		let bufferPromise = buffers.get(plan.id);
+		// per-execution buffer keyed by the CTE's stable `tableDescriptor`.
+		// NOT the plan id: references usually point at one CTENode instance, but
+		// the optimizer may split it into several (the constant-folding pass
+		// rebuilds a two-parent node once per parent path), and each copy would
+		// then own a private buffer — re-driving the source, which for a
+		// data-modifying body means writing twice. The descriptor is threaded
+		// through every rebuild, so all copies agree on the key. Mirrors
+		// emitRecursiveCTE. Each reference emits its own copy of the source
+		// subtree; only the buffer owner ever iterates one.
+		const buffers = (rctx.cteMaterializations ??= new Map<typeof plan.tableDescriptor, Promise<Row[]>>());
+		let bufferPromise = buffers.get(plan.tableDescriptor);
 		if (!bufferPromise) {
 			// First reference to run owns the single source drive. Create and
 			// store the promise SYNCHRONOUSLY (before any await) so a second
@@ -47,7 +52,7 @@ export function emitCTE(plan: CTENode, ctx: EmissionContext): Instruction {
 			// would otherwise surface an unhandled rejection. References that are
 			// still awaiting observe the rejection through their own await.
 			bufferPromise.catch(() => { /* observed by awaiting references */ });
-			buffers.set(plan.id, bufferPromise);
+			buffers.set(plan.tableDescriptor, bufferPromise);
 		}
 
 		const rows = await bufferPromise;
