@@ -101,6 +101,16 @@ Whether *any* failure should still auto-disable is the open question. Options wo
 
 Note that the failure message now also tells the user the plugin was disabled and how to
 re-enable it (that part landed with the https-plugin-loading work); it does not address the
-policy itself. Re-enabling by name is only possible when the plugin's manifest resolved —
+policy itself.
+
+**Interaction with plugin hash pinning.** `feat-cli-plugin-pinning` carves one specific
+failure out of this catch block: when a load is refused because the module's bytes no longer
+match the hash the user pinned, the record is *not* disabled (the hint would be wrong — the
+plugin has to be re-trusted or unpinned, not merely re-enabled). That is a narrow exception,
+deliberately not a general answer to the policy question above. Whoever settles Arm B should
+fold that case into whatever general rule they land on rather than leaving two mechanisms.
+The third option listed above — distinguish failures that indict the plugin from transport
+failures — gets easier once that work lands, since `dynamicLoadModule` will preserve the
+original error as `cause` instead of flattening everything into one string. Re-enabling by name is only possible when the plugin's manifest resolved —
 that gap was closed by `bug-cli-plugin-commands-unusable-without-manifest`, which has since
 completed.
