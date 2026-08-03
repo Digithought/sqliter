@@ -85,7 +85,9 @@ export function resolveTableSchema(
 	if (!tableSchema) {
 		// Generate helpful error message
 		const searchedSchemas = schemaPath || ['main', 'temp'];
-		const existsIn = ctx.schemaManager.findSchemasContainingTable(tableName);
+		// Views count here: an unqualified name resolves through the path across
+		// tables and views alike, so an off-path VIEW is exactly as suggestible.
+		const existsIn = ctx.schemaManager.findSchemasContainingRelation(tableName);
 
 		let errorMsg = `Table '${tableName}' not found in schema path: ${searchedSchemas.join(', ')}`;
 

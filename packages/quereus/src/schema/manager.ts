@@ -716,18 +716,20 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Finds all schemas that contain a table with the given name.
-	 * Useful for generating helpful error messages.
+	 * Finds all schemas holding a relation (table OR view) with the given name.
+	 * Useful for generating helpful "did you mean" error messages — an
+	 * unqualified name resolves through the path across both kinds
+	 * ({@link findSchemaItem}), so the hint must span both too.
 	 *
-	 * @param tableName Name of the table to search for
-	 * @returns Array of schema names that contain the table
+	 * @param itemName Name of the relation to search for
+	 * @returns Array of schema names that hold a relation of that name
 	 */
-	findSchemasContainingTable(tableName: string): string[] {
-		const lowerTableName = tableName.toLowerCase();
+	findSchemasContainingRelation(itemName: string): string[] {
+		const lowerItemName = itemName.toLowerCase();
 		const schemaNames: string[] = [];
 
 		for (const [schemaName, schema] of this.schemas) {
-			if (schema.getTable(lowerTableName)) {
+			if (schema.getTable(lowerItemName) || schema.getView(lowerItemName)) {
 				schemaNames.push(schemaName);
 			}
 		}
@@ -835,6 +837,10 @@ export class SchemaManager {
 	 */
 	findSchemaItem(itemName: string, dbName?: string, schemaPath?: string[]): TableSchema | ViewSchema | undefined {
 		if (dbName) return this.getSchemaItem(dbName, itemName);
+		// NOTE: the no-path fallback restates `_findTable`'s default order. The
+		// session `schema_path` option always yields a path in practice, so this
+		// branch is effectively dead — but if the default order ever changes,
+		// change it in both or the two resolvers disagree.
 		const path = schemaPath && schemaPath.length > 0 ? schemaPath : ['main', 'temp'];
 		for (const schemaName of path) {
 			const item = this.getSchemaItem(schemaName, itemName);

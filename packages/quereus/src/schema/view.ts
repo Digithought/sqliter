@@ -32,6 +32,10 @@ export interface ViewSchema {
  * Narrowing guard: true iff `item` is a view (not a table / maintained table).
  * A view carries a top-level `selectAst`; a `TableSchema` does not — a
  * maintained table's body hangs off `derivation.selectAst` instead.
+ *
+ * NOTE: structural, not a tagged union. If `TableSchema` ever gains a top-level
+ * `selectAst`, every caller silently misclassifies tables as views — add a
+ * discriminant field to both schemas then rather than picking another key.
  */
 export function isViewSchema(item: TableSchema | ViewSchema | undefined): item is ViewSchema {
 	return item !== undefined && 'selectAst' in item;

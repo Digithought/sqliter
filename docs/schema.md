@@ -318,7 +318,7 @@ lives in [view-persistence.md](view-persistence.md).
 
 ## Schema Path
 
-The schema path controls search order for unqualified table names. `Database`-level methods:
+The schema path controls search order for unqualified **relation** names — tables and views alike. Each entry's tables and views are checked together, so the first schema holding that name wins whatever its kind. `Database`-level methods:
 
 | Method | Description |
 |--------|-------------|
@@ -342,7 +342,7 @@ See the [Usage Guide](usage.md) for the consumer-facing declarative schema workf
 
 | Option | Effect |
 |--------|--------|
-| `schema_path` | Default search order for unqualified table names |
+| `schema_path` | Default search order for unqualified relation (table / view) names |
 | `default_column_nullability` | Column nullability default — `'not_null'` (Third Manifesto default) or `'nullable'` |
 
 See the [Usage Guide](usage.md) for the full options and pragmas reference.

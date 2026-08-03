@@ -562,11 +562,10 @@ export function buildInsertStmt(
 	const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
 	const tableReference = tableRetrieve.tableRef; // Extract the actual TableReferenceNode
 
-	// Backstop on the RESOLVED table: the dispatch above defaults an unqualified
-	// name to the current schema, but buildTableReference resolves through the
-	// schema path, which can land on a maintained table the dispatch missed. A
-	// direct write would corrupt derived contents — route it through the same
-	// view-mutation rewrite.
+	// Backstop on the RESOLVED table: the dispatch above and buildTableReference
+	// walk the same path today, so this should be unreachable — but they are two
+	// resolvers, and a direct write to a maintained table would corrupt derived
+	// contents. Keep the belt: route any that slips through to the same rewrite.
 	const insertResolved = tableReference.tableSchema;
 	if (isMaintainedTable(insertResolved)) {
 		return buildViewMutation(contextWithSchemaPath, maintainedTableViewLike(insertResolved), { op: 'insert', stmt });

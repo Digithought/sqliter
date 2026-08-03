@@ -309,7 +309,7 @@ for how the captured artifact is structured.
 
 #### 9.2.6 schema_path
 
-Sets or queries the default schema search path used when resolving unqualified table names. The value is a comma-separated list of schema names.
+Sets or queries the default schema search path used when resolving unqualified relation names — tables, views and materialized views alike. The value is a comma-separated list of schema names.
 
 **Values:**
 - Comma-separated list of schema names (e.g., `'main,extensions,plugins'`)

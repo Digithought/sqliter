@@ -175,14 +175,14 @@ SELECT * FROM temp.rv;
 → [{"id":1,"x":10}]
 
 -- Test 21: with `temp` OFF the session path an unqualified view is not found —
--- the same answer an unqualified table in `temp` gets
+-- the same answer an unqualified table in `temp` gets, hint included
 PRAGMA schema_path = 'main';
 
 SELECT * FROM rv;
--- error: not found
+-- error: Did you mean: temp.rv?
 
 SELECT * FROM rt;
--- error: not found
+-- error: Did you mean: temp.rt?
 
 -- Test 22: with `temp` ON the path both resolve
 PRAGMA schema_path = 'temp,main';
@@ -262,8 +262,68 @@ SELECT tag FROM main.dual_name;
 SELECT tag FROM temp.dual_name;
 → [{"tag":"view-in-temp"}]
 
+-- Test 27: the same ordering governs a WRITE target, not just a read
+CREATE TABLE temp.dn_w_src (id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO temp.dn_w_src VALUES (1, 'view-in-temp');
+CREATE VIEW temp.dn_w AS SELECT id, tag FROM dn_w_src;
+CREATE TABLE main.dn_w (id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO main.dn_w VALUES (1, 'table-in-main');
+
+PRAGMA schema_path = 'main,temp';
+
+UPDATE dn_w SET tag = 'wrote-main' WHERE id = 1;
+
+SELECT tag FROM main.dn_w;
+→ [{"tag":"wrote-main"}]
+
+SELECT tag FROM temp.dn_w_src;
+→ [{"tag":"view-in-temp"}]
+
+PRAGMA schema_path = 'temp,main';
+
+UPDATE dn_w SET tag = 'wrote-temp-view' WHERE id = 1;
+
+SELECT tag FROM main.dn_w;
+→ [{"tag":"wrote-main"}]
+
+SELECT tag FROM temp.dn_w_src;
+→ [{"tag":"wrote-temp-view"}]
+
 PRAGMA schema_path = 'main';
+
+DROP VIEW temp.dn_w;
+DROP TABLE temp.dn_w_src;
+DROP TABLE main.dn_w;
 
 DROP VIEW temp.dual_name;
 DROP TABLE temp.dn_src;
 DROP TABLE main.dual_name;
+
+-- Test 28: a user-declared (non-`temp`) schema behaves identically — the `temp`
+-- coverage above must not be reading a temp-only special case.
+CREATE TABLE myapp.ut (id INTEGER PRIMARY KEY, x INTEGER);
+INSERT INTO myapp.ut VALUES (1, 10);
+CREATE VIEW myapp.uv AS SELECT id, x FROM ut;
+
+SELECT * FROM uv;
+-- error: Did you mean: myapp.uv?
+
+PRAGMA schema_path = 'myapp,main';
+
+SELECT * FROM uv;
+→ [{"id":1,"x":10}]
+
+INSERT INTO uv (id, x) VALUES (2, 20);
+
+SELECT id, x FROM myapp.ut ORDER BY id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+DELETE FROM uv WHERE id = 2;
+
+PRAGMA schema_path = 'main';
+
+SELECT id, x FROM uv WITH SCHEMA myapp;
+→ [{"id":1,"x":10}]
+
+DROP VIEW myapp.uv;
+DROP TABLE myapp.ut;

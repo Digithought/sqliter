@@ -459,7 +459,8 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	// Build the body plan and gate it (joins / aggregates / set-ops / recursive
 	// CTEs / VALUES bodies are rejected here). A STORED body plans on its own
 	// home-schema path, not the writing statement's — see `bodyPlanningContext`.
-	const bodyPlan = buildSelectStmt(bodyPlanningContext(ctx, view), sel);
+	const bodyCtx = bodyPlanningContext(ctx, view);
+	const bodyPlan = buildSelectStmt(bodyCtx, sel);
 	if (!isRelationalNode(bodyPlan)) {
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
@@ -503,7 +504,7 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	const bodySource = ctx.schemaManager.findSchemaItem(
 		fromTable.table.name,
 		fromTable.table.schema,
-		bodyPlanningContext(ctx, view).schemaPath,
+		bodyCtx.schemaPath,
 	);
 	if (isViewSchema(bodySource)) {
 		raiseMutationDiagnostic({
@@ -518,11 +519,11 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	// write-through + the maintenance cascade) is deferred; reject cleanly. The
 	// source→backing maintenance cascade is unaffected — that is the read/maintain
 	// direction; this guards only the MV-name *write* direction.
-	// Checked both by name (on the body's home path, resolved above) and on the
-	// PLAN-resolved base table — the latter can reach a maintained table one
-	// inlining level down that the name lookup misses.
-	if ((!isViewSchema(bodySource) && isMaintainedTable(bodySource))
-		|| isMaintainedTable(baseTable)) {
+	// Checked both by name (on the body's home path, resolved above — the branch
+	// above already threw for a view, so `bodySource` is a table or nothing) and
+	// on the PLAN-resolved base table — the latter can reach a maintained table
+	// one inlining level down that the name lookup misses.
+	if (isMaintainedTable(bodySource) || isMaintainedTable(baseTable)) {
 		raiseMutationDiagnostic({
 			reason: 'nested-view',
 			table: view.name,

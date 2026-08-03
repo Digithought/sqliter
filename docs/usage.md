@@ -564,7 +564,7 @@ pragma default_column_nullability;
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `schema_path` | string | `'main'` | Comma-separated schema search path for unqualified table names. Alias: `search_path` |
+| `schema_path` | string | `'main'` | Comma-separated schema search path for unqualified relation (table / view) names. Alias: `search_path` |
 | `default_column_nullability` | string | `'not_null'` | Default nullability for columns: `'not_null'` (Third Manifesto) or `'nullable'` (SQL standard). Aliases: `column_nullability_default`, `nullable_default` |
 | `default_vtab_module` | string | `'memory'` | Default virtual table module used for `create table` without `using` clause |
 | `default_vtab_args` | object | `{}` | Default arguments passed to the default virtual table module |
@@ -955,7 +955,7 @@ See the [Memory Table documentation](./memory-table.md) for more details on the 
 
 ### Working with Multiple Schemas
 
-Quereus supports organizing tables into multiple named schemas for better modularity. Unqualified table names can be resolved using a flexible search path system.
+Quereus supports organizing tables into multiple named schemas for better modularity. Unqualified relation names — tables, views and materialized views alike — are resolved using a flexible search path system.
 
 ```typescript
 import { Database } from '@quereus/quereus';
@@ -1000,6 +1000,8 @@ for await (const row of db.eval(`
 2. `WITH SCHEMA` clause - Per-query explicit search path
 3. `PRAGMA schema_path` / `db.setSchemaPath()` - Session default
 4. Default schema (`main`) - Final fallback
+
+The path is walked one schema at a time, and each entry's tables **and** views are checked together, so the first schema holding an object of that name wins regardless of kind — a table named `x` in an earlier entry beats a view named `x` in a later one. (Within one schema a table and a view cannot share a name; `create table` and `create view` each reject a name the other already holds.)
 
 A **stored body** (a view or materialized-view definition) is the exception: it resolves its unqualified names against the owning object's own schema first, then the session default path — never the reading statement's `WITH SCHEMA` path. So a view declared next to its tables in a non-`main` schema reads correctly under any session path.
 
