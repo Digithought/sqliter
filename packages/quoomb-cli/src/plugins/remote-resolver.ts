@@ -9,7 +9,7 @@
  */
 
 import chalk from 'chalk';
-import { installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
+import { hashRemoteModule, installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
 import type { RemoteModuleFetch } from '@quereus/plugin-loader';
 
 /**
@@ -23,7 +23,53 @@ import type { RemoteModuleFetch } from '@quereus/plugin-loader';
  */
 const lastFetchByUrl = new Map<string, RemoteModuleFetch>();
 
+/**
+ * Expected hashes derived from the plugin records in `~/.quoomb/plugins.json`.
+ * Keyed by {@link normalizeUrlKey}, for the same reason {@link lastFetchByUrl}
+ * is: a record holds whatever the user typed, the resolver is handed the parsed
+ * href.
+ */
+const pinnedHashByUrl = new Map<string, string>();
+
 let installed = false;
+
+/**
+ * Replaces the record-derived pin table wholesale, so removing or unpinning a
+ * plugin drops its pin. Re-synced whenever the records change, which is what
+ * makes an unpin take effect in the same session rather than at the next start.
+ *
+ * Callers pass only the records that are actually pinned *and* have a recorded
+ * hash; a URL held by both a pinned and an unpinned record is therefore pinned.
+ * The pin table is per-URL and there is no honest way to apply two policies to
+ * one download.
+ *
+ * NOTE: two pinned records for the same URL with *different* hashes cannot both
+ * be satisfied. The first entry wins, so the outcome is at least deterministic
+ * (record order in `plugins.json`). Only reachable by hand-editing that file —
+ * `.plugin install` refuses a URL that is already installed.
+ *
+ * A second source — hashes declared in `quoomb.config.json` — is planned; when it
+ * lands it takes precedence over these, which is why {@link lookupPin} stays
+ * private.
+ */
+export function setRecordPinnedHashes(pins: Iterable<{ url: string; sha256: string }>): void {
+	pinnedHashByUrl.clear();
+	for (const pin of pins) {
+		const key = normalizeUrlKey(pin.url);
+		if (!pinnedHashByUrl.has(key)) {
+			pinnedHashByUrl.set(key, pin.sha256);
+		}
+	}
+}
+
+/**
+ * The hash `url` must serve, or undefined when it is not pinned. Deliberately
+ * not exported: the resolver asks through the closure below, so a second pin
+ * source can slot in ahead of the record source without touching callers.
+ */
+function lookupPin(url: string): string | undefined {
+	return pinnedHashByUrl.get(normalizeUrlKey(url));
+}
 
 /**
  * Installs the Node remote-module resolver. Called from every CLI entry point
@@ -36,6 +82,7 @@ export function installRemotePluginResolver(): void {
 	installed = true;
 
 	installNodeRemoteModuleResolver({
+		expectedHash: (url: string) => lookupPin(url),
 		onFetched: (info: RemoteModuleFetch) => {
 			lastFetchByUrl.set(normalizeUrlKey(info.url), info);
 			console.log(chalk.gray(
@@ -51,6 +98,22 @@ export function installRemotePluginResolver(): void {
  */
 export function getLastFetchedHash(url: string): string | undefined {
 	return lastFetchByUrl.get(normalizeUrlKey(url))?.sha256;
+}
+
+/**
+ * Fetches `url` and reports what it serves right now — same transport checks and
+ * size cap as a load, but nothing is written to disk and nothing is imported.
+ * `.plugin trust` uses it to adopt a new version without running it first.
+ *
+ * This is a *separate* fetch from any load that follows, so the bytes can change
+ * in between and a pinned load then fails. That fails closed and is acceptable;
+ * the digest is not a promise about the next load.
+ *
+ * Wrapped here rather than imported at the call site so the Node-only
+ * `@quereus/plugin-loader/node` subpath stays confined to this module.
+ */
+export async function fetchRemoteModuleHash(url: string): Promise<RemoteModuleFetch> {
+	return await hashRemoteModule(new URL(url));
 }
 
 /**

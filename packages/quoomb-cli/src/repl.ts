@@ -3,7 +3,7 @@ import { Database, formatErrorChain, unwrapError } from '@quereus/quereus';
 import { loadPluginsFromConfig, interpolateConfigEnvVars, type QuoombConfig } from '@quereus/plugin-loader';
 import chalk from 'chalk';
 import { DotCommands } from './commands/dot-commands.js';
-import { handleDotCommand, loadEnabledPlugins } from './commands/dot-commands.js';
+import { handleDotCommand, loadEnabledPlugins, syncSavedPluginPins } from './commands/dot-commands.js';
 
 interface REPLOptions {
   json?: boolean;
@@ -52,6 +52,9 @@ export class REPL {
     // Load plugins from config if provided and autoload is enabled
     if (this.options.config && this.options.autoload !== false) {
       try {
+        // A config-declared URL that a saved record pins is still pinned; this
+        // load does not go through the record path that would sync it.
+        await syncSavedPluginPins();
         const config = interpolateConfigEnvVars(this.options.config);
         if (config.autoload !== false) {
           await loadPluginsFromConfig(this.db, config);

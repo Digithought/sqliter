@@ -68,13 +68,16 @@ In interactive mode, use dot-commands for meta operations:
 
 | Command | Description |
 |---------|-------------|
-| `.plugin install <url>` | Install a plugin from an `https:` or `file:` module URL |
+| `.plugin install <url> [--pin]` | Install a plugin from an `https:` or `file:` module URL |
 | `.plugin list` | List installed plugins, with their name, version and URL |
 | `.plugin enable <name\|url>` | Enable and load a plugin |
 | `.plugin disable <name\|url>` | Disable a plugin (unloaded on next start) |
 | `.plugin remove <name\|url>` | Forget a plugin entirely |
 | `.plugin config <name\|url> [key=value ...]` | Show or set the plugin's settings |
 | `.plugin reload <name\|url>` | Re-fetch and re-register a plugin |
+| `.plugin pin <name\|url>` | Require the recorded hash before loading |
+| `.plugin unpin <name\|url>` | Go back to warning after the fact |
+| `.plugin trust <name\|url> [hash]` | Record a new expected hash (fetches and hashes when omitted) |
 
 Installed plugins live in `~/.quoomb/plugins.json` and enabled ones load at startup.
 
@@ -85,6 +88,32 @@ gist — so a plugin without one is named after the last segment of its URL
 shows is the one the other subcommands accept, and the install URL always works
 as an identifier too. If two plugins end up sharing a derived name, the
 subcommands say so and ask for a URL rather than guessing.
+
+### Pinning a remote plugin
+
+There is no cached copy of a plugin installed from an `https:` URL: every load
+re-downloads and re-runs whatever that URL serves *now*. By default the CLI
+records the SHA-256 of what it downloaded and **warns** when that changes — after
+the new code has already loaded.
+
+Pinning turns that into a refusal. `.plugin install <url> --pin`, or
+`.plugin pin <name>` for an already-installed one, marks the record so its
+recorded hash is checked *before* the module is written to disk or imported;
+bytes that do not match never run. Pinning is off unless asked for, and applies
+only to `https:` plugins — a `file:` plugin is loaded directly, with no download
+to verify.
+
+When the code behind a pinned URL changes, the load is refused, the plugin is
+left enabled, and the CLI names the two ways out:
+
+- `.plugin trust <name>` — fetch and hash the new version *without* running it,
+  print the old and new digests, and record the new one. Pass a digest
+  (`.plugin trust <name> <sha256>`) to accept a version you verified elsewhere,
+  which fetches nothing at all. Neither form loads the plugin; run
+  `.plugin reload <name>` when you are satisfied.
+- `.plugin unpin <name>` — back to warn-after-the-fact.
+
+Both take effect immediately, in the same session.
 
 ## Options
 

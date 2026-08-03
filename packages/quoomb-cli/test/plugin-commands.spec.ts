@@ -9,20 +9,41 @@
  * install URL itself. Covered here: that round-trip, the manifest-name path it
  * had to leave alone, URL lookup, ambiguous derived names, a `package.json`
  * without a `name`, writing config values, and the autoload failure hint.
+ *
+ * The `pinning` block covers the opt-in refusal path: `routes` can re-serve a
+ * different body for the same URL, which is the "the remote code changed"
+ * fixture, and the replacement body sets a global when it evaluates, so a test
+ * can tell a refused load from a load that merely reported a mismatch.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 import { Database } from '@quereus/quereus';
+import { dynamicLoadModule } from '@quereus/plugin-loader';
 import type { PluginRecord } from '@quereus/plugin-loader';
-import { handleDotCommand, loadEnabledPlugins } from '../src/commands/dot-commands.js';
-import { installRemotePluginResolver } from '../src/plugins/remote-resolver.js';
+import { handleDotCommand, loadEnabledPlugins, syncSavedPluginPins } from '../src/commands/dot-commands.js';
+import { installRemotePluginResolver, setRecordPinnedHashes } from '../src/plugins/remote-resolver.js';
 import type { Interface as ReadlineInterface } from 'node:readline';
 
 const PLUGIN_SOURCE = 'export default function register() { return {}; }\n';
+/**
+ * The same module, changed — as remote code served from a stable URL can be.
+ * It marks a global as it evaluates, so a test can assert that a refused load
+ * never ran the module body rather than only that it complained about it.
+ */
+const V2_MARKER = '__quoombPluginV2Evaluated';
+const PLUGIN_SOURCE_V2 =
+	`globalThis.${V2_MARKER} = true;\nexport default function register() { return {}; }\n`;
+
+const sha256 = (source: string): string =>
+	createHash('sha256').update(Buffer.from(source, 'utf8')).digest('hex');
+
+const v2Evaluated = (): boolean =>
+	(globalThis as unknown as Record<string, unknown>)[V2_MARKER] === true;
 
 const MODULE_URL_NO_MANIFEST = 'https://plugins.example.test/dist/plain.mjs';
 const MODULE_URL_WITH_MANIFEST = 'https://plugins.example.test/dist/named/plugin.mjs';
@@ -35,9 +56,11 @@ describe('.plugin subcommands', () => {
 	let logSpy: ReturnType<typeof vi.spyOn>;
 	/** URL → response, consulted by the stubbed `fetch`; anything else 404s. */
 	let routes: Map<string, () => Response>;
+	/** Every call the stubbed `fetch` saw, so a test can assert none happened. */
+	let fetchCount: number;
 
-	const serveModule = (url: string): void => {
-		routes.set(url, () => new Response(PLUGIN_SOURCE, { status: 200, headers: { 'content-type': 'text/javascript' } }));
+	const serveModule = (url: string, source: string = PLUGIN_SOURCE): void => {
+		routes.set(url, () => new Response(source, { status: 200, headers: { 'content-type': 'text/javascript' } }));
 	};
 
 	/** Serves a `package.json` beside `moduleUrl`, where the loader probes for it. */
@@ -55,12 +78,15 @@ describe('.plugin subcommands', () => {
 		db = new Database();
 		logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 		routes = new Map();
+		fetchCount = 0;
 		serveModule(MODULE_URL_NO_MANIFEST);
 		serveModule(MODULE_URL_WITH_MANIFEST);
 		serveManifest(MODULE_URL_WITH_MANIFEST, { name: 'named-plugin', version: '1.0.0' });
-		vi.stubGlobal('fetch', (async (input: unknown) => (
-			routes.get(String(input))?.() ?? new Response('not found', { status: 404 })
-		)) as unknown as typeof fetch);
+		vi.stubGlobal('fetch', (async (input: unknown) => {
+			fetchCount++;
+			return routes.get(String(input))?.() ?? new Response('not found', { status: 404 });
+		}) as unknown as typeof fetch);
+		delete (globalThis as unknown as Record<string, unknown>)[V2_MARKER];
 		installRemotePluginResolver();
 	});
 
@@ -68,6 +94,9 @@ describe('.plugin subcommands', () => {
 		logSpy.mockRestore();
 		vi.unstubAllGlobals();
 		vi.restoreAllMocks();
+		// The resolver and its pin table are process-wide; leaving a pin behind
+		// would gate the next test's loads.
+		setRecordPinnedHashes([]);
 		await db.close();
 		await rm(homeDir, { recursive: true, force: true });
 	});
@@ -76,6 +105,12 @@ describe('.plugin subcommands', () => {
 
 	const records = async (): Promise<PluginRecord[]> =>
 		JSON.parse(await readFile(join(homeDir, '.quoomb', 'plugins.json'), 'utf-8'));
+
+	/** Hand-writes `plugins.json`, for record shapes no command produces. */
+	const writeRecords = async (plugins: PluginRecord[]): Promise<void> => {
+		await mkdir(join(homeDir, '.quoomb'), { recursive: true });
+		await writeFile(join(homeDir, '.quoomb', 'plugins.json'), JSON.stringify(plugins, null, 2));
+	};
 
 	it('installs, lists, disables, enables, reloads, configures and removes a manifest-less plugin by its derived name', async () => {
 		await handleDotCommand(`.plugin install ${MODULE_URL_NO_MANIFEST}`, db, readlineStub);
@@ -211,5 +246,262 @@ describe('.plugin subcommands', () => {
 		expect(output()).toContain('Failed to load plugin plain');
 		expect(output()).toContain('.plugin enable plain');
 		expect((await records())[0].enabled).toBe(false);
+	});
+
+	describe('pinning', () => {
+		/** Installs the manifest-less plugin, pinned or not, and clears the log. */
+		const install = async (options: { pin?: boolean } = {}): Promise<void> => {
+			await handleDotCommand(
+				`.plugin install ${MODULE_URL_NO_MANIFEST}${options.pin ? ' --pin' : ''}`,
+				db,
+				readlineStub
+			);
+			expect(output()).toContain('Successfully installed plugin: plain');
+			logSpy.mockClear();
+		};
+
+		/** The remote code behind an installed URL changes under it. */
+		const serveChangedBytes = (): void => serveModule(MODULE_URL_NO_MANIFEST, PLUGIN_SOURCE_V2);
+
+		it('refuses a pinned plugin whose remote code changed, and changes nothing', async () => {
+			await install({ pin: true });
+			const before = (await records())[0];
+			expect(before.pinned).toBe(true);
+			expect(before.sha256).toBe(sha256(PLUGIN_SOURCE));
+
+			serveChangedBytes();
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+
+			expect(output()).toContain('does not match its pinned hash');
+			expect(output()).toContain(sha256(PLUGIN_SOURCE));
+			expect(output()).toContain(sha256(PLUGIN_SOURCE_V2));
+			expect(output()).toContain(".plugin trust plain");
+			expect(output()).toContain(".plugin unpin plain");
+			// Refused before the import, not after: the module body never ran.
+			expect(v2Evaluated()).toBe(false);
+			expect(await records()).toEqual([before]);
+		});
+
+		it('still only warns for an unpinned plugin whose remote code changed, and adopts it', async () => {
+			await install();
+			serveChangedBytes();
+
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+
+			expect(output()).toContain('has changed since it was installed');
+			expect(output()).toContain('Reloaded plugin: plain');
+			expect(v2Evaluated()).toBe(true);
+			expect((await records())[0].sha256).toBe(sha256(PLUGIN_SOURCE_V2));
+		});
+
+		it('loads a pinned plugin whose bytes are unchanged, without complaint', async () => {
+			await install({ pin: true });
+
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+
+			expect(output()).toContain('Reloaded plugin: plain');
+			expect(output()).not.toContain('does not match');
+			expect(output()).not.toContain('has changed');
+		});
+
+		it('treats a pinned record with no recorded hash as a first observation', async () => {
+			await install({ pin: true });
+			const [record] = await records();
+			delete record.sha256;
+			await writeRecords([record]);
+
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+
+			expect(output()).toContain('Reloaded plugin: plain');
+			expect(output()).not.toContain('does not match');
+			const [after] = await records();
+			expect(after.sha256).toBe(sha256(PLUGIN_SOURCE));
+			expect(after.pinned).toBe(true);
+		});
+
+		it('records a hash handed to `.plugin trust` without fetching or loading anything', async () => {
+			await install({ pin: true });
+			serveChangedBytes();
+			const fetchesBefore = fetchCount;
+
+			await handleDotCommand(`.plugin trust plain ${sha256(PLUGIN_SOURCE_V2)}`, db, readlineStub);
+
+			expect(fetchCount).toBe(fetchesBefore);
+			expect(v2Evaluated()).toBe(false);
+			expect(output()).toContain('.plugin reload plain');
+			expect((await records())[0].sha256).toBe(sha256(PLUGIN_SOURCE_V2));
+
+			// And the new hash is live: the changed bytes now load.
+			logSpy.mockClear();
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+			expect(output()).toContain('Reloaded plugin: plain');
+		});
+
+		it('fetches and digests the new version for `.plugin trust` with no hash, without loading it', async () => {
+			await install({ pin: true });
+			serveChangedBytes();
+
+			await handleDotCommand('.plugin trust plain', db, readlineStub);
+
+			expect(output()).toContain(sha256(PLUGIN_SOURCE));
+			expect(output()).toContain(sha256(PLUGIN_SOURCE_V2));
+			expect(v2Evaluated()).toBe(false);
+			expect((await records())[0].sha256).toBe(sha256(PLUGIN_SOURCE_V2));
+		});
+
+		it('refuses a `.plugin trust` argument that is not a SHA-256, leaving the record alone', async () => {
+			await install({ pin: true });
+
+			await handleDotCommand('.plugin trust plain deadbeef', db, readlineStub);
+
+			expect(output()).toContain('Not a SHA-256');
+			expect((await records())[0].sha256).toBe(sha256(PLUGIN_SOURCE));
+		});
+
+		it('records nothing when `.plugin trust` cannot fetch the module', async () => {
+			await install({ pin: true });
+			routes.delete(MODULE_URL_NO_MANIFEST);
+
+			await handleDotCommand('.plugin trust plain', db, readlineStub);
+
+			expect(output()).toContain('Could not fetch');
+			expect(output()).toContain('Nothing was changed');
+			expect((await records())[0].sha256).toBe(sha256(PLUGIN_SOURCE));
+		});
+
+		it('lets an unpin take effect in the same session', async () => {
+			await install({ pin: true });
+			serveChangedBytes();
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+			expect(output()).toContain('does not match its pinned hash');
+			logSpy.mockClear();
+
+			await handleDotCommand('.plugin unpin plain', db, readlineStub);
+			expect((await records())[0].pinned).toBe(false);
+			logSpy.mockClear();
+
+			// Same process, no restart: the pin table is rebuilt from the records.
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+			expect(output()).toContain('Reloaded plugin: plain');
+			expect(v2Evaluated()).toBe(true);
+		});
+
+		it('leaves a plugin enabled when a pin refuses it during autoload', async () => {
+			await install({ pin: true });
+			const before = (await records())[0];
+			serveChangedBytes();
+
+			await loadEnabledPlugins(db);
+
+			expect(output()).toContain('Refused to load plugin plain');
+			expect(output()).toContain(".plugin trust plain");
+			expect(output()).toContain(".plugin unpin plain");
+			expect(output()).not.toContain('Disabled it');
+			expect(v2Evaluated()).toBe(false);
+			expect(await records()).toEqual([before]);
+		});
+
+		it('keeps loading the other plugins when one autoloaded plugin fails its pin', async () => {
+			await install({ pin: true });
+			await handleDotCommand(`.plugin install ${MODULE_URL_WITH_MANIFEST}`, db, readlineStub);
+			serveChangedBytes();
+			logSpy.mockClear();
+
+			await loadEnabledPlugins(db);
+
+			expect(output()).toContain('Refused to load plugin plain');
+			const after = await records();
+			expect(after.map(p => p.enabled)).toEqual([true, true]);
+		});
+
+		it('pins a URL held by two records when only one of them is pinned', async () => {
+			await install();
+			const [record] = await records();
+			// Only reachable by hand-editing plugins.json — install refuses a URL it
+			// already holds. The strictest entry wins: the URL is pinned.
+			await writeRecords([
+				{ ...record, id: 'unpinned-copy' },
+				{ ...record, id: 'pinned-copy', pinned: true },
+			]);
+			serveChangedBytes();
+
+			await handleDotCommand(`.plugin reload ${MODULE_URL_NO_MANIFEST}`, db, readlineStub);
+
+			expect(output()).toContain('does not match its pinned hash');
+			expect(v2Evaluated()).toBe(false);
+		});
+
+		it('surfaces a hand-edited pin that is not a valid hash, rather than flattening it', async () => {
+			await install({ pin: true });
+			const [record] = await records();
+			await writeRecords([{ ...record, sha256: 'not-a-real-hash' }]);
+
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+
+			expect(output()).toContain('not 64 hex characters');
+			expect(v2Evaluated()).toBe(false);
+		});
+
+		it('refuses to pin or trust a hash for a file: plugin, whose bytes are never fetched', async () => {
+			await writeRecords([{
+				id: 'local',
+				url: 'file:///plugins/local.mjs',
+				enabled: true,
+				config: {},
+			}]);
+
+			await handleDotCommand('.plugin pin local', db, readlineStub);
+			expect(output()).toContain('Cannot pin');
+			expect(output()).toContain('https:');
+			expect((await records())[0].pinned).toBeUndefined();
+			logSpy.mockClear();
+
+			await handleDotCommand('.plugin trust local', db, readlineStub);
+			expect(output()).toContain('Cannot trust a hash');
+			expect((await records())[0].sha256).toBeUndefined();
+		});
+
+		it('pins an already-installed plugin, and says enforcement starts at the recorded hash', async () => {
+			await install();
+
+			await handleDotCommand('.plugin pin plain', db, readlineStub);
+
+			expect(output()).toContain('Pinned plugin: plain');
+			expect(output()).toContain(sha256(PLUGIN_SOURCE));
+			expect((await records())[0].pinned).toBe(true);
+			logSpy.mockClear();
+
+			// The pin is live immediately, not at the next start.
+			serveChangedBytes();
+			await handleDotCommand('.plugin reload plain', db, readlineStub);
+			expect(output()).toContain('does not match its pinned hash');
+		});
+
+		it('applies a saved pin to a load that never goes through the record path', async () => {
+			await install({ pin: true });
+			serveChangedBytes();
+			// A fresh process that is about to load plugins from quoomb.config.json:
+			// nothing has synced the records yet.
+			setRecordPinnedHashes([]);
+
+			await syncSavedPluginPins();
+
+			await expect(dynamicLoadModule(MODULE_URL_NO_MANIFEST, db, {})).rejects.toThrow(/pinned SHA-256/);
+			expect(v2Evaluated()).toBe(false);
+		});
+
+		it('does not evaluate the module when re-installing a URL it already holds', async () => {
+			await install({ pin: true });
+			serveChangedBytes();
+			const fetchesBefore = fetchCount;
+
+			await handleDotCommand(`.plugin install ${MODULE_URL_NO_MANIFEST}`, db, readlineStub);
+
+			expect(output()).toContain('already installed');
+			// The duplicate check runs before the load, so the changed bytes were
+			// never fetched, let alone imported.
+			expect(fetchCount).toBe(fetchesBefore);
+			expect(v2Evaluated()).toBe(false);
+		});
 	});
 });

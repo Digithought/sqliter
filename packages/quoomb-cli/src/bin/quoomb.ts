@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import Table from 'cli-table3';
 import { installRemotePluginResolver } from '../plugins/remote-resolver.js';
+import { syncSavedPluginPins } from '../commands/dot-commands.js';
 
 // Must run before any plugin is loaded — config autoload, saved-plugin autoload,
 // and `.plugin install <url>` all reach the loader through this one resolver.
@@ -148,6 +149,9 @@ async function executeCommand(sql: string, options: CliOptions): Promise<void> {
         if (validateConfig(config)) {
           const interpolatedConfig = interpolateConfigEnvVars(config);
           if (interpolatedConfig.autoload !== false && options.autoload !== false) {
+            // One-shot mode never loads the saved records, but a URL they pin is
+            // still pinned wherever it is loaded from.
+            await syncSavedPluginPins();
             await loadPluginsFromConfig(db, interpolatedConfig);
           }
         }

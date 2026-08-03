@@ -95,4 +95,19 @@ export interface PluginRecord {
 	 * for records installed before this was recorded, and for `file:` plugins.
 	 */
 	sha256?: string;
+	/**
+	 * When true, `sha256` is enforced *before* the module is imported: a host that
+	 * verifies remote plugins refuses the load on a mismatch instead of warning
+	 * after the code has already run. Absent or false keeps the warn-and-continue
+	 * default.
+	 *
+	 * A pinned record with no `sha256` is not a violation — it is a first
+	 * observation. The next successful load records a hash and enforcement starts
+	 * from there.
+	 *
+	 * Only meaningful for `https:` records in a host that installed the Node remote
+	 * resolver. Browsers import the URL directly with no verification step, and
+	 * `file:` URLs never reach the resolver at all.
+	 */
+	pinned?: boolean;
 }
