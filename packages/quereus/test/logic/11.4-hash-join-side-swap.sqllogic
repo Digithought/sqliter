@@ -13,6 +13,13 @@
 -- join the optimizer picks. The plan-shape assertions (that these shapes DO
 -- swap, and what the swapped node must advertise) live in
 -- test/optimizer/hash-join-side-swap.spec.ts.
+--
+-- NOTE: the 4 x 8 fixture sits near the hash/nested-loop cost crossover
+-- (nl = 7.2 vs hash = 6.4 under today's constants in planner/cost/index.ts).
+-- Because every assertion below is row equality, this file keeps passing if a
+-- cost change stops the swap from firing — it would just stop testing anything.
+-- The spec's "swap fired" assertion is the canary; if it goes red after a cost
+-- change, widen the row counts HERE too rather than only there.
 
 -- 4 x 8 with ANALYZE: hash beats nested loop and the left side is the smaller
 -- one, so the swap fires. Without ANALYZE both sides report the un-analyzed

@@ -290,6 +290,10 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		// any positional consumer that maps attribute id → column index through
 		// `getAttributes()` (e.g. `emitHashAggregate`'s scan row descriptor) read
 		// the wrong slot and silently return wrong values.
+		// The slice assumes `preserveAttrs` is exactly left++right, which the
+		// `joinType === 'inner'` test here and the `hasExistenceColumns` return
+		// above together guarantee — an existence join appends flag attributes
+		// after both sides and would need them left in place.
 		hashAttrs = [
 			...preserveAttrs.slice(leftAttrs.length),
 			...preserveAttrs.slice(0, leftAttrs.length),

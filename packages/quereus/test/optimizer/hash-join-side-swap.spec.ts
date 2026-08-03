@@ -30,6 +30,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { PlanNode, RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { BloomJoinNode } from '../../src/planner/nodes/bloom-join-node.js';
+import { MergeJoinNode } from '../../src/planner/nodes/merge-join-node.js';
 
 function collectNodes<T extends PlanNode>(
 	root: PlanNode,
@@ -44,7 +45,11 @@ function collectNodes<T extends PlanNode>(
 	return found;
 }
 
+/** A physical binary join built from a logical JoinNode with preserved attributes. */
+type PhysicalJoinNode = BloomJoinNode | MergeJoinNode;
+
 const isHashJoin = (n: PlanNode): n is BloomJoinNode => n instanceof BloomJoinNode;
+const isMergeJoin = (n: PlanNode): n is MergeJoinNode => n instanceof MergeJoinNode;
 
 /** The table each of this relation's attributes came from, deduplicated. */
 function sourceTables(rel: RelationalPlanNode): string[] {
@@ -60,7 +65,7 @@ function sourceTables(rel: RelationalPlanNode): string[] {
  * Asserted by attribute id (positions move on a swap; ids never do) and again
  * on `getType().columns`, which must stay the same arity and the same names.
  */
-function expectAdvertisedOrderMatchesRowLayout(join: BloomJoinNode, label: string): void {
+function expectAdvertisedOrderMatchesRowLayout(join: PhysicalJoinNode, label: string): void {
 	const advertised = join.getAttributes();
 	const emitted = [...join.left.getAttributes(), ...join.right.getAttributes()];
 
@@ -135,6 +140,19 @@ describe('hash join build/probe side swap', () => {
 		// …and the advertised order is therefore logical-left-then-right, which is
 		// the SAME statement as the invariant — that is the point of the invariant.
 		expectAdvertisedOrderMatchesRowLayout(joins[0], 'unswapped');
+	});
+
+	it('holds for the merge join, which takes the preserved attributes unpermuted', () => {
+		// Joining the two primary keys leaves both inputs already ordered on the
+		// equi-pair, so merge wins outright. Merge never swaps its sides, so the
+		// invariant here says logical-left-then-right — the assertion behind the
+		// `NOTE:` at the MergeJoinNode construction site in
+		// rule-join-physical-selection.
+		const plan = db.getPlan('select s.k as sk, b.v as bv from hjs_s s join hjs_b b on b.id = s.id');
+		const joins = collectNodes(plan, isMergeJoin);
+		expect(joins, 'one merge join').to.have.lengthOf(1);
+		expect(sourceTables(joins[0].left), 'left side is the logical left (s)').to.deep.equal(['s']);
+		expectAdvertisedOrderMatchesRowLayout(joins[0], 'merge');
 	});
 
 	it('holds across a three-table spine (every hash join in the plan)', async () => {

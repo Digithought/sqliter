@@ -1,6 +1,5 @@
 ---
 description: Nothing in the test suite checks that a query operator hands back its result columns in the same order it told the rest of the engine to expect, so an operator can quietly reorder its output and only some queries notice.
-prereq: bug-hash-join-side-swap-keeps-logical-attribute-order
 files:
   - packages/quereus/test/property.spec.ts                       # Key Soundness tiers — the model for a per-node walk
   - packages/quereus/src/util/row-descriptor.ts                  # buildRowDescriptor — the attr-id → column-index map every consumer uses
@@ -54,3 +53,19 @@ The immediate defect is one rule keeping a stale attribute order, and its regres
 test belongs with the fix. This ticket is the cross-cutting guard over every physical
 relational emitter — a different size of work, and one worth doing once the fix has
 settled which direction the hash join reconciles.
+
+## The direction is now settled
+
+`bug-hash-join-side-swap-keeps-logical-attribute-order` has landed. The swapped hash
+join **re-derives** its advertised attribute order to probe-then-build (same attribute
+ids, permuted positions) rather than pinning the sides to the logical order. So the
+invariant this ticket should assert is:
+
+> a physical relational node's advertised attribute order IS its emitted row layout —
+> for a binary join, `node.getAttributes()` equals
+> `[...node.left.getAttributes(), ...node.right.getAttributes()]` by id, in order.
+
+`test/optimizer/hash-join-side-swap.spec.ts` asserts exactly that, but only at plan
+level and only for `BloomJoinNode` / `MergeJoinNode`. The emitted-row-level check across
+every physical emitter — the thing that would have caught the original defect without a
+hand-written repro — is still this ticket. This ticket is no longer waiting on anything.
