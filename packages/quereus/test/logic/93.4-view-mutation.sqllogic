@@ -2117,6 +2117,129 @@ update ir_v set note = 'CHANGED' where 'A' in (select ir_t.k from ir_t where ir_
 select id, lbl from ir_t order by id;
 → [{"id":1,"lbl":"CHANGED"},{"id":2,"lbl":"B"}]
 
+-- --- (t) a definition fragment's OWN subquery correlates by the BASE TABLE NAME ---
+-- Blocks (k)-(s) all correlate the lineage subquery *unqualified* (`where fk = id`).
+-- Here the view body spells the correlation with the base table's name
+-- (`qt_l.id = qt_t.id`). The lowered UPDATE targets the base table under the
+-- synthesised correlation name (__vm_self), so a verbatim `qt_t.` qualifier inside
+-- the copied fragment resolves against nothing and the statement errored with
+-- "gt.id isn't a column". normalizeBaseRefs now re-points such a nested qualifier at
+-- the lowered correlation name (top-level qualifiers still strip to bare).
+create table qt_t (id integer primary key, x integer);
+create table qt_l (id integer primary key, lbl text);
+insert into qt_t values (1, 10), (2, 20);
+insert into qt_l values (1, 'one'), (2, 'two');
+create view qt_v as select id as id, x as x,
+    (select lbl from qt_l where qt_l.id = qt_t.id) as lbl from qt_t;
+
+select id, x, lbl from qt_v order by id;
+→ [{"id":1,"x":10,"lbl":"one"},{"id":2,"x":20,"lbl":"two"}]
+
+update qt_v set x = 77 where lbl = 'one';
+select id, x from qt_t order by id;
+→ [{"id":1,"x":77},{"id":2,"x":20}]
+
+-- --- (u) DELETE variant of (t) — the delete lowering threads the same name ---
+create table qd_t (id integer primary key, x integer);
+create table qd_l (id integer primary key, lbl text);
+insert into qd_t values (1, 10), (2, 20);
+insert into qd_l values (1, 'one'), (2, 'two');
+create view qd_v as select id as id, x as x,
+    (select lbl from qd_l where qd_l.id = qd_t.id) as lbl from qd_t;
+
+delete from qd_v where lbl = 'one';
+select id, x from qd_t order by id;
+→ [{"id":2,"x":20}]
+
+-- --- (v) the body ALIASES its source and correlates by the alias ---
+-- Same shape as (t) but the correlation is spelled `a.id` against `from qa_t a`.
+-- The alias is in the same base-qualifier set as the table name, so it re-points
+-- identically; before the fix this failed with "a.id isn't a column".
+create table qa_t (id integer primary key, x integer);
+create table qa_l (id integer primary key, lbl text);
+insert into qa_t values (1, 10), (2, 20);
+insert into qa_l values (1, 'one'), (2, 'two');
+create view qa_v as select a.id as id, a.x as x,
+    (select lbl from qa_l where qa_l.id = a.id) as lbl from qa_t a;
+
+update qa_v set x = 88 where lbl = 'two';
+select id, x from qa_t order by id;
+→ [{"id":1,"x":10},{"id":2,"x":88}]
+
+-- --- (w) COLLISION negative control — why the nested qualifier is re-pointed and
+--          not simply stripped like a top-level one ---
+-- The lineage subquery's own FROM (qk_l) carries a column named `k`, the same name
+-- as the correlated base column. Stripping `qk_t.k` to a bare `k` would re-bind it
+-- to qk_l.k by innermost-scope rules, degrading the correlation to the tautology
+-- `qk_l.k = qk_l.k`. qk_l holds exactly ONE row, so that degenerate subquery still
+-- returns a single value ('one') for EVERY outer row instead of erroring: `lbl =
+-- 'one'` would write BOTH rows — a silent wrong write. (Verified: with the nested
+-- rewrite reduced to a strip, this block writes {"id":2,"x":9}.) Re-pointing to the
+-- lowered correlation name keeps the correlation, so only the k=10 row is written.
+create table qk_t (id integer primary key, k integer, x integer);
+create table qk_l (k integer primary key, lbl text);
+insert into qk_t values (1, 10, 100), (2, 20, 200);
+insert into qk_l values (10, 'one');
+create view qk_v as select id as id, x as x,
+    (select lbl from qk_l where qk_l.k = qk_t.k) as lbl from qk_t;
+
+update qk_v set x = 9 where lbl = 'one';
+select id, x from qk_t order by id;
+→ [{"id":1,"x":9},{"id":2,"x":200}]
+
+-- --- (x) SHADOW negative control — a qualifier the fragment's OWN subquery FROM
+--          binds stays local ---
+-- The lineage subquery FROMs the view's own base table (qs_t), so `qs_t.` inside it
+-- names the INNER source by innermost-scope rules and must NOT be re-pointed. The
+-- pin column is therefore the same constant ('B', the id=2 row's lbl) for every
+-- outer row, and `pin = 'B'` writes all three rows. Had the qualifier been
+-- re-pointed, `__vm_self.id = 2` would filter per outer row instead: row 2 would see
+-- an unfiltered scan (first lbl 'A') and rows 1/3 an empty one (NULL), so nothing
+-- would match.
+create table qs_t (id integer primary key, x integer, lbl text);
+insert into qs_t values (1, 10, 'A'), (2, 20, 'B'), (3, 30, 'C');
+create view qs_v as select id as id, x as x,
+    (select qs_t.lbl from qs_t where qs_t.id = 2) as pin from qs_t;
+
+update qs_v set x = 55 where pin = 'B';
+select id, x from qs_t order by id;
+→ [{"id":1,"x":55},{"id":2,"x":55},{"id":3,"x":55}]
+
+-- --- (y) the base-qualified correlation lives in the VIEW'S OWN WHERE ---
+-- The body's selection predicate is copied into the lowered statement the same way a
+-- computed column's lineage is, so it hits the identical rewrite. Row 3 is outside
+-- the view (500 < 100 is false) and must not be touched. A naive strip would collapse
+-- `qw_lim.id = qw_t.id` to the tautology `qw_lim.id = qw_lim.id`, pinning lim to
+-- qw_lim's first row (10) for every base row — row 2 (50 < 10) would then be wrongly
+-- excluded.
+create table qw_t (id integer primary key, x integer);
+create table qw_lim (id integer primary key, lim integer);
+insert into qw_t values (1, 5), (2, 50), (3, 500);
+insert into qw_lim values (1, 10), (2, 100), (3, 100);
+create view qw_v as select id as id, x as x from qw_t
+    where x < (select lim from qw_lim where qw_lim.id = qw_t.id);
+
+select id, x from qw_v order by id;
+→ [{"id":1,"x":5},{"id":2,"x":50}]
+
+update qw_v set x = 9;
+select id, x from qw_t order by id;
+→ [{"id":1,"x":9},{"id":2,"x":9},{"id":3,"x":500}]
+
+-- --- (z) RETURNING re-projects the computed column through the same rewrite ---
+-- The RETURNING clause re-evaluates the lineage against the post-mutation row, so
+-- its nested base-qualified correlation must resolve too. Correlated, row 2 returns
+-- its own label 'two'; a de-correlated fragment would return qr_l's first row ('one').
+create table qr_t (id integer primary key, x integer);
+create table qr_l (id integer primary key, lbl text);
+insert into qr_t values (1, 10), (2, 20);
+insert into qr_l values (1, 'one'), (2, 'two');
+create view qr_v as select id as id, x as x,
+    (select lbl from qr_l where qr_l.id = qr_t.id) as lbl from qr_t;
+
+update qr_v set x = 33 where id = 2 returning id, x, lbl;
+→ [{"id":2,"x":33,"lbl":"two"}]
+
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate
 -- envelope). The shared join key is not a view column, so its value is sourced

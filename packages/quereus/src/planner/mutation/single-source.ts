@@ -14,7 +14,7 @@ import { ColumnReferenceNode } from '../nodes/reference.js';
 import type { MultiSourceKeyCapture } from './multi-source.js';
 import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
-import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
+import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, transformScopedQuery, transformAliasScopedQuery, type ScopeContext } from './scope-transform.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { bodyDefaults, isViewSchema } from '../../schema/view.js';
 import { bodyPlanningContext } from './body-context.js';
@@ -225,18 +225,46 @@ export function combineAnd(a: AST.Expression | undefined, b: AST.Expression | un
  * Rewrite base-term column references so they resolve against the single base
  * table after the rewrite. The view body may qualify its base columns by the
  * source's alias or the base table name (`x.col` / `pa.col`); the rewritten
- * statement has exactly one source, so those qualifiers are dropped (an
+ * statement has exactly one source, so a top-level qualifier is dropped (an
  * unqualified reference resolves unambiguously). This normalizes the **view
- * body's own** projection / WHERE terms (already in base terms); it does not
- * descend into subqueries, which is correct here — the body's own subqueries are
- * conjoined / projected verbatim, not re-bound against view columns. The
- * **user** predicate / assigned-value descent (where a nested reference can name
- * a *view* column) is handled separately by {@link makeViewColumnDescend}.
+ * body's own** projection / WHERE terms (already in base terms). The **user**
+ * predicate / assigned-value descent (where a nested reference can name a *view*
+ * column) is handled separately by {@link makeViewColumnDescend}.
+ *
+ * The rule is **depth-split**:
+ *
+ * - **top level** → strip the base-source qualifier to a bare name;
+ * - **nested** (inside one of the fragment's own subqueries — a computed lineage
+ *   term such as `(select lbl from gl where gl.id = gt.id)`, or the same shape in
+ *   the body's WHERE) → **re-point** the base-source qualifier at
+ *   `correlationName`, the lowered statement's correlation name.
+ *
+ * Stripping at depth would be wrong, not merely redundant: a bare name inside the
+ * subquery re-binds to a same-named column of the subquery's OWN FROM by ordinary
+ * innermost-scope rules (`gl.id = gt.id` → `id = id` → `gl.id = gl.id`), silently
+ * writing the wrong rows. Re-pointing keeps the correlation to the target row. A
+ * qualifier the subquery's own FROM binds is left local by the same innermost-scope
+ * rule (the `aliasShadow` check), and an unqualified nested reference is left alone
+ * — it is already correct by construction, since the subquery's FROM is copied
+ * unchanged. This mirrors the multi-source spine's `stripSideQualifier`
+ * (owning-side alias → `__vm_self`, at any depth, alias-scope-aware).
+ *
+ * `correlationName` defaults to the base table's own name: INSERT lowers onto the
+ * bare base-table name, so the nested rewrite is a no-op there. UPDATE/DELETE pass
+ * the synthesised {@link SELF_ALIAS} their lowered target carries.
  */
-function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): AST.Expression {
-	return transformExpr(expr, (col) =>
-		col.table && aliases.has(col.table.toLowerCase()) ? { type: 'column', name: col.name } : undefined,
-	);
+function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>, correlationName: string): AST.Expression {
+	const stripTop = (col: AST.ColumnExpr): AST.Expression | undefined =>
+		col.table && aliases.has(col.table.toLowerCase()) ? { type: 'column', name: col.name } : undefined;
+	const requalifyNested = (col: AST.ColumnExpr, aliasShadow: ReadonlySet<string>): AST.Expression | undefined => {
+		if (!col.table) return undefined;
+		const lcQual = col.table.toLowerCase();
+		if (aliasShadow.has(lcQual) || !aliases.has(lcQual)) return undefined;
+		// `schema` is cleared alongside the qualifier so a `main.gt.id` spelling cannot
+		// produce `main.__vm_self.id` (the correlation name lives in no schema).
+		return { ...col, table: correlationName, schema: undefined };
+	};
+	return transformExpr(expr, stripTop, (q) => transformAliasScopedQuery(q, requalifyNested));
 }
 
 /**
@@ -284,6 +312,14 @@ function makeBaseQualifier(
  * lineage (whose top-level refs are all base columns) and is the principled gate: only
  * the view's own base-term lineage is correlation-qualified, never a column a nested
  * source owns.
+ *
+ * The `if (col.table) return undefined` early return is deliberate and still right:
+ * every base-source qualifier a definition fragment carries has already been resolved
+ * upstream by {@link normalizeBaseRefs} — stripped at the fragment's top level,
+ * re-pointed at the lowered correlation name inside the fragment's own subqueries — so
+ * any qualified reference still standing when this scope runs is either that already-
+ * correct correlation name or a user-authored qualifier naming a source of the enclosing
+ * statement. Both must be left untouched.
  *
  * An unresolvable scope (`select *` / TVF / CTE) is **rejected** rather than
  * tainted-and-deferred: shadowing cannot be proven, so the term could over- or
@@ -430,8 +466,15 @@ export function makeViewColumnDescend(
  * Plan the view body, gate it for phase-1 mutability, and derive the
  * view→base column model. Throws a structured diagnostic on any unsupported
  * shape.
+ *
+ * `correlationName` is the name the lowered statement gives the base table, used to
+ * re-point a base-source qualifier that appears INSIDE one of the copied definition
+ * fragments' own subqueries ({@link normalizeBaseRefs}). UPDATE/DELETE pass the
+ * synthesised {@link SELF_ALIAS} their lowered target carries; INSERT and the CTE
+ * self-capture keep the default (they lower onto the bare base-table name, so the
+ * re-point is a no-op).
  */
-function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis {
+function analyzeView(ctx: PlanningContext, view: MutableViewLike, correlationName?: string): ViewAnalysis {
 	// Lens read-only gate: a logical table whose primary key is not reconstructible
 	// at the lens boundary deploys read-only (the prover sets `LensSlot.readOnly`;
 	// docs/lens.md § Coverage checklist). Reads still resolve through the registered
@@ -566,16 +609,17 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	// Build the remap table: each view column → its base-term replacement
 	// (computed expressions are normalized so any alias-qualified base column
 	// resolves against the rewritten single-source statement).
+	const lowerName = correlationName ?? baseTable.name;
 	const columnMap = new Map<string, AST.Expression>();
 	for (const vc of viewColumns) {
 		columnMap.set(
 			vc.name.toLowerCase(),
-			vc.lineage.kind === 'base' ? columnExpr(vc.lineage.baseColumnName) : normalizeBaseRefs(vc.lineage.expr, baseAliases),
+			vc.lineage.kind === 'base' ? columnExpr(vc.lineage.baseColumnName) : normalizeBaseRefs(vc.lineage.expr, baseAliases, lowerName),
 		);
 	}
 
 	const filterConstants = extractFilterConstants(sel.where, baseTable);
-	const filterPredicate = sel.where ? normalizeBaseRefs(sel.where, baseAliases) : undefined;
+	const filterPredicate = sel.where ? normalizeBaseRefs(sel.where, baseAliases, lowerName) : undefined;
 
 	// Writable-base write sites (UPDATE SET + INSERT): read the threaded plan-node
 	// `updateLineage` off the already-planned body and, per view column, capture
@@ -1136,7 +1180,10 @@ function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: Filt
 // --- UPDATE ---------------------------------------------------------------
 
 export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: MutableViewLike, descendCtx?: PlanningContext): AST.UpdateStmt {
-	const analysis = analyzeView(ctx, view);
+	// SELF_ALIAS is the lowered target's correlation name, so a base-source qualifier
+	// inside a copied definition fragment's own subquery (`… where gl.id = gt.id`) is
+	// re-pointed to it and still correlates to the row being updated.
+	const analysis = analyzeView(ctx, view, SELF_ALIAS);
 	const substitute = remapper(analysis);
 	// Qualify substituted subquery-descent base terms with the lowered target's
 	// synthesised alias (SELF_ALIAS) so they correlate to the outer target row even
@@ -1256,7 +1303,8 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 // --- DELETE ---------------------------------------------------------------
 
 export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: MutableViewLike, descendCtx?: PlanningContext): AST.DeleteStmt {
-	const analysis = analyzeView(ctx, view);
+	// SELF_ALIAS is the lowered target's correlation name — see {@link rewriteViewUpdate}.
+	const analysis = analyzeView(ctx, view, SELF_ALIAS);
 	const substitute = remapper(analysis);
 	// Qualify substituted subquery-descent base terms with the lowered target's
 	// synthesised alias (SELF_ALIAS) so they correlate to the outer target row even
