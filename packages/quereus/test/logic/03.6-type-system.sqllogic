@@ -475,3 +475,42 @@ select cast(v as text) as v from integer_text_insert;
 → [{"v":"9007199254740993"}]
 DROP TABLE integer_text_insert;
 DROP TABLE numeric_text_insert;
+
+-- === REAL comparator against a bigint operand past 2^53 (regression) ===
+-- REAL_TYPE.compare used to assert its operands were `number` and call isNaN()
+-- on them; isNaN() throws on a bigint. A REAL column compared against an
+-- integer literal past 2^53 (which the engine keeps as bigint) hit this on
+-- every index/primary-key lookup. Must order by exact value, not throw.
+
+CREATE TABLE real_big (id INTEGER PRIMARY KEY, r REAL);
+CREATE INDEX real_big_ir ON real_big(r);
+INSERT INTO real_big VALUES (1, 5.0), (2, 9007199254740992.0);
+
+-- Secondary index: equality against a bigint that doesn't match any stored REAL
+select id from real_big where r = 9007199254740993;
+→ []
+
+-- Secondary index: greater-than against a bigint
+select id from real_big where r > 9007199254740993;
+→ []
+
+-- Secondary index: IN-list mixing a bigint and a plain number
+select id from real_big where r in (9007199254740993, 5) order by id;
+→ [{"id":1}]
+
+select id from real_big where r in (9007199254740992, 5) order by id;
+→ [{"id":1},{"id":2}]
+
+DROP TABLE real_big;
+
+-- REAL primary key, no secondary index in sight
+CREATE TABLE real_pk (r REAL PRIMARY KEY);
+INSERT INTO real_pk VALUES (5.0);
+
+select r from real_pk where r = 9007199254740993;
+→ []
+
+select r from real_pk where r in (9007199254740993, 5) order by r;
+→ [{"r":5}]
+
+DROP TABLE real_pk;

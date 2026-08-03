@@ -111,13 +111,16 @@ export const REAL_TYPE: LogicalType = {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
 
-		const numA = a as number;
-		const numB = b as number;
+		// The value space is number-only per REAL_TYPE.validate, but the shared index/PK
+		// comparators pass through raw storage-class values, which can be a bigint (e.g.
+		// comparing against an INTEGER literal past 2^53). isNaN() throws on a bigint
+		// operand, so guard with typeof first — see NUMERIC_TYPE.compare for the same fix.
+		const aIsNaN = typeof a === 'number' && isNaN(a);
+		const bIsNaN = typeof b === 'number' && isNaN(b);
+		if (aIsNaN) return bIsNaN ? 0 : -1;
+		if (bIsNaN) return 1;
 
-		if (isNaN(numA)) return isNaN(numB) ? 0 : -1;
-		if (isNaN(numB)) return 1;
-
-		return numA < numB ? -1 : numA > numB ? 1 : 0;
+		return compareNumericValues(a as number | bigint, b as number | bigint);
 	},
 };
 
