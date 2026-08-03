@@ -6,7 +6,7 @@ import * as path from 'path';
 import Papa from 'papaparse';
 import { dynamicLoadModule, validatePluginUrl, PluginHashMismatchError } from '@quereus/plugin-loader';
 import type { PluginRecord, PluginSetting } from '@quereus/plugin-loader';
-import { fetchRemoteModuleHash, getLastFetchedHash, setRecordPinnedHashes } from '../plugins/remote-resolver.js';
+import { fetchRemoteModuleHash, getConfigPinnedHash, getLastFetchedHash, isRemoteUrl, setRecordPinnedHashes, SHA256_HEX } from '../plugins/remote-resolver.js';
 import type { SqlValue } from '@quereus/quereus';
 import type { Interface as ReadlineInterface } from 'node:readline';
 import os from 'os';
@@ -492,9 +492,6 @@ const resolvePlugin = (plugins: PluginRecord[], identifier: string): PluginRecor
   return byName[0];
 };
 
-/** A SHA-256 as `.plugin trust` accepts it: 64 hex characters. */
-const SHA256_HEX = /^[0-9a-f]{64}$/i;
-
 /**
  * Hands the remote resolver the pins the current records imply, so the next
  * fetch is gated on them.
@@ -527,19 +524,6 @@ const syncPluginPins = (plugins: PluginRecord[]): void => {
  */
 export const syncSavedPluginPins = async (): Promise<void> => {
   syncPluginPins(await loadPlugins());
-};
-
-/**
- * True when this URL's module is fetched over the network, which is the only
- * case a pin can act on — a `file:` URL never reaches the remote resolver, so a
- * pin on one would be silently inert.
- */
-const isRemoteUrl = (url: string): boolean => {
-  try {
-    return new URL(url).protocol === 'https:';
-  } catch {
-    return false;
-  }
 };
 
 /**
@@ -713,6 +697,24 @@ const reportPinState = (plugin: PluginRecord): void => {
   } else {
     console.log('  Pinned, but no hash is recorded yet; the next successful load records one and enforcement begins there.');
   }
+  reportConfigPinOverride(plugin.url, plugin.sha256);
+};
+
+/**
+ * Says so when `quoomb.config.json` pins this URL to something other than what
+ * the surrounding message just claimed. A config hash outranks the record it
+ * shares a URL with, so `pin`, `unpin` and `trust` would each otherwise report a
+ * state no load acts on.
+ *
+ * `enforced` is the hash the caller just described as enforced — undefined when
+ * it said nothing is (`.plugin unpin`), in which case any config pin is news.
+ */
+const reportConfigPinOverride = (url: string, enforced: string | undefined): void => {
+  const configHash = getConfigPinnedHash(url);
+  if (!configHash || configHash === enforced) return;
+
+  console.log(chalk.yellow(`  quoomb.config.json pins ${url} to sha256 ${configHash}; that hash wins over this record.`));
+  console.log(chalk.yellow('  Change what is enforced by editing the config file.'));
 };
 
 const listPluginsCommand = async (): Promise<void> => {
@@ -1027,6 +1029,7 @@ const unpinPluginCommand = async (args: string[]): Promise<void> => {
 
   console.log(`Unpinned plugin: ${name}`);
   console.log('  A changed module now warns after it loads, rather than being refused.');
+  reportConfigPinOverride(plugin.url, undefined);
 };
 
 /**
@@ -1068,6 +1071,7 @@ const trustPluginCommand = async (args: string[]): Promise<void> => {
 
   if (trusted === plugin.sha256) {
     console.log(`Plugin '${name}' already trusts that hash`);
+    reportConfigPinOverride(plugin.url, trusted);
     return;
   }
 
@@ -1077,6 +1081,7 @@ const trustPluginCommand = async (args: string[]): Promise<void> => {
 
   console.log(`Now trusting the new version of ${name}.`);
   console.log(`  It is not loaded — run '.plugin reload ${name}' to load it.`);
+  reportConfigPinOverride(plugin.url, trusted);
 };
 
 /** Validates a user-supplied digest, reporting the refusal itself. */
@@ -1161,12 +1166,24 @@ export const loadEnabledPlugins = async (db: Database): Promise<void> => {
  *
  * The wider question of whether a failed startup load should auto-disable at all
  * is tracked separately; only the pin case is carved out here.
+ *
+ * The two remedies it names are record-level, so they only resolve a refusal the
+ * *record* caused. When the enforced hash came from `quoomb.config.json`, both
+ * would leave the load refused for the same reason — say where the hash actually
+ * lives instead.
  */
 const reportPinViolation = (plugin: PluginRecord, mismatch: PluginHashMismatchError): void => {
   const name = displayName(plugin);
   console.log(chalk.yellow(`Refused to load plugin ${name}: the module at ${mismatch.url} does not match its pinned hash.`));
   console.log(chalk.yellow(`  pinned sha256 ${mismatch.expected}`));
   console.log(chalk.yellow(`  served sha256 ${mismatch.actual}`));
+
+  if (getConfigPinnedHash(mismatch.url) === mismatch.expected) {
+    console.log(chalk.yellow('  That hash is declared in quoomb.config.json, which outranks this plugin record —'));
+    console.log(chalk.yellow(`  '.plugin trust'/'unpin' cannot lift it. Verify the new version, then update sha256 there.`));
+    return;
+  }
+
   console.log(chalk.yellow(`  Verify the new version, then '.plugin trust ${name}' to accept it,`));
   console.log(chalk.yellow(`  or '.plugin unpin ${name}' to go back to warning only.`));
 };

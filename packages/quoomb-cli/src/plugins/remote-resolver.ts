@@ -12,8 +12,12 @@ import chalk from 'chalk';
 import { hashRemoteModule, installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
 import type { RemoteModuleFetch, QuoombConfig } from '@quereus/plugin-loader';
 
-/** A SHA-256 as a config entry or plugin record must supply it: 64 hex characters. */
-const SHA256_HEX = /^[0-9a-f]{64}$/i;
+/**
+ * A SHA-256 as a config entry, a plugin record, or `.plugin trust` must supply
+ * it: 64 hex characters. Shared with the `.plugin` commands so every place that
+ * accepts a digest accepts exactly the same thing.
+ */
+export const SHA256_HEX = /^[0-9a-f]{64}$/i;
 
 /**
  * Most recent fetch per requested URL. Read back by the `.plugin` commands so an
@@ -81,9 +85,15 @@ export function setRecordPinnedHashes(pins: Iterable<{ url: string; sha256: stri
  *
  * When a URL is pinned by both sources to *different* hashes, warns once here
  * (not on every subsequent lookup) naming the URL and both values, so a user is
- * not left wondering why their `.plugin trust` had no effect.
+ * not left wondering why their `.plugin trust` had no effect. A `.plugin`
+ * command issued *later* in the same session cannot reach this warning, so those
+ * commands ask {@link getConfigPinnedHash} directly instead.
+ *
+ * Private on purpose: the only way in is {@link seedConfigPluginPins}, which
+ * validates first. An unvalidated pin the resolver later rejects as malformed
+ * would fail every load of that URL for a reason no message explains.
  */
-export function setConfigPinnedHashes(pins: Iterable<{ url: string; sha256: string }>): void {
+function setConfigPinnedHashes(pins: Iterable<{ url: string; sha256: string }>): void {
 	configPinnedHashByUrl.clear();
 	for (const pin of pins) {
 		configPinnedHashByUrl.set(normalizeUrlKey(pin.url), pin.sha256);
@@ -110,6 +120,16 @@ function lookupPin(url: string): string | undefined {
 }
 
 /**
+ * The hash `quoomb.config.json` declared for `url`, or undefined when it
+ * declared none. The `.plugin` commands ask before reporting what a record's pin
+ * enforces: a config hash outranks the record, so `pin`, `trust` and a refused
+ * load would otherwise all describe a hash that is not the one being enforced.
+ */
+export function getConfigPinnedHash(url: string): string | undefined {
+	return configPinnedHashByUrl.get(normalizeUrlKey(url));
+}
+
+/**
  * Validates every `sha256` a `QuoombConfig` declares on its plugins and seeds
  * the config pin table from it. Called once per config load, before
  * `loadPluginsFromConfig` — a config that believes it is pinning but cannot be
@@ -119,35 +139,83 @@ function lookupPin(url: string): string | undefined {
  * - `sha256` on a source that is not an `https:` URL (`npm:`, a bare package
  *   name, `file:`) — it never reaches the remote resolver, so the hash could
  *   never be checked.
- * - `sha256` that is not 64 hex characters.
+ * - `sha256` that is not 64 hex characters. An *empty* `sha256` is one of those:
+ *   the key is present, so the entry means to pin, and skipping it would load
+ *   unverified under the appearance of a pin.
+ *
+ * Every entry is checked, and every problem is reported together: fixing one
+ * typo only to be stopped by the next one, a run at a time, is worse than seeing
+ * the list.
+ *
+ * The pins that *did* validate are seeded even when others failed. The caller
+ * abandons this config's plugin load either way, but the same URL can still be
+ * reached by the saved-record autoload, and a hash the config file states is a
+ * statement about the URL rather than about one load path.
  *
  * `config` must already be env-interpolated — a `${PLUGIN_SHA}` placeholder is
  * validated after substitution, not before.
+ *
+ * NOTE: seeded once per process, at startup, like the rest of the config. If a
+ * command that re-reads `quoomb.config.json` mid-session is ever added, it must
+ * call this again — otherwise the session keeps enforcing the hashes the file
+ * held when it started.
  */
 export function seedConfigPluginPins(config: QuoombConfig): void {
 	const pins: Array<{ url: string; sha256: string }> = [];
-	for (const plugin of config.plugins ?? []) {
-		if (!plugin.sha256) continue;
+	const problems: string[] = [];
+	/** Normalized URL → hash already accepted for it, to catch a self-contradicting file. */
+	const claimed = new Map<string, string>();
 
-		if (!isHttpsUrl(plugin.source)) {
-			throw new Error(
-				`Config plugin '${plugin.source}' declares sha256 but is not an https: source; ` +
-				`its hash can never be checked. Remove sha256, or serve it over https:.`
-			);
+	for (const plugin of config.plugins ?? []) {
+		if (plugin.sha256 === undefined) continue;
+
+		const problem = describePinProblem(plugin.source, plugin.sha256);
+		if (problem) {
+			problems.push(problem);
+			continue;
 		}
-		if (!SHA256_HEX.test(plugin.sha256)) {
-			throw new Error(
-				`Config plugin '${plugin.source}' declares sha256 '${plugin.sha256}', ` +
-				`which is not 64 hex characters.`
+
+		const sha256 = plugin.sha256.toLowerCase();
+		const already = claimed.get(normalizeUrlKey(plugin.source));
+		if (already !== undefined && already !== sha256) {
+			// One URL, one download; picking either hash would silently ignore what
+			// the other entry asked for.
+			problems.push(
+				`  - '${plugin.source}' is listed more than once with different sha256 values ` +
+				`('${already}' and '${sha256}'); only one of them can be enforced.`
 			);
+			continue;
 		}
-		pins.push({ url: plugin.source, sha256: plugin.sha256.toLowerCase() });
+
+		claimed.set(normalizeUrlKey(plugin.source), sha256);
+		pins.push({ url: plugin.source, sha256 });
 	}
+
 	setConfigPinnedHashes(pins);
+
+	if (problems.length > 0) {
+		throw new Error(`quoomb.config.json declares ${problems.length} unusable sha256:\n${problems.join('\n')}`);
+	}
 }
 
-/** True when `url` is an `https:` source — the only kind the remote resolver, and so a pin, can ever act on. */
-function isHttpsUrl(url: string): boolean {
+/** What is wrong with a config entry's declared hash, or undefined when nothing is. */
+function describePinProblem(source: string, sha256: string): string | undefined {
+	if (!isRemoteUrl(source)) {
+		return `  - '${source}' declares sha256 but is not an https: source; its hash can never be checked. ` +
+			`Remove sha256, or serve it over https:.`;
+	}
+	if (!SHA256_HEX.test(sha256)) {
+		return `  - '${source}' declares sha256 '${sha256}', which is not 64 hex characters.`;
+	}
+	return undefined;
+}
+
+/**
+ * True when `url` is an `https:` source — the only kind the remote resolver, and
+ * so a pin, can ever act on. Shared with the `.plugin` commands, which refuse
+ * hash-related requests against anything else for the same reason.
+ */
+export function isRemoteUrl(url: string): boolean {
 	try {
 		return new URL(url).protocol === 'https:';
 	} catch {

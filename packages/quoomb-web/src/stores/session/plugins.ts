@@ -183,6 +183,20 @@ export function createPluginActions(set: StoreSet, get: StoreGet) {
 			const configState = useConfigStore.getState();
 			if (configState.config && configState.config.plugins && configState.config.autoload !== false) {
 				const config = interpolateConfigEnvVars(configState.config);
+
+				// The browser imports `https:` URLs natively — there is no remote
+				// resolver here to hash the bytes against — so a config-declared
+				// `sha256` is inert. Say so: silence would leave a user believing the
+				// pin they wrote in the config file is being enforced.
+				const unverifiable = (config.plugins || []).filter(p => p.sha256).map(p => p.source);
+				if (unverifiable.length > 0) {
+					console.warn(
+						`quoomb.config.json declares sha256 for ${unverifiable.join(', ')}, but the browser ` +
+						'cannot verify plugin bytes before importing them; those hashes are not enforced here. ' +
+						'Load these plugins through the quoomb CLI for a checked load.'
+					);
+				}
+
 				for (const pluginConfig of config.plugins || []) {
 					try {
 						// Pass the config object through unflattened so structured settings

@@ -26,7 +26,7 @@ import { Database } from '@quereus/quereus';
 import { dynamicLoadModule } from '@quereus/plugin-loader';
 import type { PluginRecord } from '@quereus/plugin-loader';
 import { handleDotCommand, loadEnabledPlugins, syncSavedPluginPins } from '../src/commands/dot-commands.js';
-import { installRemotePluginResolver, setRecordPinnedHashes, setConfigPinnedHashes, seedConfigPluginPins } from '../src/plugins/remote-resolver.js';
+import { installRemotePluginResolver, setRecordPinnedHashes, seedConfigPluginPins } from '../src/plugins/remote-resolver.js';
 import type { Interface as ReadlineInterface } from 'node:readline';
 
 const PLUGIN_SOURCE = 'export default function register() { return {}; }\n';
@@ -54,6 +54,8 @@ describe('.plugin subcommands', () => {
 	let db: Database;
 	let homeDir: string;
 	let logSpy: ReturnType<typeof vi.spyOn>;
+	/** Separate from `logSpy`: the pin-source conflict is the one thing that warns. */
+	let warnSpy: ReturnType<typeof vi.spyOn>;
 	/** URL → response, consulted by the stubbed `fetch`; anything else 404s. */
 	let routes: Map<string, () => Response>;
 	/** Every call the stubbed `fetch` saw, so a test can assert none happened. */
@@ -77,6 +79,7 @@ describe('.plugin subcommands', () => {
 
 		db = new Database();
 		logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		routes = new Map();
 		fetchCount = 0;
 		serveModule(MODULE_URL_NO_MANIFEST);
@@ -92,17 +95,19 @@ describe('.plugin subcommands', () => {
 
 	afterEach(async () => {
 		logSpy.mockRestore();
+		warnSpy.mockRestore();
 		vi.unstubAllGlobals();
 		vi.restoreAllMocks();
-		// The resolver and its pin table are process-wide; leaving a pin behind
+		// The resolver and its pin tables are process-wide; leaving a pin behind
 		// would gate the next test's loads.
 		setRecordPinnedHashes([]);
-		setConfigPinnedHashes([]);
+		seedConfigPluginPins({ plugins: [] });
 		await db.close();
 		await rm(homeDir, { recursive: true, force: true });
 	});
 
 	const output = () => logSpy.mock.calls.flat().join('\n');
+	const warnings = () => warnSpy.mock.calls.flat().join('\n');
 
 	const records = async (): Promise<PluginRecord[]> =>
 		JSON.parse(await readFile(join(homeDir, '.quoomb', 'plugins.json'), 'utf-8'));
@@ -611,6 +616,106 @@ describe('.plugin subcommands', () => {
 				expect(() => seedConfigPluginPins({
 					plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: 'deadbeef' }]
 				})).toThrow(/64 hex characters/);
+			});
+
+			it('rejects an empty config sha256 rather than reading it as "not pinned"', async () => {
+				expect(() => seedConfigPluginPins({
+					plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: '' }]
+				})).toThrow(/64 hex characters/);
+
+				// And the entry did not quietly become an unpinned load.
+				serveChangedBytes();
+				await expect(dynamicLoadModule(MODULE_URL_NO_MANIFEST, db, {})).resolves.toBeUndefined();
+				expect(v2Evaluated()).toBe(true);
+			});
+
+			it('reports every unusable sha256 at once, not only the first', () => {
+				expect(() => seedConfigPluginPins({
+					plugins: [
+						{ source: 'npm:@scope/foo', sha256: sha256(PLUGIN_SOURCE) },
+						{ source: MODULE_URL_WITH_MANIFEST, sha256: 'deadbeef' },
+					]
+				})).toThrow(/declares 2 unusable sha256[\s\S]*not an https[\s\S]*64 hex characters/);
+			});
+
+			it('still seeds the entries that validated when a sibling entry is unusable', async () => {
+				// The caller abandons this config's plugin load, but the URL is also
+				// reachable from the saved records, and the config's statement about
+				// it stands.
+				expect(() => seedConfigPluginPins({
+					plugins: [
+						{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE) },
+						{ source: 'npm:@scope/foo', sha256: sha256(PLUGIN_SOURCE) },
+					]
+				})).toThrow();
+
+				serveChangedBytes();
+				await expect(dynamicLoadModule(MODULE_URL_NO_MANIFEST, db, {})).rejects.toThrow(/pinned SHA-256/);
+				expect(v2Evaluated()).toBe(false);
+			});
+
+			it('rejects a config that pins one URL to two different hashes', () => {
+				expect(() => seedConfigPluginPins({
+					plugins: [
+						{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE) },
+						// Differs only in host case, so it is the same download.
+						{ source: MODULE_URL_NO_MANIFEST.replace('plugins.', 'PLUGINS.'), sha256: sha256(PLUGIN_SOURCE_V2) },
+					]
+				})).toThrow(/listed more than once/);
+			});
+
+			it('accepts the same URL declared twice with the same hash', () => {
+				expect(() => seedConfigPluginPins({
+					plugins: [
+						{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE) },
+						{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE).toUpperCase() },
+					]
+				})).not.toThrow();
+			});
+
+			it('warns once when the config and a saved record pin the same URL differently', async () => {
+				await install({ pin: true });
+				await syncSavedPluginPins();
+
+				seedConfigPluginPins({ plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE_V2) }] });
+
+				expect(warnings()).toContain(MODULE_URL_NO_MANIFEST);
+				expect(warnings()).toContain(sha256(PLUGIN_SOURCE_V2));
+				expect(warnings()).toContain(sha256(PLUGIN_SOURCE));
+				expect(warnSpy.mock.calls.length).toBe(1);
+			});
+
+			it('says a config pin outranks the record when `.plugin pin` and `trust` report one', async () => {
+				await install();
+				seedConfigPluginPins({ plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE_V2) }] });
+
+				await handleDotCommand('.plugin pin plain', db, readlineStub);
+				expect(output()).toContain('quoomb.config.json pins');
+				expect(output()).toContain(sha256(PLUGIN_SOURCE_V2));
+				logSpy.mockClear();
+
+				// `.plugin trust <hash>` touches no network and reports the same way.
+				await handleDotCommand(`.plugin trust plain ${sha256(PLUGIN_SOURCE)}`, db, readlineStub);
+				expect(output()).toContain('quoomb.config.json pins');
+				logSpy.mockClear();
+
+				// Once the record agrees with the config there is nothing to warn about.
+				await handleDotCommand(`.plugin trust plain ${sha256(PLUGIN_SOURCE_V2)}`, db, readlineStub);
+				expect(output()).not.toContain('quoomb.config.json pins');
+			});
+
+			it('points a config-caused refusal at the config file, not at `.plugin trust`', async () => {
+				await install({ pin: true });
+				seedConfigPluginPins({ plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE) }] });
+				serveChangedBytes();
+				logSpy.mockClear();
+
+				await handleDotCommand('.plugin reload plain', db, readlineStub);
+
+				expect(output()).toContain('does not match its pinned hash');
+				expect(output()).toContain('declared in quoomb.config.json');
+				expect(output()).not.toContain(`.plugin trust plain' to accept`);
+				expect(v2Evaluated()).toBe(false);
 			});
 		});
 	});

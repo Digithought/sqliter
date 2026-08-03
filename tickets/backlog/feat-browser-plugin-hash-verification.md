@@ -82,3 +82,12 @@ default or strictly opt-in belongs to whoever picks this up.
 - `feat-plugin-loader-hash-pinning` — the Node-side verification this mirrors.
 - `feat-cli-plugin-pinning` — wires the CLI's saved hashes into it. It states
   explicitly that quoomb-web is untouched, which is what leaves this gap open.
+- `feat-config-declared-plugin-hashes` — a `quoomb.config.json` plugin entry can
+  now carry a `sha256`, and the *same config file* is what quoomb-web loads
+  plugins from. The web app cannot check it, so those hashes are inert there.
+  Its review added a startup `console.warn`
+  (`packages/quoomb-web/src/stores/session/plugins.ts`, `loadEnabledPlugins`)
+  naming the entries whose hashes are not being enforced — a stopgap so the
+  silence is not mistaken for verification, not a substitute for this ticket.
+  Whoever picks this up should feed those config-declared hashes into the check
+  and drop the warning.
