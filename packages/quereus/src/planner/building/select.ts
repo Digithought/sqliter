@@ -34,6 +34,7 @@ import { buildLensAuxiliaryAccessMarker } from './lens-auxiliary-access.js';
 
 // Import decomposed functionality
 import { buildWithContext } from './select-context.js';
+import { storedBodyContext } from '../mutation/body-context.js';
 import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
 import { buildAggregatePhase, buildFinalAggregateProjections } from './select-aggregates.js';
@@ -449,10 +450,10 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				// The body plans under the VIEW's home-schema path (not the
 				// caller's) so its unqualified source names resolve next to the
 				// view — independent of the reading statement's search path.
-				const viewBodyContext = { ...parentContext, schemaPath: parentContext.db._homeSchemaPath(viewSchema.schemaName) };
+				const viewBodyContext = storedBodyContext(parentContext, viewSchema.schemaName);
 				let viewSelectNode: RelationalPlanNode;
 				if (viewSchema.selectAst.type === 'select') {
-					viewSelectNode = buildSelectStmt(viewBodyContext, viewSchema.selectAst, cteNodes) as RelationalPlanNode;
+					viewSelectNode = buildSelectStmt(viewBodyContext, viewSchema.selectAst) as RelationalPlanNode;
 				} else if (viewSchema.selectAst.type === 'values') {
 					viewSelectNode = buildValuesStmt(viewBodyContext, viewSchema.selectAst);
 				} else {
@@ -539,10 +540,10 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					// path would make a perfectly resolvable non-`main` body look
 					// incompatibly changed, hiding the materialized rows behind a false
 					// staleness error.
-					const bodyContext = { ...parentContext, schemaPath: parentContext.db._homeSchemaPath(maintainedTable.schemaName) };
+					const bodyContext = storedBodyContext(parentContext, maintainedTable.schemaName);
 					try {
 						if (maintainedTable.derivation.selectAst.type === 'select') {
-							buildSelectStmt(bodyContext, maintainedTable.derivation.selectAst, cteNodes);
+							buildSelectStmt(bodyContext, maintainedTable.derivation.selectAst);
 						} else if (maintainedTable.derivation.selectAst.type === 'values') {
 							buildValuesStmt(bodyContext, maintainedTable.derivation.selectAst);
 						}
