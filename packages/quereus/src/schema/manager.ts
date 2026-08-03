@@ -823,6 +823,27 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Resolves a table-or-view name the way an unqualified name resolves: one
+	 * search-path entry at a time, checking that schema's tables AND views
+	 * together before moving to the next entry. Tables and views share one
+	 * namespace within a schema, so at most one of the two can match per entry.
+	 *
+	 * @param itemName Name of the table or view
+	 * @param dbName Optional explicit schema (a qualified name searches only it)
+	 * @param schemaPath Optional ordered search path (default: main, then temp)
+	 * @returns The TableSchema or ViewSchema, or undefined if not found
+	 */
+	findSchemaItem(itemName: string, dbName?: string, schemaPath?: string[]): TableSchema | ViewSchema | undefined {
+		if (dbName) return this.getSchemaItem(dbName, itemName);
+		const path = schemaPath && schemaPath.length > 0 ? schemaPath : ['main', 'temp'];
+		for (const schemaName of path) {
+			const item = this.getSchemaItem(schemaName, itemName);
+			if (item) return item;
+		}
+		return undefined;
+	}
+
+	/**
 	 * Gets metadata tags for a table.
 	 *
 	 * @param tableName The table name

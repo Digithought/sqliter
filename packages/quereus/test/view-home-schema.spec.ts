@@ -369,6 +369,51 @@ describe('home-schema body resolution (view write-through)', () => {
 		expect(await all(db, 'select id, x from main.sr'), 'main.sr untouched').to.deep.equal([{ id: 2, x: 2000 }]);
 	});
 
+	it('rejects write-through a non-main view whose body names another view unqualified', async () => {
+		await db.exec('create table temp.nt (id integer primary key, x integer)');
+		await db.exec('insert into temp.nt values (1, 10)');
+		await db.exec('create view temp.nv as select id, x from nt');
+		// Now that an unqualified view name resolves through the schema path, a
+		// `temp` view CAN be written over another `temp` view. The write-through
+		// analyzer must recognise the inner view by name — on the BODY's home path,
+		// not the caller's — and reject cleanly rather than mis-rewriting against
+		// the inlined base table.
+		await db.exec('create view temp.nnv as select id, x from nv');
+		expect(await all(db, 'select id, x from temp.nnv')).to.deep.equal([{ id: 1, x: 10 }]);
+
+		for (const sql of [
+			'insert into temp.nnv (id, x) values (2, 20)',
+			'update temp.nnv set x = 11 where id = 1',
+			'delete from temp.nnv where id = 1',
+		]) {
+			let message = '';
+			try {
+				await db.exec(sql);
+			} catch (e) {
+				message = (e as Error).message;
+			}
+			expect(message, sql).to.contain('references another view; nested-view mutation is not yet supported');
+		}
+		// The base table is untouched by the rejected writes.
+		expect(await all(db, 'select id, x from temp.nt')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('rejects write-through a non-main view whose body names a materialized view unqualified', async () => {
+		await db.exec('create table temp.mst (id integer primary key, x integer)');
+		await db.exec('insert into temp.mst values (1, 10)');
+		await db.exec('create materialized view temp.msmv as select id, x from mst');
+		await db.exec('create view temp.msv2 as select id, x from msmv');
+
+		let message = '';
+		try {
+			await db.exec('update temp.msv2 set x = 11 where id = 1');
+		} catch (e) {
+			message = (e as Error).message;
+		}
+		expect(message).to.contain('its body reads a materialized view');
+		expect(await all(db, 'select id, x from temp.mst')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
 	// --- main-schema controls: byte-identical to today's behaviour ---
 
 	it('keeps a main single-source view write unchanged', async () => {

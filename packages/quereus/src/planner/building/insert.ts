@@ -35,6 +35,7 @@ import { validateReturningQualifiers } from '../validation/returning-qualifier-v
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { buildViewMutation } from './view-mutation-builder.js';
 import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivation.js';
+import { isViewSchema } from '../../schema/view.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 
@@ -546,9 +547,11 @@ export function buildInsertStmt(
 	// Dispatch order is load-bearing: a maintained table (derivation-bearing)
 	// must hit the view-mutation rewrite, never the direct table write — its
 	// contents are derived and only the source may be user-written.
-	const insertMaintained = ctx.schemaManager.getMaintainedTable(stmt.table.schema ?? null, stmt.table.name);
-	const insertView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
-		?? (insertMaintained ? maintainedTableViewLike(insertMaintained) : undefined);
+	// An unqualified target resolves through the schema search path, exactly as an
+	// unqualified read does (see `SchemaManager.findSchemaItem`).
+	const insertTarget = ctx.schemaManager.findSchemaItem(stmt.table.name, stmt.table.schema, contextWithSchemaPath.schemaPath);
+	const insertView = isViewSchema(insertTarget) ? insertTarget
+		: (isMaintainedTable(insertTarget) ? maintainedTableViewLike(insertTarget) : undefined);
 	if (insertView) {
 		// Route through the view-mutation substrate: decompose to base op(s) and
 		// re-plan each through the base-table builder, wrapped in a ViewMutationNode.

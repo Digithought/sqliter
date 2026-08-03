@@ -24,6 +24,7 @@ import { validateReturningQualifiers } from '../validation/returning-qualifier-v
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { buildViewMutation } from './view-mutation-builder.js';
 import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivation.js';
+import { isViewSchema } from '../../schema/view.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { buildWithContext } from './select-context.js';
@@ -97,9 +98,11 @@ export function buildDeleteStmt(
   // hook then syncs the backing. See docs/materialized-views.md § Write boundary.
   // Dispatch order is load-bearing: a maintained table (derivation-bearing)
   // must hit the view-mutation rewrite, never the direct table write.
-  const deleteMaintained = ctx.schemaManager.getMaintainedTable(stmt.table.schema ?? null, stmt.table.name);
-  const deleteView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
-    ?? (deleteMaintained ? maintainedTableViewLike(deleteMaintained) : undefined);
+  // An unqualified target resolves through the schema search path, exactly as an
+  // unqualified read does (see `SchemaManager.findSchemaItem`).
+  const deleteTarget = ctx.schemaManager.findSchemaItem(stmt.table.name, stmt.table.schema, contextWithSchemaPath.schemaPath);
+  const deleteView = isViewSchema(deleteTarget) ? deleteTarget
+    : (isMaintainedTable(deleteTarget) ? maintainedTableViewLike(deleteTarget) : undefined);
   if (deleteView) {
     // Route through the view-mutation substrate (single-source = one base op).
     return buildViewMutation(contextWithCTEs, deleteView, { op: 'delete', stmt });

@@ -1,5 +1,6 @@
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
+import type { TableSchema } from './table.js';
 import { fnv1aHash, toBase64Url } from '../util/hash.js';
 
 /**
@@ -25,6 +26,15 @@ export interface ViewSchema {
 	columns?: ReadonlyArray<string>; // Optional list of explicitly named columns
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */
 	tags?: Readonly<Record<string, SqlValue>>;
+}
+
+/**
+ * Narrowing guard: true iff `item` is a view (not a table / maintained table).
+ * A view carries a top-level `selectAst`; a `TableSchema` does not — a
+ * maintained table's body hangs off `derivation.selectAst` instead.
+ */
+export function isViewSchema(item: TableSchema | ViewSchema | undefined): item is ViewSchema {
+	return item !== undefined && 'selectAst' in item;
 }
 
 /**

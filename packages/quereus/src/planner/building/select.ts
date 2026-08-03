@@ -6,6 +6,7 @@ import type { PlanningContext } from '../planning-context.js';
 import { SingleRowNode } from '../nodes/single-row.js';
 import { buildTableReference } from './table.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
+import { isViewSchema } from '../../schema/view.js';
 import { AliasedScope } from '../scopes/aliased.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import type { Scope } from '../scopes/scope.js';
@@ -429,17 +430,17 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				fromTable = cteRefNode;
 			}
 		} else {
-			// Check if this is a view
-			const schemaName = fromClause.table.schema || parentContext.db.schemaManager.getCurrentSchemaName();
-			const viewSchema = parentContext.db.schemaManager.getView(schemaName, fromClause.table.name);
-			let maintainedTable = viewSchema ? undefined : parentContext.db.schemaManager.getMaintainedTable(schemaName, fromClause.table.name);
-			if (!viewSchema && !maintainedTable && !fromClause.table.schema) {
-				// An unqualified name resolves through the schema path below
-				// (buildTableReference); mirror that here so a path-resolved
-				// maintained table still gets the stale re-validation guard.
-				const pathResolved = parentContext.db.schemaManager.findTable(fromClause.table.name, undefined, parentContext.schemaPath);
-				if (isMaintainedTable(pathResolved)) maintainedTable = pathResolved;
-			}
+			// Check if this is a view. An unqualified name resolves through the
+			// schema search path — one path entry at a time, that schema's tables
+			// and views checked together — exactly as `buildTableReference` below
+			// resolves a plain table name.
+			const resolvedItem = parentContext.db.schemaManager.findSchemaItem(
+				fromClause.table.name,
+				fromClause.table.schema,
+				parentContext.schemaPath,
+			);
+			const viewSchema = isViewSchema(resolvedItem) ? resolvedItem : undefined;
+			const maintainedTable = !isViewSchema(resolvedItem) && isMaintainedTable(resolvedItem) ? resolvedItem : undefined;
 
 			if (viewSchema) {
 				// Build the view's body. The body is a QueryExpr — today only

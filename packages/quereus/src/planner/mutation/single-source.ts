@@ -16,7 +16,7 @@ import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
-import { bodyDefaults } from '../../schema/view.js';
+import { bodyDefaults, isViewSchema } from '../../schema/view.js';
 import { bodyPlanningContext } from './body-context.js';
 
 /**
@@ -496,16 +496,16 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		});
 	}
 	const fromTable = sel.from[0];
-	// NOTE: this name lookup resolves against the CURRENT schema (getView's null-schema
-	// default), not the body's home path — so a `temp` view whose body names another
-	// `temp` view unqualified would slip past this guard. Unreachable today: an
-	// unqualified view name in a FROM clause never resolves through the schema path at
-	// all (`building/select.ts` view dispatch), so such a body cannot be created. Becomes
-	// reachable once `bug-unqualified-view-name-ignores-schema-path` lands — resolve the
-	// name on `bodyPlanningContext(ctx, view).schemaPath` then. (The materialized-view arm
-	// just below already has a plan-resolved `isMaintainedTable(baseTable)` fallback and is
-	// not exposed.)
-	if (ctx.schemaManager.getView(fromTable.table.schema ?? null, fromTable.table.name)) {
+	// Resolve the body's source name on the BODY's own home path — the same path
+	// `bodyPlanningContext` plans it under — not the writing statement's. A `temp`
+	// view whose body names another `temp` view unqualified must be recognised as a
+	// nested view and rejected cleanly, not mis-rewritten.
+	const bodySource = ctx.schemaManager.findSchemaItem(
+		fromTable.table.name,
+		fromTable.table.schema,
+		bodyPlanningContext(ctx, view).schemaPath,
+	);
+	if (isViewSchema(bodySource)) {
 		raiseMutationDiagnostic({
 			reason: 'nested-view',
 			table: view.name,
@@ -518,10 +518,10 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	// write-through + the maintenance cascade) is deferred; reject cleanly. The
 	// source→backing maintenance cascade is unaffected — that is the read/maintain
 	// direction; this guards only the MV-name *write* direction.
-	// Checked both by name (current-schema default) and on the PLAN-resolved base
-	// table — the body's FROM resolves through the schema path, which can reach a
-	// maintained table the name lookup misses.
-	if (ctx.schemaManager.getMaintainedTable(fromTable.table.schema ?? null, fromTable.table.name)
+	// Checked both by name (on the body's home path, resolved above) and on the
+	// PLAN-resolved base table — the latter can reach a maintained table one
+	// inlining level down that the name lookup misses.
+	if ((!isViewSchema(bodySource) && isMaintainedTable(bodySource))
 		|| isMaintainedTable(baseTable)) {
 		raiseMutationDiagnostic({
 			reason: 'nested-view',

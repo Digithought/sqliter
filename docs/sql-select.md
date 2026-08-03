@@ -304,13 +304,15 @@ See [vu-inverses.md § View defaults](vu-inverses.md#view-defaults).
 
 ### 2.1.1 Schema Search Path (WITH SCHEMA)
 
-Quereus supports flexible schema resolution through search paths. Unqualified table names are resolved by searching schemas in a specified order.
+Quereus supports flexible schema resolution through search paths. Unqualified relation names are resolved by searching schemas in a specified order.
 
 **Resolution Hierarchy:**
 1. **Qualified names** (`schema.table`) - Always used exactly as specified
 2. **WITH SCHEMA clause** - Per-query explicit search path
 3. **PRAGMA schema_path** - Session-level default search path
 4. **Default search order** - `main`, then `temp`
+
+**Tables, views and materialized views resolve identically.** The path applies to every unqualified relation name — in a `FROM` clause and as an `INSERT` / `UPDATE` / `DELETE` target alike. The path is walked **one schema at a time**, and each entry's tables *and* views are checked **together** before moving to the next entry; the first entry holding an object of that name wins, whatever its kind. So a table named `x` in an earlier path entry beats a view named `x` in a later one. (A table and a view of the same name inside one schema is impossible — `create table` and `create view` reject a name the other already holds.)
 
 **Stored bodies are the exception:** a view / materialized-view body (like a CHECK-constraint or foreign-key body) resolves its unqualified names against the **owning object's schema first**, then the session default path — never the calling statement's `WITH SCHEMA` path. A view declared next to its tables in a non-`main` schema therefore reads correctly under any session path, and `refresh materialized view` is path-independent.
 

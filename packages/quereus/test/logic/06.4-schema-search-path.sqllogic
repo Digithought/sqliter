@@ -160,3 +160,110 @@ DROP TABLE myapp.products;
 -- Clean up
 DROP TABLE users;
 DROP TABLE orders;
+
+-- ===================================
+-- Unqualified VIEW names resolve through the schema search path, exactly as
+-- unqualified table names do (bug-unqualified-view-name-ignores-schema-path).
+-- ===================================
+
+CREATE TABLE temp.rt (id INTEGER PRIMARY KEY, x INTEGER);
+INSERT INTO temp.rt VALUES (1, 10);
+CREATE VIEW temp.rv AS SELECT id, x FROM rt;
+
+-- Test 20: qualified reference (baseline, never depended on the path)
+SELECT * FROM temp.rv;
+→ [{"id":1,"x":10}]
+
+-- Test 21: with `temp` OFF the session path an unqualified view is not found —
+-- the same answer an unqualified table in `temp` gets
+PRAGMA schema_path = 'main';
+
+SELECT * FROM rv;
+-- error: not found
+
+SELECT * FROM rt;
+-- error: not found
+
+-- Test 22: with `temp` ON the path both resolve
+PRAGMA schema_path = 'temp,main';
+
+SELECT * FROM rv;
+→ [{"id":1,"x":10}]
+
+SELECT * FROM rt;
+→ [{"id":1,"x":10}]
+
+-- Test 23: a view composed over another view in the same non-main schema
+CREATE VIEW temp.rv2 AS SELECT id, x FROM rv;
+
+SELECT * FROM temp.rv2;
+→ [{"id":1,"x":10}]
+
+SELECT * FROM rv2;
+→ [{"id":1,"x":10}]
+
+-- Test 24: unqualified INSERT / UPDATE / DELETE through a non-main view
+INSERT INTO rv (id, x) VALUES (2, 20);
+
+SELECT id, x FROM temp.rt ORDER BY id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+UPDATE rv SET x = 21 WHERE id = 2;
+
+SELECT id, x FROM temp.rt WHERE id = 2;
+→ [{"id":2,"x":21}]
+
+DELETE FROM rv WHERE id = 2;
+
+SELECT COUNT(*) as count FROM temp.rt;
+→ [{"count":1}]
+
+-- Test 25: statement-level WITH SCHEMA reaches the view too
+-- (`temp` is a keyword in the WITH SCHEMA position, hence the quoted form)
+PRAGMA schema_path = 'main';
+
+SELECT id, x FROM rv WITH SCHEMA "temp";
+→ [{"id":1,"x":10}]
+
+UPDATE rv SET x = 12 WHERE id = 1 WITH SCHEMA "temp";
+
+SELECT id, x FROM temp.rt WHERE id = 1;
+→ [{"id":1,"x":12}]
+
+UPDATE temp.rv SET x = 10 WHERE id = 1;
+
+DROP VIEW temp.rv2;
+DROP VIEW temp.rv;
+DROP TABLE temp.rt;
+
+-- Test 26: within-path ordering — a TABLE in an earlier entry beats a VIEW of
+-- the same name in a later one, and vice versa. (A table/view collision inside
+-- ONE schema is impossible; CREATE TABLE / CREATE VIEW reject it.)
+CREATE TABLE main.dual_name (id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO main.dual_name VALUES (1, 'table-in-main');
+CREATE TABLE temp.dn_src (id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO temp.dn_src VALUES (1, 'view-in-temp');
+CREATE VIEW temp.dual_name AS SELECT id, tag FROM dn_src;
+
+PRAGMA schema_path = 'main,temp';
+
+SELECT tag FROM dual_name;
+→ [{"tag":"table-in-main"}]
+
+PRAGMA schema_path = 'temp,main';
+
+SELECT tag FROM dual_name;
+→ [{"tag":"view-in-temp"}]
+
+-- a qualified reference is unaffected by the path either way
+SELECT tag FROM main.dual_name;
+→ [{"tag":"table-in-main"}]
+
+SELECT tag FROM temp.dual_name;
+→ [{"tag":"view-in-temp"}]
+
+PRAGMA schema_path = 'main';
+
+DROP VIEW temp.dual_name;
+DROP TABLE temp.dn_src;
+DROP TABLE main.dual_name;

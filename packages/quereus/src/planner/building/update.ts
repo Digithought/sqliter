@@ -24,6 +24,7 @@ import { isCommittedSchemaRef } from './schema-resolution.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { buildViewMutation } from './view-mutation-builder.js';
 import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivation.js';
+import { isViewSchema } from '../../schema/view.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { buildWithContext } from './select-context.js';
@@ -97,9 +98,11 @@ export function buildUpdateStmt(
   // hook then syncs the backing. See docs/materialized-views.md § Write boundary.
   // Dispatch order is load-bearing: a maintained table (derivation-bearing)
   // must hit the view-mutation rewrite, never the direct table write.
-  const updateMaintained = ctx.schemaManager.getMaintainedTable(stmt.table.schema ?? null, stmt.table.name);
-  const updateView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
-    ?? (updateMaintained ? maintainedTableViewLike(updateMaintained) : undefined);
+  // An unqualified target resolves through the schema search path, exactly as an
+  // unqualified read does (see `SchemaManager.findSchemaItem`).
+  const updateTarget = ctx.schemaManager.findSchemaItem(stmt.table.name, stmt.table.schema, contextWithSchemaPath.schemaPath);
+  const updateView = isViewSchema(updateTarget) ? updateTarget
+    : (isMaintainedTable(updateTarget) ? maintainedTableViewLike(updateTarget) : undefined);
   if (updateView) {
     // Route through the view-mutation substrate (single-source = one base op).
     return buildViewMutation(contextWithCTEs, updateView, { op: 'update', stmt });
