@@ -369,6 +369,23 @@ describe('home-schema body resolution (view write-through)', () => {
 		expect(await all(db, 'select id, x from main.sr'), 'main.sr untouched').to.deep.equal([{ id: 2, x: 2000 }]);
 	});
 
+	it("resolves a CTE chain's base table on the session path when a rename list must be paired", async () => {
+		// The CTE-body flattener collapses `a` → `t` down to one base-table body, and pairing
+		// the rename list `a (p, q)` with a `select *` body needs the base table's ORDERED
+		// column list. That lookup consulted one fixed schema, so an off-`main` base table
+		// read as unresolvable and the write was rejected ("a column rename over a 'select *'
+		// body whose source columns are not statically resolvable cannot be inlined") even
+		// though the identical statement against `main.ml2` worked. Ephemeral target: the
+		// caller's path IS the right environment, so no home-schema swap is involved.
+		await db.exec("pragma schema_path = 'temp,main'");
+		await db.exec('create table temp.ml2 (id integer primary key, v integer)');
+		await db.exec('insert into temp.ml2 values (1, 10), (2, 20)');
+		await db.exec('with a (p, q) as (select * from ml2), t as (select * from a) '
+			+ 'update t set q = 99 where p = 1');
+		expect(await all(db, 'select id, v from temp.ml2 order by id'))
+			.to.deep.equal([{ id: 1, v: 99 }, { id: 2, v: 20 }]);
+	});
+
 	it('rejects write-through a non-main view whose body names another view unqualified', async () => {
 		await db.exec('create table temp.nt (id integer primary key, x integer)');
 		await db.exec('insert into temp.nt values (1, 10)');
@@ -964,5 +981,237 @@ describe('a view definition carries its declared `with schema` path into write-t
 		await db.exec("delete from main.wfv3 where src = 'C'");
 		expect(await all(db, 'select id, x from main.wf3c')).to.deep.equal([]);
 		expect(await all(db, 'select id, x from main.wf3b')).to.deep.equal([{ id: 2, x: 20 }]);
+	});
+});
+
+/**
+ * The STATIC half of the same rule (`bug-view-write-subquery-shadow-analysis-wrong-schema`).
+ * Before a write through a view is lowered onto its base table, the planner analyses every
+ * sub-query in the statement and asks, per `from` source, "which columns does this source
+ * have?" — the shadow set that decides whether each column reference inside the sub-query
+ * is local to it or reaches OUTWARD to the view's row. That lookup used to resolve the
+ * source's name in one fixed schema (the connection's current schema, normally `main`),
+ * consulting neither the session `schema_path` nor — for a fragment copied out of the view's
+ * own definition — the view's home environment, while the executing plan resolved the same
+ * names through the path. The two disagreed, in two visible ways:
+ *
+ *  - a sub-query in the USER's own statement over a table reached through the session path
+ *    was reported "not statically resolvable" and the whole statement rejected;
+ *  - a sub-query inside the view's DEFINITION was sized up from a same-named table in `main`
+ *    instead of the view's real source, so a local reference was mistaken for an outward
+ *    correlation and re-pointed at the row being updated — a silent change of meaning.
+ *
+ * The analysis now resolves through `SchemaManager.findSchemaItem` on the environment
+ * `fromResolutionContext` (`planner/mutation/scope-transform.ts`) enters, mirroring
+ * `buildSelectStmt`. Every case below therefore asserts the write's row set EQUALS the
+ * matching read's — a does-not-throw assertion would miss the second failure mode entirely.
+ */
+describe('write-through sub-query shadow analysis resolves sources like the plan does', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it("analyses an OUTWARD reference in a user sub-query whose source needs the session path", async () => {
+		await db.exec("pragma schema_path = 'temp,main'");
+		await db.exec('create table temp.t (id integer primary key, x integer)');
+		await db.exec('create table temp.side (tag text primary key, ref integer)');
+		await db.exec('insert into temp.t values (1, 10), (2, 20)');
+		await db.exec("insert into temp.side values ('a', 2)");
+		await db.exec('create view temp.v as select id, x from t');
+
+		// `side` has no `id`, so the bare `id` is an outward correlation to the view row.
+		// The analysis has to size `side` up to know that — and `temp.side` is a plain
+		// table, not the `select *` / TVF / unresolved source the reject describes.
+		const pred = 'exists (select 1 from side where side.ref = id)';
+		expect(await all(db, `select id from temp.v where ${pred} order by id`), 'the matching read')
+			.to.deep.equal([{ id: 2 }]);
+
+		await db.exec(`update temp.v set x = 99 where ${pred}`);
+		expect(await all(db, 'select id, x from temp.t order by id'), 'the write touched the same row')
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 99 }]);
+	});
+
+	it('analyses a SHADOWED reference in a user sub-query whose source needs the session path', async () => {
+		// The discriminating twin of the case above: here the source DOES have an `id`, so
+		// the bare `id` is the sub-query's own column and the predicate is trivially true
+		// for every view row (`sd` is non-empty). Mistaking it for an outward correlation
+		// would silently narrow the write to row 1 alone.
+		await db.exec("pragma schema_path = 'temp,main'");
+		await db.exec('create table temp.t2 (id integer primary key, x integer)');
+		await db.exec('create table temp.sd (id integer primary key)');
+		await db.exec('insert into temp.t2 values (1, 10), (2, 20)');
+		await db.exec('insert into temp.sd values (1)');
+		await db.exec('create view temp.v2 as select id, x from t2');
+
+		const pred = 'exists (select 1 from sd where sd.id = id)';
+		expect(await all(db, `select id from temp.v2 where ${pred} order by id`), 'the matching read')
+			.to.deep.equal([{ id: 1 }, { id: 2 }]);
+
+		await db.exec(`update temp.v2 set x = 99 where ${pred}`);
+		expect(await all(db, 'select id, x from temp.t2 order by id'), 'the write touched the same rows')
+			.to.deep.equal([{ id: 1, x: 99 }, { id: 2, x: 99 }]);
+	});
+
+	it("sizes a body sub-query's source up in the home schema when main holds a same-named table", async () => {
+		// The silent arm. `gl` exists in both schemas; only `temp.gl` has an `id`, so the
+		// body's `(select lbl from gl where id = 1)` binds `gl.id` LOCALLY and yields one
+		// row. Sized up as `main.gl` (no `id`) the analysis concludes `id` must be an
+		// outward correlation and re-points it at the row being updated — the lowered
+		// predicate becomes `(select lbl from gl where __vm_self.id = 1)`, no longer
+		// single-row. With a different column layout the same mis-decision produces no
+		// error at all, only a row set that disagrees with the read.
+		await db.exec('create table temp.gt (id integer primary key, x integer)');
+		await db.exec('create table temp.gl (id integer primary key, lbl text)');
+		await db.exec('create table main.gl (gid integer primary key, lbl text)');
+		await db.exec('create table main.side (tag text primary key)');
+		await db.exec('insert into temp.gt values (1, 10), (2, 20)');
+		await db.exec("insert into temp.gl values (1, 'one'), (2, 'two')");
+		await db.exec("insert into main.side values ('one')");
+		await db.exec('create view temp.gv as select id, x, (select lbl from gl where id = 1) as lbl from gt');
+
+		expect(await all(db, 'select id, x, lbl from temp.gv order by id'), 'the read binds temp.gl')
+			.to.deep.equal([{ id: 1, x: 10, lbl: 'one' }, { id: 2, x: 20, lbl: 'one' }]);
+
+		// The row set the write must land on, spelled straight against the base tables —
+		// the same predicate reading through the view computes. It is spelled that way
+		// rather than as `select id from temp.gv where exists (… side.tag = lbl)` because
+		// that (equivalent) reading form hits an unrelated pre-existing defect: a
+		// correlated sub-query cannot reference an outer COMPUTED projection column. See
+		// tickets/fix/bug-correlated-subquery-cannot-read-outer-computed-column.
+		const oracle = await all(db, 'select id from temp.gt where exists '
+			+ '(select 1 from main.side where side.tag = (select lbl from temp.gl where id = 1)) order by id');
+		expect(oracle, 'the matching read').to.deep.equal([{ id: 1 }, { id: 2 }]);
+
+		const written = await all(db, 'update temp.gv set x = 77 '
+			+ 'where exists (select 1 from side where side.tag = lbl) returning id');
+		expect([...written].sort((a, b) => Number(a.id) - Number(b.id)), 'the write touched the same rows')
+			.to.deep.equal(oracle);
+		expect(await all(db, 'select id, x from temp.gt order by id'))
+			.to.deep.equal([{ id: 1, x: 77 }, { id: 2, x: 77 }]);
+	});
+
+	it("keeps the caller's own sub-query on the caller's path when the body's is on the home path", async () => {
+		// The negative control for the case above: one statement, two sub-queries, two
+		// environments. `pick` exists in both schemas with different rows; only the
+		// caller-authored one may bind `main.pick`.
+		await db.exec('create table temp.ct2 (id integer primary key, x integer)');
+		await db.exec('create table temp.ck2 (id integer primary key)');
+		await db.exec('create table main.pick (ref integer primary key)');
+		await db.exec('create table temp.pick (ref integer primary key)');
+		await db.exec('insert into temp.ct2 values (1, 10), (2, 20)');
+		await db.exec('insert into temp.ck2 values (1), (2)');
+		await db.exec('insert into main.pick values (1)');
+		await db.exec('insert into temp.pick values (2)');
+		await db.exec('create view temp.cv2 as select id, x from ct2 where exists (select 1 from ck2 where ck2.id = id)');
+
+		// `pick` has no `id`, so the bare `id` correlates outward to the view row.
+		const pred = 'exists (select 1 from pick where pick.ref = id)';
+		expect(await all(db, `select id from temp.cv2 where ${pred} order by id`), 'the read binds main.pick')
+			.to.deep.equal([{ id: 1 }]);
+
+		await db.exec(`update temp.cv2 set x = 0 where ${pred}`);
+		expect(await all(db, 'select id, x from temp.ct2 order by id'))
+			.to.deep.equal([{ id: 1, x: 0 }, { id: 2, x: 20 }]);
+	});
+
+	it("resolves a body sub-query's source on the definition's declared `with schema` path", async () => {
+		// Isolates step 2 of the environment entry from step 1. The view lives in `main`, so
+		// its plain HOME path is main-first and would bind `main.dk` — which has no `id`, so
+		// the analysis would call the body's bare `id` an outward correlation. The declared
+		// clause flips the order, and the plan binds `temp.dk`, where `id` is local. Getting
+		// only step 1 right is therefore still wrong here.
+		await db.exec('create table main.dt (id integer primary key, x integer)');
+		await db.exec('create table temp.dk (id integer primary key, lbl text)');
+		await db.exec('create table main.dk (gid integer primary key, lbl text)');
+		await db.exec('create table main.sel (tag text primary key)');
+		await db.exec('insert into main.dt values (1, 10), (2, 20)');
+		await db.exec("insert into temp.dk values (1, 'one'), (2, 'two')");
+		await db.exec("insert into main.sel values ('one')");
+		await db.exec('create view main.dv as select id, x, '
+			+ '(select lbl from dk where id = 1) as n from dt with schema "temp", main');
+
+		expect(await all(db, 'select id, x, n from main.dv order by id'), 'the read binds temp.dk')
+			.to.deep.equal([{ id: 1, x: 10, n: 'one' }, { id: 2, x: 20, n: 'one' }]);
+
+		const oracle = await all(db, 'select id from main.dt where exists '
+			+ '(select 1 from main.sel where sel.tag = (select lbl from temp.dk where id = 1)) order by id');
+		expect(oracle, 'the matching read').to.deep.equal([{ id: 1 }, { id: 2 }]);
+
+		const written = await all(db, 'update main.dv set x = 55 '
+			+ 'where exists (select 1 from sel where sel.tag = n) returning id');
+		expect([...written].sort((a, b) => Number(a.id) - Number(b.id)), 'the write touched the same rows')
+			.to.deep.equal(oracle);
+		expect(await all(db, 'select id, x from main.dt order by id'))
+			.to.deep.equal([{ id: 1, x: 55 }, { id: 2, x: 55 }]);
+	});
+
+	// --- the conservative path must stay conservative ---
+
+	it('still rejects a user sub-query over a `select *` source under a session path', async () => {
+		await db.exec("pragma schema_path = 'temp,main'");
+		await db.exec('create table temp.nb (id integer primary key, lbl text)');
+		await db.exec('create table temp.nsrc (tag text)');
+		await db.exec("insert into temp.nb values (1, 'a')");
+		await db.exec("insert into temp.nsrc values ('a')");
+		await db.exec('create view temp.nv as select id, lbl from nb');
+
+		// The source's columns are genuinely not statically knowable, so the bare `lbl`
+		// cannot be proven correlated — the path-aware lookup must not turn this into a
+		// silent mis-bind.
+		let message = '';
+		try {
+			await db.exec("update temp.nv set lbl = 'X' where exists (select 1 from (select * from nsrc) s where s.tag = lbl)");
+		} catch (e) {
+			message = (e as Error).message;
+		}
+		expect(message).to.contain('cannot be proven correlated');
+		expect(await all(db, 'select id, lbl from temp.nb'), 'no rows written')
+			.to.deep.equal([{ id: 1, lbl: 'a' }]);
+	});
+
+	it('still rejects a user sub-query over a table-valued function under a session path', async () => {
+		await db.exec("pragma schema_path = 'temp,main'");
+		await db.exec('create table temp.fb (id integer primary key, lbl text)');
+		await db.exec("insert into temp.fb values (1, 'a')");
+		await db.exec('create view temp.fv as select id, lbl from fb');
+
+		let message = '';
+		try {
+			await db.exec("update temp.fv set lbl = 'X' where exists (select 1 from generate_series(1, 3) where value = id)");
+		} catch (e) {
+			message = (e as Error).message;
+		}
+		expect(message).to.contain('cannot be proven correlated');
+		expect(await all(db, 'select id, lbl from temp.fb'), 'no rows written')
+			.to.deep.equal([{ id: 1, lbl: 'a' }]);
+	});
+
+	it('pins the body-local-block boundary of the analysis environment', async () => {
+		// `fromResolutionContext` enters `storedBodyContext`, which CLEARS the caller's CTE
+		// namespace — so a stamped fragment naming a BODY-LOCAL block (`blk`) resolves to
+		// nothing in the analysis, which has no plan nodes to rebuild that namespace from.
+		// Not a regression (before the fix such a name missed the fixed-schema lookup and
+		// fell through to the caller's CTEs, which hold no body-local definitions either),
+		// and this shape does not reach the lineage descent at all — so the write succeeds.
+		// Pinned so a future change to that clearing trips a test rather than a user.
+		await db.exec('create table temp.bt (id integer primary key, x integer)');
+		await db.exec('create table temp.bl (id integer primary key, lbl text)');
+		await db.exec('insert into temp.bt values (1, 10), (2, 20)');
+		await db.exec("insert into temp.bl values (1, 'one'), (2, 'two')");
+		await db.exec('create view temp.bv as with blk as (select id, lbl from bl) '
+			+ 'select id, x, (select lbl from blk where blk.id = bt.id) as lbl from bt');
+
+		expect(await all(db, 'select id, x, lbl from temp.bv order by id'))
+			.to.deep.equal([{ id: 1, x: 10, lbl: 'one' }, { id: 2, x: 20, lbl: 'two' }]);
+
+		await db.exec("update temp.bv set x = 99 where lbl = 'one'");
+		expect(await all(db, 'select id, x from temp.bt order by id'))
+			.to.deep.equal([{ id: 1, x: 99 }, { id: 2, x: 20 }]);
 	});
 });

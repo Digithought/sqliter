@@ -419,11 +419,24 @@ function cloneInverse(
 	return inverse?.map(a => ({ ...a, expr: cloneExpr(a.expr) }));
 }
 
-/** The base table's column names for a flattened body whose FROM is one base table, or null. */
+/**
+ * The base table's column names for a flattened body whose FROM is one base table, or null.
+ *
+ * Path-aware (`findTable` against `ctx.schemaPath`), not a fixed-schema `getTable`: the
+ * flattened body is planned on this same context, so a fixed-schema lookup would report
+ * an off-current-schema base table as unresolvable and reject a rename-over-`select *`
+ * chain the plan resolves fine — the same defect fixed in `scope-transform.ts`'s
+ * {@link import('./scope-transform.js').collectFromColumnNames}.
+ *
+ * Unlike that one this needs no home-schema swap. A CTE write target is EPHEMERAL — its
+ * body comes from the caller's own statement, never from a stored view definition — so
+ * the caller's search path IS the right environment and there is no `StoredBodyEnv` to
+ * re-enter.
+ */
 function baseColumnsOf(ctx: PlanningContext, innerFlat: AST.SelectStmt): string[] | null {
 	const fc = innerFlat.from?.[0];
 	if (!fc || fc.type !== 'table') return null;
-	const table = ctx.schemaManager.getTable(fc.table.schema, fc.table.name);
+	const table = ctx.schemaManager.findTable(fc.table.name, fc.table.schema, ctx.schemaPath);
 	return table ? table.columns.map(c => c.name) : null;
 }
 
