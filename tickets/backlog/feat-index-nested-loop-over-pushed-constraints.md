@@ -34,6 +34,22 @@ picking between those is the real design question here.
 different site (the key-set semi join). If both get solved, they likely want the same
 mechanism.
 
+**Update — the design question above is settled, and the mechanism is being built.**
+`implement/feat-index-seek-records-pushed-predicate` threads the planner-level constraint
+objects onto the physical node: `IndexSeekNode` gains a `pushedConstraints` field holding
+the exact `PredicateConstraint` objects `rule-select-access-path` consumed, each carrying
+its original expression. That is precisely what a fresh `getBestAccessPlan` request needs
+here, so once it lands this ticket's obstacle is gone and the remaining work is the
+combine-and-re-ask logic in `index-nested-loop.ts`. Add
+`feat-index-seek-records-pushed-predicate` as a `prereq:` when promoting.
+
+Two cautions the sibling ticket surfaced. First, this rule is itself the source of
+correlated `pushedConstraints`: the seeks it builds carry `innerCol = outerCol`
+constraints referencing the outer side, so a consumer that re-applies them out of position
+is wrong — relevant if this rule ever reads another leaf's record. Second, when the module
+claims only the join-key equality out of the combined request, the local predicate has to
+come back as a residual `Filter`; the combined answer's `handledFilters` is what decides.
+
 How much this costs in practice is mild: it only bites when the module actually claims
 the local predicate, and in that case the inner side already has *an* index seek. It is
 worth doing when a real query is measured losing the join-key seek to a less selective
