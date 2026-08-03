@@ -208,6 +208,18 @@ export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanN
 
 This establishes a clean “call-like” boundary: `Retrieve.bindings` declares required inputs; physical access nodes evaluate those inputs and deliver them to the module.
 
+### Seek provenance
+
+A seek's `FilterInfo` is the only place a claimed predicate is enforced: once `handledFilters[i] === true`, `rule-select-access-path` folds filter `i` into seek keys and it exists as a `Filter` nowhere in the tree. `FilterInfo.constraints` records only the encoded form (column index, operator, argv slot) — not enough to rebuild the predicate, because a comparison's effective collation is resolved from the *original expression's* operand types (`analysis/comparison-collation.ts`), not from the column alone.
+
+So `IndexSeekNode` also carries `pushedConstraints`: the exact `PredicateConstraint` objects the rule consumed, each with its `sourceExpression`. A later rule that wants to replace the seek's access method can therefore re-apply them (AND them with the exported `combineResidualExpressions`) or re-offer them to `getBestAccessPlan`, instead of having to decline because it cannot tell what predicate it would be dropping.
+
+- **Stamped at one site.** `selectPhysicalNode` stamps between the index-aware/legacy dispatch and `reattachUnconsumedConstraints`, descending through the collation-residual `Filter` a seek arm may wrap the leaf in — not at the individual `new IndexSeekNode(...)` calls.
+- **Contents.** Exactly the constraints this seek turned into keys or bounds, in `constraints` order. Deliberately *not* every claimed filter: a claimed-but-unconsumed reclaimable constraint is already re-applied above the leaf by `reattachUnconsumedConstraints`, and a claimed constraint outside `RECLAIMABLE_OPS` is enforced nowhere today (see that constant's note), so including either would misdescribe the field.
+- **Not always re-appliable in an arbitrary position.** `rules/join/index-nested-loop.ts` builds seeks from synthesized correlated equalities whose `sourceExpression` references an outer-side attribute. Recorded faithfully, but a consumer must gate on where it intends to re-apply.
+- **`orderingLoadBearing`** rides alongside on both `IndexScanNode` and `IndexSeekNode`: true when `rule-grow-retrieve` dropped a `Sort` because this access plan advertised the matching ordering, so a rewrite that changes the leaf's emission order must decline.
+- Neither field appears in `getLogicalAttributes` — they are provenance for rules, not EXPLAIN output.
+
 ### Runtime Execution
 
 **Query-based Execution**:

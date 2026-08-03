@@ -13,6 +13,9 @@ import type { FilterInfo } from '../../vtab/filter-info.js';
 import type { ScalarPlanNode } from './plan-node.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
 import { addSingletonFd } from '../util/fd-utils.js';
+// Type-only: the runtime cycle `constraint-extractor → nodes/reference → …` is real,
+// so this must never become a value import.
+import type { PredicateConstraint } from '../analysis/constraint-extractor.js';
 
 /**
  * Advertisement lifted from a `BestAccessPlanResult` onto a physical leaf node:
@@ -388,12 +391,77 @@ export class IndexSeekNode extends TableAccessNode {
 		public readonly rangeBoundedOn?: PhysicalProperties['rangeBoundedOn'],
 		/** When true, suppress the lifted `monotonicOn` advertisement (defensive escalation). */
 		public readonly suppressMonotonic: boolean = false,
+		/**
+		 * True when a SortNode was dropped on the strength of this seek's
+		 * `providesOrdering` (sort absorption in `rule-grow-retrieve`): the seek's
+		 * emission order is the only thing producing the requested ORDER BY.
+		 * Rewrites that change this leaf's emission order must decline. False for a
+		 * vacuously-advertised ordering nothing consumed.
+		 */
+		public readonly orderingLoadBearing: boolean = false,
+		/**
+		 * The planner-level constraints this seek's keys were built from — the exact
+		 * `PredicateConstraint` objects `rule-select-access-path` consumed, each carrying
+		 * its original `sourceExpression` (and therefore its effective comparison
+		 * collation, which `filterInfo.constraints` cannot express).
+		 *
+		 * This node's `FilterInfo` is the ONLY place these predicates are enforced: they
+		 * were dropped from the tree on the module's promise (`handledFilters`). A rewrite
+		 * that replaces this node's `FilterInfo` must re-apply them (as a `Filter`) or
+		 * re-offer them to the module; a rewrite that cannot must decline.
+		 *
+		 * Caveats for a consumer that re-applies them:
+		 * - Under a `COARSER_SAFE` collation cover the seek is already wrapped in a
+		 *   residual `Filter` carrying the same predicate, so re-applying yields a
+		 *   doubly-applied predicate — correct, but one extra evaluation.
+		 * - `rules/join/index-nested-loop.ts` builds seeks from *synthesized* correlated
+		 *   equalities (`innerCol = outerCol`) whose `sourceExpression` references an
+		 *   attribute from the OUTER side of the join. Those are recorded faithfully, but
+		 *   they are not re-appliable in an arbitrary position — a consumer must gate on
+		 *   the position it intends to re-apply at.
+		 *
+		 * Undefined ⇒ this node was built by a path that did not thread the consumed set
+		 * (never true for `selectPhysicalNode`'s output). An empty array is impossible: a
+		 * seek exists only because at least one constraint was consumed.
+		 */
+		public readonly pushedConstraints?: readonly PredicateConstraint[],
 	) {
 		super(scope, source, filterInfo, estimatedCostOverride);
 	}
 
 	getAccessMethod(): 'index-seek' {
 		return 'index-seek';
+	}
+
+	/**
+	 * Clone recording what this seek's `FilterInfo` is enforcing (see
+	 * {@link pushedConstraints}) and whether its emission order is load-bearing.
+	 * Exists so the single stamping site in `rule-select-access-path` need not
+	 * re-list every constructor argument.
+	 */
+	withProvenance(
+		pushedConstraints: readonly PredicateConstraint[],
+		orderingLoadBearing: boolean,
+	): IndexSeekNode {
+		return new IndexSeekNode(
+			this.scope,
+			this.source,
+			this.filterInfo,
+			this.indexName,
+			this.seekKeys,
+			this.isRange,
+			this.providesOrdering,
+			// No cost override: the base falls back to `filterInfo.indexInfoOutput.
+			// estimatedCost`, which is the very `accessPlan.cost` every seek arm passes
+			// as its override — so the clone re-derives the same self-cost. Same
+			// reasoning as `withChildren` below.
+			undefined,
+			this.advertisement,
+			this.rangeBoundedOn,
+			this.suppressMonotonic,
+			orderingLoadBearing,
+			pushedConstraints,
+		);
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
@@ -504,6 +572,11 @@ export class IndexSeekNode extends TableAccessNode {
 			this.advertisement,
 			this.rangeBoundedOn,
 			this.suppressMonotonic,
+			// Both must survive a rebuild: a lost `orderingLoadBearing` silently
+			// re-enables an emission-order rewrite that should decline, and lost
+			// `pushedConstraints` makes the seek look like it enforces nothing.
+			this.orderingLoadBearing,
+			this.pushedConstraints,
 		);
 	}
 }

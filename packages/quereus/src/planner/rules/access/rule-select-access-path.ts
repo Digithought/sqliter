@@ -433,7 +433,37 @@ export function selectPhysicalNode(
 		? selectPhysicalNodeFromPlan(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing)
 		: selectPhysicalNodeLegacy(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed, orderingLoadBearing);
 
-	return reattachUnconsumedConstraints(tableRef, accessPlan, constraints, consumed, leaf);
+	// Record on a seek leaf what its FilterInfo is now the sole enforcer of. Iterate
+	// `constraints` (not the Set) so the recorded order is deterministic and identical
+	// across the index-aware and legacy arms.
+	const stamped = stampSeekProvenance(leaf, constraints.filter(c => consumed.has(c)), orderingLoadBearing);
+
+	return reattachUnconsumedConstraints(tableRef, accessPlan, constraints, consumed, stamped);
+}
+
+/**
+ * Record on an IndexSeek leaf which planner-level constraints its `FilterInfo` is
+ * enforcing, plus whether its emission order is load-bearing. Descends through the
+ * collation-residual `Filter` the seek arms may wrap it in (the `COARSER_SAFE` arm's
+ * `finishSeek`), rebuilding on the way back out.
+ *
+ * A non-seek leaf (SeqScan after a collation decline, EmptyResult, IndexScan — which
+ * carries `orderingLoadBearing` from its own construction) is returned unchanged.
+ */
+function stampSeekProvenance(
+	node: RelationalPlanNode,
+	pushedConstraints: PlannerPredicateConstraint[],
+	orderingLoadBearing: boolean,
+): RelationalPlanNode {
+	if (node instanceof IndexSeekNode) {
+		return node.withProvenance(pushedConstraints, orderingLoadBearing);
+	}
+	if (node instanceof FilterNode) {
+		const inner = stampSeekProvenance(node.source, pushedConstraints, orderingLoadBearing);
+		if (inner === node.source) return node;
+		return new FilterNode(node.scope, inner, node.predicate);
+	}
+	return node;
 }
 
 /**
@@ -1562,8 +1592,12 @@ function classifyCollationCover(
  * AND-combine residual `sourceExpression`s into one predicate, de-duplicating by
  * identity (a BETWEEN yields two constraints sharing one source node). Mirrors the
  * `combineParts`/`combineResiduals` shape in constraint-extractor.ts.
+ *
+ * Exported for consumers of {@link IndexSeekNode.pushedConstraints}, which need the
+ * AND of the recorded `sourceExpression`s to re-apply as a `Filter` — same
+ * de-duplication, so a BETWEEN comes back as its single `BetweenNode`.
  */
-function combineResidualExpressions(exprs: ScalarPlanNode[]): ScalarPlanNode | undefined {
+export function combineResidualExpressions(exprs: ScalarPlanNode[]): ScalarPlanNode | undefined {
 	const unique: ScalarPlanNode[] = [];
 	for (const e of exprs) {
 		if (!unique.includes(e)) unique.push(e);
