@@ -524,6 +524,31 @@ update ax_filt set note = 'F';
 select cid, note from ax_child order by cid;
 → [{"cid":2,"note":"F"},{"cid":7,"note":"z"}]
 
+-- The join-body parallel of the single-source blocks (t)/(v) further down: a computed
+-- lineage column whose subquery correlates back to a SIDE by that side's alias. The
+-- multi-source spine re-points an owning-side qualifier to the lowered per-side
+-- statement's correlation alias at ANY depth (`stripSideQualifier`), so unlike the
+-- single-source spine this shape never needed a depth-split fix — this block pins that
+-- so the two spines cannot drift apart silently. De-correlated, `ax_lbl` would pin to
+-- its first row ('one') for every row and `lbl = 'two'` would match nothing.
+-- Own fixtures: the shared ax_parent / ax_child rows are asserted on by later blocks.
+create table axc_p (pid integer primary key, pv integer);
+create table axc_c (cid integer primary key, pref integer, note text,
+    foreign key (pref) references axc_p(pid));
+create table axc_l (pid integer primary key, lbl text);
+insert into axc_p values (10, 100), (20, 200);
+insert into axc_c values (1, 10, 'a'), (2, 20, 'b');
+insert into axc_l values (10, 'one'), (20, 'two');
+create view axc_v as
+    select c.cid as cid, c.note as note,
+        (select lbl from axc_l where axc_l.pid = p.pid) as lbl
+    from axc_c c join axc_p p on p.pid = c.pref;
+select cid, lbl from axc_v order by cid;
+→ [{"cid":1,"lbl":"one"},{"cid":2,"lbl":"two"}]
+update axc_v set note = 'CORR' where lbl = 'two';
+select cid, note from axc_c order by cid;
+→ [{"cid":1,"note":"a"},{"cid":2,"note":"CORR"}]
+
 -- Explicit view column-list override (create view v (a,b) as ...): writes route by
 -- the override name to the underlying lineage.
 create view ax_named (k, n) as select c.cid, c.note from ax_child c join ax_parent p on p.pid = c.pref;
@@ -2239,6 +2264,70 @@ create view qr_v as select id as id, x as x,
 
 update qr_v set x = 33 where id = 2 returning id, x, lbl;
 → [{"id":2,"x":33,"lbl":"two"}]
+
+-- --- (aa) INSERT … RETURNING through an ALIAS-qualified lineage correlation ---
+-- INSERT lowers onto the BARE base-table name (its base statement has no target-row
+-- scan for a subquery to correlate to), so it keeps the default correlation name
+-- rather than __vm_self. For a body that aliases its source (`from qi_t a … a.id`)
+-- the nested qualifier is therefore re-pointed `a.` → `qi_t.`, which is what makes
+-- it resolvable at all — verbatim `a.` bound to nothing. RETURNING re-projects the
+-- computed column, so this is the INSERT-side dual of (z).
+create table qi_t (id integer primary key, x integer);
+create table qi_l (id integer primary key, lbl text);
+insert into qi_l values (1, 'one'), (2, 'two');
+create view qi_v as select a.id as id, a.x as x,
+    (select lbl from qi_l where qi_l.id = a.id) as lbl from qi_t a;
+
+insert into qi_v (id, x) values (2, 20) returning id, x, lbl;
+→ [{"id":2,"x":20,"lbl":"two"}]
+
+select id, x, lbl from qi_v order by id;
+→ [{"id":2,"x":20,"lbl":"two"}]
+
+-- --- (ab) the correlation sits TWO subquery levels down ---
+-- The nested rewrite recurses, so a qualifier inside a subquery of the lineage
+-- subquery is re-pointed the same way. De-correlated at either level, `qn_m` would
+-- pin to its first row (mid 100) for every base row and `lbl = 'two'` would match
+-- nothing — the update would be a no-op.
+create table qn_t (id integer primary key, x integer);
+create table qn_m (id integer primary key, mid integer);
+create table qn_l (mid integer primary key, lbl text);
+insert into qn_t values (1, 10), (2, 20);
+insert into qn_m values (1, 100), (2, 200);
+insert into qn_l values (100, 'one'), (200, 'two');
+create view qn_v as select id as id, x as x,
+    (select lbl from qn_l where qn_l.mid = (select mid from qn_m where qn_m.id = qn_t.id)) as lbl
+    from qn_t;
+
+select id, lbl from qn_v order by id;
+→ [{"id":1,"lbl":"one"},{"id":2,"lbl":"two"}]
+
+update qn_v set x = 44 where lbl = 'two';
+select id, x from qn_t order by id;
+→ [{"id":1,"x":10},{"id":2,"x":44}]
+
+-- --- (ac) COMPOUND legs inside a lineage subquery scope independently ---
+-- A union leg is a SIBLING of its neighbour, not nested inside it: it sees the
+-- ENCLOSING alias-shadow set, not the other leg's FROM. Leg 1 FROMs the view's own
+-- base table, so its `qc_t.` refs are local (and its `id = 99` filter makes it
+-- return nothing); leg 2 FROMs qc_l, so its `qc_t.id` is an outer correlation and
+-- must be re-pointed. Had leg 2 inherited leg 1's alias set, `qc_t.id` would have
+-- been left local and the statement would fail to resolve it.
+create table qc_t (id integer primary key, x integer, lbl2 text);
+create table qc_l (id integer primary key, lbl text);
+insert into qc_t values (1, 10, 'never'), (2, 20, 'never');
+insert into qc_l values (2, 'two');
+create view qc_v as select id as id, x as x,
+    (select qc_t.lbl2 from qc_t where qc_t.id = 99
+     union all
+     select lbl from qc_l where qc_l.id = qc_t.id) as lbl from qc_t;
+
+select id, lbl from qc_v order by id;
+→ [{"id":1,"lbl":null},{"id":2,"lbl":"two"}]
+
+update qc_v set x = 77 where lbl = 'two';
+select id, x from qc_t order by id;
+→ [{"id":1,"x":10},{"id":2,"x":77}]
 
 -- ===================================
 -- Phase 2b: Multi-source key-preserving inner-join INSERT (shared-surrogate

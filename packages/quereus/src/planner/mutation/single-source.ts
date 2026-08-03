@@ -249,9 +249,12 @@ export function combineAnd(a: AST.Expression | undefined, b: AST.Expression | un
  * unchanged. This mirrors the multi-source spine's `stripSideQualifier`
  * (owning-side alias → `__vm_self`, at any depth, alias-scope-aware).
  *
- * `correlationName` defaults to the base table's own name: INSERT lowers onto the
- * bare base-table name, so the nested rewrite is a no-op there. UPDATE/DELETE pass
- * the synthesised {@link SELF_ALIAS} their lowered target carries.
+ * `correlationName` defaults to the base table's own name, which is what INSERT
+ * lowers onto. That default is a textual no-op only for a body that already spells
+ * the qualifier as the table name; for a body that ALIASES its source
+ * (`from t a … a.id`) it rewrites `a.` → `t.`, which is what makes the reference
+ * resolvable at all. UPDATE/DELETE pass the synthesised {@link SELF_ALIAS} their
+ * lowered target carries.
  */
 function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>, correlationName: string): AST.Expression {
 	const stripTop = (col: AST.ColumnExpr): AST.Expression | undefined =>
@@ -262,8 +265,18 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>, c
 		if (aliasShadow.has(lcQual) || !aliases.has(lcQual)) return undefined;
 		// `schema` is cleared alongside the qualifier so a `main.gt.id` spelling cannot
 		// produce `main.__vm_self.id` (the correlation name lives in no schema).
+		// NOTE: unreachable today and deliberately kept as a guard — `resolveColumn`
+		// resolves no `schema.table.column` reference anywhere (the symbol is never
+		// registered), so such a body fails at CREATE VIEW long before this runs. If
+		// that spelling is ever made resolvable, this clear becomes live and needs a
+		// sqllogic block; until then it cannot be covered from SQL.
 		return { ...col, table: correlationName, schema: undefined };
 	};
+	// NOTE: threading a `descend` makes this deep-clone each fragment's nested
+	// sub-selects (previously they were shared verbatim) — once per view column plus
+	// the body WHERE, per plan BUILD, and plans are cached. Same order as the whole-body
+	// clone in `view-mutation-builder.ts`; if very large view bodies plus high plan-cache
+	// churn ever show up in a profile, gate both on "body contains a nested sub-select".
 	return transformExpr(expr, stripTop, (q) => transformAliasScopedQuery(q, requalifyNested));
 }
 
@@ -471,8 +484,10 @@ export function makeViewColumnDescend(
  * re-point a base-source qualifier that appears INSIDE one of the copied definition
  * fragments' own subqueries ({@link normalizeBaseRefs}). UPDATE/DELETE pass the
  * synthesised {@link SELF_ALIAS} their lowered target carries; INSERT and the CTE
- * self-capture keep the default (they lower onto the bare base-table name, so the
- * re-point is a no-op).
+ * self-capture keep the default — the bare base-table name they lower onto (which
+ * still rewrites an ALIAS-qualified body correlation to that name; see
+ * {@link normalizeBaseRefs}). The CTE self-capture reads only `viewColumns` off the
+ * analysis, so the name it passes never reaches a copied fragment.
  */
 function analyzeView(ctx: PlanningContext, view: MutableViewLike, correlationName?: string): ViewAnalysis {
 	// Lens read-only gate: a logical table whose primary key is not reconstructible
