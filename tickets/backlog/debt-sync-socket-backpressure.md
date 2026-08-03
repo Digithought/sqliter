@@ -2,6 +2,7 @@ description: The sync server writes messages to a client's socket as fast as it 
 files:
   - packages/sync-coordinator/src/server/websocket.ts   # sendMessage / snapshot + change broadcast loops
   - packages/sync-coordinator/src/service/coordinator-service.ts
+  - packages/quereus-sync-client/src/snapshot-reader.ts # receiving half — unbounded chunk queue (added by feat-sync-client-snapshot-bootstrap)
 ----
 
 ## Problem
@@ -25,3 +26,16 @@ Surfaced by the same review as the shared-protocol work.
   path needs the same treatment.
 
 Hardening under adverse client behavior; backlog rather than an active bug.
+
+## Second arm — the receiving side has the same shape
+
+Added while planning `feat-sync-client-snapshot-bootstrap`, which builds the client half of
+snapshot download. The sync client turns incoming `snapshot_chunk` messages into a queue that
+`applySnapshotStream` drains at its own pace (`SnapshotStreamReader` in
+`packages/quereus-sync-client/src/snapshot-reader.ts`). Nothing paces the sender, so a client
+whose disk writes are slower than the server's sends holds the not-yet-applied remainder of
+the snapshot in memory. It ships with a high-water-mark warning and no flow control.
+
+This is the mirror image of the server arm and the same fix resolves both: whatever pacing
+signal the streaming send path grows, the client is where the "I am behind" signal has to come
+from. Design the two together rather than separately.

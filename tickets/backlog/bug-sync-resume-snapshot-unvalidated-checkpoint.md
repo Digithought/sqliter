@@ -26,3 +26,25 @@ Surfaced by the same review as the shared-protocol work; separable from it.
   client-held — that changes whether validation or authentication is the right guard.
 
 Security-adjacent input hardening; needs a validation design before implementation.
+
+## Second arm — settle what `checkpoint.siteId` actually denotes
+
+Found while planning `feat-sync-client-snapshot-bootstrap`. The bullet above wants the
+checkpoint's `siteId` validated "consistent with the session", but the field's meaning is
+currently ambiguous, so there is nothing to validate against yet.
+
+- The **receiver** writes it: `applySnapshotStream` saves `siteId: ctx.getSiteId()` — the
+  downloading client's own site id (`packages/quereus-sync/src/sync/snapshot-stream.ts`,
+  checkpoint save in `flushMetadataBatch`).
+- The **sender** reads it back as if it were its own: `resumeSnapshotStream` passes
+  `checkpoint.siteId` through to `streamSnapshotChunks`, which stamps it into the resumed
+  stream's header — where a fresh stream puts `ctx.getSiteId()`, the *server's* site id.
+
+So a resumed snapshot's header advertises the client's site id as the snapshot's origin.
+Nothing reads `header.siteId` today (`applySnapshotStream` uses only `snapshotId`, `hlc`,
+`tableCount`, `snapshotFormat`), so it is inert — but any future consumer of that field on a
+resumed stream gets the wrong site. Decide which site the field names, fix the writer or the
+reader accordingly, and only then write the session-consistency check.
+
+(By contrast `checkpoint.hlc` is used correctly: the resumed header carries the *original*
+snapshot's HLC, which is the point-in-time the transfer is completing.)
