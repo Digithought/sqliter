@@ -240,6 +240,10 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 			log('Inserted right sort for merge join');
 		}
 
+		// NOTE: merge takes `preserveAttrs` unpermuted because it never swaps its
+		// sides — the sort wrappers preserve each child's attribute order, so
+		// logical-left-then-right IS the emitted layout here. If merge ever grows a
+		// side swap, it needs the same permutation the hash path does below.
 		return new MergeJoinNode(
 			node.scope,
 			leftSource,
@@ -258,6 +262,7 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	let probeSource = node.left;
 	let buildSource = node.right;
 	let equiPairs = extracted.equiPairs;
+	let hashAttrs = preserveAttrs;
 
 	// For INNER join, swap sides if left is smaller (becomes build side).
 	// For LEFT/SEMI/ANTI, left must remain probe to preserve semantics.
@@ -275,6 +280,20 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 			leftAttrId: p.rightAttrId,
 			rightAttrId: p.leftAttrId
 		}));
+		// INVARIANT: a physical join's advertised attribute order IS its emitted
+		// row layout. `emitBloomJoin` yields `[...leftRow, ...rightRow]` — that is,
+		// probe-then-build — and `getType()`, `combineJoinKeys` and
+		// `computePhysical`'s `leftAttrs.length` FD shift all describe the row the
+		// same way. So the preserved attributes must be permuted with the sides:
+		// same attribute IDs (which is all `preserveAttributeIds` guarantees —
+		// id stability, not position stability), new order. Skipping this makes
+		// any positional consumer that maps attribute id → column index through
+		// `getAttributes()` (e.g. `emitHashAggregate`'s scan row descriptor) read
+		// the wrong slot and silently return wrong values.
+		hashAttrs = [
+			...preserveAttrs.slice(leftAttrs.length),
+			...preserveAttrs.slice(0, leftAttrs.length),
+		];
 	}
 
 	return new BloomJoinNode(
@@ -284,6 +303,6 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		joinType,
 		equiPairs,
 		extracted.residual,
-		preserveAttrs
+		hashAttrs
 	);
 }

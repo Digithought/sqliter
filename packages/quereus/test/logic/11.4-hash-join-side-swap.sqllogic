@@ -1,0 +1,116 @@
+-- 11.4-hash-join-side-swap.sqllogic
+-- Row-equality coverage for the hash join's build/probe side swap
+-- (rule-join-physical-selection). When the logical LEFT input is the smaller of
+-- the two, an INNER hash join swaps the sides so the smaller one is the hash
+-- build side. The emitted row is then probe-then-build — the reverse of the
+-- logical left-then-right order — and the node's advertised attributes must be
+-- permuted to match. When they were not, any consumer mapping an attribute id
+-- to a column index through the join's attributes and then indexing the row
+-- positionally (the grouped-aggregate emitter is one) read the wrong slot and
+-- silently returned wrong values.
+--
+-- Every assertion here is pure row equality, so it holds whichever physical
+-- join the optimizer picks. The plan-shape assertions (that these shapes DO
+-- swap, and what the swapped node must advertise) live in
+-- test/optimizer/hash-join-side-swap.spec.ts.
+
+-- 4 x 8 with ANALYZE: hash beats nested loop and the left side is the smaller
+-- one, so the swap fires. Without ANALYZE both sides report the un-analyzed
+-- 100-row sentinel, `leftRows < rightRows` is false, and the swap never happens.
+CREATE TABLE hjs_s (id INTEGER PRIMARY KEY, k INTEGER);
+CREATE TABLE hjs_b (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER);
+INSERT INTO hjs_s VALUES (1,2),(2,1),(3,2),(4,1);
+INSERT INTO hjs_b VALUES (1,2,1),(2,1,2),(3,2,3),(4,1,4),(5,2,5),(6,1,6),(7,2,7),(8,1,8);
+
+-- Each ANALYZE is written as its OWN block with an expected result, not as a
+-- bare setup statement. ANALYZE is an async generator that does its work while
+-- being iterated, and this harness only drains the LAST statement of a block —
+-- a bare `ANALYZE;` in a setup block goes through `db.exec`, which never
+-- consumes the row iterator, so it collects nothing. (That is a real engine
+-- gap, tracked separately as `bug-analyze-via-exec-is-a-no-op`.) Draining it
+-- here is also the assertion that the statistics this whole file depends on
+-- actually landed: no row counts, no side swap, and every case below would
+-- pass vacuously.
+ANALYZE hjs_s;
+→ [{"table":"hjs_s","rows":4}]
+
+ANALYZE hjs_b;
+→ [{"table":"hjs_b","rows":8}]
+
+-- ===== The failing shape: a grouped aggregate above the swapped join =====
+-- k=1: s ids {2,4} x b v {2,4,6,8} -> 2 * 20 = 40
+-- k=2: s ids {1,3} x b v {1,3,5,7} -> 2 * 16 = 32
+SELECT s.k AS gk, sum(b.v) AS sv FROM hjs_s s JOIN hjs_b b ON b.k = s.k GROUP BY s.k ORDER BY s.k;
+→ [{"gk":1,"sv":40},{"gk":2,"sv":32}]
+
+-- The aggregate reading the PROBE side's column instead (both sides of the
+-- emitted row must be addressed correctly, not just the build side)
+-- k=1: (2+4) * 4 matching b rows = 24; k=2: (1+3) * 4 = 16
+SELECT s.k AS gk, sum(s.id) AS si FROM hjs_s s JOIN hjs_b b ON b.k = s.k GROUP BY s.k ORDER BY s.k;
+→ [{"gk":1,"si":24},{"gk":2,"si":16}]
+
+-- Grouping on the build-side column, aggregating the probe side
+SELECT b.k AS gk, sum(s.id) AS si FROM hjs_s s JOIN hjs_b b ON b.k = s.k GROUP BY b.k ORDER BY b.k;
+→ [{"gk":1,"si":24},{"gk":2,"si":16}]
+
+-- Both sides aggregated in one grouped query
+SELECT s.k AS gk, sum(b.v) AS sv, sum(s.id) AS si FROM hjs_s s JOIN hjs_b b ON b.k = s.k GROUP BY s.k ORDER BY s.k;
+→ [{"gk":1,"sv":40,"si":24},{"gk":2,"sv":32,"si":16}]
+
+-- ===== Other aggregate kinds over the same swapped join =====
+SELECT s.k AS gk, count(*) AS n, min(b.v) AS mn, max(b.v) AS mx
+FROM hjs_s s JOIN hjs_b b ON b.k = s.k GROUP BY s.k ORDER BY s.k;
+→ [{"gk":1,"n":8,"mn":2,"mx":8},{"gk":2,"n":8,"mn":1,"mx":7}]
+
+-- Ungrouped aggregate over the whole swapped join
+SELECT count(*) AS n, sum(b.v) AS sv, sum(s.id) AS si FROM hjs_s s JOIN hjs_b b ON b.k = s.k;
+→ [{"n":16,"sv":72,"si":40}]
+
+-- ===== The plain projection over the same join =====
+-- Passes even with the bug (column references above the join resolve through
+-- the join emitter's own per-side slots, each built from its own child's
+-- attributes). Kept so a future regression says WHICH consumer style broke.
+SELECT s.id AS sid, b.id AS bid, b.v AS bv FROM hjs_s s JOIN hjs_b b ON b.k = s.k ORDER BY sid, bid;
+→ [{"sid":1,"bid":1,"bv":1},{"sid":1,"bid":3,"bv":3},{"sid":1,"bid":5,"bv":5},{"sid":1,"bid":7,"bv":7},{"sid":2,"bid":2,"bv":2},{"sid":2,"bid":4,"bv":4},{"sid":2,"bid":6,"bv":6},{"sid":2,"bid":8,"bv":8},{"sid":3,"bid":1,"bv":1},{"sid":3,"bid":3,"bv":3},{"sid":3,"bid":5,"bv":5},{"sid":3,"bid":7,"bv":7},{"sid":4,"bid":2,"bv":2},{"sid":4,"bid":4,"bv":4},{"sid":4,"bid":6,"bv":6},{"sid":4,"bid":8,"bv":8}]
+
+-- ===== Sort and DISTINCT key extraction above the swapped join =====
+-- Both resolve attribute ids to column indices through the join's advertised
+-- attributes, so they read the emitted row positionally too.
+SELECT b.v AS bv FROM hjs_s s JOIN hjs_b b ON b.k = s.k ORDER BY bv DESC LIMIT 3;
+→ [{"bv":8},{"bv":8},{"bv":7}]
+
+SELECT DISTINCT s.k AS sk, b.k AS bk FROM hjs_s s JOIN hjs_b b ON b.k = s.k ORDER BY sk;
+→ [{"sk":1,"bk":1},{"sk":2,"bk":2}]
+
+SELECT DISTINCT b.v AS bv FROM hjs_s s JOIN hjs_b b ON b.k = s.k ORDER BY bv;
+→ [{"bv":1},{"bv":2},{"bv":3},{"bv":4},{"bv":5},{"bv":6},{"bv":7},{"bv":8}]
+
+-- ===== Three-table join with the aggregate on top =====
+CREATE TABLE hjs_t (id INTEGER PRIMARY KEY, k INTEGER, w INTEGER);
+INSERT INTO hjs_t VALUES (1,1,100),(2,2,200);
+ANALYZE hjs_t;
+→ [{"table":"hjs_t","rows":2}]
+
+-- Each group is s x b x t = 2 x 4 x 1 = 8 rows.
+-- k=1: sum(b.v) = 2*(2+4+6+8) = 40, sum(t.w) = 8*100 = 800
+-- k=2: sum(b.v) = 2*(1+3+5+7) = 32, sum(t.w) = 8*200 = 1600
+SELECT s.k AS gk, count(*) AS n, sum(b.v) AS sv, sum(t.w) AS tw
+FROM hjs_s s JOIN hjs_b b ON b.k = s.k JOIN hjs_t t ON t.k = s.k
+GROUP BY s.k ORDER BY s.k;
+→ [{"gk":1,"n":8,"sv":40,"tw":800},{"gk":2,"n":8,"sv":32,"tw":1600}]
+
+-- Same spine, plain projection (no aggregate) — one row per (s,b) pair since
+-- each key has exactly one t row
+SELECT s.id AS sid, b.id AS bid, t.w AS tw
+FROM hjs_s s JOIN hjs_b b ON b.k = s.k JOIN hjs_t t ON t.k = s.k
+ORDER BY sid, bid;
+→ [{"sid":1,"bid":1,"tw":200},{"sid":1,"bid":3,"tw":200},{"sid":1,"bid":5,"tw":200},{"sid":1,"bid":7,"tw":200},{"sid":2,"bid":2,"tw":100},{"sid":2,"bid":4,"tw":100},{"sid":2,"bid":6,"tw":100},{"sid":2,"bid":8,"tw":100},{"sid":3,"bid":1,"tw":200},{"sid":3,"bid":3,"tw":200},{"sid":3,"bid":5,"tw":200},{"sid":3,"bid":7,"tw":200},{"sid":4,"bid":2,"tw":100},{"sid":4,"bid":4,"tw":100},{"sid":4,"bid":6,"tw":100},{"sid":4,"bid":8,"tw":100}]
+
+-- ===== HAVING and an aggregate expression above the swapped join =====
+SELECT s.k AS gk, sum(b.v) AS sv FROM hjs_s s JOIN hjs_b b ON b.k = s.k
+GROUP BY s.k HAVING sum(b.v) > 35 ORDER BY s.k;
+→ [{"gk":1,"sv":40}]
+
+SELECT s.k AS gk, sum(b.v) + count(*) AS mixed FROM hjs_s s JOIN hjs_b b ON b.k = s.k
+GROUP BY s.k ORDER BY s.k;
+→ [{"gk":1,"mixed":48},{"gk":2,"mixed":40}]
