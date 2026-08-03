@@ -195,6 +195,25 @@ describe('Aggregate predicate pushdown', () => {
 			expect(await filtersAboveAggregate(q), 'plain GROUP BY predicate must push below the aggregate')
 				.to.equal(0);
 		});
+
+		it('still pushes an `or` conjunct whose sub-query is UNCORRELATED', async () => {
+			// The half that pins the guard to *correlation* rather than to "carries a
+			// sub-query". Same unsplittable `or` shape as the refused cases above, but the
+			// `exists` reads nothing from outside itself, so nothing is stranded below the
+			// aggregate and the conjunct must still push. `side` holds 1, so the `exists` is
+			// true and every group survives.
+			const q = 'select g, count(*) as c from t group by g '
+				+ 'having g > 0 or exists (select 1 from side where side.n = 1)';
+
+			expect(await allRows<{ g: number; c: number }>(q + ' order by g')).to.deep.equal([
+				{ g: -1, c: 4 },
+				{ g: 0, c: 1 },
+				{ g: 1, c: 2 },
+				{ g: 2, c: 1 },
+			]);
+			expect(await filtersAboveAggregate(q), 'uncorrelated sub-query must not block the push')
+				.to.equal(0);
+		});
 	});
 
 	it('scalar aggregate (no GROUP BY) — rule does not fire', async () => {

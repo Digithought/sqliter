@@ -56,6 +56,20 @@ select id from (select id, x * 2 as d from gt) t where (select max(t.d) from sid
 select id from (select id, x * 2 as d from gt) t where not exists (select 1 from side where t.d > 0);
 → [{"id":3},{"id":4}]
 
+-- The IN form: the correlated operand hangs off an `InNode`, which reports its own
+-- node type and exposes the relation only through `getChildren()`. The collector
+-- recognizes the relational child structurally, so no per-node-type list can rot.
+
+select id from (select id, x * 2 as d from gt) t where 1 in (select 1 from side where t.d > 0);
+→ [{"id":1},{"id":2}]
+
+-- Correlation buried two levels down: the operand's WHOLE subtree is scanned for
+-- outward references, not merely its top level.
+
+select id from (select id, x * 2 as d from gt) t
+	where exists (select 1 from side where exists (select 1 from side s2 where t.d > 0));
+→ [{"id":1},{"id":2}]
+
 -- Shapes that already worked and must keep working.
 
 select id from (select id, x from gt) t where exists (select 1 from side where t.x > 0);
@@ -131,13 +145,21 @@ select g, count(*) as c from t group by g
 	having g > 0 and (select max(side.n) from side where side.n = g) is not null order by g;
 → [{"g":1,"c":2},{"g":2,"c":1}]
 
--- A conjunct that is correlated but whose sub-query is NOT correlated to the
--- aggregate at all: `side.n` is local to the sub-query, so nothing is stranded and
--- the `g > 0` half still has to behave.
+-- An UNCORRELATED sub-query alongside `g > 0`. `and` splits the two apart, so each
+-- half is judged on its own and the `g > 0` half still has to behave.
 
 select g, count(*) as c from t group by g
 	having g > 0 and exists (select 1 from side where side.n = 1) order by g;
 → [{"g":1,"c":2},{"g":2,"c":1}]
+
+-- The same uncorrelated sub-query joined by `or`, so it CANNOT be split apart: one
+-- conjunct that both names a pushable GROUP BY column and carries a sub-query. The
+-- refusal above is about the correlation, not about carrying a sub-query, so this one
+-- must still push. `side` holds 1, so the `exists` is true and every group survives.
+
+select g, count(*) as c from t group by g
+	having g > 0 or exists (select 1 from side where side.n = 1) order by g;
+→ [{"g":-1,"c":4},{"g":0,"c":1},{"g":1,"c":2},{"g":2,"c":1}]
 
 drop table t;
 drop table side;

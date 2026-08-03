@@ -48,6 +48,11 @@ export function collectPredicateAttributeIds(expr: ScalarPlanNode): Set<number> 
 	return ids;
 }
 
+// NOTE: each relational child costs two full walks of its subtree (one to collect
+// what it defines, one to collect what it reads), and callers ask per conjunct per
+// rule firing. Predicate sub-query bodies are small today so nothing was measured;
+// if a rule ever shows up hot here, memoize per node — plan nodes are immutable, so
+// a WeakMap keyed on the relational child is sound.
 function walk(expr: ScalarPlanNode, direct: Set<number>, correlated: Set<number>): void {
 	if (CapabilityDetectors.isColumnReference(expr)) {
 		direct.add(expr.attributeId);

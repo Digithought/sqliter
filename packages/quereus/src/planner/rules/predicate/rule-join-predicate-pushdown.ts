@@ -49,9 +49,12 @@
  *   subquery — sees an id in neither side's set and is declined.
  *   NOTE: sound but pessimistic — `x.a = <outer>.b` would be safe on the `x`
  *   branch. Ignoring "in neither side" ids instead of refusing on them would
- *   recover that, but only after separating a genuinely-outer id from a
- *   subquery-internal one, which this walk does not currently distinguish.
- *   Left alone until a real correlated body is measured losing a seek to it.
+ *   recover that. {@link collectSubtreeAttributeIds} does not distinguish a
+ *   genuinely-outer id from a subquery-internal one, but
+ *   `analysis/predicate-dependencies.ts` does — its `correlated` set is exactly
+ *   the outer ids, and swapping this walk for it is the whole change. Left alone
+ *   until a real correlated body is measured losing a seek to it; the swap also
+ *   makes more conjuncts pushable, which needs its own plan-shape coverage.
  * - A conjunct with NO column references (`where 1 = 1`, `where :p > 0`) stays
  *   above; pushing it buys nothing and would make the rule fire on plans it
  *   should leave alone.
