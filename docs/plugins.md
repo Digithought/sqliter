@@ -938,17 +938,26 @@ Behavior:
   import { installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
 
   installNodeRemoteModuleResolver({
+    // The SHA-256 this URL must serve, or undefined to leave it unpinned.
+    // Consulted on every fetch, and asked with the normalized URL.
+    expectedHash: url => myPluginRecords.get(url)?.sha256,
     // Called after each fetch, before the module is imported. Awaited.
     onFetched: ({ url, sha256, bytes }) => console.log(`Fetched ${url} (${bytes} B, sha256 ${sha256})`),
     maxBytes: 5 * 1024 * 1024,   // default
   });
   ```
 
-  The resolver fetches the module, checks that redirects stayed on `https:`, enforces the size cap against both the declared `content-length` and the bytes actually received, SHA-256s them, writes them to a temp file (`<tmpdir>/quereus-plugins-<pid>-<random>/<hash>-<n>.mjs`), and hands the loader that file's `file:` URL. The temp directory is removed when the process exits; files are kept until then so stack traces from inside the plugin still resolve.
+  The resolver fetches the module, checks that redirects stayed on `https:`, enforces the size cap against both the declared `content-length` and the bytes actually received, SHA-256s them, verifies that digest against `expectedHash`, writes them to a temp file (`<tmpdir>/quereus-plugins-<pid>-<random>/<hash>-<n>.mjs`), and hands the loader that file's `file:` URL. The temp directory is removed when the process exits; files are kept until then so stack traces from inside the plugin still resolve.
 
   It lives behind the `@quereus/plugin-loader/node` subpath, not the package index, so a browser or React Native bundle never pulls in `node:fs`. Any Node host wanting remote plugins installs it — the quoomb CLI does so at startup, and prints one line per fetch. Without it, a Node-side `https:` load fails with a message saying so, rather than `ERR_UNSUPPORTED_ESM_URL_SCHEME`.
 
-  There is no on-disk cache: a plugin saved by URL re-downloads and re-executes remote code on every host start. That is why `onFetched` exists — hosts are expected to surface the fetch rather than let it happen silently. The CLI additionally records the hash in `~/.quoomb/plugins.json` (`PluginRecord.sha256`) and warns when the module behind a URL has changed since it was installed. The comparison happens after the load, so the warning reports code that has already run — it is a change notice, not a gate. A host that wants to gate on the hash must compare inside `onFetched`, which is awaited before the import.
+  There is no on-disk cache: a plugin saved by URL re-downloads and re-executes remote code on every host start. That is why `onFetched` exists — hosts are expected to surface the fetch rather than let it happen silently.
+
+- **Hash pinning gates the load, and is opt-in.** `expectedHash` returning `undefined` means "not pinned" and the load proceeds unchanged; returning a digest that the fetched bytes do not match aborts with a `PluginHashMismatchError` (exported from the package index) *before* the temp file is written, before `onFetched` fires, and before the import — the rejected code never evaluates. A returned value that is not 64 hex characters is a host bug and fails the load, rather than being read as "unpinned", so a typo cannot silently disarm the pin. `dynamicLoadModule` wraps every failure in `Failed to load plugin from <url>: …`, keeping the original on `error.cause`, so a caller distinguishes a mismatch with `error.cause instanceof PluginHashMismatchError`.
+
+  Scope: pinning is a property of the *Node resolver*. Browsers and workers install no resolver — they `import('https://…')` natively with no verification — and `file:` URLs never reach the resolver, so a pin on one is inert. `hashRemoteModule(url, { maxBytes, fetchImpl })` from the same subpath answers "what does this URL serve right now?" using the same transport checks and cap, writing nothing and importing nothing; it is a separate fetch from any load that follows, so bytes that change in between make the pinned load fail (closed, which is the right direction).
+
+  The CLI records each plugin's hash in `~/.quoomb/plugins.json` (`PluginRecord.sha256`) and warns when the module behind a URL has changed since it was installed. That comparison still happens after the load, so today's CLI warning reports code that has already run — a change notice, not a gate; wiring those saved records into `expectedHash` is what turns it into one.
 - npm package resolution prefers the `exports['./plugin']` subpath. In Node, the package is loaded directly. In browsers, npm resolution is disabled by default; enabling it requires `{ allowCdn: true }` and maps to a CDN URL.
 - Version compatibility: if the package declares `engines.quereus` or a `peerDependency` on `@quereus/quereus`, hosts should throw when incompatible (error, not warning).
 

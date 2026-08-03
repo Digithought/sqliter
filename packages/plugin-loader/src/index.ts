@@ -8,7 +8,13 @@
  */
 
 // Re-export plugin loader functions
-export { dynamicLoadModule, validatePluginUrl, loadPlugin, setRemoteModuleResolver } from './plugin-loader.js';
+export {
+	dynamicLoadModule,
+	validatePluginUrl,
+	loadPlugin,
+	setRemoteModuleResolver,
+	PluginHashMismatchError
+} from './plugin-loader.js';
 export type {
 	PluginModule,
 	LoadPluginOptions,

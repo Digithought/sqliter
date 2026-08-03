@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import debug from 'debug';
-import { setRemoteModuleResolver } from './plugin-loader.js';
+import { PluginHashMismatchError, setRemoteModuleResolver } from './plugin-loader.js';
 import type { RemoteModuleFetch, RemoteModuleResolver } from './plugin-loader.js';
 
 const log = debug('quereus:plugin-loader:node-remote');
@@ -28,17 +28,44 @@ const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 /** Media types we expect a JavaScript module to be served as. */
 const JS_MEDIA_TYPE = /(java|ecma)script/i;
 
+/** A SHA-256 as the host must supply it: 64 hex characters. */
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
 export interface NodeRemoteResolverOptions {
+	/**
+	 * The SHA-256 (hex) this URL's module bytes must hash to, or undefined when
+	 * the host does not pin this URL. Consulted on every fetch; a mismatch aborts
+	 * the load before the module is written to disk or imported.
+	 *
+	 * Receives the *normalized* URL (what `new URL(x).href` produces), because
+	 * that is what the loader hands the resolver — a host keyed by the raw
+	 * user-typed string must normalize on its side.
+	 *
+	 * Pinning covers only `https:` loads: a `file:` URL never reaches the
+	 * resolver, so a pin on one is inert.
+	 */
+	expectedHash?: (url: string) => string | undefined | Promise<string | undefined>;
 	/**
 	 * Called after each successful fetch, before the module is imported. Hosts
 	 * use it to tell the user what was downloaded and to record the hash.
 	 * Awaited, so a host may persist from here.
+	 *
+	 * Not called when {@link NodeRemoteResolverOptions.expectedHash} rejects the
+	 * bytes — a refused load reports nothing and writes nothing.
 	 */
 	onFetched?: (info: RemoteModuleFetch) => void | Promise<void>;
 	/** Reject modules larger than this. Defaults to 5 MiB. */
 	maxBytes?: number;
 	/** Injected by tests; defaults to the global `fetch`. */
 	fetchImpl?: typeof fetch;
+}
+
+/** What {@link fetchModuleBytes} produces: the bytes served, plus their digest. */
+interface FetchedModule {
+	/** Module bytes exactly as served. */
+	data: Uint8Array;
+	/** SHA-256 of {@link FetchedModule.data}, lowercase hex. */
+	sha256: string;
 }
 
 /**
@@ -48,33 +75,22 @@ export interface NodeRemoteResolverOptions {
  * Fetching happens on every load — there is no on-disk cache — so a plugin
  * saved by URL re-downloads and re-executes remote code each time the host
  * starts. That is why {@link NodeRemoteResolverOptions.onFetched} exists: the
- * host is expected to make it visible rather than silent.
+ * host is expected to make it visible rather than silent, and why
+ * {@link NodeRemoteResolverOptions.expectedHash} exists for hosts that want the
+ * fetch gated rather than merely reported.
  */
 export function createNodeRemoteResolver(options: NodeRemoteResolverOptions = {}): RemoteModuleResolver {
-	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
-
 	return async (url: URL): Promise<string> => {
-		// Resolved per call, not at construction: a host installs the resolver at
-		// startup, which may be before a `fetch` polyfill (or a test double) exists.
-		const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-		const response = await fetchImpl(url.toString());
-		if (!response.ok) {
-			throw new Error(
-				`Failed to fetch plugin module from ${url.href}: HTTP ${response.status}` +
-				(response.statusText ? ` ${response.statusText}` : '')
-			);
-		}
+		const { data, sha256 } = await fetchModuleBytes(url, options);
 
-		assertSecureFinalUrl(response, url);
-		logUnexpectedMediaType(response, url);
+		// Before anything touches disk or the module registry: bytes that fail the
+		// pin must never be written, reported, or imported.
+		await verifyExpectedHash(url, sha256, options.expectedHash);
 
-		const bytes = await readCappedBody(response, maxBytes, url.href);
-		const sha256 = createHash('sha256').update(bytes).digest('hex');
-		const path = writeModuleFile(bytes, sha256);
+		const path = writeModuleFile(data, sha256);
+		await options.onFetched?.({ url: url.href, sha256, bytes: data.byteLength });
 
-		await options.onFetched?.({ url: url.href, sha256, bytes: bytes.byteLength });
-
-		log('Fetched %s to %s (%d bytes, sha256 %s)', url.href, path, bytes.byteLength, sha256);
+		log('Fetched %s to %s (%d bytes, sha256 %s)', url.href, path, data.byteLength, sha256);
 		return pathToFileURL(path).href;
 	};
 }
@@ -84,9 +100,91 @@ export function installNodeRemoteModuleResolver(options: NodeRemoteResolverOptio
 	setRemoteModuleResolver(createNodeRemoteResolver(options));
 }
 
+/**
+ * Fetches a remote plugin module and returns its digest — same transport checks
+ * and size cap as the resolver, but nothing is written to disk and nothing is
+ * imported. Hosts use it to answer "what does this URL serve right now?" so a
+ * user can adopt a new version deliberately instead of running the new code to
+ * find out what it is.
+ *
+ * This is a *separate* fetch from any load that follows it: the bytes can change
+ * in between, and a pinned load then fails. That fails closed, which is the right
+ * direction, but a host must not present the digest as a promise about the next
+ * load.
+ */
+export async function hashRemoteModule(
+	url: URL,
+	options: Pick<NodeRemoteResolverOptions, 'maxBytes' | 'fetchImpl'> = {}
+): Promise<RemoteModuleFetch> {
+	const { data, sha256 } = await fetchModuleBytes(url, options);
+	return { url: url.href, sha256, bytes: data.byteLength };
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The transport half both {@link createNodeRemoteResolver} and
+ * {@link hashRemoteModule} run: fetch, refuse a redirect off `https:`, cap the
+ * body, hash it. Neither writes anything — that is the caller's business.
+ */
+async function fetchModuleBytes(
+	url: URL,
+	options: Pick<NodeRemoteResolverOptions, 'maxBytes' | 'fetchImpl'>
+): Promise<FetchedModule> {
+	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+
+	// Resolved per call, not at construction: a host installs the resolver at
+	// startup, which may be before a `fetch` polyfill (or a test double) exists.
+	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+	const response = await fetchImpl(url.toString());
+	if (!response.ok) {
+		throw new Error(
+			`Failed to fetch plugin module from ${url.href}: HTTP ${response.status}` +
+			(response.statusText ? ` ${response.statusText}` : '')
+		);
+	}
+
+	assertSecureFinalUrl(response, url);
+	logUnexpectedMediaType(response, url);
+
+	const data = await readCappedBody(response, maxBytes, url.href);
+	return { data, sha256: createHash('sha256').update(data).digest('hex') };
+}
+
+/**
+ * Compares the fetched digest against what the host pinned for this URL, if
+ * anything.
+ *
+ * An expected value that is not 64 hex characters is a host bug and fails
+ * closed: silently reading it as "not pinned" would turn a typo into an
+ * unprotected load. Likewise, an `expectedHash` that throws propagates rather
+ * than degrading to "not pinned".
+ */
+async function verifyExpectedHash(
+	url: URL,
+	sha256: string,
+	expectedHash: NodeRemoteResolverOptions['expectedHash']
+): Promise<void> {
+	if (!expectedHash) return;
+
+	const expected = await expectedHash(url.href);
+	// Only "no pin at all" is a pass; an empty or malformed string is not.
+	if (expected === undefined || expected === null) return;
+
+	const normalized = String(expected).trim().toLowerCase();
+	if (!SHA256_HEX.test(normalized)) {
+		throw new Error(
+			`Expected SHA-256 for plugin module at ${url.href} is not 64 hex characters: ` +
+			`'${expected}'. Refusing to load it.`
+		);
+	}
+
+	if (normalized !== sha256) {
+		throw new PluginHashMismatchError(url.href, normalized, sha256);
+	}
+}
 
 /**
  * `fetch` follows redirects across protocols, so an https → http hop would

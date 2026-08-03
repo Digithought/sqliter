@@ -12,10 +12,13 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { readdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Database } from '@quereus/quereus';
-import { dynamicLoadModule, setRemoteModuleResolver } from '../src/index.js';
+import { dynamicLoadModule, setRemoteModuleResolver, PluginHashMismatchError } from '../src/index.js';
 import { isNodeRuntime, resolveImportSpecifier } from '../src/plugin-loader.js';
-import { createNodeRemoteResolver, installNodeRemoteModuleResolver } from '../src/node-remote.js';
+import { createNodeRemoteResolver, hashRemoteModule, installNodeRemoteModuleResolver } from '../src/node-remote.js';
 import type { RemoteModuleFetch } from '../src/index.js';
 import { capturePluginSource, readCapturedConfig, clearCapturedConfig } from './helpers/plugin-fixtures.js';
 
@@ -70,6 +73,35 @@ export default function register() { return {}; }
 
 function readEvaluationCount(): number {
 	return ((globalThis as Record<string, unknown>)[COUNT_KEY] as number | undefined) ?? 0;
+}
+
+/** The digest a host would have to pin for `source` to be accepted. */
+function sha256Of(source: string): string {
+	return createHash('sha256').update(Buffer.from(source, 'utf8')).digest('hex');
+}
+
+/** SHA-256 of zero bytes — what an empty response body hashes to. */
+const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
+/** A well-formed digest that matches nothing these fixtures serve. */
+const WRONG_SHA256 = 'f'.repeat(64);
+
+/**
+ * Directory the resolver writes fetched modules into, discovered by doing one
+ * successful fetch — the resolver's temp directory is a module-private singleton
+ * with no accessor.
+ *
+ * NOTE: the "wrote no temp file" assertions compare entry counts in whatever
+ * directory this returns. If the resolver ever writes somewhere other than the
+ * directory of the path it returns, those assertions would compare an unrelated
+ * directory and pass vacuously; expose the directory and assert on it directly
+ * if that happens.
+ */
+async function moduleTempDir(): Promise<string> {
+	const resolver = createNodeRemoteResolver({
+		fetchImpl: fetchAnswering(() => jsResponse('export default () => ({});'))
+	});
+	return dirname(fileURLToPath(await resolver(new URL(MODULE_URL))));
 }
 
 describe('https module loads under Node', () => {
@@ -278,6 +310,263 @@ describe('https module loads under Node', () => {
 
 			await expect(dynamicLoadModule(MODULE_URL, db))
 				.rejects.toThrow(new RegExp(`Failed to load plugin from ${MODULE_URL.replace(/[.]/g, '\\.')}`));
+		});
+
+		it('keeps the original error reachable as `cause`', async () => {
+			installNodeRemoteModuleResolver({
+				fetchImpl: fetchAnswering(() => new Response('nope', { status: 500 }))
+			});
+
+			const error = await dynamicLoadModule(MODULE_URL, db).catch((e: unknown) => e);
+
+			expect((error as Error).cause).toBeInstanceOf(Error);
+			expect(((error as Error).cause as Error).message).toMatch(/HTTP 500/);
+		});
+	});
+
+	describe('expectedHash pinning', () => {
+		it('loads and runs the plugin when the pin matches', async () => {
+			const source = capturePluginSource(CAPTURE_KEY);
+			stubGlobalFetch(source);
+			installNodeRemoteModuleResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(source)),
+				expectedHash: () => sha256Of(source)
+			});
+
+			await dynamicLoadModule(MODULE_URL, db, { setting: 'on' });
+
+			expect(readCapturedConfig(CAPTURE_KEY)?.setting).toBe('on');
+		});
+
+		it('accepts a pin the host stored uppercase and padded', async () => {
+			const source = capturePluginSource(CAPTURE_KEY);
+			const resolver = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(source)),
+				expectedHash: () => `  ${sha256Of(source).toUpperCase()}\n`
+			});
+
+			await expect(resolver(new URL(MODULE_URL))).resolves.toMatch(/^file:/);
+		});
+
+		it('resolves the pin asynchronously, per call', async () => {
+			const source = capturePluginSource(CAPTURE_KEY);
+			const asked: string[] = [];
+			const resolver = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(source)),
+				expectedHash: async url => {
+					asked.push(url);
+					return sha256Of(source);
+				}
+			});
+
+			await resolver(new URL(MODULE_URL));
+			await resolver(new URL(MODULE_URL));
+
+			expect(asked).toEqual([MODULE_URL, MODULE_URL]);
+		});
+
+		it('is asked with the normalized URL', async () => {
+			const source = capturePluginSource(CAPTURE_KEY);
+			const asked: string[] = [];
+			const resolver = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(source)),
+				expectedHash: url => {
+					asked.push(url);
+					return sha256Of(source);
+				}
+			});
+
+			await resolver(new URL('https://Plugins.Example.Test/dist/plugin.mjs'));
+
+			expect(asked).toEqual(['https://plugins.example.test/dist/plugin.mjs']);
+		});
+
+		it('names the URL and both hashes when the pin does not match', async () => {
+			const source = capturePluginSource(CAPTURE_KEY);
+			const resolver = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(source)),
+				expectedHash: () => WRONG_SHA256
+			});
+
+			const error = await resolver(new URL(MODULE_URL)).catch((e: unknown) => e);
+
+			expect(error).toBeInstanceOf(PluginHashMismatchError);
+			const mismatch = error as PluginHashMismatchError;
+			expect(mismatch.url).toBe(MODULE_URL);
+			expect(mismatch.expected).toBe(WRONG_SHA256);
+			expect(mismatch.actual).toBe(sha256Of(source));
+			expect(mismatch.message).toContain(MODULE_URL);
+			expect(mismatch.message).toContain(WRONG_SHA256);
+			expect(mismatch.message).toContain(sha256Of(source));
+		});
+
+		it('never evaluates the module, calls onFetched, or writes a temp file on a mismatch', async () => {
+			const tempDir = await moduleTempDir();
+			const before = readdirSync(tempDir).length;
+
+			stubGlobalFetch(COUNTING_PLUGIN_SOURCE);
+			const seen: RemoteModuleFetch[] = [];
+			installNodeRemoteModuleResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(COUNTING_PLUGIN_SOURCE)),
+				expectedHash: () => WRONG_SHA256,
+				onFetched: info => { seen.push(info); }
+			});
+
+			await expect(dynamicLoadModule(MODULE_URL, db)).rejects.toThrow(/pinned SHA-256/);
+
+			// A test that only asserted on the message would still pass if the
+			// import had run.
+			expect(readEvaluationCount()).toBe(0);
+			expect(seen).toHaveLength(0);
+			expect(readdirSync(tempDir).length).toBe(before);
+		});
+
+		it('surfaces a mismatch through dynamicLoadModule without losing its class', async () => {
+			stubGlobalFetch(COUNTING_PLUGIN_SOURCE);
+			installNodeRemoteModuleResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(COUNTING_PLUGIN_SOURCE)),
+				expectedHash: () => WRONG_SHA256
+			});
+
+			const error = await dynamicLoadModule(MODULE_URL, db).catch((e: unknown) => e);
+
+			expect((error as Error).message).toContain(`Failed to load plugin from ${MODULE_URL}:`);
+			expect((error as Error).cause).toBeInstanceOf(PluginHashMismatchError);
+		});
+
+		it('refuses a malformed pin rather than treating it as unpinned', async () => {
+			const source = capturePluginSource(CAPTURE_KEY);
+			for (const bad of ['deadbeef', 'z'.repeat(64), '', `${sha256Of(source)}00`]) {
+				const resolver = createNodeRemoteResolver({
+					fetchImpl: fetchAnswering(() => jsResponse(source)),
+					expectedHash: () => bad
+				});
+
+				await expect(resolver(new URL(MODULE_URL)))
+					.rejects.toThrow(new RegExp(`not 64 hex characters: '${bad}'`));
+			}
+		});
+
+		it('lets a failing expectedHash propagate instead of loading unpinned', async () => {
+			stubGlobalFetch(COUNTING_PLUGIN_SOURCE);
+			installNodeRemoteModuleResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(COUNTING_PLUGIN_SOURCE)),
+				expectedHash: () => { throw new Error('plugin record store is unreadable'); }
+			});
+
+			await expect(dynamicLoadModule(MODULE_URL, db))
+				.rejects.toThrow(/plugin record store is unreadable/);
+			expect(readEvaluationCount()).toBe(0);
+		});
+
+		it('compares an empty body like any other, rather than short-circuiting', async () => {
+			const pinned = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => new Response('', { status: 200 })),
+				expectedHash: () => EMPTY_SHA256
+			});
+			const mispinned = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => new Response('', { status: 200 })),
+				expectedHash: () => WRONG_SHA256
+			});
+
+			await expect(pinned(new URL(MODULE_URL))).resolves.toMatch(/^file:/);
+			await expect(mispinned(new URL(MODULE_URL))).rejects.toThrow(PluginHashMismatchError);
+		});
+
+		it('reports an HTTP failure rather than a hash mismatch', async () => {
+			const resolver = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => new Response('nope', { status: 404, statusText: 'Not Found' })),
+				expectedHash: () => WRONG_SHA256
+			});
+
+			await expect(resolver(new URL(MODULE_URL))).rejects.toThrow(/HTTP 404/);
+		});
+
+		it('lets the redirect and size guards win over a pin', async () => {
+			const redirected = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() =>
+					responseRedirectedTo('export default () => ({});', 'http://plugins.example.test/plugin.mjs')),
+				expectedHash: () => WRONG_SHA256
+			});
+			const oversized = createNodeRemoteResolver({
+				maxBytes: 32,
+				fetchImpl: fetchAnswering(() => new Response('x'.repeat(4096), { status: 200 })),
+				expectedHash: () => WRONG_SHA256
+			});
+
+			await expect(redirected(new URL(MODULE_URL))).rejects.toThrow(/not https:/);
+			await expect(oversized(new URL(MODULE_URL))).rejects.toThrow(/over the 32-byte limit/);
+		});
+
+		it('leaves an unpinned load exactly as it was', async () => {
+			const source = capturePluginSource(CAPTURE_KEY);
+			stubGlobalFetch(source);
+			const seen: RemoteModuleFetch[] = [];
+			installNodeRemoteModuleResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(source)),
+				onFetched: info => { seen.push(info); }
+			});
+
+			await dynamicLoadModule(MODULE_URL, db, { setting: 'on' });
+
+			expect(readCapturedConfig(CAPTURE_KEY)?.setting).toBe('on');
+			expect(seen).toHaveLength(1);
+			expect(seen[0].sha256).toBe(sha256Of(source));
+		});
+
+		it('treats an expectedHash that returns undefined as unpinned', async () => {
+			const source = capturePluginSource(CAPTURE_KEY);
+			stubGlobalFetch(source);
+			installNodeRemoteModuleResolver({
+				fetchImpl: fetchAnswering(() => jsResponse(source)),
+				expectedHash: () => undefined
+			});
+
+			await dynamicLoadModule(MODULE_URL, db, { setting: 'on' });
+
+			expect(readCapturedConfig(CAPTURE_KEY)?.setting).toBe('on');
+		});
+	});
+
+	describe('hashRemoteModule', () => {
+		it('reports the same digest and size the resolver would, without importing', async () => {
+			const fetchImpl = fetchAnswering(() => jsResponse(COUNTING_PLUGIN_SOURCE));
+
+			const info = await hashRemoteModule(new URL(MODULE_URL), { fetchImpl });
+
+			expect(info.url).toBe(MODULE_URL);
+			expect(info.sha256).toBe(sha256Of(COUNTING_PLUGIN_SOURCE));
+			expect(info.bytes).toBe(Buffer.byteLength(COUNTING_PLUGIN_SOURCE, 'utf8'));
+			expect(readEvaluationCount()).toBe(0);
+
+			// Same bytes, same digest as the load path would have pinned against.
+			const resolver = createNodeRemoteResolver({ fetchImpl, expectedHash: () => info.sha256 });
+			await expect(resolver(new URL(MODULE_URL))).resolves.toMatch(/^file:/);
+		});
+
+		it('writes no temp file', async () => {
+			const tempDir = await moduleTempDir();
+			const before = readdirSync(tempDir).length;
+
+			await hashRemoteModule(new URL(MODULE_URL), {
+				fetchImpl: fetchAnswering(() => jsResponse(COUNTING_PLUGIN_SOURCE))
+			});
+
+			expect(readdirSync(tempDir).length).toBe(before);
+		});
+
+		it('enforces maxBytes', async () => {
+			await expect(hashRemoteModule(new URL(MODULE_URL), {
+				maxBytes: 32,
+				fetchImpl: fetchAnswering(() => new Response('x'.repeat(4096), { status: 200 }))
+			})).rejects.toThrow(/over the 32-byte limit/);
+		});
+
+		it('refuses a redirect that leaves https:', async () => {
+			await expect(hashRemoteModule(new URL(MODULE_URL), {
+				fetchImpl: fetchAnswering(() =>
+					responseRedirectedTo('export default () => ({});', 'http://plugins.example.test/plugin.mjs'))
+			})).rejects.toThrow(/not https:/);
 		});
 	});
 });

@@ -32,6 +32,33 @@ export interface RemoteModuleFetch {
 }
 
 /**
+ * Fetched plugin bytes did not match the SHA-256 the host pinned for that URL.
+ *
+ * Lives here rather than in `node-remote.ts` so a host can `instanceof` it
+ * without importing the Node-only subpath: it is a plain `Error` subclass with
+ * no `node:` imports.
+ */
+export class PluginHashMismatchError extends Error {
+	/** The module URL that was requested, normalized (`new URL(x).href`). */
+	readonly url: string;
+	/** Lowercase hex the host required. */
+	readonly expected: string;
+	/** Lowercase hex of what was actually served. */
+	readonly actual: string;
+
+	constructor(url: string, expected: string, actual: string) {
+		super(
+			`Plugin module at ${url} does not match its pinned SHA-256. ` +
+			`Expected ${expected}, got ${actual}. Refusing to load it.`
+		);
+		this.name = 'PluginHashMismatchError';
+		this.url = url;
+		this.expected = expected;
+		this.actual = actual;
+	}
+}
+
+/**
  * Turns an `https:` module URL into a specifier this runtime's `import()` can
  * load — under Node, a `file:` URL for a locally fetched copy.
  *
@@ -155,7 +182,10 @@ export async function dynamicLoadModule(
 		return await tryLoadManifestFromUrl(moduleUrl);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`Failed to load plugin from ${url}: ${message}`);
+		// `cause` keeps the original class reachable — without it every failure
+		// flattens to a bare Error and a caller cannot tell a hash mismatch
+		// (see {@link PluginHashMismatchError}) from a 404.
+		throw new Error(`Failed to load plugin from ${url}: ${message}`, { cause: error });
 	}
 }
 
