@@ -114,6 +114,37 @@ describe('CTE namespace isolation for stored view bodies', () => {
 			.to.deep.equal([{ id: 2, x: 20 }]);
 	});
 
+	it('isolates the body of a view read through a second view', async () => {
+		// Both bodies read `nt`; the caller shadows it. Every nesting level plans
+		// under its own `storedBodyContext`, so neither body sees the caller CTE.
+		await db.exec('create table main.nt (id integer primary key, x integer)');
+		await db.exec('insert into main.nt values (1, 10)');
+		await db.exec('create view main.inner_v as select id, x from nt');
+		await db.exec('create view main.outer_v as select v.id, v.x + (select x from nt where id = 1) as x from inner_v v');
+
+		expect(await all(db, 'with nt as (select 1 as id, 999 as x) select * from outer_v'))
+			.to.deep.equal([{ id: 1, x: 20 }]);
+	});
+
+	it('does not let a caller `with` clause mask a stale materialized view', async () => {
+		// The stale-MV re-validation in `select.ts` re-plans the derivation to decide
+		// whether the staleness is recoverable. A caller CTE that resolves the name the
+		// body can no longer resolve would make an unplannable body look healthy and
+		// serve the stale rows instead of raising.
+		await db.exec('create table main.st (id integer primary key, x integer)');
+		await db.exec('insert into main.st values (1, 10)');
+		await db.exec('create materialized view main.smv as select id, x from st');
+		await db.exec('drop table main.st');
+
+		let message = '';
+		try {
+			await all(db, 'with st as (select 1 as id, 999 as x) select * from smv');
+		} catch (e) {
+			message = e instanceof Error ? e.message : String(e);
+		}
+		expect(message).to.match(/stale/i);
+	});
+
 	it('leaves a materialized-view read unaffected by a caller `with` clause shadowing its source', async () => {
 		await db.exec('create table main.mt (id integer primary key, x integer)');
 		await db.exec('insert into main.mt values (1, 10)');

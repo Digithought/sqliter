@@ -26,6 +26,12 @@ import type { PlanningContext } from './planning-context.js';
  * Lives at the top level of `planner/` (not under `building/` or `mutation/`) because both
  * directories consume it: `building/select.ts` on the read path, `mutation/body-context.ts`
  * on the write path. Neither should import from the other for this.
+ *
+ * NOTE: the caller's `scope` and `aggregates` are deliberately still inherited. A stored body
+ * only contains names that resolved when it was created, and its own FROM shadows the caller's
+ * scope, so neither is exploitable today (probed: a view body aggregate built inside a caller
+ * HAVING context does not match the caller's aggregate). If a future feature lets a body name
+ * resolve outward — a parameterized view, a lateral/correlated stored body — clear them here too.
  */
 export function storedBodyContext(ctx: PlanningContext, schemaName: string): PlanningContext {
 	return {

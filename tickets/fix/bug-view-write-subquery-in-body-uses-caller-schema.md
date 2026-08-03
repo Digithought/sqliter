@@ -1,11 +1,13 @@
 ---
-description: Updating or deleting through a view whose definition contains a sub-select fails with a "table not found" error, or quietly changes the wrong number of rows, because that sub-select is looked up in the writer's schema instead of the view's own.
+description: Updating or deleting through a view whose definition contains a sub-select fails with a "table not found" error, or quietly changes the wrong rows, because that sub-select is looked up in the writer's naming environment instead of the view's own.
 files:
   - packages/quereus/src/planner/building/view-mutation-builder.ts  # buildBaseOp (~1276) — plans the lowered base statement on the caller's context
   - packages/quereus/src/planner/mutation/scope-transform.ts        # transformScopedExpr / transformScopedQuery / cloneExpr — where body-derived fragments are copied into the base statement
   - packages/quereus/src/planner/mutation/single-source.ts          # filterPredicate (body WHERE) + writableSites base-term exprs
-  - packages/quereus/src/planner/mutation/body-context.ts           # the existing home-path gate — covers the body PLAN, not the lowered statement
+  - packages/quereus/src/planner/mutation/body-context.ts           # the existing gate — covers the body PLAN, not the lowered statement
+  - packages/quereus/src/planner/stored-body-context.ts             # what that gate delegates to (schema path + CTE namespace)
   - packages/quereus/test/view-home-schema.spec.ts                  # where the write-through home-schema cases are pinned
+  - packages/quereus/test/view-cte-isolation.spec.ts                # where the CTE-namespace cases are pinned (Arm 3)
 repro: verified
 ---
 
@@ -86,6 +88,30 @@ The read saw the row; the write matched nothing, because the copied
 `bug-view-write-through-ignores-home-schema` and re-running: identical outcome.
 That ticket did not cause it and does not cover it.
 
+**Arm 3 — the caller's `with` clause leaks through the same hole, with no schema
+setup at all.** Same copied fragment, different naming environment: a caller CTE
+whose name matches a table the stored sub-select reads binds instead of the table.
+Everything is in `main`; no `schema_path`, no non-`main` view.
+
+```sql
+create table main.lt (id integer primary key, x integer);
+create table main.ls (id integer primary key);
+insert into main.lt values (1, 10);
+insert into main.ls values (1);
+create view main.lv as select id, x from lt where id in (select id from ls);
+
+update main.lv set x = 99 where id = 1;                      -- lt = [{1, 99}]  correct
+with ls as (select 2 as id) update main.lv set x = 99 where id = 1;
+select * from main.lt;                                       -- [{1, 10}] — silently updated nothing
+```
+
+Verified on the current tree, *after* `bug-caller-cte-shadows-view-body` landed:
+that fix clears `cteNodes` / `cteReferenceCache` on the context a stored body
+**plans** under (`planner/stored-body-context.ts`), which is the same gate this
+ticket says does not reach the lowered statement. So the CTE arm and the schema
+arm close together or not at all — whatever mechanism decides per-fragment
+resolution must isolate the CTE namespace alongside the schema path.
+
 ## Expected behavior
 
 - A table name inside a sub-select that came from the view's stored definition
@@ -99,6 +125,10 @@ That ticket did not cause it and does not cover it.
 - An ephemeral DML target — a CTE name or an inline `update (select …) as v`
   — is part of the caller's statement, not a stored object, so *all* of its
   names stay on the caller's path. Also already pinned there.
+- A table name inside such a sub-select is likewise **not** matched against the
+  writing statement's `with` clause (Arm 3), while the writing statement's own
+  sub-selects keep seeing their sibling CTEs. The read-side equivalents are
+  pinned in `test/view-cte-isolation.spec.ts`.
 
 ## Why the existing gate does not extend to this
 
