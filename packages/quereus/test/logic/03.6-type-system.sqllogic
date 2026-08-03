@@ -494,6 +494,20 @@ select id from real_big where r = 9007199254740993;
 select id from real_big where r > 9007199254740993;
 → []
 
+-- Secondary index: less-than against a bigint one past the stored REAL. Both rows
+-- must come back — had the bigint been coerced through Number() it would round
+-- down to 9007199254740992 and drop row 2.
+select id from real_big where r < 9007199254740993 order by id;
+→ [{"id":1},{"id":2}]
+
+-- ...and the exact stored value excludes itself, which the rounded form would not.
+select id from real_big where r < 9007199254740992 order by id;
+→ [{"id":1}]
+
+-- Negative bigint past -2^53, below everything stored
+select id from real_big where r > -9007199254740993 order by id;
+→ [{"id":1},{"id":2}]
+
 -- Secondary index: IN-list mixing a bigint and a plain number
 select id from real_big where r in (9007199254740993, 5) order by id;
 → [{"id":1}]
@@ -502,6 +516,20 @@ select id from real_big where r in (9007199254740992, 5) order by id;
 → [{"id":1},{"id":2}]
 
 DROP TABLE real_big;
+
+-- NULL in an indexed REAL column still sorts first and never reaches the numeric path
+-- (columns default NOT NULL in Quereus, hence the explicit `null`)
+CREATE TABLE real_big_null (id INTEGER PRIMARY KEY, r REAL null);
+CREATE INDEX real_big_null_ir ON real_big_null(r);
+INSERT INTO real_big_null VALUES (1, 5.0), (2, 9007199254740992.0), (3, NULL);
+
+select id from real_big_null where r < 9007199254740993 order by id;
+→ [{"id":1},{"id":2}]
+
+select id from real_big_null order by r, id;
+→ [{"id":3},{"id":1},{"id":2}]
+
+DROP TABLE real_big_null;
 
 -- REAL primary key, no secondary index in sight
 CREATE TABLE real_pk (r REAL PRIMARY KEY);

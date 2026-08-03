@@ -140,7 +140,11 @@ This ensures type information flows through the entire planning and execution pi
 **REAL**
 - Physical: `PhysicalType.REAL`
 - Values: `number` (floating point)
-- Comparison: Numeric ordering with NaN handling
+- Comparison: Numeric ordering with NaN handling (NaN sorts smallest, NaN = NaN). A
+  `bigint` operand is tolerated even though it is outside REAL's value space — the
+  shared index/PK comparators hand through raw storage-class values, so a `real` column
+  compared against an integer literal past 2^53 arrives as one — and is ordered by exact
+  mathematical value, not rounded through `Number()`
 - Collations: None
 
 **NUMERIC** (SQLite's NUMERIC affinity — integer if it fits, else real)
@@ -151,8 +155,8 @@ This ensures type information flows through the entire planning and execution pi
   all-digit string takes that integer arm; a fractional spelling (`'9007199254740993.0'`)
   falls through to REAL and rounds, as in SQLite
 - Comparison: numeric ordering with REAL's NaN handling (NaN sorts smallest, NaN = NaN).
-  Mixed `number`/`bigint` pairs are ordered by exact mathematical value — NUMERIC has its
-  own comparator rather than delegating to REAL's, whose `isNaN` throws on a bigint
+  Mixed `number`/`bigint` pairs are ordered by exact mathematical value — REAL and NUMERIC
+  share one comparator (`compareNumericWithNaN`, `types/builtin-types.ts`)
 - Collations: None
 
 **BOOLEAN**
@@ -634,7 +638,8 @@ arms cannot change the result), OR-merging nullability alongside:
    `NUMERIC` — whose value space is `number | bigint` — describes that. Claiming
    `REAL` was a lie the DML skip rule believed: a bigint rode it unconverted into
    a `real`-declared column, and a `real`-declared key then threw out of
-   `REAL_TYPE.compare`. Because no branch is converted, the read side is
+   `REAL_TYPE.compare` (that comparator now tolerates a bigint operand, but the
+   type claim was still wrong). Because no branch is converted, the read side is
    untouched: `select <big int> union all select 2.5` still returns each row in
    its own storage class, matching SQLite.
 4. **Exactly one side object-physical** (JSON today) → the object side's type,

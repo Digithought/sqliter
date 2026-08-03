@@ -1,6 +1,6 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { compareSqlValuesFast, BINARY_COLLATION } from '../util/comparison.js';
-import type { DeepReadonly } from '../common/types.js';
+import type { DeepReadonly, SqlValue } from '../common/types.js';
 
 /**
  * Orders a non-null `number | bigint` pair. JS relational operators compare the two
@@ -12,6 +12,26 @@ import type { DeepReadonly } from '../common/types.js';
  */
 function compareNumericValues(a: number | bigint, b: number | bigint): number {
 	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * `compare` shared by REAL and NUMERIC: NULL first, then NaN (lowest), then value order.
+ *
+ * Operands are typed `number | bigint` even for REAL, whose value space is number-only
+ * per its `validate`: the shared index/PK comparators pass through raw storage-class
+ * values, so a REAL column compared against an INTEGER literal past 2^53 arrives here
+ * as a bigint. `isNaN()` throws on a bigint operand, hence the `typeof` guard.
+ */
+function compareNumericWithNaN(a: SqlValue, b: SqlValue): number {
+	const nullCmp = compareNulls(a, b);
+	if (nullCmp !== undefined) return nullCmp;
+
+	const aIsNaN = typeof a === 'number' && isNaN(a);
+	const bIsNaN = typeof b === 'number' && isNaN(b);
+	if (aIsNaN) return bIsNaN ? 0 : -1;
+	if (bIsNaN) return 1;
+
+	return compareNumericValues(a as number | bigint, b as number | bigint);
 }
 
 /**
@@ -107,21 +127,7 @@ export const REAL_TYPE: LogicalType = {
 		throw new TypeError(`Cannot convert ${typeof v} to REAL`);
 	},
 
-	compare: (a, b) => {
-		const nullCmp = compareNulls(a, b);
-		if (nullCmp !== undefined) return nullCmp;
-
-		// The value space is number-only per REAL_TYPE.validate, but the shared index/PK
-		// comparators pass through raw storage-class values, which can be a bigint (e.g.
-		// comparing against an INTEGER literal past 2^53). isNaN() throws on a bigint
-		// operand, so guard with typeof first — see NUMERIC_TYPE.compare for the same fix.
-		const aIsNaN = typeof a === 'number' && isNaN(a);
-		const bIsNaN = typeof b === 'number' && isNaN(b);
-		if (aIsNaN) return bIsNaN ? 0 : -1;
-		if (bIsNaN) return 1;
-
-		return compareNumericValues(a as number | bigint, b as number | bigint);
-	},
+	compare: compareNumericWithNaN,
 };
 
 /**
@@ -301,19 +307,7 @@ export const NUMERIC_TYPE: LogicalType = {
 		throw new TypeError(`Cannot convert ${typeof v} to NUMERIC`);
 	},
 
-	compare: (a, b) => {
-		const nullCmp = compareNulls(a, b);
-		if (nullCmp !== undefined) return nullCmp;
-
-		// NUMERIC's value space is number | bigint (unlike REAL, which is number-only),
-		// so we can't delegate to REAL_TYPE.compare: isNaN() throws on a bigint operand.
-		const aIsNaN = typeof a === 'number' && isNaN(a);
-		const bIsNaN = typeof b === 'number' && isNaN(b);
-		if (aIsNaN) return bIsNaN ? 0 : -1;
-		if (bIsNaN) return 1;
-
-		return compareNumericValues(a as number | bigint, b as number | bigint);
-	},
+	compare: compareNumericWithNaN,
 };
 
 /**
