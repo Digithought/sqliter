@@ -844,6 +844,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * for this scan) are skipped before aligning against the required ordering
 	 * keys. The per-column direction comparison still applies to the remaining
 	 * (unbound) suffix.
+	 *
+	 * NOTE: `OrderingSpec.nullsFirst` is not compared — nothing in the planner
+	 * populates it today, so every required spec leaves it undefined. If NULLS
+	 * FIRST/LAST ever reaches requiredOrdering, this must decline the index
+	 * unless the placement matches (the store module's
+	 * `buildPkOrderingAdvertisement` already does), or the Sort gets elided
+	 * against a different NULL placement.
 	 */
 	private indexSatisfiesOrdering(
 		index: IndexSchema,

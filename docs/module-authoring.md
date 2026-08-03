@@ -161,6 +161,7 @@ interface BestAccessPlanResult {
 ```
 
 **Capability contracts**:
+- `providesOrdering` must carry each key column's *actual* emit direction. A key declared `PRIMARY KEY (id DESC)` is walked descending, so its spec is `desc: true` — advertising `desc: false` over it lets the merge-join rule skip the Sort it needs, and the join silently drops rows. Derive the flag from the column definition (`desc: !!col.desc`); never hard-code it.
 - `monotonicOn` is the leaf's natural emit order (storage property, not request-dependent). Stronger than `providesOrdering` — implies a total order with no gaps in coverage.
 - `supportsOrdinalSeek` enables the `monotonic-limit-pushdown` rule: when advertised, the runtime may stamp `FilterInfo.offset`/`FilterInfo.limit` and the module must seek directly to the kth monotonic row (see `query()` contract above). Modules that advertise `supportsOrdinalSeek` but ignore the directives at runtime degrade to a streaming `LIMIT` (the rule's slice operator enforces the cap above the leaf).
 - `supportsAsofRight` enables the `lateral-top1-asof` rule: forward-only repositioning per left row.

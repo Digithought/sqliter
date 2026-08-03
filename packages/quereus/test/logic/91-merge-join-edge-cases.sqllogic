@@ -116,6 +116,33 @@ SELECT d.id FROM mj_dpk d JOIN mj_small s ON s.id = d.id ORDER BY d.id;
 SELECT d.id AS did, s.id AS sid FROM mj_dpk d LEFT JOIN mj_small s ON s.id = d.id ORDER BY d.id;
 → [{"did":1,"sid":1},{"did":2,"sid":2},{"did":3,"sid":3}]
 
+-- Sort absorption over the same advertisement: an ORDER BY must not be elided
+-- against a stream that runs the other way.
+SELECT id FROM mj_dpk ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+SELECT id FROM mj_dpk ORDER BY id DESC;
+→ [{"id":3},{"id":2},{"id":1}]
+
+-- Composite PK with mixed directions: the advertisement is per-column, so the
+-- ASC member and the DESC member must each carry their own direction.
+CREATE TABLE mj_mixdir (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a ASC, b DESC));
+CREATE TABLE mj_mixdir_r (a INTEGER, b INTEGER, w TEXT, PRIMARY KEY (a ASC, b DESC));
+INSERT INTO mj_mixdir VALUES (1, 10, 'p'), (1, 20, 'q'), (2, 10, 'r');
+INSERT INTO mj_mixdir_r VALUES (1, 10, 's'), (1, 20, 't'), (2, 10, 'u');
+
+SELECT l.v, r.w FROM mj_mixdir l JOIN mj_mixdir_r r ON l.a = r.a AND l.b = r.b ORDER BY l.a, l.b;
+→ [{"v":"p","w":"s"},{"v":"q","w":"t"},{"v":"r","w":"u"}]
+
+SELECT l.a, l.b, r.w FROM mj_mixdir l LEFT JOIN mj_mixdir_r r ON l.a = r.a AND l.b = r.b ORDER BY l.a, l.b;
+→ [{"a":1,"b":10,"w":"s"},{"a":1,"b":20,"w":"t"},{"a":2,"b":10,"w":"u"}]
+
+SELECT a, b FROM mj_mixdir ORDER BY a, b;
+→ [{"a":1,"b":10},{"a":1,"b":20},{"a":2,"b":10}]
+
+SELECT a, b FROM mj_mixdir ORDER BY a, b DESC;
+→ [{"a":1,"b":20},{"a":1,"b":10},{"a":2,"b":10}]
+
 -- Cleanup
 DROP TABLE mj_self;
 DROP TABLE mj_allnull;
@@ -128,3 +155,5 @@ DROP TABLE mj_mc_l;
 DROP TABLE mj_mc_r;
 DROP TABLE mj_dpk;
 DROP TABLE mj_small;
+DROP TABLE mj_mixdir;
+DROP TABLE mj_mixdir_r;
