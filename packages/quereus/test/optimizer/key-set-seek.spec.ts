@@ -16,15 +16,20 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
-import { KeySetSemiJoinNode } from '../../src/planner/nodes/key-set-semi-join-node.js';
+import { KeySetSemiJoinNode, seekPreservesTargetOrder, type KeySetPushdown } from '../../src/planner/nodes/key-set-semi-join-node.js';
 import { BloomJoinNode } from '../../src/planner/nodes/bloom-join-node.js';
-import { IndexSeekNode } from '../../src/planner/nodes/table-access-nodes.js';
+import { MergeJoinNode } from '../../src/planner/nodes/merge-join-node.js';
+import { IndexScanNode, IndexSeekNode, SeqScanNode } from '../../src/planner/nodes/table-access-nodes.js';
 import { SortNode } from '../../src/planner/nodes/sort.js';
 import { FilterNode } from '../../src/planner/nodes/filter.js';
 import { LiteralNode } from '../../src/planner/nodes/scalar.js';
 import { stampMultiSeek } from '../../src/runtime/emit/key-set-semi-join.js';
 import { makeFullScanFilterInfo } from '../../src/vtab/filter-info.js';
 import { PhysicalType } from '../../src/types/logical-type.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import type { TableSchema } from '../../src/schema/table.js';
+import type { TableStatistics } from '../../src/planner/stats/catalog-stats.js';
+import type { MemoryTable } from '../../src/vtab/memory/table.js';
 
 function collectNodes<T extends PlanNode>(
 	root: PlanNode,
@@ -41,6 +46,7 @@ function collectNodes<T extends PlanNode>(
 
 const isKeySetSemiJoin = (n: PlanNode): n is KeySetSemiJoinNode => n instanceof KeySetSemiJoinNode;
 const isHashJoin = (n: PlanNode): n is BloomJoinNode => n instanceof BloomJoinNode;
+const isMergeJoin = (n: PlanNode): n is MergeJoinNode => n instanceof MergeJoinNode;
 const isSort = (n: PlanNode): n is SortNode => n instanceof SortNode;
 const isFilter = (n: PlanNode): n is FilterNode => n instanceof FilterNode;
 const isIndexSeek = (n: PlanNode): n is IndexSeekNode => n instanceof IndexSeekNode;
@@ -178,6 +184,20 @@ describe('key-set-seek plan shape', () => {
 			const sql = 'select pk, v from big where v in (select id from small) order by v';
 			expect(await orderedColumn(sql, 'v')).to.deep.equal([10, 20, 30]);
 		});
+
+		it('non-unique seek index: ties on the ordered column are unconstrained but the order holds', async () => {
+			// idx_v is non-unique — walk index and seek index coincide, so the
+			// rewrite may fire under the absorbed ORDER BY v. The claim covers
+			// only v: rows sharing one v may come back in any relative order
+			// (a downstream consumer reading more than the claim would fail here
+			// first). Assert v ascends and the row-SET is exact.
+			await db.exec('insert into big (pk, v, w) values (4, 20, 1), (5, 10, 2)');
+			const sql = 'select pk, v from big where v in (select id from small) order by v';
+			const rows: Array<{ pk: number; v: number }> = [];
+			for await (const r of db.eval(sql)) rows.push(r as { pk: number; v: number });
+			expect(rows.map(r => r.v), 'v ascends across ties').to.deep.equal([10, 10, 20, 20, 30]);
+			expect(rows.map(r => r.pk).sort((a, b) => a - b), 'exact row set').to.deep.equal([1, 2, 3, 4, 5]);
+		});
 	});
 
 	describe('cross-type numeric seek keys', () => {
@@ -305,6 +325,285 @@ describe('key-set-seek plan shape', () => {
 			const sql = 'select pk from bt where s in (select s from nsrc)';
 			expect(keySetNodes(sql)).to.have.lengthOf(0);
 			expect(collectNodes(db.getPlan(sql), isHashJoin)).to.have.lengthOf(1);
+		});
+	});
+
+	describe('merge semi join arm (IN on the target primary key)', () => {
+		// `pk in (select id from small)` walks both sides in primary-key order, so
+		// the semi join becomes a MERGE join before the hash anchor could ever see
+		// it — the `key-set-seek-merge` registry entry is what rewrites it. The
+		// rewrite is only legal because the seek index IS the walk index
+		// (`seekPreservesTargetOrder`), letting the node claim the walk's order.
+
+		async function orderedColumn(sql: string, col: string): Promise<unknown[]> {
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval(sql)) rows.push(r as Record<string, unknown>);
+			return rows.map(r => r[col]);
+		}
+
+		it('rewrites the primary-key IN shape for select, delete, and update', () => {
+			for (const sql of [
+				'select pk from big where pk in (select id from small)',
+				'delete from big where pk in (select id from small)',
+				'update big set w = 1 where pk in (select id from small)',
+			]) {
+				const plan = db.getPlan(sql);
+				const nodes = collectNodes(plan, isKeySetSemiJoin);
+				expect(nodes, `KeySetSemiJoin for: ${sql}`).to.have.lengthOf(1);
+				expect(collectNodes(plan, isMergeJoin), `merge join replaced for: ${sql}`).to.have.lengthOf(0);
+				expect(nodes[0].pushdown.indexName).to.equal('_primary_');
+				expect(nodes[0].getLogicalAttributes().preservesTargetOrder).to.equal(true);
+			}
+		});
+
+		it('claims the target walk order: ordering and monotonicOn match the leaf (what the merge join claimed)', () => {
+			// MergeJoinNode propagates the probe side's ordering and monotonicOn
+			// verbatim for semi, so "matches the leaf" is exactly "matches what the
+			// replaced merge join claimed".
+			const nodes = keySetNodes('select pk from big where pk in (select id from small)');
+			expect(nodes).to.have.lengthOf(1);
+			const node = nodes[0];
+			expect(node.physical.ordering).to.deep.equal([{ column: 0, desc: false }]);
+			expect(node.physical.ordering).to.deep.equal(node.target.physical.ordering);
+			expect(node.physical.monotonicOn, 'monotonicOn propagates').to.deep.equal(node.target.physical.monotonicOn);
+			expect(node.physical.monotonicOn?.[0]?.direction).to.equal('asc');
+		});
+
+		it('order by pk (absorbed into the walk) is admitted: no Sort, ascending rows', async () => {
+			await db.exec('insert into big (pk, v, w) values (3, 1, 1), (1, 2, 2), (2, 3, 3), (9, 4, 4)');
+			await db.exec('insert into small values (2), (9), (1)');
+			const sql = 'select pk from big where pk in (select id from small) order by pk';
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin), 'the rewrite fires despite orderingLoadBearing').to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'no Sort — the claim serves the absorbed ORDER BY').to.have.lengthOf(0);
+			expect(await orderedColumn(sql, 'pk'), 'rows actually ascend').to.deep.equal([1, 2, 9]);
+		});
+
+		it('a Sort no leaf can serve (order by w) survives above the node', async () => {
+			await db.exec('insert into big (pk, v, w) values (1, 0, 9), (2, 0, 5), (3, 0, 7)');
+			await db.exec('insert into small values (1), (2), (3)');
+			const sql = 'select pk, w from big where pk in (select id from small) order by w';
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin)).to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'the Sort must survive').to.have.lengthOf(1);
+			expect(await orderedColumn(sql, 'w')).to.deep.equal([5, 7, 9]);
+		});
+
+		it('declines a composite primary key — the merge join survives', async () => {
+			// The memory module declines a runtime-set IN on the leading column of a
+			// composite key, so the pushdown never plans. If a module change ever
+			// starts claiming it, this test forces the prefix-window ordering
+			// question to be answered first (see seekPreservesTargetOrder's doc).
+			await db.exec('create table comp (a integer, b integer, primary key (a, b))');
+			const sql = 'select a, b from comp where a in (select id from small)';
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin), 'must decline').to.have.lengthOf(0);
+			expect(collectNodes(plan, isMergeJoin), 'merge join survives').to.have.lengthOf(1);
+		});
+
+		it('leaves an anti merge join alone (not exists on the primary key)', async () => {
+			await db.exec('insert into big (pk, v, w) values (1, 0, 0), (2, 0, 0), (3, 0, 0)');
+			await db.exec('insert into small values (2)');
+			const sql = 'select pk from big b where not exists (select 1 from small s where s.id = b.pk)';
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin), 'anti must not rewrite').to.have.lengthOf(0);
+			const merges = collectNodes(plan, isMergeJoin);
+			expect(merges, 'the anti merge join survives').to.have.lengthOf(1);
+			expect(merges[0].joinType).to.equal('anti');
+			expect(await orderedColumn(sql, 'pk')).to.deep.equal([1, 3]);
+		});
+
+		it('declines a residual-carrying merge semi join (two-pair IN-style shape)', async () => {
+			// monotonic-merge-join residualizes the non-driving equi-pair, so this
+			// arrives as a MergeJoin with equiPairs.length === 1 AND a residual —
+			// the residual gate must decline it.
+			await db.exec('create table small2 (id integer primary key, k integer)');
+			await db.exec('insert into big (pk, v, w) values (1, 5, 0), (2, 6, 0), (3, 7, 0)');
+			await db.exec('insert into small2 values (1, 5), (2, 9), (3, 7)');
+			const sql = 'select pk from big b where exists (select 1 from small2 s where s.id = b.pk and s.k = b.v)';
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin), 'must decline').to.have.lengthOf(0);
+			const merges = collectNodes(plan, isMergeJoin);
+			expect(merges, 'the residual-carrying merge join survives').to.have.lengthOf(1);
+			expect(merges[0].residualCondition, 'the shape really carries a residual').to.not.equal(undefined);
+			expect(await orderedColumn(sql, 'pk')).to.deep.equal([1, 3]);
+		});
+	});
+
+	describe('merge arm: key-source-size decline (doctored catalog statistics)', () => {
+		// A merge semi join streams both sides; the rewrite drains the key source
+		// into a Set first. When the key source's row estimate already exceeds
+		// min(maxKeys, breakEvenKeys) the seek provably cannot fire, so the rule
+		// must keep the merge join. The stats are planted via `TableSchema.statistics`
+		// (what `catalogRowCount` → `physical.estimatedRows` reads); the memory
+		// module itself reports 0 for a fresh table, which is why this needs a
+		// doctored module — the gate is inert on undoctored memory tables.
+		class StatsModule extends MemoryTableModule {
+			constructor(private readonly stats: Record<string, number>) {
+				super();
+			}
+			override async create(db_: Database, tableSchema: TableSchema): Promise<MemoryTable> {
+				const table = await super.create(db_, tableSchema);
+				const rowCount = this.stats[tableSchema.name.toLowerCase()];
+				if (rowCount !== undefined) {
+					(tableSchema as { statistics?: TableStatistics }).statistics =
+						{ rowCount, columnStats: new Map() };
+				}
+				return table;
+			}
+		}
+
+		async function planWith(smallRows: number): Promise<{ db: Database; plan: PlanNode }> {
+			const statsDb = new Database();
+			// `big` large so physical join selection still prefers the merge join
+			// over index-nested-loop; only `small`'s estimate is under test.
+			statsDb.registerModule('statmem', new StatsModule({ big: 100000, small: smallRows }));
+			await statsDb.exec('create table big (id integer primary key) using statmem()');
+			await statsDb.exec('create table small (id integer primary key) using statmem()');
+			return { db: statsDb, plan: statsDb.getPlan('select id from big where id in (select id from small)') };
+		}
+
+		it('declines when the estimate exceeds min(maxKeys, breakEvenKeys)', async () => {
+			// Default memory-module costs put the threshold at the engine ceiling
+			// (1000); 1200 estimated key rows can never seek.
+			const { db: statsDb, plan } = await planWith(1200);
+			try {
+				expect(collectNodes(plan, isKeySetSemiJoin), 'must decline').to.have.lengthOf(0);
+				expect(collectNodes(plan, isMergeJoin), 'merge join survives').to.have.lengthOf(1);
+			} finally {
+				await statsDb.close();
+			}
+		});
+
+		it('rewrites below the threshold (the decline above is not vacuous)', async () => {
+			const { db: statsDb, plan } = await planWith(900);
+			try {
+				expect(collectNodes(plan, isKeySetSemiJoin)).to.have.lengthOf(1);
+			} finally {
+				await statsDb.close();
+			}
+		});
+	});
+
+	describe('descending primary key', () => {
+		// The walk and the seek both descend, so the claim admits the shape —
+		// possible only since the memory backend advertises the true PK direction
+		// (bug-desc-pk-scan-advertises-ascending-order). The join arrives as a
+		// HASH semi join here (a descending side is not merge-ready), so this
+		// covers the hash arm's relaxed orderingLoadBearing decline end to end.
+		it('absorbs order by id desc and emits descending rows', async () => {
+			await db.exec('create table ddesc (id integer, primary key (id desc))');
+			await db.exec('insert into ddesc values (1), (2), (3), (4), (5)');
+			await db.exec('insert into small values (2), (5), (3)');
+			const sql = 'select id from ddesc where id in (select id from small) order by id desc';
+			const plan = db.getPlan(sql);
+			const nodes = collectNodes(plan, isKeySetSemiJoin);
+			expect(nodes, 'the rewrite fires on the descending walk').to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'no Sort — the descending claim serves it').to.have.lengthOf(0);
+			expect(nodes[0].physical.ordering).to.deep.equal([{ column: 0, desc: true }]);
+			const rows: number[] = [];
+			for await (const r of db.eval(sql)) rows.push((r as { id: number }).id);
+			expect(rows, 'rows actually descend').to.deep.equal([5, 3, 2]);
+		});
+	});
+
+	describe('seekPreservesTargetOrder', () => {
+		// Direct predicate coverage over (leaf, pushdown) pairs: the leaves and
+		// pushdowns are real planner output, varied synthetically per clause.
+		function plannedNode(sql: string): KeySetSemiJoinNode {
+			const nodes = keySetNodes(sql);
+			expect(nodes, `planned KeySetSemiJoin for: ${sql}`).to.have.lengthOf(1);
+			return nodes[0];
+		}
+
+		it('holds when the seek index is the walk index (primary key IN)', () => {
+			const node = plannedNode('select pk from big where pk in (select id from small)');
+			expect(seekPreservesTargetOrder(node.target, node.pushdown)).to.equal(true);
+		});
+
+		it('fails when the seek index differs from the walk index', () => {
+			// `v in (…)` seeks idx_v while the leaf walks _primary_.
+			const node = plannedNode('select pk from big where v in (select id from small)');
+			expect(node.target).to.be.instanceOf(IndexScanNode);
+			expect((node.target as IndexScanNode).indexName).to.not.equal(node.pushdown.indexName);
+			expect(seekPreservesTargetOrder(node.target, node.pushdown)).to.equal(false);
+			expect(node.getLogicalAttributes().preservesTargetOrder).to.equal(false);
+		});
+
+		it('fails on a composite pushdown index (prefix-window order is unproven)', () => {
+			const node = plannedNode('select pk from big where pk in (select id from small)');
+			const index = node.pushdown.accessPath.index;
+			const composite: KeySetPushdown = {
+				...node.pushdown,
+				accessPath: {
+					...node.pushdown.accessPath,
+					index: { ...index, keyColumns: [index.keyColumns[0], { columnIndex: 1, desc: false }] },
+				},
+			};
+			expect(seekPreservesTargetOrder(node.target, composite)).to.equal(false);
+		});
+
+		it('fails when the advertised direction disagrees with the key column', () => {
+			const node = plannedNode('select pk from big where pk in (select id from small)');
+			const index = node.pushdown.accessPath.index;
+			const flipped: KeySetPushdown = {
+				...node.pushdown,
+				accessPath: {
+					...node.pushdown.accessPath,
+					index: { ...index, keyColumns: [{ ...index.keyColumns[0], desc: true }] },
+				},
+			};
+			expect(seekPreservesTargetOrder(node.target, flipped)).to.equal(false);
+		});
+
+		it('fails on a leaf whose advertised order is not the key order', () => {
+			const node = plannedNode('select pk from big where pk in (select id from small)');
+			const leaf = node.target as IndexScanNode;
+			const mismatched = new IndexScanNode(
+				leaf.scope, leaf.source, leaf.filterInfo, leaf.indexName,
+				[{ column: 0, desc: true }]);
+			expect(seekPreservesTargetOrder(mismatched, node.pushdown)).to.equal(false);
+			const none = new IndexScanNode(
+				leaf.scope, leaf.source, leaf.filterInfo, leaf.indexName, undefined);
+			expect(seekPreservesTargetOrder(none, node.pushdown)).to.equal(false);
+		});
+
+		it('fails on a SeqScan target and on a non-scan access path', () => {
+			const node = plannedNode('select pk from big where pk in (select id from small)');
+			const leaf = node.target as IndexScanNode;
+			const seq = new SeqScanNode(leaf.scope, leaf.source, makeFullScanFilterInfo());
+			expect(seekPreservesTargetOrder(seq, node.pushdown), 'SeqScan advertises nothing').to.equal(false);
+			// A full-scan FilterInfo on an IndexScan shell: accessPath.kind !== 'index'.
+			const fullScanLeaf = new IndexScanNode(
+				leaf.scope, leaf.source, makeFullScanFilterInfo(), leaf.indexName, leaf.providesOrdering);
+			expect(seekPreservesTargetOrder(fullScanLeaf, node.pushdown)).to.equal(false);
+		});
+	});
+
+	describe('rebuild stability of the ordering claim', () => {
+		// Later PostOptimization rules can rebuild the node through withChildren
+		// with a new leaf. The claim is derived per computePhysical call, so it
+		// must re-derive against the new leaf — surviving an access-path-preserving
+		// rebuild and disappearing when the access path changes.
+		it('re-derives through withChildren', () => {
+			const nodes = keySetNodes('select pk from big where pk in (select id from small)');
+			expect(nodes).to.have.lengthOf(1);
+			const node = nodes[0];
+			const leaf = node.target as IndexScanNode;
+
+			// Same access path, new leaf object: the claim survives.
+			const sameLeaf = new IndexScanNode(
+				leaf.scope, leaf.source, leaf.filterInfo, leaf.indexName, leaf.providesOrdering);
+			const rebuiltSame = node.withChildren([sameLeaf, node.keySource]) as KeySetSemiJoinNode;
+			expect(rebuiltSame).to.not.equal(node);
+			expect(rebuiltSame.getLogicalAttributes().preservesTargetOrder).to.equal(true);
+			expect(rebuiltSame.physical.ordering).to.deep.equal([{ column: 0, desc: false }]);
+
+			// Access path changed (full scan): the claim disappears.
+			const changedLeaf = new SeqScanNode(leaf.scope, leaf.source, makeFullScanFilterInfo());
+			const rebuiltChanged = node.withChildren([changedLeaf, node.keySource]) as KeySetSemiJoinNode;
+			expect(rebuiltChanged.getLogicalAttributes().preservesTargetOrder).to.equal(false);
+			expect(rebuiltChanged.physical.ordering).to.equal(undefined);
 		});
 	});
 

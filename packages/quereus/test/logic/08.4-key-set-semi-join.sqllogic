@@ -108,10 +108,13 @@ SELECT pk FROM selfref ORDER BY pk;
 --
 -- Every case above pins its rows with `ORDER BY <a column the target's own walk
 -- already provides>`. Both backends absorb that sort into the target leaf, which
--- marks the leaf's emission order load-bearing and makes the rewrite decline — so
--- those cases exercise the surviving hash semi join, not the seek. The aggregate
--- forms below need no ORDER BY, so the runtime may push the multi-seek. Same
--- answers either way, which is exactly the property being pinned.
+-- marks the leaf's emission order load-bearing; since the seek index (idx on v)
+-- is NOT the walk index in those cases, the rewrite declines — they exercise the
+-- surviving hash semi join, not the seek. (When the two indexes coincide the
+-- rewrite now fires despite the absorbed sort — see the primary-key section at
+-- the end of this file.) The aggregate forms below need no ORDER BY, so the
+-- runtime may push the multi-seek. Same answers either way, which is exactly the
+-- property being pinned.
 
 CREATE TABLE seekt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
 CREATE INDEX idx_seekt_v ON seekt(v);
@@ -232,3 +235,72 @@ SELECT count(*) AS c, min(pk) AS lo FROM xzt WHERE v IN (SELECT r FROM xzk);
 INSERT INTO xr VALUES (5, NULL);
 SELECT count(*) AS c, sum(v) AS s FROM xt WHERE v IN (SELECT r FROM xr);
 → [{"c":2,"s":40}]
+
+-- ===== Primary-key IN-subquery (the merge semi join arm) =====
+--
+-- `pk in (select <its own pk> from …)` walks BOTH sides in primary-key order, so on
+-- the memory backend it plans as a merge semi join and reaches the KeySetSemiJoin
+-- through the `key-set-seek-merge` anchor — including under an ORDER BY the walk
+-- absorbed, because the seek index IS the walk index and the node claims the walk's
+-- own order. The persistent store declines a runtime-set IN on its primary key
+-- (backlog/feat-store-pk-in-list-multiseek) and keeps the merge join there. The two
+-- backends therefore run DIFFERENT plans for every case below, which is exactly why
+-- these assert ROWS only — the answers must be byte-identical either way.
+
+CREATE TABLE pkt (pk INTEGER PRIMARY KEY, v TEXT);
+CREATE TABLE pksrc (id INTEGER PRIMARY KEY);
+CREATE TABLE pkkeys (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO pkt VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');
+INSERT INTO pksrc VALUES (4), (2), (999);
+INSERT INTO pkkeys VALUES (1, 4), (2, 2), (3, 4), (4, NULL), (5, 999);
+
+-- The headline shape, with the ORDER BY the walk absorbs (memory seeks anyway now).
+SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
+→ [{"pk":2,"v":"two"},{"pk":4,"v":"four"}]
+
+-- The same membership without ORDER BY, pinned through order-free aggregates.
+SELECT count(*) AS c, min(pk) AS lo, max(pk) AS hi FROM pkt WHERE pk IN (SELECT id FROM pksrc);
+→ [{"c":2,"lo":2,"hi":4}]
+
+-- Duplicate and NULL keys against the primary key: dupes must not fan out the
+-- target, NULLs are dropped from the set. (`k` is not the source's own key, so
+-- backends are free to serve this by whichever arm plans — the rows may not care.)
+SELECT pk FROM pkt WHERE pk IN (SELECT k FROM pkkeys) ORDER BY pk;
+→ [{"pk":2},{"pk":4}]
+
+-- Empty key set on the primary-key shape.
+SELECT pk FROM pkt WHERE pk IN (SELECT id FROM pksrc WHERE id > 10000);
+→ []
+
+-- DELETE through the primary-key shape: exactly the matching rows go.
+DELETE FROM pkt WHERE pk IN (SELECT id FROM pksrc);
+SELECT pk, v FROM pkt ORDER BY pk;
+→ [{"pk":1,"v":"one"},{"pk":3,"v":"three"},{"pk":5,"v":"five"}]
+
+-- UPDATE through the same shape.
+INSERT INTO pksrc VALUES (5);
+UPDATE pkt SET v = 'touched' WHERE pk IN (SELECT id FROM pksrc);
+SELECT pk, v FROM pkt ORDER BY pk;
+→ [{"pk":1,"v":"one"},{"pk":3,"v":"three"},{"pk":5,"v":"touched"}]
+
+-- Descending primary key: the walk and the seek both descend (the memory backend
+-- advertises the true direction), and an absorbed ORDER BY pk DESC stays served.
+CREATE TABLE pkd (pk INTEGER, v TEXT, PRIMARY KEY (pk DESC));
+INSERT INTO pkd VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+SELECT pk, v FROM pkd WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk DESC;
+→ [{"pk":4,"v":"d"},{"pk":2,"v":"b"}]
+SELECT count(*) AS c, min(pk) AS lo FROM pkd WHERE pk IN (SELECT id FROM pksrc);
+→ [{"c":2,"lo":2}]
+
+-- Read-your-own-writes through the primary-key shape: staged rows must be visible
+-- and ordered wherever the runtime seeks.
+BEGIN;
+INSERT INTO pkt VALUES (2, 'reborn');
+SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
+→ [{"pk":2,"v":"reborn"},{"pk":5,"v":"touched"}]
+DELETE FROM pkt WHERE pk = 5;
+SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
+→ [{"pk":2,"v":"reborn"}]
+ROLLBACK;
+SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
+→ [{"pk":5,"v":"touched"}]

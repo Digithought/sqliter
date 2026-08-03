@@ -1,9 +1,12 @@
 /**
  * Rule: Key-set seek — materialize the semi-join key set, then seek the target with it
  *
- * Pattern (anchored on the physical hash semi join `join-physical-selection` builds):
+ * Pattern (anchored on the physical hash semi join `join-physical-selection`
+ * builds — rule id `key-set-seek` — and on the merge semi join
+ * `monotonic-merge-join` / `join-physical-selection` build — rule id
+ * `key-set-seek-merge`; one rule function serves both anchors):
  *
- *   BloomJoinNode (semi, exactly one equi-pair, no residual)
+ *   BloomJoinNode | MergeJoinNode (semi, exactly one equi-pair, no residual)
  *     ├─ left:  (FilterNode | trivial ProjectNode | AliasNode)*
  *     │           over  SeqScan(fullScan) | ordering-only IndexScan(plan=0)
  *     └─ right: uncorrelated, deterministic, side-effect-free key source
@@ -31,10 +34,12 @@
  *     / limit / offset mean replacing its FilterInfo would silently drop the
  *     module-enforced predicates or directives
  *     (backlog/feat-key-set-seek-over-pushed-constraints)
- *   - a leaf whose emission order absorbed a SortNode (`orderingLoadBearing`):
- *     the dropped Sort's order now rides the leaf's walk order through the
- *     order-preserving hash join, and a pushed multi-seek would emit in
- *     seek-key order instead
+ *   - a leaf whose emission order absorbed a SortNode (`orderingLoadBearing`)
+ *     UNLESS the seek would reproduce that order (`seekPreservesTargetOrder`:
+ *     the seek index is the walk index, so a multi-seek emits a subsequence of
+ *     the walk — still in the same order). Otherwise the dropped Sort's order,
+ *     which rides the leaf's walk order through the order-preserving join,
+ *     would be replaced by seek-key order
  *   - target/key logical types that do not share one seek key space
  *     (`sharesSeekKeySpace`: identical types, or any two of INTEGER / REAL /
  *     NUMERIC). Anything else could be encoded into seek keys that miss rows
@@ -54,22 +59,38 @@
  *   - a break-even of zero (the module's own costs say a scan wins at every
  *     key count)
  *
- * NOTE: the three `getBestAccessPlan` probes run on every qualifying hash semi
+ * The MERGE anchor adds two gates the hash anchor does not need:
+ *   - `seekPreservesTargetOrder` must hold. `MergeJoinNode.computePhysical`
+ *     propagates the probe side's `ordering` / `monotonicOn` for semi, so a
+ *     Sort an earlier pass dropped on the strength of the merge join's order
+ *     cannot come back — a replacement that cannot reproduce that order is a
+ *     wrong-order plan, not a slow one. (`BloomJoinNode` propagates neither,
+ *     so nothing above a hash join can have depended on an ordering claim —
+ *     that asymmetry is the whole reason this gate is merge-only.)
+ *   - the key source's PHYSICAL row estimate, when present, must not exceed
+ *     min(maxKeys, breakEvenKeys) — the exact expression the runtime's `push`
+ *     decision uses. A merge semi join streams both sides; this node drains
+ *     the key source into a Set before opening the target, so when the seek
+ *     provably cannot fire the rewrite is pure loss (the same scan, plus a set
+ *     the merge join never built). The hash arm has no such gate because the
+ *     hash join it replaces already built that set.
+ *
+ * NOTE: the three `getBestAccessPlan` probes run on every qualifying semi
  * join optimization, uncached. Cheap for both shipped modules; if a third-party
  * module with an expensive planner ever shows up in optimization profiles,
  * memoize by (table, seek column).
  *
- * NOTE: the `orderingLoadBearing` decline is conservative — a future enhancement
- * could re-sort the pushed output by the leaf's advertised order, or push when
- * the seek index IS the walk index (see
- * `backlog/feat-key-set-seek-merge-semi-join`).
+ * NOTE: the `orderingLoadBearing` decline is conservative when
+ * `seekPreservesTargetOrder` is false — a future enhancement could re-sort the
+ * pushed output by the leaf's advertised order.
  */
 
 import { createLogger } from '../../../common/logger.js';
 import type { PlanNode, RelationalPlanNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
 import { BloomJoinNode } from '../../nodes/bloom-join-node.js';
-import { KeySetSemiJoinNode, RUNTIME_SET_MAX_KEYS, type KeySetPushdown, type KeySetTargetNode } from '../../nodes/key-set-semi-join-node.js';
+import { MergeJoinNode } from '../../nodes/merge-join-node.js';
+import { KeySetSemiJoinNode, RUNTIME_SET_MAX_KEYS, seekPreservesTargetOrder, type KeySetPushdown, type KeySetTargetNode } from '../../nodes/key-set-semi-join-node.js';
 import { IndexScanNode } from '../../nodes/table-access-nodes.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
@@ -90,10 +111,13 @@ const log = createLogger('optimizer:rule:key-set-seek');
 
 /**
  * Structural + purity admission of the join itself: a single-pair, residual-free
- * hash SEMI join whose key source may be drained exactly once (uncorrelated,
- * deterministic, pure) and whose probe chain carries no write.
+ * SEMI join (hash or merge — both expose the same shape) whose key source may be
+ * drained exactly once (uncorrelated, deterministic, pure) and whose probe chain
+ * carries no write. The residual gate also covers `monotonic-merge-join`'s
+ * residualized non-driving equi-pairs: a two-pair IN-style shape arrives as one
+ * equi-pair plus a residual and declines here.
  */
-function admitJoin(node: BloomJoinNode): boolean {
+function admitJoin(node: BloomJoinNode | MergeJoinNode): boolean {
 	if (node.joinType !== 'semi') return false;
 	if (node.equiPairs.length !== 1) return false;
 	if (node.residualCondition !== undefined) return false;
@@ -128,13 +152,16 @@ function admitJoin(node: BloomJoinNode): boolean {
  *
  * It must read every row with nothing pushed into it: a plain full scan, or an
  * ordering-only index walk (plan=0) — which reads every row exactly like a full
- * scan and differs only in emission order, a property nothing above this hash
- * join could depend on (BloomJoinNode propagates no ordering). A leaf already
+ * scan and differs only in emission order. A leaf already
  * carrying pushed constraints had its residual Filter dropped on the module's
  * promise to enforce them; replacing its FilterInfo with our multi-seek would
  * silently drop those predicates
  * (backlog/feat-key-set-seek-over-pushed-constraints). A pushed limit / offset
  * is likewise a directive the multi-seek would not honor.
+ *
+ * Deliberately structural only: the `orderingLoadBearing` decline needs the
+ * pushdown (an absorbed Sort is fine when `seekPreservesTargetOrder` holds),
+ * so it lives in `ruleKeySetSeek` after `planPushdown` rather than here.
  */
 function admitLeaf(left: RelationalPlanNode): KeySetTargetNode | null {
 	const leaf = peelToAccessLeaf(left);
@@ -152,15 +179,6 @@ function admitLeaf(left: RelationalPlanNode): KeySetTargetNode | null {
 		return null;
 	}
 
-	// A leaf whose emission order absorbed a SortNode (sort absorption in
-	// rule-grow-retrieve, before this join existed) is the only thing producing
-	// the query's ORDER BY: the hash semi join preserves probe order at
-	// runtime, but a pushed multi-seek emits in seek-key order. Declining keeps
-	// the order-preserving hash join.
-	if (leaf instanceof IndexScanNode && leaf.orderingLoadBearing) {
-		log('decline: leaf emission order is load-bearing (absorbed a Sort)');
-		return null;
-	}
 	return leaf;
 }
 
@@ -394,7 +412,7 @@ function interpolateBreakEven(
 }
 
 export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | null {
-	if (!(node instanceof BloomJoinNode)) return null;
+	if (!(node instanceof BloomJoinNode) && !(node instanceof MergeJoinNode)) return null;
 	if (!admitJoin(node)) return null;
 
 	const leaf = admitLeaf(node.left);
@@ -407,6 +425,51 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 	const pushdown = planPushdown(context, leaf, node.right, cols);
 	if (!pushdown) return null;
 
+	// A leaf whose emission order absorbed a SortNode (sort absorption in
+	// rule-grow-retrieve, before this join existed) is the only thing producing
+	// the query's ORDER BY: the join preserves probe order at runtime, and the
+	// replacement must keep serving that order. When the seek index is the walk
+	// index (`seekPreservesTargetOrder`) both runtime branches emit in the
+	// leaf's own order and the absorbed Sort stays served; otherwise a pushed
+	// multi-seek would emit in seek-key order — decline, keeping the
+	// order-preserving join.
+	if (leaf instanceof IndexScanNode && leaf.orderingLoadBearing
+		&& !seekPreservesTargetOrder(leaf, pushdown)) {
+		log('decline: leaf emission order is load-bearing (absorbed a Sort) and the seek would not reproduce it');
+		return null;
+	}
+
+	if (node instanceof MergeJoinNode) {
+		// Merge-arm-only gate 1: the merge join propagates the probe side's
+		// ordering / monotonicOn upward for semi, so an ancestor (or an already
+		// dropped Sort) may depend on that order. The replacement must be able
+		// to claim the same order — KeySetSemiJoinNode does so exactly when
+		// this predicate holds. (The hash arm needs no such gate: BloomJoinNode
+		// propagates no ordering, so nothing above it can have depended on one.)
+		if (!seekPreservesTargetOrder(leaf, pushdown)) {
+			log('decline: merge join propagates the probe order and the seek cannot reproduce it');
+			return null;
+		}
+		// Merge-arm-only gate 2: do not trade a streaming operator for an
+		// unbounded materialization. When the key source's row estimate already
+		// exceeds the runtime's own seek threshold — the exact expression
+		// `emitKeySetSemiJoin` uses for its `push` decision — the pushdown
+		// provably cannot fire, so the rewrite is pure loss: the same scan the
+		// merge join did, plus a probe Set the merge join never built. Absent
+		// estimate ⇒ proceed, the same posture the rest of the rule takes
+		// toward advisory numbers. The PHYSICAL estimate is read because the
+		// logical `estimatedRows` getter reads `undefined` through a physical
+		// access node. NOTE: inert on the memory backend today (its row
+		// estimate for a freshly-populated table reads 0) — this gate exists
+		// for modules that report real cardinality.
+		const keyRows = node.right.physical.estimatedRows;
+		if (keyRows !== undefined && keyRows > Math.min(pushdown.maxKeys, pushdown.breakEvenKeys)) {
+			log('decline: key source estimate %d exceeds the seek threshold min(%d, %d)',
+				keyRows, pushdown.maxKeys, pushdown.breakEvenKeys);
+			return null;
+		}
+	}
+
 	const keySetJoin = new KeySetSemiJoinNode(
 		node.scope,
 		leaf,
@@ -415,7 +478,8 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		pair.rightAttrId,
 		pushdown,
 	);
-	log('Replaced hash semi join with KeySetSemiJoin on %s.%s via %s (breakEven=%d)',
+	log('Replaced %s semi join with KeySetSemiJoin on %s.%s via %s (breakEven=%d)',
+		node instanceof MergeJoinNode ? 'merge' : 'hash',
 		leaf.tableSchema.name, leaf.tableSchema.columns[cols.seekCol]?.name,
 		pushdown.indexName, pushdown.breakEvenKeys);
 	return rebuildChain(node.left, leaf, keySetJoin);

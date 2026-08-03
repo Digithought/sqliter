@@ -29,6 +29,52 @@ export type KeySetTargetNode = SeqScanNode | IndexScanNode;
  */
 export const RUNTIME_SET_MAX_KEYS = 1000;
 
+/**
+ * True when the multi-seek this pushdown describes emits in exactly the target
+ * leaf's own walk order, so the node may claim the leaf's `ordering` /
+ * `monotonicOn` regardless of which branch the runtime picks.
+ *
+ * The equivalence: the scan branch leaves the leaf's `FilterInfo` untouched, so
+ * rows arrive in the walk index's key order; the seek branch replaces it with a
+ * `plan=5` multi-seek whose engine-wide contract is that rows come back in the
+ * *scanned structure's own key order*, never seek-argument order (pinned by
+ * `test/vtab/multiseek-key-order.spec.ts`, honoured by both backends). When the
+ * seek index IS the walk index, the seek branch therefore emits a subsequence
+ * of the scan branch's stream — and a subsequence of an ordered stream is still
+ * ordered (a subsequence of a monotonic stream is still monotonic, strictness
+ * included: dropping rows cannot create a tie). So under that condition both
+ * branches satisfy the leaf's advertised order and the node may claim it.
+ *
+ * Restricted to a single-column index: for a composite index the seek would be
+ * a leading-column *prefix* window, and "structure key order within a prefix
+ * window" is not pinned by any current test. It costs nothing today — the
+ * memory module declines a runtime-set `IN` on the leading column of a
+ * composite key, and the literal form plans as a scan + Filter, so the
+ * composite case is unreachable through either path. Relax the clause when a
+ * module actually claims a leading-column multi-seek on a composite index, and
+ * pin the prefix-window order first.
+ */
+export function seekPreservesTargetOrder(
+	target: KeySetTargetNode,
+	pushdown: KeySetPushdown,
+): boolean {
+	// A SeqScan advertises no ordering at all — nothing to preserve, nothing to prove.
+	if (!(target instanceof IndexScanNode)) return false;
+	const walk = target.filterInfo.accessPath;
+	if (walk?.kind !== 'index' || walk.plan !== 'scan') return false;
+	// The load-bearing clause: the seek index is the walk index.
+	if (walk.index.name !== pushdown.accessPath.index.name) return false;
+	const keyColumns = pushdown.accessPath.index.keyColumns;
+	if (keyColumns.length !== 1) return false;
+	// The advertised order must actually describe the index's key order — this
+	// rejects a leaf whose `providesOrdering` says something else (including a
+	// reverse walk, whose advertised direction flips against the key column's).
+	const ordering = target.providesOrdering;
+	if (!ordering || ordering.length !== 1) return false;
+	return ordering[0].column === keyColumns[0].columnIndex
+		&& ordering[0].desc === (keyColumns[0].desc === true);
+}
+
 /** How the target's access path is rewritten when the runtime decides to seek. */
 export interface KeySetPushdown {
 	/** Index name as it must appear in idxStr (the module's own spelling). */
@@ -118,16 +164,26 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		// constant bindings, domain constraints, and INDs (all per-row claims
 		// that hold on any subset).
 		//
-		// Deliberately NOT propagated: `ordering`, `monotonicOn`, and
-		// `accessCapabilities`. Emission order depends on a decision made at
-		// runtime — seek order (index-key order on the seek column) when
-		// pushing, the leaf's native order when scanning — so claiming either
-		// would let a Sort be elided that the plan actually needs. This is safe
-		// with respect to what already ran: BloomJoinNode.computePhysical
-		// propagates no ordering or monotonicOn either, so nothing above the
-		// join this node replaces could have been built on the leaf's order —
-		// losing those properties is the status quo, not a regression.
+		// `ordering` and `monotonicOn` are claimed ONLY when
+		// `seekPreservesTargetOrder` holds — then both runtime branches (the
+		// untouched walk and the multi-seek over the same index) emit in the
+		// leaf's own key order, so the claim is independent of the seek-vs-scan
+		// decision; see that predicate's doc for the subsequence argument. The
+		// predicate is DERIVED here rather than carried as a constructor flag:
+		// later PostOptimization rules may rebuild the leaf through
+		// `withChildren`, and a stale flag would be a wrong-order plan, while a
+		// re-derivation against the current target cannot go stale. When it does
+		// not hold, emission order depends on the runtime decision and claiming
+		// either property would let a Sort be elided that the plan needs —
+		// matching BloomJoinNode, which propagates neither.
+		//
+		// `accessCapabilities` stays dropped either way: those advertise a
+		// leaf's ability to serve a later pushdown, and this node is not a leaf.
+		// Dropping capabilities loses optimizations, never correctness.
 		return {
+			...(seekPreservesTargetOrder(this.target, this.pushdown)
+				? { ordering: targetPhysical?.ordering, monotonicOn: targetPhysical?.monotonicOn }
+				: {}),
 			// Same formula as the logical getter, over the PHYSICAL child counts —
 			// the logical getters read `undefined` through the physical access node
 			// this semi-join targets.
@@ -180,6 +236,7 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 			seekColumnIndex: this.pushdown.seekColumnIndex,
 			maxKeys: this.pushdown.maxKeys,
 			breakEvenKeys: this.pushdown.breakEvenKeys,
+			preservesTargetOrder: seekPreservesTargetOrder(this.target, this.pushdown),
 			targetRows: this.left.estimatedRows,
 			keySourceRows: this.keySource.estimatedRows,
 		};

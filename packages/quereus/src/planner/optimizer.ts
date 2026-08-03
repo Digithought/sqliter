@@ -1013,6 +1013,27 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		sideEffectMode: 'safe',
 	},
 
+	// The MERGE anchor of the same rule (the function dispatches on node type):
+	// the common IN-on-primary-key shape becomes a merge semi join (both sides
+	// advertise a key walk), never a hash join, so the HashJoin entry above never
+	// sees it. Same placement rationale: after both merge-join producers
+	// (`monotonic-merge-join`, `join-physical-selection`) and after
+	// `monotonic-limit-pushdown`. Two entries rather than a nodeType array
+	// because the fan-out form renames ids to `<id>-<nodeType>`, which would
+	// rename the `key-set-seek` id trace output references. Nothing else in the
+	// pass anchors on MergeJoin (`eager-prefetch-probe` is HashJoin-only), so
+	// removing a merge join costs no other rewrite. The rule only fires on this
+	// anchor when the replacement claims the merge join's own ordering
+	// (`seekPreservesTargetOrder`), so order-dependent ancestors stay served.
+	{
+		pass: PassId.PostOptimization,
+		id: 'key-set-seek-merge',
+		nodeType: PlanNodeType.MergeJoin,
+		phase: 'impl',
+		fn: ruleKeySetSeek,
+		sideEffectMode: 'safe',
+	},
+
 	// Monotonic range-scan recognition (fan-out; ids
 	// `monotonic-range-access-<nodeType>`). Runs on physical leaves to annotate
 	// `rangeBoundedOn` when a handled range/equality bounds the monotonic column.

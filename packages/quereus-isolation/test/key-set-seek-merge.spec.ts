@@ -375,6 +375,63 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 		});
 	});
 
+	describe('primary-key merge-arm shape (feat-key-set-seek-merge-semi-join)', () => {
+		// `pk in (select id from ksrc)` — the key source column IS its own primary
+		// key, so both sides walk in key order and the engine plans a MERGE semi
+		// join; the key-set rewrite fires through its merge anchor and CLAIMS the
+		// target walk's ascending order (`seekPreservesTargetOrder`). That claim
+		// now depends on this package's merged read preserving index-key order, so
+		// these assert RAW emission order — no JS sort, unlike `rowsOf` above —
+		// with staged inserts, updates and deletes interleaved into the windows.
+		const KEY_SET_QUERY = `select pk, v from t where pk in (select id from ksrc)`;
+
+		const rawRows = async (q: string): Promise<Record<string, SqlValue>[]> =>
+			(await asyncIterableToArray(db.eval(q))) as Record<string, SqlValue>[];
+
+		beforeEach(async () => {
+			await db.exec(`create table t (pk integer primary key, v text) using isolated`);
+			await db.exec(`create table ksrc (id integer primary key) using isolated`);
+			await db.exec(`insert into t values (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')`);
+			await db.exec(`insert into ksrc values (1), (3), (4)`);
+		});
+
+		function expectPrimarySeeked(): void {
+			expect(mem.seen('t')[0], 'the underlying served a primary-key multi-seek')
+				.to.match(multiSeekRe('_primary_'));
+		}
+
+		it('staged insert, update and delete merge in ascending pk order', async () => {
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (5, 'five')`); // outside the committed set…
+			await db.exec(`insert into ksrc values (5)`);      // …and now a member of it
+			await db.exec(`update t set v = 'new-three' where pk = 3`);
+			await db.exec(`delete from t where pk = 4`);
+			mem.reset();
+			expect(await rawRows(KEY_SET_QUERY), 'rows AND their emission order').to.deep.equal([
+				{ pk: 1, v: 'one' },
+				{ pk: 3, v: 'new-three' },
+				{ pk: 5, v: 'five' },
+			]);
+			expectPrimarySeeked();
+			await db.exec(`rollback`);
+		});
+
+		it('an absorbed ORDER BY pk is served through the staged merge', async () => {
+			// The ORDER BY was absorbed into the target walk before the rewrite;
+			// the seek — windowed through the overlay merge — must still ascend.
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 'new' where pk = 1`);
+			await db.exec(`delete from t where pk = 3`);
+			mem.reset();
+			expect(await rawRows(`${KEY_SET_QUERY} order by pk`)).to.deep.equal([
+				{ pk: 1, v: 'new' },
+				{ pk: 4, v: 'four' },
+			]);
+			expectPrimarySeeked();
+			await db.exec(`rollback`);
+		});
+	});
+
 	describe('literal IN-list multi-seek (fix/bug-isolation-multiseek-merge-order)', () => {
 		// A literal `where pk in (3, 1, 2)` stamps its seek keys in SQL-text order and
 		// does NOT go through `emitKeySetSemiJoin`'s sort (that rewrite only fires for

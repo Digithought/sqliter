@@ -328,6 +328,82 @@ describe('KeySetSemiJoin runtime', () => {
 		});
 	});
 
+	describe('merge-arm primary-key seek (key-set-seek-merge)', () => {
+		// `pk in (select id from small)` walks both sides in primary-key order, so
+		// it plans as a MERGE semi join and reaches the KeySetSemiJoin through the
+		// merge anchor. The node claims the walk's own order
+		// (seekPreservesTargetOrder), so the emitted rows must be in ascending pk
+		// order on BOTH runtime branches — asserted directly, not sorted in JS.
+		let db: Database;
+		let module: IdxStrCapturingModule;
+
+		const PRIMARY_MULTI_SEEK_RE = /^idx=_primary_\(0\);plan=5;inCount=(\d+)$/;
+
+		beforeEach(async () => {
+			db = new Database();
+			module = new IdxStrCapturingModule();
+			db.registerModule('countmem', module);
+			await db.exec('create table small (id integer primary key) using countmem()');
+			await db.exec('create table big (pk integer primary key, v integer null) using countmem()');
+			const values = Array.from({ length: 40 }, (_v, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ');
+			await db.exec(`insert into big values ${values}`);
+		});
+
+		afterEach(async () => {
+			await db.close();
+		});
+
+		it('pushes a _primary_ multi-seek, pulls only K rows, and emits them ascending', async () => {
+			// Inserted out of pk order: the seek keys are sorted before stamping.
+			await db.exec('insert into small values (30), (7), (18)');
+			module.reset();
+			const rows = await allRows<{ pk: number }>(db,
+				'select pk from big where pk in (select id from small)');
+			expect(rows, 'ascending pk order — the ordering claim, observed').to.deep.equal(
+				[{ pk: 7 }, { pk: 18 }, { pk: 30 }]);
+			const idxStr = (module.idxStrs.get('big') ?? [])[0];
+			expect(idxStr, 'the primary key was multi-seeked').to.match(PRIMARY_MULTI_SEEK_RE);
+			expect(idxStr).to.contain('inCount=3');
+			expect(module.rowCounts.get('big') ?? 0, 'only the matching rows pulled').to.be.at.most(3);
+		});
+
+		it('serves an absorbed ORDER BY pk through the seek', async () => {
+			await db.exec('insert into small values (25), (3), (11)');
+			module.reset();
+			const rows = await allRows<{ pk: number }>(db,
+				'select pk from big where pk in (select id from small) order by pk');
+			expect(rows).to.deep.equal([{ pk: 3 }, { pk: 11 }, { pk: 25 }]);
+			expect((module.idxStrs.get('big') ?? [])[0],
+				'the ORDER BY did not force a scan — the claim serves it').to.match(PRIMARY_MULTI_SEEK_RE);
+		});
+
+		it('deletes exactly the matching rows through the seek, and RETURNING works', async () => {
+			await db.exec('insert into small values (5), (12)');
+			module.reset();
+			const returned = await allRows<{ pk: number }>(db,
+				'delete from big where pk in (select id from small) returning pk');
+			expect(returned).to.deep.equal([{ pk: 5 }, { pk: 12 }]);
+			expect((module.idxStrs.get('big') ?? [])[0], 'the delete read was a multi-seek')
+				.to.match(PRIMARY_MULTI_SEEK_RE);
+			const remaining = await allRows<{ c: number }>(db, 'select count(*) as c from big');
+			expect(remaining).to.deep.equal([{ c: 38 }]);
+		});
+
+		it('falls back to the ordered walk above the ceiling and still emits ascending', async () => {
+			// 1001 distinct keys — over RUNTIME_SET_MAX_KEYS, so the runtime scans.
+			// The ordering claim must hold on THIS branch too.
+			const values = Array.from({ length: 1001 }, (_v, i) => `(${i + 1})`).join(', ');
+			await db.exec(`insert into small values ${values}`);
+			module.reset();
+			const rows = await allRows<{ pk: number }>(db,
+				'select pk from big where pk in (select id from small)');
+			expect(rows.map(r => r.pk), 'all 40 match, ascending').to.deep.equal(
+				Array.from({ length: 40 }, (_v, i) => i + 1));
+			expect((module.idxStrs.get('big') ?? [])[0], 'no multi-seek above the ceiling')
+				.to.not.match(PRIMARY_MULTI_SEEK_RE);
+		});
+	});
+
 	describe('descending seek index', () => {
 		it('seeks a DESC index and returns the matching rows', async () => {
 			const db = new Database();
