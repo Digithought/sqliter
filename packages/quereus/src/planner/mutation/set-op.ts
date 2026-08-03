@@ -18,6 +18,7 @@ import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { propagate, type BaseOp, type MutableViewLike, type MutationRequest } from './propagate.js';
 import { MS_UPDATE_KEYS_CTE, isJoinBody, isInnerJoinBody, analyzeJoinView, analyzeMultiSourceInsert, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, capturedSideIndices, withKeyCapture, type MultiSourceKeyCapture, type JoinViewAnalysis } from './multi-source.js';
 import { cloneExpr, transformExpr } from './scope-transform.js';
+import { bodyPlanningContext } from './body-context.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 
 /**
@@ -504,7 +505,9 @@ function analyzeSetOpView(ctx: PlanningContext, view: MutableViewLike): SetOpAna
 
 	// Plan the body ONCE: its root attributes are the view output columns (data columns
 	// then the appended membership flags — `set-op-membership-read`'s combinator surface).
-	const root = buildSelectStmt(ctx, sel);
+	// A STORED body plans on its own home-schema path (`bodyPlanningContext`); an
+	// ephemeral CTE / inline-subquery target keeps the caller's `ctx`.
+	const root = buildSelectStmt(bodyPlanningContext(ctx, view), sel);
 	if (!isRelationalNode(root)) {
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
@@ -699,6 +702,11 @@ function buildBranch(
 		name: `__setop_${side}`,
 		schemaName: view.schemaName,
 		selectAst: effectiveSelect,
+		// Carry the target's ephemeral flag: a branch of an ephemeral CTE / inline-subquery
+		// target is still part of the caller's statement, so its body must keep the caller's
+		// schema path. Without this the branch would re-acquire the home path in
+		// `bodyPlanningContext` off the (cosmetic) inherited `schemaName`.
+		...(view.ephemeral ? { ephemeral: true } : {}),
 	};
 	const flag = flags.find(f => f.side === side);
 	return { side, view: branchView, dataColNames, isNested, isMultiSource, ...(flag ? { flag } : {}) };
@@ -1709,8 +1717,9 @@ function analyzeFlaglessSetOpView(ctx: PlanningContext, view: MutableViewLike): 
 	}
 
 	// Plan the body ONCE: a flag-less body has no flag columns, so the root attributes ARE
-	// the view's data columns (positionally aligned to every leg's projection).
-	const root = buildSelectStmt(ctx, sel);
+	// the view's data columns (positionally aligned to every leg's projection). A STORED
+	// body plans on its own home-schema path (`bodyPlanningContext`).
+	const root = buildSelectStmt(bodyPlanningContext(ctx, view), sel);
 	if (!isRelationalNode(root)) {
 		raiseMutationDiagnostic({ reason: 'no-base-lineage', table: view.name, message: `cannot write through view '${view.name}': the set-operation body did not produce a relation` });
 	}
@@ -1776,7 +1785,14 @@ function buildFlaglessLeg(
 		type: 'column', expr: (rc as AST.ResultColumnExpr).expr, alias: dataColNames[i],
 	}));
 	const effectiveSelect: AST.SelectStmt = { ...legSel, columns: aliasedColumns };
-	const branchView: MutableViewLike = { name: `__setop_leg${index}`, schemaName: view.schemaName, selectAst: effectiveSelect };
+	// `ephemeral` rides along for the same reason as the flagged branch views above: a branch
+	// of an ephemeral target keeps the caller's schema path, not the home path. Defensive here
+	// — unlike the membership dispatch, the flag-less dispatch in `view-mutation-builder.ts` is
+	// itself `!view.ephemeral`-gated, so no ephemeral target reaches this builder today.
+	const branchView: MutableViewLike = {
+		name: `__setop_leg${index}`, schemaName: view.schemaName, selectAst: effectiveSelect,
+		...(view.ephemeral ? { ephemeral: true } : {}),
+	};
 	// A flag-less join leg is always an INNER join here: `isWritableLeafLeg` (the recognizer
 	// `flaglessShape` gated on) admits only single-source or INNER-join legs, so an outer / cross
 	// leg never reaches this builder (the body falls out of the flag-less route).
@@ -1788,8 +1804,9 @@ function buildFlaglessLeg(
 	// Plan the leg body for the oracle: its output attributes carry the σ-forwarded constant
 	// bindings / domains (the pre-existing half — a `where color='red'` over a `color`-projecting
 	// leg forwards `∅ → color='red'` to the output column). The synthesized discriminator
-	// bindings (Option B) close the projected-literal gap.
-	const planned = buildSelectStmt(ctx, effectiveSelect);
+	// bindings (Option B) close the projected-literal gap. The leg is part of the same stored
+	// body, so it plans on the same home-schema path (`bodyPlanningContext`).
+	const planned = buildSelectStmt(bodyPlanningContext(ctx, view), effectiveSelect);
 	if (!isRelationalNode(planned)) {
 		raiseMutationDiagnostic({ reason: 'no-base-lineage', table: view.name, message: `cannot write through view '${view.name}': a leg did not produce a relation` });
 	}

@@ -17,6 +17,7 @@ import { expressionToString } from '../../emit/ast-stringify.js';
 import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { bodyDefaults } from '../../schema/view.js';
+import { bodyPlanningContext } from './body-context.js';
 
 /**
  * Single-source view-mediated DML rewriting (the single-source spine of the
@@ -456,8 +457,9 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	const sel = view.selectAst;
 
 	// Build the body plan and gate it (joins / aggregates / set-ops / recursive
-	// CTEs / VALUES bodies are rejected here).
-	const bodyPlan = buildSelectStmt(ctx, sel);
+	// CTEs / VALUES bodies are rejected here). A STORED body plans on its own
+	// home-schema path, not the writing statement's — see `bodyPlanningContext`.
+	const bodyPlan = buildSelectStmt(bodyPlanningContext(ctx, view), sel);
 	if (!isRelationalNode(bodyPlan)) {
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
@@ -494,6 +496,15 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		});
 	}
 	const fromTable = sel.from[0];
+	// NOTE: this name lookup resolves against the CURRENT schema (getView's null-schema
+	// default), not the body's home path — so a `temp` view whose body names another
+	// `temp` view unqualified would slip past this guard. Unreachable today: an
+	// unqualified view name in a FROM clause never resolves through the schema path at
+	// all (`building/select.ts` view dispatch), so such a body cannot be created. Becomes
+	// reachable once `bug-unqualified-view-name-ignores-schema-path` lands — resolve the
+	// name on `bodyPlanningContext(ctx, view).schemaPath` then. (The materialized-view arm
+	// just below already has a plan-resolved `isMaintainedTable(baseTable)` fallback and is
+	// not exposed.)
 	if (ctx.schemaManager.getView(fromTable.table.schema ?? null, fromTable.table.name)) {
 		raiseMutationDiagnostic({
 			reason: 'nested-view',
@@ -648,7 +659,9 @@ export function buildCteSelfCapture(ctx: PlanningContext, view: MutableViewLike)
 	// own `analyzeView` would).
 	const analysis = analyzeView(ctx, view);
 	const sel = view.selectAst as AST.SelectStmt; // analyzeView already proved a SELECT body
-	const bodyPlan = buildSelectStmt(ctx, sel) as RelationalPlanNode;
+	// Matches `analyzeView`'s own body context exactly (for a CTE target — always ephemeral
+	// here — that is `ctx` verbatim, so the caller's path is preserved).
+	const bodyPlan = buildSelectStmt(bodyPlanningContext(ctx, view), sel) as RelationalPlanNode;
 	const attrs = bodyPlan.getAttributes();
 
 	// One capture column per view column, positionally aligned to the body plan's

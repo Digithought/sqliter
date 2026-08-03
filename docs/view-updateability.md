@@ -86,6 +86,12 @@ Each operator contributes its per-operator semantics (described below). Propagat
 
 The single entry point `propagate(ctx, view, req)` classifies the body and routes it: a decomposition-backed logical table (a module advertisement, no override) goes to the advertisement-driven fan-out; a single-table body to the single-source spine; a join body to the multi-source walk. All three share **one** plan-node backward-walk consumer that plans the body once and reads its threaded `updateLineage` for column→base routing — none re-walks the projection AST.
 
+### Schema resolution during write-through
+
+Decomposing a write re-plans the view body, and that re-plan uses the **view's own home-schema path** (its schema first, then the database default path — `Database._homeSchemaPath`), exactly as a read through the same view does; see [Schema § Stored bodies resolve against their home schema](schema.md). So a write through a view binds the same base tables its read binds, under any session `pragma schema_path` and any statement-level `with schema`. Only the stored body moves: the writing statement's own `where` / `set` / `returning` expressions and the `insert … select` source keep resolving on the caller's path.
+
+A CTE-name or inline-subquery DML target (`with c as (…) update c …`, `update (select …) as v …`) is **not** a stored object — it is part of the caller's statement — so its body keeps the caller's path verbatim. The single gate for both cases is `bodyPlanningContext(ctx, view)` in `planner/mutation/body-context.ts`.
+
 ### Identifying Predicates
 
 Updates and deletes carry a **row-identifying predicate** built from base-table primary keys traced through the lineage. For a relation whose lineage proves `(b1.pk, b2.pk, ...)` is a superkey at the top, the row-identifying predicate is the equality on those PKs. The propagation pass uses this predicate to bind the per-base operations to specific underlying rows.
@@ -262,6 +268,7 @@ No new subsystem is introduced — view updateability is the existing FD / EC / 
 | Law-gated `InvertibilityProfile` registry (`classifyInvertibility`) + recursive inverse-chain composer (`traceInvertibleColumn`) | `src/planner/analysis/scalar-invertibility.ts` |
 | Predicate-honest complement (`viewComplement` / `complementOf`) | `src/planner/analysis/view-complement.ts` |
 | Single propagation entry (`propagate`, `classifyViewBody`) routing single-source / multi-source / decomposition | `src/planner/mutation/propagate.ts` |
+| The one schema-path gate every body re-plan goes through (`bodyPlanningContext`) — home path for a stored view/MV, the caller's path for an ephemeral CTE / subquery target | `src/planner/mutation/body-context.ts` |
 | The one scope-aware column-substitution primitive all backward callers share (`transformExpr`, `collectFromColumnNames`, `transformScopedExpr` / `transformScopedQuery` via a `ScopeContext`) | `src/planner/mutation/scope-transform.ts` |
 | Single-source projection-and-filter rewrite (`rewriteViewInsert/Update/Delete`, `analyzeView`) | `src/planner/mutation/single-source.ts` |
 | Shared plan-node backward-walk consumer (`analyzeBodyLineage`) — plans a body once, reads `updateLineage` into column→base routing | `src/planner/mutation/backward-body.ts` |

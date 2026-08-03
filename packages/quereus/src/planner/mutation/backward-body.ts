@@ -7,6 +7,7 @@ import { buildSelectStmt } from '../building/select.js';
 import { resolveBaseSite } from '../analysis/update-lineage.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { MutableViewLike } from './single-source.js';
+import { bodyPlanningContext } from './body-context.js';
 
 /**
  * The **one** plan-node backward-walk consumer the multi-source join walk and the
@@ -165,7 +166,9 @@ export function analyzeBodyLineage(ctx: PlanningContext, view: MutableViewLike):
 	}
 	const sel = view.selectAst;
 
-	const bodyPlan = buildSelectStmt(ctx, sel);
+	// A STORED body plans on its own home-schema path, not the writing statement's
+	// (`bodyPlanningContext`); an ephemeral CTE / inline-subquery target keeps `ctx`.
+	const bodyPlan = buildSelectStmt(bodyPlanningContext(ctx, view), sel);
 	if (!isRelationalNode(bodyPlan)) {
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
