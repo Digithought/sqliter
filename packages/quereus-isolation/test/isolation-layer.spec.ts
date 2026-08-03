@@ -4963,6 +4963,10 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			// must complete rather than throw the no-accessPath INTERNAL error.
 			await adb.exec('analyze');
 
+			// The collected row count is the assertion that the scan actually ran AND saw the
+			// overlay: 2 committed rows + 1 uncommitted.
+			expect(adb.schemaManager.findTable('t', 'main')?.statistics?.rowCount).to.equal(3);
+
 			const rows = await asyncIterableToArray(adb.eval('select id, v from t order by id'));
 			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a'], [2, 'b'], [3, 'c']]);
 			await adb.exec('rollback');

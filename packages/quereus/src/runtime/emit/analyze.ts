@@ -122,7 +122,12 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 				}
 			} catch (e) {
 				log('Failed to analyze %s: %s', tableSchema.name, e);
-				// Continue with other tables on failure
+				// Continue with other tables on failure: one unreadable table should not cost
+				// the statistics of every other table in the schema.
+				// NOTE: the failure is visible only in the debug log and as a table missing from
+				// the returned report. If callers ever need to distinguish "analyzed, 0 rows"
+				// from "could not analyze", the report needs a per-table status column rather
+				// than an omitted row.
 			}
 		}
 

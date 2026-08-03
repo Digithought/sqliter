@@ -30,30 +30,30 @@ describe('ANALYZE runs eagerly under every entry point', () => {
 	afterEach(async () => { await db.close(); });
 
 	it('await db.exec("analyze") installs statistics', async () => {
-		expect(db.schemaManager._findTable('s', 'main')?.statistics, 'before ANALYZE').to.be.undefined;
+		expect(db.schemaManager.findTable('s', 'main')?.statistics, 'before ANALYZE').to.be.undefined;
 
 		await db.exec('analyze');
 
-		expect(db.schemaManager._findTable('s', 'main')?.statistics?.rowCount, 'after ANALYZE').to.equal(4);
+		expect(db.schemaManager.findTable('s', 'main')?.statistics?.rowCount, 'after ANALYZE').to.equal(4);
 	});
 
 	it('await db.exec("analyze <table>") installs statistics for the named table', async () => {
 		await db.exec('analyze s');
 
-		expect(db.schemaManager._findTable('s', 'main')?.statistics?.rowCount).to.equal(4);
+		expect(db.schemaManager.findTable('s', 'main')?.statistics?.rowCount).to.equal(4);
 	});
 
 	it('a mid-batch ANALYZE in a multi-statement exec string still runs', async () => {
 		await db.exec('create table t (id integer primary key); insert into t values (1); analyze; select 1;');
 
-		expect(db.schemaManager._findTable('s', 'main')?.statistics?.rowCount).to.equal(4);
-		expect(db.schemaManager._findTable('t', 'main')?.statistics?.rowCount).to.equal(1);
+		expect(db.schemaManager.findTable('s', 'main')?.statistics?.rowCount).to.equal(4);
+		expect(db.schemaManager.findTable('t', 'main')?.statistics?.rowCount).to.equal(1);
 	});
 
 	it('db.eval("analyze") still yields one (table, rows) row per analyzed table', async () => {
 		const rows = await collect(db.eval('analyze'));
 		expect(rows).to.deep.equal([{ table: 's', rows: 4 }]);
 
-		expect(db.schemaManager._findTable('s', 'main')?.statistics?.rowCount).to.equal(4);
+		expect(db.schemaManager.findTable('s', 'main')?.statistics?.rowCount).to.equal(4);
 	});
 });

@@ -395,6 +395,18 @@ a `finally`, and know whether your node forwards its source's attributes or orig
 new ones. Row-producing runs are `async function*`; failures throw `QuereusError` with
 a `StatusCode`.
 
+**Side effects must not live in a generator body.** A generator's body does not run
+until something iterates it, and a statement's result rows are not always iterated:
+`db.exec` discards a row-returning statement's result without pulling a single row
+(`Database._executeSingleStatement`). An emitter whose `run` both mutates engine state
+and yields a report must therefore be a plain `async` function that does the work, then
+returns an already-materialized `AsyncIterable<Row>` — `ArrayRowIterable`
+(`src/util/array-row-iterable.ts`) exists for that. `emitAnalyze` is the worked example.
+An emitter with no side effects (a scan, a filter, `EXPLAIN SCHEMA`) is free to stay a
+generator — laziness there is the point. Statements whose effect is purely void take a
+third route: the builder wraps them in a `SinkNode`, whose emitter drains the child
+(`buildPragmaStmt` does this for `pragma x = y`).
+
 ## Schema Resolution (Build-Time)
 
 Quereus resolves all schema dependencies during the planning phase and tracks them for automatic plan invalidation:
