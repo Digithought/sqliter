@@ -16,6 +16,7 @@ import {
 	logicalTypeCanHoldText,
 	pkKeyCollationName,
 	JSON_TYPE,
+	TIMESPAN_TYPE,
 	type LogicalType,
 	type Database,
 	type DatabaseInternal,
@@ -26,7 +27,7 @@ import {
 } from '@quereus/quereus';
 
 import { type KeyValueTransform } from './encoding.js';
-import { jsonStructuralKey } from './json-key.js';
+import { jsonKeyEncodable, jsonStructuralKey } from './json-key.js';
 
 /**
  * Resolve the per-column KEY collation for each primary-key column.
@@ -273,6 +274,78 @@ export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
 }
 
 /**
+ * True when this semantic-ordering type's store key bytes memcmp in EXACTLY the type's
+ * `compare` order — and byte-equal exactly when `compare` says equal — for every value a
+ * store-backed table can HOLD.
+ *
+ * An explicit per-type assertion, deliberately NOT
+ * `storeSemanticKeyTransform(type) !== undefined`: a transform is only required to be
+ * identity-faithful, and `validateSemanticKeyTransforms` can check only that one exists —
+ * nothing forces a future type's transform to be order-preserving. A type absent here
+ * keeps the pre-existing blanket decline in {@link keyOrderMatchesCollation} — no byte
+ * window, no ordering advertisement, answered by full scan + the type-aware residual.
+ *
+ * Why the stored-value claim holds for the two listed types:
+ *  - TIMESPAN — every write path coerces through `TIMESPAN_TYPE.parse` (row coercion,
+ *    the engine's pre-coerced UPDATE fast path, the ALTER retype backfill's
+ *    `validateAndParse`), which raises on anything unparseable. So every stored value
+ *    parses, `groupKey` returns total seconds for all of them, and every stored key
+ *    member is a fixed-width NUMERIC whose memcmp order is elapsed-time order. The
+ *    raw-text fallback branch of `groupKey` is unreachable for stored values.
+ *  - JSON — every stored value is a `JSON_TYPE.parse` output (never a blob, never a
+ *    bigint), all of which {@link jsonStructuralKey} encodes; its tag order reproduces
+ *    both `deepCompareJson`'s rank order and, for cross-storage-class pairs (where
+ *    `createTypedComparator` short-circuits before reaching `JSON_TYPE.compare`),
+ *    `getStorageClass`'s NULL < NUMERIC < TEXT < BLOB < OBJECT. SQL NULL never reaches
+ *    a transform (`encodeCompositeKey` exempts it) and its `0x00` tag sorts below the
+ *    BLOB tag the structural bytes travel under, matching NULL-first placement.
+ *
+ * Matched by NAME, not object identity, for the same dual-module-instance reason
+ * {@link storeSemanticKeyTransform} documents. This is a claim about values the table
+ * holds; a query-supplied seek bound needs {@link semanticProbeIsKeyFaithful} on top.
+ */
+export function semanticKeyOrderIsFaithful(type: LogicalType | undefined): boolean {
+	return hasSemanticOrdering(type)
+		&& (type.name === TIMESPAN_TYPE.name || type.name === JSON_TYPE.name);
+}
+
+/**
+ * True when `probe`'s key bytes sit at the position the type's `compare` gives it
+ * relative to every STORED value — the per-VALUE precondition a re-opened range window
+ * needs on top of {@link semanticKeyOrderIsFaithful}, which is a claim about stored
+ * values only. A seek bound comes from the query, and nothing coerces it to the
+ * column's declared type, so an unfaithful probe is reachable where an unfaithful
+ * stored value is not. Two concrete TIMESPAN under-fetches motivate the gate:
+ *
+ *  - `where d > 5`: `createTypedComparator` short-circuits on the storage-class
+ *    mismatch before `TIMESPAN.compare` runs, so every stored (TEXT-class) value ranks
+ *    ABOVE the NUMERIC probe and the predicate admits every row — but `groupKey(5)`
+ *    passes the non-string through unchanged, so the byte window is `> NUMERIC(5)` and
+ *    a row storing 'PT1S' (total 1) falls outside it. Rows lost.
+ *  - `where d > 'not a duration'`: `TIMESPAN.compare` falls back to BINARY text against
+ *    the canonical stored text, while `groupKey` falls back to the raw text, which
+ *    encodes TEXT-tagged and sorts above every NUMERIC-tagged stored key. Different
+ *    position, rows lost.
+ *
+ * Callers SKIP an unfaithful bound (widening the window to the pre-ticket full scan)
+ * rather than declining the whole access — see `StoreTableScan.buildPKRangeBounds`.
+ * The TIMESPAN arm calls the COLUMN's own `groupKey`, not the imported singleton's,
+ * for the dual-module-instance reason {@link storeSemanticKeyTransform} documents.
+ * A semantic-ordering type outside the {@link semanticKeyOrderIsFaithful} allow-list
+ * answers `false`, consistent with that predicate — no window is built for it anyway.
+ */
+export function semanticProbeIsKeyFaithful(type: LogicalType | undefined, probe: SqlValue): boolean {
+	if (!hasSemanticOrdering(type)) return true;
+	if (type.name === TIMESPAN_TYPE.name) {
+		// A number out of groupKey means the probe parsed; the raw-string fallback (or
+		// a non-string probe) means it has no faithful byte position.
+		return typeof probe === 'string' && typeof type.groupKey?.(probe) === 'number';
+	}
+	if (type.name === JSON_TYPE.name) return jsonKeyEncodable(probe);
+	return false;
+}
+
+/**
  * True when a byte window — or a byte-order advertisement — over `column` is SOUND.
  *
  * The store physically orders rows by memcmp of each column's key bytes, which for a
@@ -318,14 +391,19 @@ export function keyOrderMatchesCollation(
 ): boolean {
 	// A semantic-ordering logical type (TIMESPAN, JSON — see docs/types.md "Semantic
 	// ordering") is ordered by its `compare` (elapsed time / structural), which the
-	// engine's Sort, comparison operators, and the memory backend all use. Both types'
-	// key bytes now encode through an order-preserving transform (TIMESPAN's `groupKey`
-	// total seconds; JSON's structural encoding — see `storeSemanticKeyTransform`), so
-	// byte order DOES match the type's `compare` for every well-formed value and this
-	// blanket decline is conservative, costing the seek/sort-elision, never a row.
-	// Re-opening the window/advertisement (and the byte-EQ arms in `analyzePKAccess` /
-	// `analyzeIndexAccess`) is tracked in backlog `feat-reopen-timespan-store-seeks`.
-	if (hasSemanticOrdering(column?.logicalType)) return false;
+	// engine's Sort, comparison operators, and the memory backend all use. Byte order
+	// stands in for that order only for the types `semanticKeyOrderIsFaithful` asserts
+	// it for; any other semantic-ordering type keeps the blanket decline — no byte
+	// window, no ordering advertisement, full scan + the type-aware residual. A
+	// faithful type FALLS THROUGH to the collation checks below rather than returning
+	// true: `logicalTypeCanHoldText` admits both types (json is OBJECT-physical but
+	// text-capable; timespan is TEXT-physical), and the collation comparison is what
+	// correctly declines a collation-blind column under an INDEX column carrying an
+	// explicit non-BINARY COLLATE (index DDL does not type-gate the way column DDL
+	// does) — its key bytes are hard-BINARY while the residual re-compares under the
+	// declared name. Seek BOUNDS additionally pass through the per-value
+	// `semanticProbeIsKeyFaithful` gate at window-build time.
+	if (hasSemanticOrdering(column?.logicalType) && !semanticKeyOrderIsFaithful(column?.logicalType)) return false;
 	if (!columnCanHoldText(column)) return true;
 	if (compareCollation.toUpperCase() !== keyCollation.toUpperCase()) return false;
 	return (db as DatabaseInternal)._isCollationOrderPreserving(keyCollation);
@@ -394,8 +472,10 @@ export function indexPrefixSeekIsCollationExact(
  * Strictly stronger than {@link indexPrefixSeekIsCollationExact} at position 0: the same
  * key-vs-residual collation agreement, PLUS the collation's `orderPreserving` assertion,
  * because a range window also equates memcmp of the key bytes with the residual
- * comparator's ORDER. Both halves are {@link keyOrderMatchesCollation}, which also declines
- * a semantic-ordering column outright.
+ * comparator's ORDER. Both halves are {@link keyOrderMatchesCollation}, which admits a
+ * semantic-ordering column only when {@link semanticKeyOrderIsFaithful} asserts its key
+ * bytes order as the type's `compare` does (and the collation sides agree — a `collate`
+ * decoration on the index column still declines it).
  *
  * THE shared predicate for the two decision sites: `tryIndexAccessPlan`
  * (store-module-access-plan.ts) marks the range filters handled only when it holds, and
@@ -432,10 +512,11 @@ export function indexLeadingRangeIsOrderSafe(
  * What the advertisement is measured against is the order the planner's `Sort` would have
  * produced. For most members Sort orders under the operand's COLLATION, so a collation match
  * is the question; for a member whose logical type carries SEMANTIC ordering (TIMESPAN, JSON
- * — see docs/types.md "Semantic ordering") Sort now ranks by `logicalType.compare`, which no
- * text-byte encoding reproduces, and {@link keyOrderMatchesCollation} closes the gate for
- * such members outright (the memory backend's typed BTree order is the canonical order under
- * that ruling; the store declines rather than advertising a divergent byte order).
+ * — see docs/types.md "Semantic ordering") Sort ranks by `logicalType.compare`, and the
+ * member counts only when {@link semanticKeyOrderIsFaithful} asserts the stored key bytes
+ * memcmp in exactly that order (TIMESPAN's total-seconds transform, JSON's structural
+ * encoding). A semantic-ordering type outside that allow-list breaks the prefix, and the
+ * memory backend's typed BTree order remains the canonical order for it.
  *
  * `0` ⇒ even the leading member is unsafe: no range seek, no PK-order advertisement.
  * A prefix shorter than the PK truncates the ordering advertisement rather than voiding it.

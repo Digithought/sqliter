@@ -374,12 +374,36 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			expect(await planOps(db, gt), 'range seeks — NOCASE is order-preserving').to.match(SEEK);
 		});
 
-		it('leaves a TIMESPAN index column alone — still no range seek, still correct', async () => {
+		it('re-opens the TIMESPAN index range — the transform-threaded window returns comparator rows', async () => {
+			// The transform-threading regression: without `StoreTableScan.indexKeyTransforms`
+			// threaded into the range window, the bounds would address raw-text bytes while
+			// the index holds total-seconds bytes and the seek would return NOTHING (a range
+			// window carries no residual able to resurrect a skipped row). The memory oracle
+			// catches exactly that.
 			await twinTables(`v timespan`, `(1, 'PT30M'), (2, 'PT2H')`);
 
 			expect(await agreesWithMemory(`v > 'PT1H'`)).to.deep.equal([2]);
-			expect(await planOps(db, `select id from t where v > 'PT1H'`), 'semantic ordering declines outright')
-				.to.not.match(SEEK);
+			expect(await planOps(db, `select id from t where v > 'PT1H'`), 'faithful key bytes ⇒ range seek')
+				.to.match(SEEK);
+		});
+
+		it('truncates the PK-order advertisement at an equality-only text member ahead of a TIMESPAN one', async () => {
+			// PK (k text collate nocase, d timespan) under the order-inverting NOCASE: the
+			// order-preserving prefix must stop at `k`, so `order by k, d` keeps its Sort
+			// even though the trailing timespan member alone would qualify.
+			db.registerCollation('NOCASE', lengthFirst, { normalizer: lower });
+			const ddl = (t: string, using: string) =>
+				`create table ${t} (k text collate nocase, d timespan, primary key (k, d)) ${using}`;
+			await db.exec(ddl('t', 'using store'));
+			await db.exec(ddl('m', ''));
+			for (const t of ['t', 'm']) {
+				await db.exec(`insert into ${t} values ('aa', 'PT1H'), ('b', 'PT2H'), ('b', 'PT90M')`);
+			}
+
+			const q = `select k || '/' || d as r from t order by k, d`;
+			expect(await planOps(db, q), 'the unsafe leading text member needs its Sort').to.match(/sort/i);
+			expect(await column(db, q, 'r'))
+				.to.deep.equal(await column(db, `select k || '/' || d as r from m order by k, d`, 'r'));
 		});
 
 		it('leaves DESC and partial index shapes alone', async () => {

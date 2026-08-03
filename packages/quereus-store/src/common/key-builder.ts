@@ -363,13 +363,14 @@ export function buildFullScanBounds(): { gte: Uint8Array } {
  * for data stores.
  *
  * NOTE: all three `StoreTable` callers (`analyzeIndexAccess`, `buildIndexRangeBounds`,
- * `scanMultiSeek`) pass NO `transforms` — sound only because each declines a
- * semantic-ordering column before it gets here (the EQ-prefix loop breaks on
- * `hasSemanticOrdering`; the range arm is gated on `keyOrderMatchesCollation`; the
- * multi-seek throws INTERNAL, its plan having already been declined by
- * `tryIndexAccessPlan` (store-module-access-plan.ts)). If backlog `feat-reopen-timespan-store-seeks`
- * re-opens any arm, thread the column's transforms through first or the bounds will
- * address raw-value bytes while the index holds transformed ones.
+ * `scanMultiSeek`) thread the index's per-column key `transforms`
+ * (`StoreTableScan.indexKeyTransforms`, backed by `resolveIndexKeyTransforms`), so the
+ * bounds address the same transformed bytes `buildIndexKey` wrote. That threading is
+ * load-bearing for the range arm's semantic-ordering seeks (a window over raw-value
+ * bytes while the index holds transformed ones under-fetches silently — a range window
+ * carries no residual able to resurrect a skipped row); the point and multi-seek arms
+ * only ever see `undefined` entries today (they still decline semantic-ordering
+ * prefixes), but thread uniformly so a later re-open cannot miss it.
  */
 export function buildIndexPrefixBounds(
 	prefixValues: SqlValue[],

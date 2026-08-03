@@ -684,6 +684,32 @@ describe('StoreModule predicate pushdown', () => {
 			expect(store.iterateEntryCount).to.equal(0);
 		});
 
+		it('a `timespan` PK range visits only the elapsed-time window', async () => {
+			// The re-opened semantic-ordering range window (semanticKeyOrderIsFaithful):
+			// the bound encodes through the total-seconds transform, so the seek lands
+			// inside the elapsed-time window rather than full-scanning + re-filtering.
+			await cdb.exec(`create table ts (d timespan primary key) using store`);
+			const vals = Array.from({ length: 60 }, (_, i) => `('PT${i + 1}M')`).join(', ');
+			await cdb.exec(`insert into ts values ${vals}`);
+			const store = dataStores.get('main.ts')!;
+			store.iterateEntryCount = 0;
+
+			const rows = await asyncIterableToArray(cdb.eval(`select d from ts where d > 'PT57M'`));
+			expect(rows.map(r => r.d)).to.deep.equal(['PT58M', 'PT59M', 'PT60M']);
+			expect(store.iterateEntryCount, 'seek should visit only the in-window slice').to.be.lessThanOrEqual(4);
+		});
+
+		it('an empty `timespan` window yields no rows without scanning past it', async () => {
+			await cdb.exec(`create table ts2 (d timespan primary key) using store`);
+			await cdb.exec(`insert into ts2 values ('PT1M'), ('PT2M'), ('PT3M')`);
+			const store = dataStores.get('main.ts2')!;
+			store.iterateEntryCount = 0;
+
+			const rows = await asyncIterableToArray(cdb.eval(`select d from ts2 where d > 'PT5M'`));
+			expect(rows).to.deep.equal([]);
+			expect(store.iterateEntryCount, 'the window starts past every key').to.equal(0);
+		});
+
 		it('reads-own-writes: an uncommitted row inside the window surfaces', async () => {
 			await seed('nums', '');
 			await cdb.exec('begin');

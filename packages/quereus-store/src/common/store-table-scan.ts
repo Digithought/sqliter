@@ -22,6 +22,7 @@ import {
 	type CollationFunction,
 	type ColumnSchema,
 	type CompareFn,
+	type LogicalType,
 	type TableIndexSchema,
 	type Row,
 	type FilterInfo,
@@ -29,6 +30,7 @@ import {
 } from '@quereus/quereus';
 
 import type { IterateOptions, KVStore } from './kv-store.js';
+import type { KeyValueTransform } from './encoding.js';
 import { bytesToHex, compareBytes } from './bytes.js';
 import {
 	buildIndexKey,
@@ -38,7 +40,7 @@ import {
 import {
 	deserializeRow,
 } from './serialization.js';
-import { indexLeadingRangeIsOrderSafe, indexPrefixSeekIsCollationExact, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, storeSemanticKeyTransform } from './pk-key-resolution.js';
+import { indexLeadingRangeIsOrderSafe, indexPrefixSeekIsCollationExact, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, resolveIndexKeyTransforms, semanticProbeIsKeyFaithful, storeSemanticKeyTransform } from './pk-key-resolution.js';
 
 import { StoreTableBase } from './store-table-base.js';
 
@@ -127,15 +129,17 @@ export abstract class StoreTableScan extends StoreTableBase {
 
 	/**
 	 * True when some PK member's logical type carries semantic ordering (TIMESPAN,
-	 * JSON). Such PKs decline the point arm and full-scan, where
+	 * JSON). Such PKs decline the POINT arm and full-scan, where
 	 * {@link matchesFilters} applies the type's compare. Historically required —
 	 * byte-key equality was a strict subset of the type's equality ('PT1H' ≡
 	 * 'PT60M' elapsed-time-equal, byte-distinct) and a point window under-fetched
 	 * with no residual able to resurrect a skipped row. Both types' key transforms
 	 * (see {@link storeSemanticKeyTransform}) now make byte equality the type's
-	 * equality, so the decline is conservative; re-opening is tracked in backlog
-	 * `feat-reopen-timespan-store-seeks`. (Range windows and ordering
-	 * advertisements are already declined by {@link keyOrderMatchesCollation}.)
+	 * equality, so the decline is conservative; re-opening the point arm is ticket
+	 * `feat-store-semantic-key-point-seeks`. (Range windows and ordering
+	 * advertisements are already re-opened — `semanticKeyOrderIsFaithful` in
+	 * pk-key-resolution.ts — with each seek BOUND gated per value by
+	 * {@link semanticProbeIsKeyFaithful}.)
 	 */
 	protected pkHasSemanticOrderingMember(): boolean {
 		const schema = this.tableSchema!;
@@ -224,6 +228,15 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * SUPERSET, since {@link matchesFilters} stays the authoritative collation-aware
 	 * row filter. A NULL/missing bound value is likewise skipped (the planner never
 	 * pushes `= NULL`, and a range op against NULL rejects every row in matchesFilters).
+	 * A bound over a semantic-ordering leading column whose VALUE has no faithful byte
+	 * position ({@link semanticProbeIsKeyFaithful} — a numeric or unparseable TIMESPAN
+	 * probe, a blob/bigint JSON probe) is skipped the same way: dropping a RANGE bound
+	 * only WIDENS the window (worst case to the pre-existing full scan), and the plan
+	 * claimed the range handled from the schema alone, so the predicate the engine's
+	 * dropped Filter carried is reproduced by {@link matchesFilters} under the type's
+	 * own compare. An EQUALITY window has no such degradation — a widened point window
+	 * is still byte-EQ and under-fetches — which is why the point arms must DECLINE
+	 * rather than widen (see {@link pkHasSemanticOrderingMember}).
 	 *
 	 * NOTE: a range window over a text PK column is sound only when the column's key
 	 * normalizer is ORDER-preserving with respect to its comparator — i.e. the comparator
@@ -242,12 +255,15 @@ export abstract class StoreTableScan extends StoreTableBase {
 		if (!constraints || constraints.length === 0) return full;
 
 		const dir = this.pkDirections[0];
+		const leadingType = this.tableSchema!.columns[access.columnIndex!]?.logicalType;
 
 		let gte: Uint8Array = full.gte;
 		let lt: Uint8Array | undefined;
 
 		for (const c of constraints) {
 			if (c.value === undefined || c.value === null) continue;
+			// Widen, don't decline: see the doc comment above.
+			if (!semanticProbeIsKeyFaithful(leadingType, c.value)) continue;
 			const { gte: lo, lt: hi } = this.encodePkPrefixBounds([c.value]);
 			const lower = !dir
 				? (c.op === IndexConstraintOp.GE ? lo : c.op === IndexConstraintOp.GT ? hi : undefined)
@@ -367,6 +383,7 @@ export abstract class StoreTableScan extends StoreTableBase {
 				this.encodeOptions,
 				indexDirections.slice(0, eqValues.length),
 				indexCollations.slice(0, eqValues.length),
+				this.indexKeyTransforms(index).slice(0, eqValues.length),
 			);
 			return { index, type: 'point', bounds };
 		}
@@ -385,6 +402,8 @@ export abstract class StoreTableScan extends StoreTableBase {
 				})),
 				indexDirections[0],
 				indexCollations[0],
+				this.tableSchema!.columns[leadingCol]?.logicalType,
+				this.indexKeyTransforms(index)[0],
 			);
 			return { index, type: 'range', bounds };
 		}
@@ -417,6 +436,35 @@ export abstract class StoreTableScan extends StoreTableBase {
 		const collations = resolveIndexKeyCollations(index, columns);
 		this.indexKeyCollationsCache.set(index, { columns, collations });
 		return collations;
+	}
+
+	/**
+	 * Lazy cache behind {@link indexKeyTransforms} — the transform twin of
+	 * {@link indexKeyCollationsCache}, with the same columns-identity invalidation rule
+	 * (an ALTER can retype a column without minting new index objects).
+	 */
+	private readonly indexKeyTransformsCache = new WeakMap<
+		TableIndexSchema,
+		{ columns: ReadonlyArray<ColumnSchema>; transforms: (KeyValueTransform | undefined)[] }
+	>();
+
+	/**
+	 * Per-column key VALUE TRANSFORM for `index`'s own columns, memoized — see
+	 * {@link resolveIndexKeyTransforms}. Threaded, like {@link indexKeyCollations},
+	 * into every scan-side `buildIndexPrefixBounds` call ({@link analyzeIndexAccess},
+	 * {@link buildIndexRangeBounds}, {@link scanMultiSeek}) so a scan window addresses
+	 * the same TRANSFORMED bytes `buildIndexKey` wrote for a semantic-ordering column.
+	 * The point/multi-seek callers only ever see `undefined` entries today (their arms
+	 * still decline semantic-ordering prefixes), but threading all three uniformly is
+	 * the point — an arm re-opened later cannot silently address raw-value bytes.
+	 */
+	protected indexKeyTransforms(index: TableIndexSchema): (KeyValueTransform | undefined)[] {
+		const columns = this.tableSchema!.columns;
+		const cached = this.indexKeyTransformsCache.get(index);
+		if (cached && cached.columns === columns) return cached.transforms;
+		const transforms = resolveIndexKeyTransforms(index, columns);
+		this.indexKeyTransformsCache.set(index, { columns, transforms });
+		return transforms;
 	}
 
 	/**
@@ -492,11 +540,20 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * `hi` whose increment overflowed all-0xff) leaves that side unbounded — a safe
 	 * SUPERSET. A NULL/missing bound value is skipped (the planner never pushes
 	 * `= NULL`, and a range op against NULL rejects every row in matchesFilters).
+	 * A bound over a semantic-ordering leading column (`logicalType`) whose VALUE has
+	 * no faithful byte position ({@link semanticProbeIsKeyFaithful}) is skipped the
+	 * same way — a dropped RANGE bound only widens the window, and matchesFilters
+	 * reproduces the predicate under the type's compare; see the widen-vs-decline
+	 * note on {@link buildPKRangeBounds}. `transform` is the leading column's key
+	 * value transform ({@link indexKeyTransforms}), so a surviving bound addresses
+	 * the same transformed bytes the index store holds.
 	 */
 	protected buildIndexRangeBounds(
 		constraints: Array<{ op: IndexConstraintOp; value?: SqlValue }>,
 		dir: boolean,
 		collation: string | undefined,
+		logicalType: LogicalType | undefined,
+		transform: KeyValueTransform | undefined,
 	): IterateOptions {
 		const full = buildFullScanBounds();
 		let gte: Uint8Array = full.gte;
@@ -504,7 +561,9 @@ export abstract class StoreTableScan extends StoreTableBase {
 
 		for (const c of constraints) {
 			if (c.value === undefined || c.value === null) continue;
-			const { gte: lo, lt: hi } = buildIndexPrefixBounds([c.value], this.encodeOptions, [dir], [collation]);
+			// Widen, don't decline — see the doc comment above.
+			if (!semanticProbeIsKeyFaithful(logicalType, c.value)) continue;
+			const { gte: lo, lt: hi } = buildIndexPrefixBounds([c.value], this.encodeOptions, [dir], [collation], [transform]);
 			const lower = !dir
 				? (c.op === IndexConstraintOp.GE ? lo : c.op === IndexConstraintOp.GT ? hi : undefined)
 				: (c.op === IndexConstraintOp.LE ? lo : c.op === IndexConstraintOp.LT ? hi : undefined);
@@ -702,7 +761,9 @@ export abstract class StoreTableScan extends StoreTableBase {
 		// skipped row, so a seek column whose byte equality under-fetches the type's
 		// equality (TIMESPAN, JSON — see pkHasSemanticOrderingMember) cannot be
 		// multi-seeked. `tryIndexAccessPlan` (store-module-access-plan.ts) declines such plans; one
-		// arriving anyway is malformed.
+		// arriving anyway is malformed. Re-opening is backlog
+		// `feat-store-semantic-key-multiseek` — a multi-seek has no widen-to-full-scan
+		// degradation available across its merged windows.
 		if (seekCols.some(colIdx => hasSemanticOrdering(this.tableSchema!.columns[colIdx]?.logicalType))) {
 			this.multiSeekMalformed(filterInfo, 'semantic-ordering seek column');
 		}
@@ -721,10 +782,11 @@ export abstract class StoreTableScan extends StoreTableBase {
 		// collation C — see indexKeyCollations); C-equal tuples merge into one window,
 		// each kept as a residual alternative.
 		const seekCollations = indexKeyCollations.slice(0, seekWidth);
+		const seekTransforms = this.indexKeyTransforms(index).slice(0, seekWidth);
 		const windows = new Map<string, MultiSeekWindow>();
 		for (const tuple of tuples) {
 			const ordered = this.orderTupleValues(tuple, seekCols, filterInfo);
-			const bounds = buildIndexPrefixBounds(ordered, this.encodeOptions, indexDirections.slice(0, seekWidth), seekCollations);
+			const bounds = buildIndexPrefixBounds(ordered, this.encodeOptions, indexDirections.slice(0, seekWidth), seekCollations, seekTransforms);
 			const hex = bytesToHex(bounds.gte);
 			const info: FilterInfo = { ...filterInfo, constraints: tuple.entries };
 			const existing = windows.get(hex);

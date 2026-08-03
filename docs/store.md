@@ -532,11 +532,17 @@ analysis, and UNIQUE enforcement compare under. The schema entry points:
   the planner's `Sort` would have produced. For a collation-aware column `Sort` orders under
   the operand's *collation*, which is exactly what the key bytes encode under, so the
   advertisement holds (subject to the collation's `orderPreserving` assertion). For a
-  semantic-ordering type (TIMESPAN, JSON) `Sort` ranks through `logicalType.compare`, which
-  no collation byte encoding reproduces — `keyOrderMatchesCollation` closes the gate for
-  those members outright and the store declines rather than advertising a divergent byte
-  order. The memory backend's declared-key BTrees (`createTypedComparator`) agree with
-  `Sort` on both kinds, so the two backends advertise the same orders.
+  semantic-ordering type `Sort` ranks through `logicalType.compare`, and the member counts
+  only when the explicit per-type allow-list `semanticKeyOrderIsFaithful`
+  (pk-key-resolution.ts) asserts its stored key bytes memcmp in exactly that order —
+  TIMESPAN through its total-seconds `groupKey` transform, JSON through the structural
+  byte form; any other semantic-ordering type keeps the blanket decline. A range seek
+  *bound* passes through the per-value gate `semanticProbeIsKeyFaithful` besides: a bound
+  the type gives no faithful byte position (a numeric or unparseable TIMESPAN bound, a
+  blob/bigint JSON bound) is dropped, which only widens the window, and the type-aware
+  residual (`matchesFilters`) still decides rows. The memory backend's declared-key BTrees
+  (`createTypedComparator`) agree with `Sort` on both kinds, so the two backends advertise
+  the same orders.
 
 - **CREATE.** `module.create` applies the store default K to an *implicit*-default text PK
   column (the engine's BINARY column default becomes NOCASE under K = NOCASE), so an

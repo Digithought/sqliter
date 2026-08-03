@@ -44,6 +44,17 @@ async function column(db: Database, sql: string, name: string): Promise<SqlValue
 	return (await asyncIterableToArray(db.eval(sql))).map(r => r[name] as SqlValue);
 }
 
+/** The JSON array of physical operator names for `query`'s plan. */
+async function planOps(db: Database, query: string): Promise<string> {
+	const rows = await asyncIterableToArray(
+		db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
+	);
+	expect(rows).to.have.lengthOf(1);
+	return rows[0].ops as string;
+}
+
+const SEEK = /INDEXSEEK|INDEX SEEK|IndexSeek/i;
+
 /** Runs `sql`, returning the thrown error or null. */
 async function attempt(db: Database, sql: string): Promise<Error | null> {
 	try {
@@ -132,7 +143,7 @@ describe('TIMESPAN semantic key identity (store)', () => {
 			}
 		});
 
-		it('emits PK order matching the memory table (Sort still runs — advertisement stays declined)', async () => {
+		it('emits PK order matching the memory table (no Sort — the advertisement is live)', async () => {
 			await db.exec(`create table t (d timespan primary key) using store`);
 			await db.exec(`create table m (d timespan primary key)`);
 			for (const tbl of ['t', 'm']) {
@@ -140,6 +151,8 @@ describe('TIMESPAN semantic key identity (store)', () => {
 			}
 			expect(await column(db, `select d from t order by d`, 'd'))
 				.to.deep.equal(await column(db, `select d from m order by d`, 'd'));
+			expect(await planOps(db, `select d from t order by d`), 'total-seconds key bytes advertise PK order')
+				.to.not.match(/sort/i);
 		});
 	});
 
@@ -246,6 +259,33 @@ describe('TIMESPAN semantic key identity (store)', () => {
 			expect(err, 'the rebuilt index must surface the duplicate').to.not.be.null;
 			expect(String(err)).to.match(/unique/i);
 		});
+
+		it('serves an index range seek under the new transforms after SET DATA TYPE to timespan', async () => {
+			// `updateSchema` replaces the columns array, which invalidates the memoized
+			// index key transforms/collations (`StoreTableScan.indexKeyTransforms`) — so
+			// on the SAME table instance the window addresses the rebuilt total-seconds
+			// entries, not stale text bytes.
+			await db.exec(`create table t (id integer primary key, d text) using store`);
+			await db.exec(`create index ix_d on t (d)`);
+			await db.exec(`insert into t values (1, 'PT30M'), (2, 'PT2H')`);
+			expect(await attempt(db, `alter table t alter column d set data type timespan`)).to.be.null;
+
+			const q = `select id from t where d > 'PT1H'`;
+			expect(await column(db, q, 'id')).to.deep.equal([2]);
+			expect(await planOps(db, q), 'the re-resolved transforms make the seek sound').to.match(SEEK);
+		});
+
+		it('rejects SET DATA TYPE to timespan when an existing value cannot parse', async () => {
+			// This refusal is what keeps the stored-value claim behind the re-opened
+			// windows true: every stored TIMESPAN value parses, so `groupKey` always
+			// yields total seconds and the key bytes are NUMERIC-tagged.
+			await db.exec(`create table t (id integer primary key, d text) using store`);
+			await db.exec(`insert into t values (1, 'not a duration')`);
+
+			const err = await attempt(db, `alter table t alter column d set data type timespan`);
+			expect(err, 'the backfill must refuse the unparseable value').to.not.be.null;
+			expect((await db.get(`select d from t`))?.d, 'refusal leaves the row untouched').to.equal('not a duration');
+		});
 	});
 });
 
@@ -320,5 +360,35 @@ describe('TIMESPAN semantic key identity (isolated store)', () => {
 		expect(String(err)).to.match(/unique/i);
 		await db.exec('rollback');
 		expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(1);
+	});
+
+	it('merges staged rows into the Sort-elided ordered scan and the narrowed range window', async () => {
+		// The PK-order advertisement's real consumer: the overlay merges its pending
+		// rows against the underlying stream by the PK comparator, and that stream is
+		// now ADVERTISED as ordered — the two must interleave at elapsed-time positions.
+		await db.exec(`insert into t values ('PT30M', 'a'), ('PT2H', 'c')`);
+
+		await db.exec('begin');
+		await db.exec(`insert into t values ('PT90M', 'b'), ('PT1M', 'z')`);
+		expect(await column(db, `select v from t order by d`, 'v')).to.deep.equal(['z', 'a', 'b', 'c']);
+		// `iterateEffective` restricts the pending merge to the range window's bounds:
+		// the staged row inside the window appears, the one outside stays out.
+		expect(await column(db, `select v from t where d > 'PT1H'`, 'v')).to.deep.equal(['b', 'c']);
+		await db.exec('commit');
+		expect(await column(db, `select v from t order by d`, 'v')).to.deep.equal(['z', 'a', 'b', 'c']);
+		expect(await column(db, `select v from t where d > 'PT1H'`, 'v')).to.deep.equal(['b', 'c']);
+	});
+
+	it('an in-transaction UPDATE and DELETE hold the merged order and the range window', async () => {
+		await db.exec(`insert into t values ('PT30M', 'a'), ('PT90M', 'b'), ('PT2H', 'c')`);
+
+		await db.exec('begin');
+		await db.exec(`update t set v = 'B' where d = 'PT1H30M'`); // re-spelled address
+		await db.exec(`delete from t where d = 'PT120M'`);         // re-spelled address
+		expect(await column(db, `select v from t order by d`, 'v')).to.deep.equal(['a', 'B']);
+		expect(await column(db, `select v from t where d >= 'PT1H'`, 'v')).to.deep.equal(['B']);
+		await db.exec('commit');
+		expect(await column(db, `select v from t order by d`, 'v')).to.deep.equal(['a', 'B']);
+		expect(await column(db, `select v from t where d >= 'PT1H'`, 'v')).to.deep.equal(['B']);
 	});
 });

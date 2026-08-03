@@ -477,11 +477,21 @@ store-local **structural byte form** (`jsonStructuralKey`, `quereus-store`'s
 json-key.ts) whose memcmp order reproduces the structural compare — so a store scan
 emits JSON keys in `compare` order, agreeing with the memory backend, and the
 isolation overlay aligns its merge streams (an in-transaction update or delete of a
-JSON-keyed row shadows correctly). Store *ordering* advertisements and byte-window
-seeks over semantic-ordering members remain declined (a real Sort runs and
-point/range predicates re-check through the type-aware residual); with both types'
-key bytes now order-faithful the declines are merely conservative — re-opening them
-is tracked in backlog `feat-reopen-timespan-store-seeks`.
+JSON-keyed row shadows correctly). With both types' key bytes order-faithful, the
+store *advertises* PK order over TIMESPAN/JSON key members (`order by <pk>` elides
+its Sort) and serves a leading-column *range* predicate as a byte-window seek. Two
+gates govern that: an explicit per-type allow-list
+(`semanticKeyOrderIsFaithful`, `quereus-store`'s pk-key-resolution.ts — a claim about
+the values a table can *hold*, deliberately not inferred from a transform's mere
+existence) and a per-value probe gate (`semanticProbeIsKeyFaithful`) on each seek
+*bound*, since nothing coerces a query bound to the column's declared type: a bound
+with no faithful byte position (a numeric or unparseable TIMESPAN bound, a
+blob/bigint JSON bound) is dropped, which only *widens* the window back toward a
+full scan, and the type-aware residual still decides every row. *Equality*-shaped
+seeks over semantic-ordering members remain declined — an equality window cannot
+widen, only under-fetch — tracked as `feat-store-semantic-key-point-seeks`; IN-list
+multi-seeks likewise stay declined (no widen degradation exists across their merged
+windows), tracked as backlog `feat-store-semantic-key-multiseek`.
 
 The `min`/`max` **aggregates** follow the same rule: at emit (and materialized-view
 plan-build) time the call site binds the aggregate to its argument's declared type

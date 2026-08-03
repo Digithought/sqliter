@@ -119,6 +119,50 @@ export function jsonStructuralKey(value: SqlValue): SqlValue {
 	return Uint8Array.from(out);
 }
 
+/**
+ * True when `value` has a faithful position in {@link jsonStructuralKey}'s byte order —
+ * the probe-side gate a re-opened range window consults before encoding a seek bound
+ * (`semanticProbeIsKeyFaithful` in pk-key-resolution.ts). Stored values never need this
+ * check: they are `JSON_TYPE.parse` outputs, which contain neither node kind declined
+ * here. Only a QUERY-supplied bound can carry one, and nothing coerces a bound to the
+ * column's declared type.
+ *
+ * Declines exactly two node kinds, anywhere in the value:
+ *  - a `Uint8Array` — {@link pushJsonNode} raises `INTERNAL` for one, while the residual
+ *    comparator (`createTypedComparator`) happily ranks it by storage class (BLOB,
+ *    between TEXT and OBJECT). Declining lets the window widen instead, so
+ *    `where j > x'01'` returns its rows rather than erroring.
+ *  - a `bigint` — the encoder folds it to its nearest double (lossy above 2^53), while
+ *    `deepCompareJson`'s `jsonTypeOrder` drops a bigint into its `default:` arm at the
+ *    OBJECT rank, so the bytes and the comparator place it in two different regions
+ *    entirely.
+ *
+ * An unpaired surrogate in a string leaf or object key is deliberately NOT declined:
+ * {@link jsonStructuralKey} raises for one and must keep raising — a bound with no
+ * faithful byte position is refused, never silently widened or narrowed. That is the
+ * same rule a text PK's seek bounds already carry (lone-surrogate-keys.spec.ts).
+ *
+ * Kept beside {@link pushJsonNode} so the two node-kind switches stay visibly paired.
+ * Runs on probe values only — a handful per query.
+ */
+export function jsonKeyEncodable(value: SqlValue): boolean {
+	if (value === null) return true;
+	switch (typeof value) {
+		case 'boolean':
+		case 'number':
+		case 'string':
+			return true;
+		case 'bigint':
+			return false;
+		default:
+			break;
+	}
+	if (value instanceof Uint8Array) return false;
+	if (Array.isArray(value)) return value.every(jsonKeyEncodable);
+	// Object keys are always strings — only the values can hold a declined node.
+	return Object.values(value as { [key: string]: SqlValue }).every(jsonKeyEncodable);
+}
+
 /** Append `value`'s tagged, self-delimiting encoding to `out`. */
 function pushJsonNode(out: number[], value: SqlValue): void {
 	if (value === null) {

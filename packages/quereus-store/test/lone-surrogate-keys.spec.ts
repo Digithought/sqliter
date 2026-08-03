@@ -266,6 +266,18 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			await db.exec(`insert into j values ('["${ASTRAL}"]', 'astral')`);
 			expect((await db.get(`select count(*) as cnt from j`))?.cnt).to.equal(1);
 		});
+
+		it('rejects a range-seek bound built from a lone-surrogate literal', async () => {
+			// The json PK's range window is re-opened (feat-store-semantic-key-range-seeks)
+			// and encodes its bound through the structural key form, which raises for a
+			// lone surrogate exactly as the text PK's bound above does: a bound with no
+			// faithful byte position is refused, never silently widened or narrowed.
+			// (Before the re-open such a query full-scanned and answered by storage class —
+			// this raise is a deliberate behaviour change that aligns json with text.)
+			await db.exec(`insert into j values ('["a"]', 'one'), ('["${ASTRAL}"]', 'astral')`);
+			await rejects(db, `select v from j where k > '${LONE_HIGH}'`);
+			await rejects(db, `select v from j where k >= 'a${LONE_HIGH}b'`);
+		});
 	});
 
 	describe('an identifier or persisted DDL text carrying a lone surrogate', () => {

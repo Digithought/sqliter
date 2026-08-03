@@ -45,6 +45,15 @@ async function column(db: Database, sql: string, name: string): Promise<SqlValue
 	return (await asyncIterableToArray(db.eval(sql))).map(r => r[name] as SqlValue);
 }
 
+/** The JSON array of physical operator names for `query`'s plan. */
+async function planOps(db: Database, query: string): Promise<string> {
+	const rows = await asyncIterableToArray(
+		db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
+	);
+	expect(rows).to.have.lengthOf(1);
+	return rows[0].ops as string;
+}
+
 /** Runs `sql`, returning the thrown error or null. */
 async function attempt(db: Database, sql: string): Promise<Error | null> {
 	try {
@@ -173,7 +182,10 @@ describe('JSON structural key order (store)', () => {
 				.to.deep.equal(['[10]', '[3]', '[2]']);
 		});
 
-		it('still runs a real Sort for order by (advertisement stays declined)', async () => {
+		it('elides the Sort for order by — the byte order IS the advertised order', async () => {
+			// What used to be a test of Sort over a declined advertisement is now a test
+			// of the store's byte order itself: `semanticKeyOrderIsFaithful` opens the
+			// PK-order advertisement for a declared-json PK, so no Sort runs.
 			await db.exec(`create table t (j json primary key) using store`);
 			await db.exec(`create table m (j json primary key)`);
 			for (const tbl of ['t', 'm']) {
@@ -181,6 +193,8 @@ describe('JSON structural key order (store)', () => {
 			}
 			expect(await column(db, `select json_quote(j) as q from t order by j`, 'q'))
 				.to.deep.equal(await column(db, `select json_quote(j) as q from m order by j`, 'q'));
+			expect(await planOps(db, `select j from t order by j`), 'structural byte order needs no Sort')
+				.to.not.match(/sort/i);
 		});
 	});
 
@@ -298,6 +312,30 @@ describe('JSON structural key order (isolated store)', () => {
 			.to.deep.equal(['[3]', '[10]']);
 		await db.exec('commit');
 		expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(2);
+	});
+
+	it('merges a pending row into the Sort-elided ordered scan at its structural position', async () => {
+		// The underlying store stream is now ADVERTISED as ordered (the PK-order
+		// advertisement is live for a json PK), so the overlay's comparator merge must
+		// interleave the pending row rather than rely on a downstream Sort.
+		await db.exec(`insert into t values ('[2]', 1), ('[10]', 2)`);
+
+		await db.exec('begin');
+		await db.exec(`insert into t values ('[3]', 3)`);
+		expect((await column(db, `select v from t order by j`, 'v')).map(Number)).to.deep.equal([1, 3, 2]);
+		await db.exec('commit');
+		expect((await column(db, `select v from t order by j`, 'v')).map(Number)).to.deep.equal([1, 3, 2]);
+	});
+
+	it('narrows a range window over the structural bytes with pending rows merged', async () => {
+		await db.exec(`insert into t values ('[2]', 1), ('[10]', 2)`);
+
+		await db.exec('begin');
+		await db.exec(`insert into t values ('[3]', 3), ('[1]', 0)`);
+		// [3] and [10] sit above json('[2]') structurally; the pending [1] stays out.
+		expect((await column(db, `select v from t where j > json('[2]')`, 'v')).map(Number)).to.deep.equal([3, 2]);
+		await db.exec('commit');
+		expect((await column(db, `select v from t where j > json('[2]')`, 'v')).map(Number)).to.deep.equal([3, 2]);
 	});
 
 	it('an overlay rewrite spelled with reordered keys shadows the committed row', async () => {

@@ -17,13 +17,18 @@
  *
  * A memory table is the oracle for UNIQUENESS throughout. Since the semantic-ordering ruling
  * (docs/types.md "Semantic ordering"), it is the ordering oracle too: `Sort` ranks a TIMESPAN
- * or JSON operand by `logicalType.compare` (elapsed time / structural). The store DECLINES
- * ordering advertisements and byte windows over every semantic-ordering PK member
- * (`keyOrderMatchesCollation`), answering through a full scan + the type-aware residual
- * instead. Both types' key bytes now encode through an order-preserving transform (TIMESPAN's
- * `groupKey` total seconds — see timespan-semantic-key-identity.spec.ts; JSON's structural
- * encoding — see json-semantic-key-order.spec.ts), so the declines are merely conservative;
- * re-opening those seeks is tracked in backlog `feat-reopen-timespan-store-seeks`.
+ * or JSON operand by `logicalType.compare` (elapsed time / structural). Both types' key bytes
+ * encode through an order-preserving transform (TIMESPAN's `groupKey` total seconds — see
+ * timespan-semantic-key-identity.spec.ts; JSON's structural encoding — see
+ * json-semantic-key-order.spec.ts), so the store ADVERTISES PK order over such members and
+ * serves a leading-column range predicate as a byte-window seek
+ * (`semanticKeyOrderIsFaithful`, pk-key-resolution.ts). Every seek BOUND additionally passes
+ * the per-value gate `semanticProbeIsKeyFaithful`: a bound with no faithful byte position (a
+ * numeric or unparseable TIMESPAN probe, a blob JSON probe) is dropped, which only WIDENS
+ * the window, and the type-aware residual still decides rows — the under-fetch regressions
+ * below pin exactly that. Equality-shaped seeks over such members remain declined
+ * (`feat-store-semantic-key-point-seeks`), as do IN-list multi-seeks
+ * (backlog `feat-store-semantic-key-multiseek`).
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -234,11 +239,9 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			expect(await planOps(db, q), 'byte order is comparator order here').to.not.match(/sort/i);
 		});
 
-		it('declines the PK-order advertisement for a `json` PK and still matches the memory table', async () => {
-			// The blanket semantic-ordering gate closes for a JSON PK, so a real Sort
-			// runs (conservative now that the structural key bytes DO scan in compare
-			// order — see json-semantic-key-order.spec.ts), and its structural order
-			// agrees with the memory table's typed PK order.
+		it('advertises PK order for a `json` PK — the Sort elides and order matches memory', async () => {
+			// The structural key bytes scan in `compare` order (json-semantic-key-order.spec.ts),
+			// so `semanticKeyOrderIsFaithful` opens the advertisement and no Sort runs.
 			await db.exec(`create table t (j json primary key) using store`);
 			await db.exec(`create table m (j json primary key)`);
 			for (const t of ['t', 'm']) {
@@ -248,41 +251,233 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			const q = `select json_quote(j) as j from t order by j`;
 			expect(await column(db, q, 'j'))
 				.to.deep.equal(await column(db, `select json_quote(j) as j from m order by j`, 'j'));
-			expect(await planOps(db, `select j from t order by j`), 'advertisement conservatively declined — Sort must run')
-				.to.match(/sort/i);
+			expect(await planOps(db, `select j from t order by j`), 'structural byte order IS compare order — no Sort')
+				.to.not.match(/sort/i);
 		});
 
-		it('orders a `timespan` PK by elapsed time via a real Sort (advertisement declined)', async () => {
+		it('orders a `timespan` PK by elapsed time straight off the key bytes (no Sort)', async () => {
 			// Under the semantic-ordering ruling, Sort ranks TIMESPAN by
 			// `TIMESPAN.compare` (elapsed time): 'PT90M' precedes 'PT2H' though the
-			// text-byte order says the reverse. The store's key bytes now encode total
-			// seconds (order-preserving), but the PK-order advertisement is still
-			// conservatively declined, so a real Sort runs — on the PK table exactly
-			// as on the integer-PK table.
+			// text-byte order says the reverse. The key bytes encode total seconds, so
+			// the PK-order advertisement is live and the Sort elides; the same column
+			// as a NON-key still needs its Sort.
 			await db.exec(`create table t (d timespan primary key) using store`);
 			await db.exec(`create table sorted (id integer primary key, d timespan) using store`);
 			await db.exec(`insert into t values ('PT2H'), ('PT90M')`);
 			await db.exec(`insert into sorted values (1, 'PT2H'), (2, 'PT90M')`);
 
 			const pkOrdered = await column(db, `select d from t order by d`, 'd');
-			expect(await planOps(db, `select d from t order by d`), 'byte order is not elapsed-time order — Sort must run')
-				.to.match(/sort/i);
+			expect(await planOps(db, `select d from t order by d`), 'key-byte order IS elapsed-time order — no Sort')
+				.to.not.match(/sort/i);
 
-			expect(await planOps(db, `select d from sorted order by d`)).to.match(/sort/i);
+			expect(await planOps(db, `select d from sorted order by d`), 'a non-key column still Sorts')
+				.to.match(/sort/i);
 			expect(pkOrdered).to.deep.equal(await column(db, `select d from sorted order by d`, 'd'));
 			expect(pkOrdered).to.deep.equal(['PT90M', 'PT2H']);
 		});
 
-		it('range-scans a `timespan` PK with elapsed-time bounds (window declined, residual type-aware)', async () => {
+		it('range-scans a `timespan` PK with elapsed-time bounds through a real seek', async () => {
 			await db.exec(`create table t (d timespan primary key) using store`);
 			await db.exec(`create table m (d timespan primary key)`);
 			for (const tbl of ['t', 'm']) {
 				await db.exec(`insert into ${tbl} values ('PT2H'), ('PT90M')`);
 			}
-			// 2h > 90min semantically, though 'PT2H' < 'PT90M' textually.
+			// 2h > 90min semantically, though 'PT2H' < 'PT90M' textually — the window
+			// must be in elapsed-time space, not text space.
 			const q = `select d from t where d > 'PT90M'`;
 			expect(await column(db, q, 'd')).to.deep.equal(['PT2H']);
 			expect(await column(db, q, 'd')).to.deep.equal(await column(db, `select d from m where d > 'PT90M'`, 'd'));
+			expect(await planOps(db, q), 'total-seconds key bytes make the byte window sound').to.match(SEEK);
+		});
+	});
+
+	describe('the re-opened semantic-ordering windows: probe gating and edge shapes', () => {
+		it('returns every row for a numeric probe on a `timespan` PK (bound dropped, window widened)', async () => {
+			// `createTypedComparator` short-circuits on the storage-class mismatch, so the
+			// predicate admits every stored (TEXT-class) row — but `groupKey(5)` would
+			// build a `> NUMERIC(5)` byte window that EXCLUDES 'PT1S' (total 1). The
+			// probe gate drops the bound; the type-aware residual answers.
+			await db.exec(`create table t (d timespan primary key) using store`);
+			await db.exec(`create table m (d timespan primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT1S'), ('PT2H')`);
+			}
+			const q = (tbl: string) => `select d from ${tbl} where d > 5`;
+			expect(await column(db, q('t'), 'd')).to.deep.equal(await column(db, q('m'), 'd'));
+		});
+
+		it('matches memory for an unparseable text probe on a `timespan` PK (bound dropped)', async () => {
+			// `groupKey` falls back to the raw text (TEXT-tagged bytes, above every
+			// NUMERIC-tagged stored key) while `compare` falls back to BINARY text against
+			// the canonical stored spelling — two different positions. Drop the bound.
+			await db.exec(`create table t (d timespan primary key) using store`);
+			await db.exec(`create table m (d timespan primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT1S'), ('PT2H')`);
+			}
+			const q = (tbl: string) => `select d from ${tbl} where d > 'not a duration'`;
+			expect(await column(db, q('t'), 'd')).to.deep.equal(await column(db, q('m'), 'd'));
+		});
+
+		it('returns rows — and does not raise — for a blob probe on a `json` PK', async () => {
+			// `jsonStructuralKey` raises INTERNAL for a blob; `jsonKeyEncodable` declines
+			// it first, so the bound is dropped and the storage-class residual answers
+			// (BLOB ranks between TEXT and OBJECT).
+			await db.exec(`create table t (j json primary key) using store`);
+			await db.exec(`create table m (j json primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('7'), ('"abc"'), ('{"a":1}')`);
+			}
+			const q = (tbl: string) => `select json_quote(j) as q from ${tbl} where j > x'01'`;
+			expect(await column(db, q('t'), 'q')).to.deep.equal(await column(db, q('m'), 'q'));
+		});
+
+		it('keeps a `collate`-decorated index over a `json` column declined, rows correct', async () => {
+			// Index DDL does not type-gate a COLLATE the way column DDL does; such a
+			// column's key bytes are hard-BINARY while the residual re-compares under the
+			// declared name. `keyOrderMatchesCollation`'s FALL-THROUGH to the collation
+			// checks is what declines this — an early `return true` for a faithful
+			// semantic type would silently re-open it.
+			await db.exec(`create table t (id integer primary key, j json) using store`);
+			await db.exec(`create index ix_j on t (j collate nocase)`);
+			await db.exec(`create table m (id integer primary key, j json)`);
+			await db.exec(`create index ix_mj on m (j collate nocase)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, '"a"'), (2, '"B"'), (3, '{"a":1}')`);
+			}
+			const q = (tbl: string) => `select id from ${tbl} where j > 'a' order by id`;
+			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
+			expect(await planOps(db, q('t')), 'key bytes are BINARY, residual is NOCASE — no seek').to.not.match(SEEK);
+		});
+
+		it('keeps a `collate`-decorated index over a `timespan` column declined, rows correct', async () => {
+			await db.exec(`create table t (id integer primary key, d timespan) using store`);
+			await db.exec(`create index ix_d on t (d collate nocase)`);
+			await db.exec(`create table m (id integer primary key, d timespan)`);
+			await db.exec(`create index ix_md on m (d collate nocase)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT30M'), (2, 'PT2H')`);
+			}
+			const q = (tbl: string) => `select id from ${tbl} where d > 'PT1H' order by id`;
+			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
+			expect(await planOps(db, q('t')), 'the declared COLLATE keeps the range declined').to.not.match(SEEK);
+		});
+
+		it('elides the Sort for `order by d desc` over a DESC `timespan` PK', async () => {
+			await db.exec(`create table t (d timespan, primary key (d desc)) using store`);
+			await db.exec(`create table m (d timespan, primary key (d desc))`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT2H'), ('PT90M'), ('PT30S')`);
+			}
+			const q = `select d from t order by d desc`;
+			expect(await column(db, q, 'd')).to.deep.equal(['PT2H', 'PT90M', 'PT30S']);
+			expect(await column(db, q, 'd')).to.deep.equal(await column(db, `select d from m order by d desc`, 'd'));
+			expect(await planOps(db, q), 'the DESC advertisement matches — no Sort').to.not.match(/sort/i);
+		});
+
+		it('elides the Sort for a DESC `json` PK, a proper prefix sorting last', async () => {
+			// Bit-inversion turns the structural encoding's 0x00 terminator into 0xff —
+			// above every inverted content byte — so a proper prefix ([2] vs [2,0])
+			// correctly sorts LAST under DESC, matching the reversed length tiebreak.
+			await db.exec(`create table t (j json, primary key (j desc)) using store`);
+			await db.exec(`create table m (j json, primary key (j desc))`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('[2]'), ('[2,0]'), ('[10]')`);
+			}
+			const q = `select json_quote(j) as q from t order by j desc`;
+			expect(await column(db, q, 'q')).to.deep.equal(['[10]', '[2,0]', '[2]']);
+			expect(await column(db, q, 'q'))
+				.to.deep.equal(await column(db, `select json_quote(j) as q from m order by j desc`, 'q'));
+			expect(await planOps(db, q), 'inverted structural bytes still advertise').to.not.match(/sort/i);
+		});
+
+		it('advertises both members of a composite (timespan, integer) PK and seeks its leading range', async () => {
+			await db.exec(`create table t (d timespan, id integer, primary key (d, id)) using store`);
+			await db.exec(`create table m (d timespan, id integer, primary key (d, id))`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT2H', 1), ('PT90M', 2), ('PT90M', 1), ('PT30S', 9)`);
+			}
+			const ord = `select d || '/' || id as r from t order by d, id`;
+			expect(await column(db, ord, 'r'))
+				.to.deep.equal(await column(db, `select d || '/' || id as r from m order by d, id`, 'r'));
+			expect(await planOps(db, ord), 'the advertisement covers both members').to.not.match(/sort/i);
+
+			const rng = `select id from t where d >= 'PT1H30M' order by d, id`;
+			expect(await column(db, rng, 'id')).to.deep.equal([1, 2, 1]);
+			expect(await planOps(db, rng), 'the leading-member range seeks').to.match(SEEK);
+		});
+
+		it('counts a semantic-ordering SECOND member into the order-preserving prefix', async () => {
+			await db.exec(`create table t (id integer, d timespan, primary key (id, d)) using store`);
+			await db.exec(`create table m (id integer, d timespan, primary key (id, d))`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT2H'), (1, 'PT90M'), (2, 'PT30S')`);
+			}
+			const q = `select id || '/' || d as r from t order by id, d`;
+			expect(await column(db, q, 'r'))
+				.to.deep.equal(await column(db, `select id || '/' || d as r from m order by id, d`, 'r'));
+			expect(await planOps(db, q), 'the prefix must not truncate at the timespan member').to.not.match(/sort/i);
+		});
+
+		it("finds a row stored under a different spelling: `>= 'PT59M'` matches 'PT1H'", async () => {
+			// Bound and stored value are different spellings; the window is in
+			// elapsed-time space, so 3540s ≤ 3600s lands inside it.
+			await db.exec(`create table t (d timespan primary key) using store`);
+			await db.exec(`create table m (d timespan primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT1H'), ('PT30M')`);
+			}
+			const q = (tbl: string) => `select d from ${tbl} where d >= 'PT59M'`;
+			expect(await column(db, q('t'), 'd')).to.deep.equal(['PT1H']);
+			expect(await column(db, q('t'), 'd')).to.deep.equal(await column(db, q('m'), 'd'));
+			expect(await planOps(db, q('t'))).to.match(SEEK);
+		});
+
+		it('narrows BETWEEN to one window and lets the tighter of a redundant pair win', async () => {
+			await db.exec(`create table t (d timespan primary key) using store`);
+			await db.exec(`create table m (d timespan primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT30M'), ('PT1H'), ('PT90M'), ('PT2H')`);
+			}
+			for (const where of [
+				`d between 'PT45M' and 'PT100M'`,
+				`d > 'PT30M' and d > 'PT1H'`, // redundant same-side pair — the tighter must win
+			]) {
+				const q = (tbl: string) => `select d from ${tbl} where ${where}`;
+				expect(await column(db, q('t'), 'd'), where).to.deep.equal(await column(db, q('m'), 'd'));
+			}
+		});
+
+		it('places NULL first in a nullable `timespan` index column, matching memory', async () => {
+			await db.exec(`create table t (id integer primary key, d timespan null) using store`);
+			await db.exec(`create index ix_d on t (d)`);
+			await db.exec(`create table m (id integer primary key, d timespan null)`);
+			await db.exec(`create index ix_md on m (d)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT2H'), (2, null), (3, 'PT90M')`);
+			}
+			expect(await column(db, `select id from t order by d`, 'id'))
+				.to.deep.equal(await column(db, `select id from m order by d`, 'id'));
+			// A range op against NULL matches nothing, so the NULL row stays out.
+			const q = (tbl: string) => `select id from ${tbl} where d > 'PT100M' order by id`;
+			expect(await column(db, q('t'), 'id')).to.deep.equal([1]);
+			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
+		});
+
+		it('answers an IN-list over an indexed `timespan` column without multi-seeking', async () => {
+			// The multi-seek stays declined for a semantic-ordering seek column (backlog
+			// `feat-store-semantic-key-multiseek`): cost-only plan, residual retained —
+			// which is what lets the re-spelled 'PT60M' member match the stored 'PT1H'.
+			await db.exec(`create table t (id integer primary key, d timespan) using store`);
+			await db.exec(`create index ix_d on t (d)`);
+			await db.exec(`create table m (id integer primary key, d timespan)`);
+			await db.exec(`create index ix_md on m (d)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT1H'), (2, 'PT90M'), (3, 'PT2H')`);
+			}
+			const q = (tbl: string) => `select id from ${tbl} where d in ('PT60M', 'PT2H') order by id`;
+			expect(await column(db, q('t'), 'id')).to.deep.equal([1, 3]);
+			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
 		});
 	});
 });
