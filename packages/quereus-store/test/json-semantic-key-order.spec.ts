@@ -54,6 +54,8 @@ async function planOps(db: Database, query: string): Promise<string> {
 	return rows[0].ops as string;
 }
 
+const SEEK = /INDEXSEEK|INDEX SEEK|IndexSeek/i;
+
 /** Runs `sql`, returning the thrown error or null. */
 async function attempt(db: Database, sql: string): Promise<Error | null> {
 	try {
@@ -231,6 +233,59 @@ describe('JSON structural key order (store)', () => {
 			}
 		});
 
+		it('point-seeks a reorder-equal equality: `j = json(...)` finds the row stored the other way', async () => {
+			// The re-opened point arm. `jsonStructuralKey` sorts object keys, so both
+			// spellings key identically and the full-PK equality resolves to one
+			// data-store `get`. The probe must be written through `json(...)`: a bare TEXT
+			// literal is TEXT-class and matches no OBJECT-class row on either backend (see
+			// the note on the next test).
+			await db.exec(`create table t (j json primary key, v text) using store`);
+			await db.exec(`create table m (j json primary key, v text)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('{"a":1,"b":2}', 'a'), ('[3]', 'b')`);
+			}
+			const q = (tbl: string) => `select v from ${tbl} where j = json('{"b":2,"a":1}')`;
+			expect(await column(db, q('t'), 'v')).to.deep.equal(['a']);
+			expect(await column(db, q('t'), 'v')).to.deep.equal(await column(db, q('m'), 'v'));
+			expect(await planOps(db, q('t')), 'the full-PK equality seeks rather than scanning').to.match(SEEK);
+		});
+
+		it('matches memory — and does not raise — for a blob EQ probe on a `json` PK', async () => {
+			// `jsonStructuralKey` raises INTERNAL for a blob node, so the probe gate
+			// (`jsonKeyEncodable`) has to decline it before any window is encoded. The
+			// engine folds this particular comparison to an empty result before the module
+			// is asked at all; the assertion is that nothing anywhere raises and the row
+			// set matches memory.
+			await db.exec(`create table t (j json primary key, v text) using store`);
+			await db.exec(`create table m (j json primary key, v text)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('7', 'a'), ('"abc"', 'b'), ('{"a":1}', 'c')`);
+			}
+			const q = (tbl: string) => `select v from ${tbl} where j = x'01'`;
+			expect(await column(db, q('t'), 'v')).to.deep.equal(await column(db, q('m'), 'v'));
+			// Parameter-bound too: the literal-folding path above is not the only one.
+			const rows = await asyncIterableToArray(db.eval(`select v from t where j = ?`, [new Uint8Array([1])]));
+			const memRows = await asyncIterableToArray(db.eval(`select v from m where j = ?`, [new Uint8Array([1])]));
+			expect(rows).to.deep.equal(memRows);
+		});
+
+		it('seeks a reorder-equal EQ over a JSON-led SECONDARY index', async () => {
+			// The index EQ prefix addresses the TRANSFORMED (structural) bytes the index
+			// store holds; without the threaded `indexKeyTransforms` the window would
+			// address canonical text and return nothing.
+			await db.exec(`create table t (id integer primary key, j json) using store`);
+			await db.exec(`create index ix_j on t (j)`);
+			await db.exec(`create table m (id integer primary key, j json)`);
+			await db.exec(`create index ix_mj on m (j)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, '{"a":1,"b":2}'), (2, '[10]'), (3, '[2]')`);
+			}
+			const q = (tbl: string) => `select id from ${tbl} where j = json('{"b":2,"a":1}') order by id`;
+			expect(await column(db, q('t'), 'id')).to.deep.equal([1]);
+			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
+			expect(await planOps(db, q('t')), 'the index EQ prefix seeks').to.match(SEEK);
+		});
+
 		it('honors `insert or ignore` and `insert or replace` across reorder-equal spellings', async () => {
 			// NOTE: rows are addressed through `v` here — a JSON column compared against a
 			// TEXT literal (`where j = '{"a":1}'`) matches nothing on the memory backend
@@ -350,6 +405,20 @@ describe('JSON structural key order (isolated store)', () => {
 		await db.exec('commit');
 
 		expect((await db.get(`select count(*) as cnt from o`))?.cnt).to.equal(1);
+	});
+
+	it('answers a point lookup with the overlay row shadowing a reorder-equal committed key', async () => {
+		// The point-arm twin of the shadowing case above: both spellings key identically,
+		// so a full-PK equality inside the transaction must return the STAGED row, not the
+		// committed one, and must keep returning it after commit.
+		await db.exec(`create table o (j json primary key, v text) using store`);
+		await db.exec(`insert into o values ('{"a":1,"b":2}', 'committed')`);
+
+		await db.exec('begin');
+		await db.exec(`insert or replace into o values ('{"b":2,"a":1}', 'staged')`);
+		expect(await column(db, `select v from o where j = json('{"a":1,"b":2}')`, 'v')).to.deep.equal(['staged']);
+		await db.exec('commit');
+		expect(await column(db, `select v from o where j = json('{"b":2,"a":1}')`, 'v')).to.deep.equal(['staged']);
 	});
 
 	it('keeps a JSON-number-spelled string PK distinct from a committed row across `insert or replace`', async () => {

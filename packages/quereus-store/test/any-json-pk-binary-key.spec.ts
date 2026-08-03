@@ -26,9 +26,11 @@
  * the per-value gate `semanticProbeIsKeyFaithful`: a bound with no faithful byte position (a
  * numeric or unparseable TIMESPAN probe, a blob JSON probe) is dropped, which only WIDENS
  * the window, and the type-aware residual still decides rows — the under-fetch regressions
- * below pin exactly that. Equality-shaped seeks over such members remain declined
- * (`feat-store-semantic-key-point-seeks`), as do IN-list multi-seeks
- * (backlog `feat-store-semantic-key-multiseek`).
+ * below pin exactly that. EQUALITY-shaped seeks are open too: a full-PK equality declines
+ * the whole point arm on an unfaithful probe (a point window is one byte position and
+ * cannot be widened), while a secondary index's EQ prefix merely STOPS SHORT there (a
+ * shorter prefix window is a superset). Only IN-list multi-seeks stay declined
+ * (backlog `feat-store-semantic-key-multiseek`) — merged windows have neither escape.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -462,6 +464,63 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			const q = (tbl: string) => `select id from ${tbl} where d > 'PT100M' order by id`;
 			expect(await column(db, q('t'), 'id')).to.deep.equal([1]);
 			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
+		});
+
+		it('stops a composite index EQ prefix at an unfaithful interior probe, rows still correct', async () => {
+			// The case that distinguishes "stop the prefix" from "decline the arm": the
+			// leading integer probe is faithful, the interior TIMESPAN probe is not, so the
+			// window covers `a` alone — a strict superset — and `matchesFilters` re-checks
+			// `d` under TIMESPAN.compare. A window over both columns would address a real
+			// NUMERIC(5) key position the probe has no faithful claim to.
+			await db.exec(`create table t (id integer primary key, a integer, d timespan) using store`);
+			await db.exec(`create index ix_ad on t (a, d)`);
+			await db.exec(`create table m (id integer primary key, a integer, d timespan)`);
+			await db.exec(`create index ix_mad on m (a, d)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 1, 'PT5S'), (2, 1, 'PT2H'), (3, 2, 'PT5S')`);
+			}
+			const bad = (tbl: string) => `select id from ${tbl} where a = 1 and d = 5 order by id`;
+			expect(await column(db, bad('t'), 'id')).to.deep.equal(await column(db, bad('m'), 'id'));
+
+			// The faithful counterpart uses the full two-column prefix and finds the
+			// re-spelled row.
+			const good = (tbl: string) => `select id from ${tbl} where a = 1 and d = 'PT120M' order by id`;
+			expect(await column(db, good('t'), 'id')).to.deep.equal([2]);
+			expect(await column(db, good('t'), 'id')).to.deep.equal(await column(db, good('m'), 'id'));
+			expect(await planOps(db, good('t'))).to.match(SEEK);
+		});
+
+		it('falls through to the range arm when the EQ prefix stops at position 0', async () => {
+			// An unfaithful probe on the LEADING index column leaves `eqValues` empty, so
+			// `analyzeIndexAccess` drops to its range arm — which finds no range constraint
+			// here and full-scans. Correctness, not the plan shape, is the assertion.
+			await db.exec(`create table t (id integer primary key, d timespan) using store`);
+			await db.exec(`create index ix_d on t (d)`);
+			await db.exec(`create table m (id integer primary key, d timespan)`);
+			await db.exec(`create index ix_md on m (d)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT5S'), (2, 'PT2H')`);
+			}
+			for (const probe of ['5', `'not a duration'`]) {
+				const q = (tbl: string) => `select id from ${tbl} where d = ${probe} order by id`;
+				expect(await column(db, q('t'), 'id'), probe).to.deep.equal(await column(db, q('m'), 'id'));
+			}
+		});
+
+		it('keeps a `collate`-decorated index over a `json` column declined for EQUALITY too', async () => {
+			// `indexPrefixSeekIsCollationExact` is the gate, unchanged by the point-seek
+			// re-open: key bytes are hard-BINARY while the residual compares under the
+			// declared name, so the EQ window would be byte-equal only.
+			await db.exec(`create table t (id integer primary key, j json) using store`);
+			await db.exec(`create index ix_j on t (j collate nocase)`);
+			await db.exec(`create table m (id integer primary key, j json)`);
+			await db.exec(`create index ix_mj on m (j collate nocase)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, '"a"'), (2, '"B"'), (3, '{"a":1}')`);
+			}
+			const q = (tbl: string) => `select id from ${tbl} where j = json('"a"') order by id`;
+			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
+			expect(await planOps(db, q('t')), 'the declared COLLATE keeps the EQ prefix declined').to.not.match(SEEK);
 		});
 
 		it('answers an IN-list over an indexed `timespan` column without multi-seeking', async () => {

@@ -9,9 +9,9 @@
  * cannot honor drops the residual Filter and returns wrong rows, so every soundness
  * predicate the two share lives in `pk-key-resolution.ts` (`keyOrderMatchesCollation`,
  * `indexLeadingRangeIsOrderSafe`, `pkOrderPreservingPrefixLength`) rather than being
- * restated here. The declines that are NOT shared — partial indexes, semantic-ordering
- * columns, the multi-seek cap — are stated in both files, and changing one means changing
- * the other.
+ * restated here. The declines that are NOT shared — partial indexes, the multi-seek cap,
+ * and the semantic-ordering column ban on multi-seeks specifically — are stated in both
+ * files, and changing one means changing the other.
  *
  * Free functions rather than a layer of the store-module chain — access planning reads
  * no module state beyond the table's configured key collation, which the caller passes in.
@@ -372,10 +372,14 @@ function tryIndexAccessPlan(
 		return costOnly(`cost-only; IN cross-product of ${inCount} exceeds the ${MAX_MULTI_SEEK_KEYS}-seek cap`);
 	}
 	if (isMultiSeek && seekCols.some(colIdx => hasSemanticOrdering(tableInfo.columns[colIdx]?.logicalType))) {
-		// A plain EQ on a TIMESPAN/JSON column degrades safely (StoreTable.analyzeIndexAccess
-		// breaks its prefix there and the full-scan residual re-filters under the type's
-		// compare), but a multi-seek drops the residual and its byte-equality windows
-		// under-fetch the type's equality ('PT1H' ≡ 'PT60M', byte-distinct raw values).
+		// A plain EQ on a TIMESPAN/JSON column now seeks: `StoreTable.analyzeIndexAccess`
+		// encodes the probe through the column's key transform ('PT1H' and 'PT60M' collide
+		// on one key) and, for a probe with no faithful byte position, simply stops its
+		// prefix short and lets the residual re-filter under the type's compare. A
+		// multi-seek has neither escape — its merged windows ARE the whole access, with the
+		// residual already dropped — so an unfaithful member of the IN list would silently
+		// lose its tuple's rows or raise out of the key encoder. See `scanMultiSeek` and
+		// backlog `feat-store-semantic-key-multiseek`.
 		return costOnly('cost-only; semantic-ordering seek column cannot multi-seek');
 	}
 

@@ -477,21 +477,35 @@ store-local **structural byte form** (`jsonStructuralKey`, `quereus-store`'s
 json-key.ts) whose memcmp order reproduces the structural compare — so a store scan
 emits JSON keys in `compare` order, agreeing with the memory backend, and the
 isolation overlay aligns its merge streams (an in-transaction update or delete of a
-JSON-keyed row shadows correctly). With both types' key bytes order-faithful, the
-store *advertises* PK order over TIMESPAN/JSON key members (`order by <pk>` elides
-its Sort) and serves a leading-column *range* predicate as a byte-window seek. Two
-gates govern that: an explicit per-type allow-list
+JSON-keyed row shadows correctly). With both types' key bytes order-faithful *and*
+identity-faithful, the store reads such columns through their key bytes rather than
+by scanning: it *advertises* PK order over TIMESPAN/JSON key members (`order by <pk>`
+elides its Sort), serves a leading-column *range* predicate as a byte-window seek,
+and serves an *equality* as a point read — a full-PK `where d = 'PT60M'` fetches the
+single key the row stored as `'PT1H'` occupies, and `where j = json('{"b":2,"a":1}')`
+the one stored as `'{"a":1,"b":2}'`; the same holds for a secondary index whose
+leading columns are such types.
+
+Two gates govern all of it: an explicit per-type allow-list
 (`semanticKeyOrderIsFaithful`, `quereus-store`'s pk-key-resolution.ts — a claim about
 the values a table can *hold*, deliberately not inferred from a transform's mere
 existence) and a per-value probe gate (`semanticProbeIsKeyFaithful`) on each seek
-*bound*, since nothing coerces a query bound to the column's declared type: a bound
-with no faithful byte position (a numeric or unparseable TIMESPAN bound, a
-blob/bigint JSON bound) is dropped, which only *widens* the window back toward a
-full scan, and the type-aware residual still decides every row. *Equality*-shaped
-seeks over semantic-ordering members remain declined — an equality window cannot
-widen, only under-fetch — tracked as `feat-store-semantic-key-point-seeks`; IN-list
-multi-seeks likewise stay declined (no widen degradation exists across their merged
-windows), tracked as backlog `feat-store-semantic-key-multiseek`.
+*probe*, since nothing coerces a query value to the column's declared type. A probe
+with no faithful byte position (a numeric or unparseable TIMESPAN probe, a
+blob/bigint JSON probe) degrades in whichever way that arm can afford, and the
+type-aware residual decides every row either way:
+
+- a *range* bound is **dropped**, which only widens the window back toward a full scan;
+- a *full-PK equality* **declines the whole point arm** — a point window is a single
+  byte position and cannot be widened, only under-fetched;
+- a secondary index's *EQ prefix* **stops short** at that column — a window over the
+  columns before it is a strict superset, which the residual then narrows.
+
+(An unpaired surrogate inside a JSON probe is deliberately not degraded: it *raises*,
+matching the rule a text primary key's seek bounds already carry.) IN-list
+multi-seeks are the one shape still declined outright — their merged windows are the
+whole access, with none of the three degradations available — tracked as backlog
+`feat-store-semantic-key-multiseek`.
 
 The `min`/`max` **aggregates** follow the same rule: at emit (and materialized-view
 plan-build) time the call site binds the aggregate to its argument's declared type

@@ -729,6 +729,57 @@ describe('StoreModule predicate pushdown', () => {
 			expect(store.iterateEntryCount, 'the window starts past every key').to.equal(0);
 		});
 
+		it('a `timespan` PK equality is one point read, not a window and not a scan', async () => {
+			// The re-opened point arm (feat-store-semantic-key-point-seeks): a full-PK
+			// equality resolves through `readLiveRowByPk`, which `get`s one key and never
+			// iterates. The pre-re-open behaviour was a full scan (60 iterated entries).
+			await cdb.exec(`create table ts3 (d timespan primary key) using store`);
+			const vals = Array.from({ length: 60 }, (_, i) => `('PT${i + 1}M')`).join(', ');
+			await cdb.exec(`insert into ts3 values ${vals}`);
+			const store = dataStores.get('main.ts3')!;
+			store.iterateEntryCount = 0;
+			store.getCount = 0;
+
+			// Bound and stored value are different spellings of one hour.
+			const rows = await asyncIterableToArray(cdb.eval(`select d from ts3 where d = 'PT3600S'`));
+			expect(rows.map(r => r.d)).to.deep.equal(['PT60M']);
+			expect(store.iterateEntryCount, 'a point read iterates nothing').to.equal(0);
+			expect(store.getCount, 'exactly one key is fetched').to.equal(1);
+		});
+
+		it('a `json` PK equality is one point read, reorder-equal spelling included', async () => {
+			await cdb.exec(`create table js2 (j json primary key) using store`);
+			const vals = Array.from({ length: 60 }, (_, i) => `('{"a":${i},"b":0}')`).join(', ');
+			await cdb.exec(`insert into js2 values ${vals}`);
+			const store = dataStores.get('main.js2')!;
+			store.iterateEntryCount = 0;
+			store.getCount = 0;
+
+			const rows = await asyncIterableToArray(
+				cdb.eval(`select json_quote(j) as q from js2 where j = json('{"b":0,"a":57}')`),
+			);
+			expect(rows.map(r => r.q)).to.deep.equal(['{"a":57,"b":0}']);
+			expect(store.iterateEntryCount, 'a point read iterates nothing').to.equal(0);
+			expect(store.getCount, 'exactly one key is fetched').to.equal(1);
+		});
+
+		it('an unfaithful `timespan` EQ probe declines the point arm rather than seeking a bogus key', async () => {
+			// `d = 5` would encode to the NUMERIC(5) key — which 'PT5S' really occupies —
+			// so the decline is not observable in the ROW set (the residual rejects the row
+			// under the storage-class mismatch either way). The visit counts are what
+			// distinguish "declined to a scan" from "seeked a key the probe has no
+			// faithful position at".
+			await cdb.exec(`create table ts4 (d timespan primary key) using store`);
+			await cdb.exec(`insert into ts4 values ('PT5S'), ('PT2H'), ('PT30M')`);
+			const store = dataStores.get('main.ts4')!;
+			store.iterateEntryCount = 0;
+			store.getCount = 0;
+
+			expect(await asyncIterableToArray(cdb.eval(`select d from ts4 where d = 5`))).to.deep.equal([]);
+			expect(store.iterateEntryCount, 'the arm declined to a full scan').to.equal(3);
+			expect(store.getCount, 'no point read was issued').to.equal(0);
+		});
+
 		it('reads-own-writes: an uncommitted row inside the window surfaces', async () => {
 			await seed('nums', '');
 			await cdb.exec('begin');

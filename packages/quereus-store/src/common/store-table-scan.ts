@@ -129,17 +129,19 @@ export abstract class StoreTableScan extends StoreTableBase {
 
 	/**
 	 * True when some PK member's logical type carries semantic ordering (TIMESPAN,
-	 * JSON). Such PKs decline the POINT arm and full-scan, where
-	 * {@link matchesFilters} applies the type's compare. Historically required —
-	 * byte-key equality was a strict subset of the type's equality ('PT1H' ≡
-	 * 'PT60M' elapsed-time-equal, byte-distinct) and a point window under-fetched
-	 * with no residual able to resurrect a skipped row. Both types' key transforms
-	 * (see {@link storeSemanticKeyTransform}) now make byte equality the type's
-	 * equality, so the decline is conservative; re-opening the point arm is ticket
-	 * `feat-store-semantic-key-point-seeks`. (Range windows and ordering
-	 * advertisements are already re-opened — `semanticKeyOrderIsFaithful` in
-	 * pk-key-resolution.ts — with each seek BOUND gated per value by
-	 * {@link semanticProbeIsKeyFaithful}.)
+	 * JSON) — the gate {@link scanMultiSeekPrimary} declines on.
+	 *
+	 * A primary-key multi-seek merges N byte windows with the residual Filter already
+	 * dropped, and has no degradation available: a window that under-fetches loses rows
+	 * outright, and falling back to the scan arm would AND N mutually-exclusive
+	 * equalities to zero rows. So it fails loudly instead. Re-opening it is backlog
+	 * `feat-store-semantic-key-multiseek`.
+	 *
+	 * NOT a gate on the single-value point arm any more: both types' key transforms (see
+	 * {@link storeSemanticKeyTransform}) make byte equality exactly the type's equality
+	 * ('PT1H' and 'PT60M' land on one key), so {@link analyzePKAccess} admits a point
+	 * window per PROBE ({@link semanticProbeIsKeyFaithful}) rather than declining per
+	 * schema. A single point window CAN degrade to the scan arm; N merged ones cannot.
 	 */
 	protected pkHasSemanticOrderingMember(): boolean {
 		const schema = this.tableSchema!;
@@ -173,7 +175,28 @@ export abstract class StoreTableScan extends StoreTableBase {
 			}
 		}
 
-		if (allEq && !this.pkHasSemanticOrderingMember()) {
+		// A full-PK equality is a point window, provided every probe has a faithful byte
+		// position under its column's type ({@link semanticProbeIsKeyFaithful} — nothing
+		// coerces a query-supplied probe to the declared type).
+		//
+		// The asymmetry with {@link buildPKRangeBounds} is the non-obvious part: a range
+		// bound that fails the gate is SKIPPED, which only widens the window. An EQ window
+		// is a single byte position and cannot be widened, so an unfaithful probe must
+		// decline the WHOLE point arm and fall through to `{ type: 'scan' }`, where
+		// {@link matchesFilters} re-checks under the type's own comparator. Declining at
+		// runtime is safe even though `computeBestAccessPlan`'s full-PK-equality arm
+		// (store-module-access-plan.ts) already claimed the filters handled and the engine
+		// dropped the residual Filter: every scan arm applies `matchesFilters`, which ANDs
+		// each pushed constraint under the column's real comparator. The plan's claim is
+		// about which FILTERS the module honours, not about which physical arm serves them.
+		//
+		// NOTE: for a TIMESPAN member the gate parses the probe (`groupKey`) and
+		// `encodeDataKey`'s transform then parses it again — two duration parses per point
+		// lookup, once per QUERY rather than per row. Fine now; if a point-lookup-heavy
+		// TIMESPAN-keyed workload ever shows it, have the gate hand its parsed value back
+		// so the encode can reuse it.
+		if (allEq && eqValues.every((v, i) =>
+			semanticProbeIsKeyFaithful(schema.columns[pkColumns[i]]?.logicalType, v))) {
 			return { type: 'point', values: eqValues };
 		}
 
@@ -235,8 +258,10 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * claimed the range handled from the schema alone, so the predicate the engine's
 	 * dropped Filter carried is reproduced by {@link matchesFilters} under the type's
 	 * own compare. An EQUALITY window has no such degradation — a widened point window
-	 * is still byte-EQ and under-fetches — which is why the point arms must DECLINE
-	 * rather than widen (see {@link pkHasSemanticOrderingMember}).
+	 * is still byte-EQ and under-fetches — which is why {@link analyzePKAccess}'s point
+	 * arm DECLINES on an unfaithful probe rather than skipping it, and why
+	 * {@link analyzeIndexAccess} stops its EQ prefix SHORT (a shorter prefix window is a
+	 * superset; a widened equality is not).
 	 *
 	 * NOTE: a range window over a text PK column is sound only when the column's key
 	 * normalizer is ORDER-preserving with respect to its comparator — i.e. the comparator
@@ -356,20 +381,26 @@ export abstract class StoreTableScan extends StoreTableBase {
 		const indexDirections = index.columns.map(c => !!c.desc);
 		const indexCollations = this.indexKeyCollations(index);
 
-		// Contiguous leading-prefix EQ → point/prefix window. A prefix member whose
-		// logical type carries semantic ordering stops the prefix: its byte-equality
-		// window under-fetches the type's equality (see pkHasSemanticOrderingMember),
-		// and a skipped row cannot be resurrected by the residual.
+		// Contiguous leading-prefix EQ → point/prefix window. A member whose PROBE has no
+		// faithful byte position under its logical type ({@link semanticProbeIsKeyFaithful}
+		// — a numeric or unparseable TIMESPAN probe, a blob/bigint JSON probe) STOPS the
+		// prefix here rather than declining the whole access: a window over the columns
+		// before it is a strict SUPERSET of the longer one, and {@link matchesFilters}
+		// re-checks the dropped column under the type's own compare. That escape is exactly
+		// what the PK point arm lacks (a full-PK window cannot be shortened), which is why
+		// {@link analyzePKAccess} declines outright instead. Stopping at position 0 leaves
+		// `eqValues` empty and falls through to the range arm below.
 		const eqValues: SqlValue[] = [];
 		for (let i = 0; i < indexCols.length; i++) {
-			if (hasSemanticOrdering(this.tableSchema!.columns[indexCols[i]]?.logicalType)) break;
 			const eq = filterInfo.constraints?.find(
 				c => c.constraint.iColumn === indexCols[i]
 					&& c.constraint.op === IndexConstraintOp.EQ
 					&& c.argvIndex > 0,
 			);
 			if (!eq) break;
-			eqValues.push(filterInfo.args[eq.argvIndex - 1]);
+			const value = filterInfo.args[eq.argvIndex - 1];
+			if (!semanticProbeIsKeyFaithful(this.tableSchema!.columns[indexCols[i]]?.logicalType, value)) break;
+			eqValues.push(value);
 		}
 		if (eqValues.length > 0) {
 			// Decline rather than fall through to the range arm: an EQ prefix whose key
@@ -757,13 +788,16 @@ export abstract class StoreTableScan extends StoreTableBase {
 			this.multiSeekMalformed(filterInfo, `seekWidth ${seekWidth} exceeds ${index.name}'s ${indexCols.length} columns`);
 		}
 		const seekCols = indexCols.slice(0, seekWidth);
-		// The encoded byte windows below carry no residual able to resurrect a
-		// skipped row, so a seek column whose byte equality under-fetches the type's
-		// equality (TIMESPAN, JSON — see pkHasSemanticOrderingMember) cannot be
-		// multi-seeked. `tryIndexAccessPlan` (store-module-access-plan.ts) declines such plans; one
+		// The merged byte windows below ARE the whole access — no residual can resurrect a
+		// row they skip, and a single unfaithful probe has nowhere to degrade to. A
+		// single-window arm can decline to the full scan ({@link analyzePKAccess}) or stop
+		// its prefix short ({@link analyzeIndexAccess}); neither move exists here, and an
+		// unfaithful probe would either silently drop its tuple's rows or raise out of the
+		// key encoder (`jsonStructuralKey` throws INTERNAL for a blob probe). So a
+		// semantic-ordering seek column is refused outright.
+		// `tryIndexAccessPlan` (store-module-access-plan.ts) declines such plans; one
 		// arriving anyway is malformed. Re-opening is backlog
-		// `feat-store-semantic-key-multiseek` — a multi-seek has no widen-to-full-scan
-		// degradation available across its merged windows.
+		// `feat-store-semantic-key-multiseek`.
 		if (seekCols.some(colIdx => hasSemanticOrdering(this.tableSchema!.columns[colIdx]?.logicalType))) {
 			this.multiSeekMalformed(filterInfo, 'semantic-ordering seek column');
 		}
@@ -840,9 +874,11 @@ export abstract class StoreTableScan extends StoreTableBase {
 		if (seekWidth !== pkColumns.length) {
 			this.multiSeekMalformed(filterInfo, `seekWidth ${seekWidth} does not cover the ${pkColumns.length}-column primary key`);
 		}
-		// Mirrors analyzePKAccess's conservative decline of the point arm for such PKs
-		// (see pkHasSemanticOrderingMember); with the residual gone there is no scan to
-		// degrade to, so fail loudly rather than risk an under-fetch.
+		// Same rule as the secondary-index branch (see scanMultiSeek): with the residual
+		// gone and N windows merged there is no scan to degrade to and no prefix to stop
+		// short, so fail loudly rather than risk an under-fetch. `analyzePKAccess`'s
+		// SINGLE-value point arm has that escape and no longer declines — see
+		// pkHasSemanticOrderingMember.
 		if (this.pkHasSemanticOrderingMember()) {
 			this.multiSeekMalformed(filterInfo, 'semantic-ordering primary-key member');
 		}

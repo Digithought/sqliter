@@ -536,11 +536,14 @@ analysis, and UNIQUE enforcement compare under. The schema entry points:
   only when the explicit per-type allow-list `semanticKeyOrderIsFaithful`
   (pk-key-resolution.ts) asserts its stored key bytes memcmp in exactly that order —
   TIMESPAN through its total-seconds `groupKey` transform, JSON through the structural
-  byte form; any other semantic-ordering type keeps the blanket decline. A range seek
-  *bound* passes through the per-value gate `semanticProbeIsKeyFaithful` besides: a bound
-  the type gives no faithful byte position (a numeric or unparseable TIMESPAN bound, a
-  blob/bigint JSON bound) is dropped, which only widens the window, and the type-aware
-  residual (`matchesFilters`) still decides rows. The memory backend's declared-key BTrees
+  byte form; any other semantic-ordering type keeps the blanket decline. Every seek
+  *probe* passes through the per-value gate `semanticProbeIsKeyFaithful` besides: a probe
+  the type gives no faithful byte position (a numeric or unparseable TIMESPAN probe, a
+  blob/bigint JSON probe) degrades in whichever way its arm can afford — a range bound is
+  dropped (widening the window), a full-PK equality declines its whole point arm (a point
+  window cannot widen, only under-fetch), and a secondary index's EQ prefix stops short at
+  that column (a shorter prefix window is a superset). The type-aware residual
+  (`matchesFilters`) decides rows in every case. The memory backend's declared-key BTrees
   (`createTypedComparator`) agree with `Sort` on both kinds, so the two backends advertise
   the same orders.
 
@@ -1199,7 +1202,7 @@ cannot honor drops the residual `Filter` and returns wrong rows, so the two must
 together.
 
 - NOTE: the two largest `StoreTable` layers have both passed the ~1,000-line seam
-  (`store-table-scan.ts` 1,085, `store-table-base.ts` 1,033 — `wc -l`, 2026-08). Splitting
+  (`store-table-scan.ts` 1,121, `store-table-base.ts` 1,033 — `wc -l`, 2026-08). Splitting
   them is backlog `debt-split-store-table-scan-and-base`: the scan layer's natural seam is
   the multi-seek group (`decodeMultiSeekTuples` / `orderTupleValues` / `scanMultiSeek` /
   `scanMultiSeekPrimary`), the base's is the statistics block. Until it lands, prefer

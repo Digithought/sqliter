@@ -278,6 +278,27 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			await rejects(db, `select v from j where k > '${LONE_HIGH}'`);
 			await rejects(db, `select v from j where k >= 'a${LONE_HIGH}b'`);
 		});
+
+		it('rejects an EQUALITY probe built from a lone-surrogate literal', async () => {
+			// The point arm is re-opened too (feat-store-semantic-key-point-seeks), and it
+			// encodes its probe through the same structural key form. `jsonKeyEncodable`
+			// deliberately does NOT decline an unpaired surrogate — a probe with no faithful
+			// byte position is refused, never silently widened or narrowed — so this RAISES
+			// rather than returning the zero rows the pre-re-open full scan produced. Same
+			// rule the text PK's `where k = '<lone surrogate>'` above already carries.
+			await db.exec(`insert into j values ('["a"]', 'one'), ('["${ASTRAL}"]', 'astral')`);
+			await rejects(db, `select v from j where k = json('["\\ud800"]')`);
+			await rejects(db, `select v from j where k = json('{"\\ud800":1}')`);
+			// A bare TEXT probe reaches the same encoder (a JSON string scalar is TEXT-class).
+			await rejects(db, `select v from j where k = '${LONE_HIGH}'`);
+		});
+
+		it('rejects an EQUALITY probe over a lone-surrogate literal on a json SECONDARY index', async () => {
+			await db.exec(`create table js (id integer primary key, k json) using store`);
+			await db.exec(`create index ix_jk on js (k)`);
+			await db.exec(`insert into js values (1, '["a"]')`);
+			await rejects(db, `select id from js where k = json('["\\ud800"]')`);
+		});
 	});
 
 	describe('an identifier or persisted DDL text carrying a lone surrogate', () => {

@@ -53,6 +53,15 @@ async function planOps(db: Database, query: string): Promise<string> {
 	return rows[0].ops as string;
 }
 
+/** The JSON array of physical operator DETAILS for `query`'s plan. */
+async function planDetails(db: Database, query: string): Promise<string> {
+	const rows = await asyncIterableToArray(
+		db.eval(`select json_group_array(detail) as details from query_plan(?)`, [query]),
+	);
+	expect(rows).to.have.lengthOf(1);
+	return rows[0].details as string;
+}
+
 const SEEK = /INDEXSEEK|INDEX SEEK|IndexSeek/i;
 
 /** Runs `sql`, returning the thrown error or null. */
@@ -117,16 +126,91 @@ describe('TIMESPAN semantic key identity (store)', () => {
 			expect((await db.get(`select v from t where d = 'PT1H'`))?.v).to.equal('row');
 		});
 
-		it('addresses a row through any equal-elapsed spelling in UPDATE/DELETE', async () => {
+		it("point-seeks a re-spelled equality: `d = 'PT60M'` finds the row stored as 'PT1H'", async () => {
+			// The re-opened point arm. Both spellings key as NUMERIC(3600), so the full-PK
+			// equality resolves to one data-store `get` — and the answer must still agree
+			// with the memory table, whose typed BTree ranks by elapsed time.
 			await db.exec(`create table t (d timespan primary key, v text) using store`);
-			await db.exec(`insert into t values ('PT90M', 'a'), ('PT2H', 'b')`);
+			await db.exec(`create table m (d timespan primary key, v text)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT1H', 'a'), ('PT30M', 'b')`);
+			}
+			const q = (tbl: string) => `select v from ${tbl} where d = 'PT60M'`;
+			expect(await column(db, q('t'), 'v')).to.deep.equal(['a']);
+			expect(await column(db, q('t'), 'v')).to.deep.equal(await column(db, q('m'), 'v'));
+			expect(await planOps(db, q('t')), 'the full-PK equality seeks rather than scanning').to.match(SEEK);
+			expect(await planDetails(db, q('t')), 'served by the primary key').to.match(/primary/i);
+		});
+
+		it('matches memory for an EQ probe with no faithful byte position', async () => {
+			// `semanticProbeIsKeyFaithful` declines a numeric probe (groupKey passes a
+			// non-string through, so the window would be a real NUMERIC key position) and
+			// an unparseable string (groupKey falls back to raw TEXT-tagged bytes). An EQ
+			// window cannot be widened, so the WHOLE point arm declines and the full scan's
+			// `matchesFilters` answers under TIMESPAN.compare. 'PT5S' totals 5 seconds —
+			// exactly the key the numeric probe would seek — so a leaked bogus seek would
+			// still have to survive the residual.
+			await db.exec(`create table t (d timespan primary key, v text) using store`);
+			await db.exec(`create table m (d timespan primary key, v text)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT5S', 'a'), ('PT2H', 'b')`);
+			}
+			for (const probe of ['5', `'not a duration'`]) {
+				const q = (tbl: string) => `select v from ${tbl} where d = ${probe}`;
+				expect(await column(db, q('t'), 'v'), probe).to.deep.equal(await column(db, q('m'), 'v'));
+			}
+		});
+
+		it('declines the WHOLE point arm when one member of a composite PK probes unfaithfully', async () => {
+			// A point window is a single byte position: it cannot be shortened the way an
+			// index EQ prefix can, so an unfaithful member takes the whole arm down to the
+			// scan rather than seeking on the faithful members alone.
+			await db.exec(`create table t (d timespan, id integer, primary key (d, id)) using store`);
+			await db.exec(`create table m (d timespan, id integer, primary key (d, id))`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT1H', 1), ('PT2H', 2)`);
+			}
+			const bad = (tbl: string) => `select id from ${tbl} where d = 5 and id = 1`;
+			expect(await column(db, bad('t'), 'id')).to.deep.equal(await column(db, bad('m'), 'id'));
+
+			// The faithful counterpart still point-seeks across spellings.
+			const good = (tbl: string) => `select id from ${tbl} where d = 'PT60M' and id = 1`;
+			expect(await column(db, good('t'), 'id')).to.deep.equal([1]);
+			expect(await column(db, good('t'), 'id')).to.deep.equal(await column(db, good('m'), 'id'));
+			expect(await planOps(db, good('t'))).to.match(SEEK);
+		});
+
+		it('seeks a re-spelled EQ over a TIMESPAN-led SECONDARY index', async () => {
+			// The index EQ prefix is re-opened too, and its window addresses the
+			// TRANSFORMED bytes (`indexKeyTransforms`) the index store actually holds —
+			// without that thread the window would address raw text and return nothing.
+			await db.exec(`create table t (id integer primary key, d timespan) using store`);
+			await db.exec(`create index ix_d on t (d)`);
+			await db.exec(`create table m (id integer primary key, d timespan)`);
+			await db.exec(`create index ix_md on m (d)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT1H'), (2, 'PT2H'), (3, 'PT90M')`);
+			}
+			const q = (tbl: string) => `select id from ${tbl} where d = 'PT60M' order by id`;
+			expect(await column(db, q('t'), 'id')).to.deep.equal([1]);
+			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
+			expect(await planOps(db, q('t')), 'the index EQ prefix seeks').to.match(SEEK);
+			expect(await planDetails(db, q('t'))).to.match(/ix_d/);
+		});
+
+		it('addresses a row through any equal-elapsed spelling in UPDATE/DELETE', async () => {
+			// Both statements' WHERE now routes through the re-opened point arm, so this is
+			// the data-loss-shaped direction of the change: the SURVIVING set is asserted
+			// explicitly, not just the target's disappearance.
+			await db.exec(`create table t (d timespan primary key, v text) using store`);
+			await db.exec(`insert into t values ('PT90M', 'a'), ('PT2H', 'b'), ('PT30S', 'c')`);
 
 			await db.exec(`update t set v = 'a2' where d = 'PT1H30M'`);
 			expect((await db.get(`select v from t where d = 'PT90M'`))?.v).to.equal('a2');
+			expect(await column(db, `select v from t order by d`, 'v')).to.deep.equal(['c', 'a2', 'b']);
 
 			await db.exec(`delete from t where d = 'PT120M'`);
-			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(1);
-			expect((await db.get(`select v from t`))?.v).to.equal('a2');
+			expect(await column(db, `select v from t order by d`, 'v')).to.deep.equal(['c', 'a2']);
 		});
 
 		it('collapses spellings on a composite PK with a mid-key TIMESPAN member', async () => {
@@ -349,6 +433,39 @@ describe('TIMESPAN semantic key identity (isolated store)', () => {
 		await db.exec('commit');
 
 		expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(2);
+	});
+
+	it('point-looks-up a row staged earlier in the same transaction, under either spelling', async () => {
+		// The re-opened point arm reads through `readLiveRowByPk` → `readEffectiveRowByKey`,
+		// so a row that exists only in this transaction's pending overlay must still answer
+		// a full-PK equality — and must stop answering once a pending delete shadows it.
+		await db.exec(`insert into t values ('PT2H', 'committed')`);
+
+		await db.exec('begin');
+		await db.exec(`insert into t values ('PT1H', 'staged')`);
+		expect(await column(db, `select v from t where d = 'PT60M'`, 'v'),
+			'the staged row answers a differently-spelled point lookup').to.deep.equal(['staged']);
+
+		await db.exec(`delete from t where d = 'PT120M'`);
+		expect(await column(db, `select v from t where d = 'PT7200S'`, 'v'),
+			'the pending delete hides the committed row from the point arm').to.deep.equal([]);
+		await db.exec('commit');
+
+		expect(await column(db, `select v from t where d = 'PT60M'`, 'v')).to.deep.equal(['staged']);
+		expect(await column(db, `select v from t where d = 'PT7200S'`, 'v')).to.deep.equal([]);
+	});
+
+	it('a point lookup returns the overlay row shadowing a differently-spelled committed key', async () => {
+		// The overlay's pending row and the committed row share one physical key, so the
+		// merge must yield exactly the staged one — the point-arm twin of the full-scan
+		// shadowing case above.
+		await db.exec(`insert into t values ('PT60M', 'committed')`);
+
+		await db.exec('begin');
+		await db.exec(`insert or replace into t values ('PT1H', 'staged')`);
+		expect(await column(db, `select v from t where d = 'PT3600S'`, 'v')).to.deep.equal(['staged']);
+		await db.exec('commit');
+		expect(await column(db, `select v from t where d = 'PT3600S'`, 'v')).to.deep.equal(['staged']);
 	});
 
 	it('a duplicate spelling INSERT inside a transaction is a PK conflict against the committed row', async () => {
