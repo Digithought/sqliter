@@ -217,6 +217,10 @@ function resolveSeekColumns(
 	// byte string (above every finite double), so the window is exactly the NaN
 	// rows. Dropping NaN keys the way NULL keys are dropped would be WRONG: it
 	// would under-fetch a genuinely NaN-valued row in a REAL/NUMERIC column.
+	// The reasoning is defensive: no builtin SQL surface produces a stored NaN —
+	// `0.0/0.0`, `1e308*1e308`, `sqrt(-1)` and `cast('nan' as real)` all yield NULL
+	// or 0, and a NaN bound as a parameter arrives as NULL. Only a plugin type,
+	// module or UDF can mint one.
 	if (!sharesSeekKeySpace(targetType.logicalType, keyType.logicalType)) {
 		log('decline: %s and %s do not share a seek key space',
 			targetType.logicalType.name, keyType.logicalType.name);

@@ -350,6 +350,29 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 			expectPrimarySeeked();
 			await db.exec(`rollback`);
 		});
+
+		it('merges staged rows against an out-of-order CROSS-TYPE key set (REAL keys, INTEGER pk)', async () => {
+			// feat-key-set-seek-cross-type-keys over the ORDER-SENSITIVE merge. The seek-key
+			// sort runs `compareSqlValuesFast`, which orders by storage class and so ranks a
+			// `number` key against the `bigint`/`number` primary key by true magnitude — the
+			// same order `mergeStreams` demands of the underlying stream. If the sort ever
+			// fell back to a representation-sensitive order, the REAL keys would arrive out
+			// of primary-key order and mis-pair the staged rows exactly as the (now-fixed)
+			// literal list used to.
+			await db.exec(`create table rsrc (id integer primary key, k real) using isolated`);
+			await db.exec(`insert into rsrc values (1, 3.0), (2, 1.0), (3, 2.0), (4, 2.5)`);
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 'new' where pk = 1`);
+			await db.exec(`delete from t where pk = 3`);
+			mem.reset();
+			// 2.5 matches no whole-number pk — a coercion to 2 would double-count pk 2.
+			expect(await rowsOf(`select pk, v from t where pk in (select k from rsrc)`)).to.deep.equal([
+				{ pk: 1, v: 'new' },
+				{ pk: 2, v: 'two' },
+			]);
+			expectPrimarySeeked();
+			await db.exec(`rollback`);
+		});
 	});
 
 	describe('literal IN-list multi-seek (fix/bug-isolation-multiseek-merge-order)', () => {

@@ -732,6 +732,22 @@ describe('Type System', () => {
 			expect(sharesSeekKeySpace(PLUGIN_NUMERIC, PLUGIN_NUMERIC), 'but a type always shares with itself')
 				.to.equal(true);
 		});
+
+		it('holds for the numeric type ALIASES, which resolve to the same singletons', () => {
+			// The whitelist is by object identity, so the feature reaches `bigint` / `double` /
+			// `decimal` columns only as long as the registry keeps aliasing them to the three
+			// singletons rather than minting look-alike objects. Give any of them its own
+			// object and both seek rewrites silently stop firing for that spelling.
+			const ALIASES = ['INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT', 'FLOAT', 'DOUBLE', 'DECIMAL'];
+			for (const a of ALIASES) {
+				for (const b of ALIASES) {
+					const ta = getType(a)!;
+					const tb = getType(b)!;
+					expect(sharesSeekKeySpace(ta, tb), `${a} vs ${b}`).to.equal(true);
+				}
+				expect(sharesSeekKeySpace(getType(a)!, TEXT_TYPE), `${a} vs TEXT`).to.equal(false);
+			}
+		});
 	});
 
 });
