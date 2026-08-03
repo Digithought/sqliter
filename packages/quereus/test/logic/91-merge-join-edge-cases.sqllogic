@@ -96,6 +96,26 @@ SELECT l.v, r.w FROM mj_mc_l l JOIN mj_mc_r r ON l.a = r.x AND l.b = r.y ORDER B
 SELECT l.a, l.b, r.w FROM mj_mc_l l LEFT JOIN mj_mc_r r ON l.a = r.x AND l.b = r.y ORDER BY l.a, l.b;
 → [{"a":1,"b":10,"w":"s"},{"a":1,"b":20,"w":null},{"a":2,"b":10,"w":"u"}]
 
+-- DESC primary key: the scan's advertised ordering must carry the declared
+-- direction, or a merge join built on it drops all but one matching row.
+-- (bug-desc-pk-scan-advertises-ascending-order)
+CREATE TABLE mj_dpk (id INTEGER, v TEXT, PRIMARY KEY (id DESC));
+CREATE TABLE mj_small (id INTEGER PRIMARY KEY);
+INSERT INTO mj_dpk VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT INTO mj_small VALUES (1), (2), (3);
+
+SELECT id FROM mj_dpk WHERE id IN (SELECT id FROM mj_small) ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+SELECT id FROM mj_dpk d WHERE EXISTS (SELECT 1 FROM mj_small s WHERE s.id = d.id) ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+SELECT d.id FROM mj_dpk d JOIN mj_small s ON s.id = d.id ORDER BY d.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+SELECT d.id AS did, s.id AS sid FROM mj_dpk d LEFT JOIN mj_small s ON s.id = d.id ORDER BY d.id;
+→ [{"did":1,"sid":1},{"did":2,"sid":2},{"did":3,"sid":3}]
+
 -- Cleanup
 DROP TABLE mj_self;
 DROP TABLE mj_allnull;
@@ -106,3 +126,5 @@ DROP TABLE mj_populated;
 DROP TABLE mj_empty;
 DROP TABLE mj_mc_l;
 DROP TABLE mj_mc_r;
+DROP TABLE mj_dpk;
+DROP TABLE mj_small;

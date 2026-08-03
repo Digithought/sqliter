@@ -367,7 +367,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			if (!usesSecondaryIndex) {
 				const pkOrdering: OrderingSpec[] = tableInfo.primaryKeyDefinition.map(col => ({
 					columnIndex: col.index,
-					desc: false
+					desc: !!col.desc
 				}));
 				bestPlan = {
 					...bestPlan,
