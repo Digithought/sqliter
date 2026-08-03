@@ -65,6 +65,19 @@ function responseRedirectedTo(body: string, finalUrl: string): Response {
 	return response;
 }
 
+/**
+ * A response whose body is a stream that is never closed, so cancelling it
+ * really does reach the underlying source. A closed stream's `cancel()` returns
+ * without calling it, which would make the cleanup assertion vacuous.
+ */
+function unclosedStreamResponse(body: string, init: ResponseInit, onCancel: () => void): Response {
+	const stream = new ReadableStream<Uint8Array>({
+		start: controller => { controller.enqueue(new TextEncoder().encode(body)); },
+		cancel: onCancel
+	});
+	return new Response(stream, init);
+}
+
 /** Source of a plugin that counts how many times its module body evaluated. */
 const COUNTING_PLUGIN_SOURCE = `
 globalThis[${JSON.stringify(COUNT_KEY)}] = (globalThis[${JSON.stringify(COUNT_KEY)}] ?? 0) + 1;
@@ -312,6 +325,20 @@ describe('https module loads under Node', () => {
 				.rejects.toThrow(new RegExp(`Failed to load plugin from ${MODULE_URL.replace(/[.]/g, '\\.')}`));
 		});
 
+		it('cancels the body of a response it refuses to read', async () => {
+			let cancelled = false;
+			const resolver = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() =>
+					unclosedStreamResponse('nope', { status: 404 }, () => { cancelled = true; }))
+			});
+
+			await expect(resolver(new URL(MODULE_URL))).rejects.toThrow(/HTTP 404/);
+
+			// Left unread, the body would hold its socket until the response is
+			// garbage collected.
+			expect(cancelled).toBe(true);
+		});
+
 		it('keeps the original error reachable as `cause`', async () => {
 			installNodeRemoteModuleResolver({
 				fetchImpl: fetchAnswering(() => new Response('nope', { status: 500 }))
@@ -480,6 +507,20 @@ describe('https module loads under Node', () => {
 			});
 
 			await expect(resolver(new URL(MODULE_URL))).rejects.toThrow(/HTTP 404/);
+		});
+
+		it('is not consulted at all when the fetch never produced bytes', async () => {
+			// There is nothing to compare yet, and asking a host's record store on
+			// every failed fetch is work it did not ask for.
+			const asked: string[] = [];
+			const resolver = createNodeRemoteResolver({
+				fetchImpl: fetchAnswering(() => new Response('nope', { status: 404 })),
+				expectedHash: url => { asked.push(url); return WRONG_SHA256; }
+			});
+
+			await expect(resolver(new URL(MODULE_URL))).rejects.toThrow(/HTTP 404/);
+
+			expect(asked).toEqual([]);
 		});
 
 		it('lets the redirect and size guards win over a pin', async () => {

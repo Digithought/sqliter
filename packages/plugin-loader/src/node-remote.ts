@@ -139,18 +139,34 @@ async function fetchModuleBytes(
 	// startup, which may be before a `fetch` polyfill (or a test double) exists.
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	const response = await fetchImpl(url.toString());
-	if (!response.ok) {
-		throw new Error(
-			`Failed to fetch plugin module from ${url.href}: HTTP ${response.status}` +
-			(response.statusText ? ` ${response.statusText}` : '')
-		);
+	try {
+		if (!response.ok) {
+			throw new Error(
+				`Failed to fetch plugin module from ${url.href}: HTTP ${response.status}` +
+				(response.statusText ? ` ${response.statusText}` : '')
+			);
+		}
+
+		assertSecureFinalUrl(response, url);
+		logUnexpectedMediaType(response, url);
+
+		const data = await readCappedBody(response, maxBytes, url.href);
+		return { data, sha256: createHash('sha256').update(data).digest('hex') };
+	} catch (error) {
+		await discardBody(response);
+		throw error;
 	}
+}
 
-	assertSecureFinalUrl(response, url);
-	logUnexpectedMediaType(response, url);
-
-	const data = await readCappedBody(response, maxBytes, url.href);
-	return { data, sha256: createHash('sha256').update(data).digest('hex') };
+/**
+ * Releases the connection behind a response we are rejecting without reading.
+ * A body left unread keeps its socket occupied until the response is collected.
+ */
+async function discardBody(response: Response): Promise<void> {
+	// Locked means a reader already owns (and has cancelled) the stream —
+	// cancelling it again throws.
+	if (!response.body || response.body.locked) return;
+	await response.body.cancel().catch(error => log('Discarding a rejected body failed: %O', error));
 }
 
 /**
@@ -335,6 +351,13 @@ function ensureModuleDir(): string {
  * NOTE: as with the `?t=` cache-buster, every reload leaves the prior module
  * version in Node's registry. Fine for a CLI; a long-lived host that reloads
  * plugins in a loop needs a real unload story.
+ *
+ * NOTE: `expectedHash` verifies the bytes in memory, but the import reads them
+ * back off disk — safe only because {@link ensureModuleDir} uses `mkdtemp`, so
+ * the directory is private to this user and this process. If fetched modules
+ * ever move to a shared or predictable location (a disk cache, say), the pin
+ * would be guaranteeing bytes that another writer could have replaced; verify
+ * again on read, or keep the path unguessable.
  */
 function writeModuleFile(bytes: Uint8Array, sha256: string): string {
 	const path = join(ensureModuleDir(), `${sha256.slice(0, 16)}-${moduleCounter++}.mjs`);
