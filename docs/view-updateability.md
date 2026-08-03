@@ -110,7 +110,9 @@ A plain column reference never needed any of this: the lowering has already rewr
 
 An **ephemeral** target is deliberately left unmarked, mirroring `bodyPlanningContext`'s ephemeral guard — its body is part of the caller's statement, so its sub-selects keep the caller's path and the caller's CTEs. The writing statement's own sub-selects (a user `where … in (select …)`, an `insert … select` source) are never marked and are unaffected.
 
-One related defect at the same symptom but a different code site remains open: a body lineage sub-select that qualifies its correlation with the base table's *name* (`fix/bug-view-write-lineage-subquery-base-table-qualifier`).
+The stamp carries the view's home **schema name**, not the body's declared search path, so a body that ends in an explicit `with schema s1, s2` re-enters only the home path when a fragment is copied: the body's own FROM sources still resolve (the body statement carries its `schemaPath` into its own plan), but a sub-select the lowering copies out of it does not, and a write fails with `Table 't' not found in schema path: <home>` where the matching read succeeds. Open as `fix/bug-view-write-body-schema-path-not-carried`.
+
+Two related defects at the same symptom but different code sites remain open: a body lineage sub-select that qualifies its correlation with the base table's *name* (`fix/bug-view-write-lineage-subquery-base-table-qualifier`), and the shadow-analysis pass that sizes up a fragment's `from` sources against one fixed schema (`fix/bug-view-write-subquery-shadow-analysis-wrong-schema`).
 
 ### Identifying Predicates
 

@@ -19,6 +19,7 @@ import { jsonStringify } from "../../util/serialization.js";
 import { expressionToString } from "../../emit/ast-stringify.js";
 import { createLogger } from "../../common/logger.js";
 import type * as AST from "../../parser/ast.js";
+import { firstDataModifyingCte } from "../../parser/utils.js";
 import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-node.js";
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
@@ -753,11 +754,12 @@ function buildTableRefsById(nodes: RelationalPlanNode[]): Map<number, TableRefer
  * True when the view body's own `WITH` clause defines a data-modifying block — an
  * `insert`/`update`/`delete … returning` CTE. The static shadow of the dynamic write
  * path's `rejectDataModifyingBodyCTE` gate, so `view_info` reports the conservative row
- * for a shape every write through it rejects.
+ * for a shape every write through it rejects. Both read the same predicate
+ * (`firstDataModifyingCte`) so the two cannot drift apart.
  */
 function hasDataModifyingBodyCte(selectAst: AST.QueryExpr): boolean {
 	if (selectAst.type !== 'select' || !selectAst.withClause) return false;
-	return selectAst.withClause.ctes.some(cte => cte.query.type !== 'select' && cte.query.type !== 'values');
+	return firstDataModifyingCte(selectAst.withClause) !== undefined;
 }
 
 /** Record `baseColumn` (lowercased) as defaultable for base table `table`. */
@@ -781,19 +783,20 @@ function addDefaultable(map: Map<number, Set<string>>, table: number, baseColumn
  * caching is a later optimization.
  */
 function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
+	// Data-modifying body `with` block (`with m as (insert … returning …)`): the body plans
+	// fine — and its lineage may look perfectly writable — but every write through the view
+	// is rejected up front (`unsupported-body-cte-dml`, `rejectDataModifyingBodyCTE` in
+	// `planner/building/view-mutation-builder.ts`), so reporting anything but the conservative
+	// row would over-claim. Mirrors the `isJoinBody && !isDecomposableJoinBody` shape gate below;
+	// answered from the AST alone, so it runs BEFORE the body re-plan below rather than after it.
+	if (hasDataModifyingBodyCte(view.selectAst)) return CONSERVATIVE_VIEW_INFO;
+
 	// Home-schema path: the body's unqualified names resolve next to the view.
 	const { plan } = db._buildPlan([view.selectAst as AST.Statement], undefined, db._homeSchemaPath(view.schemaName));
 	const root = plan.getRelations()[0];
 	if (!root) return CONSERVATIVE_VIEW_INFO;
 
 	const nodes = collectBodyNodes(root);
-
-	// Data-modifying body `with` block (`with m as (insert … returning …)`): the body plans
-	// fine — and its lineage may look perfectly writable — but every write through the view
-	// is rejected up front (`unsupported-body-cte-dml`, `rejectDataModifyingBodyCTE` in
-	// `planner/building/view-mutation-builder.ts`), so reporting anything but the conservative
-	// row would over-claim. Mirrors the `isJoinBody && !isDecomposableJoinBody` shape gate below.
-	if (hasDataModifyingBodyCte(view.selectAst)) return CONSERVATIVE_VIEW_INFO;
 
 	// The minimal `MutableViewLike` the set-op insertability probe re-derives the branches from
 	// (the same `{ name, schemaName, selectAst }` shape the write path / `deriveBackingShape` use).

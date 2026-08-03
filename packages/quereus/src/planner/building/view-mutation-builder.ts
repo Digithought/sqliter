@@ -28,6 +28,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { isRelationalNode } from '../nodes/plan-node.js';
 import { parseExpressionString } from '../../parser/index.js';
+import { firstDataModifyingCte } from '../../parser/utils.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { raiseMutationDiagnostic } from '../mutation/mutation-diagnostic.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
@@ -361,15 +362,14 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
  * nothing, so it never reaches here.
  */
 function rejectDataModifyingBodyCTE(view: MutableViewLike, withClause: AST.WithClause): void {
-	for (const cte of withClause.ctes) {
-		if (cte.query.type === 'select' || cte.query.type === 'values') continue;
-		raiseMutationDiagnostic({
-			reason: 'unsupported-body-cte-dml',
-			table: view.name,
-			message: `cannot write through view '${view.name}': its body's WITH clause defines '${cte.name}' as a data-modifying statement (${cte.query.type}), which the write-through lowering cannot carry into the base statement`,
-			suggestion: 'Restrict the view body\'s WITH clause to SELECT / VALUES definitions, or write against the base table directly.',
-		});
-	}
+	const cte = firstDataModifyingCte(withClause);
+	if (!cte) return;
+	raiseMutationDiagnostic({
+		reason: 'unsupported-body-cte-dml',
+		table: view.name,
+		message: `cannot write through view '${view.name}': its body's WITH clause defines '${cte.name}' as a data-modifying statement (${cte.query.type}), which the write-through lowering cannot carry into the base statement`,
+		suggestion: 'Restrict the view body\'s WITH clause to SELECT / VALUES definitions, or write against the base table directly.',
+	});
 }
 
 /**

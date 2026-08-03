@@ -1,6 +1,6 @@
 import { quereusError } from '../common/errors.js';
 import { SqlValue } from '../common/types.js';
-import type { Expression, LiteralExpr } from './ast.js';
+import type { CommonTableExpr, Expression, LiteralExpr, WithClause } from './ast.js';
 
 export function getSyncLiteral(literal: LiteralExpr): SqlValue {
 	if (literal.value instanceof Promise) {
@@ -30,4 +30,19 @@ export function tryFoldLiteral(expr: Expression): SqlValue | undefined {
 		return undefined;
 	}
 	return undefined;
+}
+
+/**
+ * The first **data-modifying** member of a WITH clause — an `insert` / `update` /
+ * `delete … returning` CTE — or undefined when every member is a `select` / `values`.
+ * (`QueryExpr` is exactly those five forms, so the complement is exhaustive; a compound
+ * `union` body is a `select` carrying `compound`.)
+ *
+ * Single source of truth for the two sites that must agree on the shape: the write-through
+ * rejection of a view body whose own WITH clause defines one
+ * (`planner/building/view-mutation-builder.ts`) and `view_info`'s static mirror of that
+ * rejection (`func/builtins/schema.ts`).
+ */
+export function firstDataModifyingCte(withClause: WithClause): CommonTableExpr | undefined {
+	return withClause.ctes.find(cte => cte.query.type !== 'select' && cte.query.type !== 'values');
 }

@@ -323,6 +323,45 @@ describe('a stored view body carries its own `with` clause into write-through lo
 		});
 	});
 
+	// --- precedence: what the carried namespace beats, and what beats it ---
+
+	it("does not let a CALLER `with` clause of the same name displace the body's block", async () => {
+		// The other half of the sibling fix (`bug-caller-cte-shadows-view-body`) meeting this
+		// one: the caller's namespace is REPLACED by the body's, not merged with it, so a
+		// caller `c` holding a different id must not steer the lowered statement.
+		await db.exec('create view main.vc as with c as (select id from b) select id, x from a where id in (select id from c)');
+
+		await db.exec('with c as (select 999 as id) update main.vc set x = 51 where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 51 }]);
+	});
+
+	it("lets a copied fragment's OWN `with` clause shadow a same-named body-local block", async () => {
+		// The carried definitions are the fragment's PARENT namespace, so `buildWithContext`
+		// merges the fragment's own clause on top. Both `c`s select id 1 here, so the write
+		// succeeds either way — the pin is that the fragment-local definition binds at all
+		// rather than colliding with the carried one.
+		await db.exec('create view main.vo as with c as (select id from b) '
+			+ 'select id, x from a where id in (with c as (select 1 as id) select id from c)');
+
+		await db.exec('update main.vo set x = 52 where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 52 }]);
+	});
+
+	it('resolves a body-local block inside a SET-OPERATION body branch', async () => {
+		// The per-branch synthetic view-likes a set-op spine builds inherit the stamp from the
+		// one `mapNestedSelects` call, so a branch predicate reading a body-local block resolves
+		// through the same carry. Only the left branch reads `c`.
+		await db.exec('create table main.a2 (id integer primary key, x integer)');
+		await db.exec('insert into main.a2 values (2, 20)');
+		await db.exec('create view main.vso as with c as (select id from b) '
+			+ "select id, x, 'l' as kind from a where id in (select id from c) "
+			+ "union all select id, x, 'r' as kind from a2");
+
+		await db.exec("update main.vso set x = 53 where kind = 'l' and id = 1");
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 53 }]);
+		expect(await all(db, 'select id, x from main.a2')).to.deep.equal([{ id: 2, x: 20 }]);
+	});
+
 	// --- sharing: two fragments referencing one block get ONE plan node ---
 
 	it('evaluates a block referenced by two fragments once, not once per fragment', async () => {
@@ -390,6 +429,25 @@ describe('a stored view body carries its own `with` clause into write-through lo
 		it('is reported non-writable by view_info()', async () => {
 			expect(await all(db, "select is_insertable_into, is_updatable, is_deletable from view_info() where name = 'vm'"))
 				.to.deep.equal([{ is_insertable_into: 'NO', is_updatable: 'NO', is_deletable: 'NO' }]);
+		});
+
+		it('is rejected even when no copied fragment references it', async () => {
+			// A deliberate narrowing, pinned so it is a decision and not a drift: the guard keys
+			// on the shape of the body, not on whether the lowering actually copies a fragment
+			// that reads the block. Writing through this view used to succeed. `view_info`
+			// answers from the same predicate, so the advertised writability agrees.
+			await db.exec('create view main.vmu as with m as (insert into logt (k) values (2) returning k) '
+				+ 'select id, x from a where x > 0');
+
+			let message = '';
+			try {
+				await db.exec('update main.vmu set x = 1 where id = 1');
+			} catch (e) {
+				message = e instanceof Error ? e.message : String(e);
+			}
+			expect(message).to.match(/cannot write through view 'vmu'/);
+			expect(await all(db, "select is_updatable from view_info() where name = 'vmu'"))
+				.to.deep.equal([{ is_updatable: 'NO' }]);
 		});
 	});
 });

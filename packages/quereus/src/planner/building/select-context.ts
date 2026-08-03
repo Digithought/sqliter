@@ -63,6 +63,15 @@ export function buildWithContext(
  * makes every fragment of one lowering share ONE plan node per definition — two fragments
  * referencing the same block must not build it twice. Absent memo (nothing created one)
  * degrades to per-fragment building rather than failing.
+ *
+ * NOTE: the memoized node is built under the FIRST fragment to reach it, so it captures that
+ * fragment's scope (`buildCommonTableExpr` parents the definition's scope on `ctx.scope`) and
+ * is then reused by fragments with a different one — a `with inverse` put fragment has `new.*`
+ * registered, the body's own `where` does not. Exact today because a stored body's `with`
+ * clause resolved at CREATE time under a scope with no row registrations, so no member can
+ * bind outward. If a stored body ever gains an outward-resolving name (a parameterized view,
+ * a lateral body), key the memo on the fragment's scope too, or clear `scope` in
+ * `storedBodyContext` (which its own NOTE already flags for the same reason).
  */
 export function buildStoredBodyCTEs(
 	ctx: PlanningContext,
