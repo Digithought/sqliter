@@ -156,9 +156,26 @@ replays the one buffer of `RETURNING` rows. The hint is overridden here: `NOT
 MATERIALIZED` on a writing body would license a second write, so correctness
 wins — the same call the recursive branch below makes. (Streaming a write body
 per reference is what produced `UNIQUE constraint failed` on a doubly-referenced
-`INSERT` and a silent double-increment on an `UPDATE`.) An **unreferenced**
-data-modifying CTE is a separate, still-open gap: the planner drops it entirely,
-so the write never runs — SQLite and PostgreSQL both run it.
+`INSERT` and a silent double-increment on an `UPDATE`.) `LIMIT 0` over such a CTE
+still performs the write: the buffer's source drive is detached and runs to
+completion even when every consumer is torn down first. Rollback is unaffected —
+the buffer lives on the `RuntimeContext`, never in the storage layer.
+
+Three known gaps in this area, all still open:
+
+- An **unreferenced** data-modifying CTE is dropped by the planner entirely, so
+  the write never runs — SQLite and PostgreSQL both run it.
+- A data-modifying CTE nested inside a **correlated** subquery writes once per
+  statement execution, not once per outer row, and every outer row sees the first
+  row's `RETURNING` set. This predates the always-buffered rule (the once-per-
+  execution memo for impure subqueries already collapsed it) and the intended
+  semantics are undecided — PostgreSQL rejects a data-modifying CTE anywhere but
+  the top level of a statement rather than defining this case.
+- A data-modifying CTE body cannot see its **sibling** CTEs
+  (`with a as (select …), b as (insert … select from a …) …` fails with
+  `Table 'a' not found`): `buildCommonTableExpr` passes the CTE lookup map to
+  `buildSelectStmt` but not to the `INSERT` / `UPDATE` / `DELETE` builders. Tracked
+  in backlog `bug-dml-cte-body-cannot-see-sibling-cte`.
 
 **Recursive CTEs** run through the working-table machinery (`emitRecursiveCTE`),
 not `emitCTE`, but follow the same buffer-once-replay pattern when referenced

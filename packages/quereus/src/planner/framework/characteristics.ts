@@ -319,6 +319,13 @@ export interface CTECapable extends RelationalPlanNode {
 	readonly isRecursive: boolean;
 	/** Stable identity for this CTE, preserved across optimizer rebuilds. */
 	readonly tableDescriptor: TableDescriptor;
+	/**
+	 * Resolved buffer-once-per-execution decision. On the capability (not just on
+	 * `CTENode`) so a rule rebuilding a CTE carries it over without an `instanceof`
+	 * — dropping it would re-execute the body, which for a data-modifying CTE means
+	 * a second write.
+	 */
+	readonly materialize: boolean;
 	getCTESource(): RelationalPlanNode;
 }
 

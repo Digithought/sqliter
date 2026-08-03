@@ -62,6 +62,16 @@ export function isRecursiveCte(recursive: boolean, cte: AST.CommonTableExpr): bo
 }
 
 /**
+ * True when `cte`'s body writes rows — an `insert` / `update` / `delete` with a
+ * `RETURNING` clause (the parser requires one for a CTE body). Such a CTE is built
+ * with `materialize` already on; see the call site in {@link buildCommonTableExpr}.
+ */
+function isDataModifyingCte(cte: AST.CommonTableExpr): boolean {
+	const t = cte.query.type;
+	return t === 'insert' || t === 'update' || t === 'delete';
+}
+
+/**
  * Builds a plan node for a single Common Table Expression.
  */
 export function buildCommonTableExpr(
@@ -136,26 +146,19 @@ export function buildCommonTableExpr(
 	// materialize it when it is referenced more than once; a synthesized
 	// 'not_materialized' default would read as an explicit user opt-out there.
 	//
-	// A data-modifying body is a different matter: its write must happen exactly
-	// ONCE per statement execution no matter how many times the CTE is named, so
-	// `materialize` is forced on here rather than left to the advisory pass. The
-	// advisory's reference count cannot carry that decision — two mentions with the
-	// same alias share one CTEReferenceNode, so the CTENode sees a single parent and
-	// the gate reads "referenced once" while both mentions still emit and run the
-	// body. The hint is deliberately overridden too: NOT MATERIALIZED on a writing
-	// body would license re-execution, i.e. a second write. Correctness beats the
-	// hint, the same call the recursive-CTE branch makes (see the comment in
-	// MaterializationAdvisory.markCTEMaterialization). Every mention then replays the
-	// one buffer of RETURNING rows.
+	// A data-modifying body is a different matter: its write must happen exactly ONCE
+	// per statement execution no matter how many times the CTE is named, so
+	// `materialize` is forced on here rather than left to the advisory pass, and the
+	// hint is overridden (NOT MATERIALIZED on a writing body would license a second
+	// write). Rationale and the reference-count undercount it works around are in
+	// docs/runtime-caching.md § Shared CTE materialization.
 	//
 	// NOTE: this also takes a data-modifying CTE off the streaming path, so its whole
 	// RETURNING set is held in memory for the statement even when referenced once and
 	// consumed under a LIMIT. Unavoidable for the multi-reference case, and today's
 	// RETURNING sets are small; if a bulk write's RETURNING ever needs to stream,
 	// buffering would have to become conditional on the reference count — which means
-	// first fixing the undercount described above, not relaxing this flag.
-	const isDataModifying = cte.query.type === 'insert' || cte.query.type === 'update' || cte.query.type === 'delete';
-
+	// first fixing that undercount, not relaxing this flag.
 	return new CTENode(
 		ctx.scope,
 		cte.name,
@@ -163,7 +166,7 @@ export function buildCommonTableExpr(
 		query,
 		cte.materializationHint,
 		isRecursive,
-		isDataModifying
+		isDataModifyingCte(cte)
 	);
 }
 

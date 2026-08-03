@@ -157,6 +157,58 @@ with c as (insert into t11 (k) values (1) returning k) select 42 as x;
 select count(*) as cnt from t11;
 → [{"cnt":0}]
 
+-- ===== Two data-modifying CTEs in one WITH clause, each referenced twice =====
+-- Each CTE owns its own buffer key, so neither replays the other's rows.
+
+create table t13a (k integer primary key);
+create table t13b (k integer primary key);
+-- run
+
+with a as (insert into t13a (k) values (1) returning k),
+     b as (insert into t13b (k) values (2) returning k)
+select (select count(*) from a) as a1, (select count(*) from a) as a2,
+       (select count(*) from b) as b1, (select count(*) from b) as b2;
+→ [{"a1":1,"a2":1,"b1":1,"b2":1}]
+
+select k from t13a order by k;
+→ [{"k":1}]
+select k from t13b order by k;
+→ [{"k":2}]
+
+-- ===== Early teardown: LIMIT 0 does NOT skip the write =====
+-- Forced buffering detaches the source drive, so it runs to completion even when
+-- every consumer is torn down first. That is the semantics a write wants: the
+-- statement named the insert, so the insert happens.
+
+create table t14 (k integer primary key);
+-- run
+
+with c as (insert into t14 (k) values (1) returning k) select k from c limit 0;
+→ []
+
+select k from t14 order by k;
+→ [{"k":1}]
+
+-- ===== ROLLBACK still undoes the buffered write =====
+-- The buffer is per statement execution and lives in the runtime context, not in the
+-- storage layer — it never shields a write from transaction rollback.
+
+create table t15 (k integer primary key);
+-- run
+
+begin;
+-- run
+
+with c as (insert into t15 (k) values (1) returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+rollback;
+-- run
+
+select count(*) as cnt from t15;
+→ [{"cnt":0}]
+
 -- ===== Control: a plain SELECT-bodied CTE is untouched =====
 -- Re-evaluating a read-only body is a performance question, not a correctness one;
 -- the row-set answer is identical either way. Pinned so the DML rule did not leak.
@@ -183,4 +235,8 @@ drop table t9;
 drop table t10;
 drop table t11;
 drop table t12;
+drop table t13a;
+drop table t13b;
+drop table t14;
+drop table t15;
 -- run

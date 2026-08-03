@@ -60,10 +60,11 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 		public readonly materializationHint: 'materialized' | 'not_materialized' | undefined,
 		public readonly isRecursive: boolean = false,
 		/**
-		 * Resolved materialization decision for emission, set by the
-		 * materialization-advisory pass: when true, emitCTE buffers this CTE's
-		 * rows once per statement execution and every reference reads that one
-		 * shared buffer (multi-referenced or MATERIALIZED-hinted CTEs).
+		 * Resolved materialization decision for emission: when true, emitCTE buffers
+		 * this CTE's rows once per statement execution and every reference reads that
+		 * one shared buffer. Set at build time for a data-modifying body (whose write
+		 * must run exactly once), and by the materialization-advisory pass for a
+		 * multi-referenced or MATERIALIZED-hinted read-only body.
 		 */
 		public readonly materialize: boolean = false,
 		tableDescriptor?: TableDescriptor
