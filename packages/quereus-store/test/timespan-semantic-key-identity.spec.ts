@@ -180,6 +180,47 @@ describe('TIMESPAN semantic key identity (store)', () => {
 			expect(await planOps(db, good('t'))).to.match(SEEK);
 		});
 
+		it('gates each composite-PK probe against ITS OWN column when PK order differs from column order', async () => {
+			// `id` is declared first but the PK is `(d, id)`, so PK position 0 addresses
+			// column index 1. The gate walks PK POSITIONS and must look each probe's type up
+			// through `primaryKeyDefinition` — pairing position 0 with column 0 instead
+			// would test the TIMESPAN probe against `id`'s type (admitting anything) and the
+			// integer probe against TIMESPAN's (declining everything), losing the seek here.
+			await db.exec(`create table t (id integer, d timespan, primary key (d, id)) using store`);
+			await db.exec(`create table m (id integer, d timespan, primary key (d, id))`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, 'PT1H'), (2, 'PT2H')`);
+			}
+			const good = (tbl: string) => `select id from ${tbl} where d = 'PT60M' and id = 1`;
+			expect(await column(db, good('t'), 'id')).to.deep.equal([1]);
+			expect(await column(db, good('t'), 'id')).to.deep.equal(await column(db, good('m'), 'id'));
+			expect(await planOps(db, good('t')), 'the mis-paired gate would decline this').to.match(SEEK);
+
+			// And the unfaithful member is still caught in its rotated position.
+			const bad = (tbl: string) => `select id from ${tbl} where d = 5 and id = 1`;
+			expect(await column(db, bad('t'), 'id')).to.deep.equal(await column(db, bad('m'), 'id'));
+		});
+
+		it('gates a PARAMETER-bound probe, which no literal folding ever sees', async () => {
+			// Every point-arm test above probes with a literal, which the engine may fold or
+			// re-type before the module is asked. A bound parameter arrives as a raw
+			// `SqlValue` in `filterInfo.args` — the shape the gate's "nothing coerces a
+			// query-supplied probe to the declared type" claim is actually about.
+			await db.exec(`create table t (d timespan primary key, v text) using store`);
+			await db.exec(`create table m (d timespan primary key, v text)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('PT1H', 'a'), ('PT30M', 'b')`);
+			}
+			const rows = async (tbl: string, probe: SqlValue) =>
+				(await asyncIterableToArray(db.eval(`select v from ${tbl} where d = ?`, [probe])))
+					.map(r => r.v as SqlValue);
+
+			expect(await rows('t', 'PT60M'), 'a faithful bound probe seeks across spellings').to.deep.equal(['a']);
+			for (const probe of ['PT60M', 5, 'not a duration', null] as SqlValue[]) {
+				expect(await rows('t', probe), String(probe)).to.deep.equal(await rows('m', probe));
+			}
+		});
+
 		it('seeks a re-spelled EQ over a TIMESPAN-led SECONDARY index', async () => {
 			// The index EQ prefix is re-opened too, and its window addresses the
 			// TRANSFORMED bytes (`indexKeyTransforms`) the index store actually holds —

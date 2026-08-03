@@ -121,17 +121,18 @@ export function jsonStructuralKey(value: SqlValue): SqlValue {
 
 /**
  * True when `value` has a faithful position in {@link jsonStructuralKey}'s byte order —
- * the probe-side gate a re-opened range window consults before encoding a seek bound
- * (`semanticProbeIsKeyFaithful` in pk-key-resolution.ts). Stored values never need this
- * check: they are `JSON_TYPE.parse` outputs, which contain neither node kind declined
- * here. Only a QUERY-supplied bound can carry one, and nothing coerces a bound to the
+ * the probe-side gate every re-opened seek window (range bound AND equality probe)
+ * consults before encoding (`semanticProbeIsKeyFaithful` in pk-key-resolution.ts, whose
+ * doc states how each arm degrades on `false`). Stored values never need this check:
+ * they are `JSON_TYPE.parse` outputs, which contain neither node kind declined here.
+ * Only a QUERY-supplied probe can carry one, and nothing coerces a probe to the
  * column's declared type.
  *
  * Declines exactly two node kinds, anywhere in the value:
  *  - a `Uint8Array` — {@link pushJsonNode} raises `INTERNAL` for one, while the residual
  *    comparator (`createTypedComparator`) happily ranks it by storage class (BLOB,
- *    between TEXT and OBJECT). Declining lets the window widen instead, so
- *    `where j > x'01'` returns its rows rather than erroring.
+ *    between TEXT and OBJECT). Declining degrades the arm instead of erroring, so
+ *    `where j > x'01'` returns its rows and `where j = x'01'` its (empty) row set.
  *  - a `bigint` — the encoder folds it to its nearest double (lossy above 2^53), while
  *    `deepCompareJson`'s `jsonTypeOrder` drops a bigint into its `default:` arm at the
  *    OBJECT rank, so the bytes and the comparator place it in two different regions

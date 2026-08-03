@@ -1202,7 +1202,7 @@ cannot honor drops the residual `Filter` and returns wrong rows, so the two must
 together.
 
 - NOTE: the two largest `StoreTable` layers have both passed the ~1,000-line seam
-  (`store-table-scan.ts` 1,121, `store-table-base.ts` 1,033 — `wc -l`, 2026-08). Splitting
+  (`store-table-scan.ts` 1,113, `store-table-base.ts` 1,033 — `wc -l`, 2026-08). Splitting
   them is backlog `debt-split-store-table-scan-and-base`: the scan layer's natural seam is
   the multi-seek group (`decodeMultiSeekTuples` / `orderTupleValues` / `scanMultiSeek` /
   `scanMultiSeekPrimary`), the base's is the statistics block. Until it lands, prefer

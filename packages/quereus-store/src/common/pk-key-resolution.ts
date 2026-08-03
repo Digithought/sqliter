@@ -311,11 +311,12 @@ export function semanticKeyOrderIsFaithful(type: LogicalType | undefined): boole
 
 /**
  * True when `probe`'s key bytes sit at the position the type's `compare` gives it
- * relative to every STORED value — the per-VALUE precondition a re-opened range window
- * needs on top of {@link semanticKeyOrderIsFaithful}, which is a claim about stored
- * values only. A seek bound comes from the query, and nothing coerces it to the
- * column's declared type, so an unfaithful probe is reachable where an unfaithful
- * stored value is not. Two concrete TIMESPAN under-fetches motivate the gate:
+ * relative to every STORED value — the per-VALUE precondition every re-opened seek
+ * window (range bound AND equality probe) needs on top of
+ * {@link semanticKeyOrderIsFaithful}, which is a claim about stored values only. A probe
+ * comes from the query, and nothing coerces it to the column's declared type, so an
+ * unfaithful probe is reachable where an unfaithful stored value is not. Two concrete
+ * TIMESPAN under-fetches motivate the gate:
  *
  *  - `where d > 5`: `createTypedComparator` short-circuits on the storage-class
  *    mismatch before `TIMESPAN.compare` runs, so every stored (TEXT-class) value ranks
@@ -327,8 +328,19 @@ export function semanticKeyOrderIsFaithful(type: LogicalType | undefined): boole
  *    encodes TEXT-tagged and sorts above every NUMERIC-tagged stored key. Different
  *    position, rows lost.
  *
- * Callers SKIP an unfaithful bound (widening the window to the pre-ticket full scan)
- * rather than declining the whole access — see `StoreTableScan.buildPKRangeBounds`.
+ * THE canonical statement of how each arm degrades on `false` — the call sites point
+ * here rather than restating it. A window may only ever be WIDENED, never narrowed, and
+ * the type-aware residual (`StoreTableScan.matchesFilters`) decides rows in every case:
+ *
+ *  - a RANGE bound is SKIPPED (`buildPKRangeBounds`, `buildIndexRangeBounds`) — dropping
+ *    one bound only widens the window, worst case back to the full scan.
+ *  - a full-PK EQUALITY declines the WHOLE point arm (`analyzePKAccess`) — a point window
+ *    is a single byte position, so it cannot be widened, only under-fetched.
+ *  - a secondary index's EQ PREFIX stops SHORT at that column (`analyzeIndexAccess`) — a
+ *    window over the columns before it is a strict superset.
+ *  - an IN-list MULTI-SEEK has none of the three available (its merged windows are the
+ *    whole access) and so never reaches this gate: it is declined per SCHEMA upstream.
+ *
  * The TIMESPAN arm calls the COLUMN's own `groupKey`, not the imported singleton's,
  * for the dual-module-instance reason {@link storeSemanticKeyTransform} documents.
  * A semantic-ordering type outside the {@link semanticKeyOrderIsFaithful} allow-list

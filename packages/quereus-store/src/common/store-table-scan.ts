@@ -176,25 +176,22 @@ export abstract class StoreTableScan extends StoreTableBase {
 		}
 
 		// A full-PK equality is a point window, provided every probe has a faithful byte
-		// position under its column's type ({@link semanticProbeIsKeyFaithful} — nothing
-		// coerces a query-supplied probe to the declared type).
+		// position under its column's type — an unfaithful one declines the WHOLE arm here
+		// rather than widening ({@link semanticProbeIsKeyFaithful} states why, per arm).
 		//
-		// The asymmetry with {@link buildPKRangeBounds} is the non-obvious part: a range
-		// bound that fails the gate is SKIPPED, which only widens the window. An EQ window
-		// is a single byte position and cannot be widened, so an unfaithful probe must
-		// decline the WHOLE point arm and fall through to `{ type: 'scan' }`, where
-		// {@link matchesFilters} re-checks under the type's own comparator. Declining at
-		// runtime is safe even though `computeBestAccessPlan`'s full-PK-equality arm
-		// (store-module-access-plan.ts) already claimed the filters handled and the engine
-		// dropped the residual Filter: every scan arm applies `matchesFilters`, which ANDs
-		// each pushed constraint under the column's real comparator. The plan's claim is
-		// about which FILTERS the module honours, not about which physical arm serves them.
+		// Declining at RUNTIME is safe even though `computeBestAccessPlan`'s
+		// full-PK-equality arm (store-module-access-plan.ts) already claimed the filters
+		// handled and the engine dropped the residual Filter: falling through to
+		// `{ type: 'scan' }` still applies {@link matchesFilters}, which ANDs each pushed
+		// constraint under the column's real comparator. The plan's claim is about which
+		// FILTERS the module honours, not about which physical arm serves them.
 		//
 		// NOTE: for a TIMESPAN member the gate parses the probe (`groupKey`) and
-		// `encodeDataKey`'s transform then parses it again — two duration parses per point
-		// lookup, once per QUERY rather than per row. Fine now; if a point-lookup-heavy
-		// TIMESPAN-keyed workload ever shows it, have the gate hand its parsed value back
-		// so the encode can reuse it.
+		// `encodeDataKey`'s transform then parses it again — two duration parses per SEEK,
+		// not per scanned row. `query()` runs once per seek, so a nested-loop join driving
+		// N point lookups pays it N times. Fine now; if a point-lookup-heavy TIMESPAN-keyed
+		// workload ever shows it, have the gate hand its parsed value back so the encode
+		// can reuse it.
 		if (allEq && eqValues.every((v, i) =>
 			semanticProbeIsKeyFaithful(schema.columns[pkColumns[i]]?.logicalType, v))) {
 			return { type: 'point', values: eqValues };
@@ -257,11 +254,8 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * only WIDENS the window (worst case to the pre-existing full scan), and the plan
 	 * claimed the range handled from the schema alone, so the predicate the engine's
 	 * dropped Filter carried is reproduced by {@link matchesFilters} under the type's
-	 * own compare. An EQUALITY window has no such degradation — a widened point window
-	 * is still byte-EQ and under-fetches — which is why {@link analyzePKAccess}'s point
-	 * arm DECLINES on an unfaithful probe rather than skipping it, and why
-	 * {@link analyzeIndexAccess} stops its EQ prefix SHORT (a shorter prefix window is a
-	 * superset; a widened equality is not).
+	 * own compare. The EQUALITY arms cannot widen this way and degrade differently —
+	 * see {@link semanticProbeIsKeyFaithful}'s per-arm table.
 	 *
 	 * NOTE: a range window over a text PK column is sound only when the column's key
 	 * normalizer is ORDER-preserving with respect to its comparator — i.e. the comparator
@@ -384,12 +378,10 @@ export abstract class StoreTableScan extends StoreTableBase {
 		// Contiguous leading-prefix EQ → point/prefix window. A member whose PROBE has no
 		// faithful byte position under its logical type ({@link semanticProbeIsKeyFaithful}
 		// — a numeric or unparseable TIMESPAN probe, a blob/bigint JSON probe) STOPS the
-		// prefix here rather than declining the whole access: a window over the columns
-		// before it is a strict SUPERSET of the longer one, and {@link matchesFilters}
-		// re-checks the dropped column under the type's own compare. That escape is exactly
-		// what the PK point arm lacks (a full-PK window cannot be shortened), which is why
-		// {@link analyzePKAccess} declines outright instead. Stopping at position 0 leaves
-		// `eqValues` empty and falls through to the range arm below.
+		// prefix here, the widening that arm can afford; the shorter window is a strict
+		// SUPERSET and {@link matchesFilters} re-checks the dropped column under the type's
+		// own compare. Stopping at position 0 leaves `eqValues` empty and falls through to
+		// the range arm below.
 		const eqValues: SqlValue[] = [];
 		for (let i = 0; i < indexCols.length; i++) {
 			const eq = filterInfo.constraints?.find(
