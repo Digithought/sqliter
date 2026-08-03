@@ -128,9 +128,11 @@ the same rows the matching `select` returns.
   resolution knob goes.
 - Whatever carries the "which path do I resolve on" answer has to survive into
   the analysis the same way the plan-time answer does — the landed fix marks the
-  AST node (`AST.SelectStmt.storedHomeSchema`) rather than swapping the context,
-  because the lowered statement mixes caller-authored and definition-derived
-  fragments in one tree. The analysis walks that same tree, so the marker is
-  already there to read.
+  AST node (`AST.SelectStmt.storedBodyEnv`, an `AST.StoredBodyEnv` carrying the
+  home schema, the body's declared `with schema` path, and the body's own leading
+  `with` clause) rather than swapping the context, because the lowered statement
+  mixes caller-authored and definition-derived fragments in one tree. The analysis
+  walks that same tree, so the whole naming environment is already there to read
+  off one field.
 - Worth checking whether the same fixed-schema lookup hurts the multi-source
   (join-body) analogue in `mutation/multi-source.ts`, which shares the descent.

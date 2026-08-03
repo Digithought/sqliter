@@ -729,6 +729,33 @@ describe('a view definition carries its declared `with schema` path into write-t
 			.to.deep.equal([{ id: 1, x: 48 }, { id: 2, x: 20 }]);
 	});
 
+	it("resolves a sub-select in a view column's defining expression", async () => {
+		// A third copy channel: naming a computed column in the user `where` pulls that
+		// column's defining expression into the base UPDATE.
+		await db.exec('create view main.wc as select id, x, (select count(*) from wt) as n from wa '
+			+ 'with schema "temp", main');
+
+		await db.exec('update main.wc set x = 48 where n = 1 and id = 1');
+		expect(await all(db, 'select id, x from main.wa order by id'))
+			.to.deep.equal([{ id: 1, x: 48 }, { id: 2, x: 20 }]);
+	});
+
+	it('resolves a sub-select in an authored `with inverse` put expression', async () => {
+		// The fourth copy channel (`cloneInverseClause`): the put expression is what the
+		// lowering plans for an update that writes the computed column.
+		await db.exec('create table temp.wk (k integer primary key)');
+		await db.exec('insert into temp.wk values (5)');
+		await db.exec('create view main.wi as select id, x + (select max(k) from wk) as y '
+			+ 'with inverse (x = new.y - (select max(k) from wk)) from wa with schema "temp", main');
+
+		expect(await all(db, 'select id, y from main.wi order by id'), 'the read already worked')
+			.to.deep.equal([{ id: 1, y: 15 }, { id: 2, y: 25 }]);
+
+		await db.exec('update main.wi set y = 20 where id = 1');
+		expect(await all(db, 'select id, x from main.wa order by id'))
+			.to.deep.equal([{ id: 1, x: 15 }, { id: 2, x: 20 }]);
+	});
+
 	it("lets a fragment sub-select's OWN `with schema` outrank the carried path", async () => {
 		// Precedence guard. `wt` exists in both schemas with different rows; the definition
 		// declares temp-first, but the sub-select names main explicitly, so it must bind

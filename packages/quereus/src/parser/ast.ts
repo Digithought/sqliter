@@ -216,7 +216,8 @@ export interface SelectStmt extends AstNode {
  * "which naming environment does this piece belong to" cannot ride the context — it rides
  * the AST node. `buildViewMutation` stamps this object onto every nested sub-select of the
  * cloned body (via `mapNestedSelects`, `planner/mutation/scope-transform.ts`) and
- * `buildSelectStmt` (`planner/building/select.ts`) consumes it.
+ * `enterStoredBodyEnv` (`planner/building/select-context.ts`), called at the top of
+ * `buildSelectStmt`, consumes it.
  *
  * The three pieces are always stamped together and consumed together, in a fixed ORDER
  * (home swap → declared path → carried `with` clause) — hence one object rather than three

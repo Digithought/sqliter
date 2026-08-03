@@ -91,6 +91,15 @@ The same asymmetry should be checked for the flag-less predicate-honest set-op p
 builds its legs from `shape.legSelects` in `buildFlaglessLeg` (same file) — legs 2..n there
 come from the same suppressed-clause operands.
 
+One tempting shortcut does **not** work. The right operand node does carry a stamped
+`storedBodyEnv` (whose `schemaPath` is the declared path), so it looks like the fragment
+marker could simply be honoured even when the at-home guard says "no swap needed". It
+cannot: that guard is also what stops a sub-select nested inside a fragment that has its
+*own* `with schema` clause from having the body's declared path re-imposed over the
+enclosing fragment's — which is the read path's precedence, and is pinned by
+`lets a fragment sub-select's OWN 'with schema' outrank the carried path` in the same spec.
+The branch **body**'s own path is the thing to fix.
+
 ## Expected behavior
 
 Every leg of a set-operation view resolves its unqualified names on the definition's declared
