@@ -389,6 +389,46 @@ describe('key-set-seek plan shape', () => {
 			expect(await orderedColumn(sql, 'w')).to.deep.equal([5, 7, 9]);
 		});
 
+		it('the ordering claim survives the rebuilt chain: a Filter between the join and the leaf', async () => {
+			// `rebuildChain` re-roots the peeled Filter ABOVE the new node, so the
+			// absorbed `order by pk` is only served if the claim propagates through
+			// that Filter. Without it a Sort would reappear here.
+			await db.exec('insert into big (pk, v, w) values (1, 0, 5), (2, 0, 4), (3, 0, 3), (4, 0, 2)');
+			await db.exec('insert into small values (2), (3), (4)');
+			const sql = 'select pk, w from big where pk in (select id from small) and w > 2 order by pk';
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin)).to.have.lengthOf(1);
+			expect(collectNodes(plan, isFilter), 'the peeled Filter is re-rooted above the node').to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'no Sort — the claim reaches the top through the Filter').to.have.lengthOf(0);
+			expect(await orderedColumn(sql, 'pk')).to.deep.equal([2, 3]);
+		});
+
+		it('a LIMIT reading the claimed order gets the first rows, not an arbitrary K', async () => {
+			await db.exec('insert into big (pk, v, w) values (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)');
+			await db.exec('insert into small values (4), (2), (3)');
+			const sql = 'select pk from big where pk in (select id from small) order by pk limit 2';
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin)).to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'the LIMIT rides the claim, not a Sort').to.have.lengthOf(0);
+			expect(await orderedColumn(sql, 'pk'), 'the two SMALLEST matching keys').to.deep.equal([2, 3]);
+		});
+
+		it('order by pk DESC over an ASCENDING pk keeps its Sort', async () => {
+			// The memory backend does not offer a reversed primary-key walk for this
+			// shape, so the ORDER BY is never absorbed and the leaf walks ascending:
+			// the rewrite fires and the Sort above must survive to flip the order.
+			// (A leaf that DID walk reversed is rejected by `seekPreservesTargetOrder`
+			// — its advertised direction disagrees with the key column's; that clause
+			// is pinned directly in the predicate's own describe block below.)
+			await db.exec('insert into big (pk, v, w) values (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)');
+			await db.exec('insert into small values (2), (3), (4)');
+			const sql = 'select pk from big where pk in (select id from small) order by pk desc';
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin)).to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'the Sort must survive the ascending claim').to.have.lengthOf(1);
+			expect(await orderedColumn(sql, 'pk')).to.deep.equal([4, 3, 2]);
+		});
+
 		it('declines a composite primary key — the merge join survives', async () => {
 			// The memory module declines a runtime-set IN on the leading column of a
 			// composite key, so the pushdown never plans. If a module change ever

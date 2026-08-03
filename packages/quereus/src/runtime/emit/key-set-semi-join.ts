@@ -58,9 +58,11 @@ export function stampMultiSeek(
 			aConstraint: constraints.map(c => c.constraint),
 			aConstraintUsage: constraints.map(c => ({ argvIndex: c.argvIndex, omit: true })),
 			estimatedRows: BigInt(keys.length),
-			// An ordering-only leaf stamps orderByConsumed vacuously (nothing above
-			// the replaced hash join consumed its order); the multi-seek is not an
-			// ordering plan, so report false — matching the literal-IN arm's shape.
+			// The multi-seek is not an ordering plan, so report false — matching the
+			// literal-IN arm's shape. This is a plan-shape field no module runtime
+			// reads (direction rides `idxStr` / `accessPath`), so clearing it does
+			// not disturb the walk order the node may be claiming above: the seek
+			// emits in the scanned structure's key order either way.
 			orderByConsumed: false,
 		},
 	};

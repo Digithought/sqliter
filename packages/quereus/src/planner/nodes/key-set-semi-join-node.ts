@@ -13,9 +13,10 @@ import type { AccessPath } from '../../vtab/index-descriptor.js';
 /**
  * Admissible target leaves: a plain sequential scan, or an ordering-only index
  * walk (`plan=0`, no constraints) — which reads every row exactly like a full
- * scan and differs only in emission order, a property nothing above the hash
- * semi join this node replaces could have depended on (see
- * `rule-key-set-seek`'s leaf gate). Memory-vtab tables always advertise a
+ * scan and differs only in emission order. Whether that emission order is
+ * something an ancestor may depend on is settled by
+ * {@link seekPreservesTargetOrder}, not by the leaf shape (see
+ * `rule-key-set-seek`'s gates). Memory-vtab tables always advertise a
  * primary-key ordering, so their bare scans are ordering-only IndexScans —
  * admitting only SeqScan would make this node unreachable there.
  */
@@ -94,16 +95,16 @@ export interface KeySetPushdown {
 /**
  * Physical semi join that materializes the key-source side into a set once, then
  * streams the target and probes each row against the set — exactly what the hash
- * semi join it replaces does — and additionally, when the materialized distinct
+ * semi join arm it replaces does — and additionally, when the materialized distinct
  * key count is small enough (≤ min(maxKeys, breakEvenKeys)), rewrites the target
  * leaf's `FilterInfo` at runtime into an ordinary single-column `plan=5`
  * multi-seek so the storage backend reads only the matching rows.
  *
  * The probe never goes away: pushdown only changes how many rows the target
  * emits. An over-fetching seek is trimmed by the probe; a skipped pushdown
- * degrades to the hash semi join. The plan-time gates in `rule-key-set-seek`
- * exist to make an under-fetch (rows the seek fails to return, which the probe
- * cannot resurrect) impossible.
+ * degrades to that unconditional probe over the untouched walk. The plan-time
+ * gates in `rule-key-set-seek` exist to make an under-fetch (rows the seek fails
+ * to return, which the probe cannot resurrect) impossible.
  */
 export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode {
 	override readonly nodeType = PlanNodeType.KeySetSemiJoin;
@@ -127,6 +128,13 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 		// set, probe every target row). The saving is in the *target's* row
 		// count, which is not modelled at plan time — the seek-vs-scan decision
 		// is deferred to runtime by design; do not invent a discount here.
+		// NOTE: on the MERGE arm this also charges more than the MergeJoinNode it
+		// replaces (0.8·keys + 0.4·target vs 0.3·(target+keys) — bounded at ~1.33×
+		// for a large target), because the runtime work really is build-then-probe,
+		// not a co-walk. Nothing behind PostOptimization's `impl` phase makes a
+		// keep-or-drop decision on this number today; if a cost reader back there
+		// (cache injection, the materialization advisory) ever starts flipping on
+		// the delta, model the two arms separately rather than shading this one.
 		super(scope, hashJoinCost(keyRows, targetRows));
 	}
 

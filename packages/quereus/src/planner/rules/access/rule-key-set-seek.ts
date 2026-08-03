@@ -25,7 +25,7 @@
  * correctness. Every gate below exists to make an UNDER-fetch (rows the seek
  * fails to return, which the probe cannot resurrect) impossible.
  *
- * The rule declines (returns null, keeping the hash semi join) on all of:
+ * The rule declines (returns null, keeping the join it arrived as) on all of:
  *   - join type ≠ semi, >1 equi-pair, or a residual condition
  *   - a correlated, non-deterministic, or side-effect-bearing key source
  *   - side effects anywhere in the left chain
@@ -68,12 +68,16 @@
  *     so nothing above a hash join can have depended on an ordering claim —
  *     that asymmetry is the whole reason this gate is merge-only.)
  *   - the key source's PHYSICAL row estimate, when present, must not exceed
- *     min(maxKeys, breakEvenKeys) — the exact expression the runtime's `push`
+ *     min(maxKeys, breakEvenKeys) — the same expression the runtime's `push`
  *     decision uses. A merge semi join streams both sides; this node drains
- *     the key source into a Set before opening the target, so when the seek
- *     provably cannot fire the rewrite is pure loss (the same scan, plus a set
- *     the merge join never built). The hash arm has no such gate because the
- *     hash join it replaces already built that set.
+ *     the key source into a Set before opening the target, so a rewrite whose
+ *     seek then never fires is pure loss (the same scan, plus a set the merge
+ *     join never built). The gate is a heuristic in BOTH directions: the
+ *     estimate is advisory, and it counts ROWS while the runtime counts
+ *     DISTINCT non-null keys, so a duplicate-heavy key source can be declined
+ *     here and still have seeked. Both errors cost an optimization, never a
+ *     row. The hash arm has no such gate because the hash join it replaces
+ *     already built that set.
  *
  * NOTE: the three `getBestAccessPlan` probes run on every qualifying semi
  * join optimization, uncached. Cheap for both shipped modules; if a third-party
@@ -152,12 +156,11 @@ function admitJoin(node: BloomJoinNode | MergeJoinNode): boolean {
  *
  * It must read every row with nothing pushed into it: a plain full scan, or an
  * ordering-only index walk (plan=0) — which reads every row exactly like a full
- * scan and differs only in emission order. A leaf already
- * carrying pushed constraints had its residual Filter dropped on the module's
- * promise to enforce them; replacing its FilterInfo with our multi-seek would
- * silently drop those predicates
- * (backlog/feat-key-set-seek-over-pushed-constraints). A pushed limit / offset
- * is likewise a directive the multi-seek would not honor.
+ * scan and differs only in emission order. A leaf already carrying pushed
+ * constraints had its residual Filter dropped on the module's promise to enforce
+ * them; replacing its FilterInfo with our multi-seek would silently drop those
+ * predicates (backlog/feat-key-set-seek-over-pushed-constraints). A pushed
+ * limit / offset is likewise a directive the multi-seek would not honor.
  *
  * Deliberately structural only: the `orderingLoadBearing` decline needs the
  * pushdown (an absorbed Sort is fine when `seekPreservesTargetOrder` holds),
@@ -277,7 +280,7 @@ function claimedIndex(plan: BestAccessPlanResult, seekCol: number): string | nul
  *
  * These requests are the ENGINE's, not the user's: a module that answers one
  * with a plan `validateAccessPlan` rejects gets logged and declined, leaving the
- * hash semi join — the same disposition as every other gate. Failing the query
+ * incoming semi join — the same disposition as every other gate. Failing the query
  * instead would let a synthesized probe break a predicate that ran fine before.
  */
 function probeModuleCosts(
@@ -452,16 +455,18 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		}
 		// Merge-arm-only gate 2: do not trade a streaming operator for an
 		// unbounded materialization. When the key source's row estimate already
-		// exceeds the runtime's own seek threshold — the exact expression
-		// `emitKeySetSemiJoin` uses for its `push` decision — the pushdown
-		// provably cannot fire, so the rewrite is pure loss: the same scan the
-		// merge join did, plus a probe Set the merge join never built. Absent
-		// estimate ⇒ proceed, the same posture the rest of the rule takes
-		// toward advisory numbers. The PHYSICAL estimate is read because the
-		// logical `estimatedRows` getter reads `undefined` through a physical
-		// access node. NOTE: inert on the memory backend today (its row
-		// estimate for a freshly-populated table reads 0) — this gate exists
-		// for modules that report real cardinality.
+		// exceeds the runtime's own seek threshold — the same expression
+		// `emitKeySetSemiJoin` uses for its `push` decision — the seek is very
+		// unlikely to fire and the rewrite is then pure loss: the same scan the
+		// merge join did, plus a probe Set the merge join never built. Heuristic
+		// in both directions (the estimate is advisory, and it counts ROWS where
+		// the runtime counts DISTINCT non-null keys), so it can only cost an
+		// optimization, never a row. Absent estimate ⇒ proceed, the same posture
+		// the rest of the rule takes toward advisory numbers. The PHYSICAL
+		// estimate is read because the logical `estimatedRows` getter reads
+		// `undefined` through a physical access node. NOTE: inert on the memory
+		// backend today (its row estimate for a freshly-populated table reads 0)
+		// — this gate exists for modules that report real cardinality.
 		const keyRows = node.right.physical.estimatedRows;
 		if (keyRows !== undefined && keyRows > Math.min(pushdown.maxKeys, pushdown.breakEvenKeys)) {
 			log('decline: key source estimate %d exceeds the seek threshold min(%d, %d)',
