@@ -222,7 +222,7 @@ Because row-time maintenance keeps the backing consistent continuously, `REFRESH
 drop materialized view [if exists] mv;
 ```
 
-Drops the maintained table — one record, one drop: the table, its rows, and its derivation go together (maintenance is detached, covering links are unlinked, and `table_removed` + `materialized_view_removed` both fire so persisted catalogs forget both entries). Because the MV *is* a table, `drop table mv` performs the **same** whole-record drop. `DROP VIEW` rejects a materialized-view name and redirects to `DROP MATERIALIZED VIEW`; conversely `DROP MATERIALIZED VIEW` on a plain table/view name redirects to the right statement.
+Drops the maintained table — one record, one drop: the table, its rows, and its derivation go together (maintenance is detached, covering links are unlinked, and `table_removed` + `materialized_view_removed` both fire so persisted catalogs forget both entries). Because the MV *is* a table, `drop table mv` performs the **same** whole-record drop. `DROP VIEW` rejects a materialized-view name and redirects to `DROP MATERIALIZED VIEW`; conversely `DROP MATERIALIZED VIEW` on a plain table/view name redirects to the right statement. Either spelling is **refused** while an assertion's stored CHECK body still names the MV — see [sql-ddl.md § 2.6.1](sql-ddl.md#261-createdrop-assertion-global-integrity-constraints).
 
 
 ## Maintenance strategy

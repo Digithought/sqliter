@@ -22,6 +22,7 @@ drop view [if exists] view_name;
 - An optional column list renames the body's output columns (arity must match).
 - `with defaults (col = expr, ...)` is a trailing clause of the **core select** (it binds to the whole query expression after `limit`/`offset`, before `with tags`): it declares per-column **omitted-insert defaults** for write-through — typically for a base column the view projects away (see [§2.9](#29-updatable-views)). Column names must be distinct; each `expr` must be self-contained (it cannot reference the inserted row's columns); the target is resolved (and a typo rejected) at write time, not at create — the base-column lineage it resolves against is only assembled when the view is an actual write target.
 - `with tags (...)` attaches metadata (informational only — reserved `quereus.*` keys are validated, but none carries view behavior; see [§2.9](#29-updatable-views)).
+- `drop view` is **refused** while an assertion's stored CHECK body still names the view (`if exists` does not weaken that — it governs absence, not dependency); drop or redefine the assertion first. See [sql-ddl.md § 2.6.1](sql-ddl.md#261-createdrop-assertion-global-integrity-constraints).
 
 **Examples:**
 ```sql

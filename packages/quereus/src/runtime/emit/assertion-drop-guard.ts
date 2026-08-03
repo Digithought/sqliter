@@ -57,8 +57,11 @@ export function assertNoAssertionDependsOn(
 		const check = assertion.checkExpression;
 		if (!check) continue;
 		if (!tableReferencedInAst(check, objectName, schemaName)) continue;
+		// `schema.name` rather than the caller's `schemaName`: DROP emitters pass the
+		// name as the user typed it, so `drop table MAIN.t` would otherwise report a
+		// schema spelling that appears nowhere in the catalog.
 		throw new QuereusError(
-			`cannot drop ${objectKind} '${schemaName}.${objectName}': assertion '${assertion.name}' still refers to it — drop or redefine the assertion first`,
+			`cannot drop ${objectKind} '${schema.name}.${objectName}': assertion '${assertion.name}' still refers to it — drop or redefine the assertion first`,
 			StatusCode.CONSTRAINT,
 		);
 	}

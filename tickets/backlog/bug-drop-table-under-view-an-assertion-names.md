@@ -1,14 +1,21 @@
 ---
-description: Dropping a table that a view is built on is allowed even when a database-wide integrity rule uses that view, and afterwards every write to the whole database fails with an error that mentions neither the rule nor the view.
+description: Dropping a table is still allowed in two cases where a database-wide integrity rule depends on it — when the rule reaches the table through a view, and when the rule lives in a different schema — and afterwards every write to the whole database fails with an error that mentions the rule nowhere.
 files:
   - packages/quereus/src/runtime/emit/assertion-drop-guard.ts   # the guard; only sees direct references today
   - packages/quereus/src/runtime/emit/drop-table.ts             # call site
   - packages/quereus/src/schema/rename-rewriter.ts              # tableReferencedInAst — the "refers to" walk
-  - packages/quereus/test/logic/95-assertions.sqllogic          # where the direct-reference coverage lives
+  - packages/quereus/src/core/database.ts                       # _homeSchemaPath — what arm 2's bare name resolves against
+  - packages/quereus/test/logic/95-assertions.sqllogic          # direct-reference coverage + the "same-schema scoping" case arm 2 widens
 repro: verified
 ---
 
-# A view sitting between an assertion and a table defeats the drop guard
+# The assertion drop guard misses two kinds of reference
+
+Two arms, both resolving at `assertNoAssertionDependsOn`: the guard does not
+follow a reference **through a view**, and it does not look at assertions
+**living in another schema**.
+
+## Arm 1 — a view sitting between an assertion and a table
 
 `bug-assertion-body-can-name-missing-table` made `DROP TABLE` / `DROP VIEW` /
 `DROP MATERIALIZED VIEW` refuse when an assertion's stored CHECK body **names
@@ -68,6 +75,47 @@ than fixed inline:
   service, since `bug-drop-column-skips-dependent-checks` and the cross-schema
   rename gap (`bug-rename-not-propagated-across-schemas`) are asking related
   questions about the same graph.
+
+## Arm 2 — an assertion in another schema whose bare name binds to the dropped table
+
+Same site, same "the guard's reach is too narrow" shape, different axis: the
+guard only looks at assertions living in the **dropped object's own schema**.
+
+An assertion resolves its unqualified names against its own schema first and
+then the rest of the path, so an assertion in `temp` naming a bare `mt` binds to
+`main.mt` whenever `temp` has no `mt` of its own — and does correctly enforce
+against `main.mt`. Dropping `main.mt` is allowed, and the database is then
+unwritable.
+
+Reproduced in-process at commit `4e66323f`, right after the guard landed:
+
+```sql
+create table mt (k integer primary key, x integer);     -- main
+create table other (k integer primary key);
+create assertion temp.ta check (not exists (select 1 from mt where x < 0));
+
+drop table mt;                  -- allowed
+insert into other values (1);
+-- Table 'mt' not found in schema path: temp, main
+```
+
+The existing `95-assertions.sqllogic` "same-schema scoping" case does not catch
+this: it creates a `temp.mt` as well, which shadows `main.mt`, so there the
+refusal genuinely should not fire. Remove the shadow and the hole opens.
+
+`bug-rename-not-propagated-across-schemas` lists this same binding as a sub-case
+it cannot solve, and for **renames** that is right — a rename has to guess which
+schema a stored bare name meant, and nothing records the binding. A **drop** is
+easier: the catalog is live at drop time, so the guard can ask each assertion's
+home schema path what a bare `mt` resolves to right now, and refuse only on an
+actual hit. Explicitly-qualified `B.t` from schema A stays with the rename
+ticket, since answering it needs no resolution at all — just widening the loop
+to every schema.
+
+Deciding factor for whoever picks this up: whether the guard should resolve
+names (accurate, costs a catalog lookup per referenced name per assertion) or
+just widen the loop and match bare names in every schema (cheap, but refuses
+drops that no assertion actually depends on).
 
 ## Not in scope
 

@@ -786,7 +786,10 @@ CREATE TABLE temp.dg_s (x INTEGER PRIMARY KEY);
 CREATE ASSERTION temp.dg_s_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_s WHERE x < 0));
 -- run
 
--- main.dg_s is not what the temp assertion names.
+-- main.dg_s is not what the temp assertion names — `temp.dg_s` shadows it. When
+-- no like-named table shadows it the bare name DOES bind across schemas and the
+-- guard misses it; that arm is tracked by
+-- `backlog/bug-drop-table-under-view-an-assertion-names`.
 DROP TABLE main.dg_s;
 -- run
 
@@ -795,4 +798,25 @@ DROP TABLE temp.dg_s;
 
 DROP ASSERTION temp.dg_s_nonneg;
 DROP TABLE temp.dg_s;
+-- run
+
+-- --- The guard refuses only what the assertion actually names ---
+-- A live assertion must not make every drop in its schema fail.
+
+CREATE TABLE dg_named (x INTEGER PRIMARY KEY);
+CREATE TABLE dg_unrelated (i INTEGER PRIMARY KEY);
+CREATE VIEW dg_unrelated_v AS SELECT i FROM dg_unrelated;
+CREATE ASSERTION dg_named_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_named WHERE x < 0));
+-- run
+
+DROP VIEW dg_unrelated_v;
+DROP TABLE dg_unrelated;
+-- run
+
+-- The refusal reports the catalog's spelling of the schema, not the caller's.
+DROP TABLE MAIN.dg_named;
+-- error: cannot drop table 'main.dg_named': assertion 'dg_named_nonneg' still refers to it
+
+DROP ASSERTION dg_named_nonneg;
+DROP TABLE dg_named;
 -- run

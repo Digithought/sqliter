@@ -9,6 +9,7 @@ files:
   - packages/quereus/test/logic/41.10-alter-drop-column-foreign-key.sqllogic # child-side coverage; parent side has none
   - packages/quereus/src/core/database-assertions.ts                  # Arm C — where the unresolvable assertion body finally raises, at commit, for the whole database
   - packages/quereus/test/logic/95-assertions.sqllogic                # Arm C — assertion end-to-end coverage
+  - packages/quereus/src/schema/schema-differ.ts                      # namesDroppedObject — the declarative mirror Arm C needs
   - docs/sql-alter.md                                                 # DROP COLUMN restrictions — line 71 is factually wrong (see below)
   - docs/sql-ddl.md                                                   # DROP COLUMN section — the rule chosen here belongs here too
 difficulty: medium
@@ -123,10 +124,28 @@ rule Arms A and B settle on (refuse vs. drop the dependent) should extend here, 
 caveat that silently dropping a user's integrity rule is harder to justify than dropping a
 narrowed constraint.
 
-`fix/bug-assertion-body-can-name-missing-table` covers the *table* verb of the same family
+`bug-assertion-body-can-name-missing-table` covers the *table* verb of the same family
 (`DROP TABLE` with a referring assertion, and `CREATE ASSERTION` over a missing table); it
 explicitly notes assertions are unguarded on both verbs but scopes itself to `DROP TABLE`.
-This arm is the column verb.
+This arm is the column verb. It has landed, and re-verified at commit `4e66323f` that this
+arm is still open:
+
+```sql
+alter table t drop column x;   -- accepted
+insert into other values (1);  -- Column not found: x   (a DIFFERENT table)
+```
+
+**If this arm settles on "reject the drop", the declarative path needs the matching
+change.** `computeSchemaDiff` in `packages/quereus/src/schema/schema-differ.ts` gained a
+`namesDroppedObject` check that force-drops-and-recreates an otherwise-unchanged assertion
+whose body names a **table or view** the same migration drops — exactly so the runtime
+refusal cannot kill the migration. There is no column-level equivalent. So a declaration
+that removes a column while leaving an assertion body naming it produces
+`ALTER TABLE … DROP COLUMN x` with no surrounding assertion drop/recreate: today that
+applies cleanly and bricks the database; once the drop is refused, it will instead abort
+the migration. Either way the differ needs to treat a dropped column like a dropped table.
+Verified at `4e66323f` that the *changed*-body case already works (the assertion drifts, so
+it drops and recreates around the column drop); only the unchanged-body case is exposed.
 
 ## Documentation is currently wrong — fixing it is in scope
 

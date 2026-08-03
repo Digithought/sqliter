@@ -869,6 +869,17 @@ export function computeSchemaDiff(
 	// comes back and the recreate (emitted last) succeeds. When the object is
 	// genuinely gone, the recreate fails loudly with the build-time error above
 	// rather than silently bricking every write.
+	//
+	// NOTE: dropped COLUMNS have no equivalent here, so a declaration that removes a
+	// column while leaving an assertion body naming it emits a bare `DROP COLUMN`.
+	// That is harmless only because `runDropColumn` does not yet guard assertions;
+	// when it does (`bug-drop-column-skips-dependent-checks` arm C), this predicate
+	// has to widen to columns or such a migration will abort.
+	//
+	// NOTE: one AST walk per declared assertion per dropped object. Trivial at the
+	// handful-of-each scale schemas have today; if a large schema ever drops many
+	// objects at once, index the assertion bodies by referenced name instead of
+	// re-walking per pair.
 	const droppedInThisDiff = [...diff.tablesToDrop, ...diff.viewsToDrop];
 	const namesDroppedObject = (check: AST.Expression): boolean =>
 		droppedInThisDiff.some(dropped => tableReferencedInAst(check, dropped, targetSchemaName));
