@@ -880,6 +880,12 @@ describe('a view definition carries its declared `with schema` path into write-t
 
 		await db.exec("update main.wfv set x = x + 1 where src = 'R'");
 		expect(await all(db, 'select id, x from main.wfr')).to.deep.equal([{ id: 2, x: 21 }]);
+
+		// INSERT routes on the same per-leg oracle the stamped legs feed.
+		await db.exec("insert into main.wfv (id, x, src) values (5, 50, 'R')");
+		expect(await all(db, 'select id, x from main.wfr order by id'))
+			.to.deep.equal([{ id: 2, x: 21 }, { id: 5, x: 50 }]);
+		expect(await all(db, 'select id, x from main.wfl')).to.deep.equal([{ id: 1, x: 10 }]);
 	});
 
 	it('leaves a set-op definition with no `with schema` clause on the home path (right leg)', async () => {
@@ -901,5 +907,62 @@ describe('a view definition carries its declared `with schema` path into write-t
 
 		await db.exec('update main.wsv3 set x = x + 1 where inr = true');
 		expect(await all(db, 'select id, x from main.wsr3')).to.deep.equal([{ id: 2, x: 21 }]);
+	});
+
+	it('reaches a leaf inside a NESTED subtree operand of a membership set-op (depth 2)', async () => {
+		// The carry has to survive one level of recursion: `buildBranch` stamps the declared
+		// path onto the subtree operand's own compound node, and `analyzeSetOpBranches` reads
+		// it back off `branchView.selectAst.schemaPath` when it splits that subtree into its
+		// own two legs — so the depth-2 RIGHT leaf's sub-select still sees the declared path.
+		await db.exec('create table main.wn4a (id integer primary key, x integer)');
+		await db.exec('create table main.wn4b (id integer primary key, x integer)');
+		await db.exec('create table main.wn4c (id integer primary key, x integer)');
+		await db.exec('insert into main.wn4a values (1, 10)');
+		await db.exec('insert into main.wn4b values (3, 30)');
+		await db.exec('insert into main.wn4c values (3, 30)');
+		await db.exec('insert into temp.wt values (3)');
+		await db.exec('create view main.wsv4 as select id, x from wn4a '
+			+ 'with schema "temp", main '
+			+ 'union exists left as ina, exists right as insub '
+			+ '(select id, x from wn4b union select id, x from wn4c where id in (select id from wt))');
+
+		expect(await all(db, 'select id, x from main.wsv4 order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 3, x: 30 }]);
+
+		// The subtree fan reaches BOTH its leaves; the depth-2 right leaf is the one that
+		// would have failed to resolve `wt` before the carry.
+		await db.exec('update main.wsv4 set x = x + 1 where insub = true');
+		expect(await all(db, 'select id, x from main.wn4b')).to.deep.equal([{ id: 3, x: 31 }]);
+		expect(await all(db, 'select id, x from main.wn4c')).to.deep.equal([{ id: 3, x: 31 }]);
+		expect(await all(db, 'select id, x from main.wn4a')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('reaches the THIRD leg of a flag-less chain that declares a path (depth 2)', async () => {
+		// `flaglessShape` walks the chain iteratively, re-seeding `declared` from each
+		// sub-compound as it descends — so the carry has to survive past the first iteration,
+		// not just apply to the binary case above.
+		await db.exec('create table main.wf3a (id integer primary key, x integer)');
+		await db.exec('create table main.wf3b (id integer primary key, x integer)');
+		await db.exec('create table main.wf3c (id integer primary key, x integer)');
+		await db.exec('insert into main.wf3a values (1, 10)');
+		await db.exec('insert into main.wf3b values (2, 20)');
+		await db.exec('insert into main.wf3c values (3, 30)');
+		await db.exec('insert into temp.wt values (3)');
+		await db.exec("create view main.wfv3 as select id, x, 'A' as src from wf3a "
+			+ 'with schema "temp", main '
+			+ "union all select id, x, 'B' as src from wf3b "
+			+ "union all select id, x, 'C' as src from wf3c where id in (select id from wt)");
+
+		expect(await all(db, 'select id, x, src from main.wfv3 order by id'))
+			.to.deep.equal([{ id: 1, x: 10, src: 'A' }, { id: 2, x: 20, src: 'B' }, { id: 3, x: 30, src: 'C' }]);
+
+		await db.exec("update main.wfv3 set x = x + 1 where src = 'C'");
+		expect(await all(db, 'select id, x from main.wf3c')).to.deep.equal([{ id: 3, x: 31 }]);
+		expect(await all(db, 'select id, x from main.wf3b')).to.deep.equal([{ id: 2, x: 20 }]);
+
+		// DELETE takes a different builder (`buildFlaglessDelete`) off the same legs.
+		await db.exec("delete from main.wfv3 where src = 'C'");
+		expect(await all(db, 'select id, x from main.wf3c')).to.deep.equal([]);
+		expect(await all(db, 'select id, x from main.wf3b')).to.deep.equal([{ id: 2, x: 20 }]);
 	});
 });
