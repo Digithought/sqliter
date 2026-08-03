@@ -165,6 +165,38 @@ This ensures type information flows through the entire planning and execution pi
 - Comparison: false < true
 - Collations: None
 
+#### The numeric seek key space
+
+A numeric index key's identity is its **value**, not the JavaScript representation
+(`number` vs `bigint`) that happens to hold it. Three independent layers implement that
+identity and must never disagree:
+
+- **the hash/set membership key** — `canonicalNumeric` in `src/util/key-serializer.ts`
+  puts `number`, `bigint` and `boolean` under one `n:` tag and routes integer-valued
+  numbers through `BigInt(n)`, so `5`, `5.0` and `5n` all serialize to `n:5`;
+- **the in-memory index and primary-key BTrees** — ordered by the column's declared
+  logical type `compare`; `INTEGER`, `REAL` and `NUMERIC` all rank a mixed
+  `number`/`bigint` pair by exact magnitude (`compareNumericValues`);
+- **the persistent store's key bytes** — `encodeNumeric` in
+  `@quereus/store`'s `common/encoding.ts` uses a single numeric tag with an exact
+  residual tie-break, so integers and reals interleave by magnitude: `5n` and `5.0`
+  encode identically, `9007199254740993n` and `9007199254740992` do not.
+
+Because all three agree, `INTEGER`, `REAL` and `NUMERIC` are one **seek key space**: an
+index seek keyed by a value of one may be issued against a column declared another
+without missing a row. `sharesSeekKeySpace` (`src/types/builtin-types.ts`) is the
+plan-time predicate; `rule-key-set-seek` and the index-nested-loop candidate builder both
+gate on it. Two consequences worth stating explicitly:
+
+- **The key value is never coerced.** Converting it into the target column's type would
+  truncate (`INTEGER_TYPE.parse(1.5)` → `1`) and mint a key for a value `=` calls
+  unequal — a wrong answer wherever no residual re-check survives above the seek.
+- **`BOOLEAN` is not in the space**, even though the key serializer and the store's byte
+  encoding both fold booleans into it. `BOOLEAN_TYPE.compare` ranks by `a === b`, so a
+  memory BTree over a boolean column is ordered by a comparator the probe side does not
+  share. Plugin-registered numeric types are excluded for the same reason: they supply
+  their own `compare`.
+
 ### Text Types
 
 **TEXT**

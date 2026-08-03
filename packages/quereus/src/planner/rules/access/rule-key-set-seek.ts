@@ -35,8 +35,10 @@
  *     the dropped Sort's order now rides the leaf's walk order through the
  *     order-preserving hash join, and a pushed multi-seek would emit in
  *     seek-key order instead
- *   - target/key logical types that differ (a cross-type seek key can miss
- *     rows `=` considers equal — backlog/feat-key-set-seek-cross-type-keys)
+ *   - target/key logical types that do not share one seek key space
+ *     (`sharesSeekKeySpace`: identical types, or any two of INTEGER / REAL /
+ *     NUMERIC). Anything else could be encoded into seek keys that miss rows
+ *     `=` considers equal
  *   - a semantic-ordering key type ('PT1H' ≡ 'PT60M' but byte-distinct: a
  *     raw-value seek under-fetches)
  *   - a collation cover that is MISMATCH_UNSAFE (a finer index under-fetches;
@@ -72,6 +74,7 @@ import { IndexScanNode } from '../../nodes/table-access-nodes.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
 import { hasSemanticOrdering, normalizeCollationName } from '../../../util/comparison.js';
+import { sharesSeekKeySpace } from '../../../types/builtin-types.js';
 import { effectiveCollationOfTypes } from '../../analysis/comparison-collation.js';
 import { classifyConstraintCover } from './rule-select-access-path.js';
 import { peelToAccessLeaf, rebuildChain, buildProbeRequest } from '../shared/access-leaf.js';
@@ -194,11 +197,29 @@ function resolveSeekColumns(
 	const targetType = leaf.getAttributes()[seekCol].type;
 	const keyType = right.getAttributes()[keyIdx].type;
 
-	// Identical logical types only. A cross-type set (INTEGER column, REAL
-	// keys) would be encoded into seek keys that miss rows `=` considers equal,
-	// and the probe cannot resurrect a row the seek never returned.
-	if (targetType.logicalType.name !== keyType.logicalType.name) {
-		log('decline: logical types differ (%s vs %s)', targetType.logicalType.name, keyType.logicalType.name);
+	// One seek key space only. Identical types qualify; so does any pair drawn
+	// from INTEGER / REAL / NUMERIC, whose keys are identified by VALUE rather
+	// than by JS representation at every layer (see `sharesSeekKeySpace`). The
+	// key value is passed through RAW — coercing it into the target's type would
+	// truncate (`INTEGER_TYPE.parse(1.5)` → 1) and mint a key for a value `=`
+	// calls unequal. Any other cross-type pair could be encoded into seek keys
+	// that miss rows `=` considers equal, and the probe cannot resurrect a row
+	// the seek never returned.
+	//
+	// NOTE: a NaN seek key cannot under-fetch, so it needs no special handling
+	// here. A NaN key's probe string is `n:NaN`, which matches only a stored NaN.
+	// On the memory backend, REAL/NUMERIC rank NaN first and NaN = NaN in the
+	// very comparator their BTrees are built with, so the seek lands on the NaN
+	// entries; an INTEGER-declared column cannot hold NaN at all
+	// (`INTEGER_TYPE.validate` rejects it), so there is no row to miss — its
+	// comparator ranking NaN equal to everything can only over-fetch, which the
+	// probe trims. On the store backend `encodeNumeric` maps every NaN to one
+	// byte string (above every finite double), so the window is exactly the NaN
+	// rows. Dropping NaN keys the way NULL keys are dropped would be WRONG: it
+	// would under-fetch a genuinely NaN-valued row in a REAL/NUMERIC column.
+	if (!sharesSeekKeySpace(targetType.logicalType, keyType.logicalType)) {
+		log('decline: %s and %s do not share a seek key space',
+			targetType.logicalType.name, keyType.logicalType.name);
 		return null;
 	}
 	// Semantic-ordering types ('PT1H' equals 'PT60M' but is byte-distinct): a

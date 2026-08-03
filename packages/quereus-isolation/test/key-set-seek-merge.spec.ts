@@ -189,6 +189,26 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 			await db.exec(`rollback`);
 		});
 
+		it('merges staged rows against a cross-type numeric key set (REAL keys, INTEGER column)', async () => {
+			// feat-key-set-seek-cross-type-keys through the overlay: the byte window comes
+			// from the underlying while `buildConstraintMatcher` re-checks the staged rows in
+			// memory over a DIFFERENT numeric representation (the key set holds `number`s,
+			// the staged column holds whole numbers). `compareSqlValuesFast` is storage-class
+			// based and unifies the two, so no staged row is dropped and none is over-kept.
+			await db.exec(`create table rk (id integer primary key, r real) using isolated`);
+			await db.exec(`insert into rk values (1, 20.0), (2, 30.0), (3, 50.0), (4, 60.5)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (5, 50, 'e'), (6, 60, 'out')`);
+			await db.exec(`update t set v = 999 where pk = 2`);
+			mem.reset();
+			expect(await rowsOf(`select pk, v, tag from t where v in (select r from rk)`)).to.deep.equal([
+				{ pk: 3, v: 30, tag: 'c' },
+				{ pk: 5, v: 50, tag: 'e' },
+			]);
+			expectSeeked();
+			await db.exec(`rollback`);
+		});
+
 		it('interleaves several staged rows across the seek windows, each exactly once', async () => {
 			await db.exec(`begin`);
 			await db.exec(`insert into ksrc values (4, 10), (5, 40)`);

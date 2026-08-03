@@ -352,3 +352,59 @@ export function isNumericOrUnknownType(type: DeepReadonly<LogicalType>): boolean
 	return type.isNumeric === true || type === ANY_TYPE || type === NULL_TYPE;
 }
 
+/**
+ * The three builtin types whose values share one numeric seek key space. Tested by
+ * IDENTITY against the registry singletons, deliberately not by `type.isNumeric`:
+ * a plugin-registered numeric type supplies its own `compare`, which is what a
+ * memory-table BTree over such a column is ordered by, while the probe side keys by
+ * storage class. The two need not agree, and a seek has no residual able to repair an
+ * under-fetch, so plugin types stay out.
+ */
+function isSeekKeySpaceNumeric(type: DeepReadonly<LogicalType>): boolean {
+	return type === INTEGER_TYPE || type === REAL_TYPE || type === NUMERIC_TYPE;
+}
+
+/**
+ * True when two declared logical types share ONE seek key space: any two values of
+ * those types that `=` calls equal produce the same index key under every backend, so
+ * an index seek keyed by a value of one type may be issued against a column declared
+ * the other without missing a row.
+ *
+ * Identical types always qualify. Beyond that, exactly the three builtin numeric types
+ * qualify against each other, because a numeric key's identity is its VALUE and not the
+ * JavaScript representation (`number` vs `bigint`) that happens to hold it — and all
+ * three layers that must agree on that already do:
+ *
+ *  - the hash/semi-join membership check (`util/key-serializer.ts`'s `canonicalNumeric`)
+ *    puts `number`, `bigint` and `boolean` under one `n:` tag and routes integer-valued
+ *    numbers through `BigInt(n)`, so `5`, `5.0` and `5n` all serialize to `n:5`;
+ *  - the in-memory index/PK BTrees are ordered by the column type's own `compare`, and
+ *    INTEGER / REAL / NUMERIC all rank a mixed `number`/`bigint` pair by true magnitude
+ *    (`compareNumericValues`, above);
+ *  - the persistent store's key bytes use a single numeric tag (`encodeNumeric`,
+ *    `@quereus/store`'s `common/encoding.ts`) so integers and reals interleave by
+ *    magnitude: `5n` and `5.0` encode identically, `9007199254740993n` and
+ *    `9007199254740992` do not.
+ *
+ * No conversion of the key value is implied or wanted. Coercing the key into the target
+ * column's type would be WRONG: `INTEGER_TYPE.parse(1.5)` truncates to `1`, minting a key
+ * for a value the comparison does not consider equal — harmless over-fetch where a
+ * residual re-check follows, but a wrong answer on the plan-time literal `IN` path, which
+ * reports the predicate fully handled and keeps no residual.
+ *
+ * BOOLEAN is deliberately absent even though `canonicalNumeric` and the store's
+ * `encodeValue` both fold booleans into the numeric key space: `BOOLEAN_TYPE.compare`
+ * ranks by `a === b`, so against a `1`/`0` operand it disagrees with both — the mismatch
+ * is in the comparator, not the encoding.
+ *
+ * This answers only the CROSS-type question. Whether byte equality equals value equality
+ * WITHIN one type is a separate question, answered by `hasSemanticOrdering`
+ * (`util/comparison.ts`) — callers must keep applying both.
+ */
+export function sharesSeekKeySpace(a: DeepReadonly<LogicalType>, b: DeepReadonly<LogicalType>): boolean {
+	// Name rather than identity for the same-type arm, preserving the behaviour of the
+	// `logicalType.name` comparison this predicate replaced at both seek gates.
+	if (a.name === b.name) return true;
+	return isSeekKeySpaceNumeric(a) && isSeekKeySpaceNumeric(b);
+}
+

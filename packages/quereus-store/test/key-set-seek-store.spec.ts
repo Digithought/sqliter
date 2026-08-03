@@ -298,6 +298,19 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				expect(await pks(`select pk from big where pk in (2, 4, 6)`)).to.deep.equal([]);
 			});
 
+			it('seeks with cross-type numeric keys (REAL keys, INTEGER column)', async () => {
+				// The byte-encoding half of feat-key-set-seek-cross-type-keys: `encodeNumeric`
+				// uses ONE numeric tag for both `number` and `bigint`, so 100.0 and 100 produce
+				// identical key bytes and the window is exactly the qualifying rows. 55.5 keys
+				// to a window of its own that holds nothing — no truncation to 55.
+				await db.exec(`create table rsrc (id integer primary key, r real) using store`);
+				await db.exec(`insert into rsrc values (1, 100.0), (2, 300.0), (3, 55.5)`);
+				mod.reset();
+				expect(await pks(`select pk from big where v in (select r from rsrc)`)).to.deep.equal([10, 30]);
+				expect(mod.seen('big')[0], 'the store received a multi-seek').to.match(multiSeekRe('ix_v'));
+				expect(mod.seen('big')[0]).to.contain('inCount=3');
+			});
+
 			it('an UPDATE driven by the key set seeks, and only the matched rows change', async () => {
 				// A different write path from the DELETE above: the victims are read through
 				// the seek, then rewritten — which also rewrites the very index the seek is
@@ -310,6 +323,24 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 					.to.match(multiSeekRe('ix_v'));
 				expect(await pks(`select pk from big where w = -1`)).to.deep.equal([2, 4]);
 			});
+		});
+
+		it('a REAL key past 2^53 matches only the integer of equal magnitude', async () => {
+			// `encodeNumeric`'s 8-byte tie-break tail is what makes this exact: 9007199254740992n
+			// and 9007199254740992.0 share a nearest double AND a zero residual, so they encode
+			// identically, while 9007199254740993n shares the double but carries residual 1 and
+			// lands in a different window. Filler rows keep the seek cheaper than a scan.
+			await db.exec(`create table bt (pk integer primary key, v integer) using store`);
+			await db.exec(`create index ix_bt on bt (v)`);
+			await db.exec(`create table bsrc (id integer primary key, r real) using store`);
+			await db.exec(`insert into bt values ${
+				Array.from({ length: 200 }, (_, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
+			await db.exec(`insert into bt values (201, 9007199254740992), (202, 9007199254740993)`);
+			await db.exec(`insert into bsrc values (1, 9007199254740992.0)`);
+			mod.reset();
+			expect(await pks(`select pk from bt where v in (select r from bsrc)`),
+				'the neighbour one above is not in the window').to.deep.equal([201]);
+			expect(mod.seen('bt')[0], 'served as a multi-seek').to.match(multiSeekRe('ix_bt'));
 		});
 
 		it('seeks a DESC index column (seek keys sorted to match encoded-byte order)', async () => {

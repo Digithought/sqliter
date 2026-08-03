@@ -98,5 +98,30 @@ describe('Plan shape: converting CAST blocks index seek', () => {
 			expect(ops).to.not.include('INDEXSEEK');
 			expect(ops).to.include('FILTER');
 		});
+
+		// Cross-type NUMERIC literals against a whole-number key (feat-key-set-seek-cross-type-keys).
+		// The seek literals are TYPED from the column but keep their own values — no
+		// conversion — so the seek is exact in both directions. The two cases below are
+		// the ones a coercion-based implementation would get wrong: it would truncate
+		// 1.5 to 1 and, since this arm reports the IN fully handled (no residual), return
+		// a row for a query that must return none.
+		const xs = async (sql: string): Promise<unknown[]> => {
+			const rows: unknown[] = [];
+			for await (const r of dbi.eval(sql)) rows.push((r as Record<string, unknown>).x);
+			return rows;
+		};
+
+		it('whole-number REAL literals seek an INTEGER key and match', async () => {
+			const ops = await planOps(dbi, "SELECT x FROM ti WHERE x IN (1.0, 2.0)");
+			expect(ops).to.include('INDEXSEEK');
+			expect(await xs("SELECT x FROM ti WHERE x IN (1.0, 2.0)")).to.deep.equal([1, 2]);
+		});
+
+		it('a non-integral literal matches nothing on an INTEGER key (no truncation)', async () => {
+			expect(await xs("SELECT x FROM ti WHERE x IN (1.5)")).to.deep.equal([]);
+			expect(await xs("SELECT x FROM ti WHERE x IN (1.5, 2.5)")).to.deep.equal([]);
+			// …and the mixed list keeps only the exact match.
+			expect(await xs("SELECT x FROM ti WHERE x IN (1.5, 2.0)")).to.deep.equal([2]);
+		});
 	});
 });

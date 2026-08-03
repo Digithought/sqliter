@@ -37,6 +37,7 @@ import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { BinaryOpNode } from '../../nodes/scalar.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { hasSemanticOrdering } from '../../../util/comparison.js';
+import { sharesSeekKeySpace } from '../../../types/builtin-types.js';
 import { extractConstraints, createTableInfoFromNode, type PredicateConstraint } from '../../analysis/constraint-extractor.js';
 import { selectPhysicalNode } from '../access/rule-select-access-path.js';
 import { peelToAccessLeaf, rebuildChain, buildProbeRequest, type AccessLeafNode } from '../shared/access-leaf.js';
@@ -95,11 +96,16 @@ function admitLeaf(right: RelationalPlanNode): AccessLeafNode | null {
  * Resolve each equi pair to (leaf column index, outer attribute position) and
  * apply the two type gates that keep a raw-value seek from under-fetching. The
  * seek key is passed through verbatim (no cast is applied to a dynamic value
- * expression), so a cross-type key (INTEGER column vs REAL key) or a
- * semantic-ordering key type ('PT1H' ≡ 'PT60M' but byte-distinct) can miss rows
- * `=` considers equal — and the ON condition retained above the join cannot
- * resurrect a row the seek never returned. Same two gates as
- * rule-key-set-seek's resolveSeekColumns.
+ * expression), so a pair whose two types do not share one seek key space
+ * (`sharesSeekKeySpace`), or a semantic-ordering key type ('PT1H' ≡ 'PT60M' but
+ * byte-distinct), can miss rows `=` considers equal — and the ON condition
+ * retained above the join cannot resurrect a row the seek never returned. Same
+ * two gates as rule-key-set-seek's resolveSeekColumns.
+ *
+ * The gates are per pair; one non-conforming pair declines the whole candidate.
+ * That is sound for a composite seek because key-space identity is per column and
+ * the store's composite key is the concatenation of the per-column encodings, so
+ * per-column key identity gives composite key identity.
  */
 function resolvePairs(
 	leaf: AccessLeafNode,
@@ -128,8 +134,9 @@ function resolvePairs(
 
 		const innerType = leafAttrs[innerCol].type;
 		const outerType = outerAttrs[outerIdx].type;
-		if (innerType.logicalType.name !== outerType.logicalType.name) {
-			log('decline: logical types differ (%s vs %s)', innerType.logicalType.name, outerType.logicalType.name);
+		if (!sharesSeekKeySpace(innerType.logicalType, outerType.logicalType)) {
+			log('decline: %s and %s do not share a seek key space',
+				innerType.logicalType.name, outerType.logicalType.name);
 			return null;
 		}
 		if (hasSemanticOrdering(innerType.logicalType) || hasSemanticOrdering(outerType.logicalType)) {

@@ -157,3 +157,78 @@ SELECT pk FROM txt ORDER BY pk;
 COMMIT;
 SELECT pk FROM txt ORDER BY pk;
 → [{"pk":1},{"pk":3}]
+
+-- ===== Cross-type numeric keys =====
+--
+-- INTEGER, REAL and NUMERIC share ONE seek key space: a numeric key's identity is its
+-- VALUE, not the JavaScript representation (number vs bigint) that happens to hold it.
+-- The membership check (`canonicalNumeric`), the in-memory index comparators and the
+-- persistent store's key encoding all agree on that, so the rewrite admits these pairs
+-- and the seek is exact in either direction. This file runs under BOTH backends, which
+-- is what makes it the home for the row-level contract.
+--
+-- Every query below is an aggregate with no ORDER BY, so the runtime is free to push the
+-- multi-seek (see the note above on why an ORDER BY the target's own walk provides makes
+-- the rewrite decline). The answers must be identical whether it seeks or scans.
+
+CREATE TABLE xt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_xt_v ON xt(v);
+CREATE TABLE xr (id INTEGER PRIMARY KEY, r REAL NULL);
+CREATE TABLE xik (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO xt VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO xr VALUES (1, 10.0), (2, 30.0), (3, 99.5);
+INSERT INTO xik VALUES (1, 10), (2, 30), (3, 77);
+
+-- INTEGER target, REAL keys: the whole-number reals match by value; 99.5 matches nothing.
+SELECT count(*) AS c, sum(v) AS s FROM xt WHERE v IN (SELECT r FROM xr);
+→ [{"c":2,"s":40}]
+
+-- A NON-INTEGRAL key against a whole-number column matches NOTHING. This is the case a
+-- coercion-based implementation would get wrong: truncating 10.5 to 10 would return pk 1.
+INSERT INTO xr VALUES (4, 10.5);
+SELECT count(*) AS c FROM xt WHERE v IN (SELECT r FROM xr WHERE r = 10.5);
+→ [{"c":0}]
+
+-- REAL target, INTEGER keys — the reverse direction.
+CREATE TABLE xrt (pk INTEGER PRIMARY KEY, r REAL NULL);
+CREATE INDEX idx_xrt_r ON xrt(r);
+INSERT INTO xrt VALUES (1, 10.0), (2, 20.5), (3, 30.0);
+SELECT count(*) AS c, min(pk) AS lo, max(pk) AS hi FROM xrt WHERE r IN (SELECT k FROM xik);
+→ [{"c":2,"lo":1,"hi":3}]
+
+-- NUMERIC target, INTEGER keys.
+CREATE TABLE xnt (pk INTEGER PRIMARY KEY, n NUMERIC NULL);
+CREATE INDEX idx_xnt_n ON xnt(n);
+INSERT INTO xnt VALUES (1, 10), (2, 20.5), (3, 30);
+SELECT count(*) AS c, min(pk) AS lo, max(pk) AS hi FROM xnt WHERE n IN (SELECT k FROM xik);
+→ [{"c":2,"lo":1,"hi":3}]
+
+-- NUMERIC key column, reached the ordinary way: set-operation column-type merging turns
+-- a REAL branch and an INTEGER branch into one NUMERIC column.
+SELECT count(*) AS c, sum(v) AS s FROM xt WHERE v IN (SELECT r FROM xr UNION ALL SELECT k FROM xik);
+→ [{"c":2,"s":40}]
+
+-- Past 2^53: a whole-number REAL key must match the integer of EQUAL magnitude and must
+-- NOT reach its neighbour one above, which no longer shares its nearest double.
+CREATE TABLE xbt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_xbt_v ON xbt(v);
+CREATE TABLE xbr (id INTEGER PRIMARY KEY, r REAL NULL);
+INSERT INTO xbt VALUES (1, 9007199254740992), (2, 9007199254740993);
+INSERT INTO xbr VALUES (1, 9007199254740992.0);
+SELECT count(*) AS c, min(pk) AS lo FROM xbt WHERE v IN (SELECT r FROM xbr);
+→ [{"c":1,"lo":1}]
+
+-- Signed zero: -0.0 and 0 are one value everywhere (the key serializer folds both to
+-- `n:0`, the store encoder normalizes -0 to +0), so the stored 0 row comes back.
+CREATE TABLE xzt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_xzt_v ON xzt(v);
+CREATE TABLE xzk (id INTEGER PRIMARY KEY, r REAL NULL);
+INSERT INTO xzt VALUES (1, 0), (2, 5);
+INSERT INTO xzk VALUES (1, -0.0);
+SELECT count(*) AS c, min(pk) AS lo FROM xzt WHERE v IN (SELECT r FROM xzk);
+→ [{"c":1,"lo":1}]
+
+-- NULL keys are unchanged by any of this: still dropped before the seek.
+INSERT INTO xr VALUES (5, NULL);
+SELECT count(*) AS c, sum(v) AS s FROM xt WHERE v IN (SELECT r FROM xr);
+→ [{"c":2,"s":40}]

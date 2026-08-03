@@ -23,8 +23,9 @@ import {
 	BOOLEAN_TYPE,
 	NUMERIC_TYPE,
 	ANY_TYPE,
+	sharesSeekKeySpace,
 } from '../src/types/builtin-types.js';
-import { DATE_TYPE, TIME_TYPE } from '../src/types/temporal-types.js';
+import { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESPAN_TYPE } from '../src/types/temporal-types.js';
 import { JSON_TYPE } from '../src/types/json-type.js';
 import { PhysicalType, getPhysicalType } from '../src/types/logical-type.js';
 import type { LogicalType } from '../src/types/logical-type.js';
@@ -663,6 +664,73 @@ describe('Type System', () => {
 			expect(getType('EMAIL')).to.equal(EMAIL_TYPE);
 			expect(getType('email')).to.equal(EMAIL_TYPE); // case-insensitive
 			expect(typeRegistry.hasType('EMAIL')).to.be.true;
+		});
+	});
+
+	// ──────────────────── Seek key space (sharesSeekKeySpace) ────────────────────
+	describe('sharesSeekKeySpace', () => {
+		// The plan-time gate both index-seek rewrites apply to a (target column type,
+		// seek key type) pair. True ⇒ a seek keyed by a value of one type cannot miss a
+		// row of the other, so the rewrite may fire. Plan-shape consequences live in
+		// test/optimizer/key-set-seek.spec.ts and test/optimizer/index-nested-loop.spec.ts.
+		const NUMERICS = [INTEGER_TYPE, REAL_TYPE, NUMERIC_TYPE];
+		const NON_NUMERICS = [TEXT_TYPE, BLOB_TYPE, JSON_TYPE, ANY_TYPE, BOOLEAN_TYPE,
+			DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESPAN_TYPE];
+
+		it('holds for all nine ordered pairs over INTEGER / REAL / NUMERIC', () => {
+			for (const a of NUMERICS) {
+				for (const b of NUMERICS) {
+					expect(sharesSeekKeySpace(a, b), `${a.name} vs ${b.name}`).to.equal(true);
+				}
+			}
+		});
+
+		it('fails for every numeric-vs-non-numeric pair, both directions', () => {
+			for (const a of NUMERICS) {
+				for (const b of NON_NUMERICS) {
+					expect(sharesSeekKeySpace(a, b), `${a.name} vs ${b.name}`).to.equal(false);
+					expect(sharesSeekKeySpace(b, a), `${b.name} vs ${a.name}`).to.equal(false);
+				}
+			}
+		});
+
+		it('holds for identical non-numeric types (today\'s same-type behaviour is preserved)', () => {
+			for (const t of NON_NUMERICS) {
+				expect(sharesSeekKeySpace(t, t), `${t.name} vs itself`).to.equal(true);
+			}
+		});
+
+		it('fails for distinct non-numeric pairs (BOOLEAN is not in the numeric key space)', () => {
+			// BOOLEAN is the deliberate omission: the key serializer and the store's byte
+			// encoding both fold booleans into the numeric space, but BOOLEAN_TYPE.compare
+			// ranks by `a === b` and so disagrees with a 1/0 operand — the memory BTree
+			// would be ordered by a comparator the probe side does not share.
+			expect(sharesSeekKeySpace(BOOLEAN_TYPE, INTEGER_TYPE)).to.equal(false);
+			expect(sharesSeekKeySpace(INTEGER_TYPE, BOOLEAN_TYPE)).to.equal(false);
+			expect(sharesSeekKeySpace(TEXT_TYPE, BLOB_TYPE)).to.equal(false);
+			expect(sharesSeekKeySpace(DATE_TYPE, DATETIME_TYPE)).to.equal(false);
+		});
+
+		it('fails for a plugin-registered numeric type against every builtin numeric', () => {
+			// The whitelist is identity against the three registry singletons, NOT
+			// `type.isNumeric`. A plugin type supplies its own `compare` — which is what a
+			// memory BTree over such a column is ordered by — while the probe side keys by
+			// storage class; the two need not agree, and a seek has no residual able to
+			// repair an under-fetch. If this ever flips, the gate has been "simplified"
+			// into an isNumeric check and cross-type plugin seeks became unsound.
+			const PLUGIN_NUMERIC: LogicalType = {
+				name: 'PLUGNUM',
+				physicalType: PhysicalType.INTEGER,
+				isNumeric: true,
+				validate: (v) => v === null || typeof v === 'number' || typeof v === 'bigint',
+				compare: (a, b) => (a === b ? 0 : (a as number) < (b as number) ? -1 : 1),
+			};
+			for (const t of NUMERICS) {
+				expect(sharesSeekKeySpace(PLUGIN_NUMERIC, t), `PLUGNUM vs ${t.name}`).to.equal(false);
+				expect(sharesSeekKeySpace(t, PLUGIN_NUMERIC), `${t.name} vs PLUGNUM`).to.equal(false);
+			}
+			expect(sharesSeekKeySpace(PLUGIN_NUMERIC, PLUGIN_NUMERIC), 'but a type always shares with itself')
+				.to.equal(true);
 		});
 	});
 

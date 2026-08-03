@@ -556,6 +556,15 @@ function selectPhysicalNodeFromPlan(
 					log('IN-list is entirely NULL literals on %s — using empty result', physicalIndexName);
 					return createEmptyResultNode(tableRef);
 				}
+				// NOTE: each literal keeps its OWN value and is merely TYPED from the target
+				// column — nothing is converted here. That is sound because a numeric index
+				// key's identity is its value, not the JS representation holding it (see
+				// `sharesSeekKeySpace`, types/builtin-types.ts): `where i in (1.0, 2.0)` on
+				// an INTEGER column seeks the very keys `1` and `2` encode to, and returns
+				// both rows. Do NOT "fix" this by coercing through the column's `parse` —
+				// `INTEGER_TYPE.parse(1.5)` truncates to 1, and this arm reports the IN
+				// fully handled, so no residual survives to reject the `i = 1` row that
+				// `where i in (1.5)` must not return.
 				const colType = columnScalarType(tableRef, colIdx);
 				seekKeys = effectiveValues.map(v => literalFromValue(tableRef.scope, v, colType));
 			}

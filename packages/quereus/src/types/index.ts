@@ -2,7 +2,7 @@
 export { PhysicalType, type LogicalType, getPhysicalType, physicalTypeName, compareNulls } from './logical-type.js';
 
 // Built-in types
-export { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE, NUMERIC_TYPE, ANY_TYPE, isNumericOrUnknownType } from './builtin-types.js';
+export { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE, NUMERIC_TYPE, ANY_TYPE, isNumericOrUnknownType, sharesSeekKeySpace } from './builtin-types.js';
 
 // Temporal types
 export { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESPAN_TYPE } from './temporal-types.js';

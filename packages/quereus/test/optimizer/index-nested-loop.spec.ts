@@ -27,6 +27,7 @@ import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
 import { ruleJoinPhysicalSelection } from '../../src/planner/rules/join/rule-join-physical-selection.js';
 import type { OptContext } from '../../src/planner/framework/context.js';
 import { indexNestedLoopJoinCost, hashJoinCost, nestedLoopJoinCost } from '../../src/planner/cost/index.js';
+import { PhysicalType } from '../../src/types/logical-type.js';
 
 function collectNodes<T extends PlanNode>(
 	root: PlanNode,
@@ -194,11 +195,35 @@ describe('index-nested-loop join plan shape', () => {
 			expect(correlatedSeekJoins(plan)).to.have.lengthOf(1);
 		});
 
-		it('on cross-type join keys (INTEGER column vs REAL key)', async () => {
-			await db.exec('create table sr (id integer primary key, k real)');
-			await db.exec('insert into sr values (1, 5.0), (2, 7.5)');
-			for await (const _ of db.eval('analyze sr')) { /* consume */ }
-			const plan = db.getPlan('select sr.id from sr join big on big.v = sr.k');
+		it('on a join key pair outside one seek key space (INTEGER column vs TEXT key)', async () => {
+			// The pairs that still decline are the ones whose storage classes differ.
+			// (TEXT vs INTEGER also cannot normally reach the gate: `insertCrossTypeCoercion`
+			// wraps the textual operand in a CastNode and the equi-pair extractor refuses a
+			// converting cast — so no correlated seek appears by either route.)
+			await db.exec('create table st (id integer primary key, k text)');
+			await db.exec("insert into st values (1, '5'), (2, '7')");
+			for await (const _ of db.eval('analyze st')) { /* consume */ }
+			const plan = db.getPlan('select st.id from st join big on big.v = st.k');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
+		});
+
+		it('on a plugin-registered numeric type (the whitelist is by identity, not isNumeric)', async () => {
+			// A plugin type supplies its own `compare`, which is what a memory BTree over
+			// such a column is ordered by, while the probe side keys by storage class. The
+			// two need not agree, and the retained ON condition cannot resurrect a row the
+			// seek never returned.
+			db.registerType('INLNUM', {
+				name: 'INLNUM',
+				physicalType: PhysicalType.INTEGER,
+				isNumeric: true,
+				validate: (v) => v === null || typeof v === 'number' || typeof v === 'bigint',
+				parse: (v) => v,
+				compare: (a, b) => (a === b ? 0 : (a as number) < (b as number) ? -1 : 1),
+			});
+			await db.exec('create table pn (id integer primary key, k inlnum)');
+			await db.exec('insert into pn values (1, 5), (2, 7)');
+			for await (const _ of db.eval('analyze pn')) { /* consume */ }
+			const plan = db.getPlan('select pn.id from pn join big on big.v = pn.k');
 			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
 		});
 
@@ -238,6 +263,54 @@ describe('index-nested-loop join plan shape', () => {
 			expect(correlatedSeekJoins(right)).to.have.lengthOf(0);
 			const full = db.getPlan('select s.id from s full join big on big.v = s.k');
 			expect(correlatedSeekJoins(full)).to.have.lengthOf(0);
+		});
+	});
+
+	describe('cross-type numeric join keys', () => {
+		// INTEGER / REAL / NUMERIC share one seek key space (`sharesSeekKeySpace`): a
+		// numeric key's identity is its value, not the JS representation holding it, at
+		// the probe, in the memory BTree comparators, and in the store's byte encoding.
+		// So these pairs now take the index-NL path with the rows unchanged from the
+		// hash / nested-loop answer they previously pinned.
+
+		it('fires on an INTEGER inner column against REAL outer keys', async () => {
+			await db.exec('create table sr (id integer primary key, k real)');
+			await db.exec('insert into sr values (1, 5.0), (2, 7.5)');
+			for await (const _ of db.eval('analyze sr')) { /* consume */ }
+			const sql = 'select sr.id, big.id as bid from sr join big on big.v = sr.k';
+			expect(correlatedSeekJoins(db.getPlan(sql))).to.have.lengthOf(1);
+			// 5.0 matches big.v = 5; 7.5 matches nothing (no truncation to 7).
+			expect(await drain(db, sql)).to.deep.equal([{ id: 1, bid: 5 }]);
+		});
+
+		it('fires on a REAL inner column against INTEGER outer keys (the reverse direction)', async () => {
+			await db.exec('create table rbig (id integer primary key, r real)');
+			await db.exec('create index idx_rbig_r on rbig(r)');
+			const rows: string[] = [];
+			for (let i = 1; i <= 200; i++) rows.push(`(${i}, ${i}.0)`);
+			await db.exec(`insert into rbig values ${rows.join(', ')}`);
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+			const sql = 'select s.id, rbig.id as bid from s join rbig on rbig.r = s.k';
+			expect(correlatedSeekJoins(db.getPlan(sql))).to.have.lengthOf(1);
+			expect(await drain(db, sql)).to.deep.equal([
+				{ id: 1, bid: 5 }, { id: 2, bid: 7 }, { id: 3, bid: 9 },
+			]);
+		});
+
+		it('fires on a composite ON with one cross-type pair and one same-type pair', async () => {
+			// The predicate is applied per pair; the store's composite key is the
+			// concatenation of per-column encodings, so per-column key identity gives
+			// composite key identity.
+			await db.exec('create table ci (a integer, b integer, v integer, primary key (a, b))');
+			const rows: string[] = [];
+			for (let i = 1; i <= 100; i++) rows.push(`(${i}, ${i % 3}, ${i})`);
+			await db.exec(`insert into ci values ${rows.join(', ')}`);
+			await db.exec('create table co (id integer primary key, ka real, kb integer)');
+			await db.exec('insert into co values (1, 9.0, 0), (2, 10.0, 1)');
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+			const sql = 'select co.id, ci.v from co join ci on ci.a = co.ka and ci.b = co.kb';
+			expect(correlatedSeekJoins(db.getPlan(sql))).to.have.lengthOf(1);
+			expect(await drain(db, sql)).to.deep.equal([{ id: 1, v: 9 }, { id: 2, v: 10 }]);
 		});
 	});
 

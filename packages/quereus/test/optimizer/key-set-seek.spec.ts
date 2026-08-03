@@ -24,6 +24,7 @@ import { FilterNode } from '../../src/planner/nodes/filter.js';
 import { LiteralNode } from '../../src/planner/nodes/scalar.js';
 import { stampMultiSeek } from '../../src/runtime/emit/key-set-semi-join.js';
 import { makeFullScanFilterInfo } from '../../src/vtab/filter-info.js';
+import { PhysicalType } from '../../src/types/logical-type.js';
 
 function collectNodes<T extends PlanNode>(
 	root: PlanNode,
@@ -179,19 +180,89 @@ describe('key-set-seek plan shape', () => {
 		});
 	});
 
-	it('declines a cross-type pair (INTEGER column, REAL keys) and keeps the hash answer', async () => {
-		await db.exec('create table rsrc (id integer primary key, r real)');
-		const sql = 'select pk from big where v in (select r from rsrc)';
-		expect(keySetNodes(sql)).to.have.lengthOf(0);
-		expect(collectNodes(db.getPlan(sql), isHashJoin)).to.have.lengthOf(1);
+	describe('cross-type numeric seek keys', () => {
+		// A numeric key's identity is its VALUE, not the JS representation holding it —
+		// the probe's serializer, the memory BTree comparators and the store's byte
+		// encoding all agree — so INTEGER / REAL / NUMERIC share one seek key space
+		// (`sharesSeekKeySpace`). Row-level proof across both backends lives in
+		// test/logic/08.4-key-set-semi-join.sqllogic.
+		const drain = async (sql: string): Promise<unknown[]> => {
+			const rows: unknown[] = [];
+			for await (const r of db.eval(sql)) rows.push(r);
+			return rows;
+		};
 
-		// Pin the surviving hash-join answer: numeric keys normalize, so 10
-		// matches 10.0.
-		await db.exec('insert into big (pk, v, w) values (1, 10, 0), (2, 20, 0)');
-		await db.exec('insert into rsrc values (1, 10.0)');
-		const rows: unknown[] = [];
-		for await (const r of db.eval(sql)) rows.push(r);
-		expect(rows).to.deep.equal([{ pk: 1 }]);
+		it('pushes an INTEGER column against REAL keys, and the rows are unchanged', async () => {
+			await db.exec('create table rsrc (id integer primary key, r real)');
+			const sql = 'select pk from big where v in (select r from rsrc)';
+			expect(keySetNodes(sql), 'the rewrite applies').to.have.lengthOf(1);
+			expect(collectNodes(db.getPlan(sql), isHashJoin), 'the hash semi join is replaced').to.have.lengthOf(0);
+
+			// The same answer the hash semi join used to give: numeric keys normalize,
+			// so 10 matches 10.0.
+			await db.exec('insert into big (pk, v, w) values (1, 10, 0), (2, 20, 0)');
+			await db.exec('insert into rsrc values (1, 10.0)');
+			expect(await drain(sql)).to.deep.equal([{ pk: 1 }]);
+		});
+
+		it('pushes a REAL column against INTEGER keys (the reverse direction)', async () => {
+			await db.exec('create table rt (pk integer primary key, r real)');
+			await db.exec('create index idx_rt_r on rt(r)');
+			await db.exec('create table isrc (id integer primary key, k integer)');
+			const sql = 'select pk from rt where r in (select k from isrc)';
+			expect(keySetNodes(sql)).to.have.lengthOf(1);
+
+			await db.exec('insert into rt values (1, 10.0), (2, 20.5)');
+			await db.exec('insert into isrc values (1, 10), (2, 99)');
+			expect(await drain(sql)).to.deep.equal([{ pk: 1 }]);
+		});
+
+		it('pushes a NUMERIC key column produced by set-operation type merging', async () => {
+			// `select … union all select 2.5` merges INTEGER and REAL to NUMERIC, so this
+			// is the ordinary-SQL route to a NUMERIC key column against an INTEGER target.
+			const sql = 'select pk from big where v in (select id from small union all select 2.5)';
+			expect(keySetNodes(sql)).to.have.lengthOf(1);
+
+			await db.exec('insert into big (pk, v, w) values (1, 10, 0), (2, 20, 0)');
+			await db.exec('insert into small values (10)');
+			expect(await drain(sql)).to.deep.equal([{ pk: 1 }]);
+		});
+
+		it('pushes a NUMERIC column against INTEGER keys', async () => {
+			await db.exec('create table nt (pk integer primary key, n numeric)');
+			await db.exec('create index idx_nt_n on nt(n)');
+			const sql = 'select pk from nt where n in (select id from small)';
+			expect(keySetNodes(sql)).to.have.lengthOf(1);
+
+			await db.exec('insert into nt values (1, 10.0), (2, 20.5)');
+			await db.exec('insert into small values (10)');
+			expect(await drain(sql)).to.deep.equal([{ pk: 1 }]);
+		});
+
+		it('declines a plugin-registered numeric type against an INTEGER key source', async () => {
+			// The whitelist is identity against the three builtin singletons, not
+			// `type.isNumeric`: a plugin type's own `compare` orders the memory BTree while
+			// the probe keys by storage class, and the two need not agree. Predicate-level
+			// coverage is in test/type-system.spec.ts § sharesSeekKeySpace.
+			db.registerType('KSSNUM', {
+				name: 'KSSNUM',
+				physicalType: PhysicalType.INTEGER,
+				isNumeric: true,
+				validate: (v) => v === null || typeof v === 'number' || typeof v === 'bigint',
+				parse: (v) => v,
+				compare: (a, b) => (a === b ? 0 : (a as number) < (b as number) ? -1 : 1),
+			});
+			await db.exec('create table pnt (pk integer primary key, n kssnum)');
+			await db.exec('create index idx_pnt_n on pnt(n)');
+			const sql = 'select pk from pnt where n in (select id from small)';
+			expect(keySetNodes(sql), 'must decline').to.have.lengthOf(0);
+			expect(collectNodes(db.getPlan(sql), isHashJoin), 'hash semi join survives').to.have.lengthOf(1);
+
+			// …and the hash semi join still answers.
+			await db.exec('insert into pnt values (1, 10), (2, 20)');
+			await db.exec('insert into small values (10)');
+			expect(await drain(sql)).to.deep.equal([{ pk: 1 }]);
+		});
 	});
 
 	it('declines semantic-ordering key types (TIMESPAN) and keeps semantic equality', async () => {
