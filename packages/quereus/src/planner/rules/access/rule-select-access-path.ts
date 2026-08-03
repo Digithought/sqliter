@@ -449,6 +449,11 @@ export function selectPhysicalNode(
  *
  * A non-seek leaf (SeqScan after a collation decline, EmptyResult, IndexScan — which
  * carries `orderingLoadBearing` from its own construction) is returned unchanged.
+ *
+ * NOTE: `FilterNode` is the only wrapper descended through, matching the one wrapper the
+ * seek arms actually produce (`finishSeek`'s collation residual). If a future arm wraps
+ * its seek in anything else, the stamp is skipped silently rather than failing loudly and
+ * the seek looks like it enforces nothing — add that node type here when such an arm lands.
  */
 function stampSeekProvenance(
 	node: RelationalPlanNode,
@@ -460,8 +465,10 @@ function stampSeekProvenance(
 	}
 	if (node instanceof FilterNode) {
 		const inner = stampSeekProvenance(node.source, pushedConstraints, orderingLoadBearing);
-		if (inner === node.source) return node;
-		return new FilterNode(node.scope, inner, node.predicate);
+		// `withChildren` rather than `new FilterNode(...)`: it short-circuits to `this`
+		// when the stamp was a no-op and carries every field the constructor would
+		// otherwise have to re-list.
+		return node.withChildren([inner, node.predicate]) as RelationalPlanNode;
 	}
 	return node;
 }

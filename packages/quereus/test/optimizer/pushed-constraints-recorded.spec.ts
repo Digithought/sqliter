@@ -146,6 +146,41 @@ describe('IndexSeek records the predicate its FilterInfo enforces', () => {
 		expect(seek.pushedConstraints!.map(c => c.op)).to.deep.equal(['>', '<']);
 		const sources = recordedSources(seek);
 		expect(sources[0], 'two separate comparisons, two separate nodes').to.not.equal(sources[1]);
+
+		// Two distinct sources ⇒ a real AND, unlike the BETWEEN case above.
+		const combined = combineResidualExpressions([...sources]);
+		expect(combined).to.be.instanceOf(BinaryOpNode);
+		expect((combined as BinaryOpNode).expression.operator).to.equal('AND');
+	});
+
+	it('stamps through the residual Filter of a COARSER_SAFE collation cover', async () => {
+		await db.exec('create table cs (id integer primary key, name text) using memory');
+		await db.exec("insert into cs values (1, 'Alice'), (2, 'BOB'), (3, 'Bob')");
+		await db.exec('create index idx_cs on cs (name collate NOCASE)');
+
+		// BINARY equality over a NOCASE index over-fetches a superset, so the seek is
+		// kept and wrapped in a residual Filter recovering the BINARY-exact rows.
+		// One plan for every assertion below: node identity is per-plan, so a second
+		// `getPlan` of the same SQL yields equal-but-distinct nodes.
+		const sql = "select id from cs where name = 'BOB'";
+		const plan = db.getPlan(sql);
+		const residual = collectNodes(plan, isFilter).find(f => f.source instanceof IndexSeekNode);
+		expect(residual, 'the coarser cover leaves a residual Filter directly above the seek')
+			.to.not.equal(undefined);
+
+		// The stamp must reach the seek *underneath* that Filter.
+		const seek = residual!.source as IndexSeekNode;
+		expect(seek.indexName).to.equal('idx_cs');
+		expect(seek.pushedConstraints).to.have.lengthOf(1);
+		expect(seek.pushedConstraints![0].op).to.equal('=');
+
+		// The recorded source IS the residual's predicate — re-applying it above the
+		// seek is what the doc comment calls the double-application caveat.
+		expect(residual!.predicate).to.equal(recordedSources(seek)[0]);
+
+		const rows: unknown[] = [];
+		for await (const r of db.eval(sql)) rows.push(r);
+		expect(rows, 'the residual still discards the over-fetched NOCASE match').to.deep.equal([{ id: 2 }]);
 	});
 
 	it('carries both provenance fields through withChildren', () => {
@@ -156,10 +191,9 @@ describe('IndexSeek records the predicate its FilterInfo enforces', () => {
 
 		// Force a real reconstruction by handing back an equal-but-distinct key list.
 		const stamped = seek.withProvenance(seek.pushedConstraints!, true);
-		const reversedKeys = stamped.seekKeys.map(k => k);
 		const forced = stamped.withChildren([
 			stamped.source,
-			...reversedKeys.map((k, i) => (i === 0 ? cloneScalar(k) : k)),
+			...stamped.seekKeys.map((k, i) => (i === 0 ? cloneScalar(k) : k)),
 		]) as IndexSeekNode;
 		expect(forced, 'reconstructed, not the same instance').to.not.equal(stamped);
 		expect(forced.pushedConstraints).to.equal(stamped.pushedConstraints);
