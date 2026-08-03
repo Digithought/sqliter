@@ -559,8 +559,8 @@ function analyzeSetOpView(ctx: PlanningContext, view: MutableViewLike): SetOpAna
 	});
 
 	const branches: [SetOpBranch, SetOpBranch] = [
-		buildBranch(view, 'left', leftBranchSelect(sel), dataColCount, flags),
-		buildBranch(view, 'right', rightBranchSelect(view, compound.select), dataColCount, flags),
+		buildBranch(view, 'left', leftBranchSelect(sel), dataColCount, flags, sel.schemaPath),
+		buildBranch(view, 'right', rightBranchSelect(view, compound.select), dataColCount, flags, sel.schemaPath),
 	];
 
 	return { op: compound.op, root: relRoot, viewColScope, viewColNames, viewColTypes, dataColCount, dataColNames, surfacedInnerFlagNames, flags, branches };
@@ -594,8 +594,8 @@ function analyzeSetOpBranches(view: MutableViewLike, branchView: MutableViewLike
 	const compound = sel.compound!;
 	const innerFlags: MembershipFlag[] = (compound.existence ?? []).map(e => ({ name: e.name, side: e.branch }));
 	return [
-		buildBranch(view, 'left', leftBranchSelect(sel), dataColCount, innerFlags),
-		buildBranch(view, 'right', rightBranchSelect(view, compound.select), dataColCount, innerFlags),
+		buildBranch(view, 'left', leftBranchSelect(sel), dataColCount, innerFlags, sel.schemaPath),
+		buildBranch(view, 'right', rightBranchSelect(view, compound.select), dataColCount, innerFlags, sel.schemaPath),
 	];
 }
 
@@ -623,6 +623,20 @@ function leftBranchSelect(sel: AST.SelectStmt): AST.SelectStmt {
 function unwrapBranchSelect(branchSelect: AST.SelectStmt): AST.SelectStmt {
 	const inner = unwrapPassthroughSubquery(branchSelect);
 	return inner && inner.type === 'select' ? inner : branchSelect;
+}
+
+/**
+ * Stamp the compound's declared `with schema` path onto a leg that has none of its own. The
+ * parser binds a trailing `with schema` clause to the WHOLE compound but attaches it only to
+ * the leading leg's statement node (`isCompoundSubquery` suppression in `parser/parser.ts`), so
+ * every other leg's body would otherwise plan on the view's plain home path instead of the
+ * declared one (`bug-setop-right-leg-write-drops-declared-schema-path`). Identity when
+ * `declaredPath` is `undefined` (no `with schema` clause on the definition) or `sel` already
+ * carries its own path (a nested sub-compound's own clause always wins for its own legs).
+ */
+function withDeclaredPath(sel: AST.SelectStmt, declaredPath: string[] | undefined): AST.SelectStmt {
+	if (!declaredPath || sel.schemaPath) return sel;
+	return { ...sel, schemaPath: declaredPath };
 }
 
 /**
@@ -656,19 +670,28 @@ function rightBranchSelect(view: MutableViewLike, right: AST.QueryExpr): AST.Sel
 	return core as AST.SelectStmt;
 }
 
-/** Build one recursively-writable branch view-like from an operand SELECT. */
+/**
+ * Build one recursively-writable branch view-like from an operand SELECT. `declaredPath`, when
+ * given, is the compound's declared `with schema` path — stamped onto the branch body via
+ * {@link withDeclaredPath} when the body has no path of its own, so a non-leading leg (which
+ * never carries the clause; the parser attaches it only to the leading leg's statement node)
+ * still plans against the definition's declared schemas rather than the view's plain home path.
+ */
 function buildBranch(
 	view: MutableViewLike,
 	side: 'left' | 'right',
 	branchSelect: AST.SelectStmt,
 	dataColCount: number,
 	flags: readonly MembershipFlag[],
+	declaredPath?: string[],
 ): SetOpBranch {
 	// Unwrap a parenthesized LEFT compound operand's `select * from (<compound>)` wrapper to its
 	// inner compound, so a wrapped left operand is a first-class subtree operand (its data cols,
 	// `isNested`, and recursion all derive from the inner) — `set-op-leftwrap-write`. A no-op on a
-	// direct operand.
-	const effectiveSelect = unwrapBranchSelect(branchSelect);
+	// direct operand. Then stamp the compound's declared `with schema` path onto it when it has
+	// none of its own — the leading leg's body keeps its path by parser accident, every other
+	// leg's does not (`withDeclaredPath`).
+	const effectiveSelect = withDeclaredPath(unwrapBranchSelect(branchSelect), declaredPath);
 	// A subtree operand carries its own (non-diff) compound; its fan-out recurses to leaves.
 	const isNested = !!effectiveSelect.compound && effectiveSelect.compound.op !== 'diff';
 	// A non-nested **multi-source (INNER join) leg** is now writable for UPDATE / DELETE
@@ -1593,6 +1616,10 @@ function isWritableLeafLeg(leaf: AST.SelectStmt): boolean {
  *  - a **union-like** (`union` / `unionAll`) chain of any depth → N flat legs;
  *  - a **binary** `intersect` / `except` (a single depth-1 compound) → 2 legs;
  *  - anything else (a deep / mixed intersect/except chain) → `null` (kept on the existing reject).
+ *
+ * Each leg is stamped with the compound's declared `with schema` path when it has none of its
+ * own (`withDeclaredPath`) — same rationale as {@link buildBranch}: the parser binds a trailing
+ * `with schema` clause to the whole compound but attaches it only to the leading leg.
  */
 function flaglessShape(sel: AST.SelectStmt): FlaglessShape | null {
 	if (!sel.compound || sel.compound.op === 'diff') return null;
@@ -1600,13 +1627,17 @@ function flaglessShape(sel: AST.SelectStmt): FlaglessShape | null {
 	const topOp = sel.compound.op;
 	const legs: AST.SelectStmt[] = [];
 	let cur: AST.SelectStmt = sel;
+	// The compound's declared `with schema` path, carried forward to every leg that doesn't
+	// carry its own (`withDeclaredPath`) — the parser attaches the clause to the leading leg's
+	// statement node only, so legs 2..n would otherwise plan on the view's plain home path.
+	let declared = sel.schemaPath;
 	for (;;) {
-		const leftLeg = unwrapBranchSelect(leftBranchSelect(cur));
+		const leftLeg = withDeclaredPath(unwrapBranchSelect(leftBranchSelect(cur)), declared);
 		if (!isWritableLeafLeg(leftLeg)) return null;
 		legs.push(leftLeg);
 		const right = cur.compound!.select;
 		if (right.type !== 'select') return null;
-		const rightEff = unwrapBranchSelect(stripLegModifiers(right));
+		const rightEff = withDeclaredPath(unwrapBranchSelect(stripLegModifiers(right)), declared);
 		if (!rightEff.compound) {
 			if (!isWritableLeafLeg(rightEff)) return null;
 			legs.push(rightEff);
@@ -1623,6 +1654,9 @@ function flaglessShape(sel: AST.SelectStmt): FlaglessShape | null {
 		// matters and is deferred for chains).
 		if (rightEff.compound.op !== topOp || !isUnionLikeSubtree(topOp)) return null;
 		if (rightEff.compound.existence && rightEff.compound.existence.length > 0) return null;
+		// A parenthesized sub-compound's own declared path (already preserved by
+		// `withDeclaredPath` above) wins for its own legs as the chain continues.
+		declared = rightEff.schemaPath ?? declared;
 		cur = rightEff;
 	}
 }

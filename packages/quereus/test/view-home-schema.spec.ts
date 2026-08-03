@@ -816,11 +816,9 @@ describe('a view definition carries its declared `with schema` path into write-t
 	it('reaches the LEFT leg of a membership set-op definition that declares a path', async () => {
 		// `with schema` binds to the whole compound and parses on the leading leg, so the
 		// left branch view-like inherits it structurally (`leftBranchSelect` spreads the root).
-		//
-		// KNOWN GAP: the RIGHT branch does not — `rightBranchSelect` spreads `compound.select`,
-		// a leg the parser never let carry the clause — so a sub-select in a right leg still
-		// fails with `Table '<t>' not found in schema path: <home>`. That is a separate site
-		// from this ticket's marker; filed as `fix/bug-setop-right-leg-write-drops-declared-schema-path`.
+		// The RIGHT branch does too — `withDeclaredPath` stamps the compound's declared path
+		// onto it, since `rightBranchSelect` spreads `compound.select`, a leg the parser never
+		// let carry the clause directly. See the RIGHT-leg test below for that coverage.
 		await db.exec('create table main.wsl (id integer primary key, x integer)');
 		await db.exec('create table main.wsr (id integer primary key, x integer)');
 		await db.exec('insert into main.wsl values (1, 10)');
@@ -836,5 +834,72 @@ describe('a view definition carries its declared `with schema` path into write-t
 		await db.exec('update main.wsv set x = x + 1 where inl = true');
 		expect(await all(db, 'select id, x from main.wsl')).to.deep.equal([{ id: 1, x: 11 }]);
 		expect(await all(db, 'select id, x from main.wsr')).to.deep.equal([{ id: 2, x: 20 }]);
+	});
+
+	it('reaches the RIGHT leg of a membership set-op definition that declares a path (update and delete)', async () => {
+		// Mirror of the LEFT-leg case above with the sub-select moved to the RIGHT leg — the
+		// leg the parser never lets carry `with schema` directly (`rightBranchSelect` spreads
+		// `compound.select`, an operand the clause was never attached to). This was the KNOWN
+		// GAP the LEFT-leg test above flagged (`bug-setop-right-leg-write-drops-declared-schema-path`);
+		// now closed by stamping the compound's declared path onto legs that have none of their own.
+		await db.exec('create table main.wsl2 (id integer primary key, x integer)');
+		await db.exec('create table main.wsr2 (id integer primary key, x integer)');
+		await db.exec('insert into main.wsl2 values (1, 10)');
+		await db.exec('insert into main.wsr2 values (2, 20)');
+		await db.exec('insert into temp.wt values (2)');
+		await db.exec('create view main.wsv2 as select id, x from wsl2 '
+			+ 'with schema "temp", main '
+			+ 'union exists left as inl, exists right as inr '
+			+ 'select id, x from wsr2 where id in (select id from wt)');
+
+		expect(await all(db, 'select id, x from main.wsv2 order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+
+		await db.exec('update main.wsv2 set x = x + 1 where inr = true');
+		expect(await all(db, 'select id, x from main.wsr2')).to.deep.equal([{ id: 2, x: 21 }]);
+
+		await db.exec('delete from main.wsv2 where inr = true');
+		expect(await all(db, 'select id, x from main.wsr2')).to.deep.equal([]);
+	});
+
+	it('reaches the non-leading leg of a flag-less literal-discriminator set-op that declares a path', async () => {
+		// The flag-less (literal-discriminator) route hits the same drop, one call-site over
+		// in `flaglessShape` — its per-leg oracle plan needs the declared path for a
+		// non-leading leg's own sub-select just as the membership route does.
+		await db.exec('create table main.wfl (id integer primary key, x integer)');
+		await db.exec('create table main.wfr (id integer primary key, x integer)');
+		await db.exec('insert into main.wfl values (1, 10)');
+		await db.exec('insert into main.wfr values (2, 20)');
+		await db.exec('insert into temp.wt values (2)');
+		await db.exec("create view main.wfv as select id, x, 'L' as src from wfl "
+			+ 'with schema "temp", main '
+			+ "union all select id, x, 'R' as src from wfr where id in (select id from wt)");
+
+		expect(await all(db, 'select id, x, src from main.wfv order by id'))
+			.to.deep.equal([{ id: 1, x: 10, src: 'L' }, { id: 2, x: 20, src: 'R' }]);
+
+		await db.exec("update main.wfv set x = x + 1 where src = 'R'");
+		expect(await all(db, 'select id, x from main.wfr')).to.deep.equal([{ id: 2, x: 21 }]);
+	});
+
+	it('leaves a set-op definition with no `with schema` clause on the home path (right leg)', async () => {
+		// Guard against over-application: `withDeclaredPath` must be the identity when the
+		// compound declares no path at all — an unqualified name in the right leg still
+		// resolves on the view's plain home path, exactly as before this fix.
+		await db.exec('create table main.wsl3 (id integer primary key, x integer)');
+		await db.exec('create table main.wsr3 (id integer primary key, x integer)');
+		await db.exec('create table main.wsk3 (id integer primary key)');
+		await db.exec('insert into main.wsl3 values (1, 10)');
+		await db.exec('insert into main.wsr3 values (2, 20)');
+		await db.exec('insert into main.wsk3 values (2)');
+		await db.exec('create view main.wsv3 as select id, x from wsl3 '
+			+ 'union exists left as inl, exists right as inr '
+			+ 'select id, x from wsr3 where id in (select id from wsk3)');
+
+		expect(await all(db, 'select id, x from main.wsv3 order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+
+		await db.exec('update main.wsv3 set x = x + 1 where inr = true');
+		expect(await all(db, 'select id, x from main.wsr3')).to.deep.equal([{ id: 2, x: 21 }]);
 	});
 });
