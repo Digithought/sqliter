@@ -1,5 +1,6 @@
 import type { PlanningContext } from '../planning-context.js';
 import type { MutableViewLike } from './single-source.js';
+import { storedBodyContext } from '../stored-body-context.js';
 
 /**
  * The planning context a **stored** view / materialized-view body plans under when a
@@ -23,33 +24,4 @@ import type { MutableViewLike } from './single-source.js';
 export function bodyPlanningContext(ctx: PlanningContext, view: MutableViewLike): PlanningContext {
 	if (view.ephemeral) return ctx;
 	return storedBodyContext(ctx, view.schemaName);
-}
-
-/**
- * The planning context ANY stored body (view / materialized-view derivation) plans under,
- * on either the read or the write path. Isolates the whole naming environment the caller
- * could otherwise inject into the body, so a stored body binds the same objects on every
- * reference:
- *
- *  - `schemaPath` → the object's own home path (see {@link bodyPlanningContext} above);
- *  - `cteNodes` → cleared, so a caller `with` clause whose name matches a body source
- *    cannot shadow it. The body's OWN leading `with` clause still resolves — it is built
- *    by `buildWithContext` from the body statement, not inherited. Clearing here is what
- *    closes the write path: `select-context.ts` falls back to `ctx.cteNodes` whenever the
- *    explicit `parentCTEs` argument is empty, so passing an empty map is not sufficient.
- *  - `cteReferenceCache` → cleared, so the body's own CTE references get fresh
- *    `CTEReferenceNode`s. The cache is keyed by bare `cteName:alias`, so a caller CTE and
- *    a body-local CTE that share a name would otherwise collide on the same entry and the
- *    body would read the caller's relation.
- *
- * Callers that plan a body derived from the caller's own statement (an ephemeral write
- * target, a rewritten base op) must NOT use this — see {@link bodyPlanningContext}.
- */
-export function storedBodyContext(ctx: PlanningContext, schemaName: string): PlanningContext {
-	return {
-		...ctx,
-		schemaPath: ctx.db._homeSchemaPath(schemaName),
-		cteNodes: undefined,
-		cteReferenceCache: undefined,
-	};
 }

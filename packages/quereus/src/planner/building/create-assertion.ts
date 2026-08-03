@@ -6,6 +6,7 @@ import { buildSelectStmt } from './select.js';
 import { Parser } from '../../parser/parser.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { storedBodyContext } from '../stored-body-context.js';
 
 /**
  * Plans the assertion's violation query so a body that cannot resolve fails the
@@ -56,7 +57,7 @@ function planAssertionBody(
 ): void {
 	// Unqualified names in a stored body resolve against the assertion's own
 	// schema first — the same home-schema rule `planViewBody` applies.
-	const bodyCtx: PlanningContext = { ...ctx, schemaPath: ctx.db._homeSchemaPath(schemaName) };
+	const bodyCtx: PlanningContext = storedBodyContext(ctx, schemaName);
 	try {
 		const violationSql = buildAssertionViolationSql(check);
 		const parsed = new Parser().parse(violationSql);

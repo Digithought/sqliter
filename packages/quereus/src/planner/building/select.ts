@@ -34,7 +34,7 @@ import { buildLensAuxiliaryAccessMarker } from './lens-auxiliary-access.js';
 
 // Import decomposed functionality
 import { buildWithContext } from './select-context.js';
-import { storedBodyContext } from '../mutation/body-context.js';
+import { storedBodyContext } from '../stored-body-context.js';
 import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
 import { buildAggregatePhase, buildFinalAggregateProjections } from './select-aggregates.js';

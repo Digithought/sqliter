@@ -6,6 +6,7 @@ import { buildSelectStmt, buildValuesStmt } from './select.js';
 import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { storedBodyContext } from '../stored-body-context.js';
 
 /**
  * Plan the view body for arity validation. SELECT and VALUES bodies build
@@ -21,7 +22,7 @@ import { StatusCode } from '../../common/types.js';
  */
 export function planViewBody(ctx: PlanningContext, viewName: string, body: AST.QueryExpr, homeSchemaName?: string): RelationalPlanNode {
 	if (homeSchemaName) {
-		ctx = { ...ctx, schemaPath: ctx.db._homeSchemaPath(homeSchemaName) };
+		ctx = storedBodyContext(ctx, homeSchemaName);
 	}
 	switch (body.type) {
 		case 'select': {
