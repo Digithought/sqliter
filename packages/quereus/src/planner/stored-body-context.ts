@@ -18,6 +18,15 @@ import type { PlanningContext } from './planning-context.js';
  *    `CTEReferenceNode`s. The cache is keyed by bare `cteName:alias`, so a caller CTE and
  *    a body-local CTE that share a name would otherwise collide on the same entry and the
  *    body would read the caller's relation.
+ *  - `storedBodyOf` → `schemaName`, marking this context AS that body's home environment.
+ *    A write through a view is not executed as the body plan — it is *lowered* into a
+ *    base-table INSERT/UPDATE/DELETE, and definition-derived fragments copied into that
+ *    lowered statement are planned on the CALLER's context. Such a fragment carries an
+ *    {@link import('../parser/ast.js').SelectStmt.storedHomeSchema} marker instead, and
+ *    `building/select.ts` re-enters the home environment through this function when it
+ *    meets one. `storedBodyOf` is what makes that marker inert while the body itself is
+ *    being planned here (the context already IS the home environment), so the body's own
+ *    `with` clause survives.
  *
  * Callers that plan a body derived from the caller's own statement (an ephemeral write
  * target, a rewritten base op) must NOT use this — see `bodyPlanningContext` in
@@ -39,5 +48,6 @@ export function storedBodyContext(ctx: PlanningContext, schemaName: string): Pla
 		schemaPath: ctx.db._homeSchemaPath(schemaName),
 		cteNodes: undefined,
 		cteReferenceCache: undefined,
+		storedBodyOf: schemaName,
 	};
 }

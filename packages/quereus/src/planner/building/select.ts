@@ -70,13 +70,34 @@ export function buildSelectStmt(
   preserveInputColumns: boolean = true
 ): PlanNode {
 
+	// A sub-select copied out of a stored view / MV body by the write-through lowering
+	// carries a `storedHomeSchema` marker (stamped by `mapNestedSelects` in
+	// `mutation/scope-transform.ts`, from `buildViewMutation`). The lowered statement is a
+	// MIX of caller-authored clauses and definition-derived fragments planned on one
+	// (caller) context, so the resolution decision cannot ride the context — it rides the
+	// AST node, and is applied here. Done before the `schemaPath` / `with schema` swap
+	// below so an explicit in-body `with schema` still wins on the path.
+	const storedHome = stmt.storedHomeSchema;
+	// The guard makes the marker inert while the BODY itself is being planned: `analyzeView`
+	// plans it under `bodyPlanningContext` → `storedBodyContext`, which already IS that home
+	// environment (and stamps `storedBodyOf`). Re-swapping there would re-clear `cteNodes`
+	// inside the body's own plan and break a body whose sub-select reads the body's `with`.
+	const storedSwap = storedHome !== undefined && ctx.storedBodyOf !== storedHome;
+	const storedCtx = storedSwap ? storedBodyContext(ctx, storedHome) : ctx;
+	// Clearing `ctx.cteNodes` (which `storedBodyContext` does) is NOT sufficient on its own:
+	// `buildExpressionPositionQueryExpr` (`building/expression.ts`) passes the caller's
+	// `ctx.cteNodes` here as an EXPLICIT `parentCTEs` argument, and `buildWithContext`
+	// prefers a non-empty explicit argument over `ctx.cteNodes` (`building/select-context.ts`).
+	// Without this reset a caller `with ls as (…) update v …` still shadows the body's `ls`.
+	const storedParentCTEs = storedSwap ? new Map<string, CTEScopeNode>() : parentCTEs;
+
 	// Apply schema path from statement if present
 	const contextWithSchemaPath = stmt.schemaPath
-		? { ...ctx, schemaPath: stmt.schemaPath }
-		: ctx;
+		? { ...storedCtx, schemaPath: stmt.schemaPath }
+		: storedCtx;
 
 	// Phase 0: Handle WITH clause if present
-	const { contextWithCTEs, cteNodes } = buildWithContext(contextWithSchemaPath, stmt, parentCTEs);
+	const { contextWithCTEs, cteNodes } = buildWithContext(contextWithSchemaPath, stmt, storedParentCTEs);
 
 	// Handle compound set operations (UNION / INTERSECT / EXCEPT)
 	if (stmt.compound) {

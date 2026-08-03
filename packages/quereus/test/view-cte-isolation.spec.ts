@@ -145,6 +145,50 @@ describe('CTE namespace isolation for stored view bodies', () => {
 		expect(message).to.match(/stale/i);
 	});
 
+	// --- sub-selects copied out of the body by the write-through lowering ---
+	//
+	// `bug-view-write-subquery-in-body-uses-caller-schema`, arm 3. The lowering copies the
+	// view's own `where` into a base statement planned on the CALLER's context, so a
+	// sub-select inside it used to see the caller's `with` clause — with no schema setup at
+	// all. `main.ls` holds id 1 and the caller CTE holds id 2, so a leak makes the lowered
+	// UPDATE / DELETE match nothing and silently report success.
+
+	async function seedBodySubqueryView(db: Database): Promise<void> {
+		await db.exec('create table main.lt (id integer primary key, x integer)');
+		await db.exec('create table main.ls (id integer primary key)');
+		await db.exec('insert into main.lt values (1, 10)');
+		await db.exec('insert into main.ls values (1)');
+		await db.exec('create view main.lv as select id, x from lt where id in (select id from ls)');
+	}
+
+	it("does not let a caller `with` clause bind a sub-select in the view's body on update", async () => {
+		await seedBodySubqueryView(db);
+
+		await db.exec('with ls as (select 2 as id) update lv set x = 99 where id = 1');
+		expect(await all(db, 'select id, x from main.lt')).to.deep.equal([{ id: 1, x: 99 }]);
+	});
+
+	it("does not let a caller `with` clause bind a sub-select in the view's body on delete", async () => {
+		await seedBodySubqueryView(db);
+
+		await db.exec('with ls as (select 2 as id) delete from lv where id = 1');
+		expect(await all(db, 'select id, x from main.lt')).to.deep.equal([]);
+	});
+
+	it("still binds a caller CTE the user's OWN predicate sub-select reads, in the same statement", async () => {
+		// The negative control for the two above: one statement, one caller `with` clause
+		// holding BOTH a name the body reads (`ls` — must not bind) and a name only the
+		// user's predicate reads (`k` — must bind).
+		await seedBodySubqueryView(db);
+		await db.exec('insert into main.lt values (2, 20)');
+		await db.exec('insert into main.ls values (2)');
+
+		await db.exec('with ls as (select 99 as id), k as (select 1 as id) '
+			+ 'update lv set x = 0 where id in (select id from k)');
+		expect(await all(db, 'select id, x from main.lt order by id'))
+			.to.deep.equal([{ id: 1, x: 0 }, { id: 2, x: 20 }]);
+	});
+
 	it('leaves a materialized-view read unaffected by a caller `with` clause shadowing its source', async () => {
 		await db.exec('create table main.mt (id integer primary key, x integer)');
 		await db.exec('insert into main.mt values (1, 10)');

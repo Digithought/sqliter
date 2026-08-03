@@ -9,6 +9,7 @@ import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDe
 import { analyzeDecompositionInsert, analyzeDecomposition, decomposeUpdate as decomposeDecompositionUpdate, buildDecompositionKeyCapture, type DecompInsertOp, type DecompShape, type CapturedDecompValue } from '../mutation/decomposition.js';
 import { isSetOpMembershipBody, isSetOpFlaglessWritableBody, buildSetOpWrite, buildFlaglessSetOpWrite, type SetOpWritePlan } from '../mutation/set-op.js';
 import { buildCteSelfCapture } from '../mutation/single-source.js';
+import { mapNestedSelects } from '../mutation/scope-transform.js';
 import { needsSelfCapture } from './dml-target.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -45,7 +46,7 @@ const log = createLogger('planner:view-mutation');
  * results are sequenced in a `ViewMutationNode`. For the single-source case the
  * wrapped subtree is byte-identical to what the retired AST rewrite re-planned.
  */
-export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): PlanNode {
+export function buildViewMutation(ctx: PlanningContext, viewIn: MutableViewLike, req: MutationRequest): PlanNode {
 	// Site-validate the view-level reserved tags (a sited error for a typo'd /
 	// mis-sited `quereus.*` key on the view/MV is raised here, before any base op
 	// is built — atomic). The statement's own tags were already validated at the
@@ -57,8 +58,8 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// `<schema>.<cteName>` would spuriously invalidate this cached plan if a real
 	// view of that name were later created — and there would be nothing to invalidate
 	// *on* (the CTE body is part of the statement, re-planned every run). Skip both.
-	if (!view.ephemeral) {
-		validateMutationTags(view, req.stmt);
+	if (!viewIn.ephemeral) {
+		validateMutationTags(viewIn, req.stmt);
 
 		// Record a `view` schema dependency for the mutated view/MV. This is the single
 		// funnel for ALL view-/MV-mediated writes (single-source, multi-source,
@@ -71,11 +72,37 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 		// Read-only `select … from v` records no view dependency — view tags do not affect
 		// read results, so its plan need not invalidate on a tag change. Both halves
 		// (recording and invalidation) are pinned in test/plan/view-dependency-invalidation.spec.ts.
+		// `viewIn`, NOT the marked clone below: the tracker holds only a `WeakRef` to the
+		// recorded object, so handing it a temporary would let the dependency collapse.
 		ctx.schemaDependencies.recordDependency(
-			{ type: 'view', schemaName: view.schemaName, objectName: view.name },
-			view,
+			{ type: 'view', schemaName: viewIn.schemaName, objectName: viewIn.name },
+			viewIn,
 		);
 	}
+
+	// Mark the stored body's NESTED sub-selects with the view's home schema, once, here —
+	// `buildViewMutation` is the single funnel every view-mediated write passes through
+	// (single-source, multi-source, decomposition, set-op, lens), so every spine's copied
+	// fragments inherit the marker without each spine being touched. The lowered statement
+	// plans on the caller's context, and `buildSelectStmt` uses the marker to re-enter the
+	// view's own naming environment for exactly those fragments (schema path AND CTE
+	// namespace) — see `mutation/scope-transform.ts` § mapNestedSelects.
+	//
+	// The clone is essential: the schema's stored `selectAst` must never be mutated. An
+	// EPHEMERAL target (a CTE-name body, an inline FROM-subquery) is part of the caller's
+	// statement and is deliberately left unmarked — the mirror of `bodyPlanningContext`'s
+	// ephemeral guard in `mutation/body-context.ts`.
+	//
+	// NOTE: this deep-clones the whole body AST on every view-write plan BUILD (not per
+	// row, and plans are cached), so the cost is proportional to body size once per plan.
+	// If very large view bodies plus high plan-cache churn ever show up in a profile, skip
+	// the walk for a body that contains no nested sub-select at all.
+	const view: MutableViewLike = viewIn.ephemeral
+		? viewIn
+		: {
+			...viewIn,
+			selectAst: mapNestedSelects(viewIn.selectAst, sel => ({ ...sel, storedHomeSchema: viewIn.schemaName })),
+		};
 
 	// A decomposition INSERT fans out one insert per member off the same shared-
 	// surrogate envelope, materialized once and read back per member through an

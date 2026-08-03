@@ -438,3 +438,203 @@ describe('home-schema body resolution (view write-through)', () => {
 		expect(await all(db, 'select id, x from cml')).to.deep.equal([{ id: 1, x: 10 }]);
 	});
 });
+
+/**
+ * A write through a view is not executed as the body plan — it is **lowered** into an
+ * ordinary INSERT / UPDATE / DELETE against the base table, and pieces of the definition
+ * are copied into that lowered statement (the view's own `where`, each view column's
+ * base-term expression, an authored `with inverse`, a `with defaults` value). The lowered
+ * statement is planned on the CALLER's context, so before
+ * `bug-view-write-subquery-in-body-uses-caller-schema` a **sub-select** inside one of
+ * those copied fragments carried its `from` names through verbatim and resolved them on
+ * the caller's path: a non-`main` view failed outright ("Table 'b' not found in schema
+ * path: main"), and a `main` view under a session `schema_path` that reached a same-named
+ * table silently wrote the wrong row set. A plain column reference was never affected —
+ * the lowering had already rewritten it to a resolved base column.
+ *
+ * The fix marks each such sub-select with the view's home schema
+ * (`AST.SelectStmt.storedHomeSchema`, stamped by `mapNestedSelects` from
+ * `buildViewMutation`) and `buildSelectStmt` re-enters the home naming environment for it.
+ */
+describe('home-schema resolution for sub-selects copied out of a view body', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('updates and deletes through a temp view whose body predicate holds a sub-select', async () => {
+		await db.exec('create table temp.a (id integer primary key, x integer)');
+		await db.exec('create table temp.b (id integer primary key)');
+		await db.exec('insert into temp.a values (1, 10), (2, 20)');
+		await db.exec('insert into temp.b values (1)');
+		await db.exec('create view temp.va as select id, x from a where id in (select id from b)');
+
+		expect(await all(db, 'select id, x from temp.va'), 'the read already worked')
+			.to.deep.equal([{ id: 1, x: 10 }]);
+
+		await db.exec('update temp.va set x = 99 where id = 1');
+		expect(await all(db, 'select id, x from temp.a order by id'))
+			.to.deep.equal([{ id: 1, x: 99 }, { id: 2, x: 20 }]);
+
+		await db.exec('delete from temp.va where id = 1');
+		expect(await all(db, 'select id, x from temp.a order by id')).to.deep.equal([{ id: 2, x: 20 }]);
+	});
+
+	it('binds a body sub-select in the home schema when a same-named table exists in main', async () => {
+		// `b2` in BOTH schemas with different contents. Under the default path the caller
+		// reaches main.b2 (which would select row 2); the body must bind temp.b2 (row 1) —
+		// the same table the read binds.
+		await db.exec('create table main.b2 (id integer primary key)');
+		await db.exec('insert into main.b2 values (2)');
+		await db.exec('create table temp.a2 (id integer primary key, x integer)');
+		await db.exec('create table temp.b2 (id integer primary key)');
+		await db.exec('insert into temp.a2 values (1, 10), (2, 20)');
+		await db.exec('insert into temp.b2 values (1)');
+		await db.exec('create view temp.va2 as select id, x from a2 where id in (select id from b2)');
+
+		await db.exec('update temp.va2 set x = 99');
+		expect(await all(db, 'select id, x from temp.a2 order by id'))
+			.to.deep.equal([{ id: 1, x: 99 }, { id: 2, x: 20 }]);
+	});
+
+	it('resolves an unqualified body sub-select when the body FROM is schema-qualified', async () => {
+		await db.exec('create table temp.qt (id integer primary key, x integer)');
+		await db.exec('create table temp.qk (id integer primary key)');
+		await db.exec('insert into temp.qt values (1, 10)');
+		await db.exec('insert into temp.qk values (1)');
+		// The FROM names its schema; the sub-select does not, so only the home path saves it.
+		await db.exec('create view temp.qv as select id, x from temp.qt where id in (select id from qk)');
+
+		await db.exec('update temp.qv set x = 42 where id = 1');
+		expect(await all(db, 'select id, x from temp.qt')).to.deep.equal([{ id: 1, x: 42 }]);
+	});
+
+	it('updates through a temp join-bodied view whose predicate holds a sub-select', async () => {
+		await db.exec('create table temp.ja2 (k integer primary key, note text)');
+		await db.exec('create table temp.jb2 (k integer primary key, bv text)');
+		await db.exec('create table temp.jok (k integer primary key)');
+		await db.exec("insert into temp.ja2 values (1, 'alpha')");
+		await db.exec("insert into temp.jb2 values (1, 'x')");
+		await db.exec('insert into temp.jok values (1)');
+		await db.exec('create view temp.jv2 as select a.k as k, a.note as note, b.bv as bv '
+			+ 'from ja2 a join jb2 b on b.k = a.k where a.k in (select k from jok)');
+
+		await db.exec("update temp.jv2 set note = 'beta' where k = 1");
+		expect(await all(db, 'select k, note from temp.ja2')).to.deep.equal([{ k: 1, note: 'beta' }]);
+		expect(await all(db, 'select k, bv from temp.jb2')).to.deep.equal([{ k: 1, bv: 'x' }]);
+	});
+
+	it('updates through a temp membership set-op view whose branch predicate holds a sub-select', async () => {
+		// Each branch is lowered through its own synthetic view-like; the marker must reach
+		// the compound legs, not only the leading select.
+		await db.exec('create table temp.sml (id integer primary key, x integer)');
+		await db.exec('create table temp.smr (id integer primary key, x integer)');
+		await db.exec('create table temp.smok (id integer primary key)');
+		await db.exec('insert into temp.sml values (1, 10)');
+		await db.exec('insert into temp.smr values (2, 20)');
+		await db.exec('insert into temp.smok values (1), (2)');
+		await db.exec('create view temp.smv as select id, x from sml where id in (select id from smok) '
+			+ 'union exists left as inl, exists right as inr select id, x from smr where id in (select id from smok)');
+
+		await db.exec('update temp.smv set x = x + 1 where inl = true');
+		expect(await all(db, 'select id, x from temp.sml')).to.deep.equal([{ id: 1, x: 11 }]);
+		expect(await all(db, 'select id, x from temp.smr')).to.deep.equal([{ id: 2, x: 20 }]);
+	});
+
+	it('updates through a temp view whose computed column is a correlated sub-select', async () => {
+		await db.exec('create table temp.gt (id integer primary key, x integer)');
+		await db.exec('create table temp.gl (gid integer primary key, lbl text)');
+		await db.exec("insert into temp.gl values (1, 'one')");
+		await db.exec('insert into temp.gt values (1, 5)');
+		// `lbl`'s lineage is a sub-select; the lowered UPDATE's predicate recomputes it in
+		// base terms, carrying `gl` along.
+		await db.exec('create view temp.gv as select id, x, (select lbl from gl where gid = id) as lbl from gt');
+
+		expect(await all(db, 'select id, x, lbl from temp.gv')).to.deep.equal([{ id: 1, x: 5, lbl: 'one' }]);
+
+		await db.exec("update temp.gv set x = 77 where lbl = 'one'");
+		expect(await all(db, 'select id, x from temp.gt')).to.deep.equal([{ id: 1, x: 77 }]);
+	});
+
+	it('inserts through a temp view whose `with defaults` value is a sub-select', async () => {
+		// `with defaults` is cloned by `cloneDefaultsClause`, whose expression clone used to
+		// descend subqueries via the hard-wired `cloneQueryExpr` — so the marker never
+		// reached this sub-select.
+		await db.exec('create table temp.dt (id integer primary key, x integer, kind text)');
+		await db.exec('create table temp.dk (kind text primary key)');
+		await db.exec("insert into temp.dk values ('alpha')");
+		await db.exec('create view temp.dv as select id, x from dt '
+			+ 'with defaults (kind = (select kind from dk limit 1))');
+
+		await db.exec('insert into temp.dv (id, x) values (1, 10)');
+		expect(await all(db, 'select id, x, kind from temp.dt'))
+			.to.deep.equal([{ id: 1, x: 10, kind: 'alpha' }]);
+	});
+
+	it('inserts through a temp view whose authored `with inverse` holds a sub-select', async () => {
+		// The `with inverse` twin of the case above (`cloneInverseClause`).
+		await db.exec('create table temp.it2 (id integer primary key, code text)');
+		await db.exec('create table temp.lk (label text primary key, code text)');
+		await db.exec("insert into temp.lk values ('ONE', 'o')");
+		await db.exec('create view temp.iv2 as select id, '
+			+ 'upper(code) as label with inverse (code = (select code from lk where label = new.label)) '
+			+ 'from it2');
+
+		await db.exec("insert into temp.iv2 (id, label) values (1, 'ONE')");
+		expect(await all(db, 'select id, code from temp.it2')).to.deep.equal([{ id: 1, code: 'o' }]);
+	});
+
+	it('does not let the session schema path pick the wrong table for a body sub-select', async () => {
+		// Arm 2: no error, just the WRONG row set. `temp.ls2` is empty and same-named, so a
+		// caller-path binding makes the lowered UPDATE match nothing and report success.
+		await db.exec('create table main.lt2 (id integer primary key, x integer)');
+		await db.exec('create table main.ls2 (id integer primary key)');
+		await db.exec('insert into main.lt2 values (1, 10)');
+		await db.exec('insert into main.ls2 values (1)');
+		await db.exec('create table temp.ls2 (id integer primary key)');
+		await db.exec('create view main.lv2 as select id, x from lt2 where id in (select id from ls2)');
+
+		await db.exec("pragma schema_path = 'temp,main'");
+		expect(await all(db, 'select id, x from main.lv2'), 'read binds main.ls2')
+			.to.deep.equal([{ id: 1, x: 10 }]);
+		await db.exec('update main.lv2 set x = 99 where id = 1');
+		expect(await all(db, 'select id, x from main.lt2'), 'the write binds what the read bound')
+			.to.deep.equal([{ id: 1, x: 99 }]);
+	});
+
+	it("keeps the caller's own predicate sub-select on the caller's path alongside a body sub-select", async () => {
+		// The negative control: the same statement mixes a definition-derived sub-select
+		// (home path) and a caller-authored one (caller path). `side2` exists in both
+		// schemas, and only the caller's copy may bind main.side2.
+		await db.exec('create table temp.pt2 (id integer primary key, x integer)');
+		await db.exec('create table temp.pk2 (id integer primary key)');
+		await db.exec('insert into temp.pt2 values (1, 10), (2, 20)');
+		await db.exec('insert into temp.pk2 values (1), (2)');
+		await db.exec('create view temp.pv2 as select id, x from pt2 where id in (select id from pk2)');
+		await db.exec('create table main.side2 (id integer primary key)');
+		await db.exec('insert into main.side2 values (1)');
+		await db.exec('create table temp.side2 (id integer primary key)');
+		await db.exec('insert into temp.side2 values (2)');
+
+		await db.exec('update temp.pv2 set x = 0 where id in (select id from side2)');
+		expect(await all(db, 'select id, x from temp.pt2 order by id'))
+			.to.deep.equal([{ id: 1, x: 0 }, { id: 2, x: 20 }]);
+	});
+
+	it('keeps an ephemeral inline-subquery target with a sub-select on the caller path', async () => {
+		// An ephemeral target is part of the caller's statement — it is deliberately NOT
+		// marked, so its own sub-select stays on the statement's path.
+		await db.exec('create table temp.et2 (id integer primary key, x integer)');
+		await db.exec('create table temp.ek2 (id integer primary key)');
+		await db.exec('insert into temp.et2 values (1, 1)');
+		await db.exec('insert into temp.ek2 values (1)');
+		await db.exec('update (select id, x from et2 where id in (select id from ek2)) as v '
+			+ 'set x = 99 where id = 1 with schema "temp"');
+		expect(await all(db, 'select id, x from temp.et2')).to.deep.equal([{ id: 1, x: 99 }]);
+	});
+});

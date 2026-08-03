@@ -190,4 +190,14 @@ export interface PlanningContext {
    * Comes from the WITH SCHEMA clause on statements.
    */
   readonly schemaPath?: string[];
+
+  /**
+   * Set to `<schemaName>` by {@link import('./stored-body-context.js').storedBodyContext}
+   * when this context IS the home naming environment of that schema's stored body.
+   * Read only by `building/select.ts`, to decide whether a sub-select carrying an
+   * {@link import('../parser/ast.js').SelectStmt.storedHomeSchema} marker still needs
+   * the swap: while the body itself is being planned the context already is that
+   * environment, so re-swapping would clear the body's own CTE definitions.
+   */
+  readonly storedBodyOf?: string;
 }

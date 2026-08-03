@@ -195,6 +195,20 @@ export interface SelectStmt extends AstNode {
 	 * docs/vu-inverses.md § View defaults.
 	 */
 	defaults?: ReadonlyArray<ViewInsertDefault>;
+	/**
+	 * Home schema of the stored view / materialized-view body this sub-select was
+	 * copied out of. Write-through lowering metadata ONLY: the lowering copies
+	 * definition-derived fragments (the view's own `where`, each view column's
+	 * base-term expression) into a statement planned on the *caller's* context, so a
+	 * sub-select inside such a fragment would otherwise resolve its `from` names in the
+	 * caller's naming environment. Stamped by `mapNestedSelects`
+	 * (`planner/mutation/scope-transform.ts`) from `buildViewMutation`, and honoured by
+	 * `buildSelectStmt`, which re-enters the object's home environment
+	 * (`storedBodyContext`) for the marked fragment. Never set by the parser and inert
+	 * everywhere else. See docs/view-updateability.md § Schema resolution during
+	 * write-through.
+	 */
+	storedHomeSchema?: string;
 }
 
 /**

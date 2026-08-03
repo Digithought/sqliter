@@ -182,6 +182,54 @@ export function mapQueryExprUniform(
 }
 
 /**
+ * Deep-clone `query`, applying `stamp` to every **nested** sub-select root — the
+ * stored-fragment marker walker.
+ *
+ * A write through a view is *lowered* into a base-table INSERT/UPDATE/DELETE, and
+ * definition-derived fragments (the view's own `where`, each view column's base-term
+ * expression, its `with inverse` / `with defaults` clauses) are copied into that
+ * lowered statement, which is then planned on the CALLER's context. A plain column
+ * reference survives that move because the lowering rewrote it to a resolved base
+ * column, but a sub-select's `from` names ride through verbatim. `buildViewMutation`
+ * therefore stamps each such sub-select with the view's home schema
+ * ({@link AST.SelectStmt.storedHomeSchema}) so `buildSelectStmt` re-enters the home
+ * naming environment when it meets one.
+ *
+ * The **top-level root is deliberately NOT stamped** — it is the body itself, planned
+ * under `bodyPlanningContext` → `storedBodyContext`, which already IS that
+ * environment. Compound / union legs ARE treated as nested: harmless (the marker is
+ * a no-op under that same context) and it is what lets a set-operation spine's
+ * per-branch synthetic view-likes inherit the marker.
+ *
+ * No substitution is threaded — this is a pure clone plus the stamp. Marking a CLONE
+ * is required: the schema's stored `selectAst` must never be mutated.
+ *
+ * NOTE: a `with` clause's CTE bodies are cloned unstamped (via {@link cloneWithClause}).
+ * That is exact today because no lowering copies a body's `with` clause into the
+ * lowered statement (tracked as `fix/bug-view-write-body-cte-not-carried-into-lowering`);
+ * if one ever does, its CTE bodies need the stamp too.
+ */
+export function mapNestedSelects(
+	query: AST.QueryExpr,
+	stamp: (sel: AST.SelectStmt) => AST.SelectStmt,
+): AST.QueryExpr {
+	const descend = (q: AST.QueryExpr): AST.QueryExpr => {
+		const mapped = mapNestedSelects(q, stamp);
+		return mapped.type === 'select' ? stamp(mapped) : mapped;
+	};
+	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, () => undefined, descend);
+	// `onExpr` is passed as `onMetaExpr` too, so the descent reaches a sub-select inside a
+	// `with inverse` put expression or a `with defaults (col = (select …))` value — both of
+	// which the lowering copies into the base INSERT/UPDATE (`rewriteAuthoredViewInsert` /
+	// `collectAppendedDefaults` in `single-source.ts`). The default `cloneExpr` would not:
+	// its subquery descent is hard-wired to `cloneQueryExpr`.
+	if (query.type === 'select') return rebuildSelect(query, onExpr, descend, descend, onExpr);
+	if (query.type === 'values') return { ...query, values: query.values.map(row => row.map(onExpr)) };
+	// A DML … RETURNING body is rejected as a view body at create time — pure clone.
+	return cloneDmlStmt(query);
+}
+
+/**
  * Structurally rebuild a `SelectStmt`, applying `onExpr` to every scalar
  * expression in the select's OWN scope (projections, `where`, `groupBy`,
  * `having`, `orderBy`, `limit`, `offset`, and join `ON` conditions), `onNested`
@@ -190,22 +238,27 @@ export function mapQueryExprUniform(
  * select, not to this select's FROM). The `with` clause is cloned without
  * substitution — a CTE body cannot correlate to the enclosing query, so it needs
  * no rewrite, only severed sharing (see {@link cloneWithClause}).
+ *
+ * `onMetaExpr` handles the two **write-through metadata** clauses — a result
+ * column's `with inverse` and the select's `with defaults` — which default to a
+ * pure {@link cloneExpr} (no substitution: their refs are `new.`-qualified
+ * written-row reads, not live scalars of the read query). A caller that needs its
+ * *subquery descent* to reach inside them — but still no substitution — passes its
+ * own no-substitution clone here; see {@link mapNestedSelects}.
  */
 function rebuildSelect(
 	sel: AST.SelectStmt,
 	onExpr: (e: AST.Expression) => AST.Expression,
 	onNested: (q: AST.QueryExpr) => AST.QueryExpr,
 	onLeg: (q: AST.QueryExpr) => AST.QueryExpr,
+	onMetaExpr: (e: AST.Expression) => AST.Expression = cloneExpr,
 ): AST.SelectStmt {
 	return {
 		...sel,
 		withClause: cloneWithClause(sel.withClause),
-		// A `with inverse` clause is write-through metadata, not a live scalar of the
-		// read query — pure-clone it (severs sharing for in-place rewriters) without
-		// threading the substitution (its refs are `new.`-qualified written-row reads).
 		columns: sel.columns.map(rc => rc.type === 'all'
 			? { ...rc }
-			: { ...rc, expr: onExpr(rc.expr), inverse: cloneInverseClause(rc.inverse) }),
+			: { ...rc, expr: onExpr(rc.expr), inverse: cloneInverseClause(rc.inverse, onMetaExpr) }),
 		from: sel.from?.map(fc => rebuildFrom(fc, onExpr, onNested)),
 		where: sel.where ? onExpr(sel.where) : undefined,
 		groupBy: sel.groupBy ? sel.groupBy.map(onExpr) : undefined,
@@ -213,11 +266,7 @@ function rebuildSelect(
 		orderBy: sel.orderBy ? sel.orderBy.map(ob => ({ ...ob, expr: onExpr(ob.expr) })) : undefined,
 		limit: sel.limit ? onExpr(sel.limit) : undefined,
 		offset: sel.offset ? onExpr(sel.offset) : undefined,
-		// A `with defaults` clause is write-through metadata, not a live scalar of the
-		// read query — pure-clone it (severs sharing for the in-place rename
-		// rewriters that descend `select.defaults`) without threading the substitution,
-		// exactly like the sibling `with inverse` clause above.
-		defaults: cloneDefaultsClause(sel.defaults),
+		defaults: cloneDefaultsClause(sel.defaults, onMetaExpr),
 		compound: sel.compound ? { ...sel.compound, select: onLeg(sel.compound.select) } : undefined,
 		union: sel.union ? onLeg(sel.union) as AST.SelectStmt : undefined,
 	};
@@ -282,19 +331,27 @@ function cloneResultColumns(columns: AST.ResultColumn[] | undefined): AST.Result
 		: { ...rc, expr: cloneExpr(rc.expr), inverse: cloneInverseClause(rc.inverse) });
 }
 
-/** Structural clone of a result column's `with inverse` assignment list. */
+/**
+ * Structural clone of a result column's `with inverse` assignment list. `onExpr`
+ * defaults to the plain {@link cloneExpr} (whose subquery descent is hard-wired to
+ * {@link cloneQueryExpr}); {@link rebuildSelect} threads its `onMetaExpr` here so a
+ * caller whose descent must reach a sub-select nested inside an authored-inverse put
+ * expression can supply its own.
+ */
 function cloneInverseClause(
 	inverse: ReadonlyArray<AST.ResultColumnInverse> | undefined,
+	onExpr: (e: AST.Expression) => AST.Expression = cloneExpr,
 ): AST.ResultColumnInverse[] | undefined {
-	return inverse?.map(a => ({ ...a, expr: cloneExpr(a.expr) }));
+	return inverse?.map(a => ({ ...a, expr: onExpr(a.expr) }));
 }
 
 /** Structural clone of a select's `with defaults` assignment list (mirrors
- *  {@link cloneInverseClause}). */
+ *  {@link cloneInverseClause}, `onExpr` included). */
 function cloneDefaultsClause(
 	defaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
+	onExpr: (e: AST.Expression) => AST.Expression = cloneExpr,
 ): AST.ViewInsertDefault[] | undefined {
-	return defaults?.map(d => ({ ...d, expr: cloneExpr(d.expr) }));
+	return defaults?.map(d => ({ ...d, expr: onExpr(d.expr) }));
 }
 
 /** Structural clone of mutation-context assignments. */
