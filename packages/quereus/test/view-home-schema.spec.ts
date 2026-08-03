@@ -1078,14 +1078,9 @@ describe('write-through sub-query shadow analysis resolves sources like the plan
 		expect(await all(db, 'select id, x, lbl from temp.gv order by id'), 'the read binds temp.gl')
 			.to.deep.equal([{ id: 1, x: 10, lbl: 'one' }, { id: 2, x: 20, lbl: 'one' }]);
 
-		// The row set the write must land on, spelled straight against the base tables —
-		// the same predicate reading through the view computes. It is spelled that way
-		// rather than as `select id from temp.gv where exists (… side.tag = lbl)` because
-		// that (equivalent) reading form hits an unrelated pre-existing defect: a
-		// correlated sub-query cannot reference an outer COMPUTED projection column. See
-		// tickets/fix/bug-correlated-subquery-cannot-read-outer-computed-column.
-		const oracle = await all(db, 'select id from temp.gt where exists '
-			+ '(select 1 from main.side where side.tag = (select lbl from temp.gl where id = 1)) order by id');
+		// The row set the write must land on: the same predicate, read through the view.
+		const oracle = await all(db, 'select id from temp.gv where exists '
+			+ '(select 1 from side where side.tag = lbl) order by id');
 		expect(oracle, 'the matching read').to.deep.equal([{ id: 1 }, { id: 2 }]);
 
 		const written = await all(db, 'update temp.gv set x = 77 '

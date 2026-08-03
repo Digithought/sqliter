@@ -37,9 +37,10 @@ import { DistinctNode } from '../../nodes/distinct-node.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { RetrieveNode } from '../../nodes/retrieve-node.js';
 import { AliasNode } from '../../nodes/alias-node.js';
-import { CapabilityDetectors, PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import type { ScalarPlanNode } from '../../nodes/plan-node.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
+import { collectPredicateAttributeIds } from '../../analysis/predicate-dependencies.js';
 import { collectBindingsInExpr } from '../../analysis/binding-collector.js';
 import { extractConstraints, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
 import { isIndexStyleContext } from '../shared/index-style-context.js';
@@ -152,33 +153,20 @@ function tryPushDown(child: RelationalPlanNode, predicate: ScalarPlanNode, scope
 
 function canPushAcrossProject(project: ProjectNode, predicate: ScalarPlanNode): boolean {
 	// If project preserves input columns and all predicate-attested attributes exist below, it's safe.
+	// The dependency set spans sub-query operands too: a correlated reference inside
+	// `exists (…)` reads an outer attribute exactly like a top-level one does, and pushing
+	// below the Project that mints it strands it at runtime.
+	// NOTE: this refuses one case it could allow — a correlation onto a GRANDPARENT scope's
+	// attribute, which the Project neither produces nor consumes, so the push would be safe.
+	// It is refused because the gate's rule is "must exist below", and an outer-scope id does
+	// not. Buying it back means distinguishing "outer-scope id" from "id this Project defines",
+	// e.g. by testing membership in the Project's own output attributes first.
 	const sourceAttrIds = new Set(project.source.getAttributes().map(a => a.id));
-	const referenced = collectReferencedAttributeIds(predicate);
+	const referenced = collectPredicateAttributeIds(predicate);
 	for (const id of referenced) {
 		if (!sourceAttrIds.has(id)) return false;
 	}
 	return true;
-}
-
-function collectReferencedAttributeIds(expr: ScalarPlanNode): Set<number> {
-	const ids = new Set<number>();
-	walkExpr(expr, node => {
-		if (CapabilityDetectors.isColumnReference(node)) {
-			ids.add(node.attributeId);
-		}
-	});
-	return ids;
-}
-
-function walkExpr(expr: ScalarPlanNode, fn: (n: ScalarPlanNode) => void): void {
-	fn(expr);
-	for (const c of expr.getChildren()) {
-		// Only scalar children
-		if (!isRelationalNode(c)) {
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			walkExpr(c as any as ScalarPlanNode, fn);
-		}
-	}
 }
 
 

@@ -6,8 +6,8 @@
  * each conjunct of `predicate` that references only GROUP-BY columns (or
  * columns FD-determined by them in the aggregate's output FDs) is rewritten
  * onto the aggregate's source attribute IDs and moved below the aggregate.
- * Conjuncts referencing aggregate outputs (sum/count/etc.) or non-column
- * GROUP-BY expressions stay above.
+ * Conjuncts referencing aggregate outputs (sum/count/etc.), non-column
+ * GROUP-BY expressions, or a correlated sub-query stay above.
  *
  * Aggregate output indices in `physical.fds` come exclusively from
  * bare-`ColumnReferenceNode` GROUP BYs (per `propagateAggregateFds`), so every
@@ -26,6 +26,7 @@ import { StreamAggregateNode } from '../../nodes/stream-aggregate.js';
 import { HashAggregateNode } from '../../nodes/hash-aggregate.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
+import { collectPredicateDependencies } from '../../analysis/predicate-dependencies.js';
 import { splitConjuncts, combineConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { computeClosure } from '../../util/fd-utils.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
@@ -135,14 +136,28 @@ function isConjunctPushable(
 	outputToSource: ReadonlyMap<number, { sourceAttrId: number; sourceColIdx: number }>,
 	pushableOutputIndices: ReadonlySet<number>,
 ): boolean {
-	const referenced = collectReferencedAttributeIds(conj);
-	if (referenced.size === 0) {
+	const { direct, correlated } = collectPredicateDependencies(conj);
+
+	// A conjunct whose sub-query operand correlates to anything is refused outright.
+	// `splitConjuncts` cannot break an `or` (or a `case`) apart, so a single conjunct
+	// can mix a pushable GROUP-BY reference with a correlated sub-query; pushing it
+	// carries the correlated reference below the aggregate that defines the attribute
+	// it reads, and the query dies with "No row context found for column …".
+	// NOTE: this refuses a correlation onto a pushable GROUP BY column, which would in
+	// principle be legal. Buying it back means teaching `rewriteOutputToSource` to
+	// descend into relational children — it currently skips them, so the reference
+	// inside the sub-query would keep pointing at the aggregate's OUTPUT attribute id
+	// while the rest of the conjunct is rewritten onto source ids. See `remapOuterRefs`
+	// in `rule-scalar-agg-decorrelation.ts` for a rewriter that does descend.
+	if (correlated.size > 0) return false;
+
+	if (direct.size === 0) {
 		// Constant conjunct: safe to push (and safe to keep above too — pushing
 		// reduces work below). Keep above to avoid spurious rule firings; the
 		// rule only "fires" when there's a real column-driven push.
 		return false;
 	}
-	for (const attrId of referenced) {
+	for (const attrId of direct) {
 		const idx = outAttrIdToIndex.get(attrId);
 		if (idx === undefined) return false;
 		if (!pushableOutputIndices.has(idx)) return false;
@@ -150,25 +165,6 @@ function isConjunctPushable(
 		if (!outputToSource.has(attrId)) return false;
 	}
 	return true;
-}
-
-function collectReferencedAttributeIds(expr: ScalarPlanNode): Set<number> {
-	const ids = new Set<number>();
-	walkScalar(expr, n => {
-		if (n instanceof ColumnReferenceNode) {
-			ids.add(n.attributeId);
-		}
-	});
-	return ids;
-}
-
-function walkScalar(expr: ScalarPlanNode, fn: (n: ScalarPlanNode) => void): void {
-	fn(expr);
-	for (const c of expr.getChildren()) {
-		if (!isRelationalNode(c)) {
-			walkScalar(c as ScalarPlanNode, fn);
-		}
-	}
 }
 
 function rewriteOutputToSource(
