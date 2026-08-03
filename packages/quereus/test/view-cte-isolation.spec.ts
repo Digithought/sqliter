@@ -198,3 +198,198 @@ describe('CTE namespace isolation for stored view bodies', () => {
 			.to.deep.equal([{ id: 1, x: 10 }]);
 	});
 });
+
+/**
+ * The other half of the same seam (`bug-view-write-body-cte-not-carried-into-lowering`).
+ * Re-entering the body's home naming environment clears the CALLER's CTE namespace — the
+ * fix above — but the body's OWN `with` clause was not carried along, so a fragment the
+ * lowering copies out of the body (its `where`, a column's defining expression, a
+ * `with inverse` put, a `with defaults` value) that read a body-local block had nothing to
+ * bind to. Two failure modes: `Table 'c' not found` when no such object exists, and — the
+ * severe one — a silent no-op write when a REAL table of that name does exist, so the read
+ * and the write of one view disagreed about which relation `c` names.
+ *
+ * `AST.SelectStmt.storedBodyCTEs` now rides the same stamp as `storedHomeSchema`, and
+ * `buildSelectStmt` builds those definitions on the home context as the fragment's parent
+ * CTE namespace (`buildStoredBodyCTEs`, `building/select-context.ts`).
+ */
+describe('a stored view body carries its own `with` clause into write-through lowering', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table main.a (id integer primary key, x integer)');
+		await db.exec('create table main.b (id integer primary key)');
+		await db.exec('insert into main.a values (1, 10)');
+		await db.exec('insert into main.b values (1)');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	// --- one case per channel that copies a fragment out of the body ---
+
+	it("resolves a body-local block read by the body's own `where`, on update", async () => {
+		await db.exec('create view main.vc as with c as (select id from b) select id, x from a where id in (select id from c)');
+
+		expect(await all(db, 'select * from main.vc')).to.deep.equal([{ id: 1, x: 10 }]);
+		await db.exec('update main.vc set x = 99 where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 99 }]);
+	});
+
+	it("resolves a body-local block read by the body's own `where`, on delete", async () => {
+		await db.exec('create view main.vc as with c as (select id from b) select id, x from a where id in (select id from c)');
+
+		await db.exec('delete from main.vc where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([]);
+	});
+
+	it("resolves a body-local block read by a view column's defining expression", async () => {
+		// The user `where` names `n`, so the lowering pulls that column's defining
+		// expression — which reads `c` — into the base UPDATE.
+		await db.exec('create view main.vn as with c as (select id from b) select id, x, (select count(*) from c) as n from a');
+
+		await db.exec('update main.vn set x = 55 where n = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 55 }]);
+	});
+
+	it('resolves a body-local block read by an authored `with inverse` put expression', async () => {
+		await db.exec('create view main.vi as with c as (select 5 as k from b) '
+			+ 'select id, x + (select max(k) from c) as y with inverse (x = new.y - (select max(k) from c)) from a');
+
+		await db.exec('update main.vi set y = 20 where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 15 }]);
+	});
+
+	it('resolves a body-local block read by a `with defaults` value on insert', async () => {
+		await db.exec('create view main.vdf as with c as (select 7 as k from b) '
+			+ 'select id, x from a with defaults (x = (select max(k) from c))');
+
+		await db.exec('insert into main.vdf (id) values (3)');
+		expect(await all(db, 'select id, x from main.a order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 3, x: 7 }]);
+	});
+
+	it('resolves a body-local block on a write through a materialized view', async () => {
+		await db.exec('create materialized view main.mv as with c as (select id from b) '
+			+ 'select id, x from a where id in (select id from c)');
+
+		await db.exec('update main.mv set x = 88 where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 88 }]);
+	});
+
+	it('resolves a RECURSIVE body-local block', async () => {
+		await db.exec('create view main.vr as with recursive r(n) as '
+			+ '(select 1 union all select n + 1 from r where n < 3) '
+			+ 'select id, x from a where id in (select n from r)');
+
+		await db.exec('update main.vr set x = 33 where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 33 }]);
+	});
+
+	it('resolves a body-local block that references an earlier sibling block', async () => {
+		await db.exec('create view main.vs2 as with c1 as (select id from b), c2 as (select id from c1) '
+			+ 'select id, x from a where id in (select id from c2)');
+
+		await db.exec('update main.vs2 set x = 44 where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 44 }]);
+	});
+
+	// --- arm 2: the silent no-op, where a REAL table shadows the body-local name ---
+
+	describe('a body-local block wins over a same-named real table (as it does on read)', () => {
+		beforeEach(async () => {
+			// A real `main.c` holding a DIFFERENT id than the body-local block does. Before
+			// the carry the lowered statement bound THIS table, so the write matched no row
+			// and reported success while the read of the same view returned the row.
+			await db.exec('create table main.c (id integer primary key)');
+			await db.exec('insert into main.c values (2)');
+			await db.exec('create view main.vs as with c as (select id from b) select id, x from a where id in (select id from c)');
+		});
+
+		it('reads the row through the body-local block', async () => {
+			expect(await all(db, 'select * from main.vs')).to.deep.equal([{ id: 1, x: 10 }]);
+		});
+
+		it('updates the row rather than silently writing nothing', async () => {
+			await db.exec('update main.vs set x = 42 where id = 1');
+			expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 42 }]);
+		});
+
+		it('deletes the row rather than silently writing nothing', async () => {
+			await db.exec('delete from main.vs where id = 1');
+			expect(await all(db, 'select id, x from main.a')).to.deep.equal([]);
+		});
+	});
+
+	// --- sharing: two fragments referencing one block get ONE plan node ---
+
+	it('evaluates a block referenced by two fragments once, not once per fragment', async () => {
+		// `bump()` is non-deterministic (the `createScalarFunction` default), so the engine
+		// cannot hoist or fold it: every evaluation is a distinct call. Both the body's own
+		// `where` and the `n` column's defining expression read `c`, and the user `where`
+		// names `n`, so the lowering copies BOTH fragments. One shared `CTENode` (the
+		// per-lowering memo) ⇒ the multi-reference advisory materializes it ⇒ one call.
+		// Per-fragment building would give two independently-evaluated copies.
+		let calls = 0;
+		db.createScalarFunction('bump', { numArgs: 0 }, () => { calls++; return 1; });
+		await db.exec('create view main.vb as with c as (select bump() as k from b) '
+			+ 'select id, x, (select max(k) from c) as n from a where (select max(k) from c) > 0');
+
+		calls = 0;
+		await db.exec('update main.vb set x = 77 where n > 0');
+		expect(calls, 'the shared body-local block must be evaluated once per statement').to.equal(1);
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 77 }]);
+	});
+
+	// --- regression pins for the two shapes that were already correct ---
+
+	it('still rejects a body whose FROM source IS a body-local block', async () => {
+		await db.exec('create view main.vf as with c as (select id, 1 as x from b) select id, x from c');
+
+		let message = '';
+		try {
+			await db.exec('update main.vf set x = 5 where id = 1');
+		} catch (e) {
+			message = e instanceof Error ? e.message : String(e);
+		}
+		expect(message).to.match(/CTEReference/);
+	});
+
+	it('still writes through a view whose body-local block no fragment references', async () => {
+		await db.exec('create view main.vu as with c as (select id from b) select id, x from a where x > 0');
+
+		await db.exec('update main.vu set x = 66 where id = 1');
+		expect(await all(db, 'select id, x from main.a')).to.deep.equal([{ id: 1, x: 66 }]);
+	});
+
+	// --- guard: a data-modifying body-local block is rejected, and advertised as such ---
+
+	describe('a data-modifying body-local block', () => {
+		beforeEach(async () => {
+			// Reading such a view already executes the insert once per read; carrying the
+			// definitions would make a WRITE execute it too, and the shared plan node makes a
+			// two-fragment reference fail inside the runtime. Rejected up front instead.
+			await db.exec('create table main.logt (k integer primary key)');
+			await db.exec('create view main.vm as with m as (insert into logt (k) values (1) returning k) '
+				+ 'select id, x from a where id in (select k from m)');
+		});
+
+		it('rejects a write through it with a structured diagnostic', async () => {
+			let message = '';
+			try {
+				await db.exec('update main.vm set x = 1 where id = 1');
+			} catch (e) {
+				message = e instanceof Error ? e.message : String(e);
+			}
+			expect(message).to.match(/cannot write through view 'vm'/);
+			expect(message).to.match(/data-modifying statement \(insert\)/);
+		});
+
+		it('is reported non-writable by view_info()', async () => {
+			expect(await all(db, "select is_insertable_into, is_updatable, is_deletable from view_info() where name = 'vm'"))
+				.to.deep.equal([{ is_insertable_into: 'NO', is_updatable: 'NO', is_deletable: 'NO' }]);
+		});
+	});
+});

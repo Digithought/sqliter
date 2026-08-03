@@ -204,10 +204,16 @@ export function mapQueryExprUniform(
  * No substitution is threaded — this is a pure clone plus the stamp. Marking a CLONE
  * is required: the schema's stored `selectAst` must never be mutated.
  *
- * NOTE: a `with` clause's CTE bodies are cloned unstamped (via {@link cloneWithClause}).
- * That is exact today because no lowering copies a body's `with` clause into the
- * lowered statement (tracked as `fix/bug-view-write-body-cte-not-carried-into-lowering`);
- * if one ever does, its CTE bodies need the stamp too.
+ * The caller may stamp more than the home schema: `buildViewMutation` also puts the body's
+ * OWN `with` clause on each clone ({@link AST.SelectStmt.storedBodyCTEs}), so a fragment
+ * sub-select that reads a body-local CTE still has it in scope once the home swap has
+ * cleared the caller's CTE namespace.
+ *
+ * NOTE: a `with` clause's CTE bodies are cloned unstamped (via {@link cloneWithClause}),
+ * and that stays correct with the carry above: a definition's own sub-selects are built by
+ * `buildStoredBodyCTEs` on the home context already, exactly as on the read path, so
+ * stamping them would be redundant — and stamping the *carried* clause's members would make
+ * the marker self-referential.
  */
 export function mapNestedSelects(
 	query: AST.QueryExpr,

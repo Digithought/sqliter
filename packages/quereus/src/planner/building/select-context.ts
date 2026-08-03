@@ -42,3 +42,36 @@ export function buildWithContext(
 
 	return { contextWithCTEs, cteNodes };
 }
+
+/**
+ * Build the CTE definitions a copied stored-body fragment carries
+ * (`AST.SelectStmt.storedBodyCTEs`), for use as that fragment's PARENT CTE namespace.
+ *
+ * The write-through lowering copies fragments out of a view body into a statement planned
+ * on the caller's context; `buildSelectStmt` re-enters the body's home environment for each
+ * such fragment, which clears the caller's CTE namespace. Without this the body's own
+ * definitions are gone too, so a fragment sub-select reading one either errors
+ * (`Table 'c' not found`) or — worse — binds a same-named real table and writes nothing.
+ * `ctx` must already be the home environment (`storedBodyContext`), so the definitions bind
+ * the same objects they bind on the read path.
+ *
+ * Returned as a fresh copy per call: `buildWithContext` mutates the map it is handed (it
+ * merges the fragment's own `with` clause on top, which must shadow a body-local name for
+ * that fragment only). The memo entry itself is never handed out directly.
+ *
+ * The memo (`ctx.storedBodyCTECache`, created once per lowering by `buildViewMutation`)
+ * makes every fragment of one lowering share ONE plan node per definition — two fragments
+ * referencing the same block must not build it twice. Absent memo (nothing created one)
+ * degrades to per-fragment building rather than failing.
+ */
+export function buildStoredBodyCTEs(
+	ctx: PlanningContext,
+	withClause: AST.WithClause | undefined,
+): Map<string, CTEScopeNode> {
+	if (!withClause) return new Map();
+	const cached = ctx.storedBodyCTECache?.get(withClause);
+	if (cached) return new Map(cached);
+	const built = buildWithClause(ctx, withClause);
+	ctx.storedBodyCTECache?.set(withClause, built);
+	return new Map(built);
+}

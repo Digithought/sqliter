@@ -209,6 +209,20 @@ export interface SelectStmt extends AstNode {
 	 * write-through.
 	 */
 	storedHomeSchema?: string;
+	/**
+	 * The stored body's own `WITH` clause, carried along with a fragment copied out of
+	 * that body. Write-through lowering metadata ONLY, the sibling of
+	 * {@link SelectStmt.storedHomeSchema}: re-entering the body's home naming environment
+	 * clears the caller's CTE namespace, so a copied sub-select that reads a body-local
+	 * CTE would have nothing to bind to. Stamped by `mapNestedSelects`
+	 * (`planner/mutation/scope-transform.ts`) from `buildViewMutation` onto the same
+	 * clones that carry `storedHomeSchema`, and consumed by `buildSelectStmt`, which
+	 * builds these definitions on the home context and hands them in as the fragment's
+	 * parent CTE namespace (the fragment's OWN `with` clause still shadows them). Never
+	 * set by the parser and inert everywhere else. See docs/view-updateability.md
+	 * § Schema resolution during write-through.
+	 */
+	storedBodyCTEs?: WithClause;
 }
 
 /**

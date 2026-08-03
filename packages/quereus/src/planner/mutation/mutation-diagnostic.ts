@@ -25,6 +25,7 @@ export type MutationDiagnosticReason =
 	| 'unsupported-distinct'       // DISTINCT body — not row-decomposable (no 1:1 base lineage)
 	| 'no-base-lineage'            // VALUES body / no reachable base table
 	| 'nested-view'                // body sources another view / CTE (inline-propagation deferred)
+	| 'unsupported-body-cte-dml'   // the view body's own WITH clause defines a data-modifying block (`with m as (insert … returning …)`); the lowering carries the body's definitions into the base statement and cannot carry a DML one
 	| 'unsupported-source'         // INSERT source shape we cannot thread filter defaults through yet
 	| 'unsupported-multisource-insert' // INSERT into a join view — needs the shared-surrogate context (later phase)
 	| 'cross-source-assignment'    // UPDATE value references a base table other than the column it assigns

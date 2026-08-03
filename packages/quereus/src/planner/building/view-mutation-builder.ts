@@ -46,7 +46,15 @@ const log = createLogger('planner:view-mutation');
  * results are sequenced in a `ViewMutationNode`. For the single-source case the
  * wrapped subtree is byte-identical to what the retired AST rewrite re-planned.
  */
-export function buildViewMutation(ctx: PlanningContext, viewIn: MutableViewLike, req: MutationRequest): PlanNode {
+export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLike, req: MutationRequest): PlanNode {
+	// The per-lowering memo for the body's own `with` clause definitions, carried onto every
+	// copied fragment below. One memo per lowering ⇒ every fragment that references a
+	// body-local CTE shares ONE plan node for it, so a definition referenced by two fragments
+	// is evaluated once (matching the read) rather than once per fragment. An EPHEMERAL target
+	// stamps nothing (its body is part of the caller's statement), so it needs no memo and
+	// plans on the caller's context untouched. Everything below reads `ctx`.
+	const ctx: PlanningContext = viewIn.ephemeral ? ctxIn : { ...ctxIn, storedBodyCTECache: new Map() };
+
 	// Site-validate the view-level reserved tags (a sited error for a typo'd /
 	// mis-sited `quereus.*` key on the view/MV is raised here, before any base op
 	// is built — atomic). The statement's own tags were already validated at the
@@ -97,11 +105,26 @@ export function buildViewMutation(ctx: PlanningContext, viewIn: MutableViewLike,
 	// row, and plans are cached), so the cost is proportional to body size once per plan.
 	// If very large view bodies plus high plan-cache churn ever show up in a profile, skip
 	// the walk for a body that contains no nested sub-select at all.
+	//
+	// The body's OWN `with` clause rides the same stamp (`storedBodyCTEs`): re-entering the
+	// home environment clears the caller's CTE namespace, so without the carry a fragment
+	// sub-select that reads a body-local CTE has nothing to bind to — it errors
+	// (`Table 'c' not found`) or, when a real table of that name exists, silently binds the
+	// WRONG relation and the write affects no rows while the read of the same view returns
+	// them. `rebuildSelect` clones a `with` clause without descending into it, so the
+	// definitions themselves are never stamped: their sub-selects are built under the home
+	// environment already, exactly as on the read path.
+	const bodyCTEs = !viewIn.ephemeral && viewIn.selectAst.type === 'select' ? viewIn.selectAst.withClause : undefined;
+	if (bodyCTEs) rejectDataModifyingBodyCTE(viewIn, bodyCTEs);
 	const view: MutableViewLike = viewIn.ephemeral
 		? viewIn
 		: {
 			...viewIn,
-			selectAst: mapNestedSelects(viewIn.selectAst, sel => ({ ...sel, storedHomeSchema: viewIn.schemaName })),
+			selectAst: mapNestedSelects(viewIn.selectAst, sel => ({
+				...sel,
+				storedHomeSchema: viewIn.schemaName,
+				...(bodyCTEs ? { storedBodyCTEs: bodyCTEs } : {}),
+			})),
 		};
 
 	// A decomposition INSERT fans out one insert per member off the same shared-
@@ -321,6 +344,32 @@ export function buildViewMutation(ctx: PlanningContext, viewIn: MutableViewLike,
 		? { source: selfCapture.source, descriptor: selfCapture.descriptor }
 		: keyCapture ? { source: keyCapture.source, descriptor: keyCapture.descriptor } : undefined;
 	return new ViewMutationNode(ctx.scope, children, returning, undefined, returningTiming, identityCapture);
+}
+
+/**
+ * Reject a write through a view whose body's `with` clause defines a **data-modifying**
+ * block (`with m as (insert … returning …)`). Reading such a view already executes the
+ * insert once per read; once the definitions are carried into the lowering the write would
+ * execute it too — and the shared plan node the memo hands every fragment makes a
+ * multi-reference of it fail outright inside the runtime (`sourceIterable is not async
+ * iterable`). A structured rejection is strictly better than either, and better than the
+ * `Table 'm' not found` the un-carried lowering used to raise.
+ *
+ * Deliberately unconditional on whether a copied fragment actually references the block:
+ * the reject is about the shape of the body, and `view_info` mirrors exactly this gate
+ * (`deriveViewInfo`) so the advertised writability agrees. An ephemeral target stamps
+ * nothing, so it never reaches here.
+ */
+function rejectDataModifyingBodyCTE(view: MutableViewLike, withClause: AST.WithClause): void {
+	for (const cte of withClause.ctes) {
+		if (cte.query.type === 'select' || cte.query.type === 'values') continue;
+		raiseMutationDiagnostic({
+			reason: 'unsupported-body-cte-dml',
+			table: view.name,
+			message: `cannot write through view '${view.name}': its body's WITH clause defines '${cte.name}' as a data-modifying statement (${cte.query.type}), which the write-through lowering cannot carry into the base statement`,
+			suggestion: 'Restrict the view body\'s WITH clause to SELECT / VALUES definitions, or write against the base table directly.',
+		});
+	}
 }
 
 /**

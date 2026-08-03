@@ -33,7 +33,7 @@ import { computeLensAssertedKeyFds } from '../../schema/lens-prover.js';
 import { buildLensAuxiliaryAccessMarker } from './lens-auxiliary-access.js';
 
 // Import decomposed functionality
-import { buildWithContext } from './select-context.js';
+import { buildWithContext, buildStoredBodyCTEs } from './select-context.js';
 import { storedBodyContext } from '../stored-body-context.js';
 import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
@@ -95,7 +95,19 @@ export function buildSelectStmt(
 	// `ctx.cteNodes` here as an EXPLICIT `parentCTEs` argument, and `buildWithContext`
 	// prefers a non-empty explicit argument over `ctx.cteNodes` (`building/select-context.ts`).
 	// Without this reset a caller `with ls as (…) update v …` still shadows the body's `ls`.
-	const storedParentCTEs = storedSwap ? new Map<string, CTEScopeNode>() : parentCTEs;
+	//
+	// The caller's namespace is replaced by the BODY's own definitions, which the stamp
+	// carries alongside the home-schema marker (`stmt.storedBodyCTEs`) — otherwise a fragment
+	// sub-select reading a body-local CTE has nothing to bind to. Empty map when the body has
+	// no `with` clause, so the plain case is unchanged. Built on `storedCtx` (the home
+	// environment) BEFORE the `schemaPath` swap below, so the definitions resolve exactly as
+	// they do on the read path; `buildWithContext` then merges this fragment's own `with`
+	// clause on top, so a fragment-local name still shadows a body-local one. A sub-select
+	// nested inside an already-swapped fragment inherits them through `ctx.cteNodes` (the
+	// marker is inert there), as before.
+	const storedParentCTEs = storedSwap
+		? buildStoredBodyCTEs(storedCtx, stmt.storedBodyCTEs)
+		: parentCTEs;
 
 	// Apply schema path from statement if present
 	const contextWithSchemaPath = stmt.schemaPath

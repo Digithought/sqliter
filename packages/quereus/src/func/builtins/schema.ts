@@ -749,6 +749,17 @@ function buildTableRefsById(nodes: RelationalPlanNode[]): Map<number, TableRefer
 	return tableRefsById;
 }
 
+/**
+ * True when the view body's own `WITH` clause defines a data-modifying block — an
+ * `insert`/`update`/`delete … returning` CTE. The static shadow of the dynamic write
+ * path's `rejectDataModifyingBodyCTE` gate, so `view_info` reports the conservative row
+ * for a shape every write through it rejects.
+ */
+function hasDataModifyingBodyCte(selectAst: AST.QueryExpr): boolean {
+	if (selectAst.type !== 'select' || !selectAst.withClause) return false;
+	return selectAst.withClause.ctes.some(cte => cte.query.type !== 'select' && cte.query.type !== 'values');
+}
+
 /** Record `baseColumn` (lowercased) as defaultable for base table `table`. */
 function addDefaultable(map: Map<number, Set<string>>, table: number, baseColumn: string): void {
 	const set = map.get(table) ?? new Set<string>();
@@ -776,6 +787,13 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	if (!root) return CONSERVATIVE_VIEW_INFO;
 
 	const nodes = collectBodyNodes(root);
+
+	// Data-modifying body `with` block (`with m as (insert … returning …)`): the body plans
+	// fine — and its lineage may look perfectly writable — but every write through the view
+	// is rejected up front (`unsupported-body-cte-dml`, `rejectDataModifyingBodyCTE` in
+	// `planner/building/view-mutation-builder.ts`), so reporting anything but the conservative
+	// row would over-claim. Mirrors the `isJoinBody && !isDecomposableJoinBody` shape gate below.
+	if (hasDataModifyingBodyCte(view.selectAst)) return CONSERVATIVE_VIEW_INFO;
 
 	// The minimal `MutableViewLike` the set-op insertability probe re-derives the branches from
 	// (the same `{ name, schemaName, selectAst }` shape the write path / `deriveBackingShape` use).
