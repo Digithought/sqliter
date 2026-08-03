@@ -195,8 +195,8 @@ export interface PlanningContext {
   /**
    * Set to `<schemaName>` by {@link import('./stored-body-context.js').storedBodyContext}
    * when this context IS the home naming environment of that schema's stored body.
-   * Read only by `building/select.ts`, to decide whether a sub-select carrying an
-   * {@link import('../parser/ast.js').SelectStmt.storedHomeSchema} marker still needs
+   * Read only by `building/select.ts`, to decide whether a sub-select carrying a
+   * {@link import('../parser/ast.js').SelectStmt.storedBodyEnv} marker still needs
    * the swap: while the body itself is being planned the context already is that
    * environment, so re-swapping would clear the body's own CTE definitions.
    */
@@ -204,7 +204,7 @@ export interface PlanningContext {
 
   /**
    * Per-lowering memo of the CTE definitions carried on a copied body fragment
-   * ({@link import('../parser/ast.js').SelectStmt.storedBodyCTEs}), keyed by the body's
+   * ({@link import('../parser/ast.js').StoredBodyEnv.withClause}), keyed by the body's
    * `WITH` clause AST object. Created by `buildViewMutation` for a non-ephemeral target,
    * so every fragment of ONE lowering shares one plan node per body-local CTE — two
    * fragments referencing the same definition must not each build their own copy, or the

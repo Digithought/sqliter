@@ -89,13 +89,13 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 		);
 	}
 
-	// Mark the stored body's NESTED sub-selects with the view's home schema, once, here —
-	// `buildViewMutation` is the single funnel every view-mediated write passes through
-	// (single-source, multi-source, decomposition, set-op, lens), so every spine's copied
-	// fragments inherit the marker without each spine being touched. The lowered statement
-	// plans on the caller's context, and `buildSelectStmt` uses the marker to re-enter the
-	// view's own naming environment for exactly those fragments (schema path AND CTE
-	// namespace) — see `mutation/scope-transform.ts` § mapNestedSelects.
+	// Mark the stored body's NESTED sub-selects with the body's whole naming environment,
+	// once, here — `buildViewMutation` is the single funnel every view-mediated write passes
+	// through (single-source, multi-source, decomposition, set-op, lens), so every spine's
+	// copied fragments inherit the marker without each spine being touched. The lowered
+	// statement plans on the caller's context, and `buildSelectStmt` uses the marker to
+	// re-enter the view's own naming environment for exactly those fragments — see
+	// `mutation/scope-transform.ts` § mapNestedSelects and {@link AST.StoredBodyEnv}.
 	//
 	// The clone is essential: the schema's stored `selectAst` must never be mutated. An
 	// EPHEMERAL target (a CTE-name body, an inline FROM-subquery) is part of the caller's
@@ -107,25 +107,31 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 	// If very large view bodies plus high plan-cache churn ever show up in a profile, skip
 	// the walk for a body that contains no nested sub-select at all.
 	//
-	// The body's OWN `with` clause rides the same stamp (`storedBodyCTEs`): re-entering the
-	// home environment clears the caller's CTE namespace, so without the carry a fragment
-	// sub-select that reads a body-local CTE has nothing to bind to — it errors
-	// (`Table 'c' not found`) or, when a real table of that name exists, silently binds the
-	// WRONG relation and the write affects no rows while the read of the same view returns
-	// them. `rebuildSelect` clones a `with` clause without descending into it, so the
-	// definitions themselves are never stamped: their sub-selects are built under the home
-	// environment already, exactly as on the read path.
-	const bodyCTEs = !viewIn.ephemeral && viewIn.selectAst.type === 'select' ? viewIn.selectAst.withClause : undefined;
-	if (bodyCTEs) rejectDataModifyingBodyCTE(viewIn, bodyCTEs);
+	// The env carries three pieces, all read off the body's TOP-LEVEL select — which is
+	// itself never one of the copied fragments, so nothing else would see them:
+	//  - `homeSchema` — the view's schema, the environment to re-enter;
+	//  - `schemaPath` — the body's declared `with schema` path, so the write resolves
+	//    unqualified names exactly as the read of the same view does;
+	//  - `withClause` — the body's own leading `with` clause, since re-entering the home
+	//    environment clears the caller's CTE namespace and a fragment sub-select reading a
+	//    body-local block would have nothing to bind to (it errors `Table 'c' not found`,
+	//    or — worse — silently binds a same-named real table and the write affects no rows
+	//    while the read of the same view returns them).
+	// `rebuildSelect` clones a `with` clause without descending into it, so the definitions
+	// themselves are never stamped: their sub-selects are built under the home environment
+	// already, exactly as on the read path.
+	const bodySelect = !viewIn.ephemeral && viewIn.selectAst.type === 'select' ? viewIn.selectAst : undefined;
+	if (bodySelect?.withClause) rejectDataModifyingBodyCTE(viewIn, bodySelect.withClause);
+	const storedBodyEnv: AST.StoredBodyEnv = {
+		homeSchema: viewIn.schemaName,
+		schemaPath: bodySelect?.schemaPath,
+		withClause: bodySelect?.withClause,
+	};
 	const view: MutableViewLike = viewIn.ephemeral
 		? viewIn
 		: {
 			...viewIn,
-			selectAst: mapNestedSelects(viewIn.selectAst, sel => ({
-				...sel,
-				storedHomeSchema: viewIn.schemaName,
-				...(bodyCTEs ? { storedBodyCTEs: bodyCTEs } : {}),
-			})),
+			selectAst: mapNestedSelects(viewIn.selectAst, sel => ({ ...sel, storedBodyEnv })),
 		};
 
 	// A decomposition INSERT fans out one insert per member off the same shared-

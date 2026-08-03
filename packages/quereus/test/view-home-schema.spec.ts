@@ -452,9 +452,10 @@ describe('home-schema body resolution (view write-through)', () => {
  * table silently wrote the wrong row set. A plain column reference was never affected —
  * the lowering had already rewritten it to a resolved base column.
  *
- * The fix marks each such sub-select with the view's home schema
- * (`AST.SelectStmt.storedHomeSchema`, stamped by `mapNestedSelects` from
- * `buildViewMutation`) and `buildSelectStmt` re-enters the home naming environment for it.
+ * The fix marks each such sub-select with the body's naming environment
+ * (`AST.SelectStmt.storedBodyEnv`, stamped by `mapNestedSelects` from `buildViewMutation`)
+ * and `buildSelectStmt` re-enters that environment for it. This describe covers the
+ * `homeSchema` arm of that marker; the `schemaPath` arm has its own block below.
  */
 describe('home-schema resolution for sub-selects copied out of a view body', () => {
 	let db: Database;
@@ -655,5 +656,158 @@ describe('home-schema resolution for sub-selects copied out of a view body', () 
 		await db.exec('update (select id, x from et2 where id in (select id from ek2)) as v '
 			+ 'set x = 99 where id = 1 with schema "temp"');
 		expect(await all(db, 'select id, x from temp.et2')).to.deep.equal([{ id: 1, x: 99 }]);
+	});
+});
+
+/**
+ * The sibling arm of the block above (`bug-view-write-body-schema-path-not-carried`). A
+ * `select` can end in `with schema a, b`, naming the schemas its unqualified table names
+ * resolve against, and a view definition is a `select` — so a view can carry one. That
+ * clause lives on the definition's **top-level** select, which is not one of the pieces the
+ * write-through lowering copies into the base statement, so it used to reach the
+ * definition's own FROM sources and nothing else: a sub-select inside a copied fragment
+ * re-entered only the view's plain home path and the write failed with
+ * `Table 't' not found in schema path: <home>` where the matching read succeeded (and the
+ * diagnostic's "add 'temp' to your WITH SCHEMA clause" hint was misleading — the definition
+ * already named it).
+ *
+ * The declared path now rides the same marker as the home schema and the body's own `with`
+ * clause (`AST.StoredBodyEnv`, on `AST.SelectStmt.storedBodyEnv`), applied in
+ * `buildSelectStmt` between the home swap and the carried-`with`-clause build — so a
+ * carried block's own sources see it too. The carried-`with`-clause arm has its own
+ * coverage in test/view-cte-isolation.spec.ts.
+ */
+describe('a view definition carries its declared `with schema` path into write-through lowering', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table main.wa (id integer primary key, x integer)');
+		await db.exec('create table temp.wt (id integer primary key)');
+		await db.exec('insert into main.wa values (1, 10), (2, 20)');
+		await db.exec('insert into temp.wt values (1)');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it("updates through a view whose declared path is what its body's sub-select needs", async () => {
+		// The primary reproduction: `wt` lives only in temp, and only the definition's
+		// declared path reaches it. The read honoured the clause all along.
+		await db.exec('create view main.wv as select id, x from wa where id in (select id from wt) '
+			+ 'with schema "temp", main');
+
+		expect(await all(db, 'select id, x from main.wv'), 'the read already worked')
+			.to.deep.equal([{ id: 1, x: 10 }]);
+
+		await db.exec('update main.wv set x = 48 where id = 1');
+		expect(await all(db, 'select id, x from main.wa order by id'))
+			.to.deep.equal([{ id: 1, x: 48 }, { id: 2, x: 20 }]);
+	});
+
+	it('deletes through the same view', async () => {
+		await db.exec('create view main.wv as select id, x from wa where id in (select id from wt) '
+			+ 'with schema "temp", main');
+
+		await db.exec('delete from main.wv where id = 1');
+		expect(await all(db, 'select id, x from main.wa order by id')).to.deep.equal([{ id: 2, x: 20 }]);
+	});
+
+	it("resolves a carried body-local block's own sources on the declared path", async () => {
+		// The ordering pin: the block `c` is built by `buildStoredBodyCTEs`, so the declared
+		// path has to be on the context BEFORE that build — applying it afterwards fails
+		// inside the block, one level deeper than the case above.
+		await db.exec('create view main.wp as with c as (select id from wt) '
+			+ 'select id, x from wa where id in (select id from c) with schema "temp", main');
+
+		expect(await all(db, 'select id, x from main.wp'), 'the read already worked')
+			.to.deep.equal([{ id: 1, x: 10 }]);
+
+		await db.exec('update main.wp set x = 48 where id = 1');
+		expect(await all(db, 'select id, x from main.wa order by id'))
+			.to.deep.equal([{ id: 1, x: 48 }, { id: 2, x: 20 }]);
+	});
+
+	it("lets a fragment sub-select's OWN `with schema` outrank the carried path", async () => {
+		// Precedence guard. `wt` exists in both schemas with different rows; the definition
+		// declares temp-first, but the sub-select names main explicitly, so it must bind
+		// main.wt (row 2) — the same relation the read binds.
+		await db.exec('create table main.wt (id integer primary key)');
+		await db.exec('insert into main.wt values (2)');
+		await db.exec('create view main.wo as select id, x from wa '
+			+ 'where id in (select id from wt with schema "main") with schema "temp", main');
+
+		expect(await all(db, 'select id, x from main.wo')).to.deep.equal([{ id: 2, x: 20 }]);
+
+		await db.exec('update main.wo set x = 99');
+		expect(await all(db, 'select id, x from main.wa order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 99 }]);
+	});
+
+	it('leaves a definition with no `with schema` clause on the home path', async () => {
+		// The control, in a case where a declared path WOULD have differed: `wt` in both
+		// schemas, no clause ⇒ the home path (main first) wins and the write touches row 2.
+		await db.exec('create table main.wt (id integer primary key)');
+		await db.exec('insert into main.wt values (2)');
+		await db.exec('create view main.wn as select id, x from wa where id in (select id from wt)');
+
+		expect(await all(db, 'select id, x from main.wn')).to.deep.equal([{ id: 2, x: 20 }]);
+
+		await db.exec('update main.wn set x = 99');
+		expect(await all(db, 'select id, x from main.wa order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 99 }]);
+	});
+
+	it('updates through a materialized view whose definition declares a path', async () => {
+		// An MV reaches the same funnel through a different adapter object
+		// (`maintainedTableViewLike`, `schema/derivation.ts`) than a plain `ViewSchema`.
+		await db.exec('create materialized view main.wmv as select id, x from wa '
+			+ 'where id in (select id from wt) with schema "temp", main');
+
+		expect(await all(db, 'select id, x from main.wmv')).to.deep.equal([{ id: 1, x: 10 }]);
+
+		await db.exec('update main.wmv set x = 48 where id = 1');
+		expect(await all(db, 'select id, x from main.wa order by id'))
+			.to.deep.equal([{ id: 1, x: 48 }, { id: 2, x: 20 }]);
+	});
+
+	it('inserts through a view whose `with defaults` value is a sub-select needing the path', async () => {
+		// A different copy channel (`cloneDefaultsClause`) onto the same stamp; `with schema`
+		// parses before the trailing `with defaults`.
+		await db.exec('create table main.wd (id integer primary key, x integer, kind text)');
+		await db.exec('create table temp.wk (kind text primary key)');
+		await db.exec("insert into temp.wk values ('alpha')");
+		await db.exec('create view main.wdv as select id, x from wd '
+			+ 'with schema "temp", main with defaults (kind = (select kind from wk limit 1))');
+
+		await db.exec('insert into main.wdv (id, x) values (1, 10)');
+		expect(await all(db, 'select id, x, kind from main.wd'))
+			.to.deep.equal([{ id: 1, x: 10, kind: 'alpha' }]);
+	});
+
+	it('reaches the LEFT leg of a membership set-op definition that declares a path', async () => {
+		// `with schema` binds to the whole compound and parses on the leading leg, so the
+		// left branch view-like inherits it structurally (`leftBranchSelect` spreads the root).
+		//
+		// KNOWN GAP: the RIGHT branch does not — `rightBranchSelect` spreads `compound.select`,
+		// a leg the parser never let carry the clause — so a sub-select in a right leg still
+		// fails with `Table '<t>' not found in schema path: <home>`. That is a separate site
+		// from this ticket's marker; filed as `fix/bug-setop-right-leg-write-drops-declared-schema-path`.
+		await db.exec('create table main.wsl (id integer primary key, x integer)');
+		await db.exec('create table main.wsr (id integer primary key, x integer)');
+		await db.exec('insert into main.wsl values (1, 10)');
+		await db.exec('insert into main.wsr values (2, 20)');
+		await db.exec('insert into temp.wt values (2)');
+		await db.exec('create view main.wsv as select id, x from wsl where id in (select id from wt) '
+			+ 'with schema "temp", main '
+			+ 'union exists left as inl, exists right as inr select id, x from wsr');
+
+		expect(await all(db, 'select id, x from main.wsv order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+
+		await db.exec('update main.wsv set x = x + 1 where inl = true');
+		expect(await all(db, 'select id, x from main.wsl')).to.deep.equal([{ id: 1, x: 11 }]);
+		expect(await all(db, 'select id, x from main.wsr')).to.deep.equal([{ id: 2, x: 20 }]);
 	});
 });

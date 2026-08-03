@@ -45,15 +45,16 @@ export function buildWithContext(
 
 /**
  * Build the CTE definitions a copied stored-body fragment carries
- * (`AST.SelectStmt.storedBodyCTEs`), for use as that fragment's PARENT CTE namespace.
+ * (`AST.StoredBodyEnv.withClause`), for use as that fragment's PARENT CTE namespace.
  *
  * The write-through lowering copies fragments out of a view body into a statement planned
  * on the caller's context; `buildSelectStmt` re-enters the body's home environment for each
  * such fragment, which clears the caller's CTE namespace. Without this the body's own
  * definitions are gone too, so a fragment sub-select reading one either errors
  * (`Table 'c' not found`) or — worse — binds a same-named real table and writes nothing.
- * `ctx` must already be the home environment (`storedBodyContext`), so the definitions bind
- * the same objects they bind on the read path.
+ * `ctx` must already be the FULL home environment — `storedBodyContext` **plus** the body's
+ * declared `with schema` path, when it has one — so a definition's own `from` sources
+ * resolve exactly as they do on the read path.
  *
  * Returned as a fresh copy per call: `buildWithContext` mutates the map it is handed (it
  * merges the fragment's own `with` clause on top, which must shadow a body-local name for

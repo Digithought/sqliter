@@ -209,7 +209,8 @@ describe('CTE namespace isolation for stored view bodies', () => {
  * severe one — a silent no-op write when a REAL table of that name does exist, so the read
  * and the write of one view disagreed about which relation `c` names.
  *
- * `AST.SelectStmt.storedBodyCTEs` now rides the same stamp as `storedHomeSchema`, and
+ * The body's `with` clause now rides the same stamp as the home schema
+ * (`AST.StoredBodyEnv.withClause`, on `AST.SelectStmt.storedBodyEnv`), and
  * `buildSelectStmt` builds those definitions on the home context as the fragment's parent
  * CTE namespace (`buildStoredBodyCTEs`, `building/select-context.ts`).
  */

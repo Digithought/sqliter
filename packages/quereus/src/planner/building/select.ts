@@ -71,13 +71,23 @@ export function buildSelectStmt(
 ): PlanNode {
 
 	// A sub-select copied out of a stored view / MV body by the write-through lowering
-	// carries a `storedHomeSchema` marker (stamped by `mapNestedSelects` in
-	// `mutation/scope-transform.ts`, from `buildViewMutation`). The lowered statement is a
-	// MIX of caller-authored clauses and definition-derived fragments planned on one
-	// (caller) context, so the resolution decision cannot ride the context — it rides the
-	// AST node, and is applied here. Done before the `schemaPath` / `with schema` swap
-	// below so an explicit in-body `with schema` still wins on the path.
-	const storedHome = stmt.storedHomeSchema;
+	// carries a `storedBodyEnv` marker — the body's whole naming environment (home schema,
+	// the body's declared `with schema` path, the body's own leading `with` clause), stamped
+	// by `mapNestedSelects` in `mutation/scope-transform.ts` from `buildViewMutation`. The
+	// lowered statement is a MIX of caller-authored clauses and definition-derived fragments
+	// planned on one (caller) context, so the resolution decision cannot ride the context —
+	// it rides the AST node, and is applied here.
+	//
+	// The three pieces are consumed in a fixed ORDER, and each step depends on the previous:
+	//   1. re-enter the home environment (`storedBodyContext`) — home path, caller's CTE
+	//      namespace cleared;
+	//   2. override that path with the body's DECLARED `with schema` path, when it has one;
+	//   3. build the body's carried `with` clause on THAT context — so a carried block's own
+	//      `from` sources resolve on the declared path, exactly as they do on the read path
+	//      (getting 2 and 3 the wrong way round fails inside `buildStoredBodyCTEs`);
+	//   4. finally the fragment's OWN `with schema` clause (`stmt.schemaPath`, below) still
+	//      wins over the carried path.
+	const env = stmt.storedBodyEnv;
 	// The guard makes the marker inert while the BODY itself is being planned: `analyzeView`
 	// plans it under `bodyPlanningContext` → `storedBodyContext`, which already IS that home
 	// environment (and stamps `storedBodyOf`). Re-swapping there would re-clear `cteNodes`
@@ -88,28 +98,36 @@ export function buildSelectStmt(
 	// Exact today because that needs a nested write-through (a view over a view), which
 	// `analyzeView` rejects outright. If view-over-view write-through is ever allowed, key
 	// `storedBodyOf` on the body object rather than its schema name.
-	const storedSwap = storedHome !== undefined && ctx.storedBodyOf !== storedHome;
-	const storedCtx = storedSwap ? storedBodyContext(ctx, storedHome) : ctx;
-	// Clearing `ctx.cteNodes` (which `storedBodyContext` does) is NOT sufficient on its own:
-	// `buildExpressionPositionQueryExpr` (`building/expression.ts`) passes the caller's
-	// `ctx.cteNodes` here as an EXPLICIT `parentCTEs` argument, and `buildWithContext`
-	// prefers a non-empty explicit argument over `ctx.cteNodes` (`building/select-context.ts`).
-	// Without this reset a caller `with ls as (…) update v …` still shadows the body's `ls`.
+	const storedSwap = env !== undefined && ctx.storedBodyOf !== env.homeSchema;
+	// Steps 1 + 2. The declared path is applied here rather than inside `storedBodyContext`:
+	// that function is shared with the read path and takes only a schema name — it has no
+	// access to the body AST, and on the read path the body's top-level node applies its own
+	// `schemaPath` already.
+	let storedCtx = ctx;
+	if (storedSwap) {
+		storedCtx = storedBodyContext(ctx, env!.homeSchema);
+		if (env!.schemaPath) storedCtx = { ...storedCtx, schemaPath: env!.schemaPath };
+	}
+	// Step 3. Clearing `ctx.cteNodes` (which `storedBodyContext` does) is NOT sufficient on
+	// its own: `buildExpressionPositionQueryExpr` (`building/expression.ts`) passes the
+	// caller's `ctx.cteNodes` here as an EXPLICIT `parentCTEs` argument, and
+	// `buildWithContext` prefers a non-empty explicit argument over `ctx.cteNodes`
+	// (`building/select-context.ts`). Without this reset a caller `with ls as (…) update v …`
+	// still shadows the body's `ls`.
 	//
 	// The caller's namespace is replaced by the BODY's own definitions, which the stamp
-	// carries alongside the home-schema marker (`stmt.storedBodyCTEs`) — otherwise a fragment
-	// sub-select reading a body-local CTE has nothing to bind to. Empty map when the body has
-	// no `with` clause, so the plain case is unchanged. Built on `storedCtx` (the home
-	// environment) BEFORE the `schemaPath` swap below, so the definitions resolve exactly as
-	// they do on the read path; `buildWithContext` then merges this fragment's own `with`
-	// clause on top, so a fragment-local name still shadows a body-local one. A sub-select
-	// nested inside an already-swapped fragment inherits them through `ctx.cteNodes` (the
-	// marker is inert there), as before.
+	// carries (`env.withClause`) — otherwise a fragment sub-select reading a body-local CTE
+	// has nothing to bind to. Empty map when the body has no `with` clause, so the plain case
+	// is unchanged. `buildWithContext` then merges this fragment's own `with` clause on top,
+	// so a fragment-local name still shadows a body-local one. A sub-select nested inside an
+	// already-swapped fragment inherits them through `ctx.cteNodes` (the marker is inert
+	// there), as before.
 	const storedParentCTEs = storedSwap
-		? buildStoredBodyCTEs(storedCtx, stmt.storedBodyCTEs)
+		? buildStoredBodyCTEs(storedCtx, env!.withClause)
 		: parentCTEs;
 
-	// Apply schema path from statement if present
+	// Step 4: apply schema path from statement if present — a fragment's own `with schema`
+	// clause outranks the carried one.
 	const contextWithSchemaPath = stmt.schemaPath
 		? { ...storedCtx, schemaPath: stmt.schemaPath }
 		: storedCtx;

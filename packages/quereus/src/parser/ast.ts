@@ -196,33 +196,62 @@ export interface SelectStmt extends AstNode {
 	 */
 	defaults?: ReadonlyArray<ViewInsertDefault>;
 	/**
-	 * Home schema of the stored view / materialized-view body this sub-select was
-	 * copied out of. Write-through lowering metadata ONLY: the lowering copies
-	 * definition-derived fragments (the view's own `where`, each view column's
-	 * base-term expression) into a statement planned on the *caller's* context, so a
-	 * sub-select inside such a fragment would otherwise resolve its `from` names in the
-	 * caller's naming environment. Stamped by `mapNestedSelects`
-	 * (`planner/mutation/scope-transform.ts`) from `buildViewMutation`, and honoured by
-	 * `buildSelectStmt`, which re-enters the object's home environment
-	 * (`storedBodyContext`) for the marked fragment. Never set by the parser and inert
-	 * everywhere else. See docs/view-updateability.md § Schema resolution during
-	 * write-through.
+	 * The naming environment of the stored view / materialized-view body this
+	 * sub-select was copied out of. See {@link StoredBodyEnv}. Never set by the
+	 * parser and inert everywhere else.
 	 */
-	storedHomeSchema?: string;
+	storedBodyEnv?: StoredBodyEnv;
+}
+
+/**
+ * The whole naming environment of a stored view / materialized-view body, carried on a
+ * sub-select the write-through lowering copied out of that body.
+ *
+ * Write-through lowering metadata ONLY; never set by the parser. A write through a view
+ * is not executed as the body plan — it is *lowered* into a plain INSERT/UPDATE/DELETE
+ * against the base table, and definition-derived fragments (the view's own `where`, each
+ * view column's base-term expression, an authored `with inverse` put, a `with defaults`
+ * value) are copied into that lowered statement. The result is a mix of caller-authored
+ * clauses and definition-derived fragments planned on ONE (the caller's) context, so
+ * "which naming environment does this piece belong to" cannot ride the context — it rides
+ * the AST node. `buildViewMutation` stamps this object onto every nested sub-select of the
+ * cloned body (via `mapNestedSelects`, `planner/mutation/scope-transform.ts`) and
+ * `buildSelectStmt` (`planner/building/select.ts`) consumes it.
+ *
+ * The three pieces are always stamped together and consumed together, in a fixed ORDER
+ * (home swap → declared path → carried `with` clause) — hence one object rather than three
+ * parallel optional fields, so a fourth piece cannot be silently missed. See
+ * docs/view-updateability.md § Schema resolution during write-through.
+ */
+export interface StoredBodyEnv {
 	/**
-	 * The stored body's own `WITH` clause, carried along with a fragment copied out of
-	 * that body. Write-through lowering metadata ONLY, the sibling of
-	 * {@link SelectStmt.storedHomeSchema}: re-entering the body's home naming environment
-	 * clears the caller's CTE namespace, so a copied sub-select that reads a body-local
-	 * CTE would have nothing to bind to. Stamped by `mapNestedSelects`
-	 * (`planner/mutation/scope-transform.ts`) from `buildViewMutation` onto the same
-	 * clones that carry `storedHomeSchema`, and consumed by `buildSelectStmt`, which
-	 * builds these definitions on the home context and hands them in as the fragment's
-	 * parent CTE namespace (the fragment's OWN `with` clause still shadows them). Never
-	 * set by the parser and inert everywhere else. See docs/view-updateability.md
-	 * § Schema resolution during write-through.
+	 * Schema the stored view / MV this fragment was copied out of lives in. Without it
+	 * a sub-select inside a fragment resolves its `from` names on the CALLER's search
+	 * path: a non-`main` view fails outright, and a `main` view under a session path
+	 * that reaches a same-named table silently writes the wrong row set.
+	 * `buildSelectStmt` re-enters the object's home environment (`storedBodyContext`)
+	 * for the marked fragment.
 	 */
-	storedBodyCTEs?: WithClause;
+	readonly homeSchema: string;
+	/**
+	 * The definition's declared `with schema` path, when it has one. It lives on the
+	 * body's top-level `SelectStmt` — which is not one of the copied pieces — so
+	 * without the carry a fragment resolves on the plain home path and the write
+	 * disagrees with the read of the same view about which tables exist. Applied AFTER
+	 * the home swap and BEFORE the carried `with` clause is built, so a carried block's
+	 * own sources see the declared path too. A fragment's OWN `with schema` clause
+	 * (`SelectStmt.schemaPath`) still wins over this.
+	 */
+	readonly schemaPath?: string[];
+	/**
+	 * The definition's own leading `with` clause, when it has one. Re-entering the
+	 * body's home naming environment clears the caller's CTE namespace, so a copied
+	 * sub-select that reads a body-local CTE would otherwise have nothing to bind to.
+	 * `buildSelectStmt` builds these definitions on the home context and hands them in
+	 * as the fragment's parent CTE namespace (the fragment's OWN `with` clause still
+	 * shadows them).
+	 */
+	readonly withClause?: WithClause;
 }
 
 /**

@@ -8,7 +8,11 @@ import type { PlanningContext } from './planning-context.js';
  *
  *  - `schemaPath` → the object's own home path — the database default schema-resolution
  *    order rooted at `schemaName` ({@link import('../core/database.js').Database._homeSchemaPath}),
- *    independent of the referencing statement's search path;
+ *    independent of the referencing statement's search path. A body that declares its own
+ *    `with schema` path overrides this: on the read path its top-level `SelectStmt.schemaPath`
+ *    applies right after this call; on the write path `building/select.ts` applies the same
+ *    path carried on the fragment's marker. That override is deliberately NOT folded in here
+ *    — this function takes only a schema name and has no access to the body AST;
  *  - `cteNodes` → cleared, so a caller `with` clause whose name matches a body source
  *    cannot shadow it. The body's OWN leading `with` clause still resolves — it is built
  *    by `buildWithContext` from the body statement, not inherited. Clearing here is what
@@ -21,8 +25,8 @@ import type { PlanningContext } from './planning-context.js';
  *  - `storedBodyOf` → `schemaName`, marking this context AS that body's home environment.
  *    A write through a view is not executed as the body plan — it is *lowered* into a
  *    base-table INSERT/UPDATE/DELETE, and definition-derived fragments copied into that
- *    lowered statement are planned on the CALLER's context. Such a fragment carries an
- *    {@link import('../parser/ast.js').SelectStmt.storedHomeSchema} marker instead, and
+ *    lowered statement are planned on the CALLER's context. Such a fragment carries a
+ *    {@link import('../parser/ast.js').StoredBodyEnv} marker instead, and
  *    `building/select.ts` re-enters the home environment through this function when it
  *    meets one. `storedBodyOf` is what makes that marker inert while the body itself is
  *    being planned here (the context already IS the home environment), so the body's own

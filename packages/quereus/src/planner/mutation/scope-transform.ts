@@ -191,9 +191,11 @@ export function mapQueryExprUniform(
  * lowered statement, which is then planned on the CALLER's context. A plain column
  * reference survives that move because the lowering rewrote it to a resolved base
  * column, but a sub-select's `from` names ride through verbatim. `buildViewMutation`
- * therefore stamps each such sub-select with the view's home schema
- * ({@link AST.SelectStmt.storedHomeSchema}) so `buildSelectStmt` re-enters the home
- * naming environment when it meets one.
+ * therefore stamps each such sub-select with the body's whole naming environment
+ * ({@link AST.StoredBodyEnv}, on {@link AST.SelectStmt.storedBodyEnv}) so
+ * `buildSelectStmt` re-enters it when it meets one: the view's home schema, the body's
+ * declared `with schema` path, and the body's own leading `with` clause — each of which
+ * lives on the body's TOP-LEVEL select, which is never itself one of the copied pieces.
  *
  * The **top-level root is deliberately NOT stamped** — it is the body itself, planned
  * under `bodyPlanningContext` → `storedBodyContext`, which already IS that
@@ -203,11 +205,6 @@ export function mapQueryExprUniform(
  *
  * No substitution is threaded — this is a pure clone plus the stamp. Marking a CLONE
  * is required: the schema's stored `selectAst` must never be mutated.
- *
- * The caller may stamp more than the home schema: `buildViewMutation` also puts the body's
- * OWN `with` clause on each clone ({@link AST.SelectStmt.storedBodyCTEs}), so a fragment
- * sub-select that reads a body-local CTE still has it in scope once the home swap has
- * cleared the caller's CTE namespace.
  *
  * NOTE: a `with` clause's CTE bodies are cloned unstamped (via {@link cloneWithClause}),
  * and that stays correct with the carry above: a definition's own sub-selects are built by
