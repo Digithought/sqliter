@@ -10,7 +10,10 @@
 
 import chalk from 'chalk';
 import { hashRemoteModule, installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
-import type { RemoteModuleFetch } from '@quereus/plugin-loader';
+import type { RemoteModuleFetch, QuoombConfig } from '@quereus/plugin-loader';
+
+/** A SHA-256 as a config entry or plugin record must supply it: 64 hex characters. */
+const SHA256_HEX = /^[0-9a-f]{64}$/i;
 
 /**
  * Most recent fetch per requested URL. Read back by the `.plugin` commands so an
@@ -31,6 +34,14 @@ const lastFetchByUrl = new Map<string, RemoteModuleFetch>();
  */
 const pinnedHashByUrl = new Map<string, string>();
 
+/**
+ * Expected hashes declared directly in `quoomb.config.json`. Keyed the same way
+ * as {@link pinnedHashByUrl}. Takes precedence over it in {@link lookupPin}: the
+ * config file is the explicit, reviewed declaration, while a record hash is only
+ * what happened to be served the first time someone ran `.plugin install`.
+ */
+const configPinnedHashByUrl = new Map<string, string>();
+
 let installed = false;
 
 /**
@@ -48,9 +59,8 @@ let installed = false;
  * (record order in `plugins.json`). Only reachable by hand-editing that file —
  * `.plugin install` refuses a URL that is already installed.
  *
- * A second source — hashes declared in `quoomb.config.json` — is planned; when it
- * lands it takes precedence over these, which is why {@link lookupPin} stays
- * private.
+ * A config-declared hash for the same URL takes precedence over these — see
+ * {@link setConfigPinnedHashes} — which is why {@link lookupPin} stays private.
  */
 export function setRecordPinnedHashes(pins: Iterable<{ url: string; sha256: string }>): void {
 	pinnedHashByUrl.clear();
@@ -63,12 +73,86 @@ export function setRecordPinnedHashes(pins: Iterable<{ url: string; sha256: stri
 }
 
 /**
+ * Expected hashes declared in `quoomb.config.json`. Seeded once per process,
+ * before any config plugin loads. Takes precedence over hashes derived from
+ * `~/.quoomb/plugins.json` (see {@link setRecordPinnedHashes}): the config file
+ * is the explicit, reviewed declaration, and a record hash is only what happened
+ * to be served once.
+ *
+ * When a URL is pinned by both sources to *different* hashes, warns once here
+ * (not on every subsequent lookup) naming the URL and both values, so a user is
+ * not left wondering why their `.plugin trust` had no effect.
+ */
+export function setConfigPinnedHashes(pins: Iterable<{ url: string; sha256: string }>): void {
+	configPinnedHashByUrl.clear();
+	for (const pin of pins) {
+		configPinnedHashByUrl.set(normalizeUrlKey(pin.url), pin.sha256);
+	}
+	for (const [url, configHash] of configPinnedHashByUrl) {
+		const recordHash = pinnedHashByUrl.get(url);
+		if (recordHash && recordHash !== configHash) {
+			console.warn(chalk.yellow(
+				`Plugin ${url} is pinned to different hashes by quoomb.config.json (${configHash}) ` +
+				`and its saved plugin record (${recordHash}); the config file's hash wins.`
+			));
+		}
+	}
+}
+
+/**
  * The hash `url` must serve, or undefined when it is not pinned. Deliberately
- * not exported: the resolver asks through the closure below, so a second pin
- * source can slot in ahead of the record source without touching callers.
+ * not exported: the resolver asks through the closure below, so a caller cannot
+ * bypass the config → record precedence.
  */
 function lookupPin(url: string): string | undefined {
-	return pinnedHashByUrl.get(normalizeUrlKey(url));
+	const key = normalizeUrlKey(url);
+	return configPinnedHashByUrl.get(key) ?? pinnedHashByUrl.get(key);
+}
+
+/**
+ * Validates every `sha256` a `QuoombConfig` declares on its plugins and seeds
+ * the config pin table from it. Called once per config load, before
+ * `loadPluginsFromConfig` — a config that believes it is pinning but cannot be
+ * enforced is worse than no pin, so this throws rather than loading unverified.
+ *
+ * Hard errors, naming the offending entry:
+ * - `sha256` on a source that is not an `https:` URL (`npm:`, a bare package
+ *   name, `file:`) — it never reaches the remote resolver, so the hash could
+ *   never be checked.
+ * - `sha256` that is not 64 hex characters.
+ *
+ * `config` must already be env-interpolated — a `${PLUGIN_SHA}` placeholder is
+ * validated after substitution, not before.
+ */
+export function seedConfigPluginPins(config: QuoombConfig): void {
+	const pins: Array<{ url: string; sha256: string }> = [];
+	for (const plugin of config.plugins ?? []) {
+		if (!plugin.sha256) continue;
+
+		if (!isHttpsUrl(plugin.source)) {
+			throw new Error(
+				`Config plugin '${plugin.source}' declares sha256 but is not an https: source; ` +
+				`its hash can never be checked. Remove sha256, or serve it over https:.`
+			);
+		}
+		if (!SHA256_HEX.test(plugin.sha256)) {
+			throw new Error(
+				`Config plugin '${plugin.source}' declares sha256 '${plugin.sha256}', ` +
+				`which is not 64 hex characters.`
+			);
+		}
+		pins.push({ url: plugin.source, sha256: plugin.sha256.toLowerCase() });
+	}
+	setConfigPinnedHashes(pins);
+}
+
+/** True when `url` is an `https:` source — the only kind the remote resolver, and so a pin, can ever act on. */
+function isHttpsUrl(url: string): boolean {
+	try {
+		return new URL(url).protocol === 'https:';
+	} catch {
+		return false;
+	}
 }
 
 /**

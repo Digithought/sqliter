@@ -960,6 +960,18 @@ Behavior:
   The CLI records each plugin's hash in `~/.quoomb/plugins.json` (`PluginRecord.sha256`) and, by default, warns when the module behind a URL has changed since it was installed. That comparison happens after the load, so the warning reports code that has already run — a change notice, not a gate.
 
   Setting `PluginRecord.pinned` turns it into a gate: the CLI feeds every pinned record's `sha256` to `expectedHash`, so a mismatch is refused before the module is imported. It is opt-in per plugin (`.plugin install <url> --pin`, or `.plugin pin <name>`), and a pinned record with no recorded hash is a first observation rather than a violation — the next successful load records one and enforcement starts there. `.plugin trust <name> [hash]` records a new expected hash (fetching and digesting the URL without importing it when no hash is given), `.plugin unpin <name>` goes back to warning; both take effect in the same session. A pin that a startup load refuses does *not* disable the plugin — the code changed, the plugin is not broken — and the CLI prints those two remedies instead. `pinned` is meaningful only in a host that installed the Node resolver: quoomb-web keeps its own record type and imports `https:` URLs natively, with no verification step.
+
+  A plugin loaded from `quoomb.config.json` can declare its expected hash directly on the entry, instead of (or alongside) a `.plugin pin` on the installed record:
+
+  ```json
+  {
+    "plugins": [
+      { "source": "https://example.com/plugin.js", "sha256": "3f29b8...(64 hex chars)" }
+    ]
+  }
+  ```
+
+  Enforced the same way as a pinned record — refused before the module is imported — but `sha256` is only ever checked on an `https:` source, since only those reach the Node remote resolver. Declaring it on an `npm:` spec, a bare package name, or a `file:` source is a startup error naming the entry, not a silent no-op; so is a `sha256` that is not 64 hex characters. When the same URL is pinned by both the config file and a saved plugin record to different hashes, the config file's hash wins and the CLI warns once, naming the URL and both values.
 - npm package resolution prefers the `exports['./plugin']` subpath. In Node, the package is loaded directly. In browsers, npm resolution is disabled by default; enabling it requires `{ allowCdn: true }` and maps to a CDN URL.
 - Version compatibility: if the package declares `engines.quereus` or a `peerDependency` on `@quereus/quereus`, hosts should throw when incompatible (error, not warning).
 

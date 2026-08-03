@@ -9,7 +9,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import Table from 'cli-table3';
-import { installRemotePluginResolver } from '../plugins/remote-resolver.js';
+import { installRemotePluginResolver, seedConfigPluginPins } from '../plugins/remote-resolver.js';
 import { syncSavedPluginPins } from '../commands/dot-commands.js';
 
 // Must run before any plugin is loaded — config autoload, saved-plugin autoload,
@@ -152,6 +152,7 @@ async function executeCommand(sql: string, options: CliOptions): Promise<void> {
             // One-shot mode never loads the saved records, but a URL they pin is
             // still pinned wherever it is loaded from.
             await syncSavedPluginPins();
+            seedConfigPluginPins(interpolatedConfig);
             await loadPluginsFromConfig(db, interpolatedConfig);
           }
         }

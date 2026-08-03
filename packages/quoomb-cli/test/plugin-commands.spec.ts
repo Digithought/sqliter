@@ -26,7 +26,7 @@ import { Database } from '@quereus/quereus';
 import { dynamicLoadModule } from '@quereus/plugin-loader';
 import type { PluginRecord } from '@quereus/plugin-loader';
 import { handleDotCommand, loadEnabledPlugins, syncSavedPluginPins } from '../src/commands/dot-commands.js';
-import { installRemotePluginResolver, setRecordPinnedHashes } from '../src/plugins/remote-resolver.js';
+import { installRemotePluginResolver, setRecordPinnedHashes, setConfigPinnedHashes, seedConfigPluginPins } from '../src/plugins/remote-resolver.js';
 import type { Interface as ReadlineInterface } from 'node:readline';
 
 const PLUGIN_SOURCE = 'export default function register() { return {}; }\n';
@@ -97,6 +97,7 @@ describe('.plugin subcommands', () => {
 		// The resolver and its pin table are process-wide; leaving a pin behind
 		// would gate the next test's loads.
 		setRecordPinnedHashes([]);
+		setConfigPinnedHashes([]);
 		await db.close();
 		await rm(homeDir, { recursive: true, force: true });
 	});
@@ -571,6 +572,46 @@ describe('.plugin subcommands', () => {
 			// never fetched, let alone imported.
 			expect(fetchCount).toBe(fetchesBefore);
 			expect(v2Evaluated()).toBe(false);
+		});
+
+		describe('config-declared pins', () => {
+			it('loads a config-declared hash that matches what is served, without complaint', async () => {
+				serveModule(MODULE_URL_NO_MANIFEST);
+				seedConfigPluginPins({ plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE) }] });
+
+				await expect(dynamicLoadModule(MODULE_URL_NO_MANIFEST, db, {})).resolves.toBeUndefined();
+			});
+
+			it('refuses a config-declared hash that does not match, before importing the module', async () => {
+				seedConfigPluginPins({ plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE_V2) }] });
+
+				await expect(dynamicLoadModule(MODULE_URL_NO_MANIFEST, db, {})).rejects.toThrow(/pinned SHA-256/);
+				expect(v2Evaluated()).toBe(false);
+			});
+
+			it('prefers the config hash over a disagreeing saved-record hash', async () => {
+				await install({ pin: true });
+				serveChangedBytes();
+
+				seedConfigPluginPins({ plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: sha256(PLUGIN_SOURCE_V2) }] });
+
+				// The record still pins the old hash; the config's hash wins, so the
+				// changed bytes — which the record alone would have refused — load.
+				await expect(dynamicLoadModule(MODULE_URL_NO_MANIFEST, db, {})).resolves.toBeUndefined();
+				expect(v2Evaluated()).toBe(true);
+			});
+
+			it('rejects a config sha256 declared on a non-https source at seed time, before any load', () => {
+				expect(() => seedConfigPluginPins({
+					plugins: [{ source: 'npm:@scope/foo', sha256: sha256(PLUGIN_SOURCE) }]
+				})).toThrow(/not an https/);
+			});
+
+			it('rejects a malformed config sha256 at seed time, before any load', () => {
+				expect(() => seedConfigPluginPins({
+					plugins: [{ source: MODULE_URL_NO_MANIFEST, sha256: 'deadbeef' }]
+				})).toThrow(/64 hex characters/);
+			});
 		});
 	});
 });

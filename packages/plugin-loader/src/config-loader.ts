@@ -15,6 +15,12 @@ const log = debug('quereus:config-loader');
 export interface PluginConfig {
 	source: string;
 	config?: Record<string, unknown>;
+	/**
+	 * SHA-256 (hex) the module at `source` must hash to. Enforced before the
+	 * module is imported; a mismatch refuses the load. Only applies to `https:`
+	 * sources fetched by the Node remote resolver.
+	 */
+	sha256?: string;
 }
 
 /**
@@ -169,5 +175,6 @@ function isValidPluginEntry(plugin: unknown): boolean {
 	const p = plugin as Record<string, unknown>;
 	if (typeof p.source !== 'string') return false;
 	if (p.config !== undefined && p.config !== null && (typeof p.config !== 'object' || Array.isArray(p.config))) return false;
+	if (p.sha256 !== undefined && typeof p.sha256 !== 'string') return false;
 	return true;
 }

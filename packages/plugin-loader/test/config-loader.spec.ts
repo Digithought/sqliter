@@ -132,6 +132,14 @@ describe('interpolateConfigEnvVars', () => {
 		});
 		expect(result.plugins?.[0].source).toBe('from-process-env');
 	});
+
+	it('interpolates a ${VAR} placeholder inside sha256', () => {
+		const result = interpolateConfigEnvVars(
+			{ plugins: [{ source: 'https://example.test/p.mjs', sha256: '${PLUGIN_SHA}' }] },
+			{ PLUGIN_SHA: 'a'.repeat(64) }
+		);
+		expect(result.plugins?.[0].sha256).toBe('a'.repeat(64));
+	});
 });
 
 describe('validateConfig', () => {
@@ -184,6 +192,16 @@ describe('validateConfig', () => {
 
 	it('rejects when only one entry of several is malformed', () => {
 		expect(validateConfig({ plugins: [{ source: 'ok' }, { source: 42 }] })).toBe(false);
+	});
+
+	it('accepts a string sha256 and rejects any other type', () => {
+		expect(validateConfig({ plugins: [{ source: 'x', sha256: 'a'.repeat(64) }] })).toBe(true);
+		// Shape validation only checks the type here — 64-hex and https-only are
+		// enforced by the host at seed time, not by validateConfig.
+		expect(validateConfig({ plugins: [{ source: 'x', sha256: 'not-64-hex' }] })).toBe(true);
+		expect(validateConfig({ plugins: [{ source: 'x', sha256: 12345 }] })).toBe(false);
+		expect(validateConfig({ plugins: [{ source: 'x', sha256: {} }] })).toBe(false);
+		expect(validateConfig({ plugins: [{ source: 'x', sha256: null }] })).toBe(false);
 	});
 });
 

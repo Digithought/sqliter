@@ -4,6 +4,7 @@ import { loadPluginsFromConfig, interpolateConfigEnvVars, type QuoombConfig } fr
 import chalk from 'chalk';
 import { DotCommands } from './commands/dot-commands.js';
 import { handleDotCommand, loadEnabledPlugins, syncSavedPluginPins } from './commands/dot-commands.js';
+import { seedConfigPluginPins } from './plugins/remote-resolver.js';
 
 interface REPLOptions {
   json?: boolean;
@@ -56,6 +57,7 @@ export class REPL {
         // load does not go through the record path that would sync it.
         await syncSavedPluginPins();
         const config = interpolateConfigEnvVars(this.options.config);
+        seedConfigPluginPins(config);
         if (config.autoload !== false) {
           await loadPluginsFromConfig(this.db, config);
         }
