@@ -489,6 +489,151 @@ describe('KeySetSemiJoin runtime', () => {
 		});
 	});
 
+	describe('pushed-constraint (IndexSeek) target', () => {
+		// `s = 'x' and v in (select …)` with both columns indexed: the pushed `s`
+		// seek is the target leaf, admitted with its predicate re-applied above
+		// the node. Costs for `big` are doctored so the break-even lands on an
+		// exactly-known key count against the SEEK baseline (the plan the seek
+		// branch displaces), not the plain scan:
+		//
+		//   runtime-set probe: cost = 1 + 10·maxCount → seekAt2 = 21, slope = 10
+		//   s-equality probe (the physicalization request): cost = 61
+		//   breakEvenKeys = floor(2 + (61 − 21) / 10) = 6
+		//
+		// Only the `s = ?` cost is doctored (column 2), so index-nested-loop's
+		// synthesized join-key probes on `v` see stock costs and the join arrives
+		// as the same hash semi join it does undoctored.
+		class SeekBaselineModule extends IdxStrCapturingModule {
+			override getBestAccessPlan(
+				db: Database,
+				tableInfo: TableSchema,
+				request: BestAccessPlanRequest,
+			): BestAccessPlanResult {
+				const plan = MemoryTableModule.prototype.getBestAccessPlan.call(this, db, tableInfo, request) as BestAccessPlanResult;
+				if (tableInfo.name.toLowerCase() !== 'big') return plan;
+				const runtimeSet = request.filters.find(f => f.runtimeSet)?.runtimeSet;
+				if (runtimeSet) return { ...plan, cost: 1 + 10 * runtimeSet.maxCount };
+				if (request.filters.some(f => f.op === '=' && f.columnIndex === 2)) return { ...plan, cost: 61 };
+				return plan;
+			}
+		}
+
+		let db: Database;
+		let module: SeekBaselineModule;
+
+		beforeEach(async () => {
+			db = new Database();
+			module = new SeekBaselineModule();
+			db.registerModule('sbmem', module);
+			await db.exec('create table small (id integer primary key, k integer null) using sbmem()');
+			await db.exec('create table big (pk integer primary key, v integer null, s text null) using sbmem()');
+			await db.exec('create index idx_v on big(v)');
+			await db.exec('create index idx_s on big(s)');
+			// v = 10·pk; s = 'x' for the first 20 rows, 'y' for the rest — so the
+			// scan branch (the pushed s-seek) reads 20 rows.
+			const values = Array.from({ length: 40 }, (_v, i) =>
+				`(${i + 1}, ${(i + 1) * 10}, '${i < 20 ? 'x' : 'y'}')`).join(', ');
+			await db.exec(`insert into big values ${values}`);
+		});
+
+		afterEach(async () => {
+			await db.close();
+		});
+
+		const SQL = "select pk from big where s = 'x' and v in (select k from small)";
+
+		async function runWithKeys(keys: number[]): Promise<{ rows: unknown[]; idxStr: string }> {
+			await db.exec('delete from small');
+			await db.exec(`insert into small values ${keys.map((k, i) => `(${i + 1}, ${k})`).join(', ')}`);
+			module.reset();
+			const rows = await allRows(db, SQL);
+			return { rows, idxStr: (module.idxStrs.get('big') ?? [])[0] ?? '' };
+		}
+
+		it('seek branch: a key-set member failing the pushed predicate must NOT come back', async () => {
+			// pk 30 has v = 300 (in the set) but s = 'y'. Without the re-applied
+			// Filter the seek branch would emit it — the module was told to seek
+			// idx_v and knows nothing of s. THE regression guard for this ticket.
+			const { rows, idxStr } = await runWithKeys([100, 200, 300]);
+			expect(idxStr, 'the seek branch really ran').to.match(MULTI_SEEK_RE);
+			expect(idxStr).to.contain('inCount=3');
+			expect(rows, 'pk 30 (in the key set, wrong s) is excluded').to.deep.equal(
+				[{ pk: 10 }, { pk: 20 }]);
+		});
+
+		it('scan branch: the same query above the break-even returns identical rows via the pushed seek', async () => {
+			// 6 keys = the break-even → seek; a 7th no-match key → scan. The two
+			// branches must be observationally identical.
+			const at = await runWithKeys([10, 20, 30, 40, 50, 60]);
+			expect(at.idxStr, '6 keys — at the break-even — seeks').to.match(MULTI_SEEK_RE);
+			expect(at.rows).to.deep.equal(Array.from({ length: 6 }, (_v, i) => ({ pk: i + 1 })));
+
+			const over = await runWithKeys([10, 20, 30, 40, 50, 60, 99999]);
+			expect(over.idxStr, '7 keys — over the break-even — runs the pushed s-seek').to.not.match(MULTI_SEEK_RE);
+			expect(over.idxStr, 'the displaced plan is the s-seek, not a full scan').to.contain('idx=idx_s');
+			expect(over.rows, 'identical rows either side of the threshold').to.deep.equal(at.rows);
+		});
+
+		it('seek branch reads fewer target rows than the scan branch', async () => {
+			const seek = await runWithKeys([100, 200, 300]);
+			expect(seek.idxStr).to.match(MULTI_SEEK_RE);
+			const seekRows = module.rowCounts.get('big') ?? 0;
+			expect(seekRows, 'at most one row per key').to.be.at.most(3);
+
+			const scan = await runWithKeys([100, 200, 300, 1, 2, 3, 4]);
+			expect(scan.idxStr).to.not.match(MULTI_SEEK_RE);
+			const scanRows = module.rowCounts.get('big') ?? 0;
+			expect(scanRows, "the s-seek reads every s='x' row").to.equal(20);
+			expect(seekRows).to.be.lessThan(scanRows);
+			expect(scan.rows, 'both key sets select the same target rows').to.deep.equal(seek.rows);
+		});
+
+		it('empty key set: the target is never opened, the Filter above emits nothing', async () => {
+			module.reset();
+			const rows = await allRows(db, SQL);
+			expect(rows).to.deep.equal([]);
+			expect(module.scanCounts.get('big'), 'target query() never called').to.equal(undefined);
+		});
+
+		it('declines when the pushed seek is cheaper than any key-set seek (breakEven < 1)', async () => {
+			// Baseline 5 vs a two-key seek at 502: the displaced plan wins at
+			// every key count, so the rule must keep the hash semi join — the
+			// honest "the pushed seek beats any key-set seek" answer.
+			class SeekWinsModule extends IdxStrCapturingModule {
+				override getBestAccessPlan(
+					db_: Database,
+					tableInfo: TableSchema,
+					request: BestAccessPlanRequest,
+				): BestAccessPlanResult {
+					const plan = MemoryTableModule.prototype.getBestAccessPlan.call(this, db_, tableInfo, request) as BestAccessPlanResult;
+					if (tableInfo.name.toLowerCase() !== 'big2') return plan;
+					const runtimeSet = request.filters.find(f => f.runtimeSet)?.runtimeSet;
+					if (runtimeSet) return { ...plan, cost: 500 + runtimeSet.maxCount };
+					if (request.filters.some(f => f.op === '=' && f.columnIndex === 2)) return { ...plan, cost: 5 };
+					return plan;
+				}
+			}
+			const winsDb = new Database();
+			winsDb.registerModule('swmem', new SeekWinsModule());
+			try {
+				await winsDb.exec('create table small (id integer primary key, k integer null) using swmem()');
+				await winsDb.exec('create table big2 (pk integer primary key, v integer null, s text null) using swmem()');
+				await winsDb.exec('create index idx_v2 on big2(v)');
+				await winsDb.exec('create index idx_s2 on big2(s)');
+				await winsDb.exec("insert into big2 values (1, 10, 'x'), (2, 20, 'y'), (3, 30, 'x')");
+				await winsDb.exec('insert into small values (1, 10), (2, 20), (3, 30)');
+				const sql = "select pk from big2 where s = 'x' and v in (select k from small)";
+				const types = collectNodeTypes(winsDb.getPlan(sql));
+				expect(types, 'no KeySetSemiJoin — the hash semi join survives').to.not.include('KeySetSemiJoin');
+				expect(types).to.include('HashJoin');
+				expect(await allRows(winsDb, sql), 'the surviving plan still answers').to.deep.equal(
+					[{ pk: 1 }, { pk: 3 }]);
+			} finally {
+				await winsDb.close();
+			}
+		});
+	});
+
 	describe('break-even from doctored module costs', () => {
 		let db: Database;
 		let module: BreakEvenModule;

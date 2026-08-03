@@ -304,3 +304,44 @@ SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
 ROLLBACK;
 SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
 → [{"pk":5,"v":"touched"}]
+
+-- ===== A second indexed column also filtered (pushed-constraint target) =====
+--
+-- `<indexed col> = <value> and <key col> in (select …)`: the extra predicate is
+-- pushed into the target leaf as its own index seek, and the key-set rewrite —
+-- when a backend's costs admit it — keeps that seek as the target and re-applies
+-- the predicate above the semi join. Seeded so one row matches the key set but
+-- fails the extra filter (the worst failure mode: without the re-applied
+-- predicate a seek would return — or a DML would touch — it) and one row matches
+-- the extra filter but is not in the key set. Both must stay excluded whichever
+-- access path the runtime picks, on either backend.
+
+CREATE TABLE pc (pk INTEGER PRIMARY KEY, v INTEGER NULL, s TEXT NULL, w INTEGER NULL);
+CREATE INDEX idx_pc_v ON pc(v);
+CREATE INDEX idx_pc_s ON pc(s);
+CREATE TABLE pckeys (id INTEGER PRIMARY KEY, k INTEGER NULL);
+-- pk 2: in the key set (v=20) but s='y'. pk 4: s='x' but v=40 is not in the set.
+INSERT INTO pc VALUES (1, 10, 'x', 0), (2, 20, 'y', 0), (3, 30, 'x', 0), (4, 40, 'x', 0), (5, NULL, 'x', 0);
+INSERT INTO pckeys VALUES (1, 10), (2, 20), (3, 30), (4, 999);
+
+SELECT pk FROM pc WHERE s = 'x' AND v IN (SELECT k FROM pckeys) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- DELETE: only the doubly-matching rows go. Deleting pk 2 (key-set member,
+-- wrong s) would be the dropped-predicate bug this section guards against.
+DELETE FROM pc WHERE s = 'x' AND v IN (SELECT k FROM pckeys);
+SELECT pk FROM pc ORDER BY pk;
+→ [{"pk":2},{"pk":4},{"pk":5}]
+
+-- UPDATE through the same shape: pk 2 and pk 4 must stay untouched.
+INSERT INTO pc VALUES (6, 30, 'x', 0);
+UPDATE pc SET w = -1 WHERE s = 'x' AND v IN (SELECT k FROM pckeys);
+SELECT pk, w FROM pc ORDER BY pk;
+→ [{"pk":2,"w":0},{"pk":4,"w":0},{"pk":5,"w":0},{"pk":6,"w":-1}]
+
+-- Range form of the pushed predicate (a primary-key range seek as the target).
+CREATE TABLE pcr (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_pcr_v ON pcr(v);
+INSERT INTO pcr VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+SELECT pk FROM pcr WHERE pk > 2 AND v IN (SELECT k FROM pckeys) ORDER BY pk;
+→ [{"pk":3}]

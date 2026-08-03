@@ -12,7 +12,7 @@
 
 import type { PlanNode, RelationalPlanNode } from '../../nodes/plan-node.js';
 import { isRelationalNode } from '../../nodes/plan-node.js';
-import { SeqScanNode, IndexScanNode } from '../../nodes/table-access-nodes.js';
+import { SeqScanNode, IndexScanNode, IndexSeekNode } from '../../nodes/table-access-nodes.js';
 import { AliasNode } from '../../nodes/alias-node.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { FilterNode } from '../../nodes/filter.js';
@@ -34,14 +34,19 @@ export function isTrivialProject(project: ProjectNode): boolean {
 
 /**
  * Walk down from `chainRoot` toward the access leaf, descending only through
- * Alias / trivial Project / Filter wrappers. Returns null when anything else
- * appears before an admissible leaf.
+ * Alias / trivial Project / Filter wrappers, admitting constrained seek leaves
+ * as well as every-row walks. Returns null when anything else appears before
+ * an admissible leaf.
+ *
+ * Callers that can honour an `IndexSeekNode`'s pushed predicates (by
+ * re-applying `pushedConstraints` above their rewrite) use this directly;
+ * callers that would silently drop them use {@link peelToAccessLeaf}.
  */
-export function peelToAccessLeaf(chainRoot: RelationalPlanNode): AccessLeafNode | null {
+export function peelToSeekableAccessLeaf(chainRoot: RelationalPlanNode): AccessLeafNode | IndexSeekNode | null {
 	let cursor: RelationalPlanNode = chainRoot;
 	let safety = 16;
 	while (safety-- > 0) {
-		if (cursor instanceof SeqScanNode || cursor instanceof IndexScanNode) return cursor;
+		if (cursor instanceof SeqScanNode || cursor instanceof IndexScanNode || cursor instanceof IndexSeekNode) return cursor;
 		if (cursor instanceof AliasNode) {
 			cursor = cursor.source;
 			continue;
@@ -57,6 +62,18 @@ export function peelToAccessLeaf(chainRoot: RelationalPlanNode): AccessLeafNode 
 		return null;
 	}
 	return null;
+}
+
+/**
+ * {@link peelToSeekableAccessLeaf} restricted to unconstrained walks. An
+ * `IndexSeekNode` peels to null: its `FilterInfo` is the sole enforcer of the
+ * predicates recorded in `pushedConstraints`, so a caller that replaces the
+ * leaf without re-applying them (`index-nested-loop`, which would otherwise
+ * re-plan a leaf that already has constraints) must decline on it.
+ */
+export function peelToAccessLeaf(chainRoot: RelationalPlanNode): AccessLeafNode | null {
+	const leaf = peelToSeekableAccessLeaf(chainRoot);
+	return leaf instanceof IndexSeekNode ? null : leaf;
 }
 
 /**

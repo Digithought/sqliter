@@ -9,6 +9,7 @@
  *   BloomJoinNode | MergeJoinNode (semi, exactly one equi-pair, no residual)
  *     ├─ left:  (FilterNode | trivial ProjectNode | AliasNode)*
  *     │           over  SeqScan(fullScan) | ordering-only IndexScan(plan=0)
+ *     │                 | IndexSeek carrying pushedConstraints
  *     └─ right: uncorrelated, deterministic, side-effect-free key source
  *
  * On a successful match the left chain is rebuilt with the leaf replaced by a
@@ -18,6 +19,22 @@
  *
  *   HashJoin(semi, Project(Filter(leaf)), right)
  *     →  Project(Filter(KeySetSemiJoin(leaf, right)))
+ *
+ * An `IndexSeek` leaf is admitted UNCHANGED, with the predicate its
+ * `FilterInfo` enforces (recorded in `pushedConstraints`, dropped from the
+ * tree on the module's promise) re-applied as a `Filter` directly above the
+ * new node — inside the peeled wrappers, because a peeled trivial Project may
+ * not carry the predicate's columns:
+ *
+ *   HashJoin(semi, Project(IndexSeek[s='x']), right)
+ *     →  Project(Filter[s='x'](KeySetSemiJoin(IndexSeek[s='x'], right)))
+ *
+ * That is right on both runtime branches: the scan branch runs the leaf's own
+ * FilterInfo untouched (the pushed seek happens exactly as today; the added
+ * Filter is redundant), and the seek branch replaces the FilterInfo with the
+ * multi-seek (the module ignores the pushed predicate; the Filter re-applies
+ * it). The scan branch is byte-for-byte the plan being displaced, so the
+ * rewrite is never a structural loss.
  *
  * The new node ALWAYS builds the key set and ALWAYS probes each target row
  * against it — the runtime pushdown only changes how many rows the target
@@ -30,11 +47,22 @@
  *   - a correlated, non-deterministic, or side-effect-bearing key source
  *   - side effects anywhere in the left chain
  *   - any non-peelable node between the join and the access leaf
- *   - a leaf that is not an unconstrained every-row walk — pushed constraints
- *     / limit / offset mean replacing its FilterInfo would silently drop the
- *     module-enforced predicates or directives
- *     (backlog/feat-key-set-seek-over-pushed-constraints)
- *   - a leaf whose emission order absorbed a SortNode (`orderingLoadBearing`)
+ *   - a walk leaf that is not an unconstrained every-row walk (residue in
+ *     `FilterInfo.constraints`, or a pushed limit / offset)
+ *   - a seek leaf with a pushed limit / offset (a directive the multi-seek
+ *     would not honour, and unlike a predicate it cannot be re-applied by a
+ *     Filter without changing which rows are dropped — unreachable today,
+ *     `monotonic-limit-pushdown`'s peel cannot cross a join, but kept), with
+ *     no recorded `pushedConstraints` (a seek we cannot describe is a seek we
+ *     must not displace), whose recorded predicate contains a relational node
+ *     (this rule runs PostOptimization — a re-inserted relational subquery
+ *     would reach emit unphysicalized), whose subtree is correlated
+ *     (`index-nested-loop` builds seeks keyed on the OUTER side of a join —
+ *     re-applying is correct but the node drains the key source per outer
+ *     row, turning a linear plan quadratic), or whose emission order absorbed
+ *     a Sort (`orderingLoadBearing` — `seekPreservesTargetOrder` is false for
+ *     every seek, so the absorbed order cannot be reproduced)
+ *   - a walk leaf whose emission order absorbed a SortNode (`orderingLoadBearing`)
  *     UNLESS the seek would reproduce that order (`seekPreservesTargetOrder`:
  *     the seek index is the walk index, so a multi-seek emits a subsequence of
  *     the walk — still in the same order). Otherwise the dropped Sort's order,
@@ -56,8 +84,9 @@
  *   - the module answering a synthesized probe with a plan `validateAccessPlan`
  *     rejects (a module bug — logged, then declined like any other gate rather
  *     than failing a query the user's own predicate would have run fine)
- *   - a break-even of zero (the module's own costs say a scan wins at every
- *     key count)
+ *   - a break-even of zero (the module's own costs say the displaced plan —
+ *     the plain scan for a walk leaf, the leaf's own pushed seek for a seek
+ *     leaf — wins at every key count)
  *
  * The MERGE anchor adds two gates the hash anchor does not need:
  *   - `seekPreservesTargetOrder` must hold. `MergeJoinNode.computePhysical`
@@ -90,19 +119,20 @@
  */
 
 import { createLogger } from '../../../common/logger.js';
-import type { PlanNode, RelationalPlanNode } from '../../nodes/plan-node.js';
+import { isRelationalNode, type PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
 import { BloomJoinNode } from '../../nodes/bloom-join-node.js';
 import { MergeJoinNode } from '../../nodes/merge-join-node.js';
 import { KeySetSemiJoinNode, RUNTIME_SET_MAX_KEYS, seekPreservesTargetOrder, type KeySetPushdown, type KeySetTargetNode } from '../../nodes/key-set-semi-join-node.js';
-import { IndexScanNode } from '../../nodes/table-access-nodes.js';
+import { IndexScanNode, IndexSeekNode } from '../../nodes/table-access-nodes.js';
+import { FilterNode } from '../../nodes/filter.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
 import { hasSemanticOrdering, normalizeCollationName } from '../../../util/comparison.js';
 import { sharesSeekKeySpace } from '../../../types/builtin-types.js';
 import { effectiveCollationOfTypes } from '../../analysis/comparison-collation.js';
-import { classifyConstraintCover } from './rule-select-access-path.js';
-import { peelToAccessLeaf, rebuildChain, buildProbeRequest } from '../shared/access-leaf.js';
+import { classifyConstraintCover, combineResidualExpressions } from './rule-select-access-path.js';
+import { peelToSeekableAccessLeaf, rebuildChain, buildProbeRequest } from '../shared/access-leaf.js';
 import { resolveIndexDescriptor } from '../../../vtab/index-descriptor.js';
 import {
 	validateAccessPlan,
@@ -150,27 +180,46 @@ function admitJoin(node: BloomJoinNode | MergeJoinNode): boolean {
 	return true;
 }
 
+/** An admitted probe-side leaf, plus — for a seek leaf — the predicate to re-apply. */
+interface AdmittedLeaf {
+	readonly leaf: KeySetTargetNode;
+	/**
+	 * For an `IndexSeekNode` target: the AND of its `pushedConstraints`' source
+	 * expressions, to be re-applied as a `Filter` directly above the new
+	 * `KeySetSemiJoinNode`. Undefined for a walk leaf (nothing was pushed).
+	 */
+	readonly residual?: ScalarPlanNode;
+}
+
 /**
- * The probe-side access leaf, when it is one whose `FilterInfo` may be replaced
- * wholesale at runtime.
+ * The probe-side access leaf, when the rewrite can honour everything its
+ * `FilterInfo` enforces.
  *
- * It must read every row with nothing pushed into it: a plain full scan, or an
- * ordering-only index walk (plan=0) — which reads every row exactly like a full
- * scan and differs only in emission order. A leaf already carrying pushed
- * constraints had its residual Filter dropped on the module's promise to enforce
- * them; replacing its FilterInfo with our multi-seek would silently drop those
- * predicates (backlog/feat-key-set-seek-over-pushed-constraints). A pushed
- * limit / offset is likewise a directive the multi-seek would not honor.
+ * Two arms. A WALK leaf must read every row with nothing pushed into it: a
+ * plain full scan, or an ordering-only index walk (plan=0) — which reads every
+ * row exactly like a full scan and differs only in emission order. A SEEK leaf
+ * (its residual Filter dropped on the module's promise to enforce the pushed
+ * predicate) is admitted unchanged when its `pushedConstraints` fully describe
+ * that promise — the caller re-applies them above the new node; see
+ * {@link admitSeekLeaf} for the gates. A pushed limit / offset declines both
+ * arms: a directive the multi-seek would not honour, and one a Filter cannot
+ * re-apply without changing which rows are dropped.
  *
- * Deliberately structural only: the `orderingLoadBearing` decline needs the
- * pushdown (an absorbed Sort is fine when `seekPreservesTargetOrder` holds),
- * so it lives in `ruleKeySetSeek` after `planPushdown` rather than here.
+ * Deliberately structural only for the walk arm: its `orderingLoadBearing`
+ * decline needs the pushdown (an absorbed Sort is fine when
+ * `seekPreservesTargetOrder` holds), so it lives in `ruleKeySetSeek` after
+ * `planPushdown` rather than here. The seek arm's ordering decline IS here
+ * (gate 5): `seekPreservesTargetOrder` is false for every seek, so no pushdown
+ * could ever change the answer.
  */
-function admitLeaf(left: RelationalPlanNode): KeySetTargetNode | null {
-	const leaf = peelToAccessLeaf(left);
+function admitLeaf(left: RelationalPlanNode): AdmittedLeaf | null {
+	const leaf = peelToSeekableAccessLeaf(left);
 	if (!leaf) {
 		log('decline: left does not peel to an access leaf through Alias/Project/Filter');
 		return null;
+	}
+	if (leaf instanceof IndexSeekNode) {
+		return admitSeekLeaf(leaf);
 	}
 
 	const fi = leaf.filterInfo;
@@ -182,7 +231,71 @@ function admitLeaf(left: RelationalPlanNode): KeySetTargetNode | null {
 		return null;
 	}
 
-	return leaf;
+	return { leaf };
+}
+
+/**
+ * Admission gates for an `IndexSeekNode` target. The type / collation /
+ * module-claim / break-even gates applied later concern the SEEK column and
+ * apply to this arm identically; these five concern the pushed predicate.
+ */
+function admitSeekLeaf(leaf: IndexSeekNode): AdmittedLeaf | null {
+	const fi = leaf.filterInfo;
+	// Gate 1: a pushed limit / offset is a directive the multi-seek would not
+	// honour, and unlike a predicate it cannot be re-applied by a Filter without
+	// changing which rows are dropped. (Unreachable today —
+	// `monotonic-limit-pushdown`'s peel cannot cross a join — but kept.)
+	if (fi.limit !== undefined || fi.offset !== undefined) {
+		log('decline: seek leaf carries a pushed limit/offset');
+		return null;
+	}
+	// Gate 2: the seek's FilterInfo is the sole enforcer of whatever the module
+	// promised; a seek we cannot describe is a seek we must not displace.
+	if (!leaf.pushedConstraints || leaf.pushedConstraints.length === 0) {
+		log('decline: seek leaf records no pushed constraints');
+		return null;
+	}
+	const residual = combineResidualExpressions(leaf.pushedConstraints.map(c => c.sourceExpression));
+	if (!residual) {
+		log('decline: seek leaf pushed constraints combine to no predicate');
+		return null;
+	}
+	// Gate 3: this rule runs in PostOptimization, so an expression re-inserted
+	// here gets no further optimization pass — an unphysicalized relational
+	// subquery inside it would reach emit unprepared. Constraint extraction
+	// should never produce one; this gate makes that independent of the
+	// extractor's behaviour.
+	if (containsRelationalNode(residual)) {
+		log('decline: seek leaf pushed predicate contains a relational node');
+		return null;
+	}
+	// Gate 4: `index-nested-loop` builds seeks whose keys — and therefore whose
+	// pushedConstraints — reference the OUTER side of a nested-loop join.
+	// Re-applying such a predicate above the semi join would still be correct,
+	// but the node drains the key source once per outer row, turning a linear
+	// plan quadratic. Same test `admitJoin` applies to the key source.
+	if (isCorrelatedSubquery(leaf)) {
+		log('decline: seek leaf is correlated (per-outer-row seek)');
+		return null;
+	}
+	// Gate 5: `seekPreservesTargetOrder` is false for every IndexSeekNode (it
+	// requires an ordering-only index walk whose index is the seek index), so a
+	// seek target can never reproduce an absorbed Sort's order — one ordering
+	// doctrine with the walk arm's gate in `ruleKeySetSeek`, resolved here
+	// because no pushdown could change the answer.
+	if (leaf.orderingLoadBearing) {
+		log('decline: seek leaf emission order is load-bearing (absorbed a Sort)');
+		return null;
+	}
+	return { leaf, residual };
+}
+
+/** Does any descendant of `root` (root excluded) satisfy `isRelationalNode`? */
+function containsRelationalNode(root: PlanNode): boolean {
+	for (const child of root.getChildren()) {
+		if (isRelationalNode(child) || containsRelationalNode(child)) return true;
+	}
+	return false;
 }
 
 /** The join key's position on each side, with both sides' declared types. */
@@ -273,10 +386,10 @@ function claimedIndex(plan: BestAccessPlanResult, seekCol: number): string | nul
 }
 
 /**
- * The module's answers to the three synthesized requests: its cost for a
- * runtime-set seek at two key counts (2 and the engine ceiling) plus its plain
- * scan cost. `maxCount` 2 rather than 1 keeps the two seek points distinct so
- * the cost slope is well defined.
+ * The module's answers to the synthesized requests: its cost for a runtime-set
+ * seek at two key counts (2 and the engine ceiling), plus the cost of the plan
+ * the seek branch would displace. `maxCount` 2 rather than 1 keeps the two
+ * seek points distinct so the cost slope is well defined.
  *
  * These requests are the ENGINE's, not the user's: a module that answers one
  * with a plan `validateAccessPlan` rejects gets logged and declined, leaving the
@@ -288,7 +401,7 @@ function probeModuleCosts(
 	leaf: KeySetTargetNode,
 	seekCol: number,
 	keyRowsEstimate: number | undefined,
-): { seekAt2: BestAccessPlanResult; seekAtMax: BestAccessPlanResult; scan: BestAccessPlanResult } | null {
+): { seekAt2: BestAccessPlanResult; seekAtMax: BestAccessPlanResult; baselineCost: number } | null {
 	const tableSchema = leaf.tableSchema;
 	const vtabModule = leaf.source.vtabModule;
 	const getBestAccessPlan = vtabModule.getBestAccessPlan;
@@ -318,10 +431,17 @@ function probeModuleCosts(
 	};
 
 	try {
+		// The plan the seek branch displaces. A constrained leaf already records
+		// the module's cost for its own seek (`filterInfo.indexInfoOutput.
+		// estimatedCost` is `accessPlan.cost` verbatim — `makeIndexFilterInfo`
+		// spreads a base seeded with it and never overrides the field); an
+		// unconstrained walk has to be asked.
 		return {
 			seekAt2: ask([runtimeSetFilter(2)]),
 			seekAtMax: ask([runtimeSetFilter(RUNTIME_SET_MAX_KEYS)]),
-			scan: ask([]),
+			baselineCost: leaf instanceof IndexSeekNode
+				? leaf.filterInfo.indexInfoOutput.estimatedCost
+				: ask([]).cost,
 		};
 	} catch (e: unknown) {
 		log('decline: module %s answered a synthesized runtime-set probe on %s with an invalid plan: %s',
@@ -395,31 +515,50 @@ function planPushdown(
 }
 
 /**
- * The distinct key count at which the module's own seek cost overtakes its scan
- * cost. Interpolates the seek cost as a linear function of key count through the
- * two probe points and solves against the scan cost. The linear fit is an
- * approximation, but it is the MODULE's approximation — cost authority stays
- * with the module rather than a second cost model living in the optimizer.
+ * Absorbs floating-point jitter in the break-even solve before `Math.floor`.
+ * The tie case is real, not hypothetical: the memory module prices a k-key
+ * runtime-set seek and a k-row literal equality seek with one formula, so a
+ * pushed single-row equality baseline lands EXACTLY on the interpolation line
+ * at k=1 — in exact arithmetic the floor yields 1 (accept at the tie; a
+ * cost-equal seek is harmless), but the subtract-then-divide can land a hair
+ * under the integer and turn the tie into a decline.
+ */
+const BREAK_EVEN_EPSILON = 1e-9;
+
+/**
+ * The distinct key count at which the module's own seek cost overtakes the
+ * cost of the plan being displaced (the plain scan for a walk leaf, the leaf's
+ * own pushed seek for a seek leaf). Interpolates the runtime-set seek cost as
+ * a linear function of key count through the two probe points and solves
+ * against the baseline. The linear fit is an approximation, but it is the
+ * MODULE's approximation — cost authority stays with the module rather than a
+ * second cost model living in the optimizer.
  *
- * A flat-or-falling seek cost (`slope <= 0`) never overtakes the scan, so the
- * engine ceiling becomes the threshold. A scan cheaper than a two-key seek
- * interpolates below 1 and the caller declines.
+ * A flat-or-falling seek cost (`slope <= 0`) never overtakes the baseline, so
+ * the engine ceiling becomes the threshold. A baseline cheaper than a two-key
+ * seek interpolates below 1 and the caller declines — for a seek leaf that is
+ * the honest "the pushed seek beats any key-set seek" answer.
+ *
+ * NOTE: the comparison charges nothing for the re-applied predicate's per-row
+ * evaluation on a seek leaf's seek branch. It is bounded by the number of rows
+ * the seek returns (≤ key count), so it cannot flip a decision by much.
  */
 function interpolateBreakEven(
-	costs: { seekAt2: BestAccessPlanResult; seekAtMax: BestAccessPlanResult; scan: BestAccessPlanResult },
+	costs: { seekAt2: BestAccessPlanResult; seekAtMax: BestAccessPlanResult; baselineCost: number },
 ): number {
 	const slope = (costs.seekAtMax.cost - costs.seekAt2.cost) / (RUNTIME_SET_MAX_KEYS - 2);
 	if (slope <= 0) return RUNTIME_SET_MAX_KEYS;
 	return Math.max(0, Math.min(RUNTIME_SET_MAX_KEYS,
-		Math.floor(2 + (costs.scan.cost - costs.seekAt2.cost) / slope)));
+		Math.floor(2 + (costs.baselineCost - costs.seekAt2.cost) / slope + BREAK_EVEN_EPSILON)));
 }
 
 export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | null {
 	if (!(node instanceof BloomJoinNode) && !(node instanceof MergeJoinNode)) return null;
 	if (!admitJoin(node)) return null;
 
-	const leaf = admitLeaf(node.left);
-	if (!leaf) return null;
+	const admitted = admitLeaf(node.left);
+	if (!admitted) return null;
+	const { leaf, residual } = admitted;
 
 	const pair = node.equiPairs[0];
 	const cols = resolveSeekColumns(leaf, node.right, pair.leftAttrId, pair.rightAttrId);
@@ -483,9 +622,17 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		pair.rightAttrId,
 		pushdown,
 	);
-	log('Replaced %s semi join with KeySetSemiJoin on %s.%s via %s (breakEven=%d)',
+	// For a seek target, re-apply the module-enforced predicate DIRECTLY above
+	// the node — inside the peeled wrappers, because a peeled trivial Project
+	// may not carry the predicate's columns. The node exposes the target's full
+	// attribute set, so the predicate's column references resolve here.
+	const replacement = residual !== undefined
+		? new FilterNode(leaf.scope, keySetJoin, residual)
+		: keySetJoin;
+	log('Replaced %s semi join with KeySetSemiJoin on %s.%s via %s (breakEven=%d%s)',
 		node instanceof MergeJoinNode ? 'merge' : 'hash',
 		leaf.tableSchema.name, leaf.tableSchema.columns[cols.seekCol]?.name,
-		pushdown.indexName, pushdown.breakEvenKeys);
-	return rebuildChain(node.left, leaf, keySetJoin);
+		pushdown.indexName, pushdown.breakEvenKeys,
+		residual !== undefined ? ', pushed predicate re-applied' : '');
+	return rebuildChain(node.left, leaf, replacement);
 }

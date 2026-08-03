@@ -3,10 +3,11 @@
  * plus the stamped-FilterInfo shape-equivalence unit test.
  *
  * The rewrite anchors on the physical hash SEMI join and replaces it with a
- * KeySetSemiJoinNode when the target peels to an unconstrained every-row leaf
- * and the module claims a runtime-set multi-seek on the join column. Every
- * decline path below must leave the hash semi join in place — the probe-only
- * plan is the safety net.
+ * KeySetSemiJoinNode when the target peels to an unconstrained every-row leaf —
+ * or to an IndexSeek whose pushed predicate the rule re-applies as a Filter
+ * above the new node — and the module claims a runtime-set multi-seek on the
+ * join column. Every decline path below must leave the hash semi join in
+ * place — the probe-only plan is the safety net.
  *
  * Runtime behaviour (row results, seek-vs-scan decision, scan counts) lives in
  * `test/vtab/key-set-semi-join-runtime.spec.ts` and
@@ -95,15 +96,25 @@ describe('key-set-seek plan shape', () => {
 		expect(collectNodes(db.getPlan(sql), isHashJoin), 'hash semi join survives').to.have.lengthOf(1);
 	});
 
-	it('declines when the leaf already carries a pushed constraint', () => {
-		// `pk > 1` is pushed into the access leaf (a range IndexSeek), so the
-		// left no longer peels to an unconstrained every-row walk; replacing its
-		// FilterInfo would drop the module-enforced range.
+	it('fires over a leaf carrying a pushed constraint, re-applying it above the node', () => {
+		// `pk > 1` is pushed into the access leaf (a range IndexSeek on the
+		// primary key) and dropped from the tree on the module's promise to
+		// enforce it. The seek is admitted as the target UNCHANGED and the
+		// recorded predicate is re-applied as a Filter directly above the
+		// KeySetSemiJoin: the seek branch — which replaces the leaf's FilterInfo
+		// with the multi-seek — cannot lose it, and the scan branch still runs
+		// the pushed range seek untouched.
 		const sql = 'select pk from big where pk > 1 and v in (select id from small)';
 		const plan = db.getPlan(sql);
-		expect(collectNodes(plan, isKeySetSemiJoin)).to.have.lengthOf(0);
-		expect(collectNodes(plan, isHashJoin), 'hash semi join survives').to.have.lengthOf(1);
-		expect(collectNodes(plan, isIndexSeek), 'the range seek leaf survives').to.have.lengthOf(1);
+		const nodes = collectNodes(plan, isKeySetSemiJoin);
+		expect(nodes, 'the rewrite fires despite the pushed constraint').to.have.lengthOf(1);
+		expect(collectNodes(plan, isHashJoin), 'the hash semi join is replaced').to.have.lengthOf(0);
+		const target = nodes[0].target;
+		expect(target, 'the range seek survives as the target').to.be.instanceOf(IndexSeekNode);
+		const reapplied = collectNodes(plan, isFilter).find(f => f.source === nodes[0]);
+		expect(reapplied, 'a Filter sits directly above the KeySetSemiJoin').to.not.equal(undefined);
+		expect(reapplied!.predicate, 'the Filter carries the exact recorded predicate')
+			.to.equal((target as IndexSeekNode).pushedConstraints![0].sourceExpression);
 	});
 
 	it('peels through a residual Filter from an unpushable predicate', () => {
@@ -644,6 +655,143 @@ describe('key-set-seek plan shape', () => {
 			const rebuiltChanged = node.withChildren([changedLeaf, node.keySource]) as KeySetSemiJoinNode;
 			expect(rebuiltChanged.getLogicalAttributes().preservesTargetOrder).to.equal(false);
 			expect(rebuiltChanged.physical.ordering).to.equal(undefined);
+		});
+	});
+
+	describe('pushed-constraint (IndexSeek) targets', () => {
+		// A second singly-indexed column `s` alongside the seek column `v`: the
+		// pushed `s` predicate turns the target leaf into an IndexSeek, which the
+		// rule now admits by re-applying the recorded predicate above the node.
+		let pdb: Database;
+
+		beforeEach(async () => {
+			pdb = new Database();
+			await pdb.exec('create table small (id integer primary key)');
+			await pdb.exec('create table big (pk integer primary key, v integer, w integer, s text)');
+			await pdb.exec('create index idx_v on big(v)');
+			await pdb.exec('create index idx_s on big(s)');
+		});
+
+		afterEach(async () => {
+			await pdb.close();
+		});
+
+		it('fires over an equality-seek leaf on another indexed column', () => {
+			const sql = "select pk from big where s = 'x' and v in (select id from small)";
+			const plan = pdb.getPlan(sql);
+			const nodes = collectNodes(plan, isKeySetSemiJoin);
+			expect(nodes, 'exactly one KeySetSemiJoin').to.have.lengthOf(1);
+			expect(collectNodes(plan, isHashJoin), 'no hash join survives').to.have.lengthOf(0);
+			const target = nodes[0].target;
+			expect(target, "the target is the seek on s's index, unchanged").to.be.instanceOf(IndexSeekNode);
+			expect((target as IndexSeekNode).indexName).to.equal('idx_s');
+			expect(nodes[0].pushdown.indexName, "the key-set seek uses v's index").to.equal('idx_v');
+			const reapplied = collectNodes(plan, isFilter).find(f => f.source === nodes[0]);
+			expect(reapplied, 'a Filter re-applying s = \'x\' sits directly above the node').to.not.equal(undefined);
+			expect(reapplied!.predicate)
+				.to.equal((target as IndexSeekNode).pushedConstraints![0].sourceExpression);
+		});
+
+		it('fires for the delete and update forms too', () => {
+			for (const sql of [
+				"delete from big where s = 'x' and v in (select id from small)",
+				"update big set w = 1 where s = 'x' and v in (select id from small)",
+			]) {
+				const plan = pdb.getPlan(sql);
+				const nodes = collectNodes(plan, isKeySetSemiJoin);
+				expect(nodes, `KeySetSemiJoin for: ${sql}`).to.have.lengthOf(1);
+				expect(nodes[0].target).to.be.instanceOf(IndexSeekNode);
+				expect(collectNodes(plan, isFilter).some(f => f.source === nodes[0]),
+					`re-applied Filter for: ${sql}`).to.equal(true);
+			}
+		});
+
+		it('declines an absorbed-Sort seek leaf (orderingLoadBearing)', async () => {
+			// `s >= 'a'` plans as a range seek on idx_s whose emission order
+			// absorbs the ORDER BY s — no Sort survives, so the leaf's order is
+			// the only thing producing the query's ORDER BY.
+			// `seekPreservesTargetOrder` is false for every seek target, so the
+			// rule must decline and keep the hash semi join, whose runtime
+			// preserves the probe-side order.
+			const sql = "select pk, s from big where s >= 'a' and v in (select id from small) order by s";
+			const plan = pdb.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin), 'must decline').to.have.lengthOf(0);
+			expect(collectNodes(plan, isHashJoin), 'hash semi join survives').to.have.lengthOf(1);
+			expect(collectNodes(plan, isSort), 'the Sort really was absorbed — the decline is the ordering gate')
+				.to.have.lengthOf(0);
+			const seeks = collectNodes(plan, isIndexSeek);
+			expect(seeks).to.have.lengthOf(1);
+			expect(seeks[0].orderingLoadBearing).to.equal(true);
+
+			await pdb.exec("insert into big values (1, 10, 0, 'x'), (2, 20, 0, 'a'), (3, 30, 0, 'm')");
+			await pdb.exec('insert into small values (10), (20), (30)');
+			const rows: Array<{ pk: number; s: string }> = [];
+			for await (const r of pdb.eval(sql)) rows.push(r as { pk: number; s: string });
+			expect(rows.map(r => r.s), 'rows arrive in the absorbed order').to.deep.equal(['a', 'm', 'x']);
+		});
+
+		it('declines a seek target on the merge arm (the seek cannot reproduce the propagated order)', () => {
+			// `pk > 1` seeks the primary key and both sides advertise a pk walk,
+			// so the semi join arrives as a MERGE join; the merge anchor requires
+			// `seekPreservesTargetOrder`, false for every seek target.
+			const sql = 'select pk from big where pk > 1 and pk in (select id from small)';
+			const plan = pdb.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin), 'must decline').to.have.lengthOf(0);
+			expect(collectNodes(plan, isMergeJoin), 'the streaming merge semi join survives').to.have.lengthOf(1);
+		});
+
+		it('seek column == pushed column stays correct', async () => {
+			// `v = 30` and the key-set seek walk the same index; the equality is
+			// re-applied above. Correct, if pointless — assert rows only, the
+			// break-even is free to decline this shape.
+			await pdb.exec("insert into big values (1, 10, 0, 'x'), (2, 30, 0, 'x'), (3, 40, 0, 'x')");
+			await pdb.exec('insert into small values (10), (30)');
+			const rows: unknown[] = [];
+			for await (const r of pdb.eval('select pk from big where v = 30 and v in (select id from small)')) rows.push(r);
+			expect(rows).to.deep.equal([{ pk: 2 }]);
+		});
+
+		it('stampMultiSeek over a seek-derived base is indistinguishable from the literal-IN shape', () => {
+			// The base is the SEEK's own FilterInfo — the exact object the runtime
+			// hands the override hook on the seek branch — not a synthetic full
+			// scan. No seek residue may survive the stamp.
+			const literalPlan = pdb.getPlan('select pk from big where v in (10, 30)');
+			const literalSeeks = collectNodes(literalPlan, isIndexSeek);
+			expect(literalSeeks, 'literal IN plans as a multi-seek').to.have.lengthOf(1);
+			const literal = literalSeeks[0].filterInfo;
+
+			const keySetPlan = pdb.getPlan("select pk from big where s = 'x' and v in (select id from small)");
+			const keySets = collectNodes(keySetPlan, isKeySetSemiJoin);
+			expect(keySets).to.have.lengthOf(1);
+			const target = keySets[0].target as IndexSeekNode;
+			expect(target).to.be.instanceOf(IndexSeekNode);
+			const stamped = stampMultiSeek(target.filterInfo, keySets[0].pushdown, [10, 30]);
+
+			// The fields the module runtimes actually read match the literal arm.
+			expect(stamped.idxStr).to.equal(literal.idxStr);
+			expect(stamped.idxStr).to.equal('idx=idx_v(0);plan=5;inCount=2');
+			expect(stamped.constraints, 'no seek-constraint residue').to.deep.equal(literal.constraints);
+			expect([...stamped.args], 'the seek key values are fully replaced').to.deep.equal([10, 30]);
+			expect(stamped.accessPath).to.deep.equal(literal.accessPath);
+			expect(stamped.indexInfoOutput.aConstraintUsage).to.deep.equal(literal.indexInfoOutput.aConstraintUsage);
+			expect(stamped.indexInfoOutput.orderByConsumed).to.equal(literal.indexInfoOutput.orderByConsumed);
+			expect(stamped.indexInfoOutput.idxStr).to.equal(literal.indexInfoOutput.idxStr);
+
+			// Every stamped field is base-independent — the seek base leaves no
+			// residue anywhere the full-scan base would not. (nConstraint /
+			// aConstraint are asserted here rather than against `literal`:
+			// `makeIndexFilterInfo` leaves them at the full-scan base's 0 / [],
+			// while the stamp populates them — a pre-existing divergence in
+			// fields no module runtime reads.)
+			const fromScan = stampMultiSeek(makeFullScanFilterInfo(), keySets[0].pushdown, [10, 30]);
+			expect(stamped.idxStr).to.equal(fromScan.idxStr);
+			expect(stamped.constraints).to.deep.equal(fromScan.constraints);
+			expect([...stamped.args]).to.deep.equal([...fromScan.args]);
+			expect(stamped.accessPath).to.deep.equal(fromScan.accessPath);
+			expect(stamped.indexInfoOutput.nConstraint).to.equal(fromScan.indexInfoOutput.nConstraint);
+			expect(stamped.indexInfoOutput.aConstraint).to.deep.equal(fromScan.indexInfoOutput.aConstraint);
+			expect(stamped.indexInfoOutput.aConstraintUsage).to.deep.equal(fromScan.indexInfoOutput.aConstraintUsage);
+			expect(stamped.indexInfoOutput.orderByConsumed).to.equal(fromScan.indexInfoOutput.orderByConsumed);
 		});
 	});
 

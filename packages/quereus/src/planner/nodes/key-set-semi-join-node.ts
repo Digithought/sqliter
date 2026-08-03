@@ -7,20 +7,25 @@ import { quereusError } from '../../common/errors.js';
 import { hashJoinCost } from '../cost/index.js';
 import { estimateJoinRows } from './join-utils.js';
 import { physicalSourceRows } from '../util/row-estimates.js';
-import { SeqScanNode, IndexScanNode } from './table-access-nodes.js';
+import { SeqScanNode, IndexScanNode, IndexSeekNode } from './table-access-nodes.js';
 import type { AccessPath } from '../../vtab/index-descriptor.js';
 
 /**
- * Admissible target leaves: a plain sequential scan, or an ordering-only index
+ * Admissible target leaves: a plain sequential scan, an ordering-only index
  * walk (`plan=0`, no constraints) — which reads every row exactly like a full
- * scan and differs only in emission order. Whether that emission order is
- * something an ancestor may depend on is settled by
+ * scan and differs only in emission order — or a constrained `IndexSeekNode`.
+ * A seek target's `FilterInfo` is the sole enforcer of the predicates recorded
+ * in its `pushedConstraints`; `rule-key-set-seek` admits one only after
+ * re-applying that predicate as a `Filter` directly above this node, so the
+ * seek branch (which replaces the leaf's `FilterInfo` wholesale) cannot lose
+ * it, while the scan branch runs the pushed seek untouched. Whether the leaf's
+ * emission order is something an ancestor may depend on is settled by
  * {@link seekPreservesTargetOrder}, not by the leaf shape (see
  * `rule-key-set-seek`'s gates). Memory-vtab tables always advertise a
  * primary-key ordering, so their bare scans are ordering-only IndexScans —
  * admitting only SeqScan would make this node unreachable there.
  */
-export type KeySetTargetNode = SeqScanNode | IndexScanNode;
+export type KeySetTargetNode = SeqScanNode | IndexScanNode | IndexSeekNode;
 
 /**
  * Engine ceiling on the number of seek keys a runtime-materialized key set may
@@ -59,7 +64,11 @@ export function seekPreservesTargetOrder(
 	target: KeySetTargetNode,
 	pushdown: KeySetPushdown,
 ): boolean {
-	// A SeqScan advertises no ordering at all — nothing to preserve, nothing to prove.
+	// A SeqScan advertises no ordering at all — nothing to preserve, nothing to
+	// prove. An IndexSeekNode is also always false: the predicate requires an
+	// ordering-only index WALK whose index is the seek index, and a constrained
+	// seek is neither — its window is predicate-shaped, so a multi-seek over a
+	// (generally different) index cannot be argued to be a subsequence of it.
 	if (!(target instanceof IndexScanNode)) return false;
 	const walk = target.filterInfo.accessPath;
 	if (walk?.kind !== 'index' || walk.plan !== 'scan') return false;
@@ -213,8 +222,8 @@ export class KeySetSemiJoinNode extends PlanNode implements BinaryRelationalNode
 			quereusError(`KeySetSemiJoinNode expects 2 children, got ${newChildren.length}`, StatusCode.INTERNAL);
 		}
 		const [newTarget, newKeySource] = newChildren;
-		if (!(newTarget instanceof SeqScanNode) && !(newTarget instanceof IndexScanNode)) {
-			quereusError('KeySetSemiJoinNode: first child must be a SeqScanNode or IndexScanNode', StatusCode.INTERNAL);
+		if (!(newTarget instanceof SeqScanNode) && !(newTarget instanceof IndexScanNode) && !(newTarget instanceof IndexSeekNode)) {
+			quereusError('KeySetSemiJoinNode: first child must be a SeqScanNode, IndexScanNode, or IndexSeekNode', StatusCode.INTERNAL);
 		}
 		if (!isRelationalNode(newKeySource)) {
 			quereusError('KeySetSemiJoinNode: second child must be a RelationalPlanNode', StatusCode.INTERNAL);

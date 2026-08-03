@@ -987,9 +987,10 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		sideEffectMode: 'safe',
 	},
 
-	// Key-set seek: replace a single-pair hash SEMI join over a full-scan leaf
-	// with a KeySetSemiJoin that materializes the key set at runtime and, when
-	// small enough, multi-seeks the target with it. Runs after
+	// Key-set seek: replace a single-pair hash SEMI join over an every-row-walk
+	// leaf — or over an IndexSeek whose pushed predicate the rule re-applies as
+	// a Filter above the new node — with a KeySetSemiJoin that materializes the
+	// key set at runtime and, when small enough, multi-seeks the target. Runs after
 	// `join-physical-selection` (the hash semi join must exist) and after
 	// `monotonic-limit-pushdown` — the two peels are mutually exclusive
 	// (each rejects the other's output node) and whichever runs first wins;
