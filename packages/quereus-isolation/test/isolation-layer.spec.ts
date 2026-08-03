@@ -5115,11 +5115,11 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 		 *  seeds committed rows, stages `overlayRows` (tombstone column included) into a
 		 *  live dirty overlay, and returns the connected IsolatedTable plus the `v`
 		 *  column index. */
-		async function stage(committedInsert: string, overlayRows: Row[], desc = false): Promise<{ table: IsolatedTable; vIdx: number }> {
+		async function stage(committedInsert: string, overlayRows: Row[], desc = false, vType = 'text'): Promise<{ table: IsolatedTable; vIdx: number }> {
 			ndb = new Database();
 			const iso = new IsolationModule({ underlying: new SynthUnderlyingModule(desc) });
 			ndb.registerModule('isolated', iso);
-			await ndb.exec('create table t (id integer primary key, v text) using isolated');
+			await ndb.exec(`create table t (id integer primary key, v ${vType}) using isolated`);
 			await ndb.exec(committedInsert); // autocommit → flushed to the underlying
 
 			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
@@ -5173,6 +5173,65 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			// layer's own window filter — this direct query() call has no residual Filter
 			// node above it to catch it.
 			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[2, 'b'], [4, 'b']]);
+		});
+
+		it('store-semantic-index-window-overlay: the window matcher ranks a TIMESPAN column by elapsed time', async () => {
+			// The overlay's own window filter is the ONLY thing standing between a staged
+			// row and the caller: the underlying claimed the range handled, so no residual
+			// Filter survives above this merge. A plain text compare inverts a
+			// semantic-ordering column in BOTH directions — 'PT1M' > 'PT1H' textually
+			// (would leak a 1-minute row into a `> 1 hour` window) and 'PT180M' < 'PT1H'
+			// textually (would drop a 3-hour row from it).
+			const { table, vIdx } = await stage(
+				"insert into t values (1,'PT2H')",
+				[
+					[3, 'PT90M', 0],   // 90 min — inside
+					[4, 'PT1M', 0],    // 1 min — outside, but TEXTUALLY above 'PT1H'
+					[5, 'PT180M', 0],  // 3 h — inside, but TEXTUALLY below 'PT1H'
+				],
+				false,
+				'timespan',
+			);
+
+			const base = synthFilter(vIdx);
+			const filter: FilterInfo = {
+				...base,
+				constraints: [{ constraint: { iColumn: vIdx, op: IndexConstraintOp.GT, usable: true }, argvIndex: 1 }],
+				args: ['PT1H'],
+				accessPath: {
+					kind: 'index',
+					plan: 'rangeSeek',
+					index: { name: SYNTH, role: 'secondary', keyColumns: [{ columnIndex: vIdx, desc: false }], unique: false },
+				},
+			};
+			const rows = await asyncIterableToArray(table.query!(filter));
+
+			// Merged in elapsed-time order: 90 min, the committed 2 h, then 3 h. The
+			// spellings are asserted too, so a future write-path normalization that
+			// canonicalized them (making the inversions disappear) fails loudly rather
+			// than quietly voiding this test.
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[3, 'PT90M'], [1, 'PT2H'], [5, 'PT180M']]);
+		});
+
+		it('store-semantic-index-window-overlay: an EQ window matches a re-spelled staged TIMESPAN row', async () => {
+			// The equality arm of the same matcher: 'PT1H' and 'PT60M' are ONE value under
+			// the type's compare, and the underlying's byte/BTree key collapses them, so
+			// dropping the staged row here would under-fetch with nothing above to notice.
+			const { table, vIdx } = await stage(
+				"insert into t values (1,'PT30M')",
+				[[2, 'PT1H', 0]],
+				false,
+				'timespan',
+			);
+
+			const filter = synthFilter(
+				vIdx,
+				[{ constraint: { iColumn: vIdx, op: IndexConstraintOp.EQ, usable: true }, argvIndex: 1 }],
+				['PT60M'],
+			);
+			const rows = await asyncIterableToArray(table.query!(filter));
+
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[2, 'PT1H']]);
 		});
 
 		it('a synthetic index with a DESC key column merges in the underlying descending emission order', async () => {

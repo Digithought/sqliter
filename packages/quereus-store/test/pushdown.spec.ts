@@ -699,6 +699,25 @@ describe('StoreModule predicate pushdown', () => {
 			expect(store.iterateEntryCount, 'seek should visit only the in-window slice').to.be.lessThanOrEqual(4);
 		});
 
+		it('a `json` PK range narrows to the structural window', async () => {
+			// The JSON arm of the same re-open: the bound encodes through the structural
+			// byte form (number tag + sortable double), so a numeric-JSON window seeks
+			// instead of visiting every entry. A `json(…)`-valued bound is what makes the
+			// window selective — a bare text literal is TEXT-class and ranks above every
+			// number, so it would leave the window at the whole numeric region.
+			await cdb.exec(`create table js (j json primary key) using store`);
+			const vals = Array.from({ length: 60 }, (_, i) => `('${i}')`).join(', ');
+			await cdb.exec(`insert into js values ${vals}`);
+			const store = dataStores.get('main.js')!;
+			store.iterateEntryCount = 0;
+
+			const rows = await asyncIterableToArray(
+				cdb.eval(`select json_quote(j) as q from js where j > json('57')`),
+			);
+			expect(rows.map(r => r.q)).to.deep.equal(['58', '59']);
+			expect(store.iterateEntryCount, 'seek should visit only the in-window slice').to.be.lessThanOrEqual(3);
+		});
+
 		it('an empty `timespan` window yields no rows without scanning past it', async () => {
 			await cdb.exec(`create table ts2 (d timespan primary key) using store`);
 			await cdb.exec(`insert into ts2 values ('PT1M'), ('PT2M'), ('PT3M')`);

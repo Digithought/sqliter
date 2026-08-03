@@ -1198,10 +1198,13 @@ declines) are duplicated across the two on purpose. A plan that claims a filter 
 cannot honor drops the residual `Filter` and returns wrong rows, so the two must be changed
 together.
 
-- NOTE: the two largest `StoreTable` layers sit near 900 lines each. If either passes
-  ~1,000, split it the same way — the scan layer's natural next seam is the multi-seek group
-  (`decodeMultiSeekTuples` / `orderTupleValues` / `scanMultiSeek` / `scanMultiSeekPrimary`),
-  and the base's is the statistics block.
+- NOTE: the two largest `StoreTable` layers have both passed the ~1,000-line seam
+  (`store-table-scan.ts` 1,085, `store-table-base.ts` 1,033 — `wc -l`, 2026-08). Splitting
+  them is backlog `debt-split-store-table-scan-and-base`: the scan layer's natural seam is
+  the multi-seek group (`decodeMultiSeekTuples` / `orderTupleValues` / `scanMultiSeek` /
+  `scanMultiSeekPrimary`), the base's is the statistics block. Until it lands, prefer
+  putting new scan-side logic in a collaborator (`pk-key-resolution.ts`, `key-builder.ts`,
+  `json-key.ts`) over growing these two further.
 - NOTE: no `StoreModule` layer is above ~620 lines today. `store-module-alter.ts` is the
   one most likely to grow, since every new ALTER arm lands there; if it passes ~900, the
   natural next seam is the three constraint arms (`alterAddConstraint` /

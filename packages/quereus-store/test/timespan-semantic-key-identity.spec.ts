@@ -379,6 +379,28 @@ describe('TIMESPAN semantic key identity (isolated store)', () => {
 		expect(await column(db, `select v from t where d > 'PT1H'`, 'v')).to.deep.equal(['b', 'c']);
 	});
 
+	it('merges staged rows into a range-seeked TIMESPAN SECONDARY index scan', async () => {
+		// The PK-ordered merge above is not the only consumer: when the scan is driven by
+		// a re-opened *index* range window, the overlay merges by `(indexKey, PK)` using
+		// `getIndexComparator`, whose timespan entry must rank by elapsed time exactly as
+		// the index's total-seconds key bytes do. Staged rows move INTO and OUT OF the
+		// window in the same transaction, so a comparator disagreeing with the bytes
+		// misplaces one.
+		await db.exec(`create table s (id integer primary key, d timespan) using store`);
+		await db.exec(`create index s_d on s (d)`);
+		await db.exec(`insert into s values (1, 'PT30M'), (2, 'PT2H'), (5, 'PT4H')`);
+
+		await db.exec('begin');
+		await db.exec(`insert into s values (3, 'PT90M'), (4, 'PT1M')`);
+		await db.exec(`update s set d = 'PT180M' where id = 1`); // moves INTO the window
+		await db.exec(`delete from s where id = 2`);             // drops one out of it
+		const q = `select id from s where d > 'PT1H' order by id`;
+		expect(await column(db, q, 'id')).to.deep.equal([1, 3, 5]);
+		await db.exec('commit');
+		expect(await column(db, q, 'id')).to.deep.equal([1, 3, 5]);
+		expect(await column(db, `select id from s order by d`, 'id')).to.deep.equal([4, 3, 1, 5]);
+	});
+
 	it('an in-transaction UPDATE and DELETE hold the merged order and the range window', async () => {
 		await db.exec(`insert into t values ('PT30M', 'a'), ('PT90M', 'b'), ('PT2H', 'c')`);
 

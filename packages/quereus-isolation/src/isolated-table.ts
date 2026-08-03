@@ -687,11 +687,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 *   stamped GE); the real OR-of-ranges lives in the idxStr `rangeOps` parameters,
 	 *   decoded by {@link buildMultiRangeWindowMatcher}.
 	 *
-	 * Comparisons run under the index key column's collation (falling back to the table
-	 * column's, then BINARY) with seek semantics for NULL: a NULL operand or a NULL row
-	 * value never matches, mirroring what an index seek returns. Operators the matcher
-	 * does not interpret (LIKE, MATCH, ...) are ignored — that can only let through
-	 * rows a residual Filter above still removes, never drop rows.
+	 * Comparisons run through {@link constraintComparator} — the index key column's
+	 * collation, or the declared type's `compare` for a semantic-ordering column — with
+	 * seek semantics for NULL: a NULL operand or a NULL row value never matches,
+	 * mirroring what an index seek returns. Operators the matcher does not interpret
+	 * (LIKE, MATCH, ...) are ignored — that can only let through rows a residual Filter
+	 * above still removes, never drop rows.
 	 */
 	private buildConstraintMatcher(filterInfo: FilterInfo): (row: Row) => boolean {
 		const path = filterInfo.accessPath;
@@ -705,7 +706,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		}
 
 		interface ColumnWindow {
-			collation: CollationFunction;
+			compare: (a: SqlValue, b: SqlValue) => number;
 			eqValues: SqlValue[];
 			ranges: { op: IndexConstraintOp; value: SqlValue }[];
 		}
@@ -713,7 +714,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const windowFor = (columnIndex: number): ColumnWindow => {
 			let window = windows.get(columnIndex);
 			if (!window) {
-				window = { collation: this.constraintCollation(columnIndex, path.index), eqValues: [], ranges: [] };
+				window = { compare: this.constraintComparator(columnIndex, path.index), eqValues: [], ranges: [] };
 				windows.set(columnIndex, window);
 			}
 			return window;
@@ -745,11 +746,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				const rowValue = row[columnIndex];
 				if (rowValue === null) return false;
 				if (window.eqValues.length > 0
-					&& !window.eqValues.some(v => v !== null && compareSqlValuesFast(rowValue, v, window.collation) === 0)) {
+					&& !window.eqValues.some(v => v !== null && window.compare(rowValue, v) === 0)) {
 					return false;
 				}
 				for (const { op, value } of window.ranges) {
-					if (value === null || !satisfiesBound(compareSqlValuesFast(rowValue, value, window.collation), op)) {
+					if (value === null || !satisfiesBound(window.compare(rowValue, value), op)) {
 						return false;
 					}
 				}
@@ -789,19 +790,19 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		if (ranges.length === 0) return () => true;
 
 		const columnIndex = keyColumn.columnIndex;
-		const collation = this.constraintCollation(columnIndex, index);
+		const compare = this.constraintComparator(columnIndex, index);
 		return (row: Row): boolean => {
 			const rowValue = row[columnIndex];
 			if (rowValue === null) return false;
 			return ranges.some(({ lower, upper }) => {
 				if (lower) {
 					if (lower.value === null) return false;
-					const cmp = compareSqlValuesFast(rowValue, lower.value, collation);
+					const cmp = compare(rowValue, lower.value);
 					if (lower.strict ? cmp <= 0 : cmp < 0) return false;
 				}
 				if (upper) {
 					if (upper.value === null) return false;
-					const cmp = compareSqlValuesFast(rowValue, upper.value, collation);
+					const cmp = compare(rowValue, upper.value);
 					if (upper.strict ? cmp >= 0 : cmp > 0) return false;
 				}
 				return true;
@@ -810,15 +811,36 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Comparison collation for a window-matcher column: the index key column's declared
-	 * collation when the column is part of the scanned index (the seek's own window
-	 * follows the index collation), else the table column's declared collation, else
-	 * BINARY.
+	 * Comparison function for a window-matcher column, matching the comparison the
+	 * scanned module applies to its OWN stream (`StoreTableScan.matchesFilters`, the
+	 * memory backend's typed BTree): a column whose declared logical type carries
+	 * SEMANTIC ordering (TIMESPAN, JSON — see docs/types.md "Semantic ordering") ranks
+	 * by the type's `compare`; every other column by storage class + collation. The
+	 * collation is the index key column's declared one when the column is part of the
+	 * scanned index (the seek's own window follows the index collation), else the table
+	 * column's declared collation, else BINARY.
+	 *
+	 * The typed arm is a CORRECTNESS requirement, not a refinement: the underlying
+	 * claimed the window's filters HANDLED, so no residual Filter survives above this
+	 * merge to re-check an overlay row it lets through or drops. Under a plain text
+	 * compare a `d > 'PT1H'` window admits a staged 'PT1M' and rejects a staged
+	 * 'PT180M' — both inversions the type's `compare` exists to remove
+	 * (`store-semantic-index-window-overlay` in isolation-layer.spec.ts).
+	 *
+	 * NOTE: this restates, in a second package, the rule `StoreTableScan.matchesFilters`
+	 * applies to committed rows — "semantic-ordering type ⇒ the type's compare, else
+	 * storage class + collation". Two comparison dimensions keep the duplication cheap; if
+	 * a third ever appears, promote the pair to one shared helper in the engine rather than
+	 * adding a third arm here.
 	 */
-	private constraintCollation(columnIndex: number, index: IndexDescriptor): CollationFunction {
+	private constraintComparator(columnIndex: number, index: IndexDescriptor): (a: SqlValue, b: SqlValue) => number {
 		const name = index.keyColumns.find(kc => kc.columnIndex === columnIndex)?.collation
 			?? this.tableSchema?.columns[columnIndex]?.collation;
-		return name ? this.collationResolver(name) : BINARY_COLLATION;
+		const collation = name ? this.collationResolver(name) : BINARY_COLLATION;
+		const logicalType = this.tableSchema?.columns[columnIndex]?.logicalType;
+		return hasSemanticOrdering(logicalType)
+			? createTypedComparator(logicalType, collation)
+			: (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation);
 	}
 
 	/**

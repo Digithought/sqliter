@@ -514,6 +514,14 @@ When scanning via secondary index:
    constraints — the isolation layer re-applies that window itself (`buildConstraintMatcher`),
    because the overlay is never asked to resolve the scan's index name. That name may be one
    the underlying minted per plan (e.g. lamina's `_compound_v_0`), which no overlay declares.
+   The matcher compares each constrained column the way the *underlying* filters its own
+   stream: the index key column's collation normally, but the declared type's `compare` for
+   a **semantic-ordering** column (TIMESPAN, JSON — see [types.md § Semantic
+   ordering](types.md#semantic-ordering)), via `constraintComparator`. That is a correctness
+   requirement, not a refinement — the underlying claimed the window's filters *handled*, so
+   no residual `Filter` survives above the merge to re-check what this matcher lets through
+   or drops, and a plain text compare inverts such a column in both directions (`'PT1M'`
+   sorts above `'PT1H'`, `'PT180M'` below it).
 2. Sort the kept overlay rows by the scan's `(indexKey…, pk…)` sort key — the full scan emits
    PK order, so the merge cannot rely on the overlay's emission order.
 3. Execute the index scan on the underlying table → committed rows in sort-key order.
