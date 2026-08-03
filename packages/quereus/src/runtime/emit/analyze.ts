@@ -15,6 +15,7 @@ import type { BaseModuleConfig } from '../../vtab/module.js';
 import type { TableStatistics } from '../../planner/stats/catalog-stats.js';
 import { createLogger } from '../../common/logger.js';
 import { collectStatisticsFromScan } from '../../planner/stats/analyze.js';
+import { ArrayRowIterable } from '../../util/array-row-iterable.js';
 
 const log = createLogger('runtime:emit:analyze');
 
@@ -57,14 +58,18 @@ async function collectTableStatistics(
 }
 
 export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instruction {
-	const run = async function* (rctx: RuntimeContext): AsyncIterable<Row> {
+	// Eager: ANALYZE's side effects (connecting to each table, collecting statistics,
+	// writing them back onto the schema) must happen when this instruction is run, not
+	// only if/when something later iterates the returned rows — `db.exec` never does.
+	const run = async (rctx: RuntimeContext): Promise<AsyncIterable<Row>> => {
+		const report: Row[] = [];
 		const schemaManager = rctx.db.schemaManager;
 		const targetSchemaName = plan.targetSchemaName ?? 'main';
 		const schema = schemaManager.getSchema(targetSchemaName);
 
 		if (!schema) {
 			log('Schema %s not found, nothing to analyze', targetSchemaName);
-			return;
+			return new ArrayRowIterable(report);
 		}
 
 		const tables: TableSchema[] = [];
@@ -110,7 +115,7 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 							oldObject: tableSchema,
 							newObject: updatedTableSchema,
 						});
-						yield [tableSchema.name, stats.rowCount];
+						report.push([tableSchema.name, stats.rowCount]);
 					}
 				} finally {
 					await vtab.disconnect();
@@ -120,6 +125,8 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 				// Continue with other tables on failure
 			}
 		}
+
+		return new ArrayRowIterable(report);
 	};
 
 	return {

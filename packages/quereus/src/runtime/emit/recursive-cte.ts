@@ -7,7 +7,7 @@ import type { MaybePromise, Row, SqlValue } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import { BTree } from 'inheritree';
 import { compareRows } from '../../util/comparison.js';
-import { WorkingTableIterable } from '../../util/working-table-iterable.js';
+import { ArrayRowIterable } from '../../util/array-row-iterable.js';
 import { DEFAULT_TUNING } from '../../planner/optimizer-tuning.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -104,7 +104,7 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 			log('Recursive CTE %s iteration %d, delta size: %d', plan.cteName, iterationCount, deltaRows.length);
 
 			// Create a working table iterable from ONLY the delta (not all accumulated rows)
-			const deltaIterable = new WorkingTableIterable([...deltaRows]);
+			const deltaIterable = new ArrayRowIterable([...deltaRows]);
 			const newDeltaRows: Row[] = []; // Collect rows for next iteration
 
 			// Set up the delta table in context for CTE references to access

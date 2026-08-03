@@ -470,8 +470,7 @@ describe('Materialized view lateral-TVF fan-out arm (prefix-delete)', () => {
  * sound maintenance strategy is a full body rebuild — every DML write would re-scan the
  * source — is rejected when the **largest** participating source exceeds the configurable
  * `materialized_view_rebuild_row_threshold` (default 10 000). The check reads the
- * StatsProvider, so the test seeds live counts via `analyze` (drained through `db.eval`;
- * `db.exec` would not pull the analyze generator's rows). `0` disables the reject.
+ * StatsProvider, so the test seeds live counts via `analyze`. `0` disables the reject.
  *
  * The pragma round-trips through the existing options framework; an invalid (negative /
  * non-numeric) value is rejected at set time (validated here via `setOption`, since the
@@ -483,7 +482,7 @@ describe('Materialized view full-rebuild size reject + threshold option', () => 
 	beforeEach(() => { db = new Database(); });
 	afterEach(async () => { await db.close(); });
 
-	/** Run + DRAIN a statement (so a row-yielding statement like `analyze` actually executes). */
+	/** Run a statement and drain its rows (used here for `analyze`'s per-table report). */
 	async function drain(sql: string): Promise<void> {
 		for await (const _row of db.eval(sql)) { /* drain */ }
 	}

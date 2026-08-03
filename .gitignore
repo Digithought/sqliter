@@ -8,6 +8,8 @@ packages/sync-coordinator/.data
 .quereus
 .yarnrc.yml
 
+.tmp
+
 # Task runner agent logs
 tasks/.logs/
 
