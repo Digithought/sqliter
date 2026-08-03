@@ -92,6 +92,8 @@ Decomposing a write re-plans the view body, and that re-plan uses the **view's o
 
 A CTE-name or inline-subquery DML target (`with c as (…) update c …`, `update (select …) as v …`) is **not** a stored object — it is part of the caller's statement — so its body keeps the caller's path verbatim. The single gate for both cases is `bodyPlanningContext(ctx, view)` in `planner/mutation/body-context.ts`.
 
+The gate covers the body **plan**. It does not yet cover the body-derived expressions the lowering copies into the base statement — the view's own `where` and each column's base-term expression — which are planned with the rest of the lowered statement on the caller's context (`buildBaseOp`). A plain column reference is already fully resolved by then, but a **subquery** inside such a fragment carries its `from` names through verbatim and so resolves on the caller's path: for a non-`main` view an UPDATE / DELETE fails outright, and under a session `schema_path` that reaches a same-named table it silently writes the wrong row set. Tracked as `fix/bug-view-write-subquery-in-body-uses-caller-schema`.
+
 ### Identifying Predicates
 
 Updates and deletes carry a **row-identifying predicate** built from base-table primary keys traced through the lineage. For a relation whose lineage proves `(b1.pk, b2.pk, ...)` is a superkey at the top, the row-identifying predicate is the equality on those PKs. The propagation pass uses this predicate to bind the per-base operations to specific underlying rows.

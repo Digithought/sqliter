@@ -115,6 +115,45 @@ SELECT COUNT(*) as count FROM myapp.products;
 INSERT INTO products (id, name) VALUES (3, 'Thingamajig') WITH SCHEMA myapp RETURNING id, name, status;
 → [{"id":3,"name":"Thingamajig","status":"active"}]
 
+-- ===================================
+-- Non-default schema: write-through a view whose home schema is not on the path
+-- The stored body's unqualified `products` must resolve next to the VIEW (myapp),
+-- for the write exactly as for the read — the session path here is 'main'.
+-- ===================================
+
+-- Test 18: INSERT / UPDATE / DELETE through a view stored in myapp
+CREATE VIEW myapp.product_names AS SELECT id, name FROM products;
+
+INSERT INTO myapp.product_names (id, name) VALUES (4, 'Gizmo');
+
+SELECT id, name, status FROM myapp.products WHERE id = 4;
+→ [{"id":4,"name":"Gizmo","status":"active"}]
+
+UPDATE myapp.product_names SET name = 'Gizmo II' WHERE id = 4;
+
+SELECT id, name FROM myapp.products WHERE id = 4;
+→ [{"id":4,"name":"Gizmo II"}]
+
+DELETE FROM myapp.product_names WHERE id = 4;
+
+SELECT COUNT(*) as count FROM myapp.products WHERE id = 4;
+→ [{"count":0}]
+
+-- Test 19: on a name collision the view's home schema wins over the session path
+CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO products (id, name) VALUES (9, 'main-row');
+
+UPDATE myapp.product_names SET name = 'via-view' WHERE id = 3;
+
+SELECT id, name FROM myapp.products WHERE id = 3;
+→ [{"id":3,"name":"via-view"}]
+
+SELECT id, name FROM main.products;
+→ [{"id":9,"name":"main-row"}]
+
+DROP TABLE products;
+DROP VIEW myapp.product_names;
+
 -- Clean up custom schema
 DROP TABLE myapp.products;
 
