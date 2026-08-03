@@ -128,15 +128,14 @@ const [checkpoint] = await syncManager.listSnapshotCheckpoints();
 // Or look one up directly, when the id is still in hand
 // const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
 
-// Resume from where we left off
 if (checkpoint) {
+  // Resume from where we left off...
   for await (const chunk of syncManager.resumeSnapshotStream(checkpoint)) {
     sendToPeer(chunk);
   }
+  // ...or abandon a transfer that will not be resumed:
+  // await syncManager.clearSnapshotCheckpoint(checkpoint.snapshotId);
 }
-
-// Or abandon a transfer that will not be resumed
-await syncManager.clearSnapshotCheckpoint(checkpoint.snapshotId);
 ```
 
 A `SnapshotCheckpoint` holds a `Uint8Array` site id and a `bigint` HLC wall time,

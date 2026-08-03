@@ -544,6 +544,7 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 | `si:` | Site identity | `{siteId, createdAt}` |
 | `hc:` | HLC state | `{wallTime, counter}` |
 | `fv:` | Sync-metadata format version | decimal string (see *Metadata format version*) |
+| `sc:{snapshotId}` | Snapshot checkpoint — resume position of an interrupted streaming apply (see *Checkpoint presence means partial data*) | `{snapshotId, siteId, hlc, completedTables, entriesProcessed, …}` |
 
 `⟨part⟩` above is a **length-prefixed component**: `{len}:{part}`, `len` being the part's
 length in string code units (`joinKeyParts`, `metadata/keys.ts`). Schema, table and column
@@ -920,6 +921,13 @@ A checkpoint is present for the *entire* duration of a streaming apply:
 - **Re-saved at every metadata flush**, advancing `completedTables`.
 - **Cleared by the footer**, after `bootstrapFinalize` — deliberately in that order,
   so a failed finalize leaves the checkpoint in place and the transfer retries.
+
+Every *other* snapshot's checkpoint is deleted at that same header point. The clear
+just removed the local metadata of every table this apply did not inherit, so another
+transfer's `completedTables` no longer has state behind it — resuming from it would
+tell the sender to skip exactly the tables that can no longer be rebuilt. Dropping
+those records keeps at most one checkpoint alive at a time, so nothing accumulates
+and a replica made whole by *any* completed apply reports itself whole.
 
 So on a replica whose data may be mid-bootstrap, `listSnapshotCheckpoints()` is the
 single durable answer to "is this data partial?" — no `snapshotId` needed, which

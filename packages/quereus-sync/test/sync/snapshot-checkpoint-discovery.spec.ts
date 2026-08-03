@@ -15,7 +15,10 @@
  * underway. The converse must hold too: a snapshot REJECTED by the header gates
  * (wire format, clock drift) never touched local state, so it must leave no
  * checkpoint — otherwise every later connect would try to resume a transfer that
- * was never allowed to start.
+ * was never allowed to start. And a later apply's up-front metadata clear strands
+ * every OTHER transfer's resume position, so those records are dropped with it:
+ * at most one checkpoint exists at a time, and a replica made whole by any apply
+ * reports itself whole.
  */
 
 import { expect } from 'chai';
@@ -189,7 +192,7 @@ describe('snapshot checkpoint discovery', () => {
 			.to.deep.equal([header.snapshotId]);
 	});
 
-	it('several abandoned transfers coexist, and a later apply\'s metadata clear spares them', async () => {
+	it('a later apply drops the earlier transfer\'s now-stale checkpoint, keeping its own', async () => {
 		await seedTable(sender, 'big', ROWS);
 
 		const first = await chunksOf(sender);
@@ -200,12 +203,29 @@ describe('snapshot checkpoint discovery', () => {
 		await expectRejection(receiver.manager.applySnapshotStream(headerThenDrop(first)), 'the first drop');
 		await expectRejection(receiver.manager.applySnapshotStream(headerThenDrop(second)), 'the second drop');
 
-		// The second apply ran `clearExistingMetadata` (which sweeps cv:/tb:/cl:) at its
-		// header. If that sweep ever grew to include `sc:`, the FIRST checkpoint would be
-		// gone here — deleting a resume position at the moment it is needed.
-		const ids = (await receiver.manager.listSnapshotCheckpoints()).map((c) => c.snapshotId).sort();
-		expect(ids, 'both abandoned transfers are listed; neither is deduplicated away')
-			.to.deep.equal([headerOf(first).snapshotId, headerOf(second).snapshotId].sort());
+		// The second apply's `clearExistingMetadata` wiped the metadata of every table it
+		// did not inherit, so the FIRST checkpoint's completed-table set no longer has
+		// local state behind it: resuming from it would skip tables that can never be
+		// rebuilt. It must be dropped — while the running transfer's own record survives.
+		expect((await receiver.manager.listSnapshotCheckpoints()).map((c) => c.snapshotId),
+			'only the most recent transfer remains resumable')
+			.to.deep.equal([headerOf(second).snapshotId]);
+	});
+
+	it('a completed apply leaves nothing behind, including an earlier abandoned transfer', async () => {
+		await seedTable(sender, 'big', ROWS);
+
+		const abandoned = await chunksOf(sender);
+		await expectRejection(receiver.manager.applySnapshotStream(headerThenDrop(abandoned)), 'the drop');
+
+		// A full apply from a DIFFERENT snapshot makes the replica whole. Its footer
+		// clears only its own record, so the abandoned one must have gone at the header —
+		// otherwise a complete replica reports itself partial forever.
+		await receiver.manager.applySnapshotStream(toStream(await chunksOf(sender)));
+
+		expect(await receiver.manager.listSnapshotCheckpoints(), 'a complete replica reports no partial transfer')
+			.to.deep.equal([]);
+		expect(Number((await collect(receiver.db, 'select count(*) as n from big'))[0].n)).to.equal(ROWS);
 	});
 
 	it('clearSnapshotCheckpoint discards a transfer the caller will not resume', async () => {

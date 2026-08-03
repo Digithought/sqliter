@@ -6,6 +6,7 @@
  */
 
 import type { Row, SqlValue } from '@quereus/quereus';
+import { bytesEqual } from '@quereus/store';
 import type { HLC } from '../clock/hlc.js';
 import { assertWithinDrift } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
@@ -416,14 +417,15 @@ export async function applySnapshotStream(
 	let batchSize = 0;
 	const BATCH_FLUSH_SIZE = 1000;
 
-	// Flush the accumulated metadata batch and (on a live transfer) save a resume
-	// checkpoint. Shared by the column-version and tombstone chunk handlers so both
-	// honor the same BATCH_FLUSH_SIZE bound and checkpoint cadence.
 	// The checkpoint record for the apply's CURRENT position. Both save sites — the
 	// header-time save that opens the resumable window, and every metadata-batch
 	// flush below — build it here so the two cannot drift.
 	const buildCheckpointRecord = (id: string, hlc: HLC): SnapshotCheckpoint => ({
 		snapshotId: id,
+		// NOTE: this is the RECEIVER's site id, but `resumeSnapshotStream` stamps it
+		// into the resumed stream's header, where a fresh stream puts the sender's.
+		// Inert today (nothing reads `header.siteId`); see the second arm of
+		// bug-sync-resume-snapshot-unvalidated-checkpoint before any consumer appears.
 		siteId: ctx.getSiteId(),
 		hlc,
 		// NOTE: nothing reads these two — resume keys off `completedTables` alone.
@@ -437,6 +439,9 @@ export async function applySnapshotStream(
 		createdAt: Date.now(),
 	});
 
+	// Flush the accumulated metadata batch and (on a live transfer) save a resume
+	// checkpoint. Shared by the column-version and tombstone chunk handlers so both
+	// honor the same BATCH_FLUSH_SIZE bound and checkpoint cadence.
 	const flushMetadataBatch = async (): Promise<void> => {
 		await batch.write();
 		batch = ctx.kv.batch();
@@ -536,6 +541,15 @@ export async function applySnapshotStream(
 					entriesProcessed = checkpoint.entriesProcessed;
 				}
 				await clearExistingMetadata(ctx, new Set(completedTables));
+
+				// That clear just wiped the CRDT metadata of every table this apply did not
+				// inherit, so ANY OTHER transfer's saved resume position is now stale: it
+				// names tables as completed whose local metadata is gone, and resuming it
+				// would tell the sender to skip exactly the tables that can no longer be
+				// rebuilt. Drop those records here — which also keeps "a checkpoint exists"
+				// a faithful answer to "is this replica's data partial?", since the footer
+				// clears this apply's own record and leaves nothing behind it.
+				await clearOtherSnapshotCheckpoints(ctx, chunk.snapshotId);
 
 				// Open the resumable window the instant local metadata is gone. Both gates
 				// above reject WITHOUT touching local state, so a refused snapshot leaves no
@@ -750,6 +764,10 @@ export async function applySnapshotStream(
 // Checkpoint Management
 // ============================================================================
 //
+// NOTE: this file is 870 lines. If it grows much further, this section is the
+// natural extraction seam — it depends only on `SyncContext` and the `sc:` key
+// builders, not on the producer/consumer bodies above.
+//
 // NOTE: the AT-REST encoding below (wallTime as a decimal string, siteId as a
 // number array) is deliberately NOT the wire encoding. The wire form is
 // `SerializedSnapshotCheckpoint` in `wire.ts` (both binary fields as base64),
@@ -817,6 +835,31 @@ async function saveSnapshotCheckpoint(
 		siteId: Array.from(checkpoint.siteId),
 	});
 	await ctx.kv.put(buildSnapshotCheckpointKey(checkpoint.snapshotId), new TextEncoder().encode(json));
+}
+
+/**
+ * Delete every saved checkpoint EXCEPT `keepSnapshotId`'s.
+ *
+ * Called once per apply, right after `clearExistingMetadata`: at that instant
+ * every other transfer's resume position became unusable (see the call site).
+ * At most one checkpoint therefore exists at a time, so `listSnapshotCheckpoints`
+ * cannot accumulate records and cannot report a complete replica as partial.
+ */
+async function clearOtherSnapshotCheckpoints(
+	ctx: SyncContext,
+	keepSnapshotId: string,
+): Promise<void> {
+	const keep = buildSnapshotCheckpointKey(keepSnapshotId);
+	const clearBatch = ctx.kv.batch();
+	let staleCount = 0;
+
+	for await (const entry of ctx.kv.iterate(buildAllSnapshotCheckpointScanBounds())) {
+		if (bytesEqual(entry.key, keep)) continue;
+		clearBatch.delete(entry.key);
+		staleCount++;
+	}
+
+	if (staleCount > 0) await clearBatch.write();
 }
 
 /**

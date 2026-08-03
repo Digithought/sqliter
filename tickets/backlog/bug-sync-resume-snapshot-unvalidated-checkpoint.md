@@ -48,3 +48,19 @@ reader accordingly, and only then write the session-consistency check.
 
 (By contrast `checkpoint.hlc` is used correctly: the resumed header carries the *original*
 snapshot's HLC, which is the point-in-time the transfer is completing.)
+
+## Third arm — the same trust gap at rest, now on a discovery call
+
+Found reviewing `feat-sync-snapshot-checkpoint-discovery`. The two arms above are about a
+checkpoint arriving over the wire. The stored copy is read with no validation either:
+`decodeCheckpoint` (`packages/quereus-sync/src/sync/snapshot-stream.ts`) `JSON.parse`s the
+record and reaches straight into `obj.hlc.wallTime` / `obj.hlc.siteId` / `obj.siteId`. A
+truncated or corrupt record throws a raw `SyntaxError`/`TypeError`.
+
+What changed: that decode now also runs inside `listSnapshotCheckpoints()`, which a client is
+expected to call at connect time to ask "is my data partial?". Previously a corrupt record only
+broke a resume that already knew the snapshot id; now one bad record breaks the discovery call
+itself, and the client cannot even learn that it holds partial data. Same root cause as the
+wire arms — settle what a valid checkpoint is, then apply it at both the wire and at-rest
+decode sites (and decide whether a record that fails validation should be dropped rather than
+thrown, since an undecodable checkpoint is not resumable anyway).
