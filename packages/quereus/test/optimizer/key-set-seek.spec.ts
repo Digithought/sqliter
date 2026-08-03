@@ -23,7 +23,7 @@ import { MergeJoinNode } from '../../src/planner/nodes/merge-join-node.js';
 import { IndexScanNode, IndexSeekNode, SeqScanNode } from '../../src/planner/nodes/table-access-nodes.js';
 import { SortNode } from '../../src/planner/nodes/sort.js';
 import { FilterNode } from '../../src/planner/nodes/filter.js';
-import { LiteralNode } from '../../src/planner/nodes/scalar.js';
+import { BetweenNode, BinaryOpNode, LiteralNode } from '../../src/planner/nodes/scalar.js';
 import { stampMultiSeek } from '../../src/runtime/emit/key-set-semi-join.js';
 import { makeFullScanFilterInfo } from '../../src/vtab/filter-info.js';
 import { PhysicalType } from '../../src/types/logical-type.js';
@@ -704,6 +704,50 @@ describe('key-set-seek plan shape', () => {
 				expect(collectNodes(plan, isFilter).some(f => f.source === nodes[0]),
 					`re-applied Filter for: ${sql}`).to.equal(true);
 			}
+		});
+
+		it('AND-combines two pushed constraints and drops the rows the seek returns anyway', async () => {
+			// A two-sided range pushes BOTH bounds into one seek, so the recorded
+			// set has two entries and the re-applied predicate is their AND. The
+			// key set (v = 10, 30, 40) deliberately reaches OUTSIDE the range: the
+			// seek branch returns pk 1 and pk 4, and only the re-applied AND
+			// rejects them — a stronger guard than the single-constraint cases.
+			await pdb.exec("insert into big values (1, 10, 0, 'x'), (2, 20, 0, 'x'), (3, 30, 0, 'x'), (4, 40, 0, 'x')");
+			await pdb.exec('insert into small values (10), (30), (40)');
+			const sql = 'select pk from big where pk > 1 and pk < 4 and v in (select id from small)';
+			const plan = pdb.getPlan(sql);
+			const nodes = collectNodes(plan, isKeySetSemiJoin);
+			expect(nodes).to.have.lengthOf(1);
+			const target = nodes[0].target as IndexSeekNode;
+			expect(target.pushedConstraints, 'both bounds were pushed into the seek').to.have.lengthOf(2);
+			const reapplied = collectNodes(plan, isFilter).find(f => f.source === nodes[0]);
+			expect(reapplied!.predicate, 'the two recorded expressions arrive AND-combined')
+				.to.be.instanceOf(BinaryOpNode);
+			expect(nodes[0].pushdown.breakEvenKeys, 'a 3-key set takes the seek branch').to.be.at.least(3);
+
+			const rows: unknown[] = [];
+			for await (const r of pdb.eval(sql)) rows.push(r);
+			expect(rows, 'pk 1 and pk 4 are in the key set but outside the range').to.deep.equal([{ pk: 3 }]);
+		});
+
+		it('re-applies a BETWEEN as its single source node, not as two copies', async () => {
+			// Both of a BETWEEN's constraints carry the SAME `sourceExpression`,
+			// so `combineResidualExpressions`' identity de-duplication must yield
+			// the one `BetweenNode` rather than `x BETWEEN a AND b AND x BETWEEN a AND b`.
+			await pdb.exec("insert into big values (1, 10, 0, 'x'), (2, 20, 0, 'x'), (3, 30, 0, 'x'), (4, 40, 0, 'x')");
+			await pdb.exec('insert into small values (10), (30), (40)');
+			const sql = 'select pk from big where pk between 2 and 4 and v in (select id from small)';
+			const plan = pdb.getPlan(sql);
+			const nodes = collectNodes(plan, isKeySetSemiJoin);
+			expect(nodes).to.have.lengthOf(1);
+			const reapplied = collectNodes(plan, isFilter).find(f => f.source === nodes[0]);
+			expect(reapplied!.predicate).to.be.instanceOf(BetweenNode);
+			expect(reapplied!.predicate)
+				.to.equal((nodes[0].target as IndexSeekNode).pushedConstraints![0].sourceExpression);
+
+			const rows: unknown[] = [];
+			for await (const r of pdb.eval(sql)) rows.push(r);
+			expect(rows, 'pk 1 is in the key set but below the range').to.deep.equal([{ pk: 3 }, { pk: 4 }]);
 		});
 
 		it('declines an absorbed-Sort seek leaf (orderingLoadBearing)', async () => {

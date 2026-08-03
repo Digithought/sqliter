@@ -49,19 +49,22 @@
  *   - any non-peelable node between the join and the access leaf
  *   - a walk leaf that is not an unconstrained every-row walk (residue in
  *     `FilterInfo.constraints`, or a pushed limit / offset)
- *   - a seek leaf with a pushed limit / offset (a directive the multi-seek
- *     would not honour, and unlike a predicate it cannot be re-applied by a
- *     Filter without changing which rows are dropped — unreachable today,
- *     `monotonic-limit-pushdown`'s peel cannot cross a join, but kept), with
- *     no recorded `pushedConstraints` (a seek we cannot describe is a seek we
- *     must not displace), whose recorded predicate contains a relational node
- *     (this rule runs PostOptimization — a re-inserted relational subquery
- *     would reach emit unphysicalized), whose subtree is correlated
- *     (`index-nested-loop` builds seeks keyed on the OUTER side of a join —
- *     re-applying is correct but the node drains the key source per outer
- *     row, turning a linear plan quadratic), or whose emission order absorbed
- *     a Sort (`orderingLoadBearing` — `seekPreservesTargetOrder` is false for
- *     every seek, so the absorbed order cannot be reproduced)
+ *   - a seek leaf failing any of {@link admitSeekLeaf}'s five gates:
+ *     - a pushed limit / offset (a directive the multi-seek would not honour,
+ *       and unlike a predicate it cannot be re-applied by a Filter without
+ *       changing which rows are dropped — unreachable today,
+ *       `monotonic-limit-pushdown`'s peel cannot cross a join, but kept)
+ *     - no recorded `pushedConstraints` (a seek we cannot describe is a seek
+ *       we must not displace)
+ *     - a recorded predicate containing a relational node (this rule runs
+ *       PostOptimization — a re-inserted relational subquery would reach emit
+ *       unphysicalized)
+ *     - a correlated subtree (`index-nested-loop` builds seeks keyed on the
+ *       OUTER side of a join — re-applying is correct but the node drains the
+ *       key source per outer row, turning a linear plan quadratic)
+ *     - an emission order that absorbed a Sort (`orderingLoadBearing` —
+ *       `seekPreservesTargetOrder` is false for every seek, so the absorbed
+ *       order cannot be reproduced)
  *   - a walk leaf whose emission order absorbed a SortNode (`orderingLoadBearing`)
  *     UNLESS the seek would reproduce that order (`seekPreservesTargetOrder`:
  *     the seek index is the walk index, so a multi-seek emits a subsequence of
@@ -119,7 +122,7 @@
  */
 
 import { createLogger } from '../../../common/logger.js';
-import { isRelationalNode, type PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../../nodes/plan-node.js';
+import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
 import { BloomJoinNode } from '../../nodes/bloom-join-node.js';
 import { MergeJoinNode } from '../../nodes/merge-join-node.js';
@@ -131,6 +134,7 @@ import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
 import { hasSemanticOrdering, normalizeCollationName } from '../../../util/comparison.js';
 import { sharesSeekKeySpace } from '../../../types/builtin-types.js';
 import { effectiveCollationOfTypes } from '../../analysis/comparison-collation.js';
+import { hasRelationalDescendant } from '../../analysis/scalar-subqueries.js';
 import { classifyConstraintCover, combineResidualExpressions } from './rule-select-access-path.js';
 import { peelToSeekableAccessLeaf, rebuildChain, buildProbeRequest } from '../shared/access-leaf.js';
 import { resolveIndexDescriptor } from '../../../vtab/index-descriptor.js';
@@ -265,7 +269,7 @@ function admitSeekLeaf(leaf: IndexSeekNode): AdmittedLeaf | null {
 	// subquery inside it would reach emit unprepared. Constraint extraction
 	// should never produce one; this gate makes that independent of the
 	// extractor's behaviour.
-	if (containsRelationalNode(residual)) {
+	if (hasRelationalDescendant(residual)) {
 		log('decline: seek leaf pushed predicate contains a relational node');
 		return null;
 	}
@@ -288,14 +292,6 @@ function admitSeekLeaf(leaf: IndexSeekNode): AdmittedLeaf | null {
 		return null;
 	}
 	return { leaf, residual };
-}
-
-/** Does any descendant of `root` (root excluded) satisfy `isRelationalNode`? */
-function containsRelationalNode(root: PlanNode): boolean {
-	for (const child of root.getChildren()) {
-		if (isRelationalNode(child) || containsRelationalNode(child)) return true;
-	}
-	return false;
 }
 
 /** The join key's position on each side, with both sides' declared types. */
@@ -522,6 +518,14 @@ function planPushdown(
  * at k=1 — in exact arithmetic the floor yields 1 (accept at the tie; a
  * cost-equal seek is harmless), but the subtract-then-divide can land a hair
  * under the integer and turn the tie into a decline.
+ *
+ * NOTE: the consequence on the memory module is that an equality-pushed seek
+ * target always lands on `breakEvenKeys === 1`, so the plan is rewritten but
+ * the runtime seek branch fires only for a one-key set. That is the module's
+ * own verdict (it prices both seeks off the seek-key count and knows nothing
+ * of how many rows each window holds), not an engine choice. A module that
+ * prices an equality seek from its matched-row count — the store does — yields
+ * a break-even that discriminates, and the seek branch fires accordingly.
  */
 const BREAK_EVEN_EPSILON = 1e-9;
 
