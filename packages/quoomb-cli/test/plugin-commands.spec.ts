@@ -442,6 +442,75 @@ describe('.plugin subcommands', () => {
 			expect(v2Evaluated()).toBe(false);
 		});
 
+		it('reports a pin violation from `.plugin enable`, leaving the record disabled', async () => {
+			await install({ pin: true });
+			await handleDotCommand('.plugin disable plain', db, readlineStub);
+			serveChangedBytes();
+			logSpy.mockClear();
+
+			await handleDotCommand('.plugin enable plain', db, readlineStub);
+
+			expect(output()).toContain('does not match its pinned hash');
+			expect(output()).toContain('.plugin trust plain');
+			expect(output()).not.toContain('Enabled plugin');
+			expect(v2Evaluated()).toBe(false);
+			expect((await records())[0].enabled).toBe(false);
+		});
+
+		it('keeps a `.plugin config` change but reports the pin that stopped its reload', async () => {
+			// Needs a manifest: `.plugin config` only accepts a declared setting.
+			const url = 'https://settings.example.test/dist/tunable.mjs';
+			serveModule(url);
+			serveManifest(url, {
+				name: 'tunable',
+				version: '1.0.0',
+				quereus: { settings: [{ key: 'depth', label: 'Depth', type: 'number', default: 1 }] },
+			});
+			await handleDotCommand(`.plugin install ${url} --pin`, db, readlineStub);
+			serveModule(url, PLUGIN_SOURCE_V2);
+			logSpy.mockClear();
+
+			await handleDotCommand('.plugin config tunable depth=5', db, readlineStub);
+
+			expect(output()).toContain('Configuration updated');
+			expect(output()).toContain('does not match its pinned hash');
+			expect(v2Evaluated()).toBe(false);
+			const [after] = await records();
+			expect(after.config).toEqual({ depth: 5 });
+			expect(after.sha256).toBe(sha256(PLUGIN_SOURCE));
+		});
+
+		it('drops a removed plugin\'s pin in the same session, so the URL can be reinstalled', async () => {
+			await install({ pin: true });
+			serveChangedBytes();
+
+			await handleDotCommand('.plugin remove plain', db, readlineStub);
+			logSpy.mockClear();
+
+			await handleDotCommand(`.plugin install ${MODULE_URL_NO_MANIFEST}`, db, readlineStub);
+
+			expect(output()).toContain('Successfully installed plugin: plain');
+			expect(output()).not.toContain('does not match');
+			expect((await records())[0].sha256).toBe(sha256(PLUGIN_SOURCE_V2));
+		});
+
+		it('refuses `--pin` for a file: URL rather than recording a pin that can never fire', async () => {
+			await handleDotCommand('.plugin install file:///plugins/local.mjs --pin', db, readlineStub);
+
+			expect(output()).toContain('Cannot install');
+			expect(output()).toContain('https:');
+			expect(output()).not.toContain('Installing plugin from');
+			await expect(records()).rejects.toThrow();
+		});
+
+		it('rejects an unrecognized install flag instead of treating it as the URL', async () => {
+			await handleDotCommand(`.plugin install ${MODULE_URL_NO_MANIFEST} --pinn`, db, readlineStub);
+
+			expect(output()).toContain('Unknown option: --pinn');
+			expect(output()).toContain('Usage: .plugin install');
+			await expect(records()).rejects.toThrow();
+		});
+
 		it('refuses to pin or trust a hash for a file: plugin, whose bytes are never fetched', async () => {
 			await writeRecords([{
 				id: 'local',

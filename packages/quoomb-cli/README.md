@@ -101,7 +101,8 @@ Pinning turns that into a refusal. `.plugin install <url> --pin`, or
 recorded hash is checked *before* the module is written to disk or imported;
 bytes that do not match never run. Pinning is off unless asked for, and applies
 only to `https:` plugins — a `file:` plugin is loaded directly, with no download
-to verify.
+to verify, so `--pin`, `.plugin pin` and `.plugin trust` all refuse one rather
+than record a pin that could never fire.
 
 When the code behind a pinned URL changes, the load is refused, the plugin is
 left enabled, and the CLI names the two ways out:

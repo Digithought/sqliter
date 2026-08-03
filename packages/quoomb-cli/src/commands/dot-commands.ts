@@ -343,6 +343,16 @@ const PLUGIN_HELP_LINES = [
   '  <name> is whatever `.plugin list` shows; the install URL works too.',
 ];
 
+/**
+ * `.plugin` subcommand dispatch.
+ *
+ * NOTE: everything from here to the end of the file — the subcommands, the
+ * record store, the pin table sync — is one self-contained concern that happens
+ * to live in the dot-command file (1,151 lines as of the pinning work). It is
+ * still under the ~1,800 lines at which this project has split files before; if
+ * it reaches that, this is the seam: move it to `src/commands/plugin.ts` and
+ * leave `handlePluginCommand` as the only import.
+ */
 const handlePluginCommand = async (line: string, db: Database): Promise<void> => {
   const args = line.split(/\s+/).slice(1);
   const subcommand = args[0];
@@ -520,16 +530,26 @@ export const syncSavedPluginPins = async (): Promise<void> => {
 };
 
 /**
- * True when this plugin's module is fetched over the network, which is the only
+ * True when this URL's module is fetched over the network, which is the only
  * case a pin can act on — a `file:` URL never reaches the remote resolver, so a
  * pin on one would be silently inert.
  */
-const isRemotePlugin = (plugin: PluginRecord): boolean => {
+const isRemoteUrl = (url: string): boolean => {
   try {
-    return new URL(plugin.url).protocol === 'https:';
+    return new URL(url).protocol === 'https:';
   } catch {
     return false;
   }
+};
+
+/**
+ * Refuses a hash-related request against a plugin the CLI does not download, in
+ * the same words wherever it is asked. `lead` names what was refused; the reason
+ * is the same every time.
+ */
+const reportNotRemote = (lead: string, url: string): void => {
+  console.log(`${lead}: verification only applies to modules the CLI downloads (https: URLs).`);
+  console.log(`  ${url} is loaded directly, so there are no fetched bytes to verify.`);
 };
 
 /**
@@ -537,6 +557,11 @@ const isRemotePlugin = (plugin: PluginRecord): boolean => {
  * failed. `dynamicLoadModule` wraps every error in a `Failed to load plugin
  * from …` Error, keeping the original on `cause`, so the class is only reachable
  * through there.
+ *
+ * NOTE: one level of `cause` only, matching the loader's single wrap. A second
+ * wrapping layer anywhere in that path would degrade every pin refusal to the
+ * generic `Error …ing plugin: …` message with no test noticing; walk the chain
+ * if the loader ever grows one.
  */
 const hashMismatchFrom = (error: unknown): PluginHashMismatchError | undefined => {
   if (error instanceof PluginHashMismatchError) return error;
@@ -607,11 +632,26 @@ const installPluginCommand = async (args: string[], db: Database): Promise<void>
   }
 
   const pin = flags.includes('--pin');
+
+  // `--pin` on a URL the CLI never downloads would record a pin that can never
+  // fire. Refuse the install rather than quietly delivering an unenforceable
+  // one — the user asked for a guarantee, not for best effort.
+  if (pin && !isRemoteUrl(url)) {
+    reportNotRemote(`Cannot install ${url} with --pin`, url);
+    return;
+  }
+
   const plugins = await loadPlugins();
 
   // Before the load, not after: re-installing an already-installed URL used to
   // import (and register) the module and only then report the duplicate, which
   // let `.plugin install <pinned url>` run unpinned bytes.
+  //
+  // NOTE: this matches the URL string exactly, while the pin table is keyed by
+  // the normalized href, so `https://host:443/p.mjs` installs a *second* record
+  // beside `https://host/p.mjs` yet shares its pin. Harmless today (the pin
+  // applies to both, which is the safe direction), but if two records for one
+  // fetch ever need to disagree, match on the normalized form here too.
   if (plugins.some(p => p.url === url)) {
     console.log(`Plugin from ${url} is already installed`);
     return;
@@ -664,8 +704,8 @@ const installPluginCommand = async (args: string[], db: Database): Promise<void>
 /**
  * Says what a just-pinned record actually enforces. A pin without a recorded
  * hash is not an error — install records one from the fetch it just did, but a
- * `file:` plugin or a hand-edited record may have none — so say which of the two
- * situations the user is in.
+ * record predating hash recording, or a hand-edited one, may have none — so say
+ * which of the two situations the user is in.
  */
 const reportPinState = (plugin: PluginRecord): void => {
   if (plugin.sha256) {
@@ -942,9 +982,8 @@ const pinPluginCommand = async (args: string[]): Promise<void> => {
 
   const name = displayName(plugin);
 
-  if (!isRemotePlugin(plugin)) {
-    console.log(`Cannot pin '${name}': pinning only applies to modules the CLI downloads (https: URLs).`);
-    console.log(`  ${plugin.url} is loaded directly, so there are no fetched bytes to verify.`);
+  if (!isRemoteUrl(plugin.url)) {
+    reportNotRemote(`Cannot pin '${name}'`, plugin.url);
     return;
   }
 
@@ -1012,9 +1051,8 @@ const trustPluginCommand = async (args: string[]): Promise<void> => {
 
   const name = displayName(plugin);
 
-  if (!isRemotePlugin(plugin)) {
-    console.log(`Cannot trust a hash for '${name}': hashes only apply to modules the CLI downloads (https: URLs).`);
-    console.log(`  ${plugin.url} is loaded directly, so there are no fetched bytes to verify.`);
+  if (!isRemoteUrl(plugin.url)) {
+    reportNotRemote(`Cannot trust a hash for '${name}'`, plugin.url);
     return;
   }
 
