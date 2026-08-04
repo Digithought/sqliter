@@ -93,6 +93,40 @@ function reason(res: RewriteResult): string | undefined {
 	return (res as { reason?: string }).reason;
 }
 
+/** Read `sql` end-to-end, capturing declared column names and positional row values. */
+async function readPositional(db: Database, sql: string): Promise<{ columns: string[]; rows: string[] }> {
+	const stmt = db.prepare(sql);
+	try {
+		const rows: string[] = [];
+		for await (const row of stmt.iterateRows()) rows.push(JSON.stringify(Object.values(row) as SqlValue[]));
+		return { columns: stmt.getColumnNames(), rows };
+	} finally {
+		await stmt.finalize();
+	}
+}
+
+/**
+ * Assert the aggregate rewrite is a faithful drop-in for `sql`: it actually fires over
+ * `mvName`, and its column names/order and row values (positional, compared as a
+ * multiset since neither side is ordered) match the base recompute exactly.
+ */
+async function expectBaseViewAgreement(db: Database, sql: string, mvName: string): Promise<void> {
+	db.optimizer.updateTuning(DEFAULT_TUNING);
+	const withRewrite = await readPositional(db, sql);
+	// The rewrite must actually fire — else this vacuously compares two base recomputes.
+	expect(serializePlanTree(db.getPlan(sql)), 'rewrite fired over the MV').to.contain(`"name": "${mvName}"`);
+
+	db.optimizer.updateTuning({ ...DEFAULT_TUNING, disabledRules: new Set(['materialized-view-rewrite-aggregate']) });
+	try {
+		const withoutRewrite = await readPositional(db, sql);
+		expect(withRewrite.columns, 'column names/order must agree').to.deep.equal(withoutRewrite.columns);
+		expect([...withRewrite.rows].sort(), 'row values (positional) must agree')
+			.to.deep.equal([...withoutRewrite.rows].sort());
+	} finally {
+		db.optimizer.updateTuning(DEFAULT_TUNING);
+	}
+}
+
 describe('aggregate-rollup matcher — exact-key', () => {
 	it('exact-key match (query group key == MV group key) ⇒ direct scan, no re-aggregation', async () => {
 		const db = await freshDb(SALES);
@@ -317,27 +351,51 @@ describe('aggregate-rollup matcher — per-reason negatives', () => {
 			await db.exec(
 				'insert into sales (id, d, r, amt) values (1, 1, 1, 10), (2, 1, 2, 20), (3, 2, 1, 30), (4, 2, 2, null)',
 			);
+			await expectBaseViewAgreement(db, sql, 'byregion');
+		} finally {
+			await db.close();
+		}
+	});
 
-			const run = async (): Promise<{ columns: string[]; rows: SqlValue[][] }> => {
-				const stmt = db.prepare(sql);
-				try {
-					const rows: SqlValue[][] = [];
-					for await (const row of stmt.iterateRows()) rows.push(Object.values(row) as SqlValue[]);
-					return { columns: stmt.getColumnNames(), rows };
-				} finally {
-					await stmt.finalize();
-				}
-			};
+	it('group-key-equated base/view agreement: a multi-key query equating two group columns (g1 = g2) agrees with the base recompute', async () => {
+		const db = await freshDb(SALES);
+		try {
+			// `eq-column` was the other shape the retired guard forwent; it also gives the
+			// base a determining FD between two group keys, so it exercises a distinct
+			// simplification path from the `eq-literal` pin above.
+			const sql = 'select d, r, sum(amt) from sales where d = r group by d, r';
+			const res = matchAgg(db, sql, 'byregion');
+			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
+			expect(res.match!.rollup!.exact).to.equal(true);
 
-			db.optimizer.updateTuning(DEFAULT_TUNING);
-			const withRewrite = await run();
-			db.optimizer.updateTuning({ ...DEFAULT_TUNING, disabledRules: new Set(['materialized-view-rewrite-aggregate']) });
-			const withoutRewrite = await run();
-			db.optimizer.updateTuning(DEFAULT_TUNING);
+			await db.exec(
+				'insert into sales (id, d, r, amt) values (1, 1, 1, 10), (2, 1, 2, 20), (3, 2, 2, 30), (4, 2, 1, null)',
+			);
+			await expectBaseViewAgreement(db, sql, 'byregion');
+		} finally {
+			await db.close();
+		}
+	});
 
-			expect(withRewrite.columns, 'column names/order must agree').to.deep.equal(withoutRewrite.columns);
-			const normalize = (rows: SqlValue[][]) => rows.map(r => JSON.stringify(r)).sort();
-			expect(normalize(withRewrite.rows), 'row values (positional) must agree').to.deep.equal(normalize(withoutRewrite.rows));
+	it('group-key-pinned under a rollup: a 2-key query pinning a group column over a 3-key MV rolls up and agrees with the base recompute', async () => {
+		// The retired guard read the *query* group set, so it forwent rollups too — this
+		// covers the pinned shape where the query key is a strict subset of the MV key.
+		const db = await freshDb([
+			'create table s3 (id integer primary key, d integer not null, r integer not null, x integer not null, amt integer null)',
+			'create materialized view by3 as select d, r, x, sum(amt) as total, count(*) as cnt from s3 group by d, r, x',
+		]);
+		try {
+			const sql = 'select d, r, sum(amt) from s3 where d = 1 group by d, r';
+			const res = matchAgg(db, sql, 'by3');
+			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
+			expect(res.match!.rollup!.exact).to.equal(false);
+			expect(res.match!.residualConjuncts).to.have.lengthOf(1);
+
+			await db.exec(
+				'insert into s3 (id, d, r, x, amt) values (1, 1, 1, 7, 10), (2, 1, 1, 8, 20), '
+					+ '(3, 1, 2, 7, 30), (4, 2, 1, 7, 40), (5, 1, 2, 8, null)',
+			);
+			await expectBaseViewAgreement(db, sql, 'by3');
 		} finally {
 			await db.close();
 		}

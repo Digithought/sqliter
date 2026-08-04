@@ -152,6 +152,11 @@ const AGG_QUERIES: readonly string[] = [
 	'select k, j, min(x), max(x), avg(x) from t group by k, j',
 	// Exact-key with a range residual on a group-key column (safe: no re-aggregation).
 	'select k, j, sum(x) from t where k >= 0 group by k, j',
+	// Multi-key group whose residual pins (`k = 1`) or equates (`k = j`) a group key — the
+	// shape the retired `group-key-pinned` forgo refused. Both give the base a determining
+	// FD over a group column, so these fuzz the base/rewrite agreement across random data.
+	'select k, j, sum(x) from t where k = 1 group by k, j',
+	'select k, j, count(*), min(x), max(x) from t where k = j group by k, j',
 	// Rollup to the coarser key {k}.
 	'select k, sum(x) from t group by k',
 	'select k, count(*), count(x) from t group by k',
@@ -175,6 +180,7 @@ const AGG_MUST_REWRITE: readonly string[] = [
 	'select k, j, sum(x) from t group by k, j',
 	'select k, sum(x) from t group by k',
 	'select k, sum(x) from t where j = 1 group by k', // rollup + residual on a dropped MV key
+	'select k, j, sum(x) from t where k = 1 group by k, j', // multi-key group pinning a group key
 	'select sum(x) from t',
 	'select count(*) from t',
 	'select avg(x) from t',
