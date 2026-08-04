@@ -5,6 +5,7 @@ files:
   - packages/quereus/test/logic/24-builtin-branches.sqllogic  # current behavior pinned here
   - docs/types.md                                        # semantic-ordering section notes the wrinkle
 difficulty: easy
+repro: verified
 ---
 
 # `least` NULL handling is order-dependent

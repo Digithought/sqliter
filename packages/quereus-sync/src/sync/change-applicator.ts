@@ -84,11 +84,16 @@ interface BatchTableFate {
 	/** The table exists after this batch's schema steps replay in timestamp order. */
 	present: boolean;
 	/**
-	 * An applied `create_table` transitioned this name from ABSENT to present, so the
-	 * local table is a new, EMPTY incarnation and the receiver's stranded metadata for
-	 * the name describes nothing in it.
+	 * The name this name's surviving table has its sync bookkeeping (`cv:`/`tb:`/`cl:`)
+	 * filed under, or `undefined` when it has none — the name ends up empty, or its table
+	 * was CREATED by this batch. The bookkeeping is keyed by table name and nothing
+	 * re-files it on a rename (`bug-sync-rename-and-pk-change-strand-crdt-metadata`), so
+	 * this is the name's own key for a table that stays put and the OLD name for one that
+	 * arrives by rename. `historyName !== key` on a PRESENT name therefore means the
+	 * bookkeeping stranded there describes a table that is no longer there — exactly the
+	 * read-free (`freshLocalTable`) condition at the resolve site.
 	 */
-	recreated: boolean;
+	historyName: string | undefined;
 }
 
 /**
@@ -117,11 +122,12 @@ interface BatchTableFate {
  *   table again — is already in the seeded presence. Replaying it a second time would
  *   resurrect a state the receiver has since moved past.
  *
- * `recreated` marks only an ABSENT → present transition made by a `create_table`: the
- * one step that produces a new, EMPTY local table, whose rows therefore have no
- * meaningful local cell versions or tombstones to resolve against (dropping a table
- * does not purge its sync metadata). A `rename_table` moves an existing table WITH its
- * rows, so arriving under a name by rename never sets it.
+ * The simulation tracks WHICH table ends up at each name, not merely whether one does:
+ * {@link BatchTableFate.historyName} follows the table, the sync bookkeeping does not.
+ * That is what separates the two ways a name is vacated and refilled — a `drop_table`
+ * destroys its occupant, so anything arriving afterwards is a stranger to the
+ * bookkeeping left behind, while a rename-away followed by a rename BACK returns the
+ * very table the bookkeeping describes.
  */
 function computeBatchTableFates(
 	migrations: readonly SchemaMigration[],
@@ -132,7 +138,17 @@ function computeBatchTableFates(
 		const key = tableKey(schema, table);
 		let fate = fates.get(key);
 		if (!fate) {
-			fate = { present: isPresentLocally(schema, table), recreated: false };
+			// A table the receiver already holds has its bookkeeping under its own name.
+			//
+			// NOTE: the seed reads the `getTableSchema` basis oracle while Phase 2 decides
+			// the DDL against `db.schemaManager` directly. The shipped wiring makes them the
+			// same answer; a host whose oracle deliberately hides a table the catalog has
+			// would make this simulation predict a decline the store adapter then executes,
+			// and the batch's rows for that name would be held rather than applied (the
+			// drain recovers them on the next sweep). If a narrowing oracle ever ships,
+			// give the simulation a catalog-presence input of its own.
+			const present = isPresentLocally(schema, table);
+			fate = { present, historyName: present ? key : undefined };
 			fates.set(key, fate);
 		}
 		return fate;
@@ -143,18 +159,18 @@ function computeBatchTableFates(
 			case 'create_table': {
 				const fate = fateOf(migration.schema, migration.table);
 				// Already present ⇒ `decideSchemaChange` converges without executing, so the
-				// local table and its rows survive; only an absent → present transition
-				// leaves a genuinely empty incarnation.
+				// local table, its rows and its bookkeeping all survive untouched; only an
+				// absent → present transition leaves a genuinely empty table with no history.
 				if (!fate.present) {
 					fate.present = true;
-					fate.recreated = true;
+					fate.historyName = undefined;
 				}
 				break;
 			}
 			case 'drop_table': {
 				const fate = fateOf(migration.schema, migration.table);
 				fate.present = false;
-				fate.recreated = false;
+				fate.historyName = undefined;
 				break;
 			}
 			case 'rename_table': {
@@ -167,11 +183,11 @@ function computeBatchTableFates(
 				// already happened here). Both present ⇒ `decideRenameTable` throws a
 				// collision and the whole admission unit aborts; predict no movement.
 				if (!from.present || to.present) break;
-				from.present = false;
-				from.recreated = false;
 				to.present = true;
-				// The renamed table arrives carrying its rows — never a fresh, empty one.
-				to.recreated = false;
+				// The table moves; its bookkeeping stays where it was filed.
+				to.historyName = from.historyName;
+				from.present = false;
+				from.historyName = undefined;
 				break;
 			}
 		}
@@ -338,21 +354,20 @@ export async function applyChanges(
 			// Resolve it read-free rather than throwing from the keying resolver;
 			// Phase 3's metadata commit runs after the DDL, when the keying resolves.
 			//
-			// A table this batch DROPS AND RE-CREATES counts as fresh too, even when the
-			// receiver already has it: post-batch it is a new, empty incarnation, and
-			// dropping a table does not purge its sync metadata — so resolving these rows
-			// against the dropped incarnation's cell versions and tombstones would let a
-			// stale tombstone silently discard them under the default
-			// `allowResurrection: false`. `recreated` is only ever set by an applied
-			// absent → present `create_table` (see {@link computeBatchTableFates}), so a
-			// RE-DELIVERED drop/re-create batch — every schema step dominated, no local
-			// schema changed, the local table already the post-re-create incarnation —
-			// resolves normally against that incarnation's own metadata, and a table that
-			// merely arrives under this name by RENAME resolves normally too: it brings
-			// its rows with it and is not a fresh incarnation. (The broader question of a
-			// re-created table INHERITING that bookkeeping — purge policy, relays,
-			// retention horizon — is tracked separately; this only stops the in-batch
-			// recreate consulting it.)
+			// A table this batch leaves under a name whose stranded bookkeeping describes
+			// some OTHER table counts as fresh too, even when the receiver already has the
+			// name: dropping or renaming a table does not move its cell versions and
+			// tombstones, so resolving these rows against them would let a stale tombstone
+			// silently discard them under the default `allowResurrection: false`. That is
+			// `fate.historyName !== key` — a drop-then-re-create, or a swap that renames a
+			// different table into the vacated name. A RE-DELIVERED drop/re-create batch —
+			// every schema step dominated, no local schema changed, the local table already
+			// the post-re-create incarnation — keeps `historyName === key` and resolves
+			// normally against that incarnation's own metadata, and so does a name renamed
+			// AWAY and BACK in one batch: the same table returns to its own bookkeeping.
+			// (The broader question of a re-created table INHERITING that bookkeeping —
+			// purge policy, relays, retention horizon — is tracked separately; this only
+			// stops the in-batch recreate consulting it.)
 			//
 			// NOTE: `!inBasis` still resolves read-free for a table that arrives under a
 			// name the receiver does NOT currently have, including by rename. That name may
@@ -361,7 +376,7 @@ export async function applyChanges(
 			// no resolvable pk keying — and the same for `create_table`; if the stranded
 			// bookkeeping is ever purged or re-keyed on drop/rename
 			// (`bug-sync-recreated-table-inherits-dropped-table-metadata`), narrow this.
-			const freshLocalTable = !inBasis || fate?.recreated === true;
+			const freshLocalTable = !inBasis || (fate !== undefined && fate.historyName !== key);
 
 			const resolved = await resolveChange(ctx, change, freshLocalTable);
 			if (freshLocalTable) resolved.freshLocalTable = true;

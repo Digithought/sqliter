@@ -1,12 +1,14 @@
+---
 description: The documentation size check is failing on the main branch again — two design documents have grown past the maximum length recorded for them — and because that check runs first, it blocks the project's standard verification command before anything else runs.
 files:
-  - docs/sync.md                # 13,544 words vs. its recorded 12,538
+  - docs/sync.md                # 13,645 words vs. its recorded 12,538 (re-measured 2026-08-03)
   - docs/schema.md              # 13,000 words vs. its recorded 12,109
+  - docs/lens.md                # 18,310 vs. 17,934 — inside the grace band today, 124 words from failing too
   - docs/.doc-budget.json       # where the per-document limits live
   - docs/doc-conventions.md     # "The size ratchet" explains the rule
   - scripts/check-docs.mjs      # the checker (`yarn docs:check`)
 difficulty: medium
-----
+---
 
 ## What is failing
 

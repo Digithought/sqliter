@@ -607,6 +607,34 @@ describe('alter table replication', () => {
 			expect(hasTable(receiver, 'orders'), 'still orders').to.equal(true);
 			expect(hasTable(receiver, 'orders2')).to.equal(false);
 		});
+
+		it('an undecidable rename still admits the same batch\'s rows for the OLD name', async () => {
+			// The other half of the case above: an undecidable `rename_table` mentions no old
+			// name, so the simulation records no fate for it at all and the row-admission gate
+			// falls back to the basis. `orders` is still there, so its rows must land — only
+			// the rows for the name the rename failed to bring into being are diverted.
+			await localWrite(origin, "insert into orders (id, note) values (4, 'before')");
+			await localWrite(origin, 'alter table orders rename to orders2');
+			await localWrite(origin, "insert into orders2 (id, note) values (5, 'after')");
+
+			const sets = await origin.manager.getChangesSince(receiver.manager.getSiteId());
+			const stripped = sets.map(cs => ({
+				...cs,
+				schemaMigrations: cs.schemaMigrations.map(m =>
+					m.type === 'rename_table' ? (({ fromTable: _ft, ...rest }) => rest)(m) : m),
+			}));
+
+			const result = await receiver.manager.applyChanges(stripped);
+			await settle();
+
+			expect(result.applied, 'the rename migration plus the pre-rename row\'s columns')
+				.to.equal(1 + COLUMNS_PER_FRESH_INSERT);
+			expect(result.unknownTable, 'only the post-rename row is diverted')
+				.to.equal(COLUMNS_PER_FRESH_INSERT);
+			expect(await collect(receiver.db, 'select id, note from orders order by id'))
+				.to.deep.equal([{ id: 4, note: 'before' }]);
+			expect(hasTable(receiver, 'orders2')).to.equal(false);
+		});
 	});
 
 	describe('declarative apply schema', () => {

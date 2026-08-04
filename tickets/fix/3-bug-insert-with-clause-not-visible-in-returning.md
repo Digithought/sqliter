@@ -1,10 +1,12 @@
 ---
 description: An INSERT statement that declares a named temporary result set up front can use it in the rows being inserted, but not in the clause that reports back what was inserted — that fails with "table not found".
+prereq: bug-dml-cte-body-cannot-see-sibling-cte
 files:
   - packages/quereus/src/planner/building/insert.ts        # buildWithContext at ~535 (CTE-target path only); buildWithClause at ~672 feeds only the source
   - packages/quereus/src/planner/building/update.ts        # ~71 — threads CTEs into the whole statement context
   - packages/quereus/src/planner/building/delete.ts        # ~71 — same
 difficulty: medium
+repro: static
 ---
 
 # A leading `with` clause is invisible to `insert ... returning`

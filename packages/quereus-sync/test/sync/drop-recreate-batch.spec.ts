@@ -10,19 +10,20 @@
  * empty, ready for exactly those rows. With the default `quarantine` disposition the
  * rows were held and only surfaced on the next maintenance sweep (a convergence delay);
  * with `ignore` they were lost permanently. `change-applicator.ts` now derives one
- * per-table verdict from the schema steps' HLCs (`computeBatchTableFates`) and reads it
- * at all three sites: the row-admission gate, `freshLocalTable`, and the reactive drain.
- *
- * The `freshLocalTable` half of that verdict is deliberately narrow: read-free resolution
- * skips the LWW comparison, so it is reserved for the batch whose `drop_table` this
- * receiver actually applies. A re-delivered batch changes no local schema and must resolve
- * normally.
+ * per-table verdict (`computeBatchTableFates`) and reads it at all three sites: the
+ * row-admission gate, `freshLocalTable`, and the reactive drain.
  *
  * The verdict is a SIMULATION of what the receiver will do, not a reading of the batch's
  * schema steps in isolation: it seeds each mentioned name with whether the receiver has it
  * now and replays only the migrations Phase 1a KEPT. The second top-level describe below
  * pins the seeding half — a `create_table` the receiver already processed and has since
  * undone locally must not resurrect the table in the prediction.
+ *
+ * The `freshLocalTable` half of the verdict tracks table IDENTITY, not the name: read-free
+ * resolution skips the LWW comparison, so it is reserved for a name whose stranded
+ * bookkeeping belongs to some other table. A re-delivered batch changes no local schema,
+ * and a name renamed away and back gets its own table returned to it; both resolve
+ * normally.
  *
  * Every spec here runs on real `Database` peers (`_peer-harness.ts`), so it asserts what
  * `select` returns, not what the metadata believes.
@@ -329,9 +330,7 @@ describe('drop + re-create in one batch', () => {
 		// table CREATED under that name in the same batch is a fresh incarnation exactly
 		// as after a `drop_table`. The metadata stranded under the name belongs to the
 		// table that was renamed AWAY, so consulting it would let its tombstone discard
-		// the new incarnation's row. Note the deciding step is the `create_table` — a
-		// table that arrives under a name by being renamed INTO it brings its rows along
-		// and is NOT fresh. (`computeBatchTableFates` in `change-applicator.ts`.)
+		// the new incarnation's row. (`computeBatchTableFates` in `change-applicator.ts`.)
 		const origin = await makePeer('origin');
 		const receiver = await makePeer('receiver');
 		try {
@@ -364,9 +363,46 @@ describe('drop + re-create in one batch', () => {
 		}
 	});
 
-	// The CONTRAST to the spec above, and the other half of the `recreated` rule: a table
-	// that arrives under a name by being renamed INTO it is NOT a fresh incarnation — it
-	// brings its rows along — so its changes must resolve against the receiver's stored
+	it('a table swapped INTO a vacated name is fresh: the vacated name\'s tombstone does not block it', async () => {
+		// The table-swap migration shape — build the replacement under a scratch name, drop
+		// the old table, rename the replacement into its place — all in one batch. What ends
+		// up at `widgets` is the freshly created `staging`, so the metadata stranded at
+		// `widgets` describes a table that no longer exists and must not be consulted.
+		// Contrast the spec below, where the name is vacated by a rename AWAY and the SAME
+		// table comes back to it: there the stranded metadata is that table's own.
+		const origin = await makePeer('origin');
+		const receiver = await makePeer('receiver');
+		try {
+			await localWrite(origin, WIDGETS_DDL);
+			await localWrite(origin, "insert into widgets (id, w) values (2, 'other')");
+			await relayAll(origin, receiver);
+
+			await localWrite(receiver, "insert into widgets (id, w) values (1, 'local')");
+			await localWrite(receiver, 'delete from widgets where id = 1');
+			expect(await receiver.manager.tombstones.getTombstone('main', 'widgets', [1]), 'stale tombstone seeded')
+				.to.not.be.undefined;
+
+			await localWrite(origin, WIDGETS_DDL.replace('widgets', 'staging'));
+			await localWrite(origin, 'drop table widgets');
+			await localWrite(origin, 'alter table staging rename to widgets');
+			await localWrite(origin, "insert into widgets (id, w) values (1, 'swapped')");
+
+			const result = await receiver.manager.applyChanges(
+				await origin.manager.getChangesSince(receiver.manager.getSiteId()),
+			);
+
+			expect(result.unknownTable, 'the row is routed to the swapped-in table').to.be.undefined;
+			expect(await collect(receiver.db, 'select id, w from widgets where id = 1'))
+				.to.deep.equal([{ id: 1, w: 'swapped' }]);
+		} finally {
+			await closePeer(origin);
+			await closePeer(receiver);
+		}
+	});
+
+	// The CONTRAST to the spec above: the name is vacated by a rename AWAY, and the table
+	// that comes back to it is the SAME one, still described by the bookkeeping filed
+	// there — so its changes must resolve against the receiver's stored
 	// metadata like any other. Judging `widgets` fresh here let the origin's update
 	// resolve READ-FREE, straight past the receiver's own tombstone for the row, and a
 	// row the receiver had deleted came back under the default `allowResurrection: false`.

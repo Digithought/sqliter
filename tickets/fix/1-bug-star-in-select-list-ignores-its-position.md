@@ -1,9 +1,12 @@
+---
 description: When a query asks for a star (`*`) alongside named columns, the star's columns always come out first instead of where the star was written, so the result columns are in the wrong order.
 files:
   - packages/quereus/src/planner/building/select.ts                 # star projections collected before the named ones
   - packages/quereus/src/planner/building/select-projections.ts     # buildStarProjections
   - docs/sql-select.md                                              # select-list ordering is undocumented
 difficulty: medium
+repro: verified
+---
 
 # `*` in a select list does not stay where it was written
 

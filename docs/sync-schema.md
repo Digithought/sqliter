@@ -263,12 +263,15 @@ set). Two things make the data path survive the rename:
   all resolve by the same replay. A `rename_table` that leaves the new name PRESENT also
   triggers the reactive held-change drain for that name, the same as a `create_table`; a
   declined one does not, because nothing reappeared.
-- **Renamed-in tables keep their history.** The companion `recreated` verdict — "this is a
-  brand-new EMPTY local table, so its rows may resolve read-free, without consulting local
-  cell versions and tombstones" — is set only by a `create_table` that moves a name from
-  absent to present. A table that arrives under a name by RENAME brings its rows with it
-  and is not a new incarnation, so rename-away-and-back in one batch resolves normally and
-  a stored tombstone still blocks a re-delivered row.
+- **A table keeps whatever history is really its own.** The companion read-free verdict —
+  "the bookkeeping stranded under this name describes some OTHER table, so these rows must
+  resolve without consulting local cell versions and tombstones" — follows table identity,
+  not the name. The simulation records, per name, which table's bookkeeping is filed there
+  (`historyName`); a rename moves the table but not its records. So a name vacated by a
+  `drop_table` and refilled — by a `create_table`, or by renaming a DIFFERENT table into
+  it, the ordinary table-swap migration — resolves read-free, while a name vacated by a
+  rename AWAY and then renamed BACK gets its own table returned to it and resolves
+  normally: a stored tombstone still blocks a re-delivered row.
 - **Same-transaction writes.** The engine relabels a transaction's already-batched data
   events to the new name before commit (`renameBatchedEvents`), so a rename in the same
   transaction as writes files every fact under the new name.

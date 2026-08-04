@@ -1,11 +1,12 @@
+---
 description: A query that groups rows and asks only for a count (or other summary value) also hands back the column it grouped on, so callers get one more column than they asked for.
 files:
   - packages/quereus/src/planner/building/select-aggregates.ts   # buildAggregatePhase → needsFinalProjection
   - packages/quereus/src/planner/building/select.ts              # branch that decides whether a final projection is built
   - packages/quereus/test/logic/07.3.1-group-by-order-by-key.sqllogic  # sibling coverage for the no-aggregate case
 difficulty: medium
-
-----
+repro: verified
+---
 
 # Grouped query whose select list is only aggregates leaks the grouping column
 
