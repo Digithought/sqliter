@@ -123,4 +123,62 @@ describe('DML side-expression exposure to the optimizer', () => {
 		const node = findNode(db.getPlan(UPSERT_SQL), isConstraintCheck);
 		expect(node.withChildren(node.getChildren())).to.equal(node);
 	});
+
+	// The identity round-trip above only exercises the short-circuit. These substitute a
+	// distinct node into one slot and check that EVERY slot lands where getChildren() laid
+	// it out — the failure mode a slice-math bug produces (one clause's rewritten
+	// expression cross-wired into another's, or the context tail swallowed by the
+	// preceding slice) is invisible to an identity round-trip.
+
+	it('DmlExecutorNode.withChildren slices rewritten expressions back into their own slots', () => {
+		const node = findNode(db.getPlan(UPSERT_SQL), isDmlExecutor);
+		const children = node.getChildren();
+		expect(children.length, 'source + 2 clauses x (assignment + WHERE) + 1 context value').to.equal(6);
+
+		// Substitute clause 2's WHERE node into clause 1's assignment slot: distinct from
+		// what belongs there, so a cross-wire or off-by-one shows up as a slot mismatch.
+		const substituted = [...children];
+		substituted[1] = children[4];
+
+		const rebuilt = node.withChildren(substituted) as DmlExecutorNode;
+		expect(rebuilt, 'a changed child must produce a new instance').to.not.equal(node);
+		expect(rebuilt.getChildren()).to.deep.equal(substituted);
+
+		const [clause1, clause2] = rebuilt.upsertClauses!;
+		expect([...clause1.assignments!.values()]).to.deep.equal([children[4]]);
+		expect(clause1.whereCondition).to.equal(children[2]);
+		expect([...clause2.assignments!.values()]).to.deep.equal([children[3]]);
+		expect(clause2.whereCondition).to.equal(children[4]);
+		expect([...rebuilt.mutationContextValues!.values()]).to.deep.equal([children[5]]);
+
+		// Assignment keys are column indices — rebuilding the map must not renumber them.
+		expect([...clause1.assignments!.keys()]).to.deep.equal([...node.upsertClauses![0].assignments!.keys()]);
+	});
+
+	it('ConstraintCheckNode.withChildren slices rewritten expressions back into their own slots', () => {
+		const node = findNode(db.getPlan(UPSERT_SQL), isConstraintCheck);
+		const children = node.getChildren();
+		expect(children.length, 'source + 1 constraint + 1 NOT NULL default + 1 context value').to.equal(4);
+
+		// Substitute the constraint expression into the context-value slot.
+		const substituted = [...children];
+		substituted[3] = children[1];
+
+		const rebuilt = node.withChildren(substituted) as ConstraintCheckNode;
+		expect(rebuilt, 'a changed child must produce a new instance').to.not.equal(node);
+		expect(rebuilt.getChildren()).to.deep.equal(substituted);
+		expect(rebuilt.constraintChecks[0].expression, 'constraint slot untouched').to.equal(children[1]);
+		expect(rebuilt.notNullDefaults![0].defaultNode, 'default slot untouched').to.equal(children[2]);
+		expect([...rebuilt.mutationContextValues!.keys()], 'context keys preserved')
+			.to.deep.equal([...node.mutationContextValues!.keys()]);
+		expect([...rebuilt.mutationContextValues!.values()]).to.deep.equal([children[1]]);
+	});
+
+	it('withChildren rejects a child count that does not match getChildren()', () => {
+		const plan = db.getPlan(UPSERT_SQL);
+		const dml = findNode(plan, isDmlExecutor);
+		const check = findNode(plan, isConstraintCheck);
+		expect(() => dml.withChildren(dml.getChildren().slice(0, 1))).to.throw(/expects 6 children/);
+		expect(() => check.withChildren(check.getChildren().slice(0, 1))).to.throw(/expects 4 children/);
+	});
 });

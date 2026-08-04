@@ -1105,6 +1105,19 @@ export function isScalarNode(node: PlanNode): node is ScalarPlanNode {
 	return node.getType().typeClass === 'scalar';
 }
 
+/**
+ * Narrow a slice of rewritten `withChildren` input to scalars, failing loudly instead of
+ * casting. `label` names the node and slot, e.g. `'ConstraintCheckNode constraint'`.
+ */
+export function asScalarNodes(nodes: readonly PlanNode[], label: string): ScalarPlanNode[] {
+	return nodes.map((node, i) => {
+		if (!isScalarNode(node)) {
+			throw new Error(`${label} child ${i + 1} must be a ScalarPlanNode, got ${node.nodeType}`);
+		}
+		return node;
+	});
+}
+
 // --- Arity-based Base Abstractions (Interfaces, to be implemented by concrete node classes) ---
 
 /** A relational plan node that has no relational inputs (a leaf in the relational algebra tree).

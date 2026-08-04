@@ -1,5 +1,5 @@
 import type { Scope } from '../scopes/scope.js';
-import { PlanNode, type RelationalPlanNode, type Attribute, type PhysicalProperties, type ScalarPlanNode, type RowDescriptor, isRelationalNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type Attribute, type PhysicalProperties, type ScalarPlanNode, type RowDescriptor, isRelationalNode, asScalarNodes } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
@@ -112,14 +112,15 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
   withChildren(newChildren: readonly PlanNode[]): PlanNode {
     const upsertExprs = this.upsertExpressions();
     const ctxKeys = [...(this.mutationContextValues?.keys() ?? [])];
+    const ctxExprs = [...(this.mutationContextValues?.values() ?? [])];
     const expected = 1 + upsertExprs.length + ctxKeys.length;
     if (newChildren.length !== expected) {
       throw new Error(`UpdateExecutorNode expects ${expected} children, got ${newChildren.length}`);
     }
 
     const [newSource] = newChildren;
-    const newUpsertExprs = newChildren.slice(1, 1 + upsertExprs.length) as ScalarPlanNode[];
-    const newCtxExprs = newChildren.slice(1 + upsertExprs.length) as ScalarPlanNode[];
+    const newUpsertExprs = asScalarNodes(newChildren.slice(1, 1 + upsertExprs.length), 'DmlExecutorNode upsert');
+    const newCtxExprs = asScalarNodes(newChildren.slice(1 + upsertExprs.length), 'DmlExecutorNode context');
 
     // Type check
     if (!isRelationalNode(newSource)) {
@@ -128,7 +129,7 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
 
     // Return same instance if nothing changed
     const upsertUnchanged = newUpsertExprs.every((e, i) => e === upsertExprs[i]);
-    const ctxUnchanged = newCtxExprs.every((e, i) => e === this.mutationContextValues!.get(ctxKeys[i]));
+    const ctxUnchanged = newCtxExprs.every((e, i) => e === ctxExprs[i]);
     if (newSource === this.source && upsertUnchanged && ctxUnchanged) {
       return this;
     }

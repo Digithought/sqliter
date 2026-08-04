@@ -122,12 +122,14 @@ be built before the node it references; it explicitly invalidates the caches it 
 
 Every user expression a plan node holds and later emits must be reachable through
 `getChildren()`, and `withChildren` must slice the rewritten children back into the same
-slots they came from. The optimizer only ever rewrites what `getChildren()` exposes — a
-subtree a node holds out-of-band works for a simple expression (nothing to rewrite) but
-silently reaches the runtime unrewritten the moment it is a subquery, surfacing as a
-missing-emitter or unphysicalized-node error far from the actual defect. See
-`bug-dml-side-expressions-invisible-to-optimizer`, where `DmlExecutorNode`'s ON CONFLICT
-assignments/WHERE and both nodes' WITH CONTEXT values were held this way.
+slots. The optimizer rewrites only what `getChildren()` exposes: an out-of-band subtree
+works for a simple expression (nothing to rewrite) but reaches the runtime unrewritten
+once it is a subquery, surfacing as a missing-emitter or unphysicalized-node error far
+from the defect.
+
+Exempt: `InsertNode` / `UpdateNode` / `DeleteNode` carry a `mutationContextValues` map
+nothing reads from them (only the two nodes above consume it), so their copy is inert and
+goes stale after a rebuild. Expose it the moment anything reads it there.
 
 ### OPT-010 — Visited rules are inherited across a re-mint; declines are not
 
