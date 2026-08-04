@@ -1,0 +1,178 @@
+-- 13.7-cte-sibling-visibility.sqllogic - every CTE sees the CTEs defined before it
+--
+-- A WITH clause may define several CTEs, and a later member may name an earlier one.
+-- That held only while the later member's body was a SELECT: `buildCommonTableExpr`
+-- handed the earlier members to `buildSelectStmt` as an explicit parent-CTE argument,
+-- but the VALUES / INSERT / UPDATE / DELETE branches got nothing, and the DML builders
+-- read their inherited definitions off the planning context. A reference inside a
+-- writing body therefore fell through to ordinary schema lookup and failed with
+-- `Table 'a' not found in schema path: main`.
+--
+-- The same line fixed a second arm: the explicit argument carried THIS clause's earlier
+-- members only, and `buildWithContext` prefers a non-empty explicit argument over the
+-- context wholesale, so a nested WITH clause's second and later members lost the
+-- ENCLOSING statement's CTEs. Both arms are covered below.
+
+-- ===== INSERT body reads a sibling =====
+
+create table p1 (id integer primary key, v text);
+insert into p1 values (1, 'a'), (2, 'b');
+create table q1 (id integer primary key, w integer);
+-- run
+
+with a as (select id from p1),
+     b as (insert into q1 select id + 10, 1 from a returning id)
+select count(*) as n from b;
+→ [{"n":2}]
+
+select id, w from q1 order by id;
+→ [{"id":11,"w":1},{"id":12,"w":1}]
+
+-- ===== UPDATE body reads a sibling =====
+-- The sibling is read from a scalar subquery in SET, which resolves through the
+-- CTE-aware context `buildUpdateStmt` builds from the inherited definitions.
+
+create table q2 (id integer primary key, w integer);
+insert into q2 values (1, 0), (2, 0);
+-- run
+
+with a as (select id from p1),
+     b as (update q2 set w = (select count(*) from a) where id = 1 returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, w from q2 order by id;
+→ [{"id":1,"w":2},{"id":2,"w":0}]
+
+-- ===== DELETE body reads a sibling =====
+
+create table q3 (id integer primary key, w integer);
+insert into q3 values (1, 0), (2, 0), (3, 0);
+-- run
+
+with a as (select id from p1),
+     b as (delete from q3 where id in (select id from a) returning id)
+select count(*) as n from b;
+→ [{"n":2}]
+
+select id, w from q3 order by id;
+→ [{"id":3,"w":0}]
+
+-- ===== A writing body's OWN WITH clause still shadows an enclosing sibling =====
+-- The body's own clause is merged ON TOP of the inherited map, not beside it, so a
+-- same-named local definition wins.
+
+create table q4 (id integer primary key, w integer);
+-- run
+
+with a as (select id from p1),
+     b as (with a as (select 77 as id) insert into q4 select id, 5 from a returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+-- 77, not 1 and 2 — the inner `a` shadowed the sibling.
+select id, w from q4 order by id;
+→ [{"id":77,"w":5}]
+
+-- ===== A writing body's own WITH clause can itself read an enclosing sibling =====
+
+create table q5 (id integer primary key, w integer);
+-- run
+
+with a as (select id from p1),
+     b as (with c as (select id from a) insert into q5 select id + 10, 1 from c returning id)
+select count(*) as n from b;
+→ [{"n":2}]
+
+select id, w from q5 order by id;
+→ [{"id":11,"w":1},{"id":12,"w":1}]
+
+-- ===== VALUES body sibling visibility is unaffected =====
+-- A VALUES body cannot name a relation at all; pinned only so the context threading
+-- did not change what a VALUES-bodied member produces.
+
+with a as (select id from p1), b as (values (1), (2), (3))
+select (select count(*) from a) as na, (select count(*) from b) as nb;
+→ [{"na":2,"nb":3}]
+
+-- ===== Nested WITH clause: the SECOND member sees the ENCLOSING statement's CTE =====
+-- Before the fix this failed with `Table 'o' not found` — the first member alone would
+-- have seen `o`, because the explicit argument was empty for it and the context was
+-- then consulted.
+
+with o as (select id from p1)
+select n from (with z as (select 1 as k),
+                    a as (select count(*) as n from o)
+               select n from a) x;
+→ [{"n":2}]
+
+-- ===== Nested WITH clause: a sibling shadows a same-named enclosing CTE =====
+
+with o as (select 99 as id)
+select n from (with o as (select 7 as id),
+                    a as (select id as n from o)
+               select n from a) x;
+→ [{"n":7}]
+
+-- ===== Recursive CTEs unaffected =====
+-- The recursive path gets the same merged map; a non-recursive sibling stays visible to
+-- the base case and the recursion still terminates.
+
+with recursive base as (select 1 as k),
+     r as (select k from base union all select k + 1 from r where k < 3)
+select k from r order by k;
+→ [{"k":1},{"k":2},{"k":3}]
+
+-- ===== Reading a WRITING sibling yields its RETURNING rows, written ONCE =====
+-- `b` reading `a` is what drives `a`'s write. A data-modifying CTE is always
+-- materialized (docs/runtime-caching.md § Shared CTE materialization), so `b` consumes
+-- `a`'s buffered RETURNING rows however many times it names `a`, and `a` writes once.
+
+create table q6 (id integer primary key, w integer);
+-- run
+
+with a as (insert into q6 values (300, 1) returning id),
+     b as (insert into q6 select id + 1, 2 from a returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+-- Both rows present exactly once — a second drive of `a` would have tripped the
+-- primary key, and a second drive of `b` would have too.
+select id, w from q6 order by id;
+→ [{"id":300,"w":1},{"id":301,"w":2}]
+
+-- ===== A writing sibling named TWICE still writes once =====
+
+create table q7 (id integer primary key, w integer);
+create table q8 (id integer primary key, w integer);
+-- run
+
+with a as (insert into q7 values (400, 1) returning id),
+     b as (insert into q8 select id, (select count(*) from a) from a returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, w from q7 order by id;
+→ [{"id":400,"w":1}]
+select id, w from q8 order by id;
+→ [{"id":400,"w":1}]
+
+-- ===== Control: a read-only sibling chain is unchanged =====
+
+with a as (select id from p1),
+     b as (select id + 100 as id from a),
+     c as (select id + 1000 as id from b)
+select id from c order by id;
+→ [{"id":1101},{"id":1102}]
+
+-- Cleanup
+drop table p1;
+drop table q1;
+drop table q2;
+drop table q3;
+drop table q4;
+drop table q5;
+drop table q6;
+drop table q7;
+drop table q8;
+-- run

@@ -765,6 +765,34 @@ select ... from cte_name ...
 - `column_name_list`: Optional explicit column names for the CTE  
 - `materialized` / `not materialized`: Hints for optimization - by default, results are cached if accessed more than once
 
+**Visibility between CTEs:**
+
+- Every CTE in a `WITH` clause can name the CTEs defined **before** it, whatever its own
+  body is — `SELECT`, `VALUES`, or a data-modifying `INSERT` / `UPDATE` / `DELETE … RETURNING`.
+  Only a `RECURSIVE` CTE may name itself; no CTE may name a later sibling.
+- A CTE body may carry its own `WITH` clause. Its members can name the enclosing clause's
+  earlier CTEs, and a name defined there **shadows** a same-named enclosing one for that
+  body only.
+- Reading a data-modifying CTE yields that CTE's `RETURNING` rows, and its write happens
+  **once** per statement execution no matter how many times it is named — the reference is
+  what drives the write, and the rows are then replayed from one buffer. See
+  `docs/runtime-caching.md` § Shared CTE materialization.
+- A CTE that instead reads the **base table** another CTE writes is a different case: it
+  is not defined whether it observes that write. Do not rely on either answer; see the
+  gap list in `docs/runtime-caching.md`.
+
+```sql
+-- A writing CTE reading an earlier reading CTE
+with a as (select id from staging),
+     b as (insert into target select id, 1 from a returning id)
+select count(*) as loaded from b;
+
+-- A writing CTE reading an earlier WRITING CTE: `a` inserts once, `b` reads its RETURNING rows
+with a as (insert into q values (300, 1) returning id),
+     b as (insert into q select id + 1, 2 from a returning id)
+select count(*) as n from b;
+```
+
 #### 3.7.1 Basic (Non-Recursive) CTEs
 
 Basic CTEs create temporary named views that exist only for the duration of the query:

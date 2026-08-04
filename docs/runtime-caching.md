@@ -171,11 +171,23 @@ Three known gaps in this area, all still open:
   execution memo for impure subqueries already collapsed it) and the intended
   semantics are undecided — PostgreSQL rejects a data-modifying CTE anywhere but
   the top level of a statement rather than defining this case.
-- A data-modifying CTE body cannot see its **sibling** CTEs
-  (`with a as (select …), b as (insert … select from a …) …` fails with
-  `Table 'a' not found`): `buildCommonTableExpr` passes the CTE lookup map to
-  `buildSelectStmt` but not to the `INSERT` / `UPDATE` / `DELETE` builders. Tracked
-  in backlog `bug-dml-cte-body-cannot-see-sibling-cte`.
+- A CTE that reads a **base table** another CTE writes sees a result that depends on
+  where the outer query mentions each one. The two statements below differ only in
+  projection order, and `n` is 0 in the first, 1 in the second:
+
+  ```sql
+  with a as (insert into q values (1,1) returning id), b as (select count(*) as n from q)
+    select (select n from b) as n, (select count(*) from a) as m;   -- n = 0
+  with a as (insert into q values (1,1) returning id), b as (select count(*) as n from q)
+    select (select count(*) from a) as m, (select n from b) as n;   -- n = 1
+  ```
+
+  No CTE names another here, so buffering does not enter into it: `b` simply reads the
+  base table before or after `a`'s write has been driven. The intended semantics are
+  undecided — PostgreSQL gives every sub-statement of a statement one snapshot, so the
+  answer there is always "does not see it", whereas Quereus's isolation layer is
+  read-your-own-writes. A CTE that names a writing CTE *directly* is not affected: that
+  reference drives the write and then consumes its one buffer of `RETURNING` rows.
 
 **Recursive CTEs** run through the working-table machinery (`emitRecursiveCTE`),
 not `emitCTE`, but follow the same buffer-once-replay pattern when referenced

@@ -81,9 +81,19 @@ export function buildCommonTableExpr(
 	existingCTEs: Map<string, CTEScopeNode>,
 	options?: AST.WithClauseOptions
 ): CTEPlanNode {
+	// Definitions visible to THIS member: the enclosing statement's (ctx.cteNodes) with
+	// the earlier members of this clause layered on top (a same-named sibling shadows an
+	// outer one). Threaded onto the context so a member body that does NOT take an
+	// explicit parent-CTE argument — every DML body — still resolves them.
+	// Copied rather than aliased: `buildWithClause` keeps adding to `existingCTEs` after
+	// this member is built, and a member must not retain a map that grows behind it.
+	const visibleCTEs: Map<string, CTEScopeNode> = ctx.cteNodes && ctx.cteNodes.size > 0
+		? new Map([...ctx.cteNodes, ...existingCTEs])
+		: new Map(existingCTEs);
+
 	// Create a context that includes previously defined CTEs in scope
 	// This allows later CTEs to reference earlier ones
-	const cteContext = { ...ctx };
+	const cteContext = { ...ctx, cteNodes: visibleCTEs };
 
 	// Add existing CTEs to the scope for forward references
 	const cteScope = new RegisteredScope(ctx.scope);
@@ -104,7 +114,7 @@ export function buildCommonTableExpr(
 	// or DML bodies cannot be recursive and fall through to the normal path
 	// (which will report the right error for non-SELECT recursive bodies).
 	if (isRecursiveCte(isRecursive, cte)) {
-		return buildRecursiveCTE(cteContext, cte, existingCTEs, options);
+		return buildRecursiveCTE(cteContext, cte, visibleCTEs, options);
 	}
 
 	// For non-recursive CTEs or recursive CTEs without UNION structure.
@@ -114,7 +124,7 @@ export function buildCommonTableExpr(
 	let query: RelationalPlanNode;
 	switch (cte.query.type) {
 		case 'select':
-			query = buildSelectStmt(cteContext, cte.query, existingCTEs) as RelationalPlanNode;
+			query = buildSelectStmt(cteContext, cte.query, visibleCTEs) as RelationalPlanNode;
 			break;
 		case 'values':
 			query = buildValuesStmt(cteContext, cte.query);
