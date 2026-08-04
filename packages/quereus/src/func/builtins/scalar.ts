@@ -468,11 +468,14 @@ export const clampFunc = createScalarFunction(
  *
  * The fold ranks coerced KEYS but tracks the winning INDEX and returns the raw
  * argument there, so `greatest(t, 1)` over the stored text `'3'` hands back `'3'`
- * rather than the integer the conversion produced. NULL arguments are skipped
- * entirely — neither function's running best is ever a NULL key — matching
+ * rather than the integer the conversion produced. Arguments whose KEY is null
+ * are skipped entirely — the running best is never a NULL key — matching
  * `min`/`max` and the window MIN/MAX, so `greatest`/`least` agree with each
  * other and the answer never depends on where a NULL sits in the argument
- * list. All-NULL (or zero) arguments yield NULL. Ties under a non-BINARY
+ * list. That is the argument itself for an uncoerced group; in a coerced one it
+ * also covers an argument the conversion nulls (`cast('' as integer)`), which
+ * `greatest` already skipped before this fold was made symmetric. A call with
+ * no surviving key (all-NULL, or no arguments) yields NULL. Ties under a non-BINARY
  * comparator leave which argument survives unspecified (same latitude as the
  * min/max aggregate, DISTINCT, and GROUP BY) — but it is always one of the
  * arguments.
