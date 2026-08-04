@@ -519,6 +519,12 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
     );
     return 'execute';
   }
+  // NOTE: the decision reads the migration's `(schema, table)` envelope, never
+  // `stmt.table` — the origin filed the envelope from the same event that carried
+  // this text, so the two agree for anything the pipeline produces. A hand-crafted
+  // migration whose DDL names a different table would be decided against the wrong
+  // local table; if migrations ever arrive from outside the capture path, compare
+  // the two here first.
   const action = stmt.action;
 
   // RENAME TO and the tag/maintained arms have no idempotency arm — execute as
@@ -571,6 +577,11 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
         return equivalentUniqueExists(local, constraint.columns.map(c => c.name)) ? 'already-applied' : 'execute';
       }
       // Unnamed CHECK (or other forms): no identity to compare against — execute.
+      // NOTE: two peers that concurrently add the SAME unnamed CHECK therefore end
+      // up enforcing it twice (the engine auto-names each install separately), which
+      // is semantically harmless — same predicate, evaluated twice. If the duplicate
+      // ever matters (per-row cost, or a confusing `table_info`), the identity to
+      // compare on is the rendered predicate expression, not the constraint name.
       return 'execute';
     }
     case 'dropConstraint':
@@ -599,6 +610,11 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
         return inferType(action.setDataType).name === col.logicalType.name ? 'already-applied' : 'execute';
       }
       if (action.setNotNull !== undefined) {
+        // A `set not null` executes against the rows this peer currently holds, and
+        // schema changes are applied ahead of the same batch's data facts — so the
+        // very batch that fills the NULLs fails its own DDL and only succeeds on the
+        // next sync round. Whole class (tightening DDL vs. the data that satisfies
+        // it); tracked as `bug-sync-tightening-ddl-applied-before-its-data`.
         return col.notNull === action.setNotNull ? 'already-applied' : 'execute';
       }
       if (action.setDefault !== undefined) {
@@ -635,9 +651,14 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
   }
 }
 
+/** Position of the local column named `name`, or undefined. */
+function localColumnIndex(table: TableSchema, name: string): number | undefined {
+  return table.columnIndexMap.get(name.toLowerCase());
+}
+
 /** The local column named `name`, or undefined. */
 function localColumn(table: TableSchema, name: string): ColumnSchema | undefined {
-  const idx = table.columnIndexMap.get(name.toLowerCase());
+  const idx = localColumnIndex(table, name);
   return idx === undefined ? undefined : table.columns[idx];
 }
 
@@ -680,17 +701,29 @@ function decideAddColumn(
  * set (order-insensitive — `unique (a, b)` and `unique (b, a)` enforce the same
  * predicate). A column name the local table lacks ⇒ false, and the exec surfaces
  * the engine's own error.
+ *
+ * PARTIAL constraints do not count. A table-level `unique (a)` is unconditional,
+ * while a `predicate`-carrying constraint (only ever synthesized from a
+ * `create unique index … where …`) enforces over a subset of the rows — treating
+ * it as equivalent would converge the peer onto WEAKER enforcement than the
+ * alteration asked for, and duplicate-but-outside-the-predicate rows would then
+ * replicate here and be rejected on the origin.
  */
 function equivalentUniqueExists(table: TableSchema, columnNames: readonly string[]): boolean {
   const wanted: number[] = [];
   for (const name of columnNames) {
-    const idx = table.columnIndexMap.get(name.toLowerCase());
+    const idx = localColumnIndex(table, name);
     if (idx === undefined) return false;
     wanted.push(idx);
   }
-  const wantedKey = [...wanted].sort((a, b) => a - b).join(',');
+  const wantedKey = sortedIndexKey(wanted);
   return (table.uniqueConstraints ?? []).some(uc =>
-    [...uc.columns].sort((a, b) => a - b).join(',') === wantedKey);
+    uc.predicate === undefined && sortedIndexKey(uc.columns) === wantedKey);
+}
+
+/** Order-insensitive identity of a column-index set. */
+function sortedIndexKey(columns: readonly number[]): string {
+  return [...columns].sort((a, b) => a - b).join(',');
 }
 
 /**
@@ -820,9 +853,15 @@ async function mergeColumnUpdates(
         row[colIndex] = value;
         columnsApplied++;
       } else {
-        // Column name not found in schema - this could be a sync bug
+        // Now that DROP COLUMN and RENAME COLUMN replicate, the ordinary cause is a
+        // change-log fact recorded before the alteration reached this peer — the value
+        // is correctly discarded. A name that is neither dropped nor renamed still
+        // indicates a genuine source/destination mismatch, so this stays a warning.
+        // NOTE: one line per unknown column per change. If a wide table's drop ever
+        // makes this drown the log, aggregate per (table, column) instead of demoting.
         console.warn(
-          `[Sync] Column '${colName}' not found in ${tableSchema.schemaName}.${tableSchema.name}. ` +
+          `[Sync] Column '${colName}' not found in ${tableSchema.schemaName}.${tableSchema.name} — ` +
+          `discarding its value (expected if a replicated ALTER TABLE dropped or renamed it). ` +
           `Available columns: ${[...tableSchema.columnIndexMap.keys()].join(', ')}`
         );
       }

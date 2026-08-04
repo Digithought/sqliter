@@ -456,6 +456,24 @@ describe('schema replication idempotency', () => {
 				expect(schemaEvents).to.deep.equal([]);
 			});
 
+			it('add constraint: a PARTIAL unique over the same columns is not equivalent', async () => {
+				// A `create unique index … where …` synthesizes a UNIQUE constraint that
+				// carries the predicate. It enforces over a subset of the rows, so it must
+				// NOT converge an unconditional `add unique` — that would leave this peer
+				// under weaker enforcement than the alteration asked for.
+				await db.exec('alter table orders add column sku text null');
+				await db.exec('create unique index orders_sku_partial on orders (sku) where sku is not null');
+				schemaEvents = [];
+
+				const result = await apply(alter('alter table "orders" add unique (sku)'));
+
+				expect(result.errors).to.deep.equal([]);
+				expect(schemaEvents.map(e => [e.type, e.objectType, e.objectName, e.remote]))
+					.to.deep.equal([['alter', 'table', 'orders', true]]);
+				expect((db.schemaManager.getTable('main', 'orders')!.uniqueConstraints ?? [])
+					.some(uc => uc.predicate === undefined), 'unconditional UNIQUE installed').to.equal(true);
+			});
+
 			it('drop / rename constraint converge when the name is already gone', async () => {
 				const dropped = await apply(alter('alter table "orders" drop constraint ghost_uc'));
 				expect(dropped.errors).to.deep.equal([]);

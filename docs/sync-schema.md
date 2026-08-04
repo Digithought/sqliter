@@ -157,7 +157,7 @@ consistent with `drop_index`'s absent-owner arm.
 | `add column` | column present with the same **logical type** | absent → execute; different type → **conflict** naming the column and both types |
 | `drop column` | column absent | execute |
 | `rename column` | old absent, new present (neither: converge with a warning) | execute |
-| `add constraint` | a constraint of that name exists (named), or a UNIQUE over the same column set exists (unnamed) | execute |
+| `add constraint` | a constraint of that name exists (named), or an **unconditional** UNIQUE over the same column set exists (unnamed — a partial UNIQUE, i.e. one carrying a predicate, is weaker and does not count) | execute |
 | `drop constraint` | no constraint of that name | execute |
 | `rename constraint` | old absent, new present (neither: converge with a warning) | execute |
 | `alter column … set data type` | local logical type already equals the target | execute |
@@ -192,6 +192,14 @@ batch keeps aborting and retrying until an operator resolves it. Resolving it
 automatically would require last-writer-wins over schema *definitions* (apply the
 higher-HLC shape as a migration, rewriting the local table) — substantially more
 machinery.
+
+A different failure survives all of this: an alteration that **tightens** a rule
+(`set not null`, `add constraint unique`, a narrowing `set data type`, `alter primary
+key`) is legal only against rows the receiver may not hold yet, and schema changes are
+applied ahead of the same batch's data facts. The DDL therefore fails on the batch that
+carries the very rows satisfying it, and succeeds on the next sync round — self-healing,
+but one spurious error and one wasted round trip. Tracked as
+`bug-sync-tightening-ddl-applied-before-its-data`.
 
 ### What replicates
 
