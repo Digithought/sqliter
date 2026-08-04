@@ -110,6 +110,7 @@ select_expr:
 - `distinct`: Removes duplicate rows from the result set
 - `all`: Includes all rows (default behavior)
 - `select_expr`: Column expressions to be returned; `*` for all columns. A result column may carry a trailing `with inverse (...)` clause — a core-`select` extension supplying authored write-back expressions for updatable-view write-through (see [Result-column inverses](#result-column-inverses-with-inverse) below)
+- Output columns follow the written select-list order, with each `*` / `table.*` expanded in place — `select v, * from t` returns `v` followed by every column of `t` (including `v` again, disambiguated), not the star's columns first. This holds for grouped queries too (see [§3.3 GROUP BY Clause](#33-group-by-clause)).
 - `from`: Tables, views, or subqueries to retrieve data from
 - `where`: Filters rows based on a condition
 - `group by`: Groups rows that have the same values

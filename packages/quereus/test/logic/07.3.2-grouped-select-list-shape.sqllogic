@@ -81,6 +81,18 @@ select nk.a, count(*) c from nk group by a order by a;
 select *, count(*) c from nk group by a, b order by a;
 → [{"a":"x","b":"1","c":1},{"a":"y","b":"2","c":1}]
 
+-- Grouped/ungrouped agreement: a mixed select list (named columns plus a star,
+-- no aggregate) assembles star position the same way whether or not the query
+-- is grouped — the ungrouped path (buildFinalProjections) and the grouped path
+-- (buildFinalAggregateProjections) must agree. `group by a, b` collapses no
+-- rows here (a, b together are already unique), so the two queries return the
+-- same shape and values.
+select b, a, * from nk order by a;
+→ [{"b":"1","a":"x","a:1":"x","b:1":"1"},{"b":"2","a":"y","a:1":"y","b:1":"2"}]
+
+select b, a, * from nk group by a, b order by a;
+→ [{"b":"1","a":"x","a:1":"x","b:1":"1"},{"b":"2","a":"y","a:1":"y","b:1":"2"}]
+
 -- Two aggregates and no named key: still no key in the output.
 select count(*) c1, count(distinct b) c2 from nk group by a order by c1;
 → [{"c1":1,"c2":1},{"c1":1,"c2":1}]

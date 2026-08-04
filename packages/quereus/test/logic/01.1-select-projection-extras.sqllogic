@@ -17,6 +17,32 @@ select *, * from t1;
 select *, 'lit' as marker from t1;
 → [{"a":1,"b":"one","marker":"lit"}]
 
+-- =============================================================================
+-- Star position: a `*` in the select list is expanded in place, not hoisted to
+-- the front of the output. Regression for
+-- bug-star-in-select-list-ignores-its-position.
+-- =============================================================================
+
+-- A named column before the star: the star's own `a` collides with the named
+-- one and is disambiguated (`a:1`), the star's `b` is not.
+select a, * from t1;
+→ [{"a":1,"a:1":1,"b":"one"}]
+
+-- A named column aliased onto the star's own column name: order decides which
+-- occurrence keeps the bare name and which gets the `:1` suffix, so this is
+-- the case that actually distinguishes written order from star-first — the
+-- two occurrences carry different values (`b`'s value vs `a`'s value).
+select b as a, * from t1;
+→ [{"a":"one","a:1":1,"b":"one"}]
+
+-- A star between two named columns.
+select a, *, b from t1;
+→ [{"a":1,"a:1":1,"b":"one","b:1":"one"}]
+
+-- A star after a computed column.
+select upper(b) u, * from t1;
+→ [{"u":"ONE","a":1,"b":"one"}]
+
 -- Qualified column refs over a self-join (cross join)
 insert into t1 values (2, 'two');
 
@@ -25,6 +51,10 @@ select A.a as la, B.a as ra from t1 as A cross join t1 as B order by la, ra;
 
 select A.*, B.* from t1 as A cross join t1 as B order by A.a, B.a;
 → [{"a":1,"b":"one","a:1":1,"b:1":"one"},{"a":1,"b":"one","a:1":2,"b:1":"two"},{"a":2,"b":"two","a:1":1,"b:1":"one"},{"a":2,"b":"two","a:1":2,"b:1":"two"}]
+
+-- A qualified star after a named column, over the same self-join.
+select A.a as la, B.* from t1 as A cross join t1 as B order by la, B.a;
+→ [{"la":1,"a":1,"b":"one"},{"la":1,"a":2,"b":"two"},{"la":2,"a":1,"b":"one"},{"la":2,"a":2,"b":"two"}]
 
 drop table t1;
 
