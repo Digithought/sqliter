@@ -187,8 +187,9 @@ export class DeferredConstraintQueue {
 		try {
 			slot.set(evaluationRow);
 			const value = await entry.evaluator(runtimeCtx) as SqlValue;
-			// NOTE: unreachable from today's two enqueue sites (runtime/emit/constraint-check.ts
-			// and core/derived-row-validator.ts) — both wrap their evaluator so it throws its
+			// NOTE: unreachable from today's two enqueue sites (runtime/row-constraints.ts,
+			// shared by the ConstraintCheckNode emitter and the `on conflict … do update`
+			// arm, and core/derived-row-validator.ts) — both wrap their evaluator so it throws its
 			// own message, attributed identically to the immediate path. This stays as the
 			// safety net for any future caller that queues a raw evaluator; if that never
 			// happens, it can go, and if it does, prefer teaching the caller to self-attribute

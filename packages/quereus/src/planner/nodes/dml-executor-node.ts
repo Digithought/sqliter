@@ -73,12 +73,12 @@ export interface UpsertClausePlan {
  * Set only when at least one clause takes the `update` action.
  */
 export interface UpsertUpdateValidation {
-  /** UPDATE-scoped CHECKs plus child-side and parent-side FK checks. */
-  checks: ConstraintCheck[];
-  /** Flat OLD|NEW descriptor the checks' column references bind through. */
-  flatRowDescriptor: RowDescriptor;
-  /** DEFAULT evaluators for NOT NULL columns — per-constraint REPLACE substitution. */
-  notNullDefaults: NotNullDefaultPlan[];
+	/** UPDATE-scoped CHECKs plus child-side and parent-side FK checks. */
+	checks: ConstraintCheck[];
+	/** Flat OLD|NEW descriptor the checks' column references bind through. */
+	flatRowDescriptor: RowDescriptor;
+	/** DEFAULT evaluators for NOT NULL columns — per-constraint REPLACE substitution. */
+	notNullDefaults: NotNullDefaultPlan[];
 }
 
 /**

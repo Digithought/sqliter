@@ -669,7 +669,7 @@ function buildNullSafeEquality(col: string): AST.Expression {
  *   ( (OLD.p1 ≡ NEW.p1 and … and OLD.pn ≡ NEW.pn) or <NOT EXISTS over OLD> )
  *
  * where `≡` is the null-safe {@link buildNullSafeEquality}. Reproduces the physical
- * parent-side UPDATE short-circuit (`emit/constraint-check.ts` skips the `NOT EXISTS`
+ * parent-side UPDATE short-circuit (`runtime/row-constraints.ts` skips the `NOT EXISTS`
  * when no referenced parent column changed) — a **correctness** requirement, not just
  * perf: a plain `NOT EXISTS` over OLD values would reject a benign update that does not
  * touch the referenced columns but whose key a child still references. The per-column

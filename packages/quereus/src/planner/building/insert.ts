@@ -27,7 +27,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode, type UpsertClausePlan, type UpsertUpdateValidation } from '../nodes/dml-executor-node.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
-import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-builder.js';
+import { buildChildSideFKChecks, buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
 import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
@@ -384,6 +384,7 @@ function buildUpsertUpdateValidation(
 	schemaAuthoredCtx: PlanningContext,
 	tableReference: TableReferenceNode,
 	contextAttributes: Attribute[],
+	lensRouted: boolean,
 ): UpsertUpdateValidation {
 	const tableSchema = tableReference.tableSchema;
 
@@ -418,15 +419,20 @@ function buildUpsertUpdateValidation(
 			schemaAuthoredCtx, tableSchema, RowOpFlag.UPDATE,
 			oldAttributes, newAttributes, contextAttributes
 		));
-		// NOT gated on getBatchableRestrictFks, unlike buildUpdateStmt. That gate is
-		// buildUpdateStmt's contract with `runUpdate`, which owns a ParentRestrictBatch
-		// and probes every inbound RESTRICT FK once at the end-of-statement boundary.
-		// `runInsert` has no such batch, so the DO UPDATE arm must always carry the
-		// per-row plan-time `not exists` checks or parent-side RESTRICT goes unenforced.
-		checks.push(...buildParentSideFKChecks(
-			schemaAuthoredCtx, tableSchema, RowOpFlag.UPDATE,
-			oldAttributes, newAttributes, contextAttributes
-		));
+		// Parent-side: gated exactly as buildUpdateStmt gates it, so the two spellings
+		// of the same write report a RESTRICT breach with the SAME message. Dropping the
+		// plan-time `not exists` probe here loses no enforcement: `executeUpsertUpdate`
+		// always runs `assertTransitiveRestrictsForParentMutation` before `vtab.update`,
+		// which covers every inbound RESTRICT FK this would have (plus transitively
+		// cascaded ones). `runInsert` owns no ParentRestrictBatch, so unlike `runUpdate`
+		// the admitted case is enforced by that per-row pre-walk rather than one
+		// end-of-statement probe — same verdict, same message, no batching.
+		if (getBatchableRestrictFks(ctx.schemaManager, tableSchema, 'update', undefined, lensRouted) === undefined) {
+			checks.push(...buildParentSideFKChecks(
+				schemaAuthoredCtx, tableSchema, RowOpFlag.UPDATE,
+				oldAttributes, newAttributes, contextAttributes
+			));
+		}
 	}
 
 	const notNullDefaults = buildNotNullDefaults(
@@ -986,7 +992,7 @@ export function buildInsertStmt(
 	// exactly what buildUpdateStmt would build for the equivalent plain UPDATE, so the
 	// two spellings of the same write are refused (or accepted) identically.
 	const upsertUpdateValidation = upsertClausePlans?.some(clause => clause.action === 'update')
-		? buildUpsertUpdateValidation(ctx, schemaAuthoredCtx, tableReference, contextAttributes)
+		? buildUpsertUpdateValidation(ctx, schemaAuthoredCtx, tableReference, contextAttributes, lensRouted)
 		: undefined;
 
 	// Add DML executor node to perform the actual database insert operations

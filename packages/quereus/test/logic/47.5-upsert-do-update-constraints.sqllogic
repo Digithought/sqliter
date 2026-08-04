@@ -298,16 +298,14 @@ drop table fk_par;
 
 -- ===================================
 -- 13. Parent-side `on update restrict`: a DO UPDATE that changes a referenced
---     column while a child still points at the old value is refused.
+--     column while a child still points at the old value is refused, with the SAME
+--     message the plain UPDATE of that parent row produces.
 --
---     NOTE on the message. `runInsert` owns no end-of-statement RESTRICT batch, so
---     the DO UPDATE arm always carries the per-row plan-time `not exists` probe and
---     reports through it. That is the same message the equivalent NON-BATCHED plain
---     UPDATE produces. A plain UPDATE that qualifies for batched RESTRICT probing
---     (`getBatchableRestrictFks`) instead reports the batch's
---     "FOREIGN KEY constraint failed: UPDATE on '<parent>' violates RESTRICT from
---     '<child>'". Both refuse the write; only the wording differs, and it differs
---     by the same gate for a plain UPDATE.
+--     `rs_par` clears the batchability gate (one inbound FK, RESTRICT, not
+--     self-referencing), so a plain UPDATE skips the plan-time `not exists` probe and
+--     reports through the RESTRICT scan. The arm is gated the same way, and its own
+--     per-row `assertTransitiveRestrictsForParentMutation` pre-walk raises the same
+--     error. Section 13b covers the other side of that gate.
 -- ===================================
 
 create table rs_par (p integer primary key, n integer);
@@ -316,13 +314,17 @@ insert into rs_par values (1, 0);
 insert into rs_chi values (1, 1);
 
 insert into rs_par values (1, 5) on conflict (p) do update set p = 2;
--- error: CHECK constraint failed: _fk_rs_chi_p
+-- error: FOREIGN KEY constraint failed: UPDATE on 'rs_par' violates RESTRICT from 'rs_chi'
 
 -- neither parent nor child moved: no dangling child was left behind.
 select p, n from rs_par;
 → [{"p":1,"n":0}]
 select c, p from rs_chi;
 → [{"c":1,"p":1}]
+
+-- the plain UPDATE spelling reports identically.
+update rs_par set p = 2 where p = 1;
+-- error: FOREIGN KEY constraint failed: UPDATE on 'rs_par' violates RESTRICT from 'rs_chi'
 
 -- changing a NON-referenced column through the same arm is fine.
 insert into rs_par values (1, 5) on conflict (p) do update set n = 5;
@@ -331,6 +333,35 @@ select p, n from rs_par;
 
 drop table rs_chi;
 drop table rs_par;
+
+-- ===================================
+-- 13b. The non-batchable side of the same gate: a parent with a mix of RESTRICT and
+--      CASCADE inbound FKs. A plain UPDATE keeps its plan-time `not exists` probe and
+--      reports through it; the DO UPDATE arm must do the same, so the two spellings
+--      stay in step on BOTH sides of the gate.
+-- ===================================
+
+create table mx_par (p integer primary key, n integer);
+create table mx_res (c integer primary key, p integer references mx_par(p) on update restrict);
+create table mx_cas (c integer primary key, p integer references mx_par(p) on update cascade);
+insert into mx_par values (1, 0);
+insert into mx_res values (1, 1);
+insert into mx_cas values (1, 1);
+
+insert into mx_par values (1, 5) on conflict (p) do update set p = 2;
+-- error: CHECK constraint failed: _fk_mx_res_p
+
+select p, n from mx_par;
+→ [{"p":1,"n":0}]
+select c, p from mx_res;
+→ [{"c":1,"p":1}]
+
+update mx_par set p = 2 where p = 1;
+-- error: CHECK constraint failed: _fk_mx_res_p
+
+drop table mx_cas;
+drop table mx_res;
+drop table mx_par;
 
 -- ===================================
 -- 14. Parent-side `on update cascade` still cascades through the DO UPDATE arm —

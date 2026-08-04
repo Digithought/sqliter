@@ -601,8 +601,9 @@ Concretely:
   key column byte-identical.
 - Two paths inject a value *after* that pass and convert their one cell by the
   same rule: the `OR REPLACE` NOT NULL DEFAULT substitution
-  (`constraint-check.ts`) and `ON CONFLICT … DO UPDATE` assignments (the DML
-  executor).
+  (`runtime/row-constraints.ts`, reached both from the `ConstraintCheckNode`
+  emitter and from the `ON CONFLICT … DO UPDATE` arm's own validation) and
+  `ON CONFLICT … DO UPDATE` assignments (the DML executor).
 
 The DML executor then passes `preCoerced: true` on its `vtab.update` calls, and
 every conversion-performing layer below honors it: the memory module

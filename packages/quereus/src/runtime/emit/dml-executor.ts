@@ -770,13 +770,13 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// OLD-value scan dereferences through the just-mutated parent and finds nothing.
 		// runInsert owns no ParentRestrictBatch, so this is always the per-row pre-walk.
 		//
-		// NOTE: for the same reason the arm also always carries the plan-time per-row
-		// `not exists` parent-side FK probes (see buildUpsertUpdateValidation), so a bulk
-		// upsert against a heavily-referenced parent pays both per conflicting row and
-		// never gets the end-of-statement batched probe a plain UPDATE can. Fine at
-		// current scale; if bulk upsert against such a parent ever shows up as slow, give
-		// runInsert a ParentRestrictBatch and gate both sites on getBatchableRestrictFks
-		// the way runUpdate/buildUpdateStmt already do.
+		// NOTE: this pre-walk is the arm's ONLY parent-side RESTRICT enforcement whenever
+		// the table clears the batchability gate — buildUpsertUpdateValidation drops the
+		// plan-time `not exists` probes there, matching buildUpdateStmt, so both spellings
+		// report the same message. The arm still never gets the end-of-statement batched
+		// probe a plain UPDATE can, paying one probe per conflicting row instead. Fine at
+		// current scale; if bulk upsert against a heavily-referenced parent ever shows up
+		// as slow, give runInsert a ParentRestrictBatch the way runUpdate has one.
 		await assertTransitiveRestrictsForParentMutation(
 			rctx.db, tableSchema, 'update', existingRow, updatedRow, plan.lensRouted);
 

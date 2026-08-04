@@ -361,7 +361,7 @@ export function buildParentSideFKChecks(
 		if (parentColIndices.length !== fk.columns.length) continue;
 
 		// For UPDATE, the runtime skips this check when none of `parentColIndices`
-		// changed (see emit/constraint-check.ts).
+		// changed (see runtime/row-constraints.ts).
 
 		// Synthesize NOT EXISTS(SELECT 1 FROM child WHERE child.fk = OLD.pk)
 		const notExistsExpr = synthesizeNotExistsCheck(fk, childTable, tableSchema, parentColIndices);

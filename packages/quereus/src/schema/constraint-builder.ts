@@ -246,7 +246,7 @@ function qualifyRelation(schemaName: string, tableName: string): string {
  * maintenance evaluator (`core/derived-row-validator.ts`). The leading
  * `CHECK constraint failed:` / `FOREIGN KEY constraint failed:` prefixes are
  * load-bearing: existing assertions and downstream consumers key off them
- * (see `runtime/emit/constraint-check.ts`). */
+ * (see `runtime/row-constraints.ts`). */
 
 /** Attributed CHECK diagnostic for a row the derivation wrote into a maintained table. */
 export function maintainedTableCheckViolationError(

@@ -496,7 +496,7 @@ threaded through the whole DML pipeline: the seam sets a flag for the batch's du
 pre-checks (`runtime/foreign-key-actions.ts`), by every **nested cascade DML** and
 **MV-maintenance** FK pass those re-enter, and — crucially — by the **plan-time
 parent-side FK check** synthesized into each cascade statement's plan
-(`runtime/emit/constraint-check.ts`, the `fk-parent` constraint kind), the primary
+(`runtime/row-constraints.ts`, the `fk-parent` constraint kind), the primary
 enforcer a depth-≥1 cascade would otherwise trip. A replica-only RESTRICT invariant is
 **by design not enforced on apply**; express it as a global assertion if the receiver
 must be notified.
