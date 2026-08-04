@@ -141,7 +141,6 @@ export function analyzeSelectColumns(
 	selectContext: PlanningContext,
 	source: RelationalPlanNode
 ): {
-	projections: Projection[];
 	projectionsByColumn: Map<AST.ResultColumn, Projection>;
 	aggregates: { expression: ScalarPlanNode; alias: string }[];
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[];
@@ -149,12 +148,10 @@ export function analyzeSelectColumns(
 	hasWindowFunctions: boolean;
 	hasWrappedAggregates: boolean;
 } {
-	const projections: Projection[] = [];
+	// Keyed by AST result column, not a flat list: the caller assembles the final
+	// projection list by walking `columns` itself so each star expands in written
+	// position (see buildSelectStmt).
 	const projectionsByColumn = new Map<AST.ResultColumn, Projection>();
-	const addProjection = (column: AST.ResultColumn, projection: Projection): void => {
-		projections.push(projection);
-		projectionsByColumn.set(column, projection);
-	};
 	const aggregates: { expression: ScalarPlanNode; alias: string }[] = [];
 	const windowFunctions: { func: WindowFunctionCallNode; alias?: string }[] = [];
 	let hasAggregates = false;
@@ -176,7 +173,7 @@ export function analyzeSelectColumns(
 			if (isWindowExpression(scalarNode)) {
 				hasWindowFunctions = true;
 				collectWindowFunctions(scalarNode, column.alias, windowFunctions);
-				addProjection(column, {
+				projectionsByColumn.set(column, {
 					node: scalarNode,
 					alias: column.alias,
 					...(authoredInverse ? { authoredInverse } : {})
@@ -207,7 +204,7 @@ export function analyzeSelectColumns(
 					hasWrappedAggregates = true;
 				}
 			} else {
-				addProjection(column, {
+				projectionsByColumn.set(column, {
 					node: scalarNode,
 					alias: column.alias,
 					...(authoredInverse ? { authoredInverse } : {})
@@ -217,7 +214,6 @@ export function analyzeSelectColumns(
 	}
 
 	return {
-		projections,
 		projectionsByColumn,
 		aggregates,
 		windowFunctions,
