@@ -3,14 +3,19 @@ import { Database } from '../../src/core/database.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { DmlExecutorNode } from '../../src/planner/nodes/dml-executor-node.js';
 import { ConstraintCheckNode } from '../../src/planner/nodes/constraint-check-node.js';
+import { AlterTableNode } from '../../src/planner/nodes/alter-table-node.js';
 
 /**
- * Structural guard for bug-dml-side-expressions-invisible-to-optimizer:
- * `DmlExecutorNode` (ON CONFLICT assignments / WHERE, and WITH CONTEXT values)
- * and `ConstraintCheckNode` (WITH CONTEXT values, alongside its existing CHECK
- * and NOT NULL DEFAULT children) must expose every held expression through
- * `getChildren()` so the optimizer can rewrite subqueries inside them, and
- * `withChildren()` must slice a round-trip back to an equivalent node.
+ * Structural guard for bug-dml-side-expressions-invisible-to-optimizer and
+ * bug-alter-add-column-relation-default-fails-to-emit (OPT-009, "every held
+ * expression is a child"): `DmlExecutorNode` (ON CONFLICT assignments / WHERE,
+ * and WITH CONTEXT values), `ConstraintCheckNode` (WITH CONTEXT values,
+ * alongside its existing CHECK and NOT NULL DEFAULT children), and
+ * `AlterTableNode` (ADD COLUMN's per-row DEFAULT / GENERATED ALWAYS AS
+ * backfill, and any CHECK predicates on that column) must expose every held
+ * expression through `getChildren()` so the optimizer can rewrite subqueries
+ * inside them, and `withChildren()` must slice a round-trip back to an
+ * equivalent node.
  *
  * `plan-validator.ts`'s "no logical-only node reaches emission" check cannot
  * serve as this guard — it walks `getChildren()` too, so it is blind to
@@ -34,6 +39,7 @@ function findNode<T extends PlanNode>(root: PlanNode, predicate: (n: PlanNode) =
 
 const isDmlExecutor = (n: PlanNode): n is DmlExecutorNode => n instanceof DmlExecutorNode;
 const isConstraintCheck = (n: PlanNode): n is ConstraintCheckNode => n instanceof ConstraintCheckNode;
+const isAlterTable = (n: PlanNode): n is AlterTableNode => n instanceof AlterTableNode;
 
 describe('DML side-expression exposure to the optimizer', () => {
 	let db: Database;
@@ -180,5 +186,86 @@ describe('DML side-expression exposure to the optimizer', () => {
 		const check = findNode(plan, isConstraintCheck);
 		expect(() => dml.withChildren(dml.getChildren().slice(0, 1))).to.throw(/expects 6 children/);
 		expect(() => check.withChildren(check.getChildren().slice(0, 1))).to.throw(/expects 4 children/);
+	});
+});
+
+describe('AlterTableNode ADD COLUMN expression exposure to the optimizer', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table d (k integer)');
+		await db.exec('insert into d values (1)');
+		await db.exec('create table a1 (id integer primary key)');
+		await db.exec('insert into a1 values (1)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	// Non-foldable DEFAULT (a subquery) — compiles to a backfill node, no CHECK on the column.
+	const BACKFILL_ONLY_SQL = `alter table a1 add column w integer default (select count(*) from d)`;
+	// Non-foldable DEFAULT plus an inline CHECK that itself reads another table — a CHECK
+	// predicate only ever exists alongside a backfill (see AddColumnCheck), so this is the
+	// shape that exercises both slots and their relative order.
+	const BACKFILL_AND_CHECK_SQL = `
+		alter table a1 add column z integer default (new.id) check ((select count(*) from d) = 1)
+	`;
+	const RENAME_SQL = `alter table a1 rename to a2`;
+
+	it('getChildren() exposes the backfill expression when there is no CHECK', () => {
+		const node = findNode(db.getPlan(BACKFILL_ONLY_SQL), isAlterTable);
+		if (node.action.type !== 'addColumn') throw new Error('unreachable');
+
+		// Anti-vacuity: the DEFAULT really did compile to a backfill node, not fold to a literal.
+		expect(node.action.backfill, 'a subquery DEFAULT must compile to a backfill node').to.not.equal(undefined);
+		expect(node.action.checks, 'no CHECK on this column').to.equal(undefined);
+
+		const children = node.getChildren();
+		expect(children.length).to.equal(1);
+		expect(children[0]).to.equal(node.action.backfill!.node);
+	});
+
+	it('getChildren() exposes backfill first then every CHECK predicate, matching the emitter slot order', () => {
+		const node = findNode(db.getPlan(BACKFILL_AND_CHECK_SQL), isAlterTable);
+		if (node.action.type !== 'addColumn') throw new Error('unreachable');
+
+		expect(node.action.backfill, '`new.id` default must compile to a backfill node').to.not.equal(undefined);
+		expect(node.action.checks?.predicates.length, 'one CHECK predicate').to.equal(1);
+
+		const children = node.getChildren();
+		expect(children.length).to.equal(2);
+		expect(children[0]).to.equal(node.action.backfill!.node);
+		expect(children[1]).to.equal(node.action.checks!.predicates[0].node);
+	});
+
+	it('getChildren() is empty for a non-addColumn action', () => {
+		const node = findNode(db.getPlan(RENAME_SQL), isAlterTable);
+		expect(node.action.type).to.equal('renameTable');
+		expect(node.getChildren()).to.deep.equal([]);
+	});
+
+	it('withChildren(getChildren()) round-trips to the same instance', () => {
+		const node = findNode(db.getPlan(BACKFILL_AND_CHECK_SQL), isAlterTable);
+		expect(node.withChildren(node.getChildren())).to.equal(node);
+	});
+
+	it('withChildren substitutes a distinct node into each slot, not just an identity round-trip', () => {
+		const node = findNode(db.getPlan(BACKFILL_AND_CHECK_SQL), isAlterTable);
+		const children = node.getChildren();
+		expect(children.length).to.equal(2);
+
+		// Swap the two slots: a slot-order bug (e.g. the CHECK predicate written into the
+		// backfill slot) shows up as a mismatch here, invisible to an identity round-trip.
+		const swapped = [children[1], children[0]];
+		const rebuilt = node.withChildren(swapped) as AlterTableNode;
+		expect(rebuilt, 'a changed child must produce a new instance').to.not.equal(node);
+		if (rebuilt.action.type !== 'addColumn') throw new Error('unreachable');
+		expect(rebuilt.action.backfill!.node, 'backfill slot took the substituted node').to.equal(swapped[0]);
+		expect(rebuilt.action.checks!.predicates[0].node, 'check slot took the substituted node').to.equal(swapped[1]);
+		expect(rebuilt.getChildren()).to.deep.equal(swapped);
+	});
+
+	it('withChildren rejects a child count that does not match getChildren()', () => {
+		const node = findNode(db.getPlan(BACKFILL_AND_CHECK_SQL), isAlterTable);
+		expect(() => node.withChildren(node.getChildren().slice(0, 1))).to.throw(/expects 2 children/);
 	});
 });

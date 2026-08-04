@@ -60,7 +60,9 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 	// (via a row slot over the backfill's row descriptor). When the new column also carries a
 	// CHECK, its predicates ride alongside as further callbacks, evaluated per backfilled row
 	// against `[...existingRow, backfilledValue]`. Slot order is fixed: backfill first
-	// (present whenever checks are), then the checks in order.
+	// (present whenever checks are), then the checks in order — this MUST match
+	// `AlterTableNode.addColumnExpressions()` (planner/nodes/alter-table-node.ts), which is
+	// the order the optimizer rewrites these children in via getChildren/withChildren.
 	const backfill: AddColumnBackfill | undefined = action.type === 'addColumn' ? action.backfill : undefined;
 	const checks: AddColumnCheck | undefined = action.type === 'addColumn' ? action.checks : undefined;
 	const params: Instruction[] = [

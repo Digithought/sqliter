@@ -1,0 +1,63 @@
+-- ALTER TABLE ADD COLUMN's DEFAULT / GENERATED ALWAYS AS / inline CHECK may read another
+-- table (a correlated or uncorrelated subquery), and the backfill still runs per row.
+--
+-- Regression for bug-alter-add-column-relation-default-fails-to-emit: `AlterTableNode`
+-- held the backfill and CHECK expressions off the child-node graph the optimizer walks
+-- (`getChildren()`/`withChildren()`), so a subquery inside either reached the runtime
+-- unphysicalized and the whole ALTER errored — a simple expression default (nothing to
+-- rewrite) worked, so this was invisible until the default read another table.
+--
+-- Runs under both the memory module (`yarn test`) and the store module (`yarn
+-- test:store`).
+
+create table d (k integer);
+insert into d values (1);
+-- run
+
+create table a1 (id integer primary key);
+insert into a1 values (1);
+-- run
+
+-- 1. Uncorrelated aggregate subquery DEFAULT.
+alter table a1 add column w integer default (select count(*) from d);
+-- run
+
+select id, w from a1 order by id;
+→ [{"id":1,"w":1}]
+
+-- 2. Uncorrelated scalar subquery DEFAULT (LIMIT 1).
+alter table a1 add column x integer default ((select k from d limit 1));
+-- run
+
+select id, x from a1 order by id;
+→ [{"id":1,"x":1}]
+
+-- 3. GENERATED ALWAYS AS over a subquery — always a per-row backfill (a generated
+-- column has no `defaultValue` for the module to bulk-write).
+alter table a1 add column g integer generated always as ((select count(*) from d));
+-- run
+
+select id, g from a1 order by id;
+→ [{"id":1,"g":1}]
+
+-- 4. A per-row DEFAULT (`new.id`) with an inline CHECK that itself reads another
+-- table — accepted when the CHECK passes.
+alter table a1 add column z integer default (new.id) check ((select count(*) from d) = 1);
+-- run
+
+select id, z from a1 order by id;
+→ [{"id":1,"z":1}]
+
+-- 5. Same shape, CHECK fails against the backfilled row — the whole ALTER is
+-- rejected and the table is left exactly as it was (no `zz` column).
+alter table a1 add column zz integer default (new.id) check ((select count(*) from d) = 99);
+-- error: CHECK constraint failed
+
+select * from a1 order by id;
+→ [{"id":1,"w":1,"x":1,"g":1,"z":1}]
+
+drop table a1;
+-- run
+
+drop table d;
+-- run

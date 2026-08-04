@@ -118,6 +118,7 @@ be built before the node it references; it explicitly invalidates the caches it 
 
 - code: `packages/quereus/src/planner/nodes/dml-executor-node.ts` — `getChildren`, `withChildren`
 - code: `packages/quereus/src/planner/nodes/constraint-check-node.ts` — `getChildren`, `withChildren`
+- code: `packages/quereus/src/planner/nodes/alter-table-node.ts` — `getChildren`, `withChildren`
 - guard: `packages/quereus/test/optimizer/dml-child-exposure.spec.ts` — `DML side-expression exposure to the optimizer`
 
 Every user expression a plan node holds and later emits must be reachable through

@@ -234,6 +234,11 @@ select count(*) as n from temp.sp_cross;
 -- so that scan needs the owning schema pinned on it explicitly — the planning-context
 -- helper never sees it. Both directions, since one alone cannot tell a narrowed path
 -- from a scan that silently did nothing.
+--
+-- The per-row backfill / CHECK path below covers the same rule for a non-foldable
+-- (subquery) DEFAULT and the CHECK predicates that ride alongside it — untestable until
+-- bug-alter-add-column-relation-default-fails-to-emit, since before that fix a subquery
+-- inside either reached the runtime unphysicalized and the whole ALTER errored outright.
 
 create table temp.sp_ac (id integer primary key);
 insert into temp.sp_ac values (1);
@@ -251,6 +256,36 @@ alter table temp.sp_ac add column x integer default 0 check ((select count(*) fr
 
 select id, x from temp.sp_ac order by id;
 → [{"id":1,"x":0}]
+
+-- ===== ALTER TABLE ADD COLUMN's per-row backfill / CHECK, same rule =====
+
+create table temp.sp_acbf (id integer primary key);
+insert into temp.sp_acbf values (1);
+-- run
+
+-- A non-foldable (subquery) DEFAULT compiles to a per-row backfill node — 3 (temp.c,
+-- beside the table), not 1 (main.c, on the writer's path).
+alter table temp.sp_acbf add column n integer default (select count(*) from c);
+-- run
+
+select id, n from temp.sp_acbf order by id;
+→ [{"id":1,"n":3}]
+
+-- A per-row DEFAULT (`new.id`) with an inline CHECK reading `c` — true against temp.c
+-- (3 rows), beside the table ⇒ accepted.
+alter table temp.sp_acbf add column m integer default (new.id) check ((select count(*) from c) = 3);
+-- run
+
+select id, m from temp.sp_acbf order by id;
+→ [{"id":1,"m":1}]
+
+-- Same shape, but the CHECK is only true against the main.c decoy (1 row) ⇒ rejected —
+-- distinguishes a narrowed path from a CHECK that silently did nothing.
+alter table temp.sp_acbf add column mm integer default (new.id) check ((select count(*) from c) = 1);
+-- error: CHECK
+
+select * from temp.sp_acbf order by id;
+→ [{"id":1,"n":3,"m":1}]
 
 -- ===== A maintained table's declared CHECK, both when it is created and when it derives =====
 -- `create table … maintained as` reaches the same CHECK bodies by two routes that neither

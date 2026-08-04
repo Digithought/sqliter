@@ -1,5 +1,5 @@
 import type { Scope } from '../scopes/scope.js';
-import { VoidNode, type PhysicalProperties, type ScalarPlanNode, type RowDescriptor } from './plan-node.js';
+import { VoidNode, asScalarNodes, type PhysicalProperties, type PlanNode, type ScalarPlanNode, type RowDescriptor } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type * as AST from '../../parser/ast.js';
@@ -178,6 +178,42 @@ export class AlterTableNode extends VoidNode {
 
 	override getRelations(): readonly [TableReferenceNode] {
 		return [this.table];
+	}
+
+	/**
+	 * Every user expression this node holds, in the fixed order the emitter's parameter
+	 * slots use (see `emitAlterTable`'s `params`): the ADD COLUMN backfill first, then its
+	 * per-row CHECK predicates. Empty for every other action. Keep in sync with
+	 * `emitAlterTable` — the child order here IS the emitter's `args` slot order.
+	 */
+	private addColumnExpressions(): readonly ScalarPlanNode[] {
+		if (this.action.type !== 'addColumn') return [];
+		const out: ScalarPlanNode[] = [];
+		if (this.action.backfill) out.push(this.action.backfill.node);
+		for (const predicate of this.action.checks?.predicates ?? []) out.push(predicate.node);
+		return out;
+	}
+
+	override getChildren(): readonly PlanNode[] {
+		return this.addColumnExpressions();
+	}
+
+	override withChildren(newChildren: readonly PlanNode[]): PlanNode {
+		const expressions = this.addColumnExpressions();
+		if (newChildren.length !== expressions.length) {
+			throw new Error(`AlterTableNode expects ${expressions.length} children, got ${newChildren.length}`);
+		}
+		if (expressions.length === 0) return this;
+		const rewritten = asScalarNodes(newChildren, 'AlterTableNode addColumn');
+		if (rewritten.every((node, i) => node === expressions[i])) return this;
+
+		const action = this.action as Extract<AlterTableAction, { type: 'addColumn' }>;
+		let cursor = 0;
+		const backfill = action.backfill ? { ...action.backfill, node: rewritten[cursor++] } : undefined;
+		const checks = action.checks
+			? { ...action.checks, predicates: action.checks.predicates.map(p => ({ ...p, node: rewritten[cursor++] })) }
+			: undefined;
+		return new AlterTableNode(this.scope, this.table, { ...action, backfill, checks }, this.sql);
 	}
 
 	override toString(): string {
