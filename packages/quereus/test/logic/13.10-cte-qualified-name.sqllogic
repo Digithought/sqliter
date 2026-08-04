@@ -1,0 +1,110 @@
+-- 13.10-cte-qualified-name.sqllogic - a schema-qualified FROM name never binds a CTE
+--
+-- A common table expression lives in no schema, so writing the schema in front of a name
+-- (`main.c`) can only mean the real schema object. `buildFrom` (planner/building/select.ts)
+-- used to look its `cteNodes` map up on the BARE name and ignore `table.schema`, so
+-- `with c as (…) select … from main.c` silently read the CTE — wrong rows, no error.
+--
+-- The write path was already correct (`resolveCteTarget` returns undefined when
+-- `table.schema` is set), as are the lens compiler and the rename rewriter. This file pins
+-- both halves: a qualifier always reaches the schema object, and a BARE name still shadows
+-- to the CTE exactly as before.
+--
+-- See docs/vu-operators.md § Common Table Expressions and the CTE-name DML target.
+
+-- `c` is a real table with 3 rows; `p` has 1 row, so a CTE `c` over `p` has 1 row —
+-- the two disagree, so the wrong binding is always observable.
+create table c (k integer primary key);
+insert into c values (1), (2), (3);
+create table p (id integer primary key);
+insert into p values (10);
+-- run
+
+-- ===== Qualified name reads the real table =====
+
+with c as (select id as k from p) select count(*) as n from main.c;
+→ [{"n":3}]
+
+-- The values come from the real table too, not just the count.
+with c as (select id as k from p) select k from main.c order by k;
+→ [{"k":1},{"k":2},{"k":3}]
+
+-- ===== Bare name still reads the CTE (unchanged) =====
+
+with c as (select id as k from p) select count(*) as n from c;
+→ [{"n":1}]
+
+with c as (select id as k from p) select k from c order by k;
+→ [{"k":10}]
+
+-- ===== Alias on the qualified name still works =====
+
+with c as (select id as k from p) select count(*) as n from main.c as x;
+→ [{"n":3}]
+
+with c as (select id as k from p) select x.k as k from main.c as x order by x.k;
+→ [{"k":1},{"k":2},{"k":3}]
+
+-- ===== Both bindings in ONE statement =====
+-- The join proves the two names resolve independently: 3 real rows × 1 CTE row.
+
+with c as (select id as k from p)
+select count(*) as n from main.c as real_c cross join c as cte_c;
+→ [{"n":3}]
+
+with c as (select id as k from p)
+select real_c.k as rk, cte_c.k as ck from main.c as real_c cross join c as cte_c order by rk;
+→ [{"rk":1,"ck":10},{"rk":2,"ck":10},{"rk":3,"ck":10}]
+
+-- ===== Qualified name inside a subquery =====
+
+with c as (select id as k from p)
+select (select count(*) from main.c) as qualified, (select count(*) from c) as bare;
+→ [{"qualified":3,"bare":1}]
+
+-- ===== Recursion is unaffected — the self-reference is BARE =====
+
+with recursive r(n) as (
+  select 1
+  union all
+  select n + 1 from r where n < 3
+)
+select count(*) as n from r;
+→ [{"n":3}]
+
+-- ...and a qualified reference to a recursive CTE's name is still a schema lookup, which
+-- finds nothing.
+with recursive r(n) as (
+  select 1
+  union all
+  select n + 1 from r where n < 3
+)
+select count(*) as n from main.r;
+-- error: Table not found: main.r
+
+-- ===== No same-named schema object: ordinary table-not-found, not a silent CTE bind =====
+-- The qualified miss reports `Table not found: <schema>.<name>` (resolveTableSchema's
+-- explicit-schema arm in planner/building/schema-resolution.ts); the search-path wording
+-- `not found in schema path: …` is the UNqualified miss.
+
+with nope as (select id as k from p) select k from main.nope;
+-- error: Table not found: main.nope
+
+-- ===== Writes are unchanged — already correct before this fix =====
+
+with c as (select id as k from p) insert into main.c values (99);
+
+select k from c order by k;
+→ [{"k":1},{"k":2},{"k":3},{"k":99}]
+
+-- No `with` clause here, so `c` is the plain real table — restore the 3-row state.
+delete from c where k = 99;
+-- run
+
+select count(*) as n from c;
+→ [{"n":3}]
+
+-- Cleanup
+drop table p;
+drop table c;
+-- run

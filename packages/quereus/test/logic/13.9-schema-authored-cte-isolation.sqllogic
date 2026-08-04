@@ -141,9 +141,12 @@ select id, w from sa_nnd order by id;
 → [{"id":1,"w":3}]
 
 -- ===== Child-side foreign key (INSERT) =====
--- The synthesized probe is `exists (select 1 from main.<parent> where …)`. `buildFrom`
--- matches a CTE on the BARE table name and ignores the schema qualifier, so a caller
--- `with fkp as (…)` used to win even against the schema-qualified synthesized FROM.
+-- The synthesized probe is `exists (select 1 from main.<parent> where …)`. `buildFrom` used
+-- to match a CTE on the BARE table name and ignore the schema qualifier, so a caller
+-- `with fkp as (…)` won even against the schema-qualified synthesized FROM. Two independent
+-- fixes now close that: `schemaAuthoredContext` keeps the caller's CTEs out of this context
+-- at all, and `buildFrom` skips its CTE lookup for a qualified name
+-- (13.10-cte-qualified-name.sqllogic). The arms below still pin the behaviour.
 -- Here the real parent HAS the referenced row and the caller's CTE does not, so a leak
 -- shows up as a spurious `CHECK constraint failed: _fk_…`.
 

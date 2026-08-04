@@ -508,8 +508,13 @@ function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource): Set
 	// resolve `t`'s bare columns as local instead of rejecting them as
 	// unprovable-correlation (docs/vu-operators.md § Common Table Expressions). A
 	// schema object of the same name was already resolved above, so this only fires for a
-	// genuine context-backed name. `buildFrom` resolves such a name the same way (its own
-	// `cteNodes` lookup), so the static shadow set matches the plan-time binding.
+	// genuine context-backed name. `buildFrom` agrees on the QUALIFIER dimension — it also
+	// skips its `cteNodes` lookup for a schema-qualified name — so a qualified source is
+	// never shadowed here or there. The two do NOT agree on PRECEDENCE: this function tries
+	// `findSchemaItem` first and falls back to `cteNodes`, whereas `buildFrom` checks
+	// `cteNodes` first, so a bare name matching BOTH a CTE and a real table gets the table's
+	// columns here and the CTE's relation at plan time. Tracked separately as
+	// `bug-cte-shadow-precedence-scope-transform`.
 	if (!schemaName && ctx.cteNodes) {
 		const cteNode = ctx.cteNodes.get(src.table.name.toLowerCase());
 		if (cteNode) return new Set(cteNode.getType().columns.map(c => c.name.toLowerCase()));

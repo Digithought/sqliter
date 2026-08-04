@@ -418,8 +418,12 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 	if (fromClause.type === 'table') {
 		const tableName = fromClause.table.name.toLowerCase();
 
-		// Check if this is a CTE reference
-		if (cteNodes.has(tableName)) {
+		// Check if this is a CTE reference. A schema-qualified name (`main.c`) names a
+		// schema object, never a CTE — CTEs live in no schema — so a qualifier sends the
+		// name straight to the ordinary view / table resolution below, even when a
+		// same-named CTE is in scope. Matches the write path (`resolveCteTarget`) and
+		// SQLite / PostgreSQL.
+		if (!fromClause.table.schema && cteNodes.has(tableName)) {
 			const cteNode = cteNodes.get(tableName)!;
 
 			// Check if this is an internal recursive CTE reference
