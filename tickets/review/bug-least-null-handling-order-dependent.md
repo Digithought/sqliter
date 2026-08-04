@@ -1,4 +1,3 @@
----
 description: Fixed `least` so it always skips NULL arguments, matching `greatest`, instead of giving a different answer depending on where the NULL sat in the argument list.
 files:
   - packages/quereus/src/func/builtins/scalar.ts        # emitExtremum + greatestFunc/leastFunc default bodies
@@ -35,8 +34,10 @@ with all of them.
 
 The two dead-default `implementation` bodies passed to `createScalarFunction` for
 `greatestFunc`/`leastFunc` (unreachable — `customEmitter` always wins) were kept
-in step: both now reduce over `null` seed and skip NULL candidates, same as the
-custom emitter.
+in step: both now reduce over a `null` seed and skip NULL candidates, same as the
+custom emitter. Verified against `git show` of the fix commit (`2245e22e`) — the
+diff matches this description exactly, including the seed/skip change in both
+reduce bodies.
 
 ## Tests / docs updated
 
@@ -48,14 +49,19 @@ custom emitter.
   returned `null`) — this test wasn't listed in the original ticket's `files:`
   but pinned the same bug and had to move together.
 - `docs/types.md`, `docs/functions.md`, `docs/sql-functions.md`: removed the
-  "order-dependent" callouts and the dangling reference to
-  `tickets/backlog/bug-least-null-handling-order-dependent` (that backlog file
-  never existed separately — this fix ticket was already the tracking ticket).
+  "order-dependent" callouts; confirmed no dangling references to a
+  `tickets/backlog/bug-least-null-handling-order-dependent` file remain (grepped
+  all three docs — clean).
 
-## Verification
+## Verification (re-run during implement stage, this session)
 
-`yarn test` (from `packages/quereus`): 8648 passing, 13 pending, 0 failing.
-`yarn lint`: clean.
+- `yarn build` (root): clean, all packages including quoomb-web/vscode/shared-ui built.
+- `yarn test` (from `packages/quereus`): **8648 passing, 13 pending, 0 failing.**
+- `yarn lint` (from `packages/quereus`): clean, no output, exit 0.
+- Manually diffed the fix commit (`git show 2245e22e -- packages/quereus/src/func/builtins/scalar.ts`)
+  against this ticket's description — matches exactly: `emitExtremum` now uses
+  `bestIndex = -1` / `continue` on null key, and both `greatestFunc`/`leastFunc`
+  fallback reduce bodies seed on `null` and skip null `current`.
 
 ## Notes for reviewer
 
@@ -68,3 +74,12 @@ custom emitter.
   a possible follow-up, not required by this ticket's scope (making the two
   functions internally consistent), and not filed as a ticket since it's a
   speculative simplification with no concrete trigger.
+- Test coverage is limited to the `.sqllogic` cases listed above (2-3 args,
+  mixed NULL positions, numeric type). No coverage added for `least`/`greatest`
+  over non-numeric comparison groups (text, temporal) with NULLs, or for the
+  all-NULL / zero-arg edge cases beyond the two already-present `greatest(null,
+  null)` / `least(null, null)` lines — those passed already and weren't touched.
+
+## Review findings
+
+(none yet — this section is for the review stage to fill in)
