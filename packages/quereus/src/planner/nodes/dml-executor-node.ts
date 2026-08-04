@@ -206,12 +206,19 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
     }
 
     if (this.upsertClauses && this.upsertClauses.length > 0) {
-      props.upsertClauses = this.upsertClauses.map(clause => ({
-        action: clause.action,
-        hasConflictTarget: !!clause.conflictTargetIndices,
-        hasWhere: !!clause.whereCondition,
-        assignmentCount: clause.assignments?.size ?? 0
-      }));
+      props.upsertClauses = this.upsertClauses.map(clause => {
+        // `assignments` also carries the implicit generated-column recomputes; report
+        // the user's SET count separately so a plan golden reads the statement, not
+        // the target table's generated-column count.
+        const generatedCount = clause.generatedAssignmentColumns?.length ?? 0;
+        return {
+          action: clause.action,
+          hasConflictTarget: !!clause.conflictTargetIndices,
+          hasWhere: !!clause.whereCondition,
+          assignmentCount: (clause.assignments?.size ?? 0) - generatedCount,
+          ...(generatedCount > 0 ? { generatedAssignmentCount: generatedCount } : {}),
+        };
+      });
     }
 
     return props;

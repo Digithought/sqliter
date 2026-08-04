@@ -671,6 +671,144 @@ DROP ASSERTION ren_u_nonneg;
 DROP TABLE ren_u;
 -- run
 
+-- --- Body shapes the walk has to follow ---
+-- The rewriters are shared with the view-body path, so these shapes are covered
+-- there too; pinned here because an assertion body is walked UNSEEDED (it owns
+-- its own FROM scopes) and nothing else exercises that entry point.
+
+-- Join: only the renamed side moves, in both the FROM and the ON clause.
+CREATE TABLE ren_p (id INTEGER PRIMARY KEY);
+CREATE TABLE ren_c (id INTEGER PRIMARY KEY, pid INTEGER);
+CREATE ASSERTION ren_join CHECK (NOT EXISTS (
+  SELECT 1 FROM ren_c JOIN ren_p ON ren_c.pid = ren_p.id WHERE ren_c.id < 0
+));
+ALTER TABLE ren_p RENAME TO ren_p2;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_join';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_c inner join ren_p2 on ren_c.pid = ren_p2.id where ren_c.id < 0))" }]
+
+INSERT INTO ren_p2 VALUES (1);
+INSERT INTO ren_c VALUES (5, 1);
+COMMIT;
+BEGIN;
+INSERT INTO ren_c VALUES (-1, 1);
+COMMIT;
+-- error: Integrity assertion failed: ren_join
+
+DROP ASSERTION ren_join;
+DROP TABLE ren_c;
+DROP TABLE ren_p2;
+-- run
+
+-- Alias: the source name follows the rename, the alias does not.
+CREATE TABLE ren_a (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_alias CHECK (NOT EXISTS (SELECT 1 FROM ren_a AS aa WHERE aa.x < 0));
+ALTER TABLE ren_a RENAME TO ren_a2;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_alias';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_a2 as aa where aa.x < 0))" }]
+
+BEGIN;
+INSERT INTO ren_a2 VALUES (-1);
+COMMIT;
+-- error: Integrity assertion failed: ren_alias
+
+DROP ASSERTION ren_alias;
+DROP TABLE ren_a2;
+-- run
+
+-- CTE: the rename reaches inside the WITH body; the CTE name is untouched.
+CREATE TABLE ren_k (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_cte CHECK (NOT EXISTS (
+  WITH s AS (SELECT x FROM ren_k) SELECT 1 FROM s WHERE x < 0
+));
+ALTER TABLE ren_k RENAME TO ren_k2;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_cte';
+→ [{ "violation_sql": "select 1 where not (not exists (with s as (select x from ren_k2) select 1 from s where x < 0))" }]
+
+BEGIN;
+INSERT INTO ren_k2 VALUES (-1);
+COMMIT;
+-- error: Integrity assertion failed: ren_cte
+
+DROP ASSERTION ren_cte;
+DROP TABLE ren_k2;
+-- run
+
+-- RENAME COLUMN reaches a table-qualified reference, not only a bare one.
+CREATE TABLE ren_q (id INTEGER PRIMARY KEY, x INTEGER);
+CREATE ASSERTION ren_qual CHECK (NOT EXISTS (SELECT 1 FROM ren_q WHERE ren_q.x < 0));
+ALTER TABLE ren_q RENAME COLUMN x TO y;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_qual';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_q where ren_q.y < 0))" }]
+
+BEGIN;
+INSERT INTO ren_q VALUES (1, -3);
+COMMIT;
+-- error: Integrity assertion failed: ren_qual
+
+DROP ASSERTION ren_qual;
+DROP TABLE ren_q;
+-- run
+
+-- --- Rename mid-transaction, with rows already written ---
+-- The assertion evaluates at THIS commit, against the body the rename just
+-- rewrote — the rewrite has to be visible to the same transaction that made it.
+
+CREATE TABLE ren_x (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_x_nonneg CHECK (NOT EXISTS (SELECT 1 FROM ren_x WHERE x < 0));
+COMMIT;
+BEGIN;
+INSERT INTO ren_x VALUES (3);
+ALTER TABLE ren_x RENAME TO ren_x2;
+INSERT INTO ren_x2 VALUES (4);
+COMMIT;
+SELECT COUNT(*) FROM ren_x2;
+→ [{ "count(*)": 2 }]
+
+BEGIN;
+INSERT INTO ren_x2 VALUES (-9);
+COMMIT;
+-- error: Integrity assertion failed: ren_x_nonneg
+
+DROP ASSERTION ren_x_nonneg;
+DROP TABLE ren_x2;
+-- run
+
+-- --- A fresh table reusing the freed name is not governed by the assertion ---
+-- The optimizer hoists an assertion's premises onto the tables its body names.
+-- Pre-fix the body still said `ren_z`, so a new table created under the freed
+-- name inherited a rule that was never about it — and rows it legitimately held
+-- could be optimized away.
+
+CREATE TABLE ren_z (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_z_nonneg CHECK (NOT EXISTS (SELECT 1 FROM ren_z WHERE x < 0));
+ALTER TABLE ren_z RENAME TO ren_z2;
+CREATE TABLE ren_z (x INTEGER PRIMARY KEY);
+INSERT INTO ren_z VALUES (-5);
+COMMIT;
+
+-- The new ren_z keeps its negative row and stays visible to a matching filter.
+SELECT COUNT(*) FROM ren_z WHERE x < 0;
+→ [{ "count(*)": 1 }]
+
+-- The rule still governs the renamed table.
+BEGIN;
+INSERT INTO ren_z2 VALUES (-1);
+COMMIT;
+-- error: Integrity assertion failed: ren_z_nonneg
+
+DROP ASSERTION ren_z_nonneg;
+DROP TABLE ren_z;
+DROP TABLE ren_z2;
+-- run
+
 -- ===================================
 -- Body validation at CREATE (arm 1)
 -- ===================================

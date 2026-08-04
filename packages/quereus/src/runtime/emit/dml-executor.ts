@@ -579,6 +579,13 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// `await` each evaluator: deterministic does not imply synchronous — a generated
 		// expression may embed a scalar subquery, whose evaluator returns a Promise (see
 		// the same note in emitUpdate's phase 2).
+		//
+		// NOTE: each value is converted before the next generated column reads it, whereas
+		// emitUpdate converts the whole row once after its phase-2 loop. The two agree
+		// unless a generated column reads another whose expression type differs from its
+		// declared type; if such a divergence is ever observed, make emitUpdate convert
+		// per-column too (this order is the correct one — a dependent should see the
+		// stored form).
 		if (clause.generatedAssignments && clause.generatedRowDescriptor) {
 			await withAsyncRowContext(rctx, clause.generatedRowDescriptor, () => updatedRow, async () => {
 				for (const { colIndex, evaluatorIndex } of clause.generatedAssignments!) {

@@ -101,6 +101,13 @@ aborts.
 - `column` or `table.column` — References the current value in the existing row
 - The `WHERE` clause can use both to conditionally apply updates
 
+**Generated Columns:**
+
+`DO UPDATE` treats them exactly as `UPDATE` does — a generated column may not appear as a SET
+target (`Cannot UPDATE generated column '<name>'`), and every generated column of the table is
+recomputed from the updated row after the SET assignments are applied, in dependency order
+(see *Generated Columns* in [sql-ddl.md](sql-ddl.md)).
+
 **Key Differences from OR REPLACE:**
 
 | Feature | `INSERT OR REPLACE` | `ON CONFLICT DO UPDATE` |

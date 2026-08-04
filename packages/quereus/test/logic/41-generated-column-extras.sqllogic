@@ -423,3 +423,79 @@ select a, k from t_pk_up order by k;
 → [{"a":2,"k":102}]
 
 drop table t_pk_up;
+
+-- ===================================
+-- 9g. RETURNING on the DO UPDATE arm reports the RECOMPUTED generated value.
+--     The arm builds its returned row from the stored image, so a recompute the
+--     second pass missed would surface here as the stale value.
+-- ===================================
+
+create table t_up_ret (
+	id integer primary key,
+	w  integer,
+	g  integer generated always as (w * 2) stored
+);
+
+insert into t_up_ret (id, w) values (1, 1);
+
+insert into t_up_ret (id, w) values (1, 7) on conflict (id) do update set w = excluded.w returning id, w, g;
+→ [{"id":1,"w":7,"g":14}]
+
+drop table t_up_ret;
+
+-- ===================================
+-- 9h. A DO UPDATE clause whose WHERE excludes the row writes nothing — the
+--     recompute must not leak a value past the skipped write.
+-- ===================================
+
+create table t_up_where (
+	id integer primary key,
+	w  integer,
+	g  integer generated always as (w * 2) stored
+);
+
+insert into t_up_where (id, w) values (1, 1);
+
+insert into t_up_where (id, w) values (1, 7) on conflict (id) do update set w = excluded.w where w > 100;
+
+select id, w, g from t_up_where;
+→ [{"id":1,"w":1,"g":2}]
+
+insert into t_up_where (id, w) values (1, 7) on conflict (id) do update set w = excluded.w where w < 100;
+
+select id, w, g from t_up_where;
+→ [{"id":1,"w":7,"g":14}]
+
+drop table t_up_where;
+
+-- ===================================
+-- 9i. TWO `on conflict` clauses on one generated-column table. The emit-side
+--     split between user assignments and recomputes is built per clause, so each
+--     clause needs its own working second pass.
+-- ===================================
+
+create table t_up_multi (
+	id integer primary key,
+	u  integer unique,
+	w  integer,
+	g  integer generated always as (w * 2) stored
+);
+
+insert into t_up_multi (id, u, w) values (1, 10, 1);
+
+select id, u, w, g from t_up_multi;
+→ [{"id":1,"u":10,"w":1,"g":2}]
+
+-- conflicts on the PK -> first clause
+insert into t_up_multi (id, u, w) values (1, 99, 3) on conflict (id) do update set w = 3 on conflict (u) do update set w = 4;
+
+select id, u, w, g from t_up_multi;
+→ [{"id":1,"u":10,"w":3,"g":6}]
+
+-- conflicts on the unique column only -> second clause
+insert into t_up_multi (id, u, w) values (2, 10, 5) on conflict (id) do update set w = 3 on conflict (u) do update set w = 4;
+
+select id, u, w, g from t_up_multi;
+→ [{"id":1,"u":10,"w":4,"g":8}]
+
+drop table t_up_multi;

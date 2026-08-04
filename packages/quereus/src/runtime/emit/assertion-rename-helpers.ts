@@ -99,6 +99,15 @@ export function propagateColumnRenameToAssertions(
  * has an assertion catalog path), so every live assertion came from
  * `CREATE ASSERTION` and carries its expression. If an assertion-reconstruction path
  * is ever added, this pass needs a re-parse arm or those assertions break on rename.
+ *
+ * NOTE: no per-assertion try/catch, deliberately — the only plausible throw is
+ * `buildAssertionViolationSql` on an AST that already stringified at create time, and
+ * catching would leave `checkExpression` rewritten while `violationSql` still named
+ * the old table, which is silently the very breakage this pass exists to prevent. The
+ * cost is that a throw here leaves earlier assertions in the loop already rewritten
+ * against a rename the statement then reports as failed (the view loop above has the
+ * same exposure). If that ever becomes reachable, the fix is a dry-run probe before
+ * any mutation, like `assertRenameDependentsPersistable`'s — not a catch.
  */
 function reregisterRewrittenAssertion(
 	db: Database,

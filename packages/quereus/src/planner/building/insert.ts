@@ -305,6 +305,70 @@ function resolveConflictTargetEnforcement(
 }
 
 /**
+ * Register the conflicting row's columns on `scope`, under both the bare name and
+ * the `<table>.<name>` qualified form. Shared by the DO UPDATE SET scope (where
+ * unqualified names mean the existing row) and the generated-column recompute
+ * scope, which sees the same attributes but none of the `new.` / `excluded.` ones.
+ */
+function registerExistingRowColumns(
+	scope: RegisteredScope,
+	tableSchema: TableSchema,
+	existingAttributes: readonly Attribute[],
+): RegisteredScope {
+	existingAttributes.forEach((attr, columnIndex) => {
+		const col = tableSchema.columns[columnIndex];
+		const register = (symbol: string) => scope.registerSymbol(symbol, (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, columnIndex)
+		);
+		register(col.name.toLowerCase());
+		register(`${tableSchema.name.toLowerCase()}.${col.name.toLowerCase()}`);
+	});
+	return scope;
+}
+
+/**
+ * Append one implicit assignment per generated column to a DO UPDATE clause's
+ * assignment map, in topological order so a generated column referencing another
+ * sees the freshly-computed value when the runtime evaluates them in turn against
+ * the composed row. Returns the appended column indices, in that same order.
+ *
+ * A generated column can never collide with a user target (the SET loop rejects
+ * those), so appending into the same map is safe and keeps the node's child walk
+ * order-preserving.
+ *
+ * The expressions get their OWN scope over the existing-row attributes rather than
+ * reusing the SET scope: schema-authored SQL must not be able to bind the
+ * statement's `new.` / `excluded.` symbols. Wrapped in `schemaAuthoredContext` for
+ * the same reason `building/update.ts` wraps its recompute — the table's own DDL
+ * resolves bare relation names in its own schema and cannot see the writing
+ * statement's CTEs.
+ */
+function appendGeneratedRecomputes(
+	ctx: PlanningContext,
+	tableSchema: TableSchema,
+	existingAttributes: readonly Attribute[],
+	assignments: Map<number, ScalarPlanNode>,
+): number[] {
+	const generatedCtx = schemaAuthoredContext(
+		{ ...ctx, scope: registerExistingRowColumns(new RegisteredScope(ctx.scope), tableSchema, existingAttributes) },
+		tableSchema.schemaName,
+	);
+
+	const generatedAssignmentColumns: number[] = [];
+	for (const colIndex of tableSchema.generatedColumnTopoOrder ?? []) {
+		const col = tableSchema.columns[colIndex];
+		if (!col.generated || !col.generatedExpr) continue;
+		const genNode = buildExpression(generatedCtx, col.generatedExpr) as ScalarPlanNode;
+		if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+			validateDeterministicGenerated(genNode, col.name, tableSchema.name);
+		}
+		assignments.set(colIndex, genNode);
+		generatedAssignmentColumns.push(colIndex);
+	}
+	return generatedAssignmentColumns;
+}
+
+/**
  * Builds UPSERT clause plans from AST UPSERT clauses.
  *
  * In UPSERT expressions:
@@ -375,23 +439,7 @@ function buildUpsertClausePlans(
 		// Create scope for UPSERT SET expressions:
 		// - NEW.* and excluded.* reference proposed insert values
 		// - Unqualified names reference existing row values
-		const upsertScope = new RegisteredScope(ctx.scope);
-
-		// Register existing row columns (unqualified column names default to existing values)
-		existingAttributes.forEach((attr, columnIndex) => {
-			const col = tableSchema.columns[columnIndex];
-
-			// Unqualified column name -> existing row value
-			upsertScope.registerSymbol(col.name.toLowerCase(), (exp, s) =>
-				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, columnIndex)
-			);
-
-			// Table-qualified form (table.column) -> existing row value
-			const tblQualified = `${tableSchema.name.toLowerCase()}.${col.name.toLowerCase()}`;
-			upsertScope.registerSymbol(tblQualified, (exp, s) =>
-				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, columnIndex)
-			);
-		});
+		const upsertScope = registerExistingRowColumns(new RegisteredScope(ctx.scope), tableSchema, existingAttributes);
 
 		// Register NEW.* references (proposed insert values)
 		newAttributes.forEach((attr, columnIndex) => {
@@ -452,42 +500,7 @@ function buildUpsertClausePlans(
 			}
 		}
 
-		// Append one implicit assignment per generated column, in topological order so a
-		// generated column referencing another sees the freshly-computed value when the
-		// runtime evaluates them in turn against the composed row. A generated column can
-		// never collide with a user target (rejected above), so appending into the same
-		// map is safe and keeps the node's child walk order-preserving.
-		//
-		// The expressions get their OWN scope over the existing-row attributes rather than
-		// reusing `upsertScope`: schema-authored SQL must not be able to bind the
-		// statement's `new.` / `excluded.` symbols. Wrapped in `schemaAuthoredContext` for
-		// the same reason `building/update.ts` wraps its recompute — the table's own DDL
-		// resolves bare relation names in its own schema and cannot see the writing
-		// statement's CTEs.
-		const generatedScope = new RegisteredScope(ctx.scope);
-		existingAttributes.forEach((attr, columnIndex) => {
-			const col = tableSchema.columns[columnIndex];
-			generatedScope.registerSymbol(col.name.toLowerCase(), (exp, s) =>
-				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, columnIndex)
-			);
-			const tblQualified = `${tableSchema.name.toLowerCase()}.${col.name.toLowerCase()}`;
-			generatedScope.registerSymbol(tblQualified, (exp, s) =>
-				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, columnIndex)
-			);
-		});
-		const generatedCtx = schemaAuthoredContext({ ...ctx, scope: generatedScope }, tableSchema.schemaName);
-
-		const generatedAssignmentColumns: number[] = [];
-		for (const colIndex of tableSchema.generatedColumnTopoOrder ?? []) {
-			const col = tableSchema.columns[colIndex];
-			if (!col.generated || !col.generatedExpr) continue;
-			const genNode = buildExpression(generatedCtx, col.generatedExpr) as ScalarPlanNode;
-			if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
-				validateDeterministicGenerated(genNode, col.name, tableSchema.name);
-			}
-			assignments.set(colIndex, genNode);
-			generatedAssignmentColumns.push(colIndex);
-		}
+		const generatedAssignmentColumns = appendGeneratedRecomputes(ctx, tableSchema, existingAttributes, assignments);
 
 		// Build WHERE condition if present
 		let whereCondition: ScalarPlanNode | undefined;
