@@ -178,7 +178,7 @@ export function buildSelectStmt(
 	const selectListAsts = buildSelectListAsts(stmt.columns, input);
 
 	// Process aggregates if present
-	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates, selectListAsts);
+	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates, selectListAsts, starProjectionsByColumn);
 	input = aggregateResult.output;
 	let preAggregateSort = aggregateResult.preAggregateSort;
 	let orderByAppliedEarly = false;

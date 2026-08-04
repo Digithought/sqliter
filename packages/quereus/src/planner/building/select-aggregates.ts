@@ -30,7 +30,8 @@ export function buildAggregatePhase(
 	hasAggregates: boolean,
 	projections: Projection[],
 	hasWrappedAggregates: boolean = false,
-	selectListAsts: AST.Expression[] = []
+	selectListAsts: AST.Expression[] = [],
+	starProjectionsByColumn: ReadonlyMap<AST.ResultColumn, readonly Projection[]> = new Map()
 ): {
 	output: RelationalPlanNode;
 	aggregateScope?: RegisteredScope;
@@ -164,12 +165,14 @@ export function buildAggregatePhase(
 		// every grouped query changes the plan shape of a grouped materialized-view body
 		// (`select k, count(*), sum(a) … group by k`) and re-routes its incremental
 		// maintenance from residual-recompute to full-rebuild — see
-		// test/incremental/delta-aggregate.spec.ts. It is also why an aggregate-only
-		// select list still leaks its grouping key into the output
-		// (backlog/bug-grouped-aggregate-only-select-returns-extra-column); fixing that
-		// means reconciling the projection with maintenance routing, not just dropping
-		// this guard.
-		|| Boolean(hasGroupBy && !hasAggregates && projections.length > 0);
+		// test/incremental/delta-aggregate.spec.ts. So the aggregate case is decided by
+		// exact shape agreement instead (`aggregateOutputIsSelectList` below), which
+		// leaves that body's bare-aggregate plan intact.
+		|| Boolean(hasGroupBy && !hasAggregates && projections.length > 0)
+		// With aggregates present the AggregateNode may still be the root of the query.
+		// That is only sound when its own output already IS the select list; otherwise
+		// the grouping keys it advertises leak into (or reorder) the result.
+		|| !aggregateOutputIsSelectList(stmt, projections, aggregates, groupByExpressions, starProjectionsByColumn, selectContext);
 
 	return {
 		output: currentInput,
@@ -503,6 +506,85 @@ function buildHavingFilter(
 }
 
 /**
+ * True when the AggregateNode's own output already IS the SELECT list, column for
+ * column — its GROUP BY keys in GROUP BY order, then its aggregate results in
+ * SELECT order, and nothing left over.
+ *
+ * An AggregateNode advertises *every* grouping key it computes, so with no
+ * projection above it the query's declared result shape is the aggregate's shape,
+ * not the select list's. `select count(*) from t group by g` therefore hands back
+ * `g` as well as the count, and `select count(*) c, g from t group by g` hands the
+ * two back in aggregate order rather than select-list order. Only an exact
+ * positional match makes skipping the final projection sound.
+ *
+ * Callers reach this only after the other `needsFinalProjection` terms answered
+ * "no", which means every entry in `projections` is a bare, non-renaming
+ * {@link ColumnReferenceNode}; a group key is matched by attribute id so a
+ * qualified `select t.k … group by k` still counts as agreement.
+ */
+function aggregateOutputIsSelectList(
+	stmt: AST.SelectStmt,
+	projections: Projection[],
+	aggregates: { expression: ScalarPlanNode; alias: string }[],
+	groupByExpressions: ScalarPlanNode[],
+	starProjectionsByColumn: ReadonlyMap<AST.ResultColumn, readonly Projection[]>,
+	selectContext: PlanningContext,
+): boolean {
+	// `projections` holds every expanded star column first and the non-aggregate
+	// SELECT-list columns after them (buildSelectStmt pushes them in that order), so
+	// the SELECT-list walk below needs its own cursor into the second group.
+	let starColumnCount = 0;
+	for (const column of stmt.columns) {
+		if (column.type === 'all') starColumnCount += starProjectionsByColumn.get(column)?.length ?? 0;
+	}
+
+	let columnCursor = starColumnCount;
+	let aggregateCount = 0;
+	let nextGroupKey = 0;
+	let sawAggregate = false;
+
+	/** Does this select-list node reference exactly the group key we expect next? */
+	const claimsNextGroupKey = (node: PlanNode): boolean => {
+		const key: ScalarPlanNode | undefined = groupByExpressions[nextGroupKey];
+		if (!key || sawAggregate) return false;
+		if (!CapabilityDetectors.isColumnReference(node) || !CapabilityDetectors.isColumnReference(key)) return false;
+		return (node as ColumnReferenceNode).attributeId === (key as ColumnReferenceNode).attributeId;
+	};
+
+	for (const column of stmt.columns) {
+		if (column.type === 'all') {
+			for (const starProjection of starProjectionsByColumn.get(column) ?? []) {
+				if (!claimsNextGroupKey(starProjection.node)) return false;
+				nextGroupKey++;
+			}
+			continue;
+		}
+		if (column.type !== 'column') continue;
+
+		if (containsAggregateFunction(column.expr, selectContext)) {
+			// An aggregate result column claims the next aggregate output slot. Those
+			// slots all follow the group keys, so nothing may claim a key after one.
+			sawAggregate = true;
+			aggregateCount++;
+			continue;
+		}
+
+		const projection = projections[columnCursor++];
+		if (!projection || !claimsNextGroupKey(projection.node)) return false;
+		nextGroupKey++;
+	}
+
+	return nextGroupKey === groupByExpressions.length && aggregateCount === aggregates.length;
+}
+
+/** True when a SELECT-list expression contains an aggregate function call. */
+function containsAggregateFunction(expr: AST.Expression, selectContext: PlanningContext): boolean {
+	const found: AST.FunctionExpr[] = [];
+	findAggregateFunctionExprs(expr, selectContext, found);
+	return found.length > 0;
+}
+
+/**
  * Checks if a final projection is needed for complex expressions or for
  * aliasing simple column refs whose alias differs from the underlying column.
  */
@@ -627,12 +709,7 @@ function orderByContainsAggregates(
 	selectContext: PlanningContext
 ): boolean {
 	if (!orderBy || orderBy.length === 0) return false;
-	const found: AST.FunctionExpr[] = [];
-	for (const clause of orderBy) {
-		findAggregateFunctionExprs(clause.expr, selectContext, found);
-		if (found.length > 0) return true;
-	}
-	return false;
+	return orderBy.some(clause => containsAggregateFunction(clause.expr, selectContext));
 }
 
 /**

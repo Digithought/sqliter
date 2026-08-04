@@ -143,5 +143,50 @@ describe('Plan shape: grouped-query final projection', () => {
 				.to.deep.equal(['v', 'g', 'k', 'w']);
 			expect(await columnNames("SELECT *, * FROM nk GROUP BY a, b")).to.deep.equal(['a', 'b', 'a:1', 'b:1']);
 		});
+
+		/**
+		 * Regression for bug-grouped-aggregate-only-select-returns-extra-column.
+		 * An AggregateNode advertises its grouping keys followed by its aggregate
+		 * results, so with no projection above it the declared result shape is the
+		 * aggregate's, not the SELECT list's. These cases all used to come back in
+		 * aggregate shape; the results themselves are pinned in
+		 * test/logic/07.3.2-grouped-select-list-shape.sqllogic.
+		 */
+		describe('with aggregates in the SELECT list', () => {
+			it('an aggregate-only SELECT list does not publish the grouping key', async () => {
+				expect(await columnNames("SELECT count(*) AS n FROM nk GROUP BY a")).to.deep.equal(['n']);
+				expect(await columnNames("SELECT count(*) FROM nk GROUP BY a")).to.deep.equal(['count(*)']);
+				expect(await columnNames("SELECT count(*) AS n FROM nk GROUP BY a HAVING count(*) > 0")).to.deep.equal(['n']);
+				expect(await columnNames("SELECT count(*) AS n FROM nk GROUP BY a, b")).to.deep.equal(['n']);
+			});
+
+			it('emits SELECT-list order, not GROUP BY order', async () => {
+				expect(await columnNames("SELECT count(*) AS c, a FROM nk GROUP BY a")).to.deep.equal(['c', 'a']);
+				expect(await columnNames("SELECT b, a, count(*) AS c FROM nk GROUP BY a, b")).to.deep.equal(['b', 'a', 'c']);
+				expect(await columnNames("SELECT a, count(*) AS c, b FROM nk GROUP BY a, b")).to.deep.equal(['a', 'c', 'b']);
+				expect(await columnNames("SELECT a, b, count(*) AS c FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b', 'c']);
+			});
+
+			it('SELECT * plus an aggregate emits source-column order then the aggregate', async () => {
+				expect(await columnNames("SELECT *, count(*) AS c FROM nk GROUP BY a, b")).to.deep.equal(['a', 'b', 'c']);
+				expect(await columnNames("SELECT *, count(*) AS c FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b', 'c']);
+			});
+
+			it('a qualified reference to a bare grouping key counts as agreement', async () => {
+				expect(await columnNames("SELECT nk.a, count(*) AS c FROM nk GROUP BY a")).to.deep.equal(['a', 'c']);
+				expect(await columnNames("SELECT a, count(*) AS c FROM nk GROUP BY nk.a")).to.deep.equal(['a', 'c']);
+			});
+
+			// The shape the delta-aggregate maintenance path recognises: keys in GROUP BY
+			// order, then aggregates. It agrees with the aggregate output, so no
+			// projection is built and the plan stays bare aggregate-over-scan. Widening
+			// the projection to every grouped query re-routes this body's incremental
+			// maintenance to full-rebuild — see test/incremental/delta-aggregate.spec.ts.
+			it('leaves an already-agreeing SELECT list on the bare aggregate plan', async () => {
+				const rows = await planRows(db, "SELECT a, count(*) AS c FROM nk GROUP BY a");
+				expect(rows.filter(r => r.op === 'PROJECT'), 'no projection needed when the shapes agree').to.be.empty;
+				aggregateRow(rows);
+			});
+		});
 	});
 });

@@ -104,11 +104,23 @@ SELECT p.id, (SELECT count(*) FROM c WHERE c.pid < p.id) AS n FROM p ORDER BY p.
 SELECT p.id, (SELECT count(*) FROM c) AS n FROM p ORDER BY p.id;
 → [{"id":1,"n":4},{"id":2,"n":4},{"id":3,"n":4},{"id":4,"n":4}]
 
--- GROUP BY inside a scalar subquery is rejected at build time (the aggregate
--- output exposes the group column alongside the aggregate → two columns), so
--- it can never reach the decorrelation rule.
+-- GROUP BY inside a scalar subquery. This used to be rejected at build time as a
+-- two-column subquery, because a grouped select list of only aggregates leaked
+-- the grouping key into the output (bug-grouped-aggregate-only-select-returns-extra-column).
+-- It is a legal one-column subquery; the rule still rejects it (grouped body, not
+-- a bare scalar aggregate) so it stays on the correlated per-row path.
 SELECT p.id, (SELECT count(*) FROM cc WHERE cc.pid = p.id GROUP BY cc.pid) AS n FROM p WHERE p.id = 1;
--- error: Scalar subquery must return exactly one column
+→ [{"id":1,"n":2}]
+
+-- An outer row matching no inner row produces *no group at all*, so the scalar
+-- subquery is NULL — not the 0 the ungrouped count(*) would give (ids 2 and 3).
+SELECT p.id, (SELECT count(*) FROM cc WHERE cc.pid = p.id GROUP BY cc.pid) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":2},{"id":2,"n":null},{"id":3,"n":null},{"id":4,"n":1}]
+
+-- Grouping on a column the correlation does not pin can yield several groups,
+-- and the >1-row runtime error still applies.
+SELECT p.id, (SELECT count(*) FROM cc WHERE cc.pid = p.id GROUP BY cc.k) AS n FROM p WHERE p.id = 1;
+-- error: Scalar subquery returned more than one row
 
 -- Weak collation on the correlation + outer ref in the aggregate argument:
 -- the remap is not value-faithful, so the rule bails; results stay correct.

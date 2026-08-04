@@ -1,0 +1,104 @@
+-- A grouped query returns exactly the columns in its SELECT list, in SELECT-list
+-- order — nothing more, and not in GROUP BY order.
+--
+-- Regression for bug-grouped-aggregate-only-select-returns-extra-column. An
+-- AggregateNode advertises every grouping key it computes followed by its
+-- aggregate results, so whenever the planner skipped the final projection the
+-- query's declared result shape became the aggregate's shape rather than the
+-- select list's: `select count(*) from t group by g` handed back `g` as well as
+-- the count, and a select list that named its keys in a different order than
+-- GROUP BY got them back in GROUP BY order. The projection is now skipped only
+-- when the two shapes already agree column for column.
+--
+-- Column *names and order* are asserted in test/plan/grouped-projection-shape.spec.ts
+-- (row objects compare key-order-insensitively here); this file pins the values.
+
+create table t (v integer primary key, g text null);
+insert into t values (1,'a'),(2,null),(3,'b'),(4,null);
+
+-- The original repro: select list is only an aggregate, so the grouping key must
+-- not appear at all.
+select count(*) as n from t group by g;
+→ [{"n":1},{"n":2},{"n":1}]
+
+select sum(v) s from t group by g;
+→ [{"s":1},{"s":6},{"s":3}]
+
+-- Unaliased aggregate keeps its expression name and stays the only column.
+select count(*) from t group by g;
+→ [{"count(*)":1},{"count(*)":2},{"count(*)":1}]
+
+-- HAVING attached does not reintroduce the key.
+select count(*) as n from t group by g having count(*) > 1;
+→ [{"n":2}]
+
+-- ORDER BY over the (unselected) grouping key still sorts by it.
+select count(*) as n from t group by g order by g nulls first;
+→ [{"n":2},{"n":1},{"n":1}]
+
+-- Contrast: the scalar-aggregate (no GROUP BY) case was always correct.
+select count(*) n from t;
+→ [{"n":4}]
+
+-- Contrast: naming the key keeps it, exactly once.
+select g, count(*) c from t group by g order by g nulls first;
+→ [{"g":null,"c":2},{"g":"a","c":1},{"g":"b","c":1}]
+
+drop table t;
+
+-- ---------------------------------------------------------------------------
+-- SELECT-list order, independent of GROUP BY order. No primary key, so the
+-- functional-dependency GROUP BY reduction cannot rewrite the grouping keys out
+-- from under these cases.
+-- ---------------------------------------------------------------------------
+create table nk (a text, b text);
+insert into nk values ('x','1'),('y','2');
+
+-- Aggregate first, grouping key after it.
+select count(*) c, a from nk group by a order by a;
+→ [{"c":1,"a":"x"},{"c":1,"a":"y"}]
+
+-- Keys named in the reverse of GROUP BY order.
+select b, a, count(*) c from nk group by a, b order by a;
+→ [{"b":"1","a":"x","c":1},{"b":"2","a":"y","c":1}]
+
+-- Aggregate interleaved between two grouping keys.
+select a, count(*) c, b from nk group by a, b order by a;
+→ [{"a":"x","c":1,"b":"1"},{"a":"y","c":1,"b":"2"}]
+
+-- Fewer keys named than grouped on.
+select count(*) c from nk group by a, b order by a;
+→ [{"c":1},{"c":1}]
+
+-- Qualified reference to a bare grouping key is the same column.
+select nk.a, count(*) c from nk group by a order by a;
+→ [{"a":"x","c":1},{"a":"y","c":1}]
+
+-- SELECT * over a grouped query with an aggregate: source-column order, then the
+-- aggregate.
+select *, count(*) c from nk group by a, b order by a;
+→ [{"a":"x","b":"1","c":1},{"a":"y","b":"2","c":1}]
+
+-- The aggregate-only grouped select composes as a derived table...
+select n from (select count(*) n from nk group by a) order by n;
+→ [{"n":1},{"n":1}]
+
+-- ...as a CTE...
+with c as (select count(*) n from nk group by a) select * from c;
+→ [{"n":1},{"n":1}]
+
+-- ...and as a materialized view body, where the reordered projection must still
+-- carry the grouping key through as the view's unique key.
+create materialized view mvn as select count(*) n, a from nk group by a;
+select n, a from mvn order by a;
+→ [{"n":1,"a":"x"},{"n":1,"a":"y"}]
+
+drop materialized view mvn;
+
+-- Contrast: an aggregate-only body has no grouping key in its output, so it is
+-- genuinely unkeyed and a materialized view rejects it. Before the projection was
+-- built the leaked grouping key made this body look keyed by accident.
+create materialized view mvbad as select count(*) n from nk group by a;
+-- error: materialized view 'main.mvbad' body produces duplicate rows
+
+drop table nk;
