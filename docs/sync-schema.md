@@ -3,8 +3,9 @@
 > **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
 
 How `quereus-sync` replicates the **catalog** — tables, columns, indexes — rather than row
-data, and how an application ships its initial schema as a syncable seed. The data path,
-storage layout, wire protocol and transports live in [sync.md](sync.md).
+data, and how an application ships its initial schema as a syncable seed. The data path and
+storage layout live in [sync.md](sync.md); the wire protocol and transports live in
+[sync-protocol.md](sync-protocol.md).
 
 ## Schema Synchronization
 
@@ -66,7 +67,7 @@ both paths sort (`sortMigrationsByHLC`).
 "Within a batch" is the whole guarantee: a streamed snapshot is many batches (the
 receiver flushes every 100 pending row changes), so DDL arriving *after* a flush cannot
 help it. The streaming protocol therefore puts every `schema-migration` chunk ahead of
-all table data — see [sync.md](sync.md) § Streaming Snapshot API.
+all table data — see [sync-protocol.md](sync-protocol.md) § Streaming Snapshot API.
 
 ### Schema Change Types
 

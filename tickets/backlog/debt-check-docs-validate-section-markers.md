@@ -66,6 +66,30 @@ heading-only matcher would report these as unresolvable rather than as pointing 
 document; deciding whether bold-lead paragraphs count as markable sections is a third open
 design question alongside the two below.
 
+### Third data point — the `docs-split-sync-protocol` split
+
+Again on the next split, and this time the marker names a section that is **not a heading at
+all**. That split moved the sync wire protocol out of `docs/sync.md` into
+`docs/sync-protocol.md`. `§ Streaming Snapshot API` names a banner comment *inside* a fenced
+TypeScript block, which travelled with the move; three markers kept naming `docs/sync.md` and
+`node scripts/check-docs.mjs` stayed green:
+
+| Site | Marker | Should name |
+| --- | --- | --- |
+| `docs/sync-schema.md:69` | `` [sync.md](sync.md) § Streaming Snapshot API `` | `sync-protocol.md` |
+| `packages/quereus-sync/README.md:210` | `docs/sync.md § Streaming Snapshot API` | `sync-protocol.md` |
+| `packages/quereus-sync/src/sync/protocol.ts:310` | `docs/sync.md § Streaming Snapshot API` | `sync-protocol.md` |
+
+(The review pass repointed all three; they are recorded here as corpus, not as outstanding
+work.) The implementing agent had swept for markers and classified these as *pre-existing and
+stale* precisely because the name matches no heading — which is the failure mode this check has
+to handle: an unresolvable marker is not automatically a stale one, and the sibling
+`§ Who drives the sweep` markers in the same sweep resolve to a **bold prose paragraph**
+(`docs/sync.md:197`) and are correct. So a heading-only matcher would misreport both directions
+here — sharpening the third open design question above, and adding a fourth: whether a named
+banner inside a fenced code block is markable at all, or whether the marker should be rewritten
+to name the enclosing heading (`§ Sync API`) instead.
+
 ## Expected behavior
 
 `node scripts/check-docs.mjs` fails, with the usual `path:line: message` shape, when a prose

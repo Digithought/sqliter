@@ -182,8 +182,9 @@ interface SyncManager {
    * rewritten, diverging from the row data still in the store. (Tombstones are
    * re-emitted wholesale on resume and re-written idempotently.)
    *
-   * The header HLC is drift-validated before the clear (see the HLC section): a
-   * far-future snapshot is rejected before any local metadata is touched.
+   * The header HLC is drift-validated before the clear (see docs/sync.md § Hybrid
+   * Logical Clock (HLC)): a far-future snapshot is rejected before any local
+   * metadata is touched.
    *
    * A checkpoint exists for the WHOLE duration of an apply: one is saved at header
    * time, immediately after the clear, and the footer clears it on success. So
@@ -406,7 +407,7 @@ To minimize data transfer, clients track sync progress with the server. Every
 watermark is a **`ChangeSet.hlc`** — a transaction commit boundary (the max over
 `changeSets[].hlc`, via the shared `maxHLC` helper), never a per-change max or a
 batch-slice boundary — so advancing it can only land *between* whole transactions
-(§ Transaction-Based Change Grouping → Read side):
+([sync.md § Transaction-Based Change Grouping → Read side](sync.md#read-side-one-changeset-per-transaction)):
 
 1. **Receiving changes**: Only the ordered `changes` reply (contiguous, gap-free) advances `peerSyncState[serverSiteId]` (the *received* watermark) to the max `ChangeSet.hlc` received. A `push_changes` **broadcast** is applied idempotently but must **not** advance it — broadcast delivery is fire-and-forget, so a dropped broadcast is invisible to the coordinator; leaving the watermark below it means the next `get_changes sinceHLC=<watermark>` redelivers (and harmlessly re-applies) it, closing the change-loss hole
 2. **Sending changes**: The client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values, persisting `lastSentHLC` per peer on each confirmed ack via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)

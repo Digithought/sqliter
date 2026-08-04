@@ -307,7 +307,7 @@ export interface Snapshot {
  * The receiver flushes rows to the store in bounded batches rather than buffering
  * the whole snapshot, and DDL only beats DML *within* one flush — so a `create
  * table` emitted after its rows arrives too late for the flushes those rows already
- * triggered. See docs/sync.md § Streaming Snapshot API.
+ * triggered. See docs/sync-protocol.md § Streaming Snapshot API.
  */
 export type SnapshotChunkType =
   | 'header'

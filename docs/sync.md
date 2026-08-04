@@ -10,8 +10,8 @@ The architecture of `quereus-sync`, a fully automatic multi-master CRDT replicat
 | --- | --- |
 | [Sync Protocol](sync-protocol.md) | Wire data structures, the `SyncManager` API, and the WebSocket message protocol — versioning, connection lifecycle, delta sync, reconnection, debouncing, snapshot bootstrap. |
 | [Sync: Schema Replication](sync-schema.md) | Replicating the catalog — tables, columns, indexes — and shipping an initial schema as a syncable seed. |
-| [Sync Coordinator](sync-coordinator.md) | The relay server: rooms, authentication, persistence, snapshot storage, operational concerns. |
-| [Table Migration and Retirement](migration.md) | Retiring a table, diverting its inbound changes, and reviving it later. |
+| [Sync Coordinator](sync-coordinator.md) | The standalone relay server: HTTP and WebSocket surfaces, its hook-based service layer, configuration, logging, security and performance notes. |
+| [Schema Migration in a Synced Database](migration.md) | Evolving an app's schema when peers upgrade at different times: the frozen shared basis, the parallel-table pattern, and retiring, diverting, and reviving a table. |
 
 ## Design Goals
 
