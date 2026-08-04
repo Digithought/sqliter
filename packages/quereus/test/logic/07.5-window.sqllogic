@@ -862,6 +862,13 @@ select a, sum(b) over () as s from wg group by a;
 select a, row_number() over (order by count(*)) as rn from wg group by a;
 -- error: Aggregate function count in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
 
+-- Same limitation when the window spec's aggregate differs from the SELECT
+-- list's only in its argument (bug-aggregate-reuse-matching-ignores-arguments):
+-- `sum(a+0)` here is not `sum(b+0)`, so it is not the aggregate already
+-- collected for the SELECT list and must be rejected the same way.
+select a, sum(b+0) as s, row_number() over (order by sum(a+0)) as rn from wg group by a;
+-- error: Aggregate function sum in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
+
 -- Two window functions with different specifications each get their own window
 -- output column; neither collapses onto the other's.
 select a, row_number() over (order by a) as p, count(*) over (partition by a) as q

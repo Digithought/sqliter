@@ -12,6 +12,7 @@ import { ScalarFunctionCallNode } from "../nodes/function.js";
 import { resolveFunctionSchema } from "./schema-resolution.js";
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { ScalarType } from "../../common/datatype.js";
+import { expressionToString } from "../../emit/ast-stringify.js";
 
 /** One entry of {@link PlanningContext.aggregates} — an aggregate already computed by the AggregateNode. */
 export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[number];
@@ -22,9 +23,20 @@ export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[numb
  * A clause that runs ABOVE the AggregateNode (HAVING, ORDER BY, a window
  * specification in a grouped query) may spell out an aggregate the SELECT list
  * already collected; that spelling means "read the computed column", not
- * "aggregate again". Matching is by function name, argument count, DISTINCT flag
- * and a shallow argument comparison (column names / literal values); argument
- * shapes it cannot compare are treated as matching.
+ * "aggregate again". Matching is by the same canonical-AST fingerprint
+ * (`expressionToString`, case-insensitive) that `dedupeNewAggregates` and
+ * `buildGroupByCoverage` use for this same question elsewhere — so `sum(B)` in
+ * the SELECT list matches `sum(b)` in HAVING, and whitespace / redundant parens
+ * are ignored, but two structurally different arguments never match.
+ *
+ * NOTE: the fingerprint includes each argument's qualifier, so `sum(w.b)` does
+ * NOT match `sum(b)` even when `w` is the only table in scope. Resolving that
+ * would mean binding each argument to an attribute id, which needs the argument
+ * already built — and this runs BEFORE the build, by design. A HAVING/ORDER BY
+ * caller degrades gracefully (the collect path in select-aggregates.ts builds a
+ * second, redundant aggregate over the same column); a window specification
+ * degrades to the UNSUPPORTED error in `rejectUncollectedAggregates`
+ * (select-window.ts).
  *
  * Exported so callers that must *reject* an uncollected aggregate can ask the same
  * question this builder answers — see `buildWindowPhase`.
@@ -32,37 +44,11 @@ export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[numb
 export function findMatchingAggregate(ctx: PlanningContext, expr: AST.FunctionExpr): CollectedAggregate | undefined {
 	if (!ctx.aggregates || ctx.aggregates.length === 0) return undefined;
 
+	const exprKey = expressionToString(expr).toLowerCase();
 	for (const agg of ctx.aggregates) {
 		if (!CapabilityDetectors.isAggregateFunction(agg.expression)) continue;
 		const aggFuncNode = agg.expression as AggregateFunctionCallNode;
-		// Check if function name, argument count, and DISTINCT flag match
-		if (aggFuncNode.functionName.toLowerCase() !== expr.name.toLowerCase() ||
-			aggFuncNode.args.length !== expr.args.length ||
-			(aggFuncNode.isDistinct || false) !== (expr.distinct || false)) {
-			continue;
-		}
-
-		// Check if arguments match
-		let argsMatch = true;
-		for (let i = 0; i < expr.args.length; i++) {
-			const exprArg = expr.args[i];
-			const aggArg = aggFuncNode.args[i];
-			// Simple check: if both are column references, check names match
-			if (exprArg.type === 'column' && aggArg.expression?.type === 'column') {
-				if (exprArg.name.toLowerCase() !== aggArg.expression.name.toLowerCase()) {
-					argsMatch = false;
-					break;
-				}
-			} else if (exprArg.type === 'literal' && aggArg.expression?.type === 'literal') {
-				if (exprArg.value !== aggArg.expression.value) {
-					argsMatch = false;
-					break;
-				}
-			}
-			// For other cases, we'd need more sophisticated comparison
-		}
-
-		if (argsMatch) return agg;
+		if (expressionToString(aggFuncNode.expression).toLowerCase() === exprKey) return agg;
 	}
 
 	return undefined;

@@ -155,6 +155,12 @@ export function buildWindowPhase(
  * in this context" long before this runs. The argument arm is kept because it
  * becomes reachable the moment that early type-probe build stops rejecting
  * aggregates; it is not load-bearing today.
+ *
+ * NOTE: this gate is only as precise as `findMatchingAggregate` (function-call.ts):
+ * a spelling that fingerprint-matches a SELECT-list aggregate passes; anything else
+ * — including a same-column-different-qualifier spelling like `sum(w.b)` against a
+ * SELECT list `sum(b)` — is rejected as uncollected, even though the value would be
+ * identical.
  */
 function rejectUncollectedAggregates(
 	func: WindowFunctionCallNode,

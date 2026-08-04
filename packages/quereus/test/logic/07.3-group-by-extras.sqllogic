@@ -215,3 +215,59 @@ order by c.id;
 drop table items;
 drop table categories;
 drop table log_entry_items;
+
+-- ---------------------------------------------------------------------------
+-- HAVING / ORDER BY aggregate matching by canonical AST fingerprint, not a
+-- shallow argument peek (bug-aggregate-reuse-matching-ignores-arguments).
+--
+-- A clause above the AggregateNode (HAVING, a top-level ORDER BY) that spells
+-- out an aggregate must only bind to the SELECT list's computed column when the
+-- argument expressions actually match; a differently-shaped argument must be
+-- collected and computed as its own aggregate instead.
+-- ---------------------------------------------------------------------------
+create table wg (a text, b text);
+insert into wg values ('x','1'),('y','2'),('x','3');
+
+-- Fixed: HAVING spells a *different* aggregate (`sum(a+0)`) than the SELECT
+-- list's `sum(b+0)`. `sum(a+0)` is 0 for every group, so no group qualifies.
+select a, sum(b+0) as s from wg group by a having sum(a+0) > 3;
+→ []
+
+-- Fixed: same divergence in ORDER BY. `sum(a+0)` is 0 for every group, so the
+-- sort is a no-op and rows keep source (group-discovery) order.
+select a, sum(b+0) as s from wg group by a order by sum(a+0);
+→ [{"a":"x","s":4},{"a":"y","s":2}]
+
+-- Control: identical spelling (`count(*)`) still reads the computed column.
+select a, count(*) as c from wg group by a having count(*) > 1;
+→ [{"a":"x","c":2}]
+
+-- Control: DISTINCT participates in the match — `count(distinct b)` is its own
+-- aggregate, matched by its own spelling.
+select a, count(distinct b) as cd from wg group by a having count(distinct b) > 1;
+→ [{"a":"x","cd":2}]
+
+-- Control: a SELECT-list alias reference resolves through the aggregate output
+-- scope, not through this matching at all.
+select a, sum(b) as s from wg group by a having s > 3;
+→ [{"a":"x","s":4}]
+
+-- Control: whitespace and redundant parentheses don't defeat the match — the
+-- fingerprint normalizes them.
+select a, sum(b+0) as s from wg group by a having sum(b + 0) > 3;
+→ [{"a":"x","s":4}]
+
+select a, sum(b) as s from wg group by a having sum((b)) > 3;
+→ [{"a":"x","s":4}]
+
+-- Control: identifier case doesn't defeat the match.
+select a, sum(B) as s from wg group by a having sum(b) > 3;
+→ [{"a":"x","s":4}]
+
+-- Narrowing (documented, not fixed): a qualifier divergence (`w.b` vs bare `b`)
+-- no longer matches, so HAVING computes a second, redundant aggregate over the
+-- same column instead of reusing the SELECT list's — the answer is unaffected.
+select a, sum(w.b) as s from wg w group by a having sum(b) > 3;
+→ [{"a":"x","s":4}]
+
+drop table wg;
