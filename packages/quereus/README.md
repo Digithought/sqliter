@@ -170,7 +170,7 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 * [Stability Tiers](../../docs/stability.md) — what each tier promises, and which feature areas are Stable, Beta, Experimental, or Internal
 * [Usage Guide](../../docs/usage.md) — complete API reference (type mappings, parameter binding, logging, tracing, transactions)
 * [SQL Reference Guide](../../docs/sql.md) — SQL syntax (includes Declarative Schema)
-* [Schema Management](../../docs/schema.md) — SchemaManager API, change events, key types, DDL generation. Deep dive: [view and materialized-view persistence](../../docs/view-persistence.md)
+* [Schema Management](../../docs/schema.md) — SchemaManager API, change events, key types, DDL generation. Deep dives: [rename detection and body-change detection](../../docs/schema-rename-detection.md), [view and materialized-view persistence](../../docs/view-persistence.md)
 * [View Updateability](../../docs/view-updateability.md) — write-through for views, CTEs, and subqueries-in-FROM; per-operator semantics and override tags
 * [Materialized Views](../../docs/materialized-views.md) — keyed derived relations, DDL, query resolution, write-through, declarative-schema round-trip. Deep dives: [maintenance](../../docs/mv-maintenance.md), [derived-row constraints and covering structures](../../docs/mv-constraints.md), [external row-change ingestion](../../docs/mv-ingestion.md), [schema-change staleness](../../docs/mv-schema-change.md), [the backing-host capability](../../docs/mv-backing-host.md)
 * [Lenses and Layered Schemas](../../docs/lens.md) — logical/basis separation and bidirectional per-table lenses

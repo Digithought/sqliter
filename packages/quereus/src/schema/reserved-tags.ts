@@ -11,7 +11,7 @@ import type { SqlValue } from '../common/types.js';
  *   — lens advisory acknowledgments / access-pattern hints (`docs/lens.md`
  *   § Acknowledging advisories).
  * - `quereus.id` / `quereus.previous_name`
- *   — declarative-differ rename hints (docs/schema.md § Rename Detection).
+ *   — declarative-differ rename hints (docs/schema-rename-detection.md).
  * - `quereus.sync.replicate`
  *   — per-table opt-in that records a maintained table / materialized view's
  *   maintenance writes in the sync change log (`docs/migration.md` § Synced vs.
@@ -195,8 +195,9 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 	// tags through this registry with hard-error-on-unknown. valueSchema is
 	// `'string'` (NOT csv-of-identifiers): the differ never value-validated these,
 	// and a real id may carry a hyphen (`'tbl-thing'`) or name a quoted identifier
-	// — tightening would falsely reject existing schemas. See docs/schema.md
-	// § Rename Detection. A future ticket may add a dedicated `csv-of-names` schema.
+	// — tightening would falsely reject existing schemas. See
+	// docs/schema-rename-detection.md. A future ticket may add a dedicated
+	// `csv-of-names` schema.
 	{
 		key: 'quereus.id',
 		sites: siteSet('physical-table', 'physical-column', 'view-ddl', 'physical-index', 'physical-constraint'),

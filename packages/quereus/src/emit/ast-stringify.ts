@@ -1169,8 +1169,8 @@ export function createIndexBodyToCanonicalString(stmt: AST.CreateIndexStmt): str
  * constraint / index canonical bodies (whose recreates re-validate or rebuild,
  * so they fold to avoid expensive churn), a case-only edit here recreates a
  * plain view (free — data-less) or rebuilds an MV (pre-existing behavior of the
- * select-only hash). See docs/schema.md § View / materialized-view definition
- * changes.
+ * select-only hash). See docs/schema-rename-detection.md § View /
+ * materialized-view definition-change detection.
  */
 export function viewDefinitionToCanonicalString(
 	columns: ReadonlyArray<string> | undefined,

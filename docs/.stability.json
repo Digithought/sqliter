@@ -37,6 +37,7 @@
 		"docs/plugins.md": "Stable",
 		"docs/runtime-caching.md": "Internal",
 		"docs/runtime.md": "Internal",
+		"docs/schema-rename-detection.md": "Beta",
 		"docs/schema.md": "Beta",
 		"docs/sql-alter.md": "Stable",
 		"docs/sql-ddl.md": "Stable",
