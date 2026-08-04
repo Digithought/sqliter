@@ -7,14 +7,12 @@ import { StatusCode } from '../../common/types.js';
 import { buildSelectStmt, buildValuesStmt } from './select.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
-import { buildWithClause } from './with.js';
 import { buildWithContext } from './select-context.js';
 import { resolveCteTarget, contextForCteTarget } from './dml-target.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type RowDescriptor } from '../nodes/plan-node.js';
 import { buildExpression } from './expression.js';
 import { checkColumnsAssignable, columnSchemaToDef, columnSchemaToScalarType } from '../type-utils.js';
 import type { ColumnDef } from '../../common/datatype.js';
-import type { CTEScopeNode } from '../nodes/cte-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import type { Scope } from '../scopes/scope.js';
 import { buildRowDefaultScope } from './default-scope.js';
@@ -523,6 +521,31 @@ export function buildInsertStmt(
 		throw new QuereusError(`Cannot modify committed-state table 'committed.${stmt.table.name}'`, StatusCode.ERROR);
 	}
 
+	// Thread the statement's own leading WITH clause into the planning context ONCE, here,
+	// and build every user-authored clause below against it — matching buildUpdateStmt /
+	// buildDeleteStmt. `buildWithContext` seeds its map from `ctx.cteNodes` and merges
+	// `stmt.withClause` on top, so an own-clause name shadows an inherited one while the
+	// definitions this INSERT inherited from an enclosing statement stay visible. Routing
+	// the definitions through the CONTEXT rather than `buildSelectStmt`'s explicit
+	// `parentCTEs` argument is deliberate: that argument is precisely what leaks a
+	// caller's namespace past `storedBodyContext`'s clearing on the stored-body
+	// write-through path (see select-context.ts). A WITH-less insert with no parent CTEs
+	// gets the context back unchanged (no overhead).
+	//
+	// SCHEMA-authored expressions are deliberately NOT built on this context — column
+	// defaults, generated columns, CHECK constraints and FK checks stay on
+	// `contextWithSchemaPath` / `ctx` below, so a `default (select … from c)` written in
+	// the table's DDL cannot bind a caller's statement-level `c`.
+	//
+	// NOTE: this sits ABOVE the view / MV dispatch, so on a view target the clause is built
+	// here and then AGAIN when `buildViewMutation` re-plans the statement through this same
+	// builder (`buildWithClause` does not memoize). One node set ends up unreferenced —
+	// wasted planning work, not a behavior change, and a DML-bodied definition still
+	// executes exactly once (pinned in test/logic/13.6-cte-dml-runs-once.sqllogic).
+	// `buildUpdateStmt` has the same ordering. If view write-through planning cost ever
+	// shows up, memoize the clause per (context, withClause) rather than re-ordering.
+	const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);
+
 	// CTE-name target: a leading `with t as (…) insert into t …` writes through the
 	// CTE body via the ephemeral view-like substrate — the same predicate-driven
 	// updateability framework a named view uses — and SHADOWS any same-named schema
@@ -531,9 +554,8 @@ export function buildInsertStmt(
 	// `recursive-cte` reason. The statement's CTEs are threaded into the planning
 	// context so a sibling-CTE read in the source resolves. See docs/vu-operators.md
 	// § Common Table Expressions.
-	const cteTarget = resolveCteTarget(contextWithSchemaPath, stmt.table, stmt.withClause);
+	const cteTarget = resolveCteTarget(contextWithCTEs, stmt.table, stmt.withClause);
 	if (cteTarget) {
-		const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);
 		return buildViewMutation(contextForCteTarget(contextWithCTEs, stmt.withClause!, cteTarget.name), cteTarget, { op: 'insert', stmt });
 	}
 
@@ -556,10 +578,10 @@ export function buildInsertStmt(
 		// Route through the view-mutation substrate: decompose to base op(s) and
 		// re-plan each through the base-table builder, wrapped in a ViewMutationNode.
 		// Single-source = one base op (byte-identical to the retired rewrite).
-		return buildViewMutation(contextWithSchemaPath, insertView, { op: 'insert', stmt });
+		return buildViewMutation(contextWithCTEs, insertView, { op: 'insert', stmt });
 	}
 
-	const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
+	const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithCTEs);
 	const tableReference = tableRetrieve.tableRef; // Extract the actual TableReferenceNode
 
 	// Backstop on the RESOLVED table: the dispatch above and buildTableReference
@@ -568,7 +590,7 @@ export function buildInsertStmt(
 	// contents. Keep the belt: route any that slips through to the same rewrite.
 	const insertResolved = tableReference.tableSchema;
 	if (isMaintainedTable(insertResolved)) {
-		return buildViewMutation(contextWithSchemaPath, maintainedTableViewLike(insertResolved), { op: 'insert', stmt });
+		return buildViewMutation(contextWithCTEs, maintainedTableViewLike(insertResolved), { op: 'insert', stmt });
 	}
 
 	// Process mutation context assignments if present
@@ -596,7 +618,7 @@ export function buildInsertStmt(
 		// threads a produced-row NEW context, parent on it so context variables still
 		// shadow the envelope's `new.<col>` (WITH CONTEXT precedence), while an envelope
 		// column the member does not carry stays resolvable below.
-		contextScope = new RegisteredScope(defaultRowContextScope ?? contextWithSchemaPath.scope);
+		contextScope = new RegisteredScope(defaultRowContextScope ?? contextWithCTEs.scope);
 
 		// Register mutation context variables in the scope (before evaluating expressions)
 		contextAttributes.forEach((attr, index) => {
@@ -613,7 +635,7 @@ export function buildInsertStmt(
 		});
 
 		// Build context value expressions using the context scope
-		const contextWithScope = { ...contextWithSchemaPath, scope: contextScope };
+		const contextWithScope = { ...contextWithCTEs, scope: contextScope };
 		stmt.contextValues.forEach((assignment) => {
 			const valueExpr = buildExpression(contextWithScope, assignment.value) as ScalarPlanNode;
 			mutationContextValues.set(assignment.name, valueExpr);
@@ -667,13 +689,10 @@ export function buildInsertStmt(
 
 	// Build the INSERT source — a unified QueryExpr (SELECT/VALUES/DML w/ RETURNING).
 	// Each branch produces a relational plan that the row-expansion projection
-	// then aligns to the target table columns. CTEs declared on the INSERT
-	// flow into the inner build via `parentCtes`.
-	let parentCtes: Map<string, CTEScopeNode> = new Map();
-	if (stmt.withClause) {
-		parentCtes = buildWithClause(contextWithSchemaPath, stmt.withClause);
-	}
-
+	// then aligns to the target table columns. Every branch builds on
+	// `contextWithCTEs`, so the statement's CTEs (its own and any inherited) are
+	// visible to a SELECT source, to a scalar subquery inside a VALUES row, and to a
+	// nested DML source alike.
 	let sourceNode: RelationalPlanNode;
 	if (preBuiltSource) {
 		// Multi-source view-insert decomposition: the source is a projection over the
@@ -684,7 +703,7 @@ export function buildInsertStmt(
 		case 'values': {
 			// Bare VALUES — no source-side column type-check; the row-expansion
 			// projection handles column-count and per-column type coercion.
-			sourceNode = buildValuesStmt(contextWithSchemaPath, stmt.source);
+			sourceNode = buildValuesStmt(contextWithCTEs, stmt.source);
 			const sourceCols = sourceNode.getType().columns;
 			if (sourceCols.length !== targetColumns.length) {
 				throw new QuereusError(`Column count mismatch in VALUES clause. Expected ${targetColumns.length} columns, got ${sourceCols.length}.`, StatusCode.ERROR, undefined, stmt.loc?.start.line, stmt.loc?.start.column);
@@ -692,7 +711,7 @@ export function buildInsertStmt(
 			break;
 		}
 		case 'select': {
-			const selectPlan = buildSelectStmt(contextWithSchemaPath, stmt.source, parentCtes);
+			const selectPlan = buildSelectStmt(contextWithCTEs, stmt.source);
 			if (selectPlan.getType().typeClass !== 'relation') {
 				throw new QuereusError('SELECT statement in INSERT did not produce a relational plan.', StatusCode.INTERNAL, undefined, stmt.loc?.start.line, stmt.loc?.start.column);
 			}
@@ -705,17 +724,17 @@ export function buildInsertStmt(
 			// consumed by the outer INSERT. The inner is built through its
 			// standard builder; the outer's row-expansion projection aligns the
 			// RETURNING columns to the outer target columns.
-			sourceNode = buildInsertStmt(contextWithSchemaPath, stmt.source) as RelationalPlanNode;
+			sourceNode = buildInsertStmt(contextWithCTEs, stmt.source) as RelationalPlanNode;
 			checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
 			break;
 		}
 		case 'update': {
-			sourceNode = buildUpdateStmt(contextWithSchemaPath, stmt.source) as RelationalPlanNode;
+			sourceNode = buildUpdateStmt(contextWithCTEs, stmt.source) as RelationalPlanNode;
 			checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
 			break;
 		}
 		case 'delete': {
-			sourceNode = buildDeleteStmt(contextWithSchemaPath, stmt.source) as RelationalPlanNode;
+			sourceNode = buildDeleteStmt(contextWithCTEs, stmt.source) as RelationalPlanNode;
 			checkColumnsAssignable(sourceNode.getType().columns, targetColumns, stmt);
 			break;
 		}
@@ -810,8 +829,11 @@ export function buildInsertStmt(
 	// Build UPSERT clause plans if present
 	let upsertClausePlans: UpsertClausePlan[] | undefined;
 	if (stmt.upsertClauses && stmt.upsertClauses.length > 0) {
+		// User-authored clause: built on the CTE-aware context so a `do update set
+		// w = (select … from c)` / `where (select … from c)` resolves the statement's
+		// CTEs, and so a `with schema` path reaches those subqueries.
 		upsertClausePlans = buildUpsertClausePlans(
-			ctx,
+			contextWithCTEs,
 			stmt.upsertClauses,
 			tableReference.tableSchema,
 			newAttributes
@@ -835,8 +857,10 @@ export function buildInsertStmt(
 	const resultNode: RelationalPlanNode = dmlExecutorNode;
 
 	if (stmt.returning && stmt.returning.length > 0) {
-		// Create returning scope with OLD/NEW attribute access
-		const returningScope = new RegisteredScope(ctx.scope);
+		// Create returning scope with OLD/NEW attribute access. Parented on the CTE-aware
+		// context's scope and built against that context, so a RETURNING subquery sees the
+		// statement's CTEs and its `with schema` path — matching buildUpdateStmt.
+		const returningScope = new RegisteredScope(contextWithCTEs.scope);
 
 		// Register OLD.* symbols (always NULL for INSERT)
 		oldAttributes.forEach((attr, columnIndex) => {
@@ -874,7 +898,7 @@ export function buildInsertStmt(
 			if (rc.type === 'all') {
 				// INSERT has no alias (only inline-subquery targets do, and those route
 				// through the view path); the star inherits NEW via the returning scope.
-				returningProjections.push(...expandReturningStar(ctx, rc, returningScope, tableReference.tableSchema, undefined));
+				returningProjections.push(...expandReturningStar(contextWithCTEs, rc, returningScope, tableReference.tableSchema, undefined));
 				continue;
 			}
 
@@ -893,7 +917,7 @@ export function buildInsertStmt(
 			validateReturningQualifiers(rc.expr, 'INSERT');
 
 			returningProjections.push({
-				node: buildExpression({ ...ctx, scope: returningScope }, rc.expr) as ScalarPlanNode,
+				node: buildExpression({ ...contextWithCTEs, scope: returningScope }, rc.expr) as ScalarPlanNode,
 				alias: alias
 			});
 		}

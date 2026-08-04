@@ -115,6 +115,33 @@ SELECT COUNT(*) as count FROM myapp.products;
 INSERT INTO products (id, name) VALUES (3, 'Thingamajig') WITH SCHEMA myapp RETURNING id, name, status;
 → [{"id":3,"name":"Thingamajig","status":"active"}]
 
+-- Test 17a: a SUBQUERY inside RETURNING also resolves on the statement's schema path.
+-- INSERT used to build RETURNING against the bare context, so an unqualified name in a
+-- RETURNING subquery ignored WITH SCHEMA and reported "not found in schema path: main"
+-- (UPDATE and DELETE already resolved it). `lookup` exists only in myapp, and is not
+-- touched by the insert, so the count is stable.
+CREATE TABLE myapp.lookup (k INTEGER PRIMARY KEY);
+INSERT INTO myapp.lookup VALUES (1), (2), (3);
+
+INSERT INTO products (id, name) VALUES (5, 'Whatsit') WITH SCHEMA myapp
+  RETURNING id, (SELECT COUNT(*) FROM lookup) AS n;
+→ [{"id":5,"n":3}]
+
+DELETE FROM myapp.products WHERE id = 5;
+
+-- Test 17b: the ON CONFLICT arm resolves the schema path too, but cannot yet EXECUTE a
+-- subquery in that position: `DmlExecutorNode` does not expose its ON CONFLICT
+-- expressions as optimizer-visible children, so their subquery subtrees are never
+-- rewritten. Separate root cause, reproduces with no WITH SCHEMA at all — tracked by
+-- `fix/bug-dml-side-expressions-invisible-to-optimizer`. Pinned as an error so this file
+-- fails loudly when that lands and this becomes a real assertion.
+INSERT INTO products (id, name) VALUES (3, 'Dupe')
+  ON CONFLICT (id) DO UPDATE SET name = (SELECT COUNT(*) FROM lookup)
+  WITH SCHEMA myapp RETURNING name;
+-- error: No emitter registered for Aggregate
+
+DROP TABLE myapp.lookup;
+
 -- ===================================
 -- Non-default schema: write-through a view whose home schema is not on the path
 -- The stored body's unqualified `products` must resolve next to the VIEW (myapp),

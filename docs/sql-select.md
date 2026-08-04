@@ -313,7 +313,7 @@ Quereus supports flexible schema resolution through search paths. Unqualified re
 3. **PRAGMA schema_path** - Session-level default search path
 4. **Default search order** - `main`, then `temp`
 
-**Tables, views and materialized views resolve identically.** The path applies to every unqualified relation name — in a `FROM` clause and as an `INSERT` / `UPDATE` / `DELETE` target alike. The path is walked **one schema at a time**, and each entry's tables *and* views are checked **together** before moving to the next entry; the first entry holding an object of that name wins, whatever its kind. So a table named `x` in an earlier path entry beats a view named `x` in a later one. (A table and a view of the same name inside one schema is impossible — `create table` and `create view` reject a name the other already holds.)
+**Tables, views and materialized views resolve identically.** The path applies to every unqualified relation name written *anywhere in the statement that declares it* — in a `FROM` clause, as an `INSERT` / `UPDATE` / `DELETE` target, and inside that statement's other clauses (a subquery in `RETURNING`, in an `INSERT`'s `VALUES` row, in `SET` / `WHERE`). The path is walked **one schema at a time**, and each entry's tables *and* views are checked **together** before moving to the next entry; the first entry holding an object of that name wins, whatever its kind. So a table named `x` in an earlier path entry beats a view named `x` in a later one. (A table and a view of the same name inside one schema is impossible — `create table` and `create view` reject a name the other already holds.)
 
 **Stored bodies are the exception:** a view / materialized-view body (like a CHECK-constraint or foreign-key body) resolves its unqualified names against the **owning object's schema first**, then the session default path — never the calling statement's `WITH SCHEMA` path. A view declared next to its tables in a non-`main` schema therefore reads correctly under any session path, and `refresh materialized view` is path-independent.
 
@@ -780,6 +780,21 @@ select ... from cte_name ...
 - A CTE that instead reads the **base table** another CTE writes is a different case: it
   is not defined whether it observes that write. Do not rely on either answer; see the
   gap list in `docs/runtime-caching.md`.
+
+**Visibility inside the declaring statement:**
+
+- A statement's own leading `WITH` clause is visible to **every clause of that statement**,
+  not only to the relation it selects from. For `INSERT` that means the source `SELECT`,
+  a scalar subquery inside a `VALUES` row, the `RETURNING` projections, the
+  `ON CONFLICT … DO UPDATE` assignments and `WHERE`, and the `WITH CONTEXT` assignments;
+  for `UPDATE` / `DELETE`, the `SET` / `WHERE` / `RETURNING` clauses. A view or
+  materialized-view target is included — the write-through rewrite carries the same CTEs.
+  (A *subquery* in `ON CONFLICT` or `WITH CONTEXT` currently resolves but does not yet
+  execute — an unrelated planner gap, tracked separately.)
+- **Schema-authored** expressions are deliberately excluded: a column `DEFAULT`, a
+  generated-column expression, and a `CHECK` constraint belong to the table's DDL rather
+  than to the statement, so `DEFAULT (SELECT count(*) FROM c)` always binds the real `c`
+  even when the inserting statement declares a CTE of that name.
 
 ```sql
 -- A writing CTE reading an earlier reading CTE
