@@ -180,11 +180,13 @@ export function buildUpdateStmt(
   // CHECK constraints, NOT NULL defaults, FK probes). Derived once here rather than
   // per call site; both clear the CTE namespace so none of that SQL can bind this
   // statement's common table expressions — its own leading `with` clause or ones it
-  // inherited from an enclosing statement. `schemaAuthoredUpdateCtx` keeps the table
-  // scope so `new.` / `old.` still resolve; `schemaAuthoredCtx` matches the bare `ctx`
-  // the FK builders already took (they narrow the schema path themselves).
-  const schemaAuthoredUpdateCtx = schemaAuthoredContext(updateCtx);
-  const schemaAuthoredCtx = schemaAuthoredContext(ctx);
+  // inherited from an enclosing statement — and both narrow the schema path to the
+  // target's own schema. `schemaAuthoredUpdateCtx` keeps the table scope so `new.` /
+  // `old.` still resolve; `schemaAuthoredCtx` matches the bare `ctx` the FK builders
+  // already took.
+  const targetSchemaName = tableReference.tableSchema.schemaName;
+  const schemaAuthoredUpdateCtx = schemaAuthoredContext(updateCtx, targetSchemaName);
+  const schemaAuthoredCtx = schemaAuthoredContext(ctx, targetSchemaName);
 
   // IMPORTANT: Build assignments FIRST to ensure parameter indices match SQL text order.
   // SQL: UPDATE t SET col = ?1 WHERE id = ?2

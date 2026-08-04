@@ -38,8 +38,10 @@ import type { PlanningContext } from './planning-context.js';
  *
  * The OTHER kind of stored, schema-authored SQL — a column `DEFAULT`, a generated-column
  * expression, a `CHECK` constraint, a synthesized foreign-key probe — is built INLINE in
- * the caller's statement rather than re-entered as its own plan, so it needs only the CTE
- * namespace cleared, never the home path or the `storedBodyOf` marker. See the sibling
+ * the caller's statement rather than re-entered as its own plan, so it keeps the caller's
+ * scope and never sets the `storedBodyOf` marker; it clears the CTE namespace and narrows
+ * the schema path more strictly than here (the owning table's schema ONLY, with no
+ * default-path fallback). See the sibling
  * {@link import('./building/schema-authored-context.js').schemaAuthoredContext}.
  *
  * Lives at the top level of `planner/` (not under `building/` or `mutation/`) because both

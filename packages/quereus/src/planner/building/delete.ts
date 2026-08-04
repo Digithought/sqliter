@@ -180,11 +180,12 @@ export function buildDeleteStmt(
   // parent-side FK probes). Derived once here rather than per call site; both clear the
   // CTE namespace so none of that SQL can bind this statement's common table
   // expressions — its own leading `with` clause or ones it inherited from an enclosing
-  // statement. `schemaAuthoredDeleteCtx` keeps the table scope so `old.` still resolves;
-  // `schemaAuthoredCtx` matches the bare `ctx` the FK builder already took (it narrows
-  // the schema path itself).
-  const schemaAuthoredDeleteCtx = schemaAuthoredContext(deleteCtx);
-  const schemaAuthoredCtx = schemaAuthoredContext(ctx);
+  // statement — and both narrow the schema path to the target's own schema.
+  // `schemaAuthoredDeleteCtx` keeps the table scope so `old.` still resolves;
+  // `schemaAuthoredCtx` matches the bare `ctx` the FK builder already took.
+  const targetSchemaName = tableReference.tableSchema.schemaName;
+  const schemaAuthoredDeleteCtx = schemaAuthoredContext(deleteCtx, targetSchemaName);
+  const schemaAuthoredCtx = schemaAuthoredContext(ctx, targetSchemaName);
 
   if (stmt.where) {
     const filterExpression = buildExpression(deleteCtx, stmt.where);

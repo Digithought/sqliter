@@ -442,6 +442,13 @@ export interface MsInsertAnalysis {
 	 * directly supplied; absent ⇒ a supplied view column threads the key.
 	 */
 	readonly keyDefault?: AST.Expression;
+	/**
+	 * The schema owning the ANCHOR BASE TABLE the {@link keyDefault} was declared on —
+	 * which may differ from the view's schema. It is the schema the default's own
+	 * unqualified relation names resolve against (`schemaAuthoredContext`), so it must
+	 * travel with the expression. Set exactly when `keyDefault` is.
+	 */
+	readonly keyDefaultSchemaName?: string;
 }
 
 /**
@@ -628,6 +635,7 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	}
 	const suppliedKeyIndex = supplied.findIndex(s => s.isKey);
 	let keyDefault: AST.Expression | undefined;
+	let keyDefaultSchemaName: string | undefined;
 	let keyEnvelopeIndex = -1;
 	if (needsSharedKey) {
 		if (suppliedKeyIndex >= 0) {
@@ -640,6 +648,9 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 			const anchorIndex = orderSides(sides).find(isActive)!;
 			const anchorKeyCol = columnByName(sides[anchorIndex].schema, keyColumns[anchorIndex]);
 			keyDefault = requireKeyDefault(view, sides[anchorIndex].schema, anchorKeyCol);
+			// The default is schema-authored on the anchor BASE table, not on the view —
+			// carry its owning schema so the build narrows the path to the right one.
+			keyDefaultSchemaName = sides[anchorIndex].schema.schemaName;
 		}
 	}
 
@@ -773,6 +784,7 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		suppliedColumns: supplied.map(s => ({ name: s.name, type: s.type })),
 		orderedSides: order.map(i => specByIndex.get(i)!),
 		keyDefault,
+		keyDefaultSchemaName,
 	};
 }
 

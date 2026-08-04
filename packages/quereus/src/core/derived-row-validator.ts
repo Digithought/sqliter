@@ -62,6 +62,7 @@ import type { MaintainedTableSchema } from '../schema/derivation.js';
 import { maintainedTableCheckViolationError, maintainedTableFkViolationError } from '../schema/constraint-builder.js';
 import { buildConstraintChecks } from '../planner/building/constraint-builder.js';
 import { buildChildSideFKChecks } from '../planner/building/foreign-key-builder.js';
+import { schemaAuthoredContext } from '../planner/building/schema-authored-context.js';
 import type { ConstraintCheck } from '../planner/nodes/constraint-check-node.js';
 import { PlanNode, type RowDescriptor, type ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { GlobalScope } from '../planner/scopes/global.js';
@@ -218,7 +219,12 @@ export function buildDerivedRowValidator(db: Database, mv: MaintainedTableSchema
 	const fks = mv.foreignKeys ?? [];
 	if (declaredChecks.length === 0 && fks.length === 0) return undefined;
 
-	const ctx = freshPlanningContext(db);
+	// Schema-authored build, exactly as the DML pipeline does it: the fresh context
+	// carries no schema path of its own, and `buildConstraintChecks` /
+	// `buildChildSideFKChecks` no longer narrow internally, so the wrapper is what makes
+	// an unqualified relation name inside a CHECK / FK probe resolve against the
+	// maintained table's OWN schema rather than the ambient default.
+	const ctx = schemaAuthoredContext(freshPlanningContext(db), mv.schemaName);
 	const oldAttributes = mv.columns.map(col => ({
 		id: PlanNode.nextAttrId(),
 		name: col.name,

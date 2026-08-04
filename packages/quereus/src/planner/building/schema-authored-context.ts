@@ -5,10 +5,14 @@ import type { PlanningContext } from '../planning-context.js';
  * `DEFAULT`, a generated-column expression, a `CHECK` constraint, or a synthesized
  * foreign-key probe. All four are written in the TABLE's definition, not in the
  * statement doing the write, so their unqualified relation names must always mean
- * real schema objects. Clears the two CTE-related fields so no statement's common
- * table expressions — the writing statement's own leading `with` clause, or ones it
- * inherited from an enclosing statement — can shadow a real table out from under
- * someone else's DDL:
+ * real schema objects, and must mean the SAME ones no matter where the writing
+ * statement happens to be pointed. `schemaName` is the OWNING table's schema (for the
+ * anchor key default on a view write-through, the anchor BASE table's schema — not
+ * the view's).
+ *
+ * Clears the two CTE-related fields so no statement's common table expressions — the
+ * writing statement's own leading `with` clause, or ones it inherited from an enclosing
+ * statement — can shadow a real table out from under someone else's DDL:
  *
  *  - `cteNodes` → cleared, so `default (select count(*) from c)` keeps meaning the
  *    real table `c` even under `with c as (…) insert into t …`. Clearing on the
@@ -21,18 +25,25 @@ import type { PlanningContext } from '../planning-context.js';
  *    `check` subquery's own `with` clause would collide on a single entry and the
  *    schema-authored SQL would read the caller's relation.
  *
+ * And narrows the schema search path:
+ *
+ *  - `schemaPath` → `[schemaName]` exactly, the owning schema ONLY with no fallback to
+ *    the session default path. So `default (select count(*) from c)` on a `temp` table
+ *    means `temp.c` whatever schema path the writing statement carries (the session
+ *    `pragma schema_path`, or a per-statement `insert … with schema …`). This is the
+ *    single place that decides it, for all four expression kinds — the constraint and
+ *    foreign-key builders used to narrow themselves, which is exactly why a table's
+ *    `check` and its column `default` could disagree about the same bare name. It is
+ *    deliberately stricter than a stored view body's `Database._homeSchemaPath()` (home
+ *    schema first, then the session default path): a schema-authored expression that
+ *    names a relation in another schema must qualify it. See docs/schema.md.
+ *
  * It deliberately does NOT touch:
  *
  *  - `scope` — `buildWithContext` contributes CTE *definitions* only, never scope
  *    symbols, so the scope is not a leak channel. `building/update.ts` and
  *    `building/delete.ts` must keep their table scope for `new.` / `old.` resolution,
  *    so this is applied ON TOP of those contexts rather than instead of them.
- *  - `schemaPath` — `buildConstraintChecks` and both foreign-key builders already
- *    narrow to `[tableSchema.schemaName]` themselves. Column defaults and generated
- *    columns do not (they ride the statement's `with schema` path), which is a real and
- *    observed wrong answer when both schemas hold the named relation — tracked as
- *    `bug-column-default-ignores-owning-table-schema`, whose likely fix is to narrow
- *    here. See also the NOTE at the row-expansion call site in `building/insert.ts`.
  *  - `storedBodyOf` — these expressions are built INLINE in the caller's statement,
  *    not as a re-entered stored body. Setting it would wrongly make a
  *    {@link import('../../parser/ast.js').StoredBodyEnv} marker inert.
@@ -41,9 +52,15 @@ import type { PlanningContext } from '../planning-context.js';
  * the same job for the other kind of stored, schema-authored SQL: view and
  * materialized-view bodies. That one isolates the WHOLE naming environment (home
  * schema path, stored-body marker) because a body is re-entered as its own plan; this
- * one clears only the CTE namespace because these expressions stay inline.
+ * one keeps the caller's scope because these expressions stay inline.
+ *
+ * @param schemaName the owning table's schema name — REQUIRED, so no call site can
+ *   silently inherit the writing statement's path.
  */
-export function schemaAuthoredContext(ctx: PlanningContext): PlanningContext {
-	if (!ctx.cteNodes && !ctx.cteReferenceCache) return ctx;
-	return { ...ctx, cteNodes: undefined, cteReferenceCache: undefined };
+export function schemaAuthoredContext(ctx: PlanningContext, schemaName: string): PlanningContext {
+	// Identity fast-path only when nothing would actually change: the CTE namespace is
+	// already empty AND the path is already exactly the owning schema.
+	if (!ctx.cteNodes && !ctx.cteReferenceCache
+		&& ctx.schemaPath?.length === 1 && ctx.schemaPath[0] === schemaName) return ctx;
+	return { ...ctx, cteNodes: undefined, cteReferenceCache: undefined, schemaPath: [schemaName] };
 }

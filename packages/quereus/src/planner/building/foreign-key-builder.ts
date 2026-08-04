@@ -293,8 +293,9 @@ export function buildChildSideFKChecks(
 		if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(tableSchema.schemaName);
 
 		try {
-			const constraintSchemaPath = [tableSchema.schemaName];
-			const constraintCtx = { ...ctx, scope: constraintScope, schemaPath: constraintSchemaPath };
+			// Search path already narrowed to the table's own schema by
+			// `schemaAuthoredContext` — see the note in `buildConstraintChecks`.
+			const constraintCtx = { ...ctx, scope: constraintScope };
 
 			const expression = buildExpression(constraintCtx, existsExpr) as ScalarPlanNode;
 
@@ -422,8 +423,9 @@ export function buildParentSideFKChecks(
 		if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(tableSchema.schemaName);
 
 		try {
-			const constraintSchemaPath = [tableSchema.schemaName];
-			const constraintCtx = { ...ctx, scope: constraintScope, schemaPath: constraintSchemaPath };
+			// Search path already narrowed to the table's own schema by
+			// `schemaAuthoredContext` — see the note in `buildConstraintChecks`.
+			const constraintCtx = { ...ctx, scope: constraintScope };
 
 			const expression = buildExpression(constraintCtx, notExistsExpr) as ScalarPlanNode;
 

@@ -161,10 +161,13 @@ export function buildConstraintChecks(
     }
 
     try {
-      // Create a context with the table's schema in the search path
-      // This ensures unqualified table references in subqueries resolve to the same schema
-      const constraintSchemaPath = [tableSchema.schemaName];
-      const constraintCtx = { ...ctx, scope: constraintScope, schemaPath: constraintSchemaPath };
+      // The search path is already narrowed to the table's own schema by
+      // `schemaAuthoredContext` (building/schema-authored-context.ts) — the ONE place that
+      // decides it for every schema-authored expression kind. Every caller reaches here
+      // through a context derived from it (`core/derived-row-validator.ts` included), so
+      // do not re-narrow: a second copy is how the CHECK and the column DEFAULT on one
+      // table drifted apart in the first place.
+      const constraintCtx = { ...ctx, scope: constraintScope };
 
       // Fold table-qualified self-references (`check (t.qty > 0)`) to the bare
       // column form the row-context scope registers. Done as an AST rewrite on a

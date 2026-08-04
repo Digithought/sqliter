@@ -18,6 +18,7 @@ import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.j
 import { validateAddColumnGeneratedRefs } from '../../schema/table.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { planViewBody } from './create-view.js';
+import { schemaAuthoredContext } from './schema-authored-context.js';
 
 export function buildAlterTableStmt(
   ctx: PlanningContext,
@@ -305,12 +306,15 @@ function buildAddColumnBackfill(
     sourceRelation: 'add-column-backfill',
   }));
   const rowScope = buildRowDefaultScope(ctx.scope, tableSchema.columns, rowAttrs);
-  // NOTE: this is schema-authored SQL built on the caller's context, but it does NOT go
-  // through `schemaAuthoredContext` (building/schema-authored-context.ts) because ALTER
-  // can never carry CTE definitions: it is not an `AST.QueryExpr`, so it cannot be a CTE
-  // body, and it has no `with` clause of its own. If ALTER ever becomes nestable, wrap
-  // this context the way the three DML builders do.
-  const node = buildExpression({ ...ctx, scope: rowScope }, sourceExpr) as ScalarPlanNode;
+  // Schema-authored SQL, wrapped exactly as the three DML builders wrap theirs, so the
+  // backfill expression resolves bare relation names against the altered table's own
+  // schema — not whatever path the ALTER runs on. The CTE half of the wrapper is inert
+  // here (ALTER is not an `AST.QueryExpr`, so it can neither be a CTE body nor carry a
+  // `with` clause of its own); the schema-path half is the load-bearing part.
+  const node = buildExpression(
+    { ...schemaAuthoredContext(ctx, tableSchema.schemaName), scope: rowScope },
+    sourceExpr,
+  ) as ScalarPlanNode;
 
   // Same validator each arm's write-path build site uses, so an ALTER accepts exactly
   // what the equivalent CREATE TABLE + INSERT accepts. Both honour

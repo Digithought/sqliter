@@ -357,6 +357,14 @@ export interface DecompInsertAnalysis {
 	 * logical-tuple (supplied) key.
 	 */
 	readonly keyDefault?: AST.Expression;
+	/**
+	 * The schema owning the ANCHOR MEMBER's base table — where {@link keyDefault} was
+	 * declared, which may differ from the logical table's own schema. It is the schema
+	 * the default's unqualified relation names resolve against
+	 * (`schemaAuthoredContext`), so it must travel with the expression. Set exactly
+	 * when `keyDefault` is.
+	 */
+	readonly keyDefaultSchemaName?: string;
 }
 
 /** One supplied logical column routed to its backing member. */
@@ -417,7 +425,7 @@ export function analyzeDecompositionInsert(
 	// supplied logical PK. `keyEnvelopeIndex` is the envelope column every member's key
 	// column reads (the default-sourced column for a surrogate, the supplied PK column
 	// for a logical-tuple, or undefined for the singleton empty key).
-	const { keyEnvelopeIndex, keyDefault } = resolveInsertSharedKey(view, shape, memberRefs, routed);
+	const { keyEnvelopeIndex, keyDefault, keyDefaultSchemaName } = resolveInsertSharedKey(view, shape, memberRefs, routed);
 
 	// Member ops, anchor first (FK-order root: members may FK-reference the anchor).
 	const ops: DecompInsertOp[] = [];
@@ -431,6 +439,7 @@ export function analyzeDecompositionInsert(
 		suppliedColumns: routed.map(r => ({ name: r.name, type: r.type })),
 		ops,
 		keyDefault,
+		keyDefaultSchemaName,
 	};
 }
 
@@ -486,7 +495,11 @@ function resolveInsertSharedKey(
 	shape: DecompShape,
 	memberRefs: ReadonlyMap<string, TableReferenceNode>,
 	routed: readonly RoutedInsertColumn[],
-): { keyEnvelopeIndex: number | undefined; keyDefault: DecompInsertAnalysis['keyDefault'] } {
+): {
+	keyEnvelopeIndex: number | undefined;
+	keyDefault: DecompInsertAnalysis['keyDefault'];
+	keyDefaultSchemaName: DecompInsertAnalysis['keyDefaultSchemaName'];
+} {
 	const sharedKey = shape.storage.sharedKey;
 	const anchor = shape.anchor;
 
@@ -507,13 +520,17 @@ function resolveInsertSharedKey(
 		return {
 			keyEnvelopeIndex: routed.length, // the default-sourced column is appended last
 			keyDefault,
+			// Schema-authored on the anchor's BASE table, not on the logical table — carry
+			// its owner so the build narrows the path to the right schema.
+			keyDefaultSchemaName: anchorRef.tableSchema.schemaName,
 		};
 	}
 
 	// logical-tuple: the supplied logical PK threads to every member's key column.
 	const anchorKeys = memberKeyColumns(view, shape, anchor);
 	if (anchorKeys.length === 0) {
-		return { keyEnvelopeIndex: undefined, keyDefault: undefined }; // singleton — no key to thread
+		// singleton — no key to thread
+		return { keyEnvelopeIndex: undefined, keyDefault: undefined, keyDefaultSchemaName: undefined };
 	}
 	const anchorKeyCol = anchorKeys[0].toLowerCase();
 	const keyRouted = routed.find(r => r.columnar
@@ -526,7 +543,7 @@ function resolveInsertSharedKey(
 			message: `cannot insert into logical table '${view.name}': the logical-tuple shared key (anchor '${anchor.relationId}' column '${anchorKeys[0]}') is not supplied through the logical table; a logical-tuple key threads the supplied value, so it must be provided`,
 		});
 	}
-	return { keyEnvelopeIndex: keyRouted.envelopeIndex, keyDefault: undefined };
+	return { keyEnvelopeIndex: keyRouted.envelopeIndex, keyDefault: undefined, keyDefaultSchemaName: undefined };
 }
 
 /**

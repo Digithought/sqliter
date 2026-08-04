@@ -743,21 +743,16 @@ export function buildInsertStmt(
 		}
 	}
 
-	// Contexts for the table's OWN schema-authored SQL (column defaults, generated
+	// The context for the table's OWN schema-authored SQL (column defaults, generated
 	// columns, CHECK constraints, FK probes). Derived once here rather than per call
-	// site; both clear the CTE namespace so none of that SQL can bind a statement's
-	// common table expressions. Two of them only because the existing call sites differ
-	// in which schema path they ride — see the NOTE at the row-expansion call below.
-	const schemaAuthoredCtx = schemaAuthoredContext(ctx);
-	const schemaAuthoredPathCtx = stmt.schemaPath ? schemaAuthoredContext(contextWithSchemaPath) : schemaAuthoredCtx;
+	// site: it clears the CTE namespace so none of that SQL can bind a statement's common
+	// table expressions, and narrows the schema path to the target's own schema so every
+	// kind resolves bare relation names identically — the statement's `with schema` path
+	// is deliberately irrelevant to all of them.
+	const schemaAuthoredCtx = schemaAuthoredContext(ctx, tableReference.tableSchema.schemaName);
 
 	// ORTHOGONAL ROW EXPANSION: Apply uniform row expansion to map any source to table structure with defaults
-	// NOTE: defaults / generated columns ride the STATEMENT's `with schema` path, while
-	// the constraint and FK builders below narrow to the table's own schema themselves.
-	// That asymmetry is pre-existing and DOES produce a wrong answer when both schemas
-	// hold the named relation (a `temp` table's default reads `main`'s copy while its own
-	// `check` reads `temp`'s) — tracked as `bug-column-default-ignores-owning-table-schema`.
-	const expandedSourceNode = createRowExpansionProjection(schemaAuthoredPathCtx, sourceNode, targetColumns, tableReference, contextScope, defaultRowContextScope);
+	const expandedSourceNode = createRowExpansionProjection(schemaAuthoredCtx, sourceNode, targetColumns, tableReference, contextScope, defaultRowContextScope);
 
 	// Update targetColumns to reflect all table columns since we've expanded the source
 	const finalTargetColumns = tableReference.tableSchema.columns.map(col => columnSchemaToDef(col.name, col));

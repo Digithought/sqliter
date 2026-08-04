@@ -760,7 +760,7 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 	});
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
-	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.suppliedColumns);
+	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.keyDefaultSchemaName, plan.suppliedColumns);
 
 	return new ViewMutationNode(ctx.scope, baseOps, undefined, {
 		source: envelopeSource,
@@ -851,7 +851,7 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 	}
 
 	const envelopeSource = buildEnvelopeSource(ctx, view, stmt, plan.suppliedColumns.length);
-	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.suppliedColumns);
+	const keyDefault = buildKeyDefault(ctx, view, plan.keyDefault, plan.keyDefaultSchemaName, plan.suppliedColumns);
 
 	return new ViewMutationNode(ctx.scope, baseOps, undefined, {
 		source: envelopeSource,
@@ -921,6 +921,7 @@ function buildKeyDefault(
 	ctx: PlanningContext,
 	view: MutableViewLike,
 	keyDefault: AST.Expression | undefined,
+	keyDefaultSchemaName: string | undefined,
 	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
 ): { node: ScalarPlanNode; rowDescriptor: RowDescriptor } | undefined {
 	if (!keyDefault) return undefined;
@@ -938,10 +939,17 @@ function buildKeyDefault(
 
 	// SCHEMA-authored: this is the anchor key column's own declared `default`, so — like
 	// every other default / generated column / CHECK / FK probe — it resolves relation
-	// names against the schema, never against a statement's common table expressions.
-	// This is the ONE schema-authored build the decomposition lowering does itself; the
-	// per-member base ops re-enter `buildInsertStmt`, which clears the namespace there.
-	const node = buildExpression({ ...schemaAuthoredContext(ctx), scope: rowScope }, keyDefault) as ScalarPlanNode;
+	// names against the schema, never against a statement's common table expressions,
+	// and against the ANCHOR BASE TABLE's schema (`keyDefaultSchemaName` — the view may
+	// live in a different one) rather than the writing statement's path. This is the ONE
+	// schema-authored build the decomposition lowering does itself; the per-member base
+	// ops re-enter `buildInsertStmt`, which narrows and clears the namespace there.
+	// NOTE: both analyses set `keyDefaultSchemaName` exactly when they set the expression,
+	// so this fallback is unreachable today. If a third analysis ever produces a key
+	// default without one, it would silently resolve on the VIEW's schema instead of the
+	// anchor's — make the field required on the analysis types rather than widening this.
+	const anchorSchemaName = keyDefaultSchemaName ?? view.schemaName;
+	const node = buildExpression({ ...schemaAuthoredContext(ctx, anchorSchemaName), scope: rowScope }, keyDefault) as ScalarPlanNode;
 	if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
 		validateDeterministicDefault(node, '<shared key>', view.name);
 	}
