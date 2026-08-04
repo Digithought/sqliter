@@ -13,7 +13,8 @@ import { TableReferenceNode } from '../nodes/reference.js';
 import * as AST from '../../parser/ast.js';
 import { validateDeterministicConstraint } from '../validation/determinism-validator.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
-import { stripSelfQualifierInCheckExpression, type ResolveColumnInSource } from '../../schema/rename-rewriter.js';
+import { stripSelfQualifierInCheckExpression } from '../../schema/rename-rewriter.js';
+import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { cloneExpr } from '../mutation/scope-transform.js';
 
 /**
@@ -66,8 +67,7 @@ export function buildConstraintChecks(
   const applicableConstraints = [...tableSchema.checkConstraints, ...additionalConstraints]
     .filter(constraint => shouldCheckConstraint(constraint, operation));
 
-  const resolveColumnInSource: ResolveColumnInSource = (schemaName, tableName, columnName) =>
-    ctx.schemaManager.getSchema(schemaName)?.getTable(tableName)?.columnIndexMap.has(columnName.toLowerCase()) ?? false;
+  const resolveColumnInSource = buildColumnSourceResolver(ctx.schemaManager);
 
   // Build expression nodes for each constraint
   return applicableConstraints.map(constraint => {

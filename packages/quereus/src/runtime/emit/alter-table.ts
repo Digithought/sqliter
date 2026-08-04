@@ -21,7 +21,7 @@ import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
-import { buildColumnSourceResolver } from './column-source-resolver.js';
+import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn } from './drop-column-guards.js';
 import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
@@ -378,7 +378,7 @@ async function runRenameColumn(
 	// this probe runs pre-mutation while the propagation runs post-) is that
 	// `isTableInUnaliasedScope` skips the renamed table itself and probes only OTHER
 	// sources, whose column sets this rename does not touch.
-	const resolveColumnInSource = buildColumnSourceResolver(rctx.db);
+	const resolveColumnInSource = buildColumnSourceResolver(rctx.db.schemaManager);
 	assertRenameDependentsPersistable(rctx.db, schema,
 		ast => renameColumnInAst(
 			ast, tableSchema.name, oldName, newName, tableSchema.schemaName, resolveColumnInSource),

@@ -72,6 +72,36 @@ drop table DcAnon;
 -- run
 
 -- ===================================================================
+-- 2b. A COLUMN-LEVEL unnamed CHECK is auto-named `_check_<column>` at
+--     declaration time, so unlike §2 it DOES have a name to address.
+-- ===================================================================
+--
+-- The asymmetry with §2 is deliberate and worth pinning: `constraint-builder.ts` names a
+-- column-level CHECK `_check_<column>` when it lifts it to the table's constraint list,
+-- and that name is stored, so the refusal quotes it and `DROP CONSTRAINT` can resolve it.
+-- A column's OWN inline CHECK is refused like any other — the guard does not special-case
+-- "this CHECK only exists because of the column being dropped".
+
+create table DcCol (id integer primary key, a integer check (a > 0), b integer);
+insert into DcCol values (1, 5, 6);
+-- run
+
+alter table DcCol drop column a;
+-- error: CHECK constraint '_check_a'
+
+-- Still enforcing, so nothing was half-applied.
+insert into DcCol values (2, -1, 6);
+-- error: _check_a
+
+alter table DcCol drop constraint _check_a;
+alter table DcCol drop column a;
+select b from DcCol;
+→ [{"b":6}]
+
+drop table DcCol;
+-- run
+
+-- ===================================================================
 -- 3. A CHECK that does NOT name the dropped column is no obstacle, and
 --    still enforces over its own column afterwards.
 -- ===================================================================

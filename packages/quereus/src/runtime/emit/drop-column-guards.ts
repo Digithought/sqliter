@@ -4,7 +4,7 @@ import { StatusCode } from '../../common/types.js';
 import type { TableSchema } from '../../schema/table.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { columnReferencedInAst, columnReferencedInCheckExpression } from '../../schema/rename-rewriter.js';
-import { buildColumnSourceResolver } from './column-source-resolver.js';
+import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 
 /**
  * The two `ALTER TABLE … DROP COLUMN` guards over **expression** dependents that
@@ -55,13 +55,20 @@ import { buildColumnSourceResolver } from './column-source-resolver.js';
  * Only the constraints on `tableSchema.checkConstraints` at drop time are probed —
  * the user's declared set. Lens- and FK-synthesized entries are attached to a write
  * plan's constraint list, not to the catalog entry this reads.
+ *
+ * KNOWN GAP: a CHECK that names the column through the reserved row-image qualifiers —
+ * `check (new.a > 0)`, `check on delete (old.a > 0)` — is NOT caught, because the walk
+ * resolves a qualifier against FROM scopes and `new` / `old` bind to neither. The drop is
+ * accepted and the table is then unwritable. RENAME COLUMN misses the same references, so
+ * the equivalence above still holds; both are fixed at the one walk site, tracked by
+ * `bug-check-constraint-new-old-qualifier-invisible-to-column-rename`.
  */
 export function assertNoCheckConstraintNamesColumn(
 	db: Database,
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
-	const resolveColumnInSource = buildColumnSourceResolver(db);
+	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
 	for (const check of tableSchema.checkConstraints ?? []) {
 		if (!columnReferencedInCheckExpression(
 			check.expr, tableSchema.name, columnName, tableSchema.schemaName, resolveColumnInSource)) continue;
@@ -103,7 +110,7 @@ export function assertNoAssertionNamesColumn(
 ): void {
 	const schema = db.schemaManager.getSchema(tableSchema.schemaName);
 	if (!schema) return;
-	const resolveColumnInSource = buildColumnSourceResolver(db);
+	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
 	for (const assertion of schema.getAllAssertions()) {
 		// An assertion with no `checkExpression` has no AST to scan and is skipped,
 		// exactly as the rename propagation and `assertNoAssertionDependsOn` skip it.

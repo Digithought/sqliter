@@ -497,6 +497,11 @@ const PROBE_COLUMN_NAME = '__quereus_column_probe__';
  * "does this body name `t.v`?" gets `true` for a body whose only `v` is
  * another table's. Every caller should pass the catalog-backed resolver
  * (`buildColumnSourceResolver`).
+ *
+ * NOTE: one spine clone plus one walk per probe, and the DROP COLUMN guard probes every
+ * live assertion. Trivial at the handful-of-assertions scale schemas have today, and it
+ * only runs on DDL; if a schema ever carries assertions by the hundred, filter by
+ * `tableReferencedInAst` (no clone) before paying for the column probe.
  */
 export function columnReferencedInAst(
 	node: AST.AstNode | undefined,
