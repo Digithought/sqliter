@@ -16,7 +16,6 @@ import type { Scope } from '../scopes/scope.js';
 import { resolveFunctionSchema } from './schema-resolution.js';
 import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { expressionToString, expressionToIdentityString } from '../../emit/ast-stringify.js';
-import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
 import { buildOrdinalAwareExpression, resolveOrdinalReference, type SelectListEntry } from './select-ordinal.js';
 
 /**
@@ -436,6 +435,16 @@ function createAggregateOutputScope(
 
 	// Register aggregate columns by their aliases. An alias colliding with a
 	// group-key base name (or another alias) is ambiguous as a bare reference.
+	//
+	// NOTE: an un-aliased aggregate's `alias` is its whole rendered expression, and
+	// this key is lowercased — so two aggregates differing only in a quoted literal's
+	// case (`count(nullif(b,'A'))` / `count(nullif(b,'a'))`) register one ambiguous
+	// key here even though they are correctly distinct aggregates. Harmless today:
+	// nothing resolves an aggregate through this scope by its rendered text (HAVING /
+	// ORDER BY / window specs go through `findMatchingAggregate`, which compares
+	// literal-exact identity strings), and only a quoted identifier spelled exactly
+	// like the rendering could reach it. If such a lookup path is ever added, key
+	// these registrations off `expressionToIdentityString` instead of `toLowerCase`.
 	aggregates.forEach((agg, index) => {
 		const columnIndex = groupByExpressions.length + index;
 		const attr = aggregateAttributes[columnIndex];
@@ -814,8 +823,7 @@ function dedupeNewAggregates(
 	const existingKeys = new Set<string>();
 	for (const agg of existingAggregates) {
 		if (CapabilityDetectors.isAggregateFunction(agg.expression)) {
-			const aggNode = agg.expression as AggregateFunctionCallNode;
-			existingKeys.add(expressionToIdentityString(aggNode.expression));
+			existingKeys.add(expressionToIdentityString(agg.expression.expression));
 		}
 	}
 

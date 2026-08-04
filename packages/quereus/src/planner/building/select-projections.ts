@@ -11,7 +11,6 @@ import { WindowFunctionCallNode } from '../nodes/window-function.js';
 import { type RelationalPlanNode } from '../nodes/plan-node.js';
 import type { Scope } from '../scopes/scope.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
-import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
 import { validateAuthoredInverses, resultColumnOutputName } from '../analysis/authored-inverse.js';
 
 /**
@@ -108,20 +107,19 @@ function collectInnerAggregates(
 	aggregates: { expression: ScalarPlanNode; alias: string }[]
 ): void {
 	if (CapabilityDetectors.isAggregateFunction(node)) {
-		const funcNode = node as AggregateFunctionCallNode;
-		const key = expressionToIdentityString(funcNode.expression);
-		// Deduplicate against existing entries, by identity key rather than the
-		// alias text — the array may also hold direct (non-wrapped) aggregate
-		// entries pushed elsewhere, so guard the cast rather than assume every
-		// entry is an aggregate.
+		const key = expressionToIdentityString(node.expression);
+		// Deduplicate against existing entries by identity key rather than the alias
+		// text — the alias is the un-folded rendering, so comparing it case-blind
+		// would collapse two aggregates differing only in a quoted literal's case.
+		// The array may also hold non-aggregate entries, so the guard is a filter.
 		const alreadyPresent = aggregates.some(a =>
 			CapabilityDetectors.isAggregateFunction(a.expression) &&
-			expressionToIdentityString((a.expression as AggregateFunctionCallNode).expression) === key
+			expressionToIdentityString(a.expression.expression) === key
 		);
 		if (!alreadyPresent) {
 			aggregates.push({
-				expression: funcNode,
-				alias: expressionToString(funcNode.expression)
+				expression: node,
+				alias: expressionToString(node.expression)
 			});
 		}
 		return; // Don't recurse into aggregate arguments

@@ -55,8 +55,7 @@ export function findMatchingAggregate(ctx: PlanningContext, expr: AST.FunctionEx
 	const exprKey = expressionToIdentityString(expr);
 	for (const agg of ctx.aggregates) {
 		if (!CapabilityDetectors.isAggregateFunction(agg.expression)) continue;
-		const aggFuncNode = agg.expression as AggregateFunctionCallNode;
-		if (expressionToIdentityString(aggFuncNode.expression) === exprKey) return agg;
+		if (expressionToIdentityString(agg.expression.expression) === exprKey) return agg;
 	}
 
 	return undefined;

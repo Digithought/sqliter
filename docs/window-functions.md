@@ -57,6 +57,15 @@ restriction as the rest of the select list, checked at plan time
 (`assertGroupByCoverage`, shared with the select-list and HAVING checks in
 `select-aggregates.ts`).
 
+An aggregate inside a window specification of a grouped query must be one the select
+list already computes — the window runs *above* the aggregation, so there is nothing
+left to aggregate. Matching uses the same structural rule as HAVING (see
+[SELECT § 3.4](sql-select.md#34-having-clause)): identifier case is folded, literals
+and qualifiers compare exactly. A spelling that does not match any select-list
+aggregate is rejected at plan time — `Aggregate function <name> in a window function's
+<PARTITION BY | ORDER BY | arguments> is only supported when the same aggregate also
+appears in the SELECT list` — rather than silently binding to a different aggregate.
+
 ### Runtime Layer (`src/runtime/emit/window.ts`)
 
 Complete implementation following Titan architecture principles:

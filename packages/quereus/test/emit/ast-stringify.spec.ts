@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { parse } from '../../src/parser/index.js';
-import { astToString, createTableToString, createViewToString } from '../../src/emit/ast-stringify.js';
+import { astToString, createTableToString, createViewToString, expressionToIdentityString, expressionToString } from '../../src/emit/ast-stringify.js';
 import type {
 	CreateTableStmt,
 	CreateViewStmt,
@@ -11,6 +11,7 @@ import type {
 	DeclaredTable,
 	DeclaredView,
 	DeleteStmt,
+	Expression,
 	InsertStmt,
 	SelectStmt,
 	TableConstraint,
@@ -452,6 +453,59 @@ describe('Emit: ast-stringify AST round-trip', () => {
 			const reparsed = parse(emitted) as UpdateStmt;
 			expect(reparsed.targetSource!.columns).to.deep.equal(['k', 'c']);
 			expect(astToString(reparsed)).to.equal(emitted);
+		});
+	});
+
+	describe('expressionToIdentityString', () => {
+		// The aggregate-identity fingerprint the planner compares HAVING / ORDER BY /
+		// window-spec aggregates against the SELECT list's. It must fold identifier case
+		// (column resolution is case-insensitive) while leaving every literal byte-exact
+		// (a quoted value's case is part of what the aggregate computes).
+
+		const exprOf = (sqlExpr: string): Expression => {
+			const stmt = parse(`select ${sqlExpr} from t`) as SelectStmt;
+			const col = stmt.columns[0];
+			if (col.type !== 'column') throw new Error(`expected an expression result column for: ${sqlExpr}`);
+			return col.expr;
+		};
+		const identity = (sqlExpr: string): string => expressionToIdentityString(exprOf(sqlExpr));
+
+		it('folds identifier case', () => {
+			expect(identity('sum(B)')).to.equal(identity('sum(b)'));
+		});
+
+		it('folds qualifier case', () => {
+			expect(identity('sum(W.b)')).to.equal(identity('sum(w.B)'));
+		});
+
+		it('preserves string-literal case', () => {
+			expect(identity("count(nullif(b,'A'))")).to.not.equal(identity("count(nullif(b,'a'))"));
+		});
+
+		it('preserves string-literal case inside nested shapes', () => {
+			// `case` / `between` / `in` recurse through their own fold arms — a literal
+			// buried in any of them must survive the recursion unfolded.
+			expect(identity("sum(case when b = 'A' then 1 else 0 end)"))
+				.to.not.equal(identity("sum(case when b = 'a' then 1 else 0 end)"));
+			expect(identity("count(nullif(b, cast('A' as text)))"))
+				.to.not.equal(identity("count(nullif(b, cast('a' as text)))"));
+		});
+
+		it('ignores whitespace and redundant parens', () => {
+			expect(identity('sum(  (b)  )')).to.equal(identity('sum(b)'));
+		});
+
+		it('distinguishes DISTINCT participation', () => {
+			expect(identity('count(distinct b)')).to.not.equal(identity('count(b)'));
+		});
+
+		it('does not mutate the input AST', () => {
+			const expr = exprOf("count(nullif(B,'A'))");
+			const before = expressionToString(expr);
+			expressionToIdentityString(expr);
+			expect(expressionToString(expr), 'original casing survives fingerprinting').to.equal(before);
+			expect(before).to.include("'A'");
+			expect(before).to.match(/\bB\b/);
 		});
 	});
 });

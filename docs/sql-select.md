@@ -651,6 +651,8 @@ having condition
 
 The condition is applied after grouping, allowing filtering on aggregate values. References to columns are restricted: only columns that appear in `group by` and aggregate expressions are valid; bare references to ungrouped columns raise an error. The same restriction applies to the implicit single group when the query has aggregates but no `group by`.
 
+**Reusing a select-list aggregate.** An aggregate spelled out in `having` (or in a top-level `order by`, or in a window specification of the same query) reads the value the select list already computed when the two spellings denote the *same* aggregate; otherwise it is computed as an additional aggregate. Sameness is structural: column and table names compare case-insensitively (`sum(B)` is `sum(b)`), whitespace and redundant parentheses are ignored, and `distinct` participates — but every literal compares exactly, so `count(nullif(b, 'A'))` and `count(nullif(b, 'a'))` are two different aggregates. A qualifier is part of the spelling too: `sum(w.b)` and `sum(b)` do not match even when `w` is the only table in scope, so the `having` / `order by` form simply computes its own aggregate over the same column.
+
 **Examples:**
 ```sql
 -- Filter groups with HAVING
