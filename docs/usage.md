@@ -472,10 +472,11 @@ internal `addConstraint` round-trip per inline constraint, but those calls are m
 engine-internal and announce nothing.
 
 The event is raised on the statement's **success** path only — an ALTER that throws announces
-nothing at all — with one known exception on backends that emit for themselves: an `add column`
-that gets past its own module call and then fails while installing an inline constraint leaves
-its event behind (tracked as `alter-add-column-revert-leaks-schema-event`). Like every other
-event, delivery is batched to commit and dropped on rollback.
+nothing at all, on every backend. This holds even when the failure lands *after* a
+self-emitting backend has already announced the change (an `add column` that gets past its own
+module call, then fails installing an inline constraint): the engine scopes each ALTER
+statement's schema events and retracts them as the error propagates. Like every other event,
+delivery is batched to commit and dropped on rollback.
 
 Two arm families report nothing on either path: the metadata-tag arms (`set tags`, `add tags`,
 `drop tags`) and the materialized-view lifecycle arms (`set maintained`, `drop maintained`).

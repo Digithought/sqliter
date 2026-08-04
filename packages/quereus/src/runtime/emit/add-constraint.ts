@@ -10,7 +10,7 @@ import { assertConstraintNameFree, opsToMask, requireVtabModule } from '../../sc
 import { buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
-import { emitAlterSchemaEvent } from './alter-schema-event.js';
+import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
 
 const log = createLogger('runtime:emit:add-constraint');
 
@@ -126,7 +126,27 @@ async function runAddCheckEngineSide(
 	return null;
 }
 
+/**
+ * The module-routed ADD CONSTRAINT arm, under the same statement-scoped schema-event scope
+ * every `ALTER TABLE` arm runs in (see {@link withStatementScopedSchemaEvents}): the module
+ * announces from inside its own `alterTable`, so anything that throws after that call must
+ * retract the announcement. The window is narrow today — the module call is this arm's last
+ * real work — but leaving one ALTER statement path unscoped is how the ADD COLUMN leak comes
+ * back. The engine-side {@link runAddCheckEngineSide} needs no scope: the backend it exists
+ * for ships no emitter, and its own emit is already at the tail.
+ */
 async function runAddConstraintViaModule(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: import('../../schema/schema.js').Schema,
+	constraint: AddConstraintNode['constraint'],
+	sql: string,
+): Promise<SqlValue> {
+	return withStatementScopedSchemaEvents(rctx, () =>
+		addConstraintViaModule(rctx, tableSchema, schema, constraint, sql));
+}
+
+async function addConstraintViaModule(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,

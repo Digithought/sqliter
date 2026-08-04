@@ -185,6 +185,12 @@ interface PendingDataEvent {
 interface PendingSchemaEvent {
 	moduleName: string;
 	event: VTableSchemaChangeEvent;
+	/**
+	 * Position in the emitter's lifetime-monotonic schema-event stream, stamped by
+	 * {@link DatabaseEventEmitter.pushSchemaEvent}. Read only by
+	 * {@link DatabaseEventEmitter.discardSchemaEventsSince}.
+	 */
+	seq: number;
 }
 
 /** Default maximum number of listeners per event type before a warning is logged. */
@@ -307,6 +313,16 @@ export class DatabaseEventEmitter {
 	private dataEventLayers: PendingDataEvent[][] = [];
 	private schemaEventLayers: PendingSchemaEvent[][] = [];
 	private collisionEventLayers: MaintenanceCollisionEvent[][] = [];
+
+	/**
+	 * Next value stamped onto a batched schema event's {@link PendingSchemaEvent.seq}.
+	 *
+	 * NEVER reset — not by {@link startBatch}, not by {@link flushBatch}, not by
+	 * {@link removeAllListeners}. A watermark from {@link beginSchemaEventScope} is
+	 * therefore unique for the emitter's whole lifetime, so a stale one (a scope whose
+	 * transaction already committed) can never match a later transaction's events.
+	 */
+	private schemaEventSeq = 0;
 
 	/**
 	 * Cumulative count of COMMITTED key-coarsening collisions, keyed by lowercased
@@ -666,9 +682,84 @@ export class DatabaseEventEmitter {
 		return [this.batchedDataEvents, ...this.dataEventLayers];
 	}
 
+	/** Schema-channel counterpart of {@link allDataEventStores}. */
+	private allSchemaEventStores(): PendingSchemaEvent[][] {
+		return [this.batchedSchemaEvents, ...this.schemaEventLayers];
+	}
+
 	/** Collision-channel counterpart of {@link allDataEventStores}. */
 	private allCollisionEventStores(): MaintenanceCollisionEvent[][] {
 		return [this.batchedCollisionEvents, ...this.collisionEventLayers];
+	}
+
+	/**
+	 * The ONE place a schema event enters the batch, so every batched schema event carries a
+	 * {@link PendingSchemaEvent.seq} stamp — both the module-emitter path
+	 * ({@link handleModuleSchemaEvent}) and the engine's own ({@link emitAutoSchemaEvent})
+	 * route through here. A second push site that skipped the stamp would produce an event
+	 * {@link discardSchemaEventsSince} silently cannot retract.
+	 */
+	private pushSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
+		this.getActiveSchemaStore().push({ moduleName, event, seq: this.schemaEventSeq++ });
+	}
+
+	/**
+	 * Take a watermark identifying "every schema event batched from here on" — the mark half
+	 * of the mark/discard pair {@link discardSchemaEventsSince} completes. Used to make one
+	 * statement's schema events retractable when the statement then fails; see
+	 * `runtime/emit/alter-schema-event.ts` § `withStatementScopedSchemaEvents`.
+	 */
+	beginSchemaEventScope(): number {
+		return this.schemaEventSeq;
+	}
+
+	/**
+	 * Drop every BATCHED schema event stamped at or after `watermark`, and return how many
+	 * went. The retraction half of {@link beginSchemaEventScope}: a statement that produced
+	 * schema events and then threw must announce nothing, and a module that emits from inside
+	 * its own `alterTable` has already put its event in the batch by the time the engine's
+	 * revert runs.
+	 *
+	 * Walks the base batch AND every open savepoint layer, like
+	 * {@link remapBatchedDataEvents} / {@link renameBatchedEvents} do — a layer's events are
+	 * still undelivered, and a RELEASE would merge them into the parent.
+	 *
+	 * Matching is by the per-event STAMP, never by a remembered array length: between the mark
+	 * and the discard a savepoint layer can be pushed, popped, or released, and
+	 * {@link releaseSavepointLayer} moves entries between arrays. A stamp travels with the
+	 * event through all of that; an index into an array does not.
+	 *
+	 * DATA events are deliberately untouched, and this is a trap worth stating: the store
+	 * module's `ddlCommitPendingOps()` flushes the transaction's EARLIER buffered writes into
+	 * this batch during an ALTER, so those data events fall inside the failing statement's
+	 * window while belonging to previous, successful statements. Retracting them would
+	 * silently swallow committed work. The maintenance-collision channel is out of scope for
+	 * the same reason (nothing in a DDL statement's window produced it).
+	 *
+	 * No-op when not batching: without a batch the events were already delivered
+	 * synchronously and there is nothing left to retract.
+	 */
+	discardSchemaEventsSince(watermark: number): number {
+		if (!this.isBatching) return 0;
+
+		// NOTE: splices per matching event, so a scope covering N events costs O(N × batch
+		// size). One ALTER statement batches at most a handful (its module announces once),
+		// so this is nothing today. If a scope ever spans many schema events — a batched DDL
+		// arm, a whole failed migration — partition each store into a kept array instead.
+		let discarded = 0;
+		for (const store of this.allSchemaEventStores()) {
+			for (let i = store.length - 1; i >= 0; i--) {
+				if (store[i].seq < watermark) continue;
+				store.splice(i, 1);
+				discarded++;
+			}
+		}
+
+		if (discarded > 0) {
+			log('Discarded %d batched schema events stamped at or after watermark %d (the statement that produced them failed)',
+				discarded, watermark);
+		}
+		return discarded;
 	}
 
 	/**
@@ -693,7 +784,7 @@ export class DatabaseEventEmitter {
 	private handleModuleSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
 		if (this.dropSchemaEventWhileSuppressed('module', moduleName, event)) return;
 		if (this.isBatching) {
-			this.getActiveSchemaStore().push({ moduleName, event });
+			this.pushSchemaEvent(moduleName, event);
 			log('Batched schema event from %s: %s %s', moduleName, event.type, event.objectName);
 		} else {
 			this.emitSchemaEvent(moduleName, event);
@@ -727,7 +818,7 @@ export class DatabaseEventEmitter {
 	emitAutoSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
 		if (this.dropSchemaEventWhileSuppressed('auto', moduleName, event)) return;
 		if (this.isBatching) {
-			this.getActiveSchemaStore().push({ moduleName, event });
+			this.pushSchemaEvent(moduleName, event);
 		} else {
 			this.emitSchemaEvent(moduleName, event);
 		}

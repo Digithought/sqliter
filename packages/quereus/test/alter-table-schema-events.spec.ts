@@ -49,6 +49,63 @@ function shape(e: DatabaseSchemaChangeEvent): string {
 	return parts.join('/');
 }
 
+/**
+ * The three ADD COLUMN statements that fail AFTER the module call — the arrangement in which
+ * a self-emitting backend has already announced the change by the time the engine unwinds it.
+ * Each fails while installing the column's inline constraint against the backfilled rows, so
+ * `revertAddColumn` runs and the table ends up without the column.
+ *
+ * A near miss that is deliberately NOT here: `add column g integer generated always as
+ * (nosuchcol * 2)` is rejected at plan-build, before any module call, so it never exercises
+ * the retraction.
+ */
+const ADD_COLUMN_FAILING_AFTER_MODULE_CALL: ReadonlyArray<{ what: string; statement: string }> = [
+	{
+		what: 'an inline UNIQUE the literal default duplicates across existing rows',
+		statement: 'alter table p add column c integer default 5 unique',
+	},
+	{
+		what: 'an inline CHECK the literal-default backfill violates',
+		statement: 'alter table p add column c integer default 5 check (c > 10)',
+	},
+	{
+		what: 'an inline FK whose literal default matches no parent row',
+		statement: 'alter table p add column c integer default 42 references parent(pid)',
+	},
+];
+
+/**
+ * Runs one of the statements above and asserts it announced nothing, with the enclosing
+ * transaction still committing its other work and `p` left without the new column.
+ *
+ * The explicit transaction is load-bearing: an autocommit statement rolls back on the
+ * failure, and the rollback discards the whole event batch — so a leaked event would never
+ * be delivered and the test would pass on a broken engine. Committing a sibling INSERT is
+ * what forces the batch through `flushBatch`.
+ */
+async function assertFailedAddColumnAnnouncesNothing(
+	db: Database,
+	statement: string,
+	alterEvents: () => DatabaseSchemaChangeEvent[],
+): Promise<void> {
+	await db.exec('create table parent (pid integer primary key)');
+	await db.exec('insert into parent values (1)');
+	await db.exec('create table p (id integer primary key)');
+	await db.exec('insert into p values (1), (2)');
+
+	await db.exec('begin');
+	await db.exec('insert into p values (3)');
+	await assert.rejects(() => db.exec(statement));
+	await db.exec('commit');
+
+	assert.deepEqual(alterEvents().map(shape), []);
+
+	// The other work committed, and `p` never gained the column.
+	const rows: unknown[] = [];
+	for await (const row of db.eval('select * from p order by id')) rows.push(row);
+	assert.deepEqual(rows, [{ id: 1 }, { id: 2 }, { id: 3 }]);
+}
+
 describe('ALTER TABLE raises a schema-change event on the engine\'s own path', () => {
 	let db: Database;
 	let events: DatabaseSchemaChangeEvent[];
@@ -222,6 +279,15 @@ describe('ALTER TABLE raises a schema-change event on the engine\'s own path', (
 
 			assert.deepEqual(alterEvents().map(shape), []);
 		});
+
+		// Free on this path — the engine emits at the arm's tail, past the throw. Pinned
+		// anyway so the two backends stay provably in agreement about what a failed
+		// statement announces; the emitter-backed describe runs the identical cases.
+		for (const { what, statement } of ADD_COLUMN_FAILING_AFTER_MODULE_CALL) {
+			it(`an ADD COLUMN failing after its module call on ${what} emits no event`, async () => {
+				await assertFailedAddColumnAnnouncesNothing(db, statement, alterEvents);
+			});
+		}
 	});
 
 	describe('transaction scoping', () => {
@@ -438,5 +504,19 @@ describe('ALTER TABLE on an emitter-backed module emits exactly once', () => {
 		const [e] = alterEvents();
 		assert.equal(e.oldObjectName, 't');
 		assert.equal(e.ddl, 'alter table t rename to t2');
+	});
+
+	describe('a failed ADD COLUMN announces nothing', () => {
+		// This backend is where the leak lived. It emits from inside
+		// `module.alterTable(addColumn)`, which is not the end of the statement: the engine
+		// then installs the column's inline constraint through further module calls, and a
+		// failure there unwinds the column. The announcement it already batched carries the
+		// statement's SQL, so a syncing peer re-executing it would gain a column this device
+		// does not have. The engine retracts the statement's schema events on the throw.
+		for (const { what, statement } of ADD_COLUMN_FAILING_AFTER_MODULE_CALL) {
+			it(`on ${what}`, async () => {
+				await assertFailedAddColumnAnnouncesNothing(db, statement, alterEvents);
+			});
+		}
 	});
 });

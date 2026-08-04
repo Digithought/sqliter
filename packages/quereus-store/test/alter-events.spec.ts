@@ -478,6 +478,9 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 		// of those calls carries `ddl`, so zero events. Driven inside an explicit
 		// transaction that then COMMITS other work, so a leaked event would actually be
 		// delivered rather than discarded by rollback.
+		//
+		// This case fails INSIDE the module's own backfill, before the module reaches its
+		// emit — so it never exercised the retraction the three cases below need.
 		await db.exec('create table t2 (id integer primary key, n integer) using store');
 		await db.exec('insert into t2 values (1, -5)');
 		await db.exec('begin');
@@ -491,5 +494,62 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 		const rows: unknown[] = [];
 		for await (const row of db.eval('select id from t2 order by id')) rows.push(row);
 		assert.deepEqual(rows, [{ id: 1 }, { id: 2 }]);
+	});
+
+	describe('an ADD COLUMN that fails AFTER its module call announces nothing', () => {
+		// The leak this guards: the store emits from inside `module.alterTable(addColumn)`,
+		// which is NOT the end of the statement — the engine then installs each inline
+		// constraint through further module calls, and a failure there unwinds the column.
+		// The announcement carries the statement's SQL, so a syncing peer that re-executed it
+		// would really add a column the originating device does not have. The engine scopes
+		// each ALTER statement's schema events and retracts them on the throw.
+		//
+		// Each case runs inside an explicit transaction that then COMMITS other work: an
+		// autocommit statement rolls back and `discardBatch` throws the event away, which is
+		// exactly why the leak hid.
+
+		/** Set up `p` with two rows, open a transaction, and add a third row to commit later. */
+		async function seedFailingAlter(): Promise<void> {
+			await db.exec('create table p (id integer primary key) using store');
+			await db.exec('insert into p values (1), (2)');
+			await db.exec('begin');
+			await db.exec('insert into p values (3)');
+		}
+
+		/**
+		 * Commit, then assert the ALTER announced nothing, the transaction's other work
+		 * survived, and `p` never gained the column.
+		 */
+		async function assertAlterLeftNoTrace(): Promise<void> {
+			await db.exec('commit');
+
+			assert.deepEqual(alterEvents('p'), []);
+			const rows: unknown[] = [];
+			for await (const row of db.eval('select * from p order by id')) rows.push(row);
+			assert.deepEqual(rows, [{ id: 1 }, { id: 2 }, { id: 3 }]);
+		}
+
+		it('an inline UNIQUE the literal default duplicates across existing rows', async () => {
+			await seedFailingAlter();
+			await assert.rejects(
+				db.exec('alter table p add column c integer default 5 unique'));
+			await assertAlterLeftNoTrace();
+		});
+
+		it('an inline CHECK the literal-default backfill violates', async () => {
+			await seedFailingAlter();
+			await assert.rejects(
+				db.exec('alter table p add column c integer default 5 check (c > 10)'));
+			await assertAlterLeftNoTrace();
+		});
+
+		it('an inline FK whose literal default matches no parent row', async () => {
+			await db.exec('create table parent (pid integer primary key) using store');
+			await db.exec('insert into parent values (1)');
+			await seedFailingAlter();
+			await assert.rejects(
+				db.exec('alter table p add column c integer default 42 references parent(pid)'));
+			await assertAlterLeftNoTrace();
+		});
 	});
 });

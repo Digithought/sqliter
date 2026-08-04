@@ -21,7 +21,7 @@ import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
-import { emitAlterSchemaEvent } from './alter-schema-event.js';
+import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
 	snapshotStaleMaterializedViews,
@@ -104,52 +104,60 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 			);
 		}
 
-		switch (action.type) {
-			case 'renameTable':
-				return runRenameTable(rctx, tableSchema, schema, action.newName, plan.sql);
-			case 'renameColumn':
-				return runRenameColumn(rctx, tableSchema, schema, action.oldName, action.newName, plan.sql);
-			case 'addColumn': {
-				// Slot order set in `params`: backfill callback first (if any), then check callbacks.
-				const backfillCb = backfill ? (args[0] as SubProgram) : undefined;
-				const checkCbs = (args.slice(backfill ? 1 : 0) as SubProgram[]);
-				return runAddColumn(rctx, tableSchema, schema, action.column, plan.sql, backfill, backfillCb, checks, checkCbs);
-			}
-			case 'dropColumn':
-				return runDropColumn(rctx, tableSchema, schema, action.name, plan.sql);
-			case 'dropConstraint':
-				return runDropConstraint(rctx, tableSchema, schema, action.name, plan.sql);
-			case 'renameConstraint':
-				return runRenameConstraint(rctx, tableSchema, schema, action.oldName, action.newName, plan.sql);
-			case 'alterPrimaryKey':
-				return runAlterPrimaryKey(rctx, tableSchema, schema, action.columns, plan.sql);
-			case 'alterColumn':
-				return runAlterColumn(rctx, tableSchema, schema, action, plan.sql);
-			case 'setTags': {
-				const target = action.target;
-				if (action.mode === 'merge') {
-					// ADD TAGS — per-key merge onto the live tag set.
-					if (target.kind === 'column') return runMergeColumnTags(rctx, tableSchema, target.columnName, action.tags);
-					if (target.kind === 'constraint') return runMergeConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
-					return runMergeTableTags(rctx, tableSchema, action.tags);
+		// Every arm runs under the statement-scoped schema-event scope: an arm that fails
+		// after the module call has already let an emitter-backed module announce the
+		// statement (it emits from inside `module.alterTable`, not at the statement's end),
+		// so the failure path must retract that announcement. See
+		// {@link withStatementScopedSchemaEvents} for why this sits at the statement
+		// boundary rather than inside any one arm's revert.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			switch (action.type) {
+				case 'renameTable':
+					return runRenameTable(rctx, tableSchema, schema, action.newName, plan.sql);
+				case 'renameColumn':
+					return runRenameColumn(rctx, tableSchema, schema, action.oldName, action.newName, plan.sql);
+				case 'addColumn': {
+					// Slot order set in `params`: backfill callback first (if any), then check callbacks.
+					const backfillCb = backfill ? (args[0] as SubProgram) : undefined;
+					const checkCbs = (args.slice(backfill ? 1 : 0) as SubProgram[]);
+					return runAddColumn(rctx, tableSchema, schema, action.column, plan.sql, backfill, backfillCb, checks, checkCbs);
 				}
-				// SET TAGS — whole-set replace.
-				if (target.kind === 'column') return runSetColumnTags(rctx, tableSchema, target.columnName, action.tags);
-				if (target.kind === 'constraint') return runSetConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
-				return runSetTableTags(rctx, tableSchema, action.tags);
+				case 'dropColumn':
+					return runDropColumn(rctx, tableSchema, schema, action.name, plan.sql);
+				case 'dropConstraint':
+					return runDropConstraint(rctx, tableSchema, schema, action.name, plan.sql);
+				case 'renameConstraint':
+					return runRenameConstraint(rctx, tableSchema, schema, action.oldName, action.newName, plan.sql);
+				case 'alterPrimaryKey':
+					return runAlterPrimaryKey(rctx, tableSchema, schema, action.columns, plan.sql);
+				case 'alterColumn':
+					return runAlterColumn(rctx, tableSchema, schema, action, plan.sql);
+				case 'setTags': {
+					const target = action.target;
+					if (action.mode === 'merge') {
+						// ADD TAGS — per-key merge onto the live tag set.
+						if (target.kind === 'column') return runMergeColumnTags(rctx, tableSchema, target.columnName, action.tags);
+						if (target.kind === 'constraint') return runMergeConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
+						return runMergeTableTags(rctx, tableSchema, action.tags);
+					}
+					// SET TAGS — whole-set replace.
+					if (target.kind === 'column') return runSetColumnTags(rctx, tableSchema, target.columnName, action.tags);
+					if (target.kind === 'constraint') return runSetConstraintTags(rctx, tableSchema, target.constraintName, action.tags);
+					return runSetTableTags(rctx, tableSchema, action.tags);
+				}
+				case 'dropTags': {
+					// DROP TAGS — per-key delete (atomic NOTFOUND if any key absent).
+					const target = action.target;
+					if (target.kind === 'column') return runDropColumnTags(rctx, tableSchema, target.columnName, action.keys);
+					if (target.kind === 'constraint') return runDropConstraintTags(rctx, tableSchema, target.constraintName, action.keys);
+					return runDropTableTags(rctx, tableSchema, action.keys);
+				}
+				case 'setMaintained':
+					return runSetMaintained(rctx, tableSchema, schema, action.columns, action.select);
+				case 'dropMaintained':
+					return runDropMaintained(rctx, tableSchema, schema);
 			}
-			case 'dropTags': {
-				// DROP TAGS — per-key delete (atomic NOTFOUND if any key absent).
-				const target = action.target;
-				if (target.kind === 'column') return runDropColumnTags(rctx, tableSchema, target.columnName, action.keys);
-				if (target.kind === 'constraint') return runDropConstraintTags(rctx, tableSchema, target.constraintName, action.keys);
-				return runDropTableTags(rctx, tableSchema, action.keys);
-			}
-			case 'setMaintained':
-				return runSetMaintained(rctx, tableSchema, schema, action.columns, action.select);
-			case 'dropMaintained':
-				return runDropMaintained(rctx, tableSchema, schema);
-		}
+		});
 	}
 
 	const note = (() => {
@@ -717,6 +725,11 @@ async function runAddColumn(
 		// `ddl` marks this call — and only this one — as the statement's own action: the
 		// inline-constraint installs below and any revert calls pass none, so an
 		// emitter-backed module announces exactly ONE event for the whole statement.
+		//
+		// That marker settles HOW MANY events a successful statement announces, not whether a
+		// failed one announces any: this call is not the end of the statement, so a failure in
+		// the inline-constraint installs below leaves this announcement already batched. The
+		// statement-scoped retraction wrapped around the whole arm dispatch is what removes it.
 		updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
 			type: 'addColumn',
 			columnDef,
@@ -901,10 +914,13 @@ async function runAddColumn(
  * mask the original violation. Restoring the catalog entry is a no-op when the ALTER failed
  * before registering anything (the original schema is still the live one).
  *
- * Every module call here passes no `ddl`, deliberately: a statement that unwound must
- * announce nothing at all, and an emitter-backed module emits only for a call carrying
- * `ddl` — so neither the failed ADD COLUMN nor its unwinding leaves a schema event in
- * the transaction's batch.
+ * Every module call here passes no `ddl`, deliberately: an emitter-backed module emits only
+ * for a call carrying `ddl`, so the unwinding itself announces nothing. That is the SECOND
+ * line of defence, not the only one — the failed statement's own `addColumn` call DID carry
+ * `ddl`, and an emitter-backed module already batched an event for it before we got here.
+ * What actually keeps a failed ADD COLUMN silent is the statement-scoped retraction the whole
+ * arm dispatch runs under (`withStatementScopedSchemaEvents` in `emitAlterTable`'s `run()`),
+ * which drops that event as the error propagates.
  *
  * NOTE: the hand-back is by NAME, so it assumes a name resolves to the constraint this
  * ALTER installed. A pre-existing constraint can legitimately share an auto-name (nothing
