@@ -72,23 +72,42 @@ Both passes descend through **relational** children too, because a window specif
 may contain a subquery that correlates back to the grouping key (`over (order by (select
 max(t.b) from wg t where t.a = wg.a))`). Inside such a subquery live two unrelated kinds
 of column reference — the subquery's own columns, and correlated references pointing back
-out — so both passes key off `aggregateInputAttrIds`: every attribute id produced anywhere
-in the AggregateNode's *input* subtree, i.e. exactly the columns this query could read
-before it grouped. Attribute ids are minted per relation instance, so a subquery's own
-`wg t` scan and the outer `wg` scan never share one, and membership separates the two
-cases exactly:
+out — so both passes key off `aggregateInputAttrIds`: every attribute id produced in the
+AggregateNode's *input* subtree, i.e. exactly the columns this query could read before it
+grouped. Attribute ids are minted per relation instance, so a subquery's own `wg t` scan
+and the outer `wg` scan never share one, and membership separates the two cases exactly:
 
 - in the redirect, the base-attribute-id rule needs no guard at any depth (only a genuine
-  reference to this query's grouping column can match), while the *fingerprint* rule is
-  guarded on "every column reference in this subtree is a pre-grouping column of this
-  query" — otherwise a bare `a` written inside the subquery, which names the subquery's
-  own `t.a`, would be silently rewritten onto the outer group column;
+  reference to this query's grouping column can match). The *fingerprint* rule is
+  unconditional above any subquery, where the expression is written in this query's own
+  scope — that is what lets a whole correlated subquery be the grouping key and be named
+  again in the specification. Inside a subquery it is guarded on "every column reference
+  in this subtree is a pre-grouping column of this query", because there the same text can
+  name something else: a bare `a` written inside the subquery names the subquery's own
+  `t.a` and would otherwise be silently rewritten onto the outer group column;
 - in the coverage check, only a pre-grouping attribute id that is absent from the
   aggregate's output is rejected. A reference to anything else — the subquery's own
   columns, or a correlated reference to an **enclosing** query — is legal here and passes
   through. That is what lets a grouped subquery's window specification correlate outward
   (`select … (select count(*) from (select row_number() over (order by i.b, o.a) … from wg
   i where i.a = o.a group by i.b) z) … from wg o group by o.a`).
+
+The coverage check exempts an **aggregate**'s arguments from the GROUP BY restriction —
+they read pre-grouping columns by definition — but only for this query's own aggregates,
+which sit at the top level of the specification. An aggregate reached through a subquery
+belongs to that subquery, so its arguments are checked like anything else: `over (order by
+(select max(wg.b) from wg t))` reads an ungrouped column of the grouped query and is
+rejected at plan time.
+
+The one subtree both passes stop at is a **CTE definition**. A `with` clause builds it
+once and every reference points at that same node, so when the grouped query and a
+subquery in its window specification read the same CTE, the body is reachable from both.
+A CTE body is a closed scope — it cannot name a column of the query referencing it — so
+its internal attribute ids are excluded from `aggregateInputAttrIds` and neither pass
+descends into it. Without that, `with c as (select a, b from wg where b <> '') select a,
+row_number() over (order by (select count(*) from c z)) from c group by a` was rejected
+with "Column 'b' must appear in the GROUP BY clause", naming a column that appears only
+inside the CTE.
 
 An aggregate inside a window specification of a grouped query must be one the select
 list already computes — the window runs *above* the aggregation, so there is nothing

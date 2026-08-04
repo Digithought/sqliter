@@ -34,8 +34,16 @@ export function isEquiCorrelation(
 
 /**
  * Collect attribute IDs defined by a relational subtree.
+ *
+ * `shouldDescend`, when supplied, prunes the walk: a child it rejects contributes
+ * neither its own attributes nor its subtree's. Callers use it to stop at a subtree
+ * whose attributes their query could never name — see `buildGroupedWindowContext`
+ * (planner/building/select-aggregates.ts) and CTE definitions.
  */
-export function collectDefinedAttrIds(node: PlanNode): Set<number> {
+export function collectDefinedAttrIds(
+	node: PlanNode,
+	shouldDescend?: (child: PlanNode) => boolean,
+): Set<number> {
 	const ids = new Set<number>();
 	function walk(n: PlanNode): void {
 		if (isRelationalNode(n)) {
@@ -44,6 +52,7 @@ export function collectDefinedAttrIds(node: PlanNode): Set<number> {
 			}
 		}
 		for (const child of n.getChildren()) {
+			if (shouldDescend && !shouldDescend(child)) continue;
 			walk(child);
 		}
 	}

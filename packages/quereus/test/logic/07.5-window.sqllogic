@@ -1060,6 +1060,78 @@ select o.a,
 from wg o group by o.a order by o.a;
 → [{"a":"x","c":2},{"a":"y","c":1}]
 
+-- A whole SUBQUERY can be the grouping key, and repeating it verbatim in the window
+-- specification must resolve to that key's output column. It is matched by identity
+-- fingerprint at the top level of the specification, where the expression is written
+-- in this query's own scope — the "does this subtree read only pre-grouping columns"
+-- test that guards the same rule INSIDE a subquery cannot be applied here, because a
+-- correlated grouping key legitimately reads the subquery's columns too. Two groups:
+-- max(b) is '3' for a='x' and '2' for a='y'.
+select count(*) as n, row_number() over (order by (select max(t.b) from wg t where t.a = wg.a)) as rn
+from wg group by (select max(t.b) from wg t where t.a = wg.a) order by rn;
+→ [{"n":1,"rn":1},{"n":2,"rn":2}]
+
+-- The mirror: an expression grouping key named from INSIDE a subquery in the
+-- specification. `wgk` has no column `a`, so the bare `a` resolves outward to this
+-- query's grouping key and IS redirected. Each group matches one `wgk` row, so both
+-- grouped rows land in the same partition.
+create table wgk (c text);
+insert into wgk values ('x!'), ('y!'), ('z!');
+
+select a || '!' as k, count(*) over (partition by (select count(*) from wgk t where t.c = a || '!')) as c
+from wg group by a || '!' order by k;
+→ [{"k":"x!","c":2},{"k":"y!","c":2}]
+
+drop table wgk;
+
+-- An aggregate inside a subquery in the window specification belongs to the
+-- SUBQUERY, so its arguments get no exemption from the coverage check: `wg.b` is a
+-- correlated reference to an ungrouped column of the grouped query and is rejected at
+-- plan time. (Only this query's OWN top-level aggregates read pre-grouping columns by
+-- definition — see the `count(*) over (order by count(*) desc)` cases above.)
+select a, row_number() over (order by (select max(wg.b) from wg t)) as rn
+from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a, row_number() over (order by (select count(wg.b) from wg t where t.a = wg.a)) as rn
+from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- The GROUPING key inside such an aggregate is legal, and is redirected onto the
+-- aggregate's output column: max('x'||b) is 'x3', max('y'||b) is 'y3'.
+select a, row_number() over (order by (select max(wg.a || t.b) from wg t)) as rn
+from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A CTE is planned ONCE and shared by every reference to it, so when the grouped
+-- query and a subquery in its window specification both read the same CTE, the CTE
+-- body is reachable from both. Its own columns are not this query's pre-grouping
+-- columns and must not be treated as such — this rejected with "Column 'b' must
+-- appear in the GROUP BY clause", naming a column written only inside the CTE.
+with c as (select a, b from wg where b <> '')
+select a, row_number() over (order by (select count(*) from c z), a) as rn
+from c group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- Same shape, correlated: the redirect still reaches the grouping key through the
+-- shared CTE. `max(b)` is '3' for a='x' and '2' for a='y', so y sorts first.
+with c as (select a, b from wg where b <> '')
+select a, row_number() over (order by (select max(t.b) from c t where t.a = c.a)) as rn
+from c group by a order by rn;
+→ [{"a":"y","rn":1},{"a":"x","rn":2}]
+
+-- And an ungrouped correlated reference is still rejected when the CTE is shared.
+with c as (select a, b from wg where b <> '')
+select a, row_number() over (order by (select max(t.b) from c t where t.b = c.b)) as rn
+from c group by a;
+-- error: Column 'c.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- A RECURSIVE CTE is shared the same way.
+with recursive r(n) as (select 1 union all select n + 1 from r where n < 3)
+select n, row_number() over (order by (select count(*) from r z), n) as rn
+from r group by n order by rn;
+→ [{"n":1,"rn":1},{"n":2,"rn":2},{"n":3,"rn":3}]
+
 drop table wg;
 
 -- =============================================================================

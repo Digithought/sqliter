@@ -18,6 +18,7 @@ import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { expressionToString, expressionToIdentityString } from '../../emit/ast-stringify.js';
 import { buildOrdinalAwareExpression, resolveOrdinalReference, type SelectListEntry } from './select-ordinal.js';
 import { collectDefinedAttrIds } from '../analysis/equi-correlation.js';
+import { PlanNodeType } from '../nodes/plan-node-type.js';
 
 /**
  * Processes GROUP BY, aggregates, and HAVING clauses
@@ -301,7 +302,8 @@ export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage)
  * || '!'`) bind to a *base-table* attribute the aggregate row never had. This
  * context supplies both halves of the answer: the two maps let
  * {@link redirectToGroupKeys} rewrite such a subtree onto the aggregate's own
- * output column, and {@link coverage} is the strict check applied afterwards.
+ * output column, and the two attribute-id sets let
+ * {@link assertGroupedWindowCoverage} reject what survives.
  */
 export interface GroupedWindowContext {
 	/** Where each GROUP BY key lives on the AggregateNode's output row. */
@@ -309,8 +311,9 @@ export interface GroupedWindowContext {
 	/** AggregateNode output attributes: group keys in GROUP BY order, then aggregate results. */
 	readonly outputAttributes: readonly Attribute[];
 	/**
-	 * Every attribute id produced anywhere in the AggregateNode's input subtree —
-	 * exactly "the columns this grouped query could have read before it grouped".
+	 * Every attribute id the AggregateNode's input subtree produces and this query can
+	 * name — exactly "the columns this grouped query could have read before it grouped".
+	 * CTE definition bodies are excluded; see {@link isCteDefinition}.
 	 *
 	 * This is what tells a reference belonging to THIS query apart from one that does
 	 * not, at any nesting depth. A window specification may contain a subquery, and
@@ -382,9 +385,32 @@ export function buildGroupedWindowContext(
 	return {
 		groupKeys: indexGroupKeys(groupByExpressions),
 		outputAttributes,
-		aggregateInputAttrIds: collectDefinedAttrIds(aggregateInput),
+		aggregateInputAttrIds: collectDefinedAttrIds(aggregateInput, child => !isCteDefinition(child)),
 		outputAttrIds: new Set(outputAttributes.map(attr => attr.id)),
 	};
+}
+
+/**
+ * True for a CTE *definition* — the node a `with` clause builds once and every
+ * reference to that CTE then points at, as opposed to the per-reference
+ * CTEReferenceNode that mints its own attribute ids.
+ *
+ * Two consequences for the window phase, and one shape that needs both. A CTE body
+ * is a closed scope: it cannot name a column of the query that references it, so
+ * nothing inside it is ever a reference to this query's grouping key. And the SAME
+ * body node is reachable from this query's FROM clause and from a subquery inside a
+ * window specification that references the same CTE, so counting its internal
+ * attribute ids as this query's pre-grouping columns makes the body's own columns
+ * look ungrouped:
+ *
+ *   with c as (select a, b from wg where b <> '')
+ *   select a, row_number() over (order by (select count(*) from c z)) from c group by a
+ *
+ * — which rejected at plan time with "Column 'b' must appear in the GROUP BY clause",
+ * naming a column the user never wrote in the window specification.
+ */
+function isCteDefinition(node: PlanNode): boolean {
+	return node.nodeType === PlanNodeType.CTE || node.nodeType === PlanNodeType.RecursiveCTE;
 }
 
 /**
@@ -401,15 +427,16 @@ export function buildGroupedWindowContext(
  *    is folded, so `group by A || '!'` matches too; quoted literals are byte-exact,
  *    so `a || 'X'` and `a || 'x'` remain different keys.
  *
- *    Guarded by {@link readsOnlyAggregateInput}: the subtree matches only when every
- *    column reference in it is a pre-grouping column of THIS query. The guard exists
- *    because the walk descends into subqueries (below): under `group by a`, a bare `a`
- *    written INSIDE `over (order by (select … where t.a = a))` names the subquery's own
- *    `t.a` and yet fingerprints as `a`, so an unguarded rule 1 would silently rewrite
- *    it into the outer group column and change what the query means. At the top level
- *    the guard holds by construction — an expression there reads either a base column
- *    of this query or an aggregate output column, and in the latter case rule 1 was
- *    already a no-op rewrite onto the column the node names anyway.
+ *    Unconditional above any subquery, where the expression is written in this query's
+ *    own scope. INSIDE a subquery it is guarded by {@link readsOnlyAggregateInput} —
+ *    every column reference in the subtree must be a pre-grouping column of THIS query
+ *    — because there the same text can name something else entirely: under `group by
+ *    a`, a bare `a` written inside `over (order by (select … where t.a = a))` names the
+ *    subquery's own `t.a` and yet fingerprints as `a`, so an unguarded rule 1 would
+ *    silently rewrite it into the outer group column and change what the query means.
+ *    The guard cannot replace the top-level case: `group by (select max(t.b) from wg t
+ *    where t.a = wg.a)` repeated verbatim in the specification is a legal grouping key
+ *    whose subtree also reads the subquery's own columns.
  * 2. The node is a column reference whose attribute id is the *base* attribute id of
  *    a bare-column grouping key — covers `group by a` + `over (order by wg.a)` and
  *    `over (order by w.a)`. Both spellings fall through to the same base attribute
@@ -443,22 +470,26 @@ export function redirectToGroupKeys(
  * {@link redirectToGroupKeys} over any plan node — the walk crosses relational
  * boundaries, so it cannot be typed scalar-to-scalar throughout.
  *
+ * `insideSubquery` records whether the walk has crossed a relational child; it gates
+ * rule 1 (see {@link redirectToGroupKeys}).
+ *
  * NOTE: this renders an identity fingerprint at every scalar node it visits, and a
- * fingerprint hit then walks that node's subtree again for the guard — so a window
- * specification containing a large subquery costs more to build than before, once per
- * prepare of the query. Not measured; if preparing such queries ever shows up as slow,
- * memoize the fingerprint per node or bail out of the walk for subtrees that contain no
- * `aggregateInputAttrIds` reference at all.
+ * fingerprint hit inside a subquery then walks that node's subtree again for the guard
+ * — so a window specification containing a large subquery costs more to build than
+ * before, once per prepare of the query. Not measured; if preparing such queries ever
+ * shows up as slow, memoize the fingerprint per node or bail out of the walk for
+ * subtrees that contain no `aggregateInputAttrIds` reference at all.
  */
 function redirectNode(
 	node: PlanNode,
 	context: GroupedWindowContext,
 	scope: Scope,
+	insideSubquery = false,
 ): PlanNode {
 	if ('expression' in node) {
 		const expression = (node as ScalarPlanNode).expression;
 		const fingerprintIndex = context.groupKeys.byFingerprint.get(expressionToIdentityString(expression));
-		if (fingerprintIndex !== undefined && readsOnlyAggregateInput(node, context)) {
+		if (fingerprintIndex !== undefined && (!insideSubquery || readsOnlyAggregateInput(node, context))) {
 			return buildGroupKeyColumnRef(scope, context.outputAttributes[fingerprintIndex], expression, fingerprintIndex);
 		}
 
@@ -474,7 +505,12 @@ function redirectNode(
 	const newChildren: PlanNode[] = [];
 	let changed = false;
 	for (const child of node.getChildren()) {
-		const rewritten = redirectNode(child, context, scope);
+		// A CTE definition holds nothing this walk could legally rewrite, and is shared
+		// with the rest of the plan — descending would fingerprint its whole body for
+		// nothing. See {@link isCteDefinition}.
+		const rewritten = isCteDefinition(child)
+			? child
+			: redirectNode(child, context, scope, insideSubquery || isRelationalNode(child));
 		if (rewritten !== child) changed = true;
 		newChildren.push(rewritten);
 	}
@@ -511,6 +547,9 @@ function readsOnlyAggregateInput(node: PlanNode, context: GroupedWindowContext):
  * - it flags a column reference only when the attribute id is one of THIS query's
  *   pre-grouping columns. A reference to anything else — the subquery's own columns,
  *   or a correlated reference to an enclosing query — is legal here and is left alone.
+ *
+ * The aggregate exemption is likewise narrowed to this query's OWN aggregates; see
+ * {@link findUngroupedWindowColumnRef}.
  */
 export function assertGroupedWindowCoverage(node: PlanNode, context: GroupedWindowContext): void {
 	const ungrouped = findUngroupedWindowColumnRef(node, context);
@@ -524,13 +563,23 @@ export function assertGroupedWindowCoverage(node: PlanNode, context: GroupedWind
 	);
 }
 
-/** The first pre-grouping column reference in `node` that the grouped row cannot carry. */
+/**
+ * The first pre-grouping column reference in `node` that the grouped row cannot carry.
+ *
+ * `insideSubquery` tracks whether the walk has crossed into a relational child, and
+ * gates the aggregate exemption. THIS query's own aggregates read pre-grouping columns
+ * by definition (`over (order by count(b) desc)` against a select list that computes
+ * `count(b)`), and those sit at the top level. An aggregate reached through a subquery
+ * belongs to the subquery, and its arguments may correlate back out — `over (order by
+ * (select max(wg.b) from wg t))` reads an ungrouped column of this query and must say
+ * so at plan time, not die at runtime with "No row context found for column b".
+ */
 function findUngroupedWindowColumnRef(
 	node: PlanNode,
-	context: GroupedWindowContext
+	context: GroupedWindowContext,
+	insideSubquery = false,
 ): ColumnReferenceNode | null {
-	// An aggregate's own arguments read pre-grouping columns by definition.
-	if (CapabilityDetectors.isAggregateFunction(node)) {
+	if (!insideSubquery && CapabilityDetectors.isAggregateFunction(node)) {
 		return null;
 	}
 
@@ -541,7 +590,8 @@ function findUngroupedWindowColumnRef(
 	}
 
 	for (const child of node.getChildren()) {
-		const found = findUngroupedWindowColumnRef(child, context);
+		if (isCteDefinition(child)) continue;
+		const found = findUngroupedWindowColumnRef(child, context, insideSubquery || isRelationalNode(child));
 		if (found) return found;
 	}
 	return null;
