@@ -191,6 +191,9 @@ export function buildSelectStmt(
 	let preAggregateSort = aggregateResult.preAggregateSort;
 	let orderByAppliedEarly = false;
 	let aggregateProjectionScope: RegisteredScope | undefined;
+	// Set when the query is BOTH grouped and windowed: the grouped select-list
+	// projection list, to be projected above the window phase's WindowNode.
+	let windowSelectProjections: Projection[] | undefined;
 	// The node whose output attributes ARE this SELECT's result columns, once one
 	// exists. A positional ORDER BY binds to its Nth attribute (see applyOrderBy).
 	let orderByOutputRelation: RelationalPlanNode | undefined;
@@ -224,8 +227,11 @@ export function buildSelectStmt(
 			orderByAppliedEarly = true;
 		}
 
-		// Build final projections if needed
-		if (aggregateResult.needsFinalProjection && aggregateResult.aggregateNode && aggregateResult.groupByExpressions) {
+		// Build final projections if needed. A window function in the select list also
+		// forces one: the window phase projects the select list ABOVE its WindowNode, so
+		// the grouped select list must be materialized as a projection list here even when
+		// the AggregateNode's own output would otherwise have been the result shape.
+		if ((aggregateResult.needsFinalProjection || hasWindowFunctions) && aggregateResult.aggregateNode && aggregateResult.groupByExpressions) {
 			const finalProjections = buildFinalAggregateProjections(
 				stmt,
 				selectContext,
@@ -235,18 +241,25 @@ export function buildSelectStmt(
 				aggregateResult.groupByExpressions,
 				starProjectionsByColumn
 			);
-			// When HAVING-only or ORDER-BY-only aggregates were added, don't preserve
-			// input columns so they are stripped from the output (they exist only for
-			// those clauses).
-			const preserveForAggregate =
-				preserveInputColumns &&
-				!aggregateResult.hasHavingOnlyAggregates &&
-				!aggregateResult.hasOrderByOnlyAggregates;
-			input = new ProjectNode(selectScope, input, finalProjections, undefined, undefined, preserveForAggregate);
-			// Expose final-projection output column names (including SELECT-list aliases)
-			// so subsequent ORDER BY can reference aliases like the non-aggregate path.
-			aggregateProjectionScope = createProjectionOutputScope(input);
-			orderByOutputRelation = input;
+			if (hasWindowFunctions) {
+				// Hand the grouped select list to the window phase instead of projecting it
+				// here: the WindowNode must sit between the aggregate output and the final
+				// projection, so there is exactly ONE projection and it is above the window.
+				windowSelectProjections = finalProjections;
+			} else {
+				// When HAVING-only or ORDER-BY-only aggregates were added, don't preserve
+				// input columns so they are stripped from the output (they exist only for
+				// those clauses).
+				const preserveForAggregate =
+					preserveInputColumns &&
+					!aggregateResult.hasHavingOnlyAggregates &&
+					!aggregateResult.hasOrderByOnlyAggregates;
+				input = new ProjectNode(selectScope, input, finalProjections, undefined, undefined, preserveForAggregate);
+				// Expose final-projection output column names (including SELECT-list aliases)
+				// so subsequent ORDER BY can reference aliases like the non-aggregate path.
+				aggregateProjectionScope = createProjectionOutputScope(input);
+				orderByOutputRelation = input;
+			}
 		}
 	}
 
@@ -286,10 +299,9 @@ export function buildSelectStmt(
 			}
 		}
 
-		input = buildWindowPhase(input, windowFunctions, selectContext, stmt);
+		input = buildWindowPhase(input, windowFunctions, selectContext, windowSelectProjections ?? projections);
 		// The window phase ends in a ProjectNode over the SELECT list, so that node's
-		// attributes are this query's result columns (subject to the alignment guard —
-		// the window projection drops `*` entries today).
+		// attributes are this query's result columns.
 		orderByOutputRelation = input;
 
 		// Update context to include window output columns

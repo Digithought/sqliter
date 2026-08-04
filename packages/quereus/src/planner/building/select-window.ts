@@ -8,7 +8,6 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { ArrayIndexNode } from '../nodes/array-index-node.js';
 import { LiteralNode } from '../nodes/scalar.js';
 import { buildExpression } from './expression.js';
-import { isWindowExpression } from './select-projections.js';
 import type * as AST from '../../parser/ast.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 
@@ -19,7 +18,7 @@ export function buildWindowPhase(
 	input: RelationalPlanNode,
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[],
 	selectContext: PlanningContext,
-	stmt: AST.SelectStmt
+	selectListProjections: readonly Projection[]
 ): RelationalPlanNode {
 	if (windowFunctions.length === 0) {
 		return input;
@@ -89,7 +88,7 @@ export function buildWindowPhase(
 	}
 
 	// Create projections that select only the requested columns using direct array indexing
-	const windowProjections = buildWindowProjections(stmt, currentInput, selectContext, windowFunctions);
+	const windowProjections = buildWindowProjections(selectListProjections, currentInput, selectContext, windowFunctions);
 
 	if (windowProjections.length > 0) {
 		currentInput = new ProjectNode(selectContext.scope, currentInput, windowProjections);
@@ -162,50 +161,28 @@ function buildWindowFunctionArguments(
  * Builds projections for window function output columns
  */
 function buildWindowProjections(
-	stmt: AST.SelectStmt,
+	selectListProjections: readonly Projection[],
 	windowNode: RelationalPlanNode,
 	selectContext: PlanningContext,
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[]
 ): Projection[] {
-	const windowProjections: Projection[] = [];
 	const windowType = windowNode.getType();
 	const sourceColumnCount = windowType.columns.length - windowFunctions.length;
 
-	for (const column of stmt.columns) {
-		if (column.type === 'column') {
-			// Build each column expression once and reuse for both classification and projection
-			const builtExpr = buildExpression(selectContext, column.expr, true);
-
-			if (isWindowExpression(builtExpr)) {
-				// Rewrite each window-function descendant into an ArrayIndexNode pointing
-				// at its computed window-output column, preserving any surrounding
-				// arithmetic / scalar wrapper (e.g. `1000 - row_number() over (...)`).
-				// The top-level case (`row_number() over (...) as rn`) falls out naturally:
-				// the whole tree is the window node, so the rewrite returns a bare
-				// ArrayIndexNode, matching the prior behavior.
-				const rewritten = rewriteWindowFunctions(
-					builtExpr,
-					windowFunctions,
-					sourceColumnCount,
-					windowType,
-					selectContext.scope
-				);
-
-				windowProjections.push({
-					node: rewritten,
-					alias: column.alias
-				});
-			} else {
-				// For regular columns, use the already-built expression
-				windowProjections.push({
-					node: builtExpr,
-					alias: column.alias
-				});
-			}
-		}
-	}
-
-	return windowProjections;
+	return selectListProjections.map(projection => {
+		// Rewrite each window-function descendant into an ArrayIndexNode pointing
+		// at its computed window-output column, preserving any surrounding
+		// arithmetic / scalar wrapper (e.g. `1000 - row_number() over (...)`).
+		const rewritten = rewriteWindowFunctions(
+			projection.node,
+			windowFunctions,
+			sourceColumnCount,
+			windowType,
+			selectContext.scope
+		);
+		if (rewritten === projection.node) return projection;
+		return { ...projection, node: rewritten, attributeId: undefined };
+	});
 }
 
 /**
