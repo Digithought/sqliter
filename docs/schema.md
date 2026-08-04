@@ -6,9 +6,16 @@ The schema subsystem manages database schemas, tables, views, functions, and ind
 
 ## Topic documents
 
+This document is the **hub**: key types, the change-event surface, the schema path, DDL generation, and the declarative-schema pipeline. The subsystems large enough to read on their own live in the topic documents below.
+
+<!-- NOTE: a section that moved into a satellite left a one-line stub behind under its original
+     heading, so its old anchor still resolves here. `yarn docs:check` therefore cannot tell a
+     link deliberately left on a stub from one that should have been retargeted and was not.
+     When linking real content that lives in a satellite, link the satellite — not the stub. -->
+
 | Document | Covers |
 | --- | --- |
-| [Rename Detection](schema-rename-detection.md) | How the declarative differ pairs a declared object with an existing one across a rename, and the body-change detection that overrides a rename with drop+recreate. |
+| [Rename Detection](schema-rename-detection.md) | How the declarative differ pairs a declared object with an existing one across a rename; the body-change detection that overrides a rename with drop+recreate; tag-drift detection; and reserved-tag validation on the declarative path. |
 | [View and Materialized-View Persistence](view-persistence.md) | How `@quereus/store` durably persists views and materialized views: the catalog keys, the schema-change subscription that writes them, and the reopen rehydrate. |
 
 ## Key Types

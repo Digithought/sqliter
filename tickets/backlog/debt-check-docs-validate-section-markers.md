@@ -40,6 +40,32 @@ wrong, because moving the file half is checked and moving the section half is no
 future rename or split has the same hole. The manual mitigation ("grep `§` and read each one")
 was tried on this split and leaked four times out of a few dozen markers.
 
+### Second data point — the `docs-split-schema-rename-detection` split
+
+The same hole showed up again on the next split. That split moved `### Rename Detection` out of
+`docs/schema.md` into `docs/schema-rename-detection.md`. Its own grep for markers missed one
+because the marker was **wrapped across two comment lines**
+(`packages/quereus/src/schema/reserved-tags.ts`, around line 198: `...See docs/schema.md` on one
+line, `§ Rename Detection.` on the next) — so a single-line window never saw the `§`. Whatever
+extractor this ticket adds has to join wrapped comment lines before matching.
+
+The review pass for that split also found three markers naming a section that has **never** been
+in `docs/schema.md` — the content lives in `docs/store.md` (the bold `**Per-column PK key
+collation.**` paragraph, around `store.md:489`). They are stale independently of any split, and
+are the concrete corpus this check would have caught:
+
+| Site | Marker | Should name |
+| --- | --- | --- |
+| `docs/module-capabilities.md:143` | `` [`docs/schema.md` § Per-column PK key collation](schema.md) `` | `store.md` |
+| `packages/quereus/src/schema/table.ts:346` | `` `docs/schema.md` §"Per-column PK key collation" `` | `store.md` |
+| `packages/quereus/test/logic.spec.ts:60` | `docs/schema.md §"Per-column PK key collation"` | `store.md` |
+
+(`docs/memory-table.md:557` carries the same marker and already names `store.md` correctly —
+useful as the positive case.) Note the target is **bold prose, not a heading**, so a
+heading-only matcher would report these as unresolvable rather than as pointing at the wrong
+document; deciding whether bold-lead paragraphs count as markable sections is a third open
+design question alongside the two below.
+
 ## Expected behavior
 
 `node scripts/check-docs.mjs` fails, with the usual `path:line: message` shape, when a prose

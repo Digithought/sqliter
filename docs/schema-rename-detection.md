@@ -2,7 +2,7 @@
 
 > **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
 
-How the declarative schema differ decides that an object was *renamed* rather than dropped and recreated, and the body-change detection that overrides a rename with a drop+recreate. A satellite of [Schema Management](schema.md).
+How the declarative schema differ decides that an object was *renamed* rather than dropped and recreated, and the body-change detection that overrides a rename with a drop+recreate. It also covers the two neighbours that ride the same per-object comparison: metadata **tag-drift** detection, and the **reserved-tag validation** the rename hints themselves are governed by. A satellite of [Schema Management](schema.md).
 
 `computeSchemaDiff(declared, actual, policy?)` accepts an optional `RenamePolicy` (`'allow' | 'require-hint' | 'deny'`, default `'allow'`):
 
