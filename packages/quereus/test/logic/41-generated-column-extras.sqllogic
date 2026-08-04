@@ -499,3 +499,100 @@ select id, u, w, g from t_up_multi;
 → [{"id":1,"u":10,"w":4,"g":8}]
 
 drop table t_up_multi;
+
+-- ===================================
+-- 9j. MULTI-ROW DO UPDATE. Every other case here conflicts on one row; the
+--     second pass composes its row per conflicting row, so a statement mixing
+--     conflicting and non-conflicting rows must recompute each independently.
+-- ===================================
+
+create table t_up_many (id integer primary key, w integer, g integer generated always as (w * 2) stored);
+
+insert into t_up_many (id, w) values (1, 1), (2, 2);
+
+insert into t_up_many (id, w) values (1, 10), (2, 20), (3, 30) on conflict (id) do update set w = excluded.w;
+
+select id, w, g from t_up_many order by id;
+→ [{"id":1,"w":10,"g":20},{"id":2,"w":20,"g":40},{"id":3,"w":30,"g":60}]
+
+drop table t_up_many;
+
+-- ===================================
+-- 9k. A generated value whose expression type differs from the DECLARED column
+--     type is converted on the DO UPDATE arm too — it lands in the same cell as
+--     a user assignment, so it takes the same static-type coercion.
+-- ===================================
+
+create table t_up_coerce (
+	id integer primary key,
+	w  integer,
+	g  text generated always as (w * 2) stored
+);
+
+insert into t_up_coerce (id, w) values (1, 1);
+
+select id, w, g, typeof(g) as t from t_up_coerce;
+→ [{"id":1,"w":1,"g":"2","t":"text"}]
+
+insert into t_up_coerce (id, w) values (1, 5) on conflict (id) do update set w = excluded.w;
+
+select id, w, g, typeof(g) as t from t_up_coerce;
+→ [{"id":1,"w":5,"g":"10","t":"text"}]
+
+drop table t_up_coerce;
+
+-- ===================================
+-- 9l. A generated column whose dependency the SET clause does NOT touch keeps
+--     its value — the recompute reads the composed row, not the proposed insert.
+--     (`a` is 9 in the proposed row and 1 in the existing one; `g` must stay 10.)
+-- ===================================
+
+create table t_up_dep (id integer primary key, a integer, b integer, g integer generated always as (a * 10) stored);
+
+insert into t_up_dep (id, a, b) values (1, 1, 1);
+
+insert into t_up_dep (id, a, b) values (1, 9, 7) on conflict (id) do update set b = excluded.b;
+
+select id, a, b, g from t_up_dep;
+→ [{"id":1,"a":1,"b":7,"g":10}]
+
+drop table t_up_dep;
+
+-- ===================================
+-- 9m. Writing through a view whose basis table has a generated column. The
+--     view-mutation decomposition re-plans some writes as synthesized
+--     `on conflict … do update` statements, so the rejection above could in
+--     principle fire on a lowered statement. It cannot: the view-write
+--     classifier marks a projected generated column read-only and rejects
+--     first, with its own diagnostic. Pinned so that ordering does not drift.
+--     Writing the ORDINARY basis column through the same view still updates the
+--     generated one (that write lowers to a plain member UPDATE, whose own
+--     recompute covers it).
+-- ===================================
+
+create table gojp (pp integer primary key, base integer null, pv integer generated always as (base * 2) stored);
+
+create table gojc (cc integer primary key, pr integer null, cv integer null);
+
+create view gojv as select c.cc as cc, c.cv as cv, p.pv as pv, p.base as base from gojc c left join gojp p on p.pp = c.pr;
+
+insert into gojp (pp, base) values (1, 10);
+insert into gojc values (1, 1, 100);
+
+select cc, cv, pv, base from gojv order by cc;
+→ [{"cc":1,"cv":100,"pv":20,"base":10}]
+
+update gojv set pv = 777 where cc = 1;
+-- error: is a computed (non-invertible) expression and is read-only
+
+select cc, cv, pv, base from gojv order by cc;
+→ [{"cc":1,"cv":100,"pv":20,"base":10}]
+
+update gojv set base = 50 where cc = 1;
+
+select cc, cv, pv, base from gojv order by cc;
+→ [{"cc":1,"cv":100,"pv":100,"base":50}]
+
+drop view gojv;
+drop table gojc;
+drop table gojp;

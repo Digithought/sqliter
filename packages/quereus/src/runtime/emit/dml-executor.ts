@@ -61,9 +61,11 @@ interface RuntimeUpsertClause {
 	/**
 	 * Clone of {@link existingRowDescriptor} — same attribute ids, distinct object
 	 * identity — used to bind those ids to the composed post-assignment row for the
-	 * generated-column pass. Must be a distinct object: the runtime context map is
-	 * keyed by descriptor identity, so re-binding the same object would collide with
-	 * (and on teardown evict) the existing-row binding. Set only when
+	 * generated-column pass. Distinct object on purpose: the runtime context map is
+	 * keyed by descriptor identity, so binding the same object to a second row would
+	 * make the two bindings one entry. The phase-1 binding has already unwound by the
+	 * time phase 2 binds, so today they cannot overlap — the separate object is what
+	 * keeps that true if either pass is ever nested inside the other. Set only when
 	 * {@link generatedAssignments} is non-empty.
 	 */
 	generatedRowDescriptor?: RowDescriptor;
@@ -571,10 +573,10 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// which now holds the CONVERTED user assignments — a generated column derives
 		// from what will be STORED, not from the raw assignment. It cannot run in the
 		// pass above: there the existing-row attributes still resolve to PRE-update
-		// values. Here they are re-bound (via a distinct descriptor object, so the
-		// binding is additive rather than a collision) to the live `updatedRow`, which
-		// each iteration writes back into — so a generated-from-generated column reads
-		// the value its dependency just produced.
+		// values. Here they are re-bound — through a descriptor object of their own, see
+		// {@link RuntimeUpsertClause.generatedRowDescriptor} — to the live `updatedRow`,
+		// which each iteration writes back into, so a generated-from-generated column
+		// reads the value its dependency just produced.
 		//
 		// `await` each evaluator: deterministic does not imply synchronous — a generated
 		// expression may embed a scalar subquery, whose evaluator returns a Promise (see
