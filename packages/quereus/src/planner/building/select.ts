@@ -237,7 +237,10 @@ export function buildSelectStmt(
 		// through is a legal grouping key under another spelling and some is a genuinely
 		// ungrouped column, so hand the window phase both halves: the maps that redirect
 		// the former onto the aggregate's own output columns, and the strict coverage
-		// test that rejects the latter at plan time.
+		// test that rejects the latter at plan time. The aggregate's source relation goes
+		// along so both halves can tell which references belong to THIS query — a window
+		// specification may contain a subquery, whose own columns and whose correlated
+		// references to an enclosing query are neither redirected nor rejected.
 		if (
 			hasWindowFunctions &&
 			aggregateResult.aggregateNode &&
@@ -247,6 +250,7 @@ export function buildSelectStmt(
 			windowGroupedContext = buildGroupedWindowContext(
 				aggregateResult.groupByExpressions,
 				aggregateResult.aggregateNode.getAttributes(),
+				aggregateResult.aggregateNode.getRelations()[0],
 			);
 		}
 

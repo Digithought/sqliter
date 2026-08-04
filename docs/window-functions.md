@@ -65,12 +65,30 @@ runs two passes over each built window specification and argument:
    AggregateNode's own output column for that key, matching either by identity
    fingerprint or, for a bare-column key, by base attribute id (so any qualifier
    spelling works);
-2. `assertGroupByCoverage` then rejects anything still naming a base-table attribute,
-   with the same plan-time message a select-list entry gets.
+2. `assertGroupedWindowCoverage` then rejects anything still naming a pre-grouping
+   column, with the same plan-time message a select-list entry gets.
 
-Both passes stop at a relational child, so a grouping key named inside a **subquery**
-in a window specification is neither redirected nor rejected and still fails at runtime
-— see `fix/bug-window-spec-subquery-reads-base-table-column`.
+Both passes descend through **relational** children too, because a window specification
+may contain a subquery that correlates back to the grouping key (`over (order by (select
+max(t.b) from wg t where t.a = wg.a))`). Inside such a subquery live two unrelated kinds
+of column reference — the subquery's own columns, and correlated references pointing back
+out — so both passes key off `aggregateInputAttrIds`: every attribute id produced anywhere
+in the AggregateNode's *input* subtree, i.e. exactly the columns this query could read
+before it grouped. Attribute ids are minted per relation instance, so a subquery's own
+`wg t` scan and the outer `wg` scan never share one, and membership separates the two
+cases exactly:
+
+- in the redirect, the base-attribute-id rule needs no guard at any depth (only a genuine
+  reference to this query's grouping column can match), while the *fingerprint* rule is
+  guarded on "every column reference in this subtree is a pre-grouping column of this
+  query" — otherwise a bare `a` written inside the subquery, which names the subquery's
+  own `t.a`, would be silently rewritten onto the outer group column;
+- in the coverage check, only a pre-grouping attribute id that is absent from the
+  aggregate's output is rejected. A reference to anything else — the subquery's own
+  columns, or a correlated reference to an **enclosing** query — is legal here and passes
+  through. That is what lets a grouped subquery's window specification correlate outward
+  (`select … (select count(*) from (select row_number() over (order by i.b, o.a) … from wg
+  i where i.a = o.a group by i.b) z) … from wg o group by o.a`).
 
 An aggregate inside a window specification of a grouped query must be one the select
 list already computes — the window runs *above* the aggregation, so there is nothing

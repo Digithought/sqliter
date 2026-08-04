@@ -17,6 +17,7 @@ import { resolveFunctionSchema } from './schema-resolution.js';
 import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { expressionToString, expressionToIdentityString } from '../../emit/ast-stringify.js';
 import { buildOrdinalAwareExpression, resolveOrdinalReference, type SelectListEntry } from './select-ordinal.js';
+import { collectDefinedAttrIds } from '../analysis/equi-correlation.js';
 
 /**
  * Processes GROUP BY, aggregates, and HAVING clauses
@@ -226,11 +227,15 @@ function handlePreAggregateSort(
  * Two flavours of attribute id are legal, and both matter depending on where the
  * expression being checked was built. An expression built against the
  * *pre-aggregate* scope (the SELECT list, before the final projection) names base
- * source attributes, so the ids of the GROUP BY key expressions cover it. An
- * expression built against the *aggregate-output* scope (HAVING, a window
- * specification in a grouped query) names the AggregateNode's own output
- * attributes instead, so those ids must be admitted too — pass them in
- * `groupedOutputAttributes`.
+ * source attributes, so the ids of the GROUP BY key expressions cover it. A HAVING
+ * predicate resolves through a hybrid scope and may name either the AggregateNode's
+ * own output attributes or, via the source-column fallback, base ones — so the
+ * output ids must be admitted too, passed in `groupedOutputAttributes`.
+ *
+ * The window phase of a grouped query has its own check
+ * ({@link assertGroupedWindowCoverage}); it needs to descend into subqueries and to
+ * tell a correlated reference from an ungrouped local one, neither of which this
+ * coverage set can express.
  *
  * The fingerprint set covers whole grouped subtrees (`select id+1 … group by
  * id+1`) and, incidentally, the qualifier mismatch between `group by t.a` and a
@@ -269,10 +274,8 @@ export function buildGroupByCoverage(
 
 /**
  * Raises the standard GROUP BY coverage error when `node` reads a column the
- * grouped rows do not carry. Shared by the SELECT-list check below and by the
- * window phase's window-specification check, so a window spec that reads an
- * ungrouped column fails with the same plan-time message as a select-list entry
- * that does.
+ * grouped rows do not carry. Used by the SELECT-list check below; the window
+ * phase raises the same message from {@link assertGroupedWindowCoverage}.
  */
 export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage): void {
 	const ungrouped = findUngroupedColumnRef(node, coverage);
@@ -306,12 +309,25 @@ export interface GroupedWindowContext {
 	/** AggregateNode output attributes: group keys in GROUP BY order, then aggregate results. */
 	readonly outputAttributes: readonly Attribute[];
 	/**
-	 * Legal AFTER redirection: AggregateNode output attribute ids ONLY — no base
-	 * group-key attribute ids and no fingerprints. Once {@link redirectToGroupKeys}
-	 * has run, nothing legitimate reaching a WindowNode over an aggregate may still
-	 * name a base-table attribute, so anything that does is an ungrouped reference.
+	 * Every attribute id produced anywhere in the AggregateNode's input subtree —
+	 * exactly "the columns this grouped query could have read before it grouped".
+	 *
+	 * This is what tells a reference belonging to THIS query apart from one that does
+	 * not, at any nesting depth. A window specification may contain a subquery, and
+	 * inside it live two unrelated kinds of column reference: the subquery's own
+	 * columns and correlated references pointing back out. Attribute ids are minted
+	 * per relation instance, so a subquery's own `wg t` scan and the outer `wg` scan
+	 * never share one — membership here separates them exactly. A reference NOT in
+	 * this set is the subquery's own column or a reference to an ENCLOSING query, and
+	 * is none of the window phase's business either way.
 	 */
-	readonly coverage: GroupByCoverage;
+	readonly aggregateInputAttrIds: ReadonlySet<number>;
+	/**
+	 * Legal AFTER redirection: AggregateNode output attribute ids ONLY. Once
+	 * {@link redirectToGroupKeys} has run, an aggregate-input attribute id still
+	 * present anywhere in a window expression is an ungrouped reference.
+	 */
+	readonly outputAttrIds: ReadonlySet<number>;
 }
 
 /**
@@ -354,19 +370,20 @@ export function indexGroupKeys(groupByExpressions: readonly ScalarPlanNode[]): G
 /**
  * Builds the {@link GroupedWindowContext} for a grouped, windowed query.
  * `outputAttributes` is the AggregateNode's attribute list (group keys in GROUP BY
- * order, then the aggregate results).
+ * order, then the aggregate results); `aggregateInput` is the AggregateNode's
+ * source relation, whose whole subtree defines
+ * {@link GroupedWindowContext.aggregateInputAttrIds}.
  */
 export function buildGroupedWindowContext(
 	groupByExpressions: readonly ScalarPlanNode[],
 	outputAttributes: readonly Attribute[],
+	aggregateInput: PlanNode,
 ): GroupedWindowContext {
 	return {
 		groupKeys: indexGroupKeys(groupByExpressions),
 		outputAttributes,
-		coverage: {
-			attrIds: new Set(outputAttributes.map(attr => attr.id)),
-			fingerprints: new Set<string>(),
-		},
+		aggregateInputAttrIds: collectDefinedAttrIds(aggregateInput),
+		outputAttrIds: new Set(outputAttributes.map(attr => attr.id)),
 	};
 }
 
@@ -383,59 +400,151 @@ export function buildGroupedWindowContext(
  *    as `over (order by upper(a || '!'))` because the walk recurses. Identifier case
  *    is folded, so `group by A || '!'` matches too; quoted literals are byte-exact,
  *    so `a || 'X'` and `a || 'x'` remain different keys.
+ *
+ *    Guarded by {@link readsOnlyAggregateInput}: the subtree matches only when every
+ *    column reference in it is a pre-grouping column of THIS query. The guard exists
+ *    because the walk descends into subqueries (below): under `group by a`, a bare `a`
+ *    written INSIDE `over (order by (select … where t.a = a))` names the subquery's own
+ *    `t.a` and yet fingerprints as `a`, so an unguarded rule 1 would silently rewrite
+ *    it into the outer group column and change what the query means. At the top level
+ *    the guard holds by construction — an expression there reads either a base column
+ *    of this query or an aggregate output column, and in the latter case rule 1 was
+ *    already a no-op rewrite onto the column the node names anyway.
  * 2. The node is a column reference whose attribute id is the *base* attribute id of
  *    a bare-column grouping key — covers `group by a` + `over (order by wg.a)` and
  *    `over (order by w.a)`. Both spellings fall through to the same base attribute
- *    the group key was built from, so the match is qualifier-independent.
+ *    the group key was built from, so the match is qualifier-independent. It needs no
+ *    guard at any depth: attribute ids are minted per relation instance, so only a
+ *    reference that genuinely resolves to this query's grouping column can match.
  *
- * Otherwise recurse into scalar children only; relational children resolve their own
- * scope.
+ * Otherwise recurse into every child, relational ones included, rebuilding through
+ * `withChildren` — a correlated reference to a grouping key can live arbitrarily deep
+ * inside a subquery in the window specification, and it must be redirected there too
+ * or it reaches the runtime as a base-table attribute the grouped row never carried.
  *
  * NOTE: rule 1 matches by AST text, so a subtree that *reads* like a grouping key but
- * resolves to something else (a correlated outer reference shadowed by an
- * identically-spelled local column) would be redirected wrongly. This is the same
+ * resolves to something else could be redirected wrongly. Within one query the guard
+ * above closes that off; the residue is a subtree of ENCLOSING-query references that
+ * happens to spell a grouping key (`group by a` in an inner query whose window spec
+ * says `outer_alias.a`… only when that fingerprints identically). This is the same
  * limitation the select list already carries through the shared {@link GroupKeyIndex};
  * fixing it means comparing resolved attribute identity rather than text, for both
  * callers at once.
- *
- * NOTE: neither this walk nor the {@link assertGroupByCoverage} pass that follows
- * descends into a relational child, so a grouping key named inside a subquery in a
- * window specification (`over (order by (select … where t.a = wg.a))`) is neither
- * redirected nor rejected, and still dies at runtime with "No row context found" —
- * see `fix/bug-window-spec-subquery-reads-base-table-column`.
  */
 export function redirectToGroupKeys(
 	node: ScalarPlanNode,
 	context: GroupedWindowContext,
 	scope: Scope,
 ): ScalarPlanNode {
-	const fingerprintIndex = context.groupKeys.byFingerprint.get(expressionToIdentityString(node.expression));
-	if (fingerprintIndex !== undefined) {
-		return buildGroupKeyColumnRef(scope, context.outputAttributes[fingerprintIndex], node.expression, fingerprintIndex);
-	}
+	return redirectNode(node, context, scope) as ScalarPlanNode;
+}
 
-	if (CapabilityDetectors.isColumnReference(node)) {
-		const baseIndex = context.groupKeys.byBaseAttrId.get((node as ColumnReferenceNode).attributeId);
-		if (baseIndex !== undefined) {
-			return buildGroupKeyColumnRef(scope, context.outputAttributes[baseIndex], node.expression, baseIndex);
+/**
+ * {@link redirectToGroupKeys} over any plan node — the walk crosses relational
+ * boundaries, so it cannot be typed scalar-to-scalar throughout.
+ *
+ * NOTE: this renders an identity fingerprint at every scalar node it visits, and a
+ * fingerprint hit then walks that node's subtree again for the guard — so a window
+ * specification containing a large subquery costs more to build than before, once per
+ * prepare of the query. Not measured; if preparing such queries ever shows up as slow,
+ * memoize the fingerprint per node or bail out of the walk for subtrees that contain no
+ * `aggregateInputAttrIds` reference at all.
+ */
+function redirectNode(
+	node: PlanNode,
+	context: GroupedWindowContext,
+	scope: Scope,
+): PlanNode {
+	if ('expression' in node) {
+		const expression = (node as ScalarPlanNode).expression;
+		const fingerprintIndex = context.groupKeys.byFingerprint.get(expressionToIdentityString(expression));
+		if (fingerprintIndex !== undefined && readsOnlyAggregateInput(node, context)) {
+			return buildGroupKeyColumnRef(scope, context.outputAttributes[fingerprintIndex], expression, fingerprintIndex);
 		}
-		return node;
+
+		if (CapabilityDetectors.isColumnReference(node)) {
+			const baseIndex = context.groupKeys.byBaseAttrId.get((node as ColumnReferenceNode).attributeId);
+			if (baseIndex !== undefined) {
+				return buildGroupKeyColumnRef(scope, context.outputAttributes[baseIndex], expression, baseIndex);
+			}
+			return node;
+		}
 	}
 
 	const newChildren: PlanNode[] = [];
 	let changed = false;
 	for (const child of node.getChildren()) {
-		// Only scalar children participate; relational subtrees resolve their own scope.
-		if (!('expression' in child)) {
-			newChildren.push(child);
-			continue;
-		}
-		const rewritten = redirectToGroupKeys(child as ScalarPlanNode, context, scope);
+		const rewritten = redirectNode(child, context, scope);
 		if (rewritten !== child) changed = true;
 		newChildren.push(rewritten);
 	}
 
-	return changed ? (node.withChildren(newChildren) as ScalarPlanNode) : node;
+	return changed ? node.withChildren(newChildren) : node;
+}
+
+/**
+ * True when every column reference in `node`'s subtree names a column the grouped
+ * query could have read before it grouped — i.e. the whole subtree belongs to THIS
+ * query rather than to a subquery inside it or to an enclosing query. A subtree with
+ * no column references at all (a constant) trivially qualifies.
+ */
+function readsOnlyAggregateInput(node: PlanNode, context: GroupedWindowContext): boolean {
+	if (CapabilityDetectors.isColumnReference(node)) {
+		return context.aggregateInputAttrIds.has((node as ColumnReferenceNode).attributeId);
+	}
+	for (const child of node.getChildren()) {
+		if (!readsOnlyAggregateInput(child, context)) return false;
+	}
+	return true;
+}
+
+/**
+ * Raises the GROUP BY coverage error for a window specification / window-function
+ * argument of a GROUPED query that still reads a pre-grouping column after
+ * {@link redirectToGroupKeys} has run.
+ *
+ * Distinct from {@link assertGroupByCoverage} in exactly two ways, both required by
+ * the fact that a window expression may contain a subquery:
+ *
+ * - it descends into relational children, so a correlated reference buried in a
+ *   subquery is checked rather than skipped;
+ * - it flags a column reference only when the attribute id is one of THIS query's
+ *   pre-grouping columns. A reference to anything else — the subquery's own columns,
+ *   or a correlated reference to an enclosing query — is legal here and is left alone.
+ */
+export function assertGroupedWindowCoverage(node: PlanNode, context: GroupedWindowContext): void {
+	const ungrouped = findUngroupedWindowColumnRef(node, context);
+	if (!ungrouped) return;
+	throw new QuereusError(
+		`Column '${expressionToString(ungrouped.expression)}' must appear in the GROUP BY clause or be used in an aggregate function`,
+		StatusCode.ERROR,
+		undefined,
+		ungrouped.expression.loc?.start.line,
+		ungrouped.expression.loc?.start.column,
+	);
+}
+
+/** The first pre-grouping column reference in `node` that the grouped row cannot carry. */
+function findUngroupedWindowColumnRef(
+	node: PlanNode,
+	context: GroupedWindowContext
+): ColumnReferenceNode | null {
+	// An aggregate's own arguments read pre-grouping columns by definition.
+	if (CapabilityDetectors.isAggregateFunction(node)) {
+		return null;
+	}
+
+	if (CapabilityDetectors.isColumnReference(node)) {
+		const attrId = (node as ColumnReferenceNode).attributeId;
+		const ungrouped = context.aggregateInputAttrIds.has(attrId) && !context.outputAttrIds.has(attrId);
+		return ungrouped ? node as ColumnReferenceNode : null;
+	}
+
+	for (const child of node.getChildren()) {
+		const found = findUngroupedWindowColumnRef(child, context);
+		if (found) return found;
+	}
+	return null;
 }
 
 /**

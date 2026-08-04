@@ -989,6 +989,77 @@ with q as (select a, row_number() over (order by a) as rn from wg group by a)
 select * from q where rn > 1;
 → [{"a":"y","rn":2}]
 
+-- A window specification may also contain a SUBQUERY that correlates back to the
+-- grouping key. The redirect and the coverage check both descend through the
+-- subquery to reach it, keying off the attribute ids the aggregate's INPUT
+-- produces so the subquery's own columns are left alone
+-- (bug-window-spec-subquery-reads-base-table-column — every shape below used to
+-- die with an internal "No row context found for column a" error).
+
+-- Scalar subquery in ORDER BY: `max(b)` per group is '3' for a='x' and '2' for
+-- a='y', so ascending puts y first.
+select a, row_number() over (order by (select max(t.b) from wg t where t.a = wg.a)) as rn
+from wg group by a order by rn;
+→ [{"a":"y","rn":1},{"a":"x","rn":2}]
+
+-- `exists (…)` correlated on the grouping key: true only for the group that has a
+-- row with b > '2' (a='x'), so y sorts first.
+select a, row_number() over (order by (case when exists (select 1 from wg t where t.a = wg.a and t.b > '2') then 1 else 0 end)) as rn
+from wg group by a order by rn;
+→ [{"a":"y","rn":1},{"a":"x","rn":2}]
+
+-- `x in (select …)`, correlated on both sides of the membership test.
+select a, row_number() over (order by (case when wg.a in (select t.a from wg t where t.a = wg.a and t.b > '2') then 1 else 0 end)) as rn
+from wg group by a order by rn;
+→ [{"a":"y","rn":1},{"a":"x","rn":2}]
+
+-- In a window function's ARGUMENT rather than its specification: the per-group
+-- values '3' and '2' summed over the whole (unpartitioned) window.
+select a, sum((select max(t.b) from wg t where t.a = wg.a)) over () as s
+from wg group by a order by a;
+→ [{"a":"x","s":5},{"a":"y","s":5}]
+
+-- In PARTITION BY: the correlated subquery yields a distinct value per group, so
+-- every partition holds exactly one grouped row.
+select a, count(*) over (partition by (select max(t.b) from wg t where t.a = wg.a)) as c
+from wg group by a order by a;
+→ [{"a":"x","c":1},{"a":"y","c":1}]
+
+-- The mirror image, and the reason the redirect cannot simply match by name: a
+-- BARE `a` written inside the subquery names the subquery's OWN `t.a`, not the
+-- grouping key, so the predicate is the tautology `t.a = t.a` and every group sees
+-- the same global `max(b)`. One partition of two grouped rows, not two of one.
+select a, count(*) over (partition by (select max(t.b) from wg t where t.a = a)) as c
+from wg group by a order by a;
+→ [{"a":"x","c":2},{"a":"y","c":2}]
+
+-- A correlated reference to a NON-grouped column is rejected at plan time, with the
+-- same message a bare ungrouped column in a window specification gets.
+select a, row_number() over (order by (select max(t.b) from wg t where t.b = wg.b)) as rn
+from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Same rejection when the ungrouped column is only on one side of the correlation.
+select a, row_number() over (order by (select count(*) from wg t where t.a = wg.b)) as rn
+from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- An UNCORRELATED subquery in a window specification reads nothing of this query's
+-- and is left entirely alone.
+select a, row_number() over (order by (select max(t.b) from wg t), a) as rn
+from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A window specification inside a GROUPED SUBQUERY may correlate to the ENCLOSING
+-- query. `o.a` is not one of the inner query's pre-grouping columns, so the inner
+-- coverage check has no business rejecting it — it used to, because its only
+-- vocabulary was "is this an aggregate output column".
+select o.a,
+       (select count(*) from (select row_number() over (order by i.b, o.a) rn
+                              from wg i where i.a = o.a group by i.b) z) c
+from wg o group by o.a order by o.a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
 drop table wg;
 
 -- =============================================================================

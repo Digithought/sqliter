@@ -8,7 +8,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { ArrayIndexNode } from '../nodes/array-index-node.js';
 import { LiteralNode } from '../nodes/scalar.js';
 import { buildExpression } from './expression.js';
-import { assertGroupByCoverage, collectAggregateFunctionExprs, redirectToGroupKeys, type GroupedWindowContext } from './select-aggregates.js';
+import { assertGroupedWindowCoverage, collectAggregateFunctionExprs, redirectToGroupKeys, type GroupedWindowContext } from './select-aggregates.js';
 import { findMatchingAggregate } from './function-call.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -94,23 +94,18 @@ export function buildWindowPhase(
 			selectContext
 		).map(args => args.map(redirect));
 
-		// After redirection, anything still naming a base-table attribute is a genuinely
-		// ungrouped reference, illegal for exactly the reason a bare column in the select
-		// list is, and must say so at plan time — otherwise it reaches the runtime as an
-		// attribute the aggregate row never had, and the query dies with an internal
-		// "no row context" error instead.
-		//
-		// NOTE: the coverage set is AggregateNode output attribute ids only, so this
-		// cannot tell a correlated reference to an ENCLOSING relation from an ungrouped
-		// local one — both are rejected with the same message. Supporting a correlated
-		// window specification in a grouped subquery means admitting the enclosing
-		// relations' attribute ids here (the loose pre-redirect coverage rejected it too,
-		// so nothing regressed by tightening).
+		// After redirection, anything still naming one of this query's pre-grouping
+		// columns is a genuinely ungrouped reference, illegal for exactly the reason a
+		// bare column in the select list is, and must say so at plan time — otherwise it
+		// reaches the runtime as an attribute the aggregate row never had, and the query
+		// dies with an internal "no row context" error instead. A reference belonging to
+		// a subquery inside the specification, or correlated out to an ENCLOSING query,
+		// is not this query's business and passes through.
 		if (groupedWindowContext) {
-			for (const expr of partitionExpressions) assertGroupByCoverage(expr, groupedWindowContext.coverage);
-			for (const expr of orderByExpressions) assertGroupByCoverage(expr, groupedWindowContext.coverage);
+			for (const expr of partitionExpressions) assertGroupedWindowCoverage(expr, groupedWindowContext);
+			for (const expr of orderByExpressions) assertGroupedWindowCoverage(expr, groupedWindowContext);
 			for (const args of functionArguments) {
-				for (const arg of args) assertGroupByCoverage(arg, groupedWindowContext.coverage);
+				for (const arg of args) assertGroupedWindowCoverage(arg, groupedWindowContext);
 			}
 		}
 
