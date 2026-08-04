@@ -336,6 +336,8 @@ Note the deliberate asymmetry with DDL: unqualified DDL lands objects in the **c
 
 The same isolation applies to the **common-table-expression namespace**, not only the schema search path: a stored body binds only the `with` clause it declares itself, plus schema objects on its home path — a caller's `with` clause is invisible to it, so `with t as (…) select * from v` cannot substitute the caller's `t` for the base table `v` reads. Ephemeral write targets are excluded: a CTE-name DML target (`with c as (…) update c set …`) or an inline FROM-subquery target is part of the *caller's own statement*, so it keeps the caller's CTEs along with the caller's schema path.
 
+**Schema-authored expressions never see a statement's CTEs.** A column `default`, a generated-column expression, a `check` constraint and a foreign-key existence check are written in the *table's* definition, not in the statement doing the write, so their unqualified relation names always mean schema objects — never a `with` clause, whether the writing statement declared it itself or inherited it from an enclosing statement. Given `create table t (w integer default (select count(*) from c))`, the statement `with c as (…) insert into t (id) values (1)` still counts rows of the real table `c`. (These expressions are built inline in the writing statement rather than re-entered as their own plan, so — unlike a stored body — only the CTE namespace is withheld; the schema path narrowing described above is applied by the constraint and foreign-key builders themselves.)
+
 See the [Usage Guide](usage.md) for the consumer-facing declarative schema workflow, schema path resolution order, and `PRAGMA schema_path` syntax.
 
 ## Database Options Affecting Schema

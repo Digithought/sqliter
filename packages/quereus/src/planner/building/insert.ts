@@ -28,6 +28,7 @@ import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode, type UpsertClausePlan } from '../nodes/dml-executor-node.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
 import { buildChildSideFKChecks } from './foreign-key-builder.js';
+import { schemaAuthoredContext } from './schema-authored-context.js';
 import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
@@ -533,9 +534,11 @@ export function buildInsertStmt(
 	// gets the context back unchanged (no overhead).
 	//
 	// SCHEMA-authored expressions are deliberately NOT built on this context — column
-	// defaults, generated columns, CHECK constraints and FK checks stay on
-	// `contextWithSchemaPath` / `ctx` below, so a `default (select … from c)` written in
-	// the table's DDL cannot bind a caller's statement-level `c`.
+	// defaults, generated columns, CHECK constraints and FK checks are built on the
+	// `schemaAuthoredContext`-derived contexts below, which clear the CTE namespace
+	// outright (this statement's own definitions AND the ones it inherited), so a
+	// `default (select … from c)` written in the table's DDL cannot bind a caller's
+	// statement-level `c`.
 	//
 	// NOTE: this sits ABOVE the view / MV dispatch, so on a view target the clause is built
 	// here and then AGAIN when `buildViewMutation` re-plans the statement through this same
@@ -740,8 +743,20 @@ export function buildInsertStmt(
 		}
 	}
 
+	// Contexts for the table's OWN schema-authored SQL (column defaults, generated
+	// columns, CHECK constraints, FK probes). Derived once here rather than per call
+	// site; both clear the CTE namespace so none of that SQL can bind a statement's
+	// common table expressions. Two of them only because the existing call sites differ
+	// in which schema path they ride — see the NOTE at the row-expansion call below.
+	const schemaAuthoredCtx = schemaAuthoredContext(ctx);
+	const schemaAuthoredPathCtx = stmt.schemaPath ? schemaAuthoredContext(contextWithSchemaPath) : schemaAuthoredCtx;
+
 	// ORTHOGONAL ROW EXPANSION: Apply uniform row expansion to map any source to table structure with defaults
-	const expandedSourceNode = createRowExpansionProjection(contextWithSchemaPath, sourceNode, targetColumns, tableReference, contextScope, defaultRowContextScope);
+	// NOTE: defaults / generated columns ride the STATEMENT's `with schema` path, while
+	// the constraint and FK builders below narrow to the table's own schema themselves.
+	// That asymmetry is pre-existing and has produced no observed wrong answer; if a
+	// default ever resolves a relation the table's home schema would not, unify them.
+	const expandedSourceNode = createRowExpansionProjection(schemaAuthoredPathCtx, sourceNode, targetColumns, tableReference, contextScope, defaultRowContextScope);
 
 	// Update targetColumns to reflect all table columns since we've expanded the source
 	const finalTargetColumns = tableReference.tableSchema.columns.map(col => columnSchemaToDef(col.name, col));
@@ -774,7 +789,7 @@ export function buildInsertStmt(
 
 	// Build constraint checks at plan time
 	const constraintChecks = buildConstraintChecks(
-		ctx,
+		schemaAuthoredCtx,
 		tableReference.tableSchema,
 		RowOpFlag.INSERT,
 		oldAttributes,
@@ -787,7 +802,7 @@ export function buildInsertStmt(
 	// Build FK constraint checks if foreign_keys pragma is enabled
 	if (ctx.db.options.getBooleanOption('foreign_keys')) {
 		const fkChecks = buildChildSideFKChecks(
-			ctx, tableReference.tableSchema, RowOpFlag.INSERT,
+			schemaAuthoredCtx, tableReference.tableSchema, RowOpFlag.INSERT,
 			oldAttributes, newAttributes, contextAttributes
 		);
 		constraintChecks.push(...fkChecks);
@@ -796,7 +811,7 @@ export function buildInsertStmt(
 	// Pre-build DEFAULT evaluators for NOT NULL columns. Used by REPLACE to
 	// substitute the default when the user supplied NULL.
 	const notNullDefaults = buildNotNullDefaults(
-		ctx, tableReference.tableSchema, newAttributes, contextAttributes, defaultRowContextScope
+		schemaAuthoredCtx, tableReference.tableSchema, newAttributes, contextAttributes, defaultRowContextScope
 	);
 
 	const insertNode = new InsertNode(

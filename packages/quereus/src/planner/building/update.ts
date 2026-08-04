@@ -29,6 +29,7 @@ import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { buildWithContext } from './select-context.js';
 import { resolveCteTarget, contextForCteTarget, resolveSubqueryTarget } from './dml-target.js';
+import { schemaAuthoredContext } from './schema-authored-context.js';
 
 export function buildUpdateStmt(
   ctx: PlanningContext,
@@ -175,6 +176,16 @@ export function buildUpdateStmt(
   // subquery builds — a CTE read in either now resolves (closes the prior read gap).
   const updateCtx = { ...contextWithCTEs, scope: tableScope };
 
+  // Contexts for the table's OWN schema-authored SQL (generated-column recompute,
+  // CHECK constraints, NOT NULL defaults, FK probes). Derived once here rather than
+  // per call site; both clear the CTE namespace so none of that SQL can bind this
+  // statement's common table expressions — its own leading `with` clause or ones it
+  // inherited from an enclosing statement. `schemaAuthoredUpdateCtx` keeps the table
+  // scope so `new.` / `old.` still resolve; `schemaAuthoredCtx` matches the bare `ctx`
+  // the FK builders already took (they narrow the schema path themselves).
+  const schemaAuthoredUpdateCtx = schemaAuthoredContext(updateCtx);
+  const schemaAuthoredCtx = schemaAuthoredContext(ctx);
+
   // IMPORTANT: Build assignments FIRST to ensure parameter indices match SQL text order.
   // SQL: UPDATE t SET col = ?1 WHERE id = ?2
   // The SET clause parameters must be resolved before WHERE clause parameters.
@@ -219,7 +230,7 @@ export function buildUpdateStmt(
   for (const colIdx of genTopoOrder) {
     const col = tableReference.tableSchema.columns[colIdx];
     if (!col.generated || !col.generatedExpr) continue;
-    const genNode = buildExpression(updateCtx, col.generatedExpr) as ScalarPlanNode;
+    const genNode = buildExpression(schemaAuthoredUpdateCtx, col.generatedExpr) as ScalarPlanNode;
     if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
       validateDeterministicGenerated(genNode, col.name, tableReference.tableSchema.name);
     }
@@ -260,7 +271,7 @@ export function buildUpdateStmt(
 
   // Build constraint checks at plan time
   const constraintChecks = buildConstraintChecks(
-    updateCtx,
+    schemaAuthoredUpdateCtx,
     tableReference.tableSchema,
     RowOpFlag.UPDATE,
     oldAttributes,
@@ -274,7 +285,7 @@ export function buildUpdateStmt(
   if (ctx.db.options.getBooleanOption('foreign_keys')) {
     // Child-side: check new FK values reference valid parent rows
     const childFKChecks = buildChildSideFKChecks(
-      ctx, tableReference.tableSchema, RowOpFlag.UPDATE,
+      schemaAuthoredCtx, tableReference.tableSchema, RowOpFlag.UPDATE,
       oldAttributes, newAttributes, contextAttributes
     );
     constraintChecks.push(...childFKChecks);
@@ -287,7 +298,7 @@ export function buildUpdateStmt(
     // ABORT default (matching the `undefined` onConflict on the DmlExecutorNode).
     if (getBatchableRestrictFks(ctx.schemaManager, tableReference.tableSchema, 'update', undefined, lensRouted) === undefined) {
       const parentFKChecks = buildParentSideFKChecks(
-        ctx, tableReference.tableSchema, RowOpFlag.UPDATE,
+        schemaAuthoredCtx, tableReference.tableSchema, RowOpFlag.UPDATE,
         oldAttributes, newAttributes, contextAttributes
       );
       constraintChecks.push(...parentFKChecks);
@@ -296,7 +307,7 @@ export function buildUpdateStmt(
 
   // Pre-build DEFAULT evaluators for NOT NULL columns (used by REPLACE substitution).
   const notNullDefaults = buildNotNullDefaults(
-    updateCtx, tableReference.tableSchema, newAttributes, contextAttributes
+    schemaAuthoredUpdateCtx, tableReference.tableSchema, newAttributes, contextAttributes
   );
 
   if (stmt.returning && stmt.returning.length > 0) {

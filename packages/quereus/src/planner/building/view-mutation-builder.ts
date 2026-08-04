@@ -33,6 +33,7 @@ import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { raiseMutationDiagnostic } from '../mutation/mutation-diagnostic.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { buildRowDefaultScope } from './default-scope.js';
+import { schemaAuthoredContext } from './schema-authored-context.js';
 import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('planner:view-mutation');
@@ -935,7 +936,12 @@ function buildKeyDefault(
 	}));
 	const rowScope = buildRowDefaultScope(ctx.scope, suppliedColumns, rowAttrs);
 
-	const node = buildExpression({ ...ctx, scope: rowScope }, keyDefault) as ScalarPlanNode;
+	// SCHEMA-authored: this is the anchor key column's own declared `default`, so — like
+	// every other default / generated column / CHECK / FK probe — it resolves relation
+	// names against the schema, never against a statement's common table expressions.
+	// This is the ONE schema-authored build the decomposition lowering does itself; the
+	// per-member base ops re-enter `buildInsertStmt`, which clears the namespace there.
+	const node = buildExpression({ ...schemaAuthoredContext(ctx), scope: rowScope }, keyDefault) as ScalarPlanNode;
 	if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
 		validateDeterministicDefault(node, '<shared key>', view.name);
 	}

@@ -36,6 +36,12 @@ import type { PlanningContext } from './planning-context.js';
  * target, a rewritten base op) must NOT use this — see `bodyPlanningContext` in
  * `mutation/body-context.ts`, which guards the ephemeral case and delegates here otherwise.
  *
+ * The OTHER kind of stored, schema-authored SQL — a column `DEFAULT`, a generated-column
+ * expression, a `CHECK` constraint, a synthesized foreign-key probe — is built INLINE in
+ * the caller's statement rather than re-entered as its own plan, so it needs only the CTE
+ * namespace cleared, never the home path or the `storedBodyOf` marker. See the sibling
+ * {@link import('./building/schema-authored-context.js').schemaAuthoredContext}.
+ *
  * Lives at the top level of `planner/` (not under `building/` or `mutation/`) because both
  * directories consume it: `building/select.ts` on the read path, `mutation/body-context.ts`
  * on the write path. Neither should import from the other for this.

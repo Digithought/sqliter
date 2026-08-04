@@ -29,6 +29,7 @@ import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { buildWithContext } from './select-context.js';
 import { resolveCteTarget, contextForCteTarget, resolveSubqueryTarget } from './dml-target.js';
+import { schemaAuthoredContext } from './schema-authored-context.js';
 
 export function buildDeleteStmt(
   ctx: PlanningContext,
@@ -175,6 +176,16 @@ export function buildDeleteStmt(
   // builds — a CTE read there now resolves (closes the prior read gap).
   const deleteCtx = { ...contextWithCTEs, scope: tableScope };
 
+  // Contexts for the table's OWN schema-authored SQL (`check on delete` constraints,
+  // parent-side FK probes). Derived once here rather than per call site; both clear the
+  // CTE namespace so none of that SQL can bind this statement's common table
+  // expressions — its own leading `with` clause or ones it inherited from an enclosing
+  // statement. `schemaAuthoredDeleteCtx` keeps the table scope so `old.` still resolves;
+  // `schemaAuthoredCtx` matches the bare `ctx` the FK builder already took (it narrows
+  // the schema path itself).
+  const schemaAuthoredDeleteCtx = schemaAuthoredContext(deleteCtx);
+  const schemaAuthoredCtx = schemaAuthoredContext(ctx);
+
   if (stmt.where) {
     const filterExpression = buildExpression(deleteCtx, stmt.where);
     sourceNode = new FilterNode(deleteCtx.scope, sourceNode, filterExpression);
@@ -208,7 +219,7 @@ export function buildDeleteStmt(
 
   // Build constraint checks at plan time
   const constraintChecks = buildConstraintChecks(
-    deleteCtx,
+    schemaAuthoredDeleteCtx,
     tableReference.tableSchema,
     RowOpFlag.DELETE,
     oldAttributes,
@@ -228,7 +239,7 @@ export function buildDeleteStmt(
   if (ctx.db.options.getBooleanOption('foreign_keys')
     && getBatchableRestrictFks(ctx.schemaManager, tableReference.tableSchema, 'delete', undefined, lensRouted) === undefined) {
     const parentFKChecks = buildParentSideFKChecks(
-      ctx, tableReference.tableSchema, RowOpFlag.DELETE,
+      schemaAuthoredCtx, tableReference.tableSchema, RowOpFlag.DELETE,
       oldAttributes, newAttributes, contextAttributes
     );
     constraintChecks.push(...parentFKChecks);
