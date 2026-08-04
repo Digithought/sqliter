@@ -82,6 +82,32 @@ with recursive r(n) as (
 select count(*) as n from main.r;
 -- error: Table not found: main.r
 
+-- ...and the same inside the recursive body: the working-table binding is reached by the
+-- BARE self-reference only, so a qualified self-reference is an ordinary schema lookup.
+with recursive r(n) as (
+  select 1
+  union all
+  select n + 1 from main.r where n < 3
+)
+select count(*) as n from r;
+-- error: Table not found: main.r
+
+-- ===== A qualified name reaches a VIEW too, not only a base table =====
+-- The fall-through arm resolves view / maintained table / base table alike; the CTE used to
+-- win over all three.
+
+create view cv as select k from c;
+-- run
+
+with cv as (select id as k from p) select count(*) as n from main.cv;
+→ [{"n":3}]
+
+with cv as (select id as k from p) select count(*) as n from cv;
+→ [{"n":1}]
+
+drop view cv;
+-- run
+
 -- ===== No same-named schema object: ordinary table-not-found, not a silent CTE bind =====
 -- The qualified miss reports `Table not found: <schema>.<name>` (resolveTableSchema's
 -- explicit-schema arm in planner/building/schema-resolution.ts); the search-path wording

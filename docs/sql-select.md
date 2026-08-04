@@ -796,6 +796,12 @@ select ... from cte_name ...
   materialized-view target is included — the write-through rewrite carries the same CTEs.
   (A *subquery* in `ON CONFLICT` or `WITH CONTEXT` currently resolves but does not yet
   execute — an unrelated planner gap, tracked separately.)
+- A **schema-qualified** `FROM` name never binds a CTE. A CTE lives in no schema, so
+  `main.c` can only mean the schema object `c`: `WITH c AS (…) SELECT … FROM c` reads the
+  CTE while `… FROM main.c` reads the real table / view, and a qualified name with no
+  matching schema object raises the ordinary table-not-found error rather than silently
+  binding the CTE. The same rule applies to a qualified DML target (`UPDATE main.c`). This
+  matches SQLite and PostgreSQL.
 - **Schema-authored** expressions are deliberately excluded: a column `DEFAULT`, a
   generated-column expression, a `CHECK` constraint and a foreign-key existence check
   belong to the table's DDL rather than to the statement, so
