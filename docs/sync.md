@@ -969,6 +969,7 @@ fire-and-forget `push_changes`, and `ping` / `pong` keep the socket alive.
 | `get_changes` | Request changes since an HLC | `{ sinceHLC? }` (base64) |
 | `apply_changes` | Push local changes to server | `{ changes: ChangeSet[], requestId? }` |
 | `get_snapshot` | Request full snapshot | (none) |
+| `resume_snapshot` | Resume an interrupted snapshot from a saved checkpoint | `{ checkpoint }` (via `serializeSnapshotCheckpoint`) |
 | `ping` | Heartbeat / keepalive | (none) |
 
 **Server → Client:**
@@ -980,6 +981,7 @@ fire-and-forget `push_changes`, and `ping` / `pong` keep the socket alive.
 | `push_changes` | Fire-and-forget broadcast from another client (applied, but **never** advances the received watermark) | `{ changeSets: ChangeSet[] }` |
 | `apply_result` | Confirm changes applied | `{ requestId?, applied, skipped, conflicts }` |
 | `snapshot_chunk` | Streamed snapshot data | `{ chunk: SnapshotChunk }` |
+| `snapshot_complete` | Snapshot stream finished | (none) |
 | `error` | Error response | `{ code, message }` |
 | `pong` | Heartbeat response | (none) |
 
@@ -1079,6 +1081,54 @@ Rapid local changes are batched to reduce network overhead: each local change ev
 starts or resets a 50 ms debounce timer, and when it fires the client collects every
 change since `lastSentHLC` and sends them in one `apply_changes` message — N messages
 per edit become 1 per burst.
+
+#### Client snapshot bootstrap
+
+A brand-new device cannot catch up incrementally — "changes since nothing" is not the
+same as receiving the database. `SyncClient` downloads a full copy instead, on **two
+triggers**, both decided on handshake and finished **before** the incremental path
+(`get_changes`, local-change subscription, push) starts:
+
+- **Explicit**: `requestSnapshot()`. Idempotent while a transfer is in flight (a second
+  call joins it; exactly one `get_snapshot` goes on the wire).
+- **Automatic on first connect to an empty replica** (`bootstrapOnEmpty` option,
+  default `true`). "Empty" requires **both**: no peer sync state for the server
+  (never synced with it) **and** no local change facts of its own. The first alone
+  would also match a device holding real local data that merely never met this server —
+  bootstrapping it would clear sync metadata while leaving its rows, i.e. divergence.
+  A device that pre-created its schema locally still counts as empty (schema migration
+  records are not consulted; replicated DDL applies idempotently).
+
+The transfer streams `snapshot_chunk` messages through a push-to-pull adapter
+(`SnapshotStreamReader`) into `applySnapshotStream`. On success the client writes the
+snapshot header's HLC as the received watermark (`updatePeerSyncState`), so the
+follow-up `get_changes` asks for changes *after* the snapshot point. Progress is
+surfaced three ways: every tick to `onSnapshotProgress`, mirrored into the
+`bootstrapping` status (`tablesProcessed`/`totalTables`/…), and as a sync event
+throttled to table boundaries.
+
+**No local writes during a snapshot.** The apply clears sync metadata and rewrites cell
+records unconditionally — a concurrent local write is silently overwritten and never
+pushed. The client cannot block application writes; what it does instead:
+
+- incoming `changes` / `push_changes` are **dropped** (not applied) during the transfer —
+  nothing is lost, since the watermark is untouched and the post-bootstrap `get_changes`
+  re-fetches everything past the snapshot HLC;
+- local pushes and the peer-relay `request_changes` path are held;
+- `isBootstrapping` / the `bootstrapping` status expose the window so callers can hold
+  writes. (An engine-level write barrier is future work:
+  `backlog/feat-sync-bootstrap-write-gate`.)
+
+**Partial data is durable and detectable.** An interrupted apply leaves a snapshot
+checkpoint (`sc:` record) behind; `hasPendingSnapshot()` — usable before ever
+connecting, e.g. at app startup — reports it, and the next handshake finds it and sends
+`resume_snapshot` with the serialized checkpoint (newest by `createdAt`; superseded ones
+are cleared). There is **no dedicated retry machinery**: a failed or stalled transfer
+(no chunk within `snapshotChunkTimeoutMs`, default 60 s) simply closes the socket, the
+existing reconnect backoff paces the retry, and the next handshake resumes from the
+checkpoint. A resumed stream's header carries the *original* snapshot's HLC while its
+data is read live, so the watermark written at the end is conservative and the catch-up
+re-fetches a little — correct, since re-application is idempotent.
 
 ## Reactive Hooks
 

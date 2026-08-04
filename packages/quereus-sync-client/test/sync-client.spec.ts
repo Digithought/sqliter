@@ -7,6 +7,8 @@ import {
   SyncEventEmitterImpl,
   serializeChangeSet,
   serializeHLCForTransport,
+  serializeSnapshotChunk,
+  deserializeSnapshotCheckpoint,
   PROTOCOL_VERSION,
   SNAPSHOT_WIRE_FORMAT_VERSION,
   type SyncManager,
@@ -20,6 +22,8 @@ import {
   type SiteId,
   type BasisTableLifecycleRecord,
   type ClientMessage,
+  type SerializedSnapshotChunk,
+  type SerializedSnapshotCheckpoint,
 } from '@quereus/sync';
 import type { Database, LensDeploymentSnapshot } from '@quereus/quereus';
 
@@ -189,10 +193,74 @@ class MockSyncManager implements SyncManager {
 
   async *getSnapshotStream(_chunkSize?: number): AsyncIterable<SnapshotChunk> {}
 
+  /** Chunks actually consumed by applySnapshotStream, in consumption order. */
+  appliedSnapshotChunks: SnapshotChunk[] = [];
+  /** When set, applySnapshotStream throws before consuming anything — models the engine's pre-apply gates (wire-format mismatch, clock drift). */
+  applySnapshotStreamError: Error | null = null;
+  /** Monotonic createdAt for mock checkpoints, so "newest" is deterministic. */
+  private checkpointSeq = 0;
+
+  /**
+   * Really drains the iterable — chunk ordering and abort assertions in the
+   * specs are only meaningful because consumption is real, not vacuous.
+   * Mirrors the real engine's checkpoint lifecycle: a checkpoint exists from
+   * the header for the whole duration of the apply and is cleared only when
+   * the footer lands, so an interrupted apply leaves one behind (the resume
+   * marker) and a pre-apply gate failure leaves none.
+   */
   async applySnapshotStream(
-    _chunks: AsyncIterable<SnapshotChunk>,
-    _onProgress?: (progress: SnapshotProgress) => void
-  ): Promise<void> {}
+    chunks: AsyncIterable<SnapshotChunk>,
+    onProgress?: (progress: SnapshotProgress) => void
+  ): Promise<void> {
+    if (this.applySnapshotStreamError) throw this.applySnapshotStreamError;
+
+    let snapshotId = '';
+    let totalTables = 0;
+    let tablesProcessed = 0;
+    let entriesProcessed = 0;
+    let currentTable: string | undefined;
+
+    for await (const chunk of chunks) {
+      this.appliedSnapshotChunks.push(chunk);
+      switch (chunk.type) {
+        case 'header': {
+          snapshotId = chunk.snapshotId;
+          totalTables = chunk.tableCount;
+          this.checkpoints.set(snapshotId, {
+            snapshotId,
+            siteId: chunk.siteId,
+            hlc: chunk.hlc,
+            lastTableIndex: 0,
+            lastEntryIndex: 0,
+            completedTables: [],
+            entriesProcessed: 0,
+            createdAt: ++this.checkpointSeq,
+          });
+          break;
+        }
+        case 'table-start': {
+          currentTable = chunk.table;
+          break;
+        }
+        case 'column-versions': {
+          entriesProcessed += chunk.entries.length;
+          onProgress?.({ snapshotId, tablesProcessed, totalTables, entriesProcessed, totalEntries: 0, currentTable });
+          break;
+        }
+        case 'table-end': {
+          tablesProcessed++;
+          onProgress?.({ snapshotId, tablesProcessed, totalTables, entriesProcessed, totalEntries: 0, currentTable });
+          break;
+        }
+        case 'footer': {
+          this.checkpoints.delete(chunk.snapshotId);
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
 
   async getSnapshotCheckpoint(snapshotId: string): Promise<SnapshotCheckpoint | undefined> {
     return this.checkpoints.get(snapshotId);
@@ -256,6 +324,10 @@ function createClient(opts?: {
   syncManager?: MockSyncManager;
   syncEvents?: SyncEventEmitterImpl;
   autoReconnect?: boolean;
+  bootstrapOnEmpty?: boolean;
+  snapshotChunkTimeoutMs?: number;
+  readOnly?: boolean;
+  onSnapshotProgress?: (progress: SnapshotProgress) => void;
   statusChanges?: SyncStatus[];
   syncEventsLog?: SyncEvent[];
   errors?: Error[];
@@ -270,6 +342,14 @@ function createClient(opts?: {
     syncManager,
     syncEvents,
     autoReconnect: opts?.autoReconnect ?? false,
+    // Production default is TRUE; the harness defaults to false because the
+    // legacy incremental-path tests all use an empty MockSyncManager, which
+    // would otherwise auto-bootstrap on every connect. The bootstrap suite
+    // opts in explicitly (and one test covers the default via a raw client).
+    bootstrapOnEmpty: opts?.bootstrapOnEmpty ?? false,
+    snapshotChunkTimeoutMs: opts?.snapshotChunkTimeoutMs,
+    readOnly: opts?.readOnly,
+    onSnapshotProgress: opts?.onSnapshotProgress,
     reconnectDelayMs: 100,
     maxReconnectDelayMs: 1000,
     localChangeDebounceMs: 10,
@@ -1342,6 +1422,472 @@ describe('SyncClient', () => {
       // Access private send via message handling that would trigger send
       // The client should silently skip sends when not connected
       expect(client.isConnected).to.be.false;
+    });
+  });
+
+  // ==========================================================================
+  // Snapshot bootstrap
+  // ==========================================================================
+
+  describe('snapshot bootstrap', () => {
+    /** A serialized 4-chunk snapshot (header, table-start, table-end, footer). */
+    function snapshotChunks(serverSite: SiteId, hlc: HLC, snapshotId = 'snap-1'): SerializedSnapshotChunk[] {
+      return [
+        serializeSnapshotChunk({
+          type: 'header', siteId: serverSite, hlc,
+          snapshotFormat: SNAPSHOT_WIRE_FORMAT_VERSION,
+          tableCount: 1, migrationCount: 0, snapshotId,
+        }),
+        serializeSnapshotChunk({ type: 'table-start', schema: 'main', table: 'items', estimatedEntries: 0 }),
+        serializeSnapshotChunk({ type: 'table-end', schema: 'main', table: 'items', entriesWritten: 0 }),
+        serializeSnapshotChunk({ type: 'footer', snapshotId, totalTables: 1, totalEntries: 0, totalMigrations: 0 }),
+      ];
+    }
+
+    /** Deliver a whole snapshot stream, then snapshot_complete. */
+    function streamSnapshot(ws: MockWebSocket, chunks: SerializedSnapshotChunk[]): void {
+      for (const chunk of chunks) {
+        ws.simulateMessage({ type: 'snapshot_chunk', chunk });
+      }
+      ws.simulateMessage({ type: 'snapshot_complete' });
+    }
+
+    /** A one-column ChangeSet stamped with the given HLC. */
+    function changeSet(site: SiteId, txId: string, hlc: HLC): ChangeSet {
+      return {
+        siteId: site,
+        transactionId: txId,
+        hlc,
+        changes: [{ type: 'column', schema: 'main', table: 'items', pk: [1], column: 'n', value: txId, hlc }],
+        schemaMigrations: [],
+      };
+    }
+
+    function hlcAt(wallTime: bigint, site: SiteId): HLC {
+      return { wallTime, counter: 1, siteId: site, opSeq: 0 };
+    }
+
+    it('bootstraps a fresh empty device: get_snapshot before get_changes, watermark = header HLC', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const serverSite = generateSiteId();
+      const ws = await connectAndHandshake(client, serverSite);
+
+      // Transfer is in flight: the snapshot request went out and the
+      // incremental path has NOT started yet.
+      expect(client.isBootstrapping).to.be.true;
+      let types = ws.getSentMessages().map(m => m.type);
+      expect(types).to.include('get_snapshot');
+      expect(types).to.not.include('get_changes');
+
+      const hlc = hlcAt(9000n, serverSite);
+      streamSnapshot(ws, snapshotChunks(serverSite, hlc));
+      await new Promise(r => setTimeout(r, 30));
+
+      expect(client.isBootstrapping).to.be.false;
+      // The apply really consumed the chunks, in order.
+      expect(syncManager.appliedSnapshotChunks.map(c => c.type))
+        .to.deep.equal(['header', 'table-start', 'table-end', 'footer']);
+      // The received watermark was written from the header HLC…
+      expect(syncManager.updatePeerSyncStateCalls.length).to.equal(1);
+      expect(syncManager.updatePeerSyncStateCalls[0].hlc).to.deep.equal(hlc);
+
+      // …and the follow-up get_changes (a) came after get_snapshot and
+      // (b) carries the snapshot HLC, not a from-nothing request.
+      const messages = ws.getSentMessages();
+      types = messages.map(m => m.type);
+      const snapshotIndex = types.indexOf('get_snapshot');
+      const getChangesIndex = types.indexOf('get_changes');
+      expect(getChangesIndex).to.be.greaterThan(snapshotIndex);
+      expect((messages[getChangesIndex] as { sinceHLC?: string }).sinceHLC)
+        .to.equal(serializeHLCForTransport(hlc));
+    });
+
+    it('bootstrapOnEmpty defaults to true on a raw client', async () => {
+      const syncManager = new MockSyncManager();
+      const syncEvents = new SyncEventEmitterImpl();
+      const client = new SyncClient({ syncManager, syncEvents, autoReconnect: false });
+      activeClients.push(client);
+
+      const connectPromise = client.connect('ws://localhost:8080/sync', 'test-db');
+      const ws = MockWebSocket.lastInstance!;
+      ws.simulateOpen();
+      simulateHandshakeAck(ws);
+      await connectPromise;
+      await new Promise(r => setTimeout(r, 10));
+
+      expect(ws.getSentMessages().some(m => m.type === 'get_snapshot')).to.be.true;
+    });
+
+    it('does not bootstrap a device holding local data it never synced (divergence guard)', async () => {
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      // Never synced with this server (no peer state), but holds local facts.
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx-local', hlcAt(1000n, site))];
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const ws = await connectAndHandshake(client);
+
+      const types = ws.getSentMessages().map(m => m.type);
+      expect(types).to.not.include('get_snapshot');
+      expect(types).to.include('get_changes');
+      expect(client.isBootstrapping).to.be.false;
+    });
+
+    it('does not bootstrap a device with prior peer sync state', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      syncManager.peerSyncState = hlcAt(5000n, serverSite);
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      const types = ws.getSentMessages().map(m => m.type);
+      expect(types).to.not.include('get_snapshot');
+      expect(types).to.include('get_changes');
+    });
+
+    it('bootstrapOnEmpty: false skips auto-bootstrap but requestSnapshot() still works', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: false });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      expect(ws.getSentMessages().some(m => m.type === 'get_snapshot')).to.be.false;
+
+      const requestPromise = client.requestSnapshot();
+      expect(client.isBootstrapping).to.be.true;
+      expect(ws.getSentMessages().some(m => m.type === 'get_snapshot')).to.be.true;
+
+      streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9000n, serverSite)));
+      await requestPromise;
+      expect(client.isBootstrapping).to.be.false;
+      expect(syncManager.appliedSnapshotChunks.length).to.equal(4);
+    });
+
+    it('rejects requestSnapshot() when not connected', async () => {
+      const { client } = createClient();
+      let thrown: Error | null = null;
+      try {
+        await client.requestSnapshot();
+      } catch (e) {
+        thrown = e as Error;
+      }
+      expect(thrown?.message).to.match(/not connected/i);
+    });
+
+    it('sends exactly one get_snapshot for a double requestSnapshot()', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      const p1 = client.requestSnapshot();
+      const p2 = client.requestSnapshot();
+
+      expect(ws.getSentMessages().filter(m => m.type === 'get_snapshot').length).to.equal(1);
+
+      streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9000n, serverSite)));
+      await p1;
+      await p2;
+      // One transfer: the chunks were applied once.
+      expect(syncManager.appliedSnapshotChunks.length).to.equal(4);
+    });
+
+    it('resumes a pending checkpoint on connect (resume_snapshot, round-tripped through the codec)', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const checkpoint: SnapshotCheckpoint = {
+        snapshotId: 'snap-A',
+        siteId: serverSite,
+        hlc: hlcAt(7000n, serverSite),
+        lastTableIndex: 1,
+        lastEntryIndex: 42,
+        completedTables: ['main.items'],
+        entriesProcessed: 42,
+        createdAt: 1000,
+      };
+      syncManager.checkpoints.set('snap-A', checkpoint);
+      expect(await new SyncClient({ syncManager, syncEvents: new SyncEventEmitterImpl() }).hasPendingSnapshot()).to.be.true;
+
+      // NOTE: harness default bootstrapOnEmpty=false — a resume must run
+      // regardless of the bootstrap-on-empty setting.
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      const messages = ws.getSentMessages();
+      expect(messages.some(m => m.type === 'get_snapshot')).to.be.false;
+      const resume = messages.find(m => m.type === 'resume_snapshot') as { checkpoint: SerializedSnapshotCheckpoint } | undefined;
+      expect(resume, 'a resume_snapshot should be sent').to.exist;
+      // The wire checkpoint survives the codec round-trip intact.
+      expect(deserializeSnapshotCheckpoint(resume!.checkpoint)).to.deep.equal(checkpoint);
+
+      // Completing the resumed stream clears the checkpoint (footer) and the
+      // partial-data flag with it.
+      streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9000n, serverSite), 'snap-A'));
+      await new Promise(r => setTimeout(r, 30));
+      expect(client.isBootstrapping).to.be.false;
+      expect(await client.hasPendingSnapshot()).to.be.false;
+    });
+
+    it('resumes the newest of several checkpoints and clears the rest', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const older: SnapshotCheckpoint = {
+        snapshotId: 'snap-old', siteId: serverSite, hlc: hlcAt(1000n, serverSite),
+        lastTableIndex: 0, lastEntryIndex: 0, completedTables: [], entriesProcessed: 0, createdAt: 100,
+      };
+      const newer: SnapshotCheckpoint = {
+        snapshotId: 'snap-new', siteId: serverSite, hlc: hlcAt(2000n, serverSite),
+        lastTableIndex: 0, lastEntryIndex: 0, completedTables: [], entriesProcessed: 0, createdAt: 200,
+      };
+      syncManager.checkpoints.set('snap-old', older);
+      syncManager.checkpoints.set('snap-new', newer);
+
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      const resume = ws.getSentMessages().find(m => m.type === 'resume_snapshot') as { checkpoint: SerializedSnapshotCheckpoint };
+      expect(deserializeSnapshotCheckpoint(resume.checkpoint).snapshotId).to.equal('snap-new');
+      // The superseded checkpoint was cleared; the resumed one survives until
+      // its footer lands.
+      expect(syncManager.checkpoints.has('snap-old')).to.be.false;
+      expect(syncManager.checkpoints.has('snap-new')).to.be.true;
+      expect(client.isBootstrapping).to.be.true;
+    });
+
+    it('resumes an interrupted transfer across a reconnect', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true, autoReconnect: true });
+      const ws = await connectAndHandshake(client, serverSite);
+      expect(ws.getSentMessages().some(m => m.type === 'get_snapshot')).to.be.true;
+
+      // Header arrives (the apply saves its checkpoint), then the socket drops
+      // mid-stream.
+      const chunks = snapshotChunks(serverSite, hlcAt(9000n, serverSite));
+      ws.simulateMessage({ type: 'snapshot_chunk', chunk: chunks[0] });
+      await new Promise(r => setTimeout(r, 10));
+      ws.simulateClose();
+      await new Promise(r => setTimeout(r, 10));
+
+      expect(client.isBootstrapping).to.be.false;
+      // Interrupted apply left its checkpoint — the durable partial-data marker.
+      expect(await client.hasPendingSnapshot()).to.be.true;
+      // No watermark was written for the failed transfer.
+      expect(syncManager.updatePeerSyncStateCalls.length).to.equal(0);
+
+      // Reconnect fires (100ms base delay), handshake again — the client must
+      // resume, not restart.
+      await new Promise(r => setTimeout(r, 200));
+      const ws2 = MockWebSocket.lastInstance!;
+      expect(ws2).to.not.equal(ws);
+      ws2.simulateOpen();
+      simulateHandshakeAck(ws2);
+      await new Promise(r => setTimeout(r, 20));
+
+      const types = ws2.getSentMessages().map(m => m.type);
+      expect(types).to.include('resume_snapshot');
+      expect(types).to.not.include('get_snapshot');
+      const resume = ws2.getSentMessages().find(m => m.type === 'resume_snapshot') as { checkpoint: SerializedSnapshotCheckpoint };
+      expect(deserializeSnapshotCheckpoint(resume.checkpoint).snapshotId).to.equal('snap-1');
+    });
+
+    it('drops a snapshot_chunk with no active transfer without starting one', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      const [header] = snapshotChunks(serverSite, hlcAt(9000n, serverSite));
+      ws.simulateMessage({ type: 'snapshot_chunk', chunk: header });
+      await new Promise(r => setTimeout(r, 10));
+
+      expect(client.isBootstrapping).to.be.false;
+      expect(syncManager.appliedSnapshotChunks.length).to.equal(0);
+      // A late chunk must not poison a subsequent transfer either.
+      const requestPromise = client.requestSnapshot();
+      streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9500n, serverSite)));
+      await requestPromise;
+      expect(syncManager.appliedSnapshotChunks.map(c => c.type))
+        .to.deep.equal(['header', 'table-start', 'table-end', 'footer']);
+    });
+
+    it('ignores snapshot_complete with no active transfer', async () => {
+      const { client } = createClient();
+      const ws = await connectAndHandshake(client);
+      ws.simulateMessage({ type: 'snapshot_complete' });
+      await new Promise(r => setTimeout(r, 10));
+      expect(client.isBootstrapping).to.be.false;
+    });
+
+    it('aborts the transfer on a SNAPSHOT_ERROR and leaves reconnect intact', async () => {
+      const syncManager = new MockSyncManager();
+      const { client, errors } = createClient({ syncManager, bootstrapOnEmpty: true, autoReconnect: true });
+      const ws = await connectAndHandshake(client);
+      expect(client.isBootstrapping).to.be.true;
+      errors.length = 0;
+
+      ws.simulateMessage({ type: 'error', code: 'SNAPSHOT_ERROR', message: 'stream broke' });
+      await new Promise(r => setTimeout(r, 20));
+
+      expect(client.isBootstrapping).to.be.false;
+      expect(errors.length).to.be.greaterThanOrEqual(1);
+      // Transient by construction: no lasting error status, no stop-reconnect.
+      expect((client as any).stopReconnect).to.be.false;
+      expect(client.status.status).to.not.equal('error');
+      // The failure path closed the socket so the reconnect machinery takes over.
+      expect(ws.readyState).to.equal(MockWebSocket.CLOSED);
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.lastInstance).to.not.equal(ws);
+    });
+
+    it('aborts the transfer on a fatal server error and stops reconnecting', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true, autoReconnect: true });
+      const ws = await connectAndHandshake(client);
+      expect(client.isBootstrapping).to.be.true;
+
+      ws.simulateMessage({ type: 'error', code: 'AUTH_FAILED', message: 'bad token', fatal: true });
+      await new Promise(r => setTimeout(r, 20));
+
+      expect(client.isBootstrapping).to.be.false;
+      expect((client as any).stopReconnect).to.be.true;
+      expect(client.status.status).to.equal('error');
+
+      const instanceCount = MockWebSocket.instances.length;
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.instances.length).to.equal(instanceCount);
+    });
+
+    it('aborts a stalled transfer via the chunk watchdog', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client, syncEventsLog } = createClient({
+        syncManager, bootstrapOnEmpty: true, snapshotChunkTimeoutMs: 30,
+      });
+      const ws = await connectAndHandshake(client, serverSite);
+      expect(client.isBootstrapping).to.be.true;
+
+      // Header arrives, then the server goes silent without closing the socket.
+      const [header] = snapshotChunks(serverSite, hlcAt(9000n, serverSite));
+      ws.simulateMessage({ type: 'snapshot_chunk', chunk: header });
+
+      await new Promise(r => setTimeout(r, 150));
+      expect(client.isBootstrapping).to.be.false;
+      expect(syncEventsLog.some(e => e.type === 'error' && /stalled/.test(e.message))).to.be.true;
+    });
+
+    it('settles cleanly when disconnect() lands mid-transfer', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true, autoReconnect: true });
+      await connectAndHandshake(client);
+      expect(client.isBootstrapping).to.be.true;
+
+      await client.disconnect();
+      await new Promise(r => setTimeout(r, 20));
+
+      expect(client.isBootstrapping).to.be.false;
+      expect(client.status.status).to.equal('disconnected');
+      // No reconnect after a manual disconnect, even from a failed transfer.
+      const instanceCount = MockWebSocket.instances.length;
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.instances.length).to.equal(instanceCount);
+    });
+
+    it('still bootstraps a readOnly client (and never pushes)', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true, readOnly: true });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9000n, serverSite)));
+      await new Promise(r => setTimeout(r, 30));
+
+      expect(client.isBootstrapping).to.be.false;
+      expect(syncManager.appliedSnapshotChunks.length).to.equal(4);
+      expect(ws.getSentMessages().some(m => m.type === 'apply_changes')).to.be.false;
+    });
+
+    it('drops incoming changes and push_changes during a transfer, leaving the watermark untouched', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client, syncEventsLog } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const ws = await connectAndHandshake(client, serverSite);
+      expect(client.isBootstrapping).to.be.true;
+      syncEventsLog.length = 0;
+
+      const cs = changeSet(generateSiteId(), 'tx-mid', hlcAt(8000n, serverSite));
+      ws.simulateMessage({ type: 'push_changes', changeSets: [serializeChangeSet(cs)] });
+      ws.simulateMessage({ type: 'changes', changeSets: [serializeChangeSet(cs)] });
+      await new Promise(r => setTimeout(r, 10));
+
+      // Neither was applied; neither advanced the watermark; both surfaced as
+      // info (they are re-fetched by the post-bootstrap catch-up).
+      expect(syncManager.applyChangesCalls.length).to.equal(0);
+      expect(syncManager.updatePeerSyncStateCalls.length).to.equal(0);
+      expect(syncEventsLog.filter(e => e.type === 'info' && /Dropped/.test(e.message)).length).to.equal(2);
+    });
+
+    it('surfaces an engine-gate rejection without leaving a checkpoint or spinning', async () => {
+      const syncManager = new MockSyncManager();
+      syncManager.applySnapshotStreamError = new Error('snapshot wire-format mismatch');
+      const { client, errors } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const ws = await connectAndHandshake(client);
+      await new Promise(r => setTimeout(r, 20));
+
+      expect(client.isBootstrapping).to.be.false;
+      expect(errors.some(e => /wire-format mismatch/.test(e.message))).to.be.true;
+      // The gate fired before any local state was touched — no checkpoint, so
+      // the next connect retries a FRESH get_snapshot (paced only by the
+      // reconnect backoff).
+      expect(await client.hasPendingSnapshot()).to.be.false;
+      expect((client as any).stopReconnect).to.be.false;
+      expect(ws.readyState).to.equal(MockWebSocket.CLOSED);
+    });
+
+    it('preserves chunk order when other message types interleave mid-stream', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      // Interleave non-snapshot traffic between chunks. The chunk push is
+      // synchronous in handleMessage, so order must survive the concurrent
+      // (non-serialized) message handling.
+      const chunks = snapshotChunks(serverSite, hlcAt(9000n, serverSite));
+      ws.simulateMessage({ type: 'snapshot_chunk', chunk: chunks[0] });
+      ws.simulateMessage({ type: 'pong' });
+      ws.simulateMessage({ type: 'snapshot_chunk', chunk: chunks[1] });
+      ws.simulateMessage({ type: 'changes', changeSets: [] });
+      ws.simulateMessage({ type: 'snapshot_chunk', chunk: chunks[2] });
+      ws.simulateMessage({ type: 'snapshot_chunk', chunk: chunks[3] });
+      ws.simulateMessage({ type: 'snapshot_complete' });
+      await new Promise(r => setTimeout(r, 30));
+
+      expect(syncManager.appliedSnapshotChunks.map(c => c.type))
+        .to.deep.equal(['header', 'table-start', 'table-end', 'footer']);
+    });
+
+    it('reports progress via onSnapshotProgress, status, and table-boundary events', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const progressTicks: SnapshotProgress[] = [];
+      const { client, statusChanges, syncEventsLog } = createClient({
+        syncManager, bootstrapOnEmpty: true,
+        onSnapshotProgress: p => progressTicks.push(p),
+      });
+      const ws = await connectAndHandshake(client, serverSite);
+      syncEventsLog.length = 0;
+
+      streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9000n, serverSite)));
+      await new Promise(r => setTimeout(r, 30));
+
+      // The mock emits one progress tick at the table-end boundary.
+      expect(progressTicks.length).to.be.greaterThanOrEqual(1);
+      expect(progressTicks[progressTicks.length - 1].tablesProcessed).to.equal(1);
+      // Status mirrored the transfer.
+      expect(statusChanges.some(s => s.status === 'bootstrapping')).to.be.true;
+      // Human-readable event at the table boundary.
+      expect(syncEventsLog.some(e => e.type === 'info' && /1 of 1 tables/.test(e.message))).to.be.true;
     });
   });
 });

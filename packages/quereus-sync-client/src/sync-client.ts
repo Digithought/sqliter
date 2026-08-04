@@ -18,13 +18,18 @@ import {
   deserializeChangeSet,
   serializeHLCForTransport,
   deserializeHLCFromTransport,
+  serializeSnapshotCheckpoint,
   PROTOCOL_VERSION,
   type SyncManager,
   type SyncEventEmitter,
   type HLC,
   type SiteId,
   type ClientMessage,
+  type GetSnapshotMessage,
+  type ResumeSnapshotMessage,
   type SerializedChangeSet,
+  type SerializedSnapshotChunk,
+  type SnapshotProgress,
 } from '@quereus/sync';
 
 import type {
@@ -32,11 +37,13 @@ import type {
   SyncStatus,
   SyncEvent,
 } from './types.js';
+import { SnapshotStreamReader } from './snapshot-reader.js';
 
 // Default configuration values
 const DEFAULT_RECONNECT_DELAY_MS = 1000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 60_000;
 const DEFAULT_LOCAL_CHANGE_DEBOUNCE_MS = 50;
+const DEFAULT_SNAPSHOT_CHUNK_TIMEOUT_MS = 60_000;
 
 /**
  * WebSocket sync client for Quereus.
@@ -49,6 +56,7 @@ export class SyncClient {
   private readonly syncEvents: SyncEventEmitter;
   private readonly options: Required<Pick<SyncClientOptions,
     'autoReconnect' | 'reconnectDelayMs' | 'maxReconnectDelayMs' | 'localChangeDebounceMs'
+    | 'bootstrapOnEmpty' | 'snapshotChunkTimeoutMs'
   >> & SyncClientOptions;
 
   // WebSocket state
@@ -112,6 +120,23 @@ export class SyncClient {
   // Local change listener cleanup
   private localChangeUnsubscribe: (() => void) | null = null;
 
+  // Snapshot bootstrap state. `activeSnapshotReader` routes incoming
+  // snapshot_chunk messages; `snapshotTransferPromise` is the whole in-flight
+  // transfer (request → stream → apply → watermark), resolving to the failure
+  // Error or null on success — it never rejects, so an unobserved automatic
+  // bootstrap can't surface an unhandled rejection. Both are null when no
+  // transfer is active.
+  private activeSnapshotReader: SnapshotStreamReader | null = null;
+  private snapshotTransferPromise: Promise<Error | null> | null = null;
+  private snapshotStallTimer: ReturnType<typeof setTimeout> | null = null;
+  // Last tablesProcessed a sync event was emitted for — progress fires once per
+  // column-versions chunk and would flood an event log; events are throttled to
+  // table boundaries. -1 = none yet this transfer.
+  private snapshotEventTablesProcessed = -1;
+  // One dropped-chunk warning per transfer gap, not one per chunk — an aborted
+  // stream can trail thousands of late chunks.
+  private droppedChunkWarned = false;
+
   // Pending connect() promise settlement — allows handshake_ack / server error
   // to resolve or reject the promise returned by connect().
   private _connectResolve: (() => void) | null = null;
@@ -126,6 +151,8 @@ export class SyncClient {
       reconnectDelayMs: options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS,
       maxReconnectDelayMs: options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS,
       localChangeDebounceMs: options.localChangeDebounceMs ?? DEFAULT_LOCAL_CHANGE_DEBOUNCE_MS,
+      bootstrapOnEmpty: options.bootstrapOnEmpty ?? true,
+      snapshotChunkTimeoutMs: options.snapshotChunkTimeoutMs ?? DEFAULT_SNAPSHOT_CHUNK_TIMEOUT_MS,
     };
   }
 
@@ -142,6 +169,27 @@ export class SyncClient {
   /** Whether the client is fully synced */
   get isSynced(): boolean {
     return this._status.status === 'synced';
+  }
+
+  /**
+   * Whether a snapshot transfer (bootstrap or resume) is in flight. While true
+   * the local database is partial: incoming deltas are dropped (re-fetched by
+   * the post-bootstrap catch-up), local pushes are held, and the application
+   * should not write to the database.
+   */
+  get isBootstrapping(): boolean {
+    return this.snapshotTransferPromise !== null;
+  }
+
+  /**
+   * Whether the local store holds a pending snapshot checkpoint — i.e. a
+   * previous snapshot apply was interrupted and the database is PARTIAL.
+   * Usable before connecting (e.g. at app startup, to gate reads); the next
+   * connect resumes the transfer automatically.
+   */
+  async hasPendingSnapshot(): Promise<boolean> {
+    const checkpoints = await this.syncManager.listSnapshotCheckpoints();
+    return checkpoints.length > 0;
   }
 
   /**
@@ -194,6 +242,9 @@ export class SyncClient {
         };
 
         this.ws.onclose = () => {
+          // A transfer interrupted by a socket drop aborts here; the saved
+          // checkpoint makes the reconnect below resume it via resume_snapshot.
+          this.abortSnapshotTransfer(new Error('Connection closed during snapshot transfer'));
           const wasError = this._status.status === 'error';
           if (!wasError) {
             this.setStatus({ status: 'disconnected' });
@@ -245,6 +296,11 @@ export class SyncClient {
    */
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+
+    // Abort any in-flight snapshot transfer. Its promise settles (resolved with
+    // the abort error — it never rejects), and the checkpoint saved by the
+    // interrupted apply lets a later connect resume.
+    this.abortSnapshotTransfer(new Error('Disconnected'));
 
     // Reject any pending connect() promise
     this.settleConnect(new Error('Disconnected'));
@@ -309,6 +365,19 @@ export class SyncClient {
         await this.handleApplyResult(message);
         break;
 
+      case 'snapshot_chunk':
+        // MUST stay synchronous: handleMessage is invoked from ws.onmessage
+        // without serialization, so two messages can be in-flight through it at
+        // once and anything after an `await` may interleave. Reaching push()
+        // with no intervening await is what preserves chunk order — the whole
+        // transfer's correctness rests on it.
+        this.handleSnapshotChunk(message);
+        break;
+
+      case 'snapshot_complete':
+        this.handleSnapshotComplete();
+        break;
+
       case 'error':
         this.handleServerError(message);
         break;
@@ -347,6 +416,14 @@ export class SyncClient {
     // Trust the server's `fatal` flag when present; fall back to the known
     // fatal-code set for coordinators that predate it.
     const fatal = message.fatal ?? SyncClient.FATAL_ERROR_CODES.has(message.code);
+
+    // A snapshot-stream failure (or any fatal error) kills the transfer. For
+    // SNAPSHOT_ERROR the failure path closes the socket and the reconnect
+    // resumes from the checkpoint; for a fatal error the stopReconnect set
+    // below wins — no reconnect, no resume.
+    if (fatal || message.code === 'SNAPSHOT_ERROR') {
+      this.abortSnapshotTransfer(new Error(`Server error during snapshot: ${message.message}`));
+    }
 
     if (fatal) {
       // Unrecoverable — a bare reconnect would just fail again. Stop reconnect
@@ -404,6 +481,14 @@ export class SyncClient {
     // Handshake accepted — resolve the connect() promise.
     this.settleConnect();
 
+    // Bootstrap is decided and FINISHED before the incremental path starts, so
+    // the post-snapshot get_changes below carries the snapshot's HLC and the
+    // local-change subscription never sees a partial database. A failed
+    // transfer has already closed the socket — stop here and let the reconnect
+    // (which finds the saved checkpoint) resume it.
+    const bootstrapOk = await this.maybeBootstrap();
+    if (!bootstrapOk) return;
+
     // Request changes from server since our last sync with this peer
     await this.requestChangesFromServer();
 
@@ -436,6 +521,19 @@ export class SyncClient {
     serializedChangeSets: SerializedChangeSet[],
     advanceWatermark: boolean
   ): Promise<void> {
+    // While a snapshot is streaming, incoming deltas are DROPPED, not applied:
+    // applyChanges would interleave with the snapshot's clear-and-rewrite of
+    // the same cv:/tb:/cl: records. Nothing is lost — the watermark is not
+    // advanced here, so the get_changes catch-up that runs right after
+    // bootstrap re-fetches everything past the snapshot HLC.
+    if (this.isBootstrapping) {
+      this.emitSyncEvent(
+        'info',
+        `Dropped ${serializedChangeSets.length} incoming change set(s) during snapshot bootstrap (re-fetched afterwards)`
+      );
+      return;
+    }
+
     const changeSets = serializedChangeSets.map(cs => deserializeChangeSet(cs));
     const result = await this.syncManager.applyChanges(changeSets);
 
@@ -528,6 +626,8 @@ export class SyncClient {
   private async handleRequestChanges(message: { siteId?: string; sinceHLC?: string }): Promise<void> {
     // Server is relaying a request for changes from another peer
     if (!message.siteId) return;
+    // No pushes while a snapshot is landing — local data is partial.
+    if (this.isBootstrapping) return;
 
     const peerSiteId = siteIdFromBase64(message.siteId);
     const sinceHLC = message.sinceHLC ? deserializeHLCFromTransport(message.sinceHLC) : undefined;
@@ -539,6 +639,264 @@ export class SyncClient {
         type: 'apply_changes',
         changes: serialized,
       });
+    }
+  }
+
+  // ==========================================================================
+  // Snapshot bootstrap
+  // ==========================================================================
+
+  /**
+   * Explicitly request a full snapshot of the database from the server.
+   *
+   * CONTRACT: do not write to the database while the snapshot is landing. The
+   * apply clears sync metadata and rewrites cell records unconditionally — a
+   * concurrent local write is silently overwritten and never pushed. Hold
+   * application writes until this resolves (watch {@link isBootstrapping} /
+   * the `bootstrapping` status).
+   *
+   * Idempotent while a transfer is in flight: a second call joins the same
+   * transfer instead of starting another stream. Rejects when not connected /
+   * handshaken, or when the transfer fails (the socket is then closed and the
+   * normal reconnect path resumes from the saved checkpoint).
+   */
+  async requestSnapshot(): Promise<void> {
+    if (this.snapshotTransferPromise) {
+      const error = await this.snapshotTransferPromise;
+      if (error) throw error;
+      return;
+    }
+    if (!this.isConnected || !this.serverSiteId) {
+      throw new Error('Cannot request a snapshot: not connected to a sync server');
+    }
+    const error = await this.runSnapshotTransfer({ type: 'get_snapshot' });
+    if (error) throw error;
+  }
+
+  /**
+   * Decide, on handshake, whether to run a snapshot transfer before the
+   * incremental path: resume a pending checkpoint, bootstrap an empty replica,
+   * or neither.
+   *
+   * @returns false when a transfer failed — the socket has been closed and the
+   *          caller must stop the handshake flow (reconnect resumes it).
+   */
+  private async maybeBootstrap(): Promise<boolean> {
+    const pending = await this.syncManager.listSnapshotCheckpoints();
+
+    if (pending.length > 0) {
+      // A checkpoint means the database is PARTIAL: a prior apply cleared sync
+      // metadata and never reached its footer. Resume the newest; clear the
+      // rest — the client tracks one transfer, so they are unreachable and
+      // would otherwise accumulate forever.
+      const newest = pending.reduce((a, b) => (b.createdAt > a.createdAt ? b : a));
+      for (const checkpoint of pending) {
+        if (checkpoint.snapshotId !== newest.snapshotId) {
+          await this.syncManager.clearSnapshotCheckpoint(checkpoint.snapshotId);
+        }
+      }
+      this.emitSyncEvent('state-change', 'Resuming interrupted snapshot transfer');
+      const error = await this.runSnapshotTransfer({
+        type: 'resume_snapshot',
+        checkpoint: serializeSnapshotCheckpoint(newest),
+      });
+      return error === null;
+    }
+
+    if (this.options.bootstrapOnEmpty && await this.isReplicaEmpty()) {
+      this.emitSyncEvent('state-change', 'Empty replica: requesting full snapshot from server');
+      const error = await this.runSnapshotTransfer({ type: 'get_snapshot' });
+      return error === null;
+    }
+
+    return true;
+  }
+
+  /**
+   * A replica is "empty" — safe to bootstrap wholesale — only when BOTH hold
+   * against the server learned at handshake:
+   *
+   * - no peer sync state (never synced with this server), and
+   * - no local change facts of our own.
+   *
+   * The first alone would also match a device holding real local data that is
+   * merely meeting this server for the first time — bootstrapping it would
+   * clear its sync metadata while leaving its rows in place (divergence). The
+   * second alone would match a device whose entire contents came from this
+   * server. Requiring both admits only the genuinely new device. A device that
+   * pre-created its schema locally still counts as empty: schema migration
+   * records are not consulted, and replicated DDL applies idempotently.
+   */
+  private async isReplicaEmpty(): Promise<boolean> {
+    if (!this.serverSiteId) return false;
+
+    const peerState = await this.syncManager.getPeerSyncState(this.serverSiteId);
+    if (peerState !== undefined) return false;
+
+    // NOTE: this arm materializes every local change set when it runs. It runs
+    // only when no peer sync state exists — in practice once, on a device with
+    // nothing to materialize. If some future caller runs the probe on a
+    // populated replica, replace it with a cheap existence scan over the `cv:`
+    // prefix.
+    const localChanges = await this.syncManager.getChangesSince(this.serverSiteId);
+    return localChanges.length === 0;
+  }
+
+  /**
+   * Run one snapshot transfer: send the request, stream chunks through the
+   * reader into `applySnapshotStream`, then write the peer watermark.
+   *
+   * Resolves to null on success or the failure Error — never rejects, so the
+   * automatic bootstrap path (which nobody awaits externally) cannot surface
+   * an unhandled rejection. On failure the socket is closed WITHOUT detaching
+   * handlers: onclose firing is the retry mechanism (status → disconnected,
+   * scheduleReconnect, and the next handshake finds the pending checkpoint and
+   * sends resume_snapshot). No lingering `error` status and no stopReconnect —
+   * a snapshot failure is transient by construction.
+   */
+  private runSnapshotTransfer(msg: GetSnapshotMessage | ResumeSnapshotMessage): Promise<Error | null> {
+    if (this.snapshotTransferPromise) {
+      return this.snapshotTransferPromise;
+    }
+
+    const transfer = async (): Promise<Error | null> => {
+      const reader = new SnapshotStreamReader();
+      this.activeSnapshotReader = reader;
+      this.snapshotEventTablesProcessed = -1;
+      this.droppedChunkWarned = false;
+      this.setStatus({
+        status: 'bootstrapping',
+        tablesProcessed: 0, totalTables: 0,
+        entriesProcessed: 0, totalEntries: 0,
+      });
+
+      try {
+        if (!this.send(msg)) {
+          // Socket died before the request left — abandon without starting the
+          // apply; the reconnect path retries.
+          throw new Error('Snapshot request could not be sent (socket not open)');
+        }
+
+        this.resetSnapshotStallTimer();
+        await this.syncManager.applySnapshotStream(
+          reader.chunks(),
+          progress => this.reportSnapshotProgress(progress)
+        );
+
+        // The snapshot delivered everything up to its header HLC; record that
+        // as the received watermark so the follow-up get_changes asks for
+        // changes AFTER the snapshot point instead of replaying from nothing.
+        // (applySnapshotStream merges the HLC into the local clock but writes
+        // no peer state — the client owns that.) On a RESUMED transfer this is
+        // conservative: the header carries the original snapshot's HLC while
+        // the data served was read live, so the watermark is older than some
+        // applied data and the catch-up re-fetches a little. That is correct —
+        // re-application is idempotent — and cheaper than the alternative; do
+        // not "fix" it by advancing past the header HLC.
+        if (reader.headerHLC && this.serverSiteId) {
+          await this.syncManager.updatePeerSyncState(this.serverSiteId, reader.headerHLC);
+        }
+
+        this.emitSyncEvent('state-change', 'Snapshot bootstrap complete');
+        this.setStatus({ status: 'syncing', progress: 0 });
+        return null;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.emitSyncEvent('error', `Snapshot transfer failed: ${error.message}`);
+        this.options.onError?.(error);
+        // Close (handlers attached — see doc comment) unless the socket is
+        // already closed, in which case onclose has fired or is in flight.
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.close();
+        }
+        return error;
+      } finally {
+        this.clearSnapshotStallTimer();
+        this.activeSnapshotReader = null;
+        this.snapshotTransferPromise = null;
+      }
+    };
+
+    this.snapshotTransferPromise = transfer();
+    return this.snapshotTransferPromise;
+  }
+
+  /** Route one snapshot_chunk to the active transfer. Synchronous — see the dispatch comment. */
+  private handleSnapshotChunk(message: { chunk?: SerializedSnapshotChunk }): void {
+    if (!this.activeSnapshotReader) {
+      // A late chunk from an aborted stream must never leak into the next
+      // transfer. Warn once per gap, not per chunk — a dead stream can trail
+      // thousands.
+      if (!this.droppedChunkWarned) {
+        this.droppedChunkWarned = true;
+        console.warn('Dropping snapshot_chunk with no active snapshot transfer');
+        this.emitSyncEvent('info', 'Dropped snapshot chunk(s) received with no active transfer');
+      }
+      return;
+    }
+    if (!message.chunk) return;
+    this.activeSnapshotReader.push(message.chunk);
+    this.resetSnapshotStallTimer();
+  }
+
+  /** End the active transfer's stream (no-op when none). */
+  private handleSnapshotComplete(): void {
+    if (!this.activeSnapshotReader) return;
+    this.clearSnapshotStallTimer();
+    this.activeSnapshotReader.complete();
+  }
+
+  /**
+   * Abort the in-flight transfer, if any. The reader throws into
+   * `applySnapshotStream`, which lands in the transfer's failure path.
+   */
+  private abortSnapshotTransfer(error: Error): void {
+    this.activeSnapshotReader?.abort(error);
+  }
+
+  /**
+   * Stall watchdog: a server that stops sending mid-stream without closing the
+   * socket would otherwise hang the bootstrap forever with no reconnect. Reset
+   * on every chunk; cleared on complete and when the transfer settles.
+   */
+  private resetSnapshotStallTimer(): void {
+    this.clearSnapshotStallTimer();
+    const timeoutMs = this.options.snapshotChunkTimeoutMs;
+    this.snapshotStallTimer = setTimeout(() => {
+      this.snapshotStallTimer = null;
+      this.abortSnapshotTransfer(new Error(`Snapshot transfer stalled: no chunk within ${timeoutMs}ms`));
+    }, timeoutMs);
+  }
+
+  private clearSnapshotStallTimer(): void {
+    if (this.snapshotStallTimer) {
+      clearTimeout(this.snapshotStallTimer);
+      this.snapshotStallTimer = null;
+    }
+  }
+
+  /**
+   * Forward apply progress: every tick to `onSnapshotProgress` and the status,
+   * but a human-readable sync event only when `tablesProcessed` changes —
+   * progress fires once per column-versions chunk and would flood an event log.
+   */
+  private reportSnapshotProgress(progress: SnapshotProgress): void {
+    this.options.onSnapshotProgress?.(progress);
+    this.setStatus({
+      status: 'bootstrapping',
+      tablesProcessed: progress.tablesProcessed,
+      totalTables: progress.totalTables,
+      entriesProcessed: progress.entriesProcessed,
+      totalEntries: progress.totalEntries,
+      currentTable: progress.currentTable,
+    });
+    if (progress.tablesProcessed !== this.snapshotEventTablesProcessed) {
+      this.snapshotEventTablesProcessed = progress.tablesProcessed;
+      this.emitSyncEvent(
+        'info',
+        `Snapshot: ${progress.tablesProcessed} of ${progress.totalTables} tables`,
+        { changeCount: progress.entriesProcessed }
+      );
     }
   }
 
@@ -653,6 +1011,8 @@ export class SyncClient {
   private async pushLocalChanges(): Promise<void> {
     if (this.options.readOnly) return;
     if (!this.isConnected || !this.serverSiteId) return;
+    // No pushes while a snapshot is landing — local data is partial.
+    if (this.isBootstrapping) return;
 
     // Get changes since lastSentHLC (delta sync)
     // Use serverSiteId to filter out changes that originated from the server

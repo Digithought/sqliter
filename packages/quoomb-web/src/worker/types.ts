@@ -45,6 +45,8 @@ export type StorageModuleType = 'memory' | 'store' | 'sync';
 export type SyncStatus =
   | { status: 'disconnected' }
   | { status: 'connecting' }
+  | { status: 'bootstrapping'; tablesProcessed: number; totalTables: number;
+      entriesProcessed: number; totalEntries: number; currentTable?: string }
   | { status: 'syncing'; progress: number }
   | { status: 'synced'; lastSyncTime: number }
   | { status: 'error'; message: string };
