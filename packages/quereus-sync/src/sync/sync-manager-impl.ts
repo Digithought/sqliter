@@ -111,10 +111,12 @@ export function assertOpSeqInRange(opSeq: number): void {
  * records, or `undefined` when the combination is not tracked for replication
  * (e.g. column-level or view/trigger objects, or an `alter` on an index). Takes
  * the whole event rather than `(objectType, type)` because a rename is only
- * distinguishable by `oldObjectName` — set by exactly one emit site, the store
- * module's `renameTable` (the event's `objectName` carries the NEW name). Every
- * other `'table' alter` is recorded as `alter_column` — the coarse "table
- * definition changed" migration the schema-sync layer replays.
+ * distinguishable by `oldObjectName`, which exactly the three RENAME TO emit sites
+ * set — `StoreModuleRename.renameTable`, the memory module's `renameTable`, and the
+ * engine's own `runRenameTable` tail (for a module with no emitter of its own). All
+ * three put the NEW name in `objectName`. Every other `'table' alter` is recorded as
+ * `alter_column` — the coarse "table definition changed" migration the schema-sync
+ * layer replays.
  */
 function mapSchemaMigrationType(event: DatabaseSchemaChangeEvent): SchemaMigrationType | undefined {
 	const { objectType, type } = event;

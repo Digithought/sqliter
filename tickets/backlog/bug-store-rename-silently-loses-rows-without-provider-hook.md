@@ -34,11 +34,11 @@ alter table orders rename to orders2               -- no error
 select * from orders2                              -- []
 ```
 
-Every shipped backend (LevelDB, IndexedDB) does implement the method, and most
-of the store package's own test backends do too, so no shipped configuration
-loses data today. The exposure is to anyone writing their own storage backend —
-a plugin author following the interface, which documents the method's contract
-but never says that omitting it destroys data on rename.
+The desktop/browser backends (LevelDB, IndexedDB) do implement the method, and
+most of the store package's own test backends do too. The exposure is to anyone
+writing their own storage backend — a plugin author following the interface,
+which documents the method's contract but never says that omitting it destroys
+data on rename — **and to two backends we ship ourselves** (see below).
 
 ## Expected behavior
 
@@ -60,3 +60,23 @@ state the consequence of omitting it. (The sync test harness half is done:
 `sync-replicate-rename-table` added `renameTableStores` to the harness's
 in-memory backend, so it no longer models the data-losing configuration. The
 store module's silent skip — the root cause — remains.)
+
+## Second arm — two shipped mobile backends omit the method (found during `sync-replicate-rename-table` review)
+
+The claim above that only third-party backends are exposed is wrong. Both mobile
+backends implement `deleteTableStores` but not `renameTableStores`:
+
+- `packages/quereus-plugin-react-native-leveldb/src/provider.ts` (`deleteTableStores` at
+  line 150, no `renameTableStores`)
+- `packages/quereus-plugin-nativescript-sqlite/src/provider.ts` (`deleteTableStores` at
+  line 131, no `renameTableStores`)
+
+So a rename on React Native or NativeScript empties the table today, silently.
+
+This got worse rather than staying local: renames now replicate between devices
+(`sync-replicate-rename-table`). A rename typed on a laptop reaches the phone as a
+migration the phone re-executes, so one device's rename silently empties the table on
+every mobile peer — no error on either side.
+
+That raises the priority but does not change the decision the ticket asks for. Whichever
+direction is chosen, these two providers need the method (or need to fail loudly).

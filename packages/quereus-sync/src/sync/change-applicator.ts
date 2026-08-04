@@ -118,6 +118,17 @@ interface TableExistenceStep {
  * changes before all data, including migrations Phase 1a later skips as HLC-dominated:
  * a skipped migration means the receiver already reached that state, so the verdict is
  * unchanged.
+ *
+ * KNOWN WRONG for two rename shapes that also carry row data, both verified — see
+ * `tickets/fix/sync-rename-batch-existence-verdict-wrong.md`. (1) The new-name presence
+ * step assumes the receiver executes the rename; it does not when the old name is gone
+ * locally (drop won) or `fromTable` is missing, so the batch's rows for the new name reach
+ * a table that does not exist and `applySchemaChange`'s external-write lookup throws,
+ * aborting the batch with the watermark unadvanced — the same batch then re-throws
+ * forever. (2) `recreated` treats rename-away-then-rename-back as a fresh incarnation, so
+ * its rows resolve read-free past a stored tombstone that should have blocked them. Fix
+ * them together — they are one disagreement between this structural verdict and the
+ * catalog-based one in `decideRenameTable`.
  */
 function computeBatchTableFates(changes: ChangeSet[]): Map<string, BatchTableFate> {
 	// Per table: the max-HLC existence step (which decides existence) and the max-HLC
@@ -456,7 +467,8 @@ export async function applyChanges(
 	emitRemoteChanges(ctx, appliedChanges);
 
 	// Reactive low-latency drain (sync-drain-reappear-inbound-ddl): every APPLIED
-	// create_table may have revived a previously-retired table that has held
+	// migration that makes a NAME exist — a `create_table`, or a `rename_table` moving a
+	// table onto that name — may have revived a previously-retired table that has held
 	// out-of-basis changes waiting on it. Replay them NOW — as a SEPARATE post-commit
 	// apply unit, after the admitting batch above has fully committed (fresh data lands
 	// first, held changes LWW-resolve against it) — instead of waiting up to one
@@ -469,7 +481,7 @@ export async function applyChanges(
 	// never turns this successful apply into an error.
 	const reappeared = new Map<string, { schema: string; table: string }>();
 	for (const { migration } of pendingSchemaMigrations) {
-		if (migration.type !== 'create_table') continue;
+		if (migration.type !== 'create_table' && migration.type !== 'rename_table') continue;
 		const key = tableKey(migration.schema, migration.table);
 		const fate = batchFates.get(key);
 		if (fate && !fate.present) continue;
@@ -589,7 +601,7 @@ function emitRemoteChanges(
 	}
 }
 
-// NOTE: this file is 1144 lines (`wc -l`), second-largest in the package. The drain
+// NOTE: this file is 1204 lines (`wc -l`), second-largest in the package. The drain
 // block below (`drainHeldChanges` → `drainReappearedTables`) shares only `resolveChange`,
 // `reconcileInBatchDeletes`, `commitChangeMetadata`, and `admitGroup` with the wire-apply
 // half above, so it is the natural seam if the file keeps growing.

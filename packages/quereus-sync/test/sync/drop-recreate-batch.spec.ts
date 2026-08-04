@@ -315,4 +315,43 @@ describe('drop + re-create in one batch', () => {
 			await closePeer(receiver);
 		}
 	});
+
+	it('a name RENAMED away and re-created in one batch resolves read-free too', async () => {
+		// The rename arm of the same verdict: `rename_table` is an ABSENCE step for the
+		// old name, so a table re-created under that name in the same batch is a fresh
+		// incarnation exactly as after a `drop_table`. The metadata stranded under the
+		// name belongs to the table that was renamed AWAY, so consulting it would let its
+		// tombstone discard the new incarnation's row. (`computeBatchTableFates` +
+		// `appliedDropKeys` in `change-applicator.ts`.)
+		const origin = await makePeer('origin');
+		const receiver = await makePeer('receiver');
+		try {
+			await localWrite(origin, WIDGETS_DDL);
+			await localWrite(origin, "insert into widgets (id, w) values (2, 'other')");
+			await relayAll(origin, receiver);
+
+			await localWrite(receiver, "insert into widgets (id, w) values (1, 'local')");
+			await localWrite(receiver, 'delete from widgets where id = 1');
+			expect(await receiver.manager.tombstones.getTombstone('main', 'widgets', [1]), 'stale tombstone seeded')
+				.to.not.be.undefined;
+
+			// Rename `widgets` away, then create a NEW `widgets` and write pk 1 into it.
+			await localWrite(origin, 'alter table widgets rename to widgets2');
+			await localWrite(origin, WIDGETS_DDL);
+			await localWrite(origin, "insert into widgets (id, w) values (1, 'reborn')");
+
+			const result = await receiver.manager.applyChanges(
+				await origin.manager.getChangesSince(receiver.manager.getSiteId()),
+			);
+
+			expect(result.unknownTable).to.be.undefined;
+			expect(await collect(receiver.db, 'select id, w from widgets where id = 1'))
+				.to.deep.equal([{ id: 1, w: 'reborn' }]);
+			expect(receiver.db.schemaManager.getTable('main', 'widgets2'), 'the renamed-away table came across')
+				.to.not.be.undefined;
+		} finally {
+			await closePeer(origin);
+			await closePeer(receiver);
+		}
+	});
 });

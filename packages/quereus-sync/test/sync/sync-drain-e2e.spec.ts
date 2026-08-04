@@ -218,6 +218,45 @@ describe('real-engine held-change drain (revival): straggler → hold → re-cre
 		expect(siteIdEquals(hCv!.hlc.siteId, S.manager.getSiteId()), 'materialized with S\'s origin siteId').to.be.true;
 	});
 
+	it('an inbound rename_table reactively drains the hold under the NEW name', async () => {
+		// Sibling of the create_table case above: a `rename_table` makes its NEW name
+		// exist just as a `create_table` does, so it must trigger the same reactive
+		// drain. Without it, rows already held under the new name wait for the periodic
+		// sweep even though the table they need is now present.
+		const S = await spawn('S', { createOrders: true });
+		const H = await spawn('H', { createOrders: true }); // quarantine (default), has `orders`
+
+		// (1) S renames, then writes under the NEW name.
+		await localWrite(S, 'alter table orders rename to orders2');
+		await localWrite(S, "insert into orders2 values (1, 'hi')");
+
+		// (2) Relay DATA only → H has no `orders2` → the row is diverted and held.
+		await relay(S, H);
+		expect(await H.manager.quarantine.list('main', 'orders2'), 'H holds the orders2 insert')
+			.to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+		expect(H.db.schemaManager.getTable('main', 'orders2'), 'H has no orders2 at hold time').to.be.undefined;
+
+		// (3) Relay ONLY the rename migration (no data): H renames its `orders` to
+		//     `orders2`, and the reactive post-commit drain replays the held rows.
+		const drainedEvents: HeldChangesDrainedEvent[] = [];
+		H.manager.getEventEmitter().onHeldChangesDrained(e => drainedEvents.push(e));
+		const renameOnly = (await S.manager.getChangesSince(H.manager.getSiteId()))
+			.map(cs => ({ ...cs, changes: [], schemaMigrations: cs.schemaMigrations.filter(m => m.type === 'rename_table') }))
+			.filter(cs => cs.schemaMigrations.length > 0);
+		expect(renameOnly, 'S has a rename_table migration to relay').to.have.length.greaterThan(0);
+		await H.manager.applyChanges(renameOnly);
+		await settle();
+
+		expect(H.db.schemaManager.getTable('main', 'orders2'), 'the inbound rename built orders2 on H').to.not.be.undefined;
+		expect(
+			await collect(H.db, 'select id, note from orders2'),
+			'reactive drain materialized S\'s row under the new name',
+		).to.deep.equal([{ id: 1, note: 'hi' }]);
+		expect(await H.manager.quarantine.list('main', 'orders2'), 'hold cleared by the reactive drain').to.have.lengthOf(0);
+		expect(drainedEvents, 'the reactive drain fired one drained event for orders2').to.have.lengthOf(1);
+		expect(drainedEvents[0]).to.include({ schema: 'main', table: 'orders2', drained: COLUMNS_PER_FRESH_INSERT });
+	});
+
 	it('a drain BEFORE the table is re-created is a genuine no-op: nothing materializes, the hold survives', async () => {
 		const S = await spawn('S', { createOrders: true });
 		const H = await spawn('H'); // quarantine, NO orders — and it stays absent here

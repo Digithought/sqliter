@@ -143,7 +143,7 @@ a `NOCASE` key) stays one update and tombstones nothing.
 
 ### Unknown-Table Disposition
 
-After a basis table retires everywhere (see [migration.md § Contract](migration.md#4-contract--retire-the-old-table)), a long-offline **straggler** can reconnect and send changes for a table the receiver no longer has. The receiver detects this **structurally** in Phase 1 of `applyChanges` — the table simply isn't in the local basis (`getTableSchema` returns nothing); there is no version negotiation. Detection unions the current basis with the batch's own in-flight DDL, so a `create_table` earlier in the same batch makes its table known and a `drop_table` makes one unknown. The self-origin echo skip runs first, so a peer never quarantines its own change.
+After a basis table retires everywhere (see [migration.md § Contract](migration.md#4-contract--retire-the-old-table)), a long-offline **straggler** can reconnect and send changes for a table the receiver no longer has. The receiver detects this **structurally** in Phase 1 of `applyChanges` — the table simply isn't in the local basis (`getTableSchema` returns nothing); there is no version negotiation. Detection unions the current basis with the batch's own in-flight DDL, so a `create_table` earlier in the same batch makes its table known, a `drop_table` makes one unknown, and a `rename_table` does both at once (its new name known, its old name unknown). The self-origin echo skip runs first, so a peer never quarantines its own change.
 
 Diverted changes are **never resolved, applied, or recorded as CRDT metadata** — that keeps the change log clean for a table the receiver does not have — and are handled per `SyncConfig.unknownTableDisposition`:
 
@@ -182,7 +182,7 @@ A retired table can come **back** — re-created app-side, a `create_table` arri
 - **Events.** Applied changes fire `onRemoteChange` (so MV maintenance / `Database.watch` / UI react to the revival), grouped by each held change's **original origin** `hlc.siteId`; each drained table fires `onHeldChangesDrained` (`{ schema, table, drained, applied, skipped }`, `applied + skipped === drained`). A forwarded entry that drains stops being relay-offered and rides the normal change log thereafter.
 - **No-oracle no-op.** Without `getTableSchema` a relay-only coordinator cannot tell which held tables are present, so `drainHeldChanges` returns 0 and touches nothing — as unknown-table detection is inert there. Zero-cost when nothing is held.
 - **Low-latency reappearance.** Both library-internal paths replay the held edits the moment the revival commits, rather than waiting up to one sweep interval. Both share `SyncConfig.drainOnReappear` (default **on**; `false` leaves all drain timing to the host sweep), are **advisory** (a drain throw is logged + swallowed — the revival is already committed, so held entries stay held for the next sweep), **idempotent** with the periodic sweep (a second drain of an already-drained table returns 0), and inert on a relay-only / no-oracle peer.
-  - **Inbound `create_table`.** When a remote peer re-creates the table mid-sync, `applyChanges` runs the drain after the admitting batch commits. Only an *applied* `create_table` triggers it — an HLC-dominated duplicate does not — and a `create_table` + `drop_table` of the same table in one batch leaves it absent, so the drain is a no-op. No exec mutex is held here, so this drain is awaited inline.
+  - **Inbound `create_table` / `rename_table`.** When a remote peer re-creates the table mid-sync — or renames a table *onto* the held name, which makes that name exist just the same — `applyChanges` runs the drain after the admitting batch commits. Only an *applied* migration triggers it — an HLC-dominated duplicate does not — and a batch whose schema steps leave the name absent (a trailing `drop_table`, or a later rename away) is a no-op. No exec mutex is held here, so this drain is awaited inline.
   - **Lens redeploy.** When a local `apply schema` redeploy re-maps a basis table from `detached` back into the basis, `recordLensDeployment` runs the drain after its lifecycle records are durable and their `onBasisTableLifecycle` events have fired (so the basis oracle sees the re-attached table). Only the precise `detached → present` transition triggers it; an idempotent re-deploy and a brand-new table both skip the scoped scan, and the oracle gate makes any over-trigger a harmless no-op. The drain cannot abort the deploy. **Re-entrancy:** the `notifyLensDeployment` hook is awaited *inside* the firing `apply schema` statement, which holds the engine exec mutex, and the drain re-enters the engine via `db.ingestExternalRowChanges`, which acquires that same mutex — awaiting it inline would deadlock. So when the engine reports it is mid-statement (`Database._isExecuting()`), the drain is **deferred to fire-and-forget**: it queues on the mutex and runs the instant `apply schema` releases it, making the reappearance *eventually*-immediate rather than awaited by the deploy. Outside a live statement (e.g. a metadata-only unit test over a stub store) it still awaits inline.
 
 **Who drives the sweep.** The library schedules nothing; the host owns cadence. It does ship the *shape* of one pass — sweep order, per-sweep error isolation, the single-flight guard — as `runSyncMaintenancePass` / `createSyncMaintenanceTicker` (`src/sync/maintenance.ts`), so every host runs the same semantics instead of re-deriving them; arming a timer around that is still the host's job.
@@ -602,10 +602,13 @@ so a table exists by the time its entries need keying.
 ### Metadata format version
 
 The `fv:` record stores the sync-metadata storage format version
-(`SYNC_METADATA_FORMAT_VERSION`, currently **4**: pk-identity keying, raw pk in record
-values, every variable-length key component length-prefixed, and `sm:` keyed by object
-kind. Version 3 lacked that kind, so a table and a same-named index shared one version
-counter, silently suppressing each other's migrations; version 2 also lacked the length
+(`SYNC_METADATA_FORMAT_VERSION`, currently **5**: pk-identity keying, raw pk in record
+values, every variable-length key component length-prefixed, `sm:` keyed by object kind,
+and each `sm:` VALUE carrying a length-prefixed `fromTable` slot between the migration
+type and the DDL so a `rename_table` can name the table it renamed. Version 4 ended its
+records with the DDL as "rest of buffer", leaving nowhere to append that slot; version 3
+lacked the object kind, so a table and a same-named index shared one version counter,
+silently suppressing each other's migrations; version 2 also lacked the length
 prefixes). `SyncManagerImpl.create` writes it on a fresh replica and refuses to open one
 whose stored version is missing (pre-versioning) or different: old keys are unreadable
 under the new layout and mixing the two would corrupt both. Recovery is to clear the
@@ -723,12 +726,15 @@ deletion, so a receiver can show or undo *what was removed*.
 
 /** A schema modification */
 interface SchemaMigration {
-  type: 'create_table' | 'drop_table' | 'add_column' | 'drop_column' | 'add_index' | 'drop_index';
+  type: 'create_table' | 'drop_table' | 'rename_table'
+      | 'add_column' | 'drop_column' | 'alter_column'
+      | 'add_index' | 'drop_index';
   schema: string;
-  table: string;
+  table: string;                     // The object's name AFTER the migration
+  fromTable?: string;                // `rename_table` only: the name before the rename
   ddl: string;                       // The DDL statement
   hlc: HLC;
-  schemaVersion: number;             // Monotonic per-table version
+  schemaVersion: number;             // Monotonic per (object kind, object name)
 }
 ```
 
