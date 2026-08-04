@@ -90,13 +90,13 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 				updated = await this.alterPrimaryKeyChange(db, schemaName, tableName, table, oldSchema, change);
 				break;
 			case 'addConstraint':
-				updated = await this.alterAddConstraint(db, schemaName, tableName, table, oldSchema, change, rows);
+				updated = await this.alterAddConstraint(db, table, oldSchema, change, rows);
 				break;
 			case 'dropConstraint':
-				updated = await this.alterDropConstraint(schemaName, tableName, table, oldSchema, change);
+				updated = await this.alterDropConstraint(table, oldSchema, change);
 				break;
 			case 'renameConstraint':
-				updated = await this.alterRenameConstraint(schemaName, tableName, table, oldSchema, change);
+				updated = await this.alterRenameConstraint(table, oldSchema, change);
 				break;
 			case 'alterColumn':
 				updated = await this.alterColumnChange(db, schemaName, tableName, table, oldSchema, change, rows);
@@ -479,8 +479,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 	 *  (UNIQUE / FOREIGN KEY / CHECK) requires, then persist. Behavior-preserving extraction. */
 	private async alterAddConstraint(
 		db: Database,
-		_schemaName: string,
-		_tableName: string,
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'addConstraint' }>,
@@ -545,8 +543,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 	/** DROP CONSTRAINT arm of {@link alterTable}: schema-only catalog rewrite dropping a named
 	 *  constraint, then persist. Behavior-preserving extraction. */
 	private async alterDropConstraint(
-		_schemaName: string,
-		_tableName: string,
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'dropConstraint' }>,
@@ -587,8 +583,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 	 *  `reconcileImplicitUniqueIndexStores` (run after this arm) MOVES the physical store —
 	 *  tears down the old-named store and rebuilds the new-named one from effective rows. */
 	private async alterRenameConstraint(
-		_schemaName: string,
-		_tableName: string,
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'renameConstraint' }>,

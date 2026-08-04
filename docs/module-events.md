@@ -68,8 +68,9 @@ value list, not an index list. Same split:
 
 Batched **schema** events are deliberately not relabelled. A schema event records a DDL
 operation, not current state; relabelling its `objectName` without rewriting its `ddl` text
-would produce an incoherent instruction, and how a rename should reach a replicating peer is
-an open question tracked separately.
+would produce an incoherent instruction. A consumer replays the schema events in order — the
+rename is one of them, carrying its own `ddl` and the pre-rename name in `oldObjectName` — so
+earlier events legitimately name the old table.
 
 ## Event Types
 
@@ -99,8 +100,10 @@ interface DatabaseSchemaChangeEvent {
   moduleName: string;       // Which module raised this event
   schemaName: string;
   objectName: string;
+  oldObjectName?: string;   // Pre-rename table name (ALTER TABLE ... RENAME TO only)
   columnName?: string;      // For column operations
-  ddl?: string;             // DDL statement if available
+  oldColumnName?: string;   // Pre-rename column name (RENAME COLUMN only)
+  ddl?: string;             // DDL statement if available — always set for ALTER TABLE
   remote: boolean;          // true if from sync/remote source
 }
 ```

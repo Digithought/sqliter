@@ -28,7 +28,8 @@ interface SchemaChangeEvent {
   objectType: 'table' | 'index';
   schemaName: string;
   objectName: string;
-  ddl?: string;  // For create/alter
+  oldObjectName?: string;  // Pre-rename table name (ALTER TABLE ... RENAME TO only)
+  ddl?: string;            // For create/alter
 }
 
 store.onSchemaChange((event: SchemaChangeEvent) => {

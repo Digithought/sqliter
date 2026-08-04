@@ -35,6 +35,12 @@ export function buildAlterTableStmt(
   // (schema-differ.ts), so the two wire sources agree. The runtime arms thread it to the
   // module (`SchemaChangeInfo.ddl` / `renameTable`'s `ddl`) and onto the public
   // schema-change event.
+  //
+  // NOTE: rendered for EVERY arm, including the four that never announce anything (the tag
+  // arms, `set`/`drop maintained`) — `set maintained as <select>` therefore stringifies its
+  // whole SELECT body for a string nobody reads. Free today: ALTER is not a hot path and
+  // each statement builds once. If those arms ever start carrying a rendering cost that
+  // matters, render lazily and hand the arms a thunk instead of a string.
   const { schemaName, name: tableName } = tableReference.tableSchema;
   const canonicalStmt: AST.AlterTableStmt = {
     type: 'alterTable',

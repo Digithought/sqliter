@@ -421,6 +421,17 @@ describe('ALTER TABLE on an emitter-backed module emits exactly once', () => {
 		assert.equal(alterEvents()[0].ddl, 'alter table t add column w text null unique');
 	});
 
+	// The point of rendering from the RESOLVED table reference rather than from the
+	// statement as typed: a table outside `main` announces a schema-qualified statement,
+	// so a receiver never re-resolves it against ITS default schema.
+	it('a table outside main announces a schema-qualified statement', async () => {
+		await db.exec('create table temp.q (id integer primary key)');
+		await db.exec('alter table temp.q add column w text null');
+		const [e] = alterEvents();
+		assert.equal(e.schemaName, 'temp');
+		assert.equal(e.ddl, 'alter table "temp".q add column w text null');
+	});
+
 	it('rename to carries oldObjectName and the statement text, like the engine path', async () => {
 		await db.exec('create table t (id integer primary key)');
 		await db.exec('alter table t rename to t2');

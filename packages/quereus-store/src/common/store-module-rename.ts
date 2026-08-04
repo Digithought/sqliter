@@ -249,7 +249,9 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 
 		// Same emit-iff-`ddl` rule as `StoreModuleAlter.alterTable`: `ddl` set means this
 		// call IS the RENAME TO statement's action; absent means an engine-internal step
-		// (e.g. the shadow-table rebuild's trailing rename) that must announce nothing.
+		// that must announce nothing. No in-tree caller omits it today — the shadow-table
+		// rebuild's trailing rename is itself a RENAME TO statement and is silenced by
+		// `withPublicEventsSuppressed`, not by this gate.
 		// `oldObjectName` says what the table renamed FROM — `objectName` names only the
 		// new table, and a receiver could not otherwise tell which of its tables moved.
 		if (ddl !== undefined) {

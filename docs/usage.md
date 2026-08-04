@@ -434,6 +434,7 @@ The `DatabaseSchemaChangeEvent` interface:
 | `moduleName` | `string` | The module that raised the event |
 | `schemaName` | `string` | Schema name |
 | `objectName` | `string` | Object name (table or index name) |
+| `oldObjectName` | `string` | Previous table name (`alter table … rename to` only) |
 | `columnName` | `string` | Column name (for column operations) |
 | `oldColumnName` | `string` | Previous column name (for renames) |
 | `ddl` | `string` | DDL statement if available |
@@ -447,7 +448,7 @@ fallback, so a subscriber sees the same facts either way:
 
 | Statement | `type` | `objectType` | `objectName` | `columnName` | `oldColumnName` |
 |---|---|---|---|---|---|
-| `rename to` | `alter` | `table` | **new** table name | — | — |
+| `rename to` | `alter` | `table` | **new** table name (`oldObjectName` = old) | — | — |
 | `rename column` | `alter` | `column` | table | **new** column name | old column name |
 | `add column` | `alter` | `column` | table | added column | — |
 | `drop column` | **`drop`** | `column` | table | dropped column | — |
@@ -459,15 +460,22 @@ fallback, so a subscriber sees the same facts either way:
 
 Note `drop column` reports `type: 'drop'`, not `'alter'` — the arm removes an object.
 
-The event is raised on the statement's **success** path only: an ALTER that throws (including
-one that fails partway and unwinds, like an `add column` whose inline `CHECK` the existing rows
-violate) announces nothing at all. Like every other event, delivery is batched to commit and
-dropped on rollback.
+Every arm above also sets `ddl` to the statement's **canonical, schema-qualified SQL** — the
+text a replicating peer re-executes to reproduce the alteration. The engine renders it once at
+plan-build time from the *resolved* table, so `alter table orders …` on a table in schema `sales`
+announces `alter table sales.orders …` regardless of how you spelled it; statement keywords are
+lowercased, while identifier and data-type casing is preserved as written.
 
-`add column` with inline constraints (`add column w text null unique`) still reports **one**
-event on the engine's fallback path. A backend that emits for itself may report an extra
-`alter`/`table` per inline constraint, reflecting its own internal call pattern rather than a
-second change the application made.
+`add column` with inline constraints (`add column w text null unique`) reports **one** event on
+either path, carrying the whole statement's text. A backend that emits for itself makes an extra
+internal `addConstraint` round-trip per inline constraint, but those calls are marked
+engine-internal and announce nothing.
+
+The event is raised on the statement's **success** path only — an ALTER that throws announces
+nothing at all — with one known exception on backends that emit for themselves: an `add column`
+that gets past its own module call and then fails while installing an inline constraint leaves
+its event behind (tracked as `alter-add-column-revert-leaks-schema-event`). Like every other
+event, delivery is batched to commit and dropped on rollback.
 
 Two arm families report nothing on either path: the metadata-tag arms (`set tags`, `add tags`,
 `drop tags`) and the materialized-view lifecycle arms (`set maintained`, `drop maintained`).
