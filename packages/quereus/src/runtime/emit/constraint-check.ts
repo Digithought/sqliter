@@ -106,6 +106,11 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 	if (mutationContextValues && contextAttributes) {
 		for (const attr of contextAttributes) {
 			const valueExpr = mutationContextValues.get(attr.name);
+			// NOTE: a declared context var with no supplied value is silently skipped here,
+			// which would shift every later value out of alignment with contextDescriptor.
+			// Unreachable today — emitDmlExecutor throws "Missing mutation context value for
+			// '<name>'" at prepare time first — but that's an external invariant, not one
+			// this loop enforces itself.
 			if (valueExpr) {
 				contextEvaluatorInstructions.push(emitCallFromPlan(valueExpr, ctx));
 			}

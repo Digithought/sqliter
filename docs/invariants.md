@@ -114,6 +114,21 @@ writing through an existing node. The single sanctioned in-place mutator is
 be built before the node it references; it explicitly invalidates the caches it dirties
 (see OPT-018).
 
+### OPT-009 — Every held expression is a child
+
+- code: `packages/quereus/src/planner/nodes/dml-executor-node.ts` — `getChildren`, `withChildren`
+- code: `packages/quereus/src/planner/nodes/constraint-check-node.ts` — `getChildren`, `withChildren`
+- guard: `packages/quereus/test/optimizer/dml-child-exposure.spec.ts` — `DML side-expression exposure to the optimizer`
+
+Every user expression a plan node holds and later emits must be reachable through
+`getChildren()`, and `withChildren` must slice the rewritten children back into the same
+slots they came from. The optimizer only ever rewrites what `getChildren()` exposes — a
+subtree a node holds out-of-band works for a simple expression (nothing to rewrite) but
+silently reaches the runtime unrewritten the moment it is a subquery, surfacing as a
+missing-emitter or unphysicalized-node error far from the actual defect. See
+`bug-dml-side-expressions-invisible-to-optimizer`, where `DmlExecutorNode`'s ON CONFLICT
+assignments/WHERE and both nodes' WITH CONTEXT values were held this way.
+
 ### OPT-010 — Visited rules are inherited across a re-mint; declines are not
 
 - code: `packages/quereus/src/planner/framework/pass.ts` — `inheritVisitedRules`

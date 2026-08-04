@@ -192,16 +192,12 @@ with c as (select id from p) insert into q9 (id) values (9);
 select id, w from q9 order by id;
 → [{"id":9,"w":3}]
 
--- ===== ON CONFLICT and WITH CONTEXT: name resolution is fixed, execution is not =====
--- These two clauses now RESOLVE the statement's CTEs (they no longer report
--- `Table 'c' not found`), but a subquery in either position cannot execute at all —
--- `DmlExecutorNode` does not expose its ON CONFLICT / mutation-context expressions as
--- optimizer-visible children, so their subquery subtrees are never rewritten. That is a
--- separate defect with its own root cause and reproduces with no WITH clause at all;
--- it is tracked by `fix/bug-dml-side-expressions-invisible-to-optimizer`.
---
--- Pinned here as ERRORS so this file fails loudly when that ticket lands and these
--- become real assertions.
+-- ===== ON CONFLICT and WITH CONTEXT: name resolution AND execution both work =====
+-- These two clauses RESOLVE the statement's CTEs (no more `Table 'c' not found`), and a
+-- subquery in either position now executes correctly — `DmlExecutorNode` exposes its
+-- ON CONFLICT / mutation-context expressions as optimizer-visible children, so their
+-- subquery subtrees get rewritten like any other child. Fixed by
+-- `bug-dml-side-expressions-invisible-to-optimizer`.
 
 create table q10 (id integer primary key, w text);
 insert into q10 values (1, 'x');
@@ -209,24 +205,24 @@ create table mc (id integer primary key, v text) with context (who integer);
 -- run
 
 with c as (select id from p) insert into q10 values (1, 'x')
-  on conflict (id) do update set w = (select count(*) from c);
--- error: No emitter registered for Aggregate
+  on conflict (id) do update set w = (select count(*) from c) returning w;
+→ [{"w":"2"}]
 
 with c as (select id from p) insert into q10 values (1, 'x')
-  on conflict (id) do update set w = 'y' where (select count(*) from c) > 0;
--- error: No emitter registered for Aggregate
+  on conflict (id) do update set w = 'y' where (select count(*) from c) > 0 returning w;
+→ [{"w":"y"}]
 
 with c as (select id from p) insert into mc with context who = (select count(*) from c)
-  values (1, 'x');
--- error: No emitter registered for Aggregate
+  values (1, 'x') returning v;
+→ [{"v":"x"}]
 
--- The same three shapes fail identically with NO leading WITH clause — the failure is
+-- The same three shapes work identically with NO leading WITH clause — the fix is
 -- not about CTE visibility.
-insert into q10 values (1, 'x') on conflict (id) do update set w = (select count(*) from p);
--- error: No emitter registered for Aggregate
+insert into q10 values (1, 'x') on conflict (id) do update set w = (select count(*) from p) returning w;
+→ [{"w":"2"}]
 
-insert into mc with context who = (select count(*) from p) values (2, 'x');
--- error: No emitter registered for Aggregate
+insert into mc with context who = (select count(*) from p) values (2, 'x') returning id, v;
+→ [{"id":2,"v":"x"}]
 
 -- Cleanup
 drop materialized view mvq4;

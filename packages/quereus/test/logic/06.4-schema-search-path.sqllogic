@@ -129,16 +129,14 @@ INSERT INTO products (id, name) VALUES (5, 'Whatsit') WITH SCHEMA myapp
 
 DELETE FROM myapp.products WHERE id = 5;
 
--- Test 17b: the ON CONFLICT arm resolves the schema path too, but cannot yet EXECUTE a
--- subquery in that position: `DmlExecutorNode` does not expose its ON CONFLICT
--- expressions as optimizer-visible children, so their subquery subtrees are never
--- rewritten. Separate root cause, reproduces with no WITH SCHEMA at all — tracked by
--- `fix/bug-dml-side-expressions-invisible-to-optimizer`. Pinned as an error so this file
--- fails loudly when that lands and this becomes a real assertion.
+-- Test 17b: the ON CONFLICT arm resolves the schema path too, and now EXECUTEs a
+-- subquery in that position: `DmlExecutorNode` exposes its ON CONFLICT expressions as
+-- optimizer-visible children, so their subquery subtrees get rewritten. Fixed by
+-- `bug-dml-side-expressions-invisible-to-optimizer`.
 INSERT INTO products (id, name) VALUES (3, 'Dupe')
   ON CONFLICT (id) DO UPDATE SET name = (SELECT COUNT(*) FROM lookup)
   WITH SCHEMA myapp RETURNING name;
--- error: No emitter registered for Aggregate
+→ [{"name":"3"}]
 
 DROP TABLE myapp.lookup;
 

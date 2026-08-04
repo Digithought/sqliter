@@ -1,0 +1,126 @@
+import { expect } from 'chai';
+import { Database } from '../../src/core/database.js';
+import { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { DmlExecutorNode } from '../../src/planner/nodes/dml-executor-node.js';
+import { ConstraintCheckNode } from '../../src/planner/nodes/constraint-check-node.js';
+
+/**
+ * Structural guard for bug-dml-side-expressions-invisible-to-optimizer:
+ * `DmlExecutorNode` (ON CONFLICT assignments / WHERE, and WITH CONTEXT values)
+ * and `ConstraintCheckNode` (WITH CONTEXT values, alongside its existing CHECK
+ * and NOT NULL DEFAULT children) must expose every held expression through
+ * `getChildren()` so the optimizer can rewrite subqueries inside them, and
+ * `withChildren()` must slice a round-trip back to an equivalent node.
+ *
+ * `plan-validator.ts`'s "no logical-only node reaches emission" check cannot
+ * serve as this guard — it walks `getChildren()` too, so it is blind to
+ * exactly the subtrees this ticket exposes: a broken getChildren() would just
+ * make the validator agree there is nothing to check.
+ */
+
+/** First node matching `predicate`, depth-first over `getChildren()`. */
+function findNode<T extends PlanNode>(root: PlanNode, predicate: (n: PlanNode) => n is T): T {
+	const stack: PlanNode[] = [root];
+	const seen = new Set<PlanNode>();
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (seen.has(node)) continue;
+		seen.add(node);
+		if (predicate(node)) return node;
+		for (const child of node.getChildren()) stack.push(child);
+	}
+	throw new Error('no matching node found in plan');
+}
+
+const isDmlExecutor = (n: PlanNode): n is DmlExecutorNode => n instanceof DmlExecutorNode;
+const isConstraintCheck = (n: PlanNode): n is ConstraintCheckNode => n instanceof ConstraintCheckNode;
+
+describe('DML side-expression exposure to the optimizer', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table src (id integer primary key, v integer)');
+		await db.exec("insert into src values (1, 10), (2, 20)");
+		await db.exec(`
+			create table t (
+				id integer primary key,
+				email text unique,
+				tag text,
+				w integer not null default 0,
+				constraint chk check (w >= 0)
+			) with context (
+				who integer
+			)
+		`);
+		await db.exec("insert into t (id, email, tag, w) values (1, 'a@x', 'A', 1)");
+		await db.exec("insert into t (id, email, tag, w) values (2, 'b@x', 'B', 1)");
+	});
+	afterEach(async () => { await db.close(); });
+
+	// Two ON CONFLICT clauses (each with its own subquery assignment AND subquery
+	// WHERE) plus a subquery WITH CONTEXT value — exercises every slot both node
+	// types must expose, and their ordering relative to each other.
+	const UPSERT_SQL = `
+		insert into t (id, email, tag, w) values (1, 'new@x', 'ignored', 1)
+		on conflict (id) do update set tag = (select count(*) from src) where (select count(*) from src) > 0
+		on conflict (email) do update set tag = (select count(*) from src) where (select count(*) from src) > 0
+		with context who = (select count(*) from src)
+	`;
+
+	it('DmlExecutorNode.getChildren() includes every upsert assignment/WHERE and every context value', () => {
+		const node = findNode(db.getPlan(UPSERT_SQL), isDmlExecutor);
+
+		// Anti-vacuity: the shape under test is really non-trivial.
+		expect(node.upsertClauses?.length, 'two ON CONFLICT clauses').to.equal(2);
+		expect(node.mutationContextValues?.size, 'one context value').to.equal(1);
+
+		const upsertExprs = (node.upsertClauses ?? []).flatMap(clause => [
+			...(clause.assignments?.values() ?? []),
+			...(clause.whereCondition ? [clause.whereCondition] : []),
+		]);
+		const ctxExprs = [...(node.mutationContextValues?.values() ?? [])];
+
+		const children = node.getChildren();
+		expect(children.length).to.equal(1 + upsertExprs.length + ctxExprs.length);
+		for (const expr of [...upsertExprs, ...ctxExprs]) {
+			expect(children, `expression ${expr.toString()} must be a child`).to.include(expr);
+		}
+	});
+
+	it('DmlExecutorNode.withChildren(getChildren()) round-trips to the same instance', () => {
+		const node = findNode(db.getPlan(UPSERT_SQL), isDmlExecutor);
+		expect(node.withChildren(node.getChildren())).to.equal(node);
+	});
+
+	it('ConstraintCheckNode.getChildren() includes constraints, NOT NULL defaults, and every context value', () => {
+		const node = findNode(db.getPlan(UPSERT_SQL), isConstraintCheck);
+
+		// Anti-vacuity: constraint, default, and context slots are all non-empty, so
+		// the bound between them (the exact bug: an unbounded default-slice would
+		// swallow the context tail) is actually exercised.
+		expect(node.constraintChecks.length, 'one CHECK constraint').to.equal(1);
+		expect(node.notNullDefaults?.length, 'one NOT NULL default').to.equal(1);
+		expect(node.mutationContextValues?.size, 'one context value').to.equal(1);
+
+		const children = node.getChildren();
+		const expected = 1 + node.constraintChecks.length + (node.notNullDefaults?.length ?? 0)
+			+ (node.mutationContextValues?.size ?? 0);
+		expect(children.length).to.equal(expected);
+
+		for (const check of node.constraintChecks) {
+			expect(children, `constraint expression ${check.constraint.name} must be a child`).to.include(check.expression);
+		}
+		for (const d of node.notNullDefaults ?? []) {
+			expect(children, `NOT NULL default for column ${d.columnIndex} must be a child`).to.include(d.defaultNode);
+		}
+		for (const expr of node.mutationContextValues?.values() ?? []) {
+			expect(children, `context expression ${expr.toString()} must be a child`).to.include(expr);
+		}
+	});
+
+	it('ConstraintCheckNode.withChildren(getChildren()) round-trips to the same instance', () => {
+		const node = findNode(db.getPlan(UPSERT_SQL), isConstraintCheck);
+		expect(node.withChildren(node.getChildren())).to.equal(node);
+	});
+});

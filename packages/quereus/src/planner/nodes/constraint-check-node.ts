@@ -83,20 +83,26 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
     if (this.notNullDefaults) {
       this.notNullDefaults.forEach(d => children.push(d.defaultNode));
     }
+    // Add mutation context value expressions so the optimizer can rewrite them too.
+    if (this.mutationContextValues) {
+      children.push(...this.mutationContextValues.values());
+    }
     return children;
   }
 
   withChildren(newChildren: readonly PlanNode[]): PlanNode {
     const constraintCount = this.constraintChecks.length;
     const defaultCount = this.notNullDefaults?.length ?? 0;
-    const expectedChildren = 1 + constraintCount + defaultCount;
+    const ctxKeys = [...(this.mutationContextValues?.keys() ?? [])];
+    const expectedChildren = 1 + constraintCount + defaultCount + ctxKeys.length;
     if (newChildren.length !== expectedChildren) {
       throw new Error(`ConstraintCheckNode expects ${expectedChildren} children, got ${newChildren.length}`);
     }
 
     const newSource = newChildren[0];
     const newConstraintExprs = newChildren.slice(1, 1 + constraintCount);
-    const newDefaultExprs = newChildren.slice(1 + constraintCount);
+    const newDefaultExprs = newChildren.slice(1 + constraintCount, 1 + constraintCount + defaultCount);
+    const newCtxExprs = newChildren.slice(1 + constraintCount + defaultCount) as ScalarPlanNode[];
 
     // Type check the source
     if (!isRelationalNode(newSource)) {
@@ -121,7 +127,8 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
     const constraintsUnchanged = newConstraintExprs.every((expr, i) => expr === this.constraintChecks[i].expression);
     const defaultsUnchanged = !this.notNullDefaults
       || newDefaultExprs.every((expr, i) => expr === this.notNullDefaults![i].defaultNode);
-    if (newSource === this.source && constraintsUnchanged && defaultsUnchanged) {
+    const ctxUnchanged = newCtxExprs.every((e, i) => e === this.mutationContextValues!.get(ctxKeys[i]));
+    if (newSource === this.source && constraintsUnchanged && defaultsUnchanged && ctxUnchanged) {
       return this;
     }
 
@@ -138,6 +145,10 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
         }))
       : undefined;
 
+    const newContextValues = this.mutationContextValues
+      ? new Map(ctxKeys.map((k, i) => [k, newCtxExprs[i]] as const))
+      : undefined;
+
     // Create new instance
     return new ConstraintCheckNode(
       this.scope,
@@ -148,7 +159,7 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
       this.newRowDescriptor,
       this.flatRowDescriptor,
       newConstraintChecks,
-      this.mutationContextValues,
+      newContextValues,
       this.contextAttributes,
       this.contextDescriptor,
       this.onConflict,

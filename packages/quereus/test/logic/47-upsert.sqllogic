@@ -177,6 +177,79 @@ ON CONFLICT (id) DO UPDATE SET email = 'multi@test.com', name = 'Multi';
 SELECT id, email, name FROM upsert_target;
 → [{"id":1,"email":"multi@test.com","name":"Multi"}]
 
+-- === UPSERT expressions with subqueries (optimizer must see them as children) ===
+-- `DmlExecutorNode` exposes ON CONFLICT assignment/WHERE expressions as
+-- getChildren() so the optimizer can rewrite subqueries inside them just like any
+-- other plan node. See bug-dml-side-expressions-invisible-to-optimizer.
+
+DROP TABLE IF EXISTS upsert_src;
+CREATE TABLE upsert_src (id INTEGER PRIMARY KEY, v TEXT);
+INSERT INTO upsert_src VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+DROP TABLE IF EXISTS upsert_expr;
+CREATE TABLE upsert_expr (id INTEGER PRIMARY KEY, name TEXT, count INTEGER);
+INSERT INTO upsert_expr VALUES (1, 'first', 10);
+
+-- subquery in a DO UPDATE SET value
+INSERT INTO upsert_expr (id, name, count) VALUES (1, 'dup', 0)
+ON CONFLICT (id) DO UPDATE SET count = (SELECT COUNT(*) FROM upsert_src);
+SELECT id, count FROM upsert_expr WHERE id = 1;
+→ [{"id":1,"count":3}]
+
+-- subquery in the DO UPDATE WHERE clause: condition false leaves the row unchanged
+INSERT INTO upsert_expr (id, name, count) VALUES (1, 'dup2', 999)
+ON CONFLICT (id) DO UPDATE SET count = NEW.count WHERE (SELECT COUNT(*) FROM upsert_src) > 10;
+SELECT id, count FROM upsert_expr WHERE id = 1;
+→ [{"id":1,"count":3}]
+
+-- subquery in the DO UPDATE WHERE clause: condition true applies the update
+INSERT INTO upsert_expr (id, name, count) VALUES (1, 'dup3', 999)
+ON CONFLICT (id) DO UPDATE SET count = NEW.count WHERE (SELECT COUNT(*) FROM upsert_src) > 1;
+SELECT id, count FROM upsert_expr WHERE id = 1;
+→ [{"id":1,"count":999}]
+
+-- subquery correlated to excluded.<col> (the proposed/rejected row)
+INSERT INTO upsert_expr (id, name, count) VALUES (1, 'corr', 2)
+ON CONFLICT (id) DO UPDATE SET count = (SELECT COUNT(*) FROM upsert_src WHERE id <= excluded.count);
+SELECT id, count FROM upsert_expr WHERE id = 1;
+→ [{"id":1,"count":2}]
+
+-- subquery correlated to an unqualified column (the conflicting existing row, not NEW)
+INSERT INTO upsert_expr (id, name, count) VALUES (1, 'corr2', 999)
+ON CONFLICT (id) DO UPDATE SET count = (SELECT COUNT(*) FROM upsert_src WHERE id <= count);
+SELECT id, count FROM upsert_expr WHERE id = 1;
+→ [{"id":1,"count":2}]
+
+DROP TABLE upsert_expr;
+
+-- multi-clause ON CONFLICT: two conflict targets, each with its own subquery
+-- assignment and WHERE — exercises the child ordering/slicing across clauses.
+DROP TABLE IF EXISTS upsert_multi;
+CREATE TABLE upsert_multi (
+    id INTEGER PRIMARY KEY,
+    email TEXT UNIQUE,
+    tag TEXT
+);
+INSERT INTO upsert_multi VALUES (1, 'a@test.com', 'A'), (2, 'b@test.com', 'B');
+
+-- conflict lands on the `id` target — its clause fires, the `email` clause does not
+INSERT INTO upsert_multi (id, email, tag) VALUES (1, 'new@test.com', 'ignored')
+ON CONFLICT (id) DO UPDATE SET tag = (SELECT COUNT(*) FROM upsert_src) WHERE (SELECT COUNT(*) FROM upsert_src) > 0
+ON CONFLICT (email) DO UPDATE SET tag = 'email-match' WHERE (SELECT COUNT(*) FROM upsert_src) > 100;
+SELECT id, tag FROM upsert_multi WHERE id = 1;
+→ [{"id":1,"tag":"3"}]
+
+-- conflict lands on the `email` target instead — the `id` clause's WHERE (which
+-- would fail) never runs; the `email` clause fires
+INSERT INTO upsert_multi (id, email, tag) VALUES (99, 'b@test.com', 'ignored')
+ON CONFLICT (id) DO UPDATE SET tag = (SELECT COUNT(*) FROM upsert_src) WHERE (SELECT COUNT(*) FROM upsert_src) > 100
+ON CONFLICT (email) DO UPDATE SET tag = (SELECT COUNT(*) FROM upsert_src) WHERE (SELECT COUNT(*) FROM upsert_src) > 0;
+SELECT id, tag FROM upsert_multi WHERE email = 'b@test.com';
+→ [{"id":2,"tag":"3"}]
+
+DROP TABLE upsert_multi;
+DROP TABLE upsert_src;
+
 -- Clean up
 DROP TABLE upsert_test;
 DROP TABLE upsert_target;

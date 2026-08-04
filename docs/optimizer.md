@@ -539,6 +539,8 @@ about a virtual table. See
 
 ### Plan Node Hierarchy
 
+> **Invariant:** [OPT-009](invariants.md#opt-009--every-held-expression-is-a-child)
+
 All plan nodes extend the base `PlanNode` class and implement category-specific interfaces:
 
 **Base Classes**
@@ -548,7 +550,7 @@ All plan nodes extend the base `PlanNode` class and implement category-specific 
 - `VoidNode`: Nodes with side effects (DDL, DML)
 
 **Key Methods**
-- `getChildren()`: Returns all child nodes in consistent order
+- `getChildren()`: Returns all child nodes — including every held scalar expression — in a consistent order
 - `withChildren(newChildren)`: Creates new instance with updated children
 - `computePhysical()`: Optionally overrides specific physical properties
 - `getLogicalProperties()`: Returns logical plan information

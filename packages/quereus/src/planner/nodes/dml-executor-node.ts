@@ -91,16 +91,35 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
     return [this.source, this.table];
   }
 
+  /** Upsert-clause expressions in canonical child order: per clause, assignments then WHERE. */
+  private upsertExpressions(): ScalarPlanNode[] {
+    const out: ScalarPlanNode[] = [];
+    for (const clause of this.upsertClauses ?? []) {
+      if (clause.assignments) out.push(...clause.assignments.values());
+      if (clause.whereCondition) out.push(clause.whereCondition);
+    }
+    return out;
+  }
+
   getChildren(): readonly PlanNode[] {
-    return [this.source];
+    return [
+      this.source,
+      ...this.upsertExpressions(),
+      ...(this.mutationContextValues?.values() ?? []),
+    ];
   }
 
   withChildren(newChildren: readonly PlanNode[]): PlanNode {
-    if (newChildren.length !== 1) {
-      throw new Error(`UpdateExecutorNode expects 1 child, got ${newChildren.length}`);
+    const upsertExprs = this.upsertExpressions();
+    const ctxKeys = [...(this.mutationContextValues?.keys() ?? [])];
+    const expected = 1 + upsertExprs.length + ctxKeys.length;
+    if (newChildren.length !== expected) {
+      throw new Error(`UpdateExecutorNode expects ${expected} children, got ${newChildren.length}`);
     }
 
     const [newSource] = newChildren;
+    const newUpsertExprs = newChildren.slice(1, 1 + upsertExprs.length) as ScalarPlanNode[];
+    const newCtxExprs = newChildren.slice(1 + upsertExprs.length) as ScalarPlanNode[];
 
     // Type check
     if (!isRelationalNode(newSource)) {
@@ -108,9 +127,30 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
     }
 
     // Return same instance if nothing changed
-    if (newSource === this.source) {
+    const upsertUnchanged = newUpsertExprs.every((e, i) => e === upsertExprs[i]);
+    const ctxUnchanged = newCtxExprs.every((e, i) => e === this.mutationContextValues!.get(ctxKeys[i]));
+    if (newSource === this.source && upsertUnchanged && ctxUnchanged) {
       return this;
     }
+
+    // Slice rewritten expressions back into their clause slots, same order as getChildren/upsertExpressions.
+    let cursor = 0;
+    const newUpsertClauses = this.upsertClauses?.map(clause => {
+      const next: UpsertClausePlan = { ...clause };
+      if (clause.assignments) {
+        next.assignments = new Map(
+          [...clause.assignments.keys()].map(colIndex => [colIndex, newUpsertExprs[cursor++]] as const)
+        );
+      }
+      if (clause.whereCondition) {
+        next.whereCondition = newUpsertExprs[cursor++];
+      }
+      return next;
+    });
+
+    const newContextValues = this.mutationContextValues
+      ? new Map(ctxKeys.map((k, i) => [k, newCtxExprs[i]] as const))
+      : undefined;
 
     // Create new instance. lensRouted MUST be carried forward, or the optimizer
     // drops the lens-routed parent-side FK semantics on any node rebuild.
@@ -120,10 +160,10 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
       this.table,
       this.operation,
       this.onConflict,
-      this.mutationContextValues,
+      newContextValues,
       this.contextAttributes,
       this.contextDescriptor,
-      this.upsertClauses,
+      newUpsertClauses,
       this.lensRouted
     );
   }
