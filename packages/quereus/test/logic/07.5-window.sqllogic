@@ -906,11 +906,49 @@ from wg group by a order by a;
 select a, count(*) as c, row_number() over (order by c) as rn from wg group by a order by rn;
 → [{"a":"y","c":1,"rn":1},{"a":"x","c":2,"rn":2}]
 
--- A qualified reference in a window specification works when the GROUP BY key is
--- itself qualified (the aggregate output scope registers the qualified name only
--- then — see bug-window-spec-reads-base-table-attribute for the unqualified case).
+-- A grouping key may be named in a window specification by ANY spelling that
+-- denotes it, not only the one the GROUP BY used. The aggregate output scope
+-- registers a qualified name only when the GROUP BY key was itself written
+-- qualified, and registers a non-bare key only under a synthetic `group_N` name,
+-- so the other spellings bind to a base-table column the grouped row does not
+-- carry; the window phase redirects those subtrees onto the aggregate's own group
+-- output column (bug-window-spec-reads-base-table-column — they used to die with
+-- an internal "No row context found for column a" error).
+
+-- GROUP BY key written qualified, window spec qualified.
 select wg.a, row_number() over (order by wg.a) as rn from wg group by wg.a order by rn;
 → [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- GROUP BY key written bare, window spec table-qualified.
+select a, row_number() over (order by wg.a) as rn from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- Same, alias-qualified through a FROM alias.
+select a, row_number() over (order by w.a) as rn from wg w group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A non-bare grouping key spelled out again in the window specification.
+select a || '!' as k, row_number() over (order by a || '!') as rn from wg group by a || '!' order by rn;
+→ [{"k":"x!","rn":1},{"k":"y!","rn":2}]
+
+-- Same, in PARTITION BY: each group is its own partition, so every count is 1.
+select a || '!' as k, count(*) over (partition by a || '!') as c from wg group by a || '!' order by k;
+→ [{"k":"x!","c":1},{"k":"y!","c":1}]
+
+-- The grouping key nested inside a larger window-specification expression: the
+-- redirect recurses, so only the `a || '!'` subtree is rewritten.
+select a || '!' as k, row_number() over (order by upper(a || '!')) as rn from wg group by a || '!' order by rn;
+→ [{"k":"x!","rn":1},{"k":"y!","rn":2}]
+
+-- A window function ARGUMENT naming the grouping key another way works too.
+select a, max(wg.a) over () as m from wg group by a order by a;
+→ [{"a":"x","m":"y"},{"a":"y","m":"y"}]
+
+-- Referencing a grouping key by its SELECT-list alias is NOT one of the spellings
+-- that works (an *aggregate* alias does — see above). Different root cause,
+-- tracked as bug-window-spec-cannot-name-group-key-by-select-alias.
+select a as k, row_number() over (order by k) as rn from wg group by a;
+-- error: Column not found: k
 
 -- A grouped, windowed query composes as a subquery source: its window column is
 -- an ordinary output column to the enclosing query.

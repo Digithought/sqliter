@@ -37,7 +37,7 @@ import { buildWithContext, enterStoredBodyEnv } from './select-context.js';
 import { storedBodyContext } from '../stored-body-context.js';
 import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
-import { buildAggregatePhase, buildFinalAggregateProjections, buildGroupByCoverage, type GroupByCoverage } from './select-aggregates.js';
+import { buildAggregatePhase, buildFinalAggregateProjections, buildGroupedWindowContext, type GroupedWindowContext } from './select-aggregates.js';
 import { buildWindowPhase } from './select-window.js';
 import { buildFinalProjections, applyDistinct, applyOrderBy, applyLimitOffset, createProjectionOutputScope } from './select-modifiers.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
@@ -195,8 +195,9 @@ export function buildSelectStmt(
 	// projection list, to be projected above the window phase's WindowNode.
 	let windowSelectProjections: Projection[] | undefined;
 	// Also set only for a grouped, windowed query: what the aggregate's rows carry,
-	// so the window phase can reject a window specification that reads anything else.
-	let windowGroupByCoverage: GroupByCoverage | undefined;
+	// so the window phase can redirect a window specification onto them and reject
+	// one that reads anything else.
+	let windowGroupedContext: GroupedWindowContext | undefined;
 	// The node whose output attributes ARE this SELECT's result columns, once one
 	// exists. A positional ORDER BY binds to its Nth attribute (see applyOrderBy).
 	let orderByOutputRelation: RelationalPlanNode | undefined;
@@ -232,17 +233,18 @@ export function buildSelectStmt(
 
 		// A grouped, windowed query's window specifications and function arguments are
 		// built against the aggregate-output scope but fall through to the pre-aggregate
-		// select scope for anything the aggregate does not carry — which is exactly the
-		// illegal case. Hand the window phase the coverage test so it rejects those at
-		// plan time. Group keys are matched by their own attribute ids AND by the
-		// aggregate's output attribute ids, since a reference here may resolve to either.
+		// select scope for anything the aggregate does not carry. Some of what falls
+		// through is a legal grouping key under another spelling and some is a genuinely
+		// ungrouped column, so hand the window phase both halves: the maps that redirect
+		// the former onto the aggregate's own output columns, and the strict coverage
+		// test that rejects the latter at plan time.
 		if (
 			hasWindowFunctions &&
 			aggregateResult.aggregateNode &&
 			aggregateResult.groupByExpressions &&
 			aggregateResult.groupByExpressions.length > 0
 		) {
-			windowGroupByCoverage = buildGroupByCoverage(
+			windowGroupedContext = buildGroupedWindowContext(
 				aggregateResult.groupByExpressions,
 				aggregateResult.aggregateNode.getAttributes(),
 			);
@@ -320,7 +322,7 @@ export function buildSelectStmt(
 			}
 		}
 
-		input = buildWindowPhase(input, windowFunctions, selectContext, windowSelectProjections ?? projections, windowGroupByCoverage);
+		input = buildWindowPhase(input, windowFunctions, selectContext, windowSelectProjections ?? projections, windowGroupedContext);
 		// The window phase ends in a ProjectNode over the SELECT list, so that node's
 		// attributes are this query's result columns.
 		orderByOutputRelation = input;

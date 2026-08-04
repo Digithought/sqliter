@@ -285,6 +285,128 @@ export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage)
 }
 
 /**
+ * What the window phase of a GROUPED query needs in order to run its window
+ * specifications and function arguments over the AggregateNode's own rows.
+ *
+ * The WindowNode sits ABOVE the AggregateNode, so it can read only what the
+ * aggregate's output row carries: the grouping keys and the aggregate results.
+ * But the scope those expressions are built against falls through to the
+ * pre-aggregate select scope, so several perfectly legal spellings of a grouping
+ * key (`wg.a` against `group by a`, or the whole `a || '!'` against `group by a
+ * || '!'`) bind to a *base-table* attribute the aggregate row never had. This
+ * context supplies both halves of the answer: the two maps let
+ * {@link redirectToGroupKeys} rewrite such a subtree onto the aggregate's own
+ * output column, and {@link coverage} is the strict check applied afterwards.
+ */
+export interface GroupedWindowContext {
+	/** Canonical AST text of each GROUP BY expression → its AggregateNode output column index. */
+	readonly groupKeyByFingerprint: ReadonlyMap<string, number>;
+	/** Base attribute id of each bare-column GROUP BY key → its AggregateNode output column index. */
+	readonly groupKeyByBaseAttrId: ReadonlyMap<number, number>;
+	/** AggregateNode output attributes: group keys in GROUP BY order, then aggregate results. */
+	readonly outputAttributes: readonly Attribute[];
+	/**
+	 * Legal AFTER redirection: AggregateNode output attribute ids ONLY — no base
+	 * group-key attribute ids and no fingerprints. Once {@link redirectToGroupKeys}
+	 * has run, nothing legitimate reaching a WindowNode over an aggregate may still
+	 * name a base-table attribute, so anything that does is an ungrouped reference.
+	 */
+	readonly coverage: GroupByCoverage;
+}
+
+/**
+ * Builds the {@link GroupedWindowContext} for a grouped, windowed query.
+ * `outputAttributes` is the AggregateNode's attribute list (group keys in GROUP BY
+ * order, then the aggregate results).
+ */
+export function buildGroupedWindowContext(
+	groupByExpressions: readonly ScalarPlanNode[],
+	outputAttributes: readonly Attribute[],
+): GroupedWindowContext {
+	const groupKeyByFingerprint = new Map<string, number>();
+	const groupKeyByBaseAttrId = new Map<number, number>();
+
+	groupByExpressions.forEach((expr, index) => {
+		const fp = expressionToString(expr.expression);
+		if (!groupKeyByFingerprint.has(fp)) groupKeyByFingerprint.set(fp, index);
+		if (CapabilityDetectors.isColumnReference(expr)) {
+			const attrId = (expr as ColumnReferenceNode).attributeId;
+			if (!groupKeyByBaseAttrId.has(attrId)) groupKeyByBaseAttrId.set(attrId, index);
+		}
+	});
+
+	return {
+		groupKeyByFingerprint,
+		groupKeyByBaseAttrId,
+		outputAttributes,
+		coverage: {
+			attrIds: new Set(outputAttributes.map(attr => attr.id)),
+			fingerprints: new Set<string>(),
+		},
+	};
+}
+
+/**
+ * Rewrites every subtree of a window specification / window-function argument that
+ * IS a grouping key into a reference to the AggregateNode's output column for that
+ * key, so the expression reads the grouped row instead of a base-table column that
+ * row does not carry.
+ *
+ * Two match rules, in order at each node:
+ *
+ * 1. The whole subtree's canonical AST text equals a GROUP BY expression's — covers
+ *    `group by a || '!'` + `over (order by a || '!')`, and nested occurrences such
+ *    as `over (order by upper(a || '!'))` because the walk recurses.
+ * 2. The node is a column reference whose attribute id is the *base* attribute id of
+ *    a bare-column grouping key — covers `group by a` + `over (order by wg.a)` and
+ *    `over (order by w.a)`. Both spellings fall through to the same base attribute
+ *    the group key was built from, so the match is qualifier-independent.
+ *
+ * Otherwise recurse into scalar children only; relational children resolve their own
+ * scope.
+ *
+ * NOTE: rule 1 matches by canonical AST text, so a subtree that *reads* like a
+ * grouping key but resolves to something else (a correlated outer reference shadowed
+ * by an identically-spelled local column) would be redirected wrongly. This is the
+ * same limitation `buildFinalAggregateProjections`' `groupByFingerprints` map already
+ * carries for the select list; fixing it means comparing resolved attribute identity
+ * rather than text, in both places.
+ */
+export function redirectToGroupKeys(
+	node: ScalarPlanNode,
+	context: GroupedWindowContext,
+	scope: Scope,
+): ScalarPlanNode {
+	const fingerprintIndex = context.groupKeyByFingerprint.get(expressionToString(node.expression));
+	if (fingerprintIndex !== undefined) {
+		return buildGroupKeyColumnRef(scope, context.outputAttributes[fingerprintIndex], node.expression, fingerprintIndex);
+	}
+
+	if (CapabilityDetectors.isColumnReference(node)) {
+		const baseIndex = context.groupKeyByBaseAttrId.get((node as ColumnReferenceNode).attributeId);
+		if (baseIndex !== undefined) {
+			return buildGroupKeyColumnRef(scope, context.outputAttributes[baseIndex], node.expression, baseIndex);
+		}
+		return node;
+	}
+
+	const newChildren: PlanNode[] = [];
+	let changed = false;
+	for (const child of node.getChildren()) {
+		// Only scalar children participate; relational subtrees resolve their own scope.
+		if (!('expression' in child)) {
+			newChildren.push(child);
+			continue;
+		}
+		const rewritten = redirectToGroupKeys(child as ScalarPlanNode, context, scope);
+		if (rewritten !== child) changed = true;
+		newChildren.push(rewritten);
+	}
+
+	return changed ? (node.withChildren(newChildren) as ScalarPlanNode) : node;
+}
+
+/**
  * Validates that aggregate and non-aggregate projections don't mix inappropriately.
  * With GROUP BY, every non-aggregate column reference in the SELECT list must
  * either (a) match a GROUP BY column by attribute id, or (b) appear inside a
@@ -983,11 +1105,11 @@ function starGroupKeyIndex(starProj: Projection, groupKeyByAttrId: ReadonlyMap<n
  * recomputed expression.
  */
 function buildGroupKeyColumnRef(
-	aggregateOutputScope: RegisteredScope,
+	scope: Scope,
 	groupAttr: Attribute,
 	selectExpr: AST.Expression,
 	columnIndex: number,
 ): ColumnReferenceNode {
 	const colExpr: AST.ColumnExpr = { type: 'column', name: expressionToString(selectExpr) };
-	return new ColumnReferenceNode(aggregateOutputScope, colExpr, groupAttr.type, groupAttr.id, columnIndex);
+	return new ColumnReferenceNode(scope, colExpr, groupAttr.type, groupAttr.id, columnIndex);
 }

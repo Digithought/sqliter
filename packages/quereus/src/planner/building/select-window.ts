@@ -8,7 +8,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { ArrayIndexNode } from '../nodes/array-index-node.js';
 import { LiteralNode } from '../nodes/scalar.js';
 import { buildExpression } from './expression.js';
-import { assertGroupByCoverage, collectAggregateFunctionExprs, type GroupByCoverage } from './select-aggregates.js';
+import { assertGroupByCoverage, collectAggregateFunctionExprs, redirectToGroupKeys, type GroupedWindowContext } from './select-aggregates.js';
 import { findMatchingAggregate } from './function-call.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -24,7 +24,7 @@ import { CapabilityDetectors } from '../framework/characteristics.js';
  * `WindowFunctionCallNode` subtrees. It is rewritten (not rebuilt) into the
  * projection placed above the WindowNode(s); see {@link buildWindowProjections}.
  *
- * `groupByCoverage` is supplied only for a GROUPED query. The WindowNode sits
+ * `groupedWindowContext` is supplied only for a GROUPED query. The WindowNode sits
  * ABOVE the AggregateNode, so its window specifications and function arguments run
  * over the grouped rows and may only read what those rows carry.
  */
@@ -33,7 +33,7 @@ export function buildWindowPhase(
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[],
 	selectContext: PlanningContext,
 	selectListProjections: readonly Projection[],
-	groupByCoverage?: GroupByCoverage
+	groupedWindowContext?: GroupedWindowContext
 ): RelationalPlanNode {
 	if (windowFunctions.length === 0) {
 		return input;
@@ -65,15 +65,25 @@ export function buildWindowPhase(
 			rejectUncollectedAggregates(func, selectContext);
 		}
 
+		// In a grouped query the window runs over the AGGREGATE's rows, which carry only
+		// grouping keys and aggregate results. Several legal spellings of a grouping key
+		// nonetheless bind to a base-table attribute, because the scope these are built
+		// against falls through to the pre-aggregate select scope: a qualified `wg.a`
+		// against `group by a`, or the whole expression against `group by a || '!'`.
+		// Redirect every such subtree onto the aggregate's own output column.
+		const redirect = (expr: ScalarPlanNode) => groupedWindowContext
+			? redirectToGroupKeys(expr, groupedWindowContext, selectContext.scope)
+			: expr;
+
 		// CRITICAL: Build window specification expressions using the INPUT scope
 		// This ensures expressions reference the correct input attribute IDs,
 		// not premature output attribute IDs that don't exist in the runtime context
 		const partitionExpressions = windowSpec.partitionBy.map(expr =>
-			buildExpression(selectContext, expr, false)
+			redirect(buildExpression(selectContext, expr, false))
 		);
 
 		const orderByExpressions = windowSpec.orderBy.map(orderClause =>
-			buildExpression(selectContext, orderClause.expr, false)
+			redirect(buildExpression(selectContext, orderClause.expr, false))
 		);
 
 		// Build the function argument expressions FIRST (off the original nodes)
@@ -82,19 +92,25 @@ export function buildWindowPhase(
 		const functionArguments = buildWindowFunctionArguments(
 			functions.map(({ func }) => func),
 			selectContext
-		);
+		).map(args => args.map(redirect));
 
-		// In a grouped query the window runs over the AGGREGATE's rows, which carry only
-		// grouping keys and aggregate results. A window specification or argument that
-		// reads anything else is illegal for exactly the reason a bare column in the
-		// select list is, and must say so at plan time — otherwise the reference reaches
-		// the runtime as a base-table attribute the aggregate row never had, and the
-		// query dies with an internal "no row context" error instead.
-		if (groupByCoverage) {
-			for (const expr of partitionExpressions) assertGroupByCoverage(expr, groupByCoverage);
-			for (const expr of orderByExpressions) assertGroupByCoverage(expr, groupByCoverage);
+		// After redirection, anything still naming a base-table attribute is a genuinely
+		// ungrouped reference, illegal for exactly the reason a bare column in the select
+		// list is, and must say so at plan time — otherwise it reaches the runtime as an
+		// attribute the aggregate row never had, and the query dies with an internal
+		// "no row context" error instead.
+		//
+		// NOTE: the coverage set is AggregateNode output attribute ids only, so this
+		// cannot tell a correlated reference to an ENCLOSING relation from an ungrouped
+		// local one — both are rejected with the same message. Supporting a correlated
+		// window specification in a grouped subquery means admitting the enclosing
+		// relations' attribute ids here (the loose pre-redirect coverage rejected it too,
+		// so nothing regressed by tightening).
+		if (groupedWindowContext) {
+			for (const expr of partitionExpressions) assertGroupByCoverage(expr, groupedWindowContext.coverage);
+			for (const expr of orderByExpressions) assertGroupByCoverage(expr, groupedWindowContext.coverage);
 			for (const args of functionArguments) {
-				for (const arg of args) assertGroupByCoverage(arg, groupByCoverage);
+				for (const arg of args) assertGroupByCoverage(arg, groupedWindowContext.coverage);
 			}
 		}
 
