@@ -862,6 +862,34 @@ select a, sum(b) over () as s from wg group by a;
 select a, row_number() over (order by count(*)) as rn from wg group by a;
 -- error: Aggregate function count in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
 
+-- Two window functions with different specifications each get their own window
+-- output column; neither collapses onto the other's.
+select a, row_number() over (order by a) as p, count(*) over (partition by a) as q
+from wg group by a order by a;
+→ [{"a":"x","p":1,"q":1},{"a":"y","p":2,"q":1}]
+
+-- Two textually identical window functions resolve to their own columns too.
+select a, row_number() over (order by a) as p, row_number() over (order by a) as q
+from wg group by a order by a;
+→ [{"a":"x","p":1,"q":1},{"a":"y","p":2,"q":2}]
+
+-- A window specification may name an aggregate by its SELECT-list alias — that
+-- resolves through the aggregate output scope, like ORDER BY does.
+select a, count(*) as c, row_number() over (order by c) as rn from wg group by a order by rn;
+→ [{"a":"y","c":1,"rn":1},{"a":"x","c":2,"rn":2}]
+
+-- A qualified reference in a window specification works when the GROUP BY key is
+-- itself qualified (the aggregate output scope registers the qualified name only
+-- then — see bug-window-spec-reads-base-table-attribute for the unqualified case).
+select wg.a, row_number() over (order by wg.a) as rn from wg group by wg.a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A grouped, windowed query composes as a subquery source: its window column is
+-- an ordinary output column to the enclosing query.
+with q as (select a, row_number() over (order by a) as rn from wg group by a)
+select * from q where rn > 1;
+→ [{"a":"y","rn":2}]
+
 drop table wg;
 
 -- =============================================================================

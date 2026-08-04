@@ -147,6 +147,14 @@ export function buildWindowPhase(
  * NOTE: supporting the unsupported form means collecting these aggregates into the
  * AggregateNode before the window phase runs, the way `collectOrderByAggregates`
  * (select-aggregates.ts) already does for a top-level ORDER BY.
+ *
+ * NOTE: only the PARTITION BY / ORDER BY arms can fire today. A window function's
+ * ARGUMENTS are built once already, by `analyzeSelectColumns` → `buildExpression`'s
+ * `windowFunction` case, against the pre-aggregate context and with aggregates
+ * disallowed — so `sum(count(*)) over ()` dies there with the generic "not allowed
+ * in this context" long before this runs. The argument arm is kept because it
+ * becomes reachable the moment that early type-probe build stops rejecting
+ * aggregates; it is not load-bearing today.
  */
 function rejectUncollectedAggregates(
 	func: WindowFunctionCallNode,

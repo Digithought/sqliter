@@ -36,14 +36,26 @@ window_function([arguments]) OVER (
 ### Planner Layer
 
 **WindowNode (`src/planner/nodes/window-node.ts`):**
-- Groups window functions with identical window specifications for efficiency
+- Carries one window specification and the functions computed over it
 - Converts AST expressions to `ScalarPlanNode` objects for proper attribute resolution
 - Maintains separate collections for partition expressions, ORDER BY expressions, and function arguments
 
-**Query Building (`src/planner/building/select.ts`):**
-- Identifies window functions in SELECT lists
-- Groups functions by window specification to minimize processing
-- Converts expressions to plan nodes for deterministic execution
+**Query Building (`src/planner/building/select-window.ts`):**
+- Identifies window functions in SELECT lists (via `analyzeSelectColumns`)
+- Emits one `WindowNode` per window specification group, then ONE projection above them all
+- That projection is the query's select list — stars already expanded, in written order —
+  rewritten so each window-function subtree becomes an `ArrayIndexNode` pointing at its
+  computed window-output column. Everything else passes through untouched, so `select *,
+  row_number() over (…)` keeps the star's columns and an unaliased window column is named
+  after the expression the user wrote.
+
+**Grouped queries.** A window function in a grouped select list runs over the
+**grouped rows** — the plan is `Aggregate → [HAVING Filter] → Window → Project`, so
+`row_number() over (order by a) … group by a` numbers the groups. The window
+specification and the function's arguments are therefore subject to the same GROUP BY
+restriction as the rest of the select list, checked at plan time
+(`assertGroupByCoverage`, shared with the select-list and HAVING checks in
+`select-aggregates.ts`).
 
 ### Runtime Layer (`src/runtime/emit/window.ts`)
 
@@ -172,12 +184,16 @@ FROM test_results;
 
 ## Performance Optimizations
 
-### Window Specification Grouping
+### Window Specification Grouping (not currently effective)
 
-The planner automatically groups window functions with identical specifications:
-- **Single sort pass** per unique window specification
-- **Shared partition processing** for multiple functions  
-- **Reduced memory usage** through specification reuse
+`groupWindowFunctionsBySpec` is *meant* to put window functions with identical
+specifications under one `WindowNode` — a single sort pass and shared partition
+processing per unique specification. It does not do so today: the grouping key is
+`JSON.stringify` over raw AST fragments, which carry each fragment's source-location
+data, so two textually identical `over (…)` clauses never key equal and every window
+function gets its own node. Fixing that also requires teaching `findWindowColumnIndex`
+to match a function to its output column by identity or position rather than by
+name + specification; see the `NOTE:` comments in `select-window.ts`.
 
 ### Efficient Execution
 
@@ -307,6 +323,10 @@ Window functions are comprehensively tested through SQL Logic Tests (`test/logic
 - Statistical ranking (PERCENT_RANK, CUME_DIST with ties)
 - NTILE bucket distribution
 - RANGE BETWEEN value-based frames (CURRENT ROW peers, N PRECEDING/FOLLOWING)
+- Window functions in a GROUPED query (window over the groups, HAVING interaction,
+  plan-time rejection of an ungrouped column in the window specification)
+- `*` alongside a window column (position, duplicate-name disambiguation) — column
+  names and order in `test/plan/grouped-projection-shape.spec.ts`
 
 ## Extensibility
 
