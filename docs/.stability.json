@@ -49,6 +49,7 @@
 		"docs/sql.md": "Stable",
 		"docs/store.md": "Beta",
 		"docs/sync-coordinator.md": "Experimental",
+		"docs/sync-protocol.md": "Experimental",
 		"docs/sync-schema.md": "Experimental",
 		"docs/sync.md": "Experimental",
 		"docs/types.md": "Stable",

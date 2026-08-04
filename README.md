@@ -134,6 +134,7 @@ This repository contains multiple packages:
 - **[Persistent Store](docs/store.md)** — LevelDB/IndexedDB storage architecture
 - **[View Persistence](docs/view-persistence.md)** — How the store keeps view and materialized-view definitions across reopen
 - **[Schema Replication](docs/sync-schema.md)** — Replicating the catalog between peers, and shipping an app's initial schema as a seed
+- **[Sync Protocol](docs/sync-protocol.md)** — Wire data structures, the `SyncManager` API, and the WebSocket message protocol
 - **[Store Plugin base README](packages/quereus-store/README.md)** — Quick start and API reference
 
 ### Advanced Topics

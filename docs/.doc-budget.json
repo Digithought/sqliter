@@ -3,7 +3,6 @@
 	"slackWords": 500,
 	"note": "Ratchet entries record a doc's size at the time it was grandfathered in. A doc may shrink; it may grow only within `slackWords` of its recorded size, and that drift is reported on every run. Past the grace band the check fails: shrink the doc, or re-record with `node scripts/check-docs.mjs --update-ratchet --force` and say why in the commit message. `--update-ratchet` (no --force) only ever lowers, so total unforced growth stays bounded by `slackWords` for the life of an entry. New docs must come in under maxWords, which carries no grace band. Lower an entry with `--update-ratchet` after a doc shrinks. See docs/doc-conventions.md.",
 	"ratchet": {
-		"docs/lens.md": 17934,
-		"docs/sync.md": 12538
+		"docs/lens.md": 17934
 	}
 }

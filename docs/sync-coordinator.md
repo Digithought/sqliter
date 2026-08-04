@@ -217,7 +217,7 @@ WebSocket connections provide real-time bidirectional sync.
 
 The version check is **strict integer equality**: a peer that predates versioning
 (sends no `protocolVersion`) is treated as incompatible, not silently accepted.
-See [`sync.md` § Protocol version](sync.md) for the rationale.
+See [`sync-protocol.md` § Protocol version](sync-protocol.md#protocol-version) for the rationale.
 
 ### Message Types
 

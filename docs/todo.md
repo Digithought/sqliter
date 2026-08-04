@@ -445,7 +445,7 @@ Core sync is complete (see [`sync.md`](sync.md)); these are refinements and cove
 
 **Storage cost**
 - [ ] Config flag to opt out of the tombstone row before-image (`priorRow`), whose cost is
-  bounded but non-trivial for wide rows (see [`sync.md`](sync.md#data-structures))
+  bounded but non-trivial for wide rows (see [`sync-protocol.md`](sync-protocol.md#data-structures))
 
 **Testing**
 - [ ] Tombstone TTL expiration and fallback to snapshot
