@@ -423,6 +423,12 @@ export class IndexSeekNode extends TableAccessNode {
 		 * Undefined ⇒ this node was built by a path that did not thread the consumed set
 		 * (never true for `selectPhysicalNode`'s output). An empty array is impossible: a
 		 * seek exists only because at least one constraint was consumed.
+		 *
+		 * NOTE: deliberately NOT exposed via `getChildren` (OPT-009). No emitter reads these
+		 * expressions — `runtime/emit/scan.ts` emits `seekKeys` only — so they are inert and
+		 * merely hold pre-rewrite subtrees after a seek rebuild. The consumers above re-apply
+		 * them into fresh rule output the pass then descends into. Expose them if an emitter
+		 * ever reads them.
 		 */
 		public readonly pushedConstraints?: readonly PredicateConstraint[],
 	) {

@@ -59,5 +59,65 @@ select * from a1 order by id;
 drop table a1;
 -- run
 
+-- ===== Multi-row, correlated =====
+-- Every arm above has a single existing row, so it cannot tell a genuine per-row
+-- evaluation from one evaluation replayed for every row. These use three rows and a
+-- subquery correlated to the row being backfilled, so a once-only (or cached) evaluation
+-- shows up as three identical values.
+
+create table dd (k integer, v integer);
+insert into dd values (1, 10), (2, 20), (3, 30);
+-- run
+
+create table a2 (id integer primary key);
+insert into a2 values (1), (2), (3);
+-- run
+
+-- 6. Correlated subquery DEFAULT — a distinct value per existing row.
+alter table a2 add column w integer default ((select v from dd where dd.k = new.id limit 1));
+-- run
+
+select id, w from a2 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20},{"id":3,"w":30}]
+
+-- 7. Correlated subquery inside the CHECK, evaluated against each backfilled row.
+alter table a2 add column x integer default (new.id) check ((select v from dd where dd.k = new.id limit 1) = new.id * 10);
+-- run
+
+select id, x from a2 order by id;
+→ [{"id":1,"x":1},{"id":2,"x":2},{"id":3,"x":3}]
+
+-- 8. TWO inline CHECKs alongside the backfill — three optimizer children, so the
+-- emitter's slot cursor (backfill, then each predicate in order) has to walk past more
+-- than one predicate. The SECOND one fails, which a slot-order bug would misreport.
+alter table a2 add column yy integer default (new.id) check ((select count(*) from dd) = 3) check ((select v from dd where dd.k = new.id limit 1) = 999);
+-- error: CHECK constraint failed
+
+-- 9. Same two CHECKs, both true — accepted.
+alter table a2 add column y integer default (new.id) check ((select count(*) from dd) = 3) check ((select v from dd where dd.k = new.id limit 1) = new.id * 10);
+-- run
+
+select id, y from a2 order by id;
+→ [{"id":1,"y":1},{"id":2,"y":2},{"id":3,"y":3}]
+
+-- 10. GENERATED ALWAYS AS over a correlated subquery. The inner reference to the other
+-- table's column must be QUALIFIED (`dd.v`): the generated-column dependency check reads
+-- every unqualified name in the expression as a reference to this table and rejects it —
+-- see the note under docs/sql-alter.md § ADD COLUMN.
+alter table a2 add column g integer generated always as ((select dd.v from dd where dd.k = id limit 1));
+-- run
+
+select id, g from a2 order by id;
+→ [{"id":1,"g":10},{"id":2,"g":20},{"id":3,"g":30}]
+
+select * from a2 order by id;
+→ [{"id":1,"w":10,"x":1,"y":1,"g":10},{"id":2,"w":20,"x":2,"y":2,"g":20},{"id":3,"w":30,"x":3,"y":3,"g":30}]
+
+drop table a2;
+-- run
+
+drop table dd;
+-- run
+
 drop table d;
 -- run

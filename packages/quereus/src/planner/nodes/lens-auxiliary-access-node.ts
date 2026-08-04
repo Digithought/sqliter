@@ -43,6 +43,11 @@ export interface RoutableAuxiliary {
 	 * `RetrieveNode` from `buildTableReference`, with its own fresh attribute
 	 * ids). The rewrite rule pushes the column-rewritten predicate onto this
 	 * scan and semi-joins it back to the logical body on the logical key.
+	 *
+	 * NOTE: deliberately NOT exposed via the holder's `getChildren` (OPT-009). No emitter
+	 * reads it — `runtime/emit/lens-auxiliary-access.ts` emits `source` only — and the
+	 * rewrite rule splices it into a fresh subtree during the *top-down* Structural pass,
+	 * which the pass then descends into and physicalizes. Expose it if either changes.
 	 */
 	readonly auxScan: RelationalPlanNode;
 	/** Logical-PK ↔ auxiliary-key join pairs, in logical-PK order (D4). */

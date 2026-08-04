@@ -27,7 +27,14 @@ export class RetrieveNode extends PlanNode implements UnaryRelationalNode {
 		public readonly tableRef: TableReferenceNode,
 		/** Optional context data from the module's supports() assessment */
 		public readonly moduleCtx?: unknown,
-		/** Captured binding expressions used by the enveloped pipeline (params/correlated) */
+		/**
+		 * Captured binding expressions used by the enveloped pipeline (params/correlated).
+		 *
+		 * NOTE: deliberately NOT exposed via `getChildren` (OPT-009). No emitter reads them —
+		 * `runtime/emit/retrieve.ts` throws unconditionally, since a `RetrieveNode` is rewritten
+		 * to a physical access node before emission — so they are inert and merely go stale
+		 * after a rewrite. Expose them the moment an emitter reads them.
+		 */
 		public readonly bindings?: ReadonlyArray<ScalarPlanNode>
 	) {
 		// Self-cost only: the source pipeline flows in via getChildren(). This node

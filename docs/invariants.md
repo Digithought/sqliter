@@ -119,7 +119,7 @@ be built before the node it references; it explicitly invalidates the caches it 
 - code: `packages/quereus/src/planner/nodes/dml-executor-node.ts` — `getChildren`, `withChildren`
 - code: `packages/quereus/src/planner/nodes/constraint-check-node.ts` — `getChildren`, `withChildren`
 - code: `packages/quereus/src/planner/nodes/alter-table-node.ts` — `getChildren`, `withChildren`
-- guard: `packages/quereus/test/optimizer/dml-child-exposure.spec.ts` — `DML side-expression exposure to the optimizer`
+- guard: `packages/quereus/test/optimizer/dml-child-exposure.spec.ts` — `exposure to the optimizer` (the tail of both describe titles: DML side-expressions, and AlterTableNode ADD COLUMN)
 
 Every user expression a plan node holds and later emits must be reachable through
 `getChildren()`, and `withChildren` must slice the rewritten children back into the same
@@ -128,9 +128,10 @@ works for a simple expression (nothing to rewrite) but reaches the runtime unrew
 once it is a subquery, surfacing as a missing-emitter or unphysicalized-node error far
 from the defect.
 
-Exempt: `InsertNode` / `UpdateNode` / `DeleteNode` carry a `mutationContextValues` map
-nothing reads from them (only the two nodes above consume it), so their copy is inert and
-goes stale after a rebuild. Expose it the moment anything reads it there.
+Exempt, each with a `NOTE:` at its site: `InsertNode` / `UpdateNode` / `DeleteNode`
+(`mutationContextValues`), `RetrieveNode` (`bindings`), `LensAuxiliaryAccessNode`
+(`routables[].auxScan`), `IndexSeekNode` (`pushedConstraints[]`). No emitter reads these,
+so each is inert and merely stale after a rebuild. Expose one the moment an emitter reads it.
 
 ### OPT-010 — Visited rules are inherited across a re-mint; declines are not
 

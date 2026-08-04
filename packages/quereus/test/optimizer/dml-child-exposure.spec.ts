@@ -209,6 +209,14 @@ describe('AlterTableNode ADD COLUMN expression exposure to the optimizer', () =>
 	const BACKFILL_AND_CHECK_SQL = `
 		alter table a1 add column z integer default (new.id) check ((select count(*) from d) = 1)
 	`;
+	// Two inline CHECKs (both legal, both unnamed) — three slots, so `withChildren`'s cursor
+	// has to walk past more than one predicate. A two-slot case cannot catch a cursor that
+	// stalls or over-advances inside the predicate list.
+	const BACKFILL_AND_TWO_CHECKS_SQL = `
+		alter table a1 add column z integer default (new.id)
+			check ((select count(*) from d) = 1)
+			check ((select count(*) from d) > 0)
+	`;
 	const RENAME_SQL = `alter table a1 rename to a2`;
 
 	it('getChildren() exposes the backfill expression when there is no CHECK', () => {
@@ -235,6 +243,28 @@ describe('AlterTableNode ADD COLUMN expression exposure to the optimizer', () =>
 		expect(children.length).to.equal(2);
 		expect(children[0]).to.equal(node.action.backfill!.node);
 		expect(children[1]).to.equal(node.action.checks!.predicates[0].node);
+	});
+
+	it('withChildren rotates three slots back into backfill + both CHECK predicates in order', () => {
+		const node = findNode(db.getPlan(BACKFILL_AND_TWO_CHECKS_SQL), isAlterTable);
+		if (node.action.type !== 'addColumn') throw new Error('unreachable');
+		expect(node.action.checks?.predicates.length, 'two CHECK predicates').to.equal(2);
+
+		const children = node.getChildren();
+		expect(children.length).to.equal(3);
+		expect(children[0]).to.equal(node.action.backfill!.node);
+		expect(children[1]).to.equal(node.action.checks!.predicates[0].node);
+		expect(children[2]).to.equal(node.action.checks!.predicates[1].node);
+
+		// Rotate rather than swap: a cursor that stalls on the first predicate would still
+		// satisfy a two-element swap, but lands the wrong node in predicate slot 1 here.
+		const rotated = [children[2], children[0], children[1]];
+		const rebuilt = node.withChildren(rotated) as AlterTableNode;
+		if (rebuilt.action.type !== 'addColumn') throw new Error('unreachable');
+		expect(rebuilt.action.backfill!.node).to.equal(rotated[0]);
+		expect(rebuilt.action.checks!.predicates[0].node).to.equal(rotated[1]);
+		expect(rebuilt.action.checks!.predicates[1].node).to.equal(rotated[2]);
+		expect(rebuilt.getChildren()).to.deep.equal(rotated);
 	});
 
 	it('getChildren() is empty for a non-addColumn action', () => {
