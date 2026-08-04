@@ -146,7 +146,7 @@ export function buildSelectStmt(
 
 	// Analyze SELECT columns
 	const {
-		projections: columnProjections,
+		projectionsByColumn,
 		aggregates,
 		windowFunctions,
 		hasAggregates: hasAggregatesInSelect,
@@ -158,7 +158,13 @@ export function buildSelectStmt(
 	// is taken when those promote a non-aggregate query into an aggregate one.
 	let hasAggregates = hasAggregatesInSelect;
 
-	// Handle SELECT * separately. Keyed by the AST column so the aggregate path can
+	// Assemble the projection list in WRITTEN select-list order, expanding each star
+	// in place. Output columns follow the order the user wrote them — a star ahead of
+	// a named column emits its columns first, behind it emits them last — which is what
+	// SQLite/PostgreSQL do, and what the grouped path (`buildFinalAggregateProjections`,
+	// which walks `stmt.columns` itself) has always done.
+	//
+	// Star expansions are also kept keyed by their AST column so the aggregate path can
 	// expand each star back to *its own* columns — a select list may hold more than
 	// one star (`select a.*, b.* from a join b`).
 	const starProjectionsByColumn = new Map<AST.ResultColumn, Projection[]>();
@@ -167,11 +173,13 @@ export function buildSelectStmt(
 			const expanded = buildStarProjections(column, input, selectScope);
 			starProjectionsByColumn.set(column, expanded);
 			projections.push(...expanded);
+			continue;
 		}
+		// Non-star column. Aggregate items produced no projection (they are routed
+		// into the aggregate phase instead) and are simply absent from the map.
+		const columnProjection = projectionsByColumn.get(column);
+		if (columnProjection) projections.push(columnProjection);
 	}
-
-	// Add non-star projections
-	projections.push(...columnProjections);
 
 	// Build the source-order AST list of SELECT-list output columns (with stars expanded)
 	// for resolving GROUP BY / ORDER BY positional ordinals.

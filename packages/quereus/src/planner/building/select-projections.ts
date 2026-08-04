@@ -142,6 +142,7 @@ export function analyzeSelectColumns(
 	source: RelationalPlanNode
 ): {
 	projections: Projection[];
+	projectionsByColumn: Map<AST.ResultColumn, Projection>;
 	aggregates: { expression: ScalarPlanNode; alias: string }[];
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[];
 	hasAggregates: boolean;
@@ -149,6 +150,11 @@ export function analyzeSelectColumns(
 	hasWrappedAggregates: boolean;
 } {
 	const projections: Projection[] = [];
+	const projectionsByColumn = new Map<AST.ResultColumn, Projection>();
+	const addProjection = (column: AST.ResultColumn, projection: Projection): void => {
+		projections.push(projection);
+		projectionsByColumn.set(column, projection);
+	};
 	const aggregates: { expression: ScalarPlanNode; alias: string }[] = [];
 	const windowFunctions: { func: WindowFunctionCallNode; alias?: string }[] = [];
 	let hasAggregates = false;
@@ -170,7 +176,7 @@ export function analyzeSelectColumns(
 			if (isWindowExpression(scalarNode)) {
 				hasWindowFunctions = true;
 				collectWindowFunctions(scalarNode, column.alias, windowFunctions);
-				projections.push({
+				addProjection(column, {
 					node: scalarNode,
 					alias: column.alias,
 					...(authoredInverse ? { authoredInverse } : {})
@@ -201,7 +207,7 @@ export function analyzeSelectColumns(
 					hasWrappedAggregates = true;
 				}
 			} else {
-				projections.push({
+				addProjection(column, {
 					node: scalarNode,
 					alias: column.alias,
 					...(authoredInverse ? { authoredInverse } : {})
@@ -212,6 +218,7 @@ export function analyzeSelectColumns(
 
 	return {
 		projections,
+		projectionsByColumn,
 		aggregates,
 		windowFunctions,
 		hasAggregates,

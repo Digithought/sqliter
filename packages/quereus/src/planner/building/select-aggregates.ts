@@ -540,8 +540,7 @@ function aggregateOutputIsSelectList(
 	// columns. Stars are walked from `starProjectionsByColumn` below, so drop them from
 	// the cursor's list by object identity — that keeps the remaining entries in
 	// SELECT-list order no matter how buildSelectStmt interleaves the two groups
-	// (it appends stars first today; fix/1-bug-star-in-select-list-ignores-its-position
-	// is about to make that written-order instead).
+	// (it assembles them in written select-list order).
 	const starProjections = new Set<Projection>();
 	for (const expanded of starProjectionsByColumn.values()) {
 		for (const starProjection of expanded) starProjections.add(starProjection);

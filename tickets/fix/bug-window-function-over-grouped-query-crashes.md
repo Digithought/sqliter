@@ -83,8 +83,40 @@ Ranking or numbering grouped summaries is an ordinary reporting shape: "rank eac
 category by its total", "number the groups in order", "running total across group
 subtotals". Today every one of those crashes.
 
+## Second arm: `*` disappears from any window query
+
+Same function, second defect — found while working
+`fix/1-bug-star-in-select-list-ignores-its-position`, filed here because
+`buildWindowProjections` is this ticket's site and both arms are the same
+underlying problem: the window phase's select-list walk is incomplete.
+
+`buildWindowProjections` (`select-window.ts`) loops over `stmt.columns` and only
+handles `column.type === 'column'`. A `*` entry is skipped outright, so its
+columns never reach the projection and are simply absent from the result. No
+`GROUP BY` needed — this is every window query with a star in the list.
+
+Against `create table gk (v integer primary key, g text)` with two rows:
+
+| query | expected columns | actual columns |
+|---|---|---|
+| `select *, row_number() over (order by v) w from gk` | `v, g, w` | `w` |
+| `select row_number() over (order by v) w, * from gk` | `w, v, g` | `w` |
+| `select v, row_number() over (order by v) w, * from gk` | `v, w, v:1, g` | `v, w` |
+
+Verified by hand at the current HEAD; pre-existing, and unaffected by the
+star-ordering fix (the window path builds its own projections and never reads
+the list that fix reorders). No test covers it — `test/fuzz.spec.ts` generates
+`select *, <window fn> as w from <tbl>` but does not assert the column set, and
+`01.1-select-projection-extras.sqllogic:97` only pairs a window function with a
+*named* column.
+
+Whatever design settles the crash arm above — which phase owns the final column
+list — has to expand stars in that walk too, and in written select-list order,
+matching the guarantee the non-window paths now hold.
+
 ## Not in scope
 
-Window functions without `GROUP BY` already work and are not being changed. The
-separate performance concern about partitioned windows always buffering is
+Window functions without `GROUP BY` already work — apart from the star-dropping
+arm above — and are not otherwise being changed. The separate performance concern
+about partitioned windows always buffering is
 `backlog/feat-window-streaming-partitioned` — unrelated.
