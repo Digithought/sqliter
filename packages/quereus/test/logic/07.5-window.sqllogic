@@ -869,6 +869,13 @@ select a, row_number() over (order by count(*)) as rn from wg group by a;
 select a, sum(b+0) as s, row_number() over (order by sum(a+0)) as rn from wg group by a;
 -- error: Aggregate function sum in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
 
+-- The match is textual, so a *qualifier* divergence lands in that same
+-- limitation even though both spellings name the same column: `sum(w.b)` in the
+-- select list is not the fingerprint `sum(b)` the window spec asks for. Writing
+-- both the same way, or referencing the select-list alias, both work.
+select a, sum(w.b) as s, row_number() over (order by sum(b)) as rn from wg w group by a;
+-- error: Aggregate function sum in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
+
 -- Two window functions with different specifications each get their own window
 -- output column; neither collapses onto the other's.
 select a, row_number() over (order by a) as p, count(*) over (partition by a) as q

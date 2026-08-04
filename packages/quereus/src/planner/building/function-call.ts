@@ -38,6 +38,11 @@ export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[numb
  * degrades to the UNSUPPORTED error in `rejectUncollectedAggregates`
  * (select-window.ts).
  *
+ * NOTE: each call re-renders every collected aggregate's AST. Collected-aggregate
+ * lists are a handful of entries in practice; if a query shape ever carries enough
+ * of them for build time to show up, cache the fingerprint on the entry when it is
+ * collected (select-aggregates.ts) instead of re-deriving it here.
+ *
  * Exported so callers that must *reject* an uncollected aggregate can ask the same
  * question this builder answers — see `buildWindowPhase`.
  */
