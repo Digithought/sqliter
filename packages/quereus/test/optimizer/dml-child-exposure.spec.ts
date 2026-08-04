@@ -74,22 +74,32 @@ describe('DML side-expression exposure to the optimizer', () => {
 		with context who = (select count(*) from src)
 	`;
 
-	it('DmlExecutorNode.getChildren() includes every upsert assignment/WHERE and every context value', () => {
+	it('DmlExecutorNode.getChildren() includes every upsert assignment/WHERE, the DO UPDATE arm validation, and every context value', () => {
 		const node = findNode(db.getPlan(UPSERT_SQL), isDmlExecutor);
 
 		// Anti-vacuity: the shape under test is really non-trivial.
 		expect(node.upsertClauses?.length, 'two ON CONFLICT clauses').to.equal(2);
 		expect(node.mutationContextValues?.size, 'one context value').to.equal(1);
+		// The DO UPDATE arm's UPDATE-shaped validation: `check (w >= 0)` plus the
+		// NOT NULL DEFAULT for `w`. Its FK existence probes are `not exists (...)`
+		// subqueries, so leaving these out of the child walk would ship them
+		// unoptimized — the exact failure this guard exists to catch.
+		expect(node.upsertUpdateValidation?.checks.length, 'one UPDATE-scoped CHECK').to.equal(1);
+		expect(node.upsertUpdateValidation?.notNullDefaults.length, 'one NOT NULL default').to.equal(1);
 
 		const upsertExprs = (node.upsertClauses ?? []).flatMap(clause => [
 			...(clause.assignments?.values() ?? []),
 			...(clause.whereCondition ? [clause.whereCondition] : []),
 		]);
+		const validationExprs = [
+			...(node.upsertUpdateValidation?.checks ?? []).map(c => c.expression),
+			...(node.upsertUpdateValidation?.notNullDefaults ?? []).map(d => d.defaultNode),
+		];
 		const ctxExprs = [...(node.mutationContextValues?.values() ?? [])];
 
 		const children = node.getChildren();
-		expect(children.length).to.equal(1 + upsertExprs.length + ctxExprs.length);
-		for (const expr of [...upsertExprs, ...ctxExprs]) {
+		expect(children.length).to.equal(1 + upsertExprs.length + validationExprs.length + ctxExprs.length);
+		for (const expr of [...upsertExprs, ...validationExprs, ...ctxExprs]) {
 			expect(children, `expression ${expr.toString()} must be a child`).to.include(expr);
 		}
 	});
@@ -139,7 +149,10 @@ describe('DML side-expression exposure to the optimizer', () => {
 	it('DmlExecutorNode.withChildren slices rewritten expressions back into their own slots', () => {
 		const node = findNode(db.getPlan(UPSERT_SQL), isDmlExecutor);
 		const children = node.getChildren();
-		expect(children.length, 'source + 2 clauses x (assignment + WHERE) + 1 context value').to.equal(6);
+		expect(
+			children.length,
+			'source + 2 clauses x (assignment + WHERE) + 1 CHECK + 1 NOT NULL default + 1 context value',
+		).to.equal(8);
 
 		// Substitute clause 2's WHERE node into clause 1's assignment slot: distinct from
 		// what belongs there, so a cross-wire or off-by-one shows up as a slot mismatch.
@@ -155,10 +168,42 @@ describe('DML side-expression exposure to the optimizer', () => {
 		expect(clause1.whereCondition).to.equal(children[2]);
 		expect([...clause2.assignments!.values()]).to.deep.equal([children[3]]);
 		expect(clause2.whereCondition).to.equal(children[4]);
-		expect([...rebuilt.mutationContextValues!.values()]).to.deep.equal([children[5]]);
+		// The validation span sits between the clause expressions and the context tail;
+		// a slice that grew by the wrong amount would swallow one of its neighbours.
+		expect(rebuilt.upsertUpdateValidation!.checks[0].expression, 'CHECK slot').to.equal(children[5]);
+		expect(rebuilt.upsertUpdateValidation!.notNullDefaults[0].defaultNode, 'NOT NULL default slot').to.equal(children[6]);
+		expect([...rebuilt.mutationContextValues!.values()]).to.deep.equal([children[7]]);
 
 		// Assignment keys are column indices — rebuilding the map must not renumber them.
 		expect([...clause1.assignments!.keys()]).to.deep.equal([...node.upsertClauses![0].assignments!.keys()]);
+	});
+
+	// A substitution INTO the validation span: the identity round-trip and the
+	// clause-slot test above both leave it untouched, so neither would notice a
+	// validation slice that cross-wires a rewritten CHECK into the NOT NULL default
+	// slot (or drops the rebuilt validation entirely — the same failure mode the
+	// `lensRouted` carry-forward comment warns about).
+	it('DmlExecutorNode.withChildren slices rewritten DO UPDATE validation back into its own slots', () => {
+		const node = findNode(db.getPlan(UPSERT_SQL), isDmlExecutor);
+		const children = node.getChildren();
+
+		// Put clause 1's assignment into the CHECK slot.
+		const substituted = [...children];
+		substituted[5] = children[1];
+
+		const rebuilt = node.withChildren(substituted) as DmlExecutorNode;
+		expect(rebuilt).to.not.equal(node);
+		expect(rebuilt.getChildren()).to.deep.equal(substituted);
+
+		const validation = rebuilt.upsertUpdateValidation!;
+		expect(validation.checks[0].expression, 'CHECK slot took the substituted node').to.equal(children[1]);
+		expect(validation.checks[0].constraint, 'constraint metadata carried forward')
+			.to.equal(node.upsertUpdateValidation!.checks[0].constraint);
+		expect(validation.notNullDefaults[0].defaultNode, 'default slot untouched').to.equal(children[6]);
+		expect(validation.notNullDefaults[0].columnIndex, 'default column index carried forward')
+			.to.equal(node.upsertUpdateValidation!.notNullDefaults[0].columnIndex);
+		expect(validation.flatRowDescriptor, 'flat descriptor carried forward')
+			.to.equal(node.upsertUpdateValidation!.flatRowDescriptor);
 	});
 
 	it('ConstraintCheckNode.withChildren slices rewritten expressions back into their own slots', () => {
@@ -184,7 +229,7 @@ describe('DML side-expression exposure to the optimizer', () => {
 		const plan = db.getPlan(UPSERT_SQL);
 		const dml = findNode(plan, isDmlExecutor);
 		const check = findNode(plan, isConstraintCheck);
-		expect(() => dml.withChildren(dml.getChildren().slice(0, 1))).to.throw(/expects 6 children/);
+		expect(() => dml.withChildren(dml.getChildren().slice(0, 1))).to.throw(/expects 8 children/);
 		expect(() => check.withChildren(check.getChildren().slice(0, 1))).to.throw(/expects 4 children/);
 	});
 

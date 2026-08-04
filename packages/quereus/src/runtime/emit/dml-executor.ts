@@ -21,6 +21,15 @@ import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation, createParentRestrictBatch, accumulateParentRestrictKeys, flushParentRestrictBatch, type ParentRestrictBatch } from '../foreign-key-actions.js';
 import { getBatchableRestrictFks } from '../../planner/building/foreign-key-builder.js';
+import { composeCombinedDescriptor } from '../descriptor-helpers.js';
+import { RowOpFlag } from '../../schema/table.js';
+import {
+	buildConstraintMetadata,
+	evaluateRowConstraints,
+	type ConstraintMetadataEntry,
+	type NotNullDefaultRuntime,
+	type RowConstraintScope,
+} from '../row-constraints.js';
 import type { BackingConnectionCache, ResidualKeyBatch } from '../../core/database-materialized-views.js';
 import { poisonResidualDeltaAccumulations } from '../../core/database-materialized-views-apply.js';
 import type { BackingRowChange } from '../../vtab/backing-host.js';
@@ -463,6 +472,68 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		});
 	}
 
+	/**
+	 * Emit-time shape of the DO UPDATE arm's UPDATE-shaped row validation — the
+	 * evaluator positions plus everything {@link evaluateRowConstraints} needs that
+	 * does not vary per row. See {@link UpsertUpdateValidation} for why the arm needs
+	 * its own validation at all.
+	 */
+	interface UpsertValidationRuntime {
+		scope: RowConstraintScope;
+		metadata: ConstraintMetadataEntry[];
+		/** First position of the CHECK / FK evaluators within `upsertEvaluators`. */
+		checkStart: number;
+		checkCount: number;
+		/** NOT NULL DEFAULT evaluators, already resolved to their `upsertEvaluators` position. */
+		notNullDefaults: Array<{ columnIndex: number; evaluatorIndex: number; coerceColumn?: ColumnSchema }>;
+		/** Flat OLD|NEW descriptor, used when the statement has no mutation context. */
+		flatDescriptor: RowDescriptor;
+		/** Context-prefixed descriptor, used when it does. */
+		combinedDescriptor?: RowDescriptor;
+	}
+
+	// The DO UPDATE arm's validation evaluators are appended to the SAME array the
+	// clause's own evaluators use: runInsert already slices everything after the
+	// context evaluators into `upsertEvaluators`, so neither the params layout nor
+	// the `run` signature changes.
+	const upsertValidation = plan.upsertUpdateValidation;
+	let upsertValidationRuntime: UpsertValidationRuntime | undefined;
+	if (upsertValidation) {
+		const checkStart = upsertEvaluatorInstructions.length;
+		const checkInstructions = upsertValidation.checks.map(check => emitCallFromPlan(check.expression, ctx));
+		upsertEvaluatorInstructions.push(...checkInstructions);
+
+		const defaultStart = upsertEvaluatorInstructions.length;
+		const defaultInstructions = upsertValidation.notNullDefaults.map(d => emitCallFromPlan(d.defaultNode, ctx));
+		upsertEvaluatorInstructions.push(...defaultInstructions);
+
+		upsertValidationRuntime = {
+			scope: { operation: RowOpFlag.UPDATE, hasNewSection: true },
+			metadata: buildConstraintMetadata(
+				upsertValidation.checks,
+				tableSchema,
+				upsertValidation.flatRowDescriptor,
+				plan.contextDescriptor,
+				checkInstructions.map(instruction => instruction.run),
+			),
+			checkStart,
+			checkCount: checkInstructions.length,
+			notNullDefaults: upsertValidation.notNullDefaults.map((d, i) => ({
+				columnIndex: d.columnIndex,
+				evaluatorIndex: defaultStart + i,
+				// Same static-type rule as everywhere else a DEFAULT is substituted after
+				// the emitters' conversion pass — see NotNullDefaultRuntime.coerceColumn.
+				coerceColumn: d.defaultNode.getType().logicalType !== tableSchema.columns[d.columnIndex].logicalType
+					? tableSchema.columns[d.columnIndex]
+					: undefined,
+			})),
+			flatDescriptor: upsertValidation.flatRowDescriptor,
+			combinedDescriptor: plan.contextDescriptor
+				? composeCombinedDescriptor(plan.contextDescriptor, upsertValidation.flatRowDescriptor)
+				: undefined,
+		};
+	}
+
 	// --- Operation-specific run generators ------------------------------------
 
 	/**
@@ -515,6 +586,84 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * Run the DO UPDATE arm's UPDATE-shaped validation against the row the arm has
+	 * composed, exactly as the equivalent plain `UPDATE` would be validated:
+	 * OLD = the conflicting stored row, NEW = the composed row.
+	 *
+	 * Returns false when a per-constraint IGNORE says to skip the row silently;
+	 * otherwise true, having written any REPLACE DEFAULT substitution back into
+	 * `updatedRow` in place (that substituted row is what gets stored). A violation
+	 * under any other conflict action throws, which propagates out of
+	 * `processInsertRow` into `runWithStatementSavepoints` and rolls the statement
+	 * savepoint back — so a multi-row INSERT stays all-or-nothing.
+	 *
+	 * A no-op when the plan carries no validation (a DO NOTHING-only statement, or a
+	 * plain INSERT).
+	 */
+	async function validateUpsertUpdatedRow(
+		rctx: RuntimeContext,
+		existingRow: Row,
+		updatedRow: Row,
+		contextRow: Row | undefined,
+		upsertEvaluators: SubProgram[],
+	): Promise<boolean> {
+		const validation = upsertValidationRuntime;
+		if (!validation) return true;
+
+		const flatRow: Row = [...existingRow, ...updatedRow];
+		// The check expressions read the row through a lazy getter, so a REPLACE NOT
+		// NULL DEFAULT substitution mid-evaluation is visible to the CHECK / FK pass
+		// that follows it — same contract as emitConstraintCheck.
+		let visibleRow: Row = flatRow;
+
+		const checkEvaluators = upsertEvaluators.slice(
+			validation.checkStart, validation.checkStart + validation.checkCount);
+		const notNullDefaults: NotNullDefaultRuntime[] = validation.notNullDefaults.map(d => ({
+			columnIndex: d.columnIndex,
+			evaluator: upsertEvaluators[d.evaluatorIndex],
+			coerceColumn: d.coerceColumn,
+		}));
+
+		const useContext = contextRow !== undefined && validation.combinedDescriptor !== undefined;
+		const descriptor = useContext ? validation.combinedDescriptor! : validation.flatDescriptor;
+
+		const result = await withAsyncRowContext(
+			rctx,
+			descriptor,
+			() => useContext ? [...contextRow!, ...visibleRow] : visibleRow,
+			() => evaluateRowConstraints(
+				rctx,
+				validation.scope,
+				tableSchema,
+				flatRow,
+				validation.metadata,
+				checkEvaluators,
+				// NOTE: `plan.onConflict` is undefined on every path reachable today —
+				// the parser rejects `insert or ... on conflict ...` outright and no
+				// synthesized statement sets both — so this is behaviorally identical to
+				// passing undefined. Threaded anyway so the arm stays honest if that
+				// guard is ever relaxed; do not read it as live behavior.
+				plan.onConflict,
+				notNullDefaults,
+				contextRow,
+				row => { visibleRow = row; },
+			),
+		);
+
+		if (result.skip) return false;
+
+		if (result.replacedRow) {
+			// REPLACE substituted a NOT NULL column's DEFAULT — copy the substituted NEW
+			// section back over the row that is about to be stored.
+			const numCols = tableSchema.columns.length;
+			for (let i = 0; i < numCols; i++) {
+				updatedRow[i] = result.replacedRow[numCols + i];
+			}
+		}
+		return true;
 	}
 
 	/**
@@ -600,6 +749,36 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				}
 			});
 		}
+
+		// UPDATE-shaped validation of the composed row. It runs HERE — after the
+		// generated-column recompute, before anything is written — because this is the
+		// first point at which the row that will actually be stored exists.
+		//
+		// NOTE: the statement's INSERT-shaped ConstraintCheckNode has already run on the
+		// PROPOSED row, before the conflict was known (matching SQLite). One consequence:
+		// an auto-deferred (subquery-bearing) INSERT-shaped CHECK was queued against that
+		// proposed row and is evaluated at COMMIT, so it can abort the transaction over a
+		// row that was never stored. That is the deferred twin of the immediate behavior
+		// and is consistent with it — out of scope here.
+		if (!await validateUpsertUpdatedRow(rctx, existingRow, updatedRow, contextRow, upsertEvaluators)) {
+			return undefined;
+		}
+
+		// Parent-side RESTRICT enforcement for the referenced-column changes this arm
+		// makes. Mirrors runUpdate's non-batched branch and must sit BEFORE vtab.update
+		// for the same reason documented there: on a rowid-mode backend a post-mutation
+		// OLD-value scan dereferences through the just-mutated parent and finds nothing.
+		// runInsert owns no ParentRestrictBatch, so this is always the per-row pre-walk.
+		//
+		// NOTE: for the same reason the arm also always carries the plan-time per-row
+		// `not exists` parent-side FK probes (see buildUpsertUpdateValidation), so a bulk
+		// upsert against a heavily-referenced parent pays both per conflicting row and
+		// never gets the end-of-statement batched probe a plain UPDATE can. Fine at
+		// current scale; if bulk upsert against such a parent ever shows up as slow, give
+		// runInsert a ParentRestrictBatch and gate both sites on getBatchableRestrictFks
+		// the way runUpdate/buildUpdateStmt already do.
+		await assertTransitiveRestrictsForParentMutation(
+			rctx.db, tableSchema, 'update', existingRow, updatedRow, plan.lensRouted);
 
 		// Extract the primary key from existing row
 		const keyValues = pkColumnIndicesInSchema.map(idx => existingRow[idx]);

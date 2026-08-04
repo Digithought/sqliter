@@ -25,9 +25,9 @@ import { ReturningNode, type ReturningProjection } from '../nodes/returning-node
 import { expandReturningStar } from './returning-star.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
-import { DmlExecutorNode, type UpsertClausePlan } from '../nodes/dml-executor-node.js';
+import { DmlExecutorNode, type UpsertClausePlan, type UpsertUpdateValidation } from '../nodes/dml-executor-node.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
-import { buildChildSideFKChecks } from './foreign-key-builder.js';
+import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-builder.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
 import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
@@ -366,6 +366,74 @@ function appendGeneratedRecomputes(
 		generatedAssignmentColumns.push(colIndex);
 	}
 	return generatedAssignmentColumns;
+}
+
+/**
+ * Build the UPDATE-shaped row validation an INSERT's `on conflict … do update` arm
+ * runs against the row it composes — see {@link UpsertUpdateValidation}.
+ *
+ * This is deliberately the same construction `buildUpdateStmt` performs for a plain
+ * `UPDATE` of the same table: fresh OLD/NEW attributes (OLD is a real stored row here,
+ * unlike the INSERT path where OLD is all NULL), UPDATE-scoped CHECKs, both FK sides,
+ * and the NOT NULL DEFAULT evaluators. The statement's own `contextAttributes` are
+ * reused so a CHECK referencing a mutation-context variable binds the attribute ids
+ * the executor already evaluates.
+ */
+function buildUpsertUpdateValidation(
+	ctx: PlanningContext,
+	schemaAuthoredCtx: PlanningContext,
+	tableReference: TableReferenceNode,
+	contextAttributes: Attribute[],
+): UpsertUpdateValidation {
+	const tableSchema = tableReference.tableSchema;
+
+	const oldAttributes = tableSchema.columns.map((col) => ({
+		id: PlanNode.nextAttrId(),
+		name: col.name,
+		type: columnSchemaToScalarType(col),
+		sourceRelation: `OLD.${tableSchema.name}`
+	}));
+
+	const newAttributes = tableSchema.columns.map((col) => ({
+		id: PlanNode.nextAttrId(),
+		name: col.name,
+		type: columnSchemaToScalarType(col),
+		sourceRelation: `NEW.${tableSchema.name}`
+	}));
+
+	const { flatRowDescriptor } = buildOldNewRowDescriptors(oldAttributes, newAttributes);
+
+	const checks = buildConstraintChecks(
+		schemaAuthoredCtx,
+		tableSchema,
+		RowOpFlag.UPDATE,
+		oldAttributes,
+		newAttributes,
+		flatRowDescriptor,
+		contextAttributes
+	);
+
+	if (ctx.db.options.getBooleanOption('foreign_keys')) {
+		checks.push(...buildChildSideFKChecks(
+			schemaAuthoredCtx, tableSchema, RowOpFlag.UPDATE,
+			oldAttributes, newAttributes, contextAttributes
+		));
+		// NOT gated on getBatchableRestrictFks, unlike buildUpdateStmt. That gate is
+		// buildUpdateStmt's contract with `runUpdate`, which owns a ParentRestrictBatch
+		// and probes every inbound RESTRICT FK once at the end-of-statement boundary.
+		// `runInsert` has no such batch, so the DO UPDATE arm must always carry the
+		// per-row plan-time `not exists` checks or parent-side RESTRICT goes unenforced.
+		checks.push(...buildParentSideFKChecks(
+			schemaAuthoredCtx, tableSchema, RowOpFlag.UPDATE,
+			oldAttributes, newAttributes, contextAttributes
+		));
+	}
+
+	const notNullDefaults = buildNotNullDefaults(
+		schemaAuthoredCtx, tableSchema, newAttributes, contextAttributes
+	);
+
+	return { checks, flatRowDescriptor, notNullDefaults };
 }
 
 /**
@@ -912,6 +980,15 @@ export function buildInsertStmt(
 		);
 	}
 
+	// UPDATE-shaped validation for the `on conflict … do update` arm. The arm composes
+	// the row it writes inside the DML executor and calls vtab.update directly, so that
+	// row never passes through the INSERT-shaped ConstraintCheckNode above. Build here
+	// exactly what buildUpdateStmt would build for the equivalent plain UPDATE, so the
+	// two spellings of the same write are refused (or accepted) identically.
+	const upsertUpdateValidation = upsertClausePlans?.some(clause => clause.action === 'update')
+		? buildUpsertUpdateValidation(ctx, schemaAuthoredCtx, tableReference, contextAttributes)
+		: undefined;
+
 	// Add DML executor node to perform the actual database insert operations
 	const dmlExecutorNode = new DmlExecutorNode(
 		ctx.scope,
@@ -923,7 +1000,8 @@ export function buildInsertStmt(
 		contextAttributes.length > 0 ? contextAttributes : undefined,
 		contextDescriptor,
 		upsertClausePlans,
-		lensRouted
+		lensRouted,
+		upsertUpdateValidation
 	);
 
 	const resultNode: RelationalPlanNode = dmlExecutorNode;

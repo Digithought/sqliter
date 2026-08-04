@@ -1,0 +1,409 @@
+-- An INSERT's `on conflict ... do update` arm composes the row it writes inside
+-- the DML executor and hands it straight to the storage layer, so that row never
+-- passes through the statement's ConstraintCheckNode (which is INSERT-shaped and
+-- only ever sees the PROPOSED insert row). Before the fix the arm could therefore
+-- store a row that broke a CHECK, a NOT NULL, or a foreign key — one the equivalent
+-- plain `UPDATE` refuses.
+--
+-- The contract this file pins: the DO UPDATE arm validates the composed row under
+-- UPDATE-scoped constraints, identically to the equivalent plain `UPDATE`, and the
+-- per-constraint `on conflict <action>` defaults apply to a violation raised there.
+-- Every violating case asserts the error AND then selects to prove nothing was
+-- written. Ticket bug-upsert-do-update-skips-constraint-checks.
+--
+-- Not a case here: `insert or ignore ... on conflict ... do update`. The parser
+-- rejects that combination outright ("Cannot use both 'INSERT OR ...' and
+-- 'ON CONFLICT' in the same statement", covered in 47-upsert.sqllogic). The
+-- per-constraint `on conflict <action>` defaults below carry that semantics.
+
+-- ===================================
+-- 1. Row-level CHECK: the composed row is refused, and the message matches what
+--    the plain UPDATE of the same row produces.
+-- ===================================
+
+create table ck_row (a integer primary key, b integer, check (b < 10));
+insert into ck_row values (1, 1);
+
+insert into ck_row values (1, 2) on conflict (a) do update set b = 99;
+-- error: CHECK constraint failed: _check_0 (b < 10)
+
+-- nothing was written — not the proposed row, not the composed one.
+select a, b from ck_row;
+→ [{"a":1,"b":1}]
+
+-- the plain UPDATE spelling of the same write, for message parity.
+update ck_row set b = 99 where a = 1;
+-- error: CHECK constraint failed: _check_0 (b < 10)
+
+-- a satisfying DO UPDATE still succeeds — no over-rejection.
+insert into ck_row values (1, 2) on conflict (a) do update set b = 5;
+select a, b from ck_row;
+→ [{"a":1,"b":5}]
+
+drop table ck_row;
+
+-- ===================================
+-- 2. Column-level CHECK — attributed to the column's generated constraint name,
+--    same as the plain UPDATE.
+-- ===================================
+
+create table ck_col (a integer primary key, b integer check (b < 10));
+insert into ck_col values (1, 1);
+
+insert into ck_col values (1, 2) on conflict (a) do update set b = 99;
+-- error: CHECK constraint failed: _check_b (b < 10)
+
+select a, b from ck_col;
+→ [{"a":1,"b":1}]
+
+update ck_col set b = 99 where a = 1;
+-- error: CHECK constraint failed: _check_b (b < 10)
+
+drop table ck_col;
+
+-- ===================================
+-- 3. NOT NULL on the composed row.
+-- ===================================
+
+create table nn_t (a integer primary key, b integer not null);
+insert into nn_t values (1, 1);
+
+insert into nn_t values (1, 2) on conflict (a) do update set b = null;
+-- error: NOT NULL constraint failed: nn_t.b
+
+select a, b from nn_t;
+→ [{"a":1,"b":1}]
+
+update nn_t set b = null where a = 1;
+-- error: NOT NULL constraint failed: nn_t.b
+
+drop table nn_t;
+
+-- ===================================
+-- 4. A clause WHERE that skips the row short-circuits before any validation: no
+--    error is raised for the (violating) row it would have composed, and nothing
+--    is written.
+-- ===================================
+
+create table wh_t (a integer primary key, b integer, check (b < 10));
+insert into wh_t values (1, 1);
+
+insert into wh_t values (1, 2) on conflict (a) do update set b = 99 where false;
+select a, b from wh_t;
+→ [{"a":1,"b":1}]
+
+drop table wh_t;
+
+-- ===================================
+-- 5. DO NOTHING writes nothing and gains no validation.
+-- ===================================
+
+create table dn_t (a integer primary key, b integer, check (b < 10));
+insert into dn_t values (1, 1);
+
+insert into dn_t values (1, 2) on conflict (a) do nothing;
+select a, b from dn_t;
+→ [{"a":1,"b":1}]
+
+drop table dn_t;
+
+-- ===================================
+-- 6. Op-scoped constraints are filtered by the UPDATE mask, exactly as they are
+--    for a plain UPDATE: an `on insert`-only CHECK must NOT fire on this arm, an
+--    `on update`-only CHECK must.
+-- ===================================
+
+create table op_ins (a integer primary key, b integer, constraint only_ins check on insert (b < 10));
+insert into op_ins values (1, 1);
+
+-- the composed value 99 breaks the predicate, but the constraint is INSERT-scoped
+-- so the DO UPDATE arm does not enforce it.
+insert into op_ins values (1, 2) on conflict (a) do update set b = 99;
+select a, b from op_ins;
+→ [{"a":1,"b":99}]
+
+drop table op_ins;
+
+create table op_upd (a integer primary key, b integer, constraint only_upd check on update (b < 10));
+insert into op_upd values (1, 1);
+
+-- proposed row (b = 20) sails past the INSERT-shaped pass (the constraint is
+-- UPDATE-scoped); the composed row (b = 99) is caught by the arm.
+insert into op_upd values (1, 20) on conflict (a) do update set b = 99;
+-- error: CHECK constraint failed: only_upd (b < 10)
+
+select a, b from op_upd;
+→ [{"a":1,"b":1}]
+
+drop table op_upd;
+
+-- ===================================
+-- 7. A transition CHECK reading `old.<col>` sees the CONFLICTING STORED ROW as
+--    OLD — not the all-NULL OLD an INSERT would present.
+-- ===================================
+
+create table tr_t (a integer primary key, b integer, constraint monotonic check on update (b >= old.b));
+insert into tr_t values (1, 5);
+
+insert into tr_t values (1, 2) on conflict (a) do update set b = 1;
+-- error: CHECK constraint failed: monotonic (b >= old.b)
+
+select a, b from tr_t;
+→ [{"a":1,"b":5}]
+
+-- a non-decreasing composed value passes, which proves OLD really bound to the
+-- stored 5 rather than to NULL (a NULL OLD would make both directions pass).
+insert into tr_t values (1, 2) on conflict (a) do update set b = 9;
+select a, b from tr_t;
+→ [{"a":1,"b":9}]
+
+drop table tr_t;
+
+-- ===================================
+-- 8. Generated columns: the phase-2 recompute runs BEFORE validation, so a
+--    recomputed value is what the CHECK / NOT NULL sees.
+-- ===================================
+
+create table gen_ck (
+	a integer primary key,
+	x integer,
+	y integer generated always as (x * 10) stored,
+	check (y < 20)
+);
+insert into gen_ck (a, x) values (1, 1);
+
+insert into gen_ck (a, x) values (1, 5) on conflict (a) do update set x = 10;
+-- error: CHECK constraint failed: _check_0 (y < 20)
+
+select a, x, y from gen_ck;
+→ [{"a":1,"x":1,"y":10}]
+
+drop table gen_ck;
+
+create table gen_nn (
+	a integer primary key,
+	x integer,
+	y integer not null generated always as (case when x > 5 then null else x end) stored
+);
+insert into gen_nn (a, x) values (1, 1);
+
+insert into gen_nn (a, x) values (1, 2) on conflict (a) do update set x = 9;
+-- error: NOT NULL constraint failed: gen_nn.y
+
+select a, x, y from gen_nn;
+→ [{"a":1,"x":1,"y":1}]
+
+drop table gen_nn;
+
+-- ===================================
+-- 9. Per-constraint conflict defaults compose with the arm.
+--    `check (...) on conflict ignore` → the row is skipped silently: no error,
+--    nothing written.
+-- ===================================
+
+create table pc_ign (a integer primary key, b integer check (b < 10) on conflict ignore);
+insert into pc_ign values (1, 1);
+
+insert into pc_ign values (1, 2) on conflict (a) do update set b = 99;
+select a, b from pc_ign;
+→ [{"a":1,"b":1}]
+
+drop table pc_ign;
+
+-- `not null on conflict replace default <expr>` → the DEFAULT is substituted into
+-- the composed row, and that substituted row is what gets stored.
+create table pc_rep (a integer primary key, b integer not null on conflict replace default 7);
+insert into pc_rep values (1, 1);
+
+insert into pc_rep values (1, 2) on conflict (a) do update set b = null;
+select a, b from pc_rep;
+→ [{"a":1,"b":7}]
+
+drop table pc_rep;
+
+-- ===================================
+-- 10. Multi-row: row 1 updates cleanly, row 2 violates. Under the default ABORT
+--     the WHOLE statement rolls back — row 1's clean update is undone too.
+-- ===================================
+
+create table mr_t (id integer primary key, a integer, check (a < 10));
+insert into mr_t values (1, 1), (2, 2);
+
+insert into mr_t values (1, 0), (2, 0)
+	on conflict (id) do update set a = case when id = 1 then 3 else 99 end;
+-- error: CHECK constraint failed: _check_0 (a < 10)
+
+select id, a from mr_t order by id;
+→ [{"id":1,"a":1},{"id":2,"a":2}]
+
+drop table mr_t;
+
+-- ===================================
+-- 11. Multi-clause: both arms of one statement validate. The clause that matches
+--     is chosen by conflict target; whichever composes the row, the same
+--     UPDATE-shaped check set runs against it.
+-- ===================================
+
+create table mc_t (a integer primary key, e text unique, b integer, check (b < 10));
+insert into mc_t values (1, 'x', 1);
+
+-- conflicts on the PK → first clause composes b = 99.
+insert into mc_t values (1, 'y', 1)
+	on conflict (a) do update set b = 99
+	on conflict (e) do update set b = 5;
+-- error: CHECK constraint failed: _check_0 (b < 10)
+
+select a, e, b from mc_t;
+→ [{"a":1,"e":"x","b":1}]
+
+-- conflicts on the UNIQUE column → second clause composes b = 98.
+insert into mc_t values (2, 'x', 1)
+	on conflict (a) do update set b = 5
+	on conflict (e) do update set b = 98;
+-- error: CHECK constraint failed: _check_0 (b < 10)
+
+select a, e, b from mc_t;
+→ [{"a":1,"e":"x","b":1}]
+
+drop table mc_t;
+
+-- ===================================
+-- 12. Child-side foreign key: the composed row must still reference a live parent.
+-- ===================================
+
+pragma foreign_keys = true;
+
+create table fk_par (p integer primary key, n integer);
+create table fk_chi (c integer primary key, p integer references fk_par(p));
+insert into fk_par values (1, 0);
+insert into fk_chi values (1, 1);
+
+insert into fk_chi values (1, 1) on conflict (c) do update set p = 99;
+-- error: CHECK constraint failed: _fk_fk_chi_p
+
+select c, p from fk_chi;
+→ [{"c":1,"p":1}]
+
+update fk_chi set p = 99 where c = 1;
+-- error: CHECK constraint failed: _fk_fk_chi_p
+
+-- a composed value that DOES reference a live parent is accepted.
+insert into fk_par values (2, 0);
+insert into fk_chi values (1, 1) on conflict (c) do update set p = 2;
+select c, p from fk_chi;
+→ [{"c":1,"p":2}]
+
+drop table fk_chi;
+drop table fk_par;
+
+-- ===================================
+-- 13. Parent-side `on update restrict`: a DO UPDATE that changes a referenced
+--     column while a child still points at the old value is refused.
+--
+--     NOTE on the message. `runInsert` owns no end-of-statement RESTRICT batch, so
+--     the DO UPDATE arm always carries the per-row plan-time `not exists` probe and
+--     reports through it. That is the same message the equivalent NON-BATCHED plain
+--     UPDATE produces. A plain UPDATE that qualifies for batched RESTRICT probing
+--     (`getBatchableRestrictFks`) instead reports the batch's
+--     "FOREIGN KEY constraint failed: UPDATE on '<parent>' violates RESTRICT from
+--     '<child>'". Both refuse the write; only the wording differs, and it differs
+--     by the same gate for a plain UPDATE.
+-- ===================================
+
+create table rs_par (p integer primary key, n integer);
+create table rs_chi (c integer primary key, p integer references rs_par(p) on update restrict);
+insert into rs_par values (1, 0);
+insert into rs_chi values (1, 1);
+
+insert into rs_par values (1, 5) on conflict (p) do update set p = 2;
+-- error: CHECK constraint failed: _fk_rs_chi_p
+
+-- neither parent nor child moved: no dangling child was left behind.
+select p, n from rs_par;
+→ [{"p":1,"n":0}]
+select c, p from rs_chi;
+→ [{"c":1,"p":1}]
+
+-- changing a NON-referenced column through the same arm is fine.
+insert into rs_par values (1, 5) on conflict (p) do update set n = 5;
+select p, n from rs_par;
+→ [{"p":1,"n":5}]
+
+drop table rs_chi;
+drop table rs_par;
+
+-- ===================================
+-- 14. Parent-side `on update cascade` still cascades through the DO UPDATE arm —
+--     regression guard; FK ACTIONS already fired before this fix, only the
+--     validation half was missing.
+-- ===================================
+
+create table cs_par (p integer primary key, n integer);
+create table cs_chi (c integer primary key, p integer references cs_par(p) on update cascade);
+insert into cs_par values (1, 0);
+insert into cs_chi values (1, 1);
+
+insert into cs_par values (1, 5) on conflict (p) do update set p = 2;
+select p, n from cs_par;
+→ [{"p":2,"n":0}]
+select c, p from cs_chi;
+→ [{"c":1,"p":2}]
+
+drop table cs_chi;
+drop table cs_par;
+
+pragma foreign_keys = false;
+
+-- ===================================
+-- 15. A CHECK carrying a subquery is auto-deferred, so the arm's check on the
+--     COMPOSED row is queued and evaluated at COMMIT — matching the plain UPDATE
+--     of the same row exactly. The proposed row here is legal (a = 5 < 10), so the
+--     failure can only come from the composed row (a = 99).
+-- ===================================
+
+create table df_t (id integer primary key, a integer, check (a < (select 10)));
+insert into df_t values (1, 1);
+
+begin;
+insert into df_t values (1, 5) on conflict (id) do update set a = 99;
+commit;
+-- error: CHECK constraint failed: _check_0 (a < (select 10))
+rollback;
+
+select id, a from df_t;
+→ [{"id":1,"a":1}]
+
+-- the plain UPDATE twin defers and fails at the same boundary with the same message.
+begin;
+update df_t set a = 99 where id = 1;
+commit;
+-- error: CHECK constraint failed: _check_0 (a < (select 10))
+rollback;
+
+select id, a from df_t;
+→ [{"id":1,"a":1}]
+
+drop table df_t;
+
+-- ===================================
+-- 16. Mutation-context variables resolve inside the arm's checks: an UPDATE-scoped
+--     CHECK referencing a context variable binds the value the executor evaluated
+--     for this statement.
+-- ===================================
+
+create table cx_t (a integer primary key, b integer, constraint under_who check on update (b < who))
+	with context (who integer);
+insert into cx_t values (1, 1) with context who = 100;
+
+insert into cx_t values (1, 2) on conflict (a) do update set b = 99 with context who = 10;
+-- error: CHECK constraint failed: under_who (b < who)
+
+select a, b from cx_t;
+→ [{"a":1,"b":1}]
+
+-- same statement, a context value the composed row satisfies.
+insert into cx_t values (1, 2) on conflict (a) do update set b = 99 with context who = 1000;
+select a, b from cx_t;
+→ [{"a":1,"b":99}]
+
+drop table cx_t;

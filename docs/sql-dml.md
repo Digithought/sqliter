@@ -108,6 +108,28 @@ target (`Cannot UPDATE generated column '<name>'`), and every generated column o
 recomputed from the updated row after the SET assignments are applied, in dependency order
 (see *Generated Columns* in [sql-ddl.md](sql-ddl.md)).
 
+**Constraint validation on the DO UPDATE arm:**
+
+The row a `DO UPDATE` arm composes — the conflicting stored row, plus the SET assignments,
+plus the recomputed generated columns — is validated **exactly as the equivalent plain
+`UPDATE` of that row would be**, before anything is written. That means UPDATE-scoped
+`CHECK` constraints (so a `check ... on insert` does *not* fire here and a `check ... on
+update` does), `NOT NULL`, child-side foreign keys (the composed row must reference a live
+parent), and parent-side foreign keys (a change to a referenced column with a live
+`RESTRICT` child is refused). A transition CHECK sees the conflicting **stored** row as
+`OLD`. A per-constraint `ON CONFLICT <action>` default applies to a violation raised here —
+`IGNORE` skips the row silently, and `NOT NULL ... ON CONFLICT REPLACE DEFAULT <expr>`
+substitutes the default into the composed row. A CHECK carrying a subquery is auto-deferred
+and evaluated at `COMMIT`, again matching the plain `UPDATE`.
+
+Two things this does *not* change:
+
+- The statement's INSERT-shaped checks still run first, on the **proposed** row, before the
+  conflict is known (matching SQLite). A proposed row that violates a CHECK aborts even when
+  the `DO UPDATE` arm would have stored a legal value.
+- `DO NOTHING` writes nothing and gains no validation, and a clause `WHERE` that skips the
+  row short-circuits before any of it.
+
 **Key Differences from OR REPLACE:**
 
 | Feature | `INSERT OR REPLACE` | `ON CONFLICT DO UPDATE` |

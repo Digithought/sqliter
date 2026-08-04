@@ -5,6 +5,7 @@ import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { ConflictResolution } from '../../common/constants.js';
 import { RowOp } from '../../common/types.js';
+import type { ConstraintCheck, NotNullDefaultPlan } from './constraint-check-node.js';
 
 /**
  * Represents a planned UPSERT clause for INSERT operations.
@@ -57,6 +58,30 @@ export interface UpsertClausePlan {
 }
 
 /**
+ * UPDATE-shaped row validation for an INSERT's `on conflict … do update` arm.
+ *
+ * The arm composes its row *inside* the executor and writes it directly, so it can
+ * never reach the statement's ConstraintCheckNode (which is INSERT-shaped, and sits
+ * above the executor, seeing only the proposed insert row). This carries what
+ * `buildUpdateStmt` would have built for the same write: OLD = the conflicting stored
+ * row, NEW = the composed row.
+ *
+ * One set is shared by every clause of a multi-clause statement — the checks are a
+ * property of the table and the operation, not of the clause. The clause only decides
+ * *which* row is composed; the row is bound at runtime.
+ *
+ * Set only when at least one clause takes the `update` action.
+ */
+export interface UpsertUpdateValidation {
+  /** UPDATE-scoped CHECKs plus child-side and parent-side FK checks. */
+  checks: ConstraintCheck[];
+  /** Flat OLD|NEW descriptor the checks' column references bind through. */
+  flatRowDescriptor: RowDescriptor;
+  /** DEFAULT evaluators for NOT NULL columns — per-constraint REPLACE substitution. */
+  notNullDefaults: NotNullDefaultPlan[];
+}
+
+/**
  * Executes actual database insert/update/delete operations after constraint validation.
  * This node performs the actual vtab.update operations and yields the affected rows.
  * All data transformations (defaults, conversions, etc.) happen before this node.
@@ -88,6 +113,12 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
      * spine) all leave it unset.
      */
     public readonly lensRouted: boolean = false,
+    /**
+     * UPDATE-shaped validation for the `on conflict … do update` arm — see
+     * {@link UpsertUpdateValidation}. Set only on an INSERT whose statement has at
+     * least one `update`-action clause.
+     */
+    public readonly upsertUpdateValidation?: UpsertUpdateValidation,
   ) {
     super(scope);
   }
@@ -114,26 +145,49 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
     return out;
   }
 
+  /**
+   * The DO UPDATE arm's validation expressions, in canonical child order: CHECK / FK
+   * expressions then NOT NULL DEFAULT evaluators. They MUST be children — the FK
+   * existence probes are `not exists (…)` subqueries, which do not work unoptimized.
+   */
+  private validationExpressions(): ScalarPlanNode[] {
+    const validation = this.upsertUpdateValidation;
+    if (!validation) return [];
+    return [
+      ...validation.checks.map(c => c.expression),
+      ...validation.notNullDefaults.map(d => d.defaultNode),
+    ];
+  }
+
   getChildren(): readonly PlanNode[] {
     return [
       this.source,
       ...this.upsertExpressions(),
+      ...this.validationExpressions(),
       ...(this.mutationContextValues?.values() ?? []),
     ];
   }
 
   withChildren(newChildren: readonly PlanNode[]): PlanNode {
     const upsertExprs = this.upsertExpressions();
+    const validation = this.upsertUpdateValidation;
+    const checkCount = validation?.checks.length ?? 0;
+    const defaultCount = validation?.notNullDefaults.length ?? 0;
+    const validationCount = checkCount + defaultCount;
+    const validationExprs = this.validationExpressions();
     const ctxKeys = [...(this.mutationContextValues?.keys() ?? [])];
     const ctxExprs = [...(this.mutationContextValues?.values() ?? [])];
-    const expected = 1 + upsertExprs.length + ctxKeys.length;
+    const expected = 1 + upsertExprs.length + validationCount + ctxKeys.length;
     if (newChildren.length !== expected) {
       throw new Error(`UpdateExecutorNode expects ${expected} children, got ${newChildren.length}`);
     }
 
+    const validationStart = 1 + upsertExprs.length;
+    const ctxStart = validationStart + validationCount;
     const [newSource] = newChildren;
-    const newUpsertExprs = asScalarNodes(newChildren.slice(1, 1 + upsertExprs.length), 'DmlExecutorNode upsert');
-    const newCtxExprs = asScalarNodes(newChildren.slice(1 + upsertExprs.length), 'DmlExecutorNode context');
+    const newUpsertExprs = asScalarNodes(newChildren.slice(1, validationStart), 'DmlExecutorNode upsert');
+    const newValidationExprs = asScalarNodes(newChildren.slice(validationStart, ctxStart), 'DmlExecutorNode upsert validation');
+    const newCtxExprs = asScalarNodes(newChildren.slice(ctxStart), 'DmlExecutorNode context');
 
     // Type check
     if (!isRelationalNode(newSource)) {
@@ -142,10 +196,22 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
 
     // Return same instance if nothing changed
     const upsertUnchanged = newUpsertExprs.every((e, i) => e === upsertExprs[i]);
+    const validationUnchanged = newValidationExprs.every((e, i) => e === validationExprs[i]);
     const ctxUnchanged = newCtxExprs.every((e, i) => e === ctxExprs[i]);
-    if (newSource === this.source && upsertUnchanged && ctxUnchanged) {
+    if (newSource === this.source && upsertUnchanged && validationUnchanged && ctxUnchanged) {
       return this;
     }
+
+    const newValidation: UpsertUpdateValidation | undefined = validation
+      ? {
+          checks: validation.checks.map((check, i) => ({ ...check, expression: newValidationExprs[i] })),
+          flatRowDescriptor: validation.flatRowDescriptor,
+          notNullDefaults: validation.notNullDefaults.map((d, i) => ({
+            ...d,
+            defaultNode: newValidationExprs[checkCount + i],
+          })),
+        }
+      : undefined;
 
     // Slice rewritten expressions back into their clause slots, same order as getChildren/upsertExpressions.
     let cursor = 0;
@@ -166,8 +232,9 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
       ? new Map(ctxKeys.map((k, i) => [k, newCtxExprs[i]] as const))
       : undefined;
 
-    // Create new instance. lensRouted MUST be carried forward, or the optimizer
-    // drops the lens-routed parent-side FK semantics on any node rebuild.
+    // Create new instance. lensRouted and upsertUpdateValidation MUST be carried
+    // forward, or the optimizer drops the lens-routed parent-side FK semantics — and
+    // the DO UPDATE arm's row validation — on any node rebuild.
     return new DmlExecutorNode(
       this.scope,
       newSource,
@@ -178,7 +245,8 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
       this.contextAttributes,
       this.contextDescriptor,
       newUpsertClauses,
-      this.lensRouted
+      this.lensRouted,
+      newValidation
     );
   }
 
@@ -203,6 +271,11 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
 
     if (this.lensRouted) {
       props.lensRouted = true;
+    }
+
+    if (this.upsertUpdateValidation) {
+      props.upsertUpdateChecks = this.upsertUpdateValidation.checks.length;
+      props.upsertUpdateNotNullDefaults = this.upsertUpdateValidation.notNullDefaults.length;
     }
 
     if (this.upsertClauses && this.upsertClauses.length > 0) {
