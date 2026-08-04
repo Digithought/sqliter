@@ -1,4 +1,5 @@
 import type * as AST from '../parser/ast.js';
+import { spineCloneAst } from '../util/ast-spine-clone.js';
 
 /**
  * In-place, scope-aware AST rewriters over schema-object expressions: the
@@ -102,6 +103,17 @@ export function renameTableInAst(
  *
  * `name` is passed as both old and new name; under `dryRun` the new name is
  * never read.
+ *
+ * The column-level probes ({@link columnReferencedInAst},
+ * {@link columnReferencedInCheckExpression}) reach the same equivalence a
+ * different way — a real rename, to a sentinel name, over a throwaway
+ * {@link spineCloneAst} copy — because the column walker has ~8 mutation points
+ * and a CTE-re-exposure branch that reads the new name, so threading `dryRun`
+ * through it is the riskier of the two. Neither flaw of the identity-rename
+ * trick warned against above applies there: the mutated node is a discarded
+ * clone (nothing user-visible is re-cased), and the target is a fresh name no
+ * column can hold, so `newCol !== oldCol` and the re-exposure branch answers
+ * exactly as it would for a real rename to an unused name.
  */
 export function tableReferencedInAst(
 	node: AST.AstNode | undefined,
@@ -459,6 +471,64 @@ export function renameColumnInCheckExpression(
 		state.scopeStack.pop();
 	}
 	return state.changed;
+}
+
+/**
+ * Sentinel rename target for the two read-only column probes below. No user
+ * column can hold this name, and the probe rewrites *to* it, so it can never
+ * collide with anything the walk is looking for.
+ */
+const PROBE_COLUMN_NAME = '__quereus_column_probe__';
+
+/**
+ * Whether `node` refers to `tableName`.`columnName` — read-only with respect to
+ * the caller's AST; a throwaway {@link spineCloneAst} copy is what gets
+ * rewritten.
+ *
+ * Same equivalence {@link tableReferencedInAst} establishes for the table verb,
+ * and for the same reason: "refers to" must mean "would have been rewritten by
+ * `ALTER TABLE … RENAME COLUMN`", or a DROP guard built on it refuses a
+ * different set of cases than the rename follows. See that function's comment
+ * for why the column verb reaches it by clone+sentinel rather than by `dryRun`.
+ *
+ * `resolveColumnInSource` is **not optional in practice**: without it the walk
+ * has no way to tell that an unqualified ref inside a subquery binds to a
+ * like-named column on the subquery's own FROM source, and a caller asking
+ * "does this body name `t.v`?" gets `true` for a body whose only `v` is
+ * another table's. Every caller should pass the catalog-backed resolver
+ * (`buildColumnSourceResolver`).
+ */
+export function columnReferencedInAst(
+	node: AST.AstNode | undefined,
+	tableName: string,
+	columnName: string,
+	defaultSchemaName: string,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	if (!node) return false;
+	return renameColumnInAst(
+		spineCloneAst(node), tableName, columnName, PROBE_COLUMN_NAME,
+		defaultSchemaName, resolveColumnInSource);
+}
+
+/**
+ * {@link columnReferencedInAst} for an expression that resolves unqualified refs
+ * against an implicit binding to `tableName` — a CHECK expression or a
+ * partial-index predicate. Uses {@link renameColumnInCheckExpression}'s seeded
+ * entry point so the probe answers for exactly the scope that expression is
+ * planned in.
+ */
+export function columnReferencedInCheckExpression(
+	expr: AST.AstNode | undefined,
+	tableName: string,
+	columnName: string,
+	defaultSchemaName: string,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	if (!expr) return false;
+	return renameColumnInCheckExpression(
+		spineCloneAst(expr), tableName, columnName, PROBE_COLUMN_NAME,
+		defaultSchemaName, resolveColumnInSource);
 }
 
 /**

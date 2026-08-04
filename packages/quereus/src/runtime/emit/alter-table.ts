@@ -21,6 +21,8 @@ import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
+import { buildColumnSourceResolver } from './column-source-resolver.js';
+import { assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn } from './drop-column-guards.js';
 import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
@@ -1149,6 +1151,14 @@ async function runDropColumn(
 		}
 	}
 
+	// Validate: the remaining two EXPRESSION dependents — a CHECK on this table, and an
+	// assertion body — which have no narrowed form either and so refuse the same way the
+	// two loops above do. Both run before `requireVtabModule` / `module.alterTable`, so a
+	// refused drop persists nothing. CHECK first, assertion second: widening blast radius,
+	// so the most locally-explainable violation is the one reported.
+	assertNoCheckConstraintNamesColumn(rctx.db, tableSchema, columnName);
+	assertNoAssertionNamesColumn(rctx.db, tableSchema, columnName);
+
 	// Call module.alterTable for data + schema update
 	const module = requireVtabModule(tableSchema);
 	if (!module.alterTable) {
@@ -2213,22 +2223,6 @@ function rewriteTableForTableRename(
 		foreignKeys: table.foreignKeys ? Object.freeze(newFks) : table.foreignKeys,
 		indexes: table.indexes ? Object.freeze(newIndexes) : table.indexes,
 	});
-}
-
-/**
- * The catalog-backed {@link ResolveColumnInSource} the column-rename rewriters consult
- * to keep their unqualified-reference walk scope-aware. Built once per statement and
- * shared by the pre-flight probe in {@link runRenameColumn} and the real propagation
- * below, so the two cannot drift apart. Note it resolves against the LIVE catalog on
- * every call, so sharing it does not by itself freeze the answer between the two passes
- * — see the pre-flight's comment for why they agree anyway.
- */
-function buildColumnSourceResolver(db: Database): ResolveColumnInSource {
-	return (s, t, col) => {
-		const targetSchema = db.schemaManager.getSchema(s);
-		const targetTable = targetSchema?.getTable(t);
-		return targetTable?.columnIndexMap.has(col.toLowerCase()) ?? false;
-	};
 }
 
 async function propagateColumnRename(

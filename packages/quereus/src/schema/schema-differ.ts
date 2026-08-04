@@ -870,11 +870,17 @@ export function computeSchemaDiff(
 	// genuinely gone, the recreate fails loudly with the build-time error above
 	// rather than silently bricking every write.
 	//
-	// NOTE: dropped COLUMNS have no equivalent here, so a declaration that removes a
-	// column while leaving an assertion body naming it emits a bare `DROP COLUMN`.
-	// That is harmless only because `runDropColumn` does not yet guard assertions;
-	// when it does (`bug-drop-column-skips-dependent-checks` arm C), this predicate
-	// has to widen to columns or such a migration will abort.
+	// Dropped COLUMNS deliberately have NO equivalent here, and this predicate must not
+	// widen to them. `runDropColumn` now refuses to drop a column an assertion body still
+	// names (`assertNoAssertionNamesColumn`), and the three declaration shapes work out:
+	// one that removes the column AND drops the assertion already emits `DROP ASSERTION`
+	// ahead of the table-alter block; one that removes the column and EDITS the body off
+	// it already churns a drop-old + recreate-last on body drift; and one that removes the
+	// column while leaving an unchanged body naming it is self-inconsistent and must fail.
+	// Widening would not rescue that third case — it would drop the assertion, drop the
+	// column, then fail on the recreate (`CREATE ASSERTION` plans its body at build time),
+	// i.e. the same abort with a worse message and the assertion already gone. Refusing at
+	// the column drop, naming the assertion, with nothing applied, is the intended outcome.
 	//
 	// NOTE: one AST walk per declared assertion per dropped object. Trivial at the
 	// handful-of-each scale schemas have today; if a large schema ever drops many

@@ -1,0 +1,309 @@
+-- 41.10.2-alter-drop-column-check-and-assertion.sqllogic
+--
+-- Subject: `ALTER TABLE … DROP COLUMN` vs. the two EXPRESSION dependents that used to
+-- survive the drop verbatim — a CHECK constraint on the same table, and an assertion
+-- whose CHECK body names the column.
+--
+-- DROP COLUMN's dependents split in two. A STRUCTURAL dependent (a UNIQUE over the
+-- column, the table's own FK using it as a child column — §41.10 and §41.10.1) is
+-- defined by a column set, so losing a column makes it a DIFFERENT constraint and the
+-- engine removes it with the column. An EXPRESSION dependent is arbitrary user logic
+-- with no narrowed form at all, so the engine REFUSES the drop: that is what the
+-- generated-column and partial-index guards already did, and these two now join them.
+--
+-- Left unguarded, both dependents fail much later — while a WRITE statement is being
+-- planned, before any row is touched. The CHECK arm makes its own table unwritable;
+-- the assertion arm makes the WHOLE DATABASE unwritable, because the assertion
+-- evaluator recompiles every live assertion on any commit that touched any table, so
+-- one unresolvable body blocks writes to tables that have nothing to do with the
+-- altered one. §6 asserts exactly that: an unrelated table stays writable.
+--
+-- Detection is scope-aware, not a bare name match: a CHECK expression and an assertion
+-- body may both contain subqueries, so a depth-blind walk would false-refuse a legal
+-- drop whose only same-named column lives on ANOTHER table. §4 and §7 pin that.
+--
+-- No `-- requires-capability:` directive: the file uses no standalone index DDL, so it
+-- runs under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`). The store leg matters — it persists table DDL, so a CHECK broken
+-- by an unguarded drop would survive a reopen.
+
+-- ===================================================================
+-- 1. A NAMED CHECK naming the dropped column refuses the drop, and the
+--    table is left completely untouched (the guard runs before the module).
+-- ===================================================================
+
+create table DcChk (id integer primary key, a integer, b integer, constraint chk_ab check (b > a));
+insert into DcChk values (1, 1, 2);
+-- run
+
+alter table DcChk drop column a;
+-- error: chk_ab
+
+-- Untouched: the column is still there and still holds its value...
+select a, b from DcChk;
+→ [{"a":1,"b":2}]
+
+-- ...and the CHECK still enforces, so nothing was half-applied.
+insert into DcChk values (2, 5, 4);
+-- error: chk_ab
+
+insert into DcChk values (3, 5, 9);
+select count(*) as c from DcChk;
+→ [{"c":2}]
+
+drop table DcChk;
+-- run
+
+-- ===================================================================
+-- 2. An UNNAMED table-level CHECK has no name to quote, so the message
+--    quotes its expression instead — the only handle the user has on it.
+-- ===================================================================
+--
+-- Accepted cost: `DROP CONSTRAINT` resolves by name only, so this column is undroppable
+-- short of rebuilding the table. Same position SQLite takes.
+
+create table DcAnon (id integer primary key, a integer, b integer, check (b > a));
+-- run
+
+alter table DcAnon drop column a;
+-- error: it is referenced by the CHECK constraint (b > a)
+
+drop table DcAnon;
+-- run
+
+-- ===================================================================
+-- 3. A CHECK that does NOT name the dropped column is no obstacle, and
+--    still enforces over its own column afterwards.
+-- ===================================================================
+
+create table DcOther (id integer primary key, a integer, b integer, constraint chk_b check (b > 0));
+insert into DcOther values (1, 7, 3);
+alter table DcOther drop column a;
+select b from DcOther;
+→ [{"b":3}]
+
+insert into DcOther values (2, -1);
+-- error: chk_b
+
+insert into DcOther values (3, 4);
+select count(*) as c from DcOther;
+→ [{"c":2}]
+
+drop table DcOther;
+-- run
+
+-- ===================================================================
+-- 4. A CHECK whose only match for the dropped name sits inside a SUBQUERY
+--    over ANOTHER table must NOT block the drop.
+-- ===================================================================
+--
+-- The `v` inside the subquery binds to `DcSrc.v`, not to the dropped `DcSub.v`. A
+-- depth-blind walk sees the bare name and false-refuses.
+
+create table DcSrc (uid integer primary key, v integer);
+insert into DcSrc values (1, 5);
+create table DcSub (id integer primary key, v integer, w integer, check ((select min(v) from DcSrc) >= 0));
+insert into DcSub values (1, 2, 3);
+-- run
+
+alter table DcSub drop column v;
+select w from DcSub;
+→ [{"w":3}]
+
+-- Still writable, and the surviving CHECK still evaluates against DcSrc.
+insert into DcSub values (2, 9);
+select count(*) as c from DcSub;
+→ [{"c":2}]
+
+drop table DcSub;
+drop table DcSrc;
+-- run
+
+-- ===================================================================
+-- 5. Escape hatch for a NAMED CHECK: drop the constraint, then the column.
+-- ===================================================================
+
+create table DcEsc (id integer primary key, a integer, b integer, constraint chk_esc check (b > a));
+insert into DcEsc values (1, 1, 2);
+-- run
+
+alter table DcEsc drop column a;
+-- error: chk_esc
+
+alter table DcEsc drop constraint chk_esc;
+alter table DcEsc drop column a;
+select b from DcEsc;
+→ [{"b":2}]
+
+-- Nothing constrains the surviving column any more.
+insert into DcEsc values (2, -5);
+select count(*) as c from DcEsc;
+→ [{"c":2}]
+
+drop table DcEsc;
+-- run
+
+-- ===================================================================
+-- 6. An ASSERTION whose body names the column refuses the drop — and an
+--    UNRELATED table stays writable, which is the damage this prevents.
+-- ===================================================================
+
+create table DcAsrt (id integer primary key, x integer, y integer);
+create table DcBystander (id integer primary key);
+insert into DcAsrt values (1, 4, 5);
+commit;
+-- run
+
+create assertion dc_nonneg check (not exists (select 1 from DcAsrt where x < 0));
+-- run
+
+alter table DcAsrt drop column x;
+-- error: dc_nonneg
+
+-- The column survived, so the assertion still compiles and every write still commits —
+-- including a write to a table that never appears in the assertion body. Unguarded, the
+-- drop would have made THIS insert fail with `Column not found: x`.
+insert into DcBystander values (1);
+commit;
+select count(*) as c from DcBystander;
+→ [{"c":1}]
+
+-- The assertion still does its job on the altered table.
+insert into DcAsrt values (2, -1, 0);
+commit;
+-- error: dc_nonneg
+
+-- ===================================================================
+-- 7. An assertion body that names the TABLE but not the dropped column is
+--    no obstacle — including a `select *` body, which names no column at all.
+-- ===================================================================
+
+alter table DcAsrt drop column y;
+select x from DcAsrt where id = 1;
+→ [{"x":4}]
+
+create table DcStar (id integer primary key, p integer, q integer);
+create assertion dc_star check (not exists (select * from DcStar where id < 0));
+-- run
+
+alter table DcStar drop column p;
+insert into DcStar values (1, 8);
+commit;
+select q from DcStar;
+→ [{"q":8}]
+
+-- ...and a body whose only match for the name sits on a DIFFERENT table, the assertion
+-- mirror of §4. `z` in the body is DcZb.z, so DcZa.z drops freely.
+create table DcZa (id integer primary key, z integer);
+create table DcZb (id integer primary key, z integer);
+create assertion dc_z check (not exists (select 1 from DcZb where z < 0));
+-- run
+
+alter table DcZa drop column z;
+commit;
+select count(*) as c from DcZa;
+→ [{"c":0}]
+
+drop assertion dc_z;
+drop table DcZa;
+drop table DcZb;
+drop assertion dc_star;
+drop table DcStar;
+-- run
+
+-- ===================================================================
+-- 8. Escape hatch for an assertion: drop the assertion, then the column.
+-- ===================================================================
+
+drop assertion dc_nonneg;
+alter table DcAsrt drop column x;
+-- run
+
+select id from DcAsrt;
+→ [{"id":1}]
+
+drop table DcAsrt;
+drop table DcBystander;
+-- run
+
+-- ===================================================================
+-- 9. Spelling does not matter: a case-only variant and a table-qualified
+--    reference both block the drop.
+-- ===================================================================
+
+create table DcCase (id integer primary key, a integer, b integer, check (B > A));
+-- run
+
+alter table DcCase drop column a;
+-- error: it is referenced by the CHECK constraint (B > A)
+
+drop table DcCase;
+-- run
+
+create table DcQual (id integer primary key, a integer, b integer, check (DcQual.b > DcQual.a));
+-- run
+
+alter table DcQual drop column a;
+-- error: it is referenced by the CHECK constraint
+
+drop table DcQual;
+-- run
+
+create table DcQAsrt (id integer primary key, x integer, y integer);
+create assertion dc_qual check (not exists (select 1 from DcQAsrt where DcQAsrt.x < 0));
+-- run
+
+alter table DcQAsrt drop column x;
+-- error: dc_qual
+
+drop assertion dc_qual;
+drop table DcQAsrt;
+-- run
+
+-- ===================================================================
+-- 10. Both dependents at once: the CHECK message wins, because the CHECK
+--     guard runs first — widening blast radius, most local violation first.
+-- ===================================================================
+
+create table DcBoth (id integer primary key, a integer, b integer, constraint chk_both check (b > a));
+-- run
+
+create assertion dc_both check (not exists (select 1 from DcBoth where a < 0));
+-- run
+
+alter table DcBoth drop column a;
+-- error: chk_both
+
+drop assertion dc_both;
+drop table DcBoth;
+-- run
+
+-- ===================================================================
+-- 11. The two PRE-EXISTING expression guards are unchanged by the new ones,
+--     and a table with no CHECKs at all still drops cleanly.
+-- ===================================================================
+--
+-- The generated-column guard is checked ahead of the CHECK guard, so its message is the
+-- one reported even though the CHECK also names the column. The partial-index guard is
+-- NOT exercised here: declaring a partial index needs `create index … where`, which
+-- would force a `requires-capability: standalone-index-ddl` directive and take this file
+-- out of the store leg — the leg that matters most for a persisted CHECK. It has no
+-- sqllogic coverage anywhere else either.
+
+create table DcGen (id integer primary key, a integer, g integer generated always as (a + 1), constraint chk_gen check (a > 0));
+-- run
+
+alter table DcGen drop column a;
+-- error: generated column 'g'
+
+drop table DcGen;
+-- run
+
+create table DcBare (id integer primary key, a integer, b integer);
+insert into DcBare values (1, 1, 2);
+alter table DcBare drop column a;
+select b from DcBare;
+→ [{"b":2}]
+
+drop table DcBare;
+-- run
