@@ -530,15 +530,19 @@ function aggregateOutputIsSelectList(
 	starProjectionsByColumn: ReadonlyMap<AST.ResultColumn, readonly Projection[]>,
 	selectContext: PlanningContext,
 ): boolean {
-	// `projections` holds every expanded star column first and the non-aggregate
-	// SELECT-list columns after them (buildSelectStmt pushes them in that order), so
-	// the SELECT-list walk below needs its own cursor into the second group.
-	let starColumnCount = 0;
-	for (const column of stmt.columns) {
-		if (column.type === 'all') starColumnCount += starProjectionsByColumn.get(column)?.length ?? 0;
+	// `projections` holds the expanded star columns *and* the non-aggregate SELECT-list
+	// columns. Stars are walked from `starProjectionsByColumn` below, so drop them from
+	// the cursor's list by object identity — that keeps the remaining entries in
+	// SELECT-list order no matter how buildSelectStmt interleaves the two groups
+	// (it appends stars first today; fix/1-bug-star-in-select-list-ignores-its-position
+	// is about to make that written-order instead).
+	const starProjections = new Set<Projection>();
+	for (const expanded of starProjectionsByColumn.values()) {
+		for (const starProjection of expanded) starProjections.add(starProjection);
 	}
+	const nonStarProjections = projections.filter(projection => !starProjections.has(projection));
 
-	let columnCursor = starColumnCount;
+	let columnCursor = 0;
 	let aggregateCount = 0;
 	let nextGroupKey = 0;
 	let sawAggregate = false;
@@ -569,7 +573,7 @@ function aggregateOutputIsSelectList(
 			continue;
 		}
 
-		const projection = projections[columnCursor++];
+		const projection = nonStarProjections[columnCursor++];
 		if (!projection || !claimsNextGroupKey(projection.node)) return false;
 		nextGroupKey++;
 	}
@@ -577,7 +581,15 @@ function aggregateOutputIsSelectList(
 	return nextGroupKey === groupByExpressions.length && aggregateCount === aggregates.length;
 }
 
-/** True when a SELECT-list expression contains an aggregate function call. */
+/**
+ * True when a SELECT-list expression contains an aggregate function call.
+ *
+ * NOTE: resolves a function schema per function node while walking, once per prepare
+ * of a grouped query, on top of the walk analyzeSelectColumns already does. Not
+ * measured; if preparing wide grouped select lists ever shows up as slow, have
+ * analyzeSelectColumns publish its per-column aggregate/non-aggregate verdict
+ * instead of re-deriving it here.
+ */
 function containsAggregateFunction(expr: AST.Expression, selectContext: PlanningContext): boolean {
 	const found: AST.FunctionExpr[] = [];
 	findAggregateFunctionExprs(expr, selectContext, found);

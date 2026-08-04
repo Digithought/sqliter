@@ -29,6 +29,8 @@ describe('Plan shape: grouped-query final projection', () => {
 		// and rewrite the grouping keys out from under the column-order assertions.
 		await db.exec("CREATE TABLE nk (a TEXT, b TEXT) USING memory");
 		await db.exec("INSERT INTO nk VALUES ('x','1'),('y','2'),('x','3')");
+		await db.exec("CREATE TABLE u (z TEXT) USING memory");
+		await db.exec("INSERT INTO u VALUES ('p'),('q')");
 	});
 
 	afterEach(async () => {
@@ -170,6 +172,28 @@ describe('Plan shape: grouped-query final projection', () => {
 			it('SELECT * plus an aggregate emits source-column order then the aggregate', async () => {
 				expect(await columnNames("SELECT *, count(*) AS c FROM nk GROUP BY a, b")).to.deep.equal(['a', 'b', 'c']);
 				expect(await columnNames("SELECT *, count(*) AS c FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b', 'c']);
+			});
+
+			it('two aggregates over the same group do not publish the grouping key', async () => {
+				expect(await columnNames("SELECT count(*) AS c1, count(*) AS c2 FROM nk GROUP BY a")).to.deep.equal(['c1', 'c2']);
+				expect(await columnNames("SELECT count(DISTINCT b) AS c FROM nk GROUP BY a")).to.deep.equal(['c']);
+			});
+
+			it('a grouping key named twice is emitted twice', async () => {
+				// The aggregate publishes one column per *key*, so this select list is one
+				// column shorter than the aggregate output — the opposite mismatch from the
+				// leaked-key case, and equally a reason to project.
+				expect(await columnNames("SELECT a, a, count(*) AS c FROM nk GROUP BY a")).to.deep.equal(['a', 'a:1', 'c']);
+			});
+
+			it('an aggregate inside a scalar subquery is not this query\'s aggregate', async () => {
+				// `(select count(*) from u)` aggregates over `u`, not over the groups of
+				// `nk`, so it is a non-aggregate select-list item here and must not be
+				// counted against the AggregateNode's own aggregate slots.
+				expect(await columnNames("SELECT (SELECT count(*) FROM u) AS su, count(*) AS c FROM nk GROUP BY a"))
+					.to.deep.equal(['su', 'c']);
+				expect(await columnNames("SELECT a, (SELECT count(*) FROM u) AS su, count(*) AS c FROM nk GROUP BY a"))
+					.to.deep.equal(['a', 'su', 'c']);
 			});
 
 			it('a qualified reference to a bare grouping key counts as agreement', async () => {

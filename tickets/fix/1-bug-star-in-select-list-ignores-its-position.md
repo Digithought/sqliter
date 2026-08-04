@@ -57,6 +57,17 @@ path match the grouped one, not the reverse.
 - Grouped and ungrouped queries agree for the same select list.
 - Existing duplicate-name disambiguation (`v`, `v:1`) is unaffected.
 
+## One more reader of that projection list
+
+`aggregateOutputIsSelectList` in
+`packages/quereus/src/planner/building/select-aggregates.ts` also reads the list
+`buildSelectStmt` assembles, to decide whether a grouped query needs a final
+projection at all. It used to assume the same "stars first, named columns after"
+layout this ticket is about to change, which would have broken it silently. It no
+longer does — it now drops the star entries by object identity and reads the rest
+in order — so reordering the list is safe for it. Mentioned so whoever changes
+the assembly knows this second reader exists and does not need to be touched.
+
 ## Not in scope
 
 Nothing here changes which columns a star expands to, or how they are named —

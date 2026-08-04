@@ -53,6 +53,8 @@ drop table t;
 -- ---------------------------------------------------------------------------
 create table nk (a text, b text);
 insert into nk values ('x','1'),('y','2');
+create table u (z text);
+insert into u values ('p'),('q');
 
 -- Aggregate first, grouping key after it.
 select count(*) c, a from nk group by a order by a;
@@ -79,6 +81,20 @@ select nk.a, count(*) c from nk group by a order by a;
 select *, count(*) c from nk group by a, b order by a;
 → [{"a":"x","b":"1","c":1},{"a":"y","b":"2","c":1}]
 
+-- Two aggregates and no named key: still no key in the output.
+select count(*) c1, count(distinct b) c2 from nk group by a order by c1;
+→ [{"c1":1,"c2":1},{"c1":1,"c2":1}]
+
+-- A grouping key named twice is emitted twice — the select list is one column
+-- shorter than the aggregate output here, the opposite of the leaked-key case.
+select a, a, count(*) c from nk group by a order by a;
+→ [{"a":"x","a:1":"x","c":1},{"a":"y","a:1":"y","c":1}]
+
+-- An aggregate inside a scalar subquery aggregates over the *other* table, so it
+-- is a non-aggregate item of this query and must not claim an aggregate slot.
+select (select count(*) from u) su, count(*) c from nk group by a order by a;
+→ [{"su":2,"c":1},{"su":2,"c":1}]
+
 -- The aggregate-only grouped select composes as a derived table...
 select n from (select count(*) n from nk group by a) order by n;
 → [{"n":1},{"n":1}]
@@ -101,4 +117,5 @@ drop materialized view mvn;
 create materialized view mvbad as select count(*) n from nk group by a;
 -- error: materialized view 'main.mvbad' body produces duplicate rows
 
+drop table u;
 drop table nk;
