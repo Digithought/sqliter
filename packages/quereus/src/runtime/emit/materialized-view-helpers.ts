@@ -2343,7 +2343,13 @@ function describePhysicalPkChange(
 	return null;
 }
 
-/** Lifts a {@link ReshapeColumnOp} onto the module's `SchemaChangeInfo` surface. */
+/**
+ * Lifts a {@link ReshapeColumnOp} onto the module's `SchemaChangeInfo` surface.
+ * Never sets `ddl` — these are engine-internal backing reshapes, not statements the
+ * application issued, and a module emits a schema-change event only for a call
+ * carrying `ddl` (see `SchemaChangeInfo.ddl`), so every reshape stays silent on the
+ * public schema channel.
+ */
 function reshapeOpToChange(op: ReshapeColumnOp): SchemaChangeInfo {
 	switch (op.kind) {
 		case 'rename':

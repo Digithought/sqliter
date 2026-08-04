@@ -2682,13 +2682,17 @@ export class SchemaManager {
 	 * if the engine needs schema events — i.e. any `onSchemaChange` or
 	 * `onTransactionCommit` listener is registered (see `Database._needsSchemaEvents`).
 	 *
-	 * NOTE: the auto event carries no `ddl` — the callers have only the (schema,
-	 * object) names here, not the object schema each generator needs. Fine today:
-	 * the only consumer that reads `ddl` is sync replication, which runs over the
-	 * store module, and that module has native event support so this fallback never
-	 * fires for it. If a module without native events ever needs to replicate,
-	 * thread the object schema in and call the `schema/ddl-generator.ts` generators
-	 * here the way the store and memory modules do at their own emit sites.
+	 * NOTE: the auto events raised from THIS class (create/drop table, create/drop
+	 * index) carry no `ddl` — the callers have only the (schema, object) names here,
+	 * not the object schema each generator needs. Fine today: the only consumer that
+	 * reads `ddl` is sync replication, which runs over the store module, and that
+	 * module has native event support so this fallback never fires for it. If a
+	 * module without native events ever needs to replicate creates/drops, thread the
+	 * object schema in and call the `schema/ddl-generator.ts` generators here the way
+	 * the store and memory modules do at their own emit sites. The ALTER TABLE arms
+	 * are the exception: they pass through this same gate WITH `ddl` (the statement's
+	 * plan-build rendering — see `runtime/emit/alter-schema-event.ts`), so an ALTER's
+	 * auto event announces the same text an emitter-backed module does.
 	 *
 	 * Public because the `ALTER TABLE` arms live outside this class
 	 * (`runtime/emit/alter-table.ts`, `runtime/emit/add-constraint.ts`) and must reach the

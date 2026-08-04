@@ -171,26 +171,37 @@ in `packages/quereus/src/schema/ddl-generator.ts`). The memory virtual-table mod
 attaches the same four, though there is no end-to-end sync path for memory-backed tables
 today.
 
-ALTER TABLE does **not** replicate. A column add / drop / alter records an
-`alter_column` migration whose DDL is blank, so it crosses the wire as an empty statement
-and changes nothing on the receiver — a peer that alters a table stays silently diverged
-in shape. A known gap, not a bug to work around: the event (`alter` / `table` plus the
-table name) does not describe *what* was altered, a rename reports only the new name, and
-a declarative `apply schema` emits one event per alteration in its diff — so attaching the
-originating DDL is real design work, tracked in `feat-sync-replicate-alter-table`.
+ALTER TABLE events now carry a real DDL string too. Every `ALTER TABLE` statement's
+schema-change event carries the statement's **canonical, schema-qualified SQL** in `ddl`:
+the engine renders it once at plan-build time (`buildAlterTableStmt` in
+`packages/quereus/src/planner/building/alter-table.ts`) and threads it to the module as
+`SchemaChangeInfo.ddl` (or `renameTable`'s `ddl` parameter), which the store module puts
+on the event verbatim. The qualification rule matches `generateTableDDL`, so both wire
+sources agree. Two properties make the text safe to re-execute one-for-one:
 
-`RENAME TO` is the sharpest form: it also stops the table's **data** from replicating. The
-origin writes under the new name while the peer still holds the old, so every later row
-change names a table the peer lacks and takes the unknown-table disposition.
+- **One event per statement.** A module emits a schema-change event for an `alterTable`
+  call *iff* `change.ddl` is set, and the engine sets it only on the call that IS the
+  statement's action — the inline-constraint installs behind
+  `add column x text unique`, the revert calls of a failed ADD COLUMN, and the
+  materialized-view backing reshapes all pass no `ddl` and announce nothing. The engine's
+  own no-emitter path (`emitAlterSchemaEvent`) already had this shape and now carries the
+  identical text, so memory- and store-backed alterations announce the same string.
+- **A rename says what it renamed *from*.** `RENAME TO` events carry `oldObjectName`
+  alongside the new `objectName`, so a receiver can tell which of its tables the event is
+  about.
 
-Both ends log the gap. The origin warns in `recordSchemaMigration` on a DDL-less
-`alter_column` migration, naming the schema and table and stating the alteration will not
-reach other devices — one warning per altering event, so a multi-alteration `apply schema`
-names each one. The receiver warns in `applySchemaChange`'s blank-DDL early return, naming
-migration type, schema and table; that one is deliberately **not** scoped to
-`alter_column`, so a blank drop/index migration from an older-build peer is reported too.
-Neither changes behavior: the migration is still recorded (still advancing the table's
-schema version, which the destructiveness comparison depends on) and still skipped.
+An alteration therefore records a **non-blank** `alter_column` migration, the origin-side
+`recordSchemaMigration` warning no longer fires for it, and the receiver executes the DDL
+through the existing one-for-one expectation path. Receiver-side hardening (idempotent
+re-apply, divergence handling) is `sync-replicate-alter-table-ddl`; making `RENAME TO`
+carry the table's *data* stream across the rename — the origin writes under the new name
+while the peer still holds the old — is `sync-replicate-rename-table`.
+
+The receiver still warns in `applySchemaChange`'s blank-DDL early return, naming
+migration type, schema and table — deliberately **not** scoped to `alter_column`, so a
+blank migration from an older-build peer is reported too. A blank migration is still
+recorded (still advancing the table's schema version, which the destructiveness
+comparison depends on) and still skipped.
 
 A blank-DDL migration is skipped outright — counted applied, but neither executed nor
 given a pending remote-event expectation. That last part matters: expectations are

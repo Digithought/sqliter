@@ -1535,6 +1535,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		schemaName: string,
 		oldName: string,
 		newName: string,
+		ddl?: string,
 	): Promise<void> {
 		// Read the catalog entry BEFORE anything mutates: `runtime/emit/alter-table.ts`
 		// calls this hook ahead of the catalog swap, so the table is still registered
@@ -1543,7 +1544,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const preRenameSchema = db.schemaManager.getTable(schemaName, oldName);
 
 		if (this.underlying.renameTable) {
-			await this.underlying.renameTable(db, schemaName, oldName, newName);
+			// `ddl` forwarded verbatim (like alterTable's `change`): the underlying module's
+			// emit-iff-`ddl` rule must see the engine's marking, not this overlay's.
+			await this.underlying.renameTable(db, schemaName, oldName, newName, ddl);
 		}
 
 		// Drop our cached underlying VirtualTable for the old name. It may have

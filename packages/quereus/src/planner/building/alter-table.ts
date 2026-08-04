@@ -13,7 +13,7 @@ import { validateDeterministicDefault, validateDeterministicGenerated } from '..
 import { tryFoldLiteral } from '../../parser/utils.js';
 import { inferType } from '../../types/registry.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
-import { expressionToString } from '../../emit/ast-stringify.js';
+import { astToString, expressionToString } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
 import { validateAddColumnGeneratedRefs } from '../../schema/table.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
@@ -25,6 +25,25 @@ export function buildAlterTableStmt(
 ): VoidNode {
   const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, ctx);
   const tableReference = tableRetrieve.tableRef; // Extract the actual TableReferenceNode
+
+  // Canonical, fully-qualified SQL for the whole statement, rendered ONCE here — the one
+  // place that holds the parsed action and the resolved table together. Rendered from a
+  // SYNTHETIC statement whose table identifier is rebuilt from the resolved TableSchema,
+  // not from `stmt.table` as the user wrote it: an unqualified `alter table orders …`
+  // must not become a statement a receiver resolves against a different default schema.
+  // Same qualification rule as `generateTableDDL` / the schema differ's synthetic ALTER
+  // (schema-differ.ts), so the two wire sources agree. The runtime arms thread it to the
+  // module (`SchemaChangeInfo.ddl` / `renameTable`'s `ddl`) and onto the public
+  // schema-change event.
+  const { schemaName, name: tableName } = tableReference.tableSchema;
+  const canonicalStmt: AST.AlterTableStmt = {
+    type: 'alterTable',
+    table: schemaName.toLowerCase() === 'main'
+      ? { type: 'identifier', name: tableName }
+      : { type: 'identifier', name: tableName, schema: schemaName },
+    action: stmt.action,
+  };
+  const sql = astToString(canonicalStmt);
 
   switch (stmt.action.type) {
     case 'addConstraint': {
@@ -47,7 +66,8 @@ export function buildAlterTableStmt(
       return new AddConstraintNode(
         ctx.scope,
         tableReference,
-        constraintWithBitmask
+        constraintWithBitmask,
+        sql,
       );
 		}
 
@@ -55,14 +75,14 @@ export function buildAlterTableStmt(
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'renameTable',
         newName: stmt.action.newName,
-      });
+      }, sql);
 
     case 'renameColumn':
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'renameColumn',
         oldName: stmt.action.oldName,
         newName: stmt.action.newName,
-      });
+      }, sql);
 
     case 'addColumn': {
       const column = stmt.action.column;
@@ -101,33 +121,33 @@ export function buildAlterTableStmt(
         column,
         backfill,
         checks,
-      });
+      }, sql);
 		}
 
     case 'dropColumn':
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'dropColumn',
         name: stmt.action.name,
-      });
+      }, sql);
 
     case 'dropConstraint':
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'dropConstraint',
         name: stmt.action.name,
-      });
+      }, sql);
 
     case 'renameConstraint':
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'renameConstraint',
         oldName: stmt.action.oldName,
         newName: stmt.action.newName,
-      });
+      }, sql);
 
     case 'alterPrimaryKey':
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'alterPrimaryKey',
         columns: stmt.action.columns,
-      });
+      }, sql);
 
     case 'alterColumn':
       return new AlterTableNode(ctx.scope, tableReference, {
@@ -137,7 +157,7 @@ export function buildAlterTableStmt(
         setDataType: stmt.action.setDataType,
         setDefault: stmt.action.setDefault,
         setCollation: stmt.action.setCollation,
-      });
+      }, sql);
 
     case 'setTags': {
       // Validate any reserved `quereus.*` tags at the matching site so a typo
@@ -157,7 +177,7 @@ export function buildAlterTableStmt(
         target,
         mode: stmt.action.mode,
         tags: stmt.action.tags,
-      });
+      }, sql);
     }
 
     case 'dropTags': {
@@ -169,7 +189,7 @@ export function buildAlterTableStmt(
         type: 'dropTags',
         target: stmt.action.target,
         keys: stmt.action.keys,
-      });
+      }, sql);
     }
 
     case 'setMaintained': {
@@ -214,13 +234,13 @@ export function buildAlterTableStmt(
         type: 'setMaintained',
         columns: stmt.action.columns,
         select: stmt.action.select,
-      });
+      }, sql);
     }
 
     case 'dropMaintained':
       // Maintained-ness is checked in the emitter against the LIVE table (the
       // build-time schema may be a cached statement's snapshot).
-      return new AlterTableNode(ctx.scope, tableReference, { type: 'dropMaintained' });
+      return new AlterTableNode(ctx.scope, tableReference, { type: 'dropMaintained' }, sql);
 
     default:
       throw new QuereusError(

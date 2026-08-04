@@ -430,12 +430,19 @@ export interface VirtualTableModule<
 	 *
 	 * If not implemented, RENAME TO is treated as a schema-only rename; modules
 	 * that persist data keyed by the table name must implement this hook.
+	 *
+	 * `ddl` carries the statement's canonical, fully-qualified SQL under the same
+	 * rule as {@link SchemaChangeInfo}'s `ddl`: set only when this call IS the
+	 * statement's action, and an emitter-backed module emits its schema-change
+	 * event iff it is set — putting the text (and the old table name, as
+	 * `oldObjectName`) on the event. Absent ⇒ engine-internal step ⇒ no event.
 	 */
 	renameTable?(
 		db: Database,
 		schemaName: string,
 		oldName: string,
 		newName: string,
+		ddl?: string,
 	): Promise<void>;
 
 	/**
@@ -615,7 +622,7 @@ export type CatalogObjectKind = 'view' | 'materializedView' | 'table';
 /**
  * Defines the structure for schema change information passed to xAlterSchema
  */
-export type SchemaChangeInfo =
+export type SchemaChangeInfo = (
 	| {
 		type: 'addColumn';
 		columnDef: ColumnDef;
@@ -710,7 +717,26 @@ export type SchemaChangeInfo =
 		setDataType?: string;
 		setDefault?: Expression | null;
 		setCollation?: string;
-	};
+	}
+) & {
+	/**
+	 * Canonical, fully-qualified SQL for the ONE statement this call carries out —
+	 * the text a peer re-executes to reproduce it. Set by the engine only for the
+	 * call that IS the statement's action (rendered at plan-build time from the
+	 * resolved table reference, so the table identifier is schema-qualified
+	 * regardless of how the user spelled it).
+	 *
+	 * ABSENT means "engine-internal sub-step" — the inline-constraint installs and
+	 * revert calls of `runAddColumn`, and the materialized-view backing reshapes —
+	 * and a module must emit NO schema-change event for that call. The rule an
+	 * emitter-backed module owes: emit a schema-change event for an `alterTable`
+	 * call **iff** `ddl` is set, and put this text on the event. This is what keeps
+	 * one statement = one event (`add column x text unique` is one `addColumn` call
+	 * plus one `addConstraint` call, but announces once, with the whole statement's
+	 * text). See `docs/module-authoring.md` § Schema Changes.
+	 */
+	readonly ddl?: string;
+};
 
 /**
  * Type alias for the common usage pattern where specific table and config types are not known.

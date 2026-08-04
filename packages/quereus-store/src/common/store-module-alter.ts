@@ -116,6 +116,23 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// common case, incl. PK/collation/type ALTERs whose physical re-encode is already
 		// handled by `rebuildSecondaryIndexes`).
 		await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, oldSchema);
+
+		// ONE event per statement, decided here — the single gate for every arm: emit iff
+		// the engine marked this call as the statement's own action (`change.ddl` set), and
+		// put that text on the event. Engine-internal sub-steps — the inline-constraint
+		// installs and revert calls of the engine's ADD COLUMN, the materialized-view
+		// backing reshapes — arrive with no `ddl` and announce nothing, which is what keeps
+		// `add column x text unique` (one addColumn call + one addConstraint call) at
+		// exactly one announced event. See `SchemaChangeInfo.ddl`.
+		if (change.ddl !== undefined) {
+			this.eventEmitter?.emitSchemaChange({
+				type: 'alter',
+				objectType: 'table',
+				schemaName,
+				objectName: tableName,
+				ddl: change.ddl,
+			});
+		}
 		return updated;
 	}
 
@@ -220,13 +237,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// column-only.
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
-
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: tableName,
-		});
 
 		return updatedSchema;
 	}
@@ -338,13 +348,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			await this.tearDownIndexStore(schemaName, tableName, table, removed.name);
 		}
 
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: tableName,
-		});
-
 		return updatedSchema;
 	}
 
@@ -427,13 +430,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			throw e;
 		}
 
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: tableName,
-		});
-
 		return updatedSchema;
 	}
 
@@ -476,13 +472,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: tableName,
-		});
-
 		return updatedSchema;
 	}
 
@@ -490,8 +479,8 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 	 *  (UNIQUE / FOREIGN KEY / CHECK) requires, then persist. Behavior-preserving extraction. */
 	private async alterAddConstraint(
 		db: Database,
-		schemaName: string,
-		tableName: string,
+		_schemaName: string,
+		_tableName: string,
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'addConstraint' }>,
@@ -550,21 +539,14 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: tableName,
-		});
-
 		return updatedSchema;
 	}
 
 	/** DROP CONSTRAINT arm of {@link alterTable}: schema-only catalog rewrite dropping a named
 	 *  constraint, then persist. Behavior-preserving extraction. */
 	private async alterDropConstraint(
-		schemaName: string,
-		tableName: string,
+		_schemaName: string,
+		_tableName: string,
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'dropConstraint' }>,
@@ -597,13 +579,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: tableName,
-		});
-
 		return updatedSchema;
 	}
 
@@ -612,8 +587,8 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 	 *  `reconcileImplicitUniqueIndexStores` (run after this arm) MOVES the physical store —
 	 *  tears down the old-named store and rebuilds the new-named one from effective rows. */
 	private async alterRenameConstraint(
-		schemaName: string,
-		tableName: string,
+		_schemaName: string,
+		_tableName: string,
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'renameConstraint' }>,
@@ -646,13 +621,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
-
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: tableName,
-		});
 
 		return updatedSchema;
 	}

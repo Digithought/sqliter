@@ -1,12 +1,12 @@
 /**
- * ALTER TABLE does not replicate today (see `tickets/backlog/feat-sync-replicate-alter-table.md`):
- * an `alter_column` migration always carries a blank DDL, so it crosses the wire
- * as an empty statement and the receiver runs nothing. Neither end used to say
- * so. These specs cover the warning added at each end — origin
- * (`recordSchemaMigration`, sync-manager-impl.ts) and receiver
- * (`applySchemaChange`, store-adapter.ts) — and that `create_table` / `drop_table`
- * / `add_index` / `drop_index`, which all carry real DDL, never trigger either
- * warning.
+ * ALTER TABLE replicates: the schema-change event carries the statement's canonical DDL
+ * (see `SchemaChangeInfo.ddl` in the engine), so an `alter_column` migration crosses the
+ * wire with real text and the receiver re-executes it. These specs pin the ends of that
+ * path — the origin records a non-blank migration without the old "will not reach other
+ * synced devices" warning, the receiver applies the alteration without the old "no DDL"
+ * warning — and that `create_table` / `drop_table` / `add_index` / `drop_index` still
+ * never warn. The two warnings themselves remain in the code for migrations from
+ * older-build peers, which can still arrive blank.
  */
 
 import { expect } from 'chai';
@@ -42,7 +42,7 @@ async function captureWarnings(body: () => Promise<void>): Promise<string[]> {
 	return warns;
 }
 
-describe('alter table sync warnings', () => {
+describe('alter table sync replication', () => {
 	let a: Peer;
 	let b: Peer;
 
@@ -55,58 +55,50 @@ describe('alter table sync warnings', () => {
 		await closePeer(b);
 	});
 
-	it('warns on the origin when an ALTER TABLE commits, and still records the migration', async () => {
+	it('records a non-blank alter_column migration on the origin, with no warning', async () => {
 		const versionBefore = await a.manager.schemaMigrations.getCurrentVersion('main', 'table', 'orders');
 
 		const warns = await captureWarnings(async () => {
-			await localWrite(a, 'alter table orders add column qty integer');
+			await localWrite(a, 'alter table orders add column qty integer null');
 		});
 
-		// One alter event → exactly one warning; the origin's wording ("will not reach
-		// other synced devices") is what distinguishes it from the receiver's.
-		const orderWarns = warns.filter(w => w.includes('main.orders'));
-		expect(orderWarns).to.have.length(1);
-		expect(orderWarns[0].toLowerCase()).to.include('alter_column');
-		expect(orderWarns[0].toLowerCase()).to.include('not reach other synced devices');
+		// The old origin-side "will not reach other synced devices" warning fired on a
+		// blank-DDL alter_column; the event now carries the statement's canonical SQL.
+		expect(warns.filter(w => w.includes('main.orders'))).to.deep.equal([]);
 
 		const versionAfter = await a.manager.schemaMigrations.getCurrentVersion('main', 'table', 'orders');
 		expect(versionAfter).to.equal(versionBefore + 1);
 	});
 
-	it('warns on the receiver when relaying that migration, without error, and still advances its schema version', async () => {
-		await localWrite(a, 'alter table orders add column qty integer');
+	it('the receiver executes the relayed alteration, with no warning', async () => {
+		await localWrite(a, 'alter table orders add column qty integer null');
 		const versionBefore = await b.manager.schemaMigrations.getCurrentVersion('main', 'table', 'orders');
 
 		const warns = await captureWarnings(async () => {
 			await relayAll(a, b);
 		});
 
-		// Must be the RECEIVER's warning, not an origin one leaking into the window:
-		// both name `main.orders` and `alter_column`, so key on the receive-side wording.
-		const receiveWarns = warns.filter(w => w.includes('main.orders') && w.includes('Received'));
-		expect(receiveWarns).to.have.length(1);
-		expect(receiveWarns[0]).to.include('alter_column');
-		expect(receiveWarns[0]).to.include('no DDL');
+		// No receive-side "no DDL" warning: the migration carried real text.
+		expect(warns.filter(w => w.includes('main.orders'))).to.deep.equal([]);
 
 		const versionAfter = await b.manager.schemaMigrations.getCurrentVersion('main', 'table', 'orders');
 		expect(versionAfter).to.equal(versionBefore + 1);
 
-		// The blank-DDL migration ran nothing — b's table shape is unchanged.
+		// The migration's DDL actually ran — b's table gained the column.
 		const columns = b.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase());
-		expect(columns).to.not.include('qty');
+		expect(columns).to.include('qty');
 	});
 
-	// ADD COLUMN is only one of the alterations that lose their DDL: rename, drop and
-	// constraint changes all emit the same bare `alter`/`table` event, so each must
-	// warn too — otherwise the gap stays silent for exactly the cases an operator is
-	// least likely to notice by looking at the data.
+	// ADD COLUMN is only one of the alterations; rename, drop and constraint changes all
+	// emit the same one-event-per-statement `alter`/`table` shape and must carry their
+	// own statement text the same way.
 	const ALTER_FORMS = [
 		'alter table orders rename column note to memo',
 		'alter table orders add constraint orders_memo_u unique (memo)',
 		'alter table orders drop column extra',
 	];
 
-	it('warns on the origin for every ALTER TABLE form, one warning each', async () => {
+	it('no ALTER TABLE form warns on the origin', async () => {
 		const peer = await makePeer('forms', {
 			createOrders: true,
 			ordersDdl: 'create table orders (id integer primary key, note text, extra text) using store',
@@ -114,12 +106,34 @@ describe('alter table sync warnings', () => {
 		try {
 			for (const sql of ALTER_FORMS) {
 				const warns = await captureWarnings(async () => { await localWrite(peer, sql); });
-				const orderWarns = warns.filter(w => w.includes('main.orders'));
-				expect(orderWarns, sql).to.have.length(1);
-				expect(orderWarns[0].toLowerCase(), sql).to.include('alter_column');
+				expect(warns.filter(w => w.includes('main.orders')), sql).to.deep.equal([]);
 			}
 		} finally {
 			await closePeer(peer);
+		}
+	});
+
+	it('every ALTER TABLE form replicates to the peer', async () => {
+		const x = await makePeer('forms-x', {
+			createOrders: true,
+			ordersDdl: 'create table orders (id integer primary key, note text, extra text) using store',
+		});
+		const y = await makePeer('forms-y', {
+			createOrders: true,
+			ordersDdl: 'create table orders (id integer primary key, note text, extra text) using store',
+		});
+		try {
+			for (const sql of ALTER_FORMS) {
+				await localWrite(x, sql);
+				await relayAll(x, y);
+			}
+			const columns = y.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase());
+			expect(columns).to.deep.equal(['id', 'memo']);
+			const uniques = (y.db.schemaManager.getTable('main', 'orders')!.uniqueConstraints ?? []).map(uc => uc.name);
+			expect(uniques).to.include('orders_memo_u');
+		} finally {
+			await closePeer(x);
+			await closePeer(y);
 		}
 	});
 

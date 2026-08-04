@@ -64,6 +64,9 @@ export interface DatabaseSchemaChangeEvent {
 	schemaName: string;
 	/** Object name (table name for table/column, index name for index) */
 	objectName: string;
+	/** Old object name — `RENAME TO` only: the table name before the rename
+	 *  (`objectName` carries the new one). Companion to `oldColumnName`. */
+	oldObjectName?: string;
 	/** Column name (for column operations) */
 	columnName?: string;
 	/** Old column name (for column rename) */
@@ -803,6 +806,7 @@ export class DatabaseEventEmitter {
 			moduleName,
 			schemaName: event.schemaName,
 			objectName: event.objectName,
+			oldObjectName: event.oldObjectName,
 			columnName: event.columnName,
 			oldColumnName: event.oldColumnName,
 			ddl: event.ddl,

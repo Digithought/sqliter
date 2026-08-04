@@ -164,6 +164,14 @@ export class AlterTableNode extends VoidNode {
 		scope: Scope,
 		public readonly table: TableReferenceNode,
 		public readonly action: AlterTableAction,
+		/**
+		 * Canonical, fully-qualified SQL of the whole statement, rendered at plan-build
+		 * time from the resolved table reference (see `buildAlterTableStmt`). The runtime
+		 * arms thread it to `module.alterTable` / `module.renameTable` as
+		 * `SchemaChangeInfo.ddl` and onto the public schema-change event, so the
+		 * announcement carries the text a peer re-executes to reproduce the change.
+		 */
+		public readonly sql: string,
 	) {
 		super(scope);
 	}

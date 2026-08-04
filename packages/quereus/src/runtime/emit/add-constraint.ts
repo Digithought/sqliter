@@ -54,10 +54,10 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 		// against the module's stale schema reported it missing (and a later module-routed
 		// ALTER returned a schema that silently dropped it from the catalog).
 		if (constraint.type === 'check' && !tableSchema.vtabModule?.alterTable) {
-			return runAddCheckEngineSide(rctx, tableSchema, schema, constraint);
+			return runAddCheckEngineSide(rctx, tableSchema, schema, constraint, plan.sql);
 		}
 
-		return runAddConstraintViaModule(rctx, tableSchema, schema, constraint);
+		return runAddConstraintViaModule(rctx, tableSchema, schema, constraint, plan.sql);
 	}
 
 	return {
@@ -79,6 +79,7 @@ async function runAddCheckEngineSide(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	constraint: AddConstraintNode['constraint'],
+	sql: string,
 ): Promise<SqlValue> {
 	if (!constraint.expr) {
 		throw new QuereusError(
@@ -117,6 +118,7 @@ async function runAddCheckEngineSide(
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'table',
 		objectName: tableSchema.name,
+		ddl: sql,
 	});
 
 	log('Added CHECK constraint %s to table %s.%s', constraintSchema.name, tableSchema.schemaName, tableSchema.name);
@@ -129,6 +131,7 @@ async function runAddConstraintViaModule(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	constraint: AddConstraintNode['constraint'],
+	sql: string,
 ): Promise<SqlValue> {
 	const module = requireVtabModule(tableSchema);
 	if (!module.alterTable) {
@@ -176,11 +179,13 @@ async function runAddConstraintViaModule(
 		assertUniqueConstraintIndexNameFree(tableSchema, constraint.name, columnNames, operation);
 	}
 
+	// `ddl` marks this call as the statement's own action — unlike the per-inline-constraint
+	// installs `runAddColumn` makes through the same arm, which pass none and stay silent.
 	const updatedTableSchema = await module.alterTable(
 		rctx.db,
 		tableSchema.schemaName,
 		tableSchema.name,
-		{ type: 'addConstraint', constraint },
+		{ type: 'addConstraint', constraint, ddl: sql },
 	);
 
 	schema.addTable(updatedTableSchema);
@@ -196,6 +201,7 @@ async function runAddConstraintViaModule(
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'table',
 		objectName: tableSchema.name,
+		ddl: sql,
 	});
 
 	log('Added %s constraint %s to table %s.%s',

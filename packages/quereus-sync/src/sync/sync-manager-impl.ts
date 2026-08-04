@@ -865,13 +865,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 		const { schemaName, objectName, ddl } = event;
 
-		// `alter_column` is the only tracked type that legitimately reaches here with
-		// no DDL — create/drop table and add/drop index all carry canonical text (see
-		// the store module's emit sites). The migration below still records and still
-		// advances the schema version (destructiveness comparison depends on it), but
-		// nothing here reaches a peer, so a device that alters a table stays silently
-		// diverged unless an operator sees this.
-		// See tickets/backlog/feat-sync-replicate-alter-table.md.
+		// Every tracked type now carries canonical DDL — ALTER TABLE events included
+		// (the engine renders the statement's schema-qualified SQL at plan-build and the
+		// store module puts it on the event; see SchemaChangeInfo.ddl). A blank
+		// `alter_column` can therefore only come from an older event producer; the
+		// migration below still records and still advances the schema version
+		// (destructiveness comparison depends on it), but a blank one reaches a peer as
+		// an empty statement, so it is still worth an operator hearing about.
 		if (migrationType === 'alter_column' && !ddl?.trim()) {
 			console.warn(
 				`[Sync] ${schemaName}.${objectName}: recording an ${migrationType} migration with no DDL — `

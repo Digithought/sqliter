@@ -16,7 +16,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import assert from 'node:assert/strict';
-import { Database, type DatabaseDataChangeEvent } from '@quereus/quereus';
+import { Database, Parser, type DatabaseDataChangeEvent, type DatabaseSchemaChangeEvent } from '@quereus/quereus';
 import {
 	StoreModule,
 	StoreEventEmitter,
@@ -331,5 +331,165 @@ describe('Store-backed ALTER TABLE mid-transaction: events keep the delivered sc
 		assert.equal(dml.length, 2);
 		assert.deepEqual(dml[0].newRow, [1, 'a', 'z']);
 		assert.deepEqual(dml[1].newRow, [2, 'b', 'c']);
+	});
+});
+
+/**
+ * Every ALTER TABLE statement's schema-change event carries the statement's canonical,
+ * fully-qualified SQL in `ddl` — the text a sync peer re-executes to reproduce the change
+ * — under the one-event-per-statement rule: the store module emits iff the engine marked
+ * the module call with `change.ddl` (see SchemaChangeInfo.ddl), so engine-internal
+ * sub-steps (inline-constraint installs, failed-ALTER reverts) announce nothing.
+ * A rename additionally carries `oldObjectName`, since `objectName` names only the new
+ * table. Driven end to end over a real Database + StoreModule + StoreEventEmitter.
+ */
+describe('Store-backed ALTER TABLE: the schema-change event describes the alteration', () => {
+	let db: Database;
+	let provider: KVStoreProvider;
+	let schemaEvents: DatabaseSchemaChangeEvent[];
+	let unsub: () => void;
+
+	beforeEach(async () => {
+		provider = createInMemoryProvider();
+		db = new Database();
+		db.registerModule('store', new StoreModule(provider, new StoreEventEmitter()));
+		schemaEvents = [];
+		unsub = db.onSchemaChange(e => schemaEvents.push(e));
+	});
+
+	afterEach(async () => {
+		unsub();
+		await db.close();
+		await provider.closeAll();
+	});
+
+	/** The alter-shaped events on table `name` (create/drop table stay out of the way). */
+	function alterEvents(name: string): DatabaseSchemaChangeEvent[] {
+		return schemaEvents.filter(e =>
+			(e.objectName === name || e.oldObjectName === name) && e.type !== 'create');
+	}
+
+	/** Runs one ALTER statement and asserts it announced exactly one event carrying `ddl`. */
+	async function assertSingleEventDdl(statement: string, expectedDdl: string): Promise<void> {
+		const before = schemaEvents.length;
+		await db.exec(statement);
+		const emitted = schemaEvents.slice(before);
+		assert.equal(emitted.length, 1, `expected 1 schema event for '${statement}', got ${emitted.length}: ${JSON.stringify(emitted)}`);
+		assert.equal(emitted[0].ddl, expectedDdl);
+		// The wire contract: every announced ddl must re-parse.
+		assert.doesNotThrow(() => new Parser().parse(emitted[0].ddl!));
+	}
+
+	it('every ALTER arm announces its own canonical statement text', async () => {
+		await db.exec('create table orders (id integer primary key, v text, w text null) using store');
+
+		// Hand-typed expectations (not round-tripped through the stringifier), so a silent
+		// rendering change is visible here.
+		await assertSingleEventDdl(
+			'alter table orders add column sku text null',
+			'alter table orders add column sku text null');
+		await assertSingleEventDdl(
+			'alter table orders rename column v to vv',
+			'alter table orders rename column v to vv');
+		await assertSingleEventDdl(
+			"alter table orders alter column vv set default 'x'",
+			"alter table orders alter column vv set default 'x'");
+		await assertSingleEventDdl(
+			'alter table orders alter column vv drop default',
+			'alter table orders alter column vv drop default');
+		await assertSingleEventDdl(
+			'alter table orders alter column vv set data type text',
+			'alter table orders alter column vv set data type text');
+		await assertSingleEventDdl(
+			'alter table orders alter column vv set collate nocase',
+			'alter table orders alter column vv set collate nocase');
+		await assertSingleEventDdl(
+			'alter table orders alter column vv set not null',
+			'alter table orders alter column vv set not null');
+		await assertSingleEventDdl(
+			'alter table orders alter column vv drop not null',
+			'alter table orders alter column vv drop not null');
+		await assertSingleEventDdl(
+			'alter table orders add constraint c1 check (id > 0)',
+			'alter table orders add constraint c1 check (id > 0)');
+		await assertSingleEventDdl(
+			'alter table orders rename constraint c1 to c2',
+			'alter table orders rename constraint c1 to c2');
+		await assertSingleEventDdl(
+			'alter table orders drop constraint c2',
+			'alter table orders drop constraint c2');
+		await assertSingleEventDdl(
+			'alter table orders alter primary key (id)',
+			'alter table orders alter primary key (id)');
+		await assertSingleEventDdl(
+			'alter table orders drop column w',
+			'alter table orders drop column w');
+		await assertSingleEventDdl(
+			'alter table orders rename to orders2',
+			'alter table orders rename to orders2');
+	});
+
+	it('the rendered statement is canonical, not the spelling the user wrote', async () => {
+		// Redundant qualifier and keyword casing must land as the resolved, stored form —
+		// the text a receiver can execute without re-resolving against ITS default schema.
+		// (A data TYPE's casing is preserved as written; only the statement keywords and
+		// the table qualification are canonicalized.)
+		await db.exec('create table t (id integer primary key, v text) using store');
+		await assertSingleEventDdl(
+			'ALTER TABLE main.t ADD COLUMN w text NULL',
+			'alter table t add column w text null');
+	});
+
+	it('RENAME TO names both the new table and the one it renamed from', async () => {
+		await db.exec('create table orders (id integer primary key) using store');
+		await db.exec('alter table orders rename to orders2');
+
+		const renames = schemaEvents.filter(e => e.oldObjectName !== undefined);
+		assert.equal(renames.length, 1);
+		assert.equal(renames[0].objectName, 'orders2');
+		assert.equal(renames[0].oldObjectName, 'orders');
+		assert.equal(renames[0].ddl, 'alter table orders rename to orders2');
+	});
+
+	it('ADD COLUMN with inline constraints is ONE event carrying the whole statement', async () => {
+		// One statement, one inline UNIQUE → an addColumn module call plus an addConstraint
+		// module call, but only the first carries `ddl`, so exactly one announcement.
+		await db.exec('create table orders (id integer primary key, v text) using store');
+		await assertSingleEventDdl(
+			'alter table orders add column sku text unique',
+			'alter table orders add column sku text unique');
+	});
+
+	it('quoting round-trips: reserved-word column, quoted default, generated expression', async () => {
+		await db.exec('create table t (id integer primary key) using store');
+		await assertSingleEventDdl(
+			'alter table t add column "select" text null',
+			'alter table t add column "select" text null');
+		await assertSingleEventDdl(
+			"alter table t add column o text default 'O''Brien'",
+			"alter table t add column o text default 'O''Brien'");
+		await assertSingleEventDdl(
+			'alter table t add column g integer generated always as (id * 2)',
+			'alter table t add column g integer generated always as (id * 2)');
+	});
+
+	it('a failed ADD COLUMN announces nothing — not even its revert', async () => {
+		// The revert path routes dropConstraint + dropColumn back through the module; none
+		// of those calls carries `ddl`, so zero events. Driven inside an explicit
+		// transaction that then COMMITS other work, so a leaked event would actually be
+		// delivered rather than discarded by rollback.
+		await db.exec('create table t2 (id integer primary key, n integer) using store');
+		await db.exec('insert into t2 values (1, -5)');
+		await db.exec('begin');
+		await db.exec('insert into t2 values (2, 3)');
+		await assert.rejects(
+			db.exec('alter table t2 add column c integer default (new.n) check (c > 0)'));
+		await db.exec('commit');
+
+		assert.deepEqual(alterEvents('t2'), []);
+		// The transaction itself survived and committed its other work.
+		const rows: unknown[] = [];
+		for await (const row of db.eval('select id from t2 order by id')) rows.push(row);
+		assert.deepEqual(rows, [{ id: 1 }, { id: 2 }]);
 	});
 });

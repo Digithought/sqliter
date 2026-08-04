@@ -60,6 +60,9 @@ export interface VTableSchemaChangeEvent {
 	schemaName: string;
 	/** Object name (table name for table/column, index name for index) */
 	objectName: string;
+	/** Old object name — `RENAME TO` only: the table name before the rename
+	 *  (`objectName` carries the new one). Companion to `oldColumnName`. */
+	oldObjectName?: string;
 	/** Column name (for column operations) */
 	columnName?: string;
 	/** Old column name (for column rename) */

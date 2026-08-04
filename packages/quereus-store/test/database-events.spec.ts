@@ -203,4 +203,28 @@ describe('Database-level events: store-backed DML single-emit', () => {
 			unsub();
 		}
 	});
+
+	// The two ALTER event producers — the engine's auto path (memory: no module emitter)
+	// and the store module's own emitter — must announce the SAME canonical `ddl` for the
+	// same statement: both read the plan-build rendering, one via emitAlterSchemaEvent and
+	// one via SchemaChangeInfo.ddl. A drift here means a peer replays different statements
+	// depending on which backend the table happens to live on.
+	it('the engine auto path and the store module path announce identical ddl for the same statement', async () => {
+		await db.exec('create table m (id integer primary key, v text)'); // memory — auto path
+		const schemaEvents: DatabaseSchemaChangeEvent[] = [];
+		const unsub = db.onSchemaChange(e => schemaEvents.push(e));
+		try {
+			await db.exec('alter table t add column w text null');   // store — module path
+			await db.exec('alter table m add column w text null');   // memory — auto path
+			assert.equal(schemaEvents.length, 2,
+				`expected 2 schema events, got ${schemaEvents.length}: ${JSON.stringify(schemaEvents)}`);
+			const [storeEvent, memoryEvent] = schemaEvents;
+			assert.equal(storeEvent.ddl, 'alter table t add column w text null');
+			assert.equal(memoryEvent.ddl, 'alter table m add column w text null');
+			// Same statement shape, same rendering — only the table name differs.
+			assert.equal(storeEvent.ddl!.replace(' t ', ' m '), memoryEvent.ddl);
+		} finally {
+			unsub();
+		}
+	});
 });

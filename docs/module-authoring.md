@@ -730,7 +730,7 @@ passing a `SchemaChangeInfo` discriminated union as `change` and registering the
 The current arms of the union (`vtab/module.ts`):
 
 ```typescript
-export type SchemaChangeInfo =
+export type SchemaChangeInfo = (
 	| { type: 'addColumn'; columnDef: ColumnDef; backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>;
 	    insertAtIndex?: number }
 	| { type: 'dropColumn'; columnName: string }
@@ -740,8 +740,32 @@ export type SchemaChangeInfo =
 	| { type: 'dropConstraint'; constraintName: string }
 	| { type: 'renameConstraint'; oldName: string; newName: string }
 	| { type: 'alterColumn'; columnName: string;
-	    setNotNull?: boolean; setDataType?: string; setDefault?: Expression | null; setCollation?: string };
+	    setNotNull?: boolean; setDataType?: string; setDefault?: Expression | null; setCollation?: string }
+) & { readonly ddl?: string };
 ```
+
+### `ddl`: the emit-iff-set rule
+
+Every arm also carries an optional `ddl` — the statement's **canonical, fully-qualified
+SQL**, rendered by the engine at plan-build time from the *resolved* table reference (so
+an unqualified `alter table orders …` arrives qualified against the schema the table
+actually lives in, never re-resolved against a receiver's default schema). The engine
+sets it **only on the call that IS the statement's action**. A call without `ddl` is an
+engine-internal sub-step: the per-inline-constraint `addConstraint` follow-ups behind
+`ALTER TABLE … ADD COLUMN`, the `dropConstraint`/`dropColumn` calls of a failed ADD
+COLUMN's revert, and the materialized-view backing reshapes.
+
+> A module with its own event emitter emits a schema-change event for an `alterTable`
+> call **iff** `change.ddl` is set, and puts that text on the event.
+
+That is what keeps one statement = one event: `add column sku text unique` is one
+`addColumn` call plus one `addConstraint` call, but only the first carries `ddl`, so the
+module announces once — with the whole statement's text. A statement that unwound (the
+revert path) announces nothing at all. The `renameTable` hook has the same contract via
+its trailing `ddl?: string` parameter; its event additionally carries `oldObjectName`
+(the pre-rename table name), since `objectName` names only the new one. A module without
+an emitter needs none of this — the engine's own ALTER arms announce the same text
+through the auto-event gate.
 
 ### Per-arm mandate
 

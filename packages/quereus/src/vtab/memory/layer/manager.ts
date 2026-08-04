@@ -1689,13 +1689,9 @@ export class MemoryTableManager {
 		// rows at COMMIT.
 		this.adoptSchemaOnOpenLayers(renamed);
 
-		// Emit schema change event
-		this.eventEmitter?.emitSchemaChange?.({
-			type: 'alter',
-			objectType: 'table',
-			schemaName: this.schemaName,
-			objectName: newName,
-		});
+		// No emit here (or in any other ALTER-arm manager method): the module-level
+		// `alterTable`/`renameTable` raises the statement's ONE schema event, gated on the
+		// engine-set `change.ddl` — so a wrapper-driven manager call announces nothing.
 	}
 
 	/**
@@ -2137,21 +2133,6 @@ export class MemoryTableManager {
 			this.initializePrimaryKeyFunctions();
 			this.installReshapeOnOpenLayers(finalNewTableSchema, reshapePlans);
 
-			// Emit schema change event.
-			// NOTE: the event names the added column but not its position, which is fine while
-			// the only non-append caller is an in-process wrapper that rebuilds its view from the
-			// post-change schema. An append never invalidates an existing column index; an insert
-			// does. If a position ever becomes SQL-reachable, anything that caches a column index
-			// across this swap (planner caches, prepared statements, a wrapper's own schema
-			// snapshot) needs to learn the insert point — so the event would have to carry it.
-			this.eventEmitter?.emitSchemaChange?.({
-				type: 'alter',
-				objectType: 'column',
-				schemaName: this.schemaName,
-				objectName: this._tableName,
-				columnName: newColumnSchema.name,
-			});
-
 			logger.operation('Add Column', this._tableName, { columnName: newColumnSchema.name });
 		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
@@ -2229,15 +2210,6 @@ export class MemoryTableManager {
 			for (const key of droppedUcKeys) this.implicitCoveringStructures.delete(key);
 			this.initializePrimaryKeyFunctions();
 			this.installReshapeOnOpenLayers(finalNewTableSchema, reshapePlans);
-
-			// Emit schema change event
-			this.eventEmitter?.emitSchemaChange?.({
-				type: 'drop',
-				objectType: 'column',
-				schemaName: this.schemaName,
-				objectName: this._tableName,
-				columnName,
-			});
 
 			logger.operation('Drop Column', this._tableName, { columnName });
 		} catch (e: unknown) {
@@ -2351,16 +2323,6 @@ export class MemoryTableManager {
 			// `test/logic/41.8-alter-savepoint-staged-rows.sqllogic`.
 			this.adoptSchemaOnOpenLayers(finalNewTableSchema);
 
-			// Emit schema change event
-			this.eventEmitter?.emitSchemaChange?.({
-				type: 'alter',
-				objectType: 'column',
-				schemaName: this.schemaName,
-				objectName: this._tableName,
-				columnName: newColumnName,
-				oldColumnName: oldName,
-			});
-
 			logger.operation('Rename Column', this._tableName, { oldName, newName: newColumnName });
 		} catch (e: unknown) {
 			// The predicate ASTs are shared with the catalog's TableSchema, so restoring
@@ -2444,14 +2406,6 @@ export class MemoryTableManager {
 			this.initializePrimaryKeyFunctions();
 
 			this.propagateAlterColumnToOpenLayers(plan);
-
-			this.eventEmitter?.emitSchemaChange?.({
-				type: 'alter',
-				objectType: 'column',
-				schemaName: this.schemaName,
-				objectName: this._tableName,
-				columnName: change.columnName,
-			});
 
 			logger.operation('Alter Column', this._tableName, { columnName: change.columnName });
 		} catch (e: unknown) {
@@ -2556,13 +2510,6 @@ export class MemoryTableManager {
 			for (const { layer, prepared } of plans) {
 				layer.installRekeyedPrimaryKeyColumns(newSchema, prepared);
 			}
-
-			this.eventEmitter?.emitSchemaChange?.({
-				type: 'alter',
-				objectType: 'table',
-				schemaName: this.schemaName,
-				objectName: this._tableName,
-			});
 
 			logger.operation('Alter Primary Key', this._tableName, {
 				columns: newSchema.primaryKeyDefinition.map(def => def.index),
@@ -2981,13 +2928,6 @@ export class MemoryTableManager {
 			// equivalent schema, holding no per-layer structure).
 			this.adoptSchemaOnOpenLayers(newSchema);
 
-			this.eventEmitter?.emitSchemaChange?.({
-				type: 'alter',
-				objectType: 'table',
-				schemaName: this.schemaName,
-				objectName: this._tableName,
-			});
-
 			logger.operation('Drop Constraint', this._tableName, { constraintName });
 		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
@@ -3070,13 +3010,6 @@ export class MemoryTableManager {
 			// restored across this ALTER and drops the transaction's staged rows at COMMIT.
 			this.adoptSchemaOnOpenLayers(newSchema);
 
-			this.eventEmitter?.emitSchemaChange?.({
-				type: 'alter',
-				objectType: 'table',
-				schemaName: this.schemaName,
-				objectName: this._tableName,
-			});
-
 			logger.operation('Rename Constraint', this._tableName, { oldName, newName });
 		} catch (e: unknown) {
 			this.baseLayer.updateSchema(originalManagerSchema);
@@ -3128,13 +3061,6 @@ export class MemoryTableManager {
 					StatusCode.UNSUPPORTED,
 				);
 			}
-
-			this.eventEmitter?.emitSchemaChange?.({
-				type: 'alter',
-				objectType: 'table',
-				schemaName: this.schemaName,
-				objectName: this._tableName,
-			});
 
 			logger.operation('Add Constraint', this._tableName, { type: constraint.type, name: constraint.name });
 		} catch (e: unknown) {

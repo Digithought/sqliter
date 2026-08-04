@@ -279,13 +279,8 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: tableName,
-		});
-
+		// No emit here: the dispatcher (`StoreModuleAlter.alterTable`) raises the ONE
+		// event per statement after every arm, gated on `change.ddl`.
 		return updatedSchema;
 	}
 }

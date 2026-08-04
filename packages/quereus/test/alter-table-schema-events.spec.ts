@@ -17,14 +17,13 @@
  *    support, and re-deciding that at the new call sites is what would make both producers
  *    fire.
  *
- * Deliberate divergences from the emitting backend, both asserted below:
- *  - `add column … <inline constraint>` raises ONE `alter`/`column` event on the engine path,
- *    where the emitting module raises a second `alter`/`table` per inline constraint — an
- *    artifact of its own extra `alterTable(addConstraint)` round-trip, not a second thing the
- *    application did.
- *  - the tag arms (`SET`/`ADD`/`DROP TAGS`) and the materialized-view lifecycle arms
- *    (`SET`/`DROP MAINTAINED`) raise nothing on either path — see
- *    `backlog/feat-alter-table-tags-emit-no-schema-event`.
+ * Both paths now agree on one event per statement: the module emits iff the engine marked
+ * the call with `change.ddl` (the statement's canonical SQL, set only on the call that IS
+ * the statement's action), so `add column … <inline constraint>` announces once on either
+ * path, carrying the whole statement's text. The remaining deliberate silence: the tag arms
+ * (`SET`/`ADD`/`DROP TAGS`) and the materialized-view lifecycle arms (`SET`/`DROP
+ * MAINTAINED`) raise nothing on either path — see
+ * `backlog/feat-alter-table-tags-emit-no-schema-event`.
  */
 
 import assert from 'node:assert/strict';
@@ -153,8 +152,19 @@ describe('ALTER TABLE raises a schema-change event on the engine\'s own path', (
 			assert.equal(e.moduleName, 'memory');
 			assert.equal(e.schemaName, 'main');
 			assert.equal(e.remote, false);
-			// The fallback carries no DDL text, matching every other auto event.
-			assert.equal(e.ddl, undefined);
+			// Unlike the other auto events, the ALTER ones DO carry the statement's
+			// canonical DDL — the text a sync peer re-executes.
+			assert.equal(e.ddl, 'alter table t add column w text null');
+		});
+
+		it('rename to carries the old table name and the statement text', async () => {
+			await db.exec('create table t (id integer primary key)');
+			await db.exec('alter table t rename to t2');
+
+			const [e] = alterEvents();
+			assert.equal(e.objectName, 't2');
+			assert.equal(e.oldObjectName, 't');
+			assert.equal(e.ddl, 'alter table t rename to t2');
 		});
 	});
 
@@ -400,12 +410,22 @@ describe('ALTER TABLE on an emitter-backed module emits exactly once', () => {
 		assert.deepEqual(alterEvents().map(shape), ['alter/table/t', 'alter/table/t']);
 	});
 
-	// The one knowing divergence from the engine's fallback, pinned on BOTH sides so neither
-	// can drift unnoticed: the arm's extra `alterTable(addConstraint)` round-trip is visible
-	// here as a second event, where the fallback reports one (see the engine describe above).
-	it('add column with an inline constraint reports the module\'s extra constraint event', async () => {
+	// Formerly the one knowing divergence from the engine's fallback: the arm's extra
+	// `alterTable(addConstraint)` round-trip used to surface here as a second event. The
+	// emit-iff-`change.ddl` rule retired it — only the `addColumn` call carries the
+	// statement's `ddl`, so the module announces once, with the whole statement's text.
+	it('add column with an inline constraint reports exactly one event carrying the whole statement', async () => {
 		await db.exec('create table t (id integer primary key)');
 		await db.exec('alter table t add column w text null unique');
-		assert.deepEqual(alterEvents().map(shape), ['alter/column/t/w', 'alter/table/t']);
+		assert.deepEqual(alterEvents().map(shape), ['alter/column/t/w']);
+		assert.equal(alterEvents()[0].ddl, 'alter table t add column w text null unique');
+	});
+
+	it('rename to carries oldObjectName and the statement text, like the engine path', async () => {
+		await db.exec('create table t (id integer primary key)');
+		await db.exec('alter table t rename to t2');
+		const [e] = alterEvents();
+		assert.equal(e.oldObjectName, 't');
+		assert.equal(e.ddl, 'alter table t rename to t2');
 	});
 });

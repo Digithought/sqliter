@@ -13,10 +13,16 @@ export interface AlterSchemaEventShape {
 	objectType: 'table' | 'column';
 	/** Table name — the NEW one for RENAME TO. */
 	objectName: string;
+	/** RENAME TO only: the table name it had before. */
+	oldObjectName?: string;
 	/** The column the arm touched, for the `column` arms. */
 	columnName?: string;
 	/** RENAME COLUMN only: the name it had before. */
 	oldColumnName?: string;
+	/** Canonical, fully-qualified SQL of the statement — the node's plan-build
+	 *  rendering (`AlterTableNode.sql` / `AddConstraintNode.sql`), so the auto
+	 *  path announces the identical text an emitter-backed module does. */
+	ddl?: string;
 }
 
 /**
@@ -35,10 +41,13 @@ export interface AlterSchemaEventShape {
  * change that then unwound is worse than the intra-statement ordering drift, and that drift
  * is unobservable — each arm produces exactly one event and delivery is batched to commit.
  *
- * The event carries no `ddl`, matching every other auto event (see the NOTE on
- * `emitAutoSchemaEventIfNeeded`), and a rename names only the NEW table —
- * `DatabaseSchemaChangeEvent` has no old-object-name field, and the emitting backends have
- * the identical gap, so parity holds.
+ * Unlike the other auto events (see the NOTE on `emitAutoSchemaEventIfNeeded`), the ALTER
+ * ones DO carry `ddl`: the planner renders the statement's canonical, schema-qualified SQL
+ * once at plan-build time (`AlterTableNode.sql` / `AddConstraintNode.sql`) and every arm
+ * passes it here, so a memory-backed and a store-backed alteration announce the same
+ * string — the text a sync peer re-executes. A rename also carries `oldObjectName`, since
+ * `objectName` names only the NEW table and a receiver could not otherwise tell which of
+ * its tables the event is about.
  */
 export function emitAlterSchemaEvent(
 	rctx: RuntimeContext,

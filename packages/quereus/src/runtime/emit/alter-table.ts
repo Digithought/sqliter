@@ -106,25 +106,25 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 
 		switch (action.type) {
 			case 'renameTable':
-				return runRenameTable(rctx, tableSchema, schema, action.newName);
+				return runRenameTable(rctx, tableSchema, schema, action.newName, plan.sql);
 			case 'renameColumn':
-				return runRenameColumn(rctx, tableSchema, schema, action.oldName, action.newName);
+				return runRenameColumn(rctx, tableSchema, schema, action.oldName, action.newName, plan.sql);
 			case 'addColumn': {
 				// Slot order set in `params`: backfill callback first (if any), then check callbacks.
 				const backfillCb = backfill ? (args[0] as SubProgram) : undefined;
 				const checkCbs = (args.slice(backfill ? 1 : 0) as SubProgram[]);
-				return runAddColumn(rctx, tableSchema, schema, action.column, backfill, backfillCb, checks, checkCbs);
+				return runAddColumn(rctx, tableSchema, schema, action.column, plan.sql, backfill, backfillCb, checks, checkCbs);
 			}
 			case 'dropColumn':
-				return runDropColumn(rctx, tableSchema, schema, action.name);
+				return runDropColumn(rctx, tableSchema, schema, action.name, plan.sql);
 			case 'dropConstraint':
-				return runDropConstraint(rctx, tableSchema, schema, action.name);
+				return runDropConstraint(rctx, tableSchema, schema, action.name, plan.sql);
 			case 'renameConstraint':
-				return runRenameConstraint(rctx, tableSchema, schema, action.oldName, action.newName);
+				return runRenameConstraint(rctx, tableSchema, schema, action.oldName, action.newName, plan.sql);
 			case 'alterPrimaryKey':
-				return runAlterPrimaryKey(rctx, tableSchema, schema, action.columns);
+				return runAlterPrimaryKey(rctx, tableSchema, schema, action.columns, plan.sql);
 			case 'alterColumn':
-				return runAlterColumn(rctx, tableSchema, schema, action);
+				return runAlterColumn(rctx, tableSchema, schema, action, plan.sql);
 			case 'setTags': {
 				const target = action.target;
 				if (action.mode === 'merge') {
@@ -193,6 +193,7 @@ async function runRenameTable(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	newName: string,
+	sql: string,
 ): Promise<SqlValue> {
 	const oldName = tableSchema.name;
 
@@ -230,7 +231,9 @@ async function runRenameTable(
 	// omit the hook.
 	const module = requireVtabModule(tableSchema);
 	if (module.renameTable) {
-		await module.renameTable(rctx.db, tableSchema.schemaName, oldName, newName);
+		// `sql` marks this call as the statement's own action: an emitter-backed module
+		// emits its schema-change event iff it is present (see VirtualTableModule.renameTable).
+		await module.renameTable(rctx.db, tableSchema.schemaName, oldName, newName, sql);
 	}
 
 	// Events this transaction already recorded still carry the OLD name; relabel them so
@@ -241,9 +244,11 @@ async function runRenameTable(
 	// matching where the other ALTER arms call `remapBatchedDataEvents`.
 	//
 	// NOTE: batched SCHEMA events are deliberately out of scope here. A schema event
-	// records a DDL operation, not current state — relabelling `objectName` without
-	// rewriting its `ddl` text would produce an incoherent instruction. How a rename
-	// crosses the wire to a peer is `fix/sync-schema-migrations-replicate-empty-ddl`.
+	// records a DDL operation, not current state — each now carries the statement's own
+	// canonical `ddl` text (and, for a rename, `oldObjectName`), so relabelling
+	// `objectName` without rewriting that text would produce an incoherent instruction.
+	// A consumer replays the schema events in order; the rename is one of them, carrying
+	// this very statement's SQL, so earlier events legitimately name the old table.
 	rctx.db._getEventEmitter().renameBatchedEvents(tableSchema.schemaName, oldName, newName);
 
 	// Deferred constraint checks this transaction already parked carry evaluators compiled
@@ -320,9 +325,14 @@ async function runRenameTable(
 
 	// The public schema-change event, for a module with no emitter of its own — see
 	// {@link emitAlterSchemaEvent} for why every arm emits at its tail rather than
-	// alongside the module call. Names only the NEW table: `DatabaseSchemaChangeEvent`
-	// has no old-object-name field, and the emitting backends have the identical gap.
-	emitAlterSchemaEvent(rctx, tableSchema, { type: 'alter', objectType: 'table', objectName: newName });
+	// alongside the module call. `objectName` is the NEW table; `oldObjectName` says
+	// what it renamed FROM, so a receiver can tell which of its tables the event is about.
+	emitAlterSchemaEvent(rctx, tableSchema, {
+		type: 'alter', objectType: 'table',
+		objectName: newName,
+		oldObjectName: oldName,
+		ddl: sql,
+	});
 
 	log('Renamed table %s.%s to %s', tableSchema.schemaName, oldName, newName);
 	return null;
@@ -334,6 +344,7 @@ async function runRenameColumn(
 	schema: import('../../schema/schema.js').Schema,
 	oldName: string,
 	newName: string,
+	sql: string,
 ): Promise<SqlValue> {
 	const colIndex = tableSchema.columnIndexMap.get(oldName.toLowerCase());
 	if (colIndex === undefined) {
@@ -383,6 +394,7 @@ async function runRenameColumn(
 			oldName,
 			newName,
 			newColumnDefAst: newColumnDef,
+			ddl: sql,
 		});
 	} else {
 		// Schema-only rename (no data-level changes needed for rename)
@@ -433,6 +445,7 @@ async function runRenameColumn(
 		objectName: tableSchema.name,
 		columnName: newName,
 		oldColumnName: oldName,
+		ddl: sql,
 	});
 
 	log('Renamed column %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
@@ -523,6 +536,7 @@ async function runAddColumn(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	columnDef: ColumnDef,
+	sql: string,
 	backfill?: AddColumnBackfill,
 	backfillCb?: SubProgram,
 	checks?: AddColumnCheck,
@@ -700,10 +714,14 @@ async function runAddColumn(
 	// the inverse event remap.
 	let addedColIndex: number | undefined;
 	try {
+		// `ddl` marks this call — and only this one — as the statement's own action: the
+		// inline-constraint installs below and any revert calls pass none, so an
+		// emitter-backed module announces exactly ONE event for the whole statement.
 		updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
 			type: 'addColumn',
 			columnDef,
 			backfillEvaluator,
+			ddl: sql,
 		});
 
 		// Events this transaction already batched for the table still describe the
@@ -825,6 +843,9 @@ async function runAddColumn(
 			// orphans) and — store-backed — persists. Thread the returned schema forward so
 			// each constraint layers on the last. The module's answer carries no
 			// generated-column bookkeeping of its own, so re-derive it each round.
+			// Deliberately NO `ddl`: this is an engine-internal sub-step of the ADD COLUMN
+			// statement, so an emitter-backed module must announce nothing for it — the
+			// statement's one event rode the `addColumn` call above.
 			const withConstraint = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
 				type: 'addConstraint',
 				constraint,
@@ -852,14 +873,14 @@ async function runAddColumn(
 
 	// ONE event for the whole statement, even when the column declared inline constraints.
 	// The install loop above makes a second `module.alterTable(addConstraint)` round-trip per
-	// inline constraint, and an emitter-backed module therefore announces `alter`/`column`
-	// followed by an `alter`/`table` per constraint — an artifact of its internal call
-	// pattern, not a second thing the application did. The deliberate divergence from that
-	// shape: do not "fix" this into two events.
+	// inline constraint; an emitter-backed module now agrees on one event too, because only
+	// the `addColumn` call carried `ddl` and a module emits iff it is set. Do not "fix"
+	// this into per-constraint events on either path.
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'column',
 		objectName: tableSchema.name,
 		columnName: columnDef.name,
+		ddl: sql,
 	});
 
 	log('Added column %s to table %s.%s', columnDef.name, tableSchema.schemaName, tableSchema.name);
@@ -879,6 +900,11 @@ async function runAddColumn(
  * Best-effort on the module half: a revert failure is logged, never thrown, so it cannot
  * mask the original violation. Restoring the catalog entry is a no-op when the ALTER failed
  * before registering anything (the original schema is still the live one).
+ *
+ * Every module call here passes no `ddl`, deliberately: a statement that unwound must
+ * announce nothing at all, and an emitter-backed module emits only for a call carrying
+ * `ddl` — so neither the failed ADD COLUMN nor its unwinding leaves a schema event in
+ * the transaction's batch.
  *
  * NOTE: the hand-back is by NAME, so it assumes a name resolves to the constraint this
  * ALTER installed. A pre-existing constraint can legitimately share an auto-name (nothing
@@ -1055,6 +1081,7 @@ async function runDropColumn(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	columnName: string,
+	sql: string,
 ): Promise<SqlValue> {
 	const colIndex = tableSchema.columnIndexMap.get(columnName.toLowerCase());
 	if (colIndex === undefined) {
@@ -1110,6 +1137,7 @@ async function runDropColumn(
 	const updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
 		type: 'dropColumn',
 		columnName,
+		ddl: sql,
 	});
 
 	// Events this transaction already batched for the table still carry the pre-drop
@@ -1145,6 +1173,7 @@ async function runDropColumn(
 		type: 'drop', objectType: 'column',
 		objectName: tableSchema.name,
 		columnName,
+		ddl: sql,
 	});
 
 	log('Dropped column %s from table %s.%s', columnName, tableSchema.schemaName, tableSchema.name);
@@ -1166,6 +1195,7 @@ async function runDropConstraint(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	constraintName: string,
+	sql: string,
 ): Promise<SqlValue> {
 	const constraintClass = resolveNamedConstraintClass(tableSchema, constraintName);
 	if (constraintClass === 'unique') {
@@ -1183,6 +1213,7 @@ async function runDropConstraint(
 	const updatedTableSchema = await module.alterTable(rctx.db, tableSchema.schemaName, tableSchema.name, {
 		type: 'dropConstraint',
 		constraintName,
+		ddl: sql,
 	});
 
 	schema.addTable(updatedTableSchema);
@@ -1198,6 +1229,7 @@ async function runDropConstraint(
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'table',
 		objectName: tableSchema.name,
+		ddl: sql,
 	});
 
 	log('Dropped constraint %s from table %s.%s', constraintName, tableSchema.schemaName, tableSchema.name);
@@ -1216,6 +1248,7 @@ async function runRenameConstraint(
 	schema: import('../../schema/schema.js').Schema,
 	oldName: string,
 	newName: string,
+	sql: string,
 ): Promise<SqlValue> {
 	const constraintClass = resolveNamedConstraintClass(tableSchema, oldName);
 	if (constraintClass === 'unique') {
@@ -1262,6 +1295,7 @@ async function runRenameConstraint(
 		type: 'renameConstraint',
 		oldName,
 		newName,
+		ddl: sql,
 	});
 
 	schema.addTable(updatedTableSchema);
@@ -1279,6 +1313,7 @@ async function runRenameConstraint(
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'table',
 		objectName: tableSchema.name,
+		ddl: sql,
 	});
 
 	log('Renamed constraint %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
@@ -1307,6 +1342,7 @@ async function runAlterColumn(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	action: Extract<import('../../planner/nodes/alter-table-node.js').AlterTableAction, { type: 'alterColumn' }>,
+	sql: string,
 ): Promise<SqlValue> {
 	const colIndex = tableSchema.columnIndexMap.get(action.columnName.toLowerCase());
 	if (colIndex === undefined) {
@@ -1387,6 +1423,7 @@ async function runAlterColumn(
 		setDataType: action.setDataType,
 		setDefault: action.setDefault,
 		setCollation: action.setCollation,
+		ddl: sql,
 	});
 
 	// Events this transaction already batched still carry the PRE-conversion value at
@@ -1418,11 +1455,12 @@ async function runAlterColumn(
 
 	// All four attribute forms (SET/DROP NOT NULL, SET DATA TYPE, SET/DROP DEFAULT,
 	// SET COLLATE) report the same `alter`/`column` shape — the event says which column
-	// changed, not which attribute.
+	// changed, not which attribute; `ddl` says which attribute, exactly.
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'column',
 		objectName: tableSchema.name,
 		columnName: action.columnName,
+		ddl: sql,
 	});
 
 	log('Altered column %s.%s.%s', tableSchema.schemaName, tableSchema.name, action.columnName);
@@ -1606,6 +1644,7 @@ async function runAlterPrimaryKey(
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
 	columns: Array<{ name: string; direction?: 'asc' | 'desc' }>,
+	sql: string,
 ): Promise<SqlValue> {
 	const newPkDef: PrimaryKeyColumnDefinition[] = columns.map(col => {
 		const idx = tableSchema.columnIndexMap.get(col.name.toLowerCase());
@@ -1651,7 +1690,7 @@ async function runAlterPrimaryKey(
 			const schemaChangePk = newPkDef.map(pk => ({ index: pk.index, desc: pk.desc ?? false }));
 			const updatedTableSchema = await module.alterTable(
 				rctx.db, tableSchema.schemaName, tableSchema.name,
-				{ type: 'alterPrimaryKey', newPkColumns: schemaChangePk },
+				{ type: 'alterPrimaryKey', newPkColumns: schemaChangePk, ddl: sql },
 			);
 
 			// Events this transaction already recorded identify their rows by the RETIRED
@@ -1686,6 +1725,7 @@ async function runAlterPrimaryKey(
 			emitAlterSchemaEvent(rctx, tableSchema, {
 				type: 'alter', objectType: 'table',
 				objectName: tableSchema.name,
+				ddl: sql,
 			});
 
 			log('Altered primary key of %s.%s (native)', tableSchema.schemaName, tableSchema.name);
@@ -1767,6 +1807,7 @@ async function runAlterPrimaryKey(
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'table',
 		objectName: tableSchema.name,
+		ddl: sql,
 	});
 
 	log('Altered primary key of %s.%s (rebuild)', tableSchema.schemaName, tableSchema.name);

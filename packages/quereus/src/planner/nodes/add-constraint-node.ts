@@ -15,6 +15,13 @@ export class AddConstraintNode extends VoidNode {
     scope: Scope,
     public readonly table: TableReferenceNode,
     public readonly constraint: AST.TableConstraint,
+    /**
+     * Canonical, fully-qualified SQL of the whole statement, rendered at plan-build
+     * time from the resolved table reference (see `buildAlterTableStmt`). Threaded to
+     * `module.alterTable` as `SchemaChangeInfo.ddl` and onto the public
+     * schema-change event — same contract as `AlterTableNode.sql`.
+     */
+    public readonly sql: string,
   ) {
     super(scope);
   }

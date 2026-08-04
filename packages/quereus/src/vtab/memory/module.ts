@@ -14,7 +14,7 @@ import type { MemoryTableConfig } from './types.js';
 import { createMemoryTableLoggers } from './utils/logging.js';
 import { AccessPlanBuilder, equalitySeekKeyCount, isMultiValueEquality, validateAccessPlan } from '../best-access-plan.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, PredicateConstraint } from '../best-access-plan.js';
-import type { VTableEventEmitter } from '../events.js';
+import type { VTableEventEmitter, VTableSchemaChangeEvent } from '../events.js';
 import type { ModuleCapabilities } from '../capabilities.js';
 import type { MappingAdvertisement } from '../mapping-advertisement.js';
 import type { Schema } from '../../schema/schema.js';
@@ -942,7 +942,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * Renames a memory table's internal registration key.
 	 * Called by the ALTER TABLE RENAME TO emitter before the schema catalog update.
 	 */
-	async renameTable(_db: Database, schemaName: string, oldName: string, newName: string): Promise<void> {
+	async renameTable(_db: Database, schemaName: string, oldName: string, newName: string, ddl?: string): Promise<void> {
 		const oldKey = `${schemaName}.${oldName}`.toLowerCase();
 		const newKey = `${schemaName}.${newName}`.toLowerCase();
 		const manager = this.tables.get(oldKey);
@@ -950,6 +950,20 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			manager.renameTable(newName);
 			this.tables.delete(oldKey);
 			this.tables.set(newKey, manager);
+		}
+
+		// Emit-iff-`ddl`, same rule as alterTable below: `ddl` set means this call IS the
+		// RENAME TO statement's action; absent means an engine-internal step (e.g. the
+		// shadow-table rebuild's trailing rename) that must announce nothing.
+		if (ddl !== undefined) {
+			this.eventEmitter?.emitSchemaChange?.({
+				type: 'alter',
+				objectType: 'table',
+				schemaName,
+				objectName: newName,
+				oldObjectName: oldName,
+				ddl,
+			});
 		}
 	}
 
@@ -1000,6 +1014,21 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				break;
 		}
 
+		// ONE event per statement, decided here — the single gate for every arm: emit iff
+		// the engine marked this call as the statement's own action (`change.ddl` set), and
+		// put that text on the event. Engine-internal sub-steps — the inline-constraint
+		// installs and revert calls of the engine's ADD COLUMN, the materialized-view
+		// backing reshapes, and any wrapper-driven manager call — arrive with no `ddl` and
+		// announce nothing. See `SchemaChangeInfo.ddl`; mirrors the store module's gate.
+		if (change.ddl !== undefined) {
+			this.eventEmitter?.emitSchemaChange?.({
+				...MemoryTableModule.alterEventShape(change),
+				schemaName,
+				objectName: tableName,
+				ddl: change.ddl,
+			});
+		}
+
 		return manager.tableSchema;
 	}
 
@@ -1022,6 +1051,33 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			schema: schemaName,
 			columns: indexSchema.columns.map(col => `${col.index}${col.desc ? ' DESC' : ''}`)
 		});
+	}
+
+	/**
+	 * The per-arm event shape of an ALTER TABLE announcement — `alter`/`column` naming the
+	 * touched column for the column arms (`drop`/`column` for DROP COLUMN), `alter`/`table`
+	 * for the whole-table ones. Matches what the engine's own no-emitter path reports for
+	 * the same statements (`runtime/emit/alter-table.ts`), so a subscriber sees the same
+	 * facts regardless of backend.
+	 */
+	private static alterEventShape(
+		change: SchemaChangeInfo,
+	): Pick<VTableSchemaChangeEvent, 'type' | 'objectType' | 'columnName' | 'oldColumnName'> {
+		switch (change.type) {
+			case 'addColumn':
+				return { type: 'alter', objectType: 'column', columnName: change.columnDef.name };
+			case 'dropColumn':
+				return { type: 'drop', objectType: 'column', columnName: change.columnName };
+			case 'renameColumn':
+				return { type: 'alter', objectType: 'column', columnName: change.newName, oldColumnName: change.oldName };
+			case 'alterColumn':
+				return { type: 'alter', objectType: 'column', columnName: change.columnName };
+			case 'alterPrimaryKey':
+			case 'addConstraint':
+			case 'dropConstraint':
+			case 'renameConstraint':
+				return { type: 'alter', objectType: 'table' };
+		}
 	}
 
 	/**
