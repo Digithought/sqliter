@@ -165,8 +165,57 @@ with a as (select id from p1),
 select id from c order by id;
 → [{"id":1101},{"id":1102}]
 
+-- ===== Negative: a member still cannot name a LATER sibling, or itself =====
+-- The visible map only ever holds members defined BEFORE this one, so a forward or
+-- self reference falls through to ordinary schema lookup and reports table-not-found.
+
+create table q9 (id integer primary key, w integer);
+-- run
+
+with b as (insert into q9 select id, 1 from a returning id),
+     a as (select id from p1)
+select count(*) as n from b;
+-- error: Table 'a' not found
+
+with b as (select id from a),
+     a as (select id from p1)
+select count(*) as n from b;
+-- error: Table 'a' not found
+
+with c as (insert into q9 select id, 1 from c returning id)
+select count(*) as n from c;
+-- error: Table 'c' not found
+
+-- ===== A sibling shadows a same-named REAL table inside a writing body =====
+-- `buildFrom` resolves a FROM name against the visible CTEs before the schema, so the
+-- CTE wins over the base table of the same name.
+
+create table p1shadow (id integer primary key);
+insert into p1shadow values (1), (2), (3);
+-- run
+
+with p1shadow as (select 55 as id),
+     b as (insert into q9 select id, 1 from p1shadow returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, w from q9 order by id;
+→ [{"id":55,"w":1}]
+
+-- ===== Three clause levels deep =====
+-- Coverage above stops at two; this pins that the merge composes at each level.
+
+with o as (select 1 as k)
+select n from (with z as (select 2 as k)
+               select n from (with y as (select 3 as k)
+                              select (select k from o) + (select k from z)
+                                   + (select k from y) as n) i) m;
+→ [{"n":6}]
+
 -- Cleanup
 drop table p1;
+drop table p1shadow;
+drop table q9;
 drop table q1;
 drop table q2;
 drop table q3;

@@ -193,6 +193,10 @@ export function contextForCteTarget(
 	// no-op slice rather than slicing from the end.
 	const idx = withClause.ctes.findIndex(c => c.name.toLowerCase() === target);
 	if (idx < 0) return ctx;
+	// NOTE: deletion is BY NAME, so a same-named definition inherited from an ENCLOSING
+	// `with` clause is dropped along with the target's own. Unreachable today (it needs a
+	// CTE-name DML target nested inside another clause that reuses the name); if that
+	// combination becomes real, delete only the entries this clause contributed.
 	const shadowed = new Set(withClause.ctes.slice(idx).map(c => c.name.toLowerCase()));
 	const cteNodes = new Map(ctx.cteNodes);
 	for (const name of shadowed) cteNodes.delete(name);

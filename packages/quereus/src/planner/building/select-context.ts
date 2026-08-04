@@ -32,6 +32,14 @@ export function buildWithContext(
 	const cteNodes: Map<string, CTEScopeNode> = new Map(parentCTEs.size > 0 ? parentCTEs : (ctx.cteNodes ?? new Map()));
 
 	if (stmt.withClause) {
+		// NOTE: the clause's own members build against `ctx` — so they inherit `ctx.cteNodes`,
+		// NOT the explicit `parentCTEs` this function otherwise prefers. The two agree
+		// everywhere they matter today (`buildCommonTableExpr` and
+		// `buildExpressionPositionQueryExpr` pass the same map they set on the context; the
+		// stored-body path deliberately clears `ctx.cteNodes`, so a fragment's own clause sees
+		// nothing, which is what it saw before CTE inheritance existed). If a stored-body
+		// fragment's own `with` clause ever needs the body's carried definitions, pass a
+		// parent-CTE-aware context here rather than changing the `cteNodes` seed above.
 		// Merge parent CTEs with new ones (new ones take precedence)
 		for (const [name, node] of buildWithClause(ctx, stmt.withClause)) {
 			cteNodes.set(name, node);

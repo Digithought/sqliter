@@ -87,9 +87,7 @@ export function buildCommonTableExpr(
 	// explicit parent-CTE argument — every DML body — still resolves them.
 	// Copied rather than aliased: `buildWithClause` keeps adding to `existingCTEs` after
 	// this member is built, and a member must not retain a map that grows behind it.
-	const visibleCTEs: Map<string, CTEScopeNode> = ctx.cteNodes && ctx.cteNodes.size > 0
-		? new Map([...ctx.cteNodes, ...existingCTEs])
-		: new Map(existingCTEs);
+	const visibleCTEs = new Map<string, CTEScopeNode>([...(ctx.cteNodes ?? []), ...existingCTEs]);
 
 	// Create a context that includes previously defined CTEs in scope
 	// This allows later CTEs to reference earlier ones
