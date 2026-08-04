@@ -472,6 +472,9 @@ export async function applyChanges(
 	// create never triggers a drain. A batch whose schema steps leave the table ABSENT
 	// (a trailing drop_table) has its key skipped to avoid a wasted scoped
 	// `quarantine.list` — a drop-then-create batch leaves it PRESENT and does drain.
+	// A migration the simulation never modelled has no fate entry (only a
+	// `rename_table` with no `fromTable`, which returns before reaching `fateOf`): fall
+	// back to the basis, read HERE — post-DDL — so it is the exact post-batch answer.
 	// Advisory: `drainReappearedTables` logs + swallows any failure, so a drain throw
 	// never turns this successful apply into an error.
 	const reappeared = new Map<string, { schema: string; table: string }>();
@@ -479,7 +482,7 @@ export async function applyChanges(
 		if (migration.type !== 'create_table' && migration.type !== 'rename_table') continue;
 		const key = tableKey(migration.schema, migration.table);
 		const fate = batchFates.get(key);
-		if (fate && !fate.present) continue;
+		if (!(fate ? fate.present : ctx.isTableInBasis(migration.schema, migration.table))) continue;
 		if (!reappeared.has(key)) reappeared.set(key, { schema: migration.schema, table: migration.table });
 	}
 	await drainReappearedTables(ctx, [...reappeared.values()]);

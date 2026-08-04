@@ -18,6 +18,7 @@ import { expect } from 'chai';
 import { generateTableDDL } from '@quereus/quereus';
 import { compareHLC } from '../../src/clock/hlc.js';
 import {
+	COLUMNS_PER_FRESH_INSERT,
 	DEFAULT_ORDERS_DDL,
 	closePeer,
 	collect,
@@ -505,6 +506,106 @@ describe('alter table replication', () => {
 			expect(second.applied, 'nothing new on the second pass').to.equal(0);
 			expect(hasTable(b, 'orders2')).to.equal(true);
 			expect(hasTable(b, 'orders')).to.equal(false);
+		});
+	});
+
+	/**
+	 * The two DECLINED renames from the `rename to` block above — `a rename of a table the
+	 * receiver dropped converges without applying (drop wins)` and `a rename_table without
+	 * fromTable (an omitting peer) is undecidable and converges` — replayed with the origin
+	 * also writing ROWS under the new name in the very same batch.
+	 *
+	 * The receiver must NOT route those rows to the new name. It never applies the rename,
+	 * so the new name does not exist, and the store adapter's external-write lookup throws:
+	 * the whole batch aborts with its watermark unadvanced, and the SAME batch then re-throws
+	 * on every subsequent sync, with every later change from that peer stuck behind it. Rows
+	 * for a declined rename take the ordinary unknown-table route instead. Each case
+	 * re-delivers the batch, because the user-visible symptom was the endless retry rather
+	 * than the single throw.
+	 *
+	 * These peers are asymmetric on purpose, unlike the `makeSyncedPair` block above: the
+	 * receiver takes `orders` by REPLICATION rather than creating its own. Two peers that
+	 * each run `create table orders` locally file competing `create_table` migrations at
+	 * schemaVersion 1, and which one is HLC-dominated turns on the random site-id tie-break
+	 * — so whether the receiver still holds `orders` would flip between runs.
+	 */
+	describe('rename to, carrying rows for the new name', () => {
+		let origin: Peer;
+		let receiver: Peer;
+
+		const hasTable = (peer: Peer, name: string): boolean =>
+			peer.db.schemaManager.getTable('main', name) !== undefined;
+
+		beforeEach(async () => {
+			origin = await makePeer('origin', { createOrders: true });
+			receiver = await makePeer('receiver');
+			await relayAll(origin, receiver);
+			expect(hasTable(receiver, 'orders'), 'the receiver took orders by replication').to.equal(true);
+		});
+
+		afterEach(async () => {
+			await closePeer(origin);
+			await closePeer(receiver);
+		});
+
+		it('a rename of a table the receiver dropped diverts its rows instead of wedging the batch', async () => {
+			await localWrite(receiver, 'drop table orders');
+			await localWrite(origin, 'alter table orders rename to orders2');
+			await localWrite(origin, "insert into orders2 (id, note) values (5, 'after')");
+
+			const first = await relayAll(origin, receiver);
+
+			// The rename migration is recorded (applied) but decided `already-applied` —
+			// neither name exists here — and the re-delivered create_table is dominated.
+			expect(first.applied, 'the rename_table migration is recorded').to.equal(1);
+			expect(first.skipped, 'the dominated create_table').to.equal(1);
+			expect(first.unknownTable, 'the row took the unknown-table route')
+				.to.equal(COLUMNS_PER_FRESH_INSERT);
+			expect(hasTable(receiver, 'orders'), 'orders stays dropped').to.equal(false);
+			expect(hasTable(receiver, 'orders2'), 'nothing was renamed into being').to.equal(false);
+			expect(await receiver.manager.quarantine.list('main', 'orders2'))
+				.to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+
+			const second = await relayAll(origin, receiver);
+
+			expect(second.applied, 'nothing new on the second pass').to.equal(0);
+			expect(second.skipped, 'both migrations now dominated').to.equal(2);
+			expect(second.unknownTable).to.equal(COLUMNS_PER_FRESH_INSERT);
+			expect(hasTable(receiver, 'orders2')).to.equal(false);
+		});
+
+		it('a rename_table without fromTable diverts its rows instead of wedging the batch', async () => {
+			await localWrite(origin, 'alter table orders rename to orders2');
+			await localWrite(origin, "insert into orders2 (id, note) values (5, 'after')");
+
+			const sets = await origin.manager.getChangesSince(receiver.manager.getSiteId());
+			const stripped = sets.map(cs => ({
+				...cs,
+				schemaMigrations: cs.schemaMigrations.map(m =>
+					m.type === 'rename_table' ? (({ fromTable: _ft, ...rest }) => rest)(m) : m),
+			}));
+
+			const first = await receiver.manager.applyChanges(stripped);
+			await settle();
+
+			expect(first.applied, 'the rename_table migration is recorded').to.equal(1);
+			expect(first.skipped, 'the dominated create_table').to.equal(1);
+			expect(first.unknownTable, 'the row took the unknown-table route')
+				.to.equal(COLUMNS_PER_FRESH_INSERT);
+			expect(hasTable(receiver, 'orders'), 'the receiver keeps orders — the rename was undecidable')
+				.to.equal(true);
+			expect(hasTable(receiver, 'orders2')).to.equal(false);
+			expect(await receiver.manager.quarantine.list('main', 'orders2'))
+				.to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+
+			const second = await receiver.manager.applyChanges(stripped);
+			await settle();
+
+			expect(second.applied, 'nothing new on the second pass').to.equal(0);
+			expect(second.skipped, 'both migrations now dominated').to.equal(2);
+			expect(second.unknownTable).to.equal(COLUMNS_PER_FRESH_INSERT);
+			expect(hasTable(receiver, 'orders'), 'still orders').to.equal(true);
+			expect(hasTable(receiver, 'orders2')).to.equal(false);
 		});
 	});
 

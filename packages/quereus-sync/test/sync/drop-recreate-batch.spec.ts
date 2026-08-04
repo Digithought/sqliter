@@ -18,14 +18,22 @@
  * receiver actually applies. A re-delivered batch changes no local schema and must resolve
  * normally.
  *
+ * The verdict is a SIMULATION of what the receiver will do, not a reading of the batch's
+ * schema steps in isolation: it seeds each mentioned name with whether the receiver has it
+ * now and replays only the migrations Phase 1a KEPT. The second top-level describe below
+ * pins the seeding half — a `create_table` the receiver already processed and has since
+ * undone locally must not resurrect the table in the prediction.
+ *
  * Every spec here runs on real `Database` peers (`_peer-harness.ts`), so it asserts what
  * `select` returns, not what the metadata believes.
  */
 
 import { expect } from 'chai';
+import type { SqlValue } from '@quereus/quereus';
 import { type ChangeSet } from '../../src/sync/protocol.js';
 import { compareHLC } from '../../src/clock/hlc.js';
 import {
+	COLUMNS_PER_FRESH_INSERT,
 	closePeer,
 	collect,
 	localWrite,
@@ -350,6 +358,132 @@ describe('drop + re-create in one batch', () => {
 				.to.deep.equal([{ id: 1, w: 'reborn' }]);
 			expect(receiver.db.schemaManager.getTable('main', 'widgets2'), 'the renamed-away table came across')
 				.to.not.be.undefined;
+		} finally {
+			await closePeer(origin);
+			await closePeer(receiver);
+		}
+	});
+
+	// The CONTRAST to the spec above, and the other half of the `recreated` rule: a table
+	// that arrives under a name by being renamed INTO it is NOT a fresh incarnation — it
+	// brings its rows along — so its changes must resolve against the receiver's stored
+	// metadata like any other. Judging `widgets` fresh here let the origin's update
+	// resolve READ-FREE, straight past the receiver's own tombstone for the row, and a
+	// row the receiver had deleted came back under the default `allowResurrection: false`.
+	it('a name renamed AWAY and BACK in one batch is not fresh: a stored tombstone still blocks its rows', async () => {
+		// The control runs the identical scenario minus the two renames, so the claim is
+		// a comparison against how the same batch behaves when no name moves at all.
+		const control = await applyUpdateOverLocalDelete(false);
+		const withRenames = await applyUpdateOverLocalDelete(true);
+
+		expect(control.rows, 'control: the receiver\'s local delete wins').to.deep.equal([{ id: 1, w: 'keep' }]);
+		expect(withRenames.rows, 'renaming away and back changes nothing').to.deep.equal(control.rows);
+		expect(withRenames.hasWidgets, 'the round trip lands back on the original name').to.equal(true);
+		expect(withRenames.hasWidgets2, 'widgets2 is gone').to.equal(false);
+	});
+});
+
+/**
+ * Both peers hold `widgets` rows 1 and 9; the receiver deletes row 9 locally, leaving
+ * itself a tombstone; the origin then updates row 9. With `renameRoundTrip` the origin
+ * ALSO renames `widgets` → `widgets2` → `widgets` in the same relay window, so the
+ * receiver's batch carries both renames alongside the update.
+ *
+ * The receiver takes `widgets` — and the origin's `create_table` migration — by
+ * REPLICATION rather than running the DDL itself. Two peers that each run
+ * `create table widgets` locally file competing `create_table` migrations at
+ * schemaVersion 1, and which one is HLC-dominated turns on the random site-id
+ * tie-break, so the receiver's table would flip between runs.
+ */
+async function applyUpdateOverLocalDelete(renameRoundTrip: boolean): Promise<{
+	rows: Record<string, SqlValue>[];
+	hasWidgets: boolean;
+	hasWidgets2: boolean;
+}> {
+	const origin = await makePeer('origin');
+	const receiver = await makePeer('receiver');
+	try {
+		await localWrite(origin, WIDGETS_DDL);
+		await localWrite(origin, "insert into widgets (id, w) values (1, 'keep')");
+		await localWrite(origin, "insert into widgets (id, w) values (9, 'orig')");
+		await relayAll(origin, receiver);
+		expect(await collect(receiver.db, 'select id, w from widgets order by id'), 'both rows replicated')
+			.to.deep.equal([{ id: 1, w: 'keep' }, { id: 9, w: 'orig' }]);
+
+		await localWrite(receiver, 'delete from widgets where id = 9');
+		expect(await receiver.manager.tombstones.getTombstone('main', 'widgets', [9]), 'tombstone seeded')
+			.to.not.be.undefined;
+
+		await localWrite(origin, "update widgets set w = 'updated' where id = 9");
+		if (renameRoundTrip) {
+			await localWrite(origin, 'alter table widgets rename to widgets2');
+			await localWrite(origin, 'alter table widgets2 rename to widgets');
+		}
+
+		await receiver.manager.applyChanges(
+			await origin.manager.getChangesSince(receiver.manager.getSiteId()),
+		);
+		await settle();
+
+		return {
+			rows: await collect(receiver.db, 'select id, w from widgets order by id'),
+			hasWidgets: receiver.db.schemaManager.getTable('main', 'widgets') !== undefined,
+			hasWidgets2: receiver.db.schemaManager.getTable('main', 'widgets2') !== undefined,
+		};
+	} finally {
+		await closePeer(origin);
+		await closePeer(receiver);
+	}
+}
+
+/**
+ * The row-admission gate with NO rename and no in-batch drop — the shape that shows the
+ * defect was never rename-specific. The receiver took `orders` by replication and then
+ * dropped it locally, so the origin's `create_table` is HLC-dominated and Phase 1a skips
+ * it; the batch still carries rows for the table.
+ *
+ * Reading the batch's own schema steps in isolation said "this batch's `create_table`
+ * leaves the table present", so those rows were routed to a table the receiver does not
+ * have: the store adapter's external-write lookup threw, the whole batch aborted with
+ * its watermark unadvanced, and every later sync re-threw on the same batch — with all
+ * subsequent changes from that peer stuck behind it. The verdict now replays only the
+ * migrations Phase 1a KEPT over the receiver's real presence, and a dominated migration
+ * is a fact the receiver already processed — along with everything it did afterwards,
+ * like the drop — so it can no longer resurrect the table in the prediction.
+ */
+describe('a dominated create_table does not resurrect a locally-dropped table', () => {
+	it('diverts the batch\'s rows instead of wedging the apply', async () => {
+		const origin = await makePeer('origin', { createOrders: true });
+		const receiver = await makePeer('receiver');
+		try {
+			// Same asymmetric build as applyUpdateOverLocalDelete, for the same reason:
+			// the receiver must take the origin's create_table migration by replication so
+			// re-delivering it is deterministically dominated.
+			await relayAll(origin, receiver);
+			expect(receiver.db.schemaManager.getTable('main', 'orders'), 'orders replicated')
+				.to.not.be.undefined;
+
+			await localWrite(receiver, 'drop table orders');
+			await localWrite(origin, "insert into orders (id, note) values (5, 'after')");
+
+			const first = await relayAll(origin, receiver);
+
+			expect(first.applied, 'the create_table is dominated, so nothing is applied').to.equal(0);
+			expect(first.skipped, 'the dominated create_table').to.equal(1);
+			expect(first.unknownTable, 'the row took the unknown-table route')
+				.to.equal(COLUMNS_PER_FRESH_INSERT);
+			expect(receiver.db.schemaManager.getTable('main', 'orders'), 'orders stays dropped')
+				.to.be.undefined;
+			expect(await receiver.manager.quarantine.list('main', 'orders'))
+				.to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+
+			// The regression guard: the symptom was the endless retry, not the single
+			// throw, so re-delivering the same batch must stay a clean no-op.
+			const second = await relayAll(origin, receiver);
+			expect(second.applied, 'nothing new on the second pass').to.equal(0);
+			expect(second.skipped).to.equal(1);
+			expect(second.unknownTable).to.equal(COLUMNS_PER_FRESH_INSERT);
+			expect(receiver.db.schemaManager.getTable('main', 'orders')).to.be.undefined;
 		} finally {
 			await closePeer(origin);
 			await closePeer(receiver);

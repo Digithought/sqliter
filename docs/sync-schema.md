@@ -260,8 +260,9 @@ set). Two things make the data path survive the rename:
   rename the receiver DECLINES (its old table was dropped locally, or `fromTable` is
   missing) take the unknown-table disposition instead of reaching a table that does not
   exist. Chained renames, rename-then-drop, and rename-then-rename-back within one batch
-  all resolve by the same replay. An applied `rename_table` also triggers the reactive
-  held-change drain for its new name, the same as an applied `create_table`.
+  all resolve by the same replay. A `rename_table` that leaves the new name PRESENT also
+  triggers the reactive held-change drain for that name, the same as a `create_table`; a
+  declined one does not, because nothing reappeared.
 - **Renamed-in tables keep their history.** The companion `recreated` verdict — "this is a
   brand-new EMPTY local table, so its rows may resolve read-free, without consulting local
   cell versions and tombstones" — is set only by a `create_table` that moves a name from
