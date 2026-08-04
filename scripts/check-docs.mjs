@@ -573,6 +573,30 @@ function checkRatchet(fail, notice = () => {}) {
 	}
 }
 
+/**
+ * What `--update-ratchet` does with one existing entry, given the doc's current size (`undefined`
+ * if the doc is gone): `'remove'`, `'retire'`, `'lower'`, `'unchanged'`, `'raise'` (`--force`
+ * only), `'skip'` (in-band growth, entry left alone) or `'refuse'`.
+ *
+ * Retirement outranks every size comparison below it, which is the ordering that is easy to get
+ * wrong and the reason this is pure: an entry exists to grandfather a doc that is *above*
+ * `maxWords`, so once the doc is at or under the cap the entry has nothing left to grandfather —
+ * including under `--force`, where re-recording a below-cap size would pin the doc at an arbitrary
+ * number under the project's published readability limit and fail the next honest paragraph for no
+ * readability reason. Dropping it does loosen the effective limit (from `recorded + slack` up to
+ * `maxWords`), and that is the intent, not a hole in "a ratchet you can silently raise is not a
+ * ratchet": the doc is then held to the same cap as every other unratcheted doc, near-cap notice
+ * included.
+ */
+function updateVerdict(words, recorded, maxWords, slack, force) {
+	if (words === undefined) return 'remove';
+	if (words <= maxWords) return 'retire';
+	if (words < recorded) return 'lower';
+	if (words === recorded) return 'unchanged';
+	if (force) return 'raise';
+	return words - recorded <= slack ? 'skip' : 'refuse';
+}
+
 function updateRatchet(force) {
 	const budget = readBudget();
 	const slack = slackOf(budget);
@@ -583,35 +607,35 @@ function updateRatchet(force) {
 
 	for (const [doc, recorded] of Object.entries(budget.ratchet)) {
 		const words = sizes.get(doc);
-		if (words === undefined) {
-			changes.push(`  removed ${doc} (no longer present)`);
-			delete budget.ratchet[doc];
-		} else if (words <= budget.maxWords) {
-			// Not a hole in "a ratchet you can silently raise is not a ratchet". An entry exists to
-			// grandfather a doc that is *above* `maxWords`; once the doc is under it, the entry pins
-			// it at an arbitrary number below the project's published readability limit, so the next
-			// honest paragraph fails the gate for no readability reason. Dropping it does loosen the
-			// effective limit (from `recorded + slack` up to `maxWords`), and that is the intent: the
-			// doc is now subject to the same cap as every other unratcheted doc — including the
-			// near-cap notice that warns before it gets there.
-			changes.push(`  dropped ${doc}: ${words} words, at or below the ${budget.maxWords}-word cap — no longer grandfathered`);
-			delete budget.ratchet[doc];
-		} else if (words < recorded) {
-			changes.push(`  lowered ${doc}: ${recorded} -> ${words} (-${recorded - words})`);
-			budget.ratchet[doc] = words;
-		} else if (words > recorded) {
-			const over = words - recorded;
-			if (force) {
+		// NaN when the doc is gone — only the growth verdicts below, which require a size, read it.
+		const over = words - recorded;
+
+		switch (updateVerdict(words, recorded, budget.maxWords, slack, force)) {
+			case 'remove':
+				changes.push(`  removed ${doc} (no longer present)`);
+				delete budget.ratchet[doc];
+				break;
+			case 'retire':
+				changes.push(`  dropped ${doc}: ${words} words, at or below the ${budget.maxWords}-word cap — no longer grandfathered`);
+				delete budget.ratchet[doc];
+				break;
+			case 'lower':
+				changes.push(`  lowered ${doc}: ${recorded} -> ${words} (-${recorded - words})`);
+				budget.ratchet[doc] = words;
+				break;
+			case 'raise':
 				changes.push(`  RAISED ${doc}: ${recorded} -> ${words} (+${over})`);
 				budget.ratchet[doc] = words;
-			} else if (over <= slack) {
+				break;
+			case 'skip':
 				// Not a refusal: the check already passes here, and raising would hand the doc a
 				// fresh band. Skipping it also keeps one doc's drift from blocking every *lowering*
 				// in the same run — the routine case this command exists for.
 				skipped.push(`  ${doc}: +${over} over ${recorded}, inside the ${slack}-word grace band — entry left alone`);
-			} else {
+				break;
+			case 'refuse':
 				refusals.push(`  ${doc}: grew to ${words} from a ratchet of ${recorded} (+${over}), past the ${slack}-word grace band`);
-			}
+				break;
 		}
 	}
 
@@ -1130,6 +1154,28 @@ function selfTest(fail) {
 		fail(`scripts/check-docs.mjs: slackWords 0 no longer makes the near-cap notice unreachable`);
 	}
 
+	// `--update-ratchet` reads the real tree, so its per-entry decision is pinned here instead. The
+	// two rows that matter are retirement at exactly the cap and retirement under `--force`: an
+	// entry below `maxWords` grandfathers nothing, so it is dropped rather than lowered or raised.
+	const updateCases = [
+		[undefined, 12538, false, 'remove'],
+		[11999, 12538, false, 'retire'],
+		[12000, 12538, false, 'retire'],
+		[12000, 12538, true, 'retire'],
+		[12001, 12538, false, 'lower'],
+		[12538, 12538, false, 'unchanged'],
+		[12600, 12538, false, 'skip'],
+		[13038, 12538, false, 'skip'],
+		[13039, 12538, false, 'refuse'],
+		[13039, 12538, true, 'raise'],
+	];
+	for (const [words, recorded, force, expected] of updateCases) {
+		const actual = updateVerdict(words, recorded, 12000, 500, force);
+		if (actual !== expected) {
+			fail(`scripts/check-docs.mjs: --update-ratchet verdict for ${words ?? 'a missing doc'} against ${recorded}${force ? ' with --force' : ''} is '${actual}', expected '${expected}'`);
+		}
+	}
+
 	stabilitySelfTest(fail);
 	packageSelfTest(fail);
 }
@@ -1279,6 +1325,10 @@ function main() {
 	// Drift inside the grace band, and an unratcheted doc closing on the cap, are not failures — but
 	// they are not invisible either: they are the only warning a doc gets before its next edit
 	// fails, so they print even on a clean run.
+	//
+	// NOTE: a near-cap doc keeps printing until someone splits it, so this list only ever grows.
+	// Five lines today. If it reaches the length where it reads as background noise, sort the
+	// notices by headroom and print the closest few with a "+N more" tail rather than all of them.
 	const notices = [];
 
 	selfTest(fail);

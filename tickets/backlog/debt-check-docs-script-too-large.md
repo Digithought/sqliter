@@ -1,6 +1,6 @@
 description: The single script that checks the documentation has grown past a thousand lines and now does five unrelated jobs, which makes it hard to read and to add a sixth check to.
 files:
-  - scripts/check-docs.mjs (1,180 lines — the whole gate)
+  - scripts/check-docs.mjs (1,325 lines as of the near-cap-warning ticket — the whole gate)
   - docs/doc-conventions.md (documents what the gate enforces)
 difficulty: medium
 ----

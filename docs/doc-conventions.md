@@ -172,7 +172,7 @@ one honest section at a time.
   `docs/.stability.json` at its hub's tier, opening with an H1, a stability banner, and an intro
   closing `A satellite of [Hub](hub.md).`, and listed in the hub's `## Topic documents` table. A
   hub with satellites carries that table directly below its intro — copy the shape from
-  `docs/optimizer.md`, which has eleven.
+  `docs/view-updateability.md` and its satellite `docs/vu-inverses.md`.
 - **Never append to a doc the checker is already warning about.** A near-cap or drift notice means
   the next section goes in a satellite, not in that file.
 
