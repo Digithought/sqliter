@@ -29,7 +29,7 @@ assignment:
 ```
 
 **Options:**
-- `with clause`: Common Table Expressions for use in the insert
+- `with clause`: Common Table Expressions for use in the insert — visible to every clause of the statement, including the source, a subquery in a `values` row, and `returning` (see [§3.7 WITH Clause](sql-select.md#37-with-clause-common-table-expressions))
 - `or conflict_resolution`: Specifies how to handle constraint conflicts (see Conflict Resolution below)
 - `table_name`: Target table for the insertion
 - `column`: Optional list of columns to insert into
@@ -227,7 +227,7 @@ The update statement modifies existing rows in a table. The target may also be a
 ```
 
 **Options:**
-- `with clause`: Common Table Expressions for use in the update
+- `with clause`: Common Table Expressions for use in the update — visible to `set`, `where` and `returning` alike (see [§3.7 WITH Clause](sql-select.md#37-with-clause-common-table-expressions))
 - `table_name`: Table to be updated
 - `set`: Column assignments with new values
 - `where`: Optional condition to specify which rows to update
@@ -308,7 +308,7 @@ delete from table_name
 ```
 
 **Options:**
-- `with clause`: Common Table Expressions for use in the delete
+- `with clause`: Common Table Expressions for use in the delete — visible to `where` and `returning` alike (see [§3.7 WITH Clause](sql-select.md#37-with-clause-common-table-expressions))
 - `table_name`: Table to delete from
 - `where`: Optional condition to specify which rows to delete
 - `with context`: Provides table-level parameters for defaults and constraints (see [§2.6.2 Mutation Context](sql-ddl.md#262-mutation-context-table-level-parameters))

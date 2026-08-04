@@ -249,6 +249,31 @@ select id, v from t17log order by id;
 select id, w from t17 order by id;
 → [{"id":1,"w":1}]
 
+-- A MULTI-SOURCE view target is the stronger case: a join-bodied view decomposes into one
+-- base insert per member, and each member re-enters the INSERT builder with the same
+-- statement — so the hoisted WITH clause is built once per member on top of the outer
+-- build. None of those extra plannings may run the CTE body's write.
+
+create table t18log (id integer primary key, v text);
+create table t18a (id integer primary key, a text);
+create table t18b (id integer primary key, b text);
+create view vt18 as select t18a.id as id, t18a.a as a, t18b.b as b
+  from t18a join t18b on t18a.id = t18b.id;
+-- run
+
+with d as (insert into t18log values (1, 'x') returning id)
+insert into vt18 select id, 'aa', 'bb' from d;
+
+-- One log row, not one per view member.
+select id, v from t18log order by id;
+→ [{"id":1,"v":"x"}]
+
+select id, a from t18a order by id;
+→ [{"id":1,"a":"aa"}]
+
+select id, b from t18b order by id;
+→ [{"id":1,"b":"bb"}]
+
 -- ===== Control: a plain SELECT-bodied CTE is untouched =====
 -- Re-evaluating a read-only body is a performance question, not a correctness one;
 -- the row-set answer is identical either way. Pinned so the DML rule did not leak.
@@ -285,4 +310,8 @@ drop table t16log;
 drop view vt17;
 drop table t17;
 drop table t17log;
+drop view vt18;
+drop table t18a;
+drop table t18b;
+drop table t18log;
 -- run

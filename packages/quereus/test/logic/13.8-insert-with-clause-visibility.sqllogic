@@ -80,6 +80,45 @@ insert into q5 insert into q5src values (8, 'h') returning id + (select count(*)
 select id, w from q5 order by id;
 → [{"id":10,"w":"h"}]
 
+-- The UPDATE- and DELETE-bodied source branches take the same context.
+
+create table q5b (id integer primary key, w integer);
+create table q5c (id integer primary key, w integer);
+create table q5upd (id integer primary key, w text);
+insert into q5upd values (1, 'x'), (2, 'y');
+-- run
+
+with c as (select id from p)
+insert into q5b update q5upd set w = 'z' where id = 1 returning id, (select count(*) from c);
+
+select id, w from q5b order by id;
+→ [{"id":1,"w":2}]
+
+with c as (select id from p)
+insert into q5c delete from q5upd where id = 2 returning id, (select count(*) from c);
+
+select id, w from q5c order by id;
+→ [{"id":2,"w":2}]
+
+-- ===== A MULTI-SOURCE view target sees them =====
+-- A join-bodied view decomposes into one base insert per member, each re-planned through
+-- this builder with a `preBuiltSource`. Every member must still carry the statement's CTEs
+-- (and the RETURNING built over the decomposition must too).
+
+create table q11a (id integer primary key, a text);
+create table q11b (id integer primary key, b text);
+create view vq11 as select q11a.id as id, q11a.a as a, q11b.b as b
+  from q11a join q11b on q11a.id = q11b.id;
+-- run
+
+with c as (select id, v from p) insert into vq11 select id, v, v from c;
+
+select id, a from q11a order by id;
+→ [{"id":1,"a":"a"},{"id":2,"a":"b"}]
+
+select id, b from q11b order by id;
+→ [{"id":1,"b":"a"},{"id":2,"b":"b"}]
+
 -- ===== An INSERT's own WITH clause does not hide the ones it INHERITED =====
 -- Arm B: the inner `with c as (…)` used to replace, rather than shadow into, the enclosing
 -- statement's definitions, so `a` vanished and the insert failed `Table 'a' not found`.
@@ -108,6 +147,23 @@ select count(*) as n from b;
 -- 77, not 1 and 2 — the inner `a` won.
 select id, w from q7 order by id;
 → [{"id":77,"w":5}]
+
+-- ===== An INSERT nested in FROM / expression position inherits through the context =====
+-- These two shapes reach `buildInsertStmt` with no WITH clause of their own — the enclosing
+-- statement's definitions arrive only via `ctx.cteNodes`. Both only work because RETURNING
+-- is now built on the CTE-aware context rather than the bare one.
+
+create table q12 (id integer primary key, w integer);
+create table q13 (id integer primary key, w integer);
+-- run
+
+with c as (select id from p)
+select n from (insert into q12 values (1, 5) returning (select count(*) from c) as n) as d;
+→ [{"n":2}]
+
+with c as (select id from p)
+select (select n from (insert into q13 values (2, 6) returning (select count(*) from c) as n)) as k;
+→ [{"k":2}]
 
 -- ===== Control: the `select` source branch (the one that always worked) =====
 
@@ -175,6 +231,7 @@ insert into mc with context who = (select count(*) from p) values (2, 'x');
 -- Cleanup
 drop materialized view mvq4;
 drop view vq3;
+drop view vq11;
 drop table p;
 drop table c;
 drop table q1;
@@ -183,6 +240,13 @@ drop table q3;
 drop table q4;
 drop table q5;
 drop table q5src;
+drop table q5b;
+drop table q5c;
+drop table q5upd;
+drop table q11a;
+drop table q11b;
+drop table q12;
+drop table q13;
 drop table q6;
 drop table q7;
 drop table q8;
