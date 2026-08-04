@@ -187,7 +187,7 @@ export { Parser } from './parser/parser.js';
 export { Lexer, TokenType, KEYWORDS } from './parser/lexer.js';
 export { ParseError } from './parser/parser.js';
 export { tryFoldLiteral } from './parser/utils.js';
-export { quoteIdentifier } from './emit/ast-stringify.js';
+export { quoteIdentifier, expressionToString } from './emit/ast-stringify.js';
 
 // Schema management
 export { SchemaManager } from './schema/manager.js';
@@ -197,7 +197,7 @@ export type { ImportCatalogOptions } from './schema/manager.js';
 // owning table through it rather than re-scanning the schema itself.
 export type { IndexLookupScope, IndexOwnerMatch } from './schema/manager.js';
 export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent } from './schema/change-events.js';
-export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from './schema/table.js';
+export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, namedConstraintExists, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from './schema/table.js';
 export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './schema/table.js';
 // Per-column UNIQUE-enforcement collation resolver, plus the per-column comparators

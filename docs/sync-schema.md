@@ -144,6 +144,38 @@ argument — exactly how the origin produced the DDL it put on the wire) and com
 against the received DDL after a small normalization: trim, drop a trailing `;`, collapse
 whitespace runs, compare case-insensitively.
 
+An `alter_column` migration (the coarse "table definition changed" migration every
+ALTER TABLE records) is decided per alteration arm: the adapter parses the statement with
+the engine's own parser (`decideAlterTable`) and compares the parsed action against the
+local `TableSchema`. A parse failure is logged and the DDL executed as-is, so the
+engine's own diagnostic is what surfaces. If the named **table** does not exist locally,
+the migration converges with a warning (the local drop was the more destructive change) —
+consistent with `drop_index`'s absent-owner arm.
+
+| Alteration | `already-applied` when | otherwise |
+|---|---|---|
+| `add column` | column present with the same **logical type** | absent → execute; different type → **conflict** naming the column and both types |
+| `drop column` | column absent | execute |
+| `rename column` | old absent, new present (neither: converge with a warning) | execute |
+| `add constraint` | a constraint of that name exists (named), or a UNIQUE over the same column set exists (unnamed) | execute |
+| `drop constraint` | no constraint of that name | execute |
+| `rename constraint` | old absent, new present (neither: converge with a warning) | execute |
+| `alter column … set data type` | local logical type already equals the target | execute |
+| `alter column … set/drop not null` | local nullability already equals the target (column absent: converge with a warning — drop wins) | execute |
+| `alter column … set/drop default` | rendered local default equals the target expression | execute |
+| `alter column … set collate` | local collation equals the target, case-insensitively | execute |
+| `alter primary key` | local PK column names and directions already equal the target list | execute |
+| `rename to`, tag / maintained arms | — | execute (no idempotency arm; see § What replicates) |
+
+Only `add column` compares any part of a definition, and only its **logical type**. A
+type mismatch is the dangerous divergence — two peers would interpret the same rows under
+different shapes. Anything richer would compare an AST column definition against a
+catalog `ColumnSchema`, and those do not round-trip (an unnamed inline CHECK is
+auto-named `_check_<col>` in the catalog; session `default_column_nullability` decides
+whether `not null` is even spelled) — a false conflict permanently blocks the peer, which
+is strictly worse than converging on a constraint-level difference. So constraint-level
+drift between two same-named, same-typed columns converges silently.
+
 Silent convergence matters beyond noise reduction: a schema-change throw lands in
 `ApplyToStoreResult.errors`, and any non-empty `errors` aborts the whole admission unit
 *before* its CRDT metadata commits (see
@@ -171,46 +203,61 @@ in `packages/quereus/src/schema/ddl-generator.ts`). The memory virtual-table mod
 attaches the same four, though there is no end-to-end sync path for memory-backed tables
 today.
 
-ALTER TABLE events now carry a real DDL string too. Every `ALTER TABLE` statement's
-schema-change event carries the statement's **canonical, schema-qualified SQL** in `ddl`:
-the engine renders it once at plan-build time (`buildAlterTableStmt` in
+**Table alterations replicate too.** Every `ALTER TABLE` statement's schema-change event
+carries the statement's **canonical, schema-qualified SQL** in `ddl`: the engine renders
+it once at plan-build time (`buildAlterTableStmt` in
 `packages/quereus/src/planner/building/alter-table.ts`) and threads it to the module as
 `SchemaChangeInfo.ddl` (or `renameTable`'s `ddl` parameter), which the store module puts
 on the event verbatim. The qualification rule matches `generateTableDDL`, so both wire
-sources agree. Two properties make the text safe to re-execute one-for-one:
+sources agree, and a module emits exactly one event per ALTER statement — the
+inline-constraint installs behind `add column x text unique`, the revert calls of a
+failed ADD COLUMN, and the materialized-view backing reshapes all pass no `ddl` and
+announce nothing. An alteration therefore records a non-blank `alter_column` migration,
+and the receiver re-executes the statement (idempotently — see the decision table below):
+add / drop / rename column, add / drop / rename constraint, every `alter column`
+sub-form, and `alter primary key` all reach every synced peer.
 
-- **One event per statement.** A module emits a schema-change event for an `alterTable`
-  call *iff* `change.ddl` is set, and the engine sets it only on the call that IS the
-  statement's action — the inline-constraint installs behind
-  `add column x text unique`, the revert calls of a failed ADD COLUMN, and the
-  materialized-view backing reshapes all pass no `ddl` and announce nothing. The engine's
-  own no-emitter path (`emitAlterSchemaEvent`) already had this shape and now carries the
-  identical text, so memory- and store-backed alterations announce the same string.
-- **A rename says what it renamed *from*.** `RENAME TO` events carry `oldObjectName`
-  alongside the new `objectName`, so a receiver can tell which of its tables the event is
-  about.
+Two alteration-shaped changes still do **not** replicate usefully:
 
-An alteration therefore records a **non-blank** `alter_column` migration, the origin-side
-`recordSchemaMigration` warning no longer fires for it, and the receiver executes the DDL
-through the existing one-for-one expectation path. Receiver-side hardening (idempotent
-re-apply, divergence handling) is `sync-replicate-alter-table-ddl`; making `RENAME TO`
-carry the table's *data* stream across the rename — the origin writes under the new name
-while the peer still holds the old — is `sync-replicate-rename-table`.
+- **`RENAME TO`.** The migration is filed under the *new* table name, and the origin's
+  subsequent data stream writes under the new name while a peer still holds the old one —
+  replicating the rename needs the old name on the wire and a data-routing fix. That is
+  `sync-replicate-rename-table`. (`RENAME TO` events already carry `oldObjectName` for it.)
+- **The tag / maintained arms** (`SET TAGS`, `ADD TAGS`, `DROP TAGS`,
+  `SET`/`DROP MAINTAINED`). These are catalog-only and emit no schema event, so no
+  migration is ever recorded for them.
+
+**Backfilled values are not data facts.** `add column sku text default 'x'` writes every
+existing row inside `module.alterTable` (`migrateRows`), which emits no data events — so
+nothing lands in the change log and **each peer computes its own backfill** when it
+replays the statement. That converges only because non-deterministic defaults are
+rejected at plan-build time and a per-row backfill is a function of the row it fills; the
+backfilled values themselves never cross the wire.
+
+**Re-keying strands CRDT metadata.** Sync's `cv:` / `tb:` / `cl:` keys are filed under
+the row's primary-key identity, so `alter primary key` abandons the metadata of every
+existing row and later conflict resolution silently starts from empty. Pre-existing for a
+*local* primary-key change; replicating the statement makes it happen on every peer.
+Tracked as `bug-sync-rename-and-pk-change-strand-crdt-metadata`.
 
 The receiver still warns in `applySchemaChange`'s blank-DDL early return, naming
-migration type, schema and table — deliberately **not** scoped to `alter_column`, so a
-blank migration from an older-build peer is reported too. A blank migration is still
-recorded (still advancing the table's schema version, which the destructiveness
-comparison depends on) and still skipped.
+migration type, schema and table — a blank migration can now only come from an
+older-build peer or a third-party module, and the origin-side `recordSchemaMigration`
+warning covers the same gap at the other end. A blank migration is still recorded (still
+advancing the table's schema version, which the destructiveness comparison depends on)
+and still skipped.
 
-A blank-DDL migration is skipped outright — counted applied, but neither executed nor
-given a pending remote-event expectation. That last part matters: expectations are
-refcounted and never expire, so one registered for a statement that emits no event would
-linger and consume the next genuine *local* DDL of the same signature, marking it remote —
-and remote events are filtered out of local-fact capture, so that local change would never
-replicate. The same accounting is why each executed form must emit exactly one module
-event: `drop table` over an indexed table emits one `drop`/`table` event and no per-index
-drop, so its single expectation matches exactly once.
+While the receiver executes replicated DDL, it marks the module events that DDL emits as
+`remote` via a **scoped marker** (`StoreEventEmitter.beginRemoteSchemaScope` /
+`endRemoteSchemaScope`): every schema event naming the migration's `(schema, object)`
+between begin and end is marked remote, so the SyncManager's local-fact capture skips it
+and nothing is broadcast back out. The scope covers zero, one, or several events and is
+released in a `finally`, so a statement that emits nothing (a blank migration is skipped
+before the scope even opens; a tag arm emits nothing) leaves no residue, and a failed
+statement cannot leave a marker behind to swallow the next genuine local DDL. The
+tradeoff is time-bounding rather than signature-matching: a host issuing local DDL on the
+very table being replicated at that instant would be mis-marked remote (see the doc
+comment on `beginRemoteSchemaScope`).
 
 ## Schema Seed: App Provider as Sync Peer
 

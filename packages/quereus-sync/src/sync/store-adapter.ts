@@ -106,9 +106,9 @@
  * MV refresh).
  */
 
-import type { BackingRowChange, Database, ExternalRowChange, Row, SqlValue, TableSchema } from '@quereus/quereus';
-import { compareSqlValues, generateIndexDDL, generateTableDDL } from '@quereus/quereus';
-import type { ExternalRowOp, SchemaChangeEvent, StoreEventEmitter, StoreModule, StoreTable } from '@quereus/store';
+import type { BackingRowChange, ColumnSchema, Database, ExternalRowChange, Row, SqlValue, TableSchema } from '@quereus/quereus';
+import { compareSqlValues, expressionToString, generateIndexDDL, generateTableDDL, inferType, namedConstraintExists, Parser } from '@quereus/quereus';
+import type { ExternalRowOp, StoreEventEmitter, StoreModule, StoreTable } from '@quereus/store';
 import { makePkIdentityEncoder } from '../metadata/pk-identity.js';
 import type {
   ApplyToStoreCallback,
@@ -471,40 +471,226 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // converge silently rather than exec a statement that would throw
       // `no such index` and abort the admission unit.
       return db.schemaManager.findIndexOwner(change.schema, change.table) ? 'execute' : 'already-applied';
+    case 'alter_column':
+      // A table alteration (the coarse "table definition changed" migration the
+      // origin records for every ALTER TABLE form). Parse the statement and decide
+      // per alteration arm whether the local table is already in the wanted state.
+      return decideAlterTable(db, change);
     default:
-      // Column-level migrations (add_column / drop_column / alter_column) carry
-      // no object-lifecycle state to compare; run them as before.
+      // add_column / drop_column are legacy wire types no current origin records
+      // (mapSchemaMigrationType folds every table alter into alter_column); run
+      // them as before.
       return 'execute';
   }
 }
 
 /**
- * The module schema-event signature the migration's DDL will produce — the exact
- * inverse of `mapSchemaMigrationType` (sync-manager-impl.ts), which is what
- * recorded the migration on the origin in the first place.
- *
- * Keeping the two inverse is load-bearing: the signature is what pre-marks the
- * emitted event remote, and a signature that never matches means the receiver
- * records the replicated DDL as its OWN local migration and broadcasts it back
- * out. Deriving it from the migration type by string-shape (`startsWith('drop')`,
- * `includes('table')`) does not survive the `add_index` / `*_column` names, so
- * map explicitly.
+ * The ALTER TABLE statement / ADD COLUMN definition AST shapes, derived
+ * structurally from the parser's return type: the NAMED AST types live in the
+ * `@quereus/quereus/parser` subpath export, which this package's test tsconfig
+ * (node10 module resolution) cannot resolve.
  */
-function schemaEventSignature(
-  type: SchemaChangeToApply['type'],
-): { type: SchemaChangeEvent['type']; objectType: SchemaChangeEvent['objectType'] } {
-  switch (type) {
-    case 'create_table': return { type: 'create', objectType: 'table' };
-    case 'drop_table': return { type: 'drop', objectType: 'table' };
-    case 'add_index': return { type: 'create', objectType: 'index' };
-    case 'drop_index': return { type: 'drop', objectType: 'index' };
-    // Column-level migrations replay as an ALTER of the owning table — matching
-    // the `'table' alter → alter_column` direction of mapSchemaMigrationType.
-    case 'add_column':
-    case 'drop_column':
-    case 'alter_column':
-      return { type: 'alter', objectType: 'table' };
+type AlterTableStmt = Extract<ReturnType<Parser['parse']>, { type: 'alterTable' }>;
+type ColumnDef = Extract<AlterTableStmt['action'], { type: 'addColumn' }>['column'];
+
+/**
+ * Idempotency decision for a replicated `alter_column` migration. The migration
+ * carries only the statement text, so parse it with the engine's own parser and
+ * compare the parsed alteration against the local {@link TableSchema}.
+ *
+ * Two peers offline can each run `alter table orders add column sku text`;
+ * whichever migration wins the HLC comparison is then delivered to a peer that
+ * already has `sku`. Re-executing the raw DDL there throws, aborting the whole
+ * admission unit before its CRDT metadata commits — the same permanent re-fail
+ * loop `create_table` idempotency exists to prevent.
+ */
+function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChangeAction {
+  let stmt: AlterTableStmt;
+  try {
+    const parsed = new Parser().parse(change.ddl);
+    if (parsed.type !== 'alterTable') return 'execute';
+    stmt = parsed;
+  } catch (e) {
+    // A parse failure must not be swallowed into a skip: execute the DDL so the
+    // underlying engine error is what the operator sees, not a parser message.
+    console.error(
+      `[Sync] Could not parse replicated ${change.type} DDL for ${change.schema}.${change.table} — executing as-is:`,
+      e,
+    );
+    return 'execute';
   }
+  const action = stmt.action;
+
+  // RENAME TO and the tag/maintained arms have no idempotency arm — execute as
+  // before. Replicating RENAME TO also needs the old name on the wire and a
+  // data-routing fix; that lands in `sync-replicate-rename-table`.
+  if (action.type === 'renameTable' || action.type === 'setTags' || action.type === 'dropTags'
+    || action.type === 'setMaintained' || action.type === 'dropMaintained') {
+    return 'execute';
+  }
+
+  const local = db.schemaManager.getTable(change.schema, change.table);
+  if (!local) {
+    // Nothing to alter: the receiver dropped the table (drop is the more
+    // destructive migration and wins). Converge with a warning rather than exec a
+    // statement that would throw `no such table` and abort the admission unit —
+    // consistent with drop_index's absent-owner arm.
+    console.warn(
+      `[Sync] Remote ${change.type} for ${change.schema}.${change.table} names a table this peer does not have — `
+        + `converging without applying: ${change.ddl}`,
+    );
+    return 'already-applied';
+  }
+
+  switch (action.type) {
+    case 'addColumn':
+      return decideAddColumn(local, action.column, change);
+    case 'dropColumn':
+      return localColumn(local, action.name) ? 'execute' : 'already-applied';
+    case 'renameColumn': {
+      // Old name still present ⇒ the rename has not happened here (if the new name
+      // ALSO exists the exec surfaces the engine's own duplicate-name error — a
+      // genuine divergence, not one to paper over).
+      if (localColumn(local, action.oldName)) return 'execute';
+      if (localColumn(local, action.newName)) return 'already-applied';
+      console.warn(
+        `[Sync] Remote ${change.type} for ${change.schema}.${change.table}: neither column `
+          + `'${action.oldName}' nor '${action.newName}' exists locally — converging without applying`,
+      );
+      return 'already-applied';
+    }
+    case 'addConstraint': {
+      const constraint = action.constraint;
+      // Named: presence of the name is the whole check — see the NOTE on
+      // decideAddColumn for why no definition comparison is attempted.
+      if (constraint.name) {
+        return namedConstraintExists(local, constraint.name) ? 'already-applied' : 'execute';
+      }
+      // Unnamed UNIQUE: an equivalent UNIQUE over the same column set converges.
+      if (constraint.type === 'unique' && constraint.columns) {
+        return equivalentUniqueExists(local, constraint.columns.map(c => c.name)) ? 'already-applied' : 'execute';
+      }
+      // Unnamed CHECK (or other forms): no identity to compare against — execute.
+      return 'execute';
+    }
+    case 'dropConstraint':
+      return namedConstraintExists(local, action.name) ? 'execute' : 'already-applied';
+    case 'renameConstraint': {
+      if (namedConstraintExists(local, action.oldName)) return 'execute';
+      if (namedConstraintExists(local, action.newName)) return 'already-applied';
+      console.warn(
+        `[Sync] Remote ${change.type} for ${change.schema}.${change.table}: neither constraint `
+          + `'${action.oldName}' nor '${action.newName}' exists locally — converging without applying`,
+      );
+      return 'already-applied';
+    }
+    case 'alterColumn': {
+      const col = localColumn(local, action.columnName);
+      if (!col) {
+        // Most-destructive-wins (docs/sync-schema.md § Conflict Resolution): a
+        // concurrent local DROP COLUMN beats the alteration, so converge.
+        console.warn(
+          `[Sync] Remote ${change.type} for ${change.schema}.${change.table}: column `
+            + `'${action.columnName}' does not exist locally — converging without applying: ${change.ddl}`,
+        );
+        return 'already-applied';
+      }
+      if (action.setDataType !== undefined) {
+        return inferType(action.setDataType).name === col.logicalType.name ? 'already-applied' : 'execute';
+      }
+      if (action.setNotNull !== undefined) {
+        return col.notNull === action.setNotNull ? 'already-applied' : 'execute';
+      }
+      if (action.setDefault !== undefined) {
+        if (action.setDefault === null) {
+          return col.defaultValue === null ? 'already-applied' : 'execute';
+        }
+        return col.defaultValue !== null
+          && expressionToString(col.defaultValue) === expressionToString(action.setDefault)
+          ? 'already-applied' : 'execute';
+      }
+      if (action.setCollation !== undefined) {
+        return col.collation.toLowerCase() === action.setCollation.toLowerCase() ? 'already-applied' : 'execute';
+      }
+      return 'execute';
+    }
+    case 'alterPrimaryKey': {
+      // NOTE: replicating a PK change re-keys the table on EVERY peer, and sync's
+      // cv:/tb:/cl: metadata is filed under the row's old pk identity — so conflict
+      // resolution for existing rows silently restarts from empty. Pre-existing for
+      // a local PK change; tracked as
+      // `bug-sync-rename-and-pk-change-strand-crdt-metadata` (tickets/backlog).
+      const wanted = action.columns;
+      const current = local.primaryKeyDefinition;
+      const same = wanted.length === current.length && wanted.every((w, i) => {
+        const def = current[i];
+        const col = local.columns[def.index];
+        return col.name.toLowerCase() === w.name.toLowerCase()
+          && (def.desc === true) === (w.direction === 'desc');
+      });
+      return same ? 'already-applied' : 'execute';
+    }
+    default:
+      return 'execute';
+  }
+}
+
+/** The local column named `name`, or undefined. */
+function localColumn(table: TableSchema, name: string): ColumnSchema | undefined {
+  const idx = table.columnIndexMap.get(name.toLowerCase());
+  return idx === undefined ? undefined : table.columns[idx];
+}
+
+/**
+ * ADD COLUMN idempotency: absent ⇒ execute; present with the same LOGICAL TYPE ⇒
+ * converged; present with a different type ⇒ conflict.
+ *
+ * NOTE: only the logical type is compared, deliberately. A type difference is the
+ * dangerous divergence — two peers would interpret the same rows under different
+ * shapes, exactly what the create_table arm refuses to paper over. Anything
+ * richer would compare an AST column definition (rendered from the origin's
+ * statement) against a ColumnSchema (rendered from the receiver's catalog), and
+ * those do not round-trip: an unnamed inline CHECK is auto-named `_check_<col>`
+ * on the way into the catalog, session `default_column_nullability` decides
+ * whether `not null` is even spelled, and so on. A false conflict permanently
+ * blocks the peer — strictly worse than converging on a constraint-level
+ * difference. So constraint-level drift between two same-named, same-typed
+ * columns converges silently; if that ever bites, the fix is to compare parsed
+ * schemas, not rendered text.
+ */
+function decideAddColumn(
+  local: TableSchema,
+  column: ColumnDef,
+  change: SchemaChangeToApply,
+): SchemaChangeAction {
+  const existing = localColumn(local, column.name);
+  if (!existing) return 'execute';
+  const wanted = inferType(column.dataType);
+  if (wanted.name === existing.logicalType.name) return 'already-applied';
+  throw new Error(
+    `Schema conflict applying remote ${change.type} for ${change.schema}.${change.table}: ` +
+    `column '${column.name}' already exists with type ${existing.logicalType.name}, ` +
+    `but the remote alteration adds it as ${wanted.name}.\n` +
+    `  remote: ${change.ddl}`
+  );
+}
+
+/**
+ * True when the table already has a UNIQUE constraint over exactly this column
+ * set (order-insensitive — `unique (a, b)` and `unique (b, a)` enforce the same
+ * predicate). A column name the local table lacks ⇒ false, and the exec surfaces
+ * the engine's own error.
+ */
+function equivalentUniqueExists(table: TableSchema, columnNames: readonly string[]): boolean {
+  const wanted: number[] = [];
+  for (const name of columnNames) {
+    const idx = table.columnIndexMap.get(name.toLowerCase());
+    if (idx === undefined) return false;
+    wanted.push(idx);
+  }
+  const wantedKey = [...wanted].sort((a, b) => a - b).join(',');
+  return (table.uniqueConstraints ?? []).some(uc =>
+    [...uc.columns].sort((a, b) => a - b).join(',') === wantedKey);
 }
 
 /**
@@ -516,15 +702,9 @@ async function applySchemaChange(
   change: SchemaChangeToApply,
   _options: ApplyToStoreOptions
 ): Promise<void> {
-  // A blank `ddl` still reaches here: the four object-lifecycle migrations
-  // (create/drop table, add/drop index) now carry canonical text, but the
-  // `*_column` migrations do not, and a peer on an older build still sends blank
-  // drop/index migrations. Such a migration runs nothing, so it also EMITS
-  // nothing — registering a remote-event expectation for it would leave that
-  // expectation pending forever (the emitter refcounts expectations and never
-  // expires them), and the next genuine LOCAL DDL of the same signature would be
-  // consumed by it, marked remote, and dropped from the SyncManager's local-fact
-  // capture — silently never replicated.
+  // A blank `ddl` can still reach here from a peer on an older build (blank
+  // drop/index/alter migrations). Such a migration runs nothing; skip it before
+  // deciding anything (an empty string is not a parseable statement).
   if (change.ddl.trim() === '') {
     // Deliberately NOT scoped to `alter_column`, unlike the origin-side warning in
     // `recordSchemaMigration` (sync-manager-impl.ts): a peer on an older build can
@@ -542,9 +722,6 @@ async function applySchemaChange(
     return;
   }
 
-  // Decide BEFORE registering the remote-event expectation, for the same reason:
-  // an expectation for DDL that is then not executed would linger and mis-mark a
-  // later genuine LOCAL DDL of the same signature as remote.
   if (decideSchemaChange(db, change) === 'already-applied') {
     console.debug(
       `[Sync] Remote ${change.type} for ${change.schema}.${change.table} already applied locally — converging without re-executing DDL`
@@ -552,35 +729,18 @@ async function applySchemaChange(
     return;
   }
 
-  const { type: eventType, objectType } = schemaEventSignature(change.type);
-
-  // Register this as an expected remote event BEFORE executing DDL.
-  // When the module emits the event, it will be automatically marked as
-  // remote, so SyncManager won't re-record it.
-  // This approach avoids race conditions with concurrent local DDL.
-  events.expectRemoteSchemaEvent({
-    type: eventType,
-    objectType,
-    schemaName: change.schema,
-    objectName: change.table,
-  });
-
+  // Mark every schema event the replicated DDL emits as remote, so the
+  // SyncManager doesn't re-record it as a local change and broadcast it back
+  // out. The scope covers zero, one, or several events, and the `finally`
+  // releases it whether the exec succeeds or throws — so a statement that emits
+  // nothing leaves no residue to swallow the next genuine local DDL. (See
+  // `StoreEventEmitter.beginRemoteSchemaScope` for the concurrency tradeoff.)
+  events.beginRemoteSchemaScope(change.schema, change.table);
   try {
-    // Execute the DDL statement
-    // The module will emit a schema event, which will be marked as remote
     await db.exec(change.ddl);
-  } catch (e) {
-    // Clear the expectation if DDL failed
-    events.clearExpectedRemoteSchemaEvent({
-      type: eventType,
-      objectType,
-      schemaName: change.schema,
-      objectName: change.table,
-    });
-    throw e;
+  } finally {
+    events.endRemoteSchemaScope(change.schema, change.table);
   }
-  // Note: We don't emit a separate event here anymore.
-  // The module's event is automatically marked as remote.
 }
 
 /**

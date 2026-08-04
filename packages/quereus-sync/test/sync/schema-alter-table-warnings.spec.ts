@@ -10,6 +10,8 @@
  */
 
 import { expect } from 'chai';
+import type { TransactionCommitBatch } from '@quereus/quereus';
+import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import {
 	DEFAULT_ORDERS_DDL,
 	closePeer,
@@ -135,6 +137,50 @@ describe('alter table sync replication', () => {
 			await closePeer(x);
 			await closePeer(y);
 		}
+	});
+
+	// The two warnings themselves remain, for third-party modules / older-build
+	// peers that still produce DDL-less events or blank migrations. A real
+	// ALTER TABLE can no longer reach them (every arm carries text), so drive
+	// them synthetically.
+	it('the origin-side warning still fires for a DDL-less alter event', async () => {
+		const batch: TransactionCommitBatch = {
+			dataEvents: [],
+			schemaEvents: [{
+				type: 'alter',
+				objectType: 'table',
+				moduleName: 'store',
+				schemaName: 'main',
+				objectName: 'orders',
+				remote: false,
+			}],
+		};
+
+		const warns = await captureWarnings(async () => {
+			a.manager.enqueueTransactionCommit(batch);
+			await a.manager.whenCommitsSettled();
+		});
+
+		expect(warns.some(w => w.includes('main.orders') && w.includes('no DDL')),
+			`expected the blank-DDL migration warning, got: ${JSON.stringify(warns)}`).to.equal(true);
+	});
+
+	it('the receive-side warning still fires for a blank-DDL alter_column migration', async () => {
+		const applyToStore = createStoreAdapter({ db: b.db, storeModule: b.storeModule, events: b.events });
+
+		const warns = await captureWarnings(async () => {
+			const result = await applyToStore(
+				[],
+				[{ type: 'alter_column', schema: 'main', table: 'orders', ddl: '' }],
+				{ remote: true },
+			);
+			// Still counted applied — it just runs nothing.
+			expect(result.errors).to.deep.equal([]);
+			expect(result.schemaChangesApplied).to.equal(1);
+		});
+
+		expect(warns.some(w => w.includes('main.orders') && w.includes('no DDL')),
+			`expected the blank-DDL migration warning, got: ${JSON.stringify(warns)}`).to.equal(true);
 	});
 
 	it('never warns for create_table / drop_table / add_index / drop_index', async () => {
