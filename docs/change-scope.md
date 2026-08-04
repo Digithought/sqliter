@@ -230,20 +230,21 @@ AND-of-children so `subtreeHasSideEffects` is reliable.
 
 ### Materialized-view reference projection
 
-A `select` from a materialized view resolves to a `TableReference` on the MV's
-backing table (`_mv_<name>`), not a body expansion — so the analyzer would
-naively report the *backing table* as the watched table. A watcher usually wants
-the **sources**: the backing is maintained synchronously from them at the
-row-write boundary (row-time), and source-granularity is what the caller means by
-"watch this view".
+A `select` from a materialized view resolves to a `TableReference` on the
+maintained table itself (a materialized view *is* a table, registered under the
+name the user gave it), not a body expansion — so the analyzer would naively
+report that table as the watched one. A watcher usually wants the **sources**:
+the backing is maintained synchronously from them at the row-write boundary
+(row-time), and source-granularity is what the caller means by "watch this
+view".
 
-The analyzer therefore **projects** a materialized-view backing reference onto
-the MV's source tables. `Statement.getChangeScope()` passes
-`analyzeChangeScope` a `resolveMaterializedViewSource` resolver (backed by
-`SchemaManager.getMaterializedViewByBackingTable`); when a reference is a
-materialized view's backing table, its watch is replaced by the MV's
-cached source-union scope (`MaterializedViewSchema.sourceScope`, built once at
-registration by `buildSourceUnionScope`). The projected scope is `unionScopes`-d
+The analyzer therefore **projects** a maintained-table reference onto the MV's
+source tables. `Statement.getChangeScope()` passes `analyzeChangeScope` a
+`resolveMaterializedViewSource` resolver (backed by
+`SchemaManager.getMaintainedTable`); when a reference is a maintained table, its
+watch is replaced by that table's cached source-union scope
+(`TableDerivation.sourceScope`, built once at registration by
+`buildSourceUnionScope`). The projected scope is `unionScopes`-d
 into the result, so reading both the MV and a source directly reports the source
 once. v1's source-union is a `full` watch per source; a precise per-source
 row/group scope is a future refinement.

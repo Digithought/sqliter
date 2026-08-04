@@ -36,8 +36,11 @@ export interface ExternalRowChange {
 export interface IngestExternalChangesOptions {
 	/** Row-time covering-structure maintenance over the reported changes (default true). */
 	maintainMaterializedViews?: boolean;
-	/** Change capture (`_record*`): feeds `Database.watch` post-commit dispatch AND
-	 *  commit-time global-assertion evaluation (default true). */
+	/** Change capture (`_record*`) for the REPORTED rows: feeds `Database.watch`
+	 *  post-commit dispatch AND commit-time global-assertion evaluation (default true).
+	 *  Does not cover the batch's DERIVED writes — a maintained table driven by
+	 *  {@link maintainMaterializedViews} records its own realized deltas regardless
+	 *  (see `docs/mv-ingestion.md` § Facets). */
 	captureChanges?: boolean;
 	/** Parent-side FK actions for update/delete changes: transitive RESTRICT
 	 *  enforcement + CASCADE / SET NULL / SET DEFAULT propagation (default FALSE —

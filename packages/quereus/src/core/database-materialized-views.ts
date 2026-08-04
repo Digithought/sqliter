@@ -710,17 +710,31 @@ export class MaterializedViewManager {
 	 *    over `w` the projection is a watch on the (previously never-change-logged) `mv1`.
 	 *    Recording makes `main.mv1` a real changed base so `mv2`'s watcher fires.
 	 *
-	 * Keyed on the **maintained table's own** `primaryKeyDefinition` (logical, in the
-	 * table's column space — the same thing `AssertionEvaluator` derives via `_findTable`),
-	 * NOT `plan.backingPkDefinition`, which is the *physical* backing key and can differ
-	 * (collation-coarsened keys).
+	 * Keyed on `plan.mv.primaryKeyDefinition` — the SAME object `AssertionEvaluator` reads
+	 * (`_findTable(base).primaryKeyDefinition`), so the two never disagree on which columns
+	 * form a row's identity. `plan.backingPkDefinition` is that same key with each column's
+	 * collation *function* resolved (`resolveBackingPkColumns`); it would give identical
+	 * indices, but keying off the evaluator's own source keeps the agreement structural
+	 * rather than coincidental.
 	 *
-	 * Bounded by the realized per-statement delta, exactly like user DML: the bulk paths
-	 * (`materializeView` create-fill, `rebuildBacking` refresh, `attachMaintainedDerivation`)
-	 * call the host directly and never route through {@link postApplyBackingChanges}, and a
-	 * value-identical upsert reports no {@link BackingRowChange} at all, so a no-op
-	 * maintenance records nothing. Savepoints need no special handling — `_record*` writes
-	 * the current change-log layer, which `ROLLBACK TO` discards.
+	 * Bounded by the realized per-statement delta, exactly like user DML: the bulk fills
+	 * (`materializeView` create-fill, `rebuildBacking` refresh) write the host directly and
+	 * never route through {@link postApplyBackingChanges}, and a value-identical upsert
+	 * reports no {@link BackingRowChange} at all, so a no-op maintenance records nothing.
+	 * Savepoints need no special handling — `_record*` writes the current change-log layer,
+	 * which `ROLLBACK TO` discards.
+	 *
+	 * One DDL-scale exception: `attachMaintainedDerivation` writes the ATTACHED table
+	 * directly (unrecorded) but deliberately cascades its whole-set reconcile delta onward
+	 * (`materialized-view-helpers.ts` § "Cascade the GENUINE reconcile changes"), so a
+	 * CONSUMER maintained table records one entry per reconciled row for that one statement.
+	 * That is the intent — the consumer's content genuinely changed, so an assertion over it
+	 * should see the attach — but it is O(consumer rows) in a single transaction.
+	 *
+	 * Deliberately NOT gated on the ingestion seam's `captureChanges` facet
+	 * (`Database.ingestExternalRowChanges`): that flag governs the rows the CALLER reports
+	 * (already accounted for at the origin), while these are the engine's own derived
+	 * writes, which no external caller can have captured. See `docs/mv-ingestion.md`.
 	 */
 	// NOTE: change-log entries here are bounded by the REALIZED delta, which for a
 	// bounded-delta arm is O(rows touched). A full-rebuild MV whose body reshuffles many

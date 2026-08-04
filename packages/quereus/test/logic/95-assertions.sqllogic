@@ -1155,3 +1155,38 @@ drop assertion amv_mt_pos;
 drop table amv_mt;
 drop table amv_src;
 -- run
+
+-- --- Partial (WHERE-filtered) MV: a row LEAVING the view's scope records a DELETE ---
+-- The cases above are all driven by insert/update deltas. A row that stops satisfying the
+-- body's WHERE is evicted from the backing, and only recording that delete makes the
+-- maintained table a changed base at COMMIT.
+
+create table pw_t (id integer primary key, active integer, amt integer);
+create materialized view pw_mv as select id, amt from pw_t where active = 1;
+insert into pw_t values (1, 1, 5);
+create assertion pw_nonempty check (exists (select 1 from pw_mv));
+commit;
+-- run
+
+-- Warm-up past the CREATE-ASSERTION commit, which falls back to global re-evaluation.
+begin;
+insert into pw_t values (2, 1, 6);
+commit;
+-- run
+
+select id, amt from pw_mv order by id;
+→ [{ "id": 1, "amt": 5 }, { "id": 2, "amt": 6 }]
+
+-- Deactivating every row evicts both from the view; the realized delta is a pair of deletes.
+begin;
+update pw_t set active = 0;
+commit;
+-- error: Integrity assertion failed: pw_nonempty
+
+select id, amt from pw_mv order by id;
+→ [{ "id": 1, "amt": 5 }, { "id": 2, "amt": 6 }]
+
+drop assertion pw_nonempty;
+drop materialized view pw_mv;
+drop table pw_t;
+-- run

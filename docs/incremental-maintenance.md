@@ -427,11 +427,16 @@ on it:
   *direct* sources only, so a watch on `mv2` (over `mv1` over `w`) lands on `main.mv1`.
 
 Recording is bounded by the realized per-statement delta, exactly like user DML: the bulk
-paths (`materializeView` create-fill, `rebuildBacking` refresh, `attachMaintainedDerivation`)
-call the host directly and never route through `postApplyBackingChanges`, and a
-value-identical upsert reports no `BackingRowChange` at all. Savepoints need no special
-handling — the records land in the current layer and are discarded by `ROLLBACK TO` along
-with the backing write they describe.
+fills (`materializeView` create-fill, `rebuildBacking` refresh) call the host directly and
+never route through `postApplyBackingChanges`, and a value-identical upsert reports no
+`BackingRowChange` at all. Savepoints need no special handling — the records land in the
+current layer and are discarded by `ROLLBACK TO` along with the backing write they describe.
+
+`attachMaintainedDerivation` (`alter table … set maintained as …`) is the one DDL-scale
+exception: it writes the attached table directly, but deliberately cascades its whole-set
+reconcile delta to consumer maintained tables, so a consumer records one entry per
+reconciled row in that single statement. Intended — the consumer's content really did
+change — but O(consumer rows) in one transaction.
 
 One gap this does **not** close: `REFRESH MATERIALIZED VIEW` swaps committed contents via
 `replaceContents` (or a direct `applyMaintenance('replace-all')` on the constraint-bearing
