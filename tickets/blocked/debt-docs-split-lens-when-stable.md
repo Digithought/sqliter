@@ -100,3 +100,24 @@ The round-trip / lens-law prover (`schema/lens-prover.ts`, `analyzeRoundTrip` /
 `emitRoundTrip`) and the deploy-time GetPut/PutGet verdicts are the strongest `LENS-*`
 invariant candidates, analogous to how the view round-trip laws anchor the view-updateability
 area.
+
+## Update, 2026-08-04 — the "genuine obstacle" trigger is close
+
+Option 1 above says to promote this work when the grandfathered ceiling becomes a real
+obstacle. It nearly is. `docs/lens.md` now measures **18,310 words** against its recorded
+17,934 (`wc -w < docs/lens.md`), so it has grown 376 words since it was grandfathered and has
+**124 words of headroom left** before `yarn docs:check` fails on it. The checker reports this
+on every run:
+
+```
+docs/lens.md: 18310 words, 376 over its ratchet of 17934 — inside the 500-word grace band (124 left)
+```
+
+The next edit of any size to that document turns the gate red, at which point whoever makes it
+has to answer this ticket's question under time pressure. Nothing else has changed — the
+decision is still a human's, and the recommended default is still option 1 — but the window in
+which it can be answered calmly is now about one paragraph wide.
+
+Context for the answer: after `docs-split-schema-rename-detection` and
+`docs-split-sync-protocol` land, `docs/lens.md` is the **only** remaining entry in
+`docs/.doc-budget.json`. Every other document in `docs/` is under the 12,000-word cap.
