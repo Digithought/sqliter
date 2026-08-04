@@ -52,6 +52,32 @@ and reports the name as a missing table.
 A leading `with` clause on an `insert` should be visible everywhere in that statement,
 matching `update` / `delete` and matching what the insert's own source already gets.
 
+## Second arm: an insert's own `with` clause hides the ones it inherited
+
+Same site, same cause — `buildInsertStmt` building `parentCtes` by hand instead of going
+through `buildWithContext`. Because it starts that map empty and fills it from
+`stmt.withClause` alone, an insert that carries its own `with` clause loses every block
+it inherited from the enclosing statement, and `buildWithContext` prefers a non-empty
+explicit argument over the inherited ones, so nothing puts them back:
+
+```sql
+with a as (select id from p),
+     b as (with c as (select 1 as k) insert into q select id + 40, 1 from a returning id)
+select count(*) as n from b;
+-- QuereusError: Table 'a' not found in schema path: main
+```
+
+Drop the `with c as (select 1 as k)` and the same statement works. Verified on a tree
+carrying the `bug-dml-cte-body-cannot-see-sibling-cte` fix (which is what makes `a`
+inheritable in the first place — hence the `prereq:` above); without that fix this shape
+fails for the other reason too.
+
+Having `buildInsertStmt` call `buildWithContext` once at the top, the way
+`buildUpdateStmt` / `buildDeleteStmt` do, and threading the resulting context through
+the source build *and* the `returning` build closes both arms at once — that merge
+starts from the inherited `ctx.cteNodes` and layers the statement's own clause on top,
+so an own-name still shadows an inherited one.
+
 ## Notes
 
 Found during review of `bug-cte-reference-as-second-join-source-fails-at-runtime`, but
