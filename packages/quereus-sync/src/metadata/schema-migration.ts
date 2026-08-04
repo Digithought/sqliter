@@ -25,6 +25,8 @@ import {
  */
 export interface StoredMigration {
   type: SchemaMigrationType;
+  /** `rename_table` only: the table name before the rename. */
+  fromTable?: string;
   ddl: string;
   hlc: HLC;
   schemaVersion: number;
@@ -32,15 +34,21 @@ export interface StoredMigration {
 
 /**
  * Serialize a migration for storage.
- * Format: 30 bytes HLC + 4 bytes version + 1 byte type length + type + ddl
+ * Format: 30 bytes HLC + 4 bytes version + 1 byte type length + type
+ *         + 2 bytes fromTable byte-length (big-endian; 0 = absent) + fromTable + ddl
+ *
+ * The `fromTable` slot sits BEFORE the ddl because the ddl is "rest of buffer" —
+ * nothing can be appended after it. Inserting the slot is an incompatible layout
+ * change, covered by the `fv:` gate (SYNC_METADATA_FORMAT_VERSION 5 in keys.ts).
  */
 export function serializeMigration(migration: StoredMigration): Uint8Array {
   const encoder = new TextEncoder();
   const typeBytes = encoder.encode(migration.type);
+  const fromBytes = encoder.encode(migration.fromTable ?? '');
   const ddlBytes = encoder.encode(migration.ddl);
   const hlcBytes = serializeHLC(migration.hlc);
 
-  const buffer = new Uint8Array(30 + 4 + 1 + typeBytes.length + ddlBytes.length);
+  const buffer = new Uint8Array(30 + 4 + 1 + typeBytes.length + 2 + fromBytes.length + ddlBytes.length);
   let offset = 0;
 
   // HLC (30 bytes)
@@ -57,6 +65,12 @@ export function serializeMigration(migration: StoredMigration): Uint8Array {
   offset += 1;
   buffer.set(typeBytes, offset);
   offset += typeBytes.length;
+
+  // fromTable byte-length (2 bytes, big-endian; 0 = absent) + fromTable
+  view.setUint16(offset, fromBytes.length, false);
+  offset += 2;
+  buffer.set(fromBytes, offset);
+  offset += fromBytes.length;
 
   // DDL (rest of buffer)
   buffer.set(ddlBytes, offset);
@@ -86,10 +100,24 @@ export function deserializeMigration(buffer: Uint8Array): StoredMigration {
   const type = decoder.decode(buffer.slice(offset, offset + typeLength)) as SchemaMigrationType;
   offset += typeLength;
 
+  // fromTable (2-byte big-endian byte-length; 0 = absent)
+  const fromLength = view.getUint16(offset, false);
+  offset += 2;
+  const fromTable = fromLength > 0
+    ? decoder.decode(buffer.slice(offset, offset + fromLength))
+    : undefined;
+  offset += fromLength;
+
   // DDL
   const ddl = decoder.decode(buffer.slice(offset));
 
-  return { type, ddl, hlc, schemaVersion };
+  return {
+    type,
+    ...(fromTable !== undefined ? { fromTable } : {}),
+    ddl,
+    hlc,
+    schemaVersion,
+  };
 }
 
 /**
@@ -201,6 +229,7 @@ export class SchemaMigrationStore {
         type: stored.type,
         schema: parsed.schema,
         table: parsed.table,
+        ...(stored.fromTable !== undefined ? { fromTable: stored.fromTable } : {}),
         ddl: stored.ddl,
         hlc: stored.hlc,
         schemaVersion: stored.schemaVersion,

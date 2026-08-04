@@ -76,4 +76,23 @@ describe('sync metadata format version', () => {
 		expect(error, 'open must fail').to.not.be.undefined;
 		expect(error!.message).to.match(/format version 99 does not match/i);
 	});
+
+	it('refuses version-4 metadata under version 5 (the rename_table record-layout bump)', async () => {
+		// v4 `sm:` records end with the DDL as "rest of buffer"; v5 inserts a
+		// length-prefixed fromTable slot before it, so a v4 record would mis-parse
+		// silently. The gate must refuse loudly instead.
+		expect(SYNC_METADATA_FORMAT_VERSION).to.equal(5);
+		await create();
+		await kv.put(SYNC_KEY_PREFIX.FORMAT_VERSION, new TextEncoder().encode('4'));
+
+		let error: Error | undefined;
+		try {
+			await create();
+		} catch (e) {
+			error = e as Error;
+		}
+		expect(error, 'open must fail').to.not.be.undefined;
+		expect(error!.message).to.match(/format version 4 does not match/i);
+		expect(error!.message, 'names the recovery').to.match(/re-bootstrap/i);
+	});
 });

@@ -90,4 +90,56 @@ describe('snapshot DDL is ordered causally, not by key', () => {
 
 		expect(hasIndex(receiver), 'the index bootstrapped despite the sender order').to.be.true;
 	});
+
+});
+
+describe('snapshot DDL replays create-then-rename in causal order', () => {
+	// Own peers, NOT the shared beforeEach above: that one inserts a PRE-rename row,
+	// whose sync bookkeeping is keyed by table name and so would snapshot under the
+	// old name — a table the replayed DDL has renamed away
+	// (bug-sync-rename-and-pk-change-strand-crdt-metadata). Data here is inserted
+	// only after the rename.
+	let sender: Peer;
+	let receiver: Peer;
+
+	beforeEach(async () => {
+		sender = await makePeer('sender', { createOrders: true });
+		receiver = await makePeer('receiver');
+		await localWrite(sender, 'alter table orders rename to orders2');
+		await localWrite(sender, "insert into orders2 (id, note) values (2, 'renamed')");
+	});
+
+	afterEach(async () => {
+		await closePeer(sender);
+		await closePeer(receiver);
+	});
+
+	it('a fresh receiver bootstraps the renamed table from a streamed snapshot', async () => {
+		// The rename must replay AFTER the create it renames — a fresh peer holds
+		// neither name, so out-of-order replay would leave the rename undecidable
+		// (converged without applying) and the receiver stuck on the old name.
+		const chunks: SnapshotChunk[] = [];
+		for await (const c of sender.manager.getSnapshotStream()) chunks.push(c);
+		const migrations = chunks
+			.filter((c): c is SnapshotSchemaMigrationChunk => c.type === 'schema-migration')
+			.map(c => c.migration.type);
+		expect(migrations.indexOf('create_table'), 'create emitted before rename')
+			.to.be.lessThan(migrations.indexOf('rename_table'));
+
+		await receiver.manager.applySnapshotStream(toStream(chunks));
+
+		expect(receiver.db.schemaManager.getTable('main', 'orders2'), 'orders2 bootstrapped').to.not.be.undefined;
+		expect(receiver.db.schemaManager.getTable('main', 'orders'), 'orders renamed away').to.be.undefined;
+		expect(await collect(receiver.db, 'select note from orders2 where id = 2'))
+			.to.deep.equal([{ note: 'renamed' }]);
+	});
+
+	it('a fresh receiver bootstraps the renamed table from a whole snapshot', async () => {
+		await receiver.manager.applySnapshot(await sender.manager.getSnapshot());
+
+		expect(receiver.db.schemaManager.getTable('main', 'orders2'), 'orders2 bootstrapped').to.not.be.undefined;
+		expect(receiver.db.schemaManager.getTable('main', 'orders'), 'orders renamed away').to.be.undefined;
+		expect(await collect(receiver.db, 'select note from orders2 where id = 2'))
+			.to.deep.equal([{ note: 'renamed' }]);
+	});
 });

@@ -73,6 +73,7 @@ export type Change = ColumnChange | RowDeletion;
 export type SchemaMigrationType =
   | 'create_table'
   | 'drop_table'
+  | 'rename_table'
   | 'add_column'
   | 'drop_column'
   | 'add_index'
@@ -100,7 +101,7 @@ export function migrationObjectKind(type: SchemaMigrationType): SchemaObjectKind
 		case 'add_index':
 		case 'drop_index':
 			return 'index';
-		// create/drop table and the three column-level types all name a TABLE.
+		// create/drop/rename table and the three column-level types all name a TABLE.
 		default:
 			return 'table';
 	}
@@ -112,7 +113,14 @@ export function migrationObjectKind(type: SchemaMigrationType): SchemaObjectKind
 export interface SchemaMigration {
   readonly type: SchemaMigrationType;
   readonly schema: string;
+  /** The object's name AFTER this migration (for a `rename_table`, the NEW name). */
   readonly table: string;
+  /**
+   * `rename_table` only: the table name before the rename. The migration itself
+   * is keyed under the NEW name (`table`), so every subsequent alteration of the
+   * renamed table stays in one contiguous version stream where the table lives.
+   */
+  readonly fromTable?: string;
   readonly ddl: string;           // The DDL statement
   readonly hlc: HLC;              // When migration occurred
   readonly schemaVersion: number; // Monotonic per (object kind, object name)
@@ -475,7 +483,10 @@ export interface DataChangeToApply {
 export interface SchemaChangeToApply {
   readonly type: SchemaMigrationType;
   readonly schema: string;
+  /** The object's name AFTER the migration (for a `rename_table`, the NEW name). */
   readonly table: string;
+  /** `rename_table` only: the table name before the rename. */
+  readonly fromTable?: string;
   /** The DDL statement to execute. */
   readonly ddl: string;
 }
@@ -486,6 +497,8 @@ export function toSchemaChange(migration: SchemaMigration): SchemaChangeToApply 
 		type: migration.type,
 		schema: migration.schema,
 		table: migration.table,
+		// Present-only, so a non-rename migration carries no phantom key.
+		...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
 		ddl: migration.ddl,
 	};
 }

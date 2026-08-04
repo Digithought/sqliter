@@ -7,12 +7,16 @@
  * receiver. These specs drive each alteration arm end to end over two real
  * engines via `relayAll`, asserting with `generateTableDDL` — one comparison
  * that covers shape, order, types, nullability, collation, defaults and
- * constraints at once. `RENAME TO` is deliberately absent: replicating it needs
- * the old name on the wire and a data-routing fix (`sync-replicate-rename-table`).
+ * constraints at once. `RENAME TO` is the exception: it records its own
+ * `rename_table` migration carrying the old name (`fromTable`), decided by
+ * `decideRenameTable` and routed through `computeBatchTableFates` so data for
+ * the new name keeps flowing in the very batch that renames — see the
+ * `rename to` block at the end.
  */
 
 import { expect } from 'chai';
 import { generateTableDDL } from '@quereus/quereus';
+import { compareHLC } from '../../src/clock/hlc.js';
 import {
 	DEFAULT_ORDERS_DDL,
 	closePeer,
@@ -275,6 +279,232 @@ describe('alter table replication', () => {
 			await relayAll(b, a);
 			expect(a.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase()))
 				.to.include('local_col');
+		});
+	});
+
+	describe('rename to', () => {
+		let a: Peer;
+		let b: Peer;
+
+		const hasTable = (peer: Peer, name: string): boolean =>
+			peer.db.schemaManager.getTable('main', name) !== undefined;
+
+		const ddlOf = (peer: Peer, name: string): string =>
+			generateTableDDL(peer.db.schemaManager.getTable('main', name)!);
+
+		beforeEach(async () => {
+			[a, b] = await makeSyncedPair();
+			// Reconcile the two independent `create table orders` migrations first —
+			// same reason as the convergence describe, plus one rename-specific twist:
+			// after a renames `orders` away, an unreconciled create_table for `orders`
+			// arriving later from b would find the name free and re-create it.
+			await relayAll(a, b);
+			await relayAll(b, a);
+		});
+
+		afterEach(async () => {
+			await closePeer(a);
+			await closePeer(b);
+		});
+
+		it('the rename reaches the peer: b has orders2, no orders, identical DDL', async () => {
+			await localWrite(a, 'alter table orders rename to orders2');
+
+			const res = await relayAll(a, b);
+
+			expect(res.unknownTable ?? 0, 'nothing diverted').to.equal(0);
+			expect(hasTable(b, 'orders2'), 'b has orders2').to.equal(true);
+			expect(hasTable(b, 'orders'), 'b no longer has orders').to.equal(false);
+			expect(ddlOf(b, 'orders2'), 'receiver table DDL').to.equal(ddlOf(a, 'orders2'));
+		});
+
+		it('data keeps flowing across the rename (the headline case)', async () => {
+			// Pre-rename row lands on b under the old name first (incremental sync).
+			await localWrite(a, "insert into orders (id, note) values (1, 'before')");
+			const preSets = await a.manager.getChangesSince(b.manager.getSiteId());
+			await b.manager.applyChanges(preSets);
+			await settle();
+			expect(await collect(b.db, 'select note from orders where id = 1'))
+				.to.deep.equal([{ note: 'before' }]);
+
+			// Watermark the way a real consumer does — `lastSyncHLC = ChangeSet.hlc`
+			// (each set's MAX fact HLC) — so the next pull is a true incremental
+			// delta: [rename, post-rename row] in one batch. (`getCurrentHLC` reads
+			// clock STATE, which equals the last transaction's base — not past it.)
+			const since = preSets
+				.map(cs => cs.hlc)
+				.reduce((max, h) => (compareHLC(h, max) > 0 ? h : max));
+			await localWrite(a, 'alter table orders rename to orders2');
+			await localWrite(a, "insert into orders2 (id, note) values (2, 'after')");
+
+			const sets = await a.manager.getChangesSince(b.manager.getSiteId(), since);
+			const res = await b.manager.applyChanges(sets);
+			await settle();
+
+			expect(res.unknownTable ?? 0, 'no rows filed under an unknown table').to.equal(0);
+			// The post-rename row landed, and the pre-rename row survived the rename.
+			expect(await collect(b.db, 'select id, note from orders2 order by id')).to.deep.equal([
+				{ id: 1, note: 'before' },
+				{ id: 2, note: 'after' },
+			]);
+			expect(hasTable(b, 'orders'), 'b no longer has orders').to.equal(false);
+			expect(ddlOf(b, 'orders2')).to.equal(ddlOf(a, 'orders2'));
+		});
+
+		it('a rename in the same transaction as writes files every fact under the new name', async () => {
+			// The engine's renameBatchedEvents relabels the batched insert to the new
+			// name before commit, so the wire batch never mentions `orders` for data.
+			await a.db.exec('begin');
+			await a.db.exec("insert into orders (id, note) values (7, 'tx')");
+			await a.db.exec('alter table orders rename to orders2');
+			await a.db.exec('commit');
+			await settle();
+
+			const sets = await a.manager.getChangesSince(b.manager.getSiteId());
+			const txChanges = sets.flatMap(cs => [...cs.changes]);
+			expect(txChanges.length, 'the insert was captured').to.be.greaterThan(0);
+			expect(txChanges.every(c => c.table === 'orders2'), 'all facts under the new name').to.equal(true);
+
+			const res = await b.manager.applyChanges(sets);
+			await settle();
+			expect(res.unknownTable ?? 0).to.equal(0);
+			expect(await collect(b.db, 'select note from orders2 where id = 7'))
+				.to.deep.equal([{ note: 'tx' }]);
+		});
+
+		it('rename onto an independently created table throws naming both, and half-applies nothing', async () => {
+			await localWrite(b, 'create table orders2 (x text primary key) using store');
+			await localWrite(a, 'alter table orders rename to orders2');
+
+			let caught: Error | undefined;
+			try {
+				await relayAll(a, b);
+			} catch (e) {
+				caught = e as Error;
+			}
+
+			expect(caught, 'the collision surfaces').to.be.instanceOf(Error);
+			expect(caught!.message).to.include('orders');
+			expect(caught!.message).to.include('orders2');
+			// Nothing half-applied: b keeps its own orders AND its own orders2 shape.
+			expect(hasTable(b, 'orders'), 'b keeps orders').to.equal(true);
+			expect(b.db.schemaManager.getTable('main', 'orders2')!.columns.map(c => c.name.toLowerCase()))
+				.to.deep.equal(['x']);
+		});
+
+		it('both peers independently rename and converge, both directions', async () => {
+			// Same two-gate shape as the identical-alteration test: a → b absorbed by
+			// the version guard, b → a admitted and resolved by decideRenameTable's
+			// already-applied arm (old absent, new present).
+			await localWrite(a, 'alter table orders rename to orders2');
+			await localWrite(b, 'alter table orders rename to orders2');
+
+			await relayAll(a, b);
+			await relayAll(b, a);
+
+			for (const peer of [a, b]) {
+				expect(hasTable(peer, 'orders2'), `${peer.name} has orders2`).to.equal(true);
+				expect(hasTable(peer, 'orders'), `${peer.name} has no orders`).to.equal(false);
+			}
+			expect(ddlOf(b, 'orders2')).to.equal(ddlOf(a, 'orders2'));
+		});
+
+		it('a rename of a table the receiver dropped converges without applying (drop wins)', async () => {
+			await localWrite(b, 'drop table orders');
+			await localWrite(a, 'alter table orders rename to orders2');
+
+			const res = await relayAll(a, b);
+
+			expect(res, 'no throw').to.be.an('object');
+			expect(hasTable(b, 'orders'), 'orders stays dropped').to.equal(false);
+			expect(hasTable(b, 'orders2'), 'nothing was renamed into being').to.equal(false);
+		});
+
+		it('a rename_table without fromTable (an omitting peer) is undecidable and converges', async () => {
+			await localWrite(a, 'alter table orders rename to orders2');
+			const sets = await a.manager.getChangesSince(b.manager.getSiteId());
+			const stripped = sets.map(cs => ({
+				...cs,
+				schemaMigrations: cs.schemaMigrations.map(m =>
+					m.type === 'rename_table' ? (({ fromTable: _ft, ...rest }) => rest)(m) : m),
+			}));
+
+			const res = await b.manager.applyChanges(stripped);
+			await settle();
+
+			expect(res, 'no throw').to.be.an('object');
+			expect(hasTable(b, 'orders'), 'b keeps orders — the rename was undecidable').to.equal(true);
+			expect(hasTable(b, 'orders2')).to.equal(false);
+		});
+
+		it('chained rename orders → orders2 → orders3 in one batch leaves only orders3', async () => {
+			await localWrite(a, 'alter table orders rename to orders2');
+			await localWrite(a, 'alter table orders2 rename to orders3');
+
+			const res = await relayAll(a, b);
+
+			expect(res.unknownTable ?? 0).to.equal(0);
+			expect(hasTable(b, 'orders'), 'orders gone').to.equal(false);
+			expect(hasTable(b, 'orders2'), 'orders2 gone').to.equal(false);
+			expect(hasTable(b, 'orders3'), 'orders3 present').to.equal(true);
+			expect(ddlOf(b, 'orders3')).to.equal(ddlOf(a, 'orders3'));
+		});
+
+		it('rename then drop in one batch leaves neither name', async () => {
+			await localWrite(a, 'alter table orders rename to orders2');
+			await localWrite(a, 'drop table orders2');
+
+			await relayAll(a, b);
+
+			expect(hasTable(b, 'orders'), 'orders gone').to.equal(false);
+			expect(hasTable(b, 'orders2'), 'orders2 gone').to.equal(false);
+		});
+
+		it('rename then rename back in one batch leaves the original name', async () => {
+			await localWrite(a, 'alter table orders rename to orders2');
+			await localWrite(a, 'alter table orders2 rename to orders');
+
+			await relayAll(a, b);
+
+			expect(hasTable(b, 'orders'), 'orders back').to.equal(true);
+			expect(hasTable(b, 'orders2'), 'orders2 gone').to.equal(false);
+			expect(ddlOf(b, 'orders')).to.equal(ddlOf(a, 'orders'));
+		});
+
+		it('a relayed rename keeps fromTable and stays decidable at a third peer', async () => {
+			// The receiver records the inbound migration into its own metadata; if that
+			// record dropped fromTable, b's re-relay (and its snapshots) would ship the
+			// rename undecidable and c would silently keep the old name.
+			await localWrite(a, 'alter table orders rename to orders2');
+			await relayAll(a, b);
+
+			const c = await makePeer('c');
+			try {
+				const outbound = (await b.manager.getChangesSince(c.manager.getSiteId()))
+					.flatMap(cs => [...cs.schemaMigrations]);
+				const rename = outbound.find(m => m.type === 'rename_table');
+				expect(rename, 'b re-relays the rename').to.not.equal(undefined);
+				expect(rename!.fromTable, 'with the old name intact').to.equal('orders');
+
+				await relayAll(b, c);
+				expect(c.db.schemaManager.getTable('main', 'orders2'), 'c applied the rename').to.not.be.undefined;
+				expect(c.db.schemaManager.getTable('main', 'orders'), 'c has no orders').to.be.undefined;
+			} finally {
+				await closePeer(c);
+			}
+		});
+
+		it('the same rename batch delivered twice is absorbed by the version guard', async () => {
+			await localWrite(a, 'alter table orders rename to orders2');
+			const sets = await a.manager.getChangesSince(b.manager.getSiteId());
+
+			await b.manager.applyChanges(sets);
+			const second = await b.manager.applyChanges(sets);
+			await settle();
+
+			expect(second.applied, 'nothing new on the second pass').to.equal(0);
+			expect(hasTable(b, 'orders2')).to.equal(true);
+			expect(hasTable(b, 'orders')).to.equal(false);
 		});
 	});
 

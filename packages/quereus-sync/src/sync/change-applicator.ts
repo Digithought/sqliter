@@ -8,7 +8,7 @@
  */
 
 import type { WriteBatch } from '@quereus/store';
-import { compareHLC, maxHLC, assertWithinDrift } from '../clock/hlc.js';
+import { compareHLC, maxHLC, assertWithinDrift, type HLC } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
@@ -84,64 +84,91 @@ interface BatchTableFate {
 	/** The table exists after this batch's schema steps replay in timestamp order. */
 	present: boolean;
 	/**
-	 * A `drop_table` precedes the deciding `create_table`, so the batch's DDL sequence
-	 * re-creates the table. Whether the LOCAL table is therefore a new, EMPTY
-	 * incarnation additionally requires that drop to be APPLIED here rather than
+	 * An ABSENCE step (a `drop_table`, or a `rename_table` moving this name away)
+	 * precedes the deciding presence step, so the batch's DDL sequence re-creates the
+	 * table under this name. Whether the LOCAL table is therefore a new, EMPTY
+	 * incarnation additionally requires that absence to be APPLIED here rather than
 	 * skipped as HLC-dominated — the read site ANDs this with `appliedDropKeys`.
 	 */
 	recreated: boolean;
 }
 
+/** One existence step a batch migration contributes for one `(schema, table)`. */
+interface TableExistenceStep {
+	readonly hlc: HLC;
+	/** The table exists after this step replays. */
+	readonly present: boolean;
+}
+
 /**
  * Per-table verdict on what this batch's schema migrations leave behind, keyed
- * `schema.table`. Tables with no `create_table` / `drop_table` step in the batch are
- * absent from the map (only those two kinds change whether a table exists — there is
- * no rename in {@link SchemaMigrationType} — so the other kinds are ignored here).
+ * `schema.table`. Tables with no existence step in the batch are absent from the map.
+ * Three migration kinds change whether a table exists: `create_table` and `drop_table`
+ * contribute one step for their own table, and `rename_table` contributes TWO steps at
+ * its own HLC — the new name (`table`) becomes present, the old name (`fromTable`)
+ * becomes absent. A `rename_table` whose `fromTable` is missing (an omitting peer)
+ * contributes only the new-name half. The other kinds are ignored here.
  *
  * Detection runs at Phase 1, before any DDL executes in Phase 2, so the verdict has to
  * be derived from the steps' HLCs rather than observed: `present` is decided by the
- * table's LAST create/drop step in timestamp order — the same total order
+ * table's LAST existence step in timestamp order — the same total order
  * {@link orderMigrationsByHLC} replays them in — not by set membership, so a
- * create → drop → create batch correctly reports the table present. Computed over the
- * WHOLE batch because admission applies all schema changes before all data, including
- * migrations Phase 1a later skips as HLC-dominated: a skipped migration means the
- * receiver already reached that state, so the verdict is unchanged.
+ * create → drop → create (or rename-away → rename-back) batch correctly reports the
+ * table present. Computed over the WHOLE batch because admission applies all schema
+ * changes before all data, including migrations Phase 1a later skips as HLC-dominated:
+ * a skipped migration means the receiver already reached that state, so the verdict is
+ * unchanged.
  */
 function computeBatchTableFates(changes: ChangeSet[]): Map<string, BatchTableFate> {
-	// Per table: the max-HLC create/drop step (which decides existence) and the max-HLC
-	// drop (which decides whether the surviving table is a new incarnation).
-	const lastStep = new Map<string, SchemaMigration>();
-	const lastDrop = new Map<string, SchemaMigration>();
+	// Per table: the max-HLC existence step (which decides existence) and the max-HLC
+	// ABSENCE step — a drop, or a rename-away — (which decides whether the surviving
+	// table is a new incarnation).
+	const lastStep = new Map<string, TableExistenceStep>();
+	const lastAbsence = new Map<string, TableExistenceStep>();
+	const addStep = (schema: string, table: string, step: TableExistenceStep): void => {
+		const key = tableKey(schema, table);
+		keepLatestStep(lastStep, key, step);
+		if (!step.present) keepLatestStep(lastAbsence, key, step);
+	};
 	for (const changeSet of changes) {
 		for (const migration of changeSet.schemaMigrations) {
-			if (migration.type !== 'create_table' && migration.type !== 'drop_table') continue;
-			const key = tableKey(migration.schema, migration.table);
-			keepLatestStep(lastStep, key, migration);
-			if (migration.type === 'drop_table') keepLatestStep(lastDrop, key, migration);
+			switch (migration.type) {
+				case 'create_table':
+					addStep(migration.schema, migration.table, { hlc: migration.hlc, present: true });
+					break;
+				case 'drop_table':
+					addStep(migration.schema, migration.table, { hlc: migration.hlc, present: false });
+					break;
+				case 'rename_table':
+					addStep(migration.schema, migration.table, { hlc: migration.hlc, present: true });
+					if (migration.fromTable !== undefined) {
+						addStep(migration.schema, migration.fromTable, { hlc: migration.hlc, present: false });
+					}
+					break;
+			}
 		}
 	}
 
 	const fates = new Map<string, BatchTableFate>();
 	for (const [key, step] of lastStep) {
-		const present = step.type === 'create_table';
-		const drop = lastDrop.get(key);
+		const absence = lastAbsence.get(key);
 		fates.set(key, {
-			present,
-			recreated: present && drop !== undefined && compareHLC(drop.hlc, step.hlc) < 0,
+			present: step.present,
+			recreated: step.present && absence !== undefined && compareHLC(absence.hlc, step.hlc) < 0,
 		});
 	}
 	return fates;
 }
 
 /**
- * Keep the migration that replays LAST for a key. Ties keep the later-arriving one,
+ * Keep the step that replays LAST for a key. Ties keep the later-arriving one,
  * matching {@link orderMigrationsByHLC}'s stable sort (equal HLCs stay in arrival
  * order, so the last of them executes last) — unlike {@link keepMaxHLC}, which keeps
  * the first of a tie because it collapses repeats of ONE fact.
  */
-function keepLatestStep(latest: Map<string, SchemaMigration>, key: string, migration: SchemaMigration): void {
+function keepLatestStep(latest: Map<string, TableExistenceStep>, key: string, step: TableExistenceStep): void {
 	const prev = latest.get(key);
-	if (!prev || compareHLC(migration.hlc, prev.hlc) >= 0) latest.set(key, migration);
+	if (!prev || compareHLC(step.hlc, prev.hlc) >= 0) latest.set(key, step);
 }
 
 /**
@@ -258,17 +285,24 @@ export async function applyChanges(
 		applied++;
 	}
 
-	// Tables whose `drop_table` this batch actually APPLIES (Phase 1a kept it; it was not
-	// skipped as HLC-dominated). Only an executed drop leaves whatever the batch
-	// re-creates a genuinely EMPTY table, so this is the second half of the
-	// `freshLocalTable` test below: a RE-DELIVERED drop/re-create batch has every schema
-	// step dominated, changes no local schema, and the local table is already the
-	// post-re-create incarnation — its metadata is that incarnation's and must still be
-	// consulted, or the batch's rows would clobber newer writes read-free.
+	// Tables whose ABSENCE step this batch actually APPLIES (Phase 1a kept it; it was
+	// not skipped as HLC-dominated): a `drop_table` of the table, or a `rename_table`
+	// moving that name away (the stranded metadata under the old name belongs to the
+	// renamed-away incarnation, not to anything later re-created there). Only an
+	// executed absence leaves whatever the batch re-creates a genuinely EMPTY table, so
+	// this is the second half of the `freshLocalTable` test below: a RE-DELIVERED
+	// drop/re-create batch has every schema step dominated, changes no local schema,
+	// and the local table is already the post-re-create incarnation — its metadata is
+	// that incarnation's and must still be consulted, or the batch's rows would clobber
+	// newer writes read-free.
 	const appliedDropKeys = new Set(
-		pendingSchemaMigrations
-			.filter(({ migration }) => migration.type === 'drop_table')
-			.map(({ migration }) => tableKey(migration.schema, migration.table)),
+		pendingSchemaMigrations.flatMap(({ migration }) => {
+			if (migration.type === 'drop_table') return [tableKey(migration.schema, migration.table)];
+			if (migration.type === 'rename_table' && migration.fromTable !== undefined) {
+				return [tableKey(migration.schema, migration.fromTable)];
+			}
+			return [];
+		}),
 	);
 
 	// PHASE 1b: Resolve all data changes (no writes yet). The clock watermark is merged
@@ -376,6 +410,10 @@ export async function applyChanges(
 					migration.table,
 					{
 						type: migration.type,
+						// Carry the rename's old name into local storage, or this
+						// receiver's own re-relay/snapshot would ship the rename
+						// without it — undecidable downstream.
+						...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
 						ddl: migration.ddl,
 						hlc: migration.hlc,
 						schemaVersion,

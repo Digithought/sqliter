@@ -48,6 +48,12 @@ export const SYNC_KEY_PREFIX = {
 /**
  * Current sync-metadata storage format version, persisted under the `fv:` key.
  *
+ * Version 5: schema migration RECORDS (`sm:` values) carry a length-prefixed
+ * `fromTable` slot between the migration type and the DDL (see
+ * `metadata/schema-migration.ts`), so a `rename_table` migration can name the
+ * table it renamed. The DDL was previously "rest of buffer", so the slot could
+ * not be appended — version-4 records are unreadable under this layout.
+ *
  * Version 4: schema migration keys (`sm:`) carry the object KIND (`table` /
  * `index`) alongside the object name, so a table and a same-named index no
  * longer share one version counter and suppress each other's migrations
@@ -67,7 +73,7 @@ export const SYNC_KEY_PREFIX = {
  * mismatches must re-bootstrap from a peer snapshot (see docs/sync.md
  * § Metadata format version).
  */
-export const SYNC_METADATA_FORMAT_VERSION = 4;
+export const SYNC_METADATA_FORMAT_VERSION = 5;
 
 /** Separator between a component's length and the component itself. */
 const SEPARATOR = ':';

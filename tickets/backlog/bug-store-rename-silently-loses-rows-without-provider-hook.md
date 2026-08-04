@@ -56,5 +56,7 @@ Two directions, both defensible, and the choice is the substance of this ticket:
   more cheaply.
 
 Whichever is chosen, the interface documentation on `renameTableStores` should
-state the consequence of omitting it, and the sync test harness's backend should
-be brought in line so it stops modelling a configuration that loses data.
+state the consequence of omitting it. (The sync test harness half is done:
+`sync-replicate-rename-table` added `renameTableStores` to the harness's
+in-memory backend, so it no longer models the data-losing configuration. The
+store module's silent skip — the root cause — remains.)

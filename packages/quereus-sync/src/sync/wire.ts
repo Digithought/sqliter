@@ -141,6 +141,12 @@ export interface SerializedSchemaMigration {
   type: string;
   schema: string;
   table: string;
+  /**
+   * `rename_table` only: the table name before the rename. Optional so a peer
+   * that omits it deserializes to `undefined` — the receiver then treats the
+   * rename as undecidable (see store-adapter.ts `decideSchemaChange`).
+   */
+  fromTable?: string;
   ddl: string;
   hlc: string;
   schemaVersion: number;
@@ -243,6 +249,8 @@ function serializeSchemaMigration(m: SchemaMigration): SerializedSchemaMigration
     type: m.type,
     schema: m.schema,
     table: m.table,
+    // Present-only: never emit a phantom `fromTable` key for a non-rename.
+    ...(m.fromTable !== undefined ? { fromTable: m.fromTable } : {}),
     ddl: m.ddl,
     hlc: serializeHLCForTransport(m.hlc),
     schemaVersion: m.schemaVersion,
@@ -254,6 +262,7 @@ function deserializeSchemaMigration(m: SerializedSchemaMigration): SchemaMigrati
     type: m.type as SchemaMigrationType,
     schema: m.schema,
     table: m.table,
+    ...(m.fromTable !== undefined ? { fromTable: m.fromTable } : {}),
     ddl: m.ddl,
     hlc: deserializeHLCFromTransport(m.hlc),
     schemaVersion: m.schemaVersion,

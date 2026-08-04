@@ -221,6 +221,40 @@ describe('wire protocol', () => {
       expect(restored).to.deep.equal(cs);
     });
 
+    it('round-trips a rename_table migration WITH fromTable', () => {
+      const migration: SchemaMigration = {
+        type: 'rename_table',
+        schema: 'main',
+        table: 'orders2',
+        fromTable: 'orders',
+        ddl: 'alter table main.orders rename to orders2',
+        hlc: hlc(600, 0),
+        schemaVersion: 1,
+      };
+      const cs = makeChangeSet([], [migration]);
+      const restored = deserializeChangeSet(serializeChangeSet(cs));
+      expect(restored).to.deep.equal(cs);
+      expect(restored.schemaMigrations[0].fromTable).to.equal('orders');
+    });
+
+    it('omits fromTable for a non-rename migration and keeps absence through a round-trip', () => {
+      const migration: SchemaMigration = {
+        type: 'create_table',
+        schema: 'main',
+        table: 't',
+        ddl: 'create table t (id integer primary key)',
+        hlc: hlc(500, 0),
+        schemaVersion: 1,
+      };
+      const serialized = serializeChangeSet(makeChangeSet([], [migration]));
+      expect(serialized.schemaMigrations[0]).to.not.have.property('fromTable');
+
+      // A peer that omits fromTable on a rename (older build) deserializes to
+      // undefined — the receiver treats that rename as undecidable.
+      const restored = deserializeChangeSet(serialized);
+      expect(restored.schemaMigrations[0]).to.not.have.property('fromTable');
+    });
+
     it('reads schemaMigrations leniently: absent → [] (does not throw)', () => {
       const cs = makeChangeSet([]);
       const serialized = serializeChangeSet(cs);

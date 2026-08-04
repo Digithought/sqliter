@@ -165,7 +165,27 @@ consistent with `drop_index`'s absent-owner arm.
 | `alter column … set/drop default` | rendered local default equals the target expression | execute |
 | `alter column … set collate` | local collation equals the target, case-insensitively | execute |
 | `alter primary key` | local PK column names and directions already equal the target list | execute |
-| `rename to`, tag / maintained arms | — | execute (no idempotency arm; see § What replicates) |
+| tag / maintained arms | — | execute (no idempotency arm; see § What replicates) |
+
+`RENAME TO` is not decided here at all: a current origin records it as its own
+`rename_table` migration (see § What replicates below). An `alter_column` migration that
+turns out to parse as a rename can only come from a peer on an older build, and is
+executed as those builds always did.
+
+A `rename_table` migration carries the OLD table name in `fromTable` (the migration's
+`table` is the NEW name, which is also what it is keyed under, so later alterations of
+the renamed table stay in one contiguous version stream). The receiver decides it from
+the local catalog for both names:
+
+| old present | new present | verdict |
+|---|---|---|
+| yes | no | execute |
+| no | yes | already-applied — the rename already happened here |
+| yes | yes | **conflict** naming both tables — renaming would collide with an existing table; same posture as a divergent `create_table` |
+| no | no | converge with a warning — nothing to rename (the local drop was more destructive) |
+
+A `rename_table` whose `fromTable` is missing (an omitting peer) is undecidable and
+converges with a warning.
 
 Only `add column` compares any part of a definition, and only its **logical type**. A
 type mismatch is the dangerous divergence — two peers would interpret the same rows under
@@ -225,15 +245,39 @@ and the receiver re-executes the statement (idempotently — see the decision ta
 add / drop / rename column, add / drop / rename constraint, every `alter column`
 sub-form, and `alter primary key` all reach every synced peer.
 
-Two alteration-shaped changes still do **not** replicate usefully:
+**`RENAME TO` replicates, and data flows across it.** A rename records its own
+`rename_table` migration — filed under the NEW name, carrying the old one in `fromTable`
+(sourced from the schema event's `oldObjectName`, which only the store module's
+`renameTable` sets). Two things make the data path survive the rename:
 
-- **`RENAME TO`.** The migration is filed under the *new* table name, and the origin's
-  subsequent data stream writes under the new name while a peer still holds the old one —
-  replicating the rename needs the old name on the wire and a data-routing fix. That is
-  `sync-replicate-rename-table`. (`RENAME TO` events already carry `oldObjectName` for it.)
-- **The tag / maintained arms** (`SET TAGS`, `ADD TAGS`, `DROP TAGS`,
-  `SET`/`DROP MAINTAINED`). These are catalog-only and emit no schema event, so no
-  migration is ever recorded for them.
+- **In-batch routing.** The apply path's Phase-1 table-fate computation
+  (`computeBatchTableFates` in `change-applicator.ts`) treats a `rename_table` as two
+  existence steps at its own HLC — the new name becomes present, the old name absent — so
+  rows arriving under the new name in the very batch that carries the rename land instead
+  of taking the unknown-table disposition. Chained renames, rename-then-drop, and
+  rename-then-rename-back within one batch all resolve by the same max-HLC rule.
+- **Same-transaction writes.** The engine relabels a transaction's already-batched data
+  events to the new name before commit (`renameBatchedEvents`), so a rename in the same
+  transaction as writes files every fact under the new name.
+
+Two caveats:
+
+- **CRDT metadata is stranded at the old name.** Sync's per-row bookkeeping
+  (`cv:`/`tb:`/`cl:`) is keyed by table name, so both origin and receiver abandon it at
+  the old name and start empty at the new one — later conflict resolution and tombstone
+  blocking lose their history for the renamed table (an old delete no longer blocks a
+  replayed insert), a from-zero delta re-pull diverts pre-rename facts (still filed under
+  the old name) to the unknown-table disposition, and a snapshot taken after the rename
+  ships pre-rename rows under the retired name. Pre-existing for a purely local rename;
+  replicating the rename makes it happen on every peer. Tracked as
+  `bug-sync-rename-and-pk-change-strand-crdt-metadata`.
+- **Storage format bump.** Stored migration records gained a length-prefixed `fromTable`
+  slot before the DDL, so `SYNC_METADATA_FORMAT_VERSION` is now 5 — a replica with v4
+  metadata refuses to start and must re-bootstrap from a peer snapshot.
+
+**The tag / maintained arms** (`SET TAGS`, `ADD TAGS`, `DROP TAGS`,
+`SET`/`DROP MAINTAINED`) still do not replicate. These are catalog-only and emit no
+schema event, so no migration is ever recorded for them.
 
 **Backfilled values are not data facts.** `add column sku text default 'x'` writes every
 existing row inside `module.alterTable` (`migrateRows`), which emits no data events — so

@@ -42,6 +42,23 @@ export function createInMemoryProvider(): { provider: KVStoreProvider; stores: M
 			stores.delete(`${s}.${t}.__stats__`);
 			for (const i of indexNames) stores.delete(`${s}.${t}_idx_${i}`);
 		},
+		// Without this OPTIONAL hook the store module skips the physical move on
+		// `alter table … rename to` and the renamed table reads as empty — the
+		// harness would silently model a data-losing configuration
+		// (bug-store-rename-silently-loses-rows-without-provider-hook). Re-point the
+		// map entries without closing handles, mirroring deleteTableStores above.
+		async renameTableStores(s, oldName, newName, indexNames) {
+			const move = (from: string, to: string): void => {
+				const store = stores.get(from);
+				if (store) {
+					stores.set(to, store);
+					stores.delete(from);
+				}
+			};
+			move(`${s}.${oldName}`, `${s}.${newName}`);
+			move(`${s}.${oldName}.__stats__`, `${s}.${newName}.__stats__`);
+			for (const i of indexNames) move(`${s}.${oldName}_idx_${i}`, `${s}.${newName}_idx_${i}`);
+		},
 		async closeAll() {
 			for (const store of stores.values()) await store.close();
 			stores.clear();

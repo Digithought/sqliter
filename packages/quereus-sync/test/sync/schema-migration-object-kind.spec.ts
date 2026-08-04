@@ -20,6 +20,7 @@
  */
 
 import { expect } from 'chai';
+import { migrationObjectKind, type SchemaMigrationType } from '../../src/sync/protocol.js';
 import { makePeer, closePeer, localWrite, relayAll, type Peer } from './_peer-harness.js';
 
 const ORDERS_DDL = 'create table orders (id integer primary key, note text) using store';
@@ -35,6 +36,24 @@ const indexOwner = (peer: Peer, name: string): string | undefined =>
 
 const version = (peer: Peer, kind: 'table' | 'index', name: string): Promise<number> =>
 	peer.manager.schemaMigrations.getCurrentVersion('main', kind, name);
+
+describe('migrationObjectKind', () => {
+	it('maps every migration type to the kind of object it names', () => {
+		const expected: Record<SchemaMigrationType, 'table' | 'index'> = {
+			create_table: 'table',
+			drop_table: 'table',
+			rename_table: 'table',
+			add_column: 'table',
+			drop_column: 'table',
+			alter_column: 'table',
+			add_index: 'index',
+			drop_index: 'index',
+		};
+		for (const [type, kind] of Object.entries(expected)) {
+			expect(migrationObjectKind(type as SchemaMigrationType), type).to.equal(kind);
+		}
+	});
+});
 
 describe('schema migration version keys carry the object kind', () => {
 	let x: Peer;

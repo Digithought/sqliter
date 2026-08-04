@@ -270,6 +270,9 @@ export async function applySnapshot(
 					(await ctx.schemaMigrations.getCurrentVersion(migration.schema, kind, migration.table)) + 1;
 				await ctx.schemaMigrations.recordMigration(migration.schema, kind, migration.table, {
 					type: migration.type,
+					// Keep the rename's old name, or this replica's own re-relay/snapshot
+					// would ship the rename without it — undecidable downstream.
+					...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
 					ddl: migration.ddl,
 					hlc: migration.hlc,
 					schemaVersion,

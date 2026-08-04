@@ -107,17 +107,19 @@ export function assertOpSeqInRange(opSeq: number): void {
 }
 
 /**
- * Map an engine schema-change event `(objectType, type)` to the sync
- * {@link SchemaMigrationType} it records, or `undefined` when the combination is
- * not tracked for replication (e.g. column-level or view/trigger objects, or an
- * `alter` on an index). A `'table' alter` is recorded as `alter_column` — the
- * coarse "table definition changed" migration the schema-sync layer replays.
+ * Map an engine schema-change event to the sync {@link SchemaMigrationType} it
+ * records, or `undefined` when the combination is not tracked for replication
+ * (e.g. column-level or view/trigger objects, or an `alter` on an index). Takes
+ * the whole event rather than `(objectType, type)` because a rename is only
+ * distinguishable by `oldObjectName` — set by exactly one emit site, the store
+ * module's `renameTable` (the event's `objectName` carries the NEW name). Every
+ * other `'table' alter` is recorded as `alter_column` — the coarse "table
+ * definition changed" migration the schema-sync layer replays.
  */
-function mapSchemaMigrationType(
-	objectType: DatabaseSchemaChangeEvent['objectType'],
-	type: DatabaseSchemaChangeEvent['type'],
-): SchemaMigrationType | undefined {
+function mapSchemaMigrationType(event: DatabaseSchemaChangeEvent): SchemaMigrationType | undefined {
+	const { objectType, type } = event;
 	if (objectType === 'table') {
+		if (type === 'alter' && event.oldObjectName !== undefined) return 'rename_table';
 		switch (type) {
 			case 'create': return 'create_table';
 			case 'drop': return 'drop_table';
@@ -860,7 +862,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		nextHlc: () => HLC,
 		versionCounters: Map<string, number>,
 	): Promise<void> {
-		const migrationType = mapSchemaMigrationType(event.objectType, event.type);
+		const migrationType = mapSchemaMigrationType(event);
 		if (!migrationType) return;
 
 		const { schemaName, objectName, ddl } = event;
@@ -868,11 +870,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// Every tracked type now carries canonical DDL — ALTER TABLE events included
 		// (the engine renders the statement's schema-qualified SQL at plan-build and the
 		// store module puts it on the event; see SchemaChangeInfo.ddl). A blank
-		// `alter_column` can therefore only come from an older event producer; the
-		// migration below still records and still advances the schema version
-		// (destructiveness comparison depends on it), but a blank one reaches a peer as
-		// an empty statement, so it is still worth an operator hearing about.
-		if (migrationType === 'alter_column' && !ddl?.trim()) {
+		// `alter_column`/`rename_table` can therefore only come from an older event
+		// producer; the migration below still records and still advances the schema
+		// version (destructiveness comparison depends on it), but a blank one reaches a
+		// peer as an empty statement, so it is still worth an operator hearing about.
+		if ((migrationType === 'alter_column' || migrationType === 'rename_table') && !ddl?.trim()) {
 			console.warn(
 				`[Sync] ${schemaName}.${objectName}: recording an ${migrationType} migration with no DDL — `
 					+ `this table alteration will NOT reach other synced devices`,
@@ -897,8 +899,16 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		version += 1;
 		versionCounters.set(counterKey, version);
 
+		// A rename files under the NEW name (`objectName`) with the old one in
+		// `fromTable`, so later alterations of the renamed table share one contiguous
+		// version stream where the table actually lives. The rename may start a fresh
+		// counter under the new name (version 1 if nothing was ever named that) —
+		// harmless, the same thing happens when a dropped name is reused.
 		this.schemaMigrations.recordMigrationBatch(batch, schemaName, kind, objectName, {
 			type: migrationType,
+			...(migrationType === 'rename_table' && event.oldObjectName !== undefined
+				? { fromTable: event.oldObjectName }
+				: {}),
 			ddl: ddl || '',
 			hlc: nextHlc(),
 			schemaVersion: version,

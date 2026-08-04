@@ -455,6 +455,8 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
     }
     case 'drop_table':
       return db.schemaManager.getTable(change.schema, change.table) ? 'execute' : 'already-applied';
+    case 'rename_table':
+      return decideRenameTable(db, change);
     case 'add_index': {
       // For an index migration `change.table` holds the INDEX name, not the
       // table name (see `mapSchemaMigrationType` / `recordSchemaMigration`).
@@ -482,6 +484,60 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // them as before.
       return 'execute';
   }
+}
+
+/**
+ * Idempotency / conflict decision for a replicated `rename_table` migration,
+ * read from the local catalog for BOTH names:
+ *
+ * | old present | new present | verdict |
+ * |---|---|---|
+ * | yes | no  | execute |
+ * | no  | yes | already-applied — the rename already happened here |
+ * | yes | yes | THROW a conflict naming both tables (see below) |
+ * | no  | no  | converge with a warning — nothing to rename (drop won) |
+ *
+ * A missing `fromTable` (a peer that omitted it) makes the migration
+ * undecidable: converge with a warning rather than exec a statement whose
+ * outcome we cannot predict.
+ *
+ * The yes/yes row throws rather than picking a side: renaming would collide
+ * with a table that already exists, and silently keeping either shape would
+ * record "converged" for a divergence that is not — the same posture as a
+ * divergent `create_table` (see {@link assertDefinitionMatches}'s NOTE).
+ *
+ * NOTE: sync's per-row bookkeeping (`cv:`/`tb:`/`cl:`) is keyed by table name,
+ * so both origin and receiver strand it at the old name and start empty at the
+ * new one — later conflict resolution and tombstone blocking lose their history
+ * for the renamed table (an old delete no longer blocks a replayed insert).
+ * Pre-existing for a purely local rename; replicating the rename makes it
+ * happen on every peer. Tracked as
+ * `bug-sync-rename-and-pk-change-strand-crdt-metadata` (tickets/backlog).
+ */
+function decideRenameTable(db: Database, change: SchemaChangeToApply): SchemaChangeAction {
+  if (change.fromTable === undefined) {
+    console.warn(
+      `[Sync] Remote ${change.type} for ${change.schema}.${change.table} carries no old table name — `
+        + `undecidable; converging without applying: ${change.ddl}`,
+    );
+    return 'already-applied';
+  }
+  const oldPresent = db.schemaManager.getTable(change.schema, change.fromTable) !== undefined;
+  const newPresent = db.schemaManager.getTable(change.schema, change.table) !== undefined;
+  if (oldPresent && newPresent) {
+    throw new Error(
+      `Schema conflict applying remote ${change.type} for ${change.schema}.${change.fromTable}: ` +
+      `renaming to ${change.schema}.${change.table} would collide with a table that already exists locally.\n` +
+      `  remote: ${change.ddl}`
+    );
+  }
+  if (oldPresent) return 'execute';
+  if (newPresent) return 'already-applied';
+  console.warn(
+    `[Sync] Remote ${change.type} for ${change.schema}.${change.table}: neither `
+      + `'${change.fromTable}' nor '${change.table}' exists locally — converging without applying: ${change.ddl}`,
+  );
+  return 'already-applied';
 }
 
 /**
@@ -527,9 +583,10 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
   // the two here first.
   const action = stmt.action;
 
-  // RENAME TO and the tag/maintained arms have no idempotency arm — execute as
-  // before. Replicating RENAME TO also needs the old name on the wire and a
-  // data-routing fix; that lands in `sync-replicate-rename-table`.
+  // The tag/maintained arms have no idempotency arm — execute as before. A
+  // renameTable action under `alter_column` can only come from a peer on an older
+  // build (a current origin records it as `rename_table`, decided by
+  // decideRenameTable above); execute it as those builds always did.
   if (action.type === 'renameTable' || action.type === 'setTags' || action.type === 'dropTags'
     || action.type === 'setMaintained' || action.type === 'dropMaintained') {
     return 'execute';
@@ -768,11 +825,19 @@ async function applySchemaChange(
   // releases it whether the exec succeeds or throws — so a statement that emits
   // nothing leaves no residue to swallow the next genuine local DDL. (See
   // `StoreEventEmitter.beginRemoteSchemaScope` for the concurrency tradeoff.)
-  events.beginRemoteSchemaScope(change.schema, change.table);
+  //
+  // A rename_table scopes BOTH names: the store module's renameTable announces
+  // under the NEW name (`change.table`), but scoping the old one too costs
+  // nothing and protects against a module that announces under the pre-rename
+  // name.
+  const scopeNames = change.type === 'rename_table' && change.fromTable !== undefined
+    ? [change.table, change.fromTable]
+    : [change.table];
+  for (const name of scopeNames) events.beginRemoteSchemaScope(change.schema, name);
   try {
     await db.exec(change.ddl);
   } finally {
-    events.endRemoteSchemaScope(change.schema, change.table);
+    for (const name of scopeNames) events.endRemoteSchemaScope(change.schema, name);
   }
 }
 

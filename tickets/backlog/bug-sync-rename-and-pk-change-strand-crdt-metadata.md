@@ -41,6 +41,22 @@ Losing that history is not merely untidy — it changes which writes win:
 - **The stranded records are never reclaimed.** They are scanned on every delta
   extraction and re-shipped to every newly bootstrapping device, forever.
 
+Two further consequences, observed while implementing `sync-replicate-rename-table`
+(the rename now replicates, so these fire on real peers):
+
+- **A from-scratch delta pull loses pre-rename rows to quarantine.** A device that
+  re-pulls the full change history (for example after losing its sync watermark)
+  receives the pre-rename rows still filed under the old table name, in the same batch
+  as the rename itself. The apply path correctly concludes the old name no longer
+  exists after that batch, so those rows are diverted to the unknown-table disposition
+  (quarantined by default) instead of landing in the renamed table — even though the
+  receiver may already hold them there.
+- **A snapshot taken after the rename cannot bootstrap the pre-rename rows.** Snapshot
+  data is enumerated from the stranded per-cell records, so pre-rename rows are shipped
+  under the retired table name. A fresh device replays the DDL (create, then rename)
+  and then fails to apply that data — the table by the old name no longer exists. Only
+  rows written after the rename bootstrap cleanly.
+
 ## How to reproduce (inferred from the key layout, not yet run)
 
 On one device: create a table, delete a row, rename the table, then have a second device
