@@ -391,8 +391,12 @@ function buildAddColumnChecks(
   const targetColumns = [...tableSchema.columns, { name: columnDef.name }];
   const rowScope = buildRowDefaultScope(ctx.scope, targetColumns, rowAttrs);
 
+  // Schema-authored, same as the backfill expression above and as every CHECK the DML
+  // builders compile: a bare relation name means the ALTERED table's own schema, not
+  // whatever path the ALTER runs on.
+  const checkCtx = { ...schemaAuthoredContext(ctx, tableSchema.schemaName), scope: rowScope };
   const predicates = checkConstraints.map(con => ({
-    node: buildExpression({ ...ctx, scope: rowScope }, con.expr!) as ScalarPlanNode,
+    node: buildExpression(checkCtx, con.expr!) as ScalarPlanNode,
     name: con.name,
     exprText: expressionToString(con.expr!),
   }));

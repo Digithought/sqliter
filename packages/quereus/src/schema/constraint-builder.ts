@@ -339,6 +339,12 @@ export async function validateChecksOverExistingRows(
 		const sql = `select 1 from ${tableRef} where not (${exprSql}) limit 1`;
 		log('CHECK existing-row validation for %s.%s: %s', tableSchema.schemaName, tableSchema.name, sql);
 		const stmt = db.prepare(sql);
+		// The CHECK is SCHEMA-AUTHORED, so a bare relation name inside it means the OWNING
+		// table's schema — not the session path this freshly-prepared scan would otherwise
+		// inherit. Owning schema only, matching `schemaAuthoredContext`
+		// (planner/building/schema-authored-context.ts), which decides the same thing for
+		// every CHECK the DML builders compile.
+		stmt._schemaPathOverride = [tableSchema.schemaName];
 		try {
 			for await (const _row of stmt._iterateRowsRaw()) {
 				throw onViolation?.(check, exprSql) ?? new QuereusError(

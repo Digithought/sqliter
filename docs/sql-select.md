@@ -315,7 +315,10 @@ Quereus supports flexible schema resolution through search paths. Unqualified re
 
 **Tables, views and materialized views resolve identically.** The path applies to every unqualified relation name written *anywhere in the statement that declares it* — in a `FROM` clause, as an `INSERT` / `UPDATE` / `DELETE` target, and inside that statement's other clauses (a subquery in `RETURNING`, in an `INSERT`'s `VALUES` row, in `SET` / `WHERE`). The path is walked **one schema at a time**, and each entry's tables *and* views are checked **together** before moving to the next entry; the first entry holding an object of that name wins, whatever its kind. So a table named `x` in an earlier path entry beats a view named `x` in a later one. (A table and a view of the same name inside one schema is impossible — `create table` and `create view` reject a name the other already holds.)
 
-**Stored bodies are the exception:** a view / materialized-view body (like a CHECK-constraint or foreign-key body) resolves its unqualified names against the **owning object's schema first**, then the session default path — never the calling statement's `WITH SCHEMA` path. A view declared next to its tables in a non-`main` schema therefore reads correctly under any session path, and `refresh materialized view` is path-independent.
+**Anything written in an object's own definition is the exception** — it resolves against that object's schema, never the calling statement's `WITH SCHEMA` path, in two grades:
+
+- A **view / materialized-view body** resolves unqualified names against the **owning object's schema first**, then the session default path. A view declared next to its tables in a non-`main` schema therefore reads correctly under any session path, and `refresh materialized view` is path-independent.
+- A **schema-authored expression** — a column `DEFAULT`, a generated-column expression, a `CHECK` constraint, a foreign-key existence check — is stricter: the **owning table's schema only**, with no fallback to the default path. So a `DEFAULT (select count(*) from c)` on a table in `temp` always counts `temp.c`, whatever the writing statement's path, and one naming a relation in another schema must qualify it.
 
 **DDL landing vs. read resolution (deliberate asymmetry):** unqualified DDL (`create table` / `create view` / `create index` / `drop …` / `alter … tags`) lands objects in the **current schema** (`SchemaManager.setCurrentSchema`, an embedder API — there is no SQL surface for it), while unqualified *reads* resolve only via the search path above, which does **not** consult the current schema. An embedder that sets a non-`main` current schema must also set `schema_path` (or qualify references); otherwise objects it creates are invisible to unqualified reads. Pure-SQL users are unaffected — the current schema is always `main` unless an embedder changes it.
 
@@ -794,9 +797,11 @@ select ... from cte_name ...
   (A *subquery* in `ON CONFLICT` or `WITH CONTEXT` currently resolves but does not yet
   execute — an unrelated planner gap, tracked separately.)
 - **Schema-authored** expressions are deliberately excluded: a column `DEFAULT`, a
-  generated-column expression, and a `CHECK` constraint belong to the table's DDL rather
-  than to the statement, so `DEFAULT (SELECT count(*) FROM c)` always binds the real `c`
-  even when the inserting statement declares a CTE of that name.
+  generated-column expression, a `CHECK` constraint and a foreign-key existence check
+  belong to the table's DDL rather than to the statement, so
+  `DEFAULT (SELECT count(*) FROM c)` always binds the real `c` even when the inserting
+  statement declares a CTE of that name — and binds it in the *table's own* schema, not
+  the writer's (see [§2.1.1](#211-schema-search-path-with-schema)).
 
 ```sql
 -- A writing CTE reading an earlier reading CTE

@@ -227,6 +227,63 @@ insert into temp.sp_cross (id) values (1);
 select count(*) as n from temp.sp_cross;
 → [{"n":0}]
 
+-- ===== ALTER TABLE ADD COLUMN's CHECK, validated over the existing rows =====
+-- The new column's CHECK is enforced against rows already in the table by a scan
+-- re-prepared from the constraint's own SQL text (`validateBackfillAgainstChecks` in
+-- runtime/emit/alter-table.ts). A freshly-prepared statement carries the SESSION path,
+-- so that scan needs the owning schema pinned on it explicitly — the planning-context
+-- helper never sees it. Both directions, since one alone cannot tell a narrowed path
+-- from a scan that silently did nothing.
+
+create table temp.sp_ac (id integer primary key);
+insert into temp.sp_ac values (1);
+create table temp.sp_acx (id integer primary key);
+insert into temp.sp_acx values (1);
+-- run
+
+-- true only against the main.c decoy (1 row) ⇒ must be REJECTED
+alter table temp.sp_acx add column x integer default 0 check ((select count(*) from c) = 1);
+-- error: CHECK
+
+-- true against temp.c (3 rows), beside the table ⇒ must be ACCEPTED
+alter table temp.sp_ac add column x integer default 0 check ((select count(*) from c) = 3);
+-- run
+
+select id, x from temp.sp_ac order by id;
+→ [{"id":1,"x":0}]
+
+-- ===== A maintained table's declared CHECK, both when it is created and when it derives =====
+-- `create table … maintained as` reaches the same CHECK bodies by two routes that neither
+-- INSERT nor UPDATE uses: the create-time scan over the already-derived rows
+-- (`validateChecksOverExistingRows`, schema/constraint-builder.ts — again a re-prepared
+-- statement, so the path is pinned on the statement) and the per-derived-row validator
+-- (`core/derived-row-validator.ts`, which builds on its OWN fresh planning context — the
+-- one call site that would have lost the narrowing when the constraint and foreign-key
+-- builders stopped narrowing internally).
+
+create table temp.mt_src (id integer primary key, n integer);
+insert into temp.mt_src values (1, 2);
+-- run
+
+-- Created while `temp.mt_src` already holds n = 2: passes against temp.c (2 <= 3),
+-- would fail against the main.c decoy (2 <= 1).
+create table temp.mt (id integer primary key, n integer not null check (n <= (select count(*) from c)))
+	maintained as select id, n from mt_src;
+-- run
+
+select id, n from temp.mt order by id;
+→ [{"id":1,"n":2}]
+
+-- and a row derived AFTER creation goes through the derived-row validator instead
+insert into temp.mt_src values (2, 3);
+
+select id, n from temp.mt order by id;
+→ [{"id":1,"n":2},{"id":2,"n":3}]
+
+-- the same validator must still REJECT: 9 > 3, against temp.c
+insert into temp.mt_src values (3, 9);
+-- error: CHECK
+
 -- ===== A user-declared schema behaves identically (not a `temp`-only special case) =====
 
 declare schema spapp {
@@ -253,6 +310,10 @@ select id, w from spapp.t order by id;
 -- Cleanup
 drop table spapp.t;
 drop table spapp.c;
+drop table temp.mt;
+drop table temp.mt_src;
+drop table temp.sp_acx;
+drop table temp.sp_ac;
 drop table temp.sp_cross;
 drop table main.sp_only;
 drop table temp.sp_q;

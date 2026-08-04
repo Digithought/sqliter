@@ -1007,6 +1007,12 @@ async function validateBackfillAgainstChecks(
 		const checkSql = expressionToString(cc.expr);
 		const sql = `select 1 from ${qualifiedTable} where not (${checkSql}) limit 1`;
 		const stmt = rctx.db.prepare(sql);
+		// The CHECK is SCHEMA-AUTHORED: it belongs to the altered table's own DDL, so a
+		// bare relation name inside it means the ALTERED table's schema — not the session
+		// path this freshly-prepared validation statement would otherwise inherit. Owning
+		// schema ONLY, matching `schemaAuthoredContext` (planner/building/schema-authored-context.ts),
+		// which decides the same thing for every CHECK the DML builders compile.
+		stmt._schemaPathOverride = [columnOnlySchema.schemaName];
 		try {
 			let violated = false;
 			for await (const _row of stmt._iterateRowsRaw()) {

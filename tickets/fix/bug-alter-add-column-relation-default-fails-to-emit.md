@@ -54,6 +54,25 @@ an optimizer-visible child. Nothing rewrites its relational subtree to physical,
 non-foldable default runs) is reached the same way and looks like the same problem, though
 it was not separately reproduced.
 
+**Scope correction (added during the review of `bug-column-default-ignores-owning-table-schema`):**
+a CHECK on an ADD COLUMN is enforced by *two* different mechanisms, and only one of them is
+in this ticket's blast radius.
+
+- The **bulk** enforcement over the rows already in the table — `validateBackfillAgainstChecks`
+  in `runtime/emit/alter-table.ts` — re-prepares the constraint's own SQL text as an ordinary
+  `select … where not (<check>)` statement. That is a normal planned statement, so a CHECK
+  reading another table works there today; verified with
+  `alter table t add column x integer default 0 check ((select count(*) from c) = 3)`, which
+  correctly accepts and rejects. It is unaffected by this bug.
+- The **per-row** predicates (`action.checks.predicates[].node`) only exist when there IS a
+  per-row backfill — i.e. exactly the non-foldable DEFAULT / GENERATED case this ticket is
+  about — so they cannot be exercised until the emit problem is fixed. When it is, add an arm
+  for a relation-reading CHECK alongside the relation-reading default.
+
+Both of those sites now carry the owning-table schema narrowing (the review wrapped the
+compiled predicates via `schemaAuthoredContext` and pinned the bulk scan's schema path), so
+neither needs revisiting for schema resolution — only for emit.
+
 This is the same *shape* as the already-completed
 `bug-dml-side-expressions-invisible-to-optimizer`, which fixed it for `DmlExecutorNode`'s
 `ON CONFLICT` expressions by exposing them as optimizer-visible children. That ticket is a

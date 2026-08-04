@@ -54,6 +54,15 @@ import type { PlanningContext } from '../planning-context.js';
  * schema path, stored-body marker) because a body is re-entered as its own plan; this
  * one keeps the caller's scope because these expressions stay inline.
  *
+ * NOTE: this helper covers every schema-authored expression that is BUILT — but two
+ * CHECK-enforcement paths re-prepare the constraint's own SQL text as a whole statement
+ * instead, so they never reach a planning context and pin the same `[schemaName]` path on
+ * the {@link import('../../core/statement.js').Statement} directly:
+ * `validateBackfillAgainstChecks` (`runtime/emit/alter-table.ts`, ADD COLUMN over existing
+ * rows) and `validateChecksOverExistingRows` (`schema/constraint-builder.ts`, maintained
+ * tables). Two spellings of one rule is tolerable at two sites; if a third appears, give
+ * the statement seam its own helper rather than a fourth copy.
+ *
  * @param schemaName the owning table's schema name — REQUIRED, so no call site can
  *   silently inherit the writing statement's path.
  */
