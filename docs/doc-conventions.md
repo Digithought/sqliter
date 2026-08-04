@@ -158,6 +158,29 @@ editing one without the other fails. It cannot read the assignment table — tha
 — so a tier changed there alone leaves the build green and the table disagreeing with the
 banners. Edit all three.
 
+## Where new prose goes
+
+**A topic doc is a map, not a log.** New material belongs in the smallest home that fits, and
+appending to the biggest file is never the smallest home — that is how a doc reaches 38,000 words
+one honest section at a time.
+
+- If a feature *changes* what an existing section says, **edit that section.** Do not append a
+  section that contradicts one above it; a doc carrying both readings has already drifted.
+- If it needs a new section and that section is small — rule of thumb, under ~400 words — add it
+  to the topic doc.
+- Otherwise it becomes a **satellite**: `docs/<hub>-<topic>.md`, classified in
+  `docs/.stability.json` at its hub's tier, opening with an H1, a stability banner, and an intro
+  closing `A satellite of [Hub](hub.md).`, and listed in the hub's `## Topic documents` table. A
+  hub with satellites carries that table directly below its intro — copy the shape from
+  `docs/optimizer.md`, which has eleven.
+- **Never append to a doc the checker is already warning about.** A near-cap or drift notice means
+  the next section goes in a satellite, not in that file.
+
+Some prose is not design prose and does not belong in `docs/` at all. An API or usage detail goes
+in the package `README.md`; a local mechanism, or a concern that only becomes work if some
+condition trips later, goes in a `NOTE:` comment at the code site. For unimplemented work,
+[Where each one goes](#where-each-one-goes) above already names the home.
+
 ## The size ratchet
 
 `docs/.doc-budget.json` records each large doc's current word count. A doc may shrink; it
@@ -177,6 +200,17 @@ slow leak: `--update-ratchet` still refuses to raise, which bounds total unforce
 (`docs/sync.md: 12,670 words, 132 over its ratchet of 12,538 — inside the 500-word grace
 band (368 left)`), so the doc that is about to run out gets several runs of warning first.
 
+**An unratcheted doc gets the same runway.** Once it is within `slackWords` of the cap the check
+prints a notice too, so the warning arrives *before* the failure rather than with it:
+
+```
+docs/optimizer.md: 11965 words, 35 from the 12000-word cap — the cap has no grace band, so split before the next section lands
+```
+
+Both of these are notices, not failures: `yarn docs:check` still exits 0, and a healthy run prints
+one line per doc that is running out of room. A doc named there is a doc whose next section belongs
+in a satellite.
+
 After a doc shrinks, lower its entry — this is expected routine, not an event, and it is
 what buys the band back:
 
@@ -184,10 +218,17 @@ what buys the band back:
 node scripts/check-docs.mjs --update-ratchet
 ```
 
-It only ever lowers. It refuses to raise or add an entry, and exits non-zero naming the doc
-and the delta; a ratchet you can silently raise is not a ratchet. When a raise is genuinely
-justified — say a convention adds a header line to every topic doc — `--update-ratchet --force`
-will do it, and the commit message must carry a line saying why.
+It only ever lowers, and it **retires** an entry once its doc measures at or below `maxWords`. An
+entry exists to grandfather a doc that is over the cap; one left pinned below the cap holds that
+doc to an arbitrary number under the project's published readability limit, so the next honest
+paragraph fails the gate for no readability reason. Retiring it does raise the doc's effective
+limit up to `maxWords` — that is the intent, not a hole in the ratchet: the doc is then held to
+the same cap as every other unratcheted doc, near-cap notice included.
+
+It still refuses to raise or add an entry, and exits non-zero naming the doc and the delta; a
+ratchet you can silently raise is not a ratchet. When a raise is genuinely justified — say a
+convention adds a header line to every topic doc — `--update-ratchet --force` will do it, and the
+commit message must carry a line saying why.
 
 ## Frozen artifacts
 

@@ -12,7 +12,8 @@
 //                         still resolve. Pointers only; semantics are what tests are for.
 //   C. Size ratchet     — a doc listed in `docs/.doc-budget.json` may shrink but never
 //                         grow past its recorded size plus the global `slackWords` grace
-//                         band; an unlisted doc must come in under the global `maxWords`.
+//                         band; an unlisted doc must come in under the global `maxWords`,
+//                         and gets a notice once it is within `slackWords` of that cap.
 //   D. Stability tiers  — every docs/*.md is classified in `docs/.stability.json`, every
 //                         tiered doc carries exactly one header banner naming its
 //                         recorded tier, and every tier named anywhere is one that
@@ -24,7 +25,8 @@
 //
 // Usage:
 //   node scripts/check-docs.mjs                    run every check; exit 1 on any failure
-//   node scripts/check-docs.mjs --update-ratchet   lower ratchet entries to current sizes
+//   node scripts/check-docs.mjs --update-ratchet   lower ratchet entries to current sizes, and
+//                                                  retire one whose doc is now under maxWords
 //                                                  (in-band growth is left alone, not refused)
 //   node scripts/check-docs.mjs --update-ratchet --force
 //                                                  ...also allow raising / adding entries
@@ -522,13 +524,21 @@ function measureDocs() {
 const slackOf = (budget) => budget.slackWords ?? 0;
 
 /**
- * `'ok'`, `'drift'` (inside the band — a notice, not a failure), `'over-band'`, or `'over-cap'`
- * (an unratcheted doc past `maxWords`). Pure, so `selfTest()` pins the two boundaries that are
- * easy to get wrong: the band is inclusive (`recorded + slack` still passes) and the cap has no
- * band at all — at 12,000 words the answer is a split, not another 500 words.
+ * `'ok'`, `'drift'` (inside the band — a notice, not a failure), `'over-band'`, `'over-cap'`
+ * (an unratcheted doc past `maxWords`), or `'near-cap'` (an unratcheted doc within `slack` of it —
+ * also a notice, not a failure). Pure, so `selfTest()` pins the boundaries that are easy to get
+ * wrong: the band is inclusive (`recorded + slack` still passes), the cap has no band at all — at
+ * 12,000 words the answer is a split, not another 500 words — and the warning before that cliff
+ * starts one word above `maxWords - slack`.
+ *
+ * The near-cap threshold mirrors the grace band on purpose: a ratcheted doc gets 500 words of
+ * warning before it fails, and an unratcheted one now gets the same instead of failing cold.
  */
 function ratchetVerdict(words, recorded, maxWords, slack) {
-	if (recorded === undefined) return words > maxWords ? 'over-cap' : 'ok';
+	if (recorded === undefined) {
+		if (words > maxWords) return 'over-cap';
+		return words > maxWords - slack ? 'near-cap' : 'ok';
+	}
 	const over = words - recorded;
 	if (over <= 0) return 'ok';
 	return over <= slack ? 'drift' : 'over-band';
@@ -543,11 +553,15 @@ function checkRatchet(fail, notice = () => {}) {
 
 	for (const [doc, words] of measureDocs()) {
 		const recorded = budget.ratchet[doc];
+		// NaN when the doc has no entry — only the two ratcheted verdicts below may read it.
 		const over = words - recorded;
 
 		switch (ratchetVerdict(words, recorded, budget.maxWords, slack)) {
 			case 'over-cap':
 				fail(`${doc}: ${words} words exceeds the ${budget.maxWords}-word cap for an unratcheted doc — split it, or record it with --update-ratchet --force and say why in the commit message`);
+				break;
+			case 'near-cap':
+				notice(`${doc}: ${words} words, ${budget.maxWords - words} from the ${budget.maxWords}-word cap — the cap has no grace band, so split before the next section lands`);
 				break;
 			case 'drift':
 				notice(`${doc}: ${words} words, ${over} over its ratchet of ${recorded} — inside the ${slack}-word grace band (${slack - over} left)`);
@@ -571,6 +585,16 @@ function updateRatchet(force) {
 		const words = sizes.get(doc);
 		if (words === undefined) {
 			changes.push(`  removed ${doc} (no longer present)`);
+			delete budget.ratchet[doc];
+		} else if (words <= budget.maxWords) {
+			// Not a hole in "a ratchet you can silently raise is not a ratchet". An entry exists to
+			// grandfather a doc that is *above* `maxWords`; once the doc is under it, the entry pins
+			// it at an arbitrary number below the project's published readability limit, so the next
+			// honest paragraph fails the gate for no readability reason. Dropping it does loosen the
+			// effective limit (from `recorded + slack` up to `maxWords`), and that is the intent: the
+			// doc is now subject to the same cap as every other unratcheted doc — including the
+			// near-cap notice that warns before it gets there.
+			changes.push(`  dropped ${doc}: ${words} words, at or below the ${budget.maxWords}-word cap — no longer grandfathered`);
 			delete budget.ratchet[doc];
 		} else if (words < recorded) {
 			changes.push(`  lowered ${doc}: ${recorded} -> ${words} (-${recorded - words})`);
@@ -1078,13 +1102,16 @@ function selfTest(fail) {
 
 	// The grace band is inclusive at its top edge, and the unratcheted cap has none: a doc at
 	// `maxWords` is at the size where the answer is a split, so lending it 500 more words would
-	// only move the split one ticket later.
+	// only move the split one ticket later. It does get *warned* over the last 500 words, which is
+	// the same runway the band gives a ratcheted doc — the last three cases pin that edge.
 	const bandCases = [
 		[12538, 12538, 'ok'],
 		[12539, 12538, 'drift'],
 		[13038, 12538, 'drift'],
 		[13039, 12538, 'over-band'],
-		[12000, undefined, 'ok'],
+		[11500, undefined, 'ok'],
+		[11501, undefined, 'near-cap'],
+		[12000, undefined, 'near-cap'],
 		[12001, undefined, 'over-cap'],
 	];
 	for (const [words, recorded, expected] of bandCases) {
@@ -1093,9 +1120,14 @@ function selfTest(fail) {
 			fail(`scripts/check-docs.mjs: ratchet verdict for ${words} words against ${recorded ?? 'no entry'} is '${actual}', expected '${expected}'`);
 		}
 	}
-	// Slack 0 is the strict ratchet the band replaced; it must still be reachable by config.
+	// Slack 0 is the strict ratchet the band replaced; it must still be reachable by config. With no
+	// band there is no runway either: the near-cap threshold collapses onto the cap itself, so a doc
+	// at exactly `maxWords` is silently ok right up to the word that fails it.
 	if (ratchetVerdict(12539, 12538, 12000, 0) !== 'over-band') {
 		fail(`scripts/check-docs.mjs: slackWords 0 no longer restores the strict ratchet`);
+	}
+	if (ratchetVerdict(12000, undefined, 12000, 0) !== 'ok') {
+		fail(`scripts/check-docs.mjs: slackWords 0 no longer makes the near-cap notice unreachable`);
 	}
 
 	stabilitySelfTest(fail);
@@ -1244,8 +1276,9 @@ function main() {
 		failures.push(message);
 	};
 
-	// Drift inside the grace band is not a failure, but it is not invisible either: it is the
-	// only warning a doc gets before its next edit fails, so it prints even on a clean run.
+	// Drift inside the grace band, and an unratcheted doc closing on the cap, are not failures — but
+	// they are not invisible either: they are the only warning a doc gets before its next edit
+	// fails, so they print even on a clean run.
 	const notices = [];
 
 	selfTest(fail);
