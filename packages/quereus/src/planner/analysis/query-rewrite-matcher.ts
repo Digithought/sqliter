@@ -79,7 +79,6 @@ export type RewriteFailureReason =
 	| 'missing-column'         // fragment needs an output/residual column the MV does not project
 	| 'aggregate-shape'        // fragment isn't a recognizable bare-key aggregate, or MV isn't a grouped MV
 	| 'group-key-mismatch'     // fragment GROUP BY key is not a subset of the MV's group key
-	| 'group-key-pinned'       // a query WHERE pins/equates a group key (the base reorders output cols; forgo)
 	| 'aggregate-not-decomposable' // a fragment aggregate has no sound recombine recipe from the MV
 	| 'cost-declined';         // matched, but the MV scan is not cheaper (set by the rule, not the matcher)
 
@@ -711,19 +710,6 @@ export function matchAggregateFragmentToMv(
 		for (const col of clauseColumns(clause)) {
 			if (!backingColOfBaseCol.has(col)) return fail('missing-column');
 		}
-	}
-
-	// Group-key reorder guard. When the query WHERE constant-pins (`g = 1`, `g is
-	// null`) or equates (`g1 = g2`) a group-key column AND there are ≥2 group keys,
-	// the base's `rule-groupby-fd-simplification` drops the functionally-determined
-	// group column and re-emits it as a picker `min` at a *shifted* output position,
-	// changing the result's column ORDER. The rewrite preserves the pristine column
-	// order, so the two would diverge — forgo to remain a faithful drop-in. (A single
-	// group key is never dropped — the rule keeps ≥1 — and range/IN residuals create
-	// no determining FD, so both stay eligible. Checks the full query WHERE, not just
-	// the residual: a pin entailed by the MV still drives the base's simplification.)
-	if (queryGroupSet.size >= 2 && queryClauses.some(c => clausePinsOrEquatesGroupCol(c, queryGroupSet))) {
-		return fail('group-key-pinned');
 	}
 
 	// A rollup with a residual is sound: the residual coverage check above admits only
@@ -1462,21 +1448,6 @@ function baseColumnOfExpr(expr: AST.Expression, baseTable: TableSchema): number 
 		return baseTable.columnIndexMap.get(id.name.toLowerCase());
 	}
 	return undefined;
-}
-
-/**
- * True when `clause` constant-pins (`g = literal`, `g is null`) or equates
- * (`g1 = g2`) a column in `groupSet` — the predicate shapes that give a group-key
- * column a determining FD and so drive `rule-groupby-fd-simplification` to drop and
- * reposition it. Range / IN (`or-of`) clauses create no such FD and return false.
- */
-function clausePinsOrEquatesGroupCol(clause: GuardClause, groupSet: ReadonlySet<number>): boolean {
-	switch (clause.kind) {
-		case 'eq-literal': return groupSet.has(clause.column);
-		case 'is-null': return groupSet.has(clause.column);
-		case 'eq-column': return groupSet.has(clause.left) || groupSet.has(clause.right);
-		default: return false; // range / or-of: no constant-determining FD
-	}
 }
 
 /** The base-table column indices a recognized guard clause references. */

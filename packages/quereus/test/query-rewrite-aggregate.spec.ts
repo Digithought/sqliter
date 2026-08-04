@@ -303,12 +303,41 @@ describe('aggregate-rollup matcher — per-reason negatives', () => {
 		}
 	});
 
-	it('group-key-pinned: a multi-key query pinning a group column is forgone (base reorders columns)', async () => {
+	it('group-key-pinned base/view agreement: a multi-key query pinning a group column now matches, and the rewrite agrees with the base recompute on column order and row values', async () => {
 		const db = await freshDb(SALES);
 		try {
-			const res = matchAgg(db, 'select d, r, sum(amt) from sales where d = 1 group by d, r', 'byregion');
-			expect(res.match).to.be.undefined;
-			expect(reason(res)).to.equal('group-key-pinned');
+			const sql = 'select d, r, sum(amt) from sales where d = 1 group by d, r';
+
+			// The base's column-order divergence this guard used to dodge is fixed
+			// (bug-grouped-key-reorder-survives-to-output), so the match now succeeds.
+			const res = matchAgg(db, sql, 'byregion');
+			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
+			expect(res.match!.rollup!.exact).to.equal(true);
+
+			await db.exec(
+				'insert into sales (id, d, r, amt) values (1, 1, 1, 10), (2, 1, 2, 20), (3, 2, 1, 30), (4, 2, 2, null)',
+			);
+
+			const run = async (): Promise<{ columns: string[]; rows: SqlValue[][] }> => {
+				const stmt = db.prepare(sql);
+				try {
+					const rows: SqlValue[][] = [];
+					for await (const row of stmt.iterateRows()) rows.push(Object.values(row) as SqlValue[]);
+					return { columns: stmt.getColumnNames(), rows };
+				} finally {
+					await stmt.finalize();
+				}
+			};
+
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+			const withRewrite = await run();
+			db.optimizer.updateTuning({ ...DEFAULT_TUNING, disabledRules: new Set(['materialized-view-rewrite-aggregate']) });
+			const withoutRewrite = await run();
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+
+			expect(withRewrite.columns, 'column names/order must agree').to.deep.equal(withoutRewrite.columns);
+			const normalize = (rows: SqlValue[][]) => rows.map(r => JSON.stringify(r)).sort();
+			expect(normalize(withRewrite.rows), 'row values (positional) must agree').to.deep.equal(normalize(withoutRewrite.rows));
 		} finally {
 			await db.close();
 		}
