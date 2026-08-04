@@ -259,7 +259,7 @@ function validateAggregateProjections(
 		const ungrouped = findUngroupedColumnRef(proj.node, groupByAttrIds, groupByExprFingerprints);
 		if (ungrouped) {
 			throw new QuereusError(
-				'Cannot mix aggregate and non-aggregate columns in SELECT list without GROUP BY',
+				`Column '${expressionToString(ungrouped.expression)}' must appear in the GROUP BY clause or be used in an aggregate function`,
 				StatusCode.ERROR
 			);
 		}
@@ -521,6 +521,12 @@ function buildHavingFilter(
  * "no", which means every entry in `projections` is a bare, non-renaming
  * {@link ColumnReferenceNode}; a group key is matched by attribute id so a
  * qualified `select t.k … group by k` still counts as agreement.
+ *
+ * The agreement this establishes is a *build-time* one, and one optimizer rule
+ * can still break it afterwards: `rule-groupby-fd-simplification` may drop a
+ * functionally-determined group key and re-emit it as a picker `min` at a shifted
+ * output position, which reorders the result when this node is the query root
+ * (≥2 group keys only). Tracked as fix/bug-grouped-key-reorder-survives-to-output.
  */
 function aggregateOutputIsSelectList(
 	stmt: AST.SelectStmt,
