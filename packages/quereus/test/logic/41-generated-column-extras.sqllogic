@@ -128,3 +128,77 @@ select k from t_pk;
 → [{"k":101}]
 
 drop table t_pk;
+
+-- ===================================
+-- 6. Generated column whose expression is a scalar subquery
+--    (deterministic within a statement, but the evaluator resolves ASYNCHRONOUSLY —
+--     UPDATE's generated-column recompute must await it, not store the Promise)
+-- ===================================
+
+create table t_src (k integer primary key);
+
+insert into t_src values (1), (2), (3);
+
+create table t_sub (
+	id integer primary key,
+	w  integer,
+	g  integer generated always as ((select count(*) from t_src))
+);
+
+insert into t_sub (id, w) values (1, 1), (2, 2);
+
+select id, w, g from t_sub order by id;
+→ [{"id":1,"w":1,"g":3},{"id":2,"w":2,"g":3}]
+
+-- updating an unrelated column re-runs the generated expression
+update t_sub set w = 5 where id = 1;
+
+select id, w, g from t_sub order by id;
+→ [{"id":1,"w":5,"g":3},{"id":2,"w":2,"g":3}]
+
+-- the subquery's source changes: a later update must recompute, not carry the old value
+insert into t_src values (4), (5);
+
+update t_sub set w = 6 where id = 1;
+
+select id, w, g from t_sub order by id;
+→ [{"id":1,"w":6,"g":5},{"id":2,"w":2,"g":3}]
+
+-- multi-row update (no WHERE) — exercises phase-2 context teardown across iterations
+update t_sub set w = w + 10;
+
+select id, w, g from t_sub order by id;
+→ [{"id":1,"w":16,"g":5},{"id":2,"w":12,"g":5}]
+
+drop table t_sub;
+drop table t_src;
+
+-- ===================================
+-- 7. Chain across the async path — a generated column feeding another
+-- ===================================
+
+create table t_src2 (k integer primary key);
+
+insert into t_src2 values (1), (2);
+
+create table t_sub_chain (
+	id integer primary key,
+	w  integer,
+	g  integer generated always as ((select count(*) from t_src2)) stored,
+	g2 integer generated always as (g * 2) stored
+);
+
+insert into t_sub_chain (id, w) values (1, 1);
+
+select w, g, g2 from t_sub_chain;
+→ [{"w":1,"g":2,"g2":4}]
+
+insert into t_src2 values (3);
+
+update t_sub_chain set w = 9 where id = 1;
+
+select w, g, g2 from t_sub_chain;
+→ [{"w":9,"g":3,"g2":6}]
+
+drop table t_sub_chain;
+drop table t_src2;

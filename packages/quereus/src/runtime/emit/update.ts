@@ -6,7 +6,7 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { buildRowDescriptor, composeOldNewRow } from '../../util/row-descriptor.js';
-import { createRowSlot, withRowContext } from '../context-helpers.js';
+import { createRowSlot, withAsyncRowContext } from '../context-helpers.js';
 import { buildRowCoercion } from '../../types/validation.js';
 
 export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction {
@@ -74,6 +74,13 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 		? buildRowCoercion(generatedCellTypes, tableSchema.columns)
 		: undefined;
 
+	// Distinct descriptor object carrying the same attribute IDs as `sourceRowDescriptor`,
+	// so tearing the phase-2 context down does not evict the streaming source slot (the
+	// context map is keyed by descriptor identity).
+	const generatedRowDescriptor = generatedIndices.length > 0
+		? buildRowDescriptor(plan.source.getAttributes())
+		: undefined;
+
 	async function* run(rctx: RuntimeContext, sourceRowsIterable: AsyncIterable<Row>, ...assignmentEvaluators: Array<(ctx: RuntimeContext) => SqlValue | Promise<SqlValue>>): AsyncIterable<Row> {
 		const slot = createRowSlot(rctx, sourceRowDescriptor);
 		try {
@@ -93,13 +100,19 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 				// Phase 2: Evaluate generated column expressions against the updated row,
 				// now holding the CONVERTED values of the regular assignments (a generated
 				// column must derive from what is stored, not from the raw assignment).
-				// Generated expressions are validated as deterministic (see
-				// validateDeterministicGenerated in update.ts builder), so they cannot
-				// contain scalar subqueries and always return synchronously.
+				// May evaluate asynchronously: a generated expression is validated as
+				// deterministic, but deterministic does not imply synchronous — it may
+				// embed a scalar subquery (deterministic within a statement), whose
+				// evaluator returns a Promise.
+				// NOTE: both phases use a bare `await`, which costs a microtask per
+				// evaluator even for the (common) synchronous ones. If UPDATE row
+				// throughput ever shows up as hot, switch both loops to the
+				// `const raw = ev(rctx); raw instanceof Promise ? await raw : raw`
+				// idiom used at the constraint-check evaluator sites.
 				if (generatedIndices.length > 0) {
-					withRowContext(rctx, sourceRowDescriptor, () => updatedRow, () => {
+					await withAsyncRowContext(rctx, generatedRowDescriptor!, () => updatedRow, async () => {
 						for (const i of generatedIndices) {
-							const value = assignmentEvaluators[i](rctx) as SqlValue;
+							const value = await assignmentEvaluators[i](rctx) as SqlValue;
 							updatedRow[assignmentTargetIndices[i]] = value;
 						}
 					});

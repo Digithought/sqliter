@@ -16,6 +16,14 @@ The prohibition on non-deterministic expressions in DDL is therefore a
 requirement. Quereus still defaults to strict rejection, with a single opt-in to
 lift the gate.
 
+> **Deterministic does not imply synchronous.** The validators below check
+> `physical.deterministic` only. A scalar subquery over a table is deterministic
+> within a statement, so it passes every gate — and its emitted evaluator returns
+> a `Promise`. No runtime site may skip an `await` on the strength of having
+> validated determinism; doing so writes the Promise object itself into the row.
+> (This was a live defect in the UPDATE generated-column recompute; regression
+> coverage lives in `test/logic/41-generated-column-extras.sqllogic` § 6–7.)
+
 ## The `nondeterministic_schema` option
 
 | Option | Type | Default | Aliases |
