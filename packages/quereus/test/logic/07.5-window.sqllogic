@@ -784,3 +784,133 @@ FROM nested_w ORDER BY id;
 → [{"id":1,"val":10,"adj":999,"rn":1},{"id":2,"val":20,"adj":998,"rn":2},{"id":3,"val":30,"adj":997,"rn":3}]
 
 DROP TABLE nested_w;
+
+-- =============================================================================
+-- Window functions in a GROUPED query.
+--
+-- The window runs over the GROUPED rows — one row per group — so
+-- `row_number() over (order by a) ... group by a` numbers the groups, not the
+-- underlying rows. Regression for
+-- bug-window-function-over-grouped-query-crashes: the grouped select list and
+-- the window select list used to be built by two separate walks, leaving a raw
+-- window-function expression in a projection *below* the node that computes
+-- window values ("No emitter registered for WindowFunctionCall").
+--
+-- No primary key on `wg`, so the functional-dependency GROUP BY reduction cannot
+-- rewrite the grouping keys out from under these.
+-- =============================================================================
+
+create table wg (a text, b text);
+insert into wg values ('x','1'),('y','2'),('x','3');
+
+-- Bare window function over the groups: two groups, so 1 and 2 (not 1..3).
+select a, row_number() over (order by a) as rn from wg group by a order by a;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- Alongside a real aggregate.
+select a, count(*) as c, row_number() over (order by a) as rn from wg group by a order by a;
+→ [{"a":"x","c":2,"rn":1},{"a":"y","c":1,"rn":2}]
+
+-- Window function wrapped in arithmetic keeps the surrounding expression.
+select a, 1000 - row_number() over (order by a) as adj from wg group by a order by a;
+→ [{"a":"x","adj":999},{"a":"y","adj":998}]
+
+-- HAVING filters groups before the window sees them, so rn restarts at 1.
+select a, row_number() over (order by a) as rn from wg group by a having count(*) > 1;
+→ [{"a":"x","rn":1}]
+
+-- ORDER BY a window alias.
+select a, row_number() over (order by a) as rn from wg group by a order by rn desc;
+→ [{"a":"y","rn":2},{"a":"x","rn":1}]
+
+-- COUNT(*) OVER () counts GROUPS (2), not source rows (3).
+select a, count(*) over () as g from wg group by a order by a;
+→ [{"a":"x","g":2},{"a":"y","g":2}]
+
+-- LIMIT over the lot.
+select a, row_number() over (order by a) as rn from wg group by a order by rn limit 1;
+→ [{"a":"x","rn":1}]
+
+-- Grouped `select *` plus a window column. `group by a, b` collapses no rows
+-- here, so all three groups survive and the window numbers all three.
+select *, row_number() over (order by a, b) as rn from wg group by a, b order by a, b;
+→ [{"a":"x","b":"1","rn":1},{"a":"x","b":"3","rn":2},{"a":"y","b":"2","rn":3}]
+
+-- An aggregate already in the SELECT list may be spelled out again in the window
+-- specification — it reads the computed aggregate column.
+select a, count(*) as c, row_number() over (order by count(*) desc) as rn
+from wg group by a order by rn;
+→ [{"a":"x","c":2,"rn":1},{"a":"y","c":1,"rn":2}]
+
+-- A window specification is subject to the same GROUP BY restriction as the rest
+-- of the select list: the grouped rows carry only grouping keys and aggregate
+-- results, so an ungrouped column must fail at plan time (it used to reach the
+-- runtime as a base-table reference and die with an internal row-context error).
+select a, row_number() over (order by b) as rn from wg group by a;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a, count(*) over (partition by b) as c from wg group by a;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Same rule for a window function's arguments.
+select a, sum(b) over () as s from wg group by a;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- An aggregate that appears ONLY in the window specification is a named
+-- limitation, not an internal error: it would have to be collected into the
+-- aggregate node before the window phase runs.
+select a, row_number() over (order by count(*)) as rn from wg group by a;
+-- error: Aggregate function count in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
+
+drop table wg;
+
+-- =============================================================================
+-- `*` in a window query.
+--
+-- The window phase's projection used to walk the AST select list and handle only
+-- non-star entries, so a `*` was skipped outright and its columns never reached
+-- the output. The projection is now the query's ONE select-list projection, with
+-- stars already expanded, so a star is an ordinary entry.
+--
+-- Column NAMES and ORDER are asserted in test/plan/grouped-projection-shape.spec.ts
+-- (row objects compare key-order-insensitively here); this file pins the values.
+-- =============================================================================
+
+create table sw (v integer primary key, g text);
+insert into sw values (1,'a'),(2,'b');
+
+-- Star before the window column.
+select *, row_number() over (order by v) as w from sw order by v;
+→ [{"v":1,"g":"a","w":1},{"v":2,"g":"b","w":2}]
+
+-- Star after the window column.
+select row_number() over (order by v) as w, * from sw order by v;
+→ [{"w":1,"v":1,"g":"a"},{"w":2,"v":2,"g":"b"}]
+
+-- A named column repeated by a later star is disambiguated as `v:1`.
+select v, row_number() over (order by v) as w, * from sw order by w;
+→ [{"v":1,"w":1,"v:1":1,"g":"a"},{"v":2,"w":2,"v:1":2,"g":"b"}]
+
+-- Qualified star.
+select sw.*, row_number() over (order by v) as w from sw order by v;
+→ [{"v":1,"g":"a","w":1},{"v":2,"g":"b","w":2}]
+
+-- A positional ORDER BY over a star-bearing window query binds the window column
+-- (position 3 = the column after the two star columns).
+select *, row_number() over (order by v) as w from sw order by 3 desc;
+→ [{"v":2,"g":"b","w":2},{"v":1,"g":"a","w":1}]
+
+-- DISTINCT over a window column.
+select distinct row_number() over (order by v) as w from sw order by w;
+→ [{"w":1},{"w":2}]
+
+-- An UNALIASED window column keeps its authored expression as its output name,
+-- like every other unaliased select-list column. (It used to be named after the
+-- array-index node the rewrite substitutes in — `[2]`.)
+select row_number() over (order by v) from sw order by v;
+→ [{"row_number() over (order by v)":1},{"row_number() over (order by v)":2}]
+
+select v, 1000 - row_number() over (order by v) from sw order by v;
+→ [{"v":1,"1000 - row_number() over (order by v)":999},{"v":2,"1000 - row_number() over (order by v)":998}]
+
+drop table sw;

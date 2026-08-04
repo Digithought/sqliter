@@ -610,6 +610,7 @@ group by expression [, expression...]
 - A group by with no aggregate function anywhere is legal and yields one row per distinct group.
 - Output column order follows the select list, not the group by list. `select *` over a grouped query therefore emits the source columns in table order even when `group by` names them in another order.
 - The output is exactly the select list — a grouping key the select list does not name is not returned. `select count(*) from t group by g` yields one column.
+- A window function in a grouped select list runs over the **grouped result rows** — one row per group — not over the underlying rows. `select a, row_number() over (order by a) from t group by a` numbers the groups, and `count(*) over ()` returns the number of groups. Its window specification (`partition by` / `order by`) and its arguments are subject to the same group by restriction as the rest of the select list: they may reference only grouping keys and aggregate results. An aggregate spelled out inside a window specification must also appear in the select list.
 
 **Examples:**
 ```sql

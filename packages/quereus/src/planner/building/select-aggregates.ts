@@ -220,6 +220,72 @@ function handlePreAggregateSort(
 }
 
 /**
+ * What a grouped query's rows are allowed to expose: the attribute ids reachable
+ * after aggregation, plus the canonical AST strings of the GROUP BY expressions
+ * themselves.
+ *
+ * Two flavours of attribute id are legal, and both matter depending on where the
+ * expression being checked was built. An expression built against the
+ * *pre-aggregate* scope (the SELECT list, before the final projection) names base
+ * source attributes, so the ids of the GROUP BY key expressions cover it. An
+ * expression built against the *aggregate-output* scope (HAVING, a window
+ * specification in a grouped query) names the AggregateNode's own output
+ * attributes instead, so those ids must be admitted too — pass them in
+ * `groupedOutputAttributes`.
+ *
+ * The fingerprint set covers whole grouped subtrees (`select id+1 … group by
+ * id+1`) and, incidentally, the qualifier mismatch between `group by t.a` and a
+ * later bare `a`.
+ */
+export interface GroupByCoverage {
+	readonly attrIds: ReadonlySet<number>;
+	readonly fingerprints: ReadonlySet<string>;
+}
+
+/**
+ * Builds the coverage test for a grouped query. `groupedOutputAttributes` is the
+ * AggregateNode's output attributes (group keys followed by aggregate results),
+ * needed only when the expressions to be checked were built against the aggregate
+ * output scope.
+ */
+export function buildGroupByCoverage(
+	groupByExpressions: readonly ScalarPlanNode[],
+	groupedOutputAttributes: readonly Attribute[] = []
+): GroupByCoverage {
+	const attrIds = new Set<number>();
+	const fingerprints = new Set<string>();
+	for (const expr of groupByExpressions) {
+		if (CapabilityDetectors.isColumnReference(expr)) {
+			attrIds.add(expr.attributeId);
+		}
+		fingerprints.add(expressionToString(expr.expression));
+	}
+	for (const attr of groupedOutputAttributes) {
+		attrIds.add(attr.id);
+	}
+	return { attrIds, fingerprints };
+}
+
+/**
+ * Raises the standard GROUP BY coverage error when `node` reads a column the
+ * grouped rows do not carry. Shared by the SELECT-list check below and by the
+ * window phase's window-specification check, so a window spec that reads an
+ * ungrouped column fails with the same plan-time message as a select-list entry
+ * that does.
+ */
+export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage): void {
+	const ungrouped = findUngroupedColumnRef(node, coverage);
+	if (!ungrouped) return;
+	throw new QuereusError(
+		`Column '${expressionToString(ungrouped.expression)}' must appear in the GROUP BY clause or be used in an aggregate function`,
+		StatusCode.ERROR,
+		undefined,
+		ungrouped.expression.loc?.start.line,
+		ungrouped.expression.loc?.start.column,
+	);
+}
+
+/**
  * Validates that aggregate and non-aggregate projections don't mix inappropriately.
  * With GROUP BY, every non-aggregate column reference in the SELECT list must
  * either (a) match a GROUP BY column by attribute id, or (b) appear inside a
@@ -244,23 +310,11 @@ function validateAggregateProjections(
 
 	if (!hasGroupBy) return;
 
-	const groupByAttrIds = new Set<number>();
-	const groupByExprFingerprints = new Set<string>();
-	for (const expr of groupByExpressions) {
-		if (CapabilityDetectors.isColumnReference(expr)) {
-			groupByAttrIds.add(expr.attributeId);
-		}
-		groupByExprFingerprints.add(expressionToString(expr.expression));
-	}
-
+	// The SELECT list is built against the pre-aggregate scope, so no aggregate
+	// output attributes participate.
+	const coverage = buildGroupByCoverage(groupByExpressions);
 	for (const proj of projections) {
-		const ungrouped = findUngroupedColumnRef(proj.node, groupByAttrIds, groupByExprFingerprints);
-		if (ungrouped) {
-			throw new QuereusError(
-				`Column '${expressionToString(ungrouped.expression)}' must appear in the GROUP BY clause or be used in an aggregate function`,
-				StatusCode.ERROR
-			);
-		}
+		assertGroupByCoverage(proj.node, coverage);
 	}
 }
 
@@ -273,8 +327,7 @@ function validateAggregateProjections(
  */
 function findUngroupedColumnRef(
 	node: PlanNode,
-	groupByAttrIds: Set<number>,
-	groupByExprFingerprints: Set<string>
+	coverage: GroupByCoverage
 ): ColumnReferenceNode | null {
 	if (CapabilityDetectors.isAggregateFunction(node)) {
 		return null;
@@ -282,13 +335,13 @@ function findUngroupedColumnRef(
 
 	if ('expression' in node) {
 		const fp = expressionToString((node as ScalarPlanNode).expression);
-		if (groupByExprFingerprints.has(fp)) {
+		if (coverage.fingerprints.has(fp)) {
 			return null;
 		}
 	}
 
 	if (CapabilityDetectors.isColumnReference(node)) {
-		if (!groupByAttrIds.has(node.attributeId)) {
+		if (!coverage.attrIds.has(node.attributeId)) {
 			return node as ColumnReferenceNode;
 		}
 		return null;
@@ -296,7 +349,7 @@ function findUngroupedColumnRef(
 
 	for (const child of node.getChildren()) {
 		if (isRelationalNode(child)) continue;
-		const found = findUngroupedColumnRef(child, groupByAttrIds, groupByExprFingerprints);
+		const found = findUngroupedColumnRef(child, coverage);
 		if (found) return found;
 	}
 	return null;
@@ -477,18 +530,11 @@ function buildHavingFilter(
 	// source columns (registered as a fallback) land on source attribute IDs.
 	// We accept both flavors of "grouped" attribute, plus any subtree whose AST
 	// fingerprint matches a GROUP BY expression.
-	const allowedAttrIds = new Set<number>();
-	const groupByExprFingerprints = new Set<string>();
-	for (const expr of groupByExpressions) {
-		if (CapabilityDetectors.isColumnReference(expr)) {
-			allowedAttrIds.add(expr.attributeId);
-		}
-		groupByExprFingerprints.add(expressionToString(expr.expression));
-	}
-	for (let i = 0; i < groupByExpressions.length + aggregates.length; i++) {
-		allowedAttrIds.add(aggregateAttributes[i].id);
-	}
-	const ungrouped = findUngroupedColumnRef(havingExpression, allowedAttrIds, groupByExprFingerprints);
+	const coverage = buildGroupByCoverage(
+		groupByExpressions,
+		aggregateAttributes.slice(0, groupByExpressions.length + aggregates.length),
+	);
+	const ungrouped = findUngroupedColumnRef(havingExpression, coverage);
 	if (ungrouped) {
 		throw new QuereusError(
 			`HAVING references non-grouped column '${ungrouped.expression.name}'; ` +
@@ -684,6 +730,21 @@ function findAggregateFunctionExprs(
 		case 'windowFunction':
 			break;
 	}
+}
+
+/**
+ * Every aggregate function call inside an AST expression, in source order.
+ * Does not descend into an aggregate's own arguments (nested aggregates are
+ * invalid SQL). Exported for callers that need to *inspect* the aggregates in a
+ * clause rather than collect them into the AggregateNode.
+ */
+export function collectAggregateFunctionExprs(
+	expr: AST.Expression,
+	ctx: PlanningContext
+): AST.FunctionExpr[] {
+	const found: AST.FunctionExpr[] = [];
+	findAggregateFunctionExprs(expr, ctx, found);
+	return found;
 }
 
 /**

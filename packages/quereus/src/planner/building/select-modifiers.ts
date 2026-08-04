@@ -120,11 +120,13 @@ export function applyOrderBy(
 		}
 
 		// Alignment guard: bind by output position only when the relation really does
-		// publish one attribute per SELECT-list column. Two shapes do not today — the
-		// window path drops `*` entries from its projection, and the grouped path may
-		// skip its final projection — and for those, positional binding would hand back
-		// the wrong column or a spurious out-of-range error. They keep the select-list
-		// fallback below instead. The guard is a no-op once those shapes are fixed.
+		// publish one attribute per SELECT-list column. The grouped path may skip its
+		// final projection when the AggregateNode's own output already IS the select
+		// list, in which case the relation advertises every grouping key it computes —
+		// more columns than the select list names, so positional binding would hand
+		// back the wrong column. That shape keeps the select-list fallback below.
+		// (The window path DOES publish one attribute per select-list column, stars
+		// included, so it binds positionally.)
 		const alignedOutput = outputRelation && outputRelation.getAttributes().length === selectList.length
 			? outputRelation
 			: undefined;

@@ -8,17 +8,32 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { ArrayIndexNode } from '../nodes/array-index-node.js';
 import { LiteralNode } from '../nodes/scalar.js';
 import { buildExpression } from './expression.js';
+import { assertGroupByCoverage, collectAggregateFunctionExprs, type GroupByCoverage } from './select-aggregates.js';
+import { findMatchingAggregate } from './function-call.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
+import { expressionToString } from '../../emit/ast-stringify.js';
 import type * as AST from '../../parser/ast.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 
 /**
- * Processes window functions and creates WindowNode(s) with proper projections
+ * Processes window functions and creates WindowNode(s) with proper projections.
+ *
+ * `selectListProjections` is the query's ONE select-list projection list — stars
+ * already expanded, in written order, window functions still present as raw
+ * `WindowFunctionCallNode` subtrees. It is rewritten (not rebuilt) into the
+ * projection placed above the WindowNode(s); see {@link buildWindowProjections}.
+ *
+ * `groupByCoverage` is supplied only for a GROUPED query. The WindowNode sits
+ * ABOVE the AggregateNode, so its window specifications and function arguments run
+ * over the grouped rows and may only read what those rows carry.
  */
 export function buildWindowPhase(
 	input: RelationalPlanNode,
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[],
 	selectContext: PlanningContext,
-	selectListProjections: readonly Projection[]
+	selectListProjections: readonly Projection[],
+	groupByCoverage?: GroupByCoverage
 ): RelationalPlanNode {
 	if (windowFunctions.length === 0) {
 		return input;
@@ -44,6 +59,12 @@ export function buildWindowPhase(
 			// For now, proceed with WindowNode
 		}
 
+		// Reject an aggregate this query never computed before trying to build it, so
+		// the failure names the unsupported construct.
+		for (const { func } of functions) {
+			rejectUncollectedAggregates(func, selectContext);
+		}
+
 		// CRITICAL: Build window specification expressions using the INPUT scope
 		// This ensures expressions reference the correct input attribute IDs,
 		// not premature output attribute IDs that don't exist in the runtime context
@@ -62,6 +83,20 @@ export function buildWindowPhase(
 			functions.map(({ func }) => func),
 			selectContext
 		);
+
+		// In a grouped query the window runs over the AGGREGATE's rows, which carry only
+		// grouping keys and aggregate results. A window specification or argument that
+		// reads anything else is illegal for exactly the reason a bare column in the
+		// select list is, and must say so at plan time — otherwise the reference reaches
+		// the runtime as a base-table attribute the aggregate row never had, and the
+		// query dies with an internal "no row context" error instead.
+		if (groupByCoverage) {
+			for (const expr of partitionExpressions) assertGroupByCoverage(expr, groupByCoverage);
+			for (const expr of orderByExpressions) assertGroupByCoverage(expr, groupByCoverage);
+			for (const args of functionArguments) {
+				for (const arg of args) assertGroupByCoverage(arg, groupByCoverage);
+			}
+		}
 
 		// Create new WindowFunctionCallNode instances with alias + argument-type info
 		const windowFuncsWithAlias = functions.map(({ func, alias }, i) =>
@@ -98,7 +133,58 @@ export function buildWindowPhase(
 }
 
 /**
+ * Rejects an aggregate inside a window function's OVER clause or arguments that the
+ * aggregate phase never collected.
+ *
+ * The supported spelling is one the SELECT list already computes — `select a,
+ * count(*) c, row_number() over (order by count(*) desc) … group by a` — because
+ * that `count(*)` resolves to the AggregateNode's own output column. An aggregate
+ * that appears ONLY here has nothing to resolve against; without this check it
+ * reaches `buildFunctionCall` with aggregates disallowed and fails with the generic
+ * "not allowed in this context", which reads like a bug rather than the limitation
+ * it is.
+ *
+ * NOTE: supporting the unsupported form means collecting these aggregates into the
+ * AggregateNode before the window phase runs, the way `collectOrderByAggregates`
+ * (select-aggregates.ts) already does for a top-level ORDER BY.
+ */
+function rejectUncollectedAggregates(
+	func: WindowFunctionCallNode,
+	selectContext: PlanningContext
+): void {
+	const check = (expr: AST.Expression, site: string) => {
+		for (const aggExpr of collectAggregateFunctionExprs(expr, selectContext)) {
+			if (findMatchingAggregate(selectContext, aggExpr)) continue;
+			throw new QuereusError(
+				`Aggregate function ${aggExpr.name} in a window function's ${site} is only supported ` +
+				`when the same aggregate also appears in the SELECT list`,
+				StatusCode.UNSUPPORTED,
+				undefined,
+				aggExpr.loc?.start.line,
+				aggExpr.loc?.start.column,
+			);
+		}
+	};
+
+	const window = func.expression.window;
+	for (const partitionExpr of window?.partitionBy ?? []) check(partitionExpr, 'PARTITION BY');
+	for (const orderClause of window?.orderBy ?? []) check(orderClause.expr, 'ORDER BY');
+	for (const arg of func.expression.function.args ?? []) check(arg, 'arguments');
+}
+
+/**
  * Groups window functions by their window specification
+ *
+ * NOTE: the key is `JSON.stringify` over raw AST fragments, which include each
+ * fragment's source-location (`loc`) data — so two textually identical `over (…)`
+ * clauses at different source positions never key equal and this never actually
+ * groups anything; every window function gets its own WindowNode. That accident is
+ * currently load-bearing: {@link findWindowColumnIndex} matches a window function by
+ * name + spec only, so two same-named functions genuinely sharing one WindowNode
+ * would both resolve to the first one's output column. Stripping `loc` here (or
+ * comparing structurally) makes the grouping work and breaks the column matching —
+ * that change has to teach `findWindowColumnIndex` to match by node identity or
+ * position first.
  */
 function groupWindowFunctionsBySpec(
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[]
@@ -158,7 +244,11 @@ function buildWindowFunctionArguments(
 }
 
 /**
- * Builds projections for window function output columns
+ * Rewrites the SELECT list into the projection that sits above the WindowNode(s).
+ *
+ * Every entry passes through — including expanded `*` columns and ordinary
+ * expressions, which are left exactly as built. Only entries containing a window
+ * function are rebuilt, and only by substituting each window result in place.
  */
 function buildWindowProjections(
 	selectListProjections: readonly Projection[],
@@ -181,7 +271,16 @@ function buildWindowProjections(
 			selectContext.scope
 		);
 		if (rewritten === projection.node) return projection;
-		return { ...projection, node: rewritten, attributeId: undefined };
+		// The rewrite replaces the authored expression with an ArrayIndexNode, whose
+		// own name is a bare index (`[2]`). An unaliased window column must keep the
+		// expression the user wrote as its output name, like every other unaliased
+		// select-list column (`select count(*) from t group by g` yields `count(*)`).
+		return {
+			...projection,
+			node: rewritten,
+			alias: projection.alias ?? expressionToString(projection.node.expression),
+			attributeId: undefined,
+		};
 	});
 }
 
@@ -260,6 +359,15 @@ function findWindowColumnIndex(
 
 /**
  * Compares two window specifications for equality
+ *
+ * NOTE: like {@link groupWindowFunctionsBySpec}, this compares `JSON.stringify` of
+ * raw AST fragments including their source-location (`loc`) data, so two textually
+ * identical `over (…)` clauses written at different positions never compare equal.
+ * That is what keeps `sum(v) over (order by v) a, sum(v*10) over (order by v) b`
+ * resolving to two different window columns despite matching on function name.
+ * Making this comparison structural without also teaching
+ * {@link findWindowColumnIndex} to match by node identity or position collapses
+ * both onto the first function's column.
  */
 function compareWindowSpecs(originalWindow?: AST.WindowDefinition, funcWindow?: AST.WindowDefinition): boolean {
 	// Compare partition expressions

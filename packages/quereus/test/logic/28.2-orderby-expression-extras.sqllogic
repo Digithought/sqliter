@@ -299,9 +299,16 @@ select * from (select b as a, a as z from ow) order by 2;
 select a from ow order by 0;
 -- error: ORDER BY position 0 is not in the SELECT list (1..1)
 
--- A window query containing `*` cannot bind by output position (the window
--- projection drops the star columns — fix/bug-window-function-over-grouped-query-crashes).
--- The range check must still come from the SELECT list, which has 4 entries.
+-- A window query containing `*` publishes one output attribute per SELECT-list
+-- column, stars expanded, so an ordinal binds the window column directly:
+-- position 4 is `w`, after the three star columns.
+select *, row_number() over (order by a) as w from ow order by 4;
+→ [{"id":3,"a":"v","b":"q","w":1},{"id":2,"a":"w","b":"q","w":2},{"id":1,"a":"x","b":"p","w":3}]
+
+select *, row_number() over (order by a) as w from ow order by 4 desc;
+→ [{"id":1,"a":"x","b":"p","w":3},{"id":2,"a":"w","b":"q","w":2},{"id":3,"a":"v","b":"q","w":1}]
+
+-- ...and position 5 is out of range: the select list has 4 entries.
 select *, row_number() over (order by a) as w from ow order by 5;
 -- error: ORDER BY position 5 is not in the SELECT list (1..4)
 

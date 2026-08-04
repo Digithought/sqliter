@@ -281,5 +281,53 @@ describe('Plan shape: grouped-query final projection', () => {
 				aggregateRow(rows);
 			});
 		});
+
+		/**
+		 * Regression for bug-window-function-over-grouped-query-crashes.
+		 *
+		 * The window phase used to build its projection by re-walking the AST select
+		 * list and handling only non-star entries, so a `*` was dropped outright.
+		 * The projection is now the query's ONE select-list projection with stars
+		 * already expanded, so star position and the disambiguation of a repeated
+		 * name are the same as any other query's. Values are pinned in
+		 * test/logic/07.5-window.sqllogic.
+		 */
+		describe('with window functions', () => {
+			it('keeps the star columns around a window column, in written order', async () => {
+				expect(await columnNames("SELECT *, row_number() OVER (ORDER BY v) AS w FROM gk"))
+					.to.deep.equal(['v', 'g', 'w']);
+				expect(await columnNames("SELECT row_number() OVER (ORDER BY v) AS w, * FROM gk"))
+					.to.deep.equal(['w', 'v', 'g']);
+				expect(await columnNames("SELECT gk.*, row_number() OVER (ORDER BY v) AS w FROM gk"))
+					.to.deep.equal(['v', 'g', 'w']);
+			});
+
+			it('numbers a name the star repeats', async () => {
+				expect(await columnNames("SELECT v, row_number() OVER (ORDER BY v) AS w, * FROM gk"))
+					.to.deep.equal(['v', 'w', 'v:1', 'g']);
+			});
+
+			it('names an unaliased window column after its authored expression', async () => {
+				// The rewrite substitutes an ArrayIndexNode for the window function, whose
+				// own name is a bare index (`[2]`); the authored expression is carried
+				// across as the fallback alias.
+				expect(await columnNames("SELECT row_number() OVER (ORDER BY v) FROM gk"))
+					.to.deep.equal(['row_number() over (order by v)']);
+				expect(await columnNames("SELECT v, 1000 - row_number() OVER (ORDER BY v) FROM gk"))
+					.to.deep.equal(['v', '1000 - row_number() over (order by v)']);
+			});
+
+			it('emits SELECT-list order for a grouped, windowed query', async () => {
+				expect(await columnNames("SELECT a, count(*) AS c, row_number() OVER (ORDER BY a) AS rn FROM nk GROUP BY a"))
+					.to.deep.equal(['a', 'c', 'rn']);
+				expect(await columnNames("SELECT row_number() OVER (ORDER BY a) AS rn, a FROM nk GROUP BY a"))
+					.to.deep.equal(['rn', 'a']);
+			});
+
+			it('restores source-column order for a grouped star plus a window column', async () => {
+				expect(await columnNames("SELECT *, row_number() OVER (ORDER BY a, b) AS rn FROM nk GROUP BY b, a"))
+					.to.deep.equal(['a', 'b', 'rn']);
+			});
+		});
 	});
 });

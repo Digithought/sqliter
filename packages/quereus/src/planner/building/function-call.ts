@@ -13,54 +13,77 @@ import { resolveFunctionSchema } from "./schema-resolution.js";
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { ScalarType } from "../../common/datatype.js";
 
-export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, allowAggregates: boolean): ScalarPlanNode {
-	// In HAVING context, check if this function matches an existing aggregate
-	if (ctx.aggregates && ctx.aggregates.length > 0) {
-		// Try to find a matching aggregate
-		for (const agg of ctx.aggregates) {
-			if (CapabilityDetectors.isAggregateFunction(agg.expression)) {
-				const aggFuncNode = agg.expression as AggregateFunctionCallNode;
-				// Check if function name, argument count, and DISTINCT flag match
-				if (aggFuncNode.functionName.toLowerCase() === expr.name.toLowerCase() &&
-					aggFuncNode.args.length === expr.args.length &&
-					(aggFuncNode.isDistinct || false) === (expr.distinct || false)) {
-					// Check if arguments match
-					let argsMatch = true;
-					for (let i = 0; i < expr.args.length; i++) {
-						const exprArg = expr.args[i];
-						const aggArg = aggFuncNode.args[i];
-						// Simple check: if both are column references, check names match
-						if (exprArg.type === 'column' && aggArg.expression?.type === 'column') {
-							if (exprArg.name.toLowerCase() !== aggArg.expression.name.toLowerCase()) {
-								argsMatch = false;
-								break;
-							}
-						} else if (exprArg.type === 'literal' && aggArg.expression?.type === 'literal') {
-							if (exprArg.value !== aggArg.expression.value) {
-								argsMatch = false;
-								break;
-							}
-						}
-						// For other cases, we'd need more sophisticated comparison
-					}
+/** One entry of {@link PlanningContext.aggregates} — an aggregate already computed by the AggregateNode. */
+export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[number];
 
-					if (argsMatch) {
-						// Found matching aggregate - return a column reference to it
-						const columnExpr: AST.ColumnExpr = {
-							type: 'column',
-							name: agg.alias
-						};
-						return new ColumnReferenceNode(
-							ctx.scope,
-							columnExpr,
-							agg.expression.getType(),
-							agg.attributeId,
-							agg.columnIndex
-						);
-					}
+/**
+ * The already-computed aggregate this call refers to, if any.
+ *
+ * A clause that runs ABOVE the AggregateNode (HAVING, ORDER BY, a window
+ * specification in a grouped query) may spell out an aggregate the SELECT list
+ * already collected; that spelling means "read the computed column", not
+ * "aggregate again". Matching is by function name, argument count, DISTINCT flag
+ * and a shallow argument comparison (column names / literal values); argument
+ * shapes it cannot compare are treated as matching.
+ *
+ * Exported so callers that must *reject* an uncollected aggregate can ask the same
+ * question this builder answers — see `buildWindowPhase`.
+ */
+export function findMatchingAggregate(ctx: PlanningContext, expr: AST.FunctionExpr): CollectedAggregate | undefined {
+	if (!ctx.aggregates || ctx.aggregates.length === 0) return undefined;
+
+	for (const agg of ctx.aggregates) {
+		if (!CapabilityDetectors.isAggregateFunction(agg.expression)) continue;
+		const aggFuncNode = agg.expression as AggregateFunctionCallNode;
+		// Check if function name, argument count, and DISTINCT flag match
+		if (aggFuncNode.functionName.toLowerCase() !== expr.name.toLowerCase() ||
+			aggFuncNode.args.length !== expr.args.length ||
+			(aggFuncNode.isDistinct || false) !== (expr.distinct || false)) {
+			continue;
+		}
+
+		// Check if arguments match
+		let argsMatch = true;
+		for (let i = 0; i < expr.args.length; i++) {
+			const exprArg = expr.args[i];
+			const aggArg = aggFuncNode.args[i];
+			// Simple check: if both are column references, check names match
+			if (exprArg.type === 'column' && aggArg.expression?.type === 'column') {
+				if (exprArg.name.toLowerCase() !== aggArg.expression.name.toLowerCase()) {
+					argsMatch = false;
+					break;
+				}
+			} else if (exprArg.type === 'literal' && aggArg.expression?.type === 'literal') {
+				if (exprArg.value !== aggArg.expression.value) {
+					argsMatch = false;
+					break;
 				}
 			}
+			// For other cases, we'd need more sophisticated comparison
 		}
+
+		if (argsMatch) return agg;
+	}
+
+	return undefined;
+}
+
+export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, allowAggregates: boolean): ScalarPlanNode {
+	// In HAVING context, check if this function matches an existing aggregate
+	const matchingAggregate = findMatchingAggregate(ctx, expr);
+	if (matchingAggregate) {
+		// Found matching aggregate - return a column reference to it
+		const columnExpr: AST.ColumnExpr = {
+			type: 'column',
+			name: matchingAggregate.alias
+		};
+		return new ColumnReferenceNode(
+			ctx.scope,
+			columnExpr,
+			matchingAggregate.expression.getType(),
+			matchingAggregate.attributeId,
+			matchingAggregate.columnIndex
+		);
 	}
 
 	// Resolve function schema at build time
