@@ -152,6 +152,11 @@ export function resolveOrdinalOutputColumn(
 ): ColumnReferenceNode | null {
 	const value = extractOrdinalValue(expr);
 	if (value === null) return null;
+	// NOTE: the range is the relation's full output arity. A `SetOperationNode` that
+	// surfaces membership flag columns advertises them here too, so an ordinal could
+	// address one; harmless today because flags are introduced by optimizer rewrites,
+	// long after this runs at build time. If a flagged set-op ever reaches ORDER BY
+	// building, bound the range to the compound's data arity instead.
 	const columns = outputRelation.getType().columns;
 	if (value < 1 || value > columns.length) {
 		throw new QuereusError(

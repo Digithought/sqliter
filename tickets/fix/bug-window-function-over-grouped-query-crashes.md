@@ -114,6 +114,25 @@ Whatever design settles the crash arm above — which phase owns the final colum
 list — has to expand stars in that walk too, and in written select-list order,
 matching the guarantee the non-window paths now hold.
 
+**Knock-on: `order by <position of the window column>` also crashes while the
+star arm is open.** `applyOrderBy` binds a positional ORDER BY to the Nth output
+attribute only when the final relation publishes one attribute per select-list
+column. A star-bearing window query fails that check (4 select-list columns, 1
+published attribute), so the ordinal falls back to re-planning the authored
+expression — which for the window column means a fresh `WindowFunctionCall` in
+the sort key and the same `No emitter registered for WindowFunctionCall` error:
+
+```sql
+create table gk (v integer primary key, g text);
+select *, row_number() over (order by v) w from gk order by 4;  -- internal error
+```
+
+Fixing the star arm fixes this automatically (the counts line up, and the ordinal
+binds to the computed output column, as it already does for a window query with
+no star). Worth re-running the positional-reference block in
+`test/logic/28.2-orderby-expression-extras.sqllogic` when this lands — it pins
+the fallback's out-of-range message for exactly this shape.
+
 ## Not in scope
 
 Window functions without `GROUP BY` already work — apart from the star-dropping

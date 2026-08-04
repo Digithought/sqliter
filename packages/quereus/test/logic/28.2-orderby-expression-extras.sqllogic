@@ -220,5 +220,114 @@ select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by jt2.k, j
 select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by 1, 2 order by 3 desc;
 → [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
 
+-- ORDER BY that names an aggregate is applied BEFORE the grouped query's final
+-- projection exists, so a second ordinal key in the same clause has no output
+-- attributes to bind to and falls back to the select list. Position 2 is still
+-- jt2.v, not jt1's same-named column.
+select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by 1, 2 order by count(*) desc, 2;
+→ [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
+
+select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by jt2.k, jt2.v order by count(*) desc, jt2.v;
+→ [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
+
 drop table jt2;
 drop table jt1;
+
+-- -----------------------------------------------------------------------------
+-- Qualified stars from more than two sources
+-- -----------------------------------------------------------------------------
+
+create table os1 (k integer primary key, v text);
+create table os2 (k integer primary key, v text);
+create table os3 (k integer primary key, v text);
+insert into os1 values (1,'a1'), (2,'b1');
+insert into os2 values (1,'z2'), (2,'y2');
+insert into os3 values (1,'m3'), (2,'n3');
+
+-- All three sources expose a `v`; position 6 is os3.v and position 4 is os2.v,
+-- and the two produce OPPOSITE row orders, so neither can pass by coincidence.
+select os1.*, os2.*, os3.* from os1 join os2 on os1.k = os2.k join os3 on os1.k = os3.k order by 6;
+→ [{"k":1,"v":"a1","k:1":1,"v:1":"z2","k:2":1,"v:2":"m3"},{"k":2,"v":"b1","k:1":2,"v:1":"y2","k:2":2,"v:2":"n3"}]
+
+select os1.*, os2.*, os3.* from os1 join os2 on os1.k = os2.k join os3 on os1.k = os3.k order by os3.v;
+→ [{"k":1,"v":"a1","k:1":1,"v:1":"z2","k:2":1,"v:2":"m3"},{"k":2,"v":"b1","k:1":2,"v:1":"y2","k:2":2,"v:2":"n3"}]
+
+select os1.*, os2.*, os3.* from os1 join os2 on os1.k = os2.k join os3 on os1.k = os3.k order by 4;
+→ [{"k":2,"v":"b1","k:1":2,"v:1":"y2","k:2":2,"v:2":"n3"},{"k":1,"v":"a1","k:1":1,"v:1":"z2","k:2":1,"v:2":"m3"}]
+
+select os1.*, os2.*, os3.* from os1 join os2 on os1.k = os2.k join os3 on os1.k = os3.k order by os2.v;
+→ [{"k":2,"v":"b1","k:1":2,"v:1":"y2","k:2":2,"v:2":"n3"},{"k":1,"v":"a1","k:1":1,"v:1":"z2","k:2":1,"v:2":"m3"}]
+
+drop table os3;
+drop table os2;
+drop table os1;
+
+-- -----------------------------------------------------------------------------
+-- Ordinals through the remaining ORDER BY shapes
+-- -----------------------------------------------------------------------------
+
+create table ow (id integer primary key, a text, b text);
+insert into ow values (1,'x','p'), (2,'w','q'), (3,'v','q');
+
+-- Ordinals compose with the rest of the clause: direction, a second key,
+-- LIMIT, and NULLS placement all still apply to the bound output column.
+select b as z, id from ow order by 1, 2;
+→ [{"z":"p","id":1},{"z":"q","id":2},{"z":"q","id":3}]
+
+select b as z, id from ow order by 1 desc, 2;
+→ [{"z":"q","id":2},{"z":"q","id":3},{"z":"p","id":1}]
+
+select b as z, id from ow order by 1, 2 limit 2;
+→ [{"z":"p","id":1},{"z":"q","id":2}]
+
+-- A star select list under GROUP BY: the ordinals name the grouped columns
+select * from ow group by 1, 2, 3 order by 2;
+→ [{"id":3,"a":"v","b":"q"},{"id":2,"a":"w","b":"q"},{"id":1,"a":"x","b":"p"}]
+
+select * from ow group by id, a, b order by a;
+→ [{"id":3,"a":"v","b":"q"},{"id":2,"a":"w","b":"q"},{"id":1,"a":"x","b":"p"}]
+
+-- Through a CTE and through a derived table: the outer `select *` publishes the
+-- inner names, and position 2 is still the inner `z`
+with cw as (select b as a, a as z from ow) select * from cw order by 2;
+→ [{"a":"q","z":"v"},{"a":"q","z":"w"},{"a":"p","z":"x"}]
+
+select * from (select b as a, a as z from ow) order by 2;
+→ [{"a":"q","z":"v"},{"a":"q","z":"w"},{"a":"p","z":"x"}]
+
+-- Zero is out of range, like a negative or too-large position
+select a from ow order by 0;
+-- error: ORDER BY position 0 is not in the SELECT list (1..1)
+
+-- A window query containing `*` cannot bind by output position (the window
+-- projection drops the star columns — fix/bug-window-function-over-grouped-query-crashes).
+-- The range check must still come from the SELECT list, which has 4 entries.
+select *, row_number() over (order by a) as w from ow order by 5;
+-- error: ORDER BY position 5 is not in the SELECT list (1..4)
+
+drop table ow;
+
+-- NULLS FIRST / LAST apply to the bound output column
+create table onul (id integer primary key, v text null);
+insert into onul values (1, null), (2, 'a');
+
+select v as z, id from onul order by 1 nulls first;
+→ [{"z":null,"id":1},{"z":"a","id":2}]
+
+select v as z, id from onul order by 1 nulls last;
+→ [{"z":"a","id":2},{"z":null,"id":1}]
+
+drop table onul;
+
+-- The bound output column carries its declared collation, so an ordinal sorts
+-- identically to the name form
+create table ocol (id integer primary key, v text collate nocase);
+insert into ocol values (1,'B'), (2,'a');
+
+select v as z from ocol order by 1;
+→ [{"z":"a"},{"z":"B"}]
+
+select v as z from ocol order by z;
+→ [{"z":"a"},{"z":"B"}]
+
+drop table ocol;

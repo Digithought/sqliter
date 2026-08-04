@@ -61,3 +61,37 @@ class, same bytes — for every argument type, text included.
   not depend on this pre-step conversion. Verify that before removing it wholesale.
 - Watch the mixed-storage-class case: a column holding both `5` (integer) and `'5'`
   (text) must still order by storage class the way the comparison operators do.
+
+## Second arm: the optimizer injects `min()` where the user wrote no aggregate
+
+Found while reviewing `bug-order-by-ordinal-resolves-to-shadowing-alias`. Same
+root cause (`coerceForAggregate` applied to `min`), but it reaches queries that
+contain no aggregate at all, so it is much easier to hit than the `min(v)` form
+above and it silently changes stored text into numbers.
+
+`rule-groupby-fd-simplification` drops a GROUP BY column that another grouping
+column already determines, and re-derives the dropped column with a synthesized
+`min(col)` "picker" aggregate. That picker goes through the same numeric-string
+conversion, so a text column comes back as a number:
+
+```sql
+create table t (k integer primary key, s text);
+insert into t values (1,'007'), (2,'1.50');
+
+select s, typeof(s) from t group by s;        -- '007' text,  '1.50' text   (correct)
+select k, s, typeof(s) from t group by k, s;  --  7    integer, 1.5  real   (wrong)
+```
+
+The second query only differs by grouping on the primary key as well, which is
+what makes `s` functionally determined and hands it to the picker. Verified by
+hand against `Database.eval` at the current HEAD; a composite-PK table where no
+column is redundant (`primary key (k, s)`) keeps the text, confirming the rule is
+the trigger.
+
+Whatever fix lands for `min`/`max` above resolves this too — the picker has no
+reason to want the conversion, so a picker-specific skip in
+`computeAggregateSkipCoercion` (`aggregate-setup.ts`) is also a valid narrower
+fix if the general `min`/`max` behavior change is judged too broad.
+
+Site: `packages/quereus/src/planner/rules/aggregate/rule-groupby-fd-simplification.ts`
+(builds the picker), on top of the coercion files already listed above.
