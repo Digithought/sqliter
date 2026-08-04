@@ -1,8 +1,8 @@
 ---
 description: Two files in the SQL engine's instruction-emitter folder have grown to roughly 2,200 and 3,100 lines each; split them so each file covers one job and is readable on its own.
 files:
-  - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,093 lines — the bigger one
-  - packages/quereus/src/runtime/emit/alter-table.ts                 # 2,155 lines
+  - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,107 lines — the bigger one
+  - packages/quereus/src/runtime/emit/alter-table.ts                 # 2,419 lines
   - packages/quereus-isolation/src/alter-migration.ts                # a prior split of this kind, for reference
 ---
 
@@ -15,8 +15,10 @@ and the already-landed `debt-isolation-module-alter-migration-extract`).
 
 | file | lines |
 |---|---|
-| `materialized-view-helpers.ts` | 3,093 |
-| `alter-table.ts` | 2,155 |
+| `materialized-view-helpers.ts` | 3,107 |
+| `alter-table.ts` | 2,419 |
+
+(Re-measured 2026-08-03 with `wc -l`; both have grown since this ticket was filed.)
 
 Both mix several jobs that a reader has to hold at once:
 

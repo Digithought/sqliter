@@ -181,6 +181,24 @@ class MyTable extends VirtualTable {
 }
 ```
 
+#### A failed ALTER announces nothing, even from a native emitter
+
+A module emits its `ALTER TABLE` schema event from inside its own `alterTable`, which is not
+the end of the statement — the engine may still install inline constraints through further
+module calls and unwind the whole ALTER if one fails. Your module does not have to detect
+that: the engine scopes each ALTER statement's batched schema events and **retracts** them
+when the statement throws (`withStatementScopedSchemaEvents` in
+`runtime/emit/alter-schema-event.ts`, over the emitter's
+`beginSchemaEventScope`/`discardSchemaEventsSince` pair). Emit as usual; a statement that
+unwound delivers no schema event on either path. Data events are not retracted — a module
+that flushes earlier buffered writes during a DDL call would otherwise lose them.
+
+The retraction reaches only events the module has already handed to the engine (the store and
+memory modules emit theirs synchronously from inside `alterTable`). A module that instead
+holds its schema events in its own queue and emits them at commit is past the scope by then,
+and must drop a failed statement's own events itself — the same division of responsibility as
+the row-image contract above.
+
 ### For Modules without Native Events
 
 If your module doesn't need custom event logic (e.g., remote change tracking), simply don't implement `getEventEmitter()`. The engine will automatically emit events for all successful DML operations, and for the DDL statements listed below. These auto-emitted events:

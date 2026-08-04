@@ -93,6 +93,12 @@ export function emitAlterSchemaEvent(
  * {@link DatabaseEventEmitter.discardSchemaEventsSince} for why touching the data channel
  * here would swallow earlier statements' committed writes.
  *
+ * ALTER is the only statement family scoped this way. The object-lifecycle statements are
+ * not, and `create table … maintained as` demonstrably leaks the same way (it announces the
+ * backing table's create, then a drop, when filling the table fails) — tracked as
+ * `bug-failed-maintained-create-announces-create-and-drop`, whose first question is whether
+ * this wrapper should move up to cover every DDL statement boundary instead.
+ *
  * NOTE: nothing nests these scopes today (the one ALTER arm that runs nested SQL —
  * the ALTER PRIMARY KEY shadow rebuild — does it under `withPublicEventsSuppressed`, so it
  * batches no events at all). If an arm ever did nest one, the outer failure would retract the

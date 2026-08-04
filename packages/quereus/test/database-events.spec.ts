@@ -734,3 +734,142 @@ describe('DatabaseEventEmitter.withPublicEventsSuppressed', () => {
 		assert.equal(batches.length, 0, 'a transaction whose only events were suppressed groups nothing');
 	});
 });
+
+/**
+ * `beginSchemaEventScope` / `discardSchemaEventsSince` — the mark/discard pair a failed
+ * `ALTER TABLE` statement uses to retract the schema event a self-emitting backend already
+ * batched from inside its own `alterTable` (see `runtime/emit/alter-schema-event.ts` §
+ * `withStatementScopedSchemaEvents`; alter-table-schema-events.spec.ts drives that
+ * end-to-end). Here: the mechanics the SQL-level tests cannot reach — savepoint layers
+ * pushed, rolled back, or released between the mark and the discard, which is the whole
+ * reason each event carries a stamp rather than the scope remembering an array length.
+ */
+describe('DatabaseEventEmitter schema-event scopes', () => {
+	let emitter: DatabaseEventEmitter;
+	let schemaEvents: DatabaseSchemaChangeEvent[];
+	let dataEvents: DatabaseDataChangeEvent[];
+
+	const anAlter = (objectName: string) => ({
+		type: 'alter' as const, objectType: 'table' as const, schemaName: 'main', objectName,
+	});
+	const anInsert = () => ({
+		type: 'insert' as const, schemaName: 'main', tableName: 't',
+		key: [1], newRow: [1, 'a'],
+	});
+	const names = () => schemaEvents.map(e => e.objectName);
+
+	beforeEach(() => {
+		emitter = new DatabaseEventEmitter();
+		schemaEvents = [];
+		dataEvents = [];
+		emitter.onSchemaChange(e => schemaEvents.push(e));
+		emitter.onDataChange(e => dataEvents.push(e));
+		emitter.startBatch();
+	});
+
+	it('drops the scope\'s events and keeps everything batched before it', () => {
+		emitter.emitAutoSchemaEvent('memory', anAlter('before'));
+		const watermark = emitter.beginSchemaEventScope();
+		emitter.emitAutoSchemaEvent('memory', anAlter('inside'));
+
+		assert.equal(emitter.discardSchemaEventsSince(watermark), 1);
+		emitter.flushBatch();
+		assert.deepEqual(names(), ['before']);
+	});
+
+	it('leaves data events alone — a DDL call can flush an earlier statement\'s writes', () => {
+		const watermark = emitter.beginSchemaEventScope();
+		emitter.emitAutoDataEvent('memory', anInsert());
+		emitter.emitAutoSchemaEvent('memory', anAlter('t'));
+
+		emitter.discardSchemaEventsSince(watermark);
+		emitter.flushBatch();
+		assert.deepEqual(names(), []);
+		assert.equal(dataEvents.length, 1, 'retraction is schema-channel only');
+	});
+
+	it('reaches an event batched into a savepoint layer opened after the mark', () => {
+		const watermark = emitter.beginSchemaEventScope();
+		emitter.beginSavepointLayer();
+		emitter.emitAutoSchemaEvent('memory', anAlter('inside'));
+
+		assert.equal(emitter.discardSchemaEventsSince(watermark), 1);
+		emitter.releaseSavepointLayer();
+		emitter.flushBatch();
+		assert.deepEqual(names(), []);
+	});
+
+	it('reaches an event a RELEASE already merged into the base batch', () => {
+		// The stamp travels with the event through the merge; an index into the layer it
+		// was pushed to would not.
+		const watermark = emitter.beginSchemaEventScope();
+		emitter.beginSavepointLayer();
+		emitter.emitAutoSchemaEvent('memory', anAlter('inside'));
+		emitter.releaseSavepointLayer();
+
+		assert.equal(emitter.discardSchemaEventsSince(watermark), 1);
+		emitter.flushBatch();
+		assert.deepEqual(names(), []);
+	});
+
+	it('counts only what survived a ROLLBACK TO SAVEPOINT', () => {
+		const watermark = emitter.beginSchemaEventScope();
+		emitter.beginSavepointLayer();
+		emitter.emitAutoSchemaEvent('memory', anAlter('rolled-back'));
+		emitter.rollbackSavepointLayer();
+		emitter.emitAutoSchemaEvent('memory', anAlter('survives-until-discard'));
+
+		assert.equal(emitter.discardSchemaEventsSince(watermark), 1);
+		emitter.flushBatch();
+		assert.deepEqual(names(), []);
+	});
+
+	it('keeps a nested scope\'s events when only the inner scope fails', () => {
+		const outer = emitter.beginSchemaEventScope();
+		emitter.emitAutoSchemaEvent('memory', anAlter('outer'));
+		const inner = emitter.beginSchemaEventScope();
+		emitter.emitAutoSchemaEvent('memory', anAlter('inner'));
+
+		assert.equal(emitter.discardSchemaEventsSince(inner), 1);
+		emitter.flushBatch();
+		assert.deepEqual(names(), ['outer'], 'the outer statement succeeded and still announces');
+		assert.equal(outer < inner, true, 'stamps are monotonic across nested scopes');
+	});
+
+	it('is a no-op without a batch — those events were already delivered', () => {
+		emitter.flushBatch();
+		const watermark = emitter.beginSchemaEventScope();
+		emitter.emitAutoSchemaEvent('memory', anAlter('t'));
+
+		assert.equal(emitter.discardSchemaEventsSince(watermark), 0);
+		assert.deepEqual(names(), ['t']);
+	});
+
+	it('retracts a module emitter\'s event, not just the engine\'s own', () => {
+		// The leak's actual source: the backend emits from inside its own `alterTable`.
+		const moduleEmitter = new DefaultVTableEventEmitter();
+		emitter.hookModuleEmitter('mod', moduleEmitter);
+
+		const watermark = emitter.beginSchemaEventScope();
+		moduleEmitter.emitSchemaChange(anAlter('t'));
+
+		assert.equal(emitter.discardSchemaEventsSince(watermark), 1);
+		emitter.flushBatch();
+		assert.deepEqual(names(), []);
+	});
+
+	it('keeps the transaction-commit batch in step with the per-event channel', () => {
+		const batches: TransactionCommitBatch[] = [];
+		emitter.onTransactionCommit(b => batches.push(b));
+
+		const watermark = emitter.beginSchemaEventScope();
+		emitter.emitAutoSchemaEvent('memory', anAlter('t'));
+		emitter.discardSchemaEventsSince(watermark);
+		emitter.emitAutoDataEvent('memory', anInsert());
+		emitter.flushBatch();
+
+		assert.equal(batches.length, 1);
+		assert.deepEqual(batches[0].schemaEvents, [], 'sync replays this channel — a retracted ALTER must be absent here too');
+		assert.equal(batches[0].dataEvents.length, 1);
+	});
+});

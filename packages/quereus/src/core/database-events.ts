@@ -318,9 +318,15 @@ export class DatabaseEventEmitter {
 	 * Next value stamped onto a batched schema event's {@link PendingSchemaEvent.seq}.
 	 *
 	 * NEVER reset — not by {@link startBatch}, not by {@link flushBatch}, not by
-	 * {@link removeAllListeners}. A watermark from {@link beginSchemaEventScope} is
-	 * therefore unique for the emitter's whole lifetime, so a stale one (a scope whose
-	 * transaction already committed) can never match a later transaction's events.
+	 * {@link removeAllListeners}. Every stamp is therefore distinct for the emitter's whole
+	 * lifetime, so an event batched BEFORE a scope opened can never be mistaken for one
+	 * batched inside it, however many transactions and savepoint layers came between.
+	 *
+	 * That is a guard against under-matching only. `discardSchemaEventsSince` drops
+	 * everything from its watermark ON, so a watermark held past its own scope would also
+	 * retract events batched after it — which is why the only caller
+	 * (`withStatementScopedSchemaEvents` in `runtime/emit/alter-schema-event.ts`) takes one
+	 * and spends it inside a single try/catch, never storing it.
 	 */
 	private schemaEventSeq = 0;
 
