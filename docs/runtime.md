@@ -280,6 +280,15 @@ const result = await withAsyncRowContext(rctx, rowDescriptor, () => row, async (
 });
 ```
 
+`withAsyncRowContext` is the default choice. Reach for the synchronous
+`withRowContext` only when the callee is *provably* synchronous — an emitted
+scalar evaluator is not, whatever the planner validated about it. In particular
+a DDL-authored expression (column DEFAULT, `GENERATED ALWAYS AS`, `CHECK`) may
+embed a scalar subquery and return a `Promise`; validated determinism says
+nothing about synchrony (see [determinism.md](determinism.md)). As of this
+writing no `src/` site uses `withRowContext`; it is kept for callers whose
+callee is a plain value read.
+
 ### Column Reference Resolution
 Column references are resolved automatically using attribute IDs.  Resolution has
 two tiers (see `resolveAttribute` in `context-helpers.ts`):

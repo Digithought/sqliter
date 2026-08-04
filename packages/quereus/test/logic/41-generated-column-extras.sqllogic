@@ -202,3 +202,38 @@ select w, g, g2 from t_sub_chain;
 
 drop table t_sub_chain;
 drop table t_src2;
+
+-- ===================================
+-- 8. Correlated subquery generated column, multi-row UPDATE
+--    Sections 6 and 7 use an UNCORRELATED subquery, which never reads the row
+--    context UPDATE installs for its phase-2 recompute. This one does — the
+--    subquery's `id` resolves against the row being updated — across several
+--    rows in one statement, so the phase-2 context must be installed and torn
+--    down correctly on every iteration, not just the first.
+--    Note the other table's column is qualified (`t_src3.k`): an unqualified
+--    name inside a generated expression is read as a reference to THIS table
+--    and rejected at create time (see docs/sql-alter.md § ADD COLUMN).
+-- ===================================
+
+create table t_src3 (k integer primary key);
+
+insert into t_src3 values (1), (2), (3);
+
+create table t_corr (
+	id integer primary key,
+	w  integer,
+	g  integer generated always as ((select count(*) from t_src3 where t_src3.k <= id))
+);
+
+insert into t_corr (id, w) values (1, 10), (2, 20), (3, 30);
+
+select id, w, g from t_corr order by id;
+→ [{"id":1,"w":10,"g":1},{"id":2,"w":20,"g":2},{"id":3,"w":30,"g":3}]
+
+update t_corr set w = w + 1;
+
+select id, w, g from t_corr order by id;
+→ [{"id":1,"w":11,"g":1},{"id":2,"w":21,"g":2},{"id":3,"w":31,"g":3}]
+
+drop table t_corr;
+drop table t_src3;

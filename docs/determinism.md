@@ -22,7 +22,7 @@ lift the gate.
 > a `Promise`. No runtime site may skip an `await` on the strength of having
 > validated determinism; doing so writes the Promise object itself into the row.
 > (This was a live defect in the UPDATE generated-column recompute; regression
-> coverage lives in `test/logic/41-generated-column-extras.sqllogic` § 6–7.)
+> coverage lives in `test/logic/41-generated-column-extras.sqllogic` § 6–8.)
 
 ## The `nondeterministic_schema` option
 
