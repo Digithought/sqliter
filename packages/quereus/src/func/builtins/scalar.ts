@@ -468,13 +468,14 @@ export const clampFunc = createScalarFunction(
  *
  * The fold ranks coerced KEYS but tracks the winning INDEX and returns the raw
  * argument there, so `greatest(t, 1)` over the stored text `'3'` hands back `'3'`
- * rather than the integer the conversion produced. The `best === null` test rides
- * on the running key, exactly where it sat before this split (it used to read the
- * cast operand, and `cast('' as integer)` is null from a non-null operand), so
- * NULL handling is unchanged: `greatest` skips NULLs, `least`'s NULL wipes the
- * running minimum. Ties under a non-BINARY comparator leave which argument
- * survives unspecified (same latitude as the min/max aggregate, DISTINCT, and
- * GROUP BY) — but it is always one of the arguments.
+ * rather than the integer the conversion produced. NULL arguments are skipped
+ * entirely — neither function's running best is ever a NULL key — matching
+ * `min`/`max` and the window MIN/MAX, so `greatest`/`least` agree with each
+ * other and the answer never depends on where a NULL sits in the argument
+ * list. All-NULL (or zero) arguments yield NULL. Ties under a non-BINARY
+ * comparator leave which argument survives unspecified (same latitude as the
+ * min/max aggregate, DISTINCT, and GROUP BY) — but it is always one of the
+ * arguments.
  */
 function emitExtremum(direction: 1 | -1): CustomEmitterHook {
 	return (plan, ctx, _defaultEmit) => {
@@ -483,17 +484,17 @@ function emitExtremum(direction: 1 | -1): CustomEmitterHook {
 		const compare = makeGroupComparator(group.types.map(t => t.logicalType), ctx.resolveCollation(collationName));
 
 		function run(_rctx: RuntimeContext, ...args: SqlValue[]): SqlValue {
-			if (args.length === 0) return null;
-			let bestIndex = 0;
-			let bestKey = group.key(0, args[0]);
-			for (let i = 1; i < args.length; i++) {
+			let bestIndex = -1;
+			let bestKey: SqlValue = null;
+			for (let i = 0; i < args.length; i++) {
 				const currentKey = group.key(i, args[i]);
-				if (bestKey === null || compare(currentKey, bestKey) * direction > 0) {
+				if (currentKey === null) continue;
+				if (bestIndex === -1 || compare(currentKey, bestKey) * direction > 0) {
 					bestIndex = i;
 					bestKey = currentKey;
 				}
 			}
-			return args[bestIndex];
+			return bestIndex === -1 ? null : args[bestIndex];
 		}
 
 		return {
@@ -547,13 +548,13 @@ export const greatestFunc = createScalarFunction(
 	},
 	// BINARY, uncoerced fallback — see the NOTE on `nullif`'s implementation above.
 	(...args: SqlValue[]): SqlValue => {
-		if (args.length === 0) return null;
-		return args.reduce((max, current) => {
+		return args.reduce((max: SqlValue, current) => {
+			if (current === null) return max;
 			if (max === null || compareSqlValues(current, max) > 0) {
 				return current;
 			}
 			return max;
-		}, args[0]);
+		}, null);
 	}
 );
 
@@ -577,13 +578,13 @@ export const leastFunc = createScalarFunction(
 	},
 	// BINARY, uncoerced fallback — see the NOTE on `nullif`'s implementation above.
 	(...args: SqlValue[]): SqlValue => {
-		if (args.length === 0) return null;
-		return args.reduce((min, current) => {
+		return args.reduce((min: SqlValue, current) => {
+			if (current === null) return min;
 			if (min === null || compareSqlValues(current, min) < 0) {
 				return current;
 			}
 			return min;
-		}, args[0]);
+		}, null);
 	}
 );
 

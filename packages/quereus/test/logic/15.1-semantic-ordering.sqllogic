@@ -553,10 +553,10 @@ select greatest(d, 'PT30M') as g, least(d, 'PT30M') as l from gnl;
 select greatest(d, e, 'PT30M') as g, least(d, e, 'PT30M') as l from gnl;
 → [{"g":"PT2H","l":"PT30M"}]
 
--- NULL handling is the plain fold's, unchanged by the comparator swap: greatest
--- skips NULLs, least replaces a NULL accumulator but ranks a later NULL lowest.
+-- NULL handling is the plain fold's, unchanged by the comparator swap: both
+-- greatest and least skip NULLs.
 select greatest(d, null) as g, least(d, null) as l, least(null, d) as l2 from gnl;
-→ [{"g":"PT2H","l":null,"l2":"PT2H"}]
+→ [{"g":"PT2H","l":"PT2H","l2":"PT2H"}]
 
 select nullif(d, null) as a, nullif(null, d) as b from gnl;
 → [{"a":"PT2H","b":null}]

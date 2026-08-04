@@ -361,11 +361,11 @@ NULL-typed argument is left out of that test — the only value it can win with 
 NULL, which the declaration is nullable for anyway — so `greatest(int_col, null)`
 still declares INTEGER.
 
-`greatest`/`least` NULL handling is a separate, pre-existing wrinkle the
-comparison work deliberately left alone: `greatest` skips NULLs, but `least` is
-order-dependent — a NULL wipes the running minimum, so `least(1, null, 3)` is 3.
-Pinned by `test/logic/24-builtin-branches.sqllogic` and tracked as
-`tickets/backlog/bug-least-null-handling-order-dependent`.
+`greatest`/`least` both skip NULL arguments, matching the `min`/`max`
+aggregates and the window MIN/MAX — a NULL argument contributes nothing, and
+an all-NULL (or zero-argument) call returns NULL. The result never depends on
+where a NULL sits in the argument list, e.g. `least(1, null, 3)` is `1`.
+Pinned by `test/logic/24-builtin-branches.sqllogic`.
 
 **Join keys: the mixed-pair rule.** A physical equi-join key (hash / bloom / merge)
 compares with no type context, so it can only carry a pair whose two sides agree on

@@ -529,12 +529,10 @@ SELECT greatest(null, null) as result;
 SELECT greatest(null, 42) as result;
 → [{"result":42}]
 
--- least's NULL handling is asymmetric and order-dependent, unlike greatest's:
--- NULL ranks lowest so the fold picks it, but a NULL accumulator is replaced
--- unconditionally. Pinned so a future NULL-semantics change is a deliberate edit
--- rather than a silent one.
+-- least skips NULLs, matching greatest, so the answer never depends on where
+-- a NULL sits in the argument list.
 SELECT least(1, null) as result;
-→ [{"result":null}]
+→ [{"result":1}]
 
 SELECT least(null, 1) as result;
 → [{"result":1}]
@@ -542,13 +540,11 @@ SELECT least(null, 1) as result;
 SELECT least(null, null) as result;
 → [{"result":null}]
 
--- A NULL mid-list wipes the accumulator, so everything before it is discarded and
--- the answer is the minimum of the values that FOLLOW the last NULL.
 SELECT least(3, null, 1) as result;
 → [{"result":1}]
 
 SELECT least(1, null, 3) as result;
-→ [{"result":3}]
+→ [{"result":1}]
 
 -- ============================================================
 -- SCALAR: typeof edge cases

@@ -72,7 +72,7 @@ select clamp(15, 0, 10);  -- 10
 | `iif(X, Y, Z)` | 3 | any | If X is truthy then Y, else Z |
 | `typeof(X)` | 1 | TEXT | Type name: `'null'`, `'integer'`, `'real'`, `'text'`, `'blob'`, `'json'` |
 | `greatest(X, Y, ...)` | variadic | any | Largest value using SQL comparison; NULLs are skipped |
-| `least(X, Y, ...)` | variadic | any | Smallest value using SQL comparison. NULL handling is order-dependent — see caveat below |
+| `least(X, Y, ...)` | variadic | any | Smallest value using SQL comparison; NULLs are skipped |
 | `choose(N, V1, V2, ...)` | variadic | any | Returns the N-th value (1-based index). `NULL` if out of range |
 
 ```sql
@@ -98,10 +98,6 @@ argument is what comes back — `nullif('3', 1)` returns the text `'3'`,
 `least('abc', 1)` returns `'abc'` (the comparison reads `'abc'` as `0`, which loses
 to `1`, but `0` is never a result). Storage class survives too:
 `typeof(nullif('3', 1))` is `text`.
-
-A NULL argument to `least` wipes the running minimum, so the answer depends on
-argument order: `least(1, null, 3)` is `3`, not `1`. `greatest` skips NULLs
-instead. Tracked as `tickets/backlog/bug-least-null-handling-order-dependent`.
 
 ---
 

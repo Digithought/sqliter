@@ -54,10 +54,7 @@ select
 - `sqrt(X)`: Returns the square root of X
 - `clamp(X, min, max)`: Constrains X to be between min and max
 - `greatest(X, Y, ...)`: Returns the largest value from the arguments, skipping NULLs
-- `least(X, Y, ...)`: Returns the smallest value from the arguments. A NULL argument
-  wipes the running minimum, so the answer depends on argument order —
-  `least(1, null, 3)` is `3`. Tracked as
-  `tickets/backlog/bug-least-null-handling-order-dependent`
+- `least(X, Y, ...)`: Returns the smallest value from the arguments, skipping NULLs
 - `random()`: Returns a random integer
 - `randomblob(N)`: Returns a blob containing N bytes of pseudo-random data
 
