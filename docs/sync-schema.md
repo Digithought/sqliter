@@ -251,26 +251,29 @@ sub-form, and `alter primary key` all reach every synced peer.
 set). Two things make the data path survive the rename:
 
 - **In-batch routing.** The apply path's Phase-1 table-fate computation
-  (`computeBatchTableFates` in `change-applicator.ts`) treats a `rename_table` as two
-  existence steps at its own HLC — the new name becomes present, the old name absent — so
-  rows arriving under the new name in the very batch that carries the rename land instead
-  of taking the unknown-table disposition. Chained renames, rename-then-drop, and
-  rename-then-rename-back within one batch all resolve by the same max-HLC rule. An
-  applied `rename_table` also triggers the reactive held-change drain for its new name,
-  the same as an applied `create_table`.
+  (`computeBatchTableFates` in `change-applicator.ts`) simulates what the batch's schema
+  steps leave behind: it seeds each mentioned name with whether the receiver has it right
+  now, then replays the migrations Phase 1a kept, in HLC order, applying the same verdict
+  `decideSchemaChange` will reach. A `rename_table` therefore moves the name only when the
+  receiver still has the old one — matching `decideRenameTable` exactly — so rows arriving
+  under the new name in the very batch that carries the rename land, while rows for a
+  rename the receiver DECLINES (its old table was dropped locally, or `fromTable` is
+  missing) take the unknown-table disposition instead of reaching a table that does not
+  exist. Chained renames, rename-then-drop, and rename-then-rename-back within one batch
+  all resolve by the same replay. An applied `rename_table` also triggers the reactive
+  held-change drain for its new name, the same as an applied `create_table`.
+- **Renamed-in tables keep their history.** The companion `recreated` verdict — "this is a
+  brand-new EMPTY local table, so its rows may resolve read-free, without consulting local
+  cell versions and tombstones" — is set only by a `create_table` that moves a name from
+  absent to present. A table that arrives under a name by RENAME brings its rows with it
+  and is not a new incarnation, so rename-away-and-back in one batch resolves normally and
+  a stored tombstone still blocks a re-delivered row.
 - **Same-transaction writes.** The engine relabels a transaction's already-batched data
   events to the new name before commit (`renameBatchedEvents`), so a rename in the same
   transaction as writes files every fact under the new name.
 
-Three caveats:
+Two caveats:
 
-- **The in-batch existence verdict is wrong for two rename shapes that also carry rows**,
-  both verified — `tickets/fix/sync-rename-batch-existence-verdict-wrong.md`. A rename the
-  receiver declines to apply (its old table was dropped locally, or `fromTable` is missing)
-  still routes the batch's rows to the new name, which does not exist ⇒ the apply throws and
-  the batch retries forever. And rename-away-then-back in one batch is judged a fresh
-  incarnation, so its rows resolve read-free past a tombstone that should block them. The
-  DDL-only forms of both are correct and covered; only batches that also carry data fail.
 - **CRDT metadata is stranded at the old name.** Sync's per-row bookkeeping
   (`cv:`/`tb:`/`cl:`) is keyed by table name, so both origin and receiver abandon it at
   the old name and start empty at the new one — later conflict resolution and tombstone

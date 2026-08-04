@@ -317,12 +317,13 @@ describe('drop + re-create in one batch', () => {
 	});
 
 	it('a name RENAMED away and re-created in one batch resolves read-free too', async () => {
-		// The rename arm of the same verdict: `rename_table` is an ABSENCE step for the
-		// old name, so a table re-created under that name in the same batch is a fresh
-		// incarnation exactly as after a `drop_table`. The metadata stranded under the
-		// name belongs to the table that was renamed AWAY, so consulting it would let its
-		// tombstone discard the new incarnation's row. (`computeBatchTableFates` +
-		// `appliedDropKeys` in `change-applicator.ts`.)
+		// The rename arm of the same verdict: a `rename_table` VACATES the old name, so a
+		// table CREATED under that name in the same batch is a fresh incarnation exactly
+		// as after a `drop_table`. The metadata stranded under the name belongs to the
+		// table that was renamed AWAY, so consulting it would let its tombstone discard
+		// the new incarnation's row. Note the deciding step is the `create_table` — a
+		// table that arrives under a name by being renamed INTO it brings its rows along
+		// and is NOT fresh. (`computeBatchTableFates` in `change-applicator.ts`.)
 		const origin = await makePeer('origin');
 		const receiver = await makePeer('receiver');
 		try {

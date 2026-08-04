@@ -8,7 +8,7 @@
  */
 
 import type { WriteBatch } from '@quereus/store';
-import { compareHLC, maxHLC, assertWithinDrift, type HLC } from '../clock/hlc.js';
+import { compareHLC, maxHLC, assertWithinDrift } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
@@ -84,102 +84,99 @@ interface BatchTableFate {
 	/** The table exists after this batch's schema steps replay in timestamp order. */
 	present: boolean;
 	/**
-	 * An ABSENCE step (a `drop_table`, or a `rename_table` moving this name away)
-	 * precedes the deciding presence step, so the batch's DDL sequence re-creates the
-	 * table under this name. Whether the LOCAL table is therefore a new, EMPTY
-	 * incarnation additionally requires that absence to be APPLIED here rather than
-	 * skipped as HLC-dominated — the read site ANDs this with `appliedDropKeys`.
+	 * An applied `create_table` transitioned this name from ABSENT to present, so the
+	 * local table is a new, EMPTY incarnation and the receiver's stranded metadata for
+	 * the name describes nothing in it.
 	 */
 	recreated: boolean;
 }
 
-/** One existence step a batch migration contributes for one `(schema, table)`. */
-interface TableExistenceStep {
-	readonly hlc: HLC;
-	/** The table exists after this step replays. */
-	readonly present: boolean;
-}
-
 /**
  * Per-table verdict on what this batch's schema migrations leave behind, keyed
- * `schema.table`. Tables with no existence step in the batch are absent from the map.
- * Three migration kinds change whether a table exists: `create_table` and `drop_table`
- * contribute one step for their own table, and `rename_table` contributes TWO steps at
- * its own HLC — the new name (`table`) becomes present, the old name (`fromTable`)
- * becomes absent. A `rename_table` whose `fromTable` is missing (an omitting peer)
- * contributes only the new-name half. The other kinds are ignored here.
+ * `schema.table`. Names no kept migration mentions are absent from the map; the read
+ * sites fall back to the current basis for those.
  *
- * Detection runs at Phase 1, before any DDL executes in Phase 2, so the verdict has to
- * be derived from the steps' HLCs rather than observed: `present` is decided by the
- * table's LAST existence step in timestamp order — the same total order
- * {@link orderMigrationsByHLC} replays them in — not by set membership, so a
- * create → drop → create (or rename-away → rename-back) batch correctly reports the
- * table present. Computed over the WHOLE batch because admission applies all schema
- * changes before all data, including migrations Phase 1a later skips as HLC-dominated:
- * a skipped migration means the receiver already reached that state, so the verdict is
- * unchanged.
+ * The verdict is needed at Phase 1, before any DDL executes at Phase 2, so it is
+ * SIMULATED: seed each mentioned name with whether the receiver has it NOW
+ * (`isPresentLocally`), then replay the three existence-changing migration kinds in
+ * HLC order — `migrations` arrives already ordered by {@link orderMigrationsByHLC},
+ * the same order Phase 2 replays them in — applying the same decision each kind's
+ * {@link decideSchemaChange} arm will reach against the catalog.
  *
- * KNOWN WRONG for two rename shapes that also carry row data, both verified — see
- * `tickets/fix/sync-rename-batch-existence-verdict-wrong.md`. (1) The new-name presence
- * step assumes the receiver executes the rename; it does not when the old name is gone
- * locally (drop won) or `fromTable` is missing, so the batch's rows for the new name reach
- * a table that does not exist and `applySchemaChange`'s external-write lookup throws,
- * aborting the batch with the watermark unadvanced — the same batch then re-throws
- * forever. (2) `recreated` treats rename-away-then-rename-back as a fresh incarnation, so
- * its rows resolve read-free past a stored tombstone that should have blocked them. Fix
- * them together — they are one disagreement between this structural verdict and the
- * catalog-based one in `decideRenameTable`.
+ * Both halves of that are load-bearing:
+ *
+ * - Seeding from local presence is what keeps this verdict and the catalog-based one
+ *   in `decideRenameTable` from disagreeing. A `rename_table` moves the name only when
+ *   the receiver still HAS the old one; a rename it declines (the old name was dropped
+ *   here, or `fromTable` is missing) leaves the new name as absent as it really will
+ *   be, so the batch's rows for that name take the normal unknown-table route instead
+ *   of reaching a table that does not exist and throwing the whole batch away.
+ * - Replaying only the KEPT migrations (Phase 1a drops the HLC-dominated ones) is what
+ *   makes the seed meaningful: a dominated migration means the receiver already
+ *   processed that fact, so its effect — and anything it did LATER, like dropping the
+ *   table again — is already in the seeded presence. Replaying it a second time would
+ *   resurrect a state the receiver has since moved past.
+ *
+ * `recreated` marks only an ABSENT → present transition made by a `create_table`: the
+ * one step that produces a new, EMPTY local table, whose rows therefore have no
+ * meaningful local cell versions or tombstones to resolve against (dropping a table
+ * does not purge its sync metadata). A `rename_table` moves an existing table WITH its
+ * rows, so arriving under a name by rename never sets it.
  */
-function computeBatchTableFates(changes: ChangeSet[]): Map<string, BatchTableFate> {
-	// Per table: the max-HLC existence step (which decides existence) and the max-HLC
-	// ABSENCE step — a drop, or a rename-away — (which decides whether the surviving
-	// table is a new incarnation).
-	const lastStep = new Map<string, TableExistenceStep>();
-	const lastAbsence = new Map<string, TableExistenceStep>();
-	const addStep = (schema: string, table: string, step: TableExistenceStep): void => {
+function computeBatchTableFates(
+	migrations: readonly SchemaMigration[],
+	isPresentLocally: (schema: string, table: string) => boolean,
+): Map<string, BatchTableFate> {
+	const fates = new Map<string, BatchTableFate>();
+	const fateOf = (schema: string, table: string): BatchTableFate => {
 		const key = tableKey(schema, table);
-		keepLatestStep(lastStep, key, step);
-		if (!step.present) keepLatestStep(lastAbsence, key, step);
+		let fate = fates.get(key);
+		if (!fate) {
+			fate = { present: isPresentLocally(schema, table), recreated: false };
+			fates.set(key, fate);
+		}
+		return fate;
 	};
-	for (const changeSet of changes) {
-		for (const migration of changeSet.schemaMigrations) {
-			switch (migration.type) {
-				case 'create_table':
-					addStep(migration.schema, migration.table, { hlc: migration.hlc, present: true });
-					break;
-				case 'drop_table':
-					addStep(migration.schema, migration.table, { hlc: migration.hlc, present: false });
-					break;
-				case 'rename_table':
-					addStep(migration.schema, migration.table, { hlc: migration.hlc, present: true });
-					if (migration.fromTable !== undefined) {
-						addStep(migration.schema, migration.fromTable, { hlc: migration.hlc, present: false });
-					}
-					break;
+
+	for (const migration of migrations) {
+		switch (migration.type) {
+			case 'create_table': {
+				const fate = fateOf(migration.schema, migration.table);
+				// Already present ⇒ `decideSchemaChange` converges without executing, so the
+				// local table and its rows survive; only an absent → present transition
+				// leaves a genuinely empty incarnation.
+				if (!fate.present) {
+					fate.present = true;
+					fate.recreated = true;
+				}
+				break;
+			}
+			case 'drop_table': {
+				const fate = fateOf(migration.schema, migration.table);
+				fate.present = false;
+				fate.recreated = false;
+				break;
+			}
+			case 'rename_table': {
+				// Mirrors `decideRenameTable`: no `fromTable` (an omitting peer) is
+				// undecidable and converges without applying, so neither name moves.
+				if (migration.fromTable === undefined) break;
+				const from = fateOf(migration.schema, migration.fromTable);
+				const to = fateOf(migration.schema, migration.table);
+				// Old absent ⇒ the receiver declines (a local drop won, or the rename
+				// already happened here). Both present ⇒ `decideRenameTable` throws a
+				// collision and the whole admission unit aborts; predict no movement.
+				if (!from.present || to.present) break;
+				from.present = false;
+				from.recreated = false;
+				to.present = true;
+				// The renamed table arrives carrying its rows — never a fresh, empty one.
+				to.recreated = false;
+				break;
 			}
 		}
 	}
-
-	const fates = new Map<string, BatchTableFate>();
-	for (const [key, step] of lastStep) {
-		const absence = lastAbsence.get(key);
-		fates.set(key, {
-			present: step.present,
-			recreated: step.present && absence !== undefined && compareHLC(absence.hlc, step.hlc) < 0,
-		});
-	}
 	return fates;
-}
-
-/**
- * Keep the step that replays LAST for a key. Ties keep the later-arriving one,
- * matching {@link orderMigrationsByHLC}'s stable sort (equal HLCs stay in arrival
- * order, so the last of them executes last) — unlike {@link keepMaxHLC}, which keeps
- * the first of a tie because it collapses repeats of ONE fact.
- */
-function keepLatestStep(latest: Map<string, TableExistenceStep>, key: string, step: TableExistenceStep): void {
-	const prev = latest.get(key);
-	if (!prev || compareHLC(step.hlc, prev.hlc) >= 0) latest.set(key, step);
 }
 
 /**
@@ -236,8 +233,6 @@ export async function applyChanges(
 	// Out-of-basis straggler changes diverted out of the resolve/apply/metadata
 	// path, grouped per table for disposition + telemetry.
 	const unknownByTable = new Map<string, UnknownTableGroup>();
-
-	const batchFates = computeBatchTableFates(changes);
 
 	// Pre-commit drift validation: reject a batch whose maximum fact HLC is beyond the
 	// drift bound BEFORE any resolution, data write, or CRDT metadata commit — so a peer
@@ -296,24 +291,12 @@ export async function applyChanges(
 		applied++;
 	}
 
-	// Tables whose ABSENCE step this batch actually APPLIES (Phase 1a kept it; it was
-	// not skipped as HLC-dominated): a `drop_table` of the table, or a `rename_table`
-	// moving that name away (the stranded metadata under the old name belongs to the
-	// renamed-away incarnation, not to anything later re-created there). Only an
-	// executed absence leaves whatever the batch re-creates a genuinely EMPTY table, so
-	// this is the second half of the `freshLocalTable` test below: a RE-DELIVERED
-	// drop/re-create batch has every schema step dominated, changes no local schema,
-	// and the local table is already the post-re-create incarnation — its metadata is
-	// that incarnation's and must still be consulted, or the batch's rows would clobber
-	// newer writes read-free.
-	const appliedDropKeys = new Set(
-		pendingSchemaMigrations.flatMap(({ migration }) => {
-			if (migration.type === 'drop_table') return [tableKey(migration.schema, migration.table)];
-			if (migration.type === 'rename_table' && migration.fromTable !== undefined) {
-				return [tableKey(migration.schema, migration.fromTable)];
-			}
-			return [];
-		}),
+	// What the batch's schema steps leave behind, simulated over the migrations Phase 1a
+	// actually KEPT and seeded from what the receiver has now — so the verdict below
+	// agrees with the catalog the DDL will be decided against.
+	const batchFates = computeBatchTableFates(
+		pendingSchemaMigrations.map(({ migration }) => migration),
+		(schema, table) => ctx.isTableInBasis(schema, table),
 	);
 
 	// PHASE 1b: Resolve all data changes (no writes yet). The clock watermark is merged
@@ -360,13 +343,25 @@ export async function applyChanges(
 			// dropping a table does not purge its sync metadata — so resolving these rows
 			// against the dropped incarnation's cell versions and tombstones would let a
 			// stale tombstone silently discard them under the default
-			// `allowResurrection: false`. Only when the drop is APPLIED here, though (see
-			// `appliedDropKeys`) — otherwise the re-create already happened and the
-			// surviving metadata is the CURRENT incarnation's. (The broader question of a
+			// `allowResurrection: false`. `recreated` is only ever set by an applied
+			// absent → present `create_table` (see {@link computeBatchTableFates}), so a
+			// RE-DELIVERED drop/re-create batch — every schema step dominated, no local
+			// schema changed, the local table already the post-re-create incarnation —
+			// resolves normally against that incarnation's own metadata, and a table that
+			// merely arrives under this name by RENAME resolves normally too: it brings
+			// its rows with it and is not a fresh incarnation. (The broader question of a
 			// re-created table INHERITING that bookkeeping — purge policy, relays,
 			// retention horizon — is tracked separately; this only stops the in-batch
 			// recreate consulting it.)
-			const freshLocalTable = !inBasis || (fate?.recreated === true && appliedDropKeys.has(key));
+			//
+			// NOTE: `!inBasis` still resolves read-free for a table that arrives under a
+			// name the receiver does NOT currently have, including by rename. That name may
+			// carry metadata stranded by an earlier incarnation, which the arriving table's
+			// rows then skip. Unavoidable today — an out-of-basis name has no schema and so
+			// no resolvable pk keying — and the same for `create_table`; if the stranded
+			// bookkeeping is ever purged or re-keyed on drop/rename
+			// (`bug-sync-recreated-table-inherits-dropped-table-metadata`), narrow this.
+			const freshLocalTable = !inBasis || fate?.recreated === true;
 
 			const resolved = await resolveChange(ctx, change, freshLocalTable);
 			if (freshLocalTable) resolved.freshLocalTable = true;
