@@ -1649,6 +1649,7 @@ for await (const user of db.eval("select * from users")) {
 
 **Key Points:**
 - All query methods return rows as objects with column names as keys
+- Two result columns sharing a name (`select l.a, r.a from l join r …`, with or without `group by`) are numbered — the first keeps the name, later ones get a `:<n>` suffix: `a`, `a:1`. Without this the object form would drop a column; use an explicit alias when you want a stable name
 - `get()` returns a single object (or undefined)
 - `all()` and `eval()` return async iterators for streaming
 

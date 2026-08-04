@@ -180,6 +180,24 @@ select jl.a, jl.b, jr.a, jr.c, count(*) c from jl join jr on jl.a = jr.a
 drop table jl;
 drop table jr;
 
+-- The same two same-named keys with NO dependency between them (the join is on
+-- the *other* pair of columns), so the FD simplification does not fire and
+-- nothing caps the aggregate: it is the query root itself. Its own output names
+-- must still be disambiguated the way a projection's are — a result row is
+-- keyed by column name, so a repeated `a` drops one of the two values
+-- (bug-duplicate-aggregate-output-names-collapse-row). The memory and store
+-- modules pick different plans here, so this pins both physical aggregates.
+create table dl (a text, b text);
+create table dr (a text, c text);
+insert into dl values ('x','p'),('y','q');
+insert into dr values ('m','p'),('n','q');
+
+select dl.a, dr.a, count(*) n from dl join dr on dl.b = dr.c group by dl.a, dr.a order by dl.a;
+→ [{"a":"x","a:1":"m","n":1},{"a":"y","a:1":"n","n":1}]
+
+drop table dl;
+drop table dr;
+
 -- `insert into … select` binds the select output by POSITION, so it is the
 -- consumer the reorder actually corrupted: with the shift, `g`'s text landed in
 -- `sink.v` and `v`'s integer in `sink.g`.

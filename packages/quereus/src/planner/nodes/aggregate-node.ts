@@ -12,6 +12,7 @@ import { quereusError } from '../../common/errors.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
 import { aggregateCost } from '../cost/index.js';
 import { aggregateRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
+import { disambiguateColumnNames } from '../util/output-names.js';
 
 export interface AggregateExpression {
   expression: ScalarPlanNode;
@@ -144,18 +145,39 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
     return `group_${index}`;
   }
 
+  /**
+   * The published output names: GROUP BY keys then aggregates, with duplicates
+   * numbered (`a`, `a:1`) exactly like a ProjectNode's.
+   *
+   * `GROUP BY l.a, r.a` gives both keys the base name `a`, and this node is the
+   * query root whenever the SELECT list already agrees with the aggregate's own
+   * layout (no capping projection is built) — so without the suffix a result-row
+   * object would carry one `a` and drop the other column's value.
+   *
+   * Only the *type* names are disambiguated; {@link buildAttributes} keeps the
+   * base names, which `createAggregateOutputScope` reads to decide that a bare
+   * `a` is ambiguous across two group keys.
+   */
+  private buildColumnNames(): string[] {
+    return disambiguateColumnNames([
+      ...this.groupBy.map((expr, index) => this.getGroupByColumnName(expr, index)),
+      ...this.aggregates.map(agg => agg.alias)
+    ]);
+  }
+
   private buildOutputType(): RelationType {
     // Build the output relation type based on group by columns and aggregates
+    const names = this.buildColumnNames();
     const columns = [
       // Group by columns come first
       ...this.groupBy.map((expr, index) => ({
-        name: this.getGroupByColumnName(expr, index),
+        name: names[index],
         type: expr.getType(),
         generated: false
       })),
       // Then aggregate columns
-      ...this.aggregates.map(agg => ({
-        name: agg.alias,
+      ...this.aggregates.map((agg, index) => ({
+        name: names[this.groupBy.length + index],
         type: agg.expression.getType(),
         generated: true
       }))

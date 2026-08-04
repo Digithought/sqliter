@@ -254,6 +254,22 @@ describe('Plan shape: grouped-query final projection', () => {
 				)).to.deep.equal(['a', 'b', 'a:1', 'c', 'c:1']);
 			});
 
+			/**
+			 * Regression for bug-duplicate-aggregate-output-names-collapse-row.
+			 * Same-named keys with no dependency between them: the FD simplification
+			 * cannot fire, the select list agrees with the aggregate's own layout, and
+			 * so nothing caps the aggregate — it publishes the result names itself.
+			 * A result row is delivered keyed by column name, so an undisambiguated
+			 * second `a` dropped a column's value outright. Values are pinned in
+			 * test/logic/07.3.2-grouped-select-list-shape.sqllogic.
+			 */
+			it('numbers duplicate output names on a bare aggregate root', async () => {
+				const sql = "SELECT nk.a, nj.a, count(*) AS n FROM nk JOIN nj ON nk.b = nj.c GROUP BY nk.a, nj.a";
+				const rows = await planRows(db, sql);
+				expect(rows.filter(r => r.op === 'PROJECT'), 'the aggregate itself is the root here').to.be.empty;
+				expect(await columnNames(sql)).to.deep.equal(['a', 'a:1', 'n']);
+			});
+
 			// The shape the delta-aggregate maintenance path recognises: keys in GROUP BY
 			// order, then aggregates. It agrees with the aggregate output, so no
 			// projection is built and the plan stays bare aggregate-over-scan. Widening

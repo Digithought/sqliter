@@ -15,6 +15,7 @@ import type { PhysicalProperties, FunctionalDependency, AuthoredInverseMeta } fr
 import { projectMonotonicOnByAttrId, projectOrdering } from '../framework/physical-utils.js';
 import { deriveProjectUpdateLineage } from '../analysis/update-lineage.js';
 import { physicalSourceRows } from '../util/row-estimates.js';
+import { disambiguateColumnNames } from '../util/output-names.js';
 
 export interface Projection {
 	node: ScalarPlanNode;
@@ -86,46 +87,25 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 
 		this.outputTypeCache = new Cached(() => {
 			// Build column names with proper duplicate handling
-			const columnNames: string[] = [];
-			const nameCount = new Map<string, number>();
+			const columnNames = disambiguateColumnNames(this.projections.map(proj => {
+				// Determine base column name
+				if (proj.alias) return proj.alias;
+				// For column references, use the unqualified column name
+				if (proj.node instanceof ColumnReferenceNode) return proj.node.expression.name;
+				// For expressions, use the string representation
+				return expressionToString(proj.node.expression);
+			}));
 
 			// Source attribute types by id: a bare column-ref projection inherits the
 			// type the source publishes for its attribute id (the null-extended,
 			// nullable type over an outer join), not its own stale captured `columnType`.
 			const sourceTypeById = this.sourceTypeById();
 
-			const columns = this.projections.map((proj) => {
-				// Determine base column name
-				let baseName: string;
-				if (proj.alias) {
-					baseName = proj.alias;
-				} else if (proj.node instanceof ColumnReferenceNode) {
-					// For column references, use the unqualified column name
-					baseName = proj.node.expression.name;
-				} else {
-					// For expressions, use the string representation
-					baseName = expressionToString(proj.node.expression);
-				}
-
-				// Handle duplicate names
-				let finalName: string;
-				const currentCount = nameCount.get(baseName) || 0;
-				if (currentCount === 0) {
-					// First occurrence - use the base name
-					finalName = baseName;
-				} else {
-					// Subsequent occurrences - add numbered suffix
-					finalName = `${baseName}:${currentCount}`;
-				}
-				nameCount.set(baseName, currentCount + 1);
-				columnNames.push(finalName);
-
-				return {
-					name: finalName,
-					type: effectiveProjectionType(proj.node, sourceTypeById),
-					generated: proj.node.nodeType !== PlanNodeType.ColumnReference,
-				};
-			});
+			const columns = this.projections.map((proj, index) => ({
+				name: columnNames[index],
+				type: effectiveProjectionType(proj.node, sourceTypeById),
+				generated: proj.node.nodeType !== PlanNodeType.ColumnReference,
+			}));
 
 			const { map } = deriveProjectionColumnMap(
 				this.source.getAttributes(),

@@ -9,6 +9,7 @@ import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
 import { propagateAggregateFds } from './aggregate-node.js';
 import { aggregateRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
+import { disambiguateColumnNames } from '../util/output-names.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
 
 /**
@@ -91,28 +92,37 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
   getType(): RelationType {
     const columns = [];
 
-    // Start with preserved attributes if we have them, otherwise build GROUP BY + aggregates
+    // Start with preserved attributes if we have them, otherwise build GROUP BY + aggregates.
+    // Duplicate output names are numbered (`a`, `a:1`) exactly as the logical
+    // AggregateNode does — `GROUP BY l.a, r.a` publishes two `a` columns, and a
+    // result-row object keyed by name would drop one of them.
     if (this.preserveAttributeIds) {
       // Use preserved attributes to match getAttributes() exactly
-      for (const attr of this.preserveAttributeIds) {
+      const names = disambiguateColumnNames(this.preserveAttributeIds.map(attr => attr.name));
+      this.preserveAttributeIds.forEach((attr, index) => {
         columns.push({
-          name: attr.name,
+          name: names[index],
           type: attr.type,
           generated: false  // Source attributes are not generated
         });
-      }
+      });
     } else {
+      const names = disambiguateColumnNames([
+        ...this.groupBy.map((expr, index) => this.getGroupByColumnName(expr, index)),
+        ...this.aggregates.map(agg => agg.alias)
+      ]);
+
       // Group by columns come first
       columns.push(...this.groupBy.map((expr, index) => ({
-        name: this.getGroupByColumnName(expr, index),
+        name: names[index],
         type: expr.getType(),
         generated: false
       })));
 
       // Then aggregate columns. Only GROUP BY + aggregate columns are advertised
       // (consistent with getAttributes()); source columns are not emitted as output.
-      columns.push(...this.aggregates.map(agg => ({
-        name: agg.alias,
+      columns.push(...this.aggregates.map((agg, index) => ({
+        name: names[this.groupBy.length + index],
         type: agg.expression.getType(),
         generated: true
       })));
