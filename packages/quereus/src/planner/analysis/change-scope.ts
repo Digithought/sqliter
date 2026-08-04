@@ -207,9 +207,17 @@ const DML_NODE_TYPES = new Set<PlanNodeType>([
  * Resolves a table reference's qualified name to the source-union `ChangeScope`
  * that should replace its watch. The sole use is projecting a materialized
  * view's backing-table reference onto the sources whose mutations actually drive
- * its maintenance: the backing table is row-time maintained off the user change
- * log, so a watch on it would never fire. Returns `undefined` for anything that
- * is not an MV backing table (ordinary tables).
+ * its maintenance, widening a watch on the view to a watch on its sources.
+ * Returns `undefined` for anything that is not an MV backing table (ordinary
+ * tables).
+ *
+ * This projection is **conservative, not load-bearing**: a maintained table now
+ * appears in the transaction change log in its own right, because row-time
+ * maintenance records each realized backing delta there
+ * (`MaterializedViewManager.recordMaintenanceChanges`). A direct watch on the
+ * backing would therefore fire. The projection is kept because it also widens
+ * the watch's *granularity* to the sources — removing it would change which
+ * writes a watcher observes, which is a separate decision.
  */
 export type MaterializedViewSourceResolver = (table: QualifiedName) => ChangeScope | undefined;
 
@@ -253,10 +261,11 @@ export function analyzeChangeScope(
 			const tableName = ref.tableSchema.name.toLowerCase();
 			const table: QualifiedName = { schema: schemaName, table: tableName };
 
-			// An MV's backing table is row-time maintained from its sources and never
-			// appears in the user change log. Replace the (never-firing) backing-table
-			// watch with the MV's source-union scope so a watcher fires on a SOURCE
-			// mutation instead.
+			// An MV's backing table is row-time maintained from its sources. Replace the
+			// backing-table watch with the MV's source-union scope so a watcher fires on
+			// a SOURCE mutation. Widening, not a prerequisite: maintenance records its
+			// realized backing deltas into the change log, so a direct backing watch
+			// would fire too (see MaterializedViewSourceResolver).
 			const mvScope = options?.resolveMaterializedViewSource?.(table);
 			if (mvScope) {
 				mvSourceScopes.push(mvScope);

@@ -958,3 +958,200 @@ DROP TABLE MAIN.dg_named;
 DROP ASSERTION dg_named_nonneg;
 DROP TABLE dg_named;
 -- run
+
+-- ===================================
+-- Assertions over MAINTAINED TABLES (materialized views) are enforced
+-- ===================================
+-- A materialized view IS a table, so an assertion body naming one compiles to a plan
+-- reading that maintained table. The COMMIT-time evaluator dispatches an assertion only
+-- when the base tables its plan reads overlap the set of base tables the transaction
+-- changed, so the maintained table has to show up in the transaction change log.
+--
+-- Row-time maintenance writes the backing through the privileged BackingHost surface,
+-- which does not touch the change log — so maintenance records each REALIZED backing
+-- delta into it explicitly (MaterializedViewManager.recordMaintenanceChanges). Without
+-- that recording, every violating commit below succeeded silently.
+--
+-- Note: `REFRESH MATERIALIZED VIEW` deliberately stays outside this — it swaps committed
+-- contents wholesale without routing through row-time maintenance, so a refresh that
+-- re-derives violating content does not trip an assertion at that commit. That is a
+-- separate, pre-existing gap, not covered here.
+
+-- --- Projection MV: a write to the SOURCE trips the assertion ---
+
+create table amv_w (x integer primary key);
+create materialized view amv_mv as select x from amv_w;
+create assertion amv_nonneg check (not exists (select 1 from amv_mv where x < 0));
+commit;
+-- run
+
+begin;
+insert into amv_w values (-1);
+commit;
+-- error: Integrity assertion failed: amv_nonneg
+
+-- The whole transaction rolled back — neither the source nor the view kept the row.
+select count(*) as c from amv_w;
+→ [{ "c": 0 }]
+
+select count(*) as c from amv_mv;
+→ [{ "c": 0 }]
+
+-- --- The same assertion fires on a LATER commit, not only the first ---
+-- The first COMMIT after CREATE ASSERTION compiles the assertion's plan and may fall back
+-- to global re-evaluation (its projection capture demand is registered too late for that
+-- transaction). A later commit takes the ordinary keyed-dispatch path; it must still fire.
+
+begin;
+insert into amv_w values (1), (2);
+commit;
+-- run
+
+select count(*) as c from amv_mv;
+→ [{ "c": 2 }]
+
+begin;
+insert into amv_w values (-5);
+commit;
+-- error: Integrity assertion failed: amv_nonneg
+
+-- --- A write-through to the MV ITSELF trips it too ---
+-- The write is rewritten onto the source, so it reaches the assertion by the same seam.
+
+begin;
+insert into amv_mv values (-3);
+commit;
+-- error: Integrity assertion failed: amv_nonneg
+
+-- --- Negative: writes that keep the view clean still commit ---
+
+begin;
+insert into amv_w values (7);
+commit;
+-- run
+
+begin;
+update amv_w set x = 8 where x = 7;
+commit;
+-- run
+
+begin;
+delete from amv_w where x = 8;
+commit;
+-- run
+
+select x from amv_mv order by x;
+→ [{ "x": 1 }, { "x": 2 }]
+
+-- --- A savepoint-discarded MV delta does not trip the assertion ---
+-- ROLLBACK TO discards the change-log layer the maintenance delta was recorded into, so
+-- the following clean COMMIT sees no violating view row.
+
+begin;
+savepoint sp1;
+insert into amv_w values (-9);
+rollback to sp1;
+insert into amv_w values (9);
+commit;
+-- run
+
+select x from amv_mv order by x;
+→ [{ "x": 1 }, { "x": 2 }, { "x": 9 }]
+
+drop assertion amv_nonneg;
+drop materialized view amv_mv;
+drop table amv_w;
+-- run
+
+-- --- Aggregate MV (residual / delta-aggregate arm, flushed end-of-statement) ---
+
+create table amv_t (id integer primary key, g text, amt integer);
+create materialized view amv_agg as select g, sum(amt) as total from amv_t group by g;
+create assertion amv_cap check (not exists (select 1 from amv_agg where total > 100));
+commit;
+-- run
+
+begin;
+insert into amv_t values (1, 'a', 40);
+commit;
+-- run
+
+select g, total from amv_agg order by g;
+→ [{ "g": "a", "total": 40 }]
+
+-- Each row is under the cap; only the maintained SUM crosses it.
+begin;
+insert into amv_t values (2, 'a', 70);
+commit;
+-- error: Integrity assertion failed: amv_cap
+
+-- An update that pushes an existing group over the cap trips it too.
+begin;
+update amv_t set amt = 200 where id = 1;
+commit;
+-- error: Integrity assertion failed: amv_cap
+
+select g, total from amv_agg order by g;
+→ [{ "g": "a", "total": 40 }]
+
+drop assertion amv_cap;
+drop materialized view amv_agg;
+drop table amv_t;
+-- run
+
+-- --- MV over MV: the chain's TAIL is what the assertion names ---
+-- The consumer's backing is written only by the cascade off its producer's realized
+-- delta, so this case needs the recording at BOTH levels.
+
+create table amv_c (x integer primary key);
+create materialized view amv_c1 as select x from amv_c;
+create materialized view amv_c2 as select x from amv_c1;
+create assertion amv_chain check (not exists (select 1 from amv_c2 where x < 0));
+commit;
+-- run
+
+begin;
+insert into amv_c values (-1);
+commit;
+-- error: Integrity assertion failed: amv_chain
+
+begin;
+insert into amv_c values (4);
+commit;
+-- run
+
+select x from amv_c2 order by x;
+→ [{ "x": 4 }]
+
+drop assertion amv_chain;
+drop materialized view amv_c2;
+drop materialized view amv_c1;
+drop table amv_c;
+-- run
+
+-- --- `create table … maintained as` reaches the same seam ---
+-- MV sugar and an explicitly-declared maintained table share one maintenance path.
+
+create table amv_src (id integer primary key, n integer);
+create table amv_mt (id integer primary key, n integer) maintained as select id, n from amv_src;
+create assertion amv_mt_pos check (not exists (select 1 from amv_mt where n < 0));
+commit;
+-- run
+
+begin;
+insert into amv_src values (1, -2);
+commit;
+-- error: Integrity assertion failed: amv_mt_pos
+
+begin;
+insert into amv_src values (1, 2);
+commit;
+-- run
+
+select id, n from amv_mt order by id;
+→ [{ "id": 1, "n": 2 }]
+
+drop assertion amv_mt_pos;
+drop table amv_mt;
+drop table amv_src;
+-- run

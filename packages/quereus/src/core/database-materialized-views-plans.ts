@@ -56,6 +56,16 @@ export interface MaterializedViewManagerContext {
 	/** Backing-connection resolution for row-time write-through (see {@link MaterializedViewManager.getBackingConnection}). */
 	getConnectionsForTable(tableName: string): VirtualTableConnection[];
 	registerConnection(connection: VirtualTableConnection): Promise<void>;
+
+	/** Transaction change-log recording — mirrors the `Database._record*` surface the DML
+	 *  boundary uses for user writes. The manager records each REALIZED maintenance delta
+	 *  through these (see {@link MaterializedViewManager.recordMaintenanceChanges}) so a
+	 *  maintained table is a first-class *changed base* for the commit-time detection
+	 *  kernel: without them an assertion whose body names a materialized view never
+	 *  dispatches, and a watch on an MV-over-MV chain's consumer never fires. */
+	_recordInsert(baseTable: string, newRow: Row, pkIndices: readonly number[]): void;
+	_recordDelete(baseTable: string, oldRow: Row, pkIndices: readonly number[]): void;
+	_recordUpdate(baseTable: string, oldRow: Row, newRow: Row, pkIndices: readonly number[]): void;
 }
 
 /**

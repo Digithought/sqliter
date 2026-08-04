@@ -799,9 +799,11 @@ export class Statement {
 		return analyzeChangeScope(plan, {
 			...(effectiveParams !== undefined ? { params: effectiveParams } : {}),
 			// Project a maintained table's reference onto its cached source-union
-			// scope: the table is maintained at the DML boundary, off the user
-			// change log, so watching it directly would never fire. Ordinary tables
-			// resolve to `undefined` and keep reporting themselves.
+			// scope, widening the watch to the sources whose mutations drive its
+			// maintenance. (The table itself is change-logged too — maintenance
+			// records its realized deltas — so this is granularity, not a
+			// prerequisite.) Ordinary tables resolve to `undefined` and keep
+			// reporting themselves.
 			resolveMaterializedViewSource: (table) =>
 				sm.getMaintainedTable(table.schema, table.table)?.derivation.sourceScope,
 		});

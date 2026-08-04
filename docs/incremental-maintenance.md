@@ -407,6 +407,37 @@ collapses to no entry, insert-then-update keeps INSERT semantics with the refres
 projection, etc.). So changes rolled back via a savepoint are never visible to
 COMMIT-time evaluation.
 
+**Realized maintenance writes are recorded too.** User DML is not the only writer:
+row-time materialized-view maintenance writes a backing table through the privileged
+`BackingHost` surface, which bypasses the change log. `MaterializedViewManager.postApplyBackingChanges`
+therefore records each realized `BackingRowChange` through the same
+`recordInsert/Update/Delete` surface (`recordMaintenanceChanges`), keyed on the
+maintained table's own **logical** `primaryKeyDefinition` — not the physical backing key,
+which can differ under a collation-coarsened key.
+
+This is what makes a maintained table a first-class *changed base*. Two consumers depend
+on it:
+
+- **Assertions.** A maintained table is a table, so `create assertion … check (… from mv …)`
+  compiles to a plan reading `main.mv`. `DeltaExecutor` dispatches an assertion only when
+  its plan's base tables overlap `getChangedBaseTables()`; without the recording the
+  changed set after a source write names only the source, and the assertion silently never
+  runs.
+- **Watchers over MV-over-MV chains.** `analyzeChangeScope` projects an MV reference to its
+  *direct* sources only, so a watch on `mv2` (over `mv1` over `w`) lands on `main.mv1`.
+
+Recording is bounded by the realized per-statement delta, exactly like user DML: the bulk
+paths (`materializeView` create-fill, `rebuildBacking` refresh, `attachMaintainedDerivation`)
+call the host directly and never route through `postApplyBackingChanges`, and a
+value-identical upsert reports no `BackingRowChange` at all. Savepoints need no special
+handling — the records land in the current layer and are discarded by `ROLLBACK TO` along
+with the backing write they describe.
+
+One gap this does **not** close: `REFRESH MATERIALIZED VIEW` swaps committed contents via
+`replaceContents` (or a direct `applyMaintenance('replace-all')` on the constraint-bearing
+branch) without routing through `postApplyBackingChanges`, so a refresh that re-derives
+violating content does not trip an assertion at that commit.
+
 ### Reading changes at COMMIT
 
 `DeltaExecutor` iterates registered subscriptions, computes the per-relation binding

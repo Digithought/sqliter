@@ -235,6 +235,8 @@ The backing write is routed through the **same backing connection a `select` fro
 
 Because maintenance is part of the writing transaction and never re-reads the source, it cannot "diverge" from its sources between writes: there is no post-commit window and no asynchronous failure mode. A maintenance error fails (and rolls back) the source write itself.
 
-`Database.watch` on a materialized view projects to the MV's **sources** (the maintained table is written off the user change log) — see [Change-scope projection](materialized-views.md#change-scope-projection).
+Each realized maintenance delta is also **recorded into the transaction change log** (`recordMaintenanceChanges`), so a maintained table is a first-class *changed base* at COMMIT: an assertion whose body names a materialized view is dispatched like one over any other table — see [incremental-maintenance.md § Recording changes](incremental-maintenance.md#recording-changes).
+
+`Database.watch` on a materialized view still projects to the MV's **sources**, which widens the watch's granularity (the maintained table would fire on its own now) — see [Change-scope projection](materialized-views.md#change-scope-projection).
 
 Everything above is driven from *inside* the engine's own write path. Two seams exist for writes the engine did **not** execute: the vtab-internal two-arg `DatabaseInternal._maintainRowTimeCoveringStructures(sourceBase, change)` (the REPLACE-eviction hook a source vtab calls from *within* a statement — MV-only, cold, per-row) and the [batch ingestion seam](mv-ingestion.md) (the host-facing surface for everything else).

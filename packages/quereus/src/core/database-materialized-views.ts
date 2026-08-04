@@ -308,10 +308,11 @@ export class MaterializedViewManager {
 	registerMaterializedView(mv: MaintainedTableSchema): void {
 		const key = mvKey(mv.schemaName, mv.name);
 		// Cache the source-union change-scope so a `select` from this MV projects to
-		// its sources in `analyzeChangeScope`: the backing table is maintained off the
-		// user change log (synchronously at the DML boundary), so a `Database.watch`
-		// on this MV must project to its sources rather than the never-change-logged
-		// backing table. v1 is the conservative union of a `full` watch per source.
+		// its sources in `analyzeChangeScope`: a `Database.watch` on this MV widens to
+		// the sources whose mutations drive its maintenance. v1 is the conservative
+		// union of a `full` watch per source. (The backing table is itself change-logged
+		// — {@link recordMaintenanceChanges} records each realized maintenance delta —
+		// so this projection is granularity-widening, not what makes a watch fire.)
 		mv.derivation.sourceScope = buildSourceUnionScope(mv.derivation.sourceTables);
 		this.releaseRowTime(key);
 		const plan = buildMaintenancePlan(this.ctx, mv); // throws on ineligible shape
@@ -682,10 +683,65 @@ export class MaterializedViewManager {
 		}
 		await enforceParentSideReferentialActions(this.ctx, plan, backingChanges);
 		const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
+		this.recordMaintenanceChanges(plan, backingBase, backingChanges);
 		if (!this.rowTimeBySource.has(backingBase)) return; // leaf — no dependents
 		if (depth > 0) this.assertCascadeDepth(depth, backingBase);
 		for (const bc of backingChanges) {
 			await this.maintainRowTime(backingBase, bc, cache, deferred, residualBatch, depth);
+		}
+	}
+
+	/**
+	 * Record a realized maintenance delta into the transaction change log, exactly as the
+	 * user-DML boundary records a direct write (`runtime/emit/dml-executor.ts` →
+	 * `Database._recordInsert/_recordUpdate/_recordDelete`).
+	 *
+	 * This is what makes a **maintained table a first-class changed base** for the
+	 * commit-time detection kernel (`DeltaExecutor`, driven by
+	 * `TransactionManager.getChangedBaseTables`). Both consumers of the change log need it:
+	 *
+	 *  - **Assertions.** A maintained table *is* a table, so `create assertion … check (…
+	 *    from mv …)` compiles to a plan reading `main.mv`. Maintenance writes the backing
+	 *    through the privileged `BackingHost` surface, which never touches the change log,
+	 *    so without this the changed set after `insert into <source>` names only the source,
+	 *    never overlaps `{main.mv}`, and the assertion is silently never dispatched.
+	 *  - **Watchers.** `analyzeChangeScope` projects an MV reference to its **direct**
+	 *    sources (`buildSourceUnionScope`), which is one level deep — for `mv2` over `mv1`
+	 *    over `w` the projection is a watch on the (previously never-change-logged) `mv1`.
+	 *    Recording makes `main.mv1` a real changed base so `mv2`'s watcher fires.
+	 *
+	 * Keyed on the **maintained table's own** `primaryKeyDefinition` (logical, in the
+	 * table's column space — the same thing `AssertionEvaluator` derives via `_findTable`),
+	 * NOT `plan.backingPkDefinition`, which is the *physical* backing key and can differ
+	 * (collation-coarsened keys).
+	 *
+	 * Bounded by the realized per-statement delta, exactly like user DML: the bulk paths
+	 * (`materializeView` create-fill, `rebuildBacking` refresh, `attachMaintainedDerivation`)
+	 * call the host directly and never route through {@link postApplyBackingChanges}, and a
+	 * value-identical upsert reports no {@link BackingRowChange} at all, so a no-op
+	 * maintenance records nothing. Savepoints need no special handling — `_record*` writes
+	 * the current change-log layer, which `ROLLBACK TO` discards.
+	 */
+	// NOTE: change-log entries here are bounded by the REALIZED delta, which for a
+	// bounded-delta arm is O(rows touched). A full-rebuild MV whose body reshuffles many
+	// rows on a small source write (a window-function ranking, say) realizes a wide diff
+	// and so records a wide change-log slice per statement. Fine at current shapes; if a
+	// full-rebuild MV's change-log volume ever shows up as a memory or COMMIT-dispatch
+	// cost, record a single table-granular invalidation for the `'full-rebuild'` arm
+	// instead of per-row entries (assertions would then re-evaluate globally, which the
+	// evaluator already falls back to).
+	private recordMaintenanceChanges(
+		plan: MaintenancePlan,
+		backingBase: string,
+		backingChanges: readonly BackingRowChange[],
+	): void {
+		const pkIndices = plan.mv.primaryKeyDefinition.map(d => d.index);
+		for (const bc of backingChanges) {
+			switch (bc.op) {
+				case 'insert': this.ctx._recordInsert(backingBase, bc.newRow, pkIndices); break;
+				case 'delete': this.ctx._recordDelete(backingBase, bc.oldRow, pkIndices); break;
+				case 'update': this.ctx._recordUpdate(backingBase, bc.oldRow, bc.newRow, pkIndices); break;
+			}
 		}
 	}
 

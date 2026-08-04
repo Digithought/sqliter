@@ -232,10 +232,10 @@ AND-of-children so `subtreeHasSideEffects` is reliable.
 
 A `select` from a materialized view resolves to a `TableReference` on the MV's
 backing table (`_mv_<name>`), not a body expansion — so the analyzer would
-naively report the *backing table* as the watched table. That is wrong: the
-backing table is maintained synchronously from its sources at the row-write
-boundary (row-time) and is **never written through the user change log**, so a
-`Database.watch` on it would never fire.
+naively report the *backing table* as the watched table. A watcher usually wants
+the **sources**: the backing is maintained synchronously from them at the
+row-write boundary (row-time), and source-granularity is what the caller means by
+"watch this view".
 
 The analyzer therefore **projects** a materialized-view backing reference onto
 the MV's source tables. `Statement.getChangeScope()` passes
@@ -248,9 +248,24 @@ into the result, so reading both the MV and a source directly reports the source
 once. v1's source-union is a `full` watch per source; a precise per-source
 row/group scope is a future refinement.
 
-Every materialized view is projected this way: all are row-time maintained off
-the user change log, so the backing table is never the right watch target. See
+Every materialized view is projected this way. See
 [materialized-views.md § Change-scope projection](materialized-views.md#change-scope-projection).
+
+**The projection is granularity-widening, not load-bearing.** A maintained table
+*does* appear in the transaction change log in its own right: row-time
+maintenance records each realized backing delta through the same
+`TransactionManager.recordInsert/Update/Delete` surface the DML boundary uses
+(`MaterializedViewManager.recordMaintenanceChanges` — see
+[incremental-maintenance.md § Recording changes](incremental-maintenance.md#recording-changes)).
+So a watch left on the backing table would fire, and a `create assertion` whose
+body names a materialized view is dispatched at COMMIT like one over any other
+table. Removing the projection would change *which* writes a watcher observes,
+which is why it stays.
+
+One consequence worth knowing: the projection is **one level deep** — it names
+the view's *direct* sources, not the transitive closure. For `mv2` over `mv1`
+over `w`, `scope(mv2)` is a watch on `main.mv1`. That fires only because `mv1` is
+itself change-logged by maintenance; the projection alone would not reach `w`.
 
 ## The two cases that look the same but are not
 
