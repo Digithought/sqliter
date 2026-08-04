@@ -58,6 +58,19 @@ select grp as g, count(*) as cnt from gx group by grp having count(*) > 0 order 
 select grp as g from gx group by grp order by g;
 → [{"g":"a"},{"g":"b"}]
 
+-- A non-bare GROUP BY key is matched against the select list by an identity
+-- fingerprint that folds identifier case, so writing the same expression with
+-- different identifier casing still names the same key.
+select grp || sub as combined, count(*) as cnt
+from gx group by GRP || Sub order by combined;
+→ [{"combined":"ax","cnt":2},{"combined":"ay","cnt":1},{"combined":"bx","cnt":1},{"combined":"by","cnt":1}]
+
+-- Quoted literals are NOT case-folded by that fingerprint: `'-'` and the key's
+-- `'.'` differ, so the select-list expression is not the grouping key and the
+-- bare `grp` inside it is an ungrouped reference.
+select grp || '-' as combined from gx group by grp || '.';
+-- error: Column 'grp' must appear in the GROUP BY clause or be used in an aggregate function
+
 drop table gx;
 
 -- COLLATE NOCASE written in lowercase on a TEXT column is accepted at DDL (the

@@ -53,9 +53,24 @@ window_function([arguments]) OVER (
 **grouped rows** — the plan is `Aggregate → [HAVING Filter] → Window → Project`, so
 `row_number() over (order by a) … group by a` numbers the groups. The window
 specification and the function's arguments are therefore subject to the same GROUP BY
-restriction as the rest of the select list, checked at plan time
-(`assertGroupByCoverage`, shared with the select-list and HAVING checks in
-`select-aggregates.ts`).
+restriction as the rest of the select list.
+
+Those expressions are built against a scope that falls through to the *pre-aggregate*
+select scope, so a grouping key spelled any way other than the one the aggregate output
+scope registered (`wg.a` against `group by a`, or a non-bare key written out again)
+binds to a base-table column the grouped row does not carry. The window phase therefore
+runs two passes over each built window specification and argument:
+
+1. `redirectToGroupKeys` rewrites every subtree that *is* a grouping key onto the
+   AggregateNode's own output column for that key, matching either by identity
+   fingerprint or, for a bare-column key, by base attribute id (so any qualifier
+   spelling works);
+2. `assertGroupByCoverage` then rejects anything still naming a base-table attribute,
+   with the same plan-time message a select-list entry gets.
+
+Both passes stop at a relational child, so a grouping key named inside a **subquery**
+in a window specification is neither redirected nor rejected and still fails at runtime
+— see `fix/bug-window-spec-subquery-reads-base-table-column`.
 
 An aggregate inside a window specification of a grouped query must be one the select
 list already computes — the window runs *above* the aggregation, so there is nothing

@@ -234,7 +234,9 @@ function handlePreAggregateSort(
  *
  * The fingerprint set covers whole grouped subtrees (`select id+1 … group by
  * id+1`) and, incidentally, the qualifier mismatch between `group by t.a` and a
- * later bare `a`.
+ * later bare `a`. Fingerprints fold identifier case (see
+ * {@link expressionToIdentityString}), so `group by A || '!'` covers a later
+ * `a || '!'`; quoted literals stay byte-exact, so `a || 'X'` does not.
  */
 export interface GroupByCoverage {
 	readonly attrIds: ReadonlySet<number>;
@@ -257,7 +259,7 @@ export function buildGroupByCoverage(
 		if (CapabilityDetectors.isColumnReference(expr)) {
 			attrIds.add(expr.attributeId);
 		}
-		fingerprints.add(expressionToString(expr.expression));
+		fingerprints.add(expressionToIdentityString(expr.expression));
 	}
 	for (const attr of groupedOutputAttributes) {
 		attrIds.add(attr.id);
@@ -299,10 +301,8 @@ export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage)
  * output column, and {@link coverage} is the strict check applied afterwards.
  */
 export interface GroupedWindowContext {
-	/** Canonical AST text of each GROUP BY expression → its AggregateNode output column index. */
-	readonly groupKeyByFingerprint: ReadonlyMap<string, number>;
-	/** Base attribute id of each bare-column GROUP BY key → its AggregateNode output column index. */
-	readonly groupKeyByBaseAttrId: ReadonlyMap<number, number>;
+	/** Where each GROUP BY key lives on the AggregateNode's output row. */
+	readonly groupKeys: GroupKeyIndex;
 	/** AggregateNode output attributes: group keys in GROUP BY order, then aggregate results. */
 	readonly outputAttributes: readonly Attribute[];
 	/**
@@ -315,6 +315,43 @@ export interface GroupedWindowContext {
 }
 
 /**
+ * Locates each GROUP BY key on the AggregateNode's output row, under both spellings a
+ * later expression may reach it by: the whole grouped expression written out again, or
+ * (for a bare-column key) the base column under any qualifier.
+ *
+ * Shared by the window phase's {@link redirectToGroupKeys} and by the select list's
+ * {@link buildFinalAggregateProjections}, which resolve the same question about
+ * different expressions.
+ */
+export interface GroupKeyIndex {
+	/** Identity fingerprint of each GROUP BY expression → its output column index. */
+	readonly byFingerprint: ReadonlyMap<string, number>;
+	/** Base attribute id of each bare-column GROUP BY key → its output column index. */
+	readonly byBaseAttrId: ReadonlyMap<number, number>;
+}
+
+/**
+ * Builds the {@link GroupKeyIndex} for a grouped query's GROUP BY list. The output
+ * column index is the key's position in that list, which is its position on the
+ * AggregateNode's output row.
+ */
+export function indexGroupKeys(groupByExpressions: readonly ScalarPlanNode[]): GroupKeyIndex {
+	const byFingerprint = new Map<string, number>();
+	const byBaseAttrId = new Map<number, number>();
+
+	groupByExpressions.forEach((expr, index) => {
+		const fp = expressionToIdentityString(expr.expression);
+		if (!byFingerprint.has(fp)) byFingerprint.set(fp, index);
+		if (CapabilityDetectors.isColumnReference(expr)) {
+			const attrId = (expr as ColumnReferenceNode).attributeId;
+			if (!byBaseAttrId.has(attrId)) byBaseAttrId.set(attrId, index);
+		}
+	});
+
+	return { byFingerprint, byBaseAttrId };
+}
+
+/**
  * Builds the {@link GroupedWindowContext} for a grouped, windowed query.
  * `outputAttributes` is the AggregateNode's attribute list (group keys in GROUP BY
  * order, then the aggregate results).
@@ -323,21 +360,8 @@ export function buildGroupedWindowContext(
 	groupByExpressions: readonly ScalarPlanNode[],
 	outputAttributes: readonly Attribute[],
 ): GroupedWindowContext {
-	const groupKeyByFingerprint = new Map<string, number>();
-	const groupKeyByBaseAttrId = new Map<number, number>();
-
-	groupByExpressions.forEach((expr, index) => {
-		const fp = expressionToString(expr.expression);
-		if (!groupKeyByFingerprint.has(fp)) groupKeyByFingerprint.set(fp, index);
-		if (CapabilityDetectors.isColumnReference(expr)) {
-			const attrId = (expr as ColumnReferenceNode).attributeId;
-			if (!groupKeyByBaseAttrId.has(attrId)) groupKeyByBaseAttrId.set(attrId, index);
-		}
-	});
-
 	return {
-		groupKeyByFingerprint,
-		groupKeyByBaseAttrId,
+		groupKeys: indexGroupKeys(groupByExpressions),
 		outputAttributes,
 		coverage: {
 			attrIds: new Set(outputAttributes.map(attr => attr.id)),
@@ -354,9 +378,11 @@ export function buildGroupedWindowContext(
  *
  * Two match rules, in order at each node:
  *
- * 1. The whole subtree's canonical AST text equals a GROUP BY expression's — covers
+ * 1. The whole subtree's identity fingerprint equals a GROUP BY expression's — covers
  *    `group by a || '!'` + `over (order by a || '!')`, and nested occurrences such
- *    as `over (order by upper(a || '!'))` because the walk recurses.
+ *    as `over (order by upper(a || '!'))` because the walk recurses. Identifier case
+ *    is folded, so `group by A || '!'` matches too; quoted literals are byte-exact,
+ *    so `a || 'X'` and `a || 'x'` remain different keys.
  * 2. The node is a column reference whose attribute id is the *base* attribute id of
  *    a bare-column grouping key — covers `group by a` + `over (order by wg.a)` and
  *    `over (order by w.a)`. Both spellings fall through to the same base attribute
@@ -365,25 +391,31 @@ export function buildGroupedWindowContext(
  * Otherwise recurse into scalar children only; relational children resolve their own
  * scope.
  *
- * NOTE: rule 1 matches by canonical AST text, so a subtree that *reads* like a
- * grouping key but resolves to something else (a correlated outer reference shadowed
- * by an identically-spelled local column) would be redirected wrongly. This is the
- * same limitation `buildFinalAggregateProjections`' `groupByFingerprints` map already
- * carries for the select list; fixing it means comparing resolved attribute identity
- * rather than text, in both places.
+ * NOTE: rule 1 matches by AST text, so a subtree that *reads* like a grouping key but
+ * resolves to something else (a correlated outer reference shadowed by an
+ * identically-spelled local column) would be redirected wrongly. This is the same
+ * limitation the select list already carries through the shared {@link GroupKeyIndex};
+ * fixing it means comparing resolved attribute identity rather than text, for both
+ * callers at once.
+ *
+ * NOTE: neither this walk nor the {@link assertGroupByCoverage} pass that follows
+ * descends into a relational child, so a grouping key named inside a subquery in a
+ * window specification (`over (order by (select … where t.a = wg.a))`) is neither
+ * redirected nor rejected, and still dies at runtime with "No row context found" —
+ * see `fix/bug-window-spec-subquery-reads-base-table-column`.
  */
 export function redirectToGroupKeys(
 	node: ScalarPlanNode,
 	context: GroupedWindowContext,
 	scope: Scope,
 ): ScalarPlanNode {
-	const fingerprintIndex = context.groupKeyByFingerprint.get(expressionToString(node.expression));
+	const fingerprintIndex = context.groupKeys.byFingerprint.get(expressionToIdentityString(node.expression));
 	if (fingerprintIndex !== undefined) {
 		return buildGroupKeyColumnRef(scope, context.outputAttributes[fingerprintIndex], node.expression, fingerprintIndex);
 	}
 
 	if (CapabilityDetectors.isColumnReference(node)) {
-		const baseIndex = context.groupKeyByBaseAttrId.get((node as ColumnReferenceNode).attributeId);
+		const baseIndex = context.groupKeys.byBaseAttrId.get((node as ColumnReferenceNode).attributeId);
 		if (baseIndex !== undefined) {
 			return buildGroupKeyColumnRef(scope, context.outputAttributes[baseIndex], node.expression, baseIndex);
 		}
@@ -455,7 +487,7 @@ function findUngroupedColumnRef(
 	}
 
 	if ('expression' in node) {
-		const fp = expressionToString((node as ScalarPlanNode).expression);
+		const fp = expressionToIdentityString((node as ScalarPlanNode).expression);
 		if (coverage.fingerprints.has(fp)) {
 			return null;
 		}
@@ -1004,27 +1036,16 @@ export function buildFinalAggregateProjections(
 	// it and the unique group-key FD is silently dropped at the projection
 	// (`keysOf(root) = []`). Referencing the aggregate group column keeps the key
 	// and republishes it under exactly its grouping collation (trivially sound).
-	const groupByFingerprints = new Map<string, number>();
-	groupByExpressions.forEach((expr, index) => {
-		const fp = expressionToString(expr.expression);
-		if (!groupByFingerprints.has(fp)) groupByFingerprints.set(fp, index);
-	});
-
-	// Bare source columns that are themselves group keys map straight to the
-	// aggregate's group output column. Used to expand `SELECT *` in a grouped
-	// query, which must emit source-column order rather than GROUP BY order.
-	const groupKeyByAttrId = new Map<number, number>();
-	groupByExpressions.forEach((expr, index) => {
-		if (CapabilityDetectors.isColumnReference(expr)) {
-			const attrId = (expr as ColumnReferenceNode).attributeId;
-			if (!groupKeyByAttrId.has(attrId)) groupKeyByAttrId.set(attrId, index);
-		}
-	});
+	//
+	// The same index also maps bare source columns that are themselves group keys
+	// straight to the aggregate's group output column, which is what expands
+	// `SELECT *` in a grouped query in source-column order rather than GROUP BY order.
+	const groupKeys = indexGroupKeys(groupByExpressions);
 
 	for (const column of stmt.columns) {
 		if (column.type === 'all') {
 			for (const starProj of starProjectionsByColumn.get(column) ?? []) {
-				const gbIdx = starGroupKeyIndex(starProj, groupKeyByAttrId);
+				const gbIdx = starGroupKeyIndex(starProj, groupKeys.byBaseAttrId);
 				if (gbIdx === undefined) {
 					// validateAggregateProjections already rejected every star column that
 					// is not a grouping key, so reaching here means the two disagree.
@@ -1048,7 +1069,7 @@ export function buildFinalAggregateProjections(
 			// group symbol (registered under the column name) in recompute, so their
 			// key survives; only non-bare group expressions need the direct reference.
 			const gbIdx = column.expr.type !== 'column'
-				? groupByFingerprints.get(expressionToString(column.expr))
+				? groupKeys.byFingerprint.get(expressionToIdentityString(column.expr))
 				: undefined;
 			if (gbIdx !== undefined) {
 				const colRef = buildGroupKeyColumnRef(aggregateOutputScope, aggregateAttributes[gbIdx], column.expr, gbIdx);
