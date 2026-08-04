@@ -19,7 +19,14 @@ export interface UpdateArgs {
 	operation: RowOp;
 	/** For INSERT/UPDATE, the values to insert/update. For DELETE, undefined */
 	values: Row | undefined;
-	/** For UPDATE/DELETE, the old key values of the row to modify. Undefined for INSERT */
+	/**
+	 * For UPDATE/DELETE, the old key values of the row to modify. Undefined for INSERT.
+	 *
+	 * COMPACT: exactly one cell per `primaryKeyDefinition` entry, in that order — NOT a
+	 * full row indexed by column position. A vtab must address it as `keyValues[i]` for
+	 * PK column `i`, never `row[pkDef[i].index]`; the two agree only when the PK columns
+	 * happen to be the table's leading columns in PK order.
+	 */
 	oldKeyValues?: Row;
 	/** Conflict resolution mode (defaults to ABORT if unspecified) */
 	onConflict?: ConflictResolution;

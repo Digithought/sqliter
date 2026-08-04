@@ -696,10 +696,36 @@ export abstract class StoreTableBase extends VirtualTable {
 		return this.connection ?? undefined;
 	}
 
-	/** Extract primary key values from a row. */
+	/** Extract primary key values from a full row (positioned by column index). */
 	protected extractPK(row: Row): SqlValue[] {
 		const schema = this.tableSchema!;
 		return schema.primaryKeyDefinition.map(pk => row[pk.index]);
+	}
+
+	/**
+	 * Resolve the PK cells an UPDATE/DELETE's `oldKeyValues` addresses.
+	 *
+	 * `UpdateArgs.oldKeyValues` is COMPACT — one cell per `primaryKeyDefinition`
+	 * entry, in that order — NOT a full row positioned by column index. Every
+	 * producer builds it that way (`pkIndices.map(i => row[i])` in the DML
+	 * executor and in the isolation flush/overlay), and the memory module's
+	 * `buildPrimaryKeyFromValues` asserts exactly this arity.
+	 *
+	 * Running it through {@link extractPK} instead only coincides when every PK
+	 * column sits at the index matching its position in the PK definition. For a
+	 * table whose PK is not its leading columns (e.g. a generated stored PK
+	 * declared after the columns it derives from) that read lands past the end of
+	 * the compact array and yields `undefined`.
+	 */
+	protected pkFromKeyValues(keyValues: Row): SqlValue[] {
+		const pkDef = this.tableSchema!.primaryKeyDefinition;
+		if (keyValues.length !== pkDef.length) {
+			throw new QuereusError(
+				`Key value count mismatch for '${this.tableName}'. Expected ${pkDef.length}, got ${keyValues.length}.`,
+				StatusCode.INTERNAL,
+			);
+		}
+		return [...keyValues];
 	}
 
 	/**

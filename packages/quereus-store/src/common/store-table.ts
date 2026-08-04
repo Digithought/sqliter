@@ -466,7 +466,7 @@ export class StoreTable extends StoreTableConstraints {
 			case 'update': {
 				if (!values || !oldKeyValues) throw new QuereusError('UPDATE requires values and oldKeyValues', StatusCode.MISUSE);
 				const coerced = args.preCoerced ? values : this.coerceRow(values);
-				const oldPk = this.extractPK(oldKeyValues);
+				const oldPk = this.pkFromKeyValues(oldKeyValues);
 				const newPk = this.extractPK(coerced);
 				const oldKey = this.encodeDataKey(oldPk);
 				const newKey = this.encodeDataKey(newPk);
@@ -599,7 +599,7 @@ export class StoreTable extends StoreTableConstraints {
 
 			case 'delete': {
 				if (!oldKeyValues) throw new QuereusError('DELETE requires oldKeyValues', StatusCode.MISUSE);
-				const pk = this.extractPK(oldKeyValues);
+				const pk = this.pkFromKeyValues(oldKeyValues);
 				const key = this.encodeDataKey(pk);
 
 				// Get old row for index cleanup. Read the effective
