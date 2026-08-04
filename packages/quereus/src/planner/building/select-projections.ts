@@ -4,7 +4,7 @@ import type { PlanningContext } from '../planning-context.js';
 import type { Projection } from '../nodes/project-node.js';
 import { buildExpression } from './expression.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
-import { expressionToString } from '../../emit/ast-stringify.js';
+import { expressionToString, expressionToIdentityString } from '../../emit/ast-stringify.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { WindowFunctionCallNode } from '../nodes/window-function.js';
@@ -109,9 +109,16 @@ function collectInnerAggregates(
 ): void {
 	if (CapabilityDetectors.isAggregateFunction(node)) {
 		const funcNode = node as AggregateFunctionCallNode;
-		const key = expressionToString(funcNode.expression).toLowerCase();
-		// Deduplicate against existing entries
-		if (!aggregates.some(a => a.alias.toLowerCase() === key)) {
+		const key = expressionToIdentityString(funcNode.expression);
+		// Deduplicate against existing entries, by identity key rather than the
+		// alias text — the array may also hold direct (non-wrapped) aggregate
+		// entries pushed elsewhere, so guard the cast rather than assume every
+		// entry is an aggregate.
+		const alreadyPresent = aggregates.some(a =>
+			CapabilityDetectors.isAggregateFunction(a.expression) &&
+			expressionToIdentityString((a.expression as AggregateFunctionCallNode).expression) === key
+		);
+		if (!alreadyPresent) {
 			aggregates.push({
 				expression: funcNode,
 				alias: expressionToString(funcNode.expression)

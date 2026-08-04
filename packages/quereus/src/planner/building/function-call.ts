@@ -12,7 +12,7 @@ import { ScalarFunctionCallNode } from "../nodes/function.js";
 import { resolveFunctionSchema } from "./schema-resolution.js";
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { ScalarType } from "../../common/datatype.js";
-import { expressionToString } from "../../emit/ast-stringify.js";
+import { expressionToIdentityString } from "../../emit/ast-stringify.js";
 
 /** One entry of {@link PlanningContext.aggregates} — an aggregate already computed by the AggregateNode. */
 export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[number];
@@ -24,10 +24,13 @@ export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[numb
  * specification in a grouped query) may spell out an aggregate the SELECT list
  * already collected; that spelling means "read the computed column", not
  * "aggregate again". Matching is by the same canonical-AST fingerprint
- * (`expressionToString`, case-insensitive) that `dedupeNewAggregates` and
- * `buildGroupByCoverage` use for this same question elsewhere — so `sum(B)` in
- * the SELECT list matches `sum(b)` in HAVING, and whitespace / redundant parens
- * are ignored, but two structurally different arguments never match.
+ * (`expressionToIdentityString` — identifier case folded, literal case preserved)
+ * that `dedupeNewAggregates` and `collectInnerAggregates` use for this same
+ * question elsewhere — so `sum(B)` in the SELECT list matches `sum(b)` in HAVING,
+ * whitespace / redundant parens are ignored, and two structurally different
+ * arguments never match. (`buildGroupByCoverage`'s fingerprint is a *different*,
+ * fully case-sensitive `expressionToString` convention — it answers a stricter
+ * question, whether a HAVING/window subtree exactly reproduces a GROUP BY key.)
  *
  * NOTE: the fingerprint includes each argument's qualifier, so `sum(w.b)` does
  * NOT match `sum(b)` even when `w` is the only table in scope. Resolving that
@@ -49,11 +52,11 @@ export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[numb
 export function findMatchingAggregate(ctx: PlanningContext, expr: AST.FunctionExpr): CollectedAggregate | undefined {
 	if (!ctx.aggregates || ctx.aggregates.length === 0) return undefined;
 
-	const exprKey = expressionToString(expr).toLowerCase();
+	const exprKey = expressionToIdentityString(expr);
 	for (const agg of ctx.aggregates) {
 		if (!CapabilityDetectors.isAggregateFunction(agg.expression)) continue;
 		const aggFuncNode = agg.expression as AggregateFunctionCallNode;
-		if (expressionToString(aggFuncNode.expression).toLowerCase() === exprKey) return agg;
+		if (expressionToIdentityString(aggFuncNode.expression) === exprKey) return agg;
 	}
 
 	return undefined;

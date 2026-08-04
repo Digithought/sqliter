@@ -271,3 +271,36 @@ select a, sum(w.b) as s from wg w group by a having sum(b) > 3;
 → [{"a":"x","s":4}]
 
 drop table wg;
+
+-- ---------------------------------------------------------------------------
+-- HAVING / ORDER BY aggregate matching folds identifier case only, not literal
+-- case (bug-aggregate-match-ignores-string-literal-case). A quoted string
+-- literal's case is part of an aggregate's identity: two aggregates that differ
+-- only in literal case (`nullif(b,'A')` vs `nullif(b,'a')`) must never collapse
+-- into one, or a clause above the AggregateNode silently reads the wrong number.
+-- ---------------------------------------------------------------------------
+create table wgl (id integer primary key, g integer, b text);
+insert into wgl values
+  (1, 1, 'A'), (2, 1, 'A'), (3, 1, 'a'),
+  (4, 2, 'A'), (5, 2, 'a'), (6, 2, 'a');
+
+-- Fixed: HAVING spells a literal-case-distinct aggregate (`nullif(b,'a')`) from
+-- the SELECT list's `nullif(b,'A')`; HAVING binds to its own aggregate rather
+-- than reusing (and reporting) the SELECT list's.
+select g, count(nullif(b,'A')) as c from wgl where g = 1 group by g having count(nullif(b,'a')) > 1;
+→ [{"g":1,"c":1}]
+
+-- Same shape, both aggregates present in the SELECT list: HAVING must bind to
+-- `d`, not silently reuse `c`.
+select g, count(nullif(b,'A')) as c, count(nullif(b,'a')) as d from wgl where g = 1 group by g having count(nullif(b,'a')) > 1;
+→ [{"g":1,"c":1,"d":2}]
+
+-- Fixed: same divergence in a top-level ORDER BY, using two groups so a wrong
+-- bind changes row order (not just a displayed value). Ordering by
+-- count(nullif(b,'a')) (g=1 → 2, g=2 → 1) puts g=2 first; the buggy fold would
+-- instead have ordered by the SELECT list's count(nullif(b,'A')) (g=1 → 1,
+-- g=2 → 2), putting g=1 first.
+select g, count(nullif(b,'A')) as c from wgl group by g order by count(nullif(b,'a'));
+→ [{"g":2,"c":2},{"g":1,"c":1}]
+
+drop table wgl;

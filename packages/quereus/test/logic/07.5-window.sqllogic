@@ -876,6 +876,20 @@ select a, sum(b+0) as s, row_number() over (order by sum(a+0)) as rn from wg gro
 select a, sum(w.b) as s, row_number() over (order by sum(b)) as rn from wg w group by a;
 -- error: Aggregate function sum in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
 
+-- Same limitation for a literal-case divergence
+-- (bug-aggregate-match-ignores-string-literal-case): a quoted string literal's
+-- case is part of an aggregate's identity, so `count(nullif(b,'a'))` here is not
+-- `count(nullif(b,'A'))` and must be rejected the same way — reading the wrong
+-- aggregate silently would be worse than this loud error.
+create table wgc (id integer primary key, g integer, b text);
+insert into wgc values (1, 1, 'A'), (2, 1, 'A'), (3, 1, 'a');
+
+select g, count(nullif(b,'A')) as c, row_number() over (order by count(nullif(b,'a'))) as w
+from wgc group by g;
+-- error: Aggregate function count in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
+
+drop table wgc;
+
 -- Two window functions with different specifications each get their own window
 -- output column; neither collapses onto the other's.
 select a, row_number() over (order by a) as p, count(*) over (partition by a) as q

@@ -529,6 +529,25 @@ function lowerWindowFrameBoundIdentifiers(bound: AST.WindowFrameBound): AST.Wind
 }
 
 /**
+ * Case-insensitive identity fingerprint for aggregate-matching comparisons: folds
+ * identifier (`column` / `identifier` node `name` / `table` / `schema`) case via
+ * {@link lowerExprIdentifiers}, then renders through {@link expressionToString}.
+ * String / blob / number / JSON literals stay byte-exact — two aggregate calls that
+ * differ only in quoted-literal case (`count(nullif(b,'A'))` vs `count(nullif(b,'a'))`)
+ * must NOT be treated as the same aggregate.
+ *
+ * NOT round-trip SQL (identifiers are lowercased) — for identity comparison only, not
+ * persistence or display. Shares {@link lowerExprIdentifiers}'s bounded limitation: does
+ * not descend into subquery bodies, so an aggregate argument containing a subquery whose
+ * inner identifier case diverges misses the match. That is a missed match (an extra
+ * aggregate gets computed, or a window specification hits the loud "not collected"
+ * error) — never a wrong answer — so it is left unaddressed.
+ */
+export function expressionToIdentityString(expr: AST.Expression): string {
+	return expressionToString(lowerExprIdentifiers(expr));
+}
+
+/**
  * Convert a result column (SELECT column list / RETURNING) to string:
  * `*` / `t.*` / `expr [as alias] [with inverse (col = expr, …)]`.
  */

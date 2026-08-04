@@ -15,7 +15,7 @@ import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { Scope } from '../scopes/scope.js';
 import { resolveFunctionSchema } from './schema-resolution.js';
 import { isAggregateFunctionSchema } from '../../schema/function.js';
-import { expressionToString } from '../../emit/ast-stringify.js';
+import { expressionToString, expressionToIdentityString } from '../../emit/ast-stringify.js';
 import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
 import { buildOrdinalAwareExpression, resolveOrdinalReference, type SelectListEntry } from './select-ordinal.js';
 
@@ -815,20 +815,22 @@ function dedupeNewAggregates(
 	for (const agg of existingAggregates) {
 		if (CapabilityDetectors.isAggregateFunction(agg.expression)) {
 			const aggNode = agg.expression as AggregateFunctionCallNode;
-			existingKeys.add(expressionToString(aggNode.expression).toLowerCase());
+			existingKeys.add(expressionToIdentityString(aggNode.expression));
 		}
 	}
 
 	const newAggregates: { expression: ScalarPlanNode; alias: string }[] = [];
+	const newKeys = new Set<string>();
 
 	for (const funcExpr of funcExprs) {
-		const key = expressionToString(funcExpr).toLowerCase();
+		const key = expressionToIdentityString(funcExpr);
 
 		if (existingKeys.has(key)) continue;
-		if (newAggregates.some(a => a.alias.toLowerCase() === key)) continue;
+		if (newKeys.has(key)) continue;
 
 		const aggNode = buildFunctionCall(selectContext, funcExpr, true);
 		newAggregates.push({ expression: aggNode, alias: expressionToString(funcExpr) });
+		newKeys.add(key);
 	}
 
 	return newAggregates;
