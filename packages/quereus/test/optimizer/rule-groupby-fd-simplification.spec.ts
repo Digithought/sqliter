@@ -2,6 +2,8 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 
 interface PlanRow {
+	id: number;
+	parent_id: number | null;
 	node_type: string;
 	op: string;
 	detail: string;
@@ -12,7 +14,7 @@ interface PlanRow {
 async function planRows(db: Database, sql: string): Promise<PlanRow[]> {
 	const rows: PlanRow[] = [];
 	for await (const r of db.eval(
-		'SELECT node_type, op, detail, properties, physical FROM query_plan(?)',
+		'SELECT id, parent_id, node_type, op, detail, properties, physical FROM query_plan(?)',
 		[sql],
 	)) {
 		rows.push(r as unknown as PlanRow);
@@ -157,6 +159,46 @@ describe('ruleGroupByFdSimplification', () => {
 			{ id: 2, name: 'b' },
 			{ id: 3, name: 'c' },
 		]);
+	});
+
+	// An AggregateNode's layout is fixed — grouping keys first, then aggregate
+	// results — so a dropped key necessarily leaves its key slot for the aggregate
+	// block. When that moves it *past* a surviving column the output order changes,
+	// and the rule caps the new aggregate with an order-restoring Project.
+	//
+	// Both select lists below already match the pre-rewrite aggregate output column
+	// for column (keys in GROUP BY order, then the aggregate), so the builder forces
+	// no select-list projection of its own — every PROJECT in these plans is the
+	// rule's cap.
+	describe('order-restoring cap', () => {
+		beforeEach(async () => {
+			await db.exec("CREATE TABLE cap (id INTEGER PRIMARY KEY, name TEXT) USING memory");
+		});
+
+		it('caps the rewrite with a Project when the drop permutes the output', async () => {
+			// `id` is the PK, so `name` is dropped — out of slot 0, down behind `id`.
+			const rows = await planRows(db, 'SELECT name, id, count(*) AS c FROM cap GROUP BY name, id');
+			const projects = rows.filter(r => r.op === 'PROJECT');
+			expect(projects, 'the permuting rewrite should be capped by exactly one Project')
+				.to.have.length(1);
+			const agg = aggregateRow(rows);
+			expect(agg, 'expected an aggregate node').to.not.equal(undefined);
+			expect(agg!.parent_id, 'the cap should sit directly above the aggregate')
+				.to.equal(projects[0].id);
+			expect(projects[0].detail, 'the cap re-emits the original column order')
+				.to.match(/name.*\bid\b/);
+		});
+
+		it('adds no Project when the dropped keys were already a suffix', async () => {
+			// `name` is dropped from the tail, so the picker `min(name)` lands back at
+			// its own index — the output order never changes and the cap is skipped.
+			const rows = await planRows(db, 'SELECT id, name, count(*) AS c FROM cap GROUP BY id, name');
+			const props = aggregateProps(rows);
+			expect(props, 'expected aggregate node').to.not.equal(undefined);
+			expect(props!.groupBy, 'the rule should still have fired').to.have.length(1);
+			expect(rows.filter(r => r.op === 'PROJECT'), 'an order-preserving drop needs no cap')
+				.to.be.empty;
+		});
 	});
 
 	it('Result rows match the un-simplified semantics under EC-driven drop', async () => {

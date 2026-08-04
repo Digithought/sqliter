@@ -522,11 +522,11 @@ function buildHavingFilter(
  * {@link ColumnReferenceNode}; a group key is matched by attribute id so a
  * qualified `select t.k … group by k` still counts as agreement.
  *
- * The agreement this establishes is a *build-time* one, and one optimizer rule
- * can still break it afterwards: `rule-groupby-fd-simplification` may drop a
- * functionally-determined group key and re-emit it as a picker `min` at a shifted
- * output position, which reorders the result when this node is the query root
- * (≥2 group keys only). Tracked as fix/bug-grouped-key-reorder-survives-to-output.
+ * The agreement this establishes is a *build-time* one, so an optimizer rule that
+ * reshapes the aggregate must keep it. `rule-groupby-fd-simplification` drops a
+ * functionally-determined group key and re-emits it as a picker `min`, which lands
+ * at a different output position; it caps that rewrite with an order-restoring
+ * `Project` precisely so this build-time agreement still holds at runtime.
  */
 function aggregateOutputIsSelectList(
 	stmt: AST.SelectStmt,

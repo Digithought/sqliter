@@ -29,6 +29,11 @@ describe('Plan shape: grouped-query final projection', () => {
 		// and rewrite the grouping keys out from under the column-order assertions.
 		await db.exec("CREATE TABLE nk (a TEXT, b TEXT) USING memory");
 		await db.exec("INSERT INTO nk VALUES ('x','1'),('y','2'),('x','3')");
+		// Second no-PK table sharing a column name with `nk`, for the join case where
+		// the join equality (`nk.a = nj.a`) is what makes one grouping key
+		// functionally determined by another.
+		await db.exec("CREATE TABLE nj (a TEXT, c TEXT) USING memory");
+		await db.exec("INSERT INTO nj VALUES ('x','p'),('y','q')");
 		await db.exec("CREATE TABLE u (z TEXT) USING memory");
 		await db.exec("INSERT INTO u VALUES ('p'),('q')");
 	});
@@ -80,9 +85,27 @@ describe('Plan shape: grouped-query final projection', () => {
 	it('projects a grouped select list even when it needs no expression rewriting', async () => {
 		// Without a forced final projection this plan is bare aggregate output:
 		// the group keys in GROUP BY order, under the wrong names.
+		//
+		// Two Projects stacked is the intended shape here, not a regression. `gk.v`
+		// is the primary key, so `rule-groupby-fd-simplification` drops `g` from the
+		// GROUP BY and re-emits it as a picker `min(g)` — which lands *after* `v`
+		// rather than before it. The rule caps that permuting rewrite with its own
+		// order-restoring Project (sitting directly on the aggregate), and the
+		// builder's select-list Project sits above that:
+		//
+		//   PROJECT SELECT v, g          <- the builder's select-list projection
+		//   PROJECT SELECT g, v          <- the rule's order-restoring cap
+		//   STREAMAGGREGATE GROUP BY v  STREAM AGG min(g) AS g
 		const rows = await planRows(db, "SELECT v, g FROM gk GROUP BY g, v");
-		const project = single(rows, 'PROJECT');
-		expect(isDescendantOf(rows, aggregateRow(rows).id, project.id)).to.be.true;
+		const projects = rows.filter(r => r.op === 'PROJECT');
+		expect(projects, `expected the select-list Project stacked on the rule's cap in:\n${rows.map(r => `${r.id} <- ${r.parent_id}: ${r.op} ${r.detail}`).join('\n')}`)
+			.to.have.lengthOf(2);
+		const aggregate = aggregateRow(rows);
+		// The cap is whichever Project the aggregate hangs directly off of.
+		const cap = projects.find(p => aggregate.parent_id === p.id);
+		expect(cap, "the rule's cap should sit directly above the aggregate").to.not.equal(undefined);
+		const selectList = projects.find(p => p !== cap)!;
+		expect(isDescendantOf(rows, cap!.id, selectList.id), 'the select-list Project should sit above the cap').to.be.true;
 	});
 
 	it('keeps the non-grouped pre-projection sort path intact', async () => {
@@ -199,6 +222,36 @@ describe('Plan shape: grouped-query final projection', () => {
 			it('a qualified reference to a bare grouping key counts as agreement', async () => {
 				expect(await columnNames("SELECT nk.a, count(*) AS c FROM nk GROUP BY a")).to.deep.equal(['a', 'c']);
 				expect(await columnNames("SELECT a, count(*) AS c FROM nk GROUP BY nk.a")).to.deep.equal(['a', 'c']);
+			});
+
+			/**
+			 * Regression for bug-grouped-key-reorder-survives-to-output.
+			 * `rule-groupby-fd-simplification` drops a grouping column that is
+			 * functionally determined by the survivors and re-emits it as a picker
+			 * `min(<col>)` aggregate. An AggregateNode's layout is fixed — grouping
+			 * keys first, then aggregate results — so the dropped key moves out of its
+			 * key slot down into the aggregate block. These select lists all agree with
+			 * the *pre-rewrite* aggregate shape, so no builder projection is forced and
+			 * the aggregate is the query root: the shift used to reach the result. The
+			 * rule now caps a permuting rewrite with an order-restoring Project.
+			 * Values are pinned in test/logic/07.3.2-grouped-select-list-shape.sqllogic.
+			 */
+			it('keeps SELECT-list order when the FD simplification drops a grouping key', async () => {
+				// Primary-key-driven: `v` determines `g`, so `g` is dropped from the
+				// GROUP BY and re-emitted as `min(g)` after `v`.
+				expect(await columnNames("SELECT g, v, count(*) AS c FROM gk GROUP BY g, v"))
+					.to.deep.equal(['g', 'v', 'c']);
+
+				// Equality-driven: `where a = b` puts both in one equivalence class, so
+				// one of them is dropped.
+				expect(await columnNames("SELECT a, b, count(*) AS c FROM nk WHERE a = b GROUP BY a, b"))
+					.to.deep.equal(['a', 'b', 'c']);
+
+				// Join-equality-driven, with the drop in the middle of the select list.
+				expect(await columnNames(
+					"SELECT nk.a, nk.b, nj.a, nj.c, count(*) AS c FROM nk JOIN nj ON nk.a = nj.a "
+					+ "GROUP BY nk.a, nk.b, nj.a, nj.c",
+				)).to.deep.equal(['a', 'b', 'a:1', 'c', 'c:1']);
 			});
 
 			// The shape the delta-aggregate maintenance path recognises: keys in GROUP BY

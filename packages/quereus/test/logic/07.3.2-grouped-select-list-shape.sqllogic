@@ -131,3 +131,65 @@ create materialized view mvbad as select count(*) n from nk group by a;
 
 drop table u;
 drop table nk;
+
+-- ---------------------------------------------------------------------------
+-- The select list survives the FD-driven GROUP BY simplification.
+--
+-- `rule-groupby-fd-simplification` drops a grouping column that another grouping
+-- column functionally determines and re-emits it as a picker `min(<col>)`. An
+-- aggregate's layout is fixed — grouping keys first, then aggregate results — so
+-- the dropped column leaves the key block for the aggregate block. Each select
+-- list below already agrees with the *pre-rewrite* aggregate shape, so no
+-- projection is built above the aggregate and it is the query root: the shift
+-- used to reach the result (bug-grouped-key-reorder-survives-to-output).
+--
+-- Column order is asserted in test/plan/grouped-projection-shape.spec.ts (row
+-- objects compare key-order-insensitively here); this file pins the values, so a
+-- picker that recovered the wrong value per group would fail here.
+-- ---------------------------------------------------------------------------
+
+-- Primary-key-driven: `v` determines `g`, so `g` is dropped and re-picked.
+create table pk (v integer primary key, g text);
+insert into pk values (1,'a'),(2,'b'),(3,'a');
+
+select g, v, count(*) c from pk group by g, v order by v;
+→ [{"g":"a","v":1,"c":1},{"g":"b","v":2,"c":1},{"g":"a","v":3,"c":1}]
+
+drop table pk;
+
+-- Equality-driven: `where a = b` puts the two grouping columns in one equivalence
+-- class, so either one determines the other.
+create table eqk (a text, b text);
+insert into eqk values ('x','x'),('y','z'),('w','w');
+
+select a, b, count(*) c from eqk where a = b group by a, b order by a;
+→ [{"a":"w","b":"w","c":1},{"a":"x","b":"x","c":1}]
+
+drop table eqk;
+
+-- Join-equality-driven, with the dropped column in the middle of the select list.
+create table jl (a text, b text);
+create table jr (a text, c text);
+insert into jl values ('x','1'),('y','2');
+insert into jr values ('x','p'),('y','q');
+
+select jl.a, jl.b, jr.a, jr.c, count(*) c from jl join jr on jl.a = jr.a
+  group by jl.a, jl.b, jr.a, jr.c order by jl.a;
+→ [{"a":"x","b":"1","a:1":"x","c":"p","c:1":1},{"a":"y","b":"2","a:1":"y","c":"q","c:1":1}]
+
+drop table jl;
+drop table jr;
+
+-- `insert into … select` binds the select output by POSITION, so it is the
+-- consumer the reorder actually corrupted: with the shift, `g`'s text landed in
+-- `sink.v` and `v`'s integer in `sink.g`.
+create table src (v integer primary key, g text);
+insert into src values (1,'a'),(2,'b');
+create table sink (g text, v integer, c integer);
+
+insert into sink select g, v, count(*) from src group by g, v;
+select g, v, c from sink order by v;
+→ [{"g":"a","v":1,"c":1},{"g":"b","v":2,"c":1}]
+
+drop table sink;
+drop table src;
