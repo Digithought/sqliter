@@ -601,6 +601,7 @@ group by expression [, expression...]
 
 **Behavior:**
 - Each expression in the group by must be a column name, an expression, or a positive integer representing a position in the select list.
+- A positional reference binds to the select list's Nth **output column**, not to that column's name. A select-list alias, or a same-named column from another table in the FROM clause, therefore cannot capture it: in `select t2.*, count(*) from t1 join t2 on t1.k = t2.k group by 1, 2` the ordinals name `t2`'s columns even though `t1` exposes the same column names.
 - Aggregate functions (`count()`, `sum()`, etc.) can be used with group by to calculate summary statistics for each group.
 - Columns in the select list that are not aggregated must appear in the group by clause.
 - A group by with no aggregate function anywhere is legal and yields one row per distinct group.
@@ -684,6 +685,7 @@ order by expression [asc | desc] [nulls first | nulls last]
 - `nulls first`: NULL values sort before non-NULL values
 - `nulls last`: NULL values sort after non-NULL values
 - Expression can be a column name, alias, expression, or a positive integer representing a position in the select list (1-based; out-of-range raises an error)
+- A positional reference binds to the select list's Nth **output column**, not to the name of the expression that produced it — `order by 2` is exactly `order by <the second result column>`. A select-list alias cannot shadow it (`select b as a, a as z from t order by 2` sorts by `z`), two same-named columns under `*` cannot be confused (`select * from t1 join t2 … order by 4` sorts by whichever table owns output column 4), and a computed column is read from the output rather than recomputed — so an ordinal may point at a window function or an aggregate
 - Aggregate functions are permitted when the query is itself an aggregate query (has aggregates in `select`/`having`, or has `group by`)
 - Any expression legal in `group by` is also legal in `order by` of the same query and sorts by the grouped value — regardless of how, or whether, the select list projects it. This holds even when the select list contains no aggregate function at all
 

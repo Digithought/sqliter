@@ -17,7 +17,7 @@ import { resolveFunctionSchema } from './schema-resolution.js';
 import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
-import { resolveOrdinalReference } from './select-ordinal.js';
+import { buildOrdinalAwareExpression, resolveOrdinalReference, type SelectListEntry } from './select-ordinal.js';
 
 /**
  * Processes GROUP BY, aggregates, and HAVING clauses
@@ -30,7 +30,7 @@ export function buildAggregatePhase(
 	hasAggregates: boolean,
 	projections: Projection[],
 	hasWrappedAggregates: boolean = false,
-	selectListAsts: AST.Expression[] = [],
+	selectList: readonly SelectListEntry[] = [],
 	starProjectionsByColumn: ReadonlyMap<AST.ResultColumn, readonly Projection[]> = new Map()
 ): {
 	output: RelationalPlanNode;
@@ -64,7 +64,7 @@ export function buildAggregatePhase(
 	// or has a GROUP BY). When legal, any ORDER BY aggregate not already present
 	// in the SELECT or HAVING aggregate list must be added to the AggregateNode
 	// so it is computed and available to the post-aggregate sort.
-	const orderByHasAggregates = orderByContainsAggregates(stmt.orderBy, selectContext);
+	const orderByHasAggregates = orderByContainsAggregates(stmt.orderBy, selectContext, selectList);
 	let hasOrderByOnlyAggregates = false;
 	if (orderByHasAggregates && (hasAggregates || hasGroupBy)) {
 		const orderByAggs = collectOrderByAggregates(stmt.orderBy!, selectContext, aggregates);
@@ -108,14 +108,11 @@ export function buildAggregatePhase(
 	const preAggregateSort = Boolean(
 		hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !orderByHasAggregates
 	);
-	currentInput = handlePreAggregateSort(currentInput, stmt, selectContext, hasAggregates, !!hasGroupBy, orderByHasAggregates, selectListAsts);
+	currentInput = handlePreAggregateSort(currentInput, stmt, selectContext, hasAggregates, !!hasGroupBy, orderByHasAggregates, selectList);
 
 	// Build GROUP BY expressions, resolving 1-based positional references against the SELECT list.
 	const groupByExpressions = stmt.groupBy ?
-		stmt.groupBy.map(expr => {
-			const resolved = resolveOrdinalReference(expr, selectListAsts, 'GROUP BY');
-			return buildExpression(selectContext, resolved ?? expr, false);
-		}) : [];
+		stmt.groupBy.map(expr => buildOrdinalAwareExpression(selectContext, expr, selectList, 'GROUP BY', false)) : [];
 
 	// Validate aggregate/non-aggregate mixing (must run after groupByExpressions are built
 	// so we can check column-coverage of SELECT projections against GROUP BY)
@@ -198,16 +195,17 @@ function handlePreAggregateSort(
 	hasAggregates: boolean,
 	hasGroupBy: boolean,
 	orderByHasAggregates: boolean,
-	selectListAsts: AST.Expression[]
+	selectList: readonly SelectListEntry[]
 ): RelationalPlanNode {
 	// Special handling for ORDER BY with aggregates but no GROUP BY.
 	// Skip when ORDER BY itself references aggregates — those must run
 	// post-aggregation, not on the per-row input.
 	if (hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !orderByHasAggregates) {
-		// Apply ORDER BY before aggregation
+		// Apply ORDER BY before aggregation. This sort sits BELOW the AggregateNode,
+		// so a positional reference resolves through the select list (no output
+		// attributes exist yet to bind to).
 		const sortKeys: SortKey[] = stmt.orderBy.map(orderByClause => {
-			const resolved = resolveOrdinalReference(orderByClause.expr, selectListAsts, 'ORDER BY');
-			const expression = buildExpression(selectContext, resolved ?? orderByClause.expr);
+			const expression = buildOrdinalAwareExpression(selectContext, orderByClause.expr, selectList, 'ORDER BY');
 			return {
 				expression,
 				direction: orderByClause.direction,
@@ -720,13 +718,24 @@ function collectOrderByAggregates(
 
 /**
  * Returns true if any ORDER BY clause expression contains an aggregate function call.
+ *
+ * A positional reference is resolved against the SELECT list FIRST: the literal `1`
+ * in `select count(*) as c from t order by 1` contains no aggregate itself, but it
+ * stands for one. Without this the query would take the pre-aggregate sort path and
+ * fail with "Aggregate function count not allowed in this context"; with it, it
+ * routes to the post-aggregate ORDER BY exactly like the spelled-out
+ * `order by count(*)`.
  */
 function orderByContainsAggregates(
 	orderBy: AST.OrderByClause[] | undefined,
-	selectContext: PlanningContext
+	selectContext: PlanningContext,
+	selectList: readonly SelectListEntry[]
 ): boolean {
 	if (!orderBy || orderBy.length === 0) return false;
-	return orderBy.some(clause => containsAggregateFunction(clause.expr, selectContext));
+	return orderBy.some(clause => {
+		const entry = resolveOrdinalReference(clause.expr, selectList, 'ORDER BY');
+		return containsAggregateFunction(entry?.expr ?? clause.expr, selectContext);
+	});
 }
 
 /**

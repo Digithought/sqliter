@@ -11,7 +11,7 @@ import { LiteralNode } from '../nodes/scalar.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
-import { resolveCompoundOrdinalColumn } from './select-ordinal.js';
+import { resolveOrdinalOutputColumn } from './select-ordinal.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 import { buildValuesStmt } from './select.js';
 import { buildInsertStmt } from './insert.js';
@@ -167,7 +167,7 @@ function applyOuterOrderBy(
 			// A bare positional ordinal (`order by 1`) maps to the compound's Nth
 			// OUTPUT column, inheriting its resolved type/collation; any other
 			// expression shape builds normally against the set-op output scope.
-			const ordinalRef = resolveCompoundOrdinalColumn(ob.expr, input, selectContext.scope);
+			const ordinalRef = resolveOrdinalOutputColumn(ob.expr, input, selectContext.scope);
 			return {
 				expression: ordinalRef ?? buildExpression(selectContext, ob.expr),
 				direction: ob.direction,

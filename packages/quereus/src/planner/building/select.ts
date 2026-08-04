@@ -41,7 +41,7 @@ import { buildAggregatePhase, buildFinalAggregateProjections } from './select-ag
 import { buildWindowPhase } from './select-window.js';
 import { buildFinalProjections, applyDistinct, applyOrderBy, applyLimitOffset, createProjectionOutputScope } from './select-modifiers.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
-import { buildSelectListAsts, resolveOrdinalReference } from './select-ordinal.js';
+import { buildOrdinalAwareExpression, buildSelectListEntries } from './select-ordinal.js';
 
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
@@ -181,16 +181,19 @@ export function buildSelectStmt(
 		if (columnProjection) projections.push(columnProjection);
 	}
 
-	// Build the source-order AST list of SELECT-list output columns (with stars expanded)
+	// Build the source-order list of SELECT-list output columns (with stars expanded)
 	// for resolving GROUP BY / ORDER BY positional ordinals.
-	const selectListAsts = buildSelectListAsts(stmt.columns, input);
+	const selectListEntries = buildSelectListEntries(stmt.columns, input);
 
 	// Process aggregates if present
-	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates, selectListAsts, starProjectionsByColumn);
+	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates, selectListEntries, starProjectionsByColumn);
 	input = aggregateResult.output;
 	let preAggregateSort = aggregateResult.preAggregateSort;
 	let orderByAppliedEarly = false;
 	let aggregateProjectionScope: RegisteredScope | undefined;
+	// The node whose output attributes ARE this SELECT's result columns, once one
+	// exists. A positional ORDER BY binds to its Nth attribute (see applyOrderBy).
+	let orderByOutputRelation: RelationalPlanNode | undefined;
 
 	// Update context if we have aggregates
 	if (aggregateResult.aggregateScope) {
@@ -217,7 +220,7 @@ export function buildSelectStmt(
 			!hasWindowFunctions &&
 			stmt.orderBy && stmt.orderBy.length > 0
 		) {
-			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, undefined, true, selectListAsts);
+			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, undefined, true, selectListEntries);
 			orderByAppliedEarly = true;
 		}
 
@@ -243,6 +246,7 @@ export function buildSelectStmt(
 			// Expose final-projection output column names (including SELECT-list aliases)
 			// so subsequent ORDER BY can reference aliases like the non-aggregate path.
 			aggregateProjectionScope = createProjectionOutputScope(input);
+			orderByOutputRelation = input;
 		}
 	}
 
@@ -266,15 +270,14 @@ export function buildSelectStmt(
 				if (orderByClause.expr.type === 'column') {
 					const orderColumn = orderByClause.expr.name.toLowerCase();
 					if (!selectedColumns.has(orderColumn)) {
-						// Apply ORDER BY before window projections
-						const sortKeys: SortKey[] = stmt.orderBy.map(orderBy => {
-							const resolved = resolveOrdinalReference(orderBy.expr, selectListAsts, 'ORDER BY');
-							return {
-								expression: buildExpression(selectContext, resolved ?? orderBy.expr),
-								direction: orderBy.direction,
-								nulls: orderBy.nulls
-							};
-						});
+						// Apply ORDER BY before window projections. This sort sits BELOW the
+						// window projection, so a positional reference resolves through the
+						// select list (no output attributes exist yet to bind to).
+						const sortKeys: SortKey[] = stmt.orderBy.map(orderBy => ({
+							expression: buildOrdinalAwareExpression(selectContext, orderBy.expr, selectListEntries, 'ORDER BY'),
+							direction: orderBy.direction,
+							nulls: orderBy.nulls
+						}));
 						input = new SortNode(selectContext.scope, input, sortKeys);
 						preWindowSort = true;
 						break;
@@ -284,6 +287,10 @@ export function buildSelectStmt(
 		}
 
 		input = buildWindowPhase(input, windowFunctions, selectContext, stmt);
+		// The window phase ends in a ProjectNode over the SELECT list, so that node's
+		// attributes are this query's result columns (subject to the alignment guard —
+		// the window projection drops `*` entries today).
+		orderByOutputRelation = input;
 
 		// Update context to include window output columns
 		const windowOutputScope = new RegisteredScope(selectContext.scope);
@@ -312,14 +319,17 @@ export function buildSelectStmt(
 	// attributes, which the AggregateNode does not output.
 	const hasGrouping = Boolean(aggregateResult.aggregateScope);
 	if (!hasGrouping && !hasWindowFunctions) {
-		const finalResult = buildFinalProjections(input, projections, selectScope, stmt, selectContext, preserveInputColumns, selectListAsts);
+		const finalResult = buildFinalProjections(input, projections, selectScope, stmt, selectContext, preserveInputColumns, selectListEntries);
 		input = finalResult.output;
 		selectContext = finalResult.finalContext;
 		preAggregateSort = finalResult.preAggregateSort;
+		// Either the final ProjectNode, or — for an identity `select *` — the source
+		// itself, whose attributes already ARE the select list.
+		orderByOutputRelation = finalResult.output;
 
 		// Apply final modifiers with projection scope for column alias resolution
 		input = applyDistinct(input, stmt, selectScope);
-		input = applyOrderBy(input, stmt, selectContext, preAggregateSort, finalResult.projectionScope, false, selectListAsts);
+		input = applyOrderBy(input, stmt, selectContext, preAggregateSort, finalResult.projectionScope, false, selectListEntries, orderByOutputRelation);
 		input = applyLimitOffset(input, stmt, selectContext, finalResult.projectionScope);
 	} else {
 		// Apply final modifiers. For the aggregate path, expose the final-projection
@@ -330,7 +340,7 @@ export function buildSelectStmt(
 		if (!orderByAppliedEarly) {
 			// In the aggregate path, ORDER BY may legally reference aggregates; in the
 			// window path it may reference window outputs. Both are now in selectContext.
-			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, aggregateProjectionScope, hasAggregates, selectListAsts);
+			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, aggregateProjectionScope, hasAggregates, selectListEntries, orderByOutputRelation);
 		}
 		input = applyLimitOffset(input, stmt, selectContext, aggregateProjectionScope);
 	}

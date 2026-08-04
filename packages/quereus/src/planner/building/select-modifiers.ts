@@ -12,7 +12,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
-import { resolveOrdinalReference } from './select-ordinal.js';
+import { buildOrdinalAwareExpression, resolveOrdinalOutputColumn, type SelectListEntry } from './select-ordinal.js';
 
 /**
  * Creates final output projections and applies result column aliases
@@ -24,7 +24,7 @@ export function buildFinalProjections(
 	stmt: AST.SelectStmt,
 	selectContext: PlanningContext,
 	preserveInputColumns: boolean = true,
-	selectListAsts: AST.Expression[] = []
+	selectList: readonly SelectListEntry[] = []
 ): {
 	output: RelationalPlanNode;
 	finalContext: PlanningContext;
@@ -48,10 +48,11 @@ export function buildFinalProjections(
 	let currentInput = input;
 
 	// Apply ORDER BY before projection if needed (compile expressions against input scope)
+	// This sort sits BELOW the projection, so there are no output attributes to bind a
+	// positional ORDER BY reference to — ordinals resolve through the select list instead.
 	if (needsPreProjectionSort && stmt.orderBy && stmt.orderBy.length > 0) {
 		const sortKeys: SortKey[] = stmt.orderBy.map(orderByClause => {
-			const resolved = resolveOrdinalReference(orderByClause.expr, selectListAsts, 'ORDER BY');
-			const expression = buildExpression(selectContext, resolved ?? orderByClause.expr);
+			const expression = buildOrdinalAwareExpression(selectContext, orderByClause.expr, selectList, 'ORDER BY');
 			return {
 				expression,
 				direction: orderByClause.direction,
@@ -92,7 +93,13 @@ export function applyDistinct(
 }
 
 /**
- * Applies ORDER BY clause if not already applied
+ * Applies ORDER BY clause if not already applied.
+ *
+ * `outputRelation`, when supplied, is the node whose output attributes ARE this
+ * SELECT's result columns (the final `ProjectNode`, or the source itself for an
+ * identity `select *`). A positional ORDER BY reference then binds to output
+ * position N directly — see {@link resolveOrdinalOutputColumn}. The sort this
+ * builds sits ABOVE that relation, so the reference resolves at runtime.
  */
 export function applyOrderBy(
 	input: RelationalPlanNode,
@@ -101,7 +108,8 @@ export function applyOrderBy(
 	preAggregateSort: boolean,
 	projectionScope?: RegisteredScope,
 	allowAggregates: boolean = false,
-	selectListAsts: AST.Expression[] = []
+	selectList: readonly SelectListEntry[] = [],
+	outputRelation?: RelationalPlanNode
 ): RelationalPlanNode {
 	if (stmt.orderBy && stmt.orderBy.length > 0 && !preAggregateSort) {
 		// Merge projection scope if available so ORDER BY can reference output column aliases
@@ -111,9 +119,22 @@ export function applyOrderBy(
 			orderByContext = { ...selectContext, scope: combinedScope };
 		}
 
+		// Alignment guard: bind by output position only when the relation really does
+		// publish one attribute per SELECT-list column. Two shapes do not today — the
+		// window path drops `*` entries from its projection, and the grouped path may
+		// skip its final projection — and for those, positional binding would hand back
+		// the wrong column or a spurious out-of-range error. They keep the select-list
+		// fallback below instead. The guard is a no-op once those shapes are fixed.
+		const alignedOutput = outputRelation && outputRelation.getAttributes().length === selectList.length
+			? outputRelation
+			: undefined;
+
 		const sortKeys: SortKey[] = stmt.orderBy.map(orderByClause => {
-			const resolved = resolveOrdinalReference(orderByClause.expr, selectListAsts, 'ORDER BY');
-			const expression = buildExpression(orderByContext, resolved ?? orderByClause.expr, allowAggregates);
+			const positional = alignedOutput
+				? resolveOrdinalOutputColumn(orderByClause.expr, alignedOutput, orderByContext.scope)
+				: null;
+			const expression = positional
+				?? buildOrdinalAwareExpression(orderByContext, orderByClause.expr, selectList, 'ORDER BY', allowAggregates);
 			return {
 				expression,
 				direction: orderByClause.direction,
