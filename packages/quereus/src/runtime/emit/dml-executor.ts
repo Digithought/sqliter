@@ -49,8 +49,24 @@ interface RuntimeUpsertClause {
 	 */
 	conflictTargetComparators?: Array<(a: SqlValue, b: SqlValue) => number>;
 	action: 'nothing' | 'update';
-	/** Indices into the evaluators array for each assignment (column index -> evaluator index) */
+	/** Indices into the evaluators array for each USER assignment (column index -> evaluator index) */
 	assignmentIndices?: Map<number, number>;
+	/**
+	 * The implicit generated-column recomputes, in `generatedColumnTopoOrder`.
+	 * Held separately from {@link assignmentIndices} because they run in a SECOND
+	 * pass: a generated column derives from the POST-update row, so it cannot be
+	 * evaluated in the pass that still has the pre-update existing row bound.
+	 */
+	generatedAssignments?: Array<{ colIndex: number; evaluatorIndex: number }>;
+	/**
+	 * Clone of {@link existingRowDescriptor} — same attribute ids, distinct object
+	 * identity — used to bind those ids to the composed post-assignment row for the
+	 * generated-column pass. Must be a distinct object: the runtime context map is
+	 * keyed by descriptor identity, so re-binding the same object would collide with
+	 * (and on teardown evict) the existing-row binding. Set only when
+	 * {@link generatedAssignments} is non-empty.
+	 */
+	generatedRowDescriptor?: RowDescriptor;
 	/**
 	 * Columns whose DO UPDATE assignment value needs conversion to the declared
 	 * type before it is written — the same static-type rule emitUpdate applies
@@ -396,17 +412,42 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			if (clause.action === 'update' && clause.assignments) {
 				runtime.assignmentIndices = new Map();
 				runtime.assignmentCoercions = new Map();
+				// Split the map into the user's SET targets and the appended
+				// generated-column recomputes — the latter run as a second pass.
+				const generatedColumns = new Set(clause.generatedAssignmentColumns ?? []);
+				const generatedEvaluatorIndices = new Map<number, number>();
 				for (const [colIndex, valueNode] of clause.assignments) {
 					const evaluatorIndex = upsertEvaluatorInstructions.length;
 					const instruction = emitCallFromPlan(valueNode, ctx);
 					upsertEvaluatorInstructions.push(instruction);
-					runtime.assignmentIndices.set(colIndex, evaluatorIndex);
+					if (generatedColumns.has(colIndex)) {
+						generatedEvaluatorIndices.set(colIndex, evaluatorIndex);
+					} else {
+						runtime.assignmentIndices.set(colIndex, evaluatorIndex);
+					}
 					// Same static-type rule as emitUpdate: convert only when the
 					// assignment expression's type is not the column's declared type.
+					// Applies to a generated value too — it is written to the same cell.
 					const column = tableSchema.columns[colIndex];
 					if (valueNode.getType().logicalType !== column.logicalType) {
 						runtime.assignmentCoercions.set(colIndex, column);
 					}
+				}
+				// Keep topological order (drive off the plan's list, not map order).
+				if (generatedEvaluatorIndices.size > 0) {
+					runtime.generatedAssignments = clause.generatedAssignmentColumns!
+						.filter(colIndex => generatedEvaluatorIndices.has(colIndex))
+						.map(colIndex => ({ colIndex, evaluatorIndex: generatedEvaluatorIndices.get(colIndex)! }));
+					// Sparse array indexed by attribute id — `slice` preserves the holes.
+					// Missing it would make the runtime skip the recompute SILENTLY, so
+					// treat it as the plan-shape violation it is rather than degrading.
+					if (!clause.existingRowDescriptor) {
+						throw new QuereusError(
+							`UPSERT DO UPDATE on '${tableSchema.name}' has generated-column recomputes but no existing-row descriptor`,
+							StatusCode.INTERNAL
+						);
+					}
+					runtime.generatedRowDescriptor = clause.existingRowDescriptor.slice();
 				}
 			}
 
@@ -524,6 +565,31 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				}
 				updatedRow[colIndex] = value;
 			}
+		}
+
+		// Phase 2: recompute the generated columns against the row as composed above,
+		// which now holds the CONVERTED user assignments — a generated column derives
+		// from what will be STORED, not from the raw assignment. It cannot run in the
+		// pass above: there the existing-row attributes still resolve to PRE-update
+		// values. Here they are re-bound (via a distinct descriptor object, so the
+		// binding is additive rather than a collision) to the live `updatedRow`, which
+		// each iteration writes back into — so a generated-from-generated column reads
+		// the value its dependency just produced.
+		//
+		// `await` each evaluator: deterministic does not imply synchronous — a generated
+		// expression may embed a scalar subquery, whose evaluator returns a Promise (see
+		// the same note in emitUpdate's phase 2).
+		if (clause.generatedAssignments && clause.generatedRowDescriptor) {
+			await withAsyncRowContext(rctx, clause.generatedRowDescriptor, () => updatedRow, async () => {
+				for (const { colIndex, evaluatorIndex } of clause.generatedAssignments!) {
+					let value = await upsertEvaluators[evaluatorIndex](rctx) as SqlValue;
+					const coerceColumn = clause.assignmentCoercions?.get(colIndex);
+					if (coerceColumn) {
+						value = validateAndParse(value, coerceColumn.logicalType, coerceColumn.name);
+					}
+					updatedRow[colIndex] = value;
+				}
+			});
 		}
 
 		// Extract the primary key from existing row

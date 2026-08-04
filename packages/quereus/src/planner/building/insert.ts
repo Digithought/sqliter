@@ -437,9 +437,56 @@ function buildUpsertClausePlans(
 						StatusCode.ERROR
 					);
 				}
+				// Reject SET on generated columns, exactly as `building/update.ts` does —
+				// this path never routes through `buildUpdateStmt`, so it needs its own
+				// copy of the rule. Raised BEFORE the value expression is built so the
+				// diagnostic does not depend on that expression resolving.
+				if (tableSchema.columns[colIndex].generated) {
+					throw new QuereusError(
+						`Cannot UPDATE generated column '${assign.column}'`,
+						StatusCode.ERROR
+					);
+				}
 				const valueNode = buildExpression(upsertCtx, assign.value) as ScalarPlanNode;
 				assignments.set(colIndex, valueNode);
 			}
+		}
+
+		// Append one implicit assignment per generated column, in topological order so a
+		// generated column referencing another sees the freshly-computed value when the
+		// runtime evaluates them in turn against the composed row. A generated column can
+		// never collide with a user target (rejected above), so appending into the same
+		// map is safe and keeps the node's child walk order-preserving.
+		//
+		// The expressions get their OWN scope over the existing-row attributes rather than
+		// reusing `upsertScope`: schema-authored SQL must not be able to bind the
+		// statement's `new.` / `excluded.` symbols. Wrapped in `schemaAuthoredContext` for
+		// the same reason `building/update.ts` wraps its recompute — the table's own DDL
+		// resolves bare relation names in its own schema and cannot see the writing
+		// statement's CTEs.
+		const generatedScope = new RegisteredScope(ctx.scope);
+		existingAttributes.forEach((attr, columnIndex) => {
+			const col = tableSchema.columns[columnIndex];
+			generatedScope.registerSymbol(col.name.toLowerCase(), (exp, s) =>
+				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, columnIndex)
+			);
+			const tblQualified = `${tableSchema.name.toLowerCase()}.${col.name.toLowerCase()}`;
+			generatedScope.registerSymbol(tblQualified, (exp, s) =>
+				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, columnIndex)
+			);
+		});
+		const generatedCtx = schemaAuthoredContext({ ...ctx, scope: generatedScope }, tableSchema.schemaName);
+
+		const generatedAssignmentColumns: number[] = [];
+		for (const colIndex of tableSchema.generatedColumnTopoOrder ?? []) {
+			const col = tableSchema.columns[colIndex];
+			if (!col.generated || !col.generatedExpr) continue;
+			const genNode = buildExpression(generatedCtx, col.generatedExpr) as ScalarPlanNode;
+			if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+				validateDeterministicGenerated(genNode, col.name, tableSchema.name);
+			}
+			assignments.set(colIndex, genNode);
+			generatedAssignmentColumns.push(colIndex);
 		}
 
 		// Build WHERE condition if present
@@ -453,6 +500,7 @@ function buildUpsertClausePlans(
 			conflictTargetCollations: enforcement?.collations,
 			action: 'update' as const,
 			assignments,
+			generatedAssignmentColumns: generatedAssignmentColumns.length > 0 ? generatedAssignmentColumns : undefined,
 			whereCondition,
 			newRowDescriptor,
 			existingRowDescriptor,

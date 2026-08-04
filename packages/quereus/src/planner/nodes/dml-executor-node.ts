@@ -35,6 +35,19 @@ export interface UpsertClausePlan {
 	 * - unqualified column names (existing row values) via existingRowDescriptor
 	 */
 	assignments?: Map<number, ScalarPlanNode>;
+	/**
+	 * Column indices whose entry in {@link assignments} is an implicit
+	 * generated-column recompute rather than a user-written SET, listed in
+	 * `generatedColumnTopoOrder`. The runtime evaluates these in a SECOND pass,
+	 * after the user assignments have been applied and coerced into the updated
+	 * row, so a generated column derives from the post-update image (and a
+	 * generated-from-generated column sees the freshly computed value).
+	 *
+	 * Their expressions bind bare column names to the EXISTING-row attributes —
+	 * the same attributes the user assignments read — but the second pass
+	 * re-binds those attribute ids to the composed row via a cloned descriptor.
+	 */
+	generatedAssignmentColumns?: number[];
 	/** For 'update' action: optional WHERE condition plan */
 	whereCondition?: ScalarPlanNode;
 	/** Row descriptor for NEW.* references (proposed insert values) */

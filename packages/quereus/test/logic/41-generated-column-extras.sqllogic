@@ -237,3 +237,189 @@ select id, w, g from t_corr order by id;
 
 drop table t_corr;
 drop table t_src3;
+
+-- ===================================
+-- 9. `on conflict … do update` recomputes generated columns
+--    The DO UPDATE arm composes its row from the EXISTING row plus the SET
+--    assignments and writes it directly, so it needs its own second-pass
+--    recompute — the INSERT-side and UPDATE-side ones never run for it.
+-- ===================================
+
+create table t_up (
+	id integer primary key,
+	w  integer,
+	g  integer generated always as (w * 2) stored
+);
+
+insert into t_up (id, w) values (1, 1);
+
+select id, w, g from t_up;
+→ [{"id":1,"w":1,"g":2}]
+
+-- literal assignment: g derives from the POST-update w, not the old one
+insert into t_up (id, w) values (1, 7) on conflict (id) do update set w = 7;
+
+select id, w, g from t_up;
+→ [{"id":1,"w":7,"g":14}]
+
+-- `excluded.` assignment (the proposed insert value)
+insert into t_up (id, w) values (1, 20) on conflict (id) do update set w = excluded.w;
+
+select id, w, g from t_up;
+→ [{"id":1,"w":20,"g":40}]
+
+-- assignment reading the EXISTING row (unqualified `w` = 20)
+insert into t_up (id, w) values (1, 0) on conflict (id) do update set w = w + 1;
+
+select id, w, g from t_up;
+→ [{"id":1,"w":21,"g":42}]
+
+-- assigning a generated column is rejected, exactly as `update t_up set g = 99` is
+insert into t_up (id, w) values (1, 5) on conflict (id) do update set g = 99;
+-- error: Cannot UPDATE generated column 'g'
+
+-- rejected at plan time, so nothing was written
+select id, w, g from t_up;
+→ [{"id":1,"w":21,"g":42}]
+
+-- `on conflict … do nothing` writes nothing at all (control)
+insert into t_up (id, w) values (1, 99) on conflict (id) do nothing;
+
+select id, w, g from t_up;
+→ [{"id":1,"w":21,"g":42}]
+
+drop table t_up;
+
+-- ===================================
+-- 9b. DO UPDATE across a generated-from-generated chain, declared in reverse
+--     dependency order — the second pass must follow topological order, not
+--     declaration order.
+-- ===================================
+
+create table t_up_chain (
+	id integer primary key,
+	a  integer,
+	w  integer generated always as (m * 5) stored,
+	m  integer generated always as (a * 2) stored
+);
+
+insert into t_up_chain (id, a) values (1, 3);
+
+select a, m, w from t_up_chain;
+→ [{"a":3,"m":6,"w":30}]
+
+insert into t_up_chain (id, a) values (1, 4) on conflict (id) do update set a = excluded.a;
+
+select a, m, w from t_up_chain;
+→ [{"a":4,"m":8,"w":40}]
+
+drop table t_up_chain;
+
+-- ===================================
+-- 9c. DO UPDATE with a subquery-valued generated column
+--     Its evaluator resolves ASYNCHRONOUSLY, so the second pass must await it
+--     rather than store the Promise. The source table changes between the two
+--     statements, so a carried-over value is visible in the result.
+-- ===================================
+
+create table t_up_src (k integer primary key);
+
+insert into t_up_src values (1), (2), (3);
+
+create table t_up_sub (
+	id integer primary key,
+	w  integer,
+	g  integer generated always as ((select count(*) from t_up_src))
+);
+
+insert into t_up_sub (id, w) values (1, 1);
+
+select id, w, g from t_up_sub;
+→ [{"id":1,"w":1,"g":3}]
+
+insert into t_up_src values (4), (5);
+
+insert into t_up_sub (id, w) values (1, 2) on conflict (id) do update set w = excluded.w;
+
+select id, w, g from t_up_sub;
+→ [{"id":1,"w":2,"g":5}]
+
+drop table t_up_sub;
+drop table t_up_src;
+
+-- ===================================
+-- 9d. DO UPDATE with a CORRELATED subquery generated column whose correlation
+--     is on a column the SET clause changes — the second pass must bind the
+--     post-assignment row, not the pre-update existing row.
+-- ===================================
+
+create table t_up_corr_src (k integer primary key);
+
+insert into t_up_corr_src values (1), (2), (3), (4);
+
+create table t_up_corr (
+	id integer primary key,
+	w  integer,
+	c  integer generated always as ((select count(*) from t_up_corr_src where t_up_corr_src.k <= w))
+);
+
+insert into t_up_corr (id, w) values (1, 1);
+
+select id, w, c from t_up_corr;
+→ [{"id":1,"w":1,"c":1}]
+
+insert into t_up_corr (id, w) values (1, 3) on conflict (id) do update set w = excluded.w;
+
+select id, w, c from t_up_corr;
+→ [{"id":1,"w":3,"c":3}]
+
+drop table t_up_corr;
+drop table t_up_corr_src;
+
+-- ===================================
+-- 9e. Control — `insert or replace` (delete-then-insert) routes through the
+--     INSERT path, which already recomputes. Pinned so a future change to the
+--     upsert path cannot quietly regress it.
+-- ===================================
+
+create table t_rep (
+	id integer primary key,
+	w  integer,
+	g  integer generated always as (w * 2) stored
+);
+
+insert into t_rep (id, w) values (1, 1);
+
+select id, w, g from t_rep;
+→ [{"id":1,"w":1,"g":2}]
+
+insert or replace into t_rep (id, w) values (1, 9);
+
+select id, w, g from t_rep;
+→ [{"id":1,"w":9,"g":18}]
+
+drop table t_rep;
+
+-- ===================================
+-- 9f. Generated column that IS the primary key, relocated by the recompute.
+--     The DO UPDATE arm issues its write with `oldKeyValues` taken from the
+--     existing row, so the row must MOVE to the new key rather than duplicate
+--     or be lost.
+-- ===================================
+
+create table t_pk_up (
+	a integer not null,
+	k integer generated always as (a + 100) stored primary key
+);
+
+insert into t_pk_up (a) values (1);
+
+select a, k from t_pk_up;
+→ [{"a":1,"k":101}]
+
+insert into t_pk_up (a) values (1) on conflict (k) do update set a = 2;
+
+select a, k from t_pk_up order by k;
+→ [{"a":2,"k":102}]
+
+drop table t_pk_up;

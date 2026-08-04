@@ -187,6 +187,54 @@ describe('DML side-expression exposure to the optimizer', () => {
 		expect(() => dml.withChildren(dml.getChildren().slice(0, 1))).to.throw(/expects 6 children/);
 		expect(() => check.withChildren(check.getChildren().slice(0, 1))).to.throw(/expects 4 children/);
 	});
+
+	// A DO UPDATE clause on a table with generated columns carries implicit recompute
+	// expressions appended to the same `assignments` map. They are plan children like any
+	// other held expression — a subquery-valued generated expression is rewritten by the
+	// optimizer, and one left out of the child walk reaches emit unoptimized.
+	it('generated-column recompute expressions are children and survive a withChildren round-trip', async () => {
+		await db.exec(`
+			create table gt (
+				id integer primary key,
+				w  integer,
+				g  integer generated always as ((select count(*) from src) + w) stored,
+				g2 integer generated always as (g * 2) stored
+			)
+		`);
+		const node = findNode(
+			db.getPlan(`insert into gt (id, w) values (1, 1) on conflict (id) do update set w = excluded.w`),
+			isDmlExecutor);
+
+		const clause = node.upsertClauses![0];
+		// Anti-vacuity: one user SET plus both generated recomputes, generated last and
+		// in topological order (`g` feeds `g2`).
+		expect([...clause.assignments!.keys()], 'w, then g, then g2 by column index').to.deep.equal([1, 2, 3]);
+		expect(clause.generatedAssignmentColumns, 'both generated columns, topologically ordered')
+			.to.deep.equal([2, 3]);
+
+		const children = node.getChildren();
+		expect(children.length, 'source + 3 assignments').to.equal(4);
+		for (const expr of clause.assignments!.values()) {
+			expect(children, `assignment ${expr.toString()} must be a child`).to.include(expr);
+		}
+
+		expect(node.withChildren(children), 'identity round-trip').to.equal(node);
+
+		// Substitute the user assignment into the first generated slot: a slot mismatch or
+		// a dropped `generatedAssignmentColumns` marker shows up here, not in the identity
+		// round-trip.
+		const substituted = [...children];
+		substituted[2] = children[1];
+		const rebuilt = node.withChildren(substituted) as DmlExecutorNode;
+		expect(rebuilt).to.not.equal(node);
+		expect(rebuilt.getChildren()).to.deep.equal(substituted);
+
+		const rebuiltClause = rebuilt.upsertClauses![0];
+		expect([...rebuiltClause.assignments!.keys()], 'column-index keys preserved').to.deep.equal([1, 2, 3]);
+		expect([...rebuiltClause.assignments!.values()]).to.deep.equal(substituted.slice(1));
+		expect(rebuiltClause.generatedAssignmentColumns, 'generated marker carried forward')
+			.to.deep.equal([2, 3]);
+	});
 });
 
 describe('AlterTableNode ADD COLUMN expression exposure to the optimizer', () => {
