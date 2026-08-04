@@ -754,8 +754,9 @@ export function buildInsertStmt(
 	// ORTHOGONAL ROW EXPANSION: Apply uniform row expansion to map any source to table structure with defaults
 	// NOTE: defaults / generated columns ride the STATEMENT's `with schema` path, while
 	// the constraint and FK builders below narrow to the table's own schema themselves.
-	// That asymmetry is pre-existing and has produced no observed wrong answer; if a
-	// default ever resolves a relation the table's home schema would not, unify them.
+	// That asymmetry is pre-existing and DOES produce a wrong answer when both schemas
+	// hold the named relation (a `temp` table's default reads `main`'s copy while its own
+	// `check` reads `temp`'s) — tracked as `bug-column-default-ignores-owning-table-schema`.
 	const expandedSourceNode = createRowExpansionProjection(schemaAuthoredPathCtx, sourceNode, targetColumns, tableReference, contextScope, defaultRowContextScope);
 
 	// Update targetColumns to reflect all table columns since we've expanded the source

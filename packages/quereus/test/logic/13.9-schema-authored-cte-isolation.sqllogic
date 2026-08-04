@@ -265,7 +265,40 @@ select rid, name from kd_core order by rid;
 select rid, email from kd_contact order by rid;
 → [{"rid":101,"email":"ada@x.io"}]
 
+-- ===== Controls: the clearing reaches ONLY the schema-authored expressions =====
+-- (a) The statement that must NOT leak into the default still reads the CTE everywhere
+-- the user wrote it: the insert's source and its scalar subquery see `c` as the 1-row
+-- CTE (`v = 1`), while the column default sees the real 3-row table (`w = 3`).
+
+create table sa_both (id integer primary key, v integer, w integer default (select count(*) from c));
+-- run
+
+with c as (select id from p),
+     b as (insert into sa_both (id, v) select id, (select count(*) from c) from c returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, v, w from sa_both order by id;
+→ [{"id":10,"v":1,"w":3}]
+
+-- (b) A schema-authored expression's OWN `with` clause still binds: the namespace is
+-- cleared on the way IN, not disabled, so a default may declare and read its own CTE —
+-- and a relation that clause reads is still the real table, not the caller's.
+
+create table sa_ownwith (id integer primary key, w integer default ((with q as (select count(*) as n from c) select n from q)));
+-- run
+
+with c as (select id from p),
+     b as (insert into sa_ownwith (id) values (1) returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, w from sa_ownwith order by id;
+→ [{"id":1,"w":3}]
+
 -- Cleanup
+drop table sa_ownwith;
+drop table sa_both;
 drop view kd_v;
 drop view vsa;
 drop table kd_contact;

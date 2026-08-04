@@ -29,9 +29,10 @@ import type { PlanningContext } from '../planning-context.js';
  *    so this is applied ON TOP of those contexts rather than instead of them.
  *  - `schemaPath` — `buildConstraintChecks` and both foreign-key builders already
  *    narrow to `[tableSchema.schemaName]` themselves. Column defaults and generated
- *    columns do not (they ride the statement's `with schema` path); that asymmetry is
- *    real but is a separate question with no observed wrong answer — see the NOTE at
- *    the row-expansion call site in `building/insert.ts`.
+ *    columns do not (they ride the statement's `with schema` path), which is a real and
+ *    observed wrong answer when both schemas hold the named relation — tracked as
+ *    `bug-column-default-ignores-owning-table-schema`, whose likely fix is to narrow
+ *    here. See also the NOTE at the row-expansion call site in `building/insert.ts`.
  *  - `storedBodyOf` — these expressions are built INLINE in the caller's statement,
  *    not as a re-entered stored body. Setting it would wrongly make a
  *    {@link import('../../parser/ast.js').StoredBodyEnv} marker inert.

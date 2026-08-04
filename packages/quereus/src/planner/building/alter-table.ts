@@ -305,6 +305,11 @@ function buildAddColumnBackfill(
     sourceRelation: 'add-column-backfill',
   }));
   const rowScope = buildRowDefaultScope(ctx.scope, tableSchema.columns, rowAttrs);
+  // NOTE: this is schema-authored SQL built on the caller's context, but it does NOT go
+  // through `schemaAuthoredContext` (building/schema-authored-context.ts) because ALTER
+  // can never carry CTE definitions: it is not an `AST.QueryExpr`, so it cannot be a CTE
+  // body, and it has no `with` clause of its own. If ALTER ever becomes nestable, wrap
+  // this context the way the three DML builders do.
   const node = buildExpression({ ...ctx, scope: rowScope }, sourceExpr) as ScalarPlanNode;
 
   // Same validator each arm's write-path build site uses, so an ALTER accepts exactly
