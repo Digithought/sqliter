@@ -645,6 +645,12 @@ export class SyncClient {
   // ==========================================================================
   // Snapshot bootstrap
   // ==========================================================================
+  //
+  // NOTE: this file is ~1170 lines; this section is ~300 of them and is the
+  // natural extraction seam — it touches the rest of the client only through
+  // `send`, `setStatus`, `emitSyncEvent`, `syncManager` and `ws`. If the file
+  // grows much further, lift it into a `SnapshotBootstrap` collaborator that
+  // takes those five as its interface rather than splitting elsewhere.
 
   /**
    * Explicitly request a full snapshot of the database from the server.
@@ -682,6 +688,19 @@ export class SyncClient {
    *          caller must stop the handshake flow (reconnect resumes it).
    */
   private async maybeBootstrap(): Promise<boolean> {
+    // A transfer from the PREVIOUS socket can still be unwinding (its abort has
+    // to propagate through the apply). This handshake belongs to a new socket,
+    // so joining that dead transfer would report its failure as this
+    // connection's and stop the handshake with nothing scheduled to retry it.
+    // Wait for it to settle, then decide fresh off the checkpoint it left.
+    if (this.snapshotTransferPromise) await this.snapshotTransferPromise;
+
+    // NOTE: checkpoints carry no server identity (the apply stamps the
+    // RECEIVER's site id into them), so a replica that syncs one database to
+    // two different coordinators would resume server A's checkpoint against
+    // server B — B skips the tables A already completed, silently. One
+    // coordinator per database today; key checkpoints by peer before that
+    // changes.
     const pending = await this.syncManager.listSnapshotCheckpoints();
 
     if (pending.length > 0) {
@@ -759,66 +778,95 @@ export class SyncClient {
       return this.snapshotTransferPromise;
     }
 
-    const transfer = async (): Promise<Error | null> => {
-      const reader = new SnapshotStreamReader();
-      this.activeSnapshotReader = reader;
-      this.snapshotEventTablesProcessed = -1;
-      this.droppedChunkWarned = false;
+    // Cleanup rides on the returned promise rather than a `finally` INSIDE the
+    // transfer body: the body can settle synchronously (a send that fails
+    // before its first await), and an inner finally would then null the field
+    // before the assignment below ever set it — pinning isBootstrapping true
+    // for the life of the client. A .finally() callback always runs a microtask
+    // later, i.e. after the assignment.
+    const promise = this.executeSnapshotTransfer(msg).finally(() => {
+      this.clearSnapshotStallTimer();
+      this.activeSnapshotReader = null;
+      this.snapshotTransferPromise = null;
+    });
+    this.snapshotTransferPromise = promise;
+    return promise;
+  }
+
+  /** The transfer body itself; state setup/teardown belongs to {@link runSnapshotTransfer}. */
+  private async executeSnapshotTransfer(
+    msg: GetSnapshotMessage | ResumeSnapshotMessage
+  ): Promise<Error | null> {
+    // The socket this transfer belongs to. A reconnect can replace `this.ws`
+    // while the apply unwinds, and the failure path below must not close the
+    // fresh socket in the dead one's name.
+    const socket = this.ws;
+    const reader = new SnapshotStreamReader();
+    this.activeSnapshotReader = reader;
+    this.snapshotEventTablesProcessed = -1;
+    this.droppedChunkWarned = false;
+
+    try {
       this.setStatus({
         status: 'bootstrapping',
         tablesProcessed: 0, totalTables: 0,
         entriesProcessed: 0, totalEntries: 0,
       });
 
-      try {
-        if (!this.send(msg)) {
-          // Socket died before the request left — abandon without starting the
-          // apply; the reconnect path retries.
-          throw new Error('Snapshot request could not be sent (socket not open)');
-        }
+      if (!this.send(msg)) {
+        // Socket died before the request left — abandon without starting the
+        // apply; the reconnect path retries.
+        throw new Error('Snapshot request could not be sent (socket not open)');
+      }
 
-        this.resetSnapshotStallTimer();
-        await this.syncManager.applySnapshotStream(
-          reader.chunks(),
-          progress => this.reportSnapshotProgress(progress)
-        );
+      this.resetSnapshotStallTimer();
+      // NOTE: the apply returns only when the stream ENDS, and only
+      // snapshot_complete ends it — a socket drop between the footer and that
+      // message fails a transfer whose data already landed and whose
+      // checkpoint the footer already cleared, so the next connect
+      // re-bootstraps from scratch. Correct (idempotent), just wasteful; if it
+      // ever shows up in practice, end the stream on the footer instead.
+      await this.syncManager.applySnapshotStream(
+        reader.chunks(),
+        progress => this.reportSnapshotProgress(progress)
+      );
 
-        // The snapshot delivered everything up to its header HLC; record that
-        // as the received watermark so the follow-up get_changes asks for
-        // changes AFTER the snapshot point instead of replaying from nothing.
-        // (applySnapshotStream merges the HLC into the local clock but writes
-        // no peer state — the client owns that.) On a RESUMED transfer this is
-        // conservative: the header carries the original snapshot's HLC while
-        // the data served was read live, so the watermark is older than some
-        // applied data and the catch-up re-fetches a little. That is correct —
-        // re-application is idempotent — and cheaper than the alternative; do
-        // not "fix" it by advancing past the header HLC.
-        if (reader.headerHLC && this.serverSiteId) {
-          await this.syncManager.updatePeerSyncState(this.serverSiteId, reader.headerHLC);
-        }
+      // The snapshot delivered everything up to its header HLC; record that
+      // as the received watermark so the follow-up get_changes asks for
+      // changes AFTER the snapshot point instead of replaying from nothing.
+      // (applySnapshotStream merges the HLC into the local clock but writes
+      // no peer state — the client owns that.) On a RESUMED transfer this is
+      // conservative: the header carries the original snapshot's HLC while
+      // the data served was read live, so the watermark is older than some
+      // applied data and the catch-up re-fetches a little. That is correct —
+      // re-application is idempotent — and cheaper than the alternative; do
+      // not "fix" it by advancing past the header HLC.
+      if (reader.headerHLC && this.serverSiteId) {
+        await this.syncManager.updatePeerSyncState(this.serverSiteId, reader.headerHLC);
+      }
 
-        this.emitSyncEvent('state-change', 'Snapshot bootstrap complete');
-        this.setStatus({ status: 'syncing', progress: 0 });
-        return null;
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
+      this.emitSyncEvent('state-change', 'Snapshot bootstrap complete');
+      this.setStatus({ status: 'syncing', progress: 0 });
+      return null;
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      // A transfer torn down by our own disconnect() is not a failure to
+      // report — the caller asked for it, and onError means "needs attention".
+      if (!this.intentionalDisconnect) {
         this.emitSyncEvent('error', `Snapshot transfer failed: ${error.message}`);
         this.options.onError?.(error);
-        // Close (handlers attached — see doc comment) unless the socket is
-        // already closed, in which case onclose has fired or is in flight.
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.close();
-        }
-        return error;
-      } finally {
-        this.clearSnapshotStallTimer();
-        this.activeSnapshotReader = null;
-        this.snapshotTransferPromise = null;
       }
-    };
-
-    this.snapshotTransferPromise = transfer();
-    return this.snapshotTransferPromise;
+      // Close (handlers attached — see doc comment) unless the socket is
+      // already closed, in which case onclose has fired or is in flight.
+      // `socket.OPEN`, not the global `WebSocket.OPEN`: this runs long after
+      // the transfer started, and a teardown that has since removed the global
+      // (an environment shim, a test harness) would turn this cleanup into a
+      // ReferenceError and break the "never rejects" contract above.
+      if (socket && socket.readyState === socket.OPEN) {
+        socket.close();
+      }
+      return error;
+    }
   }
 
   /** Route one snapshot_chunk to the active transfer. Synchronous — see the dispatch comment. */

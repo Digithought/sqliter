@@ -1085,50 +1085,41 @@ per edit become 1 per burst.
 #### Client snapshot bootstrap
 
 A brand-new device cannot catch up incrementally — "changes since nothing" is not the
-same as receiving the database. `SyncClient` downloads a full copy instead, on **two
-triggers**, both decided on handshake and finished **before** the incremental path
-(`get_changes`, local-change subscription, push) starts:
+database. `SyncClient` downloads a full copy instead, on two triggers, both decided at
+handshake and finished *before* the incremental path (`get_changes`, local-change
+subscription, push) starts:
 
-- **Explicit**: `requestSnapshot()`. Idempotent while a transfer is in flight (a second
-  call joins it; exactly one `get_snapshot` goes on the wire).
-- **Automatic on first connect to an empty replica** (`bootstrapOnEmpty` option,
-  default `true`). "Empty" requires **both**: no peer sync state for the server
-  (never synced with it) **and** no local change facts of its own. The first alone
-  would also match a device holding real local data that merely never met this server —
-  bootstrapping it would clear sync metadata while leaving its rows, i.e. divergence.
-  A device that pre-created its schema locally still counts as empty (schema migration
-  records are not consulted; replicated DDL applies idempotently).
+- `requestSnapshot()`, explicit. Idempotent while a transfer is in flight: a second call
+  joins it, and exactly one `get_snapshot` goes on the wire.
+- An empty replica on first connect (`bootstrapOnEmpty`, default `true`). "Empty"
+  requires **both** no peer sync state for this server and no local change facts of our
+  own — the first alone also matches a device holding real local data that merely never
+  met this server, and bootstrapping that clears its sync metadata while leaving its
+  rows (divergence). A locally pre-created schema still counts as empty; replicated DDL
+  applies idempotently.
 
-The transfer streams `snapshot_chunk` messages through a push-to-pull adapter
-(`SnapshotStreamReader`) into `applySnapshotStream`. On success the client writes the
-snapshot header's HLC as the received watermark (`updatePeerSyncState`), so the
-follow-up `get_changes` asks for changes *after* the snapshot point. Progress is
-surfaced three ways: every tick to `onSnapshotProgress`, mirrored into the
-`bootstrapping` status (`tablesProcessed`/`totalTables`/…), and as a sync event
-throttled to table boundaries.
+Chunks stream through a push-to-pull adapter (`SnapshotStreamReader`) into
+`applySnapshotStream`. On success the client records the header's HLC as the received
+watermark, so the follow-up `get_changes` starts *after* the snapshot point. Progress
+reaches callers three ways: `onSnapshotProgress` (every tick), the `bootstrapping`
+status, and a sync event throttled to table boundaries.
 
-**No local writes during a snapshot.** The apply clears sync metadata and rewrites cell
-records unconditionally — a concurrent local write is silently overwritten and never
-pushed. The client cannot block application writes; what it does instead:
+**Do not write locally while a snapshot lands.** The apply clears sync metadata and
+rewrites cell records unconditionally, so a concurrent write is silently overwritten and
+never pushed; the client cannot block application writes (engine-level barrier:
+`backlog/feat-sync-bootstrap-write-gate`). It holds what it does control — local pushes
+and the peer-relay `request_changes` wait — and *drops* incoming `changes` /
+`push_changes` rather than interleaving them with the rewrite. Nothing is lost: the
+watermark stays put, so the post-bootstrap catch-up re-fetches them.
 
-- incoming `changes` / `push_changes` are **dropped** (not applied) during the transfer —
-  nothing is lost, since the watermark is untouched and the post-bootstrap `get_changes`
-  re-fetches everything past the snapshot HLC;
-- local pushes and the peer-relay `request_changes` path are held;
-- `isBootstrapping` / the `bootstrapping` status expose the window so callers can hold
-  writes. (An engine-level write barrier is future work:
-  `backlog/feat-sync-bootstrap-write-gate`.)
-
-**Partial data is durable and detectable.** An interrupted apply leaves a snapshot
-checkpoint (`sc:` record) behind; `hasPendingSnapshot()` — usable before ever
-connecting, e.g. at app startup — reports it, and the next handshake finds it and sends
-`resume_snapshot` with the serialized checkpoint (newest by `createdAt`; superseded ones
-are cleared). There is **no dedicated retry machinery**: a failed or stalled transfer
-(no chunk within `snapshotChunkTimeoutMs`, default 60 s) simply closes the socket, the
-existing reconnect backoff paces the retry, and the next handshake resumes from the
-checkpoint. A resumed stream's header carries the *original* snapshot's HLC while its
-data is read live, so the watermark written at the end is conservative and the catch-up
-re-fetches a little — correct, since re-application is idempotent.
+An interrupted apply leaves a checkpoint (`sc:` record) marking the data partial.
+`hasPendingSnapshot()` reports one before connecting (e.g. at app startup), and the next
+handshake sends `resume_snapshot` with it — newest by `createdAt`, superseded ones
+cleared. There is **no dedicated retry machinery**: a failed or stalled transfer (no
+chunk within `snapshotChunkTimeoutMs`, default 60 s) closes the socket, and the existing
+reconnect backoff paces the retry. A resumed stream's header carries the *original*
+snapshot's HLC while its data is read live, so the final watermark is deliberately
+conservative — the catch-up re-fetches a little, which is idempotent.
 
 ## Reactive Hooks
 

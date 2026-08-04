@@ -197,6 +197,13 @@ class MockSyncManager implements SyncManager {
   appliedSnapshotChunks: SnapshotChunk[] = [];
   /** When set, applySnapshotStream throws before consuming anything — models the engine's pre-apply gates (wire-format mismatch, clock drift). */
   applySnapshotStreamError: Error | null = null;
+  /**
+   * Delay (ms) between the stream throwing and applySnapshotStream rethrowing —
+   * models a real apply that takes a while to unwind an abort (a store flush in
+   * flight). Lets a test land a reconnect while the prior transfer is still
+   * settling.
+   */
+  applyUnwindDelayMs = 0;
   /** Monotonic createdAt for mock checkpoints, so "newest" is deterministic. */
   private checkpointSeq = 0;
 
@@ -213,7 +220,21 @@ class MockSyncManager implements SyncManager {
     onProgress?: (progress: SnapshotProgress) => void
   ): Promise<void> {
     if (this.applySnapshotStreamError) throw this.applySnapshotStreamError;
+    if (this.applyUnwindDelayMs > 0) {
+      try {
+        return await this.consumeSnapshotStream(chunks, onProgress);
+      } catch (err) {
+        await new Promise(r => setTimeout(r, this.applyUnwindDelayMs));
+        throw err;
+      }
+    }
+    return this.consumeSnapshotStream(chunks, onProgress);
+  }
 
+  private async consumeSnapshotStream(
+    chunks: AsyncIterable<SnapshotChunk>,
+    onProgress?: (progress: SnapshotProgress) => void
+  ): Promise<void> {
     let snapshotId = '';
     let totalTables = 0;
     let tablesProcessed = 0;
@@ -382,7 +403,7 @@ async function connectAndHandshake(
   const ws = MockWebSocket.lastInstance!;
   ws.simulateOpen();
 
-  // Simulate handshake ack BEFORE awaiting Ã¢â‚¬â€ connect() waits for handshake_ack
+  // Simulate handshake ack BEFORE awaiting — connect() waits for handshake_ack
   const sId = serverSiteId ?? generateSiteId();
   ws.simulateMessage({
     type: 'handshake_ack',
@@ -1865,6 +1886,64 @@ describe('SyncClient', () => {
 
       expect(syncManager.appliedSnapshotChunks.map(c => c.type))
         .to.deep.equal(['header', 'table-start', 'table-end', 'footer']);
+    });
+
+    it('does not wedge isBootstrapping when the snapshot request cannot be sent', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
+
+      const connectPromise = client.connect('ws://localhost:8080/sync', 'test-db');
+      const ws = MockWebSocket.lastInstance!;
+      ws.simulateOpen();
+      simulateHandshakeAck(ws);
+      await connectPromise;
+      // The socket dies while maybeBootstrap is still probing the local store,
+      // so the get_snapshot never leaves — the transfer fails before its first
+      // await, i.e. entirely synchronously.
+      ws.simulateClose();
+      await new Promise(r => setTimeout(r, 20));
+
+      expect(ws.getSentMessages().some(m => m.type === 'get_snapshot')).to.be.false;
+      // The failed transfer must not pin the client in the bootstrapping state:
+      // that would gate every push and drop every incoming change forever.
+      expect(client.isBootstrapping).to.be.false;
+
+      // And a later connection bootstraps normally rather than replaying the
+      // dead transfer's error.
+      const ws2 = await connectAndHandshake(client, serverSite);
+      expect(ws2.getSentMessages().some(m => m.type === 'get_snapshot')).to.be.true;
+      streamSnapshot(ws2, snapshotChunks(serverSite, hlcAt(9000n, serverSite)));
+      await new Promise(r => setTimeout(r, 30));
+      expect(client.isBootstrapping).to.be.false;
+      expect(syncManager.appliedSnapshotChunks.length).to.equal(4);
+    });
+
+    it('resumes on the new socket when the dropped transfer is still unwinding', async () => {
+      const syncManager = new MockSyncManager();
+      const serverSite = generateSiteId();
+      // The apply takes 150ms to unwind its abort — longer than the 100ms
+      // reconnect delay, so the next handshake lands mid-unwind.
+      syncManager.applyUnwindDelayMs = 150;
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true, autoReconnect: true });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      const chunks = snapshotChunks(serverSite, hlcAt(9000n, serverSite));
+      ws.simulateMessage({ type: 'snapshot_chunk', chunk: chunks[0] });
+      await new Promise(r => setTimeout(r, 10));
+      ws.simulateClose();
+
+      await new Promise(r => setTimeout(r, 150));
+      const ws2 = MockWebSocket.lastInstance!;
+      expect(ws2).to.not.equal(ws);
+      ws2.simulateOpen();
+      simulateHandshakeAck(ws2);
+      await new Promise(r => setTimeout(r, 250));
+
+      // The stale transfer neither claimed this handshake's outcome nor closed
+      // the fresh socket: the resume went out on it.
+      expect(ws2.getSentMessages().map(m => m.type)).to.include('resume_snapshot');
+      expect(ws2.readyState).to.equal(MockWebSocket.OPEN);
     });
 
     it('reports progress via onSnapshotProgress, status, and table-boundary events', async () => {
