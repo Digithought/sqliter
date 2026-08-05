@@ -90,11 +90,10 @@ export interface Layer {
 	 * The count NEVER decrements. There is no layer-destruction hook to decrement from,
 	 * and `MemoryTableManager.connections` cannot stand in as a liveness registry: its
 	 * `disconnect` removes connections that are still live and are committed later
-	 * (`MemoryTable.ensureConnection` reuses exactly such a connection — see its comment
-	 * at `table.ts:95-110`). So the signal has to live on the layer, and it errs
-	 * conservatively: collapse fires only on a head that has *never* had a child derived
-	 * from it, which is precisely the quiescent case where detaching it changes no other
-	 * tree's `chainVersion()`.
+	 * (`MemoryTable.ensureConnection` reuses exactly such a connection). So the signal has to
+	 * live on the layer, and it errs conservatively: collapse fires only on a head that has
+	 * *never* had a child derived from it, which is precisely the quiescent case where
+	 * detaching it changes no other tree's `chainVersion()`.
 	 */
 	hasDerivedChildren(): boolean;
 }

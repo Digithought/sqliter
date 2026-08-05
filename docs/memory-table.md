@@ -24,7 +24,7 @@ The `MemoryTable` implementation (`src/vtab/memory/`) provides a sophisticated, 
 *   **Backend Library:** Uses the `inheritree` library (fork of `digitree`) for efficient, sorted storage with copy-on-write inheritance
 *   **Inheritance Model:** Each `TransactionLayer` creates BTrees that inherit from their parent layer's BTrees, providing automatic data propagation without complex change tracking
 *   **Copy-on-Write:** Modifications in child layers only copy pages when necessary, sharing immutable pages with parent layers
-*   **Layer Promotion:** The `clearBase()` method allows transaction layers to become independent, supporting efficient layer collapse — but **only for a layer no other layer has ever derived from**. `clearBase()` drops the base pointer, which removes the base's contribution from inheritree's chain-version total; every tree already built over the promoted one snapshotted that total, so each fails its next base check with `MutatedBaseError` even though no row moved. (The detached tree also keeps sharing nodes by identity with its former base, so base-immutability outlives the call.) `Layer.hasDerivedChildren()` is the precondition — see [Layer Collapse](#mvcc-transaction-support) below
+*   **Layer Promotion:** The `clearBase()` method makes a transaction layer independent of its base, supporting layer collapse — legal **only for a layer nothing has ever derived from**; see [Layer Management](#layer-management)
 
 ## **Key Features:**
 
@@ -32,7 +32,7 @@ The `MemoryTable` implementation (`src/vtab/memory/`) provides a sophisticated, 
 *   **Isolation:** Each connection sees a consistent snapshot of data throughout its transaction
 *   **Concurrency:** Multiple connections can read/write simultaneously with proper isolation
 *   **Savepoints:** Full support for nested savepoints within transactions (`SAVEPOINT`, `ROLLBACK TO`, `RELEASE`)
-*   **Layer Collapse:** Automatic promotion and cleanup of committed layers when safe. "Safe" is two conditions, both required: no attached connection's read or pending chain reaches the layer below the head, **and** the head itself has never had a child layer derive BTrees from it (`Layer.hasDerivedChildren()`). The second is the load-bearing one — the manager's connection map is not an authoritative liveness registry, because `disconnect` detaches connections that stay registered on the `Database` and are committed later. The derived-child count is set by the `TransactionLayer` constructor and never decremented (there is no layer-destruction hook), so collapse fires only on a quiescent head; a promotion that needs to reclaim a chain under live children would have to copy (`BTree.flatten()`), not detach
+*   **Layer Collapse:** Automatic promotion and cleanup of committed layers when safe — two required conditions, both in [Layer Management](#layer-management)
 
 #### Commit and sibling-layer rebase
 
@@ -184,9 +184,28 @@ await db.exec("alter table users rename column created_at to registration_date")
 
 ### **Layer Management:**
 *   **Connection Isolation:** Each connection maintains its own read layer and optional pending transaction layer
-*   **Automatic Promotion:** Committed transaction layers are automatically promoted when no longer referenced
+*   **Automatic Promotion:** `MemoryTableManager.tryCollapseLayers` (run on `disconnect`) promotes the committed head when both conditions below hold
 *   **Lock-Free Reads:** Read operations don't require locks, using the connection's current layer view
 *   **Efficient Writes:** Write operations use inherited BTrees to minimize data copying
+
+Promotion means `clearBase()` on the head's BTrees: the head stops inheriting, and the chain
+below it becomes releasable. It is safe only when **both** hold:
+
+1.  **No attached connection's read or pending chain reaches the head's parent** —
+    `isLayerInUse` walks both chains to the chain root.
+2.  **Nothing has ever derived a BTree from the head itself** — `Layer.hasDerivedChildren()`.
+
+The second condition is the load-bearing one. `clearBase()` drops the base pointer, which removes
+the base's contribution from inheritree's chain-version total — the total every tree already built
+over the head snapshotted at construction — so each such tree fails its next base check with
+`MutatedBaseError` even though no row moved. (The detached tree also goes on sharing nodes by
+identity with its former base, so base-immutability outlives the call.) The first condition cannot
+stand in for it: the manager's connection map is not an authoritative liveness registry, because
+`disconnect` detaches connections that stay registered on the `Database` and commit later.
+
+The derived-child flag is set by the `TransactionLayer` constructor and never cleared (there is no
+layer-destruction hook), so collapse fires only on a head no writer has moved past. Reclaiming a
+chain under live children would have to copy (`BTree.flatten()`) rather than detach.
 
 ### **Index Consistency:**
 *   **Unified Updates:** Primary and secondary index updates are handled uniformly during mutations
@@ -215,7 +234,7 @@ a full scan that applies the constraint's own predicate and collations — slowe
 ### **Memory Management:**
 *   **Copy-on-Write Pages:** Only modified pages are copied, sharing immutable pages across layers
 *   **Automatic Cleanup:** Unused layers are automatically garbage collected when no longer referenced
-*   **Base Clearing:** The `clearBase()` operation makes layers independent, reducing memory overhead
+*   **Base Clearing:** The `clearBase()` operation makes a layer independent, releasing its ancestors — subject to the two promotion conditions in [Layer Management](#layer-management)
 
 ## DDL and transactions
 

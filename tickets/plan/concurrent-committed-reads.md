@@ -51,6 +51,12 @@ already built:
   cover committed-read semantics inside deferred constraint checks; whether a
   committed read stays non-blocking while a distributed commit is stalled is a
   verification item tracked in that repo, not assumed here.
+- **Second external implementation**: the Lamina vtab module (separate repo)
+  also honours `_readCommitted` today — its `LaminaModule.connect` maps the
+  flag onto the table and the read path bypasses the in-transaction staged
+  overlay. See "What honouring `_readCommitted` today does NOT guarantee"
+  below: that implementation, like the memory vtab's, is only correct because
+  the mutex currently guarantees no read overlaps a commit.
 - **Read-without-joining-transaction precedent**: deferred-constraint
   evaluation already registers connections that skip `begin()`
   (`Database.registerConnection`, the `isEvaluatingDeferredConstraints` gate).
@@ -60,7 +66,86 @@ already built:
   whether concurrent reads are safe per connection.
 
 What is missing is engine plumbing: routing eligible reads around the mutex and
-onto committed-read connections.
+onto committed-read connections — plus a sharpened module contract (next
+section).
+
+## What honouring `_readCommitted` today does NOT guarantee
+
+Reviewing the Lamina adapter against this plan surfaced a gap that applies to
+*every* module already claiming `_readCommitted` support, including the
+in-tree memory vtab. Today the flag means only "do not show me the writer's
+staged rows". It says nothing about **when** the underlying committed state is
+read, because under the current mutex a read can never overlap a commit. Once
+reads run concurrently, "read the committed store directly" and "read a
+*consistent* committed state" stop being the same statement.
+
+Concretely, a module whose commit publishes its new state incrementally —
+per-column, per-index, per-chunk, or by mutating live structures in place
+rather than flipping one root at the end — will let a concurrent reader
+observe a half-applied commit:
+
+- a row present in one column's structure and absent in another (torn row on
+  `select *`);
+- base rows materialized while the corresponding secondary/compound index
+  entries are not yet built, so an *index-driven* plan silently returns fewer
+  rows than a full scan of the same snapshot;
+- for modules that deliberately split one logical write into several atomic
+  units, a partially-applied write.
+
+Lamina hits all three: its per-column stores are mutated in place under the
+writer's write context, and its index maintenance drains after the cell
+writes. Its snapshot machinery (point-in-time reads keyed by a logical clock)
+can answer this correctly, but the current `_readCommitted` branch does not
+use it — it reads the live structures.
+
+So the module contract this plan depends on has to be stated as a **snapshot**
+obligation, not a staged-rows-bypass obligation:
+
+> A connection opened with `_readCommitted` must serve a state that is
+> consistent as of some commit boundary at or before the moment the read
+> began, and must keep serving that same state for the life of the scan —
+> including across a concurrent writer's commit landing mid-iteration, and
+> including across index-driven access paths.
+
+Two acceptable implementation shapes: pin a snapshot at scan start, or publish
+committed state atomically at end-of-commit so a live read can never observe a
+partial one. Modules that can do neither must decline the concurrent path (see
+`VtabConcurrencyMode` below) rather than answer with a torn snapshot.
+
+Action items this adds to the plan:
+
+- State the obligation above in the module-authoring docs for
+  `_readCommitted`, not just "skips the pending transaction layer".
+- Audit the in-tree memory vtab against it: does starting at `readLayer`
+  remain coherent if the writer's commit publishes to that layer in steps?
+- Make `VtabConcurrencyMode` the fail-closed switch: a module that cannot meet
+  the snapshot obligation declares itself serial-only and the engine routes
+  its reads down the existing serialized path.
+
+## Module connection registry: broadcasts must not reach read connections
+
+The plan already says a concurrent read must never reuse the writer's
+registered connection and must never call `_finalizeImplicitTransaction`. The
+Lamina adapter shows why that has to be enforced on the *engine* side rather
+than left to each module: its per-connection transaction state is keyed by
+`Database`, not by connection, and sibling connections cooperate idempotently
+on one shared transaction. A committed-read connection that lands in the same
+registry would receive `begin` / `commit` / `rollback` / savepoint broadcasts
+and drive the *writer's* transaction; symmetrically, that connection
+disconnecting at end-of-statement would tear down per-database transaction
+state the writer still owns. Any module using a per-database (rather than
+per-connection) transaction map has the same exposure.
+
+Requirements this adds:
+
+- Committed-read connections are held in a registry the transactional
+  broadcasts (`begin`/`commit`/`rollback`/`savepoint*`) never walk — not
+  merely filtered at each broadcast site, since a new broadcast site added
+  later would silently reacquire the bug.
+- Their disconnect must not trigger last-connection teardown of shared
+  per-database state owned by the writer.
+- `Database.close()` with concurrent reads in flight disposes them without
+  double-disconnect and without releasing a writer-held resource.
 
 ## Required behavior
 
@@ -123,6 +208,40 @@ The persistent store stack must be first-class in this work, not assumed:
   serialized (inside `BEGIN`) or concurrent (autocommit) — the
   committed-read flag must therefore bind at execution, not bake into the
   cached plan the way `committed.` references do.
+- **Where the flag binds, given modules resolve it at `connect`.** The
+  bind-at-execution requirement above collides with how `_readCommitted` is
+  actually delivered: it rides `connect`'s options dictionary, so modules
+  (Lamina and the isolation layer both do this) read it once at connect and
+  store it on the table instance. "Bind at execution" therefore means "open a
+  *different connection* at execution", and each such connection can be
+  expensive — Lamina's takes a refcounted database handle per connection.
+  Settle one of:
+    (a) per-statement committed-read connection, opened and disposed around
+        the scan (simple, correct, costs a connect per statement);
+    (b) a cached committed-read connection per (database, table), disposed at
+        database close (cheap steady-state, needs an eviction/invalidation
+        story on schema change and a refcount that survives overlapping
+        concurrent reads);
+    (c) carry the flag on the scan call rather than on `connect`, so one
+        connection can serve both modes — the largest module-contract change
+        of the three, and it forces every module to make the decision
+        per-scan.
+  Whichever is chosen, the concurrent path must not acquire the connection
+  from the same pool the writer's connection came from (see the registry
+  section above).
+- Interaction with `committed.<table>` and any module-specific temporal
+  qualifier (`AS OF`-style historical reads, change-stream reads). Lamina's
+  current `_readCommitted` branch bypasses temporal scope entirely, and its
+  change-stream scope is not a row fold at all. Define precedence explicitly:
+  which wins when a statement is both opted into concurrent reads and carries
+  a temporal qualifier, and which qualifiers make a statement ineligible for
+  the concurrent path.
+- Whether the engine exposes a "reads are currently unsafe" signal a module
+  can raise mid-flight. Lamina can enter a poisoned state when a commit fails
+  between its durable log append and its projection apply; a concurrent reader
+  holding a snapshot from before that point is arguably still correct, but
+  new concurrent reads afterwards are not. Decide whether fail-closed here is
+  the module's job or the engine's.
 - Planning-vs-DDL race: a concurrent read plans against `SchemaManager` while
   a DDL statement may be mid-mutation. Note public `db.prepare()` already
   parses without the mutex, so the race class is not new, but decide the
@@ -149,7 +268,15 @@ The persistent store stack must be first-class in this work, not assumed:
 - Writer rollback while a concurrent read is mid-iteration — read result must
   stay a coherent committed snapshot.
 - DDL executing while a concurrent read is planning (see the schema gate
-  decision above).
+  decision above). Note the module-side half: a module may mutate its own
+  catalogue and per-table caches during DDL (Lamina clears a shared per-table
+  scan-plan registry on schema refresh), so the schema gate has to cover the
+  module's structures too, not only `SchemaManager`.
+- A concurrent read whose plan uses a secondary or compound index while a
+  writer's commit is between "base rows applied" and "index entries applied"
+  — must not return a short result set (see the snapshot obligation above).
+- A writer's commit that fails partway and leaves the module in a degraded or
+  poisoned state while concurrent reads are mid-iteration.
 - `Database.close()` while concurrent reads are in flight — connection scope
   disposal must not leak or double-disconnect.
 - A mixed batch (`select; insert; select`) with the opt-in set — not
@@ -181,4 +308,11 @@ The persistent store stack must be first-class in this work, not assumed:
   concurrent path explicitly; each declares an accurate `VtabConcurrencyMode`.
 - Docs updated where the serialization contract is stated (`database.ts`
   mutex comment, module authoring docs for `_readCommitted` +
-  `VtabConcurrencyMode`).
+  `VtabConcurrencyMode`), including the snapshot obligation — stated as a
+  requirement out-of-tree module authors can implement against, since at
+  least two out-of-tree modules (optimystic, Lamina) already claim
+  `_readCommitted` support under the weaker reading.
+- An engine-level conformance test a module author can run against their own
+  module: with a commit artificially stalled mid-publish, a committed read
+  returns a snapshot that is self-consistent across columns and across
+  index-driven vs. full-scan access paths.

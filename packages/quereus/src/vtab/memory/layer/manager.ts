@@ -540,6 +540,12 @@ export class MemoryTableManager {
 		// `pendingTransactionLayer`, so the narrower test dropped a connection that was still
 		// reading — and writing, at commit — a live layer, hiding it from `isLayerInUse` while
 		// the collapse below ran.
+		//
+		// NOTE: deferral has no timeout, so a transaction abandoned without commit or rollback
+		// keeps this connection — and the layer chain it reads — reachable for the table's
+		// lifetime. The same was already true of an abandoned pending layer; if abandoned
+		// transactions ever show up as a leak, the fix is a reaper over `connections`, not a
+		// narrower test here.
 		if (connection.hasOpenWork()) {
 			logger.debugLog(`[Disconnect] Deferring disconnect of connection ${connectionId} while transaction pending for ${this._tableName}`);
 			return;
@@ -923,15 +929,9 @@ export class MemoryTableManager {
 		// by calling clearBase() on its BTrees, effectively making it the new base data
 		layerToPromote.clearBase();
 
-		// Update connections that were reading from the collapsed parent layer
-		for (const conn of this.connections.values()) {
-			if (conn.readLayer === parentLayer) {
-				// Update connections to read from the now-independent transaction layer
-				conn.readLayer = layerToPromote;
-				logger.debugLog(`[Collapse] Connection ${conn.connectionId} updated to read from independent layer ${layerToPromote.getLayerId()}`);
-			}
-		}
-
+		// No connection needs re-pointing off `parentLayer`: `isLayerInUse` above returns true
+		// for a connection whose read or pending chain reaches it — reading it directly
+		// included — so reaching here proves no attached connection holds it.
 		logger.debugLog(`[Collapse] Layer ${layerToPromote.getLayerId()} is now independent for ${this._tableName}`);
 		return true;
 	}
