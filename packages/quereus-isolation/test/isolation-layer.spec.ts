@@ -4341,11 +4341,12 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 
 	// `readCommittedSnapshot` is a module's promise that a `_readCommitted`
 	// connection serves a stable committed snapshot for the life of the scan. The
-	// wrapper declines it unconditionally — it does NOT inherit the underlying's
-	// value — because `connect` memoizes one underlying handle per (schema, table)
-	// and re-serves it, so a committed read runs on the writer's handle and can
-	// observe the overlay flush half-applied. See
-	// `tickets/fix/bug-isolation-committed-read-shares-writer-handle`.
+	// wrapper MIRRORS the underlying: a `_readCommitted` connect opens its own
+	// dedicated underlying handle (never the memoized writer handle) and the read
+	// bypasses the overlay entirely, so the wrapper adds no tearing window of its
+	// own. It still cannot promise more than the underlying delivers — an underlying
+	// that ignores `_readCommitted` (the store stack) hands back a handle
+	// indistinguishable from the writer's.
 	describe('readCommittedSnapshot', () => {
 		/** Module stub declaring (or omitting) only `readCommittedSnapshot`. */
 		function snapshotStub(readCommittedSnapshot?: boolean): VirtualTableModule<any, any> {
@@ -4354,13 +4355,21 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			return m as unknown as VirtualTableModule<any, any>;
 		}
 
-		it('is false even over a snapshot-safe underlying', () => {
-			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
-			expect(iso.readCommittedSnapshot).to.equal(false);
-			expect(getModuleReadCommittedSnapshot(iso)).to.equal(false);
+		/** Live connection count on the memory manager backing `<schema>.<table>`. */
+		function managerConnectionCount(memory: MemoryTableModule, schemaName: string, tableName: string): number {
+			const manager = memory.tables.get(`${schemaName}.${tableName}`.toLowerCase())!;
+			return (manager as unknown as { connections: Map<number, unknown> }).connections.size;
+		}
 
+		it('mirrors a snapshot-safe underlying', () => {
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			expect(iso.readCommittedSnapshot).to.equal(true);
+			expect(getModuleReadCommittedSnapshot(iso)).to.equal(true);
+
+			// The overlay does NOT enter the expression — committed reads bypass it — but a
+			// snapshot-safe overlay must not change the answer either.
 			const stubbed = new IsolationModule({ underlying: snapshotStub(true), overlay: snapshotStub(true) });
-			expect(getModuleReadCommittedSnapshot(stubbed)).to.equal(false);
+			expect(getModuleReadCommittedSnapshot(stubbed)).to.equal(true);
 		});
 
 		it('is false over an underlying that omits or declines the flag', () => {
@@ -4368,14 +4377,12 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(getModuleReadCommittedSnapshot(new IsolationModule({ underlying: snapshotStub(false) }))).to.equal(false);
 		});
 
-		// The reason the flag is false, made executable. `commitConnectionOverlays`
-		// applies staged rows into the underlying (Phase 1: begin + row-by-row) and
-		// only commits afterwards (Phase 2); a `_readCommitted` IsolatedTable delegates
-		// its query to that SAME memoized handle, so a read landing between the phases
-		// sees the batch half-applied. When the wrapper learns to open its own
-		// `_readCommitted` underlying connection, this test flips to asserting the
-		// pre-flush row set and the declaration above flips to true.
-		it('a committed read shares the writer underlying handle, so a mid-flush read tears', async () => {
+		// Regression guard for `bug-isolation-committed-read-shares-writer-handle`.
+		// `commitConnectionOverlays` applies staged rows into the underlying (Phase 1:
+		// begin + row-by-row) and only commits afterwards (Phase 2). A committed read
+		// that delegated to that SAME memoized handle saw the batch half-applied (3
+		// rows). With its own `_readCommitted` handle it sees the committed layer only.
+		it('a committed read runs on its own handle, so a mid-flush read does not tear', async () => {
 			const db = new Database();
 			const mod = new IsolationModule({ underlying: new MemoryTableModule() });
 			db.registerModule('iso_snap', mod);
@@ -4395,49 +4402,122 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			await reader.disconnect();
 			await db.close();
 
-			expect(rows.length, 'today the committed read observes the half-applied batch').to.equal(3);
+			expect(rows.length, 'the committed read sees the pre-flush committed row set').to.equal(2);
 		});
 
-		/**
-		 * Flip to `true` together with `IsolationModule.readCommittedSnapshot` when
-		 * `fix/bug-isolation-committed-read-shares-writer-handle` lands. The case
-		 * below then stops asserting the harness's refusal and starts asserting a
-		 * full conformance pass — a wrapper whose snapshot safety depends on its own
-		 * commit path, not on the module beneath it, is the most valuable in-tree
-		 * case the harness can run.
-		 */
-		const ISOLATION_SERVES_COMMITTED_SNAPSHOT = false;
+		it('a committed connect neither returns nor installs the memoized writer handle', async () => {
+			const db = new Database();
+			const mod = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('iso_handle', mod);
+			await db.exec('CREATE TABLE h (id INTEGER PRIMARY KEY, v TEXT) USING iso_handle');
+			await db.exec(`INSERT INTO h VALUES (1, 'a')`);
 
-		it('the conformance harness refuses the wrapper today (one flag flip from asserting a pass)', async () => {
+			const writerHandle = mod.getUnderlyingState('main', 'h')!.underlyingTable;
+			const reader = await mod.connect(db, undefined, 'iso_handle', 'main', 'h', { _readCommitted: true } as never);
+
+			expect((reader as unknown as { underlyingTable: VirtualTable }).underlyingTable,
+				'committed read must not share the writer handle').to.not.equal(writerHandle);
+			expect(mod.getUnderlyingState('main', 'h')!.underlyingTable,
+				'the memo must be left pointing at the writer handle').to.equal(writerHandle);
+
+			await reader.disconnect();
+			await db.close();
+		});
+
+		// Arm 2 of the bug: a committed read arriving as the FIRST connect for a table used
+		// to memoize a `_readCommitted` underlying, which every later reader AND writer then
+		// got back — and a committed-snapshot memory table throws `Cannot modify
+		// committed-state snapshot` on `update()`. The committed path no longer reads or
+		// writes the memo, so the memo stays empty and the later write connects its own
+		// writable handle. The rename round-trip is what evicts the memo installed by CREATE.
+		it('a committed read as the first access leaves the memo empty and does not poison later writes', async () => {
+			const db = new Database();
+			const mod = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('iso_first', mod);
+			await db.exec('CREATE TABLE fa (id INTEGER PRIMARY KEY, v TEXT) USING iso_first');
+			await db.exec(`INSERT INTO fa VALUES (1, 'a')`);
+
+			await db.exec('ALTER TABLE fa RENAME TO fa2');
+			await db.exec('ALTER TABLE fa2 RENAME TO fa');
+			expect(mod.getUnderlyingState('main', 'fa'), 'rename must have evicted the memo').to.equal(undefined);
+
+			const reader = await mod.connect(db, undefined, 'iso_first', 'main', 'fa', { _readCommitted: true } as never);
+			expect(await asyncIterableToArray(reader.query!(makeFullScanFilterInfo()))).to.have.length(1);
+			expect(mod.getUnderlyingState('main', 'fa'), 'a committed connect must not install a memo').to.equal(undefined);
+			await reader.disconnect();
+
+			// The write path must get a writable handle, not the committed snapshot.
+			await db.exec(`INSERT INTO fa VALUES (2, 'b')`);
+			const rows = await asyncIterableToArray(db.eval('select id from fa order by id'));
+			expect(rows.map(r => r.id)).to.deep.equal([1, 2]);
+
+			await db.close();
+		});
+
+		it('disconnect releases the committed handle back to the memory manager', async () => {
+			const db = new Database();
+			const memory = new MemoryTableModule();
+			const mod = new IsolationModule({ underlying: memory });
+			db.registerModule('iso_release', mod);
+			await db.exec('CREATE TABLE rel (id INTEGER PRIMARY KEY, v TEXT) USING iso_release');
+			await db.exec(`INSERT INTO rel VALUES (1, 'a')`);
+
+			const before = managerConnectionCount(memory, 'main', 'rel');
+
+			const reader = await mod.connect(db, undefined, 'iso_release', 'main', 'rel', { _readCommitted: true } as never);
+			// The manager connection (and its pinned read layer) is created at the first pull.
+			await asyncIterableToArray(reader.query!(makeFullScanFilterInfo()));
+			expect(managerConnectionCount(memory, 'main', 'rel'),
+				'the committed scan pins a manager connection').to.equal(before + 1);
+
+			await reader.disconnect();
+			expect(managerConnectionCount(memory, 'main', 'rel'),
+				'disconnect must release the pinned layer').to.equal(before);
+
+			await db.close();
+		});
+
+		it('createConnection is refused on a committed-snapshot instance', async () => {
+			const db = new Database();
+			const mod = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('iso_conn', mod);
+			await db.exec('CREATE TABLE cc (id INTEGER PRIMARY KEY, v TEXT) USING iso_conn');
+
+			const reader = await mod.connect(db, undefined, 'iso_conn', 'main', 'cc', { _readCommitted: true } as never);
+			expect(() => reader.createConnection()).to.throw(QuereusError, /must not join the writer/);
+
+			// The normal (writer) path is unaffected.
+			const writer = await mod.connect(db, undefined, 'iso_conn', 'main', 'cc', {} as never);
+			expect(() => writer.createConnection()).to.not.throw();
+
+			await reader.disconnect();
+			await db.close();
+		});
+
+		// NOTE: this case is NOT the regression guard for the shared-handle tear — the tear
+		// test above is. `installCommitStall` parks a connection at the ENTRY to `commit()`,
+		// which for the wrapper is before `commitConnectionOverlays` starts its Phase-1 apply,
+		// so the reader never overlaps the wrapper's own publish window. Verified: with the
+		// committed-handle branch disabled the harness still passes here. If the harness ever
+		// needs to exercise a wrapper's multi-phase publish, it needs a gate that parks INSIDE
+		// the module's commit, not ahead of it.
+		it('the conformance harness passes against the wrapper', async () => {
 			const db = new Database();
 			const stall = installCommitStall(db);
 			db.registerModule('iso_conf', new IsolationModule({ underlying: new MemoryTableModule() }));
 			await db.exec('CREATE TABLE iso_conf_t (id INTEGER PRIMARY KEY, v TEXT) USING iso_conf');
 
-			const run = () => runCommittedReadConformance({
-				db,
-				table: 'iso_conf_t',
-				keyColumn: 'id',
-				valueColumn: 'v',
-				rowCount: 20,
-				stallCommit: () => stall.asStallCommit(),
-			});
-
 			try {
-				if (ISOLATION_SERVES_COMMITTED_SNAPSHOT) {
-					const result = await run();
-					expect(result.observedCommitOverlap).to.equal(true);
-					expect(result.fullScanRows).to.equal(20);
-				} else {
-					let message = '';
-					try {
-						await run();
-					} catch (e) {
-						message = e instanceof Error ? e.message : String(e);
-					}
-					expect(message, 'the harness refuses a module that declines the flag')
-						.to.contain('readCommittedSnapshot');
-				}
+				const result = await runCommittedReadConformance({
+					db,
+					table: 'iso_conf_t',
+					keyColumn: 'id',
+					valueColumn: 'v',
+					rowCount: 20,
+					stallCommit: () => stall.asStallCommit(),
+				});
+				expect(result.observedCommitOverlap).to.equal(true);
+				expect(result.fullScanRows).to.equal(20);
 			} finally {
 				stall.release();
 				await db.close();

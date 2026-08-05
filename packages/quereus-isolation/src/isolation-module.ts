@@ -281,29 +281,30 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Declines the engine's concurrent committed-read path, whatever the underlying
-	 * declares. Not an inheritance of the underlying's value: the wrapper adds a
-	 * tearing window of its own that no underlying can close.
+	 * Mirrors the underlying module's committed-snapshot promise. The wrapper adds no
+	 * tearing window of its own: a `_readCommitted` connect opens a DEDICATED underlying
+	 * handle (see {@link connect}) and `IsolatedTable.query`'s fast path delegates
+	 * straight to it, so a committed read never runs on the writer's memoized handle and
+	 * never observes the overlay flush half-applied.
 	 *
-	 * `connect` memoizes ONE underlying `VirtualTable` per (schema, table) and
-	 * re-serves it to every caller, so the `_readCommitted` connect option never
-	 * reaches the underlying for any connect after the first. A committed read's
-	 * `IsolatedTable.query` therefore delegates to the WRITER's underlying handle —
-	 * and `commitConnectionOverlays` flushes staged rows through that same handle
-	 * incrementally (Phase 1 begins it and applies row by row; Phase 2 commits), so
-	 * a read overlapping the flush observes a partially applied batch. Verified
-	 * against a memory underlying: a scan taken between the Phase-1 apply and the
-	 * Phase-2 commit returns the half-written row set.
+	 * Stays a function of the underlying because an underlying that IGNORES
+	 * `_readCommitted` (the store stack — its `connect` re-serves one cached table per
+	 * key) hands back a handle indistinguishable from the writer's, and the wrapper must
+	 * not claim snapshot safety it cannot deliver. Making store itself snapshot-safe is
+	 * `backlog/feat-store-committed-snapshot-reads`.
 	 *
-	 * Lifting this needs the wrapper to open its OWN `_readCommitted` underlying
-	 * connection for committed reads rather than sharing the memoized handle — see
-	 * `tickets/fix/bug-isolation-committed-read-shares-writer-handle`. Until then
-	 * the whole stack stays on the serialized read path, which is the fail-closed
-	 * outcome.
+	 * The overlay module deliberately does NOT enter this expression — committed reads
+	 * bypass the overlay entirely, so its own snapshot behaviour is irrelevant. Unlike
+	 * {@link concurrencyMode}, which is the weaker-of because merged reads touch both.
+	 *
+	 * A getter, not a stored field, for the same reason as `concurrencyMode`: the value
+	 * is read live off the underlying each plan.
 	 *
 	 * See `docs/module-authoring.md` § "Committed-Snapshot Reads (`_readCommitted`)".
 	 */
-	readonly readCommittedSnapshot = false as const;
+	get readCommittedSnapshot(): boolean {
+		return this.underlying.readCommittedSnapshot === true;
+	}
 
 	/**
 	 * Gets the underlying table state for a table.
@@ -787,6 +788,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * - The overlay table (with the same connection/transaction context)
 	 *
 	 * The overlay is created lazily on first write.
+	 *
+	 * A committed-snapshot connect (`_readCommitted`) is the one exception: it gets its
+	 * OWN underlying handle and never touches `underlyingTables` — see below.
 	 */
 	async connect(
 		db: Database,
@@ -797,6 +801,14 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		options: BaseModuleConfig,
 		tableSchema?: TableSchema
 	): Promise<IsolatedTable> {
+		// When the planner requested a committed-snapshot read (committed.<table>), bypass
+		// the per-connection overlay so reads reflect only persisted underlying state.
+		const readCommitted = (options as { _readCommitted?: boolean } | undefined)?._readCommitted === true;
+
+		if (readCommitted) {
+			return this.connectCommitted(db, pAux, moduleName, schemaName, tableName, options, tableSchema);
+		}
+
 		// Check for existing underlying table
 		let state = this.getUnderlyingState(schemaName, tableName);
 
@@ -810,15 +822,58 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			this.setUnderlyingState(schemaName, tableName, state);
 		}
 
-		// When the planner requested a committed-snapshot read (committed.<table>), bypass
-		// the per-connection overlay so reads reflect only persisted underlying state.
-		const readCommitted = (options as { _readCommitted?: boolean } | undefined)?._readCommitted === true;
-
 		// Return a fresh IsolatedTable instance that will look up its overlay
 		// from connection-scoped storage (shared with other instances in same transaction).
 		// Pass the connect-time (schemaName, tableName) — the pair `underlyingTables` is keyed
 		// by — never the underlying's self-reported names (see IsolatedTable's ctor doc).
-		return new IsolatedTable(db, this, schemaName, tableName, state.underlyingTable, readCommitted);
+		return new IsolatedTable(db, this, schemaName, tableName, state.underlyingTable, false);
+	}
+
+	/**
+	 * Opens a DEDICATED underlying handle for a committed-snapshot read, forwarding the
+	 * caller's `options` (already carrying `_readCommitted`) so the underlying can honour
+	 * the flag. `underlyingTables` is neither read nor written here — the writer's memoized
+	 * handle stays untouched in both directions.
+	 *
+	 * **Why a fresh handle per committed read, rather than sharing the memoized one.**
+	 * The memoized handle is the WRITER's: `commitConnectionOverlays` flushes staged rows
+	 * through it incrementally (Phase 1 begins the underlying and applies row by row;
+	 * Phase 2 commits), so a read delegating to it between the phases observes a partially
+	 * applied batch — defeating the underlying's own atomic commit one level up.
+	 *
+	 * **Why it is not memoized alongside the writer handle either.** A `_readCommitted`
+	 * `MemoryTable` pins its read layer at the first scan pull and serves that layer for
+	 * the life of the instance (`MemoryTable.ensureConnection`, the `readCommitted` arm).
+	 * A handle memoized for the table's lifetime would therefore serve the SAME committed
+	 * state forever, going arbitrarily stale, and would hold the layer chain against
+	 * collapse (`MemoryTableManager.isLayerInUse` walks the connection's `readLayer` chain)
+	 * for as long as the table exists. A stale-forever snapshot is worse than the tear.
+	 * Not memoizing also keeps `destroy`/`renameTable`/the attach seams free of a second
+	 * eviction: nothing new ever lands in `underlyingTables`.
+	 *
+	 * The per-read connect is cheap for both in-tree underlyings — `MemoryTableModule.connect`
+	 * is a map lookup plus a `new MemoryTable(...)` (the manager connection and layer pin
+	 * happen later, at the first scan pull), and `StoreModule.connect` returns its own
+	 * memoized `StoreTable` on a map hit. Neither performs I/O per committed read. An
+	 * out-of-tree underlying with an expensive `connect` pays it per committed read, which
+	 * is the accepted cost of not freezing the snapshot.
+	 *
+	 * The handle is released by {@link IsolatedTable.disconnect} — required on the memory
+	 * path, where disconnect is what drops the pinned read layer's collapse protection.
+	 */
+	private async connectCommitted(
+		db: Database,
+		pAux: unknown,
+		moduleName: string,
+		schemaName: string,
+		tableName: string,
+		options: BaseModuleConfig,
+		tableSchema?: TableSchema
+	): Promise<IsolatedTable> {
+		const committedUnderlying = await this.underlying.connect(
+			db, pAux, moduleName, schemaName, tableName, options, tableSchema
+		);
+		return new IsolatedTable(db, this, schemaName, tableName, committedUnderlying, true);
 	}
 
 	/**

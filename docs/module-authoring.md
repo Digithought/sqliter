@@ -452,14 +452,25 @@ shared cached table per table key — dropping the `_readCommitted` option — a
 its `query` merges the coordinator's pending-op view over the committed store, so
 a read taken during a commit flush sees a partially applied batch. The platform
 plugins (leveldb, indexeddb, nativescript-sqlite, react-native-leveldb) wrap
-`StoreModule`, so they inherit `false`. `IsolationModule` declares `false`
-**regardless of what it wraps**, and this is the instructive case: skipping the
-overlay is not sufficient. It memoizes one underlying `VirtualTable` per
-(schema, table) and re-serves that handle, so a committed read runs on the
-*writer's* handle while `commitConnectionOverlays` flushes staged rows through it
-incrementally — the reader can observe a half-applied flush even over a memory
-underlying whose own commit is atomic. **A wrapper is only as snapshot-safe as
-its own commit path**, not as the module beneath it.
+`StoreModule`, so they inherit `false`. `IsolationModule` **mirrors its
+underlying**, and how it earns that is the instructive part: skipping the overlay
+is not sufficient. It memoizes one underlying `VirtualTable` per (schema, table)
+for writers, and re-serving that handle to a committed read put the read on the
+*writer's* handle while `commitConnectionOverlays` flushed staged rows through it
+incrementally — a half-applied flush observable even over a memory underlying
+whose own commit is atomic. It therefore opens a **dedicated** `_readCommitted`
+underlying handle per committed read (unmemoized, released on `disconnect`) and
+refuses `createConnection` on such an instance. **A wrapper is only as
+snapshot-safe as its own commit path** — and never more than the module beneath
+it, which is why the mirror stops at `false` over an underlying that ignores
+`_readCommitted`.
+
+**If you write a wrapper module that memoizes one underlying handle per table**,
+this is the rule to copy: open a **separate** underlying handle for a
+`_readCommitted` connect rather than re-serving the writer's, or you silently
+degrade a snapshot-safe underlying to a tearing one. Do not cache that handle for
+the table's lifetime either — an underlying that pins its snapshot at first pull
+would then serve the same, ever-staler state forever.
 
 #### Proving it: the conformance harness
 

@@ -354,8 +354,22 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * Creates a new isolated connection for transaction support.
 	 * The connection includes this table as a callback so commit/rollback
 	 * operations properly flush/clear the overlay.
+	 *
+	 * Refused on a committed-snapshot instance: an `IsolatedConnection` gets registered with
+	 * the Database and then receives begin/commit/rollback broadcasts, and
+	 * `docs/module-authoring.md` § "Committed-Snapshot Reads (`_readCommitted`)" forbids a
+	 * `_readCommitted` connection joining the writer's transaction. Nothing in-tree reaches
+	 * this on a committed instance today (the committed `query` path returns before
+	 * `ensureConnection`), so the throw is a guard against a future caller, not a live path.
 	 */
 	createConnection(): MaybePromise<VirtualTableConnection> {
+		if (this.readCommitted) {
+			throw new QuereusError(
+				`Cannot create a transaction connection on a committed-snapshot read of '${this.schemaName}.${this.tableName}': ` +
+				'a _readCommitted connection must not join the writer\'s transaction',
+				StatusCode.MISUSE
+			);
+		}
 		const underlyingConn = this.underlyingTable.createConnection?.();
 		// Overlay connection created lazily - may not exist yet
 		const overlayConn = this.overlayTable?.createConnection?.();
@@ -1946,8 +1960,25 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 	// ==================== Schema Operations ====================
 
+	/**
+	 * Releases only what this wrapper itself opened.
+	 *
+	 * The overlay is connection-scoped and the writer's underlying handle is memoized and
+	 * shared across every `IsolatedTable` for the table, so neither is disconnected here.
+	 * A committed-snapshot instance is the exception: `IsolationModule.connectCommitted`
+	 * opened a dedicated underlying handle for THIS instance, so this instance releases it
+	 * — symmetric by contract, and nothing else holds a reference to it.
+	 *
+	 * Required, not merely tidy: on the memory path `MemoryTable.disconnect` is what drops
+	 * the pinned read layer's collapse protection (see its own NOTE), so without this every
+	 * committed read leaks a pinned layer chain for the life of the table. Safe on the store
+	 * path: `StoreTable.disconnect` is the documented per-scan no-op that only flushes stats,
+	 * and the engine already calls it after every scan.
+	 */
 	async disconnect(): Promise<void> {
-		// Don't disconnect overlay or underlying - they're connection-scoped/shared
+		if (this.readCommitted) {
+			await this.underlyingTable.disconnect?.();
+		}
 	}
 
 	async rename(newName: string): Promise<void> {

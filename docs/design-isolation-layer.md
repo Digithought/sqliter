@@ -302,6 +302,35 @@ This is analogous to LSM-tree merge or 3-way merge in version control.
    underlying module may drive the scan under an index it minted per plan (e.g. lamina's
    `_compound_v_0`), a name no table schema (and therefore no overlay) declares
 
+#### Committed-snapshot reads get their own underlying handle
+
+A `committed.<table>` read (the engine's concurrent committed-read path, which connects with
+`_readCommitted: true`) bypasses the overlay entirely — `IsolatedTable.query` delegates
+straight to the underlying. That handle is **not** the memoized writer handle:
+`IsolationModule.connect` routes a `_readCommitted` connect to a dedicated
+`underlying.connect(...)` and never reads or writes `underlyingTables` on that path.
+
+Sharing the writer handle would tear the read. `commitConnectionOverlays` flushes staged rows
+through it incrementally — Phase 1 begins the underlying and applies row by row, Phase 2
+commits — so a read landing between the phases observes a half-applied batch, defeating the
+underlying's own atomic commit one level up.
+
+The dedicated handle is deliberately **not memoized** either. A `_readCommitted` memory table
+pins its read layer at the first scan pull and serves that layer for the life of the instance,
+so a handle cached for the table's lifetime would serve the same committed state forever and
+hold the layer chain against collapse. Not memoizing also keeps `destroy` / `renameTable` / the
+attach seams free of a second eviction.
+
+`IsolatedTable.disconnect()` releases the handle it opened (and only that one). This is
+required, not tidy: on the memory path `disconnect` is what drops the pinned read layer's
+collapse protection. `IsolatedTable.createConnection()` throws on a committed instance — a
+`_readCommitted` connection must not join the writer's transaction.
+
+Consequently `IsolationModule.readCommittedSnapshot` **mirrors the underlying** rather than
+declining unconditionally: the wrapper adds no tearing window of its own, but it cannot promise
+more than the underlying delivers (an underlying that ignores `_readCommitted` — the store
+stack — hands back a handle indistinguishable from the writer's).
+
 ### Write Operations
 
 1. Apply change to overlay only (insert/update/delete)
