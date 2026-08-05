@@ -344,7 +344,7 @@ Generated columns are computed from an expression over other columns in the same
 - Cannot have both `DEFAULT` and `GENERATED ALWAYS AS` on the same column.
 - Cannot INSERT into or UPDATE a generated column directly.
 - `ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS (...)` **backfills the existing rows**: each one's value is computed from that row, exactly as `CREATE TABLE` with the same declaration and a subsequent INSERT would produce it. This holds for the `STORED`, `VIRTUAL` and unspecified spellings alike, and for an expression that reads another generated column (already materialized in the stored row). Determinism is checked at `ALTER` time, before any row is touched — `ADD COLUMN g INTEGER GENERATED ALWAYS AS (random())` is rejected there rather than at the next INSERT (unless `nondeterministic_schema` is on). If the new column is `NOT NULL` and the expression yields NULL for some existing row, or an inline `CHECK` on it fails for some existing row, the whole `ALTER` is rejected and the table is left exactly as it was.
-- `ALTER TABLE ... DROP COLUMN` of a column referenced by another generated column's expression is rejected; drop the referencing generated column first.
+- `ALTER TABLE ... DROP COLUMN` of a column referenced by another generated column's expression is rejected; drop the referencing generated column first. (A column that a foreign key in another table points at is rejected the same way — see §7.6.)
 
 **CHECK Constraints:**
 
@@ -963,6 +963,8 @@ pragma foreign_keys = off;  -- parse but don't enforce
 ```
 
 When no `ON DELETE` or `ON UPDATE` clause is specified, the default action is `RESTRICT`. `NO ACTION` is currently treated as a synonym for `RESTRICT`.
+
+A foreign key records its **child** columns by position but its **parent** columns by *name*, re-resolving them on every write. So `ALTER TABLE ... DROP COLUMN` treats the two sides differently: dropping a child column removes the key along with it, while dropping a column some key points **at** as a parent column is **rejected** — drop the referencing key first (`ALTER TABLE <child> DROP CONSTRAINT <name>`). The rejection does not depend on `pragma foreign_keys`, since a schema left in that state breaks the referencing table as soon as enforcement is switched on. See [sql-alter.md § 2.7](sql-alter.md#27-alter-table-statement) under *DROP COLUMN*.
 
 **Syntax - Column Constraint:**
 ```sql

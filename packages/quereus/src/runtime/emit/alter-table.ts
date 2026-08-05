@@ -22,7 +22,7 @@ import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
-import { assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn } from './drop-column-guards.js';
+import { assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn, assertNoForeignKeyReferencesColumn } from './drop-column-guards.js';
 import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
@@ -1151,12 +1151,13 @@ async function runDropColumn(
 		}
 	}
 
-	// Validate: the remaining two EXPRESSION dependents — a CHECK on this table, and an
-	// assertion body — which have no narrowed form either and so refuse the same way the
-	// two loops above do. Both run before `requireVtabModule` / `module.alterTable`, so a
-	// refused drop persists nothing. CHECK first, assertion second: widening blast radius,
-	// so the most locally-explainable violation is the one reported.
+	// Validate: the remaining dependents `module.alterTable` cannot narrow — a CHECK on this
+	// table, a foreign key in another table pointing AT the column, and an assertion body.
+	// All three run before `requireVtabModule` / `module.alterTable`, so a refused drop
+	// persists nothing. Ordered by widening blast radius (this table → another table → the
+	// whole database), so the most locally-explainable violation is the one reported.
 	assertNoCheckConstraintNamesColumn(rctx.db, tableSchema, columnName);
+	assertNoForeignKeyReferencesColumn(rctx.db, tableSchema, columnName);
 	assertNoAssertionNamesColumn(rctx.db, tableSchema, columnName);
 
 	// Call module.alterTable for data + schema update

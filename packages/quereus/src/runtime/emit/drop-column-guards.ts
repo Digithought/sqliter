@@ -7,24 +7,29 @@ import { columnReferencedInAst, columnReferencedInCheckExpression } from '../../
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 
 /**
- * The two `ALTER TABLE … DROP COLUMN` guards over **expression** dependents that
- * `runDropColumn` does not otherwise see: a CHECK constraint on the table itself,
- * and an assertion whose CHECK body names the column.
+ * The `ALTER TABLE … DROP COLUMN` guards over dependents that `runDropColumn` does not
+ * otherwise see: a CHECK constraint on the table itself, an assertion whose CHECK body
+ * names the column, and a foreign key in *another* table pointing **at** the column.
  *
- * DROP COLUMN's dependents split in two, and the split is what decides the policy:
+ * Whether a dependent is removed with the column or blocks the drop turns on two
+ * questions: is it defined by a *column set* or by an *expression*, and does it live on
+ * the altered table or somewhere else?
  *
- * - **Structural** dependents (a UNIQUE over the dropped column, the table's own FK
- *   using it as a child column) are defined by a *column set*. Losing a column makes
- *   them a different constraint, not a narrower one, so both vtab modules **remove
- *   them with the column**.
+ * - **Structural** dependents **of the altered table** (a UNIQUE over the dropped column,
+ *   the table's own FK using it as a child column) are defined by a *column set*. Losing
+ *   a column makes them a different constraint, not a narrower one, so both vtab modules
+ *   **remove them with the column**.
  * - **Expression** dependents (a generated column's expression, a partial index's
  *   `WHERE`, and — here — a CHECK expression and an assertion body) are arbitrary
  *   user-authored logic with no narrowed form at all. The only choices are
  *   delete-it-silently and refuse, and the engine **refuses**, `StatusCode.CONSTRAINT`.
+ * - **Dependents living in another table** — here, a foreign key whose *parent* column is
+ *   the one being dropped — refuse regardless of shape. Removing one would silently
+ *   weaken a constraint on a table the user did not name in the statement.
  *
- * Refuse is right for these two specifically because it is what the two expression
- * guards already inside `runDropColumn` do (so the function gains no second policy),
- * it is SQLite's position for the whole family, and — for the assertion arm —
+ * Refuse is right for all three guards here because it is what the two expression guards
+ * already inside `runDropColumn` do (so the function gains no second policy), it is
+ * SQLite's position for the whole family, and — for the assertion arm —
  * `assertNoAssertionDependsOn` already chose refuse for the *table* verb over the same
  * assertion. Cascading here would make `drop table f` and `alter table f drop column x`
  * disagree about the same object.
@@ -35,7 +40,7 @@ import { buildColumnSourceResolver } from '../../schema/column-source-resolver.j
  * message quotes the constraint's expression so the user can at least see what is in
  * the way.
  *
- * Both guards must run **before** `requireVtabModule` / `module.alterTable`, so a
+ * All three guards must run **before** `requireVtabModule` / `module.alterTable`, so a
  * refused statement never reaches a persisting module and the table is left untouched
  * rather than reverted.
  */
@@ -122,5 +127,79 @@ export function assertNoAssertionNamesColumn(
 			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by assertion '${assertion.name}' — drop or redefine the assertion first`,
 			StatusCode.CONSTRAINT,
 		);
+	}
+}
+
+/**
+ * Refuses the drop when some foreign key — in any schema, this table's own included —
+ * names the column among its **parent** columns.
+ *
+ * A foreign key stores its parent columns as *names* (`referencedColumnNames`) and
+ * re-resolves them against the parent's current shape on every write
+ * (`resolveReferencedColumns`, `schema/table.ts`). Dropping a named parent column therefore does not
+ * break the altered table at all — it makes the *referencing* table unwritable, with an
+ * error naming a column the user deliberately removed somewhere else. Refusing is the
+ * only way that failure stays attached to the statement that caused it.
+ *
+ * The refusal is **not** gated on `pragma foreign_keys`. The pragma decides whether the
+ * DML builders emit FK checks, so with it off the breakage is merely latent: the schema
+ * is still wrong and turning the pragma on later bricks the child table. The guards
+ * already in `runDropColumn` are likewise unconditional.
+ *
+ * The parent is resolved with the same `findTable(fk.referencedTable, fk.referencedSchema)`
+ * call `planner/building/foreign-key-builder.ts` uses at enforcement time, rather than by
+ * comparing names by hand — that identity is what makes "the guard refuses exactly the
+ * drops enforcement would have choked on" true. It carries the same dependence on the
+ * session search path: an unqualified `fk.referencedTable` resolves through that path, not
+ * through the child's own schema, so a key can bind to a different parent than its
+ * spelling suggests. Whatever enforcement would pick is what this refuses over.
+ *
+ * Two keys are skipped, both deliberately:
+ *
+ * - One with **no `referencedColumnNames`** (`references Parent` with no column list)
+ *   falls back to the parent's primary key, which no name resolution can miss and which
+ *   `runDropColumn` already refuses to drop. Not an oversight — there is no name here for
+ *   this drop to invalidate.
+ * - A **self-referencing key that this same drop removes** — one on the altered table whose
+ *   *child* columns include the dropped column (`x integer references t(x)`). The module
+ *   removes the whole key as part of the drop, so nothing is left pointing at the missing
+ *   name. Refusing there would turn away a legal drop.
+ */
+export function assertNoForeignKeyReferencesColumn(
+	db: Database,
+	tableSchema: TableSchema,
+	columnName: string,
+): void {
+	const lowerColumn = columnName.toLowerCase();
+	const droppedIndex = tableSchema.columnIndexMap.get(lowerColumn);
+	const lowerSchema = tableSchema.schemaName.toLowerCase();
+	const lowerTable = tableSchema.name.toLowerCase();
+
+	// NOTE: this walks every foreign key of every table in every schema on each DROP COLUMN.
+	// Trivial at today's schema sizes; if a database ever carries many tables and the ALTER
+	// path gets hot, index parent references by parent table name instead.
+	for (const schema of db.schemaManager._getAllSchemas()) {
+		for (const childTable of schema.getAllTables()) {
+			for (const fk of childTable.foreignKeys ?? []) {
+				const refNames = fk.referencedColumnNames;
+				if (!refNames || refNames.length === 0) continue;
+				if (!refNames.some(name => name.toLowerCase() === lowerColumn)) continue;
+
+				const parent = db.schemaManager.findTable(fk.referencedTable, fk.referencedSchema);
+				if (!parent) continue;	// dangling parent — already broken, and not this drop's doing
+				if (parent.schemaName.toLowerCase() !== lowerSchema || parent.name.toLowerCase() !== lowerTable) continue;
+
+				const selfKeyRemovedByThisDrop = childTable.name.toLowerCase() === lowerTable
+					&& childTable.schemaName.toLowerCase() === lowerSchema
+					&& droppedIndex !== undefined && fk.columns.includes(droppedIndex);
+				if (selfKeyRemovedByThisDrop) continue;
+
+				const fkName = fk.name ?? `_fk_${childTable.name}`;
+				throw new QuereusError(
+					`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by foreign key '${fkName}' on table '${childTable.name}'`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
 	}
 }
