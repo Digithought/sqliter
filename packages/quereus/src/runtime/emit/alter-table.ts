@@ -13,7 +13,7 @@ import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractC
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
-import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameColumnInColumnExpressions } from '../../schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameColumnInColumnExpressions, renameTableInColumnExpressions } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
@@ -2218,6 +2218,21 @@ function rewriteTableForTableRename(
 		changed = true;
 		return { ...idx };
 	});
+
+	// Column-level expressions — a DEFAULT (`w integer default ((select min(v) from u))`)
+	// and a generated column's body. Unlike the column verb's arm, no seeded/unseeded
+	// split: `renameTableInAst` resolves nothing against an implicit owning table, so one
+	// entry point covers the renamed table's own self-referencing default and every other
+	// table's alike.
+	//
+	// Also unlike the collections above, no per-item shallow copy: the rewrite is in place
+	// and a `ColumnSchema`'s own fields are untouched, so a fresh column object would only
+	// make the catalog's array stop being identical to the one the module's rename hook
+	// just handed back. Flipping `changed` is what re-registers the table and fires
+	// `table_modified`, which is all the copies above achieve either.
+	const columnsRewritten = renameTableInColumnExpressions(
+		table.columns, oldName, newName, renamedSchemaLower);
+	if (columnsRewritten) changed = true;
 
 	if (!changed) return table;
 

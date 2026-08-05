@@ -318,8 +318,9 @@ function visitTableRename(
  * Apply an in-place expression rewrite across a schema-object collection,
  * skipping items whose expression is absent. Returns whether any item changed.
  *
- * Backs the four `rename*In{IndexPredicates,CheckConstraints}` entry points
- * below, which differ only in which field they pluck and which walker they run.
+ * Backs the `rename{Column,Table}In{IndexPredicates,CheckConstraints,ColumnExpressions}`
+ * entry points below, which differ only in which field they pluck and which walker they
+ * run.
  */
 function rewriteEach<T>(
 	items: ReadonlyArray<T> | undefined,
@@ -372,6 +373,44 @@ export function renameTableInCheckConstraints(
 ): boolean {
 	return rewriteEach(checks, cc => cc.expr,
 		expr => renameTableInAst(expr, oldName, newName, defaultSchemaName));
+}
+
+/**
+ * Rewrite the renamed table inside the two expressions a `ColumnSchema` can carry —
+ * a column DEFAULT (`w integer default ((select min(v) from u))`, however authored:
+ * inline, or via `ALTER TABLE … ALTER COLUMN … SET DEFAULT`, which writes the same
+ * field) and a generated column's body (`g integer generated always as ((select
+ * min(u.v) from u) + id)`) — in place.
+ *
+ * Unlike the column-rename counterpart ({@link renameColumnInColumnExpressions}) there
+ * is no seeded/unseeded split: {@link renameTableInAst} resolves nothing against an
+ * implicit owning table, so the SAME entry point is correct for the renamed table's own
+ * columns (a self-referencing default, `default ((select count(*) from t))`) and for
+ * every other table's.
+ *
+ * Same sharing and idempotence story as {@link renameTableInCheckConstraints}: the
+ * `Expression` is the very AST the catalog's `TableSchema` holds, so one in-place
+ * rewrite reaches every holder and a second call with the same pair finds nothing
+ * naming `oldName` and returns false.
+ *
+ * The parameter is structurally typed rather than `ColumnSchema[]` so this module stays
+ * free of catalog imports; `ColumnSchema` satisfies it.
+ */
+export function renameTableInColumnExpressions(
+	columns: ReadonlyArray<{
+		readonly defaultValue?: AST.Expression | null;
+		readonly generatedExpr?: AST.Expression;
+	}> | undefined,
+	oldName: string,
+	newName: string,
+	defaultSchemaName: string,
+): boolean {
+	const rewrite = (expr: AST.Expression): boolean =>
+		renameTableInAst(expr, oldName, newName, defaultSchemaName);
+	// Both walks always run — `||` on the results, not short-circuited between them.
+	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
+	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);
+	return defaultsChanged || generatedChanged;
 }
 
 function rewriteIdentifierIfTable(

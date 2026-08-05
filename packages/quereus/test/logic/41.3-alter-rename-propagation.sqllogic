@@ -1204,3 +1204,112 @@ drop table y_xnest;
 drop table x_xnest;
 drop table u_xnest;
 drop table t_xnest;
+
+-- ===================================
+-- 38. RENAME TO rewrites a table named inside ANOTHER table's column DEFAULT
+-- ===================================
+-- The table-rename pass walks CHECK expressions and index predicates; the two
+-- expressions a column carries — a DEFAULT and a generated body — were invisible to
+-- it, so pre-fix `t_tdef` accepted no rows at all after the rename, failing with
+-- "Table 'u_tdef' not found in schema path: main" — an error naming a table the user
+-- renamed in a different statement.
+
+create table u_tdef (k integer primary key, v integer);
+insert into u_tdef values (1, 42);
+
+create table t_tdef (id integer primary key, w integer default ((select min(v) from u_tdef)));
+
+alter table u_tdef rename to u_tdef2;
+
+insert into t_tdef (id) values (1);
+
+select id, w from t_tdef;
+→ [{"id":1,"w":42}]
+
+-- The renamed table is what the default now reads: change it and the next default follows.
+insert into u_tdef2 values (2, 7);
+
+insert into t_tdef (id) values (2);
+
+select id, w from t_tdef where id = 2;
+→ [{"id":2,"w":7}]
+
+drop table t_tdef;
+drop table u_tdef2;
+
+-- ===================================
+-- 39. RENAME TO follows a SELF-referencing DEFAULT on the renamed table itself
+-- ===================================
+-- The renamed table's own default names the renamed table. `runRenameTable` rewrites
+-- the renamed table's schema BEFORE the catalog swap, so no listener — and, on a store
+-- backend, no persisted DDL bundle — ever observes a default naming the vanished old
+-- name. Unlike the column verb there is no seeded/unseeded split: the same walk decides
+-- this arm and §38.
+
+create table t_self (id integer primary key, w integer default ((select count(*) from t_self)));
+
+insert into t_self (id) values (1);
+
+alter table t_self rename to t_self9;
+
+insert into t_self9 (id) values (2);
+
+select id, w from t_self9;
+→ [{"id":1,"w":0},{"id":2,"w":1}]
+
+drop table t_self9;
+
+-- ===================================
+-- 40. RENAME TO rewrites a generated column's expression
+-- ===================================
+-- The other of the two expressions a column carries. The cross-table subquery must be
+-- QUALIFIED here (`u_tgen.v`, not a bare `v`): the generated-column dependency check
+-- rejects an unqualified foreign ref at create time ("Column 'v' referenced by generated
+-- column 'gg' not found in table 'g_tgen'"), so only the qualified shape is reachable.
+
+create table u_tgen (k integer primary key, v integer);
+insert into u_tgen values (1, 10);
+
+create table g_tgen (id integer primary key,
+                     gg integer generated always as ((select min(u_tgen.v) from u_tgen) + id));
+
+alter table u_tgen rename to u_tgen2;
+
+insert into g_tgen (id) values (5);
+
+select id, gg from g_tgen;
+→ [{"id":5,"gg":15}]
+
+drop table g_tgen;
+drop table u_tgen2;
+
+-- ===================================
+-- 41. RENAME TO must NOT rewrite a same-named table in ANOTHER schema inside a DEFAULT
+-- ===================================
+-- The rewrite is schema-aware: the default's subquery reads temp.u_tsch, so renaming
+-- main.u_tsch must leave it alone. Rewriting it would leave the default naming a table
+-- temp does not have and `t_tsch` would stop accepting rows.
+--
+-- The alias/CTE shadowing shape (a subquery source ALIASED to the renamed table's name)
+-- is deliberately not pinned here — the table walker keeps no scope frame at all, which
+-- is tracked as `bug-table-rename-rewrites-cte-references`; when that lands it fixes all
+-- four arms (checks, predicates, defaults, generated bodies) at once.
+
+create table temp.u_tsch (k integer primary key, v integer);
+insert into temp.u_tsch values (1, 11);
+
+create table u_tsch (k integer primary key, v integer);
+insert into u_tsch values (1, 22);
+
+create table t_tsch (id integer primary key, w integer default ((select min(v) from temp.u_tsch)));
+
+alter table u_tsch rename to u_tsch2;
+
+insert into t_tsch (id) values (1);
+
+select id, w from t_tsch;
+→ [{"id":1,"w":11}]
+
+drop table t_tsch;
+drop table u_tsch2;
+drop table temp.u_tsch;

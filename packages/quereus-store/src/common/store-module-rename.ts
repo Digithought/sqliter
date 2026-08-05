@@ -14,6 +14,7 @@ import {
 	QuereusError,
 	StatusCode,
 	renameTableInCheckConstraints,
+	renameTableInColumnExpressions,
 	renameTableInIndexPredicates,
 } from '@quereus/quereus';
 import { StoreConnection } from './store-connection.js';
@@ -174,11 +175,14 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 				// copy — no rollback needed, `renamedSchema` is local to the write.
 				foreignKeys: retargetSelfForeignKeys(currentSchema.foreignKeys, schemaName, oldName, newName),
 			};
-			// A partial index's WHERE clause and a CHECK constraint's expression can each
-			// carry a table-qualified self-reference (`where t.b > 0`) still naming the OLD
-			// table: `propagateTableRename` runs only after this hook returns, so — exactly
-			// as in the `renameColumn` arm of `alterTable` — persisting now would durably
-			// write a stale qualifier that only the later propagation event corrects.
+			// A partial index's WHERE clause, a CHECK constraint's expression, and a column's
+			// DEFAULT / `generated always as` body can each name the OLD table — a
+			// table-qualified self-reference (`where t.b > 0`), or, for a column expression,
+			// a subquery reading it (`default ((select count(*) from t))`). All three are
+			// rendered into the persisted DDL bundle, and `propagateTableRename` runs only
+			// after this hook returns, so — exactly as in the `renameColumn` arm of
+			// `alterTable` — persisting now would durably write a stale reference that only
+			// the later propagation event corrects.
 			// Rewrite first, in place (each `Expression` is shared with the catalog
 			// `TableSchema` and, for a unique partial index, with its derived UNIQUE
 			// constraint), which also makes that later pass a no-op for these fields. A
@@ -194,9 +198,19 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 			// <thisTable>.b > 0`) or a bare reference — never `where <newName>.b > 0` for a
 			// different table. The mis-reversal path is therefore unreachable for a live
 			// predicate.
+			//
+			// NOTE: that argument does NOT extend to the column-expression arm, and the
+			// residual is left open deliberately. A DEFAULT naming a table that does not
+			// exist is accepted at create time (the reference is only resolved when a row is
+			// written), so `create table u (…, v integer default ((select 1 from u2)))`
+			// followed by `alter table u rename to u2` has a forward pass that matches
+			// nothing and a reverse pass that would clobber that `u2` back to `u`. Reaching
+			// it needs `saveTableDDL` to throw, and closing it needs a per-walk changed-set
+			// threaded through every arm — not worth it for a failed-persist-only path.
 			const rewriteTable = (from: string, to: string): void => {
 				renameTableInIndexPredicates(currentSchema.indexes, from, to, schemaName);
 				renameTableInCheckConstraints(currentSchema.checkConstraints, from, to, schemaName);
+				renameTableInColumnExpressions(currentSchema.columns, from, to, schemaName);
 			};
 			try {
 				rewriteTable(oldName, newName);
