@@ -178,4 +178,45 @@ describe('GENERATED ALWAYS AS: survives a reopen', () => {
 
 		await db2.close();
 	});
+
+	it('a generated column added by ALTER TABLE ADD COLUMN survives a reopen', async () => {
+		// ADD COLUMN reaches persistence through the same `formatColumnDef`, but by a
+		// different producer (the ALTER path rebuilds the column schema rather than taking it
+		// from a CREATE TABLE parse), so pin it independently of the inline-declaration case.
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+
+		await db1.exec('create table gcr3 (id integer primary key, a integer null) using store');
+		await db1.exec('insert into gcr3 (id, a) values (1, 5)');
+		await db1.exec('alter table gcr3 add column g integer null generated always as (a + 1) stored');
+		await db1.exec('alter table gcr3 add column v integer null generated always as (a * 2)');
+
+		// Backfill happened on the pre-existing row.
+		const backfilled = await db1.get('select g, v from gcr3 where id = 1');
+		expect(backfilled?.g, 'ADD COLUMN backfilled the stored column').to.equal(6);
+		expect(backfilled?.v, 'ADD COLUMN computes the virtual column').to.equal(10);
+
+		await mod1.whenCatalogPersisted();
+		await db1.close();
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 'catalog rehydrates cleanly').to.have.lengthOf(0);
+
+		const table = db2.schemaManager.findTable('gcr3', 'main');
+		const gCol = table!.columns.find(c => c.name === 'g')!;
+		const vCol = table!.columns.find(c => c.name === 'v')!;
+		expect(gCol.generatedStored, 'g: stored flag rehydrated').to.equal(true);
+		expect(vCol.generatedStored, 'v: virtual flag rehydrated').to.equal(false);
+
+		await db2.exec('insert into gcr3 (id, a) values (2, 7)');
+		const post = await db2.get('select g, v from gcr3 where id = 2');
+		expect(post?.g, 'post-reopen row computes the stored column').to.equal(8);
+		expect(post?.v, 'post-reopen row computes the virtual column').to.equal(14);
+
+		await db2.close();
+	});
 });
