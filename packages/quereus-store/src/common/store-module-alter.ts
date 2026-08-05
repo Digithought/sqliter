@@ -30,6 +30,7 @@ import {
 	foldDefaultToType,
 	rekeySchemaPrimaryKey,
 	renameColumnInCheckConstraints,
+	renameColumnInColumnExpressions,
 	renameColumnInIndexPredicates,
 	resolveNamedConstraintClass,
 	shiftSchemaIndicesForDrop,
@@ -394,15 +395,26 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 				oldSchema.foreignKeys, schemaName, tableName, change.oldName, change.newName),
 		};
 
-		// A partial index's WHERE clause and a CHECK constraint's expression both
-		// still name the OLD column: the engine's `propagateColumnRename` pass runs
-		// only after this hook returns. Persisting now would durably write a bundle
-		// naming a column the table no longer has, and only the later propagation's
-		// `table_modified` event would correct it — a crash in between leaves the
-		// catalog un-rehydratable. So rewrite first, in place: each `Expression` is
-		// shared by reference with the catalog's `TableSchema` and, for a unique
-		// partial index, with the `derivedFromIndex` UNIQUE constraint, so one
+		// A partial index's WHERE clause, a CHECK constraint's expression, and a column's
+		// DEFAULT / generated expression all still name the OLD column: the engine's
+		// `propagateColumnRename` pass runs only after this hook returns. Persisting now
+		// would durably write a bundle naming a column the table no longer has, and only
+		// the later propagation's `table_modified` event would correct it — a crash in
+		// between leaves the catalog un-rehydratable. So rewrite first, in place: each
+		// `Expression` is shared by reference with the catalog's `TableSchema` and, for a
+		// unique partial index, with the `derivedFromIndex` UNIQUE constraint, so one
 		// rewrite covers all holders and makes the later propagation pass a no-op.
+		//
+		// The column arm walks `updatedColumns` — the array this hook is about to persist.
+		// Its renamed entry is a fresh `ColumnSchema` built from `newColumnDefAst`, but that
+		// def carries the SAME expression nodes (`buildConstraintsFromColumn` passes them in
+		// by reference and `columnDefToSchema` assigns them straight back), and every other
+		// entry is `oldSchema`'s by reference — so this is the same one-rewrite-covers-all
+		// story as the two above, reverse pass included. `formatColumnDef` renders a DEFAULT
+		// into the persisted bundle, which is what makes the arm load-bearing here; a
+		// generated expression is not rendered at all today (tracked by
+		// `bug-store-reopen-loses-computed-columns`), so covering it is correct-but-inert
+		// until that lands.
 		//
 		// The rewrites are the first statements in the `try`, and each walks its
 		// collection one item at a time, so a throw anywhere — including partway
@@ -418,6 +430,8 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 				updatedIndexes, tableName, from, to, schemaName, resolveColumnInSource);
 			renameColumnInCheckConstraints(
 				oldSchema.checkConstraints, tableName, from, to, schemaName, resolveColumnInSource);
+			renameColumnInColumnExpressions(
+				updatedColumns, tableName, from, to, schemaName, resolveColumnInSource);
 		};
 		try {
 			rewriteColumn(change.oldName, change.newName);

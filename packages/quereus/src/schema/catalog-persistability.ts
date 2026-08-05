@@ -142,10 +142,16 @@ function assertRenameDependentTablesPersistable(db: Database, rewriteTable: Tabl
 }
 
 /**
- * A shallow copy of `table` whose in-place-rewritable ASTs are {@link spineCloneAst}
+ * A shallow copy of `table` whose in-place-rewritable ASTs — CHECK expressions, partial-index
+ * predicates, and each column's DEFAULT / generated expression — are {@link spineCloneAst}
  * copies, so a prospective rewrite cannot touch the live catalog. `foreignKeys` needs no
  * clone — that arm of both table rewriters is already copy-on-write (it builds a new `fk`
  * record rather than assigning into the existing one).
+ *
+ * The column arm matters for exactly the reason the others do: `runRenameColumn` runs this
+ * probe BEFORE its first side effect, and a module veto thrown afterwards must leave the
+ * catalog untouched. Without the clone the probe would rewrite the LIVE default AST and a
+ * vetoed statement would leave a table whose defaults name a column that was never renamed.
  */
 // NOTE: a unique partial index and its derived UNIQUE constraint share ONE predicate node by
 // reference (see `appendIndexToTableSchema`), which is how the live propagation rewrites both
@@ -159,6 +165,14 @@ function cloneTableRewritableAsts(table: TableSchema): TableSchema {
 		checkConstraints: table.checkConstraints.map(cc => ({ ...cc, expr: spineCloneAst(cc.expr) })),
 		indexes: table.indexes?.map(idx =>
 			idx.predicate ? { ...idx, predicate: spineCloneAst(idx.predicate) } : idx),
+		columns: table.columns.map(col => {
+			if (!col.defaultValue && !col.generatedExpr) return col;
+			return {
+				...col,
+				defaultValue: col.defaultValue ? spineCloneAst(col.defaultValue) : col.defaultValue,
+				generatedExpr: col.generatedExpr ? spineCloneAst(col.generatedExpr) : col.generatedExpr,
+			};
+		}),
 	};
 }
 

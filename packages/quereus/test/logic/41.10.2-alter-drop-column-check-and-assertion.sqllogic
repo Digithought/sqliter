@@ -1,8 +1,8 @@
 -- 41.10.2-alter-drop-column-check-and-assertion.sqllogic
 --
--- Subject: `ALTER TABLE … DROP COLUMN` vs. the two EXPRESSION dependents that used to
--- survive the drop verbatim — a CHECK constraint on the same table, and an assertion
--- whose CHECK body names the column.
+-- Subject: `ALTER TABLE … DROP COLUMN` vs. the three EXPRESSION dependents that used to
+-- survive the drop verbatim — a CHECK constraint on the same table, an assertion whose
+-- CHECK body names the column, and a sibling column's DEFAULT (§15-18).
 --
 -- DROP COLUMN's dependents split in two. A STRUCTURAL dependent (a UNIQUE over the
 -- column, the table's own FK using it as a child column — §41.10 and §41.10.1) is
@@ -459,4 +459,115 @@ select b from DcCte;
 → [{"b":3}]
 
 drop table DcCte;
+-- run
+
+-- ===================================================================
+-- 15. A sibling column's DEFAULT naming the dropped column refuses the drop
+-- ===================================================================
+--
+-- A DEFAULT is a third EXPRESSION dependent and gets the same policy as the two above.
+-- Left unguarded the drop succeeded and the table could then accept NO new row at all:
+-- every insert failed at plan time with "new.a isn't a column". The guard runs FIRST of
+-- the four — ordered by widening blast radius, and a DEFAULT names a column of the very
+-- table being altered, the narrowest end.
+--
+-- The message names the column whose DEFAULT is in the way, the handle the user needs.
+-- Forward half of §29 in 41.3-alter-rename-propagation.
+
+create table DcDef (id integer primary key, a integer, b integer default (new.a + 1));
+insert into DcDef (id, a) values (1, 5);
+-- run
+
+alter table DcDef drop column a;
+-- error: it is referenced by the DEFAULT of column 'b'
+
+-- Untouched: the column is still there, still holds its value...
+select id, a, b from DcDef;
+→ [{"id":1,"a":5,"b":6}]
+
+-- ...and the DEFAULT still computes, so nothing was half-applied.
+insert into DcDef (id, a) values (2, 9);
+select id, b from DcDef where id = 2;
+→ [{"id":2,"b":10}]
+
+drop table DcDef;
+-- run
+
+-- ===================================================================
+-- 16. Dropping the column that OWNS a self-naming DEFAULT is still allowed
+-- ===================================================================
+--
+-- A column's own DEFAULT goes away with the column, so there is nothing for the drop to
+-- orphan. Refusing here would turn away a legal drop; the guard skips the dropped
+-- column's own default for exactly that reason.
+
+create table DcDefSelf (id integer primary key, a integer default (new.id + 1), b integer);
+insert into DcDefSelf (id, b) values (1, 7);
+-- run
+
+alter table DcDefSelf drop column a;
+select id, b from DcDefSelf;
+→ [{"id":1,"b":7}]
+
+-- Still writable afterwards.
+insert into DcDefSelf (id, b) values (2, 8);
+select count(*) as c from DcDefSelf;
+→ [{"c":2}]
+
+drop table DcDefSelf;
+-- run
+
+-- ===================================================================
+-- 17. A DEFAULT whose only match sits inside a SUBQUERY over ANOTHER table
+--     is no obstacle — the same scope-awareness §4 pins for a CHECK
+-- ===================================================================
+--
+-- The inner `v` binds to `UcDef.v`, not to this table's own `v`, so a depth-blind name
+-- match would false-refuse a legal drop. Sharing the probe with the rename walk is what
+-- keeps the two definitions of "names the column" identical.
+
+create table UcDef (k integer primary key, v integer);
+insert into UcDef values (1, 11);
+-- run
+
+create table DcDefSub (id integer primary key, v integer,
+                       w integer default ((select min(v) from UcDef)));
+insert into DcDefSub (id, v) values (1, 2);
+-- run
+
+alter table DcDefSub drop column v;
+select id, w from DcDefSub;
+→ [{"id":1,"w":11}]
+
+-- Still writable, and the surviving DEFAULT still reads UcDef.
+insert into DcDefSub (id) values (2);
+select id, w from DcDefSub where id = 2;
+→ [{"id":2,"w":11}]
+
+drop table DcDefSub;
+drop table UcDef;
+-- run
+
+-- ===================================================================
+-- 18. A `new` rebound by an inner FROM inside a DEFAULT does not block the drop
+-- ===================================================================
+--
+-- Mirror of §13 for the DEFAULT arm: `"new".a` there names the real table `"new"`, not
+-- this table's row image, so dropping this table's own like-named column is legal.
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+-- run
+
+create table DcDefShadow (id integer primary key, a integer,
+                          b integer default ((select max("new".a) from "new")));
+insert into DcDefShadow (id, a) values (1, 7);
+-- run
+
+alter table DcDefShadow drop column a;
+select id, b from DcDefShadow;
+→ [{"id":1,"b":3}]
+
+drop table DcDefShadow;
+drop table "new";
 -- run

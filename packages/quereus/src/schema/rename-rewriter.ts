@@ -618,6 +618,60 @@ export function renameColumnInCheckConstraints(
 		expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource));
 }
 
+/**
+ * Rewrite the renamed column inside the two expressions a `ColumnSchema` can carry —
+ * a column DEFAULT (`b integer default (new.a + 1)`, however authored: inline, or via
+ * `ALTER TABLE … ALTER COLUMN … SET DEFAULT`, which writes the same field) and a
+ * generated column's body (`g integer generated always as (a + 1)`) — in place, for
+ * every column of the renamed table itself.
+ *
+ * The seeded {@link renameColumnInCheckExpression} entry point is correct for both, for
+ * the two halves of what the seed provides:
+ *
+ * - The implicit unaliased binding to the owning table is what makes a generated
+ *   column's **bare** `a` resolve — it has no FROM clause to bind against, exactly like
+ *   a CHECK.
+ * - The seed also owns the `new.` / `old.` **row-image** namespace, which is what makes a
+ *   default's `new.a` resolve. A default is evaluated against the row being written, so
+ *   that qualifier names this table's row image, not anything a FROM binds.
+ *
+ * Case folding (`NEW.A`) and the shadowing edge (a real table literally named `new`,
+ * reached from a subquery inside the expression) therefore behave exactly as they do for
+ * a CHECK, because the same walk decides all three.
+ *
+ * Only pass the renamed table's OWN columns. A default on a *different* table can reach
+ * this table only through a subquery, so an unqualified ref there must bind inside that
+ * subquery's FROM — that caller wants {@link renameColumnInAst}, whose walk has no seed.
+ *
+ * Same sharing and idempotence story as {@link renameColumnInCheckConstraints}: a
+ * module's rename hook rebuilds only the renamed column's `ColumnSchema` and keeps every
+ * other one by reference, and even the rebuilt one carries the SAME expression nodes
+ * (`buildConstraintsFromColumn` passes them into the reconstructed `ColumnDef` by
+ * reference and `columnDefToSchema` assigns them straight back), so one in-place rewrite
+ * reaches every holder and a second call with the same pair is a no-op.
+ *
+ * The parameter is structurally typed rather than `ColumnSchema[]` so this module stays
+ * free of catalog imports; `ColumnSchema` satisfies it.
+ */
+export function renameColumnInColumnExpressions(
+	columns: ReadonlyArray<{
+		readonly defaultValue?: AST.Expression | null;
+		readonly generatedExpr?: AST.Expression;
+	}> | undefined,
+	tableName: string,
+	oldColName: string,
+	newColName: string,
+	defaultSchemaName: string,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	const rewrite = (expr: AST.Expression): boolean => renameColumnInCheckExpression(
+		expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource);
+	// Both walks always run — `||` on the results, not short-circuited between them.
+	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
+	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);
+	return defaultsChanged || generatedChanged;
+}
+
 interface ColumnRewriteState {
 	tableName: string;
 	oldCol: string;

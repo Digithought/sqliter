@@ -982,3 +982,181 @@ select id, z from t_ricte;
 → [{"id":1,"z":7}]
 
 drop table t_ricte;
+
+-- ===================================
+-- 29. RENAME COLUMN rewrites a `new.<col>` reference in a sibling column's DEFAULT
+-- ===================================
+-- A column DEFAULT names its siblings through the row-image qualifier — the same
+-- namespace §24 pins for a CHECK, and decided by the same walk. Pre-fix the rewrite
+-- pass never looked at `table.columns` at all, so after the rename every insert failed
+-- at plan time with "new.a isn't a column" and the table could accept no new rows.
+--
+-- Both halves matter: the post-rename insert must succeed AND the default must still
+-- compute the right value from the renamed column.
+
+create table t_rdnew (id integer primary key, a integer, b integer default (new.a + 1));
+
+insert into t_rdnew (id, a) values (1, 5);
+
+alter table t_rdnew rename column a to z;
+
+insert into t_rdnew (id, z) values (2, 7);
+
+select id, z, b from t_rdnew order by id;
+→ [{"id":1,"z":5,"b":6},{"id":2,"z":7,"b":8}]
+
+drop table t_rdnew;
+
+-- ===================================
+-- 30. A case-folded `NEW.A` in a DEFAULT follows the rename too
+-- ===================================
+-- Mirror of §26 for the DEFAULT arm — the same walk decides both, so the folding is
+-- shared rather than re-implemented.
+
+create table t_rdcase (id integer primary key, a integer, b integer default (NEW.A + 1));
+
+alter table t_rdcase rename column a to z;
+
+insert into t_rdcase (id, z) values (1, 7);
+
+select id, z, b from t_rdcase;
+→ [{"id":1,"z":7,"b":8}]
+
+drop table t_rdcase;
+
+-- ===================================
+-- 31. A DEFAULT installed by `alter column … set default` follows the rename
+-- ===================================
+-- `SET DEFAULT` writes the very same `ColumnSchema.defaultValue` field the inline
+-- spelling does, so it is not a separate gap — pinned here so a future refactor that
+-- splits the two storage paths trips this test.
+
+create table t_rdset (id integer primary key, a integer, b integer);
+
+alter table t_rdset alter column b set default (new.a + 1);
+
+alter table t_rdset rename column a to z;
+
+insert into t_rdset (id, z) values (2, 7);
+
+select id, z, b from t_rdset;
+→ [{"id":2,"z":7,"b":8}]
+
+drop table t_rdset;
+
+-- ===================================
+-- 32. RENAME COLUMN rewrites a generated column's expression
+-- ===================================
+-- A generated column's body reads its siblings BARE (`generated always as (a + 1)`) —
+-- it has no FROM clause, so the unqualified name binds to the owning table exactly as
+-- it does inside a CHECK. Pre-fix the rename left it naming `a` and the next insert
+-- failed with "Column not found: a".
+--
+-- Deliberately NOT table-qualified (`generated always as (t.a + 1)`): that spelling
+-- fails on insert with or without a rename, tracked by
+-- `bug-generated-column-own-table-qualified-reference-unusable`.
+
+create table t_rgen (id integer primary key, a integer, g integer generated always as (a + 1));
+
+insert into t_rgen (id, a) values (1, 5);
+
+alter table t_rgen rename column a to z;
+
+insert into t_rgen (id, z) values (2, 7);
+
+select id, z, g from t_rgen order by id;
+→ [{"id":1,"z":5,"g":6},{"id":2,"z":7,"g":8}]
+
+drop table t_rgen;
+
+-- ===================================
+-- 33. A DEFAULT and a generated expression on the same table both follow one rename
+-- ===================================
+-- The two fields are rewritten by one pass over `table.columns`; this pins that
+-- neither arm short-circuits the other.
+
+create table t_rboth (id integer primary key, a integer,
+                      b integer default (new.a + 1),
+                      g integer generated always as (a * 2));
+
+insert into t_rboth (id, a) values (1, 5);
+
+alter table t_rboth rename column a to z;
+
+insert into t_rboth (id, z) values (2, 7);
+
+select id, z, b, g from t_rboth order by id;
+→ [{"id":1,"z":5,"b":6,"g":10},{"id":2,"z":7,"b":8,"g":14}]
+
+drop table t_rboth;
+
+-- ===================================
+-- 34. A DEFAULT's subquery reading a like-named column on ANOTHER table must NOT rewrite
+-- ===================================
+-- The rewrite is scope-AWARE, not a depth-blind name match: the inner `v` binds to
+-- `u_dsub.v`, so renaming this table's own `v` must leave it alone. Rewriting it would
+-- leave the default naming a column `u_dsub` does not have. Mirror of the CHECK case
+-- at §15 for the DEFAULT arm.
+
+create table u_dsub (k integer primary key, v integer);
+insert into u_dsub values (1, 11);
+
+create table t_dsub (id integer primary key, v integer,
+                     w integer default ((select min(v) from u_dsub)));
+
+alter table t_dsub rename column v to vz;
+
+insert into t_dsub (id, vz) values (1, 2);
+
+select id, vz, w from t_dsub;
+→ [{"id":1,"vz":2,"w":11}]
+
+drop table t_dsub;
+drop table u_dsub;
+
+-- ===================================
+-- 35. A DEFAULT on ANOTHER table reaching the renamed column through a subquery DOES rewrite
+-- ===================================
+-- The other half of §34: here the inner `a` genuinely binds to the renamed table's
+-- column (it is the subquery's own FROM source), so the rename must follow it or
+-- `u_xdef` becomes uninsertable. The unseeded walk decides this arm — an unqualified
+-- ref in someone else's default binds inside its own subquery's FROM, never to the
+-- renamed table implicitly.
+
+create table t_xdef (id integer primary key, a integer);
+insert into t_xdef values (1, 42);
+
+create table u_xdef (id integer primary key, c integer default ((select max(a) from t_xdef)));
+
+alter table t_xdef rename column a to z;
+
+insert into u_xdef (id) values (1);
+
+select id, c from u_xdef;
+→ [{"id":1,"c":42}]
+
+drop table u_xdef;
+drop table t_xdef;
+
+-- ===================================
+-- 36. A `new` REBOUND BY AN INNER FROM inside a DEFAULT is not a row image
+-- ===================================
+-- Mirror of §27 for the DEFAULT arm: `create table "new" (…)` is legal, so a default's
+-- subquery may read from it. Rewriting `"new".a` → `"new".z` would leave the default
+-- naming a column that table does not have and the next insert would fail at plan time.
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+
+create table t_dshadow (id integer primary key, a integer,
+                        b integer default ((select max("new".a) from "new")));
+
+alter table t_dshadow rename column a to z;
+
+insert into t_dshadow (id, z) values (1, 7);
+
+select id, z, b from t_dshadow;
+→ [{"id":1,"z":7,"b":3}]
+
+drop table t_dshadow;
+drop table "new";

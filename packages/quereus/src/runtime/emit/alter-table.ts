@@ -13,8 +13,9 @@ import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractC
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
-import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameColumnInColumnExpressions } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
+import type { ColumnSchema } from '../../schema/column.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, uniqueConstraintColumnSetKey } from '../../schema/catalog.js';
 import type { Schema } from '../../schema/schema.js';
@@ -22,7 +23,7 @@ import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
-import { assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn, assertNoForeignKeyReferencesColumn } from './drop-column-guards.js';
+import { assertNoColumnDefaultNamesColumn, assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn, assertNoForeignKeyReferencesColumn } from './drop-column-guards.js';
 import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
@@ -1151,11 +1152,13 @@ async function runDropColumn(
 		}
 	}
 
-	// Validate: the remaining dependents `module.alterTable` cannot narrow — a CHECK on this
-	// table, a foreign key in another table pointing AT the column, and an assertion body.
-	// All three run before `requireVtabModule` / `module.alterTable`, so a refused drop
-	// persists nothing. Ordered by widening blast radius (this table → another table → the
-	// whole database), so the most locally-explainable violation is the one reported.
+	// Validate: the remaining dependents `module.alterTable` cannot narrow — a sibling
+	// column's DEFAULT, a CHECK on this table, a foreign key in another table pointing AT
+	// the column, and an assertion body. All four run before `requireVtabModule` /
+	// `module.alterTable`, so a refused drop persists nothing. Ordered by widening blast
+	// radius (a column of this table → this table → another table → the whole database), so
+	// the most locally-explainable violation is the one reported.
+	assertNoColumnDefaultNamesColumn(rctx.db, tableSchema, columnName);
 	assertNoCheckConstraintNamesColumn(rctx.db, tableSchema, columnName);
 	assertNoForeignKeyReferencesColumn(rctx.db, tableSchema, columnName);
 	assertNoAssertionNamesColumn(rctx.db, tableSchema, columnName);
@@ -2382,6 +2385,23 @@ function rewriteTableForColumnRename(
 		return { ...idx };
 	});
 
+	// Column-level expressions — a DEFAULT (`b integer default (new.a + 1)`) and a
+	// generated column's body (`g integer generated always as (a + 1)`). Same branch split
+	// the checks and predicates use above: the renamed table's own columns take the seeded
+	// walk (a generated body's bare `a` binds to the owning table; a default's `new.a`
+	// names its row image), any other table's take the unseeded one (it can reach here only
+	// through a subquery, whose FROM must bind the ref).
+	//
+	// Unlike the collections above, no per-item shallow copy: the rewrite is in place and a
+	// `ColumnSchema`'s own fields are untouched, so a fresh column object would only make
+	// the catalog's array stop being identical to the one the module's rename hook just
+	// built and handed back. Flipping `changed` is what re-registers the table and fires
+	// `table_modified`, which is all the copies above achieve either.
+	const columnsRewritten = isRenamedTable
+		? renameColumnInColumnExpressions(table.columns, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)
+		: rewriteOtherTableColumnExpressions(table.columns, tableName, oldCol, newCol, renamedSchemaLower);
+	if (columnsRewritten) changed = true;
+
 	if (!changed) return table;
 
 	return Object.freeze({
@@ -2393,10 +2413,34 @@ function rewriteTableForColumnRename(
 }
 
 /**
+ * The unseeded arm of the column-expression rewrite above, for a table that is NOT the
+ * renamed one. `renameColumnInColumnExpressions` is deliberately seeded-only (that is the
+ * whole reason it exists), so the other branch walks the two fields directly with
+ * {@link renameColumnInAst} — the same entry point the checks and predicates arms use for
+ * a foreign table, and for the same reason: an unqualified ref in someone else's default
+ * must bind inside its own subquery's FROM, never to this table.
+ */
+function rewriteOtherTableColumnExpressions(
+	columns: ReadonlyArray<ColumnSchema>,
+	tableName: string,
+	oldCol: string,
+	newCol: string,
+	renamedSchemaLower: string,
+): boolean {
+	let changed = false;
+	for (const col of columns) {
+		for (const expr of [col.defaultValue, col.generatedExpr]) {
+			if (expr && renameColumnInAst(expr, tableName, oldCol, newCol, renamedSchemaLower)) changed = true;
+		}
+	}
+	return changed;
+}
+
+/**
  * Build a minimal constraints array from an existing ColumnSchema
  * so that the ColumnDef AST accurately represents the column.
  */
-function buildConstraintsFromColumn(col: import('../../schema/column.js').ColumnSchema): ColumnDef['constraints'] {
+function buildConstraintsFromColumn(col: ColumnSchema): ColumnDef['constraints'] {
 	const constraints: ColumnDef['constraints'] = [];
 	if (col.notNull) {
 		constraints.push({ type: 'notNull' });

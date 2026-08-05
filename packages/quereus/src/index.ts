@@ -220,6 +220,7 @@ export type { SyntheticExposedIndex } from './schema/catalog.js';
 export {
 	renameColumnInIndexPredicates, renameTableInIndexPredicates,
 	renameColumnInCheckConstraints, renameTableInCheckConstraints,
+	renameColumnInColumnExpressions,
 } from './schema/rename-rewriter.js';
 export type { ResolveColumnInSource } from './schema/rename-rewriter.js';
 // Reserved-tag namespace surface — `@quereus/quereus-store` keys its sync-replication

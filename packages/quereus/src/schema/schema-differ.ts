@@ -2427,6 +2427,17 @@ function computeColumnAttributeChange(
 	}
 
 	// Default expression — declared absent + actual present → drop (null).
+	//
+	// NOTE: this compare is NOT inverse-reconciled against the pending column renames the way
+	// constraint bodies are (`reconciledDeclaredBody` covers named constraints only). So a diff
+	// that carries a column rename AND a default naming the renamed column (`default (new.a+1)`
+	// re-declared as `default (new.z+1)`) sees a spurious mismatch and emits one redundant
+	// `ALTER COLUMN … SET DEFAULT` alongside the `RENAME COLUMN`. Harmless and deliberately left
+	// alone: the emitter orders RENAME COLUMN first, so the redundant statement re-sets the
+	// column to exactly the expression the rename propagation already produced, and the
+	// follow-up diff is empty (pinned by `test/schema/differ-alter-column.spec.ts`, "a column
+	// rename carrying a DEFAULT"). Reconciling here would mean inverse-renaming the declared
+	// default through `columnsToRename` for no behavioural gain.
 	const declaredDefault = extractDeclaredDefault(declared);
 	const hasDeclaredDefaultConstraint = !!declared.constraints?.some(c => c.type === 'default');
 	const actualDefault = actual.defaultValue ?? null;

@@ -8,8 +8,9 @@ import { buildColumnSourceResolver } from '../../schema/column-source-resolver.j
 
 /**
  * The `ALTER TABLE … DROP COLUMN` guards over dependents that `runDropColumn` does not
- * otherwise see: a CHECK constraint on the table itself, an assertion whose CHECK body
- * names the column, and a foreign key in *another* table pointing **at** the column.
+ * otherwise see: the DEFAULT of another column on the table itself, a CHECK constraint on
+ * the table itself, an assertion whose CHECK body names the column, and a foreign key in
+ * *another* table pointing **at** the column.
  *
  * Whether a dependent is removed with the column or blocks the drop turns on two
  * questions: is it defined by a *column set* or by an *expression*, and does it live on
@@ -20,14 +21,14 @@ import { buildColumnSourceResolver } from '../../schema/column-source-resolver.j
  *   a column makes them a different constraint, not a narrower one, so both vtab modules
  *   **remove them with the column**.
  * - **Expression** dependents (a generated column's expression, a partial index's
- *   `WHERE`, and — here — a CHECK expression and an assertion body) are arbitrary
- *   user-authored logic with no narrowed form at all. The only choices are
+ *   `WHERE`, and — here — a column DEFAULT, a CHECK expression and an assertion body) are
+ *   arbitrary user-authored logic with no narrowed form at all. The only choices are
  *   delete-it-silently and refuse, and the engine **refuses**, `StatusCode.CONSTRAINT`.
  * - **Dependents living in another table** — here, a foreign key whose *parent* column is
  *   the one being dropped — refuse regardless of shape. Removing one would silently
  *   weaken a constraint on a table the user did not name in the statement.
  *
- * Refuse is right for all three guards here because it is what the two expression guards
+ * Refuse is right for all four guards here because it is what the two expression guards
  * already inside `runDropColumn` do (so the function gains no second policy), it is
  * SQLite's position for the whole family, and — for the assertion arm —
  * `assertNoAssertionDependsOn` already chose refuse for the *table* verb over the same
@@ -40,10 +41,55 @@ import { buildColumnSourceResolver } from '../../schema/column-source-resolver.j
  * message quotes the constraint's expression so the user can at least see what is in
  * the way.
  *
- * All three guards must run **before** `requireVtabModule` / `module.alterTable`, so a
+ * All four guards must run **before** `requireVtabModule` / `module.alterTable`, so a
  * refused statement never reaches a persisting module and the table is left untouched
  * rather than reverted.
  */
+
+/**
+ * Refuses the drop when the DEFAULT of some OTHER column on `tableSchema` names the column.
+ *
+ * A default is evaluated against the row being written, so it names its siblings through
+ * the row-image qualifier — `b integer default (new.a + 1)`. Dropping `a` leaves that
+ * default uncompilable and the table unable to accept any new row at all, with an error
+ * naming a column the user deliberately removed. Refusing keeps the failure attached to
+ * the statement that caused it.
+ *
+ * Decided by {@link columnReferencedInCheckExpression}, the same seeded probe the CHECK
+ * guard below uses, and for the same two reasons: the seed owns the `new.` / `old.`
+ * row-image namespace a default is written in, and it is scope-**aware**, so a default
+ * whose subquery reads a like-named column on another table
+ * (`default ((select min(v) from u))`) does not false-refuse dropping this table's own `v`.
+ * Sharing the probe with the rename walk is what makes "the drop refuses exactly the
+ * references a rename would have rewritten" true — the same equivalence the CHECK guard
+ * rests on, case folding (`NEW.A`) and the `"new"`-named-table shadowing edge included.
+ *
+ * The dropped column's **own** default is skipped: it goes away with the column, so a
+ * self-naming default (`a integer default (new.a)`) is not something the drop orphans.
+ *
+ * The generated-column half of this pair is NOT here — `runDropColumn` already refuses off
+ * `generatedColumnDependencies`, the resolved column-index map `extractGeneratedColumnDependencies`
+ * builds. Two mechanisms for one policy, but the existing one predates this guard and its map
+ * is load-bearing elsewhere (evaluation order), so it stays where it is.
+ */
+export function assertNoColumnDefaultNamesColumn(
+	db: Database,
+	tableSchema: TableSchema,
+	columnName: string,
+): void {
+	const lowerColumn = columnName.toLowerCase();
+	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
+	for (const col of tableSchema.columns) {
+		if (col.name.toLowerCase() === lowerColumn) continue;
+		if (!col.defaultValue) continue;
+		if (!columnReferencedInCheckExpression(
+			col.defaultValue, tableSchema.name, columnName, tableSchema.schemaName, resolveColumnInSource)) continue;
+		throw new QuereusError(
+			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by the DEFAULT of column '${col.name}'`,
+			StatusCode.CONSTRAINT,
+		);
+	}
+}
 
 /**
  * Refuses the drop when one of `tableSchema`'s own CHECK constraints names the column.
