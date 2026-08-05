@@ -10,7 +10,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, asyncIterableToArray, type DatabaseInternal, type VirtualTableConnection } from '@quereus/quereus';
+import { Database, MemoryTableModule, asyncIterableToArray, installCommitStall, runCommittedReadConformance, type DatabaseInternal, type VirtualTableConnection } from '@quereus/quereus';
 import { IsolationModule } from '@quereus/isolation';
 import {
 	createIsolatedStoreModule,
@@ -201,6 +201,53 @@ describe('Isolated Store Module', () => {
 			// Reads".
 			expect(new StoreModule(provider).readCommittedSnapshot).to.equal(false);
 			expect(createIsolatedStoreModule({ provider }).readCommittedSnapshot).to.equal(false);
+		});
+
+		it('the conformance harness refuses the store stack, naming the flag', async () => {
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+			await db.exec('CREATE TABLE conf (id INTEGER PRIMARY KEY, v TEXT) USING store');
+
+			let message = '';
+			try {
+				await runCommittedReadConformance({
+					db, table: 'conf', keyColumn: 'id', valueColumn: 'v', rowCount: 10,
+				});
+			} catch (e) {
+				message = e instanceof Error ? e.message : String(e);
+			}
+			expect(message).to.contain('readCommittedSnapshot');
+		});
+
+		/**
+		 * The engine half of the same fact. Because the stack declines the flag, an
+		 * opted-in read of a store-backed table is INELIGIBLE and silently falls back
+		 * to the serialized path. Both halves matter: the read must still return the
+		 * right rows, AND it must demonstrably wait for the parked writer. A future
+		 * change that wrongly qualifies the store stack breaks the second assertion
+		 * loudly instead of quietly serving a half-flushed batch.
+		 */
+		it('an opted-in read of a store-backed table falls back: correct rows, and it waits', async () => {
+			const stall = installCommitStall(db);
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+			await db.exec('CREATE TABLE fallback_t (id INTEGER PRIMARY KEY, v TEXT) USING store');
+			await db.exec(`INSERT INTO fallback_t VALUES (1, 'a')`);
+
+			const entered = stall.arm();
+			const writer = db.exec(`INSERT INTO fallback_t VALUES (2, 'b')`);
+			await entered; // the writer is now parked inside its commit
+
+			let settled = false;
+			const read = db.get('SELECT count(*) AS n FROM fallback_t', undefined, { readConcurrency: 'committed' })
+				.then(row => { settled = true; return row; }, err => { settled = true; throw err; });
+
+			for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setTimeout(resolve, 0));
+			expect(settled, 'a store-backed read must NOT run mutex-free past a parked commit').to.equal(false);
+
+			stall.release();
+			await writer;
+			const row = await read;
+			// Serialized semantics: it waited, so it sees the writer's row.
+			expect(Number(row?.n)).to.equal(2);
 		});
 	});
 

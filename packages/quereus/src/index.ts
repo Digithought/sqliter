@@ -62,6 +62,17 @@ export {
 export type { BaseModuleConfig, CatalogObjectKind, EffectiveRowSource, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
 export { getModuleConcurrencyMode, getModuleReadCommittedSnapshot, acquireConnectionLock } from './vtab/concurrency.js';
 
+// Module-author test support. Ships in the package deliberately — an out-of-tree
+// module needs the conformance check at runtime. Nothing in the engine imports it.
+export type {
+	CommitStallHandle,
+	CommittedReadConformanceOptions,
+	CommittedReadConformanceResult,
+} from './vtab/test-support/committed-read-conformance.js';
+export { runCommittedReadConformance } from './vtab/test-support/committed-read-conformance.js';
+export type { CommitStall } from './vtab/test-support/commit-stall.js';
+export { installCommitStall } from './vtab/test-support/commit-stall.js';
+
 // Virtual Table Event Hooks
 export type {
 	VTableDataChangeEvent,

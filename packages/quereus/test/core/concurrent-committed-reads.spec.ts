@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { AbortError } from '../../src/common/errors.js';
-import type { VirtualTableConnection } from '../../src/vtab/connection.js';
+import { installCommitStall, type CommitStall } from '../../src/vtab/test-support/commit-stall.js';
 import type { SqlValue } from '../../src/common/types.js';
 
 /**
@@ -11,58 +11,10 @@ import type { SqlValue } from '../../src/common/types.js';
  * against each table's last committed state, so it completes even while another
  * statement is parked inside its virtual-table commit.
  *
- * Stall harness: instead of a wrapper module (the memory table registers its
- * connection itself via `db.registerConnection`, out of a wrapper's reach), we
- * patch `db.registerConnection` up front so every registered connection's
- * `commit()` first awaits a test-armed gate. Disarmed, commits pass through
- * untouched; armed, the next commit parks — exactly the mid-commit window the
- * feature targets — and `release()` lets it land normally.
+ * The mid-commit stall gate lives in `vtab/test-support/commit-stall.ts` — it
+ * ships with the package because the conformance harness (and out-of-tree module
+ * authors) need the same window.
  */
-
-interface StallControl {
-	/** Arm the gate; returns a promise resolving when a commit ENTERS the stall. */
-	arm(): Promise<void>;
-	/** Release the gate (idempotent); parked and future commits proceed. */
-	release(): void;
-}
-
-function instrumentCommits(db: Database): StallControl {
-	let gate: Promise<void> | null = null;
-	let releaseGate: (() => void) | null = null;
-	let enteredResolve: (() => void) | null = null;
-
-	const original = db.registerConnection.bind(db);
-	(db as unknown as { registerConnection: typeof db.registerConnection }).registerConnection =
-		async (conn: VirtualTableConnection) => {
-			const realCommit = conn.commit.bind(conn);
-			(conn as { commit: () => Promise<void> }).commit = async () => {
-				if (gate) {
-					enteredResolve?.();
-					enteredResolve = null;
-					await gate;
-				}
-				await realCommit();
-			};
-			return original(conn);
-		};
-
-	return {
-		arm() {
-			const entered = new Promise<void>(resolve => {
-				enteredResolve = resolve;
-			});
-			gate = new Promise<void>(resolve => {
-				releaseGate = resolve;
-			});
-			return entered;
-		},
-		release() {
-			gate = null;
-			releaseGate?.();
-			releaseGate = null;
-		},
-	};
-}
 
 async function collect(iter: AsyncIterable<Record<string, SqlValue>>): Promise<Record<string, SqlValue>[]> {
 	const rows: Record<string, SqlValue>[] = [];
@@ -82,7 +34,7 @@ async function settleWindow(): Promise<void> {
  * SERIALIZED path. Gives it a fair settle window, pins that it has not resolved,
  * then releases the stall and returns its result.
  */
-async function expectSerialized<T>(stall: StallControl, work: Promise<T>): Promise<T> {
+async function expectSerialized<T>(stall: CommitStall, work: Promise<T>): Promise<T> {
 	let settled = false;
 	const tracked = work.then(
 		value => { settled = true; return value; },
@@ -108,11 +60,11 @@ function registerNoSnapshotModule(db: Database, name = 'nosnap'): void {
 
 describe('concurrent committed reads (readConcurrency: committed)', () => {
 	let db: Database;
-	let stall: StallControl;
+	let stall: CommitStall;
 
 	beforeEach(async () => {
 		db = new Database();
-		stall = instrumentCommits(db);
+		stall = installCommitStall(db);
 		await db.exec("create table t (id integer primary key, v text)");
 		await db.exec("insert into t values (1, 'a')");
 	});

@@ -861,6 +861,34 @@ This would provide true ACID semantics and enable features like:
 - Sync operations that apply atomically across tables
 - Snapshot isolation for reporting queries
 
+### Concurrent committed reads: not supported
+
+The engine can run an eligible read-only statement *outside* the execution mutex,
+against each table's last committed state, when the caller passes
+`{ readConcurrency: 'committed' }` — so the read completes even while another
+statement is parked inside a slow commit. **Store-backed tables never take that
+path.** `StoreModule.readCommittedSnapshot` is `false`, so a read of a
+store-backed table silently falls back to the ordinary serialized path: correct
+rows, but it waits for the writer like any other statement. Opting in is never an
+error; it just has no effect here.
+
+Two things would have to change first:
+
+1. `StoreModule.connect` returns a **shared cached `StoreTable` per table key**,
+   so the `_readCommitted` connect option is dropped on the floor — the
+   "committed snapshot" reader is handed the same instance the writer is using.
+2. `StoreTable.query` **merges the coordinator's pending-op view** over the
+   committed store (read-your-own-writes, see [Isolation Gap](#isolation-gap)), so
+   a read taken while a commit flushes those ops observes a partially applied
+   batch.
+
+Wrapping with `@quereus/isolation` does not rescue this: the wrapper declines the
+flag on its own account too. See
+[Committed-Snapshot Reads](module-authoring.md#4-committed-snapshot-reads-_readcommitted)
+for the obligation a module takes on by declaring it, and the
+`runCommittedReadConformance` harness that checks it. The work that would let the
+store stack qualify is filed as `backlog/feat-store-committed-snapshot-reads`.
+
 ## Statistics
 
 Row counts are maintained lazily for efficient query planning:

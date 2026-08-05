@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, VirtualTable, AccessPlanBuilder, IndexConstraintOp, asyncIterableToArray, getModuleConcurrencyMode, getModuleReadCommittedSnapshot, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
+import { Database, MemoryTableModule, VirtualTable, AccessPlanBuilder, IndexConstraintOp, asyncIterableToArray, getModuleConcurrencyMode, getModuleReadCommittedSnapshot, installCommitStall, runCommittedReadConformance, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
 import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs, UpdateResult, IndexDescriptor, EffectiveRowSource } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
@@ -4396,6 +4396,52 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			await db.close();
 
 			expect(rows.length, 'today the committed read observes the half-applied batch').to.equal(3);
+		});
+
+		/**
+		 * Flip to `true` together with `IsolationModule.readCommittedSnapshot` when
+		 * `fix/bug-isolation-committed-read-shares-writer-handle` lands. The case
+		 * below then stops asserting the harness's refusal and starts asserting a
+		 * full conformance pass — a wrapper whose snapshot safety depends on its own
+		 * commit path, not on the module beneath it, is the most valuable in-tree
+		 * case the harness can run.
+		 */
+		const ISOLATION_SERVES_COMMITTED_SNAPSHOT = false;
+
+		it('the conformance harness refuses the wrapper today (one flag flip from asserting a pass)', async () => {
+			const db = new Database();
+			const stall = installCommitStall(db);
+			db.registerModule('iso_conf', new IsolationModule({ underlying: new MemoryTableModule() }));
+			await db.exec('CREATE TABLE iso_conf_t (id INTEGER PRIMARY KEY, v TEXT) USING iso_conf');
+
+			const run = () => runCommittedReadConformance({
+				db,
+				table: 'iso_conf_t',
+				keyColumn: 'id',
+				valueColumn: 'v',
+				rowCount: 20,
+				stallCommit: () => stall.asStallCommit(),
+			});
+
+			try {
+				if (ISOLATION_SERVES_COMMITTED_SNAPSHOT) {
+					const result = await run();
+					expect(result.observedCommitOverlap).to.equal(true);
+					expect(result.fullScanRows).to.equal(20);
+				} else {
+					let message = '';
+					try {
+						await run();
+					} catch (e) {
+						message = e instanceof Error ? e.message : String(e);
+					}
+					expect(message, 'the harness refuses a module that declines the flag')
+						.to.contain('readCommittedSnapshot');
+				}
+			} finally {
+				stall.release();
+				await db.close();
+			}
 		});
 	});
 

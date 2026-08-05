@@ -461,6 +461,76 @@ incrementally — the reader can observe a half-applied flush even over a memory
 underlying whose own commit is atomic. **A wrapper is only as snapshot-safe as
 its own commit path**, not as the module beneath it.
 
+#### Proving it: the conformance harness
+
+The obligation above is prose; `runCommittedReadConformance` is the runnable form
+of it. It ships from the package root so an out-of-tree module can run it against
+its own table, and it is framework-agnostic — it throws a descriptive `Error` on
+failure and returns a result object on success, so it drops into Mocha, Vitest,
+or a plain script with no assertion library.
+
+```typescript
+import { Database, installCommitStall, runCommittedReadConformance } from '@quereus/quereus';
+
+const db = new Database();
+// `installCommitStall` patches the database so the next commit parks until you
+// release it. It works for any module that registers its write connections with
+// `Database.registerConnection`; supply your own `stallCommit` if yours does not.
+// TEST SUPPORT ONLY — the patch is permanent for the life of `db`.
+const stall = installCommitStall(db);
+
+db.registerModule('mymod', new MyModule());
+await db.exec('create table conf (id integer primary key, v text) using mymod');
+
+const result = await runCommittedReadConformance({
+  db,
+  table: 'conf',          // must be EMPTY on entry — the harness owns its contents
+  keyColumn: 'id',        // integer primary key
+  valueColumn: 'v',       // a text column the writer rewrites
+  stallCommit: () => stall.asStallCommit(),
+});
+```
+
+What it does, in order:
+
+1. **Refuses** unless the table's module declares `readCommittedSnapshot` — the
+   harness only applies to modules claiming the guarantee, and a confusing
+   assertion failure is a poor way to say "you never opted in".
+2. Seeds `rowCount` rows (default 200) and commits.
+3. Starts an **unawaited** writer that rewrites *every* seeded row's value **and**
+   appends new rows in one statement, so a torn publish shows up both as a mix of
+   old and new values and as a longer result set. `stallCommit` parks it
+   mid-commit.
+4. While it is parked, runs two reads with `readConcurrency: 'committed'` — a full
+   scan and an index-driven path over `keyColumn`. The index leg is only run if
+   the plan really contains a seek; otherwise it is **skipped with a reason** in
+   the result rather than silently rerun as a second full scan.
+5. Asserts both reads return exactly the seeded snapshot, that every value column
+   holds its pre-write value, and that the two legs agree row-for-row. Any
+   divergence is reported with the specific rows that differed. *Without* a
+   provable park the bar necessarily drops: each read must equal ONE whole state
+   (pre- or post-write) — a mix is still a failure, but a writer that committed
+   before the read began is not — and the two legs are not compared, since they
+   may legitimately straddle the commit.
+6. Releases the stall, awaits the writer, and asserts a fresh read now sees the
+   post-write state — so a module that pins a snapshot and never advances it fails
+   too. Finally it deletes the rows it wrote.
+
+**Read `observedCommitOverlap` before believing a pass.** It is `true` only when a
+`stallCommit` was supplied *and* the writer stayed parked for the whole of both
+reads. `false` means "no evidence the read overlapped a commit" — **not**
+"conformant". Without a stall, a module that commits in one synchronous step may
+leave no window to observe at all.
+
+```typescript
+if (!result.observedCommitOverlap) {
+  throw new Error('no commit overlap observed — supply a stallCommit for a meaningful run');
+}
+if (result.indexDrivenSkippedReason) {
+  console.warn(`index-driven leg not covered: ${result.indexDrivenSkippedReason}`);
+}
+```
+
 ### 5. Backing Host (Materialized-View Backing Tables)
 
 A module may volunteer to host materialized-view backing tables by implementing
