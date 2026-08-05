@@ -329,8 +329,8 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 
 				// Qualify table name with schema if not main
 				const qualifiedTableName = (schemaName && schemaName.toLowerCase() !== 'main')
-					? `${schemaName}.${tableName}`
-					: tableName;
+					? `${quoteIdentifier(schemaName)}.${quoteIdentifier(tableName)}`
+					: quoteIdentifier(tableName);
 
 				// Resolve the just-migrated table to learn its PK column list for the
 				// per-row conflict target. The migration loop above created/aligned the

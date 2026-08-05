@@ -1972,3 +1972,76 @@ diff schema nm_assert_pol;
 
 drop table nm_unrelated;
 drop table nm_assert_pol.at_t;
+
+-- ===================================================================
+-- Seed-apply against a quoted (non-bare) schema name (ticket
+-- bug-seed-schema-name-not-quoted). The generated seed INSERT used to
+-- splice schemaName/tableName into the target unquoted, so any schema
+-- name needing quoting broke the apply. Two distinct failure shapes:
+-- a colon in the name reaches the parser as a bare token and derails
+-- statement parsing, while a digit-e-nondigit run (e.g. "4ee6") gets
+-- read by the LEXER as a botched scientific-notation number before the
+-- parser ever sees it. Both must be fixed by quoting the whole name.
+-- ===================================================================
+
+-- Symptom 1: colon in the schema name, no digit-e-nondigit run.
+declare schema "scope:alpha" using (default_vtab_module = 'memory') {
+	table meta {
+		id INTEGER PRIMARY KEY,
+		label TEXT NOT NULL
+	}
+
+	seed meta (
+		(1, 'first')
+	)
+}
+
+-- run
+
+apply schema "scope:alpha" with seed;
+
+-- run
+
+select id, label from "scope:alpha".meta order by id;
+→ [{"id": 1, "label": "first"}]
+
+-- Idempotent reseed stays a no-op on the existing PK.
+apply schema "scope:alpha" with seed;
+
+-- run
+
+select id, label from "scope:alpha".meta order by id;
+→ [{"id": 1, "label": "first"}]
+
+drop table "scope:alpha".meta;
+
+-- Symptom 2: a digit-e-nondigit run (no colon) that the lexer would
+-- otherwise misread as a truncated scientific-notation number literal.
+declare schema "item4ee6" using (default_vtab_module = 'memory') {
+	table meta {
+		id INTEGER PRIMARY KEY,
+		label TEXT NOT NULL
+	}
+
+	seed meta (
+		(1, 'first')
+	)
+}
+
+-- run
+
+apply schema "item4ee6" with seed;
+
+-- run
+
+select id, label from "item4ee6".meta order by id;
+→ [{"id": 1, "label": "first"}]
+
+apply schema "item4ee6" with seed;
+
+-- run
+
+select id, label from "item4ee6".meta order by id;
+→ [{"id": 1, "label": "first"}]
+
+drop table "item4ee6".meta;
