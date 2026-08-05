@@ -327,6 +327,14 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 	 * than being swallowed: `renameTable` must not rewrite the catalog under
 	 * `newName` after an incomplete copy, which would reproduce the old
 	 * silent-data-loss bug through a different path.
+	 *
+	 * NOTE: a failed copy leaves partially-written stores under `newName`, and
+	 * nothing clears them — a later retry of the same rename copies over them
+	 * key-by-key, so a row DELETED between the two attempts survives as a stale
+	 * entry under the new name. Harmless today (the destination is empty on the
+	 * first attempt, and a retry of an unchanged table is idempotent); if
+	 * retry-after-partial-copy ever becomes an ordinary path, drain the
+	 * destination stores before copying into them.
 	 */
 	private async copyTableStores(
 		schemaName: string,
@@ -350,6 +358,12 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 			await copyEntries(oldIndex, newIndex);
 		}
 
+		// NOTE: reclaim is best-effort by contract — `deleteTableStores` is only
+		// promised to drop the old-named stores, and the two mobile providers
+		// (react-native-leveldb, nativescript-sqlite) merely CLOSE them today, so
+		// this arm silently leaves the same orphan the `else` arm warns about. That
+		// is a provider defect, tracked by `bug-mobile-providers-delete-table-stores-only-closes`;
+		// the rename itself is correct either way.
 		if (this.provider.deleteTableStores) {
 			await this.provider.deleteTableStores(schemaName, oldName, indexNames);
 		} else {

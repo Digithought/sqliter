@@ -3,8 +3,7 @@
  * implement the optional `renameTableStores` hook, the module must still move
  * a table's rows (and its secondary indexes) to the new name by copying
  * through the REQUIRED `getStore`/`getIndexStore` surface, instead of silently
- * leaving them behind under the old name (see the bug this guards against —
- * `tickets/implement/1-bug-store-rename-silently-loses-rows-without-provider-hook.md`).
+ * leaving them behind under the old name.
  *
  * Both shipped mobile providers (`@quereus/plugin-react-native-leveldb`,
  * `@quereus/plugin-nativescript-sqlite`) ship without `renameTableStores`
@@ -22,11 +21,14 @@ import { StoreModule, InMemoryKVStore, type KVStoreProvider } from '../src/index
  * optional native-move hook. Exercises `StoreModuleRename`'s generic
  * copy-then-reclaim fallback.
  */
-function createProviderWithoutRenameHook(): KVStoreProvider & {
+function createProviderWithoutRenameHook(options: { withDeleteTableStores?: boolean } = {}): KVStoreProvider & {
 	stores: Map<string, InMemoryKVStore>;
+	closed: string[];
 	_hardClose: () => void;
 } {
+	const withDelete = options.withDeleteTableStores ?? true;
 	const stores = new Map<string, InMemoryKVStore>();
+	const closed: string[] = [];
 	const getOrCreate = (key: string): InMemoryKVStore => {
 		let s = stores.get(key);
 		if (!s) {
@@ -41,21 +43,28 @@ function createProviderWithoutRenameHook(): KVStoreProvider & {
 
 	return {
 		stores,
+		closed,
 		async getStore(s: string, t: string) { return getOrCreate(dataKey(s, t)); },
 		async getIndexStore(s: string, t: string, i: string) { return getOrCreate(idxKey(s, t, i)); },
 		async getStatsStore(s: string, t: string) { return getOrCreate(statsKey(s, t)); },
 		async getCatalogStore() { return getOrCreate('__catalog__'); },
-		async closeStore() { /* durable */ },
-		async closeIndexStore() { /* durable */ },
+		async closeStore(s: string, t: string) { closed.push(dataKey(s, t)); },
+		async closeIndexStore(s: string, t: string, i: string) { closed.push(idxKey(s, t, i)); },
 		async deleteIndexStore(s: string, t: string, i: string) {
 			stores.delete(idxKey(s, t, i));
 		},
-		async deleteTableStores(s: string, t: string, indexNames: readonly string[]) {
-			stores.delete(dataKey(s, t));
-			stores.delete(statsKey(s, t));
-			for (const i of indexNames) stores.delete(idxKey(s, t, i));
-		},
 		// Deliberately NO renameTableStores — that is exactly the case under test.
+		// `deleteTableStores` is optional too: omitting it selects the fallback's
+		// close-and-warn arm instead of its reclaim arm.
+		...(withDelete
+			? {
+				async deleteTableStores(s: string, t: string, indexNames: readonly string[]) {
+					stores.delete(dataKey(s, t));
+					stores.delete(statsKey(s, t));
+					for (const i of indexNames) stores.delete(idxKey(s, t, i));
+				},
+			}
+			: {}),
 		async closeAll() { /* data survives module close, mirroring real disk */ },
 		_hardClose() {
 			for (const s of stores.values()) void s.close();
@@ -115,6 +124,65 @@ describe('StoreModule rename fallback (provider without renameTableStores)', () 
 		expect(provider.stores.get('main.t2')!.size).to.equal(10);
 		expect(provider.stores.has('main.t2_idx_ix_v')).to.be.true;
 		expect(provider.stores.get('main.t2_idx_ix_v')!.size).to.equal(10);
+
+		await db.close();
+	});
+
+	it('copies the hidden index backing a UNIQUE constraint, so duplicates stay rejected', async () => {
+		const db = new Database();
+		db.registerModule('store', new StoreModule(provider));
+
+		await db.exec(`create table t (id integer primary key, v integer unique) using store`);
+		await db.exec(`insert into t values (1, 100)`);
+
+		await db.exec(`alter table t rename to t2`);
+
+		// The UNIQUE constraint is realized by a hidden `_uc_*` index store. If the
+		// fallback skipped it, the renamed table would seek a fresh EMPTY one and
+		// silently accept a duplicate of the pre-rename row.
+		let threw = false;
+		try {
+			await db.exec(`insert into t2 values (2, 100)`);
+		} catch {
+			threw = true;
+		}
+		expect(threw, 'the pre-rename row still occupies the UNIQUE value').to.be.true;
+
+		const rows = await asyncIterableToArray(db.eval(`select id, v from t2 order by id`));
+		expect(rows).to.deep.equal([{ id: 1, v: 100 }]);
+
+		await db.close();
+	});
+
+	it('closes the old handles and warns when the provider cannot reclaim them', async () => {
+		provider._hardClose();
+		provider = createProviderWithoutRenameHook({ withDeleteTableStores: false });
+
+		const db = new Database();
+		db.registerModule('store', new StoreModule(provider));
+
+		await db.exec(`create table t (id integer primary key, v integer) using store`);
+		await db.exec(`create index ix_v on t (v)`);
+		await db.exec(`insert into t values (1, 10)`);
+
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (...args: unknown[]) => { warnings.push(String(args[0])); };
+		try {
+			await db.exec(`alter table t rename to t2`);
+		} finally {
+			console.warn = originalWarn;
+		}
+
+		// Rows still moved — correctness never depends on the reclaim succeeding.
+		const rows = await asyncIterableToArray(db.eval(`select id, v from t2`));
+		expect(rows).to.deep.equal([{ id: 1, v: 10 }]);
+
+		// The old-named handles were closed rather than leaked, and the orphaned
+		// duplicate they leave behind was announced instead of hidden.
+		expect(provider.closed).to.deep.equal(['main.t', 'main.t_idx_ix_v']);
+		expect(warnings.filter(w => w.includes('orphaned duplicate'))).to.have.lengthOf(1);
+		expect(provider.stores.has('main.t'), 'the orphan is documented, not reclaimed').to.be.true;
 
 		await db.close();
 	});

@@ -274,7 +274,9 @@ interface KVStoreProvider {
   deleteTableStores?(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void>;
 
   // Optional: Relocate a table's data + index stores for ALTER TABLE ... RENAME TO
-  // (`indexNames` carries the same authoritative, exact index list).
+  // (`indexNames` carries the same authoritative, exact index list). Omit it and the
+  // module copies every entry through getStore/getIndexStore instead — correct on any
+  // provider, but O(table size); implement this for a native move.
   renameTableStores?(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void>;
 }
 ```

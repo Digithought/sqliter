@@ -207,7 +207,9 @@ interface KVStoreProvider {
   deleteTableStores?(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void>;
 
   // Optional: Relocate a table's data + index stores for ALTER TABLE ... RENAME TO
-  // (`indexNames` carries the same authoritative, exact index list).
+  // (`indexNames` carries the same authoritative, exact index list). Omit it and the
+  // module copies every entry through getStore/getIndexStore instead — correct on any
+  // provider, but O(table size); implement this for a native move.
   renameTableStores?(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void>;
 }
 ```
@@ -479,6 +481,14 @@ does not make the whole rename atomic. Two accepted residues remain, both safer 
   store into the new name inside `renameTable`, while the old catalog entry is still present.
   A crash there, then reopen, rehydrates the old name as an **empty** table (a fresh store
   is minted on connect) — a visible, droppable orphan.
+- **Copy-fallback orphan.** A provider without `renameTableStores` gets the module's
+  generic copy fallback instead: every entry is read from the old-named data and index
+  stores and written under the new name, then the old stores are reclaimed via
+  `deleteTableStores` when the provider has it, or closed with a logged warning when it
+  does not (the old-named copy then survives as a droppable duplicate). A provider whose
+  `deleteTableStores` only *closes* its stores — both mobile plugins do today — leaves the
+  same duplicate without the warning. A copy failure propagates before the catalog is
+  rewritten, so the table stays reachable under its old name.
 - **Old-entry delete failure.** The deferred old-entry delete is best-effort (logged, not
   fatal); a failure leaves both entries on disk — again a droppable orphan, not a stranded
   dependent.
