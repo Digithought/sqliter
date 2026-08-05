@@ -75,7 +75,8 @@ layer) must forward the hook or the wrapped module never gets its veto.
 `alter table … rename to` / `rename column` rewrites the new name into every dependent
 view and materialized-view body and fires `view_modified` / `materialized_view_modified`;
 it also rewrites every dependent **table** (an FK's `referencedTable` / referenced-column
-list, a CHECK expression, a partial-index predicate) and fires `table_modified`; and
+list, a CHECK expression, a partial-index predicate, a column's `DEFAULT` / generated
+expression) and fires `table_modified`; and
 renaming a materialized view additionally moves its own catalog entry
 (`materialized_view_removed` old → `materialized_view_added` new). Those re-persists are
 fire-and-forget like the rest, so both arms run `assertRenameDependentsPersistable`

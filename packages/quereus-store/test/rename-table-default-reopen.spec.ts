@@ -191,4 +191,48 @@ describe('RENAME TO: a column DEFAULT naming the renamed table survives a reopen
 
 		await db2.close();
 	});
+
+	it('rewrites a SELF-referencing GENERATED body in the persisted DDL, and the reopened table still inserts', async () => {
+		// The other expression a column carries. `formatColumnDef` renders
+		// `GENERATED ALWAYS AS (…)` into the bundle (since
+		// `bug-store-reopen-loses-computed-columns` landed), so the in-hook arm is
+		// load-bearing for this shape exactly as it is for a self-referencing DEFAULT
+		// above — a self-referencing generated body is reachable, unlike an *unqualified*
+		// foreign one, which the generated-column dependency check rejects at create time.
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+
+		await db1.exec('create table rtg (id integer primary key, g integer generated always as ((select count(*) from rtg)) virtual) using store');
+		await db1.exec('insert into rtg (id) values (1)');
+
+		provider.catalogWrites.length = 0;
+		await db1.exec('alter table rtg rename to rtg9');
+
+		expect(provider.catalogWrites.filter(w => w.includes('from rtg ') || w.includes('from rtg)')),
+			'no bundle ever names the old table in a generated body').to.deep.equal([]);
+		expect(provider.catalogWrites.some(w => w.includes('rtg9')), 'the rewritten body was persisted')
+			.to.equal(true);
+
+		await mod1.whenCatalogPersisted();
+		await db1.close();
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 'catalog rehydrates cleanly').to.have.lengthOf(0);
+
+		const table = db2.schemaManager.findTable('rtg9', 'main');
+		expect(table?.columns[1].generatedExpr, 'the generated body survived the round-trip').to.not.be.undefined;
+
+		// A body that still named the pre-rename table would fail this insert outright with
+		// "Table 'rtg' not found". The value is 1, not 2: the body is evaluated against the
+		// table as it stands BEFORE the new row lands (the pre-rename row is the only one).
+		await db2.exec('insert into rtg9 (id) values (2)');
+		const row = await db2.get('select g from rtg9 where id = 2');
+		expect(row?.g, 'generated body computes against the renamed table after the reopen').to.equal(1);
+
+		await db2.close();
+	});
 });

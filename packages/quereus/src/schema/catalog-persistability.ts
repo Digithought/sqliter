@@ -115,8 +115,9 @@ function assertRenameDependentViewsPersistable(db: Database, schema: Schema, rew
 
 /**
  * The dependent-TABLE arm of {@link assertRenameDependentsPersistable}: a rename rewrites
- * the FK targets, CHECK expressions and partial-index predicates of tables that mention the
- * renamed object, and a store-backed one of those has to re-persist its catalog entry.
+ * the FK targets, CHECK expressions, partial-index predicates and column DEFAULT / generated
+ * expressions of tables that mention the renamed object, and a store-backed one of those has
+ * to re-persist its catalog entry.
  *
  * Walks EVERY schema, not just the renamed object's own, because the propagation's table
  * loop does (`propagateTableRename` iterates `_getAllSchemas()`) — a cross-schema foreign

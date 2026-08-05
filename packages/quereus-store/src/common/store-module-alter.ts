@@ -410,11 +410,10 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// def carries the SAME expression nodes (`buildConstraintsFromColumn` passes them in
 		// by reference and `columnDefToSchema` assigns them straight back), and every other
 		// entry is `oldSchema`'s by reference — so this is the same one-rewrite-covers-all
-		// story as the two above, reverse pass included. `formatColumnDef` renders a DEFAULT
-		// into the persisted bundle, which is what makes the arm load-bearing here; a
-		// generated expression is not rendered at all today (tracked by
-		// `bug-store-reopen-loses-computed-columns`), so covering it is correct-but-inert
-		// until that lands.
+		// story as the two above, reverse pass included. `formatColumnDef` renders BOTH a
+		// DEFAULT and a `GENERATED ALWAYS AS` body into the persisted bundle (the latter
+		// since `bug-store-reopen-loses-computed-columns` landed), so the arm is
+		// load-bearing for both.
 		//
 		// The rewrites are the first statements in the `try`, and each walks its
 		// collection one item at a time, so a throw anywhere — including partway

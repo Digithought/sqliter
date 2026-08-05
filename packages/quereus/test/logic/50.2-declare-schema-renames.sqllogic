@@ -750,3 +750,59 @@ diff schema main;
 
 drop view ev_new;
 drop table emp2;
+
+-- ===================================
+-- 24. Hinted TABLE rename + another table's DEFAULT that names it
+-- ===================================
+
+-- The table-verb twin of the column-rename case pinned by
+-- `test/schema/differ-alter-column.spec.ts` ("a column rename carrying a DEFAULT").
+-- The default compare in `computeColumnAttributeChange` is not inverse-reconciled
+-- against pending TABLE renames either, so the declared default (naming the NEW
+-- table) mismatches the actual one (still naming the OLD) and one redundant
+-- SET DEFAULT rides along. This pins that it is HARMLESS: renames are emitted
+-- first, so by the time the SET DEFAULT runs the live rename propagation has
+-- already produced exactly that expression, and the re-diff is empty.
+--
+-- This route converges even WITHOUT the propagation into `columns[].defaultValue`
+-- (the redundant SET DEFAULT would repair the default on its own), so it is a
+-- differ-behaviour guard, not a second copy of the propagation guard — that one is
+-- `41.3-alter-rename-propagation.sqllogic` §38-41, on the imperative RENAME TO path
+-- where nothing re-states the default.
+
+create table dt_u (k integer primary key, v integer null);
+insert into dt_u values (1, 42);
+create table dt_t (id integer primary key, w integer null default ((select min(v) from dt_u)));
+
+declare schema main {
+	table dt_u2 {
+		k integer primary key,
+		v integer null
+	} with tags ("quereus.previous_name" = 'dt_u')
+
+	table dt_t {
+		id integer primary key,
+		w integer null default ((select min(v) from dt_u2))
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE dt_u RENAME TO dt_u2"}, {"ddl": "ALTER TABLE dt_t ALTER COLUMN w SET DEFAULT (select min(v) from dt_u2)"}]
+
+apply schema main;
+
+-- run
+
+-- The dependent table still accepts rows and its default reads the renamed table.
+insert into dt_t (id) values (1);
+select id, w from dt_t;
+→ [{"id": 1, "w": 42}]
+
+-- Convergence: the live default now names dt_u2, so the re-diff is empty.
+diff schema main;
+→ []
+
+drop table dt_t;
+drop table dt_u2;

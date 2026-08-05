@@ -1042,8 +1042,9 @@ pre-flight dependent scan `assertRenameDependentsPersistable`: before
 and materialized-view body in that schema is rewritten on a clone and the prospective object
 is offered here — and a renamed materialized view's own new catalog key and DDL text are
 vetted too. Dependent **tables** ride the same scan under the `'table'` kind: a rename is also
-propagated into other tables' FK targets, referenced-column lists, CHECK expressions and
-partial-index predicates, and those re-persists are fire-and-forget too, so every table whose
+propagated into other tables' FK targets, referenced-column lists, CHECK expressions,
+partial-index predicates and column `DEFAULT` / generated expressions, and those re-persists
+are fire-and-forget too, so every table whose
 record the rewrite would change is offered here as well. Because that scan reaches tables this
 module may not own, the hook self-filters on ownership (`ownsTableCatalogEntry`, mirroring
 `StoreModule.resolveOwnedTable`) instead of the write path's catalog-entry-absent test, which
