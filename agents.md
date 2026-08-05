@@ -23,6 +23,7 @@
 Project uses [tess](tess/) for AI ticket mgmt.
 Read + follow ticket workflow rules in tess/agent-rules/tickets.md.
 Tickets in [tickets/](tickets/) dir.
+If asked to "tend the garden" or similar, see tess/agent-rules/tend.md.
 
 ## Launch process tool (if under PowerShell)
 
