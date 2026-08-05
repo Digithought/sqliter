@@ -844,8 +844,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			// none of them, but it does want the work — an un-drained stream means the statement
 			// never ran at all. Drain and discard, checking the abort signal at row boundaries the
 			// way Statement._iterateWithSignal does.
-			if (isAsyncIterable(result)) {
-				for await (const _row of result as AsyncIterable<Row>) {
+			if (isAsyncIterable<Row>(result)) {
+				for await (const _row of result) {
 					throwIfAborted(signal);
 				}
 			}

@@ -53,6 +53,8 @@ const db = new Database();
 
 Use `db.exec(sql)` for executing statements without fetching results, especially for DDL (`create`, `drop`), transaction control (`begin`, `commit`), or simple `insert`/`update`/`delete` statements with or without parameters.
 
+A row-returning statement (`select`, `values`, `explain`, or DML with `RETURNING`) still runs to completion under `exec` — its rows are pulled and discarded, so its side effects happen and its errors surface, but the caller never sees the rows. Use `db.eval`/`db.get` to consume them.
+
 ```typescript
 // Execute DDL
 await db.exec("create table users (id integer primary key, name text, email text)");
@@ -252,7 +254,7 @@ Quereus supports explicit transaction control using `BEGIN`, `COMMIT`, and `ROLL
 When not in an explicit transaction (autocommit mode), both `db.exec()` and `statement.run()` automatically wrap their execution in an implicit transaction:
 
 ```typescript
-// db.exec() - wraps entire batch in one transaction
+// db.exec() - each statement is its own implicit transaction
 await db.exec("insert into users (name) values ('User 1')");
 // Automatically committed after successful execution
 
@@ -262,12 +264,14 @@ await stmt.run(["User 2"]);
 await stmt.finalize();
 // Automatically committed after successful execution
 
-// Multiple statements in db.exec() are atomic
+// Multiple statements in one db.exec() are NOT atomic as a batch: matching
+// SQLite autocommit, each statement commits or rolls back on its own.
 await db.exec(`
   insert into users (name) values ('User 3');
   insert into users (name) values ('User 4');
 `);
-// All statements commit together, or all rollback on error
+// If the second statement fails, the first stays committed.
+// Wrap the batch in begin/commit for all-or-nothing.
 
 // On error, implicit transactions automatically rollback
 try {
