@@ -1,6 +1,9 @@
 description: The debugging helper that traces how a query executes hangs forever instead of returning results, so anyone who calls it has to kill the process.
 files: packages/quereus/src/func/builtins/explain.ts
 repro: verified
+severity: edge-case
+likelihood: normal-use
+tradeoffs: row_trace() already covers the same need and works, so the cheapest resolution may be to delete execution_trace() rather than re-plumb it around the execution mutex.
 ----
 
 # `execution_trace()` deadlocks on every call

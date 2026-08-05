@@ -8,6 +8,7 @@ files:
   - docs/types.md                               # § Polymorphic Function Type Inference → "Omitting the return type"
   - packages/quereus/test/filter-conjunct-early-exit.spec.ts  # had to use the internal factory to get an async UDF
 difficulty: easy
+tradeoffs: Both capabilities already exist one layer down, so anyone who needs them has a working route - this is convenience-surface parity rather than new capability.
 ---
 
 # The convenience registration surface for user functions is missing two capabilities

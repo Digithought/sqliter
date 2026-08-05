@@ -5,6 +5,9 @@ files:
   - packages/quereus/src/planner/building/select.ts              # only the GROUPED branch exposes a projection scope to ORDER BY
   - packages/quereus/test/logic/07.3-group-by-extras.sqllogic    # nearest existing aggregate coverage
 repro: verified
+severity: edge-case
+likelihood: normal-use
+tradeoffs: The query is rejected rather than answered wrongly, and both workarounds - repeat the expression, or drop the pointless sort of a one-row result - are trivial.
 ---
 
 # `select count(*) as c from t order by c` fails with "Column not found: c"

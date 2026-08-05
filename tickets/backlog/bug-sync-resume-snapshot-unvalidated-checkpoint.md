@@ -3,6 +3,10 @@ files:
   - packages/sync-coordinator/src/server/websocket.ts          # handleResumeSnapshot (~269)
   - packages/sync-coordinator/src/service/coordinator-service.ts # resumeSnapshotStream (~469)
   - packages/quereus-sync/src/sync/snapshot-stream.ts           # resumeSnapshotStream / SnapshotCheckpoint
+repro: none
+severity: edge-case
+likelihood: contrived
+tradeoffs: Needs a malformed or hostile client to reach, no concrete failure has been demonstrated, and the ticket first has to settle whether checkpoints are server-issued (authenticate them) or client-held (validate them).
 ----
 
 ## Problem

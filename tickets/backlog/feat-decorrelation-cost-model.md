@@ -1,6 +1,7 @@
 ----
 description: The subquery-to-join decorrelation rewrites always fire; add a cost/statistics gate so a query with very few outer rows and a huge indexed inner table can keep the cheaper per-row plan.
 files: packages/quereus/src/planner/rules/subquery/rule-subquery-decorrelation.ts, packages/quereus/src/planner/rules/subquery/rule-scalar-agg-decorrelation.ts, packages/quereus/src/planner/cost/, packages/quereus/src/planner/stats/
+tradeoffs: No report of the inverse case in practice - the ratio only matters at extreme outer/inner skew - and the ticket asks to land after feat-decorrelate-remaining-subquery-sites so the gate is not designed against a moving target.
 ----
 
 # Cost gate for subquery decorrelation rules

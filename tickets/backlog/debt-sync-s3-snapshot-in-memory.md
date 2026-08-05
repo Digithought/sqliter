@@ -2,6 +2,7 @@ description: A code comment claims the sync server streams database snapshots to
 files:
   - packages/sync-coordinator/src/service/s3-snapshot-store.ts
   - packages/sync-coordinator/src/service/s3-batch-store.ts
+tradeoffs: Only bites large databases on the coordinator, which no deployment has reported hitting, and it depends on confirming the AWS SDK streaming body shape fits the snapshot chunk stream.
 ----
 
 ## Problem

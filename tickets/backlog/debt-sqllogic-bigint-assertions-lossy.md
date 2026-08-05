@@ -5,6 +5,7 @@ files:
   - packages/quereus/test/logic/03.6-type-system.sqllogic  # blocks that work around this today
   - packages/quereus/test/logic/03.7-bigint-mixed-arithmetic.sqllogic
 difficulty: medium
+tradeoffs: Only affects expectations above 2^53-1, which a handful of files work around by hand today, and fixing it changes how every .sqllogic expectation is parsed and compared.
 ---
 
 ## Problem

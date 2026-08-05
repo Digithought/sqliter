@@ -3,6 +3,10 @@ files:
   - packages/quereus/src/vtab/memory/layer/manager.ts        # assertNoPrimaryKeyCollisionInLayer / assertNoPrimaryKeyCollisionInRows — both use `this._tableName`
   - packages/quereus-isolation/src/isolation-module.ts       # creates the staging overlay table under the `_overlay_<table>_<n>` name
 difficulty: easy
+repro: verified
+severity: cosmetic
+likelihood: unusual
+tradeoffs: Only the name inside an error message is wrong; the refusal itself is correct and the transaction stays usable, so this competes poorly against anything that changes behaviour.
 ----
 
 # Re-key refusal names the internal staging table

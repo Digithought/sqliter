@@ -4,6 +4,9 @@ files:
   - packages/quereus/src/planner/building/select-aggregates.ts   # createAggregateOutputScope — registers aggregate aliases but not grouping-key aliases
   - packages/quereus/test/logic/07.5-window.sqllogic             # line ~906 asserts the aggregate-alias case works
 repro: verified
+severity: edge-case
+likelihood: unusual
+tradeoffs: The query is rejected, not answered wrongly, and naming the grouping column instead of its alias works - so this is an ergonomics gap in one scope-building function rather than a defect in results.
 ---
 
 # A window specification can name an aggregate by its select-list alias, but not a grouping key

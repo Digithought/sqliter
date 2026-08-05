@@ -1,6 +1,7 @@
 ----
 description: Row-count estimates assume conditions on different columns are unrelated, so a query filtering on two columns that move together (like city and postal code) is estimated as far more selective than it really is.
 files: packages/quereus/src/planner/stats/catalog-stats.ts, packages/quereus/src/planner/stats/selectivity-combine.ts, packages/quereus/src/planner/stats/analyze.ts, packages/quereus/src/planner/stats/histogram.ts
+tradeoffs: Only the cheapest tier needs no new stored statistics; everything beyond it means collecting, storing and maintaining multi-column statistics - a large ongoing cost for better estimates rather than correct answers.
 ----
 
 ## Background

@@ -6,6 +6,9 @@ files:
   - packages/quereus-sync/test/sync/_peer-harness.ts (a provider that omits the hook — where this was observed)
 difficulty: easy
 repro: verified
+severity: corruption
+likelihood: unusual
+tradeoffs: No shipped storage provider omits the hook - only a test harness does - so a maintainer may prefer to make renameTableStores a required part of the interface rather than add a runtime guard.
 ----
 
 ## What happens

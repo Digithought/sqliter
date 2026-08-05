@@ -6,6 +6,7 @@ files:
   - packages/quoomb-web/src/worker/quereus.worker.ts (`loadModule`)
   - packages/plugin-loader/README.md, docs/plugins.md
 difficulty: medium
+tradeoffs: There is no download step to hook in a browser, so this needs a fetch-and-evaluate path built specifically to make verification possible, for a host whose plugin records carry no hashes today either.
 ----
 
 ## What is missing

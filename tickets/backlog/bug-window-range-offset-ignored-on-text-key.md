@@ -6,6 +6,10 @@ files:
   - packages/quereus/test/plan/window-one-sided-frames.spec.ts           # existing "non-numeric ORDER BY key" case
   - docs/window-functions.md
 difficulty: easy
+repro: static
+severity: wrong-result
+likelihood: unusual
+tradeoffs: The ticket's own preferred fix is to raise an error rather than compute anything, which turns queries that run today into failures - and a numeric RANGE offset over a text ordering column is arguably an authoring mistake nobody writes on purpose.
 ---
 
 # A numeric RANGE frame offset over a non-numeric ordering column should be an error

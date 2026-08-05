@@ -4,6 +4,7 @@ files:
   - packages/plugin-loader/src/node-remote.ts (`createNodeRemoteResolver`, `ensureModuleDir`, `writeModuleFile`)
   - packages/quoomb-cli/src/plugins/remote-resolver.ts
 difficulty: medium
+tradeoffs: Adds a cache with its own invalidation and on-disk location questions to a CLI that works today when online, and the safety half of the same problem is already covered by hash pinning.
 ----
 
 ## The problem

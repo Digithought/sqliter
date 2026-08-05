@@ -5,6 +5,9 @@ files:
   - packages/quereus/src/planner/building/select.ts             # buildFrom — the resolution order it must match
   - docs/view-updateability.md                                  # ~line 125 states the same-order requirement
 repro: static
+severity: wrong-result
+likelihood: unusual
+tradeoffs: Only bites when a CTE deliberately shadows a real table of the same name, and the usual outcome is a rejected statement rather than a wrong answer, so a maintainer may prefer to make the analysis conservative instead of aligning two resolution orders.
 ---
 
 # Two passes disagree on which relation an ambiguous bare FROM name means

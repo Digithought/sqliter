@@ -4,6 +4,7 @@ files:
   - packages/quereus/src/planner/nodes/table-access-nodes.ts
   - packages/quereus/src/planner/rules/access/rule-monotonic-range-access.ts
 difficulty: medium
+tradeoffs: Nothing is broken today, and the fix is a constructor-shape change across three node classes and eight clone sites - churn landing entirely on code that currently works.
 ---
 
 # Physical access leaf nodes are cloned by re-listing positional constructor arguments

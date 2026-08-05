@@ -1,6 +1,7 @@
 ----
 description: The new debug-mode wrong-row detector catches most cases but is blind to one specific mistake pattern; closing that gap needs the query planner to tell the runtime which operator each column read is supposed to come from, which is a bigger, unresolved piece of work.
 files: packages/quereus/src/runtime/context-helpers.ts, packages/quereus/src/runtime/emit/asof-scan.ts, packages/quereus/src/planner/nodes/reference.ts, docs/runtime.md
+tradeoffs: Closing the blind spot requires threading per-column provenance from the planner to the runtime, a large unresolved design, for a debug-mode assertion that already catches the common failure.
 ----
 
 ## Context

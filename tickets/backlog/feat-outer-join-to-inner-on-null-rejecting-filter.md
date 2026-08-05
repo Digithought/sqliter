@@ -5,6 +5,7 @@ files:
   - packages/quereus/src/planner/rules/predicate/rule-join-predicate-pushdown.ts   # the rule this unlocks work for
 prereq: feat-filter-pushdown-through-join
 difficulty: medium
+tradeoffs: Requires a correct null-rejecting analysis - getting coalesce, is-not-distinct-from or a user function wrong turns a kept row into a dropped one - for a rewrite whose payoff is avoided padding work.
 ---
 
 # Convert an outer join to an inner join when a filter above it rejects nulls

@@ -3,6 +3,7 @@ files:
   - packages/sync-coordinator/src/server/websocket.ts   # sendMessage / snapshot + change broadcast loops
   - packages/sync-coordinator/src/service/coordinator-service.ts
   - packages/quereus-sync-client/src/snapshot-reader.ts # receiving half — unbounded chunk queue (added by feat-sync-client-snapshot-bootstrap)
+tradeoffs: Requires an adversarial or very slow client to matter, and the ticket still has to decide the policy for a client that never drains: unbounded wait versus closing the session.
 ----
 
 ## Problem

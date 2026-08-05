@@ -7,6 +7,7 @@ files:
   - packages/quereus/test/incremental/maintenance-equivalence.spec.ts        # "join-residual partial-WHERE plan selection" guards the outcome
   - docs/mv-maintenance.md                                                   # § 'join-residual' — documents the suppression
 difficulty: hard
+tradeoffs: The suppression works - maintenance strategies are chosen correctly today - so this only buys the removal of a rule-disable list, at the cost of teaching the coverage prover to see through pushed-down predicates.
 ---
 
 # Materialized-view maintenance analysis is pinned to a pre-pushdown plan shape

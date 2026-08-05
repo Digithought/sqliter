@@ -5,6 +5,10 @@ files:
   - packages/quereus/src/planner/rules/join/rule-asof-strategy-select.ts
   - packages/quereus/src/util/comparison.ts          # createSemanticValueComparator / semanticOrderingsAgree
 difficulty: medium
+repro: static
+severity: wrong-result
+likelihood: contrived
+tradeoffs: Unreproduced and only reachable with a TIMESPAN or JSON match column, while every canonical AS OF column type (DATE/DATETIME) already orders correctly as text - so a maintainer may prefer to refuse those types and document the restriction.
 ---
 
 # "As of" join compares its match column as text, ignoring types that order by meaning

@@ -4,6 +4,7 @@ files:
   - packages/quereus/src/vtab/memory/layer/manager.ts        # ensureUniqueConstraintIndexes — runs at construction only
   - packages/quereus-store/src/common/store-table.ts         # findReusableIndexForUnique — the store-side equivalent
   - packages/quereus-store/src/common/store-module.ts        # reconcileImplicitUniqueIndexStores — the create/drop transition
+tradeoffs: The redundant structure costs write throughput and memory but never correctness, and matching the store means growing the memory manager a re-decide-on-every-schema-change path it does not have.
 ----
 
 # Memory backend: re-decide unique-index reuse when an index is created or dropped

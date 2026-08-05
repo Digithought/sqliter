@@ -3,6 +3,10 @@ description: The command-line tool reacts to plugin problems by quietly destroyi
 files:
   - packages/quoomb-cli/src/commands/dot-commands.ts (`loadPlugins`, `savePlugins`, `loadEnabledPlugins`)
 difficulty: easy
+repro: static
+severity: corruption
+likelihood: unusual
+tradeoffs: Only the CLI's own plugin configuration is at risk, never user data, and today's behaviour always yields a usable shell - failing loudly on a damaged plugins.json makes the CLI unusable until a human repairs the file by hand.
 ----
 
 ## Root cause

@@ -7,6 +7,10 @@ files:
   - packages/quereus/src/types/builtin-types.ts      # TEXT_TYPE.parse (~line 138) — the hex-encoding answer; BLOB_TYPE.parse
   - packages/quereus/src/types/json-type.ts          # canonicalJsonString lives nearby
 difficulty: medium
+repro: static
+severity: wrong-result
+likelihood: normal-use
+tradeoffs: Unifying the five conversion sites changes the text a BLOB and a JSON document produce today, which is a visible output change for anyone already relying on the current spelling in concatenation or group_concat.
 ---
 
 # There is no single value-to-text conversion, and three of them disagree

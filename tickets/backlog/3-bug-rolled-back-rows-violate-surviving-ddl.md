@@ -9,6 +9,10 @@ files:
   - packages/quereus/test/logic/41.2.1-alter-column-retype-deleted-row-memory.sqllogic  # memory-only exclusion that should go away with the fix
   - docs/memory-table.md                                # § DDL and transactions
 difficulty: hard
+repro: static
+severity: corruption
+likelihood: unusual
+tradeoffs: Follows directly from the decided contract that schema changes are not transactional on the memory backend, so the honest fix may be feat-transactional-ddl-native-backends; a narrower guard that validates DDL against committed rows too would reject statements that are legal today.
 ----
 
 # Rolled-back rows can violate the schema change that outlived them

@@ -6,6 +6,7 @@ files:
   - packages/quereus-isolation/test/isolation-layer.spec.ts          # existing memory row-count proof (CountingMemoryModule)
   - packages/quereus-store/test/isolated-store.spec.ts               # where a store-backed seek-count test would live
 difficulty: medium
+tradeoffs: Correctness on the store is already covered; what is missing is only a guard against the optimisation silently disappearing, and a seek-counting harness for the store path is more work than the memory-side equivalent it mirrors.
 ---
 
 ## Why

@@ -7,6 +7,9 @@ files:
   - packages/quereus/src/runtime/types.ts                # RuntimeContext: cteMaterializations, cacheStates
 repro: verified
 difficulty: hard
+severity: edge-case
+likelihood: unusual
+tradeoffs: The query fails loudly rather than returning a wrong answer, the shape is rare, and the fix is in per-iteration buffer lifetime - hard to get right without regressing the recursive cases that work.
 ---
 
 # A recursive query's repeating part goes stale when its self-reference sits inside a nested `with` block

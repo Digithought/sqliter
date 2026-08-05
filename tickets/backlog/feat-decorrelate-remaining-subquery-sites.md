@@ -1,6 +1,7 @@
 ----
 description: Two remaining query shapes still re-run an inner lookup once per row instead of doing it in one pass; extend the existing one-pass rewrite to cover them both.
 files: packages/quereus/src/planner/rules/subquery/rule-scalar-agg-decorrelation.ts, packages/quereus/src/planner/rules/subquery/rule-subquery-decorrelation.ts, packages/quereus/src/planner/nodes/join-node.ts, packages/quereus/src/planner/nodes/sort.ts, packages/quereus/src/planner/nodes/project-node.ts, packages/quereus/src/planner/building/select-modifiers.ts
+tradeoffs: Both arms widen a rewrite that already fires unconditionally, enlarging the surface feat-decorrelation-cost-model must later gate, and the column-index bookkeeping in these rules is where past defects have come from.
 ----
 
 # Decorrelate the two remaining per-row subquery sites

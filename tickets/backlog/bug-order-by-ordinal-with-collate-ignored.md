@@ -8,6 +8,9 @@ files:
   - packages/quereus/test/logic/28.2-orderby-expression-extras.sqllogic  # where the positional-reference coverage lives
 difficulty: medium
 repro: verified
+severity: wrong-result
+likelihood: unusual
+tradeoffs: A legal but uncommon spelling with an obvious workaround (name the column), so a maintainer may prefer to reject the combination rather than teach the ordinal extractor to see through a collation.
 ---
 
 # `order by 2 collate nocase` does not sort

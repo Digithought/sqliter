@@ -4,6 +4,9 @@ files:
   - packages/quereus/src/runtime/emit/analyze.ts       # unresolved name -> empty table list -> empty report, no error
   - docs/sql.md                                        # grammar for the statement (analyze_stmt, ~line 604)
 repro: verified
+severity: edge-case
+likelihood: normal-use
+tradeoffs: Raising an error on an unresolvable name could break scripts that run ANALYZE speculatively over a name list, and the statement's only effect is on plan quality, so nothing is corrupted by the silence.
 ---
 
 # `ANALYZE <unknown name>` is a silent no-op

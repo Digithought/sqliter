@@ -8,6 +8,7 @@ files:
   - packages/quereus-sync/README.md:74 (lists it as part of the architecture)
   - docs/sync.md § Storage layout (does not mention the `sv:` prefix at all)
 difficulty: easy
+tradeoffs: Nothing uses the module, so nothing is broken; the decision it needs - delete it or wire it up - is a product question about whether column-level schema versioning is wanted at all.
 ----
 
 ## What is there

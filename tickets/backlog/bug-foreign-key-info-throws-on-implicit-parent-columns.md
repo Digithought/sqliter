@@ -4,6 +4,9 @@ files:
   - packages/quereus/src/func/builtins/schema.ts   # foreign_key_info(), the parent-column fallback at ~line 343
   - packages/quereus/src/schema/table.ts           # resolveReferencedColumns (~line 935) — the fallback that IS correct
 repro: verified
+severity: edge-case
+likelihood: normal-use
+tradeoffs: Introspection-only: the constraint itself works and spelling the parent columns out avoids it, so the impact falls on tooling rather than on data.
 ---
 
 # `foreign_key_info()` throws for a foreign key declared with no parent column list

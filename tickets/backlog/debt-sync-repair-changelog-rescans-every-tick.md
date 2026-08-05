@@ -5,6 +5,7 @@ files:
   - packages/quoomb-web/src/worker/quereus.worker.ts           # ~line 809 — the 5-minute host loop
   - packages/sync-coordinator/src/service/maintenance.ts       # the coordinator's hourly loop
 difficulty: medium
+tradeoffs: The cost is read from the code rather than measured, the sweep is correct if wasteful, and retiring it needs a durable this-device-is-clean marker that is new state to get right.
 ----
 
 ## What is going on

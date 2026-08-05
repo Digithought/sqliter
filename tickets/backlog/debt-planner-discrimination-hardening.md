@@ -1,5 +1,6 @@
 description: Optional follow-up hardening for how the query optimizer identifies node kinds — a codebase-wide tidy-up and a stricter automated check, only worth doing if the looser style starts causing bugs again.
 files: packages/quereus/src/planner
+tradeoffs: Neither piece fixes a live defect, both carry real churn (a roughly 415-site audit, and a codebase-wide any-cleanup before the lint rule can be enabled), and the ticket itself says to promote only if the pain materialises.
 ----
 
 ## Background

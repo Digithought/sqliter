@@ -5,6 +5,7 @@ files:
   - packages/*/package.json
   - package.json
 difficulty: easy
+tradeoffs: The two known holes were already fixed by hand across all 14 packages, so this only protects against recurrence, and it adds a build step that will occasionally fail for reasons unrelated to the change being made.
 ---
 
 # Guard: prove each package's test type check actually compiles its test files

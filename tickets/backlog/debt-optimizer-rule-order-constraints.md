@@ -1,5 +1,6 @@
 description: Optimizer rules must run in a specific order for correctness, but that order lives only in code comments and array position — add machine-checked "run me after rule X" declarations so a future edit that reorders them wrong fails loudly at startup instead of silently producing bad query plans.
 files: packages/quereus/src/planner/optimizer.ts, packages/quereus/src/planner/framework/registry.ts, packages/quereus/src/planner/framework/pass.ts
+tradeoffs: Re-deriving the true ordering dependency of about forty rules from their prose comments is judgment-heavy work with no live defect behind it, and two design questions (cross-pass edges, mandatory declaration) are still open.
 ----
 
 ## Context

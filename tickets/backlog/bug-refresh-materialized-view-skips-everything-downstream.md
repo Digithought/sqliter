@@ -7,6 +7,9 @@ files:
   - docs/incremental-maintenance.md                                  # § Recording changes — the carve-out this would remove
   - docs/mv-maintenance.md
 repro: static
+severity: wrong-result
+likelihood: unusual
+tradeoffs: refresh materialized view is a manual repair command used rarely, and cascading its changes makes a refresh able to fail an assertion - turning a repair tool into something that can be refused.
 ---
 
 # What is wrong

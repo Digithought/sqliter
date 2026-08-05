@@ -5,6 +5,7 @@ files:
   - packages/quereus/src/parser/ast.ts             # AlterTableStmt action union — has setDefault/setCollate/setNotNull/setTags, no generated action
   - packages/quereus/src/schema/column.ts          # ColumnSchema.generated / .generatedExpr / .generatedStored
 repro: static
+tradeoffs: The sharper half - the declarative differ silently ignoring a generated-clause change - could be fixed on its own by making the differ report drift it cannot express, without adding the statement at all.
 ---
 
 # No `ALTER COLUMN … SET / DROP GENERATED`, and the declarative differ hides its absence

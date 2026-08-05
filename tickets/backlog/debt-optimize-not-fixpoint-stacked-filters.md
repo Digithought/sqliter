@@ -1,6 +1,7 @@
 description: Running the query planner twice on the same query produces a simpler plan the second time — it leaves two WHERE-clause steps stacked on top of each other that it knows how to combine into one, but never gets a second chance to do so.
 files: packages/quereus/src/planner/rules/predicate/rule-filter-merge.ts, packages/quereus/src/planner/rules/access/rule-select-access-path.ts, packages/quereus/src/planner/framework/pass.ts, packages/quereus/src/planner/optimizer.ts
 difficulty: medium
+tradeoffs: The stacked filters are a plan-shape wart with no measured cost, and running the optimizer to a fixpoint risks pass-ordering surprises elsewhere.
 ----
 
 ## What was observed

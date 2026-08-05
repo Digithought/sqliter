@@ -5,6 +5,10 @@ files:
   - packages/quereus-store/src/common/store-module-base.ts     # ddlCommitPendingOps and its documented transaction consequences
   - packages/quereus-store/test/alter-primary-key-persistence.spec.ts
 difficulty: medium
+repro: static
+severity: corruption
+likelihood: unusual
+tradeoffs: Store backend and one verb only, and the sibling set-collate fix shows the shape - but moving the legality check before the flush means validating against the transaction's visible rows, which bug-rolled-back-rows-violate-surviving-ddl shows can itself be unsound.
 ----
 
 # `alter table … alter primary key` rejects only after spending the transaction

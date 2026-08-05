@@ -4,6 +4,10 @@ files:
   - packages/quereus/src/types/builtin-types.ts   # INTEGER_TYPE.parse (number arm, ~line 46) and INTEGER_TYPE.validate (~line 36)
   - packages/quereus/src/types/validation.ts      # validateAndParse — parse-then-validate, where the two disagree
 difficulty: easy
+repro: static
+severity: edge-case
+likelihood: unusual
+tradeoffs: Only whole numbers above 2^53-1 written in scientific notation are affected, and accepting them means INTEGER.parse and INTEGER.validate must agree on a rule that today's exact-integer promotion may not want.
 ---
 
 ## Problem

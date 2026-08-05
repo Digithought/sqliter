@@ -2,6 +2,7 @@ description: Tables kept in persistent key-value storage cannot yet serve a quer
 prereq: concurrent-reads-engine-path
 files: packages/quereus-store/src/common/store-module.ts, packages/quereus-store/src/common/store-table.ts, packages/quereus-store/src/common/store-table-scan.ts, packages/quereus-store/src/common/transaction.ts, packages/quereus-store/src/common/kv-store.ts, packages/quereus-isolation/src/isolation-module.ts
 difficulty: hard
+tradeoffs: The largest single piece of the concurrent-read line of work - shared connect caching, pending-op merging and incremental commit flush all have to change - and until it lands the fail-closed behaviour is correct, just slow.
 ----
 
 # Committed-snapshot reads for store-backed tables

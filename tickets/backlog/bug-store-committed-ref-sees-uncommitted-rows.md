@@ -3,6 +3,9 @@ prereq:
 files: packages/quereus-store/src/common/store-module.ts, packages/quereus-store/src/common/store-table-scan.ts, packages/quereus/src/runtime/emit/scan.ts
 difficulty: medium
 repro: static
+severity: wrong-result
+likelihood: unusual
+tradeoffs: Only reachable on a raw store table without the isolation wrapper, and the same shared-connect caching is the first blocker listed in feat-store-committed-snapshot-reads - so a maintainer may prefer to fix both there rather than patch connect twice.
 ----
 
 # `committed.<table>` on a raw store table returns uncommitted rows

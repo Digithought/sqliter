@@ -5,6 +5,9 @@ files:
   - packages/quereus/src/core/database-assertions.ts        # AssertionEvaluator.compileUnderSuppression — derives the same base set correctly, via extractBindings
   - packages/quereus/src/schema/assertion.ts                # IntegrityAssertionSchema.dependentTables
 repro: verified
+severity: cosmetic
+likelihood: normal-use
+tradeoffs: Only an introspection column is wrong - nothing in the engine reads dependentTables to decide anything - so the fix buys diagnostics and nothing else.
 ---
 
 # `assertion_info().dependent_tables` is empty for every realistic assertion

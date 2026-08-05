@@ -1,6 +1,7 @@
 description: If the query engine ever asks the in-memory table to read a secondary index backwards, rows that share the same indexed value would come back in the wrong relative order, which would corrupt reads inside a transaction; nothing asks for that today, so this is a latent problem to fix before that path is turned on.
 files: packages/quereus/src/vtab/memory/layer/scan-layer.ts, packages/quereus/src/vtab/memory/index.ts, packages/quereus-isolation/src/isolated-table.ts, packages/quereus/src/vtab/memory/layer/scan-plan.ts
 difficulty: easy
+tradeoffs: Nothing in the engine asks for a backwards secondary-index read today, so this is dormant - a maintainer may prefer to assert loudly on that request instead of implementing the ordering.
 ---
 
 ## What is wrong

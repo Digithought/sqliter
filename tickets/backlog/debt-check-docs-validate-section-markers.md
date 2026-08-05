@@ -6,6 +6,7 @@ files:
   - packages/quereus/src/vtab/module.ts         # example markers
   - docs/store.md                               # example markers
 difficulty: medium
+tradeoffs: Stale prose section markers are a documentation-only cost, and validating them means inventing a marker syntax that every existing comment then has to conform to.
 ----
 
 ## Background

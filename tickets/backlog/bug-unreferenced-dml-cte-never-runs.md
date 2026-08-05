@@ -6,6 +6,9 @@ files:
   - packages/quereus/src/planner/building/select.ts   # buildFrom — the only thing that pulls a block into the plan, via the lookup map
   - packages/quereus/src/planner/nodes/sink-node.ts   # SinkNode — consumes a relation for its side effects; plausible anchor
 repro: verified
+severity: wrong-result
+likelihood: unusual
+tradeoffs: Naming a data-modifying with-block and then never referencing it is as likely to be an authoring mistake as an intention, so a maintainer might reject the statement instead of executing the block.
 ---
 
 # An unreferenced data-modifying `with` block is dropped instead of executed

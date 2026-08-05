@@ -5,6 +5,7 @@ files:
   - packages/quereus/src/planner/nodes/join-node.ts                               # JoinNode.condition
 prereq: feat-filter-pushdown-through-join
 difficulty: medium
+tradeoffs: The outer-join rules are the mirror image of the WHERE rules this follows, so it is easy to get backwards and delete rows the query keeps, for a payoff limited to queries that put a single-table condition in ON rather than WHERE.
 ---
 
 # Push single-table ON-clause conjuncts into the joined table

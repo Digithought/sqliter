@@ -1,6 +1,7 @@
 description: Two reads that share the same pre-compiled query now collide and one of them fails, so callers wanting concurrent reads must build a separate copy of the query per caller.
 files: packages/quereus/src/core/statement.ts, packages/quereus/src/core/database.ts, packages/quereus/test/core/concurrent-committed-reads.spec.ts
 difficulty: hard
+tradeoffs: The workaround - one statement per concurrent caller - is documented and works, and separating per-execution state from the compiled plan changes the Statement contract that every existing caller depends on.
 ----
 
 # Let one prepared statement serve several concurrent reads

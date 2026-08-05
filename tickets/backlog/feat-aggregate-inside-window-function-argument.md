@@ -5,6 +5,7 @@ files:
   - packages/quereus/src/planner/building/select-projections.ts    # analyzeSelectColumns — where that build happens, before the aggregate phase
   - packages/quereus/src/planner/building/select-window.ts         # buildWindowPhase / rejectUncollectedAggregates — where the check would belong
   - packages/quereus/test/logic/07.5-window.sqllogic               # grouped + window coverage
+tradeoffs: Supporting it means moving the aggregate check out of expression building and into the window phase - a restructuring of select-building order for one query shape that has a subquery workaround.
 ---
 
 # An aggregate cannot be a window function's argument

@@ -1,6 +1,7 @@
 description: The reusable check that storage backends run to prove they serve consistent older data during a save only exercises the easiest case. Two harder situations it is meant to catch — a backend whose extra lookup structures lag behind its main data, and a table definition being changed at the same time — go untested, so a backend can pass and still be wrong.
 files: packages/quereus/src/vtab/test-support/committed-read-conformance.ts, packages/quereus/test/core/committed-read-conformance.spec.ts, packages/quereus/test/vtab/_conformance-stub-modules.ts, packages/quereus/test/core/concurrent-committed-reads.spec.ts, docs/module-authoring.md
 difficulty: medium
+tradeoffs: The harness is honest about what it checks and does catch the two-step publish, so the gap only matters once a third-party backend with lagging secondary indexes actually shows up.
 ----
 
 # The committed-read conformance harness under-covers the guarantee it certifies

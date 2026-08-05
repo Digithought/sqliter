@@ -2,6 +2,7 @@ description: When the persistent store rewrites a whole table's rows in place (r
 files:
   - packages/quereus-store/src/common/store-table.ts   # mapRowsAtIndex (~553-570), rekeyRows (~594-632), migrateRows (~645-674)
   - packages/quereus-store/src/common/kv-store.ts       # WriteBatch, AtomicBatch, beginAtomicBatch
+tradeoffs: There may be no fix: the single batch write is the only thing making these rewrites all-or-nothing, and any chunked alternative needs a rollback envelope the store does not have - so this is exploratory work that may conclude nothing can change.
 ----
 
 # Store: bound the peak of in-place data-store rewrites without losing atomicity

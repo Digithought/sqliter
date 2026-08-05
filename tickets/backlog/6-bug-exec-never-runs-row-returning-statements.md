@@ -5,6 +5,9 @@ files:
   - packages/quereus/src/runtime/emit/block.ts   # emitBlock — returns the last statement's value; nothing drains it
   - packages/quereus/src/planner/nodes/sink-node.ts  # the existing "consume a relation for its side effects" node
 repro: verified
+severity: wrong-result
+likelihood: normal-use
+tradeoffs: Draining rows makes every exec of a query pay for the full execution it currently skips, and callers who have been passing selects to exec harmlessly would start seeing their errors - a behaviour change wider than the bug.
 ---
 
 # `Database.exec` never runs a statement that returns rows

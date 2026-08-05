@@ -1,10 +1,11 @@
 description: The table in the docs that says which parts of the project are stable is written as prose, so nobody notices when someone edits it and forgets to update the matching labels elsewhere.
-prereq: debt-check-docs-script-too-large
+prereq: debt-oversized-source-files
 files:
   - docs/stability.md (the `## Assignment` table — the human-readable source of truth)
   - docs/.stability.json (the machine-readable `docs` and `packages` maps the build gate reads)
   - scripts/check-docs.mjs (Checks D and E — the existing banner gates)
 difficulty: medium
+tradeoffs: The two machine-readable halves are already pinned to each other; only the prose table can drift, and parsing it constrains how that table may be written from then on.
 ----
 
 ## Background

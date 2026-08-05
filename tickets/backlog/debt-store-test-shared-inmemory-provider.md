@@ -3,6 +3,7 @@ files:
   - packages/quereus-store/test/                     # ~20+ spec files each defining createInMemoryProvider
   - packages/quereus-store/src/testing/index.ts      # existing shared test-support entry point (@quereus/store/testing)
 difficulty: easy
+tradeoffs: Pure test-code cleanup that touches every spec in the package at once, making it a merge-conflict magnet against any other in-flight store work.
 ----
 
 # One shared in-memory storage provider for the store package's tests

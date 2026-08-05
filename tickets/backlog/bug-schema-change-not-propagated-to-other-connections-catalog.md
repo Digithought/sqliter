@@ -4,6 +4,10 @@ files:
   - packages/quereus/src/schema/manager.ts               # per-Database catalog; SchemaChangeNotifier lives here
   - packages/quereus-isolation/test/isolation-layer.spec.ts
 difficulty: medium
+repro: verified
+severity: wrong-result
+likelihood: unusual
+tradeoffs: Nothing in the engine claims to support two Database objects over one storage module, so documenting that as unsupported may be the honest answer rather than building cross-connection catalog invalidation.
 ---
 
 # What was observed

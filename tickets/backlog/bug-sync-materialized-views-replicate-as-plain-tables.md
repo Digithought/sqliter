@@ -5,6 +5,10 @@ files:
   - packages/quereus-sync/src/sync/sync-manager-impl.ts (recordSchemaMigration)
   - docs/sync-schema.md (§ What replicates)
 difficulty: medium
+repro: static
+severity: wrong-result
+likelihood: unusual
+tradeoffs: Only affects databases that both use materialized views and sync, and replicating a derivation means peers re-run maintenance over source tables they may not have - refusing to replicate maintained tables at all is a defensible alternative.
 ----
 
 ## What is wrong

@@ -4,6 +4,7 @@ files:
   - packages/quereus/src/planner/analysis/README.md   # the stale file
   - docs/architecture.md                              # where the real orientation lives
 difficulty: easy
+tradeoffs: A single stale README a reader can route around via docs/architecture.md, and deleting the file may beat maintaining a second orientation document alongside it.
 ---
 
 # The analysis folder's README describes only constant folding

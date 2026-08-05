@@ -2,6 +2,7 @@ description: Reads that run alongside writes currently rely on each storage adap
 prereq: concurrent-reads-engine-path
 files: packages/quereus/src/core/database.ts, packages/quereus/src/schema/manager.ts, packages/quereus/src/core/statement.ts
 difficulty: hard
+tradeoffs: No adapter needs this today - every module that opts into concurrent committed reads meets the obligation structurally - so building the gate now is work against a hypothetical future adapter.
 ----
 
 # Shared/exclusive schema gate for the concurrent committed-read path

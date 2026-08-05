@@ -6,6 +6,7 @@ files:
   - packages/quereus/src/vtab/module.ts                     # AnyVirtualTableModule: optional hooks (~415 alterTable, ~434 renameTable)
   - packages/quereus/src/vtab/capabilities.ts               # getCapabilities() — where a declared capability would live
 difficulty: medium
+tradeoffs: The only wrapper in the repo is the isolation layer, which is used over backends that do support rename, so the hole is currently unreachable in practice; closing it properly needs a declared capability rather than a method-presence check.
 ---
 
 # What is wrong

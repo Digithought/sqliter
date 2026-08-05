@@ -8,6 +8,7 @@ files:
   - packages/quereus/src/runtime/emit/fanout-lookup-join.ts
   - packages/quereus/src/runtime/emit/async-gather.ts
   - packages/quereus/src/runtime/emit/hash-aggregate.ts
+tradeoffs: The one known violation is already fixed; this is a property test to catch the next one, and constructing a valid input row for every physical operator is substantial test machinery.
 ---
 
 # No test asserts a physical node's emitted row matches the attributes it advertises

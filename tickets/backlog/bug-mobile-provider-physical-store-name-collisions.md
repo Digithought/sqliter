@@ -7,6 +7,10 @@ files:
   - packages/quereus-store/src/common/store-module.ts                  # assertStoreNameFree / collectOccupiedStoreNames (~lines 524-580)
   - packages/quereus-plugin-leveldb/src/provider.ts                    # the provider that does it correctly, for reference
 difficulty: medium
+repro: static
+severity: corruption
+likelihood: unusual
+tradeoffs: Only affects the two mobile plugins, which have no shipped consumers in this repo, and moving them onto the shared naming helper changes the physical store names of any database already written by them.
 ---
 
 ## Background

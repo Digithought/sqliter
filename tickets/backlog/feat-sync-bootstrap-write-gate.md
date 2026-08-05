@@ -3,6 +3,7 @@ files:
   - packages/quereus-sync/src/sync/snapshot-stream.ts   # applySnapshotStream — clears metadata at the header, then overwrites cells unconditionally
   - packages/quereus-sync/src/sync/snapshot.ts          # applySnapshot — the non-streaming path has the same shape
   - packages/quereus-sync-client/src/sync-client.ts     # exposes the 'bootstrapping' status callers are asked to respect
+tradeoffs: The sync client cannot block application writes, so enforcement has to live somewhere that changes the engine's or the application's contract, and the documented do-not-write-while-bootstrapping rule already prevents the loss for apps that follow it.
 ----
 
 ## Problem

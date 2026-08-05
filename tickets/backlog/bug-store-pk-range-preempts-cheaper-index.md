@@ -4,6 +4,9 @@ files:
   - packages/quereus-store/src/common/store-module-access-plan.ts  # computeBestAccessPlan — the leading-PK range arm returns before the secondary-index loop runs
   - packages/quereus-store/test/pushdown.spec.ts                   # where the analogous secondary-vs-secondary tests live
 repro: verified
+severity: edge-case
+likelihood: normal-use
+tradeoffs: Rows returned are correct - the residual filter is retained - so this is speed only, and making the access-plan arms compete on cost means giving the primary-key arms a cost model they do not have today.
 ---
 
 # Primary-key range scan wins over a cheaper secondary index

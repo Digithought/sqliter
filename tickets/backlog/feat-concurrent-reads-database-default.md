@@ -2,6 +2,7 @@ description: Once queries can opt into reading slightly older data instead of wa
 prereq: concurrent-reads-engine-path
 files: packages/quereus/src/core/database-options.ts, packages/quereus/src/core/database.ts, packages/quereus/src/common/types.ts
 difficulty: easy
+tradeoffs: Flipping it changes ordering semantics for every read in the process, including reads inside library code the application does not own, and the failure mode is a quiet pre-write read; the ticket's own advice is to wait for a consumer who asks.
 ----
 
 # Database-level default for read concurrency

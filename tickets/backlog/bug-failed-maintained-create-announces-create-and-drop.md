@@ -6,6 +6,9 @@ files:
   - packages/quereus/src/runtime/emit/alter-schema-event.ts          # withStatementScopedSchemaEvents — the existing fix shape for ALTER
   - packages/quereus/src/core/database-events.ts                     # beginSchemaEventScope / discardSchemaEventsSince
 repro: verified
+severity: wrong-result
+likelihood: unusual
+tradeoffs: Needs a failing maintained-table create inside an explicit transaction on an emitter-backed module to observe, and a subscriber that re-reads the catalog after any event is unaffected either way.
 ---
 
 # A failed maintained-table create announces a table that never existed

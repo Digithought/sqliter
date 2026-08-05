@@ -1,5 +1,9 @@
 description: The row-cache safety threshold is computed so that even a perfectly estimated result abandons the cache, silently degrading scalar subqueries and nested-loop joins from linear to quadratic on larger inputs.
 files: packages/quereus/src/planner/framework/characteristics.ts, packages/quereus/src/runtime/cache/shared-cache.ts, packages/quereus/src/planner/rules/cache/rule-scalar-subquery-cache.ts, packages/quereus/src/planner/rules/cache/rule-nested-loop-right-cache.ts, packages/quereus/src/planner/optimizer-tuning.ts
+repro: static
+severity: edge-case
+likelihood: normal-use
+tradeoffs: Answers stay correct - this is a performance cliff, which is why it is filed below wrong-result - and raising the threshold trades a bounded slowdown for unbounded cache memory when an estimate is badly wrong, which is what the guard exists to prevent.
 ----
 
 ## Problem

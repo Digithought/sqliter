@@ -2,6 +2,7 @@
 description: A view whose stored copy is kept in sorted order gets that ordering by a trick that can force a column to reject blank values even when the view itself says blanks are allowed; keep the sort in a separate index instead, so the two stop contradicting each other.
 files:
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # computeBackingPrimaryKey (~236) and the two // NOTE: sites that reference this rework
+tradeoffs: The concrete defects it would retire have each already been patched with narrow guards, so the payoff is removing guards rather than fixing live behaviour, against the cost of a new materialized secondary index mechanism.
 ---
 
 # Replace ordering-seeded physical PK with a proper materialized secondary index

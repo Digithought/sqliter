@@ -4,6 +4,7 @@ files:
   - .gitignore
   - .tmp/
 difficulty: easy
+tradeoffs: Trivial to do, but the ticket says a decision is needed first about the three .tmp/ files already committed - whether to delete or relocate them - and nobody has made it.
 ---
 
 # What happens

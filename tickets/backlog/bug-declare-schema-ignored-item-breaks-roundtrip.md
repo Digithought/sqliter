@@ -5,6 +5,10 @@ files:
   - packages/quereus/src/emit/ast-stringify.ts (`declareItemToString` case `'declareIgnored'` ~1427; `declareSchemaToString` ~1392)
   - packages/quereus/src/parser/ast.ts (`DeclareIgnoredItem` ~918)
 difficulty: medium
+repro: static
+severity: wrong-result
+likelihood: unusual
+tradeoffs: Only reachable through declare-schema item kinds the parser does not support anyway (domain, collation, import), so refusing those items outright is a defensible alternative to teaching the parser to retain their source text.
 ----
 
 ## What happens

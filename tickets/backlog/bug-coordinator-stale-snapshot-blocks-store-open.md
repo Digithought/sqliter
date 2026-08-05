@@ -7,6 +7,10 @@ files:
   - packages/quereus-sync/src/sync/snapshot-stream.ts              # applySnapshotStream — the header format gate that throws
   - docs/sync.md                                                   # § Snapshot wire-format version — operator note describing today's manual recovery
 difficulty: medium
+repro: static
+severity: edge-case
+likelihood: unusual
+tradeoffs: Filed below corruption because no data is lost - the database rebuilds from reconnecting clients once an operator deletes the stale snapshot objects - so the cheapest fix may be to make the error say that rather than to change the restore path.
 ----
 
 ## What happens today

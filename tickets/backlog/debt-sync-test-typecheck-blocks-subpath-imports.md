@@ -7,6 +7,7 @@ files:
   - packages/quereus-sync/src/sync/store-adapter.ts  # current workaround: AST types derived structurally from Parser['parse']
   - packages/quereus/src/index.ts                    # exports widened purely so the sync package could reach two helpers
 difficulty: medium
+tradeoffs: The workaround in place works and the only cost is that the next person needing an engine subpath type re-invents it; flipping the resolution mode may surface a batch of unrelated type errors in the sync test suite.
 ---
 
 # The sync test type-check dictates what sync source may import

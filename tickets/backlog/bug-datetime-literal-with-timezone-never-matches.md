@@ -8,6 +8,10 @@ files:
   - packages/quereus/test/logic/                       # temporal coverage lives under the 4x.x series
   - packages/quereus/test/logic/06.5.4-declared-return-type-builtins.sqllogic  # section 8 pins today's TEXT return type
 difficulty: medium
+repro: verified
+severity: wrong-result
+likelihood: normal-use
+tradeoffs: The fix is gated on an unsettled semantics decision - what DATETIME's canonical stored spelling is, and whether it denotes a fixed instant or a wall-clock time - which a maintainer may want to make deliberately in blocked/ rather than inside a bug fix.
 ---
 
 # DATETIME has no settled canonical spelling, and two things break because of it

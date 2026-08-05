@@ -5,6 +5,7 @@ files:
   - packages/quereus/src/vtab/memory/layer/manager.ts       # DDL mutates the base layer directly
   - packages/quereus/src/vtab/memory/layer/transaction.ts   # adoptSchema — where a buffered schema would live
   - packages/quereus-store/src/common/store-module.ts       # ddlCommitPendingOps — the auto-commit posture to retire
+tradeoffs: Needs a transaction-scoped catalog that SchemaManager does not have and that touches every schema consumer; the current tiers are a decided and documented contract, not an oversight.
 ----
 
 # Raise the native backends to the `'transactional'` DDL tier

@@ -7,6 +7,10 @@ files:
   - packages/quereus-sync/src/sync/sync-manager-impl.ts         # SyncManager.canDeltaSync — no production caller
   - packages/quereus-sync/src/metadata/change-log.ts            # ChangeLogStore.pruneEntriesBefore — exists, never called
 difficulty: hard
+repro: static
+severity: corruption
+likelihood: unusual
+tradeoffs: Requires a device offline longer than the retention horizon, the fix adds a wire-protocol response every client must learn, and it is gated on the snapshot-bootstrap work landing first.
 ----
 
 ## Root cause: the server cannot say "you are too far behind"

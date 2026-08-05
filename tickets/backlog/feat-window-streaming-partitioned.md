@@ -7,6 +7,7 @@ files:
   - packages/quereus/test/plan/window-one-sided-frames.spec.ts             # PARTITION BY cases, currently buffered on both databases
   - docs/window-functions.md                                               # bail-conditions list
 difficulty: medium
+tradeoffs: Requires widening what a table access advertises about its sort order, from one column to a prefix, which affects every consumer of that advertisement, for a plan improvement that only fires when a matching composite index exists.
 ---
 
 # Let partitioned window queries take the streaming fast path
