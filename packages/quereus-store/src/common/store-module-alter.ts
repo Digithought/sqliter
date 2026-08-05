@@ -88,7 +88,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 				updated = await this.alterRenameColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
 				break;
 			case 'alterPrimaryKey':
-				updated = await this.alterPrimaryKeyChange(db, schemaName, tableName, table, oldSchema, change);
+				updated = await this.alterPrimaryKeyChange(db, schemaName, tableName, table, oldSchema, change, rows);
 				break;
 			case 'addConstraint':
 				updated = await this.alterAddConstraint(db, table, oldSchema, change, rows);
@@ -455,6 +455,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		table: StoreTable,
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'alterPrimaryKey' }>,
+		rows?: EffectiveRowSource,
 	): Promise<TableSchema> {
 		const newPkColumns = change.newPkColumns;
 		// Shared with the memory module's native arm: rebuilds `primaryKeyDefinition` AND the
@@ -464,11 +465,23 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// under their declared collation (`StoreTable.pkKeyCollations`).
 		const updatedSchema: TableSchema = rekeySchemaPrimaryKey(oldSchema, newPkColumns);
 
-		// Physical re-key ahead — flush buffered writes so every live row is
-		// re-keyed and no stale-schema op replays over the rewritten store.
-		// `rekeyRows`' duplicate-key pass runs against the flushed store, so a
-		// pending insert that collides under the new PK is caught. See
-		// `StoreModuleBase.ddlCommitPendingOps` for the transaction consequences.
+		// The two throw-only re-key questions — "is the change legal?" over the rows this
+		// transaction can SEE (CONSTRAINT), then "can the store carry it?" over the
+		// committed rows a rollback must restore (BUSY) — asked BEFORE the DDL flush below,
+		// so either refusal leaves the store, the catalog AND the enclosing transaction
+		// untouched. Mirrors the memory backend's `MemoryTableManager.validateRekeyedPrimaryKey`
+		// and the SET COLLATE arm's `pkRekeyNeeded` block (store-module-alter-column.ts).
+		await table.validateRekeyedPrimaryKey(
+			updatedSchema.primaryKeyDefinition,
+			updatedSchema.columns,
+			effectiveDdlRows(table, rows),
+		);
+
+		// Physical re-key ahead — flush buffered writes so every live row is re-keyed and
+		// no stale-schema op replays over the rewritten store. Every refusal this arm can
+		// make has already run above, reading effectively and throwing without the flush,
+		// so a rejected ALTER keeps the transaction alive; `rekeyRows`' own duplicate-key
+		// pass is now a backstop, not the gate. See `StoreModuleBase.ddlCommitPendingOps`.
 		await this.ddlCommitPendingOps();
 
 		// Re-key the data store. Throws CONSTRAINT on duplicates without

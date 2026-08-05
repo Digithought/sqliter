@@ -584,23 +584,26 @@ analysis, and UNIQUE enforcement compare under. The schema entry points:
   no-`COLLATE` column to `BINARY`, so the reloaded collation matches what the physical
   keys were written under. (A persisted DDL whose declared collation does not match its
   key bytes loads as-declared — see `store-pk-collate-legacy-reopen-divergence`.)
-- **`ALTER COLUMN … SET COLLATE` on a PK column** is honored by a **physical re-key**:
-  `StoreTable.rekeyRows` re-encodes every data-store key under the column's new collation
-  and `rebuildSecondaryIndexes` rebuilds each secondary index non-enforcing (its keys embed
-  the PK suffix; uniqueness was already judged pre-mutation, see below). Before anything is
-  flushed or mutated, `StoreTable.validateRekeyedPrimaryKey` asks the memory backend's two
-  re-key questions over two different row sets (see
-  [memory-table.md](memory-table.md) §"A collation change on a PRIMARY KEY column obeys a
-  stricter rule" — the store mirrors it status-for-status): a collision among the rows the
-  DDL transaction can *see* (its staged rows included, via the isolation wrapper's effective
-  row stream) throws `CONSTRAINT` naming the key; a collision confined to committed rows the
-  transaction has *deleted* — rows a `rollback` must restore, which a re-keyed store cannot
-  hold — throws `BUSY` ("commit/rollback and retry"). Either refusal leaves the store, the
-  catalog, and the enclosing transaction untouched. "Deleted" covers a delete staged in an
-  isolation wrapper's overlay *and* one buffered in this module's own coordinator, so the
-  bare module answers `BUSY` here too rather than flushing the delete and re-keying — which
-  would spend the transaction's rollback silently. A target equal to the column's current
-  collation is a schema-only no-op (no re-key).
+- **`ALTER COLUMN … SET COLLATE` on a PK column, and `ALTER TABLE … ALTER PRIMARY KEY`,**
+  are both honored by a **physical re-key**: `StoreTable.rekeyRows` re-encodes every
+  data-store key under the new key definition (a new collation for SET COLLATE, a new
+  column set for ALTER PRIMARY KEY) and `rebuildSecondaryIndexes` rebuilds each secondary
+  index non-enforcing (its keys embed the PK suffix; uniqueness was already judged
+  pre-mutation, see below). Before anything is flushed or mutated, both arms ask
+  `StoreTable.validateRekeyedPrimaryKey` the memory backend's two re-key questions over two
+  different row sets (see [memory-table.md](memory-table.md) §"A collation change on a
+  PRIMARY KEY column obeys a stricter rule" — the store mirrors it status-for-status): a
+  collision among the rows the DDL transaction can *see* (its staged rows included, via the
+  isolation wrapper's effective row stream) throws `CONSTRAINT` naming the key; a collision
+  confined to committed rows the transaction has *deleted* — rows a `rollback` must restore,
+  which a re-keyed store cannot hold — throws `BUSY` ("commit/rollback and retry"). Either
+  refusal leaves the store, the catalog, and the enclosing transaction untouched. "Deleted"
+  covers a delete staged in an isolation wrapper's overlay *and* one buffered in this
+  module's own coordinator, so the bare module answers `BUSY` here too rather than flushing
+  the delete and re-keying — which would spend the transaction's rollback silently. For SET
+  COLLATE, a target equal to the column's current collation is a schema-only no-op (no
+  re-key); ALTER PRIMARY KEY always re-keys. `rekeyRows`' own duplicate-key pass stays in
+  place after both probes, as a backstop rather than the gate.
 
   An ACCEPTED re-key is still not transactional: the new collation and the re-keyed
   stores are durable the moment the statement returns, while the issuing transaction's
@@ -768,7 +771,7 @@ The statements with this behavior:
 - `ALTER TABLE ... ALTER COLUMN <non-pk-member> SET DATA TYPE`, for any move between two *different* logical types — the physical representation need not change (every row's value is re-parsed and re-stored in the new type's canonical form). Retyping a **primary-key member** to a different logical type is rejected with `CONSTRAINT` before anything is scanned or written: the value rewrite is payload-only and would leave the row's key bytes encoded under the old type. The engine refuses this for every backend already (see [SQL DDL § ALTER TABLE](sql-alter.md#27-alter-table-statement)); the store repeats the check for direct module calls, as the memory backend does
 - `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL`, when existing rows hold NULL and a literal `DEFAULT` backfills them
 
-Validation that can reject the statement runs *before* the commit wherever possible, reading the buffered-plus-committed view so it sees this transaction's own rows: the NULL probe of `SET NOT NULL`, the convertibility probe of `SET DATA TYPE`, the `NOT NULL`-without-`DEFAULT` probe of `ADD COLUMN`, the non-PK UNIQUE re-validation — run for `SET COLLATE` and, over the *converted* values, for the two value-rewriting arms (`SET DATA TYPE`, `SET NOT NULL` backfill), whose rewrite can collapse two distinct values onto one — and both primary-key probes of a `SET COLLATE` PK re-key (`StoreTable.validateRekeyedPrimaryKey`: `CONSTRAINT` over the transaction's effective rows, `BUSY` over the committed rows a rollback must restore). All of these leave the transaction intact when they reject. Validation that cannot be separated from the rewrite runs after the commit, so its error arrives with the enclosing transaction already committed. Storage is still left untouched in that case; only the transaction is gone. Two checks remain in this category: the duplicate-key pass of `ALTER PRIMARY KEY`'s re-key (`rekeyRows` pass 1 — that arm has no pre-flush probe; for the `SET COLLATE` re-key the same pass is only a backstop behind the pre-commit probes above), and the `NOT NULL` check on a value produced by an `ADD COLUMN` backfill expression (it runs per row, as the rows are rewritten).
+Validation that can reject the statement runs *before* the commit wherever possible, reading the buffered-plus-committed view so it sees this transaction's own rows: the NULL probe of `SET NOT NULL`, the convertibility probe of `SET DATA TYPE`, the `NOT NULL`-without-`DEFAULT` probe of `ADD COLUMN`, the non-PK UNIQUE re-validation — run for `SET COLLATE` and, over the *converted* values, for the two value-rewriting arms (`SET DATA TYPE`, `SET NOT NULL` backfill), whose rewrite can collapse two distinct values onto one — and both primary-key probes of *either* PK re-key, `SET COLLATE` on a PK member and `ALTER PRIMARY KEY` alike (`StoreTable.validateRekeyedPrimaryKey`: `CONSTRAINT` over the transaction's effective rows, `BUSY` over the committed rows a rollback must restore). All of these leave the transaction intact when they reject. Validation that cannot be separated from the rewrite runs after the commit, so its error arrives with the enclosing transaction already committed. Storage is still left untouched in that case; only the transaction is gone. One check remains in this category: the `NOT NULL` check on a value produced by an `ADD COLUMN` backfill expression (it runs per row, as the rows are rewritten). `rekeyRows`' own duplicate-key pass, for both re-keying statements, is now only a backstop behind the pre-commit probes above, not a rejection path a caller can reach.
 
 Savepoints opened before such a statement go away with the transaction. A later `ROLLBACK TO` or `RELEASE` naming one of them warns and proceeds — everything committed by the DDL stays committed — rather than raising. This mirrors the memory module.
 
