@@ -195,8 +195,10 @@ describe('Isolated Store Module', () => {
 			// `_readCommitted` option is dropped), and `StoreTable.query` merges the
 			// coordinator's pending ops over the committed store — a read taken during
 			// a commit flush would see a partially applied batch. The isolation wrapper
-			// inherits that verbatim, so the whole stack stays on the serialized read
-			// path. See docs/module-authoring.md § "Committed-snapshot reads".
+			// declines on its own account too (it re-serves one underlying handle and
+			// flushes overlays through it incrementally), so the whole stack stays on
+			// the serialized read path. See docs/module-authoring.md § "Committed-Snapshot
+			// Reads".
 			expect(new StoreModule(provider).readCommittedSnapshot).to.equal(false);
 			expect(createIsolatedStoreModule({ provider }).readCommittedSnapshot).to.equal(false);
 		});

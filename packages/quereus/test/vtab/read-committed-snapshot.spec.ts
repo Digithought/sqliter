@@ -180,6 +180,48 @@ describe('committed-snapshot reads (readCommittedSnapshot)', () => {
 			await reader.disconnect();
 		});
 
+		// The obligation bounds the snapshot at "some commit boundary at or before the
+		// read began", and `ensureConnection` is lazy, so the pin lands on the first
+		// pull rather than on `connect`. A commit in that window is therefore allowed
+		// to be visible — pinned here so the laxer boundary is a decision, not a
+		// surprise, if the pin ever moves earlier.
+		it('pins at the first pull, not at connect', async () => {
+			const reader = await committedReader();
+
+			await db.exec("insert into t values (4, 'd')");
+
+			expect(normalize(await collect(reader.query(makeFullScanFilterInfo()))))
+				.to.deep.equal([[1, 'a'], [2, 'b'], [3, 'c'], [4, 'd']]);
+
+			await reader.disconnect();
+		});
+
+		it('holds the snapshot across a concurrent DROP INDEX of the index being walked', async () => {
+			await db.exec('create index t_v on t (v)');
+
+			const reader = await committedReader();
+			const iterator = reader.query(indexScanFilterInfo('t_v', 1))[Symbol.asyncIterator]();
+
+			const first = await iterator.next();
+			expect(first.done).to.equal(false);
+
+			// Dropping the index a committed scan is mid-walk removes it from the
+			// schema and from the base layer's index map. The walk holds its own
+			// captured tree, so it must finish on the pre-drop entries rather than
+			// truncate or throw "Secondary index not found".
+			await db.exec('drop index t_v');
+
+			const rest: Row[] = [];
+			for (let step = await iterator.next(); !step.done; step = await iterator.next()) {
+				rest.push(step.value);
+			}
+
+			expect(normalize([first.value, ...rest]), 'snapshot survives the concurrent drop')
+				.to.deep.equal([[1, 'a'], [2, 'b'], [3, 'c']]);
+
+			await reader.disconnect();
+		});
+
 		it('holds the snapshot across a concurrent DDL that rebuilds the table structures', async () => {
 			await db.exec('create index t_v on t (v)');
 

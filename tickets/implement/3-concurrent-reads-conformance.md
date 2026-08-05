@@ -88,11 +88,14 @@ first prereq ticket.
 - **Memory vtab** — run the harness with a `stallCommit` built from the same
   wrapper module the engine test uses (`test/core/concurrent-committed-reads.spec.ts`
   from the prereq ticket). Expect a pass with `observedCommitOverlap: true`.
-- **Isolation wrapper over memory** — same, registered through `IsolationModule`
-  in `packages/quereus-isolation/test/`. Proves the inherited
-  `readCommittedSnapshot` getter is wired end-to-end, and that the overlay
-  bypass on the `_readCommitted` path does not reintroduce the writer's staged
-  rows.
+- **Isolation wrapper over memory** — declares `false` (review of the prereq
+  ticket found the wrapper re-serves one memoized underlying handle to committed
+  reads while flushing overlays through it incrementally, so it tears mid-flush
+  even over memory). The harness must **refuse** at step 1 today. Once
+  `fix/bug-isolation-committed-read-shares-writer-handle` lands, this becomes the
+  most valuable in-tree case in the suite — a wrapper whose safety depends on its
+  own commit path, not the module beneath it — so wire the case in a form that is
+  one flag flip away from asserting a pass.
 - **Isolation wrapper over `StoreModule` (memory KV provider)** — declares
   `false`, so the harness must **refuse** at step 1. The real assertion here is
   at the engine level: an opted-in read against a store-backed table

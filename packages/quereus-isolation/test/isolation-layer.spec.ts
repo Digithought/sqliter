@@ -4339,12 +4339,14 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 		});
 	});
 
-	// `readCommittedSnapshot` is the underlying's promise that a `_readCommitted`
+	// `readCommittedSnapshot` is a module's promise that a `_readCommitted`
 	// connection serves a stable committed snapshot for the life of the scan. The
-	// wrapper inherits it VERBATIM (not weakest-of, unlike concurrencyMode): a
-	// committed read skips the overlay entirely, so the overlay's own properties
-	// cannot degrade it.
-	describe('readCommittedSnapshot inheritance', () => {
+	// wrapper declines it unconditionally — it does NOT inherit the underlying's
+	// value — because `connect` memoizes one underlying handle per (schema, table)
+	// and re-serves it, so a committed read runs on the writer's handle and can
+	// observe the overlay flush half-applied. See
+	// `tickets/fix/bug-isolation-committed-read-shares-writer-handle`.
+	describe('readCommittedSnapshot', () => {
 		/** Module stub declaring (or omitting) only `readCommittedSnapshot`. */
 		function snapshotStub(readCommittedSnapshot?: boolean): VirtualTableModule<any, any> {
 			const m: Record<string, unknown> = {};
@@ -4352,31 +4354,48 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			return m as unknown as VirtualTableModule<any, any>;
 		}
 
-		it('is true over MemoryTableModule', () => {
+		it('is false even over a snapshot-safe underlying', () => {
 			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
-			expect(iso.readCommittedSnapshot).to.equal(true);
-			expect(getModuleReadCommittedSnapshot(iso)).to.equal(true);
-		});
-
-		it('is false over an underlying that omits the flag', () => {
-			const iso = new IsolationModule({ underlying: snapshotStub() });
 			expect(iso.readCommittedSnapshot).to.equal(false);
 			expect(getModuleReadCommittedSnapshot(iso)).to.equal(false);
+
+			const stubbed = new IsolationModule({ underlying: snapshotStub(true), overlay: snapshotStub(true) });
+			expect(getModuleReadCommittedSnapshot(stubbed)).to.equal(false);
 		});
 
-		it('is false over an underlying that explicitly declines', () => {
-			const iso = new IsolationModule({ underlying: snapshotStub(false) });
-			expect(getModuleReadCommittedSnapshot(iso)).to.equal(false);
+		it('is false over an underlying that omits or declines the flag', () => {
+			expect(getModuleReadCommittedSnapshot(new IsolationModule({ underlying: snapshotStub() }))).to.equal(false);
+			expect(getModuleReadCommittedSnapshot(new IsolationModule({ underlying: snapshotStub(false) }))).to.equal(false);
 		});
 
-		it('follows the underlying, not the overlay', () => {
-			// A snapshot-safe overlay cannot lift a non-snapshot-safe underlying...
-			const lifted = new IsolationModule({ underlying: snapshotStub(false), overlay: new MemoryTableModule() });
-			expect(lifted.readCommittedSnapshot).to.equal(false);
+		// The reason the flag is false, made executable. `commitConnectionOverlays`
+		// applies staged rows into the underlying (Phase 1: begin + row-by-row) and
+		// only commits afterwards (Phase 2); a `_readCommitted` IsolatedTable delegates
+		// its query to that SAME memoized handle, so a read landing between the phases
+		// sees the batch half-applied. When the wrapper learns to open its own
+		// `_readCommitted` underlying connection, this test flips to asserting the
+		// pre-flush row set and the declaration above flips to true.
+		it('a committed read shares the writer underlying handle, so a mid-flush read tears', async () => {
+			const db = new Database();
+			const mod = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('iso_snap', mod);
+			await db.exec('CREATE TABLE snap_tear (id INTEGER PRIMARY KEY, v TEXT) USING iso_snap');
+			await db.exec(`INSERT INTO snap_tear VALUES (1, 'a'), (2, 'b')`);
 
-			// ...and a non-declaring overlay cannot drag a snapshot-safe underlying down.
-			const dragged = new IsolationModule({ underlying: snapshotStub(true), overlay: snapshotStub() });
-			expect(dragged.readCommittedSnapshot).to.equal(true);
+			const reader = await mod.connect(db, undefined, 'iso_snap', 'main', 'snap_tear', { _readCommitted: true } as never);
+
+			// Stand in for Phase 1 of an overlay flush: rows applied, not yet committed.
+			const underlying = mod.getUnderlyingState('main', 'snap_tear')!.underlyingTable;
+			await underlying.begin?.();
+			await underlying.update!({ operation: 'insert', values: [3, 'mid-flush'] });
+
+			const rows = await asyncIterableToArray(reader.query!(makeFullScanFilterInfo()));
+
+			await underlying.rollback?.();
+			await reader.disconnect();
+			await db.close();
+
+			expect(rows.length, 'today the committed read observes the half-applied batch').to.equal(3);
 		});
 	});
 

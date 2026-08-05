@@ -281,23 +281,29 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Inherits the underlying module's committed-snapshot guarantee verbatim.
+	 * Declines the engine's concurrent committed-read path, whatever the underlying
+	 * declares. Not an inheritance of the underlying's value: the wrapper adds a
+	 * tearing window of its own that no underlying can close.
 	 *
-	 * The wrapper contributes no tearing of its own: `IsolatedTable.query` skips
-	 * the per-connection overlay entirely for a `readCommitted` table and delegates
-	 * straight to the underlying, so a committed read never touches overlay state a
-	 * concurrent writer is staging into. The wrapper can therefore be exactly as
-	 * good as what it wraps — `true` over `MemoryTableModule`, `false` over
-	 * `StoreModule`.
+	 * `connect` memoizes ONE underlying `VirtualTable` per (schema, table) and
+	 * re-serves it to every caller, so the `_readCommitted` connect option never
+	 * reaches the underlying for any connect after the first. A committed read's
+	 * `IsolatedTable.query` therefore delegates to the WRITER's underlying handle —
+	 * and `commitConnectionOverlays` flushes staged rows through that same handle
+	 * incrementally (Phase 1 begins it and applies row by row; Phase 2 commits), so
+	 * a read overlapping the flush observes a partially applied batch. Verified
+	 * against a memory underlying: a scan taken between the Phase-1 apply and the
+	 * Phase-2 commit returns the half-written row set.
 	 *
-	 * A getter, not a stored field, for the same two reasons as `concurrencyMode`
-	 * above: the underlying's value is read live each time, and a concrete boolean
-	 * (never `undefined`) satisfies the optional `readCommittedSnapshot?` under
-	 * `exactOptionalPropertyTypes`.
+	 * Lifting this needs the wrapper to open its OWN `_readCommitted` underlying
+	 * connection for committed reads rather than sharing the memoized handle — see
+	 * `tickets/fix/bug-isolation-committed-read-shares-writer-handle`. Until then
+	 * the whole stack stays on the serialized read path, which is the fail-closed
+	 * outcome.
+	 *
+	 * See `docs/module-authoring.md` § "Committed-Snapshot Reads (`_readCommitted`)".
 	 */
-	get readCommittedSnapshot(): boolean {
-		return this.underlying.readCommittedSnapshot === true;
-	}
+	readonly readCommittedSnapshot = false as const;
 
 	/**
 	 * Gets the underlying table state for a table.

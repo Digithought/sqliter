@@ -174,7 +174,11 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 *    creates a fresh manager connection that is never handed to
 	 *    `Database.registerConnection` (`table.ts` — `ensureConnection`), so it
 	 *    never receives begin/commit/rollback/savepoint broadcasts and never joins
-	 *    the writer's transaction. Its `readLayer` is captured at connect time.
+	 *    the writer's transaction. `ensureConnection` is lazy, so its `readLayer`
+	 *    pins at the scan's first pull, not at `connect()` — within the obligation,
+	 *    which bounds the snapshot at "some commit boundary at or before the read
+	 *    began". Every later `query()` on the same instance reuses that connection,
+	 *    so two scans of one reader agree.
 	 * 3. **`query()` starts from the pinned layer.** `table.ts` reads
 	 *    `conn.readLayer` (not `pendingTransactionLayer`) in committed mode, and
 	 *    `scanLayerSync` captures the layer's BTree object once at scan start — a

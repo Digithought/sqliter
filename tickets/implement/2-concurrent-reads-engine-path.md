@@ -28,8 +28,12 @@ The read-committed machinery mostly exists; what is missing is the routing.
 - **`_readCommitted` connect option** (`vtab/module.ts`, `BaseModuleConfig`) and
   the `committed.<table>` schema qualifier that sets it per table reference.
 - **`readCommittedSnapshot` module flag** — added by the prereq ticket; `true`
-  on the memory vtab, inherited by the isolation wrapper, `false` everywhere
-  else (fail closed).
+  on the memory vtab and `false` everywhere else (fail closed). Note the
+  isolation wrapper does **not** inherit it: review found it re-serves one
+  memoized underlying handle to committed reads while flushing overlays through
+  that same handle incrementally, so it declares `false` unconditionally until
+  `fix/bug-isolation-committed-read-shares-writer-handle` lands. Only a bare
+  memory-vtab table takes the concurrent path for now.
 - **The scan emitter already connects per scan site, per execution.**
   `runtime/emit/scan.ts` calls `module.connect(...)` directly (~line 107) —
   it does *not* go through `getVTableConnection` — caches the instance in

@@ -442,17 +442,24 @@ if (getModuleReadCommittedSnapshot(module)) {
 **In-tree declarations.** The memory vtab declares `true`: layers are immutable
 BTrees, a commit publishes by a single pointer assignment to the current
 committed layer, a `_readCommitted` connect makes a fresh *unregistered*
-connection whose read layer is pinned at connect time, and the scan captures that
-layer's BTree object at scan start — so a concurrent DDL rebuild (which replaces
-tree objects wholesale) leaves the in-flight walk on a *stale but coherent*
-snapshot, which is the documented semantics rather than corruption. The isolation
-wrapper inherits the underlying module's value verbatim (its committed-read path
-bypasses the overlay entirely). `StoreModule` declares `false`: its `connect`
-returns a shared cached table per table key — dropping the `_readCommitted`
-option — and its `query` merges the coordinator's pending-op view over the
-committed store, so a read taken during a commit flush sees a partially applied
-batch. The platform plugins (leveldb, indexeddb, nativescript-sqlite,
-react-native-leveldb) wrap `StoreModule`, so they inherit `false`.
+connection whose read layer is pinned when the scan first pulls, and the scan
+captures that layer's BTree object at scan start — so a concurrent DDL rebuild
+(which replaces tree objects wholesale) leaves the in-flight walk on a *stale but
+coherent* snapshot, which is the documented semantics rather than corruption.
+
+Both wrappers decline. `StoreModule` declares `false`: its `connect` returns a
+shared cached table per table key — dropping the `_readCommitted` option — and
+its `query` merges the coordinator's pending-op view over the committed store, so
+a read taken during a commit flush sees a partially applied batch. The platform
+plugins (leveldb, indexeddb, nativescript-sqlite, react-native-leveldb) wrap
+`StoreModule`, so they inherit `false`. `IsolationModule` declares `false`
+**regardless of what it wraps**, and this is the instructive case: skipping the
+overlay is not sufficient. It memoizes one underlying `VirtualTable` per
+(schema, table) and re-serves that handle, so a committed read runs on the
+*writer's* handle while `commitConnectionOverlays` flushes staged rows through it
+incrementally — the reader can observe a half-applied flush even over a memory
+underlying whose own commit is atomic. **A wrapper is only as snapshot-safe as
+its own commit path**, not as the module beneath it.
 
 ### 5. Backing Host (Materialized-View Backing Tables)
 

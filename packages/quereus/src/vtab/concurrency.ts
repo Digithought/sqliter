@@ -20,7 +20,7 @@ export function getModuleConcurrencyMode(module: AnyVirtualTableModule): VtabCon
  * Fails closed: an undeclared module (every module that predates the flag) reads
  * as `false` and keeps taking the serialized path. See
  * `VirtualTableModule.readCommittedSnapshot` for the obligation, and
- * `docs/module-authoring.md` § "Committed-snapshot reads (`_readCommitted`)".
+ * `docs/module-authoring.md` § "Committed-Snapshot Reads (`_readCommitted`)".
  *
  * Deliberately NOT folded into {@link getModuleConcurrencyMode}: that answers a
  * per-connection reentrancy question, this one a cross-connection tearing question.

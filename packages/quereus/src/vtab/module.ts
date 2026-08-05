@@ -142,7 +142,7 @@ export interface VirtualTableModule<
 	/**
 	 * Declares that a connection opened with the `_readCommitted` connect option
 	 * serves a STABLE, self-consistent snapshot of committed state for the life of
-	 * the scan — see `docs/module-authoring.md` § "Committed-snapshot reads
+	 * the scan — see `docs/module-authoring.md` § "Committed-Snapshot Reads
 	 * (`_readCommitted`)" for the full obligation an out-of-tree module takes on.
 	 *
 	 * In one sentence: such a connection must serve a state that is consistent as
@@ -164,6 +164,12 @@ export interface VirtualTableModule<
 	 * stake. What is at stake is whether the module's shared, cross-connection
 	 * state tears while a commit publishes. A `'fully-reentrant'` module can still
 	 * publish commits incrementally, so reusing that enum would over-promise.
+	 *
+	 * **Also distinct from {@link scanSnapshotIsolation} above**, despite the shared
+	 * word: that one is about ONE connection's own scan surviving ITS OWN writes
+	 * (the Halloween case, which the DML executor resolves by buffering). This one is
+	 * about a read connection surviving ANOTHER connection's commit. A module can
+	 * hold either without the other.
 	 */
 	readonly readCommittedSnapshot?: boolean;
 

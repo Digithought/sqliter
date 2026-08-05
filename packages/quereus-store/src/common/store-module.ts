@@ -131,7 +131,7 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 	 *   comment below), so a read taken while a commit flushes those ops observes
 	 *   a partially applied batch.
 	 *
-	 * See `docs/module-authoring.md` § "Committed-snapshot reads (`_readCommitted`)".
+	 * See `docs/module-authoring.md` § "Committed-Snapshot Reads (`_readCommitted`)".
 	 */
 	readonly readCommittedSnapshot = false as const;
 
