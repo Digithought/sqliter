@@ -69,6 +69,9 @@ export async function asyncIterableToArray<T>(iterable: AsyncIterable<T>): Promi
  */
 export async function getVTableConnection(ctx: RuntimeContext, tableSchema: TableSchema): Promise<VirtualTableConnection> {
 	if (ctx.readCommitted) {
+		// NOTE: this helper currently has no callers anywhere in the repo, so the
+		// guard below is a standing precondition for whoever revives it, not an
+		// active safety net. Delete both together if the helper goes.
 		// Assertion, not control flow: this helper is the transaction-JOINING path —
 		// it reuses the writer's registered connection and `registerConnection`
 		// auto-joins new connections to the open transaction. A mutex-free committed

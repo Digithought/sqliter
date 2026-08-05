@@ -31,6 +31,7 @@ import { ParameterScope } from '../planner/scopes/param.js';
 import { GlobalScope } from '../planner/scopes/global.js';
 import { PlanNode, isRelationalNode } from '../planner/nodes/plan-node.js';
 import { TableReferenceNode } from '../planner/nodes/reference.js';
+import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { getModuleReadCommittedSnapshot } from '../vtab/concurrency.js';
 import { registerEmitters } from '../runtime/register.js';
 import { serializePlanTree, formatPlanTree } from '../planner/debug.js';
@@ -605,6 +606,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *   `readCommittedSnapshot` (universal, not existential — one unqualified
 	 *   table makes the whole block serialize). Checked on the OPTIMIZED plan, so
 	 *   tables reached through views and materialized views are covered.
+	 * - No table-valued function is called. A TVF reaches its data outside the
+	 *   `TableReferenceNode` gate above, and `TableFunctionCallNode` reports
+	 *   `readonly: true` unconditionally, so neither of the other checks can see
+	 *   what it does — `execution_trace('insert ...')`, for one, prepares and
+	 *   runs arbitrary SQL. Fail closed, matching the module contract's
+	 *   opt-in-or-serialize discipline.
 	 *
 	 * Evaluated at routing time; a `BEGIN` landing after routing does not
 	 * invalidate an in-flight concurrent read — that read is already pinned to a
@@ -625,15 +632,26 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			return false;
 		}
 		if (block.statements.length === 0) return false;
-		for (const stmt of block.statements) {
-			if (!isRelationalNode(stmt)) return false;
-		}
-		// Single walk over the optimized statement trees: reject on any
-		// side-effecting node or any table whose module does not qualify.
-		const stack: PlanNode[] = [...block.statements];
+		return block.statements.every(stmt =>
+			isRelationalNode(stmt) && Database.isCommittedReadSafeSubtree(stmt));
+	}
+
+	/**
+	 * @internal Single walk over one optimized statement tree: rejects on any
+	 * side-effecting node, any table-valued function call, or any table whose
+	 * module does not declare `readCommittedSnapshot`. See
+	 * {@link _isConcurrentReadEligible} for why each is disqualifying.
+	 */
+	private static isCommittedReadSafeSubtree(root: PlanNode): boolean {
+		const stack: PlanNode[] = [root];
 		while (stack.length > 0) {
 			const node = stack.pop()!;
 			if (PlanNode.hasSideEffects(node.physical)) return false;
+			// NOTE: rejects every TVF, pure ones (`json_each`) included, because no
+			// declaration distinguishes them from `execution_trace`, which runs
+			// arbitrary SQL. If a pure TVF ever needs this path, add an explicit
+			// opt-in flag to the table-valued function schema and gate on it here.
+			if (node.nodeType === PlanNodeType.TableFunctionCall) return false;
 			if (node instanceof TableReferenceNode && !getModuleReadCommittedSnapshot(node.vtabModule)) {
 				return false;
 			}

@@ -19,14 +19,19 @@ export function emitRemoteQuery(plan: RemoteQueryNode, _ctx: EmissionContext): I
 		const tableSchema = tableRef.tableSchema;
 		const vtabModule = (moduleCtx as { vtabModule?: AnyVirtualTableModule } | undefined)?.vtabModule ?? tableRef.vtabModule;
 
-		// Connect to the table to get the instance
+		// Connect to the table to get the instance.
+		// NOTE: `vtabArgs` from the table schema are still not threaded through here
+		// (pre-existing); add them if a pushdown-capable module ever needs them.
 		const table = await vtabModule.connect(
 			rctx.db,
 			undefined, // pAux
 			tableSchema.vtabModuleName,
 			tableSchema.schemaName,
 			tableSchema.name,
-			{} // empty config for now
+			// Same committed-read propagation as the scan leaf (runtime/emit/scan.ts):
+			// on the mutex-free path this connection must NOT join the writer's
+			// transaction, so the option has to reach a pushdown module too.
+			(tableRef.readCommitted || rctx.readCommitted) ? { _readCommitted: true } : {}
 		);
 
 		if (!table.executePlan) {

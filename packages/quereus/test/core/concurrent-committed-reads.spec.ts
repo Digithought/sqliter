@@ -77,6 +77,35 @@ async function settleWindow(): Promise<void> {
 	}
 }
 
+/**
+ * Assert that `work` is queued behind the parked writer — i.e. it took the
+ * SERIALIZED path. Gives it a fair settle window, pins that it has not resolved,
+ * then releases the stall and returns its result.
+ */
+async function expectSerialized<T>(stall: StallControl, work: Promise<T>): Promise<T> {
+	let settled = false;
+	const tracked = work.then(
+		value => { settled = true; return value; },
+		error => { settled = true; throw error; },
+	);
+	await settleWindow();
+	expect(settled, 'statement resolved without waiting for the parked writer').to.equal(false);
+	stall.release();
+	return tracked;
+}
+
+/**
+ * A second memory module identical to the built-in one except that it declines
+ * the committed-snapshot contract, so tables using it can never be eligible.
+ * Methods and table state resolve through the prototype chain; the own-property
+ * override wins.
+ */
+function registerNoSnapshotModule(db: Database, name = 'nosnap'): void {
+	const noSnap = Object.create(new MemoryTableModule()) as MemoryTableModule;
+	Object.defineProperty(noSnap, 'readCommittedSnapshot', { value: false });
+	db.registerModule(name, noSnap);
+}
+
 describe('concurrent committed reads (readConcurrency: committed)', () => {
 	let db: Database;
 	let stall: StallControl;
@@ -118,17 +147,8 @@ describe('concurrent committed reads (readConcurrency: committed)', () => {
 		const writer = db.exec("insert into t values (2, 'b')");
 		await entered;
 
-		let resolved = false;
-		const readP = db.get('select count(*) as n from t').then(row => {
-			resolved = true;
-			return row;
-		});
-		await settleWindow();
-		expect(resolved).to.equal(false); // pinned: the serialized path waits
-
-		stall.release();
+		const row = await expectSerialized(stall, db.get('select count(*) as n from t'));
 		await writer;
-		const row = await readP;
 		expect(Number(row?.n)).to.equal(2); // and then sees the committed write
 	});
 
@@ -185,12 +205,7 @@ describe('concurrent committed reads (readConcurrency: committed)', () => {
 	});
 
 	it('falls back silently for a module without readCommittedSnapshot', async () => {
-		// Same live memory-module state, minus the flag: methods and table state
-		// resolve through the prototype chain; the own-property override wins.
-		const inner = new MemoryTableModule();
-		const noSnap = Object.create(inner) as MemoryTableModule;
-		Object.defineProperty(noSnap, 'readCommittedSnapshot', { value: false });
-		db.registerModule('nosnap', noSnap);
+		registerNoSnapshotModule(db);
 		await db.exec('create table u (id integer primary key, v text) using nosnap');
 		await db.exec("insert into u values (1, 'q')");
 
@@ -199,10 +214,7 @@ describe('concurrent committed reads (readConcurrency: committed)', () => {
 	});
 
 	it('a multi-table statement is ineligible when any table does not qualify', async () => {
-		const inner = new MemoryTableModule();
-		const noSnap = Object.create(inner) as MemoryTableModule;
-		Object.defineProperty(noSnap, 'readCommittedSnapshot', { value: false });
-		db.registerModule('nosnap', noSnap);
+		registerNoSnapshotModule(db);
 		await db.exec('create table u (id integer primary key, v text) using nosnap');
 		await db.exec("insert into u values (1, 'q')");
 
@@ -214,6 +226,94 @@ describe('concurrent committed reads (readConcurrency: committed)', () => {
 			{ readConcurrency: 'committed' },
 		);
 		expect(Number(row?.n)).to.equal(1);
+	});
+
+	it('an unqualified table reached through a view still disqualifies', async () => {
+		registerNoSnapshotModule(db);
+		await db.exec('create table u (id integer primary key, v text) using nosnap');
+		await db.exec("insert into u values (1, 'q')");
+		await db.exec('create view uv as select * from u');
+
+		const entered = stall.arm();
+		const writer = db.exec("insert into t values (2, 'b')");
+		await entered;
+
+		// The gate walks the OPTIMIZED plan, so the view's inlined table reference
+		// is visible and the read queues behind the parked writer like any other.
+		const row = await expectSerialized(stall, db.get('select v from uv', undefined, { readConcurrency: 'committed' }));
+		await writer;
+		expect(row?.v).to.equal('q');
+	});
+
+	it('a view over a qualified table still runs concurrently', async () => {
+		await db.exec('create view tv as select * from t');
+		const entered = stall.arm();
+		const writer = db.exec("insert into t values (2, 'b')");
+		await entered;
+
+		const rows = await collect(db.eval('select id from tv', undefined, { readConcurrency: 'committed' }));
+		expect(rows.length).to.equal(1); // pre-write committed state, no wait
+
+		stall.release();
+		await writer;
+	});
+
+	it('bound parameters resolve on the concurrent path', async () => {
+		const entered = stall.arm();
+		const writer = db.exec("insert into t values (2, 'b')");
+		await entered;
+
+		const row = await db.get('select v from t where id = ?', [1], { readConcurrency: 'committed' });
+		expect(row?.v).to.equal('a');
+
+		stall.release();
+		await writer;
+	});
+
+	it('a side-effecting statement falls back and still writes (insert ... returning)', async () => {
+		const rows = await collect(db.eval(
+			"insert into t values (5, 'e') returning id",
+			undefined,
+			{ readConcurrency: 'committed' },
+		));
+		expect(rows.length).to.equal(1);
+		const after = await db.get('select count(*) as n from t');
+		expect(Number(after?.n)).to.equal(2); // the write landed on the serialized path
+	});
+
+	it('a table-valued function makes the statement ineligible (fail closed)', async () => {
+		const entered = stall.arm();
+		const writer = db.exec("insert into t values (2, 'b')");
+		await entered;
+
+		// `schema()` is pure, but nothing in a TVF's schema says so — and
+		// `TableFunctionCallNode` reports readonly unconditionally while exposing no
+		// TableReferenceNode, so neither the side-effect check nor the module gate
+		// can see through one. Every surviving TVF therefore serializes. (A
+		// constant-argument deterministic TVF like `json_each('[1,2]')` folds to a
+		// table literal before the gate runs — that literal reads nothing, so it
+		// stays eligible.)
+		const rows = await expectSerialized(stall,
+			collect(db.eval('select name from schema()', undefined, { readConcurrency: 'committed' })));
+		await writer;
+		expect(rows.length).to.be.greaterThan(0);
+	});
+
+	it('a DML-bearing trace TVF never runs mutex-free', async () => {
+		const entered = stall.arm();
+		const writer = db.exec("insert into t values (2, 'b')");
+		await entered;
+
+		// `row_trace` prepares and runs its argument — an arbitrary INSERT here.
+		// Routing it concurrently would let a write run outside the exec mutex while
+		// another statement sits inside its commit.
+		const traced = expectSerialized(stall,
+			collect(db.eval("select count(*) as n from row_trace('insert into t values (99, ''z'')')",
+				undefined, { readConcurrency: 'committed' })));
+		await writer;
+		await traced;
+		const after = await db.get('select count(*) as n from t');
+		expect(Number(after?.n)).to.equal(3); // writer's row + the traced insert
 	});
 
 	it('db.close() aborts a mid-iteration concurrent read and still resolves', async () => {
@@ -286,5 +386,23 @@ describe('concurrent committed reads (readConcurrency: committed)', () => {
 		await writer;
 		const after = await db.get('select count(*) as n from t');
 		expect(Number(after?.n)).to.equal(2);
+	});
+
+	it('two overlapping reads on the SAME prepared statement still hit the busy guard', async () => {
+		await db.exec("insert into t values (2, 'b'), (3, 'c')");
+		const stmt = db.prepare('select id from t');
+
+		// A Statement carries per-execution state (bound args, the busy flag), so it
+		// has always been single-execution. The mutex used to make that unobservable;
+		// mutex-free reads expose it. Concurrent callers need one statement each —
+		// `db.get` / `db.eval` prepare per call and are unaffected.
+		const first = collect(stmt.all(undefined, { readConcurrency: 'committed' }));
+		const second = collect(stmt.all(undefined, { readConcurrency: 'committed' }));
+		const outcomes = await Promise.allSettled([first, second]);
+		expect(outcomes.filter(o => o.status === 'fulfilled').length).to.equal(1);
+		const rejected = outcomes.find(o => o.status === 'rejected') as PromiseRejectedResult;
+		expect(String(rejected.reason)).to.contain('Statement busy');
+
+		await stmt.finalize();
 	});
 });
