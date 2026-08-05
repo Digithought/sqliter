@@ -2336,7 +2336,7 @@ function rewriteTableForColumnRename(
 	const newChecks = table.checkConstraints.map(cc => {
 		const rewrote = isRenamedTable
 			? renameColumnInCheckExpression(cc.expr, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)
-			: renameColumnInAst(cc.expr, tableName, oldCol, newCol, renamedSchemaLower);
+			: renameColumnInAst(cc.expr, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource);
 		if (!rewrote) return cc;
 		changed = true;
 		return { ...cc };
@@ -2379,7 +2379,7 @@ function rewriteTableForColumnRename(
 	const newIndexes = (table.indexes ?? []).map(idx => {
 		const rewrote = isRenamedTable
 			? renameColumnInCheckExpression(idx.predicate, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)
-			: renameColumnInAst(idx.predicate, tableName, oldCol, newCol, renamedSchemaLower);
+			: renameColumnInAst(idx.predicate, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource);
 		if (!rewrote) return idx;
 		changed = true;
 		return { ...idx };
@@ -2399,7 +2399,7 @@ function rewriteTableForColumnRename(
 	// `table_modified`, which is all the copies above achieve either.
 	const columnsRewritten = isRenamedTable
 		? renameColumnInColumnExpressions(table.columns, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)
-		: rewriteOtherTableColumnExpressions(table.columns, tableName, oldCol, newCol, renamedSchemaLower);
+		: rewriteOtherTableColumnExpressions(table.columns, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource);
 	if (columnsRewritten) changed = true;
 
 	if (!changed) return table;
@@ -2419,6 +2419,13 @@ function rewriteTableForColumnRename(
  * {@link renameColumnInAst} — the same entry point the checks and predicates arms use for
  * a foreign table, and for the same reason: an unqualified ref in someone else's default
  * must bind inside its own subquery's FROM, never to this table.
+ *
+ * `resolveColumnInSource` is as load-bearing here as on the seeded arm, and for the mirror
+ * reason: without it the walk cannot tell that an inner FROM source exposes the old name,
+ * so a nested `(select (select max(a) from other) from t)` rewrites the INNER `a` — which
+ * binds to `other` — and the default silently starts reading a different column. It also
+ * keeps this pass in step with the pre-flight persistability probe, which runs the same
+ * rewriter with the resolver supplied.
  */
 function rewriteOtherTableColumnExpressions(
 	columns: ReadonlyArray<ColumnSchema>,
@@ -2426,11 +2433,12 @@ function rewriteOtherTableColumnExpressions(
 	oldCol: string,
 	newCol: string,
 	renamedSchemaLower: string,
+	resolveColumnInSource: ResolveColumnInSource,
 ): boolean {
 	let changed = false;
 	for (const col of columns) {
 		for (const expr of [col.defaultValue, col.generatedExpr]) {
-			if (expr && renameColumnInAst(expr, tableName, oldCol, newCol, renamedSchemaLower)) changed = true;
+			if (expr && renameColumnInAst(expr, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)) changed = true;
 		}
 	}
 	return changed;

@@ -1160,3 +1160,47 @@ select id, z, b from t_dshadow;
 
 drop table t_dshadow;
 drop table "new";
+
+-- ===================================
+-- 37. A NESTED subquery in another object binds its inner ref to the INNER source
+-- ===================================
+-- §34-35 pin the one-level cases. The nesting below is what distinguishes a
+-- scope-aware walk from a "the renamed table is somewhere in scope" one: the inner
+-- `max(a)` binds to `u_xnest`, while the OUTER frame is the renamed table. Only the
+-- column-source resolver can tell the two apart — without it the inner ref is rewritten
+-- to `max(z)`, which then resolves against the outer frame instead and the expression
+-- silently starts reading a different table's column (no error, wrong value).
+--
+-- Both arms of the foreign-object rewrite are pinned: a DEFAULT (this ticket's arm) and
+-- a CHECK (the arm next to it, which had the same hole).
+
+create table t_xnest (id integer primary key, a integer);
+insert into t_xnest values (1, 1);
+
+create table u_xnest (id integer primary key, a integer);
+insert into u_xnest values (1, 99);
+
+create table x_xnest (id integer primary key,
+                      c integer default ((select (select max(a) from u_xnest) from t_xnest limit 1)));
+
+create table y_xnest (id integer primary key, n integer,
+                      check (n < (select (select max(a) from u_xnest) from t_xnest limit 1)));
+
+alter table t_xnest rename column a to z;
+
+-- 99 (u_xnest.a), not 1 (t_xnest.z): the inner ref was left alone.
+insert into x_xnest (id) values (1);
+
+select id, c from x_xnest;
+→ [{"id":1,"c":99}]
+
+-- Same for the CHECK: `n < 99` passes; a rewritten inner ref would compare against 1.
+insert into y_xnest (id, n) values (1, 1);
+
+select id, n from y_xnest;
+→ [{"id":1,"n":1}]
+
+drop table y_xnest;
+drop table x_xnest;
+drop table u_xnest;
+drop table t_xnest;

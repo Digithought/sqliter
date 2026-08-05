@@ -69,6 +69,26 @@ Cannot drop column 'v' from 'T': it is referenced by CHECK constraint 'chk_x' on
   cross-schema reference is the known gap tracked by
   `bug-rename-not-propagated-across-schemas`.
 
+## Second arm: another table's column DEFAULT, same hole
+
+Added by the review of `bug-column-default-new-qualifier-invisible-to-column-rename`,
+which landed the *same-table* DEFAULT guard (`assertNoColumnDefaultNamesColumn`, same
+file). A column default can reach another table through a subquery exactly as a CHECK
+can, and the new guard scans only the altered table's own columns:
+
+```sql
+create table u (k integer primary key, v integer);
+create table t (id integer primary key, w integer default ((select min(v) from u)));
+
+alter table u drop column v;   -- accepted, no error
+insert into t (id) values (1); -- Column not found: v
+```
+
+Verified in-process at `ccdcf8f9`. Same shape, same site, same probe question
+(`columnReferencedInAst`, unseeded — a foreign table's default binds its unqualified
+names inside its own subquery's FROM) and the same cost question. Whoever widens the
+scan should widen it once for both expression kinds rather than twice.
+
 ## Related
 
 - `bug-drop-column-skips-dependent-checks` — the same-table CHECK + assertion arms (landed).
