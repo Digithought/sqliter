@@ -222,6 +222,25 @@ try {
 
 Cancellation interrupts *execution* (the row-by-row drain), not an already-started commit: an abort that races a commit is a no-op, so a cancelled write can never leave a partially-committed state. A fully-synchronous, await-free in-memory operator (e.g. an in-memory sort over an already-drained array) is uninterruptible by construction — the drain that *fills* it is interruptible, but the CPU-bound pass itself runs to completion. See [errors.md](./errors.md) for `AbortError` / `isAbortError` / `throwIfAborted`.
 
+#### Concurrent Committed Reads (`readConcurrency`)
+
+By default, every statement — reads included — queues behind the database's execution mutex. That means a read issued while another statement is stuck in a slow virtual-table commit (e.g. a network-backed store) waits for that commit to finish. The same options bag accepts an opt-out for reads that can tolerate slightly stale data:
+
+```typescript
+// Runs immediately against the last COMMITTED state, even while a write is
+// mid-commit — instead of waiting its turn behind the mutex.
+const row = await db.get("select count(*) as n from t", undefined, { readConcurrency: 'committed' });
+```
+
+- `'serialized'` (default) — queue behind the mutex, exactly as today.
+- `'committed'` — when the statement is *eligible*, run WITHOUT the mutex against each table's last committed state. An ineligible statement silently falls back to `'serialized'` — opting in is never an error.
+
+Eligibility (all must hold): the query is read-only; no explicit `BEGIN` is open (a read inside your own transaction must see the transaction's writes, so it always serializes); for `db.eval`, the SQL is a single statement (a `select; insert; select` batch falls back wholesale); and every table read resolves to a module that declares `readCommittedSnapshot` (the in-memory module qualifies; store-backed modules currently do not — reads on them just keep serializing).
+
+**The tradeoff — read this before opting in.** `'committed'` deliberately gives up an ordering guarantee you may be relying on without realizing it: after `void db.exec(insert)` (unawaited), an opted-in `await db.get(select)` may answer from the *pre-insert* state, because the read no longer waits for the write to land. If you need read-your-writes ordering, either `await` the write first or use the default. That footgun is exactly why the opt-in is per call and there is no database-wide switch.
+
+Honored by the row-returning entry points: `db.get`, `db.eval`, and the prepared-statement `stmt.get`, `stmt.all`, `stmt.iterateRows`, `stmt.run`. `db.exec` ignores the option (it returns no rows, and its per-statement transaction loop is exactly what the mutex-free path must not touch). A caller `signal` combines with the option normally, and `db.close()` aborts any in-flight concurrent read at its next row boundary. See [SQL Transactions § Concurrent committed reads](sql-txn.md#86-concurrent-committed-reads) for the transaction-interaction details and [Module Authoring § Committed-Snapshot Reads](module-authoring.md#4-committed-snapshot-reads-_readcommitted) for the module contract.
+
 ### Transactions
 
 Quereus supports explicit transaction control using `BEGIN`, `COMMIT`, and `ROLLBACK`. Additionally, both `db.exec()` and `statement.run()` automatically wrap their execution in implicit transactions when in autocommit mode.

@@ -52,9 +52,10 @@ export class ParallelDriver {
 	 * - an **independent** `tableContexts` map seeded with a shallow snapshot of the
 	 *   parent's entries — set/delete in one fork do not leak to siblings or parent;
 	 * - **shared** references to read-mostly state: `db`, `stmt`, `params`,
-	 *   `enableMetrics`, `mutationOrdinal`, `signal`, `tracer`, `activeConnection`,
-	 *   `tableNameRemap`, `contextTracker`, `planStack`, `executionMemo`,
-	 *   `scanConnections`, `cacheStates`, `cteMaterializations`, `inSetProbes`.
+	 *   `enableMetrics`, `mutationOrdinal`, `signal`, `readCommitted`, `tracer`,
+	 *   `activeConnection`, `tableNameRemap`, `contextTracker`, `planStack`,
+	 *   `executionMemo`, `scanConnections`, `cacheStates`, `cteMaterializations`,
+	 *   `inSetProbes`.
 	 *   (`tableNameRemap` is the deferred-constraint queue's per-entry old→new table
 	 *   name map; shared by reference and read-only, so a scan leaf inside a fork
 	 *   resolves the same post-rename name the parent would.)
@@ -128,6 +129,10 @@ export class ParallelDriver {
 				enableMetrics: rctx.enableMetrics,
 				mutationOrdinal: rctx.mutationOrdinal,
 				signal: rctx.signal,
+				// Mutex-free committed-read marker: set once at execution start, only
+				// ever read afterwards (scan connect options, getVTableConnection
+				// assertion), so every branch shares the parent's value as immutable.
+				readCommitted: rctx.readCommitted,
 				contextTracker: rctx.contextTracker,
 				planStack: rctx.planStack,
 				executionMemo: rctx.executionMemo,

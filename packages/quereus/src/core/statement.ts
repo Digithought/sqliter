@@ -20,6 +20,7 @@ import { getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
+import { combineAbortSignals } from '../util/abort-signal.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
 import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
 import { isObjectClassValue } from '../util/comparison.js';
@@ -323,6 +324,8 @@ export class Statement {
 			tracer?: InstructionTracer;
 			enableMetrics?: boolean;
 			signal?: AbortSignal;
+			/** Mutex-free committed read — see {@link RuntimeContext.readCommitted}. */
+			readCommitted?: boolean;
 		}
 	): AsyncIterable<Row> {
 		this.validateStatement("iterate rows for");
@@ -376,6 +379,7 @@ export class Statement {
 				enableMetrics,
 				signal,
 				scanConnections,
+				readCommitted: runtimeOverrides?.readCommitted,
 			};
 
 			// Validate captured schema objects once per execution — hoisted out of every
@@ -442,6 +446,53 @@ export class Statement {
 	}
 
 	/**
+	 * @internal True when this execution should take the mutex-free committed-read
+	 * path: the caller opted in (`readConcurrency: 'committed'`) and the compiled
+	 * block passes {@link Database._isConcurrentReadEligible}. Compiles early
+	 * (synchronously) — the serialized path is untouched and still compiles
+	 * lazily inside the mutex when this returns false. Never throws: an
+	 * ineligible or uncompilable statement falls back to the serialized path,
+	 * where a compile error re-surfaces identically (compile failures are not
+	 * memoized).
+	 */
+	private tryRouteConcurrent(options?: StatementOptions): boolean {
+		if (options?.readConcurrency !== 'committed') return false;
+		try {
+			return this.db._isConcurrentReadEligible(this.compile());
+		} catch (e) {
+			log('committed-read routing declined (compile failed): %O', e);
+			return false;
+		}
+	}
+
+	/**
+	 * @internal Mutex-free committed-read execution. Runs WITHOUT the exec mutex
+	 * and MUST NOT touch the implicit-transaction lifecycle
+	 * (`_finalizeImplicitTransaction` / `_ensureTransaction` / autocommit
+	 * helpers) — any open implicit transaction belongs to the writer running
+	 * alongside, and finalizing it here would commit or roll back the WRITER's
+	 * transaction. Every table scan connects with `_readCommitted: true` (see
+	 * `RuntimeContext.readCommitted`), serving the last committed state.
+	 *
+	 * The {@link ConcurrentReadScope} is acquired lazily at first pull (not at
+	 * routing time) so an iterator that is never consumed holds no scope —
+	 * `Database.close()` awaits every live scope's teardown. The scope's signal
+	 * (fired by `close()`) is combined with the caller's; `scope.end()` runs in
+	 * this generator's `finally`, i.e. on every exit path.
+	 */
+	async *_iterateConcurrent(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Row> {
+		throwIfAborted(options?.signal);
+		const scope = this.db._beginConcurrentRead();
+		const combined = combineAbortSignals(options?.signal, scope.signal);
+		try {
+			yield* this._iterateRowsRawInternal(params, { signal: combined.signal, readCommitted: true });
+		} finally {
+			combined.dispose();
+			scope.end();
+		}
+	}
+
+	/**
 	 * Iterates over result rows. Handles JIT transaction management - commits
 	 * implicit transactions on successful completion, rolls back on error.
 	 *
@@ -450,6 +501,11 @@ export class Statement {
 	 *   boundary so iteration can be interrupted on a request timeout).
 	 */
 	iterateRows(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Row> {
+		if (this.tryRouteConcurrent(options)) {
+			// Mutex-free committed read: no transaction to finalize here — the
+			// writer owns any open implicit transaction (see _iterateConcurrent).
+			return this._iterateConcurrent(params, options);
+		}
 		return wrapAsyncIterator(this._iterateRowsGenerator(params, options?.signal), (commit, error) =>
 			this.db._finalizeImplicitTransaction(commit, error)
 		);
@@ -559,6 +615,15 @@ export class Statement {
 		// Pre-flight cancellation: reject before acquiring the mutex / doing work.
 		throwIfAborted(options?.signal);
 
+		if (this.tryRouteConcurrent(options)) {
+			// Mutex-free committed read (eligibility guarantees read-only): drain
+			// without touching the implicit-transaction lifecycle.
+			for await (const _ of this._iterateConcurrent(params, options)) {
+				/* Consume all rows */
+			}
+			return;
+		}
+
 		await this.db._runWithMutex(async () => {
 			let success = false;
 			let runError: unknown;
@@ -588,6 +653,16 @@ export class Statement {
 		this.validateStatement("get first row for");
 		// Pre-flight cancellation: reject before acquiring the mutex / doing work.
 		throwIfAborted(options?.signal);
+
+		if (this.tryRouteConcurrent(options)) {
+			const names = this.getColumnNames();
+			// The early return triggers the generator's return() → its finally, so
+			// scan connections disconnect and the read scope ends.
+			for await (const row of this._iterateConcurrent(params, options)) {
+				return rowToObject(row, names);
+			}
+			return undefined;
+		}
 
 		return this.db._runWithMutex(async () => {
 			let result: Record<string, SqlValue> | undefined;
@@ -623,9 +698,25 @@ export class Statement {
 	all(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Record<string, SqlValue>> {
 		this.validateStatement("get all rows for");
 
+		if (this.tryRouteConcurrent(options)) {
+			return this._allConcurrentGenerator(params, options);
+		}
+
 		return wrapAsyncIterator(this._allGenerator(params, options?.signal), (commit, error) =>
 			this.db._finalizeImplicitTransaction(commit, error)
 		);
+	}
+
+	/**
+	 * @internal Committed-read counterpart of {@link _allGenerator}: maps the
+	 * mutex-free row stream to objects. No transaction finalization — see
+	 * {@link _iterateConcurrent}.
+	 */
+	private async *_allConcurrentGenerator(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Record<string, SqlValue>> {
+		const names = this.getColumnNames();
+		for await (const row of this._iterateConcurrent(params, options)) {
+			yield rowToObject(row, names);
+		}
 	}
 
 	/**

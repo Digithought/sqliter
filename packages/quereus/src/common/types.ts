@@ -60,6 +60,25 @@ export interface StatementOptions {
 	 * before any work is performed.
 	 */
 	signal?: AbortSignal;
+	/**
+	 * Read concurrency for this execution.
+	 *
+	 * - `'serialized'` (default) — queue behind the execution mutex. The read
+	 *   sees whatever an already-queued write left behind, exactly as today.
+	 * - `'committed'` — when the statement is eligible (a read-only query in
+	 *   autocommit mode whose every table's module declares
+	 *   `readCommittedSnapshot`), run WITHOUT the mutex against each table's last
+	 *   committed state, so the read completes even while another statement is
+	 *   blocked in its virtual-table commit. An ineligible statement silently
+	 *   falls back to `'serialized'` — never an error.
+	 *
+	 * `'committed'` deliberately gives up the ordering guarantee that
+	 * `void db.exec(insert); await db.get(select)` shows the insert — the read
+	 * may serve the pre-insert state. That is why it is opt-in per call.
+	 * Honored by the row-returning entry points (`Database.get`, `Database.eval`,
+	 * `Statement.get/all/iterateRows/run`); `Database.exec` ignores it.
+	 */
+	readConcurrency?: 'serialized' | 'committed';
 }
 
 /**

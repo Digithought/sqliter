@@ -50,6 +50,10 @@ const EXPECTED_FORK_POLICY = {
 	// Cooperative cancellation signal: shared by reference so every branch honors the
 	// same abort; the runtime only ever reads it (never mutates), so it is frozen.
 	signal: 'shared-frozen',
+	// Mutex-free committed-read marker: set once at execution start by the
+	// concurrent-read path and only ever READ (scan emitter connect options,
+	// getVTableConnection assertion), so a fork shares it by reference as immutable.
+	readCommitted: 'shared-frozen',
 	contextTracker: 'shared-sink',
 	planStack: 'shared-sink',
 	// Once-per-execution memo for impure subqueries: shared by reference so the
@@ -150,8 +154,9 @@ function makeRuntimeContext(): RuntimeContext {
 		context: createStrictRowContextMap(),
 		tableContexts: wrapTableContextsStrict(new Map()),
 		enableMetrics: false,
-		// Non-undefined sentinel so the 'shared-frozen' aliasing assertion is meaningful.
+		// Non-undefined sentinels so the 'shared-frozen' aliasing assertion is meaningful.
 		mutationOrdinal: 0,
+		readCommitted: false,
 	};
 }
 

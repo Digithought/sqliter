@@ -102,7 +102,10 @@ export function emitSeqScan(
 			try {
 				const options: BaseModuleConfig = {
 					...(schema.vtabArgs ?? {}),
-					...(source.readCommitted ? { _readCommitted: true } : {})
+					// Per-reference (`committed.<table>`) OR per-execution (mutex-free
+					// committed read — see RuntimeContext.readCommitted). The OR makes a
+					// `committed.` reference inside a concurrent read a no-op, not a conflict.
+					...((source.readCommitted || runtimeCtx.readCommitted) ? { _readCommitted: true } : {})
 				};
 				vtabInstance = await module.connect(
 					runtimeCtx.db,

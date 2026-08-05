@@ -68,6 +68,16 @@ export async function asyncIterableToArray<T>(iterable: AsyncIterable<T>): Promi
  * This ensures transaction consistency by reusing connections within the same context.
  */
 export async function getVTableConnection(ctx: RuntimeContext, tableSchema: TableSchema): Promise<VirtualTableConnection> {
+	if (ctx.readCommitted) {
+		// Assertion, not control flow: this helper is the transaction-JOINING path —
+		// it reuses the writer's registered connection and `registerConnection`
+		// auto-joins new connections to the open transaction. A mutex-free committed
+		// read is gated read-only before routing (Database._isConcurrentReadEligible),
+		// so reaching here means the eligibility gate failed.
+		throw new QuereusError(
+			`getVTableConnection reached during a committed read (table '${tableSchema.schemaName}.${tableSchema.name}')`,
+			StatusCode.INTERNAL);
+	}
 	const tableName = `${tableSchema.schemaName}.${tableSchema.name}`;
 
 	// Check if we already have an active connection for this table

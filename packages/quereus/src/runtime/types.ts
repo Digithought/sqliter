@@ -42,6 +42,16 @@ export type RuntimeContext = {
 	 */
 	signal?: AbortSignal;
 	/**
+	 * When true, this execution is a mutex-free committed read: every table scan
+	 * in this execution connects with `_readCommitted: true`, and no connection
+	 * may join (or create) a transaction — `getVTableConnection` asserts on this
+	 * flag. Set only by the concurrent committed-read path
+	 * (`core/statement.ts` `_iterateConcurrent`), which is gated on the plan
+	 * being read-only over `readCommittedSnapshot`-declaring modules
+	 * (`Database._isConcurrentReadEligible`).
+	 */
+	readCommitted?: boolean;
+	/**
 	 * The 1-based ordinal of the row currently being produced within the active
 	 * INSERT / mutation-context evaluation, or undefined outside one. Exposed to
 	 * the `mutation_ordinal()` builtin so a column `default` can author a per-row

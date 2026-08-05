@@ -29,7 +29,9 @@ import type { PlanningContext } from '../planner/planning-context.js';
 import { BuildTimeDependencyTracker } from '../planner/planning-context.js';
 import { ParameterScope } from '../planner/scopes/param.js';
 import { GlobalScope } from '../planner/scopes/global.js';
-import { PlanNode } from '../planner/nodes/plan-node.js';
+import { PlanNode, isRelationalNode } from '../planner/nodes/plan-node.js';
+import { TableReferenceNode } from '../planner/nodes/reference.js';
+import { getModuleReadCommittedSnapshot } from '../vtab/concurrency.js';
 import { registerEmitters } from '../runtime/register.js';
 import { serializePlanTree, formatPlanTree } from '../planner/debug.js';
 import type { DebugOptions } from '../planner/planning-context.js';
@@ -78,6 +80,25 @@ export interface BuildPlanResult {
 	schemaDependencies: BuildTimeDependencyTracker;
 }
 
+/**
+ * Live handle for one mutex-free committed read (see
+ * {@link import('../common/types.js').StatementOptions.readConcurrency}).
+ * Minted by {@link Database._beginConcurrentRead}; the read combines `signal`
+ * with the caller's own signal and MUST call `end()` on every exit path
+ * (completion, break, error, abort) — {@link Database.close} awaits `done`,
+ * so a leaked scope hangs close.
+ */
+export interface ConcurrentReadScope {
+	/** Fired by {@link Database.close} so an in-flight read unwinds (with an
+	 *  AbortError) at its next row boundary. */
+	readonly signal: AbortSignal;
+	/** Resolves once {@link end} has run — i.e. the read's teardown (scan
+	 *  connection disconnects included) is complete. */
+	readonly done: Promise<void>;
+	/** Marks the read finished. Idempotent. */
+	end(): void;
+}
+
 /** Options accepted by {@link Database.registerCollation}'s third argument. */
 export interface RegisterCollationOptions {
 	normalizer?: (s: string) => string;
@@ -119,6 +140,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Mutex for serializing statement execution.
 	 * This prevents concurrent statements from interfering with each other's
 	 * transaction state, matching SQLite's behavior of serializing writes.
+	 *
+	 * Not quite unconditional: a read-only statement executed with
+	 * `readConcurrency: 'committed'` (see {@link StatementOptions}) that passes
+	 * {@link _isConcurrentReadEligible} runs WITHOUT this mutex against each
+	 * table's last committed state, so it completes even while another statement
+	 * is blocked in its virtual-table commit. Everything else — every write, every
+	 * default read — still serializes here.
 	 */
 	private execMutex: Promise<void> = Promise.resolve();
 	/**
@@ -129,6 +157,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * detect it must defer rather than deadlock on the held mutex.
 	 */
 	private execMutexDepth = 0;
+	/**
+	 * Live mutex-free committed-read scopes → their abort controllers.
+	 * {@link close} aborts each and awaits its `done` before tearing down shared
+	 * state, so no read is left iterating a schema being cleared.
+	 */
+	private readonly concurrentReads = new Map<ConcurrentReadScope, AbortController>();
 	/** Database-level event emitter for unified reactivity */
 	private readonly eventEmitter = new DatabaseEventEmitter();
 	/** Transaction management */
@@ -484,7 +518,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * @param params Optional parameters to bind.
 	 * @param options Optional execution options (e.g. an `AbortSignal` for
 	 *   cooperative cancellation — checked before preparing and at the row
-	 *   boundary while the first row is produced).
+	 *   boundary while the first row is produced; or `readConcurrency:
+	 *   'committed'` to run an eligible read-only query mutex-free against
+	 *   committed state — honored via `Statement.get`).
 	 * @returns A Promise resolving to the first result row as an object, or undefined if no rows.
 	 * @throws QuereusError on failure (an `AbortError` if the signal fired).
 	 */
@@ -547,6 +583,88 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 */
 	_isExecuting(): boolean {
 		return this.execMutexDepth > 0;
+	}
+
+	/**
+	 * @internal True when this optimized block may run on the mutex-free
+	 * committed-read path. Pure predicate — no side effects, no awaits. All of
+	 * the following must hold, else the caller falls back to the serialized path
+	 * (falling back is always correct, so this never throws):
+	 *
+	 * - No EXPLICIT transaction is open. A read inside a user `BEGIN` must see
+	 *   the transaction's own writes, so it always serializes. An *implicit*
+	 *   transaction (another statement's in-flight autocommit wrapper — including
+	 *   one parked in its virtual-table commit, the motivating case) does NOT
+	 *   disqualify: the committed read never joins it and serves the last
+	 *   committed state.
+	 * - Every statement in the block is relational (row-producing). Transaction
+	 *   control and DDL lower to void nodes whose `physical.readonly` does not
+	 *   model their engine-level effects, so `readonly` alone is not a safe gate.
+	 * - No node in any statement's subtree has side effects.
+	 * - Every {@link TableReferenceNode} resolves to a module declaring
+	 *   `readCommittedSnapshot` (universal, not existential — one unqualified
+	 *   table makes the whole block serialize). Checked on the OPTIMIZED plan, so
+	 *   tables reached through views and materialized views are covered.
+	 *
+	 * Evaluated at routing time; a `BEGIN` landing after routing does not
+	 * invalidate an in-flight concurrent read — that read is already pinned to a
+	 * committed snapshot and simply does not see the new transaction's writes,
+	 * which is the documented semantics.
+	 *
+	 * NOTE: deliberately no plan-time schema gate. `Statement.compile()` is
+	 * synchronous (cannot observe half-applied multi-step DDL), captured schema
+	 * objects re-validate at execution start, and for the long window (the scan
+	 * itself) the `readCommittedSnapshot` obligation requires the module to keep
+	 * serving its pinned snapshot across concurrent DDL. A shared/exclusive gate
+	 * becomes necessary only if a module that cannot pin across DDL ever wants
+	 * onto this path — see backlog/debt-concurrent-reads-schema-gate.
+	 */
+	_isConcurrentReadEligible(block: BlockNode): boolean {
+		if (!this.isOpen) return false;
+		if (!this.transactionManager.getAutocommit() && !this.transactionManager.isImplicitTransaction()) {
+			return false;
+		}
+		if (block.statements.length === 0) return false;
+		for (const stmt of block.statements) {
+			if (!isRelationalNode(stmt)) return false;
+		}
+		// Single walk over the optimized statement trees: reject on any
+		// side-effecting node or any table whose module does not qualify.
+		const stack: PlanNode[] = [...block.statements];
+		while (stack.length > 0) {
+			const node = stack.pop()!;
+			if (PlanNode.hasSideEffects(node.physical)) return false;
+			if (node instanceof TableReferenceNode && !getModuleReadCommittedSnapshot(node.vtabModule)) {
+				return false;
+			}
+			for (const child of node.getChildren()) {
+				stack.push(child);
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * @internal Registers a mutex-free committed read. The returned scope's
+	 * `signal` fires when {@link close} runs; the read must call `end()` on every
+	 * exit path or `close()` waits forever on `done`.
+	 */
+	_beginConcurrentRead(): ConcurrentReadScope {
+		this.checkOpen();
+		const controller = new AbortController();
+		let resolveDone!: () => void;
+		const done = new Promise<void>(resolve => {
+			resolveDone = resolve;
+		});
+		const scope: ConcurrentReadScope = {
+			signal: controller.signal,
+			done,
+			end: () => {
+				if (this.concurrentReads.delete(scope)) resolveDone();
+			},
+		};
+		this.concurrentReads.set(scope, controller);
+		return scope;
 	}
 
 	/**
@@ -734,6 +852,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * `BEGIN`) are NOT auto-committed per-statement; they remain part of the
 	 * surrounding explicit transaction until the user issues `COMMIT` or
 	 * `ROLLBACK`.
+	 *
+	 * `options.readConcurrency` is IGNORED here: `exec` returns no rows, so a
+	 * concurrent committed read through it would have no consumer, and its
+	 * per-statement implicit-transaction loop is exactly the machinery the
+	 * mutex-free path must not touch. Use `get`/`eval` for concurrent reads.
 	 *
 	 * @param sql The SQL string(s) to execute.
 	 * @param params Optional parameters to bind.
@@ -1074,6 +1197,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		log("Closing database...");
 		this.isOpen = false;
+
+		// Abort every live mutex-free committed read and wait for each to tear
+		// down (its scan connections disconnect in the read's own finally) before
+		// touching shared state. A read parked at a yield unwinds at the
+		// consumer's next pull/return — close() waits for that, so an abandoned,
+		// never-again-pulled iterator delays close (same discipline as any held
+		// iterator).
+		for (const controller of this.concurrentReads.values()) {
+			controller.abort();
+		}
+		await Promise.all(Array.from(this.concurrentReads.keys()).map(scope => scope.done));
 
 		// Disconnect all active connections first
 		await this.disconnectAllConnections();
@@ -1826,9 +1960,62 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * ```
 	 */
 	eval(sql: string, params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Record<string, SqlValue>> {
+		if (options?.readConcurrency === 'committed') {
+			// Routing (parse + compile + eligibility) happens at first pull inside the
+			// delegating generator, so an unconsumed iterator holds no resources.
+			return this._evalRoutedGenerator(sql, params, options);
+		}
 		return wrapAsyncIterator(this._evalGenerator(sql, params, options?.signal), (commit, error) =>
 			this._finalizeImplicitTransaction(commit, error)
 		);
+	}
+
+	/**
+	 * @internal Committed-read routing for {@link eval}: a SINGLE-statement,
+	 * concurrent-read-eligible batch runs mutex-free against committed state
+	 * (never touching the implicit-transaction lifecycle — the writer owns any
+	 * open one); everything else — multi-statement batches included — delegates
+	 * to the serialized path with identical semantics. `yield*` forwards
+	 * `return()`/`throw()` into the wrapped serialized iterator, so its
+	 * transaction-finalize cleanup still runs on early exit.
+	 */
+	private async *_evalRoutedGenerator(sql: string, params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Record<string, SqlValue>> {
+		this.checkOpen();
+		throwIfAborted(options?.signal);
+
+		let stmt: Statement | null = null;
+		try {
+			const candidate = this.prepare(sql, params);
+			let eligible = false;
+			if (candidate.astBatch.length === 1) {
+				try {
+					// compile() is synchronous — no awaited DDL can interleave.
+					eligible = this._isConcurrentReadEligible(candidate.compile());
+				} catch (e) {
+					// A compile error re-surfaces identically on the serialized path
+					// below (compile failures are not memoized), so routing stays
+					// error-free. Logged for diagnosability, not swallowed.
+					log('eval committed-read routing declined (compile failed): %O', e);
+				}
+			}
+			if (!eligible) {
+				await candidate.finalize();
+				yield* wrapAsyncIterator(this._evalGenerator(sql, params, options?.signal), (commit, error) =>
+					this._finalizeImplicitTransaction(commit, error)
+				);
+				return;
+			}
+			stmt = candidate;
+			// Params were already bound by prepare(); passing them again would rebind.
+			const names = stmt.getColumnNames();
+			for await (const row of stmt._iterateConcurrent(undefined, options)) {
+				yield rowToObject(row, names);
+			}
+		} finally {
+			if (stmt) {
+				await stmt.finalize();
+			}
+		}
 	}
 
 	/**

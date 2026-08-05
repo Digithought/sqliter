@@ -126,6 +126,17 @@ try {
 }
 ```
 
+### 8.6 Concurrent Committed Reads
+
+Ordinarily every statement — reads included — serializes behind the database's execution mutex, so a read waits for any in-flight write (including its commit) to finish. A caller can mark an individual read-only query as willing to see slightly older data via the API option `readConcurrency: 'committed'` (see [Usage § Concurrent Committed Reads](usage.md#concurrent-committed-reads-readconcurrency)); when eligible it runs immediately against each table's last **committed** state. How that interacts with transactions:
+
+- **It never joins a transaction.** A concurrent read opens its own committed-snapshot connection per table and does not participate in `BEGIN`/`COMMIT`/`ROLLBACK` or savepoints. A writer's implicit (autocommit) transaction that is open — even one blocked mid-commit — is unaffected by the read, and still commits or rolls back with its own outcome.
+- **Inside an explicit `BEGIN` it always serializes.** A read within your own transaction must see the transaction's uncommitted writes, so the opt-in silently falls back to the normal serialized path there.
+- **Uncommitted and rolled-back writes are invisible.** The read serves a coherent snapshot as of some commit boundary at or before it began: staged rows from an in-flight write never appear, and a writer rolling back mid-read changes nothing the read observes.
+- **A `BEGIN` issued after the read started does not affect it.** The read is already pinned to its committed snapshot and simply does not see the new transaction's writes.
+
+The consequence to internalize: with the opt-in, an *unawaited* earlier write may not be visible to the read (the read no longer waits for it to land). That is the documented tradeoff, not a bug — use the default `'serialized'` mode (or `await` the write) when read-your-writes ordering matters.
+
 ## 9. PRAGMA Statements
 
 PRAGMA statements are special commands that control the behavior of the Quereus database engine.
