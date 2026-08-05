@@ -177,8 +177,9 @@ export class StoreTable extends StoreTableConstraints {
 	 * Both probes key through {@link rekeyedKeyComputer}, so they and the re-key agree
 	 * byte-for-byte.
 	 *
-	 * NOTE: these two probes put the SET COLLATE re-key at four full table scans (two
-	 * here, then {@link rekeyRows}' pass 1 backstop and pass 2), each holding one hex
+	 * NOTE: these two probes put both re-keying arms — SET COLLATE on a PK member and
+	 * ALTER PRIMARY KEY — at four full table scans (two here, then {@link rekeyRows}'
+	 * pass 1 backstop and pass 2), each holding one hex
 	 * key signature per row. Fine for a statement this rare; if a huge table ever makes
 	 * it slow, drop pass 1 for callers that pre-validated — it cannot fire for them.
 	 */
@@ -194,10 +195,13 @@ export class StoreTable extends StoreTableConstraints {
 			const hex = bytesToHex(computeNewKey(row));
 			if (seenEffective.has(hex)) {
 				// Mirror the memory module's diagnostic, naming the key from the second
-				// (colliding) row's PK values.
+				// (colliding) row's PK values — including its empty-key wording, since
+				// `alter primary key ()` leaves no components to name and "(key: )" reads
+				// as a bug (`MemoryTableManager.assertNoPrimaryKeyCollisionInRows`).
 				const parts = newPkDef.map(pk => formatKeyValue(row[pk.index]));
+				const keyDesc = parts.length > 0 ? `(key: ${parts.join(', ')})` : '(the empty key admits one row)';
 				throw new QuereusError(
-					`UNIQUE constraint failed: ${this.tableName} primary key collides under the new key definition (key: ${parts.join(', ')})`,
+					`UNIQUE constraint failed: ${this.tableName} primary key collides under the new key definition ${keyDesc}`,
 					StatusCode.CONSTRAINT,
 				);
 			}

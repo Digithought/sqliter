@@ -484,10 +484,11 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// pass is now a backstop, not the gate. See `StoreModuleBase.ddlCommitPendingOps`.
 		await this.ddlCommitPendingOps();
 
-		// Re-key the data store. Throws CONSTRAINT on duplicates without
-		// mutating the store, giving us all-or-nothing semantics for the
-		// validation phase.
-		await table.rekeyRows(newPkColumns);
+		// Re-key the data store. Throws CONSTRAINT on duplicates without mutating the
+		// store, giving us all-or-nothing semantics for the validation phase. Handed
+		// `updatedSchema.columns` — the same array the probe above keyed through — so the
+		// two can never resolve different key collations/transforms for the new key.
+		await table.rekeyRows(updatedSchema.primaryKeyDefinition, updatedSchema.columns);
 
 		// Secondary index keys embed the PK suffix — clear + rebuild every
 		// index against the now-rekeyed data store. Rebuild the MATERIALIZED index list

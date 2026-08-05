@@ -167,6 +167,32 @@ describe('ALTER TABLE ALTER PRIMARY KEY on the bare store module, inside a trans
 		expect(await asyncIterableToArray(db.eval(`select id from t where code = 20`)))
 			.to.deep.equal([{ id: 2 }]);
 	});
+
+	// `alter primary key ()` reverts to an implicit key, whose empty key admits exactly one
+	// row — so a multi-row table collides on the second row. The probe now owns that
+	// rejection (pre-fix it came from `rekeyRows` pass 1, after the flush), and it words the
+	// componentless key the same way the memory backend does rather than "(key: )".
+	it('reverting to an implicit key on a multi-row table is rejected without spending the transaction', async () => {
+		await db.exec(`create table t (id integer primary key, code integer not null) using store`);
+		await db.exec(`create table other (id integer primary key, v text) using store`);
+		await db.exec(`insert into t values (1, 10), (2, 20)`);
+
+		await db.exec('begin');
+		await db.exec(`insert into other values (1, 'uncommitted')`);
+
+		await expectRejection(
+			db,
+			`alter table t alter primary key ()`,
+			StatusCode.CONSTRAINT,
+			/the empty key admits one row/,
+		);
+
+		await db.exec('rollback');
+		expect(await asyncIterableToArray(db.eval(`select id, v from other`))).to.deep.equal([]);
+		// The key is untouched: a point lookup on the original PK still resolves.
+		expect(await asyncIterableToArray(db.eval(`select code from t where id = 2`)))
+			.to.deep.equal([{ code: 20 }]);
+	});
 });
 
 describe('ALTER TABLE ALTER PRIMARY KEY behind the isolation wrapper, inside a transaction', () => {
