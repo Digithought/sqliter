@@ -1979,9 +1979,11 @@ drop table nm_assert_pol.at_t;
 -- splice schemaName/tableName into the target unquoted, so any schema
 -- name needing quoting broke the apply. Two distinct failure shapes:
 -- a colon in the name reaches the parser as a bare token and derails
--- statement parsing, while a digit-e-nondigit run (e.g. "4ee6") gets
--- read by the LEXER as a botched scientific-notation number before the
--- parser ever sees it. Both must be fixed by quoting the whole name.
+-- statement parsing, while a name whose leading run looks like a broken
+-- number (e.g. "4ee6...") is rejected by the LEXER as a truncated
+-- scientific-notation literal before the parser ever sees it. Both are
+-- fixed by quoting the whole name. A table name needing quoting takes
+-- the same path (third block).
 -- ===================================================================
 
 -- Symptom 1: colon in the schema name, no digit-e-nondigit run.
@@ -2015,9 +2017,11 @@ select id, label from "scope:alpha".meta order by id;
 
 drop table "scope:alpha".meta;
 
--- Symptom 2: a digit-e-nondigit run (no colon) that the lexer would
--- otherwise misread as a truncated scientific-notation number literal.
-declare schema "item4ee6" using (default_vtab_module = 'memory') {
+-- Symptom 2: no colon, but a leading digit-e-nondigit run the lexer
+-- misreads as a truncated scientific-notation number literal. The
+-- leading digit is what makes the name non-bare: an interior run
+-- (item4ee6) is a valid identifier and never needed quoting.
+declare schema "4ee6item" using (default_vtab_module = 'memory') {
 	table meta {
 		id INTEGER PRIMARY KEY,
 		label TEXT NOT NULL
@@ -2030,18 +2034,43 @@ declare schema "item4ee6" using (default_vtab_module = 'memory') {
 
 -- run
 
-apply schema "item4ee6" with seed;
+apply schema "4ee6item" with seed;
 
 -- run
 
-select id, label from "item4ee6".meta order by id;
+select id, label from "4ee6item".meta order by id;
 → [{"id": 1, "label": "first"}]
 
-apply schema "item4ee6" with seed;
+apply schema "4ee6item" with seed;
 
 -- run
 
-select id, label from "item4ee6".meta order by id;
+select id, label from "4ee6item".meta order by id;
 → [{"id": 1, "label": "first"}]
 
-drop table "item4ee6".meta;
+drop table "4ee6item".meta;
+
+-- Both symptoms in one name (the shape the original report hit: a UUID
+-- suffix after a colon), plus a table name that itself needs quoting —
+-- the seed INSERT target quotes both halves.
+declare schema "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88" using (default_vtab_module = 'memory') {
+	table "row data" {
+		id INTEGER PRIMARY KEY,
+		label TEXT NOT NULL
+	}
+
+	seed "row data" (
+		(1, 'first')
+	)
+}
+
+-- run
+
+apply schema "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88" with seed;
+
+-- run
+
+select id, label from "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88"."row data" order by id;
+→ [{"id": 1, "label": "first"}]
+
+drop table "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88"."row data";
