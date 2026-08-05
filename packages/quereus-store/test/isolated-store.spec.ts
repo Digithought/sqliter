@@ -194,11 +194,13 @@ describe('Isolated Store Module', () => {
 			// `connect` hands back a shared cached StoreTable per table key (so the
 			// `_readCommitted` option is dropped), and `StoreTable.query` merges the
 			// coordinator's pending ops over the committed store — a read taken during
-			// a commit flush would see a partially applied batch. The isolation wrapper
-			// declines on its own account too (it re-serves one underlying handle and
-			// flushes overlays through it incrementally), so the whole stack stays on
-			// the serialized read path. See docs/module-authoring.md § "Committed-Snapshot
-			// Reads".
+			// a commit flush would see a partially applied batch. The isolation wrapper no
+			// longer declines on its own account — it MIRRORS its underlying (a committed
+			// read gets a dedicated `_readCommitted` handle and bypasses the overlay) — but
+			// mirroring `false` is still `false`, and the first reason above is why: the
+			// "dedicated" handle over a store is the shared cached StoreTable. So the whole
+			// stack stays on the serialized read path. This is the assertion that keeps the
+			// mirror honest; see docs/module-authoring.md § "Committed-Snapshot Reads".
 			expect(new StoreModule(provider).readCommittedSnapshot).to.equal(false);
 			expect(createIsolatedStoreModule({ provider }).readCommittedSnapshot).to.equal(false);
 		});

@@ -882,8 +882,12 @@ Two things would have to change first:
    a read taken while a commit flushes those ops observes a partially applied
    batch.
 
-Wrapping with `@quereus/isolation` does not rescue this: the wrapper declines the
-flag on its own account too. See
+Wrapping with `@quereus/isolation` does not rescue this. The wrapper *mirrors* its
+underlying — its own committed reads open a dedicated `_readCommitted` underlying
+handle and bypass the overlay, so it adds no tearing window — but mirroring `false`
+is still `false`, and point 1 above is exactly why: `StoreModule.connect` re-serves
+the cached `StoreTable`, so the wrapper's "dedicated" handle is the writer's
+instance. See
 [Committed-Snapshot Reads](module-authoring.md#4-committed-snapshot-reads-_readcommitted)
 for the obligation a module takes on by declaring it, and the
 `runCommittedReadConformance` harness that checks it. The work that would let the

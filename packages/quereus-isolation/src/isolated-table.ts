@@ -1966,14 +1966,21 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * The overlay is connection-scoped and the writer's underlying handle is memoized and
 	 * shared across every `IsolatedTable` for the table, so neither is disconnected here.
 	 * A committed-snapshot instance is the exception: `IsolationModule.connectCommitted`
-	 * opened a dedicated underlying handle for THIS instance, so this instance releases it
-	 * — symmetric by contract, and nothing else holds a reference to it.
+	 * called `underlying.connect(...)` for THIS instance, so this instance releases it —
+	 * symmetric by contract, one disconnect per connect.
 	 *
 	 * Required, not merely tidy: on the memory path `MemoryTable.disconnect` is what drops
 	 * the pinned read layer's collapse protection (see its own NOTE), so without this every
-	 * committed read leaks a pinned layer chain for the life of the table. Safe on the store
-	 * path: `StoreTable.disconnect` is the documented per-scan no-op that only flushes stats,
-	 * and the engine already calls it after every scan.
+	 * committed read leaks a pinned layer chain for the life of the table.
+	 *
+	 * NOTE: symmetry does NOT imply exclusive ownership. An underlying module is free to
+	 * re-serve a cached instance from `connect` — `StoreModule` does exactly that, so over
+	 * a store the "dedicated" handle IS the writer's `StoreTable` and this call lands on a
+	 * shared object. That is safe only because `VirtualTable.disconnect` is contracted
+	 * per-statement rather than as a teardown (`StoreTable.disconnect` merely flushes
+	 * stats, and the engine already calls it after every scan on the unwrapped store path).
+	 * A wrapper author copying this pattern over an underlying with a destructive
+	 * `disconnect` would tear down the writer's handle instead.
 	 */
 	async disconnect(): Promise<void> {
 		if (this.readCommitted) {

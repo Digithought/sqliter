@@ -4477,6 +4477,103 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			await db.close();
 		});
 
+		// The other half of the disconnect rule, and the one nothing else pins: a WRITER
+		// instance must leave the memoized handle alone. Every scan connects a fresh
+		// IsolatedTable and the engine disconnects it at statement teardown, so a
+		// disconnect that forgot to check `readCommitted` would release the shared handle
+		// out from under every other connection on the table.
+		it('a writer instance disconnect leaves the shared underlying handle alone', async () => {
+			const db = new Database();
+			const mod = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('iso_keep', mod);
+			await db.exec('CREATE TABLE keep (id INTEGER PRIMARY KEY, v TEXT) USING iso_keep');
+
+			const shared = mod.getUnderlyingState('main', 'keep')!.underlyingTable;
+			let sharedDisconnects = 0;
+			const realDisconnect = shared.disconnect.bind(shared);
+			(shared as { disconnect: () => Promise<void> }).disconnect = async () => {
+				sharedDisconnects++;
+				await realDisconnect();
+			};
+
+			const writer = await mod.connect(db, undefined, 'iso_keep', 'main', 'keep', {} as never);
+			await writer.disconnect();
+			expect(sharedDisconnects, 'a writer must not disconnect the shared handle').to.equal(0);
+
+			// A committed reader disconnects its OWN handle — never this one.
+			const reader = await mod.connect(db, undefined, 'iso_keep', 'main', 'keep', { _readCommitted: true } as never);
+			await reader.disconnect();
+			expect(sharedDisconnects, 'a committed read must not disconnect the shared handle either').to.equal(0);
+
+			await db.close();
+		});
+
+		// Store-shaped underlying: `StoreModule.connect` re-serves ONE cached table per key
+		// whatever the options, so the wrapper's "dedicated" committed handle is the writer's
+		// object. Two things must hold in that shape — the mirror stays `false` (the wrapper
+		// must not claim safety the underlying cannot deliver), and `disconnect` still lands
+		// exactly once on that shared object, which is only safe because `VirtualTable.disconnect`
+		// is contracted per-statement rather than as a teardown.
+		it('over an underlying that re-serves one cached handle, the mirror stays false and disconnect lands once', async () => {
+			const memory = new MemoryTableModule();
+			const served = new Map<string, VirtualTable>();
+			let disconnects = 0;
+			const countDisconnects = (table: VirtualTable): VirtualTable => {
+				const realDisconnect = table.disconnect.bind(table);
+				(table as { disconnect: () => Promise<void> }).disconnect = async () => {
+					disconnects++;
+					await realDisconnect();
+				};
+				return table;
+			};
+			const shared = Object.create(memory) as MemoryTableModule;
+			Object.defineProperty(shared, 'readCommittedSnapshot', { value: false });
+			// `create` seeds the same per-key cache `connect` re-serves from — the store shape,
+			// where CREATE TABLE is what first populates `StoreModule.tables`.
+			Object.defineProperty(shared, 'create', {
+				value: async (...args: Parameters<MemoryTableModule['create']>): Promise<VirtualTable> => {
+					const table = countDisconnects(await memory.create(...args));
+					served.set(`${args[1].schemaName}.${args[1].name}`.toLowerCase(), table);
+					return table;
+				},
+			});
+			Object.defineProperty(shared, 'connect', {
+				value: async (...args: Parameters<MemoryTableModule['connect']>): Promise<VirtualTable> => {
+					const key = `${args[3]}.${args[4]}`.toLowerCase();
+					const existing = served.get(key);
+					if (existing) return existing;
+					const table = countDisconnects(await memory.connect(...args));
+					served.set(key, table);
+					return table;
+				},
+			});
+
+			const db = new Database();
+			const mod = new IsolationModule({ underlying: shared });
+			db.registerModule('iso_shared', mod);
+			await db.exec('CREATE TABLE sh (id INTEGER PRIMARY KEY, v TEXT) USING iso_shared');
+			await db.exec(`INSERT INTO sh VALUES (1, 'a')`);
+
+			expect(getModuleReadCommittedSnapshot(mod),
+				'an underlying that cannot honour _readCommitted must not be mirrored as safe').to.equal(false);
+
+			const writerHandle = mod.getUnderlyingState('main', 'sh')!.underlyingTable;
+			const reader = await mod.connect(db, undefined, 'iso_shared', 'main', 'sh', { _readCommitted: true } as never);
+			expect((reader as unknown as { underlyingTable: VirtualTable }).underlyingTable,
+				'the store shape hands back the writer object — documented, not a defect').to.equal(writerHandle);
+			expect(await asyncIterableToArray(reader.query!(makeFullScanFilterInfo()))).to.have.length(1);
+
+			await reader.disconnect();
+			expect(disconnects, 'one connect, one disconnect — never doubled').to.equal(1);
+
+			// The shared handle is still usable afterwards: disconnect is per-statement.
+			await db.exec(`INSERT INTO sh VALUES (2, 'b')`);
+			const rows = await asyncIterableToArray(db.eval('select id from sh order by id'));
+			expect(rows.map(r => r.id)).to.deep.equal([1, 2]);
+
+			await db.close();
+		});
+
 		it('createConnection is refused on a committed-snapshot instance', async () => {
 			const db = new Database();
 			const mod = new IsolationModule({ underlying: new MemoryTableModule() });

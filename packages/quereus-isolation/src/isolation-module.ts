@@ -835,6 +835,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * the flag. `underlyingTables` is neither read nor written here — the writer's memoized
 	 * handle stays untouched in both directions.
 	 *
+	 * "Dedicated" is what this asks of the underlying, not what it can guarantee: a module
+	 * whose `connect` re-serves a cached instance per table key (`StoreModule` does) hands
+	 * back the writer's object anyway. That is precisely why {@link readCommittedSnapshot}
+	 * mirrors the underlying instead of claiming safety unconditionally.
+	 *
 	 * **Why a fresh handle per committed read, rather than sharing the memoized one.**
 	 * The memoized handle is the WRITER's: `commitConnectionOverlays` flushes staged rows
 	 * through it incrementally (Phase 1 begins the underlying and applies row by row;

@@ -542,6 +542,19 @@ if (result.indexDrivenSkippedReason) {
 }
 ```
 
+**Where the gate parks bounds what the harness can catch.** `installCommitStall`
+wraps each registered `VirtualTableConnection.commit` and parks at its **entry**, so
+the observed window is "before the module's commit begins", not "inside it". A module
+that publishes in one step is fully covered. A module that publishes in *phases* after
+`commit()` is entered — `IsolationModule` applies its overlay row-by-row into the
+underlying, then commits — has its own publish window entirely downstream of the gate,
+so a torn read there is invisible to the harness and it still passes. Verified in tree:
+disabling the wrapper's dedicated-handle branch does not fail
+`runCommittedReadConformance`. If you own such a module, keep a direct test that drives
+your phases by hand (the isolation package's mid-flush tear test does), and treat a
+harness pass as a full-stack smoke test rather than proof. Closing the gap needs a
+stall that parks *inside* the module's commit, which `installCommitStall` cannot reach.
+
 ### 5. Backing Host (Materialized-View Backing Tables)
 
 A module may volunteer to host materialized-view backing tables by implementing
