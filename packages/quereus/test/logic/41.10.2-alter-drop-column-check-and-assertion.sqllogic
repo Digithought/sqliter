@@ -337,3 +337,92 @@ select b from DcBare;
 
 drop table DcBare;
 -- run
+
+-- ===================================================================
+-- 12. A CHECK naming the column through a ROW-IMAGE qualifier —
+--     `new.<col>` / `old.<col>` — refuses the drop like any other.
+-- ===================================================================
+--
+-- `new.<col>` / `old.<col>` name the row being written explicitly; an unqualified
+-- column in a CHECK means the same thing implicitly (docs/sql-ddl.md § CHECK
+-- Constraints). The two spellings must refuse identically, or the qualified one
+-- silently buys an unwritable table: the drop is accepted and every subsequent write
+-- then fails while being planned, with `new.a isn't a column`.
+--
+-- The walk decides this the same way RENAME COLUMN decides what to rewrite, so §26–§27
+-- of 41.3-alter-rename-propagation are the other half of the same guarantee.
+
+create table DcNew (id integer primary key, a integer, b integer, constraint chk_new check (new.a > 0));
+insert into DcNew values (1, 5, 6);
+-- run
+
+alter table DcNew drop column a;
+-- error: CHECK constraint 'chk_new'
+
+-- Untouched, exactly as §1 asserts for the unqualified spelling.
+select a, b from DcNew;
+→ [{"a":5,"b":6}]
+
+insert into DcNew values (2, -1, 6);
+-- error: chk_new
+
+drop table DcNew;
+-- run
+
+-- A DELETE-only CHECK names the OLD row image; same refusal.
+create table DcOld (id integer primary key, a integer, b integer, constraint chk_old check on delete (old.a > 0));
+insert into DcOld values (1, 5, 6);
+insert into DcOld values (2, -1, 7);
+-- run
+
+alter table DcOld drop column a;
+-- error: CHECK constraint 'chk_old'
+
+-- Still enforcing over the OLD row, so nothing was half-applied.
+delete from DcOld where id = 2;
+-- error: chk_old
+
+delete from DcOld where id = 1;
+select count(*) as c from DcOld;
+→ [{"c":1}]
+
+drop table DcOld;
+-- run
+
+-- Case folds like every other identifier in the engine.
+create table DcNewCase (id integer primary key, a integer, b integer, constraint chk_case check (NEW.A > 0));
+-- run
+
+alter table DcNewCase drop column a;
+-- error: CHECK constraint 'chk_case'
+
+drop table DcNewCase;
+-- run
+
+-- ===================================================================
+-- 13. `new` and `old` are NOT reserved words here, so the row-image match is
+--     scope-aware: a subquery over a real table named "new" is not a row image.
+-- ===================================================================
+--
+-- `create table "new" (…)` is legal, so `"new".a` inside a CHECK subquery binds to that
+-- table's column, not to the written row. A depth-blind `qualifier === 'new'` match would
+-- false-refuse this drop — the row-image mirror of §4.
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+create table DcShadow (id integer primary key, a integer, b integer, check ((select max("new".a) from "new") >= 0));
+insert into DcShadow values (1, 2, 3);
+-- run
+
+alter table DcShadow drop column a;
+select b from DcShadow;
+→ [{"b":3}]
+
+-- Still writable, and the surviving CHECK still evaluates against the "new" table.
+insert into DcShadow values (2, 9);
+select count(*) as c from DcShadow;
+→ [{"c":2}]
+
+drop table DcShadow;
+drop table "new";
+-- run

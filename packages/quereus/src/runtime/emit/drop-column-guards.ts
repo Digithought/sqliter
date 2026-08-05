@@ -61,12 +61,11 @@ import { buildColumnSourceResolver } from '../../schema/column-source-resolver.j
  * the user's declared set. Lens- and FK-synthesized entries are attached to a write
  * plan's constraint list, not to the catalog entry this reads.
  *
- * KNOWN GAP: a CHECK that names the column through the reserved row-image qualifiers —
- * `check (new.a > 0)`, `check on delete (old.a > 0)` — is NOT caught, because the walk
- * resolves a qualifier against FROM scopes and `new` / `old` bind to neither. The drop is
- * accepted and the table is then unwritable. RENAME COLUMN misses the same references, so
- * the equivalence above still holds; both are fixed at the one walk site, tracked by
- * `bug-check-constraint-new-old-qualifier-invisible-to-column-rename`.
+ * A CHECK naming the column through the row-image qualifiers — `check (new.a > 0)`,
+ * `check on delete (old.a > 0)` — refuses the drop just like the unqualified spelling:
+ * the same walk owns that namespace, shadowing edge included, so a CHECK whose subquery
+ * reads a real table named `"new"` still does not block dropping this table's own
+ * like-named column.
  */
 export function assertNoCheckConstraintNamesColumn(
 	db: Database,

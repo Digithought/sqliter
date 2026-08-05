@@ -852,3 +852,95 @@ select id, cap_new, ts from t_vd6;
 drop view v_vd6;
 drop table t_vd6;
 drop table lim_vd6;
+
+-- ===================================
+-- 24. RENAME COLUMN rewrites a `new.<col>` reference in the table's own CHECK
+-- ===================================
+-- A CHECK may name the row being written explicitly (docs/sql-ddl.md § CHECK
+-- Constraints); unqualified columns mean the same row implicitly, and §10b above
+-- already pins that spelling. Pre-fix the qualified one was left alone, so after the
+-- rename every write failed at plan time with "new.a isn't a column".
+--
+-- Both halves matter: the violating insert must still be REJECTED (proving the
+-- constraint still enforces, not merely that it parses) and the conforming one accepted.
+
+create table t_rinew (id integer primary key, a integer, constraint chk_rinew check (new.a > 0));
+
+alter table t_rinew rename column a to z;
+
+insert into t_rinew values (1, -5);
+-- error: CHECK constraint failed: chk_rinew
+
+insert into t_rinew values (2, 7);
+
+select id, z from t_rinew;
+→ [{"id":2,"z":7}]
+
+drop table t_rinew;
+
+-- ===================================
+-- 25. Same for `old.<col>` in a DELETE-only CHECK, verified by an actual DELETE
+-- ===================================
+-- `check on delete` sees only the OLD row image, so the rename has to follow the
+-- `old.` qualifier or the table becomes undeletable.
+
+create table t_riold (id integer primary key, a integer, constraint chk_riold check on delete (old.a > 0));
+insert into t_riold values (1, 5), (2, -1);
+
+alter table t_riold rename column a to z;
+
+-- deleting the row that violates the rule is still refused...
+delete from t_riold where id = 2;
+-- error: CHECK constraint failed: chk_riold
+
+-- ...and deleting the conforming row still succeeds.
+delete from t_riold where id = 1;
+
+select id, z from t_riold;
+→ [{"id":2,"z":-1}]
+
+drop table t_riold;
+
+-- ===================================
+-- 26. A case-folded `NEW.A` follows the rename too
+-- ===================================
+
+create table t_ricase (id integer primary key, a integer, constraint chk_ricase check (NEW.A > 0));
+
+alter table t_ricase rename column a to z;
+
+insert into t_ricase values (1, -3);
+-- error: CHECK constraint failed: chk_ricase
+
+insert into t_ricase values (2, 4);
+
+select id, z from t_ricase;
+→ [{"id":2,"z":4}]
+
+drop table t_ricase;
+
+-- ===================================
+-- 27. A `new` REBOUND BY AN INNER FROM is not a row image and must NOT rewrite
+-- ===================================
+-- `new` and `old` are not reserved words in this parser, so `create table "new" (…)` is
+-- legal and a CHECK subquery may read from it. Rewriting `"new".a` → `"new".z` there
+-- would leave the CHECK naming a column that table does not have, and the next write
+-- would fail at plan time. This is why the row-image match consults the scope stack
+-- instead of matching the qualifier by name alone. Mirror of §15.
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+
+create table t_rishadow (id integer primary key, a integer,
+                         check ((select max("new".a) from "new") >= 0));
+
+alter table t_rishadow rename column a to z;
+
+-- the CHECK still evaluates (against the "new" table), so the write goes through
+insert into t_rishadow values (1, 7);
+
+select id, z from t_rishadow;
+→ [{"id":1,"z":7}]
+
+drop table t_rishadow;
+drop table "new";

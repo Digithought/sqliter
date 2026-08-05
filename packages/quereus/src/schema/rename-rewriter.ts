@@ -418,6 +418,7 @@ export function renameColumnInAst(
 		scopeStack: [],
 		changed: false,
 		resolveColumnInSource,
+		matchRowImageQualifier: false,
 	};
 	visitColumnRename(node, state);
 	return state.changed;
@@ -443,6 +444,20 @@ export function renameColumnInAst(
  * sources are not asked (the rewriter would need recursive column-set
  * inference on their bodies). `renameColumnInAst` shares the same callback
  * (passed by the view-body callers) and the same limitation.
+ *
+ * The seed also makes this walk the owner of the `new.` / `old.` **row-image**
+ * namespace: a CHECK may name the row being written explicitly
+ * (`check (new.a > 0)`, `check on delete (old.a > 0)` — `docs/sql-ddl.md`
+ * § CHECK Constraints), and those qualifiers name the owning table's row, not
+ * anything a FROM clause binds. So the qualified-ref case matches them too —
+ * but only here, never through `renameColumnInAst`, where a `new.` ref belongs
+ * to some other table's row image.
+ *
+ * That match is scope-**aware**, not depth-blind, because `new` and `old` are
+ * not reserved words in this parser: `create table "new" (…)` is legal, so a
+ * CHECK may legitimately contain `(select max("new".a) from "new")`. The match
+ * therefore requires that no FROM/WITH frame above the seed rebind the
+ * qualifier — see `matchesRowImage`.
  */
 export function renameColumnInCheckExpression(
 	expr: AST.AstNode | undefined,
@@ -461,6 +476,7 @@ export function renameColumnInCheckExpression(
 		scopeStack: [],
 		changed: false,
 		resolveColumnInSource,
+		matchRowImageQualifier: true,
 	};
 	const frame = emptyFrame();
 	frame.unaliased.add(state.tableName);
@@ -554,6 +570,12 @@ export function columnReferencedInCheckExpression(
  *
  * The parameter is structurally typed rather than `IndexSchema[]` so this module
  * stays free of catalog imports; `IndexSchema` satisfies it.
+ *
+ * Sharing the seeded entry point also brings its `new.` / `old.` row-image match
+ * along, which is inert here: a partial-index predicate describes rows already
+ * stored, has no written-row context, and a predicate naming one would not plan
+ * in the first place. Nothing to suppress — noted so the shared entry point does
+ * not read as an oversight.
  */
 export function renameColumnInIndexPredicates(
 	indexes: ReadonlyArray<{ readonly predicate?: AST.Expression }> | undefined,
@@ -597,6 +619,14 @@ interface ColumnRewriteState {
 	scopeStack: ScopeFrame[];
 	changed: boolean;
 	resolveColumnInSource?: ResolveColumnInSource;
+	/**
+	 * Match `new.` / `old.` as this table's row image. Set only by the seeded
+	 * entry point ({@link renameColumnInCheckExpression}), whose expression is
+	 * evaluated against a row of `tableName` and therefore owns that namespace;
+	 * the unseeded {@link renameColumnInAst} leaves it false, so a `new.` ref in
+	 * some *other* table's CHECK is never mistaken for this table's row image.
+	 */
+	matchRowImageQualifier: boolean;
 }
 
 function emptyFrame(): ScopeFrame {
@@ -752,6 +782,61 @@ function isQualifierShadowedInScope(state: ColumnRewriteState, qualifier: string
 		// Closer rebind to the real table wins → not shadowed at this point.
 		if (frame.aliasMap.get(qualifier) === state.tableName) return false;
 		if (qualifier === state.tableName && frame.unaliased.has(state.tableName)) return false;
+	}
+	return false;
+}
+
+/**
+ * Whether a qualified column ref names the **row image** of the table this
+ * seeded walk was entered for — `new.<col>` / `old.<col>` inside one of its own
+ * CHECK expressions. Only the seeded entry point sets
+ * `matchRowImageQualifier`; see {@link renameColumnInCheckExpression} for why
+ * that scoping is what keeps another table's `new.` ref out of this match.
+ *
+ * A schema-qualified `main.new.a` is a real three-part table reference, never a
+ * row image, so it is excluded outright.
+ *
+ * `qualifierLower` is `col.table` already lowercased by the caller.
+ */
+function matchesRowImage(state: ColumnRewriteState, col: AST.ColumnExpr, qualifierLower: string): boolean {
+	if (!state.matchRowImageQualifier) return false;
+	if (col.schema !== undefined) return false;
+	if (qualifierLower !== 'new' && qualifierLower !== 'old') return false;
+	return !isQualifierReboundAboveSeed(state, qualifierLower);
+}
+
+/**
+ * Whether any real FROM / WITH frame rebinds `qualifier` to a row source of its
+ * own, which would make a `new.` / `old.` ref name that source rather than the
+ * row image. `new` and `old` are not reserved words here — `create table "new"`
+ * is legal — so this scan is what stops the row-image match from false-firing
+ * inside `check ((select max("new".a) from "new") >= 0)`.
+ *
+ * The scan starts at index 1: frame 0 is the implicit seed
+ * {@link renameColumnInCheckExpression} pushes for the owning table, which is
+ * not a FROM binding and must not count as a rebind. All four ways a frame can
+ * bind a qualifier are checked — an unaliased source, an alias, a CTE name in
+ * scope, and a shadowing-but-not-exposing CTE source.
+ *
+ * Deliberately "any enclosing frame wins" rather than innermost-first: a frame
+ * only sits above index 0 while the walk is *inside* the subquery that pushed
+ * it, so every such frame really does enclose the reference. A top-level
+ * `new.a` in `check (new.a > 0 and (select count(*) from "new") >= 0)` is
+ * visited with only the seed on the stack and still matches.
+ *
+ * NOTE: the residual is a *correlated* `new.<col>` written inside a subquery
+ * that selects from a real table named `new` — left alone by both the rewrite
+ * and the drop refusal, since the qualifier is ambiguous there anyway. If that
+ * ever needs to resolve to the row image, it needs a spelling that distinguishes
+ * the two (the SQL standard has none), not a change to this scan.
+ */
+function isQualifierReboundAboveSeed(state: ColumnRewriteState, qualifier: string): boolean {
+	for (let i = 1; i < state.scopeStack.length; i++) {
+		const frame = state.scopeStack[i];
+		if (frame.unaliased.has(qualifier)) return true;
+		if (frame.aliasMap.has(qualifier)) return true;
+		if (frame.ctesInScope.has(qualifier)) return true;
+		if (frame.ctesShadowingSource.has(qualifier)) return true;
 	}
 	return false;
 }
@@ -1062,7 +1147,11 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 					(col.schema === undefined || eq(col.schema, state.defaultSchema)) &&
 					!isQualifierShadowedInScope(state, qualifierLower);
 				const viaAlias = aliasResolvesToTable(state, col.table);
-				if (directHit || viaAlias) {
+				// Row-image match is tried LAST so a table genuinely named `new` or
+				// `old` that is itself the renamed table keeps resolving through
+				// `directHit` exactly as it did before this path existed.
+				const rowImageHit = !directHit && !viaAlias && matchesRowImage(state, col, qualifierLower);
+				if (directHit || viaAlias || rowImageHit) {
 					col.name = state.newCol;
 					state.changed = true;
 				}
@@ -1213,6 +1302,12 @@ function isResultColumnExposure(
  * is the reserved written-row namespace no FROM source legitimately shadows), so
  * no scope tracking applies — narrower and simpler than the scope-aware walkers
  * above. Returns whether any reference was rewritten.
+ *
+ * Depth-blind **on purpose**, unlike the row-image match in `matchesRowImage`.
+ * The two look alike but answer different questions: this one rewrites by view
+ * *output* name inside a `with inverse` expr, whose grammar admits no FROM
+ * clause that could rebind `new`, whereas a CHECK body may contain a subquery
+ * selecting from a real table named `"new"` and so must consult the scope stack.
  */
 function renameNewQualifiedRefs(expr: AST.Expression, renames: ReadonlyMap<string, string>): boolean {
 	let changed = false;
