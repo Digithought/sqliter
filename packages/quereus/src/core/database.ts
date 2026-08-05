@@ -49,6 +49,8 @@ import { type LogicalType, type CollationResolver, type KeyNormalizer, type KeyN
 import { registerType as registerTypeInRegistry } from '../types/registry.js';
 import { getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
+import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
+import type { VirtualTable } from '../vtab/table.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
 import { Latches } from '../util/latches.js';
 import {
@@ -823,6 +825,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			boundArgs = { ...params };
 		}
 
+		const scanConnections = new Map<symbol, VirtualTable>();
 		const runtimeCtx: RuntimeContext = {
 			db: this,
 			stmt: undefined,
@@ -832,9 +835,25 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			tracer: this.instructionTracer,
 			enableMetrics: this.options.getBooleanOption('runtime_stats'),
 			signal,
+			scanConnections,
 		};
 
-		await scheduler.run(runtimeCtx);
+		try {
+			const result = await scheduler.run(runtimeCtx);
+			// A row-returning statement does its work only as its rows are pulled. `exec` wants
+			// none of them, but it does want the work — an un-drained stream means the statement
+			// never ran at all. Drain and discard, checking the abort signal at row boundaries the
+			// way Statement._iterateWithSignal does.
+			if (isAsyncIterable(result)) {
+				for await (const _row of result as AsyncIterable<Row>) {
+					throwIfAborted(signal);
+				}
+			}
+		} finally {
+			for (const vtab of scanConnections.values()) {
+				await disconnectVTable(runtimeCtx, vtab);
+			}
+		}
 	}
 
 	/**
@@ -875,6 +894,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * concurrent committed read through it would have no consumer, and its
 	 * per-statement implicit-transaction loop is exactly the machinery the
 	 * mutex-free path must not touch. Use `get`/`eval` for concurrent reads.
+	 *
+	 * Every statement runs to completion, including row-returning ones (`select`,
+	 * `values`, `explain`, ...) — their rows are pulled and discarded so any side
+	 * effects and errors the query produces still happen. A caller passing a
+	 * row-returning query pays for the full scan and sees any error it raises,
+	 * but never sees the rows themselves; use `get`/`eval` to consume them.
 	 *
 	 * @param sql The SQL string(s) to execute.
 	 * @param params Optional parameters to bind.
