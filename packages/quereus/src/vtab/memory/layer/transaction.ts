@@ -125,6 +125,8 @@ export class TransactionLayer implements Layer {
 
 	private _isCommitted: boolean = false;
 	private _hasModifications: boolean = false;
+	/** How many child layers have derived BTrees from this one — see {@link Layer.noteDerivedChild}. */
+	private derivedChildCount = 0;
 
 	/** Pending changes for event emission. Null if tracking disabled. */
 	private pendingChanges: PendingChange[] | null = null;
@@ -159,6 +161,11 @@ export class TransactionLayer implements Layer {
 			const result = extractFromRow(value);
 			return result;
 		};
+
+		// Before any tree is built over the parent's: from here on the parent may not be
+		// promoted, because `clearBase()` on it would move its `chainVersion()` out from
+		// under the snapshot this layer's trees are about to take.
+		parent.noteDerivedChild();
 
 		const parentPrimaryTree = parent.getModificationTree('primary');
 
@@ -780,6 +787,14 @@ export class TransactionLayer implements Layer {
 		return this._isCommitted;
 	}
 
+	noteDerivedChild(): void {
+		this.derivedChildCount++;
+	}
+
+	hasDerivedChildren(): boolean {
+		return this.derivedChildCount > 0;
+	}
+
 	/** Marks this layer as committed. Should only be done by MemoryTable. */
 	markCommitted(): void {
 		if (!this._isCommitted) {
@@ -964,6 +979,13 @@ export class TransactionLayer implements Layer {
 	/**
 	 * Detaches this layer's BTrees from their base, making them self-contained.
 	 * This should be called when the layer becomes the new effective base.
+	 *
+	 * ONLY legal while {@link hasDerivedChildren} is false. Dropping the base pointer
+	 * removes the base's contribution from each tree's `chainVersion()`, so any tree
+	 * already derived from these ones fails its next `checkBase()` with
+	 * `MutatedBaseError`; and per inheritree's own contract the detached tree still
+	 * shares nodes by identity with its former base, so base-immutability outlives the
+	 * call. `MemoryTableManager.tryCollapseLayers` is the only caller and enforces it.
 	 */
 	public clearBase(): void {
 		this.primaryModifications.clearBase();

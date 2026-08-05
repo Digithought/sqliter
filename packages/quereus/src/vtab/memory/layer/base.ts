@@ -111,6 +111,8 @@ export class BaseLayer implements Layer {
 	private primaryKeyFunctions!: PrimaryKeyFunctions;
 	public primaryTree: BTree<BTreeKeyForPrimary, Row>;
 	public readonly secondaryIndexes: Map<string, MemoryIndex>;
+	/** How many child layers have derived BTrees from this one — see {@link Layer.noteDerivedChild}. */
+	private derivedChildCount = 0;
 
 	constructor(schema: TableSchema, collationResolver: CollationResolver) {
 		this.layerId = baseLayerCounter++;
@@ -312,6 +314,9 @@ export class BaseLayer implements Layer {
 	getParent = (): Layer | null => null;
 	getSchema = (): TableSchema => this.tableSchema;
 	isCommitted = (): boolean => true;
+
+	noteDerivedChild = (): void => { this.derivedChildCount++; };
+	hasDerivedChildren = (): boolean => this.derivedChildCount > 0;
 
 	getModificationTree = (indexName: string | 'primary'): BTree<BTreeKeyForPrimary, Row> | null =>
 		indexName === 'primary' ? this.primaryTree : null;

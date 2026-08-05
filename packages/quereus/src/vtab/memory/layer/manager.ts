@@ -531,11 +531,16 @@ export class MemoryTableManager {
 		const connection = this.connections.get(connectionId);
 		if (!connection) return;
 
-		// If the connection still has an un-committed pending layer, defer
-		// disconnect until the layer is either committed or rolled back by the
-		// transaction coordinator.  This avoids accidental rollback during
-		// implicit transactions.
-		if (connection.pendingTransactionLayer && !connection.pendingTransactionLayer.isCommitted()) {
+		// If the connection still holds uncommitted work, defer disconnect until it is
+		// either committed or rolled back by the transaction coordinator. This avoids
+		// accidental rollback during implicit transactions.
+		//
+		// `hasOpenWork()` rather than an uncommitted pending layer: an eager savepoint moves
+		// the connection's uncommitted rows into `readLayer` and nulls
+		// `pendingTransactionLayer`, so the narrower test dropped a connection that was still
+		// reading — and writing, at commit — a live layer, hiding it from `isLayerInUse` while
+		// the collapse below ran.
+		if (connection.hasOpenWork()) {
 			logger.debugLog(`[Disconnect] Deferring disconnect of connection ${connectionId} while transaction pending for ${this._tableName}`);
 			return;
 		}
@@ -573,16 +578,7 @@ export class MemoryTableManager {
 		if (!connection.pendingTransactionLayer
 			&& connection.readLayer !== this._currentCommittedLayer
 			&& connection.readLayer instanceof TransactionLayer) {
-			let walker: Layer | null = connection.readLayer.getParent();
-			let isAhead = false;
-			while (walker) {
-				if (walker === this._currentCommittedLayer) {
-					isAhead = true;
-					break;
-				}
-				walker = walker.getParent();
-			}
-			if (isAhead) {
+			if (this.chainContains(connection.readLayer, this._currentCommittedLayer)) {
 				if (connection.readLayer.getSchema() === this.tableSchema) {
 					connection.pendingTransactionLayer = new TransactionLayer(connection.readLayer);
 					if (this.eventEmitter?.hasDataListeners?.()) {
@@ -633,14 +629,7 @@ export class MemoryTableManager {
 			// Case C — no common ancestor reachable: a genuinely stale commit. Roll
 			//   back with BUSY outside a coordinated commit (the caller can retry);
 			//   inside one, preserve the prior wholesale fallback.
-			let headIsAncestorOfPending = false;
-			{
-				let cur: Layer | null = pendingLayer;
-				while (cur) {
-					if (cur === this._currentCommittedLayer) { headIsAncestorOfPending = true; break; }
-					cur = cur.getParent();
-				}
-			}
+			const headIsAncestorOfPending = this.chainContains(pendingLayer, this._currentCommittedLayer);
 
 			let committedLayer: TransactionLayer;
 			let changes: ReturnType<TransactionLayer['getPendingChanges']>;
@@ -862,53 +851,13 @@ export class MemoryTableManager {
 				return;
 			}
 			logger.debugLog(`[Collapse] Acquired lock for ${this._tableName}`);
-			let collapsedCount = 0;
-			const maxCollapseIterations = 10; // Prevent infinite loops
-			let iterations = 0;
-
-			// Continue collapsing layers as long as it's safe to do so
-			while (iterations < maxCollapseIterations &&
-			       this._currentCommittedLayer instanceof TransactionLayer &&
-			       this._currentCommittedLayer.isCommitted()) {
-
-				const layerToPromote = this._currentCommittedLayer as TransactionLayer;
-				const parentLayer = layerToPromote.getParent();
-				if (!parentLayer) {
-					logger.error('Collapse Layers', this._tableName, 'Committed TransactionLayer has no parent', { layerId: layerToPromote.getLayerId() });
-					break;
-				}
-
-				// Check if anyone is still using the parent layer or any of its ancestors
-				if (this.isLayerInUse(parentLayer)) {
-					logger.debugLog(`[Collapse] Parent layer ${parentLayer.getLayerId()} or its ancestors in use. Cannot collapse layer ${layerToPromote.getLayerId()}.`);
-					break;
-				}
-
-				logger.debugLog(`[Collapse] Promoting layer ${layerToPromote.getLayerId()} to become independent from parent ${parentLayer.getLayerId()} for ${this._tableName}`);
-
-				// With inherited BTrees, "collapsing" means making the transaction layer independent
-				// by calling clearBase() on its BTrees, effectively making it the new base data
-				layerToPromote.clearBase();
-
-				// Update connections that were reading from the collapsed parent layer
-				for (const conn of this.connections.values()) {
-					if (conn.readLayer === parentLayer) {
-						// Update connections to read from the now-independent transaction layer
-						conn.readLayer = layerToPromote;
-						logger.debugLog(`[Collapse] Connection ${conn.connectionId} updated to read from independent layer ${layerToPromote.getLayerId()}`);
-					}
-				}
-
-				collapsedCount++;
-				iterations++;
-
-				// The layer is now independent, but check if we can collapse further
-				// by examining if this layer can be promoted above its (now detached) parent
-				logger.debugLog(`[Collapse] Layer ${layerToPromote.getLayerId()} is now independent for ${this._tableName}`);
-			}
-
-			if (collapsedCount > 0) {
-				logger.operation('Collapse Layers', this._tableName, { collapsedCount, iterations });
+			// At most ONE promotion per call, and no loop: promoting detaches the head's
+			// BTrees from their base but leaves the head exactly where it is, so there is
+			// never a second layer to promote afterwards. (The former `while` re-tested
+			// `_currentCommittedLayer`, which its body never reassigned, and so re-ran
+			// `clearBase()` on the same layer up to ten times per call.)
+			if (this.promoteCommittedHead()) {
+				logger.operation('Collapse Layers', this._tableName, { collapsedCount: 1 });
 			} else {
 				logger.debugLog(`[Collapse] No layers collapsed for ${this._tableName}. Current: ${this._currentCommittedLayer.getLayerId()}`);
 			}
@@ -924,34 +873,97 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * Checks if a layer is currently in use by any connections.
-	 * This includes checking if any connection is reading from the layer,
-	 * has it as a pending transaction layer, or has it as a savepoint.
+	 * Detaches the committed head from its parent (`clearBase()`), so the chain below it
+	 * can be released. Returns whether it did.
+	 *
+	 * Caller holds the collapse latch.
+	 */
+	private promoteCommittedHead(): boolean {
+		if (!(this._currentCommittedLayer instanceof TransactionLayer)) return false;
+		if (!this._currentCommittedLayer.isCommitted()) return false;
+
+		const layerToPromote = this._currentCommittedLayer;
+		const parentLayer = layerToPromote.getParent();
+		if (!parentLayer) {
+			logger.error('Collapse Layers', this._tableName, 'Committed TransactionLayer has no parent', { layerId: layerToPromote.getLayerId() });
+			return false;
+		}
+
+		// A layer any child has EVER derived from must not be promoted. `clearBase()` drops
+		// the base pointer, which removes the base's whole contribution from the tree's
+		// `chainVersion()` — and every already-derived child snapshotted that total when it
+		// was built, so each one's next `checkBase()` raises `MutatedBaseError` although no
+		// row moved. inheritree forbids it for a second reason too: the detached tree keeps
+		// sharing nodes by identity with its former base, so the base-immutability contract
+		// outlives the call.
+		//
+		// The connection-based check below cannot cover this: `disconnect` detaches
+		// still-live connections from `this.connections`, so the map is not an authoritative
+		// liveness registry. The signal has to live on the layer.
+		//
+		// NOTE: the derived-child counter never decrements (no layer-destruction hook exists),
+		// so a long-lived table whose head always has a child may never collapse. If
+		// layer-chain memory growth ever shows up, switch the promotion to inheritree's
+		// `BTree.flatten()` — a real O(n) independent copy that leaves the old tree valid for
+		// its children — behind a chain-depth threshold, rather than loosening this guard.
+		if (layerToPromote.hasDerivedChildren()) {
+			logger.debugLog(`[Collapse] Layer ${layerToPromote.getLayerId()} has derived children. Cannot promote it for ${this._tableName}.`);
+			return false;
+		}
+
+		// Check if anyone is still using the parent layer or any of its ancestors
+		if (this.isLayerInUse(parentLayer)) {
+			logger.debugLog(`[Collapse] Parent layer ${parentLayer.getLayerId()} or its ancestors in use. Cannot collapse layer ${layerToPromote.getLayerId()}.`);
+			return false;
+		}
+
+		logger.debugLog(`[Collapse] Promoting layer ${layerToPromote.getLayerId()} to become independent from parent ${parentLayer.getLayerId()} for ${this._tableName}`);
+
+		// With inherited BTrees, "collapsing" means making the transaction layer independent
+		// by calling clearBase() on its BTrees, effectively making it the new base data
+		layerToPromote.clearBase();
+
+		// Update connections that were reading from the collapsed parent layer
+		for (const conn of this.connections.values()) {
+			if (conn.readLayer === parentLayer) {
+				// Update connections to read from the now-independent transaction layer
+				conn.readLayer = layerToPromote;
+				logger.debugLog(`[Collapse] Connection ${conn.connectionId} updated to read from independent layer ${layerToPromote.getLayerId()}`);
+			}
+		}
+
+		logger.debugLog(`[Collapse] Layer ${layerToPromote.getLayerId()} is now independent for ${this._tableName}`);
+		return true;
+	}
+
+	/**
+	 * Whether any attached connection's read or write view still reaches `layer` — as its
+	 * read layer, its pending layer, or an ancestor of either.
+	 *
+	 * BOTH chains are walked, and each all the way to the chain root. An eager savepoint
+	 * (`MemoryTableConnection.createSavepoint`) moves the connection's uncommitted layer into
+	 * `readLayer` and leaves `pendingTransactionLayer` null, so walking only the pending chain
+	 * misses exactly the connection whose live snapshot the collapse would strand.
+	 *
+	 * Necessary but NOT sufficient as a collapse precondition: `disconnect` can drop a still-live
+	 * connection from `this.connections` (it stays registered on the Database and is committed
+	 * later), so a layer this reports unused may still have live derived trees. That is what
+	 * {@link Layer.hasDerivedChildren} covers.
 	 */
 	private isLayerInUse(layer: Layer): boolean {
 		for (const conn of this.connections.values()) {
-			// Check if connection is reading from this layer
-			if (conn.readLayer === layer) {
-				return true;
-			}
+			if (this.chainContains(conn.readLayer, layer)) return true;
+			if (conn.pendingTransactionLayer && this.chainContains(conn.pendingTransactionLayer, layer)) return true;
+		}
+		return false;
+	}
 
-			// Check if connection has this layer as pending transaction
-			if (conn.pendingTransactionLayer === layer) {
-				return true;
-			}
-
-			// Check if connection has this layer in its parent chain
-			let currentLayer = conn.pendingTransactionLayer?.getParent();
-			while (currentLayer) {
-				if (currentLayer === layer) {
-					return true;
-				}
-				if (currentLayer instanceof TransactionLayer) {
-					currentLayer = currentLayer.getParent();
-				} else {
-					break;
-				}
-			}
+	/** Whether `layer` is `from` itself or any of its ancestors. */
+	private chainContains(from: Layer, layer: Layer): boolean {
+		let cur: Layer | null = from;
+		while (cur) {
+			if (cur === layer) return true;
+			cur = cur.getParent();
 		}
 		return false;
 	}
@@ -3275,8 +3287,8 @@ export class MemoryTableManager {
 		// loop above misses it, so after an in-transaction schema change (e.g. ALTER TABLE ADD
 		// COLUMN, now permitted inside an explicit transaction) it keeps reading a stale
 		// pre-change layer carrying the OLD column shape — the materialized-view-source-stale-read
-		// bug. A detached connection always has `pendingTransactionLayer === null` (disconnect
-		// defers while a pending layer is uncommitted), so this never discards in-flight writes.
+		// bug. A detached connection never holds open work (`disconnect` defers while
+		// `hasOpenWork()`), so this never discards in-flight writes.
 		this.repointRegisteredConnections();
 
 		// Re-pointing `readLayer` is not enough: a savepoint taken while a connection held no
