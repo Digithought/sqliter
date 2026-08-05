@@ -291,6 +291,14 @@ export interface KVStoreProvider {
 	 * named `{oldName}_idx_<x>` and would silently move its data under `newName`.
 	 *
 	 * Called by StoreModule.renameTable during ALTER TABLE ... RENAME TO.
+	 *
+	 * Optional: when a provider omits this hook, StoreModule falls back to a generic
+	 * copy — read every entry via the required `getStore`/`getIndexStore` on the old
+	 * name and `put` it under the new name, then reclaim the old stores via
+	 * `deleteTableStores` if implemented. That fallback is correct on every provider
+	 * but does not stream at the backend's native speed and is O(table size) for a
+	 * single rename. Implement this hook for an efficient native move (e.g. a
+	 * directory/file rename) instead.
 	 * @param schemaName - The schema name
 	 * @param oldName - The current table name
 	 * @param newName - The desired table name

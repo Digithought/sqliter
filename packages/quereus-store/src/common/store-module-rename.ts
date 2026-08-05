@@ -17,6 +17,7 @@ import {
 	renameTableInColumnExpressions,
 	renameTableInIndexPredicates,
 } from '@quereus/quereus';
+import type { KVStore } from './kv-store.js';
 import { StoreConnection } from './store-connection.js';
 import { buildDataStoreName, buildIndexStoreName, buildStatsKey } from './key-builder.js';
 import { StoreModuleAlter } from './store-module-alter.js';
@@ -161,6 +162,8 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 		// relocation must be undone here or deferred until after the catalog write.
 		if (this.provider.renameTableStores) {
 			await this.provider.renameTableStores(schemaName, oldName, newName, indexNames);
+		} else {
+			await this.copyTableStores(schemaName, oldName, newName, indexNames);
 		}
 
 		// Rewrite persistent catalog under the new name. Write the new DDL first
@@ -310,5 +313,59 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 	): Promise<void> {
 		this.enqueuePersist(() => this.removeTableDDL(schemaName, oldName));
 		await this.whenCatalogPersisted();
+	}
+
+	/**
+	 * Fallback used by {@link renameTable} when the provider does not implement
+	 * `renameTableStores`: relocate a table's data + index stores by copying every
+	 * entry through the provider's REQUIRED `getStore`/`getIndexStore`, rather than
+	 * a native move. Streams one entry at a time (no whole-table buffering) — this
+	 * path exists precisely for backends that cannot move storage cheaply, so the
+	 * table it runs against may be large.
+	 *
+	 * A failure partway through (a bad write, a closed store) propagates rather
+	 * than being swallowed: `renameTable` must not rewrite the catalog under
+	 * `newName` after an incomplete copy, which would reproduce the old
+	 * silent-data-loss bug through a different path.
+	 */
+	private async copyTableStores(
+		schemaName: string,
+		oldName: string,
+		newName: string,
+		indexNames: readonly string[],
+	): Promise<void> {
+		const copyEntries = async (from: KVStore, to: KVStore): Promise<void> => {
+			for await (const { key, value } of from.iterate()) {
+				await to.put(key, value);
+			}
+		};
+
+		const oldData = await this.provider.getStore(schemaName, oldName);
+		const newData = await this.provider.getStore(schemaName, newName);
+		await copyEntries(oldData, newData);
+
+		for (const indexName of indexNames) {
+			const oldIndex = await this.provider.getIndexStore(schemaName, oldName, indexName);
+			const newIndex = await this.provider.getIndexStore(schemaName, newName, indexName);
+			await copyEntries(oldIndex, newIndex);
+		}
+
+		if (this.provider.deleteTableStores) {
+			await this.provider.deleteTableStores(schemaName, oldName, indexNames);
+		} else {
+			// No native relocation AND no way to drop the old-named stores: close the
+			// stale handles so they're not leaked, but the old-named copy stays on
+			// disk as an orphaned duplicate until a human notices this warning.
+			await this.provider.closeStore(schemaName, oldName);
+			for (const indexName of indexNames) {
+				await this.provider.closeIndexStore(schemaName, oldName, indexName);
+			}
+			console.warn(
+				`[StoreModule] Provider implements neither renameTableStores nor deleteTableStores: `
+					+ `'${schemaName}.${oldName}' was copied to '${schemaName}.${newName}' but the `
+					+ `old-named storage was left behind as an orphaned duplicate. Implement `
+					+ `deleteTableStores or renameTableStores on the provider to reclaim it.`,
+			);
+		}
 	}
 }
