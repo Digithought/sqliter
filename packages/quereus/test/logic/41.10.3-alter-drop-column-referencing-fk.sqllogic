@@ -226,3 +226,63 @@ select pid from EscP;
 insert into EscC values (2, 999);
 select count(*) as c from EscC;
 → [{"c":2}]
+
+-- ===================================================================
+-- 10. Control for the guard's OTHER half: the key must point at THIS table, not
+--     merely at a column with the same name. Two parents both own a `refd`; only
+--     one is referenced, so dropping the other's `refd` is accepted. A guard that
+--     matched parent column NAMES without resolving the parent would refuse here.
+-- ===================================================================
+
+create table TwinA (id integer primary key, refd integer unique);
+create table TwinB (id integer primary key, refd integer unique);
+create table TwinC (id integer primary key, c integer references TwinB(refd));
+insert into TwinA values (1, 100);
+insert into TwinB values (1, 200);
+insert into TwinC values (1, 200);
+
+-- Nothing points at TwinA.refd, same name notwithstanding.
+alter table TwinA drop column refd;
+select id from TwinA;
+→ [{"id":1}]
+
+-- TwinB's identically-named column is still the referenced one, and still refused.
+alter table TwinB drop column refd;
+-- error: _fk_twinc_c
+
+-- ===================================================================
+-- 11. A key whose parent table does not exist resolves to no parent at all, so it
+--     constrains nothing and blocks nothing. Dropping a same-named column of an
+--     unrelated real table is accepted.
+-- ===================================================================
+
+create table Ghost (id integer primary key, refd integer unique);
+create table GhostC (id integer primary key, c integer references NoSuchParent(refd));
+insert into Ghost values (1, 100);
+
+alter table Ghost drop column refd;
+select id from Ghost;
+→ [{"id":1}]
+
+-- ===================================================================
+-- 12. Discovery reads the cached reverse-FK index, so a key created AFTER an
+--     earlier drop already warmed that cache still has to block. Covers both ways
+--     a key appears late: `ALTER TABLE … ADD CONSTRAINT`, and a child table
+--     created after the parent was altered. § 9 covers the removal direction.
+-- ===================================================================
+
+create table LateP (pid integer primary key, refd integer unique);
+create table LateC (id integer primary key, c integer);
+
+-- Warm the cache with a lookup that finds nothing pointing at LateP.
+alter table LateP drop column refd;
+alter table LateP add column refd integer unique;
+
+alter table LateC add constraint fk_latec foreign key (c) references LateP(refd);
+alter table LateP drop column refd;
+-- error: fk_latec
+
+-- A child declared after the fact is seen the same way.
+create table LateC2 (id integer primary key, c integer references LateP(refd));
+alter table LateP drop column refd;
+-- error: fk_latec

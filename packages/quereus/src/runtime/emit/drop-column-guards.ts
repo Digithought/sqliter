@@ -1,7 +1,7 @@
 import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import type { TableSchema } from '../../schema/table.js';
+import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { columnReferencedInAst, columnReferencedInCheckExpression } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
@@ -146,13 +146,17 @@ export function assertNoAssertionNamesColumn(
  * is still wrong and turning the pragma on later bricks the child table. The guards
  * already in `runDropColumn` are likewise unconditional.
  *
- * The parent is resolved with the same `findTable(fk.referencedTable, fk.referencedSchema)`
- * call `planner/building/foreign-key-builder.ts` uses at enforcement time, rather than by
- * comparing names by hand — that identity is what makes "the guard refuses exactly the
- * drops enforcement would have choked on" true. It carries the same dependence on the
- * session search path: an unqualified `fk.referencedTable` resolves through that path, not
- * through the child's own schema, so a key can bind to a different parent than its
- * spelling suggests. Whatever enforcement would pick is what this refuses over.
+ * Discovery goes through {@link SchemaManager.getReferencingForeignKeys} — the cached
+ * reverse index keyed by referenced `schema.table` that `DROP TABLE`'s parent-side guard
+ * already uses — rather than a fresh walk of every foreign key in every schema. Its key
+ * is `fk.referencedSchema ?? childTable.schemaName`, and `referencedSchema` is populated
+ * at build time from the declaration (`constraint-builder.ts`: `fk.schema ?? childSchemaName`),
+ * so the bucket a key lands in is the same parent
+ * `planner/building/foreign-key-builder.ts` resolves at enforcement time. That identity is
+ * what makes "the guard refuses exactly the drops enforcement would have choked on" true.
+ * An unqualified reference binds to the **child's own schema**, not through the session
+ * search path — a cross-schema key must qualify its parent (`references main.p(c)`) or it
+ * resolves to no parent at all.
  *
  * Two keys are skipped, both deliberately:
  *
@@ -172,34 +176,43 @@ export function assertNoForeignKeyReferencesColumn(
 ): void {
 	const lowerColumn = columnName.toLowerCase();
 	const droppedIndex = tableSchema.columnIndexMap.get(lowerColumn);
-	const lowerSchema = tableSchema.schemaName.toLowerCase();
-	const lowerTable = tableSchema.name.toLowerCase();
 
-	// NOTE: this walks every foreign key of every table in every schema on each DROP COLUMN.
-	// Trivial at today's schema sizes; if a database ever carries many tables and the ALTER
-	// path gets hot, index parent references by parent table name instead.
-	for (const schema of db.schemaManager._getAllSchemas()) {
-		for (const childTable of schema.getAllTables()) {
-			for (const fk of childTable.foreignKeys ?? []) {
-				const refNames = fk.referencedColumnNames;
-				if (!refNames || refNames.length === 0) continue;
-				if (!refNames.some(name => name.toLowerCase() === lowerColumn)) continue;
+	for (const { childTable, fk } of db.schemaManager.getReferencingForeignKeys(tableSchema.schemaName, tableSchema.name)) {
+		if (!namesParentColumn(fk, lowerColumn)) continue;
+		if (dropRemovesKeyOutright(tableSchema, childTable, fk, droppedIndex)) continue;
 
-				const parent = db.schemaManager.findTable(fk.referencedTable, fk.referencedSchema);
-				if (!parent) continue;	// dangling parent — already broken, and not this drop's doing
-				if (parent.schemaName.toLowerCase() !== lowerSchema || parent.name.toLowerCase() !== lowerTable) continue;
-
-				const selfKeyRemovedByThisDrop = childTable.name.toLowerCase() === lowerTable
-					&& childTable.schemaName.toLowerCase() === lowerSchema
-					&& droppedIndex !== undefined && fk.columns.includes(droppedIndex);
-				if (selfKeyRemovedByThisDrop) continue;
-
-				const fkName = fk.name ?? `_fk_${childTable.name}`;
-				throw new QuereusError(
-					`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by foreign key '${fkName}' on table '${childTable.name}'`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-		}
+		const fkName = fk.name ?? `_fk_${childTable.name}`;
+		throw new QuereusError(
+			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by foreign key '${fkName}' on table '${childTable.name}'`,
+			StatusCode.CONSTRAINT,
+		);
 	}
+}
+
+/**
+ * Whether `fk` lists `lowerColumn` (already lowercased) among its declared parent columns.
+ * A key with no declared list targets the parent's primary key and matches nothing here —
+ * see the second skip in {@link assertNoForeignKeyReferencesColumn}'s doc comment.
+ */
+function namesParentColumn(fk: ForeignKeyConstraintSchema, lowerColumn: string): boolean {
+	const refNames = fk.referencedColumnNames;
+	if (!refNames || refNames.length === 0) return false;
+	return refNames.some(name => name.toLowerCase() === lowerColumn);
+}
+
+/**
+ * Whether this drop takes the whole key with it: a **self**-referencing key, on the table
+ * being altered, holding the dropped column among its *child* columns. The module removes
+ * such a key as part of the drop, so no reference to the missing name survives it.
+ */
+function dropRemovesKeyOutright(
+	tableSchema: TableSchema,
+	childTable: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+	droppedIndex: number | undefined,
+): boolean {
+	if (droppedIndex === undefined) return false;
+	if (childTable.name.toLowerCase() !== tableSchema.name.toLowerCase()) return false;
+	if (childTable.schemaName.toLowerCase() !== tableSchema.schemaName.toLowerCase()) return false;
+	return fk.columns.includes(droppedIndex);
 }
