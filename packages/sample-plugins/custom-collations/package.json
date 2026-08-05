@@ -1,6 +1,6 @@
 {
   "name": "@quereus/quereus-plugin-custom-collations",
-  "version": "4.7.0",
+  "version": "4.8.0",
   "type": "module",
   "description": "Custom collation functions for specialized sorting behaviors",
   "author": "Quereus Team",
