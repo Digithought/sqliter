@@ -1,5 +1,5 @@
 ---
-description: Renaming a table also rewrites same-named temporary result sets defined inside stored views and rules, so those objects silently start reading the real table instead of their own local definition and return wrong answers.
+description: Renaming a table also rewrites anything else that happens to share its name inside stored views and rules — a local temporary result set, or the "new"/"old" prefix that names the row being written — so those objects silently read the wrong thing, return wrong answers, or stop accepting writes at all.
 files:
   - packages/quereus/src/schema/rename-rewriter.ts   # visitTableRename — the walk; no scope tracking at all
   - packages/quereus/src/runtime/emit/alter-table.ts # propagateTableRenameInSchema — the caller for views/MVs/assertions
@@ -7,6 +7,7 @@ files:
   - packages/quereus/test/logic/41.3-alter-rename-propagation.sqllogic # where rename-dependent coverage lives
   - packages/quereus/test/logic/53.2-materialized-view-rename-propagation.sqllogic
   - packages/quereus/test/logic/95-assertions.sqllogic # assertion rename + drop-guard coverage
+  - packages/quereus/test/logic/41.10.2-alter-drop-column-check-and-assertion.sqllogic # §13/§14 — the row-image scope cases the column walker already covers
 repro: verified
 ---
 
@@ -81,6 +82,42 @@ is corrupted), but it is the same over-match and it disappears with the same
 fix. Keeping the guard and the rename walk on one shared definition of "refers
 to" is deliberate — see the comment on `tableReferencedInAst` — so the fix
 should stay in the walker, not be special-cased in the guard.
+
+## Third symptom: a table called `new` or `old`, renamed, breaks other tables' CHECKs
+
+Found during review of `bug-check-constraint-new-old-qualifier-invisible-to-column-rename`
+(memory module, at commit `3bd01d40`). Same scope-blind walk, different shadowed
+namespace.
+
+A CHECK constraint may name the row being written explicitly — `check (new.a > 0)`,
+`check on delete (old.a > 0)`. `new` and `old` are not reserved words here, so a real
+table may also be called `new`. Renaming that table rewrites the row-image qualifier in
+every *other* table's CHECK, and those tables become unwritable:
+
+```sql
+create table "new" (a integer primary key);
+create table T (id integer primary key, a integer, constraint ck check (new.a > 0));
+insert into T values (1, 5);                 -- OK
+
+alter table "new" rename to "renamed";       -- succeeds
+
+insert into T values (2, 7);                 -- ERROR: renamed.a isn't a column
+```
+
+`T`'s CHECK never referred to the `new` table at all — `new.a` named `T`'s own written
+row. The walk matched it by bare name.
+
+The mirror direction (RENAME COLUMN / DROP COLUMN failing to see `new.a`) was the
+column walker's version of this and is already fixed; the fix taught the *column* walker
+that a `new.` / `old.` qualifier in a CHECK names the row image unless an inner FROM
+rebinds it. `visitTableRename` needs the complementary rule: a `new.` / `old.` qualifier
+in a CHECK expression of the table that owns it is a row image, not a table reference,
+and must not be rewritten by a table rename — again unless an inner FROM rebinds the
+name, which is exactly the CTE/alias scope tracking the rest of this ticket is about.
+
+Note this arm needs the walk to know *whose* CHECK it is walking, which the column
+walker gets from a seeded entry point (`renameColumnInCheckExpression`) and the table
+walker currently has no equivalent of.
 
 ## Expected behaviour
 

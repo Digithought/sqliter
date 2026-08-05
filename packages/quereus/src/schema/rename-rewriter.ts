@@ -12,6 +12,13 @@ import { spineCloneAst } from '../util/ast-spine-clone.js';
  * applied. Callers can use the returned flag to skip cloning when nothing
  * matched. Name comparisons are case-insensitive throughout to match the
  * Quereus catalog rules.
+ *
+ * NOTE: ~1640 lines (wc -l, 2026-08-04) holding three independent walkers —
+ * table rename, column rename, self-qualifier strip — that share only `eq` and
+ * the FROM-binding vocabulary. Under the bar the repo's other size-debt tickets
+ * were filed at (schema-differ.ts, 2725), so not worth splitting today; if the
+ * table walker grows its own ScopeFrame (see
+ * `bug-table-rename-rewrites-cte-references`), split along those three seams.
  */
 
 interface ScopeFrame {

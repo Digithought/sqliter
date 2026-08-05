@@ -426,3 +426,37 @@ select count(*) as c from DcShadow;
 drop table DcShadow;
 drop table "new";
 -- run
+
+-- ===================================================================
+-- 14. The same scope-awareness for a `new` rebound by an ALIAS or by a CTE name
+-- ===================================================================
+--
+-- §13 covers the rebind-by-unaliased-source shape only; a FROM source can bind the name
+-- by alias or by `with` clause too, and neither is a row image. Both drops must be
+-- ALLOWED. Refusal half of §28 in 41.3-alter-rename-propagation.
+
+create table UcAlias (k integer primary key, a integer);
+create table DcAlias (id integer primary key, a integer, b integer,
+                      check ((select max("new".a) from UcAlias as "new") >= 0));
+insert into DcAlias values (1, 2, 3);
+-- run
+
+alter table DcAlias drop column a;
+select b from DcAlias;
+→ [{"b":3}]
+
+drop table DcAlias;
+drop table UcAlias;
+-- run
+
+create table DcCte (id integer primary key, a integer, b integer,
+                    check ((with "new" as (select 1 as a) select max("new".a) from "new") >= 0));
+insert into DcCte values (1, 2, 3);
+-- run
+
+alter table DcCte drop column a;
+select b from DcCte;
+→ [{"b":3}]
+
+drop table DcCte;
+-- run

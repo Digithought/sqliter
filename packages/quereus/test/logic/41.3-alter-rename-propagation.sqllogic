@@ -944,3 +944,41 @@ select id, z from t_rishadow;
 
 drop table t_rishadow;
 drop table "new";
+
+-- ===================================
+-- 28. `new` rebound by an ALIAS, or by a CTE name, is likewise not a row image
+-- ===================================
+-- §27 covers the rebind-by-unaliased-source shape only. A FROM source can bind the
+-- name three other ways, and each has to suppress the row-image rewrite the same
+-- way; these two are the reachable ones (`select … from U as "new"`, and a
+-- `with "new" as (…)` clause). Rewriting `"new".a` → `"new".z` in either would name a
+-- column the aliased/CTE row source does not have, and the next write would fail at
+-- plan time.
+
+create table u_rialias (k integer primary key, a integer);
+insert into u_rialias values (1, 4);
+
+create table t_rialias (id integer primary key, a integer,
+                        check ((select max("new".a) from u_rialias as "new") >= 0));
+
+alter table t_rialias rename column a to z;
+
+insert into t_rialias values (1, 7);
+
+select id, z from t_rialias;
+→ [{"id":1,"z":7}]
+
+drop table t_rialias;
+drop table u_rialias;
+
+create table t_ricte (id integer primary key, a integer,
+                      check ((with "new" as (select 1 as a) select max("new".a) from "new") >= 0));
+
+alter table t_ricte rename column a to z;
+
+insert into t_ricte values (1, 7);
+
+select id, z from t_ricte;
+→ [{"id":1,"z":7}]
+
+drop table t_ricte;
