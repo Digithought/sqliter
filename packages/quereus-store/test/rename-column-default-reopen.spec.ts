@@ -21,9 +21,9 @@
  * The sqllogic harness has no reopen primitive, which is why this lives here: the memory-leg
  * arms are pinned by `test/logic/41.3-alter-rename-propagation.sqllogic` §29-36.
  *
- * Deliberately asserts on the DEFAULT arm only. A `generated always as` clause is not
- * rendered into the bundle at all today — a computed column comes back after a reopen as a
- * plain null column, with or without any rename — tracked separately by
+ * Deliberately asserts on the DEFAULT arm only. The equivalent `generated always as` arm
+ * (a computed column's renamed body, across a reopen) is pinned separately in
+ * `generated-column-reopen.spec.ts`, alongside the base persistence case fixed by
  * `bug-store-reopen-loses-computed-columns`.
  */
 

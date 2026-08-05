@@ -468,6 +468,47 @@ describe('Generator: cross-schema FOREIGN KEY qualifier round-trip', () => {
 	});
 });
 
+describe('Generator: GENERATED ALWAYS AS round-trips (generateTableDDL → parse → columnDefToSchema)', () => {
+	// bug-store-reopen-loses-computed-columns: formatColumnDef had no branch for
+	// GENERATED ALWAYS AS, so a store-backed catalog silently dropped the computing rule
+	// on reopen. Pins the engine-side round-trip without needing the store package.
+	it('a stored and a virtual generated column both survive generate → parse → columnDefToSchema', () => {
+		const src = parse(`create table t (
+			id integer primary key,
+			a integer null,
+			g integer null generated always as (a + 1) stored,
+			v integer null generated always as (a * 2)
+		)`);
+		expect(src.type, 'source parses as createTable').to.equal('createTable');
+		if (src.type !== 'createTable') return;
+
+		const columns = src.columns.map(c => columnDefToSchema(c));
+		const table = makeTableSchema({
+			name: 't',
+			columns,
+			primaryKeyDefinition: [{ index: 0 }],
+		});
+		const ddl = generateTableDDL(table);
+		expect(ddl, ddl).to.include('GENERATED ALWAYS AS (a + 1) STORED');
+		expect(ddl, ddl).to.include('GENERATED ALWAYS AS (a * 2) VIRTUAL');
+
+		const reparsed = parse(ddl);
+		expect(reparsed.type, `ddl re-parses\n  ddl: ${ddl}`).to.equal('createTable');
+		if (reparsed.type !== 'createTable') return;
+
+		const gSchema = columnDefToSchema(reparsed.columns.find(c => c.name === 'g')!);
+		const vSchema = columnDefToSchema(reparsed.columns.find(c => c.name === 'v')!);
+
+		expect(gSchema.generated, 'g: generated survives').to.equal(true);
+		expect(gSchema.generatedStored, 'g: stored survives').to.equal(true);
+		expect(gSchema.generatedExpr && expressionToString(gSchema.generatedExpr), 'g: expr survives').to.equal('a + 1');
+
+		expect(vSchema.generated, 'v: generated survives').to.equal(true);
+		expect(vSchema.generatedStored, 'v: virtual survives').to.equal(false);
+		expect(vSchema.generatedExpr && expressionToString(vSchema.generatedExpr), 'v: expr survives').to.equal('a * 2');
+	});
+});
+
 describe('Generator: CREATE ASSERTION name (collectSchemaCatalog)', () => {
 	// The assertion DDL is emitted inside the private `assertionSchemaToCatalog`;
 	// `collectSchemaCatalog` is the public driver that reaches it. We create a

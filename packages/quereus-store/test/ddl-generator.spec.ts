@@ -311,5 +311,67 @@ describe('DDL generator', () => {
 			}
 		});
 	});
+
+	// generateTableDDL must serialize GENERATED ALWAYS AS, or a store-backed table's
+	// computed columns silently revert to plain nullable columns on reopen — the rule
+	// that computes them is never persisted, so every post-reopen row stores null there
+	// (bug-store-reopen-loses-computed-columns).
+	describe('generateTableDDL generated columns', () => {
+		function genExpr(col: string, operator: string, n: number): ColumnSchema['generatedExpr'] {
+			return {
+				type: 'binary',
+				operator,
+				left: { type: 'column', name: col },
+				right: { type: 'literal', value: n },
+			};
+		}
+
+		it('emits GENERATED ALWAYS AS (...) STORED for a stored generated column', () => {
+			const schema = makeTableSchema({
+				name: 'g',
+				columns: [
+					makeColumn('id', INTEGER_TYPE, { primaryKey: true, pkOrder: 1 }),
+					makeColumn('a', INTEGER_TYPE, { notNull: false }),
+					makeColumn('g', INTEGER_TYPE, {
+						notNull: false,
+						generated: true,
+						generatedExpr: genExpr('a', '+', 1),
+						generatedStored: true,
+					}),
+				],
+				primaryKeyDefinition: [{ index: 0 }],
+			});
+			const ddl = generateTableDDL(schema);
+			expect(ddl, ddl).to.include('"g" INTEGER NULL GENERATED ALWAYS AS (a + 1) STORED');
+		});
+
+		it('emits GENERATED ALWAYS AS (...) VIRTUAL for a virtual generated column', () => {
+			const schema = makeTableSchema({
+				name: 'g',
+				columns: [
+					makeColumn('id', INTEGER_TYPE, { primaryKey: true, pkOrder: 1 }),
+					makeColumn('a', INTEGER_TYPE, { notNull: false }),
+					makeColumn('v', INTEGER_TYPE, {
+						notNull: false,
+						generated: true,
+						generatedExpr: genExpr('a', '*', 2),
+						generatedStored: false,
+					}),
+				],
+				primaryKeyDefinition: [{ index: 0 }],
+			});
+			const ddl = generateTableDDL(schema);
+			expect(ddl, ddl).to.include('"v" INTEGER NULL GENERATED ALWAYS AS (a * 2) VIRTUAL');
+		});
+
+		it('does not emit GENERATED when generatedExpr is absent (unreachable-defence guard)', () => {
+			const schema = makeTableSchema({
+				name: 'g',
+				columns: [makeColumn('x', INTEGER_TYPE, { notNull: false, generated: true })],
+			});
+			const ddl = generateTableDDL(schema);
+			expect(ddl, ddl).to.not.include('GENERATED');
+		});
+	});
 });
 

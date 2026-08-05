@@ -529,6 +529,15 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 		colDef += ` DEFAULT ${formatDefaultExpression(col.defaultValue)}`;
 	}
 
+	// GENERATED ALWAYS AS: mutually exclusive with DEFAULT (columnDefToSchema rejects both),
+	// so this and the block above never both fire. Without this, the rule computing the
+	// column is silently dropped on persist — a reopened table stores nulls in the column
+	// forever after (and, wrongly, accepts direct writes to it again).
+	if (col.generated && col.generatedExpr) {
+		colDef += ` GENERATED ALWAYS AS (${expressionToString(col.generatedExpr)})`;
+		colDef += col.generatedStored ? ' STORED' : ' VIRTUAL';
+	}
+
 	if (hasTags(col.tags)) {
 		colDef += ' ' + formatTagsClause(col.tags!);
 	}
