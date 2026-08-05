@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, VirtualTable, AccessPlanBuilder, IndexConstraintOp, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
+import { Database, MemoryTableModule, VirtualTable, AccessPlanBuilder, IndexConstraintOp, asyncIterableToArray, getModuleConcurrencyMode, getModuleReadCommittedSnapshot, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
 import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs, UpdateResult, IndexDescriptor, EffectiveRowSource } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
@@ -4336,6 +4336,47 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 		it('expectedLatencyMs comes from the underlying, never the overlay', () => {
 			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads', 25), overlay: modeStub('reentrant-reads', 999) });
 			expect(iso.expectedLatencyMs).to.equal(25);
+		});
+	});
+
+	// `readCommittedSnapshot` is the underlying's promise that a `_readCommitted`
+	// connection serves a stable committed snapshot for the life of the scan. The
+	// wrapper inherits it VERBATIM (not weakest-of, unlike concurrencyMode): a
+	// committed read skips the overlay entirely, so the overlay's own properties
+	// cannot degrade it.
+	describe('readCommittedSnapshot inheritance', () => {
+		/** Module stub declaring (or omitting) only `readCommittedSnapshot`. */
+		function snapshotStub(readCommittedSnapshot?: boolean): VirtualTableModule<any, any> {
+			const m: Record<string, unknown> = {};
+			if (readCommittedSnapshot !== undefined) m.readCommittedSnapshot = readCommittedSnapshot;
+			return m as unknown as VirtualTableModule<any, any>;
+		}
+
+		it('is true over MemoryTableModule', () => {
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			expect(iso.readCommittedSnapshot).to.equal(true);
+			expect(getModuleReadCommittedSnapshot(iso)).to.equal(true);
+		});
+
+		it('is false over an underlying that omits the flag', () => {
+			const iso = new IsolationModule({ underlying: snapshotStub() });
+			expect(iso.readCommittedSnapshot).to.equal(false);
+			expect(getModuleReadCommittedSnapshot(iso)).to.equal(false);
+		});
+
+		it('is false over an underlying that explicitly declines', () => {
+			const iso = new IsolationModule({ underlying: snapshotStub(false) });
+			expect(getModuleReadCommittedSnapshot(iso)).to.equal(false);
+		});
+
+		it('follows the underlying, not the overlay', () => {
+			// A snapshot-safe overlay cannot lift a non-snapshot-safe underlying...
+			const lifted = new IsolationModule({ underlying: snapshotStub(false), overlay: new MemoryTableModule() });
+			expect(lifted.readCommittedSnapshot).to.equal(false);
+
+			// ...and a non-declaring overlay cannot drag a snapshot-safe underlying down.
+			const dragged = new IsolationModule({ underlying: snapshotStub(true), overlay: snapshotStub() });
+			expect(dragged.readCommittedSnapshot).to.equal(true);
 		});
 	});
 

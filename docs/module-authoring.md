@@ -351,7 +351,110 @@ place — `'fully-reentrant'` would require either fresh-per-write layers
 or an iterator-safe mutation path. Layered stores, isolation wrappers,
 and persistent plugins stay default until their owners audit them.
 
-### 4. Backing Host (Materialized-View Backing Tables)
+### 4. Committed-Snapshot Reads (`_readCommitted`)
+
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+
+A table reference qualified `committed.<table>` (and, in future, a statement the
+engine elects to run outside the execution mutex) opens the module with the
+`_readCommitted` connect option. On its own that option means only *"do not show
+me the writer's staged rows"* — a weak promise several modules already implement.
+
+`readCommittedSnapshot` is the separate, default-off declaration that the module
+can meet the **stronger** promise the engine needs before it runs such a read
+*concurrently* with another connection's commit:
+
+```typescript
+interface VirtualTableModule {
+  readonly readCommittedSnapshot?: boolean;   // default false
+}
+```
+
+**The obligation you take on by declaring it:**
+
+> A connection opened with `_readCommitted` must serve a state that is consistent
+> as of some commit boundary at or before the moment the read began, and must keep
+> serving that same state for the life of the scan — including across another
+> connection's commit landing mid-iteration, including across concurrent DDL on
+> that table, and including across index-driven access paths (an index-driven plan
+> and a full scan of the same connection must agree).
+
+Why the bar is that high: once reads overlap commits, *"read the committed store
+directly"* and *"read a consistent committed state"* stop being the same
+statement. A module whose commit publishes its new state in steps — per column,
+per index, per chunk, or by mutating live structures in place rather than
+swapping one root at the end — lets a concurrent reader observe a half-applied
+commit: a row present in one column's structure and absent in another (a torn row
+on `select *`); base rows applied while the matching secondary-index entries are
+not, so an index-driven plan returns fewer rows than a full scan of the same
+nominal snapshot; or, for a module that splits one logical write into several
+atomic units, a partially applied write.
+
+**Two acceptable implementation shapes:**
+
+1. **Pin at scan start** — capture an immutable snapshot when the connection is
+   opened (or when `query()` is entered) and iterate only that.
+2. **Publish atomically at end of commit** — make the committed state visible via
+   a single swap, so a live read can never observe a partial one.
+
+A module that can do neither must leave the flag off. **Leaving it off is not a
+defect** — reads against that module simply keep taking today's serialized path.
+
+**Three consequences you will not infer from the sentence above:**
+
+- **A `_readCommitted` connection must not join the writer's transaction.** Do
+  not hand it to `Database.registerConnection`; it must never receive
+  `begin` / `commit` / `rollback` / savepoint broadcasts, and disconnecting it
+  must not tear down per-database state the writer still owns. Modules that key
+  transaction state by `Database` rather than by connection are the exposed case:
+  a committed-read connection landing in that map would drive the *writer's*
+  transaction. (The engine cannot detect this from the declaration alone — it is
+  on the module.)
+- **Temporal / change-stream scopes.** If your module offers a point-in-time or
+  change-stream read scope whose interaction with `_readCommitted` is undefined,
+  leave the flag off. The engine has no table-level temporal qualifier today, so
+  it cannot arbitrate precedence for you.
+- **Degraded state is the module's problem.** If the module can enter a state
+  where it cannot serve a coherent committed snapshot (e.g. a commit that failed
+  between its durable log append and its projection apply), it must throw from
+  `connect` or from the first `query()` pull rather than answer. The engine adds
+  no mid-flight "reads are unsafe" signal.
+
+**Orthogonal to [`concurrencyMode`](#3-concurrency-mode-parallel-runtime).** That
+enum answers *"may the runtime issue concurrent calls on **one** connection?"* A
+committed read opens its **own separate** connection, so intra-connection
+reentrancy is not what is at stake — what is, is whether the module's shared,
+cross-connection state tears while a commit publishes. The two do not imply each
+other in either direction: the memory vtab is `'reentrant-reads'` *and*
+snapshot-safe, while a hypothetical `'fully-reentrant'` module could still publish
+its commits incrementally. Reusing the enum would silently over-promise.
+
+The engine-side reader is `getModuleReadCommittedSnapshot`, which fails closed:
+
+```typescript
+import { getModuleReadCommittedSnapshot } from '@quereus/quereus';
+
+if (getModuleReadCommittedSnapshot(module)) {
+  // may open a `_readCommitted` connection and read it without the exec mutex
+}
+```
+
+**In-tree declarations.** The memory vtab declares `true`: layers are immutable
+BTrees, a commit publishes by a single pointer assignment to the current
+committed layer, a `_readCommitted` connect makes a fresh *unregistered*
+connection whose read layer is pinned at connect time, and the scan captures that
+layer's BTree object at scan start — so a concurrent DDL rebuild (which replaces
+tree objects wholesale) leaves the in-flight walk on a *stale but coherent*
+snapshot, which is the documented semantics rather than corruption. The isolation
+wrapper inherits the underlying module's value verbatim (its committed-read path
+bypasses the overlay entirely). `StoreModule` declares `false`: its `connect`
+returns a shared cached table per table key — dropping the `_readCommitted`
+option — and its `query` merges the coordinator's pending-op view over the
+committed store, so a read taken during a commit flush sees a partially applied
+batch. The platform plugins (leveldb, indexeddb, nativescript-sqlite,
+react-native-leveldb) wrap `StoreModule`, so they inherit `false`.
+
+### 5. Backing Host (Materialized-View Backing Tables)
 
 A module may volunteer to host materialized-view backing tables by implementing
 the optional `getBackingHost` hook — presence of the method is the capability

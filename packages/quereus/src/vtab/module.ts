@@ -140,6 +140,34 @@ export interface VirtualTableModule<
 	readonly scanSnapshotIsolation?: boolean;
 
 	/**
+	 * Declares that a connection opened with the `_readCommitted` connect option
+	 * serves a STABLE, self-consistent snapshot of committed state for the life of
+	 * the scan — see `docs/module-authoring.md` § "Committed-snapshot reads
+	 * (`_readCommitted`)" for the full obligation an out-of-tree module takes on.
+	 *
+	 * In one sentence: such a connection must serve a state that is consistent as
+	 * of some commit boundary at or before the moment the read began, and must keep
+	 * serving that same state for the whole scan — across another connection's
+	 * commit landing mid-iteration, across concurrent DDL on that table, and across
+	 * index-driven access paths (an index-driven plan and a full scan of the same
+	 * connection must agree).
+	 *
+	 * Omit (default `false`) to decline the engine's concurrent committed-read
+	 * path; reads against this module then keep taking today's serialized path.
+	 * Declining is not a defect — `_readCommitted` on its own still means only
+	 * "do not show me the writer's staged rows", which is a weaker promise and is
+	 * all several out-of-tree modules implement.
+	 *
+	 * **Orthogonal to {@link concurrencyMode}.** That enum answers "may the runtime
+	 * issue concurrent calls on ONE connection?"; the committed-read path opens its
+	 * own separate connection, so intra-connection reentrancy is not what is at
+	 * stake. What is at stake is whether the module's shared, cross-connection
+	 * state tears while a commit publishes. A `'fully-reentrant'` module can still
+	 * publish commits incrementally, so reusing that enum would over-promise.
+	 */
+	readonly readCommittedSnapshot?: boolean;
+
+	/**
 	 * Creates the persistent definition of a virtual table.
 	 * Called by CREATE VIRTUAL TABLE to define schema and initialize storage.
 	 *

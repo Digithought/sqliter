@@ -281,6 +281,25 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Inherits the underlying module's committed-snapshot guarantee verbatim.
+	 *
+	 * The wrapper contributes no tearing of its own: `IsolatedTable.query` skips
+	 * the per-connection overlay entirely for a `readCommitted` table and delegates
+	 * straight to the underlying, so a committed read never touches overlay state a
+	 * concurrent writer is staging into. The wrapper can therefore be exactly as
+	 * good as what it wraps — `true` over `MemoryTableModule`, `false` over
+	 * `StoreModule`.
+	 *
+	 * A getter, not a stored field, for the same two reasons as `concurrencyMode`
+	 * above: the underlying's value is read live each time, and a concrete boolean
+	 * (never `undefined`) satisfies the optional `readCommittedSnapshot?` under
+	 * `exactOptionalPropertyTypes`.
+	 */
+	get readCommittedSnapshot(): boolean {
+		return this.underlying.readCommittedSnapshot === true;
+	}
+
+	/**
 	 * Gets the underlying table state for a table.
 	 */
 	getUnderlyingState(schemaName: string, tableName: string): UnderlyingTableState | undefined {

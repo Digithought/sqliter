@@ -159,6 +159,44 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 */
 	readonly scanSnapshotIsolation = true as const;
 
+	/**
+	 * A `_readCommitted` connection on a memory table serves a stable, coherent
+	 * committed snapshot for the life of the scan, so it may be read outside the
+	 * execution mutex while another connection commits. Audited against four
+	 * points — re-verify all four before touching any of them:
+	 *
+	 * 1. **Commit publishes atomically.** Layers are immutable BTrees and a commit
+	 *    hands over by a single assignment to `_currentCommittedLayer`
+	 *    (`layer/manager.ts` — `commitTransaction`, `replaceAllRows`, `destroy`,
+	 *    `consolidateToBaseLayer`). A reader sees either the pre- or the
+	 *    post-commit root, never a mix.
+	 * 2. **The read connection is pinned and unregistered.** `_readCommitted`
+	 *    creates a fresh manager connection that is never handed to
+	 *    `Database.registerConnection` (`table.ts` — `ensureConnection`), so it
+	 *    never receives begin/commit/rollback/savepoint broadcasts and never joins
+	 *    the writer's transaction. Its `readLayer` is captured at connect time.
+	 * 3. **`query()` starts from the pinned layer.** `table.ts` reads
+	 *    `conn.readLayer` (not `pendingTransactionLayer`) in committed mode, and
+	 *    `scanLayerSync` captures the layer's BTree object once at scan start — a
+	 *    later whole-tree swap (DDL rebuild, consolidation) leaves the in-flight
+	 *    walk on its own tree: stale but coherent, which is the documented
+	 *    semantics.
+	 * 4. **Collapse cannot strand the pinned layer.** The connection IS in the
+	 *    manager's `connections` map, so `isLayerInUse` walks its `readLayer`
+	 *    chain and `promoteCommittedHead` refuses to `clearBase()` any layer that
+	 *    chain reaches; `MemoryTable.disconnect` releases it after the scan.
+	 *
+	 * Point 3 is the fragile one, and it rests on a property every DDL path in
+	 * `layer/base.ts` currently has: each rebuild REPLACES the tree object
+	 * (`rebuildPrimaryTreeFromRows`, `rebuildPrimaryTreeStrict`,
+	 * `rebuildAllSecondaryIndexes` — and `MemoryIndex.clear()` itself swaps in a
+	 * fresh BTree rather than emptying the live one). A rebuild that ever mutated a
+	 * published tree in place would empty the very structure a concurrent
+	 * index-driven committed read is walking, and the obligation requires an
+	 * index-driven plan and a full scan of one snapshot to agree.
+	 */
+	readonly readCommittedSnapshot = true as const;
+
 	public readonly tables: Map<string, MemoryTableManager> = new Map();
 	private eventEmitter?: VTableEventEmitter;
 

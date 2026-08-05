@@ -412,7 +412,18 @@ export class MemoryTable extends VirtualTable {
 		}
 	}
 
-	/** Disconnects this connection instance from the manager */
+	/**
+	 * Disconnects this connection instance from the manager.
+	 *
+	 * NOTE: for a `_readCommitted` instance this releases the pinned read layer's
+	 * protection — `MemoryTableManager.isLayerInUse` only sees connections still in
+	 * the manager's map, so once dropped, a layer collapse may `clearBase()` the
+	 * layer chain the snapshot was reading. Safe today because every caller
+	 * disconnects only after its `query()` iterator is exhausted or closed. If a
+	 * caller ever disconnects while an iterator is still live (a cancelled
+	 * concurrent read that tears down its scan connection eagerly, say), pin the
+	 * layer for the iterator's lifetime instead of relying on the connection.
+	 */
 	async disconnect(): Promise<void> {
 		if (this.connection) {
 			// Manager handles cleanup and potential layer collapse trigger

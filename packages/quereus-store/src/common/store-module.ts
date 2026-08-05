@@ -119,6 +119,23 @@ function sizeRequestFromLiveCount(
  */
 export class StoreModule extends StoreModuleRename implements VirtualTableModule<StoreTable, StoreModuleConfig>, StoreTableModule {
 	/**
+	 * Declines the engine's concurrent committed-read path. Declared explicitly
+	 * rather than left to the `false` default so the two reasons stay attached to
+	 * the code — both would have to be fixed before this could flip:
+	 *
+	 * - `connect` returns a SHARED cached `StoreTable` per table key, so the
+	 *   `_readCommitted` connect option is dropped on the floor: the "committed
+	 *   snapshot" reader gets the same instance the writer is using.
+	 * - `StoreTable.query` merges the coordinator's pending-op view over the
+	 *   committed store (read-your-own-writes — see the `getCapabilities` doc
+	 *   comment below), so a read taken while a commit flushes those ops observes
+	 *   a partially applied batch.
+	 *
+	 * See `docs/module-authoring.md` § "Committed-snapshot reads (`_readCommitted`)".
+	 */
+	readonly readCommittedSnapshot = false as const;
+
+	/**
 	 * Returns capability flags for this module.
 	 *
 	 * The base StoreModule does NOT provide transaction isolation: there is no

@@ -172,6 +172,12 @@ export class BaseLayer implements Layer {
 	 * Every index gets a FRESH `MemoryIndex` and BTree, so any layer inheriting the
 	 * old trees must be re-pointed at the new ones — that is
 	 * `TransactionLayer.adoptSchema`'s replacement path.
+	 *
+	 * Nothing here mutates a published structure in place: `MemoryIndex.clear()`
+	 * swaps in a new BTree rather than emptying the old one, and the map is then
+	 * replaced wholesale. That is what lets a `_readCommitted` scan — which
+	 * captures its index tree object at scan start — keep walking a coherent
+	 * pre-DDL snapshot while this runs (see `MemoryTableModule.readCommittedSnapshot`).
 	 */
 	public rebuildAllSecondaryIndexes(): void {
 		this.clearExistingSecondaryIndexes();

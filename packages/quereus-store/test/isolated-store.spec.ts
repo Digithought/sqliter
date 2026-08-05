@@ -189,6 +189,17 @@ describe('Isolated Store Module', () => {
 			// underlying DDL-commit, so the pessimistic value is the honest one.
 			expect(caps.ddlTransactionality).to.equal('auto-commit');
 		});
+
+		it('declines committed-snapshot reads, wrapped or not', () => {
+			// `connect` hands back a shared cached StoreTable per table key (so the
+			// `_readCommitted` option is dropped), and `StoreTable.query` merges the
+			// coordinator's pending ops over the committed store — a read taken during
+			// a commit flush would see a partially applied batch. The isolation wrapper
+			// inherits that verbatim, so the whole stack stays on the serialized read
+			// path. See docs/module-authoring.md § "Committed-snapshot reads".
+			expect(new StoreModule(provider).readCommittedSnapshot).to.equal(false);
+			expect(createIsolatedStoreModule({ provider }).readCommittedSnapshot).to.equal(false);
+		});
 	});
 
 	describe('table creation', () => {
