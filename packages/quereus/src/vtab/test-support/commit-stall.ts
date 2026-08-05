@@ -1,6 +1,18 @@
 import type { Database } from '../../core/database.js';
 import type { VirtualTableConnection } from '../connection.js';
-import type { CommitStallHandle } from './committed-read-conformance.js';
+
+/** Handle returned by `CommittedReadConformanceOptions.stallCommit`. */
+export interface CommitStallHandle {
+	/**
+	 * Optional. Resolves once a commit has actually ENTERED the stall. Supply it
+	 * when your gate can tell — the conformance harness then waits for the writer
+	 * to be provably parked before reading, instead of guessing with a settle
+	 * window.
+	 */
+	readonly entered?: Promise<void>;
+	/** Release the gate so the parked commit (and any later one) proceeds. Must be idempotent. */
+	release(): void;
+}
 
 /**
  * A gate that parks the next virtual-table commit on a database, so a read can
@@ -55,6 +67,10 @@ export function installCommitStall(db: Database): CommitStall {
 
 	const stall: CommitStall = {
 		arm() {
+			// Re-arming must not orphan a commit already parked on the previous gate:
+			// `release()` only resolves the CURRENT one, so an un-released predecessor
+			// would hang forever.
+			stall.release();
 			const entered = new Promise<void>(resolve => {
 				enteredResolve = resolve;
 			});
@@ -67,6 +83,7 @@ export function installCommitStall(db: Database): CommitStall {
 			gate = null;
 			releaseGate?.();
 			releaseGate = null;
+			enteredResolve = null;
 		},
 		asStallCommit() {
 			const entered = stall.arm();
@@ -74,4 +91,17 @@ export function installCommitStall(db: Database): CommitStall {
 		},
 	};
 	return stall;
+}
+
+/**
+ * Yield the event loop `macrotasks` times, so anything already pending has a fair
+ * chance to run: a commit to reach the gate, or a read to settle. Used to pin
+ * "this did NOT complete" without inventing a wall-clock timeout.
+ *
+ * `setTimeout` rather than `setImmediate` — the latter is Node-only.
+ */
+export async function settleMacrotasks(macrotasks = 20): Promise<void> {
+	for (let i = 0; i < macrotasks; i++) {
+		await new Promise<void>(resolve => setTimeout(resolve, 0));
+	}
 }

@@ -10,7 +10,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, asyncIterableToArray, installCommitStall, runCommittedReadConformance, type DatabaseInternal, type VirtualTableConnection } from '@quereus/quereus';
+import { Database, MemoryTableModule, asyncIterableToArray, installCommitStall, runCommittedReadConformance, settleMacrotasks, type DatabaseInternal, type VirtualTableConnection } from '@quereus/quereus';
 import { IsolationModule } from '@quereus/isolation';
 import {
 	createIsolatedStoreModule,
@@ -240,7 +240,7 @@ describe('Isolated Store Module', () => {
 			const read = db.get('SELECT count(*) AS n FROM fallback_t', undefined, { readConcurrency: 'committed' })
 				.then(row => { settled = true; return row; }, err => { settled = true; throw err; });
 
-			for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setTimeout(resolve, 0));
+			await settleMacrotasks();
 			expect(settled, 'a store-backed read must NOT run mutex-free past a parked commit').to.equal(false);
 
 			stall.release();

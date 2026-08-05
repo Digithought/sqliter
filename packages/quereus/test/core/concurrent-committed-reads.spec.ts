@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { AbortError } from '../../src/common/errors.js';
-import { installCommitStall, type CommitStall } from '../../src/vtab/test-support/commit-stall.js';
+import { installCommitStall, settleMacrotasks, type CommitStall } from '../../src/vtab/test-support/commit-stall.js';
 import type { SqlValue } from '../../src/common/types.js';
 
 /**
@@ -22,13 +22,6 @@ async function collect(iter: AsyncIterable<Record<string, SqlValue>>): Promise<R
 	return rows;
 }
 
-/** Give a pending promise a fair chance to settle across several macrotasks. */
-async function settleWindow(): Promise<void> {
-	for (let i = 0; i < 20; i++) {
-		await new Promise<void>(resolve => setImmediate(resolve));
-	}
-}
-
 /**
  * Assert that `work` is queued behind the parked writer — i.e. it took the
  * SERIALIZED path. Gives it a fair settle window, pins that it has not resolved,
@@ -40,7 +33,7 @@ async function expectSerialized<T>(stall: CommitStall, work: Promise<T>): Promis
 		value => { settled = true; return value; },
 		error => { settled = true; throw error; },
 	);
-	await settleWindow();
+	await settleMacrotasks();
 	expect(settled, 'statement resolved without waiting for the parked writer').to.equal(false);
 	stall.release();
 	return tracked;

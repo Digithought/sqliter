@@ -14,6 +14,21 @@ function keyToString(value: SqlValue): string {
 }
 
 /**
+ * Replace `table.query` with a version that pipes its rows through `transform`.
+ * Shared by the stubs below so each one only has to express its own misbehaviour.
+ */
+function interceptQuery(
+	table: MemoryTable,
+	transform: (source: AsyncIterable<Row>, filterInfo: FilterInfo, pkIndex: number) => AsyncIterable<Row>,
+): MemoryTable {
+	const originalQuery = table.query.bind(table);
+	const pkIndex = table.tableSchema?.primaryKeyDefinition?.[0]?.index ?? 0;
+	table.query = (filterInfo: FilterInfo): AsyncIterable<Row> =>
+		transform(originalQuery(filterInfo), filterInfo, pkIndex);
+	return table;
+}
+
+/**
  * Which committed-read access paths the {@link TornPublishModule} tears on.
  *
  * - `'all'` — every committed read leaks, so the full scan catches it first.
@@ -58,10 +73,8 @@ export class TornPublishModule extends MemoryTableModule {
 		const pkIndex = table.tableSchema?.primaryKeyDefinition?.[0]?.index ?? 0;
 
 		if (readCommitted) {
-			const originalQuery = table.query.bind(table);
 			const scope = this.scope;
-			table.query = (filterInfo: FilterInfo): AsyncIterable<Row> => {
-				const source = originalQuery(filterInfo);
+			return interceptQuery(table, (source, filterInfo, keyIndex) => {
 				const path = filterInfo.accessPath;
 				const isSeek = path?.kind === 'index' && path.plan !== 'scan';
 				if (scope === 'seek' && !isSeek) return source;
@@ -71,7 +84,7 @@ export class TornPublishModule extends MemoryTableModule {
 				return (async function* () {
 					let leaked = 0;
 					for await (const row of source) {
-						const stagedRow = staged.get(keyToString(row[pkIndex]));
+						const stagedRow = staged.get(keyToString(row[keyIndex]));
 						if (stagedRow && leaked < leakLimit) {
 							leaked++;
 							yield stagedRow;
@@ -80,8 +93,7 @@ export class TornPublishModule extends MemoryTableModule {
 						}
 					}
 				})();
-			};
-			return table;
+			});
 		}
 
 		const originalUpdate = table.update.bind(table);
@@ -109,6 +121,61 @@ export class TornPublishModule extends MemoryTableModule {
 	): Promise<MemoryTable> {
 		const table = await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema);
 		return this.instrument(table, options?._readCommitted === true);
+	}
+}
+
+/**
+ * A DELIBERATELY non-conformant module of the opposite kind: it never tears, but
+ * it never ADVANCES either. The first time a key is served, that row is pinned
+ * forever, so every later read — including ordinary, non-committed ones after the
+ * writer has landed — replays the stale value.
+ *
+ * Pins a module that passes every mid-commit check and still fails the run: it is
+ * the only thing exercising the harness's post-commit "the snapshot must advance"
+ * step.
+ */
+export class StaleSnapshotModule extends MemoryTableModule {
+	/** First row ever served for a key, per table: table → key → row. */
+	private readonly pinned = new Map<string, Map<string, Row>>();
+
+	private pinFirstSeen(table: MemoryTable): MemoryTable {
+		const key = table.tableName.toLowerCase();
+		let rows = this.pinned.get(key);
+		if (!rows) {
+			rows = new Map();
+			this.pinned.set(key, rows);
+		}
+		const byKey = rows;
+		return interceptQuery(table, (source, _filterInfo, pkIndex) => (async function* () {
+			for await (const row of source) {
+				const rowKey = keyToString(row[pkIndex]);
+				const first = byKey.get(rowKey);
+				if (first) {
+					yield first;
+				} else {
+					byKey.set(rowKey, row);
+					yield row;
+				}
+			}
+		})());
+	}
+
+	override async create(db: Database, tableSchema: TableSchema): Promise<MemoryTable> {
+		return this.pinFirstSeen(await super.create(db, tableSchema));
+	}
+
+	override async connect(
+		db: Database,
+		pAux: unknown,
+		moduleName: string,
+		schemaName: string,
+		tableName: string,
+		options: MemoryTableConfig,
+		tableSchema?: TableSchema,
+	): Promise<MemoryTable> {
+		return this.pinFirstSeen(
+			await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema),
+		);
 	}
 }
 

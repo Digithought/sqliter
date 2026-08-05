@@ -64,7 +64,9 @@ and never changes what a normal read or write of the same table is served.
 Once that holds, `IsolationModule.readCommittedSnapshot` becomes the underlying's
 value rather than a hard `false` (`isolation-module.ts` ~line 283), the wrapper
 case in the committed-read conformance suite flips from "must refuse" to "must
-pass" (`tickets/implement/3-concurrent-reads-conformance`), and the mid-flush
+pass" — flip the `ISOLATION_SERVES_COMMITTED_SNAPSHOT` constant in
+`packages/quereus-isolation/test/isolation-layer.spec.ts`, which today gates an
+unexecuted "asserts a pass" branch — and the mid-flush
 tearing test in `isolation-layer.spec.ts` ("a committed read shares the writer
 underlying handle, so a mid-flush read tears") inverts to assert the pre-flush row
 set.

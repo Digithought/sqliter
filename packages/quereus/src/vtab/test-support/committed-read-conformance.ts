@@ -3,6 +3,7 @@ import type { SqlValue } from '../../common/types.js';
 import { PlanNode } from '../../planner/nodes/plan-node.js';
 import { TableReferenceNode } from '../../planner/nodes/reference.js';
 import { getModuleReadCommittedSnapshot } from '../concurrency.js';
+import { settleMacrotasks, type CommitStallHandle } from './commit-stall.js';
 
 /**
  * Conformance check for the committed-snapshot obligation a virtual-table module
@@ -16,18 +17,6 @@ import { getModuleReadCommittedSnapshot } from '../concurrency.js';
  * package because an out-of-tree module author needs it at runtime; nothing in
  * the engine imports it.
  */
-
-/** Handle returned by {@link CommittedReadConformanceOptions.stallCommit}. */
-export interface CommitStallHandle {
-	/**
-	 * Optional. Resolves once a commit has actually ENTERED the stall. Supply it
-	 * when your gate can tell — the harness then waits for the writer to be
-	 * provably parked before reading, instead of guessing with a settle window.
-	 */
-	readonly entered?: Promise<void>;
-	/** Release the gate so the parked commit (and any later one) proceeds. Must be idempotent. */
-	release(): void;
-}
 
 export interface CommittedReadConformanceOptions {
 	/** Database with the module under test registered and the table created. */
@@ -213,7 +202,14 @@ function describeDivergences(
 	return parts.length > 0 ? parts.join('; ') : '(no per-row divergence — the row sets match)';
 }
 
-/** Reject after `ms` with a message that names the likely cause. */
+/**
+ * Reject after `ms` with a message that names the likely cause.
+ *
+ * NOTE: the timed-out read is abandoned, not cancelled — it drains on its own once
+ * the stall is released (which the run always does), and its rejection is already
+ * handled here. If the harness ever gains a mode that keeps running on the same
+ * database after a timeout, give it a real cancellation instead.
+ */
 function withStallTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
 		const timer = setTimeout(() => {
@@ -252,15 +248,7 @@ function withStallTimeout<T>(work: Promise<T>, ms: number, what: string): Promis
 export async function runCommittedReadConformance(
 	options: CommittedReadConformanceOptions,
 ): Promise<CommittedReadConformanceResult> {
-	const {
-		db,
-		table,
-		keyColumn,
-		valueColumn,
-		stallCommit,
-		rowCount = 200,
-		stallTimeoutMs = 5000,
-	} = options;
+	const { db, table, keyColumn, valueColumn, rowCount = 200 } = options;
 
 	if (!Number.isInteger(rowCount) || rowCount < 2) {
 		throw new Error(`committed-read conformance: rowCount must be an integer >= 2, got ${rowCount}`);
@@ -268,7 +256,66 @@ export async function runCommittedReadConformance(
 
 	assertModuleDeclaresSnapshot(db, table);
 
+	const plan = buildRunPlan(table, keyColumn, valueColumn, rowCount);
+	await assertTableEmpty(db, table, plan.projection);
+
+	// From here on the table holds the harness's rows, so every exit path — thrown
+	// assertion, thrown engine error, or success — has to clear them.
+	await db.exec(plan.seedSql);
+	try {
+		const result = await runAgainstSeededTable(options, plan);
+		await cleanup(db, table, undefined);
+		return result;
+	} catch (e) {
+		await cleanup(db, table, e);
+		throw e;
+	}
+}
+
+/** Everything the run needs derived from the caller's options: SQL, and the two whole states. */
+interface RunPlan {
+	readonly projection: string;
+	readonly indexDrivenSql: string;
+	readonly seedSql: string;
+	readonly writerSql: string;
+	readonly keyColumn: string;
+	readonly highKey: number;
+	readonly rowCount: number;
+	readonly expectedPre: readonly SnapshotRow[];
+	readonly expectedPost: readonly SnapshotRow[];
+}
+
+function buildRunPlan(table: string, keyColumn: string, valueColumn: string, rowCount: number): RunPlan {
+	// Seeded band is 1..rowCount; the writer appends rowCount+1..highKey.
+	const appendCount = Math.max(1, Math.floor(rowCount / 10));
+	const highKey = rowCount + appendCount;
+	const keys = (count: number) => Array.from({ length: count }, (_, i) => i + 1);
+	const tuples = (count: number, value: (k: number) => string) =>
+		keys(count).map(k => `(${k}, '${value(k)}')`).join(', ');
+
+	// Both legs project identically; only the predicate differs. The range covers
+	// the appended keys too, so an index-driven read of a torn publish is short or
+	// long in exactly the way the full scan is.
 	const projection = `select ${keyColumn} as ${KEY_ALIAS}, ${valueColumn} as ${VALUE_ALIAS} from ${table}`;
+
+	return {
+		projection,
+		indexDrivenSql: `${projection} where ${keyColumn} >= 1 and ${keyColumn} <= ${highKey}`,
+		seedSql: `insert into ${table} (${keyColumn}, ${valueColumn}) values ${tuples(rowCount, seedValue)}`,
+		// A single statement, so it commits once: `or replace` rewrites every seeded
+		// row's value AND appends new keys. A torn publish therefore shows up two
+		// ways — as a mix of old and new values, and as a longer result set.
+		writerSql: `insert or replace into ${table} (${keyColumn}, ${valueColumn}) values ${tuples(highKey, postValue)}`,
+		keyColumn,
+		highKey,
+		rowCount,
+		expectedPre: keys(rowCount).map(k => ({ key: String(k), value: seedValue(k) })),
+		expectedPost: keys(highKey).map(k => ({ key: String(k), value: postValue(k) })),
+	};
+}
+
+/** The harness owns the table's contents for the run, so it refuses to share it. */
+async function assertTableEmpty(db: Database, table: string, projection: string): Promise<void> {
 	const existing = await collectSnapshot(db, projection);
 	if (existing.length > 0) {
 		throw new Error(
@@ -276,136 +323,151 @@ export async function runCommittedReadConformance(
 			`The harness owns the table's contents for the run and deletes what it wrote on the way out.`,
 		);
 	}
+}
 
-	// Seeded band is 1..rowCount; the writer appends rowCount+1..highKey.
-	const appendCount = Math.max(1, Math.floor(rowCount / 10));
-	const highKey = rowCount + appendCount;
-	const seedKeys = Array.from({ length: rowCount }, (_, i) => i + 1);
-	const expectedPre: SnapshotRow[] = seedKeys.map(k => ({ key: String(k), value: seedValue(k) }));
-	const expectedPost: SnapshotRow[] = Array.from(
-		{ length: highKey },
-		(_, i) => ({ key: String(i + 1), value: postValue(i + 1) }),
-	);
+/** Steps 3–6, with the seeded rows already committed. Always throws or returns; never cleans up. */
+async function runAgainstSeededTable(
+	options: CommittedReadConformanceOptions,
+	plan: RunPlan,
+): Promise<CommittedReadConformanceResult> {
+	const { db, valueColumn, stallCommit, stallTimeoutMs = 5000 } = options;
 
-	const tuples = (keys: number[], value: (k: number) => string) =>
-		keys.map(k => `(${k}, '${value(k)}')`).join(', ');
-
-	await db.exec(`insert into ${table} (${keyColumn}, ${valueColumn}) values ${tuples(seedKeys, seedValue)}`);
-
-	// A single statement, so it commits once: `or replace` rewrites every seeded
-	// row's value AND appends new keys. A torn publish therefore shows up two
-	// ways — as a mix of old and new values, and as a longer result set.
-	const writerKeys = Array.from({ length: highKey }, (_, i) => i + 1);
-	const writerSql =
-		`insert or replace into ${table} (${keyColumn}, ${valueColumn}) values ${tuples(writerKeys, postValue)}`;
-
-	// Both legs project identically; only the predicate differs. The range covers
-	// the appended keys too, so an index-driven read of a torn publish is short or
-	// long in exactly the way the full scan is.
-	const fullScanSql = projection;
-	const indexDrivenSql = `${projection} where ${keyColumn} >= 1 and ${keyColumn} <= ${highKey}`;
-
-	// Probe the plan BEFORE anything parks — `query_plan()` is an ordinary
-	// statement and would queue behind the stalled writer.
-	const indexOps = await planOperators(db, indexDrivenSql);
-	const indexSeekPlanned = indexOps.includes('INDEXSEEK');
-	const indexDrivenSkippedReason = indexSeekPlanned
-		? undefined
-		: `the planner did not choose a seek for a range predicate on '${keyColumn}' (plan operators: ${indexOps.join(', ')}); ` +
-		  `the index-driven leg was skipped rather than run as a second full scan`;
+	const { seekPlanned, indexDrivenSkippedReason } = await probeIndexPath(db, plan);
 
 	const handle = stallCommit?.();
-	let writerSettled = false;
-	const writer = db.exec(writerSql);
-	const trackedWriter = writer.then(
-		() => { writerSettled = true; },
-		error => { writerSettled = true; throw error; },
-	);
-	// Keep an unhandled rejection from escaping before the awaited read below.
-	trackedWriter.catch(() => { /* re-thrown at the awaited join */ });
-
-	let fullScan: SnapshotRow[] = [];
-	let indexDriven: SnapshotRow[] = [];
-	let parkedForReads = false;
-	let readError: unknown;
-
 	try {
-		if (handle) {
-			if (handle.entered) {
-				// Deterministic: proceed once a commit is provably inside the gate. If
-				// the writer finished first there was no window at all.
-				await Promise.race([handle.entered, trackedWriter]);
-			} else {
-				await settleWindow();
-			}
-		}
-		parkedForReads = handle !== undefined && !writerSettled;
+		const writer = startWriter(db, plan.writerSql);
 
-		const guard = <T>(work: Promise<T>, what: string): Promise<T> =>
-			parkedForReads ? withStallTimeout(work, stallTimeoutMs, what) : work;
-
-		fullScan = await guard(collectSnapshot(db, fullScanSql, { readCommitted: true }), 'the full-scan read');
-		if (indexSeekPlanned) {
-			indexDriven = await guard(
-				collectSnapshot(db, indexDrivenSql, { readCommitted: true }),
-				'the index-driven read',
-			);
-		}
-		if (parkedForReads && writerSettled) {
-			// The writer landed while we were reading, so neither read is evidence of
-			// anything: the "committed snapshot" they saw may simply be the new state.
-			parkedForReads = false;
-		}
-
-		// Parked: the commit provably had NOT landed, so the pre-write snapshot is the
-		// only correct answer. Not parked: the writer may have committed before either
-		// read began, and serving the post-write state is then equally correct — so
-		// accept either whole state, but never a mix of the two (that is a tear no
-		// interleaving excuses).
-		const acceptable = parkedForReads ? [expectedPre] : [expectedPre, expectedPost];
-		assertCoherent('full scan', fullScan, acceptable, valueColumn, parkedForReads);
-		if (indexSeekPlanned) {
-			assertCoherent('index-driven read', indexDriven, acceptable, valueColumn, parkedForReads);
-			// Only meaningful while the writer is parked: unparked, the two legs run at
-			// different times and may legitimately straddle the commit.
-			if (parkedForReads) assertLegsAgree(fullScan, indexDriven);
-		}
-	} catch (e) {
-		readError = e;
-	}
-
-	handle?.release();
-	try {
-		await trackedWriter;
-	} catch (e) {
-		if (readError === undefined) readError = e;
-	}
-
-	if (readError === undefined) {
+		let outcome: ReadOutcome | undefined;
+		let readError: unknown;
 		try {
-			await assertAdvancesAfterCommit(db, projection, highKey, rowCount);
+			outcome = await observeConcurrentReads({
+				db, plan, valueColumn, handle, writer, seekPlanned, stallTimeoutMs,
+			});
 		} catch (e) {
 			readError = e;
 		}
+
+		handle?.release();
+		try {
+			await writer.promise;
+		} catch (e) {
+			if (readError === undefined) readError = e;
+		}
+		if (readError !== undefined) throw readError;
+		if (!outcome) throw new Error('committed-read conformance: internal error — the reads produced no outcome');
+
+		await assertAdvancesAfterCommit(db, plan);
+
+		return {
+			observedCommitOverlap: outcome.parked,
+			fullScanRows: outcome.fullScan.length,
+			indexDrivenRows: outcome.indexDriven.length,
+			...(indexDrivenSkippedReason !== undefined ? { indexDrivenSkippedReason } : {}),
+		};
+	} finally {
+		// Idempotent by contract. Covers the paths that throw before the explicit
+		// release above — an armed gate left behind would park the cleanup delete
+		// and hang the caller instead of reporting the real failure.
+		handle?.release();
 	}
+}
 
-	await cleanup(db, table, readError);
-
-	if (readError !== undefined) throw readError;
-
+/**
+ * Does the planner really seek for the index-driven leg? Probed BEFORE anything
+ * parks — `query_plan()` is an ordinary statement and would queue behind the
+ * stalled writer.
+ */
+async function probeIndexPath(
+	db: Database,
+	plan: RunPlan,
+): Promise<{ seekPlanned: boolean; indexDrivenSkippedReason?: string }> {
+	const ops = await planOperators(db, plan.indexDrivenSql);
+	if (ops.includes('INDEXSEEK')) return { seekPlanned: true };
 	return {
-		observedCommitOverlap: parkedForReads,
-		fullScanRows: fullScan.length,
-		indexDrivenRows: indexDriven.length,
-		...(indexDrivenSkippedReason !== undefined ? { indexDrivenSkippedReason } : {}),
+		seekPlanned: false,
+		indexDrivenSkippedReason:
+			`the planner did not choose a seek for a range predicate on '${plan.keyColumn}' (plan operators: ${ops.join(', ')}); ` +
+			`the index-driven leg was skipped rather than run as a second full scan`,
 	};
 }
 
-/** Give a pending commit a fair chance to reach the gate across several macrotasks. */
-async function settleWindow(): Promise<void> {
-	for (let i = 0; i < 20; i++) {
-		await new Promise<void>(resolve => setTimeout(resolve, 0));
+/** An unawaited writer whose settlement can be sampled synchronously. */
+interface TrackedWriter {
+	readonly promise: Promise<void>;
+	settled(): boolean;
+}
+
+function startWriter(db: Database, sql: string): TrackedWriter {
+	let settled = false;
+	const promise = db.exec(sql).then(
+		() => { settled = true; },
+		error => { settled = true; throw error; },
+	);
+	// Keep an unhandled rejection from escaping before the awaited join below.
+	promise.catch(() => { /* re-thrown where the run joins the writer */ });
+	return { promise, settled: () => settled };
+}
+
+interface ReadOutcome {
+	readonly fullScan: readonly SnapshotRow[];
+	readonly indexDriven: readonly SnapshotRow[];
+	/** True only if the writer stayed parked for the whole of both reads. */
+	readonly parked: boolean;
+}
+
+interface ObserveArgs {
+	db: Database;
+	plan: RunPlan;
+	valueColumn: string;
+	handle: CommitStallHandle | undefined;
+	writer: TrackedWriter;
+	seekPlanned: boolean;
+	stallTimeoutMs: number;
+}
+
+/** Steps 4–5: read twice while the writer is parked, and judge what came back. */
+async function observeConcurrentReads(args: ObserveArgs): Promise<ReadOutcome> {
+	const { db, plan, valueColumn, handle, writer, seekPlanned, stallTimeoutMs } = args;
+
+	if (handle) {
+		if (handle.entered) {
+			// Deterministic: proceed once a commit is provably inside the gate. If the
+			// writer finished first there was no window at all.
+			await Promise.race([handle.entered, writer.promise]);
+		} else {
+			await settleMacrotasks();
+		}
 	}
+	let parked = handle !== undefined && !writer.settled();
+
+	const guard = <T>(work: Promise<T>, what: string): Promise<T> =>
+		parked ? withStallTimeout(work, stallTimeoutMs, what) : work;
+
+	const fullScan = await guard(collectSnapshot(db, plan.projection, { readCommitted: true }), 'the full-scan read');
+	const indexDriven = seekPlanned
+		? await guard(collectSnapshot(db, plan.indexDrivenSql, { readCommitted: true }), 'the index-driven read')
+		: [];
+	if (parked && writer.settled()) {
+		// The writer landed while we were reading, so neither read is evidence of
+		// anything: the "committed snapshot" they saw may simply be the new state.
+		parked = false;
+	}
+
+	// Parked: the commit provably had NOT landed, so the pre-write snapshot is the
+	// only correct answer. Not parked: the writer may have committed before either
+	// read began, and serving the post-write state is then equally correct — so
+	// accept either whole state, but never a mix of the two (that is a tear no
+	// interleaving excuses).
+	const acceptable = parked ? [plan.expectedPre] : [plan.expectedPre, plan.expectedPost];
+	assertCoherent('full scan', fullScan, acceptable, valueColumn, parked);
+	if (seekPlanned) {
+		assertCoherent('index-driven read', indexDriven, acceptable, valueColumn, parked);
+		// Only meaningful while the writer is parked: unparked, the two legs run at
+		// different times and may legitimately straddle the commit.
+		if (parked) assertLegsAgree(fullScan, indexDriven);
+	}
+	return { fullScan, indexDriven, parked };
 }
 
 /** Row-for-row equality, in key order. */
@@ -452,16 +514,11 @@ function assertLegsAgree(fullScan: readonly SnapshotRow[], indexDriven: readonly
  * Step 6: a module that pins a snapshot but never advances it would pass every
  * check above. After the writer lands, a fresh read must see the new state.
  */
-async function assertAdvancesAfterCommit(
-	db: Database,
-	projection: string,
-	highKey: number,
-	rowCount: number,
-): Promise<void> {
-	const after = await collectSnapshot(db, projection);
-	if (after.length !== highKey) {
+async function assertAdvancesAfterCommit(db: Database, plan: RunPlan): Promise<void> {
+	const after = await collectSnapshot(db, plan.projection);
+	if (after.length !== plan.highKey) {
 		throw new Error(
-			`committed-read conformance: after the writer committed, a fresh read returned ${after.length} rows, expected ${highKey}. ` +
+			`committed-read conformance: after the writer committed, a fresh read returned ${after.length} rows, expected ${plan.highKey}. ` +
 			`The module is serving a stale snapshot to ordinary reads.`,
 		);
 	}
@@ -470,7 +527,7 @@ async function assertAdvancesAfterCommit(
 		throw new Error(
 			`committed-read conformance: after the writer committed, ${stale.length} of ${after.length} rows still held their pre-write value ` +
 			`(first: key ${stale[0].key} = ${JSON.stringify(stale[0].value)}). A pinned snapshot must advance once the commit lands ` +
-			`— seeding was ${rowCount} rows.`,
+			`— seeding was ${plan.rowCount} rows.`,
 		);
 	}
 }

@@ -3,7 +3,7 @@ import { Database } from '../../src/core/database.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { runCommittedReadConformance } from '../../src/vtab/test-support/committed-read-conformance.js';
 import { installCommitStall, type CommitStall } from '../../src/vtab/test-support/commit-stall.js';
-import { NoSeekMemoryModule, TornPublishModule } from '../vtab/_conformance-stub-modules.js';
+import { NoSeekMemoryModule, StaleSnapshotModule, TornPublishModule } from '../vtab/_conformance-stub-modules.js';
 
 /**
  * `runCommittedReadConformance` is the runnable form of the obligation a module
@@ -157,6 +157,86 @@ describe('committed-read conformance harness', () => {
 		expect(result.fullScanRows).to.equal(20);
 		expect(result.indexDrivenRows, 'skipped, not silently rerun as a full scan').to.equal(0);
 		expect(result.indexDrivenSkippedReason).to.contain('seek');
+	});
+
+	it('fails a module that pins a snapshot and never advances it', async () => {
+		// The mirror image of a torn publish, and the reason step 6 exists: this
+		// module is perfectly coherent mid-commit and still wrong, because an
+		// ordinary read taken after the writer landed replays the pre-write value.
+		db.registerModule('stale', new StaleSnapshotModule());
+		await db.exec('create table conf (id integer primary key, v text) using stale');
+
+		const error = await captureError(runCommittedReadConformance({
+			db,
+			table: 'conf',
+			keyColumn: 'id',
+			valueColumn: 'v',
+			rowCount: 20,
+			stallCommit: () => stall.asStallCommit(),
+		}));
+
+		expect(error).to.contain('still held their pre-write value');
+		expect(error).to.contain('crc-seed-1');
+	});
+
+	it('rejects a rowCount it cannot seed a meaningful snapshot from', async () => {
+		await db.exec('create table conf (id integer primary key, v text)');
+		const error = await captureError(runCommittedReadConformance({
+			db, table: 'conf', keyColumn: 'id', valueColumn: 'v', rowCount: 1,
+		}));
+		expect(error).to.contain('rowCount must be an integer >= 2');
+	});
+
+	it('clears its rows even when the run fails partway', async () => {
+		db.registerModule('torn', new TornPublishModule());
+		await db.exec('create table conf (id integer primary key, v text) using torn');
+
+		await captureError(runCommittedReadConformance({
+			db, table: 'conf', keyColumn: 'id', valueColumn: 'v', rowCount: 20,
+			stallCommit: () => stall.asStallCommit(),
+		}));
+
+		const after = await db.get('select count(*) as n from conf');
+		expect(Number(after?.n), 'a failed run must not strand its seeded rows').to.equal(0);
+	});
+
+	it('clears its rows when the failure comes from the caller, before any read', async () => {
+		await db.exec('create table conf (id integer primary key, v text)');
+
+		const error = await captureError(runCommittedReadConformance({
+			db, table: 'conf', keyColumn: 'id', valueColumn: 'v', rowCount: 20,
+			stallCommit: () => { throw new Error("the caller's gate blew up"); },
+		}));
+
+		expect(error).to.contain("the caller's gate blew up");
+		const after = await db.get('select count(*) as n from conf');
+		expect(Number(after?.n), 'seeding happens before this point, so it must still be undone').to.equal(0);
+	});
+});
+
+describe('installCommitStall', () => {
+	it('re-arming releases a commit already parked on the previous gate', async () => {
+		const db = new Database();
+		const stall = installCommitStall(db);
+		try {
+			await db.exec('create table t (id integer primary key)');
+
+			const entered = stall.arm();
+			const writer = db.exec('insert into t values (1)');
+			await entered;
+
+			// Without the release-on-re-arm, this writer would wait on a gate nobody
+			// holds a resolver for any more, and the test would time out.
+			void stall.arm();
+			stall.release();
+			await writer;
+
+			const row = await db.get('select count(*) as n from t');
+			expect(Number(row?.n)).to.equal(1);
+		} finally {
+			stall.release();
+			await db.close();
+		}
 	});
 });
 
