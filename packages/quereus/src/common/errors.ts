@@ -71,6 +71,28 @@ export class RollbackConflictError extends ConstraintError {
 }
 
 /**
+ * Error thrown when a statement names a table or view that does not resolve —
+ * the object is absent, or the schema qualifying it is not attached.
+ *
+ * Distinct from the generic `QuereusError` so callers can positively recognise
+ * "the relation is not there" without matching message text. Deliberately scoped
+ * to *relations* only: a missing column, function, parameter, or tag is a
+ * different failure and must not be reported through this class, since callers
+ * use it to decide that "no such row" is an observed fact rather than a failed
+ * lookup.
+ *
+ * Carries `StatusCode.NOTFOUND`, but note that code is shared with several
+ * unrelated absent-object errors — the class / `name` is the discriminator.
+ */
+export class RelationNotFoundError extends QuereusError {
+	constructor(message: string, cause?: Error, line?: number, column?: number) {
+		super(message, StatusCode.NOTFOUND, cause, line, column);
+		this.name = 'RelationNotFoundError';
+		Object.setPrototypeOf(this, RelationNotFoundError.prototype);
+	}
+}
+
+/**
  * Error thrown when an in-flight statement is cancelled via an `AbortSignal`
  * (e.g. a request-timeout). Extends `QuereusError` (so it survives the engine's
  * `instanceof QuereusError` re-throw paths unchanged) while exposing the web

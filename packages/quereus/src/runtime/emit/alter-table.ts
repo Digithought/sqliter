@@ -4,7 +4,7 @@ import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
 import { createRowSlot } from '../context-helpers.js';
-import { QuereusError } from '../../common/errors.js';
+import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition } from '../../schema/table.js';
@@ -1965,7 +1965,7 @@ async function runSetMaintained(
 ): Promise<SqlValue> {
 	const live = schema.getTable(tableSchema.name);
 	if (!live) {
-		throw new QuereusError(`no such table: ${tableSchema.name}`, StatusCode.ERROR);
+		throw new RelationNotFoundError(`no such table: ${tableSchema.name}`);
 	}
 	const explicit = columns !== undefined && columns.length > 0;
 	// Any omitted-insert defaults ride inside `select` (→ derivation.selectAst).

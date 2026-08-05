@@ -3,7 +3,7 @@ import type { TableSchema } from '../../schema/table.js';
 import type { FunctionSchema } from '../../schema/function.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import type { CollationFunction } from '../../util/comparison.js';
-import { QuereusError } from '../../common/errors.js';
+import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 
@@ -45,9 +45,9 @@ export function resolveTableSchema(
 		// Resolve table schema with explicit schema name
 		const tableSchema = ctx.schemaManager.findTable(tableName, resolvedSchemaName);
 		if (!tableSchema) {
-			throw new QuereusError(
-				`Table not found: ${resolvedSchemaName}.${tableName}`,
-				StatusCode.ERROR
+			// Message text is asserted on by the sqllogic suites — keep it byte-identical.
+			throw new RelationNotFoundError(
+				`Table not found: ${resolvedSchemaName}.${tableName}`
 			);
 		}
 
@@ -103,7 +103,7 @@ export function resolveTableSchema(
 			}
 		}
 
-		throw new QuereusError(errorMsg, StatusCode.ERROR);
+		throw new RelationNotFoundError(errorMsg);
 	}
 
 	// Record dependency

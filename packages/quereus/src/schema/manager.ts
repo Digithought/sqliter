@@ -4,7 +4,7 @@ import type { IntegrityAssertionSchema } from './assertion.js';
 import type { Database } from '../core/database.js';
 import type { TableSchema, RowConstraintSchema, IndexSchema, IndexColumnSchema, MutationContextDefinition, ForeignKeyConstraintSchema, UniqueConstraintSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
-import { quereusError, QuereusError } from '../common/errors.js';
+import { quereusError, QuereusError, RelationNotFoundError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type { AnyVirtualTableModule, BaseModuleConfig } from '../vtab/module.js';
 import type { VirtualTable } from '../vtab/table.js';
@@ -2368,7 +2368,7 @@ export class SchemaManager {
 
 		const tableSchema = this.getTable(targetSchemaName, tableName);
 		if (!tableSchema) {
-			throw new QuereusError(`no such table: ${tableName}`, StatusCode.ERROR, undefined, stmt.table.loc?.start.line, stmt.table.loc?.start.column);
+			throw new RelationNotFoundError(`no such table: ${tableName}`, undefined, stmt.table.loc?.start.line, stmt.table.loc?.start.column);
 		}
 
 		const vtabModule = requireVtabModule(tableSchema);
