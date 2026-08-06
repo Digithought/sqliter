@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-06T01:50:46.429Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\4-bug-schema-object-dependency-tracking.plan.2026-08-06T01-50-46-428Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Renaming or dropping something in the schema updates only some of the other objects that referred to it, and rewrites some things that were never references at all — so views, integrity rules and whole databases can silently stop working after an ordinary rename or drop.
 files:
   - packages/quereus/src/schema/rename-rewriter.ts                  # renameTableInAst / renameColumnInAst / visitTableRename / tableReferencedInAst / columnReferencedInAst — the name walk shared by every arm
