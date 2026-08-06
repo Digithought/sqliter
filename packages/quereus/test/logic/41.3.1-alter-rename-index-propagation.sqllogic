@@ -72,3 +72,23 @@ create index ix_idxc on t_idxc(v + 1);
 -- error: not supported
 
 drop table if exists t_idxc;
+
+-- ===================================
+-- 8. RENAME of a table literally named `new` DOES rewrite its partial-index predicate
+-- ===================================
+-- Deliberate asymmetry with the CHECK arm (41.3 §47): a partial-index predicate
+-- describes rows already stored — there is no written-row context — so `new.x` in the
+-- predicate is an ordinary table-qualified reference and must follow the rename, or
+-- the stored predicate would name a vanished table.
+
+create table "new" (id integer primary key, x integer not null);
+create index ix_new_pos on "new"(x) where new.x > 0;
+
+alter table "new" rename to fresh;
+
+insert into fresh values (1, 5), (2, -1);
+
+select x from fresh where x > 0 order by x;
+→ [{"x":5}]
+
+drop table fresh;

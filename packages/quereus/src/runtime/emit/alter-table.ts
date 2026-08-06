@@ -2195,7 +2195,9 @@ function rewriteTableForTableRename(
 	let changed = false;
 
 	const newChecks = table.checkConstraints.map(cc => {
-		const rewrote = renameTableInAst(cc.expr, oldName, newName, renamedSchemaLower);
+		// rowImageContext: a CHECK evaluates against the row being written, so a bare
+		// `new.a` / `old.a` names the row image — never a table called `new` / `old`.
+		const rewrote = renameTableInAst(cc.expr, oldName, newName, renamedSchemaLower, { rowImageContext: true });
 		if (!rewrote) return cc;
 		changed = true;
 		return { ...cc };

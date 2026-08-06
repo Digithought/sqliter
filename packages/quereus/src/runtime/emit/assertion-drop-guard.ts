@@ -23,7 +23,10 @@ export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
  * "Refers to" is decided by {@link tableReferencedInAst}, the read-only run of
  * the very walker `ALTER TABLE … RENAME` uses to rewrite dependent bodies, so
  * the guard refuses exactly the references a rename would have followed and the
- * two definitions cannot drift.
+ * two definitions cannot drift. The walk is scope-aware: an assertion whose
+ * body merely DECLARES a same-named CTE (`with t as (…) … from t`) or binds the
+ * name as a FROM alias does not reference the real table, so it no longer
+ * blocks the drop.
  *
  * Scope is the dropped object's OWN schema, matching
  * `propagateTableRenameToAssertions`: an assertion's unqualified names resolve

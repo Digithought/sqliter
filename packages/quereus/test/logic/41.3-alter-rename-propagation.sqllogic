@@ -1290,10 +1290,10 @@ drop table u_tgen2;
 -- main.u_tsch must leave it alone. Rewriting it would leave the default naming a table
 -- temp does not have and `t_tsch` would stop accepting rows.
 --
--- The alias/CTE shadowing shape (a subquery source ALIASED to the renamed table's name)
--- is deliberately not pinned here — the table walker keeps no scope frame at all, which
--- is tracked as `bug-table-rename-rewrites-cte-references`; when that lands it fixes all
--- four arms (checks, predicates, defaults, generated bodies) at once.
+-- The alias/CTE shadowing shapes are pinned in §42-§47 below: the table walker is
+-- scope-aware, so a name the body itself binds (a CTE, a FROM alias, a subquery source)
+-- is not a reference and is left untouched across all four arms (checks, predicates,
+-- defaults, generated bodies).
 
 create table temp.u_tsch (k integer primary key, v integer);
 insert into temp.u_tsch values (1, 11);
@@ -1313,3 +1313,153 @@ select id, w from t_tsch;
 drop table t_tsch;
 drop table u_tsch2;
 drop table temp.u_tsch;
+
+-- ===================================
+-- 42. RENAME TO leaves a view CTE that SHADOWS the old name untouched
+-- ===================================
+-- The `from zap` inside the view resolves to the view's own CTE, not the real table,
+-- so the rename must not touch the body. Pre-fix the walk rewrote it to `from zap2`,
+-- silently repointing the view at the real (renamed) table while its declared CTE
+-- went unused.
+
+create table zap (id integer primary key, k integer);
+insert into zap values (1, 100);
+
+create view v_shadow as with zap as (select 1 as k) select k from zap;
+
+alter table zap rename to zap2;
+
+-- the view still returns its CTE's row, not the renamed table's
+select k from v_shadow;
+→ [{"k":1}]
+
+-- and the real table is reachable under its new name
+select k from zap2;
+→ [{"k":100}]
+
+drop view v_shadow;
+drop table zap2;
+
+-- ===================================
+-- 43. DROP TABLE is NOT refused for an assertion whose body only DECLARES a same-named CTE
+-- ===================================
+-- The drop guard runs the same walk read-only, so it inherited the over-match as a
+-- FALSE REFUSAL: an assertion that merely declares `with zap as (…)` blocked
+-- `drop table zap`. The walk is scope-aware now, so the drop goes through — and the
+-- assertion (which never read the real table) keeps evaluating on later writes.
+
+create table zap (id integer primary key, k integer);
+create table t_asrt_other (id integer primary key);
+
+create assertion a_shadow check (not exists (with zap as (select 1 as k) select k from zap where k < 0));
+
+drop table zap;
+
+-- writes elsewhere still recompile and pass the assertion
+insert into t_asrt_other values (1);
+
+select count(*) as cnt from t_asrt_other;
+→ [{"cnt":1}]
+
+drop assertion a_shadow;
+drop table t_asrt_other;
+
+-- ===================================
+-- 44. An ALIASED SUBQUERY SOURCE named like the renamed table is untouched
+-- ===================================
+-- `(select 5 as k) zap` binds the name to the derived table; `zap.k` resolves through
+-- that alias. Pre-fix the qualified ref rewrote to `zap2.k` (while the alias stayed
+-- `zap`), leaving the view unplannable.
+
+create table zap (id integer primary key, k integer);
+insert into zap values (1, 100);
+
+create view v_sub as select zap.k from (select 5 as k) zap;
+
+alter table zap rename to zap2;
+
+select k from v_sub;
+→ [{"k":5}]
+
+drop view v_sub;
+drop table zap2;
+
+-- ===================================
+-- 45. An ALIASED TABLE SOURCE `from other zap` binds `zap.k` to OTHER, not the renamed table
+-- ===================================
+-- The alias `zap` qualifies rows of t_alias_other; renaming the real `zap` must leave
+-- both the alias and the qualified ref alone.
+
+create table zap (id integer primary key, k integer);
+insert into zap values (1, 100);
+
+create table t_alias_other (id integer primary key, k integer);
+insert into t_alias_other values (1, 7);
+
+create view v_alias as select zap.k from t_alias_other zap;
+
+alter table zap rename to zap3;
+
+select k from v_alias;
+→ [{"k":7}]
+
+drop view v_alias;
+drop table t_alias_other;
+drop table zap3;
+
+-- ===================================
+-- 46. Positive regressions: genuine references still rewrite under shadow-adjacent shapes
+-- ===================================
+-- Scope-awareness must not under-match: (a) a `from zap` inside a CTE BODY is a real
+-- reference (the CTE's own name is not in scope in a non-recursive body); (b) a
+-- schema-qualified `main.zap` is never a CTE, even where a same-named CTE is in scope;
+-- (c) an aliased real source `from zap z` still reads the real table.
+
+create table zap (id integer primary key, k integer);
+insert into zap values (1, 42);
+
+create view v_pos1 as with c as (select k from zap) select k from c;
+-- (The three-part `main.zap.k` COLUMN ref is pinned at the AST level in
+-- test/schema/table-rename-scope.spec.ts; the planner does not resolve that
+-- spelling in a view body today.)
+create view v_pos2 as with zap as (select 1 as k) select k from main.zap;
+create view v_pos3 as select z.k from zap z;
+
+alter table zap rename to zap4;
+
+select k from v_pos1;
+→ [{"k":42}]
+
+select k from v_pos2;
+→ [{"k":42}]
+
+select k from v_pos3;
+→ [{"k":42}]
+
+drop view v_pos3;
+drop view v_pos2;
+drop view v_pos1;
+drop table zap4;
+
+-- ===================================
+-- 47. RENAME of a table literally named `new` leaves its CHECK's row image alone
+-- ===================================
+-- `new` is not a reserved word, so `create table "new"` is legal — and inside that
+-- table's own CHECK, `new.a` names the ROW BEING WRITTEN, not the table. Pre-fix the
+-- rename rewrote the qualifier to the new table name; now the row image survives and
+-- the constraint keeps enforcing. (The partial-index mirror — where `new.x` IS a real
+-- reference — lives in 41.3.1 §8.)
+
+create table "new" (id integer primary key, a integer, constraint chk_fresh check (new.a > 0));
+
+alter table "new" rename to fresh;
+
+insert into fresh values (1, -5);
+-- error: CHECK constraint failed: chk_fresh
+
+insert into fresh values (2, 5);
+
+select id, a from fresh;
+→ [{"id":2,"a":5}]
+
+drop table fresh;

@@ -1322,10 +1322,12 @@ function declaredColumnCollation(declaredTable: AST.DeclaredTable | undefined, c
  * (oldName) can match another inverse input (newName). This keeps a partial index
  * over a renamed column AND/OR a qualified self-reference under a renamed table from
  * churning, while a genuine predicate edit layered on either rename still differs
- * (recreate). `schemaName` is the default schema for both rewriters. Known accepted
- * edge (symmetric with the forward path): the rewriters are scope-naive about a
- * subquery alias that happens to equal a renamed table's new name — worst case a
- * spurious (valid) recreate.
+ * (recreate). `schemaName` is the default schema for both rewriters. The TABLE
+ * rewriter is scope-aware (an alias- or CTE-bound qualifier is not a table
+ * reference and is skipped, forward and inverse alike); known accepted edge
+ * (symmetric with the forward path): the COLUMN rewriter stays scope-naive about
+ * a subquery-source alias that happens to equal a renamed table's name — worst
+ * case a spurious (valid) recreate.
  */
 function declaredIndexCanonicalBody(
 	indexStmt: AST.CreateIndexStmt,
@@ -1737,7 +1739,11 @@ function reconciledDeclaredBody(
 			// rename's inverse output can match another's inverse input — order is
 			// immaterial and equivalent to simultaneous substitution.
 			for (const r of tableRenames) {
-				renameTableInAst(clone.expr!, r.newName, r.oldName, schemaName);
+				// rowImageContext, matching the forward propagation's CHECK arm: a bare
+				// `new.` / `old.` in a CHECK names the row image, so the inverse
+				// reconcile must leave it alone exactly as the forward rewrite does —
+				// otherwise a table renamed to/from `new` would churn the constraint.
+				renameTableInAst(clone.expr!, r.newName, r.oldName, schemaName, { rowImageContext: true });
 			}
 			for (const r of colRenames) {
 				// Inverse: rewrite the declared NEW column name back to its OLD name.
