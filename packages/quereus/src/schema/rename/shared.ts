@@ -3,17 +3,49 @@ import type * as AST from '../../parser/ast.js';
 /**
  * Vocabulary shared by the three rename/strip walkers in this directory
  * (table rename, column rename, self-qualifier strip): case-insensitive name
- * comparison, schema-qualifier matching, the catalog-resolver callback type,
- * and the collection-rewrite helper their entry points are built on.
+ * comparison, planner-parity object-reference resolution (the
+ * {@link ResolveObjectRef} callback and its canonical key), the
+ * column-resolver callback type, and the collection-rewrite helper their
+ * entry points are built on.
  */
 
 export const eq = (a: string | undefined, b: string | undefined): boolean =>
 	(a ?? '').toLowerCase() === (b ?? '').toLowerCase();
 
-export const schemaMatches = (
-	nodeSchema: string | undefined,
-	defaultSchema: string,
-): boolean => nodeSchema === undefined || eq(nodeSchema, defaultSchema);
+/**
+ * Resolves a table / view / materialized-view reference as written in a stored
+ * body to its canonical `<schema>.<name>` key (both lowercase) — the same
+ * answer the planner would give for that body, i.e. against the owning
+ * object's home schema path, NOT against whatever single "default schema" a
+ * caller happens to hold. `undefined` only when the resolver cannot be
+ * consulted at all; a name that resolves nowhere still yields a stable key
+ * (the home schema's) so probe and rewrite stay total.
+ *
+ * The catalog-backed builder lives in `schema/object-ref-resolver.ts`
+ * (`buildObjectRefResolver` / `snapshotObjectRefResolvers`), next to
+ * `buildColumnSourceResolver` and for the same reason: the walkers here stay
+ * free of catalog imports. {@link singleSchemaObjectRefResolver} below covers
+ * the contexts that have no catalog (the schema differ's declared world).
+ */
+export type ResolveObjectRef = (schema: string | undefined, name: string) => string | undefined;
+
+/** The canonical object key {@link ResolveObjectRef} deals in: `<schema>.<name>`, both lowercase. */
+export const objectRefKey = (schemaName: string, objectName: string): string =>
+	`${schemaName.toLowerCase()}.${objectName.toLowerCase()}`;
+
+/**
+ * {@link ResolveObjectRef} for a world where every unqualified name belongs to
+ * exactly one schema: the schema differ's declared catalog (single-schema by
+ * construction) and any other context with no live catalog to consult. A
+ * qualified name means what it says; an unqualified one keys under
+ * `schemaName`. This intentionally reproduces what the old
+ * `schemaMatches(nodeSchema, defaultSchema)` equality decided, so the differ's
+ * inverse reconcile keeps parity with the store-module forward rewrites (whose
+ * catalog-backed resolver gives the same answers for a single-schema catalog).
+ */
+export function singleSchemaObjectRefResolver(schemaName: string): ResolveObjectRef {
+	return (schema, name) => objectRefKey(schema ?? schemaName, name);
+}
 
 /**
  * Returns whether the named source table has a column matching the renamed

@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import { schemaMatches, type ResolveColumnInSource } from './shared.js';
+import { eq, type ResolveColumnInSource } from './shared.js';
 
 // ──────────────────────────────────────────────────────────────────────
 // Self-qualifier strip (CHECK expressions)
@@ -280,7 +280,11 @@ function stripColumnQualifier(col: AST.ColumnExpr, state: StripState): void {
 		if (state.stack[i].bound.has(qualifier)) return;
 	}
 	if (qualifier !== state.tableName) return;
-	if (!schemaMatches(col.schema, state.defaultSchema)) return;
+	// A qualified self-reference must name the OWNING table's schema exactly —
+	// `defaultSchema` here is the CHECK's owning schema (the caller passes
+	// `tableSchema.schemaName`), so no path resolution applies: `main.t.qty` in
+	// a CHECK on `temp.t` is not a self-reference.
+	if (!(col.schema === undefined || eq(col.schema, state.defaultSchema))) return;
 	// Strip only when no intervening frame could capture the unqualified name.
 	const colLower = col.name.toLowerCase();
 	for (let i = 1; i < state.stack.length; i++) {

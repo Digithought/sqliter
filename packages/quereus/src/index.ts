@@ -231,8 +231,15 @@ export {
 	renameColumnInIndexPredicates, renameTableInIndexPredicates,
 	renameColumnInCheckConstraints, renameTableInCheckConstraints,
 	renameColumnInColumnExpressions, renameTableInColumnExpressions,
+	objectRefKey, singleSchemaObjectRefResolver,
 } from './schema/rename-rewriter.js';
-export type { ResolveColumnInSource } from './schema/rename-rewriter.js';
+export type { ResolveColumnInSource, ResolveObjectRef } from './schema/rename-rewriter.js';
+// Planner-parity object-reference resolution for the rename walkers above: a
+// module rewriting stored bodies must resolve references the way the planner
+// does (home schema path), from a snapshot taken BEFORE the statement's first
+// catalog mutation — see the builder's doc comment.
+export { buildObjectRefResolver, snapshotObjectRefResolvers } from './schema/object-ref-resolver.js';
+export type { ObjectRefResolvers } from './schema/object-ref-resolver.js';
 // Reserved-tag namespace surface — `@quereus/quereus-store` keys its sync-replication
 // opt-in off SYNC_REPLICATE_TAG (DRY: one literal) and reads it via getReservedTag.
 // `@quereus/sync` keys its per-table eviction override off SYNC_EVICT_TAG.

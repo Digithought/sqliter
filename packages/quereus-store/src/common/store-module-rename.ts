@@ -13,6 +13,8 @@ import type { Database, DatabaseInternal, TableSchema } from '@quereus/quereus';
 import {
 	QuereusError,
 	StatusCode,
+	buildObjectRefResolver,
+	objectRefKey,
 	renameTableInCheckConstraints,
 	renameTableInColumnExpressions,
 	renameTableInIndexPredicates,
@@ -219,10 +221,18 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 			// semantic one. Revisit if a CHECK ever gains a legal bare qualifier naming a
 			// table OTHER than its own; then the reverse pass needs the same per-walk
 			// changed-set the residual above wants.
+			// Planner-parity resolution, snapshotted here — this hook runs before the
+			// engine's catalog swap, so the snapshot sees the pre-rename catalog. The
+			// reverse pass reuses the same snapshot with the NEW name's key: the new
+			// name resolves nowhere in the snapshot, so the resolver's miss→home
+			// fallback keys it under this schema, which is exactly where the forward
+			// pass just wrote it.
+			const resolveRef = buildObjectRefResolver(db, schemaName);
 			const rewriteTable = (from: string, to: string): void => {
-				renameTableInIndexPredicates(currentSchema.indexes, from, to, schemaName);
-				renameTableInCheckConstraints(currentSchema.checkConstraints, from, to, schemaName);
-				renameTableInColumnExpressions(currentSchema.columns, from, to, schemaName);
+				const fromKey = objectRefKey(schemaName, from);
+				renameTableInIndexPredicates(currentSchema.indexes, from, to, resolveRef, fromKey);
+				renameTableInCheckConstraints(currentSchema.checkConstraints, from, to, resolveRef, fromKey);
+				renameTableInColumnExpressions(currentSchema.columns, from, to, resolveRef, fromKey);
 			};
 			try {
 				rewriteTable(oldName, newName);

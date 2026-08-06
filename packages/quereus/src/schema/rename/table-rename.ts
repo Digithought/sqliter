@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import { eq, schemaMatches, rewriteEach } from './shared.js';
+import { eq, rewriteEach, type ResolveObjectRef } from './shared.js';
 
 /**
  * Scope-aware, in-place table-reference walker: propagates
@@ -84,17 +84,27 @@ interface TableRefWalkState {
 	stop: boolean;
 }
 
+/**
+ * `resolve` / `targetKey` decide matching for both entry points below: a
+ * reference matches when `resolve(ref.schema, ref.name)` — the reference's
+ * planner-parity resolution under the WALKED BODY's home schema path — equals
+ * `targetKey`, the canonical key (`objectRefKey(schema, name)`) of the object
+ * being renamed / probed. The bare-name equality check in front is a pure
+ * short-circuit: the resolver echoes the name it is given into the key, so a
+ * reference spelled differently can never resolve to the target.
+ */
 export function renameTableInAst(
 	node: AST.AstNode | undefined,
 	oldName: string,
 	newName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	opts?: TableRenameOpts,
 ): boolean {
 	if (!node) return false;
 	let changed = false;
 	walkTableRefs(node, ref => {
-		if (eq(ref.name, oldName) && schemaMatches(ref.schema, defaultSchemaName)) {
+		if (eq(ref.name, oldName) && resolve(ref.schema, ref.name) === targetKey) {
 			ref.setName(newName);
 			changed = true;
 		}
@@ -103,8 +113,8 @@ export function renameTableInAst(
 }
 
 /**
- * Whether `node` refers to the table/view `name` in schema `defaultSchemaName` —
- * read-only, nothing is mutated.
+ * Whether `node` refers to the table/view identified by `targetKey` (spelled
+ * `name`) — read-only, nothing is mutated.
  *
  * Deliberately the SAME traversal {@link renameTableInAst} uses — both are
  * sinks over {@link visitTableRefs} — so "refers to" can never drift from
@@ -123,13 +133,14 @@ export function renameTableInAst(
 export function tableReferencedInAst(
 	node: AST.AstNode | undefined,
 	name: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	opts?: TableRenameOpts,
 ): boolean {
 	if (!node) return false;
 	let found = false;
 	walkTableRefs(node, ref => {
-		if (eq(ref.name, name) && schemaMatches(ref.schema, defaultSchemaName)) {
+		if (eq(ref.name, name) && resolve(ref.schema, ref.name) === targetKey) {
 			found = true;
 			return true;
 		}
@@ -157,10 +168,11 @@ export function renameTableInIndexPredicates(
 	indexes: ReadonlyArray<{ readonly predicate?: AST.Expression }> | undefined,
 	oldName: string,
 	newName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 ): boolean {
 	return rewriteEach(indexes, idx => idx.predicate,
-		expr => renameTableInAst(expr, oldName, newName, defaultSchemaName));
+		expr => renameTableInAst(expr, oldName, newName, resolve, targetKey));
 }
 
 /**
@@ -180,10 +192,11 @@ export function renameTableInCheckConstraints(
 	checks: ReadonlyArray<{ readonly expr: AST.Expression }> | undefined,
 	oldName: string,
 	newName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 ): boolean {
 	return rewriteEach(checks, cc => cc.expr,
-		expr => renameTableInAst(expr, oldName, newName, defaultSchemaName, { rowImageContext: true }));
+		expr => renameTableInAst(expr, oldName, newName, resolve, targetKey, { rowImageContext: true }));
 }
 
 /**
@@ -219,10 +232,11 @@ export function renameTableInColumnExpressions(
 	}> | undefined,
 	oldName: string,
 	newName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 ): boolean {
 	const rewrite = (expr: AST.Expression): boolean =>
-		renameTableInAst(expr, oldName, newName, defaultSchemaName, { rowImageContext: true });
+		renameTableInAst(expr, oldName, newName, resolve, targetKey, { rowImageContext: true });
 	// Both walks always run — `||` on the results, not short-circuited between them.
 	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
 	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);

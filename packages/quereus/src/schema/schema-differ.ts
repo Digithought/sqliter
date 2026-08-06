@@ -8,7 +8,7 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst } from './rename-rewriter.js';
+import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver } from './rename-rewriter.js';
 import type { ResolveColumnInSource } from './rename-rewriter.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
@@ -887,8 +887,12 @@ export function computeSchemaDiff(
 	// objects at once, index the assertion bodies by referenced name instead of
 	// re-walking per pair.
 	const droppedInThisDiff = [...diff.tablesToDrop, ...diff.viewsToDrop];
+	// Declared world is single-schema, so the single-schema resolver reproduces
+	// exactly what the forward walkers resolve for these bodies.
+	const resolveDeclaredRef = singleSchemaObjectRefResolver(targetSchemaName);
 	const namesDroppedObject = (check: AST.Expression): boolean =>
-		droppedInThisDiff.some(dropped => tableReferencedInAst(check, dropped, targetSchemaName));
+		droppedInThisDiff.some(dropped => tableReferencedInAst(
+			check, dropped, resolveDeclaredRef, objectRefKey(targetSchemaName, dropped)));
 
 	for (const [name, declaredAssertion] of declaredAssertions) {
 		const matchedActual = actualAssertions.get(name);
@@ -1362,8 +1366,10 @@ function declaredIndexCanonicalBody(
 	let where = indexStmt.where;
 	if (where && (colRenames.length > 0 || tableRenames.length > 0)) {
 		const clone = cloneExpr(where);
+		const resolveRef = singleSchemaObjectRefResolver(schemaName);
 		for (const r of tableRenames) {
-			renameTableInAst(clone, r.newName, r.oldName, schemaName);
+			// Inverse: references to the declared NEW name resolve back to its key.
+			renameTableInAst(clone, r.newName, r.oldName, resolveRef, objectRefKey(schemaName, r.newName));
 		}
 		// The index's OWN table rename retains one special role: seeding the
 		// column rewrites with that table's OLD name (matched by the declared/
@@ -1373,7 +1379,8 @@ function declaredIndexCanonicalBody(
 		);
 		const seedTableName = ownRename?.oldName ?? indexStmt.table.name;
 		for (const r of colRenames) {
-			renameColumnInCheckExpression(clone, seedTableName, r.newName, r.oldName, schemaName);
+			renameColumnInCheckExpression(clone, seedTableName, r.newName, r.oldName,
+				resolveRef, objectRefKey(schemaName, seedTableName));
 		}
 		where = clone;
 	}
@@ -1449,14 +1456,16 @@ function inverseRenamedViewParts(
 	resolveDeclaredColumn: ResolveColumnInSource,
 ): AST.QueryExpr {
 	const selectClone = cloneQueryExpr(select);
+	const resolveRef = singleSchemaObjectRefResolver(schemaName);
 	for (const r of tableRenames) {
-		renameTableInAst(selectClone, r.newName, r.oldName, schemaName);
+		renameTableInAst(selectClone, r.newName, r.oldName, resolveRef, objectRefKey(schemaName, r.newName));
 	}
 	for (const [declaredTableName, colRenames] of columnRenamesByTable) {
 		const ownRename = tableRenames.find(r => r.newName.toLowerCase() === declaredTableName);
 		const seedTableName = ownRename?.oldName ?? declaredTableName;
 		for (const r of colRenames) {
-			renameColumnInAst(selectClone, seedTableName, r.newName, r.oldName, schemaName, resolveDeclaredColumn);
+			renameColumnInAst(selectClone, seedTableName, r.newName, r.oldName,
+				resolveRef, objectRefKey(schemaName, seedTableName), resolveDeclaredColumn);
 		}
 	}
 	return selectClone;
@@ -1533,14 +1542,17 @@ function columnReconciledIndexStmt(
 	let where = stmt.where;
 	if (where) {
 		const clone = cloneExpr(where);
+		const resolveRef = singleSchemaObjectRefResolver(schemaName);
 		for (const r of colRenames) {
-			renameColumnInCheckExpression(clone, stmt.table.name, r.newName, r.oldName, schemaName);
+			renameColumnInCheckExpression(clone, stmt.table.name, r.newName, r.oldName,
+				resolveRef, objectRefKey(schemaName, stmt.table.name));
 		}
 		const ownTableLower = stmt.table.name.toLowerCase();
 		for (const [declaredTableName, renames] of columnRenamesByTable) {
 			if (declaredTableName === ownTableLower) continue;
 			for (const r of renames) {
-				renameColumnInAst(clone, declaredTableName, r.newName, r.oldName, schemaName);
+				renameColumnInAst(clone, declaredTableName, r.newName, r.oldName,
+					resolveRef, objectRefKey(schemaName, declaredTableName));
 			}
 		}
 		where = clone;
@@ -1728,6 +1740,7 @@ function reconciledDeclaredBody(
 			if (!tc.expr) return d.definition;
 			// cloneExpr: the rewriters mutate in place; bodyAst backs ddl/definition.
 			const clone: AST.TableConstraint = { ...tc, expr: cloneExpr(tc.expr) };
+			const resolveRef = singleSchemaObjectRefResolver(schemaName);
 			// Qualifiers first: any qualified reference in the declared CHECK carries
 			// a NEW table name (a self-reference after the owning table's rename, or a
 			// cross-table reference inside a subquery after THAT table's rename);
@@ -1743,7 +1756,8 @@ function reconciledDeclaredBody(
 				// `new.` / `old.` in a CHECK names the row image, so the inverse
 				// reconcile must leave it alone exactly as the forward rewrite does —
 				// otherwise a table renamed to/from `new` would churn the constraint.
-				renameTableInAst(clone.expr!, r.newName, r.oldName, schemaName, { rowImageContext: true });
+				renameTableInAst(clone.expr!, r.newName, r.oldName,
+					resolveRef, objectRefKey(schemaName, r.newName), { rowImageContext: true });
 			}
 			for (const r of colRenames) {
 				// Inverse: rewrite the declared NEW column name back to its OLD name.
@@ -1752,7 +1766,8 @@ function reconciledDeclaredBody(
 				// NEW name (in the declared world) binds there, not to the owning
 				// seed, so it is NOT inverse-rewritten — mirroring the forward seeded
 				// call in `rewriteTableForColumnRename` (owning-table branch).
-				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName, schemaName, resolveDeclaredColumn);
+				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName,
+					resolveRef, objectRefKey(schemaName, tableName), resolveDeclaredColumn);
 			}
 			// Cross-table column renames: a subquery in this CHECK may reference
 			// ANOTHER table whose column was renamed in this same diff; the forward
@@ -1776,7 +1791,8 @@ function reconciledDeclaredBody(
 				const seedTableName = ownRename?.oldName ?? declaredTableName;
 				if (seedTableName.toLowerCase() === tableName.toLowerCase()) continue;
 				for (const r of renames) {
-					renameColumnInAst(clone.expr!, seedTableName, r.newName, r.oldName, schemaName);
+					renameColumnInAst(clone.expr!, seedTableName, r.newName, r.oldName,
+						resolveRef, objectRefKey(schemaName, seedTableName));
 				}
 			}
 			return constraintBodyToCanonicalString(clone);

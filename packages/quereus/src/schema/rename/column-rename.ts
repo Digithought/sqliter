@@ -1,6 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
-import { eq, rewriteEach, type ResolveColumnInSource } from './shared.js';
+import { eq, rewriteEach, type ResolveColumnInSource, type ResolveObjectRef } from './shared.js';
 
 /**
  * Scope-aware, in-place column-rename walkers: propagate `ALTER TABLE … RENAME
@@ -12,9 +12,14 @@ import { eq, rewriteEach, type ResolveColumnInSource } from './shared.js';
  */
 
 interface ScopeFrame {
-	/** Lowercase table names in scope without an alias (eligible for unqualified resolution). */
-	unaliased: Set<string>;
-	/** Lowercase alias → lowercase underlying table name. */
+	/**
+	 * Lowercase unaliased qualifier name (a source's bare table name, or an
+	 * exposing CTE's name) → resolved object key of the table it binds. A
+	 * value equal to the walk's target key marks a binding to the renamed
+	 * table, eligible for unqualified capture.
+	 */
+	unaliased: Map<string, string>;
+	/** Lowercase alias → resolved object key of the underlying table. */
 	aliasMap: Map<string, string>;
 	/** Lowercase CTE names declared in this WITH that re-expose the renamed column. */
 	ctesExposingRenamed: Set<string>;
@@ -28,15 +33,15 @@ interface ScopeFrame {
 	 */
 	ctesShadowingSource: Set<string>;
 	/**
-	 * Real-table sources in this frame's FROM, with their lowercase schema
-	 * and table names. Used by the unqualified-scope walk to ask whether
-	 * an inner FROM source exposes the renamed column — if it does, the
-	 * unqualified ref binds there and an outer seed binding to the renamed
-	 * table must not capture it. Aliased subquery / function-source /
-	 * CTE-shadowed sources are NOT recorded (the rewriter can't ask the
-	 * callback about those without recursive analysis).
+	 * Real-table sources in this frame's FROM, under their RESOLVED identity
+	 * (the object key plus its lowercase schema/name parts). Used by the
+	 * unqualified-scope walk to ask whether an inner FROM source exposes the
+	 * renamed column — if it does, the unqualified ref binds there and an
+	 * outer seed binding to the renamed table must not capture it. Aliased
+	 * subquery / function-source / CTE-shadowed sources are NOT recorded (the
+	 * rewriter can't ask the callback about those without recursive analysis).
 	 */
-	realSources: Array<{ schema: string; name: string }>;
+	realSources: Array<{ key: string; schemaLower: string; nameLower: string }>;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -64,7 +69,8 @@ export function renameColumnInAst(
 	tableName: string,
 	oldColName: string,
 	newColName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!node) return false;
@@ -72,7 +78,8 @@ export function renameColumnInAst(
 		tableName: tableName.toLowerCase(),
 		oldCol: oldColName.toLowerCase(),
 		newCol: newColName,
-		defaultSchema: defaultSchemaName.toLowerCase(),
+		resolveRef: resolve,
+		targetKey,
 		scopeStack: [],
 		changed: false,
 		resolveColumnInSource,
@@ -122,7 +129,8 @@ export function renameColumnInCheckExpression(
 	tableName: string,
 	oldColName: string,
 	newColName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!expr) return false;
@@ -130,14 +138,15 @@ export function renameColumnInCheckExpression(
 		tableName: tableName.toLowerCase(),
 		oldCol: oldColName.toLowerCase(),
 		newCol: newColName,
-		defaultSchema: defaultSchemaName.toLowerCase(),
+		resolveRef: resolve,
+		targetKey,
 		scopeStack: [],
 		changed: false,
 		resolveColumnInSource,
 		matchRowImageQualifier: true,
 	};
 	const frame = emptyFrame();
-	frame.unaliased.add(state.tableName);
+	frame.unaliased.set(state.tableName, state.targetKey);
 	state.scopeStack.push(frame);
 	try {
 		visitColumnRename(expr, state);
@@ -181,13 +190,14 @@ export function columnReferencedInAst(
 	node: AST.AstNode | undefined,
 	tableName: string,
 	columnName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!node) return false;
 	return renameColumnInAst(
 		spineCloneAst(node), tableName, columnName, PROBE_COLUMN_NAME,
-		defaultSchemaName, resolveColumnInSource);
+		resolve, targetKey, resolveColumnInSource);
 }
 
 /**
@@ -201,13 +211,14 @@ export function columnReferencedInCheckExpression(
 	expr: AST.AstNode | undefined,
 	tableName: string,
 	columnName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!expr) return false;
 	return renameColumnInCheckExpression(
 		spineCloneAst(expr), tableName, columnName, PROBE_COLUMN_NAME,
-		defaultSchemaName, resolveColumnInSource);
+		resolve, targetKey, resolveColumnInSource);
 }
 
 /**
@@ -240,11 +251,12 @@ export function renameColumnInIndexPredicates(
 	tableName: string,
 	oldColName: string,
 	newColName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	return rewriteEach(indexes, idx => idx.predicate, expr => renameColumnInCheckExpression(
-		expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource));
+		expr, tableName, oldColName, newColName, resolve, targetKey, resolveColumnInSource));
 }
 
 /**
@@ -262,11 +274,12 @@ export function renameColumnInCheckConstraints(
 	tableName: string,
 	oldColName: string,
 	newColName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	return rewriteEach(checks, cc => cc.expr, expr => renameColumnInCheckExpression(
-		expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource));
+		expr, tableName, oldColName, newColName, resolve, targetKey, resolveColumnInSource));
 }
 
 /**
@@ -312,11 +325,12 @@ export function renameColumnInColumnExpressions(
 	tableName: string,
 	oldColName: string,
 	newColName: string,
-	defaultSchemaName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	const rewrite = (expr: AST.Expression): boolean => renameColumnInCheckExpression(
-		expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource);
+		expr, tableName, oldColName, newColName, resolve, targetKey, resolveColumnInSource);
 	// Both walks always run — `||` on the results, not short-circuited between them.
 	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
 	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);
@@ -324,10 +338,14 @@ export function renameColumnInColumnExpressions(
 }
 
 interface ColumnRewriteState {
+	/** Lowercase bare name of the renamed table (seed qualifier, row-image and CTE bookkeeping). */
 	tableName: string;
 	oldCol: string;
 	newCol: string;
-	defaultSchema: string;
+	/** Planner-parity reference resolution under the walked body's home schema path. */
+	resolveRef: ResolveObjectRef;
+	/** Canonical key of the renamed table — what a reference must resolve to, to match. */
+	targetKey: string;
 	scopeStack: ScopeFrame[];
 	changed: boolean;
 	resolveColumnInSource?: ResolveColumnInSource;
@@ -343,7 +361,7 @@ interface ColumnRewriteState {
 
 function emptyFrame(): ScopeFrame {
 	return {
-		unaliased: new Set(),
+		unaliased: new Map(),
 		aliasMap: new Map(),
 		ctesExposingRenamed: new Set(),
 		ctesInScope: new Set(),
@@ -376,11 +394,13 @@ function collectFromBindings(
 			if (ts.table.schema === undefined && isCteInScope(state, name)) {
 				if (isCteExposingInScope(state, name)) {
 					if (ts.alias) {
-						frame.aliasMap.set(ts.alias.toLowerCase(), state.tableName);
+						frame.aliasMap.set(ts.alias.toLowerCase(), state.targetKey);
 					} else {
-						frame.unaliased.add(state.tableName);
-						// The CTE name acts as an implicit qualifier for refs like "a.k".
-						frame.aliasMap.set(name, state.tableName);
+						// Unqualified refs capture here, and the CTE name acts as
+						// an implicit qualifier for refs like "a.k" — both bind
+						// the renamed table's key through the CTE.
+						frame.unaliased.set(name, state.targetKey);
+						frame.aliasMap.set(name, state.targetKey);
 					}
 				} else {
 					// Shadowing-but-not-exposing: the source binds to the CTE
@@ -393,17 +413,29 @@ function collectFromBindings(
 				// Shadowing-but-not-exposing: do not bind as the renamed table.
 				break;
 			}
-			const schemaLower = (ts.table.schema ?? state.defaultSchema).toLowerCase();
+			// Resolve the source the way the planner would for this body: home
+			// schema path for an unqualified name, passthrough for a qualified
+			// one. The KEY is what every capture / qualifier decision compares —
+			// a bare `from t` binds the renamed table only when it RESOLVES to
+			// it, and `from other_schema.t z` never does just because the bare
+			// names collide.
+			const key = state.resolveRef(ts.table.schema, ts.table.name);
+			if (key === undefined) break;
 			if (ts.alias) {
-				frame.aliasMap.set(ts.alias.toLowerCase(), name);
-			} else if (schemaLower === state.defaultSchema || ts.table.schema === undefined) {
-				frame.unaliased.add(name);
+				frame.aliasMap.set(ts.alias.toLowerCase(), key);
+			} else {
+				frame.unaliased.set(name, key);
 			}
-			// Record as a real-table source so the unqualified-scope walk can
-			// ask whether this source exposes the renamed column. Both aliased
-			// and unaliased real sources are recorded — asking "does u expose
-			// col v" is the same question regardless of any alias.
-			frame.realSources.push({ schema: schemaLower, name });
+			// Record as a real-table source (under its RESOLVED schema) so the
+			// unqualified-scope walk can ask whether this source exposes the
+			// renamed column. Both aliased and unaliased real sources are
+			// recorded — asking "does u expose col v" is the same question
+			// regardless of any alias.
+			frame.realSources.push({
+				key,
+				schemaLower: key.slice(0, key.length - name.length - 1),
+				nameLower: name,
+			});
 			break;
 		}
 		case 'join': {
@@ -457,45 +489,49 @@ function isTableInUnaliasedScope(state: ColumnRewriteState): boolean {
 		if (state.resolveColumnInSource && frame.realSources.length > 0) {
 			for (const src of frame.realSources) {
 				// The renamed table itself trivially exposes oldCol; defer to
-				// the existing `unaliased` check below so we don't
-				// double-capture.
-				if (src.name === state.tableName && src.schema === state.defaultSchema) continue;
-				if (state.resolveColumnInSource(src.schema, src.name, state.oldCol)) return false;
+				// the binding check below so we don't double-capture.
+				if (src.key === state.targetKey) continue;
+				if (state.resolveColumnInSource(src.schemaLower, src.nameLower, state.oldCol)) return false;
 			}
 		}
-		if (frame.unaliased.has(state.tableName)) return true;
+		if (frameBindsTargetUnaliased(frame, state.targetKey)) return true;
+	}
+	return false;
+}
+
+/** Whether any unaliased binding in `frame` resolves to `targetKey`. */
+function frameBindsTargetUnaliased(frame: ScopeFrame, targetKey: string): boolean {
+	for (const key of frame.unaliased.values()) {
+		if (key === targetKey) return true;
 	}
 	return false;
 }
 
 /**
- * Innermost-first walk: a closer alias binding wins over an outer one
- * (standard SQL alias shadowing).
+ * Resolve a bare column qualifier innermost-first against the scope stack:
+ * the resolved key of the table it binds (through an alias, an unaliased
+ * source, or an exposing CTE), `null` when it binds something that is not the
+ * renamed real table and can never be (a non-exposing shadowing CTE, or a CTE
+ * merely in scope), or `undefined` when nothing in scope binds it. The
+ * innermost binding decides — standard SQL shadowing. Subquery / function
+ * sources are not recorded (pre-existing limitation, shared with the
+ * unqualified capture walk), so a qualifier bound only by one of those falls
+ * through to the caller's seedless fallback.
  */
-function aliasResolvesToTable(state: ColumnRewriteState, alias: string): boolean {
-	const aliasLower = alias.toLowerCase();
-	for (let i = state.scopeStack.length - 1; i >= 0; i--) {
-		const target = state.scopeStack[i].aliasMap.get(aliasLower);
-		if (target !== undefined) return target === state.tableName;
-	}
-	return false;
-}
-
-/**
- * Walk the scope stack innermost-first to decide whether a qualifier
- * resolves to a non-exposing shadowing CTE rather than the renamed real
- * table. A closer rebind to the real table (via unaliased binding or alias)
- * wins over an outer shadowing entry.
- */
-function isQualifierShadowedInScope(state: ColumnRewriteState, qualifier: string): boolean {
+function resolveQualifierBinding(
+	state: ColumnRewriteState,
+	qualifierLower: string,
+): string | null | undefined {
 	for (let i = state.scopeStack.length - 1; i >= 0; i--) {
 		const frame = state.scopeStack[i];
-		if (frame.ctesShadowingSource.has(qualifier)) return true;
-		// Closer rebind to the real table wins → not shadowed at this point.
-		if (frame.aliasMap.get(qualifier) === state.tableName) return false;
-		if (qualifier === state.tableName && frame.unaliased.has(state.tableName)) return false;
+		const viaAlias = frame.aliasMap.get(qualifierLower);
+		if (viaAlias !== undefined) return viaAlias;
+		const viaSource = frame.unaliased.get(qualifierLower);
+		if (viaSource !== undefined) return viaSource;
+		if (frame.ctesShadowingSource.has(qualifierLower)) return null;
+		if (frame.ctesInScope.has(qualifierLower)) return null;
 	}
-	return false;
+	return undefined;
 }
 
 /**
@@ -623,12 +659,12 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 					if (hasInverseClauses && !outputRenames.has(state.oldCol)) {
 						const starCoversRenamed = (stmt.columns ?? []).some(c => {
 							if (c.type !== 'all') return false;
-							const boundToRenamed = frame.unaliased.has(state.tableName)
-								|| [...frame.aliasMap.values()].includes(state.tableName);
+							const boundToRenamed = frameBindsTargetUnaliased(frame, state.targetKey)
+								|| [...frame.aliasMap.values()].includes(state.targetKey);
 							if (c.table === undefined) return boundToRenamed;
 							const q = c.table.toLowerCase();
-							return frame.aliasMap.get(q) === state.tableName
-								|| (q === state.tableName && frame.unaliased.has(state.tableName));
+							return frame.aliasMap.get(q) === state.targetKey
+								|| frame.unaliased.get(q) === state.targetKey;
 						});
 						const oldStillExposed = (stmt.columns ?? []).some(c => c.type === 'column'
 							&& (c.alias
@@ -667,9 +703,13 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 			const stmt = node as AST.InsertStmt;
 			pushWithFrame(stmt.withClause, state);
 			try {
-				const targetIsRenamed =
-					eq(stmt.table.name, state.tableName) &&
-					(stmt.table.schema === undefined || eq(stmt.table.schema, state.defaultSchema));
+				// Mirrors the planner's write-target rule (and the table walker's
+				// `visitDmlTarget`): an unqualified target naming a member of the
+				// statement's own leading WITH binds that CTE, not the renamed table.
+				const targetIsCte = stmt.table.schema === undefined &&
+					(stmt.withClause?.ctes ?? []).some(c => eq(c.name, stmt.table.name));
+				const targetIsRenamed = !targetIsCte &&
+					state.resolveRef(stmt.table.schema, stmt.table.name) === state.targetKey;
 				if (targetIsRenamed && stmt.columns) {
 					stmt.columns = stmt.columns.map(c => {
 						if (c.toLowerCase() === state.oldCol) {
@@ -718,9 +758,11 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 			const stmt = node as AST.UpdateStmt;
 			pushWithFrame(stmt.withClause, state);
 			try {
-				const targetIsRenamed =
-					eq(stmt.table.name, state.tableName) &&
-					(stmt.table.schema === undefined || eq(stmt.table.schema, state.defaultSchema));
+				// Same write-target rule as the insert arm above.
+				const targetIsCte = stmt.table.schema === undefined &&
+					(stmt.withClause?.ctes ?? []).some(c => eq(c.name, stmt.table.name));
+				const targetIsRenamed = !targetIsCte &&
+					state.resolveRef(stmt.table.schema, stmt.table.name) === state.targetKey;
 				if (targetIsRenamed) {
 					for (const a of stmt.assignments) {
 						if (a.column.toLowerCase() === state.oldCol) {
@@ -730,10 +772,11 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 					}
 				}
 				// Push a scope frame so unqualified column refs in WHERE/RETURNING
-				// resolve against the update target.
+				// resolve against the update target, bound under its resolved key.
 				const frame = emptyFrame();
-				if (stmt.table.schema === undefined || eq(stmt.table.schema, state.defaultSchema)) {
-					frame.unaliased.add(stmt.table.name.toLowerCase());
+				const targetBinding = state.resolveRef(stmt.table.schema, stmt.table.name);
+				if (targetBinding !== undefined) {
+					frame.unaliased.set(stmt.table.name.toLowerCase(), targetBinding);
 				}
 				state.scopeStack.push(frame);
 				try {
@@ -756,8 +799,9 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 			pushWithFrame(stmt.withClause, state);
 			try {
 				const frame = emptyFrame();
-				if (stmt.table.schema === undefined || eq(stmt.table.schema, state.defaultSchema)) {
-					frame.unaliased.add(stmt.table.name.toLowerCase());
+				const targetBinding = state.resolveRef(stmt.table.schema, stmt.table.name);
+				if (targetBinding !== undefined) {
+					frame.unaliased.set(stmt.table.name.toLowerCase(), targetBinding);
 				}
 				state.scopeStack.push(frame);
 				try {
@@ -855,15 +899,33 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 			if (col.name.toLowerCase() !== state.oldCol) break;
 			if (col.table) {
 				const qualifierLower = col.table.toLowerCase();
-				const directHit = qualifierLower === state.tableName &&
-					(col.schema === undefined || eq(col.schema, state.defaultSchema)) &&
-					!isQualifierShadowedInScope(state, qualifierLower);
-				const viaAlias = aliasResolvesToTable(state, col.table);
-				// Row-image match is tried LAST so a table genuinely named `new` or
-				// `old` that is itself the renamed table keeps resolving through
-				// `directHit` exactly as it did before this path existed.
-				const rowImageHit = !directHit && !viaAlias && matchesRowImage(state, col, qualifierLower);
-				if (directHit || viaAlias || rowImageHit) {
+				let hit: boolean;
+				if (col.schema !== undefined) {
+					// A schema-qualified qualifier (`main.t.k`) can never be an
+					// alias, a CTE, or the row image — resolve it directly.
+					hit = state.resolveRef(col.schema, col.table) === state.targetKey;
+				} else {
+					const binding = resolveQualifierBinding(state, qualifierLower);
+					if (binding !== undefined) {
+						// The innermost binding decides: the renamed table's key,
+						// another object's key, or null (a shadowing CTE). A table
+						// genuinely named `new` / `old` that is bound in scope —
+						// the seeded owning table included — resolves through its
+						// binding, never through the row image.
+						hit = binding === state.targetKey;
+					} else if (matchesRowImage(state, col, qualifierLower)) {
+						// Row-image match applies only to an UNBOUND `new.` /
+						// `old.` qualifier in a seeded (written-row) walk.
+						hit = true;
+					} else {
+						// Nothing in scope binds the qualifier: a seedless
+						// expression context (correlation the walk cannot see).
+						// Resolve directly, as the planner would against the
+						// body's home schema path.
+						hit = state.resolveRef(undefined, col.table) === state.targetKey;
+					}
+				}
+				if (hit) {
 					col.name = state.newCol;
 					state.changed = true;
 				}
@@ -982,11 +1044,11 @@ function isResultColumnExposure(
 ): boolean {
 	if (col.type === 'all') {
 		if (col.table === undefined) {
-			return bodyFrame.unaliased.has(state.tableName);
+			return frameBindsTargetUnaliased(bodyFrame, state.targetKey);
 		}
 		const qualLower = col.table.toLowerCase();
-		if (qualLower === state.tableName && bodyFrame.unaliased.has(state.tableName)) return true;
-		return bodyFrame.aliasMap.get(qualLower) === state.tableName;
+		return bodyFrame.unaliased.get(qualLower) === state.targetKey
+			|| bodyFrame.aliasMap.get(qualLower) === state.targetKey;
 	}
 	if (col.alias !== undefined) return false;
 	const expr = col.expr;
@@ -994,16 +1056,15 @@ function isResultColumnExposure(
 	const colExpr = expr as AST.ColumnExpr;
 	if (colExpr.name.toLowerCase() !== state.newCol.toLowerCase()) return false;
 	if (colExpr.table === undefined) {
-		return bodyFrame.unaliased.has(state.tableName);
+		return frameBindsTargetUnaliased(bodyFrame, state.targetKey);
+	}
+	if (colExpr.schema !== undefined) {
+		// Schema-qualified: never an alias — resolve directly.
+		return state.resolveRef(colExpr.schema, colExpr.table) === state.targetKey;
 	}
 	const qualLower = colExpr.table.toLowerCase();
-	if (
-		qualLower === state.tableName &&
-		(colExpr.schema === undefined || eq(colExpr.schema, state.defaultSchema))
-	) {
-		return true;
-	}
-	return bodyFrame.aliasMap.get(qualLower) === state.tableName;
+	return bodyFrame.unaliased.get(qualLower) === state.targetKey
+		|| bodyFrame.aliasMap.get(qualLower) === state.targetKey;
 }
 
 /**

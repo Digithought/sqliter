@@ -25,9 +25,11 @@ import {
 	buildCheckConstraintSchema,
 	buildColumnIndexMap,
 	buildForeignKeyConstraintSchema,
+	buildObjectRefResolver,
 	buildUniqueConstraintSchema,
 	columnDefToSchema,
 	foldDefaultToType,
+	objectRefKey,
 	rekeySchemaPrimaryKey,
 	renameColumnInCheckConstraints,
 	renameColumnInColumnExpressions,
@@ -424,13 +426,18 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// named it.
 		const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
 			db.schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
+		// Planner-parity resolution, snapshotted before this hook's first mutation
+		// (the engine's catalog swap comes later still). A column rename never moves
+		// the table itself, so forward and reverse passes share one target key.
+		const resolveRef = buildObjectRefResolver(db, schemaName);
+		const tableKey = objectRefKey(schemaName, tableName);
 		const rewriteColumn = (from: string, to: string): void => {
 			renameColumnInIndexPredicates(
-				updatedIndexes, tableName, from, to, schemaName, resolveColumnInSource);
+				updatedIndexes, tableName, from, to, resolveRef, tableKey, resolveColumnInSource);
 			renameColumnInCheckConstraints(
-				oldSchema.checkConstraints, tableName, from, to, schemaName, resolveColumnInSource);
+				oldSchema.checkConstraints, tableName, from, to, resolveRef, tableKey, resolveColumnInSource);
 			renameColumnInColumnExpressions(
-				updatedColumns, tableName, from, to, schemaName, resolveColumnInSource);
+				updatedColumns, tableName, from, to, resolveRef, tableKey, resolveColumnInSource);
 		};
 		try {
 			rewriteColumn(change.oldName, change.newName);

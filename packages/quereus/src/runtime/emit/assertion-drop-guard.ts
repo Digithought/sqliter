@@ -1,7 +1,8 @@
 import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { tableReferencedInAst } from '../../schema/rename-rewriter.js';
+import { tableReferencedInAst, objectRefKey } from '../../schema/rename-rewriter.js';
+import { buildObjectRefResolver } from '../../schema/object-ref-resolver.js';
 
 /** What the guard calls the object in its error message. */
 export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
@@ -49,6 +50,10 @@ export function assertNoAssertionDependsOn(
 ): void {
 	const schema = db.schemaManager.getSchema(schemaName);
 	if (!schema) return;
+	// Assertions in this schema resolve their unqualified names under its home
+	// path; the guard runs before any mutation, so the snapshot is the live state.
+	const resolve = buildObjectRefResolver(db, schema.name);
+	const targetKey = objectRefKey(schema.name, objectName);
 	for (const assertion of schema.getAllAssertions()) {
 		// NOTE: an assertion with no `checkExpression` has no AST to scan and is
 		// skipped, exactly as the rename propagation skips it. Unreachable today —
@@ -59,7 +64,7 @@ export function assertNoAssertionDependsOn(
 		// needs a re-parse arm or it silently stops protecting those assertions.
 		const check = assertion.checkExpression;
 		if (!check) continue;
-		if (!tableReferencedInAst(check, objectName, schemaName)) continue;
+		if (!tableReferencedInAst(check, objectName, resolve, targetKey)) continue;
 		// `schema.name` rather than the caller's `schemaName`: DROP emitters pass the
 		// name as the user typed it, so `drop table MAIN.t` would otherwise report a
 		// schema spelling that appears nowhere in the catalog.

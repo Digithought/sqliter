@@ -4,21 +4,20 @@ import type { Schema } from '../../schema/schema.js';
 import type { AssertionDependentTable, IntegrityAssertionSchema } from '../../schema/assertion.js';
 import { buildAssertionViolationSql } from '../../schema/assertion.js';
 import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewriter.js';
-import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
+import type { ResolveColumnInSource, ResolveObjectRef } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('runtime:emit:assertion-rename');
 
 // NOTE: both passes walk only the renamed object's OWN schema — the same scope the
-// plain-view and materialized-view loops in `alter-table.ts` use. An assertion's
-// stored body resolves unqualified table names against the assertion's own schema
-// first (`Database._homeSchemaPath`), so an unqualified `t` inside an assertion
-// living in some other schema does not necessarily mean the renamed table, and
-// rewriting it would be a false positive. The converse gap — an assertion that names
-// the renamed table with an explicit `<other schema>.<table>` qualifier is NOT
-// rewritten — is real, and shared verbatim with views and materialized views; it is
-// tracked by `bug-rename-not-propagated-across-schemas`, which fixes all three object
-// kinds with one "explicitly-qualified references only" rewriter mode.
+// plain-view and materialized-view loops in `alter-table.ts` use, and the caller
+// passes the resolver built for that schema's home path (over the statement's
+// pre-mutation snapshot), so an unqualified `t` in a body matches only when it
+// actually RESOLVES to the renamed table. The remaining gap — an assertion living
+// in some OTHER schema whose body names the renamed table is never walked at all —
+// is shared verbatim with views and materialized views; it is tracked by
+// `bug-rename-not-propagated-across-schemas`, which widens the loops for all three
+// object kinds.
 
 /**
  * Rewrites every assertion in `schema` after a source TABLE RENAME — the assertion
@@ -39,6 +38,8 @@ export function propagateTableRenameToAssertions(
 	renamedSchemaName: string,
 	oldName: string,
 	newName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 ): void {
 	const schemaLower = renamedSchemaName.toLowerCase();
 	const oldBase = `${schemaLower}.${oldName.toLowerCase()}`;
@@ -46,7 +47,7 @@ export function propagateTableRenameToAssertions(
 	for (const assertion of Array.from(schema.getAllAssertions())) {
 		const check = assertion.checkExpression;
 		if (!check) continue;
-		if (!renameTableInAst(check, oldName, newName, renamedSchemaName)) continue;
+		if (!renameTableInAst(check, oldName, newName, resolve, targetKey)) continue;
 		reregisterRewrittenAssertion(db, schema, assertion, check,
 			remapDependentTables(assertion.dependentTables, oldBase, newBase));
 	}
@@ -69,16 +70,17 @@ export function propagateTableRenameToAssertions(
 export function propagateColumnRenameToAssertions(
 	db: Database,
 	schema: Schema,
-	renamedSchemaName: string,
 	tableName: string,
 	oldCol: string,
 	newCol: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
 	resolveColumnInSource: ResolveColumnInSource,
 ): void {
 	for (const assertion of Array.from(schema.getAllAssertions())) {
 		const check = assertion.checkExpression;
 		if (!check) continue;
-		if (!renameColumnInAst(check, tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)) continue;
+		if (!renameColumnInAst(check, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource)) continue;
 		reregisterRewrittenAssertion(db, schema, assertion, check, assertion.dependentTables);
 	}
 }

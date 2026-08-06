@@ -25,7 +25,8 @@ import { createMemoryTableLoggers } from '../utils/logging.js';
 import { coerceRowToSchema, foldDefaultToType } from '../../../types/validation.js';
 import type { VTableEventEmitter } from '../../events.js';
 import { compilePredicate } from '../utils/predicate.js';
-import { renameColumnInIndexPredicates, type ResolveColumnInSource } from '../../../schema/rename-rewriter.js';
+import { renameColumnInIndexPredicates, objectRefKey, type ResolveColumnInSource } from '../../../schema/rename-rewriter.js';
+import { buildObjectRefResolver } from '../../../schema/object-ref-resolver.js';
 import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
@@ -2243,6 +2244,10 @@ export class MemoryTableManager {
 		const schemaManager = this.db.schemaManager;
 		const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
 			schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
+		// Built before any mutation of this hook (the engine's catalog swap comes
+		// later still); the reverse pass reuses the same snapshot and key.
+		const resolveRef = buildObjectRefResolver(this.db, this.schemaName);
+		const tableKey = objectRefKey(this.schemaName, this._tableName);
 		let predicatesRewritten = false;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -2309,7 +2314,7 @@ export class MemoryTableManager {
 			predicatesRewritten = true;
 			renameColumnInIndexPredicates(
 				finalNewTableSchema.indexes, this._tableName, oldName, newColumnName,
-				this.schemaName, resolveColumnInSource);
+				resolveRef, tableKey, resolveColumnInSource);
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			// Rebuilds every secondary index from the new schema, so a renamed covering index
@@ -2343,7 +2348,7 @@ export class MemoryTableManager {
 			if (predicatesRewritten) {
 				renameColumnInIndexPredicates(
 					originalManagerSchema.indexes, this._tableName, newColumnDefAst.name, oldName,
-					this.schemaName, resolveColumnInSource);
+					resolveRef, tableKey, resolveColumnInSource);
 			}
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;

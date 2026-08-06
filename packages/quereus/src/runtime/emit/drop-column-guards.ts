@@ -3,8 +3,9 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
-import { columnReferencedInAst, columnReferencedInCheckExpression } from '../../schema/rename-rewriter.js';
+import { columnReferencedInAst, columnReferencedInCheckExpression, objectRefKey } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
+import { buildObjectRefResolver } from '../../schema/object-ref-resolver.js';
 
 /**
  * The `ALTER TABLE … DROP COLUMN` guards over dependents that `runDropColumn` does not
@@ -79,11 +80,13 @@ export function assertNoColumnDefaultNamesColumn(
 ): void {
 	const lowerColumn = columnName.toLowerCase();
 	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
+	const resolve = buildObjectRefResolver(db, tableSchema.schemaName);
+	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
 	for (const col of tableSchema.columns) {
 		if (col.name.toLowerCase() === lowerColumn) continue;
 		if (!col.defaultValue) continue;
 		if (!columnReferencedInCheckExpression(
-			col.defaultValue, tableSchema.name, columnName, tableSchema.schemaName, resolveColumnInSource)) continue;
+			col.defaultValue, tableSchema.name, columnName, resolve, tableKey, resolveColumnInSource)) continue;
 		throw new QuereusError(
 			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by the DEFAULT of column '${col.name}'`,
 			StatusCode.CONSTRAINT,
@@ -119,9 +122,11 @@ export function assertNoCheckConstraintNamesColumn(
 	columnName: string,
 ): void {
 	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
+	const resolve = buildObjectRefResolver(db, tableSchema.schemaName);
+	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
 	for (const check of tableSchema.checkConstraints ?? []) {
 		if (!columnReferencedInCheckExpression(
-			check.expr, tableSchema.name, columnName, tableSchema.schemaName, resolveColumnInSource)) continue;
+			check.expr, tableSchema.name, columnName, resolve, tableKey, resolveColumnInSource)) continue;
 		// A table-level unnamed CHECK genuinely carries `name: undefined` — the
 		// `_check_<table>` spelling `manager.ts` produces is error text, not stored
 		// identity — so there is no name to quote and the expression stands in for one.
@@ -161,13 +166,15 @@ export function assertNoAssertionNamesColumn(
 	const schema = db.schemaManager.getSchema(tableSchema.schemaName);
 	if (!schema) return;
 	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
+	const resolve = buildObjectRefResolver(db, tableSchema.schemaName);
+	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
 	for (const assertion of schema.getAllAssertions()) {
 		// An assertion with no `checkExpression` has no AST to scan and is skipped,
 		// exactly as the rename propagation and `assertNoAssertionDependsOn` skip it.
 		const check = assertion.checkExpression;
 		if (!check) continue;
 		if (!columnReferencedInAst(
-			check, tableSchema.name, columnName, tableSchema.schemaName, resolveColumnInSource)) continue;
+			check, tableSchema.name, columnName, resolve, tableKey, resolveColumnInSource)) continue;
 		throw new QuereusError(
 			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by assertion '${assertion.name}' — drop or redefine the assertion first`,
 			StatusCode.CONSTRAINT,
