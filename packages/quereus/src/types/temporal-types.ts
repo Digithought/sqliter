@@ -210,6 +210,84 @@ export const DATETIME_TYPE: LogicalType = {
 };
 
 /**
+ * TIMESTAMP type - an integer instant (signed 64-bit epoch value).
+ *
+ * The stored value is an integer whose unit the engine does not reinterpret:
+ * an integer written to a TIMESTAMP column reads back exactly as written. Only
+ * the string→integer direction pins a unit — an ISO 8601 datetime string
+ * parses to epoch MILLISECONDS, matching the epoch-ms convention DATE and
+ * DATETIME already use for their numeric inputs
+ * (`Temporal.Instant.fromEpochMilliseconds`).
+ */
+export const TIMESTAMP_TYPE: LogicalType = {
+	name: 'TIMESTAMP',
+	physicalType: PhysicalType.INTEGER,
+	isTemporal: true,
+
+	validate: (v) => {
+		if (v === null) return true;
+		if (typeof v === 'bigint') return true;
+		if (typeof v === 'number') return Number.isInteger(v);
+		return false;
+	},
+
+	parse: (v) => {
+		if (v === null) return null;
+		if (typeof v === 'bigint') return v;
+		if (typeof v === 'number') {
+			if (!Number.isInteger(v)) {
+				throw new TypeError(`Cannot convert non-integer number '${v}' to TIMESTAMP`);
+			}
+			return v;
+		}
+		if (typeof v === 'string') {
+			const trimmed = v.trim();
+			if (trimmed === '') return null;
+			// Integer-shaped string → that integer verbatim (no unit interpretation).
+			// Past 2^53 rebuild from the digit string, not the rounded number — same
+			// safe-integer boundary as INTEGER_TYPE.parse.
+			if (/^[+-]?\d+$/.test(trimmed)) {
+				const parsed = Number(trimmed);
+				if (Number.isSafeInteger(parsed)) return parsed;
+				return BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed);
+			}
+			// ISO 8601 datetime string → epoch milliseconds. Bare datetimes are
+			// treated as UTC wall-clock; offset/zone-bearing inputs convert to UTC —
+			// same canonicalization DATE / DATETIME apply.
+			try {
+				return parseDateTimeStringToUtcPlain(trimmed).toZonedDateTime('UTC').epochMilliseconds;
+			} catch (e) {
+				throw new TypeError(`Cannot convert '${v}' to TIMESTAMP: ${e instanceof Error ? e.message : String(e)}`);
+			}
+		}
+		throw new TypeError(`Cannot convert ${typeof v} to TIMESTAMP`);
+	},
+
+	// NOTE: deliberately NOT `isNumeric`. TIMESTAMP is an instant, not a number —
+	// `abs(ts)` / `round(ts)` should not typecheck on it. The cost is that
+	// `sharesSeekKeySpace(TIMESTAMP, INTEGER)` is false, so a key-set seek or
+	// index-nested-loop join keyed by an INTEGER-typed expression against a
+	// TIMESTAMP column declines and falls back to a scan — conservative, never a
+	// wrong answer. If that decline ever shows up as a real plan regression, add
+	// TIMESTAMP to `isSeekKeySpaceNumeric` (its compare already ranks mixed
+	// number/bigint by exact value, which is the predicate's requirement) rather
+	// than flipping `isNumeric`.
+	//
+	// Integer storage order IS the semantic order (no semanticOrdering flag).
+	// Mixed number/bigint compares by exact mathematical value under JS
+	// relational operators; validate admits only integers, so NaN never arrives.
+	compare: (a, b) => {
+		const nullCmp = compareNulls(a, b);
+		if (nullCmp !== undefined) return nullCmp;
+		const av = a as number | bigint;
+		const bv = b as number | bigint;
+		return av < bv ? -1 : av > bv ? 1 : 0;
+	},
+
+	supportedCollations: [],
+};
+
+/**
  * Parse human-readable duration strings into Temporal.Duration
  * Supports formats like "1 hour", "30 minutes", "2 days 3 hours"
  */

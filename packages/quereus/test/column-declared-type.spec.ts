@@ -1,11 +1,11 @@
 /**
- * `ColumnSchema.declaredType` — the raw DDL type token (e.g. 'BIGINT', 'TIMESTAMP')
+ * `ColumnSchema.declaredType` — the raw DDL type token (e.g. 'BIGINT', 'GEOMETRY')
  * carried forward alongside the flattened `logicalType` (see schema/column.ts).
  * `inferType` flattens BIGINT onto the shared INTEGER_TYPE (same object as plain
- * INTEGER) and TIMESTAMP (no registry entry, no "INT" affinity match) onto BLOB_TYPE,
- * erasing the distinction a host consuming the projected TableSchema (not the CREATE
- * TABLE AST) may still need; `declaredType` preserves it regardless of where
- * `logicalType` lands.
+ * INTEGER) and an unregistered token with no affinity keyword (e.g. GEOMETRY) onto
+ * BLOB_TYPE, erasing the distinction a host consuming the projected TableSchema
+ * (not the CREATE TABLE AST) may still need; `declaredType` preserves it
+ * regardless of where `logicalType` lands.
  */
 
 import { expect } from 'chai';
@@ -28,9 +28,15 @@ describe('ColumnSchema.declaredType', () => {
 		expect(schema.logicalType.name).to.equal('INTEGER');
 	});
 
-	it('preserves TIMESTAMP verbatim while logicalType flattens to BLOB (no registry entry, no INT affinity match)', () => {
+	it('preserves TIMESTAMP verbatim; logicalType resolves to the registered TIMESTAMP type', () => {
 		const schema = columnDefToSchema(columnDef('create table t (created TIMESTAMP)', 'created'));
 		expect(schema.declaredType).to.equal('TIMESTAMP');
+		expect(schema.logicalType.name).to.equal('TIMESTAMP');
+	});
+
+	it('preserves an unregistered token (GEOMETRY) verbatim while logicalType falls back to BLOB (no registry entry, no affinity keyword)', () => {
+		const schema = columnDefToSchema(columnDef('create table t (shape GEOMETRY)', 'shape'));
+		expect(schema.declaredType).to.equal('GEOMETRY');
 		expect(schema.logicalType.name).to.equal('BLOB');
 	});
 
