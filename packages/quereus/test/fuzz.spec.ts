@@ -118,6 +118,12 @@ function arbValueForType(type: string): fc.Arbitrary<string> {
 			return fc.string({ minLength: 0, maxLength: 20 })
 				.map(s => `'${s.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`);
 		case 'blob':
+			// NOTE: one constant blob value. The set-identity oracles below compare rows
+			// through `cast(col as text)`, and that conversion is lossy for bytes that are
+			// not valid UTF-8 (they all decode to U+FFFD). With a single blob value nothing
+			// can collide; if blob generation ever widens, distinct blobs will fold onto one
+			// text value and those oracles will quietly lose discriminating power — give
+			// them a lossless rendering (or compare the raw values) at that point.
 			return fc.constant("x'00'");
 		case 'any':
 			return fc.oneof(

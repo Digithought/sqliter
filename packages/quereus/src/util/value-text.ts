@@ -8,14 +8,30 @@ import type { SqlValue } from '../common/types.js';
  * Decoding is non-fatal (the default), so malformed bytes become U+FFFD rather
  * than raising — {@link valueToText} has to be total. `decode()` without
  * `{ stream: true }` keeps no state between calls, so one shared instance is safe.
+ *
+ * Built on first blob decode, not at module load: `TextDecoder` is not a global on
+ * every platform the engine targets (the React Native plugin checks for it before
+ * opening a store), and constructing it eagerly would turn "cannot cast a blob to
+ * text here" into "cannot import the engine here". `BLOB_TYPE.parse` reaches for
+ * `TextEncoder` the same way, per call.
  */
-const utf8Decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+let utf8Decoder: TextDecoder | undefined;
+
+function decodeUtf8(bytes: Uint8Array): string {
+	utf8Decoder ??= new TextDecoder('utf-8', { ignoreBOM: true });
+	return utf8Decoder.decode(bytes);
+}
 
 /**
  * THE SQL value-to-text conversion. Every site that has to render a value as text —
- * CAST/parse to TEXT, `||`, LIKE operand coercion, `group_concat`, TEXT affinity —
- * calls this and nothing else, so a value has exactly one text spelling no matter
- * which construct produced it.
+ * CAST/parse to TEXT, `||`, LIKE operand coercion (the `LIKE` operator in
+ * `runtime/emit/binary.ts` and the `like`/`glob` functions in
+ * `func/builtins/string.ts`), `group_concat`, TEXT affinity — calls this and nothing
+ * else, so a value has exactly one text spelling no matter which construct produced it.
+ *
+ * The remaining string builtins (`substr`, `trim`, `replace`, `instr`, and the ones
+ * that return NULL for a non-text argument) are the known exception, tracked as
+ * `debt-string-builtins-coerce-three-different-ways`.
  *
  * | source            | text              | notes                                                        |
  * |-------------------|-------------------|--------------------------------------------------------------|
@@ -60,7 +76,7 @@ export function valueToText(value: SqlValue): string | null {
 		case 'bigint': return value.toString();
 		case 'boolean': return value ? 'true' : 'false';
 	}
-	if (value instanceof Uint8Array) return utf8Decoder.decode(value);
+	if (value instanceof Uint8Array) return decodeUtf8(value);
 	// Narrowed to JsonSqlValue — an object or array, so stringify always yields a string.
 	return JSON.stringify(value);
 }

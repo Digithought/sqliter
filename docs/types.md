@@ -759,8 +759,15 @@ There is exactly ONE conversion from a value to text — `valueToText`
 (`util/value-text.ts`). Every construct that has to render a value as text calls
 it and nothing else: `TEXT_TYPE.parse` (and so `cast(x as text)`, `text(x)`, and
 any write into a TEXT column), `castFallback`'s TEXT and BLOB arms, `||`, LIKE's
-operand coercion, `group_concat`, and TEXT affinity. A value therefore has one
-text spelling no matter which construct produced it.
+operand coercion (both the `LIKE` operator and the `like`/`glob` functions),
+`group_concat`, and TEXT affinity. A value therefore has one text spelling no
+matter which construct produced it.
+
+The one exception is the rest of the string builtin family — `substr`, `trim`,
+`replace`, `instr`, `lower`, `upper`, `reverse`, `lpad`, `rpad` — which still coerce
+a non-text argument their own way (some with JavaScript stringification, some by
+returning NULL). See [functions.md § String functions](functions.md#string-functions);
+tracked as `debt-string-builtins-coerce-three-different-ways`.
 
 | source | text | notes |
 |---|---|---|

@@ -144,6 +144,22 @@ select group_concat(b) = group_concat(cast(b as text)) as r from vt_b;
 select b like cast(b as text) as r from vt_b order by id;
 → [{"r":true},{"r":true}]
 
+-- The `like` FUNCTION is the same operation as the LIKE operator, so it must derive
+-- the same text. (It used to use JS stringification and answer false here.)
+select like(cast(b as text), b) = (b like cast(b as text)) as r from vt_b order by id;
+→ [{"r":true},{"r":true}]
+
+select like('ab', x'6162') as r;
+→ [{"r":true}]
+
+-- glob() shares the coercion with like().
+select glob('ab', x'6162') as r;
+→ [{"r":true}]
+
+-- Same for a JSON document rendered as its own text.
+select like('%"a"%', json('{"a":1}')) as r;
+→ [{"r":true}]
+
 -- Same three-way agreement over a JSON value.
 create table vt_j (id integer primary key, j json);
 insert into vt_j values (1, '{"a":1}'), (2, '[1,2,3]');

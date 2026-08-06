@@ -2,6 +2,7 @@ import { createAggregateFunction, createScalarFunction, createTableValuedFunctio
 import type { Row, SqlValue, DeepReadonly } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import { simpleLike, simpleGlob } from '../../util/patterns.js';
+import { valueToText } from '../../util/value-text.js';
 import { INTEGER_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
 import { BOOLEAN_RETURN } from './return-types.js';
 import type { LogicalType } from '../../types/logical-type.js';
@@ -93,11 +94,14 @@ export const substringFunc = createScalarFunction(
 );
 
 // Nullable: `like(null, x)` and `like(p, null)` are NULL, not false.
+// Operands render through the one value-to-text rule (util/value-text.ts), the same
+// one `emitLikeOp` uses — `like('ab', x'6162')` and `x'6162' like 'ab'` are two
+// spellings of one operation and must not answer differently.
 export const likeFunc = createScalarFunction(
 	{ name: 'like', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN },
 	(pattern: SqlValue, text: SqlValue): SqlValue => {
 		if (text === null || pattern === null) return null;
-		return simpleLike(String(pattern), String(text));
+		return simpleLike(valueToText(pattern), valueToText(text));
 	}
 );
 
@@ -105,7 +109,7 @@ export const globFunc = createScalarFunction(
 	{ name: 'glob', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN },
 	(pattern: SqlValue, text: SqlValue): SqlValue => {
 		if (text === null || pattern === null) return null;
-		return simpleGlob(String(pattern), String(text));
+		return simpleGlob(valueToText(pattern), valueToText(text));
 	}
 );
 

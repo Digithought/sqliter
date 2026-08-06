@@ -118,7 +118,14 @@ to `1`, but `0` is never a result). Storage class survives too:
 | `lpad(X, N, P)` | 3 | TEXT | Left-pad X to length N using pad string P |
 | `rpad(X, N, P)` | 3 | TEXT | Right-pad X to length N using pad string P |
 | `like(pattern, string)` | 2 | BOOLEAN | LIKE match: `%` = any chars, `_` = one char. Case-sensitive. `NULL` if either argument is `NULL`. A non-text operand is rendered through the one value-to-text conversion first (see [types.md § Value to text](types.md#value-to-text)) |
-| `glob(pattern, string)` | 2 | BOOLEAN | GLOB match: `*` = any chars, `?` = one char. Case-sensitive. `NULL` if either argument is `NULL` |
+| `glob(pattern, string)` | 2 | BOOLEAN | GLOB match: `*` = any chars, `?` = one char. Case-sensitive. `NULL` if either argument is `NULL`. Operands render the same way `like` renders them |
+
+The rest of the table above is **not** yet on the one value-to-text conversion. Given a
+non-text argument, `substr`/`substring`, `trim`/`ltrim`/`rtrim`, `replace` and `instr`
+still use JavaScript's own stringification (a BLOB becomes its comma-joined byte numbers,
+`97,98`), while `lower`, `upper`, `reverse`, `lpad` and `rpad` return `NULL` instead. Pass
+`text(X)` explicitly if the argument may not be text. Tracked as
+`debt-string-builtins-coerce-three-different-ways`.
 
 ```sql
 select lower('Quereus');             -- 'quereus'
