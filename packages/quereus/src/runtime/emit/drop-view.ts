@@ -4,6 +4,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import { assertNoAssertionDependsOn } from './assertion-drop-guard.js';
+import { assertNoExpressionDependsOn } from './expression-drop-guard.js';
 
 export function emitDropView(plan: DropViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -36,6 +37,10 @@ export function emitDropView(plan: DropViewNode, _ctx: EmissionContext): Instruc
 		// An assertion body may name a view exactly as it names a base table, and
 		// dropping it out from under one breaks every write to the database.
 		assertNoAssertionDependsOn(rctx.db, plan.schemaName, plan.viewName, 'view');
+		// A CHECK / DEFAULT / generated body may read a VIEW through a subquery exactly as
+		// it reads a base table, so the referencing table breaks the same way. (The
+		// asymmetry is on the other side: a table dropped under a plain view stays legal.)
+		assertNoExpressionDependsOn(rctx.db, plan.schemaName, plan.viewName, 'view');
 
 		// Remove the view from the schema manager
 		const schema = rctx.db.schemaManager.getSchema(plan.schemaName);

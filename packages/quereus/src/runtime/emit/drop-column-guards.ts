@@ -2,16 +2,21 @@ import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
-import { expressionToString } from '../../emit/ast-stringify.js';
-import { columnReferencedInAst, columnReferencedInCheckExpression, objectRefKey } from '../../schema/rename-rewriter.js';
+import { columnReferencedInAst, objectRefKey } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { buildObjectRefResolver } from '../../schema/object-ref-resolver.js';
+import {
+	findColumnExpressionDependent,
+	describeDependentTable,
+	type ColumnExpressionArm,
+	type ExpressionDependent,
+} from '../../schema/expression-dependents.js';
 
 /**
  * The `ALTER TABLE … DROP COLUMN` guards over dependents that `runDropColumn` does not
- * otherwise see: the DEFAULT of another column on the table itself, a CHECK constraint on
- * the table itself, an assertion whose CHECK body names the column, and a foreign key in
- * *another* table pointing **at** the column.
+ * otherwise see: a column DEFAULT or `GENERATED ALWAYS AS` body that names the column, a
+ * CHECK constraint that names it, an assertion whose CHECK body names it, and a foreign
+ * key in *another* table pointing **at** the column.
  *
  * Whether a dependent is removed with the column or blocks the drop turns on two
  * questions: is it defined by a *column set* or by an *expression*, and does it live on
@@ -25,9 +30,10 @@ import { buildObjectRefResolver } from '../../schema/object-ref-resolver.js';
  *   `WHERE`, and — here — a column DEFAULT, a CHECK expression and an assertion body) are
  *   arbitrary user-authored logic with no narrowed form at all. The only choices are
  *   delete-it-silently and refuse, and the engine **refuses**, `StatusCode.CONSTRAINT`.
- * - **Dependents living in another table** — here, a foreign key whose *parent* column is
- *   the one being dropped — refuse regardless of shape. Removing one would silently
- *   weaken a constraint on a table the user did not name in the statement.
+ * - **Dependents living in another table** — a foreign key whose *parent* column is the
+ *   one being dropped, and (through a subquery) another table's CHECK / DEFAULT /
+ *   generated body — refuse regardless of shape. Removing one would silently weaken, or
+ *   outright break, a constraint on a table the user did not name in the statement.
  *
  * Refuse is right for all four guards here because it is what the two expression guards
  * already inside `runDropColumn` do (so the function gains no second policy), it is
@@ -36,11 +42,17 @@ import { buildObjectRefResolver } from '../../schema/object-ref-resolver.js';
  * assertion. Cascading here would make `drop table f` and `alter table f drop column x`
  * disagree about the same object.
  *
+ * The two expression guards below scan **every table in every schema**, not just the
+ * altered one, via `schema/expression-dependents.ts` — a CHECK or DEFAULT may contain a
+ * subquery, so another table's expression can legitimately name this column, and
+ * `ALTER TABLE … RENAME COLUMN` has always rewritten exactly those. See that module for
+ * the shared walk and the seeded/unseeded probe split it turns on.
+ *
  * Known cost, accepted: an **unnamed** table-level CHECK cannot be dropped
  * (`DROP CONSTRAINT` resolves by name only), so refusing leaves such a column
- * undroppable short of rebuilding the table — again SQLite's position. The refusal
- * message quotes the constraint's expression so the user can at least see what is in
- * the way.
+ * undroppable short of rebuilding the referencing table — again SQLite's position. The
+ * refusal message quotes the constraint's expression so the user can at least see what is
+ * in the way.
  *
  * All four guards must run **before** `requireVtabModule` / `module.alterTable`, so a
  * refused statement never reaches a persisting module and the table is left untouched
@@ -48,71 +60,56 @@ import { buildObjectRefResolver } from '../../schema/object-ref-resolver.js';
  */
 
 /**
- * Refuses the drop when the DEFAULT of some OTHER column on `tableSchema` names the column.
+ * Refuses the drop when a column DEFAULT or `GENERATED ALWAYS AS` body — on the altered
+ * table or on any other table in any schema — names the column.
  *
- * A default is evaluated against the row being written, so it names its siblings through
- * the row-image qualifier — `b integer default (new.a + 1)`. Dropping `a` leaves that
- * default uncompilable and the table unable to accept any new row at all, with an error
- * naming a column the user deliberately removed. Refusing keeps the failure attached to
- * the statement that caused it.
+ * A default is evaluated against the row being written, so on the altered table it names
+ * its siblings through the row-image qualifier — `b integer default (new.a + 1)`.
+ * Dropping `a` leaves that default uncompilable and the table unable to accept any new
+ * row at all, with an error naming a column the user deliberately removed. On ANOTHER
+ * table the same expression reaches this column only through a subquery
+ * (`w integer default ((select min(v) from t))`), and the damage is worse: that table
+ * becomes unwritable and the error names neither `t`, nor the dropped column, nor the
+ * default that broke.
  *
- * Decided by {@link columnReferencedInCheckExpression}, the same seeded probe the CHECK
- * guard below uses, and for the same two reasons: the seed owns the `new.` / `old.`
- * row-image namespace a default is written in, and it is scope-**aware**, so a default
- * whose subquery reads a like-named column on another table
- * (`default ((select min(v) from u))`) does not false-refuse dropping this table's own `v`.
- * Sharing the probe with the rename walk is what makes "the drop refuses exactly the
- * references a rename would have rewritten" true — the same equivalence the CHECK guard
- * rests on, case folding (`NEW.A`) and the `"new"`-named-table shadowing edge included.
+ * "Names" is decided by {@link findColumnExpressionDependent}, which shares its walk with
+ * the rename propagation — so the drop refuses exactly the references a rename would have
+ * rewritten, case folding (`NEW.A`) and the `"new"`-named-table shadowing edge included,
+ * and the two definitions cannot drift. That scope-awareness is load-bearing rather than
+ * decorative: a default whose subquery reads a like-named column on another table
+ * (`default ((select min(v) from u))`) must NOT false-refuse dropping this table's own `v`.
  *
- * The dropped column's **own** default is skipped: it goes away with the column, so a
- * self-naming default (`a integer default (new.a)`) is not something the drop orphans.
- *
- * The generated-column half of this pair is NOT here — `runDropColumn` already refuses off
- * `generatedColumnDependencies`, the resolved column-index map `extractGeneratedColumnDependencies`
- * builds. Two mechanisms for one policy, but the existing one predates this guard and its map
- * is load-bearing elsewhere (evaluation order), so it stays where it is.
+ * Two expressions on the altered table are deliberately skipped — the dropped column's
+ * own default (it goes away with the column) and every own-table generated body
+ * (`runDropColumn` already refuses off `generatedColumnDependencies`). See
+ * {@link findColumnExpressionDependent} for both.
  */
-export function assertNoColumnDefaultNamesColumn(
+export function assertNoColumnExpressionNamesColumn(
 	db: Database,
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
-	const lowerColumn = columnName.toLowerCase();
-	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
-	const resolve = buildObjectRefResolver(db, tableSchema.schemaName);
-	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
-	for (const col of tableSchema.columns) {
-		if (col.name.toLowerCase() === lowerColumn) continue;
-		if (!col.defaultValue) continue;
-		if (!columnReferencedInCheckExpression(
-			col.defaultValue, tableSchema.name, columnName, resolve, tableKey, resolveColumnInSource)) continue;
-		throw new QuereusError(
-			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by the DEFAULT of column '${col.name}'`,
-			StatusCode.CONSTRAINT,
-		);
-	}
+	refuseColumnExpressionDependent(db, tableSchema, columnName, 'columnExpression');
 }
 
 /**
- * Refuses the drop when one of `tableSchema`'s own CHECK constraints names the column.
+ * Refuses the drop when a CHECK constraint — on the altered table or on any other table
+ * in any schema — names the column.
  *
- * "Names" is decided by {@link columnReferencedInCheckExpression} — a real rename to a
- * sentinel over a throwaway clone of the body — so the guard refuses exactly the
- * references `ALTER TABLE … RENAME COLUMN` would have rewritten, and the two
- * definitions cannot drift. That scope-awareness is load-bearing rather than
- * decorative: a CHECK may contain a subquery, so a depth-blind name match (what the
- * partial-index guard next door can afford, its predicates admitting no subqueries)
- * would false-refuse `check ((select min(v) from u) >= 0)` when dropping this table's
- * own `v`.
+ * Same walk, same equivalence with the rename, as
+ * {@link assertNoColumnExpressionNamesColumn}. A CHECK may contain a subquery, so a
+ * depth-blind name match (what the partial-index guard next door can afford, its
+ * predicates admitting no subqueries) would both false-refuse
+ * `check ((select min(v) from u) >= 0)` when dropping this table's own `v` AND miss
+ * another table's `check (n < (select max(v) from t))` entirely.
  *
- * Only the constraints on `tableSchema.checkConstraints` at drop time are probed —
+ * Only the constraints on each table's `checkConstraints` at drop time are probed —
  * the user's declared set. Lens- and FK-synthesized entries are attached to a write
- * plan's constraint list, not to the catalog entry this reads.
+ * plan's constraint list, not to the catalog entries this reads.
  *
  * A CHECK naming the column through the row-image qualifiers — `check (new.a > 0)`,
  * `check on delete (old.a > 0)` — refuses the drop just like the unqualified spelling:
- * the same walk owns that namespace, shadowing edge included, so a CHECK whose subquery
+ * the seeded walk owns that namespace, shadowing edge included, so a CHECK whose subquery
  * reads a real table named `"new"` still does not block dropping this table's own
  * like-named column.
  */
@@ -121,23 +118,33 @@ export function assertNoCheckConstraintNamesColumn(
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
-	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
-	const resolve = buildObjectRefResolver(db, tableSchema.schemaName);
-	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
-	for (const check of tableSchema.checkConstraints ?? []) {
-		if (!columnReferencedInCheckExpression(
-			check.expr, tableSchema.name, columnName, resolve, tableKey, resolveColumnInSource)) continue;
-		// A table-level unnamed CHECK genuinely carries `name: undefined` — the
-		// `_check_<table>` spelling `manager.ts` produces is error text, not stored
-		// identity — so there is no name to quote and the expression stands in for one.
-		const referencedBy = check.name
-			? `CHECK constraint '${check.name}'`
-			: `the CHECK constraint (${expressionToString(check.expr)})`;
-		throw new QuereusError(
-			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by ${referencedBy}`,
-			StatusCode.CONSTRAINT,
-		);
-	}
+	refuseColumnExpressionDependent(db, tableSchema, columnName, 'check');
+}
+
+/**
+ * The shared body of the two expression guards: probe, then refuse with a message that
+ * names the dropped column, the table it is being dropped from, the offending expression,
+ * and — when the expression lives somewhere else — the table carrying it. The own-table
+ * message is unchanged from before this guard learned to scan other tables.
+ */
+function refuseColumnExpressionDependent(
+	db: Database,
+	tableSchema: TableSchema,
+	columnName: string,
+	arm: ColumnExpressionArm,
+): void {
+	const dependent = findColumnExpressionDependent(db, tableSchema, columnName, arm);
+	if (!dependent) return;
+	throw new QuereusError(
+		`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by ${referencedBy(dependent, tableSchema.schemaName)}`,
+		StatusCode.CONSTRAINT,
+	);
+}
+
+/** `CHECK constraint 'ck1'`, or `CHECK constraint 'ck1' on table 'x'` when it lives elsewhere. */
+function referencedBy(dependent: ExpressionDependent, homeSchemaName: string): string {
+	if (dependent.ownTable) return dependent.describe;
+	return `${dependent.describe} on table ${describeDependentTable(dependent.table, homeSchemaName)}`;
 }
 
 /**

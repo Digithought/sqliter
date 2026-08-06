@@ -8,6 +8,7 @@ import { dropMaintainedTable } from './materialized-view.js';
 import { requireVtabModule } from '../../schema/table.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import { assertNoAssertionDependsOn } from './assertion-drop-guard.js';
+import { assertNoExpressionDependsOn } from './expression-drop-guard.js';
 
 export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instruction {
 	const schemaManager = ctx.db.schemaManager;
@@ -37,6 +38,10 @@ export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instru
 			// `IF EXISTS` drop of an absent name is a no-op with nothing to protect
 			// (and any assertion naming that name is already broken).
 			assertNoAssertionDependsOn(rctx.db, targetSchemaName, objectName, 'table');
+			// Another table's CHECK / DEFAULT / generated body may name this one through a
+			// subquery; dropping out from under it leaves that table unwritable. Same gate
+			// (table exists) and same layer (emitter, not `SchemaManager.dropTable`) as above.
+			assertNoExpressionDependsOn(rctx.db, targetSchemaName, objectName, 'table');
 		}
 
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)

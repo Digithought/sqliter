@@ -239,6 +239,12 @@ describe('Maintained-table declared-constraint validation', () => {
 			});
 		});
 
+		// A maintained table's declared CHECK is a stored expression like any other, so
+		// dropping the table its subquery reads is REFUSED, naming the maintained table and
+		// the constraint (`runtime/emit/expression-drop-guard.ts`). The drop used to be
+		// accepted and left the validator poisoned; the poisoned-validator fallback the
+		// rebuild still carries is now defensive only, for internal drop paths (rollback,
+		// catalog import) that no SQL statement can drive.
 		describe('subquery-CHECK target drop', () => {
 			beforeEach(async () => {
 				await db.exec(`
@@ -248,22 +254,24 @@ describe('Maintained-table declared-constraint validation', () => {
 					create table mq (id integer primary key, n integer not null
 						check (n <= (select lim from quota where k = 1)))
 						maintained as select id, n from qsrc;
-					drop table quota;
 				`);
 			});
 
-			it('a source write surfaces a clear table-not-found planning error, not a module connect failure', async () => {
-				let message = '';
-				try {
-					await db.exec(`insert into qsrc values (1, 5)`);
-					expect.fail('expected the poisoned validator to re-throw the sited planning error');
-				} catch (e) {
-					message = (e as Error).message;
-				}
-				expect(message).to.contain(`Table 'quota' not found`);
-				expect(message).to.not.contain('connect failed');
-				expect(message).to.not.contain('Cannot connect');
-				expect(await readAll('select count(*) as n from mq')).to.deep.equal([{ n: 0 }]);
+			it('the drop is refused, naming the maintained table and its CHECK', async () => {
+				await expectError(`drop table quota`,
+					`it is referenced by CHECK constraint '_check_n' on table 'mq'`);
+			});
+
+			it('nothing is applied, so the CHECK keeps validating', async () => {
+				await expectError(`drop table quota`, `it is referenced by CHECK constraint`);
+				await db.exec(`insert into qsrc values (1, 5)`);
+				expect(await readAll('select * from mq')).to.deep.equal([{ id: 1, n: 5 }]);
+				await expectError(`insert into qsrc values (2, 500)`,
+					`row derived into maintained table 'main.mq'`);
+			});
+
+			it('dropping the maintained table first releases the target', async () => {
+				await db.exec(`drop table mq; drop table quota;`);
 			});
 		});
 
@@ -292,26 +300,12 @@ describe('Maintained-table declared-constraint validation', () => {
 			});
 		});
 
+		// No subquery-CHECK arm here any more: the drop half is refused (see
+		// `subquery-CHECK target drop` above) and the maintained table cannot be declared
+		// against an absent CHECK target either, so there is no SQL sequence that reaches
+		// the `table_added` rebuild through a CHECK. The FK-parent arm still works — a
+		// parent drop with no referencing rows is allowed and only rebuilds the validator.
 		describe('self-heal on dependency re-create', () => {
-			it('re-creating a dropped subquery-CHECK target restores healthy validation', async () => {
-				await db.exec(`
-					create table quota (k integer primary key, lim integer not null);
-					insert into quota values (1, 100);
-					create table qsrc (id integer primary key, n integer not null);
-					create table mq (id integer primary key, n integer not null
-						check (n <= (select lim from quota where k = 1)))
-						maintained as select id, n from qsrc;
-					drop table quota;
-					create table quota (k integer primary key, lim integer not null);
-					insert into quota values (1, 100);
-				`);
-				// validator self-healed off the table_added: a conforming write flows…
-				await db.exec(`insert into qsrc values (1, 5)`);
-				expect(await readAll('select * from mq')).to.deep.equal([{ id: 1, n: 5 }]);
-				// …and a violating write fails the (re-resolved) CHECK
-				await expectError(`insert into qsrc values (2, 500)`, `row derived into maintained table 'main.mq'`);
-			});
-
 			it('re-creating a dropped FK parent restores existence validation', async () => {
 				await db.exec(`
 					create table parent (pid integer primary key);

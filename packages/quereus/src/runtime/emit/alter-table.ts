@@ -24,7 +24,7 @@ import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
-import { assertNoColumnDefaultNamesColumn, assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn, assertNoForeignKeyReferencesColumn } from './drop-column-guards.js';
+import { assertNoColumnExpressionNamesColumn, assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn, assertNoForeignKeyReferencesColumn } from './drop-column-guards.js';
 import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
@@ -1169,13 +1169,15 @@ async function runDropColumn(
 		}
 	}
 
-	// Validate: the remaining dependents `module.alterTable` cannot narrow — a sibling
-	// column's DEFAULT, a CHECK on this table, a foreign key in another table pointing AT
-	// the column, and an assertion body. All four run before `requireVtabModule` /
+	// Validate: the remaining dependents `module.alterTable` cannot narrow — a column
+	// DEFAULT / generated body, a CHECK constraint, a foreign key in another table pointing
+	// AT the column, and an assertion body. All four run before `requireVtabModule` /
 	// `module.alterTable`, so a refused drop persists nothing. Ordered by widening blast
-	// radius (a column of this table → this table → another table → the whole database), so
-	// the most locally-explainable violation is the one reported.
-	assertNoColumnDefaultNamesColumn(rctx.db, tableSchema, columnName);
+	// radius (a column expression → a CHECK → a foreign key → the whole database), so the
+	// most locally-explainable violation is the one reported. The first two scan every
+	// table in every schema and report a dependent on the ALTERED table first, so their
+	// messages for a same-table dependent are unchanged by that widening.
+	assertNoColumnExpressionNamesColumn(rctx.db, tableSchema, columnName);
 	assertNoCheckConstraintNamesColumn(rctx.db, tableSchema, columnName);
 	assertNoForeignKeyReferencesColumn(rctx.db, tableSchema, columnName);
 	assertNoAssertionNamesColumn(rctx.db, tableSchema, columnName);

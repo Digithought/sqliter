@@ -1,0 +1,294 @@
+-- 41.10.4-drop-object-expression-dependents.sqllogic
+--
+-- Subject: `DROP TABLE` / `DROP VIEW` / `DROP MATERIALIZED VIEW` vs. a stored expression
+-- on ANOTHER table that still names the dropped object — a CHECK constraint, a column
+-- DEFAULT, or a `GENERATED ALWAYS AS` body, each reaching it through a subquery.
+--
+-- This is the table-verb half of 41.10.2. Both verbs resolve at the same question the
+-- catalog could not previously answer — "which stored table expressions reference this
+-- object?" — and both now answer it the same way, so `drop table t` and
+-- `alter table t drop column v` cannot disagree about the same constraint.
+--
+-- Left unguarded, the drop was accepted and the REFERENCING table became unwritable at
+-- the next INSERT, with `Table 't' not found in schema path: main` — an error naming
+-- neither the object the user dropped nor the constraint that broke.
+--
+-- Policy is REFUSE, matching the whole expression-dependent family (`assertion-drop-guard.ts`,
+-- `drop-column-guards.ts`) and SQLite's position. What refuse does NOT extend to is the
+-- referencing side of a plain VIEW: dropping a table out from under a view stays legal and
+-- leaves the view broken (§5) — a broken view breaks queries OF that view, while a broken
+-- CHECK makes a whole table unwritable.
+--
+-- No `-- requires-capability:` directive: the file uses no standalone index DDL, so it
+-- runs under both the memory module (`yarn test`) and the store module (`yarn test:store`).
+
+-- ===================================================================
+-- 1. A CHECK on another table refuses the drop; drop the constraint to proceed
+-- ===================================================================
+
+create table DtSrc (id integer primary key, v integer);
+insert into DtSrc values (1, 10);
+create table DtRef (id integer primary key, n integer,
+                    constraint ck_dt check (n < (select max(v) from DtSrc)));
+-- run
+
+drop table DtSrc;
+-- error: it is referenced by CHECK constraint 'ck_dt' on table 'DtRef'
+
+-- Nothing was applied: DtSrc is still there, and DtRef is still writable AND still
+-- enforcing — the damage the refusal prevents.
+insert into DtRef values (1, 1);
+select n from DtRef;
+→ [{"n":1}]
+
+insert into DtRef values (2, 99);
+-- error: ck_dt
+
+-- Escape hatch: remove the reference, then the drop goes through.
+alter table DtRef drop constraint ck_dt;
+drop table DtSrc;
+-- run
+
+insert into DtRef values (3, 99);
+select count(*) as c from DtRef;
+→ [{"c":2}]
+
+drop table DtRef;
+-- run
+
+-- ===================================================================
+-- 2. An UNNAMED CHECK has no name to quote, so the message quotes its expression
+-- ===================================================================
+--
+-- Accepted cost, exactly as in §2 of 41.10.2: `DROP CONSTRAINT` resolves by name only, so
+-- the referenced table can only be dropped by rebuilding the REFERENCING one. The quoted
+-- expression is the only handle the user has on it.
+
+create table DtASrc (id integer primary key, v integer);
+create table DtARef (id integer primary key, n integer, check (n < (select max(v) from DtASrc)));
+-- run
+
+drop table DtASrc;
+-- error: it is referenced by the CHECK constraint (n < (select max(v) from DtASrc))
+
+drop table DtARef;
+drop table DtASrc;
+-- run
+
+-- ===================================================================
+-- 3. A DEFAULT and a GENERATED body on another table refuse it too
+-- ===================================================================
+
+create table DtDSrc (id integer primary key, v integer);
+insert into DtDSrc values (1, 11);
+create table DtDRef (id integer primary key, w integer default ((select min(v) from DtDSrc)));
+-- run
+
+drop table DtDSrc;
+-- error: it is referenced by the DEFAULT of column 'w' on table 'DtDRef'
+
+insert into DtDRef (id) values (1);
+select id, w from DtDRef;
+→ [{"id":1,"w":11}]
+
+drop table DtDRef;
+drop table DtDSrc;
+-- run
+
+create table DtGSrc (id integer primary key, v integer);
+insert into DtGSrc values (1, 12);
+create table DtGRef (id integer primary key,
+                     g integer generated always as ((select max(DtGSrc.v) from DtGSrc)));
+-- run
+
+drop table DtGSrc;
+-- error: it is referenced by the GENERATED expression of column 'g' on table 'DtGRef'
+
+drop table DtGRef;
+drop table DtGSrc;
+-- run
+
+-- ===================================================================
+-- 4. A table's own SELF-referencing CHECK never blocks its own drop
+-- ===================================================================
+--
+-- The constraint goes away with the table, so there is nothing left pointing at a missing
+-- name. Refusing here would make every self-referencing table undroppable. (The COLUMN
+-- verb is the opposite case and keeps the altered table in scope: dropping one column
+-- leaves the rest of the table, and its CHECKs, behind.)
+
+create table DtSelf (id integer primary key, v integer,
+                     check (v <= (select max(v) from DtSelf)));
+insert into DtSelf values (1, 1);
+-- run
+
+drop table DtSelf;
+-- run
+
+-- ===================================================================
+-- 5. A plain VIEW over the table does NOT block the drop
+-- ===================================================================
+--
+-- The engine's stated asymmetry, unchanged by this guard. A broken view breaks queries of
+-- that view and nothing else, so the drop stays legal.
+
+create table DtViewed (id integer primary key, v integer);
+create view DtV as select id, v from DtViewed;
+-- run
+
+drop table DtViewed;
+-- run
+
+select id from DtV;
+-- error: DtViewed
+
+drop view DtV;
+-- run
+
+-- ===================================================================
+-- 6. …but DROP VIEW is refused when a CHECK reads the VIEW
+-- ===================================================================
+--
+-- The other side of §5, and the reason the guard is wired into all three DROP emitters: a
+-- CHECK subquery can read a view exactly as it reads a base table, and losing the view
+-- breaks the referencing table just as thoroughly.
+
+create table DtVBase (id integer primary key, v integer);
+insert into DtVBase values (1, 4);
+create view DtVSrc as select id, v from DtVBase;
+create table DtVRef (id integer primary key, n integer,
+                     constraint ck_dtv check (n < (select max(v) from DtVSrc)));
+-- run
+
+drop view DtVSrc;
+-- error: cannot drop view 'main.DtVSrc': it is referenced by CHECK constraint 'ck_dtv' on table 'DtVRef'
+
+insert into DtVRef values (1, 1);
+select n from DtVRef;
+→ [{"n":1}]
+
+alter table DtVRef drop constraint ck_dtv;
+drop view DtVSrc;
+drop table DtVRef;
+drop table DtVBase;
+-- run
+
+-- A materialized view is a table to a CHECK subquery, and gets the same refusal.
+create table DtMBase (id integer primary key, v integer);
+insert into DtMBase values (1, 6);
+create materialized view DtMSrc as select id, v from DtMBase;
+create table DtMRef (id integer primary key, n integer,
+                     constraint ck_dtm check (n < (select max(v) from DtMSrc)));
+-- run
+
+drop materialized view DtMSrc;
+-- error: cannot drop materialized view 'main.DtMSrc': it is referenced by CHECK constraint 'ck_dtm' on table 'DtMRef'
+
+alter table DtMRef drop constraint ck_dtm;
+drop materialized view DtMSrc;
+drop table DtMRef;
+drop table DtMBase;
+-- run
+
+-- ===================================================================
+-- 7. `IF EXISTS` governs ABSENCE, not dependency, so it does not weaken the refusal
+-- ===================================================================
+--
+-- Same position `assertNoAssertionDependsOn` takes. `IF EXISTS` says "it is fine if this
+-- object is already gone"; it says nothing about dropping one that other objects need.
+
+create table DtIfSrc (id integer primary key, v integer);
+create table DtIfRef (id integer primary key, n integer,
+                      constraint ck_dtif check (n < (select max(v) from DtIfSrc)));
+-- run
+
+drop table if exists DtIfSrc;
+-- error: it is referenced by CHECK constraint 'ck_dtif' on table 'DtIfRef'
+
+-- An absent object is still a clean no-op.
+drop table if exists DtNeverExisted;
+-- run
+
+drop table DtIfRef;
+drop table DtIfSrc;
+-- run
+
+-- ===================================================================
+-- 8. Scope-aware, not a bare name match: a CTE or an alias that merely
+--    SHADOWS the name is not a reference
+-- ===================================================================
+--
+-- The walk is the read-only run of the one `ALTER TABLE … RENAME TO` uses, so the drop
+-- refuses exactly the references a rename would have rewritten — a `with DtCte as (…)`
+-- body names the CTE, not the real table of that name.
+
+create table DtCte (id integer primary key, v integer);
+insert into DtCte values (1, 3);
+create table DtCteRef (id integer primary key, n integer,
+                       check ((with DtCte as (select 1 as v) select max(v) from DtCte) >= 0));
+-- run
+
+drop table DtCte;
+-- run
+
+insert into DtCteRef values (1, 1);
+select n from DtCteRef;
+→ [{"n":1}]
+
+drop table DtCteRef;
+-- run
+
+-- A FROM alias binds the name just as a CTE does: `from DtAliased as DtAlias` makes
+-- `DtAlias.v` a column of DtAliased, so the real DtAlias table is droppable.
+create table DtAlias (id integer primary key, v integer);
+create table DtAliased (k integer primary key, v integer);
+insert into DtAliased values (1, 2);
+create table DtAliasRef (id integer primary key, n integer,
+                         check ((select max(DtAlias.v) from DtAliased as DtAlias) >= 0));
+-- run
+
+drop table DtAlias;
+-- run
+
+insert into DtAliasRef values (1, 1);
+select n from DtAliasRef;
+→ [{"n":1}]
+
+drop table DtAliasRef;
+drop table DtAliased;
+-- run
+
+-- ===================================================================
+-- 9. Cross-schema: a qualified reference from another schema is caught,
+--    a bare name that resolves locally is not
+-- ===================================================================
+--
+-- Mirror of §22 in 41.10.2 for the table verb, and of §48–§49 in
+-- 41.3-alter-rename-propagation for the rename it is defined against.
+
+create table main.DtCs (id integer primary key, v integer);
+create table temp.DtCsRef (id integer primary key, n integer,
+                           constraint ck_dtcs check (n < (select max(v) from main.DtCs)));
+-- run
+
+drop table main.DtCs;
+-- error: it is referenced by CHECK constraint 'ck_dtcs' on table 'temp.DtCsRef'
+
+drop table temp.DtCsRef;
+drop table main.DtCs;
+-- run
+
+create table main.DtDup (id integer primary key, v integer);
+create table temp.DtDup (id integer primary key, v integer);
+-- The CHECK's home is temp, so its bare `DtDup` binds temp.DtDup and says nothing about
+-- the main-schema table of the same name.
+create table temp.DtDupRef (id integer primary key, n integer,
+                            check (n < (select max(v) from DtDup)));
+-- run
+
+drop table main.DtDup;
+-- run
+
+drop table temp.DtDupRef;
+drop table temp.DtDup;
+-- run

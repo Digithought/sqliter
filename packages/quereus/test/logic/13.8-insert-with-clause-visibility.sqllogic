@@ -225,9 +225,12 @@ insert into mc with context who = (select count(*) from p) values (2, 'x') retur
 → [{"id":2,"v":"x"}]
 
 -- Cleanup
+-- q9's DEFAULT reads `c` through a subquery, so it has to go first: dropping a table a
+-- stored expression still names is refused (41.10.4-drop-object-expression-dependents).
 drop materialized view mvq4;
 drop view vq3;
 drop view vq11;
+drop table q9;
 drop table p;
 drop table c;
 drop table q1;
@@ -246,7 +249,6 @@ drop table q13;
 drop table q6;
 drop table q7;
 drop table q8;
-drop table q9;
 drop table q10;
 drop table mc;
 -- run

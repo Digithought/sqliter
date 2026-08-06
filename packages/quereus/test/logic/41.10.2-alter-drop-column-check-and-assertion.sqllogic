@@ -571,3 +571,174 @@ select id, b from DcDefShadow;
 drop table DcDefShadow;
 drop table "new";
 -- run
+
+-- ===================================================================
+-- 19. A CHECK on ANOTHER table, reading this column through a subquery,
+--     refuses the drop — and the message names that other table
+-- ===================================================================
+--
+-- §1–§18 all keep the dependent on the altered table. But a CHECK may contain a
+-- subquery, so another table's constraint can legitimately read this one; RENAME COLUMN
+-- has always rewritten exactly those, across every table in every schema, while the DROP
+-- guard used to scan the altered table alone. The drop was accepted and the OTHER table
+-- became unwritable, with `Column not found: v` naming neither this table, nor the
+-- dropped column, nor the constraint that broke.
+--
+-- The message has to name the referencing table: it is the one handle the user has on a
+-- statement that mentions only the altered one.
+
+create table DcXsrc (id integer primary key, v integer);
+insert into DcXsrc values (1, 10);
+create table DcXref (id integer primary key, n integer,
+                     constraint ck_xref check (n < (select max(v) from DcXsrc)));
+-- run
+
+alter table DcXsrc drop column v;
+-- error: CHECK constraint 'ck_xref' on table 'DcXref'
+
+-- Untouched, so the referencing table is still writable — the damage this prevents.
+insert into DcXref values (1, 1);
+select n from DcXref;
+→ [{"n":1}]
+
+-- ...and the CHECK still enforces against DcXsrc.
+insert into DcXref values (2, 99);
+-- error: ck_xref
+
+-- Escape hatch, same shape as §5: drop the constraint, then the column.
+alter table DcXref drop constraint ck_xref;
+alter table DcXsrc drop column v;
+select id from DcXsrc;
+→ [{"id":1}]
+
+drop table DcXref;
+drop table DcXsrc;
+-- run
+
+-- ===================================================================
+-- 20. Same for a DEFAULT and a GENERATED body on another table
+-- ===================================================================
+--
+-- Both are column-level expressions and reach this column the only way they can — through
+-- a subquery — so both get the DEFAULT guard's message plus the owning table's name.
+
+create table DcDsrc (id integer primary key, v integer);
+insert into DcDsrc values (1, 11);
+create table DcDref (id integer primary key, w integer default ((select min(v) from DcDsrc)));
+-- run
+
+alter table DcDsrc drop column v;
+-- error: the DEFAULT of column 'w' on table 'DcDref'
+
+-- Still writable, and the DEFAULT still reads DcDsrc.
+insert into DcDref (id) values (1);
+select id, w from DcDref;
+→ [{"id":1,"w":11}]
+
+drop table DcDref;
+drop table DcDsrc;
+-- run
+
+-- A generated body must qualify its subquery's column (`DcGsrc.v`) — an unqualified name
+-- there is resolved against the OWNING table at declaration time and rejected outright.
+create table DcGsrc (id integer primary key, v integer);
+insert into DcGsrc values (1, 12);
+create table DcGref (id integer primary key,
+                     g integer generated always as ((select max(DcGsrc.v) from DcGsrc)));
+insert into DcGref (id) values (1);
+-- run
+
+alter table DcGsrc drop column v;
+-- error: the GENERATED expression of column 'g' on table 'DcGref'
+
+select id, g from DcGref;
+→ [{"id":1,"g":12}]
+
+drop table DcGref;
+drop table DcGsrc;
+-- run
+
+-- ===================================================================
+-- 21. A like-named column on a THIRD table does not block the drop
+-- ===================================================================
+--
+-- The other-table mirror of §4: the scan is scope-aware in both directions, so widening
+-- it to every table must not start refusing drops whose only name match belongs to a
+-- table nobody mentioned. `v` in DcNref's CHECK binds DcNoise.v.
+
+create table DcNsrc (id integer primary key, v integer);
+create table DcNoise (k integer primary key, v integer);
+create table DcNref (id integer primary key, n integer, check ((select min(v) from DcNoise) >= 0));
+insert into DcNsrc values (1, 5);
+-- run
+
+alter table DcNsrc drop column v;
+select id from DcNsrc;
+→ [{"id":1}]
+
+drop table DcNref;
+drop table DcNoise;
+drop table DcNsrc;
+-- run
+
+-- The commonest false-refusal shape: another table simply HAS a column of the same name
+-- and constrains its own, bare or self-qualified. Neither is a reference to this one.
+create table DcOwn (id integer primary key, v integer);
+create table DcOwnBare (id integer primary key, v integer, check (v > 0));
+create table DcOwnQual (id integer primary key, v integer, check (DcOwnQual.v > 0));
+insert into DcOwn values (1, 4);
+-- run
+
+alter table DcOwn drop column v;
+select id from DcOwn;
+→ [{"id":1}]
+
+-- The other tables' own constraints are untouched and still enforcing.
+insert into DcOwnBare values (1, -1);
+-- error: CHECK constraint failed
+
+insert into DcOwnQual values (1, -1);
+-- error: CHECK constraint failed
+
+drop table DcOwnQual;
+drop table DcOwnBare;
+drop table DcOwn;
+-- run
+
+-- ===================================================================
+-- 22. Cross-schema: what decides a match is whether the reference RESOLVES
+--     to the altered table, not whether the bare names collide
+-- ===================================================================
+--
+-- Same rule §48–§49 of 41.3-alter-rename-propagation pin for the rename: a CHECK in
+-- `temp` naming `main.DcCs` explicitly IS a reference, while a bare name in `temp` that
+-- `temp` itself holds is not.
+
+create table main.DcCs (id integer primary key, v integer);
+create table temp.DcCsRef (id integer primary key, n integer,
+                           constraint ck_cs check (n < (select max(v) from main.DcCs)));
+-- run
+
+alter table main.DcCs drop column v;
+-- error: CHECK constraint 'ck_cs' on table 'temp.DcCsRef'
+
+drop table temp.DcCsRef;
+drop table main.DcCs;
+-- run
+
+create table main.DcDup (id integer primary key, v integer);
+create table temp.DcDup (id integer primary key, v integer);
+-- The CHECK's home is temp, so its bare `DcDup` binds temp.DcDup.
+create table temp.DcDupRef (id integer primary key, n integer,
+                            check (n < (select max(v) from DcDup)));
+insert into main.DcDup values (1, 7);
+-- run
+
+alter table main.DcDup drop column v;
+select id from main.DcDup;
+→ [{"id":1}]
+
+drop table temp.DcDupRef;
+drop table temp.DcDup;
+drop table main.DcDup;
+-- run

@@ -373,6 +373,10 @@ drop table temp.sp_ws;
 drop table temp.sp_nnd;
 drop table temp.sp_gen;
 drop table temp.sp_def;
+-- sp_acbf's added CHECK reads `c` through a subquery (resolving, from temp, to temp.c),
+-- so it has to go before it: dropping a table a stored expression still names is refused
+-- (41.10.4-drop-object-expression-dependents).
+drop table temp.sp_acbf;
 drop table temp.c;
 drop table main.c;
 -- run

@@ -308,17 +308,35 @@ insert into xsrc values (2, null);
 select * from xmt order by id;
 → [{"id":2,"ref":null}]
 
--- subquery-CHECK target DROP: the CHECK can no longer compile, so a poisoned
--- validator surfaces the clear sited planning error on the next write
+-- subquery-CHECK target DROP: REFUSED. A maintained table's declared CHECK is a
+-- stored expression like any other, so dropping the table its subquery reads is
+-- refused naming the maintained table and the constraint
+-- (41.10.4-drop-object-expression-dependents). This used to be accepted and left
+-- the validator poisoned — the next write failed with a bare
+-- `Table 'fquota' not found`, naming neither the maintained table nor the CHECK.
+-- The poisoned-validator fallback the rebuild carries is now defensive only: no
+-- user-facing DDL statement can reach it.
 create table fquota (k integer primary key, lim integer not null);
 insert into fquota values (1, 100);
 create table fqsrc (id integer primary key, n integer not null);
 create table fmq (id integer primary key, n integer not null check (n <= (select lim from fquota where k = 1))) maintained as select id, n from fqsrc;
 drop table fquota;
+-- error: it is referenced by CHECK constraint '_check_n' on table 'fmq'
+
+-- Nothing was applied, so the CHECK still compiles and still enforces.
 insert into fqsrc values (1, 5);
--- error: Table 'fquota' not found
+select * from fmq order by id;
+→ [{"id":1,"n":5}]
+insert into fqsrc values (2, 500);
+-- error: row derived into maintained table 'main.fmq'
 select count(*) as n from fmq;
-→ [{"n":0}]
+→ [{"n":1}]
+
+-- Escape hatch: drop the maintained table (which takes its CHECK with it), then
+-- the target goes freely.
+drop table fmq;
+drop table fquota;
+-- run
 
 -- subquery-CHECK target RENAME: the CHECK AST is rewritten in place and the
 -- rebuilt validator re-resolves against the renamed target
@@ -335,22 +353,14 @@ insert into gqsrc values (2, 500);
 select count(*) as n from gmq;
 → [{"n":1}]
 
--- self-heal: re-creating a dropped subquery-CHECK target restores healthy
--- validation via the table_added rebuild
-create table hquota (k integer primary key, lim integer not null);
-insert into hquota values (1, 100);
-create table hqsrc (id integer primary key, n integer not null);
-create table hmq (id integer primary key, n integer not null check (n <= (select lim from hquota where k = 1))) maintained as select id, n from hqsrc;
-drop table hquota;
-create table hquota (k integer primary key, lim integer not null);
-insert into hquota values (1, 100);
-insert into hqsrc values (1, 5);
-select * from hmq order by id;
-→ [{"id":1,"n":5}]
-insert into hqsrc values (2, 500);
--- error: row derived into maintained table 'main.hmq'
-select count(*) as n from hmq;
-→ [{"n":1}]
+-- No self-heal case here any more. It used to read `drop table hquota;` followed by a
+-- re-`create table hquota`, asserting that the `table_added` rebuild restored healthy
+-- validation. Both halves are unreachable from SQL now: the drop is refused
+-- (41.10.4-drop-object-expression-dependents), and the maintained table cannot be
+-- declared against an absent CHECK target either — `create table … check ((select lim
+-- from hquota …)) maintained as …` fails at build time with `Table 'hquota' not found`.
+-- The rebuild-on-`table_added` path stays in the code as a defensive fallback for
+-- internal drop paths (rollback, catalog import), which no sqllogic file can drive.
 
 -- ===================================
 -- 13. CHECK truthiness: the derived-row validator must reject a bigint-0n / '0'
