@@ -25,10 +25,15 @@ function viewBody(db: Database, name: string, schema = 'main'): AST.QueryExpr {
 	return view!.selectAst;
 }
 
-function viewSql(db: Database, name: string, schema = 'main'): string {
+function rawViewSql(db: Database, name: string, schema = 'main'): string {
 	const view = db.schemaManager.getSchema(schema)!.getView(name);
 	expect(view, `view ${schema}.${name}`).to.exist;
-	return view!.sql.replace(/"/g, '').toLowerCase();
+	return view!.sql.replace(/"/g, '');
+}
+
+/** Case-folded, for assertions that do not turn on identifier spelling. */
+function viewSql(db: Database, name: string, schema = 'main'): string {
+	return rawViewSql(db, name, schema).toLowerCase();
 }
 
 /** Records `schemaName.objectName` per event of `type` until stopped. */
@@ -130,6 +135,22 @@ describe('column-rename cascade', () => {
 		const table = db.schemaManager.getTable('main', 'wq');
 		expect(table!.columns.map(c => c.name)).to.deep.equal(['id', 'x']);
 		expect(viewSql(db, 'vq1')).to.equal(before);
+	});
+
+	it('a case-only respelling is not a collision — it cascades like any other rename', async () => {
+		await db.exec('create table wc (id integer primary key, x integer)');
+		await db.exec('create view vc1 as select id, x from wc');
+		await db.exec('create view vc2 as select x from vc1');
+
+		// The renamed column is the very column the dependents "already publish"
+		// under the new name, so the pristine-body collision test would see a
+		// phantom duplicate if it ran at all.
+		await db.exec('alter table wc rename column x to X');
+
+		expect(db.schemaManager.getTable('main', 'wc')!.columns.map(c => c.name)).to.deep.equal(['id', 'X']);
+		// Both levels follow the respelling — the cascade runs, only the veto is skipped.
+		expect(rawViewSql(db, 'vc1')).to.contain('id, X from wc');
+		expect(rawViewSql(db, 'vc2')).to.contain('select X from vc1');
 	});
 
 	it('collision at depth is refused too, naming the intermediate view', async () => {

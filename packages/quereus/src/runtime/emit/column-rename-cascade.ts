@@ -35,6 +35,14 @@ import { spineCloneAst } from '../../util/ast-spine-clone.js';
  * Views cannot be recursive and a maintained table cannot derive from itself,
  * so the visited set is insurance against a malformed catalog rather than an
  * expected cycle — but without it the loop would be unbounded.
+ *
+ * NOTE: each round costs a full all-schema propagation plus a full scan of every
+ * schema's views and maintained tables, and the pre-flight additionally spine-clones
+ * every scanned body per round — so one `RENAME COLUMN` is O(chain depth × catalog
+ * size) AST walks. Depth is 1–3 for realistic catalogs and DDL is rare, so this is
+ * not worth optimizing now; if a deep republishing chain over a large catalog ever
+ * makes RENAME COLUMN slow, narrow each round to the objects that actually name the
+ * round's target (an object-dependency index) instead of re-sweeping the catalog.
  */
 
 /** One round's rename target: the object whose published column shifts old → new. */
@@ -105,7 +113,12 @@ export async function runColumnRenameCascade(
  *
  * The collision test runs against the PRISTINE body: before the rename the
  * target cannot publish `newCol`, so any `newCol` already published is
- * necessarily a different column. The exposure test runs against a throwaway
+ * necessarily a different column (a case-only respelling is the one rename for
+ * which that premise fails, and returns below before any scan). A `newCol`
+ * publication some EARLIER round created is likewise never a distinct column —
+ * it can only have come from an `oldCol` publication — which is why measuring
+ * the collision on the pristine body is right rather than merely convenient.
+ * The exposure test runs against a throwaway
  * clone with the round's rewrite applied, matching the live driver's
  * post-rewrite contract; the pre-mutation catalog gives the same answers the
  * live rounds see because a round only rewrites references binding ITS OWN
@@ -120,6 +133,11 @@ export function assertColumnRenameCascadePublishable(
 	resolveColumnInSource: ResolveColumnInSource,
 ): void {
 	const oldColLower = oldCol.toLowerCase();
+	// A case-only respelling ('x' → 'X') merges no two name classes: the `newCol` a
+	// dependent "already publishes" IS the renamed column itself, not a second one.
+	// Skipping keeps the pristine-body collision test's premise — that the target
+	// cannot publish `newCol` before the rename — true on every case it runs on.
+	if (oldColLower === newCol.toLowerCase()) return;
 	const visited = new Set<string>([visitKeyOf(seed, oldColLower)]);
 	const queue: ColumnRenameCascadeTarget[] = [seed];
 	while (queue.length > 0) {

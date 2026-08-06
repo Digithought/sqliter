@@ -1746,3 +1746,25 @@ select id, y from main.v2_c58;
 drop view main.v2_c58;
 drop view temp.v1_c58;
 drop table temp.w_c58;
+
+-- ===================================
+-- 59. A case-only respelling is not a published-name collision
+-- ===================================
+-- `x` → `X` renames the column to a name every dependent already publishes —
+-- but that name IS the renamed column, not a second one, so the cascade's
+-- collision refusal must not fire. Both levels follow the new spelling.
+
+create table w_c59 (id integer primary key, x integer);
+insert into w_c59 values (1, 6);
+
+create view v1_c59 as select id, x from w_c59;
+create view v2_c59 as select x from v1_c59;
+
+alter table w_c59 rename column x to X;
+
+select X from v2_c59;
+→ [{"X":6}]
+
+drop view v2_c59;
+drop view v1_c59;
+drop table w_c59;
