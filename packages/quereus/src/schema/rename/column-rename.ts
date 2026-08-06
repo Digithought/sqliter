@@ -472,6 +472,18 @@ interface ColumnRewriteState {
 	 * evaluated against a row of `tableName` and therefore owns that namespace;
 	 * the unseeded {@link renameColumnInAst} leaves it false, so a `new.` ref in
 	 * some *other* table's CHECK is never mistaken for this table's row image.
+	 *
+	 * KNOWN GAP — this is two-state where the domain has three. False here means
+	 * "not MY row image", and the walk then falls through to treating `new` as a
+	 * catalog TABLE reference, which is wrong for the case that actually occurs:
+	 * another table's CHECK / DEFAULT / generated body, written-row context whose
+	 * image is that table, where `new.` names nothing this walk cares about. With
+	 * a real table called `"new"`, `alter table "new" rename column v to w`
+	 * therefore rewrites that other table's `new.v` and leaves it unwritable, and
+	 * `alter table "new" drop column v` is false-refused. The table walker has the
+	 * missing mode already ({@link import('./table-rename.js').TableRenameOpts.rowImageContext}),
+	 * which is why the table verbs get the same SQL right. Tracked as
+	 * `rename-column-corrupts-other-tables-row-image-qualifier`.
 	 */
 	matchRowImageQualifier: boolean;
 }

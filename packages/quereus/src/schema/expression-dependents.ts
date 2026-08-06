@@ -70,10 +70,14 @@ import { reachableObjects } from './object-dependency-closure.js';
  *
  * NOTE: each probe walks every table in every schema, re-walking already-parsed ASTs, and
  * now builds one closure PER STORED EXPRESSION rather than per table. The closure only
- * expands objects a body actually names, so an expression naming no view still costs one
- * walk. DDL is rare and schemas hold handfuls of tables, so this is not worth optimising
- * now; if it ever shows as hot, gate each table on a cheap literal name scan of its stored
- * SQL before paying for the AST walk.
+ * expands objects a body actually names, so an expression naming no view adds no reached
+ * bodies at all — but it is still one extra walk per expression for the COLUMN verb, which
+ * pays `collectTableRefsInAst` to build the reach and then the column probe on top (the
+ * table verb reads its answer straight off the reach, so it is walk-for-walk with the
+ * one-hop probe it replaced). Reasoned from the call shape, not measured. DDL is rare and
+ * schemas hold handfuls of tables, so this is not worth optimising now; if it ever shows as
+ * hot, gate each table on a cheap literal name scan of its stored SQL before paying for the
+ * AST walk.
  */
 
 /** A stored, table-attached expression that references a probed object. */
@@ -279,8 +283,10 @@ function columnProbe(
 /** The first CHECK constraint of `table` the probe matches, described for an error. */
 function findInChecks(table: TableSchema, names: ExpressionProbe): ProbeHit | undefined {
 	for (const check of table.checkConstraints ?? []) {
+		// `!== undefined`, not truthiness: an EMPTY path is a direct match, and `[]` reading
+		// as truthy today is exactly the sort of thing a later `path?.length` guard breaks.
 		const path = names(check.expr);
-		if (path) return { describe: describeCheck(check), path };
+		if (path !== undefined) return { describe: describeCheck(check), path };
 	}
 	return undefined;
 }
@@ -300,11 +306,14 @@ function findInColumnExpressions(
 	const lowerSkip = ownTable ? skipColumnName?.toLowerCase() : undefined;
 	for (const col of table.columns) {
 		if (lowerSkip !== undefined && col.name.toLowerCase() === lowerSkip) continue;
+		// `!== undefined` for the same reason as in {@link findInChecks}: `[]` is a hit.
 		const defaultPath = names(col.defaultValue ?? undefined);
-		if (defaultPath) return { describe: `the DEFAULT of column '${col.name}'`, path: defaultPath };
+		if (defaultPath !== undefined) {
+			return { describe: `the DEFAULT of column '${col.name}'`, path: defaultPath };
+		}
 		if (ownTable) continue;
 		const generatedPath = names(col.generatedExpr);
-		if (generatedPath) {
+		if (generatedPath !== undefined) {
 			return { describe: `the GENERATED expression of column '${col.name}'`, path: generatedPath };
 		}
 	}

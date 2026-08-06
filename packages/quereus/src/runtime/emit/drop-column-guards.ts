@@ -147,9 +147,11 @@ function refuseColumnExpressionDependent(
 
 /**
  * How the refusal describes the reference. A DIRECT one keeps the wording these guards
- * have always used; an indirect one leads with the expression and names the chain,
- * mirroring {@link assertNoAssertionNamesColumn} so all four guard families phrase an
- * indirect refusal identically.
+ * have always used; an indirect one leads with the expression and names the chain, the
+ * same `… reaches it through view 'v'` split `assertNoAssertionDependsOn` uses. It is NOT
+ * the spelling {@link assertNoAssertionNamesColumn} uses next door
+ * (`it is referenced by assertion 'a' through view 'v'`) — that message was already in
+ * tests when the closure landed, and both read.
  */
 function refersTo(dependent: ExpressionDependent, homeSchemaName: string): string {
 	const what = referencedBy(dependent, homeSchemaName);

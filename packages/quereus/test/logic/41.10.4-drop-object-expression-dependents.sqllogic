@@ -406,6 +406,27 @@ drop table DtMvBase;
 drop table DtMvRef;
 -- run
 
+-- The `materialized view` VERB refuses indirectly too, not only the table verb through a
+-- materialized view. §6 pins its DIRECT refusal, §11 pins the middle-link refusal for a
+-- plain view; this is the remaining cell of that verb × directness matrix, and the one
+-- where the object being protected is itself a maintained table rather than a view.
+create table DtMwBase (id integer primary key, v integer);
+create materialized view DtMwM as select id, v from DtMwBase;
+create view DtMwV as select id, v from DtMwM;
+create table DtMwRef (id integer primary key, n integer,
+                      constraint ck_dtmw check (n < (select max(DtMwV.v) from DtMwV)));
+-- run
+
+drop materialized view DtMwM;
+-- error: cannot drop materialized view 'main.DtMwM': CHECK constraint 'ck_dtmw' on table 'DtMwRef' reaches it through view 'DtMwV' — drop or redefine it first
+
+alter table DtMwRef drop constraint ck_dtmw;
+drop view DtMwV;
+drop materialized view DtMwM;
+drop table DtMwBase;
+drop table DtMwRef;
+-- run
+
 -- ===================================================================
 -- 13. DEFAULT and GENERATED bodies follow chains too
 -- ===================================================================

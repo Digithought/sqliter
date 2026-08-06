@@ -108,6 +108,16 @@ export interface ObjectReach {
  * (`schema/expression-dependents.ts` passes it for exactly that reason). The
  * assertion guards pass nothing: an assertion CHECK owns no `new.` / `old.`
  * namespace either.
+ *
+ * NOTE: no test pins the root-ONLY half, and cannot today. The suppression fires
+ * at exactly one site — a bare `new.` / `old.` COLUMN qualifier that nothing in
+ * scope binds (`rename/table-rename.ts`, the `binding === undefined` branch) — and
+ * `CREATE VIEW` rejects such a body outright (`create view v as select new.a from
+ * "new" as x` → `new.a isn't a column`), so a reached body can never contain one
+ * and leaking `rootOpts` downward would change no answer. Root-only is therefore
+ * correct by construction rather than by test. If the suppression ever widens
+ * beyond seedless column qualifiers — to a FROM source spelled `new`, say — that
+ * stops being true and this needs a test.
  */
 export function reachableObjects(
 	db: Database,

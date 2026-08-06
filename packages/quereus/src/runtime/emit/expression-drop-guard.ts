@@ -1,7 +1,7 @@
 import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { findTableExpressionDependent, describeDependentTable } from '../../schema/expression-dependents.js';
+import { findTableExpressionDependent, describeDependentTable, type ExpressionDependent } from '../../schema/expression-dependents.js';
 import { describeReachPath } from '../../schema/object-dependency-closure.js';
 import type { DroppableObjectKind } from './assertion-drop-guard.js';
 
@@ -79,11 +79,13 @@ export function assertNoExpressionDependsOn(
 
 /**
  * How the refusal describes the reference. A DIRECT one keeps the wording this guard has
- * always used; an indirect one leads with the expression and names the chain, mirroring
- * {@link assertNoAssertionDependsOn}'s split so all four guard families phrase an indirect
- * refusal identically.
+ * always used; an indirect one leads with the expression and names the chain, the same
+ * `… reaches it through view 'v'` split `assertNoAssertionDependsOn` uses for the same
+ * verb. (The DROP COLUMN assertion guard spells its indirect clause differently —
+ * `it is referenced by assertion 'a' through view 'v'` — because that message was already
+ * in tests when the closure landed; both read, and neither is worth churning.)
  */
-function refersTo(dependent: { describe: string; path: ReadonlyArray<string> }, on: string): string {
+function refersTo(dependent: ExpressionDependent, on: string): string {
 	return dependent.path.length === 0
 		? `it is referenced by ${dependent.describe} ${on}`
 		: `${dependent.describe} ${on} reaches it${describeReachPath(dependent.path)}`;
