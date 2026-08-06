@@ -243,6 +243,7 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 					oldName: from, newName: to, schemaName,
 					resolve: resolveRef, resolveAfter: resolveRef,
 				};
+				console.error('DBG target', from, to, schemaName, 'after(t_q2)=', resolveRef(undefined, to), 'cols=', JSON.stringify(currentSchema.columns.map(c=>[c.name, !!c.defaultValue])));
 				renameTableInIndexPredicates(currentSchema.indexes, target);
 				renameTableInCheckConstraints(currentSchema.checkConstraints, target);
 				renameTableInColumnExpressions(currentSchema.columns, target);

@@ -458,6 +458,31 @@ describe('Store ALTER TABLE', () => {
 			expect(ddlStatements[0].toLowerCase()).to.not.include('t_before');
 		});
 
+		it('does not schema-qualify an own-table self-reference when another schema on the path holds the NEW name', async () => {
+			// The forward rewrite's post-condition asks how a rewritten bare reference
+			// will resolve AFTER the rename. For the renamed table's OWN expressions the
+			// answer is always this schema (its own schema leads its home path), so no
+			// qualifier belongs in the persisted DDL — even though `temp` holds the new
+			// name and `temp` sits on `main`'s home path.
+			const storeModule = new StoreModule(provider);
+			db.registerModule('store_rename_qualify', storeModule);
+
+			await db.exec(`CREATE TABLE temp.t_q2 (id INTEGER PRIMARY KEY)`);
+			await db.exec(`
+				CREATE TABLE t_q (
+					id INTEGER PRIMARY KEY,
+					n INTEGER DEFAULT ((SELECT count(*) FROM t_q))
+				) USING store_rename_qualify
+			`);
+			await db.exec(`ALTER TABLE t_q RENAME TO t_q2`);
+
+			const ddlStatements = await storeModule.loadAllDDL();
+			expect(ddlStatements).to.have.lengthOf(1);
+			const ddl = ddlStatements[0].toLowerCase();
+			expect(ddl).to.include('t_q2');
+			expect(ddl, 'SHOWME').to.equal('SHOWME');
+		});
+
 		it('rename inside a savepoint does not throw on rollback-to (DDL-commits posture)', async () => {
 			// renameTable commits the coordinator mid-transaction (DDL-commits posture),
 			// clearing the savepoint stack. The engine still broadcasts rollback-to-s1
