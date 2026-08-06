@@ -2,6 +2,7 @@ import type { SqlValue } from '../common/types.js';
 import type { ScalarType } from '../common/datatype.js';
 import type { LogicalType } from './logical-type.js';
 import { TEXT_TYPE, BLOB_TYPE } from './builtin-types.js';
+import { valueToText } from '../util/value-text.js';
 
 /**
  * What a CAST produces when the target type's `parse` rejects the operand.
@@ -10,8 +11,8 @@ import { TEXT_TYPE, BLOB_TYPE } from './builtin-types.js';
  * actually inhabits the target type — otherwise the cast advertises a logical
  * type it does not produce and 'junk' ends up stored in a DATE column.
  *
- * The SQLite-compatible arms below (0 / 0.0 / String(v) / UTF-8 bytes) each
- * satisfy their own type's `validate`. Everything else falls to the default,
+ * The SQLite-compatible arms below (0 / 0.0 / {@link valueToText} / its UTF-8 bytes)
+ * each satisfy their own type's `validate`. Everything else falls to the default,
  * where the type itself is asked. `parse` reads its input as *source text*, so
  * it can reject a value that already IS a valid member of the target type — a
  * bare JS string is a legitimate JSON string scalar even though
@@ -34,10 +35,18 @@ export function castFallback(value: SqlValue, type: LogicalType): SqlValue {
 			return 0.0;
 		case 'NUMERIC':
 			return 0;
-		case 'TEXT':
-			return String(value);
-		case 'BLOB':
-			return new TextEncoder().encode(String(value));
+		case 'TEXT': {
+			// Unreachable in practice — `TEXT_TYPE.parse` is `valueToText`, which is total
+			// and so never throws its way here. Kept because the arm is about the TEXT
+			// *target*, not about today's TEXT type object: a plugin type registered under
+			// the name TEXT, or a future parse that does reject something, must still land
+			// on the one value-to-text rule rather than on the default arm's NULL.
+			return valueToText(value);
+		}
+		case 'BLOB': {
+			const text = valueToText(value);
+			return text === null ? null : new TextEncoder().encode(text);
+		}
 		default:
 			return type.validate?.(value) === true ? value : null;
 	}
@@ -81,9 +90,11 @@ export function lenientCast(value: SqlValue, type: LogicalType): SqlValue {
  * Can `cast(<non-null operand> as type)` produce NULL? Answers the static
  * nullability of a converting CAST ({@link import('../planner/nodes/scalar.js').CastNode}).
  *
- * TEXT and BLOB are total over non-null operands: `parse` converts every storage
- * class it accepts and throws otherwise, and {@link castFallback}'s arms for them
- * (`String(v)` / UTF-8 bytes) always yield a value. Every other target can reach
+ * TEXT and BLOB are total over non-null operands: TEXT's `parse` IS
+ * {@link valueToText}, which converts every storage class without throwing, BLOB's
+ * converts every class it accepts and throws otherwise, and {@link castFallback}'s
+ * arms for them (`valueToText` / its UTF-8 bytes) always yield a value from a
+ * non-null operand. Every other target can reach
  * NULL — INTEGER / REAL / NUMERIC `parse` map the empty string to null, and
  * `castFallback`'s default arm nulls any operand the target will not validate.
  *

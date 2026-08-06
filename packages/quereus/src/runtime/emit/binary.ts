@@ -12,6 +12,7 @@ import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, isTru
 import type { LogicalType } from "../../types/logical-type.js";
 import type { CollationFunction } from "../../util/comparison.js";
 import { coerceToNumberForArithmetic } from "../../util/coercion.js";
+import { valueToText } from "../../util/value-text.js";
 import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
@@ -327,10 +328,9 @@ export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 		// SQL concatenation: NULL || anything -> NULL
 		if (v1 === null || v2 === null) return null;
 
-		// Convert both operands to strings
-		const s1 = String(v1);
-		const s2 = String(v2);
-		return s1 + s2;
+		// Convert both operands through the shared value-to-text rule, so `b || ''`
+		// spells a blob or a JSON document exactly as `cast(b as text)` does.
+		return valueToText(v1) + valueToText(v2);
 	}
 
 	const leftExpr = emitPlanNode(plan.left, ctx);
@@ -449,7 +449,7 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 
 /**
  * If `node` is a literal-constant, non-NULL pattern, return the exact string the
- * per-row path would derive from it (`String(value)`), otherwise undefined.
+ * per-row path would derive from it ({@link valueToText}), otherwise undefined.
  * A NULL literal, a not-yet-resolved Promise value, or any non-literal node
  * falls through to the dynamic (memoized) per-row path so semantics are
  * unchanged. Cast/collate-wrapped literals are intentionally NOT unwrapped —
@@ -459,7 +459,7 @@ function constLikePattern(node: ScalarPlanNode): string | undefined {
 	if (!(node instanceof LiteralNode)) return undefined;
 	const value = node.expression.value;
 	if (value === null || value === undefined || value instanceof Promise) return undefined;
-	return String(value);
+	return valueToText(value);
 }
 
 export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
@@ -475,7 +475,7 @@ export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instructio
 		function runConstPattern(_ctx: RuntimeContext, text: SqlValue): SqlValue {
 			// text LIKE <const>: NULL text → NULL, else run the pre-compiled matcher.
 			if (text === null) return null;
-			return matcher(String(text));
+			return matcher(valueToText(text));
 		}
 		return {
 			params: [leftExpr],
@@ -491,9 +491,11 @@ export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instructio
 			return null;
 		}
 
-		// Convert both operands to strings and perform LIKE matching (memoized compile).
-		const textStr = String(text);
-		const patternStr = String(pattern);
+		// Convert both operands through the shared value-to-text rule and perform LIKE
+		// matching (memoized compile). Must agree with `constLikePattern` above, or the
+		// constant-pattern fast path starts answering differently from this one.
+		const textStr = valueToText(text);
+		const patternStr = valueToText(pattern);
 
 		return simpleLike(patternStr, textStr);
 	}

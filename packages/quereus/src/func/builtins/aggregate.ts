@@ -3,6 +3,7 @@ import type { SqlValue } from '../../common/types.js';
 import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, AggregateReducer } from '../../schema/function.js';
 import { createAggregateFunction } from '../registration.js';
 import { compareSqlValuesFast, createSemanticValueComparator, BINARY_COLLATION } from '../../util/comparison.js';
+import { valueToText } from '../../util/value-text.js';
 import { INTEGER_RETURN_NOT_NULL, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN } from './return-types.js';
 
 const log = createLogger('func:builtins:aggregate');
@@ -261,14 +262,14 @@ interface GroupConcatAccumulator {
 export const groupConcatFuncRev = createAggregateFunction(
 	{ name: 'group_concat', numArgs: -1, initialValue: () => ({ values: [], separator: ',' }), returnType: TEXT_RETURN },
 	(acc: GroupConcatAccumulator, value: SqlValue, separator: SqlValue = ','): GroupConcatAccumulator => {
-		const currentSeparator = (separator === undefined || separator === null) ? acc.separator : String(separator);
+		const currentSeparator = (separator === undefined || separator === null) ? acc.separator : valueToText(separator);
 		acc.separator = currentSeparator;
 
 		if (value === null) {
 			return acc;
 		}
 
-		acc.values.push(String(value));
+		acc.values.push(valueToText(value));
 		return acc;
 	},
 	(acc: GroupConcatAccumulator): string | null => {

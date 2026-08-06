@@ -12,8 +12,8 @@
 --
 -- Every query is paired with the identical predicate over a non-indexed column
 -- of the same declared type; indexed and non-indexed must agree. The TEXT group
--- is followed by REAL and BLOB keys, whose converting casts (truncation,
--- hex-encoding) change the value without crossing into a text/number mismatch.
+-- is followed by REAL and BLOB keys, whose converting casts (truncation, UTF-8
+-- decode) change the value without crossing into a text/number mismatch.
 --
 -- Plan shapes are pinned separately in `test/plan/cast-seek-blocking.spec.ts`.
 
@@ -105,8 +105,8 @@ SELECT v FROM r WHERE CAST(v AS REAL) = 1.5 ORDER BY v;
 DROP TABLE r;
 DROP TABLE s;
 
--- BLOB key: `cast(b as text)` hex-encodes the bytes, so the cast's value is never
--- the stored blob and must not become a seek key.
+-- BLOB key: `cast(b as text)` decodes the bytes as UTF-8, so the cast's value is a
+-- string and never the stored blob — it must not become a seek key.
 -- `tag` names the row so the assertion needs no blob-formatting function.
 CREATE TABLE bt (b BLOB PRIMARY KEY, tag TEXT);
 INSERT INTO bt VALUES (x'31', 'one'), (x'32', 'two');
@@ -114,10 +114,10 @@ INSERT INTO bt VALUES (x'31', 'one'), (x'32', 'two');
 CREATE TABLE bu (id INTEGER PRIMARY KEY, b BLOB, tag TEXT);
 INSERT INTO bu VALUES (1, x'31', 'one'), (2, x'32', 'two');
 
-SELECT tag FROM bt WHERE CAST(b AS TEXT) = '31' ORDER BY tag;
+SELECT tag FROM bt WHERE CAST(b AS TEXT) = '1' ORDER BY tag;
 → [{"tag":"one"}]
 
-SELECT tag FROM bu WHERE CAST(b AS TEXT) = '31' ORDER BY tag;
+SELECT tag FROM bu WHERE CAST(b AS TEXT) = '1' ORDER BY tag;
 → [{"tag":"one"}]
 
 DROP TABLE bt;

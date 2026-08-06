@@ -1,5 +1,6 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { compareSqlValuesFast, BINARY_COLLATION } from '../util/comparison.js';
+import { valueToText } from '../util/value-text.js';
 import type { DeepReadonly, SqlValue } from '../common/types.js';
 
 /**
@@ -145,20 +146,10 @@ export const TEXT_TYPE: LogicalType = {
 		return typeof v === 'string';
 	},
 
-	parse: (v) => {
-		if (v === null) return null;
-		if (typeof v === 'string') return v;
-		if (typeof v === 'number' || typeof v === 'bigint' || typeof v === 'boolean') {
-			return String(v);
-		}
-		if (v instanceof Uint8Array) {
-			// Convert blob to hex string
-			return Array.from(v)
-				.map(b => b.toString(16).padStart(2, '0'))
-				.join('');
-		}
-		throw new TypeError(`Cannot convert ${typeof v} to TEXT`);
-	},
+	// THE one value-to-text rule (util/value-text.ts) — no storage class gets its own
+	// spelling here, and nothing throws: `valueToText` is total over SqlValue, which is
+	// what keeps `castCanYieldNull(TEXT_TYPE)` false.
+	parse: (v) => valueToText(v),
 
 	compare: (a, b, collation) => {
 		const nullCmp = compareNulls(a, b);
@@ -198,10 +189,13 @@ export const BLOB_TYPE: LogicalType = {
 			return encoder.encode(v);
 		}
 		if (typeof v === 'number' || typeof v === 'bigint' || typeof v === 'boolean') {
-			// Convert to string first, then to UTF-8 bytes
+			// Render through the shared value-to-text rule, then take its UTF-8 bytes.
 			const encoder = new TextEncoder();
-			return encoder.encode(String(v));
+			return encoder.encode(valueToText(v));
 		}
+		// A JSON object/array lands here; `castFallback`'s BLOB arm renders it via
+		// `valueToText` and encodes that, so `cast(<json> as blob)` is the document's
+		// own text. Direct `BLOB_TYPE.parse` callers still see the rejection.
 		throw new TypeError(`Cannot convert ${typeof v} to BLOB`);
 	},
 

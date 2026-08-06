@@ -1156,7 +1156,10 @@ select null as no_value;
 - Right shift: `>>`
 
 **String Operators:**
-- Concatenation: `||`
+- Concatenation: `||` — NULL if either operand is NULL; a non-text operand is
+  rendered through the one value-to-text conversion
+  ([types.md § Value to text](types.md#value-to-text)), so `b || ''` and
+  `cast(b as text)` always agree. `like` coerces its operands the same way.
 
 **JSON Path Operators:**
 - `->`: Extract JSON value at path, returns JSON (syntactic sugar for `json_extract()`)

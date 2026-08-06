@@ -727,11 +727,12 @@ types the logical node did.
 lenient — it never throws — but it never produces a value outside the type it
 advertises either. When the target type's `parse` throws, `castFallback`
 (`types/cast-semantics.ts`) applies SQLite's numeric/text/blob fallbacks (`0`,
-`0.0`, `String(v)`, UTF-8 bytes — each a valid member of its own type); for
-every other target it keeps the operand only when the target type's own
-`validate` accepts it, and yields NULL otherwise. `parse` reads its input as
-source *text*, so `validate` is the right question to ask: a bare string is a
-legitimate JSON string scalar that `JSON_TYPE.parse` nonetheless rejects.
+`0.0`, [`valueToText`](#value-to-text) and its UTF-8 bytes — each a valid member
+of its own type); for every other target it keeps the operand only when the
+target type's own `validate` accepts it, and yields NULL otherwise. `parse` reads
+its input as source *text*, so `validate` is the right question to ask: a bare
+string is a legitimate JSON string scalar that `JSON_TYPE.parse` nonetheless
+rejects.
 
 Because a converting cast can produce NULL from a non-null operand,
 `CastNode.getType()` reports `nullable` for a cast that changes the logical type
@@ -751,6 +752,57 @@ scalars, across ordinary writes and the row-rewriting paths — `ALTER TABLE`
 transactions, savepoints, rollback, `INSERT OR REPLACE`, primary-key
 relocation, index DDL) lives in `test/logic/06.9.1-json-coerce-once.sqllogic` and its
 capability-gated sibling `test/logic/06.9.1.1-json-coerce-once-index.sqllogic`.
+
+### Value to text
+
+There is exactly ONE conversion from a value to text — `valueToText`
+(`util/value-text.ts`). Every construct that has to render a value as text calls
+it and nothing else: `TEXT_TYPE.parse` (and so `cast(x as text)`, `text(x)`, and
+any write into a TEXT column), `castFallback`'s TEXT and BLOB arms, `||`, LIKE's
+operand coercion, `group_concat`, and TEXT affinity. A value therefore has one
+text spelling no matter which construct produced it.
+
+| source | text | notes |
+|---|---|---|
+| `NULL` | `NULL` | SQL NULL propagates |
+| TEXT | itself | including every temporal value — DATE/TIME/DATETIME/TIMESPAN are physically text |
+| INTEGER / REAL / NUMERIC (`number`) | `String(v)` | JavaScript's shortest round-trip spelling |
+| INTEGER / NUMERIC (`bigint`) | exact decimal digits | no `Number()` round-trip, so no rounding past 2^53 |
+| BOOLEAN | `true` / `false` | |
+| BLOB | UTF-8 decode | the bytes reinterpreted as text, matching SQLite |
+| JSON object / array | `JSON.stringify` | the document's own key order |
+
+Three properties are load-bearing and should not be "fixed" without reading why:
+
+- **The binary decode is lossy.** Decoding is non-fatal, so bytes that are not
+  valid UTF-8 become U+FFFD — `x'ff'` and `x'fe'` render as the same text. Text
+  derived from a blob is not a key for that blob. The decoder is constructed with
+  `ignoreBOM: true`, so a leading `EF BB BF` stays one U+FEFF character instead of
+  being silently stripped (`length(cast(x'efbbbf' as text))` is 1, not 0).
+- **JSON keeps the document's own key order**, deliberately not the canonical
+  (sorted) form `canonicalJsonString` produces. Canonical form exists for grouping
+  keys and expression fingerprints, which must agree with `JSON_TYPE.compare`; a
+  user-visible conversion should show the document as it is. The consequence is
+  real: that comparator is a structural deep-compare, so two documents differing
+  only in key order are *equal* yet render *different* text.
+- **The conversion is total** — it never throws for a value inhabiting `SqlValue`.
+  `castCanYieldNull` declares TEXT and BLOB total over non-null operands on the
+  strength of that, and a `not null` lens column over `cast(x as text)` deploys on
+  the strength of `castCanYieldNull`.
+
+Two consequences worth stating outright. A JSON column holding a *string* scalar is
+physically a JS string, so it renders bare (`hello`, not `"hello"`) — the conversion
+dispatches on the runtime value and cannot see the declared type. And because
+`TEXT_TYPE.parse` is this conversion, inserting a BLOB into a TEXT column **stores**
+the UTF-8 decode; that is a stored value, not just a display, and it is lossy for
+non-UTF-8 bytes.
+
+Number spelling stays JavaScript's: `cast(1.0 as text)` is `1` where SQLite gives
+`1.0`, and non-finite values give `Infinity`/`NaN` where SQLite gives `Inf`. That is
+a separate divergence, tracked on its own.
+
+Behaviour is pinned in `test/logic/03.6.2-value-to-text.sqllogic` (SQL-visible) and
+`test/util/value-text.spec.ts` (per-type table).
 
 ### Explicit Conversion
 

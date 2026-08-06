@@ -31,9 +31,10 @@ select '{"a":"hello"}' ->> '$.a' as val;
 select '{"a":42}' ->> '$.a' as val;
 → [{"val":"42"}]
 
--- ->> coerces array to TEXT
+-- ->> renders an array as JSON text (one value-to-text rule, src/util/value-text.ts
+-- — this used to be the JS Array.toString() spelling '1,2')
 select '{"a":[1,2]}' ->> '$.a' as val;
-→ [{"val":"1,2"}]
+→ [{"val":"[1,2]"}]
 
 -- ->> with string shorthand
 select '{"x":"y"}' ->> 'x' as val;
@@ -92,6 +93,7 @@ select '{"t":true}' -> 't';
 select '{"n":null}' -> 'n';
 → [null]
 
--- ->> with nested object returns text
+-- ->> with nested object returns the document's own text (one value-to-text rule,
+-- src/util/value-text.ts — this used to be the placeholder '[object Object]')
 select '{"a":{"x":1}}' ->> 'a' as val;
-→ [{"val":"[object Object]"}]
+→ [{"val":"{\"x\":1}"}]

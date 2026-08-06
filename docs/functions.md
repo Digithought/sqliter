@@ -14,7 +14,7 @@ Quereus uses conversion functions instead of the SQL `CAST` operator for explici
 |---|---|---|
 | `integer(X)` | INTEGER | Truncates reals, parses strings, booleans to 0/1 |
 | `real(X)` | REAL | Parses strings, integers to float, booleans to 0.0/1.0 |
-| `text(X)` | TEXT | Stringifies numbers, booleans to `'true'`/`'false'`, blobs to hex |
+| `text(X)` | TEXT | The one value-to-text conversion (see [types.md § Value to text](types.md#value-to-text)): numbers stringified, booleans to `'true'`/`'false'`, blobs UTF-8-decoded, JSON documents to their own text. Never throws |
 | `boolean(X)` | BOOLEAN | 0/`'false'` is false; non-zero/`'true'` is true |
 | `date(X)` | TEXT | `YYYY-MM-DD` format. Accepts `'now'` for current UTC date |
 | `time(X)` | TEXT | `HH:MM:SS` format. Accepts `'now'` for current UTC time |
@@ -117,7 +117,7 @@ to `1`, but `0` is never a result). Storage class survives too:
 | `instr(X, Y)` | 2 | INTEGER | 1-based position of first occurrence of Y in X. 0 if not found. `NULL` if either input is `NULL` || `reverse(X)` | 1 | TEXT | Reverse the string. Unicode-aware |
 | `lpad(X, N, P)` | 3 | TEXT | Left-pad X to length N using pad string P |
 | `rpad(X, N, P)` | 3 | TEXT | Right-pad X to length N using pad string P |
-| `like(pattern, string)` | 2 | BOOLEAN | LIKE match: `%` = any chars, `_` = one char. Case-sensitive. `NULL` if either argument is `NULL` |
+| `like(pattern, string)` | 2 | BOOLEAN | LIKE match: `%` = any chars, `_` = one char. Case-sensitive. `NULL` if either argument is `NULL`. A non-text operand is rendered through the one value-to-text conversion first (see [types.md § Value to text](types.md#value-to-text)) |
 | `glob(pattern, string)` | 2 | BOOLEAN | GLOB match: `*` = any chars, `?` = one char. Case-sensitive. `NULL` if either argument is `NULL` |
 
 ```sql
@@ -170,7 +170,7 @@ Aggregate functions compute a single result from multiple rows within a `GROUP B
 | `avg(X)` | 1 | REAL | Average. `NULL` for empty set |
 | `min(X)` | 1 | any | Minimum non-NULL value |
 | `max(X)` | 1 | any | Maximum non-NULL value |
-| `group_concat(X, Y?)` | 1-2 | TEXT | Concatenate values, separated by Y (default `','`) |
+| `group_concat(X, Y?)` | 1-2 | TEXT | Concatenate values, separated by Y (default `','`). Skips NULLs. Non-text values render through the one value-to-text conversion (see [types.md § Value to text](types.md#value-to-text)) — a BLOB is UTF-8-decoded, a JSON document keeps its own text |
 | `var_pop(X)` | 1 | REAL | Population variance. `NULL` if fewer than 1 value |
 | `var_pop(X)` | 1 | REAL | Population variance. `NULL` for empty set |
 | `var_samp(X)` | 1 | REAL | Sample variance. `NULL` if fewer than 2 values |
