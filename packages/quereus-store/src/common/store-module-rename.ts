@@ -210,6 +210,15 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 			// nothing and a reverse pass that would clobber that `u2` back to `u`. Reaching
 			// it needs `saveTableDDL` to throw, and closing it needs a per-walk changed-set
 			// threaded through every arm — not worth it for a failed-persist-only path.
+			//
+			// NOTE: renaming a table TO the name `new` / `old` makes the reverse pass a
+			// partial undo for the CHECK arm: the forward pass turns a self-qualifier
+			// `t.b` into `new.b`, which the reverse walk reads as the written-row image
+			// and leaves alone. Harmless today — in a CHECK on its own table the two
+			// spellings denote the same row — so this is a spelling residual, not a
+			// semantic one. Revisit if a CHECK ever gains a legal bare qualifier naming a
+			// table OTHER than its own; then the reverse pass needs the same per-walk
+			// changed-set the residual above wants.
 			const rewriteTable = (from: string, to: string): void => {
 				renameTableInIndexPredicates(currentSchema.indexes, from, to, schemaName);
 				renameTableInCheckConstraints(currentSchema.checkConstraints, from, to, schemaName);

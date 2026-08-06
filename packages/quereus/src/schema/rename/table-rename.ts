@@ -372,6 +372,37 @@ function visitDmlTarget(
 	emit(state, { schema: id.schema, name: id.name, setName: next => { id.name = next; } });
 }
 
+/**
+ * Visit the clauses an UPDATE / DELETE evaluates against its TARGET row — the
+ * assignments, WHERE, RETURNING and mutation-context values — inside a frame
+ * binding the statement's target correlation name.
+ *
+ * That name is a qualifier, never a table: it is the mandatory alias of an
+ * inline subquery target (`update (select …) as v set … where v.k = 1`) or the
+ * collision-proof one the view-mutation lowering synthesizes for a named
+ * target. Renaming a table that happens to share it must leave `v.k` alone,
+ * exactly as a FROM alias is left alone — and the alias itself never moves, so
+ * rewriting the qualifier would only break the reference.
+ */
+function visitDmlTargetRowClauses(
+	stmt: AST.UpdateStmt | AST.DeleteStmt,
+	state: TableRefWalkState,
+): void {
+	const frame = emptyTableFrame();
+	if (stmt.alias) frame.bound.set(stmt.alias.toLowerCase(), null);
+	state.stack.push(frame);
+	try {
+		if (stmt.type === 'update') stmt.assignments.forEach(a => visitTableRefs(a.value, state));
+		visitTableRefs(stmt.where, state);
+		(stmt.returning ?? []).forEach(r => {
+			if (r.type === 'column') visitTableRefs(r.expr, state);
+		});
+		(stmt.contextValues ?? []).forEach(cv => visitTableRefs(cv.value, state));
+	} finally {
+		state.stack.pop();
+	}
+}
+
 function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState): void {
 	if (!node || state.stop) return;
 
@@ -436,38 +467,18 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 			}
 			break;
 		}
-		case 'update': {
-			const stmt = node as AST.UpdateStmt;
+		case 'update':
+		case 'delete': {
+			const stmt = node as AST.UpdateStmt | AST.DeleteStmt;
 			pushWithFrame(stmt.withClause, state);
 			try {
 				// An inline subquery target (`update (select …) as v set …`): `table` is a
 				// synthetic placeholder equal to the alias, not a table reference — the real
-				// references live inside the subquery body.
+				// references live inside the subquery body. Visited OUTSIDE the target frame
+				// below: the body cannot see its own correlation name.
 				if (stmt.targetSource) visitTableRefs(stmt.targetSource, state);
 				else visitDmlTarget(stmt.table, stmt.withClause, state);
-				stmt.assignments.forEach(a => visitTableRefs(a.value, state));
-				visitTableRefs(stmt.where, state);
-				(stmt.returning ?? []).forEach(r => {
-					if (r.type === 'column') visitTableRefs(r.expr, state);
-				});
-				(stmt.contextValues ?? []).forEach(cv => visitTableRefs(cv.value, state));
-			} finally {
-				state.stack.pop();
-			}
-			break;
-		}
-		case 'delete': {
-			const stmt = node as AST.DeleteStmt;
-			pushWithFrame(stmt.withClause, state);
-			try {
-				// Same inline-subquery-target placeholder rule as the update arm above.
-				if (stmt.targetSource) visitTableRefs(stmt.targetSource, state);
-				else visitDmlTarget(stmt.table, stmt.withClause, state);
-				visitTableRefs(stmt.where, state);
-				(stmt.returning ?? []).forEach(r => {
-					if (r.type === 'column') visitTableRefs(r.expr, state);
-				});
-				(stmt.contextValues ?? []).forEach(cv => visitTableRefs(cv.value, state));
+				visitDmlTargetRowClauses(stmt, state);
 			} finally {
 				state.stack.pop();
 			}

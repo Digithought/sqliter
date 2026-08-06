@@ -10,6 +10,7 @@ files:
   - packages/quoomb-cli/src/commands/dot-commands.ts         # 1,189 lines
   - packages/quereus-store/src/common/store-table-base.ts    # 1,033 lines
   - packages/quereus-store/src/common/store-table-scan.ts    # 1,023 lines
+  - packages/quereus/src/schema/rename/column-rename.ts      # 1,057 lines — residue of the 1,759-line rename-rewriter.ts split (table/column/strip); the column walk alone is still over
   - packages/quereus-store/src/common/store-table.ts         # update() alone is ~315 lines (~252-565)
   - packages/quereus-isolation/test/isolation-layer.spec.ts  # 6,860 lines
   - packages/quereus-isolation/src/alter-migration.ts        # 1,078 lines — a prior split of this kind, for reference
