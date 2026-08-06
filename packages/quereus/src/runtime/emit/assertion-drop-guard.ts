@@ -2,9 +2,8 @@ import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { objectRefKey } from '../../schema/rename-rewriter.js';
-import { snapshotObjectRefResolvers } from '../../schema/object-ref-resolver.js';
-import { assertionsHomeSchemaFirst, describeOwnedAssertion } from '../../schema/assertion.js';
-import { reachableObjects, describeReachPath } from '../../schema/object-dependency-closure.js';
+import { assertionReachesHomeSchemaFirst, describeOwnedAssertion } from '../../schema/assertion.js';
+import { describeReachPath } from '../../schema/object-dependency-closure.js';
 
 /** What the guard calls the object in its error message. */
 export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
@@ -51,12 +50,9 @@ export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
  * `SchemaManager.dropTable`, which is also driven by internal rollback and
  * catalog-import cleanup paths that must not be vetoed.
  *
- * NOTE: one catalog snapshot plus one breadth-first walk PER LIVE ASSERTION on
- * every drop, over already-parsed ASTs. DDL is rare and the walk stops at the
- * bodies an assertion actually reaches, so this is not worth caching now; a
- * database holding many assertions over deep view chains would be what makes a
- * cached reverse dependency index (invalidated on every view / assertion
- * change) worth its consistency risk.
+ * The scan itself — one snapshot, home schema first, bodiless assertions
+ * skipped, one walk per assertion — is
+ * {@link assertionReachesHomeSchemaFirst}, shared with the DROP COLUMN verb.
  */
 export function assertNoAssertionDependsOn(
 	db: Database,
@@ -66,23 +62,10 @@ export function assertNoAssertionDependsOn(
 ): void {
 	const schema = db.schemaManager.getSchema(schemaName);
 	if (!schema) return;
-	// One snapshot for every assertion walked: the guard runs before any
-	// mutation, so it is the live state, and sharing it is the snapshot
-	// discipline `schema/object-ref-resolver.ts` documents.
-	const resolvers = snapshotObjectRefResolvers(db);
 	const targetKey = objectRefKey(schema.name, objectName);
 
-	for (const owned of assertionsHomeSchemaFirst(db, schema.name)) {
-		// NOTE: an assertion with no `checkExpression` has no AST to scan and is
-		// skipped, exactly as the rename propagation skips it. Unreachable today —
-		// `SchemaManager.importDDL` accepts only createTable / createIndex /
-		// createView / createMaterializedView / alterIndex, so no assertion
-		// persistence path exists and every live assertion came from
-		// `CREATE ASSERTION`. If a reconstruction path is ever added, this guard
-		// needs a re-parse arm or it silently stops protecting those assertions.
-		const check = owned.assertion.checkExpression;
-		if (!check) continue;
-		const namer = reachableObjects(db, check, owned.schema.name, resolvers).namerOf(targetKey);
+	for (const { owned, reach } of assertionReachesHomeSchemaFirst(db, schema.name)) {
+		const namer = reach.namerOf(targetKey);
 		if (!namer) continue;
 		// `schema.name` rather than the caller's `schemaName`: DROP emitters pass the
 		// name as the user typed it, so `drop table MAIN.t` would otherwise report a

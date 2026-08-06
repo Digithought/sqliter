@@ -1090,6 +1090,44 @@ DROP TABLE dg_g;
 DROP VIEW dg_gv;
 -- run
 
+-- --- The two widenings composed: another schema's assertion, through a view ---
+-- Cross-schema scope and chain-following are independent mechanisms; only their
+-- composition proves the closure is driven by the ASSERTION's home schema and each
+-- reached body by its OWN. Here `temp.dg_h_nonneg` reads `main.dg_hv`, whose bare
+-- `dg_h` must bind main's — even though the root assertion lives in temp.
+
+CREATE TABLE main.dg_h (x INTEGER PRIMARY KEY);
+CREATE VIEW main.dg_hv AS SELECT * FROM dg_h;
+CREATE ASSERTION temp.dg_h_nonneg CHECK (NOT EXISTS (SELECT 1 FROM main.dg_hv WHERE x < 0));
+-- run
+
+DROP TABLE main.dg_h;
+-- error: cannot drop table 'main.dg_h': assertion 'temp.dg_h_nonneg' reaches it through view 'dg_hv'
+
+DROP ASSERTION temp.dg_h_nonneg;
+DROP VIEW main.dg_hv;
+DROP TABLE main.dg_h;
+-- run
+
+-- ...and a temp table of the same name is NOT what the main-owned view body reads,
+-- so dropping it is no business of that assertion's.
+CREATE TABLE main.dg_i (x INTEGER PRIMARY KEY);
+CREATE TABLE temp.dg_i (x INTEGER PRIMARY KEY);
+CREATE VIEW main.dg_iv AS SELECT * FROM dg_i;
+CREATE ASSERTION temp.dg_i_nonneg CHECK (NOT EXISTS (SELECT 1 FROM main.dg_iv WHERE x < 0));
+-- run
+
+DROP TABLE temp.dg_i;
+-- run
+
+DROP TABLE main.dg_i;
+-- error: cannot drop table 'main.dg_i': assertion 'temp.dg_i_nonneg' reaches it through view 'dg_iv'
+
+DROP ASSERTION temp.dg_i_nonneg;
+DROP VIEW main.dg_iv;
+DROP TABLE main.dg_i;
+-- run
+
 -- --- The guard refuses only what the assertion actually names ---
 -- A live assertion must not make every drop in its schema fail.
 

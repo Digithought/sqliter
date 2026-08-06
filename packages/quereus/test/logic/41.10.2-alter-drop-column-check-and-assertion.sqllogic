@@ -850,6 +850,23 @@ drop table temp.DcXsDup;
 drop table main.DcXsDup;
 -- run
 
+-- The two widenings composed: a `temp` assertion reaching a `main` column through a
+-- `main` view. Only the composition proves the column probe runs each reached body
+-- under that body's OWN home schema rather than the root assertion's — the view's
+-- bare `DcXv` must bind main's even though the assertion lives in temp.
+create table main.DcXv (id integer primary key, v integer);
+create view main.DcXvV as select id, v from DcXv;
+create assertion temp.dc_xv check (not exists (select 1 from main.DcXvV where v < 0));
+-- run
+
+alter table main.DcXv drop column v;
+-- error: it is referenced by assertion 'temp.dc_xv' through view 'DcXvV'
+
+drop assertion temp.dc_xv;
+drop view main.DcXvV;
+drop table main.DcXv;
+-- run
+
 -- ===================================================================
 -- 25. A merely SHADOWED name in the reach is still not a reference
 -- ===================================================================

@@ -2,6 +2,8 @@ import type * as AST from '../parser/ast.js';
 import type { Database } from '../core/database.js';
 import type { Schema } from './schema.js';
 import { expressionToString } from '../emit/ast-stringify.js';
+import { snapshotObjectRefResolvers } from './object-ref-resolver.js';
+import { reachableObjects, type ObjectReach } from './object-dependency-closure.js';
 
 export interface AssertionDependentTable {
   /** Instance-unique table reference key, e.g. schema.table#nodeId */
@@ -96,5 +98,48 @@ export function describeOwnedAssertion(owned: OwnedAssertion, homeSchemaName: st
 	return owned.schema.name.toLowerCase() === homeSchemaName.toLowerCase()
 		? `'${owned.assertion.name}'`
 		: `'${owned.schema.name}.${owned.assertion.name}'`;
+}
+
+/** An assertion paired with everything its CHECK body can reach. */
+export interface AssertionReach {
+	owned: OwnedAssertion;
+	reach: ObjectReach;
+}
+
+/**
+ * Every live assertion that has a body to scan, home schema first, each paired
+ * with its {@link reachableObjects} closure.
+ *
+ * The single place the DROP guards' shared preamble lives, so the two of them
+ * cannot drift on the part that is easy to get wrong: ONE catalog snapshot for
+ * the whole scan. A guard runs before its statement's first mutation, so the
+ * snapshot is the live state, and every assertion resolving against the same one
+ * is the discipline `schema/object-ref-resolver.ts` documents — a per-assertion
+ * snapshot would be correct today only by accident.
+ *
+ * NOTE: one breadth-first walk PER LIVE ASSERTION on every drop, uncached, over
+ * already-parsed ASTs. DDL is rare and each walk stops at the bodies that
+ * assertion actually reaches, so this is not worth caching now; a database
+ * holding many assertions over deep view chains would be what makes a cached
+ * reverse dependency index (invalidated on every view / assertion change) worth
+ * its consistency risk.
+ */
+export function* assertionReachesHomeSchemaFirst(
+	db: Database,
+	homeSchemaName: string,
+): Iterable<AssertionReach> {
+	const resolvers = snapshotObjectRefResolvers(db);
+	for (const owned of assertionsHomeSchemaFirst(db, homeSchemaName)) {
+		// NOTE: an assertion with no `checkExpression` has no AST to scan and is
+		// skipped, exactly as the rename propagation skips it. Unreachable today —
+		// `SchemaManager.importDDL` accepts only createTable / createIndex /
+		// createView / createMaterializedView / alterIndex, so no assertion
+		// persistence path exists and every live assertion came from
+		// `CREATE ASSERTION`. If a reconstruction path is ever added, the guards
+		// need a re-parse arm here or they silently stop protecting those assertions.
+		const check = owned.assertion.checkExpression;
+		if (!check) continue;
+		yield { owned, reach: reachableObjects(db, check, owned.schema.name, resolvers) };
+	}
 }
 

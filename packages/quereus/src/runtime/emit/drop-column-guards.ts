@@ -4,9 +4,8 @@ import { StatusCode } from '../../common/types.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { columnReferencedInAst, objectRefKey } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
-import { snapshotObjectRefResolvers } from '../../schema/object-ref-resolver.js';
-import { assertionsHomeSchemaFirst, describeOwnedAssertion } from '../../schema/assertion.js';
-import { reachableObjects, describeReachPath } from '../../schema/object-dependency-closure.js';
+import { assertionReachesHomeSchemaFirst, describeOwnedAssertion } from '../../schema/assertion.js';
+import { describeReachPath } from '../../schema/object-dependency-closure.js';
 import {
 	findColumnExpressionDependent,
 	describeDependentTable,
@@ -166,18 +165,25 @@ function referencedBy(dependent: ExpressionDependent, homeSchemaName: string): s
  * (unlike a CHECK). A body that names the table but not the column — `select *`
  * included — is not a reference and does not block the drop.
  *
- * The same probe runs over EVERY body in the assertion's reach
- * ({@link reachableObjects}), its own included. No column lineage through a view's
- * projection is built, and none is needed: if no body in the chain names the column,
- * the assertion could not have been reading it in the first place. So
+ * The same probe runs over EVERY body in the assertion's reach, its own included, so
  * `create view v as select id, x from t` plus `create assertion a check (… from v
  * where x < 0)` refuses `alter table t drop column x` — the match is on `v`'s body,
  * not the assertion's.
  *
+ * KNOWN GAP — no column lineage through a view's PROJECTION is built, so a body that
+ * re-exposes the column by a star (`create view v as select * from t`, `select t.*`,
+ * or a materialized view of either) hides it: nothing in the chain spells `x`, the
+ * drop is accepted, and the assertion's `where x < 0` then fails every write to the
+ * whole database with `Column not found: x`. Tracked as
+ * `drop-column-guard-blind-to-star-reexposure`, which owns the fix for this family
+ * and for the CHECK / DEFAULT one once `expression-guards-follow-view-chains` lands.
+ * Widening it needs the view's OUTPUT column set, which `ViewSchema` does not carry.
+ *
  * Scope is EVERY schema, matching `assertNoAssertionDependsOn`: an assertion in
  * `temp` naming `main.t`'s column blocks the drop, while one whose bare `t` resolves
  * to `temp.t` does not. Each body resolves its unqualified names under its own home
- * schema path.
+ * schema path. The scan itself is {@link assertionReachesHomeSchemaFirst}, shared
+ * with the table verb.
  */
 export function assertNoAssertionNamesColumn(
 	db: Database,
@@ -185,17 +191,10 @@ export function assertNoAssertionNamesColumn(
 	columnName: string,
 ): void {
 	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
-	// One snapshot shared by every assertion's closure — see the same NOTE on
-	// `assertNoAssertionDependsOn` for why this is not cached across statements.
-	const resolvers = snapshotObjectRefResolvers(db);
 	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
 
-	for (const owned of assertionsHomeSchemaFirst(db, tableSchema.schemaName)) {
-		// An assertion with no `checkExpression` has no AST to scan and is skipped,
-		// exactly as the rename propagation and `assertNoAssertionDependsOn` skip it.
-		const check = owned.assertion.checkExpression;
-		if (!check) continue;
-		for (const reached of reachableObjects(db, check, owned.schema.name, resolvers).bodies) {
+	for (const { owned, reach } of assertionReachesHomeSchemaFirst(db, tableSchema.schemaName)) {
+		for (const reached of reach.bodies) {
 			if (!columnReferencedInAst(reached.body, tableSchema.name, columnName,
 				reached.resolve, tableKey, resolveColumnInSource)) continue;
 			throw new QuereusError(

@@ -67,6 +67,13 @@ export interface ObjectReach {
 	 * The body that NAMES `key`, or `undefined` when nothing in the reach does.
 	 * Breadth-first, so the answer is the shortest chain from the root and its
 	 * {@link ReachedBody.path} is the shortest path to quote in an error.
+	 *
+	 * NOTE: two chains of EQUAL length to the same object tie on queue order,
+	 * i.e. the order the parent bodies happened to name their children. Harmless
+	 * while the path is advisory — either chain is a true one, and dropping the
+	 * rule is the escape hatch for both — but a caller that ever needs a
+	 * deterministic chain (a stable error-message fixture, say) has to order the
+	 * candidates itself.
 	 */
 	namerOf(key: string): ReachedBody | undefined;
 }
