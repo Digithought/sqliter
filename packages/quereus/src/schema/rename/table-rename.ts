@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import { eq, rewriteEach, type ResolveObjectRef } from './shared.js';
+import { eq, objectRefKey, rewriteEach, type ResolveObjectRef, type TableRenameTarget } from './shared.js';
 
 /**
  * Scope-aware, in-place table-reference walker: propagates
@@ -55,6 +55,17 @@ interface TableRef {
 	name: string;
 	/** Rewrite the reference's name in place. */
 	setName: (next: string) => void;
+	/**
+	 * Add a schema qualifier to the reference in place. Present at exactly the
+	 * sites where the reference RE-RESOLVES THROUGH THE CATALOG the next time
+	 * the body is planned — a DML target, a FROM table source, a seedless bare
+	 * column qualifier. ABSENCE IS A SIGNAL, not an omission: the other sites
+	 * either carry their own written qualifier already (a schema-qualified
+	 * column ref) or bind through a FROM frame rather than the catalog (a
+	 * column qualifier bound to an unaliased source), so a qualifier there
+	 * would be wrong or meaningless.
+	 */
+	qualify?: (schemaName: string) => void;
 }
 
 /** Return `true` to stop the walk early (the read-only probe's short-circuit). */
@@ -87,28 +98,43 @@ interface TableRefWalkState {
 }
 
 /**
- * `resolve` / `targetKey` decide matching for both entry points below: a
+ * `target.resolve` and the derived `targetKey` (`objectRefKey(target.schemaName,
+ * target.oldName)`) decide matching for the rewrite and the probe below alike: a
  * reference matches when `resolve(ref.schema, ref.name)` — the reference's
  * planner-parity resolution under the WALKED BODY's home schema path — equals
- * `targetKey`, the canonical key (`objectRefKey(schema, name)`) of the object
- * being renamed / probed. The bare-name equality check in front is a pure
- * short-circuit: the resolver echoes the name it is given into the key, so a
- * reference spelled differently can never resolve to the target.
+ * `targetKey`. The bare-name equality check in front is a pure short-circuit:
+ * the resolver echoes the name it is given into the key, so a reference spelled
+ * differently can never resolve to the target.
+ *
+ * The rewrite additionally enforces a POST-CONDITION the probe does not need:
+ * after rewriting, re-resolving the reference under the same home schema path
+ * against the catalog AS IT WILL BE AFTER THE RENAME (`target.resolveAfter`)
+ * must still yield the renamed object's key. When it would not — the bare new
+ * name is captured by an earlier schema on the body's home path — the reference
+ * is schema-qualified via {@link TableRef.qualify}. Qualification is
+ * conditional, not eager, so the common no-collision rename leaves body text
+ * (and a materialized view's `bodyHash`) exactly as before. A qualified
+ * reference holds the post-condition by construction (it only matched because
+ * its written schema IS the renamed schema, and a qualified name resolves by
+ * passthrough), so only unqualified references can ever qualify.
  */
 export function renameTableInAst(
 	node: AST.AstNode | undefined,
-	oldName: string,
-	newName: string,
-	resolve: ResolveObjectRef,
-	targetKey: string,
+	target: TableRenameTarget,
 	opts?: TableRenameOpts,
 ): boolean {
 	if (!node) return false;
+	const { oldName, newName, schemaName, resolve, resolveAfter } = target;
+	const targetKey = objectRefKey(schemaName, oldName);
+	const newTargetKey = objectRefKey(schemaName, newName);
 	let changed = false;
 	walkTableRefs(node, ref => {
 		if (eq(ref.name, oldName) && resolve(ref.schema, ref.name) === targetKey) {
 			ref.setName(newName);
 			changed = true;
+			if (ref.qualify && resolveAfter(ref.schema, newName) !== newTargetKey) {
+				ref.qualify(schemaName);
+			}
 		}
 	}, opts);
 	return changed;
@@ -207,13 +233,10 @@ export function collectTableRefsInAst(
  */
 export function renameTableInIndexPredicates(
 	indexes: ReadonlyArray<{ readonly predicate?: AST.Expression }> | undefined,
-	oldName: string,
-	newName: string,
-	resolve: ResolveObjectRef,
-	targetKey: string,
+	target: TableRenameTarget,
 ): boolean {
 	return rewriteEach(indexes, idx => idx.predicate,
-		expr => renameTableInAst(expr, oldName, newName, resolve, targetKey));
+		expr => renameTableInAst(expr, target));
 }
 
 /**
@@ -231,13 +254,10 @@ export function renameTableInIndexPredicates(
  */
 export function renameTableInCheckConstraints(
 	checks: ReadonlyArray<{ readonly expr: AST.Expression }> | undefined,
-	oldName: string,
-	newName: string,
-	resolve: ResolveObjectRef,
-	targetKey: string,
+	target: TableRenameTarget,
 ): boolean {
 	return rewriteEach(checks, cc => cc.expr,
-		expr => renameTableInAst(expr, oldName, newName, resolve, targetKey, { rowImageContext: true }));
+		expr => renameTableInAst(expr, target, { rowImageContext: true }));
 }
 
 /**
@@ -271,13 +291,10 @@ export function renameTableInColumnExpressions(
 		readonly defaultValue?: AST.Expression | null;
 		readonly generatedExpr?: AST.Expression;
 	}> | undefined,
-	oldName: string,
-	newName: string,
-	resolve: ResolveObjectRef,
-	targetKey: string,
+	target: TableRenameTarget,
 ): boolean {
 	const rewrite = (expr: AST.Expression): boolean =>
-		renameTableInAst(expr, oldName, newName, resolve, targetKey, { rowImageContext: true });
+		renameTableInAst(expr, target, { rowImageContext: true });
 	// Both walks always run — `||` on the results, not short-circuited between them.
 	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
 	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);
@@ -424,7 +441,14 @@ function visitDmlTarget(
 ): void {
 	if (state.stop) return;
 	if (id.schema === undefined && (withClause?.ctes ?? []).some(c => eq(c.name, id.name))) return;
-	emit(state, { schema: id.schema, name: id.name, setName: next => { id.name = next; } });
+	emit(state, {
+		schema: id.schema,
+		name: id.name,
+		setName: next => { id.name = next; },
+		// A DML target re-resolves through the catalog when the body is next
+		// planned, so it can carry the post-condition qualifier.
+		qualify: schemaName => { id.schema = schemaName; },
+	});
 }
 
 /**
@@ -555,6 +579,13 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 					schema: ts.table.schema,
 					name: ts.table.name,
 					setName: next => { ts.table.name = next; },
+					// A FROM source re-resolves through the catalog, so it can carry
+					// the post-condition qualifier. Column qualifiers bound through
+					// this source are unaffected: their frame bindings were copied by
+					// value BEFORE anything under the FROM was visited, and a
+					// qualified `main.t2` source still exposes the bare qualifier
+					// `t2` to the rows it produces.
+					qualify: schemaName => { ts.table.schema = schemaName; },
 				});
 			}
 			break;
@@ -641,7 +672,10 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 			if (!col.table) break;
 			if (col.schema !== undefined) {
 				// A schema-qualified qualifier (`main.zap.k`) can never be a CTE, an
-				// alias, or a row image — always a real table reference.
+				// alias, or a row image — always a real table reference. No `qualify`:
+				// it only matches when its written schema IS the renamed schema, so
+				// the rewrite post-condition holds by construction (a qualified name
+				// resolves by passthrough).
 				emit(state, {
 					schema: col.schema,
 					name: col.table,
@@ -661,11 +695,22 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 					schema: undefined,
 					name: col.table,
 					setName: next => { col.table = next; },
+					// Seedless, so it re-resolves through the catalog and can carry
+					// the post-condition qualifier. In practice this only ever fires
+					// on an already-unevaluable body: a CHECK / DEFAULT plans under
+					// its owning schema ONLY (`schemaAuthoredContext`), so a bare
+					// qualifier that resolves by falling through to ANOTHER schema —
+					// the only way the post-condition can fail here — is one the
+					// planner already rejects. Harmless, arguably an improvement.
+					qualify: schemaName => { col.schema = schemaName; },
 				});
 			} else if (binding !== null) {
 				// Bound by an unaliased real table source: the qualifier IS that
 				// table's name. Report under the SOURCE's identity so a source in
-				// another schema doesn't match by bare name.
+				// another schema doesn't match by bare name. No `qualify`: this
+				// reference binds through the FROM frame, not the catalog —
+				// qualifying the SOURCE (the `table` case above) is what preserves
+				// resolution; the qualifier just needs the new bare name.
 				emit(state, {
 					schema: binding.schema,
 					name: binding.name,

@@ -14,13 +14,18 @@
 import { expect } from 'chai';
 import { parseExpressionString } from '../../src/parser/index.js';
 import { cloneExpr } from '../../src/planner/mutation/scope-transform.js';
-import { renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver, type TableRenameOpts } from '../../src/schema/rename-rewriter.js';
+import { renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver, type TableRenameOpts, type TableRenameTarget } from '../../src/schema/rename-rewriter.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 
 // These are pure scope-rule tests over a single default schema, so the
-// single-schema resolver reproduces the resolution every case was written for.
+// single-schema resolver reproduces the resolution every case was written for
+// (and, single-schema, `resolveAfter === resolve` — no qualification fires).
 const resolveMain = singleSchemaObjectRefResolver('main');
 const keyFor = (table: string): string => objectRefKey('main', table);
+const targetFor = (table: string): TableRenameTarget => ({
+	oldName: table, newName: NEW_NAME, schemaName: 'main',
+	resolve: resolveMain, resolveAfter: resolveMain,
+});
 
 interface Case {
 	title: string;
@@ -223,7 +228,7 @@ describe('table-rename scope rules', () => {
 		it(c.title, () => {
 			const ast = parseExpressionString(c.sql);
 			const before = expressionToString(ast);
-			const changed = renameTableInAst(ast, c.table, NEW_NAME, resolveMain, keyFor(c.table), c.opts);
+			const changed = renameTableInAst(ast, targetFor(c.table), c.opts);
 			expect(changed, 'changed flag').to.equal(c.referenced);
 			const after = expressionToString(ast);
 			if (!c.referenced) {
@@ -244,7 +249,7 @@ describe('table-rename scope rules', () => {
 		for (const c of CASES) {
 			const ast = parseExpressionString(c.sql);
 			const probed = tableReferencedInAst(ast, c.table, resolveMain, keyFor(c.table), c.opts);
-			const renamed = renameTableInAst(cloneExpr(ast), c.table, NEW_NAME, resolveMain, keyFor(c.table), c.opts);
+			const renamed = renameTableInAst(cloneExpr(ast), targetFor(c.table), c.opts);
 			expect(probed, `probe/rename drift on: ${c.title}`).to.equal(renamed);
 			expect(probed, `expected outcome on: ${c.title}`).to.equal(c.referenced);
 		}
@@ -253,8 +258,8 @@ describe('table-rename scope rules', () => {
 	it('rename is idempotent — a second pass finds nothing', () => {
 		for (const c of CASES.filter(x => x.referenced)) {
 			const ast = parseExpressionString(c.sql);
-			expect(renameTableInAst(ast, c.table, NEW_NAME, resolveMain, keyFor(c.table), c.opts)).to.equal(true);
-			expect(renameTableInAst(ast, c.table, NEW_NAME, resolveMain, keyFor(c.table), c.opts),
+			expect(renameTableInAst(ast, targetFor(c.table), c.opts)).to.equal(true);
+			expect(renameTableInAst(ast, targetFor(c.table), c.opts),
 				`second pass must be a no-op on: ${c.title}`).to.equal(false);
 		}
 	});

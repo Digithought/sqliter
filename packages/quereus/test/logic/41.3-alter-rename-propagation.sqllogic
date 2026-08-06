@@ -1768,3 +1768,49 @@ select X from v2_c59;
 drop view v2_c59;
 drop view v1_c59;
 drop table w_c59;
+
+-- ===================================
+-- 60. The rewrite preserves what a reference resolves to when the NEW name
+--     is already taken earlier on the body's home path (collision)
+-- ===================================
+-- A temp-owned body reading bare `t_c60` means main.t_c60 (temp holds none).
+-- After `alter table main.t_c60 rename to t2_c60`, the bare new name would
+-- resolve to the pre-existing temp.t2_c60 instead — so the propagation adds
+-- the schema qualifier and every dependent keeps reading the renamed table.
+-- (§49 covers the no-collision half: bare rewrites stay unqualified there.)
+
+create table main.t_c60 (id integer primary key, x integer);
+insert into main.t_c60 values (1, 10);
+-- The collision: temp already holds the rename target's name.
+create table temp.t2_c60 (id integer primary key, x integer);
+insert into temp.t2_c60 values (99, 999);
+
+create view temp.v_c60 as select id, x from t_c60;
+create materialized view temp.mv_c60 as select id, x from t_c60;
+create assertion temp.a_c60 check (not exists (select 1 from t_c60 where x < 0));
+
+alter table main.t_c60 rename to t2_c60;
+
+-- The view still reads the renamed table, not temp.t2_c60.
+select id, x from temp.v_c60;
+→ [{"id":1,"x":10}]
+
+-- REFRESH re-plans the MV body from its stored text — the path that exposed a
+-- mis-bound bare reference — and must not swap in temp.t2_c60's rows.
+refresh materialized view temp.mv_c60;
+
+select id, x from temp.mv_c60;
+→ [{"id":1,"x":10}]
+
+-- The assertion still enforces against the renamed table…
+insert into main.t2_c60 values (2, -1);
+-- error: Assertion
+
+-- …and is NOT watching the same-named temp table.
+insert into temp.t2_c60 values (2, -1);
+
+drop assertion temp.a_c60;
+drop materialized view temp.mv_c60;
+drop view temp.v_c60;
+drop table main.t2_c60;
+drop table temp.t2_c60;

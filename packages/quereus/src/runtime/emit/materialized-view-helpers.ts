@@ -24,7 +24,7 @@ import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } f
 import { assertCatalogObjectPersistable } from '../../schema/catalog-persistability.js';
 import type { Schema } from '../../schema/schema.js';
 import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewriter.js';
-import type { ResolveObjectRef } from '../../schema/rename-rewriter.js';
+import type { ResolveObjectRef, TableRenameTarget } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
 import type { BackingHost, BackingRowChange } from '../../vtab/backing-host.js';
@@ -2718,7 +2718,7 @@ function maintainedTablesOf(schema: Schema): MaintainedTableSchema[] {
  * Rewrites every dependent materialized view in `schema` after a source TABLE
  * RENAME — the MV mirror of the plain-view loop in `propagateTableRenameInSchema`
  * ("MV ≡ faster view"): the caller calls this once per schema in the catalog with
- * `resolve` bound to THAT schema's home path, and the body `selectAst` is mutated
+ * `target` bound to THAT schema's home path, and the body `selectAst` is mutated
  * in place by the same `renameTableInAst` walker. An MV is
  * processed when its body AST changed, its `insert defaults` clause changed (an
  * expr subquery can name the renamed table even when the body doesn't), OR its
@@ -2737,14 +2737,11 @@ function maintainedTablesOf(schema: Schema): MaintainedTableSchema[] {
 export async function propagateTableRenameToMaterializedViews(
 	db: Database,
 	schema: Schema,
-	renamedSchemaName: string,
-	oldName: string,
-	newName: string,
 	preStale: ReadonlySet<string>,
-	resolve: ResolveObjectRef,
-	targetKey: string,
+	target: TableRenameTarget,
 ): Promise<void> {
-	const schemaLower = renamedSchemaName.toLowerCase();
+	const { oldName, newName } = target;
+	const schemaLower = target.schemaName.toLowerCase();
 	const oldBase = `${schemaLower}.${oldName.toLowerCase()}`;
 	const newBase = `${schemaLower}.${newName.toLowerCase()}`;
 	for (const mv of maintainedTablesOf(schema)) {
@@ -2753,7 +2750,7 @@ export async function propagateTableRenameToMaterializedViews(
 			// The body walk also descends the trailing `with defaults (…)` clause
 			// (now on `selectAst.defaults`), so a defaults-expr subquery naming the
 			// renamed table flips `bodyChanged` even when the body never names it.
-			const bodyChanged = renameTableInAst(d.selectAst, oldName, newName, resolve, targetKey);
+			const bodyChanged = renameTableInAst(d.selectAst, target);
 			if (!bodyChanged && !d.sourceTables.includes(oldBase)) continue;
 			const covers = d.covers
 				&& d.covers.schemaName.toLowerCase() === schemaLower

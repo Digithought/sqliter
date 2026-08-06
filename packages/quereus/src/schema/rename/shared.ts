@@ -57,6 +57,33 @@ export function singleSchemaObjectRefResolver(schemaName: string): ResolveObject
 }
 
 /**
+ * The object being renamed, as one required argument to the table-rename
+ * rewrite entry points — bundled rather than positional so no caller can
+ * supply the match-time resolution without also answering how the reference
+ * will resolve AFTER the rename lands. That second answer is what enforces the
+ * rewrite's post-condition: a rewritten reference must still resolve to the
+ * renamed object under the walked body's home schema path, or the rewrite adds
+ * a schema qualifier (see `renameTableInAst`).
+ *
+ * Both resolvers must be bound to the WALKED BODY's home schema. The
+ * catalog-backed factory is
+ * {@link import('../object-ref-resolver.js').tableRenameTargetsFor}; a
+ * single-schema world ({@link singleSchemaObjectRefResolver}) passes the same
+ * function for both fields, because a bare new name there always resolves back
+ * to the one schema and no qualification can ever fire.
+ */
+export interface TableRenameTarget {
+	oldName: string;
+	newName: string;
+	/** Schema owning the renamed object. The match key is `objectRefKey(schemaName, oldName)`. */
+	schemaName: string;
+	/** Resolution as the bodies planned it — the pre-mutation snapshot. */
+	resolve: ResolveObjectRef;
+	/** Resolution as it will be after the rename lands. */
+	resolveAfter: ResolveObjectRef;
+}
+
+/**
  * Returns whether the named source table has a column matching the renamed
  * column's old name. Implementation looks up the table in the catalog;
  * `schemaName` is the lowercase schema name (already resolved to the

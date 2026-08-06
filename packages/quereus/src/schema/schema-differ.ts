@@ -1369,7 +1369,12 @@ function declaredIndexCanonicalBody(
 		const resolveRef = singleSchemaObjectRefResolver(schemaName);
 		for (const r of tableRenames) {
 			// Inverse: references to the declared NEW name resolve back to its key.
-			renameTableInAst(clone, r.newName, r.oldName, resolveRef, objectRefKey(schemaName, r.newName));
+			// Single-schema world: a bare name always resolves back to this schema,
+			// so `resolveAfter === resolve` and no qualification ever fires.
+			renameTableInAst(clone, {
+				oldName: r.newName, newName: r.oldName, schemaName,
+				resolve: resolveRef, resolveAfter: resolveRef,
+			});
 		}
 		// The index's OWN table rename retains one special role: seeding the
 		// column rewrites with that table's OLD name (matched by the declared/
@@ -1458,7 +1463,12 @@ function inverseRenamedViewParts(
 	const selectClone = cloneQueryExpr(select);
 	const resolveRef = singleSchemaObjectRefResolver(schemaName);
 	for (const r of tableRenames) {
-		renameTableInAst(selectClone, r.newName, r.oldName, resolveRef, objectRefKey(schemaName, r.newName));
+		// Single-schema world: a bare name always resolves back to this schema,
+		// so `resolveAfter === resolve` and no qualification ever fires.
+		renameTableInAst(selectClone, {
+			oldName: r.newName, newName: r.oldName, schemaName,
+			resolve: resolveRef, resolveAfter: resolveRef,
+		});
 	}
 	for (const [declaredTableName, colRenames] of columnRenamesByTable) {
 		const ownRename = tableRenames.find(r => r.newName.toLowerCase() === declaredTableName);
@@ -1756,8 +1766,12 @@ function reconciledDeclaredBody(
 				// `new.` / `old.` in a CHECK names the row image, so the inverse
 				// reconcile must leave it alone exactly as the forward rewrite does —
 				// otherwise a table renamed to/from `new` would churn the constraint.
-				renameTableInAst(clone.expr!, r.newName, r.oldName,
-					resolveRef, objectRefKey(schemaName, r.newName), { rowImageContext: true });
+				// Single-schema world: a bare name always resolves back to this schema,
+				// so `resolveAfter === resolve` and no qualification ever fires.
+				renameTableInAst(clone.expr!, {
+					oldName: r.newName, newName: r.oldName, schemaName,
+					resolve: resolveRef, resolveAfter: resolveRef,
+				}, { rowImageContext: true });
 			}
 			for (const r of colRenames) {
 				// Inverse: rewrite the declared NEW column name back to its OLD name.

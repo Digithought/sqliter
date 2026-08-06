@@ -14,8 +14,8 @@ import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
 import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameColumnInColumnExpressions, renameTableInCheckConstraints, renameTableInIndexPredicates, renameTableInColumnExpressions, objectRefKey } from '../../schema/rename-rewriter.js';
-import type { ResolveColumnInSource, ResolveObjectRef } from '../../schema/rename-rewriter.js';
-import { snapshotObjectRefResolvers, type ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
+import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from '../../schema/rename-rewriter.js';
+import { snapshotObjectRefResolvers, tableRenameTargetsFor, type ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, uniqueConstraintColumnSetKey } from '../../schema/catalog.js';
@@ -222,8 +222,12 @@ async function runRenameTable(
 	// catalog swap, and each reference must resolve the way its body PLANNED —
 	// against the pre-rename catalog — or a bare `t` would fall through to a
 	// same-named table further down the schema path once `main.t` is gone.
+	// `targetFor` pairs that pre-mutation resolution with its post-rename sibling
+	// snapshot, per body-owning home schema, so every rewrite can hold its
+	// post-condition (a rewritten reference still resolves to the renamed table,
+	// schema-qualifying when the bare new name would otherwise re-bind).
 	const objectResolvers = snapshotObjectRefResolvers(rctx.db);
-	const renameTargetKey = objectRefKey(tableSchema.schemaName, oldName);
+	const targetFor = tableRenameTargetsFor(objectResolvers, tableSchema.schemaName, oldName, newName);
 
 	// Pre-flight, BEFORE the first side effect (`module.renameTable`): every catalog
 	// entry this rename would rewrite must still be persistable. Both the rename
@@ -239,9 +243,8 @@ async function runRenameTable(
 		assertCatalogObjectPersistable(rctx.db, 'materializedView', { ...tableSchema, name: newName });
 	}
 	assertRenameDependentsPersistable(rctx.db,
-		home => ast => renameTableInAst(ast, oldName, newName,
-			objectResolvers.forHomeSchema(home), renameTargetKey),
-		t => rewriteTableForTableRename(t, oldName, newName, objectResolvers, renameTargetKey));
+		home => ast => renameTableInAst(ast, targetFor(home)),
+		t => rewriteTableForTableRename(t, targetFor));
 
 	// Clone schema with new name
 	const updatedTableSchema: TableSchema = {
@@ -289,8 +292,7 @@ async function runRenameTable(
 	// vanished old name. `propagateTableRename` runs the same rewrite over every
 	// table in the catalog, but only after the notify; it is idempotent, so this
 	// call simply makes that pass a no-op for this one table.
-	const renamedTableSchema = rewriteTableForTableRename(
-		updatedTableSchema, oldName, newName, objectResolvers, renameTargetKey);
+	const renamedTableSchema = rewriteTableForTableRename(updatedTableSchema, targetFor);
 
 	// Remove old, add new in the catalog
 	schema.removeTable(oldName);
@@ -315,8 +317,7 @@ async function runRenameTable(
 	// predicates in this and other tables, view and materialized-view bodies).
 	// Best-effort AST rewrite — there is no global dependency tracker yet, so we
 	// walk the catalog and patch in-place.
-	await propagateTableRename(rctx, tableSchema.schemaName, oldName, newName, preStaleMvs,
-		objectResolvers, renameTargetKey);
+	await propagateTableRename(rctx, preStaleMvs, targetFor);
 
 	// Renaming a MAINTAINED table is an ordinary table rename plus a maintenance
 	// re-key: the row-time plan is keyed by `schema.name`, so release the old key
@@ -2138,20 +2139,15 @@ async function rebuildViaShadowTable(
  */
 async function propagateTableRename(
 	rctx: RuntimeContext,
-	renamedSchemaName: string,
-	oldName: string,
-	newName: string,
 	preStaleMvs: ReadonlySet<string>,
-	resolvers: ObjectRefResolvers,
-	targetKey: string,
+	targetFor: (homeSchemaName: string) => TableRenameTarget,
 ): Promise<void> {
 	const schemas = Array.from(rctx.db.schemaManager._getAllSchemas());
 	for (const schema of schemas) {
-		propagateTableRenameInSchema(rctx.db, schema, renamedSchemaName, oldName, newName, resolvers, targetKey);
+		propagateTableRenameInSchema(rctx.db, schema, targetFor);
 	}
 	for (const schema of schemas) {
-		await propagateTableRenameToMaterializedViews(rctx.db, schema, renamedSchemaName, oldName, newName,
-			preStaleMvs, resolvers.forHomeSchema(schema.name), targetKey);
+		await propagateTableRenameToMaterializedViews(rctx.db, schema, preStaleMvs, targetFor(schema.name));
 	}
 	// After all per-schema rewrites and their cascade events: restore any MV this
 	// statement's events marked stale that the rename provably did not affect
@@ -2164,11 +2160,7 @@ async function propagateTableRename(
 function propagateTableRenameInSchema(
 	db: Database,
 	schema: Schema,
-	renamedSchemaName: string,
-	oldName: string,
-	newName: string,
-	resolvers: ObjectRefResolvers,
-	targetKey: string,
+	targetFor: (homeSchemaName: string) => TableRenameTarget,
 ): void {
 	const notifier = db.schemaManager.getChangeNotifier();
 
@@ -2176,7 +2168,7 @@ function propagateTableRenameInSchema(
 		// The just-renamed table is deliberately NOT skipped: it already carries its
 		// new name, but a self-referencing FK's `referencedTable` (and its own CHECK /
 		// DEFAULT / index-predicate ASTs) still name the old one and need rewriting.
-		const updated = rewriteTableForTableRename(table, oldName, newName, resolvers, targetKey);
+		const updated = rewriteTableForTableRename(table, targetFor);
 		if (updated !== table) {
 			schema.addTable(updated);
 			notifier.notifyChange({
@@ -2190,16 +2182,16 @@ function propagateTableRenameInSchema(
 	}
 
 	// Bodies owned by this schema resolve their unqualified names under ITS home
-	// path — one resolver per schema walked, all over the pre-mutation snapshot. A
+	// path — one target per schema walked, all over the pre-mutation snapshot. A
 	// bare `t` matches only when it RESOLVES to the renamed object's key under that
 	// path, so a `temp`-owned body meaning `temp.t` survives a rename of `main.t`.
-	const resolve = resolvers.forHomeSchema(schema.name);
+	const target = targetFor(schema.name);
 	for (const view of Array.from(schema.getAllViews())) {
 		// The body walk also descends the trailing `with defaults (…)` clause
 		// (now stored on `selectAst.defaults`), so a clause-only rewrite — a
 		// defaults-expr subquery referencing the renamed table even when the body
 		// never names it — flips `bodyChanged` and fires the (single) view_modified.
-		const bodyChanged = renameTableInAst(view.selectAst, oldName, newName, resolve, targetKey);
+		const bodyChanged = renameTableInAst(view.selectAst, target);
 		if (bodyChanged) {
 			const updatedView = { ...view, sql: astToString(view.selectAst) };
 			schema.addView(updatedView);
@@ -2221,7 +2213,7 @@ function propagateTableRenameInSchema(
 	// `violationSql` (the text the commit-time evaluator re-parses). Assertions
 	// feed no materialized view, so order against the MV pass is free; sitting
 	// next to the view loop keeps the plain schema-level objects together.
-	propagateTableRenameToAssertions(db, schema, renamedSchemaName, oldName, newName, resolve, targetKey);
+	propagateTableRenameToAssertions(db, schema, target);
 }
 
 /**
@@ -2246,33 +2238,31 @@ function propagateTableRenameInSchema(
  */
 function rewriteTableForTableRename(
 	table: TableSchema,
-	oldName: string,
-	newName: string,
-	resolvers: ObjectRefResolvers,
-	targetKey: string,
+	targetFor: (homeSchemaName: string) => TableRenameTarget,
 ): TableSchema {
-	const resolve = resolvers.forHomeSchema(table.schemaName);
+	const target = targetFor(table.schemaName);
+	const targetKey = objectRefKey(target.schemaName, target.oldName);
 	let changed = false;
 
-	if (renameTableInCheckConstraints(table.checkConstraints, oldName, newName, resolve, targetKey)) changed = true;
+	if (renameTableInCheckConstraints(table.checkConstraints, target)) changed = true;
 
 	const newFks = (table.foreignKeys ?? []).map(fk => {
 		if (objectRefKey(fk.referencedSchema ?? table.schemaName, fk.referencedTable) !== targetKey) return fk;
 		changed = true;
-		return { ...fk, referencedTable: newName };
+		return { ...fk, referencedTable: target.newName };
 	});
 
 	// Partial-index predicates: the AST is mutated in place, so the derived
 	// UNIQUE constraint of a unique partial index (which shares the predicate
 	// by reference — see appendIndexToTableSchema) is rewritten with it.
-	if (renameTableInIndexPredicates(table.indexes, oldName, newName, resolve, targetKey)) changed = true;
+	if (renameTableInIndexPredicates(table.indexes, target)) changed = true;
 
 	// Column-level expressions — a DEFAULT (`w integer default ((select min(v) from u))`)
 	// and a generated column's body. Unlike the column verb's arm, no seeded/unseeded
 	// split: `renameTableInAst` resolves nothing against an implicit owning table, so one
 	// entry point covers the renamed table's own self-referencing default and every other
 	// table's alike.
-	if (renameTableInColumnExpressions(table.columns, oldName, newName, resolve, targetKey)) changed = true;
+	if (renameTableInColumnExpressions(table.columns, target)) changed = true;
 
 	if (!changed) return table;
 

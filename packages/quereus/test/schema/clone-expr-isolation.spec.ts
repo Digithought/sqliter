@@ -14,20 +14,24 @@
 import { expect } from 'chai';
 import { parseExpressionString } from '../../src/parser/index.js';
 import { cloneExpr } from '../../src/planner/mutation/scope-transform.js';
-import { renameTableInAst, renameColumnInCheckExpression, stripSelfQualifierInCheckExpression, objectRefKey, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInCheckExpression, stripSelfQualifierInCheckExpression, objectRefKey, singleSchemaObjectRefResolver, type TableRenameTarget } from '../../src/schema/rename-rewriter.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 
-// Single-schema resolver: these are clone-isolation tests, not resolution tests.
+// Single-schema resolver: these are clone-isolation tests, not resolution tests
+// (and, single-schema, `resolveAfter === resolve` — no qualification fires).
 const resolveMain = singleSchemaObjectRefResolver('main');
-const OLD_T_KEY = objectRefKey('main', 'old_t');
 const T_KEY = objectRefKey('main', 't');
+const OLD_T_TARGET: TableRenameTarget = {
+	oldName: 'old_t', newName: 'renamed_t', schemaName: 'main',
+	resolve: resolveMain, resolveAfter: resolveMain,
+};
 
 describe('cloneExpr isolation vs in-place rename rewriters', () => {
 	it('table rename through a CTE body does NOT leak into the source AST', () => {
 		const src = parseExpressionString('exists (with c as (select x from old_t) select 1 from c)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameTableInAst(clone, 'old_t', 'renamed_t', resolveMain, OLD_T_KEY);
+		const changed = renameTableInAst(clone, OLD_T_TARGET);
 		expect(changed, 'rewriter should hit the CTE body in the clone').to.equal(true);
 		expect(expressionToString(clone)).to.contain('renamed_t');
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
@@ -55,7 +59,7 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 		const src = parseExpressionString('exists (insert into old_t (a) values (1) returning a)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameTableInAst(clone, 'old_t', 'renamed_t', resolveMain, OLD_T_KEY);
+		const changed = renameTableInAst(clone, OLD_T_TARGET);
 		expect(changed, 'rewriter should hit the IUD target in the clone').to.equal(true);
 		expect(expressionToString(clone)).to.contain('renamed_t');
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
@@ -65,7 +69,7 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 		const src = parseExpressionString('exists (update old_t set a = a + 1 where a > 0 returning a)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameTableInAst(clone, 'old_t', 'renamed_t', resolveMain, OLD_T_KEY);
+		const changed = renameTableInAst(clone, OLD_T_TARGET);
 		expect(changed, 'rewriter should hit the UPDATE target in the clone').to.equal(true);
 		expect(expressionToString(clone)).to.contain('renamed_t');
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
@@ -94,7 +98,7 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 		const src = parseExpressionString('exists (delete from old_t where a > 0 returning a)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameTableInAst(clone, 'old_t', 'renamed_t', resolveMain, OLD_T_KEY);
+		const changed = renameTableInAst(clone, OLD_T_TARGET);
 		expect(changed, 'rewriter should hit the DELETE target in the clone').to.equal(true);
 		expect(expressionToString(clone)).to.contain('renamed_t');
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
@@ -105,7 +109,7 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 			'exists (with c as (select x from old_t) insert into t2 (a) select x from c returning a)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameTableInAst(clone, 'old_t', 'renamed_t', resolveMain, OLD_T_KEY);
+		const changed = renameTableInAst(clone, OLD_T_TARGET);
 		expect(changed, 'rewriter should hit the DML-attached CTE body in the clone').to.equal(true);
 		expect(expressionToString(clone)).to.contain('renamed_t');
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);

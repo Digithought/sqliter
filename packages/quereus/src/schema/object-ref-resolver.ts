@@ -1,5 +1,5 @@
 import type { Database } from '../core/database.js';
-import { objectRefKey, type ResolveObjectRef } from './rename-rewriter.js';
+import { objectRefKey, type ResolveObjectRef, type TableRenameTarget } from './rename-rewriter.js';
 
 /**
  * Per-home-schema {@link ResolveObjectRef} factory over ONE catalog snapshot.
@@ -10,6 +10,15 @@ import { objectRefKey, type ResolveObjectRef } from './rename-rewriter.js';
 export interface ObjectRefResolvers {
 	/** Resolver for a stored body owned by `homeSchemaName`. Cached per home schema. */
 	forHomeSchema(homeSchemaName: string): ResolveObjectRef;
+	/**
+	 * A sibling snapshot with one table rename applied — the catalog as it will
+	 * look AFTER the statement. Used only to check the rename post-condition
+	 * ({@link import('./rename/table-rename.js').renameTableInAst}: a rewritten
+	 * reference must still resolve to the renamed object). Derived from this
+	 * snapshot's name sets, never the live catalog, so the SNAPSHOT DISCIPLINE
+	 * below holds for both.
+	 */
+	withTableRenamed(schemaName: string, oldName: string, newName: string): ObjectRefResolvers;
 }
 
 /**
@@ -67,6 +76,12 @@ export function snapshotObjectRefResolvers(db: Database): ObjectRefResolvers {
 		for (const view of schema.getAllViews()) names.add(view.name.toLowerCase());
 		bySchema.set(schema.name.toLowerCase(), names);
 	}
+	return buildResolvers(db, bySchema);
+}
+
+/** The shared builder over `(db, bySchema)`, so a {@link ObjectRefResolvers.withTableRenamed}
+ *  sibling reuses the base snapshot's resolution logic over its own name-set map. */
+function buildResolvers(db: Database, bySchema: ReadonlyMap<string, ReadonlySet<string>>): ObjectRefResolvers {
 	const cache = new Map<string, ResolveObjectRef>();
 	return {
 		forHomeSchema(homeSchemaName: string): ResolveObjectRef {
@@ -85,6 +100,50 @@ export function snapshotObjectRefResolvers(db: Database): ObjectRefResolvers {
 			cache.set(homeLower, resolve);
 			return resolve;
 		},
+		withTableRenamed(schemaName: string, oldName: string, newName: string): ObjectRefResolvers {
+			// Copy the affected schema's Set and the outer Map shallowly — the base
+			// snapshot must keep answering pre-rename.
+			const schemaLower = schemaName.toLowerCase();
+			const sibling = new Map(bySchema);
+			const names = new Set(bySchema.get(schemaLower) ?? []);
+			names.delete(oldName.toLowerCase());
+			names.add(newName.toLowerCase());
+			sibling.set(schemaLower, names);
+			return buildResolvers(db, sibling);
+		},
+	};
+}
+
+/**
+ * Per-home-schema {@link TableRenameTarget} factory for one `ALTER TABLE … RENAME TO`
+ * statement: binds the renamed object's identity to a pre-mutation `resolve` and a
+ * post-rename `resolveAfter` (the {@link ObjectRefResolvers.withTableRenamed} sibling),
+ * both derived per body-owning home schema. One statement builds this once and hands
+ * every walk the target for the walked body's owner, which is what lets the rewrite
+ * enforce its post-condition — a rewritten reference must still resolve to the renamed
+ * object — at the sink.
+ */
+export function tableRenameTargetsFor(
+	resolvers: ObjectRefResolvers,
+	schemaName: string,
+	oldName: string,
+	newName: string,
+): (homeSchemaName: string) => TableRenameTarget {
+	const after = resolvers.withTableRenamed(schemaName, oldName, newName);
+	const cache = new Map<string, TableRenameTarget>();
+	return homeSchemaName => {
+		const homeLower = homeSchemaName.toLowerCase();
+		const cached = cache.get(homeLower);
+		if (cached) return cached;
+		const target: TableRenameTarget = {
+			oldName,
+			newName,
+			schemaName,
+			resolve: resolvers.forHomeSchema(homeSchemaName),
+			resolveAfter: after.forHomeSchema(homeSchemaName),
+		};
+		cache.set(homeLower, target);
+		return target;
 	};
 }
 

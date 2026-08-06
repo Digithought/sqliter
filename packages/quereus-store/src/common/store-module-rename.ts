@@ -14,7 +14,6 @@ import {
 	QuereusError,
 	StatusCode,
 	buildObjectRefResolver,
-	objectRefKey,
 	renameTableInCheckConstraints,
 	renameTableInColumnExpressions,
 	renameTableInIndexPredicates,
@@ -233,12 +232,20 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 			//
 			// Planner-parity resolution, snapshotted here — this hook runs before the
 			// engine's catalog swap, so the snapshot sees the pre-rename catalog.
+			// These walks rewrite only the renamed table's OWN expressions, whose bare
+			// self-references stay in this schema across the rename — so the rewrite
+			// post-condition holds with `resolveAfter === resolve` and no
+			// qualification ever fires (the engine's cross-schema propagation is
+			// where a post-rename sibling snapshot is needed).
 			const resolveRef = buildObjectRefResolver(db, schemaName);
 			const rewriteTable = (from: string, to: string): void => {
-				const fromKey = objectRefKey(schemaName, from);
-				renameTableInIndexPredicates(currentSchema.indexes, from, to, resolveRef, fromKey);
-				renameTableInCheckConstraints(currentSchema.checkConstraints, from, to, resolveRef, fromKey);
-				renameTableInColumnExpressions(currentSchema.columns, from, to, resolveRef, fromKey);
+				const target = {
+					oldName: from, newName: to, schemaName,
+					resolve: resolveRef, resolveAfter: resolveRef,
+				};
+				renameTableInIndexPredicates(currentSchema.indexes, target);
+				renameTableInCheckConstraints(currentSchema.checkConstraints, target);
+				renameTableInColumnExpressions(currentSchema.columns, target);
 			};
 			try {
 				rewriteTable(oldName, newName);

@@ -23,7 +23,8 @@ import { expressionToString } from '../../src/emit/ast-stringify.js';
 import { parseExpressionString } from '../../src/parser/index.js';
 import { parseInsert, parse } from '../../src/parser/index.js';
 import { snapshotObjectRefResolvers } from '../../src/schema/object-ref-resolver.js';
-import { objectRefKey, renameColumnInAst, renameTableInCheckConstraints, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
+import { objectRefKey, renameColumnInAst, renameTableInAst, renameTableInCheckConstraints, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
+import type { ResolveObjectRef, TableRenameTarget } from '../../src/schema/rename-rewriter.js';
 import type * as AST from '../../src/parser/ast.js';
 
 function checkText(db: Database, schema: string, table: string): string {
@@ -88,6 +89,39 @@ describe('object-ref resolver (snapshotObjectRefResolvers)', () => {
 		await db.exec('create view temp.vv as select id from src');
 		const resolvers = snapshotObjectRefResolvers(db);
 		expect(resolvers.forHomeSchema('main')(undefined, 'vv')).to.equal('temp.vv');
+	});
+
+	it('withTableRenamed answers post-rename while the base snapshot keeps answering pre-rename', async () => {
+		await db.exec("pragma schema_path = 'main,temp'");
+		await db.exec('create table main.t (id integer primary key)');
+		await db.exec('create table temp.t (id integer primary key)');
+		await db.exec('create table temp.other (id integer primary key)');
+
+		const base = snapshotObjectRefResolvers(db);
+		const after = base.withTableRenamed('main', 't', 'tnew');
+
+		// Old name gone from the renamed schema: a bare `t` under main's path now
+		// falls through to temp.t.
+		expect(after.forHomeSchema('main')(undefined, 't')).to.equal('temp.t');
+		// New name present: a bare `tnew` in a temp-owned body falls through to
+		// main.tnew (temp holds none).
+		expect(after.forHomeSchema('temp')(undefined, 'tnew')).to.equal('main.tnew');
+		// Other schemas untouched.
+		expect(after.forHomeSchema('main')(undefined, 'other')).to.equal('temp.other');
+		// The base snapshot must keep answering pre-rename.
+		expect(base.forHomeSchema('main')(undefined, 't')).to.equal('main.t');
+		expect(base.forHomeSchema('temp')(undefined, 'tnew')).to.equal('temp.tnew');
+	});
+
+	it('withTableRenamed folds case like everything else in the snapshot', async () => {
+		await db.exec("pragma schema_path = 'main,temp'");
+		await db.exec('create table main.t (id integer primary key)');
+		await db.exec('create table temp.t (id integer primary key)');
+		const after = snapshotObjectRefResolvers(db).withTableRenamed('MAIN', 'T', 'TNEW');
+		// Removal and addition both case-fold: bare `t` under main's path no
+		// longer finds main.t, and the upper-cased new name is found lower.
+		expect(after.forHomeSchema('main')(undefined, 't')).to.equal('temp.t');
+		expect(after.forHomeSchema('temp')(undefined, 'TNEW')).to.equal('main.tnew');
 	});
 });
 
@@ -442,8 +476,10 @@ describe('row-image context through the shared CHECK collection helper', () => {
 	it('renaming a table named `new` leaves a bare new.a row image alone (helper level — both engine and store call this)', () => {
 		const expr = parseExpressionString('new.a > 0') as AST.Expression;
 		const resolve = singleSchemaObjectRefResolver('main');
-		const changed = renameTableInCheckConstraints(
-			[{ expr }], 'new', 'n2', resolve, objectRefKey('main', 'new'));
+		const changed = renameTableInCheckConstraints([{ expr }], {
+			oldName: 'new', newName: 'n2', schemaName: 'main',
+			resolve, resolveAfter: resolve,
+		});
 		expect(changed).to.equal(false);
 		expect(expressionToString(expr).replace(/"/g, '')).to.contain('new.a');
 	});
@@ -459,5 +495,208 @@ describe('row-image context through the shared CHECK collection helper', () => {
 		} finally {
 			await db.close();
 		}
+	});
+});
+
+/**
+ * The rewrite post-condition, pinned at the walker level: after `renameTableInAst`
+ * a reference must still resolve — under the walked body's home path, against the
+ * catalog AS IT WILL BE AFTER the rename (`resolveAfter`) — to the renamed object.
+ * When the bare new name would re-bind (an earlier schema on the path already
+ * holds it), the walker schema-qualifies the reference; when it would not, the
+ * text is left unqualified (no churn). The hand-built resolver pair below models
+ * a temp-owned body over home path [temp, main]: pre-rename `t` falls through to
+ * main.t; post-rename the bare `t2` is captured by an existing temp.t2.
+ */
+describe('rename rewrite post-condition (conditional qualification at the walker level)', () => {
+	const qualified: ResolveObjectRef = (schema, name) => objectRefKey(schema!, name);
+	const resolvePre: ResolveObjectRef = (schema, name) => {
+		if (schema !== undefined) return qualified(schema, name);
+		const n = name.toLowerCase();
+		return n === 't2' ? 'temp.t2' : n === 't' ? 'main.t' : `temp.${n}`;
+	};
+	/** Post-rename with the collision: bare `t2` binds temp.t2, not main.t2. */
+	const afterCollision: ResolveObjectRef = (schema, name) => {
+		if (schema !== undefined) return qualified(schema, name);
+		const n = name.toLowerCase();
+		return n === 't2' ? 'temp.t2' : `temp.${n}`;
+	};
+	/** Post-rename with the new name free: bare `t2` falls through to main.t2. */
+	const afterFree: ResolveObjectRef = (schema, name) => {
+		if (schema !== undefined) return qualified(schema, name);
+		const n = name.toLowerCase();
+		return n === 't2' ? 'main.t2' : `temp.${n}`;
+	};
+	const collisionTarget: TableRenameTarget = {
+		oldName: 't', newName: 't2', schemaName: 'main',
+		resolve: resolvePre, resolveAfter: afterCollision,
+	};
+	const freeTarget: TableRenameTarget = {
+		oldName: 't', newName: 't2', schemaName: 'main',
+		resolve: resolvePre, resolveAfter: afterFree,
+	};
+
+	const rewritten = (sql: string, target: TableRenameTarget): string => {
+		const ast = parseExpressionString(sql);
+		expect(renameTableInAst(ast, target), `expected a rewrite in: ${sql}`).to.equal(true);
+		return expressionToString(ast).replace(/"/g, '');
+	};
+
+	it('qualifies a FROM source when the bare new name would re-bind', () => {
+		expect(rewritten('exists (select 1 from t)', collisionTarget)).to.contain('from main.t2');
+	});
+
+	it('leaves the FROM source unqualified when the new name resolves back (no text churn)', () => {
+		const text = rewritten('exists (select 1 from t)', freeTarget);
+		expect(text).to.contain('from t2');
+		expect(text).to.not.contain('main.');
+	});
+
+	it('qualifies a DML target when the bare new name would re-bind', () => {
+		expect(rewritten('exists (insert into t (a) values (1) returning a)', collisionTarget))
+			.to.contain('into main.t2');
+	});
+
+	it('keeps a bound column qualifier bare while its FROM source qualifies', () => {
+		// `t.x` binds through the FROM frame, not the catalog: qualifying the
+		// source is what preserves resolution; the qualifier takes the bare new
+		// name, which `from main.t2` still exposes.
+		const text = rewritten('exists (select t.x from t)', collisionTarget);
+		expect(text).to.contain('t2.x');
+		expect(text).to.not.contain('main.t2.x');
+		expect(text).to.contain('from main.t2');
+	});
+
+	it('does not double-qualify an already schema-qualified reference', () => {
+		const text = rewritten('exists (select 1 from main.t)', collisionTarget);
+		expect(text).to.contain('from main.t2');
+		expect(text).to.not.contain('main.main');
+	});
+
+	it('qualifies a seedless bare column qualifier when the bare new name would re-bind', () => {
+		expect(rewritten('t.b > 0', collisionTarget)).to.contain('main.t2.b');
+	});
+});
+
+/**
+ * The engine-level collision grid: for each body kind (view, materialized view,
+ * assertion) and each reference form (schema-qualified, bare same-schema, bare
+ * fallthrough), the body must still resolve to the intended table after
+ * `alter table main.t rename to t2` — WITH the new name already taken by
+ * `temp.t2`, earlier on a temp-owned body's home path. The "new name free"
+ * column of the grid is covered by the existing tests above ('cross-schema
+ * dependents follow a rename').
+ */
+describe('rename rewrite preserves what a reference resolves to (collision grid)', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec("pragma schema_path = 'main,temp'");
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('insert into main.t values (1, 10)');
+		// The collision: temp already holds the rename target's name, and temp
+		// precedes main on a temp-owned body's home path.
+		await db.exec('create table temp.t2 (id integer primary key, x integer)');
+		await db.exec('insert into temp.t2 values (99, 999)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const viewSql = (schema: string, name: string): string =>
+		db.schemaManager.getSchema(schema)!.getView(name)!.sql.replace(/"/g, '');
+
+	async function rows(sql: string): Promise<unknown[]> {
+		const out: unknown[] = [];
+		for await (const r of db.eval(sql)) out.push(r);
+		return out;
+	}
+
+	async function expectRefused(sql: string, label: string): Promise<void> {
+		let err: Error | undefined;
+		try {
+			await db.exec(sql);
+		} catch (e) {
+			err = e instanceof Error ? e : new Error(String(e));
+		}
+		expect(err, label).to.not.be.undefined;
+	}
+
+	// ── views ──────────────────────────────────────────────────────────
+
+	it('view, bare fallthrough: the reference is schema-qualified and keeps reading the renamed table', async () => {
+		await db.exec('create view temp.vt as select id, x from t');
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('temp', 'vt')).to.contain('main.t2');
+		expect(await rows('select * from temp.vt')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('view, bare same-schema: stays unqualified (home schema wins) and reads the renamed table', async () => {
+		await db.exec('create view main.vm as select id, x from t');
+		await db.exec('alter table main.t rename to t2');
+		const sql = viewSql('main', 'vm');
+		expect(sql).to.contain('t2');
+		expect(sql, 'no qualifier churn when the bare name still resolves home-first').to.not.match(/main\./);
+		expect(await rows('select * from main.vm')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('view, schema-qualified: follows the rename without re-binding', async () => {
+		await db.exec('create view temp.vq as select id, x from main.t');
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('temp', 'vq')).to.contain('main.t2');
+		expect(await rows('select * from temp.vq')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	// ── materialized views (REFRESH re-plans the body — the path that
+	//    exposed a mis-bound bare reference) ────────────────────────────
+
+	it('materialized view, bare fallthrough: REFRESH still reads the renamed table', async () => {
+		await db.exec('create materialized view temp.mv as select id, x from t');
+		await db.exec('alter table main.t rename to t2');
+		const mv = db.schemaManager.getTable('temp', 'mv');
+		expect(mv!.derivation?.stale, 'MV left live').to.equal(false);
+		expect(mv!.derivation?.sourceTables).to.deep.equal(['main.t2']);
+		expect(await rows('select * from temp.mv')).to.deep.equal([{ id: 1, x: 10 }]);
+		await db.exec('refresh materialized view temp.mv');
+		expect(await rows('select * from temp.mv'), 'refresh must not swap in temp.t2 rows')
+			.to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('materialized view, bare same-schema: REFRESH still reads the renamed table', async () => {
+		await db.exec('create materialized view main.mvm as select id, x from t');
+		await db.exec('alter table main.t rename to t2');
+		await db.exec('refresh materialized view main.mvm');
+		expect(await rows('select * from main.mvm')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('materialized view, schema-qualified: REFRESH still reads the renamed table', async () => {
+		await db.exec('create materialized view temp.mvq as select id, x from main.t');
+		await db.exec('alter table main.t rename to t2');
+		await db.exec('refresh materialized view temp.mvq');
+		expect(await rows('select * from temp.mvq')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	// ── assertions (a violating write must still be REFUSED) ───────────
+
+	it('assertion, bare fallthrough: still enforces against the renamed table, not temp.t2', async () => {
+		await db.exec('create assertion temp.a check (not exists (select 1 from t where x < 0))');
+		await db.exec('alter table main.t rename to t2');
+		await expectRefused('insert into main.t2 values (2, -1)',
+			'assertion must still refuse a violating write to the renamed table');
+		// And it is NOT watching the same-named temp table.
+		await db.exec('insert into temp.t2 values (2, -1)');
+	});
+
+	it('assertion, bare same-schema: still enforces against the renamed table', async () => {
+		await db.exec('create assertion main.am check (not exists (select 1 from t where x < 0))');
+		await db.exec('alter table main.t rename to t2');
+		await expectRefused('insert into main.t2 values (2, -1)',
+			'assertion must still refuse a violating write to the renamed table');
+	});
+
+	it('assertion, schema-qualified: still enforces against the renamed table, not temp.t2', async () => {
+		await db.exec('create assertion temp.aq check (not exists (select 1 from main.t where x < 0))');
+		await db.exec('alter table main.t rename to t2');
+		await expectRefused('insert into main.t2 values (2, -1)',
+			'assertion must still refuse a violating write to the renamed table');
+		await db.exec('insert into temp.t2 values (2, -1)');
 	});
 });

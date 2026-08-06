@@ -4,14 +4,14 @@ import type { Schema } from '../../schema/schema.js';
 import type { AssertionDependentTable, IntegrityAssertionSchema } from '../../schema/assertion.js';
 import { buildAssertionViolationSql } from '../../schema/assertion.js';
 import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewriter.js';
-import type { ResolveColumnInSource, ResolveObjectRef } from '../../schema/rename-rewriter.js';
+import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('runtime:emit:assertion-rename');
 
 // NOTE: both passes are called once per schema in the catalog — the same scope the
 // plain-view and materialized-view loops in `alter-table.ts` use — and the caller
-// passes the resolver built for THAT schema's home path (over the statement's
+// passes the target/resolver built for THAT schema's home path (over the statement's
 // pre-mutation snapshot), so an unqualified `t` in a body matches only when it
 // actually RESOLVES to the renamed table. An assertion in `temp` naming `main.t`
 // therefore follows a rename of `main.t`, while one whose bare `t` means `temp.t`
@@ -33,19 +33,15 @@ const log = createLogger('runtime:emit:assertion-rename');
 export function propagateTableRenameToAssertions(
 	db: Database,
 	schema: Schema,
-	renamedSchemaName: string,
-	oldName: string,
-	newName: string,
-	resolve: ResolveObjectRef,
-	targetKey: string,
+	target: TableRenameTarget,
 ): void {
-	const schemaLower = renamedSchemaName.toLowerCase();
-	const oldBase = `${schemaLower}.${oldName.toLowerCase()}`;
-	const newBase = `${schemaLower}.${newName.toLowerCase()}`;
+	const schemaLower = target.schemaName.toLowerCase();
+	const oldBase = `${schemaLower}.${target.oldName.toLowerCase()}`;
+	const newBase = `${schemaLower}.${target.newName.toLowerCase()}`;
 	for (const assertion of Array.from(schema.getAllAssertions())) {
 		const check = assertion.checkExpression;
 		if (!check) continue;
-		if (!renameTableInAst(check, oldName, newName, resolve, targetKey)) continue;
+		if (!renameTableInAst(check, target)) continue;
 		reregisterRewrittenAssertion(db, schema, assertion, check,
 			remapDependentTables(assertion.dependentTables, oldBase, newBase));
 	}
