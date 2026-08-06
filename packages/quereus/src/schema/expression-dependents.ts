@@ -56,9 +56,9 @@ import { snapshotObjectRefResolvers } from './object-ref-resolver.js';
  * DIRECT reference. A CHECK that reads a VIEW whose body reads the dropped object
  * (`check (n < (select max(v) from vv))` over `create view vv as select v from t`) is not
  * matched, so `drop table t` / `alter table t drop column v` is still accepted and still
- * leaves the referencing table unwritable. Closing it needs the reachability closure
- * `assertion-guards-follow-view-chains-and-schemas` builds for the assertion guards; both
- * families should then share it rather than grow a second walk.
+ * leaves the referencing table unwritable. The reachability closure that closes it now
+ * exists — `schema/object-dependency-closure.ts`, which the assertion guards already
+ * consume — so this family should widen onto THAT rather than grow a second walk.
  *
  * NOTE: each probe walks every table in every schema, re-walking already-parsed ASTs.
  * DDL is rare and schemas hold handfuls of tables, so this is not worth optimising now;

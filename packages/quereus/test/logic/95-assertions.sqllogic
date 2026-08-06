@@ -924,10 +924,7 @@ CREATE TABLE temp.dg_s (x INTEGER PRIMARY KEY);
 CREATE ASSERTION temp.dg_s_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_s WHERE x < 0));
 -- run
 
--- main.dg_s is not what the temp assertion names — `temp.dg_s` shadows it. When
--- no like-named table shadows it the bare name DOES bind across schemas and the
--- guard misses it; that arm is tracked by
--- `backlog/bug-drop-table-under-view-an-assertion-names`.
+-- main.dg_s is not what the temp assertion names — `temp.dg_s` shadows it.
 DROP TABLE main.dg_s;
 -- run
 
@@ -936,6 +933,161 @@ DROP TABLE temp.dg_s;
 
 DROP ASSERTION temp.dg_s_nonneg;
 DROP TABLE temp.dg_s;
+-- run
+
+-- --- Cross-schema scoping, the other direction ---
+-- The guard consults assertions in EVERY schema, not only the dropped object's
+-- own: a `temp` assertion naming `main.t` explicitly blocks dropping it, and the
+-- refusal qualifies the assertion so the user can find the thing to drop.
+
+CREATE TABLE main.dg_x (x INTEGER PRIMARY KEY);
+CREATE TABLE main.dg_x_other (i INTEGER PRIMARY KEY);
+CREATE ASSERTION temp.dg_x_nonneg CHECK (NOT EXISTS (SELECT 1 FROM main.dg_x WHERE x < 0));
+-- run
+
+DROP TABLE main.dg_x;
+-- error: cannot drop table 'main.dg_x': assertion 'temp.dg_x_nonneg' still refers to it
+
+-- The refusal is a clean no-op — writes to an unrelated table still commit,
+-- which is exactly what the missed drop used to break.
+INSERT INTO main.dg_x_other VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM main.dg_x_other;
+→ [{ "n": 1 }]
+
+DROP ASSERTION temp.dg_x_nonneg;
+DROP TABLE main.dg_x;
+DROP TABLE main.dg_x_other;
+-- run
+
+-- A `temp` assertion whose BARE name has no `temp` table to bind resolves down
+-- its home path to `main` and blocks that drop too.
+CREATE TABLE main.dg_y (x INTEGER PRIMARY KEY);
+CREATE TABLE temp.dg_y_anchor (x INTEGER PRIMARY KEY);
+CREATE ASSERTION temp.dg_y_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_y WHERE x < 0));
+-- run
+
+DROP TABLE main.dg_y;
+-- error: cannot drop table 'main.dg_y': assertion 'temp.dg_y_nonneg' still refers to it
+
+DROP ASSERTION temp.dg_y_nonneg;
+DROP TABLE main.dg_y;
+DROP TABLE temp.dg_y_anchor;
+-- run
+
+-- --- The assertion reaches the object THROUGH a view ---
+-- An assertion body names a view; the view's body names the table. Dropping the
+-- table used to be accepted and then made every write to the whole database fail
+-- with an error naming neither the assertion nor the view.
+
+CREATE TABLE dg_c (x INTEGER PRIMARY KEY);
+CREATE VIEW dg_cv AS SELECT * FROM dg_c;
+CREATE TABLE dg_c_other (i INTEGER PRIMARY KEY);
+CREATE ASSERTION dg_c_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_cv WHERE x < 0));
+-- run
+
+-- The message names the chain: an assertion whose body does not mention `dg_c`
+-- is unactionable advice without it.
+DROP TABLE dg_c;
+-- error: cannot drop table 'main.dg_c': assertion 'dg_c_nonneg' reaches it through view 'dg_cv'
+
+-- Still a clean no-op, and the unrelated table is still writable.
+INSERT INTO dg_c_other VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM dg_c_other;
+→ [{ "n": 1 }]
+
+DROP ASSERTION dg_c_nonneg;
+DROP TABLE dg_c;
+DROP VIEW dg_cv;
+DROP TABLE dg_c_other;
+-- run
+
+-- --- Three levels deep, and the intermediate views are guarded too ---
+-- One-hop expansion is the natural under-fix; the chain here is
+-- assertion → dg_d2 → dg_d1 → dg_d.
+
+CREATE TABLE dg_d (x INTEGER PRIMARY KEY);
+CREATE VIEW dg_d1 AS SELECT * FROM dg_d;
+CREATE VIEW dg_d2 AS SELECT * FROM dg_d1;
+CREATE ASSERTION dg_d_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_d2 WHERE x < 0));
+-- run
+
+DROP TABLE dg_d;
+-- error: cannot drop table 'main.dg_d': assertion 'dg_d_nonneg' reaches it through view 'dg_d2' -> view 'dg_d1'
+
+-- A view reached only through a further view is refused on the same closure.
+DROP VIEW dg_d1;
+-- error: cannot drop view 'main.dg_d1': assertion 'dg_d_nonneg' reaches it through view 'dg_d2'
+
+-- The one the assertion names directly keeps the direct wording.
+DROP VIEW dg_d2;
+-- error: cannot drop view 'main.dg_d2': assertion 'dg_d_nonneg' still refers to it
+
+-- Dropping the rule is still the whole escape hatch, at any depth.
+DROP ASSERTION dg_d_nonneg;
+DROP VIEW dg_d2;
+DROP VIEW dg_d1;
+DROP TABLE dg_d;
+-- run
+
+-- --- A materialized view in the chain ---
+
+CREATE TABLE dg_e (x INTEGER PRIMARY KEY);
+CREATE MATERIALIZED VIEW dg_emv AS SELECT x FROM dg_e;
+CREATE VIEW dg_ev AS SELECT * FROM dg_emv;
+CREATE ASSERTION dg_e_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_ev WHERE x < 0));
+-- run
+
+DROP TABLE dg_e;
+-- error: cannot drop table 'main.dg_e': assertion 'dg_e_nonneg' reaches it through view 'dg_ev' -> materialized view 'dg_emv'
+
+-- The maintained table in the middle is guarded on both of its drop verbs.
+DROP MATERIALIZED VIEW dg_emv;
+-- error: cannot drop materialized view 'main.dg_emv': assertion 'dg_e_nonneg' reaches it through view 'dg_ev'
+
+DROP TABLE dg_emv;
+-- error: cannot drop table 'main.dg_emv': assertion 'dg_e_nonneg' reaches it through view 'dg_ev'
+
+DROP ASSERTION dg_e_nonneg;
+DROP VIEW dg_ev;
+DROP MATERIALIZED VIEW dg_emv;
+DROP TABLE dg_e;
+-- run
+
+-- --- A merely SHADOWED name is still not a reference ---
+-- The closure collects every reference the traversal reports, and that traversal
+-- is scope-aware — a `with dg_f as (…)` that shadows the name binds the CTE, not
+-- the real table, so it must not turn a legal drop into an error. This is the
+-- property a collect-everything walk would silently lose.
+
+CREATE TABLE dg_f (x INTEGER PRIMARY KEY);
+CREATE TABLE dg_f_src (x INTEGER PRIMARY KEY);
+CREATE ASSERTION dg_f_nonneg CHECK (NOT EXISTS (
+  WITH dg_f AS (SELECT x FROM dg_f_src) SELECT 1 FROM dg_f WHERE x < 0));
+-- run
+
+DROP TABLE dg_f;
+-- run
+
+-- ...and the table the CTE actually reads IS still protected.
+DROP TABLE dg_f_src;
+-- error: cannot drop table 'main.dg_f_src': assertion 'dg_f_nonneg' still refers to it
+
+DROP ASSERTION dg_f_nonneg;
+DROP TABLE dg_f_src;
+-- run
+
+-- --- A plain view over a dropped table, with no assertion reading it ---
+-- The engine's stated asymmetry survives the widening: without an assertion in
+-- the picture the view just breaks and the drop stands.
+
+CREATE TABLE dg_g (x INTEGER PRIMARY KEY);
+CREATE VIEW dg_gv AS SELECT * FROM dg_g;
+-- run
+
+DROP TABLE dg_g;
+DROP VIEW dg_gv;
 -- run
 
 -- --- The guard refuses only what the assertion actually names ---

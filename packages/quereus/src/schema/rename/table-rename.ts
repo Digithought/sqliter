@@ -8,12 +8,14 @@ import { eq, rewriteEach, type ResolveObjectRef } from './shared.js';
  * generated expressions) and answers the read-only "does this AST reference
  * table X?" probe the DROP guards use.
  *
- * Both verbs are expressed over ONE traversal ({@link visitTableRefs}), which
- * reports every REAL table reference — one not shadowed by a CTE, a FROM
+ * All three verbs are expressed over ONE traversal ({@link visitTableRefs}),
+ * which reports every REAL table reference — one not shadowed by a CTE, a FROM
  * alias, or the `new.`/`old.` row image — to a sink. The rewrite sink renames
  * matching references in place; the probe sink records a match and stops the
- * walk. One traversal is the invariant, not an implementation detail: the
- * DROP guard must refuse exactly the references a rename would rewrite.
+ * walk; the collect sink ({@link collectTableRefsInAst}) keys every reference
+ * for the reachability closure the DROP guards follow through view chains. One
+ * traversal is the invariant, not an implementation detail: the DROP guards
+ * must refuse exactly the references a rename would rewrite.
  *
  * All name comparisons are case-insensitive to match the Quereus catalog
  * rules. Walkers mutate the input AST and return whether anything changed, so
@@ -146,6 +148,45 @@ export function tableReferencedInAst(
 		}
 	}, opts);
 	return found;
+}
+
+/**
+ * Every real (non-shadowed) table / view reference in `node`, keyed the way
+ * {@link renameTableInAst} and {@link tableReferencedInAst} key their target:
+ * `resolve(ref.schema, ref.name)`, the reference's planner-parity resolution
+ * under the WALKED BODY's home schema path.
+ *
+ * The collect-all THIRD sink over the same {@link walkTableRefs} traversal, so
+ * it inherits the scope-awareness of the other two for free: a body whose
+ * `with t as (…)` merely SHADOWS the name contributes no `<schema>.t` key, a FROM
+ * alias contributes nothing, and a `new.` / `old.` row-image qualifier under
+ * {@link TableRenameOpts.rowImageContext} contributes nothing. That matters
+ * more here than anywhere else — a collect-everything walk is exactly where
+ * that property gets quietly lost, and the reachability closure built on this
+ * ({@link import('../object-dependency-closure.js').reachableObjects}) turns
+ * every key it yields into a refused DROP.
+ *
+ * The value is the object NAME the key was built from, lowercased. The
+ * resolver echoes the name it is given into the key, so this is always
+ * `ref.name.toLowerCase()`; it is returned rather than re-derived because a
+ * schema name may itself contain a dot, which makes splitting a key by
+ * separator scan wrong — see {@link import('./shared.js').objectRefKeySchema},
+ * whose whole job is that split and which needs exactly this.
+ */
+export function collectTableRefsInAst(
+	node: AST.AstNode | undefined,
+	resolve: ResolveObjectRef,
+	opts?: TableRenameOpts,
+): Map<string, string> {
+	const refs = new Map<string, string>();
+	if (!node) return refs;
+	walkTableRefs(node, ref => {
+		const key = resolve(ref.schema, ref.name);
+		// `undefined` means "no resolver could be consulted at all" — a reference
+		// with no key is not something a closure can follow.
+		if (key !== undefined) refs.set(key, ref.name.toLowerCase());
+	}, opts);
+	return refs;
 }
 
 /**

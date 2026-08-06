@@ -14,10 +14,11 @@
  */
 
 export type { ResolveColumnInSource, ResolveObjectRef } from './rename/shared.js';
-export { objectRefKey, singleSchemaObjectRefResolver } from './rename/shared.js';
+export { objectRefKey, objectRefKeySchema, singleSchemaObjectRefResolver } from './rename/shared.js';
 export {
 	renameTableInAst,
 	tableReferencedInAst,
+	collectTableRefsInAst,
 	renameTableInIndexPredicates,
 	renameTableInCheckConstraints,
 	renameTableInColumnExpressions,

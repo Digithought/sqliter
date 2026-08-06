@@ -742,3 +742,138 @@ drop table temp.DcDupRef;
 drop table temp.DcDup;
 drop table main.DcDup;
 -- run
+
+-- ===================================================================
+-- 23. An assertion reaches the column THROUGH a view
+-- ===================================================================
+--
+-- The assertion body names a view; the VIEW's body names the column. Dropping the
+-- column used to be accepted and then made every write to the whole database fail —
+-- the assertion evaluator recompiles every live assertion on any commit.
+--
+-- No column lineage through the view's projection is built, and none is needed: the
+-- match is on the view's own body. If no body in the chain named the column, the
+-- assertion could not have been reading it.
+
+create table DcVw (id integer primary key, x integer);
+create view DcVwV as select id, x from DcVw;
+create table DcVwBystander (id integer primary key);
+create assertion dc_vw check (not exists (select 1 from DcVwV where x < 0));
+-- run
+
+-- The message names the chain — an assertion whose body does not mention `x` is
+-- unactionable advice without it.
+alter table DcVw drop column x;
+-- error: it is referenced by assertion 'dc_vw' through view 'DcVwV'
+
+-- Clean no-op: the unrelated table is still writable, which is exactly what the
+-- missed refusal used to break.
+insert into DcVwBystander values (1);
+commit;
+select count(*) as c from DcVwBystander;
+→ [{"c":1}]
+
+drop assertion dc_vw;
+alter table DcVw drop column x;
+drop view DcVwV;
+drop table DcVw;
+drop table DcVwBystander;
+-- run
+
+-- Three levels deep — one-hop expansion is the natural under-fix.
+create table DcCh (id integer primary key, x integer);
+create view DcCh1 as select id, x from DcCh;
+create view DcCh2 as select id, x from DcCh1;
+create assertion dc_ch check (not exists (select 1 from DcCh2 where x < 0));
+-- run
+
+alter table DcCh drop column x;
+-- error: it is referenced by assertion 'dc_ch' through view 'DcCh2' -> view 'DcCh1'
+
+drop assertion dc_ch;
+drop view DcCh2;
+drop view DcCh1;
+drop table DcCh;
+-- run
+
+-- A view in the chain that names the TABLE but not the column is no obstacle,
+-- exactly as a direct `select *` body is not (§7).
+create table DcVwStar (id integer primary key, p integer, q integer);
+create view DcVwStarV as select id, q from DcVwStar;
+create assertion dc_vw_star check (not exists (select 1 from DcVwStarV where q < 0));
+-- run
+
+alter table DcVwStar drop column p;
+insert into DcVwStar values (1, 8);
+commit;
+select q from DcVwStar;
+→ [{"q":8}]
+
+drop assertion dc_vw_star;
+drop view DcVwStarV;
+drop table DcVwStar;
+-- run
+
+-- ===================================================================
+-- 24. The assertion guard consults assertions in EVERY schema
+-- ===================================================================
+--
+-- Same rule §22 pins for CHECK constraints: what decides a match is whether the
+-- reference RESOLVES to the altered table, not which schema the rule lives in. The
+-- refusal qualifies the assertion so the user can find the thing to drop.
+
+create table main.DcXs (id integer primary key, v integer);
+create assertion temp.dc_xs check (not exists (select 1 from main.DcXs where v < 0));
+-- run
+
+alter table main.DcXs drop column v;
+-- error: it is referenced by assertion 'temp.dc_xs'
+
+drop assertion temp.dc_xs;
+alter table main.DcXs drop column v;
+drop table main.DcXs;
+-- run
+
+-- ...and a bare name in `temp` that `temp` itself holds is not a reference to main's.
+create table main.DcXsDup (id integer primary key, v integer);
+create table temp.DcXsDup (id integer primary key, v integer);
+create assertion temp.dc_xs_dup check (not exists (select 1 from DcXsDup where v < 0));
+insert into main.DcXsDup values (1, 7);
+-- run
+
+alter table main.DcXsDup drop column v;
+select id from main.DcXsDup;
+→ [{"id":1}]
+
+drop assertion temp.dc_xs_dup;
+drop table temp.DcXsDup;
+drop table main.DcXsDup;
+-- run
+
+-- ===================================================================
+-- 25. A merely SHADOWED name in the reach is still not a reference
+-- ===================================================================
+--
+-- The closure walks every body it reaches with the same scope-aware probe, so a
+-- `with DcSh as (…)` that shadows the name binds the CTE, not the real table. This is
+-- the property a collect-everything walk would silently lose, turning a missed
+-- refusal into a false one.
+
+create table DcSh (id integer primary key, x integer);
+create table DcShSrc (id integer primary key, x integer);
+create assertion dc_sh check (not exists (
+  with DcSh as (select id, x from DcShSrc) select 1 from DcSh where x < 0));
+-- run
+
+alter table DcSh drop column x;
+select id from DcSh;
+→ []
+
+-- ...and the table the CTE actually reads IS still protected.
+alter table DcShSrc drop column x;
+-- error: it is referenced by assertion 'dc_sh'
+
+drop assertion dc_sh;
+drop table DcShSrc;
+drop table DcSh;
+-- run

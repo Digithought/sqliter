@@ -4,7 +4,9 @@ import { StatusCode } from '../../common/types.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { columnReferencedInAst, objectRefKey } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
-import { buildObjectRefResolver } from '../../schema/object-ref-resolver.js';
+import { snapshotObjectRefResolvers } from '../../schema/object-ref-resolver.js';
+import { assertionsHomeSchemaFirst, describeOwnedAssertion } from '../../schema/assertion.js';
+import { reachableObjects, describeReachPath } from '../../schema/object-dependency-closure.js';
 import {
 	findColumnExpressionDependent,
 	describeDependentTable,
@@ -46,7 +48,10 @@ import {
  * altered one, via `schema/expression-dependents.ts` — a CHECK or DEFAULT may contain a
  * subquery, so another table's expression can legitimately name this column, and
  * `ALTER TABLE … RENAME COLUMN` has always rewritten exactly those. See that module for
- * the shared walk and the seeded/unseeded probe split it turns on.
+ * the shared walk and the seeded/unseeded probe split it turns on. The assertion guard
+ * scans every schema too, and additionally follows view / materialized-view bodies
+ * (`schema/object-dependency-closure.ts`); the two expression guards do not yet, which is
+ * the gap `expression-guards-follow-view-chains` tracks.
  *
  * Known cost, accepted: an **unnamed** table-level CHECK cannot be dropped
  * (`DROP CONSTRAINT` resolves by name only), so refusing leaves such a column
@@ -148,7 +153,8 @@ function referencedBy(dependent: ExpressionDependent, homeSchemaName: string): s
 }
 
 /**
- * Refuses the drop when a live assertion's CHECK body names the column.
+ * Refuses the drop when a live assertion's CHECK body, or any stored view /
+ * materialized-view body that assertion can reach, names the column.
  *
  * Blast radius is why this one is worth a guard at all: `AssertionEvaluator`
  * recompiles **every** live assertion on any commit that touched any table, so a
@@ -160,34 +166,45 @@ function referencedBy(dependent: ExpressionDependent, homeSchemaName: string): s
  * (unlike a CHECK). A body that names the table but not the column — `select *`
  * included — is not a reference and does not block the drop.
  *
- * Scope is the altered table's OWN schema, matching `assertNoAssertionDependsOn` and
- * carrying the same documented gap: an assertion living in schema A that names `B.t`
- * explicitly is not caught. Tracked by
- * `assertion-guards-follow-view-chains-and-schemas`. The rename propagation is no
- * longer a precedent for the limit — `propagateColumnRenameToAssertions` now runs for
- * every schema.
+ * The same probe runs over EVERY body in the assertion's reach
+ * ({@link reachableObjects}), its own included. No column lineage through a view's
+ * projection is built, and none is needed: if no body in the chain names the column,
+ * the assertion could not have been reading it in the first place. So
+ * `create view v as select id, x from t` plus `create assertion a check (… from v
+ * where x < 0)` refuses `alter table t drop column x` — the match is on `v`'s body,
+ * not the assertion's.
+ *
+ * Scope is EVERY schema, matching `assertNoAssertionDependsOn`: an assertion in
+ * `temp` naming `main.t`'s column blocks the drop, while one whose bare `t` resolves
+ * to `temp.t` does not. Each body resolves its unqualified names under its own home
+ * schema path.
  */
 export function assertNoAssertionNamesColumn(
 	db: Database,
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
-	const schema = db.schemaManager.getSchema(tableSchema.schemaName);
-	if (!schema) return;
 	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
-	const resolve = buildObjectRefResolver(db, tableSchema.schemaName);
+	// One snapshot shared by every assertion's closure — see the same NOTE on
+	// `assertNoAssertionDependsOn` for why this is not cached across statements.
+	const resolvers = snapshotObjectRefResolvers(db);
 	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
-	for (const assertion of schema.getAllAssertions()) {
+
+	for (const owned of assertionsHomeSchemaFirst(db, tableSchema.schemaName)) {
 		// An assertion with no `checkExpression` has no AST to scan and is skipped,
 		// exactly as the rename propagation and `assertNoAssertionDependsOn` skip it.
-		const check = assertion.checkExpression;
+		const check = owned.assertion.checkExpression;
 		if (!check) continue;
-		if (!columnReferencedInAst(
-			check, tableSchema.name, columnName, resolve, tableKey, resolveColumnInSource)) continue;
-		throw new QuereusError(
-			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by assertion '${assertion.name}' — drop or redefine the assertion first`,
-			StatusCode.CONSTRAINT,
-		);
+		for (const reached of reachableObjects(db, check, owned.schema.name, resolvers).bodies) {
+			if (!columnReferencedInAst(reached.body, tableSchema.name, columnName,
+				reached.resolve, tableKey, resolveColumnInSource)) continue;
+			throw new QuereusError(
+				`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by `
+				+ `assertion ${describeOwnedAssertion(owned, tableSchema.schemaName)}`
+				+ `${describeReachPath(reached.path)} — drop or redefine the assertion first`,
+				StatusCode.CONSTRAINT,
+			);
+		}
 	}
 }
 

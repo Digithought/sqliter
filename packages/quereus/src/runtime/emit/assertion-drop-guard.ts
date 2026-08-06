@@ -1,15 +1,17 @@
 import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { tableReferencedInAst, objectRefKey } from '../../schema/rename-rewriter.js';
-import { buildObjectRefResolver } from '../../schema/object-ref-resolver.js';
+import { objectRefKey } from '../../schema/rename-rewriter.js';
+import { snapshotObjectRefResolvers } from '../../schema/object-ref-resolver.js';
+import { assertionsHomeSchemaFirst, describeOwnedAssertion } from '../../schema/assertion.js';
+import { reachableObjects, describeReachPath } from '../../schema/object-dependency-closure.js';
 
 /** What the guard calls the object in its error message. */
 export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
 
 /**
  * Refuses to drop a table / view / materialized view that a live assertion's
- * CHECK body still names.
+ * CHECK body can still REACH.
  *
  * Policy is **refuse**, not cascade: a cascade would silently delete a user's
  * integrity rule. This is stricter than the nearest precedents — dropping a
@@ -21,28 +23,40 @@ export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
  * touched any table. Refusal never traps anyone: `drop assertion <name>` then
  * lets the drop through.
  *
- * "Refers to" is decided by {@link tableReferencedInAst}, the read-only run of
- * the very walker `ALTER TABLE … RENAME` uses to rewrite dependent bodies, so
- * the guard refuses exactly the references a rename would have followed and the
- * two definitions cannot drift. The walk is scope-aware: an assertion whose
- * body merely DECLARES a same-named CTE (`with t as (…) … from t`) or binds the
- * name as a FROM alias does not reference the real table, so it no longer
- * blocks the drop.
+ * "Can reach" is decided by {@link reachableObjects}, the breadth-first closure
+ * over stored view / materialized-view bodies built on the very walker
+ * `ALTER TABLE … RENAME` uses to rewrite dependent bodies. Two consequences,
+ * both load-bearing:
  *
- * Scope is the dropped object's OWN schema: an assertion's unqualified names
- * resolve against its own home schema first (`Database._homeSchemaPath`), so an
- * unqualified `t` in an assertion living elsewhere is not necessarily this
- * table. The symmetric gap — an assertion in schema A naming `B.t` explicitly
- * is not caught — is tracked by
- * `assertion-guards-follow-view-chains-and-schemas`. The rename propagation no
- * longer shares that limit: `propagateTableRenameToAssertions` is now called for
- * every schema, with a resolver per body owner, so it follows a qualified
- * cross-schema reference. Widening this guard the same way is that ticket's job.
+ * - A DIRECT reference is refused exactly where a rename would have rewritten
+ *   it, so the two definitions cannot drift. The walk is scope-aware: an
+ *   assertion whose body merely DECLARES a same-named CTE (`with t as (…) …
+ *   from t`) or binds the name as a FROM alias does not reference the real
+ *   table and does not block the drop.
+ * - An INDIRECT reference — the assertion names a view, whose body names the
+ *   dropped object, to any depth — is refused too. Without that, `create view v
+ *   as select * from t` plus an assertion over `v` let `drop table t` through
+ *   and made every write to the database fail with an error naming neither the
+ *   assertion nor the view.
+ *
+ * Scope is EVERY schema, not the dropped object's own: an assertion in `temp`
+ * naming `main.t` explicitly is caught, and so is one whose unqualified `t`
+ * resolves down its home path to `main.t`. Each body still resolves its
+ * unqualified names under ITS OWN home schema path
+ * (`Database._homeSchemaPath`), so an assertion in `temp` whose bare `t` means
+ * `temp.t` does not block dropping `main.t`.
  *
  * Called from the three user-facing DDL emitters (`emitDropTable`,
  * `emitDropView`, `emitDropMaterializedView`) rather than from
  * `SchemaManager.dropTable`, which is also driven by internal rollback and
  * catalog-import cleanup paths that must not be vetoed.
+ *
+ * NOTE: one catalog snapshot plus one breadth-first walk PER LIVE ASSERTION on
+ * every drop, over already-parsed ASTs. DDL is rare and the walk stops at the
+ * bodies an assertion actually reaches, so this is not worth caching now; a
+ * database holding many assertions over deep view chains would be what makes a
+ * cached reverse dependency index (invalidated on every view / assertion
+ * change) worth its consistency risk.
  */
 export function assertNoAssertionDependsOn(
 	db: Database,
@@ -52,11 +66,13 @@ export function assertNoAssertionDependsOn(
 ): void {
 	const schema = db.schemaManager.getSchema(schemaName);
 	if (!schema) return;
-	// Assertions in this schema resolve their unqualified names under its home
-	// path; the guard runs before any mutation, so the snapshot is the live state.
-	const resolve = buildObjectRefResolver(db, schema.name);
+	// One snapshot for every assertion walked: the guard runs before any
+	// mutation, so it is the live state, and sharing it is the snapshot
+	// discipline `schema/object-ref-resolver.ts` documents.
+	const resolvers = snapshotObjectRefResolvers(db);
 	const targetKey = objectRefKey(schema.name, objectName);
-	for (const assertion of schema.getAllAssertions()) {
+
+	for (const owned of assertionsHomeSchemaFirst(db, schema.name)) {
 		// NOTE: an assertion with no `checkExpression` has no AST to scan and is
 		// skipped, exactly as the rename propagation skips it. Unreachable today —
 		// `SchemaManager.importDDL` accepts only createTable / createIndex /
@@ -64,15 +80,28 @@ export function assertNoAssertionDependsOn(
 		// persistence path exists and every live assertion came from
 		// `CREATE ASSERTION`. If a reconstruction path is ever added, this guard
 		// needs a re-parse arm or it silently stops protecting those assertions.
-		const check = assertion.checkExpression;
+		const check = owned.assertion.checkExpression;
 		if (!check) continue;
-		if (!tableReferencedInAst(check, objectName, resolve, targetKey)) continue;
+		const namer = reachableObjects(db, check, owned.schema.name, resolvers).namerOf(targetKey);
+		if (!namer) continue;
 		// `schema.name` rather than the caller's `schemaName`: DROP emitters pass the
 		// name as the user typed it, so `drop table MAIN.t` would otherwise report a
 		// schema spelling that appears nowhere in the catalog.
 		throw new QuereusError(
-			`cannot drop ${objectKind} '${schema.name}.${objectName}': assertion '${assertion.name}' still refers to it — drop or redefine the assertion first`,
+			`cannot drop ${objectKind} '${schema.name}.${objectName}': assertion `
+			+ `${describeOwnedAssertion(owned, schema.name)} ${refersTo(namer.path)}`
+			+ ` — drop or redefine the assertion first`,
 			StatusCode.CONSTRAINT,
 		);
 	}
+}
+
+/**
+ * How the refusal describes the reference. A DIRECT one keeps the wording this
+ * guard has always used; an indirect one must name the chain, because a user
+ * told to fix an assertion whose body does not mention the dropped object has
+ * nothing to act on.
+ */
+function refersTo(path: ReadonlyArray<string>): string {
+	return path.length === 0 ? 'still refers to it' : `reaches it${describeReachPath(path)}`;
 }
