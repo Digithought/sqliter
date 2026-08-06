@@ -2161,9 +2161,9 @@ function propagateTableRenameInSchema(
 	const notifier = db.schemaManager.getChangeNotifier();
 
 	for (const table of Array.from(schema.getAllTables())) {
-		// Skip the just-renamed table when iterating the home schema; the FK
-		// `referencedTable` field on its own FKs (if any self-reference) is
-		// still pointing at the old name and needs rewriting too.
+		// The just-renamed table is deliberately NOT skipped: it already carries its
+		// new name, but a self-referencing FK's `referencedTable` (and its own CHECK /
+		// DEFAULT / index-predicate ASTs) still name the old one and need rewriting.
 		const updated = rewriteTableForTableRename(table, oldName, newName, resolvers, targetKey);
 		if (updated !== table) {
 			schema.addTable(updated);

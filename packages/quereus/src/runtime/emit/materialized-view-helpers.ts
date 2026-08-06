@@ -2947,8 +2947,10 @@ async function restoreMaterializedViewLive(
  * a producer whose own NAME did not change re-plans fine either way (verified for
  * both verbs in `test/schema/rename-cross-schema.spec.ts`). If a producer's output
  * names can shift while its consumer lives in an earlier-iterated schema, this pass
- * needs a topological order (or a second round) rather than catalog order. Best-effort like the rest of the propagation:
- * a per-MV failure logs, leaves that MV stale, and continues.
+ * needs a topological order (or a second round) rather than catalog order.
+ *
+ * Best-effort like the rest of the propagation: a per-MV failure logs, leaves that MV
+ * stale, and continues.
  *
  * NOTE: firing no `materialized_view_modified` is deliberate, but
  * {@link renameShiftedBackingColumns} (run from the shared restore tail) DOES change the
