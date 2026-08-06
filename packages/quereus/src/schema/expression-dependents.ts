@@ -47,10 +47,18 @@ import { snapshotObjectRefResolvers } from './object-ref-resolver.js';
  * predicate, so such a predicate can only name its own table, and `runDropColumn`'s
  * existing predicate guard covers that case.
  *
- * Views are deliberately NOT probed. Dropping a table or column out from under a plain
- * view stays allowed and breaks the view — the engine's stated asymmetry (see
- * `runtime/emit/assertion-drop-guard.ts`): a broken view breaks queries OF that view,
+ * Views are deliberately NOT probed as *dependents*. Dropping a table or column out from
+ * under a plain view stays allowed and breaks the view — the engine's stated asymmetry
+ * (see `runtime/emit/assertion-drop-guard.ts`): a broken view breaks queries OF that view,
  * while a broken CHECK makes a whole table unwritable.
+ *
+ * Known gap, tracked by `expression-guards-follow-view-chains`: these probes see only a
+ * DIRECT reference. A CHECK that reads a VIEW whose body reads the dropped object
+ * (`check (n < (select max(v) from vv))` over `create view vv as select v from t`) is not
+ * matched, so `drop table t` / `alter table t drop column v` is still accepted and still
+ * leaves the referencing table unwritable. Closing it needs the reachability closure
+ * `assertion-guards-follow-view-chains-and-schemas` builds for the assertion guards; both
+ * families should then share it rather than grow a second walk.
  *
  * NOTE: each probe walks every table in every schema, re-walking already-parsed ASTs.
  * DDL is rare and schemas hold handfuls of tables, so this is not worth optimising now;
@@ -176,6 +184,13 @@ type ExpressionProbe = (expr: AST.Expression | undefined) => boolean;
  * Order is not cosmetic: the guards report the FIRST hit, and the own-table messages are
  * the ones users and tests already know. Scanning the target first keeps a self-reference
  * winning over an unrelated schema's.
+ *
+ * NOTE: past the probed table the order is `_getAllSchemas()` × `getAllTables()` insertion
+ * order, so with TWO referencing tables which one the refusal names follows catalog
+ * insertion rather than any user-visible rule. Harmless while the message is advisory —
+ * every referencing table has to be dealt with anyway. If a caller ever needs to *list*
+ * dependents (a `CASCADE` arm, an introspection function), give it a collect-all entry
+ * point with a defined order rather than calling this in a loop.
  */
 function* tablesProbedTargetFirst(db: Database, targetKey: string): Iterable<TableSchema> {
 	const rest: TableSchema[] = [];
