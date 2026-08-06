@@ -29,13 +29,15 @@ export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
  * name as a FROM alias does not reference the real table, so it no longer
  * blocks the drop.
  *
- * Scope is the dropped object's OWN schema, matching
- * `propagateTableRenameToAssertions`: an assertion's unqualified names resolve
- * against its own home schema first (`Database._homeSchemaPath`), so an
+ * Scope is the dropped object's OWN schema: an assertion's unqualified names
+ * resolve against its own home schema first (`Database._homeSchemaPath`), so an
  * unqualified `t` in an assertion living elsewhere is not necessarily this
  * table. The symmetric gap — an assertion in schema A naming `B.t` explicitly
- * is not caught — is the same one views, materialized views and assertions
- * already share on rename, tracked by `bug-schema-object-dependency-tracking`.
+ * is not caught — is tracked by
+ * `assertion-guards-follow-view-chains-and-schemas`. The rename propagation no
+ * longer shares that limit: `propagateTableRenameToAssertions` is now called for
+ * every schema, with a resolver per body owner, so it follows a qualified
+ * cross-schema reference. Widening this guard the same way is that ticket's job.
  *
  * Called from the three user-facing DDL emitters (`emitDropTable`,
  * `emitDropView`, `emitDropMaterializedView`) rather than from

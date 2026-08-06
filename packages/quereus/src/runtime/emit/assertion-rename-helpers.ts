@@ -9,21 +9,19 @@ import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('runtime:emit:assertion-rename');
 
-// NOTE: both passes walk only the renamed object's OWN schema — the same scope the
-// plain-view and materialized-view loops in `alter-table.ts` use, and the caller
-// passes the resolver built for that schema's home path (over the statement's
+// NOTE: both passes are called once per schema in the catalog — the same scope the
+// plain-view and materialized-view loops in `alter-table.ts` use — and the caller
+// passes the resolver built for THAT schema's home path (over the statement's
 // pre-mutation snapshot), so an unqualified `t` in a body matches only when it
-// actually RESOLVES to the renamed table. The remaining gap — an assertion living
-// in some OTHER schema whose body names the renamed table is never walked at all —
-// is shared verbatim with views and materialized views; it is tracked by
-// `bug-schema-object-dependency-tracking`, which widens the loops for all three
-// object kinds.
+// actually RESOLVES to the renamed table. An assertion in `temp` naming `main.t`
+// therefore follows a rename of `main.t`, while one whose bare `t` means `temp.t`
+// is left alone.
 
 /**
  * Rewrites every assertion in `schema` after a source TABLE RENAME — the assertion
- * mirror of the plain-view loop in `propagateTableRenameInSchema` (same same-schema
- * gate at the caller, same in-place `renameTableInAst` walk over a body that owns its
- * own FROM scopes).
+ * mirror of the plain-view loop in `propagateTableRenameInSchema` (called once per
+ * schema by the caller with that schema's resolver, same in-place `renameTableInAst`
+ * walk over a body that owns its own FROM scopes).
  *
  * On a changed body the derived `violationSql` is regenerated from the rewritten
  * expression (the commit-time evaluator re-parses that text, so it is the field that

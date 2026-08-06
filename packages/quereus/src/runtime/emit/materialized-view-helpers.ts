@@ -2717,8 +2717,9 @@ function maintainedTablesOf(schema: Schema): MaintainedTableSchema[] {
 /**
  * Rewrites every dependent materialized view in `schema` after a source TABLE
  * RENAME — the MV mirror of the plain-view loop in `propagateTableRenameInSchema`
- * ("MV ≡ faster view"): the caller applies the same same-schema gate, and the body
- * `selectAst` is mutated in place by the same `renameTableInAst` walker. An MV is
+ * ("MV ≡ faster view"): the caller calls this once per schema in the catalog with
+ * `resolve` bound to THAT schema's home path, and the body `selectAst` is mutated
+ * in place by the same `renameTableInAst` walker. An MV is
  * processed when its body AST changed, its `insert defaults` clause changed (an
  * expr subquery can name the renamed table even when the body doesn't), OR its
  * `sourceTables` carries the old base — the latter catches a body that reads the
@@ -2772,7 +2773,8 @@ export async function propagateTableRenameToMaterializedViews(
 /**
  * Rewrites every dependent materialized view in `schema` after a source COLUMN
  * RENAME — the MV mirror of the plain-view loop in `propagateColumnRenameInSchema`
- * (same same-schema gate at the caller, same in-place `renameColumnInAst` walk).
+ * (called once per schema by the caller with that schema's resolver, same in-place
+ * `renameColumnInAst` walk).
  * The body walk also descends the trailing `with defaults (…)` clause (now on
  * `selectAst.defaults`): the clause target is typically a projected-away NOT NULL
  * column the body never mentions, so its rewrite still flips `bodyChanged` and
@@ -2936,7 +2938,16 @@ async function restoreMaterializedViewLive(
  * order — topological for same-schema MV chains, so a producer restores before its
  * consumer is examined. A chained MV whose body references a renamed-away producer
  * output name fails shape derivation and stays stale (staleness-diagnostic parity
- * with a broken plain-view chain). Best-effort like the rest of the propagation:
+ * with a broken plain-view chain).
+ *
+ * NOTE: the walk is schema-by-schema, then creation order WITHIN a schema, so a
+ * CROSS-schema MV chain is only topological when the producer's schema is iterated
+ * first. Harmless today — a consumer whose body does not itself name the renamed
+ * object is skipped by the propagation entirely and only ever reaches this pass, and
+ * a producer whose own NAME did not change re-plans fine either way (verified for
+ * both verbs in `test/schema/rename-cross-schema.spec.ts`). If a producer's output
+ * names can shift while its consumer lives in an earlier-iterated schema, this pass
+ * needs a topological order (or a second round) rather than catalog order. Best-effort like the rest of the propagation:
  * a per-MV failure logs, leaves that MV stale, and continues.
  *
  * NOTE: firing no `materialized_view_modified` is deliberate, but

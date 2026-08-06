@@ -9,14 +9,14 @@
  *   2. `assertion_modified` fires for a rewritten assertion (that event is what
  *      invalidates the optimizer's assertion-hoist cache) and does NOT fire for an
  *      assertion the rename never touched.
- *   3. The walk is scoped to the renamed object's own schema, so a non-`main`
- *      assertion tracks a rename in its own schema and is left alone by an
- *      identically-named table renamed in another schema.
+ *   3. Matching is by resolved key, not bare name, so a non-`main` assertion tracks a
+ *      rename in its own schema and is left alone by an identically-named table
+ *      renamed in another schema.
  *
- * Cross-schema propagation (an assertion in `main` naming `temp.u` explicitly) is a
- * known gap shared with views and materialized views — see
- * `bug-schema-object-dependency-tracking`. It is deliberately not asserted here:
- * it is a defect, not a contract.
+ * The walk itself covers every schema (an assertion in `temp` naming `main.t`
+ * explicitly does follow the rename) — pinned in
+ * `test/schema/rename-cross-schema.spec.ts` alongside the view and materialized-view
+ * cases it shares that scope with.
  */
 
 import { expect } from 'chai';
@@ -153,7 +153,7 @@ describe('assertion rename propagation: stored body, derived SQL, and events', (
 		}
 	});
 
-	it('propagates a rename inside a non-main schema (home-schema scoping)', async () => {
+	it('propagates a rename inside a non-main schema', async () => {
 		const db = new Database();
 		try {
 			await db.exec('create table temp.qt (id integer primary key, x integer not null)');

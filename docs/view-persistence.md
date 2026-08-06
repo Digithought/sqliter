@@ -83,17 +83,18 @@ fire-and-forget like the rest, so both arms run `assertRenameDependentsPersistab
 (same file) BEFORE their first side effect — `module.renameTable` for the table arm,
 `module.alterTable` for the column arm:
 
-- Every view and every maintained table in the renamed object's **own schema** (the scope
-  the propagation's own loops use) has its body rewritten on a **spine clone** —
+- Every view and every maintained table in **every** schema (the scope the propagation's
+  own loops use) has its body rewritten on a **spine clone** — with the rewrite bound to
+  that body's own home schema, so the probe matches exactly what propagation will rewrite —
   `spineCloneAst` in `src/util/ast-spine-clone.ts`, a plain-object/array deep copy that
   passes every other value through by reference. The rewriters mutate in place, so a veto
   thrown after mutating the live AST would strand a body naming a table that was never
   renamed; `structuredClone` is not an option, because `LiteralExpr.value` may hold a
   Promise. A body the rewrite does not touch renders identically to what is persisted, so
   it is skipped.
-- Every table in **every** schema is probed under kind `'table'`, because the propagation's
-  table loop is not schema-scoped (`propagateTableRename` walks `_getAllSchemas()`, so a
-  cross-schema FK reference is rewritten). Its rewritable state is spread over three fields
+- Every table in every schema is probed under kind `'table'`, on the same all-schema scope
+  (`propagateTableRename` walks `_getAllSchemas()`, so a cross-schema FK reference is
+  rewritten). Its rewritable state is spread over three fields
   and only the FK arm is copy-on-write, so the probe runs against a copy whose CHECK
   expressions and index predicates are spine clones (`cloneTableRewritableAsts`). The
   rewriters return the SAME reference when nothing changed, which is the skip test.

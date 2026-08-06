@@ -219,12 +219,193 @@ describe('qualifier binding resolves cross-schema (column verb)', () => {
 	});
 
 	it('the same inner source DOES follow when it is the renamed table', async () => {
-		// The view lives in `temp` so the propagation's home-schema view loop reaches
-		// it — a `main`-owned view naming `temp.t` is a separate, tracked gap
-		// (`bug-schema-object-dependency-tracking`), not a resolution question.
+		// The propagation walks EVERY schema now, so the view's own schema no longer
+		// matters — what decides is whether the reference RESOLVES to the renamed
+		// table. Kept in `temp` as the historical companion to the two tests above.
 		await db.exec('create view temp.v3 as select (select max(t.x) from temp.t) as m from main.t');
 		await db.exec('alter table temp.t rename column x to y');
 		expect(viewSql('temp', 'v3')).to.contain('max(t.y)');
+	});
+
+	it('a main-owned view naming temp.t follows a rename of temp.t (the loop is no longer home-schema scoped)', async () => {
+		await db.exec('create view main.v4 as select (select max(t.x) from temp.t) as m from main.t');
+		await db.exec('alter table temp.t rename column x to y');
+		expect(viewSql('main', 'v4')).to.contain('max(t.y)');
+	});
+});
+
+/**
+ * The gate this ticket removed: `propagateTableRenameInSchema` /
+ * `propagateColumnRenameInSchema` used to rewrite dependent VIEWS, MATERIALIZED
+ * VIEWS and ASSERTIONS only while iterating the renamed table's own schema, so a
+ * `temp` view over `main.t` kept naming a table that no longer existed. The
+ * dependent-TABLE arm (FKs, CHECKs, index predicates, DEFAULTs) always walked every
+ * schema — these tests pin the other three object kinds to the same scope, with the
+ * per-home-schema resolver as the thing that keeps it from over-matching.
+ */
+describe('cross-schema dependents follow a rename (views, MVs, assertions)', () => {
+	let db: Database;
+	beforeEach(() => { db = new Database(); });
+	afterEach(async () => { await db.close(); });
+
+	const viewSql = (schema: string, name: string): string =>
+		db.schemaManager.getSchema(schema)!.getView(name)!.sql.replace(/"/g, '');
+
+	async function rows(sql: string): Promise<unknown[]> {
+		const out: unknown[] = [];
+		for await (const r of db.eval(sql)) out.push(r);
+		return out;
+	}
+
+	it('a temp view over main.t follows a table rename and still reads', async () => {
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('insert into main.t values (1, 10)');
+		await db.exec('create view temp.vt as select id, x from main.t');
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('temp', 'vt')).to.contain('main.t2');
+		expect(await rows('select * from temp.vt')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('a temp view over main.t follows a column rename and still reads', async () => {
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('insert into main.t values (1, 10)');
+		await db.exec('create view temp.vt as select id, x from main.t');
+		await db.exec('alter table main.t rename column x to y');
+		const sql = viewSql('temp', 'vt');
+		expect(sql).to.contain('y');
+		expect(sql).to.not.match(/\bx\b/);
+		expect(await rows('select * from temp.vt')).to.deep.equal([{ id: 1, y: 10 }]);
+	});
+
+	it('a temp view whose bare `t` means temp.t is NOT rewritten by a rename of main.t', async () => {
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('create table temp.t (id integer primary key, x integer)');
+		await db.exec('create view temp.vt as select * from t');
+		const before = viewSql('temp', 'vt');
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('temp', 'vt')).to.equal(before);
+		expect(viewSql('temp', 'vt')).to.not.contain('t2');
+	});
+
+	it('a temp view whose bare `t` falls through the home path to main.t DOES follow the rename', async () => {
+		// `_homeSchemaPath('temp')` is [temp, ...session path]; `temp` holds no `t`,
+		// so the bare name legitimately resolves to main.t and must be rewritten.
+		// This is the case a "only rewrite qualified cross-schema references"
+		// shortcut would get wrong.
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('insert into main.t values (1, 10)');
+		await db.exec('create view temp.vt as select id, x from t');
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('temp', 'vt')).to.contain('t2');
+		expect(await rows('select * from temp.vt')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('a temp assertion over main.t keeps enforcing across a table rename', async () => {
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('create assertion temp.a check (not exists (select 1 from main.t where x < 0))');
+		await db.exec('alter table main.t rename to t2');
+		// Writes still succeed (the body would no longer plan if it still named main.t)…
+		await db.exec('insert into main.t2 values (1, 5)');
+		// …and the assertion still refuses the violating row.
+		let err: Error | undefined;
+		try {
+			await db.exec('insert into main.t2 values (2, -1)');
+		} catch (e) {
+			err = e instanceof Error ? e : new Error(String(e));
+		}
+		expect(err, 'assertion still enforced after the rename').to.not.be.undefined;
+	});
+
+	it('a temp assertion over main.t keeps enforcing across a column rename', async () => {
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('create assertion temp.a check (not exists (select 1 from main.t where x < 0))');
+		await db.exec('alter table main.t rename column x to y');
+		await db.exec('insert into main.t values (1, 5)');
+		let err: Error | undefined;
+		try {
+			await db.exec('insert into main.t values (2, -1)');
+		} catch (e) {
+			err = e instanceof Error ? e : new Error(String(e));
+		}
+		expect(err, 'assertion still enforced after the column rename').to.not.be.undefined;
+	});
+
+	it('a temp materialized view over main.t survives a table rename live (not stale)', async () => {
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('insert into main.t values (1, 10)');
+		await db.exec('create materialized view temp.mv as select id, x from main.t');
+		await db.exec('alter table main.t rename to t2');
+		const mv = db.schemaManager.getTable('temp', 'mv');
+		expect(mv, 'temp.mv still registered').to.exist;
+		expect(mv!.derivation?.stale, 'MV left live, not stale').to.equal(false);
+		expect(mv!.derivation?.sourceTables, 'sourceTables re-keyed').to.deep.equal(['main.t2']);
+		expect(await rows('select * from temp.mv')).to.deep.equal([{ id: 1, x: 10 }]);
+		// Row-time maintenance re-registered under the new source name.
+		await db.exec('insert into main.t2 values (2, 20)');
+		expect(await rows('select * from temp.mv order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+	});
+
+	it('a temp materialized view over main.t survives a column rename live', async () => {
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('insert into main.t values (1, 10)');
+		await db.exec('create materialized view temp.mv as select id, x from main.t');
+		await db.exec('alter table main.t rename column x to y');
+		const mv = db.schemaManager.getTable('temp', 'mv');
+		expect(mv!.derivation?.stale, 'MV left live, not stale').to.equal(false);
+		expect(await rows('select * from temp.mv')).to.deep.equal([{ id: 1, y: 10 }]);
+		await db.exec('insert into main.t values (2, 20)');
+		expect(await rows('select * from temp.mv order by id'))
+			.to.deep.equal([{ id: 1, y: 10 }, { id: 2, y: 20 }]);
+	});
+
+	it('a main MV reading through a temp view survives the rename (views everywhere rewrite before any MV re-plans)', async () => {
+		// The propagation runs two GLOBAL passes — all tables/views/assertions in every
+		// schema, then all MVs — rather than one combined per-schema pass. Schemas are
+		// iterated `main` first, so a combined pass would re-plan `main.mv` while
+		// `temp.vt` still named the vanished `main.t`.
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('insert into main.t values (1, 10)');
+		await db.exec('create view temp.vt as select id, x from main.t');
+		await db.exec('create materialized view main.mv as select id, x from temp.vt');
+		await db.exec('alter table main.t rename to t2');
+		const mv = db.schemaManager.getTable('main', 'mv');
+		expect(mv!.derivation?.stale, 'MV over a cross-schema view left live').to.equal(false);
+		await db.exec('insert into main.t2 values (2, 20)');
+		expect(await rows('select * from main.mv order by id'))
+			.to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+	});
+
+	it('a materialized view in a third schema the rename never touched is not left stale', async () => {
+		db.schemaManager.addSchema('aux');
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('create table aux.other (id integer primary key, v integer)');
+		await db.exec('insert into aux.other values (1, 7)');
+		await db.exec('create materialized view aux.amv as select id, v from aux.other');
+		await db.exec('create view temp.vt as select id, x from main.t');
+		await db.exec('alter table main.t rename to t2');
+		const amv = db.schemaManager.getTable('aux', 'amv');
+		expect(amv!.derivation?.stale, 'untouched MV in a third schema stays live').to.equal(false);
+		expect(await rows('select * from aux.amv')).to.deep.equal([{ id: 1, v: 7 }]);
+	});
+
+	it('a cross-schema dependent fires exactly one modified event, not one per schema walked', async () => {
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('create view temp.vt as select id, x from main.t');
+		await db.exec('create materialized view temp.mv as select id, x from main.t');
+		const seen: string[] = [];
+		const unsubscribe = db.schemaManager.getChangeNotifier().addListener(e => {
+			if (e.type === 'view_modified' || e.type === 'materialized_view_modified') {
+				seen.push(`${e.type}:${e.schemaName}.${e.objectName}`);
+			}
+		});
+		try {
+			await db.exec('alter table main.t rename to t2');
+		} finally {
+			unsubscribe();
+		}
+		expect(seen.filter(s => s === 'view_modified:temp.vt')).to.have.length(1);
+		expect(seen.filter(s => s === 'materialized_view_modified:temp.mv')).to.have.length(1);
 	});
 });
 

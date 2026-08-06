@@ -3,7 +3,6 @@ import type * as AST from '../parser/ast.js';
 import { spineCloneAst } from '../util/ast-spine-clone.js';
 import type { CatalogObjectKind } from '../vtab/module.js';
 import { isMaintainedTable } from './derivation.js';
-import type { Schema } from './schema.js';
 import type { TableSchema } from './table.js';
 import type { ViewSchema } from './view.js';
 
@@ -45,6 +44,16 @@ export function assertCatalogObjectPersistable(
 export type BodyRewrite = (ast: AST.QueryExpr) => boolean;
 
 /**
+ * A {@link BodyRewrite} factory bound to the home schema of the body it will be handed.
+ * The pre-flight walks dependents living in every schema, and an unqualified name in a
+ * stored body resolves under ITS OWN home schema path — so the caller supplies one
+ * rewrite per body owner rather than one for the whole statement. The factory must draw
+ * every resolver from the statement's single pre-mutation catalog snapshot (see
+ * {@link import('./object-ref-resolver.js').snapshotObjectRefResolvers}).
+ */
+export type BodyRewriteFor = (homeSchemaName: string) => BodyRewrite;
+
+/**
  * A rewrite of a dependent TABLE's schema, returning a NEW record when anything changed
  * and the SAME reference when nothing did — the shape `rewriteTableForTableRename` /
  * `rewriteTableForColumnRename` (both in `runtime/emit/alter-table.ts`) already have.
@@ -53,7 +62,7 @@ export type TableRewrite = (table: TableSchema) => TableSchema;
 
 /**
  * Pre-flight gate for `ALTER TABLE … RENAME [COLUMN]`: computes what the rename would
- * make of every dependent catalog entry — view / materialized-view bodies via `rewrite`,
+ * make of every dependent catalog entry — view / materialized-view bodies via `rewriteFor`,
  * plain table records via `rewriteTable` — and vetoes each PROSPECTIVE object through
  * {@link assertCatalogObjectPersistable}, so a rename that would leave a persisted
  * dependent unwritable fails the statement instead of succeeding and losing (or silently
@@ -71,45 +80,49 @@ export type TableRewrite = (table: TableSchema) => TableSchema;
  * prospective render needs. Dependents the rewrite does not touch render identically to
  * what is already persisted and are skipped.
  */
-// NOTE: clones and re-renders the body of every view and maintained table in the schema,
-// and the rewritable ASTs of every table in EVERY schema, on every `ALTER … RENAME` — and
-// the propagation that follows renders each changed one again. DDL is rare and the ASTs
-// are small, so this is not worth caching today; if a schema-heavy workload ever shows up
+// NOTE: clones and re-renders the body of every view and maintained table, and the
+// rewritable ASTs of every table, in EVERY schema, on every `ALTER … RENAME` — and the
+// propagation that follows renders each changed one again. DDL is rare and the ASTs are
+// small, so this is not worth caching today; if a schema-heavy workload ever shows up
 // hot here, gate the clone on a cheap dry-run name scan (or thread the prospective object
 // through to the propagation instead of rebuilding it). Costs nothing at all when no
 // module can veto (the early return below) — a memory-only database never pays it.
 export function assertRenameDependentsPersistable(
 	db: Database,
-	schema: Schema,
-	rewrite: BodyRewrite,
+	rewriteFor: BodyRewriteFor,
 	rewriteTable: TableRewrite,
 ): void {
 	if (!anyModuleCanVeto(db)) return;
-	assertRenameDependentViewsPersistable(db, schema, rewrite);
+	assertRenameDependentViewsPersistable(db, rewriteFor);
 	assertRenameDependentTablesPersistable(db, rewriteTable);
 }
 
 /**
  * The view / materialized-view arm of {@link assertRenameDependentsPersistable}.
  *
- * Scoped to a single `Schema` because that is the scope the propagation's own view / MV
- * loops use (see `propagateTableRenameInSchema`) — a dependent in another schema is
- * never rewritten, so it has nothing new to persist.
+ * Walks EVERY schema, exactly like the dependent-table arm below and for the same reason:
+ * the propagation's view / MV loops walk every schema too (see `propagateTableRename`), so
+ * a view or materialized view in another schema over the renamed object IS rewritten and
+ * must be vetted. `rewriteFor` is asked for a rewrite bound to each body's OWN home schema,
+ * because that is the path its unqualified names resolve under.
  */
-function assertRenameDependentViewsPersistable(db: Database, schema: Schema, rewrite: BodyRewrite): void {
-	for (const view of Array.from(schema.getAllViews())) {
-		const selectAst = spineCloneAst(view.selectAst);
-		if (!rewrite(selectAst)) continue;
-		assertCatalogObjectPersistable(db, 'view', { ...view, selectAst });
-	}
-	for (const table of Array.from(schema.getAllTables())) {
-		if (!isMaintainedTable(table)) continue;
-		const selectAst = spineCloneAst(table.derivation.selectAst);
-		if (!rewrite(selectAst)) continue;
-		assertCatalogObjectPersistable(db, 'materializedView', {
-			...table,
-			derivation: { ...table.derivation, selectAst },
-		});
+function assertRenameDependentViewsPersistable(db: Database, rewriteFor: BodyRewriteFor): void {
+	for (const schema of db.schemaManager._getAllSchemas()) {
+		const rewrite = rewriteFor(schema.name);
+		for (const view of Array.from(schema.getAllViews())) {
+			const selectAst = spineCloneAst(view.selectAst);
+			if (!rewrite(selectAst)) continue;
+			assertCatalogObjectPersistable(db, 'view', { ...view, selectAst });
+		}
+		for (const table of Array.from(schema.getAllTables())) {
+			if (!isMaintainedTable(table)) continue;
+			const selectAst = spineCloneAst(table.derivation.selectAst);
+			if (!rewrite(selectAst)) continue;
+			assertCatalogObjectPersistable(db, 'materializedView', {
+				...table,
+				derivation: { ...table.derivation, selectAst },
+			});
+		}
 	}
 }
 
@@ -121,8 +134,9 @@ function assertRenameDependentViewsPersistable(db: Database, schema: Schema, rew
  *
  * Walks EVERY schema, not just the renamed object's own, because the propagation's table
  * loop does (`propagateTableRename` iterates `_getAllSchemas()`) — a cross-schema foreign
- * key is rewritten and so must be vetted. That is the one structural difference from the
- * view / MV arm above.
+ * key is rewritten and so must be vetted. Same scope as the view / MV arm above; the one
+ * structural difference is that a table record needs no per-home-schema rewrite factory
+ * (`rewriteTableForTableRename` derives its own resolver from `table.schemaName`).
  *
  * The renamed table itself is deliberately left in the scan rather than special-cased. It
  * is probed under its OLD name with any self-references rewritten to the NEW one (table

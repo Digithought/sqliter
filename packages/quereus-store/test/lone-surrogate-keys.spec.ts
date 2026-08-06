@@ -97,8 +97,8 @@ async function catalogDDL(provider: KVStoreProvider, key: Uint8Array): Promise<s
 }
 
 /** Whether a maintained table's row-time maintenance was released (`stale`). */
-function isStale(db: Database, name: string): boolean {
-	const mv = db.schemaManager.getTable('main', name) as { derivation?: { stale?: boolean } } | undefined;
+function isStale(db: Database, name: string, schemaName = 'main'): boolean {
+	const mv = db.schemaManager.getTable(schemaName, name) as { derivation?: { stale?: boolean } } | undefined;
 	return mv?.derivation?.stale === true;
 }
 
@@ -557,6 +557,42 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			expect(db.schemaManager.getTable('main', 'm')?.columnIndexMap.has('x'),
 				'the column keeps its name').to.be.true;
 			expect(await column(db, `select x from vm`, 'x'), 'the view body still names x').to.deep.equal([100]);
+		});
+
+		it('refuses to rename a memory table that a persisted view in ANOTHER SCHEMA reads', async () => {
+			// The pre-flight's view / MV arm walks every schema, matching the propagation
+			// (which now does too). A `temp` view over `main.m` IS rewritten by the rename,
+			// so it must also be vetted — otherwise a cross-schema dependent gets rewritten
+			// without ever being offered to the module, and its persisted entry diverges.
+			await db.exec(`create view temp.vt as select id, x from main.m`);
+
+			await rejects(db, `alter table m rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm'), 'the table keeps its name').to.not.be.undefined;
+			expect(db.schemaManager.getTable('main', LONE_HIGH)).to.be.undefined;
+			expect(await column(db, `select x from temp.vt`, 'x'),
+				'the cross-schema view body still names main.m').to.deep.equal([100]);
+		});
+
+		it('refuses a COLUMN rename a persisted view in ANOTHER SCHEMA could not persist', async () => {
+			await db.exec(`create view temp.vt as select id, x from main.m`);
+
+			await rejects(db, `alter table m rename column x to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm')?.columnIndexMap.has('x'),
+				'the column keeps its name').to.be.true;
+			expect(await column(db, `select x from temp.vt`, 'x'),
+				'the cross-schema view body still names x').to.deep.equal([100]);
+		});
+
+		it('refuses a table rename a dependent materialized view in ANOTHER SCHEMA could not persist', async () => {
+			await db.exec(`create materialized view temp.mvt as select id, x from main.m`);
+
+			await rejects(db, `alter table m rename to "${LONE_HIGH}"`);
+
+			expect(db.schemaManager.getTable('main', 'm')).to.not.be.undefined;
+			expect(await column(db, `select x from temp.mvt`, 'x')).to.deep.equal([100]);
+			expect(isStale(db, 'mvt', 'temp'), 'the MV must not be left stale').to.be.false;
 		});
 
 		it('refuses a table rename a dependent memory-backed materialized view could not persist', async () => {

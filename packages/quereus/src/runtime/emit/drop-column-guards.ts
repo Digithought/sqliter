@@ -154,9 +154,11 @@ export function assertNoCheckConstraintNamesColumn(
  * included — is not a reference and does not block the drop.
  *
  * Scope is the altered table's OWN schema, matching `assertNoAssertionDependsOn` and
- * `propagateColumnRenameToAssertions`, and carrying the same documented gap: an
- * assertion living in schema A that names `B.t` explicitly is not caught. Tracked by
- * `bug-schema-object-dependency-tracking`.
+ * carrying the same documented gap: an assertion living in schema A that names `B.t`
+ * explicitly is not caught. Tracked by
+ * `assertion-guards-follow-view-chains-and-schemas`. The rename propagation is no
+ * longer a precedent for the limit — `propagateColumnRenameToAssertions` now runs for
+ * every schema.
  */
 export function assertNoAssertionNamesColumn(
 	db: Database,

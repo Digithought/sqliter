@@ -1463,3 +1463,79 @@ select id, a from fresh;
 → [{"id":2,"a":5}]
 
 drop table fresh;
+
+-- ===================================
+-- 48. Dependents in ANOTHER schema follow the rename (views + assertions)
+-- ===================================
+-- The propagation used to rewrite dependent views / materialized views /
+-- assertions only while iterating the renamed table's OWN schema, so a `temp`
+-- view over `main.t` kept naming a table that no longer existed and every read
+-- of it failed (an assertion in that position broke every WRITE). Every schema
+-- is walked now; what decides a match is whether the reference RESOLVES to the
+-- renamed object under the walked body's own home schema path.
+
+create table main.xs_cs (id integer primary key, x integer not null);
+insert into main.xs_cs values (1, 10);
+create view temp.v_cs as select id, x from main.xs_cs;
+create assertion temp.a_cs check (not exists (select 1 from main.xs_cs where x < 0));
+
+alter table main.xs_cs rename to xs_cs2;
+
+-- The view body followed the rename and still reads.
+select id, x from temp.v_cs;
+→ [{"id":1,"x":10}]
+
+-- The assertion followed it too: writes still succeed…
+insert into main.xs_cs2 values (2, 20);
+
+-- …and the rule is still enforced.
+insert into main.xs_cs2 values (3, -1);
+-- error: Assertion
+
+-- Column verb, same cross-schema dependents.
+alter table main.xs_cs2 rename column x to y;
+
+select id, y from temp.v_cs order by id;
+→ [{"id":1,"y":10},{"id":2,"y":20}]
+
+insert into main.xs_cs2 values (4, -1);
+-- error: Assertion
+
+drop assertion temp.a_cs;
+drop view temp.v_cs;
+drop table main.xs_cs2;
+
+-- ===================================
+-- 49. …but only when the reference actually resolves to the renamed table
+-- ===================================
+-- A `temp`-owned view whose bare `t` means `temp.t` must NOT follow a rename of
+-- the same-named `main.t`; the converse — a bare name in `temp` that falls
+-- through the home path to `main` because `temp` has no such table — must.
+
+create table main.dup_cs (id integer primary key, x integer);
+create table temp.dup_cs (id integer primary key, x integer);
+insert into temp.dup_cs values (1, 111);
+-- The view's home is temp, so its bare `dup_cs` binds temp.dup_cs.
+create view temp.v_bare as select id, x from dup_cs;
+
+-- `temp` holds no `only_main`, so this bare name falls through to main.
+create table main.only_main (id integer primary key, x integer);
+insert into main.only_main values (1, 222);
+create view temp.v_fall as select id, x from only_main;
+
+alter table main.dup_cs rename to dup_cs2;
+alter table main.only_main rename to only_main2;
+
+-- Untouched: still reading temp.dup_cs.
+select id, x from temp.v_bare;
+→ [{"id":1,"x":111}]
+
+-- Rewritten: follows main.only_main → main.only_main2.
+select id, x from temp.v_fall;
+→ [{"id":1,"x":222}]
+
+drop view temp.v_fall;
+drop view temp.v_bare;
+drop table main.only_main2;
+drop table temp.dup_cs;
+drop table main.dup_cs2;

@@ -360,3 +360,43 @@ select id from mv13c order by id;
 drop materialized view mv13c;
 drop materialized view mv13p;
 drop table cs;
+
+-- ===================================
+-- 14. A materialized view in ANOTHER schema follows the rename and stays LIVE
+-- ===================================
+-- The MV loop used to run only while iterating the renamed table's own schema,
+-- so an MV in `temp` over `main.t` was never re-keyed: its body kept naming the
+-- vanished table, its `sourceTables` kept the old base, and the rename's
+-- `table_modified` left it stale with row-time maintenance detached. Every
+-- schema is walked now.
+
+create table main.xsrc (id integer primary key, v integer not null);
+insert into main.xsrc values (1, 10);
+create materialized view temp.mv14 as select id, v from main.xsrc;
+
+alter table main.xsrc rename to xsrc2;
+
+-- Live, not stale: a write to the renamed base still cascades (a stale MV would
+-- serve the unmaintained backing and never see row 2).
+insert into main.xsrc2 values (2, 20);
+select id, v from temp.mv14 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+-- REFRESH re-plans the rewritten body against the renamed catalog.
+refresh materialized view temp.mv14;
+select id, v from temp.mv14 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+-- Column verb, same cross-schema MV.
+alter table main.xsrc2 rename column v to w;
+
+insert into main.xsrc2 values (3, 30);
+select id, w from temp.mv14 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20},{"id":3,"w":30}]
+
+refresh materialized view temp.mv14;
+select id, w from temp.mv14 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20},{"id":3,"w":30}]
+
+drop materialized view temp.mv14;
+drop table main.xsrc2;

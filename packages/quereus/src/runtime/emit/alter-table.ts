@@ -237,9 +237,9 @@ async function runRenameTable(
 		// substitutes `newName`, which is already under test as the record's own name.
 		assertCatalogObjectPersistable(rctx.db, 'materializedView', { ...tableSchema, name: newName });
 	}
-	assertRenameDependentsPersistable(rctx.db, schema,
-		ast => renameTableInAst(ast, oldName, newName,
-			objectResolvers.forHomeSchema(tableSchema.schemaName), renameTargetKey),
+	assertRenameDependentsPersistable(rctx.db,
+		home => ast => renameTableInAst(ast, oldName, newName,
+			objectResolvers.forHomeSchema(home), renameTargetKey),
 		t => rewriteTableForTableRename(t, oldName, newName, objectResolvers, renameTargetKey));
 
 	// Clone schema with new name
@@ -395,10 +395,10 @@ async function runRenameColumn(
 	// (and same reasoning) as the table-rename arm above.
 	const objectResolvers = snapshotObjectRefResolvers(rctx.db);
 	const renamedTableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
-	assertRenameDependentsPersistable(rctx.db, schema,
-		ast => renameColumnInAst(
+	assertRenameDependentsPersistable(rctx.db,
+		home => ast => renameColumnInAst(
 			ast, tableSchema.name, oldName, newName,
-			objectResolvers.forHomeSchema(tableSchema.schemaName), renamedTableKey, resolveColumnInSource),
+			objectResolvers.forHomeSchema(home), renamedTableKey, resolveColumnInSource),
 		t => rewriteTableForColumnRename(
 			t, tableSchema.name, oldName, newName, objectResolvers, renamedTableKey, resolveColumnInSource));
 
@@ -467,7 +467,7 @@ async function runRenameColumn(
 
 	// Propagate the rename into dependent objects (CHECK / FK / partial-index
 	// predicates in this and other tables, view and materialized-view bodies).
-	await propagateColumnRename(rctx, tableSchema.schemaName, tableSchema.name, oldName, newName, preStaleMvs,
+	await propagateColumnRename(rctx, tableSchema.name, oldName, newName, preStaleMvs,
 		objectResolvers, renamedTableKey, resolveColumnInSource);
 
 	emitAlterSchemaEvent(rctx, tableSchema, {
@@ -2112,12 +2112,17 @@ async function rebuildViaShadowTable(
 }
 
 /**
- * Propagates a table rename into every dependent schema object the catalog
- * knows about: CHECK expressions, FK references, partial-index predicates,
- * view bodies, and materialized-view bodies. Walks every schema (not just the
- * renamed table's home schema) so cross-schema FK references are picked up.
- * View `selectAst` is mutated in place because the planner re-walks it on
- * every reference.
+ * Propagates a table rename into every dependent schema object the catalog knows
+ * about: CHECK expressions, FK references, partial-index predicates, view bodies,
+ * assertion bodies, and materialized-view bodies. EVERY schema is walked for every
+ * object kind — a view / assertion / MV elsewhere over the renamed table is as much a
+ * dependent as a cross-schema foreign key, and the per-home-schema resolver is what
+ * keeps that from over-matching (see {@link snapshotObjectRefResolvers}). View
+ * `selectAst` is mutated in place because the planner re-walks it on every reference.
+ *
+ * Two global passes, not one combined per-schema pass: the MV pass re-plans each body
+ * it rewrites, so every plain VIEW in every schema must already carry the new name
+ * before the first MV re-plans — an MV in `main` may read a view in `temp`.
  */
 async function propagateTableRename(
 	rctx: RuntimeContext,
@@ -2128,8 +2133,13 @@ async function propagateTableRename(
 	resolvers: ObjectRefResolvers,
 	targetKey: string,
 ): Promise<void> {
-	for (const schema of rctx.db.schemaManager._getAllSchemas()) {
-		await propagateTableRenameInSchema(rctx.db, schema, renamedSchemaName, oldName, newName, preStaleMvs, resolvers, targetKey);
+	const schemas = Array.from(rctx.db.schemaManager._getAllSchemas());
+	for (const schema of schemas) {
+		propagateTableRenameInSchema(rctx.db, schema, renamedSchemaName, oldName, newName, resolvers, targetKey);
+	}
+	for (const schema of schemas) {
+		await propagateTableRenameToMaterializedViews(rctx.db, schema, renamedSchemaName, oldName, newName,
+			preStaleMvs, resolvers.forHomeSchema(schema.name), targetKey);
 	}
 	// After all per-schema rewrites and their cascade events: restore any MV this
 	// statement's events marked stale that the rename provably did not affect
@@ -2137,18 +2147,18 @@ async function propagateTableRename(
 	await restoreUnaffectedMaterializedViews(rctx.db, preStaleMvs);
 }
 
-async function propagateTableRenameInSchema(
+/** Tables, views and assertions of one schema. Materialized views are a separate
+ *  global pass — see {@link propagateTableRename}. */
+function propagateTableRenameInSchema(
 	db: Database,
 	schema: Schema,
 	renamedSchemaName: string,
 	oldName: string,
 	newName: string,
-	preStaleMvs: ReadonlySet<string>,
 	resolvers: ObjectRefResolvers,
 	targetKey: string,
-): Promise<void> {
+): void {
 	const notifier = db.schemaManager.getChangeNotifier();
-	const renamedSchemaLower = renamedSchemaName.toLowerCase();
 
 	for (const table of Array.from(schema.getAllTables())) {
 		// Skip the just-renamed table when iterating the home schema; the FK
@@ -2167,47 +2177,39 @@ async function propagateTableRenameInSchema(
 		}
 	}
 
-	if (schema.name.toLowerCase() === renamedSchemaLower) {
-		// Bodies owned by this schema resolve their unqualified names under ITS
-		// home path — one resolver per schema walked, all over the pre-mutation
-		// snapshot.
-		const resolve = resolvers.forHomeSchema(schema.name);
-		for (const view of Array.from(schema.getAllViews())) {
-			// The body walk also descends the trailing `with defaults (…)` clause
-			// (now stored on `selectAst.defaults`), so a clause-only rewrite — a
-			// defaults-expr subquery referencing the renamed table even when the body
-			// never names it — flips `bodyChanged` and fires the (single) view_modified.
-			const bodyChanged = renameTableInAst(view.selectAst, oldName, newName, resolve, targetKey);
-			if (bodyChanged) {
-				const updatedView = { ...view, sql: astToString(view.selectAst) };
-				schema.addView(updatedView);
-				// The rewriter mutated `view.selectAst` (including its defaults clause) in
-				// place, so `oldObject` shares the rewritten AST (only `newObject.sql`
-				// differs). No consumer reads `oldObject.selectAst`; mirrors the table
-				// loop above (no clone).
-				notifier.notifyChange({
-					type: 'view_modified',
-					schemaName: schema.name,
-					objectName: updatedView.name,
-					oldObject: view,
-					newObject: updatedView,
-				});
-			}
+	// Bodies owned by this schema resolve their unqualified names under ITS home
+	// path — one resolver per schema walked, all over the pre-mutation snapshot. A
+	// bare `t` matches only when it RESOLVES to the renamed object's key under that
+	// path, so a `temp`-owned body meaning `temp.t` survives a rename of `main.t`.
+	const resolve = resolvers.forHomeSchema(schema.name);
+	for (const view of Array.from(schema.getAllViews())) {
+		// The body walk also descends the trailing `with defaults (…)` clause
+		// (now stored on `selectAst.defaults`), so a clause-only rewrite — a
+		// defaults-expr subquery referencing the renamed table even when the body
+		// never names it — flips `bodyChanged` and fires the (single) view_modified.
+		const bodyChanged = renameTableInAst(view.selectAst, oldName, newName, resolve, targetKey);
+		if (bodyChanged) {
+			const updatedView = { ...view, sql: astToString(view.selectAst) };
+			schema.addView(updatedView);
+			// The rewriter mutated `view.selectAst` (including its defaults clause) in
+			// place, so `oldObject` shares the rewritten AST (only `newObject.sql`
+			// differs). No consumer reads `oldObject.selectAst`; mirrors the table
+			// loop above (no clone).
+			notifier.notifyChange({
+				type: 'view_modified',
+				schemaName: schema.name,
+				objectName: updatedView.name,
+				oldObject: view,
+				newObject: updatedView,
+			});
 		}
-
-		// Assertions: same in-place body rewrite as plain views, plus a regenerated
-		// `violationSql` (the text the commit-time evaluator re-parses). Assertions
-		// feed no materialized view, so order against the MV pass is free; sitting
-		// next to the view loop keeps the plain schema-level objects together.
-		propagateTableRenameToAssertions(db, schema, renamedSchemaName, oldName, newName, resolve, targetKey);
-
-		// Materialized views: same in-place body rewrite as plain views ("MV ≡
-		// faster view"), plus the derived-field re-key, row-time re-registration,
-		// and staleness discipline the MV record needs. Runs AFTER the view loop
-		// so a body reading the renamed table through a view re-plans against the
-		// already-rewritten view.
-		await propagateTableRenameToMaterializedViews(db, schema, renamedSchemaName, oldName, newName, preStaleMvs, resolve, targetKey);
 	}
+
+	// Assertions: same in-place body rewrite as plain views, plus a regenerated
+	// `violationSql` (the text the commit-time evaluator re-parses). Assertions
+	// feed no materialized view, so order against the MV pass is free; sitting
+	// next to the view loop keeps the plain schema-level objects together.
+	propagateTableRenameToAssertions(db, schema, renamedSchemaName, oldName, newName, resolve, targetKey);
 }
 
 /**
@@ -2268,9 +2270,13 @@ function rewriteTableForTableRename(
 	});
 }
 
+/**
+ * The column-verb mirror of {@link propagateTableRename} — same all-schema scope for
+ * every dependent object kind, same two-global-passes shape (views everywhere before
+ * the first MV re-plans).
+ */
 async function propagateColumnRename(
 	rctx: RuntimeContext,
-	renamedSchemaName: string,
 	tableName: string,
 	oldCol: string,
 	newCol: string,
@@ -2279,9 +2285,13 @@ async function propagateColumnRename(
 	targetKey: string,
 	resolveColumnInSource: ResolveColumnInSource,
 ): Promise<void> {
-	const schemaManager = rctx.db.schemaManager;
-	for (const schema of schemaManager._getAllSchemas()) {
-		await propagateColumnRenameInSchema(rctx.db, schema, renamedSchemaName, tableName, oldCol, newCol, resolvers, targetKey, resolveColumnInSource, preStaleMvs);
+	const schemas = Array.from(rctx.db.schemaManager._getAllSchemas());
+	for (const schema of schemas) {
+		propagateColumnRenameInSchema(rctx.db, schema, tableName, oldCol, newCol, resolvers, targetKey, resolveColumnInSource);
+	}
+	for (const schema of schemas) {
+		await propagateColumnRenameToMaterializedViews(rctx.db, schema, tableName, oldCol, newCol,
+			preStaleMvs, resolvers.forHomeSchema(schema.name), targetKey, resolveColumnInSource);
 	}
 	// After all per-schema rewrites and their cascade events: restore any MV this
 	// statement's events marked stale that the rename provably did not affect — a
@@ -2290,20 +2300,19 @@ async function propagateColumnRename(
 	await restoreUnaffectedMaterializedViews(rctx.db, preStaleMvs);
 }
 
-async function propagateColumnRenameInSchema(
+/** Tables, views and assertions of one schema. Materialized views are a separate
+ *  global pass — see {@link propagateColumnRename}. */
+function propagateColumnRenameInSchema(
 	db: Database,
 	schema: Schema,
-	renamedSchemaName: string,
 	tableName: string,
 	oldCol: string,
 	newCol: string,
 	resolvers: ObjectRefResolvers,
 	targetKey: string,
 	resolveColumnInSource: ResolveColumnInSource,
-	preStaleMvs: ReadonlySet<string>,
-): Promise<void> {
+): void {
 	const notifier = db.schemaManager.getChangeNotifier();
-	const renamedSchemaLower = renamedSchemaName.toLowerCase();
 
 	for (const table of Array.from(schema.getAllTables())) {
 		const updated = rewriteTableForColumnRename(table, tableName, oldCol, newCol, resolvers, targetKey, resolveColumnInSource);
@@ -2319,49 +2328,41 @@ async function propagateColumnRenameInSchema(
 		}
 	}
 
-	if (schema.name.toLowerCase() === renamedSchemaLower) {
-		// Bodies owned by this schema resolve under ITS home path, over the
-		// pre-mutation snapshot — same per-schema resolver as the table-rename loop.
-		const resolve = resolvers.forHomeSchema(schema.name);
-		for (const view of Array.from(schema.getAllViews())) {
-			// The body walk also descends the trailing `with defaults (…)` clause (now
-			// on `selectAst.defaults`): the entry `column` (a base column of the view's
-			// FROM table, usually projected away) rewrites via the same scope-aware
-			// synthetic probe as a `with inverse` target, and the entry exprs rewrite in
-			// the FROM frame — so a clause-only change flips `bodyChanged`. The live
-			// `resolveColumnInSource` keeps the walk scope-aware so an unqualified ref
-			// inside a defaults-expr subquery that binds a like-named column on its own
-			// FROM is not false-captured (the differ's inverse reconcile passes the
-			// declared-side resolver for parity).
-			const bodyChanged = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
-			if (bodyChanged) {
-				const updatedView = { ...view, sql: astToString(view.selectAst) };
-				schema.addView(updatedView);
-				// The rewriter mutated `view.selectAst` (including its defaults clause) in
-				// place, so `oldObject` shares the rewritten AST (only `sql` differs). No
-				// consumer reads `oldObject.selectAst`; mirrors the table loop above (no clone).
-				notifier.notifyChange({
-					type: 'view_modified',
-					schemaName: schema.name,
-					objectName: updatedView.name,
-					oldObject: view,
-					newObject: updatedView,
-				});
-			}
+	// Bodies owned by this schema resolve under ITS home path, over the pre-mutation
+	// snapshot — same per-schema resolver, and same all-schema scope, as the
+	// table-rename loop.
+	const resolve = resolvers.forHomeSchema(schema.name);
+	for (const view of Array.from(schema.getAllViews())) {
+		// The body walk also descends the trailing `with defaults (…)` clause (now
+		// on `selectAst.defaults`): the entry `column` (a base column of the view's
+		// FROM table, usually projected away) rewrites via the same scope-aware
+		// synthetic probe as a `with inverse` target, and the entry exprs rewrite in
+		// the FROM frame — so a clause-only change flips `bodyChanged`. The live
+		// `resolveColumnInSource` keeps the walk scope-aware so an unqualified ref
+		// inside a defaults-expr subquery that binds a like-named column on its own
+		// FROM is not false-captured (the differ's inverse reconcile passes the
+		// declared-side resolver for parity).
+		const bodyChanged = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
+		if (bodyChanged) {
+			const updatedView = { ...view, sql: astToString(view.selectAst) };
+			schema.addView(updatedView);
+			// The rewriter mutated `view.selectAst` (including its defaults clause) in
+			// place, so `oldObject` shares the rewritten AST (only `sql` differs). No
+			// consumer reads `oldObject.selectAst`; mirrors the table loop above (no clone).
+			notifier.notifyChange({
+				type: 'view_modified',
+				schemaName: schema.name,
+				objectName: updatedView.name,
+				oldObject: view,
+				newObject: updatedView,
+			});
 		}
-
-		// Assertions: same in-place body rewrite as plain views (unseeded walker —
-		// an assertion body owns its own FROM scopes), plus a regenerated
-		// `violationSql`.
-		propagateColumnRenameToAssertions(db, schema, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
-
-		// Materialized views: same in-place body rewrite as plain views, then the
-		// MV-specific tail — backing-column rename for a shifted output name,
-		// row-time re-registration, staleness discipline (the listener marked every
-		// dependent MV stale during the rename's notify; only statement-local
-		// staleness is cleared, per the pre-statement snapshot).
-		await propagateColumnRenameToMaterializedViews(db, schema, tableName, oldCol, newCol, preStaleMvs, resolve, targetKey, resolveColumnInSource);
 	}
+
+	// Assertions: same in-place body rewrite as plain views (unseeded walker —
+	// an assertion body owns its own FROM scopes), plus a regenerated
+	// `violationSql`.
+	propagateColumnRenameToAssertions(db, schema, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
 }
 
 function rewriteTableForColumnRename(
