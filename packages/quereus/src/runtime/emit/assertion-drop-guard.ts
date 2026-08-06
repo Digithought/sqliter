@@ -35,7 +35,7 @@ export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
  * unqualified `t` in an assertion living elsewhere is not necessarily this
  * table. The symmetric gap — an assertion in schema A naming `B.t` explicitly
  * is not caught — is the same one views, materialized views and assertions
- * already share on rename, tracked by `bug-rename-not-propagated-across-schemas`.
+ * already share on rename, tracked by `bug-schema-object-dependency-tracking`.
  *
  * Called from the three user-facing DDL emitters (`emitDropTable`,
  * `emitDropView`, `emitDropMaterializedView`) rather than from

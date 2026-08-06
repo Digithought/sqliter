@@ -221,12 +221,18 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 			// semantic one. Revisit if a CHECK ever gains a legal bare qualifier naming a
 			// table OTHER than its own; then the reverse pass needs the same per-walk
 			// changed-set the residual above wants.
+			// NOTE: a third residual, same class and same accepted rationale as the two
+			// above. The reverse pass reuses the FORWARD snapshot with the NEW name's
+			// key, relying on the resolver's miss→home fallback to key a bare `newName`
+			// under this schema — which holds only while no OTHER schema on this
+			// schema's home path already has a table or view called `newName`. When one
+			// does, the bare name resolves there instead, the reverse walk matches
+			// nothing, and a rewritten self-reference stays spelled `newName` after the
+			// rollback. Closing it wants the same per-walk changed-set the residual
+			// above wants; unreached without a failed persist.
+			//
 			// Planner-parity resolution, snapshotted here — this hook runs before the
-			// engine's catalog swap, so the snapshot sees the pre-rename catalog. The
-			// reverse pass reuses the same snapshot with the NEW name's key: the new
-			// name resolves nowhere in the snapshot, so the resolver's miss→home
-			// fallback keys it under this schema, which is exactly where the forward
-			// pass just wrote it.
+			// engine's catalog swap, so the snapshot sees the pre-rename catalog.
 			const resolveRef = buildObjectRefResolver(db, schemaName);
 			const rewriteTable = (from: string, to: string): void => {
 				const fromKey = objectRefKey(schemaName, from);

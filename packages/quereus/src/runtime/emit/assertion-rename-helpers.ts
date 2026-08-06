@@ -16,7 +16,7 @@ const log = createLogger('runtime:emit:assertion-rename');
 // actually RESOLVES to the renamed table. The remaining gap — an assertion living
 // in some OTHER schema whose body names the renamed table is never walked at all —
 // is shared verbatim with views and materialized views; it is tracked by
-// `bug-rename-not-propagated-across-schemas`, which widens the loops for all three
+// `bug-schema-object-dependency-tracking`, which widens the loops for all three
 // object kinds.
 
 /**

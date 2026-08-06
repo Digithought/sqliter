@@ -21,8 +21,9 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 import { parseExpressionString } from '../../src/parser/index.js';
+import { parseInsert, parse } from '../../src/parser/index.js';
 import { snapshotObjectRefResolvers } from '../../src/schema/object-ref-resolver.js';
-import { objectRefKey, renameTableInCheckConstraints, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
+import { objectRefKey, renameColumnInAst, renameTableInCheckConstraints, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
 import type * as AST from '../../src/parser/ast.js';
 
 function checkText(db: Database, schema: string, table: string): string {
@@ -185,6 +186,74 @@ describe('cross-schema rename propagation (planner-parity resolution)', () => {
 		const once = checkText(db, 'main', 'dep');
 		await db.exec('alter table temp.t2 rename to t3');
 		expect(checkText(db, 'main', 'dep')).to.equal(once.replace('t2', 't3'));
+	});
+});
+
+describe('qualifier binding resolves cross-schema (column verb)', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec("pragma schema_path = 'main,temp'");
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('create table temp.t (id integer primary key, x integer)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const viewSql = (schema: string, name: string): string =>
+		db.schemaManager.getSchema(schema)!.getView(name)!.sql.replace(/"/g, '');
+
+	it('an ALIAS on another schema\'s same-named table does not follow the rename', async () => {
+		await db.exec('create view main.v as select (select max(z.x) from temp.t z) as m, t.x as tx from main.t');
+		await db.exec('alter table main.t rename column x to y');
+		const sql = viewSql('main', 'v');
+		// `z` binds temp.t — untouched; the outer unaliased `t` binds main.t — renamed.
+		expect(sql).to.contain('max(z.x)');
+		expect(sql).to.contain('t.y as tx');
+	});
+
+	it('an inner unaliased cross-schema source wins over the outer same-named renamed table', async () => {
+		await db.exec('create view main.v2 as select (select max(t.x) from temp.t) as m from main.t');
+		await db.exec('alter table main.t rename column x to y');
+		// The innermost frame binds `t` to temp.t, so `t.x` is not the renamed column.
+		expect(viewSql('main', 'v2')).to.contain('max(t.x)');
+	});
+
+	it('the same inner source DOES follow when it is the renamed table', async () => {
+		// The view lives in `temp` so the propagation's home-schema view loop reaches
+		// it — a `main`-owned view naming `temp.t` is a separate, tracked gap
+		// (`bug-schema-object-dependency-tracking`), not a resolution question.
+		await db.exec('create view temp.v3 as select (select max(t.x) from temp.t) as m from main.t');
+		await db.exec('alter table temp.t rename column x to y');
+		expect(viewSql('temp', 'v3')).to.contain('max(t.y)');
+	});
+});
+
+describe('DML write targets in the column walker', () => {
+	const resolve = singleSchemaObjectRefResolver('main');
+	const targetKey = objectRefKey('main', 't');
+
+	it('an INSERT target naming the statement\'s own CTE is not the renamed table', () => {
+		const stmt = parseInsert('with t as (select 1 as k) insert into t (k) select k from t');
+		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey)).to.equal(false);
+		expect(stmt.columns).to.deep.equal(['k']);
+	});
+
+	it('an INSERT target that really is the renamed table still rewrites its column list', () => {
+		const stmt = parseInsert('insert into t (k) values (1)');
+		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey)).to.equal(true);
+		expect(stmt.columns).to.deep.equal(['k2']);
+	});
+
+	it('an UPDATE target naming the statement\'s own CTE leaves its assignments alone', () => {
+		const stmt = parse('with t as (select 1 as k) update t set k = 2') as AST.UpdateStmt;
+		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey)).to.equal(false);
+		expect(stmt.assignments[0].column).to.equal('k');
+	});
+
+	it('an UPDATE target in another schema is not the renamed table', () => {
+		const stmt = parse('update temp.t set k = 2') as AST.UpdateStmt;
+		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey)).to.equal(false);
+		expect(stmt.assignments[0].column).to.equal('k');
 	});
 });
 

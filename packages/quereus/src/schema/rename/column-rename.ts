@@ -1,6 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
-import { eq, rewriteEach, type ResolveColumnInSource, type ResolveObjectRef } from './shared.js';
+import { eq, objectRefKeySchema, rewriteEach, type ResolveColumnInSource, type ResolveObjectRef } from './shared.js';
 
 /**
  * Scope-aware, in-place column-rename walkers: propagate `ALTER TABLE … RENAME
@@ -431,11 +431,7 @@ function collectFromBindings(
 			// renamed column. Both aliased and unaliased real sources are
 			// recorded — asking "does u expose col v" is the same question
 			// regardless of any alias.
-			frame.realSources.push({
-				key,
-				schemaLower: key.slice(0, key.length - name.length - 1),
-				nameLower: name,
-			});
+			frame.realSources.push({ key, schemaLower: objectRefKeySchema(key, name), nameLower: name });
 			break;
 		}
 		case 'join': {

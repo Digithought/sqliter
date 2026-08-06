@@ -34,6 +34,15 @@ export const objectRefKey = (schemaName: string, objectName: string): string =>
 	`${schemaName.toLowerCase()}.${objectName.toLowerCase()}`;
 
 /**
+ * The `<schema>` half of a key {@link objectRefKey} built, given the object name
+ * it was built from (already lowercase). Split by the KNOWN name's length rather
+ * than by a separator scan, because a schema name may itself contain a dot. Kept
+ * here next to `objectRefKey` so the key format is known in exactly one file.
+ */
+export const objectRefKeySchema = (key: string, objectNameLower: string): string =>
+	key.slice(0, key.length - objectNameLower.length - 1);
+
+/**
  * {@link ResolveObjectRef} for a world where every unqualified name belongs to
  * exactly one schema: the schema differ's declared catalog (single-schema by
  * construction) and any other context with no live catalog to consult. A

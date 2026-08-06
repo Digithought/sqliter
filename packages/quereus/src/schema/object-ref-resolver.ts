@@ -29,6 +29,20 @@ export interface ObjectRefResolvers {
  *   that does not exist still gets a stable key rather than `undefined` —
  *   `undefined` is reserved for "no resolver could be consulted at all".
  *
+ * NOTE: "the way the planner answers" is exact for the body kinds that plan under
+ * {@link Database._homeSchemaPath} — view bodies, materialized-view bodies, and
+ * assertion checks (`planner/stored-body-context.ts`). A CHECK constraint or a
+ * column DEFAULT / generated expression is stricter still: it plans under
+ * `schemaAuthoredContext` (`planner/building/schema-authored-context.ts`), the
+ * owning schema and NOTHING else, so an unqualified name the owning schema does
+ * not hold is an error there rather than a fallthrough down the session path.
+ * This resolver applies the looser home-path rule to all of them, which is
+ * deliberately safe rather than exact: the two rules can only disagree when the
+ * home schema lacks the name, and such a CHECK / DEFAULT cannot be evaluated at
+ * all — so no VALID body is ever matched (or missed) differently. Tighten to a
+ * per-body-kind path only if a rename ever needs to be right about a body the
+ * planner itself rejects.
+ *
  * SNAPSHOT DISCIPLINE — the single most likely way to get this wrong: build the
  * snapshot (`snapshotObjectRefResolvers` / `buildObjectRefResolver`) BEFORE the
  * statement's first catalog mutation, and pass the same instance through the whole

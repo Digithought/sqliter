@@ -15,7 +15,7 @@
  *
  * Cross-schema propagation (an assertion in `main` naming `temp.u` explicitly) is a
  * known gap shared with views and materialized views — see
- * `bug-rename-not-propagated-across-schemas`. It is deliberately not asserted here:
+ * `bug-schema-object-dependency-tracking`. It is deliberately not asserted here:
  * it is a defect, not a contract.
  */
 
