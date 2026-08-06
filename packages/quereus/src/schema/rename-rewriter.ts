@@ -25,6 +25,7 @@ export {
 	type TableRenameOpts,
 } from './rename/table-rename.js';
 export {
+	PROBE_COLUMN_NAME,
 	renameColumnInAst,
 	renameColumnInCheckExpression,
 	columnReferencedInAst,

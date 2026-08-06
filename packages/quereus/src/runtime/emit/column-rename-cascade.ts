@@ -1,17 +1,16 @@
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { Database } from '../../core/database.js';
-import type * as AST from '../../parser/ast.js';
-import { isMaintainedTable } from '../../schema/derivation.js';
-import type { ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
 import {
-	bodyExposesRenamedColumn,
-	bodyPublishesColumnNamed,
-	objectRefKey,
-	renameColumnInAst,
-} from '../../schema/rename-rewriter.js';
+	scanShiftedPublishers,
+	visitKeyOf,
+	type ColumnRenameCascadeTarget,
+} from '../../schema/column-republication.js';
+import type { ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
+import { objectRefKey } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
-import { spineCloneAst } from '../../util/ast-spine-clone.js';
+
+export type { ColumnRenameCascadeTarget };
 
 /**
  * Worklist driver for `ALTER TABLE … RENAME COLUMN` propagation. Rewriting a
@@ -32,6 +31,10 @@ import { spineCloneAst } from '../../util/ast-spine-clone.js';
  * covers — dependent tables' CHECK / DEFAULT / GENERATED expressions, views,
  * materialized views, assertions — is covered at every depth.
  *
+ * The per-round dependent scan ({@link scanShiftedPublishers}) lives in
+ * `schema/column-republication.ts`, shared with the DROP COLUMN guards'
+ * read-only fixpoint over the same lineage.
+ *
  * Views cannot be recursive and a maintained table cannot derive from itself,
  * so the visited set is insurance against a malformed catalog rather than an
  * expected cycle — but without it the loop would be unbounded.
@@ -45,23 +48,12 @@ import { spineCloneAst } from '../../util/ast-spine-clone.js';
  * round's target (an object-dependency index) instead of re-sweeping the catalog.
  */
 
-/** One round's rename target: the object whose published column shifts old → new. */
-export interface ColumnRenameCascadeTarget {
-	/** Canonical `<schema>.<name>` key of the target (see {@link objectRefKey}). */
-	targetKey: string;
-	/** The target's bare name — what unqualified references in dependent bodies spell. */
-	tableName: string;
-}
-
-const visitKeyOf = (target: ColumnRenameCascadeTarget, oldColLower: string): string =>
-	`${target.targetKey}:${oldColLower}`;
-
 /**
  * The live cascade. Breadth-first from the renamed table: run `runRound` (the
  * ordinary all-schema column-rename propagation) for the head, then scan for
  * views / MVs whose published names that round shifted and enqueue them as the
  * next targets. Each round's rewrites land in place before the scan runs, so
- * the scan reads post-rewrite bodies — {@link bodyExposesRenamedColumn}'s
+ * the scan reads post-rewrite bodies — {@link import('../../schema/rename/column-rename.js').bodyExposesRenamedColumn}'s
  * documented contract.
  *
  * `preStaleMvs` is the statement's pre-notify staleness snapshot: a pre-stale
@@ -165,68 +157,5 @@ export function assertColumnRenameCascadePublishable(
 				queue.push(dependent);
 			},
 		});
-	}
-}
-
-interface ShiftScanOpts {
-	/**
-	 * Probe a spine clone with the round's rewrite applied first — the read-only
-	 * pre-flight, whose bodies have not been rewritten yet. The live driver's
-	 * scan runs after the round's in-place rewrites and reads the live ASTs.
-	 */
-	probeOnClone: boolean;
-	/** MVs whose published names cannot shift (pre-existing staleness — the
-	 *  backing columns are not renamed for those). */
-	isMvExcluded: (mv: { schemaName: string; name: string; derivation: { stale?: boolean } }) => boolean;
-	/** Called once per dependent whose published names the target's rename shifts. */
-	onShifted: (dependent: ColumnRenameCascadeTarget) => void;
-	/** Pre-flight only: a shifted dependent ALSO already publishes `newCol`. */
-	onCollision?: (kind: 'view' | 'materialized view', schemaName: string, name: string) => void;
-}
-
-/**
- * One round's dependent scan, shared by the pre-flight and the live driver:
- * every schema's plain views and maintained tables, skipping any with an
- * explicit column list (a declared list pins the published names — the same
- * guard `cte.columns` is inside the CTE exposure analysis).
- */
-function scanShiftedPublishers(
-	db: Database,
-	target: ColumnRenameCascadeTarget,
-	oldCol: string,
-	newCol: string,
-	resolvers: ObjectRefResolvers,
-	resolveColumnInSource: ResolveColumnInSource,
-	opts: ShiftScanOpts,
-): void {
-	for (const schema of db.schemaManager._getAllSchemas()) {
-		const resolve = resolvers.forHomeSchema(schema.name);
-		const shifted = (body: AST.QueryExpr): boolean => {
-			let probe = body;
-			if (opts.probeOnClone) {
-				probe = spineCloneAst(body);
-				renameColumnInAst(probe, target.tableName, oldCol, newCol, resolve, target.targetKey, resolveColumnInSource);
-			}
-			return bodyExposesRenamedColumn(probe, target.tableName, oldCol, newCol, resolve, target.targetKey, resolveColumnInSource);
-		};
-		for (const view of Array.from(schema.getAllViews())) {
-			if (view.columns && view.columns.length > 0) continue;
-			if (!shifted(view.selectAst)) continue;
-			if (opts.onCollision && bodyPublishesColumnNamed(view.selectAst, newCol, resolve, resolveColumnInSource)) {
-				opts.onCollision('view', schema.name, view.name);
-			}
-			opts.onShifted({ targetKey: objectRefKey(schema.name, view.name), tableName: view.name });
-		}
-		for (const table of Array.from(schema.getAllTables())) {
-			if (!isMaintainedTable(table)) continue;
-			if (opts.isMvExcluded(table)) continue;
-			const d = table.derivation;
-			if (d.columns && d.columns.length > 0) continue;
-			if (!shifted(d.selectAst)) continue;
-			if (opts.onCollision && bodyPublishesColumnNamed(d.selectAst, newCol, resolve, resolveColumnInSource)) {
-				opts.onCollision('materialized view', schema.name, table.name);
-			}
-			opts.onShifted({ targetKey: objectRefKey(schema.name, table.name), tableName: table.name });
-		}
 	}
 }

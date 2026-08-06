@@ -157,11 +157,13 @@ export function renameColumnInCheckExpression(
 }
 
 /**
- * Sentinel rename target for the two read-only column probes below. No user
- * column can hold this name, and the probe rewrites *to* it, so it can never
- * collide with anything the walk is looking for.
+ * Sentinel rename target for the read-only column probes: the two below, and
+ * the drop verb's republication fixpoint
+ * (`schema/column-republication.ts`), which probes exposure the same way. No
+ * user column can hold this name, and the probe rewrites *to* it, so it can
+ * never collide with anything the walk is looking for.
  */
-const PROBE_COLUMN_NAME = '__quereus_column_probe__';
+export const PROBE_COLUMN_NAME = '__quereus_column_probe__';
 
 /**
  * Whether `node` refers to `tableName`.`columnName` — read-only with respect to

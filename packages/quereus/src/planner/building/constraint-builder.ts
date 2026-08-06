@@ -67,7 +67,7 @@ export function buildConstraintChecks(
   const applicableConstraints = [...tableSchema.checkConstraints, ...additionalConstraints]
     .filter(constraint => shouldCheckConstraint(constraint, operation));
 
-  const resolveColumnInSource = buildColumnSourceResolver(ctx.schemaManager);
+  const resolveColumnInSource = buildColumnSourceResolver(ctx.db);
 
   // Build expression nodes for each constraint
   return applicableConstraints.map(constraint => {

@@ -178,7 +178,7 @@ describe('column-rename cascade', () => {
 			await db.exec('create table w (id integer primary key, y integer)');
 			await db.exec('create table other (id integer primary key, y integer)');
 			const resolve = snapshotObjectRefResolvers(db).forHomeSchema('main');
-			return { resolve, inSource: buildColumnSourceResolver(db.schemaManager), key: objectRefKey('main', 'w') };
+			return { resolve, inSource: buildColumnSourceResolver(db), key: objectRefKey('main', 'w') };
 		};
 
 		it('bare projection of the new name bound to the target exposes', async () => {
@@ -215,7 +215,7 @@ describe('column-rename cascade', () => {
 			await db.exec('create table w (id integer primary key, x integer)');
 			await db.exec('create table u (id integer primary key, y integer)');
 			await db.exec('create table nu (id integer primary key, z integer)');
-			return { resolve: snapshotObjectRefResolvers(db).forHomeSchema('main'), inSource: buildColumnSourceResolver(db.schemaManager) };
+			return { resolve: snapshotObjectRefResolvers(db).forHomeSchema('main'), inSource: buildColumnSourceResolver(db) };
 		};
 
 		it('sees an alias, a bare projection wherever bound, and `*` over an exposing source', async () => {

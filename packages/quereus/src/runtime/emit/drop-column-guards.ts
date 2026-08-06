@@ -4,6 +4,8 @@ import { StatusCode } from '../../common/types.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { columnReferencedInAst, objectRefKey } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
+import { snapshotObjectRefResolvers } from '../../schema/object-ref-resolver.js';
+import { collectColumnRepublication } from '../../schema/column-republication.js';
 import { assertionReachesHomeSchemaFirst, describeOwnedAssertion } from '../../schema/assertion.js';
 import { describeReachPath } from '../../schema/object-dependency-closure.js';
 import {
@@ -130,6 +132,11 @@ export function assertNoCheckConstraintNamesColumn(
  * names the dropped column, the table it is being dropped from, the offending expression,
  * and — when the expression lives somewhere else — the table carrying it. The own-table
  * message is unchanged from before this guard learned to scan other tables.
+ *
+ * A {@link ExpressionDependent.breaksEntirely} match gets its own spelling: the
+ * expression references a view / MV the drop breaks OUTRIGHT (an explicit column list
+ * over a `*` covering the column), so telling the user one column is referenced would
+ * send them hunting for a name no body spells.
  */
 function refuseColumnExpressionDependent(
 	db: Database,
@@ -139,6 +146,15 @@ function refuseColumnExpressionDependent(
 ): void {
 	const dependent = findColumnExpressionDependent(db, tableSchema, columnName, arm);
 	if (!dependent) return;
+	if (dependent.breaksEntirely) {
+		throw new QuereusError(
+			`Cannot drop column '${columnName}' from '${tableSchema.name}': `
+			+ `${referencedBy(dependent, tableSchema.schemaName)} references ${dependent.breaksEntirely}, `
+			+ `whose explicit column list would no longer match its body once '*' expands without the `
+			+ `column — dropping the column breaks it outright, not just one column`,
+			StatusCode.CONSTRAINT,
+		);
+	}
 	throw new QuereusError(
 		`Cannot drop column '${columnName}' from '${tableSchema.name}': ${refersTo(dependent, tableSchema.schemaName)}`,
 		StatusCode.CONSTRAINT,
@@ -185,14 +201,19 @@ function referencedBy(dependent: ExpressionDependent, homeSchemaName: string): s
  * where x < 0)` refuses `alter table t drop column x` — the match is on `v`'s body,
  * not the assertion's.
  *
- * KNOWN GAP — no column lineage through a view's PROJECTION is built, so a body that
+ * Each body is probed against every COLUMN REPUBLICATION target
+ * (`schema/column-republication.ts`), not the base table alone: a view that
  * re-exposes the column by a star (`create view v as select * from t`, `select t.*`,
- * or a materialized view of either) hides it: nothing in the chain spells `x`, the
- * drop is accepted, and the assertion's `where x < 0` then fails every write to the
- * whole database with `Column not found: x`. Tracked as
- * `drop-column-guard-blind-to-star-reexposure`, which owns the fix for this family and
- * for the CHECK / DEFAULT one — that one now follows the same chains and so has the same
- * hole. Widening it needs the view's OUTPUT column set, which `ViewSchema` does not carry.
+ * or a materialized view of either) spells the name nowhere, and a reader's
+ * `where x < 0` references the column against `v`. Targets are swept OUTER — base
+ * table first, bodies inner — so every match the base sweep finds is found at the
+ * body it always was and the existing message spellings do not move. The
+ * broken-listed arm follows the sweep: an explicit column list over a covering `*`
+ * (`create view v(a, b) as select * from t`) breaks the whole view on the drop
+ * (the star's arity changes), so an assertion whose reach names such a view at all
+ * refuses, with a message saying the view breaks outright. The fixpoint's second
+ * catalog snapshot is taken at the same pre-mutation point as
+ * `assertionReachesHomeSchemaFirst`'s, so the two answer identically.
  *
  * Scope is EVERY schema, matching `assertNoAssertionDependsOn`: an assertion in
  * `temp` naming `main.t`'s column blocks the drop, while one whose bare `t` resolves
@@ -205,17 +226,32 @@ export function assertNoAssertionNamesColumn(
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
-	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
+	const resolveColumnInSource = buildColumnSourceResolver(db);
 	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
+	const republication = collectColumnRepublication(db,
+		{ targetKey: tableKey, tableName: tableSchema.name }, columnName,
+		snapshotObjectRefResolvers(db), resolveColumnInSource);
 
 	for (const { owned, reach } of assertionReachesHomeSchemaFirst(db, tableSchema.schemaName)) {
-		for (const reached of reach.bodies) {
-			if (!columnReferencedInAst(reached.body, tableSchema.name, columnName,
-				reached.resolve, tableKey, resolveColumnInSource)) continue;
+		for (const target of republication.targets) {
+			for (const reached of reach.bodies) {
+				if (!columnReferencedInAst(reached.body, target.tableName, columnName,
+					reached.resolve, target.targetKey, resolveColumnInSource)) continue;
+				throw new QuereusError(
+					`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by `
+					+ `assertion ${describeOwnedAssertion(owned, tableSchema.schemaName)}`
+					+ `${describeReachPath(reached.path)} — drop or redefine the assertion first`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
+		for (const broken of republication.brokenListed) {
+			if (!reach.namerOf(broken.key)) continue;
 			throw new QuereusError(
-				`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by `
-				+ `assertion ${describeOwnedAssertion(owned, tableSchema.schemaName)}`
-				+ `${describeReachPath(reached.path)} — drop or redefine the assertion first`,
+				`Cannot drop column '${columnName}' from '${tableSchema.name}': assertion `
+				+ `${describeOwnedAssertion(owned, tableSchema.schemaName)} references ${broken.describe}, `
+				+ `whose explicit column list would no longer match its body once '*' expands without the `
+				+ `column — dropping the column breaks it outright — drop or redefine the assertion first`,
 				StatusCode.CONSTRAINT,
 			);
 		}

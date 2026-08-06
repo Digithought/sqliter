@@ -392,7 +392,7 @@ async function runRenameColumn(
 	// this probe runs pre-mutation while the propagation runs post-) is that
 	// `isTableInUnaliasedScope` skips the renamed table itself and probes only OTHER
 	// sources, whose column sets this rename does not touch.
-	const resolveColumnInSource = buildColumnSourceResolver(rctx.db.schemaManager);
+	const resolveColumnInSource = buildColumnSourceResolver(rctx.db);
 	// Reference-resolution snapshot, BEFORE the first side effect — same discipline
 	// (and same reasoning) as the table-rename arm above.
 	const objectResolvers = snapshotObjectRefResolvers(rctx.db);

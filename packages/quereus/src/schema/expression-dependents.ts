@@ -11,6 +11,7 @@ import {
 import { buildColumnSourceResolver } from './column-source-resolver.js';
 import { snapshotObjectRefResolvers, type ObjectRefResolvers } from './object-ref-resolver.js';
 import { reachableObjects } from './object-dependency-closure.js';
+import { collectColumnRepublication, type ColumnRepublication } from './column-republication.js';
 
 /**
  * The catalog query "which stored, table-attached expressions reference this object?",
@@ -74,7 +75,11 @@ import { reachableObjects } from './object-dependency-closure.js';
  * bodies at all — but it is still one extra walk per expression for the COLUMN verb, which
  * pays `collectTableRefsInAst` to build the reach and then the column probe on top (the
  * table verb reads its answer straight off the reach, so it is walk-for-walk with the
- * one-hop probe it replaced). Reasoned from the call shape, not measured. DDL is rare and
+ * one-hop probe it replaced). The COLUMN verb additionally runs one republication
+ * fixpoint per guard call (`schema/column-republication.ts` — a catalog sweep per round)
+ * and probes bodies × targets instead of bodies × 1; targets beyond the base table exist
+ * only when some view republishes the dropped column, so the common case pays one sweep
+ * and nothing else. Reasoned from the call shape, not measured. DDL is rare and
  * schemas hold handfuls of tables, so this is not worth optimising now; if it ever shows as
  * hot, gate each table on a cheap literal name scan of its stored SQL before paying for the
  * AST walk.
@@ -94,6 +99,14 @@ export interface ExpressionDependent {
 	 * object itself. Feed it to `describeReachPath` to phrase an indirect refusal.
 	 */
 	path: ReadonlyArray<string>;
+	/**
+	 * Present when the match is not a body NAMING the column but a view / MV the drop
+	 * would BREAK OUTRIGHT: the object declares an explicit column list over a body
+	 * whose `*` republishes the dropped column, so the drop changes the star's arity
+	 * and every reference to the object breaks — not just references to one column.
+	 * The value is the object's description (`view 'v'`), for the refusal message.
+	 */
+	breaksEntirely?: string;
 }
 
 /**
@@ -135,14 +148,18 @@ export function findColumnExpressionDependent(
 	arm: ColumnExpressionArm,
 ): ExpressionDependent | undefined {
 	const resolvers = snapshotObjectRefResolvers(db);
-	const resolveColumnInSource = buildColumnSourceResolver(db.schemaManager);
+	const resolveColumnInSource = buildColumnSourceResolver(db);
 	const targetKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
+	// One republication fixpoint per drop (seed first), shared by every probe below:
+	// a view republishing the column by a star (`select * from t`) is a target its
+	// readers reference the column THROUGH, without any body spelling the name.
+	const republication = collectColumnRepublication(db,
+		{ targetKey, tableName: tableSchema.name }, columnName, resolvers, resolveColumnInSource);
 
 	for (const table of tablesProbedTargetFirst(db, targetKey)) {
 		const ownTable = objectRefKey(table.schemaName, table.name) === targetKey;
 		const names = columnProbe(
-			db, resolvers, table.schemaName, ownTable, tableSchema.name, columnName,
-			targetKey, resolveColumnInSource);
+			db, resolvers, table.schemaName, ownTable, republication, columnName, resolveColumnInSource);
 		const found = arm === 'check'
 			? findInChecks(table, names)
 			: findInColumnExpressions(table, ownTable, columnName, names);
@@ -178,10 +195,12 @@ export function findTableExpressionDependent(
 
 	for (const table of tablesProbedTargetFirst(db, targetKey)) {
 		if (objectRefKey(table.schemaName, table.name) === targetKey) continue;
-		const names: ExpressionProbe = expr => expr === undefined
-			? undefined
-			: reachableObjects(db, expr, table.schemaName, resolvers, { rowImageContext: true })
+		const names: ExpressionProbe = expr => {
+			if (expr === undefined) return undefined;
+			const path = reachableObjects(db, expr, table.schemaName, resolvers, { rowImageContext: true })
 				.namerOf(targetKey)?.path;
+			return path === undefined ? undefined : { path };
+		};
 		const found = findInChecks(table, names) ?? findInColumnExpressions(table, false, undefined, names);
 		if (found) return { table, ownTable: false, ...found };
 	}
@@ -202,17 +221,23 @@ export function describeDependentTable(table: TableSchema, homeSchemaName: strin
 
 /**
  * Whether one stored expression REACHES the probed object, and how: the chain of stored
- * bodies traversed to get there — EMPTY for a direct match — or `undefined` for no match.
- * Path-returning rather than boolean because a caller has to phrase an indirect refusal
- * differently: a user told a CHECK blocks the drop will read its body, find no mention of
- * the dropped object, and be stuck without the chain.
+ * bodies traversed to get there — EMPTY {@link ProbeMatch.path} for a direct match — or
+ * `undefined` for no match. Path-returning rather than boolean because a caller has to
+ * phrase an indirect refusal differently: a user told a CHECK blocks the drop will read
+ * its body, find no mention of the dropped object, and be stuck without the chain.
  */
-type ExpressionProbe = (expr: AST.Expression | undefined) => ReadonlyArray<string> | undefined;
+type ExpressionProbe = (expr: AST.Expression | undefined) => ProbeMatch | undefined;
 
-/** A matched stored expression: what to call it, and the reach path to the match. */
-interface ProbeHit {
-	describe: string;
+/** How a probe matched: the reach path, plus the broken-view arm's marker. */
+interface ProbeMatch {
 	path: ReadonlyArray<string>;
+	/** See {@link ExpressionDependent.breaksEntirely}. */
+	breaksEntirely?: string;
+}
+
+/** A matched stored expression: what to call it, and how the probe matched. */
+interface ProbeHit extends ProbeMatch {
+	describe: string;
 }
 
 /**
@@ -249,32 +274,52 @@ function* tablesProbedTargetFirst(db: Database, targetKey: string): Iterable<Tab
  * bodies the way `assertNoAssertionNamesColumn` already does, each under its own resolver.
  * `homeSchemaName` is the SCANNED table's schema — the root expression's own — because that
  * is what its unqualified names resolve against.
+ *
+ * Each body is probed against EVERY republication target, not the base table alone: a
+ * reference through `create view v as select * from t` spells the column against `v`, and
+ * only the target sweep sees it. Targets are swept OUTER, bodies inner, base table first —
+ * so every match the base-table sweep finds is found at the body it always was, and the
+ * existing message spellings (`reaches it through view 'v'`) do not move; the widened
+ * targets only ever ADD refusals.
+ *
+ * After the target sweep, the broken-listed arm: a view / MV with an explicit column list
+ * over a `*` covering the column breaks OUTRIGHT on the drop (the star's arity changes),
+ * so an expression whose reach names such an object at all refuses, marked
+ * {@link ProbeMatch.breaksEntirely} so the guard can phrase it honestly.
  */
 function columnProbe(
 	db: Database,
 	resolvers: ObjectRefResolvers,
 	homeSchemaName: string,
 	ownTable: boolean,
-	probedTableName: string,
+	republication: ColumnRepublication,
 	columnName: string,
-	targetKey: string,
 	resolveColumnInSource: ResolveColumnInSource,
 ): ExpressionProbe {
 	return expr => {
 		if (!expr) return undefined;
 		const reach = reachableObjects(db, expr, homeSchemaName, resolvers, { rowImageContext: true });
-		for (const reached of reach.bodies) {
-			// Seeded ONLY on the probed table's own ROOT body: a CHECK / DEFAULT there is
-			// written against the row being written, so an unqualified name binds the owning
-			// table implicitly. A view body below it is a relation with no such seed, and the
-			// root body of ANOTHER table's expression binds that table's row, not ours.
-			const seeded = ownTable && reached.ownerKey === undefined;
-			const hit = seeded
-				? columnReferencedInCheckExpression(reached.body, probedTableName, columnName,
-					reached.resolve, targetKey, resolveColumnInSource)
-				: columnReferencedInAst(reached.body, probedTableName, columnName,
-					reached.resolve, targetKey, resolveColumnInSource);
-			if (hit) return reached.path;
+		for (const [targetIndex, target] of republication.targets.entries()) {
+			for (const reached of reach.bodies) {
+				// Seeded ONLY on the probed table's own ROOT body, probing the BASE target: a
+				// CHECK / DEFAULT there is written against the row being written, so an
+				// unqualified name binds the owning table implicitly. A view body below it is
+				// a relation with no such seed, the root body of ANOTHER table's expression
+				// binds that table's row, not ours — and no expression ever binds a VIEW
+				// target implicitly, so a republication target takes the unseeded probe even
+				// at the root (a reference to it can only sit inside a subquery FROM).
+				const seeded = targetIndex === 0 && ownTable && reached.ownerKey === undefined;
+				const hit = seeded
+					? columnReferencedInCheckExpression(reached.body, target.tableName, columnName,
+						reached.resolve, target.targetKey, resolveColumnInSource)
+					: columnReferencedInAst(reached.body, target.tableName, columnName,
+						reached.resolve, target.targetKey, resolveColumnInSource);
+				if (hit) return { path: reached.path };
+			}
+		}
+		for (const broken of republication.brokenListed) {
+			const namer = reach.namerOf(broken.key);
+			if (namer) return { path: namer.path, breaksEntirely: broken.describe };
 		}
 		return undefined;
 	};
@@ -283,10 +328,9 @@ function columnProbe(
 /** The first CHECK constraint of `table` the probe matches, described for an error. */
 function findInChecks(table: TableSchema, names: ExpressionProbe): ProbeHit | undefined {
 	for (const check of table.checkConstraints ?? []) {
-		// `!== undefined`, not truthiness: an EMPTY path is a direct match, and `[]` reading
-		// as truthy today is exactly the sort of thing a later `path?.length` guard breaks.
-		const path = names(check.expr);
-		if (path !== undefined) return { describe: describeCheck(check), path };
+		// `!== undefined`, not truthiness: a match with an EMPTY path is a direct match.
+		const match = names(check.expr);
+		if (match !== undefined) return { describe: describeCheck(check), ...match };
 	}
 	return undefined;
 }
@@ -306,15 +350,16 @@ function findInColumnExpressions(
 	const lowerSkip = ownTable ? skipColumnName?.toLowerCase() : undefined;
 	for (const col of table.columns) {
 		if (lowerSkip !== undefined && col.name.toLowerCase() === lowerSkip) continue;
-		// `!== undefined` for the same reason as in {@link findInChecks}: `[]` is a hit.
-		const defaultPath = names(col.defaultValue ?? undefined);
-		if (defaultPath !== undefined) {
-			return { describe: `the DEFAULT of column '${col.name}'`, path: defaultPath };
+		// `!== undefined` for the same reason as in {@link findInChecks}: an empty-path
+		// match is a direct hit.
+		const defaultMatch = names(col.defaultValue ?? undefined);
+		if (defaultMatch !== undefined) {
+			return { describe: `the DEFAULT of column '${col.name}'`, ...defaultMatch };
 		}
 		if (ownTable) continue;
-		const generatedPath = names(col.generatedExpr);
-		if (generatedPath !== undefined) {
-			return { describe: `the GENERATED expression of column '${col.name}'`, path: generatedPath };
+		const generatedMatch = names(col.generatedExpr);
+		if (generatedMatch !== undefined) {
+			return { describe: `the GENERATED expression of column '${col.name}'`, ...generatedMatch };
 		}
 	}
 	return undefined;

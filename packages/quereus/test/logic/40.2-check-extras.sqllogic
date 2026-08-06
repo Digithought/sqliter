@@ -344,6 +344,50 @@ select qty from t_selfq_r;
 
 drop table t_selfq_r;
 
+-- a subquery over a VIEW that exposes the same name blocks the strip, exactly as a
+-- real table exposing it would: the column-source resolver reads a view's published
+-- columns (explicit list, or the body's projection / star), so the qualified
+-- self-reference is NOT rewritten to a bare name the view would capture. The ref then
+-- stays qualified and fails to resolve at write time — loud, instead of silently
+-- comparing the view's column to itself (what the view-blind resolver used to produce).
+create table t_selfq_vsrc (k integer primary key, n integer);
+create view t_selfq_vw as select n from t_selfq_vsrc;
+insert into t_selfq_vsrc values (1, 10);
+
+create table t_selfq_v (
+	id integer primary key,
+	n integer,
+	constraint over_view check ((select count(*) from t_selfq_vw where t_selfq_vw.n > t_selfq_v.n) = 0)
+);
+
+insert into t_selfq_v values (1, 50);
+-- error: t_selfq_v.n isn't a column
+
+drop table t_selfq_v;
+
+-- ...and when the view does NOT expose the name, the strip proceeds and the
+-- self-reference correlates to the constraint row, same as the real-table case above.
+create view t_selfq_vk as select k from t_selfq_vsrc;
+
+create table t_selfq_v2 (
+	id integer primary key,
+	m integer,
+	constraint under_view check ((select count(*) from t_selfq_vk where k > t_selfq_v2.m) = 0)
+);
+
+insert into t_selfq_v2 values (1, 50);
+
+select m from t_selfq_v2;
+→ [{"m":50}]
+
+insert into t_selfq_v2 values (2, 0);
+-- error: under_view
+
+drop table t_selfq_v2;
+drop view t_selfq_vk;
+drop view t_selfq_vw;
+drop table t_selfq_vsrc;
+
 -- ===================================
 -- CHECK comparisons resolve declared column collations, exactly like read-path
 -- queries (and ALTER backfill validation / assertion enforcement, which compile
