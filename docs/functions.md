@@ -15,7 +15,7 @@ Quereus uses conversion functions instead of the SQL `CAST` operator for explici
 | `integer(X)` | INTEGER | Truncates reals, parses strings, booleans to 0/1 |
 | `real(X)` | REAL | Parses strings, integers to float, booleans to 0.0/1.0 |
 | `text(X)` | TEXT | The one value-to-text conversion (see [types.md § Value to text](types.md#value-to-text)): numbers stringified, booleans to `'true'`/`'false'`, blobs UTF-8-decoded, JSON documents to their own text. Never throws |
-| `blob(X)` | BLOB | A string becomes its literal UTF-8 bytes — no hex sniffing. Use `unhex(X)` for a hex string |
+| `blob(X)` | BLOB | A string becomes its literal UTF-8 bytes — no hex sniffing. Use `unhex(X)` for a hex string. Throws on a JSON document; `cast(X as blob)` stays lenient there and yields the document's own text as bytes |
 | `boolean(X)` | BOOLEAN | 0/`'false'` is false; non-zero/`'true'` is true |
 | `date(X)` | TEXT | `YYYY-MM-DD` format. Accepts `'now'` for current UTC date |
 | `time(X)` | TEXT | `HH:MM:SS` format. Accepts `'now'` for current UTC time |
@@ -116,13 +116,18 @@ to `1`, but `0` is never a result). Storage class survives too:
 | `ltrim(X, Y?)` | 1-2 | TEXT | Remove leading chars |
 | `rtrim(X, Y?)` | 1-2 | TEXT | Remove trailing chars |
 | `replace(X, Y, Z)` | 3 | TEXT | Replace all occurrences of Y in X with Z. Case-sensitive |
-| `instr(X, Y)` | 2 | INTEGER | 1-based position of first occurrence of Y in X. 0 if not found. `NULL` if either input is `NULL` || `reverse(X)` | 1 | TEXT | Reverse the string. Unicode-aware |
+| `instr(X, Y)` | 2 | INTEGER | 1-based position of first occurrence of Y in X. 0 if not found. `NULL` if either input is `NULL` |
+| `reverse(X)` | 1 | TEXT | Reverse the string. Unicode-aware |
 | `lpad(X, N, P)` | 3 | TEXT | Left-pad X to length N using pad string P |
 | `rpad(X, N, P)` | 3 | TEXT | Right-pad X to length N using pad string P |
 | `like(pattern, string)` | 2 | BOOLEAN | LIKE match: `%` = any chars, `_` = one char. Case-sensitive. `NULL` if either argument is `NULL`. A non-text operand is rendered through the one value-to-text conversion first (see [types.md § Value to text](types.md#value-to-text)) |
 | `glob(pattern, string)` | 2 | BOOLEAN | GLOB match: `*` = any chars, `?` = one char. Case-sensitive. `NULL` if either argument is `NULL`. Operands render the same way `like` renders them |
 | `hex(X)` | 1 | TEXT | Uppercase hex spelling of X's bytes, no separator. A non-blob argument converts to bytes first, the same path `cast(X as blob)` takes |
 | `unhex(X)` | 1 | BLOB | Parses a hex string into bytes. `NULL` (not an error) if X is not a whole number of hex digit pairs |
+
+`hex`/`unhex` are on the one *blob* conversion (`hex` converts a non-blob argument through
+the same path `cast(X as blob)` takes; see [types.md § Binary types](types.md#binary-types)), so they are
+not part of the divergence below.
 
 The rest of the table above is **not** yet on the one value-to-text conversion. Given a
 non-text argument, `substr`/`substring`, `trim`/`ltrim`/`rtrim`, `replace` and `instr`

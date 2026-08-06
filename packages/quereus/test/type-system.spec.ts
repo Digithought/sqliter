@@ -274,6 +274,16 @@ describe('Type System', () => {
 				expect(result).to.be.instanceOf(Uint8Array);
 				expect(Array.from(result)).to.deep.equal(Array.from(new TextEncoder().encode('ff00')));
 			});
+
+			it('parses every string the same way, whatever its length or alphabet', () => {
+				// The removed hex sniff branched on "even length AND all hex digits", so the
+				// bug it caused was invisible for odd-length or non-hex strings. Cover both
+				// sides of each old branch condition so no future sniff can slip back in.
+				for (const s of ['', 'a', 'ab', 'abc', 'f', 'ff00', '6162', 'DEAD', 'zz', 'héllo']) {
+					expect(Array.from(BLOB_TYPE.parse!(s) as Uint8Array), s)
+						.to.deep.equal(Array.from(new TextEncoder().encode(s)));
+				}
+			});
 		});
 
 		describe('BOOLEAN_TYPE', () => {

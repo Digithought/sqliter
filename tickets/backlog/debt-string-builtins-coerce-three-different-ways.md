@@ -3,6 +3,8 @@ files:
   - packages/quereus/src/func/builtins/string.ts     # substr/substring, trim/ltrim/rtrim, replace, instr, lower, upper, reverse, lpad, rpad, split_string, string_concat, length
   - packages/quereus/src/util/value-text.ts          # valueToText — the one conversion these should be using
   - packages/quereus/src/func/registration.ts        # createScalarFunction — where an argument-coercion policy would live
+  - packages/quereus/src/func/builtins/return-types.ts # the nullable/_NOT_NULL contract the second arm breaks
+  - packages/quereus/src/schema/lens-prover.ts       # checkTypeAndNullability — the consumer that makes the second arm unsound
   - packages/quereus/test/logic/03.6.2-value-to-text.sqllogic  # the agreement assertions this would extend
   - docs/functions.md                                # § String Functions — the paragraph describing today's three behaviours
 difficulty: medium
@@ -76,3 +78,36 @@ first time somebody adds a function.
 `docs/functions.md` § String Functions and `docs/types.md` § Value to text both state
 today's divergence in plain terms and name this ticket. Both paragraphs come out when this
 lands.
+
+## Second arm: the same functions also lie about whether they can return nothing
+
+Found while reviewing `blob-text-conversion-explicit`. Same file, same shared helper,
+and it resolves at the same seam this ticket already proposes.
+
+`textReturnTypeInference` (`func/builtins/string.ts`) is spread into `trim`, `ltrim`,
+`rtrim`, `replace`, `lower`, `upper`, `reverse`, `lpad` and `rpad`. It reports
+`nullable: false` — and ignores its `argTypes` parameter entirely — while every one of
+those functions returns SQL NULL for input it cannot use. `func/builtins/return-types.ts`
+states the contract being broken in as many words: the non-nullable variants are "for the
+handful whose implementation provably cannot return null on any path".
+
+Why it is not cosmetic: the lens prover reads that flag. `checkTypeAndNullability`
+(`schema/lens-prover.ts`) raises `lens.nullability-mismatch` only when the basis
+expression reports `nullable === true`, so a logical column declared `not null` over
+`lower(<nullable column>)` deploys clean today and a NULL can then be read into it.
+Static (read from the code, not run) — confirming it means deploying such a lens and
+reading a row where the argument is NULL.
+
+The fix belongs at the same seam as the coercion arm: if `createScalarFunction` derived a
+result's nullability from the declared argument nullability plus a per-function
+"null-in-null-out / can-refuse-input" flag, no builtin could declare a nullability it does
+not honor. Editing nine spread sites is the fallback.
+
+Related but out of scope here: which functions still *should* return NULL at all is the
+first arm's decision. If the coercion arm lands first and they stop refusing input, some
+of these declarations become true rather than needing a change — sequence the arms, do
+not resolve them independently.
+
+Note the sibling site: `hex()` in the same file was given `TEXT_RETURN` (nullable) during
+that review rather than the shared helper, with a comment saying why. It is the shape the
+other nine should end up in.

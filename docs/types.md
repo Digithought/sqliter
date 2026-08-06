@@ -215,8 +215,10 @@ gate on it. Two consequences worth stating explicitly:
 - Conversion: `blob(value)` / `cast(value as blob)` on a string is **literal UTF-8** —
   the string's bytes, with no hex sniffing. `cast('6162' as blob)` is the four
   bytes of `'6162'`, not the two bytes `x'6162'`. Use `unhex(x)` to parse a hex
-  string into bytes, and `hex(x)` for the reverse (uppercase, no separator);
-  a non-blob argument to either goes through the same blob conversion first.
+  string into bytes, and `hex(x)` for the reverse (uppercase, no separator).
+  `hex` runs a non-blob argument through that same blob conversion first, so
+  `hex('ab')` is `'6162'`; `unhex` takes text only and answers `NULL` for
+  anything else, including a blob.
 
 ### Temporal Types
 

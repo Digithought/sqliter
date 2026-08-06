@@ -6,7 +6,7 @@ import { StatusCode } from '../../common/types.js';
 import { simpleLike, simpleGlob } from '../../util/patterns.js';
 import { valueToText } from '../../util/value-text.js';
 import { INTEGER_TYPE, TEXT_TYPE, BLOB_TYPE } from '../../types/builtin-types.js';
-import { BOOLEAN_RETURN, BLOB_RETURN } from './return-types.js';
+import { BOOLEAN_RETURN, BLOB_RETURN, TEXT_RETURN } from './return-types.js';
 import type { LogicalType } from '../../types/logical-type.js';
 
 const log = createLogger('func:builtins:scalar');
@@ -295,8 +295,19 @@ export const upperFunc = createScalarFunction(
 // via BLOB_TYPE.parse — so a JSON object/array argument throws rather than
 // returning NULL, matching blob()'s behavior instead of adding a second,
 // divergent conversion table here.
+// `TEXT_RETURN`, not the family's `textReturnTypeInference`: that helper declares
+// `nullable: false`, which is a lie for any function that maps NULL to NULL, and
+// the lens prover reads the flag to decide whether a NOT NULL logical column over
+// the expression is sound (`schema/lens-prover.ts` checkTypeAndNullability).
+// NOTE: @quereus/quereus cannot import `bytesToHex` from @quereus/quereus-store
+// (the dependency runs the other way), so this is a second byte→hex encoder in
+// the monorepo. They are not interchangeable: the store's must stay LOWERCASE —
+// `InMemoryKVStore` orders keys by string comparison and only `[0-9a-f]` matches
+// unsigned-byte order — while SQL `hex()` must be uppercase. If a third copy
+// appears, promote a case-parameterized one to a shared export rather than
+// unifying these two on one case.
 export const hexFunc = createScalarFunction(
-	{ name: 'hex', numArgs: 1, deterministic: true, ...textReturnTypeInference },
+	{ name: 'hex', numArgs: 1, deterministic: true, returnType: TEXT_RETURN },
 	(arg: SqlValue): SqlValue => {
 		if (arg === null) return null;
 
@@ -318,14 +329,19 @@ export const hexFunc = createScalarFunction(
 	}
 );
 
+/** A whole number of hex digit pairs — the only input `unhex` accepts. */
+const HEX_PAIRS = /^[0-9a-fA-F]*$/;
+
 // --- unhex(X) ---
 // Inverse of hex(): a hex-digit-pair string to bytes. Anything that is not a
-// whole number of hex digit pairs is NULL, not an error, matching SQLite.
+// whole number of hex digit pairs is NULL, not an error, matching SQLite. Text
+// only — a blob argument is NULL rather than being re-read as its own bytes, so
+// unhex() is the inverse of hex() only for hex()'s own output.
 export const unhexFunc = createScalarFunction(
 	{ name: 'unhex', numArgs: 1, deterministic: true, returnType: BLOB_RETURN },
 	(arg: SqlValue): SqlValue => {
 		if (typeof arg !== 'string') return null;
-		if (arg.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(arg)) return null;
+		if (arg.length % 2 !== 0 || !HEX_PAIRS.test(arg)) return null;
 
 		const bytes = new Uint8Array(arg.length / 2);
 		for (let i = 0; i < arg.length; i += 2) {
