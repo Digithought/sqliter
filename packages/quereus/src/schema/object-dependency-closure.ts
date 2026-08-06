@@ -1,6 +1,6 @@
 import type * as AST from '../parser/ast.js';
 import type { Database } from '../core/database.js';
-import { collectTableRefsInAst, objectRefKeySchema, type ResolveObjectRef } from './rename-rewriter.js';
+import { collectTableRefsInAst, objectRefKeySchema, type ResolveObjectRef, type TableRenameOpts } from './rename-rewriter.js';
 import type { ObjectRefResolvers } from './object-ref-resolver.js';
 import { isMaintainedTable } from './derivation.js';
 
@@ -97,23 +97,24 @@ export interface ObjectReach {
  * miss→home fallback keys it stably and the expansion below simply finds
  * nothing to expand.
  *
- * NOTE: every body here is walked WITHOUT
- * {@link import('./rename/table-rename.js').TableRenameOpts.rowImageContext}.
- * That is right for the bodies this reaches — a view / materialized-view body
- * is a relation, with no written-row context — and right for the root the
- * assertion guards pass, an assertion CHECK, which owns no `new.` / `old.`
- * namespace either. It is NOT right for a root that is a table's CHECK
+ * `rootOpts` applies to the ROOT body's collection ONLY, never to a body
+ * reached below it. Every reached body is a view / materialized-view body — a
+ * relation, with no written-row context — so
+ * {@link import('./rename/table-rename.js').TableRenameOpts.rowImageContext}
+ * would be wrong there. It is REQUIRED at a root that is a table's CHECK
  * constraint or column DEFAULT / generated body, where a bare `new.a` names the
  * row image: rooted there without the flag, a table literally called `new`
- * would land in the reach and false-refuse its own drop. A consumer rooting at
- * one of those (`expression-guards-follow-view-chains`) must thread the option
- * onto the ROOT body's collection only.
+ * would land in the reach and false-refuse its own drop
+ * (`schema/expression-dependents.ts` passes it for exactly that reason). The
+ * assertion guards pass nothing: an assertion CHECK owns no `new.` / `old.`
+ * namespace either.
  */
 export function reachableObjects(
 	db: Database,
 	root: AST.AstNode,
 	homeSchemaName: string,
 	resolvers: ObjectRefResolvers,
+	rootOpts?: TableRenameOpts,
 ): ObjectReach {
 	const bodies: ReachedBody[] = [];
 	const namer = new Map<string, ReachedBody>();
@@ -132,7 +133,10 @@ export function reachableObjects(
 	for (let head = 0; head < queue.length; head++) {
 		const current = queue[head];
 		bodies.push(current);
-		for (const [key, nameLower] of collectTableRefsInAst(current.body, current.resolve)) {
+		// `ownerKey === undefined` identifies the ROOT uniquely — every body reached
+		// below it gets one from `childBody`.
+		const opts = current.ownerKey === undefined ? rootOpts : undefined;
+		for (const [key, nameLower] of collectTableRefsInAst(current.body, current.resolve, opts)) {
 			if (!namer.has(key)) namer.set(key, current);
 			if (visited.has(key)) continue;
 			visited.add(key);

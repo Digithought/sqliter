@@ -47,10 +47,10 @@ import {
  * altered one, via `schema/expression-dependents.ts` — a CHECK or DEFAULT may contain a
  * subquery, so another table's expression can legitimately name this column, and
  * `ALTER TABLE … RENAME COLUMN` has always rewritten exactly those. See that module for
- * the shared walk and the seeded/unseeded probe split it turns on. The assertion guard
- * scans every schema too, and additionally follows view / materialized-view bodies
- * (`schema/object-dependency-closure.ts`); the two expression guards do not yet, which is
- * the gap `expression-guards-follow-view-chains` tracks.
+ * the shared walk and the seeded/unseeded probe split it turns on. All three guards follow
+ * view / materialized-view bodies through the same closure
+ * (`schema/object-dependency-closure.ts`), so a CHECK reaching the column only through a
+ * view refuses the drop and the refusal names the chain.
  *
  * Known cost, accepted: an **unnamed** table-level CHECK cannot be dropped
  * (`DROP CONSTRAINT` resolves by name only), so refusing leaves such a column
@@ -140,9 +140,22 @@ function refuseColumnExpressionDependent(
 	const dependent = findColumnExpressionDependent(db, tableSchema, columnName, arm);
 	if (!dependent) return;
 	throw new QuereusError(
-		`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by ${referencedBy(dependent, tableSchema.schemaName)}`,
+		`Cannot drop column '${columnName}' from '${tableSchema.name}': ${refersTo(dependent, tableSchema.schemaName)}`,
 		StatusCode.CONSTRAINT,
 	);
+}
+
+/**
+ * How the refusal describes the reference. A DIRECT one keeps the wording these guards
+ * have always used; an indirect one leads with the expression and names the chain,
+ * mirroring {@link assertNoAssertionNamesColumn} so all four guard families phrase an
+ * indirect refusal identically.
+ */
+function refersTo(dependent: ExpressionDependent, homeSchemaName: string): string {
+	const what = referencedBy(dependent, homeSchemaName);
+	return dependent.path.length === 0
+		? `it is referenced by ${what}`
+		: `${what} reaches it${describeReachPath(dependent.path)}`;
 }
 
 /** `CHECK constraint 'ck1'`, or `CHECK constraint 'ck1' on table 'x'` when it lives elsewhere. */
@@ -175,9 +188,9 @@ function referencedBy(dependent: ExpressionDependent, homeSchemaName: string): s
  * or a materialized view of either) hides it: nothing in the chain spells `x`, the
  * drop is accepted, and the assertion's `where x < 0` then fails every write to the
  * whole database with `Column not found: x`. Tracked as
- * `drop-column-guard-blind-to-star-reexposure`, which owns the fix for this family
- * and for the CHECK / DEFAULT one once `expression-guards-follow-view-chains` lands.
- * Widening it needs the view's OUTPUT column set, which `ViewSchema` does not carry.
+ * `drop-column-guard-blind-to-star-reexposure`, which owns the fix for this family and
+ * for the CHECK / DEFAULT one — that one now follows the same chains and so has the same
+ * hole. Widening it needs the view's OUTPUT column set, which `ViewSchema` does not carry.
  *
  * Scope is EVERY schema, matching `assertNoAssertionDependsOn`: an assertion in
  * `temp` naming `main.t`'s column blocks the drop, while one whose bare `t` resolves

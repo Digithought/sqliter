@@ -1,8 +1,9 @@
 -- 41.10.4-drop-object-expression-dependents.sqllogic
 --
 -- Subject: `DROP TABLE` / `DROP VIEW` / `DROP MATERIALIZED VIEW` vs. a stored expression
--- on ANOTHER table that still names the dropped object — a CHECK constraint, a column
--- DEFAULT, or a `GENERATED ALWAYS AS` body, each reaching it through a subquery.
+-- on ANOTHER table that can still REACH the dropped object — a CHECK constraint, a column
+-- DEFAULT, or a `GENERATED ALWAYS AS` body, each reaching it through a subquery, either
+-- directly (§1-§9) or through any chain of view / materialized-view bodies (§10-§15).
 --
 -- This is the table-verb half of 41.10.2. Both verbs resolve at the same question the
 -- catalog could not previously answer — "which stored table expressions reference this
@@ -291,4 +292,255 @@ drop table main.DtDup;
 
 drop table temp.DtDupRef;
 drop table temp.DtDup;
+-- run
+
+-- ===================================================================
+-- 10. A CHECK that reaches the table only THROUGH a view refuses the drop
+-- ===================================================================
+--
+-- The referencing CHECK never spells `DtRvBase` at all — it reads a view whose body does.
+-- Accepted, the drop left DtRvRef unwritable at the next INSERT, with an error naming
+-- neither the dropped table, nor the view, nor the constraint that broke.
+--
+-- The message therefore names the CHAIN. A user told a constraint blocks the drop will
+-- read its body, find no mention of the dropped table, and be stuck without it. Same
+-- spelling the assertion guard uses (`95-assertions.sqllogic`), because both guards now
+-- consume the same reachability closure.
+
+create table DtRvBase (id integer primary key, v integer);
+insert into DtRvBase values (1, 10);
+create view DtRvV as select id, v from DtRvBase;
+create table DtRvRef (id integer primary key, n integer,
+                      constraint ck_dtrv check (n < (select max(DtRvV.v) from DtRvV)));
+-- run
+
+drop table DtRvBase;
+-- error: cannot drop table 'main.DtRvBase': CHECK constraint 'ck_dtrv' on table 'DtRvRef' reaches it through view 'DtRvV' — drop or redefine it first
+
+-- Nothing was applied: DtRvRef is still writable AND still enforcing through the view.
+insert into DtRvRef values (1, 1);
+select n from DtRvRef;
+→ [{"n":1}]
+
+insert into DtRvRef values (2, 99);
+-- error: ck_dtrv
+
+-- Escape hatch, same as §1: remove the reference and the drop goes through.
+alter table DtRvRef drop constraint ck_dtrv;
+drop table DtRvBase;
+drop view DtRvV;
+drop table DtRvRef;
+-- run
+
+-- The CHECK need not qualify its column for the refusal to fire: the match is on the
+-- VIEW's body, not the CHECK's, so how the CHECK spells the view's output is irrelevant.
+create table DtRuBase (id integer primary key, v integer);
+create view DtRuV as select id, v from DtRuBase;
+create table DtRuRef (id integer primary key, n integer,
+                      check (n < (select max(v) from DtRuV)));
+-- run
+
+drop table DtRuBase;
+-- error: reaches it through view 'DtRuV'
+
+drop table DtRuRef;
+drop view DtRuV;
+drop table DtRuBase;
+-- run
+
+-- ===================================================================
+-- 11. Chains of any depth, and the MIDDLE link of one
+-- ===================================================================
+--
+-- One-hop expansion is the natural under-fix, so the chain is pinned two views deep and
+-- the refusal renders the whole path with `->`.
+
+create table DtChBase (id integer primary key, v integer);
+create view DtCh1 as select id, v from DtChBase;
+create view DtCh2 as select id, v from DtCh1;
+create table DtChRef (id integer primary key, n integer,
+                      constraint ck_dtch check (n < (select max(DtCh2.v) from DtCh2)));
+-- run
+
+drop table DtChBase;
+-- error: CHECK constraint 'ck_dtch' on table 'DtChRef' reaches it through view 'DtCh2' -> view 'DtCh1'
+
+-- The MIDDLE view is protected too, and its path is the shorter prefix. Losing DtCh1
+-- breaks DtChRef exactly as thoroughly as losing the base table would.
+drop view DtCh1;
+-- error: cannot drop view 'main.DtCh1': CHECK constraint 'ck_dtch' on table 'DtChRef' reaches it through view 'DtCh2'
+
+-- ...and the view the CHECK names DIRECTLY keeps the direct wording (§6's shape, in a
+-- chain): a direct match carries no path, so no `through` clause is added.
+drop view DtCh2;
+-- error: cannot drop view 'main.DtCh2': it is referenced by CHECK constraint 'ck_dtch' on table 'DtChRef'
+
+alter table DtChRef drop constraint ck_dtch;
+drop view DtCh2;
+drop view DtCh1;
+drop table DtChBase;
+drop table DtChRef;
+-- run
+
+-- ===================================================================
+-- 12. A materialized view in the chain reads as one
+-- ===================================================================
+--
+-- A materialized view is a table in the catalog, so its body has to be followed like a
+-- view's — and named as what the user declared, or `drop materialized view` is not
+-- obviously the fix.
+
+create table DtMvBase (id integer primary key, v integer);
+insert into DtMvBase values (1, 6);
+create materialized view DtMvM as select id, v from DtMvBase;
+create table DtMvRef (id integer primary key, n integer,
+                      constraint ck_dtmv check (n < (select max(DtMvM.v) from DtMvM)));
+-- run
+
+drop table DtMvBase;
+-- error: CHECK constraint 'ck_dtmv' on table 'DtMvRef' reaches it through materialized view 'DtMvM'
+
+alter table DtMvRef drop constraint ck_dtmv;
+drop materialized view DtMvM;
+drop table DtMvBase;
+drop table DtMvRef;
+-- run
+
+-- ===================================================================
+-- 13. DEFAULT and GENERATED bodies follow chains too
+-- ===================================================================
+--
+-- All three arms run the same probe, so widening one without the others would let
+-- `drop table` disagree with itself depending on which expression kind holds the reference.
+
+create table DtDvBase (id integer primary key, v integer);
+insert into DtDvBase values (1, 11);
+create view DtDvV as select id, v from DtDvBase;
+create table DtDvRef (id integer primary key, w integer default ((select min(DtDvV.v) from DtDvV)));
+-- run
+
+drop table DtDvBase;
+-- error: the DEFAULT of column 'w' on table 'DtDvRef' reaches it through view 'DtDvV'
+
+insert into DtDvRef (id) values (1);
+select id, w from DtDvRef;
+→ [{"id":1,"w":11}]
+
+drop table DtDvRef;
+drop view DtDvV;
+drop table DtDvBase;
+-- run
+
+create table DtGvBase (id integer primary key, v integer);
+insert into DtGvBase values (1, 12);
+create view DtGvV as select id, v from DtGvBase;
+create table DtGvRef (id integer primary key,
+                      g integer generated always as ((select max(DtGvV.v) from DtGvV)));
+-- run
+
+drop table DtGvBase;
+-- error: the GENERATED expression of column 'g' on table 'DtGvRef' reaches it through view 'DtGvV'
+
+drop table DtGvRef;
+drop view DtGvV;
+drop table DtGvBase;
+-- run
+
+-- ===================================================================
+-- 14. Cross-schema chains: each body resolves under ITS OWN home schema
+-- ===================================================================
+--
+-- The composition of §9 with §10, and the only shape that proves each reached body is
+-- walked under its own resolver rather than the root expression's.
+
+create table main.DtXv (id integer primary key, v integer);
+create view temp.DtXvV as select id, v from main.DtXv;
+create table temp.DtXvRef (id integer primary key, n integer,
+                           constraint ck_dtxv check (n < (select max(DtXvV.v) from DtXvV)));
+-- run
+
+drop table main.DtXv;
+-- error: CHECK constraint 'ck_dtxv' on table 'temp.DtXvRef' reaches it through view 'DtXvV'
+
+drop table temp.DtXvRef;
+drop view temp.DtXvV;
+drop table main.DtXv;
+-- run
+
+-- The other direction: a bare name inside a `temp` view body that `temp` itself holds
+-- binds temp's table, and says nothing about main's like-named one.
+create table main.DtXd (id integer primary key, v integer);
+create table temp.DtXd (id integer primary key, v integer);
+create view temp.DtXdV as select id, v from DtXd;
+create table temp.DtXdRef (id integer primary key, n integer,
+                           check (n < (select max(DtXdV.v) from DtXdV)));
+insert into main.DtXd values (1, 7);
+-- run
+
+drop table main.DtXd;
+select count(*) as c from temp.DtXdRef;
+→ [{"c":0}]
+
+drop table temp.DtXdRef;
+drop view temp.DtXdV;
+drop table temp.DtXd;
+-- run
+
+-- ===================================================================
+-- 15. The widening must not start false-refusing
+-- ===================================================================
+--
+-- These are the shapes a name-collecting second walk would have broken. The closure is
+-- scope-aware by construction — it is the read-only run of the walker
+-- `ALTER TABLE … RENAME TO` uses — so each stays allowed.
+--
+-- §5 already pins the first control: a plain view over the table, with nothing reading
+-- the view, does NOT block the drop. Chains change nothing about that.
+
+-- A CTE inside the VIEW's body that merely SHADOWS the name is not a reference: the view
+-- really reads DtScSrc, so DtSc is droppable and DtScSrc is not.
+create table DtSc (id integer primary key, v integer);
+create table DtScSrc (id integer primary key, v integer);
+create view DtScV as with DtSc as (select id, v from DtScSrc) select id, v from DtSc;
+create table DtScRef (id integer primary key, n integer,
+                      check (n < (select max(DtScV.v) from DtScV)));
+-- run
+
+drop table DtSc;
+-- run
+
+drop table DtScSrc;
+-- error: reaches it through view 'DtScV'
+
+drop table DtScRef;
+drop view DtScV;
+drop table DtScSrc;
+-- run
+
+-- The row image is not a table: a CHECK's bare `new.` names the row being written, so a
+-- real table called "new" is droppable even though the CHECK's text mentions `new`. The
+-- flag is applied to the ROOT expression only — without it, rooting the closure at a
+-- CHECK would put `new` in the reach and false-refuse its own drop.
+create table "new" (a integer primary key);
+create table DtNwRef (id integer primary key, n integer, check (new.n > 0));
+-- run
+
+drop table "new";
+-- run
+
+-- ...and a real "new" reached through a view IS still protected, so the suppression is
+-- the row-image qualifier and not the name.
+create table "new" (a integer primary key);
+create view DtNwV as select a from "new";
+create table DtNwRef2 (id integer primary key, n integer,
+                       check (new.n > (select max(DtNwV.a) from DtNwV)));
+-- run
+
+drop table "new";
+-- error: reaches it through view 'DtNwV'
+
+drop table DtNwRef2;
+drop view DtNwV;
+drop table "new";
+drop table DtNwRef;
 -- run

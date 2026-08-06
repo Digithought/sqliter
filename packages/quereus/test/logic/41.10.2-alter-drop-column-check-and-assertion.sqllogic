@@ -22,6 +22,12 @@
 -- body may both contain subqueries, so a depth-blind walk would false-refuse a legal
 -- drop whose only same-named column lives on ANOTHER table. §4 and §7 pin that.
 --
+-- Detection also follows VIEW and MATERIALIZED VIEW bodies, to any depth — the assertion
+-- arm in §23, the CHECK / DEFAULT / generated arm in §26-§29 — because a rule that reads
+-- the column through a view breaks just as thoroughly as one that names it. §30 re-pins
+-- the scope controls one hop deeper, since that is where a name-collecting walk would
+-- quietly turn a missed refusal into a false one.
+--
 -- No `-- requires-capability:` directive: the file uses no standalone index DDL, so it
 -- runs under both the memory module (`yarn test`) and the store module
 -- (`yarn test:store`). The store leg matters — it persists table DDL, so a CHECK broken
@@ -893,4 +899,267 @@ alter table DcShSrc drop column x;
 drop assertion dc_sh;
 drop table DcShSrc;
 drop table DcSh;
+-- run
+
+-- ===================================================================
+-- 26. A CHECK on another table reaches the column THROUGH a view
+-- ===================================================================
+--
+-- §19's shape with a view in the middle. The referencing CHECK never spells `DcRv` at
+-- all — it reads a view whose body does — and dropping the column used to be accepted,
+-- leaving DcRvRef unwritable with an error naming neither the column nor the constraint.
+--
+-- No column lineage through the view's projection is needed here, exactly as in §23: the
+-- match is on the VIEW's body. If no body in the chain named the column, the CHECK could
+-- not have been reading it.
+
+create table DcRv (id integer primary key, v integer);
+insert into DcRv values (1, 10);
+create view DcRvV as select id, v from DcRv;
+create table DcRvRef (id integer primary key, n integer,
+                      constraint ck_dcrv check (n < (select max(DcRvV.v) from DcRvV)));
+-- run
+
+-- The message names the chain — a constraint whose body does not mention `v` is
+-- unactionable advice without it. Same spelling the assertion arm uses in §23.
+alter table DcRv drop column v;
+-- error: Cannot drop column 'v' from 'DcRv': CHECK constraint 'ck_dcrv' on table 'DcRvRef' reaches it through view 'DcRvV'
+
+-- Nothing was applied: the column is still there, and the CHECK still enforces.
+select v from DcRv;
+→ [{"v":10}]
+
+insert into DcRvRef values (1, 99);
+-- error: ck_dcrv
+
+-- Escape hatch, same as §19: drop the constraint, then the column.
+alter table DcRvRef drop constraint ck_dcrv;
+alter table DcRv drop column v;
+select id from DcRv;
+→ [{"id":1}]
+
+drop table DcRvRef;
+drop view DcRvV;
+drop table DcRv;
+-- run
+
+-- Three levels deep, and the whole path is rendered.
+create table DcCv (id integer primary key, v integer);
+create view DcCv1 as select id, v from DcCv;
+create view DcCv2 as select id, v from DcCv1;
+create table DcCvRef (id integer primary key, n integer,
+                      constraint ck_dccv check (n < (select max(DcCv2.v) from DcCv2)));
+-- run
+
+alter table DcCv drop column v;
+-- error: CHECK constraint 'ck_dccv' on table 'DcCvRef' reaches it through view 'DcCv2' -> view 'DcCv1'
+
+alter table DcCvRef drop constraint ck_dccv;
+drop view DcCv2;
+drop view DcCv1;
+drop table DcCv;
+drop table DcCvRef;
+-- run
+
+-- A view in the chain that names the TABLE but not the COLUMN is no obstacle, exactly as
+-- a direct `select id, q` body is not (§7, §23). The TABLE verb has no such hole — it
+-- matches the object, not a column — which is 41.10.4 §10's business, not this file's.
+create table DcVs (id integer primary key, p integer, q integer);
+create view DcVsV as select id, q from DcVs;
+create table DcVsRef (id integer primary key, n integer,
+                      check (n < (select max(DcVsV.q) from DcVsV)));
+insert into DcVs values (1, 3, 8);
+-- run
+
+alter table DcVs drop column p;
+select q from DcVs;
+→ [{"q":8}]
+
+drop table DcVsRef;
+drop view DcVsV;
+drop table DcVs;
+-- run
+
+-- ===================================================================
+-- 27. A materialized view in the chain reads as one
+-- ===================================================================
+
+create table DcMv (id integer primary key, v integer);
+insert into DcMv values (1, 6);
+create materialized view DcMvM as select id, v from DcMv;
+create table DcMvRef (id integer primary key, n integer,
+                      constraint ck_dcmv check (n < (select max(DcMvM.v) from DcMvM)));
+-- run
+
+alter table DcMv drop column v;
+-- error: CHECK constraint 'ck_dcmv' on table 'DcMvRef' reaches it through materialized view 'DcMvM'
+
+alter table DcMvRef drop constraint ck_dcmv;
+drop materialized view DcMvM;
+drop table DcMv;
+drop table DcMvRef;
+-- run
+
+-- ===================================================================
+-- 28. DEFAULT and GENERATED bodies follow chains too
+-- ===================================================================
+--
+-- §20's shapes one view deeper. All three arms run the same probe, so widening one
+-- without the others would let two guards over the same DDL disagree.
+
+create table DcDv (id integer primary key, v integer);
+insert into DcDv values (1, 11);
+create view DcDvV as select id, v from DcDv;
+create table DcDvRef (id integer primary key, w integer default ((select min(DcDvV.v) from DcDvV)));
+-- run
+
+alter table DcDv drop column v;
+-- error: the DEFAULT of column 'w' on table 'DcDvRef' reaches it through view 'DcDvV'
+
+insert into DcDvRef (id) values (1);
+select id, w from DcDvRef;
+→ [{"id":1,"w":11}]
+
+drop table DcDvRef;
+drop view DcDvV;
+drop table DcDv;
+-- run
+
+create table DcGv (id integer primary key, v integer);
+insert into DcGv values (1, 12);
+create view DcGvV as select id, v from DcGv;
+create table DcGvRef (id integer primary key,
+                      g integer generated always as ((select max(DcGvV.v) from DcGvV)));
+insert into DcGvRef (id) values (1);
+-- run
+
+alter table DcGv drop column v;
+-- error: the GENERATED expression of column 'g' on table 'DcGvRef' reaches it through view 'DcGvV'
+
+select id, g from DcGvRef;
+→ [{"id":1,"g":12}]
+
+drop table DcGvRef;
+drop view DcGvV;
+drop table DcGv;
+-- run
+
+-- ===================================================================
+-- 29. An OWN-table CHECK reaching its own column through a view
+-- ===================================================================
+--
+-- The seeded probe still applies to the CHECK's OWN body and to nothing below it: a view
+-- body is a relation with no written-row seed, so a reached body's unqualified names bind
+-- through its own FROM clauses.
+--
+-- The reference must be QUALIFIED (`DcOvV.v`). An unqualified `v` inside an own-table
+-- CHECK's subquery over a VIEW is false-refused today — `buildColumnSourceResolver`
+-- answers "does source X expose column `v`?" by looking X up as a TABLE, so a view
+-- answers no and the seeded probe concludes the bare `v` binds the owning table's row.
+-- Tracked with the other missing-view-output-columns work in
+-- `drop-column-guard-blind-to-star-reexposure`; the qualified spelling is correct now.
+
+create table DcOv (id integer primary key, v integer);
+create view DcOvV as select id, v from DcOv;
+-- run
+
+alter table DcOv add constraint ck_dcov check (id < (select max(DcOvV.v) from DcOvV));
+-- run
+
+alter table DcOv drop column v;
+-- error: Cannot drop column 'v' from 'DcOv': CHECK constraint 'ck_dcov' reaches it through view 'DcOvV'
+
+alter table DcOv drop constraint ck_dcov;
+alter table DcOv drop column v;
+select count(*) as c from DcOv;
+→ [{"c":0}]
+
+drop view DcOvV;
+drop table DcOv;
+-- run
+
+-- ===================================================================
+-- 30. The widening must not start false-refusing
+-- ===================================================================
+--
+-- §21 and §25 re-pinned one view deeper: the closure is scope-aware by construction, so
+-- adding hops must not turn a missed refusal into a false one.
+
+-- §21's shape with a view in the way: `uv` re-exposes a LIKE-NAMED column of a THIRD
+-- table, so dropping this table's own `v` is still legal.
+create table DcPv (id integer primary key, v integer);
+create table DcPvNoise (k integer primary key, v integer);
+create view DcPvV as select k, v from DcPvNoise;
+create table DcPvRef (id integer primary key, n integer,
+                      check ((select min(DcPvV.v) from DcPvV) >= 0));
+insert into DcPv values (1, 5);
+-- run
+
+alter table DcPv drop column v;
+select id from DcPv;
+→ [{"id":1}]
+
+drop table DcPvRef;
+drop view DcPvV;
+drop table DcPvNoise;
+drop table DcPv;
+-- run
+
+-- §25's shape one hop out of the assertion arm and into this one: a CTE inside the VIEW's
+-- body that merely SHADOWS the name binds the CTE, and the table it really reads IS
+-- protected.
+create table DcSv (id integer primary key, x integer);
+create table DcSvSrc (id integer primary key, x integer);
+create view DcSvV as with DcSv as (select id, x from DcSvSrc) select id, x from DcSv;
+create table DcSvRef (id integer primary key, n integer,
+                      check ((select min(DcSvV.x) from DcSvV) >= 0));
+-- run
+
+alter table DcSv drop column x;
+select count(*) as c from DcSv;
+→ [{"c":0}]
+
+alter table DcSvSrc drop column x;
+-- error: reaches it through view 'DcSvV'
+
+drop table DcSvRef;
+drop view DcSvV;
+drop table DcSvSrc;
+drop table DcSv;
+-- run
+
+-- §22's cross-schema rule composed with the chain: the view's bare `DcXvw` binds MAIN's
+-- because the VIEW lives in main, even though the CHECK that reaches it lives in temp.
+create table main.DcXvw (id integer primary key, v integer);
+create view main.DcXvwV as select id, v from DcXvw;
+create table temp.DcXvwRef (id integer primary key, n integer,
+                            constraint ck_dcxvw check (n < (select max(DcXvwV.v) from main.DcXvwV)));
+-- run
+
+alter table main.DcXvw drop column v;
+-- error: CHECK constraint 'ck_dcxvw' on table 'temp.DcXvwRef' reaches it through view 'DcXvwV'
+
+drop table temp.DcXvwRef;
+drop view main.DcXvwV;
+drop table main.DcXvw;
+-- run
+
+-- ...and the other direction: a bare name inside a `temp` view body that `temp` itself
+-- holds says nothing about main's like-named table.
+create table main.DcXvd (id integer primary key, v integer);
+create table temp.DcXvd (id integer primary key, v integer);
+create view temp.DcXvdV as select id, v from DcXvd;
+create table temp.DcXvdRef (id integer primary key, n integer,
+                            check (n < (select max(DcXvdV.v) from DcXvdV)));
+insert into main.DcXvd values (1, 7);
+-- run
+
+alter table main.DcXvd drop column v;
+select id from main.DcXvd;
+→ [{"id":1}]
+
+drop table temp.DcXvdRef;
+drop view temp.DcXvdV;
+drop table temp.DcXvd;
+drop table main.DcXvd;
 -- run

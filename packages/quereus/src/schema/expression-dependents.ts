@@ -5,13 +5,12 @@ import { expressionToString } from '../emit/ast-stringify.js';
 import {
 	columnReferencedInAst,
 	columnReferencedInCheckExpression,
-	tableReferencedInAst,
 	objectRefKey,
-	type ResolveObjectRef,
 	type ResolveColumnInSource,
 } from './rename-rewriter.js';
 import { buildColumnSourceResolver } from './column-source-resolver.js';
-import { snapshotObjectRefResolvers } from './object-ref-resolver.js';
+import { snapshotObjectRefResolvers, type ObjectRefResolvers } from './object-ref-resolver.js';
+import { reachableObjects } from './object-dependency-closure.js';
 
 /**
  * The catalog query "which stored, table-attached expressions reference this object?",
@@ -52,17 +51,28 @@ import { snapshotObjectRefResolvers } from './object-ref-resolver.js';
  * (see `runtime/emit/assertion-drop-guard.ts`): a broken view breaks queries OF that view,
  * while a broken CHECK makes a whole table unwritable.
  *
- * Known gap, tracked by `expression-guards-follow-view-chains`: these probes see only a
- * DIRECT reference. A CHECK that reads a VIEW whose body reads the dropped object
- * (`check (n < (select max(v) from vv))` over `create view vv as select v from t`) is not
- * matched, so `drop table t` / `alter table t drop column v` is still accepted and still
- * leaves the referencing table unwritable. The reachability closure that closes it now
- * exists — `schema/object-dependency-closure.ts`, which the assertion guards already
- * consume — so this family should widen onto THAT rather than grow a second walk.
+ * Each probe runs over the REACH of the stored expression — {@link reachableObjects}, the
+ * same breadth-first closure over stored view / materialized-view bodies the assertion
+ * guards consume — not over the expression alone. Two consequences, both load-bearing:
  *
- * NOTE: each probe walks every table in every schema, re-walking already-parsed ASTs.
- * DDL is rare and schemas hold handfuls of tables, so this is not worth optimising now;
- * if it ever shows as hot, gate each table on a cheap literal name scan of its stored
+ * - A DIRECT reference matches exactly where a rename would have rewritten it, so the two
+ *   definitions still cannot drift; the reach path is empty there, which is what keeps the
+ *   guards' direct message spelling unchanged.
+ * - An INDIRECT reference — the expression names a view, whose body names the dropped
+ *   object, to any depth — matches too. Without that, `check (n < (select max(v) from vv))`
+ *   over `create view vv as select v from t` let `drop table t` /
+ *   `alter table t drop column v` through and left the referencing table unwritable with
+ *   an error naming neither the dropped object nor the constraint that broke.
+ *
+ * The root body is walked with `rowImageContext` and every body below it without — see
+ * `reachableObjects`' `rootOpts`. Rooting a CHECK / DEFAULT without it would put a table
+ * literally called `new` in the reach and false-refuse its own drop.
+ *
+ * NOTE: each probe walks every table in every schema, re-walking already-parsed ASTs, and
+ * now builds one closure PER STORED EXPRESSION rather than per table. The closure only
+ * expands objects a body actually names, so an expression naming no view still costs one
+ * walk. DDL is rare and schemas hold handfuls of tables, so this is not worth optimising
+ * now; if it ever shows as hot, gate each table on a cheap literal name scan of its stored
  * SQL before paying for the AST walk.
  */
 
@@ -74,6 +84,12 @@ export interface ExpressionDependent {
 	ownTable: boolean;
 	/** What to call it in an error: `CHECK constraint 'ck1'`, `the DEFAULT of column 'w'`, … */
 	describe: string;
+	/**
+	 * The stored bodies the expression traversed to reach the probed object, each already
+	 * described (`view 'v'`, `materialized view 'm'`) — EMPTY when the expression names the
+	 * object itself. Feed it to `describeReachPath` to phrase an indirect refusal.
+	 */
+	path: ReadonlyArray<string>;
 }
 
 /**
@@ -121,12 +137,12 @@ export function findColumnExpressionDependent(
 	for (const table of tablesProbedTargetFirst(db, targetKey)) {
 		const ownTable = objectRefKey(table.schemaName, table.name) === targetKey;
 		const names = columnProbe(
-			ownTable, tableSchema.name, columnName,
-			resolvers.forHomeSchema(table.schemaName), targetKey, resolveColumnInSource);
+			db, resolvers, table.schemaName, ownTable, tableSchema.name, columnName,
+			targetKey, resolveColumnInSource);
 		const found = arm === 'check'
 			? findInChecks(table, names)
 			: findInColumnExpressions(table, ownTable, columnName, names);
-		if (found) return { table, ownTable, describe: found };
+		if (found) return { table, ownTable, ...found };
 	}
 	return undefined;
 }
@@ -139,10 +155,14 @@ export function findColumnExpressionDependent(
  * refusing on them would make every self-referencing table undroppable. (The column verb
  * keeps its target in the walk — a column drop leaves the rest of the table behind.)
  *
- * All three arms run with the walker's `rowImageContext`, exactly as
+ * All three arms run with the walker's `rowImageContext` on the ROOT expression, exactly as
  * `renameTableInCheckConstraints` / `renameTableInColumnExpressions` do: these
  * expressions evaluate against a written row, so a bare `new.` / `old.` qualifier names
  * that row image rather than a table literally called `new`.
+ *
+ * The match is `namerOf` over the expression's whole reach, so a CHECK that reads a view
+ * whose body reads the dropped object matches too, and `path` carries the shortest chain
+ * for the error to quote — empty exactly when the expression names the object itself.
  */
 export function findTableExpressionDependent(
 	db: Database,
@@ -154,11 +174,12 @@ export function findTableExpressionDependent(
 
 	for (const table of tablesProbedTargetFirst(db, targetKey)) {
 		if (objectRefKey(table.schemaName, table.name) === targetKey) continue;
-		const resolve = resolvers.forHomeSchema(table.schemaName);
-		const names = (expr: AST.Expression | undefined): boolean =>
-			tableReferencedInAst(expr, objectName, resolve, targetKey, { rowImageContext: true });
+		const names: ExpressionProbe = expr => expr === undefined
+			? undefined
+			: reachableObjects(db, expr, table.schemaName, resolvers, { rowImageContext: true })
+				.namerOf(targetKey)?.path;
 		const found = findInChecks(table, names) ?? findInColumnExpressions(table, false, undefined, names);
-		if (found) return { table, ownTable: false, describe: found };
+		if (found) return { table, ownTable: false, ...found };
 	}
 	return undefined;
 }
@@ -175,8 +196,20 @@ export function describeDependentTable(table: TableSchema, homeSchemaName: strin
 		: `'${table.schemaName}.${table.name}'`;
 }
 
-/** Whether one stored expression names the probed object. */
-type ExpressionProbe = (expr: AST.Expression | undefined) => boolean;
+/**
+ * Whether one stored expression REACHES the probed object, and how: the chain of stored
+ * bodies traversed to get there — EMPTY for a direct match — or `undefined` for no match.
+ * Path-returning rather than boolean because a caller has to phrase an indirect refusal
+ * differently: a user told a CHECK blocks the drop will read its body, find no mention of
+ * the dropped object, and be stuck without the chain.
+ */
+type ExpressionProbe = (expr: AST.Expression | undefined) => ReadonlyArray<string> | undefined;
+
+/** A matched stored expression: what to call it, and the reach path to the match. */
+interface ProbeHit {
+	describe: string;
+	path: ReadonlyArray<string>;
+}
 
 /**
  * Every table in every schema, with the probed table (if it exists) first.
@@ -206,26 +239,48 @@ function* tablesProbedTargetFirst(db: Database, targetKey: string): Iterable<Tab
 /**
  * The column probe for one scanned table — seeded on the probed table itself, unseeded
  * everywhere else. See this module's header for why that split is load-bearing.
+ *
+ * The column question is not "does the reach CONTAIN this key?" (which is all the table
+ * verb needs) but "does any body in the reach NAME this column?", so this loops the reach's
+ * bodies the way `assertNoAssertionNamesColumn` already does, each under its own resolver.
+ * `homeSchemaName` is the SCANNED table's schema — the root expression's own — because that
+ * is what its unqualified names resolve against.
  */
 function columnProbe(
+	db: Database,
+	resolvers: ObjectRefResolvers,
+	homeSchemaName: string,
 	ownTable: boolean,
 	probedTableName: string,
 	columnName: string,
-	resolve: ResolveObjectRef,
 	targetKey: string,
 	resolveColumnInSource: ResolveColumnInSource,
 ): ExpressionProbe {
-	return expr => ownTable
-		? columnReferencedInCheckExpression(
-			expr, probedTableName, columnName, resolve, targetKey, resolveColumnInSource)
-		: columnReferencedInAst(
-			expr, probedTableName, columnName, resolve, targetKey, resolveColumnInSource);
+	return expr => {
+		if (!expr) return undefined;
+		const reach = reachableObjects(db, expr, homeSchemaName, resolvers, { rowImageContext: true });
+		for (const reached of reach.bodies) {
+			// Seeded ONLY on the probed table's own ROOT body: a CHECK / DEFAULT there is
+			// written against the row being written, so an unqualified name binds the owning
+			// table implicitly. A view body below it is a relation with no such seed, and the
+			// root body of ANOTHER table's expression binds that table's row, not ours.
+			const seeded = ownTable && reached.ownerKey === undefined;
+			const hit = seeded
+				? columnReferencedInCheckExpression(reached.body, probedTableName, columnName,
+					reached.resolve, targetKey, resolveColumnInSource)
+				: columnReferencedInAst(reached.body, probedTableName, columnName,
+					reached.resolve, targetKey, resolveColumnInSource);
+			if (hit) return reached.path;
+		}
+		return undefined;
+	};
 }
 
 /** The first CHECK constraint of `table` the probe matches, described for an error. */
-function findInChecks(table: TableSchema, names: ExpressionProbe): string | undefined {
+function findInChecks(table: TableSchema, names: ExpressionProbe): ProbeHit | undefined {
 	for (const check of table.checkConstraints ?? []) {
-		if (names(check.expr)) return describeCheck(check);
+		const path = names(check.expr);
+		if (path) return { describe: describeCheck(check), path };
 	}
 	return undefined;
 }
@@ -241,13 +296,17 @@ function findInColumnExpressions(
 	ownTable: boolean,
 	skipColumnName: string | undefined,
 	names: ExpressionProbe,
-): string | undefined {
+): ProbeHit | undefined {
 	const lowerSkip = ownTable ? skipColumnName?.toLowerCase() : undefined;
 	for (const col of table.columns) {
 		if (lowerSkip !== undefined && col.name.toLowerCase() === lowerSkip) continue;
-		if (names(col.defaultValue ?? undefined)) return `the DEFAULT of column '${col.name}'`;
+		const defaultPath = names(col.defaultValue ?? undefined);
+		if (defaultPath) return { describe: `the DEFAULT of column '${col.name}'`, path: defaultPath };
 		if (ownTable) continue;
-		if (names(col.generatedExpr)) return `the GENERATED expression of column '${col.name}'`;
+		const generatedPath = names(col.generatedExpr);
+		if (generatedPath) {
+			return { describe: `the GENERATED expression of column '${col.name}'`, path: generatedPath };
+		}
 	}
 	return undefined;
 }

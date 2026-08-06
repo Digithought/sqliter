@@ -2,12 +2,14 @@ import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { findTableExpressionDependent, describeDependentTable } from '../../schema/expression-dependents.js';
+import { describeReachPath } from '../../schema/object-dependency-closure.js';
 import type { DroppableObjectKind } from './assertion-drop-guard.js';
 
 /**
  * Refuses to drop a table / view / materialized view that another table's stored
  * expression — a CHECK constraint, a column DEFAULT, or a `GENERATED ALWAYS AS` body —
- * still names through a subquery.
+ * can still REACH through a subquery: directly, or through any chain of view /
+ * materialized-view bodies.
  *
  * The damage this prevents is the same one `assertNoCheckConstraintNamesColumn` prevents
  * for the column verb, and both verbs resolve at the same missing catalog capability:
@@ -47,6 +49,14 @@ import type { DroppableObjectKind } from './assertion-drop-guard.js';
  *
  * Not gated on `IF EXISTS`: that clause governs ABSENCE, not dependency. Callers already
  * skip the guard when the object does not exist, since there is then nothing to protect.
+ *
+ * "Can reach" is decided by {@link findTableExpressionDependent}, which runs the same
+ * breadth-first closure over stored bodies ({@link reachableObjects}) that
+ * {@link assertNoAssertionDependsOn} does — so a CHECK reading `vv` where
+ * `create view vv as select v from t` refuses `drop table t`, and the two guard families
+ * cannot disagree about what "reaches" means. The refusal names the chain, because a user
+ * told to fix a constraint whose body does not mention the dropped object has nothing to
+ * act on otherwise.
  */
 export function assertNoExpressionDependsOn(
 	db: Database,
@@ -60,8 +70,21 @@ export function assertNoExpressionDependsOn(
 	// name as the user typed it, so `drop table MAIN.t` would otherwise report a schema
 	// spelling that appears nowhere in the catalog. Same rule as `assertNoAssertionDependsOn`.
 	const home = db.schemaManager.getSchema(schemaName)?.name ?? schemaName;
+	const on = `on table ${describeDependentTable(dependent.table, home)}`;
 	throw new QuereusError(
-		`cannot drop ${objectKind} '${home}.${objectName}': it is referenced by ${dependent.describe} on table ${describeDependentTable(dependent.table, home)} — drop or redefine it first`,
+		`cannot drop ${objectKind} '${home}.${objectName}': ${refersTo(dependent, on)} — drop or redefine it first`,
 		StatusCode.CONSTRAINT,
 	);
+}
+
+/**
+ * How the refusal describes the reference. A DIRECT one keeps the wording this guard has
+ * always used; an indirect one leads with the expression and names the chain, mirroring
+ * {@link assertNoAssertionDependsOn}'s split so all four guard families phrase an indirect
+ * refusal identically.
+ */
+function refersTo(dependent: { describe: string; path: ReadonlyArray<string> }, on: string): string {
+	return dependent.path.length === 0
+		? `it is referenced by ${dependent.describe} ${on}`
+		: `${dependent.describe} ${on} reaches it${describeReachPath(dependent.path)}`;
 }
