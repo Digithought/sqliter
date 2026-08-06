@@ -1380,3 +1380,38 @@ drop assertion pw_nonempty;
 drop materialized view pw_mv;
 drop table pw_t;
 -- run
+
+-- --- RENAME COLUMN cascades into an assertion that reads the table THROUGH A VIEW ---
+-- Rewriting the view's body shifts the name it publishes (x → y), and the assertion
+-- reads the VIEW — one level further out. Pre-fix the assertion kept naming `x`,
+-- and because every live assertion recompiles on any commit, EVERY write to the
+-- database failed after the rename, not just writes near the view.
+
+create table arc_w (id integer primary key, x integer);
+create view arc_v1 as select id, x from arc_w;
+create assertion arc_a1 check (not exists (select 1 from arc_v1 where x < 0));
+commit;
+-- run
+
+alter table arc_w rename column x to y;
+-- run
+
+-- writes work again after the rename…
+begin;
+insert into arc_w values (1, 1);
+commit;
+-- run
+
+-- …and the assertion still enforces the same rule through the rewritten view
+begin;
+insert into arc_w values (2, -1);
+commit;
+-- error: Integrity assertion failed: arc_a1
+
+select id, y from arc_w order by id;
+→ [{ "id": 1, "y": 1 }]
+
+drop assertion arc_a1;
+drop view arc_v1;
+drop table arc_w;
+-- run

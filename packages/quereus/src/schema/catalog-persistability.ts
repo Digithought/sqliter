@@ -87,6 +87,19 @@ export type TableRewrite = (table: TableSchema) => TableSchema;
 // hot here, gate the clone on a cheap dry-run name scan (or thread the prospective object
 // through to the propagation instead of rebuilding it). Costs nothing at all when no
 // module can veto (the early return below) — a memory-only database never pays it.
+//
+// NOTE: round-1-only by design. The column-rename propagation is a CASCADE (a view whose
+// PUBLISHED name shifts re-runs the propagation with the view as the target — see
+// runtime/emit/column-rename-cascade.ts), but this probe vets only the direct rewrites of
+// the renamed table's round. Simulating the whole cascade here would mean running the
+// fixpoint twice or vetoing after the catalog swap — the latter inventing a partial-rename
+// failure mode the engine does not have. And it is unnecessary: the only thing a module
+// refuses is an unencodable name / literal, and every cascade round introduces the SAME
+// `newCol` string the statement already vets (this probe on any round-1 body it changes,
+// and the module's own alterTable/renameColumn guard on the renamed table itself), so a
+// cascaded body can only be unpersistable for a reason that predates the statement.
+// Revisit if the veto hook ever grows a check that depends on the body as a whole rather
+// than on the names introduced.
 export function assertRenameDependentsPersistable(
 	db: Database,
 	rewriteFor: BodyRewriteFor,

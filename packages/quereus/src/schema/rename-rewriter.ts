@@ -32,5 +32,7 @@ export {
 	renameColumnInIndexPredicates,
 	renameColumnInCheckConstraints,
 	renameColumnInColumnExpressions,
+	bodyExposesRenamedColumn,
+	bodyPublishesColumnNamed,
 } from './rename/column-rename.js';
 export { stripSelfQualifierInCheckExpression } from './rename/self-qualifier-strip.js';

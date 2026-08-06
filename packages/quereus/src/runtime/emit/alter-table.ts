@@ -39,6 +39,7 @@ import {
 	propagateTableRenameToAssertions,
 	propagateColumnRenameToAssertions,
 } from './assertion-rename-helpers.js';
+import { assertColumnRenameCascadePublishable, runColumnRenameCascade } from './column-rename-cascade.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { inferType } from '../../types/registry.js';
 
@@ -401,6 +402,15 @@ async function runRenameColumn(
 			objectResolvers.forHomeSchema(home), renamedTableKey, resolveColumnInSource),
 		t => rewriteTableForColumnRename(
 			t, tableSchema.name, oldName, newName, objectResolvers, renamedTableKey, resolveColumnInSource));
+
+	// Pre-flight the CASCADE, still before the first side effect: a dependent view /
+	// materialized view whose published names the rename would shift must not end up
+	// publishing two columns of the new name (its own `newName` plus the shifted
+	// passthrough). The live cascade rewrites bodies in place with no rollback, so
+	// the refusal has to land here, while the statement is still a clean no-op.
+	assertColumnRenameCascadePublishable(rctx.db,
+		{ targetKey: renamedTableKey, tableName: tableSchema.name },
+		oldName, newName, objectResolvers, resolveColumnInSource);
 
 	assertRenamedColumnBackingNamesFree(tableSchema, colIndex, oldName, newName);
 
@@ -2274,8 +2284,13 @@ function rewriteTableForTableRename(
 
 /**
  * The column-verb mirror of {@link propagateTableRename} — same all-schema scope for
- * every dependent object kind, same two-global-passes shape (views everywhere before
- * the first MV re-plans).
+ * every dependent object kind, same two-global-passes shape per round (views everywhere
+ * before the first MV re-plans) — plus the one dimension the table verb does not have:
+ * a rewritten view / MV body can SHIFT THE NAME the object publishes (a bare or `*`
+ * passthrough of the renamed column), and the objects reading it then need the same
+ * rename with the view as the target. The worklist lives in `column-rename-cascade.ts`;
+ * each round re-enters the two passes below through the callback (threaded to avoid an
+ * import cycle), so every dependent kind is covered at every depth.
  */
 async function propagateColumnRename(
 	rctx: RuntimeContext,
@@ -2287,17 +2302,20 @@ async function propagateColumnRename(
 	targetKey: string,
 	resolveColumnInSource: ResolveColumnInSource,
 ): Promise<void> {
-	const schemas = Array.from(rctx.db.schemaManager._getAllSchemas());
-	for (const schema of schemas) {
-		propagateColumnRenameInSchema(rctx.db, schema, tableName, oldCol, newCol, resolvers, targetKey, resolveColumnInSource);
-	}
-	for (const schema of schemas) {
-		await propagateColumnRenameToMaterializedViews(rctx.db, schema, tableName, oldCol, newCol,
-			preStaleMvs, resolvers.forHomeSchema(schema.name), targetKey, resolveColumnInSource);
-	}
-	// After all per-schema rewrites and their cascade events: restore any MV this
-	// statement's events marked stale that the rename provably did not affect — a
-	// body that never names the renamed column, or a `select *` body whose output
+	await runColumnRenameCascade(rctx.db, { targetKey, tableName }, oldCol, newCol, preStaleMvs,
+		resolvers, resolveColumnInSource, async target => {
+			const schemas = Array.from(rctx.db.schemaManager._getAllSchemas());
+			for (const schema of schemas) {
+				propagateColumnRenameInSchema(rctx.db, schema, target.tableName, oldCol, newCol, resolvers, target.targetKey, resolveColumnInSource);
+			}
+			for (const schema of schemas) {
+				await propagateColumnRenameToMaterializedViews(rctx.db, schema, target.tableName, oldCol, newCol,
+					preStaleMvs, resolvers.forHomeSchema(schema.name), target.targetKey, resolveColumnInSource);
+			}
+		});
+	// After the whole cascade (once, not per round) and its events: restore any MV
+	// this statement's events marked stale that the rename provably did not affect —
+	// a body that never names the renamed column, or a `select *` body whose output
 	// is a pure name shift (carried onto the live backing by the pass).
 	await restoreUnaffectedMaterializedViews(rctx.db, preStaleMvs);
 }

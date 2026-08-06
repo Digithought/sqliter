@@ -2773,7 +2773,9 @@ export async function propagateTableRenameToMaterializedViews(
 /**
  * Rewrites every dependent materialized view in `schema` after a source COLUMN
  * RENAME — the MV mirror of the plain-view loop in `propagateColumnRenameInSchema`
- * (called once per schema by the caller with that schema's resolver, same in-place
+ * (called once per schema PER CASCADE ROUND — the target may be the renamed table
+ * or a view/MV whose published names a prior round shifted, see
+ * `column-rename-cascade.ts` — with that schema's resolver, same in-place
  * `renameColumnInAst` walk).
  * The body walk also descends the trailing `with defaults (…)` clause (now on
  * `selectAst.defaults`): the clause target is typically a projected-away NOT NULL
@@ -2936,9 +2938,10 @@ async function restoreMaterializedViewLive(
  * sql, sourceTables) is unchanged here — `stale` is runtime state, not persisted.
  * Walks all schemas (the listener marks cross-schema dependents too), in creation
  * order — topological for same-schema MV chains, so a producer restores before its
- * consumer is examined. A chained MV whose body references a renamed-away producer
- * output name fails shape derivation and stays stale (staleness-diagnostic parity
- * with a broken plain-view chain).
+ * consumer is examined. A chained MV normally follows a producer's shifted output
+ * name through the cascade driver's later rounds (`column-rename-cascade.ts`); one
+ * whose body still references a renamed-away name (a mid-statement rewrite
+ * failure) fails shape derivation here and stays stale.
  *
  * NOTE: the walk is schema-by-schema, then creation order WITHIN a schema, so a
  * CROSS-schema MV chain is only topological when the producer's schema is iterated
@@ -3028,11 +3031,14 @@ function sameSourceTables(a: ReadonlyArray<string>, b: ReadonlyArray<string>): b
  * difference (count / types / PK) is NOT a rename outcome — throw so the caller's
  * failure path leaves the MV stale rather than rebuilding data here.
  *
- * The backing `table_modified` fired on a real rename deliberately cascades: a
- * chained MV whose body references the OLD output name is marked stale by the
- * manager's listener and surfaces the staleness diagnostic on its next read
- * (parity with a broken plain-view chain — strictly better than silently freezing),
- * and cached plans scanning the backing directly recompile against the new names.
+ * The backing `table_modified` fired on a real rename deliberately cascades to
+ * the manager's listener (a chained MV referencing the OLD output name is marked
+ * stale), and cached plans scanning the backing directly recompile against the
+ * new names. Within a RENAME COLUMN statement that staleness is transient: the
+ * cascade driver (`column-rename-cascade.ts`) re-runs the propagation with this
+ * MV as the target, so the chained body is rewritten and restored in a later
+ * round — the staleness diagnostic remains only for a body the cascade could not
+ * rewrite (a mid-statement failure).
  */
 async function renameShiftedBackingColumns(
 	db: Database,

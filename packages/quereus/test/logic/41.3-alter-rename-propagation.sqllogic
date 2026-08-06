@@ -1539,3 +1539,210 @@ drop view temp.v_bare;
 drop table main.only_main2;
 drop table temp.dup_cs;
 drop table main.dup_cs2;
+
+-- ===================================
+-- 50. RENAME COLUMN cascades through a view-over-view chain
+-- ===================================
+-- Rewriting v1's body also shifts the name v1 PUBLISHES (x → y), so v2 —
+-- which reads v1, not the renamed table — must be rewritten in a second
+-- round. Pre-fix v2's body kept naming `x` and every read of it failed.
+
+create table w_c50 (id integer primary key, x integer);
+insert into w_c50 values (1, 10);
+
+create view v1_c50 as select id, x from w_c50;
+create view v2_c50 as select id, x from v1_c50;
+
+alter table w_c50 rename column x to y;
+
+select id, y from v2_c50;
+→ [{"id":1,"y":10}]
+
+-- the old name is gone at every level
+select x from v2_c50;
+-- error: not found
+
+drop view v2_c50;
+drop view v1_c50;
+drop table w_c50;
+
+-- ===================================
+-- 51. Three-level chain: every body follows
+-- ===================================
+
+create table t_c51 (id integer primary key, x integer);
+insert into t_c51 values (1, 42);
+
+create view c51_a as select id, x from t_c51;
+create view c51_b as select id, x from c51_a;
+create view c51_c as select id, x from c51_b;
+
+alter table t_c51 rename column x to y;
+
+select id, y from c51_c;
+→ [{"id":1,"y":42}]
+
+drop view c51_c;
+drop view c51_b;
+drop view c51_a;
+drop table t_c51;
+
+-- ===================================
+-- 52. An ALIASED republish does NOT cascade
+-- ===================================
+-- `x as x` keeps publishing `x` after the rename (the alias pins the output
+-- name), so the reader must NOT be rewritten — the sharpest false-positive
+-- case for a syntactic "bare x in the result columns" shortcut.
+
+create table w_c52 (id integer primary key, x integer);
+insert into w_c52 values (1, 5);
+
+create view v1_c52 as select id, x as x from w_c52;
+create view v2_c52 as select id, x from v1_c52;
+
+alter table w_c52 rename column x to y;
+
+-- v1 still publishes `x`; v2 still reads it
+select id, x from v2_c52;
+→ [{"id":1,"x":5}]
+
+drop view v2_c52;
+drop view v1_c52;
+drop table w_c52;
+
+-- ===================================
+-- 53. An explicit view column list stops the cascade
+-- ===================================
+-- `create view v(a, b)` publishes `a, b` regardless of the body — the same
+-- guard an explicit CTE column list is for the in-body exposure analysis.
+
+create table w_c53 (id integer primary key, x integer);
+insert into w_c53 values (3, 8);
+
+create view v1_c53 (a, b) as select id, x from w_c53;
+create view v2_c53 as select a, b from v1_c53;
+
+alter table w_c53 rename column x to y;
+
+select a, b from v2_c53;
+→ [{"a":3,"b":8}]
+
+drop view v2_c53;
+drop view v1_c53;
+drop table w_c53;
+
+-- ===================================
+-- 54. A `select *` view republishes the renamed column — readers follow
+-- ===================================
+-- The star body never names the column, so the round-1 rewrite leaves it
+-- untouched — yet its published names shift with the base table's. This is
+-- the case a "look for a bare x in the result columns" shortcut gets wrong.
+
+create table w_c54 (id integer primary key, x integer);
+insert into w_c54 values (2, 7);
+
+create view v1_c54 as select * from w_c54;
+create view v2_c54 as select id, x from v1_c54;
+
+alter table w_c54 rename column x to y;
+
+select id, y from v2_c54;
+→ [{"id":2,"y":7}]
+
+drop view v2_c54;
+drop view v1_c54;
+drop table w_c54;
+
+-- ===================================
+-- 55. A reader of the view that does NOT touch the renamed column is untouched
+-- ===================================
+
+create table w_c55 (id integer primary key, x integer);
+insert into w_c55 values (1, 9);
+
+create view v1_c55 as select id, x from w_c55;
+create view v2_c55 as select id from v1_c55;
+
+alter table w_c55 rename column x to y;
+
+select id from v2_c55;
+→ [{"id":1}]
+
+drop view v2_c55;
+drop view v1_c55;
+drop table w_c55;
+
+-- ===================================
+-- 56. Published-name collision REFUSES the rename, before any side effect
+-- ===================================
+-- v1 publishes `x` (a passthrough of the renamed column) AND its own `y`;
+-- following the rename would make it publish two `y`s, mirroring the
+-- base-verb refusal of a rename that collides with an existing column.
+-- The statement must be a clean no-op: the table keeps `x` and v1 still reads.
+
+create table w_c56 (id integer primary key, x integer);
+insert into w_c56 values (1, 4);
+
+create view v1_c56 as select x, id as y from w_c56;
+
+alter table w_c56 rename column x to y;
+-- error: already publishes a column named 'y'
+
+-- clean no-op: the base column and the view are untouched
+select x, y from v1_c56;
+→ [{"x":4,"y":1}]
+
+drop view v1_c56;
+drop table w_c56;
+
+-- ===================================
+-- 57. The cascade crosses schemas, and a body touched by TWO rounds settles
+-- ===================================
+-- main.t → main.v1 → temp.v2: the second round must reach dependents in every
+-- schema, exactly like the first. The `vb` view is touched twice — round 1
+-- rewrites its subquery on the base table, round 2 its projection through v1.
+
+create table w_c57 (id integer primary key, x integer);
+insert into w_c57 values (1, 77);
+
+create view v1_c57 as select id, x from w_c57;
+create view temp.v2_c57 as select id, x from main.v1_c57;
+create view vb_c57 as select v1_c57.x as through_view, (select max(w_c57.x) from w_c57) as direct from v1_c57;
+
+alter table w_c57 rename column x to y;
+
+select id, y from temp.v2_c57;
+→ [{"id":1,"y":77}]
+
+select through_view, direct from vb_c57;
+→ [{"through_view":77,"direct":77}]
+
+drop view vb_c57;
+drop view temp.v2_c57;
+drop view v1_c57;
+drop table w_c57;
+
+-- ===================================
+-- 58. Round order must not matter: the reader sits in an EARLIER-iterated
+--     schema (main) than the view it reads (temp)
+-- ===================================
+-- Within one schema a reader is always created after — and therefore iterated
+-- after — its dependency; putting the reader in main and the shifted view in
+-- temp exercises the reader-before-dependency visit order. Correctness cannot
+-- depend on it: the reader's reference is rewritten only in the round AFTER
+-- the view's shift is discovered.
+
+create table temp.w_c58 (id integer primary key, x integer);
+insert into temp.w_c58 values (1, 21);
+
+create view temp.v1_c58 as select id, x from temp.w_c58;
+create view main.v2_c58 as select id, x from temp.v1_c58;
+
+alter table temp.w_c58 rename column x to y;
+
+select id, y from main.v2_c58;
+→ [{"id":1,"y":21}]
+
+drop view main.v2_c58;
+drop view temp.v1_c58;
+drop table temp.w_c58;

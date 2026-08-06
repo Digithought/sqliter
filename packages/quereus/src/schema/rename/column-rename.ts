@@ -337,6 +337,123 @@ export function renameColumnInColumnExpressions(
 	return defaultsChanged || generatedChanged;
 }
 
+/**
+ * Whether `body`'s top-level result columns publish the renamed column under
+ * `newColName` — i.e. whether rewriting this body shifted the name its readers
+ * see. Call AFTER the body rewrite: the predicate compares against the NEW
+ * name, exactly as the CTE exposure analysis it shares its internals with
+ * ({@link cteExposesRenamedColumn} / `isResultColumnExposure`). An explicit
+ * alias suppresses exposure; a bare projection of the renamed column, or a
+ * `*` / `t.*` whose frame binds the target unaliased, exposes it.
+ *
+ * An explicit view / materialized-view column list pins the published names
+ * regardless of the body — that guard belongs at the call site
+ * (`ViewSchema.columns` / `TableDerivation.columns` play the role
+ * `cte.columns` plays inside the CTE analysis; this predicate never sees them).
+ */
+export function bodyExposesRenamedColumn(
+	body: AST.QueryExpr | undefined,
+	tableName: string,
+	oldColName: string,
+	newColName: string,
+	resolve: ResolveObjectRef,
+	targetKey: string,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	if (!body) return false;
+	const state: ColumnRewriteState = {
+		tableName: tableName.toLowerCase(),
+		oldCol: oldColName.toLowerCase(),
+		newCol: newColName,
+		resolveRef: resolve,
+		targetKey,
+		scopeStack: [],
+		changed: false,
+		resolveColumnInSource,
+		matchRowImageQualifier: false,
+	};
+	return queryExposesRenamedColumn(body, state);
+}
+
+/**
+ * Sentinel target key for {@link bodyPublishesColumnNamed}'s throwaway walk
+ * state: the frame machinery wants a rename target, but this probe must match
+ * nothing — real object keys are `<schema>.<name>` built from identifiers,
+ * which never contain a NUL.
+ */
+const PROBE_TARGET_KEY = '\u0000.\u0000';
+
+/**
+ * Whether `body`'s top-level result columns publish a column named
+ * `columnName`, from ANY origin: an explicit alias, an unaliased bare
+ * projection of a column so named (wherever it binds), or a `*` / `t.*` whose
+ * bound real-table source exposes it (asked through `resolveColumnInSource`).
+ *
+ * The collision half of the rename-cascade pre-flight
+ * (`runtime/emit/column-rename-cascade.ts`): run against the PRISTINE
+ * (pre-rewrite) body with `columnName = newCol` — the rename target cannot
+ * publish `newCol` before the rename, so anything found is necessarily a
+ * DIFFERENT column the shifted name would collide with.
+ *
+ * Shares the walker's scope limitations: a `*` over an aliased subquery,
+ * function source, or CTE has no askable column set, so a publication arriving
+ * only through one of those is not seen.
+ */
+export function bodyPublishesColumnNamed(
+	body: AST.QueryExpr | undefined,
+	columnName: string,
+	resolve: ResolveObjectRef,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	if (!body || body.type !== 'select') return false;
+	const select = body as AST.SelectStmt;
+	const nameLower = columnName.toLowerCase();
+	const state: ColumnRewriteState = {
+		tableName: '\u0000',
+		oldCol: '\u0000',
+		newCol: '\u0000',
+		resolveRef: resolve,
+		targetKey: PROBE_TARGET_KEY,
+		scopeStack: [],
+		changed: false,
+		resolveColumnInSource,
+		matchRowImageQualifier: false,
+	};
+	const withFrame = analyzeWithFrame(select.withClause, state);
+	state.scopeStack.push(withFrame);
+	try {
+		const frame = buildScopeFrame(select.from, state);
+		for (const col of select.columns ?? []) {
+			if (resultColumnPublishesName(col, frame, nameLower, resolveColumnInSource)) return true;
+		}
+		return false;
+	} finally {
+		state.scopeStack.pop();
+	}
+}
+
+/** One result column's published-name test for {@link bodyPublishesColumnNamed}. */
+function resultColumnPublishesName(
+	col: AST.ResultColumn,
+	frame: ScopeFrame,
+	nameLower: string,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	if (col.type === 'all') {
+		if (!resolveColumnInSource) return false;
+		if (col.table === undefined) {
+			return frame.realSources.some(src => resolveColumnInSource(src.schemaLower, src.nameLower, nameLower));
+		}
+		const qualLower = col.table.toLowerCase();
+		const key = frame.aliasMap.get(qualLower) ?? frame.unaliased.get(qualLower);
+		if (key === undefined) return false;
+		return frame.realSources.some(src => src.key === key
+			&& resolveColumnInSource(src.schemaLower, src.nameLower, nameLower));
+	}
+	if (col.alias !== undefined) return col.alias.toLowerCase() === nameLower;
+	return col.expr.type === 'column' && (col.expr as AST.ColumnExpr).name.toLowerCase() === nameLower;
+}
+
 interface ColumnRewriteState {
 	/** Lowercase bare name of the renamed table (seed qualifier, row-image and CTE bookkeeping). */
 	tableName: string;
@@ -1014,7 +1131,19 @@ function cteExposesRenamedColumn(
 	state: ColumnRewriteState,
 ): boolean {
 	if (cte.columns) return false;
-	const query = cte.query;
+	return queryExposesRenamedColumn(cte.query, state);
+}
+
+/**
+ * The query-level core {@link cteExposesRenamedColumn} and the public
+ * {@link bodyExposesRenamedColumn} share: whether `query`'s top-level result
+ * columns publish the renamed column under `state.newCol`. Expects the body to
+ * be ALREADY rewritten — the walk rewrites a CTE body before asking, and the
+ * public entry point documents the same contract. For a compound body the
+ * first arm's result list is what names the output, and that is what
+ * `query.columns` holds here; a non-select body never exposes.
+ */
+function queryExposesRenamedColumn(query: AST.QueryExpr, state: ColumnRewriteState): boolean {
 	if (query.type !== 'select') return false;
 	const select = query as AST.SelectStmt;
 
