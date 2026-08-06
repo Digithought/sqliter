@@ -269,11 +269,10 @@ describe('Type System', () => {
 				expect(BLOB_TYPE.validate!('not a blob')).to.be.false;
 			});
 
-			it('should parse hex strings to blobs', () => {
+			it('should parse strings as literal UTF-8 bytes, not hex', () => {
 				const result = BLOB_TYPE.parse!('ff00') as Uint8Array;
 				expect(result).to.be.instanceOf(Uint8Array);
-				expect(result[0]).to.equal(0xff);
-				expect(result[1]).to.equal(0x00);
+				expect(Array.from(result)).to.deep.equal(Array.from(new TextEncoder().encode('ff00')));
 			});
 		});
 

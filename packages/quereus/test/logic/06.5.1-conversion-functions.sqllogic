@@ -35,3 +35,84 @@ select integer(-5), integer('-10');
 -- real from integer string
 select real('42');
 → [{"real('42')":42}]
+
+-- =============================================================================
+-- blob() -- literal UTF-8, no hex sniffing
+-- =============================================================================
+
+select blob('abc') = x'616263' as r;
+→ [{"r":true}]
+
+-- Even a string that looks like hex digits still becomes its literal UTF-8 bytes.
+select blob('6162') = x'36313632' as r;
+→ [{"r":true}]
+
+select blob(null);
+→ [{"blob(null)":null}]
+
+select typeof(blob('abc'));
+→ [{"typeof(blob('abc'))":"blob"}]
+
+-- =============================================================================
+-- hex() / unhex()
+-- =============================================================================
+
+select hex(x'6162');
+→ [{"hex(x'6162')":"6162"}]
+
+-- hex() is uppercase, no separator.
+select hex(x'cafe');
+→ [{"hex(x'cafe')":"CAFE"}]
+
+-- A non-blob argument converts to bytes first, same path as cast(X as blob).
+select hex('abc');
+→ [{"hex('abc')":"616263"}]
+
+select hex(null);
+→ [{"hex(null)":null}]
+
+-- Empty blob is a distinct non-null zero-length value, not null.
+select hex(x'');
+→ [{"hex(x'')":""}]
+
+select unhex('6162') = x'6162' as r;
+→ [{"r":true}]
+
+-- Case-insensitive input.
+select unhex('CAFE') = unhex('cafe') as r;
+→ [{"r":true}]
+
+-- Odd number of hex digits -> null, not an error.
+select unhex('616');
+→ [{"unhex('616')":null}]
+
+-- Non-hex characters -> null.
+select unhex('zz');
+→ [{"unhex('zz')":null}]
+
+select unhex(null);
+→ [{"unhex(null)":null}]
+
+-- Empty string unhexes to the empty blob, not null.
+select unhex('') = x'' as r, unhex('') is null as isnull;
+→ [{"r":true,"isnull":false}]
+
+-- Round trip through hex()/unhex().
+select unhex(hex(x'deadbeef')) = x'deadbeef' as r;
+→ [{"r":true}]
+
+-- =============================================================================
+-- Text-into-BLOB-column write/read-back
+-- =============================================================================
+
+create table blob_write_test (id integer primary key, data blob);
+
+insert into blob_write_test values (1, cast('abc' as blob));
+select id, data = x'616263' as r from blob_write_test where id = 1;
+→ [{"id":1,"r":true}]
+
+insert into blob_write_test values (2, cast('6162' as blob));
+select id, data = x'36313632' as r from blob_write_test where id = 2;
+→ [{"id":2,"r":true}]
+
+drop table blob_write_test;

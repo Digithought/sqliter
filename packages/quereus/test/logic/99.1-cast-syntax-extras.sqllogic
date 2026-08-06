@@ -14,6 +14,26 @@ select cast('hello' as blob) = x'68656c6c6f' as r;
 select cast(x'0102' as blob) = x'0102' as r;
 → [{"r":true}]
 
+-- -----------------------------------------------------------------------------
+-- Text-to-binary is literal UTF-8 -- no hex sniffing
+-- -----------------------------------------------------------------------------
+
+-- The round trip this behavior exists for: text(blob) then blob(text) is
+-- lossless for UTF-8-clean bytes.
+select cast(cast(x'6162' as text) as blob) = x'6162' as r;
+→ [{"r":true}]
+
+-- Round-trip is NOT total: a blob that is not valid UTF-8 renders as U+FFFD
+-- on the way to text, so it comes back as the UTF-8 bytes of the replacement
+-- character, not the original byte.
+select cast(cast(x'ff' as text) as blob) = x'efbfbd' as r;
+→ [{"r":true}]
+
+-- A string that looks like hex digits is no longer sniffed as hex -- it
+-- becomes its own UTF-8 bytes, four of them, not the two bytes 0x61 0x62.
+select cast('6162' as blob) = x'36313632' as r;
+→ [{"r":true}]
+
 -- =============================================================================
 -- Scientific notation in conversions
 -- =============================================================================

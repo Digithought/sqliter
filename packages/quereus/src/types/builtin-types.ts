@@ -175,16 +175,8 @@ export const BLOB_TYPE: LogicalType = {
 		if (v === null) return null;
 		if (v instanceof Uint8Array) return v;
 		if (typeof v === 'string') {
-			// Check if it's a hex string (even length, all hex chars)
-			if (v.length % 2 === 0 && /^[0-9a-fA-F]*$/.test(v) && v.length > 0) {
-				// Convert hex string to blob
-				const bytes = new Uint8Array(v.length / 2);
-				for (let i = 0; i < v.length; i += 2) {
-					bytes[i / 2] = parseInt(v.substr(i, 2), 16);
-				}
-				return bytes;
-			}
-			// For non-hex strings, convert to UTF-8 bytes
+			// Text-to-binary is always literal UTF-8 — no hex sniffing. Ask for hex
+			// explicitly with unhex().
 			const encoder = new TextEncoder();
 			return encoder.encode(v);
 		}

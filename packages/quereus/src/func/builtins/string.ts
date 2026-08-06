@@ -1,10 +1,12 @@
 import { createAggregateFunction, createScalarFunction, createTableValuedFunction } from '../registration.js';
 import type { Row, SqlValue, DeepReadonly } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
 import { simpleLike, simpleGlob } from '../../util/patterns.js';
 import { valueToText } from '../../util/value-text.js';
-import { INTEGER_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
-import { BOOLEAN_RETURN } from './return-types.js';
+import { INTEGER_TYPE, TEXT_TYPE, BLOB_TYPE } from '../../types/builtin-types.js';
+import { BOOLEAN_RETURN, BLOB_RETURN } from './return-types.js';
 import type { LogicalType } from '../../types/logical-type.js';
 
 const log = createLogger('func:builtins:scalar');
@@ -285,5 +287,50 @@ export const upperFunc = createScalarFunction(
 	{ name: 'upper', numArgs: 1, deterministic: true, ...textReturnTypeInference },
 	(arg: SqlValue): SqlValue => {
 		return typeof arg === 'string' ? arg.toUpperCase() : null;
+	}
+);
+
+// --- hex(X) ---
+// A non-blob argument is converted to bytes the same way cast(X as blob) is,
+// via BLOB_TYPE.parse — so a JSON object/array argument throws rather than
+// returning NULL, matching blob()'s behavior instead of adding a second,
+// divergent conversion table here.
+export const hexFunc = createScalarFunction(
+	{ name: 'hex', numArgs: 1, deterministic: true, ...textReturnTypeInference },
+	(arg: SqlValue): SqlValue => {
+		if (arg === null) return null;
+
+		let bytes: Uint8Array;
+		try {
+			bytes = BLOB_TYPE.parse!(arg) as Uint8Array;
+		} catch (e) {
+			throw new QuereusError(
+				`Cannot convert to BLOB for hex(): ${e instanceof Error ? e.message : String(e)}`,
+				StatusCode.MISMATCH
+			);
+		}
+
+		let out = '';
+		for (let i = 0; i < bytes.length; i++) {
+			out += bytes[i].toString(16).padStart(2, '0');
+		}
+		return out.toUpperCase();
+	}
+);
+
+// --- unhex(X) ---
+// Inverse of hex(): a hex-digit-pair string to bytes. Anything that is not a
+// whole number of hex digit pairs is NULL, not an error, matching SQLite.
+export const unhexFunc = createScalarFunction(
+	{ name: 'unhex', numArgs: 1, deterministic: true, returnType: BLOB_RETURN },
+	(arg: SqlValue): SqlValue => {
+		if (typeof arg !== 'string') return null;
+		if (arg.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(arg)) return null;
+
+		const bytes = new Uint8Array(arg.length / 2);
+		for (let i = 0; i < arg.length; i += 2) {
+			bytes[i / 2] = parseInt(arg.slice(i, i + 2), 16);
+		}
+		return bytes;
 	}
 );

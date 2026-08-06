@@ -28,6 +28,8 @@ Scalar functions operate on single values and return a single value per row.
 - `reverse(X)`: Returns string X with characters in reverse order
 - `like(pattern, X)`: Returns BOOLEAN — `true` if X matches `pattern`, `false` otherwise, `NULL` if either argument is `NULL`
 - `glob(pattern, X)`: Returns BOOLEAN — `true` if X matches glob `pattern`, `false` otherwise, `NULL` if either argument is `NULL`
+- `hex(X)`: Returns the uppercase hex spelling of X's bytes, no separator. A non-blob X converts to bytes first, the same path `cast(X as blob)` takes
+- `unhex(X)`: Returns the BLOB parsed from hex string X, or `NULL` if X is not a whole number of hex digit pairs
 
 **Examples:**
 ```sql

@@ -9,7 +9,8 @@ import { lowerFunc, upperFunc } from './string.js';
 import { lengthFunc, substrFunc, substringFunc, likeFunc, globFunc, trimFunc, ltrimFunc, rtrimFunc, replaceFunc,
 	instrFunc, lpadFunc, rpadFunc, reverseFunc,
 	stringConcatFunc,
-	splitStringFunc} from './string.js';
+	splitStringFunc,
+	hexFunc, unhexFunc} from './string.js';
 import { countStarFunc, sumFunc, avgFunc, minFunc, maxFunc, countXFunc, groupConcatFuncRev, totalFunc,
 	varPopFunc, varSampFunc, stdDevPopFunc, stdDevSampFunc } from './aggregate.js';
 import type { FunctionSchema } from '../../schema/function.js';
@@ -26,7 +27,7 @@ import { schemaFunc, tableInfoFunc, functionInfoFunc, foreignKeyInfoFunc,
 	indexInfoFunc, checkConstraintInfoFunc, uniqueConstraintInfoFunc, assertionInfoFunc,
 	viewInfoFunc, columnInfoFunc } from './schema.js';
 import { jsonEachFunc, jsonTreeFunc } from './json-tvf.js';
-import { INTEGER_FUNC, REAL_FUNC, TEXT_FUNC, BOOLEAN_FUNC, DATE_FUNC, TIME_FUNC, DATETIME_FUNC, JSON_FUNC, TIMESPAN_FUNC } from './conversion.js';
+import { INTEGER_FUNC, REAL_FUNC, TEXT_FUNC, BLOB_FUNC, BOOLEAN_FUNC, DATE_FUNC, TIME_FUNC, DATETIME_FUNC, JSON_FUNC, TIMESPAN_FUNC } from './conversion.js';
 import {
 	timespanYearsFunc, timespanMonthsFunc, timespanWeeksFunc, timespanDaysFunc,
 	timespanHoursFunc, timespanMinutesFunc, timespanSecondsFunc,
@@ -41,6 +42,7 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	INTEGER_FUNC,
 	REAL_FUNC,
 	TEXT_FUNC,
+	BLOB_FUNC,
 	BOOLEAN_FUNC,
 	DATE_FUNC,
 	TIME_FUNC,
@@ -83,6 +85,8 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	reverseFunc,
 	lpadFunc,
 	rpadFunc,
+	hexFunc,
+	unhexFunc,
 	stringConcatFunc,
 	splitStringFunc,
 	// Aggregates

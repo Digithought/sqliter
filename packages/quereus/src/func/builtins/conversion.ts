@@ -2,10 +2,10 @@ import type { SqlValue } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE } from '../../types/builtin-types.js';
+import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE, BLOB_TYPE } from '../../types/builtin-types.js';
 import { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESPAN_TYPE } from '../../types/temporal-types.js';
 import { JSON_TYPE } from '../../types/json-type.js';
-import { BOOLEAN_RETURN, INTEGER_RETURN, JSON_RETURN, REAL_RETURN, TEXT_RETURN, scalarReturn } from './return-types.js';
+import { BLOB_RETURN, BOOLEAN_RETURN, INTEGER_RETURN, JSON_RETURN, REAL_RETURN, TEXT_RETURN, scalarReturn } from './return-types.js';
 
 /**
  * integer() - Convert value to INTEGER
@@ -61,6 +61,26 @@ export const TEXT_FUNC = createScalarFunction(
 		} catch (e) {
 			throw new QuereusError(
 				`Cannot convert to TEXT: ${e instanceof Error ? e.message : String(e)}`,
+				StatusCode.MISMATCH
+			);
+		}
+	}
+);
+
+/**
+ * blob() - Convert value to BLOB
+ * Usage: blob(value)
+ */
+export const BLOB_FUNC = createScalarFunction(
+	{ name: 'blob', numArgs: 1, deterministic: true, returnType: BLOB_RETURN },
+	(value: SqlValue): SqlValue => {
+		if (value === null) return null;
+
+		try {
+			return BLOB_TYPE.parse!(value);
+		} catch (e) {
+			throw new QuereusError(
+				`Cannot convert to BLOB: ${e instanceof Error ? e.message : String(e)}`,
 				StatusCode.MISMATCH
 			);
 		}
