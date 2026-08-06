@@ -459,14 +459,17 @@ describe('Store ALTER TABLE', () => {
 		});
 
 		it('does not schema-qualify an own-table self-reference when another schema on the path holds the NEW name', async () => {
-			// The forward rewrite's post-condition asks how a rewritten bare reference
-			// will resolve AFTER the rename. For the renamed table's OWN expressions the
-			// answer is always this schema (its own schema leads its home path), so no
-			// qualifier belongs in the persisted DDL — even though `temp` holds the new
-			// name and `temp` sits on `main`'s home path.
+			// The rewrite's post-condition asks how a rewritten bare reference resolves
+			// AFTER the rename. For the renamed table's OWN expressions the answer is
+			// always this schema (its own schema leads its home path), so no qualifier
+			// belongs in the persisted DDL — even with `temp` on `main`'s search path
+			// holding the new name. Answering that with the PRE-rename snapshot instead
+			// gets it wrong (`temp.t_q2` there), qualifying text the engine's in-memory
+			// pass leaves bare and diverging the persisted DDL from the catalog.
 			const storeModule = new StoreModule(provider);
 			db.registerModule('store_rename_qualify', storeModule);
 
+			await db.exec(`PRAGMA schema_path = 'main,temp'`);
 			await db.exec(`CREATE TABLE temp.t_q2 (id INTEGER PRIMARY KEY)`);
 			await db.exec(`
 				CREATE TABLE t_q (
@@ -479,8 +482,9 @@ describe('Store ALTER TABLE', () => {
 			const ddlStatements = await storeModule.loadAllDDL();
 			expect(ddlStatements).to.have.lengthOf(1);
 			const ddl = ddlStatements[0].toLowerCase();
-			expect(ddl).to.include('t_q2');
-			expect(ddl, 'SHOWME').to.equal('SHOWME');
+			expect(ddl).to.include('from t_q2');
+			expect(ddl).to.not.include('main.t_q2');
+			expect(ddl).to.not.include('temp.t_q2');
 		});
 
 		it('rename inside a savepoint does not throw on rollback-to (DDL-commits posture)', async () => {

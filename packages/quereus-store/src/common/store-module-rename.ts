@@ -13,7 +13,8 @@ import type { Database, DatabaseInternal, TableSchema } from '@quereus/quereus';
 import {
 	QuereusError,
 	StatusCode,
-	buildObjectRefResolver,
+	snapshotObjectRefResolvers,
+	tableRenameTargetsFor,
 	renameTableInCheckConstraints,
 	renameTableInColumnExpressions,
 	renameTableInIndexPredicates,
@@ -232,18 +233,20 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 			//
 			// Planner-parity resolution, snapshotted here — this hook runs before the
 			// engine's catalog swap, so the snapshot sees the pre-rename catalog.
-			// These walks rewrite only the renamed table's OWN expressions, whose bare
-			// self-references stay in this schema across the rename — so the rewrite
-			// post-condition holds with `resolveAfter === resolve` and no
-			// qualification ever fires (the engine's cross-schema propagation is
-			// where a post-rename sibling snapshot is needed).
-			const resolveRef = buildObjectRefResolver(db, schemaName);
+			// `tableRenameTargetsFor` pairs it with the post-rename sibling, which is
+			// what the rewrite's post-condition asks (a rewritten reference must still
+			// resolve to the renamed table). Deriving it — rather than passing the
+			// pre-rename resolver twice — is load-bearing whenever the session
+			// `schema_path` reaches past this schema: with `main,temp` and a
+			// `temp.<newName>` present, the pre-rename snapshot answers `temp.<newName>`
+			// for the rewritten bare name and the walk would schema-qualify a
+			// self-reference the engine's own pass leaves bare, diverging the persisted
+			// DDL from the in-memory catalog. The reverse (rollback) direction gets its
+			// own target: un-renaming back to `oldName` lands on the base snapshot,
+			// which IS the pre-rename catalog.
+			const resolvers = snapshotObjectRefResolvers(db);
 			const rewriteTable = (from: string, to: string): void => {
-				const target = {
-					oldName: from, newName: to, schemaName,
-					resolve: resolveRef, resolveAfter: resolveRef,
-				};
-				console.error('DBG target', from, to, schemaName, 'after(t_q2)=', resolveRef(undefined, to), 'cols=', JSON.stringify(currentSchema.columns.map(c=>[c.name, !!c.defaultValue])));
+				const target = tableRenameTargetsFor(resolvers, schemaName, from, to)(schemaName);
 				renameTableInIndexPredicates(currentSchema.indexes, target);
 				renameTableInCheckConstraints(currentSchema.checkConstraints, target);
 				renameTableInColumnExpressions(currentSchema.columns, target);

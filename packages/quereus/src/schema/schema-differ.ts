@@ -1465,6 +1465,17 @@ function inverseRenamedViewParts(
 	for (const r of tableRenames) {
 		// Single-schema world: a bare name always resolves back to this schema,
 		// so `resolveAfter === resolve` and no qualification ever fires.
+		//
+		// NOTE: the FORWARD live rename can still leave a qualifier behind that this
+		// walk has no declared counterpart for — `alter table main.t rename to t2`
+		// writes `main.t2` into a temp-owned body when `temp.t2` exists (see
+		// `renameTableInAst`'s post-condition). A declared form of THAT body would
+		// read bare `t2`, so re-diffing it reads as a body change and would emit a
+		// recreate back to the re-binding spelling. Unreachable today: qualification
+		// only fires when the body's home schema differs from the renamed table's,
+		// and a diff covers one schema at a time. If declarative schemas ever span
+		// schemas, this walk needs to accept a qualifier equal to `schemaName` as
+		// equivalent to the bare declared name.
 		renameTableInAst(selectClone, {
 			oldName: r.newName, newName: r.oldName, schemaName,
 			resolve: resolveRef, resolveAfter: resolveRef,

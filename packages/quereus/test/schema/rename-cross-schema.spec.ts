@@ -692,6 +692,22 @@ describe('rename rewrite preserves what a reference resolves to (collision grid)
 			'assertion must still refuse a violating write to the renamed table');
 	});
 
+	// ── the renamed table's OWN expressions ────────────────────────────
+
+	it('own-table self-reference: stays unqualified even though temp holds the new name', async () => {
+		// A table's own schema leads its home path, so a bare self-reference resolves
+		// back to it after the rename and needs no qualifier. This is also the engine
+		// half of a store-path parity: `store-module-rename.ts` runs the same walk over
+		// the persisted DDL, and answering the post-condition with the PRE-rename
+		// snapshot there would qualify this text while the catalog kept it bare.
+		await db.exec('create table temp.s2 (id integer primary key)');
+		await db.exec('create table main.s (id integer primary key, n integer default ((select count(*) from s)), check ((select count(*) from s) >= 0))');
+		await db.exec('alter table main.s rename to s2');
+		expect(defaultText(db, 'main', 's2', 'n')).to.equal('(select count(*) from s2)');
+		expect(checkText(db, 'main', 's2')).to.contain('from s2');
+		expect(checkText(db, 'main', 's2')).to.not.contain('main.s2');
+	});
+
 	it('assertion, schema-qualified: still enforces against the renamed table, not temp.t2', async () => {
 		await db.exec('create assertion temp.aq check (not exists (select 1 from main.t where x < 0))');
 		await db.exec('alter table main.t rename to t2');
