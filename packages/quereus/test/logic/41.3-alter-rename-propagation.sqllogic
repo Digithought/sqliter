@@ -2096,3 +2096,46 @@ drop view alg_c65;
 drop table alo_c65;
 drop table ali_c65;
 -- run
+
+-- A `with defaults` target is the third site on the widened binding, and the one
+-- least like a body reference: the clause names a projected-away base column and
+-- rides the walk as a synthetic bare ref (see § 18 for the unaliased spelling), so
+-- an aliased FROM used to leave it un-rewritten and the write-through then failed
+-- with "'with defaults (created = …)' names column 'created'".
+create table ald_c65 (id integer primary key, name text, created integer not null);
+create view alvd_c65 as select id, name from ald_c65 a with defaults (created = 99);
+-- run
+
+alter table ald_c65 rename column created to created_at;
+
+insert into alvd_c65 values (1, 'x');
+
+select id, name, created_at from ald_c65;
+→ [{"id":1,"name":"x","created_at":99}]
+
+drop view alvd_c65;
+drop table ald_c65;
+-- run
+
+-- ...and the `with inverse` ASSIGNMENT TARGET, the fourth site: also a bare
+-- base-column name riding the walk as a synthetic probe (§ 63 covers the clause's
+-- `new.` refs, which stay inert either way). Under an aliased FROM the target used
+-- to be left naming the old column, and every write through the view then failed.
+create table ali2_c65 (id integer primary key, code5 text);
+create view alvi_c65 as
+  select id, case code5 when 'A1' then 'A' end as v
+    with inverse (code5 = case new.v when 'A' then 'A1' end)
+  from ali2_c65 a;
+insert into alvi_c65 (id, v) values (1, 'A');
+-- run
+
+alter table ali2_c65 rename column code5 to code6;
+
+insert into alvi_c65 (id, v) values (2, 'A');
+
+select id, code6 from ali2_c65 order by id;
+→ [{"id":1,"code6":"A1"},{"id":2,"code6":"A1"}]
+
+drop view alvi_c65;
+drop table ali2_c65;
+-- run

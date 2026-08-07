@@ -30,6 +30,17 @@
  * bare `x` nor republish one — it sits beside the subquery source in the walk
  * only because both are equally unaskable, not because it has a reachable case
  * of its own.
+ *
+ * Scope of the matrix: view bodies and assertion bodies. The same walk also
+ * serves the expressions a *table* carries, but none of those can be authored
+ * with an aliased FROM shape reaching another table, so there is nothing here
+ * for them — a generated body's unqualified foreign reference is rejected at
+ * declaration time (`Column 'x' referenced by generated column … not found`),
+ * and a partial-index predicate rejects a subquery outright (`Unsupported
+ * expression in partial-index predicate: subquery`, measured 2026-08-06), which
+ * is the only way a predicate could carry a FROM clause at all. The remaining
+ * site, a column DEFAULT, is pinned in
+ * `test/logic/41.10.2-alter-drop-column-check-and-assertion.sqllogic`.
  */
 
 import { expect } from 'chai';
