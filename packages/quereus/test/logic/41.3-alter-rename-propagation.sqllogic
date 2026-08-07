@@ -1814,3 +1814,44 @@ drop materialized view temp.mv_c60;
 drop view temp.v_c60;
 drop table main.t2_c60;
 drop table temp.t2_c60;
+
+-- ===================================
+-- 61. An inner reference binding a VIEW that exposes the old name is not
+--     false-captured by the rename
+-- ===================================
+-- The seeded CHECK walk stops at any inner FROM frame whose sources already
+-- expose the renamed column — otherwise the outer seed captures a name that
+-- legitimately binds inside the subquery. `buildColumnSourceResolver` answers
+-- that "does this source expose this column?" question for a VIEW (its explicit
+-- column list, else its body's projections and stars), not only for a table, so
+-- a view over ANOTHER table shields its own `v` exactly as that table would.
+-- The DROP COLUMN mirror of this case is 41.10.2 §36; the two verbs share the
+-- one resolver, which is what keeps them from drifting apart.
+
+create table t_c61 (id integer primary key, v integer);
+create table u_c61 (id integer primary key, v integer);
+create view uv_c61 as select v from u_c61;
+
+alter table t_c61 add constraint ck_c61 check (id < (select max(v) from uv_c61));
+insert into u_c61 values (1, 50);
+
+alter table t_c61 rename column v to z;
+
+-- The CHECK's `v` still names the view's column, so the constraint keeps
+-- enforcing the rule it was written for.
+insert into t_c61 values (10, 1);
+
+select id, z from t_c61;
+→ [{"id":10,"z":1}]
+
+insert into t_c61 values (99, 2);
+-- error: ck_c61
+
+-- The renamed column is the one the rename actually moved.
+insert into t_c61 (id, z) values (11, 7);
+select count(*) as c from t_c61;
+→ [{"c":2}]
+
+drop table t_c61;
+drop view uv_c61;
+drop table u_c61;

@@ -26,6 +26,7 @@ import { coerceRowToSchema, foldDefaultToType } from '../../../types/validation.
 import type { VTableEventEmitter } from '../../events.js';
 import { compilePredicate } from '../utils/predicate.js';
 import { renameColumnInIndexPredicates, objectRefKey, type ResolveColumnInSource } from '../../../schema/rename-rewriter.js';
+import { buildColumnSourceResolver } from '../../../schema/column-source-resolver.js';
 import { buildObjectRefResolver } from '../../../schema/object-ref-resolver.js';
 import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
@@ -2241,9 +2242,11 @@ export class MemoryTableManager {
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
-		const schemaManager = this.db.schemaManager;
-		const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
-			schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
+		// The engine's own propagation pass walks these same shared `Expression` nodes with
+		// `buildColumnSourceResolver`, so this hook must use it too: a hand-rolled table-only
+		// lookup answers "no" for a VIEW source, and the two walks then disagree about
+		// whether an unqualified ref inside a subquery binds the view or the owning table.
+		const resolveColumnInSource: ResolveColumnInSource = buildColumnSourceResolver(this.db);
 		// Built before any mutation of this hook (the engine's catalog swap comes
 		// later still); the reverse pass reuses the same snapshot and key.
 		const resolveRef = buildObjectRefResolver(this.db, this.schemaName);

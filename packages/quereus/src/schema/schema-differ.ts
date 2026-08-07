@@ -586,7 +586,11 @@ export function computeSchemaDiff(
 	// already-declared name simply misses the rename find and passes through.
 	// Cross-schema sources answer false (the catalog is single-schema) —
 	// conservative where the forward path's live lookup could say yes; worst
-	// case a benign drop+recreate.
+	// case a benign drop+recreate. A VIEW source answers false for the same
+	// reason and in the same direction: `buildColumnSourceResolver` reads a live
+	// view's published columns, but the declared world here holds only table
+	// column sets. This is the ONE place a hand-rolled answer is correct rather
+	// than a stale copy of that builder — there is no live catalog to ask.
 	const targetSchemaLower = targetSchemaName.toLowerCase();
 	const resolveDeclaredColumn: ResolveColumnInSource = (schema, table, column) => {
 		if (schema !== targetSchemaLower) return false;

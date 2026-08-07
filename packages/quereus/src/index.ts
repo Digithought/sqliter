@@ -243,6 +243,12 @@ export type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from 
 // a table-rename rewrite can hold its resolution-preserving post-condition.
 export { buildObjectRefResolver, snapshotObjectRefResolvers, tableRenameTargetsFor } from './schema/object-ref-resolver.js';
 export type { ObjectRefResolvers } from './schema/object-ref-resolver.js';
+// The `ResolveColumnInSource` half of the same pair, for the same reason: a module
+// rewriting stored bodies must decide "does this inner FROM source expose this column?"
+// exactly as the engine does, or its rewrite and the engine's disagree about which
+// unqualified refs bind where. There is ONE live-catalog definition — do not hand-roll
+// a `getTable(t)?.columnIndexMap.has(col)` copy, which is blind to views.
+export { buildColumnSourceResolver } from './schema/column-source-resolver.js';
 // Reserved-tag namespace surface — `@quereus/quereus-store` keys its sync-replication
 // opt-in off SYNC_REPLICATE_TAG (DRY: one literal) and reads it via getReservedTag.
 // `@quereus/sync` keys its per-table eviction override off SYNC_EVICT_TAG.

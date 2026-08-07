@@ -25,6 +25,7 @@ import {
 	buildCheckConstraintSchema,
 	buildColumnIndexMap,
 	buildForeignKeyConstraintSchema,
+	buildColumnSourceResolver,
 	buildObjectRefResolver,
 	buildUniqueConstraintSchema,
 	columnDefToSchema,
@@ -424,8 +425,11 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// and the engine has already rejected a rename onto an existing column name,
 		// so the reverse pass cannot collide with an expression that legitimately
 		// named it.
-		const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
-			db.schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
+		// The engine's own propagation pass walks these same shared `Expression` nodes with
+		// `buildColumnSourceResolver`, so this hook must use it too: a hand-rolled table-only
+		// lookup answers "no" for a VIEW source, and the two walks then disagree about
+		// whether an unqualified ref inside a subquery binds the view or the owning table.
+		const resolveColumnInSource: ResolveColumnInSource = buildColumnSourceResolver(db);
 		// Planner-parity resolution, snapshotted before this hook's first mutation
 		// (the engine's catalog swap comes later still). A column rename never moves
 		// the table itself, so forward and reverse passes share one target key.
