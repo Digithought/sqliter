@@ -104,6 +104,40 @@ interface TableRef {
 	 * would be wrong or meaningless.
 	 */
 	qualify?: (schemaName: string) => void;
+	/**
+	 * Present only for a reference that binds through a FROM frame — an
+	 * UNALIASED FROM source, or a bare column qualifier bound to one. Answers:
+	 * would giving that source the bare name `next` collide with a qualifier
+	 * visible where the SOURCE sits (a sibling entry in its own FROM frame, a
+	 * sibling's alias, a CTE declared in an enclosing WITH, a binding
+	 * contributed by an enclosing FROM frame) or introducible anywhere BELOW
+	 * its select (a correlated qualifier bound to the source can sit inside an
+	 * inner subquery, where an inner alias / source / CTE of that name would
+	 * capture its new spelling)? Both emit sites must get the same answer, so
+	 * it is evaluated at the source's own frame, never the walk's current
+	 * depth — see {@link qualifierCollidesAt}. Like `qualify`, absence is a
+	 * signal: an aliased source exposes its alias, which a rename never moves,
+	 * so there is no collision to ask about.
+	 */
+	qualifierCollides?: (next: string) => boolean;
+	/**
+	 * FROM-source only, and only for a source with NO author-written alias:
+	 * pin the pre-rename bare name as an explicit alias so qualifiers spelled
+	 * that way keep binding this source. Absent on an aliased source — the
+	 * rename cannot move an alias, so there is nothing to preserve.
+	 */
+	aliasAs?: (aliasName: string) => void;
+	/**
+	 * Present at the sites a CTE can capture the reference the next time the
+	 * body is planned — an unqualified FROM source (any CTE in scope) and an
+	 * unqualified DML target (the statement's own WITH only, mirroring
+	 * `resolveCteTarget`). Answers whether the bare name `next` would bind a
+	 * CTE there rather than the catalog. The catalog resolvers behind the
+	 * rewrite post-condition cannot see CTEs, so this is what makes the sink
+	 * schema-qualify a rewritten reference whose new name a CTE shadows — a
+	 * schema-qualified source or target is never a CTE.
+	 */
+	cteShadows?: (next: string) => boolean;
 }
 
 /** Return `true` to stop the walk early (the read-only probe's short-circuit). */
@@ -125,6 +159,23 @@ interface TableScopeFrame {
 	 * subquery / function source.
 	 */
 	bound: Map<string, { schema: string | undefined; name: string } | null>;
+	/**
+	 * The select this FROM frame spans (set when the select arm pushes it), so
+	 * {@link qualifierCollidesAt} can lazily collect the names the SUBTREE can
+	 * introduce as qualifiers. A qualifier bound to this frame can sit deeper
+	 * than the frame itself — inside a correlated subquery — where an inner
+	 * alias / source / CTE of the new name would capture its new spelling even
+	 * though nothing AT the frame binds that name.
+	 */
+	subtreeRoot?: AST.AstNode;
+	/**
+	 * Lazily memoized {@link collectIntroducedQualifierNames} over
+	 * `subtreeRoot`. Memoization is what keeps the collision predicate a pure
+	 * function of the frame for every consult (source emit and each bound
+	 * qualifier emit), regardless of where in the visit order the first
+	 * consult happens.
+	 */
+	introduced?: Set<string>;
 }
 
 interface TableRefWalkState {
@@ -172,6 +223,18 @@ interface TableRefWalkState {
  *   the schema-authored expressions, which need it neither for correctness nor
  *   for the re-walks they are deliberately subjected to — see that flag.
  *
+ * The post-condition also covers the FROM-frame namespace, not just the
+ * catalog's: inside one body, the bare qualifier an unaliased FROM source
+ * exposes must keep binding that source. When the rename would give a source a
+ * name already visible as a qualifier where it sits ({@link
+ * TableRef.qualifierCollides}), the source pins its pre-rename spelling as an
+ * explicit alias ({@link TableRef.aliasAs}) and every column qualifier bound
+ * through it keeps the old spelling — `from t join u as t2` becomes
+ * `from t2 as t join u as t2` under `t → t2`, with `t.x` untouched. And when
+ * the new name is shadowed by a CTE in scope at the source ({@link
+ * TableRef.cteShadows}) — invisible to the catalog resolvers — the reference
+ * is schema-qualified so it cannot re-bind to the CTE.
+ *
  * Qualification is conditional in both arms, never eager, so the common
  * no-collision rename leaves body text (and a materialized view's `bodyHash`)
  * exactly as before. A qualified reference resolves by passthrough, so its
@@ -204,9 +267,37 @@ export function renameTableInAst(
 	let changed = false;
 	walkTableRefs(node, ref => {
 		if (eq(ref.name, oldName) && resolve(ref.schema, ref.name) === targetKey) {
+			// Qualifier-namespace guard, the FROM-frame twin of the catalog
+			// post-condition below: the bare qualifier an unaliased source
+			// exposes must keep binding that source. When the new name is
+			// already visible as a qualifier where the source sits, the source
+			// takes the new name but pins the OLD spelling as an explicit
+			// alias, and every qualifier bound through it keeps that spelling.
+			// Guarded on a real name change so a case-only rename never
+			// self-collides on the source's own frame entry.
+			//
+			// NOTE: deliberately conservative — the source is aliased whenever
+			// the new name is visible in scope, even when nothing in its
+			// subtree actually spells it. Detecting real use would need a
+			// second pass over the subtree; the extra alias is harmless and
+			// only appears in a genuine collision.
+			const collides = !eq(oldName, newName) && (ref.qualifierCollides?.(newName) ?? false);
+			if (collides && !ref.aliasAs) {
+				// A column qualifier bound to a source the rename is about to
+				// alias: the aliased source keeps exposing the old spelling,
+				// so the qualifier keeps it too. The source's own emit (same
+				// walk, same predicate) is what sets `changed`.
+				return;
+			}
 			ref.setName(newName);
 			changed = true;
-			if (ref.qualify && resolveAfter(ref.schema, newName) !== newTargetKey) {
+			if (collides) ref.aliasAs?.(oldName);
+			// Catalog post-condition — with one addition the catalog resolvers
+			// cannot express: a CTE in scope at the source captures a bare
+			// name before the catalog is ever consulted, so a rewritten
+			// reference whose new name a CTE shadows must be schema-qualified
+			// even when the catalog answer alone would leave it bare.
+			if (ref.qualify && (resolveAfter(ref.schema, newName) !== newTargetKey || (ref.cteShadows?.(newName) ?? false))) {
 				ref.qualify(schemaName);
 			}
 			return;
@@ -433,23 +524,113 @@ function isCteInScope(state: TableRefWalkState, nameLower: string): boolean {
 
 /**
  * Resolve a bare column qualifier innermost-first against the scope stack.
- * Returns the real unaliased table source it binds, `null` when it binds
- * something that is not directly a table name (an alias, a CTE, a subquery /
- * function source), or `undefined` when nothing in scope binds it.
+ * `binding` is the real unaliased table source it binds, or `null` when it
+ * binds something that is not directly a table name (an alias, a CTE, a
+ * subquery / function source); `frameIndex` is the stack index of the frame
+ * that bound it, so the collision predicate can be evaluated at the BINDING
+ * frame's depth — a deeper frame binding the new name is inner to the source
+ * and must not falsely trigger. Returns `undefined` when nothing in scope
+ * binds the qualifier.
  */
 function resolveQualifier(
 	state: TableRefWalkState,
 	qualifierLower: string,
-): { schema: string | undefined; name: string } | null | undefined {
+): { binding: { schema: string | undefined; name: string } | null; frameIndex: number } | undefined {
 	for (let i = state.stack.length - 1; i >= 0; i--) {
 		const frame = state.stack[i];
 		const binding = frame.bound.get(qualifierLower);
-		if (binding !== undefined) return binding;
+		if (binding !== undefined) return { binding, frameIndex: i };
 		// A CTE name in scope shadows the qualifier even without a FROM entry
 		// (mirrors the column walker's rebind scan, which counts `ctesInScope`).
-		if (frame.ctes.has(qualifierLower)) return null;
+		if (frame.ctes.has(qualifierLower)) return { binding: null, frameIndex: i };
 	}
 	return undefined;
+}
+
+/**
+ * Whether `nameLower` is visible as a column qualifier at frame `limit` or any
+ * enclosing frame — a FROM binding (an alias or an unaliased source's name) or
+ * a CTE declaration.
+ */
+function qualifierVisibleUpTo(state: TableRefWalkState, nameLower: string, limit: number): boolean {
+	for (let i = 0; i <= limit && i < state.stack.length; i++) {
+		const frame = state.stack[i];
+		if (frame.bound.has(nameLower) || frame.ctes.has(nameLower)) return true;
+	}
+	return false;
+}
+
+/**
+ * The predicate behind {@link TableRef.qualifierCollides}, evaluated at the
+ * SOURCE's own frame (its FROM frame for the source emit, the binding frame
+ * for a bound column-qualifier emit — the same frame, so the two sites always
+ * agree). `nameLower` collides when it is visible as a qualifier at or above
+ * that frame, OR when the frame's select SUBTREE can introduce it (an inner
+ * alias / source / CTE): a qualifier bound to the source can sit inside a
+ * correlated subquery, where an inner binding of the new name would capture
+ * its new spelling — `select t.x from t where exists (select 1 from other as
+ * t2 where t2.id = t.id)` must not let `t → t2` re-bind the correlation.
+ * Frame state was filled with pre-rewrite names before anything under the
+ * FROM was visited, and the subtree set is memoized on first consult, so
+ * every consult for one frame gets the same answer regardless of visit order.
+ */
+function qualifierCollidesAt(state: TableRefWalkState, nameLower: string, frameIndex: number): boolean {
+	if (qualifierVisibleUpTo(state, nameLower, frameIndex)) return true;
+	const frame = state.stack[frameIndex];
+	if (!frame?.subtreeRoot) return false;
+	frame.introduced ??= collectIntroducedQualifierNames(frame.subtreeRoot);
+	return frame.introduced.has(nameLower);
+}
+
+/**
+ * Every name `root`'s subtree can bind as a column qualifier or capture a FROM
+ * source with, lowercased: FROM source bare names and aliases, subquery /
+ * function-source aliases, CTE names, UPDATE/DELETE correlation names.
+ * Deliberately position-blind and conservative — a name introduced in a
+ * sibling subquery that could never actually shadow the consulted source still
+ * counts, because the only cost of a false positive is a harmless explicit
+ * alias on the renamed source. Structural recursion over plain objects/arrays
+ * so unknown node kinds are walked rather than missed.
+ */
+function collectIntroducedQualifierNames(root: AST.AstNode): Set<string> {
+	const names = new Set<string>();
+	const visit = (node: unknown): void => {
+		if (Array.isArray(node)) {
+			for (const item of node) visit(item);
+			return;
+		}
+		if (node === null || typeof node !== 'object') return;
+		const obj = node as Record<string, unknown>;
+		switch (obj.type) {
+			case 'table': {
+				const ts = obj as unknown as AST.TableSource;
+				names.add((ts.alias ?? ts.table.name).toLowerCase());
+				break;
+			}
+			case 'subquerySource':
+				names.add((obj as unknown as AST.SubquerySource).alias.toLowerCase());
+				break;
+			case 'functionSource': {
+				const alias = (obj as unknown as AST.FunctionSource).alias;
+				if (alias) names.add(alias.toLowerCase());
+				break;
+			}
+			case 'commonTableExpr':
+				names.add((obj as unknown as AST.CommonTableExpr).name.toLowerCase());
+				break;
+			case 'update':
+			case 'delete': {
+				const alias = (obj as unknown as AST.UpdateStmt | AST.DeleteStmt).alias;
+				if (alias) names.add(alias.toLowerCase());
+				break;
+			}
+			default:
+				break;
+		}
+		for (const value of Object.values(obj)) visit(value);
+	};
+	visit(root);
+	return names;
 }
 
 /**
@@ -547,6 +728,10 @@ function visitDmlTarget(
 		// A DML target re-resolves through the catalog when the body is next
 		// planned, so it can carry the post-condition qualifier.
 		qualify: schemaName => { id.schema = schemaName; },
+		// The statement's OWN WITH can capture an unqualified target the rename
+		// gives a member's name (`resolveCteTarget` binds it as a write target);
+		// enclosing statements' CTEs cannot, so only `withClause` is consulted.
+		cteShadows: next => id.schema === undefined && (withClause?.ctes ?? []).some(c => eq(c.name, next)),
 	});
 }
 
@@ -610,6 +795,7 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 			try {
 				const frame = emptyTableFrame();
 				(stmt.from ?? []).forEach(f => collectFromBindings(f, state, frame));
+				frame.subtreeRoot = stmt;
 				state.stack.push(frame);
 				try {
 					(stmt.columns ?? []).forEach(c => {
@@ -703,7 +889,12 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 			// (`main.zap`) is never a CTE. The alias, if any, does not matter here —
 			// `from zap z` still reads the real table.
 			if (!(ts.table.schema === undefined && isCteInScope(state, ts.table.name.toLowerCase()))) {
-				emit(state, {
+				// The top of the stack IS this source's own FROM frame: `case 'table'`
+				// is reachable only from a select's `from` array (directly or through
+				// `join` — UPDATE/DELETE targets are typed `AST.SubquerySource`), and
+				// the select arm pushes the FROM frame before visiting it.
+				const sourceFrameIndex = state.stack.length - 1;
+				const ref: TableRef = {
 					schema: ts.table.schema,
 					name: ts.table.name,
 					setName: next => { ts.table.name = next; },
@@ -714,7 +905,16 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 					// qualified `main.t2` source still exposes the bare qualifier
 					// `t2` to the rows it produces.
 					qualify: schemaName => { ts.table.schema = schemaName; },
-				});
+					// The catalog resolvers cannot see a CTE capturing the new name.
+					cteShadows: next => ts.table.schema === undefined && isCteInScope(state, next.toLowerCase()),
+				};
+				if (ts.alias === undefined) {
+					// Only an unaliased source exposes its own name as a qualifier;
+					// an aliased one exposes the alias, which a rename never moves.
+					ref.qualifierCollides = next => qualifierCollidesAt(state, next.toLowerCase(), sourceFrameIndex);
+					ref.aliasAs = aliasName => { ts.alias = aliasName; };
+				}
+				emit(state, ref);
 			}
 			break;
 		}
@@ -812,8 +1012,8 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 				break;
 			}
 			const qualifierLower = col.table.toLowerCase();
-			const binding = resolveQualifier(state, qualifierLower);
-			if (binding === undefined) {
+			const resolved = resolveQualifier(state, qualifierLower);
+			if (resolved === undefined) {
 				// Nothing in scope binds the qualifier: a seedless expression context
 				// (a CHECK / index-predicate self-qualifier, or correlation the walk
 				// cannot see). Treat as a direct table reference — except the row
@@ -832,21 +1032,28 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 					// planner already rejects. Harmless, arguably an improvement.
 					qualify: schemaName => { col.schema = schemaName; },
 				});
-			} else if (binding !== null) {
+			} else if (resolved.binding !== null) {
 				// Bound by an unaliased real table source: the qualifier IS that
 				// table's name. Report under the SOURCE's identity so a source in
 				// another schema doesn't match by bare name. No `qualify`: this
 				// reference binds through the FROM frame, not the catalog —
 				// qualifying the SOURCE (the `table` case above) is what preserves
 				// resolution; the qualifier just needs the new bare name.
+				const { binding, frameIndex } = resolved;
 				emit(state, {
 					schema: binding.schema,
 					name: binding.name,
 					setName: next => { col.table = next; },
+					// Evaluated at the BINDING frame — the source's own depth — so
+					// this answer always matches the source emit's (same frame,
+					// same memoized subtree set). No `aliasAs`: when this fires,
+					// the sink leaves the qualifier's old spelling in place and
+					// the SOURCE gains the alias that keeps it bound.
+					qualifierCollides: next => qualifierCollidesAt(state, next.toLowerCase(), frameIndex),
 				});
 			}
-			// binding === null: an alias / CTE / subquery / function source — the
-			// qualifier is not a table name; nothing to report.
+			// resolved.binding === null: an alias / CTE / subquery / function source
+			// — the qualifier is not a table name; nothing to report.
 			break;
 		}
 		// Leaf nodes / DDL — nothing to recurse into for our purposes.

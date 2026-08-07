@@ -67,6 +67,11 @@ export interface CatalogTable {
 		backingModuleName?: string;
 		/** Backing-module args; recorded only when non-empty. */
 		backingModuleArgs?: Readonly<Record<string, SqlValue>>;
+		/**
+		 * The live derivation body AST, for the differ's rename-artifact-tolerant
+		 * hash re-compare (see `CatalogView.select`). Read-only to consumers.
+		 */
+		select?: AST.QueryExpr;
 	};
 }
 
@@ -85,6 +90,16 @@ export interface CatalogView {
 	 */
 	definition: string;
 	tags?: Readonly<Record<string, SqlValue>>;
+	/**
+	 * The live body AST behind `definition`. The differ needs it for the
+	 * rename-artifact-tolerant compare (`absorbRenameArtifacts`): the live
+	 * rename propagation can write an engine-authored schema qualifier or FROM
+	 * alias into a stored body, and only a structural walk against the declared
+	 * AST can tell those artifacts from a real edit. Optional so hand-built
+	 * catalogs without it simply skip that tolerance (strict compare). Treated
+	 * as read-only by every consumer — it is the live schema's AST, not a copy.
+	 */
+	select?: AST.QueryExpr;
 }
 
 export interface CatalogIndex {
@@ -128,6 +143,13 @@ export interface CatalogAssertion {
 	 * `CatalogView.definition` / `CatalogIndex.definition`.
 	 */
 	definition: string;
+	/**
+	 * The live CHECK expression AST behind `definition`, for the differ's
+	 * rename-artifact-tolerant compare (see `CatalogView.select`). Absent for
+	 * the hypothetical violationSql-only reconstruction path. Read-only to
+	 * consumers.
+	 */
+	check?: AST.Expression;
 }
 
 /**
@@ -346,6 +368,7 @@ function maintainedDescriptor(table: MaintainedTableSchema): NonNullable<Catalog
 		bodyHash: table.derivation.bodyHash,
 		backingModuleName: backing.storedModuleName,
 		backingModuleArgs: backing.storedModuleArgs,
+		select: table.derivation.selectAst,
 	};
 }
 
@@ -355,6 +378,7 @@ function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 		ddl: viewSchema.sql,
 		definition: viewDefinitionToCanonicalString(viewSchema.columns, viewSchema.selectAst),
 		tags: viewSchema.tags,
+		select: viewSchema.selectAst,
 	};
 }
 
@@ -776,7 +800,8 @@ function assertionSchemaToCatalog(assertionSchema: IntegrityAssertionSchema): Ca
 	return {
 		name: assertionSchema.name,
 		ddl: `CREATE ASSERTION ${qualifiedName} CHECK (${checkSql})`,
-		definition: checkSql
+		definition: checkSql,
+		check: assertionSchema.checkExpression,
 	};
 }
 

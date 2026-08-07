@@ -10,8 +10,8 @@
  * Why not `structuredClone`: `AST.LiteralExpr.value` is typed
  * `MaybePromise<SqlValue>`, and a Promise is not structured-cloneable — a live
  * body carrying one would throw `DataCloneError`. The rewriters only ever assign
- * to string fields (`.name`, `.schema`, `.table`, `.column`) and replace string
- * arrays on plain AST nodes, so copying the plain-object/array spine is enough:
+ * to string fields (`.name`, `.schema`, `.table`, `.column`, `.alias`) and replace
+ * string arrays on plain AST nodes, so copying the plain-object/array spine is enough:
  * every leaf they mutate is freshly owned, and every leaf they do not touch
  * (primitives, `Uint8Array`, `bigint`, class instances, Promises) can safely stay
  * shared.

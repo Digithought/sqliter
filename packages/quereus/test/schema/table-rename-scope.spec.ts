@@ -39,6 +39,8 @@ interface Case {
 	contains?: string[];
 	/** Substrings the rewritten form must still contain UNCHANGED. */
 	preserves?: string[];
+	/** Substrings the rewritten form must NOT contain. */
+	absent?: string[];
 }
 
 const NEW_NAME = 'renamed_tbl';
@@ -221,6 +223,73 @@ const CASES: Case[] = [
 		table: 'zap',
 		referenced: false,
 	},
+	// ── qualifier collisions: the new name is already visible as a qualifier
+	//    where the source sits, so the source pins its old spelling as an alias
+	//    and bound qualifiers keep it (rename-preserves-qualifier-meaning) ──
+	{
+		title: 'collision with a sibling unaliased source — alias pins the old qualifier',
+		sql: 'exists (select zap.k, renamed_tbl.k from zap inner join renamed_tbl on zap.id = renamed_tbl.id)',
+		table: 'zap',
+		referenced: true,
+		contains: ['renamed_tbl as zap'],
+		preserves: ['zap.k', 'renamed_tbl.k', 'zap.id = renamed_tbl.id'],
+	},
+	{
+		title: 'collision with a sibling\'s alias — alias pins the old qualifier',
+		sql: 'exists (select zap.k, renamed_tbl.k from zap inner join other as renamed_tbl on zap.id = renamed_tbl.id)',
+		table: 'zap',
+		referenced: true,
+		contains: ['renamed_tbl as zap'],
+		preserves: ['zap.k', 'other as renamed_tbl'],
+	},
+	{
+		title: 'collision with a CTE the body declares — alias plus schema qualifier (a bare source would bind the CTE)',
+		sql: 'exists (with renamed_tbl as (select 1 as k) select zap.k, renamed_tbl.k from zap inner join renamed_tbl on zap.k = renamed_tbl.k)',
+		table: 'zap',
+		referenced: true,
+		contains: ['main.renamed_tbl as zap'],
+		preserves: ['zap.k', 'renamed_tbl as ('],
+	},
+	{
+		title: 'collision with an ENCLOSING frame\'s qualifier — the inner source aliases, correlation survives',
+		sql: 'exists (select 1 from other as renamed_tbl where exists (select 1 from zap where zap.id = renamed_tbl.id))',
+		table: 'zap',
+		referenced: true,
+		contains: ['renamed_tbl as zap'],
+		preserves: ['zap.id', 'renamed_tbl.id'],
+	},
+	{
+		title: 'an author-aliased source never needs the pin — alias stays, no extra alias',
+		sql: 'exists (select z.k, renamed_tbl.k from zap as z inner join other as renamed_tbl on z.id = renamed_tbl.id)',
+		table: 'zap',
+		referenced: true,
+		contains: ['renamed_tbl as z'],
+		preserves: ['z.k', 'other as renamed_tbl'],
+	},
+	{
+		title: 'no collision — the source takes the bare new name with no alias',
+		sql: 'exists (select zap.k from zap inner join other on zap.id = other.id)',
+		table: 'zap',
+		referenced: true,
+		contains: ['renamed_tbl.k', 'from renamed_tbl'],
+		absent: [' as '],
+	},
+	{
+		title: 'a DEEPER frame binding the new name would capture the correlated qualifier — the source aliases',
+		sql: 'exists (select zap.k from zap where exists (select 1 from other as renamed_tbl where renamed_tbl.id = zap.id))',
+		table: 'zap',
+		referenced: true,
+		contains: ['renamed_tbl as zap'],
+		preserves: ['zap.k', 'renamed_tbl.id = zap.id'],
+	},
+	{
+		title: 'a DML target renamed onto its statement\'s own CTE name is schema-qualified (resolveCteTarget would capture it)',
+		sql: 'exists (with renamed_tbl as (select 1 as k) insert into zap select k from renamed_tbl returning k)',
+		table: 'zap',
+		referenced: true,
+		contains: ['into main.renamed_tbl'],
+		preserves: ['renamed_tbl as ('],
+	},
 ];
 
 describe('table-rename scope rules', () => {
@@ -241,6 +310,9 @@ describe('table-rename scope rules', () => {
 			}
 			for (const s of c.preserves ?? []) {
 				expect(afterBare).to.contain(s);
+			}
+			for (const s of c.absent ?? []) {
+				expect(afterBare).to.not.contain(s);
 			}
 		});
 	}

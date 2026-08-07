@@ -2190,3 +2190,117 @@ drop materialized view temp.mv_c66;
 drop view temp.v_c66;
 drop table temp.k_c66;
 drop table main.k_c66;
+
+-- ===================================
+-- 67. A rename must not change what a body QUALIFIER binds
+-- ===================================
+-- Inside one body, the bare qualifier an unaliased FROM source exposes must
+-- keep binding that source. Renaming a source onto a name already live as a
+-- qualifier in that part of the body pins the pre-rename spelling as an
+-- explicit alias (`from t2 as t`), so `t.x` keeps reading the renamed table
+-- instead of collapsing onto whichever same-spelled source wins.
+
+-- Sibling source in another schema: the join must not become self-referential.
+create table main.qa_c67 (id integer primary key, x integer);
+insert into main.qa_c67 values (1, 10);
+create table temp.qb_c67 (id integer primary key, x integer);
+insert into temp.qb_c67 values (2, 20);
+create view temp.qv_c67 as select qa_c67.x as a, qb_c67.x as b from qa_c67 join temp.qb_c67 on qa_c67.id = qb_c67.id - 1;
+
+select * from temp.qv_c67;
+→ [{"a": 10, "b": 20}]
+
+alter table main.qa_c67 rename to qb_c67;
+
+select * from temp.qv_c67;
+→ [{"a": 10, "b": 20}]
+
+drop view temp.qv_c67;
+drop table temp.qb_c67;
+drop table main.qb_c67;
+-- run
+
+-- Sibling's alias, single schema: b must keep reading the aliased table.
+create table qt_c67 (id integer primary key, x integer);
+insert into qt_c67 values (1, 10);
+create table qu_c67 (id integer primary key, x integer);
+insert into qu_c67 values (1, 77);
+create view qw_c67 as select qt_c67.x as a, z.x as b from qt_c67 join qu_c67 as z on qt_c67.id = z.id;
+
+alter table qt_c67 rename to z;
+
+select * from qw_c67;
+→ [{"a": 10, "b": 77}]
+
+drop view qw_c67;
+drop table qu_c67;
+drop table z;
+-- run
+
+-- CTE the body declares: the renamed source is schema-qualified as well as
+-- aliased (a bare source spelling the CTE's name would bind the CTE outright).
+create table qc_c67 (id integer primary key, x integer);
+insert into qc_c67 values (1, 10);
+create view qcv_c67 as with c as (select 1 as id, 999 as x) select qc_c67.x as a, c.x as b from qc_c67 join c on qc_c67.id = c.id;
+
+alter table qc_c67 rename to c;
+
+select * from qcv_c67;
+→ [{"a": 10, "b": 999}]
+
+drop view qcv_c67;
+drop table c;
+-- run
+
+-- Enclosing frame's qualifier: the correlated EXISTS must stay correlated.
+-- id 7 has no match in the renamed table, so a lost correlation would admit it.
+create table main.qe_c67 (id integer primary key, x integer);
+insert into main.qe_c67 values (1, 10);
+create table temp.qf_c67 (id integer primary key, x integer);
+insert into temp.qf_c67 values (1, 20), (7, 70);
+create view temp.qev_c67 as select qf_c67.x as a from temp.qf_c67 where exists (select 1 from qe_c67 where qe_c67.id = qf_c67.id);
+
+alter table main.qe_c67 rename to qf_c67;
+
+select * from temp.qev_c67 order by a;
+→ [{"a": 20}]
+
+drop view temp.qev_c67;
+drop table temp.qf_c67;
+drop table main.qf_c67;
+-- run
+
+-- Deep capture: an alias of the new name INSIDE a correlated subquery would
+-- capture the outer qualifier's new spelling — the outer source aliases too.
+create table qg_c67 (id integer primary key, x integer);
+insert into qg_c67 values (1, 10), (2, 20);
+create table qh_c67 (id integer primary key);
+insert into qh_c67 values (1);
+create view qgv_c67 as select qg_c67.x from qg_c67 where exists (select 1 from qh_c67 as g2 where g2.id = qg_c67.id);
+
+alter table qg_c67 rename to g2;
+
+select * from qgv_c67;
+→ [{"x": 10}]
+
+drop view qgv_c67;
+drop table qh_c67;
+drop table g2;
+-- run
+
+-- Control: a source that already carries an author alias needs no pin — the
+-- alias is the qualifier and a rename never moves it.
+create table qi_c67 (id integer primary key, x integer);
+insert into qi_c67 values (1, 10);
+create table temp.qj_c67 (id integer primary key, x integer);
+insert into temp.qj_c67 values (1, 20);
+create view temp.qiv_c67 as select tt.x as a, qj_c67.x as b from qi_c67 as tt join temp.qj_c67 on tt.id = qj_c67.id;
+
+alter table qi_c67 rename to qj_c67;
+
+select * from temp.qiv_c67;
+→ [{"a": 10, "b": 20}]
+
+drop view temp.qiv_c67;
+drop table temp.qj_c67;
+drop table main.qj_c67;

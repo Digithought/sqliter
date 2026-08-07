@@ -64,6 +64,7 @@ function catalogView(sql: string): CatalogView {
 		ddl: sql,
 		definition: viewDefinitionToCanonicalString(view.columns, view.select),
 		tags: view.tags,
+		select: view.select,
 	};
 }
 
@@ -78,6 +79,7 @@ function catalogAssertion(sql: string): CatalogAssertion {
 		name: assertion.name.name,
 		ddl: sql,
 		definition: expressionToString(assertion.check),
+		check: assertion.check,
 	};
 }
 
@@ -104,7 +106,7 @@ function catalogMaintainedTable(sql: string, columns: Array<{ name: string; prim
 		primaryKey: columns.filter(c => c.primaryKey).map(c => ({ columnName: c.name, desc: false })),
 		referencedTables: [],
 		namedConstraints: [],
-		maintained: { bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.select)) },
+		maintained: { bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.select)), select: mv.select },
 	};
 }
 
@@ -899,6 +901,133 @@ describe('Schema Differ', () => {
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal(['v']);
 			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id, newc from t where id > 0']);
+		});
+	});
+
+	describe('rename-artifact-tolerant compare (absorbRenameArtifacts)', () => {
+		// The live rename propagation writes two spellings into stored bodies that
+		// a single-schema declaration has no counterpart for: a pin qualifier on a
+		// reference the rename would otherwise capture (`from k` → `from aux.k`)
+		// and an alias on a source whose new name collides with a live qualifier
+		// (`from t` → `from t2 as t`). Neither is an author edit, so neither may
+		// churn a recreate — the recreate would undo the pin.
+
+		it('a live engine-pinned qualifier vs a bare declared reference → no recreate', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main { table k { id integer primary key } view v as select id from k }`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('k', 'id')],
+				[catalogView('create view v as select id from aux.k')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop, 'the pin is an engine artifact, not an edit').to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+		});
+
+		it('a forward-rename FROM alias reconciles as a pure rename (no recreate)', () => {
+			// Live body predates the rename; declared body is the post-rename form
+			// the propagation will write (`t2 as t` keeps `t.x` bound). The inverse
+			// pass maps `t2 as t` → `t as t`, whose alias the compare drops.
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table t2 { id integer primary key, x integer } with tags ("quereus.previous_name" = 't')
+					table u { id integer primary key, x integer }
+					view v as select t.x as a, t2.x as b from t2 as t inner join u as t2 on t.id = t2.id
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'x' }]),
+					catalogTableWithColumns('u', [{ name: 'id', primaryKey: true }, { name: 'x' }]),
+				],
+				[catalogView('create view v as select t.x as a, t2.x as b from t inner join u as t2 on t.id = t2.id')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.renames).to.deep.include({ kind: 'table', oldName: 't', newName: 't2' });
+			expect(diff.viewsToDrop, 'pure rename — the alias is the propagation\'s own artifact').to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+		});
+
+		it('a declared qualifier naming the diff\'s own schema equals the bare live spelling', () => {
+			// Single-schema equivalence: `main.t` and `t` spell the same object in a
+			// main-schema declaration — the declared form a CTE-collision body must
+			// use (`from main.t2 as t` binds the table, bare `t2` would bind the CTE).
+			const declared = parseDeclaredSchema(
+				`declare schema main { table t { id integer primary key } view v as select id from main.t }`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('t', 'id')],
+				[catalogView('create view v as select id from t')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal([]);
+			expect(diff.viewsToCreate).to.deep.equal([]);
+		});
+
+		it('an author-written qualifier naming ANOTHER schema still recreates', () => {
+			// The absorb accepts only live-side qualifiers over bare declared refs and
+			// home-schema declared qualifiers over bare live refs; an explicit foreign
+			// qualifier is an author edit and must drift.
+			const declared = parseDeclaredSchema(
+				`declare schema main { table g { id integer primary key } view vg as select id from temp.g }`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('g', 'id')],
+				[catalogView('create view vg as select id from g')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop).to.deep.equal(['vg']);
+			expect(diff.viewsToCreate).to.have.length(1);
+		});
+
+		it('a genuine edit beside a pinned reference still recreates', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main { table k { id integer primary key } view v as select id from k where id > 0 }`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('k', 'id')],
+				[catalogView('create view v as select id from aux.k')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.viewsToDrop, 'the absorb must not mask a real body edit').to.deep.equal(['v']);
+			expect(diff.viewsToCreate).to.have.length(1);
+		});
+
+		it('assertion twin: a live engine-pinned qualifier does not drift the body', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table k { id integer primary key, x integer }
+					assertion a1 check (not exists (select 1 from k where x < 0))
+				}`
+			);
+			const catalog = makeCatalog(
+				[catalogTable('k', 'id')],
+				[],
+				[catalogAssertion('create assertion a1 check (not exists (select 1 from aux.k where x < 0))')],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			expect(diff.assertionsToDrop, 'recreating would re-bind the bare name').to.deep.equal([]);
+			expect(diff.assertionsToCreate).to.deep.equal([]);
+		});
+
+		it('MV twin: a live engine-pinned qualifier does not force a re-attach', () => {
+			const declared = parseDeclaredSchema(
+				`declare schema main {
+					table k { id integer primary key }
+					materialized view mv as select id from k
+				}`
+			);
+			const catalog = makeCatalog(
+				[
+					catalogTable('k', 'id'),
+					catalogMaintainedTable('create materialized view mv as select id from aux.k'),
+				],
+			);
+			const diff = computeSchemaDiff(declared, catalog);
+			const mvAlter = diff.tablesToAlter.find(t => t.tableName === 'mv');
+			expect(mvAlter?.setMaintained, 'no spurious re-attach of a pinned body').to.be.undefined;
+			expect(mvAlter?.dropMaintained).to.be.undefined;
 		});
 	});
 

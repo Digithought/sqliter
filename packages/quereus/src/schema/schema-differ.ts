@@ -722,6 +722,16 @@ export function computeSchemaDiff(
 		if (definitionDrifted && (tableRenames.renames.length > 0 || columnRenamesByTable.size > 0)) {
 			definitionDrifted = reconciledDeclaredViewDefinition(stmt.columns, stmt.select, tableRenames.renames, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn) !== matchedActual.definition;
 		}
+		if (definitionDrifted && matchedActual.select) {
+			// Last resort: the live body may differ only by the rename
+			// propagation's own artifacts (a pin qualifier / a FROM alias) —
+			// absorbing them must not read as an edit, or the recreate would
+			// undo the pin (see `absorbRenameArtifacts`).
+			definitionDrifted = !declaredViewMatchesModuloRenameArtifacts(
+				stmt.columns, stmt.select, matchedActual.select,
+				canonical => canonical === matchedActual.definition,
+				tableRenames.renames, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn);
+		}
 		if (definitionDrifted) {
 			diff.viewsToDrop.push(matchedActual.name);
 			diff.viewsToCreate.push(createViewToString(applyViewSchemaDefault(stmt, targetSchemaName)));
@@ -901,8 +911,20 @@ export function computeSchemaDiff(
 	for (const [name, declaredAssertion] of declaredAssertions) {
 		const matchedActual = actualAssertions.get(name);
 		const declaredBody = expressionToString(declaredAssertion.assertionStmt.check);
-		if (matchedActual && declaredBody === matchedActual.definition
-			&& !namesDroppedObject(declaredAssertion.assertionStmt.check)) continue;
+		// The raw compare, then the rename-artifact-tolerant one: a live body the
+		// rename propagation pinned (`from k` → `from main.k`) must not read as an
+		// edit — the recreate would plan the bare declared name against the
+		// post-rename catalog and silently re-bind it (see `absorbRenameArtifacts`).
+		// Assertions have no in-diff rename reconciliation to compose with, so the
+		// absorb runs over a plain clone.
+		const bodyMatches = matchedActual !== undefined
+			&& (declaredBody === matchedActual.definition
+				|| (matchedActual.check !== undefined && (() => {
+					const clone = cloneExpr(declaredAssertion.assertionStmt.check);
+					absorbRenameArtifacts(clone, matchedActual.check, targetSchemaName);
+					return expressionToString(clone) === matchedActual.definition;
+				})()));
+		if (bodyMatches && !namesDroppedObject(declaredAssertion.assertionStmt.check)) continue;
 		// Drift on a name match: drop the old one first (creates run later, see
 		// `generateMigrationDDL`), then recreate from the declaration.
 		if (matchedActual) diff.assertionsToDrop.push(matchedActual.name);
@@ -1470,38 +1492,29 @@ function inverseRenamedViewParts(
 	const resolveRef = singleSchemaObjectRefResolver(schemaName);
 	for (const r of tableRenames) {
 		// Single-schema world: a bare name always resolves back to this schema,
-		// so `resolveAfter === resolve` and no qualification ever fires.
+		// so `resolveAfter === resolve` and no CATALOG qualification ever fires
+		// here (a CTE-shadow qualification still can — see `renameTableInAst` —
+		// which is fine: the declared body needs the same spelling to mean the
+		// real table, and `absorbRenameArtifacts` drops it when the actual side
+		// is bare).
 		//
-		// NOTE: the FORWARD live rename can still leave a qualifier behind that this
-		// walk has no declared counterpart for, in either arm of its post-condition
-		// (see `renameTableInAst`):
-		//   - on the REWRITTEN reference — `alter table main.t rename to t2` writes
-		//     `main.t2` into a temp-owned body when `temp.t2` exists;
-		//   - on an UNTOUCHED reference — `alter table temp.other rename to k` writes
-		//     `main.k` over a temp-owned body's bare `k`, whose text never mentioned
-		//     the renamed table at all.
-		// A declared form of EITHER body would read the bare name, so re-diffing it
-		// reads as a body change and would emit a recreate back to the re-binding
-		// spelling. The two arms differ in whether that is reachable:
-		//   - REWRITTEN arm: unreachable. It qualifies to `schemaName`, and that only
-		//     fires when an EARLIER schema on the body's home path holds the new name
-		//     — impossible when the body's home schema IS the renamed table's, since a
-		//     home schema leads its own path. A diff covers one schema at a time, so
-		//     the two always coincide here. If declarative schemas ever span schemas,
-		//     this walk needs to accept a qualifier equal to `schemaName` as equivalent
-		//     to the bare declared name.
-		//   - UNTOUCHED arm: REACHABLE, and it does not need two schemas in the diff.
-		//     It qualifies to the schema the reference resolved to BEFORE — a LATER
-		//     one on the home path, never `schemaName` — so `declare schema temp` over
-		//     a `temp`-owned view reading bare `k` (meaning `main.k`), renaming
-		//     `temp.other` to `k`, leaves the live body reading `main.k` while the
-		//     declared form reads bare `k`. Measured: `apply schema temp` then
-		//     `diff schema temp` returns a DROP + recreate, so apply no longer
-		//     converges in one pass and a second apply undoes the pin. Accepting a
-		//     qualifier as equivalent to the bare declared name does NOT fix this one
-		//     — the declared single-schema world genuinely reads `k` as `temp.k`.
-		//     Tracked as an arm of `rename-preserves-qualifier-meaning`, which has to
-		//     teach this walk about forward-rename artifacts anyway.
+		// NOTE: the FORWARD live rename can leave spellings in a stored body that
+		// a single-schema declared form has no counterpart for, and BOTH arms of
+		// its post-condition are reachable without a second schema in the diff:
+		//   - the REWRITTEN reference can gain an ALIAS (`from t` → `from t2 as t`
+		//     when a sibling/CTE already exposes `t2`) and, in the CTE case, a
+		//     schema qualifier equal to this diff's own schema;
+		//   - an UNTOUCHED reference can gain a PIN qualifier naming a LATER
+		//     schema on the body's home path (`from k` → `from main.k` after
+		//     `alter table temp.other rename to k`), with no rename in the
+		//     re-diff at all.
+		// This walk deliberately stays single-schema for resolution; the artifact
+		// gap is closed at COMPARE time instead — callers run
+		// `absorbRenameArtifacts` over the clone this pass returns (or over a
+		// plain clone when no renames are in play) before the canonical-string /
+		// hash compare, normalizing the declared side toward the actual spelling
+		// exactly where the two are equivalent. Recreate DDL renders
+		// (`columnReconciledViewStmt`) never absorb — they must stay as-authored.
 		renameTableInAst(selectClone, {
 			oldName: r.newName, newName: r.oldName, schemaName,
 			resolve: resolveRef, resolveAfter: resolveRef,
@@ -1518,6 +1531,119 @@ function inverseRenamedViewParts(
 		}
 	}
 	return selectClone;
+}
+
+/** A plain AST node object (arrays and non-plain prototypes excluded). */
+function isPlainAstObject(v: unknown): v is Record<string, unknown> {
+	if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+	const proto = Object.getPrototypeOf(v);
+	return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Compare-time normalization of the spellings the LIVE rename propagation can
+ * write into a stored body that a declared (single-schema) body has no
+ * counterpart for — see `renameTableInAst`'s post-condition:
+ *
+ * - an engine-authored SCHEMA QUALIFIER pinning what a reference resolved to
+ *   before a rename created a capturing name (`from k` → `from main.k`), and
+ * - an engine-authored FROM ALIAS pinning the qualifier a renamed source used
+ *   to expose (`from t` → `from t2 as t`).
+ *
+ * Walks the declared body (already a throwaway clone — the inverse pass's) and
+ * the actual live body in structural lockstep and rewrites the DECLARED side
+ * toward the actual spelling exactly where the two are equivalent:
+ *
+ * - copies an actual-side schema qualifier onto an unqualified declared
+ *   reference (accept the engine pin);
+ * - drops a declared-side qualifier equal to the diff's own schema when the
+ *   actual side is bare (in the single-schema declared world `main.t` and `t`
+ *   spell the same object — the declared form a CTE-collision body must use);
+ * - drops a declared-side FROM alias equal to the source's own bare name when
+ *   the actual side carries none (`from t as t` ≡ `from t`, the shape the
+ *   inverse table pass leaves behind when it un-renames an aliased source).
+ *
+ * Sound because every caller string- or hash-compares the full canonical
+ * render afterwards: a rewrite at a genuinely-edited site cannot manufacture
+ * equality (every other byte still has to match), it only stops an artifact
+ * from masking it. Applied ONLY to compares, never to recreate DDL renders.
+ *
+ * NOTE: accepted tradeoff — a declared body that merely UN-qualifies a
+ * reference the live side carries qualified reads as unchanged, so apply
+ * preserves the live pin (the rename series' invariant: an unedited body keeps
+ * meaning what it meant). A metadata-free compare cannot distinguish that edit
+ * from the engine's own pin; an author who wants the re-bound meaning says so
+ * with an explicit qualifier (`temp.k`), which drifts and recreates. Revisit
+ * only if pins ever gain durable provenance metadata.
+ */
+function absorbRenameArtifacts(declared: unknown, actual: unknown, schemaName: string): void {
+	if (Array.isArray(declared) && Array.isArray(actual)) {
+		const n = Math.min(declared.length, actual.length);
+		for (let i = 0; i < n; i++) absorbRenameArtifacts(declared[i], actual[i], schemaName);
+		return;
+	}
+	if (!isPlainAstObject(declared) || !isPlainAstObject(actual)) return;
+	if (typeof declared.type === 'string' && declared.type === actual.type) {
+		// Exactly the sites the forward walk can qualify or alias: a FROM source,
+		// a DML target, a schema-qualifiable column reference. Nothing else (e.g.
+		// a function name) absorbs, so an author edit elsewhere still drifts.
+		if (declared.type === 'table') {
+			const d = declared as unknown as AST.TableSource;
+			const a = actual as unknown as AST.TableSource;
+			reconcileSchemaQualifier(d.table, a.table, schemaName);
+			if (d.alias !== undefined && a.alias === undefined && d.alias.toLowerCase() === d.table.name.toLowerCase()) {
+				d.alias = undefined;
+			}
+		} else if (declared.type === 'insert' || declared.type === 'update' || declared.type === 'delete') {
+			const d = declared as unknown as { table?: AST.IdentifierExpr };
+			const a = actual as unknown as { table?: AST.IdentifierExpr };
+			if (d.table && a.table) reconcileSchemaQualifier(d.table, a.table, schemaName);
+		} else if (declared.type === 'column') {
+			reconcileSchemaQualifier(declared as unknown as AST.ColumnExpr, actual as unknown as AST.ColumnExpr, schemaName);
+		}
+	}
+	for (const key of Object.keys(declared)) {
+		if (key in actual) absorbRenameArtifacts(declared[key], actual[key], schemaName);
+	}
+}
+
+/** The qualifier half of {@link absorbRenameArtifacts}, shared by its three site kinds. */
+function reconcileSchemaQualifier(
+	declared: { schema?: string },
+	actual: { schema?: string },
+	schemaName: string,
+): void {
+	if (declared.schema === undefined && typeof actual.schema === 'string') {
+		declared.schema = actual.schema;
+	} else if (declared.schema !== undefined && actual.schema === undefined
+		&& declared.schema.toLowerCase() === schemaName.toLowerCase()) {
+		declared.schema = undefined;
+	}
+}
+
+/**
+ * Whether the declared view definition matches the actual one once in-diff
+ * renames are inverse-applied AND the live rename propagation's artifacts are
+ * absorbed ({@link absorbRenameArtifacts}). The last-resort compare behind the
+ * raw and rename-reconciled ones: it is what lets a body the propagation
+ * pinned (`from main.k`) or aliased (`from t2 as t`) re-diff clean against its
+ * unedited declared form instead of churning a recreate that would undo the
+ * pin. Requires the actual body AST (`CatalogView.select` /
+ * `CatalogTable.maintained.select`); without it callers keep the strict answer.
+ */
+function declaredViewMatchesModuloRenameArtifacts(
+	columns: ReadonlyArray<string> | undefined,
+	select: AST.QueryExpr,
+	actualSelect: AST.QueryExpr,
+	matches: (canonical: string) => boolean,
+	tableRenames: ReadonlyArray<RenameOp>,
+	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	schemaName: string,
+	resolveDeclaredColumn: ResolveColumnInSource,
+): boolean {
+	const reconciled = inverseRenamedViewParts(select, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
+	absorbRenameArtifacts(reconciled, actualSelect, schemaName);
+	return matches(viewDefinitionToCanonicalString(columns, reconciled));
 }
 
 /**
@@ -2282,7 +2408,7 @@ function applyMaintainedTransition(
 	}
 	// Both maintained — compare the canonical body hash (reconciling in-diff renames
 	// so a pure source rename converges via the rename propagation, not a re-attach).
-	if (maintainedBodyMatches(declaredMaintained!, liveMaintained!.bodyHash, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) {
+	if (maintainedBodyMatches(declaredMaintained!, liveMaintained!, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) {
 		return; // no derivation change → no churn
 	}
 	// Body drift → re-attach. A concurrent shape change (column / PK / constraint
@@ -2313,13 +2439,14 @@ function applyMaintainedTransition(
  */
 function maintainedBodyMatches(
 	declared: AST.MaintainedClause,
-	liveBodyHash: string,
+	liveMaintained: NonNullable<CatalogTable['maintained']>,
 	tableRenames: ReadonlyArray<RenameOp>,
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
 	/** Declared-side column-existence resolver for the seeded defaults-expr rewrites (see `computeSchemaDiff`). */
 	resolveDeclaredColumn: ResolveColumnInSource,
 ): boolean {
+	const liveBodyHash = liveMaintained.bodyHash;
 	const hasRenames = tableRenames.length > 0 || columnRenamesByTable.size > 0;
 	// The single as-authored form: implicit (`undefined`) for a sugar / verb-attached
 	// body, or the explicit declared rename list. Both create and re-attach record the
@@ -2331,6 +2458,16 @@ function maintainedBodyMatches(
 		if (computeBodyHash(viewDefinitionToCanonicalString(columns, declared.select)) === liveBodyHash) return true;
 		if (hasRenames
 			&& computeBodyHash(reconciledDeclaredViewDefinition(columns, declared.select, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) === liveBodyHash) {
+			return true;
+		}
+		// Last resort, mirroring the plain-view compare: the live body may differ
+		// only by the rename propagation's pin qualifier / FROM alias — absorbing
+		// those must not read as a body edit, or the re-attach would undo the pin.
+		if (liveMaintained.select
+			&& declaredViewMatchesModuloRenameArtifacts(
+				columns, declared.select, liveMaintained.select,
+				canonical => computeBodyHash(canonical) === liveBodyHash,
+				tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) {
 			return true;
 		}
 	}

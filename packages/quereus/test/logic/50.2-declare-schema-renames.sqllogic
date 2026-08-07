@@ -858,3 +858,92 @@ diff schema main;
 
 drop table dnw_t;
 drop table "new";
+
+-- ===================================
+-- 26. A rename that PINS an untouched dependent body must converge in one apply
+-- ===================================
+-- The declared rename creates a temp.k26 where the temp-owned view's bare k26
+-- used to fall through to main.k26. The live propagation pins the view body to
+-- main.k26; the re-diff must read that pin as the rename's own artifact — NOT a
+-- body edit — or the recreate would silently re-bind the view to temp.k26.
+
+create table main.k26 (id integer primary key, x integer);
+insert into main.k26 values (1, 10);
+create table temp.o26 (id integer primary key, x integer);
+insert into temp.o26 values (99, 999);
+create view temp.v26 as select id, x from k26;
+
+declare schema temp {
+	table k26 {
+		id integer primary key,
+		x integer
+	} with tags ("quereus.previous_name" = 'o26')
+	view v26 as select id, x from k26
+}
+
+-- run
+
+diff schema temp;
+→ [{"ddl": "ALTER TABLE \"temp\".o26 RENAME TO k26"}]
+
+apply schema temp;
+
+-- run
+
+-- One pass converged: no drop+recreate of the pinned view.
+diff schema temp;
+→ []
+
+-- And the view still reads main.k26, not the table that took its name.
+select * from temp.v26;
+→ [{"id": 1, "x": 10}]
+
+drop view temp.v26;
+drop table temp.k26;
+drop table main.k26;
+
+-- ===================================
+-- 27. A rename whose propagation ALIASES a colliding FROM source re-diffs clean
+-- ===================================
+-- Single schema: the view reads t27 bare AND aliases u27 as t27's new name, so
+-- the forward rename writes `from t27_2 as t27` to keep both qualifiers bound.
+-- The declared (post-rename) body carries that alias; the diff must recognize a
+-- pure rename, and the re-diff after apply must be empty.
+
+create table t27 (id integer primary key, x integer);
+insert into t27 values (1, 10);
+create table u27 (id integer primary key, x integer);
+insert into u27 values (1, 77);
+create view v27 as select t27.x as a, t27_2.x as b from t27 join u27 as t27_2 on t27.id = t27_2.id;
+
+declare schema main {
+	table t27_2 {
+		id integer primary key,
+		x integer
+	} with tags ("quereus.previous_name" = 't27')
+	table u27 {
+		id integer primary key,
+		x integer
+	}
+	view v27 as select t27.x as a, t27_2.x as b from t27_2 as t27 inner join u27 as t27_2 on t27.id = t27_2.id
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE t27 RENAME TO t27_2"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+-- Both qualifiers still bind what they bound before the rename.
+select * from v27;
+→ [{"a": 10, "b": 77}]
+
+drop view v27;
+drop table u27;
+drop table t27_2;

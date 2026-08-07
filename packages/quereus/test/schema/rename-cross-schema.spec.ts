@@ -578,6 +578,47 @@ describe('rename rewrite post-condition (conditional qualification at the walker
 	});
 
 	/**
+	 * The qualifier-namespace side of the same post-condition
+	 * (rename-preserves-qualifier-meaning): when the new name is already a live
+	 * qualifier where the source sits, the source pins its old spelling as an
+	 * alias and bound qualifiers keep it. Composes with the catalog arm — the
+	 * alias and the schema qualifier are independent.
+	 */
+	describe('qualifier collisions pin the old spelling as an alias', () => {
+		it('sibling source in another schema: alias and schema qualifier compose', () => {
+			const text = rewritten('exists (select t.x, t2.x from t inner join temp.t2 on t.id = t2.id)', collisionTarget);
+			expect(text).to.contain('main.t2 as t');
+			expect(text, 'bound qualifier keeps the old spelling').to.contain('t.x');
+			expect(text, 'the sibling source is untouched').to.contain('temp.t2');
+		});
+
+		it('sibling alias, no catalog collision: alias alone, no qualifier churn', () => {
+			const text = rewritten('exists (select t.x, t2.x from t inner join u as t2 on t.id = t2.id)', freeTarget);
+			expect(text).to.contain('t2 as t');
+			expect(text).to.not.contain('main.');
+			expect(text).to.contain('t.x');
+		});
+
+		it('CTE collision: the source schema-qualifies even though the catalog answer is free (a bare source would bind the CTE)', () => {
+			const text = rewritten('exists (with t2 as (select 1 as id) select t.x from t inner join t2 on t.id = t2.id)', freeTarget);
+			expect(text).to.contain('main.t2 as t');
+			expect(text).to.contain('t.x');
+		});
+
+		it('enclosing-frame collision: the inner source aliases, correlation survives', () => {
+			const text = rewritten('exists (select 1 from temp.t2 where exists (select 1 from t where t.id = t2.id))', freeTarget);
+			expect(text).to.contain('t2 as t');
+			expect(text, 'correlated comparison keeps both spellings').to.contain('t.id = t2.id');
+		});
+
+		it('no collision: no alias is pinned', () => {
+			const text = rewritten('exists (select t.x from t inner join u on t.id = u.id)', freeTarget);
+			expect(text).to.contain('t2.x');
+			expect(text).to.not.contain('as t');
+		});
+	});
+
+	/**
 	 * The UNTOUCHED arm of the same post-condition: the rename also CREATES a
 	 * name, and that name can capture a reference the walk never rewrote. Models
 	 * the measured case — `alter table temp.other rename to k` under a temp-owned
@@ -938,5 +979,106 @@ describe('rename preserves what an untouched reference resolves to (new-name cap
 		const before = viewSql('temp', 'vu');
 		await db.exec('alter table temp.other rename to k');
 		expect(viewSql('temp', 'vu')).to.equal(before);
+	});
+});
+
+/**
+ * Engine level: a rename must not change what a body's QUALIFIERS bind
+ * (rename-preserves-qualifier-meaning). Renaming an unaliased FROM source onto
+ * a name already live as a qualifier in that part of the body pins the
+ * pre-rename spelling as an explicit alias, so `t.x` keeps reading the renamed
+ * table instead of collapsing onto whichever same-spelled source wins. Each
+ * case asserts the ticket's measured before/after row sets.
+ */
+describe('rename preserves what a body qualifier binds (qualifier collisions)', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table main.t (id integer primary key, x integer)');
+		await db.exec('insert into main.t values (1, 10)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const viewSql = (schema: string, name: string): string =>
+		db.schemaManager.getSchema(schema)!.getView(name)!.sql.replace(/"/g, '');
+
+	async function rows(sql: string): Promise<unknown[]> {
+		const out: unknown[] = [];
+		for await (const r of db.eval(sql)) out.push(r);
+		return out;
+	}
+
+	it('2a: collision with a sibling FROM source in another schema', async () => {
+		await db.exec('create table temp.t2 (id integer primary key, x integer)');
+		await db.exec('insert into temp.t2 values (2, 20)');
+		await db.exec('create view temp.v as select t.x as a, t2.x as b from t join temp.t2 on t.id = t2.id - 1');
+		expect(await rows('select * from temp.v')).to.deep.equal([{ a: 10, b: 20 }]);
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('temp', 'v')).to.contain('main.t2 as t');
+		expect(await rows('select * from temp.v'), 'the join must not become self-referential')
+			.to.deep.equal([{ a: 10, b: 20 }]);
+	});
+
+	it('2b: collision with a sibling\'s alias (single schema)', async () => {
+		await db.exec('create table main.u (id integer primary key, x integer)');
+		await db.exec('insert into main.u values (1, 77)');
+		await db.exec('create view temp.v as select t.x as a, t2.x as b from t join u as t2 on t.id = t2.id');
+		expect(await rows('select * from temp.v')).to.deep.equal([{ a: 10, b: 77 }]);
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('temp', 'v')).to.contain('t2 as t');
+		expect(await rows('select * from temp.v'), 'b must keep reading u through its alias')
+			.to.deep.equal([{ a: 10, b: 77 }]);
+	});
+
+	it('2c: collision with a CTE the body declares — alias plus schema qualifier', async () => {
+		await db.exec('create view temp.v as with t2 as (select 1 as id, 999 as x) select t.x as a, t2.x as b from t join t2 on t.id = t2.id');
+		expect(await rows('select * from temp.v')).to.deep.equal([{ a: 10, b: 999 }]);
+		await db.exec('alter table main.t rename to t2');
+		// A bare `t2` source would bind the CTE, so the renamed source must be
+		// schema-qualified as well as aliased.
+		expect(viewSql('temp', 'v')).to.contain('main.t2 as t');
+		expect(await rows('select * from temp.v'), 'a reads the table, b reads the CTE — as before')
+			.to.deep.equal([{ a: 10, b: 999 }]);
+	});
+
+	it('2e: collision with an ENCLOSING frame\'s qualifier — correlation survives', async () => {
+		await db.exec('create table temp.t2 (id integer primary key, x integer)');
+		await db.exec('insert into temp.t2 values (1, 20), (7, 70)'); // id 7 has no main.t match
+		await db.exec('create view temp.v as select t2.x as a from temp.t2 where exists (select 1 from t where t.id = t2.id)');
+		expect(await rows('select * from temp.v order by a')).to.deep.equal([{ a: 20 }]);
+		await db.exec('alter table main.t rename to t2');
+		expect(await rows('select * from temp.v order by a'), 'the EXISTS must stay correlated to the outer t2')
+			.to.deep.equal([{ a: 20 }]);
+	});
+
+	it('deep capture: an inner alias of the new name would capture the correlated qualifier — the source aliases', async () => {
+		await db.exec('insert into main.t values (2, 20)');
+		await db.exec('create table main.other (id integer primary key)');
+		await db.exec('insert into main.other values (1)');
+		await db.exec('create view main.v as select t.x from t where exists (select 1 from other as t2 where t2.id = t.id)');
+		expect(await rows('select * from main.v')).to.deep.equal([{ x: 10 }]);
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('main', 'v')).to.contain('t2 as t');
+		expect(await rows('select * from main.v'), 'the correlation to the outer source must survive')
+			.to.deep.equal([{ x: 10 }]);
+	});
+
+	it('2d control: a source that already carries an author alias stays correct with no extra alias', async () => {
+		await db.exec('create table temp.t2 (id integer primary key, x integer)');
+		await db.exec('insert into temp.t2 values (1, 20)');
+		await db.exec('create view temp.v as select tt.x as a, t2.x as b from t as tt join temp.t2 on tt.id = t2.id');
+		expect(await rows('select * from temp.v')).to.deep.equal([{ a: 10, b: 20 }]);
+		await db.exec('alter table main.t rename to t2');
+		expect(viewSql('temp', 'v')).to.contain('main.t2 as tt');
+		expect(await rows('select * from temp.v')).to.deep.equal([{ a: 10, b: 20 }]);
+	});
+
+	it('control: a rename with no collision leaves the body alias-free and byte-stable', async () => {
+		await db.exec('create table main.u (id integer primary key, y integer)');
+		await db.exec('create view main.v as select t.x as a, u.y as b from t join u on t.id = u.id');
+		await db.exec('alter table main.t rename to t9');
+		const sql = viewSql('main', 'v');
+		expect(sql).to.contain('t9.x');
+		expect(sql, 'no alias pinned when nothing collides').to.not.contain('as t');
 	});
 });
