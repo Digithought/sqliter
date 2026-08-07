@@ -54,6 +54,33 @@ alter table t drop column x;      -- accepted; should be refused
 Assertions are recompiled on any commit that touched any table, so the orphaned
 assertion then blocks writes to tables it has nothing to do with.
 
+## Second arm — a bare column ref over a subquery source (RENAME only)
+
+Found while writing the spelling matrix for `column-scope-walk-binds-aliased-sources`
+(`packages/quereus/test/schema/column-scope-body-spellings.spec.ts`). Same root
+site, same fix; recorded here rather than as its own ticket.
+
+A star is not required. An **outer bare column reference** whose only binding is
+a subquery source is equally invisible, because the source registers no
+qualifier:
+
+```sql
+create table t (id integer primary key, x integer);
+create view v as select id, x from (select id, x from t) s;
+
+alter table t rename column x to z;
+select * from v;                  -- ERROR: Column not found: x
+```
+
+The rename rewrites the INNER `select id, x from t` (that select gets its own
+scope frame, where `t` is bound normally) but leaves the OUTER `x` alone, so the
+view is left projecting a name its own source no longer publishes.
+
+The two verbs part company on this shape, which is worth knowing when the fix
+lands: the DROP guard **does** refuse here, because the inner select spells the
+column in a frame the walk can see. So it is only `RENAME COLUMN` that is blind.
+Pinned as a pending rename-arm cell in the spec above.
+
 ## Not affected
 
 A star over a **CTE** source is already correct — the CTE exposure analysis

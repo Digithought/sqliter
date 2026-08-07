@@ -1514,3 +1514,86 @@ alter table "new" drop column v;
 drop table DcNwRef;
 drop table "new";
 -- run
+
+-- ===================================================================
+-- 38. An ALIASED FROM source keeps its columns in scope
+-- ===================================================================
+--
+-- A FROM alias adds a qualifier; it does not take the source's columns out of
+-- scope, so a bare `x` written against `from t a` binds `t.x` exactly as it
+-- would against `from t`. The scope walk used to treat an aliased source as
+-- contributing nothing to unqualified resolution, so this drop was ACCEPTED and
+-- the orphaned assertion then failed every write to the whole database with
+-- `Column not found: x`.
+
+create table DcAl (id integer primary key, x integer);
+create table DcAlBy (id integer primary key);
+create assertion dc_al check (not exists (select 1 from DcAl a where x < 0));
+-- run
+
+alter table DcAl drop column x;
+-- error: it is referenced by assertion 'dc_al'
+
+-- The database is still writable, which is the whole point of refusing.
+insert into DcAlBy values (1);
+commit;
+select count(*) as c from DcAlBy;
+→ [{"c":1}]
+
+drop assertion dc_al;
+drop table DcAl;
+drop table DcAlBy;
+-- run
+
+-- The republication arm: a view that re-exposes the column through a bare star
+-- over an aliased source is a republisher like any other, so a rule reading it
+-- blocks the drop even though no body spells the column's name.
+create table DcAlS (id integer primary key, x integer);
+create view DcAlSV as select * from DcAlS a;
+create assertion dc_als check (not exists (select 1 from DcAlSV where x < 0));
+-- run
+
+-- No chain in the message: the fixpoint makes DcAlSV a republication TARGET, so the
+-- assertion's own body names the column directly against it — the same shape §31
+-- pins for `select *` / `select t.*` over an unaliased source.
+alter table DcAlS drop column x;
+-- error: it is referenced by assertion 'dc_als'
+
+drop assertion dc_als;
+drop view DcAlSV;
+drop table DcAlS;
+-- run
+
+-- ...and the CHECK arm of the same shape, under a join whose renamed side carries
+-- the alias.
+create table DcAlJ (id integer primary key, x integer);
+create table DcAlJU (id integer primary key, n integer);
+create table DcAlJRef (id integer primary key, n integer,
+                       constraint ck_dcalj check (n < (select max(x)
+                                                       from DcAlJ a join DcAlJU u on a.id = u.id)));
+-- run
+
+alter table DcAlJ drop column x;
+-- error: CHECK constraint 'ck_dcalj' on table 'DcAlJRef'
+
+drop table DcAlJRef;
+drop table DcAlJU;
+drop table DcAlJ;
+-- run
+
+-- Guard rail: widening the binding must not start capturing a bare name that
+-- legitimately binds somewhere ELSE. Here the rule's `x` binds the aliased `DcAlO`,
+-- not the altered table, so dropping DcAlN.x is still legal.
+create table DcAlN (id integer primary key, x integer);
+create table DcAlO (id integer primary key, x integer);
+create assertion dc_aln check (not exists (select 1 from DcAlO b where x < 0));
+-- run
+
+alter table DcAlN drop column x;
+select count(*) as c from DcAlN;
+→ [{"c":0}]
+
+drop assertion dc_aln;
+drop table DcAlO;
+drop table DcAlN;
+-- run

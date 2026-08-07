@@ -16,8 +16,10 @@ import type { ResolveColumnInSource, ResolveObjectRef } from './rename-rewriter.
  * A source may be a TABLE (a maintained table included — its backing columns are
  * real) or a VIEW. A view exposes a column when its explicit column list names it,
  * or — with no list — when its body publishes it ({@link bodyPublishesColumnNamed}:
- * an alias, an unaliased bare projection, or a `*` / `t.*` over a source that
- * exposes it). The view arm recurses through this same resolver, so a view over a
+ * a result-column alias, a bare projection, or a `*` / `t.*` / `a.*` over a source
+ * that exposes it — a FROM alias only changes which qualifier names the source, so
+ * `select * from t a` publishes exactly what `select * from t` does). The view arm
+ * recurses through this same resolver, so a view over a
  * view answers too; views cannot be recursive, so the per-question in-flight set is
  * insurance against a malformed catalog, the same role the visited set plays in
  * `reachableObjects`.

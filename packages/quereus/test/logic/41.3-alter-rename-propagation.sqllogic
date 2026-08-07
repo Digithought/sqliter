@@ -2021,3 +2021,61 @@ select id, w from b_c64;
 drop view vw_c64;
 drop table c_c64;
 drop table b_c64;
+
+-- ===================================
+-- 65. RENAME COLUMN follows through an ALIASED FROM source
+-- ===================================
+-- A FROM alias adds a qualifier; it does not take the source's columns out of
+-- scope. So a bare `x` under `from t a` binds `t.x` and must follow the rename,
+-- and a bare star over an aliased source republishes like any other star — the
+-- cascade re-targets on it. Before the scope walk bound aliased sources, both
+-- bodies were left naming a column that no longer existed and every read of the
+-- view failed with `Column not found: x`.
+
+create table al_c65 (id integer primary key, x integer);
+insert into al_c65 values (1, 5);
+
+-- Bare ref under an alias, and a star over an aliased source.
+create view alv_c65 as select id, x from al_c65 a;
+create view als_c65 as select * from al_c65 a;
+-- A second-level reader pins the CASCADE: als_c65's published name shifts, so
+-- this body must be re-targeted too.
+create view alr_c65 as select x from als_c65;
+-- run
+
+alter table al_c65 rename column x to z;
+
+select id, z from alv_c65;
+→ [{"id":1,"z":5}]
+
+select id, z from als_c65;
+→ [{"id":1,"z":5}]
+
+select z from alr_c65;
+→ [{"z":5}]
+
+drop view alr_c65;
+drop view als_c65;
+drop view alv_c65;
+drop table al_c65;
+-- run
+
+-- Guard rail: the widened binding must not capture a bare name that binds
+-- elsewhere. The inner `x` here belongs to the aliased alo_c65, so the rename of
+-- ali_c65.x must leave it alone and the view must keep planning.
+create table ali_c65 (id integer primary key, x integer);
+create table alo_c65 (id integer primary key, x integer);
+insert into ali_c65 values (1, 5);
+insert into alo_c65 values (1, 9);
+create view alg_c65 as select id, (select max(x) from alo_c65 b) as m from ali_c65;
+-- run
+
+alter table ali_c65 rename column x to z;
+
+select id, m from alg_c65;
+→ [{"id":1,"m":9}]
+
+drop view alg_c65;
+drop table alo_c65;
+drop table ali_c65;
+-- run
