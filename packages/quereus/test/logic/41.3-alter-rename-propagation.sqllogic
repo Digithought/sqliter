@@ -1877,6 +1877,9 @@ insert into nwdf_c62 (id, v) values (1, 4);
 alter table "new" rename column v to w;
 
 -- Both tables still writable: their qualifiers still name their own row images.
+-- (No generated-body arm: a generated expression rejects the `new.` qualifier
+-- outright — `new.v isn't a column` — so it cannot carry a foreign row image.
+-- The walker-level cell is pinned by test/schema/row-image-context-matrix.spec.ts.)
 insert into nwck_c62 values (2, 7);
 insert into nwdf_c62 (id, v) values (2, 9);
 select id, d from nwdf_c62 order by id;

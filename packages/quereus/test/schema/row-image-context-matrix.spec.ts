@@ -101,6 +101,9 @@ const exprSites: readonly Site[] = [
 		expected: ALL,
 	},
 	{
+		// Walker-level only: the engine rejects a `new.` qualifier in a generated
+		// body outright (`new.v isn't a column`), so this cell pins the helper's
+		// contract rather than a shape a user can author today.
 		name: 'own GENERATED body (collection helper)',
 		rewrite: e => renameColumnInColumnExpressions([{ generatedExpr: e }], 'new', 'v', 'w', resolve, NEW_KEY),
 		expected: ALL,

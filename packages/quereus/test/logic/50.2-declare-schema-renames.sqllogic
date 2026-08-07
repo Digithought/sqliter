@@ -806,3 +806,55 @@ diff schema main;
 
 drop table dt_t;
 drop table dt_u2;
+
+-- ===================================
+-- 25. In-diff COLUMN rename of a table called "new" vs another table's row image
+-- ===================================
+
+-- The differ reconciles a declared CHECK against the not-yet-renamed catalog by
+-- running the rename walk INVERSELY, so it inherits the same `new.` / `old.`
+-- ambiguity the forward propagation does (`41.3` §62): `new` is not a reserved
+-- word, so `dnw_t`'s `check (new.w > 0)` names dnw_t's own written row while a
+-- real table called "new" is having its column `v` renamed to `w` in the same
+-- diff. Treating that qualifier as a reference to the table would inverse-rewrite
+-- the declared body to `new.v`, mismatch the actual body, and emit a spurious
+-- constraint drop/recreate alongside the rename.
+
+create table "new" (id integer primary key, v integer);
+create table dnw_t (id integer primary key, w integer, constraint ck_dnw check (new.w > 0));
+
+declare schema main {
+	table "new" {
+		id integer primary key,
+		w integer with tags ("quereus.previous_name" = 'v')
+	}
+
+	table dnw_t {
+		id integer primary key,
+		w integer,
+		constraint ck_dnw check (new.w > 0)
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE new RENAME COLUMN v TO w"}]
+
+apply schema main;
+
+-- run
+
+-- dnw_t still writable against its own row image, and its CHECK still enforces.
+insert into dnw_t values (1, 5);
+select w from dnw_t;
+→ [{"w": 5}]
+
+insert into dnw_t values (2, -1);
+-- error: ck_dnw
+
+diff schema main;
+→ []
+
+drop table dnw_t;
+drop table "new";

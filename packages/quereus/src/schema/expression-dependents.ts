@@ -35,13 +35,19 @@ import { collectColumnRepublication, type ColumnRepublication } from './column-r
  * `rewriteTableForColumnRename`'s `isRenamedTable` branch:
  *
  * - On the **probed table itself**, the *seeded* probe
- *   ({@link columnReferencedInCheckExpression}) — a CHECK / DEFAULT there is written
- *   against the row being written and owns the `new.` / `old.` namespace, and an
- *   unqualified name binds the owning table implicitly.
- * - On **any other table**, the *unseeded* probe ({@link columnReferencedInAst}) — that
- *   table's row image is its own columns, not ours, so only an explicit reference
- *   through a subquery counts. Getting this backwards false-refuses on every table that
- *   merely happens to have a like-named column.
+ *   ({@link columnReferencedInCheckExpression}) — an unqualified name in a CHECK /
+ *   DEFAULT there binds the owning table implicitly.
+ * - On **any other table**, the *unseeded* probe ({@link columnReferencedInAst}) — no
+ *   implicit binding, so only an explicit reference through a subquery counts. Getting
+ *   this backwards false-refuses on every table that merely happens to have a like-named
+ *   column.
+ *
+ * The seed answers only that binding question. What a bare `new.` / `old.` qualifier
+ * NAMES is a separate, explicitly-passed
+ * {@link import('./rename-rewriter.js').RowImageContext} — `'own'` on the seeded
+ * base-target probe, `'foreign'` on every other ROOT body (that table's row image is its
+ * own columns, not ours), `'none'` on the view / MV bodies below the root. See
+ * {@link columnProbe}.
  *
  * Partial-index predicates need no arm: the parser rejects a subquery in a partial-index
  * predicate, so such a predicate can only name its own table, and `runDropColumn`'s

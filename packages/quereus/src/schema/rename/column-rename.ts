@@ -1294,6 +1294,13 @@ function isResultColumnExposure(
  * in-walk belongs to a nested select. Correlated `new.<outer-output>` refs in
  * ORDINARY subqueries of the expression are still reached — the skip is the
  * clause, not the subquery.
+ *
+ * NOTE: `inverse` is skipped but `defaults` is not, deliberately — a nested
+ * select's `with defaults` entry expr owns no written-row scope (the inverse
+ * validation in `planner/analysis/authored-inverse.ts` never descends one, so a
+ * `new.` ref there binds nothing either way) and shifting a ref inside one is
+ * inert. If `with defaults` ever gains a written-row scope of its own, this walk
+ * needs the same skip for `defaults`.
  */
 function renameNewQualifiedRefs(expr: AST.Expression, renames: ReadonlyMap<string, string>): boolean {
 	let changed = false;
