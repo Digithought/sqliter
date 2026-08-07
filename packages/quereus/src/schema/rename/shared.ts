@@ -84,6 +84,24 @@ export interface TableRenameTarget {
 }
 
 /**
+ * What a bare, unbound `new.` / `old.` column qualifier names AT THIS POINT in a
+ * rename walk. Three-valued because the domain is: the walk's own target's row
+ * image, some OTHER relation's row image, or no written-row context at all.
+ * `new` and `old` are not reserved words in this parser (`create table "new"` is
+ * legal), so the mode is what disambiguates the two spellings — and it is a
+ * property of the POSITION in the tree, not of the walk's entry point: a
+ * `with inverse` expression forces `'foreign'` over its subtree regardless of
+ * the ambient mode (see `visitColumnRename`'s select arm).
+ */
+export type RowImageContext =
+	/** No written-row context here — `new.x` is an ordinary table reference. */
+	| 'none'
+	/** Written-row context whose image IS the walk's target table — match it. */
+	| 'own'
+	/** Written-row context whose image belongs to another relation — ignore it. */
+	| 'foreign';
+
+/**
  * Returns whether the named source table has a column matching the renamed
  * column's old name. Implementation looks up the table in the catalog;
  * `schemaName` is the lowercase schema name (already resolved to the

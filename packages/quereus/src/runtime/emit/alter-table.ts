@@ -398,9 +398,12 @@ async function runRenameColumn(
 	const objectResolvers = snapshotObjectRefResolvers(rctx.db);
 	const renamedTableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
 	assertRenameDependentsPersistable(rctx.db,
+		// Row-image mode 'none': the probed bodies are view / MV bodies — relations
+		// with no written row (their `with inverse` / `with defaults` subtrees
+		// self-suppress inside the walker).
 		home => ast => renameColumnInAst(
 			ast, tableSchema.name, oldName, newName,
-			objectResolvers.forHomeSchema(home), renamedTableKey, resolveColumnInSource),
+			objectResolvers.forHomeSchema(home), renamedTableKey, 'none', resolveColumnInSource),
 		t => rewriteTableForColumnRename(
 			t, tableSchema.name, oldName, newName, objectResolvers, renamedTableKey, resolveColumnInSource));
 
@@ -2352,7 +2355,7 @@ function propagateColumnRenameInSchema(
 		// inside a defaults-expr subquery that binds a like-named column on its own
 		// FROM is not false-captured (the differ's inverse reconcile passes the
 		// declared-side resolver for parity).
-		const bodyChanged = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
+		const bodyChanged = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, resolve, targetKey, 'none', resolveColumnInSource);
 		if (bodyChanged) {
 			const updatedView = { ...view, sql: astToString(view.selectAst) };
 			schema.addView(updatedView);
@@ -2391,10 +2394,14 @@ function rewriteTableForColumnRename(
 	const isRenamedTable = objectRefKey(table.schemaName, table.name) === targetKey;
 	let changed = false;
 
+	// Row-image modes: a CHECK is written-row context wherever it lives — 'own'
+	// when its image IS the renamed table, 'foreign' when it is another table's
+	// (a bare `new.`/`old.` there names THAT table's row, never the renamed one,
+	// even for a table literally called `new`).
 	const newChecks = table.checkConstraints.map(cc => {
 		const rewrote = isRenamedTable
-			? renameColumnInCheckExpression(cc.expr, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource)
-			: renameColumnInAst(cc.expr, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
+			? renameColumnInCheckExpression(cc.expr, tableName, oldCol, newCol, resolve, targetKey, 'own', resolveColumnInSource)
+			: renameColumnInAst(cc.expr, tableName, oldCol, newCol, resolve, targetKey, 'foreign', resolveColumnInSource);
 		if (!rewrote) return cc;
 		changed = true;
 		return { ...cc };
@@ -2435,10 +2442,12 @@ function rewriteTableForColumnRename(
 	// expressions above, via `renameColumnInCheckConstraints`). Both use the same
 	// idempotent `renameColumnInIndexPredicates`, so this pass then finds nothing naming
 	// `oldCol`, `rewrote` is false, and the table is not needlessly re-registered.
+	// Row-image mode 'none' on both arms: a predicate describes rows already
+	// stored, so it has no written-row context regardless of which table owns it.
 	const newIndexes = (table.indexes ?? []).map(idx => {
 		const rewrote = isRenamedTable
-			? renameColumnInCheckExpression(idx.predicate, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource)
-			: renameColumnInAst(idx.predicate, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
+			? renameColumnInCheckExpression(idx.predicate, tableName, oldCol, newCol, resolve, targetKey, 'none', resolveColumnInSource)
+			: renameColumnInAst(idx.predicate, tableName, oldCol, newCol, resolve, targetKey, 'none', resolveColumnInSource);
 		if (!rewrote) return idx;
 		changed = true;
 		return { ...idx };
@@ -2498,7 +2507,10 @@ function rewriteOtherTableColumnExpressions(
 	let changed = false;
 	for (const col of columns) {
 		for (const expr of [col.defaultValue, col.generatedExpr]) {
-			if (expr && renameColumnInAst(expr, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource)) changed = true;
+			// 'foreign': another table's DEFAULT / generated body is written-row
+			// context whose image is THAT table — a bare `new.`/`old.` there names
+			// nothing this rename cares about.
+			if (expr && renameColumnInAst(expr, tableName, oldCol, newCol, resolve, targetKey, 'foreign', resolveColumnInSource)) changed = true;
 		}
 	}
 	return changed;

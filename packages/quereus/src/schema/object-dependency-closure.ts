@@ -109,15 +109,16 @@ export interface ObjectReach {
  * assertion guards pass nothing: an assertion CHECK owns no `new.` / `old.`
  * namespace either.
  *
- * NOTE: no test pins the root-ONLY half, and cannot today. The suppression fires
- * at exactly one site — a bare `new.` / `old.` COLUMN qualifier that nothing in
- * scope binds (`rename/table-rename.ts`, the `binding === undefined` branch) — and
- * `CREATE VIEW` rejects such a body outright (`create view v as select new.a from
- * "new" as x` → `new.a isn't a column`), so a reached body can never contain one
- * and leaking `rootOpts` downward would change no answer. Root-only is therefore
- * correct by construction rather than by test. If the suppression ever widens
- * beyond seedless column qualifiers — to a FROM source spelled `new`, say — that
- * stops being true and this needs a test.
+ * Root-only stays correct even though a reached body CAN carry a bare unbound
+ * `new.` qualifier — a `with inverse` / `with defaults` expression holds one
+ * legitimately (`CREATE VIEW` accepts it there; the refs name the enclosing
+ * select's output row) — because the walker suppresses those SUBTREES itself,
+ * unconditionally, wherever the walk entered (`rename/table-rename.ts`,
+ * `visitRowImageSubtree`). The suppression travels with the position, not with
+ * this flag, so a reached view body self-suppresses and leaking `rootOpts`
+ * downward would change no answer. Pinned by
+ * `test/logic/41.10.4-drop-object-expression-dependents.sqllogic` (drop of a
+ * table named `new` reached through a `with inverse` view).
  */
 export function reachableObjects(
 	db: Database,

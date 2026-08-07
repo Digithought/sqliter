@@ -1,14 +1,15 @@
 import type * as AST from '../../parser/ast.js';
 import { spineCloneAst } from '../../util/ast-spine-clone.js';
-import { eq, objectRefKeySchema, rewriteEach, type ResolveColumnInSource, type ResolveObjectRef } from './shared.js';
+import { eq, objectRefKeySchema, rewriteEach, type ResolveColumnInSource, type ResolveObjectRef, type RowImageContext } from './shared.js';
 
 /**
  * Scope-aware, in-place column-rename walkers: propagate `ALTER TABLE … RENAME
  * COLUMN` into dependent object ASTs (view bodies, CHECK expressions, partial
  * index predicates, column DEFAULT / generated expressions), plus the
- * read-only column-reference probes built on them. The seeded entry point
- * ({@link renameColumnInCheckExpression}) additionally owns the `new.` /
- * `old.` row-image namespace; see its doc comment.
+ * read-only column-reference probes built on them. What a bare, unbound
+ * `new.` / `old.` qualifier means is NOT tied to the entry point: every entry
+ * point takes an explicit {@link RowImageContext} argument, threaded to the
+ * position in the tree; see {@link matchesRowImage}.
  */
 
 interface ScopeFrame {
@@ -55,6 +56,14 @@ interface ScopeFrame {
  * body's trailing `with defaults (…)` clause ({@link AST.SelectStmt.defaults}),
  * whose entry exprs evaluate in the body's FROM scope.
  *
+ * `rowImage` says what a bare, unbound `new.` / `old.` qualifier means in the
+ * walked expression — independent of the (absent) seed; see
+ * {@link RowImageContext} and {@link matchesRowImage}. A view / assertion body
+ * is `'none'` (no written-row context — `new.x` is an ordinary table
+ * reference); another table's CHECK / DEFAULT / generated body is `'foreign'`
+ * (written-row context whose image belongs to that table, so the qualifier
+ * names nothing this walk cares about).
+ *
  * When `resolveColumnInSource` is supplied, the scope walk consults it at each
  * inner FROM frame so an unqualified ref that legitimately binds to a like-named
  * column on a subquery's own FROM source is NOT false-captured by an enclosing
@@ -71,6 +80,7 @@ export function renameColumnInAst(
 	newColName: string,
 	resolve: ResolveObjectRef,
 	targetKey: string,
+	rowImage: RowImageContext,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!node) return false;
@@ -83,7 +93,7 @@ export function renameColumnInAst(
 		scopeStack: [],
 		changed: false,
 		resolveColumnInSource,
-		matchRowImageQualifier: false,
+		rowImage,
 	};
 	visitColumnRename(node, state);
 	return state.changed;
@@ -110,16 +120,18 @@ export function renameColumnInAst(
  * inference on their bodies). `renameColumnInAst` shares the same callback
  * (passed by the view-body callers) and the same limitation.
  *
- * The seed also makes this walk the owner of the `new.` / `old.` **row-image**
- * namespace: a CHECK may name the row being written explicitly
- * (`check (new.a > 0)`, `check on delete (old.a > 0)` — `docs/sql-ddl.md`
- * § CHECK Constraints), and those qualifiers name the owning table's row, not
- * anything a FROM clause binds. So the qualified-ref case matches them too —
- * but only here, never through `renameColumnInAst`, where a `new.` ref belongs
- * to some other table's row image.
+ * The seed and the `new.` / `old.` **row-image** namespace are INDEPENDENT: the
+ * seed answers how *unqualified* refs bind, while the explicit `rowImage`
+ * argument answers what a bare, unbound `new.` / `old.` qualifier names (see
+ * {@link RowImageContext}). A CHECK / DEFAULT / generated body of the renamed
+ * table itself passes `'own'` — those expressions evaluate against the row
+ * being written, so `check (new.a > 0)` (`docs/sql-ddl.md` § CHECK Constraints)
+ * names the owning table's row image and matches. A partial-index predicate is
+ * seeded too but passes `'none'`: it describes rows already stored, with no
+ * written-row context.
  *
- * That match is scope-**aware**, not depth-blind, because `new` and `old` are
- * not reserved words in this parser: `create table "new" (…)` is legal, so a
+ * The `'own'` match is scope-**aware**, not depth-blind, because `new` and `old`
+ * are not reserved words in this parser: `create table "new" (…)` is legal, so a
  * CHECK may legitimately contain `(select max("new".a) from "new")`. The match
  * therefore requires that no FROM/WITH frame above the seed rebind the
  * qualifier — see `matchesRowImage`.
@@ -131,6 +143,7 @@ export function renameColumnInCheckExpression(
 	newColName: string,
 	resolve: ResolveObjectRef,
 	targetKey: string,
+	rowImage: RowImageContext,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!expr) return false;
@@ -143,7 +156,7 @@ export function renameColumnInCheckExpression(
 		scopeStack: [],
 		changed: false,
 		resolveColumnInSource,
-		matchRowImageQualifier: true,
+		rowImage,
 	};
 	const frame = emptyFrame();
 	frame.unaliased.set(state.tableName, state.targetKey);
@@ -194,12 +207,13 @@ export function columnReferencedInAst(
 	columnName: string,
 	resolve: ResolveObjectRef,
 	targetKey: string,
+	rowImage: RowImageContext,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!node) return false;
 	return renameColumnInAst(
 		spineCloneAst(node), tableName, columnName, PROBE_COLUMN_NAME,
-		resolve, targetKey, resolveColumnInSource);
+		resolve, targetKey, rowImage, resolveColumnInSource);
 }
 
 /**
@@ -215,12 +229,13 @@ export function columnReferencedInCheckExpression(
 	columnName: string,
 	resolve: ResolveObjectRef,
 	targetKey: string,
+	rowImage: RowImageContext,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!expr) return false;
 	return renameColumnInCheckExpression(
 		spineCloneAst(expr), tableName, columnName, PROBE_COLUMN_NAME,
-		resolve, targetKey, resolveColumnInSource);
+		resolve, targetKey, rowImage, resolveColumnInSource);
 }
 
 /**
@@ -242,11 +257,13 @@ export function columnReferencedInCheckExpression(
  * The parameter is structurally typed rather than `IndexSchema[]` so this module
  * stays free of catalog imports; `IndexSchema` satisfies it.
  *
- * Sharing the seeded entry point also brings its `new.` / `old.` row-image match
- * along, which is inert here: a partial-index predicate describes rows already
- * stored, has no written-row context, and a predicate naming one would not plan
- * in the first place. Nothing to suppress — noted so the shared entry point does
- * not read as an oversight.
+ * Row-image mode is `'none'`: a partial-index predicate describes rows already
+ * stored, so it has no written-row context and a bare `new.` / `old.` qualifier
+ * there is an ordinary table reference — the same asymmetry
+ * {@link import('./table-rename.js').renameTableInIndexPredicates} records by
+ * passing no `rowImageContext`. (An indexed table literally named `new` still
+ * matches through the seed binding, so this changes no answer for the case
+ * that plans.)
  */
 export function renameColumnInIndexPredicates(
 	indexes: ReadonlyArray<{ readonly predicate?: AST.Expression }> | undefined,
@@ -258,7 +275,7 @@ export function renameColumnInIndexPredicates(
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	return rewriteEach(indexes, idx => idx.predicate, expr => renameColumnInCheckExpression(
-		expr, tableName, oldColName, newColName, resolve, targetKey, resolveColumnInSource));
+		expr, tableName, oldColName, newColName, resolve, targetKey, 'none', resolveColumnInSource));
 }
 
 /**
@@ -269,7 +286,9 @@ export function renameColumnInIndexPredicates(
  *
  * Only pass the renamed table's OWN checks — a CHECK on a *different* table that
  * happens to reference the renamed table needs {@link renameColumnInAst}, whose
- * walk has no implicit seed.
+ * walk has no implicit seed. That own-table contract is also why the row-image
+ * mode is hardcoded `'own'` here: a CHECK evaluates against the row being
+ * written, whose image IS the renamed table's.
  */
 export function renameColumnInCheckConstraints(
 	checks: ReadonlyArray<{ readonly expr: AST.Expression }> | undefined,
@@ -281,7 +300,7 @@ export function renameColumnInCheckConstraints(
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	return rewriteEach(checks, cc => cc.expr, expr => renameColumnInCheckExpression(
-		expr, tableName, oldColName, newColName, resolve, targetKey, resolveColumnInSource));
+		expr, tableName, oldColName, newColName, resolve, targetKey, 'own', resolveColumnInSource));
 }
 
 /**
@@ -291,15 +310,15 @@ export function renameColumnInCheckConstraints(
  * generated column's body (`g integer generated always as (a + 1)`) — in place, for
  * every column of the renamed table itself.
  *
- * The seeded {@link renameColumnInCheckExpression} entry point is correct for both, for
- * the two halves of what the seed provides:
+ * The seeded {@link renameColumnInCheckExpression} entry point with row-image mode
+ * `'own'` is correct for both:
  *
  * - The implicit unaliased binding to the owning table is what makes a generated
  *   column's **bare** `a` resolve — it has no FROM clause to bind against, exactly like
  *   a CHECK.
- * - The seed also owns the `new.` / `old.` **row-image** namespace, which is what makes a
- *   default's `new.a` resolve. A default is evaluated against the row being written, so
- *   that qualifier names this table's row image, not anything a FROM binds.
+ * - The `'own'` mode is what makes a default's `new.a` resolve. A default is evaluated
+ *   against the row being written, so that qualifier names this table's row image, not
+ *   anything a FROM binds.
  *
  * Case folding (`NEW.A`) and the shadowing edge (a real table literally named `new`,
  * reached from a subquery inside the expression) therefore behave exactly as they do for
@@ -332,7 +351,7 @@ export function renameColumnInColumnExpressions(
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	const rewrite = (expr: AST.Expression): boolean => renameColumnInCheckExpression(
-		expr, tableName, oldColName, newColName, resolve, targetKey, resolveColumnInSource);
+		expr, tableName, oldColName, newColName, resolve, targetKey, 'own', resolveColumnInSource);
 	// Both walks always run — `||` on the results, not short-circuited between them.
 	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
 	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);
@@ -372,7 +391,10 @@ export function bodyExposesRenamedColumn(
 		scopeStack: [],
 		changed: false,
 		resolveColumnInSource,
-		matchRowImageQualifier: false,
+		// Exposure is a question about published output names, not row images —
+		// `'none'` unconditionally (a `new.`-qualified projection is never a bare
+		// passthrough, so the mode cannot matter to the answer).
+		rowImage: 'none',
 	};
 	return queryExposesRenamedColumn(body, state);
 }
@@ -419,7 +441,7 @@ export function bodyPublishesColumnNamed(
 		scopeStack: [],
 		changed: false,
 		resolveColumnInSource,
-		matchRowImageQualifier: false,
+		rowImage: 'none',
 	};
 	const withFrame = analyzeWithFrame(select.withClause, state);
 	state.scopeStack.push(withFrame);
@@ -469,25 +491,15 @@ interface ColumnRewriteState {
 	changed: boolean;
 	resolveColumnInSource?: ResolveColumnInSource;
 	/**
-	 * Match `new.` / `old.` as this table's row image. Set only by the seeded
-	 * entry point ({@link renameColumnInCheckExpression}), whose expression is
-	 * evaluated against a row of `tableName` and therefore owns that namespace;
-	 * the unseeded {@link renameColumnInAst} leaves it false, so a `new.` ref in
-	 * some *other* table's CHECK is never mistaken for this table's row image.
-	 *
-	 * KNOWN GAP — this is two-state where the domain has three. False here means
-	 * "not MY row image", and the walk then falls through to treating `new` as a
-	 * catalog TABLE reference, which is wrong for the case that actually occurs:
-	 * another table's CHECK / DEFAULT / generated body, written-row context whose
-	 * image is that table, where `new.` names nothing this walk cares about. With
-	 * a real table called `"new"`, `alter table "new" rename column v to w`
-	 * therefore rewrites that other table's `new.v` and leaves it unwritable, and
-	 * `alter table "new" drop column v` is false-refused. The table walker has the
-	 * missing mode already ({@link import('./table-rename.js').TableRenameOpts.rowImageContext}),
-	 * which is why the table verbs get the same SQL right. Tracked as
-	 * `rename-column-corrupts-other-tables-row-image-qualifier`.
+	 * What a bare, unbound `new.` / `old.` qualifier names at the CURRENT
+	 * position — the caller's mode for the walked expression, overridden to
+	 * `'foreign'` while the walk descends a `with inverse` / `with defaults`
+	 * subtree (whose `new.` refs belong to the enclosing select, never to any
+	 * rename target — see the select arm of {@link visitColumnRename}). Decides
+	 * only the unbound-bare case in {@link matchesRowImage}; an in-scope binding
+	 * or a schema qualifier always wins first.
 	 */
-	matchRowImageQualifier: boolean;
+	rowImage: RowImageContext;
 }
 
 function emptyFrame(): ScopeFrame {
@@ -662,22 +674,37 @@ function resolveQualifierBinding(
 }
 
 /**
- * Whether a qualified column ref names the **row image** of the table this
- * seeded walk was entered for — `new.<col>` / `old.<col>` inside one of its own
- * CHECK expressions. Only the seeded entry point sets
- * `matchRowImageQualifier`; see {@link renameColumnInCheckExpression} for why
- * that scoping is what keeps another table's `new.` ref out of this match.
+ * Whether a qualified column ref names a **row image** — `new.<col>` /
+ * `old.<col>` in written-row context — and if so, whose. The three-way answer
+ * mirrors {@link RowImageContext}:
+ *
+ * - `'own'`: the image is the walk's target table — the ref matches and the
+ *   rename rewrites it (`check (new.a > 0)` on the renamed table itself).
+ * - `'foreign'`: written-row context, but the image belongs to some OTHER
+ *   relation (another table's CHECK / DEFAULT / generated body, or a
+ *   `with inverse` expression whose `new.` names the enclosing select's output
+ *   row) — the ref names nothing this walk cares about and must be IGNORED,
+ *   not resolved as a table called `new`.
+ * - `'none'`: no written-row context here — the qualifier is not a row image
+ *   at all, and the caller falls through to ordinary table-reference
+ *   resolution.
  *
  * A schema-qualified `main.new.a` is a real three-part table reference, never a
- * row image, so it is excluded outright.
+ * row image, so it answers `'none'` outright, as does any qualifier a FROM/WITH
+ * frame rebinds (`new` and `old` are not reserved words — `create table "new"`
+ * is legal, so `(select max("new".a) from "new")` must keep resolving as a
+ * table). Callers reach this only for a qualifier nothing in scope binds, which
+ * makes the rebind scan redundant there — kept as a cheap belt-and-braces guard
+ * so this function is safe to call from any future site.
  *
  * `qualifierLower` is `col.table` already lowercased by the caller.
  */
-function matchesRowImage(state: ColumnRewriteState, col: AST.ColumnExpr, qualifierLower: string): boolean {
-	if (!state.matchRowImageQualifier) return false;
-	if (col.schema !== undefined) return false;
-	if (qualifierLower !== 'new' && qualifierLower !== 'old') return false;
-	return !isQualifierReboundAboveSeed(state, qualifierLower);
+function matchesRowImage(state: ColumnRewriteState, col: AST.ColumnExpr, qualifierLower: string): RowImageContext {
+	if (state.rowImage === 'none') return 'none';
+	if (col.schema !== undefined) return 'none';
+	if (qualifierLower !== 'new' && qualifierLower !== 'old') return 'none';
+	if (isQualifierReboundAboveSeed(state, qualifierLower)) return 'none';
+	return state.rowImage;
 }
 
 /**
@@ -716,6 +743,25 @@ function isQualifierReboundAboveSeed(state: ColumnRewriteState, qualifier: strin
 	return false;
 }
 
+/**
+ * Visit a subtree that is written-row context belonging to the ENCLOSING select
+ * — a `with inverse` assignment expression or a `with defaults` entry
+ * expression — with the row-image mode forced to `'foreign'`, restoring the
+ * ambient mode after. The override is unconditional (not `||`-combined with the
+ * ambient mode): even inside a seeded `'own'` walk, a nested select's inverse
+ * expression's `new.` refs name THAT select's outputs, not the seeded table's
+ * row image.
+ */
+function visitRowImageForeignSubtree(expr: AST.Expression, state: ColumnRewriteState): void {
+	const ambient = state.rowImage;
+	state.rowImage = 'foreign';
+	try {
+		visitColumnRename(expr, state);
+	} finally {
+		state.rowImage = ambient;
+	}
+}
+
 function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteState): void {
 	if (!node) return;
 
@@ -740,8 +786,15 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 					// `with inverse` clauses: the assignment target is a bare base-column
 					// name resolving against this select's FROM — exactly an unqualified
 					// body ref, so it rides the same scope-aware walk via a synthetic
-					// probe (the `with defaults` clause below uses the same pattern); the
-					// assignment expr rewrites like any body expression.
+					// probe (the `with defaults` clause below uses the same pattern). The
+					// assignment EXPR is written-row context regardless of the ambient
+					// mode: its `new.<x>` refs name the enclosing select's OUTPUT row
+					// (docs/sql-select.md § Result-column inverses), never any rename
+					// target's row image and never a table called `new` — so the walk
+					// descends it with the mode forced to `'foreign'` (the legitimate
+					// output-name shift is applied separately by
+					// {@link renameNewQualifiedRefs} after the body walk). The table
+					// walker forces its own suppression over the same subtree.
 					(stmt.columns ?? []).forEach(c => {
 						if (c.type !== 'column' || !c.inverse?.length) return;
 						c.inverse.forEach(a => {
@@ -751,16 +804,22 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 								(a as { column: string }).column = probe.name;
 								state.changed = true;
 							}
-							visitColumnRename(a.expr, state);
+							visitRowImageForeignSubtree(a.expr, state);
 						});
 					});
 					// `with defaults` clause: each entry's `column` is a bare base-column
 					// name of this select's FROM (a projected-away base column), so it
 					// rides the same scope-aware synthetic probe as a `with inverse`
-					// target; the entry's `expr` evaluates in the inserted-row context of
-					// the FROM table — exactly the FROM frame already on the scope stack —
-					// so it rewrites like any body expression (an inner subquery in the
-					// expr pushes its own frame and disambiguates a like-named column).
+					// target; the entry's `expr` evaluates in the FROM frame already on
+					// the scope stack, so it rewrites like any body expression (an inner
+					// subquery in the expr pushes its own frame and disambiguates a
+					// like-named column). A defaults entry is documented self-contained —
+					// it cannot reference the inserted row (docs/sql-select.md § Insert
+					// defaults) — but nothing enforces that at CREATE VIEW time, so the
+					// walk pins the documented meaning the same way the inverse arm above
+					// does: a bare unbound `new.` / `old.` there is inert, never a
+					// reference to a table so named (such a ref could not plan anyway —
+					// the lowered INSERT gives the expr no scope that binds `new`).
 					(stmt.defaults ?? []).forEach(d => {
 						const probe: AST.ColumnExpr = { type: 'column', name: d.column };
 						visitColumnRename(probe, state);
@@ -768,7 +827,7 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 							(d as { column: string }).column = probe.name;
 							state.changed = true;
 						}
-						visitColumnRename(d.expr, state);
+						visitRowImageForeignSubtree(d.expr, state);
 					});
 					const outputRenames = new Map<string, string>();
 					(stmt.columns ?? []).forEach((c, i) => {
@@ -1040,16 +1099,18 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 						// the seeded owning table included — resolves through its
 						// binding, never through the row image.
 						hit = binding === state.targetKey;
-					} else if (matchesRowImage(state, col, qualifierLower)) {
-						// Row-image match applies only to an UNBOUND `new.` /
-						// `old.` qualifier in a seeded (written-row) walk.
-						hit = true;
 					} else {
-						// Nothing in scope binds the qualifier: a seedless
-						// expression context (correlation the walk cannot see).
-						// Resolve directly, as the planner would against the
-						// body's home schema path.
-						hit = state.resolveRef(undefined, col.table) === state.targetKey;
+						// An UNBOUND bare qualifier: the three-way row-image mode
+						// decides (see {@link matchesRowImage}) — `'own'` matches
+						// the walk's target, `'foreign'` is another relation's row
+						// image and must be ignored (NOT resolved as a table called
+						// `new`), `'none'` falls through to direct resolution, as
+						// the planner would against the body's home schema path
+						// (correlation the walk cannot see).
+						const image = matchesRowImage(state, col, qualifierLower);
+						hit = image === 'own' ? true
+							: image === 'foreign' ? false
+							: state.resolveRef(undefined, col.table) === state.targetKey;
 					}
 				}
 				if (hit) {
@@ -1217,9 +1278,22 @@ function isResultColumnExposure(
  *
  * Depth-blind **on purpose**, unlike the row-image match in `matchesRowImage`.
  * The two look alike but answer different questions: this one rewrites by view
- * *output* name inside a `with inverse` expr, whose grammar admits no FROM
- * clause that could rebind `new`, whereas a CHECK body may contain a subquery
- * selecting from a real table named `"new"` and so must consult the scope stack.
+ * *output* name inside a `with inverse` expr, so no FROM scope tracking applies
+ * (`new.` is the written-row namespace validation reserves there —
+ * `planner/analysis/authored-inverse.ts` requires every `new.<x>` to resolve to
+ * an output column of its own enclosing select), whereas a CHECK body may
+ * contain a subquery selecting from a real table named `"new"` and so must
+ * consult the scope stack.
+ *
+ * One boundary the depth-blind walk must still respect: a subquery inside the
+ * expression may be a select carrying its OWN `with inverse` clause, whose
+ * `new.` refs name THAT select's outputs (validation pins them there — they can
+ * never reach the outer select's), so the walk skips `inverse` subtrees.
+ * `inverse` is a property of {@link AST.ResultColumnExpr} only, and the walk's
+ * roots are the OUTER clause's assignment exprs, so every `inverse` key met
+ * in-walk belongs to a nested select. Correlated `new.<outer-output>` refs in
+ * ORDINARY subqueries of the expression are still reached — the skip is the
+ * clause, not the subquery.
  */
 function renameNewQualifiedRefs(expr: AST.Expression, renames: ReadonlyMap<string, string>): boolean {
 	let changed = false;
@@ -1239,7 +1313,7 @@ function renameNewQualifiedRefs(expr: AST.Expression, renames: ReadonlyMap<strin
 			}
 		}
 		for (const key of Object.keys(n)) {
-			if (key === 'loc') continue;
+			if (key === 'loc' || key === 'inverse') continue;
 			visit(n[key]);
 		}
 	};

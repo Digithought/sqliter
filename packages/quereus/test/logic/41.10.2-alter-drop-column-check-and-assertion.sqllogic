@@ -1468,3 +1468,49 @@ drop table DcSg2;
 drop view DcSg2uv;
 drop table DcSg2u;
 -- run
+
+-- ===================================================================
+-- 37. ANOTHER table's row-image qualifier does not block dropping a column
+--     of a table called "new"
+-- ===================================================================
+--
+-- §12 pins the refusal when the row image is the ALTERED table's own (`check
+-- (new.a > 0)` on the table being altered); §13/§14 pin the FROM-rebound edges. The
+-- remaining cell of the matrix: the qualifier sits on a DIFFERENT table, where it names
+-- THAT table's row image — not a column of the real table "new" — so `alter table "new"
+-- drop column v` is legal. Pre-fix the guard treated the foreign `new.v` as a reference
+-- to the table "new" and false-refused.
+
+create table "new" (id integer primary key, v integer);
+create table DcNwCk (id integer primary key, v integer, constraint ck_dcnw check (new.v > 0));
+create table DcNwDf (id integer primary key, v integer, d integer default (new.v + 1));
+-- run
+
+alter table "new" drop column v;
+select count(*) as c from "new";
+→ [{"c":0}]
+
+-- Both foreign tables keep working against their own row images.
+insert into DcNwCk values (1, 5);
+insert into DcNwDf (id, v) values (1, 4);
+select d from DcNwDf;
+→ [{"d":5}]
+
+drop table DcNwDf;
+drop table DcNwCk;
+drop table "new";
+-- run
+
+-- ...and a GENUINE reference to the table "new" (through a subquery FROM) still
+-- refuses, so the allowance is the row image and not the name.
+create table "new" (id integer primary key, v integer);
+create table DcNwRef (id integer primary key, n integer,
+                      constraint ck_dcnwref check (n < (select max("new".v) from "new")));
+-- run
+
+alter table "new" drop column v;
+-- error: CHECK constraint 'ck_dcnwref' on table 'DcNwRef'
+
+drop table DcNwRef;
+drop table "new";
+-- run

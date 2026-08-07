@@ -35,8 +35,17 @@ export interface TableRenameOpts {
 	 *
 	 * Deliberately NOT set for partial-index predicates: a predicate describes
 	 * rows already stored and has no written-row context, so `new.x` there IS
-	 * a table reference. (The column walker's seeded entry point records the
-	 * same asymmetry from the other direction.)
+	 * a table reference. (The column walker records the same asymmetry by
+	 * passing row-image mode `'none'` for predicates.)
+	 *
+	 * A boolean where the column walker's
+	 * {@link import('./shared.js').RowImageContext} is three-valued, and
+	 * COMPLETE at two: this walker never *matches* a row image, only
+	 * suppresses one, so the column walker's `'own'`/`'foreign'` split
+	 * collapses — `false` maps to `'none'`, `true` to `'foreign'`. Like the
+	 * column walker, the flag is overridden (to `true`) over `with inverse` /
+	 * `with defaults` subtrees regardless of the entry-point value, because
+	 * written-row context there is a property of the position, not the walk.
 	 */
 	rowImageContext?: boolean;
 }
@@ -482,6 +491,25 @@ function visitDmlTargetRowClauses(
 	}
 }
 
+/**
+ * Visit a `with inverse` assignment expression or `with defaults` entry
+ * expression with the row-image suppression forced ON, restoring the ambient
+ * flag after — the table-walker twin of the column walker's
+ * `visitRowImageForeignSubtree`. Unconditional on purpose: these subtrees are
+ * written-row context of their enclosing select wherever the walk entered, so a
+ * reached view body self-suppresses even though the entry point (rightly)
+ * passed no `rowImageContext` for it.
+ */
+function visitRowImageSubtree(expr: AST.Expression, state: TableRefWalkState): void {
+	const ambient = state.rowImage;
+	state.rowImage = true;
+	try {
+		visitTableRefs(expr, state);
+	} finally {
+		state.rowImage = ambient;
+	}
+}
+
 function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState): void {
 	if (!node || state.stop) return;
 
@@ -500,14 +528,24 @@ function visitTableRefs(node: AST.AstNode | undefined, state: TableRefWalkState)
 							// A `with inverse` assignment expr can embed a subquery naming any
 							// table; the assignment's target names a base COLUMN, untouched by a
 							// table rename (same as the `with defaults` clause below). Both sit
-							// in this body's FROM frame.
-							(c.inverse ?? []).forEach(a => visitTableRefs(a.expr, state));
+							// in this body's FROM frame — but the expr is written-row context
+							// of the ENCLOSING select regardless of the walk's entry point: a
+							// bare unbound `new.<x>` there names an output column of this
+							// select (docs/sql-select.md § Result-column inverses), never a
+							// table called `new`, so the row-image suppression is forced over
+							// the subtree (the column walker forces `'foreign'` over the same
+							// one).
+							(c.inverse ?? []).forEach(a => visitRowImageSubtree(a.expr, state));
 						}
 					});
 					// `with defaults` clause: each entry's `expr` (an inserted-row default) can
 					// embed a subquery naming any table; the entry's `column` names a base
-					// COLUMN, untouched by a table rename.
-					(stmt.defaults ?? []).forEach(d => visitTableRefs(d.expr, state));
+					// COLUMN, untouched by a table rename. A defaults entry is documented
+					// self-contained — it cannot reference the inserted row — but nothing
+					// enforces that at CREATE VIEW time, so a bare unbound `new.` / `old.`
+					// there is pinned inert the same way (column-walker parity; such a ref
+					// could never plan as a table reference anyway).
+					(stmt.defaults ?? []).forEach(d => visitRowImageSubtree(d.expr, state));
 					(stmt.from ?? []).forEach(f => visitTableRefs(f, state));
 					visitTableRefs(stmt.where, state);
 					(stmt.groupBy ?? []).forEach(g => visitTableRefs(g, state));

@@ -565,3 +565,38 @@ drop view DtNwV;
 drop table "new";
 drop table DtNwRef;
 -- run
+
+-- ===================================================================
+-- 16. A `with inverse` expression in a REACHED view body is not a reference
+--     to a table called "new"
+-- ===================================================================
+--
+-- §15 pins the root-body suppression. This is the reached-body pin the closure's
+-- root-only flag used to argue could not exist: `CREATE VIEW` ACCEPTS a body whose
+-- `with inverse (…)` expression holds a bare `new.<x>` (it names an output column of
+-- the enclosing select — docs/sql-select.md § Result-column inverses), so a CHECK
+-- whose reach includes such a view walks a reached body containing an unbound `new.`
+-- qualifier. The walker suppresses the `with inverse` subtree itself, wherever the
+-- walk entered, so the table "new" does not land in the reach and stays droppable.
+
+create table "new" (id integer primary key, v integer);
+create table DtIvSrc (id integer primary key, code5 text);
+create view DtIvV as
+  select id, case code5 when 'A1' then 'A' end as v
+    with inverse (code5 = case new.v when 'A' then 'A1' end)
+  from DtIvSrc;
+create table DtIvRef (id integer primary key, n integer,
+                      constraint ck_dtiv check (n < (select count(*) from DtIvV) + 10));
+-- run
+
+drop table "new";
+-- run
+
+-- ...and the table the view really reads IS still protected through the chain.
+drop table DtIvSrc;
+-- error: reaches it through view 'DtIvV'
+
+drop table DtIvRef;
+drop view DtIvV;
+drop table DtIvSrc;
+-- run

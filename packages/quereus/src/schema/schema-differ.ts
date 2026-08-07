@@ -1388,8 +1388,10 @@ function declaredIndexCanonicalBody(
 		);
 		const seedTableName = ownRename?.oldName ?? indexStmt.table.name;
 		for (const r of colRenames) {
+			// Row-image mode 'none', mirroring the forward predicate rewrite: a
+			// partial-index predicate has no written-row context.
 			renameColumnInCheckExpression(clone, seedTableName, r.newName, r.oldName,
-				resolveRef, objectRefKey(schemaName, seedTableName));
+				resolveRef, objectRefKey(schemaName, seedTableName), 'none');
 		}
 		where = clone;
 	}
@@ -1489,8 +1491,10 @@ function inverseRenamedViewParts(
 		const ownRename = tableRenames.find(r => r.newName.toLowerCase() === declaredTableName);
 		const seedTableName = ownRename?.oldName ?? declaredTableName;
 		for (const r of colRenames) {
+			// 'none', mirroring the forward view-body walk: a view body is a
+			// relation with no written row.
 			renameColumnInAst(selectClone, seedTableName, r.newName, r.oldName,
-				resolveRef, objectRefKey(schemaName, seedTableName), resolveDeclaredColumn);
+				resolveRef, objectRefKey(schemaName, seedTableName), 'none', resolveDeclaredColumn);
 		}
 	}
 	return selectClone;
@@ -1569,15 +1573,17 @@ function columnReconciledIndexStmt(
 		const clone = cloneExpr(where);
 		const resolveRef = singleSchemaObjectRefResolver(schemaName);
 		for (const r of colRenames) {
+			// 'none' on both predicate arms below, mirroring the forward rewrite:
+			// no written-row context in an index predicate.
 			renameColumnInCheckExpression(clone, stmt.table.name, r.newName, r.oldName,
-				resolveRef, objectRefKey(schemaName, stmt.table.name));
+				resolveRef, objectRefKey(schemaName, stmt.table.name), 'none');
 		}
 		const ownTableLower = stmt.table.name.toLowerCase();
 		for (const [declaredTableName, renames] of columnRenamesByTable) {
 			if (declaredTableName === ownTableLower) continue;
 			for (const r of renames) {
 				renameColumnInAst(clone, declaredTableName, r.newName, r.oldName,
-					resolveRef, objectRefKey(schemaName, declaredTableName));
+					resolveRef, objectRefKey(schemaName, declaredTableName), 'none');
 			}
 		}
 		where = clone;
@@ -1794,9 +1800,11 @@ function reconciledDeclaredBody(
 				// unqualified ref inside a subquery whose own FROM source exposes the
 				// NEW name (in the declared world) binds there, not to the owning
 				// seed, so it is NOT inverse-rewritten — mirroring the forward seeded
-				// call in `rewriteTableForColumnRename` (owning-table branch).
+				// call in `rewriteTableForColumnRename` (owning-table branch). Row-image
+				// mode 'own' mirrors that branch too: this CHECK's `new.`/`old.` names
+				// the owning table's row image, so an owning-column inverse follows it.
 				renameColumnInCheckExpression(clone.expr!, tableName, r.newName, r.oldName,
-					resolveRef, objectRefKey(schemaName, tableName), resolveDeclaredColumn);
+					resolveRef, objectRefKey(schemaName, tableName), 'own', resolveDeclaredColumn);
 			}
 			// Cross-table column renames: a subquery in this CHECK may reference
 			// ANOTHER table whose column was renamed in this same diff; the forward
@@ -1820,8 +1828,11 @@ function reconciledDeclaredBody(
 				const seedTableName = ownRename?.oldName ?? declaredTableName;
 				if (seedTableName.toLowerCase() === tableName.toLowerCase()) continue;
 				for (const r of renames) {
+					// 'foreign', mirroring the forward non-owning branch: this CHECK is
+					// written-row context of the OWNING table, so a bare `new.`/`old.`
+					// here is not a reference to the cross-renamed table.
 					renameColumnInAst(clone.expr!, seedTableName, r.newName, r.oldName,
-						resolveRef, objectRefKey(schemaName, seedTableName));
+						resolveRef, objectRefKey(schemaName, seedTableName), 'foreign');
 				}
 			}
 			return constraintBodyToCanonicalString(clone);

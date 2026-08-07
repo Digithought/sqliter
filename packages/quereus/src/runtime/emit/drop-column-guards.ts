@@ -235,8 +235,10 @@ export function assertNoAssertionNamesColumn(
 	for (const { owned, reach } of assertionReachesHomeSchemaFirst(db, tableSchema.schemaName)) {
 		for (const target of republication.targets) {
 			for (const reached of reach.bodies) {
+				// Row-image mode 'none': an assertion body and every view / MV body in
+				// its reach are relations with no written row.
 				if (!columnReferencedInAst(reached.body, target.tableName, columnName,
-					reached.resolve, target.targetKey, resolveColumnInSource)) continue;
+					reached.resolve, target.targetKey, 'none', resolveColumnInSource)) continue;
 				throw new QuereusError(
 					`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by `
 					+ `assertion ${describeOwnedAssertion(owned, tableSchema.schemaName)}`

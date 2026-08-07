@@ -309,11 +309,19 @@ function columnProbe(
 				// target implicitly, so a republication target takes the unseeded probe even
 				// at the root (a reference to it can only sit inside a subquery FROM).
 				const seeded = targetIndex === 0 && ownTable && reached.ownerKey === undefined;
+				// Row-image mode, the one non-constant site: a ROOT body is a table's CHECK /
+				// DEFAULT / generated expression and therefore always written-row context —
+				// `'own'` only for the seeded base-target case, `'foreign'` otherwise (another
+				// table's root body binds that table's image; a republication target at the
+				// root still binds the OWNING table's image, not the view being probed).
+				// Anything REACHED below the root is a view / MV body — a relation with no
+				// written row — so `'none'`.
+				const rowImage = reached.ownerKey === undefined ? (seeded ? 'own' : 'foreign') : 'none';
 				const hit = seeded
 					? columnReferencedInCheckExpression(reached.body, target.tableName, columnName,
-						reached.resolve, target.targetKey, resolveColumnInSource)
+						reached.resolve, target.targetKey, rowImage, resolveColumnInSource)
 					: columnReferencedInAst(reached.body, target.tableName, columnName,
-						reached.resolve, target.targetKey, resolveColumnInSource);
+						reached.resolve, target.targetKey, rowImage, resolveColumnInSource);
 				if (hit) return { path: reached.path };
 			}
 		}

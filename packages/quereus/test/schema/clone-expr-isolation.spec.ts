@@ -41,7 +41,7 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 		const src = parseExpressionString('(with c as (select v from t) select count(*) from c) > 0');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', resolveMain, T_KEY);
+		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', resolveMain, T_KEY, 'own');
 		expect(changed, 'rewriter should hit the CTE body in the clone').to.equal(true);
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
 	});
@@ -50,7 +50,7 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 		const src = parseExpressionString('exists (select sum(v) over (partition by v order by v) from t)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', resolveMain, T_KEY);
+		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', resolveMain, T_KEY, 'own');
 		expect(changed, 'rewriter should hit the window function in the clone').to.equal(true);
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
 	});
@@ -79,7 +79,7 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 		const src = parseExpressionString('exists (update t set v = v + 1 where v > 0 returning v)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', resolveMain, T_KEY);
+		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', resolveMain, T_KEY, 'own');
 		expect(changed, 'rewriter should hit the assignments in the clone').to.equal(true);
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
 	});
@@ -89,7 +89,7 @@ describe('cloneExpr isolation vs in-place rename rewriters', () => {
 			'exists (insert into t (v) values (1) on conflict (v) do update set v = v + 1 where v > 0 returning v)');
 		const before = expressionToString(src);
 		const clone = cloneExpr(src);
-		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', resolveMain, T_KEY);
+		const changed = renameColumnInCheckExpression(clone, 't', 'v', 'w', resolveMain, T_KEY, 'own');
 		expect(changed, 'rewriter should hit the upsert clause in the clone').to.equal(true);
 		expect(expressionToString(src), 'source AST must be byte-stable').to.equal(before);
 	});

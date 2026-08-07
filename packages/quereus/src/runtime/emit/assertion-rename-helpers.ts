@@ -74,7 +74,8 @@ export function propagateColumnRenameToAssertions(
 	for (const assertion of Array.from(schema.getAllAssertions())) {
 		const check = assertion.checkExpression;
 		if (!check) continue;
-		if (!renameColumnInAst(check, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource)) continue;
+		// Row-image mode 'none': an assertion body owns no `new.` / `old.` namespace.
+		if (!renameColumnInAst(check, tableName, oldCol, newCol, resolve, targetKey, 'none', resolveColumnInSource)) continue;
 		reregisterRewrittenAssertion(db, schema, assertion, check, assertion.dependentTables);
 	}
 }

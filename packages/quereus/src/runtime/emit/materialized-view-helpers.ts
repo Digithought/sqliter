@@ -2802,7 +2802,7 @@ export async function propagateColumnRenameToMaterializedViews(
 			// `resolveColumnInSource` keeps the body walk scope-aware for a defaults-expr
 			// subquery referencing a like-named column on its own FROM — plain-view /
 			// differ-reconcile parity (see `renameColumnInAst`).
-			const bodyChanged = renameColumnInAst(d.selectAst, tableName, oldCol, newCol, resolve, targetKey, resolveColumnInSource);
+			const bodyChanged = renameColumnInAst(d.selectAst, tableName, oldCol, newCol, resolve, targetKey, 'none', resolveColumnInSource);
 			if (!bodyChanged) continue;
 			await applyMaterializedViewRewrite(db, schema, mv, {}, preStale, /*renamedColumns*/ true);
 		} catch (e) {

@@ -449,25 +449,25 @@ describe('DML write targets in the column walker', () => {
 
 	it('an INSERT target naming the statement\'s own CTE is not the renamed table', () => {
 		const stmt = parseInsert('with t as (select 1 as k) insert into t (k) select k from t');
-		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey)).to.equal(false);
+		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey, 'none')).to.equal(false);
 		expect(stmt.columns).to.deep.equal(['k']);
 	});
 
 	it('an INSERT target that really is the renamed table still rewrites its column list', () => {
 		const stmt = parseInsert('insert into t (k) values (1)');
-		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey)).to.equal(true);
+		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey, 'none')).to.equal(true);
 		expect(stmt.columns).to.deep.equal(['k2']);
 	});
 
 	it('an UPDATE target naming the statement\'s own CTE leaves its assignments alone', () => {
 		const stmt = parse('with t as (select 1 as k) update t set k = 2') as AST.UpdateStmt;
-		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey)).to.equal(false);
+		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey, 'none')).to.equal(false);
 		expect(stmt.assignments[0].column).to.equal('k');
 	});
 
 	it('an UPDATE target in another schema is not the renamed table', () => {
 		const stmt = parse('update temp.t set k = 2') as AST.UpdateStmt;
-		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey)).to.equal(false);
+		expect(renameColumnInAst(stmt, 't', 'k', 'k2', resolve, targetKey, 'none')).to.equal(false);
 		expect(stmt.assignments[0].column).to.equal('k');
 	});
 });

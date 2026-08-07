@@ -269,6 +269,14 @@ from people;
 - Because the clause lives on the core `select`, it parses at every relation site — view
   bodies, CTE bodies, subqueries-in-`from`, and lens bodies — and is **inert metadata
   until the relation is an actual write target**.
+- An inverse expression's `new.` references are **inert to schema-rename propagation**:
+  they name the enclosing select's output row, so neither renaming a real table called
+  `new` (or one of its columns) nor dropping it touches or is blocked by them. They follow
+  exactly one thing — a shift of the enclosing select's **own published output name**
+  (e.g. `alter table … rename column` moving a bare passthrough projection's name), and
+  that shift stops at a nested select's own `with inverse` clause, whose `new.` refs
+  track the nested outputs instead. Table and column references inside an inverse
+  expression's *subqueries* propagate normally.
 
 See [vu-inverses.md § Authored inverses](vu-inverses.md#authored-inverses-with-inverse)
 for the law treatment (PutGet / GetPut) and the per-shape consumption.
@@ -291,7 +299,10 @@ insert into NewUsers (uid, label) values (7, 'Bob');   -- created defaults to ep
 
 - Each entry names a base column the view projects away (the dominant case) or a
   `base`-lineage view column, and supplies a **self-contained** expression (literals,
-  function calls, subqueries — it cannot reference the inserted row's columns). At
+  function calls, subqueries — it cannot reference the inserted row's columns; that rule
+  is documented, not rejected at create time, and schema-rename propagation pins it the
+  same way it does `with inverse`: a bare `new.` / `old.` in an entry expression is never
+  treated as a reference to a table so named). At
   write-through it fills a still-omitted column *after* the user value / equality-predicate
   constant / EC sources and *ahead of* the base column's declared `default`.
 - Column names must be distinct (a duplicate is a parse error); the target is resolved —

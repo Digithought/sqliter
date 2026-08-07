@@ -13,7 +13,7 @@
  * keep one import path.
  */
 
-export type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from './rename/shared.js';
+export type { ResolveColumnInSource, ResolveObjectRef, RowImageContext, TableRenameTarget } from './rename/shared.js';
 export { objectRefKey, objectRefKeySchema, singleSchemaObjectRefResolver } from './rename/shared.js';
 export {
 	renameTableInAst,

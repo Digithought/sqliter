@@ -95,7 +95,9 @@ export function scanShiftedPublishers(
 			let probe = body;
 			if (opts.probeOnClone) {
 				probe = spineCloneAst(body);
-				renameColumnInAst(probe, target.tableName, oldCol, newCol, resolve, target.targetKey, resolveColumnInSource);
+				// Row-image mode 'none': a view / MV body is a relation with no written
+				// row (its `with inverse` / `with defaults` subtrees self-suppress).
+				renameColumnInAst(probe, target.tableName, oldCol, newCol, resolve, target.targetKey, 'none', resolveColumnInSource);
 			}
 			return bodyExposesRenamedColumn(probe, target.tableName, oldCol, newCol, resolve, target.targetKey, resolveColumnInSource);
 		};

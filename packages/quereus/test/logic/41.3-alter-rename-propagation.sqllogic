@@ -1855,3 +1855,166 @@ select count(*) as c from t_c61;
 drop table t_c61;
 drop view uv_c61;
 drop table u_c61;
+
+-- ===================================
+-- 62. Renaming a column of a table called "new" / "old" leaves OTHER tables'
+--     row-image qualifiers untouched
+-- ===================================
+-- Inside a CHECK, a column DEFAULT or a generated body, a bare unbound `new.<col>` /
+-- `old.<col>` names the row being written — that TABLE'S OWN row image, never a
+-- catalog table. So renaming a column of a real table called "new" must not touch
+-- another table's `new.v`: pre-fix it did, the other table's CHECK/DEFAULT then named
+-- a column it does not have, and every later write to it failed with an error naming
+-- neither the table nor the statement that broke it. §24/§29 pin the OWN-table rewrite
+-- (the qualifier follows its own table's rename); this section pins the foreign no-op.
+
+create table "new" (id integer primary key, v integer);
+create table nwck_c62 (id integer primary key, v integer, constraint ck_c62 check (new.v > 0));
+create table nwdf_c62 (id integer primary key, v integer, d integer default (new.v + 1));
+insert into nwck_c62 values (1, 5);
+insert into nwdf_c62 (id, v) values (1, 4);
+
+alter table "new" rename column v to w;
+
+-- Both tables still writable: their qualifiers still name their own row images.
+insert into nwck_c62 values (2, 7);
+insert into nwdf_c62 (id, v) values (2, 9);
+select id, d from nwdf_c62 order by id;
+→ [{"id":1,"d":5},{"id":2,"d":10}]
+
+-- ...and the CHECK still enforces.
+insert into nwck_c62 values (3, -1);
+-- error: ck_c62
+
+drop table nwdf_c62;
+drop table nwck_c62;
+drop table "new";
+
+-- `old.` behaves identically.
+create table "old" (id integer primary key, v integer);
+create table odck_c62 (id integer primary key, v integer,
+                       constraint ckod_c62 check on update (old.v >= 0));
+insert into odck_c62 values (1, 5);
+
+alter table "old" rename column v to w;
+
+update odck_c62 set v = 6 where id = 1;
+select v from odck_c62;
+→ [{"v":6}]
+
+drop table odck_c62;
+drop table "old";
+
+-- Controls: a GENUINE reference to the table called "new" still rewrites. A
+-- FROM-bound subquery reference (bare and qualified alike) is not a row image —
+-- the qualifier binds through the subquery's FROM, so the rename follows it.
+create table "new" (id integer primary key, v integer);
+insert into "new" values (1, 10);
+create table r_c62 (id integer primary key, n integer,
+                    constraint ckr_c62 check (n < (select max(v) from "new")));
+create table rq_c62 (id integer primary key, n integer,
+                     constraint ckrq_c62 check (n < (select max("new".v) from "new")));
+
+alter table "new" rename column v to w;
+
+insert into r_c62 values (1, 5);
+insert into rq_c62 values (1, 5);
+insert into r_c62 values (2, 99);
+-- error: ckr_c62
+insert into rq_c62 values (2, 99);
+-- error: ckrq_c62
+
+-- ...and the OWN-table row image of "new" itself still follows its own rename
+-- (§24's shape, on a table that happens to be called "new").
+alter table "new" add constraint cknw_c62 check (new.w >= 0);
+alter table "new" rename column w to x;
+insert into "new" values (2, 20);
+insert into "new" values (3, -1);
+-- error: cknw_c62
+
+drop table rq_c62;
+drop table r_c62;
+drop table "new";
+
+-- ===================================
+-- 63. A `with inverse` expression's `new.` refs are inert to renames of a
+--     table called "new"
+-- ===================================
+-- Inside a result column's `with inverse (…)` clause, `new.<x>` names an OUTPUT
+-- column of the enclosing select (docs/sql-select.md § Result-column inverses) —
+-- written-row context sitting inside a view body. Neither a column rename nor a
+-- table rename of a real table called "new" may touch it; pre-fix both corrupted
+-- the clause and every later write through the view failed validation.
+
+create table "new" (id integer primary key, v integer);
+create table people_c63 (id integer primary key, code5 text);
+create view vp_c63 as
+  select id, case code5 when 'A1' then 'A' end as v
+    with inverse (code5 = case new.v when 'A' then 'A1' end)
+  from people_c63;
+insert into vp_c63 (id, v) values (1, 'A');
+
+alter table "new" rename column v to w;
+
+insert into vp_c63 (id, v) values (2, 'A');
+select id, code5 from people_c63 order by id;
+→ [{"id":1,"code5":"A1"},{"id":2,"code5":"A1"}]
+
+alter table "new" rename to fresh_c63;
+
+insert into vp_c63 (id, v) values (3, 'A');
+select count(*) as c from people_c63;
+→ [{"c":3}]
+
+drop view vp_c63;
+drop table people_c63;
+drop table fresh_c63;
+
+-- The same shape one level in from a seeded CHECK — the inverse clause of a
+-- subquery select inside another table's own CHECK is that INNER select's
+-- written-row namespace, not the outer table's, so the outer rename leaves its
+-- `new.a` alone (the inner output `a` is an alias and does not shift).
+create table src_c63 (id integer primary key, a integer);
+create table ck8_c63 (id integer primary key, a integer,
+  constraint c8_c63 check (a < (select count(*)
+                                from (select id as a with inverse (id = new.a) from src_c63)) + 100));
+
+alter table ck8_c63 rename column a to b;
+
+insert into ck8_c63 (id, b) values (1, 0);
+select id, b from ck8_c63;
+→ [{"id":1,"b":0}]
+
+drop table ck8_c63;
+drop table src_c63;
+
+-- ===================================
+-- 64. The output-name shift stops at a NESTED select's own inverse clause
+-- ===================================
+-- When a rename shifts the enclosing select's published output name, sibling
+-- `new.<old>` refs in its inverse clauses follow (§'s above). A subquery inside
+-- such an expression may be a select with its OWN inverse clause, whose `new.`
+-- refs belong to THAT select's outputs — the pass must not reach into it.
+
+create table b_c64 (id integer primary key, v integer);
+create table c_c64 (id integer primary key, v integer);
+create view vw_c64 as
+  select id, v
+    with inverse (v = new.v + (select count(*)
+                               from (select v with inverse (v = new.v) from c_c64)))
+  from b_c64;
+insert into c_c64 values (1, 1);
+
+alter table b_c64 rename column v to w;
+
+-- The outer output shifted v → w (readers follow, §54), so the outer `new.v`
+-- followed the shift; the inner select still publishes `v`, so its own `new.v`
+-- must not have moved. The write-through evaluates the outer clause:
+-- base w = new.w + count over c_c64 = 41 + 1.
+insert into vw_c64 (id, w) values (1, 41);
+select id, w from b_c64;
+→ [{"id":1,"w":42}]
+
+drop view vw_c64;
+drop table c_c64;
+drop table b_c64;
