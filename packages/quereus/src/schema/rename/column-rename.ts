@@ -542,6 +542,14 @@ function buildScopeFrame(from: AST.FromClause[] | undefined, state: ColumnRewrit
  * with that, now that one map holds aliases and bare names together — a
  * two-map lookup used to answer alias-first, which matched the planner only
  * when the aliased source came first.
+ *
+ * First-wins matches how the planner resolves a qualified COLUMN, but the planner
+ * expands a qualified STAR by name-matching every source, so `select t.* from u as
+ * t join t` yields both sources' columns while this walk sees only `u` — the
+ * engine disagreeing with itself about a duplicated qualifier, tracked by
+ * `bug-duplicate-from-qualifier-resolves-inconsistently`. Making this walk match
+ * the star would just pick the other side of the disagreement; the ticket's fix is
+ * to reject the duplicate at build time, after which the question stops existing.
  */
 function bindQualifier(frame: ScopeFrame, qualifierLower: string, key: string): void {
 	if (!frame.qualifiers.has(qualifierLower)) frame.qualifiers.set(qualifierLower, key);

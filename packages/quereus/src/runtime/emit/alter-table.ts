@@ -390,7 +390,7 @@ async function runRenameColumn(
 	// resolver with `propagateColumnRename` so the two passes cannot drift apart in
 	// code; what makes them agree at RUNTIME (the resolver reads the LIVE catalog, and
 	// this probe runs pre-mutation while the propagation runs post-) is that
-	// `isTableInUnaliasedScope` skips the renamed table itself and probes only OTHER
+	// `unqualifiedRefBindsTarget` skips the renamed table itself and probes only OTHER
 	// sources, whose column sets this rename does not touch.
 	const resolveColumnInSource = buildColumnSourceResolver(rctx.db);
 	// Reference-resolution snapshot, BEFORE the first side effect — same discipline

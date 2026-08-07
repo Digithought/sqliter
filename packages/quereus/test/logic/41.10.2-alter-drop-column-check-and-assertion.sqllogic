@@ -1581,6 +1581,23 @@ drop table DcAlJU;
 drop table DcAlJ;
 -- run
 
+-- ...and the column-DEFAULT arm. Same walk, different site: the assertion and CHECK
+-- arms above both reach the walk through a body the drop guard probes as a rule,
+-- while a DEFAULT is an expression carried by a column. Both bare-under-alias
+-- spellings are here — one where the alias is the only thing between the ref and
+-- the source, one where the source is joined.
+create table DcAlD (id integer primary key, x integer);
+create table DcAlDRef (id integer primary key,
+                       n integer default ((select max(x) from DcAlD a where x > 0)));
+-- run
+
+alter table DcAlD drop column x;
+-- error: it is referenced by the DEFAULT of column 'n' on table 'DcAlDRef'
+
+drop table DcAlDRef;
+drop table DcAlD;
+-- run
+
 -- Guard rail: widening the binding must not start capturing a bare name that
 -- legitimately binds somewhere ELSE. Here the rule's `x` binds the aliased `DcAlO`,
 -- not the altered table, so dropping DcAlN.x is still legal.

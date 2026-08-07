@@ -599,7 +599,7 @@ drop table t_nest;
 -- ===================================
 -- 13. Shadowing CTE inside a derived-table subquery — unqualified ref
 -- ===================================
--- Outer FROM has the renamed real table (so the outer frame's `unaliased`
+-- Outer FROM has the renamed real table (so the outer frame's `qualifiers`
 -- has it). A nested derived-table subquery introduces a same-name
 -- non-exposing CTE; the inner unqualified `k` must resolve to the inner
 -- CTE row source, not to the outer real-table binding, and therefore
@@ -2058,6 +2058,23 @@ drop view alr_c65;
 drop view als_c65;
 drop view alv_c65;
 drop table al_c65;
+-- run
+
+-- A MATERIALIZED view over an aliased source is a second site on the same walk:
+-- its body rewrite carries the shifted output name onto the backing table in
+-- place, so the star has to be recognised as a passthrough there too.
+create table alm_c65 (id integer primary key, x integer);
+insert into alm_c65 values (1, 5);
+create materialized view almv_c65 as select * from alm_c65 a;
+-- run
+
+alter table alm_c65 rename column x to z;
+
+select id, z from almv_c65;
+→ [{"id":1,"z":5}]
+
+drop materialized view almv_c65;
+drop table alm_c65;
 -- run
 
 -- Guard rail: the widened binding must not capture a bare name that binds
