@@ -1,0 +1,200 @@
+-- conjunct-monotonicity.sqllogic - adding a WHERE conjunct must never widen the result
+--
+-- Regression guard for `bug-primary-key-conjunct-lost-with-correlated-subquery`, and
+-- the generalisation of `bug-filter-conjunct-lost-under-index-order` (pinned next door
+-- in 07.7.5). Both bugs are the same observable class: a conjunct is silently dropped
+-- and the query returns rows the WHERE excluded.
+--
+-- Mechanism of this instance: once `rule-grow-retrieve` equips a Retrieve with an
+-- index-style access plan, that plan is the SOLE authority for what the table access
+-- enforces — `rule-select-access-path` never reads `Retrieve.source`. A correlated
+-- sub-select conjunct is hoisted above the Retrieve as its own Filter, gets rewritten
+-- into a semi join, and join-predicate-pushdown then drops the REMAINING plain conjunct
+-- back down as a bare Filter directly over the already-equipped Retrieve. That fires
+-- grow-retrieve a SECOND time, and its re-probe used to build a request from the new
+-- Filter alone — replacing the committed plan (which was seeking `id = 2`) with an
+-- ordering-only index walk that enforced nothing. Three conjuncts and a CORRELATED
+-- sub-select are both required: with two conjuncts nothing is left over to push back
+-- down, and an uncorrelated sub-select keeps the residual as a single Filter.
+--
+-- Invariant pinned here: the result of a WHERE is monotonically non-increasing in its
+-- conjuncts. For conjuncts K (primary key), N (non-key column) and S (correlated
+-- sub-select), every superset's row set is contained in every subset's. The sweep below
+-- enumerates all seven non-empty subsets, so it covers both known instances and every
+-- shape between them rather than only the one query that was reported.
+
+-- =============================================================================
+-- The sweep. Each conjunct discriminates, so a dropped one is always visible:
+--   K = id = 2                                             -> {2}
+--   N = flag = 1                                           -> {1,2}
+--   S = exists (select 1 from o o2 where o2.id = o.id
+--                 and o2.id < 4)                           -> {1,2,3}
+-- =============================================================================
+
+create table o (id integer primary key, flag integer);
+insert into o values (1, 1), (2, 1), (3, 0), (4, 0);
+
+-- Singletons.
+
+select id from o where id = 2;
+→ [{"id":2}]
+
+select id from o where flag = 1;
+→ [{"id":1},{"id":2}]
+
+select id from o where exists (select 1 from o o2 where o2.id = o.id and o2.id < 4);
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- Pairs. Each must be contained in both of its singletons.
+
+select id from o where id = 2 and flag = 1;
+→ [{"id":2}]
+
+select id from o where id = 2 and exists (select 1 from o o2 where o2.id = o.id and o2.id < 4);
+→ [{"id":2}]
+
+select id from o where flag = 1 and exists (select 1 from o o2 where o2.id = o.id and o2.id < 4);
+→ [{"id":1},{"id":2}]
+
+-- The triple, in every conjunct order. This is the shape that regressed: the answer
+-- must stay {2} no matter which conjunct the planner happens to visit first.
+
+select id from o where id = 2 and flag = 1 and exists (select 1 from o o2 where o2.id = o.id and o2.id < 4);
+→ [{"id":2}]
+
+select id from o where flag = 1 and id = 2 and exists (select 1 from o o2 where o2.id = o.id and o2.id < 4);
+→ [{"id":2}]
+
+select id from o where exists (select 1 from o o2 where o2.id = o.id and o2.id < 4) and flag = 1 and id = 2;
+→ [{"id":2}]
+
+select id from o where flag = 1 and exists (select 1 from o o2 where o2.id = o.id and o2.id < 4) and id = 2;
+→ [{"id":2}]
+
+drop table o;
+
+-- =============================================================================
+-- The reported shapes, verbatim. Every row carries flag = 1 here, so the non-key
+-- conjunct cannot mask a dropped key conjunct: dropping `id = 2` yields all three
+-- rows, which is unmistakable.
+-- =============================================================================
+
+create table o (id integer primary key, flag integer);
+insert into o values (1, 1), (2, 1), (3, 1);
+
+-- Correlated EXISTS on the key column.
+
+select id from o where flag = 1 and id = 2 and exists (select 1 from o o2 where o2.id = o.id);
+→ [{"id":2}]
+
+-- Correlated EXISTS on the NON-key column: a different decorrelation shape.
+
+select id from o where flag = 1 and id = 2 and exists (select 1 from o o2 where o2.flag = o.flag);
+→ [{"id":2}]
+
+-- Correlated scalar sub-select rather than EXISTS.
+
+select id from o where flag = 1 and id = 2 and (select count(*) from o o2 where o2.id = o.id) = 1;
+→ [{"id":2}]
+
+-- The key conjunct written as a single-element IN: extracts as an IN constraint, not '='.
+
+select id from o where flag = 1 and id in (2) and exists (select 1 from o o2 where o2.id = o.id);
+→ [{"id":2}]
+
+-- The sub-select written first.
+
+select id from o where exists (select 1 from o o2 where o2.id = o.id) and flag = 1 and id = 2;
+→ [{"id":2}]
+
+-- BETWEEN: decomposes into a lower and an upper bound sharing ONE source expression.
+-- The de-duplication that keeps the re-probe's unioned constraint list clean must key
+-- on (expression, column, op) — keying on the expression alone collapses these two into
+-- one and silently drops the upper bound.
+
+select id from o where flag = 1 and id between 2 and 2 and exists (select 1 from o o2 where o2.id = o.id);
+→ [{"id":2}]
+
+select id from o where flag = 1 and id between 2 and 3 and exists (select 1 from o o2 where o2.id = o.id);
+→ [{"id":2},{"id":3}]
+
+-- A range key conjunct rather than an equality: keeps more than one row, so a dropped
+-- predicate cannot be mistaken for a correct answer.
+
+select id from o where flag = 1 and id >= 2 and exists (select 1 from o o2 where o2.id = o.id);
+→ [{"id":2},{"id":3}]
+
+-- Aliased table with qualified column references throughout.
+
+select E.id from o E where E.flag = 1 and E.id = 2 and (select count(*) from o T where T.id = E.id) = 1;
+→ [{"id":2}]
+
+-- =============================================================================
+-- Control shapes that were already correct and must stay so: they exercise the
+-- neighbouring paths through the same rule (two conjuncts, constant conjunct,
+-- UNCORRELATED sub-select, absorbed ORDER BY, pushed LIMIT).
+-- =============================================================================
+
+select id from o where id = 2 and exists (select 1 from o o2 where o2.id = o.id);
+→ [{"id":2}]
+
+select id from o where flag = 1 and id = 2 and 1 = 1;
+→ [{"id":2}]
+
+select id from o where flag = 1 and id = 2 and (select count(*) from o o2) = 3;
+→ [{"id":2}]
+
+select id from o where id = 2 order by id;
+→ [{"id":2}]
+
+select id from o where id = 2 order by id desc;
+→ [{"id":2}]
+
+select id from o where id = 2 limit 5;
+→ [{"id":2}]
+
+select id from o where flag = 1 and id = 2 order by id;
+→ [{"id":2}]
+
+-- The full shape with an ORDER BY on top: the Sort re-probes the equipped Retrieve
+-- through the same code path the Filter does, so it must not clobber the seek either.
+
+select id from o where flag = 1 and id = 2 and exists (select 1 from o o2 where o2.id = o.id) order by id;
+→ [{"id":2}]
+
+select id from o where flag = 1 and id >= 2 and exists (select 1 from o o2 where o2.id = o.id) order by id desc;
+→ [{"id":3},{"id":2}]
+
+-- LIMIT on top: LimitOffset is the third operation grow-retrieve can translate into an
+-- index-style context, so it re-probes the committed plan as well.
+
+select id from o where flag = 1 and id >= 2 and exists (select 1 from o o2 where o2.id = o.id) order by id limit 1;
+→ [{"id":2}]
+
+drop table o;
+
+-- =============================================================================
+-- The mutation planner walks the same Retrieve/access-path rules, so a dropped
+-- conjunct there destroys or corrupts rows the WHERE excluded. This is the arm that
+-- makes the bug data-loss rather than a wrong read.
+-- =============================================================================
+
+create table m (id integer primary key, flag integer);
+insert into m values (1, 1), (2, 1), (3, 1);
+
+delete from m where flag = 1 and id = 2 and exists (select 1 from m m2 where m2.id = m.id);
+
+select id, flag from m order by id;
+→ [{"id":1,"flag":1},{"id":3,"flag":1}]
+
+drop table m;
+
+create table m (id integer primary key, flag integer);
+insert into m values (1, 1), (2, 1), (3, 1);
+
+update m set flag = 9 where flag = 1 and id = 2 and exists (select 1 from m m2 where m2.id = m.id);
+
+select id, flag from m order by id;
+→ [{"id":1,"flag":1},{"id":2,"flag":9},{"id":3,"flag":1}]
+
+drop table m;

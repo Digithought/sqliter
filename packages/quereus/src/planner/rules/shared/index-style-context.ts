@@ -13,10 +13,20 @@
  *
  * NOTE: once this context is present on a Retrieve, it is the SOLE authority for what
  * the table access applies — `ruleSelectAccessPath` builds the physical leaf from
- * `accessPlan` + `residualPredicate` and never reads `RetrieveNode.source`. Rules must
- * therefore not push a predicate into a committed Retrieve's `source`; it would be
- * silently dropped. Amend this context instead, or leave the Filter above the Retrieve
- * so `ruleGrowRetrieve` can re-probe the module with it.
+ * `accessPlan` + `residualPredicate` and never reads `RetrieveNode.source`. Two rules
+ * follow from that, and BOTH have been the subject of a rows-silently-widened bug:
+ *
+ *  1. Rules must not push a predicate into a committed Retrieve's `source`; it would be
+ *     silently dropped. Amend this context instead, or leave the Filter above the
+ *     Retrieve so `ruleGrowRetrieve` can re-probe the module with it.
+ *     (`bug-filter-conjunct-lost-under-index-order`.)
+ *  2. A committed context may only be REPLACED by one that enforces a superset of what
+ *     it enforced. `ruleGrowRetrieve` can fire a second time on the same Retrieve, and
+ *     its re-probe returns a fresh context that replaces this one wholesale — so the
+ *     re-probe must request at least the constraints this context already claims
+ *     (`originalConstraints`), must carry `residualPredicate` forward, and must not
+ *     accept a plan that drops `accessPlan.providesOrdering` when it is load-bearing.
+ *     (`bug-primary-key-conjunct-lost-with-correlated-subquery`.)
  */
 
 import type { BestAccessPlanResult } from '../../../vtab/best-access-plan.js';

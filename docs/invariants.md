@@ -248,7 +248,8 @@ therefore declines outright and leaves the `Filter` above the boundary, where gr
 re-probes `getBestAccessPlan()` with the constraint on the next fixed-point iteration and
 residualizes whatever the module declines — so nothing is lost by declining. `Retrieve.source`
 stays populated for the readers that still walk it (binding collection, and the constraint
-sweep in `trySortAbsorbViaIndexOrdering`); it is dead only as an *execution* channel.
+sweep in `trySortAbsorbViaIndexOrdering`); it is dead only as an *execution* channel. See
+OPT-026 for the same seam in the opposite direction — replacing the context itself.
 
 ### OPT-024 — An unconsumed seek constraint is reattached
 
@@ -279,6 +280,21 @@ relational node reached through a scalar child is a different scope. Without the
 constraint on `a`, which becomes a residual `Filter` reading `t.s` over the scan of `a` — a
 "no row context" error, or (under `not exists`) silently wrong rows. A constraint whose
 *value* side references an outer attribute stays legal: that is correlated seek pushdown.
+
+### OPT-026 — A committed access-path context is replaced only by a superset
+
+- code: `packages/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts` — `fallbackIndexSupports`
+- guard: `packages/quereus/test/primary-key-conjunct-lost-with-correlated-subquery.spec.ts` — `Primary key conjunct lost with correlated subquery`
+- doc: [Retrieve § Re-probing a committed access path](optimizer-retrieve.md#re-probing-a-committed-access-path)
+
+`ruleGrowRetrieve` can fire again on an already-equipped `Retrieve`, and its re-probe
+returns a context that replaces the committed one wholesale. Since `moduleCtx` — not
+`Retrieve.source` — is what executes, the new context must enforce a superset of the old:
+the request is seeded with the committed `originalConstraints` (de-duplicated on
+`(sourceExpression, columnIndex, op)`, so a `BETWEEN`'s two bounds survive), the committed
+`residualPredicate` is folded into the new residual, and an equipped `providesOrdering` is
+re-requested. Growing a `Sort` or `LimitOffset` swallows it, so those arms additionally
+require the plan to provide the requested ordering.
 
 ### OPT-030 — Uniqueness is read through one surface
 

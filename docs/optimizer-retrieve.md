@@ -52,6 +52,47 @@ RetrieveNode
 
 This policy ensures the `Retrieve` pipeline is always a precise description of what the module/index can handle; unsupported parts never enter the boundary.
 
+### Re-probing a committed access path
+
+> **Invariant:** [OPT-026](invariants.md#opt-026--a-committed-access-path-context-is-replaced-only-by-a-superset)
+
+`moduleCtx` and `Retrieve.source` are two channels, and only one of them executes. Once an
+index-style `moduleCtx` exists it is the **sole authority** for what the table access
+enforces; `source` is walked only for binding collection and the
+`trySortAbsorbViaIndexOrdering` constraint sweep. The policy above is the first
+consequence: do not write into `source`. This section is the second, in the opposite
+direction: do not **replace** `moduleCtx` with less than it held.
+
+`ruleGrowRetrieve` can fire more than once on the same `Retrieve` — a later rule drops a
+fresh `Filter` (or `Sort`, or `LimitOffset`) on top of one that is already equipped — and
+`fallbackIndexSupports` returns a brand-new context that replaces the committed one
+wholesale. So the re-probe seeds its `BestAccessPlanRequest` with the union of the
+committed context's `originalConstraints` and whatever it extracts from the incoming node,
+and folds the committed `residualPredicate` into the new residual. Anything the module
+declines on the second probe is residualized, so correctness does not depend on it
+answering the same way twice.
+
+Three details are load-bearing:
+
+- **De-duplication is keyed on `(sourceExpression, columnIndex, op)`, not on the expression
+  alone.** A `BETWEEN` decomposes into a lower and an upper bound sharing one source node;
+  collapsing them drops half the range. Leaving genuine duplicates in is not harmless
+  either — the module claims the first copy, `reattachUnconsumedConstraints` re-applies the
+  second as a redundant residual, and the cost shift can flip a join strategy.
+- **The ordering channel has the same rule.** An equipped `providesOrdering` is
+  re-requested and a plan that does not provide it is declined, so a re-probe cannot
+  clobber a plan whose emission order a dropped `Sort` now depends on.
+- **Growing a `Sort` or a `LimitOffset` swallows it** — the node lands in `source`, which
+  never executes — so those arms are accepted only when the plan provides the requested
+  ordering. A handled filter is not a licence to drop an `ORDER BY`.
+
+Two bugs have been filed against these two directions of the same seam
+(`bug-filter-conjunct-lost-under-index-order` for `source`,
+`bug-primary-key-conjunct-lost-with-correlated-subquery` for replacement); both presented
+identically, as a silently dropped `WHERE` conjunct returning every row. The general
+property behind them is that **adding a conjunct must never widen the result set**, pinned
+in `test/logic/07.7.9-conjunct-monotonicity.sqllogic`.
+
 ### Constraint sweep scope
 
 > **Invariant:** [OPT-025](invariants.md#opt-025--a-predicate-constrains-only-tables-in-its-own-relational-input)

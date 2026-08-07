@@ -240,8 +240,55 @@ function canTranslateToIndexConstraints(node: PlanNode): boolean {
 }
 
 /**
+ * Drop constraints that repeat one already present. A re-grow unions the committed
+ * context's constraints with those re-extracted from the incoming node, and the same
+ * predicate node commonly appears in both.
+ *
+ * Identity is (sourceExpression, columnIndex, op) — NOT `sourceExpression` alone: a
+ * BETWEEN decomposes into a lower and an upper bound that share one source node, so
+ * keying on the node would drop half the range (`id between 51 and 150` would delete
+ * everything from 51 up). Do not "simplify" this back to expression identity.
+ *
+ * Duplicates are not merely untidy: the module claims the first copy and the second
+ * falls through to `reattachUnconsumedConstraints`, which re-applies it as a redundant
+ * residual Filter and shifts the cost estimate enough to flip join strategies.
+ */
+function dedupeConstraints(constraints: PredicateConstraint[]): PredicateConstraint[] {
+	const rolesByExpression = new Map<ScalarPlanNode, Set<string>>();
+	const out: PredicateConstraint[] = [];
+	for (const constraint of constraints) {
+		if (constraint.sourceExpression) {
+			const role = `${constraint.columnIndex}:${constraint.op}`;
+			let roles = rolesByExpression.get(constraint.sourceExpression);
+			if (!roles) {
+				roles = new Set();
+				rolesByExpression.set(constraint.sourceExpression, roles);
+			}
+			if (roles.has(role)) continue;
+			roles.add(role);
+		}
+		out.push(constraint);
+	}
+	return out;
+}
+
+/**
  * Fallback assessment for index-style modules using getBestAccessPlan
  * Translates various operations to index constraints
+ *
+ * INVARIANT — an `IndexStyleContext` may only be replaced by one that enforces a
+ * SUPERSET of what it enforced. This function returns a brand-new context that
+ * *replaces* `existingCtx` wholesale, and once a Retrieve carries such a context it is
+ * the sole authority for what the table access applies (`ruleSelectAccessPath` never
+ * reads `Retrieve.source`). So the re-probe must request at least the constraints the
+ * committed context already claims, and must carry its residual forward — otherwise a
+ * conjunct the displaced plan was seeking is silently dropped and the query returns rows
+ * the WHERE excluded. Both halves are enforced below:
+ *  - constraints: `committedConstraints` is unioned into `request.filters` on every arm,
+ *    and anything the new plan declines is residualized instead (so correctness does not
+ *    depend on the module answering the second probe the way it answered the first);
+ *  - ordering: `equippedOrdering` is re-requested and the no-clobber guard declines a
+ *    plan that does not provide it.
  */
 function fallbackIndexSupports(
 	node: PlanNode,
@@ -269,6 +316,14 @@ function fallbackIndexSupports(
 			? existingCtx.accessPlan.providesOrdering
 			: undefined;
 
+	// What the CURRENTLY COMMITTED plan is enforcing. A re-probe replaces moduleCtx
+	// wholesale, so anything here left out of the new request/residual is silently
+	// dropped — `Retrieve.source` is not an execution channel once a ctx exists.
+	const committedConstraints: PredicateConstraint[] =
+		isIndexStyleContext(existingCtx) ? [...existingCtx.originalConstraints] : [];
+	const committedResidual: ScalarPlanNode | undefined =
+		isIndexStyleContext(existingCtx) ? existingCtx.residualPredicate : undefined;
+
 	// Build BestAccessPlanRequest based on node type
 	const request: BestAccessPlanRequest = {
 		columns: tableSchema.columns.map((col, index) => ({
@@ -286,7 +341,7 @@ function fallbackIndexSupports(
 
 	// Extract information based on node type
 	let residualPredicate: ScalarPlanNode | undefined;
-	let plannerConstraints: PredicateConstraint[] | undefined;
+	let plannerConstraints: PredicateConstraint[] = committedConstraints;
 
 	if (node instanceof FilterNode) {
 		// Extract constraints from filter predicate
@@ -294,15 +349,17 @@ function fallbackIndexSupports(
 		const normalizedPredicate = normalizePredicate(node.predicate);
 		const extraction = extractConstraints(normalizedPredicate, [tableInfo]);
 
+		// Declining is always safe, committed context or not: the Filter stays above the
+		// Retrieve and executes there, and the committed context is left untouched.
 		if (extraction.allConstraints.length === 0) {
 			log('No extractable constraints from filter predicate');
 			return undefined;
 		}
 
-		plannerConstraints = extraction.allConstraints;
-		request.filters = plannerConstraints;
+		plannerConstraints = dedupeConstraints([...committedConstraints, ...extraction.allConstraints]);
 		residualPredicate = extraction.residualPredicate;
-		log('Extracted %d constraints from Filter', plannerConstraints.length);
+		log('Extracted %d constraints from Filter (%d carried from committed context)',
+			extraction.allConstraints.length, committedConstraints.length);
 
 	} else if (node.nodeType === PlanNodeType.Sort) {
 		// Extract ordering requirements from Sort node
@@ -356,6 +413,12 @@ function fallbackIndexSupports(
 		return undefined;
 	}
 
+	// Every arm requests at least the committed context's constraints: the Filter arm
+	// unions them with its own extraction, the Sort / LimitOffset arms inherit them from
+	// the initializer. `handledFilters` is positional against this array, so it must be
+	// the same object the residual assembly below walks.
+	request.filters = plannerConstraints;
+
 	// Carry the equipped ordering into the re-probe (unless the node type already
 	// derived one, e.g. a Sort) so the module returns a direction-matching plan
 	// instead of a no-ordering one that would clobber the absorbed reverse plan.
@@ -408,6 +471,17 @@ function fallbackIndexSupports(
 		return undefined;
 	}
 
+	// Growing a Sort or a LimitOffset SWALLOWS it — the node lands in `Retrieve.source`,
+	// which the index-style branch of `ruleSelectAccessPath` never reads. Such a grow is
+	// only sound when the plan actually provides the ordering that was requested, so a
+	// handled filter alone must not license it. Before the committed constraints were
+	// unioned into `request.filters` these arms sent no filters at all and
+	// `handlesAnyFilter` was therefore always false for them; this keeps that.
+	if (!(node instanceof FilterNode) && !providesOrdering) {
+		log('Growing %s would swallow it without the plan providing its ordering; declining', node.nodeType);
+		return undefined;
+	}
+
 	if (accessPlan.cost >= seqCost && !providesOrdering) {
 		log('Access plan cost (%d) not better than sequential scan (%d)', accessPlan.cost, seqCost);
 		return undefined;
@@ -415,16 +489,19 @@ function fallbackIndexSupports(
 
 	log('Index-style fallback beneficial: cost %d vs %d seq scan', accessPlan.cost, seqCost);
 
-	// Compute full residual: extraction residual + source expressions of unhandled constraints.
-	// The extractor marks constraints it can decompose (e.g., LIKE), but the module may not
-	// handle them.  Those unhandled constraints must be preserved as a residual filter.
-	if (plannerConstraints && plannerConstraints.length > 0) {
+	// Compute full residual: extraction residual + source expressions of unhandled
+	// constraints + the residual the displaced context was enforcing. The extractor marks
+	// constraints it can decompose (e.g., LIKE), but the module may not handle them; those
+	// must be preserved as a residual filter. `committedResidual` joins them because this
+	// new context replaces the committed one — nothing else re-applies it.
+	{
 		const unhandledExprs: ScalarPlanNode[] = [];
 		for (let i = 0; i < plannerConstraints.length; i++) {
 			if (!accessPlan.handledFilters[i] && plannerConstraints[i].sourceExpression) {
 				unhandledExprs.push(plannerConstraints[i].sourceExpression);
 			}
 		}
+		if (committedResidual) unhandledExprs.push(committedResidual);
 		if (unhandledExprs.length > 0) {
 			const parts: ScalarPlanNode[] = residualPredicate ? [residualPredicate, ...unhandledExprs] : unhandledExprs;
 			if (parts.length === 1) {
@@ -438,7 +515,7 @@ function fallbackIndexSupports(
 				}
 				residualPredicate = acc;
 			}
-			log('Added %d unhandled constraint expressions to residual', unhandledExprs.length);
+			log('Added %d unhandled/carried constraint expressions to residual', unhandledExprs.length);
 		}
 	}
 
@@ -449,7 +526,7 @@ function fallbackIndexSupports(
 		kind: 'index-style',
 		accessPlan,
 		residualPredicate,
-		originalConstraints: plannerConstraints ? [...plannerConstraints] : [],
+		originalConstraints: [...plannerConstraints],
 		...(isIndexStyleContext(existingCtx) && existingCtx.orderingLoadBearing
 			? { orderingLoadBearing: true } : {}),
 	};
