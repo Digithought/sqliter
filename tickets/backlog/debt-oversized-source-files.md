@@ -2,7 +2,7 @@ description: Nine source and test files across the repo have grown well past the
 files:
   - packages/quereus/src/vtab/memory/layer/manager.ts        # 3,589 lines
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,107 lines
-  - packages/quereus/src/schema/schema-differ.ts             # 2,725 lines (spec: 1,057)
+  - packages/quereus/src/schema/schema-differ.ts             # 3,013 lines (`wc -l`, 2026-08-07; 2,725 when this ticket was filed) (spec: 1,186)
   - packages/quereus/src/runtime/emit/alter-table.ts         # 2,419 lines
   - packages/quereus-isolation/src/isolated-table.ts         # 2,077 lines
   - packages/quereus-isolation/src/isolation-module.ts       # 1,825 lines
@@ -10,6 +10,7 @@ files:
   - packages/quoomb-cli/src/commands/dot-commands.ts         # 1,189 lines
   - packages/quereus-store/src/common/store-table-base.ts    # 1,033 lines
   - packages/quereus-store/src/common/store-table-scan.ts    # 1,023 lines
+  - packages/quereus/src/schema/rename/table-rename.ts       # 1,063 lines (`wc -l`, 2026-08-07) — the other half of the same split; crossed 1,000 when the qualifier-collision predicate landed
   - packages/quereus/src/schema/rename/column-rename.ts      # 1,370 lines (`wc -l`, 2026-08-06; 1,057 when this ticket was filed) — residue of the 1,759-line rename-rewriter.ts split (table/column/strip); the column walk alone is still over, and still growing
   - packages/quereus-store/src/common/store-table.ts         # update() alone is ~315 lines (~252-565)
   - packages/quereus-isolation/test/isolation-layer.spec.ts  # 6,860 lines
@@ -62,9 +63,11 @@ Reference: `packages/quereus/src/vtab/memory/module.ts` (988 lines) drives it.
 The larger of the two emitter offenders. Its internal seams need a look before proposing
 a split. (Re-measured 2026-08-03 with `wc -l`; grown since first filing at 3,093.)
 
-### `packages/quereus/src/schema/schema-differ.ts` — 2,725 lines (unit spec 1,057)
+### `packages/quereus/src/schema/schema-differ.ts` — 3,013 lines (unit spec 1,186)
 
-Measured with `wc -l` on 2026-08-02. One entry point (`computeSchemaDiff`) plus the DDL
+Re-measured with `wc -l` on 2026-08-07 (2,725 at first filing); the rename-artifact-tolerant
+compare (`absorbRenameArtifacts` and its three per-sink wrappers) is a natural extraction seam
+that arrived after the split description below was written. One entry point (`computeSchemaDiff`) plus the DDL
 renderer (`generateMigrationDDL`) over several separable responsibilities: rename
 resolution (tables, views, indexes, columns, named constraints); per-object-kind diffing
 (tables & columns, named constraints, indexes, views & materialized views, assertions);

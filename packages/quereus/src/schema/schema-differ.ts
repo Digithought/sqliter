@@ -1,4 +1,4 @@
-import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './catalog.js';
+import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex, CatalogAssertion } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, indexedColumnBareName, viewDefinitionToCanonicalString, astToString } from '../emit/ast-stringify.js';
@@ -919,11 +919,8 @@ export function computeSchemaDiff(
 		// absorb runs over a plain clone.
 		const bodyMatches = matchedActual !== undefined
 			&& (declaredBody === matchedActual.definition
-				|| (matchedActual.check !== undefined && (() => {
-					const clone = cloneExpr(declaredAssertion.assertionStmt.check);
-					absorbRenameArtifacts(clone, matchedActual.check, targetSchemaName);
-					return expressionToString(clone) === matchedActual.definition;
-				})()));
+				|| declaredCheckMatchesModuloRenameArtifacts(
+					declaredAssertion.assertionStmt.check, matchedActual, targetSchemaName));
 		if (bodyMatches && !namesDroppedObject(declaredAssertion.assertionStmt.check)) continue;
 		// Drift on a name match: drop the old one first (creates run later, see
 		// `generateMigrationDDL`), then recreate from the declaration.
@@ -1644,6 +1641,24 @@ function declaredViewMatchesModuloRenameArtifacts(
 	const reconciled = inverseRenamedViewParts(select, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
 	absorbRenameArtifacts(reconciled, actualSelect, schemaName);
 	return matches(viewDefinitionToCanonicalString(columns, reconciled));
+}
+
+/**
+ * The assertion twin of {@link declaredViewMatchesModuloRenameArtifacts}:
+ * whether the declared CHECK body equals the live one once the rename
+ * propagation's artifacts are absorbed. Assertions have no in-diff rename
+ * reconciliation to compose with, so the absorb runs over a plain clone.
+ * Returns `false` when the catalog carries no live AST (strict compare).
+ */
+function declaredCheckMatchesModuloRenameArtifacts(
+	declaredCheck: AST.Expression,
+	actual: CatalogAssertion,
+	schemaName: string,
+): boolean {
+	if (actual.check === undefined) return false;
+	const clone = cloneExpr(declaredCheck);
+	absorbRenameArtifacts(clone, actual.check, schemaName);
+	return expressionToString(clone) === actual.definition;
 }
 
 /**

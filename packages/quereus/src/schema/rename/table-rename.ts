@@ -280,7 +280,12 @@ export function renameTableInAst(
 			// the new name is visible in scope, even when nothing in its
 			// subtree actually spells it. Detecting real use would need a
 			// second pass over the subtree; the extra alias is harmless and
-			// only appears in a genuine collision.
+			// only appears in a genuine collision. It is not free for a
+			// MAINTAINED body, though: a pin changes the body text, hence the
+			// `bodyHash`, hence forces a re-hash / regenerate on an MV whose
+			// meaning did not change. If that ever shows up as churn on large
+			// bodies, narrow the predicate to names the subtree actually
+			// spells as a qualifier.
 			const collides = !eq(oldName, newName) && (ref.qualifierCollides?.(newName) ?? false);
 			if (collides && !ref.aliasAs) {
 				// A column qualifier bound to a source the rename is about to

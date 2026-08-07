@@ -2304,3 +2304,49 @@ select * from temp.qiv_c67;
 drop view temp.qiv_c67;
 drop table temp.qj_c67;
 drop table main.qj_c67;
+-- run
+
+-- Materialized-view twin: a maintained body is rewritten by the same walk, so
+-- the pin must survive the re-hash and re-plan the refresh performs.
+create table qm_c67 (id integer primary key, x integer);
+insert into qm_c67 values (1, 10);
+create table qn_c67 (id integer primary key, x integer);
+insert into qn_c67 values (1, 77);
+create materialized view qmv_c67 as select qm_c67.id as k, qm_c67.x as a, z_c67.x as b from qm_c67 join qn_c67 as z_c67 on qm_c67.id = z_c67.id;
+
+select * from qmv_c67;
+→ [{"k": 1, "a": 10, "b": 77}]
+
+alter table qm_c67 rename to z_c67;
+
+-- The stored rows mask a re-bind until the body re-plans.
+refresh materialized view qmv_c67;
+
+select * from qmv_c67;
+→ [{"k": 1, "a": 10, "b": 77}]
+
+drop materialized view qmv_c67;
+drop table qn_c67;
+drop table z_c67;
+-- run
+
+-- Assertion twin: the stored CHECK body goes through the same walk, so its
+-- qualifiers must keep binding what they bound.
+create table qp_c67 (id integer primary key, x integer);
+insert into qp_c67 values (1, 10);
+create table qq_c67 (id integer primary key, x integer);
+insert into qq_c67 values (1, 77), (2, 77), (3, 77);
+create assertion qa_c67 check (not exists (select 1 from qp_c67 join qq_c67 as w_c67 on qp_c67.id = w_c67.id where qp_c67.x < 0));
+
+alter table qp_c67 rename to w_c67;
+
+-- Still watching the renamed table…
+insert into w_c67 values (2, -1);
+-- error: Assertion
+
+-- …and not the sibling whose alias it now spells.
+insert into qq_c67 values (4, -1);
+
+drop assertion qa_c67;
+drop table qq_c67;
+drop table w_c67;
