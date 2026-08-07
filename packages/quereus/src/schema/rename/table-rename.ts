@@ -211,15 +211,20 @@ export function renameTableInAst(
 			}
 			return;
 		}
-		// The untouched arm: this reference is not the renamed object, but the
-		// name the rename CREATES can still capture it. Only references that
-		// re-resolve through the catalog carry `qualify` — the rest bind through
-		// a FROM frame and are preserved by qualifying their source instead. On a
-		// body naming an object that exists nowhere, `before` is the home
-		// schema's key and this pins the pre-existing "no such table" failure
-		// rather than letting the body start reading the new arrival; see the
-		// ALREADY-BROKEN BODIES note above.
+		// The untouched arm (see the doc comment). Only a reference that
+		// re-resolves through the catalog carries `qualify` — the rest bind
+		// through a FROM frame and are preserved by qualifying their source.
 		if (opts?.schemaAuthoredBody || !ref.qualify) return;
+		// NOTE: asks the resolvers about EVERY reference, where the rewrite arm
+		// above short-circuits on a bare-name compare first. The arm can in fact
+		// only fire on a reference spelling `newName` — the two resolvers differ
+		// only over `schemaName`'s name set, and the `oldName` direction is either
+		// the rewrite arm's or unchanged — so an `eq(ref.name, newName)` guard here
+		// would be equivalent and cheaper. Declined: it trades two Set lookups per
+		// reference on a DDL-only path for a claim that silently loses coverage if
+		// the `resolve`/`resolveAfter` pair ever differs more broadly than one
+		// table rename. Add the guard if rename propagation over a schema-heavy
+		// catalog ever measures hot.
 		const before = resolve(ref.schema, ref.name);
 		if (before === undefined || before === resolveAfter(ref.schema, ref.name)) return;
 		ref.qualify(objectRefKeySchema(before, ref.name.toLowerCase()));

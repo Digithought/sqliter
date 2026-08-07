@@ -1482,11 +1482,26 @@ function inverseRenamedViewParts(
 		//     the renamed table at all.
 		// A declared form of EITHER body would read the bare name, so re-diffing it
 		// reads as a body change and would emit a recreate back to the re-binding
-		// spelling. Unreachable today for both: qualification fires only when the
-		// body's home schema differs from the renamed table's, and a diff covers one
-		// schema at a time. If declarative schemas ever span schemas, this walk needs
-		// to accept a qualifier equal to `schemaName` as equivalent to the bare
-		// declared name.
+		// spelling. The two arms differ in whether that is reachable:
+		//   - REWRITTEN arm: unreachable. It qualifies to `schemaName`, and that only
+		//     fires when an EARLIER schema on the body's home path holds the new name
+		//     — impossible when the body's home schema IS the renamed table's, since a
+		//     home schema leads its own path. A diff covers one schema at a time, so
+		//     the two always coincide here. If declarative schemas ever span schemas,
+		//     this walk needs to accept a qualifier equal to `schemaName` as equivalent
+		//     to the bare declared name.
+		//   - UNTOUCHED arm: REACHABLE, and it does not need two schemas in the diff.
+		//     It qualifies to the schema the reference resolved to BEFORE — a LATER
+		//     one on the home path, never `schemaName` — so `declare schema temp` over
+		//     a `temp`-owned view reading bare `k` (meaning `main.k`), renaming
+		//     `temp.other` to `k`, leaves the live body reading `main.k` while the
+		//     declared form reads bare `k`. Measured: `apply schema temp` then
+		//     `diff schema temp` returns a DROP + recreate, so apply no longer
+		//     converges in one pass and a second apply undoes the pin. Accepting a
+		//     qualifier as equivalent to the bare declared name does NOT fix this one
+		//     — the declared single-schema world genuinely reads `k` as `temp.k`.
+		//     Tracked as an arm of `rename-preserves-qualifier-meaning`, which has to
+		//     teach this walk about forward-rename artifacts anyway.
 		renameTableInAst(selectClone, {
 			oldName: r.newName, newName: r.oldName, schemaName,
 			resolve: resolveRef, resolveAfter: resolveRef,

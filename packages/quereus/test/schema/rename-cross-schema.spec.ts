@@ -23,7 +23,7 @@ import { expressionToString } from '../../src/emit/ast-stringify.js';
 import { parseExpressionString } from '../../src/parser/index.js';
 import { parseInsert, parse } from '../../src/parser/index.js';
 import { snapshotObjectRefResolvers } from '../../src/schema/object-ref-resolver.js';
-import { objectRefKey, renameColumnInAst, renameTableInAst, renameTableInCheckConstraints, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
+import { objectRefKey, renameColumnInAst, renameTableInAst, renameTableInCheckConstraints, renameTableInColumnExpressions, renameTableInIndexPredicates, singleSchemaObjectRefResolver } from '../../src/schema/rename-rewriter.js';
 import type { ResolveObjectRef, TableRenameTarget } from '../../src/schema/rename-rewriter.js';
 import type * as AST from '../../src/parser/ast.js';
 
@@ -657,22 +657,40 @@ describe('rename rewrite post-condition (conditional qualification at the walker
 		const checkText = (expr: AST.Expression): string =>
 			expressionToString(expr).replace(/"/g, '');
 
-		it('re-applying the same rename to an already-rewritten CHECK is a no-op', () => {
-			// Load-bearing: the renamed table's own expressions are walked by
-			// `runRenameTable` before the catalog swap, by `propagateTableRename`
-			// after it, AND by a persisting module's own `renameTable` hook — all
-			// over the SAME shared AST. `freeTarget` is the shape that would break
-			// it: post-rename the bare `t2` resolves back to the renamed table, but
-			// PRE-rename it meant temp.t2, so an untouched arm running here on the
-			// second pass would "preserve" the reference onto temp.t2.
-			const expr = parseExpressionString('(select count(*) from t) >= 0') as AST.Expression;
-			expect(renameTableInCheckConstraints([{ expr }], freeTarget)).to.equal(true);
-			expect(checkText(expr)).to.contain('from t2');
-			expect(renameTableInCheckConstraints([{ expr }], freeTarget),
-				'second application must find nothing to do').to.equal(false);
-			expect(checkText(expr)).to.contain('from t2');
-			expect(checkText(expr)).to.not.contain('temp.');
-		});
+		/**
+		 * Idempotence is load-bearing for ALL THREE collection helpers, not just
+		 * CHECKs: the renamed table's own expressions are walked by
+		 * `runRenameTable` before the catalog swap, by `propagateTableRename`
+		 * after it, AND by a persisting module's own `renameTable` hook — all over
+		 * the SAME shared AST. `freeTarget` is the shape that would break it:
+		 * post-rename the bare `t2` resolves back to the renamed table, but
+		 * PRE-rename it meant temp.t2, so an untouched arm running here on the
+		 * second pass would "preserve" the reference onto temp.t2.
+		 *
+		 * Driven off one case list so a refactor that drops `schemaAuthoredBody`
+		 * from any single helper fails here, rather than only in whichever shape
+		 * some engine test happens to exercise.
+		 */
+		const reapplied: ReadonlyArray<{
+			readonly kind: string;
+			readonly apply: (expr: AST.Expression) => boolean;
+		}> = [
+			{ kind: 'CHECK constraint', apply: expr => renameTableInCheckConstraints([{ expr }], freeTarget) },
+			{ kind: 'partial-index predicate', apply: expr => renameTableInIndexPredicates([{ predicate: expr }], freeTarget) },
+			{ kind: 'column DEFAULT', apply: expr => renameTableInColumnExpressions([{ defaultValue: expr }], freeTarget) },
+			{ kind: 'generated column', apply: expr => renameTableInColumnExpressions([{ generatedExpr: expr }], freeTarget) },
+		];
+
+		for (const { kind, apply } of reapplied) {
+			it(`re-applying the same rename to an already-rewritten ${kind} is a no-op`, () => {
+				const expr = parseExpressionString('(select count(*) from t) >= 0') as AST.Expression;
+				expect(apply(expr)).to.equal(true);
+				expect(checkText(expr)).to.contain('from t2');
+				expect(apply(expr), 'second application must find nothing to do').to.equal(false);
+				expect(checkText(expr)).to.contain('from t2');
+				expect(checkText(expr)).to.not.contain('temp.');
+			});
+		}
 
 		it('a captured bare name in a CHECK is left alone (the planner rejects that body anyway)', () => {
 			// A CHECK plans under its owning schema and nothing else, so a bare name
@@ -898,6 +916,19 @@ describe('rename preserves what an untouched reference resolves to (new-name cap
 		expect(viewSql('main', 'vm'), 'no qualifier churn when the name cannot re-bind')
 			.to.not.match(/main\.k/);
 		expect(await rows('select * from main.vm')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('materialized view reading the captured name THROUGH a view keeps its rows', async () => {
+		// The chain shape: only the temp view's body carries the capturable bare
+		// name, so the MV in `main` is never itself rewritten — it stays correct
+		// only because the view it reads was pinned. REFRESH is what re-plans the
+		// chain, so assert after one.
+		await db.exec('create view temp.v as select id, x from k');
+		await db.exec('create materialized view main.mv as select id, x from temp.v');
+		await db.exec('alter table temp.other rename to k');
+		await db.exec('refresh materialized view main.mv');
+		expect(await rows('select * from main.mv'), 'the pinned view must carry through the chain')
+			.to.deep.equal([{ id: 1, x: 10 }]);
 	});
 
 	it('an unrelated name in the same body is left byte-identical', async () => {
