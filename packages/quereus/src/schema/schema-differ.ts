@@ -1473,15 +1473,20 @@ function inverseRenamedViewParts(
 		// so `resolveAfter === resolve` and no qualification ever fires.
 		//
 		// NOTE: the FORWARD live rename can still leave a qualifier behind that this
-		// walk has no declared counterpart for — `alter table main.t rename to t2`
-		// writes `main.t2` into a temp-owned body when `temp.t2` exists (see
-		// `renameTableInAst`'s post-condition). A declared form of THAT body would
-		// read bare `t2`, so re-diffing it reads as a body change and would emit a
-		// recreate back to the re-binding spelling. Unreachable today: qualification
-		// only fires when the body's home schema differs from the renamed table's,
-		// and a diff covers one schema at a time. If declarative schemas ever span
-		// schemas, this walk needs to accept a qualifier equal to `schemaName` as
-		// equivalent to the bare declared name.
+		// walk has no declared counterpart for, in either arm of its post-condition
+		// (see `renameTableInAst`):
+		//   - on the REWRITTEN reference — `alter table main.t rename to t2` writes
+		//     `main.t2` into a temp-owned body when `temp.t2` exists;
+		//   - on an UNTOUCHED reference — `alter table temp.other rename to k` writes
+		//     `main.k` over a temp-owned body's bare `k`, whose text never mentioned
+		//     the renamed table at all.
+		// A declared form of EITHER body would read the bare name, so re-diffing it
+		// reads as a body change and would emit a recreate back to the re-binding
+		// spelling. Unreachable today for both: qualification fires only when the
+		// body's home schema differs from the renamed table's, and a diff covers one
+		// schema at a time. If declarative schemas ever span schemas, this walk needs
+		// to accept a qualifier equal to `schemaName` as equivalent to the bare
+		// declared name.
 		renameTableInAst(selectClone, {
 			oldName: r.newName, newName: r.oldName, schemaName,
 			resolve: resolveRef, resolveAfter: resolveRef,

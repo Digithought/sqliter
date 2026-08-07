@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import { eq, objectRefKey, rewriteEach, type ResolveObjectRef, type TableRenameTarget } from './shared.js';
+import { eq, objectRefKey, objectRefKeySchema, rewriteEach, type ResolveObjectRef, type TableRenameTarget } from './shared.js';
 
 /**
  * Scope-aware, in-place table-reference walker: propagates
@@ -48,6 +48,35 @@ export interface TableRenameOpts {
 	 * written-row context there is a property of the position, not the walk.
 	 */
 	rowImageContext?: boolean;
+	/**
+	 * The walked expression is SCHEMA-AUTHORED — a CHECK constraint, a column
+	 * DEFAULT / generated body, or a partial-index predicate — so it plans under
+	 * `schemaAuthoredContext` (`planner/building/schema-authored-context.ts`):
+	 * its owning schema and NOTHING else, never the session schema path. Set by
+	 * the three collection helpers below; absent for the stored bodies that DO
+	 * plan under the home schema path (view bodies, materialized-view bodies,
+	 * assertion checks).
+	 *
+	 * Suppresses the untouched-reference arm of {@link renameTableInAst}, for
+	 * two reasons that agree:
+	 *
+	 * - Nothing is lost. That arm fires only when an unqualified name resolves
+	 *   through to ANOTHER schema, which is precisely what this planning context
+	 *   rejects — so it could only ever fire on a body the planner already
+	 *   refuses to evaluate.
+	 * - It keeps the walk IDEMPOTENT where idempotence is load-bearing. The
+	 *   renamed table's own CHECK / predicate / column expressions are walked
+	 *   more than once on purpose: `runRenameTable` rewrites them before the
+	 *   catalog swap, `propagateTableRename` walks every table again afterwards,
+	 *   and a persisting module rewrites the same shared ASTs inside its own
+	 *   `renameTable` hook. The rewrite arm is idempotent by construction (after
+	 *   it runs, nothing names `oldName`); the untouched arm is NOT, because a
+	 *   reference the rewrite already turned into `newName` is indistinguishable
+	 *   — to the resolvers — from one the new name captured. Confining that arm
+	 *   to the once-walked home-path bodies is what keeps the two facts from
+	 *   colliding.
+	 */
+	schemaAuthoredBody?: boolean;
 }
 
 /** A real (non-shadowed) table reference the scope-aware walk found. */
@@ -115,17 +144,53 @@ interface TableRefWalkState {
  * the resolver echoes the name it is given into the key, so a reference spelled
  * differently can never resolve to the target.
  *
- * The rewrite additionally enforces a POST-CONDITION the probe does not need:
- * after rewriting, re-resolving the reference under the same home schema path
- * against the catalog AS IT WILL BE AFTER THE RENAME (`target.resolveAfter`)
- * must still yield the renamed object's key. When it would not — the bare new
- * name is captured by an earlier schema on the body's home path — the reference
- * is schema-qualified via {@link TableRef.qualify}. Qualification is
- * conditional, not eager, so the common no-collision rename leaves body text
- * (and a materialized view's `bodyHash`) exactly as before. A qualified
- * reference holds the post-condition by construction (it only matched because
- * its written schema IS the renamed schema, and a qualified name resolves by
- * passthrough), so only unqualified references can ever qualify.
+ * The rewrite additionally enforces a POST-CONDITION the probe does not need,
+ * and it covers EVERY reference the walk reports — not only the ones it
+ * rewrites:
+ *
+ * > Walking a body for a rename, every reference must mean after the statement
+ * > exactly what it meant before.
+ *
+ * Both arms decide that the same way: re-resolve the reference under the same
+ * home schema path against the catalog AS IT WILL BE AFTER THE RENAME
+ * (`target.resolveAfter`) and compare with what it meant before.
+ *
+ * - A REWRITTEN reference must still yield the renamed object's key. When it
+ *   would not — the bare new name is captured by an earlier schema on the
+ *   body's home path — it is schema-qualified to the renamed schema via
+ *   {@link TableRef.qualify}.
+ * - An UNTOUCHED reference must still yield its own before-answer. A rename
+ *   also CREATES a name, and that new name can capture a reference the walk
+ *   never matched: a `temp`-owned body reading bare `k` (falling through to
+ *   `main.k`, because `temp` holds no `k`) silently re-binds to `temp.k` the
+ *   moment `alter table temp.other rename to k` lands, without its text ever
+ *   mentioning the renamed table. When the answer would change, the reference
+ *   is qualified to the schema its BEFORE-answer named — recovered from that
+ *   key by {@link import('./shared.js').objectRefKeySchema}. This arm applies
+ *   to the stored bodies that plan under the home schema path and is walked
+ *   ONCE per body; {@link TableRenameOpts.schemaAuthoredBody} turns it off for
+ *   the schema-authored expressions, which need it neither for correctness nor
+ *   for the re-walks they are deliberately subjected to — see that flag.
+ *
+ * Qualification is conditional in both arms, never eager, so the common
+ * no-collision rename leaves body text (and a materialized view's `bodyHash`)
+ * exactly as before. A qualified reference resolves by passthrough, so its
+ * before- and after-answers are always equal and neither arm can fire on one;
+ * only unqualified references ever gain a qualifier. And only the NEW name can
+ * change meaning without being rewritten: removing the old name can only push a
+ * resolution later, and the references that resolved to the removed entry are
+ * exactly the ones the rewrite already matches — so there is no freed-name
+ * direction to handle.
+ *
+ * ALREADY-BROKEN BODIES: the resolver answers a total function — a name held by
+ * no schema on the path still gets a stable key, the home schema's — so a body
+ * naming an object that exists nowhere reads `before = <home>.<name>`, and a
+ * rename introducing that name in an earlier schema flips `after`. The
+ * untouched arm then qualifies the reference to the home schema, PINNING the
+ * pre-existing "no such table" failure rather than letting the body silently
+ * start reading the new arrival. That is the invariant-faithful answer, so no
+ * existence probe is added to dodge it (same reasoning as the seedless-qualifier
+ * emit site below: it only ever fires on an already-unevaluable body).
  */
 export function renameTableInAst(
 	node: AST.AstNode | undefined,
@@ -144,7 +209,21 @@ export function renameTableInAst(
 			if (ref.qualify && resolveAfter(ref.schema, newName) !== newTargetKey) {
 				ref.qualify(schemaName);
 			}
+			return;
 		}
+		// The untouched arm: this reference is not the renamed object, but the
+		// name the rename CREATES can still capture it. Only references that
+		// re-resolve through the catalog carry `qualify` — the rest bind through
+		// a FROM frame and are preserved by qualifying their source instead. On a
+		// body naming an object that exists nowhere, `before` is the home
+		// schema's key and this pins the pre-existing "no such table" failure
+		// rather than letting the body start reading the new arrival; see the
+		// ALREADY-BROKEN BODIES note above.
+		if (opts?.schemaAuthoredBody || !ref.qualify) return;
+		const before = resolve(ref.schema, ref.name);
+		if (before === undefined || before === resolveAfter(ref.schema, ref.name)) return;
+		ref.qualify(objectRefKeySchema(before, ref.name.toLowerCase()));
+		changed = true;
 	}, opts);
 	return changed;
 }
@@ -231,7 +310,9 @@ export function collectTableRefsInAst(
  *
  * No {@link TableRenameOpts.rowImageContext}: a predicate describes rows
  * already stored, so `new.x` there is a real table reference — see the flag's
- * doc comment.
+ * doc comment. {@link TableRenameOpts.schemaAuthoredBody} IS set: a predicate
+ * plans under its owning schema alone, and this AST is one of the several the
+ * rename walks more than once.
  *
  * Sharing and idempotence work exactly as in
  * {@link import('./column-rename.js').renameColumnInIndexPredicates}: the
@@ -245,7 +326,7 @@ export function renameTableInIndexPredicates(
 	target: TableRenameTarget,
 ): boolean {
 	return rewriteEach(indexes, idx => idx.predicate,
-		expr => renameTableInAst(expr, target));
+		expr => renameTableInAst(expr, target, { schemaAuthoredBody: true }));
 }
 
 /**
@@ -255,7 +336,9 @@ export function renameTableInIndexPredicates(
  *
  * A CHECK is evaluated against a written row, so the walk runs with
  * {@link TableRenameOpts.rowImageContext}: a bare `new.a` / `old.a` names the
- * row image and survives even a rename of a table literally called `new`.
+ * row image and survives even a rename of a table literally called `new`. It
+ * also runs with {@link TableRenameOpts.schemaAuthoredBody}, for the same
+ * reasons the predicate arm above does.
  *
  * Same sharing and idempotence story as {@link renameTableInIndexPredicates}: the
  * `expr` is the very AST the catalog's `TableSchema` holds, so one rewrite covers
@@ -266,7 +349,7 @@ export function renameTableInCheckConstraints(
 	target: TableRenameTarget,
 ): boolean {
 	return rewriteEach(checks, cc => cc.expr,
-		expr => renameTableInAst(expr, target, { rowImageContext: true }));
+		expr => renameTableInAst(expr, target, { rowImageContext: true, schemaAuthoredBody: true }));
 }
 
 /**
@@ -278,7 +361,9 @@ export function renameTableInCheckConstraints(
  *
  * Both expressions evaluate against the row being written, so the walk runs
  * with {@link TableRenameOpts.rowImageContext}: a default's `new.a` names the
- * row image, not a table called `new`.
+ * row image, not a table called `new`. It also runs with
+ * {@link TableRenameOpts.schemaAuthoredBody}, for the same reasons the two arms
+ * above do.
  *
  * Unlike the column-rename counterpart
  * ({@link import('./column-rename.js').renameColumnInColumnExpressions}) there
@@ -303,7 +388,7 @@ export function renameTableInColumnExpressions(
 	target: TableRenameTarget,
 ): boolean {
 	const rewrite = (expr: AST.Expression): boolean =>
-		renameTableInAst(expr, target, { rowImageContext: true });
+		renameTableInAst(expr, target, { rowImageContext: true, schemaAuthoredBody: true });
 	// Both walks always run — `||` on the results, not short-circuited between them.
 	const defaultsChanged = rewriteEach(columns, c => c.defaultValue ?? undefined, rewrite);
 	const generatedChanged = rewriteEach(columns, c => c.generatedExpr, rewrite);

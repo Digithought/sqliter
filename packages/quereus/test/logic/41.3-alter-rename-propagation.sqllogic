@@ -2139,3 +2139,54 @@ select id, code6 from ali2_c65 order by id;
 drop view alvi_c65;
 drop table ali2_c65;
 -- run
+
+-- ===================================
+-- 66. A rename must not change what an UNTOUCHED reference resolves to
+-- ===================================
+-- The mirror of §60. There the rename REWROTE a reference and had to keep it
+-- pointing at the renamed table; here it rewrites nothing at all, but the name
+-- it CREATES captures a reference whose body never mentions the renamed table.
+-- A temp-owned body reading bare `k_c66` means main.k_c66 (temp holds none);
+-- `alter table temp.o_c66 rename to k_c66` puts a `k_c66` in temp, earlier on
+-- that body's home path. Every dependent must keep reading main.k_c66.
+
+create table main.k_c66 (id integer primary key, x integer);
+insert into main.k_c66 values (1, 10);
+-- The capture: renaming this onto `k_c66` shadows main.k_c66 for temp-owned bodies.
+create table temp.o_c66 (id integer primary key, x integer);
+insert into temp.o_c66 values (99, 999);
+
+create view temp.v_c66 as select id, x from k_c66;
+create materialized view temp.mv_c66 as select id, x from k_c66;
+create assertion temp.a_c66 check (not exists (select 1 from k_c66 where x < 0));
+-- A main-owned body reading the same bare name: main leads its own home path,
+-- so nothing can capture it and its stored text must not churn.
+create view main.vm_c66 as select id, x from k_c66;
+
+alter table temp.o_c66 rename to k_c66;
+
+select id, x from temp.v_c66;
+→ [{"id":1,"x":10}]
+
+select id, x from main.vm_c66;
+→ [{"id":1,"x":10}]
+
+-- The already-materialized rows mask a re-bind until the stored body re-plans.
+refresh materialized view temp.mv_c66;
+
+select id, x from temp.mv_c66;
+→ [{"id":1,"x":10}]
+
+-- The assertion still enforces against main.k_c66…
+insert into main.k_c66 values (2, -1);
+-- error: Assertion
+
+-- …and is NOT watching the table that took its name.
+insert into temp.k_c66 values (2, -1);
+
+drop view main.vm_c66;
+drop assertion temp.a_c66;
+drop materialized view temp.mv_c66;
+drop view temp.v_c66;
+drop table temp.k_c66;
+drop table main.k_c66;

@@ -576,6 +576,114 @@ describe('rename rewrite post-condition (conditional qualification at the walker
 	it('qualifies a seedless bare column qualifier when the bare new name would re-bind', () => {
 		expect(rewritten('t.b > 0', collisionTarget)).to.contain('main.t2.b');
 	});
+
+	/**
+	 * The UNTOUCHED arm of the same post-condition: the rename also CREATES a
+	 * name, and that name can capture a reference the walk never rewrote. Models
+	 * the measured case — `alter table temp.other rename to k` under a temp-owned
+	 * body over home path [temp, main] with `main.k` present: pre-rename a bare
+	 * `k` falls through to main.k; post-rename temp holds a `k` and captures it.
+	 * The body's text never mentions the renamed table at all.
+	 */
+	const capturePre: ResolveObjectRef = (schema, name) => {
+		if (schema !== undefined) return qualified(schema, name);
+		const n = name.toLowerCase();
+		return n === 'k' ? 'main.k' : `temp.${n}`;
+	};
+	const captureAfter: ResolveObjectRef = (schema, name) => {
+		if (schema !== undefined) return qualified(schema, name);
+		return `temp.${name.toLowerCase()}`;
+	};
+	const captureTarget: TableRenameTarget = {
+		oldName: 'other', newName: 'k', schemaName: 'temp',
+		resolve: capturePre, resolveAfter: captureAfter,
+	};
+
+	const walked = (sql: string): { text: string; changed: boolean } => {
+		const ast = parseExpressionString(sql);
+		const changed = renameTableInAst(ast, captureTarget);
+		return { text: expressionToString(ast).replace(/"/g, ''), changed };
+	};
+
+	const roundTripped = (sql: string): string =>
+		expressionToString(parseExpressionString(sql)).replace(/"/g, '');
+
+	it('qualifies an untouched FROM source the new name would capture', () => {
+		const { text, changed } = walked('exists (select 1 from k)');
+		expect(changed).to.equal(true);
+		expect(text).to.contain('from main.k');
+	});
+
+	it('qualifies an untouched DML target the new name would capture', () => {
+		const { text, changed } = walked('exists (insert into k (a) values (1) returning a)');
+		expect(changed).to.equal(true);
+		expect(text).to.contain('into main.k');
+	});
+
+	it('qualifies an untouched seedless bare column qualifier the new name would capture', () => {
+		const { text, changed } = walked('k.b > 0');
+		expect(changed).to.equal(true);
+		expect(text).to.contain('main.k.b');
+	});
+
+	it('keeps a bound column qualifier bare while its untouched source qualifies', () => {
+		const { text, changed } = walked('exists (select k.b from k)');
+		expect(changed).to.equal(true);
+		expect(text).to.contain('from main.k');
+		expect(text, 'the qualifier binds through the FROM frame, not the catalog')
+			.to.not.contain('main.k.b');
+	});
+
+	it('leaves an already-qualified untouched reference alone (it resolves by passthrough)', () => {
+		const sql = 'exists (select 1 from main.k)';
+		const { text, changed } = walked(sql);
+		expect(changed).to.equal(false);
+		expect(text).to.equal(roundTripped(sql));
+	});
+
+	it('leaves a name the rename cannot re-bind byte-identical (no qualifier churn)', () => {
+		const sql = 'exists (select 1 from u where u.b > 0)';
+		const { text, changed } = walked(sql);
+		expect(changed).to.equal(false);
+		expect(text).to.equal(roundTripped(sql));
+	});
+
+	/**
+	 * The untouched arm is OFF for schema-authored expressions (CHECK, column
+	 * DEFAULT / generated, partial-index predicate) — see
+	 * `TableRenameOpts.schemaAuthoredBody`. Two consequences, both pinned here.
+	 */
+	describe('schema-authored expressions opt out of the untouched arm', () => {
+		const checkText = (expr: AST.Expression): string =>
+			expressionToString(expr).replace(/"/g, '');
+
+		it('re-applying the same rename to an already-rewritten CHECK is a no-op', () => {
+			// Load-bearing: the renamed table's own expressions are walked by
+			// `runRenameTable` before the catalog swap, by `propagateTableRename`
+			// after it, AND by a persisting module's own `renameTable` hook — all
+			// over the SAME shared AST. `freeTarget` is the shape that would break
+			// it: post-rename the bare `t2` resolves back to the renamed table, but
+			// PRE-rename it meant temp.t2, so an untouched arm running here on the
+			// second pass would "preserve" the reference onto temp.t2.
+			const expr = parseExpressionString('(select count(*) from t) >= 0') as AST.Expression;
+			expect(renameTableInCheckConstraints([{ expr }], freeTarget)).to.equal(true);
+			expect(checkText(expr)).to.contain('from t2');
+			expect(renameTableInCheckConstraints([{ expr }], freeTarget),
+				'second application must find nothing to do').to.equal(false);
+			expect(checkText(expr)).to.contain('from t2');
+			expect(checkText(expr)).to.not.contain('temp.');
+		});
+
+		it('a captured bare name in a CHECK is left alone (the planner rejects that body anyway)', () => {
+			// A CHECK plans under its owning schema and nothing else, so a bare name
+			// that resolves through to another schema is already unevaluable — the
+			// only shape the untouched arm could fire on here.
+			const expr = parseExpressionString('(select count(*) from k) >= 0') as AST.Expression;
+			expect(renameTableInCheckConstraints([{ expr }], captureTarget)).to.equal(false);
+			expect(checkText(expr)).to.contain('from k');
+			expect(checkText(expr)).to.not.contain('main.');
+		});
+	});
 });
 
 /**
@@ -714,5 +822,90 @@ describe('rename rewrite preserves what a reference resolves to (collision grid)
 		await expectRefused('insert into main.t2 values (2, -1)',
 			'assertion must still refuse a violating write to the renamed table');
 		await db.exec('insert into temp.t2 values (2, -1)');
+	});
+});
+
+/**
+ * The other direction, engine level: a rename must not change what an
+ * UNTOUCHED reference resolves to. `alter table temp.other rename to k` never
+ * rewrites a body that reads bare `k` — the text does not mention `other` at
+ * all — but it puts a `k` in `temp`, which precedes `main` on a temp-owned
+ * body's home path, so the bare name would silently start reading the other
+ * table. Each body kind below must keep reading `main.k`.
+ */
+describe('rename preserves what an untouched reference resolves to (new-name capture)', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec("pragma schema_path = 'main,temp'");
+		await db.exec('create table main.k (id integer primary key, x integer)');
+		await db.exec('insert into main.k values (1, 10)');
+		// The capture: renaming this onto `k` creates a temp-owned `k` where a
+		// temp-owned body's bare `k` used to fall through to main.k.
+		await db.exec('create table temp.other (id integer primary key, x integer)');
+		await db.exec('insert into temp.other values (99, 999)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	const viewSql = (schema: string, name: string): string =>
+		db.schemaManager.getSchema(schema)!.getView(name)!.sql.replace(/"/g, '');
+
+	async function rows(sql: string): Promise<unknown[]> {
+		const out: unknown[] = [];
+		for await (const r of db.eval(sql)) out.push(r);
+		return out;
+	}
+
+	it('view: the untouched bare reference is qualified and keeps reading main.k', async () => {
+		await db.exec('create view temp.v as select id, x from k');
+		expect(await rows('select * from temp.v')).to.deep.equal([{ id: 1, x: 10 }]);
+		await db.exec('alter table temp.other rename to k');
+		expect(viewSql('temp', 'v')).to.contain('main.k');
+		expect(await rows('select * from temp.v'), 'must not re-bind to the new temp.k')
+			.to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('materialized view: REFRESH after the rename still reads main.k', async () => {
+		// The already-materialized rows mask a re-bind until the next refresh
+		// re-plans the stored body, so assert on both sides of one.
+		await db.exec('create materialized view temp.mv as select id, x from k');
+		await db.exec('alter table temp.other rename to k');
+		const mv = db.schemaManager.getTable('temp', 'mv');
+		expect(mv!.derivation?.sourceTables).to.deep.equal(['main.k']);
+		await db.exec('refresh materialized view temp.mv');
+		expect(await rows('select * from temp.mv'), 'refresh must not swap in temp.k rows')
+			.to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('assertion: keeps watching main.k, not the table that took its name', async () => {
+		await db.exec('create assertion temp.a check (not exists (select 1 from k where x > 100))');
+		await db.exec('alter table temp.other rename to k');
+		let err: Error | undefined;
+		try {
+			await db.exec('insert into main.k values (2, 500)');
+		} catch (e) {
+			err = e instanceof Error ? e : new Error(String(e));
+		}
+		expect(err, 'assertion must still refuse a violating write to main.k').to.not.be.undefined;
+		// And it is NOT watching the table that took the name.
+		await db.exec('insert into temp.k values (2, 500)');
+	});
+
+	it('a main-owned body reading bare k is unaffected, and its text does not churn', async () => {
+		// main leads its own home path, so the new temp.k cannot capture the name.
+		await db.exec('create view main.vm as select id, x from k');
+		await db.exec('alter table temp.other rename to k');
+		expect(viewSql('main', 'vm'), 'no qualifier churn when the name cannot re-bind')
+			.to.not.match(/main\.k/);
+		expect(await rows('select * from main.vm')).to.deep.equal([{ id: 1, x: 10 }]);
+	});
+
+	it('an unrelated name in the same body is left byte-identical', async () => {
+		await db.exec('create table main.u (id integer primary key, y integer)');
+		await db.exec('insert into main.u values (1, 7)');
+		await db.exec('create view temp.vu as select id, y from u');
+		const before = viewSql('temp', 'vu');
+		await db.exec('alter table temp.other rename to k');
+		expect(viewSql('temp', 'vu')).to.equal(before);
 	});
 });
