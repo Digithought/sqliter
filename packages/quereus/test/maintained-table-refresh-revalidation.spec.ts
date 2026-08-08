@@ -340,9 +340,9 @@ describe('Maintained-table refresh re-validation', () => {
 
 		it('control: a collation-INSENSITIVE CHECK over the same recollate reshape still rejects a genuine violator', async () => {
 			// Same reshape (recollate v BINARY → NOCASE), but the CHECK is a value-domain
-			// `id > 0` — its truth does NOT depend on any collation. The step-3 scan enforces
-			// it correctly, so a drifted -1 row IS rejected. This scopes the limitation
-			// strictly to collation-SENSITIVE comparisons (the validation path itself is sound).
+			// `id > 0` — its truth does NOT depend on any collation, so the preview cannot
+			// change its outcome. Pins that the ordinary validation path is undisturbed: a
+			// drifted -1 row IS still rejected.
 			await db.exec(`
 				create table src (id integer primary key, v text);
 				create table mt (id integer primary key, v text, check (id > 0))
@@ -471,10 +471,9 @@ describe('Maintained-table refresh re-validation', () => {
 
 		it('control: a type-INSENSITIVE CHECK over the same retype reshape still rejects a genuine violator', async () => {
 			// Same reshape (retype v TEXT → INTEGER), but the CHECK is a value-domain `id > 0` —
-			// its truth does NOT depend on any column's affinity. The step-3 scan enforces it
-			// correctly, so a drifted -1 row IS rejected. This scopes the limitation strictly to
-			// affinity-SENSITIVE comparisons (the validation path itself is sound), exactly
-			// parallel to the collation-insensitive control above.
+			// its truth does NOT depend on any column's affinity, so the preview cannot change
+			// its outcome. Pins that the ordinary validation path is undisturbed: a drifted -1
+			// row IS still rejected. Exactly parallel to the collation-insensitive control above.
 			await db.exec(`
 				create table src (id integer primary key, v text);
 				create table mt (id integer primary key, v text, check (id > 0))
@@ -528,6 +527,123 @@ describe('Maintained-table refresh re-validation', () => {
 				`row derived into maintained table 'main.mt'`);
 			expect(await readAll('select id, v from mt order by id'), 'fresh offending row rejected')
 				.to.deep.equal([{ id: 1, v: 5 }]);
+		});
+	});
+
+	describe('reshape arm: the ATTACH call site (`alter table … set maintained as`)', () => {
+		// The refresh blocks above reach the preview through `reshapeBackingInPlace` →
+		// `rebuildBacking`. The attach core reaches it through its OWN call site, with a
+		// different rollback shape (`restorePrior` / `restoreReshaped` / the
+		// `reconcileCommitted` branch). The rejection happens BEFORE the attach's eager
+		// `conn.commit()`, so `reconcileCommitted` is still false and the table reverts to
+		// an ordinary, untouched table at its original attributes.
+
+		function isMaintained(name: string): boolean {
+			return db.schemaManager.getMaintainedTable('main', name) !== undefined;
+		}
+
+		function columnAttrs(name: string, col: string): { type: string; collation: string } {
+			const c = db.schemaManager.getSchemaOrFail('main').getTable(name)!.columns.find(x => x.name === col)!;
+			return { type: c.logicalType.name.toUpperCase(), collation: c.collation ?? 'BINARY' };
+		}
+
+		it('an attach whose reshape RETYPES a column rejects a row violating its CHECK under the FINAL type', async () => {
+			await db.exec(`
+				create table src (id integer primary key, v integer);
+				create table mt (id integer primary key, v text, check (v < '9'));
+				insert into src values (1, 10);
+			`);
+			// mt.v is TEXT, the body derives INTEGER ⇒ strict shape mismatch ⇒ reshape attach
+			// with a post-reconcile retype. Under the OLD declared TEXT the CHECK would compare
+			// lexicographically ('10' < '9' is true) and admit the row.
+			await expectError('alter table mt set maintained as select id, v from src',
+				`row derived into maintained table 'main.mt'`);
+
+			// Nothing committed, nothing reshaped: the attach never reached its eager commit,
+			// so the catalog reverts to the ordinary pre-attach table at its original type.
+			expect(isMaintained('mt'), 'the rejected attach left mt an ordinary table').to.equal(false);
+			expect(columnAttrs('mt', 'v').type, 'v keeps its declared TEXT').to.equal('TEXT');
+			expect(await readAll('select id, v from mt order by id'), 'mt still empty').to.deep.equal([]);
+
+			// Correct the source and re-attach: the reshape now completes.
+			await db.exec('update src set v = 5 where id = 1');
+			await db.exec('alter table mt set maintained as select id, v from src');
+			expect(isMaintained('mt'), 'the conforming attach landed the derivation').to.equal(true);
+			expect(columnAttrs('mt', 'v').type, 'v retyped to INTEGER ⇒ the reshape arm ran').to.equal('INTEGER');
+			expect(await readAll('select id, v from mt order by id')).to.deep.equal([{ id: 1, v: 5 }]);
+		});
+
+		it('an attach whose reshape RECOLLATES a column rejects a row violating its CHECK under the FINAL collation', async () => {
+			await db.exec(`
+				create table src (id integer primary key, v text collate nocase);
+				create table mt (id integer primary key, v text, check (v <> 'abc'));
+				insert into src values (1, 'ABC');
+			`);
+			// Under the OLD BINARY collation 'ABC' <> 'abc' is true and the row would be admitted.
+			await expectError('alter table mt set maintained as select id, v from src',
+				`row derived into maintained table 'main.mt'`);
+			expect(isMaintained('mt'), 'the rejected attach left mt an ordinary table').to.equal(false);
+			expect(columnAttrs('mt', 'v').collation, 'v keeps BINARY').to.equal('BINARY');
+			expect(await readAll('select id, v from mt order by id'), 'mt still empty').to.deep.equal([]);
+
+			await db.exec(`update src set v = 'xyz' where id = 1`);
+			await db.exec('alter table mt set maintained as select id, v from src');
+			expect(columnAttrs('mt', 'v').collation, 'v recollated to NOCASE ⇒ the reshape arm ran').to.equal('NOCASE');
+			expect(await readAll('select id, v from mt order by id')).to.deep.equal([{ id: 1, v: 'xyz' }]);
+		});
+	});
+
+	describe('reshape arm: FK and multi-column mappings', () => {
+		// `previewReshapedColumns` maps live columns onto the target shape BY NAME and the
+		// preview feeds the FK scan through the same constraint-stripped clone as the CHECK
+		// scan. Neither was exercised by the single-column CHECK reshapes above.
+
+		it('a declared child-side FK is still enforced across a retype reshape of a DIFFERENT column', async () => {
+			await db.exec(`
+				create table parent (pid integer primary key);
+				create table src (id integer primary key, v text, ref integer null);
+				create table mt (id integer primary key, v text, ref integer null references parent(pid))
+					maintained as select * from src;
+				insert into parent values (1);
+				insert into src values (1, '5', 1);
+			`);
+			await db.exec(`alter table src alter column v set data type integer`); // retype reshape ⇒ stale
+			expect(isStale('mt'), 'set data type marked mt stale').to.equal(true);
+			await db.exec(`insert into src values (2, 7, 99)`); // drift: parent 99 absent, unmaintained
+
+			await expectError('refresh materialized view mt', `references a missing 'main.parent'`);
+			expect(await readAll('select id from mt order by id'), 'nothing committed')
+				.to.deep.equal([{ id: 1 }]);
+			expect(isStale('mt'), 'a rejected reshape refresh leaves mt stale').to.equal(true);
+		});
+
+		it('a mixed reshape (pre-reconcile ADD plus a retype on another column) still rejects under the FINAL type', async () => {
+			// The added column lands pre-reconcile, so the live column list the preview maps
+			// from is [id, v, w] while the retype targets only `v`. Pins the by-name mapping
+			// over a live/target list the structural batch has already grown.
+			await db.exec(`
+				create table src (id integer primary key, v text);
+				create table mt (id integer primary key, v text, check (v < '9'))
+					maintained as select * from src;
+				insert into src values (1, '10');
+			`);
+			await db.exec(`alter table src alter column v set data type integer`);
+			await db.exec(`alter table src add column w text null`);
+
+			await expectError('refresh materialized view mt',
+				`row derived into maintained table 'main.mt'`);
+			expect(await readAll('select id, v from mt order by id'), 'nothing committed')
+				.to.deep.equal([{ id: 1, v: '10' }]);
+			expect(isStale('mt'), 'a rejected reshape refresh leaves mt stale').to.equal(true);
+
+			// Correcting the source lets the whole mixed reshape land: `w` appended AND `v` retyped.
+			await db.exec('update src set v = 5 where id = 1');
+			await db.exec('refresh materialized view mt');
+			expect(await readAll('select id, v, w from mt order by id'))
+				.to.deep.equal([{ id: 1, v: 5, w: null }]);
+			const v = db.schemaManager.getMaintainedTable('main', 'mt')!.columns.find(c => c.name === 'v')!;
+			expect(v.logicalType.name.toUpperCase(), 'v retyped to INTEGER ⇒ the reshape arm ran')
+				.to.equal('INTEGER');
 		});
 	});
 

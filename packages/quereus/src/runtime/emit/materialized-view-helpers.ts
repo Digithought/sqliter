@@ -2463,6 +2463,16 @@ function graftReshapedRecord(moduleSchema: TableSchema, source: MaintainedTableS
  * its own declared output type now trips the physical-representation checker
  * (`QUEREUS_REPR_STRICT`) at this scan rather than sliding through. That is a
  * genuine defect surfacing at the earliest honest point, not a regression.
+ *
+ * NOTE: this RE-DERIVES the attribute shift from live-vs-shape rather than reading
+ * `ReshapePlan.postReconcileOps`, which is the authoritative list of the `retype` /
+ * `recollate` ops that will actually run. The two agree today because the
+ * pre-reconcile structural ops preserve attributes exactly ({@link backingColumnDef}
+ * carries type + collation through a rename, and an `add` lands the shape column's
+ * own attributes), so every live-vs-shape shift has a queued op and vice versa. If a
+ * structural op ever stops preserving an attribute, this would preview an attribute
+ * no op lands and the scan would reject rows the finished reshape accepts — build the
+ * preview from `postReconcileOps` then.
  */
 function previewReshapedColumns(live: TableSchema, shape: BackingShape): readonly ColumnSchema[] | undefined {
 	const byName = new Map(shape.columns.map(c => [c.name.toLowerCase(), c]));

@@ -1071,7 +1071,7 @@ Set `QUEREUS_REPR_STRICT=1` (or run `yarn test:repr-strict` from `packages/quere
 
 **Cost & gating.** Zero-cost when off, on the same pattern as the two harnesses above: a module-level `REPR_STRICT` boolean guards every call site, and each seam's supporting state (declared column type/name arrays, the resolved UDF return type) is built inside that guard so a normal emit allocates nothing for it. The scan seam's check is synchronous and sits inside the existing `for await` loop, so enabling the flag adds no microtask hop to the scan's fast path.
 
-This harness is **not** yet in the root `yarn check` chain — it has three known failures, all one root cause (`tickets/fix/bug-mv-reshape-validates-contents-before-retype`).
+This harness runs in the root `yarn check` chain via `test:repr-strict`, alongside `test:fork-strict` and `test:context-strict`.
 
 ## Incremental Delta Runtime
 
