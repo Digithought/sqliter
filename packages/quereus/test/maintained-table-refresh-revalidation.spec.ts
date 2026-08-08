@@ -28,6 +28,15 @@ import { Database } from '../src/index.js';
  * shape is unchanged, so `refresh` recomputes through the ordinary (non-reshape) path.
  * (A structural ALTER the body provably does NOT read now keeps the dependent LIVE —
  * see 53.4-materialized-view-structural-alter-restore.sqllogic.)
+ *
+ * The two `reshape arm: …-sensitive CHECK` blocks below cover the case where the
+ * source ALTER also shifts the maintained table's own column attributes, so the
+ * refresh takes the RESHAPE arm and the column is retyped/recollated as part of the
+ * refresh. The scan there resolves against the attributes the reshape is about to
+ * land (`previewReshapedColumns`), not the ones it is replacing — so a CHECK whose
+ * truth flips under the new type or collation is rejected before the commit, same as
+ * on the non-reshape arm. The type/collation-INSENSITIVE controls in those blocks
+ * pin that the fix did not disturb the ordinary path.
  */
 describe('Maintained-table refresh re-validation', () => {
 	let db: Database;
@@ -263,29 +272,31 @@ describe('Maintained-table refresh re-validation', () => {
 		});
 	});
 
-	describe('reshape arm: collation-sensitive CHECK (documented limitation)', () => {
-		// Characterizes — does NOT aspire to fix — the one corner the reshape arm's
-		// two-phase ordering leaves open. `reshapeBackingInPlace` sequences:
+	describe('reshape arm: collation-sensitive CHECK', () => {
+		// The reshape arm evaluates a declared CHECK under the collation the reshape is
+		// LANDING, not the one it is replacing. `reshapeBackingInPlace` still sequences:
 		//   3. rebuildBacking → validateDeclaredConstraintsOverContents (validates + COMMITS)
 		//   4. post-reconcile RECOLLATE (re-keys/re-validates, applies the NEW collation)
-		// The step-3 declared-CHECK scan runs against the rows in their PRE-recollate
-		// physical form (the catalog column still carries the OLD collation), so a CHECK
-		// whose truth FLIPS under the recollate passes validation, commits, and is then
-		// recollated into a violating state. Commit-first ordering (the reshape's own
-		// post-reconcile ops scan committed contents) blocks a clean fix; the attach
-		// reshape path uses the identical ordering. See docs/materialized-views.md
-		// § REFRESH MATERIALIZED VIEW "Known limitation — collation-sensitive CHECK".
+		// — the ordering is unchanged and commit-first parity is preserved — but step 3
+		// is handed `previewReshapedColumns`, the column list carrying step 4's collation,
+		// so a comparison resolves against the FINAL collation while still validating
+		// before the commit. A CHECK whose truth flips under the recollate is therefore
+		// rejected with nothing written. The attach reshape path passes the same preview,
+		// so both arms reject identically. See docs/materialized-views.md § REFRESH
+		// MATERIALIZED VIEW.
 
 		/** The live backing collation of column `v` — BINARY before the reshape's
 		 *  post-reconcile recollate runs, NOCASE after. The flip is the observable proof
 		 *  the refresh took the RESHAPE arm with a `recollate` op (the fast path would
-		 *  leave the collation untouched). */
+		 *  leave the collation untouched). Note the flip only happens on a SUCCESSFUL
+		 *  refresh: a rejected one throws in step 3, so step 4 never runs and the catalog
+		 *  keeps the OLD collation — which is why the reject tests below assert BINARY. */
 		function vCollation(name: string): string {
 			const col = db.schemaManager.getMaintainedTable('main', name)!.columns.find(c => c.name === 'v');
 			return col!.collation ?? 'BINARY';
 		}
 
-		it('the core corner: a recollate-during-reshape commits a row that violates its CHECK under the FINAL collation', async () => {
+		it('a recollate-during-reshape rejects a row that violates its CHECK under the FINAL collation', async () => {
 			await db.exec(`
 				create table src (id integer primary key, v text);
 				create table mt (id integer primary key, v text, check (v <> 'abc'))
@@ -303,19 +314,28 @@ describe('Maintained-table refresh re-validation', () => {
 			// The catalog still carries the OLD collation until the reshape's step-4 recollate.
 			expect(vCollation('mt'), 'catalog v still BINARY pre-refresh').to.equal('BINARY');
 
-			// LIMITATION. Refresh takes the reshape arm: step-3 rebuildBacking validates
-			// `v <> 'abc'` under the PRE-recollate BINARY collation, where 'ABC' <> 'abc' is
-			// true → the scan PASSES and COMMITS; step-4 then recollates v to NOCASE. Under
-			// NOCASE 'ABC' = 'abc', so the committed row now violates its own CHECK — but the
-			// pre-recollate scan never resolved the comparison under NOCASE. The refresh
-			// SUCCEEDS and the violating row survives. (This is the corner being pinned; it
-			// is NOT the behavior we would want if the limitation were closed.)
+			// Refresh takes the reshape arm. Step-3's scan resolves `v <> 'abc'` under the
+			// PREVIEWED NOCASE collation — the one step 4 is about to land — where
+			// 'ABC' = 'abc', so the row violates and the refresh is REJECTED before commit.
+			await expectError('refresh materialized view mt',
+				`row derived into maintained table 'main.mt'`);
+			// Pre-refresh contents survive and mt stays stale: same guarantee the
+			// non-reshape arm gives, because the scan sits at the same point in the sequence.
+			expect(await readAll('select id, v from mt order by id'),
+				'the rejected refresh committed nothing; pre-refresh contents intact')
+				.to.deep.equal([{ id: 1, v: 'ABC' }]);
+			expect(isStale('mt'), 'a rejected reshape refresh leaves mt stale').to.equal(true);
+			// Step 4 never ran, so the catalog column keeps its OLD collation.
+			expect(vCollation('mt'), 'rejected refresh leaves v BINARY (post-reconcile ops never ran)')
+				.to.equal('BINARY');
+
+			// Correct the offending source row and refresh again: NOW the reshape completes,
+			// and the collation flip is the proof the recollate arm was the one being exercised.
+			await db.exec(`update src set v = 'xyz' where id = 1`);
 			await db.exec('refresh materialized view mt');
 			expect(vCollation('mt'), 'v recollated to NOCASE ⇒ reshape arm + recollate ran').to.equal('NOCASE');
-			expect(await readAll('select id, v from mt order by id'),
-				'limitation: the row that violates the CHECK under the FINAL NOCASE collation survives')
-				.to.deep.equal([{ id: 1, v: 'ABC' }]);
-			expect(isStale('mt'), 'the (limitation) successful reshape clears stale').to.equal(false);
+			expect(await readAll('select id, v from mt order by id')).to.deep.equal([{ id: 1, v: 'xyz' }]);
+			expect(isStale('mt'), 'the successful reshape clears stale').to.equal(false);
 		});
 
 		it('control: a collation-INSENSITIVE CHECK over the same recollate reshape still rejects a genuine violator', async () => {
@@ -340,74 +360,69 @@ describe('Maintained-table refresh re-validation', () => {
 			expect(isStale('mt'), 'a rejected reshape refresh leaves mt stale').to.equal(true);
 		});
 
-		it('next maintenance re-validates under the NEW collation: a genuine re-derivation is rejected, but the already-committed row is frozen', async () => {
-			// Reach the limitation state: the offending row is committed under NOCASE.
+		it('after a successful recollate reshape, row-time maintenance enforces the NEW collation', async () => {
+			// The bulk scan (above) and the row-time derived-row validator (here) are two
+			// distinct enforcement points; this pins that the second one also resolves under
+			// the post-reshape collation, reached from a CLEAN successful refresh.
 			await db.exec(`
 				create table src (id integer primary key, v text);
 				create table mt (id integer primary key, v text, check (v <> 'abc'))
 					maintained as select * from src;
-				insert into src values (1, 'ABC');
+				insert into src values (1, 'xyz');
 			`);
 			await db.exec(`alter table src alter column v set collate nocase`);
 			await db.exec('refresh materialized view mt');
-			expect(await readAll('select id, v from mt order by id'), 'limitation row committed')
-				.to.deep.equal([{ id: 1, v: 'ABC' }]);
+			expect(vCollation('mt'), 'the reshape landed NOCASE').to.equal('NOCASE');
+			expect(await readAll('select id, v from mt order by id'), 'conforming set committed')
+				.to.deep.equal([{ id: 1, v: 'xyz' }]);
+			expect(isStale('mt'), 'successful refresh clears stale').to.equal(false);
 
 			// A value-identical source touch produces NO derived-row delta, so the maintenance
-			// manager suppresses the backing op and runs no row-time validation — the frozen
-			// violator is left exactly as-is (not corrected, not re-rejected).
+			// manager suppresses the backing op entirely — nothing to validate, nothing changes.
 			await db.exec(`update src set v = v where id = 1`);
-			expect(await readAll('select id, v from mt order by id'), 'no-delta touch leaves it frozen')
-				.to.deep.equal([{ id: 1, v: 'ABC' }]);
+			expect(await readAll('select id, v from mt order by id'), 'no-delta touch is a no-op')
+				.to.deep.equal([{ id: 1, v: 'xyz' }]);
 
-			// A GENUINE delta that re-derives the offending value (distinct under BINARY so a
-			// real derived-row change is produced, but still == 'abc' under NOCASE) runs
-			// buildDerivedRowValidator under the NEW collation ⇒ the write is REJECTED. So the
-			// violation cannot silently spread via ordinary writes…
+			// A GENUINE delta deriving a value that is <> 'abc' under BINARY but = 'abc' under
+			// NOCASE runs buildDerivedRowValidator under the NEW collation ⇒ REJECTED.
 			await expectError(`update src set v = 'Abc' where id = 1`,
 				`row derived into maintained table 'main.mt'`);
-			// …and the rejected write rolls back, leaving the already-committed row unchanged.
-			expect(await readAll('select id, v from mt order by id'), 'rejected update rolls back; row frozen')
-				.to.deep.equal([{ id: 1, v: 'ABC' }]);
+			// …and the rejected write rolls back, leaving the committed row unchanged.
+			expect(await readAll('select id, v from mt order by id'), 'rejected update rolls back')
+				.to.deep.equal([{ id: 1, v: 'xyz' }]);
 
-			// A brand-new source row deriving the offending value is likewise rejected under
-			// NOCASE (the row-time validator, not the pre-recollate bulk scan, sees it).
+			// A brand-new source row deriving the offending value is likewise rejected under NOCASE.
 			await expectError(`insert into src values (2, 'ABC')`,
 				`row derived into maintained table 'main.mt'`);
-			expect(await readAll('select id, v from mt order by id'), 'fresh offending row rejected; original frozen')
-				.to.deep.equal([{ id: 1, v: 'ABC' }]);
+			expect(await readAll('select id, v from mt order by id'), 'fresh offending row rejected')
+				.to.deep.equal([{ id: 1, v: 'xyz' }]);
 		});
 	});
 
-	describe('reshape arm: type-sensitive CHECK (documented limitation)', () => {
-		// Sibling of the collation corner above — the type-affinity-sensitive analog.
+	describe('reshape arm: type-sensitive CHECK', () => {
+		// Sibling of the collation block above — the type-affinity analog, same fix.
 		// `reshapeBackingInPlace` sequences:
 		//   3. rebuildBacking → validateDeclaredConstraintsOverContents (validates + COMMITS)
 		//   4. post-reconcile RETYPE (`set data type`, a `postReconcileOps` op — same batch
 		//      the recollate above rides in)
-		// The step-3 declared-CHECK scan resolves comparison **affinity** from the column's
-		// declared logical type, and runs while the catalog column still carries the OLD type
-		// (the `retype` op applies AFTER this commit). So a CHECK whose truth FLIPS under the
-		// affinity change passes validation, commits, and is then retyped into a violating
-		// state. `set data type` DOES physically rewrite the stored value (same PK, converted
-		// value written in place) — but the retype-during-reshape is a raw backing rewrite, not
-		// a revalidating write, so the CHECK is never re-run against the converted value. The
-		// corner is therefore NOT closed by the physical rewrite: only the stored representation
-		// changes (`typeof(v)` now tracks the new type); the violation itself still survives.
-		// Commit-first ordering and attach-path parity
-		// block a clean fix, exactly as for the recollate sibling. See docs/materialized-views.md
-		// § REFRESH MATERIALIZED VIEW "Known limitation — type-sensitive CHECK on the reshape arm".
+		// A comparison resolves its **affinity** from the column's declared logical type, so
+		// step 3 is handed `previewReshapedColumns` carrying step 4's type. A CHECK whose
+		// truth flips under the affinity change is therefore evaluated under the FINAL type
+		// and rejected before the commit, with the ordering (and commit-first parity) intact.
+		// See docs/materialized-views.md § REFRESH MATERIALIZED VIEW.
 
 		/** The live backing logical type of column `v` — TEXT before the reshape's
 		 *  post-reconcile retype runs, INTEGER after. The flip is the observable proof the
 		 *  refresh took the RESHAPE arm with a `retype` op (the fast path would leave the
-		 *  type untouched). Paralleling `vCollation` in the recollate block above. */
+		 *  type untouched). Paralleling `vCollation` in the recollate block above — and, as
+		 *  there, the flip only follows a SUCCESSFUL refresh: a rejected one throws in step 3
+		 *  so step 4 never runs and the catalog keeps TEXT. */
 		function vType(name: string): string {
 			const col = db.schemaManager.getMaintainedTable('main', name)!.columns.find(c => c.name === 'v');
 			return col!.logicalType.name.toUpperCase();
 		}
 
-		it('the core corner: a retype-during-reshape commits a row that violates its CHECK under the FINAL type', async () => {
+		it('a retype-during-reshape rejects a row that violates its CHECK under the FINAL type', async () => {
 			await db.exec(`
 				create table src (id integer primary key, v text);
 				create table mt (id integer primary key, v text, check (v < '9'))
@@ -424,30 +439,34 @@ describe('Maintained-table refresh re-validation', () => {
 			// The catalog still carries the OLD logical type until the reshape's post-reconcile retype.
 			expect(vType('mt'), 'catalog v still TEXT pre-refresh').to.equal('TEXT');
 
-			// LIMITATION. Refresh takes the reshape arm: step-3 rebuildBacking validates `v < '9'`
-			// under the PRE-retype TEXT affinity, where lexicographic '10' < '9' is true → the scan
-			// PASSES and COMMITS; step-4 then retypes v to INTEGER. Under INTEGER affinity the
-			// comparison is numeric 10 < 9 = false, so the committed row now violates its own CHECK
-			// — but the pre-retype scan never resolved the comparison under INTEGER. The refresh
-			// SUCCEEDS and the violating row survives. (This is the corner being pinned; it is NOT
-			// the behavior we would want if the limitation were closed.)
+			// Refresh takes the reshape arm. Step-3's scan resolves `v < '9'` under the
+			// PREVIEWED INTEGER affinity — the one step 4 is about to land — where the
+			// comparison is numeric 10 < 9 = false, so the row violates and the refresh is
+			// REJECTED before commit.
+			await expectError('refresh materialized view mt',
+				`row derived into maintained table 'main.mt'`);
+			// Pre-refresh contents survive, still in their pre-retype TEXT form, and mt stays stale.
+			expect(await readAll('select id, v from mt order by id'),
+				'the rejected refresh committed nothing; pre-refresh contents intact')
+				.to.deep.equal([{ id: 1, v: '10' }]);
+			expect(isStale('mt'), 'a rejected reshape refresh leaves mt stale').to.equal(true);
+			// Step 4 never ran, so the catalog column keeps its OLD logical type.
+			expect(vType('mt'), 'rejected refresh leaves v TEXT (post-reconcile ops never ran)')
+				.to.equal('TEXT');
+
+			// Correct the offending source row and refresh again: NOW the reshape completes,
+			// and the type flip is the proof the retype arm was the one being exercised.
+			await db.exec(`update src set v = 5 where id = 1`);
 			await db.exec('refresh materialized view mt');
 			expect(vType('mt'), 'v retyped to INTEGER ⇒ reshape arm + retype ran').to.equal('INTEGER');
-			// The retype physically rewrites the stored value ('10' text -> 10 integer). This is
-			// NOT the crux, though: the retype-during-reshape only rewrites the value in place —
-			// it does not re-run the CHECK, so the corner stays open despite the value now
-			// being genuinely converted. Pinned so that regression is visible here.
 			expect(await readAll(`select v, typeof(v) as t from mt`),
-				'the retype physically converted the value; the CHECK was not re-run against it')
-				.to.deep.equal([{ v: 10, t: 'integer' }]);
-			expect(await readAll('select id, v from mt order by id'),
-				'limitation: the row that violates the CHECK under the FINAL INTEGER affinity survives')
-				.to.deep.equal([{ id: 1, v: 10 }]);
-			// Re-evaluated under the final INTEGER column, the committed row violates its own CHECK.
+				'the retype landed the converted value')
+				.to.deep.equal([{ v: 5, t: 'integer' }]);
+			// Re-evaluated under the final INTEGER column, the committed row satisfies its CHECK.
 			expect(await readAll(`select (v < '9') as lt from mt`),
-				'limitation: v < 9 is now numeric-false on the committed row')
-				.to.deep.equal([{ lt: false }]);
-			expect(isStale('mt'), 'the (limitation) successful reshape clears stale').to.equal(false);
+				'the committed row is numeric-true under the final affinity')
+				.to.deep.equal([{ lt: true }]);
+			expect(isStale('mt'), 'the successful reshape clears stale').to.equal(false);
 		});
 
 		it('control: a type-INSENSITIVE CHECK over the same retype reshape still rejects a genuine violator', async () => {
@@ -473,42 +492,42 @@ describe('Maintained-table refresh re-validation', () => {
 			expect(isStale('mt'), 'a rejected reshape refresh leaves mt stale').to.equal(true);
 		});
 
-		it('next maintenance re-validates under the NEW type: a genuine re-derivation is rejected, but the already-committed row is frozen', async () => {
-			// Reach the limitation state: the offending row is committed under INTEGER.
+		it('after a successful retype reshape, row-time maintenance enforces the NEW type', async () => {
+			// The affinity analog of the recollate block's row-time test: reached from a CLEAN
+			// successful refresh, pinning that the row-time derived-row validator also resolves
+			// under the post-reshape logical type.
 			await db.exec(`
 				create table src (id integer primary key, v text);
 				create table mt (id integer primary key, v text, check (v < '9'))
 					maintained as select * from src;
-				insert into src values (1, '10');
+				insert into src values (1, '5');
 			`);
 			await db.exec(`alter table src alter column v set data type integer`);
 			await db.exec('refresh materialized view mt');
-			expect(await readAll('select id, v from mt order by id'), 'limitation row committed')
-				.to.deep.equal([{ id: 1, v: 10 }]);
+			expect(vType('mt'), 'the reshape landed INTEGER').to.equal('INTEGER');
+			expect(await readAll('select id, v from mt order by id'), 'conforming set committed')
+				.to.deep.equal([{ id: 1, v: 5 }]);
+			expect(isStale('mt'), 'successful refresh clears stale').to.equal(false);
 
 			// A value-identical source touch produces NO derived-row delta, so the maintenance
-			// manager suppresses the backing op and runs no row-time validation — the frozen
-			// violator is left exactly as-is (not corrected, not re-rejected).
+			// manager suppresses the backing op entirely — nothing to validate, nothing changes.
 			await db.exec(`update src set v = v where id = 1`);
-			expect(await readAll('select id, v from mt order by id'), 'no-delta touch leaves it frozen')
-				.to.deep.equal([{ id: 1, v: 10 }]);
+			expect(await readAll('select id, v from mt order by id'), 'no-delta touch is a no-op')
+				.to.deep.equal([{ id: 1, v: 5 }]);
 
-			// A GENUINE delta that re-derives an offending value (distinct from 10 so a real
-			// derived-row change is produced, but 11 < '9' is still false under INTEGER) runs
-			// buildDerivedRowValidator under the NEW type ⇒ the write is REJECTED. So the
-			// violation cannot silently spread via ordinary writes…
+			// A GENUINE delta deriving 11 — numeric-false against '9' under the NEW INTEGER
+			// affinity — runs buildDerivedRowValidator under that type ⇒ REJECTED.
 			await expectError(`update src set v = 11 where id = 1`,
 				`row derived into maintained table 'main.mt'`);
-			// …and the rejected write rolls back, leaving the already-committed row unchanged.
-			expect(await readAll('select id, v from mt order by id'), 'rejected update rolls back; row frozen')
-				.to.deep.equal([{ id: 1, v: 10 }]);
+			// …and the rejected write rolls back, leaving the committed row unchanged.
+			expect(await readAll('select id, v from mt order by id'), 'rejected update rolls back')
+				.to.deep.equal([{ id: 1, v: 5 }]);
 
-			// A brand-new source row deriving an offending value is likewise rejected under
-			// INTEGER (the row-time validator, not the pre-retype bulk scan, sees it).
+			// A brand-new source row deriving an offending value is likewise rejected under INTEGER.
 			await expectError(`insert into src values (2, 20)`,
 				`row derived into maintained table 'main.mt'`);
-			expect(await readAll('select id, v from mt order by id'), 'fresh offending row rejected; original frozen')
-				.to.deep.equal([{ id: 1, v: 10 }]);
+			expect(await readAll('select id, v from mt order by id'), 'fresh offending row rejected')
+				.to.deep.equal([{ id: 1, v: 5 }]);
 		});
 	});
 

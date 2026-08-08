@@ -923,15 +923,35 @@ function hasApplicableConstraints(db: Database, mt: TableSchema): boolean {
  * the LIVE record here. So the live record is swapped for a constraint-stripped
  * clone for the duration of the scans (the ADD COLUMN intermediate-schema
  * discipline, see `runtime/emit/alter-table.ts`), then restored.
+ *
+ * `validationColumns` (the reshape arms only, {@link previewReshapedColumns})
+ * overrides the clone's column list with the attributes the reshape is ABOUT TO
+ * land, so a CHECK / FK resolves its affinity and collation from the final
+ * declared shape rather than the one being replaced. Comparison semantics are a
+ * function of the DECLARED column attributes, and the reshape's `retype` /
+ * `recollate` module ops run after this scan (they convert stored rows, so they
+ * must); without the override this scan would evaluate `v < '9'` on a column
+ * moving TEXT → INTEGER as a text comparison and admit a row that violates the
+ * constraint under the type it is about to have. Omitted (⇒ `mt.columns`) on
+ * every non-reshape path, so those stay byte-identical.
  */
-async function validateDeclaredConstraintsOverContents(db: Database, mt: MaintainedTableSchema): Promise<void> {
+async function validateDeclaredConstraintsOverContents(
+	db: Database,
+	mt: MaintainedTableSchema,
+	validationColumns?: readonly ColumnSchema[],
+): Promise<void> {
 	const applicableChecks = mt.checkConstraints.filter(
 		c => (c.operations & (RowOpFlag.INSERT | RowOpFlag.UPDATE)) !== 0);
 	const fks = mt.foreignKeys ?? [];
 	if (applicableChecks.length === 0 && fks.length === 0) return;
 
 	const schema = db.schemaManager.getSchemaOrFail(mt.schemaName);
-	const stripped: MaintainedTableSchema = { ...mt, checkConstraints: Object.freeze([]), foreignKeys: undefined };
+	const stripped: MaintainedTableSchema = {
+		...mt,
+		columns: validationColumns ?? mt.columns,
+		checkConstraints: Object.freeze([]),
+		foreignKeys: undefined,
+	};
 	schema.addTable(stripped);
 	try {
 		await validateChecksOverExistingRows(db, mt, applicableChecks, (check, exprSql) =>
@@ -1269,8 +1289,12 @@ export async function attachMaintainedDerivation(
 		changes = await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);
 		// Declared CHECK / child-side FK over the reconciled (derived) row set —
 		// inside this try so a violation restores the prior record; the pending
-		// reconcile writes roll back with the failing statement.
-		await validateDeclaredConstraintsOverContents(db, live);
+		// reconcile writes roll back with the failing statement. On the reshape arm
+		// the scan resolves against the attributes the post-reconcile ops below are
+		// about to land, keeping this path identical to the refresh reshape arm
+		// (`reshapeBackingInPlace` → `rebuildBacking`).
+		await validateDeclaredConstraintsOverContents(db, live,
+			reshapePlan ? previewReshapedColumns(live, shape) : undefined);
 
 		if (reshapePlan && reshapePlan.postReconcileOps.length > 0) {
 			// Data-validating attribute ops (retype / recollate / tighten NOT NULL)
@@ -1534,8 +1558,18 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
  * behavior. The caller is responsible for staleness re-validation when relevant;
  * this helper assumes the derivation body plans. Throws if the table is missing
  * from the catalog.
+ *
+ * `validationColumns` is the reshape arm's column preview
+ * ({@link previewReshapedColumns}) — the type/collation attributes the reshape's
+ * still-pending post-reconcile ops are about to land — forwarded to the scan so
+ * the CHECK / FK resolve against the final declared shape. `undefined` on every
+ * other path (and on a reshape that shifts neither attribute).
  */
-export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): Promise<void> {
+export async function rebuildBacking(
+	db: Database,
+	mv: MaintainedTableSchema,
+	validationColumns?: readonly ColumnSchema[],
+): Promise<void> {
 	const bodySql = astToString(mv.derivation.selectAst);
 	const rows: Row[] = await collectBodyRows(db, mv.schemaName, bodySql);
 
@@ -1589,23 +1623,15 @@ export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): P
 	// leaving the pre-refresh committed contents intact (the MV stays stale, so the
 	// next read re-validates rather than serving the rejected set).
 	//
-	// Documented limitation (collation-sensitive CHECK on the reshape arm): on the
-	// reshape path this scan validates the rows in their PRE-recollate physical form
-	// — the catalog column still carries the OLD collation here, and any
-	// `recollate` op runs post-reconcile in reshapeBackingInPlace, AFTER this commit.
-	// So a CHECK whose truth flips under a recollate-during-reshape (e.g. `v <> 'abc'`
-	// with v recollated BINARY → NOCASE over a row 'ABC') passes here and is then
-	// recollated into a violating state. The same class of corner applies to a
-	// `retype` op (it shares this `postReconcileOps` batch): a CHECK whose truth flips
-	// under the column's NEW affinity (e.g. `v < '9'` retyped TEXT → INTEGER over a
-	// row '10' — lexicographic-true then numeric-false) passes here and is retyped into
-	// violation. Not closed: this commit is load-bearing (commit-first parity + the
-	// post-reconcile ops scan committed contents), and the attach reshape path uses the
-	// identical ordering. See docs/materialized-views.md § REFRESH MATERIALIZED VIEW
-	// "Known limitation — collation-sensitive CHECK" / "… type-sensitive CHECK" and
-	// maintained-table-refresh-revalidation.spec.ts § "reshape arm: collation-
-	// sensitive CHECK" / "reshape arm: type-sensitive CHECK".
-	await validateDeclaredConstraintsOverContents(db, backing);
+	// On the reshape arm `validationColumns` carries the attributes the reshape is
+	// about to land ({@link previewReshapedColumns}), so a CHECK / FK is evaluated
+	// under the column's FINAL type and collation even though the `retype` /
+	// `recollate` module ops still run post-reconcile in reshapeBackingInPlace. That
+	// keeps this commit's ordering exactly as it was — the scan stays before the
+	// commit, the post-reconcile ops still scan committed contents — while removing
+	// the wrong-semantics gap. The attach reshape path passes the same preview at its
+	// own call site, so both arms reject identically.
+	await validateDeclaredConstraintsOverContents(db, backing, validationColumns);
 	await conn.commit();
 }
 
@@ -2393,6 +2419,65 @@ function graftReshapedRecord(moduleSchema: TableSchema, source: MaintainedTableS
 }
 
 /**
+ * The column list a reshape is ABOUT TO land, for the declared-constraint scan that
+ * runs mid-reshape ({@link validateDeclaredConstraintsOverContents}).
+ *
+ * A reshape's data-validating ops (`retype` / `recollate`) must run AFTER the data
+ * reconcile — they convert/re-key STORED rows, so running them first would validate
+ * the about-to-be-discarded contents and throw spuriously. But a SQL comparison
+ * takes its type affinity and its collation from the column's DECLARED attributes,
+ * so a scan against the live (pre-op) record evaluates a declared CHECK under the
+ * attributes the reshape is replacing: `check (v < '9')` on a column moving
+ * TEXT → INTEGER compares as text ('10' < '9' is true) and never as the numeric
+ * comparison it is becoming. Previewing the attributes fixes the semantics without
+ * moving a single op — the scan stays exactly where it was, still before the commit.
+ *
+ * Maps `live`'s columns onto `shape`'s **by name** (names and order already agree:
+ * the reshape's pre-reconcile batch has applied every rename / add / drop before
+ * either caller reaches this) and overrides only `logicalType` and `collation`.
+ * Returns `undefined` when neither attribute shifts, so a reshape with no
+ * `retype`/`recollate` — and every non-reshape path — behaves exactly as before.
+ *
+ * Deliberately NOT previewed:
+ *  - **`notNull`.** The tighten-NOT-NULL op stays a post-reconcile module op and
+ *    keeps validating there. Declaring `notNull` early would let the optimizer fold
+ *    a nullability-sensitive CHECK into a vacuous pass — the same class of unsound
+ *    folding the caller's constraint-stripped-clone swap exists to prevent.
+ *  - **`defaultValue` and the generated-column attributes.** A reshape never moves
+ *    them, so previewing them could only introduce drift.
+ *
+ * Physical-PK columns need no special handling: `describePhysicalPkChange` refuses
+ * a reshape whose key column changes type or collation, so a previewed attribute
+ * can never desynchronize the key encoding `assertRefreshRowsAreSet` or the host's
+ * keyed diff rely on.
+ *
+ * NOTE: the scan sees the rebuilt values in their PRE-conversion physical form but
+ * under the POST-conversion declared type. These agree in practice — the target
+ * attribute is derived FROM the body's own output type, so the body already emits
+ * values of the new type. A retype whose conversion genuinely rewrites the value
+ * (a text → date canonicalization turning '2024-06-05T00:00:00Z' into '2024-06-05')
+ * would have the CHECK see the un-normalized spelling. Not chased; revisit if a
+ * value-rewriting conversion is ever added to the reshape's op set.
+ *
+ * NOTE: with the preview in place, a body emitting a value that does not conform to
+ * its own declared output type now trips the physical-representation checker
+ * (`QUEREUS_REPR_STRICT`) at this scan rather than sliding through. That is a
+ * genuine defect surfacing at the earliest honest point, not a regression.
+ */
+function previewReshapedColumns(live: TableSchema, shape: BackingShape): readonly ColumnSchema[] | undefined {
+	const byName = new Map(shape.columns.map(c => [c.name.toLowerCase(), c]));
+	let shifted = false;
+	const preview = live.columns.map(col => {
+		const target = byName.get(col.name.toLowerCase());
+		if (!target) return col;
+		if (backingTypeMatches(col, target) && backingCollationMatches(col, target)) return col;
+		shifted = true;
+		return { ...col, logicalType: target.logicalType, collation: target.collation };
+	});
+	return shifted ? Object.freeze(preview) : undefined;
+}
+
+/**
  * The sited error a refresh raises when the re-derived body shape cannot be
  * reconciled onto the live maintained table in place — an interleaving column
  * reorder or a physical-PK definition change (or a host module without
@@ -2511,8 +2596,10 @@ async function reshapeBackingInPlace(
 	schema.addTable(live);
 
 	// Data reconcile: re-run the body and swap contents (the identity-preserving
-	// data-only path — same host, same incarnation).
-	await rebuildBacking(db, live);
+	// data-only path — same host, same incarnation). The column preview lets that
+	// path's declared-constraint scan resolve against the type/collation the
+	// post-reconcile ops below will land, not the ones they replace.
+	await rebuildBacking(db, live, previewReshapedColumns(live, shape));
 
 	// Post-reconcile data-validating ops (retype / recollate / tighten NOT NULL): the
 	// reconciled body rows satisfy the new attribute where the discarded backing
@@ -2524,14 +2611,14 @@ async function reshapeBackingInPlace(
 	// partial throw. Per-op registration keeps the catalog tracking the module so a
 	// mid-batch failure leaves a coherent, re-runnable table.
 	//
-	// NOTE: a `recollate` here applies AFTER step 3's rebuildBacking has already
-	// validated + committed the rows under the OLD collation — so a collation-
-	// sensitive declared CHECK whose truth flips under this recollate is not caught
-	// by that scan. A `retype` in this same batch is the affinity analog: a CHECK
-	// whose truth flips under the column's NEW logical type (e.g. `v < '9'` retyped
-	// TEXT → INTEGER) is likewise validated under the OLD type and missed (documented
-	// limitation; see the note in rebuildBacking's constraint-bearing branch and
-	// docs/materialized-views.md § REFRESH MATERIALIZED VIEW).
+	// These ops still run after step 3's rebuildBacking has validated + committed,
+	// but the declared-CHECK/FK scan inside that step is no longer blind to them:
+	// the `previewReshapedColumns` argument above hands it the type/collation each
+	// `retype` / `recollate` here is about to land, so a constraint whose truth
+	// flips under the new attribute (`v <> 'abc'` recollated BINARY → NOCASE over
+	// 'ABC'; `v < '9'` retyped TEXT → INTEGER over '10') is rejected there, before
+	// the commit, with nothing written. A tighten-NOT-NULL is deliberately NOT
+	// previewed and keeps validating right here — see previewReshapedColumns.
 	for (const op of plan.postReconcileOps) {
 		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
 		live = graftReshapedRecord(current, mv);
