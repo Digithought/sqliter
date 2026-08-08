@@ -494,6 +494,9 @@ Notes on the edges:
   or a plugin type that shadows a built-in temporal name (a different object, so identity
   fails) — selects no case at plan time. The runtime still classifies that operand by
   value, so `timespan('PT1H') + 'PT1H'` is still `'PT2H'`.
+- Announcing TIMESPAN also hands a difference expression the semantic ordering below, so
+  `order by (a - b)`, `min`/`max`, `distinct` and materialized views over it now rank by
+  elapsed time; they ranked the duration strings as text while the announcement was DATE.
 
 **Two families of date/time functions, typed differently.** The single-argument
 conversion functions `date(x)`, `time(x)`, `datetime(x)` (`func/builtins/conversion.ts`)

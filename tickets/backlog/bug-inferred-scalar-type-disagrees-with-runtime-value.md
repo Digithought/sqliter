@@ -109,7 +109,7 @@ invariant permanently.
   (`NO_DECLARED_TYPES`) to the plan's real output types and running `yarn test:repr-strict`
   is the regression net.
 
-# Arm 3 — the temporal-arithmetic row is being fixed separately
+# Arm 3 — the temporal-arithmetic row has landed (no longer this ticket's work)
 
 The `select 2 * timespan('PT1H')` row of the table above (and its siblings — `date - date`
 announced DATE while producing a TIMESPAN, `timespan / timespan` announced TIMESPAN while
@@ -123,3 +123,12 @@ string in hand.
 Scope note: that ticket covers **only** the arithmetic-operator rows. The untyped-`?`,
 aggregate-return-type, comparison-returns-boolean, and integer-literal-announced-REAL rows
 are untouched and remain this ticket's subject.
+
+**Status: `temporal-op-table` has landed.** `select 2 * timespan('PT1H')` now announces
+TIMESPAN, `date - date` announces TIMESPAN, and `timespan / timespan` announces REAL, so
+the three temporal rows of the table above no longer reproduce. Two side effects worth
+knowing when this ticket is eventually worked: `select (2 * timespan('PT1H')) + 3` now
+raises `Unsupported temporal operation` instead of returning null, and ordering sites over
+a difference expression (`order by (a - b)`, `min`/`max`, `distinct`, materialized views)
+switched from text order to semantic elapsed-time order. Everything else in this ticket
+still reproduces.

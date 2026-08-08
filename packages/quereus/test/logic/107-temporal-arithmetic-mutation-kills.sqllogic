@@ -513,6 +513,60 @@ DROP MATERIALIZED VIEW ts_mv;
 DROP TABLE ts_src;
 
 -- ============================================================
+-- Semantic ordering reaches a COMPUTED difference, not just a declared column
+--
+-- Everything above orders a column DECLARED timespan. `date - date` produces the
+-- same duration strings, and until the operation table (types/temporal-ops.ts)
+-- gave it a TIMESPAN result type the planner announced DATE — so every ordering
+-- site fell back to text order and disagreed with the `<`/`>` results above.
+-- Each expectation below is a value the old announcement got wrong: text order
+-- ranks 'P15D' before 'P1D' before 'P9D'.
+-- ============================================================
+
+CREATE TABLE spans (id INTEGER PRIMARY KEY, a DATE NOT NULL, b DATE NOT NULL);
+INSERT INTO spans VALUES
+  (1, '2024-01-20', '2024-01-05'),
+  (2, '2024-01-20', '2024-01-11'),
+  (3, '2024-01-20', '2024-01-19');
+-- run
+
+SELECT id, a - b AS g FROM spans ORDER BY (a - b);
+→ [{"id":3,"g":"P1D"},{"id":2,"g":"P9D"},{"id":1,"g":"P15D"}]
+
+SELECT min(a - b) AS mn, max(a - b) AS mx FROM spans;
+→ [{"mn":"P1D","mx":"P15D"}]
+
+SELECT DISTINCT (a - b) AS g FROM spans ORDER BY 1;
+→ [{"g":"P1D"},{"g":"P9D"},{"g":"P15D"}]
+
+-- the computed difference and a declared TIMESPAN literal rank against each other
+SELECT id FROM spans WHERE (a - b) > timespan('P8D') ORDER BY id;
+→ [{"id":1},{"id":2}]
+
+-- a materialized view over the computed difference stores and orders it the same way
+CREATE MATERIALIZED VIEW spans_mv AS SELECT id, (a - b) AS g FROM spans;
+-- run
+
+SELECT id, g FROM spans_mv ORDER BY g;
+→ [{"id":3,"g":"P1D"},{"id":2,"g":"P9D"},{"id":1,"g":"P15D"}]
+
+DROP MATERIALIZED VIEW spans_mv;
+DROP TABLE spans;
+
+-- ============================================================
+-- Dividing a calendar duration truncates the sub-month remainder
+--
+-- months have no fixed day count, so the remainder cannot cascade to days.
+-- See the NOTE on divideDuration in src/types/temporal-ops.ts.
+-- ============================================================
+
+SELECT timespan('P1Y2M') / 2 AS result;
+→ [{"result":"P7M"}]
+
+SELECT timespan('P1M') / 2 AS result;
+→ [{"result":"PT0S"}]
+
+-- ============================================================
 -- Temporal arithmetic in WHERE clause (ensures dispatch path is exercised)
 -- ============================================================
 

@@ -169,15 +169,11 @@ export function divideDuration(d: Temporal.Duration, divisor: number): Temporal.
 	// Final field (nanoseconds) — just divide, truncate to integer
 	fields['nanoseconds'] = Math.trunc(fields['nanoseconds'] / divisor);
 
-	// Handle months independently (not part of cascade chain above for months→days)
-	// months was already accumulated from years cascade; now divide it
-	const monthQuotient = Math.trunc(fields['months'] / divisor);
-	const monthRemainder = fields['months'] - monthQuotient * divisor;
-	fields['months'] = monthQuotient;
-	// Fractional months can't be converted to days; truncate
-	if (monthRemainder !== 0) {
-		// Best-effort: drop sub-month remainder since we can't convert to days
-	}
+	// Months divide independently: the cascade above already folded years into them, but
+	// a month has no fixed day count, so the sub-month remainder cannot cascade onward.
+	// NOTE: that remainder is truncated away — `timespan('P1M') / 2` is `PT0S`, not `P15D`.
+	// Preserved as found; revisit if a caller needs a reference-date-relative division.
+	fields['months'] = Math.trunc(fields['months'] / divisor);
 
 	return Temporal.Duration.from({
 		years: fields['years'],
@@ -292,6 +288,13 @@ function timespanRatio(v1: SqlValue, v2: SqlValue): SqlValue {
 	return total1 / total2;
 }
 
+/**
+ * NOTE: the value-sniffed path builds one of these strings per row, where the old cascade
+ * allocated nothing. Immaterial next to the `Temporal.Duration.from` parse that follows it
+ * on the same row, and the emit-time specialization hoists the lookup out of the row loop
+ * entirely; if temporal arithmetic ever shows up in a profile without that hoist, nest the
+ * table two levels deep instead of keying on a concatenation.
+ */
 function key(operator: string, left: TemporalOperandKind, right: TemporalOperandKind): string {
 	return `${operator}|${left}|${right}`;
 }
