@@ -18,6 +18,7 @@ import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
+import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 
 export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
 	// Normalize operator to uppercase for case-insensitive matching of keywords
@@ -100,7 +101,7 @@ function mixedBigIntArithmetic(
 	return result;
 }
 
-export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	let inner: (v1: number, v2: number) => number;
 	let innerBigInt: (v1: bigint, v2: bigint) => bigint;
 
@@ -214,17 +215,18 @@ export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 		note = `${plan.expression.operator}(numeric)`;
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: asRun(run),
+		operands: [plan.left, plan.right],
+		run,
 		note
 	};
 }
 
-export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	return emitScalarOp(buildNumericOpSpec(plan), ctx);
+}
+
+export function buildComparisonOpSpec(plan: BinaryOpNode, ctx: EmissionContext): ScalarOpSpec {
 	const leftType = plan.left.getType();
 	const rightType = plan.right.getType();
 
@@ -288,14 +290,15 @@ export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Inst
 		noteTag = 'compare';
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: asRun(run),
+		operands: [plan.left, plan.right],
+		run,
 		note: `${plan.expression.operator}(${noteTag}${collationName !== 'BINARY' ? ` ${collationName}` : ''})`
 	};
+}
+
+export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	return emitScalarOp(buildComparisonOpSpec(plan, ctx), ctx);
 }
 
 /** Build a function that converts a numeric cmp result to a boolean for the given operator */
@@ -339,7 +342,7 @@ function buildGenericComparisonRun(
 	};
 }
 
-export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+export function buildConcatOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	function run(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 		// SQL concatenation: NULL || anything -> NULL
 		if (v1 === null || v2 === null) return null;
@@ -349,14 +352,15 @@ export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 		return valueToText(v1) + valueToText(v2);
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: asRun(run),
+		operands: [plan.left, plan.right],
+		run,
 		note: '||(concat)'
 	};
+}
+
+export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	return emitScalarOp(buildConcatOpSpec(plan), ctx);
 }
 
 /** Truth-table combine for a single logical operator, over already-truthiness-coerced
@@ -394,91 +398,114 @@ function selectLogicalCombine(operator: string, plan: BinaryOpNode): LogicalComb
 	}
 }
 
-export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	// Normalize operator to uppercase for case-insensitive matching
-	const operator = plan.expression.operator.toUpperCase();
-
-	// Resolved once at emit time (not per row) — single source of truth shared by
-	// the eager `run` and the deferred `runShortCircuit` path below, so the two
-	// cannot diverge (the parity tests in test/and-or-short-circuit.spec.ts guard
-	// exactly this).
+/**
+ * The 3VL combine over raw operand values, resolved once at emit time (not per row) —
+ * single source of truth shared by the eager spec body and the deferred short-circuit
+ * path below, so the two cannot diverge (the parity tests in
+ * test/and-or-short-circuit.spec.ts guard exactly this).
+ *
+ * Coerces non-NULL operands to a boolean using SQL truthiness (isTruthy) rather than
+ * JS truthiness so that values like blobs and non-numeric strings agree with how
+ * FilterNode/CASE/NOT treat them — otherwise `<blob> AND true` and a bare `<blob>`
+ * predicate diverge.
+ */
+function buildCombineLogical(operator: string, plan: BinaryOpNode): (v1: SqlValue, v2: SqlValue) => SqlValue {
 	const combine = selectLogicalCombine(operator, plan);
-
-	// Coerce non-NULL operands to a boolean using SQL truthiness (isTruthy) rather
-	// than JS truthiness so that values like blobs and non-numeric strings agree
-	// with how FilterNode/CASE/NOT treat them — otherwise `<blob> AND true` and a
-	// bare `<blob>` predicate diverge.
-	function combineLogical(v1: SqlValue, v2: SqlValue): SqlValue {
+	return function combineLogical(v1: SqlValue, v2: SqlValue): SqlValue {
 		const b1 = v1 === null ? null : isTruthy(v1);
 		const b2 = v2 === null ? null : isTruthy(v2);
 		return combine(b1, b2);
-	}
+	};
+}
 
-	// Eager two-param combine. Used for XOR (both operands always required) and for
-	// AND/OR whose right operand is cheap (no subquery) — the zero-overhead path.
+/**
+ * Short-circuit deferral gate: AND/OR whose right operand contains a subquery
+ * (a scalar/IN/EXISTS subquery — a relational descendant). Such an operand is emitted
+ * as an on-demand callback and evaluated lazily, only when the left operand does not
+ * already decide the result (`false AND x` → false; `true OR x` → true). This stops an
+ * expensive/side-effecting subquery from running on every row for nothing. Left stays
+ * eager — it is always needed and always evaluated first, so operand order is unchanged.
+ *
+ * NOTE: only a *subquery* right operand defers. A non-subquery expensive scalar operand
+ * (deeply nested arithmetic, or a volatile/slow UDF called directly rather than inside a
+ * subquery) is still evaluated eagerly. Such operands are rare and the dominant expensive
+ * case in SQL is the subquery; if a non-subquery volatile/expensive scalar operand ever
+ * shows up hot, extend this gate with a cost or volatility check.
+ */
+function usesShortCircuit(plan: BinaryOpNode, operator: string): boolean {
+	return (operator === 'AND' || operator === 'OR') && hasRelationalDescendant(plan.right);
+}
+
+/**
+ * Eager two-operand combine. Used for XOR (both operands always required) and for
+ * AND/OR whose right operand is cheap (no subquery) — the zero-overhead path.
+ *
+ * `undefined` for the short-circuit form, whose right operand is a `SubProgram` param
+ * rather than a value and whose body returns `MaybePromise` — not a {@link ScalarOpSpec}
+ * body. Consumers fall back: the emitter below builds that Instruction itself, and a
+ * fusion consumer must decline to fuse.
+ */
+export function buildLogicalOpSpec(plan: BinaryOpNode): ScalarOpSpec | undefined {
+	// Normalize operator to uppercase for case-insensitive matching
+	const operator = plan.expression.operator.toUpperCase();
+	if (usesShortCircuit(plan, operator)) return undefined;
+
+	const combineLogical = buildCombineLogical(operator, plan);
+
 	function run(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 		return combineLogical(v1, v2);
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-
-	// Short-circuit deferral: for AND/OR whose right operand contains a subquery
-	// (a scalar/IN/EXISTS subquery — a relational descendant), emit the right
-	// operand as an on-demand callback and evaluate it lazily, only when the left
-	// operand does not already decide the result (`false AND x` → false;
-	// `true OR x` → true). This stops an expensive/side-effecting subquery from
-	// running on every row for nothing. Left stays eager — it is always needed
-	// and always evaluated first, so operand order is unchanged.
-	//
-	// NOTE: only a *subquery* right operand defers. A non-subquery expensive
-	// scalar operand (deeply nested arithmetic, or a volatile/slow UDF called
-	// directly rather than inside a subquery) is still evaluated eagerly. Such
-	// operands are rare and the dominant expensive case in SQL is the subquery;
-	// if a non-subquery volatile/expensive scalar operand ever shows up hot,
-	// extend this gate with a cost or volatility check.
-	if ((operator === 'AND' || operator === 'OR') && hasRelationalDescendant(plan.right)) {
-		const rightCall = emitCallFromPlan(plan.right, ctx);
-
-		// The left-operand value that decides the result on its own, resolved once at
-		// emit time: `false AND x` → false, `true OR x` → true. Also the result itself.
-		const decidingValue = operator === 'AND' ? false : true;
-
-		function runShortCircuit(
-			ctx: RuntimeContext,
-			v1: SqlValue,
-			rightFn: (ctx: RuntimeContext) => MaybePromise<SqlValue>
-		): MaybePromise<SqlValue> {
-			// Left decides — the right operand is never fetched (`false AND x` → false;
-			// `true OR x` → true). Same SQL truthiness as the eager path.
-			const b1 = v1 === null ? null : isTruthy(v1);
-			if (b1 === decidingValue) return decidingValue;
-
-			// Otherwise fetch the deferred right and combine with the shared 3VL
-			// (combineLogical) — byte-identical to the eager path. Stay synchronous
-			// when the right sub-program resolves synchronously; only take the
-			// microtask hop on a genuinely async subquery (see docs/runtime.md
-			// "Avoid a per-row microtask hop on the synchronous fast path"). A
-			// left-decides row returned above, so it never pays an async tick.
-			const raw = rightFn(ctx);
-			return raw instanceof Promise
-				? raw.then(v2 => combineLogical(v1, v2))
-				: combineLogical(v1, raw);
-		}
-
-		return {
-			params: [leftExpr, rightCall],
-			run: asRun(runShortCircuit),
-			note: `${plan.expression.operator}(logical short-circuit)`
-		};
-	}
-
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: asRun(run),
+		operands: [plan.left, plan.right],
+		run,
 		note: `${plan.expression.operator}(logical)`
 	};
+}
+
+function emitShortCircuitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	const operator = plan.expression.operator.toUpperCase();
+	const combineLogical = buildCombineLogical(operator, plan);
+
+	const leftExpr = emitPlanNode(plan.left, ctx);
+	const rightCall = emitCallFromPlan(plan.right, ctx);
+
+	// The left-operand value that decides the result on its own, resolved once at
+	// emit time: `false AND x` → false, `true OR x` → true. Also the result itself.
+	const decidingValue = operator === 'AND' ? false : true;
+
+	function runShortCircuit(
+		ctx: RuntimeContext,
+		v1: SqlValue,
+		rightFn: (ctx: RuntimeContext) => MaybePromise<SqlValue>
+	): MaybePromise<SqlValue> {
+		// Left decides — the right operand is never fetched (`false AND x` → false;
+		// `true OR x` → true). Same SQL truthiness as the eager path.
+		const b1 = v1 === null ? null : isTruthy(v1);
+		if (b1 === decidingValue) return decidingValue;
+
+		// Otherwise fetch the deferred right and combine with the shared 3VL
+		// (combineLogical) — byte-identical to the eager path. Stay synchronous
+		// when the right sub-program resolves synchronously; only take the
+		// microtask hop on a genuinely async subquery (see docs/runtime.md
+		// "Avoid a per-row microtask hop on the synchronous fast path"). A
+		// left-decides row returned above, so it never pays an async tick.
+		const raw = rightFn(ctx);
+		return raw instanceof Promise
+			? raw.then(v2 => combineLogical(v1, v2))
+			: combineLogical(v1, raw);
+	}
+
+	return {
+		params: [leftExpr, rightCall],
+		run: asRun(runShortCircuit),
+		note: `${plan.expression.operator}(logical short-circuit)`
+	};
+}
+
+export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	const spec = buildLogicalOpSpec(plan);
+	return spec ? emitScalarOp(spec, ctx) : emitShortCircuitLogicalOp(plan, ctx);
 }
 
 /**
@@ -496,13 +523,12 @@ function constLikePattern(node: ScalarPlanNode): string | undefined {
 	return valueToText(value);
 }
 
-export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	const leftExpr = emitPlanNode(plan.left, ctx);
-
+export function buildLikeOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	// Fast path: the pattern operand is a literal constant. Compile the matcher
 	// once here at emit time and capture it in the closure, so no per-row compile
-	// or cache lookup happens at all. The literal operand is not emitted as a
-	// param since its value is already baked into `matcher`.
+	// or cache lookup happens at all. The literal operand is NOT declared as an
+	// operand since its value is already baked into `matcher` — this spec's arity
+	// is one, while the plan node still has two children.
 	const constPattern = constLikePattern(plan.right);
 	if (constPattern !== undefined) {
 		const matcher = compileLikeMatcher(constPattern);
@@ -512,8 +538,8 @@ export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instructio
 			return matcher(valueToText(text));
 		}
 		return {
-			params: [leftExpr],
-			run: asRun(runConstPattern),
+			operands: [plan.left],
+			run: runConstPattern,
 			note: 'LIKE(like-const)'
 		};
 	}
@@ -534,12 +560,14 @@ export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instructio
 		return simpleLike(patternStr, textStr);
 	}
 
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: asRun(run),
+		operands: [plan.left, plan.right],
+		run,
 		note: 'LIKE(like)'
 	};
+}
+
+export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	return emitScalarOp(buildLikeOpSpec(plan), ctx);
 }
 

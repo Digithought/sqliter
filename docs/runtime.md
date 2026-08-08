@@ -243,6 +243,35 @@ Wrap `run` in `asRun(...)`: a `run` with specific parameters (`SqlValue`,
 `Promise<RuntimeValue>`, and a sometimes-emitted `SubProgram` param is a rest tuple,
 not optional (`emit/bloom-join.ts`).
 
+#### Scalar emitters: build a `ScalarOpSpec`, don't build the `Instruction`
+
+A **scalar** emitter whose body is synchronous and takes one already-evaluated value per
+operand does not build its own `Instruction`. It splits in two: a `buildXxxSpec(plan, ctx)`
+returning a `ScalarOpSpec` (`emit/scalar-op.ts`) — the operand plan nodes plus the body and
+the note — and a one-line `emitXxx` that calls `emitScalarOp(spec, ctx)`. Only the `emitXxx`
+name is registered; the spec builder is the reusable half.
+
+The point is that the body has two consumers: `emitScalarOp` wraps it as an `Instruction`
+the scheduler dispatches, and the scalar-fusion compiler composes it directly into a closure
+chain with no scheduler. Keeping the body in one place is what stops the two from drifting
+as emit-time specializations accumulate (`+(numeric-fast)` vs `+(temporal)`,
+`=(compare-typed)` vs `=(compare-fast)`, `LIKE(like-const)` vs `LIKE(like)`).
+
+`spec.operands` is what becomes `Instruction.params` — **not** the plan node's children.
+`emitLikeOp`'s constant-pattern fast path bakes the pattern into its closure and declares
+one operand while the plan node still has two.
+
+Two shapes stay off the spec, and their builders return `undefined` (or there is no builder)
+so a fusion consumer knows to decline:
+
+- **A body that can return a `MaybePromise`.** `ScalarOpSpec.run` returns a plain `SqlValue`
+  deliberately; widening it to `OutputValue` would break fusion's contract. AND/OR's
+  short-circuit form (right operand is a `SubProgram`, not a value) and a literal holding an
+  unresolved async constant-fold result are the two live cases.
+- **A body that invokes lazy branch callbacks.** `emitCaseExpr` must not evaluate unmatched
+  branches, so it keeps its own emitter; what it shares is `buildCaseMatcher`, the per-clause
+  match test, so a fused CASE and an instruction CASE agree on which branch fires.
+
 ### 2. Register the Emitter
 
 ```typescript

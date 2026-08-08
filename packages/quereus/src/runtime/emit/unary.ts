@@ -2,10 +2,9 @@ import { StatusCode } from "../../common/types.js";
 import { quereusError } from "../../common/errors.js";
 import type { SqlValue } from "../../common/types.js";
 import type { Instruction, RuntimeContext } from "../types.js";
-import { asRun } from "../types.js";
 import type { UnaryOpNode } from "../../planner/nodes/scalar.js";
-import { emitPlanNode } from "../emitters.js";
 import type { EmissionContext } from "../emission-context.js";
+import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 import { isTruthy } from "../../util/comparison.js";
 import { canonicalizeInteger } from "../../util/numeric-canonical.js";
 import { Temporal } from 'temporal-polyfill';
@@ -30,7 +29,7 @@ function bitwiseNot(operand: number | bigint): number | bigint {
 	return canonicalizeInteger(typeof exact === 'bigint' ? -exact - 1n : -exact - 1);
 }
 
-export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instruction {
+export function buildUnaryOpSpec(plan: UnaryOpNode): ScalarOpSpec {
 	// Select the operation function at emit time
 	let run: (ctx: RuntimeContext, operand: SqlValue) => SqlValue;
 	let note: string;
@@ -189,11 +188,13 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 			quereusError(`Unsupported unary operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
 	}
 
-	const operandExpr = emitPlanNode(plan.operand, ctx);
-
 	return {
-		params: [operandExpr],
-		run: asRun(run),
+		operands: [plan.operand],
+		run,
 		note
 	};
+}
+
+export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instruction {
+	return emitScalarOp(buildUnaryOpSpec(plan), ctx);
 }

@@ -11,10 +11,15 @@ import { formatOperandCollationNote, makeOperandComparator, type OperandComparat
 /** On-demand branch callback — evaluates its sub-expression only when invoked. */
 type BranchFn = (ctx: RuntimeContext) => MaybePromise<SqlValue>;
 
-/** Per-WHEN-clause comparison setup of a simple CASE; both arrays are empty for a searched CASE. */
-interface WhenComparison {
-	readonly collationNames: string[];
-	readonly comparators: OperandComparator[];
+/**
+ * Per-clause match test of a simple CASE, resolved once at emit time: collation +
+ * type routing per WHEN operand, and the rule that a NULL base matches nothing.
+ * Shared by the instruction emitter and the fusion compiler so a fused CASE and an
+ * instruction CASE can never disagree about which branch fires.
+ */
+export interface CaseMatcher {
+	readonly collationNames: readonly string[];
+	readonly matches: (clauseIndex: number, baseValue: SqlValue, whenValue: SqlValue) => boolean;
 }
 
 /**
@@ -31,24 +36,39 @@ interface WhenComparison {
  * each other. A genuine conflict — explicit COLLATE on the base AND a different explicit
  * COLLATE on a WHEN operand — throws, exactly as `=` throws for the same operand pair.
  *
+ * A searched CASE (no `baseExpr`) yields an empty `collationNames` and a `matches` that
+ * is never called.
+ *
  * NOTE: that throw happens at emit time, where `=` validates in `BinaryOpNode.generateType`.
  * Both surface inside `db.prepare` today (even a fully-constant CASE is emitted so the
  * folder can evaluate it). If a rule ever rewrites a `CaseExprNode` away without emitting
  * it, move this resolution into `CaseExprNode.generateType` and read the cached result here.
  */
-function resolveWhenComparison(plan: CaseExprNode, ctx: EmissionContext): WhenComparison {
+export function buildCaseMatcher(plan: CaseExprNode, ctx: EmissionContext): CaseMatcher {
 	const base = plan.baseExpr;
-	if (!base) return { collationNames: [], comparators: [] };
+	if (!base) return { collationNames: [], matches: neverMatches };
 
 	const baseLogical = base.getType().logicalType;
 	const collationNames = plan.whenThenClauses.map(
 		clause => effectiveComparisonCollation(base, clause.when, plan.expression));
-	const comparators = plan.whenThenClauses.map((clause, i) => makeOperandComparator(
+	const comparators: OperandComparator[] = plan.whenThenClauses.map((clause, i) => makeOperandComparator(
 		baseLogical,
 		clause.when.getType().logicalType,
 		ctx.resolveCollation(collationNames[i]),
 	));
-	return { collationNames, comparators };
+
+	// NULL base never matches any WHEN — falls through to ELSE/NULL. Each clause
+	// compares under its OWN pre-resolved comparator (collation + type routing).
+	const matches = (clauseIndex: number, baseValue: SqlValue, whenValue: SqlValue): boolean =>
+		baseValue !== null && whenValue !== null &&
+		comparators[clauseIndex](baseValue, whenValue) === 0;
+
+	return { collationNames, matches };
+}
+
+/** Placeholder match test of a searched CASE, which compares nothing. */
+function neverMatches(): boolean {
+	return false;
 }
 
 export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruction {
@@ -73,8 +93,7 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 
 	// A simple CASE compares its base against each WHEN under a per-clause
 	// collation + type routing (searched CASE compares nothing here).
-	const { collationNames: whenCollationNames, comparators: whenComparators } =
-		resolveWhenComparison(plan, ctx);
+	const matcher = buildCaseMatcher(plan, ctx);
 
 	// Searched CASE: CASE WHEN c1 THEN r1 ... ELSE e END
 	// args layout: [when0, then0, when1, then1, ..., else?]
@@ -110,12 +129,6 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 		const baseValue = args[0] as SqlValue;
 		const branch = (idx: number): BranchFn => args[idx] as BranchFn;
 
-		// NULL base never matches any WHEN — falls through to ELSE/NULL. Each clause
-		// compares under its OWN pre-resolved comparator (collation + type routing).
-		const matches = (i: number, whenValue: SqlValue): boolean =>
-			baseValue !== null && whenValue !== null &&
-			whenComparators[i](baseValue, whenValue) === 0;
-
 		const noMatch = (): MaybePromise<SqlValue> =>
 			plan.elseExpr ? branch(1 + clauseCount * 2)(runtimeCtx) : null;
 
@@ -125,9 +138,9 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 			const thenFn = branch(1 + i * 2 + 1);
 			const w = whenFn(runtimeCtx);
 			if (w instanceof Promise) {
-				return w.then(wv => (matches(i, wv) ? thenFn(runtimeCtx) : step(i + 1)));
+				return w.then(wv => (matcher.matches(i, baseValue, wv) ? thenFn(runtimeCtx) : step(i + 1)));
 			}
-			return matches(i, w) ? thenFn(runtimeCtx) : step(i + 1);
+			return matcher.matches(i, baseValue, w) ? thenFn(runtimeCtx) : step(i + 1);
 		};
 
 		return step(0);
@@ -156,6 +169,6 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 		params: paramInstructions,
 		run: plan.baseExpr ? asRun(runSimpleCase) : asRun(runSearchedCase),
 		note: `case(short-circuit, ${clauseCount} when clauses${plan.elseExpr ? ', else' : ''})`
-			+ formatOperandCollationNote(whenCollationNames)
+			+ formatOperandCollationNote(matcher.collationNames)
 	};
 }

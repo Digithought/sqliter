@@ -4,8 +4,10 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
+import { emitScalarOp, type ScalarOpSpec } from './scalar-op.js';
 
-export function emitParameterReference(plan: ParameterReferenceNode, _ctx: EmissionContext): Instruction {
+export function buildParameterSpec(plan: ParameterReferenceNode): ScalarOpSpec {
+	// The throw stays inside the body: the binding is not known at emit time.
 	function run(ctx: RuntimeContext): SqlValue {
 		const identifier = plan.nameOrIndex; // This comes from the ParameterReferenceNode instance
 		const params = ctx.params;
@@ -32,8 +34,12 @@ export function emitParameterReference(plan: ParameterReferenceNode, _ctx: Emiss
 	}
 
 	return {
-		params: [],
+		operands: [],
 		run,
 		note: `param(${typeof plan.nameOrIndex === 'string' ? plan.nameOrIndex : '#' + plan.nameOrIndex})`
 	};
+}
+
+export function emitParameterReference(plan: ParameterReferenceNode, ctx: EmissionContext): Instruction {
+	return emitScalarOp(buildParameterSpec(plan), ctx);
 }

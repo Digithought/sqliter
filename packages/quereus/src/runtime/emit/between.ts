@@ -1,13 +1,12 @@
 import type { SqlValue } from "../../common/types.js";
 import type { Instruction, RuntimeContext } from "../types.js";
-import { asRun } from "../types.js";
 import type { BetweenNode } from "../../planner/nodes/scalar.js";
-import { emitPlanNode } from "../emitters.js";
 import type { EmissionContext } from "../emission-context.js";
 import { effectiveBetweenBoundCollation } from "../../planner/analysis/comparison-collation.js";
 import { formatOperandCollationNote, makeOperandComparator } from "./operand-comparator.js";
+import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 
-export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instruction {
+export function buildBetweenSpec(plan: BetweenNode, ctx: EmissionContext): ScalarOpSpec {
 	// BETWEEN desugars to `expr >= lower AND expr <= upper`; each comparison
 	// resolves its collation independently through the shared provenance lattice
 	// (explicit COLLATE > declared column collation > defaults — see
@@ -38,15 +37,15 @@ export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instructio
 		return plan.expression.not ? !betweenResult : betweenResult;
 	}
 
-	const valueExpr = emitPlanNode(plan.expr, ctx);
-	const lowerExpr = emitPlanNode(plan.lower, ctx);
-	const upperExpr = emitPlanNode(plan.upper, ctx);
-
 	const notPrefix = plan.expression.not ? 'NOT ' : '';
 
 	return {
-		params: [valueExpr, lowerExpr, upperExpr],
-		run: asRun(run),
+		operands: [plan.expr, plan.lower, plan.upper],
+		run,
 		note: `${notPrefix}BETWEEN${formatOperandCollationNote([lowerCollationName, upperCollationName])}`
 	};
+}
+
+export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instruction {
+	return emitScalarOp(buildBetweenSpec(plan, ctx), ctx);
 }
