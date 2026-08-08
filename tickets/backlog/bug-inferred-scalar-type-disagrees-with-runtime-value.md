@@ -108,3 +108,18 @@ invariant permanently.
 - Once fixed, widening the statement-egress seam in `core/statement.ts` from R1-only
   (`NO_DECLARED_TYPES`) to the plan's real output types and running `yarn test:repr-strict`
   is the regression net.
+
+# Arm 3 — the temporal-arithmetic row is being fixed separately
+
+The `select 2 * timespan('PT1H')` row of the table above (and its siblings — `date - date`
+announced DATE while producing a TIMESPAN, `timespan / timespan` announced TIMESPAN while
+producing a number) is handled by the `temporal-op-table` ticket, which gives
+`BinaryOpNode.generateType` a real result-type table for temporal operand pairs instead of
+falling back to the left operand's type. That ticket also demonstrates a concrete wrong
+answer from the inaccuracy — `select (2 * timespan('PT1H')) + 3` returns null, because the
+outer `+` trusts the INTEGER announcement and takes the numeric-fast path with a duration
+string in hand.
+
+Scope note: that ticket covers **only** the arithmetic-operator rows. The untyped-`?`,
+aggregate-return-type, comparison-returns-boolean, and integer-literal-announced-REAL rows
+are untouched and remain this ticket's subject.
