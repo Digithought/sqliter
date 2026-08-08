@@ -81,7 +81,13 @@ type SumAccumulator = {
 	/** Exact integer part: every `bigint` and every safe-integer `number` contribution. */
 	exact: number | bigint;
 	/** Floating-point part: everything else — fractions, whole numbers outside the
-	 *  safe-integer range, ±Infinity, NaN. */
+	 *  safe-integer range, ±Infinity, NaN.
+	 *
+	 *  NOTE: plain IEEE-754 accumulation, NOT compensated (Kahan) — a fold over many
+	 *  REAL values carries the usual rounding error, and re-associating those rows can
+	 *  shift the last digits. That is why the delta-maintenance gate refuses a REAL
+	 *  argument (see `decode` below); revisit only if a REAL sum ever needs the fast
+	 *  path, which is a design change and not a relaxation of that gate. */
 	approx: number;
 	count: number;
 } | null;
@@ -173,6 +179,11 @@ export const sumFunc = createAggregateFunction(
 		if (acc === null || acc.count === 0) return null;
 		// An all-integer fold finalizes to its exact part untouched (still R1-canonical);
 		// only a fold that saw a non-exact contribution combines, and it lands in float.
+		// NOTE: a non-finite total propagates (±Infinity, and NaN for Infinity + -Infinity)
+		// rather than becoming NULL. Deliberate: sum matches the other float-summing
+		// aggregates, `total()` and `avg()`, over identical rows. Binary `+` is the
+		// outlier — `runtime/emit/binary.ts` nulls a non-finite result — so a caller
+		// comparing `sum(v)` against a hand-written `a + b` sees them diverge at overflow.
 		if (acc.approx === 0) return acc.exact;
 		return Number(acc.exact) + acc.approx;
 	}

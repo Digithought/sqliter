@@ -205,7 +205,7 @@ select json_group_object(key, value) from config;
 -- {"theme":"dark","fontSize":12}  (native object)
 ```
 
-**Difference from SQLite:** `sum()` promotes to BIGINT to avoid overflow, falling back to REAL only when types are mixed.
+**Difference from SQLite:** `sum()` promotes to BIGINT to avoid overflow. It accumulates exact integers and floating-point values in *separate* running totals and combines them only at the end, so the answer does not depend on the order rows were scanned. A fold that saw only `bigint`s and safe integers returns an exact integer; a fold that saw anything else — a fraction, a whole `number` past 9,007,199,254,740,991, or a non-finite — returns REAL. A REAL total that overflows returns `Infinity` (agreeing with `total()` and `avg()`), unlike binary `+`, which returns `NULL` on a non-finite result.
 
 ---
 

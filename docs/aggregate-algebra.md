@@ -53,17 +53,24 @@ Algebra functions are peers of `stepFunction`: same accumulator representation, 
    - **4b (only when `decodeExact` is declared):** the same identity holds for `b` containing retractions (`negate`d contributions) — decode fully reconstructs the accumulator. `count`'s decode is exact (the stored int *is* the accumulator); `sum`'s is not (the stored sum forgets how many non-NULL rows contributed), which is exactly why sum must not declare the flag.
 5. Decompose: `finalize(a) ≡ combine([finalize(p) …])` over the partial accumulators induced by the same input rows.
 
-Law 3 has a subtle consequence: an accumulator must be able to *observationally return* to the empty state. A bare running sum cannot — insert 5 then retract 5 leaves `{sum: 0}`, which finalizes to `0`, while the empty group finalizes to `NULL`. The builtin `sum` therefore tracks a contribution count alongside the running sum and finalizes `count === 0` as `NULL`; a UDAF with a NULL-on-empty finalize and a `negate` needs the same pattern.
+Law 3 has a subtle consequence: an accumulator must be able to *observationally return* to the empty state. A bare running sum cannot — insert 5 then retract 5 leaves a running total of `0`, which finalizes to `0`, while the empty group finalizes to `NULL`. The builtin `sum` therefore tracks a contribution count alongside its running totals and finalizes `count === 0` as `NULL`; a UDAF with a NULL-on-empty finalize and a `negate` needs the same pattern.
 
-A non-exact decode's count witness must additionally be **absorbing**: `sum.decode(stored)` reconstructs `{sum: stored, count: Infinity}` — non-zero (the group is non-empty) and unable to reach zero under any finite retraction. A finite witness (e.g. `1`) would collapse to `0` on the first retraction and finalize a spurious `NULL` while contributions remain. The write-side delta arm pairs this with its own proof obligations (a NOT NULL argument column plus the count(*) multiplicity witness) before retracting through a non-exact decode — see [Materialized-View Maintenance § delta fast path](mv-maintenance.md#residual-recompute-single-source-aggregate-shape).
+Law 1 also constrains the accumulator's *shape*, not just its arithmetic. `sum`'s accumulator is `{exact, approx, count}` — a contribution joins `exact` iff it is a `bigint` or satisfies `Number.isSafeInteger`, everything else joins `approx`, and the two combine only at finalize. A single running total would have to decide *per addition* whether it was in the exact or the float domain, and that decision depends on the order rows arrived, which is precisely a merge-associativity violation ([Type System § Physical representation](types.md#physical-representation)). `test/incremental/aggregate-algebra.spec.ts` pins this by building the single-slot alternative inline and asserting it *fails* `merge-associative`.
+
+A non-exact decode's count witness must additionally be **absorbing**: `sum.decode(stored)` reconstructs `{exact | approx: stored, count: Infinity}` — non-zero (the group is non-empty) and unable to reach zero under any finite retraction. A finite witness (e.g. `1`) would collapse to `0` on the first retraction and finalize a spurious `NULL` while contributions remain. The write-side delta arm pairs this with its own proof obligations (a NOT NULL argument column plus the count(*) multiplicity witness) before retracting through a non-exact decode — see [Materialized-View Maintenance § delta fast path](mv-maintenance.md#residual-recompute-single-source-aggregate-shape).
 
 Validate a declaration with the `fast-check` law harness on the test surface (`test/util/aggregate-algebra-laws.ts`):
 
 ```ts
-assertAggregateAlgebraLaws(mySchema, valueArb /* legal argument values, incl. NULL */);
+assertAggregateAlgebraLaws(mySchema, valueArb /* legal argument values, incl. NULL */, {
+	numRuns,         // fast-check runs per law (default 100)
+	decodeValueArb,  // narrower domain for laws 4/4b only (defaults to valueArb)
+});
 ```
 
-It property-checks laws 1–5 for whichever fields are present and throws naming the violated law. Pick a `valueArb` matching the value-domain the declaration is exact for (integers for sum — float sums drift, which is a value-domain property the write side gates on, not something the declaration can express).
+It property-checks laws 1–5 for whichever fields are present and throws naming the violated law. Pick a `valueArb` matching the value-domain the declaration is exact for — and note that "exact for" can differ **per law**. `sum` is the live example: laws 1–3 and 5 run over integers *and* fractions, because that mixed domain is what catches an order-dependent fold; laws 4/4b use `decodeValueArb` to narrow to integers alone, because one stored value per group cannot say how a total split between `exact` and `approx`, so `decode` is observational only where `approx` is always empty — exactly the domain the write side's delta arm gates on.
+
+The fractions in `sum`'s domain are deliberately dyadic (multiples of `0.25`, bounded magnitude) so float addition over them is itself exact. Feeding a law harness ordinary decimals tests IEEE-754 rounding order, which no accumulator shape can make associative, rather than testing the declaration.
 
 ### Call-site binding (`bindArgs`)
 
@@ -83,7 +90,7 @@ One consequence to keep in mind when consuming *stored* results: an aggregate's 
 | aggregate | merge | negate | decode | decodeExact | decompose |
 |---|---|---|---|---|---|
 | `count(*)`, `count(x)` | `a+b` | `-a` | stored int (finalize is identity) | yes | — |
-| `sum(x)` | add (bigint-promoting) | yes | stored v → non-empty accumulator with an absorbing (Infinity) count witness; NULL → empty | — (witness) | — |
+| `sum(x)` | exact and float parts each add within their own domain (the exact part bigint-promoting) | yes | stored v → non-empty accumulator with an absorbing (Infinity) count witness, routed to whichever part the value belongs to; NULL → empty. Observational over the exact-integer domain only | — (witness) | — |
 | `min(x)` / `max(x)` | keeps whichever value the call site's comparator ranks first/last (the same comparator as step — see [Call-site binding](#call-site-binding-bindargs)) | — (tighten-only) | stored v → accumulator; NULL → empty | — | — |
 | `avg(x)` | sum+count pairwise | yes | — (quotient forgets the count) | — | `sum(x)`, `count(x)` → real division; count 0/NULL ⇒ NULL |
 | `total`, `group_concat`, `var_*`, `stddev_*` | — | — | — | — | — (deliberately residual-only; e.g. total's float running sum drifts under retraction) |

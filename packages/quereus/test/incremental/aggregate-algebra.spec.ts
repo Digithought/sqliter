@@ -174,6 +174,45 @@ describe('Aggregate algebra declarations', () => {
 				.to.deep.equal({ exact: 0, approx: 0.5, count: Number.POSITIVE_INFINITY });
 		});
 
+		it("sum's non-numeric contributions are SKIPPED, not counted and not thrown", () => {
+			// The step used to wrap its coercion in a try/catch that swallowed a real
+			// RangeError from BigInt(); the catch is gone, so these skips are now the only
+			// way a value contributes nothing, and each has to be reached deliberately.
+			const step = (acc: AggValue, v: SqlValue): AggValue => sumFunc.stepFunction(acc, v);
+			expect(step(null, 'abc'), 'text naming no number').to.equal(null);
+			expect(step(null, ''), 'empty text coerces to 0, which DOES count')
+				.to.deep.equal({ exact: 0, approx: 0, count: 1 });
+			expect(step(null, new Uint8Array([1, 2])), 'blob').to.equal(null);
+			expect(step(null, { a: 1 }), 'json object').to.equal(null);
+			// Coerced contributions route by the same rule as native numbers.
+			expect(step(null, '7'), 'integral text').to.deep.equal({ exact: 7, approx: 0, count: 1 });
+			expect(step(null, '2.5'), 'fractional text').to.deep.equal({ exact: 0, approx: 2.5, count: 1 });
+			expect(step(null, true), 'true').to.deep.equal({ exact: 1, approx: 0, count: 1 });
+			expect(step(null, false), 'false').to.deep.equal({ exact: 0, approx: 0, count: 1 });
+			// A skipped value leaves an existing accumulator untouched — identically, not
+			// merely equally, so a skip can never bump the count that decides NULL-on-empty.
+			const counted = step(null, 5);
+			expect(step(counted, 'abc'), 'skip after a real contribution').to.equal(counted);
+		});
+
+		it('sum propagates a non-finite total instead of nulling it, matching total()/avg()', () => {
+			// Binary `+` nulls a non-finite result (runtime/emit/binary.ts); the aggregate
+			// family does not. This pins which of the two sum follows — reversing it means
+			// nulling here and then diverging from total() over identical rows.
+			const fold = (vs: SqlValue[]): SqlValue => {
+				let acc: AggValue = null;
+				for (const v of vs) acc = sumFunc.stepFunction(acc, v);
+				return sumFunc.finalizeFunction(acc);
+			};
+			expect(fold([1e308, 1e308]), 'overflow to +Infinity').to.equal(Number.POSITIVE_INFINITY);
+			expect(fold([-1e308, -1e308]), 'overflow to -Infinity').to.equal(Number.NEGATIVE_INFINITY);
+			expect(Number.isNaN(fold([Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) as number),
+				'+Infinity plus -Infinity is NaN, not NULL').to.be.true;
+			// An exact-integer contribution alongside a non-finite one is absorbed, not lost.
+			expect(fold([9007199254740993n, Number.POSITIVE_INFINITY]), 'exact part plus Infinity')
+				.to.equal(Number.POSITIVE_INFINITY);
+		});
+
 		it('non-incremental builtins declare no algebra', () => {
 			for (const f of [totalFunc, groupConcatFuncRev, varPopFunc, varSampFunc, stdDevPopFunc, stdDevSampFunc]) {
 				expect(f.algebra, `${f.name}.algebra`).to.equal(undefined);

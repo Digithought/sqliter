@@ -13,6 +13,13 @@
 --
 -- Every fold-order pair below must agree — that equality, not just the literal
 -- expected value, is what this file is guarding.
+--
+-- NOTE: the two fold orders are forced with `order by id` inside a subquery, and
+-- nothing here asserts that the two scans genuinely ran in opposite orders. If the
+-- planner ever becomes free to discard an inner `order by` that no outer clause
+-- observes, these arms weaken to two identical scans and stop guarding anything —
+-- they would still pass. If that optimization lands, pin the orders some other way
+-- (an ordered plan assertion under test/plan/, or scan-order-sensitive data).
 
 -- ===========================================================================
 -- 1. Fraction + integer past the safe-integer boundary — both scan orders
