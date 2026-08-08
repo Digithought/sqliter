@@ -132,6 +132,21 @@ describe('Primary key conjunct lost with correlated subquery', () => {
 		]);
 	});
 
+	it('carries the displaced context\'s residual forward exactly once', () => {
+		// `order by id` equips the Retrieve with an ordering plan whose residual is the
+		// declined `flag = 1`; the re-probe over the Filter then re-derives that same
+		// conjunct from the unioned constraints. Contributing the committed residual
+		// wholesale on top of that yielded `flag = 1 AND flag = 1` — a correct answer, but
+		// a predicate evaluated twice per row and a cost estimate that can flip a join
+		// strategy. This is the smallest shape in which the committed residual is non-empty.
+		const prog = topLevelProgram(db, 'select id from o where flag = 1 order by id');
+		const filters = prog.match(/filter\([^)]*\)/g) ?? [];
+		expect(filters, `one residual filter:\n${prog}`).to.have.lengthOf(1);
+		const [residual] = filters;
+		expect((residual!.match(/flag = 1/g) ?? []).length, `the conjunct appears once: ${residual}`)
+			.to.equal(1);
+	});
+
 	it('keeps both bounds of a BETWEEN key conjunct', async () => {
 		// The two bounds share one source expression, so de-duplicating the unioned
 		// constraint list on expression identity alone would drop the upper bound.

@@ -35,9 +35,10 @@ import { extractOrderingFromSortKeys } from '../../framework/physical-utils.js';
 import { LimitOffsetNode } from '../../nodes/limit-offset.js';
 import { PlanNode as _PlanNode } from '../../nodes/plan-node.js';
 import { PlanNodeType as _PlanNodeType } from '../../nodes/plan-node-type.js';
-import { LiteralNode, BinaryOpNode } from '../../nodes/scalar.js';
+import { LiteralNode } from '../../nodes/scalar.js';
 import { collectBindingsInPlan } from '../../analysis/binding-collector.js';
-import type * as AST from '../../../parser/ast.js';
+import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
+import { combineResidualExpressions } from '../access/rule-select-access-path.js';
 import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:grow-retrieve');
@@ -255,21 +256,50 @@ function canTranslateToIndexConstraints(node: PlanNode): boolean {
  */
 function dedupeConstraints(constraints: PredicateConstraint[]): PredicateConstraint[] {
 	const rolesByExpression = new Map<ScalarPlanNode, Set<string>>();
-	const out: PredicateConstraint[] = [];
-	for (const constraint of constraints) {
-		if (constraint.sourceExpression) {
-			const role = `${constraint.columnIndex}:${constraint.op}`;
-			let roles = rolesByExpression.get(constraint.sourceExpression);
-			if (!roles) {
-				roles = new Set();
-				rolesByExpression.set(constraint.sourceExpression, roles);
-			}
-			if (roles.has(role)) continue;
-			roles.add(role);
-		}
-		out.push(constraint);
+	return constraints.filter(constraint => {
+		let roles = rolesByExpression.get(constraint.sourceExpression);
+		if (!roles) rolesByExpression.set(constraint.sourceExpression, roles = new Set());
+		const role = `${constraint.columnIndex}:${constraint.op}`;
+		if (roles.has(role)) return false;
+		roles.add(role);
+		return true;
+	});
+}
+
+/**
+ * The predicate the physical leaf must still apply once the module has taken what it
+ * can: the extractor's own residual, plus the source expression of every constraint the
+ * module declined, plus the residual the displaced context was enforcing (nothing else
+ * re-applies that one — the new context replaces it wholesale).
+ *
+ * The committed residual is contributed conjunct-by-conjunct rather than whole, skipping
+ * any conjunct that is also a constraint's source expression: the re-probe already covers
+ * those, either by seeking them or by re-adding them here. Keeping the committed copy as
+ * well would apply the same predicate twice — correct, but a wasted evaluation per row and
+ * a cost shift of exactly the kind `dedupeConstraints` exists to avoid.
+ *
+ * `combineResidualExpressions` supplies the rest of the de-duplication by identity, which
+ * is what collapses the two bounds of a declined BETWEEN back into their one source node.
+ */
+function assembleResidual(
+	extractionResidual: ScalarPlanNode | undefined,
+	constraints: readonly PredicateConstraint[],
+	handledFilters: readonly boolean[],
+	committedResidual: ScalarPlanNode | undefined,
+): ScalarPlanNode | undefined {
+	const constraintExprs = new Set<ScalarPlanNode>(constraints.map(c => c.sourceExpression));
+
+	const parts: ScalarPlanNode[] = extractionResidual ? [extractionResidual] : [];
+	constraints.forEach((constraint, i) => {
+		if (!handledFilters[i]) parts.push(constraint.sourceExpression);
+	});
+	if (committedResidual) {
+		parts.push(...splitConjuncts(committedResidual).filter(c => !constraintExprs.has(c)));
 	}
-	return out;
+
+	const residual = combineResidualExpressions(parts);
+	log('Residual over %d constraint(s): %s', constraints.length, residual ? 'yes' : 'none');
+	return residual;
 }
 
 /**
@@ -393,6 +423,14 @@ function fallbackIndexSupports(
 				} else {
 					// Non-numeric literal OFFSET — refuse to push the LIMIT,
 					// because we cannot soundly compute `limit + offset`.
+					// NOTE: a bare `LIMIT n` lands HERE, not in the branch above — the
+					// builder materializes an absent OFFSET as `Literal(null)`, so every
+					// LIMIT without an explicit numeric OFFSET is refused and no module
+					// sees `request.limit` by this route. Inert today: this arm is
+					// unreached anyway (no shape puts a LimitOffset directly above a
+					// Retrieve, and the benefit gate below requires a requested ordering).
+					// If it becomes reachable, read a null/absent OFFSET as 0 rather than
+					// refusing.
 					limitVal = undefined;
 				}
 			} else {
@@ -489,39 +527,25 @@ function fallbackIndexSupports(
 
 	log('Index-style fallback beneficial: cost %d vs %d seq scan', accessPlan.cost, seqCost);
 
-	// Compute full residual: extraction residual + source expressions of unhandled
-	// constraints + the residual the displaced context was enforcing. The extractor marks
-	// constraints it can decompose (e.g., LIKE), but the module may not handle them; those
-	// must be preserved as a residual filter. `committedResidual` joins them because this
-	// new context replaces the committed one — nothing else re-applies it.
-	{
-		const unhandledExprs: ScalarPlanNode[] = [];
-		for (let i = 0; i < plannerConstraints.length; i++) {
-			if (!accessPlan.handledFilters[i] && plannerConstraints[i].sourceExpression) {
-				unhandledExprs.push(plannerConstraints[i].sourceExpression);
-			}
-		}
-		if (committedResidual) unhandledExprs.push(committedResidual);
-		if (unhandledExprs.length > 0) {
-			const parts: ScalarPlanNode[] = residualPredicate ? [residualPredicate, ...unhandledExprs] : unhandledExprs;
-			if (parts.length === 1) {
-				residualPredicate = parts[0];
-			} else {
-				let acc: ScalarPlanNode = parts[0];
-				for (let i = 1; i < parts.length; i++) {
-					const right = parts[i];
-					const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
-					acc = new BinaryOpNode(acc.scope, ast, acc, right);
-				}
-				residualPredicate = acc;
-			}
-			log('Added %d unhandled/carried constraint expressions to residual', unhandledExprs.length);
-		}
-	}
+	residualPredicate = assembleResidual(
+		residualPredicate, plannerConstraints, accessPlan.handledFilters, committedResidual);
 
 	// Store context for later use in ruleSelectAccessPath. A re-grow over a
 	// Retrieve whose ordering already absorbed a Sort must keep the
 	// load-bearing marker — the Sort is gone either way.
+	//
+	// NOTE: accepted tradeoff — the Sort arm above also drops a Sort (`select * from t
+	// order by id` reaches it: no Project or Filter between Sort and Retrieve) yet
+	// deliberately does NOT mark it, unlike `trySortAbsorbViaIndexOrdering`. Marking it is
+	// the conservative reading but costs a real optimization — the leaf under
+	// `join (select * from big order by v) z` would stop qualifying for an
+	// index-nested-loop seek, which test/optimizer/index-nested-loop.spec.ts pins as
+	// firing. Sound because the two conditions never coincide: an ordering a consumer
+	// observes has no emission-order-changing rewrite above it (nothing sits above a
+	// top-level ordered scan), and the shapes that do have one are subquery ORDER BYs,
+	// which SQL does not guarantee through a join — the LIMIT case that would make one
+	// meaningful is already refused by the peel gate in rules/join/index-nested-loop.ts.
+	// Revisit if a rewrite ever reorders a leaf whose ordering the query genuinely observes.
 	const indexCtx: IndexStyleContext = {
 		kind: 'index-style',
 		accessPlan,
@@ -649,24 +673,7 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 	// Build residual predicate from any constraints the access plan didn't handle.
 	// rule-select-access-path's index-style branch trusts moduleCtx.residualPredicate
 	// rather than rebuilding from retrieveNode.source, so this must be set.
-	let residualPredicate: ScalarPlanNode | undefined;
-	if (constraints.length > 0) {
-		const unhandledExprs: ScalarPlanNode[] = [];
-		for (let i = 0; i < constraints.length; i++) {
-			if (!accessPlan.handledFilters[i] && constraints[i].sourceExpression) {
-				unhandledExprs.push(constraints[i].sourceExpression);
-			}
-		}
-		if (unhandledExprs.length > 0) {
-			let acc: ScalarPlanNode = unhandledExprs[0];
-			for (let i = 1; i < unhandledExprs.length; i++) {
-				const right = unhandledExprs[i];
-				const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
-				acc = new BinaryOpNode(acc.scope, ast, acc, right);
-			}
-			residualPredicate = acc;
-		}
-	}
+	const residualPredicate = assembleResidual(undefined, constraints, accessPlan.handledFilters, undefined);
 
 	// Equip the Retrieve with index-style context so rule-select-access-path
 	// uses this plan. Existing source pipeline (which may already contain

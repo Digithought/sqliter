@@ -68,9 +68,10 @@ fresh `Filter` (or `Sort`, or `LimitOffset`) on top of one that is already equip
 `fallbackIndexSupports` returns a brand-new context that replaces the committed one
 wholesale. So the re-probe seeds its `BestAccessPlanRequest` with the union of the
 committed context's `originalConstraints` and whatever it extracts from the incoming node,
-and folds the committed `residualPredicate` into the new residual. Anything the module
-declines on the second probe is residualized, so correctness does not depend on it
-answering the same way twice.
+and folds the committed `residualPredicate` into the new residual conjunct-by-conjunct,
+skipping whatever the constraint union already covers (otherwise a carried predicate is
+evaluated twice per row). Anything the module declines on the second probe is residualized,
+so correctness does not depend on it answering the same way twice.
 
 Three details are load-bearing:
 
