@@ -90,6 +90,17 @@ exactly this reason.
   one.
 - Whether a deterministic function is allowed to be async at all (caching and replication
   assumptions).
+- **New since scalar-function fusion landed** (`runtime-scalar-fusion-function-calls`): the
+  engine now decides at compile time whether a scalar function can return a promise, and a
+  function that returns one without saying so fails at its first call with a message telling
+  the author to set `isAsync: true` on the registration. That option exists only on the
+  low-level factory. So widening this convenience method to accept a promise-returning
+  callback must also give it a way to say so — either by accepting the same flag, or by
+  treating any callback registered through the widened method as possibly-asynchronous.
+  Callbacks written with the `async` keyword are recognized automatically and need neither;
+  the gap is only for a plain function that hands back a promise (a wrapper, a `.bind()`,
+  a memoizer). Until this lands, a user of this method who hits that error has no remedy
+  inside this API and must move to `db.registerFunction`, which `docs/usage.md` now says.
 
 ## Documentation
 

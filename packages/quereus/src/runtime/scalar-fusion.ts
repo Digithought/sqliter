@@ -126,6 +126,13 @@ function fuseNode(plan: PlanNode, ctx: EmissionContext, depth: number): FusedSca
  * The `AsyncFunction` constructor, which has no global binding — reachable only off an
  * instance. An `async function` / `async` arrow carries `AsyncFunction.prototype` on its
  * prototype chain, so `impl instanceof AsyncFunction` recognizes one.
+ *
+ * NOTE: `instanceof` is realm-local. A plugin loaded into a *different* JS realm (a worker,
+ * an iframe, a `node:vm` context) carries that realm's `AsyncFunction.prototype`, so its
+ * async implementation would not be recognized and would fall to step 4's guard — a thrown
+ * error with the `isAsync` remedy rather than a wrong answer. No loader in this repo crosses
+ * a realm (plugin-loader uses same-realm dynamic `import()`); if one ever does, widen this
+ * to also accept `impl[Symbol.toStringTag] === 'AsyncFunction'`, which is realm-agnostic.
  */
 const AsyncFunction = (async () => { /* probe only */ }).constructor;
 

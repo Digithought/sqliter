@@ -466,10 +466,12 @@ Fusable nodes: literals (unless holding an unresolved async constant-fold result
 column references, parameter references, `COLLATE` (fused through, no runtime
 effect), `CAST`, unary operators, `BETWEEN`, binary operators (numeric, comparison,
 concat, `LIKE`, and the *eager* logical form — the `AND`/`OR` short-circuit form with
-a subquery right leg declines), and `CASE` (all-or-nothing over base/WHEN/THEN/ELSE,
-keeping lazy branch selection via the shared `buildCaseMatcher`). Every fused body is
-the node's own `ScalarOpSpec` body — the same function the instruction emitter runs —
-so semantics, error messages, and evaluation counts are identical by construction.
+a subquery right leg declines), `CASE` (all-or-nothing over base/WHEN/THEN/ELSE,
+keeping lazy branch selection via the shared `buildCaseMatcher`), and scalar function
+calls that are provably synchronous (next subsection). Every fused body is the node's
+own `ScalarOpSpec` body — or, for `CASE` and function calls, the same `buildCaseMatcher`
+/ `buildScalarFunctionRun` the instruction emitter uses — so semantics, error messages,
+and evaluation counts are identical by construction.
 Subqueries and window/aggregate/relational nodes decline as unknown node types. A
 subtree deeper than `MAX_FUSION_DEPTH` (32) declines
 whole — fused closures nest on the JS call stack where the scheduler's linearized

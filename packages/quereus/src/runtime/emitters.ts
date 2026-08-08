@@ -151,8 +151,9 @@ export function emitCall(root: Instruction): Instruction {
  * (runtime/scalar-fusion.ts) instead of a per-row sub-program. Transparent to every
  * consumer — a `FusedScalar` satisfies the same `(ctx) => MaybePromise<SqlValue>`
  * callback contract a sub-program does, and any plan the fusion compiler cannot
- * prove pure and synchronous (relational plans, subqueries, function calls, async
- * literals, over-deep trees) falls back to the sub-program path unchanged.
+ * prove pure and synchronous (relational plans, subqueries, custom-emitter or
+ * asynchronous function calls, async literals, over-deep trees) falls back to the
+ * sub-program path unchanged.
  *
  * A fused instruction returns the SAME closure on every invocation, where `emitCall`
  * allocates a fresh arrow each time; nothing keys on sub-program function identity

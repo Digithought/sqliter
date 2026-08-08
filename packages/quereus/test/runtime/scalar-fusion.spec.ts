@@ -128,6 +128,18 @@ describe('scalar fusion', () => {
 				.to.equal(undefined);
 		});
 
+		it('declines the custom-emitter calls whose direct implementation is a stub', () => {
+			// json_schema and mutation_ordinal are the sharp end of the customEmitter
+			// check: mutation_ordinal's `implementation` exists only to THROW (the real
+			// behaviour reads rctx.mutationOrdinal inside its emitter), and it is
+			// zero-arg, so a fused compose would hand that stub straight back as the
+			// closure. json_schema's emitter pre-compiles a constant schema argument.
+			expect(fuseFrom('select mutation_ordinal() as v', PlanNodeType.ScalarFunctionCall))
+				.to.equal(undefined);
+			expect(fuseFrom('select json_schema(?, ?) as v', PlanNodeType.ScalarFunctionCall))
+				.to.equal(undefined);
+		});
+
 		it('declines an implementation declared `async` (no flag needed)', () => {
 			db.registerFunction(createScalarFunction(
 				{ name: 'async_auto', numArgs: 1, deterministic: true },
@@ -171,6 +183,21 @@ describe('scalar fusion', () => {
 			expect(fuseFrom(atCap, PlanNodeType.BinaryOp), 'at the cap').to.be.a('function');
 			const pastCap = 'select lower(?)' + ' || \'x\''.repeat(MAX_FUSION_DEPTH + 1) + ' as v';
 			expect(fuseFrom(pastCap, PlanNodeType.BinaryOp), 'past the cap').to.equal(undefined);
+		});
+
+		it('nested function calls fuse, and nest against the same depth cap', () => {
+			// `lower(lower(…(?)))` — the only shape where every frame in the chain is a
+			// call. n nestings put the parameter at depth n, so the cap bites at n > MAX.
+			const nest = (n: number) => 'select ' + 'lower('.repeat(n) + '?' + ')'.repeat(n) + ' as v';
+
+			const shallow = fuseFrom(nest(3), PlanNodeType.ScalarFunctionCall);
+			expect(shallow).to.be.a('function');
+			expect(shallow!(makeRctx(db, { 1: 'MiXeD' }))).to.equal('mixed');
+
+			expect(fuseFrom(nest(MAX_FUSION_DEPTH), PlanNodeType.ScalarFunctionCall), 'at the cap')
+				.to.be.a('function');
+			expect(fuseFrom(nest(MAX_FUSION_DEPTH + 1), PlanNodeType.ScalarFunctionCall), 'past the cap')
+				.to.equal(undefined);
 		});
 
 		it('declines past MAX_FUSION_DEPTH but fuses below it', () => {
@@ -468,6 +495,76 @@ describe('scalar fusion', () => {
 					lower(s) || cast(abs(n) as text) as c11,
 					case when lower(s) = 'apple' then upper(s) else 'x' end as c12
 				from t order by id`);
+		});
+
+		it('the json and datetime builtin families stay parity', async () => {
+			// Ordinary synchronous scalars with no custom emitter, so they fuse now. The
+			// datetime family is `deterministic: false`, which is what keeps it out of
+			// constant folding and in the fused per-row path where parity matters.
+			await setup(
+				'create table t (id integer primary key, j text null, d text null)',
+				`insert into t values
+					(1, '{"a":[1,2],"b":"x"}', '2024-01-15 06:30:00'),
+					(2, '[10,20,30]', '1999-12-31 23:59:59'),
+					(3, null, null)`,
+			);
+			await expectParity(`
+				select id,
+					json_type(j) as c1,
+					json_extract(j, '$.b') as c2,
+					json_array_length(j) as c3,
+					json_valid(j) as c4,
+					json_quote(j) as c5,
+					date(d) as c6,
+					time(d) as c7,
+					datetime(d) as c8,
+					strftime('%Y/%m', d) as c9,
+					julianday(d) as c10,
+					lower(json_type(j)) || ':' || coalesce(date(d), 'none') as c11
+				from t order by id`);
+		});
+
+		it('function calls inside every CASE position stay parity', async () => {
+			// The implement pass covered a call in the CASE *base* only via a decline.
+			// These put fusable calls in the base, a WHEN, a THEN and the ELSE.
+			await setup(
+				'create table t (id integer primary key, s text null, n integer null)',
+				"insert into t values (1, 'Apple', -3), (2, 'banana', 7), (3, null, null)",
+			);
+			await expectParity(`
+				select id,
+					case lower(s) when 'apple' then upper(s) else coalesce(s, 'none') end as c1,
+					case when length(s) > 5 then abs(n) else length(coalesce(s, '')) end as c2,
+					case when lower(s) = upper(s) then 'same' else lower(s) end as c3
+				from t order by id`);
+		});
+
+		it('call arguments evaluate in the same order fused as unfused', async () => {
+			// Side-effect order, not just call count: the fixed-arity arms compose as
+			// `run(rctx, a(rctx), b(rctx))` while the >3 arm maps over an array, so both
+			// arms are exercised (2 args and 5 args).
+			const order = new Map<Database, string[]>();
+			for (const db of [fusedDb, unfusedDb]) {
+				order.set(db, []);
+				db.registerFunction(createScalarFunction(
+					{ name: 'tag', numArgs: 1, deterministic: false },
+					(v: SqlValue) => { order.get(db)!.push(String(v)); return null; },
+				));
+			}
+			await setup(
+				'create table t (id integer primary key)',
+				'insert into t values (1)',
+			);
+			await expectParity("select coalesce(tag('a'), tag('b'), 'z') as v from t");
+			expect(order.get(fusedDb), 'fixed-arity arm, left to right').to.deep.equal(['a', 'b']);
+			expect(order.get(fusedDb)).to.deep.equal(order.get(unfusedDb));
+
+			for (const db of [fusedDb, unfusedDb]) order.set(db, []);
+			await expectParity(
+				"select coalesce(tag('a'), tag('b'), tag('c'), tag('d'), 'z') as v from t");
+			expect(order.get(fusedDb), 'array-and-spread arm, left to right')
+				.to.deep.equal(['a', 'b', 'c', 'd']);
+			expect(order.get(fusedDb)).to.deep.equal(order.get(unfusedDb));
 		});
 
 		it('a volatile function is invoked exactly as often fused as unfused', async () => {

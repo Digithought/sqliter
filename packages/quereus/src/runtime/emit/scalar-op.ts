@@ -55,8 +55,9 @@ export interface ScalarOpSpec {
  *
  * NOTE: a body with a rest signature (`(ctx, ...args)`) or a defaulted parameter reports
  * a `Function.length` that stops short, so it trips this. No spec is variadic today —
- * `emitScalarFunctionCallDefault`, the one variadic scalar body, deliberately stays off
- * `ScalarOpSpec`. A future variadic spec needs an explicit opt-out here, not a weakened
+ * `buildScalarFunctionRun` (emit/scalar-function.ts), the one variadic scalar body,
+ * deliberately stays off `ScalarOpSpec` and is composed by the fusion compiler without
+ * this guard. A future variadic spec needs an explicit opt-out here, not a weakened
  * check for everyone.
  *
  * Exported for the scalar-fusion compiler (runtime/scalar-fusion.ts), which composes
