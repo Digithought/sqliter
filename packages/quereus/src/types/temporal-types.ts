@@ -1,5 +1,6 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { BINARY_COLLATION } from '../util/comparison.js';
+import { canonicalizeInteger } from '../util/numeric-canonical.js';
 import { Temporal } from 'temporal-polyfill';
 
 /**
@@ -233,12 +234,16 @@ export const TIMESTAMP_TYPE: LogicalType = {
 
 	parse: (v) => {
 		if (v === null) return null;
-		if (typeof v === 'bigint') return v;
+		// TIMESTAMP's value space is the integer domain (physicalType INTEGER), so its
+		// arms canonicalize exactly like INTEGER_TYPE.parse: a safe-range bigint narrows
+		// to number, a whole number past the boundary widens to an exact bigint (R1,
+		// util/numeric-canonical.ts).
+		if (typeof v === 'bigint') return canonicalizeInteger(v);
 		if (typeof v === 'number') {
 			if (!Number.isInteger(v)) {
 				throw new TypeError(`Cannot convert non-integer number '${v}' to TIMESTAMP`);
 			}
-			return v;
+			return canonicalizeInteger(v);
 		}
 		if (typeof v === 'string') {
 			const trimmed = v.trim();
@@ -249,7 +254,7 @@ export const TIMESTAMP_TYPE: LogicalType = {
 			if (/^[+-]?\d+$/.test(trimmed)) {
 				const parsed = Number(trimmed);
 				if (Number.isSafeInteger(parsed)) return parsed;
-				return BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed);
+				return canonicalizeInteger(BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed));
 			}
 			// ISO 8601 datetime string → epoch milliseconds. Bare datetimes are
 			// treated as UTC wall-clock; offset/zone-bearing inputs convert to UTC —

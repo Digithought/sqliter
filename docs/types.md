@@ -72,7 +72,8 @@ type; `null` is always admissible and nullability is a separate contract:
 | REAL | `number` |
 | NUMERIC | `number`, or `bigint` under R1 |
 | BOOLEAN | `boolean` |
-| TEXT and the temporals (DATE/TIME/DATETIME/TIMESPAN) | `string` |
+| TIMESTAMP | same as INTEGER — it is an integer instant, not a string temporal |
+| TEXT and the string temporals (DATE/TIME/DATETIME/TIMESPAN) | `string` |
 | BLOB | `Uint8Array` |
 | JSON | native JS object/array, or a JSON scalar (`string`/`number`/`boolean`) |
 | ANY | any of the above, each obeying R1 |
@@ -90,8 +91,9 @@ Under R1, 9007199254740992 is a `bigint`.
 on read paths:
 
 - **Literals**: the lexer emits `number` below the safe boundary, `bigint` above it.
-- **Conversion**: `INTEGER_TYPE.parse` and `NUMERIC_TYPE.parse` (covering `cast(…)`, the
-  conversion builtins, DML coercion of a differently-typed cell, and ALTER backfill).
+- **Conversion**: `INTEGER_TYPE.parse`, `NUMERIC_TYPE.parse` and `TIMESTAMP_TYPE.parse` —
+  the three integer-domain conversions — covering `cast(…)`, the conversion builtins, DML
+  coercion of a differently-typed cell, and ALTER backfill.
 - **Bound parameters**: canonicalized as they are stored into the statement's bound-args
   map (per-bind, not per-row).
 - **Arithmetic and aggregation results**: the bigint arms of binary/unary arithmetic and
@@ -100,6 +102,15 @@ on read paths:
 Rows returned from a virtual-table `query()` and values returned from user-defined
 functions are held to R1 by contract rather than by per-row coercion — every consumer
 already tolerates both forms, so coercing there would cost where there is nothing to win.
+Built-in functions are on the same footing and must simply return the canonical form:
+`random()` draws a safe integer, so it returns a `number`; `abs()` preserves magnitude, so
+canonical input gives canonical output.
+
+**Downstream operators must be exact over the whole integer domain.** Because arithmetic
+narrows, an operator can now receive as a `number` a value that previously reached it as a
+`bigint` — so a fixed-width implementation is a wrong answer, not merely a representation
+wart. Bitwise NOT is the live example: JS `~` coerces through ToInt32, so `~x` is computed
+as `-x - 1` arithmetically instead (`runtime/emit/unary.ts`).
 
 **BOOLEAN stays a first-class runtime value.** The alternative — canonicalize booleans to
 0/1 at ingress and make BOOLEAN purely logical — was considered and rejected: `boolean`

@@ -11,6 +11,25 @@ import { canonicalizeInteger } from "../../util/numeric-canonical.js";
 import { Temporal } from 'temporal-polyfill';
 import { TIMESPAN_TYPE } from "../../types/temporal-types.js";
 
+/**
+ * `~v = -v - 1` over the engine's arbitrary-precision integer domain.
+ *
+ * JS's `~` operator coerces through ToInt32 first, so it is only correct below 2^31:
+ * `~3000000000` evaluates to 1294967295 instead of -3000000001. Complement
+ * arithmetically instead and canonicalize the result (R1, util/numeric-canonical.ts) —
+ * `~(2^53 - 1)` leaves the safe range and must widen, `~(-2^53)` re-enters it and must
+ * narrow.
+ *
+ * A non-finite operand keeps the historical `~ToInt32(x)` result of -1; see the NaN
+ * note at the numeric-fast call site.
+ */
+function bitwiseNot(operand: number | bigint): number | bigint {
+	const truncated = typeof operand === 'bigint' ? operand : Math.trunc(operand);
+	if (typeof truncated === 'number' && !Number.isFinite(truncated)) return -1;
+	const exact = canonicalizeInteger(truncated);
+	return canonicalizeInteger(typeof exact === 'bigint' ? -exact - 1n : -exact - 1);
+}
+
 export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instruction {
 	// Select the operation function at emit time
 	let run: (ctx: RuntimeContext, operand: SqlValue) => SqlValue;
@@ -149,19 +168,17 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 				// path ever admits NaN into a numeric-typed value, restore an isNaN check.
 				run = (_ctx: RuntimeContext, operand: SqlValue) => {
 					if (operand === null) return null;
-					// ~v = -v-1 can land a canonical bigint back inside the safe range
-					// (~(-2^53) = 2^53-1), so the bigint arm must narrow (R1).
-					return typeof operand === 'bigint' ? canonicalizeInteger(~operand) : ~Math.trunc(operand as number);
+					return bitwiseNot(operand as number | bigint);
 				};
 				note = '~(numeric-fast)';
 			} else {
 				run = (_ctx: RuntimeContext, operand: SqlValue) => {
 					if (operand === null) return null;
-					if (typeof operand === 'bigint') return canonicalizeInteger(~operand);
+					if (typeof operand === 'bigint') return bitwiseNot(operand);
 					// Convert to integer and apply bitwise NOT
 					const num = Number(operand);
 					if (isNaN(num)) return null;
-					return ~Math.trunc(num);
+					return bitwiseNot(num);
 				};
 				note = 'bitwise ~';
 			}

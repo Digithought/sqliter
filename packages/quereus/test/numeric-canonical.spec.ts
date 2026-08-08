@@ -18,6 +18,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Database } from '../src/core/database.js';
 import { INTEGER_TYPE, NUMERIC_TYPE } from '../src/types/builtin-types.js';
+import { TIMESTAMP_TYPE } from '../src/types/temporal-types.js';
 import { canonicalizeInteger, canonicalizeSqlValue, isCanonicalNumeric } from '../src/util/numeric-canonical.js';
 import type { SqlValue } from '../src/common/types.js';
 
@@ -145,6 +146,24 @@ describe('Canonical numeric representation (R1/R2)', () => {
 		});
 	});
 
+	// TIMESTAMP is the third integer-domain conversion (physicalType INTEGER, value
+	// space number|bigint) — it must canonicalize on the same rule as INTEGER, not be
+	// grouped with the string temporals.
+	describe('TIMESTAMP_TYPE.parse', () => {
+		const parse = (v: SqlValue): SqlValue => TIMESTAMP_TYPE.parse!(v);
+
+		it('canonicalizes both numeric arms like INTEGER_TYPE.parse', () => {
+			expectCanonical(parse(5n), 5, 'bigint narrows');
+			expectCanonical(parse(9007199254740991n), MAX_SAFE, '2^53-1 bigint narrows');
+			expectCanonical(parse(TWO_53), TWO_53, '2^53 bigint stays');
+			expectCanonical(parse(9007199254740992), TWO_53, '2^53 number widens');
+			expectCanonical(parse(1e20), 100000000000000000000n, '1e20 widens exactly');
+			expectCanonical(parse(-1), -1, 'small number');
+			expectCanonical(parse('9007199254740993'), 9007199254740993n, 'digit string past 2^53');
+			expect(TIMESTAMP_TYPE.validate!(parse(1e20))).to.be.true;
+		});
+	});
+
 	describe(`engine round-trips (${USE_STORE_MODULE ? 'store' : 'memory'} backend)`, () => {
 		let db: Database;
 		let testStorePath: string | null = null;
@@ -251,6 +270,29 @@ describe('Canonical numeric representation (R1/R2)', () => {
 			expectCanonical(await selectValue('select ~(-9007199254740992)'), MAX_SAFE);
 			// Negation preserves magnitude: an out-of-range result stays bigint.
 			expectCanonical(await selectValue('select -(9007199254740993 - 1)'), -TWO_53);
+		});
+
+		// Narrowing hands ~ a `number` where it previously saw a bigint, so ~ has to be
+		// exact over the whole integer domain — JS's ToInt32-based `~` is not (see the
+		// value-level cases in test/logic/03-expressions.sqllogic). These pin the form.
+		it('~ crosses the safe-integer boundary in both directions', async () => {
+			// ~(2^53−1) = −2^53 — leaves the safe range, so the result must widen.
+			expectCanonical(await selectValue('select ~9007199254740991'), -TWO_53);
+			// ~(−2^53) = 2^53−1 — re-enters it, so the result must narrow.
+			expectCanonical(await selectValue('select ~(-9007199254740992)'), MAX_SAFE);
+			// Operand narrowed by the preceding subtraction; stays exact and a number.
+			expectCanonical(await selectValue('select ~(9007199254740993 - 3)'), -9007199254740991);
+			// Past 2^31, where a 32-bit complement would wrap.
+			expectCanonical(await selectValue('select ~3000000000'), -3000000001);
+		});
+
+		it('random() returns a canonical safe-range number, never a bigint', async () => {
+			for (let i = 0; i < 20; i++) {
+				const v = await selectValue('select random()');
+				expect(isCanonicalNumeric(v), `random() returned ${String(v)} (${typeof v})`).to.be.true;
+				expect(typeof v).to.equal('number');
+				expect(Number.isSafeInteger(v as number)).to.be.true;
+			}
 		});
 
 		it('sum() narrows a promote-then-retract fold back to number', async () => {

@@ -17,12 +17,19 @@
  *
  * NOTE: this codec intentionally keeps `5n` (bigint) and `5` (number) as
  * DISTINCT keys — matching `delta-executor` `tupleKey`, and unlike
- * `compareSqlValues` (which treats `5n == 5`). The split is safe because of the
- * canonical numeric representation rule R1 (docs/types.md § "Physical
- * representation", util/numeric-canonical.ts): one integer value has exactly one
- * JS form engine-wide (bigint only outside the safe-integer range), so a single
- * logical row's PK can never appear as `5` in one op and `5n` in another, and an
- * INSERT/DELETE pair always coalesces. If R1 is ever relaxed, unify numerics in
+ * `compareSqlValues` (which treats `5n == 5`). If a single logical row's PK were
+ * ever presented as differently-typed numerics across two ops in one
+ * transaction, its INSERT/DELETE would not coalesce. Two things keep that
+ * unreachable, and BOTH are load-bearing:
+ *   - a table's PK storage type is stable per row (a delete's key tuple is read
+ *     back off the stored row, so it carries the stored row's form); and
+ *   - inside the safe-integer range there is only one legal form to begin with,
+ *     by the canonical numeric representation rule R1 (docs/types.md § "Physical
+ *     representation", util/numeric-canonical.ts).
+ * R1 alone is NOT sufficient: it constrains which values may be bigint, not which
+ * `number`s may be whole, so `1e20` (number) and `100000000000000000000n` (bigint)
+ * are both canonical spellings of one value and would key apart here. Only the
+ * first bullet rules that out. If either premise is relaxed, unify numerics in
  * BOTH this codec and `delta-executor` `tupleKey` together.
  *
  * Encoding: a JSON array of type-tagged element strings (first char = tag), then

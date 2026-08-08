@@ -35,6 +35,17 @@ SELECT -i AS a, +i AS b, ~i AS c, -n AS d, +n AS e FROM expr_t WHERE i = 2;
 -- TEXT operand keeps the generic coerce-or-null path.
 SELECT -t AS a, +t AS b, ~t AS c FROM expr_t WHERE i = 1;
 → [{"a":null,"b":null,"c":null}]
+-- ~ is -x-1 over the WHOLE integer domain, not a 32-bit complement: every operand
+-- below is past 2^31, where a ToInt32-based ~ silently wraps (~3000000000 would be
+-- 1294967295). The last two land on the safe-integer boundary from both sides —
+-- arithmetic narrowing (R1) hands ~ a number where it used to see a bigint.
+SELECT ~2147483647 AS a, ~2147483648 AS b, ~3000000000 AS c, ~(-3000000000) AS d;
+→ [{"a":-2147483648,"b":-2147483649,"c":-3000000001,"d":2999999999}]
+SELECT ~9007199254740990 AS a, ~(9007199254740993 - 3) AS b, ~9007199254740991 AS c;
+→ [{"a":-9007199254740991,"b":-9007199254740991,"c":-9007199254740992}]
+-- Generic (TEXT-operand) path agrees with the numeric-fast path past 2^31.
+SELECT ~'3000000000' AS a;
+→ [{"a":-3000000001}]
 
 -- String Concatenation
 SELECT t || ' ' || t FROM expr_t WHERE i = 1;

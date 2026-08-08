@@ -273,8 +273,10 @@ export const typeofFunc = createScalarFunction(
 export const randomFunc = createScalarFunction(
 	{ name: 'random', numArgs: 0, deterministic: false, returnType: INTEGER_RETURN_NOT_NULL },
 	(): SqlValue => {
-		const randomInt = Math.floor(Math.random() * (Number.MAX_SAFE_INTEGER - Number.MIN_SAFE_INTEGER + 1)) + Number.MIN_SAFE_INTEGER;
-		return BigInt(randomInt);
+		// Draws from [MIN_SAFE_INTEGER, MAX_SAFE_INTEGER], so the result is always a
+		// safe integer and must stay a `number` (R1, util/numeric-canonical.ts) —
+		// wrapping it in BigInt() minted an in-range bigint on every call.
+		return Math.floor(Math.random() * (Number.MAX_SAFE_INTEGER - Number.MIN_SAFE_INTEGER + 1)) + Number.MIN_SAFE_INTEGER;
 	}
 );
 

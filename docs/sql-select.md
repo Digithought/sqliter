@@ -1160,11 +1160,12 @@ select null as no_value;
 - NOT: `not`
 
 **Bitwise Operators:**
-- AND: `&`
-- OR: `|`
-- NOT: `~`
-- Left shift: `<<`
-- Right shift: `>>`
+- NOT: `~` — `~x` is `-x - 1` over the whole integer domain, not a fixed-width
+  complement: `~3000000000` is `-3000000001` and `~9223372036854775807` is
+  `-9223372036854775808`, both exact. A REAL operand truncates toward zero first, and the
+  result takes its canonical form ([types.md § Physical
+  representation](types.md#physical-representation)).
+- `&`, `|`, `<<` and `>>` are **not implemented** — the parser rejects them.
 
 **String Operators:**
 - Concatenation: `||` — NULL if either operand is NULL; a non-text operand is

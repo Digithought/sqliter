@@ -96,9 +96,12 @@ Pick the narrowest existing choke point for each; do not add a new pipeline stag
   (`valueToText`), which is total over `SqlValue`, and truncate long renderings.
 - **`ANY` and untyped positions** get R1 only. `types[i] === undefined` is normal, not an
   error, and must not be reported as one.
-- **The temporals are physically TEXT.** A DATE value is a `string`; R2 must not demand a
-  `Temporal` object. Likewise a JSON *string scalar* is physically a plain `string`, not an
-  object — the JSON row of R2's table is the fiddly one, write its test first.
+- **Most temporals are physically TEXT, but TIMESTAMP is not.** A DATE value is a `string`;
+  R2 must not demand a `Temporal` object. TIMESTAMP is the exception — it is an integer
+  instant (`physicalType` INTEGER, value space `number | bigint` under R1), so it takes
+  INTEGER's rule, not TEXT's. Likewise a JSON *string scalar* is physically a plain
+  `string`, not an object — the JSON row of R2's table is the fiddly one, write its test
+  first.
 - **`null` is always admissible.** The checker does not police nullability; that is
   `notNull` constraint enforcement's job and lives elsewhere.
 - **A failing check must not be caught and swallowed** by a surrounding `try`/`catch` that
@@ -112,7 +115,9 @@ Pick the narrowest existing choke point for each; do not add a new pipeline stag
   builtin whose declared return type is narrower than what it returns. Each one is either a
   real fix in this ticket or, if it is a bigger change than this ticket can carry, a
   `fix/` ticket named in the handoff. **Do not loosen the checker to make the suite pass**,
-  and do not skip a test to hide a violation.
+  and do not skip a test to hide a violation. One such builtin was already found and fixed
+  during the prereq's review — `random()` wrapped its (always safe-range) draw in
+  `BigInt()`, so every call minted an R1 violation. Expect more of the same shape.
 - **`@quereus/store`'s exported `decodeValue` / `decodeCompositeKey`** return `BigInt(...)`
   for every integer-valued key, which violates R1 for small integers. They are key decoders
   and are not used to reconstruct rows, so the strict checker will not see them — filed
