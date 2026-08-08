@@ -104,14 +104,28 @@ export class EmissionContext {
 	/** Schema snapshot for table/view references during emission */
 	private readonly schemaSnapshot = new Map<string, SchemaObject>();
 	public readonly tracePlanStack: boolean;
+	/**
+	 * Whether `emitCallFromPlan` may compile pure synchronous scalar subtrees into
+	 * fused closures (runtime/scalar-fusion.ts) instead of per-row sub-programs.
+	 * Resolved once here: `trace_plan_stack` disables fusion because a fused subtree
+	 * bypasses the per-instruction tracing wrapper (its frames would silently vanish
+	 * from `ctx.planStack`), and `runtime_fuse_scalars` (default true) is the explicit
+	 * kill switch. The override forces a decision regardless of either option — used
+	 * by the debug-introspection surfaces (`scheduler_program()`, `execution_trace()`,
+	 * `Statement.getDebugProgram()`), which must report the unfused instruction graph.
+	 */
+	public readonly fuseScalars: boolean;
 
 	constructor(
 		public readonly db: Database,
+		options?: { fuseScalars?: boolean },
 	) {
 		const option = db.getOption('trace_plan_stack');
 		this.tracePlanStack = typeof option === 'object' && option !== null && 'value' in option
 			? Boolean((option as { value: unknown }).value)
 			: Boolean(option);
+		this.fuseScalars = options?.fuseScalars
+			?? (!this.tracePlanStack && db.options.getBooleanOption('runtime_fuse_scalars'));
 		this.schemaManager = db.schemaManager;
 	}
 

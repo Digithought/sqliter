@@ -83,6 +83,16 @@ export class Statement {
 	 * path — see {@link Database._homeSchemaPath}.
 	 */
 	_schemaPathOverride?: string[];
+	/**
+	 * @internal When true, this statement emits with scalar fusion disabled, so its
+	 * instruction graph is the full, faithful sub-program form. Set right after
+	 * `db.prepare(...)` by debug introspection (the `execution_trace()` TVF), which
+	 * joins trace events against `scheduler_program()` by instruction index — the two
+	 * must agree, and `scheduler_program()` reports the unfused graph. Compile is
+	 * deferred, so setting this before first iteration is race-free, exactly as
+	 * {@link _schemaPathOverride} documents.
+	 */
+	_emitUnfused?: boolean;
 
 	/**
 	 * @internal - Use db.prepare().
@@ -267,7 +277,10 @@ export class Statement {
 	/** @internal Gets or creates the emission context for this statement */
 	private getEmissionContext(): EmissionContext {
 		if (!this.emissionContext) {
-			this.emissionContext = new EmissionContext(this.db);
+			this.emissionContext = new EmissionContext(
+				this.db,
+				this._emitUnfused ? { fuseScalars: false } : undefined,
+			);
 		}
 		return this.emissionContext;
 	}
@@ -377,10 +390,11 @@ export class Statement {
 			// emit time), and its validity is exactly the emission context's, which is
 			// nulled together with `this.scheduler` on any schema-dependency change.
 			// NOTE: the emission context (and thus this scheduler) is cached, so toggling
-			// the `trace_plan_stack` db option mid-life is ignored until the plan is
-			// recompiled — the tracing wrap is baked at emit time. Pre-existing behavior,
-			// unchanged here; caching the scheduler does not regress it (per-run tracer
-			// wrapping lives in the scheduler hooks, not baked). Recompile to pick up a toggle.
+			// the `trace_plan_stack` or `runtime_fuse_scalars` db options mid-life is
+			// ignored until the plan is recompiled — the tracing wrap and the fuse-or-not
+			// decision are both baked at emit time. Pre-existing behavior, unchanged here;
+			// caching the scheduler does not regress it (per-run tracer wrapping lives in
+			// the scheduler hooks, not baked). Recompile to pick up a toggle.
 			if (!this.scheduler) {
 				const rootInstruction = emitPlanNode(blockPlanNode, emissionContext);
 				this.scheduler = new Scheduler(rootInstruction);
@@ -976,7 +990,11 @@ export class Statement {
 	getDebugProgram(): string {
 		this.validateStatement("get debug program for");
 		const plan = this.compile();
-		const emissionContext = this.getEmissionContext();
+		// A fresh unfused context, NOT the cached one: this dump exists to show the
+		// full instruction graph, and scalar fusion would dissolve scalar sub-programs
+		// into opaque fused(...) entries. Debug introspection reports the unfused
+		// graph; a normal execution still runs the (possibly fused) cached form.
+		const emissionContext = new EmissionContext(this.db, { fuseScalars: false });
 		const rootInstruction = emitPlanNode(plan, emissionContext);
 		const scheduler = new Scheduler(rootInstruction);
 

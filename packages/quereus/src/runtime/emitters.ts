@@ -7,6 +7,7 @@ import { createLogger } from '../common/logger.js';
 import { Scheduler } from "./scheduler.js";
 import type { EmissionContext } from "./emission-context.js";
 import { isAsyncIterable } from "./utils.js";
+import { tryFuseScalar } from "./scalar-fusion.js";
 
 const log = createLogger('emitters');
 
@@ -144,8 +145,27 @@ export function emitCall(root: Instruction): Instruction {
 /**
  * Helper function to emit a plan node and wrap it as a callable instruction.
  * This is useful for emitters that need to create sub-instructions.
+ *
+ * This is also the single front door of scalar fusion: when the emission context
+ * allows it, a pure synchronous scalar subtree compiles into one fused closure
+ * (runtime/scalar-fusion.ts) instead of a per-row sub-program. Transparent to every
+ * consumer — a `FusedScalar` satisfies the same `(ctx) => MaybePromise<SqlValue>`
+ * callback contract a sub-program does, and any plan the fusion compiler cannot
+ * prove pure and synchronous (relational plans, subqueries, function calls, async
+ * literals, over-deep trees) falls back to the sub-program path unchanged.
+ *
+ * A fused instruction returns the SAME closure on every invocation, where `emitCall`
+ * allocates a fresh arrow each time; nothing keys on sub-program function identity
+ * (verified across the runtime emitters), and identity per emit site is strictly
+ * more stable than identity per invocation.
  */
 export function emitCallFromPlan(plan: PlanNode, emissionCtx: EmissionContext): Instruction {
+	if (emissionCtx.fuseScalars) {
+		const fused = tryFuseScalar(plan, emissionCtx);
+		if (fused) {
+			return { params: [], run: () => fused, note: `fused(${plan.toString()})` };
+		}
+	}
 	const instruction = emitPlanNode(plan, emissionCtx);
 	return emitCall(instruction);
 }

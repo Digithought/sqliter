@@ -449,6 +449,42 @@ if the final instruction returns a bare `Promise` (rare — a SELECT root is an 
 iterable, counted synchronously) that instruction's `out` count may be missing from
 the debug-only aggregate log. Not observable outside the `runtime:metrics` logger.
 
+### Scalar fusion: the second execution tier
+
+The instruction graph handles relational and asynchronous work; **pure synchronous
+scalar subtrees run as fused closures** beside it. `emitCallFromPlan`
+(`runtime/emitters.ts`) — the one front door every per-row scalar callback goes
+through (filter conjuncts, aggregate/GROUP BY arguments, CASE branches, sort and join
+keys, projections, LIMIT/OFFSET, INSERT values, CHECK predicates) — first offers the
+plan to `tryFuseScalar` (`runtime/scalar-fusion.ts`). On success the whole subtree
+becomes one closure `(rctx) => SqlValue`, invoked directly per row with no
+sub-`Scheduler`, no per-instruction argument arrays, and no `instanceof Promise`
+checks; the instruction is marked `fused(<expr>)`. On refusal (`undefined`) the plan
+takes the existing sub-program path unchanged.
+
+Fusable nodes: literals (unless holding an unresolved async constant-fold result),
+column references, parameter references, `COLLATE` (fused through, no runtime
+effect), `CAST`, unary operators, `BETWEEN`, binary operators (numeric, comparison,
+concat, `LIKE`, and the *eager* logical form — the `AND`/`OR` short-circuit form with
+a subquery right leg declines), and `CASE` (all-or-nothing over base/WHEN/THEN/ELSE,
+keeping lazy branch selection via the shared `buildCaseMatcher`). Every fused body is
+the node's own `ScalarOpSpec` body — the same function the instruction emitter runs —
+so semantics, error messages, and evaluation counts are identical by construction.
+Scalar **function calls are not yet fused** (their sync/async split is pending), so
+any subtree containing one declines; subqueries, window/aggregate/relational nodes
+decline as unknown node types. A subtree deeper than `MAX_FUSION_DEPTH` (32) declines
+whole — fused closures nest on the JS call stack where the scheduler's linearized
+loop did not.
+
+Fusion is off when `trace_plan_stack = true` (fused frames would silently vanish from
+`ctx.planStack`) or when the `runtime_fuse_scalars` db option (default `true`) is set
+false — the explicit kill switch for bisecting a suspected fusion bug. Both are baked
+into a prepared statement's cached emission context at emit time; recompile to pick up
+a toggle. **Debug introspection reports the unfused graph**: `scheduler_program()`,
+`execution_trace()` (which joins the former by instruction index), and
+`Statement.getDebugProgram()` all emit with fusion disabled — the faithful description
+of what the query computes — while a normal execution runs the fused form.
+
 ### Key Points for Emitter Authors
 
 Build a row descriptor mapping attribute IDs to column indices, close every context in

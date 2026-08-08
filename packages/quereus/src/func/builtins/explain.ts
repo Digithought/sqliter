@@ -237,8 +237,11 @@ export const schedulerProgramFunc = createIntegratedTableValuedFunction(
 			// Parse and plan the SQL to get the actual plan tree
 			const plan = db.getPlan(sql);
 
-			// Emit the plan to get the instruction tree
-			const emissionContext = new EmissionContext(db);
+			// Emit the plan to get the instruction tree. Unfused: this TVF exists to show
+			// the instruction graph, and execution_trace() joins against it by instruction
+			// index — both must report the same (full, sub-program) form. Scalar fusion
+			// would dissolve scalar sub-programs into single fused(...) instructions.
+			const emissionContext = new EmissionContext(db, { fuseScalars: false });
 			const rootInstruction = emitPlanNode(plan, emissionContext);
 
 			// Create a scheduler to get the instruction sequence
@@ -468,6 +471,10 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 			let stmt: ReturnType<Database['prepare']> | undefined;
 			try {
 				stmt = db.prepare(sql);
+				// Trace the UNFUSED graph so instruction indices line up with the
+				// scheduler_program() rows joined above. Compile is deferred, so setting
+				// this right after prepare is race-free (see Statement._emitUnfused).
+				stmt._emitUnfused = true;
 
 				// Execute the query with tracing to collect actual instruction events
 				const results: Row[] = [];

@@ -58,8 +58,11 @@ export interface ScalarOpSpec {
  * `emitScalarFunctionCallDefault`, the one variadic scalar body, deliberately stays off
  * `ScalarOpSpec`. A future variadic spec needs an explicit opt-out here, not a weakened
  * check for everyone.
+ *
+ * Exported for the scalar-fusion compiler (runtime/scalar-fusion.ts), which composes
+ * spec bodies without going through {@link emitScalarOp} and needs the same guard.
  */
-function assertSpecArity(spec: ScalarOpSpec): void {
+export function assertSpecArity(spec: ScalarOpSpec): void {
 	const expected = spec.operands.length + 1;
 	if (spec.run.length !== expected) {
 		throw new QuereusError(

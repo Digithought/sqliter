@@ -395,6 +395,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			description: 'Enable plan stack tracing',
 		});
 
+		this.options.registerOption('runtime_fuse_scalars', {
+			type: 'boolean',
+			defaultValue: true,
+			description: 'Compile pure synchronous scalar expression subtrees into single fused closures ' +
+				'instead of per-row sub-programs (runtime/scalar-fusion.ts). Kill switch for bisecting a ' +
+				'suspected fusion bug; trace_plan_stack=true also disables fusion. Like trace_plan_stack, ' +
+				'the decision is baked into a prepared statement at emit time — recompile to pick up a toggle.',
+		});
+
 		this.options.registerOption('foreign_keys', {
 			type: 'boolean',
 			defaultValue: true,
