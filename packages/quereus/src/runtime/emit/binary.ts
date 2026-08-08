@@ -158,6 +158,12 @@ export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 		note = `${plan.expression.operator}(temporal)`;
 	} else if (leftLogical.isNumeric && rightLogical.isNumeric) {
 		// Numeric-only path: skip temporal check and coercion entirely
+		//
+		// NOTE: accepted tradeoff — the two null checks plus two `typeof === 'bigint'`
+		// checks below are NOT collapsed into one `typeof === 'number'` pair with the
+		// null/bigint handling behind a fallback. Measured at 1.19 ns vs 1.22 ns per
+		// operation (isolated microbench, see `compareSqlValuesFast` in
+		// util/comparison.ts) — no difference at all, so the guard would be pure noise.
 		run = function runNumericOnly(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 			if (v1 !== null && v2 !== null) {
 				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
@@ -259,6 +265,11 @@ export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Inst
 	} else if (!needsTemporalCheck && bothSameCategory) {
 		// Fast same-category comparison: no temporal check, no coercion needed
 		// Use compareSqlValuesFast which handles runtime type mismatches gracefully
+		//
+		// NOTE: accepted tradeoff — this does NOT further specialize on the known category
+		// (both-TEXT → guarded `typeof` pair → collation call, both-numeric → guarded
+		// inline three-way). Measured and declined; the numbers and the revisit condition
+		// are on `compareSqlValuesFast` in util/comparison.ts.
 		const cmpToResult = buildCmpToResult(operator, plan);
 		run = function runSameCategoryCompare(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 			if (v1 === null || v2 === null) return null;

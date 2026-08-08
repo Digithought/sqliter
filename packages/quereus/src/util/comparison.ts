@@ -371,6 +371,31 @@ export function resolveCollationFunctions(
  * Optimized version of compareSqlValues that takes a pre-resolved collation function.
  * This avoids the collation lookup on every call.
  *
+ * NOTE: accepted tradeoff — the per-call {@link getStorageClass} classification stays,
+ * even where the emitter statically knows both operand categories. The alternative
+ * (a `typeof`-guarded fast path that falls back here on a miss, the shape
+ * {@link createTypedComparator} already uses for storage-class drift) was prototyped and
+ * measured, and the payoff does not survive contact with the interpreter:
+ *   - guarded vs. this function, per comparison, isolated per-process microbench
+ *     (65536 pairs × 300 passes, median, node 24): text 25.5 → 23.0 ns; text with a
+ *     40-char shared prefix 26.5 → 25.9 ns; numeric 3.14 → 1.17 ns; text with 5% NULLs
+ *     23.0 → 19.8 ns (the fallback is not a cliff — guard misses stay cheap, so no
+ *     deopt/inline-cache machinery would be needed either).
+ *   - text can barely improve: a bare `BINARY_COLLATION(a, b)` call with no
+ *     classification at all measured 20.2 ns, so classification is ~5 ns of ~25 ns and
+ *     the guard itself costs ~3 ns of that back.
+ *   - end-to-end, one comparison expression costs ~210-226 ns/row (measured as the slope
+ *     of a 1→8-column projection ladder over 10k rows, isolated processes), against
+ *     143 ns/row for a bare column-reference instruction. Per-instruction scheduler
+ *     dispatch, not classification, is the cost. A ≤9 ns saving is ~4% of one comparison
+ *     expression and ~0.3% of a row — well inside the 20% bench regression gate.
+ * Sort/BTree comparators are no better a target: `order by` over 10k text rows runs
+ * ~n·log2(n) ≈ 133k comparisons ≈ 3 ms of comparator at the rates above, against a
+ * 260 ms benchmark median.
+ * Revisit if `runtime-scalar-expression-fusion` lands — fusion removes the per-instruction
+ * dispatch that swamps this, after which the guard is a double-digit percentage of what
+ * remains of a numeric comparison. Re-measure the ladder above before adding it.
+ *
  * @param a First value
  * @param b Second value
  * @param collationFunc Pre-resolved collation function
