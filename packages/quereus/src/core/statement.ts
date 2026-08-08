@@ -11,7 +11,7 @@ import { Scheduler } from '../runtime/scheduler.js';
 import type { InstructionTracer, RuntimeContext } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { REPR_STRICT } from '../runtime/strict-flags.js';
-import { assertCanonicalValue } from '../runtime/strict-representation.js';
+import { assertRowConforms, type DeclaredType } from '../runtime/strict-representation.js';
 import { Cached } from '../util/cached.js';
 import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
@@ -31,6 +31,13 @@ import { astToString } from '../emit/ast-stringify.js';
 
 const log = createLogger('core:statement');
 const errorLog = log.extend('error');
+
+/**
+ * The declared-type argument for a row check that has no declared types to check
+ * against — every position reads as `undefined` and takes `assertRowConforms`'s R1-only
+ * path. See {@link Statement._iterateWithSignal} for why statement egress is that case.
+ */
+const NO_DECLARED_TYPES: readonly (DeclaredType | undefined)[] = [];
 
 /**
  * Represents a prepared SQL statement.
@@ -443,41 +450,35 @@ export class Statement {
 	 * @internal
 	 */
 	private async *_iterateWithSignal(source: AsyncIterable<Row>, signal?: AbortSignal): AsyncIterable<Row> {
-		if (REPR_STRICT) {
-			// QUEREUS_REPR_STRICT backstop seam: rows yielded to the caller. This is the only
-			// one of the four seams that sees an EXPRESSION producing a non-canonical value
-			// (an arithmetic path that forgot to narrow) — the scan, write and UDF seams all
-			// sit upstream of it.
-			//
-			// R1 ONLY, deliberately. R2 is a rule about *declared* types — a column's DDL type
-			// — and a projection's `ScalarType` is not one: it is the planner's static
-			// INFERENCE, and the engine never coerces a projection's output to it. The two
-			// legitimately disagree all over the suite (`select ? as v` infers TEXT for an
-			// untyped parameter and yields a number; a comparison infers TEXT and yields a
-			// boolean; `sum(v)` infers REAL and yields a bigint past 2^53). Asserting R2 here
-			// would report the inference, not a representation defect. The declared-type
-			// checks live at the seams that actually have a declared type: the vtab scan and
-			// the DML write.
-			//
-			// NOTE: that the inferred scalar type so often disagrees with the runtime storage
-			// class is itself worth knowing — `Statement.getColumnType()` reports it to
-			// embedders. Tracked as `backlog/bug-inferred-scalar-type-disagrees-with-runtime-value`.
-			const reprNames = this.columnDefCache.value.map(col => col.name);
-			for await (const row of source) {
-				if (signal) throwIfAborted(signal);
-				for (let i = 0; i < row.length; i++) {
-					assertCanonicalValue(row[i], `the statement result row column ${i} (${reprNames[i] ?? '?'})`);
-				}
-				yield row;
-			}
-			return;
-		}
-		if (!signal) {
+		if (!signal && !REPR_STRICT) {
 			yield* source;
 			return;
 		}
+		// QUEREUS_REPR_STRICT backstop seam: rows yielded to the caller. This is the only
+		// one of the four seams that sees an EXPRESSION producing a non-canonical value
+		// (an arithmetic path that forgot to narrow) — the scan, write and UDF seams all
+		// sit upstream of it.
+		//
+		// R1 ONLY, deliberately — hence the empty declared-type array, which puts every
+		// cell on `assertRowConforms`'s untyped-position path. R2 is a rule about
+		// *declared* types — a column's DDL type — and a projection's `ScalarType` is not
+		// one: it is the planner's static INFERENCE, and the engine never coerces a
+		// projection's output to it. The two legitimately disagree all over the suite
+		// (`select ? as v` infers TEXT for an untyped parameter and yields a number; a
+		// comparison infers TEXT and yields a boolean; `sum(v)` infers REAL and yields a
+		// bigint past 2^53). Asserting R2 here would report the inference, not a
+		// representation defect. The declared-type checks live at the seams that actually
+		// have a declared type: the vtab scan and the DML write.
+		//
+		// NOTE: the inferred scalar type disagreeing with the runtime storage class is not
+		// only embedder-visible metadata — `emitInsert` builds its declared-type coercion
+		// from the source expression's static type and SKIPS a cell whose static type
+		// already equals the column's, so a disagreement there stores a non-conforming
+		// value. Tracked as `backlog/bug-inferred-scalar-type-disagrees-with-runtime-value`.
+		const reprNames = REPR_STRICT ? this.columnDefCache.value.map(col => col.name) : undefined;
 		for await (const row of source) {
-			throwIfAborted(signal);
+			if (signal) throwIfAborted(signal);
+			if (reprNames) assertRowConforms(row, NO_DECLARED_TYPES, 'the statement result row', reprNames);
 			yield row;
 		}
 	}

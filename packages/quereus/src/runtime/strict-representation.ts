@@ -118,6 +118,12 @@ function admissibleForms(type: DeclaredType): string {
  *
  * - **NUMERIC** shares REAL's `physicalType` (see the NOTE on `NUMERIC_TYPE` in
  *   `types/builtin-types.ts`) but its value space includes `bigint`.
+ *   NOTE: matched by NAME, not by identity against the `NUMERIC_TYPE` singleton the way
+ *   `isSeekKeySpaceNumeric` matches, because the surrounding switch is deliberately keyed
+ *   on `physicalType` so plugin-registered types are covered. The cost is that a
+ *   plugin-registered REAL-physical type *named* `NUMERIC` would silently inherit
+ *   bigint admission. No such type exists in tree; if one is ever registered, give
+ *   `LogicalType` an explicit "admits bigint" property and switch on that instead.
  * - **`ANY`/NULL** (`PhysicalType.NULL`) impose no R2 constraint at all — R1 already
  *   passed, and an `ANY` position may legitimately hold any storage class.
  *

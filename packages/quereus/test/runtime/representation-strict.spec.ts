@@ -5,9 +5,11 @@ import type { MemoryTable } from '../../src/vtab/memory/table.js';
 import type { MemoryTableConfig } from '../../src/vtab/memory/types.js';
 import type { TableSchema } from '../../src/schema/table.js';
 import type { FilterInfo } from '../../src/vtab/filter-info.js';
-import type { Row, SqlValue } from '../../src/common/types.js';
+import type { MaybePromise, Row, SqlValue } from '../../src/common/types.js';
 import { StatusCode } from '../../src/common/types.js';
 import { QuereusError } from '../../src/common/errors.js';
+import { FunctionFlags } from '../../src/common/constants.js';
+import type { ScalarFunctionSchema } from '../../src/schema/function.js';
 import {
 	assertCanonicalValue,
 	assertConformsToType,
@@ -236,6 +238,51 @@ describe('Physical representation (QUEREUS_REPR_STRICT)', () => {
 			const message = (err as Error).message;
 			expect(message, 'names the function').to.contain('bad_int(0)');
 			expect(message, 'is not re-reported as a call failure').to.not.contain('failed:');
+		});
+
+		/**
+		 * `Database.createScalarFunction` never passes a `returnType`, so every function it
+		 * registers is ANY and can only ever break R1. Reaching the seam's R2 half needs the
+		 * lower-level `registerFunction`, which is also the path every plugin takes.
+		 */
+		function registerTyped(db: Database, name: string, logicalType: typeof REAL_TYPE, impl: () => MaybePromise<SqlValue>): void {
+			const schema: ScalarFunctionSchema = {
+				name,
+				numArgs: 0,
+				flags: FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC,
+				returnType: { typeClass: 'scalar', logicalType, nullable: true, isReadOnly: true },
+				implementation: impl,
+			};
+			db.registerFunction(schema);
+		}
+
+		it('UDF seam: a function DECLARING a return type is held to it (R2)', async function () {
+			if (!strictMode) { this.skip(); }
+			registerTyped(db, 'bad_real', REAL_TYPE, () => 9007199254740993n);
+			const err = await capture(async () => {
+				for await (const _ of db.eval('select bad_real() as v')) { /* drain */ }
+			});
+			expect(err).to.be.instanceOf(RepresentationError);
+			const message = (err as Error).message;
+			expect(message, 'names the function').to.contain('bad_real(0)');
+			expect(message, 'names the declared type').to.contain('declared type REAL');
+			expect(message, 'states the rule').to.contain('R2');
+		});
+
+		it('UDF seam: an ASYNC implementation is checked on its resolved value', async function () {
+			if (!strictMode) { this.skip(); }
+			registerTyped(db, 'bad_text_async', TEXT_TYPE, () => Promise.resolve(42));
+			registerTyped(db, 'good_text_async', TEXT_TYPE, () => Promise.resolve('ok'));
+
+			const err = await capture(async () => {
+				for await (const _ of db.eval('select bad_text_async() as v')) { /* drain */ }
+			});
+			expect(err, 'the promise arm must assert on the RESOLVED value').to.be.instanceOf(RepresentationError);
+			expect((err as Error).message).to.contain('declared type TEXT');
+
+			const rows: SqlValue[] = [];
+			for await (const row of db.eval('select good_text_async() as v')) rows.push(row.v);
+			expect(rows, 'a conforming async function still returns its value').to.deep.equal(['ok']);
 		});
 
 		it('UDF seam: a conforming function is untouched', async function () {

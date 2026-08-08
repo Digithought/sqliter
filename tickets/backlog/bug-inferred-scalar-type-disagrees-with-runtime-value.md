@@ -1,15 +1,17 @@
 ---
-description: The data type the engine reports for a query's result column is often not the kind of value that column actually produces — a column announced as text can come back holding a number, a boolean, or a list — so a caller that trusts the announcement to decide how to handle the value can get it wrong.
+description: The data type the engine reports for a query's result column is often not the kind of value that column actually produces — a column announced as text can come back holding a number, a boolean, or a list. A caller that trusts the announcement gets it wrong, and in one case the engine trusts it too and stores a wrongly-shaped value.
 files:
   - packages/quereus/src/core/statement.ts                     # getColumnType / getColumnDefs — where the announced type reaches embedders
   - packages/quereus/src/common/type-inference.ts              # parameter type inference — the untyped-`?` case
   - packages/quereus/src/planner/nodes/function.ts             # ScalarFunctionCallNode.getType — aggregate/window return types
   - packages/quereus/src/runtime/emit/binary.ts                # arithmetic/comparison results whose runtime class differs from the inferred type
+  - packages/quereus/src/runtime/emit/insert.ts                # ARM 2 — builds the declared-type coercion from the SOURCE's announced type
+  - packages/quereus/src/types/validation.ts                   # ARM 2 — buildRowCoercion, which skips a cell whose announced type already matches
   - docs/types.md                                              # § Physical representation — states what IS promised (R1/R2 over DECLARED types)
 repro: verified
 severity: wrong-result
 likelihood: unusual
-tradeoffs: nothing inside the engine consumes the announced type at runtime — it is metadata for embedders only — so tightening inference is churn across the planner for a benefit no in-tree code can demonstrate, and some of the gaps (an untyped `?`) have no correct answer at plan time by construction.
+tradeoffs: most of the damage is embedder-facing metadata that no in-tree code reads, so tightening inference is churn across the planner for a benefit only arm 2 can demonstrate concretely — and some of the gaps (an untyped `?`) have no correct answer at plan time by construction; a maintainer could reasonably fix arm 2 alone by making the INSERT coercion representation-driven and leave the announcements as they are.
 ---
 
 # What is wrong
@@ -35,11 +37,48 @@ to stop reporting them. Representative cases, each verified:
 | `select lag(x, 1, 0) over (…)` | TEXT | a number |
 | `select 1 as v` | REAL | a number (an integer literal announced as REAL) |
 
-Nothing inside the engine reads the announced type at runtime — values carry their own
-JavaScript form and every operator dispatches on that — so none of these is a wrong ANSWER
-today. The cost lands entirely on embedders: a driver, UI grid, or serializer that switches
-on the announced type to decide how to render or marshal a value will handle these columns
-under the wrong branch.
+No operator reads the announced type while evaluating — values carry their own JavaScript
+form and every operator dispatches on that. So for the table above the cost lands on
+embedders: a driver, UI grid, or serializer that switches on the announced type to decide
+how to render or marshal a value handles these columns under the wrong branch.
+
+# Arm 2 — one place the engine DOES consume the announcement, and stores a bad value
+
+Found during the review of `representation-strict-checker`; this arm is why the ticket is
+not purely cosmetic.
+
+`emitInsert` (`runtime/emit/insert.ts`) builds its declared-type coercion with
+`buildRowCoercion(sourceAttrs.map(a => a.type.logicalType), tableSchema.columns)` — driven
+by the **announced** type of each source expression — and `buildRowCoercion` deliberately
+leaves a cell alone when its announced type already equals the column's declared type
+(the comment names `insert into b select j from a` for a JSON column, where re-converting
+would be wrong). When the announcement is wrong, that skip lets a non-conforming value
+through to storage.
+
+Verified, with the strict checker **off**:
+
+```sql
+create table s (id integer primary key, v integer);
+insert into s values (1, 9007199254740993), (2, 9007199254740993);
+create table t (id integer primary key, r real);
+insert into t values (1, (select sum(v) from s));
+select r from t;   -- comes back as the JS bigint 18014398509481986n
+```
+
+`sum()` announces REAL, so `buildRowCoercion` sees REAL-into-REAL and skips; the runtime
+value is a `bigint` past 2^53. A REAL-declared column now holds a `bigint`, which is an R2
+violation of *stored* data — the storage-level rule, not an announcement. With
+`QUEREUS_REPR_STRICT=1` the DML write seam reports it:
+
+```
+repr-strict: representation mismatch at write to main.t column 1 (r): declared type REAL
+admits a number, but the value is a JS bigint (18014398509481986) (rule R2).
+```
+
+Fixing the announcement (`sum()` over integers announcing NUMERIC rather than REAL) fixes
+this arm too, since the coercion would then see NUMERIC≠REAL and run. The alternative
+local fix is to make the INSERT coercion decide from the value's representation rather than
+from a static type it cannot trust.
 
 # Expected behavior
 
@@ -64,6 +103,8 @@ invariant permanently.
   the storage class each actually returns.
 - `sum()` over integers past 2^53: announced type must admit `bigint` (NUMERIC, not REAL).
 - A plain `select col from t`: unchanged — this already agrees and must keep agreeing.
-- Once fixed, flipping the statement-egress seam in `core/statement.ts` from
-  `assertCanonicalValue` (R1) to `assertRowConforms` (R2) and running
-  `yarn test:repr-strict` is the regression net.
+- Arm 2: the `insert into t values (1, (select sum(v) from s))` case above stores a JS
+  `number` in the REAL column, and `QUEREUS_REPR_STRICT=1` stays quiet on it.
+- Once fixed, widening the statement-egress seam in `core/statement.ts` from R1-only
+  (`NO_DECLARED_TYPES`) to the plan's real output types and running `yarn test:repr-strict`
+  is the regression net.

@@ -314,6 +314,13 @@ export {
 	isNumericValue
 } from './util/coercion.js';
 
+// Canonical numeric form (rule R1, docs/types.md § Physical representation). Exported
+// because the contract binds OUT-of-package code: a virtual-table module's `query()` rows
+// and a scalar function's return value are the two boundaries the engine does not coerce,
+// so a plugin that mints an integer needs the same narrowing the engine applies to its own.
+// `QUEREUS_REPR_STRICT` checks the result; these produce it.
+export { canonicalizeInteger, canonicalizeSqlValue, isCanonicalNumeric } from './util/numeric-canonical.js';
+
 // Utility functions
 export { Latches } from './util/latches.js';
 
