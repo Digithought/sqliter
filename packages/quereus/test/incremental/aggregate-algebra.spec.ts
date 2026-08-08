@@ -9,6 +9,7 @@ import {
 	totalFunc, groupConcatFuncRev, varPopFunc, varSampFunc, stdDevPopFunc, stdDevSampFunc,
 } from '../../src/func/builtins/aggregate.js';
 import { bindAggregateSchema } from '../../src/func/registration.js';
+import { canonicalizeInteger } from '../../src/util/numeric-canonical.js';
 import { TIMESPAN_TYPE } from '../../src/types/index.js';
 
 /** Integers + NULL — the exact domain for count/avg (avg sums as floats, so
@@ -18,13 +19,28 @@ const intOrNull: fc.Arbitrary<SqlValue> = fc.oneof(
 	fc.integer({ min: -1_000, max: 1_000 }).map((v): SqlValue => v),
 );
 
-/** Integers, overflow-scale bigints, and NULL — exercises sum's
- *  number→bigint promotion in merge/negate/decode (5n ≡ 5 under the
- *  storage-class-tolerant comparison). */
-const sumDomain: fc.Arbitrary<SqlValue> = fc.oneof(
+/** Integers, overflow-scale bigints, and NULL — sum's EXACT-INTEGER domain, and the
+ *  only domain its `decode` is observational over (a stored total cannot say how it
+ *  split between sum's exact and floating-point parts). Exercises the number→bigint
+ *  promotion in merge/negate/decode (5n ≡ 5 under the storage-class-tolerant
+ *  comparison). */
+const sumExactDomain: fc.Arbitrary<SqlValue> = fc.oneof(
 	fc.constant(null as SqlValue),
 	fc.integer({ min: -1_000_000, max: 1_000_000 }).map((v): SqlValue => v),
 	fc.bigInt({ min: -(2n ** 70n), max: 2n ** 70n }).map((v): SqlValue => v),
+);
+
+/** The exact-integer domain PLUS fractions — the mixed domain sum's merge/step laws
+ *  must hold over, and the guard that catches an order-dependent fold. A single-slot
+ *  accumulator that decides per addition whether the running total is exact or float
+ *  fails merge-associativity here within a few hundred runs.
+ *
+ *  Fractions are dyadic (multiples of 0.25, bounded magnitude) so that float addition
+ *  over them is itself exact — otherwise the laws would be testing IEEE-754 rounding
+ *  order, which no accumulator shape can make associative, instead of sum's routing. */
+const sumDomain: fc.Arbitrary<SqlValue> = fc.oneof(
+	sumExactDomain,
+	fc.integer({ min: -4_000, max: 4_000 }).map((v): SqlValue => v / 4),
 );
 
 /** Mixed comparable values + NULL for min/max (cross-type BINARY ordering:
@@ -47,8 +63,13 @@ describe('Aggregate algebra declarations', () => {
 			assertAggregateAlgebraLaws(countXFunc, intOrNull);
 		});
 
-		it('sum(x) satisfies the algebra laws over the integer domain', () => {
-			assertAggregateAlgebraLaws(sumFunc, sumDomain);
+		it('sum(x) satisfies the algebra laws over mixed integer/fractional values', () => {
+			// Merge/step laws over the MIXED domain (fractions included) — this is what
+			// catches an order-dependent fold. Decode laws over the exact-integer domain
+			// only, matching the write-side gate that is the sole caller of decode.
+			// 1000 runs, not the default 100: the order-dependence this domain exists to
+			// catch needs a few hundred runs to surface (see the mirror-`+` twin below).
+			assertAggregateAlgebraLaws(sumFunc, sumDomain, { decodeValueArb: sumExactDomain, numRuns: 1000 });
 		});
 
 		it('min(x) satisfies the algebra laws over mixed comparable values', () => {
@@ -135,6 +156,24 @@ describe('Aggregate algebra declarations', () => {
 			expect(sumFunc.finalizeFunction(algebra.merge(decoded, retractOne)), 'stored 12 minus one 5-contribution').to.equal(7);
 		});
 
+		it("sum's routing rule splits on Number.isSafeInteger, not Number.isInteger", () => {
+			const step = (v: SqlValue): AggValue => sumFunc.stepFunction(null, v);
+			// bigint and safe-integer number → exact part; the approx part stays empty.
+			// (A safe-range bigint narrows to number on the way in — R1, unrelated to routing.)
+			expect(step(9007199254740993n), 'bigint').to.deep.equal({ exact: 9007199254740993n, approx: 0, count: 1 });
+			expect(step(5n), 'safe-range bigint narrows').to.deep.equal({ exact: 5, approx: 0, count: 1 });
+			expect(step(5), 'safe integer').to.deep.equal({ exact: 5, approx: 0, count: 1 });
+			// A fraction and a WHOLE number past the safe boundary both go to approx —
+			// routing 1e308 to the exact part is what produced a 309-digit integer total.
+			expect(step(0.5), 'fraction').to.deep.equal({ exact: 0, approx: 0.5, count: 1 });
+			expect(step(1e308), 'whole but not safe').to.deep.equal({ exact: 0, approx: 1e308, count: 1 });
+			// decode applies the same rule to the single stored value.
+			expect(sumFunc.algebra!.decode!(7), 'decode integer')
+				.to.deep.equal({ exact: 7, approx: 0, count: Number.POSITIVE_INFINITY });
+			expect(sumFunc.algebra!.decode!(0.5), 'decode fraction')
+				.to.deep.equal({ exact: 0, approx: 0.5, count: Number.POSITIVE_INFINITY });
+		});
+
 		it('non-incremental builtins declare no algebra', () => {
 			for (const f of [totalFunc, groupConcatFuncRev, varPopFunc, varSampFunc, stdDevPopFunc, stdDevSampFunc]) {
 				expect(f.algebra, `${f.name}.algebra`).to.equal(undefined);
@@ -158,9 +197,9 @@ describe('Aggregate algebra declarations', () => {
 			if (!sumAlgebra) throw new Error('sum must declare algebra');
 			const broken: AggregateFunctionSchema = {
 				...sumFunc,
-				algebra: { ...sumAlgebra, decode: (_stored: SqlValue): AggValue => ({ sum: 1, count: 1 }) },
+				algebra: { ...sumAlgebra, decode: (_stored: SqlValue): AggValue => ({ exact: 1, approx: 0, count: 1 }) },
 			};
-			expect(() => assertAggregateAlgebraLaws(broken, sumDomain)).to.throw(/decode-observational/);
+			expect(() => assertAggregateAlgebraLaws(broken, sumExactDomain)).to.throw(/decode-observational/);
 		});
 
 		it('falsely declaring decodeExact on sum fails the decode-exact-retraction law', () => {
@@ -173,7 +212,52 @@ describe('Aggregate algebra declarations', () => {
 				...sumFunc,
 				algebra: { ...sumAlgebra, decodeExact: true },
 			};
-			expect(() => assertAggregateAlgebraLaws(broken, sumDomain)).to.throw(/decode-exact-retraction/);
+			// Exact-integer domain: law 4 (observational) passes there, so the failure the
+			// assertion sees is 4b's and not an artifact of the mixed domain.
+			expect(() => assertAggregateAlgebraLaws(broken, sumExactDomain)).to.throw(/decode-exact-retraction/);
+		});
+
+		it('the single-slot "mirror binary +" alternative fails merge-associativity on the mixed domain', () => {
+			// This is the design that was considered and rejected for sum: keep ONE
+			// accumulator slot and copy binary `+`'s mixed-operand rule (demote the exact
+			// side to float when the other side is fractional). It fixes the dropped values
+			// — but whether the running total is exact or float still depends on the order
+			// rows arrived, so re-associating the same rows gives different totals. This
+			// test is the reason sumDomain includes fractions: over integers alone the
+			// mirror variant passes every law.
+			const mirrorAdd = (a: number | bigint, b: number | bigint): number | bigint => {
+				if (typeof a === 'bigint' || typeof b === 'bigint') {
+					const other = typeof a === 'bigint' ? b : a;
+					if (typeof other === 'bigint' || Number.isInteger(other)) {
+						return canonicalizeInteger(BigInt(a) + BigInt(b));
+					}
+					return Number(a) + Number(b); // fractional other side ⇒ float domain
+				}
+				const s = a + b;
+				if (Number.isSafeInteger(a) && Number.isSafeInteger(b)
+					&& (s > Number.MAX_SAFE_INTEGER || s < Number.MIN_SAFE_INTEGER)) {
+					return BigInt(a) + BigInt(b);
+				}
+				return s;
+			};
+			type MirrorAcc = { sum: number | bigint; count: number } | null;
+			const mirrorSum: AggregateFunctionSchema = {
+				...sumFunc,
+				stepFunction: (acc: MirrorAcc, value: SqlValue): MirrorAcc =>
+					value === null ? acc : { sum: mirrorAdd(acc?.sum ?? 0, value as number | bigint), count: (acc?.count ?? 0) + 1 },
+				finalizeFunction: (acc: MirrorAcc): SqlValue =>
+					acc === null || acc.count === 0 ? null : acc.sum,
+				algebra: {
+					merge: (a: MirrorAcc, b: MirrorAcc): MirrorAcc => {
+						if (a === null) return b;
+						if (b === null) return a;
+						return { sum: mirrorAdd(a.sum, b.sum), count: a.count + b.count };
+					},
+					negate: (a: MirrorAcc): MirrorAcc => a === null ? null : { sum: -a.sum, count: -a.count },
+				},
+			};
+			expect(() => assertAggregateAlgebraLaws(mirrorSum, sumDomain, { numRuns: 3000 }))
+				.to.throw(/merge-associative/);
 		});
 	});
 });

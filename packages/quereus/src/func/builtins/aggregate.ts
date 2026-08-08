@@ -10,9 +10,13 @@ import { INTEGER_RETURN_NOT_NULL, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN
 const log = createLogger('func:builtins:aggregate');
 const warnLog = log.extend('warn');
 
-/** Add two accumulated numeric values, promoting to BigInt when either side is
- *  BigInt or the numeric sum would leave the safe-integer range — the same
- *  promotion the SUM step applies per value. */
+/** Add two INTEGER-DOMAIN values exactly, promoting to BigInt when either side is
+ *  BigInt or the numeric sum would leave the safe-integer range.
+ *
+ *  PRECONDITION: each operand is `isExactIntegerDomain` — a `bigint`, or a `number`
+ *  satisfying `Number.isSafeInteger`. Callers route every other numeric value
+ *  (fractions, whole numbers past the safe boundary, ±Infinity, NaN) to a separate
+ *  floating-point accumulator, so the `BigInt()` conversions here cannot throw. */
 function addWithPromotion(a: number | bigint, b: number | bigint): number | bigint {
 	if (typeof a === 'bigint' || typeof b === 'bigint') {
 		// Narrow a sum that retracts back inside the safe range (R1) — shared by the
@@ -22,12 +26,25 @@ function addWithPromotion(a: number | bigint, b: number | bigint): number | bigi
 	}
 	const sum = a + b;
 	if (sum > Number.MAX_SAFE_INTEGER || sum < Number.MIN_SAFE_INTEGER) {
-		// No narrowing needed: two safe integers whose float sum left the safe range
-		// have an exact sum outside it (an in-range exact sum is float-representable,
-		// so the float sum would have been exact and in range).
+		// No narrowing needed, and this is sound only BECAUSE of the precondition: two
+		// SAFE integers whose float sum left the safe range have an exact sum outside it
+		// (an in-range exact sum is float-representable, so the float sum would have been
+		// exact and in range). Without the precondition the premise is false — `1e308`
+		// is a whole `number` outside the safe range — which is why the routing rule,
+		// not this branch, decides what is exact.
 		return BigInt(a) + BigInt(b);
 	}
 	return sum;
+}
+
+/** SUM's routing rule: does this contribution belong to the exact-integer part?
+ *
+ *  Deliberately `Number.isSafeInteger`, NOT `Number.isInteger`: `1e308` is a whole
+ *  `number` that is not exact in the integer sense (R1 permits it as a `number`), and
+ *  routing it to the exact part is what turns a REAL fold's total into an
+ *  arbitrary-precision integer — a `bigint` in a REAL-typed result, violating R2. */
+function isExactIntegerDomain(v: number | bigint): boolean {
+	return typeof v === 'bigint' || Number.isSafeInteger(v);
 }
 
 // --- count(*) ---
@@ -48,12 +65,35 @@ export const countStarFunc = createAggregateFunction(
 );
 
 // --- SUM(X) ---
-// The accumulator tracks the count of counted (non-NULL numeric) contributions
-// alongside the running sum so retraction stays observational: merge(a, negate(a))
-// must finalize to NULL (the empty-group value), which a bare running sum cannot
-// distinguish from contributions that cancel to 0. External behavior is unchanged —
-// a fold that counted nothing still finalizes to NULL, everything else to the sum.
-type SumAccumulator = { sum: number | bigint; count: number } | null;
+// The accumulator SPLITS the two number domains and never mixes them until finalize.
+// One slot cannot decide per addition whether the running total is an exact integer
+// or a float: promoting both sides because one is a bigint throws on a fractional
+// side, and reinterpreting an overflowing FLOAT sum as an exact integer computation
+// is only valid when both operands were safe integers. Either way the answer depends
+// on the order rows happened to arrive, which breaks merge-associativity and so
+// materialized-view maintenance.
+//
+// The count of counted (non-NULL numeric) contributions rides alongside so retraction
+// stays observational: merge(a, negate(a)) must finalize to NULL (the empty-group
+// value), which a bare running sum cannot distinguish from contributions cancelling
+// to 0. A fold that counted nothing still finalizes to NULL.
+type SumAccumulator = {
+	/** Exact integer part: every `bigint` and every safe-integer `number` contribution. */
+	exact: number | bigint;
+	/** Floating-point part: everything else — fractions, whole numbers outside the
+	 *  safe-integer range, ±Infinity, NaN. */
+	approx: number;
+	count: number;
+} | null;
+
+/** Fold one numeric contribution into the accumulator, routing it by `isExactIntegerDomain`. */
+function addSumContribution(acc: SumAccumulator, value: number | bigint): SumAccumulator {
+	const base = acc ?? { exact: 0, approx: 0, count: 0 };
+	return isExactIntegerDomain(value)
+		? { exact: addWithPromotion(base.exact, value), approx: base.approx, count: base.count + 1 }
+		: { exact: base.exact, approx: base.approx + (value as number), count: base.count + 1 };
+}
+
 export const sumFunc = createAggregateFunction(
 	{
 		name: 'sum', numArgs: 1, initialValue: null,
@@ -65,9 +105,16 @@ export const sumFunc = createAggregateFunction(
 			merge: (a: SumAccumulator, b: SumAccumulator): SumAccumulator => {
 				if (a === null) return b;
 				if (b === null) return a;
-				return { sum: addWithPromotion(a.sum, b.sum), count: a.count + b.count };
+				// Each part combines within its own domain — the exact parts exactly, the
+				// approx parts in float. Mixing them here is what made the fold order-dependent.
+				return {
+					exact: addWithPromotion(a.exact, b.exact),
+					approx: a.approx + b.approx,
+					count: a.count + b.count,
+				};
 			},
-			negate: (a: SumAccumulator): SumAccumulator => a === null ? null : { sum: -a.sum, count: -a.count },
+			negate: (a: SumAccumulator): SumAccumulator =>
+				a === null ? null : { exact: -a.exact, approx: -a.approx, count: -a.count },
 			// Stored NULL (empty group) decodes to the empty accumulator, never a
 			// wrapped NULL. A stored value decodes with an ABSORBING count witness
 			// (Infinity): the stored sum cannot recover the true non-NULL contribution
@@ -81,41 +128,53 @@ export const sumFunc = createAggregateFunction(
 			// NOTE: type-trusts its input — a non-numeric stored value poisons the
 			// accumulator. Sound while the only caller is the delta arm reading back a
 			// value this same aggregate wrote.
-			decode: (stored: SqlValue): SumAccumulator =>
-				stored === null ? null : { sum: stored as number | bigint, count: Number.POSITIVE_INFINITY },
+			// NOTE: OBSERVATIONAL DOMAIN IS THE EXACT-INTEGER PART ONLY. The backing table
+			// stores one finalized value per group, which cannot carry the exact/approx
+			// split apart — a fold that saw both parts cannot be reconstructed from it, and
+			// no single-slot representation could. The write side already guards this: the
+			// delta-aggregate arm only delta-maintains `sum` over an INTEGER-physical
+			// argument column ("exact numeric domain" gate,
+			// core/database-materialized-views-plan-builders.ts), where the approx part is
+			// always empty and this decode IS observational. Do not relax that gate without
+			// giving the backing store somewhere to keep both parts.
+			decode: (stored: SqlValue): SumAccumulator => {
+				if (stored === null) return null;
+				const value = stored as number | bigint;
+				return isExactIntegerDomain(value)
+					? { exact: value, approx: 0, count: Number.POSITIVE_INFINITY }
+					: { exact: 0, approx: value as number, count: Number.POSITIVE_INFINITY };
+			},
 		},
 	},
 	(acc: SumAccumulator, value: SqlValue): SumAccumulator => {
 		if (value === null) return acc; // Ignore NULLs
-		const currentSum = acc?.sum ?? 0; // Initialize sum to 0 if null
-		let numValue: number | bigint;
 
-		try {
-			if (typeof value === 'bigint') {
-				numValue = value;
-			} else if (typeof value === 'number') {
-				numValue = value;
-			} else if (typeof value === 'string') {
-				const parsed = Number(value);
-				if (isNaN(parsed)) return acc;
-				numValue = parsed;
-			} else if (typeof value === 'boolean') {
-				numValue = value ? 1 : 0;
-			} else {
-				return acc; // Ignore non-numeric types like Uint8Array
-			}
-
-			return { sum: addWithPromotion(currentSum, numValue), count: (acc?.count ?? 0) + 1 };
-		} catch (e) {
-			warnLog("Error during SUM step coercion: %O", e);
-			return acc; // Ignore value if coercion fails
+		if (typeof value === 'bigint' || typeof value === 'number') {
+			return addSumContribution(acc, value);
 		}
+		if (typeof value === 'boolean') {
+			return addSumContribution(acc, value ? 1 : 0);
+		}
+		if (typeof value === 'string') {
+			const parsed = Number(value);
+			// Documented skip, not a failure: text that names no number contributes nothing.
+			// (How text becomes a number at all is the coercion layer's rule, not sum's.)
+			if (isNaN(parsed)) return acc;
+			return addSumContribution(acc, parsed);
+		}
+		// Documented skip, not a failure: a non-numeric storage class (Uint8Array, JSON
+		// object) contributes nothing. Every remaining branch routes into the split
+		// accumulator, whose adder cannot throw, so there is nothing left to catch.
+		return acc;
 	},
 	(acc: SumAccumulator): number | bigint | null => {
 		// SQLite returns NULL for SUM of empty set, INTEGER or REAL result.
 		// count === 0 (all contributions retracted) is observationally the empty group.
 		if (acc === null || acc.count === 0) return null;
-		return acc.sum;
+		// An all-integer fold finalizes to its exact part untouched (still R1-canonical);
+		// only a fold that saw a non-exact contribution combines, and it lands in float.
+		if (acc.approx === 0) return acc.exact;
+		return Number(acc.exact) + acc.approx;
 	}
 );
 

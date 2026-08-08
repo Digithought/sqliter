@@ -113,6 +113,24 @@ on read paths:
 - **Arithmetic and aggregation results**: the bigint arms of binary/unary arithmetic and
   `sum()` narrow a result that lands back inside the safe range.
 
+  `sum()` additionally **splits the two number domains** rather than deciding per
+  addition which one the running total is in. A contribution joins the *exact* part iff
+  it is a `bigint` or satisfies `Number.isSafeInteger`; every other numeric contribution
+  — fractions, whole `number`s outside the safe range (`1e308`), `±Infinity`, `NaN` —
+  joins a separate floating-point part. The two combine only at finalize, so a fold that
+  saw any non-exact contribution finalizes to a `number` and a fold that saw none
+  finalizes to the exact (R1-canonical) integer. The split is what makes the answer
+  independent of the order rows were scanned in, which `merge`-associativity — and
+  therefore materialized-view maintenance — depends on. The predicate is
+  `Number.isSafeInteger` and not `Number.isInteger` precisely because a whole `number`
+  past the safe boundary is not exact in the integer sense; treating it as exact would
+  put a `bigint` in a REAL-typed result, violating R2.
+
+  `sum()`'s `algebra.decode` is therefore observational only over the exact-integer part:
+  one stored value per group cannot carry the split apart. The write side already gates on
+  this — the delta-aggregate arm delta-maintains `sum` only over an INTEGER-physical
+  argument column, where the floating-point part is always empty.
+
 Rows returned from a virtual-table `query()` and values returned from user-defined
 functions are held to R1 by contract rather than by per-row coercion — every consumer
 already tolerates both forms, so coercing there would cost where there is nothing to win.

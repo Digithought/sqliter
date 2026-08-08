@@ -35,6 +35,19 @@ export interface AggregateAlgebraLawOptions {
 	resolvePartial?: (func: string, arg: 'same-arg' | 'star') => AggregateFunctionSchema | undefined;
 	/** fast-check run count per law (default 100). */
 	numRuns?: number;
+	/**
+	 * Narrower domain for the DECODE laws (4 and 4b) only; laws 1–3 and 5 keep using
+	 * `valueArb`. Defaults to `valueArb`.
+	 *
+	 * `decode` reconstructs an accumulator from ONE finalized value per group, so an
+	 * aggregate whose accumulator carries more state than its finalized value can
+	 * express is observational only over the sub-domain where the extra state is
+	 * always empty. `sum` is the live example: it accumulates an exact-integer part
+	 * and a floating-point part separately, and a stored total cannot say how it
+	 * split — so its decode domain is the integer part alone, which is exactly the
+	 * domain the write side's delta arm gates on.
+	 */
+	decodeValueArb?: fc.Arbitrary<SqlValue>;
 }
 
 const BUILTIN_PARTIALS: ReadonlyArray<AggregateFunctionSchema> =
@@ -80,6 +93,7 @@ export function assertAggregateAlgebraLaws(
 	}
 	const numRuns = options.numRuns ?? 100;
 	const valuesArb = fc.array(valueArb, { maxLength: 12 });
+	const decodeValuesArb = fc.array(options.decodeValueArb ?? valueArb, { maxLength: 12 });
 	const identity = (): AggValue => cloneInitialValue(schema.initialValue);
 
 	const check = (law: string, run: () => void): void => {
@@ -138,9 +152,11 @@ export function assertAggregateAlgebraLaws(
 	// Law 4: decode is observational — a stored (finalized) value reconstructs an
 	// accumulator that behaves identically under further merges. xs = [] pins that
 	// decode of a stored NULL (empty group) yields a merge-neutral accumulator.
+	// Runs over `decodeValueArb` (defaults to `valueArb`) — see the option's doc for
+	// why an aggregate may be observational only over a sub-domain.
 	const decode = algebra.decode;
 	if (decode) {
-		check('decode-observational', () => fc.assert(fc.property(valuesArb, valuesArb, (xs, ys) => {
+		check('decode-observational', () => fc.assert(fc.property(decodeValuesArb, decodeValuesArb, (xs, ys) => {
 			const viaStore = algebra.merge(decode(schema.finalizeFunction(fold(schema, xs))), fold(schema, ys));
 			const direct = algebra.merge(fold(schema, xs), fold(schema, ys));
 			return accEquivalent(schema, viaStore, direct);
@@ -153,7 +169,7 @@ export function assertAggregateAlgebraLaws(
 	// contribution count) fails this for a partial retraction, which is exactly why it
 	// must not declare `decodeExact`.
 	if (decode && algebra.decodeExact && negate) {
-		check('decode-exact-retraction', () => fc.assert(fc.property(valuesArb, valuesArb, (xs, ys) => {
+		check('decode-exact-retraction', () => fc.assert(fc.property(decodeValuesArb, decodeValuesArb, (xs, ys) => {
 			const viaStore = algebra.merge(decode(schema.finalizeFunction(fold(schema, xs))), negate(fold(schema, ys)));
 			const direct = algebra.merge(fold(schema, xs), negate(fold(schema, ys)));
 			return accEquivalent(schema, viaStore, direct);
