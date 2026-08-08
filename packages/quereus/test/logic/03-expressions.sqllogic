@@ -18,6 +18,24 @@ SELECT NOT NOT 1;
 SELECT ~-1;
 → [{"~-1":0}]
 
+-- Unary operators over numeric-typed operands take a specialized emit-time path
+-- (see runtime/emit/unary.ts); these pin its results against the generic path.
+-- REAL operand: ~ truncates toward zero before complementing.
+SELECT ~5.7 AS a, ~(-5.7) AS b, -5.5 AS c, +5.5 AS d;
+→ [{"a":-6,"b":4,"c":-5.5,"d":5.5}]
+-- BIGINT operand: stays in the bigint domain, no float round-trip.
+SELECT -9223372036854775807 AS a, +9223372036854775807 AS b, ~9223372036854775807 AS c;
+→ [{"a":-9223372036854775807,"b":9223372036854775807,"c":-9223372036854775808}]
+-- NULL propagates through every unary arithmetic operator.
+SELECT -null AS a, +null AS b, ~null AS c;
+→ [{"a":null,"b":null,"c":null}]
+-- Column-sourced operands (INTEGER key, NUMERIC column) take the same path.
+SELECT -i AS a, +i AS b, ~i AS c, -n AS d, +n AS e FROM expr_t WHERE i = 2;
+→ [{"a":-2,"b":2,"c":-3,"d":5,"e":-5}]
+-- TEXT operand keeps the generic coerce-or-null path.
+SELECT -t AS a, +t AS b, ~t AS c FROM expr_t WHERE i = 1;
+→ [{"a":null,"b":null,"c":null}]
+
 -- String Concatenation
 SELECT t || ' ' || t FROM expr_t WHERE i = 1;
 → [{"t || ' ' || t":"hello hello"}]

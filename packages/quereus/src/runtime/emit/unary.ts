@@ -18,6 +18,9 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 	// Normalize operator to uppercase for case-insensitive matching
 	const operator = plan.expression.operator.toUpperCase();
 
+	// Plan-time operand type — drives the specialized arithmetic paths below.
+	const operandLogical = plan.operand.getType().logicalType;
+
 	switch (operator) {
 		case 'NOT':
 			run = (_ctx: RuntimeContext, operand: SqlValue) => {
@@ -77,7 +80,6 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 		case '-': {
 			// Use plan-time type info to select a specialized run function, mirroring
 			// the binary arithmetic emitter's numeric-fast / temporal split.
-			const operandLogical = plan.operand.getType().logicalType;
 			if (operandLogical.isNumeric) {
 				run = (_ctx: RuntimeContext, operand: SqlValue) => {
 					if (operand === null) return null;
@@ -117,7 +119,6 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 		}
 
 		case '+': {
-			const operandLogical = plan.operand.getType().logicalType;
 			if (operandLogical.isNumeric) {
 				// Already number/bigint — unary plus is the identity.
 				run = (_ctx: RuntimeContext, operand: SqlValue) => operand;
@@ -136,9 +137,12 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 		}
 
 		case '~': {
-			const operandLogical = plan.operand.getType().logicalType;
 			if (operandLogical.isNumeric) {
 				// Already number/bigint — skip the Number() conversion attempt.
+				// NOTE: a NaN operand yields -1 here where the generic path below yields
+				// null. No numeric-typed expression can produce NaN today (arithmetic
+				// nulls out non-finite results, and REAL_TYPE.parse rejects 'NaN'); if a
+				// path ever admits NaN into a numeric-typed value, restore an isNaN check.
 				run = (_ctx: RuntimeContext, operand: SqlValue) => {
 					if (operand === null) return null;
 					return typeof operand === 'bigint' ? ~operand : ~Math.trunc(operand as number);

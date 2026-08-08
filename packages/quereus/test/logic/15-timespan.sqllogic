@@ -177,6 +177,19 @@ SELECT * FROM events WHERE duration > timespan('PT1H') ORDER BY id;
 SELECT * FROM events WHERE duration <= timespan('PT1H') ORDER BY id;
 → [{"id":1,"name":"Meeting","duration":"PT1H"},{"id":2,"name":"Lunch","duration":"PT30M"}]
 
+-- Negation of a TIMESPAN *column* takes the emit-time timespan path in
+-- runtime/emit/unary.ts, which assumes the stored value is a normalized ISO 8601
+-- duration. Row 5 is inserted as a bare human-readable string, so this also pins
+-- that the write path normalizes before storage (the path throws on unparseable
+-- input rather than falling back).
+INSERT INTO events VALUES (4, 'Standup', '90 minutes');
+SELECT id, -duration AS neg FROM events ORDER BY id;
+→ [{"id":1,"neg":"-PT1H"},{"id":2,"neg":"-PT30M"},{"id":3,"neg":"-P2D"},{"id":4,"neg":"-PT90M"}]
+
+-- NULL TIMESPAN negates to NULL on the same path.
+SELECT -timespan(NULL) AS neg;
+→ [{"neg":null}]
+
 DROP TABLE events;
 
 -- Test TIMESPAN extraction functions

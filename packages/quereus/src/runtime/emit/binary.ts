@@ -422,6 +422,10 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 	if ((operator === 'AND' || operator === 'OR') && hasRelationalDescendant(plan.right)) {
 		const rightCall = emitCallFromPlan(plan.right, ctx);
 
+		// The left-operand value that decides the result on its own, resolved once at
+		// emit time: `false AND x` → false, `true OR x` → true. Also the result itself.
+		const decidingValue = operator === 'AND' ? false : true;
+
 		function runShortCircuit(
 			ctx: RuntimeContext,
 			v1: SqlValue,
@@ -430,8 +434,7 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 			// Left decides — the right operand is never fetched (`false AND x` → false;
 			// `true OR x` → true). Same SQL truthiness as the eager path.
 			const b1 = v1 === null ? null : isTruthy(v1);
-			if (operator === 'AND' && b1 === false) return false;
-			if (operator === 'OR' && b1 === true) return true;
+			if (b1 === decidingValue) return decidingValue;
 
 			// Otherwise fetch the deferred right and combine with the shared 3VL
 			// (combineLogical) — byte-identical to the eager path. Stay synchronous
