@@ -470,13 +470,40 @@ a subquery right leg declines), and `CASE` (all-or-nothing over base/WHEN/THEN/E
 keeping lazy branch selection via the shared `buildCaseMatcher`). Every fused body is
 the node's own `ScalarOpSpec` body — the same function the instruction emitter runs —
 so semantics, error messages, and evaluation counts are identical by construction.
-Scalar **function calls are not yet fused** (their sync/async split is pending), so
-any subtree containing one declines; subqueries, window/aggregate/relational nodes
-decline as unknown node types. A subtree deeper than `MAX_FUSION_DEPTH` (32) declines
+Subqueries and window/aggregate/relational nodes decline as unknown node types. A
+subtree deeper than `MAX_FUSION_DEPTH` (32) declines
 whole — fused closures nest on the JS call stack where the scheduler's linearized
 loop did not — but the fallback emission still reaches nested `emitCallFromPlan` sites
 (CASE branches, an AND/OR short-circuit right leg), each of which retries fusion from
 depth 0, so a deep tree fuses in pieces below those seams.
+
+#### What makes a scalar function call fusable
+
+A fused node's contract is a plain `SqlValue`, while a `ScalarFunc` is typed
+`(...args) => MaybePromise<SqlValue>`. Admitting `MaybePromise` into the fused contract
+would put a Promise check and a `.then` path on *every* node in the chain — the
+sub-program overhead fusion exists to delete — so a call fuses only when it is provably
+synchronous, decided at emit time in this order:
+
+1. **A `customEmitter` never fuses.** It builds its own `Instruction`, possibly with
+   sub-programs or async behavior, and the compiler cannot see inside it. That is
+   `nullif`, `greatest`, `least`, `json_schema` and `mutation_ordinal` today.
+2. **`ScalarFunctionSchema.isAsync === true` never fuses** — the author's explicit
+   declaration that the implementation may return a Promise.
+3. **A declared `async function` / `async` arrow never fuses**, auto-detected via
+   `implementation instanceof AsyncFunction`, so an ordinary async UDF needs no flag.
+4. **Otherwise it fuses, with a guard.** A non-`async` function that returns a Promise
+   anyway (including a `.bind()` or wrapper around an async one) is invisible to step 3,
+   so the fused body checks and throws a `QuereusError` naming the function and telling
+   the author to declare `isAsync: true`. One `instanceof` per call, and it converts a
+   silent wrong answer — a Promise flowing on as if it were a value — into a loud error.
+
+The fused body is `buildScalarFunctionRun` (`emit/scalar-function.ts`), the same body
+`emitScalarFunctionCallDefault` gives the scheduler, so the arity assert, the
+`Function <name> failed: …` wrapping with source location, and the `REPR_STRICT` return
+check are shared rather than restated. Variadic functions (`numArgs === -1`, e.g.
+`coalesce`) need no special case: composition switches on the call site's operand count.
+A call's arguments count toward `MAX_FUSION_DEPTH` like any other operand.
 
 Fusion is off when `trace_plan_stack = true` (fused frames would silently vanish from
 `ctx.planStack`) or when the `runtime_fuse_scalars` db option (default `true`) is set

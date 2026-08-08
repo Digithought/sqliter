@@ -22,6 +22,12 @@ interface ScalarFuncOptions {
 	/** Whether the function is REPLICABLE — bit-identical across peers/platforms/app
 	 *  versions (stronger than deterministic). See {@link import('../schema/function.js').BaseFunctionSchema.replicable}. */
 	replicable?: boolean;
+	/** The implementation may return a Promise. Omitting it declares the function
+	 *  synchronous, which lets the engine fuse its calls into a direct closure. Only
+	 *  needed for a promise-returning function that is not declared `async` (an `async`
+	 *  function or arrow is detected automatically). See
+	 *  {@link import('../schema/function.js').ScalarFunctionSchema.isAsync}. */
+	isAsync?: boolean;
 	/** Return type information */
 	returnType?: ScalarType;
 	/**
@@ -376,6 +382,7 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 		returnType: options.returnType ?? UNKNOWN_SCALAR_RETURN,
 		implementation: jsFunc,
 		replicable: options.replicable,
+		isAsync: options.isAsync,
 		inferReturnType: options.inferReturnType,
 		validateArgTypes: options.validateArgTypes,
 		injectiveOnArgs: options.injectiveOnArgs,

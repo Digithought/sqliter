@@ -1,5 +1,6 @@
-import type { SqlValue } from '../common/types.js';
-import type { PlanNode } from '../planner/nodes/plan-node.js';
+import { StatusCode, type SqlValue } from '../common/types.js';
+import { QuereusError } from '../common/errors.js';
+import type { PlanNode, ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import type {
 	BetweenNode,
@@ -10,10 +11,13 @@ import type {
 	LiteralNode,
 	UnaryOpNode,
 } from '../planner/nodes/scalar.js';
+import type { ScalarFunctionCallNode } from '../planner/nodes/function.js';
 import type { ColumnReferenceNode, ParameterReferenceNode } from '../planner/nodes/reference.js';
+import { isScalarFunctionSchema } from '../schema/function.js';
 import type { RuntimeContext } from './types.js';
 import type { EmissionContext } from './emission-context.js';
-import { assertSpecArity, type ScalarOpSpec } from './emit/scalar-op.js';
+import { assertSpecArity, type ScalarOpRun, type ScalarOpSpec } from './emit/scalar-op.js';
+import { buildScalarFunctionRun } from './emit/scalar-function.js';
 import { buildLiteralSpec } from './emit/literal.js';
 import { buildColumnReferenceSpec } from './emit/column-reference.js';
 import { buildParameterSpec } from './emit/parameter.js';
@@ -60,13 +64,12 @@ export const MAX_FUSION_DEPTH = 32;
  * messages, or evaluation counts. This compiler only changes HOW operand values reach
  * those bodies: direct nested calls instead of scheduler slots.
  *
- * Scalar function calls are deliberately not fused yet (their sync/async split is the
- * follow-up ticket `runtime-scalar-fusion-function-calls`), so any subtree containing
- * one declines. The AND/OR short-circuit form declines through `buildBinaryOpSpec`
- * returning undefined, and subquery/window/aggregate/relational nodes decline as
- * unknown node types — which also keeps every `emitCallFromPlan` call site that passes
- * a relational plan (cache sources, join legs, view-mutation programs) on the
- * sub-program path for free.
+ * A scalar function call fuses only when it is provably synchronous — see
+ * {@link fuseScalarFunctionCall}. The AND/OR short-circuit form declines through
+ * `buildBinaryOpSpec` returning undefined, and subquery/window/aggregate/relational
+ * nodes decline as unknown node types — which also keeps every `emitCallFromPlan` call
+ * site that passes a relational plan (cache sources, join legs, view-mutation programs)
+ * on the sub-program path for free.
  */
 export function tryFuseScalar(plan: PlanNode, ctx: EmissionContext): FusedScalar | undefined {
 	return fuseNode(plan, ctx, 0);
@@ -112,48 +115,133 @@ function fuseNode(plan: PlanNode, ctx: EmissionContext, depth: number): FusedSca
 		}
 		case PlanNodeType.CaseExpr:
 			return fuseCase(plan as CaseExprNode, ctx, depth);
+		case PlanNodeType.ScalarFunctionCall:
+			return fuseScalarFunctionCall(plan as ScalarFunctionCallNode, ctx, depth);
 		default:
 			return undefined;
 	}
 }
 
 /**
- * Compose a spec's synchronous body with its fused operands, specialized by arity so
- * the common cases allocate nothing per row and stay monomorphic. Closure composition
- * only — no `new Function`/`eval`, which are unavailable under a Content-Security-Policy
- * and under React Native.
+ * The `AsyncFunction` constructor, which has no global binding — reachable only off an
+ * instance. An `async function` / `async` arrow carries `AsyncFunction.prototype` on its
+ * prototype chain, so `impl instanceof AsyncFunction` recognizes one.
  */
+const AsyncFunction = (async () => { /* probe only */ }).constructor;
+
+/**
+ * Fuse a scalar function call, but only when its implementation is provably
+ * synchronous. A fused node's contract is a plain `SqlValue`, while a `ScalarFunc` is
+ * typed `(...args) => MaybePromise<SqlValue>`; admitting `MaybePromise` into the fused
+ * contract would put a Promise check and a `.then` path on every node in the chain,
+ * which is the sub-program overhead this compiler exists to delete. So the decision is
+ * made once here, at emit time, in this order:
+ *
+ * 1. **A `customEmitter` never fuses.** It builds its own `Instruction` — possibly with
+ *    sub-programs or async behavior — and this compiler cannot see inside it. Today that
+ *    excludes `nullif`, `greatest`, `least`, `json_schema` and `mutation_ordinal`;
+ *    giving custom emitters a fusion hook is parked in
+ *    `tickets/backlog/feat-fuse-custom-emitter-scalar-functions.md`.
+ * 2. **`isAsync === true` never fuses** — the author's explicit declaration.
+ * 3. **A declared `async` implementation never fuses**, auto-detected, so the ordinary
+ *    async UDF needs no flag.
+ * 4. **Otherwise fuse, with a guard**: a non-`async` implementation that returns a
+ *    Promise anyway is invisible to step 3, so the fused body checks and throws a
+ *    `QuereusError` naming the function and the `isAsync` remedy. One `instanceof` per
+ *    call — negligible beside the sub-program it replaces — and it converts a silent
+ *    wrong answer (a Promise flowing on as if it were a value, comparing as garbage)
+ *    into a loud, actionable error.
+ *
+ * The body itself is {@link buildScalarFunctionRun}, the same one
+ * `emitScalarFunctionCallDefault` gives the scheduler, so a fused call and an
+ * instruction call cannot disagree on error text, arity checking or the `REPR_STRICT`
+ * return check. Operands compose by arity like every other fused node — including the
+ * variadic case (`numArgs === -1`, e.g. `coalesce`), which needs no special handling
+ * because the composition switches on `operands.length`, not on the declared arity.
+ */
+function fuseScalarFunctionCall(
+	plan: ScalarFunctionCallNode,
+	ctx: EmissionContext,
+	depth: number,
+): FusedScalar | undefined {
+	const schema = plan.functionSchema;
+	// Not a scalar schema at all: `emitScalarFunctionCall` reports that, and the unfused
+	// path it falls back to still does. Decline rather than duplicate the diagnosis.
+	if (!isScalarFunctionSchema(schema)) return undefined;
+	if (schema.customEmitter) return undefined;
+	if (schema.isAsync) return undefined;
+	if (schema.implementation instanceof AsyncFunction) return undefined;
+
+	const body = buildScalarFunctionRun(plan);
+	const functionName = plan.expression.name.toLowerCase();
+	const loc = plan.expression.loc?.start;
+
+	const guarded: ScalarOpRun = (rctx, ...args) => {
+		const result = body(rctx, ...args);
+		if (result instanceof Promise) {
+			throw new QuereusError(
+				`Function ${functionName} returned a Promise but is not declared asynchronous. `
+				+ `Declare isAsync: true on its registration so the engine keeps it off the fused expression path.`,
+				StatusCode.ERROR, undefined, loc?.line, loc?.column);
+		}
+		return result;
+	};
+
+	return composeFused(guarded, plan.operands, ctx, depth);
+}
+
+/** Check the spec's body arity, then compose it with its fused operands. */
 function fuseSpec(spec: ScalarOpSpec, ctx: EmissionContext, depth: number): FusedScalar | undefined {
 	assertSpecArity(spec);
-	const run = spec.run;
-	switch (spec.operands.length) {
+	return composeFused(spec.run, spec.operands, ctx, depth);
+}
+
+/**
+ * Compose a synchronous body with its fused operands, specialized by arity so the common
+ * cases allocate nothing per row and stay monomorphic. Closure composition only — no
+ * `new Function`/`eval`, which are unavailable under a Content-Security-Policy and under
+ * React Native.
+ *
+ * Shared by the {@link ScalarOpSpec} nodes and by {@link fuseScalarFunctionCall}, whose
+ * variadic body has no fixed parameter count to assert (hence the assert living in
+ * {@link fuseSpec}, not here). The switch is on how many operands are actually
+ * evaluated, so a variadic function's call site lands in whichever fixed arm matches
+ * its argument count.
+ */
+function composeFused(
+	run: ScalarOpRun,
+	operands: readonly ScalarPlanNode[],
+	ctx: EmissionContext,
+	depth: number,
+): FusedScalar | undefined {
+	switch (operands.length) {
 		case 0:
 			// The body already IS the fused closure — wrapping it would add a call frame
 			// per row to the two most common leaves in any query (column refs, literals).
 			return run;
 		case 1: {
-			const a = fuseNode(spec.operands[0], ctx, depth + 1);
+			const a = fuseNode(operands[0], ctx, depth + 1);
 			return a && ((rctx) => run(rctx, a(rctx)));
 		}
 		case 2: {
-			const a = fuseNode(spec.operands[0], ctx, depth + 1);
+			const a = fuseNode(operands[0], ctx, depth + 1);
 			if (!a) return undefined;
-			const b = fuseNode(spec.operands[1], ctx, depth + 1);
+			const b = fuseNode(operands[1], ctx, depth + 1);
 			return b && ((rctx) => run(rctx, a(rctx), b(rctx)));
 		}
 		case 3: {
-			const a = fuseNode(spec.operands[0], ctx, depth + 1);
+			const a = fuseNode(operands[0], ctx, depth + 1);
 			if (!a) return undefined;
-			const b = fuseNode(spec.operands[1], ctx, depth + 1);
+			const b = fuseNode(operands[1], ctx, depth + 1);
 			if (!b) return undefined;
-			const c = fuseNode(spec.operands[2], ctx, depth + 1);
+			const c = fuseNode(operands[2], ctx, depth + 1);
 			return c && ((rctx) => run(rctx, a(rctx), b(rctx), c(rctx)));
 		}
 		default: {
-			// No spec is wider than 3 operands today; an args array + spread is still far
-			// cheaper than a sub-program if one ever appears.
+			// No spec is wider than 3 operands; a wide variadic call (`coalesce(a,b,c,d)`)
+			// lands here. An args array + spread is still far cheaper than a sub-program.
 			const fused: FusedScalar[] = [];
-			for (const operand of spec.operands) {
+			for (const operand of operands) {
 				const f = fuseNode(operand, ctx, depth + 1);
 				if (!f) return undefined;
 				fused.push(f);

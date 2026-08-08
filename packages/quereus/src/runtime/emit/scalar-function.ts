@@ -3,7 +3,7 @@ import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitPlanNode, createValidatedInstruction } from '../emitters.js';
 import { QuereusError } from '../../common/errors.js';
-import { StatusCode, type MaybePromise, type SqlValue, type OutputValue } from '../../common/types.js';
+import { StatusCode, type MaybePromise, type SqlValue } from '../../common/types.js';
 import { REPR_STRICT } from '../strict-flags.js';
 import { assertConformsToType } from '../strict-representation.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -11,22 +11,38 @@ import type { ScalarFunctionSchema } from '../../schema/function.js';
 import { isScalarFunctionSchema } from '../../schema/function.js';
 
 /**
- * Default emission logic for scalar function calls.
- * This is exported so custom emitters can call it if needed.
+ * The per-call body of a scalar function call: its emit-time arity assert, its
+ * implementation-error wrapping (carrying the call's source location) and its
+ * `REPR_STRICT` return-type check, all resolved once here rather than per row.
  *
- * Assumes `plan.functionSchema` has already been validated as a scalar function
- * schema by the caller (the entry point {@link emitScalarFunctionCall} checks it
- * before dispatching here directly or via a `customEmitter`'s `defaultEmit`) —
- * this function does not repeat the check.
+ * Two consumers read this, exactly as {@link import('./scalar-op.js').ScalarOpSpec} has
+ * two: {@link emitScalarFunctionCallDefault} hands it to the scheduler as an
+ * `Instruction.run`, and the scalar-fusion compiler (`runtime/scalar-fusion.ts`)
+ * composes it directly into a fused closure. Keeping one copy is what stops a fused
+ * call and an instruction call from disagreeing on error text or evaluation counts.
+ *
+ * The return type is `MaybePromise<SqlValue>` because a registered implementation may
+ * be async — the scheduler resolves that, while fusion admits only bodies it has
+ * *proven* synchronous and guards the remainder. The body is variadic (a `ScalarFunc`
+ * is `(...args: SqlValue[])`), which is why it stays off `ScalarOpSpec`, whose
+ * `assertSpecArity` requires one declared parameter per operand.
+ *
+ * Assumes `plan.functionSchema` has already been validated as a scalar function schema
+ * by the caller (the entry point {@link emitScalarFunctionCall} checks it before
+ * dispatching here directly or via a `customEmitter`'s `defaultEmit`; the fusion arm
+ * declines when the check fails and lets the unfused path report it) — this function
+ * does not repeat the check.
  */
-export function emitScalarFunctionCallDefault(plan: ScalarFunctionCallNode, ctx: EmissionContext): Instruction {
+export function buildScalarFunctionRun(
+	plan: ScalarFunctionCallNode,
+): (rctx: RuntimeContext, ...args: SqlValue[]) => MaybePromise<SqlValue> {
 	const functionName = plan.expression.name.toLowerCase();
 	const scalarFunction = plan.functionSchema as ScalarFunctionSchema;
 
-	// Arity is a plan-time fact: the planner resolved this schema by arity, and
-	// `operandExprs` below is built from `plan.operands` — so a mismatch here can
-	// only be an emitter bug, not a per-call condition. Assert once at emit time
-	// instead of re-checking every row.
+	// Arity is a plan-time fact: the planner resolved this schema by arity, and both
+	// consumers evaluate exactly `plan.operands` — so a mismatch here can only be an
+	// emitter bug, not a per-call condition. Assert once at emit time instead of
+	// re-checking every row.
 	if (scalarFunction.numArgs >= 0 && plan.operands.length !== scalarFunction.numArgs) {
 		throw new QuereusError(`Internal error: function ${functionName} plan has ${plan.operands.length} operands, expected ${scalarFunction.numArgs}`, StatusCode.INTERNAL);
 	}
@@ -41,7 +57,7 @@ export function emitScalarFunctionCallDefault(plan: ScalarFunctionCallNode, ctx:
 		? `the return value of function ${functionName}(${plan.operands.length})`
 		: '';
 
-	function run(_rctx: RuntimeContext, ...args: Array<SqlValue>): OutputValue {
+	return function run(_rctx: RuntimeContext, ...args: Array<SqlValue>): MaybePromise<SqlValue> {
 		let result: MaybePromise<SqlValue>;
 		try {
 			result = scalarFunction.implementation(...args);
@@ -61,8 +77,18 @@ export function emitScalarFunctionCallDefault(plan: ScalarFunctionCallNode, ctx:
 			assertConformsToType(result, reprReturnType!, reprWhere);
 		}
 		return result;
-	}
+	};
+}
 
+/**
+ * Default emission logic for scalar function calls.
+ * This is exported so custom emitters can call it if needed.
+ *
+ * A thin wrapper over {@link buildScalarFunctionRun}: it emits one instruction param
+ * per operand and hands the shared body to the scheduler.
+ */
+export function emitScalarFunctionCallDefault(plan: ScalarFunctionCallNode, ctx: EmissionContext): Instruction {
+	const run = buildScalarFunctionRun(plan);
 	const operandExprs = plan.operands.map(operand => emitPlanNode(operand, ctx));
 
 	return createValidatedInstruction(

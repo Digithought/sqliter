@@ -1220,6 +1220,12 @@ db.createScalarFunction("reverse", { numArgs: 1, deterministic: true },
 const result = await db.prepare("select reverse(name) from users").all();
 ```
 
+`db.createScalarFunction` takes a **synchronous** implementation. An asynchronous one —
+or any implementation that returns a Promise — is registered by building the schema with
+`createScalarFunction` from `@quereus/quereus` and passing it to `db.registerFunction`;
+see [Plugins § Asynchronous scalar functions](plugins.md#asynchronous-scalar-functions)
+for why a promise-returning function that is not declared `async` must set `isAsync: true`.
+
 ## Error Handling
 
 Quereus throws specific error types that you can catch and handle. For the complete error class hierarchy, status codes, error chain utilities, and common error patterns, see [Error Handling](errors.md).

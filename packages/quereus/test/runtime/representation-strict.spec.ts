@@ -271,8 +271,14 @@ describe('Physical representation (QUEREUS_REPR_STRICT)', () => {
 
 		it('UDF seam: an ASYNC implementation is checked on its resolved value', async function () {
 			if (!strictMode) { this.skip(); }
-			registerTyped(db, 'bad_text_async', TEXT_TYPE, () => Promise.resolve(42));
-			registerTyped(db, 'good_text_async', TEXT_TYPE, () => Promise.resolve('ok'));
+			// Declared `async`, not merely promise-returning: that is what keeps the call
+			// off the fused expression path (runtime/scalar-fusion.ts auto-detects it), so
+			// the instruction path's promise arm is the one under test. A non-`async`
+			// function returning a Promise without declaring `isAsync: true` is rejected
+			// at its first fused call instead — see docs/runtime.md § What makes a scalar
+			// function call fusable.
+			registerTyped(db, 'bad_text_async', TEXT_TYPE, async () => 42);
+			registerTyped(db, 'good_text_async', TEXT_TYPE, async () => 'ok');
 
 			const err = await capture(async () => {
 				for await (const _ of db.eval('select bad_text_async() as v')) { /* drain */ }

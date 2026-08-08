@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../../src/index.js';
+import { createScalarFunction } from '../../src/func/registration.js';
 import type { SqlValue } from '../../src/common/types.js';
 import { EmissionContext } from '../../src/runtime/emission-context.js';
 import { tryFuseScalar, MAX_FUSION_DEPTH, type FusedScalar } from '../../src/runtime/scalar-fusion.js';
@@ -16,8 +17,9 @@ import { createStrictRowContextMap, wrapTableContextsStrict } from '../../src/ru
  * path. This suite pins:
  *
  *  1. Unit level — what fuses (returning a working closure) and what declines
- *     (function calls, over-deep trees), plus fused CASE's lazy branch selection
- *     and error propagation, exercised directly against plan nodes.
+ *     (custom-emitter or asynchronous function calls, over-deep trees), plus fused
+ *     CASE's lazy branch selection and error propagation, exercised directly against
+ *     plan nodes.
  *  2. End-to-end parity — identical rows AND identical errors with
  *     `runtime_fuse_scalars` on vs off, across filters, joins, CASE, mixed
  *     fusable/unfusable siblings, deep expressions, and prepared-statement
@@ -103,10 +105,72 @@ describe('scalar fusion', () => {
 				.to.throw(/Parameter index 2 is out of bounds/);
 		});
 
-		it('declines a subtree containing a scalar function call', () => {
-			// lower(?) cannot constant-fold; function calls are the follow-up ticket.
+		it('fuses a synchronous scalar function call', () => {
+			// lower(?) cannot constant-fold, so the call survives to emit.
 			const fused = fuseFrom('select lower(?) as v', PlanNodeType.ScalarFunctionCall);
-			expect(fused).to.equal(undefined);
+			expect(fused).to.be.a('function');
+			expect(fused!(makeRctx(db, { 1: 'MiXeD' }))).to.equal('mixed');
+		});
+
+		it('declines a scalar function call that has a custom emitter', () => {
+			// nullif/greatest/least/json_schema/mutation_ordinal build their own
+			// Instruction, which the compiler cannot see inside.
+			expect(fuseFrom('select nullif(?, ?) as v', PlanNodeType.ScalarFunctionCall))
+				.to.equal(undefined);
+			expect(fuseFrom('select greatest(?, ?) as v', PlanNodeType.ScalarFunctionCall))
+				.to.equal(undefined);
+			expect(fuseFrom('select least(?, ?) as v', PlanNodeType.ScalarFunctionCall))
+				.to.equal(undefined);
+		});
+
+		it('a fusable operator containing a custom-emitter call declines whole', () => {
+			expect(fuseFrom('select nullif(?, ?) + 1 as v', PlanNodeType.BinaryOp))
+				.to.equal(undefined);
+		});
+
+		it('declines an implementation declared `async` (no flag needed)', () => {
+			db.registerFunction(createScalarFunction(
+				{ name: 'async_auto', numArgs: 1, deterministic: true },
+				async (v: SqlValue) => Number(v) * 2,
+			));
+			expect(fuseFrom('select async_auto(?) as v', PlanNodeType.ScalarFunctionCall))
+				.to.equal(undefined);
+		});
+
+		it('declines an implementation declared `isAsync: true`', () => {
+			db.registerFunction(createScalarFunction(
+				{ name: 'declared_async', numArgs: 1, deterministic: true, isAsync: true },
+				(v: SqlValue) => Promise.resolve(Number(v) * 2),
+			));
+			expect(fuseFrom('select declared_async(?) as v', PlanNodeType.ScalarFunctionCall))
+				.to.equal(undefined);
+		});
+
+		it('fuses a variadic call, composing whatever argument count the site has', () => {
+			// coalesce declares numArgs -1; the composition switches on operands.length,
+			// so a 2-arg site and a 5-arg site both fuse (the latter via the array arm).
+			const two = fuseFrom('select coalesce(?, ?) as v', PlanNodeType.ScalarFunctionCall);
+			expect(two).to.be.a('function');
+			expect(two!(makeRctx(db, { 1: null, 2: 7 }))).to.equal(7);
+
+			const five = fuseFrom('select coalesce(?, ?, ?, ?, ?) as v', PlanNodeType.ScalarFunctionCall);
+			expect(five).to.be.a('function');
+			expect(five!(makeRctx(db, { 1: null, 2: null, 3: null, 4: 'x', 5: 'y' }))).to.equal('x');
+		});
+
+		it('a zero-argument synchronous function fuses to the body itself', () => {
+			const fused = fuseFrom('select random() as v', PlanNodeType.ScalarFunctionCall);
+			expect(fused).to.be.a('function');
+			expect(fused!(makeRctx(db, {}))).to.be.a('number');
+		});
+
+		it('a function argument counts toward MAX_FUSION_DEPTH', () => {
+			// `lower(?)` wrapped in n operators: the argument sits one frame below the
+			// call, so the same cap that bounds an operator chain bounds this one.
+			const atCap = 'select lower(?)' + ' || \'x\''.repeat(MAX_FUSION_DEPTH - 1) + ' as v';
+			expect(fuseFrom(atCap, PlanNodeType.BinaryOp), 'at the cap').to.be.a('function');
+			const pastCap = 'select lower(?)' + ' || \'x\''.repeat(MAX_FUSION_DEPTH + 1) + ' as v';
+			expect(fuseFrom(pastCap, PlanNodeType.BinaryOp), 'past the cap').to.equal(undefined);
 		});
 
 		it('declines past MAX_FUSION_DEPTH but fuses below it', () => {
@@ -131,10 +195,10 @@ describe('scalar fusion', () => {
 		});
 
 		it('declines a simple CASE whose base expression cannot fuse', () => {
-			// Base declines (function call) => the whole CASE declines, rather than
-			// half-fusing the branches into a mixed contract.
+			// Base declines (custom-emitter function call) => the whole CASE declines,
+			// rather than half-fusing the branches into a mixed contract.
 			const fused = fuseFrom(
-				`select case lower(?) when 'a' then 1 else 2 end as v`, PlanNodeType.CaseExpr);
+				`select case nullif(?, ?) when 'a' then 1 else 2 end as v`, PlanNodeType.CaseExpr);
 			expect(fused).to.equal(undefined);
 		});
 
@@ -382,6 +446,135 @@ describe('scalar fusion', () => {
 				'select grp, sum(n * 2) as total, count(*) as c from t group by grp order by grp');
 			await expectParity(
 				"select id, grp || ':' || cast(n as text) as tag from t order by n * -1");
+		});
+
+		it('built-in scalar functions stay parity, including the custom-emitter ones', async () => {
+			await setup(
+				'create table t (id integer primary key, s text null, n integer null)',
+				"insert into t values (1, 'Apple', -3), (2, null, 7), (3, 'cherry', null)",
+			);
+			await expectParity(`
+				select id,
+					lower(s) as c1,
+					upper(s) as c2,
+					substr(s, 2, 3) as c3,
+					abs(n) as c4,
+					length(s) as c5,
+					coalesce(s, 'none') as c6,
+					round(n / 2.0, 1) as c7,
+					nullif(n, 7) as c8,
+					greatest(n, 0) as c9,
+					least(n, 0) as c10,
+					lower(s) || cast(abs(n) as text) as c11,
+					case when lower(s) = 'apple' then upper(s) else 'x' end as c12
+				from t order by id`);
+		});
+
+		it('a volatile function is invoked exactly as often fused as unfused', async () => {
+			const counts = new Map<Database, number>();
+			for (const db of [fusedDb, unfusedDb]) {
+				counts.set(db, 0);
+				db.registerFunction(createScalarFunction(
+					{ name: 'ticker', numArgs: 1, deterministic: false },
+					(v: SqlValue) => {
+						counts.set(db, counts.get(db)! + 1);
+						return Number(v) * 2;
+					},
+				));
+			}
+			await setup(
+				'create table t (id integer primary key, n integer)',
+				'insert into t values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)',
+			);
+			const rows = await expectParity('select id from t where ticker(n) > 4 order by id');
+			expect(rows).to.deep.equal([{ id: 3 }, { id: 4 }, { id: 5 }]);
+			expect(counts.get(fusedDb), 'one call per scanned row').to.equal(5);
+			expect(counts.get(fusedDb), 'fused and unfused invocation counts')
+				.to.equal(counts.get(unfusedDb));
+		});
+
+		it('a throwing UDF reports the same message and location fused or unfused', async () => {
+			for (const db of [fusedDb, unfusedDb]) {
+				db.registerFunction(createScalarFunction(
+					{ name: 'kaboom', numArgs: 1, deterministic: true },
+					(_v: SqlValue): SqlValue => { throw new Error('nope'); },
+				));
+			}
+			await setup(
+				'create table t (id integer primary key, n integer)',
+				'insert into t values (1, 1)',
+			);
+			const errors: Array<{ message: string; line?: number; column?: number }> = [];
+			for (const db of [fusedDb, unfusedDb]) {
+				try {
+					await collect(db, 'select kaboom(n) as v from t');
+					expect.fail('a throwing UDF must throw');
+				} catch (e) {
+					const err = e as Error & { line?: number; column?: number };
+					errors.push({ message: err.message, line: err.line, column: err.column });
+				}
+			}
+			expect(errors[0].message).to.equal('Function kaboom failed: nope (at line 1, column 8)');
+			expect(errors[0], 'fused and unfused error, including source location')
+				.to.deep.equal(errors[1]);
+		});
+
+		it('an async UDF (auto-detected) answers identically fused or unfused', async () => {
+			for (const db of [fusedDb, unfusedDb]) {
+				db.registerFunction(createScalarFunction(
+					{ name: 'async_double', numArgs: 1, deterministic: true },
+					async (v: SqlValue) => Number(v) * 2,
+				));
+			}
+			await setup(
+				'create table t (id integer primary key, n integer)',
+				'insert into t values (1, 5), (2, 6)',
+			);
+			const rows = await expectParity('select id, async_double(n) as v from t order by id');
+			expect(rows).to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 12 }]);
+		});
+
+		it('a promise-returning UDF declared isAsync answers identically fused or unfused', async () => {
+			for (const db of [fusedDb, unfusedDb]) {
+				db.registerFunction(createScalarFunction(
+					{ name: 'thenable_double', numArgs: 1, deterministic: true, isAsync: true },
+					(v: SqlValue) => Promise.resolve(Number(v) * 2),
+				));
+			}
+			await setup(
+				'create table t (id integer primary key, n integer)',
+				'insert into t values (1, 5), (2, 6)',
+			);
+			const rows = await expectParity('select id, thenable_double(n) as v from t order by id');
+			expect(rows).to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 12 }]);
+		});
+
+		it('a promise-returning UDF declaring nothing fails loudly on the fused path', async () => {
+			// Neither `async` (so auto-detection cannot see it) nor `isAsync` — the one
+			// case step 4's guard exists for. The unfused path still resolves it, which
+			// is exactly why the guard has to name the remedy rather than stay silent.
+			for (const db of [fusedDb, unfusedDb]) {
+				db.registerFunction(createScalarFunction(
+					{ name: 'sneaky_double', numArgs: 1, deterministic: true },
+					(v: SqlValue) => Promise.resolve(Number(v) * 2),
+				));
+			}
+			await setup(
+				'create table t (id integer primary key, n integer)',
+				'insert into t values (1, 5)',
+			);
+			let message = '';
+			try {
+				await collect(fusedDb, 'select sneaky_double(n) as v from t');
+				expect.fail('an undeclared promise-returning UDF must throw when fused');
+			} catch (e) {
+				message = (e as Error).message;
+			}
+			expect(message).to.contain('sneaky_double');
+			expect(message).to.contain('isAsync: true');
+
+			const unfused = await collect(unfusedDb, 'select sneaky_double(n) as v from t');
+			expect(unfused, 'the unfused path resolves it as before').to.deep.equal([{ v: 10 }]);
 		});
 	});
 

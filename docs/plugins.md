@@ -362,6 +362,40 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 }
 ```
 
+#### Asynchronous scalar functions
+
+A scalar implementation may return a Promise. Write it as an ordinary `async` function
+and nothing else is required:
+
+```typescript
+createScalarFunction(
+  { name: 'fetch_label', numArgs: 1, returnType: TEXT_RETURN },
+  async (id: SqlValue) => (await lookup(id)) ?? null
+);
+```
+
+The engine compiles pure **synchronous** scalar expressions into a single fused closure
+instead of a per-row sub-program (see [runtime.md § Scalar
+fusion](./runtime.md#scalar-fusion-the-second-execution-tier)), so it has to know which
+implementations can hand back a Promise. A declared `async` function or arrow is
+detected automatically. What it cannot detect is a function that returns a Promise
+*without* being declared `async` — a plain function returning `somePromise`, or a
+`.bind()` / decorator wrapper around an async one. Declare those:
+
+```typescript
+createScalarFunction(
+  { name: 'fetch_label', numArgs: 1, returnType: TEXT_RETURN, isAsync: true },
+  wrapWithRetries(fetchLabel)   // returns a Promise, but is not itself `async`
+);
+```
+
+- **Omitting `isAsync` declares the function synchronous.** That is the right default,
+  and it is what lets calls to it fuse.
+- An undeclared function that returns a Promise anyway **throws on its first call**,
+  naming itself and this flag, rather than letting the Promise flow on as if it were a
+  value. Fixing it is a one-word registration change.
+- A function supplying a `customEmitter` is never fused and is unaffected either way.
+
 ### Table-Valued Functions
 
 Return multiple rows. The implementation is an **async generator** (its declared type is `(...args) => MaybePromise<AsyncIterable<Row>>`), and each row it yields is an **array of values in declared column order** — not an object keyed by column name:

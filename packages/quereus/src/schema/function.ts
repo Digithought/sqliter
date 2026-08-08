@@ -248,6 +248,21 @@ export interface ScalarFunctionSchema extends BaseFunctionSchema {
 	/** Direct scalar function implementation */
 	implementation: ScalarFunc;
 	/**
+	 * When `true`, {@link ScalarFunctionSchema.implementation} may return a Promise.
+	 * Absent / `false` **declares the function synchronous**, which lets the engine
+	 * fuse its calls into a direct closure instead of running a per-row sub-program
+	 * (`runtime/scalar-fusion.ts`; see docs/runtime.md § Scalar fusion).
+	 *
+	 * A declared `async function` / `async` arrow is detected automatically and never
+	 * needs this flag. It exists for the implementation that returns a Promise WITHOUT
+	 * being declared `async` — a non-`async` function returning `somePromise`, or a
+	 * `.bind()` / wrapper around an async one — which is invisible to that detection.
+	 * Such a function that declares nothing fails loudly at its first fused call,
+	 * naming itself and this flag, rather than letting a Promise flow on as if it were
+	 * a value.
+	 */
+	isAsync?: boolean;
+	/**
 	 * Optional type inference function for polymorphic functions.
 	 * If provided, this function will be called at planning time to determine
 	 * the return type based on the actual argument types.
