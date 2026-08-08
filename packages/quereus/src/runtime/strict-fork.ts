@@ -17,7 +17,7 @@ import { FORK_STRICT, CONTEXT_STRICT } from './strict-flags.js';
  *      forks is being driven throws. State is tracked **per parent map** (not
  *      globally) so concurrent unrelated drivers don't interfere, forks may mutate
  *      their own fresh maps freely, and sub-forks are independently tracked.
- *      See docs/runtime.md § Parallel runtime fork contract.
+ *      See docs/runtime-parallel.md § Parallel runtime fork contract.
  *
  *   2. **`QUEREUS_CONTEXT_STRICT`** — stale-shadow detection. Maintains a per-
  *      descriptor epoch and a per-attribute index-winner map so `assertNoShadow`
@@ -53,7 +53,7 @@ export function strictForkEnabled(): boolean {
 function violation(target: string, count: number): never {
 	throw new QuereusError(
 		`strict-fork: parent context mutated ${target} while ${count} fork(s) are active. ` +
-		`This is a fork-contract violation. See docs/runtime.md § Parallel runtime fork contract.`,
+		`This is a fork-contract violation. See docs/runtime-parallel.md § Parallel runtime fork contract.`,
 		StatusCode.INTERNAL,
 	);
 }

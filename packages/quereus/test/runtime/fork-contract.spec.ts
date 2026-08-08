@@ -84,7 +84,7 @@ const EXPECTED_FORK_POLICY = {
 /**
  * Files allowed to call `tableContexts.set(` / `tableContexts.delete(` on a
  * RuntimeContext. Any new site must be added here deliberately after reading
- * docs/runtime.md § Parallel runtime fork contract — parent mutation while
+ * docs/runtime-parallel.md § Parallel runtime fork contract — parent mutation while
  * forks are alive is a contract violation.
  *
  * Excludes construction sites (`new Map()` / `new Map(rctx.tableContexts)`)
@@ -105,7 +105,7 @@ const TABLE_CONTEXTS_MUTATION_ALLOWLIST = new Set<string>([
  * Files allowed to call `context.set(` / `context.delete(` on a RuntimeContext.
  * Other consumers should use `createRowSlot` / `withRowContext` / `withAsyncRowContext`.
  * The aggregate/window emitters mutate directly for performance and predate the
- * helpers — see runtime.md § Parallel runtime fork contract.
+ * helpers — see docs/runtime-parallel.md § Parallel runtime fork contract.
  */
 const ROW_CONTEXT_MUTATION_ALLOWLIST = new Set<string>([
 	'src/runtime/context-helpers.ts',
@@ -176,7 +176,7 @@ describe('Fork contract (test harness)', () => {
 
 			expect(missing, `RuntimeContext fields without a declared fork policy: ${missing.join(', ')}. ` +
 				`Add to EXPECTED_FORK_POLICY in test/runtime/fork-contract.spec.ts after reading ` +
-				`docs/runtime.md § Parallel runtime fork contract.`).to.deep.equal([]);
+				`docs/runtime-parallel.md § Parallel runtime fork contract.`).to.deep.equal([]);
 			expect(extra, `EXPECTED_FORK_POLICY declares fields that no longer exist on RuntimeContext: ${extra.join(', ')}`)
 				.to.deep.equal([]);
 		});
@@ -241,7 +241,7 @@ describe('Fork contract (test harness)', () => {
 			expect(unexpected,
 				`Files mutating RuntimeContext.tableContexts outside the allowlist: ${unexpected.join(', ')}. ` +
 				`If this is a legitimate emit site, add it to TABLE_CONTEXTS_MUTATION_ALLOWLIST ` +
-				`after reading docs/runtime.md § Parallel runtime fork contract — mutating the ` +
+				`after reading docs/runtime-parallel.md § Parallel runtime fork contract — mutating the ` +
 				`parent map while forks are alive is a contract violation.`,
 			).to.deep.equal([]);
 
@@ -270,8 +270,8 @@ describe('Fork contract (test harness)', () => {
 			expect(unexpected,
 				`Files mutating RuntimeContext.context outside the allowlist: ${unexpected.join(', ')}. ` +
 				`Prefer createRowSlot / withRowContext / withAsyncRowContext. If direct mutation ` +
-				`is required, add to ROW_CONTEXT_MUTATION_ALLOWLIST after reading docs/runtime.md ` +
-				`§ Parallel runtime fork contract.`,
+				`is required, add to ROW_CONTEXT_MUTATION_ALLOWLIST after reading ` +
+				`docs/runtime-parallel.md § Parallel runtime fork contract.`,
 			).to.deep.equal([]);
 
 			const dead = [...ROW_CONTEXT_MUTATION_ALLOWLIST].filter(f => !runtimeFound.has(f));

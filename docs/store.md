@@ -696,8 +696,8 @@ this per-scan / auto-index path, still under the index collation. That gate read
 `index.columns[i].collation` this resolver does, so the two stay consistent across an `ALTER
 COLUMN … SET COLLATE`.
 
-A **semantic-ordering** column (TIMESPAN, JSON — see [types.md § Semantic
-ordering](types.md#semantic-ordering)) is the one exception: its enforcement comparison is
+A **semantic-ordering** column (TIMESPAN, JSON — see [types-ordering.md § Semantic
+ordering](types-ordering.md#semantic-ordering)) is the one exception: its enforcement comparison is
 the declared type's `compare`, so neither the index nor the column `COLLATE` participates
 and `'PT1H'`/`'PT60M'` conflict under any collation. The resolved collation is still passed
 to the type's `compare` (types whose ordering is partly textual may consult it). Every

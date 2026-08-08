@@ -55,7 +55,7 @@ function sortByK(rows: Record<string, SqlValue>[]): Record<string, SqlValue>[] {
 
 // The declined-fold plan below executes an EagerPrefetch (bloom-probe) above the
 // FULL JOIN; a slot-creating ancestor over an eager-start fork is a known
-// strict-fork false positive (see docs/runtime.md § EagerPrefetchNode), so that
+// strict-fork false positive (see docs/runtime-parallel.md § EagerPrefetchNode), so that
 // executed-plan test is skipped under QUEREUS_FORK_STRICT like its siblings in
 // parallel-eager-prefetch-probe.spec.ts.
 const strictFork = typeof process !== 'undefined'

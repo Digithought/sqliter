@@ -73,7 +73,7 @@ function fanOutBranchModes(rows: readonly PlanRow[]): string[] {
 // active, tripping invariant 2 (parent immutability during fork lifetime). The
 // forks never read the parent's later-created slot, so this is a
 // strict-harness false-positive only — `bumpParentForkCounter` is a no-op in
-// production (see docs/runtime.md § Strict-fork interaction). Mirror the
+// production (see docs/runtime-parallel.md § Strict-fork interaction). Mirror the
 // `Sort-above-AsyncGather` guard in `parallel-async-gather.spec.ts`: skip the
 // execution paths under strict-fork; the non-strict run validates correctness.
 const strictFork = typeof process !== 'undefined' && (process.env?.QUEREUS_FORK_STRICT === '1' || process.env?.QUEREUS_FORK_STRICT === 'true');

@@ -84,7 +84,7 @@ insert into table_name (columns) values (...)
 A targeted conflict is matched the way the named constraint *enforces* uniqueness: the target
 column's affinity is applied to the proposed value and it is compared under the constraint's
 collation, or — for a column whose declared type defines its own notion of equal values
-(TIMESPAN, JSON; see [types.md § Semantic ordering](types.md)) — under that type. So a conflict
+(TIMESPAN, JSON; see [types-ordering.md § Semantic ordering](types-ordering.md)) — under that type. So a conflict
 that arises only through collation (e.g. `'abc'` proposed against a stored `'ABC'` under
 `COLLATE NOCASE`), through affinity (e.g. `'1'` proposed against a stored integer `1` on an
 `INTEGER` key), or through a re-spelling of the same value (`'PT60M'` against a stored `'PT1H'`

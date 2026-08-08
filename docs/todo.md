@@ -288,10 +288,10 @@ The logical type system enables significant runtime performance improvements by 
 **Runtime — parallel and validation follow-ups**
 - [ ] **Per-branch equi-pair surface on `FanOutBranchSpec`**: would let
   `FanOutLookupJoinNode.computePhysical` tighten its ordering/FD derivation without
-  changing the emitter (see [`runtime.md`](runtime.md#fanoutlookupjoinnode-per-row-fan-out-lookup-join)).
+  changing the emitter (see [`runtime-parallel.md`](runtime-parallel.md#fanoutlookupjoinnode-per-row-fan-out-lookup-join)).
 - [ ] **Relax the connection lock for fully-reentrant modules**: once a module advertises
   `'fully-reentrant'`, the optimizer predicate and the lock policy can refine in tandem
-  for that module (see [`runtime.md`](runtime.md#connection-lock-contract-under-impure-subtrees)).
+  for that module (see [`runtime-parallel.md`](runtime-parallel.md#connection-lock-contract-under-impure-subtrees)).
 
 **Performance & Scalability (Medium-term)**
 - [ ] **Memory Pooling**: Reduce allocation overhead in hot paths

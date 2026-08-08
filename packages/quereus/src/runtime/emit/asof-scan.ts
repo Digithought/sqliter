@@ -67,7 +67,7 @@ function resolveSetup(plan: AsofScanNode, ctx: EmissionContext): AsofScanSetup {
 	// semantic-ordering-aware. Correct for the canonical AS OF column types
 	// (DATE/DATETIME — canonical ISO text order IS their semantic order). A TIMESPAN
 	// or JSON match column would order by text here, disagreeing with `<`/ORDER BY.
-	// The equi-join rule (docs/types.md § "Semantic ordering": a physical key pair is
+	// The equi-join rule (docs/types-ordering.md § "Semantic ordering": a physical key pair is
 	// admissible only when both sides agree on semantic ordering, else it demotes to
 	// the residual) does NOT apply here — AS OF has no residual to demote into, so a
 	// declining gate would only make the query unplannable. Fixing this means

@@ -116,7 +116,7 @@ Aggregate functions perform a calculation on a set of values and return a single
 - `max(X)`: Returns the maximum value of all non-NULL values of X — `min`/`max`
   rank X the same way `order by X` does, so a `timespan` column compares by
   elapsed time, a `json` column by structure, and a collated text column under
-  its declared collation (see [Type System § Semantic ordering](types.md#semantic-ordering))
+  its declared collation (see [Type System § Semantic ordering](types-ordering.md#semantic-ordering))
 - `group_concat(X[, Y])`: Returns a string concatenating non-NULL values of X, separated by Y (default ',')
 - `total(X)`: Returns the sum as a floating-point value (returns 0.0 for empty set)
 - `var_pop(X)`: Returns the population variance
