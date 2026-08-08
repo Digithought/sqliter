@@ -4,21 +4,18 @@ import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type Row, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { isRelationalNode } from '../../planner/nodes/plan-node.js';
 import type { BTree } from 'inheritree';
 import { createValueSet } from '../../util/value-set.js';
 import { logContextPush, logContextPop } from '../utils.js';
-import { quereusError } from '../../common/errors.js';
-import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { AggValue } from '../../func/registration.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { semanticKeyTransform } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import { cloneInitialValue, findSourceRelation, ctxLog } from './aggregate.js';
-import { bindAggregateSchemas, buildDistinctComparators, computeAggregateValueTransforms, evalArgsSync } from './aggregate-setup.js';
+import { bindAggregateSchemas, buildDistinctComparators, computeAggregateValueTransforms, emitAggregateArgInstructions, evalArgsSync } from './aggregate-setup.js';
 import type { ContextInstaller } from '../context-helpers.js';
 
 interface GroupState {
@@ -257,20 +254,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 	const groupByInstructions = plan.groupBy.map(expr => emitCallFromPlan(expr, ctx));
 
-	const aggregateArgInstructions: Instruction[] = [];
-	for (const agg of plan.aggregates) {
-		const funcNode = agg.expression;
-		if (!(funcNode instanceof AggregateFunctionCallNode)) {
-			quereusError(`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`, StatusCode.INTERNAL);
-		}
-		const args = funcNode.args || [];
-		for (const arg of args) {
-			if (!arg) {
-				quereusError(`Aggregate argument is undefined for function ${funcNode.functionName}`, StatusCode.INTERNAL);
-			}
-			aggregateArgInstructions.push(emitCallFromPlan(arg, ctx));
-		}
-	}
+	const aggregateArgInstructions = emitAggregateArgInstructions(plan.aggregates, ctx);
 
 	return {
 		params: [sourceInstruction, ...groupByInstructions, ...aggregateArgInstructions],

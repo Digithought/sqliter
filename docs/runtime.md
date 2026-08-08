@@ -1193,16 +1193,21 @@ SQL requires different coercion strategies for different contexts. Quereus coerc
 
 **Aggregate Context** (`coerceForAggregate`):
 - Function-specific coercion for aggregate arguments
-- COUNT functions skip coercion, numeric aggregates (SUM/AVG) coerce strings
-- Used in: aggregate function argument processing
+- COUNT/GROUP_CONCAT/`JSON_*` skip coercion, numeric aggregates (SUM/AVG) coerce strings
+- The aggregate emitters do not call it per row: the routing decision is constant for a
+  call site, so `computeAggregateValueTransforms` (`runtime/emit/aggregate-setup.ts`)
+  resolves it once at emit time into a per-aggregate value transform — `undefined` when
+  the site never coerces (the aggregate ignores coercion, or every argument is already
+  numeric or carries semantic ordering). The transform applies the identical value-level
+  conversion; `coerceForAggregate` remains the definition and the public export
 
 ### Implementation Guidelines
 
 **Critical Rule**: never write coercion logic in an emitter. Coerce each operand with
 `coerceToNumberForArithmetic` before an arithmetic op, coerce an aggregate argument
-with `coerceForAggregate(rawValue, functionName)` before the step function, and for
-comparisons rely on the planner-inserted `CastNode` — one behavior, one home
-(`src/util/coercion.ts`).
+through the emit-time transform described above (whose body is `coerceForAggregate`'s,
+not a re-derivation), and for comparisons rely on the planner-inserted `CastNode` — one
+behavior, one home (`src/util/coercion.ts`).
 
 ## Uniqueness and sorting guidelines
 

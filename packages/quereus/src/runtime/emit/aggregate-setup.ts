@@ -7,10 +7,10 @@ import { createTypedComparator, hasSemanticOrdering } from '../../util/compariso
 import type { LogicalType } from '../../types/logical-type.js';
 import { StatusCode, type SqlValue, type MaybePromise } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
-import { tryCoerceToNumber } from '../../util/coercion.js';
-import { resolveMaybe } from '../async-util.js';
+import { aggregateCoercesArguments, coerceAggregateValue } from '../../util/coercion.js';
+import { emitCallFromPlan } from '../emitters.js';
 import type { EmissionContext } from '../emission-context.js';
-import type { RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
 
 /**
  * Emit-time setup shared by the stream and hash aggregate emitters: both walk the
@@ -100,6 +100,31 @@ export function bindAggregateSchemas(
 	return { schemas, distinctFlags, argCounts };
 }
 
+/**
+ * Emit one call instruction per aggregate argument, flattened across the aggregate list
+ * in declaration order — the order both emitters' row loops slice back out of
+ * `groupByAndAggregateArgs` using `argCounts` from {@link bindAggregateSchemas}.
+ */
+export function emitAggregateArgInstructions(
+	aggregates: readonly AggregateExpr[],
+	ctx: EmissionContext,
+): Instruction[] {
+	const instructions: Instruction[] = [];
+	for (const agg of aggregates) {
+		const funcNode = requireAggregateCall(agg);
+		for (const arg of funcNode.args || []) {
+			if (!arg) {
+				quereusError(
+					`Aggregate argument is undefined for function ${funcNode.functionName}`,
+					StatusCode.INTERNAL
+				);
+			}
+			instructions.push(emitCallFromPlan(arg, ctx));
+		}
+	}
+	return instructions;
+}
+
 /** Pre-resolved typed comparators for DISTINCT aggregate argument tracking. */
 export function buildDistinctComparators(
 	aggregates: readonly AggregateExpr[],
@@ -129,52 +154,74 @@ export function buildDistinctComparators(
 
 /**
  * Per-aggregate value transform, replacing a per-row `coerceForAggregate(value,
- * functionName)` call with a closure resolved once at emit time. `undefined` means the
- * call site never coerces — the aggregate never coerces its arguments (COUNT,
- * GROUP_CONCAT, JSON_*), every argument is already numeric, or every argument type
- * carries semantic ordering (TIMESPAN/JSON) where the numeric-string conversion must
- * never run ahead of a type-aware comparator. Otherwise the closure applies exactly the
- * value-level conversion `coerceForAggregate` performs (string → number when the
- * trimmed value parses), with the function-name routing already decided.
+ * functionName)` call with a decision made once at emit time. `undefined` means the call
+ * site never coerces — the aggregate ignores coercion (COUNT, GROUP_CONCAT, JSON_*, per
+ * {@link aggregateCoercesArguments}), every argument is already numeric, or every
+ * argument type carries semantic ordering (TIMESPAN/JSON) where the numeric-string
+ * conversion must never run ahead of a type-aware comparator. Otherwise the transform is
+ * {@link coerceAggregateValue} — the same function `coerceForAggregate` calls once its
+ * own routing agrees, so the two paths cannot drift.
  */
 export function computeAggregateValueTransforms(
 	aggregates: readonly AggregateExpr[],
 ): Array<((value: SqlValue) => SqlValue) | undefined> {
 	return aggregates.map(agg => {
-		const funcNode = agg.expression;
-		if (!(funcNode instanceof AggregateFunctionCallNode)) return undefined;
-		const funcName = (funcNode.functionName || '').toUpperCase();
-		// COUNT, GROUP_CONCAT and JSON_* never coerce their arguments.
-		if (funcName === 'COUNT' || funcName === 'GROUP_CONCAT' || funcName.startsWith('JSON_')) return undefined;
+		const funcNode = requireAggregateCall(agg);
+		if (!aggregateCoercesArguments(funcNode.functionName || '')) return undefined;
 		const args = funcNode.args || [];
 		const skip = args.length > 0 && (
 			args.every(arg => arg.getType().logicalType.isNumeric)
 			|| args.every(arg => hasSemanticOrdering(arg.getType().logicalType as LogicalType))
 		);
-		if (skip) return undefined;
-		return (value: SqlValue): SqlValue =>
-			typeof value === 'string' && value.trim() !== '' ? tryCoerceToNumber(value) : value;
+		return skip ? undefined : coerceAggregateValue;
 	});
 }
+
+/** One argument/key evaluator: a scalar sub-program bound to a row context. */
+type ValueEvaluator = (ctx: RuntimeContext) => MaybePromise<SqlValue>;
 
 /**
  * Evaluate N argument-evaluator closures against the same row context, applying an
  * optional per-value transform, without paying a microtask hop when every closure
- * resolves synchronously (the common case — see {@link resolveMaybe}). Shared by the
- * stream/hash aggregate step loops (grouped and ungrouped) and GROUP BY key evaluation.
+ * resolves synchronously (the common case — see `resolveMaybe`, runtime/async-util.ts).
+ * Shared by the stream/hash aggregate step loops (grouped and ungrouped) and by GROUP BY
+ * key evaluation.
+ *
+ * Evaluation stays strictly sequential: each closure runs only after the previous one
+ * has settled. Sibling scalar sub-programs share one {@link RuntimeContext} — row slots,
+ * scan connections and the once-per-execution memo all live on it — and the only
+ * supported way to run sub-programs concurrently is against forked contexts
+ * (`ParallelDriver.fork`, runtime/parallel-driver.ts). So this must not start argument
+ * `j+1` while `j` is still pending; the saving here is the microtask hop, not overlap.
  */
 export function evalArgsSync(
 	rctx: RuntimeContext,
-	fns: readonly ((ctx: RuntimeContext) => MaybePromise<SqlValue>)[],
+	fns: readonly ValueEvaluator[],
 	transform?: (value: SqlValue) => SqlValue,
 ): MaybePromise<SqlValue[]> {
-	const n = fns.length;
-	const results = new Array<MaybePromise<SqlValue>>(n);
-	let hasAsync = false;
-	for (let j = 0; j < n; j++) {
-		const mapped = transform ? resolveMaybe(fns[j](rctx), transform) : fns[j](rctx);
-		if (mapped instanceof Promise) hasAsync = true;
-		results[j] = mapped;
+	const results = new Array<SqlValue>(fns.length);
+	for (let j = 0; j < fns.length; j++) {
+		const raw = fns[j](rctx);
+		if (raw instanceof Promise) return evalArgsFrom(rctx, fns, transform, results, j, raw);
+		results[j] = transform ? transform(raw) : raw;
 	}
-	return hasAsync ? Promise.all(results) : (results as SqlValue[]);
+	return results;
+}
+
+/** Async tail of {@link evalArgsSync}: awaits the first pending argument, then the rest in order. */
+async function evalArgsFrom(
+	rctx: RuntimeContext,
+	fns: readonly ValueEvaluator[],
+	transform: ((value: SqlValue) => SqlValue) | undefined,
+	results: SqlValue[],
+	pendingIndex: number,
+	pending: Promise<SqlValue>,
+): Promise<SqlValue[]> {
+	const first = await pending;
+	results[pendingIndex] = transform ? transform(first) : first;
+	for (let j = pendingIndex + 1; j < fns.length; j++) {
+		const raw = await fns[j](rctx);
+		results[j] = transform ? transform(raw) : raw;
+	}
+	return results;
 }
