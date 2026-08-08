@@ -57,6 +57,7 @@ describe('scalar op specs', () => {
 		beforeEach(async () => {
 			db = new Database();
 			await db.exec('create table t (id integer primary key, n integer not null, m integer not null, s text not null)');
+			await db.exec('create table d (id integer primary key, d1 date not null, d2 date not null, d3 date not null, d4 date not null)');
 		});
 
 		afterEach(async () => {
@@ -78,6 +79,12 @@ describe('scalar op specs', () => {
 			['not between', 'select n not between 1 and 5 from t', 'NOT BETWEEN'],
 			['numeric', 'select n + m from t', '+(numeric-fast)'],
 			['comparison', 'select n > m from t', '>(compare-fast)'],
+			// Both sides of the `=` are DATE - DATE, which the operation table
+			// (types/temporal-ops.ts) says produces a TIMESPAN. That announced type is
+			// what routes the comparison to the semantic (elapsed-time) comparator
+			// instead of the generic path — so this note is the planner-side proof that
+			// the table's result type reached `generateType`.
+			['comparison of two date differences', 'select (d2 - d1) = (d4 - d3) from d', '=(compare-typed)'],
 			['concat', "select s || s from t", '||(concat)'],
 			['constant-pattern LIKE', "select s like 'a%' from t", 'LIKE(like-const)'],
 			['dynamic-pattern LIKE', 'select s like s from t', 'LIKE(like)'],

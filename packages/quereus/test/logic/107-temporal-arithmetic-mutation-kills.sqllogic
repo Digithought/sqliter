@@ -295,6 +295,118 @@ SELECT timespan('PT1H') * null as result;
 SELECT timespan('PT1H') / null as result;
 → [{"result":null}]
 
+SELECT null * timespan('PT1H') as result;
+→ [{"result":null}]
+
+SELECT timespan('PT1H') - null as result;
+→ [{"result":null}]
+
+SELECT null / timespan('PT1H') as result;
+→ [{"result":null}]
+
+SELECT time('10:00:00') - null as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- Chained temporal arithmetic
+--
+-- The declared result type of the inner expression is what the outer operator
+-- specializes on (types/temporal-ops.ts). Before that table existed the planner
+-- announced the LEFT operand's type for every temporal pair, so the inner
+-- `date - date` claimed DATE while holding a duration string.
+-- ============================================================
+
+-- (DATE - DATE) is a TIMESPAN, so the outer + is TIMESPAN + TIMESPAN
+SELECT (date('2024-01-20') - date('2024-01-15')) + timespan('P1D') as result;
+→ [{"result":"P6D"}]
+
+-- (DATE + TIMESPAN) is a DATE, so the outer - is DATE - DATE → a TIMESPAN
+SELECT (date('2024-01-20') + timespan('P1D')) - date('2024-01-15') as result;
+→ [{"result":"P6D"}]
+
+-- (TIMESPAN / TIMESPAN) is a REAL, so the outer + is plain numeric arithmetic
+SELECT (timespan('PT2H') / timespan('PT1H')) + 1 as result;
+→ [{"result":3}]
+
+-- (TIMESPAN - TIMESPAN) is a TIMESPAN
+SELECT (timespan('PT2H') - timespan('PT30M')) + timespan('PT30M') as result;
+→ [{"result":"PT2H"}]
+
+-- (NUMBER * TIMESPAN) is a TIMESPAN, so the outer + finds no NUMBER case.
+-- Returned null before the result type was fixed: the inner expression was
+-- announced INTEGER, the outer + took the numeric fast path, and `'PT7200S' + 3`
+-- produced a non-finite value. An error is the honest answer.
+SELECT (2 * timespan('PT1H')) + 3 as result;
+-- error: Unsupported temporal operation
+
+-- ============================================================
+-- Unsupported combinations still raise, byte for byte
+-- ============================================================
+
+SELECT date('2024-01-15') + date('2024-01-16') as result;
+-- error: Unsupported temporal operation
+
+SELECT date('2024-01-15') * 2 as result;
+-- error: Unsupported temporal operation
+
+SELECT time('10:00:00') - date('2024-01-15') as result;
+-- error: Unsupported temporal operation
+
+SELECT timespan('PT1H') % timespan('PT1H') as result;
+-- error: Unsupported temporal operation
+
+SELECT date('2024-01-15') - 5 as result;
+-- error: Unsupported temporal operation
+
+-- A number past 2^53 is a bigint, which the `*` / `/` number cases reject.
+-- Preserved as found — see the NOTE on scaleTimespan in types/temporal-ops.ts.
+SELECT timespan('PT1H') * 9007199254740993 as result;
+-- error: Unsupported temporal operation
+
+-- ============================================================
+-- Operands whose declared type settles nothing keep sniffing values at runtime
+-- ============================================================
+
+-- TEXT operand: no plan-time kind, so the pair falls back to runtime shape probes,
+-- which find no (undefined, date) case.
+SELECT 'not-a-date' - date('2024-01-15') as result;
+-- error: Unsupported temporal operation
+
+-- ...and the same fallback still succeeds when the TEXT value does look temporal
+SELECT timespan('PT1H') + 'PT1H' as result;
+→ [{"result":"PT2H"}]
+
+-- ============================================================
+-- TIMESTAMP is deliberately outside the table
+--
+-- It is an integer instant, not a string temporal, and appears in no case — so
+-- `ts + 1` keeps taking the runtime-sniffed path (both values look numeric, so
+-- nothing temporal matches) and plain numeric arithmetic answers.
+-- ============================================================
+
+CREATE TABLE ts_int (id INTEGER PRIMARY KEY, t TIMESTAMP);
+INSERT INTO ts_int VALUES (1, 1705276800000);
+-- run
+
+SELECT t + 1 as result FROM ts_int;
+→ [{"result":1705276800001}]
+
+SELECT t - t as result FROM ts_int;
+→ [{"result":0}]
+
+DROP TABLE ts_int;
+
+-- ============================================================
+-- DATETIME - DATETIME drops the time of day
+--
+-- Both sides collapse to a PlainDate before the difference is taken, so a
+-- 2-hour remainder disappears. Locked here as preserved-as-found behavior; the
+-- fix is tracked as `bug-datetime-difference-drops-time-of-day`.
+-- ============================================================
+
+SELECT datetime('2024-01-20T10:00:00') - datetime('2024-01-15T08:00:00') as result;
+→ [{"result":"P5D"}]
+
 -- ============================================================
 -- TIMESPAN comparisons (semantic, not lexicographic)
 -- ============================================================

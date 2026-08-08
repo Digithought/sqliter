@@ -445,6 +445,56 @@ gate on it. Two consequences worth stating explicitly:
 - Arithmetic: Supports addition/subtraction with DATE, TIME, DATETIME types
 - Human-readable parsing: `timespan('1 hour 30 minutes')` → `"PT1H30M"`
 
+**Temporal arithmetic: one table, read by both the planner and the evaluator.**
+Which `(operator, left operand, right operand)` combinations exist, what each produces,
+and what result type each announces all live in a single table,
+`src/types/temporal-ops.ts`. `BinaryOpNode.generateType` reads `resultType` from it —
+classifying each operand by identity against the registered singletons — and
+`tryTemporalArithmetic` (`runtime/emit/temporal-arithmetic.ts`) runs the same table's
+`apply`, classifying each operand by the shape of the runtime value. Because both sides
+read one description, the type an expression *announces* predicts the value it
+*produces*; before the table existed the planner announced the left operand's type for
+every temporal pair, so `date - date` claimed DATE while yielding a duration string, and
+downstream consumers of the declared type (the numeric fast path, `create table … as
+select`, view column types, `Statement.getColumnType()`) were reading a type that did not
+hold.
+
+The operand kinds are `date`, `time`, `datetime`, `timespan`, and `number`. Supported
+combinations:
+
+| Operator | Left | Right | Result |
+|---|---|---|---|
+| `-` | DATE / DATETIME | DATE / DATETIME | TIMESPAN |
+| `-` | TIME | TIME | TIMESPAN |
+| `+` / `-` | DATE | TIMESPAN | DATE |
+| `+` / `-` | DATETIME | TIMESPAN | DATETIME |
+| `+` / `-` | TIME | TIMESPAN | TIME |
+| `+` | TIMESPAN | DATE / DATETIME / TIME | DATE / DATETIME / TIME |
+| `+` / `-` | TIMESPAN | TIMESPAN | TIMESPAN |
+| `*` | TIMESPAN | number | TIMESPAN |
+| `*` | number | TIMESPAN | TIMESPAN |
+| `/` | TIMESPAN | number | TIMESPAN |
+| `/` | TIMESPAN | TIMESPAN | REAL (ratio of elapsed seconds) |
+
+Anything absent — `%` on any pair, `DATE + DATE`, `DATE * number`, `TIME - DATE`,
+`DATE - number` — raises `Unsupported temporal operation` when a row is evaluated.
+Notes on the edges:
+
+- A `DATE`/`DATETIME` difference collapses both sides to a calendar date first, so
+  `datetime('2024-01-20T10:00:00') - datetime('2024-01-15T08:00:00')` is `P5D`, not
+  `P5DT2H`. Tracked as `bug-datetime-difference-drops-time-of-day`.
+- `TIMESPAN / 0` and a ratio involving calendar units (years/months/weeks, which have no
+  fixed length without a reference date) both return NULL rather than raising.
+- The `number` side must be a JS `number`; a value past 2^53 arrives as a `bigint` and is
+  rejected as unsupported.
+- **TIMESTAMP is deliberately not in the table.** It is an integer instant rather than a
+  string temporal, so `ts_col + 1` is ordinary integer arithmetic and keeps the runtime
+  path it always had.
+- An operand whose declared type settles nothing — TEXT, ANY, a plugin-registered type,
+  or a plugin type that shadows a built-in temporal name (a different object, so identity
+  fails) — selects no case at plan time. The runtime still classifies that operand by
+  value, so `timespan('PT1H') + 'PT1H'` is still `'PT2H'`.
+
 **Two families of date/time functions, typed differently.** The single-argument
 conversion functions `date(x)`, `time(x)`, `datetime(x)` (`func/builtins/conversion.ts`)
 return DATE / TIME / DATETIME and produce each type's canonical spelling. The
@@ -1407,6 +1457,7 @@ The parameter type system provides significant performance benefits:
 - `src/types/registry.ts` - Type registry and lookup
 - `src/types/builtin-types.ts` - Built-in type definitions (INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, DATETIME, TIMESPAN)
 - `src/types/temporal-types.ts` - Temporal type implementations
+- `src/types/temporal-ops.ts` - The temporal arithmetic operation table (result type + evaluation for each `(operator, kind, kind)`), read by both `BinaryOpNode.generateType` and `tryTemporalArithmetic`
 - `src/func/builtins/conversion.ts` - Type conversion functions
 
 **Type Inference**:

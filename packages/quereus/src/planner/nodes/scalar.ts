@@ -11,6 +11,7 @@ import { StatusCode } from '../../common/types.js';
 import { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE } from "../../types/builtin-types.js";
 import { JSON_TYPE } from "../../types/json-type.js";
 import { typeRegistry } from "../../types/registry.js";
+import { temporalKindOfType, temporalOpCase } from "../../types/temporal-ops.js";
 import { castedScalarType } from "../../types/cast-semantics.js";
 import { collationConflictError, isComparisonOperator, mergePropagatedCollation, resolveComparisonCollation } from "../analysis/comparison-collation.js";
 
@@ -201,7 +202,21 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 			case '-':
 			case '*':
 			case '/':
-			case '%':
+			case '%': {
+				// Temporal arithmetic first: the one table both the planner and the
+				// evaluator read (types/temporal-ops.ts) says what each supported
+				// (operator, kind, kind) combination produces — `date - date` is a
+				// TIMESPAN, `timespan / timespan` a REAL. Two numeric operands never
+				// produce a case, so this is inert for ordinary arithmetic.
+				const leftKind = temporalKindOfType(leftType.logicalType);
+				const rightKind = temporalKindOfType(rightType.logicalType);
+				const temporalCase = leftKind && rightKind
+					? temporalOpCase(this.expression.operator, leftKind, rightKind)
+					: undefined;
+				if (temporalCase) {
+					logicalType = temporalCase.resultType;
+					break;
+				}
 				// Arithmetic operators - implement numeric type promotion
 				// Rules: INTEGER + INTEGER -> INTEGER, INTEGER + REAL -> REAL, REAL + REAL -> REAL
 				if (leftType.logicalType.isNumeric && rightType.logicalType.isNumeric) {
@@ -218,6 +233,7 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 					logicalType = leftType.logicalType;
 				}
 				break;
+			}
 			case '||':
 				// String concatenation
 				logicalType = TEXT_TYPE;
