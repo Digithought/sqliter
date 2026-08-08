@@ -63,3 +63,12 @@ the observable type of an existing expression.
 This is pre-existing and independent of the text-conversion fix; it was found
 while reviewing it. Nothing in the current test suite covers a large
 floating-point value written to an `INTEGER` column.
+
+## Superseded
+
+`implement/integer-canonical-representation` fixes this as a consequence of the
+canonical-representation rule it lands: `INTEGER_TYPE.parse`'s number arm widens a finite
+whole value past the safe-integer boundary to an exact `bigint`, which `validate` already
+accepts. It also answers the open question above — yes, `cast(1e20 as integer)` returns an
+exact integer — and carries this ticket's repro as a test. That ticket deletes this file
+when the fix lands; if it is dropped instead, this stays live on its own merits.

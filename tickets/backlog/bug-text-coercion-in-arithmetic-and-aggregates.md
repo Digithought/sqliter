@@ -79,3 +79,11 @@ opt out of the conversion, and both the stream and hash aggregate paths apply it
   between "what does this text mean as a number" and "which aggregates want a number" first.
 - Whatever lands, `min`/`max` must agree with `ORDER BY`, which is the invariant to write a
   test against — not the specific values above.
+- **Arm A's target representation is settled elsewhere.**
+  `implement/integer-canonical-representation` writes down the rule for which JavaScript
+  form a whole number takes (`number` inside the safe-integer range, exact `bigint` outside)
+  and canonicalizes the arithmetic paths, `mixedBigIntArithmetic` included. It deliberately
+  does **not** touch `coerceToNumberForArithmetic` / `tryCoerceToNumber`, which is this
+  ticket's arm A: those still return `number` and still round. Land that first and arm A
+  becomes "widen the return type of the text→number coercion to `number | bigint` and
+  produce the canonical form", with the rule already decided and documented.
