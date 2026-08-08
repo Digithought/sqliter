@@ -56,8 +56,7 @@ src/
 │   └── cache/                # Plan cache
 ├── runtime/
 │   ├── emit/                 # Instruction emitters (mirrors planner/nodes/)
-│   ├── cache/                # Runtime caching
-│   └── functions/            # Runtime function dispatch
+│   └── cache/                # Runtime caching
 ├── emit/                     # Top-level emitter entry (plan → instructions)
 ├── schema/                   # Catalog, schema manager, table/column/view/assertion defs
 ├── types/                    # Type system (logical types, registry, temporal, JSON)

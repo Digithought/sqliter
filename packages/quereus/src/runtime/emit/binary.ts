@@ -163,13 +163,12 @@ export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
 					return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
 				} else {
-					try {
-						const result = inner(v1 as number, v2 as number);
-						if (!Number.isFinite(result)) return null;
-						return result;
-					} catch {
-						return null;
-					}
+					// No try/catch: `inner` over plain numbers cannot throw (division by
+					// zero yields Infinity/NaN, caught by the finite check below); only
+					// the bigint arm above can throw (handled inside mixedBigIntArithmetic).
+					const result = inner(v1 as number, v2 as number);
+					if (!Number.isFinite(result)) return null;
+					return result;
 				}
 			}
 			return null;
@@ -343,44 +342,59 @@ export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 	};
 }
 
+/** Truth-table combine for a single logical operator, over already-truthiness-coerced
+ *  operands (`null` = SQL NULL). Selected once at emit time by {@link selectLogicalCombine}
+ *  so the per-row path never re-dispatches on the operator string. */
+type LogicalCombine = (b1: boolean | null, b2: boolean | null) => SqlValue;
+
+/** false dominates; else NULL if any operand is NULL; else true. */
+const combineAnd: LogicalCombine = (b1, b2) => {
+	if (b1 === false || b2 === false) return false;
+	if (b1 === null || b2 === null) return null;
+	return true;
+};
+
+/** true dominates; else NULL if any operand is NULL; else false. */
+const combineOr: LogicalCombine = (b1, b2) => {
+	if (b1 === true || b2 === true) return true;
+	if (b1 === null || b2 === null) return null;
+	return false;
+};
+
+/** NULL with anything -> NULL; else logical inequality. */
+const combineXor: LogicalCombine = (b1, b2) => {
+	if (b1 === null || b2 === null) return null;
+	return b1 !== b2;
+};
+
+function selectLogicalCombine(operator: string, plan: BinaryOpNode): LogicalCombine {
+	switch (operator) {
+		case 'AND': return combineAnd;
+		case 'OR': return combineOr;
+		case 'XOR': return combineXor;
+		default:
+			quereusError(`Unsupported logical operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
+	}
+}
+
 export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
 	// Normalize operator to uppercase for case-insensitive matching
 	const operator = plan.expression.operator.toUpperCase();
 
-	// SQL three-valued-logic combine — single source of truth shared by the eager
-	// `run` and the deferred `runShortCircuit` path, so the two cannot diverge (the
-	// parity tests in test/and-or-short-circuit.spec.ts guard exactly this). Coerce
-	// non-NULL operands to a boolean using SQL truthiness (isTruthy) rather than JS
-	// truthiness so that values like blobs and non-numeric strings agree with how
-	// FilterNode/CASE/NOT treat them — otherwise `<blob> AND true` and a bare
-	// `<blob>` predicate diverge.
+	// Resolved once at emit time (not per row) — single source of truth shared by
+	// the eager `run` and the deferred `runShortCircuit` path below, so the two
+	// cannot diverge (the parity tests in test/and-or-short-circuit.spec.ts guard
+	// exactly this).
+	const combine = selectLogicalCombine(operator, plan);
+
+	// Coerce non-NULL operands to a boolean using SQL truthiness (isTruthy) rather
+	// than JS truthiness so that values like blobs and non-numeric strings agree
+	// with how FilterNode/CASE/NOT treat them — otherwise `<blob> AND true` and a
+	// bare `<blob>` predicate diverge.
 	function combineLogical(v1: SqlValue, v2: SqlValue): SqlValue {
 		const b1 = v1 === null ? null : isTruthy(v1);
 		const b2 = v2 === null ? null : isTruthy(v2);
-		switch (operator) {
-			case 'AND': {
-				// false dominates; else NULL if any operand is NULL; else true.
-				if (b1 === false || b2 === false) return false;
-				if (b1 === null || b2 === null) return null;
-				return true;
-			}
-
-			case 'OR': {
-				// true dominates; else NULL if any operand is NULL; else false.
-				if (b1 === true || b2 === true) return true;
-				if (b1 === null || b2 === null) return null;
-				return false;
-			}
-
-			case 'XOR': {
-				// NULL with anything -> NULL; else logical inequality.
-				if (b1 === null || b2 === null) return null;
-				return b1 !== b2;
-			}
-
-			default:
-				quereusError(`Unsupported logical operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
-		}
+		return combine(b1, b2);
 	}
 
 	// Eager two-param combine. Used for XOR (both operands always required) and for

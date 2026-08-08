@@ -11,25 +11,25 @@ import { isScalarFunctionSchema } from '../../schema/function.js';
 /**
  * Default emission logic for scalar function calls.
  * This is exported so custom emitters can call it if needed.
+ *
+ * Assumes `plan.functionSchema` has already been validated as a scalar function
+ * schema by the caller (the entry point {@link emitScalarFunctionCall} checks it
+ * before dispatching here directly or via a `customEmitter`'s `defaultEmit`) —
+ * this function does not repeat the check.
  */
 export function emitScalarFunctionCallDefault(plan: ScalarFunctionCallNode, ctx: EmissionContext): Instruction {
 	const functionName = plan.expression.name.toLowerCase();
-	const functionSchema = plan.functionSchema;
+	const scalarFunction = plan.functionSchema as ScalarFunctionSchema;
 
-	// Validate that it's a scalar function
-	if (!isScalarFunctionSchema(functionSchema)) {
-		throw new QuereusError(`Function ${functionName} is not a scalar function`, StatusCode.ERROR);
+	// Arity is a plan-time fact: the planner resolved this schema by arity, and
+	// `operandExprs` below is built from `plan.operands` — so a mismatch here can
+	// only be an emitter bug, not a per-call condition. Assert once at emit time
+	// instead of re-checking every row.
+	if (scalarFunction.numArgs >= 0 && plan.operands.length !== scalarFunction.numArgs) {
+		throw new QuereusError(`Internal error: function ${functionName} plan has ${plan.operands.length} operands, expected ${scalarFunction.numArgs}`, StatusCode.INTERNAL);
 	}
 
 	function run(_rctx: RuntimeContext, ...args: Array<SqlValue>): OutputValue {
-		// Use the pre-resolved function schema from the plan node
-		const scalarFunction = functionSchema as ScalarFunctionSchema;
-
-		// Validate argument count
-		if (scalarFunction.numArgs >= 0 && args.length !== scalarFunction.numArgs) {
-			throw new QuereusError(`Function ${functionName} called with ${args.length} arguments, expected ${scalarFunction.numArgs}`, StatusCode.ERROR);
-		}
-
 		try {
 			return scalarFunction.implementation(...args);
 		} catch (error: unknown) {
