@@ -1,4 +1,5 @@
-import type { SqlValue } from '../../common/types.js';
+import { StatusCode, type SqlValue } from '../../common/types.js';
+import { QuereusError } from '../../common/errors.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import type { ScalarPlanNode } from '../../planner/nodes/plan-node.js';
@@ -13,13 +14,11 @@ import type { EmissionContext } from '../emission-context.js';
  * rest signature directly — no `asRun`-style cast is needed, and every declared param
  * and the return stay checked against `SqlValue`.
  *
- * NOTE: what a rest signature cannot check is that the body's arity matches
- * `operands.length` — a spec that declares two operands and a body taking one compiles,
- * and the extra value is silently dropped at runtime. `emitLikeOp` deliberately varies
- * its arity between the two paths, so the mismatch is not statically detectable in
- * general. Today the eleven specs are short enough to eyeball; if the set grows or a
- * spec starts computing its operand list conditionally, add a runtime assert in
- * {@link emitScalarOp} comparing `spec.operands.length` to `spec.run.length`.
+ * What a rest signature cannot check is that the body's arity matches `operands.length`
+ * — a spec declaring two operands with a body taking one compiles, and the extra value
+ * is silently dropped at runtime. `buildLikeOpSpec` varies both together between its two
+ * paths, so the pairing is not statically detectable in general; {@link assertSpecArity}
+ * checks it at emit time instead.
  *
  * Deliberately NOT widened to `OutputValue`. A spec body that could return a Promise
  * would be unusable by the fusion consumer described on {@link ScalarOpSpec}, so an
@@ -39,7 +38,7 @@ export type ScalarOpRun = (ctx: RuntimeContext, ...args: SqlValue[]) => SqlValue
  * agree exactly, which is why the body lives here and not inside either one.
  *
  * `operands` is the list that becomes `Instruction.params` — NOT the plan node's
- * children. `emitLikeOp`'s constant-pattern fast path bakes its right operand into the
+ * children. `buildLikeOpSpec`'s constant-pattern fast path bakes its right operand into the
  * closure and declares one operand; the spec describes what is actually evaluated.
  */
 export interface ScalarOpSpec {
@@ -48,8 +47,31 @@ export interface ScalarOpSpec {
 	readonly note: string;
 }
 
+/**
+ * Emit-time guard that a spec's body takes exactly one parameter per declared operand,
+ * plus the leading context. A mismatch is an emitter bug, not a per-row condition, and
+ * it is otherwise silent: the scheduler spreads `params.length` args into a body that
+ * ignores the tail, and a fused call would drop the same values.
+ *
+ * NOTE: a body with a rest signature (`(ctx, ...args)`) or a defaulted parameter reports
+ * a `Function.length` that stops short, so it trips this. No spec is variadic today —
+ * `emitScalarFunctionCallDefault`, the one variadic scalar body, deliberately stays off
+ * `ScalarOpSpec`. A future variadic spec needs an explicit opt-out here, not a weakened
+ * check for everyone.
+ */
+function assertSpecArity(spec: ScalarOpSpec): void {
+	const expected = spec.operands.length + 1;
+	if (spec.run.length !== expected) {
+		throw new QuereusError(
+			`Internal error: scalar op '${spec.note}' declares ${spec.operands.length} operand(s) `
+			+ `but its body takes ${spec.run.length - 1}`,
+			StatusCode.INTERNAL);
+	}
+}
+
 /** Emit a spec as the `Instruction` its emitter returned before this factoring. */
 export function emitScalarOp(spec: ScalarOpSpec, ctx: EmissionContext): Instruction {
+	assertSpecArity(spec);
 	return {
 		params: spec.operands.map(operand => emitPlanNode(operand, ctx)),
 		run: asRun(spec.run),

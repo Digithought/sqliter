@@ -246,10 +246,16 @@ not optional (`emit/bloom-join.ts`).
 #### Scalar emitters: build a `ScalarOpSpec`, don't build the `Instruction`
 
 A **scalar** emitter whose body is synchronous and takes one already-evaluated value per
-operand does not build its own `Instruction`. It splits in two: a `buildXxxSpec(plan, ctx)`
-returning a `ScalarOpSpec` (`emit/scalar-op.ts`) — the operand plan nodes plus the body and
-the note — and a one-line `emitXxx` that calls `emitScalarOp(spec, ctx)`. Only the `emitXxx`
-name is registered; the spec builder is the reusable half.
+operand does not build its own `Instruction`. It splits in two: a `buildXxxSpec(plan)` —
+plus `ctx` only when it resolves collations — returning a `ScalarOpSpec`
+(`emit/scalar-op.ts`), the operand plan nodes plus the body and the note; and a one-line
+`emitXxx` that calls `emitScalarOp(spec, ctx)`. Only the `emitXxx` name is registered; the
+spec builder is the reusable half.
+
+**One spec builder per registered node type.** Where an emitter dispatches internally, the
+dispatch belongs on the spec side, not the `Instruction` side: `emitBinaryOp` is a two-liner
+over `buildBinaryOpSpec`, which owns the operator switch, so a fusion consumer never restates
+which operator routes to which body.
 
 The point is that the body has two consumers: `emitScalarOp` wraps it as an `Instruction`
 the scheduler dispatches, and the scalar-fusion compiler composes it directly into a closure
@@ -258,8 +264,10 @@ as emit-time specializations accumulate (`+(numeric-fast)` vs `+(temporal)`,
 `=(compare-typed)` vs `=(compare-fast)`, `LIKE(like-const)` vs `LIKE(like)`).
 
 `spec.operands` is what becomes `Instruction.params` — **not** the plan node's children.
-`emitLikeOp`'s constant-pattern fast path bakes the pattern into its closure and declares
-one operand while the plan node still has two.
+`buildLikeOpSpec`'s constant-pattern fast path bakes the pattern into its closure and declares
+one operand while the plan node still has two. The body must declare exactly one parameter per
+operand (plus the leading context); `emitScalarOp` asserts that at emit time, since a short
+body would otherwise silently ignore the values it was handed.
 
 Two shapes stay off the spec, and their builders return `undefined` (or there is no builder)
 so a fusion consumer knows to decline:

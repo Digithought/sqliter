@@ -4,7 +4,8 @@ import type { SqlValue } from '../src/common/types.js';
 import { programOf as dumpProgram } from './util/debug-program.js';
 
 /**
- * AND/OR short-circuit deferral (runtime/emit/binary.ts `emitLogicalOp`).
+ * AND/OR short-circuit deferral (runtime/emit/binary.ts `buildLogicalOpSpec` /
+ * `emitShortCircuitLogicalOp`).
  *
  * When an AND/OR right operand contains a subquery, it is emitted as an
  * on-demand callback and evaluated only when the left operand does not already

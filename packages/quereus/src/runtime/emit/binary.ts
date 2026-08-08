@@ -20,7 +20,18 @@ import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithme
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
 import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 
-export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+/**
+ * Operator dispatch for a binary node — the single entry point both consumers share, so
+ * neither has to restate which operator routes to which body. `undefined` means the node
+ * has no {@link ScalarOpSpec}: today that is exactly the AND/OR short-circuit form, whose
+ * right operand is a deferred sub-program rather than a value (see
+ * {@link buildLogicalOpSpec}). A fusion consumer treats `undefined` as "do not fuse";
+ * {@link emitBinaryOp} falls back to {@link emitShortCircuitLogicalOp}.
+ *
+ * An unsupported operator throws here rather than returning `undefined` — that is an
+ * unimplemented operator, not a node that declines to fuse.
+ */
+export function buildBinaryOpSpec(plan: BinaryOpNode, ctx: EmissionContext): ScalarOpSpec | undefined {
 	// Normalize operator to uppercase for case-insensitive matching of keywords
 	const operator = plan.expression.operator.toUpperCase();
 
@@ -30,7 +41,7 @@ export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 		case '*':
 		case '/':
 		case '%':
-			return emitNumericOp(plan, ctx);
+			return buildNumericOpSpec(plan);
 		case '=':
 		case '==':
 		case '!=':
@@ -39,19 +50,24 @@ export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 		case '<=':
 		case '>':
 		case '>=':
-			return emitComparisonOp(plan, ctx);
+			return buildComparisonOpSpec(plan, ctx);
 		case '||':
-			return emitConcatOp(plan, ctx);
+			return buildConcatOpSpec(plan);
 		case 'AND':
 		case 'OR':
 		case 'XOR':
-			return emitLogicalOp(plan, ctx);
+			return buildLogicalOpSpec(plan);
 		case 'LIKE':
-			return emitLikeOp(plan, ctx);
-		// TODO: emitBitwise
+			return buildLikeOpSpec(plan);
+		// TODO: bitwise operators
 		default:
 			quereusError(`Unsupported binary operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
 	}
+}
+
+export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	const spec = buildBinaryOpSpec(plan, ctx);
+	return spec ? emitScalarOp(spec, ctx) : emitShortCircuitLogicalOp(plan, ctx);
 }
 
 /** Handle arithmetic when at least one operand is bigint.
@@ -222,10 +238,6 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	};
 }
 
-export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	return emitScalarOp(buildNumericOpSpec(plan), ctx);
-}
-
 export function buildComparisonOpSpec(plan: BinaryOpNode, ctx: EmissionContext): ScalarOpSpec {
 	const leftType = plan.left.getType();
 	const rightType = plan.right.getType();
@@ -297,10 +309,6 @@ export function buildComparisonOpSpec(plan: BinaryOpNode, ctx: EmissionContext):
 	};
 }
 
-export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	return emitScalarOp(buildComparisonOpSpec(plan, ctx), ctx);
-}
-
 /** Build a function that converts a numeric cmp result to a boolean for the given operator */
 function buildCmpToResult(operator: string, plan: BinaryOpNode): (cmp: number) => boolean {
 	switch (operator) {
@@ -357,10 +365,6 @@ export function buildConcatOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 		run,
 		note: '||(concat)'
 	};
-}
-
-export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	return emitScalarOp(buildConcatOpSpec(plan), ctx);
 }
 
 /** Truth-table combine for a single logical operator, over already-truthiness-coerced
@@ -503,11 +507,6 @@ function emitShortCircuitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): In
 	};
 }
 
-export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	const spec = buildLogicalOpSpec(plan);
-	return spec ? emitScalarOp(spec, ctx) : emitShortCircuitLogicalOp(plan, ctx);
-}
-
 /**
  * If `node` is a literal-constant, non-NULL pattern, return the exact string the
  * per-row path would derive from it ({@link valueToText}), otherwise undefined.
@@ -566,8 +565,3 @@ export function buildLikeOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 		note: 'LIKE(like)'
 	};
 }
-
-export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	return emitScalarOp(buildLikeOpSpec(plan), ctx);
-}
-

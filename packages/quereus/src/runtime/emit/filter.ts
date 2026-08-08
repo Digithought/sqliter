@@ -44,7 +44,7 @@ function evaluatePredicate(rctx: RuntimeContext, predicate: SubProgram): MaybePr
  * predicate used before, so blob / string / numeric truthiness is unchanged.
  *
  * Nested `AND`s that are not at the top level of the predicate (under a `NOT`, inside
- * a `CASE`, below an `OR`) are untouched and still route through `emitLogicalOp`.
+ * a `CASE`, below an `OR`) are untouched and still route through `buildLogicalOpSpec`.
  */
 export function emitFilter(plan: FilterNode, ctx: EmissionContext): Instruction {
 	const sourceInstruction = emitPlanNode(plan.source, ctx);
