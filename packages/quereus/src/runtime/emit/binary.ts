@@ -17,7 +17,7 @@ import { valueToText } from "../../util/value-text.js";
 import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
-import { runTemporalCase, temporalKindOfType, temporalOpCase, unsupportedTemporalOp } from "../../types/temporal-ops.js";
+import { runTemporalCase, temporalOpCaseForTypes, unsupportedTemporalOp } from "../../types/temporal-ops.js";
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
 import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 
@@ -118,6 +118,45 @@ function mixedBigIntArithmetic(
 	return result;
 }
 
+/**
+ * The general arithmetic body: sniff the values for a temporal shape first, then fall back
+ * to coercing numeric arithmetic.
+ *
+ * Two branches of {@link buildNumericOpSpec} share it — the temporal arm whose declared
+ * types settle nothing, and the non-temporal generic path — because value sniffing is the
+ * defined semantics for both. They differ only in the note they carry; keeping one body
+ * means they cannot come to differ in behavior.
+ */
+function buildCoercingArithmeticRun(
+	operator: string,
+	inner: (v1: number, v2: number) => number,
+	innerBigInt: (v1: bigint, v2: bigint) => bigint,
+): (ctx: RuntimeContext, v1: SqlValue, v2: SqlValue) => SqlValue {
+	return function runCoercingArithmetic(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+		const temporalResult = tryTemporalArithmetic(operator, v1, v2);
+		if (temporalResult !== undefined) {
+			return temporalResult;
+		}
+
+		if (v1 !== null && v2 !== null) {
+			if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
+				return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
+			} else {
+				const n1 = coerceToNumberForArithmetic(v1);
+				const n2 = coerceToNumberForArithmetic(v2);
+				try {
+					const result = inner(n1, n2);
+					if (!Number.isFinite(result)) return null;
+					return result;
+				} catch {
+					return null;
+				}
+			}
+		}
+		return null;
+	};
+}
+
 export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	let inner: (v1: number, v2: number) => number;
 	let innerBigInt: (v1: bigint, v2: bigint) => bigint;
@@ -158,12 +197,12 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 		// Temporal path. Both operands' declared logical types are already in hand — that
 		// is *why* this branch was selected — so the (operator, left kind, right kind)
 		// lookup into the operation table (types/temporal-ops.ts) happens once here rather
-		// than once per row. Three arms, chosen at emit:
-		const lk = temporalKindOfType(leftLogical);
-		const rk = temporalKindOfType(rightLogical);
-		const entry = lk && rk ? temporalOpCase(plan.expression.operator, lk, rk) : undefined;
+		// than once per row. Same lookup `BinaryOpNode.generateType` used to announce the
+		// result type, through the same function, so the two cannot select different cases.
+		// Three arms, chosen at emit:
+		const { kinds, entry } = temporalOpCaseForTypes(plan.expression.operator, leftLogical, rightLogical);
 
-		if (lk && rk && entry) {
+		if (kinds && entry) {
 			// (1) Specialized: the case is fixed, so the per-row path is one call into the
 			// shared envelope — no value sniffing at all.
 			//
@@ -175,8 +214,8 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 			run = function runTemporalCased(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 				return runTemporalCase(entry, v1, v2);
 			};
-			note = `${plan.expression.operator}(temporal-${lk}-${rk})`;
-		} else if (lk && rk) {
+			note = `${plan.expression.operator}(temporal-${kinds[0]}-${kinds[1]})`;
+		} else if (kinds) {
 			// (2) Statically unsupported: both kinds are known and the table has no case
 			// for them (DATE + DATE, DATE * NUMBER, TIME − DATE, anything with `%`), so no
 			// combination of runtime values can succeed.
@@ -199,30 +238,9 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 			// (3) Fallback: at least one operand is TEXT / ANY / NULL / TIMESTAMP / a
 			// plugin-registered temporal type, so the declared types cannot settle the
 			// case. Runtime sniffing IS the defined semantics there (a TEXT column holding
-			// a duration string is a supported shape) — body unchanged.
-			run = function runTemporalArithmetic(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
-				const temporalResult = tryTemporalArithmetic(plan.expression.operator, v1, v2);
-				if (temporalResult !== undefined) {
-					return temporalResult;
-				}
-
-				if (v1 !== null && v2 !== null) {
-					if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
-						return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
-					} else {
-						const n1 = coerceToNumberForArithmetic(v1);
-						const n2 = coerceToNumberForArithmetic(v2);
-						try {
-							const result = inner(n1, n2);
-							if (!Number.isFinite(result)) return null;
-							return result;
-						} catch {
-							return null;
-						}
-					}
-				}
-				return null;
-			};
+			// a duration string is a supported shape), so this arm is the generic body
+			// below under a different note — same function, so they cannot drift.
+			run = buildCoercingArithmeticRun(plan.expression.operator, inner, innerBigInt);
 			note = `${plan.expression.operator}(temporal)`;
 		}
 	} else if (leftLogical.isNumeric && rightLogical.isNumeric) {
@@ -251,29 +269,7 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 		note = `${plan.expression.operator}(numeric-fast)`;
 	} else {
 		// Generic path: temporal check + coercion (for TEXT or mixed types)
-		run = function runGenericArithmetic(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
-			const temporalResult = tryTemporalArithmetic(plan.expression.operator, v1, v2);
-			if (temporalResult !== undefined) {
-				return temporalResult;
-			}
-
-			if (v1 !== null && v2 !== null) {
-				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
-					return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
-				} else {
-					const n1 = coerceToNumberForArithmetic(v1);
-					const n2 = coerceToNumberForArithmetic(v2);
-					try {
-						const result = inner(n1, n2);
-						if (!Number.isFinite(result)) return null;
-						return result;
-					} catch {
-						return null;
-					}
-				}
-			}
-			return null;
-		};
+		run = buildCoercingArithmeticRun(plan.expression.operator, inner, innerBigInt);
 		note = `${plan.expression.operator}(numeric)`;
 	}
 

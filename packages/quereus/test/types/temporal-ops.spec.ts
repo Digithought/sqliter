@@ -5,6 +5,7 @@ import {
 	temporalKindOfType,
 	temporalKindOfValue,
 	temporalOpCase,
+	temporalOpCaseForTypes,
 	temporalOpCaseKeys,
 	unsupportedTemporalOp,
 	type TemporalOperandKind,
@@ -121,6 +122,49 @@ describe('temporal operation table', () => {
 		it('does not classify a plugin type that shadows a built-in temporal name', () => {
 			const impostor: LogicalType = { name: 'DATE', physicalType: PhysicalType.TEXT, isTemporal: true };
 			expect(temporalKindOfType(impostor)).to.equal(undefined);
+		});
+	});
+
+	// The single route from two declared types to a case. `BinaryOpNode.generateType`
+	// announces `entry.resultType` through it and `buildNumericOpSpec` emits a body that
+	// runs `entry.apply` through it, so its three outcomes are a contract, not an
+	// implementation detail: the two callers branch on exactly these.
+	describe('temporalOpCaseForTypes', () => {
+		it('resolves both kinds and the case when the table has one', () => {
+			const { kinds, entry } = temporalOpCaseForTypes('+', DATE_TYPE, TIMESPAN_TYPE);
+			expect(kinds).to.deep.equal(['date', 'timespan']);
+			expect(entry).to.equal(temporalOpCase('+', 'date', 'timespan'));
+		});
+
+		it('resolves both kinds with no case when the combination is unsupported', () => {
+			const { kinds, entry } = temporalOpCaseForTypes('+', DATE_TYPE, DATE_TYPE);
+			expect(kinds).to.deep.equal(['date', 'date']);
+			expect(entry).to.equal(undefined);
+		});
+
+		it('resolves nothing when either declared type settles nothing', () => {
+			for (const other of [TEXT_TYPE, ANY_TYPE, NULL_TYPE, TIMESTAMP_TYPE]) {
+				expect(temporalOpCaseForTypes('+', other, TIMESPAN_TYPE), `${other.name} on the left`)
+					.to.deep.equal({});
+				expect(temporalOpCaseForTypes('+', TIMESPAN_TYPE, other), `${other.name} on the right`)
+					.to.deep.equal({});
+			}
+		});
+
+		// The planner announces the result type from this lookup and the emitter runs the
+		// body from it. Anything that made them disagree would be a value that does not
+		// match its own declared type, so pin agreement across the whole table.
+		it('gives the planner and the emitter the same case for every table entry', () => {
+			const TYPE_OF_KIND: Record<TemporalOperandKind, LogicalType> = {
+				date: DATE_TYPE, time: TIME_TYPE, datetime: DATETIME_TYPE,
+				timespan: TIMESPAN_TYPE, number: INTEGER_TYPE,
+			};
+			for (const tableKey of temporalOpCaseKeys()) {
+				const [operator, left, right] = tableKey.split('|') as [string, TemporalOperandKind, TemporalOperandKind];
+				const { kinds, entry } = temporalOpCaseForTypes(operator, TYPE_OF_KIND[left], TYPE_OF_KIND[right]);
+				expect(kinds, tableKey).to.deep.equal([left, right]);
+				expect(entry, tableKey).to.equal(temporalOpCase(operator, left, right));
+			}
 		});
 	});
 

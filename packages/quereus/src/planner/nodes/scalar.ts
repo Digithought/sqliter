@@ -11,7 +11,7 @@ import { StatusCode } from '../../common/types.js';
 import { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE } from "../../types/builtin-types.js";
 import { JSON_TYPE } from "../../types/json-type.js";
 import { typeRegistry } from "../../types/registry.js";
-import { temporalKindOfType, temporalOpCase } from "../../types/temporal-ops.js";
+import { temporalOpCaseForTypes } from "../../types/temporal-ops.js";
 import { castedScalarType } from "../../types/cast-semantics.js";
 import { collationConflictError, isComparisonOperator, mergePropagatedCollation, resolveComparisonCollation } from "../analysis/comparison-collation.js";
 
@@ -208,11 +208,8 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 				// (operator, kind, kind) combination produces — `date - date` is a
 				// TIMESPAN, `timespan / timespan` a REAL. Two numeric operands never
 				// produce a case, so this is inert for ordinary arithmetic.
-				const leftKind = temporalKindOfType(leftType.logicalType);
-				const rightKind = temporalKindOfType(rightType.logicalType);
-				const temporalCase = leftKind && rightKind
-					? temporalOpCase(this.expression.operator, leftKind, rightKind)
-					: undefined;
+				const { entry: temporalCase } = temporalOpCaseForTypes(
+					this.expression.operator, leftType.logicalType, rightType.logicalType);
 				if (temporalCase) {
 					logicalType = temporalCase.resultType;
 					break;

@@ -448,16 +448,35 @@ gate on it. Two consequences worth stating explicitly:
 **Temporal arithmetic: one table, read by both the planner and the evaluator.**
 Which `(operator, left operand, right operand)` combinations exist, what each produces,
 and what result type each announces all live in a single table,
-`src/types/temporal-ops.ts`. `BinaryOpNode.generateType` reads `resultType` from it —
-classifying each operand by identity against the registered singletons — and
-`tryTemporalArithmetic` (`runtime/emit/temporal-arithmetic.ts`) runs the same table's
-`apply`, classifying each operand by the shape of the runtime value. Because both sides
-read one description, the type an expression *announces* predicts the value it
-*produces*; before the table existed the planner announced the left operand's type for
-every temporal pair, so `date - date` claimed DATE while yielding a duration string, and
-downstream consumers of the declared type (the numeric fast path, `create table … as
-select`, view column types, `Statement.getColumnType()`) were reading a type that did not
-hold.
+`src/types/temporal-ops.ts`. Because every side reads one description, the type an
+expression *announces* predicts the value it *produces*; before the table existed the
+planner announced the left operand's type for every temporal pair, so `date - date`
+claimed DATE while yielding a duration string, and downstream consumers of the declared
+type (the numeric fast path, `create table … as select`, view column types,
+`Statement.getColumnType()`) were reading a type that did not hold.
+
+There are two routes into the table, and which one an expression takes is decided once,
+at plan/emit time, from the operands' **declared** types:
+
+- **From declared types** — `temporalOpCaseForTypes` classifies each operand by identity
+  against the registered singletons. `BinaryOpNode.generateType` announces the case's
+  `resultType`, and the emitter (`buildNumericOpSpec`, `runtime/emit/binary.ts`) bakes the
+  same case into the per-row body so no classification happens while rows flow. Both call
+  the one function, so the announced type and the executed case cannot disagree. When both
+  kinds are known and the table has *no* case, the emitted body is a NULL check plus a
+  constant throw — still raised per row, so a guarded or filtered-out occurrence keeps
+  succeeding.
+- **From runtime values** — when a declared type settles nothing (TEXT, ANY, NULL,
+  TIMESTAMP, a plugin-registered type), `tryTemporalArithmetic`
+  (`runtime/emit/temporal-arithmetic.ts`) classifies each operand by the shape of the
+  value instead, per row. That *is* the defined semantics there: a TEXT column holding a
+  duration string is a supported shape.
+
+The declared-type route trusts the declaration: an operand typed DATE that somehow held a
+non-parseable string would yield NULL where value classification raised `Unsupported
+temporal operation`. Write-side coercion enforces declared types on every path SQL can
+reach (a bad INSERT is rejected, a failed CAST is NULL), so only a misbehaving virtual
+table can produce such a value.
 
 The operand kinds are `date`, `time`, `datetime`, `timespan`, and `number`. Supported
 combinations:
@@ -1460,7 +1479,7 @@ The parameter type system provides significant performance benefits:
 - `src/types/registry.ts` - Type registry and lookup
 - `src/types/builtin-types.ts` - Built-in type definitions (INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, DATETIME, TIMESPAN)
 - `src/types/temporal-types.ts` - Temporal type implementations
-- `src/types/temporal-ops.ts` - The temporal arithmetic operation table (result type + evaluation for each `(operator, kind, kind)`), read by both `BinaryOpNode.generateType` and `tryTemporalArithmetic`
+- `src/types/temporal-ops.ts` - The temporal arithmetic operation table (result type + evaluation for each `(operator, kind, kind)`), read from declared types by `temporalOpCaseForTypes` (`BinaryOpNode.generateType` and `buildNumericOpSpec`) and from runtime values by `tryTemporalArithmetic`
 - `src/func/builtins/conversion.ts` - Type conversion functions
 
 **Type Inference**:

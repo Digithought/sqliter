@@ -612,6 +612,88 @@ SELECT id, txt + sp AS r FROM arms ORDER BY id;
 SELECT id, dt + sp - dt2 + sp2 AS r FROM arms ORDER BY id;
 → [{"id":1,"r":"P6DT12H"},{"id":2,"r":"P31DT6H"}]
 
+-- ============================================================
+-- arm 1, the rest of the operation table, over COLUMNS
+--
+-- The cases above reach four of the table's entries. The remainder — TIME and
+-- DATETIME shifts, the commuted TIMESPAN-first forms, mixed DATE/DATETIME
+-- differences, and the two division cases — are otherwise pinned only by literal
+-- expressions, which constant-fold before a row is scanned. These run them per row,
+-- so a wrong entry in the emit-time lookup cannot hide behind the folder.
+-- ============================================================
+
+CREATE TABLE arms2 (
+  id INTEGER PRIMARY KEY,
+  dt DATE,
+  dtm DATETIME, dtm2 DATETIME,
+  tm TIME, tm2 TIME,
+  sp TIMESPAN, sp2 TIMESPAN,
+  n INTEGER
+);
+INSERT INTO arms2 VALUES
+  (1, '2024-01-15', '2024-01-20T08:15:00', '2024-01-10T06:00:00', '10:30:00', '08:00:00', 'PT1H30M', 'PT30M', 3);
+-- run
+
+-- TIME ± TIMESPAN, and the commuted TIMESPAN + TIME
+SELECT tm + sp AS a, tm - sp AS b, sp + tm AS c FROM arms2;
+→ [{"a":"12:00:00","b":"09:00:00","c":"12:00:00"}]
+
+-- DATETIME ± TIMESPAN, and the commuted TIMESPAN + DATETIME
+SELECT dtm + sp AS a, dtm - sp AS b, sp + dtm AS c FROM arms2;
+→ [{"a":"2024-01-20T09:45:00","b":"2024-01-20T06:45:00","c":"2024-01-20T09:45:00"}]
+
+-- the commuted TIMESPAN + DATE. PT30M carries no whole days, and a DATE has no time
+-- of day to carry them into, so the date is unchanged — the same sub-day truncation
+-- `date('2024-01-15') + timespan('PT30M')` shows as a literal.
+SELECT sp2 + dt AS r FROM arms2;
+→ [{"r":"2024-01-15"}]
+
+-- TIME - TIME
+SELECT tm - tm2 AS r FROM arms2;
+→ [{"r":"PT2H30M"}]
+
+-- the three mixed DATE/DATETIME differences (all collapse to whole days — see the
+-- NOTE on dateDifference in types/temporal-ops.ts)
+SELECT dtm - dtm2 AS a, dtm - dt AS b, dt - dtm2 AS c FROM arms2;
+→ [{"a":"P10D","b":"P5D","c":"P5D"}]
+
+-- TIMESPAN ± TIMESPAN
+SELECT sp + sp2 AS a, sp - sp2 AS b FROM arms2;
+→ [{"a":"PT2H","b":"PT1H"}]
+
+-- TIMESPAN / TIMESPAN announces REAL, TIMESPAN / NUMBER announces TIMESPAN,
+-- and NUMBER * TIMESPAN is the commuted scale case
+SELECT sp / sp2 AS a, sp / n AS b, n * sp AS c FROM arms2;
+→ [{"a":3,"b":"PT1800S","c":"PT16200S"}]
+
+-- A view body is emitted like any other scalar op, so the specialized arm applies there too
+CREATE VIEW arms2_v AS SELECT id, dtm + sp AS shifted FROM arms2;
+-- run
+SELECT shifted FROM arms2_v;
+→ [{"shifted":"2024-01-20T09:45:00"}]
+DROP VIEW arms2_v;
+
+DROP TABLE arms2;
+
+-- A CHECK constraint is another scalar-op site: the specialized body decides the verdict
+CREATE TABLE arm_check (
+  id INTEGER PRIMARY KEY,
+  dt DATE,
+  sp TIMESPAN,
+  CHECK (dt + sp > dt)
+);
+-- run
+INSERT INTO arm_check VALUES (1, '2024-01-15', 'P1D');
+-- run
+SELECT dt + sp AS r FROM arm_check;
+→ [{"r":"2024-01-16"}]
+
+-- a negative shift moves the date backwards, so the constraint rejects the row
+INSERT INTO arm_check VALUES (2, '2024-01-15', '-P1D');
+-- error: CHECK constraint
+
+DROP TABLE arm_check;
+
 -- arm 2: no case for DATE + DATE. The throw is per row, not at emit — so a query
 -- that never evaluates the expression still succeeds (next three).
 SELECT id, dt + dt2 AS r FROM arms ORDER BY id;

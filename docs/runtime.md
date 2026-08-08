@@ -272,7 +272,7 @@ re-deciding per row. The tag inside the note names which body was picked, so
 | --- | --- | --- |
 | `+(numeric-fast)` | both operands numeric, neither temporal | the temporal probe and arithmetic coercion |
 | `+(numeric)` | anything else non-temporal (TEXT, mixed) | — (the general body) |
-| `+(temporal-date-timespan)` | both operands' temporal kinds resolve **and** `types/temporal-ops.ts` has a case for `(operator, left kind, right kind)` | deriving both operand kinds from the values (up to four shape probes each) before the same table lookup |
+| `+(temporal-date-timespan)` | `temporalOpCaseForTypes` resolves both operand kinds **and** `types/temporal-ops.ts` has a case for `(operator, left kind, right kind)` — the same lookup the planner announced the result type from | deriving both operand kinds from the values (up to four shape probes each) before the same table lookup |
 | `+(temporal-unsupported)` | both kinds resolve and the table has **no** case (`date + date`, `date * number`, anything with `%`) | as above; the body is a NULL check plus a constant throw. The throw stays at *runtime* deliberately — a guarded, filtered-out, or empty-table occurrence must keep succeeding |
 | `+(temporal)` | at least one declared type settles nothing: TEXT, ANY, NULL, TIMESTAMP, or a plugin-registered temporal type | nothing — runtime value sniffing *is* the defined semantics there |
 | `=(compare-typed)` | both operands the same logical type with semantic ordering (TIMESPAN, JSON) | the generic compare and its temporal probe |

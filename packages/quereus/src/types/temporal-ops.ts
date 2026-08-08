@@ -10,11 +10,13 @@ import { REAL_TYPE } from './builtin-types.js';
  * The single table of supported temporal arithmetic operations, keyed by
  * `(operator, left operand kind, right operand kind)`.
  *
- * Two callers read it, and they must agree:
- *  - the planner (`BinaryOpNode.generateType`) announces `resultType`, deriving the
- *    operand kinds from the operands' *declared* logical types;
- *  - the runtime (`tryTemporalArithmetic`, and the emit-time specialization built on
- *    top of it) runs `apply`, deriving the operand kinds from the *values*.
+ * Two ways in, and they must agree:
+ *  - from *declared* logical types, via {@link temporalOpCaseForTypes} — the planner
+ *    (`BinaryOpNode.generateType`) announces the case's `resultType` and the emitter
+ *    (`buildNumericOpSpec`) bakes the same case's `apply` into the per-row body. One
+ *    function for both, so the announced type and the executed case cannot diverge;
+ *  - from the *values*, via `tryTemporalArithmetic` — the per-row path taken only when a
+ *    declared type settles nothing (TEXT / ANY / NULL / TIMESTAMP / a plugin type).
  *
  * Before this table existed, the set of supported combinations lived only as control
  * flow inside `tryTemporalArithmetic`, so the planner could not consult it and
@@ -357,6 +359,39 @@ export function temporalOpCase(
 	right: TemporalOperandKind,
 ): TemporalOpCase | undefined {
 	return TEMPORAL_OP_CASES.get(key(operator, left, right));
+}
+
+/**
+ * What a pair of DECLARED logical types settles about the operation, resolved once at
+ * plan/emit time.
+ *
+ * `kinds` absent means at least one declared type settles nothing (TEXT / ANY / NULL /
+ * TIMESTAMP / a plugin-registered type), so the caller must derive the kinds from the
+ * runtime values instead. `kinds` present with `entry` absent means both kinds are known
+ * and the table has no case for them — statically unsupported, whatever the values are.
+ */
+export interface TemporalTypeLookup {
+	readonly kinds?: readonly [TemporalOperandKind, TemporalOperandKind];
+	readonly entry?: TemporalOpCase;
+}
+
+/**
+ * The one route from two declared logical types to a case.
+ *
+ * Two callers must reach the same answer or the announced result type stops predicting
+ * the value: `BinaryOpNode.generateType` announces `entry.resultType`, and
+ * `buildNumericOpSpec`'s temporal branch emits a body that runs `entry.apply`. Neither
+ * re-spells the kind derivation, so the two cannot come to select different entries.
+ */
+export function temporalOpCaseForTypes(
+	operator: string,
+	left: LogicalType,
+	right: LogicalType,
+): TemporalTypeLookup {
+	const lk = temporalKindOfType(left);
+	const rk = temporalKindOfType(right);
+	if (!lk || !rk) return {};
+	return { kinds: [lk, rk], entry: temporalOpCase(operator, lk, rk) };
 }
 
 /** Test-only view of the table's keys, so a spec can assert its shape without re-listing it. */
