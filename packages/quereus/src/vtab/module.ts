@@ -71,6 +71,31 @@ export interface SupportAssessment {
  * Interface defining the methods for a virtual table module implementation.
  * The module primarily acts as a factory for connection-specific VirtualTable instances.
  *
+ * **Row representation obligation.** Every cell of every row a table of this module yields
+ * from `query()` must already be in the JavaScript form its DECLARED column type calls for
+ * — the engine does not coerce read rows, because doing so would cost per row on every
+ * scan for no gain on a conforming module. Concretely (full rules in `docs/types.md`
+ * § Physical representation):
+ *
+ * - a whole number is a JS `number` while its magnitude stays inside the safe-integer
+ *   range (|v| ≤ 2^53 − 1) and a `bigint` only outside it — one form per value, both
+ *   directions. `BigInt(x)` around a small integer is the common way to get this wrong;
+ *   `canonicalizeInteger` / `canonicalizeSqlValue` (`util/numeric-canonical.ts`) are
+ *   exported to get it right;
+ * - an INTEGER or TIMESTAMP column holds `number`/`bigint` by that rule, REAL holds
+ *   `number`, TEXT and the string temporals (DATE/TIME/DATETIME/TIMESPAN) hold `string`,
+ *   BLOB holds `Uint8Array`, BOOLEAN holds `boolean`, JSON holds a native object/array or
+ *   a JSON scalar. `null` is always allowed here — nullability is enforced separately;
+ * - an `ANY` column is bound by the numeric rule only.
+ *
+ * This is a contract, not a capability: there is no flag to declare it and no alternate
+ * code path for a module that does not honor it. A module that returns a non-conforming
+ * value produces answers that are right today and subtly wrong under a later
+ * representation-sensitive change. Verify with `QUEREUS_REPR_STRICT=1`, which checks every
+ * scanned row against the declared column types and throws naming the module, table,
+ * column and type (`runtime/strict-representation.ts`). The same obligation applies to the
+ * rows a module reports back from `update()`.
+ *
  * @template TTable The specific type of VirtualTable managed by this module.
  * @template TConfig The type defining module-specific configuration options.
  */

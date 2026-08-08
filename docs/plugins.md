@@ -471,6 +471,17 @@ Rules:
 
 Older documentation showed `returnType: { typeClass: 'scalar', sqlType: 'TEXT' }` and relation columns typed `{ name: 'v', type: 'INTEGER' }`. Neither shape has ever been read by the engine; both are now rejected at registration.
 
+#### Returning values in the right JavaScript form
+
+A declared `returnType` is a promise about the *value*, not only about the plan. The engine does not coerce what a function returns — coercing every call would cost on every row for no gain on a correct function — so an implementation must hand back the JavaScript form its declared type calls for. The rules are in [types.md § Physical representation](./types.md#physical-representation); the two that catch people out:
+
+- **One JavaScript form per whole number.** A whole number is a `number` while its magnitude stays inside the safe-integer range (|v| ≤ 2<sup>53</sup> − 1) and a `bigint` only outside it. Wrapping a small result in `BigInt(...)` is a violation even though the value is right — `canonicalizeInteger` and `canonicalizeSqlValue` (exported from the package) return the canonical form. A function declaring INTEGER may return either form under that rule; one declaring REAL must return a `number`.
+- **Most temporal types are physically text.** A DATE / TIME / DATETIME / TIMESPAN value is a `string`, not a `Temporal` object. TIMESTAMP is the exception: it is an integer instant and takes INTEGER's rule. A JSON *scalar* is likewise a plain `string` / `number` / `boolean`, not a wrapped object.
+
+`null` is always acceptable regardless of the declared type — nullability is a separate contract. Declaring no `returnType` (ANY) still binds you to the numeric rule, which holds for every value everywhere in the engine.
+
+Run your plugin's tests with `QUEREUS_REPR_STRICT=1` to check this: the engine then verifies every scalar function's returned value against its declared return type and throws naming the function and the offending form. Functions supplying a `customEmitter` build their own runtime path and are not covered by that check.
+
 ### Variable Arguments
 
 Use `numArgs: -1` for variadic functions:

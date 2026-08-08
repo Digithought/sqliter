@@ -10,6 +10,8 @@ import { emitPlanNode } from '../runtime/emitters.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { InstructionTracer, RuntimeContext } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
+import { REPR_STRICT } from '../runtime/strict-flags.js';
+import { assertCanonicalValue } from '../runtime/strict-representation.js';
 import { Cached } from '../util/cached.js';
 import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
@@ -441,6 +443,35 @@ export class Statement {
 	 * @internal
 	 */
 	private async *_iterateWithSignal(source: AsyncIterable<Row>, signal?: AbortSignal): AsyncIterable<Row> {
+		if (REPR_STRICT) {
+			// QUEREUS_REPR_STRICT backstop seam: rows yielded to the caller. This is the only
+			// one of the four seams that sees an EXPRESSION producing a non-canonical value
+			// (an arithmetic path that forgot to narrow) — the scan, write and UDF seams all
+			// sit upstream of it.
+			//
+			// R1 ONLY, deliberately. R2 is a rule about *declared* types — a column's DDL type
+			// — and a projection's `ScalarType` is not one: it is the planner's static
+			// INFERENCE, and the engine never coerces a projection's output to it. The two
+			// legitimately disagree all over the suite (`select ? as v` infers TEXT for an
+			// untyped parameter and yields a number; a comparison infers TEXT and yields a
+			// boolean; `sum(v)` infers REAL and yields a bigint past 2^53). Asserting R2 here
+			// would report the inference, not a representation defect. The declared-type
+			// checks live at the seams that actually have a declared type: the vtab scan and
+			// the DML write.
+			//
+			// NOTE: that the inferred scalar type so often disagrees with the runtime storage
+			// class is itself worth knowing — `Statement.getColumnType()` reports it to
+			// embedders. Tracked as `backlog/bug-inferred-scalar-type-disagrees-with-runtime-value`.
+			const reprNames = this.columnDefCache.value.map(col => col.name);
+			for await (const row of source) {
+				if (signal) throwIfAborted(signal);
+				for (let i = 0; i < row.length; i++) {
+					assertCanonicalValue(row[i], `the statement result row column ${i} (${reprNames[i] ?? '?'})`);
+				}
+				yield row;
+			}
+			return;
+		}
 		if (!signal) {
 			yield* source;
 			return;

@@ -3,7 +3,9 @@ import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitPlanNode, createValidatedInstruction } from '../emitters.js';
 import { QuereusError } from '../../common/errors.js';
-import { StatusCode, type SqlValue, type OutputValue } from '../../common/types.js';
+import { StatusCode, type MaybePromise, type SqlValue, type OutputValue } from '../../common/types.js';
+import { REPR_STRICT } from '../strict-flags.js';
+import { assertConformsToType } from '../strict-representation.js';
 import type { EmissionContext } from '../emission-context.js';
 import type { ScalarFunctionSchema } from '../../schema/function.js';
 import { isScalarFunctionSchema } from '../../schema/function.js';
@@ -29,13 +31,36 @@ export function emitScalarFunctionCallDefault(plan: ScalarFunctionCallNode, ctx:
 		throw new QuereusError(`Internal error: function ${functionName} plan has ${plan.operands.length} operands, expected ${scalarFunction.numArgs}`, StatusCode.INTERNAL);
 	}
 
+	// QUEREUS_REPR_STRICT seam: the value a function RETURNS, checked against its
+	// schema's declared return type. A UDF's output is one of the two boundaries the
+	// engine deliberately does not coerce (docs/types.md § Physical representation), so
+	// this is where a drifting implementation is caught. Resolved only when the flag is
+	// on — a normal emit does no type lookup for it.
+	const reprReturnType = REPR_STRICT ? scalarFunction.returnType.logicalType : undefined;
+	const reprWhere = REPR_STRICT
+		? `the return value of function ${functionName}(${plan.operands.length})`
+		: '';
+
 	function run(_rctx: RuntimeContext, ...args: Array<SqlValue>): OutputValue {
+		let result: MaybePromise<SqlValue>;
 		try {
-			return scalarFunction.implementation(...args);
+			result = scalarFunction.implementation(...args);
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
 			throw new QuereusError(`Function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined, plan.expression.loc?.start.line, plan.expression.loc?.start.column);
 		}
+		// Checked OUTSIDE the try on purpose: inside, a representation violation would be
+		// re-reported as "Function <name> failed", hiding the seam its message names.
+		if (REPR_STRICT) {
+			if (result instanceof Promise) {
+				return result.then(value => {
+					assertConformsToType(value, reprReturnType!, reprWhere);
+					return value;
+				});
+			}
+			assertConformsToType(result, reprReturnType!, reprWhere);
+		}
+		return result;
 	}
 
 	const operandExprs = plan.operands.map(operand => emitPlanNode(operand, ctx));

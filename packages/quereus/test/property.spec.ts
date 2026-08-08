@@ -24,6 +24,11 @@ import { createStrictRowContextMap, wrapTableContextsStrict } from '../src/runti
 import { isAsyncIterable } from '../src/runtime/utils.js';
 import type { RuntimeContext } from '../src/runtime/types.js';
 import { isCanonicalNumeric } from '../src/util/numeric-canonical.js';
+import { assertConformsToType } from '../src/runtime/strict-representation.js';
+import type { LogicalType } from '../src/types/logical-type.js';
+import { ANY_TYPE, BLOB_TYPE, BOOLEAN_TYPE, INTEGER_TYPE, NUMERIC_TYPE, REAL_TYPE, TEXT_TYPE } from '../src/types/builtin-types.js';
+import { JSON_TYPE } from '../src/types/json-type.js';
+import { DATE_TYPE, TIMESTAMP_TYPE } from '../src/types/temporal-types.js';
 
 describe('Property-Based Tests', () => {
 	let db: Database;
@@ -168,6 +173,114 @@ describe('Property-Based Tests', () => {
 					expect(BigInt(out as number | bigint)).to.equal(values[i],
 						`row ${i}: value changed across round-trip`);
 				}
+			}), { numRuns: 30 });
+		});
+	});
+
+	// --- 1c. Per-declared-type representation (R2) ---
+	// The companion to the R1 property above: R1 constrains numerics everywhere, R2
+	// constrains what JS form a value may take in a position of a given DECLARED type
+	// (docs/types.md § Physical representation). Round-trip one value per builtin type
+	// through insert → select and hold every returned cell to its column's declared type
+	// with the engine's own checker — the same function `QUEREUS_REPR_STRICT` wires into
+	// the four runtime seams, so this property is meaningful with the flag on or off.
+	describe('Per-declared-type representation (R2)', () => {
+		/** Column name → declared type, in the order the table declares them. */
+		const COLUMNS: ReadonlyArray<{ name: string; sql: string; type: LogicalType; arb: fc.Arbitrary<SqlValue> }> = [
+			{
+				name: 'i', sql: 'integer', type: INTEGER_TYPE,
+				// Spans the safe-integer boundary in both directions.
+				arb: fc.oneof(
+					fc.bigInt({ min: -(2n ** 60n), max: 2n ** 60n }),
+					fc.constantFrom(0n, 1n, -1n, 9007199254740991n, 9007199254740992n, -9007199254740993n),
+				) as fc.Arbitrary<SqlValue>,
+			},
+			{ name: 'r', sql: 'real', type: REAL_TYPE, arb: fc.double({ noNaN: true, noDefaultInfinity: true }) as fc.Arbitrary<SqlValue> },
+			{
+				name: 'n', sql: 'numeric', type: NUMERIC_TYPE,
+				arb: fc.oneof(
+					fc.double({ noNaN: true, noDefaultInfinity: true }),
+					fc.bigInt({ min: -(2n ** 60n), max: 2n ** 60n }),
+				) as fc.Arbitrary<SqlValue>,
+			},
+			{ name: 's', sql: 'text', type: TEXT_TYPE, arb: fc.string() as fc.Arbitrary<SqlValue> },
+			{ name: 'b', sql: 'blob', type: BLOB_TYPE, arb: fc.uint8Array() as fc.Arbitrary<SqlValue> },
+			{ name: 'bo', sql: 'boolean', type: BOOLEAN_TYPE, arb: fc.boolean() as fc.Arbitrary<SqlValue> },
+			{
+				name: 'j', sql: 'json', type: JSON_TYPE,
+				// Spread into a plain object: fc.dictionary yields null-prototype objects,
+				// which `isSqlValue` (correctly) rejects at bind.
+				arb: fc.dictionary(fc.string(), fc.integer()).map(d => ({ ...d })) as fc.Arbitrary<SqlValue>,
+			},
+			{
+				name: 'd', sql: 'date', type: DATE_TYPE,
+				arb: fc.constantFrom('2024-01-01', '1970-01-01', '2099-12-31') as fc.Arbitrary<SqlValue>,
+			},
+			{
+				name: 'ts', sql: 'timestamp', type: TIMESTAMP_TYPE,
+				arb: fc.oneof(
+					fc.integer({ min: -1e12, max: 1e12 }),
+					fc.bigInt({ min: -(2n ** 60n), max: 2n ** 60n }),
+				) as fc.Arbitrary<SqlValue>,
+			},
+			{ name: 'a', sql: 'any', type: ANY_TYPE, arb: fc.oneof(fc.string(), fc.integer(), fc.boolean()) as fc.Arbitrary<SqlValue> },
+		];
+
+		/** Total, primitive-conversion-free rendering for assertion messages. */
+		function describeValue(v: SqlValue): string {
+			if (typeof v === 'bigint') return `${v}n (bigint)`;
+			if (v instanceof Uint8Array) return `blob[${v.length}] (Uint8Array)`;
+			if (v !== null && typeof v === 'object') return `${safeJsonStringify(v)} (object)`;
+			return `${safeJsonStringify(v)} (${typeof v})`;
+		}
+
+		/** Value equality that survives the storage-class change canonicalization makes. */
+		function sameValue(actual: SqlValue, expected: SqlValue): boolean {
+			if (typeof expected === 'bigint' && (typeof actual === 'number' || typeof actual === 'bigint')) {
+				// A safe-range bigint comes back as the equal `number`; compare by value.
+				return BigInt(actual) === expected;
+			}
+			if (expected instanceof Uint8Array && actual instanceof Uint8Array) {
+				return safeJsonStringify([...actual]) === safeJsonStringify([...expected]);
+			}
+			if (expected !== null && typeof expected === 'object') {
+				return deepEqualIgnoringZeroSign(actual, expected);
+			}
+			return Object.is(actual, expected) || actual === expected;
+		}
+
+		it('every builtin type round-trips with its value AND its JavaScript form intact', async () => {
+			const columnDdl = COLUMNS.map(c => `${c.name} ${c.sql}`).join(', ');
+			await db.exec(`create table repr_t (id integer primary key, ${columnDdl}) using memory`);
+
+			const rowArb = fc.tuple(...COLUMNS.map(c => c.arb));
+			await fc.assert(fc.asyncProperty(rowArb, async (values) => {
+				await db.exec('delete from repr_t');
+				const placeholders = COLUMNS.map(() => '?').join(', ');
+				const stmt = db.prepare(`insert into repr_t (id, ${COLUMNS.map(c => c.name).join(', ')}) values (1, ${placeholders})`);
+				try {
+					await stmt.run(values as SqlValue[]);
+				} finally {
+					await stmt.finalize();
+				}
+
+				const rows: Record<string, SqlValue>[] = [];
+				for await (const row of db.eval(`select ${COLUMNS.map(c => c.name).join(', ')} from repr_t`)) {
+					rows.push(row);
+				}
+				expect(rows).to.have.length(1);
+
+				COLUMNS.forEach((column, i) => {
+					const out = rows[0][column.name];
+					// Representation: throws (naming column and type) if the JS form is wrong.
+					assertConformsToType(out, column.type, `property round-trip column ${column.name}`);
+					// Value: unchanged, modulo the storage-class narrowing R1 mandates.
+					// Render through safeJsonStringify, never String(): a generated JSON document
+					// may carry its own `toString` key, which String() then tries to call.
+					expect(sameValue(out, values[i] as SqlValue),
+						`${column.name}: ${describeValue(out)} != ${describeValue(values[i] as SqlValue)}`)
+						.to.be.true;
+				});
 			}), { numRuns: 30 });
 		});
 	});

@@ -61,6 +61,7 @@
     "test:store": "node test-runner.mjs --store",
     "test:fork-strict": "node test-runner.mjs --fork-strict",
     "test:context-strict": "node test-runner.mjs --context-strict",
+    "test:repr-strict": "node test-runner.mjs --repr-strict",
     "test:full": "yarn test && yarn test:store",
     "test:coverage": "c8 --exclude 'test/**' --exclude 'bench/**' --exclude 'dist/**' --reporter text --reporter html node test-runner.mjs",
     "test:single": "cd ../.. && node --import ./packages/quereus/register.mjs node_modules/mocha/bin/mocha.js --bail",

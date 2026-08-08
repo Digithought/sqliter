@@ -128,8 +128,11 @@ describe('Filter conjunct early exit', () => {
 			['integer -1', -1, true],
 			['float 0.0', 0.0, false],
 			['float 1.5', 1.5, true],
-			['bigint 0n', 0n, false],
-			['bigint 7n', 7n, true],
+			// Under R1 (docs/types.md § Physical representation) a `bigint` only ever holds a
+			// value OUTSIDE the safe-integer range, so `0n` / `7n` name states the engine
+			// never produces and a UDF is contractually forbidden to return. Every canonical
+			// bigint is therefore truthy; the out-of-range case is the only one left to cover.
+			['bigint past 2^53', 9007199254740993n, true],
 			['empty string', '', false],
 			['non-numeric string', 'abc', false],
 			['numeric string "0"', '0', false],

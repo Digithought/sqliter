@@ -11,6 +11,8 @@ import { createValidatedInstruction, emitPlanNode } from "../emitters.js";
 import { disconnectVTable } from "../utils.js";
 import { buildRowDescriptor } from "../../util/row-descriptor.js";
 import { createRowSlot } from "../context-helpers.js";
+import { REPR_STRICT } from "../strict-flags.js";
+import { assertRowConforms, RepresentationError } from "../strict-representation.js";
 
 /**
  * Optional override hook supplied by callers that need to mutate the
@@ -62,6 +64,17 @@ export function emitSeqScan(
 	// scan site — a self-join's two scans over the same table get different keys and
 	// therefore isolated instances. Mirrors the executionMemo symbol pattern.
 	const scanConnectionKey = Symbol(`scan:${plan.nodeType}(${schema.name})`);
+
+	// QUEREUS_REPR_STRICT seam: rows leaving a module's `query()`, checked against the
+	// table's declared column types. Catches a non-conforming module (in-tree or
+	// third-party) at its OWN boundary rather than three layers downstream. Everything
+	// the check needs is built here only when the flag is on, so a normal emit allocates
+	// nothing on its behalf.
+	const reprColumnTypes = REPR_STRICT ? schema.columns.map(col => col.logicalType) : undefined;
+	const reprColumnNames = REPR_STRICT ? schema.columns.map(col => col.name) : undefined;
+	const reprWhere = REPR_STRICT
+		? `module '${schema.vtabModuleName}' query() row for ${schema.schemaName}.${schema.name}`
+		: '';
 
 	async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: SqlValue[]): AsyncIterable<Row> {
 		// Use the captured module info instead of doing a fresh lookup
@@ -155,12 +168,17 @@ export function emitSeqScan(
 				// checkpoint — the inner scan layers (safeIterate/scanLayer) went sync,
 				// so do not remove it expecting an inner checkpoint to cover the scan.
 				throwIfAborted(runtimeCtx.signal);
+				// Synchronous and inside this loop on purpose: enabling the flag must not
+				// introduce a microtask hop into the scan's fast path (docs/runtime.md).
+				if (REPR_STRICT) assertRowConforms(row, reprColumnTypes!, reprWhere, reprColumnNames);
 				rowSlot.set(row);
 				yield row;
 			}
 		} catch (e: unknown) {
 			// Preserve cancellation identity — don't re-wrap it as a generic query error.
-			if (e instanceof AbortError) throw e;
+			// A representation violation is likewise rethrown verbatim: re-wrapping it
+			// would bury the seam/column/type detail its message exists to carry.
+			if (e instanceof AbortError || e instanceof RepresentationError) throw e;
 			const message = e instanceof Error ? e.message : String(e);
 			throw new QuereusError(`Error during query on table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
 		} finally {

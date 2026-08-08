@@ -137,6 +137,62 @@ inside the safe range is a `number`. An embedder relying on a `bigint` round-tri
 safe-range values must re-widen on its own side. Both changes move toward the form the
 same value would have had if written as a literal.
 
+#### Enforcement: `QUEREUS_REPR_STRICT`
+
+R1 and R2 are enforced by coercion only where the engine MINTS values. At the two ingress
+boundaries it deliberately does not coerce — rows out of a virtual-table module's
+`query()`, and values out of a user-defined function — the rules are a **contract**, and an
+opt-in strict mode verifies it. Set the environment variable `QUEREUS_REPR_STRICT=1` (or
+run `yarn test:repr-strict`, which is `node test-runner.mjs --repr-strict`). This is the
+same shape as the two existing runtime harnesses, `QUEREUS_FORK_STRICT` and
+`QUEREUS_CONTEXT_STRICT` (see `runtime/strict-flags.ts` and `docs/runtime.md`).
+
+The flag is read once at module load. With it off, every check is a single already-false
+branch and nothing is built at emit time on the checker's behalf; the checker itself lives
+in `runtime/strict-representation.ts` and throws `QuereusError(INTERNAL)` naming the seam,
+the column or argument, the declared type, the value's JavaScript form and a truncated
+rendering of the value.
+
+Four seams, each chosen so a violation is reported at the layer that CAUSED it:
+
+| seam | what is checked | against |
+|---|---|---|
+| virtual-table scan output (`runtime/emit/scan.ts`) | each row a module's `query()` yields | the table's declared column types — R1 + R2 |
+| DML write (`runtime/emit/dml-executor.ts`) | the row about to reach `vtab.update`, after the pipeline's coercion pass | the declared column types — R1 + R2 |
+| UDF return (`runtime/emit/scalar-function.ts`) | a scalar function's returned value | its schema's declared return type — R1 + R2 |
+| statement row egress (`core/statement.ts`) | each row yielded to the caller | **R1 only** |
+
+The egress seam is the backstop for an *expression* producing a non-canonical value (an
+arithmetic path that forgot to narrow), which none of the other three sees. It checks R1
+only, on purpose: R2 is a rule about *declared* types, and a projection's `ScalarType` is
+the planner's static inference rather than a declared type — the engine never coerces a
+projection's output to it, and the two legitimately disagree (`select ? as v` infers TEXT
+for an untyped parameter and yields a number). Asserting R2 there would report inference
+imprecision, not representation drift. That imprecision is tracked separately as
+`backlog/bug-inferred-scalar-type-disagrees-with-runtime-value`; if it is fixed, this seam
+can be upgraded to full R2.
+
+**No capability flag, and why.** A `representationFidelity` declaration on
+`VirtualTableModule` (alongside `scanSnapshotIsolation`) was considered and rejected:
+nothing would *behave* differently based on it. The engine tolerates both numeric forms
+everywhere today and will continue to, so a module declaring "I am faithful" and a module
+declaring nothing take the identical code path — a configuration knob with no consumer,
+which rots. The obligation lives in the module contract prose (`vtab/module.ts`, and
+`docs/plugins.md` § Declaring return types for functions) and the strict checker enforces
+it in tests.
+
+**Known gaps in coverage** (the checker is a net, not a proof):
+
+- A scalar function with a `customEmitter` bypasses the UDF seam — its emitter builds its
+  own `run`. Several builtins are in this category.
+- Aggregate and window function results are not checked at their own seam; they reach the
+  egress seam, where only R1 applies.
+- Values inside a JSON document are not walked; only the top-level `SqlValue` is checked.
+- `@quereus/store`'s exported `decodeValue` / `decodeCompositeKey` return `BigInt(...)` for
+  every integer-valued key, which violates R1 for small integers. They are key decoders and
+  are not used to reconstruct rows, so no seam sees them — tracked as
+  `backlog/debt-store-key-decode-returns-noncanonical-integers`.
+
 ### Logical Types
 
 Logical types define the semantics and behavior of values:

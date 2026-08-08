@@ -30,6 +30,9 @@ while (i < args.length) {
 		case '--context-strict':
 			env.QUEREUS_CONTEXT_STRICT = '1';
 			break;
+		case '--repr-strict':
+			env.QUEREUS_REPR_STRICT = '1';
+			break;
 		case '--show-plan':
 			env.QUEREUS_TEST_SHOW_PLAN = 'true';
 			break;

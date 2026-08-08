@@ -58,7 +58,24 @@ describe('Parameter Type System', () => {
 				rows.push(row);
 			}
 			expect(rows).to.have.length(1);
-			expect(rows[0].int_col).to.equal(9007199254740991n);
+			// A bound bigint INSIDE the safe-integer range canonicalizes to `number` at the
+			// bind boundary and is stored and returned in that form — R1, and the documented
+			// API surface (docs/types.md § Physical representation). The VALUE round-trips
+			// exactly; only its JavaScript form changes.
+			expect(rows[0].int_col).to.equal(9007199254740991);
+		});
+
+		it('keeps a bound bigint PAST the safe-integer range exact', async () => {
+			// The companion to the case above: outside the safe range `bigint` IS the canonical
+			// form, so it survives the round trip untouched rather than being narrowed (which
+			// would round it to 9007199254740994).
+			await db.exec('INSERT INTO type_test (id, int_col) VALUES (?, ?)', [1, 9007199254740993n]);
+			const rows: ResultRow[] = [];
+			for await (const row of db.eval('SELECT int_col FROM type_test WHERE id = ?', [1])) {
+				rows.push(row);
+			}
+			expect(rows).to.have.length(1);
+			expect(rows[0].int_col).to.equal(9007199254740993n);
 		});
 
 		it('should infer TEXT from JavaScript string', async () => {

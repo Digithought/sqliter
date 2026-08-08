@@ -18,6 +18,8 @@ import { uniqueEnforcementComparators } from '../../schema/unique-enforcement.js
 import { validateAndParse } from '../../types/validation.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { withAsyncRowContext } from '../context-helpers.js';
+import { REPR_STRICT } from '../strict-flags.js';
+import { assertRowConforms } from '../strict-representation.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation, createParentRestrictBatch, accumulateParentRestrictKeys, flushParentRestrictBatch, type ParentRestrictBatch } from '../foreign-key-actions.js';
 import { getBatchableRestrictFks } from '../../planner/building/foreign-key-builder.js';
@@ -359,6 +361,20 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 	// Pre-calculate primary key column indices from schema (needed for update/delete)
 	const pkColumnIndicesInSchema = tableSchema.primaryKeyDefinition.map(pkColDef => pkColDef.index);
+
+	// QUEREUS_REPR_STRICT seam: the row about to be handed to `vtab.update`, checked
+	// against the declared column types AFTER the DML pipeline's coercion pass. This is
+	// the failure mode with the longest fuse — a non-canonical value that gets PERSISTED.
+	// Both arrays are built only when the flag is on, so a normal emit allocates nothing
+	// on the checker's behalf.
+	// The three row-bearing `vtab.update` sites below each call `assertRowConforms` under
+	// `if (REPR_STRICT)`, immediately before the write and deliberately OUTSIDE the
+	// conversion/constraint `catch` blocks, so a violation propagates as the internal error
+	// it is rather than being re-reported as a constraint failure. DELETE carries no row, so
+	// it has no check.
+	const reprColumnTypes = REPR_STRICT ? tableSchema.columns.map(col => col.logicalType) : undefined;
+	const reprColumnNames = REPR_STRICT ? tableSchema.columns.map(col => col.name) : undefined;
+	const reprWhere = REPR_STRICT ? `write to ${tableSchema.schemaName}.${tableSchema.name}` : '';
 
 	// Per-PK-column comparators for the data-event contract's relocation test: an UPDATE
 	// whose key values differ under the PRIMARY KEY's own comparator MOVES the row, and the
@@ -795,6 +811,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				buildUpdateStatement(tableSchema, updatedRow, keyValues, contextRow) : undefined
 		};
 
+		if (REPR_STRICT) assertRowConforms(updatedRow, reprColumnTypes!, reprWhere, reprColumnNames);
+
 		const updateResult = await vtab.update!(updateArgs);
 
 		if (isConstraintViolation(updateResult)) {
@@ -1170,6 +1188,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			mutationStatement
 		};
 
+		if (REPR_STRICT) assertRowConforms(newRow, reprColumnTypes!, reprWhere, reprColumnNames);
+
 		const result = await vtab.update!(args);
 
 		if (isConstraintViolation(result)) {
@@ -1404,6 +1424,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			preCoerced: true,
 			mutationStatement
 		};
+
+		if (REPR_STRICT) assertRowConforms(newRow, reprColumnTypes!, reprWhere, reprColumnNames);
 
 		const result = await vtab.update!(args);
 
