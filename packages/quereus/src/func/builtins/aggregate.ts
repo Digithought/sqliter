@@ -3,6 +3,7 @@ import type { SqlValue } from '../../common/types.js';
 import type { AggregateAlgebra, AggregateFinalizer, AggregateFunctionSchema, AggregateReducer } from '../../schema/function.js';
 import { createAggregateFunction } from '../registration.js';
 import { compareSqlValuesFast, createSemanticValueComparator, BINARY_COLLATION } from '../../util/comparison.js';
+import { canonicalizeInteger } from '../../util/numeric-canonical.js';
 import { valueToText } from '../../util/value-text.js';
 import { INTEGER_RETURN_NOT_NULL, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN } from './return-types.js';
 
@@ -14,10 +15,16 @@ const warnLog = log.extend('warn');
  *  promotion the SUM step applies per value. */
 function addWithPromotion(a: number | bigint, b: number | bigint): number | bigint {
 	if (typeof a === 'bigint' || typeof b === 'bigint') {
-		return BigInt(a) + BigInt(b);
+		// Narrow a sum that retracts back inside the safe range (R1) — shared by the
+		// SUM step and merge/negate maintenance, so a maintained view's stored
+		// partial and a direct evaluation agree on representation.
+		return canonicalizeInteger(BigInt(a) + BigInt(b));
 	}
 	const sum = a + b;
 	if (sum > Number.MAX_SAFE_INTEGER || sum < Number.MIN_SAFE_INTEGER) {
+		// No narrowing needed: two safe integers whose float sum left the safe range
+		// have an exact sum outside it (an in-range exact sum is float-representable,
+		// so the float sum would have been exact and in range).
 		return BigInt(a) + BigInt(b);
 	}
 	return sum;

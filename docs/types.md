@@ -46,6 +46,86 @@ export type SqlValue = string | number | bigint | boolean | Uint8Array | JsonSql
 // JsonSqlValue = { [key: string]: JSONValue } | JSONValue[]
 ```
 
+#### Physical representation
+
+A whole number could be held by either of two JavaScript forms — the `number` `5` or the
+`bigint` `5n`. The engine pins one form per value (`util/numeric-canonical.ts`):
+
+**R1 — canonical numeric form.** Holds for every `SqlValue` anywhere in the engine,
+whatever its declared type, including `ANY` columns:
+
+> A `SqlValue` is a JS `bigint` only when its magnitude is outside the safe-integer range
+> (|v| > 2^53 − 1 = 9007199254740991). Every integer value inside that range is a JS
+> `number`.
+
+R1 constrains which values may be `bigint`; it does not constrain which `number`s may be
+whole. A whole-valued `number` outside the safe range (e.g. `1e20` in a REAL position) is
+not a violation, and `-0` is a safe integer that stays the `number` `-0` — it is neither
+normalized to `0` nor widened.
+
+**R2 — per-declared-type value space.** Holds for a value in a position of that declared
+type; `null` is always admissible and nullability is a separate contract:
+
+| declared type | admissible JS forms |
+|---|---|
+| INTEGER | `number` that is a safe integer, or `bigint` (necessarily outside the safe range, by R1) |
+| REAL | `number` |
+| NUMERIC | `number`, or `bigint` under R1 |
+| BOOLEAN | `boolean` |
+| TEXT and the temporals (DATE/TIME/DATETIME/TIMESPAN) | `string` |
+| BLOB | `Uint8Array` |
+| JSON | native JS object/array, or a JSON scalar (`string`/`number`/`boolean`) |
+| ANY | any of the above, each obeying R1 |
+
+R2 does **not** constrain a *probe* value handed to a comparator: `REAL_TYPE.compare`
+tolerating a `bigint` operand (an integer literal past 2^53 compared against a `real`
+column) is comparator robustness against a value that is not a REAL, and stays.
+
+**Why the safe-integer boundary and not "exactly representable as a double".** 2^53
+itself (9007199254740992) is exactly representable but is not a *safe* integer —
+2^53 + 1 is not representable, so arithmetic around the boundary stops round-tripping.
+Under R1, 9007199254740992 is a `bigint`.
+
+**Where canonicalization happens.** At the points where a value is *born* — never per-row
+on read paths:
+
+- **Literals**: the lexer emits `number` below the safe boundary, `bigint` above it.
+- **Conversion**: `INTEGER_TYPE.parse` and `NUMERIC_TYPE.parse` (covering `cast(…)`, the
+  conversion builtins, DML coercion of a differently-typed cell, and ALTER backfill).
+- **Bound parameters**: canonicalized as they are stored into the statement's bound-args
+  map (per-bind, not per-row).
+- **Arithmetic and aggregation results**: the bigint arms of binary/unary arithmetic and
+  `sum()` narrow a result that lands back inside the safe range.
+
+Rows returned from a virtual-table `query()` and values returned from user-defined
+functions are held to R1 by contract rather than by per-row coercion — every consumer
+already tolerates both forms, so coercing there would cost where there is nothing to win.
+
+**BOOLEAN stays a first-class runtime value.** The alternative — canonicalize booleans to
+0/1 at ingress and make BOOLEAN purely logical — was considered and rejected: `boolean`
+is a user-visible result value with its own `PhysicalType`, its own `compare` and its own
+JSON round-trip, and the only thing the change would buy is deleting the boolean arms of
+the storage-class dispatch helpers, which measurement (see the accepted-tradeoff `NOTE:`
+on `compareSqlValuesFast` in `util/comparison.ts`) says are worth nothing. Those arms are
+also not removable on other grounds: an `ANY` column may legitimately hold a boolean, so
+a numeric comparison can meet one regardless of what R2 says about declared BOOLEAN
+positions.
+
+**These `typeof` branches are not debt.** R1/R2 are correctness rules, not a license to
+delete runtime storage-class dispatch: the per-row `typeof` branches measure at 0–2 ns
+against a ~143 ns/instruction dispatch floor (accepted-tradeoff `NOTE:`s on
+`compareSqlValuesFast` and at the `numeric-fast`/`compare-fast` branches in
+`runtime/emit/binary.ts`), and probe values, `ANY` columns, and uncanonicalized
+vtab/UDF output all still reach them.
+
+**API surface.** Canonicalization is visible to embedders through `eval` /
+`iterateRows` / UDF arguments / vtab `update()` inputs as a `typeof` change, never a
+value change: a parameter bound as a small `bigint` (`stmt.bind(1, 5n)`) is used, stored
+and returned as the `number` `5`, and a bigint arithmetic or `sum()` result landing back
+inside the safe range is a `number`. An embedder relying on a `bigint` round-trip for
+safe-range values must re-widen on its own side. Both changes move toward the form the
+same value would have had if written as a literal.
+
 ### Logical Types
 
 Logical types define the semantics and behavior of values:
@@ -127,7 +207,8 @@ This ensures type information flows through the entire planning and execution pi
 
 **INTEGER**
 - Physical: `PhysicalType.INTEGER`
-- Values: `number` (safe integers) or `bigint`
+- Values: `number` (safe integers) or `bigint` (only outside the safe range — see
+  [Physical representation](#physical-representation))
 - Comparison: Numeric ordering
 - Collations: None
 - Text conversion (`cast('…' as integer)`, `integer('…')`, and the plan-time cast the
@@ -136,6 +217,11 @@ This ensures type information flows through the entire planning and execution pi
   the same boundary the lexer applies to INTEGER literals. There is **no 64-bit clamp**:
   `cast('99999999999999999999999999' as integer)` is exact rather than SQLite's
   `INT64_MAX`, matching Quereus' arbitrary-precision integer literals.
+- Number conversion follows the same rule: a finite whole `number` past the safe boundary
+  widens to an exact `bigint`, so `cast(1e20 as integer)` — and `insert into t(int_col)
+  values (1e20)` — stores exactly `100000000000000000000`, matching the digit and text
+  spellings of the same value. Fractional values truncate as before; `NaN`/`±Infinity`
+  are still rejected by `validate` at a write.
 
 **REAL**
 - Physical: `PhysicalType.REAL`
@@ -149,11 +235,14 @@ This ensures type information flows through the entire planning and execution pi
 
 **NUMERIC** (SQLite's NUMERIC affinity — integer if it fits, else real)
 - Physical: `PhysicalType.REAL`
-- Values: `number` or `bigint` — both halves are accepted by `validate`/`parse`, so a
-  NUMERIC column can hold a whole number past 2^53 in exact `bigint` form, including one
-  written as text (`insert into t(numeric_col) values ('9007199254740993')`). Only an
-  all-digit string takes that integer arm; a fractional spelling (`'9007199254740993.0'`)
-  falls through to REAL and rounds, as in SQLite
+- Values: `number` or `bigint` under R1 (see
+  [Physical representation](#physical-representation)) — both halves are accepted by
+  `validate`/`parse`, so a NUMERIC column can hold a whole number past 2^53 in exact
+  `bigint` form, including one written as text
+  (`insert into t(numeric_col) values ('9007199254740993')`), while `parse` narrows a
+  safe-range `bigint` to `number`. Only an all-digit string takes the integer arm; a
+  fractional spelling (`'9007199254740993.0'`) falls through to REAL and rounds, as in
+  SQLite
 - Comparison: numeric ordering with REAL's NaN handling (NaN sorts smallest, NaN = NaN).
   Mixed `number`/`bigint` pairs are ordered by exact mathematical value — REAL and NUMERIC
   share one comparator (`compareNumericWithNaN`, `types/builtin-types.ts`)
@@ -1421,6 +1510,7 @@ Parameter type validation ensures type safety across executions:
 - **Validation on execution**: Each execution validates that parameter values match the established physical types
 - **NULL compatibility**: NULL values are compatible with any nullable parameter type
 - **Flexible logical types**: Different logical types with the same physical type are compatible (e.g., `number` and `bigint` both work for INTEGER physical type)
+- **Canonical form at bind**: A bound value is canonicalized as it is stored (see [Physical representation](#physical-representation)) — a `bigint` inside the safe-integer range narrows to `number`, so `stmt.bind(1, 5n)` is used, stored, and returned as `5`
 - **No implicit conversion**: Physical type mismatches are rejected with clear error messages
 - **Explicit conversion**: Use conversion functions like `integer()`, `real()`, `text()`, `date()`, etc. in your SQL to convert between types
 - **Array/object scalar guard**: A parameter used directly (through `CAST`s) as a comparand in a scalar comparison (`= <> < <= > >=`, `IN`, `BETWEEN`) against a non-object scalar operand may not be bound to a JS array or plain object. The OBJECT storage class sorts above every scalar, so such a binding could never match — instead of silently returning no rows it throws `StatusCode.MISMATCH` at bind time (e.g. `where id = ?` with `[[1, 2]]`). JSON-vs-JSON comparisons (`jsoncol = :p`), function arguments (`json_array_length(?)`), projections (`select ? as v`), and storing into a JSON column are never flagged. Collected by `src/planner/analysis/scalar-param-usage.ts` from the logical plan.

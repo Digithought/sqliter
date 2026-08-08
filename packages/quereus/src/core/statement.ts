@@ -24,6 +24,7 @@ import { combineAbortSignals } from '../util/abort-signal.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
 import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
 import { isObjectClassValue } from '../util/comparison.js';
+import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
 import { astToString } from '../emit/ast-stringify.js';
 
 const log = createLogger('core:statement');
@@ -104,13 +105,19 @@ export class Statement {
 		} else if (paramsOrTypes !== undefined) {
 			// Initial parameter values - infer types and bind them
 			this.parameterTypes = getParameterTypes(paramsOrTypes);
-			// Also bind the initial values
+			// Also bind the initial values. Values canonicalize as they enter boundArgs
+			// (a safe-range bigint narrows to number, R1 — util/numeric-canonical.ts):
+			// per-bind, not per-row, and shared by all three ingress sites (here,
+			// bind, bindAll). Type inference above saw the raw values, but it maps a
+			// safe-range bigint and its number form to INTEGER alike, so no drift.
 			if (Array.isArray(paramsOrTypes)) {
 				paramsOrTypes.forEach((value, index) => {
-					this.boundArgs[index + 1] = value;
+					this.boundArgs[index + 1] = canonicalizeSqlValue(value);
 				});
 			} else {
-				Object.assign(this.boundArgs, paramsOrTypes);
+				for (const [key, value] of Object.entries(paramsOrTypes)) {
+					this.boundArgs[key] = canonicalizeSqlValue(value);
+				}
 			}
 		}
 
@@ -267,9 +274,9 @@ export class Statement {
 		}
 		if (typeof key === 'number') {
 			if (key < 1) throw new RangeError(`Argument index ${key} out of range (must be >= 1)`);
-			this.boundArgs[key] = value;
+			this.boundArgs[key] = canonicalizeSqlValue(value);
 		} else if (typeof key === 'string') {
-			this.boundArgs[key] = value;
+			this.boundArgs[key] = canonicalizeSqlValue(value);
 		} else {
 			throw new MisuseError("Invalid argument key type");
 		}
@@ -289,15 +296,19 @@ export class Statement {
 				if (!isSqlValue(value)) {
 					throw new MisuseError(`bindAll: invalid value at index ${index}: expected SqlValue, got ${describeSqlValueViolation(value)}`);
 				}
-				this.boundArgs[index + 1] = value;
+				this.boundArgs[index + 1] = canonicalizeSqlValue(value);
 			});
 		} else if (typeof args === 'object' && args !== null) {
+			// Validate every entry before assigning any, so a rejected value leaves
+			// boundArgs empty rather than partially bound.
 			for (const [key, value] of Object.entries(args)) {
 				if (!isSqlValue(value)) {
 					throw new MisuseError(`bindAll: invalid value for key '${key}': expected SqlValue, got ${describeSqlValueViolation(value)}`);
 				}
 			}
-			Object.assign(this.boundArgs, args);
+			for (const [key, value] of Object.entries(args)) {
+				this.boundArgs[key] = canonicalizeSqlValue(value);
+			}
 		} else {
 			throw new MisuseError("Invalid parameters type for bindAll. Use array or object.");
 		}

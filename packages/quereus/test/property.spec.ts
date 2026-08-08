@@ -23,6 +23,7 @@ import { Scheduler } from '../src/runtime/scheduler.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../src/runtime/strict-fork.js';
 import { isAsyncIterable } from '../src/runtime/utils.js';
 import type { RuntimeContext } from '../src/runtime/types.js';
+import { isCanonicalNumeric } from '../src/util/numeric-canonical.js';
 
 describe('Property-Based Tests', () => {
 	let db: Database;
@@ -118,6 +119,57 @@ describe('Property-Based Tests', () => {
 				}), { numRuns: 50 }); // Keep numRuns reasonable for CI
 			});
 		}
+	});
+
+	// --- 1b. Canonical numeric representation (R1) ---
+	// docs/types.md § "Physical representation": a SqlValue is a bigint only outside
+	// the safe-integer range; every safe-range integer is a number. This property keeps
+	// the whole class closed — insert arbitrary integers spanning the boundary (as
+	// bound bigint parameters, the ingress that used to leak `5n` through verbatim),
+	// select them back, and require canonical form plus exact numeric equality.
+	describe('Canonical Numeric Representation (R1)', () => {
+		const integerArb = fc.oneof(
+			fc.bigInt({ min: -(2n ** 60n), max: 2n ** 60n }),
+			fc.bigInt({ min: -9007199254741091n, max: 9007199254741091n }), // dense near ±2^53
+			fc.constantFrom(
+				0n, 1n, -1n,
+				9007199254740991n, -9007199254740991n,     // ±(2^53 − 1): narrow to number
+				9007199254740992n, -9007199254740992n,     // ±2^53: stay bigint
+				9007199254740993n, -9007199254740993n,
+			),
+		);
+
+		it('insert → select round-trips arbitrary integers into canonical form', async () => {
+			await db.exec('CREATE TABLE canon_t (id INTEGER PRIMARY KEY, v INTEGER) USING memory');
+
+			await fc.assert(fc.asyncProperty(fc.array(integerArb, { minLength: 1, maxLength: 8 }), async (values) => {
+				await db.exec('DELETE FROM canon_t');
+				const stmt = db.prepare('INSERT INTO canon_t (id, v) VALUES (?, ?)');
+				try {
+					for (let i = 0; i < values.length; i++) {
+						await stmt.run([i + 1, values[i]]);
+					}
+				} finally {
+					await stmt.finalize();
+				}
+
+				const returned: SqlValue[] = [];
+				for await (const row of db.eval('SELECT v FROM canon_t ORDER BY id')) {
+					returned.push(row.v);
+				}
+
+				expect(returned.length).to.equal(values.length);
+				for (let i = 0; i < values.length; i++) {
+					const out = returned[i];
+					expect(typeof out === 'number' || typeof out === 'bigint',
+						`row ${i}: expected numeric, got ${typeof out}`).to.be.true;
+					expect(isCanonicalNumeric(out),
+						`row ${i}: ${String(out)} (${typeof out}) violates R1`).to.be.true;
+					expect(BigInt(out as number | bigint)).to.equal(values[i],
+						`row ${i}: value changed across round-trip`);
+				}
+			}), { numRuns: 30 });
+		});
 	});
 
 	// --- 2. Numeric Affinity ---

@@ -12,6 +12,7 @@ import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, isTru
 import type { LogicalType } from "../../types/logical-type.js";
 import type { CollationFunction } from "../../util/comparison.js";
 import { coerceToNumberForArithmetic } from "../../util/coercion.js";
+import { canonicalizeInteger } from "../../util/numeric-canonical.js";
 import { valueToText } from "../../util/value-text.js";
 import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
@@ -65,7 +66,11 @@ function mixedBigIntArithmetic(
 ): SqlValue {
 	if (typeof v1 === 'bigint' && typeof v2 === 'bigint') {
 		try {
-			return innerBigInt(v1, v2);
+			// Narrow a result that lands inside the safe-integer range back to number
+			// (R1, util/numeric-canonical.ts) — on the success path only; the catch
+			// arms (division by zero, RangeError) still return null. Narrowing itself
+			// cannot throw.
+			return canonicalizeInteger(innerBigInt(v1, v2));
 		} catch {
 			return null;
 		}
@@ -78,10 +83,11 @@ function mixedBigIntArithmetic(
 	const num = typeof v1n === 'bigint' ? v2n as number : v1n as number;
 	if (Number.isInteger(num)) {
 		try {
-			return innerBigInt(
+			// Same success-path narrowing as the both-bigint arm above.
+			return canonicalizeInteger(innerBigInt(
 				typeof v1n === 'bigint' ? v1n : BigInt(v1n),
 				typeof v2n === 'bigint' ? v2n : BigInt(v2n)
-			);
+			));
 		} catch {
 			// Fall through to float path (e.g., division by zero)
 		}

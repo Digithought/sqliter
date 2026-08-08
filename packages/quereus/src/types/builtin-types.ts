@@ -1,6 +1,7 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { compareSqlValuesFast, BINARY_COLLATION } from '../util/comparison.js';
 import { valueToText } from '../util/value-text.js';
+import { canonicalizeInteger } from '../util/numeric-canonical.js';
 import type { DeepReadonly, SqlValue } from '../common/types.js';
 
 /**
@@ -64,12 +65,13 @@ export const INTEGER_TYPE: LogicalType = {
 
 	parse: (v) => {
 		if (v === null) return null;
-		if (typeof v === 'bigint') return v;
+		if (typeof v === 'bigint') return canonicalizeInteger(v);
 		if (typeof v === 'number') {
-			if (!Number.isInteger(v)) {
-				return Math.trunc(v);
-			}
-			return v;
+			// Truncate, then canonicalize: a finite whole value past the safe-integer
+			// boundary widens to an exact bigint (so `1e20` stores exactly, R1), while
+			// NaN/±Infinity pass through untouched for `validate` to reject with the
+			// existing MISMATCH message (`BigInt()` would throw a RangeError instead).
+			return canonicalizeInteger(Math.trunc(v));
 		}
 		if (typeof v === 'boolean') return v ? 1 : 0;
 		if (typeof v === 'string') {
@@ -85,7 +87,9 @@ export const INTEGER_TYPE: LogicalType = {
 			const digits = m[0];
 			const parsed = Number(digits);
 			if (Number.isSafeInteger(parsed)) return parsed;
-			return BigInt(digits[0] === '+' ? digits.slice(1) : digits);
+			// Canonical by construction (a digit string whose Number() is unsafe names a
+			// value outside the safe range); wrapped anyway so R1 is locally evident.
+			return canonicalizeInteger(BigInt(digits[0] === '+' ? digits.slice(1) : digits));
 		}
 		throw new TypeError(`Cannot convert ${typeof v} to INTEGER`);
 	},
@@ -266,7 +270,10 @@ export const NUMERIC_TYPE: LogicalType = {
 
 	parse: (v) => {
 		if (v === null) return null;
-		if (typeof v === 'number' || typeof v === 'bigint') return v;
+		// The number arm accepts non-integers unchanged (NUMERIC's real half); only
+		// the bigint arm canonicalizes, narrowing a safe-range bigint to number (R1).
+		if (typeof v === 'number') return v;
+		if (typeof v === 'bigint') return canonicalizeInteger(v);
 		if (typeof v === 'boolean') return v ? 1 : 0;
 		if (typeof v === 'string') {
 			const trimmed = v.trim();
@@ -280,7 +287,8 @@ export const NUMERIC_TYPE: LogicalType = {
 			if (/^[+-]?\d+$/.test(trimmed)) {
 				const parsed = Number(trimmed);
 				if (Number.isSafeInteger(parsed)) return parsed;
-				return BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed);
+				// Canonical by construction — see INTEGER_TYPE.parse's string arm.
+				return canonicalizeInteger(BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed));
 			}
 
 			// Fall back to real

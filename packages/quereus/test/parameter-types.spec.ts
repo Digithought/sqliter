@@ -247,10 +247,13 @@ describe('Parameter Type System', () => {
 			// Prepare with an integer number (infers INTEGER logical type)
 			const stmt = db.prepare('SELECT ? as value', [42]);
 
-			// Should accept bigint (same physical type: INTEGER)
+			// Should accept bigint (same physical type: INTEGER). A safe-range bigint
+			// canonicalizes to number at bind (R1, docs/types.md § Physical
+			// representation), so the value comes back as the number 100.
 			const result1 = await stmt.get([100n]);
 			expect(result1).to.exist;
-			expect(result1!.value).to.equal(100n);
+			expect(result1!.value).to.equal(100);
+			expect(typeof result1!.value).to.equal('number');
 
 			// Should accept integer number
 			const result2 = await stmt.get([200]);

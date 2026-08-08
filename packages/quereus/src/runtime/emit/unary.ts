@@ -7,6 +7,7 @@ import type { UnaryOpNode } from "../../planner/nodes/scalar.js";
 import { emitPlanNode } from "../emitters.js";
 import type { EmissionContext } from "../emission-context.js";
 import { isTruthy } from "../../util/comparison.js";
+import { canonicalizeInteger } from "../../util/numeric-canonical.js";
 import { Temporal } from 'temporal-polyfill';
 import { TIMESPAN_TYPE } from "../../types/temporal-types.js";
 
@@ -83,7 +84,10 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 			if (operandLogical.isNumeric) {
 				run = (_ctx: RuntimeContext, operand: SqlValue) => {
 					if (operand === null) return null;
-					return typeof operand === 'bigint' ? -operand : -(operand as number);
+					// Bigint arm narrows the result back to number when it fits (R1);
+					// on canonical input negation preserves magnitude, so this only
+					// fires for a non-canonical bigint from a vtab/UDF.
+					return typeof operand === 'bigint' ? canonicalizeInteger(-operand) : -(operand as number);
 				};
 				note = '-(numeric-fast)';
 			} else if (operandLogical === TIMESPAN_TYPE) {
@@ -108,7 +112,7 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 
 					// Numeric negation
 					if (typeof operand === 'number') return -operand;
-					if (typeof operand === 'bigint') return -operand;
+					if (typeof operand === 'bigint') return canonicalizeInteger(-operand);
 					// Try to convert to number
 					const num = Number(operand);
 					return isNaN(num) ? null : -num;
@@ -145,13 +149,15 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 				// path ever admits NaN into a numeric-typed value, restore an isNaN check.
 				run = (_ctx: RuntimeContext, operand: SqlValue) => {
 					if (operand === null) return null;
-					return typeof operand === 'bigint' ? ~operand : ~Math.trunc(operand as number);
+					// ~v = -v-1 can land a canonical bigint back inside the safe range
+					// (~(-2^53) = 2^53-1), so the bigint arm must narrow (R1).
+					return typeof operand === 'bigint' ? canonicalizeInteger(~operand) : ~Math.trunc(operand as number);
 				};
 				note = '~(numeric-fast)';
 			} else {
 				run = (_ctx: RuntimeContext, operand: SqlValue) => {
 					if (operand === null) return null;
-					if (typeof operand === 'bigint') return ~operand;
+					if (typeof operand === 'bigint') return canonicalizeInteger(~operand);
 					// Convert to integer and apply bitwise NOT
 					const num = Number(operand);
 					if (isNaN(num)) return null;
