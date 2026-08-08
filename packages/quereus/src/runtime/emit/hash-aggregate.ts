@@ -4,14 +4,12 @@ import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type Row, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { isRelationalNode } from '../../planner/nodes/plan-node.js';
 import type { BTree } from 'inheritree';
 import { createValueSet } from '../../util/value-set.js';
 import { logContextPush, logContextPop } from '../utils.js';
-import { coerceForAggregate } from '../../util/coercion.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
@@ -20,7 +18,7 @@ import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { semanticKeyTransform } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import { cloneInitialValue, findSourceRelation, ctxLog } from './aggregate.js';
-import { bindAggregateSchemas, buildDistinctComparators, computeAggregateSkipCoercion } from './aggregate-setup.js';
+import { bindAggregateSchemas, buildDistinctComparators, computeAggregateValueTransforms, evalArgsSync } from './aggregate-setup.js';
 import type { ContextInstaller } from '../context-helpers.js';
 
 interface GroupState {
@@ -71,8 +69,8 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 	const hasKeyCanonicalizer = keyCanonicalizers.some(c => c !== undefined);
 
 	const distinctComparators = buildDistinctComparators(plan.aggregates, ctx);
-	const aggregateSkipCoercion = computeAggregateSkipCoercion(plan.aggregates);
-	const { schemas: aggregateSchemas, distinctFlags: aggregateDistinctFlags } =
+	const aggregateValueTransforms = computeAggregateValueTransforms(plan.aggregates);
+	const { schemas: aggregateSchemas, distinctFlags: aggregateDistinctFlags, argCounts: aggregateArgCounts } =
 		bindAggregateSchemas(plan.aggregates, ctx);
 
 	async function* run(
@@ -87,24 +85,13 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 		let aggregateArgOffset = numGroupBy;
 		const aggregateArgFunctions: Array<Array<(ctx: RuntimeContext) => MaybePromise<SqlValue>>> = [];
 
-		for (const agg of plan.aggregates) {
-			const funcNode = agg.expression;
-			if (!(funcNode instanceof AggregateFunctionCallNode)) {
-				quereusError(
-					`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`,
-					StatusCode.INTERNAL
-				);
-			}
-			const args = funcNode.args || [];
-			const aggregateArgs = groupByAndAggregateArgs.slice(aggregateArgOffset, aggregateArgOffset + args.length);
-			aggregateArgFunctions.push(aggregateArgs);
-			aggregateArgOffset += args.length;
+		for (const argCount of aggregateArgCounts) {
+			aggregateArgFunctions.push(groupByAndAggregateArgs.slice(aggregateArgOffset, aggregateArgOffset + argCount));
+			aggregateArgOffset += argCount;
 		}
 
 		function createAccumulators(): AggValue[] {
-			return aggregateSchemas.map(schema =>
-				cloneInitialValue(isAggregateFunctionSchema(schema) ? schema.initialValue : undefined)
-			);
+			return aggregateSchemas.map(schema => cloneInitialValue(schema.initialValue));
 		}
 
 		function createDistinctTrees(): (BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]> | null)[] {
@@ -126,23 +113,10 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 				try {
 					for (let i = 0; i < plan.aggregates.length; i++) {
-						const schema = aggregateSchemas[i];
 						const isDistinct = aggregateDistinctFlags[i];
 
-						const funcNode = plan.aggregates[i].expression;
-						if (!(funcNode instanceof AggregateFunctionCallNode)) {
-							quereusError(`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`, StatusCode.INTERNAL);
-						}
-						const args = funcNode.args || [];
-						const argFunctions = aggregateArgFunctions[i];
-
-						const skipCoercion = aggregateSkipCoercion[i];
-						const argValues: SqlValue[] = [];
-						for (let j = 0; j < args.length; j++) {
-							const rawValue = await argFunctions[j](ctx);
-							const coercedValue = skipCoercion ? rawValue : coerceForAggregate(rawValue, funcNode.functionName || 'unknown');
-							argValues.push(coercedValue);
-						}
+						const argValuesMaybe = evalArgsSync(ctx, aggregateArgFunctions[i], aggregateValueTransforms[i]);
+						const argValues = argValuesMaybe instanceof Promise ? await argValuesMaybe : argValuesMaybe;
 
 						if (isDistinct) {
 							const distinctValue = argValues.length === 1 ? argValues[0] : argValues;
@@ -150,9 +124,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 							if (!existingPath.on) continue;
 						}
 
-						if (isAggregateFunctionSchema(schema)) {
-							accumulators[i] = schema.stepFunction(accumulators[i], ...argValues);
-						}
+						accumulators[i] = aggregateSchemas[i].stepFunction(accumulators[i], ...argValues);
 					}
 				} finally {
 					logContextPop(scanRowDescriptor, 'scan-row');
@@ -162,14 +134,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 			const aggregateRow: SqlValue[] = [];
 			for (let i = 0; i < plan.aggregates.length; i++) {
-				const schema = aggregateSchemas[i];
-				let finalValue: SqlValue;
-				if (isAggregateFunctionSchema(schema)) {
-					finalValue = schema.finalizeFunction(accumulators[i]);
-				} else {
-					finalValue = accumulators[i];
-				}
-				aggregateRow.push(finalValue);
+				aggregateRow.push(aggregateSchemas[i].finalizeFunction(accumulators[i]));
 			}
 
 			const fullRow = lastSourceRow ? [...aggregateRow, ...lastSourceRow] : aggregateRow;
@@ -203,10 +168,8 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 			try {
 				// Evaluate GROUP BY expressions
-				const groupValues: SqlValue[] = [];
-				for (const groupByFunc of groupByFunctions) {
-					groupValues.push(await groupByFunc(ctx));
-				}
+				const groupValuesMaybe = evalArgsSync(ctx, groupByFunctions);
+				const groupValues = groupValuesMaybe instanceof Promise ? await groupValuesMaybe : groupValuesMaybe;
 
 				// Serialize key using collation-aware serialization (NULLs group together per SQL standard)
 				const keyValues = hasKeyCanonicalizer
@@ -228,23 +191,10 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 				// Evaluate aggregate arguments and step accumulators
 				for (let i = 0; i < plan.aggregates.length; i++) {
-					const schema = aggregateSchemas[i];
 					const isDistinct = aggregateDistinctFlags[i];
 
-					const funcNode = plan.aggregates[i].expression;
-					if (!(funcNode instanceof AggregateFunctionCallNode)) {
-						quereusError(`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`, StatusCode.INTERNAL);
-					}
-					const args = funcNode.args || [];
-					const argFunctions = aggregateArgFunctions[i];
-
-					const skipCoercion = aggregateSkipCoercion[i];
-					const argValues: SqlValue[] = [];
-					for (let j = 0; j < args.length; j++) {
-						const rawValue = await argFunctions[j](ctx);
-						const coercedValue = skipCoercion ? rawValue : coerceForAggregate(rawValue, funcNode.functionName || 'unknown');
-						argValues.push(coercedValue);
-					}
+					const argValuesMaybe = evalArgsSync(ctx, aggregateArgFunctions[i], aggregateValueTransforms[i]);
+					const argValues = argValuesMaybe instanceof Promise ? await argValuesMaybe : argValuesMaybe;
 
 					if (isDistinct) {
 						const distinctValue = argValues.length === 1 ? argValues[0] : argValues;
@@ -252,9 +202,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 						if (!existingPath.on) continue;
 					}
 
-					if (isAggregateFunctionSchema(schema)) {
-						group.accumulators[i] = schema.stepFunction(group.accumulators[i], ...argValues);
-					}
+					group.accumulators[i] = aggregateSchemas[i].stepFunction(group.accumulators[i], ...argValues);
 				}
 			} finally {
 				logContextPop(scanRowDescriptor, 'scan-row');
@@ -271,14 +219,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 			// Finalized aggregate values
 			for (let i = 0; i < plan.aggregates.length; i++) {
-				const schema = aggregateSchemas[i];
-				let finalValue: SqlValue;
-				if (isAggregateFunctionSchema(schema)) {
-					finalValue = schema.finalizeFunction(group.accumulators[i]);
-				} else {
-					finalValue = group.accumulators[i];
-				}
-				aggregateRow.push(finalValue);
+				aggregateRow.push(aggregateSchemas[i].finalizeFunction(group.accumulators[i]));
 			}
 
 			// Set up combined context (output + representative source row) for HAVING

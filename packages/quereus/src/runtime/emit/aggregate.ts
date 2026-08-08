@@ -4,18 +4,16 @@ import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type Row, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
-import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
 import type { PlanNode, RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { isRelationalNode } from '../../planner/nodes/plan-node.js';
 import { createTypedComparator } from '../../util/comparison.js';
-import { bindAggregateSchemas, buildDistinctComparators, computeAggregateSkipCoercion } from './aggregate-setup.js';
+import { bindAggregateSchemas, buildDistinctComparators, computeAggregateValueTransforms, evalArgsSync } from './aggregate-setup.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import type { BTree } from 'inheritree';
 import { createValueSet } from '../../util/value-set.js';
 import { createLogger } from '../../common/logger.js';
 import { logContextPush, logContextPop } from '../utils.js';
-import { coerceForAggregate } from '../../util/coercion.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
@@ -109,8 +107,8 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 	}
 
 	const distinctComparators = buildDistinctComparators(plan.aggregates, ctx);
-	const aggregateSkipCoercion = computeAggregateSkipCoercion(plan.aggregates);
-	const { schemas: aggregateSchemas, distinctFlags: aggregateDistinctFlags } =
+	const aggregateValueTransforms = computeAggregateValueTransforms(plan.aggregates);
+	const { schemas: aggregateSchemas, distinctFlags: aggregateDistinctFlags, argCounts: aggregateArgCounts } =
 		bindAggregateSchemas(plan.aggregates, ctx);
 
 	async function* run(
@@ -127,26 +125,15 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 		let aggregateArgOffset = numGroupBy;
 		const aggregateArgFunctions: Array<Array<(ctx: RuntimeContext) => MaybePromise<SqlValue>>> = [];
 
-		for (const agg of plan.aggregates) {
-			const funcNode = agg.expression;
-			if (!(funcNode instanceof AggregateFunctionCallNode)) {
-				quereusError(
-					`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`,
-					StatusCode.INTERNAL
-				);
-			}
-			const args = funcNode.args || [];
-			const aggregateArgs = groupByAndAggregateArgs.slice(aggregateArgOffset, aggregateArgOffset + args.length);
-			aggregateArgFunctions.push(aggregateArgs);
-			aggregateArgOffset += args.length;
+		for (const argCount of aggregateArgCounts) {
+			aggregateArgFunctions.push(groupByAndAggregateArgs.slice(aggregateArgOffset, aggregateArgOffset + argCount));
+			aggregateArgOffset += argCount;
 		}
 
 		// Handle the case with no GROUP BY - aggregate everything into a single group
 		if (plan.groupBy.length === 0) {
 			// Initialize accumulators for each aggregate
-			const accumulators: SqlValue[] = aggregateSchemas.map(schema => {
-				return cloneInitialValue(isAggregateFunctionSchema(schema) ? schema.initialValue : undefined);
-			});
+			const accumulators: SqlValue[] = aggregateSchemas.map(schema => cloneInitialValue(schema.initialValue));
 
 			// For DISTINCT aggregates, track unique values using BTree with pre-resolved typed comparators
 			const distinctTrees: (BTree<SqlValue | SqlValue[], SqlValue | SqlValue[]> | null)[] = aggregateDistinctFlags.map((isDistinct, i) =>
@@ -167,24 +154,11 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 				try {
 					// For each aggregate, call its step function
 					for (let i = 0; i < plan.aggregates.length; i++) {
-						const schema = aggregateSchemas[i];
 						const isDistinct = aggregateDistinctFlags[i];
 
 						// Evaluate the aggregate arguments in the context of the current row
-						const argValues: SqlValue[] = [];
-						const funcNode = plan.aggregates[i].expression;
-						if (!(funcNode instanceof AggregateFunctionCallNode)) {
-							quereusError(`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`, StatusCode.INTERNAL);
-						}
-						const args = funcNode.args || [];
-						const argFunctions = aggregateArgFunctions[i];
-
-						const skipCoercion = aggregateSkipCoercion[i];
-						for (let j = 0; j < args.length; j++) {
-							const rawValue = await argFunctions[j](ctx);
-							const coercedValue = skipCoercion ? rawValue : coerceForAggregate(rawValue, funcNode.functionName || 'unknown');
-							argValues.push(coercedValue);
-						}
+						const argValuesMaybe = evalArgsSync(ctx, aggregateArgFunctions[i], aggregateValueTransforms[i]);
+						const argValues = argValuesMaybe instanceof Promise ? await argValuesMaybe : argValuesMaybe;
 
 						// Handle DISTINCT logic using BTree for proper SQL value comparison
 						if (isDistinct) {
@@ -197,9 +171,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 						}
 
 						// Call the step function
-						if (isAggregateFunctionSchema(schema)) {
-							accumulators[i] = schema.stepFunction(accumulators[i], ...argValues);
-						}
+						accumulators[i] = aggregateSchemas[i].stepFunction(accumulators[i], ...argValues);
 					}
 				} finally {
 					// Clean up scan context for this row
@@ -211,16 +183,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 			// Finalize and yield the result
 			const aggregateRow: SqlValue[] = [];
 			for (let i = 0; i < plan.aggregates.length; i++) {
-				const schema = aggregateSchemas[i];
-
-				let finalValue: SqlValue;
-				if (isAggregateFunctionSchema(schema)) {
-					finalValue = schema.finalizeFunction(accumulators[i]);
-				} else {
-					finalValue = accumulators[i];
-				}
-
-				aggregateRow.push(finalValue);
+				aggregateRow.push(aggregateSchemas[i].finalizeFunction(accumulators[i]));
 			}
 
 			// Build combined row with aggregate results + representative source row
@@ -262,30 +225,15 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 				try {
 					// Evaluate GROUP BY expressions to determine the group
-					const groupValues: SqlValue[] = [];
-					for (const groupByFunc of groupByFunctions) {
-						groupValues.push(await groupByFunc(ctx));
-					}
+					const groupValuesMaybe = evalArgsSync(ctx, groupByFunctions);
+					const groupValues = groupValuesMaybe instanceof Promise ? await groupValuesMaybe : groupValuesMaybe;
 
 					// Evaluate aggregate function arguments BEFORE checking for group changes
 					// This ensures we have the values we need even if we're about to yield the previous group
 					const currentRowArgValues: SqlValue[][] = [];
 					for (let i = 0; i < plan.aggregates.length; i++) {
-						const funcNode = plan.aggregates[i].expression;
-						if (!(funcNode instanceof AggregateFunctionCallNode)) {
-							quereusError(`Expected AggregateFunctionCallNode but got ${funcNode.constructor.name}`, StatusCode.INTERNAL);
-						}
-						const args = funcNode.args || [];
-						const argFunctions = aggregateArgFunctions[i];
-
-						const skipCoercion = aggregateSkipCoercion[i];
-						const argValues: SqlValue[] = [];
-						for (let j = 0; j < args.length; j++) {
-							const rawValue = await argFunctions[j](ctx);
-							const coercedValue = skipCoercion ? rawValue : coerceForAggregate(rawValue, funcNode.functionName || 'unknown');
-							argValues.push(coercedValue);
-						}
-						currentRowArgValues.push(argValues);
+						const argValuesMaybe = evalArgsSync(ctx, aggregateArgFunctions[i], aggregateValueTransforms[i]);
+						currentRowArgValues.push(argValuesMaybe instanceof Promise ? await argValuesMaybe : argValuesMaybe);
 					}
 
 					// Check if we've moved to a new group using proper SQL value comparison
@@ -301,16 +249,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 						// Then, add the finalized aggregate values
 						for (let i = 0; i < plan.aggregates.length; i++) {
-							const schema = aggregateSchemas[i];
-
-							let finalValue: SqlValue;
-							if (isAggregateFunctionSchema(schema)) {
-								finalValue = schema.finalizeFunction(currentAccumulators[i]);
-							} else {
-								finalValue = currentAccumulators[i];
-							}
-
-							aggregateRow.push(finalValue);
+							aggregateRow.push(aggregateSchemas[i].finalizeFunction(currentAccumulators[i]));
 						}
 
 						// Build combined row with aggregate results + representative source row
@@ -366,9 +305,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 						}
 
 						// Reset for new group
-						currentAccumulators = aggregateSchemas.map(schema => {
-							return cloneInitialValue(isAggregateFunctionSchema(schema) ? schema.initialValue : undefined);
-						});
+						currentAccumulators = aggregateSchemas.map(schema => cloneInitialValue(schema.initialValue));
 						currentDistinctTrees = aggregateDistinctFlags.map((isDistinct, i) =>
 							isDistinct ? createValueSet<SqlValue | SqlValue[]>(distinctComparators[i]) : null
 						);
@@ -378,9 +315,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 					// Initialize if first group
 					if (currentGroupKey === null) {
-						currentAccumulators = aggregateSchemas.map(schema => {
-							return cloneInitialValue(isAggregateFunctionSchema(schema) ? schema.initialValue : undefined);
-						});
+						currentAccumulators = aggregateSchemas.map(schema => cloneInitialValue(schema.initialValue));
 						currentDistinctTrees = aggregateDistinctFlags.map((isDistinct, i) =>
 							isDistinct ? createValueSet<SqlValue | SqlValue[]>(distinctComparators[i]) : null
 						);
@@ -394,7 +329,6 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 					// For each aggregate, call its step function using the pre-evaluated arguments
 					for (let i = 0; i < plan.aggregates.length; i++) {
-						const schema = aggregateSchemas[i];
 						const isDistinct = aggregateDistinctFlags[i];
 						const argValues = currentRowArgValues[i];
 
@@ -409,9 +343,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 						}
 
 						// Call the step function
-						if (isAggregateFunctionSchema(schema)) {
-							currentAccumulators[i] = schema.stepFunction(currentAccumulators[i], ...argValues);
-						}
+						currentAccumulators[i] = aggregateSchemas[i].stepFunction(currentAccumulators[i], ...argValues);
 					}
 				} finally {
 					// Clean up scan context for this row
@@ -429,16 +361,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 				// Then, add the finalized aggregate values
 				for (let i = 0; i < plan.aggregates.length; i++) {
-					const schema = aggregateSchemas[i];
-
-					let finalValue: SqlValue;
-					if (isAggregateFunctionSchema(schema)) {
-						finalValue = schema.finalizeFunction(currentAccumulators[i]);
-					} else {
-						finalValue = currentAccumulators[i];
-					}
-
-					aggregateRow.push(finalValue);
+					aggregateRow.push(aggregateSchemas[i].finalizeFunction(currentAccumulators[i]));
 				}
 
 				// Build combined row with aggregate results + representative source row

@@ -1,13 +1,16 @@
 import { AggregateFunctionCallNode } from '../../planner/nodes/aggregate-function.js';
 import type { ScalarPlanNode } from '../../planner/nodes/plan-node.js';
-import type { AggregateArgBinding, FunctionSchema } from '../../schema/function.js';
+import type { AggregateArgBinding, AggregateFunctionSchema } from '../../schema/function.js';
 import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { bindAggregateSchema } from '../../func/registration.js';
 import { createTypedComparator, hasSemanticOrdering } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { StatusCode, type SqlValue } from '../../common/types.js';
+import { StatusCode, type SqlValue, type MaybePromise } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
+import { tryCoerceToNumber } from '../../util/coercion.js';
+import { resolveMaybe } from '../async-util.js';
 import type { EmissionContext } from '../emission-context.js';
+import type { RuntimeContext } from '../types.js';
 
 /**
  * Emit-time setup shared by the stream and hash aggregate emitters: both walk the
@@ -66,13 +69,20 @@ function requireAggregateCall(agg: AggregateExpr): AggregateFunctionCallNode {
  * {@link import('../../schema/function.js').AggregateFunctionSchema.bindArgs}) steps
  * and merges by the argument's semantic order. Nothing in the per-row path then has
  * to resolve a type or a collation.
+ *
+ * The returned `schemas` are already narrowed to {@link AggregateFunctionSchema} (the
+ * `isAggregateFunctionSchema` check above throws INTERNAL on mismatch) and `argCounts`
+ * captures each call site's argument count — row loops need neither an
+ * `instanceof AggregateFunctionCallNode` re-check nor a `isAggregateFunctionSchema`
+ * re-check to use `stepFunction` / `finalizeFunction` or to size their argument loop.
  */
 export function bindAggregateSchemas(
 	aggregates: readonly AggregateExpr[],
 	ctx: EmissionContext,
-): { schemas: FunctionSchema[]; distinctFlags: boolean[] } {
-	const schemas: FunctionSchema[] = [];
+): { schemas: AggregateFunctionSchema[]; distinctFlags: boolean[]; argCounts: number[] } {
+	const schemas: AggregateFunctionSchema[] = [];
 	const distinctFlags: boolean[] = [];
+	const argCounts: number[] = [];
 	for (const agg of aggregates) {
 		const funcNode = requireAggregateCall(agg);
 		const funcSchema = funcNode.functionSchema;
@@ -82,10 +92,12 @@ export function bindAggregateSchemas(
 				StatusCode.INTERNAL
 			);
 		}
-		schemas.push(bindAggregateSchema(funcSchema, (funcNode.args || []).map(arg => argComparisonContext(arg, ctx))));
+		const args = funcNode.args || [];
+		schemas.push(bindAggregateSchema(funcSchema, args.map(arg => argComparisonContext(arg, ctx))));
 		distinctFlags.push(funcNode.isDistinct);
+		argCounts.push(args.length);
 	}
-	return { schemas, distinctFlags };
+	return { schemas, distinctFlags, argCounts };
 }
 
 /** Pre-resolved typed comparators for DISTINCT aggregate argument tracking. */
@@ -116,22 +128,53 @@ export function buildDistinctComparators(
 }
 
 /**
- * Per-aggregate: may `coerceForAggregate` be skipped for this call site? Skipped when
- * the aggregate never coerces anyway, when every argument is already numeric, or when
- * every argument type carries semantic ordering (TIMESPAN/JSON) — the numeric-string
- * conversion must never run ahead of a type-aware comparator.
+ * Per-aggregate value transform, replacing a per-row `coerceForAggregate(value,
+ * functionName)` call with a closure resolved once at emit time. `undefined` means the
+ * call site never coerces — the aggregate never coerces its arguments (COUNT,
+ * GROUP_CONCAT, JSON_*), every argument is already numeric, or every argument type
+ * carries semantic ordering (TIMESPAN/JSON) where the numeric-string conversion must
+ * never run ahead of a type-aware comparator. Otherwise the closure applies exactly the
+ * value-level conversion `coerceForAggregate` performs (string → number when the
+ * trimmed value parses), with the function-name routing already decided.
  */
-export function computeAggregateSkipCoercion(aggregates: readonly AggregateExpr[]): boolean[] {
+export function computeAggregateValueTransforms(
+	aggregates: readonly AggregateExpr[],
+): Array<((value: SqlValue) => SqlValue) | undefined> {
 	return aggregates.map(agg => {
 		const funcNode = agg.expression;
-		if (!(funcNode instanceof AggregateFunctionCallNode)) return false;
+		if (!(funcNode instanceof AggregateFunctionCallNode)) return undefined;
 		const funcName = (funcNode.functionName || '').toUpperCase();
 		// COUNT, GROUP_CONCAT and JSON_* never coerce their arguments.
-		if (funcName === 'COUNT' || funcName === 'GROUP_CONCAT' || funcName.startsWith('JSON_')) return false;
+		if (funcName === 'COUNT' || funcName === 'GROUP_CONCAT' || funcName.startsWith('JSON_')) return undefined;
 		const args = funcNode.args || [];
-		return args.length > 0 && (
+		const skip = args.length > 0 && (
 			args.every(arg => arg.getType().logicalType.isNumeric)
 			|| args.every(arg => hasSemanticOrdering(arg.getType().logicalType as LogicalType))
 		);
+		if (skip) return undefined;
+		return (value: SqlValue): SqlValue =>
+			typeof value === 'string' && value.trim() !== '' ? tryCoerceToNumber(value) : value;
 	});
+}
+
+/**
+ * Evaluate N argument-evaluator closures against the same row context, applying an
+ * optional per-value transform, without paying a microtask hop when every closure
+ * resolves synchronously (the common case — see {@link resolveMaybe}). Shared by the
+ * stream/hash aggregate step loops (grouped and ungrouped) and GROUP BY key evaluation.
+ */
+export function evalArgsSync(
+	rctx: RuntimeContext,
+	fns: readonly ((ctx: RuntimeContext) => MaybePromise<SqlValue>)[],
+	transform?: (value: SqlValue) => SqlValue,
+): MaybePromise<SqlValue[]> {
+	const n = fns.length;
+	const results = new Array<MaybePromise<SqlValue>>(n);
+	let hasAsync = false;
+	for (let j = 0; j < n; j++) {
+		const mapped = transform ? resolveMaybe(fns[j](rctx), transform) : fns[j](rctx);
+		if (mapped instanceof Promise) hasAsync = true;
+		results[j] = mapped;
+	}
+	return hasAsync ? Promise.all(results) : (results as SqlValue[]);
 }
