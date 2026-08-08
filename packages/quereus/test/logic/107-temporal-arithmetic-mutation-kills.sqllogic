@@ -567,6 +567,150 @@ SELECT timespan('P1M') / 2 AS result;
 → [{"result":"PT0S"}]
 
 -- ============================================================
+-- The three emit-time arms, over COLUMNS
+--
+-- Every case above operates on literals, which constant-fold before a row is ever
+-- scanned. These run the same shapes per row instead, so each of the three arms of
+-- the temporal branch in runtime/emit/binary.ts is exercised where it matters:
+--   arm 1  both declared kinds resolve and the operation table has a case
+--   arm 2  both resolve and the table has NO case (a constant-throw body)
+--   arm 3  a declared type settles nothing, so runtime value sniffing decides
+-- The emitted note for each is asserted in test/runtime/scalar-op-spec.spec.ts.
+-- ============================================================
+
+CREATE TABLE arms (
+  id INTEGER PRIMARY KEY,
+  dt DATE, dt2 DATE,
+  sp TIMESPAN, sp2 TIMESPAN,
+  txt TEXT,
+  n INTEGER
+);
+INSERT INTO arms VALUES
+  (1, '2024-01-20', '2024-01-15', 'P1D', 'PT12H', 'PT1H', 2),
+  (2, '2024-03-01', '2024-02-01', 'P2D', 'PT6H', 'P3D', 3);
+-- run
+
+-- arm 1: DATE + TIMESPAN, case fixed at emit
+SELECT id, dt + sp AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"2024-01-21"},{"id":2,"r":"2024-03-03"}]
+
+-- arm 1: DATE - DATE announces TIMESPAN, and the value agrees
+SELECT id, dt - dt2 AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"P5D"},{"id":2,"r":"P29D"}]
+
+-- arm 1: TIMESPAN * NUMBER
+SELECT id, sp2 * n AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"PT86400S"},{"id":2,"r":"PT64800S"}]
+
+-- arm 3: a TEXT operand settles nothing at emit, so the value decides — and this
+-- value does look like a duration, so the (timespan, timespan) case still applies
+SELECT id, txt + sp AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"P1DT1H"},{"id":2,"r":"P5D"}]
+
+-- Deep chain: every level specializes on the level below's announced type.
+-- (dt + sp) is a DATE, minus dt2 is a TIMESPAN, plus sp2 is a TIMESPAN.
+SELECT id, dt + sp - dt2 + sp2 AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"P6DT12H"},{"id":2,"r":"P31DT6H"}]
+
+-- arm 2: no case for DATE + DATE. The throw is per row, not at emit — so a query
+-- that never evaluates the expression still succeeds (next three).
+SELECT id, dt + dt2 AS r FROM arms ORDER BY id;
+-- error: Unsupported temporal operation
+
+-- ...guarded by a CASE that never selects it
+SELECT id, CASE WHEN 0 THEN dt + dt2 ELSE 'skipped' END AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"skipped"},{"id":2,"r":"skipped"}]
+
+-- ...filtered out before evaluation
+SELECT dt + dt2 AS r FROM arms WHERE 1 = 0;
+→ []
+
+-- ...or over no rows at all
+CREATE TABLE arms_empty (id INTEGER PRIMARY KEY, dt DATE, dt2 DATE);
+-- run
+SELECT dt + dt2 AS r FROM arms_empty;
+→ []
+DROP TABLE arms_empty;
+
+-- ============================================================
+-- NULL short-circuits ahead of the arm choice, on all three arms
+--
+-- All three bodies null-check before doing anything else, so a NULL operand is
+-- NULL rather than an error — including on arm 2, where a non-NULL pair throws.
+-- ============================================================
+
+CREATE TABLE arm_nulls (id INTEGER PRIMARY KEY, dt DATE NULL, dt2 DATE NULL, sp TIMESPAN NULL, txt TEXT NULL, n INTEGER NULL);
+INSERT INTO arm_nulls VALUES (1, null, null, null, null, null);
+-- run
+
+-- arm 1 (date, timespan) with a NULL operand
+SELECT dt + sp AS r FROM arm_nulls;
+→ [{"r":null}]
+
+-- arm 1 (timespan, number) with a NULL operand
+SELECT sp * n AS r FROM arm_nulls;
+→ [{"r":null}]
+
+-- arm 2 (date, date) — no case exists, yet NULL still wins over the throw
+SELECT dt + dt2 AS r FROM arm_nulls;
+→ [{"r":null}]
+
+-- arm 3 (text, date)
+SELECT txt - dt AS r FROM arm_nulls;
+→ [{"r":null}]
+
+DROP TABLE arm_nulls;
+
+-- ============================================================
+-- A bigint on the NUMBER side of `*` / `/`
+--
+-- `sp * big` resolves to the (timespan, number) case at emit, and the case's own
+-- `typeof n === 'number'` guard then rejects the bigint — the same error the
+-- value-sniffed path produced, reached by a different route. This is the one place
+-- that guard is reachable (see the NOTE on scaleTimespan in types/temporal-ops.ts).
+-- ============================================================
+
+CREATE TABLE bigmul (id INTEGER PRIMARY KEY, sp TIMESPAN, big INTEGER);
+INSERT INTO bigmul VALUES (1, 'PT1H', 9007199254740993);
+-- run
+
+SELECT sp * big AS r FROM bigmul;
+-- error: Unsupported temporal operation
+
+SELECT sp / big AS r FROM bigmul;
+-- error: Unsupported temporal operation
+
+DROP TABLE bigmul;
+
+-- ============================================================
+-- A DATE-declared column cannot hold a value that is not a DATE
+--
+-- The specialized arm trusts the declared type: a DATE-typed operand holding a
+-- non-parseable string would return null where value sniffing raised
+-- `Unsupported temporal operation`. These pin the two ways a caller might try to
+-- manufacture such a value — write-side coercion rejects the insert outright, and a
+-- failed CAST yields NULL rather than the garbage string — so the divergence is not
+-- reachable through SQL. Only a misbehaving virtual table could produce one.
+-- ============================================================
+
+CREATE TABLE trust (id INTEGER PRIMARY KEY, dt DATE, sp TIMESPAN);
+-- run
+
+INSERT INTO trust VALUES (1, 'garbage', 'PT1H');
+-- error: Cannot convert 'garbage' to DATE
+
+INSERT INTO trust VALUES (2, '2024-01-15', 'PT1H');
+-- run
+
+-- a failed cast is NULL, so the null check answers before the declared type matters
+SELECT cast('garbage' as DATE) + sp AS r FROM trust;
+→ [{"r":null}]
+
+DROP TABLE trust;
+
+DROP TABLE arms;
+
+-- ============================================================
 -- Temporal arithmetic in WHERE clause (ensures dispatch path is exercised)
 -- ============================================================
 

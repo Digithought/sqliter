@@ -1,9 +1,4 @@
 import type { SqlValue } from "../../common/types.js";
-import type { Instruction, RuntimeContext } from "../types.js";
-import { asRun } from "../types.js";
-import type { BinaryOpNode } from "../../planner/nodes/scalar.js";
-import { emitPlanNode } from "../emitters.js";
-import type { EmissionContext } from "../emission-context.js";
 import { TIMESPAN_TYPE } from "../../types/temporal-types.js";
 import {
 	isTemporalKind,
@@ -40,27 +35,6 @@ export function tryTemporalArithmetic(operator: string, v1: SqlValue, v2: SqlVal
 }
 
 /**
- * Emit temporal arithmetic operations
- * Handles operations between temporal types (DATE, TIME, DATETIME, TIMESPAN)
- */
-export function emitTemporalArithmetic(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	const operator = plan.expression.operator;
-
-	function run(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
-		return tryTemporalArithmetic(operator, v1, v2) ?? null;
-	}
-
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
-	return {
-		params: [leftExpr, rightExpr],
-		run: asRun(run),
-		note: `${operator}(temporal)`
-	};
-}
-
-/**
  * Attempts to perform temporal comparison. Returns undefined if not a temporal comparison.
  * This allows the caller to fall back to standard comparison logic.
  *
@@ -70,6 +44,18 @@ export function emitTemporalArithmetic(plan: BinaryOpNode, ctx: EmissionContext)
  *
  * Note: DATE, TIME, and DATETIME use ISO 8601 format which compares correctly lexicographically,
  * so they don't need special handling here.
+ *
+ * NOTE: deliberately NOT given the emit-time specialization `buildNumericOpSpec`'s temporal
+ * arm got. The shapes look alike, but the economics do not:
+ *  - the per-row cost here is one `startsWith` per operand, not four regexes — TIMESPAN is
+ *    the only temporal type whose text order differs from its semantic order, so it is the
+ *    only one {@link tryTemporalCompare} probes for;
+ *  - `buildComparisonOpSpec` already bypasses this function for the hot case: two operands
+ *    of the same semantic-ordering type take the `sharedSemanticType` path
+ *    (`=(compare-typed)`) and never reach the generic comparison run;
+ *  - what is left is the mixed TIMESPAN-vs-TEXT/ANY shape, where runtime sniffing is the
+ *    defined semantics and cannot be resolved from the declared types anyway.
+ * Revisit only if a profile shows the generic comparison run hot on temporal operands.
  *
  * @param operator The comparison operator (=, !=, <, <=, >, >=)
  * @param v1 First value

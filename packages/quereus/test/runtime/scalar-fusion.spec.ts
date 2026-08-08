@@ -385,6 +385,59 @@ describe('scalar fusion', () => {
 				from t order by id`);
 		});
 
+		it('temporal arithmetic stays parity across all three emit-time arms', async () => {
+			// `buildNumericOpSpec`'s temporal branch picks one of three bodies at emit
+			// (specialized case / statically unsupported / runtime-sniffed fallback). All
+			// three are plain two-operand `SqlValue` bodies, so fusion composes them the
+			// same way it composes `+(numeric-fast)` — this pins that it does.
+			await setup(
+				'create table t (id integer primary key, dt date null, dt2 date null, sp timespan null, txt text null, n integer null)',
+				`insert into t values
+					(1, '2024-01-20', '2024-01-15', 'P1D', 'PT1H', 2),
+					(2, '2024-03-01', '2024-02-01', 'PT6H', 'P3D', 3),
+					(3, null, null, null, null, null)`,
+			);
+			const rows = await expectParity(`
+				select id,
+					dt + sp as c1,
+					dt - dt2 as c2,
+					sp * n as c3,
+					sp / n as c4,
+					txt + sp as c5,
+					dt + sp - dt2 as c6,
+					(dt + sp - dt2) + sp as c7
+				from t order by id`);
+			// Spot-check row 1 so a parity pass over two identically-wrong paths cannot
+			// masquerade as a success.
+			expect(rows[0]).to.deep.equal({
+				id: 1, c1: '2024-01-21', c2: 'P5D', c3: 'PT172800S', c4: 'PT43200S',
+				c5: 'P1DT1H', c6: 'P6D', c7: 'P7D',
+			});
+		});
+
+		it('the statically-unsupported temporal arm throws identically fused or unfused', async () => {
+			// DATE + DATE has no case in the operation table, so the emitted body is a
+			// constant throw. Fused or not, the error must be the same — and must still be
+			// raised per row rather than at emit (the empty-table query below succeeds).
+			await setup(
+				'create table t (id integer primary key, dt date null, dt2 date null)',
+				"insert into t values (1, '2024-01-20', '2024-01-15')",
+			);
+			const messages: string[] = [];
+			for (const db of [fusedDb, unfusedDb]) {
+				try {
+					await collect(db, 'select dt + dt2 as v from t');
+					expect.fail('an unsupported temporal pair must throw');
+				} catch (e) {
+					messages.push((e as Error).message);
+				}
+			}
+			expect(messages[0]).to.match(/Unsupported temporal operation/);
+			expect(messages[0], 'fused and unfused unsupported-temporal errors').to.equal(messages[1]);
+			// The same expression over no rows never evaluates, so it must not throw.
+			await expectParity('select dt + dt2 as v from t where 1 = 0');
+		});
+
 		it('a fused CHECK predicate rejects and reports identically', async () => {
 			await setup('create table t (id integer primary key, n integer, check (n * 2 < 10))');
 			const messages: string[] = [];

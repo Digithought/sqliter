@@ -260,8 +260,35 @@ which operator routes to which body.
 The point is that the body has two consumers: `emitScalarOp` wraps it as an `Instruction`
 the scheduler dispatches, and the scalar-fusion compiler composes it directly into a closure
 chain with no scheduler. Keeping the body in one place is what stops the two from drifting
-as emit-time specializations accumulate (`+(numeric-fast)` vs `+(temporal)`,
+as emit-time specializations accumulate (`+(numeric-fast)` vs `+(temporal-date-timespan)`,
 `=(compare-typed)` vs `=(compare-fast)`, `LIKE(like-const)` vs `LIKE(like)`).
+
+**Emit-time specializations, and what each note means.** A spec builder reads the operands'
+*declared* types and picks the narrowest body that can be correct, once, instead of
+re-deciding per row. The tag inside the note names which body was picked, so
+`scheduler_program()` / `EXPLAIN` shows whether a specialization engaged:
+
+| Note | Selected when | Per-row cost it removes |
+| --- | --- | --- |
+| `+(numeric-fast)` | both operands numeric, neither temporal | the temporal probe and arithmetic coercion |
+| `+(numeric)` | anything else non-temporal (TEXT, mixed) | — (the general body) |
+| `+(temporal-date-timespan)` | both operands' temporal kinds resolve **and** `types/temporal-ops.ts` has a case for `(operator, left kind, right kind)` | deriving both operand kinds from the values (up to four shape probes each) before the same table lookup |
+| `+(temporal-unsupported)` | both kinds resolve and the table has **no** case (`date + date`, `date * number`, anything with `%`) | as above; the body is a NULL check plus a constant throw. The throw stays at *runtime* deliberately — a guarded, filtered-out, or empty-table occurrence must keep succeeding |
+| `+(temporal)` | at least one declared type settles nothing: TEXT, ANY, NULL, TIMESTAMP, or a plugin-registered temporal type | nothing — runtime value sniffing *is* the defined semantics there |
+| `=(compare-typed)` | both operands the same logical type with semantic ordering (TIMESPAN, JSON) | the generic compare and its temporal probe |
+| `=(compare-fast)` | both operands the same category (numeric or textual), neither temporal | the temporal probe |
+| `LIKE(like-const)` | the pattern is a literal constant | compiling (or cache-looking-up) the matcher |
+
+The temporal rows carry one trade worth knowing: `temporal-date-timespan` and its siblings
+**trust the declared type**. A DATE-declared operand actually holding a non-parseable string
+yields NULL there, where the sniffing body raised `Unsupported temporal operation`. Write-side
+coercion enforces declared logical types on every path SQL can reach (a bad INSERT is
+rejected; a failed CAST is NULL), so only a misbehaving virtual table can produce such a
+value.
+
+The comparison twin, `tryTemporalComparison`, is deliberately *not* specialized this way —
+its per-row cost is one `startsWith` per operand, and `buildComparisonOpSpec` already routes
+the hot case to `=(compare-typed)` before reaching it.
 
 `spec.operands` is what becomes `Instruction.params` — **not** the plan node's children.
 `buildLikeOpSpec`'s constant-pattern fast path bakes the pattern into its closure and declares

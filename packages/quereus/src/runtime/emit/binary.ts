@@ -17,6 +17,7 @@ import { valueToText } from "../../util/value-text.js";
 import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
+import { runTemporalCase, temporalKindOfType, temporalOpCase, unsupportedTemporalOp } from "../../types/temporal-ops.js";
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
 import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 
@@ -154,31 +155,76 @@ export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	let note: string;
 
 	if (leftLogical.isTemporal || rightLogical.isTemporal) {
-		// Temporal path: must check temporal arithmetic first
-		run = function runTemporalArithmetic(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
-			const temporalResult = tryTemporalArithmetic(plan.expression.operator, v1, v2);
-			if (temporalResult !== undefined) {
-				return temporalResult;
-			}
+		// Temporal path. Both operands' declared logical types are already in hand — that
+		// is *why* this branch was selected — so the (operator, left kind, right kind)
+		// lookup into the operation table (types/temporal-ops.ts) happens once here rather
+		// than once per row. Three arms, chosen at emit:
+		const lk = temporalKindOfType(leftLogical);
+		const rk = temporalKindOfType(rightLogical);
+		const entry = lk && rk ? temporalOpCase(plan.expression.operator, lk, rk) : undefined;
 
-			if (v1 !== null && v2 !== null) {
-				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
-					return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
-				} else {
-					const n1 = coerceToNumberForArithmetic(v1);
-					const n2 = coerceToNumberForArithmetic(v2);
-					try {
-						const result = inner(n1, n2);
-						if (!Number.isFinite(result)) return null;
-						return result;
-					} catch {
-						return null;
+		if (lk && rk && entry) {
+			// (1) Specialized: the case is fixed, so the per-row path is one call into the
+			// shared envelope — no value sniffing at all.
+			//
+			// This arm TRUSTS the declared types. A DATE-declared operand actually holding
+			// `'garbage'` returns null here (runTemporalCase's catch), where the sniffing
+			// path below would have raised `Unsupported temporal operation`. That is the
+			// intended trade: write-side coercion enforces declared logical types on every
+			// normal path, so only a misbehaving virtual table can produce such a value.
+			run = function runTemporalCased(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+				return runTemporalCase(entry, v1, v2);
+			};
+			note = `${plan.expression.operator}(temporal-${lk}-${rk})`;
+		} else if (lk && rk) {
+			// (2) Statically unsupported: both kinds are known and the table has no case
+			// for them (DATE + DATE, DATE * NUMBER, TIME − DATE, anything with `%`), so no
+			// combination of runtime values can succeed.
+			//
+			// The throw deliberately stays at RUNTIME rather than moving to emit/plan time.
+			// Today the error is raised only when a row is actually evaluated, so
+			// `select case when 0 then date_a + date_b else 1 end`, the same expression
+			// under `where 1 = 0`, and the same expression over an empty table all succeed.
+			// Hoisting the throw would turn each into a hard failure for no gain — a
+			// constant-throw closure costs nothing per row on the paths that never run it.
+			//
+			// The null check is load-bearing: `date_a + date_b` with a NULL operand returns
+			// null today rather than erroring, and must keep doing so.
+			run = function runTemporalUnsupported(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+				if (v1 === null || v2 === null) return null;
+				unsupportedTemporalOp();
+			};
+			note = `${plan.expression.operator}(temporal-unsupported)`;
+		} else {
+			// (3) Fallback: at least one operand is TEXT / ANY / NULL / TIMESTAMP / a
+			// plugin-registered temporal type, so the declared types cannot settle the
+			// case. Runtime sniffing IS the defined semantics there (a TEXT column holding
+			// a duration string is a supported shape) — body unchanged.
+			run = function runTemporalArithmetic(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+				const temporalResult = tryTemporalArithmetic(plan.expression.operator, v1, v2);
+				if (temporalResult !== undefined) {
+					return temporalResult;
+				}
+
+				if (v1 !== null && v2 !== null) {
+					if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
+						return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
+					} else {
+						const n1 = coerceToNumberForArithmetic(v1);
+						const n2 = coerceToNumberForArithmetic(v2);
+						try {
+							const result = inner(n1, n2);
+							if (!Number.isFinite(result)) return null;
+							return result;
+						} catch {
+							return null;
+						}
 					}
 				}
-			}
-			return null;
-		};
-		note = `${plan.expression.operator}(temporal)`;
+				return null;
+			};
+			note = `${plan.expression.operator}(temporal)`;
+		}
 	} else if (leftLogical.isNumeric && rightLogical.isNumeric) {
 		// Numeric-only path: skip temporal check and coercion entirely
 		//

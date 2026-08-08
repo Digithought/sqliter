@@ -57,7 +57,7 @@ describe('scalar op specs', () => {
 		beforeEach(async () => {
 			db = new Database();
 			await db.exec('create table t (id integer primary key, n integer not null, m integer not null, s text not null)');
-			await db.exec('create table d (id integer primary key, d1 date not null, d2 date not null, d3 date not null, d4 date not null)');
+			await db.exec('create table d (id integer primary key, d1 date not null, d2 date not null, d3 date not null, d4 date not null, sp timespan not null, txt text not null)');
 		});
 
 		afterEach(async () => {
@@ -85,6 +85,18 @@ describe('scalar op specs', () => {
 			// instead of the generic path — so this note is the planner-side proof that
 			// the table's result type reached `generateType`.
 			['comparison of two date differences', 'select (d2 - d1) = (d4 - d3) from d', '=(compare-typed)'],
+			// The three arms of the temporal branch of `buildNumericOpSpec`, each chosen at
+			// emit from the operands' DECLARED types (types/temporal-ops.ts):
+			//  1. both kinds known and the table has a case — the per-row path is one call
+			//     into that case, with no value sniffing at all;
+			['temporal pair the table has a case for', 'select d1 + sp from d', '+(temporal-date-timespan)'],
+			//  2. both kinds known and the table has NO case — statically doomed, so the
+			//     body is a constant throw (still raised per row, not at emit time);
+			['temporal pair the table has no case for', 'select d1 + d2 from d', '+(temporal-unsupported)'],
+			//  3. a declared type that settles nothing (TEXT here; also ANY / NULL /
+			//     TIMESTAMP / a plugin-registered temporal type) — runtime value sniffing,
+			//     which is the defined semantics for those operands.
+			['temporal operand whose declared type settles nothing', 'select txt - d1 from d', '-(temporal)'],
 			['concat', "select s || s from t", '||(concat)'],
 			['constant-pattern LIKE', "select s like 'a%' from t", 'LIKE(like-const)'],
 			['dynamic-pattern LIKE', 'select s like s from t', 'LIKE(like)'],

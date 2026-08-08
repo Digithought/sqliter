@@ -74,6 +74,31 @@ async function createTextDb() {
 	return db;
 }
 
+/**
+ * Build and populate a 10K-row database with a DATE column and a TIMESPAN column,
+ * so `d + s` over a full scan is one temporal add per row. Both columns are
+ * DECLARED temporal, which is what lets `buildNumericOpSpec` resolve the
+ * (operator, kind, kind) case once at emit instead of re-deriving both operand
+ * kinds from the values on every row (see runtime/emit/binary.ts).
+ */
+async function createTemporalDb() {
+	const db = new Database();
+	await db.exec('create table bench_temporal_t (id integer primary key, d date, s timespan)');
+
+	for (let batch = 0; batch < 20; batch++) {
+		const values = Array.from({ length: 500 }, (_, j) => {
+			const id = batch * 500 + j + 1;
+			// Spread over 2024 (a leap year, 366 days) so the dates are not all identical.
+			const day = String((id % 28) + 1).padStart(2, '0');
+			const month = String((id % 12) + 1).padStart(2, '0');
+			return `(${id}, '2024-${month}-${day}', 'P${(id % 30) + 1}D')`;
+		}).join(', ');
+		await db.exec(`insert into bench_temporal_t values ${values}`);
+	}
+
+	return db;
+}
+
 /** Build and populate a 10K-row database with a text primary key (zero-padded so
  * lexicographic order matches insertion order, making range bounds predictable). */
 async function createTextPkDb() {
@@ -102,6 +127,32 @@ export const benchmarks = [
 		async teardown() { await db.close(); db = null; },
 		async fn() {
 			const rows = await collect(db.eval('select * from bench_t'));
+			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
+		},
+	},
+	{
+		// One DATE + TIMESPAN add per row over a full scan. Both operands are declared
+		// temporal, so the operation-table lookup resolves at emit and the per-row path
+		// is a single call into the selected case; before that, each row re-derived both
+		// operand kinds from the values (four regex/prefix probes each). Scan overhead is
+		// shared with `full-scan-10k`, so the delta between the two isolates the add.
+		//
+		// NOTE: deliberately NOT given a `ratioGuards` entry — those bound a pathological
+		// plan regression (an N+1 scan), not a constant factor like this one.
+		//
+		// NOTE: measured ~90 ms specialized vs ~103 ms on the value-sniffed body (medians of
+		// 4 runs each, `full-scan-10k` steady at ~12 ms across all 8). So dispatch is ~1.2 µs
+		// of the ~9 µs each row spends here — the other ~8 µs is temporal-polyfill parsing
+		// (`Temporal.PlainDate.from` + `Temporal.Duration.from`, re-parsed per row even when
+		// one operand is a constant). If this shape ever needs to be materially faster,
+		// that parse is the target, not the dispatch.
+		name: 'temporal-arith-scan-10k',
+		iterations: 10,
+		warmup: 2,
+		async setup() { db = await createTemporalDb(); },
+		async teardown() { await db.close(); db = null; },
+		async fn() {
+			const rows = await collect(db.eval('select d + s as a from bench_temporal_t'));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
 		},
 	},
