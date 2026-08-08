@@ -474,7 +474,9 @@ Scalar **function calls are not yet fused** (their sync/async split is pending),
 any subtree containing one declines; subqueries, window/aggregate/relational nodes
 decline as unknown node types. A subtree deeper than `MAX_FUSION_DEPTH` (32) declines
 whole — fused closures nest on the JS call stack where the scheduler's linearized
-loop did not.
+loop did not — but the fallback emission still reaches nested `emitCallFromPlan` sites
+(CASE branches, an AND/OR short-circuit right leg), each of which retries fusion from
+depth 0, so a deep tree fuses in pieces below those seams.
 
 Fusion is off when `trace_plan_stack = true` (fused frames would silently vanish from
 `ctx.planStack`) or when the `runtime_fuse_scalars` db option (default `true`) is set

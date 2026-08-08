@@ -120,10 +120,9 @@ export class EmissionContext {
 		public readonly db: Database,
 		options?: { fuseScalars?: boolean },
 	) {
-		const option = db.getOption('trace_plan_stack');
-		this.tracePlanStack = typeof option === 'object' && option !== null && 'value' in option
-			? Boolean((option as { value: unknown }).value)
-			: Boolean(option);
+		// Both options are registered `type: 'boolean'`, and `setOption` converts on the
+		// way in, so the stored value is always a boolean — read it as one.
+		this.tracePlanStack = db.options.getBooleanOption('trace_plan_stack');
 		this.fuseScalars = options?.fuseScalars
 			?? (!this.tracePlanStack && db.options.getBooleanOption('runtime_fuse_scalars'));
 		this.schemaManager = db.schemaManager;

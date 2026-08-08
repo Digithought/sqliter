@@ -605,7 +605,8 @@ pragma default_column_nullability;
 | `foreign_keys` | boolean | `true` | Enable foreign key constraint enforcement. When omitted, ON DELETE / ON UPDATE default to RESTRICT. Alias: `fk_enforcement` |
 | `runtime_stats` | boolean | `false` | Enable runtime execution statistics collection. Alias: `runtime_metrics` |
 | `validate_plan` | boolean | `false` | Enable plan validation before execution. Alias: `plan_validation` |
-| `trace_plan_stack` | boolean | `false` | Enable plan stack tracing for debugging |
+| `trace_plan_stack` | boolean | `false` | Enable plan stack tracing for debugging (also disables scalar fusion) |
+| `runtime_fuse_scalars` | boolean | `true` | Compile pure synchronous scalar expression subtrees into single fused closures instead of per-row sub-programs (see `docs/runtime.md` § Scalar fusion). Kill switch for bisecting a suspected fusion bug; baked into a prepared statement at emit time, so recompile to pick up a change |
 
 ### Type-Safe Getters
 

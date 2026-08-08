@@ -54,6 +54,11 @@ async function collect(db: Database, sql: string, params?: SqlValue[]): Promise<
 	return rows;
 }
 
+/** `select ? + 1 + 1 … as v` — n left-associative operators, so the tree nests n deep. */
+function chain(n: number): string {
+	return 'select ?' + ' + 1'.repeat(n) + ' as v';
+}
+
 describe('scalar fusion', () => {
 	describe('tryFuseScalar (unit)', () => {
 		let db: Database;
@@ -105,13 +110,46 @@ describe('scalar fusion', () => {
 		});
 
 		it('declines past MAX_FUSION_DEPTH but fuses below it', () => {
-			const chain = (n: number) => 'select ?' + ' + 1'.repeat(n) + ' as v';
 			const shallow = fuseFrom(chain(10), PlanNodeType.BinaryOp);
 			expect(shallow).to.be.a('function');
 			expect(shallow!(makeRctx(db, { 1: 0 }))).to.equal(10);
 
 			const deep = fuseFrom(chain(MAX_FUSION_DEPTH + 8), PlanNodeType.BinaryOp);
 			expect(deep, 'a subtree past the depth cap falls back whole').to.equal(undefined);
+		});
+
+		it('the depth cap is exact: a chain AT the cap fuses, one deeper does not', () => {
+			// `? + 1 + 1 + …` parses left-associative, so n operators nest n deep and the
+			// innermost operands land at depth n. Pinning both sides of the boundary keeps
+			// a future refactor from silently shifting the cap by one.
+			const atCap = fuseFrom(chain(MAX_FUSION_DEPTH), PlanNodeType.BinaryOp);
+			expect(atCap, 'a chain exactly at the cap still fuses').to.be.a('function');
+			expect(atCap!(makeRctx(db, { 1: 0 }))).to.equal(MAX_FUSION_DEPTH);
+
+			expect(fuseFrom(chain(MAX_FUSION_DEPTH + 1), PlanNodeType.BinaryOp),
+				'one operator past the cap declines').to.equal(undefined);
+		});
+
+		it('declines a simple CASE whose base expression cannot fuse', () => {
+			// Base declines (function call) => the whole CASE declines, rather than
+			// half-fusing the branches into a mixed contract.
+			const fused = fuseFrom(
+				`select case lower(?) when 'a' then 1 else 2 end as v`, PlanNodeType.CaseExpr);
+			expect(fused).to.equal(undefined);
+		});
+
+		it('fused simple CASE with a NULL base matches no WHEN and takes the ELSE', () => {
+			const fused = fuseFrom(`select case ? when 1 then 'one' else 'other' end as v`, PlanNodeType.CaseExpr);
+			expect(fused).to.be.a('function');
+			expect(fused!(makeRctx(db, { 1: 1 }))).to.equal('one');
+			expect(fused!(makeRctx(db, { 1: null })), 'NULL base matches nothing').to.equal('other');
+		});
+
+		it('fused simple CASE with a NULL base and no ELSE yields NULL', () => {
+			const fused = fuseFrom(`select case ? when 1 then 'one' end as v`, PlanNodeType.CaseExpr);
+			expect(fused).to.be.a('function');
+			expect(fused!(makeRctx(db, { 1: null }))).to.equal(null);
+			expect(fused!(makeRctx(db, { 1: 2 })), 'no match and no ELSE').to.equal(null);
 		});
 
 		it('honors the fuseScalars=false override', () => {
@@ -221,6 +259,56 @@ describe('scalar fusion', () => {
 			const terms = MAX_FUSION_DEPTH + 8;
 			const rows = await expectParity(`select id, n${' + 1'.repeat(terms)} as v from t order by id`);
 			expect(rows).to.deep.equal([{ id: 1, v: terms }, { id: 2, v: 100 + terms }]);
+		});
+
+		it('a CASE nested inside a past-cap expression still answers correctly', async () => {
+			// The outer chain declines on depth, but the fallback emission re-offers each
+			// CASE branch to the fusion compiler at depth 0 — the partial-fusion seam the
+			// MAX_FUSION_DEPTH doc describes. Parity is what makes that seam safe.
+			await setup(
+				'create table t (id integer primary key, n integer)',
+				'insert into t values (1, 0), (2, 5)',
+			);
+			const terms = MAX_FUSION_DEPTH + 8;
+			const rows = await expectParity(
+				`select id, (case when n = 0 then n + 1 else n * 2 end)${' + 1'.repeat(terms)} as v from t order by id`);
+			expect(rows).to.deep.equal([{ id: 1, v: 1 + terms }, { id: 2, v: 10 + terms }]);
+		});
+
+		it('NULL propagation through fused operators matches the instruction path', async () => {
+			await setup(
+				'create table t (id integer primary key, n integer null, s text null)',
+				"insert into t values (1, null, null), (2, 5, 'x')",
+			);
+			await expectParity(`
+				select id,
+					n + 1 as c1,
+					n between 0 and 10 as c2,
+					n between 0 and null as c3,
+					s || '!' as c4,
+					-n as c5,
+					not n as c6,
+					n is null as c7,
+					cast(n as text) as c8,
+					case n when null then 'never' else 'else' end as c9
+				from t order by id`);
+		});
+
+		it('a fused CHECK predicate rejects and reports identically', async () => {
+			await setup('create table t (id integer primary key, n integer, check (n * 2 < 10))');
+			const messages: string[] = [];
+			for (const db of [fusedDb, unfusedDb]) {
+				try {
+					await db.exec('insert into t values (1, 99)');
+					expect.fail('CHECK violation must throw');
+				} catch (e) {
+					messages.push((e as Error).message);
+				}
+			}
+			expect(messages[0]).to.match(/CHECK/i);
+			expect(messages[0], 'fused and unfused CHECK errors').to.equal(messages[1]);
+			// And the passing row still lands in both.
+			await expectParity('select id from t');
 		});
 
 		it('correlated predicate over a nested-loop join reads both sides per row', async () => {

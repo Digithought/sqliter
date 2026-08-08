@@ -39,8 +39,11 @@ export type FusedScalar = (rctx: RuntimeContext) => SqlValue;
  * Largest fused subtree depth. Fused closures nest on the JS call stack where the
  * scheduler's linearized instruction loop did not, so a pathologically deep expression
  * (`a+a+a+…` thousands of terms) could overflow the stack where it works unfused.
- * Past this depth the whole expression falls back to the sub-program path — correct,
- * just unoptimized. 32 is far above any real expression's nesting.
+ * Past this depth the expression offered to {@link tryFuseScalar} falls back whole to the
+ * sub-program path — correct, just unoptimized. Fusion is still retried from depth 0 at
+ * every nested `emitCallFromPlan` site the fallback emission reaches (CASE branches, an
+ * AND/OR short-circuit right leg), so a deep tree fuses in pieces below those seams rather
+ * than not at all. 32 is far above any real expression's nesting.
  */
 export const MAX_FUSION_DEPTH = 32;
 
@@ -68,6 +71,13 @@ export const MAX_FUSION_DEPTH = 32;
 export function tryFuseScalar(plan: PlanNode, ctx: EmissionContext): FusedScalar | undefined {
 	return fuseNode(plan, ctx, 0);
 }
+
+// NOTE: a subtree that declines partway has already built every spec above the declining
+// node — resolving collations, compiling a constant LIKE matcher — and those are then
+// rebuilt by the fallback `emitPlanNode`. Emit-time only, bounded by subtree size, and the
+// idempotent work (collation lookups record into a Set) cannot diverge. Fine today; if emit
+// latency ever shows up on function-heavy expressions, pre-walk the subtree for unfusable
+// node types before building any spec.
 
 /** Per-node dispatch. `depth` counts the closure frames already wrapping this node. */
 function fuseNode(plan: PlanNode, ctx: EmissionContext, depth: number): FusedScalar | undefined {
@@ -118,7 +128,9 @@ function fuseSpec(spec: ScalarOpSpec, ctx: EmissionContext, depth: number): Fuse
 	const run = spec.run;
 	switch (spec.operands.length) {
 		case 0:
-			return (rctx) => run(rctx);
+			// The body already IS the fused closure — wrapping it would add a call frame
+			// per row to the two most common leaves in any query (column refs, literals).
+			return run;
 		case 1: {
 			const a = fuseNode(spec.operands[0], ctx, depth + 1);
 			return a && ((rctx) => run(rctx, a(rctx)));
@@ -164,8 +176,6 @@ function fuseSpec(spec: ScalarOpSpec, ctx: EmissionContext, depth: number): Fuse
  * they count toward the depth cap (depth + 1), same as spec operands.
  */
 function fuseCase(plan: CaseExprNode, ctx: EmissionContext, depth: number): FusedScalar | undefined {
-	if (depth > MAX_FUSION_DEPTH) return undefined;
-
 	const whens: FusedScalar[] = [];
 	const thens: FusedScalar[] = [];
 	for (const clause of plan.whenThenClauses) {

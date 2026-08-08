@@ -158,6 +158,14 @@ export function emitCall(root: Instruction): Instruction {
  * allocates a fresh arrow each time; nothing keys on sub-program function identity
  * (verified across the runtime emitters), and identity per emit site is strictly
  * more stable than identity per invocation.
+ *
+ * NOTE: the three *debug introspection* surfaces emit unfused, but the two *observation*
+ * surfaces that run a normal statement do not — `runtime_stats` metrics and a db-level
+ * `Database.setInstructionTracer` both see a fused subtree as one `fused(...)`
+ * instruction, so per-operator timings and per-operator trace events inside it are gone.
+ * Fine today (both are debug telemetry, and `execution_trace()` covers the per-operator
+ * view via `_emitUnfused`); if per-scalar-operator cost ever has to be attributed from a
+ * normal run, have those two paths force `fuseScalars: false` the way `_emitUnfused` does.
  */
 export function emitCallFromPlan(plan: PlanNode, emissionCtx: EmissionContext): Instruction {
 	if (emissionCtx.fuseScalars) {
