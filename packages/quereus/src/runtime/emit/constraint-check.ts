@@ -4,7 +4,8 @@ import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
-import { type SqlValue, type OutputValue } from '../../common/types.js';
+import { StatusCode, type SqlValue, type OutputValue } from '../../common/types.js';
+import { QuereusError } from '../../common/errors.js';
 import { withAsyncRowContext, createRowSlot } from '../context-helpers.js';
 import { composeCombinedDescriptor } from '../descriptor-helpers.js';
 import {
@@ -31,14 +32,14 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 	if (mutationContextValues && contextAttributes) {
 		for (const attr of contextAttributes) {
 			const valueExpr = mutationContextValues.get(attr.name);
-			// NOTE: a declared context var with no supplied value is silently skipped here,
-			// which would shift every later value out of alignment with contextDescriptor.
-			// Unreachable today — emitDmlExecutor throws "Missing mutation context value for
-			// '<name>'" at prepare time first — but that's an external invariant, not one
-			// this loop enforces itself.
-			if (valueExpr) {
-				contextEvaluatorInstructions.push(emitCallFromPlan(valueExpr, ctx));
+			if (!valueExpr) {
+				// Invariant: the DML builders fill every declared context slot (a supplied
+				// value expression, or a NULL literal for an omitted variable — see
+				// planner/building/mutation-context.ts). Skipping one would shift every
+				// later value out of alignment with contextDescriptor, so assert instead.
+				throw new QuereusError(`Internal: no mutation context evaluator for '${attr.name}'`, StatusCode.INTERNAL);
 			}
+			contextEvaluatorInstructions.push(emitCallFromPlan(valueExpr, ctx));
 		}
 	}
 

@@ -16,6 +16,7 @@ import { columnSchemaToScalarType } from '../type-utils.js';
 import { stripSelfQualifierInCheckExpression } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { cloneExpr } from '../mutation/scope-transform.js';
+import { mutationContextVarNames, registerMutationContextSymbols, type MutationContextAttribute } from './mutation-context.js';
 
 /**
  * Determines if a constraint should be checked for the given operation
@@ -36,7 +37,7 @@ export function buildConstraintChecks(
   oldAttributes: Attribute[],
   newAttributes: Attribute[],
   _flatRowDescriptor: RowDescriptor,
-  contextAttributes: Attribute[] = [],
+  contextAttributes: ReadonlyArray<MutationContextAttribute> = [],
   /**
    * Extra CHECK constraints to enforce alongside the table's own — already
    * resolved in this table's column space. The lens layer threads its logical
@@ -69,26 +70,18 @@ export function buildConstraintChecks(
 
   const resolveColumnInSource = buildColumnSourceResolver(ctx.db);
 
+  // Bare column names a mutation context variable claims. The unqualified form is left
+  // to the context variable (the documented WITH CONTEXT precedence); the shadowed
+  // column stays reachable as `new.<col>` / `old.<col>`.
+  const shadowedByContext = mutationContextVarNames(contextAttributes);
+
   // Build expression nodes for each constraint
   return applicableConstraints.map(constraint => {
     // Create scope with OLD/NEW column access for constraint evaluation
     const constraintScope = new RegisteredScope(ctx.scope);
 
     // Register mutation context variables FIRST (so they shadow column names if conflicts exist)
-    contextAttributes.forEach((attr, contextVarIndex) => {
-      if (contextVarIndex < (tableSchema.mutationContext?.length || 0)) {
-        const contextVar = tableSchema.mutationContext![contextVarIndex];
-        const varNameLower = contextVar.name.toLowerCase();
-
-        // Register both unqualified and qualified names
-        constraintScope.registerSymbol(varNameLower, (exp, s) =>
-          new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
-        );
-        constraintScope.registerSymbol(`context.${varNameLower}`, (exp, s) =>
-          new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
-        );
-      }
-    });
+    registerMutationContextSymbols(constraintScope, contextAttributes);
 
     // The per-relation write-row correlation for THIS op's target relation — the
     // decomposition analogue of `NEW`. A lens row-local CHECK rewritten over a multi-member
@@ -125,8 +118,9 @@ export function buildConstraintChecks(
         constraintScope.registerSymbol(`${writeRowCorr}.${colNameLower}`, (exp, s) =>
           new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttrId, tableColIndex));
 
-        // For INSERT/UPDATE, unqualified column defaults to NEW
-        if (operation === RowOpFlag.INSERT || operation === RowOpFlag.UPDATE) {
+        // For INSERT/UPDATE, unqualified column defaults to NEW — unless a mutation
+        // context variable claims the bare name.
+        if ((operation === RowOpFlag.INSERT || operation === RowOpFlag.UPDATE) && !shadowedByContext.has(colNameLower)) {
           constraintScope.registerSymbol(colNameLower, (exp, s) =>
             new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttrId, tableColIndex));
         }
@@ -142,8 +136,9 @@ export function buildConstraintChecks(
         constraintScope.registerSymbol(`old.${colNameLower}`, (exp, s) =>
           new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttrId, tableColIndex));
 
-        // For DELETE, unqualified column defaults to OLD
-        if (operation === RowOpFlag.DELETE) {
+        // For DELETE, unqualified column defaults to OLD — unless a mutation context
+        // variable claims the bare name.
+        if (operation === RowOpFlag.DELETE && !shadowedByContext.has(colNameLower)) {
           constraintScope.registerSymbol(colNameLower, (exp, s) =>
             new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttrId, tableColIndex));
         }
@@ -242,7 +237,7 @@ export function buildNotNullDefaults(
   ctx: PlanningContext,
   tableSchema: TableSchema,
   newAttributes: Attribute[],
-  contextAttributes: Attribute[] = [],
+  contextAttributes: ReadonlyArray<MutationContextAttribute> = [],
   /**
    * Parent scope for `new.<col>` resolution, threaded by a synthetic decomposition /
    * multi-source member insert (see {@link buildInsertStmt}'s `defaultRowContextScope`).
@@ -256,6 +251,9 @@ export function buildNotNullDefaults(
 ): NotNullDefaultPlan[] {
   const result: NotNullDefaultPlan[] = [];
 
+  // Bare column names a mutation context variable claims (see buildConstraintChecks).
+  const reservedKeys = mutationContextVarNames(contextAttributes);
+
   for (let columnIndex = 0; columnIndex < tableSchema.columns.length; columnIndex++) {
     const column = tableSchema.columns[columnIndex];
     if (!column.notNull) continue;
@@ -263,24 +261,10 @@ export function buildNotNullDefaults(
     if (!defaultExpr || typeof defaultExpr !== 'object' || !('type' in defaultExpr)) continue;
 
     const scope = new RegisteredScope(defaultRowContextScope ?? ctx.scope);
-    const reservedKeys = new Set<string>();
 
     // Mutation context variables first so they shadow column names if conflicts exist
     // (matches createRowExpansionProjection's resolution order).
-    contextAttributes.forEach((attr, contextVarIndex) => {
-      if (contextVarIndex < (tableSchema.mutationContext?.length || 0)) {
-        const contextVar = tableSchema.mutationContext![contextVarIndex];
-        const varNameLower = contextVar.name.toLowerCase();
-        scope.registerSymbol(varNameLower, (exp, s) =>
-          new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
-        );
-        scope.registerSymbol(`context.${varNameLower}`, (exp, s) =>
-          new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
-        );
-        reservedKeys.add(varNameLower);
-        reservedKeys.add(`context.${varNameLower}`);
-      }
-    });
+    registerMutationContextSymbols(scope, contextAttributes);
 
     // Register NEW columns (DEFAULT can reference siblings as in row-expansion).
     // Skip the unqualified form when shadowed by a mutation context variable; the

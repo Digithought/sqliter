@@ -13,6 +13,26 @@ Bindings have two cadences:
 - **Per-statement** — a captured `now`, a bound parameter. Evaluated once; stable across every row and every base operation the statement emits (transaction-time semantics).
 - **Per-row** — a sequence, a surrogate allocator. Evaluated once *per top-level row produced*, so a multi-row insert mints a distinct value per row. The captured context records the per-row values, preserving replay.
 
+## Forwarding: one envelope, many base tables
+
+A view-mediated write decomposes into one statement per underlying base table, and the
+statement's `with context` envelope is forwarded **verbatim** to every one of them. The
+base tables need not agree on what they declare, so each member resolves the envelope
+against its own `with context (...)` declaration:
+
+- Names the member **declares** take their value from the envelope.
+- Names the envelope supplies that the member does **not** declare are **ignored**, not
+  rejected. This leniency is load-bearing — it is what lets one envelope serve members
+  with different declarations. The cost is that a mistyped name reads as NULL instead of
+  being reported.
+- Names the member declares that the envelope **omits** read NULL if declared `null`. A
+  NOT NULL one that any of the member's defaults or constraints reads fails at plan time,
+  and the message names the **member table** that requires it — not the view the user
+  named, which does not declare context variables at all.
+
+The per-variable rules themselves are the ordinary ones; see
+[§2.6.2 Mutation Context](sql-ddl.md#262-mutation-context-table-level-parameters).
+
 ## Shared keys are ordinary defaults — the engine chooses no ID policy
 
 > **Invariant:** [VU-007](invariants.md#vu-007--a-shared-key-is-evaluated-once-and-threaded-to-every-member)

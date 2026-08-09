@@ -37,6 +37,7 @@ import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivat
 import { isViewSchema } from '../../schema/view.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
+import { buildMutationContextAttributes, buildMutationContextValues, registerMutationContextSymbols, type MutationContextAttribute } from './mutation-context.js';
 
 /**
  * Creates a uniform row expansion projection that maps any relational source
@@ -383,7 +384,7 @@ function buildUpsertUpdateValidation(
 	ctx: PlanningContext,
 	schemaAuthoredCtx: PlanningContext,
 	tableReference: TableReferenceNode,
-	contextAttributes: Attribute[],
+	contextAttributes: ReadonlyArray<MutationContextAttribute>,
 	lensRouted: boolean,
 ): UpsertUpdateValidation {
 	const tableSchema = tableReference.tableSchema;
@@ -731,54 +732,30 @@ export function buildInsertStmt(
 		return buildViewMutation(contextWithCTEs, maintainedTableViewLike(insertResolved), { op: 'insert', stmt });
 	}
 
-	// Process mutation context assignments if present
-	const mutationContextValues = new Map<string, ScalarPlanNode>();
-	const contextAttributes: Attribute[] = [];
+	// Mutation context is driven by the TABLE's declaration, not by the statement: the
+	// symbols are registered whenever the table declares any, so a default or CHECK that
+	// reads one still resolves when the statement carries no `with context` clause. A
+	// NOT NULL variable the statement omitted then fails at reference time with a message
+	// naming the table and the variable — see building/mutation-context.ts.
+	const contextAttributes = buildMutationContextAttributes(tableReference.tableSchema, stmt.contextValues);
 	let contextScope: RegisteredScope | undefined;
 
-	if (stmt.contextValues && tableReference.tableSchema.mutationContext) {
-		// Create context attributes
-		tableReference.tableSchema.mutationContext.forEach((contextVar) => {
-			contextAttributes.push({
-				id: PlanNode.nextAttrId(),
-				name: contextVar.name,
-				type: {
-					typeClass: 'scalar' as const,
-					logicalType: contextVar.logicalType,
-					nullable: !contextVar.notNull,
-					isReadOnly: true
-				},
-				sourceRelation: `context.${tableReference.tableSchema.name}`
-			});
-		});
-
+	if (contextAttributes.length > 0) {
 		// Create a new scope for mutation context. When a synthetic member insert
 		// threads a produced-row NEW context, parent on it so context variables still
 		// shadow the envelope's `new.<col>` (WITH CONTEXT precedence), while an envelope
 		// column the member does not carry stays resolvable below.
 		contextScope = new RegisteredScope(defaultRowContextScope ?? contextWithCTEs.scope);
-
-		// Register mutation context variables in the scope (before evaluating expressions)
-		contextAttributes.forEach((attr, index) => {
-			const contextVar = tableReference.tableSchema.mutationContext![index];
-			const varNameLower = contextVar.name.toLowerCase();
-
-			// Register both unqualified and qualified names
-			contextScope!.registerSymbol(varNameLower, (exp, s) =>
-				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, index)
-			);
-			contextScope!.registerSymbol(`context.${varNameLower}`, (exp, s) =>
-				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, index)
-			);
-		});
-
-		// Build context value expressions using the context scope
-		const contextWithScope = { ...contextWithCTEs, scope: contextScope };
-		stmt.contextValues.forEach((assignment) => {
-			const valueExpr = buildExpression(contextWithScope, assignment.value) as ScalarPlanNode;
-			mutationContextValues.set(assignment.name, valueExpr);
-		});
+		registerMutationContextSymbols(contextScope, contextAttributes);
 	}
+
+	// Build context value expressions in the context scope (as before), so one context
+	// value can be written in terms of another.
+	const mutationContextValues = buildMutationContextValues(
+		contextScope ? { ...contextWithCTEs, scope: contextScope } : contextWithCTEs,
+		contextAttributes,
+		stmt.contextValues,
+	);
 
 	let targetColumns: ColumnDef[] = [];
 	if (stmt.columns && stmt.columns.length > 0) {

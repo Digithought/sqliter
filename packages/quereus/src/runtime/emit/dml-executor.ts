@@ -396,7 +396,11 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		for (const attr of plan.contextAttributes) {
 			const valueNode = plan.mutationContextValues.get(attr.name);
 			if (!valueNode) {
-				throw new QuereusError(`Missing mutation context value for '${attr.name}'`, StatusCode.INTERNAL);
+				// Invariant, not user input: the DML builders fill EVERY declared context
+				// slot — the supplied value expression, or a NULL literal when the statement
+				// omitted the variable (planner/building/mutation-context.ts). A gap here
+				// would silently shift the evaluated context row against contextDescriptor.
+				throw new QuereusError(`Internal: no mutation context evaluator for '${attr.name}'`, StatusCode.INTERNAL);
 			}
 			const instruction = emitCallFromPlan(valueNode, ctx);
 			contextEvaluatorInstructions.push(instruction);

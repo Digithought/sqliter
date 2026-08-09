@@ -17,7 +17,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
-import { resolveReferencedColumns, opsToMask } from './table.js';
+import { resolveReferencedColumns, opsToMask, disambiguateAutoConstraintName } from './table.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -61,12 +61,19 @@ export function buildUniqueConstraintSchema(
  * parent-column resolution (the parent table may not exist yet). Mirrors
  * `SchemaManager.extractForeignKeys` (table-level arm), including the
  * child/parent column-count mismatch error.
+ *
+ * `takenNames` is the CREATE TABLE path's statement-wide taken-set: when
+ * provided, an unnamed FK's `_fk_<table>_<cols>` mint is disambiguated against —
+ * and registered into — it (see `disambiguateAutoConstraintName`), so two
+ * colliding mints in one declaration get distinct names. ALTER callers omit it
+ * and keep the historical mint byte-identical.
  */
 export function buildForeignKeyConstraintSchema(
 	con: AST.TableConstraint,
 	columnIndexMap: ReadonlyMap<string, number>,
 	childTableName: string,
 	childSchemaName: string,
+	takenNames?: Set<string>,
 ): ForeignKeyConstraintSchema {
 	if (con.type !== 'foreignKey' || !con.foreignKey || !con.columns) {
 		throw new QuereusError('FOREIGN KEY constraint requires child columns and a REFERENCES clause', StatusCode.ERROR);
@@ -80,7 +87,9 @@ export function buildForeignKeyConstraintSchema(
 		return idx;
 	});
 
-	const fkName = con.name ?? `_fk_${childTableName}_${con.columns.map(c => c.name).join('_')}`;
+	const mintedName = `_fk_${childTableName}_${con.columns.map(c => c.name).join('_')}`;
+	const fkName = con.name
+		?? (takenNames !== undefined ? disambiguateAutoConstraintName(mintedName, takenNames) : mintedName);
 
 	if (fk.columns && fk.columns.length !== childColIndices.length) {
 		throw new QuereusError(
@@ -153,14 +162,22 @@ export function buildCheckConstraintSchema(
  * {@link buildCheckConstraintSchema} (which would auto-name it `check_<n>`,
  * the table-level `ADD CONSTRAINT` convention): the inline-CREATE-TABLE spelling
  * of the same declaration is named `_check_<column>`, and the two paths must agree.
+ *
+ * `takenNames` (when provided) is the disambiguation set the CREATE TABLE mint
+ * sites share — the table's existing constraint names plus this statement's
+ * user-written inline names — so two unnamed CHECKs on one new column (legal;
+ * see `assertInlineConstraintNamesFree`) mint `_check_<col>` / `_check_<col>_2`
+ * exactly as the CREATE TABLE spelling does, instead of two constraints one
+ * name addresses. The mint is registered into the set as it is chosen.
  */
-export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef): AST.TableConstraint[] {
+export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef, takenNames?: Set<string>): AST.TableConstraint[] {
 	const result: AST.TableConstraint[] = [];
 	for (const con of columnDef.constraints ?? []) {
 		if (con.type !== 'check' || !con.expr) continue;
+		const mint = `_check_${columnDef.name}`;
 		result.push({
 			type: 'check',
-			name: con.name ?? `_check_${columnDef.name}`,
+			name: con.name ?? (takenNames !== undefined ? disambiguateAutoConstraintName(mint, takenNames) : mint),
 			expr: con.expr,
 			operations: con.operations,
 			tags: con.tags,

@@ -181,15 +181,14 @@ alter table e_nf rename constraint nope to other;
 drop table e_nf;
 -- run
 
--- Ambiguous: same name in two constraint classes
+-- Ambiguous: same name in two constraint classes. Formerly constructible right
+-- here — which was exactly the defect: `drop constraint dup` reported the pair
+-- ambiguous FOREVER, so neither could ever be removed. The state is now refused
+-- at CREATE TABLE (see 10.1.4-create-table-duplicate-constraint-names), so the
+-- resolver's ambiguity arm survives only as a defensive guard for catalogs
+-- persisted before the guard existed.
 create table e_amb (id integer primary key, a integer, constraint dup check (a > 0), constraint dup unique (a));
--- run
-
-alter table e_amb drop constraint dup;
--- error: ambiguous
-
-drop table e_amb;
--- run
+-- error: duplicate constraint name 'dup'
 
 -- Collision: rename target already names a constraint
 create table e_coll (id integer primary key, a integer, b integer, constraint u1 unique (a), constraint u2 unique (b));

@@ -4,7 +4,7 @@ import { UpdateNode, type UpdateAssignment } from '../nodes/update-node.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
 import { buildTableReference } from './table.js';
 import { buildExpression } from './expression.js';
-import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type RowDescriptor } from '../nodes/plan-node.js';
+import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type RowDescriptor } from '../nodes/plan-node.js';
 import { FilterNode } from '../nodes/filter.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -30,6 +30,7 @@ import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { buildWithContext } from './select-context.js';
 import { resolveCteTarget, contextForCteTarget, resolveSubqueryTarget } from './dml-target.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
+import { buildMutationContextAttributes, buildMutationContextValues } from './mutation-context.js';
 
 export function buildUpdateStmt(
   ctx: PlanningContext,
@@ -121,32 +122,12 @@ export function buildUpdateStmt(
     return buildViewMutation(contextWithCTEs, maintainedTableViewLike(updateResolved), { op: 'update', stmt });
   }
 
-  // Process mutation context assignments if present
-  const mutationContextValues = new Map<string, ScalarPlanNode>();
-  const contextAttributes: Attribute[] = [];
-
-  if (stmt.contextValues && tableReference.tableSchema.mutationContext) {
-    // Create context attributes
-    tableReference.tableSchema.mutationContext.forEach((contextVar) => {
-      contextAttributes.push({
-        id: PlanNode.nextAttrId(),
-        name: contextVar.name,
-        type: {
-          typeClass: 'scalar' as const,
-          logicalType: contextVar.logicalType,
-          nullable: !contextVar.notNull,
-          isReadOnly: true
-        },
-        sourceRelation: `context.${tableReference.tableSchema.name}`
-      });
-    });
-
-    // Build context value expressions (evaluated in the base scope, before table scope)
-    stmt.contextValues.forEach((assignment) => {
-      const valueExpr = buildExpression(contextWithCTEs, assignment.value) as ScalarPlanNode;
-      mutationContextValues.set(assignment.name, valueExpr);
-    });
-  }
+  // Mutation context is driven by the TABLE's declaration, not by the statement — see
+  // building/mutation-context.ts. Values are evaluated in the base scope, before the
+  // table scope; a declared variable the statement omitted gets a NULL literal, and a
+  // NOT NULL one fails at reference time from any default or CHECK that reads it.
+  const contextAttributes = buildMutationContextAttributes(tableReference.tableSchema, stmt.contextValues);
+  const mutationContextValues = buildMutationContextValues(contextWithCTEs, contextAttributes, stmt.contextValues);
 
   // Plan the source of rows to update. This is typically the table itself, potentially filtered.
   let sourceNode: RelationalPlanNode = buildTableReference({ type: 'table', table: stmt.table }, contextWithCTEs);

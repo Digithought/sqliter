@@ -8,7 +8,7 @@ import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition } from '../../schema/table.js';
-import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema } from '../../schema/table.js';
+import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, collectTableConstraintNames, collectDeclaredConstraintNames } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
@@ -668,7 +668,15 @@ async function runAddColumn(
 	// untouched. Install order within the loop is UNIQUE → CHECK → FK, so a column
 	// declaring several kinds reports the cheapest-to-explain violation first; the
 	// literal-default CHECK scan runs ahead of the whole loop (see below).
-	const inlineChecks = extractColumnLevelCheckConstraints(columnDef);
+	//
+	// The CHECK mint disambiguates against the table's existing constraint names
+	// plus this column's user-written inline names, so two unnamed CHECKs on the
+	// new column (legal — see assertInlineConstraintNamesFree below) mint
+	// `_check_<col>` / `_check_<col>_2` exactly as the CREATE TABLE spelling does,
+	// and a re-added `_check_<col>` never collides with one already on the table.
+	const inlineTakenNames = collectTableConstraintNames(tableSchema);
+	for (const declared of collectDeclaredConstraintNames([columnDef], undefined)) inlineTakenNames.add(declared);
+	const inlineChecks = extractColumnLevelCheckConstraints(columnDef, inlineTakenNames);
 	const inlineConstraints: AST.TableConstraint[] = [
 		...extractColumnLevelUniqueConstraints(columnDef),
 		...inlineChecks,

@@ -29,11 +29,12 @@ rule only considers seeking the **right** side. Swapping the inputs inside a
 physical-selection rule would reshuffle the output row layout that the emitter's
 `[...leftRow, ...rightRow]` depends on — which is why v1 did not.
 
-In practice the restriction is usually harmless because `rule-join-greedy-commute` runs
+In practice the restriction is often harmless because `rule-join-greedy-commute` runs
 earlier and puts the smaller input on the left, landing the large indexed table on the
 right. But that heuristic decides on row-count estimates alone: it knows nothing about
 which side has a usable index, so it can commute a join into exactly the orientation that
-loses the seek.
+loses the seek. The measured instance at the bottom of this ticket is that case — and
+shows it is not rare on a perfectly ordinary schema.
 
 Two improvements, not the same size:
 
@@ -92,3 +93,59 @@ Combining them turns one round trip per row into one per batch.
   promise); the others are purely about not leaving speed on the table.
 - Arms A and C interact: batching amplifies whichever orientation Arm A settles on, so
   landing A first makes C's benchmark easier to read.
+- Arms A and B also interact, and the instance below shows they can *interlock* — landing
+  A alone leaves that query shape exactly as slow as it is today. Read the instance before
+  scoping A as a standalone first cut.
+
+## Measured instance — a filtered parent/child join reads the whole child table
+
+Reported by a downstream accounting app, then reproduced in-process (store module over
+`InMemoryKVStore`, so no storage-plugin cost is involved).
+
+```sql
+create table txn   (id integer primary key, entity_id integer, date text) using store;
+create table entry (id integer primary key, txn_id integer, amount real)  using store;
+create index txn_entity on txn (entity_id, date);
+create index entry_txn  on entry (txn_id);
+
+select e.txn_id, sum(e.amount)
+from entry e join txn t on t.id = e.txn_id
+where t.entity_id = ?
+group by e.txn_id;
+```
+
+With 2,000 transactions / 4,000 entries and 200 distinct entities — so the predicate keeps
+about 10 transactions and 20 entries — the chosen plan is:
+
+```
+HashAggregate
+└─ HashJoin  (inner)
+   ├─ IndexScan entry USING _primary_     ← reads all 4,000 entry rows
+   └─ IndexSeek txn   USING txn_entity    ← reads ~10 txn rows
+```
+
+Running `analyze` first does not change it. Cardinality is not the problem: after
+`analyze`, `TableReference main.entry` reports 4,000 rows and the `txn` side's estimate
+drops into the tens, so the optimizer can see the size difference. Scaled to 10,000
+transactions / 20,000 entries the same plan reads every one of the 20,000 entry rows to
+produce a handful.
+
+**Why both arms have to move.** The two restrictions cover the two orientations between
+them:
+
+- As planned, the inner (right) side is `txn`, which already carries the pushed
+  `entity_id` equality — **Arm B** declines it.
+- The orientation that would pay off puts `txn` outer and seeks `entry` by `txn_id`
+  (~10 seeks instead of a 4,000-row scan), but that requires seeking the *left* input —
+  **Arm A** declines it.
+
+So neither arm alone rescues this shape. It is the plainest possible parent/child rollup —
+filter the parent, aggregate the children — which suggests the combination is common rather
+than a corner.
+
+This is also, on the downstream report's numbers, the engine-side half of their complaint
+that "cost grows with total table size, not selectivity". The other half was their storage
+plugin reading one row per IndexedDB cursor request; the engine-only measurement for this
+query shape is ~200 ms at 20,000 entries against ~2,560 ms through IndexedDB, so this arm
+is the smaller of the two effects — real, but not the reason their screens take seconds.
+

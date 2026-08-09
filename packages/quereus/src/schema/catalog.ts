@@ -597,8 +597,9 @@ function duplicateUniqueConstraintError(operation: string, columnNames: Readonly
  * stays legal: both are addressable and droppable by name, so the state is merely
  * redundant rather than broken, and refusing it would change more surface than the
  * defect this guard exists for. Two DIFFERENTLY-named UNIQUEs over one column set are
- * legal for the same reason; two with the SAME name are already refused by
- * `assertConstraintNameFree`.
+ * legal for the same reason; two with the SAME name are refused by
+ * `assertConstraintNameFree` on the ALTER paths and by
+ * {@link assertNoDuplicateConstraintNames} at CREATE TABLE.
  */
 export function assertUniqueConstraintNotDuplicated(
 	tableSchema: TableSchema,
@@ -642,6 +643,53 @@ export function assertNoDuplicateUniqueConstraints(
 		if (seen.has(key)) throw duplicateUniqueConstraintError(operation, names);
 		seen.add(key);
 	}
+}
+
+/**
+ * Refuses a CREATE TABLE whose declaration carries two *user-written* constraint
+ * names that collide — the same within-table rule every ALTER path enforces via
+ * `assertConstraintNameFree` (schema/table.ts), applied at birth. One case-folded
+ * name space across CHECK + UNIQUE + FOREIGN KEY: two same-class collisions make
+ * `DROP CONSTRAINT` remove both, and a cross-class collision makes the pair
+ * permanently un-droppable (`resolveNamedConstraintClass` reports it ambiguous
+ * forever), so neither shape may be born.
+ *
+ * Reads the RAW declaration (`stmt.columns[].constraints` + `stmt.constraints`),
+ * never the built constraints: the extractors auto-name unnamed CHECKs / FKs, and
+ * a synthesized name is not user identity — comparing built names would refuse
+ * two unnamed CHECKs on one column, which is legal (the same reasoning
+ * `assertInlineConstraintNamesFree` in runtime/emit/alter-table.ts documents;
+ * colliding *mints* are disambiguated by `disambiguateAutoConstraintName`
+ * instead). Only the three classes that occupy a named-constraint array are
+ * compared — a name on an inline NOT NULL / DEFAULT is not stored, so it cannot
+ * collide.
+ *
+ * Called from `SchemaManager.createTable` only — never from the import /
+ * rehydrate path, so a catalog written before this guard existed still opens
+ * (same placement rationale as {@link assertNoDuplicateUniqueConstraints}).
+ */
+export function assertNoDuplicateConstraintNames(
+	astColumns: ReadonlyArray<AST.ColumnDef>,
+	astConstraints: ReadonlyArray<AST.TableConstraint> | undefined,
+	operation: string,
+): void {
+	const seen = new Set<string>();
+	const claim = (con: { name?: string; type: string }): void => {
+		if (!con.name) return;
+		if (con.type !== 'check' && con.type !== 'unique' && con.type !== 'foreignKey') return;
+		const lower = con.name.toLowerCase();
+		if (seen.has(lower)) {
+			throw new QuereusError(
+				`Cannot ${operation}: duplicate constraint name '${con.name}' — constraint names must be unique within a table (case-insensitive, across CHECK / UNIQUE / FOREIGN KEY)`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+		seen.add(lower);
+	};
+	for (const colDef of astColumns) {
+		for (const con of colDef.constraints ?? []) claim(con);
+	}
+	for (const con of astConstraints ?? []) claim(con);
 }
 
 /**

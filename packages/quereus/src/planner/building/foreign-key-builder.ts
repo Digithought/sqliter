@@ -12,6 +12,7 @@ import { columnSchemaToScalarType } from '../type-utils.js';
 import { basisFksOverriddenByDivergentLensFk } from '../../schema/lens-fk-discovery.js';
 import * as AST from '../../parser/ast.js';
 import { createLogger } from '../../common/logger.js';
+import { mutationContextVarNames, registerMutationContextSymbols, type MutationContextAttribute } from './mutation-context.js';
 
 const log = createLogger('planner:fk-builder');
 
@@ -196,13 +197,17 @@ export function buildChildSideFKChecks(
 	operation: RowOpFlag,
 	oldAttributes: Attribute[],
 	newAttributes: Attribute[],
-	contextAttributes: Attribute[] = [],
+	contextAttributes: ReadonlyArray<MutationContextAttribute> = [],
 ): ConstraintCheck[] {
 	if (!tableSchema.foreignKeys || tableSchema.foreignKeys.length === 0) return [];
 	// Child-side only applies to INSERT and UPDATE
 	if (operation !== RowOpFlag.INSERT && operation !== RowOpFlag.UPDATE) return [];
 
 	const checks: ConstraintCheck[] = [];
+
+	// Bare column names a mutation context variable claims — the unqualified form is
+	// left to the context variable (WITH CONTEXT precedence, as in buildConstraintChecks).
+	const shadowedByContext = mutationContextVarNames(contextAttributes);
 
 	for (const fk of tableSchema.foreignKeys) {
 		// Resolve parent table. If absent, MATCH SIMPLE still allows the row when any
@@ -248,16 +253,8 @@ export function buildChildSideFKChecks(
 		// Build the expression using a scope with OLD/NEW column access
 		const constraintScope = new RegisteredScope(ctx.scope);
 
-		// Register mutation context variables
-		contextAttributes.forEach((attr, contextVarIndex) => {
-			if (contextVarIndex < (tableSchema.mutationContext?.length || 0)) {
-				const contextVar = tableSchema.mutationContext![contextVarIndex];
-				const varNameLower = contextVar.name.toLowerCase();
-				constraintScope.registerSymbol(varNameLower, (exp, s) =>
-					new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
-				);
-			}
-		});
+		// Register mutation context variables FIRST (so they shadow column names)
+		registerMutationContextSymbols(constraintScope, contextAttributes);
 
 		// Register column symbols
 		tableSchema.columns.forEach((tableColumn, tableColIndex) => {
@@ -273,7 +270,7 @@ export function buildChildSideFKChecks(
 				constraintScope.registerSymbol(`new.${colNameLower}`, (exp, s) =>
 					new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
 
-				if (operation === RowOpFlag.INSERT || operation === RowOpFlag.UPDATE) {
+				if ((operation === RowOpFlag.INSERT || operation === RowOpFlag.UPDATE) && !shadowedByContext.has(colNameLower)) {
 					constraintScope.registerSymbol(colNameLower, (exp, s) =>
 						new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
 				}
@@ -325,12 +322,15 @@ export function buildParentSideFKChecks(
 	operation: RowOpFlag,
 	oldAttributes: Attribute[],
 	newAttributes: Attribute[],
-	contextAttributes: Attribute[] = [],
+	contextAttributes: ReadonlyArray<MutationContextAttribute> = [],
 ): ConstraintCheck[] {
 	// Parent-side only applies to DELETE and UPDATE
 	if (operation !== RowOpFlag.DELETE && operation !== RowOpFlag.UPDATE) return [];
 
 	const checks: ConstraintCheck[] = [];
+
+	// Bare column names a mutation context variable claims (see buildChildSideFKChecks).
+	const shadowedByContext = mutationContextVarNames(contextAttributes);
 
 	// Basis RESTRICT FKs a divergent non-RESTRICT logical FK overrides — their immediate
 	// plan-time NOT EXISTS is suppressed so the parent write a logical cascade must
@@ -378,14 +378,8 @@ export function buildParentSideFKChecks(
 		// Build scope with OLD/NEW column access
 		const constraintScope = new RegisteredScope(ctx.scope);
 
-		contextAttributes.forEach((attr, contextVarIndex) => {
-			if (contextVarIndex < (tableSchema.mutationContext?.length || 0)) {
-				const contextVar = tableSchema.mutationContext![contextVarIndex];
-				constraintScope.registerSymbol(contextVar.name.toLowerCase(), (exp, s) =>
-					new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
-				);
-			}
-		});
+		// Register mutation context variables FIRST (so they shadow column names)
+		registerMutationContextSymbols(constraintScope, contextAttributes);
 
 		tableSchema.columns.forEach((tableColumn, tableColIndex) => {
 			const colNameLower = tableColumn.name.toLowerCase();
@@ -398,7 +392,7 @@ export function buildParentSideFKChecks(
 					new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttr.id, tableColIndex));
 
 				// For DELETE, unqualified defaults to OLD
-				if (operation === RowOpFlag.DELETE) {
+				if (operation === RowOpFlag.DELETE && !shadowedByContext.has(colNameLower)) {
 					constraintScope.registerSymbol(colNameLower, (exp, s) =>
 						new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttr.id, tableColIndex));
 				}
@@ -411,7 +405,7 @@ export function buildParentSideFKChecks(
 				constraintScope.registerSymbol(`new.${colNameLower}`, (exp, s) =>
 					new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
 
-				if (operation === RowOpFlag.UPDATE) {
+				if (operation === RowOpFlag.UPDATE && !shadowedByContext.has(colNameLower)) {
 					constraintScope.registerSymbol(colNameLower, (exp, s) =>
 						new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
 				}

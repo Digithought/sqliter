@@ -320,14 +320,17 @@ describe('ALTER TABLE ADD CONSTRAINT', () => {
 			expect(t.foreignKeys ?? []).to.deep.equal([]);
 		});
 
-		it('leaves two unnamed inline CHECKs on one new column alone', async () => {
-			// Both auto-name `_check_b`. The guard reads user-written names off the raw
-			// declaration precisely so a synthesized name never refuses a legal statement.
+		it('accepts two unnamed inline CHECKs on one new column, minting disambiguated names', async () => {
+			// The guard reads user-written names off the raw declaration precisely so a
+			// synthesized name never refuses a legal statement. The colliding mints are
+			// disambiguated instead (`_check_b` / `_check_b_2` — the same names the
+			// CREATE TABLE spelling of this declaration produces), so DROP CONSTRAINT
+			// can address each individually.
 			await db.exec('create table t (id integer primary key, a integer)');
 			await db.exec('alter table t add column b integer null check (b > 0) check (b < 10)');
 			const t = db.schemaManager.getTable('main', 't')!;
 			expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'a', 'b']);
-			expect(t.checkConstraints.map(c => c.name)).to.deep.equal(['_check_b', '_check_b']);
+			expect(t.checkConstraints.map(c => c.name)).to.deep.equal(['_check_b', '_check_b_2']);
 		});
 
 		it('ignores a name on an inline constraint class that stores none', async () => {

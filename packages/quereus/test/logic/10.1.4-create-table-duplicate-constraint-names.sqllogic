@@ -1,0 +1,149 @@
+-- CREATE TABLE constraint-name uniqueness and minted-name disambiguation.
+--
+-- One constraint name must address exactly one constraint on a table. Two arms:
+--
+--   1. USER-WRITTEN names: a CREATE TABLE declaring two constraints under one
+--      (case-folded) name is refused outright — the same within-table rule every
+--      ALTER path enforces via assertConstraintNameFree, applied at birth
+--      (assertNoDuplicateConstraintNames, schema/catalog.ts). One name space
+--      across CHECK / UNIQUE / FOREIGN KEY: a same-class collision makes DROP
+--      CONSTRAINT remove both, and a cross-class collision is permanently
+--      un-droppable (resolveNamedConstraintClass reports it ambiguous forever).
+--
+--   2. ENGINE-MINTED names (`_check_<col>`, `_fk_<table>_<cols>`): the colliding
+--      declaration is LEGAL (two unnamed CHECKs on one column; two FKs on one
+--      child column into different parents), so the mint disambiguates instead of
+--      rejecting: the first occurrence keeps the base name, the Nth gets `_<N>`
+--      (disambiguateAutoConstraintName, schema/table.ts). Every non-colliding
+--      mint stays byte-identical to before — 41.10.3 and 03.4 pin that.
+--
+-- No `-- requires-capability:` directive, so this runs under both the memory
+-- module and the store module. The store leg matters: disambiguated names are
+-- persisted and must survive a reopen.
+
+pragma foreign_keys = true;
+
+-- ===================================================================
+-- 1. User-written duplicate names are refused at CREATE TABLE
+-- ===================================================================
+
+-- 1a. Exact duplicate, same class.
+create table Dup1 (id integer primary key, a integer, b integer, constraint z unique (a), constraint z unique (b));
+-- error: duplicate constraint name 'z'
+
+-- 1b. Case-differing spellings are one name (identifier semantics).
+create table Dup2 (id integer primary key, a integer, b integer, constraint q unique (a), constraint Q unique (b));
+-- error: duplicate constraint name
+
+-- 1c. Cross-class (UNIQUE vs FOREIGN KEY) — the un-droppable-forever shape.
+create table NPar (pid integer primary key, r integer unique);
+create table Dup3 (id integer primary key, a integer, constraint n unique (a), constraint n foreign key (a) references NPar(r));
+-- error: duplicate constraint name 'n'
+
+-- 1d. Cross-class (CHECK vs UNIQUE), column-level vs table-level declaration.
+create table Dup4 (id integer primary key, a integer constraint w check (a > 0), constraint W unique (a));
+-- error: duplicate constraint name
+
+-- None of the refused tables were created.
+select count(*) as c from schema() where type = 'table' and name like 'Dup%';
+→ [{"c":0}]
+
+-- Distinct names on the same shapes are accepted (positive control).
+create table DOk (id integer primary key, a integer, b integer, constraint u1 unique (a), constraint u2 unique (b));
+drop table DOk;
+
+-- ===================================================================
+-- 2. Two unnamed FKs on one child column (different parents): minted
+--    `_fk_FkC_x` and `_fk_FkC_x_2`, each addressable, each dropping only itself
+-- ===================================================================
+
+create table FkP1 (x integer primary key);
+create table FkP2 (y integer primary key);
+create table FkC (id integer primary key, x integer null, foreign key (x) references FkP1(x), foreign key (x) references FkP2(y));
+
+select name, "to" from foreign_key_info('FkC') order by name;
+→ [{"name":"_fk_FkC_x","to":"x"},{"name":"_fk_FkC_x_2","to":"y"}]
+
+-- Both keys enforce, each under its own name (FK existence checks share the
+-- `CHECK constraint failed:` prefix — see runtime/row-constraints.ts).
+-- A value present in FkP1 but not FkP2 trips only the second key…
+insert into FkP1 values (1);
+insert into FkC values (1, 1);
+-- error: CHECK constraint failed: _fk_FkC_x_2
+
+-- …a value present in FkP2 but not FkP1 trips only the first…
+insert into FkP2 values (2);
+insert into FkC values (1, 2);
+-- error: CHECK constraint failed: _fk_FkC_x
+
+-- …and a value present in both parents is accepted.
+insert into FkP2 values (7);
+insert into FkP1 values (7);
+insert into FkC values (1, 7);
+select count(*) as c from FkC;
+→ [{"c":1}]
+
+-- Dropping the first key removes ONLY it (the original defect removed both).
+alter table FkC drop constraint _fk_FkC_x;
+select name from foreign_key_info('FkC');
+→ [{"name":"_fk_FkC_x_2"}]
+
+-- The surviving key still enforces (1 ∉ FkP2)…
+insert into FkC values (2, 1);
+-- error: CHECK constraint failed: _fk_FkC_x_2
+
+-- …while a value only FkP2 holds is now accepted (the dropped key no longer binds).
+insert into FkP2 values (9);
+insert into FkC values (3, 9);
+select count(*) as c from FkC;
+→ [{"c":2}]
+
+-- And the survivor is itself addressable by its disambiguated name.
+alter table FkC drop constraint _fk_FkC_x_2;
+select count(*) as c from foreign_key_info('FkC');
+→ [{"c":0}]
+insert into FkC values (4, 12345);
+select count(*) as c from FkC;
+→ [{"c":3}]
+
+-- ===================================================================
+-- 3. Two unnamed CHECKs on one column: minted `_check_b` and `_check_b_2`,
+--    both enforced, each individually droppable
+-- ===================================================================
+
+create table Ck (id integer primary key, b integer null check (b > 0) check (b < 10));
+insert into Ck values (1, 5);
+
+insert into Ck values (2, -1);
+-- error: _check_b (b > 0)
+
+insert into Ck values (2, 99);
+-- error: _check_b_2 (b < 10)
+
+-- Dropping `_check_b` removes only the lower bound; the upper bound survives.
+alter table Ck drop constraint _check_b;
+insert into Ck values (3, -1);
+insert into Ck values (4, 99);
+-- error: _check_b_2 (b < 10)
+
+alter table Ck drop constraint _check_b_2;
+insert into Ck values (5, 99);
+select count(*) as c from Ck;
+→ [{"c":3}]
+
+-- ===================================================================
+-- 4. A mint never collides with a name the user typed: the user claims
+--    `_check_b`, so the unnamed CHECK on the same column mints `_check_b_2`
+-- ===================================================================
+
+create table MintU (id integer primary key, b integer null constraint _check_b check (b < 10) check (b > 0));
+insert into MintU values (1, -1);
+-- error: _check_b_2 (b > 0)
+
+-- ===================================================================
+-- 5. A non-colliding mint is unchanged (pins the compatibility property)
+-- ===================================================================
+
+create table Solo (id integer primary key, b integer null check (b > 0));
+insert into Solo values (1, -1);
+-- error: _check_b (b > 0)

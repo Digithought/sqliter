@@ -456,11 +456,22 @@ where condition
 
 **Key Features:**
 - Context variables are declared in the table definition alongside columns
-- Variables default to NOT NULL unless explicitly marked NULL
+- Variables default to NOT NULL unless explicitly marked NULL (the session `default_column_nullability` decides, exactly as it does for columns)
 - Both unqualified (`varName`) and qualified (`context.varName`) references supported
 - Context variables can be used in DEFAULT expressions and CHECK constraints
 - Context values are evaluated once per statement, not per row
 - Context is captured for deferred constraints and evaluated at COMMIT time
+
+**Which variables a statement must supply:**
+
+The rule is per variable, and it is enforced where the variable is *read*:
+
+- A **NOT NULL** variable must be supplied by any statement whose defaults or constraints read it. One that is read but not supplied fails at plan time with `table '<schema>.<table>' requires mutation context variable '<name>'; supply it with `with context <name> = …``. This is the same diagnosis whether the statement omitted the whole `with context` clause or just that one variable.
+- A variable declared **NULL** may be omitted; it reads as NULL. A CHECK comparing against a NULL context variable is *unknown* and therefore passes, like any NULL comparison — write `coalesce(<comparison>, 0)` if the intent is to reject the omission.
+- A variable that **no default or constraint of this statement reads** never needs supplying, even when it is NOT NULL. A table may declare a variable only its `check on update` reads, and a DELETE against that table needs no envelope.
+- A supplied name the table does **not** declare is ignored, not rejected. A write through a view forwards one envelope to every underlying base table, and each takes only the variables it declares. (This does mean a mistyped variable name reads as NULL rather than being reported.)
+
+Because context variables shadow same-named columns, a table that declares a variable named like one of its columns resolves a *bare* reference in a DEFAULT or CHECK to the variable — including when the statement supplies no envelope, in which case an omitted NULL-marked variable reads NULL. The `new.<column>` / `old.<column>` forms always reach the column.
 
 **Examples:**
 
@@ -534,9 +545,9 @@ where user_id = 42;  -- Passes: requester_id matches
 - Implement signature verification, digest validation, and rights checking in constraints
 - Store actor identity, timestamps, and cryptographic proofs in defaults
 - Use qualified `context.varName` for clarity when variable names might conflict
-- Mark optional context variables as NULL
+- Mark optional context variables as NULL — those may then be omitted by a statement and read as NULL
 - Combine with user-defined functions for custom verification logic
-- Context is required when defaults or constraints reference context variables
+- A NOT NULL context variable must be supplied by any statement whose defaults or constraints read it
 
 ## 2.6.3 Metadata Tags
 

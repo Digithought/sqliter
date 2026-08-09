@@ -179,6 +179,20 @@ export function namedConstraintExists(tableSchema: TableSchema, name: string): b
 }
 
 /**
+ * Every constraint name a table currently holds (CHECK / UNIQUE / FK — the same
+ * three arrays {@link namedConstraintExists} scans), case-folded. The set form of
+ * that predicate, for callers that seed a mint-disambiguation taken-set
+ * ({@link disambiguateAutoConstraintName}) rather than testing one name.
+ */
+export function collectTableConstraintNames(tableSchema: TableSchema): Set<string> {
+	const names = new Set<string>();
+	for (const c of tableSchema.checkConstraints ?? []) if (c.name) names.add(c.name.toLowerCase());
+	for (const c of tableSchema.uniqueConstraints ?? []) if (c.name) names.add(c.name.toLowerCase());
+	for (const c of tableSchema.foreignKeys ?? []) if (c.name) names.add(c.name.toLowerCase());
+	return names;
+}
+
+/**
  * Refuses a *user-written* constraint name that is already taken — the within-table
  * name-uniqueness rule shared by every ALTER path that adds a named constraint
  * (`ADD CONSTRAINT`, and an inline named constraint on `ADD COLUMN`). Without it a
@@ -208,6 +222,56 @@ export function assertConstraintNameFree(tableSchema: TableSchema, name: string,
 		`Cannot add constraint '${name}' to table '${tableSchema.name}': a constraint with that name already exists`,
 		StatusCode.CONSTRAINT,
 	);
+}
+
+/**
+ * The statement-wide taken-set the CREATE TABLE mint sites disambiguate against:
+ * every *user-written* CHECK / UNIQUE / FOREIGN KEY constraint name in the
+ * declaration, case-folded. Only those three classes occupy a named-constraint
+ * array (a name on an inline NOT NULL / DEFAULT is not stored, so it cannot
+ * collide) — the same filter `assertNoDuplicateConstraintNames`
+ * (schema/catalog.ts) applies. Seeded BEFORE any mint runs so a mint can never
+ * collide with a user name declared later in the statement.
+ */
+export function collectDeclaredConstraintNames(
+	astColumns: ReadonlyArray<AST.ColumnDef>,
+	astConstraints: ReadonlyArray<AST.TableConstraint> | undefined,
+): Set<string> {
+	const names = new Set<string>();
+	const claim = (con: { name?: string; type: string }): void => {
+		if (!con.name) return;
+		if (con.type !== 'check' && con.type !== 'unique' && con.type !== 'foreignKey') return;
+		names.add(con.name.toLowerCase());
+	};
+	for (const colDef of astColumns) {
+		for (const con of colDef.constraints ?? []) claim(con);
+	}
+	for (const con of astConstraints ?? []) claim(con);
+	return names;
+}
+
+/**
+ * Collision-only disambiguation for an engine-minted constraint name
+ * (`_check_<col>`, `_fk_<table>_<cols>`). The first occurrence keeps the base
+ * name byte-identical to what the mint has always produced — the property that
+ * keeps every non-colliding persisted name and corpus assertion unchanged; the
+ * Nth colliding occurrence gets `_<N>` (N starting at 2), bumping past any
+ * already-taken suffixed spelling. `taken` spans the statement's user-written
+ * names ({@link collectDeclaredConstraintNames}) plus every earlier mint — one
+ * case-folded name space across CHECK / UNIQUE / FK — so a mint can never
+ * collide with a name the user typed, or with another mint. The chosen name is
+ * registered into `taken` before returning.
+ *
+ * A suffixed name keeps the reserved `_` prefix, so `isAutoConstraintName`
+ * (schema/catalog.ts) still classifies it as engine-synthesized.
+ */
+export function disambiguateAutoConstraintName(base: string, taken: Set<string>): string {
+	let candidate = base;
+	for (let n = 2; taken.has(candidate.toLowerCase()); n++) {
+		candidate = `${base}_${n}`;
+	}
+	taken.add(candidate.toLowerCase());
+	return candidate;
 }
 
 /**

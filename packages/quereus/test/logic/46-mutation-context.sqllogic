@@ -383,3 +383,213 @@ SELECT id FROM ctx_delete
 DROP TABLE ctx_delete;
 DROP TABLE ctx_src;
 
+-- Test 16: omitting the envelope on a table whose CHECK reads a NOT NULL context
+-- variable reports the missing STATEMENT argument, naming both table and variable —
+-- not "context.<var> isn't a column", which pointed the reader at the schema.
+CREATE TABLE revocation (
+	stamp_id TEXT PRIMARY KEY,
+	reissued_at INTEGER NULL,
+	CONSTRAINT authorized_reissue CHECK (context.owner_key = 'k')
+) USING memory
+WITH CONTEXT (
+	owner_key TEXT,
+	signature TEXT NULL
+);
+
+INSERT INTO revocation (stamp_id) VALUES ('a');
+-- error: table 'main.revocation' requires mutation context variable 'owner_key'
+
+-- Test 17: supplying an envelope that omits one NOT NULL variable is the same
+-- diagnosis, not an internal error.
+INSERT INTO revocation (stamp_id) WITH CONTEXT signature = 'x' VALUES ('a');
+-- error: table 'main.revocation' requires mutation context variable 'owner_key'
+
+UPDATE revocation WITH CONTEXT signature = 'x' SET reissued_at = 1;
+-- error: table 'main.revocation' requires mutation context variable 'owner_key'
+
+-- The NULL-marked `signature` may be omitted entirely.
+INSERT INTO revocation (stamp_id) WITH CONTEXT owner_key = 'k' VALUES ('a');
+
+SELECT stamp_id, reissued_at FROM revocation
+→ [{"stamp_id":"a","reissued_at":null}]
+
+-- Test 18: a name the table does not declare is ignored, not rejected. View
+-- decomposition forwards one envelope verbatim to every member statement, so a member
+-- routinely receives values for variables it never declared.
+INSERT INTO revocation (stamp_id) WITH CONTEXT owner_key = 'k', bogus = 1 VALUES ('b');
+
+SELECT stamp_id FROM revocation ORDER BY stamp_id
+→ [{"stamp_id":"a"},{"stamp_id":"b"}]
+
+-- Test 19: an omitted NULL-marked variable reads as NULL rather than erroring, so a
+-- CHECK comparing against it behaves like any NULL comparison (unknown ⇒ passes),
+-- and one written to reject NULL fails as a CHECK — never as a missing argument.
+CREATE TABLE floor_guard (
+	id INTEGER PRIMARY KEY,
+	v INTEGER NULL,
+	CONSTRAINT unknown_passes CHECK (v >= floor_v)
+) USING memory
+WITH CONTEXT (
+	floor_v INTEGER NULL
+);
+
+INSERT INTO floor_guard (id, v) VALUES (1, 5);
+
+SELECT id, v FROM floor_guard
+→ [{"id":1,"v":5}]
+
+CREATE TABLE floor_strict (
+	id INTEGER PRIMARY KEY,
+	v INTEGER NULL,
+	CONSTRAINT null_rejected CHECK (coalesce(v >= floor_v, 0))
+) USING memory
+WITH CONTEXT (
+	floor_v INTEGER NULL
+);
+
+INSERT INTO floor_strict (id, v) VALUES (1, 5);
+-- error: CHECK constraint failed
+
+INSERT INTO floor_strict (id, v) WITH CONTEXT floor_v = 1 VALUES (1, 5);
+
+SELECT id, v FROM floor_strict
+→ [{"id":1,"v":5}]
+
+-- Test 20: a declared variable that no default or constraint reads never makes the
+-- envelope mandatory — the error is raised where the variable is REFERENCED, not
+-- where the symbols are registered. Regression guard for envelope-less writes.
+CREATE TABLE unread_ctx (
+	id INTEGER PRIMARY KEY
+) USING memory
+WITH CONTEXT (
+	never_read TEXT
+);
+
+INSERT INTO unread_ctx VALUES (1);
+
+SELECT id FROM unread_ctx
+→ [{"id":1}]
+
+-- Likewise for an op the constraint does not cover: `revocation`'s CHECK is
+-- INSERT/UPDATE-scoped, so a DELETE reads no context variable and needs no envelope.
+DELETE FROM revocation WHERE stamp_id = 'b';
+
+SELECT stamp_id FROM revocation
+→ [{"stamp_id":"a"}]
+
+-- Test 21: a write mediated by a view reports the MEMBER table that declares the
+-- variable, not the view the statement named.
+CREATE TABLE mv_core (
+	rid INTEGER PRIMARY KEY DEFAULT (coalesce((SELECT max(rid) FROM mv_core), 0) + mutation_ordinal()),
+	name TEXT
+) USING memory;
+CREATE TABLE mv_line (
+	rid INTEGER PRIMARY KEY,
+	amount INTEGER,
+	CONSTRAINT cap_check CHECK (amount <= cap)
+) USING memory
+WITH CONTEXT (
+	cap INTEGER
+);
+CREATE VIEW mv_v AS SELECT c.name AS name, l.amount AS amount
+	FROM mv_core c JOIN mv_line l ON l.rid = c.rid;
+
+INSERT INTO mv_v VALUES ('Ada', 10);
+-- error: table 'main.mv_line' requires mutation context variable 'cap'
+
+INSERT INTO mv_v WITH CONTEXT cap = 100 VALUES ('Lin', 10);
+
+SELECT rid, amount FROM mv_line
+→ [{"rid":1,"amount":10}]
+
+-- Test 22: BEHAVIOR CHANGE — context variables are now registered for a write that
+-- supplies no envelope, so a bare reference that collides with a column name resolves
+-- to the (unsupplied, hence NULL) context variable, where it used to resolve to the
+-- column. Precedence is the documented one; only the envelope-less case moved.
+CREATE TABLE shadow_null (
+	id INTEGER PRIMARY KEY,
+	value TEXT NULL,
+	bare_label TEXT NULL DEFAULT value,
+	qual_label TEXT NULL DEFAULT (new.value)
+) USING memory
+WITH CONTEXT (
+	value TEXT NULL
+);
+
+INSERT INTO shadow_null (id, value) VALUES (1, 'col');
+INSERT INTO shadow_null (id, value) WITH CONTEXT value = 'ctx' VALUES (2, 'col');
+
+SELECT id, bare_label, qual_label FROM shadow_null ORDER BY id
+→ [{"id":1,"bare_label":null,"qual_label":"col"},{"id":2,"bare_label":"ctx","qual_label":"col"}]
+
+-- Test 23: a deferred CHECK captures context at write time and evaluates at COMMIT;
+-- an omitted NULL-marked variable must survive that capture AS NULL, not vanish (which
+-- would misalign the captured context row against its descriptor).
+CREATE TABLE deferred_null_ctx (
+	id INTEGER PRIMARY KEY,
+	stock INTEGER,
+	CONSTRAINT stock_check CHECK (
+		coalesce(stock >= min_stock, 1) AND
+		EXISTS (SELECT 1 FROM deferred_null_ctx WHERE id = NEW.id)
+	)
+) USING memory
+WITH CONTEXT (
+	min_stock INTEGER NULL
+);
+
+BEGIN;
+
+INSERT INTO deferred_null_ctx (id, stock) VALUES (1, 15);
+
+COMMIT;
+
+SELECT stock FROM deferred_null_ctx WHERE id = 1
+→ [{"stock":15}]
+
+-- The same deferred constraint still sees a supplied value.
+BEGIN;
+
+INSERT INTO deferred_null_ctx (id, stock) WITH CONTEXT min_stock = 99 VALUES (2, 15);
+
+COMMIT;
+-- error: CHECK constraint failed
+
+-- Test 24: a NOT NULL column whose DEFAULT reads an omitted NULL-marked variable
+-- yields NULL and then hits the ordinary NOT NULL column check — not a context error.
+CREATE TABLE stamped (
+	id INTEGER PRIMARY KEY,
+	who TEXT NOT NULL DEFAULT stamp
+) USING memory
+WITH CONTEXT (
+	stamp TEXT NULL
+);
+
+INSERT INTO stamped (id) VALUES (1);
+-- error: NOT NULL constraint failed: stamped.who
+
+INSERT INTO stamped (id) WITH CONTEXT stamp = 'me' VALUES (2);
+
+SELECT id, who FROM stamped
+→ [{"id":2,"who":"me"}]
+
+-- Test 25: the UPSERT `do update` arm re-plans the table's UPDATE-scoped constraints,
+-- so the same rules hold there.
+CREATE TABLE upsert_ctx (
+	id INTEGER PRIMARY KEY,
+	v INTEGER,
+	CONSTRAINT cap_check CHECK (v <= cap)
+) USING memory
+WITH CONTEXT (
+	cap INTEGER
+);
+
+INSERT INTO upsert_ctx WITH CONTEXT cap = 100 VALUES (1, 1);
+
+INSERT INTO upsert_ctx VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = 2;
+-- error: table 'main.upsert_ctx' requires mutation context variable 'cap'
+
+INSERT INTO upsert_ctx WITH CONTEXT cap = 100 VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = 2;
+
+SELECT id, v FROM upsert_ctx
+→ [{"id":1,"v":2}]
+
