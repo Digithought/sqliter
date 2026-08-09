@@ -241,7 +241,7 @@ describe('.plugin subcommands', () => {
 		expect(output()).toContain('depth: 5');
 	});
 
-	it('names a manifest-less plugin in the autoload failure hint', async () => {
+	it('names a manifest-less plugin in the autoload failure hint, without disabling it', async () => {
 		await handleDotCommand(`.plugin install ${MODULE_URL_NO_MANIFEST}`, db, readlineStub);
 		logSpy.mockClear();
 
@@ -250,8 +250,35 @@ describe('.plugin subcommands', () => {
 		await loadEnabledPlugins(db);
 
 		expect(output()).toContain('Failed to load plugin plain');
-		expect(output()).toContain('.plugin enable plain');
-		expect((await records())[0].enabled).toBe(false);
+		expect(output()).toContain('.plugin disable plain');
+		// A load failure can be transient (host offline, DNS, a 5xx) and has
+		// nothing to do with the plugin itself, so it stays enabled and is
+		// retried at the next startup rather than being silently dropped.
+		expect((await records())[0].enabled).toBe(true);
+	});
+
+	it('quarantines an unreadable plugins.json instead of overwriting it, and installs cleanly afterward', async () => {
+		const pluginsPath = join(homeDir, '.quoomb', 'plugins.json');
+		await mkdir(join(homeDir, '.quoomb'), { recursive: true });
+		const garbage = '{ this is not valid json';
+		await writeFile(pluginsPath, garbage);
+
+		await handleDotCommand('.plugin list', db, readlineStub);
+		expect(output()).toContain(pluginsPath);
+		expect(output()).toMatch(/error/i);
+
+		const quarantinedPath = `${pluginsPath}.corrupt-1`;
+		expect(await readFile(quarantinedPath, 'utf-8')).toBe(garbage);
+		logSpy.mockClear();
+
+		await handleDotCommand(`.plugin install ${MODULE_URL_NO_MANIFEST}`, db, readlineStub);
+		expect(output()).toContain('Successfully installed plugin: plain');
+
+		const fresh = await records();
+		expect(fresh).toHaveLength(1);
+		expect(fresh[0].url).toBe(MODULE_URL_NO_MANIFEST);
+		// The quarantined copy is untouched by the fresh write.
+		expect(await readFile(quarantinedPath, 'utf-8')).toBe(garbage);
 	});
 
 	describe('pinning', () => {

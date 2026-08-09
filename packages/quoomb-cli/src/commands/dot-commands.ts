@@ -401,13 +401,54 @@ const getPluginsFilePath = (): string => {
   return path.join(configDir, 'plugins.json');
 };
 
-const loadPlugins = async (): Promise<PluginRecord[]> => {
+/**
+ * Renames an unreadable `plugins.json` out of the way so the next
+ * {@link savePlugins} doesn't overwrite bytes the CLI couldn't parse. Picks
+ * the lowest-numbered `.corrupt-<n>` suffix not already taken, so repeated
+ * corruption in one session quarantines each occurrence separately instead
+ * of clobbering the previous one.
+ */
+const quarantineCorruptPluginsFile = async (filePath: string): Promise<string> => {
+  let n = 1;
+  for (;;) {
+    const target = `${filePath}.corrupt-${n}`;
+    try {
+      await fs.access(target);
+      n++;
+    } catch {
+      await fs.rename(filePath, target);
+      return target;
+    }
+  }
+};
+
+const reportAndQuarantine = async (filePath: string, reason: string, error: unknown): Promise<void> => {
+  console.log(chalk.red(`Error ${reason} plugin file ${filePath}: ${error instanceof Error ? error.message : String(error)}`));
   try {
-    const filePath = getPluginsFilePath();
-    const data = await fs.readFile(filePath, 'utf-8');
+    const quarantined = await quarantineCorruptPluginsFile(filePath);
+    console.log(chalk.yellow(`  Moved it aside to ${quarantined}; recover settings from there by hand if needed.`));
+  } catch (renameError) {
+    console.log(chalk.red(`  Could not move it aside: ${renameError instanceof Error ? renameError.message : String(renameError)}`));
+  }
+};
+
+const loadPlugins = async (): Promise<PluginRecord[]> => {
+  const filePath = getPluginsFilePath();
+  let data: string;
+  try {
+    data = await fs.readFile(filePath, 'utf-8');
+  } catch (error) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return [];
+    }
+    await reportAndQuarantine(filePath, 'reading', error);
+    return [];
+  }
+
+  try {
     return JSON.parse(data);
   } catch (error) {
-    // File doesn't exist or is invalid, return empty array
+    await reportAndQuarantine(filePath, 'parsing', error);
     return [];
   }
 };
@@ -1141,14 +1182,12 @@ export const loadEnabledPlugins = async (db: Database): Promise<void> => {
 
       console.log(`Warning: Failed to load plugin ${displayName(plugin)}: ${error instanceof Error ? error.message : 'Unknown error'}`);
 
-      // Disable the plugin if it failed to load. Say so — a remote plugin can
-      // fail for a reason that has nothing to do with the plugin (the host was
-      // offline), and a silent disable leaves the user with no idea why it
-      // stopped loading. `displayName` always resolves to something typeable,
-      // even when no manifest was ever cached.
-      plugin.enabled = false;
-      await savePlugins(plugins);
-      console.log(`  Disabled it; run '.plugin enable ${displayName(plugin)}' to try again.`);
+      // Leave it enabled and retry at next startup. A remote plugin can fail
+      // for a reason that has nothing to do with the plugin (the host was
+      // offline, DNS hiccup, a 5xx), so auto-disabling on one bad load would
+      // silently drop it until the user noticed. If the plugin really is the
+      // problem, the user says so explicitly with '.plugin disable <name>'.
+      console.log(`  It stays enabled and will be retried next start; run '.plugin disable ${displayName(plugin)}' to turn it off.`);
     }
   }
 };
@@ -1157,15 +1196,12 @@ export const loadEnabledPlugins = async (db: Database): Promise<void> => {
  * Reports a load refused by a pin, from wherever it was attempted, and names the
  * only two things that resolve it.
  *
- * Every caller leaves the record alone. That matters most in
- * {@link loadEnabledPlugins}, which disables a plugin that fails to load: here
- * that would be wrong twice over — the plugin is not broken (the code behind its
- * URL changed), and the hint that path prints, `.plugin enable`, hits the same
- * pin and fails identically. Nothing is saved, so the record keeps both
- * `enabled: true` and the hash the user pinned.
- *
- * The wider question of whether a failed startup load should auto-disable at all
- * is tracked separately; only the pin case is carved out here.
+ * Every caller leaves the record alone — nothing is saved, so the record keeps
+ * both `enabled: true` and the hash the user pinned. That matters in
+ * {@link loadEnabledPlugins}: a pin mismatch means the code behind the URL
+ * changed, not that the plugin is broken, so it gets this dedicated message
+ * instead of the generic load-failure warning (which would suggest
+ * `.plugin enable`, hitting the same pin and failing identically).
  *
  * The two remedies it names are record-level, so they only resolve a refusal the
  * *record* caused. When the enforced hash came from `quoomb.config.json`, both
