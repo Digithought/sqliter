@@ -169,6 +169,19 @@ describe('IndexedDB batched range reads', () => {
 		}
 	});
 
+	describe('non-positive want', () => {
+		it('reads nothing rather than letting count: 0 mean "the whole range"', async () => {
+			await seed(100);
+			const idbStore = await rawStore();
+			const baseGetAll = counts.getAll;
+			expect(await readBatchedForward(idbStore, undefined, 0)).to.deep.equal([]);
+			expect(await readBatchedForward(idbStore, undefined, -1)).to.deep.equal([]);
+			// The point of the guard: `getAll(range, 0)` would return every record in the
+			// range, so the request must not be issued at all.
+			expect(counts.getAll - baseGetAll).to.equal(0);
+		});
+	});
+
 	describe('pairEntries', () => {
 		const key = (n: number): ArrayBuffer => rawKey(n);
 

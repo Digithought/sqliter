@@ -12,7 +12,8 @@ IndexedDB storage plugin for Quereus. Provides persistent storage for browser en
 - **Transaction isolation**: Read-committed + read-your-own-writes by default (no write-write conflict detection; not snapshot isolation)
 - **Read cache**: In-memory LRU cache reduces redundant IDB transactions (enabled by default)
 - **Cross-tab sync**: BroadcastChannel-based synchronization across browser tabs, with automatic cache invalidation
-- **Async iteration**: Efficient range queries with cursor-based iteration
+- **Async iteration**: Range queries paged 256 entries at a time — a forward page costs one
+  `getAllKeys` + `getAll` pair, reverse steps a cursor (see [store docs](../../docs/store.md#key-interfaces))
 
 ## Installation
 

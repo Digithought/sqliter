@@ -2,7 +2,7 @@
  * Runs the shared KVStore conformance suite against the IndexedDB backend, under
  * `fake-indexeddb/auto` in Node/Mocha (same harness as every other IndexedDB spec).
  * Real-browser execution is a separate concern — see
- * tickets/backlog/feat-indexeddb-real-browser-smoke.md.
+ * tickets/blocked/feat-indexeddb-real-browser-smoke.md.
  *
  * The suite lives in `@quereus/store/testing` (built to dist — run the store build,
  * or `yarn build`, before this spec so the import resolves). The adapter opens one

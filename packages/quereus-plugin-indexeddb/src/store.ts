@@ -97,7 +97,9 @@ export function pairEntries(keys: IDBValidKey[], values: unknown[]): KVEntry[] {
   const entries: KVEntry[] = new Array(keys.length);
   for (let i = 0; i < keys.length; i++) {
     entries[i] = {
-      key: toBytes(keys[i] as ArrayBuffer),
+      // `IDBValidKey` is wider than what this store ever writes (`toKey` stores an
+      // ArrayBuffer), but an engine is free to hand a `BufferSource` key back as a view.
+      key: toBytes(keys[i] as ArrayBuffer | ArrayBufferView),
       value: toBytes(values[i] as ArrayBuffer | ArrayBufferView),
     };
   }
@@ -115,13 +117,16 @@ export function pairEntries(keys: IDBValidKey[], values: unknown[]): KVEntry[] {
  * awaits in between, so the transaction cannot auto-commit between them and the two
  * results describe the same records.
  *
- * `want` must be >= 1: IndexedDB reads `count: 0` as "every record in the range".
+ * A non-positive `want` yields nothing and is checked HERE, not only at the call site:
+ * IndexedDB reads `count: 0` as "every record in the range", so letting one through would
+ * turn a bounded page into an unbounded read of the whole range into memory.
  */
 export function readBatchedForward(
   store: IDBObjectStore,
   range: IDBKeyRange | undefined,
   want: number,
 ): Promise<KVEntry[]> {
+  if (want <= 0) return Promise.resolve([]);
   return new Promise((resolve, reject) => {
     const keysRequest = store.getAllKeys(range, want);
     const valuesRequest = store.getAll(range, want);
@@ -165,7 +170,7 @@ export function readViaCursor(
       const cursor = request.result;
       if (cursor && entries.length < want) {
         entries.push({
-          key: toBytes(cursor.key as ArrayBuffer),
+          key: toBytes(cursor.key as ArrayBuffer | ArrayBufferView),
           value: toBytes(cursor.value as ArrayBuffer | ArrayBufferView),
         });
         cursor.continue();

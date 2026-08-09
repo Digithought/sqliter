@@ -438,6 +438,12 @@ export class IndexedDBManager {
             db.createObjectStore(to);
           }
 
+          // NOTE: this copies one record per IDB request, so renaming a table costs about
+          // one round trip per row (`IndexedDBStore.iterate` pages forward reads with
+          // getAllKeys/getAll for exactly this reason). Kept per-row here because a rename
+          // is a rare one-off DDL and the chained cursor is what keeps the versionchange
+          // transaction alive; page it the same way if renaming a large table ever shows up
+          // as slow.
           const cursorReq = tx.objectStore(from).openCursor();
           cursorReq.onsuccess = () => {
             const cursor = cursorReq.result;
