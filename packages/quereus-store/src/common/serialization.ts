@@ -18,6 +18,24 @@ const JSON_MARKER = '$json';
 // allocating a fresh encoder on every serialize call.
 const textEncoder = new TextEncoder();
 
+// TextDecoder is likewise stateless per non-streaming decode() call, so one
+// instance can be shared safely across concurrent scans.
+const decoder = new TextDecoder();
+
+/**
+ * True if the decoded JSON text could contain a marker object emitted by
+ * `replacer` (`{"$bigint":...}`, `{"$blob":...}`, `{"$json":...}`). All three
+ * markers are single-key objects, so they always serialize with the literal
+ * `{"$` sigil — checking for it (rather than the looser `"$`) avoids false
+ * positives on ordinary text values that merely start with `$`.
+ *
+ * Centralized so a future fourth marker type can't add a new marker shape
+ * while forgetting this gate.
+ */
+function hasMarkerSigil(json: string): boolean {
+  return json.includes('{"$');
+}
+
 /**
  * Serialize a row to a byte array for storage.
  */
@@ -32,8 +50,12 @@ export function serializeRow(row: Row): Uint8Array {
  * Deserialize a byte array back to a row.
  */
 export function deserializeRow(buffer: Uint8Array): Row {
-  const json = new TextDecoder().decode(buffer);
-  return JSON.parse(json, reviver) as Row;
+  const json = decoder.decode(buffer);
+  // NOTE: accepted tradeoff — the reviver gate infers from the decoded text rather than a
+  // write-time flag byte. A flag would save ~0.11 µs/row over this scan (measured) but needs
+  // a stored-format version + migration; not worth it on its own. Revisit only if the row
+  // codec is being opened anyway — a binary/columnar format subsumes this entirely.
+  return JSON.parse(json, hasMarkerSigil(json) ? reviver : undefined) as Row;
 }
 
 /**
@@ -49,8 +71,8 @@ export function serializeValue(value: SqlValue): Uint8Array {
  * Deserialize a byte array back to a SQL value.
  */
 export function deserializeValue(buffer: Uint8Array): SqlValue {
-  const json = new TextDecoder().decode(buffer);
-  return JSON.parse(json, reviver) as SqlValue;
+  const json = decoder.decode(buffer);
+  return JSON.parse(json, hasMarkerSigil(json) ? reviver : undefined) as SqlValue;
 }
 
 /**
