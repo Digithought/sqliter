@@ -91,6 +91,19 @@ describe('Emit: CREATE ASSERTION dependency discovery', () => {
 		return (a!.dependentTables ?? []).map(d => d.relationKey);
 	}
 
+	/**
+	 * The bases the ANALYSIS path sees, one row per reference it classifies —
+	 * `explain_assertion` re-derives them from the assertion's stored body exactly
+	 * as the commit-time evaluator does, so this is the other side of the agreement.
+	 */
+	async function analysisBases(name: string): Promise<string[]> {
+		const out: string[] = [];
+		for await (const row of db.eval(`select base from explain_assertion('${name}')`)) {
+			out.push(row.base as string);
+		}
+		return out.sort();
+	}
+
 	it('records the base table read through a NOT EXISTS subquery', async () => {
 		await db.exec('create table t (x integer primary key)');
 		await db.exec('create assertion a1 check (not exists (select 1 from t where x < 0))');
@@ -136,6 +149,22 @@ describe('Emit: CREATE ASSERTION dependency discovery', () => {
 		await db.exec('create assertion a1 check (1 = 1)');
 
 		expect(bases('main', 'a1')).to.deep.equal([]);
+	});
+
+	/**
+	 * The bug this describe block exists for was two derivations of "what does this
+	 * body read" drifting apart. They share one plan-and-walk now; this is the guard
+	 * that says so out loud, so re-pointing one call site fails a test rather than
+	 * silently reopening the gap.
+	 */
+	it('records the same references the analysis path derives for enforcement', async () => {
+		await db.exec('create table t (x integer primary key, y integer)');
+		await db.exec('create table u (y integer primary key)');
+		await db.exec('create assertion a1 check (not exists (select 1 from t as p join t as q on p.y = q.y where p.x < q.x))');
+		await db.exec('create assertion a2 check (not exists (select 1 from t join u on t.x = u.y where t.x < 0))');
+
+		expect(await analysisBases('a1')).to.deep.equal(bases('main', 'a1'));
+		expect(await analysisBases('a2')).to.deep.equal(bases('main', 'a2'));
 	});
 
 	it('resolves an unqualified name against the assertion\'s own schema', async () => {

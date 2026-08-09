@@ -115,8 +115,8 @@ Execution strategy:
 
 During assertion creation/update:
 - Parse and normalize the violation expression into a SELECT form `SELECT 1 WHERE NOT (<check>)` if provided as CHECK.
-- Plan using analysis entrypoint and extract base tables with `relationKey`s at earliest references; store as `dependentTables` with preliminary classification (updated at COMMIT time to reflect current statistics/rewrites).
-- On schema change (table/column/index/constraint) touching any dependent object: mark assertion stale; re‑prepare on next COMMIT or on `VALIDATE ASSERTION`.
+- Plan using the analysis entrypoint (`planAssertionBodyForAnalysis`) and extract one `relationKey` per base-table reference (`collectTableReferences`); store as `dependentTables`. No classification is stored — classification is derived fresh from the analyzed plan wherever it is needed (`analyzeRowSpecific`, at COMMIT time and in `explain_assertion`).
+- On schema change (table/column/index/constraint) touching any dependent object: the evaluator's compiled-plan cache is invalidated and the assertion re-compiles on the next COMMIT, which re-derives its base set. The recorded `dependentTables` is NOT re-derived — only `ALTER TABLE … RENAME` re-keys it, in place — so it can go stale; see the `NOTE:` on `IntegrityAssertionSchema.dependentTables`. Harmless while nothing but `assertion_info()` reads it.
 
 ### Diagnostics & Tooling
 
