@@ -121,6 +121,51 @@ SELECT * FROM foreign_key_info('nonexistent_table');
 -- error: Table 'nonexistent_table' not found
 
 -- ===================================================================
+-- Test 9: Implicit single-column FK (no parent column list) resolves
+-- to the parent's primary key
+-- ===================================================================
+
+CREATE TABLE imp_parent (pid INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE imp_child (id INTEGER PRIMARY KEY, x INTEGER REFERENCES imp_parent);
+
+SELECT "from", "to" FROM foreign_key_info('imp_child');
+→ [{"from":"x","to":"pid"}]
+
+DROP TABLE imp_child;
+DROP TABLE imp_parent;
+
+-- ===================================================================
+-- Test 10: Implicit composite FK yields one row per parent primary-key
+-- column, in primary-key order
+-- ===================================================================
+
+CREATE TABLE imp_parent2 (a INTEGER, b INTEGER, PRIMARY KEY (a, b));
+CREATE TABLE imp_child2 (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    y INTEGER,
+    FOREIGN KEY (x, y) REFERENCES imp_parent2
+);
+
+SELECT "from", "to", seq FROM foreign_key_info('imp_child2') ORDER BY seq;
+→ [{"from":"x","to":"a","seq":0},{"from":"y","to":"b","seq":1}]
+
+DROP TABLE imp_child2;
+DROP TABLE imp_parent2;
+
+-- ===================================================================
+-- Test 11: Implicit FK whose parent table does not exist reports "to"
+-- as NULL rather than raising
+-- ===================================================================
+
+CREATE TABLE imp_child3 (id INTEGER PRIMARY KEY, x INTEGER REFERENCES nonexistent_parent);
+
+SELECT "from", "to" FROM foreign_key_info('imp_child3');
+→ [{"from":"x","to":null}]
+
+DROP TABLE imp_child3;
+
+-- ===================================================================
 -- Cleanup
 -- ===================================================================
 

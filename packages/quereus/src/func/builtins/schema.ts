@@ -14,7 +14,7 @@ import { generateMaintainedTableDDL } from "../../schema/ddl-generator.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
 import { ColumnSchema } from "../../schema/column.js";
 import { FunctionFlags } from "../../common/constants.js";
-import { RowOpFlag, type TableSchema } from "../../schema/table.js";
+import { resolveReferencedColumns, RowOpFlag, type TableSchema } from "../../schema/table.js";
 import { jsonStringify } from "../../util/serialization.js";
 import { expressionToString } from "../../emit/ast-stringify.js";
 import { createLogger } from "../../common/logger.js";
@@ -303,7 +303,7 @@ export const foreignKeyInfoFunc = createIntegratedTableValuedFunction(
 				{ name: 'from', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'referenced_table', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'referenced_schema', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
-				{ name: 'to', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'to', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				{ name: 'on_update', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'on_delete', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'deferred', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
@@ -335,21 +335,28 @@ export const foreignKeyInfoFunc = createIntegratedTableValuedFunction(
 		for (let fkIdx = 0; fkIdx < foreignKeys.length; fkIdx++) {
 			const fk = foreignKeys[fkIdx];
 			const fkTagJson = tagsToJson(fk.tags);
+
+			// Resolve parent column names once per FK, not per seq.
+			let toColNames: ReadonlyArray<string | null>;
+			if (fk.referencedColumnNames && fk.referencedColumnNames.length > 0) {
+				// Declared names are reported verbatim, even if the parent (or the
+				// named column) can't be resolved — no parent lookup needed.
+				toColNames = fk.referencedColumnNames;
+			} else {
+				const parentTable = db._findTable(fk.referencedTable, fk.referencedSchema);
+				if (parentTable) {
+					// No declared names: resolveReferencedColumns takes the primary-key
+					// path here, which cannot throw.
+					const parentColIndices = resolveReferencedColumns(fk, parentTable);
+					toColNames = parentColIndices.map(idx => parentTable.columns[idx]?.name ?? null);
+				} else {
+					toColNames = [];
+				}
+			}
+
 			for (let seq = 0; seq < fk.columns.length; seq++) {
 				const fromCol = table.columns[fk.columns[seq]];
-
-				// Resolve parent column name
-				let toColName: string;
-				if (fk.referencedColumnNames && fk.referencedColumnNames[seq]) {
-					toColName = fk.referencedColumnNames[seq];
-				} else {
-					const parentTable = db._findTable(fk.referencedTable);
-					if (parentTable) {
-						toColName = parentTable.columns[fk.referencedColumns[seq]].name;
-					} else {
-						toColName = String(fk.referencedColumns[seq]);
-					}
-				}
+				const toColName = toColNames[seq] ?? null;
 
 				yield [
 					fkIdx,                              // id

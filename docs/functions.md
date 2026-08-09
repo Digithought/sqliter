@@ -553,7 +553,7 @@ select name, json_extract(tags, '$.error_message') as msg
 | `from` | TEXT | Child column name |
 | `referenced_table` | TEXT | Parent table name |
 | `referenced_schema` | TEXT? | Parent schema (null if same schema) |
-| `to` | TEXT | Parent column name |
+| `to` | TEXT? | Parent column name — the parent's primary-key column when the declaration named no parent columns, `NULL` when the parent table can't be resolved |
 | `on_update` | TEXT | Update action (`cascade`, `restrict`, `setNull`, `setDefault`) |
 | `on_delete` | TEXT | Delete action (`cascade`, `restrict`, `setNull`, `setDefault`) |
 | `deferred` | INTEGER | 1 if enforcement is deferred to COMMIT |

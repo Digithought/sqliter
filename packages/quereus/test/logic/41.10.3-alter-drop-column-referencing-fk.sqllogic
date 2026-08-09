@@ -173,6 +173,10 @@ alter table PkP drop column other;
 select pid from PkP;
 → [{"pid":1}]
 
+-- Introspection resolves the implicit reference to the parent's primary key.
+select "from", "to" from foreign_key_info('PkC');
+→ [{"from":"c","to":"pid"}]
+
 -- Still enforced against the primary key after the drop.
 insert into PkC values (2, 99);
 -- error: _fk_pkc_c

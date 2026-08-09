@@ -224,6 +224,18 @@ insert into mchild values (2, 99);
 -- error: constraint failed
 
 drop table mchild;
+
+-- Implicit (no parent column list) cross-schema FK resolves against the
+-- s2 parent's primary key, not just its own schema.
+create table mchild2 (
+    id integer primary key,
+    p_id integer references s2.par
+);
+
+select referenced_table, referenced_schema, "to" from foreign_key_info('mchild2');
+→ [{"referenced_table":"par","referenced_schema":"s2","to":"id"}]
+
+drop table mchild2;
 drop table s2.par;
 
 -- Regression: an ordinary same-schema FK reports its own schema (not null),
