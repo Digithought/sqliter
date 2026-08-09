@@ -159,4 +159,90 @@ describe('Mutation Context (Programmatic Tests)', () => {
 
 		await db.close();
 	});
+
+	it('does not plan the value expression of an undeclared supplied name', async () => {
+		// The flip side of ignoring undeclared names: their value expressions are never
+		// built, so a planning error inside one (here, an unresolvable column) is not
+		// reported. Pinning the contract — view decomposition forwards one envelope to
+		// members that disagree about what they declare, and re-planning every member's
+		// unread assignments to report errors in them would cost more than it is worth.
+		const db = new Database();
+		await db.exec(`
+			CREATE TABLE unplanned (
+				id INTEGER PRIMARY KEY,
+				CONSTRAINT gate CHECK (id <= cap)
+			) USING memory
+			WITH CONTEXT (cap INTEGER)
+		`);
+
+		await db.exec(`INSERT INTO unplanned WITH CONTEXT cap = 100, junk = no_such_column VALUES (1)`);
+
+		await db.close();
+	});
+
+	it('matches a supplied name against the declaration case-insensitively', async () => {
+		// Identifiers are case-insensitive everywhere else in the language; a supplied
+		// name that differed only in case used to miss the declaration and surface as
+		// the INTERNAL "missing mutation context value" error.
+		const db = new Database();
+		await db.exec(`
+			CREATE TABLE folded (
+				id INTEGER PRIMARY KEY,
+				CONSTRAINT gate CHECK (context.OwnerKey = 'k')
+			) USING memory
+			WITH CONTEXT (OwnerKey TEXT)
+		`);
+
+		await db.exec(`INSERT INTO folded WITH CONTEXT ownerkey = 'k' VALUES (1)`);
+
+		const message = await errorFrom(db, `INSERT INTO folded WITH CONTEXT OWNERKEY = 'wrong' VALUES (2)`);
+		expect(message).to.include('CHECK constraint failed');
+
+		await db.close();
+	});
+
+	it('rejects a context variable supplied more than once', async () => {
+		// Same rule the other two assignment lists already carry: `insert into t (a, a)`
+		// and `update t set a = 1, a = 2` are both rejected rather than silently
+		// last-wins.
+		const db = new Database();
+		await db.exec(`
+			CREATE TABLE twice (
+				id INTEGER PRIMARY KEY,
+				CONSTRAINT gate CHECK (id <= cap)
+			) USING memory
+			WITH CONTEXT (cap INTEGER)
+		`);
+
+		const message = await errorFrom(db, `INSERT INTO twice WITH CONTEXT cap = 1, CAP = 2 VALUES (1)`);
+		expect(message).to.equal("mutation context variable 'CAP' supplied more than once");
+
+		await db.close();
+	});
+
+	it('reports a context value that reads a context variable as an unresolved column', async () => {
+		// A context value expression is evaluated to BUILD the context row, so it cannot
+		// read that row. INSERT used to resolve the name into the context scope and then
+		// fail at runtime with an opaque "no row context found"; it now reports the same
+		// unresolved-column error UPDATE and DELETE always did.
+		const db = new Database();
+		await db.exec(`
+			CREATE TABLE crossref (
+				id INTEGER PRIMARY KEY,
+				CONSTRAINT gate CHECK (id <= cap)
+			) USING memory
+			WITH CONTEXT (cap INTEGER, base INTEGER)
+		`);
+
+		for (const sql of [
+			`INSERT INTO crossref WITH CONTEXT base = 5, cap = base VALUES (1)`,
+			`UPDATE crossref WITH CONTEXT base = 5, cap = base SET id = 2`,
+			`DELETE FROM crossref WITH CONTEXT base = 5, cap = base WHERE id = 1`,
+		]) {
+			const message = await errorFrom(db, sql);
+			expect(message, sql).to.equal('Column not found: base');
+		}
+
+		await db.close();
+	});
 });

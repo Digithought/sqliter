@@ -42,21 +42,47 @@ function missingContextValueError(attr: MutationContextAttribute): QuereusError 
 }
 
 /**
+ * Case-folded map of the names the statement supplied, rejecting a name assigned
+ * twice. Silently taking the last of `with context cap = 1, cap = 2` would hide a
+ * typo the way `insert into t (a, a)` and `update t set a = 1, a = 2` — both already
+ * rejected — would; this is the same rule for the third assignment list.
+ */
+function indexSuppliedValues(
+	suppliedValues: ReadonlyArray<AST.ContextAssignment> | undefined,
+): Map<string, AST.ContextAssignment> {
+	const supplied = new Map<string, AST.ContextAssignment>();
+	for (const assignment of suppliedValues ?? []) {
+		const key = assignment.name.toLowerCase();
+		if (supplied.has(key)) {
+			throw new QuereusError(
+				`mutation context variable '${assignment.name}' supplied more than once`,
+				StatusCode.ERROR,
+			);
+		}
+		supplied.set(key, assignment);
+	}
+	return supplied;
+}
+
+/**
  * Builds the context attributes for a write to `tableSchema`.
  *
  * Returns an empty array when the table declares no mutation context, which is the
- * signal every caller uses to skip context wiring entirely.
+ * signal every caller uses to skip context wiring entirely. The supplied clause is
+ * still validated in that case — a malformed envelope is malformed whether or not
+ * this particular table reads any of it.
  */
 export function buildMutationContextAttributes(
 	tableSchema: TableSchema,
 	suppliedValues: ReadonlyArray<AST.ContextAssignment> | undefined,
 ): MutationContextAttribute[] {
+	// Names the statement supplied. Matched case-insensitively, as identifiers are
+	// everywhere else — the scope keys are lower-cased too.
+	const suppliedNames = indexSuppliedValues(suppliedValues);
+
 	const declared = tableSchema.mutationContext;
 	if (!declared || declared.length === 0) return [];
 
-	// Names the statement supplied. Matched case-insensitively, as identifiers are
-	// everywhere else — the scope keys are lower-cased too.
-	const suppliedNames = new Set((suppliedValues ?? []).map(a => a.name.toLowerCase()));
 	const tableLabel = `${tableSchema.schemaName}.${tableSchema.name}`;
 
 	return declared.map(contextVar => ({
@@ -139,10 +165,7 @@ export function buildMutationContextValues(
 	const values = new Map<string, ScalarPlanNode>();
 	if (contextAttributes.length === 0) return values;
 
-	const supplied = new Map<string, AST.ContextAssignment>();
-	for (const assignment of suppliedValues ?? []) {
-		supplied.set(assignment.name.toLowerCase(), assignment);
-	}
+	const supplied = indexSuppliedValues(suppliedValues);
 
 	for (const attr of contextAttributes) {
 		const assignment = supplied.get(attr.contextVar.name.toLowerCase());

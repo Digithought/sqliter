@@ -240,7 +240,10 @@ accepted afterwards. Consequences of routing through the module:
 - An unnamed constraint is auto-named by the **same** convention the `CREATE TABLE`
   spelling uses: `_check_<column>`, `_fk_<table>_<column>`. (The CHECK name is set by
   the extractor, because the module's table-level `ADD CONSTRAINT` convention would
-  otherwise name it `check_<n>`.)
+  otherwise name it `check_<n>`.) A name already taken — by another auto-name in the
+  same statement or by a constraint already on the table — gets a deterministic
+  collision-only `_<N>` suffix (`_check_b_2`), so the auto-name still addresses
+  exactly one constraint. Non-colliding names are unchanged.
 - Any failure from the materialization onward goes through `revertAddColumn`: each
   CHECK / FK the module already accepted is handed back via `dropConstraint` (newest
   first), then the column is dropped, the batched events are un-remapped, and the

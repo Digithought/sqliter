@@ -749,10 +749,14 @@ export function buildInsertStmt(
 		registerMutationContextSymbols(contextScope, contextAttributes);
 	}
 
-	// Build context value expressions in the context scope (as before), so one context
-	// value can be written in terms of another.
+	// Build the context value expressions against the produced-row NEW context when a
+	// synthetic member insert threads one, but NOT against `contextScope` itself: a
+	// context value that reads a context variable has no context row to read it from
+	// and fails at runtime with an opaque "no row context found". Resolving outward
+	// instead reports it as the ordinary unresolved column it is, matching UPDATE and
+	// DELETE, which build their values in the plain base scope.
 	const mutationContextValues = buildMutationContextValues(
-		contextScope ? { ...contextWithCTEs, scope: contextScope } : contextWithCTEs,
+		defaultRowContextScope ? { ...contextWithCTEs, scope: defaultRowContextScope } : contextWithCTEs,
 		contextAttributes,
 		stmt.contextValues,
 	);

@@ -225,12 +225,37 @@ export function assertConstraintNameFree(tableSchema: TableSchema, name: string,
 }
 
 /**
+ * Visits every *user-written* constraint name in a CREATE TABLE declaration —
+ * column-level clauses first, then table-level, each in declaration order, with
+ * the name spelled as the user typed it. Only the three classes that occupy a
+ * named-constraint array (CHECK / UNIQUE / FOREIGN KEY) are visited: a name on
+ * an inline NOT NULL / DEFAULT is not stored, so it cannot collide.
+ *
+ * The single walk behind both {@link collectDeclaredConstraintNames} (the mint
+ * taken-set) and `assertNoDuplicateConstraintNames` (schema/catalog.ts, the
+ * CREATE-time refusal), so the class filter cannot drift between the guard and
+ * the set it guards.
+ */
+export function forEachDeclaredConstraintName(
+	astColumns: ReadonlyArray<AST.ColumnDef>,
+	astConstraints: ReadonlyArray<AST.TableConstraint> | undefined,
+	visit: (name: string) => void,
+): void {
+	const claim = (con: { name?: string; type: string }): void => {
+		if (!con.name) return;
+		if (con.type !== 'check' && con.type !== 'unique' && con.type !== 'foreignKey') return;
+		visit(con.name);
+	};
+	for (const colDef of astColumns) {
+		for (const con of colDef.constraints ?? []) claim(con);
+	}
+	for (const con of astConstraints ?? []) claim(con);
+}
+
+/**
  * The statement-wide taken-set the CREATE TABLE mint sites disambiguate against:
  * every *user-written* CHECK / UNIQUE / FOREIGN KEY constraint name in the
- * declaration, case-folded. Only those three classes occupy a named-constraint
- * array (a name on an inline NOT NULL / DEFAULT is not stored, so it cannot
- * collide) — the same filter `assertNoDuplicateConstraintNames`
- * (schema/catalog.ts) applies. Seeded BEFORE any mint runs so a mint can never
+ * declaration, case-folded. Seeded BEFORE any mint runs so a mint can never
  * collide with a user name declared later in the statement.
  */
 export function collectDeclaredConstraintNames(
@@ -238,15 +263,7 @@ export function collectDeclaredConstraintNames(
 	astConstraints: ReadonlyArray<AST.TableConstraint> | undefined,
 ): Set<string> {
 	const names = new Set<string>();
-	const claim = (con: { name?: string; type: string }): void => {
-		if (!con.name) return;
-		if (con.type !== 'check' && con.type !== 'unique' && con.type !== 'foreignKey') return;
-		names.add(con.name.toLowerCase());
-	};
-	for (const colDef of astColumns) {
-		for (const con of colDef.constraints ?? []) claim(con);
-	}
-	for (const con of astConstraints ?? []) claim(con);
+	forEachDeclaredConstraintName(astColumns, astConstraints, name => names.add(name.toLowerCase()));
 	return names;
 }
 

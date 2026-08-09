@@ -1965,6 +1965,13 @@ export class SchemaManager {
 	 * registered or executed; its compiled effective body is registered as a
 	 * `ViewSchema`. Module association / indexes / storage are rejected upstream
 	 * by the lens compiler before this is called.
+	 *
+	 * NOTE: `assertNoDuplicateConstraintNames` is deliberately NOT run here — it
+	 * guards `createTable` only. A logical table is never a `DROP CONSTRAINT` /
+	 * `RENAME CONSTRAINT` target, so a colliding user-written name in a lens
+	 * declaration costs nothing today; running the guard would instead risk
+	 * refusing a lens declaration that deployed before the guard existed. Revisit
+	 * if named-constraint lifecycle verbs ever address a logical table.
 	 */
 	buildLogicalTableSchema(stmt: AST.CreateTableStmt, schemaName: string): TableSchema {
 		const tableName = stmt.table.name;

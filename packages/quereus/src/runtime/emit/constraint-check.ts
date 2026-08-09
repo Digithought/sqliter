@@ -111,6 +111,14 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 		}));
 
 		// Pre-compute the combined descriptor (constant across rows)
+		// NOTE: once `contextRow` exists, the row getter below concatenates it onto every
+		// visible row on each lookup. Mutation context attributes are now built from the
+		// TABLE's declaration rather than the statement's `with context` clause
+		// (planner/building/mutation-context.ts), so that concatenation applies to EVERY
+		// write to a context-declaring table, not only the ones carrying an envelope.
+		// Cheap at the declaration sizes seen so far; if a bulk envelope-less write into a
+		// context-declaring table ever shows up as slow, hoist the concatenation to one
+		// pre-sized array reused per row instead of spreading per lookup.
 		const combinedDescriptor = contextDescriptor && contextRow
 			? composeCombinedDescriptor(contextDescriptor, flatRowDescriptor)
 			: flatRowDescriptor;

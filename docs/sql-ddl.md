@@ -469,7 +469,10 @@ The rule is per variable, and it is enforced where the variable is *read*:
 - A **NOT NULL** variable must be supplied by any statement whose defaults or constraints read it. One that is read but not supplied fails at plan time with `table '<schema>.<table>' requires mutation context variable '<name>'; supply it with `with context <name> = …``. This is the same diagnosis whether the statement omitted the whole `with context` clause or just that one variable.
 - A variable declared **NULL** may be omitted; it reads as NULL. A CHECK comparing against a NULL context variable is *unknown* and therefore passes, like any NULL comparison — write `coalesce(<comparison>, 0)` if the intent is to reject the omission.
 - A variable that **no default or constraint of this statement reads** never needs supplying, even when it is NOT NULL. A table may declare a variable only its `check on update` reads, and a DELETE against that table needs no envelope.
-- A supplied name the table does **not** declare is ignored, not rejected. A write through a view forwards one envelope to every underlying base table, and each takes only the variables it declares. (This does mean a mistyped variable name reads as NULL rather than being reported.)
+- A supplied name the table does **not** declare is ignored, not rejected. A write through a view forwards one envelope to every underlying base table, and each takes only the variables it declares. (This does mean a mistyped variable name reads as NULL rather than being reported, and that a planning error inside an unread assignment's expression goes unreported — the expression is never built.)
+- Names are matched **case-insensitively**, like every other identifier: `with context ownerkey = …` supplies a variable declared `OwnerKey`.
+- Supplying the same name **twice** is rejected (`mutation context variable '<name>' supplied more than once`), matching the duplicate rules on an INSERT column list and an UPDATE `set` list.
+- A context value expression is evaluated to *build* the context row, so it cannot read a context variable — `with context cap = base` reports `base` as an unresolved column even when `base` is itself declared.
 
 Because context variables shadow same-named columns, a table that declares a variable named like one of its columns resolves a *bare* reference in a DEFAULT or CHECK to the variable — including when the statement supplies no envelope, in which case an omitted NULL-marked variable reads NULL. The `new.<column>` / `old.<column>` forms always reach the column.
 
@@ -785,6 +788,10 @@ create index idx_note on t2 (note);
 - **`declare schema` rejects duplicates up front.** Two `index` declarations sharing a name (on any tables) are an error at diff time rather than a silently half-applied declaration — one case of the general rule that each declared name appears once (see §2.0 *Declaration Syntax*).
 
 ## 7. Constraints and Indexes
+
+**Constraint names are unique within a table — one case-insensitive name space across CHECK, UNIQUE and FOREIGN KEY.** A `CREATE TABLE` declaring two constraints under one name is refused with `CONSTRAINT`; so is every `ALTER TABLE … ADD CONSTRAINT` / `ADD COLUMN … constraint <name> …` / `RENAME CONSTRAINT` onto a taken name ([§2.7](sql-alter.md)). The rule exists because `DROP` / `RENAME CONSTRAINT` resolves by name: two constraints of the same class under one name would both be removed by a single `DROP`, and two of different classes would be rejected as **ambiguous** forever. The import / rehydrate path is deliberately *not* guarded, so a database written before the rule still opens and surfaces the collision at its next `ALTER`.
+
+Constraints written **without** a name are auto-named — `_check_<column>`, `_fk_<table>_<columns>`, `_uc_<columns>` for a UNIQUE's covering structure — and those names are user-addressable (a CHECK violation and a `DROP COLUMN` refusal both quote them back at you). Declaring two constraints that mint the *same* auto-name is legal — two unnamed CHECKs on one column, or two foreign keys from one child column into different parents — so the mint disambiguates instead of refusing: the first keeps the base spelling, the Nth gets a `_<N>` suffix (`_fk_c_x`, then `_fk_c_x_2`). The suffix is collision-only and the taken set includes the names the user typed, so an auto-name never lands on a user's name and every non-colliding auto-name is spelled exactly as it always was.
 
 ### 7.1 Primary Key Constraint
 
