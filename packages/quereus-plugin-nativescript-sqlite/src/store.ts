@@ -37,6 +37,15 @@ export interface SQLiteDatabase {
 }
 
 /**
+ * How a driver hands back a BLOB column.
+ *
+ * @nativescript-community/sqlite returns an `ArrayBuffer`; better-sqlite3 (what the tests
+ * drive this store with) returns a `Buffer`, which is a `Uint8Array`. Both are accepted
+ * everywhere a row's key or value is read — {@link toUint8Array} normalizes them.
+ */
+type BlobColumn = ArrayBuffer | Uint8Array;
+
+/**
  * Options for opening a SQLite store.
  */
 export interface SQLiteStoreOptions {
@@ -97,7 +106,7 @@ export class SQLiteStore implements KVStore {
 
   async get(key: Uint8Array): Promise<Uint8Array | undefined> {
     this.checkOpen();
-    const rows = this.db.select(this.sqlGet, [toArrayBuffer(key)]) as Array<{ value: ArrayBuffer | null }>;
+    const rows = this.db.select(this.sqlGet, [toArrayBuffer(key)]) as Array<{ value: BlobColumn | null }>;
 
     if (rows.length === 0 || rows[0].value === null) {
       return undefined;
@@ -145,7 +154,7 @@ export class SQLiteStore implements KVStore {
   /** Read up to `want` entries for one already-resume-adjusted batch of a range. */
   private async fetchBatch(bounds: IterateOptions, want: number): Promise<KVEntry[]> {
     const { sql, params } = this.buildIterateQuery(bounds, want);
-    const rows = this.db.select(sql, params) as Array<{ key: ArrayBuffer; value: ArrayBuffer }>;
+    const rows = this.db.select(sql, params) as Array<{ key: BlobColumn; value: BlobColumn }>;
     return rows.map((row) => ({
       key: toUint8Array(row.key),
       value: toUint8Array(row.value),

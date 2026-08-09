@@ -25,6 +25,9 @@
  * semantics: writes committed after that point are invisible to the walk.
  */
 
+// The same ordering oracle the store and the conformance battery use — the mock's whole
+// job is to reproduce LevelDB's memcmp key order, which is what `compareBytes` defines.
+import { compareBytes } from '@quereus/store';
 import type {
 	LevelDB,
 	LevelDBIterator,
@@ -40,17 +43,6 @@ export interface MockLevelDBOptions {
 	 * does, once per position however many times it is read there.
 	 */
 	onEntryRead?: () => void;
-}
-
-/** Compare two byte strings lexicographically — the LevelDB key order. */
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
-	const minLen = Math.min(a.length, b.length);
-	for (let i = 0; i < minLen; i++) {
-		if (a[i] !== b[i]) {
-			return a[i] - b[i];
-		}
-	}
-	return a.length - b.length;
 }
 
 /** Encode key bytes as a latin1 string — lossless, and string order matches byte order. */

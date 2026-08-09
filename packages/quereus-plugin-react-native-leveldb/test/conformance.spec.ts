@@ -37,10 +37,13 @@ runKVStoreConformance('ReactNativeLevelDBStore', () => {
 		},
 		readMeter: {
 			entriesRead: () => reads,
-			// The store walks the native cursor one entry per yield — no read-ahead.
-			// Measured: consuming k entries reads exactly k (re-measure by temporarily
-			// setting this to 0 and reading the failure message).
-			maxReadAhead: 1,
+			// The store walks the native cursor one entry per yield,
+			// plus at most one probe read: an exclusive `gt` whose key exists is read,
+			// skipped, and the next entry read, so one yield can cost two.
+			// Measured: unbounded consumption of k entries reads exactly k, and
+			// `{ gt: <a present key> }` stopped after one entry reads 2 (re-measure by
+			// temporarily setting this to 0 and reading the failure message).
+			maxReadAhead: 2,
 		},
 	};
 });

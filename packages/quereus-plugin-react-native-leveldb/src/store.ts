@@ -5,7 +5,10 @@
  * Keys and values are stored as binary ArrayBuffers.
  */
 
-import type { KVStore, KVEntry, WriteBatch, IterateOptions } from '@quereus/store';
+// `compareBytes` is the ordering oracle the KVStore contract and its conformance battery
+// are written against — the bound checks below must use that exact definition, not a
+// re-derived copy that could drift from it.
+import { compareBytes, type KVStore, type KVEntry, type WriteBatch, type IterateOptions } from '@quereus/store';
 
 /**
  * Type definition for rn-leveldb write batch.
@@ -384,19 +387,5 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
  */
 function toUint8Array(data: ArrayBuffer): Uint8Array {
 	return new Uint8Array(data);
-}
-
-/**
- * Compare two Uint8Arrays lexicographically.
- * @returns Negative if a < b, 0 if equal, positive if a > b.
- */
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
-	const minLength = Math.min(a.length, b.length);
-	for (let i = 0; i < minLength; i++) {
-		if (a[i] !== b[i]) {
-			return a[i] - b[i];
-		}
-	}
-	return a.length - b.length;
 }
 
