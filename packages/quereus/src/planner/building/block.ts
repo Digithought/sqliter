@@ -1,8 +1,12 @@
 import { BlockNode } from '../nodes/block.js';
 import * as AST from '../../parser/ast.js';
-import type { PlanNode } from '../nodes/plan-node.js';
+import type { PlanNode, RelationalPlanNode, TableDescriptor } from '../nodes/plan-node.js';
 import { buildSelectStmt } from './select.js';
 import type { PlanningContext } from '../planning-context.js';
+import { CTENode } from '../nodes/cte-node.js';
+import { SequenceNode } from '../nodes/sequence-node.js';
+import { SinkNode } from '../nodes/sink-node.js';
+import { buildWithClause, isDataModifyingCte } from './with.js';
 import { buildCreateTableStmt } from './ddl.js';
 import { buildCreateIndexStmt } from './ddl.js';
 import { buildDropTableStmt } from './drop-table.js';
@@ -31,6 +35,16 @@ import { buildDeclareSchemaStmt, buildDeclareLensStmt, buildDiffSchemaStmt, buil
 
 export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): BlockNode {
 	const plannedStatements = statements.map((stmt) => {
+		const planned = buildStatement(ctx, stmt);
+		return planned === undefined ? undefined : attachUnreferencedDmlCtes(ctx, stmt, planned);
+	}).filter(p => p !== undefined) as PlanNode[]; // Ensure we only have valid PlanNodes and cast
+
+    // The final BatchNode for the entire batch.
+    // Its scope is batchParameterScope, and it contains all successfully planned statements.
+	return new BlockNode(ctx.scope, plannedStatements, { ...ctx.parameters });
+}
+
+function buildStatement(ctx: PlanningContext, stmt: AST.Statement): PlanNode | undefined {
 		switch (stmt.type) {
 			case 'select':
 				// buildSelectStmt returns a BatchNode, which is a PlanNode.
@@ -118,9 +132,79 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 					stmt
 				);
 		}
-	}).filter(p => p !== undefined) as PlanNode[]; // Ensure we only have valid PlanNodes and cast
+}
 
-    // The final BatchNode for the entire batch.
-    // Its scope is batchParameterScope, and it contains all successfully planned statements.
-	return new BlockNode(ctx.scope, plannedStatements, { ...ctx.parameters });
+/**
+ * Guarantee the write of every data-modifying `with` member the statement never
+ * references. A member enters the plan only when something reads it, but an
+ * `insert`/`update`/`delete` member is a stated effect of the statement — SQLite
+ * and PostgreSQL both perform it whether or not anything reads the block.
+ *
+ * This is the ONE safe attachment site: `buildBlock` is the single entry for
+ * user statements (`Database._buildPlan` is its only caller), sees both the
+ * statement AST and the finished plan, and runs once per top-level statement.
+ * Every site inside the statement builders is re-entered by the view
+ * write-through path (and once per base member by a multi-source decomposition),
+ * so a per-builder attachment would fan the sink out N times. A `with` clause on
+ * a NESTED statement (a sub-select's own clause, a stored view body) is out of
+ * scope: PostgreSQL rejects a data-modifying member anywhere but a statement's
+ * top level, so matching top-level behaviour is the whole obligation.
+ *
+ * Mechanics: each member's runtime identity (`CTENode.tableDescriptor`) is
+ * memoized per source AST member for the whole statement build
+ * (`PlanningContext.cteDescriptors`), so a member whose descriptor is absent
+ * from the built plan is provably unreferenced. The clause is then rebuilt —
+ * required because a member may read an earlier sibling — and each unreferenced
+ * data-modifying member's node is Sink-wrapped and sequenced AHEAD of the
+ * statement (a trailing effect could be skipped by a main abandoned early, e.g.
+ * `limit 0`). The rebuild cannot double a referenced member's write: its rebuilt
+ * `CTENode` shares the referenced one's descriptor, hence its one buffer.
+ */
+function attachUnreferencedDmlCtes(ctx: PlanningContext, stmt: AST.Statement, plan: PlanNode): PlanNode {
+	const stmtAst = stmt as { withClause?: AST.WithClause; schemaPath?: string[] };
+	const withClause = stmtAst.withClause;
+	if (!withClause) return plan;
+
+	const dmlMembers = withClause.ctes.filter(isDataModifyingCte);
+	if (dmlMembers.length === 0) return plan;
+
+	const reachable = collectCteDescriptors(plan);
+	const unreferenced = dmlMembers.filter(cte => {
+		const descriptor = ctx.cteDescriptors?.get(cte);
+		return descriptor !== undefined && !reachable.has(descriptor);
+	});
+	if (unreferenced.length === 0) return plan;
+
+	// Rebuild the whole clause in order (a member may read an earlier sibling);
+	// the descriptor memo makes this safe — see the doc comment above. The
+	// statement's own WITH SCHEMA path applies to its clause, so mirror the
+	// statement builders' `contextWithSchemaPath`.
+	const rebuildCtx = stmtAst.schemaPath ? { ...ctx, schemaPath: stmtAst.schemaPath } : ctx;
+	const rebuilt = buildWithClause(rebuildCtx, withClause);
+	const sinks = unreferenced.map(cte => {
+		const node = rebuilt.get(cte.name.toLowerCase());
+		if (!node) {
+			quereusError(`CTE '${cte.name}' missing from rebuilt WITH clause`, StatusCode.INTERNAL, undefined, stmt);
+		}
+		return new SinkNode(ctx.scope, node as unknown as RelationalPlanNode, `unreferenced-cte ${cte.name}`);
+	});
+
+	return new SequenceNode(ctx.scope, sinks, plan);
+}
+
+/** Every `CTENode` runtime identity reachable from `plan`. Walks `getRelations`
+ *  as well as `getChildren` so DML write targets (outside `getChildren`) are
+ *  covered — mirrors `collectTableRefs` in analysis/change-scope.ts. */
+function collectCteDescriptors(plan: PlanNode): Set<TableDescriptor> {
+	const descriptors = new Set<TableDescriptor>();
+	const visited = new Set<PlanNode>();
+	function walk(node: PlanNode): void {
+		if (visited.has(node)) return;
+		visited.add(node);
+		if (node instanceof CTENode) descriptors.add(node.tableDescriptor);
+		for (const c of node.getChildren()) walk(c as unknown as PlanNode);
+		for (const r of node.getRelations()) walk(r as unknown as PlanNode);
+	}
+	walk(plan);
+	return descriptors;
 }

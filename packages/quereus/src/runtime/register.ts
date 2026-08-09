@@ -69,6 +69,7 @@ import { emitAsyncGather } from './emit/async-gather.js';
 import { emitFanOutLookupJoin } from './emit/fanout-lookup-join.js';
 import { emitReturning } from './emit/returning.js';
 import { emitSink } from './emit/sink.js';
+import { emitSequence } from './emit/sequence.js';
 import { emitViewMutation } from './emit/view-mutation.js';
 import { emitBetween } from './emit/between.js';
 import { emitRetrieve } from './emit/retrieve.js';
@@ -198,6 +199,9 @@ export function registerEmitters() {
 
 	// Sink emitter
 	registerEmitter(PlanNodeType.Sink, emitSink as EmitterFunc);
+
+	// Sequenced side-effect prelude (unreferenced data-modifying CTEs)
+	registerEmitter(PlanNodeType.Sequence, emitSequence as EmitterFunc);
 
 	// View-/MV-mediated mutation substrate emitter
 	registerEmitter(PlanNodeType.ViewMutation, emitViewMutation as EmitterFunc);

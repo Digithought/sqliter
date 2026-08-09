@@ -3,6 +3,7 @@ import { Database } from '../../src/core/database.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { CTENode } from '../../src/planner/nodes/cte-node.js';
+import { SequenceNode } from '../../src/planner/nodes/sequence-node.js';
 import { serializePlanForGolden } from './_helpers.js';
 
 /**
@@ -276,5 +277,123 @@ describe('data-modifying CTE: plan-shape invariants', () => {
 		for (const node of nodes) {
 			expect(node.materialize, `read-only CTENode ${node.cteName} was force-materialized`).to.equal(false);
 		}
+	});
+});
+
+/** The `SequenceNode`s reachable from `root`, in discovery order. */
+function sequenceNodes(root: PlanNode): SequenceNode[] {
+	const found: SequenceNode[] = [];
+	const stack: PlanNode[] = [root];
+	const seen = new Set<PlanNode>();
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (seen.has(node)) continue;
+		seen.add(node);
+		if (node instanceof SequenceNode) found.push(node);
+		for (const child of node.getChildren()) stack.push(child);
+	}
+	return found;
+}
+
+/**
+ * An UNREFERENCED data-modifying `with` member still writes (matching SQLite /
+ * PostgreSQL): `buildBlock` sinks the member ahead of the statement under a
+ * `SequenceNode`. The plan-level invariants pinned here:
+ *
+ *  1. an unreferenced writing member produces exactly ONE `SequenceNode`, whose
+ *     effects are `SinkNode`s over the member's `CTENode`;
+ *  2. every `CTENode` built from one source member — across the original build, the
+ *     sink rebuild, and the view write-through re-plan — shares ONE `tableDescriptor`
+ *     (the per-statement memo `PlanningContext.cteDescriptors`), which is what makes
+ *     the sink rebuild unable to double a referenced member's write; and
+ *  3. a statement whose members are all referenced (or read-only) gets NO wrapper.
+ *
+ * `test/logic/13.7-unreferenced-dml-cte.sqllogic` pins the observable behaviour.
+ */
+describe('unreferenced data-modifying CTE: plan-shape invariants', () => {
+	let db: Database;
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table w (k integer primary key, v integer)');
+		await db.exec('create table u (k integer primary key)');
+		await db.exec('create view vu as select k from u');
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('an unreferenced INSERT member is sunk under one SequenceNode', () => {
+		const plan = db.getPlan('with c as (insert into w (k) values (1) returning k) select 42 as x');
+		const sequences = sequenceNodes(plan);
+		expect(sequences.length, 'exactly one SequenceNode wraps the statement').to.equal(1);
+		expect(sequences[0].effects.length, 'one effect for the one unreferenced member').to.equal(1);
+		expect(sequences[0].effects[0].nodeType, 'the effect is a Sink').to.equal(PlanNodeType.Sink);
+
+		const nodes = cteNodes(plan);
+		expect(nodes.length, 'the sunk CTE is in the plan').to.be.greaterThan(0);
+		expect(new Set(nodes.map(n => n.tableDescriptor)).size, 'all CTENodes share one descriptor').to.equal(1);
+		for (const node of nodes) {
+			expect(node.materialize, 'a writing body stays buffered under the sink').to.equal(true);
+		}
+	});
+
+	it('a referenced + an unreferenced member: one effect, one descriptor per member', () => {
+		const plan = db.getPlan(
+			'with a as (insert into w (k) values (1) returning k), b as (insert into u (k) values (2) returning k) select k from a'
+		);
+		const sequences = sequenceNodes(plan);
+		expect(sequences.length).to.equal(1);
+		expect(sequences[0].effects.length, 'only the unreferenced member is sunk').to.equal(1);
+
+		// Group descriptors by member: however many CTENode copies exist (the sink
+		// rebuild adds one per member it rebuilds), each member owns exactly one.
+		const byName = new Map<string, Set<object>>();
+		for (const node of cteNodes(plan)) {
+			if (!byName.has(node.cteName)) byName.set(node.cteName, new Set());
+			byName.get(node.cteName)!.add(node.tableDescriptor);
+		}
+		for (const [name, descriptors] of byName) {
+			expect(descriptors.size, `member '${name}' must own exactly one descriptor`).to.equal(1);
+		}
+	});
+
+	it('a fully-referenced clause gets NO SequenceNode', () => {
+		const plan = db.getPlan('with c as (insert into w (k) values (1) returning k) select k from c');
+		expect(sequenceNodes(plan).length).to.equal(0);
+	});
+
+	it('an unreferenced read-only member gets NO SequenceNode', () => {
+		const plan = db.getPlan('with c as (select k from u) select 42 as x');
+		expect(sequenceNodes(plan).length).to.equal(0);
+	});
+
+	// The view write-through path re-plans the statement through the same builder, so
+	// the clause is built 2+ times within one planning context. The per-statement
+	// descriptor memo must make every build agree — this is the Arm-A invariant the
+	// unreferenced-member scan (and emitCTE's one-buffer guarantee) both key off.
+	it('the view write-through double build agrees on the descriptor', () => {
+		const plan = db.getPlan(
+			'with d as (insert into w (k) values (1) returning k) insert into vu (k) select k from d'
+		);
+		const nodes = cteNodes(plan);
+		expect(nodes.length, 'the CTE must survive into the optimized plan').to.be.greaterThan(0);
+		expect(new Set(nodes.map(n => n.tableDescriptor)).size, 'every build shares one descriptor').to.equal(1);
+		// d is referenced, so no sink prelude either.
+		expect(sequenceNodes(plan).length).to.equal(0);
+	});
+
+	// Behavioural: the buffer (and so the write) is per EXECUTION, not per plan — a
+	// prepared statement re-executed 3× writes 3 rows.
+	it('a prepared statement re-executed 3× writes 3×', async () => {
+		const stmt = db.prepare(
+			'with c as (insert into u (k) select coalesce(max(k), 0) + 1 from u returning k) select 42 as x'
+		);
+		try {
+			for (let i = 0; i < 3; i++) {
+				await stmt.run();
+			}
+		} finally {
+			await stmt.finalize();
+		}
+		const row = await db.get('select count(*) as cnt from u');
+		expect(row?.cnt).to.equal(3);
 	});
 });

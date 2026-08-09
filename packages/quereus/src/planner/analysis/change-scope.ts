@@ -302,6 +302,15 @@ export function analyzeChangeScope(
  * parameters in the WHERE/SET clauses still count toward unboundParameters).
  */
 function isDmlWithoutReturning(plan: PlanNode): boolean {
+	// A Sequence node prepends side-effect statements (sunk unreferenced
+	// data-modifying CTEs) ahead of the actual statement. Classify by the MAIN
+	// child only: the effects' RETURNING clauses are internal to the sunk CTE
+	// bodies, not the statement's own RETURNING, and the effects give the node
+	// 2+ children so the single-child descent below would stop short.
+	if (plan.nodeType === PlanNodeType.Sequence) {
+		return isDmlWithoutReturning((plan as unknown as { main: PlanNode }).main);
+	}
+
 	function hasReturning(node: PlanNode): boolean {
 		if (node.nodeType === PlanNodeType.Returning) return true;
 		for (const c of node.getChildren()) {

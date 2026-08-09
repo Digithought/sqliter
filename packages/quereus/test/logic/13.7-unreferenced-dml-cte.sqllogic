@@ -1,0 +1,323 @@
+-- 13.7-unreferenced-dml-cte.sqllogic - an UNREFERENCED data-modifying CTE still runs
+--
+-- A top-level statement's `with` clause naming an `insert`/`update`/`delete` member
+-- performs that member's write exactly once per statement execution, whether or not the
+-- rest of the statement names it — matching SQLite and PostgreSQL, for which the write
+-- is a stated effect of the statement, not an optimization the engine may skip.
+--
+-- Mechanics: `buildBlock` detects a member whose runtime identity (the CTE's
+-- tableDescriptor, memoized per source member in PlanningContext.cteDescriptors) is
+-- absent from the built plan, rebuilds the clause, and sequences a Sink over each such
+-- member AHEAD of the statement (SequenceNode). Effects-first is deliberate: a main
+-- statement abandoned early (limit 0) must not skip the write.
+--
+-- Known divergence from PostgreSQL, accepted and documented in
+-- docs/runtime-caching.md § Shared CTE materialization: because the write runs before
+-- the main statement, the outer query CAN observe it (PostgreSQL's sub-statements never
+-- see one another's effects). Consistent with Quereus's existing behaviour for
+-- referenced members, whose writes the outer query can also observe.
+
+-- ===== INSERT body, never referenced =====
+
+create table t1 (k integer primary key);
+-- run
+
+-- Result shape must survive the sequencing wrapper: `x`, not a synthesized name.
+with c as (insert into t1 (k) values (1) returning k) select 42 as x;
+→ [{"x":42}]
+
+select k from t1 order by k;
+→ [{"k":1}]
+
+-- ===== UPDATE body, never referenced =====
+
+create table t2 (k integer primary key, v integer);
+insert into t2 values (1, 0), (2, 0);
+-- run
+
+with c as (update t2 set v = v + 1 returning k) select 42 as x;
+→ [{"x":42}]
+
+select k, v from t2 order by k;
+→ [{"k":1,"v":1},{"k":2,"v":1}]
+
+-- ===== DELETE body, never referenced =====
+
+create table t3 (k integer primary key);
+insert into t3 values (1), (2), (3);
+-- run
+
+with c as (delete from t3 where k < 3 returning k) select 42 as x;
+→ [{"x":42}]
+
+select k from t3 order by k;
+→ [{"k":3}]
+
+-- ===== Unreferenced member under an outer INSERT =====
+-- The write and the outer statement's own write must run sequentially — interleaving
+-- them broke statement-savepoint pairing on a prototype that nested a BlockNode.
+
+create table t4a (k integer primary key);
+create table t4b (k integer primary key);
+-- run
+
+with c as (insert into t4a (k) values (1) returning k) insert into t4b (k) values (2);
+-- run
+
+select k from t4a order by k;
+→ [{"k":1}]
+
+select k from t4b order by k;
+→ [{"k":2}]
+
+-- ===== Unreferenced member under an outer UPDATE =====
+
+create table t5a (k integer primary key);
+create table t5b (k integer primary key, v integer);
+insert into t5b values (1, 0);
+-- run
+
+with c as (insert into t5a (k) values (7) returning k) update t5b set v = v + 1;
+-- run
+
+select k from t5a order by k;
+→ [{"k":7}]
+
+select k, v from t5b order by k;
+→ [{"k":1,"v":1}]
+
+-- ===== Unreferenced member under an outer DELETE =====
+
+create table t6a (k integer primary key);
+create table t6b (k integer primary key);
+insert into t6b values (1), (2);
+-- run
+
+with c as (insert into t6a (k) values (7) returning k) delete from t6b where k = 1;
+-- run
+
+select k from t6a order by k;
+→ [{"k":7}]
+
+select k from t6b order by k;
+→ [{"k":2}]
+
+-- ===== Two unreferenced members in one clause =====
+-- Both write, in clause order, exactly once each.
+
+create table t7a (k integer primary key);
+create table t7b (k integer primary key);
+-- run
+
+with a as (insert into t7a (k) values (1) returning k),
+     b as (insert into t7b (k) values (2) returning k)
+select 42 as x;
+→ [{"x":42}]
+
+select k from t7a order by k;
+→ [{"k":1}]
+
+select k from t7b order by k;
+→ [{"k":2}]
+
+-- ===== One referenced + one unreferenced member =====
+-- Exactly one write each: the sink rebuild shares the referenced member's runtime
+-- identity, so it cannot double the referenced write.
+
+create table t8a (k integer primary key);
+create table t8b (k integer primary key);
+-- run
+
+with a as (insert into t8a (k) values (1) returning k),
+     b as (insert into t8b (k) values (2) returning k)
+select k from a;
+→ [{"k":1}]
+
+select k from t8a order by k;
+→ [{"k":1}]
+
+select k from t8b order by k;
+→ [{"k":2}]
+
+-- ===== An unreferenced writing member reading a referenced sibling =====
+-- The rebuild replays the referenced member's one buffer instead of re-driving its
+-- write: `a` writes once even though the sunk `b` reads it.
+
+create table t9a (k integer primary key);
+create table t9b (k integer primary key);
+-- run
+
+with a as (insert into t9a (k) values (1) returning k),
+     b as (insert into t9b (k) select k + 10 from a returning k)
+select k from a;
+→ [{"k":1}]
+
+select k from t9a order by k;
+→ [{"k":1}]
+
+select k from t9b order by k;
+→ [{"k":11}]
+
+-- ===== Transitively unreferenced: reachable only from another unreferenced member =====
+-- `d` reads `c` but nothing reads `d`; `c`'s write still runs exactly once (the select
+-- member `d` is NOT sunk — only data-modifying members are).
+
+create table t10 (k integer primary key);
+-- run
+
+with c as (insert into t10 (k) values (1) returning k),
+     d as (select k from c)
+select 42 as x;
+→ [{"x":42}]
+
+select k from t10 order by k;
+→ [{"k":1}]
+
+-- ===== Two unreferenced writing members, second reading the first =====
+-- Sunk in clause order: `c` writes and buffers, `d`'s drive replays that buffer.
+-- One write each.
+
+create table t11a (k integer primary key);
+create table t11b (k integer primary key);
+-- run
+
+with c as (insert into t11a (k) values (1) returning k),
+     d as (insert into t11b (k) select k + 10 from c returning k)
+select 42 as x;
+→ [{"x":42}]
+
+select k from t11a order by k;
+→ [{"k":1}]
+
+select k from t11b order by k;
+→ [{"k":11}]
+
+-- ===== LIMIT 0 on the main statement does NOT skip the write =====
+-- The prelude runs before the main statement, so early abandonment cannot starve it.
+
+create table t12 (k integer primary key);
+-- run
+
+with c as (insert into t12 (k) values (1) returning k) select 42 as x limit 0;
+→ []
+
+select k from t12 order by k;
+→ [{"k":1}]
+
+-- ===== The outer statement CAN observe the write (documented divergence) =====
+-- PostgreSQL would answer 1 here (sub-statements never see one another's effects);
+-- Quereus sequences the write first, consistent with its existing visibility for
+-- referenced members. See docs/runtime-caching.md § Shared CTE materialization.
+
+create table t13 (k integer primary key);
+insert into t13 values (1);
+-- run
+
+with c as (insert into t13 (k) values (2) returning k) select count(*) as n from t13;
+→ [{"n":2}]
+
+-- ===== Unreferenced member alongside a VIEW-targeted outer write =====
+-- The view write-through path re-plans the statement (building the clause 2+ times);
+-- the shared runtime identity keeps it to ONE write, and the unreferenced-member scan
+-- keys off that same identity so the member is not double-sunk either.
+
+create table t14log (id integer primary key, v text);
+create table t14 (id integer primary key, w text);
+create view vt14 as select id, w from t14;
+-- run
+
+with d as (insert into t14log values (1, 'x') returning id)
+insert into vt14 values (5, 'z');
+-- run
+
+select id, v from t14log order by id;
+→ [{"id":1,"v":"x"}]
+
+select id, w from t14 order by id;
+→ [{"id":5,"w":"z"}]
+
+-- Multi-source view target: a join-bodied view decomposes into one base insert per
+-- member, each re-entering the INSERT builder — none of those extra plannings may run
+-- (or sink) the unreferenced member's write again.
+
+create table t15log (id integer primary key, v text);
+create table t15a (id integer primary key, a text);
+create table t15b (id integer primary key, b text);
+create view vt15 as select t15a.id as id, t15a.a as a, t15b.b as b
+  from t15a join t15b on t15a.id = t15b.id;
+-- run
+
+with d as (insert into t15log values (1, 'x') returning id)
+insert into vt15 values (5, 'aa', 'bb');
+-- run
+
+select id, v from t15log order by id;
+→ [{"id":1,"v":"x"}]
+
+select id, a from t15a order by id;
+→ [{"id":5,"a":"aa"}]
+
+select id, b from t15b order by id;
+→ [{"id":5,"b":"bb"}]
+
+-- ===== ROLLBACK undoes a sunk write =====
+-- The prelude write goes through the ordinary DML path; nothing about the sink
+-- shields it from transaction rollback.
+
+create table t16 (k integer primary key);
+-- run
+
+begin;
+-- run
+
+with c as (insert into t16 (k) values (1) returning k) select 42 as x;
+→ [{"x":42}]
+
+rollback;
+-- run
+
+select count(*) as cnt from t16;
+→ [{"cnt":0}]
+
+-- ===== Control: an unreferenced SELECT-bodied member is still dropped =====
+-- Only data-modifying members carry an obligation to run; a read-only member nobody
+-- names has no observable effect and stays unplanned.
+
+create table t17 (k integer primary key);
+insert into t17 values (1);
+-- run
+
+with c as (select k from t17) select 42 as x;
+→ [{"x":42}]
+
+-- Cleanup
+drop table t1;
+drop table t2;
+drop table t3;
+drop table t4a;
+drop table t4b;
+drop table t5a;
+drop table t5b;
+drop table t6a;
+drop table t6b;
+drop table t7a;
+drop table t7b;
+drop table t8a;
+drop table t8b;
+drop table t9a;
+drop table t9b;
+drop table t10;
+drop table t11a;
+drop table t11b;
+drop table t12;
+drop table t13;
+drop view vt14;
+drop table t14;
+drop table t14log;
+drop view vt15;
+drop table t15a;
+drop table t15b;
+drop table t15log;
+drop table t16;
+drop table t17;
+-- run

@@ -3,7 +3,7 @@ import type { SqlParameters } from '../common/types.js';
 import type { Database } from '../core/database.js';
 import type { SchemaManager } from '../schema/manager.js';
 import type { Scope } from './scopes/scope.js';
-import type { PlanNode, ScalarPlanNode } from './nodes/plan-node.js';
+import type { PlanNode, ScalarPlanNode, TableDescriptor } from './nodes/plan-node.js';
 import type { CTEScopeNode } from './nodes/cte-node.js';
 import type { CTEReferenceNode } from './nodes/cte-reference-node.js';
 
@@ -181,6 +181,18 @@ export interface PlanningContext {
    * to the same CTE with the same alias. Key format: "cteName:alias"
    */
   cteReferenceCache?: Map<string, CTEReferenceNode>;
+
+  /**
+   * Per-statement memo of CTE runtime identities, keyed by the source `with` member.
+   * Every `CTENode` built from one member — however many times the builders re-plan
+   * that member (the view write-through path re-enters the same statement builder,
+   * a multi-source decomposition once per base member) — shares one descriptor and
+   * therefore one per-execution row buffer (`emitCTE` keys its buffer on it), so a
+   * data-modifying body writes once per statement execution by construction rather
+   * than by nothing having re-planned it. Keyed on the AST member OBJECT, not its
+   * name, so a nested statement's same-named member keeps its own identity.
+   */
+  readonly cteDescriptors?: Map<AST.CommonTableExpr, TableDescriptor>;
 
   /** maps a RelationalPlanNode to its column scope during building */
   readonly outputScopes: Map<PlanNode, Scope>;

@@ -161,10 +161,37 @@ still performs the write: the buffer's source drive is detached and runs to
 completion even when every consumer is torn down first. Rollback is unaffected —
 the buffer lives on the `RuntimeContext`, never in the storage layer.
 
-Three known gaps in this area, all still open:
+**One runtime identity per source member.** The `tableDescriptor` is memoized
+per source `with` member for the duration of one statement build
+(`PlanningContext.cteDescriptors`, keyed on the member's AST object so a nested
+statement's same-named member keeps its own identity). The builders really do
+plan one member more than once — the view write-through path re-enters the same
+statement builder, a multi-source view decomposition re-enters it once per base
+member, and the unreferenced-member sink below rebuilds the clause — and every
+build's `CTENode` shares the one descriptor, hence the one buffer. A
+data-modifying body therefore writes once per statement execution by
+construction, not because nothing happened to re-plan it.
 
-- An **unreferenced** data-modifying CTE is dropped by the planner entirely, so
-  the write never runs — SQLite and PostgreSQL both run it.
+**An unreferenced data-modifying member still writes.** A `with` member enters
+the plan only when something reads it, but an `insert`/`update`/`delete` member
+is a stated effect of the statement — SQLite and PostgreSQL both perform it
+whether or not anything reads the block. `buildBlock` (the single entry for
+user statements) detects a data-modifying member whose descriptor is absent
+from the built plan, rebuilds the clause (a member may read an earlier
+sibling; the shared descriptor keeps the rebuild from doubling a referenced
+member's write), and sequences a `SinkNode` over each such member **ahead** of
+the statement under a `SequenceNode` (`runtime/emit/sequence.ts` drives each
+effect to completion in order, then delegates to the main statement).
+Effects-first is deliberate: a trailing effect could be skipped by a main
+statement abandoned early (`limit 0` must not skip the write). Consequence,
+accepted and pinned in `test/logic/13.7-unreferenced-dml-cte.sqllogic`: the
+outer statement **can observe** the write (`select count(*)` sees the inserted
+row). PostgreSQL's sub-statements never see one another's effects and would
+not; Quereus already lets the outer query observe a *referenced* member's
+write, so this is consistent engine behaviour rather than a new divergence.
+
+Two known gaps in this area, both still open:
+
 - A data-modifying CTE nested inside a **correlated** subquery writes once per
   statement execution, not once per outer row, and every outer row sees the first
   row's `RETURNING` set. This predates the always-buffered rule (the once-per-

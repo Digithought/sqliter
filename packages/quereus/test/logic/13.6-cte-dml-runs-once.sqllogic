@@ -142,11 +142,11 @@ with c as (insert into t10 (k) values (1) returning k) select k from c;
 select k from t10 order by k;
 → [{"k":1}]
 
--- ===== Control: referenced ZERO times =====
--- Out of scope here: the planner drops an unreferenced CTE entirely, so the write
--- never happens (a known deviation from SQLite/PostgreSQL, tracked separately in
--- backlog `bug-unreferenced-dml-cte-never-runs`). Pinned so this fix does not
--- accidentally change it in either direction without a deliberate decision.
+-- ===== Control: referenced ZERO times still writes =====
+-- The write is guaranteed, not reference-driven: `buildBlock` sinks an unreferenced
+-- data-modifying member ahead of the statement (a SequenceNode prelude), matching
+-- SQLite and PostgreSQL. Full coverage of the unreferenced arm lives in
+-- test/logic/13.7-unreferenced-dml-cte.sqllogic.
 
 create table t11 (k integer primary key);
 -- run
@@ -155,7 +155,7 @@ with c as (insert into t11 (k) values (1) returning k) select 42 as x;
 → [{"x":42}]
 
 select count(*) as cnt from t11;
-→ [{"cnt":0}]
+→ [{"cnt":1}]
 
 -- ===== Two data-modifying CTEs in one WITH clause, each referenced twice =====
 -- Each CTE owns its own buffer key, so neither replays the other's rows.
@@ -212,11 +212,12 @@ select count(*) as cnt from t15;
 -- ===== A data-modifying CTE feeding an INSERT through a VIEW still runs once =====
 -- INSERT now builds its leading WITH clause ONCE, above the view-target dispatch, so the
 -- clause is built before `buildViewMutation` re-plans the statement through the same
--- builder — and the re-plan builds `stmt.withClause` a second time (buildWithClause does
--- not memoize). One of the two node sets ends up unreferenced, so this should be wasted
--- planning work rather than a behavior change; pinned here because the thing that must
--- NOT double is the write inside the CTE body. (UPDATE has had this same
--- hoist-then-re-plan ordering all along.)
+-- builder — and the re-plan builds `stmt.withClause` a second time (buildWithClause
+-- rebuilds the nodes, but every build of one source member shares one runtime identity
+-- via PlanningContext.cteDescriptors, so all copies share one buffer). One of the two
+-- node sets ends up unreferenced — wasted planning work rather than a behavior change;
+-- pinned here because the thing that must NOT double is the write inside the CTE body.
+-- (UPDATE has had this same hoist-then-re-plan ordering all along.)
 
 create table t16log (id integer primary key, v text);
 create table t16 (id integer primary key, w text);

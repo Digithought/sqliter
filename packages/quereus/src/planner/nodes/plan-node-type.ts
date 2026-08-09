@@ -20,6 +20,7 @@ export enum PlanNodeType {
   In = 'In',
   Exists = 'Exists',
   Sequencing = 'Sequencing',
+  Sequence = 'Sequence',  // Ordered side-effect prelude ahead of a main statement (unreferenced data-modifying CTEs)
 
   // DML/DDL Nodes
   Insert = 'Insert',

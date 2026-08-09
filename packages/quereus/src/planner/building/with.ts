@@ -66,7 +66,7 @@ export function isRecursiveCte(recursive: boolean, cte: AST.CommonTableExpr): bo
  * `RETURNING` clause (the parser requires one for a CTE body). Such a CTE is built
  * with `materialize` already on; see the call site in {@link buildCommonTableExpr}.
  */
-function isDataModifyingCte(cte: AST.CommonTableExpr): boolean {
+export function isDataModifyingCte(cte: AST.CommonTableExpr): boolean {
 	const t = cte.query.type;
 	return t === 'insert' || t === 'update' || t === 'delete';
 }
@@ -167,6 +167,18 @@ export function buildCommonTableExpr(
 	// RETURNING sets are small; if a bulk write's RETURNING ever needs to stream,
 	// buffering would have to become conditional on the reference count — which means
 	// first fixing that undercount, not relaxing this flag.
+	// Resolve the CTE's runtime identity through the per-statement memo
+	// (PlanningContext.cteDescriptors): every build of THIS source member within one
+	// statement gets the same descriptor, so all its CTENodes share one per-execution
+	// buffer in emitCTE — a data-modifying body writes once per statement execution
+	// even when the builders plan the member more than once (view write-through,
+	// multi-source decomposition, the unreferenced-member sink rebuild in buildBlock).
+	let tableDescriptor = ctx.cteDescriptors?.get(cte);
+	if (!tableDescriptor) {
+		tableDescriptor = {};
+		ctx.cteDescriptors?.set(cte, tableDescriptor);
+	}
+
 	return new CTENode(
 		ctx.scope,
 		cte.name,
@@ -174,7 +186,8 @@ export function buildCommonTableExpr(
 		query,
 		cte.materializationHint,
 		isRecursive,
-		isDataModifyingCte(cte)
+		isDataModifyingCte(cte),
+		tableDescriptor
 	);
 }
 
