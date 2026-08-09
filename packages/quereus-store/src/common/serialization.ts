@@ -55,8 +55,14 @@ const decoder = new TextDecoder();
  *
  * Centralized so a future fourth marker type can't add a new marker shape
  * while forgetting this gate.
+ *
+ * NOTE: a row that does contain a marker (any bigint or blob column) is scanned
+ * up to three times before its reviver runs. Measured neutral against the
+ * unconditional-reviver baseline on such rows; if very wide rows or large blobs
+ * ever make these scans show up in a profile, fold the three passes into one
+ * hand-rolled character scan.
  */
-function hasMarkerSigil(json: string): boolean {
+function needsReviver(json: string): boolean {
   if (!json.includes('"$')) return false;
   return json.includes('{"$') || json.includes('"$$');
 }
@@ -78,7 +84,7 @@ export function deserializeRow(buffer: Uint8Array): Row {
   // write-time flag byte. A flag would save ~0.11 µs/row over this scan (measured) but needs
   // a stored-format version + migration; not worth it on its own. Revisit only if the row
   // codec is being opened anyway — a binary/columnar format subsumes this entirely.
-  return JSON.parse(json, hasMarkerSigil(json) ? reviver : undefined) as Row;
+  return JSON.parse(json, needsReviver(json) ? reviver : undefined) as Row;
 }
 
 /**
@@ -94,7 +100,7 @@ export function serializeValue(value: SqlValue): Uint8Array {
  */
 export function deserializeValue(buffer: Uint8Array): SqlValue {
   const json = decoder.decode(buffer);
-  return JSON.parse(json, hasMarkerSigil(json) ? reviver : undefined) as SqlValue;
+  return JSON.parse(json, needsReviver(json) ? reviver : undefined) as SqlValue;
 }
 
 /** True if `key` needs escaping (or unescaping) — cheap `$` test before the regex. */
@@ -108,6 +114,21 @@ function isEscapedKey(key: string): boolean {
 }
 
 /**
+ * Rebuilds `obj` with each own key passed through `rename`.
+ *
+ * Built via `Object.fromEntries` rather than assignment because a JSON value
+ * may legitimately carry an own `__proto__` key; `copy[key] = value` would
+ * invoke the prototype setter, silently dropping the key and re-pointing the
+ * object's prototype. `fromEntries` defines own properties instead.
+ */
+function rekey(
+  obj: Record<string, unknown>,
+  rename: (key: string) => string
+): Record<string, unknown> {
+  return Object.fromEntries(Object.keys(obj).map(key => [rename(key), obj[key]]));
+}
+
+/**
  * Rewrites marker-colliding keys of a plain object so no user data can ever
  * present the shape of a marker. Returns the original object untouched when
  * nothing collides, so the common case allocates nothing.
@@ -116,26 +137,14 @@ function isEscapedKey(key: string): boolean {
  * `JSON.stringify`, which applies `replacer` top-down to every member.
  */
 function escapeMarkerKeys(obj: Record<string, unknown>): Record<string, unknown> {
-  const keys = Object.keys(obj);
-  if (!keys.some(isCollidingKey)) return obj;
-
-  const escaped: Record<string, unknown> = {};
-  for (const key of keys) {
-    escaped[isCollidingKey(key) ? `$${key}` : key] = obj[key];
-  }
-  return escaped;
+  if (!Object.keys(obj).some(isCollidingKey)) return obj;
+  return rekey(obj, key => (isCollidingKey(key) ? `$${key}` : key));
 }
 
 /** Inverse of `escapeMarkerKeys`; likewise returns the original object when nothing was escaped. */
 function unescapeMarkerKeys(obj: Record<string, unknown>): Record<string, unknown> {
-  const keys = Object.keys(obj);
-  if (!keys.some(isEscapedKey)) return obj;
-
-  const unescaped: Record<string, unknown> = {};
-  for (const key of keys) {
-    unescaped[isEscapedKey(key) ? key.slice(1) : key] = obj[key];
-  }
-  return unescaped;
+  if (!Object.keys(obj).some(isEscapedKey)) return obj;
+  return rekey(obj, key => (isEscapedKey(key) ? key.slice(1) : key));
 }
 
 /**
@@ -254,5 +263,5 @@ export function serializeStats(stats: TableStats): Uint8Array {
  * Deserialize table statistics.
  */
 export function deserializeStats(buffer: Uint8Array): TableStats {
-  return JSON.parse(new TextDecoder().decode(buffer)) as TableStats;
+  return JSON.parse(decoder.decode(buffer)) as TableStats;
 }

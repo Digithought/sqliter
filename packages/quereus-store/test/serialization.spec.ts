@@ -277,9 +277,9 @@ describe('Row Serialization', () => {
       expect(deserializeRow(serializeRow(row))).to.deep.equal(row);
     });
 
-    it('round-trips a JSON column with a real $bigint key inside a $json wrapper on read-back', () => {
-      // serializeRow itself decides whether to wrap (wrapJsonIfNeeded) — this
-      // asserts the wrapped-on-write shape still round-trips correctly.
+    it('round-trips a JSON column with a real $bigint key nested under a $json key', () => {
+      // Both keys collide with a marker name, at two different depths — each is
+      // escaped independently on write and unescaped on read.
       const row: Row = [{ $json: { $bigint: 'also-not-a-bigint' } }];
       expect(deserializeRow(serializeRow(row))).to.deep.equal(row);
     });
@@ -311,6 +311,28 @@ describe('Row Serialization', () => {
     it('round-trips a marker-shaped object nested inside a blob-free array column', () => {
       const row: Row = [[{ $blob: 'fake' }, { $json: { $blob: 'also-fake' } }]];
       expect(deserializeRow(serializeRow(row))).to.deep.equal(row);
+    });
+
+    it('preserves an own __proto__ key alongside a colliding key', () => {
+      // Key rewriting must define own properties, not assign them — assigning
+      // `__proto__` would invoke the prototype setter, dropping the key and
+      // re-pointing the object's prototype.
+      const row: Row = [JSON.parse('{"__proto__":{"polluted":true},"$bigint":"x"}') as SqlValue];
+      const result = deserializeRow(serializeRow(row));
+      const value = result[0] as Record<string, unknown>;
+
+      expect(Object.keys(value)).to.deep.equal(['__proto__', '$bigint']);
+      expect(Object.getPrototypeOf(value)).to.equal(Object.prototype);
+      expect(value.$bigint).to.equal('x');
+    });
+
+    it('preserves an own __proto__ key alongside an escaped-lookalike key', () => {
+      const row: Row = [JSON.parse('{"__proto__":{"polluted":true},"$$blob":"y"}') as SqlValue];
+      const result = deserializeRow(serializeRow(row));
+      const value = result[0] as Record<string, unknown>;
+
+      expect(Object.keys(value)).to.deep.equal(['__proto__', '$$blob']);
+      expect(Object.getPrototypeOf(value)).to.equal(Object.prototype);
     });
 
     it('round-trips blob content whose base64 text happens to contain a sigil-like run', () => {
