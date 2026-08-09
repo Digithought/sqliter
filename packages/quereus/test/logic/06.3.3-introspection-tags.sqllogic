@@ -175,10 +175,14 @@ SELECT name, "deferrable", initially_deferred FROM assertion_info() ORDER BY nam
 SELECT count(*) AS cnt FROM assertion_info() WHERE length(violation_sql) > 0;
 → [{"cnt":2}]
 
--- dependent_tables is JSON (may be an empty array if discovery hasn't run yet,
--- so we only check that the column is parseable JSON)
+-- dependent_tables is a JSON array of the base tables the body reads: one entry
+-- per table reference, named `<schema>.<table>` lowercased
 SELECT count(*) AS cnt FROM assertion_info() WHERE json_valid(dependent_tables) = 1;
 → [{"cnt":2}]
+
+SELECT name, json_array_length(dependent_tables) AS n, json_extract(dependent_tables, '$[0].base') AS base
+FROM assertion_info() ORDER BY name;
+→ [{"name":"val_bounded","n":1,"base":"main.assertdata"},{"name":"val_positive","n":1,"base":"main.assertdata"}]
 
 -- ===================================================================
 -- Cleanup

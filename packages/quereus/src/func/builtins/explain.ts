@@ -15,13 +15,9 @@ import { analyzeRowSpecific } from "../../planner/analysis/constraint-extractor.
 import { Parser } from "../../parser/parser.js";
 import * as AST from "../../parser/ast.js";
 import { astToString } from "../../emit/ast-stringify.js";
-import { GlobalScope } from "../../planner/scopes/global.js";
-import { ParameterScope } from "../../planner/scopes/param.js";
 import { computeBasisBackfill } from "../../schema/basis-backfill.js";
 import { computeSchemaHash } from "../../schema/schema-hasher.js";
-import type { PlanningContext } from "../../planner/planning-context.js";
-import { BuildTimeDependencyTracker } from "../../planner/planning-context.js";
-import { buildBlock } from "../../planner/building/block.js";
+import { planAssertionBodyForAnalysis } from "../../planner/analysis/assertion-plan.js";
 import { resolveBaseSite } from "../../planner/analysis/update-lineage.js";
 import type { LensSlot } from "../../schema/lens.js";
 import { createLogger } from "../../common/logger.js";
@@ -1017,31 +1013,13 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			throw new QuereusError(`Failed to parse assertion SQL: ${(e as Error).message}`, StatusCode.ERROR, e as Error);
 		}
 
-		const globalScope = new GlobalScope(db.schemaManager);
-		const parameterScope = new ParameterScope(globalScope);
-		const ctx: PlanningContext = {
-			db,
-			schemaManager: db.schemaManager,
-			parameters: {},
-			scope: parameterScope,
-			cteNodes: new Map(),
-			schemaDependencies: new BuildTimeDependencyTracker(),
-			schemaCache: new Map(),
-			cteReferenceCache: new Map(),
-			outputScopes: new Map(),
-			// The stored body resolves unqualified names against the assertion's
-			// home schema, same as commit-time enforcement.
-			schemaPath: db._homeSchemaPath(assertion.schemaName)
-		};
-
-		// Suppress assertion-hoisting while planning, exactly as the commit-time
-		// evaluator does: otherwise a canonical-shaped assertion's own hoisted
-		// facts fold its violation query to empty and the explain shows no
-		// classifications at all.
-		const analyzed = db.schemaManager.withSuppressedAssertionHoist(() => {
-			const plan = buildBlock(ctx, [ast]);
-			return db.optimizer.optimizeForAnalysis(plan, db) as unknown as RelationalPlanNode;
-		});
+		// The shared recipe: home-schema path (the stored body resolves unqualified
+		// names against the assertion's own schema, same as commit-time
+		// enforcement), analysis stage, and hoist suppression — without the last, a
+		// canonical-shaped assertion's own hoisted facts fold its violation query to
+		// empty and the explain shows no classifications at all.
+		const analyzed = planAssertionBodyForAnalysis(
+			db, ast, assertion.schemaName) as unknown as RelationalPlanNode;
 
 		// Classify each table reference as row/group/global.
 		const { classifications, groupKeys } = analyzeRowSpecific(analyzed);

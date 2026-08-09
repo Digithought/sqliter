@@ -6,7 +6,15 @@ import { snapshotObjectRefResolvers } from './object-ref-resolver.js';
 import { reachableObjects, type ObjectReach } from './object-dependency-closure.js';
 
 export interface AssertionDependentTable {
-  /** Instance-unique table reference key, e.g. schema.table#nodeId */
+  /**
+   * Instance-unique table reference key, e.g. `schema.table#nodeId`.
+   *
+   * Meaningful ONLY within one recorded list, where it tells two references to
+   * the same table apart (a self-join records two entries). The embedded node id
+   * comes from a process-wide counter over whichever plan produced the list, so
+   * it will never equal the key the commit-time evaluator computes for the same
+   * table — do not build a lookup that compares the two.
+   */
   relationKey: string;
   /** Base table identifier, e.g. schema.table */
   base: string;
@@ -23,7 +31,21 @@ export interface IntegrityAssertionSchema {
   deferrable: boolean;
   /** If true, initially deferred. Currently informational. */
   initiallyDeferred: boolean;
-  /** Base tables referenced; filled during assertion preparation/creation. */
+  /**
+   * Base-table references in the body — informational only; it feeds
+   * `assertion_info().dependent_tables` and enforcement never reads it (the
+   * commit-time evaluator derives its own set when it compiles the body, from
+   * the same `planAssertionBodyForAnalysis` + `collectTableReferences` pair).
+   *
+   * NOTE: recorded once at CREATE, and after that only string-re-keyed by the
+   * `ALTER TABLE … RENAME` propagation — no other schema change re-derives it.
+   * It can therefore go stale where the body's plan shape depends on something
+   * other than the table names in its text (a view in the body redefined over
+   * different tables is the reachable case). Harmless while nothing but
+   * introspection reads it; the day a consumer needs it to be live, re-derive it
+   * on the schema-change events the evaluator already invalidates its cache on
+   * rather than adding another remap.
+   */
   dependentTables?: AssertionDependentTable[];
   /**
    * Original CHECK expression AST. Populated when the assertion is created

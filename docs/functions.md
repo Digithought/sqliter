@@ -611,7 +611,7 @@ One row per (UNIQUE constraint, column) pair. The primary key is excluded — qu
 | `violation_sql` | TEXT | The query that should return zero rows when the assertion holds |
 | `deferrable` | INTEGER | 0/1 |
 | `initially_deferred` | INTEGER | 0/1 |
-| `dependent_tables` | TEXT | JSON array of `{relationKey, base}` |
+| `dependent_tables` | TEXT | JSON array of `{relationKey, base}` — one entry per base-table *reference* in the body (a self-join yields two), `base` lowercased `schema.table` |
 
 ```sql
 select type, name from schema() where type = 'table';

@@ -26,6 +26,7 @@ import { BlockNode } from '../planner/nodes/block.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import { isAsyncIterable } from '../runtime/utils.js';
 import { extractBindings, type BindingMode, type PlanBindings } from '../planner/analysis/binding-extractor.js';
+import { planAssertionBodyForAnalysis } from '../planner/analysis/assertion-plan.js';
 import { injectKeyFilter } from '../planner/analysis/key-filter.js';
 import { DeltaExecutor, type DeltaApplyInput, type DeltaExecutorContext, type DeltaSubscription } from '../runtime/delta-executor.js';
 import type { Database } from './database.js';
@@ -322,11 +323,13 @@ export class AssertionEvaluator {
 		ast: AST.Statement,
 		key: string,
 	): CachedAssertionPlan {
-		// Plan under the assertion's home-schema path so unqualified table names in
-		// the stored body resolve against the assertion's own schema first,
-		// independent of the session's search path (see Database._homeSchemaPath).
-		const { plan } = this.ctx._buildPlan([ast], undefined, this.ctx._homeSchemaPath(assertion.schemaName));
-		const analyzed = this.ctx.optimizer.optimizeForAnalysis(plan, this.ctx as unknown as Database) as BlockNode;
+		// Home-schema path, analysis-stage optimization, hoist suppression — the
+		// shared recipe, so `CREATE ASSERTION`'s dependency discovery and
+		// `explain_assertion()` see exactly the plan enforcement runs against.
+		// (The hoist suppression the helper applies nests inside the caller's,
+		// which covers the residual compilation below as well.)
+		const analyzed = planAssertionBodyForAnalysis(
+			this.ctx as unknown as Database, ast, assertion.schemaName) as BlockNode;
 
 		const bindings = extractBindings(analyzed);
 

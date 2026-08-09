@@ -92,20 +92,18 @@ describe('assertion rename propagation: stored body, derived SQL, and events', (
 			await db.exec('create table t (x integer primary key)');
 			await db.exec('create assertion a1 check (not exists (select 1 from t where x < 0))');
 			const before = getAssertion(db, 'main', 'a1').dependentTables ?? [];
+			expect(before.map(d => d.base), 'the created assertion names the table it reads')
+				.to.deep.equal(['main.t']);
 
 			await db.exec('alter table t rename to t2');
 
 			const after = getAssertion(db, 'main', 'a1').dependentTables ?? [];
-			expect(after.length, 'entry count unchanged').to.equal(before.length);
-			expect(after.map(d => d.base), 'no entry still names the old base')
-				.to.not.include('main.t');
-			for (const dep of after) {
-				expect(dep.relationKey.startsWith(`${dep.base}#`), 'relationKey keeps its <base>#<nodeId> shape')
-					.to.equal(true);
-			}
-			// Discovery through a subquery is itself incomplete today
-			// (`bug-assertion-info-dependent-tables-always-empty`), so this asserts the
-			// mapping is consistent rather than that any particular entry exists.
+			expect(after.map(d => d.base), 'the entry follows the rename')
+				.to.deep.equal(['main.t2']);
+			expect(after[0].relationKey.startsWith('main.t2#'), 'relationKey keeps its <base>#<nodeId> shape')
+				.to.equal(true);
+			expect(after[0].relationKey.slice('main.t2'.length), 'only the base is re-keyed; the node id is carried over')
+				.to.equal(before[0].relationKey.slice('main.t'.length));
 		} finally {
 			await db.close();
 		}

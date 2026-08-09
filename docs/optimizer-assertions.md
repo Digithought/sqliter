@@ -93,7 +93,7 @@ Savepoints:
 ### Commit‑time Evaluation Engine
 
 High‑level algorithm:
-1) Collect assertions impacted by the transaction: `dependentTables ∩ changedTables ≠ ∅` (dependent tables discovered during assertion preparation by examining the violation plan).
+1) Collect assertions impacted by the transaction: dependent tables ∩ changed tables ≠ ∅. The evaluator uses the base-table set it derives when it compiles the body, NOT the `dependentTables` recorded on the schema object — that field is informational (it feeds `assertion_info().dependent_tables`) and enforcement never reads it. Both come from the same plan-and-walk (`planAssertionBodyForAnalysis` + `collectTableReferences`), so they agree on content; only the recorded one can go stale.
 2) For each impacted assertion:
    a) Build/obtain pre‑physical plan via analysis entrypoint; run `analyzeRowSpecific(plan)`.
    b) If any dependent reference is classified 'global' AND that base table changed: execute the original violation SQL once. If any row returns → fail.
