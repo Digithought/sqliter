@@ -4,15 +4,35 @@
  * Uses extended JSON format that preserves SQL value types:
  * - bigint: { "$bigint": "12345678901234567890" }
  * - Uint8Array: { "$blob": "base64..." }
- * - JSON objects with marker-colliding keys: { "$json": { "$bigint": "not-a-bigint" } }
  * - Other types: Native JSON representation
+ *
+ * JSON/object values whose own keys collide with a marker name are escaped on
+ * write by prefixing one extra `$` (`$bigint` -> `$$bigint`, `$$blob` ->
+ * `$$$blob`) and unescaped on read. Escaping happens per key at any depth, so
+ * a marker-shaped object can never be confused with a real marker no matter
+ * how deeply it is nested.
+ *
+ * Escaping (not wrapping) is required because `JSON.parse` invokes the reviver
+ * bottom-up: an enclosing `{"$json": ...}` wrapper is visited *after* the value
+ * it was meant to protect, so the inner object would already have been decoded
+ * (or thrown) before the wrapper could suppress it.
  */
 
 import type { Row, SqlValue } from '@quereus/quereus';
 
 const BIGINT_MARKER = '$bigint';
 const BLOB_MARKER = '$blob';
+
+/** Legacy write-side wrapper; still unwrapped on read for rows written before key escaping. */
 const JSON_MARKER = '$json';
+
+/** A user key that would collide with a marker, or with an escaped marker key. */
+const COLLIDING_KEY = /^\$+(?:bigint|blob|json)$/;
+
+/** An escaped user key produced by `escapeKey` — one `$` more than a colliding key. */
+const ESCAPED_KEY = /^\$\$+(?:bigint|blob|json)$/;
+
+const DOLLAR_CHAR_CODE = 36;
 
 // TextEncoder is stateless and reusable — hoist one instance rather than
 // allocating a fresh encoder on every serialize call.
@@ -23,26 +43,29 @@ const textEncoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 /**
- * True if the decoded JSON text could contain a marker object emitted by
- * `replacer` (`{"$bigint":...}`, `{"$blob":...}`, `{"$json":...}`). All three
- * markers are single-key objects, so they always serialize with the literal
- * `{"$` sigil — checking for it (rather than the looser `"$`) avoids false
- * positives on ordinary text values that merely start with `$`.
+ * True if the decoded JSON text could need reviving — either a marker object
+ * emitted by `replacer` or a key escaped by `escapeMarkerKeys`.
+ *
+ * Markers are single-key objects, so they always serialize with the literal
+ * `{"$` sigil. Escaped keys always start with `$$` but may sit at any position
+ * in their object, so they only guarantee the `"$$` sigil. Both are preceded by
+ * a quote, so a single `"$` scan rules out the overwhelmingly common case in
+ * one pass; the narrower checks then run only for text that already contains a
+ * quoted `$`, keeping ordinary values like `"$125.00 fee"` off the slow path.
  *
  * Centralized so a future fourth marker type can't add a new marker shape
  * while forgetting this gate.
  */
 function hasMarkerSigil(json: string): boolean {
-  return json.includes('{"$');
+  if (!json.includes('"$')) return false;
+  return json.includes('{"$') || json.includes('"$$');
 }
 
 /**
  * Serialize a row to a byte array for storage.
  */
 export function serializeRow(row: Row): Uint8Array {
-  // Pre-process row elements to handle JSON objects with marker-colliding keys
-  const safeRow = row.map(wrapJsonIfNeeded);
-  const json = JSON.stringify(safeRow, replacer);
+  const json = JSON.stringify(row, replacer);
   return textEncoder.encode(json);
 }
 
@@ -62,8 +85,7 @@ export function deserializeRow(buffer: Uint8Array): Row {
  * Serialize a single SQL value to a byte array.
  */
 export function serializeValue(value: SqlValue): Uint8Array {
-  const safe = wrapJsonIfNeeded(value);
-  const json = JSON.stringify(safe, replacer);
+  const json = JSON.stringify(value, replacer);
   return textEncoder.encode(json);
 }
 
@@ -75,23 +97,52 @@ export function deserializeValue(buffer: Uint8Array): SqlValue {
   return JSON.parse(json, hasMarkerSigil(json) ? reviver : undefined) as SqlValue;
 }
 
+/** True if `key` needs escaping (or unescaping) — cheap `$` test before the regex. */
+function isCollidingKey(key: string): boolean {
+  return key.charCodeAt(0) === DOLLAR_CHAR_CODE && COLLIDING_KEY.test(key);
+}
+
+/** True if `key` was produced by escaping a colliding key. */
+function isEscapedKey(key: string): boolean {
+  return key.charCodeAt(0) === DOLLAR_CHAR_CODE && ESCAPED_KEY.test(key);
+}
+
 /**
- * Wraps a JSON object in a $json marker if it contains keys that
- * would collide with our bigint/blob markers during deserialization.
+ * Rewrites marker-colliding keys of a plain object so no user data can ever
+ * present the shape of a marker. Returns the original object untouched when
+ * nothing collides, so the common case allocates nothing.
+ *
+ * Only the object's own keys are rewritten — nested objects are reached by
+ * `JSON.stringify`, which applies `replacer` top-down to every member.
  */
-function wrapJsonIfNeeded(value: SqlValue): unknown {
-  if (typeof value !== 'object' || value === null || value instanceof Uint8Array) {
-    return value;
+function escapeMarkerKeys(obj: Record<string, unknown>): Record<string, unknown> {
+  const keys = Object.keys(obj);
+  if (!keys.some(isCollidingKey)) return obj;
+
+  const escaped: Record<string, unknown> = {};
+  for (const key of keys) {
+    escaped[isCollidingKey(key) ? `$${key}` : key] = obj[key];
   }
-  // It's a JSON object or array stored as a SqlValue
-  if (!Array.isArray(value) && (BIGINT_MARKER in value || BLOB_MARKER in value)) {
-    return { [JSON_MARKER]: value };
+  return escaped;
+}
+
+/** Inverse of `escapeMarkerKeys`; likewise returns the original object when nothing was escaped. */
+function unescapeMarkerKeys(obj: Record<string, unknown>): Record<string, unknown> {
+  const keys = Object.keys(obj);
+  if (!keys.some(isEscapedKey)) return obj;
+
+  const unescaped: Record<string, unknown> = {};
+  for (const key of keys) {
+    unescaped[isEscapedKey(key) ? key.slice(1) : key] = obj[key];
   }
-  return value;
+  return unescaped;
 }
 
 /**
  * JSON replacer function for SQL values.
+ *
+ * `JSON.stringify` calls this top-down for every member, which is what lets the
+ * key escaping reach arbitrary nesting depth without a separate pre-walk.
  */
 function replacer(_key: string, value: unknown): unknown {
   if (typeof value === 'bigint') {
@@ -102,28 +153,42 @@ function replacer(_key: string, value: unknown): unknown {
     return { [BLOB_MARKER]: uint8ArrayToBase64(value) };
   }
 
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return escapeMarkerKeys(value as Record<string, unknown>);
+  }
+
   return value;
 }
 
 /**
  * JSON reviver function for SQL values.
+ *
+ * Markers are matched only in their exact single-key form; escaping guarantees
+ * that shape is unreachable from user data, so no ambiguity remains.
  */
 function reviver(_key: string, value: unknown): unknown {
   if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
     const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj);
 
-    // Unwrap $json marker first (before checking for $bigint/$blob)
-    if (JSON_MARKER in obj && Object.keys(obj).length === 1) {
-      return obj[JSON_MARKER];
+    if (keys.length === 1) {
+      const [key] = keys;
+
+      if (key === BIGINT_MARKER && typeof obj[BIGINT_MARKER] === 'string') {
+        return BigInt(obj[BIGINT_MARKER]);
+      }
+
+      if (key === BLOB_MARKER && typeof obj[BLOB_MARKER] === 'string') {
+        return base64ToUint8Array(obj[BLOB_MARKER]);
+      }
+
+      // Legacy wrapper from before key escaping; user data now escapes `$json`.
+      if (key === JSON_MARKER) {
+        return obj[JSON_MARKER];
+      }
     }
 
-    if (BIGINT_MARKER in obj && typeof obj[BIGINT_MARKER] === 'string') {
-      return BigInt(obj[BIGINT_MARKER]);
-    }
-
-    if (BLOB_MARKER in obj && typeof obj[BLOB_MARKER] === 'string') {
-      return base64ToUint8Array(obj[BLOB_MARKER]);
-    }
+    return unescapeMarkerKeys(obj);
   }
 
   return value;

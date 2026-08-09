@@ -44,6 +44,8 @@ const VALUE_KINDS = [
   'jsonMarkerCollision',
   'jsonArray',
   'jsonNestedMarker',
+  'jsonCollidingKeyLate',
+  'jsonEscapedLookalike',
 ] as const;
 
 /** Generates one random SqlValue, covering every kind the reviver gate must stay sound for. */
@@ -84,6 +86,10 @@ function generateValue(rand: () => number): SqlValue {
       return [randomInt(rand, 10), 'x', { $blob: 'fake' }];
     case 'jsonNestedMarker':
       return { outer: { inner: [{ $bigint: 'deep' }] } };
+    case 'jsonCollidingKeyLate':
+      return { lead: randomInt(rand, 100), $blob: 'fake' };
+    case 'jsonEscapedLookalike':
+      return { $$bigint: 'pre-escaped', $json: { $$blob: 'nested' } };
   }
 }
 
@@ -280,6 +286,30 @@ describe('Row Serialization', () => {
 
     it('round-trips a marker nested inside an array inside an object', () => {
       const row: Row = [{ outer: { list: [1, 2, { $bigint: 'deep-not-a-bigint' }] } }];
+      expect(deserializeRow(serializeRow(row))).to.deep.equal(row);
+    });
+
+    it('round-trips a colliding key that is not the first key of its object', () => {
+      // Escaping this key yields `{"a":1,"$$blob":"fake"}` — no `{"$` sigil
+      // anywhere, so the gate must also recognize the `"$$` escape sigil.
+      const row: Row = [{ a: 1, $blob: 'fake' }];
+      expect(deserializeRow(serializeRow(row))).to.deep.equal(row);
+    });
+
+    it('round-trips a user key that already looks like an escaped marker key', () => {
+      // `$$bigint` escapes to `$$$bigint`, so it cannot be confused on read-back
+      // with a genuinely escaped `$bigint`.
+      const row: Row = [{ $$bigint: 'x', $bigint: 'y' }];
+      expect(deserializeRow(serializeRow(row))).to.deep.equal(row);
+    });
+
+    it('leaves non-marker keys starting with $ untouched', () => {
+      const row: Row = [{ $ref: 'a', $bigintish: 'b', $: 'c' }];
+      expect(deserializeRow(serializeRow(row))).to.deep.equal(row);
+    });
+
+    it('round-trips a marker-shaped object nested inside a blob-free array column', () => {
+      const row: Row = [[{ $blob: 'fake' }, { $json: { $blob: 'also-fake' } }]];
       expect(deserializeRow(serializeRow(row))).to.deep.equal(row);
     });
 

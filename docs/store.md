@@ -322,6 +322,12 @@ Rows are stored as values using Quereus's extended JSON serializer, which handle
 - `Uint8Array` via `{"$blob": "base64..."}`
 - Standard JSON types
 
+A JSON/object value whose own keys collide with a marker name is escaped on write
+by prefixing one extra `$` (`$bigint` → `$$bigint`, `$$blob` → `$$$blob`) and
+unescaped on read, at any nesting depth. Escaping rather than wrapping is required
+because `JSON.parse` runs its reviver bottom-up, so an enclosing wrapper is visited
+only after the value it was meant to protect has already been decoded.
+
 ## Secondary Indexes
 
 Indexes are stored in separate stores, with keys containing the indexed values plus the primary key:
