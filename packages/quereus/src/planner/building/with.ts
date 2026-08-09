@@ -167,16 +167,24 @@ export function buildCommonTableExpr(
 	// RETURNING sets are small; if a bulk write's RETURNING ever needs to stream,
 	// buffering would have to become conditional on the reference count — which means
 	// first fixing that undercount, not relaxing this flag.
+	//
 	// Resolve the CTE's runtime identity through the per-statement memo
 	// (PlanningContext.cteDescriptors): every build of THIS source member within one
 	// statement gets the same descriptor, so all its CTENodes share one per-execution
 	// buffer in emitCTE — a data-modifying body writes once per statement execution
 	// even when the builders plan the member more than once (view write-through,
 	// multi-source decomposition, the unreferenced-member sink rebuild in buildBlock).
-	let tableDescriptor = ctx.cteDescriptors?.get(cte);
+	//
+	// NOTE: sharing the identity can also drop a READ-ONLY member's evaluation count from
+	// N to 1 — two builds of one member now feed one buffer when the materialization
+	// advisory buffers it, where they used to evaluate independently. Row-identical for a
+	// deterministic body, and arguably better for a non-deterministic one (one consistent
+	// image). If a body ever needs per-build re-evaluation, the memo has to become
+	// conditional on `isDataModifyingCte` rather than universal.
+	let tableDescriptor = ctx.cteDescriptors.get(cte);
 	if (!tableDescriptor) {
 		tableDescriptor = {};
-		ctx.cteDescriptors?.set(cte, tableDescriptor);
+		ctx.cteDescriptors.set(cte, tableDescriptor);
 	}
 
 	return new CTENode(

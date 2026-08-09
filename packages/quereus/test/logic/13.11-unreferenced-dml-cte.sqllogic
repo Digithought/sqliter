@@ -1,4 +1,4 @@
--- 13.7-unreferenced-dml-cte.sqllogic - an UNREFERENCED data-modifying CTE still runs
+-- 13.11-unreferenced-dml-cte.sqllogic - an UNREFERENCED data-modifying CTE still runs
 --
 -- A top-level statement's `with` clause naming an `insert`/`update`/`delete` member
 -- performs that member's write exactly once per statement execution, whether or not the
@@ -290,6 +290,90 @@ insert into t17 values (1);
 with c as (select k from t17) select 42 as x;
 → [{"x":42}]
 
+-- ===== A compound (UNION ALL) main statement still carries the clause =====
+-- The attach site reads the clause off the TOP statement node; a compound main must not
+-- hide it on an arm.
+
+create table t22 (k integer primary key);
+-- run
+
+with c as (insert into t22 (k) values (1) returning k)
+select 42 as x union all select 43 as x;
+→ [{"x":42},{"x":43}]
+
+select k from t22 order by k;
+→ [{"k":1}]
+
+-- ===== A bind parameter inside the unreferenced member's body still binds =====
+-- The member is rebuilt for the sink AFTER the statement is planned; the rebuild must
+-- reach the same parameter, not a second unbound one.
+
+create table t18 (k integer primary key);
+-- run
+
+-- params: [7]
+with c as (insert into t18 (k) values (?) returning k) select 42 as x;
+→ [{"x":42}]
+
+select k from t18 order by k;
+→ [{"k":7}]
+
+-- ===== A failing sunk write surfaces its error, it is not swallowed =====
+
+create table t19 (k integer primary key);
+insert into t19 values (1);
+-- run
+
+with c as (insert into t19 (k) values (1) returning k) select 42 as x;
+-- error: UNIQUE constraint failed
+
+select count(*) as cnt from t19;
+→ [{"cnt":1}]
+
+-- ===== A failing MAIN statement rolls the prelude write back with it =====
+-- The prelude is part of the statement, not a statement of its own: one statement
+-- savepoint covers both, so a main-statement failure undoes the sunk write.
+
+create table t20 (k integer primary key);
+create table t20u (k integer primary key);
+insert into t20u values (1);
+-- run
+
+with c as (insert into t20 (k) values (1) returning k) insert into t20u (k) values (1);
+-- error: UNIQUE constraint failed
+
+select count(*) as cnt from t20;
+→ [{"cnt":0}]
+
+-- ===== The statement's WITH SCHEMA steers the sunk member's write =====
+-- The sink rebuild runs on its own context, which must mirror the statement's schema
+-- path — else the write resolves the bare name against the SESSION path instead.
+
+create table main.t21 (k integer primary key);
+create table temp.t21 (k integer primary key);
+pragma schema_path = 'temp';
+-- run
+
+with c as (insert into t21 (k) values (1) returning k) select 42 as x with schema main;
+→ [{"x":42}]
+
+select count(*) as cnt from main.t21;
+→ [{"cnt":1}]
+
+select count(*) as cnt from temp.t21;
+→ [{"cnt":0}]
+
+-- Control: with no statement schema path, the SESSION path (temp) takes the write.
+
+with c as (insert into t21 (k) values (2) returning k) select 42 as x;
+→ [{"x":42}]
+
+select count(*) as cnt from temp.t21;
+→ [{"cnt":1}]
+
+pragma schema_path = 'main';
+-- run
+
 -- Cleanup
 drop table t1;
 drop table t2;
@@ -320,4 +404,11 @@ drop table t15b;
 drop table t15log;
 drop table t16;
 drop table t17;
+drop table t18;
+drop table t19;
+drop table t20;
+drop table t20u;
+drop table main.t21;
+drop table temp.t21;
+drop table t22;
 -- run

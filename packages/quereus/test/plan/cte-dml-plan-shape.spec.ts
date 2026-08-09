@@ -308,7 +308,7 @@ function sequenceNodes(root: PlanNode): SequenceNode[] {
  *     the sink rebuild unable to double a referenced member's write; and
  *  3. a statement whose members are all referenced (or read-only) gets NO wrapper.
  *
- * `test/logic/13.7-unreferenced-dml-cte.sqllogic` pins the observable behaviour.
+ * `test/logic/13.11-unreferenced-dml-cte.sqllogic` pins the observable behaviour.
  */
 describe('unreferenced data-modifying CTE: plan-shape invariants', () => {
 	let db: Database;

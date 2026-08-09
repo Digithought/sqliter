@@ -38,6 +38,7 @@ function analyzedPlan(db: Database, sql: string): PlanNode {
 		schemaDependencies: new BuildTimeDependencyTracker(),
 		schemaCache: new Map(),
 		cteReferenceCache: new Map(),
+		cteDescriptors: new Map(),
 		outputScopes: new Map(),
 	};
 	const plan = buildBlock(ctx, [ast]);

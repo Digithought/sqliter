@@ -1,6 +1,6 @@
 import { BlockNode } from '../nodes/block.js';
 import * as AST from '../../parser/ast.js';
-import type { PlanNode, RelationalPlanNode, TableDescriptor } from '../nodes/plan-node.js';
+import { isRelationalNode, type PlanNode, type TableDescriptor } from '../nodes/plan-node.js';
 import { buildSelectStmt } from './select.js';
 import type { PlanningContext } from '../planning-context.js';
 import { CTENode } from '../nodes/cte-node.js';
@@ -45,93 +45,93 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 }
 
 function buildStatement(ctx: PlanningContext, stmt: AST.Statement): PlanNode | undefined {
-		switch (stmt.type) {
-			case 'select':
-				// buildSelectStmt returns a BatchNode, which is a PlanNode.
-				return buildSelectStmt(ctx, stmt as AST.SelectStmt);
-			case 'createTable':
-				return buildCreateTableStmt(ctx, stmt as AST.CreateTableStmt);
-			case 'createIndex':
-				return buildCreateIndexStmt(ctx, stmt as AST.CreateIndexStmt);
-			case 'createView':
-				return buildCreateViewStmt(ctx, stmt as AST.CreateViewStmt);
-			case 'createMaterializedView':
-				return buildCreateMaterializedViewStmt(ctx, stmt as AST.CreateMaterializedViewStmt);
-			case 'refreshMaterializedView':
-				return buildRefreshMaterializedViewStmt(ctx, stmt as AST.RefreshMaterializedViewStmt);
-			case 'createAssertion':
-				return buildCreateAssertionStmt(ctx, stmt as AST.CreateAssertionStmt);
-			case 'drop': {
-				const dropStmt = stmt as AST.DropStmt;
-				if (dropStmt.objectType === 'table') {
-					return buildDropTableStmt(ctx, dropStmt);
-				} else if (dropStmt.objectType === 'view') {
-					return buildDropViewStmt(ctx, dropStmt);
-				} else if (dropStmt.objectType === 'materializedView') {
-					return buildDropMaterializedViewStmt(ctx, dropStmt);
-				} else if (dropStmt.objectType === 'assertion') {
-					return buildDropAssertionStmt(ctx, dropStmt);
-				} else if (dropStmt.objectType === 'index') {
-					return buildDropIndexStmt(ctx, dropStmt);
-				} else if (dropStmt.objectType === 'trigger') {
-					quereusError(
-						`DROP TRIGGER is not supported`,
-						StatusCode.UNSUPPORTED,
-						undefined,
-						dropStmt
-					);
-				}
-				break;
-			}
-			case 'insert':
-				return buildInsertStmt(ctx, stmt as AST.InsertStmt);
-			case 'update':
-				return buildUpdateStmt(ctx, stmt as AST.UpdateStmt);
-			case 'delete':
-				return buildDeleteStmt(ctx, stmt as AST.DeleteStmt);
-			case 'begin':
-				return buildBeginStmt(ctx, stmt as AST.BeginStmt);
-			case 'commit':
-				return buildCommitStmt(ctx, stmt as AST.CommitStmt);
-			case 'rollback':
-				return buildRollbackStmt(ctx, stmt as AST.RollbackStmt);
-			case 'savepoint':
-				return buildSavepointStmt(ctx, stmt as AST.SavepointStmt);
-			case 'release':
-				return buildReleaseStmt(ctx, stmt as AST.ReleaseStmt);
-			case 'pragma':
-				return buildPragmaStmt(ctx, stmt as AST.PragmaStmt);
-			case 'analyze':
-				return buildAnalyzeStmt(ctx, stmt as AST.AnalyzeStmt);
-			case 'alterTable':
-				return buildAlterTableStmt(ctx, stmt as AST.AlterTableStmt);
-			case 'alterView':
-				return buildAlterViewStmt(ctx, stmt as AST.AlterViewStmt);
-			case 'alterMaterializedView':
-				return buildAlterMaterializedViewStmt(ctx, stmt as AST.AlterMaterializedViewStmt);
-			case 'alterIndex':
-				return buildAlterIndexStmt(ctx, stmt as AST.AlterIndexStmt);
-			case 'values':
-				return buildValuesStmt(ctx, stmt as AST.ValuesStmt);
-			case 'declareSchema':
-				return buildDeclareSchemaStmt(ctx, stmt);
-			case 'declareLens':
-				return buildDeclareLensStmt(ctx, stmt);
-			case 'diffSchema':
-				return buildDiffSchemaStmt(ctx, stmt);
-			case 'applySchema':
-				return buildApplySchemaStmt(ctx, stmt);
-			case 'explainSchema':
-				return buildExplainSchemaStmt(ctx, stmt);
-			default:
-				// Throw an exception for unsupported statement types
+	switch (stmt.type) {
+		case 'select':
+			// buildSelectStmt returns a BatchNode, which is a PlanNode.
+			return buildSelectStmt(ctx, stmt as AST.SelectStmt);
+		case 'createTable':
+			return buildCreateTableStmt(ctx, stmt as AST.CreateTableStmt);
+		case 'createIndex':
+			return buildCreateIndexStmt(ctx, stmt as AST.CreateIndexStmt);
+		case 'createView':
+			return buildCreateViewStmt(ctx, stmt as AST.CreateViewStmt);
+		case 'createMaterializedView':
+			return buildCreateMaterializedViewStmt(ctx, stmt as AST.CreateMaterializedViewStmt);
+		case 'refreshMaterializedView':
+			return buildRefreshMaterializedViewStmt(ctx, stmt as AST.RefreshMaterializedViewStmt);
+		case 'createAssertion':
+			return buildCreateAssertionStmt(ctx, stmt as AST.CreateAssertionStmt);
+		case 'drop': {
+			const dropStmt = stmt as AST.DropStmt;
+			if (dropStmt.objectType === 'table') {
+				return buildDropTableStmt(ctx, dropStmt);
+			} else if (dropStmt.objectType === 'view') {
+				return buildDropViewStmt(ctx, dropStmt);
+			} else if (dropStmt.objectType === 'materializedView') {
+				return buildDropMaterializedViewStmt(ctx, dropStmt);
+			} else if (dropStmt.objectType === 'assertion') {
+				return buildDropAssertionStmt(ctx, dropStmt);
+			} else if (dropStmt.objectType === 'index') {
+				return buildDropIndexStmt(ctx, dropStmt);
+			} else if (dropStmt.objectType === 'trigger') {
 				quereusError(
-					`Unsupported statement type: ${(stmt as AST.Statement).type}`,
+					`DROP TRIGGER is not supported`,
 					StatusCode.UNSUPPORTED,
 					undefined,
-					stmt
+					dropStmt
 				);
+			}
+			break;
 		}
+		case 'insert':
+			return buildInsertStmt(ctx, stmt as AST.InsertStmt);
+		case 'update':
+			return buildUpdateStmt(ctx, stmt as AST.UpdateStmt);
+		case 'delete':
+			return buildDeleteStmt(ctx, stmt as AST.DeleteStmt);
+		case 'begin':
+			return buildBeginStmt(ctx, stmt as AST.BeginStmt);
+		case 'commit':
+			return buildCommitStmt(ctx, stmt as AST.CommitStmt);
+		case 'rollback':
+			return buildRollbackStmt(ctx, stmt as AST.RollbackStmt);
+		case 'savepoint':
+			return buildSavepointStmt(ctx, stmt as AST.SavepointStmt);
+		case 'release':
+			return buildReleaseStmt(ctx, stmt as AST.ReleaseStmt);
+		case 'pragma':
+			return buildPragmaStmt(ctx, stmt as AST.PragmaStmt);
+		case 'analyze':
+			return buildAnalyzeStmt(ctx, stmt as AST.AnalyzeStmt);
+		case 'alterTable':
+			return buildAlterTableStmt(ctx, stmt as AST.AlterTableStmt);
+		case 'alterView':
+			return buildAlterViewStmt(ctx, stmt as AST.AlterViewStmt);
+		case 'alterMaterializedView':
+			return buildAlterMaterializedViewStmt(ctx, stmt as AST.AlterMaterializedViewStmt);
+		case 'alterIndex':
+			return buildAlterIndexStmt(ctx, stmt as AST.AlterIndexStmt);
+		case 'values':
+			return buildValuesStmt(ctx, stmt as AST.ValuesStmt);
+		case 'declareSchema':
+			return buildDeclareSchemaStmt(ctx, stmt);
+		case 'declareLens':
+			return buildDeclareLensStmt(ctx, stmt);
+		case 'diffSchema':
+			return buildDiffSchemaStmt(ctx, stmt);
+		case 'applySchema':
+			return buildApplySchemaStmt(ctx, stmt);
+		case 'explainSchema':
+			return buildExplainSchemaStmt(ctx, stmt);
+		default:
+			// Throw an exception for unsupported statement types
+			quereusError(
+				`Unsupported statement type: ${(stmt as AST.Statement).type}`,
+				StatusCode.UNSUPPORTED,
+				undefined,
+				stmt
+			);
+	}
 }
 
 /**
@@ -170,7 +170,7 @@ function attachUnreferencedDmlCtes(ctx: PlanningContext, stmt: AST.Statement, pl
 
 	const reachable = collectCteDescriptors(plan);
 	const unreferenced = dmlMembers.filter(cte => {
-		const descriptor = ctx.cteDescriptors?.get(cte);
+		const descriptor = ctx.cteDescriptors.get(cte);
 		return descriptor !== undefined && !reachable.has(descriptor);
 	});
 	if (unreferenced.length === 0) return plan;
@@ -183,10 +183,10 @@ function attachUnreferencedDmlCtes(ctx: PlanningContext, stmt: AST.Statement, pl
 	const rebuilt = buildWithClause(rebuildCtx, withClause);
 	const sinks = unreferenced.map(cte => {
 		const node = rebuilt.get(cte.name.toLowerCase());
-		if (!node) {
+		if (!node || !isRelationalNode(node)) {
 			quereusError(`CTE '${cte.name}' missing from rebuilt WITH clause`, StatusCode.INTERNAL, undefined, stmt);
 		}
-		return new SinkNode(ctx.scope, node as unknown as RelationalPlanNode, `unreferenced-cte ${cte.name}`);
+		return new SinkNode(ctx.scope, node, `unreferenced-cte ${cte.name}`);
 	});
 
 	return new SequenceNode(ctx.scope, sinks, plan);

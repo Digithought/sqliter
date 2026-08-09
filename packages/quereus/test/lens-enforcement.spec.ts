@@ -79,6 +79,7 @@ function makeCtx(db: Database): PlanningContext {
 		schemaDependencies: new BuildTimeDependencyTracker(),
 		schemaCache: new Map(),
 		cteReferenceCache: new Map(),
+		cteDescriptors: new Map(),
 		outputScopes: new Map(),
 	};
 }
@@ -3508,6 +3509,7 @@ describe('lens enforcement: parent-side FK is lens-routed-only (basis-direct DML
 				schemaDependencies: new BuildTimeDependencyTracker(),
 				schemaCache: new Map(),
 				cteReferenceCache: new Map(),
+				cteDescriptors: new Map(),
 				outputScopes: new Map(),
 			};
 			const ast = new Parser().parseAll('delete from x.parent where id = 1')[0] as AST.DeleteStmt;

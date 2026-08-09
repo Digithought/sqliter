@@ -146,7 +146,7 @@ select k from t10 order by k;
 -- The write is guaranteed, not reference-driven: `buildBlock` sinks an unreferenced
 -- data-modifying member ahead of the statement (a SequenceNode prelude), matching
 -- SQLite and PostgreSQL. Full coverage of the unreferenced arm lives in
--- test/logic/13.7-unreferenced-dml-cte.sqllogic.
+-- test/logic/13.11-unreferenced-dml-cte.sqllogic.
 
 create table t11 (k integer primary key);
 -- run

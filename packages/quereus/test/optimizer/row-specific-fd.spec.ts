@@ -28,6 +28,7 @@ function analyze(db: Database, sql: string): RowSpecificResult {
 		schemaDependencies: new BuildTimeDependencyTracker(),
 		schemaCache: new Map(),
 		cteReferenceCache: new Map(),
+		cteDescriptors: new Map(),
 		outputScopes: new Map(),
 	};
 

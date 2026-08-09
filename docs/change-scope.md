@@ -308,6 +308,17 @@ describes more.
   that the analyzer cannot decode into a `ScopeValue`, the watch falls
   back to `{kind:'full'}` rather than emitting `{kind:'rows', values: []}`
   (which would describe "watch zero rows" and under-specify the scope).
+- **A sunk unreferenced data-modifying CTE widens the watches.** When a
+  statement's `with` clause names an `insert`/`update`/`delete` member nothing
+  reads, the planner sequences that write ahead of the statement under a
+  `SequenceNode` (see [runtime caching](runtime-caching.md#shared-cte-materialization-multi-reference-ctes)).
+  The table walk descends the whole node, so the effect's tables join the
+  statement's `watches` even though the caller never sees their rows. Sound —
+  over-reporting only costs an extra wakeup. Only the DML-without-`RETURNING`
+  classification is scoped to the node's main child (the effects' `RETURNING`
+  clauses are internal to the CTE bodies, not the statement's own). NOTE: if
+  narrowing ever matters, scope the table walk to the main child and union the
+  effects' *write* targets only.
 - **MV source projection is whole-table.** Reading a materialized view projects
   to a `{kind:'full'}` watch per source table (see
   [Materialized-view reference projection](#materialized-view-reference-projection)).

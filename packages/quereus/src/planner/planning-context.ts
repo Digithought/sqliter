@@ -191,8 +191,13 @@ export interface PlanningContext {
    * data-modifying body writes once per statement execution by construction rather
    * than by nothing having re-planned it. Keyed on the AST member OBJECT, not its
    * name, so a nested statement's same-named member keeps its own identity.
+   *
+   * REQUIRED (unlike the optional `cteNodes` / `cteReferenceCache` scope plumbing):
+   * a context missing it would silently mint one descriptor per build, which both
+   * doubles a re-planned member's write and blinds `buildBlock`'s unreferenced-member
+   * scan. Every context factory must supply a fresh map per statement build.
    */
-  readonly cteDescriptors?: Map<AST.CommonTableExpr, TableDescriptor>;
+  readonly cteDescriptors: Map<AST.CommonTableExpr, TableDescriptor>;
 
   /** maps a RelationalPlanNode to its column scope during building */
   readonly outputScopes: Map<PlanNode, Scope>;

@@ -41,6 +41,7 @@ describe('View Mutation Substrate (single-source parity)', () => {
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
+			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
 	}
@@ -130,6 +131,7 @@ describe('View Mutation Substrate (cross-source cardinality)', () => {
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
+			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
 	}
@@ -169,6 +171,7 @@ describe('View Mutation Substrate (cross-source cardinality)', () => {
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
+			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
 		const ast = new Parser().parseAll(`update xs1n_cv set cv = pv where cid = 1`)[0] as AST.UpdateStmt;
@@ -199,6 +202,7 @@ describe('View Mutation Substrate (with defaults unknown column)', () => {
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
+			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
 		const ast = new Parser().parseAll(`insert into dft_v values (1)`)[0] as AST.InsertStmt;
@@ -239,6 +243,7 @@ describe('View Mutation Substrate (ordered multi-capture)', () => {
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
+			cteDescriptors: new Map(),
 			outputScopes: new Map(),
 		};
 	}

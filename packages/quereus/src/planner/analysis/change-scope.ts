@@ -20,6 +20,7 @@ import { isRelationalNode } from '../nodes/plan-node.js';
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode, ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { ScalarFunctionCallNode } from '../nodes/function.js';
+import { SequenceNode } from '../nodes/sequence-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { FunctionFlags } from '../../common/constants.js';
 import { extractBindings, type BindingMode } from './binding-extractor.js';
@@ -307,8 +308,8 @@ function isDmlWithoutReturning(plan: PlanNode): boolean {
 	// child only: the effects' RETURNING clauses are internal to the sunk CTE
 	// bodies, not the statement's own RETURNING, and the effects give the node
 	// 2+ children so the single-child descent below would stop short.
-	if (plan.nodeType === PlanNodeType.Sequence) {
-		return isDmlWithoutReturning((plan as unknown as { main: PlanNode }).main);
+	if (plan instanceof SequenceNode) {
+		return isDmlWithoutReturning(plan.main);
 	}
 
 	function hasReturning(node: PlanNode): boolean {

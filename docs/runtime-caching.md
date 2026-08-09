@@ -184,7 +184,7 @@ the statement under a `SequenceNode` (`runtime/emit/sequence.ts` drives each
 effect to completion in order, then delegates to the main statement).
 Effects-first is deliberate: a trailing effect could be skipped by a main
 statement abandoned early (`limit 0` must not skip the write). Consequence,
-accepted and pinned in `test/logic/13.7-unreferenced-dml-cte.sqllogic`: the
+accepted and pinned in `test/logic/13.11-unreferenced-dml-cte.sqllogic`: the
 outer statement **can observe** the write (`select count(*)` sees the inserted
 row). PostgreSQL's sub-statements never see one another's effects and would
 not; Quereus already lets the outer query observe a *referenced* member's
