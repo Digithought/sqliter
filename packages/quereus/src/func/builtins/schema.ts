@@ -14,7 +14,7 @@ import { generateMaintainedTableDDL } from "../../schema/ddl-generator.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
 import { ColumnSchema } from "../../schema/column.js";
 import { FunctionFlags } from "../../common/constants.js";
-import { resolveReferencedColumns, RowOpFlag, type TableSchema } from "../../schema/table.js";
+import { resolveReferencedColumns, RowOpFlag, type ForeignKeyConstraintSchema, type TableSchema } from "../../schema/table.js";
 import { jsonStringify } from "../../util/serialization.js";
 import { expressionToString } from "../../emit/ast-stringify.js";
 import { createLogger } from "../../common/logger.js";
@@ -286,6 +286,33 @@ export const tableInfoFunc = createIntegratedTableValuedFunction(
 	}
 );
 
+/**
+ * Reports the parent column name behind each position of a foreign key, for
+ * introspection. Positions that can't be resolved (unknown parent table, or a
+ * parent key narrower than the child column list) come back as `null` rather
+ * than raising — introspection must stay printable for malformed schemas.
+ */
+function resolveForeignKeyParentColumnNames(
+	db: Database,
+	childTable: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+): ReadonlyArray<string | null> {
+	// Declared names are reported verbatim, even if the parent (or the named
+	// column) can't be resolved — no parent lookup needed.
+	if (fk.referencedColumnNames && fk.referencedColumnNames.length > 0) {
+		return fk.referencedColumnNames;
+	}
+
+	// An absent referencedSchema means the child's own schema, matching how
+	// enforcement resolves the parent.
+	const parentTable = db._findTable(fk.referencedTable, fk.referencedSchema ?? childTable.schemaName);
+	if (!parentTable) return [];
+
+	// With no declared names, resolveReferencedColumns takes the primary-key
+	// path, which cannot throw.
+	return resolveReferencedColumns(fk, parentTable).map(idx => parentTable.columns[idx]?.name ?? null);
+}
+
 // Foreign key information function (table-valued function)
 export const foreignKeyInfoFunc = createIntegratedTableValuedFunction(
 	{
@@ -337,22 +364,7 @@ export const foreignKeyInfoFunc = createIntegratedTableValuedFunction(
 			const fkTagJson = tagsToJson(fk.tags);
 
 			// Resolve parent column names once per FK, not per seq.
-			let toColNames: ReadonlyArray<string | null>;
-			if (fk.referencedColumnNames && fk.referencedColumnNames.length > 0) {
-				// Declared names are reported verbatim, even if the parent (or the
-				// named column) can't be resolved — no parent lookup needed.
-				toColNames = fk.referencedColumnNames;
-			} else {
-				const parentTable = db._findTable(fk.referencedTable, fk.referencedSchema);
-				if (parentTable) {
-					// No declared names: resolveReferencedColumns takes the primary-key
-					// path here, which cannot throw.
-					const parentColIndices = resolveReferencedColumns(fk, parentTable);
-					toColNames = parentColIndices.map(idx => parentTable.columns[idx]?.name ?? null);
-				} else {
-					toColNames = [];
-				}
-			}
+			const toColNames = resolveForeignKeyParentColumnNames(db, table, fk);
 
 			for (let seq = 0; seq < fk.columns.length; seq++) {
 				const fromCol = table.columns[fk.columns[seq]];

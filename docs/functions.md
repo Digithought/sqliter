@@ -552,8 +552,8 @@ select name, json_extract(tags, '$.error_message') as msg
 | `table` | TEXT | Child table name |
 | `from` | TEXT | Child column name |
 | `referenced_table` | TEXT | Parent table name |
-| `referenced_schema` | TEXT? | Parent schema (null if same schema) |
-| `to` | TEXT? | Parent column name — the parent's primary-key column when the declaration named no parent columns, `NULL` when the parent table can't be resolved |
+| `referenced_schema` | TEXT? | Parent schema; resolved at CREATE TABLE time, so a same-schema FK reports that schema rather than null |
+| `to` | TEXT? | Parent column name — the parent's primary-key column when the declaration named no parent columns, `NULL` when the parent table can't be resolved or the parent key is narrower than the child column list |
 | `on_update` | TEXT | Update action (`cascade`, `restrict`, `setNull`, `setDefault`) |
 | `on_delete` | TEXT | Delete action (`cascade`, `restrict`, `setNull`, `setDefault`) |
 | `deferred` | INTEGER | 1 if enforcement is deferred to COMMIT |

@@ -166,6 +166,40 @@ SELECT "from", "to" FROM foreign_key_info('imp_child3');
 DROP TABLE imp_child3;
 
 -- ===================================================================
+-- Test 12: Implicit FK wider than the parent's primary key reports the
+-- unmatched positions as NULL rather than raising (enforcement skips
+-- this malformed shape entirely)
+-- ===================================================================
+
+CREATE TABLE imp_parent4 (pid INTEGER PRIMARY KEY);
+CREATE TABLE imp_child4 (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    y INTEGER,
+    FOREIGN KEY (x, y) REFERENCES imp_parent4
+);
+
+SELECT "from", "to", seq FROM foreign_key_info('imp_child4') ORDER BY seq;
+→ [{"from":"x","to":"pid","seq":0},{"from":"y","to":null,"seq":1}]
+
+DROP TABLE imp_child4;
+DROP TABLE imp_parent4;
+
+-- ===================================================================
+-- Test 13: Implicit FK to a parent that declares no primary key resolves
+-- against the synthesized key Quereus gives every table
+-- ===================================================================
+
+CREATE TABLE imp_parent5 (a INTEGER);
+CREATE TABLE imp_child5 (id INTEGER PRIMARY KEY, x INTEGER REFERENCES imp_parent5);
+
+SELECT "from", "to" FROM foreign_key_info('imp_child5');
+→ [{"from":"x","to":"a"}]
+
+DROP TABLE imp_child5;
+DROP TABLE imp_parent5;
+
+-- ===================================================================
 -- Cleanup
 -- ===================================================================
 
