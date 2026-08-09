@@ -210,8 +210,12 @@ runKVStoreConformance('MyCustomStore', () => ({
 }));
 ```
 
-See `test/kv-conformance.spec.ts` (in-memory), and the LevelDB / IndexedDB plugins'
-`test/conformance.spec.ts` for worked adapters.
+See `test/kv-conformance.spec.ts` (in-memory), and the `test/conformance.spec.ts` of each
+backend plugin — LevelDB, IndexedDB, React Native LevelDB, NativeScript SQLite — for worked
+adapters. The two mobile plugins run against an in-process stand-in for their native module
+(a mock LevelDB, and better-sqlite3 behind the NativeScript SQLite interface), which is what
+makes them testable off-device; the NativeScript one uses a temp file database so it also
+drives the persistence tier.
 
 **If your provider implements `beginAtomicBatch`, also run the provider suite.** The same
 entry point exports `runKVProviderConformance(name, makeProviderBackend)` — the battery for

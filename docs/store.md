@@ -198,7 +198,10 @@ adapter may supply a `readMeter` — a counter over whatever the store reads fro
 backend's batch size. Adapters without one still run tier 7's release-on-abandon cases.
 Backends that cannot stream at all (a SQL `select` returns a whole result set) should page
 with `pagedIterate` from `@quereus/store` rather than re-deriving the resume edge, which is
-easy to get wrong at batch boundaries.
+easy to get wrong at batch boundaries. Today LevelDB and React Native LevelDB stream a
+native cursor one entry per yield; IndexedDB pages 256 (its own resume loop, one
+transaction per batch) and NativeScript SQLite pages `ITERATE_BATCH_SIZE` (128) rows per
+`select` via `pagedIterate`.
 
 **KVStoreProvider** - Factory for platform-specific stores:
 ```typescript

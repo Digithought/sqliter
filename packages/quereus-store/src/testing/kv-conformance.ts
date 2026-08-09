@@ -5,8 +5,8 @@
  * contract (not against any single backend), invoked once per backend. Each backend
  * supplies only a small {@link KVBackend} adapter (how to open / reopen / tear down);
  * this file supplies every assertion. A behavior that drifts on one backend then
- * fails the suite instead of silently diverging across the three interchangeable
- * stores (in-memory, LevelDB, IndexedDB).
+ * fails the suite instead of silently diverging across the interchangeable stores
+ * (in-memory, LevelDB, IndexedDB, React Native LevelDB, NativeScript SQLite).
  *
  * Deps are deliberately minimal so this file can be compiled into `@quereus/store`'s
  * normal `src` build without dragging a test framework into the shipped package:

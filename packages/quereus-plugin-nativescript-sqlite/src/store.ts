@@ -5,7 +5,25 @@
  * Keys and values are stored as BLOBs for correct lexicographic ordering.
  */
 
-import type { KVStore, KVEntry, WriteBatch, IterateOptions } from '@quereus/store';
+import { pagedIterate, type KVStore, type KVEntry, type WriteBatch, type IterateOptions } from '@quereus/store';
+
+/**
+ * Entries per `select` when {@link SQLiteStore.iterate} pages a range.
+ *
+ * A SQL `select` hands back a whole result set, so this backend cannot stream: it reads
+ * one bounded batch, yields it, and resumes past the last key seen (see `pagedIterate`).
+ * The size is the peak-memory / round-trip tradeoff — small enough that a full table
+ * scan on a phone holds one page rather than the table, large enough that a big scan is
+ * not one query per handful of rows. Exported so the conformance adapter's read meter
+ * reports the real read-ahead instead of duplicating the number.
+ *
+ * NOTE: 128 is a judgement call, not a measurement — nothing has profiled this backend on
+ * a device (the tests run better-sqlite3 on a desktop). If a device profile ever shows
+ * scans dominated by query round-trips, raise it; if peak memory per scan is the problem,
+ * lower it. Conformance tier 3 seeds 306 entries, so any size it still crosses keeps the
+ * batch-seam cases meaningful.
+ */
+export const ITERATE_BATCH_SIZE = 128;
 
 /**
  * Type definition for @nativescript-community/sqlite database.
@@ -107,18 +125,41 @@ export class SQLiteStore implements KVStore {
   async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
     this.checkOpen();
 
-    const { sql, params } = this.buildIterateQuery(options);
-    const rows = this.db.select(sql, params) as Array<{ key: ArrayBuffer; value: ArrayBuffer }>;
-
-    for (const row of rows) {
-      yield {
-        key: toUint8Array(row.key),
-        value: toUint8Array(row.value),
-      };
-    }
+    // One `select` per batch, resuming from the last key seen — so peak memory is one
+    // batch however many entries the range holds, and a consumer that stops early costs
+    // at most one batch beyond what it consumed. `pagedIterate` owns the resume edge.
+    //
+    // Nothing to release on early termination, so no try/finally: each batch's `select`
+    // is self-contained and `SQLiteDatabase.select` returns a realized array — there is
+    // no cursor or statement handle left open between batches. If the driver interface
+    // ever grows a statement-handle read, this needs a `finally` that closes it.
+    //
+    // NOTE: `checkOpen` runs once, at the start, as it did when one `select` read the whole
+    // range — so a `close()` while a scan is suspended does not stop its remaining batches.
+    // Harmless today because `close()` deliberately leaves the (possibly shared) database
+    // open. If closing a store ever also closes its database, the next batch would throw a
+    // driver error mid-scan; re-check `closed` per batch then.
+    yield* pagedIterate(options, (bounds, want) => this.fetchBatch(bounds, want), ITERATE_BATCH_SIZE);
   }
 
-  private buildIterateQuery(options?: IterateOptions): { sql: string; params: unknown[] } {
+  /** Read up to `want` entries for one already-resume-adjusted batch of a range. */
+  private async fetchBatch(bounds: IterateOptions, want: number): Promise<KVEntry[]> {
+    const { sql, params } = this.buildIterateQuery(bounds, want);
+    const rows = this.db.select(sql, params) as Array<{ key: ArrayBuffer; value: ArrayBuffer }>;
+    return rows.map((row) => ({
+      key: toUint8Array(row.key),
+      value: toUint8Array(row.value),
+    }));
+  }
+
+  /**
+   * Build the `where` conditions + bound parameters for a key range.
+   *
+   * Every bound present is emitted, so a caller `gt` and a resume `gt` would both appear
+   * (`and` of two `key > ?` is correct, just redundant). `pagedIterate` merges the resume
+   * edge into a single bound, so in practice at most one lower and one upper appear.
+   */
+  private buildRangeFilter(options?: IterateOptions): { where: string; params: unknown[] } {
     const conditions: string[] = [];
     const params: unknown[] = [];
 
@@ -139,15 +180,19 @@ export class SQLiteStore implements KVStore {
       params.push(toArrayBuffer(options.lt));
     }
 
-    let sql = `select key, value from ${this.tableName}`;
-    if (conditions.length > 0) {
-      sql += ` where ${conditions.join(' and ')}`;
-    }
-    sql += ` order by key ${options?.reverse ? 'desc' : 'asc'}`;
-    if (options?.limit !== undefined) {
-      sql += ` limit ${options.limit}`;
-    }
+    return { where: conditions.length > 0 ? ` where ${conditions.join(' and ')}` : '', params };
+  }
 
+  /**
+   * Build one batch read over a key range, ordered by key and capped at `limit` rows.
+   *
+   * `limit` is the batch size, NOT the caller's `IterateOptions.limit` — `pagedIterate`
+   * spends the caller's limit across batches and passes the per-batch want here.
+   */
+  private buildIterateQuery(options: IterateOptions | undefined, limit: number): { sql: string; params: unknown[] } {
+    const { where, params } = this.buildRangeFilter(options);
+    const sql = `select key, value from ${this.tableName}${where}`
+      + ` order by key ${options?.reverse ? 'desc' : 'asc'} limit ${limit}`;
     return { sql, params };
   }
 
@@ -161,19 +206,22 @@ export class SQLiteStore implements KVStore {
     this.closed = true;
   }
 
+  /**
+   * Count the keys in a range with one `count(*)`.
+   *
+   * NOTE: `options.limit` is ignored — the count of a range is not affected by how many
+   * of it a caller would read. That matches IndexedDB (`IDBObjectStore.count(range)`)
+   * and this store's previous behavior; the LevelDB and in-memory backends count by
+   * iterating, so they cap at `limit` instead. The contract says nothing either way and
+   * the conformance battery never passes `limit` here. If a caller ever depends on the
+   * capped reading, settle it in `KVStore.approximateCount`'s contract and make the
+   * battery enforce it, rather than changing one backend.
+   */
   async approximateCount(options?: IterateOptions): Promise<number> {
     this.checkOpen();
 
-    if (!options?.gte && !options?.gt && !options?.lte && !options?.lt) {
-      // Fast path: count all rows
-      const rows = this.db.select(`select count(*) as cnt from ${this.tableName}`, []) as Array<{ cnt: number }>;
-      return rows[0]?.cnt ?? 0;
-    }
-
-    // With bounds, we need to count with conditions
-    const { sql, params } = this.buildIterateQuery(options);
-    const countSql = sql.replace(/^select key, value/, 'select count(*) as cnt').replace(/ order by.*$/, '');
-    const rows = this.db.select(countSql, params) as Array<{ cnt: number }>;
+    const { where, params } = this.buildRangeFilter(options);
+    const rows = this.db.select(`select count(*) as cnt from ${this.tableName}${where}`, params) as Array<{ cnt: number }>;
     return rows[0]?.cnt ?? 0;
   }
 
