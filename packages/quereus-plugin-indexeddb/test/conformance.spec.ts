@@ -19,6 +19,54 @@ import { IndexedDBManager } from '../src/manager.js';
 
 const STORE_NAME = 'conformance-store';
 
+/** Max entries `IndexedDBStore.iterate` pages at once — mirrors `BATCH` in src/store.ts. */
+const BATCH = 256;
+
+/**
+ * Entries read from IndexedDB across the whole process, counted below. Monotonic;
+ * `assertBoundedIterate` baselines it, so reads from other specs do not interfere.
+ */
+let idbEntriesRead = 0;
+
+/**
+ * Count entries IndexedDB hands back, by patching the object-store prototype once.
+ *
+ * `IndexedDBStore` is built from an `IndexedDBManager` singleton, so unlike the LevelDB
+ * adapter there is no handle to wrap — the read surface has to be instrumented globally.
+ * Both read shapes are covered: each delivered (non-null) cursor position is one entry,
+ * and `getAll`'s result length is however many that request returned. Counting is the
+ * only effect, so the patch is harmless to every other IndexedDB spec in this process.
+ */
+function installReadMeter(): void {
+	const proto = IDBObjectStore.prototype as IDBObjectStore & { __quereusMetered?: boolean };
+	if (proto.__quereusMetered) return;
+	proto.__quereusMetered = true;
+
+	const openCursor = proto.openCursor;
+	proto.openCursor = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['openCursor']>) {
+		const request = openCursor.apply(this, args);
+		request.addEventListener('success', () => {
+			if (request.result) idbEntriesRead++;
+		});
+		return request;
+	};
+
+	// Not used by `iterate` today; instrumented so a switch to a batched read stays metered
+	// instead of silently reporting zero.
+	const getAll = proto.getAll;
+	if (typeof getAll === 'function') {
+		proto.getAll = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['getAll']>) {
+			const request = getAll.apply(this, args);
+			request.addEventListener('success', () => {
+				idbEntriesRead += Array.isArray(request.result) ? request.result.length : 0;
+			});
+			return request;
+		};
+	}
+}
+
+installReadMeter();
+
 // Per-test unique database name. A counter (not Date.now/random) keeps names stable
 // and collision-free across the suite's many tests within one process.
 let seq = 0;
@@ -60,6 +108,12 @@ runKVStoreConformance('IndexedDBStore', () => {
 		async teardown(): Promise<void> {
 			await dropHandles();
 			await deleteDatabase(dbName);
+		},
+		readMeter: {
+			entriesRead: () => idbEntriesRead,
+			// One batch is BATCH pushed entries PLUS the one extra cursor position
+			// `readBatch` reads to discover the batch is full.
+			maxReadAhead: BATCH + 1,
 		},
 	};
 });

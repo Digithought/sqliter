@@ -16,6 +16,9 @@ export type {
   KVStoreProvider,
 } from './kv-store.js';
 
+// Bounded paging for backends without a streaming cursor
+export { pagedIterate, type FetchBatch } from './paged-iterate.js';
+
 // Key encoding
 export {
   encodeValue,

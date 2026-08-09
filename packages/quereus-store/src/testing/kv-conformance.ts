@@ -38,6 +38,29 @@ declare const beforeEach: (fn: () => void | Promise<void>) => void;
 declare const afterEach: (fn: () => void | Promise<void>) => void;
 
 /**
+ * Read instrumentation for the bounded-iteration tier.
+ *
+ * The battery only ever holds a {@link KVStore}; it cannot see what a backend reads
+ * underneath. A backend supplies this by wrapping whatever its store reads FROM — the
+ * level handle, the SQL driver, the IDB cursor — in its own adapter's closure.
+ */
+export interface ReadMeter {
+	/**
+	 * Entries read from backing storage so far — monotonically increasing over the
+	 * adapter's lifetime. Callers take a baseline and measure the delta, so this never
+	 * needs an explicit reset.
+	 */
+	entriesRead(): number;
+	/**
+	 * How many entries this backend may read ahead of one yield — its batch size.
+	 * `abstract-level` awaits `next()` once per entry, so 1; IndexedDB pages 256.
+	 * Count what the meter actually observes, including any extra probe read the
+	 * implementation takes to discover a batch is full.
+	 */
+	maxReadAhead: number;
+}
+
+/**
  * Per-backend lifecycle adapter. The suite drives its own per-test lifecycle and
  * calls {@link makeBackend} fresh for every test, so state never leaks between tests.
  */
@@ -52,6 +75,58 @@ export interface KVBackend {
 	reopen?(): Promise<KVStore>;
 	/** Release everything open()/reopen() created (close handles, rm temp dir / delete db). */
 	teardown(): Promise<void>;
+	/**
+	 * Optional read instrumentation for the bounded-iteration tier. Omit it and that
+	 * tier's METERED cases are not registered for this backend (its unmetered cases —
+	 * break and throw mid-iteration — still run). See {@link ReadMeter}.
+	 */
+	readMeter?: ReadMeter;
+}
+
+/**
+ * Assert that `store.iterate(options)` reads a BOUNDED amount from backing storage:
+ * consume `take` entries, then stop, and check the meter.
+ *
+ * The allowance is `take + maxReadAhead - 1`: a backend that reads one entry per yield
+ * reads exactly `take`, and one that pages reads at most `take` rounded up past a batch
+ * boundary. Crucially the allowance does NOT grow with the size of the range, so a
+ * backend that materializes the whole range fails however large the range is — which is
+ * the property the bounded-iteration tier exists to pin.
+ *
+ * Exported standalone so a spec can drive it against a deliberately-buffering store
+ * double and prove it rejects (see `bounded-iterate.spec.ts`).
+ *
+ * @param store - The store under test.
+ * @param meter - Read instrumentation for whatever `store` reads from.
+ * @param options - Iterate options. The range must hold at least `take` entries.
+ * @param take - Entries to consume before stopping. Default 1 (prefix-and-stop).
+ */
+export async function assertBoundedIterate(
+	store: KVStore,
+	meter: ReadMeter,
+	options?: IterateOptions,
+	take: number = 1,
+): Promise<void> {
+	assert.ok(take >= 1, `assertBoundedIterate: take must be >= 1, got ${take}`);
+	const baseline = meter.entriesRead();
+
+	let consumed = 0;
+	for await (const _entry of store.iterate(options)) {
+		if (++consumed >= take) break;
+	}
+	const read = meter.entriesRead() - baseline;
+
+	// Guards against a vacuous pass: a store that yields nothing reads nothing, and a
+	// meter wired to the wrong thing reports zero however the store behaves.
+	assert.strictEqual(consumed, take,
+		`expected to consume ${take} entries before stopping, got ${consumed} — the range is too small to measure`);
+	assert.ok(read >= 1,
+		'the read meter counted nothing — it is not wired to what this store reads from');
+
+	const allowed = take + meter.maxReadAhead - 1;
+	assert.ok(read <= allowed,
+		`bounded iteration: consuming ${take} entr${take === 1 ? 'y' : 'ies'} read ${read} from backing storage, ` +
+		`allowance is ${allowed} (take + maxReadAhead - 1, maxReadAhead=${meter.maxReadAhead})`);
 }
 
 // ============================================================================
@@ -74,6 +149,11 @@ function sortedByBytes(keys: Uint8Array[]): Uint8Array[] {
 async function seed1to5(store: KVStore): Promise<void> {
 	for (let i = 1; i <= 5; i++) await store.put(b(i), b(i * 10));
 }
+
+/** 2-byte big-endian key for the large-range tiers (0..65535) — byte order matches key order. */
+const enc = (n: number): Uint8Array => b((n >> 8) & 0xff, n & 0xff);
+/** Inverse of {@link enc}. */
+const dec = (k: Uint8Array): number => (k[0] << 8) | k[1];
 
 // ============================================================================
 // Tier 6 golden vector — cross-backend byte-ordering agreement
@@ -125,8 +205,11 @@ const key1 = (v: SqlValue): Uint8Array => encodeCompositeKey([v]);
  */
 export function runKVStoreConformance(name: string, makeBackend: () => KVBackend): void {
 	// Probe (no open()/teardown() — the factory only builds the adapter object) to
-	// learn whether this backend persists across a reopen.
-	const supportsReopen = typeof makeBackend().reopen === 'function';
+	// learn whether this backend persists across a reopen, and whether it can report
+	// what it reads from backing storage.
+	const probe = makeBackend();
+	const supportsReopen = typeof probe.reopen === 'function';
+	const supportsReadMeter = probe.readMeter !== undefined;
 
 	describe(name, () => {
 		let backend: KVBackend;
@@ -308,8 +391,6 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 		// ------------------------------------------------------------------
 		describe('tier 3: streaming iteration across a batch boundary', () => {
 			const COUNT = 306; // > 256 so iteration crosses at least one IndexedDB page boundary
-			const enc = (n: number): Uint8Array => b((n >> 8) & 0xff, n & 0xff); // 2-byte big-endian
-			const dec = (k: Uint8Array): number => (k[0] << 8) | k[1];
 
 			beforeEach(async () => {
 				const batch = store.batch();
@@ -504,6 +585,68 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 				assert.strictEqual(await store.approximateCount(), 1);
 				assertBytes(await store.get(key1(5n)), b(2));
 			});
+		});
+
+		// ------------------------------------------------------------------
+		// Tier 7 — bounded iteration (see KVStore.iterate's contract)
+		//
+		// The unmetered cases run everywhere: they pin that abandoning an iteration
+		// releases whatever the backend held. The metered cases need the adapter to
+		// supply a ReadMeter, because a KVStore handle cannot see its own reads.
+		// ------------------------------------------------------------------
+		describe('tier 7: bounded iteration', () => {
+			it('breaking out mid-iteration leaves the store usable and closeable', async () => {
+				await seed1to5(store);
+				let seen = 0;
+				for await (const _entry of store.iterate()) {
+					seen++;
+					break;
+				}
+				assert.strictEqual(seen, 1);
+				// An iterator/transaction left open by the abandoned scan would wedge these.
+				assertBytes(await store.get(b(3)), b(30));
+				assert.deepStrictEqual(await keysOf(store), [b(1), b(2), b(3), b(4), b(5)]);
+				await store.close(); // must resolve, not hang on an unreleased handle
+			});
+
+			it('an exception thrown from the loop body propagates and leaves the store usable', async () => {
+				await seed1to5(store);
+				await assert.rejects(async () => {
+					for await (const _entry of store.iterate()) {
+						throw new Error('consumer boom');
+					}
+				}, /consumer boom/);
+				assertBytes(await store.get(b(3)), b(30));
+				assert.deepStrictEqual(await keysOf(store), [b(1), b(2), b(3), b(4), b(5)]);
+			});
+
+			if (supportsReadMeter) {
+				describe('metered: reads stay bounded regardless of range size', () => {
+					let meter: ReadMeter;
+
+					beforeEach(async () => {
+						meter = backend.readMeter as ReadMeter;
+						// Big enough that a backend materializing the range blows the allowance
+						// by orders of magnitude, whatever its batch size is.
+						const count = Math.max(3 * meter.maxReadAhead, 512);
+						const batch = store.batch();
+						for (let i = 0; i < count; i++) batch.put(enc(i), b(i & 0xff));
+						await batch.write();
+					});
+
+					it('an unbounded iterate stopped after one entry reads at most one batch', async () => {
+						await assertBoundedIterate(store, meter);
+					});
+
+					it('the same holds in reverse', async () => {
+						await assertBoundedIterate(store, meter, { reverse: true });
+					});
+
+					it('a small limit costs the limit, not the range', async () => {
+						await assertBoundedIterate(store, meter, { limit: 5 }, 5);
+					});
+				});
+			}
 		});
 	});
 }

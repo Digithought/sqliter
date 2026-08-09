@@ -179,6 +179,25 @@ interface KVStore {
 }
 ```
 
+**Iteration is bounded, not snapshotted.** `iterate` is a streaming read, and the full
+contract lives on the interface in `kv-store.ts`. In short: peak memory must not grow with
+the size of the range (a fixed-size batch is fine — IndexedDB pages 256 entries,
+`abstract-level` yields one per `next()` — reading the whole range before the first yield
+is not); a consumer that stops after *k* entries must cost about *k* entries of work, not
+the size of the range; abandoning an iteration (`break` or a throw) must release the
+backend's cursor / transaction / statement; and because batching splits one logical read
+into several physical ones, `iterate` promises no point-in-time view. A backend whose
+dataset is wholly resident in memory (`InMemoryKVStore`) satisfies the memory bound
+trivially — the bound is on reads from *backing storage*.
+
+Tier 7 of the shared `runKVStoreConformance` battery enforces this. The battery only holds
+a `KVStore` handle and cannot see what a backend reads underneath, so a backend's test
+adapter may supply a `readMeter` — a counter over whatever the store reads from, plus that
+backend's batch size. Adapters without one still run tier 7's release-on-abandon cases.
+Backends that cannot stream at all (a SQL `select` returns a whole result set) should page
+with `pagedIterate` from `@quereus/store` rather than re-deriving the resume edge, which is
+easy to get wrong at batch boundaries.
+
 **KVStoreProvider** - Factory for platform-specific stores:
 ```typescript
 interface KVStoreProvider {

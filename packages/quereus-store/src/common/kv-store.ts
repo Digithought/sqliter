@@ -144,6 +144,41 @@ export interface KVStore {
 	/**
 	 * Iterate over key-value pairs in sorted order.
 	 * Keys are compared lexicographically by bytes.
+	 *
+	 * BOUNDED PEAK. Peak memory must be independent of how many entries the range
+	 * holds. An implementation may buffer a FIXED-SIZE batch — IndexedDB pages 256
+	 * entries at a time, `abstract-level` hands back one entry per `next()` — but it
+	 * must never read the whole range before yielding the first entry. Reason: a full
+	 * table scan calls `iterate(buildFullScanBounds())` with NO limit, and the mobile
+	 * backends that run this code have the least memory headroom of any of them.
+	 *
+	 * A backend whose dataset is already wholly resident in memory by construction
+	 * (`InMemoryKVStore`) satisfies this trivially — the requirement bounds reads from
+	 * BACKING STORAGE, and such a backend has none.
+	 *
+	 * EARLY TERMINATION IS CHEAP. A consumer that stops after k entries must cost
+	 * roughly k entries of work, not the size of the range: `limit: 10` over a million
+	 * rows must not read a million rows. Concretely, reads from backing storage must
+	 * stay within `k + (one batch)`, whatever the implementation's batch size is.
+	 *
+	 * EARLY TERMINATION RELEASES RESOURCES. When the consumer `break`s or throws, the
+	 * returned iterable's `return()`/`throw()` runs; the implementation must close its
+	 * cursor / transaction / statement there — a `try/finally` around the yield loop —
+	 * not only on natural exhaustion. After an abandoned iteration the store must still
+	 * serve `get`/`iterate` normally and `close()` must still resolve.
+	 *
+	 * NO SNAPSHOT PROMISE. Batching splits one logical read into several physical ones,
+	 * so a write committed mid-scan may become visible partway through a scan where a
+	 * single-shot read could not have shown it. `iterate` therefore does NOT promise a
+	 * point-in-time view and consumers must not assume one. This is honest about what
+	 * the stack already does: `StoreTable`'s scan merges the transaction coordinator's
+	 * pending ops over the committed range, and the store stack declares
+	 * `readCommittedSnapshot: false`. A real snapshot read is separate, future work.
+	 *
+	 * Backends without a streaming cursor (a SQL `select` hands back a whole result set)
+	 * should page with {@link pagedIterate} rather than re-deriving the resume edge.
+	 * `runKVStoreConformance`'s bounded-iteration tier enforces all of the above for any
+	 * backend whose adapter supplies a read meter.
 	 */
 	iterate(options?: IterateOptions): AsyncIterable<KVEntry>;
 

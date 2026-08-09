@@ -19,6 +19,21 @@ export interface CacheOptions {
 	enabled?: boolean;
 }
 
+/**
+ * Copy a value across the cache boundary.
+ *
+ * The cache must OWN every buffer it holds and must never hand one out: `get()`'s
+ * read-buffer contract says a caller mutating a returned value cannot corrupt stored
+ * data, and the same has to hold for a value the caller passed to `put()` and then
+ * scribbled on. Without this the cache aliases the caller's buffer in both directions
+ * and a later cache hit serves the scribbles. One allocation per cached read is the
+ * same cost every real backend already pays (LevelDB deserializes, IndexedDB
+ * structured-clones).
+ */
+function copyValue(value: Uint8Array | undefined): Uint8Array | undefined {
+	return value === undefined ? undefined : new Uint8Array(value);
+}
+
 /** Doubly-linked list node for LRU tracking. */
 interface LRUNode {
 	key: string;
@@ -67,12 +82,13 @@ export class CachedKVStore implements KVStore {
 		const node = this.map.get(hex);
 		if (node) {
 			this.moveToHead(node);
-			return node.value;
+			return copyValue(node.value);
 		}
 
-		// Cache miss — read from underlying
+		// Cache miss — read from underlying. The underlying hands back a fresh buffer per
+		// read, so the caller gets that one and the cache keeps its own copy.
 		const value = await this.store.get(key);
-		this.addEntry(hex, value, key.length + (value?.length ?? 0));
+		this.addEntry(hex, copyValue(value), key.length + (value?.length ?? 0));
 		return value;
 	}
 
@@ -88,7 +104,7 @@ export class CachedKVStore implements KVStore {
 
 		// Cache miss — delegate to underlying, then cache the result
 		const value = await this.store.get(key);
-		this.addEntry(hex, value, key.length + (value?.length ?? 0));
+		this.addEntry(hex, copyValue(value), key.length + (value?.length ?? 0));
 		return value !== undefined;
 	}
 
@@ -102,12 +118,12 @@ export class CachedKVStore implements KVStore {
 		const existing = this.map.get(hex);
 		if (existing) {
 			this.totalBytes -= existing.size;
-			existing.value = value;
+			existing.value = new Uint8Array(value); // cache owns its buffer — see copyValue
 			existing.size = key.length + value.length;
 			this.totalBytes += existing.size;
 			this.moveToHead(existing);
 		} else {
-			this.addEntry(hex, value, key.length + value.length);
+			this.addEntry(hex, new Uint8Array(value), key.length + value.length);
 		}
 	}
 

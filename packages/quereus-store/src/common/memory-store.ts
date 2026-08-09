@@ -73,7 +73,15 @@ export class InMemoryKVStore implements KVStore {
   async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
     this.checkOpen();
 
-    // Sort entries by hex key for correct ordering
+    // Sort entries by hex key for correct ordering.
+    // This materializes and sorts the WHOLE map on every call, so even a `limit: 1`
+    // scan is O(n log n) and allocates an n-entry array. That does not violate
+    // KVStore.iterate's bounded-peak requirement — the requirement bounds reads from
+    // backing storage and this store's dataset is already wholly resident — and it is
+    // fine while the memory store backs test-sized data and build-time seeds.
+    // NOTE: if the memory store ever backs large tables with frequent small-limit
+    // scans, keep a sorted key index (or a sorted-insert structure) instead of
+    // re-sorting per call.
     const entries = Array.from(this.data.entries())
       .sort((a, b) => compareHex(a[0], b[0]));
 

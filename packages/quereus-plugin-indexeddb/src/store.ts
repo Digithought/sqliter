@@ -207,6 +207,13 @@ export class IndexedDBStore implements KVStore {
     // NOTE: one tx per batch — a single cursor can't survive consumer awaits (IDB
     // auto-commits an idle readonly tx → TransactionInactiveError). Page in bounded
     // batches, each in its own short-lived tx, resuming from the last key seen.
+    // NOTE: `pagedIterate` in @quereus/store is the backend-neutral version of this
+    // resume-edge logic (forward tightens the lower bound, reverse the upper, both
+    // exclusive; resume key captured before yielding; empty range reads as exhausted).
+    // This loop is deliberately NOT refactored onto it — the per-batch transaction and
+    // the DataError-avoiding `isEmptyRange` short-circuit are IDB-specific, and
+    // `readBatch` is being rewritten separately. Keep the two in sync by hand until
+    // that settles.
     for (;;) {
       if (remaining !== undefined && remaining <= 0) return;
       const want = remaining === undefined ? BATCH : Math.min(BATCH, remaining);
