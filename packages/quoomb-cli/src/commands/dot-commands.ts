@@ -407,6 +407,10 @@ const getPluginsFilePath = (): string => {
  * the lowest-numbered `.corrupt-<n>` suffix not already taken, so repeated
  * corruption in one session quarantines each occurrence separately instead
  * of clobbering the previous one.
+ *
+ * NOTE: the search restarts at 1 on every call, so it stats once per copy
+ * already on disk. Corruption is rare and the user is expected to clean these
+ * up; if a workflow ever leaves them to pile up, remember the last `n`.
  */
 const quarantineCorruptPluginsFile = async (filePath: string): Promise<string> => {
   let n = 1;
@@ -423,7 +427,7 @@ const quarantineCorruptPluginsFile = async (filePath: string): Promise<string> =
 };
 
 const reportAndQuarantine = async (filePath: string, reason: string, error: unknown): Promise<void> => {
-  console.log(chalk.red(`Error ${reason} plugin file ${filePath}: ${error instanceof Error ? error.message : String(error)}`));
+  console.log(chalk.red(`Error ${reason} plugins file ${filePath}: ${error instanceof Error ? error.message : String(error)}`));
   try {
     const quarantined = await quarantineCorruptPluginsFile(filePath);
     console.log(chalk.yellow(`  Moved it aside to ${quarantined}; recover settings from there by hand if needed.`));
@@ -431,6 +435,19 @@ const reportAndQuarantine = async (filePath: string, reason: string, error: unkn
     console.log(chalk.red(`  Could not move it aside: ${renameError instanceof Error ? renameError.message : String(renameError)}`));
   }
 };
+
+/**
+ * Whether a parsed `plugins.json` is the record list every caller assumes.
+ * Well-formed JSON of the wrong shape — a hand-edit that wraps the array in an
+ * object, a stray `null`, an element that is not a record — parses fine and
+ * would otherwise be returned as `PluginRecord[]` on trust, then fail in
+ * whichever subcommand touched it first (`plugins.some is not a function`),
+ * leaving no way out but editing the file by hand. `url` is the one field every
+ * consumer reads, so it is the field worth checking.
+ */
+const isPluginRecordList = (parsed: unknown): parsed is PluginRecord[] =>
+  Array.isArray(parsed)
+  && parsed.every(record => typeof record === 'object' && record !== null && typeof (record as PluginRecord).url === 'string');
 
 const loadPlugins = async (): Promise<PluginRecord[]> => {
   const filePath = getPluginsFilePath();
@@ -445,12 +462,20 @@ const loadPlugins = async (): Promise<PluginRecord[]> => {
     return [];
   }
 
+  let parsed: unknown;
   try {
-    return JSON.parse(data);
+    parsed = JSON.parse(data);
   } catch (error) {
     await reportAndQuarantine(filePath, 'parsing', error);
     return [];
   }
+
+  if (!isPluginRecordList(parsed)) {
+    await reportAndQuarantine(filePath, 'parsing', new Error('expected a JSON array of plugin records, each with a url'));
+    return [];
+  }
+
+  return parsed;
 };
 
 // NOTE: every subcommand read-modify-writes the whole file, so two CLI sessions
@@ -459,16 +484,18 @@ const loadPlugins = async (): Promise<PluginRecord[]> => {
 // anything concurrent, this needs a merge on the record `id` or a lock file.
 const savePlugins = async (plugins: PluginRecord[]): Promise<void> => {
   const filePath = getPluginsFilePath();
-  const configDir = path.dirname(filePath);
 
-  // Ensure config directory exists
-  try {
-    await fs.mkdir(configDir, { recursive: true });
-  } catch (error) {
-    // Directory already exists
-  }
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
 
-  await fs.writeFile(filePath, JSON.stringify(plugins, null, 2));
+  // Write-then-rename, not writeFile: `writeFile` truncates before it writes,
+  // so a save interrupted midway (Ctrl-C, a crash, the machine going down)
+  // leaves exactly the half-written file `loadPlugins` has to quarantine. The
+  // rename is atomic, so the real path only ever holds a whole document. The
+  // temp name carries the pid because two CLI sessions saving at once would
+  // otherwise share one partial file.
+  const tempPath = `${filePath}.tmp-${process.pid}`;
+  await fs.writeFile(tempPath, JSON.stringify(plugins, null, 2));
+  await fs.rename(tempPath, filePath);
 };
 
 /**

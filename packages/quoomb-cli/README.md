@@ -80,6 +80,12 @@ In interactive mode, use dot-commands for meta operations:
 | `.plugin trust <name\|url> [hash]` | Record a new expected hash (fetches and hashes when omitted) |
 
 Installed plugins live in `~/.quoomb/plugins.json` and enabled ones load at startup.
+A plugin that fails to load at startup stays enabled and is retried next start —
+a remote plugin can fail because the host was offline, not because the plugin is
+broken — so use `.plugin disable <name>` to turn one off for good. If
+`plugins.json` itself cannot be read or parsed, it is renamed to
+`plugins.json.corrupt-<n>` rather than overwritten, so the settings in it can be
+recovered by hand.
 
 A plugin's name comes from the `package.json` next to its module. Many hosting
 layouts have no such file — a lone `.mjs` on a static host, a raw file URL, a

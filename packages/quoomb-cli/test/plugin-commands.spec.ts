@@ -10,6 +10,11 @@
  * had to leave alone, URL lookup, ambiguous derived names, a `package.json`
  * without a `name`, writing config values, and the autoload failure hint.
  *
+ * A second group covers what happens to a `plugins.json` the CLI cannot use:
+ * broken syntax, well-formed JSON of the wrong shape, and a second corruption in
+ * the same session all get moved aside rather than overwritten, and a completed
+ * save leaves nothing but the file itself behind.
+ *
  * The `pinning` block covers the opt-in refusal path: `routes` can re-serve a
  * different body for the same URL, which is the "the remote code changed"
  * fixture, and the replacement body sets a global when it evaluates, so a test
@@ -17,7 +22,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rm, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import os from 'node:os';
@@ -279,6 +284,57 @@ describe('.plugin subcommands', () => {
 		expect(fresh[0].url).toBe(MODULE_URL_NO_MANIFEST);
 		// The quarantined copy is untouched by the fresh write.
 		expect(await readFile(quarantinedPath, 'utf-8')).toBe(garbage);
+	});
+
+	it('quarantines a second corrupt plugins.json beside the first, not over it', async () => {
+		const pluginsPath = join(homeDir, '.quoomb', 'plugins.json');
+		await mkdir(join(homeDir, '.quoomb'), { recursive: true });
+
+		await writeFile(pluginsPath, 'first garbage {');
+		await handleDotCommand('.plugin list', db, readlineStub);
+
+		await writeFile(pluginsPath, 'second garbage {');
+		await handleDotCommand('.plugin list', db, readlineStub);
+
+		expect(await readFile(`${pluginsPath}.corrupt-1`, 'utf-8')).toBe('first garbage {');
+		expect(await readFile(`${pluginsPath}.corrupt-2`, 'utf-8')).toBe('second garbage {');
+	});
+
+	it('quarantines a plugins.json it cannot read at all', async () => {
+		// A directory where the file should be: unreadable for a reason other than
+		// "not there", which is the one read failure that must stay silent.
+		const pluginsPath = join(homeDir, '.quoomb', 'plugins.json');
+		await mkdir(pluginsPath, { recursive: true });
+
+		await handleDotCommand('.plugin list', db, readlineStub);
+
+		expect(output()).toContain(pluginsPath);
+		expect(output()).toContain('No plugins installed');
+		expect(await stat(`${pluginsPath}.corrupt-1`)).toBeTruthy();
+	});
+
+	it('quarantines well-formed JSON that is not a plugin record list', async () => {
+		const pluginsPath = join(homeDir, '.quoomb', 'plugins.json');
+		await mkdir(join(homeDir, '.quoomb'), { recursive: true });
+		// A hand-edit that wraps the array, rather than one that breaks the syntax:
+		// it parses, so only a shape check catches it.
+		const wrapped = JSON.stringify({ plugins: [{ id: 'x', url: MODULE_URL_NO_MANIFEST, enabled: true, config: {} }] });
+		await writeFile(pluginsPath, wrapped);
+
+		await handleDotCommand('.plugin list', db, readlineStub);
+
+		expect(output()).toContain(pluginsPath);
+		expect(output()).toContain('No plugins installed');
+		expect(await readFile(`${pluginsPath}.corrupt-1`, 'utf-8')).toBe(wrapped);
+	});
+
+	it('leaves no temp file behind after a save', async () => {
+		await handleDotCommand(`.plugin install ${MODULE_URL_NO_MANIFEST}`, db, readlineStub);
+
+		// Saves write a temp file and rename it over the real one, so an
+		// interrupted save cannot truncate `plugins.json`. Nothing should survive
+		// a completed save but the file itself.
+		expect(await readdir(join(homeDir, '.quoomb'))).toEqual(['plugins.json']);
 	});
 
 	describe('pinning', () => {
