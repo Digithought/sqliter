@@ -203,6 +203,17 @@ native cursor one entry per yield; IndexedDB pages 256 (its own resume loop, one
 transaction per batch) and NativeScript SQLite pages `ITERATE_BATCH_SIZE` (128) rows per
 `select` via `pagedIterate`.
 
+Within an IndexedDB page the direction matters. A **forward** page is one `getAllKeys` +
+`getAll` pair issued over the same range in the same transaction, then zipped
+positionally — two requests per 256 entries, so an N-row scan costs about
+`2 × (⌊N/256⌋ + 1)` requests. A **reverse** page still steps `openCursor` +
+`cursor.continue()`, which is one request and one event-loop turn per row, because
+`getAll` returns records in ascending order only and its `count` takes from the front of
+the range: a reverse page needs the *last* `want` entries, which can only be expressed by
+reading the whole range and reversing it in memory — exactly the unbounded read the
+contract above forbids. An engine without `getAll`/`getAllKeys` falls back to the same
+cursor walk.
+
 **KVStoreProvider** - Factory for platform-specific stores:
 ```typescript
 interface KVStoreProvider {

@@ -56,8 +56,12 @@ function installReadMeter(): void {
 		return request;
 	};
 
-	// Not used by `iterate` today; instrumented so a switch to a batched read stays metered
-	// instead of silently reporting zero.
+	// The forward `iterate` path reads a whole page per `getAll`, so its result length is
+	// that page's entry count.
+	//
+	// IMPORTANT: do NOT also meter `getAllKeys`. The batched read issues both over the
+	// same range, so every entry would be counted twice and tier 7's
+	// `take + maxReadAhead - 1` allowance would fail even though reads are bounded.
 	const getAll = proto.getAll;
 	if (typeof getAll === 'function') {
 		proto.getAll = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['getAll']>) {
@@ -116,11 +120,12 @@ runKVStoreConformance('IndexedDBStore', () => {
 		},
 		readMeter: {
 			entriesRead: () => idbEntriesRead,
-			// One batch is BATCH pushed entries PLUS the one extra cursor position
-			// `readBatch` reads to discover the batch is full.
-			// NOTE: measured against today's cursor loop. Rewriting `readBatch` (e.g. onto
-			// `getAll`) changes this number — re-measure by temporarily setting it to 1 and
-			// reading the failure message, rather than reasoning about it.
+			// Upper bound over BOTH read paths. Forward now reads exactly BATCH per page
+			// (one `getAll`, no probe read past the end); reverse still steps a cursor and
+			// reads one extra position to discover the page is full — so BATCH + 1 stays
+			// correct, now slightly loose for forward.
+			// NOTE: if `readBatch` changes again, re-measure by temporarily setting this to
+			// 1 and reading the failure message, rather than reasoning about it.
 			maxReadAhead: BATCH + 1,
 		},
 	};

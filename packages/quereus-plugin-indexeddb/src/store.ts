@@ -19,14 +19,21 @@ function toKey(key: Uint8Array): ArrayBuffer {
 }
 
 /**
- * Copy an IDB-returned ArrayBuffer into an independent `Uint8Array`. `new
+ * Copy an IDB-returned buffer into an independent `Uint8Array`. `new
  * Uint8Array(arrayBuffer)` only *views* the buffer — a consumer mutating a yielded
  * key/value would then reach back into whatever the buffer aliases (the stored record
  * under some IDB engines). Slicing hands out a private copy, satisfying the KVStore
  * read-buffer contract regardless of what the engine's cursor exposes.
+ *
+ * Both shapes arrive in practice and are handled with exactly ONE copy each: keys come
+ * back as `ArrayBuffer` (that is what `toKey` stores), while values were stored as
+ * `Uint8Array` and a structured clone hands them back as a view.
  */
-function toBytes(buf: ArrayBuffer): Uint8Array {
-  return new Uint8Array(buf).slice();
+function toBytes(data: ArrayBuffer | ArrayBufferView): Uint8Array {
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice();
+  }
+  return new Uint8Array(data).slice();
 }
 
 /** Max entries read per iterate batch — bounds memory to one batch, not the whole range. */
@@ -58,6 +65,115 @@ function isEmptyRange(lower: KeyBound | undefined, upper: KeyBound | undefined):
   if (!lower || !upper) return false;
   const c = indexedDB.cmp(lower.key, upper.key);
   return c > 0 || (c === 0 && (lower.open || upper.open));
+}
+
+/**
+ * True when this engine can serve a whole page from one request. `getAll`/`getAllKeys`
+ * are widely available but not universal (and some IDB fakes/shims omit them), so the
+ * cursor walk stays the fallback — it has to exist for reverse reads anyway.
+ */
+function supportsBatchedRead(store: IDBObjectStore): boolean {
+  return typeof store.getAll === 'function' && typeof store.getAllKeys === 'function';
+}
+
+/**
+ * Zip positionally-aligned `getAllKeys`/`getAll` results into entries.
+ *
+ * Issued over the same range in the same readonly transaction, both calls retrieve the
+ * records of that range in ascending key order up to `count`, so index `i` of one names
+ * index `i` of the other. That is spec-guaranteed, but a silent zip of mismatched arrays
+ * would hand back a row under someone else's key — i.e. corrupt data — so the invariant
+ * is asserted rather than assumed.
+ *
+ * @throws if the two arrays differ in length.
+ */
+export function pairEntries(keys: IDBValidKey[], values: unknown[]): KVEntry[] {
+  if (keys.length !== values.length) {
+    throw new Error(
+      `IndexedDB batched read is misaligned: ${keys.length} keys vs ${values.length} values ` +
+      '(getAllKeys and getAll must return positionally paired results over the same range)'
+    );
+  }
+  const entries: KVEntry[] = new Array(keys.length);
+  for (let i = 0; i < keys.length; i++) {
+    entries[i] = {
+      key: toBytes(keys[i] as ArrayBuffer),
+      value: toBytes(values[i] as ArrayBuffer | ArrayBufferView),
+    };
+  }
+  return entries;
+}
+
+/**
+ * Read an ascending page of up to `want` entries in ONE pair of requests.
+ *
+ * This is the whole point of the batched path: `openCursor` + `continue()` costs one
+ * IDB request and one event-loop turn PER ROW, so an N-row forward scan costs ~N+1
+ * requests; paging with `getAll`/`getAllKeys` costs 2 per batch instead.
+ *
+ * Both requests are issued synchronously here, in the caller's transaction — nothing
+ * awaits in between, so the transaction cannot auto-commit between them and the two
+ * results describe the same records.
+ *
+ * `want` must be >= 1: IndexedDB reads `count: 0` as "every record in the range".
+ */
+export function readBatchedForward(
+  store: IDBObjectStore,
+  range: IDBKeyRange | undefined,
+  want: number,
+): Promise<KVEntry[]> {
+  return new Promise((resolve, reject) => {
+    const keysRequest = store.getAllKeys(range, want);
+    const valuesRequest = store.getAll(range, want);
+    let keys: IDBValidKey[] | undefined;
+    let values: unknown[] | undefined;
+    // Resolve once BOTH have landed. IDB delivers results in request order, but reading
+    // `request.result` before its success event throws InvalidStateError, so track each
+    // arrival rather than relying on the ordering.
+    const settle = (): void => {
+      if (keys === undefined || values === undefined) return;
+      try {
+        resolve(pairEntries(keys, values));
+      } catch (error) {
+        reject(error);
+      }
+    };
+    keysRequest.onerror = () => reject(keysRequest.error);
+    valuesRequest.onerror = () => reject(valuesRequest.error);
+    keysRequest.onsuccess = () => { keys = keysRequest.result; settle(); };
+    valuesRequest.onsuccess = () => { values = valuesRequest.result; settle(); };
+  });
+}
+
+/**
+ * Read up to `want` entries by stepping a cursor — one request per row.
+ *
+ * Used for reverse iteration (which `getAll` cannot express, see `readBatch`) and as the
+ * fallback when the engine lacks `getAll`/`getAllKeys`.
+ */
+export function readViaCursor(
+  store: IDBObjectStore,
+  range: IDBKeyRange | undefined,
+  direction: IDBCursorDirection,
+  want: number,
+): Promise<KVEntry[]> {
+  return new Promise((resolve, reject) => {
+    const request = store.openCursor(range, direction);
+    const entries: KVEntry[] = [];
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (cursor && entries.length < want) {
+        entries.push({
+          key: toBytes(cursor.key as ArrayBuffer),
+          value: toBytes(cursor.value as ArrayBuffer | ArrayBufferView),
+        });
+        cursor.continue();
+      } else {
+        resolve(entries);
+      }
+    };
+  });
 }
 
 /**
@@ -133,7 +249,7 @@ export class IndexedDBStore implements KVStore {
       request.onerror = () => reject(request.error);
       request.onsuccess = () => {
         const result = request.result;
-        resolve(result === undefined ? undefined : new Uint8Array(result));
+        resolve(result === undefined ? undefined : toBytes(result));
       };
     });
   }
@@ -211,9 +327,8 @@ export class IndexedDBStore implements KVStore {
     // resume-edge logic (forward tightens the lower bound, reverse the upper, both
     // exclusive; resume key captured before yielding; empty range reads as exhausted).
     // This loop is deliberately NOT refactored onto it — the per-batch transaction and
-    // the DataError-avoiding `isEmptyRange` short-circuit are IDB-specific, and
-    // `readBatch` is being rewritten separately. Keep the two in sync by hand until
-    // that settles.
+    // the DataError-avoiding `isEmptyRange` short-circuit are IDB-specific. Keep the two
+    // in sync by hand.
     for (;;) {
       if (remaining !== undefined && remaining <= 0) return;
       const want = remaining === undefined ? BATCH : Math.min(BATCH, remaining);
@@ -240,6 +355,12 @@ export class IndexedDBStore implements KVStore {
   /**
    * Read up to `want` entries in a single short-lived readonly transaction. The tx
    * opens and commits within this call, so it never spans a consumer await.
+   *
+   * Forward reads take the batched path (two requests per page); reverse reads step a
+   * cursor, because `getAll` only returns ascending records and its `count` takes from
+   * the FRONT of the range — a reverse page needs the LAST `want` entries, which cannot
+   * be expressed without reading the whole range and reversing it in memory, breaking
+   * `iterate`'s bounded-memory contract.
    */
   private async readBatch(
     lower: KeyBound | undefined,
@@ -247,30 +368,26 @@ export class IndexedDBStore implements KVStore {
     direction: IDBCursorDirection,
     want: number,
   ): Promise<KVEntry[]> {
+    // IndexedDB reads `count: 0` as "all records", so a non-positive want must never
+    // reach getAll — it would silently turn a bounded page into a full-range read.
+    if (want <= 0) return [];
     // An exhausted resume edge can collapse the bounds to an empty range, which
     // IDBKeyRange.bound would reject with DataError — treat it as "no more entries".
     if (isEmptyRange(lower, upper)) return [];
     const db = await this.manager.ensureOpen();
     const range = makeKeyRange(lower, upper);
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.storeName, 'readonly');
-      const store = tx.objectStore(this.storeName);
-      const request = store.openCursor(range, direction);
-      const entries: KVEntry[] = [];
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => {
-        const cursor = request.result;
-        if (cursor && entries.length < want) {
-          entries.push({
-            key: toBytes(cursor.key as ArrayBuffer),
-            value: toBytes(cursor.value as ArrayBuffer),
-          });
-          cursor.continue();
-        } else {
-          resolve(entries);
-        }
-      };
-    });
+    const tx = db.transaction(this.storeName, 'readonly');
+    const store = tx.objectStore(this.storeName);
+    if (direction === 'next' && supportsBatchedRead(store)) {
+      return readBatchedForward(store, range, want);
+    }
+    // NOTE: reverse costs one IDB request per row. It could be batched in ~3 requests
+    // per page — openKeyCursor(range, 'prev') then advance(want - 1) to find the page's
+    // LOW edge (one request, not `want`), then getAll over the narrowed range, reversed
+    // in memory — but that adds a second resume-edge derivation to get wrong, and
+    // nothing measured says reverse scans are hot. Do it if a reverse scan shows up in a
+    // profile.
+    return readViaCursor(store, range, direction, want);
   }
 
   /** Derive lower/upper key bounds from iterate options (resume edges applied by the caller). */

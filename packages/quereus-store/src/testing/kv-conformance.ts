@@ -395,8 +395,11 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 			const COUNT = 306; // > 256 so iteration crosses at least one IndexedDB page boundary
 
 			beforeEach(async () => {
+				// Value = key. Values must be UNIQUE across the whole fixture (not `i & 0xff`,
+				// which repeats every 256 entries) so the pairing case below can catch a
+				// backend that misaligns keys against values by a whole page.
 				const batch = store.batch();
-				for (let i = 0; i < COUNT; i++) batch.put(enc(i), b(i & 0xff));
+				for (let i = 0; i < COUNT; i++) batch.put(enc(i), enc(i));
 				await batch.write();
 			});
 
@@ -410,6 +413,38 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 				}
 				assert.strictEqual(seen.length, COUNT);
 				for (let i = 0; i < COUNT; i++) assert.strictEqual(seen[i], i, `entry ${i}`);
+			});
+
+			it('pairs every value with its own key across the batch boundary', async () => {
+				// A backend that reads keys and values as two separate bulk requests (IndexedDB's
+				// getAllKeys + getAll) could zip them out of step and hand back real-looking rows
+				// filed under the wrong keys. Values are unique here, so any misalignment shows.
+				let seen = 0;
+				for await (const entry of store.iterate()) {
+					assert.strictEqual(dec(entry.value), dec(entry.key),
+						`entry ${dec(entry.key)} came back carrying value ${dec(entry.value)}`);
+					seen++;
+				}
+				assert.strictEqual(seen, COUNT);
+			});
+
+			it('mutating yielded keys/values mid-iteration does not perturb resumption', async () => {
+				// A paged backend derives the next page's resume edge from the last key of this
+				// page. If it captures that edge AFTER handing the entry to the consumer, a
+				// consumer scribbling on the key moves where the next page starts — skipping or
+				// repeating entries. Tier 2 pins the single-page version of the read-buffer
+				// contract; this is the version that crosses a page boundary.
+				const seen: number[] = [];
+				for await (const entry of store.iterate()) {
+					seen.push(dec(entry.key));
+					entry.key.fill(0xff);
+					entry.value.fill(0xff);
+				}
+				assert.strictEqual(seen.length, COUNT, 'every entry must be seen exactly once');
+				for (let i = 0; i < COUNT; i++) assert.strictEqual(seen[i], i, `entry ${i}`);
+				// ...and the scribbles must not have reached the store's own buffers.
+				assertBytes(await store.get(enc(0)), enc(0));
+				assertBytes(await store.get(enc(COUNT - 1)), enc(COUNT - 1));
 			});
 
 			it('honors reverse across the batch boundary', async () => {
