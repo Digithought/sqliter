@@ -184,7 +184,9 @@ contract lives on the interface in `kv-store.ts`. In short: peak memory must not
 the size of the range (a fixed-size batch is fine — IndexedDB pages 256 entries,
 `abstract-level` yields one per `next()` — reading the whole range before the first yield
 is not); a consumer that stops after *k* entries must cost about *k* entries of work, not
-the size of the range; abandoning an iteration (`break` or a throw) must release the
+the size of the range; draining the whole range must cost about one read per entry, so a
+paged backend resumes from the last key seen instead of re-reading a growing prefix
+(`limit`/`offset` paging is quadratic); abandoning an iteration (`break` or a throw) must release the
 backend's cursor / transaction / statement; and because batching splits one logical read
 into several physical ones, `iterate` promises no point-in-time view. A backend whose
 dataset is wholly resident in memory (`InMemoryKVStore`) satisfies the memory bound

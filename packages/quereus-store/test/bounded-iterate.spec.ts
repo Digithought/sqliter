@@ -3,15 +3,17 @@
  *
  * `runKVStoreConformance`'s tier 7 asserts that a backend reads a bounded amount from
  * backing storage no matter how big the range is. A guard nobody has watched fail is
- * not a guard — so this spec drives {@link assertBoundedIterate} directly against a
- * store double built to violate the contract (drain the whole range, then yield) and
- * checks that it REJECTS, plus a well-behaved double that must PASS.
+ * not a guard — so this spec drives {@link assertBoundedIterate} directly against store
+ * doubles built to violate the contract and checks that it REJECTS, plus a well-behaved
+ * double that must PASS. Two violations, because they fail different assertions:
+ * draining the whole range before yielding (caught by prefix-and-stop) and `limit`/
+ * `offset` re-paging (bounded first batch, quadratic total — caught only by a drain).
  */
 
 import assert from 'node:assert/strict';
 import { InMemoryKVStore } from '../src/common/memory-store.js';
 import { assertBoundedIterate, type ReadMeter } from '../src/testing/kv-conformance.js';
-import { BufferingKVStore, CountingKVStore } from './kv-store-doubles.js';
+import { BufferingKVStore, CountingKVStore, RescanningKVStore } from './kv-store-doubles.js';
 
 const COUNT = 512;
 
@@ -66,6 +68,31 @@ describe('assertBoundedIterate (bounded-iteration guard)', () => {
 		await assertBoundedIterate(counter, meterOf(counter));
 		await assertBoundedIterate(counter, meterOf(counter), { reverse: true });
 		await assertBoundedIterate(counter, meterOf(counter), { limit: 5 }, 5);
+		await assertBoundedIterate(counter, meterOf(counter), undefined, COUNT);
+	});
+
+	describe('offset-style re-paging (bounded first batch, quadratic total)', () => {
+		const BATCH = 64;
+		/** A meter over `counter` declaring the re-pager's batch as its read-ahead. */
+		const pagedMeter = (counter: CountingKVStore): ReadMeter =>
+			({ entriesRead: () => counter.entriesRead(), maxReadAhead: BATCH });
+
+		it('slips past every prefix-and-stop assertion', async () => {
+			// Documents WHY the full-drain case exists: stopping early cannot see this bug.
+			const counter = new CountingKVStore(await seeded());
+			const rescanning = new RescanningKVStore(counter, BATCH);
+			await assertBoundedIterate(rescanning, pagedMeter(counter));
+			await assertBoundedIterate(rescanning, pagedMeter(counter), { limit: 5 }, 5);
+		});
+
+		it('is caught by draining the whole range', async () => {
+			const counter = new CountingKVStore(await seeded());
+			const rescanning = new RescanningKVStore(counter, BATCH);
+			await assert.rejects(
+				() => assertBoundedIterate(rescanning, pagedMeter(counter), undefined, COUNT),
+				/bounded iteration: consuming 512 entries read 2304 from backing storage/,
+			);
+		});
 	});
 
 	it('rejects a dead meter rather than reporting a bounded read', async () => {

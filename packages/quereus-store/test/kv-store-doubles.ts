@@ -68,6 +68,40 @@ export class CountingKVStore extends DelegatingKVStore {
 }
 
 /**
+ * DELIBERATELY QUADRATIC: pages in fixed-size batches — so peak memory and the FIRST
+ * batch both look bounded — but resumes by re-reading from the start of the range and
+ * discarding a growing prefix, the shape of `limit`/`offset` paging over a SQL backend.
+ * Total reads are O(n²). The negative control for the full-drain case, which is the only
+ * one that can see this: every prefix-and-stop assertion passes against it.
+ */
+export class RescanningKVStore extends DelegatingKVStore {
+	constructor(inner: KVStore, private readonly batchSize = 64) {
+		super(inner);
+	}
+
+	async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
+		const { limit, ...bounds } = options ?? {};
+		for (let offset = 0; ; offset += this.batchSize) {
+			if (limit !== undefined && offset >= limit) return;
+			const want = limit === undefined ? this.batchSize : Math.min(this.batchSize, limit - offset);
+			const page = await this.readFromStart(bounds, offset, want);
+			for (const entry of page) yield entry;
+			if (page.length < want) return;
+		}
+	}
+
+	/** Read `offset + want` entries from the range start and keep only the last `want`. */
+	private async readFromStart(bounds: IterateOptions, offset: number, want: number): Promise<KVEntry[]> {
+		const page: KVEntry[] = [];
+		let seen = 0;
+		for await (const entry of this.inner.iterate({ ...bounds, limit: offset + want })) {
+			if (seen++ >= offset) page.push(entry);
+		}
+		return page;
+	}
+}
+
+/**
  * DELIBERATELY UNBOUNDED: reads the entire BOUNDS range into an array before yielding
  * the first entry, and only then applies `limit` — the exact shape of the two mobile
  * backends the bounded-iteration contract exists to rule out (one runs a `select` and

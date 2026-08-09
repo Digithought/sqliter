@@ -190,9 +190,9 @@ db.registerModule('store', module);
 **Validate a new backend against the shared conformance suite.** `@quereus/store/testing`
 exports `runKVStoreConformance(name, makeBackend)` — one parameterized battery of
 behavioral tests written against the `KVStore` contract (point ops, ordering, range
-iteration, streaming across page boundaries, batch semantics, optional persistence, and
-cross-backend encoded-key ordering). Wire a tiny lifecycle adapter and run it under Mocha
-so any drift from the contract fails a test:
+iteration, streaming across page boundaries, batch semantics, optional persistence,
+cross-backend encoded-key ordering, and bounded iteration). Wire a tiny lifecycle adapter
+and run it under Mocha so any drift from the contract fails a test:
 
 ```typescript
 import { runKVStoreConformance } from '@quereus/store/testing';
@@ -202,6 +202,11 @@ runKVStoreConformance('MyCustomStore', () => ({
   // Omit `reopen` for a non-persistent backend; supply it (reopen the SAME keyspace
   // without wiping) to also exercise the persistence tier.
   teardown: async () => { /* close handles, remove backing storage */ },
+  // Optional. The battery holds only a KVStore handle and cannot see what the backend
+  // reads underneath, so supply a counter over whatever the store reads FROM plus the
+  // backend's batch size, and the bounded-iteration tier also measures reads. Omit it
+  // and that tier still checks that abandoning an iteration releases resources.
+  readMeter: { entriesRead: () => myBackingReads, maxReadAhead: 1 },
 }));
 ```
 

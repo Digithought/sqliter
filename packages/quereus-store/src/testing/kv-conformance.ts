@@ -91,7 +91,9 @@ export interface KVBackend {
  * reads exactly `take`, and one that pages reads at most `take` rounded up past a batch
  * boundary. Crucially the allowance does NOT grow with the size of the range, so a
  * backend that materializes the whole range fails however large the range is — which is
- * the property the bounded-iteration tier exists to pin.
+ * the property the bounded-iteration tier exists to pin. Passing `take` = the whole range
+ * pins the other half of the contract, that total work is linear: a backend paging by
+ * `limit`/`offset` reads a bounded FIRST batch but O(n²) overall.
  *
  * Exported standalone so a spec can drive it against a deliberately-buffering store
  * double and prove it rejects (see `bounded-iterate.spec.ts`).
@@ -623,12 +625,14 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 			if (supportsReadMeter) {
 				describe('metered: reads stay bounded regardless of range size', () => {
 					let meter: ReadMeter;
+					let count: number;
 
 					beforeEach(async () => {
 						meter = backend.readMeter as ReadMeter;
 						// Big enough that a backend materializing the range blows the allowance
-						// by orders of magnitude, whatever its batch size is.
-						const count = Math.max(3 * meter.maxReadAhead, 512);
+						// by orders of magnitude, whatever its batch size is. Several batches
+						// deep, so the full-drain case below actually exercises resumption.
+						count = Math.max(3 * meter.maxReadAhead, 512);
 						const batch = store.batch();
 						for (let i = 0; i < count; i++) batch.put(enc(i), b(i & 0xff));
 						await batch.write();
@@ -643,7 +647,20 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 					});
 
 					it('a small limit costs the limit, not the range', async () => {
+						// NOTE: on a backend whose batch is much larger than 5 this case adds
+						// little over the unbounded one — the allowance is dominated by
+						// maxReadAhead, so it cannot tell "pushed the limit down" from "read a
+						// whole batch". It is exact for a one-entry-per-yield backend. If a
+						// backend ever needs its limit pushdown pinned specifically, assert on
+						// a limit LARGER than its batch instead of adding slack here.
 						await assertBoundedIterate(store, meter, { limit: 5 }, 5);
+					});
+
+					it('draining the whole range costs about one read per entry', async () => {
+						// Prefix cases above cannot see a backend that pages by re-reading from
+						// the start and discarding a growing prefix (`limit`/`offset` paging):
+						// its FIRST batch is bounded, and only the total goes quadratic.
+						await assertBoundedIterate(store, meter, undefined, count);
 					});
 				});
 			}

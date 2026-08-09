@@ -36,6 +36,11 @@ let idbEntriesRead = 0;
  * Both read shapes are covered: each delivered (non-null) cursor position is one entry,
  * and `getAll`'s result length is however many that request returned. Counting is the
  * only effect, so the patch is harmless to every other IndexedDB spec in this process.
+ *
+ * NOTE: accepted tradeoff — a process-global prototype patch, kept because there is no
+ * handle to wrap and the alternative is no IndexedDB metering at all. It relies on Mocha
+ * running specs serially (a parallel runner would fold another spec's reads into the
+ * measured delta) and on nothing else asserting IDB read counts; revisit if either changes.
  */
 function installReadMeter(): void {
 	const proto = IDBObjectStore.prototype as IDBObjectStore & { __quereusMetered?: boolean };
@@ -113,6 +118,9 @@ runKVStoreConformance('IndexedDBStore', () => {
 			entriesRead: () => idbEntriesRead,
 			// One batch is BATCH pushed entries PLUS the one extra cursor position
 			// `readBatch` reads to discover the batch is full.
+			// NOTE: measured against today's cursor loop. Rewriting `readBatch` (e.g. onto
+			// `getAll`) changes this number — re-measure by temporarily setting it to 1 and
+			// reading the failure message, rather than reasoning about it.
 			maxReadAhead: BATCH + 1,
 		},
 	};

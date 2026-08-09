@@ -17,7 +17,11 @@ export interface IterateOptions {
 	lt?: Uint8Array;
 	/** Iterate in reverse order. */
 	reverse?: boolean;
-	/** Maximum number of entries to return. */
+	/**
+	 * Maximum number of entries to return. Omitted means unbounded and `0` means no
+	 * entries; a NEGATIVE limit is not a valid input — backends disagree on it
+	 * (`abstract-level` reads `-1` as unbounded, the in-memory store as zero).
+	 */
 	limit?: number;
 }
 
@@ -116,6 +120,14 @@ export interface AtomicBatch {
 /**
  * Abstract key-value store interface.
  * Provides sorted key-value storage with range iteration support.
+ *
+ * BUFFER OWNERSHIP. Every buffer crossing this interface is independent of the store's
+ * internal state: `get` and `iterate` hand back buffers the caller may scribble on
+ * without corrupting stored data, and `put`/`delete` do not retain the caller's buffer,
+ * so mutating it afterwards changes nothing stored. A backend that deserializes per read
+ * (LevelDB, IndexedDB) gets this for free; one holding live buffers (the in-memory store,
+ * a cache wrapper) must copy at the boundary. Tiers 1 and 3 of
+ * `runKVStoreConformance` enforce it.
  */
 export interface KVStore {
 	/**
@@ -160,6 +172,11 @@ export interface KVStore {
 	 * roughly k entries of work, not the size of the range: `limit: 10` over a million
 	 * rows must not read a million rows. Concretely, reads from backing storage must
 	 * stay within `k + (one batch)`, whatever the implementation's batch size is.
+	 *
+	 * TOTAL WORK IS LINEAR. Draining the whole range must read about one entry per
+	 * entry. A paged backend resumes from the LAST KEY SEEN — never by re-reading from
+	 * the start and discarding a growing prefix. `limit`/`offset` paging is O(n²) reads
+	 * yet still looks fine to a peak-memory check, so this is stated separately.
 	 *
 	 * EARLY TERMINATION RELEASES RESOURCES. When the consumer `break`s or throws, the
 	 * returned iterable's `return()`/`throw()` runs; the implementation must close its
