@@ -60,6 +60,15 @@ Fully reversible and cheap either way. Choosing to wait costs nothing but the ex
 above. Choosing to build it and later regretting it means deleting a test script and a dev
 dependency. No stored data, public API, or user-visible behavior is affected.
 
+## New evidence since this was filed (does not change the question)
+
+A performance change to the plugin's range read (`perf-indexeddb-batch-range-reads`) replaces
+a per-row read with a whole-page read. Its effect is measurable in this repo only as a count
+of requests made to the browser database, not as elapsed time: the Node stand-in's timings
+say nothing about a real browser. So there is now a concrete piece of work that *would* have
+used a browser run if one existed — a scan of ~20,000 rows, timed before and after. That is
+one more small item on option 2's side of the ledger; it does not settle the call.
+
 ## Already settled — do not re-open here
 
 The **default** test harness for IndexedDB was decided by the parent plan
