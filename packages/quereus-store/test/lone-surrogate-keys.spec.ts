@@ -308,20 +308,23 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 		// catalog key, and the second table's DDL write silently clobbered the first's on
 		// reopen (`bug-store-catalog-key-lone-surrogate-identifier-collision`).
 		//
-		// Three different rejection timings live here, and the difference is the point:
-		//   - A bad TABLE / INDEX NAME is refused at `CREATE`, by the identifier guard in
+		// Two rejection MECHANISMS live here, and both fire at `CREATE`, before anything is
+		// registered:
+		//   - A bad TABLE / INDEX NAME is refused by the identifier guard in
 		//     `buildDataStoreName` / `buildIndexStoreName` — the PHYSICAL store name is
 		//     built before the statement's first side effect, so the create is a clean
 		//     no-op (`bug-store-physical-store-name-lone-surrogate-collision`).
 		//   - A bad identifier or literal that only shows up in the persisted DDL TEXT (a
-		//     column name, a `default` string) leaves the table's own name clean, so the
-		//     store-name guard never sees it. DDL text is persisted lazily, on first access
-		//     to the table's underlying store (see `StoreTable.initializeStore`), so those
-		//     surface on the first INSERT/SELECT rather than at `CREATE TABLE`.
-		//   - A VIEW / MATERIALIZED VIEW is refused at `CREATE` too, but by a different
-		//     mechanism: a synchronous pre-flight veto over every registered module
-		//     (`VirtualTableModule.assertCatalogObjectPersistable`), run before the object
-		//     is registered. See the dedicated block below for why nothing later can work.
+		//     column name, a `default` string, a `check` literal) leaves the table's own
+		//     name clean, so the store-name guard never sees it. `CREATE TABLE` asks every
+		//     registered module `assertCatalogObjectPersistable` before `module.create` —
+		//     the same synchronous pre-flight veto `CREATE VIEW` / `CREATE MATERIALIZED
+		//     VIEW` already ran — so this is refused at `CREATE` too, not on the first
+		//     INSERT/SELECT that happens to touch the table.
+		//   - The one place DDL text is STILL persisted lazily is a catalog written before
+		//     this guard existed (an imported / rehydrated entry) — that path never calls
+		//     `createTable`, so a legacy definition the guard would now refuse keeps
+		//     opening, and the lazy-persist timing note continues to apply to it alone.
 
 		it('rejects CREATE TABLE for a table named with a lone surrogate', async () => {
 			await rejects(db, `create table "${LONE_HIGH}" (k integer primary key) using store`);
@@ -351,17 +354,47 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 
 		it('rejects a column name carrying a lone surrogate, not just the table name', async () => {
 			// The DDL-text guard fires on the FULL persisted text, so a quoted column name
-			// is caught even though the table's own name is clean.
-			await db.exec(`create table t (id integer primary key, "${LONE_HIGH}" text) using store`);
-			await rejects(db, `insert into t (id, "${LONE_HIGH}") values (1, 'x')`);
+			// is caught even though the table's own name is clean — and it fires at CREATE,
+			// not on the first statement that happens to touch the table.
+			await rejects(db, `create table t (id integer primary key, "${LONE_HIGH}" text) using store`);
+			expect(db.schemaManager.getTable('main', 't'), 'the table must not be registered').to.be.undefined;
 		});
 
 		it('rejects a DEFAULT string literal carrying a lone surrogate', async () => {
 			// Neither the table name nor any identifier is at fault here — a column
 			// DEFAULT's string constant is reconstructed verbatim into the persisted DDL,
-			// so it must be guarded too (not just the catalog-key identifiers).
-			await db.exec(`create table t2 (id integer primary key, v text default '${LONE_HIGH}') using store`);
-			await rejects(db, `insert into t2 (id) values (1)`);
+			// so it must be guarded too (not just the catalog-key identifiers), and refused
+			// at CREATE.
+			await rejects(db, `create table t2 (id integer primary key, v text default '${LONE_HIGH}') using store`);
+			expect(db.schemaManager.getTable('main', 't2'), 'the table must not be registered').to.be.undefined;
+		});
+
+		it('rejects a CHECK constraint string literal carrying a lone surrogate', async () => {
+			// Proves the veto reads the whole generated text, not just column/table names:
+			// neither the table's name nor any identifier is at fault, only a string
+			// constant inside a `check` expression.
+			await rejects(db, `create table t4 (id integer primary key, v text check (v <> '${LONE_HIGH}')) using store`);
+			expect(db.schemaManager.getTable('main', 't4'), 'the table must not be registered').to.be.undefined;
+		});
+
+		it('still creates a memory-backed table with the same unencodable column name', async () => {
+			// The store must not veto a table it does not own: a `using memory` table in a
+			// database that also has store tables keeps creating and accepting writes freely.
+			await db.exec(`create table tm (id integer primary key, "${LONE_HIGH}" text)`);
+			await db.exec(`insert into tm (id, "${LONE_HIGH}") values (1, 'x')`);
+			expect(await column(db, `select "${LONE_HIGH}" from tm`, LONE_HIGH)).to.deep.equal(['x']);
+		});
+
+		it('refuses a table the store could never write, rather than silently losing it if untouched', async () => {
+			// The loss case this whole guard exists for: before the fix, a store table whose
+			// DDL text the store cannot encode created successfully and was simply absent
+			// after reopen if nobody ever read or wrote it — no error anywhere. Now the
+			// create itself is refused, so there is nothing to lose.
+			await rejects(db, `create table t5 (id integer primary key, v text default '${LONE_HIGH}') using store`);
+			expect(db.schemaManager.getTable('main', 't5'), 'the table must not be registered').to.be.undefined;
+
+			const mod = new StoreModule(provider);
+			expect(await mod.loadAllDDL(), 'nothing was silently written to the catalog').to.deep.equal([]);
 		});
 	});
 

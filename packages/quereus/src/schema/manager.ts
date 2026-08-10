@@ -2845,6 +2845,23 @@ export class SchemaManager {
 			`create table '${tableName}'`,
 		);
 
+		// Ask every registered module whether it could durably persist this table's
+		// definition — the same veto CREATE VIEW / CREATE MATERIALIZED VIEW / the RENAME
+		// dependent scan already run (see assertCatalogObjectPersistable). Without it, a
+		// definition the storage backend cannot encode (e.g. an unpaired surrogate in a
+		// column name or a DEFAULT/CHECK string literal) creates successfully and then is
+		// silently dropped by the swallowing SchemaChangeNotifier / persist-queue layers —
+		// worse, if the table is never touched again, nothing ever surfaces the loss.
+		// Before `module.create`, same as the duplicate-UNIQUE guard above, so a refusal
+		// leaves no storage behind. `baseTableSchema` (pre-`module.create`) rather than the
+		// post-create `completeTableSchema` is safe here: the veto reads only the rendered
+		// DDL text, and the one thing `finalizeCreatedTableSchema` still changes —
+		// collation reconciliation — can only substitute an engine-known collation name,
+		// never introduce an unencodable character. Not run on the import/rehydrate path
+		// (`buildTableSchemaFromAST` itself, `importTable`/`importDDL`) — a catalog written
+		// before this guard existed must still open.
+		assertCatalogObjectPersistable(this.db, 'table', baseTableSchema);
+
 		let tableInstance: VirtualTable;
 		try {
 			// `preferBacking` (set only by the maintained-table create path) routes

@@ -291,6 +291,20 @@ on conflict { rollback | abort | fail | ignore | replace }
 - `table_constraint`: Defines a table-level constraint
 - `using module_name`: Specifies a virtual table module
 
+**Persistability:**
+
+Before the table is created, every registered virtual-table module is asked whether it
+could durably persist the resulting definition, and the first refusal fails the statement —
+the table is never created, no storage is left behind. This guards against a definition
+whose generated DDL text a storage backend cannot write down (today's only instance: a
+JavaScript string carrying a lone/unpaired surrogate — in the table name, a quoted column
+name, a `default` string literal, or a `check` constant — has no valid UTF-8 encoding, which
+the persistent store's catalog requires). Without this check the create would otherwise
+succeed, and — since the catalog write it depends on is fire-and-forget — a table nobody
+ever reads or writes again would simply vanish on the next reopen with no error at all. See
+[store.md](store.md) and [view-persistence.md](view-persistence.md) for the underlying
+mechanism, which `CREATE VIEW` / `CREATE MATERIALIZED VIEW` / `ALTER TABLE … RENAME` also use.
+
 **Examples:**
 ```sql
 -- Basic table with constraints

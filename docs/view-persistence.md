@@ -129,16 +129,19 @@ the pre-flight fires ahead of the store's physical store-name guard, so the repo
 is `cannot store persisted schema text …` rather than `cannot store the identifier …`. Both
 name the unpaired surrogate and both leave a clean no-op.
 
-Two things stay uncovered. A `select *` materialized view's persisted backing **column
+One thing stays uncovered. A `select *` materialized view's persisted backing **column
 list** shifts under a column rename with no AST change, so the scan cannot see it (and no
 persist event fires) — harmless today because reopen re-derives an implicit MV's shape from
 its body; see the `NOTE:` on `restoreUnaffectedMaterializedViews` in
-`runtime/emit/materialized-view-helpers.ts`. And a `create table` is not gated here at
-all — it goes through `module.create`, whose failure already reaches the statement, but
-that hook does not check DDL-text encodability; for a store table an unencodable
-definition (a lone surrogate in a quoted column name, a `DEFAULT` string literal, a
-`CHECK` constant) is instead raised by the catalog backstop the first time the table's
-storage is opened, so a table nobody ever reads or writes never surfaces it.
+`runtime/emit/materialized-view-helpers.ts`.
+
+A plain `create table` IS gated the same way, at the same point in `SchemaManager.createTable`
+that this file's table-rename scan vets a dependent's prospective record: the pre-flight runs
+against the pre-`module.create` schema, before `module.create` is called, so a definition a
+store module could not durably persist (a lone surrogate in a quoted column name, a `DEFAULT`
+string literal, a `CHECK` constant) is refused at `CREATE TABLE` and never registered — rather
+than surfacing on the first INSERT/SELECT that happens to touch the table, or — worse, for a
+table nobody ever touches again — never surfacing at all.
 
 **Rehydrate phasing.** `rehydrateCatalog` first consumes the clean-shutdown marker
 (the reserved `\x00meta\x00clean_shutdown` entry `closeAll` writes after every batch

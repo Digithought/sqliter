@@ -1114,13 +1114,18 @@ text (`saveTableDDL` and the other catalog-write sites in `store-module-catalog.
 a lone surrogate in a quoted column name or a `default`/`check` string literal is caught even
 when the table's own name is clean.
 
-For a **view or materialized view** that guard alone is not enough, because the catalog write
-is fire-and-forget (see [view-persistence.md](view-persistence.md)): the
+For a **view, materialized view, or plain table** that guard alone is not enough, because the
+catalog write is fire-and-forget (see [view-persistence.md](view-persistence.md)): the
 throw lands inside the persist queue, where it can only be logged, so the definition would
-create "successfully" and be gone after reopen. `StoreModule.assertCatalogObjectPersistable`
-closes that on the CREATE VIEW / CREATE MATERIALIZED VIEW / `ALTER … SET TAGS` paths — it runs
-the same key + DDL derivation the write path runs, synchronously, before the object is
-registered, so a refusal is a clean no-op.
+create "successfully" and be gone after reopen — and for a table nobody ever reads or writes
+again, nothing would ever surface the loss at all. `StoreModule.assertCatalogObjectPersistable`
+closes that on the CREATE TABLE / CREATE VIEW / CREATE MATERIALIZED VIEW / `ALTER … SET TAGS`
+paths — it runs the same key + DDL derivation the write path runs, synchronously, before the
+object is registered, so a refusal is a clean no-op. `CREATE TABLE` calls it with the
+pre-`module.create` schema (`SchemaManager.createTable`, before the module is asked to
+instantiate the table) — the only thing a later reconcile can still change is a PK's collation,
+which can only substitute another engine-known collation name, never introduce an unencodable
+character, so the pre-create object is text-equivalent to the one that would actually persist.
 
 An ALTER that rewrites a view/MV **indirectly** rides the same hook, through the engine-side
 pre-flight dependent scan `assertRenameDependentsPersistable`: before
