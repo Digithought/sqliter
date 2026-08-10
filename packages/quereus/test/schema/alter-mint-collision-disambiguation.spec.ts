@@ -48,10 +48,11 @@ describe('ALTER-path constraint-name mints', () => {
 			expect(mintCheck(1, ['check_1', 'check_2', 'check_3'])).to.equal('check_4');
 		});
 
-		it('treats UNIQUE / FK names as taken too (one case-folded namespace)', () => {
-			// The taken-set spans all three constraint classes, so a UNIQUE called
-			// `CHECK_0` blocks the CHECK mint — DROP CONSTRAINT resolves across classes
-			// and a shared name is ambiguous forever.
+		it('bumps past a taken name whatever constraint class holds it', () => {
+			// The set is built by `collectTableConstraintNames`, which spans CHECK /
+			// UNIQUE / FK — so `check_0` blocks the mint whether a CHECK, a UNIQUE or an
+			// FK answers to it. The builder sees only names, so one fixture covers all
+			// three; DROP CONSTRAINT resolving across classes is what makes that right.
 			expect(mintCheck(0, ['check_0'])).to.equal('check_1');
 		});
 
