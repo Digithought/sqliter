@@ -410,8 +410,13 @@ analyze main.products;
 
 -- Analyze every table in a specific schema
 analyze main.*;
+
+-- The temp schema qualifier works too
+analyze temp.scratch;
 ```
 
 `ANALYZE` returns one row per table with columns `table` (text) and `rows` (integer).
+
+A named target (`analyze <table>` or `analyze <schema>.<table>`) is resolved the same way any other statement resolves a table name: it must exist, and must be a real table, or the statement raises an error rather than silently returning nothing. `ANALYZE <schema>.*` likewise errors if `<schema>` does not exist. Bare `ANALYZE` and `ANALYZE <schema>.*` on a schema with no tables still return zero rows — that is not an error, there is simply nothing to analyze.
 
 If a virtual table module implements `getStatistics()`, those statistics are used directly. Otherwise, a full table scan collects per-column statistics with reservoir-sampled histograms. Collected statistics are cached on the table schema and used by the optimizer's `CatalogStatsProvider` for improved cost estimates.

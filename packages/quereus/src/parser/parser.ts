@@ -3566,14 +3566,16 @@ export class Parser {
 			return { type: 'analyze', loc: _createLoc(startToken, this.previous()) };
 		}
 
-		// Parse optional schema.table, schema.* (all tables in schema), or just table
-		const name1 = this.consumeIdentifier([], "Expected table name after ANALYZE.");
+		// Parse optional schema.table, schema.* (all tables in schema), or just table.
+		// Mirrors tableIdentifier()'s allowed keyword set so `analyze temp.tt` parses.
+		const contextualKeywords = [...CONTEXTUAL_KEYWORDS, 'temp', 'temporary'];
+		const name1 = this.consumeIdentifier(contextualKeywords, "Expected table name after ANALYZE.");
 		if (this.match(TokenType.DOT)) {
 			// ANALYZE schema.* → analyze every table in the schema (schema-only shape)
 			if (this.match(TokenType.ASTERISK)) {
 				return { type: 'analyze', schemaName: name1, loc: _createLoc(startToken, this.previous()) };
 			}
-			const name2 = this.consumeIdentifier([], "Expected table name after schema qualifier.");
+			const name2 = this.consumeIdentifier(contextualKeywords, "Expected table name after schema qualifier.");
 			return { type: 'analyze', schemaName: name1, tableName: name2, loc: _createLoc(startToken, this.previous()) };
 		}
 		return { type: 'analyze', tableName: name1, loc: _createLoc(startToken, this.previous()) };

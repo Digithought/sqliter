@@ -108,6 +108,13 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 						// Create a new schema with statistics (honor immutability of frozen schemas)
 						const updatedTableSchema: TableSchema = { ...tableSchema, statistics: stats };
 						schema.addTable(updatedTableSchema);
+						// NOTE: since the target now resolves through resolveTableSchema at build
+						// time, ANALYZE records a 'table' dependency on itself — this notifyChange
+						// nulls out this statement's own cached plan/scheduler mid-run (see the
+						// schema-change listener in core/statement.ts). Harmless: the running
+						// instance already closed over the plan it needs, same as ALTER TABLE,
+						// which has exercised this self-invalidation path in production for a
+						// while (it resolves its target the same way and then mutates it).
 						schemaManager.getChangeNotifier().notifyChange({
 							type: 'table_modified',
 							schemaName: tableSchema.schemaName,

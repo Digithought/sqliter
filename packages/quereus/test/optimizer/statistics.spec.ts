@@ -489,13 +489,14 @@ describe('ANALYZE command', () => {
 		expect(results).to.have.lengthOf(25);
 	});
 
-	it('ANALYZE on nonexistent table produces no output', async () => {
+	it('ANALYZE on a nonexistent table throws instead of silently producing no output', async () => {
 		await setupTable();
-		const rows: any[] = [];
-		for await (const r of db.eval('ANALYZE nonexistent_table')) {
-			rows.push(r);
+		try {
+			for await (const _ of db.eval('ANALYZE nonexistent_table')) { /* consume */ }
+			expect.fail('ANALYZE on a missing table must throw');
+		} catch (e) {
+			expect((e as Error).message).to.match(/not found/i);
 		}
-		expect(rows).to.have.lengthOf(0);
 	});
 
 	it('ANALYZE main.* analyzes every table in the schema', async () => {

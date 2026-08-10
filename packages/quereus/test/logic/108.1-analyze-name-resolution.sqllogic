@@ -1,0 +1,76 @@
+-- 108.1-analyze-name-resolution.sqllogic
+-- ANALYZE on a name that resolves to nothing used to succeed quietly with zero
+-- rows (through both the emitter's table lookup and the schema-only lookup).
+-- It now resolves the target at build time, the same way every other
+-- name-taking statement does, and errors when the name does not exist.
+-- Covers every row of the before/after table in
+-- tickets/implement/3-analyze-unresolvable-name-is-silent.md.
+
+create table t (id integer primary key, v integer);
+insert into t values (1, 10), (2, 20);
+
+create view v_t as select * from t;
+
+create materialized view mv_t as select * from t;
+
+create table temp.tt (id integer primary key, v integer);
+insert into temp.tt values (1, 100);
+
+-- ===================================
+-- Real table: unchanged
+-- ===================================
+
+analyze t;
+→ [{"table":"t","rows":2}]
+
+-- ===================================
+-- Unresolvable names now error instead of silently returning nothing
+-- ===================================
+
+analyze nosuchtable;
+-- error: not found
+
+analyze main.nosuchtable;
+-- error: not found
+
+analyze nosuchschema.t;
+-- error: not found
+
+analyze nosuchschema.*;
+-- error: schema not found
+
+-- ===================================
+-- A plain view has no stored rows to collect statistics from
+-- ===================================
+
+analyze v_t;
+-- error: view
+
+-- ===================================
+-- `temp.` now parses as a schema qualifier (was a parse error before this fix)
+-- ===================================
+
+analyze temp.tt;
+→ [{"table":"tt","rows":1}]
+
+analyze temp.*;
+→ [{"table":"tt","rows":1}]
+
+-- ===================================
+-- Materialized view: real backing table, unchanged
+-- ===================================
+
+analyze mv_t;
+→ [{"table":"mv_t","rows":2}]
+
+-- ===================================
+-- Bare ANALYZE: unchanged, still allowed to report nothing for an empty schema
+-- ===================================
+
+analyze;
+-- run
+
+drop materialized view mv_t;
+drop view v_t;
+drop table t;
+drop table temp.tt;
