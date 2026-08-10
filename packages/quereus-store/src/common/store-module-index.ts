@@ -55,6 +55,19 @@ function implicitUniqueIndexNameMap(schema: TableSchema): Map<string, string> {
 	return map;
 }
 
+/**
+ * How far a `createIndex` / `dropIndex` got before it threw — the two steps that
+ * outlive the statement unless something puts them back, and so the two the unwind
+ * ({@link StoreModuleIndex.unwindFailedIndexDdl}) is driven by. Mutated in place by the
+ * arm's try block so the catch can read it.
+ */
+interface IndexDdlProgress {
+	/** the connected table's cached schema was replaced with the post-DDL one */
+	schemaSwapped: boolean;
+	/** the catalog bundle was rewritten to the post-DDL one */
+	catalogWritten: boolean;
+}
+
 export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	/**
 	 * Creates an index on a store-backed table.
@@ -130,11 +143,22 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		// discards are harmless: both readers resolve each entry to its live row and
 		// drop it when the row is gone or no longer matches (see `scanIndex`).
 		//
-		// The store is FRESHLY created above, so any build failure — a UNIQUE violation,
-		// an IO error, or a mid-stream flush failure now that the build is chunked — must
-		// tear the whole store down. Nothing else reclaims it: SchemaManager.createIndex
-		// wraps the error but does no teardown, so without this a rejected build leaks a
-		// partial/empty index-store directory. Mirrors dropIndex's teardown.
+		// EVERYTHING from here on is unwound on failure, so a refused CREATE INDEX is a
+		// clean no-op. The index store is FRESHLY created above and the engine unwinds
+		// nothing — SchemaManager.createIndex registers the index in its own schema only
+		// AFTER this returns, and wraps a throw without any cleanup — so each step this
+		// arm completes outlives the statement unless it puts it back:
+		//   - the populated index store (a build failure — UNIQUE violation, IO error, a
+		//     mid-stream flush failure now that the build is chunked — leaves a partial
+		//     one; a later step's failure leaves a complete one);
+		//   - the connected table's cached schema, which would keep maintaining an index
+		//     the engine never registered, and which `assertStoreNameFree` reads — so a
+		//     retry of the very same statement would be refused by the ghost it left;
+		//   - the catalog entry, which would list an index the engine does not have;
+		//   - the `_uc_*` store the reconcile below tears down when the new index realizes
+		//     a plain UNIQUE, which nothing would then maintain or rebuild.
+		// `progress` records how far the statement got; the catch runs the exact inverse.
+		const progress: IndexDdlProgress = { schemaSwapped: false, catalogWritten: false };
 		try {
 			await buildIndexEntries(
 				table.iterateEffectiveEntries(buildFullScanBounds()),
@@ -146,63 +170,73 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 				rows !== undefined,
 				table.getConfig().maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES,
 			);
-		} catch (buildError) {
-			// Best-effort teardown: guard it against its own throw so a teardown failure
-			// never masks the original build error the caller must see.
-			try {
-				await this.tearDownIndexStore(schemaName, tableName, table, indexSchema.name);
-			} catch (teardownError) {
-				console.warn(
-					`[StoreModule] failed to tear down index store '${indexSchema.name}' on `
-						+ `table '${schemaName}.${tableName}' after a failed CREATE INDEX: ${String(teardownError)}`,
-				);
-			}
-			throw buildError;
+
+			// Refresh the connected table's cached schema so subsequent DML
+			// maintains the new index (the engine's schema registry is updated
+			// separately by SchemaManager.createIndex, but the StoreTable instance
+			// holds its own reference captured at connect time). The shared
+			// appendIndexToTableSchema also synthesizes the UNIQUE → derived
+			// uniqueConstraint entry so checkUniqueConstraints enforces it; the
+			// `derivedFromIndex` tag lets StoreModule.dropIndex filter it back out
+			// symmetrically (mirrors SchemaManager.dropIndex / MemoryTableManager.dropIndex).
+			const updatedSchema = appendIndexToTableSchema(tableSchema, indexSchema);
+			table.updateSchema(updatedSchema);
+			progress.schemaSwapped = true;
+
+			// Authoritative catalog write: persist the table's bundle now (including the
+			// new index), so the index survives close → reopen even when the table has
+			// no rows yet and was never lazily persisted. `markDdlSaved` suppresses the
+			// later lazy table-only write on first store access (StoreTable.ddlSaved), so
+			// this is the only catalog write the createIndex produces. SchemaManager fires
+			// a follow-up `table_modified` whose listener regenerates the SAME bundle and
+			// skips (identical) — see persistCatalogIfChanged.
+			await this.saveTableDDL(updatedSchema);
+			table.markDdlSaved();
+			progress.catalogWritten = true;
+
+			// The new index may now REALIZE a plain UNIQUE over the same columns, which
+			// `updateSchema` above has already dropped from the materialized enforcement
+			// schema (`findReusableIndexForUnique`). Nothing maintains that `_uc_*` any more,
+			// so tear its physical store down — leaving it would rot into a store whose
+			// entries no longer track the rows, which a later `DROP INDEX` would hand back to
+			// the constraint as if current. A no-op for every index that covers no UNIQUE —
+			// which is what keeps the DDL-commit the teardown forces (see
+			// {@link reconcileImplicitUniqueIndexStores}) off every ordinary CREATE INDEX.
+			await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, tableSchema);
+
+			// Emit schema change event. `updatedSchema` (not the pre-create
+			// `tableSchema`) is the owner the canonical CREATE INDEX renders against —
+			// it is only read for the table's qualified name and column names, but
+			// passing the post-create schema keeps the rendering consistent with what a
+			// receiving peer regenerates when it compares definitions.
+			this.eventEmitter?.emitSchemaChange({
+				type: 'create',
+				objectType: 'index',
+				schemaName,
+				objectName: indexSchema.name,
+				ddl: generateIndexDDL(indexSchema, updatedSchema),
+			});
+		} catch (createError) {
+			const subject = `index '${indexSchema.name}' on table '${schemaName}.${tableName}'`;
+			// Newest step first. Re-running the reconcile with the FAILED schema as its
+			// `oldSchema` (and the restored schema live) is the symmetric inverse of the
+			// forward call: it rebuilds the `_uc_*` store the forward pass tore down.
+			// Nothing is doomed on that pass, so it takes only the build arm — no forced
+			// DDL commit.
+			await this.unwindFailedIndexDdl(
+				table,
+				subject,
+				tableSchema,
+				progress,
+				failedSchema =>
+					this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, failedSchema),
+			);
+			// The index store this arm created: torn down on every failure, including the
+			// build's own. Mirrors dropIndex's teardown.
+			await this.guardedUnwindStep('tear down the index store', subject, () =>
+				this.tearDownIndexStore(schemaName, tableName, table, indexSchema.name));
+			throw createError;
 		}
-
-		// Refresh the connected table's cached schema so subsequent DML
-		// maintains the new index (the engine's schema registry is updated
-		// separately by SchemaManager.createIndex, but the StoreTable instance
-		// holds its own reference captured at connect time). The shared
-		// appendIndexToTableSchema also synthesizes the UNIQUE → derived
-		// uniqueConstraint entry so checkUniqueConstraints enforces it; the
-		// `derivedFromIndex` tag lets StoreModule.dropIndex filter it back out
-		// symmetrically (mirrors SchemaManager.dropIndex / MemoryTableManager.dropIndex).
-		const updatedSchema = appendIndexToTableSchema(tableSchema, indexSchema);
-		table.updateSchema(updatedSchema);
-
-		// Authoritative catalog write: persist the table's bundle now (including the
-		// new index), so the index survives close → reopen even when the table has
-		// no rows yet and was never lazily persisted. `markDdlSaved` suppresses the
-		// later lazy table-only write on first store access (StoreTable.ddlSaved), so
-		// this is the only catalog write the createIndex produces. SchemaManager fires
-		// a follow-up `table_modified` whose listener regenerates the SAME bundle and
-		// skips (identical) — see persistCatalogIfChanged.
-		await this.saveTableDDL(updatedSchema);
-		table.markDdlSaved();
-
-		// The new index may now REALIZE a plain UNIQUE over the same columns, which
-		// `updateSchema` above has already dropped from the materialized enforcement
-		// schema (`findReusableIndexForUnique`). Nothing maintains that `_uc_*` any more,
-		// so tear its physical store down — leaving it would rot into a store whose
-		// entries no longer track the rows, which a later `DROP INDEX` would hand back to
-		// the constraint as if current. A no-op for every index that covers no UNIQUE —
-		// which is what keeps the DDL-commit the teardown forces (see
-		// {@link reconcileImplicitUniqueIndexStores}) off every ordinary CREATE INDEX.
-		await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, tableSchema);
-
-		// Emit schema change event. `updatedSchema` (not the pre-create
-		// `tableSchema`) is the owner the canonical CREATE INDEX renders against —
-		// it is only read for the table's qualified name and column names, but
-		// passing the post-create schema keeps the rendering consistent with what a
-		// receiving peer regenerates when it compares definitions.
-		this.eventEmitter?.emitSchemaChange({
-			type: 'create',
-			objectType: 'index',
-			schemaName,
-			objectName: indexSchema.name,
-			ddl: generateIndexDDL(indexSchema, updatedSchema),
-		});
 	}
 
 	/**
@@ -212,6 +246,8 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 * tableSchema (removing the index entry and any UNIQUE constraint
 	 * synthesized from it, tagged with `derivedFromIndex`), releases the
 	 * cached index-store handle, and tears down the underlying index store.
+	 * A failure before the physical teardown unwinds the same way createIndex's does
+	 * ({@link unwindFailedIndexDdl}), so a refused DROP INDEX is a no-op.
 	 */
 	async dropIndex(
 		db: Database,
@@ -250,28 +286,57 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 				? Object.freeze(remainingUniqueConstraints)
 				: undefined,
 		};
-		// Update the cached schema BEFORE tearing down the store so that a
-		// failure of the physical drop doesn't leave the schema enforcing an
-		// index whose backing store has already been mutated.
-		table.updateSchema(updatedSchema);
+		// Everything up to (not including) the physical teardown is unwound on failure,
+		// so a refused DROP INDEX leaves the index intact AND still maintained. The engine
+		// unwinds neither step: SchemaManager.dropIndex removes the index from its own
+		// registry only AFTER this returns, so a throw here would otherwise leave the
+		// engine planning seeks against an index this table has already stopped
+		// maintaining — stale entries answering queries — and a catalog that no longer
+		// lists it.
+		//
+		// The window ENDS at the teardown: once `tearDownIndexStore` starts, the physical
+		// store may be partly or wholly gone, and restoring the schema would point the
+		// table at an index that no longer exists.
+		const progress: IndexDdlProgress = { schemaSwapped: false, catalogWritten: false };
+		try {
+			// Update the cached schema BEFORE tearing down the store so that a
+			// failure of the physical drop doesn't leave the schema enforcing an
+			// index whose backing store has already been mutated.
+			table.updateSchema(updatedSchema);
+			progress.schemaSwapped = true;
 
-		// Rewrite the catalog bundle without the dropped index, before the physical
-		// teardown — so on reopen the index does not resurrect even if the store
-		// delete below fails. `markDdlSaved` keeps the lazy first-access save from
-		// re-writing the same bundle. SchemaManager's follow-up `table_modified`
-		// regenerates an identical bundle and skips.
-		await this.saveTableDDL(updatedSchema);
-		table.markDdlSaved();
+			// Rewrite the catalog bundle without the dropped index, before the physical
+			// teardown — so on reopen the index does not resurrect even if the store
+			// delete below fails. `markDdlSaved` keeps the lazy first-access save from
+			// re-writing the same bundle. SchemaManager's follow-up `table_modified`
+			// regenerates an identical bundle and skips.
+			await this.saveTableDDL(updatedSchema);
+			table.markDdlSaved();
+			progress.catalogWritten = true;
+
+			// Flush before the teardown below: the coordinator keys buffered ops on the
+			// KVStore HANDLE, so ops this transaction queued against the index being
+			// dropped would be replayed into a closed store at commit and throw. Same
+			// posture (and same reason) as the teardown in
+			// `reconcileImplicitUniqueIndexStores` and the row-rewriting ALTER arms — see
+			// `StoreModuleBase.ddlCommitPendingOps`.
+			await this.ddlCommitPendingOps();
+		} catch (dropError) {
+			// No `_uc_*` rebuild callback here (unlike createIndex): this arm's reconcile
+			// runs after the teardown, outside the unwind window, so nothing physical has
+			// changed yet — restoring the cached schema de-materializes the `_uc_*` entry
+			// the swap above re-materialized, and no store was ever built for it.
+			await this.unwindFailedIndexDdl(
+				table,
+				`index '${indexName}' on table '${schemaName}.${tableName}'`,
+				tableSchema,
+				progress,
+			);
+			throw dropError;
+		}
 
 		// Drop the cached handle on the table side and tear down the underlying KVStore
 		// ({@link tearDownIndexStore}).
-		//
-		// Flush first: the coordinator keys buffered ops on the KVStore HANDLE, so ops
-		// this transaction queued against the index being dropped would be replayed into
-		// a closed store at commit and throw. Same posture (and same reason) as the
-		// teardown in `reconcileImplicitUniqueIndexStores` and the row-rewriting ALTER
-		// arms — see `StoreModuleBase.ddlCommitPendingOps`.
-		await this.ddlCommitPendingOps();
 		await this.tearDownIndexStore(schemaName, tableName, table, indexName);
 
 		// The dropped index may have been the structure REALIZING a plain UNIQUE over its
@@ -289,6 +354,68 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 			objectName: indexName,
 			ddl: generateDropIndexDDL(schemaName, indexName),
 		});
+	}
+
+	/**
+	 * The unwind {@link createIndex} and {@link dropIndex} share: put the connected
+	 * table's cached schema back to `originalSchema`, and re-write the catalog bundle for
+	 * it — each step only when the failed statement had actually done it, per `progress`.
+	 *
+	 * `StoreTableBase.updateSchema` validates before adopting and recomputes the
+	 * materialized `_uc_*` copy, so restoring the pre-DDL schema is safe and
+	 * re-materializes any implicit unique index the statement had retired.
+	 *
+	 * `rebuildImplicitUniqueStores` (when given) runs with the restored schema already
+	 * live, receiving the schema the failed statement had installed — the caller's hook
+	 * for rebuilding a `_uc_*` store its forward pass tore down.
+	 *
+	 * The catalog is only rewritten when the statement got PAST its `saveTableDDL`. If
+	 * that call is what threw, the catalog is already correct, and writing here would
+	 * create an entry for a table that may deliberately have none yet (the lazy
+	 * first-access persist). `markDdlSaved` staying set after a re-save of the old bundle
+	 * is correct — the flag means "the catalog matches this table", which it then does.
+	 *
+	 * Every step is guarded ({@link guardedUnwindStep}) so a cleanup failure cannot mask
+	 * the original error the caller must see.
+	 */
+	private async unwindFailedIndexDdl(
+		table: StoreTable,
+		subject: string,
+		originalSchema: TableSchema,
+		progress: IndexDdlProgress,
+		rebuildImplicitUniqueStores?: (failedSchema: TableSchema) => Promise<void>,
+	): Promise<void> {
+		if (progress.schemaSwapped) {
+			await this.guardedUnwindStep('restore the cached schema', subject, async () => {
+				const failedSchema = table.getSchema();
+				table.updateSchema(originalSchema);
+				await rebuildImplicitUniqueStores?.(failedSchema);
+			});
+		}
+		if (progress.catalogWritten) {
+			await this.guardedUnwindStep('restore the catalog entry', subject, () =>
+				this.saveTableDDL(originalSchema));
+		}
+	}
+
+	/**
+	 * Run one unwind step, swallowing its own failure after logging it: a cleanup that
+	 * throws must never replace the error the caller has to see. `subject` names the index
+	 * and table; `what` completes "failed to …".
+	 */
+	private async guardedUnwindStep(
+		what: string,
+		subject: string,
+		step: () => Promise<void>,
+	): Promise<void> {
+		try {
+			await step();
+		} catch (cleanupError) {
+			console.warn(
+				`[StoreModule] failed to ${what} for ${subject} while unwinding a failed `
+					+ `index DDL statement: ${String(cleanupError)}`,
+			);
+		}
 	}
 
 	/**
@@ -456,13 +583,14 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 * `deleteIndexStore` when the provider implements it (it closes the handle before
 	 * removing the directory), else just `closeIndexStore`.
 	 *
-	 * The single teardown every path shares — `dropIndex`, `createIndex`'s build-failure
-	 * rollback, the implicit `_uc_*` reconcile above, and `DROP COLUMN`'s removed-index
-	 * pass (`StoreModuleAlter.alterDropColumn`). Each caller owns the surrounding
-	 * posture, which deliberately differs: the DDL-commit flush (buffered ops are keyed
-	 * on the KVStore HANDLE, so a doomed store's queued ops would replay into a closed
-	 * store at commit — see `StoreModuleBase.ddlCommitPendingOps`) and, for
-	 * `createIndex`, swallowing a teardown throw so it cannot mask the build error.
+	 * The single teardown every path shares — `dropIndex`, `createIndex`'s failure unwind,
+	 * the implicit `_uc_*` reconcile above, and `DROP COLUMN`'s removed-index pass
+	 * (`StoreModuleAlter.alterDropColumn`). Each caller owns the surrounding posture,
+	 * which deliberately differs: the DDL-commit flush (buffered ops are keyed on the
+	 * KVStore HANDLE, so a doomed store's queued ops would replay into a closed store at
+	 * commit — see `StoreModuleBase.ddlCommitPendingOps`) and, for `createIndex`,
+	 * swallowing a teardown throw so it cannot mask the original error
+	 * ({@link guardedUnwindStep}).
 	 */
 	protected async tearDownIndexStore(
 		schemaName: string,

@@ -18,9 +18,17 @@
  *  - `rebuildSecondaryIndexes` (driven here by ALTER COLUMN SET COLLATE on a
  *    text PK) rebuilds an index identical to the pre-ALTER one, across chunks.
  *
+ * It also owns the wider class the teardown belongs to — **a refused store DDL
+ * statement leaves no residue** — covering the steps AFTER the build (the cached-schema
+ * swap, the catalog write) for both `CREATE INDEX` and `DROP INDEX`. Those cases assert
+ * against a whole-provider snapshot ({@link snapshotResidue}) rather than naming the one
+ * store they expect to be missing, so a step appended to either arm later is covered for
+ * free.
+ *
  * Uses a persistent in-memory provider (no-op close) mirroring
- * index-persistence.spec.ts, with two extra hooks: per-index-store batch tracing
- * (flush + put counters) and an optional injected write failure on the Nth flush.
+ * index-persistence.spec.ts, with three extra hooks: per-index-store batch tracing
+ * (flush + put counters), an optional injected write failure on the Nth flush, and a
+ * togglable catalog-store write failure.
  */
 
 import { describe, it, afterEach } from 'mocha';
@@ -83,23 +91,41 @@ function traceBatches(
 	};
 }
 
+/** Mutable switch the catalog-store `put` wrapper reads; see {@link createProvider}. */
+interface CatalogFailure {
+	/** while true, every catalog `put` throws — an injected durable-write IO error. */
+	fail: boolean;
+}
+
 /**
  * Persistent in-memory provider: logical close is a no-op (data survives
  * closeAll, like real disk). `deleteIndexStore` removes the index store from the
  * map so a failed-build teardown is observable. Optionally traces index-store
  * batches and injects a write failure on a named index store.
+ *
+ * `catalogFailure.fail` is a live switch a test flips around ONE statement to make the
+ * catalog write (`saveTableDDL`) throw — the general IO-error case for the DDL steps that
+ * follow the index build.
+ *
+ * `failDeleteIndex` names an index whose `deleteIndexStore` removes the store and THEN
+ * reports failure — a provider that got the delete done but could not confirm it. That
+ * reaches the LAST step of `createIndex` (the `_uc_*` reconcile), which is the only way
+ * to exercise the unwind's implicit-unique-store rebuild.
  */
 function createProvider(opts?: {
 	failIndex?: string;
 	failOnFlush?: number;
+	failDeleteIndex?: string;
 }): KVStoreProvider & {
 	stores: Map<string, InMemoryKVStore>;
 	indexTraces: Map<string, BatchTrace>;
+	catalogFailure: CatalogFailure;
 	_hardClose: () => void;
 } {
 	const stores = new Map<string, InMemoryKVStore>();
 	const indexTraces = new Map<string, BatchTrace>();
 	const wrapped = new WeakSet<KVStore>();
+	const catalogFailure: CatalogFailure = { fail: false };
 	const getOrCreate = (key: string): InMemoryKVStore => {
 		let s = stores.get(key);
 		if (!s) {
@@ -115,6 +141,7 @@ function createProvider(opts?: {
 	return {
 		stores,
 		indexTraces,
+		catalogFailure,
 		async getStore(s: string, t: string) { return getOrCreate(dataKey(s, t)); },
 		async getIndexStore(s: string, t: string, i: string) {
 			const store = getOrCreate(idxKey(s, t, i));
@@ -127,11 +154,23 @@ function createProvider(opts?: {
 			return store;
 		},
 		async getStatsStore(s: string, t: string) { return getOrCreate(statsKey(s, t)); },
-		async getCatalogStore() { return getOrCreate('__catalog__'); },
+		async getCatalogStore() {
+			const store = getOrCreate('__catalog__');
+			if (!wrapped.has(store)) {
+				wrapped.add(store);
+				const origPut = store.put.bind(store);
+				store.put = async (k: Uint8Array, v: Uint8Array, o?: Parameters<KVStore['put']>[2]) => {
+					if (catalogFailure.fail) throw new Error('injected catalog-store write failure');
+					await origPut(k, v, o);
+				};
+			}
+			return store;
+		},
 		async closeStore() { /* durable */ },
 		async closeIndexStore() { /* durable */ },
 		async deleteIndexStore(s: string, t: string, i: string) {
 			stores.delete(idxKey(s, t, i));
+			if (opts?.failDeleteIndex === i) throw new Error('injected index-store delete failure');
 		},
 		async deleteTableStores(s: string, t: string, indexNames: readonly string[]) {
 			stores.delete(dataKey(s, t));
@@ -167,6 +206,49 @@ describe('StoreModule bounded-memory index builds', () => {
 	function indexStoreSize(p: ReturnType<typeof createProvider>, table: string, indexName: string, schema = 'main'): number {
 		const s = p.stores.get(`${schema}.${table}_idx_${indexName}`);
 		return s ? s.size : 0;
+	}
+
+	/**
+	 * Everything a refused DDL statement could leave behind, as one comparable string:
+	 * every provider store that exists and how many entries it holds, plus the catalog's
+	 * decoded DDL text. Entry counts (not values) for the data/index stores keep this
+	 * cheap while still catching a half-built index; the catalog is compared as TEXT
+	 * because the residue there is a changed bundle, not a changed entry count.
+	 */
+	async function snapshotResidue(p: ReturnType<typeof createProvider>): Promise<string> {
+		const lines = [...p.stores.keys()].sort().map(k => `${k}=${p.stores.get(k)!.size}`);
+		const catalog = p.stores.get('__catalog__');
+		if (catalog) {
+			const decoder = new TextDecoder();
+			const ddl: string[] = [];
+			for await (const entry of catalog.iterate()) ddl.push(decoder.decode(entry.value));
+			lines.push('catalog:', ...ddl.sort());
+		}
+		return lines.join('\n');
+	}
+
+	/**
+	 * The shared assertion for the whole "a refused store DDL statement leaves no residue"
+	 * class: snapshot every store, run a statement expected to throw, assert the snapshot
+	 * is byte-identical. Returns the error so a caller can assert more about it.
+	 */
+	async function expectRefusedDdlLeavesNoResidue(
+		p: ReturnType<typeof createProvider>,
+		db: Database,
+		sql: string,
+		errorMatch: RegExp,
+	): Promise<unknown> {
+		const before = await snapshotResidue(p);
+		let caught: unknown;
+		try {
+			await db.exec(sql);
+		} catch (e) {
+			caught = e;
+		}
+		expect(caught, `statement was refused: ${sql}`).to.not.equal(undefined);
+		expect(String(caught)).to.match(errorMatch);
+		expect(await snapshotResidue(p), `refused DDL left residue: ${sql}`).to.equal(before);
+		return caught;
 	}
 
 	it('chunked build indexes every row and matches single-batch results, flushing in multiple chunks', async () => {
@@ -286,6 +368,141 @@ describe('StoreModule bounded-memory index builds', () => {
 		expect((await rows(db, `select count(*) as n from t`))[0].n, 'rows unchanged').to.equal(2);
 		await db.exec(`insert into t values (3, 'b@x.com')`);
 		expect((await rows(db, `select count(*) as n from t`))[0].n, 'insert still works').to.equal(3);
+	});
+
+	it('a CREATE INDEX refused by the catalog write leaves no residue, and the retry succeeds', async () => {
+		// A lone high surrogate in the partial-index predicate is text the catalog encoder
+		// refuses (`assertPersistableDdlText`), so `saveTableDDL` throws deterministically —
+		// AFTER the index store has been created and fully populated, and after the
+		// connected table's cached schema already lists the index.
+		const LONE_SURROGATE = '\uD800';
+		provider = createProvider();
+		const db = open(provider);
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`insert into t values (1, 'a'), (2, 'b')`);
+
+		await expectRefusedDdlLeavesNoResidue(
+			provider,
+			db,
+			`create index ix on t (v) where v <> '${LONE_SURROGATE}'`,
+			/unpaired surrogate/,
+		);
+
+		// The ghost index would keep being maintained by the connected table for the rest
+		// of the session, growing a store the engine never registered.
+		await db.exec(`insert into t values (3, 'c')`);
+		expect(provider.stores.has('main.t_idx_ix'), 'no ghost index store maintained by later DML').to.equal(false);
+
+		// The store-name guard reads occupancy off the cached schema, so a leftover ghost
+		// would refuse this retry with a self-contradictory collision against itself.
+		await db.exec(`create index ix on t (v)`);
+		expect(indexStoreSize(provider, 't', 'ix'), 'the retry built the index over every row').to.equal(3);
+		expect(await rows(db, `select id from t where v = 'b'`), 'the retried index answers a seek').to.deep.equal([{ id: 2 }]);
+
+		const catalog = provider.stores.get('__catalog__')!;
+		const decoder = new TextDecoder();
+		const bundles: string[] = [];
+		for await (const entry of catalog.iterate()) bundles.push(decoder.decode(entry.value));
+		expect(bundles.join('\n'), 'the retried index is persisted').to.match(/create index "ix"/i);
+	});
+
+	it('a CREATE INDEX refused by an IO error in the catalog write leaves no residue', async () => {
+		// Same window as the unencodable-text case above, reached the general way: the
+		// durable catalog write fails. Covers every provider-side failure of that step,
+		// not only the one the encoder can predict.
+		provider = createProvider();
+		const db = open(provider);
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`insert into t values (1, 'a'), (2, 'b')`);
+
+		provider.catalogFailure.fail = true;
+		try {
+			await expectRefusedDdlLeavesNoResidue(
+				provider,
+				db,
+				`create index ix on t (v)`,
+				/injected catalog-store write failure/,
+			);
+		} finally {
+			provider.catalogFailure.fail = false;
+		}
+
+		await db.exec(`insert into t values (3, 'c')`);
+		expect(provider.stores.has('main.t_idx_ix'), 'no ghost index store maintained by later DML').to.equal(false);
+
+		// A clean retry once the catalog write works again.
+		await db.exec(`create index ix on t (v)`);
+		expect(indexStoreSize(provider, 't', 'ix'), 'the retry built the index over every row').to.equal(3);
+	});
+
+	it('a DROP INDEX refused by the catalog write leaves the index intact and still maintained', async () => {
+		provider = createProvider();
+		const db = open(provider);
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`insert into t values (1, 'a'), (2, 'b')`);
+		await db.exec(`create index ix on t (v)`);
+		expect(indexStoreSize(provider, 't', 'ix'), 'index built over both rows').to.equal(2);
+
+		provider.catalogFailure.fail = true;
+		try {
+			await expectRefusedDdlLeavesNoResidue(
+				provider,
+				db,
+				`drop index ix`,
+				/injected catalog-store write failure/,
+			);
+		} finally {
+			provider.catalogFailure.fail = false;
+		}
+
+		// The engine deregisters the index only AFTER the module returns, so a refused drop
+		// leaves it planning seeks against `ix`. The connected table must therefore still
+		// MAINTAIN it — otherwise later rows go missing from index-driven results.
+		await db.exec(`insert into t values (3, 'c')`);
+		expect(indexStoreSize(provider, 't', 'ix'), 'index still maintained by later DML').to.equal(3);
+		expect(await rows(db, `select id from t where v = 'c'`), 'index seek finds the row inserted after the refused drop')
+			.to.deep.equal([{ id: 3 }]);
+
+		// And the drop still works once the catalog write does.
+		await db.exec(`drop index ix`);
+		expect(provider.stores.has('main.t_idx_ix'), 'index store gone after a successful drop').to.equal(false);
+	});
+
+	it('a CREATE INDEX refused after retiring an implicit unique store rebuilds that store', async () => {
+		// `email` carries a plain UNIQUE, so the table maintains a hidden `_uc_email` store.
+		// A `create unique index` over the same column REALIZES that constraint, so the
+		// reconcile — the last step of createIndex — tears `_uc_email` down. Failing THAT
+		// teardown is the only way to reach the unwind with a `_uc_*` store already gone,
+		// which is the case the unwind's inverse reconcile exists for.
+		provider = createProvider({ failDeleteIndex: '_uc_email' });
+		const db = open(provider);
+		await db.exec(`create table t (id integer primary key, email text unique) using store`);
+		await db.exec(`insert into t values (1, 'a@x.com'), (2, 'b@x.com')`);
+		expect(indexStoreSize(provider, 't', '_uc_email'), 'implicit unique store built over both rows').to.equal(2);
+
+		// The snapshot equality is the whole assertion here: `_uc_email` must be back with
+		// its entries, `uq_email` must be gone, and the catalog must be the pre-statement
+		// bundle (the statement had already rewritten it before the reconcile threw).
+		await expectRefusedDdlLeavesNoResidue(
+			provider,
+			db,
+			`create unique index uq_email on t (email)`,
+			/injected index-store delete failure/,
+		);
+
+		// Still enforced, still maintained: the rebuilt `_uc_email` must track new rows,
+		// and reject a duplicate of a row that predates the refused statement.
+		await db.exec(`insert into t values (3, 'c@x.com')`);
+		expect(indexStoreSize(provider, 't', '_uc_email'), 'rebuilt implicit unique store still maintained').to.equal(3);
+
+		let threw = false;
+		try {
+			await db.exec(`insert into t values (4, 'a@x.com')`);
+		} catch (e) {
+			threw = true;
+			expect(String(e)).to.match(/unique|constraint/i);
+		}
+		expect(threw, 'UNIQUE still enforced after the refused CREATE UNIQUE INDEX').to.be.true;
 	});
 
 	it('ALTER COLUMN SET COLLATE on a text PK rebuilds the secondary index identically, across chunks', async () => {
