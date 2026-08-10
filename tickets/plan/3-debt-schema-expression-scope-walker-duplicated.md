@@ -71,3 +71,13 @@ place, not silently absent from one copy and present in the other.
 Behavior must not change for anything currently exercised — `packages/quereus/test/logic/41-generated-column-scope.sqllogic`,
 `41.14-alter-add-column-subquery-backfill.sqllogic`, and the CHECK self-qualifier and
 column-rename suites are the guard rails.
+
+## Landing after a classifier change to the same file
+
+`implement/1-bug-generated-body-unbound-qualifier-accepted-at-create-table.md` changes
+the *semantics* of `generated-column-refs.ts`'s qualified-reference classifier: it adds
+a fourth `RefBinding` variant, `'unbound'`, for a qualifier that no frame binds, and
+makes `classifyQualified` track whether an opaque frame was crossed so the answer stays
+`'unknown'` in that case. That lands first (it is a live bug). This refactor must carry
+the variant and the opacity tracking forward — do not collapse `'unbound'` back into
+`'foreign'` while merging the two walkers.
