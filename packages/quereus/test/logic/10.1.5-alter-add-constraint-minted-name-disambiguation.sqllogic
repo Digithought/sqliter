@@ -116,18 +116,27 @@ select count(*) as c from AcC;
 --    LATER inline constraint fails. If the engine's mint and the module's mint
 --    disambiguated against different sets, the revert would drop a name that was
 --    never installed and strand the real constraint on a column that is about to
---    disappear. Here the first FK installs, the second fails its existing-row
---    validation, and the whole ALTER must leave the table exactly as it was.
+--    disappear — under a DISAMBIGUATED name, which is exactly the case this file
+--    creates. Here the first inline FK installs and the second is rejected, so the
+--    whole ALTER must leave the table exactly as it was.
+--
+--    The rejection trigger is a child/parent COLLATION conflict rather than an
+--    existing-row FK orphan, because the collation check is engine-side and
+--    unconditional, so this case runs identically on every backend. (The orphan
+--    trigger does not fire on the Lamina backend, which replays this corpus —
+--    tracked in that repo as `bug-add-constraint-admits-orphan-rows`.) The first
+--    FK's parent column has a DEFAULTED binary collation, which is the engine
+--    floor and resolves against the child's declared NOCASE; the second FK's
+--    parent DECLARES binary, and two declarations at the same rank conflict.
 -- ===================================================================
 
-create table RvP1 (x integer primary key);
-create table RvP2 (y integer primary key);
+create table RvP1 (id integer primary key, x text unique);
+create table RvP2 (id integer primary key, y text collate binary unique);
 create table RvC (id integer primary key);
 insert into RvC values (1);
-insert into RvP1 values (5);
 
-alter table RvC add column x integer null default 5 references RvP1(x) references RvP2(y);
--- error: FOREIGN KEY constraint failed
+alter table RvC add column x text null collate nocase references RvP1(x) references RvP2(y);
+-- error: conflicting collations
 
 -- Column gone, both keys gone — nothing stranded.
 select count(*) as c from table_info('RvC');
