@@ -205,6 +205,64 @@ describe('Schema differ — ALTER COLUMN detection', () => {
 		]);
 	});
 
+	// A retype refuses to carry an unconvertible existing default into the new type, so a
+	// migration that replaces (or drops) that default has to clear it BEFORE the retype —
+	// otherwise the value it is discarding vetoes the statement.
+	it('hoists DROP DEFAULT ahead of a retype when the default is replaced too', () => {
+		const declared = parseDeclaredSchema(
+			`declare schema main { table t (id integer primary key, c integer default 0); }`
+		);
+		const actual = makeCatalog([
+			catalogTable('t', [
+				{ name: 'id', type: 'integer', notNull: true, primaryKey: true },
+				{ name: 'c', type: 'text', defaultValue: parseLiteralDefault(`'abc'`) },
+			], [{ columnName: 'id' }]),
+		]);
+
+		const diff = computeSchemaDiff(declared, actual);
+		expect(generateMigrationDDL(diff)).to.deep.equal([
+			'ALTER TABLE t ALTER COLUMN c DROP DEFAULT',
+			'ALTER TABLE t ALTER COLUMN c SET DATA TYPE integer',
+			'ALTER TABLE t ALTER COLUMN c SET DEFAULT 0',
+		]);
+	});
+
+	it('emits exactly one DROP DEFAULT when a retype also drops the default', () => {
+		const declared = parseDeclaredSchema(
+			`declare schema main { table t (id integer primary key, c integer); }`
+		);
+		const actual = makeCatalog([
+			catalogTable('t', [
+				{ name: 'id', type: 'text', notNull: true, primaryKey: true },
+				{ name: 'c', type: 'text', defaultValue: parseLiteralDefault(`'abc'`) },
+			], [{ columnName: 'id' }]),
+		]);
+
+		const diff = computeSchemaDiff(declared, actual);
+		const ddl = generateMigrationDDL(diff).filter(s => s.includes('COLUMN c'));
+		expect(ddl).to.deep.equal([
+			'ALTER TABLE t ALTER COLUMN c DROP DEFAULT',
+			'ALTER TABLE t ALTER COLUMN c SET DATA TYPE integer',
+		]);
+	});
+
+	it('leaves a retype alone when the default is unchanged', () => {
+		const declared = parseDeclaredSchema(
+			`declare schema main { table t (id integer primary key, c integer default 5); }`
+		);
+		const actual = makeCatalog([
+			catalogTable('t', [
+				{ name: 'id', type: 'integer', notNull: true, primaryKey: true },
+				{ name: 'c', type: 'text', defaultValue: parseLiteralDefault('5') },
+			], [{ columnName: 'id' }]),
+		]);
+
+		const diff = computeSchemaDiff(declared, actual);
+		expect(generateMigrationDDL(diff)).to.deep.equal([
+			'ALTER TABLE t ALTER COLUMN c SET DATA TYPE integer',
+		]);
+	});
+
 	it('emits DROP DEFAULT when declared drops a present default', () => {
 		const declared = parseDeclaredSchema(
 			`declare schema main { table t (id integer primary key, c integer); }`

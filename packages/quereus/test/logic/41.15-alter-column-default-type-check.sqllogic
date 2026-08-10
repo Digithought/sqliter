@@ -23,6 +23,19 @@ select id, n from t_sd order by id;
 drop table t_sd;
 -- run
 
+-- A refused SET DEFAULT also leaves an EXISTING default in place — the column is
+-- not left defaultless by the failed statement.
+create table t_sd_keep (id integer primary key, n integer default 3);
+alter table t_sd_keep alter column n set default 'abc';
+-- error: Type conversion failed
+
+insert into t_sd_keep (id) values (1);
+select n from t_sd_keep where id = 1;
+→ [{"n":3}]
+
+drop table t_sd_keep;
+-- run
+
 -- A convertible literal SET DEFAULT still succeeds, and a later insert stores it
 -- already converted.
 create table t_sd_ok (id integer primary key, n integer);
@@ -108,4 +121,58 @@ alter table t_pk alter column id set data type integer;
 -- error: PRIMARY KEY
 
 drop table t_pk;
+-- run
+
+-- ============================================================
+-- 4. A declarative migration that retypes a column AND replaces (or drops) its
+-- DEFAULT must still apply: the outgoing default is dropped BEFORE the retype, so
+-- a default only the OLD type could hold does not veto the migration. Only a
+-- migration that keeps an unconvertible default hits the §2 refusal.
+-- ============================================================
+
+create table t_mig (id integer primary key, n text default 'abc');
+insert into t_mig (id, n) values (1, '99');
+-- run
+
+declare schema main {
+	table t_mig {
+		id INTEGER PRIMARY KEY,
+		n INTEGER DEFAULT 0
+	}
+}
+
+-- run
+
+apply schema main;
+-- run
+
+insert into t_mig (id) values (2);
+select id, n, typeof(n) as t from t_mig order by id;
+→ [{"id":1,"n":99,"t":"integer"},{"id":2,"n":0,"t":"integer"}]
+
+drop table t_mig;
+-- run
+
+-- The same shape with the DEFAULT dropped rather than replaced.
+create table t_mig_drop (id integer primary key, n text default 'abc');
+insert into t_mig_drop (id, n) values (1, '99');
+-- run
+
+declare schema main {
+	table t_mig_drop {
+		id INTEGER PRIMARY KEY,
+		n INTEGER NULL
+	}
+}
+
+-- run
+
+apply schema main;
+-- run
+
+insert into t_mig_drop (id) values (2);
+select id, n from t_mig_drop order by id;
+→ [{"id":1,"n":99},{"id":2,"n":null}]
+
+drop table t_mig_drop;
 -- run

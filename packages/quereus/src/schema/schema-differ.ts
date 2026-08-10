@@ -107,6 +107,14 @@ export interface ColumnAttributeChange {
 	 */
 	collation?: string;
 	/**
+	 * Set only when a retype (`dataType`) and a DEFAULT change (`defaultValue`) land on the
+	 * same column AND the column currently has a DEFAULT. `SET DATA TYPE` folds the column's
+	 * EXISTING default against the new type and rejects one that cannot convert, so the
+	 * outgoing default — which this migration replaces anyway — must be dropped first or it
+	 * vetoes the retype (`text default 'abc'` → `integer default 0`).
+	 */
+	dropStaleDefaultFirst?: true;
+	/**
 	 * Desired metadata tag set (whole-set replacement) when the declared column
 	 * tags differ from actual. Omitted = no change; `{}` = clear all tags. Rename
 	 * hints (`quereus.id` / `quereus.previous_name`) are excluded from the drift
@@ -2686,6 +2694,13 @@ function computeColumnAttributeChange(
 		any = true;
 	}
 
+	// The retype refuses to carry an unconvertible existing default across; when this
+	// migration replaces that default anyway, clear it ahead of the retype. See
+	// `dropStaleDefaultFirst`.
+	if (change.dataType !== undefined && change.defaultValue !== undefined && actualDefault !== null) {
+		change.dropStaleDefaultFirst = true;
+	}
+
 	// Collation — declared COLLATE (default BINARY) vs actual, case-insensitive.
 	// Absent and BINARY are equal, so a column that never mentions COLLATE never
 	// churns a diff against an actual BINARY column.
@@ -2880,7 +2895,9 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	//   → ADD COLUMN
 	//   → ALTER COLUMN (comparison domain, then default, then nullability — so SET
 	//     NOT NULL can rely on an already-populated DEFAULT for backfill; the
-	//     type/collation pair orders internally, see comparisonDomainAlters)
+	//     type/collation pair orders internally, see comparisonDomainAlters; a
+	//     retype whose replaced default would veto it is preceded by a DROP DEFAULT,
+	//     see dropStaleDefaultFirst)
 	//   → RENAME CONSTRAINT, then DROP CONSTRAINT (free / remove a name before any
 	//     re-add; a UNIQUE drop precedes the PK change so it can't strand a PK dep)
 	//   → ALTER PRIMARY KEY
@@ -2896,12 +2913,20 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		}
 		for (const colAlter of alter.columnsToAlter) {
 			const quotedCol = quoteIdentifier(colAlter.columnName);
+			// A default the retype would choke on and this migration replaces anyway is
+			// cleared BEFORE the comparison-domain phase (see `dropStaleDefaultFirst`).
+			if (colAlter.dropStaleDefaultFirst) {
+				statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
+			}
 			// SET DATA TYPE / SET COLLATE lead the per-column phase (both are
 			// comparison-domain changes), before DEFAULT / NOT NULL.
 			statements.push(...comparisonDomainAlters(quotedTable, quotedCol, colAlter));
 			if (colAlter.defaultValue !== undefined) {
 				if (colAlter.defaultValue === null) {
-					statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
+					// Already dropped above when it preceded the retype.
+					if (!colAlter.dropStaleDefaultFirst) {
+						statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
+					}
 				} else {
 					statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET DEFAULT ${expressionToString(colAlter.defaultValue)}`);
 				}

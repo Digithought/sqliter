@@ -1479,17 +1479,24 @@ async function runAlterColumn(
 	// is not persisted, so keying on it would coerce before a reopen and reject after one.
 	// Remedy: `SET COLLATE binary` first, then retype.
 	if (action.setDataType !== undefined) {
+		const newLogicalType = inferType(action.setDataType);
 		validateCollationForType(
 			tableSchema.columns[colIndex].collation,
-			inferType(action.setDataType),
+			newLogicalType,
 			action.columnName,
 			(n) => rctx.db.isCollationRegistered(n),
 		);
 		// The column's EXISTING stored default must remain convertible to the NEW type —
 		// otherwise the retype mints a column CREATE TABLE would refuse. Same rationale as
 		// the collation check above: engine-side and pre-module, so a refusal touches no
-		// storage. Remedy: DROP DEFAULT first, then retype.
-		foldDefaultToType(tableSchema.columns[colIndex].defaultValue, inferType(action.setDataType), action.columnName);
+		// storage. Remedy: DROP DEFAULT first, then retype — which is what the declarative
+		// differ emits when a migration replaces the default alongside the retype.
+		//
+		// NOTE: an ACCEPTED retype leaves the default's AST in its old-type spelling (`text default '7'`
+		// retyped to INTEGER keeps the literal `'7'`, not `7`), so generated DDL is non-canonical even
+		// though it re-parses and re-folds to the same value. If a DDL round-trip ever needs canonical
+		// defaults (a schema-hash compare across a retype, say), rewrite the AST from this fold's result.
+		foldDefaultToType(tableSchema.columns[colIndex].defaultValue, newLogicalType, action.columnName);
 	}
 
 	// Route a SET DEFAULT through the same DDL validator CREATE TABLE uses, so the
