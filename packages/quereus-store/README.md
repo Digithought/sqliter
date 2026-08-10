@@ -241,6 +241,32 @@ The LevelDB / IndexedDB plugins' `test/atomic-batch.spec.ts` run it, keeping onl
 backend-specific cases (LevelDB's "no batch before the shared root is open", IndexedDB's
 post-write read-cache invalidation) alongside.
 
+**Every provider runs the store-name distinctness battery.** `runStoreNameDistinctness(name,
+makeNamingBackend)` holds a provider to the one naming rule the engine depends on: two
+logical stores it considers distinct never share one physical store. A provider must build
+its names with `buildDataStoreName` / `buildIndexStoreName` and escape them into its own
+namespace injectively; a name the namespace cannot represent must be *rejected*, never folded
+onto another. The battery asserts this behaviorally — it opens a corpus of adversarial
+`(schema, table)` and `(schema, table, index)` names, writes a distinct marker into each under
+one shared key, and checks each still reads back its own — plus that two spellings of one
+case-insensitive identifier land on the SAME store, and that a user table named `__stats__` or
+`__catalog__` stays off the reserved stores:
+
+```typescript
+import { runStoreNameDistinctness } from '@quereus/store/testing';
+
+runStoreNameDistinctness('MyCustomProvider store names', () => ({
+  open: async () => new MyCustomProvider(/* fresh, empty keyspace */),
+  teardown: async () => { /* close the provider, remove backing storage */ },
+}));
+```
+
+All four backend plugins register it in their `test/conformance.spec.ts`. LevelDB and
+IndexedDB are its reference implementations, so a failure there means the battery is wrong
+rather than the plugin. `assertStoreNamesDistinct` — its core assertion — is exported
+standalone; `test/store-name-distinctness.spec.ts` drives it against provider doubles built
+to fold, truncate, and over-reject, so the guard itself is watched failing.
+
 ## KVStore Interface
 
 The `KVStore` interface is the foundation for all storage backends:

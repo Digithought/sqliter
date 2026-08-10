@@ -34,6 +34,15 @@
  * NOTE: this asserts distinctness, not decodability. An injective encoding is what the
  * property needs; nothing here requires a provider to be able to recover the logical name
  * from the physical one, and no shipped provider does.
+ *
+ * NOTE: the marker check reads back through the very handles it wrote through, so a
+ * provider that (a) caches one read-your-own-writes handle PER LOGICAL NAME — as
+ * `IndexedDBProvider` does, wrapping each store in `CachedKVStore` — and (b) folds two
+ * logical names onto one physical store BELOW that cache would serve each marker from its
+ * own cache and pass. No shipped provider does both: the only caching provider names its
+ * object stores verbatim, so its folding (if any) would happen at the cache key and be
+ * caught. If a provider ever gains a lossy escape underneath a per-name cache, re-read the
+ * markers through handles reopened after `closeStore`/`closeIndexStore` instead.
  */
 
 import assert from 'node:assert/strict';
@@ -253,13 +262,26 @@ export function runStoreNameDistinctness(name: string, makeNamingBackend: () => 
 			// A user table may legally be named `__catalog__` or `__stats__`. Its data store
 			// must not land on the reserved store of the same name — providers keep the
 			// reserved names in a namespace their encoded table names cannot reach.
+			const tableStores = new Map<string, KVStore>();
 			for (const table of ['__catalog__', '__stats__']) {
 				const store = await provider.getStore('main', table);
+				tableStores.set(table, store);
 				await store.put(MARKER_KEY, encoder.encode(`table ${table}`));
 			}
 
 			assert.strictEqual(await readMarker(catalog), 'catalog', 'a table named __catalog__ landed on the reserved catalog store');
 			assert.strictEqual(await readMarker(stats), 'stats', 'a table named __stats__ landed on the reserved stats store');
+
+			// …and the two user tables are distinct from EACH OTHER, not just from the
+			// reserved pair — a provider that folded both onto one store would otherwise
+			// leave the reserved markers intact and pass.
+			for (const [table, store] of tableStores) {
+				assert.strictEqual(
+					await readMarker(store),
+					`table ${table}`,
+					`the user table "${table}" reads back another store's marker`,
+				);
+			}
 		});
 	});
 }

@@ -285,6 +285,16 @@ statement is a clean no-op. Providers implementing `renameTableStores` should st
 every destination before moving anything (the bundled LevelDB and IndexedDB providers do)
 as a backstop against on-disk state the catalog doesn't know about.
 
+**Provider encoding must be injective.** The names above are *logical*; each provider maps
+them into its own namespace (IndexedDB verbatim, the other three escaped — see their
+READMEs). A provider must build the name with `buildDataStoreName` / `buildIndexStoreName`
+rather than composing its own, and its mapping must be one-to-one: two logical names may
+never produce one physical name, and a namespace that cannot represent one must reject it
+rather than fold it onto another. That is what lets the string comparison above stand in for
+a physical check, and nothing in the type system enforces it — so `@quereus/store/testing`
+exports `runStoreNameDistinctness`, registered by every plugin's `test/conformance.spec.ts`,
+which opens a corpus of adversarial names and checks each store reads back its own marker.
+
 ### Key Formats
 
 **Data Keys** (in `{schema}.{table}` store):
@@ -1164,11 +1174,8 @@ resolve to the *same* sublevel (`main.%EF%BF%BD`). Second, it is what lets
 `StoreModule.assertStoreNameFree` stand in for a *physical* store collision check: that check
 compares names as JS strings, before any provider encoding, so distinct logical names imply
 distinct physical stores only where the provider's encoding is injective. With unpaired
-surrogates refused it is, for LevelDB (percent-escaped UTF-8) and IndexedDB (verbatim
-`DOMString`). It is not for `@quereus/plugin-nativescript-sqlite`, whose `getTableName` folds
-every character outside `[a-zA-Z0-9_]` to `_` — a lossy mapping unrelated to surrogates and
-not repairable by this guard, tracked separately in
-`tickets/backlog/bug-mobile-provider-physical-store-name-collisions.md`.
+surrogates refused, every shipped provider's encoding is (see
+[Store Naming Convention](#store-naming-convention)).
 Because every call site builds the physical name before its first side
 effect, the throw always lands on a clean no-op — notably `renameTable`, which relocates
 storage *before* rewriting the catalog and does not undo the relocation, so a guard that only

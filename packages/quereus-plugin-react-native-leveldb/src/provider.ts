@@ -84,6 +84,14 @@ function isSafeNameByte(byte: number): boolean {
  * at least one `.` (it is built as `{schema}.{table}`) which survives escaping, while
  * neither reserved name contains one. Do not run the reserved names through this function.
  */
+// NOTE: escaping is a 3x expansion per unsafe byte, and the result is one path component,
+// which most filesystems cap at 255 bytes. A 90-character Cyrillic table name is 193 bytes
+// as raw UTF-8 (which the previous unescaped naming handed to rn-leveldb) but 553 bytes
+// escaped, so names of roughly 80+ non-ASCII characters that used to open will now fail on
+// device with a filesystem error. Not reproducible off-device (the tests drive MockLevelDB,
+// which has no path). If long non-ASCII table names ever need to work here, hash the tail of
+// an over-long encoded name rather than widening the safe set — the escape must stay
+// injective. The other three providers have no equivalent limit.
 function encodeDatabaseName(name: string): string {
 	let out = '';
 	for (const byte of textEncoder.encode(name)) {
