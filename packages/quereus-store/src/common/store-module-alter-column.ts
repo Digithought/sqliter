@@ -276,6 +276,12 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			await this.rebuildSecondaryIndexes(schemaName, tableName, table, materializedUpdated, db.getKeyNormalizerResolver(), true);
 		}
 
+		// The bare pair, not `StoreModuleIndex.adoptAndPersistSchema` — this arm may already
+		// have rewritten stored values (`mapRowsAtIndex`), re-keyed the data store and rebuilt
+		// index stores above, so restoring the old cached schema on a persist failure would
+		// read re-encoded bytes through the pre-ALTER layout. Same accepted tradeoff as every
+		// other row-rewriting arm; see the `NOTE:` above `rebuildSecondaryIndexes` in
+		// `StoreModuleAlter.alterDropColumn`.
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 

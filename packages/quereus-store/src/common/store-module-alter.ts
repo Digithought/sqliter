@@ -119,6 +119,16 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// the post-ALTER set. A no-op when the implicit-index name set is unchanged (the
 		// common case, incl. PK/collation/type ALTERs whose physical re-encode is already
 		// handled by `rebuildSecondaryIndexes`).
+		//
+		// NOTE: this call sits OUTSIDE the schema-only arms' persist seam
+		// (`StoreModuleIndex.adoptAndPersistSchema`), so it opens a window that seam does not
+		// close. If the `_uc_*` build/teardown throws here — an IO error — the catalog and the
+		// connected table both already carry the post-ALTER constraint set while the engine,
+		// which registers only after `alterTable` returns, does not. Unwinding it would mean
+		// restoring the cached schema, re-writing the catalog, AND running the inverse of a
+		// reconcile that may have half-completed. Not attempted; a re-run of the statement or a
+		// reopen rebuilds the store (`reconcileImplicitUniqueIndexStores` already tolerates a
+		// partial `_uc_*` build for the same reason).
 		await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, oldSchema);
 
 		// ONE event per statement, decided here — the single gate for every arm: emit iff
@@ -239,6 +249,14 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// `addConstraint` call from the engine's `runAddColumn`, which is what persists it —
 		// so this arm neither installs nor persists them, and the schema it hands back stays
 		// column-only.
+		//
+		// Deliberately the bare pair, NOT `adoptAndPersistSchema`: `migrateRows` above has
+		// already re-encoded every row under the new column layout, so restoring the old
+		// cached schema on a persist failure would leave the table reading re-encoded rows
+		// through the pre-ALTER layout — worse than the divergence it repairs. Same for every
+		// other row-rewriting arm (DROP COLUMN, ALTER PRIMARY KEY, ALTER COLUMN); the accepted
+		// tradeoff and its real fix are recorded in the `NOTE:` above `rebuildSecondaryIndexes`
+		// in `alterDropColumn`.
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 
@@ -335,7 +353,9 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			);
 		}
 
-		// Update table schema and persist DDL
+		// Update table schema and persist DDL. The bare pair, not `adoptAndPersistSchema` —
+		// the rows and index stores above are already re-encoded, so a cached-schema restore
+		// would misread them (see the accepted-tradeoff `NOTE:` above).
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 
@@ -446,9 +466,12 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		try {
 			rewriteColumn(change.oldName, change.newName);
 
-			// Rename is schema-only — no row migration needed
-			table.updateSchema(updatedSchema);
-			await this.saveTableDDL(updatedSchema);
+			// Rename is schema-only — no row migration needed, so the persist seam's
+			// cached-schema restore is a complete undo of everything below this line. The two
+			// unwinds nest: the seam puts the cached schema back and rethrows, and the catch
+			// here then reverses the in-place AST rewrites the restored schema still shares by
+			// reference (a schema restore cannot undo those).
+			await this.adoptAndPersistSchema(table, updatedSchema, alterSubject(oldSchema));
 		} catch (e) {
 			rewriteColumn(change.newName, change.oldName);
 			throw e;
@@ -507,6 +530,9 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// off the de-materialized `oldSchema`, so it carries no `_uc_*` on its own).
 		await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver());
 
+		// The bare pair, not `adoptAndPersistSchema` — `rekeyRows` above already re-keyed the
+		// data store, so a cached-schema restore would read the new key bytes through the old
+		// PK definition (see the accepted-tradeoff `NOTE:` in `alterDropColumn`).
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 
@@ -572,8 +598,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			);
 		}
 
-		table.updateSchema(updatedSchema);
-		await this.saveTableDDL(updatedSchema);
+		await this.adoptAndPersistSchema(table, updatedSchema, alterSubject(oldSchema));
 
 		return updatedSchema;
 	}
@@ -610,8 +635,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			updatedSchema = { ...oldSchema, uniqueConstraints: remaining.length > 0 ? Object.freeze(remaining) : undefined };
 		}
 
-		table.updateSchema(updatedSchema);
-		await this.saveTableDDL(updatedSchema);
+		await this.adoptAndPersistSchema(table, updatedSchema, alterSubject(oldSchema));
 
 		return updatedSchema;
 	}
@@ -651,11 +675,19 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			};
 		}
 
-		table.updateSchema(updatedSchema);
-		await this.saveTableDDL(updatedSchema);
+		await this.adoptAndPersistSchema(table, updatedSchema, alterSubject(oldSchema));
 
 		return updatedSchema;
 	}
+}
+
+/**
+ * How a failed schema-only ALTER names its table in the unwind's warning — see
+ * `StoreModuleIndex.guardedUnwindStep`. Reads the schema rather than the arms'
+ * `schemaName` / `tableName` parameters, which two of the four arms do not receive.
+ */
+function alterSubject(schema: TableSchema): string {
+	return `table '${schema.schemaName}.${schema.name}'`;
 }
 
 /**

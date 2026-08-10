@@ -4,6 +4,12 @@
  * back a plain UNIQUE constraint, whose set is reconciled against the schema after
  * every DDL that can change it.
  *
+ * Also home to the failure unwind every schema-swapping DDL statement shares
+ * ({@link StoreModuleIndex.unwindFailedSchemaDdl} / {@link StoreModuleIndex.guardedUnwindStep})
+ * and the {@link StoreModuleIndex.adoptAndPersistSchema} seam the schema-only ALTER TABLE
+ * arms in `store-module-alter.ts` persist through, so a refused statement of either family
+ * leaves the connected table exactly where it found it.
+ *
  * Fourth layer of the store-module chain:
  *   StoreModuleBase -> StoreModuleCatalog -> StoreModuleSchemaSync -> StoreModuleIndex
  *   -> StoreModuleAlterColumn -> StoreModuleAlter -> StoreModuleRename -> StoreModule
@@ -56,12 +62,14 @@ function implicitUniqueIndexNameMap(schema: TableSchema): Map<string, string> {
 }
 
 /**
- * How far a `createIndex` / `dropIndex` got before it threw — the two steps that
- * outlive the statement unless something puts them back, and so the two the unwind
- * ({@link StoreModuleIndex.unwindFailedIndexDdl}) is driven by. Mutated in place by the
- * arm's try block so the catch can read it.
+ * How far a DDL statement got before it threw — the two steps that outlive the
+ * statement unless something puts them back, and so the two the unwind
+ * ({@link StoreModuleIndex.unwindFailedSchemaDdl}) is driven by. Mutated in place by the
+ * arm's try block so the catch can read it. Shared by both DDL families that swap the
+ * connected table's cached schema: `createIndex` / `dropIndex` here, and the schema-only
+ * `ALTER TABLE` arms via {@link StoreModuleIndex.adoptAndPersistSchema}.
  */
-interface IndexDdlProgress {
+interface SchemaDdlProgress {
 	/** the connected table's cached schema was replaced with the post-DDL one */
 	schemaSwapped: boolean;
 	/** the catalog bundle was rewritten to the post-DDL one */
@@ -158,7 +166,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		//   - the `_uc_*` store the reconcile below tears down when the new index realizes
 		//     a plain UNIQUE, which nothing would then maintain or rebuild.
 		// `progress` records how far the statement got; the catch runs the exact inverse.
-		const progress: IndexDdlProgress = { schemaSwapped: false, catalogWritten: false };
+		const progress: SchemaDdlProgress = { schemaSwapped: false, catalogWritten: false };
 		try {
 			await buildIndexEntries(
 				table.iterateEffectiveEntries(buildFullScanBounds()),
@@ -223,7 +231,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 			// forward call: it rebuilds the `_uc_*` store the forward pass tore down.
 			// Nothing is doomed on that pass, so it takes only the build arm — no forced
 			// DDL commit.
-			await this.unwindFailedIndexDdl(
+			await this.unwindFailedSchemaDdl(
 				table,
 				subject,
 				tableSchema,
@@ -253,7 +261,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 * synthesized from it, tagged with `derivedFromIndex`), releases the
 	 * cached index-store handle, and tears down the underlying index store.
 	 * A failure before the physical teardown unwinds the same way createIndex's does
-	 * ({@link unwindFailedIndexDdl}), so a refused DROP INDEX is a no-op.
+	 * ({@link unwindFailedSchemaDdl}), so a refused DROP INDEX is a no-op.
 	 */
 	async dropIndex(
 		db: Database,
@@ -303,7 +311,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		// The window ENDS at the teardown: once `tearDownIndexStore` starts, the physical
 		// store may be partly or wholly gone, and restoring the schema would point the
 		// table at an index that no longer exists.
-		const progress: IndexDdlProgress = { schemaSwapped: false, catalogWritten: false };
+		const progress: SchemaDdlProgress = { schemaSwapped: false, catalogWritten: false };
 		try {
 			// Update the cached schema BEFORE tearing down the store so that a
 			// failure of the physical drop doesn't leave the schema enforcing an
@@ -332,7 +340,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 			// runs after the teardown, outside the unwind window, so nothing physical has
 			// changed yet — restoring the cached schema de-materializes the `_uc_*` entry
 			// the swap above re-materialized, and no store was ever built for it.
-			await this.unwindFailedIndexDdl(
+			await this.unwindFailedSchemaDdl(
 				table,
 				`index '${indexName}' on table '${schemaName}.${tableName}'`,
 				tableSchema,
@@ -363,9 +371,59 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	}
 
 	/**
-	 * The unwind {@link createIndex} and {@link dropIndex} share: put the connected
-	 * table's cached schema back to `originalSchema`, and re-write the catalog bundle for
-	 * it — each step only when the failed statement had actually done it, per `progress`.
+	 * Adopt `updatedSchema` on the connected table and persist it to the catalog; on a
+	 * persist failure put the previous cached schema back, so a refused SCHEMA-ONLY DDL
+	 * statement is a clean no-op. `subject` names what failed for the guarded-unwind
+	 * warning (e.g. `table 'main.t'`).
+	 *
+	 * The seam the four schema-only `ALTER TABLE` arms share — ADD / DROP / RENAME
+	 * CONSTRAINT and RENAME COLUMN (`StoreModuleAlter`). None of them touches row data
+	 * before the catalog write, so restoring the previous cached schema is a COMPLETE
+	 * undo. The row-rewriting arms (ADD / DROP COLUMN, ALTER PRIMARY KEY, ALTER COLUMN)
+	 * deliberately do NOT use this: each has already physically re-encoded the data store
+	 * by this point, so putting the old schema back would leave the table reading
+	 * re-encoded rows through the old layout — strictly worse than the divergence it
+	 * repairs. Their window is an accepted tradeoff whose real fix is one durable marker
+	 * covering the whole physical rewrite; see the `NOTE:` above `rebuildSecondaryIndexes`
+	 * in `StoreModuleAlter.alterDropColumn`.
+	 *
+	 * Ordering is swap-then-persist, deliberately: `StoreTableBase.updateSchema` validates
+	 * (key collations, semantic key transforms) before adopting anything, so a schema the
+	 * table cannot carry is rejected with nothing persisted. Persist-first would invert
+	 * that and leave the catalog ahead of the table.
+	 *
+	 * The original is captured here (`table.getSchema()`) rather than taken from the
+	 * caller's `oldSchema` — the same object today, but it keeps this contract
+	 * self-contained.
+	 *
+	 * Only the cached-schema restore can ever fire, so `catalogWritten` stays false: the
+	 * only step after the swap IS the catalog write, so a throw means the catalog was
+	 * never written — and re-writing the old bundle would create a catalog entry for a
+	 * table that may deliberately have none yet (the lazy first-access persist). See
+	 * {@link unwindFailedSchemaDdl}, which documents that reasoning.
+	 */
+	protected async adoptAndPersistSchema(
+		table: StoreTable,
+		updatedSchema: TableSchema,
+		subject: string,
+	): Promise<void> {
+		const originalSchema = table.getSchema();
+		const progress: SchemaDdlProgress = { schemaSwapped: false, catalogWritten: false };
+		try {
+			table.updateSchema(updatedSchema);
+			progress.schemaSwapped = true;
+			await this.saveTableDDL(updatedSchema);
+		} catch (persistError) {
+			await this.unwindFailedSchemaDdl(table, subject, originalSchema, progress);
+			throw persistError;
+		}
+	}
+
+	/**
+	 * The unwind {@link createIndex}, {@link dropIndex} and {@link adoptAndPersistSchema}
+	 * share: put the connected table's cached schema back to `originalSchema`, and
+	 * re-write the catalog bundle for it — each step only when the failed statement had
+	 * actually done it, per `progress`.
 	 *
 	 * `StoreTableBase.updateSchema` validates before adopting and recomputes the
 	 * materialized `_uc_*` copy, so restoring the pre-DDL schema is safe and
@@ -384,11 +442,11 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 * Every step is guarded ({@link guardedUnwindStep}) so a cleanup failure cannot mask
 	 * the original error the caller must see.
 	 */
-	private async unwindFailedIndexDdl(
+	protected async unwindFailedSchemaDdl(
 		table: StoreTable,
 		subject: string,
 		originalSchema: TableSchema,
-		progress: IndexDdlProgress,
+		progress: SchemaDdlProgress,
 		rebuildImplicitUniqueStores?: (failedSchema: TableSchema) => Promise<void>,
 	): Promise<void> {
 		if (progress.schemaSwapped) {
@@ -409,10 +467,11 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 
 	/**
 	 * Run one unwind step, swallowing its own failure after logging it: a cleanup that
-	 * throws must never replace the error the caller has to see. `subject` names the index
-	 * and table; `what` completes "failed to …".
+	 * throws must never replace the error the caller has to see. `subject` names what the
+	 * failed statement was about — an index and its table for the CREATE / DROP INDEX
+	 * arms, the table alone for the schema-only ALTER arms; `what` completes "failed to …".
 	 */
-	private async guardedUnwindStep(
+	protected async guardedUnwindStep(
 		what: string,
 		subject: string,
 		step: () => Promise<void>,
@@ -422,7 +481,7 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		} catch (cleanupError) {
 			console.warn(
 				`[StoreModule] failed to ${what} for ${subject} while unwinding a failed `
-					+ `index DDL statement: ${String(cleanupError)}`,
+					+ `DDL statement: ${String(cleanupError)}`,
 			);
 		}
 	}
