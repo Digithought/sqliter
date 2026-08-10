@@ -139,6 +139,32 @@ create table mt_dml (k integer primary key) maintained as with c as (insert into
 create assertion a_dml check (not exists (with c as (insert into t (k) values (1) returning k) select k from c));
 -- error: only allowed in a statement's own leading WITH clause
 
+-- No object survived any of the four rejected definitions — the reject fires while the
+-- body is planned, which is before the definition is registered.
+
+select count(*) as n from view_info() where name in ('v_dml', 'v_dml_unref', 'mv_dml', 'mv_dml_unref');
+→ [{"n":0}]
+
+select count(*) as n from assertion_info() where name = 'a_dml';
+→ [{"n":0}]
+
+select k from mt_dml;
+-- error: not found
+
+-- ===== `with recursive` in a nested position =====
+-- The `recursive` keyword does not buy a data-modifying member a nested position: a
+-- non-compound DML member is not itself recursive, so it reaches the same gate.
+
+select * from (with recursive c as (insert into t (k) values (1) returning k) select k as x from c) z;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== Two nesting levels =====
+-- The gate is on the clause, not on the position, so depth does not matter: a clause
+-- reached through a read-only nested clause rejects exactly the same.
+
+select n from (with z as (select x as k from (with c as (insert into t (k) values (1) returning k) select k as x from c) w) select k as n from z) q;
+-- error: only allowed in a statement's own leading WITH clause
+
 -- ===== Correlated scalar sub-query =====
 -- The shape `docs/runtime-caching.md` used to list as an open gap: it wrote once for the
 -- whole statement rather than once per outer row, and every outer row saw the first row's

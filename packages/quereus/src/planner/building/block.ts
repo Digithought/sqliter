@@ -40,15 +40,26 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 	// rebuild goes through `buildWithClause` on the SAME clause object and must stay
 	// allowed.
 	//
-	// NOTE: several analysis paths re-plan a STORED body as if it were a standalone
-	// top-level statement — `db._buildPlan([view.selectAst])` in `func/builtins/schema.ts`,
-	// `planner/analysis/assertion-plan.ts`, `core/database-materialized-views-plan-builders.ts`,
+	// NOTE: accepted tradeoff — several analysis paths re-plan a STORED body as if it were a
+	// standalone top-level statement (`db._buildPlan([view.selectAst])` in
+	// `func/builtins/schema.ts`, `planner/analysis/assertion-plan.ts`,
+	// `core/database-materialized-views-plan-builders.ts`,
 	// `runtime/emit/materialized-view-helpers.ts`, `schema/lens-prover.ts`,
-	// `func/builtins/explain.ts`. Those calls mark the body's own clause top-level, so a body
-	// that ALREADY contains a data-modifying member would still be accepted there.
-	// Unreachable for anything created after this gate landed (definition-time planning goes
-	// through a nested context and is rejected); reachable only for a definition persisted by
-	// an older build. Not worth a "this is a stored body" flag on `_buildPlan`.
+	// `func/builtins/explain.ts`), so those calls mark the body's own clause top-level and a
+	// body that ALREADY contains a data-modifying member is still accepted there. A "this is
+	// a stored body" flag on `_buildPlan` was weighed and declined: the shape is unreachable
+	// for anything defined after this gate landed, so it needs a definition persisted by an
+	// older build (or hand-injected via `importCatalog`) — and on that path an ordinary READ
+	// of the object already rejects (the body plans nested) and write-through has its own
+	// `unsupported-body-cte-dml` guard, leaving only introspection, where succeeding is more
+	// useful than erroring. Revisit if a legacy definition is ever found to re-drive its write
+	// through one of those paths — the materialized-view refresh call is the one that would.
+	//
+	// NOTE: the gate is the marker, not the nesting site — nothing asserts that `buildBlock`
+	// is never re-entered on a NESTED statement. A future path that did so would mark that
+	// statement's clause top-level and open every nested position silently. `_buildPlan` is
+	// the only non-test caller today; keep it that way, or make the gate positive (a "this
+	// clause is owned" flag set by the statement builders) rather than by-omission.
 	const blockCtx: PlanningContext = { ...ctx, topLevelWithClauses: collectTopLevelWithClauses(statements) };
 
 	const plannedStatements = statements.map((stmt) => {
@@ -65,10 +76,28 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 function collectTopLevelWithClauses(statements: AST.Statement[]): ReadonlySet<AST.WithClause> {
 	const clauses = new Set<AST.WithClause>();
 	for (const stmt of statements) {
-		const withClause = (stmt as { withClause?: AST.WithClause }).withClause;
+		const { withClause } = leadingClauses(stmt);
 		if (withClause) clauses.add(withClause);
 	}
 	return clauses;
+}
+
+/**
+ * The leading `with` clause and `with schema` path a statement carries. Only the four
+ * query/DML forms can have either (`Parser.statementSupportsWithClause` attaches the
+ * clause to exactly those), so the narrowing is the union itself rather than a cast to
+ * a hand-written shape.
+ */
+function leadingClauses(stmt: AST.Statement): { withClause?: AST.WithClause; schemaPath?: string[] } {
+	switch (stmt.type) {
+		case 'select':
+		case 'insert':
+		case 'update':
+		case 'delete':
+			return stmt;
+		default:
+			return {};
+	}
 }
 
 function buildStatement(ctx: PlanningContext, stmt: AST.Statement): PlanNode | undefined {
@@ -190,8 +219,7 @@ function buildStatement(ctx: PlanningContext, stmt: AST.Statement): PlanNode | u
  * `CTENode` shares the referenced one's descriptor, hence its one buffer.
  */
 function attachUnreferencedDmlCtes(ctx: PlanningContext, stmt: AST.Statement, plan: PlanNode): PlanNode {
-	const stmtAst = stmt as { withClause?: AST.WithClause; schemaPath?: string[] };
-	const withClause = stmtAst.withClause;
+	const { withClause, schemaPath } = leadingClauses(stmt);
 	if (!withClause) return plan;
 
 	const dmlMembers = withClause.ctes.filter(isDataModifyingCte);
@@ -208,7 +236,7 @@ function attachUnreferencedDmlCtes(ctx: PlanningContext, stmt: AST.Statement, pl
 	// the descriptor memo makes this safe — see the doc comment above. The
 	// statement's own WITH SCHEMA path applies to its clause, so mirror the
 	// statement builders' `contextWithSchemaPath`.
-	const rebuildCtx = stmtAst.schemaPath ? { ...ctx, schemaPath: stmtAst.schemaPath } : ctx;
+	const rebuildCtx = schemaPath ? { ...ctx, schemaPath } : ctx;
 	const rebuilt = buildWithClause(rebuildCtx, withClause);
 	const sinks = unreferenced.map(cte => {
 		const node = rebuilt.get(cte.name.toLowerCase());

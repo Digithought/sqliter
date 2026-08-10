@@ -805,8 +805,8 @@ select ... from cte_name ...
 
 A member whose body is an `INSERT` / `UPDATE` / `DELETE … RETURNING` is legal **only in a
 statement's own leading `WITH` clause**. Anywhere else it is rejected at build time with
-`WITH member '<name>' is an INSERT, which is only allowed in a statement's own leading
-WITH clause …`. Rejected positions include a `FROM` sub-query, a scalar / `EXISTS` / `IN`
+`WITH member '<name>' is data-modifying (INSERT), which is only allowed in a statement's
+own leading WITH clause …`. Rejected positions include a `FROM` sub-query, a scalar / `EXISTS` / `IN`
 sub-query, a `WITH` clause nested inside another CTE's body, a compound (`UNION`) arm's own
 clause, and the body of a stored `CREATE VIEW`, `CREATE MATERIALIZED VIEW`,
 `CREATE TABLE … MAINTAINED` or `CREATE ASSERTION` — whether or not anything references the

@@ -9,7 +9,7 @@ import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
 import { buildExpression } from './expression.js';
 import type { RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
-import { QuereusError } from '../../common/errors.js';
+import { QuereusError, quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
@@ -76,12 +76,11 @@ export function buildWithClause(
  * `buildWithContext` or `buildStoredBodyCTEs` into this function.
  */
 function rejectNestedDataModifyingCte(cte: AST.CommonTableExpr): never {
-	throw new QuereusError(
-		`WITH member '${cte.name}' is an ${cte.query.type.toUpperCase()}, which is only allowed in a statement's own leading WITH clause — not in a subquery or a stored view/materialized-view body, where the write would either be dropped or re-driven on every evaluation. Move the mutation to the statement that uses this query.`,
+	quereusError(
+		`WITH member '${cte.name}' is data-modifying (${cte.query.type.toUpperCase()}), which is only allowed in a statement's own leading WITH clause — not in a subquery or a stored view/materialized-view body, where the write would either be dropped or re-driven on every evaluation. Move the mutation to the statement that uses this query.`,
 		StatusCode.ERROR,
 		undefined,
-		cte.query.loc?.start.line,
-		cte.query.loc?.start.column,
+		cte.query,
 	);
 }
 

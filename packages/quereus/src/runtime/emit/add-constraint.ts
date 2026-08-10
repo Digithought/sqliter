@@ -7,7 +7,7 @@ import { SqlValue, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import type { Schema } from '../../schema/schema.js';
-import { assertConstraintNameFree, opsToMask, requireVtabModule } from '../../schema/table.js';
+import { assertConstraintNameFree, opsToMask, requireVtabModule, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
 import { buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
@@ -175,6 +175,40 @@ async function runAddConstraintViaModule(
 			tableSchema.schemaName,
 		);
 		validateForeignKeyCollations(rctx.db, tableSchema, fk);
+
+		// Same pre-dispatch reasoning, second malformed-declaration class: a FK whose child
+		// column count does not match the resolved parent key cannot be enforced at all.
+		// ADD CONSTRAINT is an ENFORCEMENT seam (it scans the existing rows), so the arity
+		// must be decided here rather than skipped — see
+		// `resolveReferencedColumnsForEnforcement`, which owns the wording every other
+		// enforcement site reports (test/logic/41.16-fk-unenforceable.sqllogic case B6).
+		//
+		// The memory backend reaches the identical throw slightly later, from the same
+		// helper, via `MemoryTableManager.addForeignKeyConstraint` →
+		// `validateForeignKeyOverExistingRows`; hoisting it here changes nothing for that
+		// backend and gives every other module the same diagnosis instead of whatever its
+		// own probe happens to say. `runAddColumn` re-drives inline column-level constraints
+		// through this arm, so `alter table t add column p integer references <parent>` with
+		// a mismatched parent PK is refused too — again matching the memory backend.
+		//
+		// Two gates, both load-bearing:
+		//   - `foreign_keys` pragma: off means off on BOTH sides (corpus case B4), and it is
+		//     how `validateForeignKeyOverExistingRows` already behaves, so gating keeps the
+		//     memory backend byte-identical. (Unlike the collation check above, which is a
+		//     conflict in the declaration itself and is rejected regardless of enforcement.)
+		//   - parent present: forward references are legal (docs/sql-ddl.md § Order
+		//     Independence, corpus case A5) and an absent parent has no knowable arity.
+		//
+		// NOT at CREATE TABLE: corpus B1 requires `create table c (..., x integer null
+		// references p)` against a 2-column-PK parent to SUCCEED. The mismatch is caught at
+		// enforcement seams only.
+		if (rctx.db.options.getBooleanOption('foreign_keys')) {
+			const parentSchemaName = fk.referencedSchema ?? tableSchema.schemaName;
+			const parentTable = rctx.db.schemaManager.findTable(fk.referencedTable, parentSchemaName);
+			if (parentTable) {
+				resolveReferencedColumnsForEnforcement(fk, parentTable, tableSchema);
+			}
+		}
 	}
 
 	// Two UNIQUE guards, both pre-dispatch for the same reason the FK check above is: the

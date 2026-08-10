@@ -437,6 +437,20 @@ describe('a stored view body carries its own `with` clause into write-through lo
 			expect(await all(db, 'select count(*) as n from main.logt')).to.deep.equal([{ n: 0 }]);
 		});
 
+		it('is rejected on READ too, so the carried write can no longer re-drive', async () => {
+			// The behaviour change for an older catalog: reading `vm` used to execute the
+			// insert once per read. The body now plans on a nested context like any other,
+			// so the read errors and writes nothing.
+			let message = '';
+			try {
+				await all(db, 'select * from main.vm');
+			} catch (e) {
+				message = e instanceof Error ? e.message : String(e);
+			}
+			expect(message).to.match(/only allowed in a statement's own leading WITH clause/);
+			expect(await all(db, 'select count(*) as n from main.logt')).to.deep.equal([{ n: 0 }]);
+		});
+
 		it('rejects a write through it with a structured diagnostic', async () => {
 			let message = '';
 			try {
