@@ -100,18 +100,24 @@ alter table a2 add column y integer default (new.id) check ((select count(*) fro
 select id, y from a2 order by id;
 → [{"id":1,"y":1},{"id":2,"y":2},{"id":3,"y":3}]
 
--- 10. GENERATED ALWAYS AS over a correlated subquery. The inner reference to the other
--- table's column must be QUALIFIED (`dd.v`): the generated-column dependency check reads
--- every unqualified name in the expression as a reference to this table and rejects it —
--- see the note under docs/sql-alter.md § ADD COLUMN.
+-- 10. GENERATED ALWAYS AS over a correlated subquery, inner reference QUALIFIED (`dd.v`).
 alter table a2 add column g integer generated always as ((select dd.v from dd where dd.k = id limit 1));
 -- run
 
 select id, g from a2 order by id;
 → [{"id":1,"g":10},{"id":2,"g":20},{"id":3,"g":30}]
 
+-- 11. Same shape, inner reference UNQUALIFIED (`v`): the subquery's own FROM binds it,
+-- so the generated-column reference analysis leaves it to that source instead of
+-- reading it as a (missing) column of this table.
+alter table a2 add column h integer generated always as ((select v from dd where dd.k = id limit 1));
+-- run
+
+select id, h from a2 order by id;
+→ [{"id":1,"h":10},{"id":2,"h":20},{"id":3,"h":30}]
+
 select * from a2 order by id;
-→ [{"id":1,"w":10,"x":1,"y":1,"g":10},{"id":2,"w":20,"x":2,"y":2,"g":20},{"id":3,"w":30,"x":3,"y":3,"g":30}]
+→ [{"id":1,"w":10,"x":1,"y":1,"g":10,"h":10},{"id":2,"w":20,"x":2,"y":2,"g":20,"h":20},{"id":3,"w":30,"x":3,"y":3,"g":30,"h":30}]
 
 drop table a2;
 -- run

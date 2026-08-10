@@ -12,6 +12,7 @@ import type { ColumnSchema } from './column.js';
 import { foldDefaultToType } from '../types/validation.js';
 import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from './constraint-builder.js';
+import { buildColumnSourceResolver } from './column-source-resolver.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
@@ -1920,8 +1921,11 @@ export class SchemaManager {
 
 		// Extract generated-column dependencies and validate that they form a DAG.
 		// Cycle detection runs before module.create so an invalid schema never
-		// reaches storage.
-		const rawGenDeps = extractGeneratedColumnDependencies(columns, tableName);
+		// reaches storage. The catalog resolver serves the scope-aware analysis's
+		// inner-FROM questions; the table being created is answered from the
+		// in-flight `columns` (it is not in the catalog yet).
+		const rawGenDeps = extractGeneratedColumnDependencies(
+			columns, tableName, targetSchemaName, buildColumnSourceResolver(this.db));
 		const genTopoOrder = rawGenDeps.size > 0
 			? topoSortGeneratedColumns(columns, rawGenDeps)
 			: undefined;

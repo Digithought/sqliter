@@ -11,8 +11,9 @@ import { quereusError, QuereusError } from '../common/errors.js';
 import { createLogger } from '../common/logger.js';
 import { inferType } from '../types/registry.js';
 import type { LogicalType } from '../types/logical-type.js';
-import { traverseAst } from '../parser/visitor.js';
 import type { TableStatistics } from '../planner/stats/catalog-stats.js';
+import { collectGeneratedColumnRefs } from './generated-column-refs.js';
+import type { ResolveColumnInSource } from './rename/shared.js';
 
 const log = createLogger('schema:table');
 const warnLog = log.extend('warn');
@@ -1404,9 +1405,19 @@ function findColumnPKDefinition(columns: ReadonlyArray<ColumnSchema>): ReadonlyA
  * Returns a copy of `tableSchema` with `generatedColumnDependencies` and
  * `generatedColumnTopoOrder` recomputed from its current column list.
  * Throws on cycle. The other fields are preserved as-is.
+ *
+ * `resolveColumnInSource` is the catalog-backed resolver
+ * (`buildColumnSourceResolver(db)`) the scope-aware reference analysis
+ * consults for inner FROM sources; questions about this table itself are
+ * answered from `tableSchema.columns` (the catalog may hold a stale
+ * pre-ALTER column set, or not hold the table at all).
  */
-export function withGeneratedColumnGraph(tableSchema: TableSchema): TableSchema {
-	const rawDeps = extractGeneratedColumnDependencies(tableSchema.columns, tableSchema.name);
+export function withGeneratedColumnGraph(
+	tableSchema: TableSchema,
+	resolveColumnInSource: ResolveColumnInSource,
+): TableSchema {
+	const rawDeps = extractGeneratedColumnDependencies(
+		tableSchema.columns, tableSchema.name, tableSchema.schemaName, resolveColumnInSource);
 	if (rawDeps.size === 0) {
 		return Object.freeze({
 			...tableSchema,
@@ -1425,49 +1436,76 @@ export function withGeneratedColumnGraph(tableSchema: TableSchema): TableSchema 
 }
 
 /**
- * For each generated column, walks its expression AST and collects the column
- * indices in this table that the expression references. Unknown column names
- * referenced unqualified (or qualified to this table) are rejected with a
- * specific error so typos surface at CREATE TABLE / ALTER TABLE time rather
- * than at INSERT/UPDATE time.
+ * Wrap the catalog-backed source resolver so questions about the table under
+ * analysis are answered from the in-flight column list instead of the catalog:
+ * at CREATE TABLE the catalog does not hold the table yet, and at DROP COLUMN
+ * it still holds the pre-drop column set. `extraColumnLower` covers ALTER ADD
+ * COLUMN, where the resolver must answer for the post-ALTER column set the
+ * emitter's re-analysis will see.
+ */
+function resolveWithInFlightColumns(
+	resolve: ResolveColumnInSource,
+	schemaName: string,
+	tableName: string,
+	columnIndexMap: ReadonlyMap<string, number>,
+	extraColumnLower?: string,
+): ResolveColumnInSource {
+	const schemaLower = schemaName.toLowerCase();
+	const tableLower = tableName.toLowerCase();
+	return (sourceSchema, sourceName, columnName) => {
+		if (sourceSchema.toLowerCase() === schemaLower && sourceName.toLowerCase() === tableLower) {
+			const colLower = columnName.toLowerCase();
+			return columnIndexMap.has(colLower) || colLower === extraColumnLower;
+		}
+		return resolve(sourceSchema, sourceName, columnName);
+	};
+}
+
+/**
+ * For each generated column, collects the column indices in this table that
+ * its expression references, via the scope-aware collector
+ * (`./generated-column-refs.ts`) — a name bound by a FROM clause inside the
+ * expression belongs to that source, not to this table. Per reference:
  *
- * References qualified to a different table are skipped — they belong to
- * an outer scope (e.g. a scalar subquery's source) and don't constitute a
- * dependency on this table's columns.
+ * - `'own'` binding: a known column records a dependency edge; an unknown
+ *   name of `'column'` shape is rejected ("not found") so typos surface at
+ *   CREATE TABLE / ALTER TABLE time rather than at INSERT/UPDATE time; an
+ *   unknown `'identifier'` is ignored (it may legitimately be a function or
+ *   mutation-context variable).
+ * - `'foreign'` binding: ignored entirely.
+ * - `'unknown'` binding (an opaque subquery / function / CTE source
+ *   intervenes): a known column records an edge (a missing edge would compute
+ *   a generated column before its dependency and silently write NULL);
+ *   an unknown name is ignored silently. Net effect vs. the scope-blind
+ *   analysis this replaced: only ever accepts more, never less.
  */
 export function extractGeneratedColumnDependencies(
 	columns: ReadonlyArray<ColumnSchema>,
 	tableName: string,
+	schemaName: string,
+	resolveColumnInSource: ResolveColumnInSource,
 ): Map<number, number[]> {
 	const columnIndexMap = buildColumnIndexMap(columns);
-	const tableNameLower = tableName.toLowerCase();
+	const resolve = resolveWithInFlightColumns(
+		resolveColumnInSource, schemaName, tableName, columnIndexMap);
 	const result = new Map<number, number[]>();
 
 	columns.forEach((col, colIdx) => {
 		if (!col.generated || !col.generatedExpr) return;
 
 		const deps = new Set<number>();
-		traverseAst(col.generatedExpr as AST.AstNode, {
-			enterNode: (node: AST.AstNode) => {
-				if (node.type === 'column') {
-					const ref = node as AST.ColumnExpr;
-					if (ref.table && ref.table.toLowerCase() !== tableNameLower) return;
-					const refIdx = columnIndexMap.get(ref.name.toLowerCase());
-					if (refIdx === undefined) {
-						throw new QuereusError(
-							`Column '${ref.name}' referenced by generated column '${col.name}' not found in table '${tableName}'`,
-							StatusCode.ERROR,
-						);
-					}
-					deps.add(refIdx);
-				} else if (node.type === 'identifier') {
-					const ref = node as AST.IdentifierExpr;
-					if (ref.schema) return;
-					const refIdx = columnIndexMap.get(ref.name.toLowerCase());
-					if (refIdx !== undefined) deps.add(refIdx);
-				}
-			},
-		});
+		for (const ref of collectGeneratedColumnRefs(col.generatedExpr, tableName, schemaName, resolve)) {
+			if (ref.binding === 'foreign') continue;
+			const refIdx = columnIndexMap.get(ref.name);
+			if (refIdx !== undefined) {
+				deps.add(refIdx);
+			} else if (ref.binding === 'own' && ref.shape === 'column') {
+				throw new QuereusError(
+					`Column '${ref.originalName}' referenced by generated column '${col.name}' not found in table '${tableName}'`,
+					StatusCode.ERROR,
+				);
+			}
+		}
 
 		result.set(colIdx, Array.from(deps).sort((a, b) => a - b));
 	});
@@ -1497,49 +1535,43 @@ export function validateAddColumnGeneratedRefs(
 	newColumnName: string,
 	existingColumns: ReadonlyArray<ColumnSchema>,
 	tableName: string,
+	schemaName: string,
+	resolveColumnInSource: ResolveColumnInSource,
 ): void {
 	const columnIndexMap = buildColumnIndexMap(existingColumns);
-	const tableNameLower = tableName.toLowerCase();
 	const newColLower = newColumnName.toLowerCase();
 	// `add column v … generated always as (v * 2)` where `v` ALREADY exists is a duplicate
 	// column, not a cycle; the reference resolves to the existing sibling. Leave the
 	// rejection to `runAddColumn`'s duplicate check so the message names the real problem.
 	const newColumnIsDuplicate = columnIndexMap.has(newColLower);
+	// Resolve questions about this table from the POST-ALTER column set (existing
+	// plus the new column): the emitter re-runs `extractGeneratedColumnDependencies`
+	// on that set, and this pre-flight must accept exactly what it will.
+	const resolve = resolveWithInFlightColumns(
+		resolveColumnInSource, schemaName, tableName, columnIndexMap, newColLower);
 
-	traverseAst(expr as AST.AstNode, {
-		enterNode: (node: AST.AstNode) => {
-			// Same ref shapes and same skip rules as extractGeneratedColumnDependencies:
-			// a ref qualified to another table belongs to an outer scope, and a bare
-			// `identifier` may legitimately resolve to something that is not a column of
-			// this table — so only the unambiguous `column` shape yields "not found".
-			let name: string | undefined;
-			if (node.type === 'column') {
-				const ref = node as AST.ColumnExpr;
-				if (ref.table && ref.table.toLowerCase() !== tableNameLower) return;
-				name = ref.name;
-			} else if (node.type === 'identifier') {
-				const ref = node as AST.IdentifierExpr;
-				if (ref.schema) return;
-				name = ref.name;
-			} else {
-				return;
-			}
-
-			const lower = name.toLowerCase();
-			if (lower === newColLower && !newColumnIsDuplicate) {
-				throw new QuereusError(
-					`Cyclic dependency in generated columns: '${newColumnName}'`,
-					StatusCode.ERROR,
-				);
-			}
-			if (node.type === 'column' && !columnIndexMap.has(lower)) {
-				throw new QuereusError(
-					`Column '${name}' referenced by generated column '${newColumnName}' not found in table '${tableName}'`,
-					StatusCode.ERROR,
-				);
-			}
-		},
-	});
+	for (const ref of collectGeneratedColumnRefs(expr, tableName, schemaName, resolve)) {
+		if (ref.binding === 'foreign') continue;
+		// Both `'own'` and `'unknown'` bindings of the new column's own name are a
+		// self-cycle here: the emitter's re-analysis records a dependency edge for
+		// either (see extractGeneratedColumnDependencies) and its topological sort
+		// then raises this same error — this pre-flight only moves it earlier.
+		if (ref.name === newColLower && !newColumnIsDuplicate) {
+			throw new QuereusError(
+				`Cyclic dependency in generated columns: '${newColumnName}'`,
+				StatusCode.ERROR,
+			);
+		}
+		// Only an `'own'`-bound `column` shape yields "not found" — an `'unknown'`
+		// binding may bind an opaque inner source, and a bare `identifier` may
+		// legitimately resolve to something that is not a column of this table.
+		if (ref.binding === 'own' && ref.shape === 'column' && !columnIndexMap.has(ref.name)) {
+			throw new QuereusError(
+				`Column '${ref.originalName}' referenced by generated column '${newColumnName}' not found in table '${tableName}'`,
+				StatusCode.ERROR,
+			);
+		}
+	}
 }
 
 /**

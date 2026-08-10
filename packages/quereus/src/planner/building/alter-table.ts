@@ -16,6 +16,7 @@ import { columnSchemaToScalarType } from '../type-utils.js';
 import { astToString, expressionToString } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
 import { validateAddColumnGeneratedRefs } from '../../schema/table.js';
+import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { planViewBody } from './create-view.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
@@ -293,7 +294,9 @@ function buildAddColumnBackfill(
   // compile below turns an unresolvable (or self-referencing) name into a generic
   // "Column not found".
   if (generatedExpr) {
-    validateAddColumnGeneratedRefs(generatedExpr, columnDef.name, tableSchema.columns, tableSchema.name);
+    validateAddColumnGeneratedRefs(
+      generatedExpr, columnDef.name, tableSchema.columns, tableSchema.name,
+      tableSchema.schemaName, buildColumnSourceResolver(ctx.db));
   }
   // Fresh attributes for the existing columns, referenced only by this expression's
   // column refs and resolved at runtime via the row slot the emitter installs over

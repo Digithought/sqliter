@@ -1,0 +1,189 @@
+-- Scope-aware reference analysis for GENERATED ALWAYS AS expressions.
+--
+-- A name in a generated expression resolves against the table being defined unless a
+-- FROM clause inside the expression binds it — the same rule a CHECK constraint
+-- follows. The dependency analysis (extractGeneratedColumnDependencies) and the ALTER
+-- ADD COLUMN pre-flight (validateAddColumnGeneratedRefs) share one scope-aware
+-- collector (src/schema/generated-column-refs.ts), so a subquery's own FROM sources
+-- bind their columns and the owning table neither falsely rejects the name nor
+-- records a false dependency edge. Genuine typos and genuine cycles still raise the
+-- same errors as before.
+
+-- ===================================
+-- 1. Subquery over another table, inner name UNQUALIFIED — accepted, correct value.
+--    (Previously: "Column 'v' referenced by generated column 'g' not found in table 't'".)
+-- ===================================
+
+create table d (k integer primary key, v integer);
+insert into d values (1, 42);
+
+create table t (
+	id integer primary key,
+	g integer generated always as ((select v from d where d.k = id limit 1))
+);
+insert into t (id) values (1);
+
+select id, g from t;
+→ [{"id":1,"g":42}]
+
+drop table t;
+drop table d;
+
+-- ===================================
+-- 2. Two generated columns each reading ANOTHER table's like-named column —
+--    no false cycle, both values correct.
+-- ===================================
+
+create table d2 (k integer primary key, w integer, g integer);
+insert into d2 values (1, 10, 20);
+
+create table t2 (
+	id integer primary key,
+	w integer generated always as ((select g from d2 where d2.k = id limit 1)),
+	g integer generated always as ((select w from d2 where d2.k = id limit 1))
+);
+insert into t2 (id) values (1);
+
+select id, w, g from t2;
+→ [{"id":1,"w":20,"g":10}]
+
+drop table t2;
+drop table d2;
+
+-- ===================================
+-- 3. Generated column whose subquery selects another table's column with the SAME
+--    name as itself — no false self-cycle.
+-- ===================================
+
+create table l0 (k integer primary key, g integer);
+insert into l0 values (1, 7);
+
+create table l1 (
+	id integer primary key,
+	g integer generated always as ((select g from l0 where l0.k = id limit 1))
+);
+insert into l1 (id) values (1);
+
+select id, g from l1;
+→ [{"id":1,"g":7}]
+
+drop table l1;
+drop table l0;
+
+-- ===================================
+-- 4. Common table expression binds the inner name — accepted.
+-- ===================================
+
+create table j1 (
+	id integer primary key,
+	g integer generated always as ((with c(v) as (select 7) select v from c))
+);
+insert into j1 (id) values (1);
+
+select id, g from j1;
+→ [{"id":1,"g":7}]
+
+drop table j1;
+
+-- ===================================
+-- 5. Aliased self source: the alias binds the subquery's FROM, so the inner bare `a`
+--    is that source's column, not the row being computed. Nullable because the
+--    subquery finds no row while the table is still empty.
+-- ===================================
+
+create table s1 (
+	id integer primary key,
+	a integer,
+	g integer null generated always as ((select a from s1 x where x.id = 1 limit 1))
+);
+insert into s1 (id, a) values (1, 5);
+insert into s1 (id, a) values (2, 6);
+
+select id, g from s1 order by id;
+→ [{"id":1,"g":null},{"id":2,"g":5}]
+
+drop table s1;
+
+-- ===================================
+-- 6. A real table named "new": the FROM binding wins over the row-image reading
+--    (`new` is not a reserved word).
+-- ===================================
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+
+create table tn (
+	id integer primary key,
+	g integer generated always as ((select max("new".a) from "new"))
+);
+insert into tn (id) values (1);
+
+select id, g from tn;
+→ [{"id":1,"g":3}]
+
+drop table tn;
+drop table "new";
+
+-- ===================================
+-- 7. Subquery over the table's OWN pre-insert rows — the in-flight column set
+--    answers for the table before the catalog holds it. Nullable: the subquery
+--    sees no rows while inserting the first one.
+-- ===================================
+
+create table own1 (
+	id integer primary key,
+	g integer null generated always as ((select max(id) from own1))
+);
+insert into own1 (id) values (5);
+
+select id, g from own1;
+→ [{"id":5,"g":null}]
+
+drop table own1;
+
+-- ===================================
+-- 8. Dependency edges survive the scope awareness: an unrebound `new.<col>` and a
+--    schema-qualified self reference both bind the owning row, so DROP COLUMN of the
+--    referenced column is still refused.
+-- ===================================
+
+create table tnew (id integer primary key, a integer, g integer generated always as (new.a * 2));
+alter table tnew drop column a;
+-- error: Cannot drop column 'a' from 'tnew': it is referenced by generated column 'g'
+drop table tnew;
+
+create table sq3 (id integer primary key, a integer, g integer generated always as (main.sq3.a + 1));
+alter table sq3 drop column a;
+-- error: Cannot drop column 'a' from 'sq3': it is referenced by generated column 'g'
+drop table sq3;
+
+-- A qualifier naming ANOTHER schema is not a self reference even though the bare
+-- names collide — no dependency edge, so the drop is allowed.
+create table sqm (id integer primary key, a integer, g integer generated always as ("temp".sqm.a + 1));
+alter table sqm drop column a;
+drop table sqm;
+
+-- ===================================
+-- 9. Negative arms — genuine mistakes still raise the original messages.
+-- ===================================
+
+create table n1 (id integer primary key, g integer generated always as (nosuch + 1));
+-- error: Column 'nosuch' referenced by generated column 'g' not found in table 'n1'
+
+-- A typo INSIDE a subquery whose FROM does not expose the name is still a typo.
+create table dz (k integer primary key);
+create table nz (id integer primary key, g integer generated always as ((select nosuch from dz limit 1)));
+-- error: Column 'nosuch' referenced by generated column 'g' not found in table 'nz'
+drop table dz;
+
+create table n2 (id integer primary key);
+alter table n2 add column g integer generated always as (g + 1);
+-- error: Cyclic dependency in generated columns: 'g'
+drop table n2;
+
+create table n3 (
+	id integer primary key,
+	a integer generated always as (b + 1),
+	b integer generated always as (a + 1)
+);
+-- error: Cyclic dependency in generated columns

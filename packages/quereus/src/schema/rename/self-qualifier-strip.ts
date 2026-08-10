@@ -1,30 +1,10 @@
 import type * as AST from '../../parser/ast.js';
 import { eq, type ResolveColumnInSource } from './shared.js';
+import { buildScopeFrame, emptyScopeFrame, opaqueScopeFrame, withScopeFrame, type ScopeFrame } from './scope-frame.js';
 
 // ──────────────────────────────────────────────────────────────────────
 // Self-qualifier strip (CHECK expressions)
 // ──────────────────────────────────────────────────────────────────────
-
-/**
- * One FROM nesting level for the self-qualifier strip walk. Unlike the
- * column walker's `ScopeFrame` (`./column-rename.ts`), this only needs to
- * answer two questions: "is this qualifier rebound here?" and "could this frame
- * capture an unqualified column name?".
- */
-interface StripFrame {
-	/** Lowercase qualifier names this frame's FROM binds (table names, aliases, CTE names). */
-	bound: Set<string>;
-	/** Real-table sources, askable via the catalog callback for unqualified capture. */
-	realSources: Array<{ schema: string; name: string }>;
-	/**
-	 * Frame contains sources whose column sets cannot be analyzed
-	 * (subquery / function / CTE sources), or marks a context where
-	 * stripping is categorically unsafe (CTE / derived-table bodies).
-	 */
-	hasOpaque: boolean;
-	/** Lowercase CTE names declared at this level (consulted by nested FROMs). */
-	cteNames: Set<string>;
-}
 
 interface StripState {
 	/** Lowercase owning-table name (the implicit seed binding). */
@@ -33,7 +13,7 @@ interface StripState {
 	defaultSchema: string;
 	resolve: ResolveColumnInSource;
 	/** Index 0 is the implicit seed frame binding the owning table. */
-	stack: StripFrame[];
+	stack: ScopeFrame[];
 	changed: boolean;
 }
 
@@ -58,6 +38,8 @@ interface StripState {
  * strip (the ref then stays qualified and fails to resolve exactly as it
  * did before this rewrite existed). CTE and derived-table bodies cannot
  * correlate to the constraint row, so stripping is suppressed inside them.
+ * The frame model lives in `./scope-frame.ts`, shared with the
+ * generated-column reference collector.
  *
  * Mutates `expr` in place (callers pass a clone of the stored constraint
  * AST) and returns whether anything was rewritten.
@@ -76,72 +58,15 @@ export function stripSelfQualifierInCheckExpression(
 		stack: [],
 		changed: false,
 	};
-	const seed = emptyStripFrame();
+	const seed = emptyScopeFrame();
 	seed.bound.add(state.tableName);
-	state.stack.push(seed);
-	try {
-		visitStrip(expr, state);
-	} finally {
-		state.stack.pop();
-	}
+	withScopeFrame(state.stack, seed, () => visitStrip(expr, state));
 	return state.changed;
-}
-
-function emptyStripFrame(): StripFrame {
-	return { bound: new Set(), realSources: [], hasOpaque: false, cteNames: new Set() };
-}
-
-function isStripCteName(state: StripState, name: string): boolean {
-	for (const frame of state.stack) {
-		if (frame.cteNames.has(name)) return true;
-	}
-	return false;
-}
-
-function collectStripBindings(item: AST.FromClause, state: StripState, frame: StripFrame): void {
-	switch (item.type) {
-		case 'table': {
-			const ts = item as AST.TableSource;
-			const name = ts.table.name.toLowerCase();
-			frame.bound.add(ts.alias ? ts.alias.toLowerCase() : name);
-			if (ts.table.schema === undefined && isStripCteName(state, name)) {
-				// CTE source — column set not analyzed.
-				frame.hasOpaque = true;
-			} else {
-				frame.realSources.push({ schema: (ts.table.schema ?? state.defaultSchema).toLowerCase(), name });
-			}
-			break;
-		}
-		case 'join': {
-			const join = item as AST.JoinClause;
-			collectStripBindings(join.left, state, frame);
-			collectStripBindings(join.right, state, frame);
-			break;
-		}
-		case 'subquerySource': {
-			frame.bound.add((item as AST.SubquerySource).alias.toLowerCase());
-			frame.hasOpaque = true;
-			break;
-		}
-		case 'functionSource': {
-			const fs = item as AST.FunctionSource;
-			if (fs.alias) frame.bound.add(fs.alias.toLowerCase());
-			frame.hasOpaque = true;
-			break;
-		}
-	}
 }
 
 /** Visit a node in a context where stripping must not occur (CTE / derived-table bodies). */
 function visitStripBarrier(node: AST.AstNode | undefined, state: StripState): void {
-	const barrier = emptyStripFrame();
-	barrier.hasOpaque = true;
-	state.stack.push(barrier);
-	try {
-		visitStrip(node, state);
-	} finally {
-		state.stack.pop();
-	}
+	withScopeFrame(state.stack, opaqueScopeFrame(), () => visitStrip(node, state));
 }
 
 function visitStrip(node: AST.AstNode | undefined, state: StripState): void {
@@ -150,17 +75,15 @@ function visitStrip(node: AST.AstNode | undefined, state: StripState): void {
 	switch (node.type) {
 		case 'select': {
 			const stmt = node as AST.SelectStmt;
-			const withFrame = emptyStripFrame();
-			state.stack.push(withFrame);
-			try {
+			const withFrame = emptyScopeFrame();
+			withScopeFrame(state.stack, withFrame, () => {
 				for (const cte of stmt.withClause?.ctes ?? []) {
 					// A CTE body cannot correlate to the constraint row — no stripping inside.
 					visitStripBarrier(cte.query, state);
 					withFrame.cteNames.add(cte.name.toLowerCase());
 				}
-				const frame = buildStripFrame(stmt.from, state);
-				state.stack.push(frame);
-				try {
+				const frame = buildScopeFrame(stmt.from, state.defaultSchema, state.stack);
+				withScopeFrame(state.stack, frame, () => {
 					(stmt.columns ?? []).forEach(c => {
 						if (c.type === 'column') visitStrip(c.expr, state);
 					});
@@ -173,12 +96,8 @@ function visitStrip(node: AST.AstNode | undefined, state: StripState): void {
 					visitStrip(stmt.offset, state);
 					visitStrip(stmt.union, state);
 					if (stmt.compound) visitStrip(stmt.compound.select, state);
-				} finally {
-					state.stack.pop();
-				}
-			} finally {
-				state.stack.pop();
-			}
+				});
+			});
 			break;
 		}
 		case 'values': {
@@ -264,12 +183,6 @@ function visitStrip(node: AST.AstNode | undefined, state: StripState): void {
 		default:
 			break;
 	}
-}
-
-function buildStripFrame(from: AST.FromClause[] | undefined, state: StripState): StripFrame {
-	const frame = emptyStripFrame();
-	(from ?? []).forEach(item => collectStripBindings(item, state, frame));
-	return frame;
 }
 
 function stripColumnQualifier(col: AST.ColumnExpr, state: StripState): void {

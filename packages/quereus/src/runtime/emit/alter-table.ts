@@ -844,7 +844,7 @@ async function runAddColumn(
 		// Recompute the generated-column dependency graph. If the added column is generated
 		// and its expression references an unknown column, or any new generated-column edges
 		// form a cycle, this throws — and the revert below undoes the materialization.
-		const columnOnlySchema = withGeneratedColumnGraph(updatedTableSchema);
+		const columnOnlySchema = withGeneratedColumnGraph(updatedTableSchema, buildColumnSourceResolver(rctx.db));
 
 		// Register the COLUMN-ONLY schema before installing any inline constraint. Two
 		// properties depend on this ordering, and both are easy to break:
@@ -918,7 +918,7 @@ async function runAddColumn(
 				type: 'addConstraint',
 				constraint,
 			});
-			current = withGeneratedColumnGraph(withConstraint);
+			current = withGeneratedColumnGraph(withConstraint, buildColumnSourceResolver(rctx.db));
 			if (installedName !== undefined) installedConstraintNames.push(installedName);
 		}
 
@@ -1243,8 +1243,10 @@ async function runDropColumn(
 	);
 
 	// Recompute the generated-column dependency graph against the post-drop
-	// column array — old indices in the previous map are invalid.
-	const finalSchema = withGeneratedColumnGraph(updatedTableSchema);
+	// column array — old indices in the previous map are invalid. Questions about
+	// this table resolve against the post-drop `columns`, not the stale catalog
+	// entry (the catalog is only updated below).
+	const finalSchema = withGeneratedColumnGraph(updatedTableSchema, buildColumnSourceResolver(rctx.db));
 
 	// Update the schema catalog
 	schema.addTable(finalSchema);
