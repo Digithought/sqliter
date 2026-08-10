@@ -236,3 +236,24 @@ create table n3 (
 -- scope-aware analysis and only failed at the first write.)
 create table n4 (id integer primary key, g integer generated always as (new.nosuch + 1));
 -- error: Column 'nosuch' referenced by generated column 'g' not found in table 'n4'
+
+-- ===================================
+-- 12. An unbound qualifier reached only through an OPAQUE frame (a derived
+--     table's body) is undecidable, not rejected. The walk cannot see what such
+--     a body binds, so it defers rather than refusing a declaration it cannot
+--     prove wrong — contrast 41-generated-column-errors.sqllogic § 4, where no
+--     opaque frame intervenes and CREATE TABLE rejects up front. Documented
+--     residual (see the NOTE in src/schema/generated-column-refs.ts): the
+--     declaration is accepted and the first write is what reports the name.
+-- ===================================
+
+create table dop (k integer primary key, v integer);
+
+create table sop (
+	id integer primary key,
+	a integer,
+	g integer generated always as ((select y from (select zz.v as y from dop) s limit 1))
+);
+
+drop table sop;
+drop table dop;

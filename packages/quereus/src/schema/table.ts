@@ -1466,6 +1466,12 @@ function resolveWithInFlightColumns(
  * (`RefBinding` `'unbound'`) — thrown identically by both authoring surfaces
  * so a declaration cannot be accepted by one and rejected by the other. See
  * `RefBinding` in `./generated-column-refs.ts`.
+ *
+ * NOTE: accepted tradeoff — this also fires on catalog reload (via
+ * `withGeneratedColumnGraph`), so a table a pre-fix build persisted with such a
+ * body now fails to LOAD rather than loading unwritable. Kept: the table could
+ * never be written either way, and backwards compatibility is not yet a project
+ * constraint. Revisit if stores written by older builds must open.
  */
 function unboundQualifierError(
 	ref: GeneratedColumnRef,
