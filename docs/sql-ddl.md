@@ -368,6 +368,8 @@ Generated columns are computed from an expression over other columns in the same
   | any other qualifier | no | resolved through the ordinary scope chain, so it fails unless a `FROM` inside the expression binds it |
 
   `new` and `old` are not reserved words, so a subquery inside the body that names a real table called `"new"` reads that table: the subquery's own `FROM` binds the name first.
+
+  **When the rejection happens differs by statement.** `ALTER TABLE ... ADD COLUMN` rejects an unbindable qualified reference — `old.<column>`, or `<some other table>.<column>` with no `FROM` inside the body binding it — at declaration time, and leaves the table unchanged. `CREATE TABLE` currently accepts the same declaration and fails at the first write instead, so the table is created but cannot be written to. Prefer spelling the row's own columns with one of the four accepted forms above.
 - **Mutation-context variables do not shadow a column here.** In a `CHECK` or a column `DEFAULT`, a `with context (...)` variable claims the bare name and the column stays reachable as `new.<column>` (§2.6.2). A generated expression is deliberately different: the bare name always means the column. Its value is a pure function of the row being written and must compute identically at all the sites above, and the `ADD COLUMN` backfill has no mutation-context envelope to read. Nothing is lost by this: a bare name in a generated body that is not a column of the table is already rejected at DDL time, so a generated body can only ever collide with a context variable, never usefully name one.
 - Cannot have both `DEFAULT` and `GENERATED ALWAYS AS` on the same column.
 - Cannot INSERT into or UPDATE a generated column directly.

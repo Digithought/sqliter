@@ -535,3 +535,32 @@ select id, a, g1, g2 from t_sp_chain order by id;
 
 drop table t_sp_chain;
 -- run
+
+-- ============================================================
+-- 16. A declared COLLATE applies inside a backfilled generated body
+--
+-- The backfill compiles the body through the same builder the write paths use,
+-- which resolves each column reference at its DECLARED type — collation
+-- included. So an existing row backfills by the same comparison a later INSERT
+-- computes with.
+-- ============================================================
+
+create table t_sp_coll (id integer primary key, a text collate nocase);
+insert into t_sp_coll values (1, 'abc');
+-- run
+
+alter table t_sp_coll add column g integer generated always as (case when a = 'ABC' then 1 else 0 end);
+-- run
+
+select id, a, g from t_sp_coll order by id;
+→ [{"id":1,"a":"abc","g":1}]
+
+insert into t_sp_coll (id, a) values (2, 'AbC');
+insert into t_sp_coll (id, a) values (3, 'abd');
+-- run
+
+select id, g from t_sp_coll order by id;
+→ [{"id":1,"g":1},{"id":2,"g":1},{"id":3,"g":0}]
+
+drop table t_sp_coll;
+-- run

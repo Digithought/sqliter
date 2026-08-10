@@ -157,8 +157,9 @@ export function buildUpdateStmt(
   // subquery builds — a CTE read in either now resolves (closes the prior read gap).
   const updateCtx = { ...contextWithCTEs, scope: tableScope };
 
-  // Contexts for the table's OWN schema-authored SQL (generated-column recompute,
-  // CHECK constraints, NOT NULL defaults, FK probes). Derived once here rather than
+  // Contexts for the table's OWN schema-authored SQL (CHECK constraints, NOT NULL
+  // defaults, FK probes — the generated-column recompute builds its own, below, off
+  // the plain statement context). Derived once here rather than
   // per call site; both clear the CTE namespace so none of that SQL can bind this
   // statement's common table expressions — its own leading `with` clause or ones it
   // inherited from an enclosing statement — and both narrow the schema path to the
@@ -212,10 +213,11 @@ export function buildUpdateStmt(
   //
   // Built through the shared generated-expression builder — NOT on the statement's
   // table scope — so the body accepts exactly the spellings an INSERT, an upsert
-  // recompute and an ADD COLUMN backfill accept. Parenting on the plain statement
-  // scope also keeps the statement's own correlation name (`update t as x …`) out of
-  // reach of schema-authored SQL: a self-qualified `t.<col>` is folded by the builder,
-  // while `x.<col>` resolves nowhere, as it does at the other three sites.
+  // recompute and an ADD COLUMN backfill accept: a self-qualified `t.<col>` is folded
+  // by the builder, and nothing else the statement happens to bind is reachable. That
+  // includes `stmt.alias`, the synthesised correlation name the view-mutation lowering
+  // puts on the target; the surface syntax has no `update <t> as <x>` form, so no
+  // stored body could name it anyway.
   const genTopoOrder = tableReference.tableSchema.generatedColumnTopoOrder ?? [];
   for (const colIdx of genTopoOrder) {
     const col = tableReference.tableSchema.columns[colIdx];

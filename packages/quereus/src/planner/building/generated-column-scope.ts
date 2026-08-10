@@ -1,4 +1,6 @@
 import type * as AST from '../../parser/ast.js';
+import { quereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { Attribute, ScalarPlanNode } from '../nodes/plan-node.js';
@@ -50,9 +52,8 @@ import { columnSchemaToScalarType } from '../type-utils.js';
  * capture the name would make a currently-working backfill fail); and the
  * schema-time analysis already rejects any bare name in a generated body that is
  * not a column of the table, so a generated body can only ever *collide* with a
- * context variable, never usefully name one. Because no context symbols are
- * registered, {@link RegisteredScope.registerSymbol} cannot see a duplicate key
- * here. See docs/sql-ddl.md § Generated Columns.
+ * context variable, never usefully name one. See docs/sql-ddl.md § Generated
+ * Columns.
  */
 export function buildGeneratedColumnExpr(
 	ctx: PlanningContext,
@@ -90,9 +91,25 @@ export function buildGeneratedColumnExpr(
 	}
 
 	const scope = new RegisteredScope(ctx.scope);
+	// NOTE: a column whose quoted name contains a dot (`"new.a"` beside a column `a`)
+	// makes the `new.` alias key collide with the bare key, and `registerSymbol`
+	// rejects the duplicate — so every write to such a table fails to plan. Pre-exists
+	// this builder on the CHECK (`constraint-builder.ts`) and `do update` SET scopes,
+	// which key the same flat `<qualifier>.<name>` string namespace; tracked as
+	// `bug-scope-symbol-keys-collide-with-dotted-column-names`. Do not paper over it
+	// here — a local skip would silently pick one of the two columns.
 	tableSchema.columns.forEach((column, columnIndex) => {
 		const attr = rowAttributes[columnIndex];
-		if (!attr) return;
+		if (!attr) {
+			// Every caller derives its row from `tableSchema.columns`, so a short array
+			// is a caller bug. Failing loudly beats registering nothing: the missing
+			// column name would fall through to the enclosing scope and bind whatever
+			// happens to be there.
+			quereusError(
+				`Internal: generated column '${columnName}' on '${tableSchema.name}' has no row attribute for column '${column.name}' (index ${columnIndex}); row supplies ${rowAttributes.length} of ${tableSchema.columns.length}`,
+				StatusCode.INTERNAL,
+			);
+		}
 		// Resolve against the column's DECLARED type (which carries its declared
 		// collation), so a generated expression comparing text resolves the same
 		// collation a read-path query and a CHECK would — the row attribute's type

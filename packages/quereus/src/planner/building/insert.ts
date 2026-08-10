@@ -296,9 +296,12 @@ function resolveConflictTargetEnforcement(
 
 /**
  * Register the conflicting row's columns on `scope`, under both the bare name and
- * the `<table>.<name>` qualified form. Shared by the DO UPDATE SET scope (where
- * unqualified names mean the existing row) and the generated-column recompute
- * scope, which sees the same attributes but none of the `new.` / `excluded.` ones.
+ * the `<table>.<name>` qualified form. Serves the DO UPDATE SET scope, where
+ * unqualified names mean the existing row — user-written SQL, which may name the
+ * target however the statement spells it. The generated-column recompute reads the
+ * same attributes but builds its own scope in {@link buildGeneratedColumnExpr}: a
+ * stored body must accept the same spellings at every write site, not the ones this
+ * statement happens to offer.
  */
 function registerExistingRowColumns(
 	scope: RegisteredScope,

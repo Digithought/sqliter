@@ -329,3 +329,33 @@ select id, a, g from t_spell_ctx order by id;
 → [{"id":1,"a":3,"g":4}]
 
 drop table t_spell_ctx;
+
+-- --- the row's columns resolve at their DECLARED type, so a declared COLLATE
+-- --- applies inside the body — identically at all three write sites ---
+-- The shared builder resolves each column reference against
+-- `columnSchemaToScalarType(column)`, which carries the column's declared
+-- collation, rather than against the type of whatever expression produced the
+-- row attribute. A `collate nocase` column therefore compares case-insensitively
+-- inside a generated body, the same way it does in a CHECK and on the read path.
+
+create table t_spell_coll (id integer primary key, a text collate nocase,
+	g integer generated always as (case when a = 'ABC' then 1 else 0 end) stored);
+
+insert into t_spell_coll (id, a) values (1, 'abc');
+select id, a, g from t_spell_coll order by id;
+→ [{"id":1,"a":"abc","g":1}]
+
+update t_spell_coll set a = 'AbC' where id = 1;
+select id, g from t_spell_coll order by id;
+→ [{"id":1,"g":1}]
+
+insert into t_spell_coll (id, a) values (1, 'zzz') on conflict (id) do update set a = 'ABc';
+select id, g from t_spell_coll order by id;
+→ [{"id":1,"g":1}]
+
+-- a value the collation does NOT equate still yields 0, so the arm is not vacuous
+update t_spell_coll set a = 'abd' where id = 1;
+select id, g from t_spell_coll order by id;
+→ [{"id":1,"g":0}]
+
+drop table t_spell_coll;

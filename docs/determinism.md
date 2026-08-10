@@ -176,8 +176,11 @@ commit.
 `ALTER TABLE ADD COLUMN … GENERATED ALWAYS AS (…)` takes that **same** per-row route:
 `buildAddColumnBackfill` sources its scalar from the `generated` clause when there is
 one, so a generated column added to a populated table is computed for the existing
-rows. Three differences from the DEFAULT arm, all of them forced by a generated column
-having no stored `defaultValue`:
+rows. The generated arm does not build its own scope: it hands the body to
+`planner/building/generated-column-scope.ts`, the one builder every write site shares
+(see below), so the ALTER accepts exactly the spellings a later write accepts. The
+DEFAULT arm keeps `buildRowDefaultScope`. Beyond that, three differences from the
+DEFAULT arm, all of them forced by a generated column having no stored `defaultValue`:
 
 - It is **never** folded to a bulk-written literal — even `generated always as (2)` is
   evaluated per row, since there is no `defaultValue` for the module to write.
@@ -279,8 +282,11 @@ accepted afterwards. Consequences of routing through the module:
 - CHECK constraints validated when building constraint checks (full
   column-scope resolution happens here)
 - `GENERATED ALWAYS AS` expressions validated when building the generated
-  column projection (INSERT), assignment chain (UPDATE), or ADD COLUMN backfill
-  (`ALTER TABLE ADD COLUMN`, at plan-build — see above)
+  column projection (INSERT), the `ON CONFLICT ... DO UPDATE` recompute,
+  the assignment chain (UPDATE), or the ADD COLUMN backfill (`ALTER TABLE ADD
+  COLUMN`, at plan-build — see above). All four compile the stored body through
+  `planner/building/generated-column-scope.ts`, so the determinism check — and
+  the set of accepted column spellings — is one decision, not four
 
 **ALTER TABLE ADD CONSTRAINT:**
 - Validation deferred to first INSERT/UPDATE (constraints may reference NEW/OLD)
