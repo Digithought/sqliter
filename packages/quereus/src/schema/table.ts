@@ -12,7 +12,7 @@ import { createLogger } from '../common/logger.js';
 import { inferType } from '../types/registry.js';
 import type { LogicalType } from '../types/logical-type.js';
 import type { TableStatistics } from '../planner/stats/catalog-stats.js';
-import { collectGeneratedColumnRefs } from './generated-column-refs.js';
+import { collectGeneratedColumnRefs, type GeneratedColumnRef } from './generated-column-refs.js';
 import type { ResolveColumnInSource } from './rename/shared.js';
 
 const log = createLogger('schema:table');
@@ -1462,6 +1462,23 @@ function resolveWithInFlightColumns(
 }
 
 /**
+ * Shared rejection for a qualified generated-column reference nothing binds
+ * (`RefBinding` `'unbound'`) — thrown identically by both authoring surfaces
+ * so a declaration cannot be accepted by one and rejected by the other. See
+ * `RefBinding` in `./generated-column-refs.ts`.
+ */
+function unboundQualifierError(
+	ref: GeneratedColumnRef,
+	generatedColumnName: string,
+	tableName: string,
+): QuereusError {
+	return new QuereusError(
+		`'${ref.originalQualifier}.${ref.originalName}' referenced by generated column '${generatedColumnName}' in table '${tableName}' binds nothing: a generated expression computes from the row being written, so it may only name this table's own columns (bare, '${tableName}.', or 'new.') or columns of a source it selects from`,
+		StatusCode.ERROR,
+	);
+}
+
+/**
  * For each generated column, collects the column indices in this table that
  * its expression references, via the scope-aware collector
  * (`./generated-column-refs.ts`) — a name bound by a FROM clause inside the
@@ -1473,6 +1490,8 @@ function resolveWithInFlightColumns(
  *   unknown `'identifier'` is ignored (it may legitimately be a function or
  *   mutation-context variable).
  * - `'foreign'` binding: ignored entirely.
+ * - `'unbound'` binding (a qualified reference nothing binds): rejected —
+ *   there is nothing for it to resolve against at write time either.
  * - `'unknown'` binding (an opaque subquery / function / CTE source
  *   intervenes): a known column records an edge (a missing edge would compute
  *   a generated column before its dependency and silently write NULL);
@@ -1495,6 +1514,7 @@ export function extractGeneratedColumnDependencies(
 
 		const deps = new Set<number>();
 		for (const ref of collectGeneratedColumnRefs(col.generatedExpr, tableName, schemaName, resolve)) {
+			if (ref.binding === 'unbound') throw unboundQualifierError(ref, col.name, tableName);
 			if (ref.binding === 'foreign') continue;
 			const refIdx = columnIndexMap.get(ref.name);
 			if (refIdx !== undefined) {
@@ -1551,6 +1571,7 @@ export function validateAddColumnGeneratedRefs(
 		resolveColumnInSource, schemaName, tableName, columnIndexMap, newColLower);
 
 	for (const ref of collectGeneratedColumnRefs(expr, tableName, schemaName, resolve)) {
+		if (ref.binding === 'unbound') throw unboundQualifierError(ref, newColumnName, tableName);
 		if (ref.binding === 'foreign') continue;
 		// Both `'own'` and `'unknown'` bindings of the new column's own name are a
 		// self-cycle here: the emitter's re-analysis records a dependency edge for

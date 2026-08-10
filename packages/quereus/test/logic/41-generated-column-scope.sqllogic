@@ -158,10 +158,10 @@ alter table sq3 drop column a;
 drop table sq3;
 
 -- A qualifier naming ANOTHER schema is not a self reference even though the bare
--- names collide — no dependency edge, so the drop is allowed.
+-- names collide — and nothing else binds it either, so CREATE TABLE rejects the
+-- declaration up front (see 41-generated-column-errors.sqllogic § 4).
 create table sqm (id integer primary key, a integer, g integer generated always as ("temp".sqm.a + 1));
-alter table sqm drop column a;
-drop table sqm;
+-- error: binds nothing
 
 -- ===================================
 -- 9. The name a subquery's FROM binds is a reference to THAT table, so the

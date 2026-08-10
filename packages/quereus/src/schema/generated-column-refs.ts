@@ -20,6 +20,11 @@ import {
 // `ResolveColumnInSource`; subquery / function / CTE sources are opaque and
 // make the answer undecidable rather than wrong.
 //
+// A qualified reference whose qualifier no frame binds is `'unbound'`: nothing
+// in the body, and nothing at write time, can ever resolve it. Both consumers
+// reject `'unbound'` at declaration time rather than deferring to a write-time
+// failure — see `unboundQualifierError` in `./table.ts`.
+//
 // NOTE: residual — a reference to an own-column NAME reachable only through
 // an opaque source (e.g. a CTE shadowing the owning table) classifies as
 // 'unknown', and the consumers record a dependency edge for it. That edge is
@@ -37,6 +42,10 @@ export type RefBinding =
 	/** Binds something else: an analysable inner FROM source exposes the name, or the
 	 *  qualifier resolves to another object. */
 	| 'foreign'
+	/** Qualified, and NOTHING binds the qualifier — no inner FROM, and it does not
+	 *  name the owning table (or `new`). There is nothing for it to resolve against
+	 *  at write time either; rejected at declaration time by both consumers. */
+	| 'unbound'
 	/** Cannot be decided: an intervening frame holds a subquery / function / CTE source. */
 	| 'unknown';
 
@@ -45,6 +54,9 @@ export interface GeneratedColumnRef {
 	readonly name: string;
 	/** Name as written (original casing), for error messages. */
 	readonly originalName: string;
+	/** Qualifier as written (original casing), e.g. `d` or `s.d`, when the reference
+	 *  carried one — used to report `'unbound'` errors. */
+	readonly originalQualifier?: string;
 	/** `'column'` refs may raise "not found"; `'identifier'` refs never do (a bare
 	 *  identifier may legitimately be a function or a mutation-context variable). */
 	readonly shape: 'column' | 'identifier';
@@ -112,22 +124,26 @@ function classifyUnqualified(state: CollectState, nameLower: string): RefBinding
  * bare table name, or CTE name) resolves there. An unbound bare `new` names
  * the row image of the table being defined (the same rule `matchesRowImage`
  * applies in `./rename/column-rename.ts` — `new` is not a reserved word, so a
- * frame binding it wins first); an unbound bare `old` names nothing in a
- * generated body (there is no old row to compute from). Otherwise the
- * qualifier must name the owning table — schema-qualified spellings must name
- * the owning schema exactly, matching the self-qualifier strip's rule.
+ * frame binding it wins first); a bare `old`, or any other qualifier, must
+ * name the owning table — schema-qualified spellings must name the owning
+ * schema exactly, matching the self-qualifier strip's rule. Anything else is
+ * `'unbound'` (nothing binds it) unless an opaque frame was crossed on the
+ * way out, in which case the walk cannot tell and defers to `'unknown'`.
  */
 function classifyQualified(state: CollectState, col: AST.ColumnExpr): RefBinding {
 	const qualifier = col.table!.toLowerCase();
+	let opaque = false;
 	for (let i = state.stack.length - 1; i >= 1; i--) {
 		if (state.stack[i].bound.has(qualifier)) return 'foreign';
+		if (state.stack[i].hasOpaque) opaque = true;
 	}
 	if (col.schema === undefined) {
 		if (qualifier === 'new') return 'own';
-		if (qualifier === 'old') return 'foreign';
-		return qualifier === state.tableName ? 'own' : 'foreign';
+		if (qualifier === state.tableName) return 'own';
+	} else if (qualifier === state.tableName && eq(col.schema, state.schemaName)) {
+		return 'own';
 	}
-	return qualifier === state.tableName && eq(col.schema, state.schemaName) ? 'own' : 'foreign';
+	return opaque ? 'unknown' : 'unbound';
 }
 
 function recordColumnRef(col: AST.ColumnExpr, state: CollectState): void {
@@ -135,7 +151,13 @@ function recordColumnRef(col: AST.ColumnExpr, state: CollectState): void {
 	const binding = col.table === undefined
 		? classifyUnqualified(state, nameLower)
 		: classifyQualified(state, col);
-	state.refs.push({ name: nameLower, originalName: col.name, shape: 'column', binding });
+	state.refs.push({
+		name: nameLower,
+		originalName: col.name,
+		originalQualifier: col.schema !== undefined ? `${col.schema}.${col.table}` : col.table,
+		shape: 'column',
+		binding,
+	});
 }
 
 function recordIdentifierRef(ident: AST.IdentifierExpr, state: CollectState): void {

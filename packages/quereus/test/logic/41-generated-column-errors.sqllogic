@@ -50,40 +50,82 @@ select id, a from t_drop where id = 1;
 drop table t_drop;
 
 -- ===================================
--- 4. `old.<col>` rejected in a generated expression, at every write site
+-- 4. A generated expression whose qualifier binds nothing is rejected at
+--    DECLARATION time, identically by CREATE TABLE and ALTER TABLE ADD COLUMN
 --
--- A generated value is computed from the row being WRITTEN; there is no old row
--- to compute it from. The bare, `<table>.`, `<schema>.<table>.` and `new.`
--- spellings all resolve (see 41-generated-columns.sqllogic); `old.` resolves
--- nowhere, and reports the same thing whichever statement compiles the body.
+-- A generated value is computed from the row being WRITTEN. The bare,
+-- `<table>.`, `<schema>.<table>.` and `new.` spellings all resolve to that row
+-- (see 41-generated-columns.sqllogic). `old.<col>` never resolves — there is
+-- no old row to compute from — and neither does any other qualifier that no
+-- inner FROM in the body binds. Both are rejected when the table is declared,
+-- not deferred to the first write.
 -- ===================================
 
+create table d (k integer primary key, v integer);
+insert into d values (1, 100);
+
+-- 4a. `old.<col>`, at CREATE TABLE — rejected, table not created
 create table t_old (id integer primary key, a integer,
 	g integer generated always as (old.a + 1) stored);
-
--- INSERT row expansion
-insert into t_old (id, a) values (1, 3);
--- error: old.a isn't a column
-
--- `on conflict ... do update` recompute
-insert into t_old (id, a) values (1, 3) on conflict (id) do update set a = 1;
--- error: old.a isn't a column
-
--- UPDATE recompute (rejected at plan time, so no rows are needed)
-update t_old set a = 1 where id = 1;
--- error: old.a isn't a column
+-- error: binds nothing
 
 drop table t_old;
+-- error: not found in schema
 
--- `alter table ... add column` backfill
+-- 4b. `old.<col>`, at ALTER TABLE ADD COLUMN — same rejection, table untouched
 create table t_old_alter (id integer primary key, a integer);
 insert into t_old_alter values (1, 3);
 
 alter table t_old_alter add column g integer generated always as (old.a + 1);
--- error: old.a isn't a column
+-- error: binds nothing
 
--- the rejected ALTER left the table alone
 select id, a from t_old_alter order by id;
 → [{"id":1,"a":3}]
 
 drop table t_old_alter;
+
+-- 4c. A qualifier naming a real table, but with no FROM in the body that
+--     selects from it — rejected at CREATE TABLE, table not created
+create table t_unbound (id integer primary key, a integer,
+	x integer generated always as (d.v + 1) stored);
+-- error: binds nothing
+
+drop table t_unbound;
+-- error: not found in schema
+
+-- 4d. Same qualifier, at ALTER TABLE ADD COLUMN — same rejection, table untouched
+create table t_unbound_alter (id integer primary key, a integer);
+insert into t_unbound_alter values (1, 3);
+
+alter table t_unbound_alter add column x integer generated always as (d.v + 1);
+-- error: binds nothing
+
+select id, a from t_unbound_alter order by id;
+→ [{"id":1,"a":3}]
+
+drop table t_unbound_alter;
+
+-- 4e. A qualifier bound inside the subquery — `d` — is fine; a qualifier the
+--     subquery never binds — `z` — is not, even though a subquery intervenes
+create table t_unbound_sub (id integer primary key, a integer,
+	x integer generated always as
+		((select z.v from d where d.k = a limit 1)) stored);
+-- error: binds nothing
+
+drop table t_unbound_sub;
+-- error: not found in schema
+
+-- 4f. Regression guard: a body that legitimately selects from another table
+--     still creates, inserts, and reads back — a bound qualifier stays accepted
+create table t_bound (id integer primary key, a integer,
+	x integer generated always as
+		((select d.v from d where d.k = a limit 1)) stored);
+
+insert into t_bound (id, a) values (1, 1);
+
+select id, a, x from t_bound where id = 1;
+→ [{"id":1,"a":1,"x":100}]
+
+drop table t_bound;
+
+drop table d;
