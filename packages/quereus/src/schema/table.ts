@@ -1037,6 +1037,45 @@ export function resolveReferencedColumns(
 }
 
 /**
+ * {@link resolveReferencedColumns} plus the arity check every ENFORCEMENT site
+ * needs: a FK whose child column count does not match the resolved parent key
+ * cannot be checked at all, so the statement must fail rather than quietly skip
+ * the constraint.
+ *
+ * The gap this closes is the `references <Parent>` form with no parent column
+ * list: the declaration builders (`schema/constraint-builder.ts`
+ * `buildForeignKeyConstraintSchema`, `SchemaManager.extractForeignKeys`) compare
+ * counts only when a parent column list is written, and the defaulted form
+ * resolves to the parent's primary key — which may not exist yet (forward
+ * references are legal, see docs/sql-ddl.md § Order Independence) and can change
+ * arity later. So the arity is only knowable at enforcement time, and every
+ * enforcement site routes through here.
+ *
+ * Introspection / optimization callers (key-utils, ind-utils, lens FK
+ * discovery, `foreign_key_info`) keep using {@link resolveReferencedColumns} —
+ * a malformed FK must not make a read query fail.
+ */
+export function resolveReferencedColumnsForEnforcement(
+	fk: ForeignKeyConstraintSchema,
+	parentSchema: TableSchema,
+	childSchema: TableSchema,
+): number[] {
+	const parentColIndices = resolveReferencedColumns(fk, parentSchema);
+	if (parentColIndices.length === fk.columns.length) return parentColIndices;
+
+	const fkName = fk.name ?? `_fk_${childSchema.name}`;
+	const child = `${childSchema.schemaName}.${childSchema.name}`;
+	const parent = `${parentSchema.schemaName}.${parentSchema.name}`;
+	const target = (fk.referencedColumnNames && fk.referencedColumnNames.length > 0)
+		? `${parentColIndices.length} column(s) of '${parent}'`
+		: `the primary key of '${parent}', which has ${parentColIndices.length} column(s)`;
+	throw new QuereusError(
+		`Foreign key '${fkName}' on table '${child}': ${fk.columns.length} column(s) reference ${target}.`,
+		StatusCode.ERROR,
+	);
+}
+
+/**
  * Represents a UNIQUE constraint on one or more columns (beyond the primary key)
  */
 export interface UniqueConstraintSchema {

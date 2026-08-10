@@ -19,6 +19,15 @@ export interface ConstraintCheck {
   /** For 'fk-parent' UPDATE checks: parent-table column indices the FK references.
    *  When set, the runtime can skip the check when none of these indices changed. */
   referencedColumnIndices?: ReadonlyArray<number>;
+  /**
+   * Verbatim violation text for a SYNTHESIZED check whose expression would
+   * otherwise be reported as-is and mean nothing to the user (nobody wrote it).
+   * When set, `runtime/row-constraints.ts` reports this instead of deriving
+   * `CHECK constraint failed: <name> (<expr>)` — on both the immediate and the
+   * deferred (commit-time) path. Unset for user-written CHECKs, which keep the
+   * derived message.
+   */
+  violationMessage?: string;
 }
 
 /**

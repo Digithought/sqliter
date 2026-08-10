@@ -1042,6 +1042,13 @@ to a same-schema FK). All reference actions (RESTRICT / CASCADE / SET NULL /
 SET DEFAULT) and `foreign_key_info()`'s `referenced_schema` column work the same
 across schemas.
 
+<a id="unqualified-parent-binding"></a>
+Because an unqualified parent binds to the **child's own schema**, a table in one
+schema that names a parent living in another resolves to a table that is not
+there — the foreign key is declared but can never be satisfied. The remedy is to
+qualify the parent; the missing-parent diagnostic below names the schema it
+looked in so this case is visible from the error alone.
+
 **Reference Actions:**
 ```sql
 [on delete action] [on update action]
@@ -1067,6 +1074,28 @@ When `pragma foreign_keys = on` (the default):
 On UPDATE, all three propagating actions (CASCADE / SET NULL / SET DEFAULT) apply the same short-circuit as the RESTRICT check above: if the update leaves every parent column the FK references at its old value, the action does not fire and child rows are not written at all — an update to an unrelated parent column never touches, re-points, or emits a data-change event for the children.
 
 Cascade cycle detection prevents infinite recursion when cascading actions chain across multiple tables.
+
+**When a foreign key cannot be enforced:**
+
+Parent resolution happens **per plan**, not once at `CREATE TABLE` — that is what makes forward references (§ *Order Independence*) work, and it means a key can become unenforceable long after it was declared. Two cases, and what each reports:
+
+- **The parent table does not exist** (never created, dropped since, or — see the note under *Syntax* above — named without a qualifier from a child in another schema). MATCH SIMPLE still applies: a row with any NULL FK column is accepted. Every other row is rejected with
+
+  ```
+  CHECK constraint failed: <fk name> — referenced table '<schema>.<parent>' does not exist
+  ```
+
+  The schema in that message is the one the lookup used, so an unqualified cross-schema reference is diagnosable from the error: qualify the parent. This is *not* a `CREATE TABLE` refusal — declaring a child before its parent stays legal.
+
+- **The child's column count does not match the parent key.** Writing an explicit parent column list of the wrong length (`references p(a, b)` from a one-column key) is refused at declaration time. The defaulted form, `references <parent>` with no column list, resolves to the parent's **primary key** — whose arity is not knowable at declaration time — so a mismatch there is raised at the enforcement seam instead, failing the statement:
+
+  ```
+  Foreign key '<name>' on table '<schema>.<child>': <n> column(s) reference the primary key of '<schema>.<parent>', which has <m> column(s).
+  ```
+
+  Both the child-side existence check and every parent-side path (RESTRICT, CASCADE / SET NULL / SET DEFAULT) raise it, so an unenforceable key never looks enforced. Read queries and `foreign_key_info()` are unaffected.
+
+Neither case fires while `pragma foreign_keys = off` — no checks are built at all.
 
 **Examples:**
 ```sql

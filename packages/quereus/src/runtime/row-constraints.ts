@@ -44,6 +44,9 @@ export interface ConstraintMetadataEntry {
 	kind: 'check' | 'fk-child' | 'fk-parent';
 	/** For 'fk-parent' UPDATE checks: parent-table column indices the FK references. */
 	referencedColumnIndices?: ReadonlyArray<number>;
+	/** Verbatim violation text carried from a synthesized {@link ConstraintCheck}
+	 *  (see {@link constraintViolationMessage}). */
+	violationMessage?: string;
 }
 
 export interface NotNullDefaultRuntime {
@@ -80,8 +83,14 @@ export interface RowConstraintResult {
  * "CHECK constraint failed" prefix for backward compatibility with existing
  * assertions; downstream consumers identify FK by name. The expression text is
  * appended as a hint only when short enough to stay readable.
+ *
+ * A synthesized check may override the whole text via `violationMessage` — the
+ * expression hint is engine-authored there, so quoting it back at the user
+ * explains nothing (see the absent-parent branch of `buildChildSideFKChecks`).
+ * Overrides keep the shared prefix themselves.
  */
 function constraintViolationMessage(metadata: ConstraintMetadataEntry): string {
+	if (metadata.violationMessage) return metadata.violationMessage;
 	const exprHint = metadata.constraintExpr.length <= 60 ? ` (${metadata.constraintExpr})` : '';
 	return `CHECK constraint failed: ${metadata.constraintName}${exprHint}`;
 }
@@ -145,6 +154,7 @@ export function buildConstraintMetadata(
 		contextDescriptor,
 		kind: check.kind ?? 'check',
 		referencedColumnIndices: check.referencedColumnIndices,
+		violationMessage: check.violationMessage,
 	}));
 }
 

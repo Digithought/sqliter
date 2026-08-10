@@ -1,0 +1,270 @@
+-- 41.16-fk-unenforceable.sqllogic - a FOREIGN KEY that cannot be enforced must SAY SO
+--
+-- Two ways a declared foreign key ends up unenforceable, and what the engine owes the
+-- user in each case:
+--
+--  A. the parent table does not exist. MATCH SIMPLE still admits a row whose FK columns
+--     are NULL, and every other row is rejected — the behaviour is right and unchanged.
+--     What changes is the MESSAGE: it used to quote the engine-synthesized null-guard
+--     expression (`_fk_x_c (NEW.c is null or 0)`), which named nothing the user wrote.
+--     It now names the missing table, qualified by the schema it was looked up in —
+--     which is what makes the cross-schema mistake below diagnosable at all.
+--
+--  B. the child's FK column count does not line up with the parent key it references.
+--     Both FK check builders used to `continue` past such a key, leaving it declared but
+--     NOT ENFORCED: orphans accepted on the child, RESTRICT silently bypassed on the
+--     parent. The statement now fails instead.
+
+pragma foreign_keys = true;
+
+-- ===================================
+-- A1. missing parent — the error names the table, not the synthesized expression
+-- ===================================
+
+create table ghost_c (id integer primary key, c integer null references ghost_parent(refd));
+
+insert into ghost_c values (1, 5);
+-- error: CHECK constraint failed: _fk_ghost_c_c — referenced table 'main.ghost_parent' does not exist
+
+select count(*) as n from ghost_c;
+→ [{"n":0}]
+
+-- MATCH SIMPLE is untouched: a NULL FK column still satisfies the constraint
+insert into ghost_c values (2, null);
+
+select id, c from ghost_c order by id;
+→ [{"id":2,"c":null}]
+
+-- the UPDATE path reports the same thing
+update ghost_c set c = 7 where id = 2;
+-- error: referenced table 'main.ghost_parent' does not exist
+
+-- ===================================
+-- A2. composite FK, MATCH SIMPLE — one NULL column is enough to admit the row
+-- ===================================
+
+create table ghost_c2 (id integer primary key, x integer null, y integer null,
+	foreign key (x, y) references ghost_parent2(a, b));
+
+insert into ghost_c2 values (1, 1, null);
+insert into ghost_c2 values (2, null, null);
+
+select id, x, y from ghost_c2 order by id;
+→ [{"id":1,"x":1,"y":null},{"id":2,"x":null,"y":null}]
+
+-- both non-NULL: rejected, naming the missing parent
+insert into ghost_c2 values (3, 1, 2);
+-- error: referenced table 'main.ghost_parent2' does not exist
+
+-- ===================================
+-- A3. the immediate and the deferred report paths must agree
+--
+-- A child-side FK check is EXISTS-shaped, so it auto-defers to COMMIT under the default
+-- ABORT resolution; `or fail` forces evaluation at row time instead. Both must produce
+-- the same text (they share `constraintViolationMessage`).
+-- ===================================
+
+-- deferred: the failure surfaces at COMMIT of an explicit transaction
+begin;
+insert into ghost_c values (10, 5);
+commit;
+-- error: CHECK constraint failed: _fk_ghost_c_c — referenced table 'main.ghost_parent' does not exist
+
+select count(*) as n from ghost_c;
+→ [{"n":1}]
+
+-- immediate: `or fail` evaluates at row time
+insert or fail into ghost_c values (11, 5);
+-- error: CHECK constraint failed: _fk_ghost_c_c — referenced table 'main.ghost_parent' does not exist
+
+select count(*) as n from ghost_c;
+→ [{"n":1}]
+
+-- ===================================
+-- A4. `pragma foreign_keys = off` builds no checks at all — a missing parent must not
+--     start raising just because the message got better
+-- ===================================
+
+pragma foreign_keys = false;
+
+insert into ghost_c values (20, 5);
+
+select id, c from ghost_c order by id;
+→ [{"id":2,"c":null},{"id":20,"c":5}]
+
+delete from ghost_c where id = 20;
+
+pragma foreign_keys = true;
+
+drop table ghost_c2;
+drop table ghost_c;
+
+-- ===================================
+-- A5. resolution is PER PLAN, not cached at CREATE — forward references stay legal
+--
+-- `create table child` naming a not-yet-declared parent is documented as legal
+-- (docs/sql-ddl.md § Order Independence): restore-from-dump and mutually-referencing
+-- tables depend on it. So the child below must start enforcing the moment the parent
+-- appears, with no DDL on the child itself.
+-- ===================================
+
+create table fwd_c (id integer primary key, p integer null references fwd_p(pid));
+
+-- before the parent exists: rejected, naming it
+insert into fwd_c values (1, 1);
+-- error: referenced table 'main.fwd_p' does not exist
+
+create table fwd_p (pid integer primary key);
+insert into fwd_p values (1);
+
+-- now the very same insert succeeds — the check resolved on the LATER plan
+insert into fwd_c values (1, 1);
+
+select id, p from fwd_c order by id;
+→ [{"id":1,"p":1}]
+
+-- and a genuine orphan still fails with the ordinary FK message (parent exists)
+insert into fwd_c values (2, 99);
+-- error: CHECK constraint failed: _fk_fwd_c_p
+
+-- ===================================
+-- A6. …and the other direction: DROP the parent and the child goes back to reporting
+--     the missing table. Proves nothing was cached from creation.
+-- ===================================
+
+delete from fwd_c;
+drop table fwd_p;
+
+insert into fwd_c values (3, 1);
+-- error: referenced table 'main.fwd_p' does not exist
+
+drop table fwd_c;
+
+-- ===================================
+-- A7. cross-schema: an UNQUALIFIED parent name binds to the CHILD's OWN schema
+--
+-- That rule is deliberate and matches SQLite, where a foreign key cannot cross
+-- databases (docs/sql-ddl.md § FOREIGN KEY). The failure mode it produces is nasty:
+-- the parent plainly exists — in `main` — and the child in another schema silently
+-- refuses every row. Naming the schema in the message is what makes it diagnosable,
+-- and it points straight at the remedy: qualify the parent.
+-- ===================================
+
+declare schema xs {}
+apply schema xs;
+-- run
+
+create table main.xs_parent (pid integer primary key);
+insert into main.xs_parent values (1);
+
+-- unqualified `xs_parent` inside a table declared in `xs` means `xs.xs_parent`
+create table xs.xs_child (id integer primary key, p integer null references xs_parent(pid));
+
+insert into xs.xs_child values (1, 1);
+-- error: referenced table 'xs.xs_parent' does not exist
+
+-- qualifying the parent is the fix, and it works
+create table xs.xs_child2 (id integer primary key, p integer null references main.xs_parent(pid));
+
+insert into xs.xs_child2 values (1, 1);
+
+select id, p from xs.xs_child2 order by id;
+→ [{"id":1,"p":1}]
+
+-- and it is a real check, not a resolution that quietly stopped enforcing
+insert into xs.xs_child2 values (2, 99);
+-- error: CHECK constraint failed: _fk_xs_child2_p
+
+drop table xs.xs_child2;
+drop table xs.xs_child;
+drop table main.xs_parent;
+
+-- ===================================
+-- B1. column-count mismatch, child side — `references <parent>` with no column list
+--     defaults to the parent's PRIMARY KEY, which may have a different arity
+--
+-- The written-parent-column form (`references mp(a, b)`) is already refused at CREATE
+-- (41-fk-extended-targets.sqllogic case 5). The defaulted form cannot be: the parent may
+-- not exist yet, and its primary key can change afterwards. So it is caught at the
+-- enforcement seam instead — the statement fails rather than the key going unenforced.
+-- ===================================
+
+create table mm_p (a integer not null, b integer not null, primary key (a, b));
+create table mm_c (id integer primary key, x integer null references mm_p);
+
+insert into mm_p values (1, 2);
+
+insert into mm_c values (1, 1);
+-- error: Foreign key '_fk_mm_c_x' on table 'main.mm_c': 1 column(s) reference the primary key of 'main.mm_p', which has 2 column(s).
+
+select count(*) as n from mm_c;
+→ [{"n":0}]
+
+-- ===================================
+-- B2. …and the parent side. This is the part that used to be silent: a RESTRICT delete
+--     against the parent simply went through, because the parent-side builder skipped
+--     the malformed key exactly as the child-side one did.
+-- ===================================
+
+delete from mm_p where a = 1;
+-- error: Foreign key '_fk_mm_c_x' on table 'main.mm_c': 1 column(s) reference the primary key of 'main.mm_p', which has 2 column(s).
+
+select count(*) as n from mm_p;
+→ [{"n":1}]
+
+-- the parent-side UPDATE path too
+update mm_p set b = 3 where a = 1;
+-- error: Foreign key '_fk_mm_c_x' on table 'main.mm_c'
+
+select a, b from mm_p order by a;
+→ [{"a":1,"b":2}]
+
+-- reads are unaffected — a malformed key must not break introspection or queries
+select count(*) as n from mm_p join mm_c on mm_c.x = mm_p.a;
+→ [{"n":0}]
+
+drop table mm_c;
+drop table mm_p;
+
+-- ===================================
+-- B3. the correctly-shaped composite case still works end to end, so B1/B2 are not
+--     rejecting every defaulted `references <parent>`
+-- ===================================
+
+create table ok_p (a integer not null, b integer not null, primary key (a, b));
+create table ok_c (id integer primary key, x integer null, y integer null, foreign key (x, y) references ok_p);
+
+insert into ok_p values (1, 2);
+insert into ok_c values (1, 1, 2);
+
+select id, x, y from ok_c order by id;
+→ [{"id":1,"x":1,"y":2}]
+
+insert into ok_c values (2, 9, 9);
+-- error: CHECK constraint failed: _fk_ok_c_x_y
+
+-- RESTRICT is genuinely enforced on the parent
+delete from ok_p where a = 1;
+-- error: FOREIGN KEY constraint failed
+
+select a, b from ok_p order by a;
+→ [{"a":1,"b":2}]
+
+drop table ok_c;
+drop table ok_p;
+
+-- single-column defaulted `references <parent>` — the ordinary shape
+create table ok1_p (pid integer primary key);
+create table ok1_c (id integer primary key, p integer null references ok1_p);
+
+insert into ok1_p values (1);
+insert into ok1_c values (1, 1);
+
+select id, p from ok1_c order by id;
+→ [{"id":1,"p":1}]
+
+insert into ok1_c values (2, 99);
+-- error: CHECK constraint failed: _fk_ok1_c_p
+
+drop table ok1_c;
+drop table ok1_p;

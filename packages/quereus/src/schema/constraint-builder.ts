@@ -17,7 +17,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
-import { resolveReferencedColumns, opsToMask, disambiguateAutoConstraintName } from './table.js';
+import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, disambiguateAutoConstraintName } from './table.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -421,13 +421,9 @@ export async function validateForeignKeyOverExistingRows(
 		// Parent absent: any fully-non-NULL child row references a non-existent parent.
 		sql = `select 1 from ${childRef} as ${childAlias} where ${notNullChain} limit 1`;
 	} else {
-		const parentColIndices = resolveReferencedColumns(fk, parentTable);
-		if (parentColIndices.length !== fk.columns.length) {
-			throw new QuereusError(
-				`FK constraint '${fk.name ?? `_fk_${childSchema.name}`}' on table '${childSchema.name}': child column count (${fk.columns.length}) does not match parent column count (${parentColIndices.length})`,
-				StatusCode.ERROR,
-			);
-		}
+		// Shared with the plan-time / runtime enforcement sites so one malformed FK
+		// reports one message wherever it is met.
+		const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childSchema);
 		const parentRef = qualifyRelation(parentTable.schemaName, parentTable.name);
 		const parentAlias = '_p';
 		// Aliases keep the correlation unambiguous even for a self-referencing FK

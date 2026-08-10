@@ -1,6 +1,6 @@
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from '../../schema/table.js';
-import { RowOpFlag, type RowOpMask, resolveReferencedColumns } from '../../schema/table.js';
+import { RowOpFlag, type RowOpMask, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import { ConflictResolution } from '../../common/constants.js';
 import type { Attribute, ScalarPlanNode } from '../nodes/plan-node.js';
@@ -218,9 +218,16 @@ export function buildChildSideFKChecks(
 			fk.referencedSchema,
 		);
 
+		const constraintName = fk.name ?? `_fk_${tableSchema.name}`;
+
 		let existsExpr: AST.Expression;
+		// Set only for the absent-parent fallback: the null-guard chain is engine-
+		// synthesized, so quoting it back as the failure hint tells the user nothing
+		// about WHY the row was rejected. Name the table that is missing instead.
+		let violationMessage: string | undefined;
 		if (!parentSchema) {
-			log(`FK '${fk.name}': parent table '${fk.referencedTable}' not found; emitting null-guards-only check`);
+			const parentQualified = `${fk.referencedSchema ?? tableSchema.schemaName}.${fk.referencedTable}`;
+			log(`FK '${fk.name}': parent table '${parentQualified}' not found; emitting null-guards-only check`);
 			const nullGuards: AST.UnaryExpr[] = fk.columns.map((childColIdx) => ({
 				type: 'unary',
 				operator: 'IS NULL',
@@ -230,12 +237,15 @@ export function buildChildSideFKChecks(
 				(acc, guard) => ({ type: 'binary', operator: 'OR', left: guard, right: acc } as AST.BinaryExpr),
 				{ type: 'literal', value: 0 } as AST.LiteralExpr,
 			);
+			// An unqualified parent name binds to the CHILD's own schema (docs/sql-ddl.md
+			// § FOREIGN KEY), so naming the schema is what makes a cross-schema mistake
+			// visible: the fix is to qualify the parent.
+			violationMessage = `CHECK constraint failed: ${constraintName} — referenced table `
+				+ `'${parentQualified}' does not exist`;
 		} else {
-			const parentColIndices = resolveReferencedColumns(fk, parentSchema);
-			if (parentColIndices.length !== fk.columns.length) {
-				log(`FK check skipped: column count mismatch for FK '${fk.name}'`);
-				continue;
-			}
+			// A count mismatch means the FK cannot be checked at all — raise rather
+			// than skip, so an unenforceable constraint never looks enforced.
+			const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentSchema, tableSchema);
 
 			// Synthesize EXISTS(SELECT 1 FROM parent WHERE parent.ref = NEW.fk)
 			existsExpr = synthesizeExistsCheck(fk, tableSchema, parentSchema, parentColIndices, 'new');
@@ -243,7 +253,7 @@ export function buildChildSideFKChecks(
 
 		// Build as a RowConstraintSchema so it integrates with existing infrastructure
 		const syntheticConstraint: RowConstraintSchema = {
-			name: fk.name ?? `_fk_${tableSchema.name}`,
+			name: constraintName,
 			expr: existsExpr,
 			operations: (RowOpFlag.INSERT | RowOpFlag.UPDATE) as RowOpMask,
 			deferrable: true,
@@ -303,6 +313,7 @@ export function buildChildSideFKChecks(
 				initiallyDeferred: true,
 				needsDeferred: true,
 				kind: 'fk-child',
+				violationMessage,
 			});
 		} finally {
 			if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(originalCurrentSchema);
@@ -357,8 +368,9 @@ export function buildParentSideFKChecks(
 		// rejected by the immediate plan-time NOT EXISTS).
 		if (suppressed.has(fk)) continue;
 
-		const parentColIndices = resolveReferencedColumns(fk, tableSchema);
-		if (parentColIndices.length !== fk.columns.length) continue;
+		// A count mismatch means this inbound FK cannot be checked — raise rather
+		// than skip, so RESTRICT never silently stops rejecting.
+		const parentColIndices = resolveReferencedColumnsForEnforcement(fk, tableSchema, childTable);
 
 		// For UPDATE, the runtime skips this check when none of `parentColIndices`
 		// changed (see runtime/row-constraints.ts).
@@ -476,10 +488,11 @@ export interface BatchableRestrictFk {
  *   outcome depends on which rows the same statement has already deleted.
  *
  * An inbound FK whose referenced-column resolution is malformed (column-count
- * mismatch) is skipped from the batch — the per-row paths skip it identically,
- * so it never disqualifies. The `foreign_keys` pragma is NOT part of the gate;
- * callers check it (the plan side already gates the build, the runtime flush
- * re-checks at execution).
+ * mismatch) RAISES here, matching the per-row builders — the batch replaces
+ * both per-row probes, so skipping it would leave the FK unenforced on this
+ * route only. The `foreign_keys` pragma is NOT part of the gate; callers check
+ * it (the plan side already gates the build, the runtime flush re-checks at
+ * execution).
  */
 export function getBatchableRestrictFks(
 	schemaManager: SchemaManager,
@@ -503,8 +516,10 @@ export function getBatchableRestrictFks(
 			&& childTable.name.toLowerCase() === tableSchema.name.toLowerCase()) {
 			return undefined;
 		}
-		const parentColIndices = resolveReferencedColumns(fk, tableSchema);
-		if (parentColIndices.length !== fk.columns.length) continue; // malformed — per-row skips it too
+		// Raises on a column-count mismatch, exactly as the per-row builders do —
+		// the batch is the ONLY enforcement on this route (the per-row parent-side
+		// checks are not built when batching applies), so it must not skip.
+		const parentColIndices = resolveReferencedColumnsForEnforcement(fk, tableSchema, childTable);
 		batchable.push({ childTable, fk, parentColIndices });
 	}
 	return batchable;

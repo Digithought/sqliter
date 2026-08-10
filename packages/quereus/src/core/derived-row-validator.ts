@@ -262,8 +262,13 @@ export function buildDerivedRowValidator(db: Database, mv: MaintainedTableSchema
 	}
 
 	// Build each FK through a single-FK schema view so the compiled check pairs
-	// with its declaring FK (the builder may skip a malformed FK, which would
-	// desynchronize a whole-array build).
+	// with its declaring FK by construction, independent of what the builder does
+	// with any one FK.
+	// NOTE: the builder's `ConstraintCheck.violationMessage` (the absent-parent text
+	// `runtime/row-constraints.ts` reports) is deliberately IGNORED here — a derived row
+	// needs the maintained-table attribution instead, which already names the missing
+	// parent. If a future check kind carries a message this path cannot reconstruct,
+	// thread `plan.violationMessage` through as the fallback rather than dropping it.
 	for (const fk of fks) {
 		const single: TableSchema = { ...mv, foreignKeys: Object.freeze([fk]) };
 		const plans = buildChildSideFKChecks(ctx, single, RowOpFlag.INSERT, oldAttributes, newAttributes);

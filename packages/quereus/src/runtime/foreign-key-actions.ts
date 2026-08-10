@@ -1,6 +1,6 @@
 import type { Database } from '../core/database.js';
 import type { TableSchema, ForeignKeyConstraintSchema } from '../schema/table.js';
-import { resolveReferencedColumns } from '../schema/table.js';
+import { resolveReferencedColumnsForEnforcement } from '../schema/table.js';
 import type { ForeignKeyAction } from '../parser/ast.js';
 import type { Row, SqlValue } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
@@ -267,8 +267,9 @@ export async function executeForeignKeyActions(
 			// replaces this basis action (the lens walker fires the logical action).
 			if (suppressed.has(fk)) continue;
 
-			const parentColIndices = resolveReferencedColumns(fk, parentTable);
-			if (parentColIndices.length !== fk.columns.length) continue;
+			// A count mismatch means the cascade cannot be aimed at the child rows —
+			// raise rather than skip, which would leave orphans behind a CASCADE.
+			const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childTable);
 
 			// UPDATE: an ON UPDATE action propagates a change to the parent's REFERENCED
 			// columns, so an update that leaves them alone must not touch the child at
@@ -425,8 +426,8 @@ export async function assertTransitiveRestrictsForParentMutation(
 			// physical cascade it would walk never runs — do not recurse through it.
 			if (suppressed.has(fk)) continue;
 
-			const parentColIndices = resolveReferencedColumns(fk, parentTable);
-			if (parentColIndices.length !== fk.columns.length) continue;
+			// Raises on a column-count mismatch, as every other enforcement site does.
+			const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childTable);
 
 			// MATCH SIMPLE: NULL parent values cannot be referenced.
 			const oldParentValues = parentColIndices.map(idx => oldRow[idx]) as SqlValue[];
@@ -562,8 +563,9 @@ export async function assertNoRestrictedChildrenForParentMutation(
 		// replaces this basis RESTRICT (the logical cascade must run, not abort).
 		if (suppressed.has(fk)) continue;
 
-		const parentColIndices = resolveReferencedColumns(fk, parentTable);
-		if (parentColIndices.length !== fk.columns.length) continue;
+		// A count mismatch means RESTRICT cannot be probed — raise rather than skip,
+		// which would silently let the parent write through.
+		const parentColIndices = resolveReferencedColumnsForEnforcement(fk, parentTable, childTable);
 
 		// UPDATE: only enforce when at least one referenced parent column changed.
 		if (operation === 'update' && newRow !== undefined) {
