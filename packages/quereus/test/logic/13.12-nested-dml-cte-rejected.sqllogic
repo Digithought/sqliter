@@ -1,0 +1,254 @@
+-- 13.12-nested-dml-cte-rejected.sqllogic - a data-modifying `with` member is legal
+-- ONLY in a statement's own leading WITH clause
+--
+-- A member whose body is an `insert` / `update` / `delete` carries a write that must
+-- happen exactly once per statement execution. Only a statement's OWN leading clause has
+-- an owner for that guarantee: `attachUnreferencedDmlCtes` (planner/building/block.ts),
+-- which only ever sees top-level statements. In every other position the write is driven
+-- by whoever happens to reference the member — silently dropped when nothing does,
+-- re-driven on every read when the position is a stored view body, and once for the whole
+-- statement rather than once per outer row when the position is a correlated subquery.
+--
+-- `buildWithClause` (planner/building/with.ts) therefore rejects such a member in any
+-- clause `buildBlock` did not mark as a top-level statement's own. Same rationale (and
+-- same permanent-rejection status) as `planViewBody`'s refusal of a DML view *body*.
+-- PostgreSQL rejects every shape below too.
+--
+-- Coverage below: one case per nesting position, REFERENCED and UNREFERENCED (both must
+-- reject — the unreferenced ones are the reported bug, the referenced ones are a
+-- deliberate narrowing of shapes that used to write). Positive controls at the end pin
+-- that the top-level clause still writes and that read-only nested clauses are untouched.
+
+create table t (k integer primary key);
+create table src (k integer primary key);
+create table dst (id integer primary key, v integer);
+insert into dst values (1, 10), (2, 20);
+-- run
+
+-- ===== FROM sub-query =====
+-- Unreferenced: the reported bug. This used to return the row and write nothing.
+
+select * from (with c as (insert into t (k) values (1) returning k) select 42 as x) z;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- Referenced: used to write once per statement execution. Narrowed to a rejection so
+-- position, not reachability, decides.
+
+select * from (with c as (insert into t (k) values (1) returning k) select k as x from c) z;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- Nothing was written by either.
+
+select count(*) as n from t;
+→ [{"n":0}]
+
+-- ===== Scalar sub-query =====
+
+select (with c as (insert into t (k) values (1) returning k) select k from c) as x;
+-- error: only allowed in a statement's own leading WITH clause
+
+select (with c as (insert into t (k) values (1) returning k) select 42) as x;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== EXISTS sub-query =====
+
+select 1 as x where exists (with c as (insert into t (k) values (1) returning k) select k from c);
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== IN sub-query =====
+
+select id from dst where id in (with c as (insert into t (k) values (1) returning k) select k from c);
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== A clause nested inside a top-level CTE's body =====
+-- The OUTER clause is the statement's own and would be fine; the inner one is not.
+
+with o as (with c as (insert into t (k) values (1) returning k) select k from c)
+select k from o;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== A compound arm's own clause =====
+-- The attach site reads the clause off the TOP statement node, so an arm's own clause has
+-- no owner even though the compound as a whole is top-level.
+
+select 1 as x
+union all
+select x from (with c as (insert into t (k) values (1) returning k) select k as x from c) z;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== A nested clause feeding an outer INSERT =====
+
+insert into t (k) select x from (with c as (insert into src (k) values (1) returning k) select k as x from c) z;
+-- error: only allowed in a statement's own leading WITH clause
+
+select count(*) as n from src;
+→ [{"n":0}]
+
+-- ===== A nested clause in an UPDATE ... WHERE =====
+
+update dst set v = 99 where id in (select x from (with c as (insert into src (k) values (1) returning k) select k as x from c) z);
+-- error: only allowed in a statement's own leading WITH clause
+
+select id, v from dst order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+-- ===== A nested clause in a DELETE ... WHERE =====
+
+delete from dst where id in (select x from (with c as (insert into src (k) values (1) returning k) select k as x from c) z);
+-- error: only allowed in a statement's own leading WITH clause
+
+select count(*) as n from dst;
+→ [{"n":2}]
+
+-- ===== Stored view body =====
+-- Referenced: this used to CREATE, and then re-drive the write on every read of the view.
+
+create view v_dml as with c as (insert into t (k) values (1) returning k) select k as x from c;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- Unreferenced: this used to create a view that silently wrote nothing.
+
+create view v_dml_unref as with c as (insert into t (k) values (1) returning k) select 42 as x;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== Materialized-view body =====
+-- Replaces a late, confusing "body is non-deterministic (SINK (unreferenced-cte c))".
+
+create materialized view mv_dml as with c as (insert into t (k) values (1) returning k) select k as x from c;
+-- error: only allowed in a statement's own leading WITH clause
+
+create materialized view mv_dml_unref as with c as (insert into t (k) values (1) returning k) select 42 as x;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- Nothing above wrote anything, and no object was defined.
+
+select count(*) as n from t;
+→ [{"n":0}]
+
+select count(*) as n from src;
+→ [{"n":0}]
+
+-- ===== Maintained-table body =====
+
+create table mt_dml (k integer primary key) maintained as with c as (insert into t (k) values (1) returning k) select k from c;
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== Assertion body =====
+-- Wrapped in the create-assertion diagnostic, so match on the inner text.
+
+create assertion a_dml check (not exists (with c as (insert into t (k) values (1) returning k) select k from c));
+-- error: only allowed in a statement's own leading WITH clause
+
+-- ===== Correlated scalar sub-query =====
+-- The shape `docs/runtime-caching.md` used to list as an open gap: it wrote once for the
+-- whole statement rather than once per outer row, and every outer row saw the first row's
+-- RETURNING set. Now unreachable.
+
+insert into src values (7), (8);
+-- run
+
+select (select x from (with c as (insert into t (k) values (src.k) returning k) select k as x from c) z) as n from src;
+-- error: only allowed in a statement's own leading WITH clause
+
+select count(*) as n from t;
+→ [{"n":0}]
+
+delete from src;
+-- run
+
+-- ===== UPDATE and DELETE bodies reject in a nested position too =====
+
+create table upd (k integer primary key, v integer);
+insert into upd values (1, 0);
+-- run
+
+select * from (with c as (update upd set v = v + 1 returning k) select 42 as x) z;
+-- error: only allowed in a statement's own leading WITH clause
+
+select * from (with c as (delete from upd where k = 1 returning k) select 42 as x) z;
+-- error: only allowed in a statement's own leading WITH clause
+
+select k, v from upd order by k;
+→ [{"k":1,"v":0}]
+
+-- ===== Positive control: the statement's own leading clause still writes =====
+-- Referenced and unreferenced, for INSERT / UPDATE / DELETE — the guarantee 13.11 pins,
+-- re-checked here so the rejection cannot swallow it.
+
+with c as (insert into t (k) values (1) returning k) select k as x from c;
+→ [{"x":1}]
+
+with c as (insert into t (k) values (2) returning k) select 42 as x;
+→ [{"x":42}]
+
+select k from t order by k;
+→ [{"k":1},{"k":2}]
+
+with c as (update upd set v = v + 1 returning k) select 42 as x;
+→ [{"x":42}]
+
+with c as (delete from upd where k = 1 returning k) select 42 as x;
+→ [{"x":42}]
+
+select count(*) as n from upd;
+→ [{"n":0}]
+
+-- A leading clause on an outer INSERT / UPDATE / DELETE is equally its own.
+
+with c as (insert into src (k) values (5) returning k) insert into t (k) select k + 100 from c;
+-- run
+
+select k from src order by k;
+→ [{"k":5}]
+
+select k from t order by k;
+→ [{"k":1},{"k":2},{"k":105}]
+
+-- ===== Positive control: a READ-ONLY nested clause is untouched =====
+-- Only `isDataModifyingCte` members are rejected; 13.7-cte-sibling-visibility covers this
+-- ground in depth, these pin the exact positions the rejection walks past.
+
+select n from (with z as (select 1 as k) select k as n from z) q;
+→ [{"n":1}]
+
+select (with z as (select 7 as k) select k from z) as x;
+→ [{"x":7}]
+
+select id from dst where id in (with z as (select 1 as k) select k from z);
+→ [{"id":1}]
+
+create view v_ro as with z as (select 3 as k) select k as x from z;
+-- run
+
+select x from v_ro;
+→ [{"x":3}]
+
+-- (a materialized view's body must read a source table, hence `mvsrc` rather than a
+-- literal block — orthogonal to what this file pins.)
+create table mvsrc (k integer primary key);
+insert into mvsrc values (4);
+create materialized view mv_ro as with z as (select k from mvsrc) select k as x from z;
+-- run
+
+select x from mv_ro;
+→ [{"x":4}]
+
+-- A read-only clause nested inside a DML CTE body in a TOP-LEVEL clause still works:
+-- the outer clause is the statement's own, and the inner one is not data-modifying.
+
+with c as (with z as (select 300 as k) insert into src (k) select k from z returning k)
+select k as x from c;
+→ [{"x":300}]
+
+select k from src order by k;
+→ [{"k":5},{"k":300}]
+
+-- Cleanup
+drop materialized view mv_ro;
+drop view v_ro;
+drop table t;
+drop table src;
+drop table dst;
+drop table upd;
+drop table mvsrc;
+-- run

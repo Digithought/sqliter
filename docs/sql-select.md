@@ -801,6 +801,27 @@ select ... from cte_name ...
   is not defined whether it observes that write. Do not rely on either answer; see the
   gap list in `docs/runtime-caching.md`.
 
+**Where a data-modifying CTE may appear:**
+
+A member whose body is an `INSERT` / `UPDATE` / `DELETE … RETURNING` is legal **only in a
+statement's own leading `WITH` clause**. Anywhere else it is rejected at build time with
+`WITH member '<name>' is an INSERT, which is only allowed in a statement's own leading
+WITH clause …`. Rejected positions include a `FROM` sub-query, a scalar / `EXISTS` / `IN`
+sub-query, a `WITH` clause nested inside another CTE's body, a compound (`UNION`) arm's own
+clause, and the body of a stored `CREATE VIEW`, `CREATE MATERIALIZED VIEW`,
+`CREATE TABLE … MAINTAINED` or `CREATE ASSERTION` — whether or not anything references the
+member. This matches PostgreSQL.
+
+The reason is that only the leading clause has an owner for the write's
+once-per-statement-execution guarantee. In the other positions the write is driven by
+whatever happens to reference the member: nothing does, and the write silently disappears;
+a stored view body re-evaluates, and the write re-runs on every read; a correlated
+sub-query evaluates per outer row, and "once per statement" stops meaning anything. Move
+the mutation to the statement that uses the query.
+
+**Read-only** nested `WITH` clauses are unaffected — the rule applies to data-modifying
+members only.
+
 **Visibility inside the declaring statement:**
 
 - A statement's own leading `WITH` clause is visible to **every clause of that statement**,

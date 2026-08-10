@@ -199,6 +199,28 @@ export interface PlanningContext {
    */
   readonly cteDescriptors: Map<AST.CommonTableExpr, TableDescriptor>;
 
+  /**
+   * The `with` clauses that belong to a TOP-LEVEL statement of this build, by AST object
+   * identity. Set once by `buildBlock` from the statements it is handed; inherited by every
+   * derived context through the usual spread, so a clause met anywhere below still compares
+   * correctly.
+   *
+   * Read only by `buildWithClause`, to decide whether a data-modifying member is in a
+   * position that can honour the once-per-statement write guarantee
+   * (`attachUnreferencedDmlCtes` only ever sees top-level statements, so nothing owns the
+   * write anywhere else).
+   *
+   * Keyed on the CLAUSE object rather than the statement: a view write-through re-plan
+   * rewrites the statement but carries the same clause object, so a top-level
+   * `with c as (insert …) update v …` must keep working. A nested clause — a sub-select's
+   * own, a stored body's carried one — is always a distinct object, so it never matches.
+   *
+   * Optional: a context built outside `buildBlock` (a DDL-time DEFAULT probe, a constraint
+   * compile) marks nothing top-level, which is the conservative answer — such a context
+   * never plans a user statement's leading clause.
+   */
+  readonly topLevelWithClauses?: ReadonlySet<AST.WithClause>;
+
   /** maps a RelationalPlanNode to its column scope during building */
   readonly outputScopes: Map<PlanNode, Scope>;
 

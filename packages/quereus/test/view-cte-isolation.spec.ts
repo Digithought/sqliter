@@ -412,8 +412,29 @@ describe('a stored view body carries its own `with` clause into write-through lo
 			// definitions would make a WRITE execute it too, and the shared plan node makes a
 			// two-fragment reference fail inside the runtime. Rejected up front instead.
 			await db.exec('create table main.logt (k integer primary key)');
-			await db.exec('create view main.vm as with m as (insert into logt (k) values (1) returning k) '
-				+ 'select id, x from a where id in (select k from m)');
+			// `create view` no longer accepts this body — `buildWithClause` rejects a
+			// data-modifying member outside a statement's own leading clause (see the
+			// definition-time test below). The shape can still reach the catalog from a
+			// definition persisted by an older build, which is what `importCatalog` models
+			// here: import does not plan a plain view's body. The write-through guard and
+			// `view_info` predicate below are that path's backstop, so they stay pinned.
+			await db.schemaManager.importCatalog([
+				'create view main.vm as with m as (insert into logt (k) values (1) returning k) '
+				+ 'select id, x from a where id in (select k from m)',
+			]);
+		});
+
+		it('is rejected at definition time by CREATE VIEW', async () => {
+			let message = '';
+			try {
+				await db.exec('create view main.vdml as with m as (insert into logt (k) values (9) returning k) '
+					+ 'select id, x from a where id in (select k from m)');
+			} catch (e) {
+				message = e instanceof Error ? e.message : String(e);
+			}
+			expect(message).to.match(/only allowed in a statement's own leading WITH clause/);
+			// The rejection happens while planning the body, so nothing was written.
+			expect(await all(db, 'select count(*) as n from main.logt')).to.deep.equal([{ n: 0 }]);
 		});
 
 		it('rejects a write through it with a structured diagnostic', async () => {
@@ -437,8 +458,11 @@ describe('a stored view body carries its own `with` clause into write-through lo
 			// on the shape of the body, not on whether the lowering actually copies a fragment
 			// that reads the block. Writing through this view used to succeed. `view_info`
 			// answers from the same predicate, so the advertised writability agrees.
-			await db.exec('create view main.vmu as with m as (insert into logt (k) values (2) returning k) '
-				+ 'select id, x from a where x > 0');
+			// Imported rather than created, for the same reason as `vm` above.
+			await db.schemaManager.importCatalog([
+				'create view main.vmu as with m as (insert into logt (k) values (2) returning k) '
+				+ 'select id, x from a where x > 0',
+			]);
 
 			let message = '';
 			try {

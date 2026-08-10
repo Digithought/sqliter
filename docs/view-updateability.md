@@ -116,6 +116,8 @@ All fragments of one lowering share **one** plan node per body-local block, via 
 
 A body whose `with` clause defines a **data-modifying** block (`with m as (insert … returning …)`) is rejected up front on every write with `unsupported-body-cte-dml`, and `view_info` reports the conservative all-`NO` row for it. Reading such a view already executes the insert per read; carrying the definition would make a write execute it too, and the shared plan node makes a two-fragment reference fail inside the runtime.
 
+That guard is now a **backstop** rather than the first line: `create view` no longer accepts such a body at all. `buildWithClause` rejects a data-modifying `with` member outside a statement's own leading clause (see `docs/sql-select.md` § 3.7), and a view body plans on a nested context, so the definition fails at `CREATE` time. The shape can still reach the catalog from a definition persisted by an older build — plain-view import does not plan the body — which is exactly what the guard and the `view_info` predicate cover.
+
 A plain column reference never needed any of this: the lowering has already rewritten it to a resolved base column by the time the fragment is copied.
 
 An **ephemeral** target is deliberately left unmarked, mirroring `bodyPlanningContext`'s ephemeral guard — its body is part of the caller's statement, so its sub-selects keep the caller's path and the caller's CTEs. The writing statement's own sub-selects (a user `where … in (select …)`, an `insert … select` source) are never marked and are unaffected.

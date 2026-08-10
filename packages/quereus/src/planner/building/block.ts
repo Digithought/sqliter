@@ -34,14 +34,41 @@ import { StatusCode } from '../../common/types.js';
 import { buildDeclareSchemaStmt, buildDeclareLensStmt, buildDiffSchemaStmt, buildApplySchemaStmt, buildExplainSchemaStmt } from './declare-schema.js';
 
 export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): BlockNode {
+	// Mark these statements' own leading WITH clauses before anything is built: a
+	// data-modifying member is legal only there, and `buildWithClause` rejects one
+	// anywhere else (see its comment). Used for `attachUnreferencedDmlCtes` too — that
+	// rebuild goes through `buildWithClause` on the SAME clause object and must stay
+	// allowed.
+	//
+	// NOTE: several analysis paths re-plan a STORED body as if it were a standalone
+	// top-level statement — `db._buildPlan([view.selectAst])` in `func/builtins/schema.ts`,
+	// `planner/analysis/assertion-plan.ts`, `core/database-materialized-views-plan-builders.ts`,
+	// `runtime/emit/materialized-view-helpers.ts`, `schema/lens-prover.ts`,
+	// `func/builtins/explain.ts`. Those calls mark the body's own clause top-level, so a body
+	// that ALREADY contains a data-modifying member would still be accepted there.
+	// Unreachable for anything created after this gate landed (definition-time planning goes
+	// through a nested context and is rejected); reachable only for a definition persisted by
+	// an older build. Not worth a "this is a stored body" flag on `_buildPlan`.
+	const blockCtx: PlanningContext = { ...ctx, topLevelWithClauses: collectTopLevelWithClauses(statements) };
+
 	const plannedStatements = statements.map((stmt) => {
-		const planned = buildStatement(ctx, stmt);
-		return planned === undefined ? undefined : attachUnreferencedDmlCtes(ctx, stmt, planned);
+		const planned = buildStatement(blockCtx, stmt);
+		return planned === undefined ? undefined : attachUnreferencedDmlCtes(blockCtx, stmt, planned);
 	}).filter(p => p !== undefined) as PlanNode[]; // Ensure we only have valid PlanNodes and cast
 
     // The final BatchNode for the entire batch.
     // Its scope is batchParameterScope, and it contains all successfully planned statements.
 	return new BlockNode(ctx.scope, plannedStatements, { ...ctx.parameters });
+}
+
+/** The leading `with` clause of each statement in this block, by AST object identity. */
+function collectTopLevelWithClauses(statements: AST.Statement[]): ReadonlySet<AST.WithClause> {
+	const clauses = new Set<AST.WithClause>();
+	for (const stmt of statements) {
+		const withClause = (stmt as { withClause?: AST.WithClause }).withClause;
+		if (withClause) clauses.add(withClause);
+	}
+	return clauses;
 }
 
 function buildStatement(ctx: PlanningContext, stmt: AST.Statement): PlanNode | undefined {
@@ -147,8 +174,10 @@ function buildStatement(ctx: PlanningContext, stmt: AST.Statement): PlanNode | u
  * write-through path (and once per base member by a multi-source decomposition),
  * so a per-builder attachment would fan the sink out N times. A `with` clause on
  * a NESTED statement (a sub-select's own clause, a stored view body) is out of
- * scope: PostgreSQL rejects a data-modifying member anywhere but a statement's
- * top level, so matching top-level behaviour is the whole obligation.
+ * scope, and that boundary is now ENFORCED rather than merely unimplemented:
+ * `buildWithClause` rejects a data-modifying member in any clause `buildBlock`
+ * did not mark top-level (PostgreSQL rejects the same shapes), so no position
+ * exists where a write would go unowned.
  *
  * Mechanics: each member's runtime identity (`CTENode.tableDescriptor`) is
  * memoized per source AST member for the whole statement build

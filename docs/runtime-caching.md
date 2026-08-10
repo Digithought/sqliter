@@ -190,14 +190,22 @@ row). PostgreSQL's sub-statements never see one another's effects and would
 not; Quereus already lets the outer query observe a *referenced* member's
 write, so this is consistent engine behaviour rather than a new divergence.
 
-Two known gaps in this area, both still open:
+**Only the leading clause may write.** A data-modifying member is accepted **only** in a
+statement's own leading `with` clause — the position `attachUnreferencedDmlCtes` owns.
+`buildWithClause` rejects one anywhere else (`buildBlock` marks the top-level clauses by
+AST object identity on the context it builds every statement under; an unmarked clause
+rejects). Rejected positions: a `from` / scalar / `exists` / `in` sub-query, a clause
+nested inside another CTE body, a compound arm's own clause, and a stored view /
+materialized-view / maintained-table / assertion body. Referenced or not, all reject.
+This closes the position where an unreferenced member's write was silently dropped, and
+narrows away the shapes that *did* write inconsistently — including the correlated
+sub-query case, where the write ran once per statement execution rather than once per
+outer row and every outer row saw the first row's `RETURNING` set. PostgreSQL rejects the
+same shapes, so there is nothing left to define. Pinned in
+`test/logic/13.12-nested-dml-cte-rejected.sqllogic`.
 
-- A data-modifying CTE nested inside a **correlated** subquery writes once per
-  statement execution, not once per outer row, and every outer row sees the first
-  row's `RETURNING` set. This predates the always-buffered rule (the once-per-
-  execution memo for impure subqueries already collapsed it) and the intended
-  semantics are undecided — PostgreSQL rejects a data-modifying CTE anywhere but
-  the top level of a statement rather than defining this case.
+One known gap in this area is still open:
+
 - A CTE that reads a **base table** another CTE writes sees a result that depends on
   where the outer query mentions each one. The two statements below differ only in
   projection order, and `n` is 0 in the first, 1 in the second:

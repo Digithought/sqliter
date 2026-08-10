@@ -24,6 +24,12 @@ export function buildWithClause(
 ): Map<string, CTEScopeNode> {
 	const cteNodes = new Map<string, CTEScopeNode>();
 
+	// Is this a statement's OWN leading clause? `buildBlock` marks those (by clause
+	// object identity) on the context it builds every top-level statement under; a
+	// context that never passed through `buildBlock` marks nothing, which is the
+	// conservative answer. Absent the mark, a data-modifying member is rejected below.
+	const isTopLevelClause = ctx.topLevelWithClauses?.has(withClause) ?? false;
+
 	// Check for duplicate CTE names
 	const cteNames = new Set<string>();
 	for (const cte of withClause.ctes) {
@@ -35,6 +41,9 @@ export function buildWithClause(
 			);
 		}
 		cteNames.add(cteName);
+		if (!isTopLevelClause && isDataModifyingCte(cte)) {
+			rejectNestedDataModifyingCte(cte);
+		}
 	}
 
 	// Build each CTE in order
@@ -45,6 +54,35 @@ export function buildWithClause(
 	}
 
 	return cteNodes;
+}
+
+/**
+ * A data-modifying `with` member is legal ONLY in a statement's own leading clause.
+ * Only there does anything own its write: `attachUnreferencedDmlCtes` (building/block.ts)
+ * guarantees exactly one write per statement execution whether or not the member is read,
+ * and it is only ever handed top-level statements. Everywhere else the member's write is
+ * driven by whoever happens to reference it — dropped entirely when nothing does, re-driven
+ * on every evaluation when the position re-evaluates (a stored view body), and once for the
+ * whole statement rather than once per outer row when the position is a correlated subquery.
+ *
+ * Rejecting rather than defining those cases matches PostgreSQL, and mirrors the sibling
+ * reject in `planViewBody` (building/create-view.ts), which refuses a DML *body* for a view
+ * for the same re-drive reason.
+ *
+ * Sited here — one check on the clause — rather than at each nesting position, so it covers
+ * every one at once (`from` sub-query, scalar / `exists` / `in` sub-query, a clause nested
+ * inside another CTE body, a compound arm, a stored view / materialized-view / maintained
+ * body, an assertion body) plus any position added later: they all funnel through
+ * `buildWithContext` or `buildStoredBodyCTEs` into this function.
+ */
+function rejectNestedDataModifyingCte(cte: AST.CommonTableExpr): never {
+	throw new QuereusError(
+		`WITH member '${cte.name}' is an ${cte.query.type.toUpperCase()}, which is only allowed in a statement's own leading WITH clause — not in a subquery or a stored view/materialized-view body, where the write would either be dropped or re-driven on every evaluation. Move the mutation to the statement that uses this query.`,
+		StatusCode.ERROR,
+		undefined,
+		cte.query.loc?.start.line,
+		cte.query.loc?.start.column,
+	);
 }
 
 /**
