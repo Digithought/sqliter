@@ -97,6 +97,14 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			return oldSchema;
 		}
 		const { newCol, collationChanged, valueConvert } = attr;
+		// Whether anything PHYSICAL has been written by the time this arm persists — the
+		// deferred value rewrite, the PK re-key, or an index rebuild. This arm is only
+		// SOMETIMES row-rewriting: DROP NOT NULL, SET DEFAULT, a SET NOT NULL over rows that
+		// hold no NULL, and a SET COLLATE on an unindexed non-PK column all reach the persist
+		// below having touched no store at all. Those shapes must unwind a failed persist like
+		// every other schema-only ALTER (`StoreModuleIndex.adoptAndPersistSchema`); the
+		// row-rewriting ones must not. Set at each mutation site below, read at the persist.
+		let storeMutated = false;
 		// Named for the PENDING act, not a completed one: the deferred value rewrite (SET DATA
 		// TYPE conversion / SET NOT NULL backfill) is applied below, after every throw-only
 		// check. Both gates that read this run BEFORE it, while the store still holds the old
@@ -211,6 +219,7 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			// rejected ALTER keeps the transaction alive; `rekeyRows`' own pass 1 is now a
 			// backstop, not the gate.
 			await this.ddlCommitPendingOps();
+			storeMutated = true;
 			await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
 			// Materialize so the implicit `_uc_*` PK suffix is re-encoded under the new
 			// key collation too (`updatedSchema` carries none on its own). NON-enforcing
@@ -245,6 +254,7 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		// disagreeing with the stored values.
 		if (valueConvert) {
 			await this.ddlCommitPendingOps();
+			storeMutated = true;
 			await table.mapRowsAtIndex(colIndex, valueConvert);
 		}
 
@@ -273,17 +283,23 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			.some(ix => ix.columns.some(ic => ic.index === colIndex));
 		if ((rewritesValues || keyTransformChanged || (collationChanged && indexCoversAlteredColumn)) && !pkRekeyNeeded) {
 			await this.ddlCommitPendingOps();
+			storeMutated = true;
 			await this.rebuildSecondaryIndexes(schemaName, tableName, table, materializedUpdated, db.getKeyNormalizerResolver(), true);
 		}
 
-		// The bare pair, not `StoreModuleIndex.adoptAndPersistSchema` — this arm may already
-		// have rewritten stored values (`mapRowsAtIndex`), re-keyed the data store and rebuilt
-		// index stores above, so restoring the old cached schema on a persist failure would
-		// read re-encoded bytes through the pre-ALTER layout. Same accepted tradeoff as every
-		// other row-rewriting arm; see the `NOTE:` above `rebuildSecondaryIndexes` in
-		// `StoreModuleAlter.alterDropColumn`.
-		table.updateSchema(updatedSchema);
-		await this.saveTableDDL(updatedSchema);
+		if (storeMutated) {
+			// The bare pair: stored values, data-store keys or index entries above are already
+			// re-encoded, so restoring the old cached schema on a persist failure would read
+			// those bytes through the pre-ALTER layout — worse than the divergence it repairs.
+			// Same accepted tradeoff as every other row-rewriting arm; see the `NOTE:` above
+			// `rebuildSecondaryIndexes` in `StoreModuleAlter.alterDropColumn`.
+			table.updateSchema(updatedSchema);
+			await this.saveTableDDL(updatedSchema);
+		} else {
+			// Nothing physical happened, so a failed persist unwinds completely — same seam,
+			// same guarantee as the schema-only arms in `StoreModuleAlter`.
+			await this.adoptAndPersistSchema(table, updatedSchema);
+		}
 
 		// No emit here: the dispatcher (`StoreModuleAlter.alterTable`) raises the ONE
 		// event per statement after every arm, gated on `change.ddl`.

@@ -471,7 +471,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			// unwinds nest: the seam puts the cached schema back and rethrows, and the catch
 			// here then reverses the in-place AST rewrites the restored schema still shares by
 			// reference (a schema restore cannot undo those).
-			await this.adoptAndPersistSchema(table, updatedSchema, alterSubject(oldSchema));
+			await this.adoptAndPersistSchema(table, updatedSchema);
 		} catch (e) {
 			rewriteColumn(change.newName, change.oldName);
 			throw e;
@@ -598,7 +598,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			);
 		}
 
-		await this.adoptAndPersistSchema(table, updatedSchema, alterSubject(oldSchema));
+		await this.adoptAndPersistSchema(table, updatedSchema);
 
 		return updatedSchema;
 	}
@@ -635,7 +635,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			updatedSchema = { ...oldSchema, uniqueConstraints: remaining.length > 0 ? Object.freeze(remaining) : undefined };
 		}
 
-		await this.adoptAndPersistSchema(table, updatedSchema, alterSubject(oldSchema));
+		await this.adoptAndPersistSchema(table, updatedSchema);
 
 		return updatedSchema;
 	}
@@ -675,19 +675,10 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			};
 		}
 
-		await this.adoptAndPersistSchema(table, updatedSchema, alterSubject(oldSchema));
+		await this.adoptAndPersistSchema(table, updatedSchema);
 
 		return updatedSchema;
 	}
-}
-
-/**
- * How a failed schema-only ALTER names its table in the unwind's warning — see
- * `StoreModuleIndex.guardedUnwindStep`. Reads the schema rather than the arms'
- * `schemaName` / `tableName` parameters, which two of the four arms do not receive.
- */
-function alterSubject(schema: TableSchema): string {
-	return `table '${schema.schemaName}.${schema.name}'`;
 }
 
 /**

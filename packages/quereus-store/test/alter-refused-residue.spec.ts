@@ -2,9 +2,10 @@
  * A refused SCHEMA-ONLY `ALTER TABLE` on a store-backed table must be a clean no-op
  * (alter-table-failure-leaves-half-applied-schema).
  *
- * The four arms that touch no row data before the catalog write — ADD / DROP / RENAME
- * CONSTRAINT and RENAME COLUMN — persist through `StoreModuleIndex.adoptAndPersistSchema`,
- * which puts the connected table's cached schema back when the catalog write throws. Without
+ * The paths that touch no row data before the catalog write — ADD / DROP / RENAME CONSTRAINT,
+ * RENAME COLUMN, and the ALTER COLUMN shapes that rewrite nothing physical — persist through
+ * `StoreModuleIndex.adoptAndPersistSchema`, which puts the connected table's cached schema
+ * back when the catalog write throws. Without
  * it the table stayed one schema ahead of both the engine and the catalog for the rest of the
  * session, and a plain UNIQUE is materially harmed by that: `StoreTableBase.updateSchema`
  * materializes the hidden `_uc_*` index that backs it, so DML starts enforcing by seek against
@@ -15,11 +16,15 @@
  *  - residue equality across the refused statement (`expectRefusedDdlLeavesNoResidue`);
  *  - behavior afterwards. Residue equality alone would catch neither UNIQUE harm — the
  *    half-applied schema lives in memory, and the ghost `_uc_*` store it leaves is created by
- *    the NEXT write, after the snapshot window closes.
+ *    the NEXT write, after the snapshot window closes. For a change with no physical structure
+ *    at all (a FOREIGN KEY, a DEFAULT, a nullability relaxation) the harm surfaces one
+ *    statement later still: the next successful catalog write re-renders the bundle from the
+ *    cached schema, making the refused change durable.
  *
- * The row-rewriting arms (ADD / DROP COLUMN, ALTER PRIMARY KEY, ALTER COLUMN) deliberately do
- * NOT unwind — they have already re-encoded the data store — and are out of scope here; see
- * the accepted-tradeoff `NOTE:` in `StoreModuleAlter.alterDropColumn`.
+ * The row-rewriting paths (ADD / DROP COLUMN, ALTER PRIMARY KEY, and the ALTER COLUMN shapes
+ * that re-encode values or keys) deliberately do NOT unwind — they have already re-encoded the
+ * data store — and are out of scope here; see the accepted-tradeoff `NOTE:` in
+ * `StoreModuleAlter.alterDropColumn`.
  *
  * The failure is injected the general way: the provider's catalog `put` throws for exactly the
  * one statement under test, standing in for any durable-write IO error.
@@ -29,6 +34,7 @@ import { describe, it, afterEach } from 'mocha';
 import { expect } from 'chai';
 import type { Database } from '@quereus/quereus';
 import {
+	catalogDdlText,
 	createProvider,
 	expectRefusedDdlLeavesNoResidue,
 	open,
@@ -51,6 +57,17 @@ async function expectConstraintRejected(db: Database, sql: string, why: string):
 /** Row count of the one table every case uses. */
 async function rowCount(db: Database): Promise<unknown> {
 	return (await rows(db, `select count(*) as n from t`))[0].n;
+}
+
+/**
+ * A half-applied cached schema is invisible until something re-persists it: the NEXT
+ * successful catalog write re-renders the whole bundle from the module's cached schema, so
+ * a refused statement's residue becomes durable through an unrelated later statement. This
+ * runs one such statement and hands back what the catalog then holds.
+ */
+async function catalogAfterAnUnrelatedSuccessfulAlter(db: Database, p: TestProvider): Promise<string> {
+	await db.exec(`alter table t add constraint ck_probe check (id > 0)`);
+	return await catalogDdlText(p);
 }
 
 /**
@@ -170,6 +187,67 @@ const CASES: readonly RefusedAlterCase[] = [
 			await db.exec(`alter table t rename column email to mail`);
 			expect((await rows(db, `select mail from t`)).map(r => r.mail), 'the retried rename took effect')
 				.to.deep.equal(['a@x.com']);
+		},
+	},
+	{
+		title: 'ADD CONSTRAINT FOREIGN KEY — the FK was never added, and a retry can still add it',
+		setup: [
+			`create table p (id integer primary key) using store`,
+			`create table t (id integer primary key, pid integer) using store`,
+			`insert into p values (1)`,
+			`insert into t values (1, 1)`,
+			// Warm both tables' stats entries into existence before the snapshot: the FK's
+			// existing-row validation opens the parent store, and a stats entry first written
+			// DURING the refused statement is provider noise, not schema residue.
+			`select count(*) from p`,
+			`select count(*) from t`,
+		],
+		sql: `alter table t add constraint fk foreign key (pid) references p(id)`,
+		after: async (db, p) => {
+			// The third constraint kind through the same arm and the same seam. A FOREIGN KEY
+			// has no physical structure in the store, so the only residue it can leave is the
+			// cached schema — which the next successful catalog write would make durable.
+			expect(await catalogAfterAnUnrelatedSuccessfulAlter(db, p), 'the refused FK did not leak into the catalog')
+				.to.not.match(/references/i);
+
+			await db.exec(`alter table t add constraint fk foreign key (pid) references p(id)`);
+			expect(await catalogDdlText(p), 'the retried FK persisted').to.match(/references/i);
+		},
+	},
+	{
+		title: 'ALTER COLUMN DROP NOT NULL — the relaxation never happened, and does not leak later',
+		setup: [
+			`create table t (id integer primary key, n integer not null) using store`,
+			`insert into t values (1, 5)`,
+		],
+		sql: `alter table t alter column n drop not null`,
+		after: async (db, p) => {
+			// DROP NOT NULL rewrites no rows, so nothing physical stands in the way of the undo —
+			// but the arm it dispatches through (`alterColumnChange`) is only SOMETIMES
+			// row-rewriting, and its schema-only shapes must unwind like the other four.
+			// Matched against the COLUMN's rendered definition, not a bare `not null` — the PK
+			// column renders one too, so a loose match would pass with the relaxation leaked.
+			expect(await catalogAfterAnUnrelatedSuccessfulAlter(db, p), 'the column is still NOT NULL in the catalog')
+				.to.match(/"n" INTEGER NOT NULL/i);
+
+			await db.exec(`alter table t alter column n drop not null`);
+			await db.exec(`insert into t values (2, null)`);
+			expect(await rowCount(db), 'the retried relaxation took effect').to.equal(2);
+		},
+	},
+	{
+		title: 'ALTER COLUMN SET DEFAULT — the default was never set, and does not leak later',
+		setup: [
+			`create table t (id integer primary key, n integer) using store`,
+			`insert into t values (1, 5)`,
+		],
+		sql: `alter table t alter column n set default 42`,
+		after: async (db, p) => {
+			expect(await catalogAfterAnUnrelatedSuccessfulAlter(db, p), 'the refused default did not leak into the catalog')
+				.to.not.match(/default 42/i);
+
+			await db.exec(`alter table t alter column n set default 42`);
+			expect(await catalogDdlText(p), 'the retried default persisted').to.match(/default 42/i);
 		},
 	},
 ];

@@ -219,6 +219,21 @@ export async function snapshotResidue(p: TestProvider): Promise<string> {
 }
 
 /**
+ * The catalog's decoded DDL text, all entries joined. For asserting what a LATER statement
+ * durably wrote — a half-applied schema is invisible in the residue snapshot of the refused
+ * statement itself but becomes durable through the next successful catalog write, which
+ * re-persists the whole bundle from the module's cached schema.
+ */
+export async function catalogDdlText(p: TestProvider): Promise<string> {
+	const catalog = p.stores.get('__catalog__');
+	if (!catalog) return '';
+	const decoder = new TextDecoder();
+	const ddl: string[] = [];
+	for await (const entry of catalog.iterate()) ddl.push(decoder.decode(entry.value));
+	return ddl.join('\n');
+}
+
+/**
  * The shared assertion for the whole "a refused store DDL statement leaves no residue"
  * class: snapshot every store, run a statement expected to throw, assert the snapshot
  * is byte-identical. Returns the error so a caller can assert more about it.

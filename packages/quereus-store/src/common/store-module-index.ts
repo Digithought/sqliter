@@ -6,9 +6,9 @@
  *
  * Also home to the failure unwind every schema-swapping DDL statement shares
  * ({@link StoreModuleIndex.unwindFailedSchemaDdl} / {@link StoreModuleIndex.guardedUnwindStep})
- * and the {@link StoreModuleIndex.adoptAndPersistSchema} seam the schema-only ALTER TABLE
- * arms in `store-module-alter.ts` persist through, so a refused statement of either family
- * leaves the connected table exactly where it found it.
+ * and the {@link StoreModuleIndex.adoptAndPersistSchema} seam every schema-only ALTER TABLE
+ * path persists through (`store-module-alter.ts`, `store-module-alter-column.ts`), so a
+ * refused statement of either family leaves the connected table exactly where it found it.
  *
  * Fourth layer of the store-module chain:
  *   StoreModuleBase -> StoreModuleCatalog -> StoreModuleSchemaSync -> StoreModuleIndex
@@ -67,7 +67,7 @@ function implicitUniqueIndexNameMap(schema: TableSchema): Map<string, string> {
  * ({@link StoreModuleIndex.unwindFailedSchemaDdl}) is driven by. Mutated in place by the
  * arm's try block so the catch can read it. Shared by both DDL families that swap the
  * connected table's cached schema: `createIndex` / `dropIndex` here, and the schema-only
- * `ALTER TABLE` arms via {@link StoreModuleIndex.adoptAndPersistSchema}.
+ * `ALTER TABLE` paths via {@link StoreModuleIndex.adoptAndPersistSchema}.
  */
 interface SchemaDdlProgress {
 	/** the connected table's cached schema was replaced with the post-DDL one */
@@ -373,19 +373,21 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	/**
 	 * Adopt `updatedSchema` on the connected table and persist it to the catalog; on a
 	 * persist failure put the previous cached schema back, so a refused SCHEMA-ONLY DDL
-	 * statement is a clean no-op. `subject` names what failed for the guarded-unwind
-	 * warning (e.g. `table 'main.t'`).
+	 * statement is a clean no-op.
 	 *
-	 * The seam the four schema-only `ALTER TABLE` arms share — ADD / DROP / RENAME
-	 * CONSTRAINT and RENAME COLUMN (`StoreModuleAlter`). None of them touches row data
-	 * before the catalog write, so restoring the previous cached schema is a COMPLETE
-	 * undo. The row-rewriting arms (ADD / DROP COLUMN, ALTER PRIMARY KEY, ALTER COLUMN)
-	 * deliberately do NOT use this: each has already physically re-encoded the data store
-	 * by this point, so putting the old schema back would leave the table reading
-	 * re-encoded rows through the old layout — strictly worse than the divergence it
-	 * repairs. Their window is an accepted tradeoff whose real fix is one durable marker
-	 * covering the whole physical rewrite; see the `NOTE:` above `rebuildSecondaryIndexes`
-	 * in `StoreModuleAlter.alterDropColumn`.
+	 * The seam every schema-only `ALTER TABLE` path shares — ADD / DROP / RENAME
+	 * CONSTRAINT and RENAME COLUMN (`StoreModuleAlter`), plus the `ALTER COLUMN` shapes
+	 * that rewrite nothing physical (`StoreModuleAlterColumn.alterColumnChange`). None of
+	 * them touches row data before the catalog write, so restoring the previous cached
+	 * schema is a COMPLETE undo.
+	 *
+	 * A path that HAS re-encoded the data store by this point (ADD / DROP COLUMN, ALTER
+	 * PRIMARY KEY, and the row-rewriting `ALTER COLUMN` shapes) must NOT use this:
+	 * putting the old schema back would leave the table reading re-encoded rows through
+	 * the old layout — strictly worse than the divergence it repairs. Their window is an
+	 * accepted tradeoff whose real fix is one durable marker covering the whole physical
+	 * rewrite; see the `NOTE:` above `rebuildSecondaryIndexes` in
+	 * `StoreModuleAlter.alterDropColumn`.
 	 *
 	 * Ordering is swap-then-persist, deliberately: `StoreTableBase.updateSchema` validates
 	 * (key collations, semantic key transforms) before adopting anything, so a schema the
@@ -394,7 +396,8 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	 *
 	 * The original is captured here (`table.getSchema()`) rather than taken from the
 	 * caller's `oldSchema` — the same object today, but it keeps this contract
-	 * self-contained.
+	 * self-contained, and it is also what names the table in the unwind warning, so no
+	 * caller has to pass a subject the schema already carries.
 	 *
 	 * Only the cached-schema restore can ever fire, so `catalogWritten` stays false: the
 	 * only step after the swap IS the catalog write, so a throw means the catalog was
@@ -405,9 +408,9 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 	protected async adoptAndPersistSchema(
 		table: StoreTable,
 		updatedSchema: TableSchema,
-		subject: string,
 	): Promise<void> {
 		const originalSchema = table.getSchema();
+		const subject = `table '${originalSchema.schemaName}.${originalSchema.name}'`;
 		const progress: SchemaDdlProgress = { schemaSwapped: false, catalogWritten: false };
 		try {
 			table.updateSchema(updatedSchema);
