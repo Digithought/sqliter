@@ -475,17 +475,15 @@ function implicitIndexNameForColumns(constraintName: string | undefined, columnN
  * `columnNames` is consulted only when `constraintName` is undefined (the
  * `_uc_<cols>` auto-name); a named constraint ignores it.
  *
- * NOTE: the *input* is backend-dependent even though the check itself is not. A user
- * index is in `tableSchema.indexes` on every backend, so the collision this exists to
- * catch is refused identically everywhere. Another constraint's backing structure is
- * NOT — the memory module materializes one into `.indexes`, the store module does not
- * — so a constraint whose structure is named like another's is refused under memory and
- * accepted under store. Two shapes reach that: a constraint name carrying the engine's
- * reserved `_uc_` prefix (`constraint _uc_z unique (b)` beside `unique (z)`), and the
- * `_`-joined auto-name colliding on ordinary names (`unique (a_b)` beside
- * `unique (a, b)` — both derive `_uc_a_b`). If a caller ever needs the two to agree
- * there, compare against the derived names of the table's other UNIQUE constraints as
- * well, not just `.indexes`.
+ * NOTE: reads `.indexes` only, which is what makes it backend-independent — a user
+ * index is in `tableSchema.indexes` on every backend, so this collision is refused
+ * identically everywhere. The OTHER producer of a shared structure name — a second
+ * UNIQUE constraint on the same table deriving the same name — is deliberately not
+ * this function's business: `.indexes` sees it under memory (which materializes a
+ * constraint's structure there) and not under store, so reading it here would make
+ * the two backends disagree. {@link findUniqueConstraintSharingBackingName} handles
+ * that arm off `uniqueConstraints`, which both backends carry, and
+ * {@link assertUniqueConstraintIndexNameFree} runs it first.
  */
 function findIndexShadowedByUniqueConstraint(
 	tableSchema: TableSchema,
@@ -497,14 +495,65 @@ function findIndexShadowedByUniqueConstraint(
 }
 
 /**
+ * The UNIQUE constraint already on `tableSchema` whose own backing structure name is
+ * the one a constraint declared as `constraintName` over `columnNames` would take —
+ * or undefined when no other constraint holds it.
+ *
+ * The constraint-side twin of {@link findIndexShadowedByUniqueConstraint}. Two
+ * spellings reach it: a constraint name carrying the engine's reserved `_uc_` prefix
+ * (`constraint _uc_z unique (b)` beside `unique (z)`), and the `_`-joined auto-name
+ * colliding on ordinary column names (`unique (a_b)` beside `unique (a, b)` — both
+ * derive `_uc_a_b`). Left unguarded the second constraint adopts the first's
+ * structure and is then enforced by one keyed on the OTHER constraint's columns, so
+ * it silently stops rejecting duplicates.
+ *
+ * Reads `uniqueConstraints`, which every backend carries, so the refusal is identical
+ * on memory and store. Case-folded, like every other index-name comparison here.
+ *
+ * `derivedFromIndex` constraints are skipped: such a constraint's backing structure
+ * IS the `CREATE UNIQUE INDEX` that synthesized it, already in `.indexes` and already
+ * compared by the sibling arm — matching it here would report one collision twice
+ * under two different messages.
+ *
+ * Deliberately compares against the table's CURRENT derived names, including those of
+ * constraints a RENAME COLUMN is about to move. That is sufficient: two constraints
+ * can only newly collide under a rename if both cover the renamed column, and two such
+ * names differ only in their unrenamed parts — which the rename leaves alone.
+ */
+function findUniqueConstraintSharingBackingName(
+	tableSchema: TableSchema,
+	constraintName: string | undefined,
+	columnNames: ReadonlyArray<string>,
+): UniqueConstraintSchema | undefined {
+	const wanted = implicitIndexNameForColumns(constraintName, columnNames).toLowerCase();
+	return (tableSchema.uniqueConstraints ?? []).find(uc =>
+		uc.derivedFromIndex === undefined
+		&& implicitIndexName(tableSchema, uc).toLowerCase() === wanted);
+}
+
+/**
+ * How a UNIQUE constraint is named back to the user in a collision message: by the
+ * name they wrote when it has one, else by the columns they wrote.
+ */
+function describeUniqueConstraint(constraintName: string | undefined, columnNames: ReadonlyArray<string>): string {
+	return constraintName !== undefined ? `'${constraintName}'` : `on (${columnNames.join(', ')})`;
+}
+
+/**
  * Rejects a UNIQUE constraint declaration whose implicit backing structure would
- * claim a name already held by an index on the same table (see
- * {@link findIndexShadowedByUniqueConstraint}). No-op for any other constraint
- * kind — CHECK and FOREIGN KEY build no backing index, so they cannot collide.
+ * claim a name already held on the same table — by another UNIQUE constraint's
+ * backing structure ({@link findUniqueConstraintSharingBackingName}) or by an index
+ * ({@link findIndexShadowedByUniqueConstraint}). No-op for any other constraint kind
+ * — CHECK and FOREIGN KEY build no backing index, so they cannot collide.
  *
  * Called from the engine side BEFORE `module.alterTable`, which is what makes one
  * guard cover both backends and keeps a rejected statement from reaching the
  * store's persistence side effects.
+ *
+ * The constraint arm runs FIRST so a collision both arms can see reports identically
+ * on memory and store: memory materializes a constraint's structure into `.indexes`
+ * and store does not, so letting the index arm rule first would name an index the
+ * user never created under one backend and a constraint under the other.
  *
  * `operation` describes what the statement was doing, e.g.
  * `add constraint 'foo' to table 't'`.
@@ -515,13 +564,95 @@ export function assertUniqueConstraintIndexNameFree(
 	columnNames: ReadonlyArray<string>,
 	operation: string,
 ): void {
+	const backingName = implicitIndexNameForColumns(constraintName, columnNames);
+
+	const sibling = findUniqueConstraintSharingBackingName(tableSchema, constraintName, columnNames);
+	if (sibling) {
+		const siblingDescription = describeUniqueConstraint(
+			sibling.name,
+			uniqueConstraintColumnNames(tableSchema.columns, sibling),
+		);
+		throw new QuereusError(
+			`Cannot ${operation}: its backing structure '${backingName}' would collide with the backing structure `
+				+ `of the UNIQUE constraint ${siblingDescription} on the same table. Rename the constraint.`,
+			StatusCode.CONSTRAINT,
+		);
+	}
+
 	const shadowed = findIndexShadowedByUniqueConstraint(tableSchema, constraintName, columnNames);
 	if (!shadowed) return;
-	const backingName = implicitIndexNameForColumns(constraintName, columnNames);
 	throw new QuereusError(
 		`Cannot ${operation}: its backing index '${backingName}' would collide with existing index '${shadowed.name}' `
 			+ `on the same table. Rename the constraint or the index.`,
 		StatusCode.CONSTRAINT,
+	);
+}
+
+/**
+ * The pairwise form of {@link assertUniqueConstraintIndexNameFree}'s constraint arm:
+ * refuses a set of UNIQUE constraints declared TOGETHER, none of them on a table yet,
+ * in which two derive one backing structure name.
+ *
+ * Two callers hold a whole declaration at once and so have no table to compare
+ * against: `CREATE TABLE` (its entire constraint list) and
+ * `ALTER TABLE … ADD COLUMN` (the inline `unique` constraints on the new column).
+ * Both run it AFTER the duplicate-constraint guards, so a genuine duplicate keeps
+ * producing the constraint-worded duplicate message rather than a structure-name one,
+ * and — for `CREATE TABLE` — before `module.create`, so a refusal leaves no storage
+ * behind.
+ *
+ * Takes `{ name, columnNames }` pairs rather than built {@link UniqueConstraintSchema}s
+ * so the ADD COLUMN caller, whose column does not exist on any schema yet, can use it;
+ * {@link assertNoDuplicateUniqueConstraintBackingNames} is the built-constraint wrapper.
+ */
+export function assertUniqueConstraintBackingNamesDistinct(
+	declared: ReadonlyArray<{ name?: string; columnNames: ReadonlyArray<string> }>,
+	operation: string,
+): void {
+	const seen = new Map<string, { name?: string; columnNames: ReadonlyArray<string> }>();
+	for (const uc of declared) {
+		const backingName = implicitIndexNameForColumns(uc.name, uc.columnNames);
+		const lower = backingName.toLowerCase();
+		const held = seen.get(lower);
+		if (held) {
+			throw new QuereusError(
+				`Cannot ${operation}: the UNIQUE constraint ${describeUniqueConstraint(held.name, held.columnNames)} and `
+					+ `the UNIQUE constraint ${describeUniqueConstraint(uc.name, uc.columnNames)} both derive backing `
+					+ `structure name '${backingName}'. Rename one of them.`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+		seen.set(lower, uc);
+	}
+}
+
+/**
+ * The `CREATE TABLE` wrapper over {@link assertUniqueConstraintBackingNamesDistinct},
+ * reading the BUILT constraints (column indices already resolved) so inline and
+ * table-level spellings are compared in one place. A `CREATE TABLE` declares no
+ * indexes, so this pairwise comparison is the whole of the check there.
+ *
+ * `derivedFromIndex` constraints are skipped for the same reason
+ * {@link findUniqueConstraintSharingBackingName} skips them — unreachable from a
+ * `CREATE TABLE` today (the statement carries no index declarations), kept so the two
+ * arms answer alike if that ever changes.
+ *
+ * Called from `SchemaManager.createTable` only — never from the import / rehydrate
+ * path, so a catalog written before this guard existed still opens (same placement
+ * rationale as {@link assertNoDuplicateUniqueConstraints}; the memory backend's
+ * `ensureUniqueConstraintIndexes` keeps its adoption behaviour as damage limitation
+ * for exactly those catalogs).
+ */
+export function assertNoDuplicateUniqueConstraintBackingNames(
+	constraints: ReadonlyArray<UniqueConstraintSchema>,
+	columns: ReadonlyArray<{ name: string }>,
+	operation: string,
+): void {
+	assertUniqueConstraintBackingNamesDistinct(
+		constraints
+			.filter(uc => uc.derivedFromIndex === undefined)
+			.map(uc => ({ name: uc.name, columnNames: uniqueConstraintColumnNames(columns, uc) })),
+		operation,
 	);
 }
 

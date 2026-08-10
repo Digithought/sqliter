@@ -18,7 +18,7 @@ import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from 
 import { snapshotObjectRefResolvers, tableRenameTargetsFor, type ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
-import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, uniqueConstraintColumnSetKey } from '../../schema/catalog.js';
+import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, assertUniqueConstraintBackingNamesDistinct, uniqueConstraintColumnSetKey } from '../../schema/catalog.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
@@ -709,6 +709,18 @@ async function runAddColumn(
 		assertUniqueConstraintIndexNameFree(tableSchema, constraint.name, columnNames, operation);
 		if (constraint.name === undefined) declaredColumnSets.add(uniqueConstraintColumnSetKey(columnNames));
 	}
+
+	// Two inline `unique` constraints on the SAME new column can also derive one backing
+	// structure name without duplicating each other (`add column c text constraint _uc_c
+	// unique unique` — a name and an auto-name that coincide). Neither is on `tableSchema`
+	// yet, so the per-constraint guard above cannot see the pair; this compares them against
+	// each other. After the loop, so a plain duplicate still reports as a duplicate.
+	assertUniqueConstraintBackingNamesDistinct(
+		inlineConstraints
+			.filter(c => c.type === 'unique')
+			.map(c => ({ name: c.name, columnNames: (c.columns ?? []).map(col => col.name) })),
+		`add column '${columnDef.name}' to table '${tableSchema.name}'`,
+	);
 
 	// A per-row backfill derives each existing row's value from that row. Install a row slot
 	// over the backfill's row descriptor; the evaluator the module calls per existing row

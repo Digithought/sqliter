@@ -1052,4 +1052,42 @@ describe('StoreModule secondary-index persistence', () => {
 		try { await db2.exec(`insert into t values (4, 'x', 's')`); } catch { rejectedAfterReopen = true; }
 		expect(rejectedAfterReopen, 'UNIQUE still enforces after reopen').to.be.true;
 	});
+
+	it('a legacy catalog whose two UNIQUEs derive one backing structure name still reopens', async () => {
+		// Two UNIQUE constraints on one table may not derive the same backing structure
+		// name (`constraint _uc_c unique (b)` beside `unique (c)` — both derive `_uc_c`);
+		// every write path refuses the pair now. But the guard sits on `createTable` only,
+		// never on the import / rehydrate path, so a catalog written BEFORE it existed must
+		// still open and must still behave as it did. No write path can produce such a
+		// catalog any more, so the bundle is hand-edited into the shape an older version
+		// would have persisted.
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, c integer, b integer, constraint _uc_c unique (b)) using store`);
+		await db.exec(`insert into t values (1, 5, 7)`);
+		await mod.closeAll();
+
+		const before = (await catalogEntry('t'))!;
+		const legacy = before.replace(/(constraint\s+"?_uc_c"?\s+unique\s*\(\s*"?b"?\s*\))/i, '$1, unique ("c")');
+		expect(legacy, 'bundle rewritten to carry the colliding second UNIQUE').to.not.equal(before);
+		const catalog = await provider.getCatalogStore();
+		await catalog.put(buildCatalogKey('main', 't'), new TextEncoder().encode(legacy));
+
+		// `reopen()` asserts the rehydrated bundle parses cleanly — the open is not refused.
+		const { db: db2 } = await reopen();
+
+		expect(await rows(db2, `select count(distinct id) as c from unique_constraint_info('t')`),
+			'both constraints registered').to.deep.equal([{ c: 2 }]);
+		expect(await rows(db2, `select id from t`), 'the row survives').to.deep.equal([{ id: 1 }]);
+
+		// Enforcement is unchanged from what this catalog always did: the store resolves a
+		// constraint's serving structure by COLUMNS rather than by name, so the second
+		// constraint falls back to a correct scan instead of adopting the first's structure.
+		let err: Error | undefined;
+		try { await db2.exec(`insert into t values (2, 6, 7)`); } catch (e) { err = e as Error; }
+		expect(err?.message, 'the named UNIQUE on (b) still enforces').to.match(/unique/i);
+
+		err = undefined;
+		try { await db2.exec(`insert into t values (3, 5, 8)`); } catch (e) { err = e as Error; }
+		expect(err?.message, 'the unnamed UNIQUE on (c) still enforces').to.match(/unique/i);
+	});
 });

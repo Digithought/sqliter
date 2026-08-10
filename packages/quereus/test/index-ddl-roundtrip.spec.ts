@@ -238,71 +238,54 @@ describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 		}
 	});
 
-	it('two UNIQUE constraints deriving one structure name leave ONE index entry, not two', async () => {
+	it('CREATE TABLE refuses two UNIQUE constraints that derive one structure name', async () => {
 		// The sibling test above pins what two entries under one name cost. This pins the
-		// other producer of that shape and the guard that now closes it: a UNIQUE whose
-		// backing structure name is the `_uc_<cols>` another UNIQUE on the same table
-		// derives. The ALTER paths refuse it (`assertUniqueConstraintIndexNameFree` sees
-		// the materialized structure in `tableSchema.indexes`), but CREATE TABLE runs no
-		// such check, so the declaration below reaches `ensureUniqueConstraintIndexes` with
-		// two constraints wanting one name. It now ADOPTS the held name instead of pushing
-		// a second entry under it. Reachable two ways — the reserved `_uc_` prefix written into
-		// a constraint name (here), and the `_`-joined auto-name colliding on ORDINARY column
-		// names (the sibling test below) — see the NOTE on
-		// `findIndexShadowedByUniqueConstraint`.
-		//
-		// NOTE: adoption is damage LIMITATION, not a fix. The adopting constraint is left
-		// enforced by a structure keyed on the OTHER constraint's column, so `unique (c)`
-		// below silently stops rejecting duplicate `c`. That gap predates this guard (with
-		// two entries, both constraints resolved the name to the same first-match entry) and
-		// is filed as `backlog/bug-create-table-unique-derived-name-collision`; asserted
-		// here only as the array shape, so a future fix visibly flips it.
+		// other producer of that shape and the guard that closes it: a UNIQUE whose backing
+		// structure name is the one another UNIQUE on the same table derives. Reachable two
+		// ways — the engine's reserved `_uc_` prefix written into a constraint name (here),
+		// and the `_`-joined auto-name colliding on ORDINARY column names (the sibling test
+		// below). Both are refused at CREATE TABLE, as they already were at every ALTER path.
 		const dst = new Database();
 		try {
-			await dst.exec('create table t (id integer primary key, c integer, b integer, constraint _uc_c unique (b), unique (c))');
-
-			const t = dst._findTable('t')!;
-			expect(t.uniqueConstraints, 'both constraints registered').to.have.length(2);
-			expect((t.indexes ?? []).map(idx => idx.name), 'one entry under the shared name').to.deep.equal(['_uc_c']);
-
-			// Both are backing structures, so neither surfaces as a user index.
-			expect(await rows(dst, "select index_name from index_info('t')")).to.deep.equal([]);
-
-			// The constraint that OWNS the structure still enforces normally.
-			await dst.exec('insert into t values (1, 5, 7)');
 			let err: Error | undefined;
-			try { await dst.exec('insert into t values (2, 6, 7)'); } catch (e) { err = e as Error; }
-			expect(err?.message, 'the owning UNIQUE still enforces').to.match(/UNIQUE constraint failed/i);
+			try {
+				await dst.exec('create table t (id integer primary key, c integer, b integer, constraint _uc_c unique (b), unique (c))');
+			} catch (e) { err = e as Error; }
+			expect(err?.message, 'refused').to.match(/both derive backing structure name '_uc_c'/i);
+
+			// Refused before `module.create`, so nothing was registered.
+			expect(dst._findTable('t'), 'no table left behind').to.equal(undefined);
+			expect(await rows(dst, "select count(*) as c from schema() where type = 'table' and name = 't'"))
+				.to.deep.equal([{ c: 0 }]);
 		} finally {
 			await dst.close();
 		}
 	});
 
-	it('the same collision is reachable with ordinary column names', async () => {
+	it('the same collision is reachable with ordinary column names, and is refused there too', async () => {
 		// `_uc_<cols>` joins the covered column names with `_`, so a single column named
 		// `a_b` derives the name the pair `(a, b)` derives. No reserved prefix, no unusual
 		// spelling — two plain UNIQUE declarations. The duplicate-constraint guard does not
-		// fire (different column SETS, genuinely different rules) and CREATE TABLE runs no
-		// derived-name check, so both constraints land on one structure.
-		//
-		// NOTE: shape only, deliberately — the second constraint is then enforced by a
-		// structure keyed on the FIRST one's column, so `unique (a, b)` silently accepts
-		// duplicates on the memory backend. The store backend resolves the serving index by
-		// COLUMNS rather than by name (`findIndexForUniqueConstraint`), finds none, and falls
-		// back to a correct full scan — so this is a memory-backend defect, filed as
-		// `backlog/bug-create-table-unique-derived-name-collision`. Asserting the enforcement
-		// loss here would bless it; the shape assertion below flips visibly when it is fixed.
+		// fire (different column SETS, genuinely different rules), so only the structure-name
+		// guard catches it.
 		const dst = new Database();
 		try {
-			await dst.exec('create table t (id integer primary key, a_b integer, a integer, b integer, unique (a_b), unique (a, b))');
-
-			const t = dst._findTable('t')!;
-			expect(t.uniqueConstraints, 'both constraints registered').to.have.length(2);
-			expect((t.indexes ?? []).map(idx => idx.name), 'one entry under the shared name').to.deep.equal(['_uc_a_b']);
+			let err: Error | undefined;
+			try {
+				await dst.exec('create table t (id integer primary key, a_b integer, a integer, b integer, unique (a_b), unique (a, b))');
+			} catch (e) { err = e as Error; }
+			expect(err?.message, 'refused').to.match(/both derive backing structure name '_uc_a_b'/i);
+			expect(dst._findTable('t'), 'no table left behind').to.equal(undefined);
 		} finally {
 			await dst.close();
 		}
 	});
+
+	// NOTE: the legacy-catalog half of this rule — a catalog written BEFORE the guard,
+	// carrying the colliding pair, must still open — is pinned store-side in
+	// `packages/quereus-store/test/index-persistence.spec.ts`. It cannot be expressed
+	// here: `importTable` rehydrates through `module.connect`, and the memory module has
+	// no definition to connect to for a table it never created.
 
 	it('a genuine expression index is still rejected on import', async () => {
 		const dst = new Database();

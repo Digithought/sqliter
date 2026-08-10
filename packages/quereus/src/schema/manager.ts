@@ -14,7 +14,7 @@ import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateF
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
-import { isHiddenImplicitIndex, isImplicitCoveringIndex, findExposedImplicitConstraintIndex, assertNoDuplicateUniqueConstraints, assertNoDuplicateConstraintNames } from './catalog.js';
+import { isHiddenImplicitIndex, isImplicitCoveringIndex, findExposedImplicitConstraintIndex, assertNoDuplicateUniqueConstraints, assertNoDuplicateUniqueConstraintBackingNames, assertNoDuplicateConstraintNames } from './catalog.js';
 import { assertCatalogObjectPersistable } from './catalog-persistability.js';
 import { buildLensBasisFkGate } from './lens-fk-discovery.js';
 import { createLogger } from '../common/logger.js';
@@ -2840,6 +2840,21 @@ export class SchemaManager {
 		// still open a catalog written before this guard existed (same placement rationale
 		// as the FK-collation check below).
 		assertNoDuplicateUniqueConstraints(
+			baseTableSchema.uniqueConstraints ?? [],
+			baseTableSchema.columns,
+			`create table '${tableName}'`,
+		);
+
+		// Two DIFFERENT UNIQUE constraints (different column sets, so the duplicate guard
+		// above passes) may still derive ONE backing structure name — via a constraint name
+		// written with the engine's reserved `_uc_` prefix, or via the `_`-joined auto-name
+		// colliding on ordinary column names (`unique (a_b)` beside `unique (a, b)`). The
+		// second constraint then adopts the first's structure and is enforced by one keyed on
+		// the OTHER constraint's columns, so it silently stops rejecting duplicates. Every
+		// ALTER path refuses this; refused here too, so one declaration gets one answer
+		// wherever it is written. After the duplicate guard (a genuine duplicate must keep its
+		// constraint-worded message) and before `module.create` (a refusal leaves no storage).
+		assertNoDuplicateUniqueConstraintBackingNames(
 			baseTableSchema.uniqueConstraints ?? [],
 			baseTableSchema.columns,
 			`create table '${tableName}'`,
